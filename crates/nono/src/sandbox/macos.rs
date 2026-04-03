@@ -476,10 +476,7 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
     for cap in caps.fs_capabilities() {
         if matches!(
             cap.access,
-            AccessMode::Execute
-                | AccessMode::ReadWrite
-                | AccessMode::ReadExecute
-                | AccessMode::ReadWriteExecute
+            AccessMode::Execute | AccessMode::ReadExecute | AccessMode::ReadWriteExecute
         ) {
             for filter in path_filters_for_cap(cap)? {
                 profile.push_str(&format!("(allow process-exec ({}))\n", filter));
@@ -605,11 +602,7 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
     for cap in caps.fs_capabilities() {
         if matches!(
             cap.access,
-            AccessMode::Read
-                | AccessMode::ReadWrite
-                | AccessMode::Execute
-                | AccessMode::ReadExecute
-                | AccessMode::ReadWriteExecute
+            AccessMode::Execute | AccessMode::ReadExecute | AccessMode::ReadWriteExecute
         ) {
             for filter in path_filters_for_cap(cap)? {
                 profile.push_str(&format!("(allow file-map-executable ({}))\n", filter));

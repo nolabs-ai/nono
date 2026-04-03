@@ -141,8 +141,14 @@ pub fn query_path(
         let sufficient = matches!(
             (cap.access, requested),
             (AccessMode::ReadWriteExecute, _)
-                | (AccessMode::ReadWrite, AccessMode::ReadWrite | AccessMode::Read | AccessMode::Write)
-                | (AccessMode::ReadExecute, AccessMode::ReadExecute | AccessMode::Read | AccessMode::Execute)
+                | (
+                    AccessMode::ReadWrite,
+                    AccessMode::ReadWrite | AccessMode::Read | AccessMode::Write
+                )
+                | (
+                    AccessMode::ReadExecute,
+                    AccessMode::ReadExecute | AccessMode::Read | AccessMode::Execute
+                )
                 | (AccessMode::Read, AccessMode::Read)
                 | (AccessMode::Write, AccessMode::Write)
                 | (AccessMode::Execute, AccessMode::Execute)

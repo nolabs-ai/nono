@@ -468,86 +468,13 @@ pub trait CapabilitySetExt {
 impl CapabilitySetExt for CapabilitySet {
     fn from_args(args: &SandboxArgs) -> Result<(CapabilitySet, bool)> {
         let mut caps = CapabilitySet::new();
-        let protected_roots = ProtectedRoots::from_defaults()?;
 
         // Resolve base policy groups (system paths, deny rules, dangerous commands)
         let loaded_policy = policy::load_embedded_policy()?;
         let default_groups = default_profile_groups()?;
         let mut resolved = policy::resolve_groups(&loaded_policy, &default_groups, &mut caps)?;
 
-        // Directory permissions (canonicalize handles existence check atomically)
-        for path in &args.allow {
-            validate_requested_dir(path, "CLI", &protected_roots, false)?;
-            if let Some(cap) =
-                try_new_dir(path, AccessMode::ReadWrite, "Skipping non-existent path")?
-            {
-                caps.add_fs(cap);
-            }
-        }
-
-        for path in &args.read {
-            validate_requested_dir(path, "CLI", &protected_roots, false)?;
-            if let Some(cap) = try_new_dir(path, AccessMode::Read, "Skipping non-existent path")? {
-                caps.add_fs(cap);
-            }
-        }
-
-        for path in &args.write {
-            validate_requested_dir(path, "CLI", &protected_roots, false)?;
-            if let Some(cap) = try_new_dir(path, AccessMode::Write, "Skipping non-existent path")? {
-                caps.add_fs(cap);
-            }
-        }
-
-        // Single file permissions
-        for path in &args.allow_file {
-            validate_requested_file(path, "CLI", &protected_roots, false)?;
-            if let Some(cap) =
-                try_new_file(path, AccessMode::ReadWrite, "Skipping non-existent file")?
-            {
-                caps.add_fs(cap);
-            }
-        }
-
-        for path in &args.read_file {
-            validate_requested_file(path, "CLI", &protected_roots, false)?;
-            if let Some(cap) = try_new_file(path, AccessMode::Read, "Skipping non-existent file")? {
-                caps.add_fs(cap);
-            }
-        }
-
-        for path in &args.write_file {
-            validate_requested_file(path, "CLI", &protected_roots, false)?;
-            if let Some(cap) = try_new_file(path, AccessMode::Write, "Skipping non-existent file")?
-            {
-                caps.add_fs(cap);
-            }
-        }
-
-        // AF_UNIX socket capabilities (issue #685 / #696). See
-        // add_cli_unix_socket_caps for the full flag handling + implied
-        // fs-grant sugar.
-        add_cli_unix_socket_caps(&mut caps, args, &protected_roots, false)?;
-
-        // Execute permissions (directory and single file). Standardized to
-        // ReadExecute since execve(2) requires reading the binary header.
-        for path in &args.execute {
-            validate_requested_dir(path, "CLI", &protected_roots, false)?;
-            if let Some(cap) =
-                try_new_dir(path, AccessMode::ReadExecute, "Skipping non-existent path")?
-            {
-                caps.add_fs(cap);
-            }
-        }
-
-        for path in &args.execute_file {
-            validate_requested_file(path, "CLI", &protected_roots, false)?;
-            if let Some(cap) =
-                try_new_file(path, AccessMode::ReadExecute, "Skipping non-existent file")?
-            {
-                caps.add_fs(cap);
-            }
-        }
+        apply_cli_fs_grants(&mut caps, args, false)?;
 
         apply_cli_network_mode(&mut caps, args);
 
@@ -1103,9 +1030,48 @@ fn add_cli_overrides(
     args: &SandboxArgs,
     allow_parent_of_protected: bool,
 ) -> Result<()> {
+    apply_cli_fs_grants(caps, args, allow_parent_of_protected)?;
+
+    apply_cli_network_mode(caps, args);
+
+    for port in &args.allow_port {
+        caps.add_localhost_port(*port);
+    }
+
+    #[cfg(target_os = "macos")]
+    if !args.allow_connect_port.is_empty() {
+        return Err(NonoError::UnsupportedPlatform(
+            "--allow-connect-port is not supported on macOS: Seatbelt cannot filter by TCP port. \
+             Use --allow-domain for host-level filtering, or ProxyOnly mode."
+                .to_string(),
+        ));
+    }
+    #[cfg(not(target_os = "macos"))]
+    for port in &args.allow_connect_port {
+        caps.add_tcp_connect_port(*port);
+    }
+
+    for cmd in &args.allow_command {
+        caps.add_allowed_command(cmd.clone());
+    }
+
+    for cmd in &args.block_command {
+        caps.add_blocked_command(cmd);
+    }
+
+    Ok(())
+}
+
+/// Helper to apply all filesystem-related grants from CLI arguments.
+/// Standardizes execution flags to use ReadExecute access mode.
+fn apply_cli_fs_grants(
+    caps: &mut CapabilitySet,
+    args: &SandboxArgs,
+    allow_parent_of_protected: bool,
+) -> Result<()> {
     let protected_roots = ProtectedRoots::from_defaults()?;
 
-    // Additional directories from CLI
+    // Directories
     for path in &args.allow {
         validate_requested_dir(path, "CLI", &protected_roots, allow_parent_of_protected)?;
         if let Some(cap) = try_new_dir(path, AccessMode::ReadWrite, "Skipping non-existent path")? {
@@ -1127,7 +1093,7 @@ fn add_cli_overrides(
         }
     }
 
-    // Additional files from CLI
+    // Single files
     for path in &args.allow_file {
         validate_requested_file(path, "CLI", &protected_roots, allow_parent_of_protected)?;
         if let Some(cap) = try_new_file(path, AccessMode::ReadWrite, "Skipping non-existent file")?
@@ -1153,8 +1119,8 @@ fn add_cli_overrides(
     // AF_UNIX socket capabilities from CLI overrides.
     add_cli_unix_socket_caps(caps, args, &protected_roots, allow_parent_of_protected)?;
 
-    // Execute permissions (directory and single file). Standardized to
-    // ReadExecute since execve(2) requires reading the binary header.
+    // Execute permissions (standardized to ReadExecute since execve(2) requires
+    // reading the binary header).
     for path in &args.execute {
         validate_requested_dir(path, "CLI", &protected_roots, allow_parent_of_protected)?;
         if let Some(cap) = try_new_dir(path, AccessMode::ReadExecute, "Skipping non-existent path")?
@@ -1170,37 +1136,6 @@ fn add_cli_overrides(
         {
             caps.add_fs(cap);
         }
-    }
-
-    // CLI network flags override profile network settings.
-    apply_cli_network_mode(caps, args);
-
-    // Localhost IPC ports from CLI
-    for port in &args.allow_port {
-        caps.add_localhost_port(*port);
-    }
-
-    // Outbound TCP connect port allowlist from CLI (Linux Landlock V4+ only)
-    #[cfg(target_os = "macos")]
-    if !args.allow_connect_port.is_empty() {
-        return Err(NonoError::UnsupportedPlatform(
-            "--allow-connect-port is not supported on macOS: Seatbelt cannot filter by TCP port. \
-             Use --allow-domain for host-level filtering, or ProxyOnly mode."
-                .to_string(),
-        ));
-    }
-    #[cfg(not(target_os = "macos"))]
-    for port in &args.allow_connect_port {
-        caps.add_tcp_connect_port(*port);
-    }
-
-    // Command allow/block from CLI
-    for cmd in &args.allow_command {
-        caps.add_allowed_command(cmd.clone());
-    }
-
-    for cmd in &args.block_command {
-        caps.add_blocked_command(cmd);
     }
 
     Ok(())

@@ -395,14 +395,21 @@
     "node_runtime": {
       "description": "Node.js runtime and package manager paths",
       "allow": {
-        "readwriteexecute": [
+        "read": [
+          "~/.node",
+          "~/.node-gyp"
+        ],
+        "readexecute": [
           "~/.nvm",
           "~/.fnm",
-          "~/.npm",
-          "~/.node",
           "~/.local/share/fnm",
-          "/usr/local/lib/node_modules",
-          "~/Library/pnpm",
+          "/usr/local/lib/node_modules"
+        ],
+        "readwrite": [
+          "~/.npm",
+          "~/Library/pnpm"
+        ],
+        "readwriteexecute": [
           "~/.local/share/pnpm"
         ]
       }

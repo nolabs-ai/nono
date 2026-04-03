@@ -71,12 +71,14 @@ impl AccessMode {
     pub fn contains(self, required: AccessMode) -> bool {
         match (self, required) {
             (AccessMode::ReadWriteExecute, _) => true,
-            (AccessMode::ReadWrite, AccessMode::ReadWrite | AccessMode::Read | AccessMode::Write) => {
-                true
-            }
-            (AccessMode::ReadExecute, AccessMode::ReadExecute | AccessMode::Read | AccessMode::Execute) => {
-                true
-            }
+            (
+                AccessMode::ReadWrite,
+                AccessMode::ReadWrite | AccessMode::Read | AccessMode::Write,
+            ) => true,
+            (
+                AccessMode::ReadExecute,
+                AccessMode::ReadExecute | AccessMode::Read | AccessMode::Execute,
+            ) => true,
             (AccessMode::ReadWrite, _) => false,
             (AccessMode::ReadExecute, _) => false,
             (AccessMode::Write, AccessMode::Write) => true,

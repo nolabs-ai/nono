@@ -1502,6 +1502,12 @@ pub fn load_profile_extends(name_or_path: &str) -> Option<Vec<String>> {
 /// 1. User profiles from ~/.config/nono/profiles/<name>.json (allows customization)
 /// 2. Built-in profiles (compiled into binary, fallback)
 pub fn load_profile(name_or_path: &str) -> Result<Profile> {
+    // Registry reference (namespace/name) — detect before the file path check
+    // since the `/` would otherwise be treated as a path separator.
+    if is_registry_ref(name_or_path) {
+        return load_registry_profile(name_or_path);
+    }
+
     // Direct file path: contains separator or ends with .json
     if name_or_path.contains('/') || name_or_path.ends_with(".json") {
         return load_profile_from_path(Path::new(name_or_path));
@@ -1529,6 +1535,94 @@ pub fn load_profile(name_or_path: &str) -> Result<Profile> {
     }
 
     Err(NonoError::ProfileNotFound(name_or_path.to_string()))
+}
+
+/// Returns true if the string looks like a registry package reference
+/// (`namespace/name` or `namespace/name@version`) rather than a filesystem path.
+fn is_registry_ref(s: &str) -> bool {
+    // Strip optional @version suffix for the path check
+    let path_part = s.split_once('@').map_or(s, |(p, _)| p);
+    let parts: Vec<&str> = path_part.split('/').collect();
+    parts.len() == 2
+        && !s.starts_with('.')
+        && !s.starts_with('~')
+        && !s.starts_with('/')
+        && !s.ends_with(".json")
+        && parts.iter().all(|p| !p.is_empty())
+}
+
+/// Load a profile from a registry pack. If the pack isn't installed locally,
+/// pull it first (Docker-style auto-pull with Sigstore verification).
+fn load_registry_profile(name_or_path: &str) -> Result<Profile> {
+    let package_ref = crate::package::parse_package_ref(name_or_path)?;
+    let install_dir = crate::package::package_install_dir(&package_ref.namespace, &package_ref.name)?;
+
+    // Check if pack is already installed
+    if !install_dir.join("package.json").exists() {
+        eprintln!(
+            "Profile '{}' not found locally.",
+            package_ref.key()
+        );
+
+        // Auto-pull from registry
+        crate::package_cmd::run_pull(crate::cli::PullArgs {
+            package_ref: name_or_path.to_string(),
+            registry: None,
+            force: false,
+            init: false,
+            help: None,
+        })?;
+    }
+
+    // Read manifest to check pack type and find profile artifacts
+    let manifest_path = install_dir.join("package.json");
+    if !manifest_path.exists() {
+        return Err(NonoError::ProfileNotFound(format!(
+            "pack '{}' failed to install",
+            package_ref.key()
+        )));
+    }
+
+    let manifest_json = std::fs::read_to_string(&manifest_path).map_err(NonoError::Io)?;
+    let manifest: crate::package::PackageManifest =
+        serde_json::from_str(&manifest_json).map_err(|e| {
+            NonoError::ProfileParse(format!(
+                "invalid package.json in '{}': {e}",
+                package_ref.key()
+            ))
+        })?;
+
+    if manifest.pack_type != crate::package::PackType::Policy {
+        return Err(NonoError::ProfileParse(format!(
+            "'{}' is a {} — only policy packs can be used with --profile.\n\
+             Use 'nono pull {}' to install it instead.",
+            package_ref.key(),
+            manifest.pack_type.label(),
+            package_ref.key()
+        )));
+    }
+
+    // Find the profile JSON in the installed pack
+    for artifact in &manifest.artifacts {
+        if artifact.artifact_type == crate::package::ArtifactType::Profile {
+            let install_name = artifact.install_as.as_deref().unwrap_or(&artifact.path);
+            let profile_path = install_dir
+                .join("profiles")
+                .join(format!("{install_name}.json"));
+            if profile_path.exists() {
+                tracing::info!(
+                    "Loading registry profile from: {}",
+                    profile_path.display()
+                );
+                return finalize_profile(load_from_file(&profile_path)?);
+            }
+        }
+    }
+
+    Err(NonoError::ProfileParse(format!(
+        "no profile found in pack '{}'",
+        package_ref.key()
+    )))
 }
 
 /// Load a profile from a direct file path.

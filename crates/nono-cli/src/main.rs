@@ -44,6 +44,8 @@ mod policy_cmd;
 mod profile;
 mod profile_cmd;
 mod profile_runtime;
+#[cfg(not(target_os = "windows"))]
+mod profile_save_runtime;
 mod protected_paths;
 mod proxy_runtime;
 #[cfg(not(target_os = "windows"))]

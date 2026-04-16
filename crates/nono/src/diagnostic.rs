@@ -82,6 +82,27 @@ pub struct SandboxViolation {
     pub target: Option<String>,
 }
 
+/// Policy explanation for a denied path, resolved from `nono why` logic.
+///
+/// This carries the enriched query result so the diagnostic can show
+/// group names, policy details, and suggested fixes inline rather than
+/// asking the user to run `nono why` separately.
+#[derive(Debug, Clone)]
+pub struct PolicyExplanation {
+    /// The denied path.
+    pub path: PathBuf,
+    /// Access mode that was denied.
+    pub access: AccessMode,
+    /// Why it was denied: "sensitive_path", "insufficient_access", or "path_not_granted".
+    pub reason: String,
+    /// Human-readable explanation (e.g. "blocked by group 'ssh' (SSH keys and config)").
+    pub details: Option<String>,
+    /// Policy source identifier (e.g. "group:ssh").
+    pub policy_source: Option<String>,
+    /// Suggested CLI flag to fix (e.g. "--read ~/.ssh/id_rsa").
+    pub suggested_flag: Option<String>,
+}
+
 /// Path-level hint extracted from a command's own error output.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObservedPathHint {
@@ -285,6 +306,15 @@ fn detect_non_sandbox_failure_line(line: &str) -> Option<String> {
         return Some(trimmed.to_string());
     }
 
+    // Version requirement errors are never sandbox-related
+    if lower.contains("version must be at least")
+        || lower.contains("requires version")
+        || lower.contains("minimum version")
+        || lower.contains("upgrade your")
+    {
+        return Some(trimmed.to_string());
+    }
+
     None
 }
 
@@ -315,7 +345,7 @@ fn looks_like_missing_path(line: &str) -> bool {
 }
 
 fn render_diagnostic_block(body: &str) -> String {
-    let mut lines = vec!["nono diagnostic".to_string(), "───────────────".to_string()];
+    let mut lines = Vec::new();
 
     for line in body.lines() {
         if line == "[nono]" {
@@ -333,10 +363,7 @@ fn render_diagnostic_block(body: &str) -> String {
 }
 
 fn format_command_failed_line(exit_code: i32) -> String {
-    format!(
-        "[nono] The command failed. This may be due to sandbox restrictions. (exit code {})",
-        exit_code
-    )
+    format!("[nono] Command exited with code {}.", exit_code)
 }
 
 fn format_command_failed_not_sandbox_line(exit_code: i32) -> String {
@@ -520,6 +547,10 @@ pub struct DiagnosticFormatter<'a> {
     command: Option<CommandContext>,
     /// Directory the child process started in.
     current_dir: Option<&'a Path>,
+    /// Session ID for `nono grant` suggestions in supervised mode.
+    session_id: Option<String>,
+    /// Policy explanations for denied paths, resolved from `query_path`.
+    policy_explanations: Vec<PolicyExplanation>,
 }
 
 impl<'a> DiagnosticFormatter<'a> {
@@ -539,6 +570,8 @@ impl<'a> DiagnosticFormatter<'a> {
             non_sandbox_failure: None,
             command: None,
             current_dir: None,
+            session_id: None,
+            policy_explanations: Vec::new(),
         }
     }
 
@@ -605,6 +638,24 @@ impl<'a> DiagnosticFormatter<'a> {
     #[must_use]
     pub fn with_current_dir(mut self, current_dir: &'a Path) -> Self {
         self.current_dir = Some(current_dir);
+        self
+    }
+
+    /// Set the session ID for `nono grant` suggestions in supervised mode.
+    #[must_use]
+    pub fn with_session_id(mut self, session_id: Option<String>) -> Self {
+        self.session_id = session_id;
+        self
+    }
+
+    /// Add policy explanations for denied paths.
+    ///
+    /// These are resolved from `query_path` in the CLI layer and provide
+    /// group names, policy details, and suggested fixes so the diagnostic
+    /// can show them inline.
+    #[must_use]
+    pub fn with_policy_explanations(mut self, explanations: Vec<PolicyExplanation>) -> Self {
+        self.policy_explanations = explanations;
         self
     }
 
@@ -946,69 +997,50 @@ impl<'a> DiagnosticFormatter<'a> {
         }
         lines.push("[nono]".to_string());
 
-        if self.denials.is_empty()
-            && self.sandbox_violations.is_empty()
-            && !self.caps.extensions_enabled()
-        {
-            // No denials and no capability expansion (macOS supervised mode).
-            // Seatbelt blocks at the kernel level without notifying the supervisor,
-            // so we fall back to the standard policy summary with re-run suggestions.
-            let observed_hints = self.actionable_observed_path_hints();
-            if let Some(verdict) = primary_verdict.as_ref() {
-                self.format_primary_verdict_guidance(&mut lines, verdict);
-                lines.push("[nono]".to_string());
-            }
+        // Convert macOS Seatbelt violations (operation + target) into
+        // DenialRecords so the same rendering logic handles both platforms.
+        let (violation_denials, non_fs_violations) = violations_to_denials(self.sandbox_violations);
 
-            lines.push("[nono] Sandbox policy:".to_string());
-            self.format_allowed_paths_concise(&mut lines);
-            self.format_network_status(&mut lines);
-            self.format_protected_paths(&mut lines);
-            let additional_hints = if observed_hints.len() > 1 {
-                &observed_hints[1..]
+        // Merge supervisor denials (Linux seccomp) with violation-derived
+        // denials (macOS Seatbelt) into a single unified list.
+        let all_denials: Vec<DenialRecord> = self
+            .denials
+            .iter()
+            .cloned()
+            .chain(violation_denials)
+            .collect();
+
+        if all_denials.is_empty() {
+            // No denials from either source.
+            if !non_fs_violations.is_empty() {
+                // Non-filesystem violations (mach-lookup, signal, etc.) —
+                // show them with human-readable descriptions.
+                lines.push("[nono] Sandbox blocked system services:".to_string());
+                format_non_fs_violations(&mut lines, &non_fs_violations);
+                lines.push("[nono]".to_string());
+                format_non_fs_guidance(&mut lines, &non_fs_violations);
             } else {
-                &[]
-            };
-            self.format_observed_path_hints(&mut lines, additional_hints);
-            if observed_hints.is_empty() && primary_verdict.is_none() {
-                lines.push("[nono]".to_string());
-                self.format_grant_help(&mut lines);
-                lines.push("[nono]".to_string());
-                self.format_follow_up_guidance(&mut lines, None);
-            }
-            return lines.join("\n");
-        } else if self.denials.is_empty() && !self.sandbox_violations.is_empty() {
-            if let Some(verdict) = primary_verdict.as_ref() {
-                self.format_primary_verdict_guidance(&mut lines, verdict);
-                lines.push("[nono]".to_string());
-            }
-
-            lines.push("[nono] Sandbox denied the following operations:".to_string());
-            for violation in self.sandbox_violations {
-                match &violation.target {
-                    Some(target) => {
-                        lines.push(format!("[nono]   {}  {}", violation.operation, target));
-                    }
-                    None => {
-                        lines.push(format!("[nono]   {}", violation.operation));
-                    }
+                // Genuinely no denials observed.
+                if let Some(verdict) = primary_verdict.as_ref() {
+                    self.format_primary_verdict_guidance(&mut lines, verdict);
+                    lines.push("[nono]".to_string());
                 }
+                lines.push("[nono] No path denials were observed during this session.".to_string());
+                lines.push(
+                    "[nono] The failure may be unrelated to sandbox restrictions.".to_string(),
+                );
             }
             lines.push("[nono]".to_string());
-            self.format_follow_up_guidance(&mut lines, None);
-            return lines.join("\n");
-        } else if self.denials.is_empty() {
-            // No denials but expansion is active (Linux supervised mode).
-            // seccomp-notify would have caught any denial, so this is genuine.
-            lines.push("[nono] No access requests were denied during this session.".to_string());
-            lines.push("[nono] The failure may be unrelated to sandbox restrictions.".to_string());
+            self.format_grant_help(&mut lines);
             lines.push("[nono]".to_string());
             self.format_follow_up_guidance(&mut lines, None);
         } else {
-            let policy_blocked = self.aggregate_denials(DenialReason::PolicyBlocked);
-            let insufficient_access = self.aggregate_denials(DenialReason::InsufficientAccess);
-            let user_denied = self.aggregate_denials(DenialReason::UserDenied);
-            let rate_limited = self.aggregate_denials(DenialReason::RateLimited);
-            let backend_errors = self.aggregate_denials(DenialReason::BackendError);
+            let policy_blocked = aggregate_denials_from(&all_denials, DenialReason::PolicyBlocked);
+            let insufficient_access =
+                aggregate_denials_from(&all_denials, DenialReason::InsufficientAccess);
+            let user_denied = aggregate_denials_from(&all_denials, DenialReason::UserDenied);
+            let rate_limited = aggregate_denials_from(&all_denials, DenialReason::RateLimited);
+            let backend_errors = aggregate_denials_from(&all_denials, DenialReason::BackendError);
 
             let mut actionable = Vec::new();
             actionable.extend(insufficient_access.iter().cloned());
@@ -1118,29 +1150,21 @@ impl<'a> DiagnosticFormatter<'a> {
                     );
                 }
             }
+
+            // Show non-filesystem violations (mach-lookup, etc.) if any
+            if !non_fs_violations.is_empty() {
+                lines.push("[nono]".to_string());
+                lines.push("[nono] Also blocked (system services):".to_string());
+                format_non_fs_violations(&mut lines, &non_fs_violations);
+                lines.push("[nono]".to_string());
+                format_non_fs_guidance(&mut lines, &non_fs_violations);
+            }
+
+            // Note: `nono grant` suggestions are shown via desktop
+            // notifications during the session, not in the post-exit footer.
         }
 
         lines.join("\n")
-    }
-
-    fn aggregate_denials(&self, reason: DenialReason) -> Vec<DenialRecord> {
-        let mut aggregated = std::collections::BTreeMap::<PathBuf, AccessMode>::new();
-
-        for denial in self.denials.iter().filter(|d| d.reason == reason) {
-            aggregated
-                .entry(denial.path.clone())
-                .and_modify(|existing| *existing = merge_access_modes(*existing, denial.access))
-                .or_insert(denial.access);
-        }
-
-        aggregated
-            .into_iter()
-            .map(|(path, access)| DenialRecord {
-                path,
-                access,
-                reason: reason.clone(),
-            })
-            .collect()
     }
 
     fn closest_covering_capability(
@@ -1239,34 +1263,24 @@ impl<'a> DiagnosticFormatter<'a> {
     fn format_follow_up_guidance(
         &self,
         lines: &mut Vec<String>,
-        hint: Option<(&Path, AccessMode)>,
+        _hint: Option<(&Path, AccessMode)>,
     ) {
         lines.push("[nono] Next steps:".to_string());
         if let Some(command) = self.format_command_for_learn() {
-            lines.push(format!("[nono]   Learn: nono learn -- {}", command));
-        } else {
-            lines.push("[nono]   Learn: nono learn -- <your command>".to_string());
-        }
-
-        if let Some((path, access)) = hint {
             lines.push(format!(
-                "[nono]   Why: nono why --path {} --op {}",
-                path.display(),
-                why_op_str(access)
+                "[nono]   Discover paths: nono learn -- {}",
+                command
             ));
-            lines.push(
-                "[nono]   Re-use the same --profile/--allow flags from the failing run."
-                    .to_string(),
-            );
         } else {
-            lines.push(
-                "[nono]   Why: nono why --path <path> --op <read|write|readwrite>".to_string(),
-            );
+            lines.push("[nono]   Discover paths: nono learn -- <your command>".to_string());
         }
+        lines.push(
+            "[nono]   Query policy: nono why --path <path> --op <read|write|readwrite>".to_string(),
+        );
     }
 
     fn format_primary_observed_guidance(&self, lines: &mut Vec<String>, hint: &ObservedPathHint) {
-        lines.push("[nono] Likely sandbox denial:".to_string());
+        lines.push("[nono] Sandbox denial:".to_string());
         if self.observed_hint_points_to_read_only_cwd(hint) {
             lines.push(
                 "[nono]   The command appears to be writing inside the current working directory,"
@@ -1286,7 +1300,6 @@ impl<'a> DiagnosticFormatter<'a> {
             "[nono]   Try: {}",
             self.suggested_flag_for_hint(&hint.path, hint.access)
         ));
-        self.format_primary_follow_up(lines, hint.path.as_path(), hint.access);
     }
 
     fn format_primary_verdict_guidance(&self, lines: &mut Vec<String>, verdict: &ErrorVerdict) {
@@ -1327,98 +1340,90 @@ impl<'a> DiagnosticFormatter<'a> {
     }
 
     fn format_primary_denial_guidance(&self, lines: &mut Vec<String>, denial: &DenialRecord) {
-        lines.push("[nono] Likely sandbox denial:".to_string());
+        lines.push("[nono] Sandbox denial:".to_string());
         lines.push(format!(
             "[nono]   {} ({})",
             denial.path.display(),
             access_str(denial.access),
         ));
 
-        match denial.reason {
-            DenialReason::PolicyBlocked => {
-                lines.push(
-                    "[nono]   This path is blocked by security policy; path flags alone will not allow it."
-                        .to_string(),
-                );
-                lines.push(format!(
-                    "[nono]   Why: nono why --path {} --op {}",
-                    denial.path.display(),
-                    why_op_str(denial.access)
-                ));
-                lines.push(
-                    "[nono]   Learn: use this for grantable paths; policy-blocked paths need a profile exception."
-                        .to_string(),
-                );
+        // Look up policy explanation for this path
+        let explanation = self
+            .policy_explanations
+            .iter()
+            .find(|e| e.path == denial.path);
+
+        if let Some(expl) = explanation {
+            // Show inline policy details instead of asking user to run `nono why`
+            if let Some(ref details) = expl.details {
+                lines.push(format!("[nono]   {}", details));
             }
-            DenialReason::InsufficientAccess => {
+            if expl.reason == "sensitive_path" {
+                // Policy-blocked path: needs profile exception
+                lines.push("[nono]".to_string());
                 lines.push(
-                    "[nono]   This path matched the sandbox, but the access mode was not granted."
+                    "[nono] To override, create a user profile with policy.override_deny:"
                         .to_string(),
                 );
-                if let Some(cap) = self.closest_covering_capability(&denial.path, denial.access) {
+                lines.push("[nono]   ~/.config/nono/profiles/<name>.json:".to_string());
+                lines.push("[nono]   {".to_string());
+                lines.push(format!(
+                    "[nono]     \"policy\": {{ \"override_deny\": [\"{}\"] }},",
+                    denial.path.display()
+                ));
+                lines.push(format!(
+                    "[nono]     \"filesystem\": {{ \"{}\": [\"{}\"] }}",
+                    access_str(denial.access),
+                    denial.path.display()
+                ));
+                lines.push("[nono]   }".to_string());
+            } else if let Some(ref flag) = expl.suggested_flag {
+                lines.push(format!("[nono]   Fix: {}", flag));
+            }
+        } else {
+            // No policy explanation available — fall back to generic guidance
+            match denial.reason {
+                DenialReason::PolicyBlocked => {
+                    lines.push("[nono]   Blocked by security policy.".to_string());
+                }
+                DenialReason::InsufficientAccess => {
+                    if let Some(cap) = self.closest_covering_capability(&denial.path, denial.access)
+                    {
+                        lines.push(format!(
+                            "[nono]   Closest grant: {} ({}, {})",
+                            cap.resolved.display(),
+                            access_str(cap.access),
+                            cap.source,
+                        ));
+                    }
                     lines.push(format!(
-                        "[nono]   Closest grant: {} ({}, {})",
-                        cap.resolved.display(),
-                        access_str(cap.access),
-                        cap.source,
+                        "[nono]   Fix: {}",
+                        suggested_flag_for_path(&denial.path, denial.access)
                     ));
                 }
-                lines.push(format!(
-                    "[nono]   Try: {}",
-                    suggested_flag_for_path(&denial.path, denial.access)
-                ));
-                self.format_primary_follow_up(lines, denial.path.as_path(), denial.access);
-            }
-            DenialReason::UserDenied => {
-                lines.push("[nono]   This access was declined at the prompt.".to_string());
-                lines.push(
-                    "[nono]   Re-run and approve the prompt, or pre-grant the path with the suggested flag."
-                        .to_string(),
-                );
-                lines.push(format!(
-                    "[nono]   Try: {}",
-                    suggested_flag_for_path(&denial.path, denial.access)
-                ));
-                self.format_primary_follow_up(lines, denial.path.as_path(), denial.access);
-            }
-            DenialReason::RateLimited => {
-                lines.push(
-                    "[nono]   This path was denied after too many approval requests.".to_string(),
-                );
-                lines.push(format!(
-                    "[nono]   Try: {}",
-                    suggested_flag_for_path(&denial.path, denial.access)
-                ));
-                self.format_primary_follow_up(lines, denial.path.as_path(), denial.access);
-            }
-            DenialReason::BackendError => {
-                lines.push(
-                    "[nono]   The approval backend failed before this access could be granted."
-                        .to_string(),
-                );
-                lines.push(format!(
-                    "[nono]   Try: {}",
-                    suggested_flag_for_path(&denial.path, denial.access)
-                ));
-                self.format_primary_follow_up(lines, denial.path.as_path(), denial.access);
+                DenialReason::UserDenied => {
+                    lines.push("[nono]   Access was declined at the prompt.".to_string());
+                    lines.push(format!(
+                        "[nono]   Fix: {}",
+                        suggested_flag_for_path(&denial.path, denial.access)
+                    ));
+                }
+                DenialReason::RateLimited => {
+                    lines.push("[nono]   Denied after too many approval requests.".to_string());
+                    lines.push(format!(
+                        "[nono]   Fix: {}",
+                        suggested_flag_for_path(&denial.path, denial.access)
+                    ));
+                }
+                DenialReason::BackendError => {
+                    lines.push("[nono]   Approval backend failed.".to_string());
+                    lines.push(format!(
+                        "[nono]   Fix: {}",
+                        suggested_flag_for_path(&denial.path, denial.access)
+                    ));
+                }
             }
         }
-    }
-
-    fn format_primary_follow_up(&self, lines: &mut Vec<String>, path: &Path, access: AccessMode) {
-        lines.push(format!(
-            "[nono]   Why: nono why --path {} --op {}",
-            path.display(),
-            why_op_str(access)
-        ));
-        if let Some(command) = self.format_command_for_learn() {
-            lines.push(format!("[nono]   Learn: nono learn -- {}", command));
-        } else {
-            lines.push("[nono]   Learn: nono learn -- <your command>".to_string());
-        }
-        lines.push(
-            "[nono]   Re-use the same --profile/--allow flags from the failing run.".to_string(),
-        );
     }
 
     fn format_grant_help(&self, lines: &mut Vec<String>) {
@@ -1626,19 +1631,137 @@ impl<'a> DiagnosticFormatter<'a> {
     }
 }
 
+/// Human-readable descriptions for commonly denied macOS mach services.
+fn describe_mach_service(service: &str) -> Option<&'static str> {
+    Some(match service {
+        s if s.starts_with("com.apple.security") || s == "com.apple.secd" => {
+            "Keychain / Security framework"
+        }
+        "com.apple.logd" => "System logging",
+        "com.apple.system.notification_center" | "com.apple.distributed_notifications" => {
+            "Distributed notifications"
+        }
+        "com.apple.CoreServices.coreservicesd" | "com.apple.lsd.mapdb" => "Launch Services",
+        s if s.starts_with("com.apple.windowserver") => "Window Server / GUI",
+        s if s.starts_with("com.apple.cfprefsd") => "Preferences (NSUserDefaults)",
+        s if s.starts_with("com.apple.pasteboard") => "Pasteboard / clipboard",
+        s if s.starts_with("com.apple.coreservices") => "Core Services",
+        _ => return None,
+    })
+}
+
+/// Format non-filesystem violations with human-readable service descriptions.
+fn format_non_fs_violations(lines: &mut Vec<String>, violations: &[&SandboxViolation]) {
+    for v in violations {
+        let desc = v.target.as_deref().and_then(describe_mach_service);
+        match (&v.target, desc) {
+            (Some(target), Some(description)) => {
+                lines.push(format!(
+                    "[nono]   {} ({}) — {}",
+                    v.operation, target, description
+                ));
+            }
+            (Some(target), None) => {
+                lines.push(format!("[nono]   {} ({})", v.operation, target));
+            }
+            (None, _) => {
+                lines.push(format!("[nono]   {}", v.operation));
+            }
+        }
+    }
+}
+
+/// Generate actionable guidance for non-filesystem violations.
+fn format_non_fs_guidance(lines: &mut Vec<String>, violations: &[&SandboxViolation]) {
+    let has_keychain = violations.iter().any(|v| {
+        v.target
+            .as_deref()
+            .is_some_and(|t| t.contains("SecurityServer") || t.contains("securityd"))
+    });
+
+    if has_keychain {
+        lines.push("[nono] Keychain access requires granting the login keychain path:".to_string());
+        lines.push("[nono]   --read ~/Library/Keychains/login.keychain-db".to_string());
+    }
+}
+
+/// Aggregate denial records by reason, deduplicating by path and merging access modes.
+fn aggregate_denials_from(denials: &[DenialRecord], reason: DenialReason) -> Vec<DenialRecord> {
+    let mut aggregated = std::collections::BTreeMap::<PathBuf, AccessMode>::new();
+
+    for denial in denials.iter().filter(|d| d.reason == reason) {
+        aggregated
+            .entry(denial.path.clone())
+            .and_modify(|existing| *existing = merge_access_modes(*existing, denial.access))
+            .or_insert(denial.access);
+    }
+
+    aggregated
+        .into_iter()
+        .map(|(path, access)| DenialRecord {
+            path,
+            access,
+            reason: reason.clone(),
+        })
+        .collect()
+}
+
+/// Map a Seatbelt operation name to an `AccessMode`.
+///
+/// Returns `None` for non-filesystem operations (e.g. `mach-lookup`,
+/// `signal`, `process-exec`) that cannot be expressed as path grants.
+pub fn seatbelt_operation_to_access(operation: &str) -> Option<AccessMode> {
+    match operation {
+        "file-read-data" | "file-read-metadata" | "file-read-xattr" => Some(AccessMode::Read),
+        "file-write-data" | "file-write-create" | "file-write-unlink" | "file-write-flags"
+        | "file-write-mode" | "file-write-owner" | "file-write-times" | "file-write-xattr" => {
+            Some(AccessMode::Write)
+        }
+        _ => None,
+    }
+}
+
+/// Convert `SandboxViolation`s with filesystem targets into `DenialRecord`s.
+///
+/// Non-filesystem violations (mach-lookup, signal, etc.) are returned
+/// separately since they can't be expressed as path grants.
+fn violations_to_denials(
+    violations: &[SandboxViolation],
+) -> (Vec<DenialRecord>, Vec<&SandboxViolation>) {
+    let mut denials = Vec::new();
+    let mut non_fs = Vec::new();
+    // Deduplicate: multiple operations on the same path merge into one denial
+    let mut seen = std::collections::BTreeMap::<PathBuf, AccessMode>::new();
+
+    for v in violations {
+        if let (Some(access), Some(target)) =
+            (seatbelt_operation_to_access(&v.operation), &v.target)
+        {
+            let path = PathBuf::from(target);
+            seen.entry(path)
+                .and_modify(|existing| *existing = merge_access_modes(*existing, access))
+                .or_insert(access);
+        } else {
+            non_fs.push(v);
+        }
+    }
+
+    for (path, access) in seen {
+        denials.push(DenialRecord {
+            path,
+            access,
+            reason: DenialReason::PolicyBlocked,
+        });
+    }
+
+    (denials, non_fs)
+}
+
 fn access_str(access: AccessMode) -> &'static str {
     match access {
         AccessMode::Read => "read",
         AccessMode::Write => "write",
         AccessMode::ReadWrite => "read+write",
-    }
-}
-
-fn why_op_str(access: AccessMode) -> &'static str {
-    match access {
-        AccessMode::Read => "read",
-        AccessMode::Write => "write",
-        AccessMode::ReadWrite => "readwrite",
     }
 }
 
@@ -1783,8 +1906,7 @@ mod tests {
         let formatter = DiagnosticFormatter::new(&caps);
         let output = formatter.format_footer(1);
 
-        assert!(output.contains("The command failed."));
-        assert!(output.contains("(exit code 1)"));
+        assert!(output.contains("Command exited with code 1."));
     }
 
     #[test]
@@ -1793,7 +1915,7 @@ mod tests {
         let formatter = DiagnosticFormatter::new(&caps);
         let output = formatter.format_footer(1);
 
-        assert!(output.contains("may be due to"));
+        assert!(!output.contains("may be due to sandbox restrictions"));
         assert!(!output.contains("was caused by"));
     }
 
@@ -1803,7 +1925,7 @@ mod tests {
         let formatter = DiagnosticFormatter::new(&caps);
         let output = formatter.format_footer(1);
 
-        assert!(output.starts_with("nono diagnostic\n───────────────\n"));
+        assert!(!output.starts_with("nono diagnostic"));
         assert!(!output.contains("[nono]"));
     }
 
@@ -2133,36 +2255,11 @@ mod tests {
             non_sandbox_failure: None,
         });
         let output = formatter.format_footer(1);
-        let denial_idx = match output.find("Likely sandbox denial:") {
-            Some(idx) => idx,
-            None => panic!("missing primary denial block: {output}"),
-        };
-        let why_idx = match output.find(&format!(
-            "Why: nono why --path {} --op read",
-            denied.display()
-        )) {
-            Some(idx) => idx,
-            None => panic!("missing why follow-up: {output}"),
-        };
-        let learn_idx = match output.find("Learn: nono learn -- <your command>") {
-            Some(idx) => idx,
-            None => panic!("missing learn follow-up: {output}"),
-        };
-        let policy_idx = match output.find("Sandbox policy:") {
-            Some(idx) => idx,
-            None => panic!("missing sandbox policy section: {output}"),
-        };
 
-        assert!(output.contains("Likely sandbox denial:"));
+        assert!(output.contains("Sandbox denial:"));
         assert!(output.contains(&denied.display().to_string()));
         assert!(output.contains(&format!("Try: --read-file {}", denied.display())));
-        assert!(output.contains(&format!(
-            "Why: nono why --path {} --op read",
-            denied.display()
-        )));
-        assert!(denial_idx < policy_idx);
-        assert!(why_idx < policy_idx);
-        assert!(learn_idx < policy_idx);
+        assert!(output.contains("Sandbox policy:"));
     }
 
     #[test]
@@ -2187,12 +2284,8 @@ mod tests {
         assert!(output.contains(
             "The command succeeded, but stderr showed a likely sandbox-related access issue."
         ));
-        assert!(output.contains("Likely sandbox denial:"));
+        assert!(output.contains("Sandbox denial:"));
         assert!(output.contains(&denied.display().to_string()));
-        assert!(output.contains(&format!(
-            "Why: nono why --path {} --op read",
-            denied.display()
-        )));
     }
 
     #[test]
@@ -2295,7 +2388,6 @@ mod tests {
 
         assert!(output.contains(&format!("{} (write)", denied.display())));
         assert!(output.contains(&format!("--write {}", canonical_temp.display())));
-        assert!(output.contains(&format!("nono why --path {} --op write", denied.display())));
         assert!(!output.contains(&format!("--allow-file {}", denied.display())));
     }
 
@@ -2332,10 +2424,6 @@ mod tests {
         assert!(output.contains("current working directory is read-only"));
         assert!(output.contains(&format!("Try: --write {}", cwd.display())));
         assert!(!output.contains("Try: --allow-cwd"));
-        assert!(output.contains(&format!(
-            "Why: nono why --path {} --op write",
-            denied.display()
-        )));
     }
 
     #[test]
@@ -2385,15 +2473,15 @@ mod tests {
 
     #[test]
     fn test_supervised_no_denials_no_extensions() {
-        // macOS supervised mode: no capability expansion, Seatbelt blocks silently.
-        // Should fall back to policy summary + --allow suggestions.
         let caps = make_test_caps(); // extensions_enabled defaults to false
         let formatter = DiagnosticFormatter::new(&caps).with_mode(DiagnosticMode::Supervised);
         let output = formatter.format_footer(1);
 
-        assert!(output.contains("Sandbox policy:"));
+        assert!(output.contains("No path denials were observed during this session."));
+        assert!(output.contains("The failure may be unrelated to sandbox restrictions."));
+        assert!(output.contains("To grant additional access, re-run with:"));
         assert!(output.contains("--allow <path>"));
-        assert!(!output.contains("No access requests were denied"));
+        assert!(!output.contains("Sandbox policy:"));
     }
 
     #[test]
@@ -2424,35 +2512,12 @@ mod tests {
                 non_sandbox_failure: None,
             });
         let output = formatter.format_footer(1);
-        let denial_idx = match output.find("Likely sandbox denial:") {
-            Some(idx) => idx,
-            None => panic!("missing primary denial block: {output}"),
-        };
-        let why_idx = match output.find(&format!(
-            "Why: nono why --path {} --op read",
-            denied.display()
-        )) {
-            Some(idx) => idx,
-            None => panic!("missing why follow-up: {output}"),
-        };
-        let learn_idx = match output.find("Learn: nono learn -- <your command>") {
-            Some(idx) => idx,
-            None => panic!("missing learn follow-up: {output}"),
-        };
-        let policy_idx = match output.find("Sandbox policy:") {
-            Some(idx) => idx,
-            None => panic!("missing sandbox policy section: {output}"),
-        };
 
-        assert!(output.contains("Likely sandbox denial:"));
+        assert!(output.contains("Sandbox denial:"));
         assert!(output.contains(&format!("Try: --read-file {}", denied.display())));
-        assert!(output.contains(&format!(
-            "Why: nono why --path {} --op read",
-            denied.display()
-        )));
-        assert!(denial_idx < policy_idx);
-        assert!(why_idx < policy_idx);
-        assert!(learn_idx < policy_idx);
+        assert!(output.contains("No path denials were observed during this session."));
+        assert!(output.contains("Discover paths: nono learn -- <your command>"));
+        assert!(!output.contains("Sandbox policy:"));
     }
 
     #[test]
@@ -2479,12 +2544,9 @@ mod tests {
         assert!(output.contains(
             "The command succeeded, but stderr showed a likely sandbox-related access issue."
         ));
-        assert!(output.contains("Likely sandbox denial:"));
+        assert!(output.contains("Sandbox denial:"));
         assert!(output.contains(&denied.display().to_string()));
-        assert!(output.contains(&format!(
-            "Why: nono why --path {} --op read",
-            denied.display()
-        )));
+        assert!(output.contains("Discover paths: nono learn -- <your command>"));
     }
 
     #[test]
@@ -2501,22 +2563,13 @@ mod tests {
                 non_sandbox_failure: None,
             });
         let output = formatter.format_footer(1);
-        let missing_idx = match output.find("Missing path:") {
-            Some(idx) => idx,
-            None => panic!("missing path block missing: {output}"),
-        };
-        let policy_idx = match output.find("Sandbox policy:") {
-            Some(idx) => idx,
-            None => panic!("policy block missing: {output}"),
-        };
 
         assert!(
             output.contains("The command failed, but this does not look like a sandbox denial.")
         );
         assert!(output.contains(&missing.display().to_string()));
-        assert!(missing_idx < policy_idx);
-        assert!(!output.contains("To grant additional access, re-run with:"));
-        assert!(!output.contains("Why: nono why"));
+        assert!(output.contains("To grant additional access, re-run with:"));
+        assert!(output.contains("Query policy: nono why --path <path> --op <read|write|readwrite>"));
     }
 
     #[test]
@@ -2544,22 +2597,20 @@ mod tests {
         );
         assert!(output.contains("Application error:"));
         assert!(output.contains("EEXIST: file already exists"));
-        assert!(!output.contains("To grant additional access, re-run with:"));
-        assert!(!output.contains("Why: nono why"));
+        assert!(output.contains("To grant additional access, re-run with:"));
+        assert!(output.contains("Discover paths: nono learn -- <your command>"));
     }
 
     #[test]
     fn test_supervised_no_denials_extensions_active() {
-        // Linux supervised mode: seccomp-notify is active, empty denials means
-        // nothing was actually blocked.
         let mut caps = make_test_caps();
         caps.set_extensions_enabled(true);
         let formatter = DiagnosticFormatter::new(&caps).with_mode(DiagnosticMode::Supervised);
         let output = formatter.format_footer(1);
 
-        assert!(output.contains("No access requests were denied"));
+        assert!(output.contains("No path denials were observed during this session."));
         assert!(output.contains("may be unrelated"));
-        assert!(!output.contains("--allow <path>"));
+        assert!(output.contains("--allow <path>"));
     }
 
     #[test]
@@ -2580,10 +2631,11 @@ mod tests {
             .with_sandbox_violations(&violations);
         let output = formatter.format_footer(1);
 
-        assert!(output.contains("Sandbox denied the following operations:"));
-        assert!(output.contains("file-read-data  /Users/alice/.ssh/id_rsa"));
-        assert!(output.contains("mach-lookup  com.apple.logd"));
-        assert!(!output.contains("Sandbox policy:"));
+        assert!(output.contains("Sandbox denial:"));
+        assert!(output.contains("/Users/alice/.ssh/id_rsa (read)"));
+        assert!(output.contains("Also blocked (system services):"));
+        assert!(output.contains("mach-lookup (com.apple.logd)"));
+        assert!(output.contains("System logging"));
     }
 
     #[test]
@@ -2600,7 +2652,7 @@ mod tests {
         let output = formatter.format_footer(1);
 
         assert!(output.contains("/etc/shadow"));
-        assert!(output.contains("blocked by security policy"));
+        assert!(output.contains("Blocked by security policy"));
         assert!(!output.contains("--allow <path>"));
     }
 
@@ -2621,9 +2673,8 @@ mod tests {
         let output = formatter.format_footer(1);
 
         assert!(output.contains(&denied_path.display().to_string()));
-        assert!(output.contains("declined at the prompt"));
-        assert!(output.contains(&format!("--read-file {}", denied_path.display())));
-        assert!(output.contains("pre-grant the path"));
+        assert!(output.contains("Access was declined at the prompt."));
+        assert!(output.contains(&format!("Fix: --read-file {}", denied_path.display())));
     }
 
     #[test]
@@ -2649,7 +2700,8 @@ mod tests {
         assert!(output.contains("/etc/shadow"));
         assert!(output.contains("/home/user/data.txt"));
         assert!(output.contains("blocked by security policy"));
-        assert!(output.contains("granting the requested access mode"));
+        assert!(output.contains("access declined at the prompt"));
+        assert!(output.contains("Some paths are permanently restricted."));
     }
 
     #[test]
@@ -2672,9 +2724,8 @@ mod tests {
             .with_denials(&denials);
         let output = formatter.format_footer(1);
 
-        // The path should appear once in the primary diagnosis and once in the `why` follow-up.
         let count = output.matches("/etc/shadow").count();
-        assert_eq!(count, 2, "Path should be deduplicated");
+        assert_eq!(count, 1, "Path should be deduplicated");
         assert!(!output.contains("Denied paths during this session:"));
     }
 
@@ -2691,7 +2742,7 @@ mod tests {
             .with_denials(&denials);
         let output = formatter.format_footer(1);
 
-        assert!(output.starts_with("nono diagnostic\n───────────────\n"));
+        assert!(!output.starts_with("nono diagnostic"));
         assert!(!output.contains("[nono]"));
     }
 
@@ -2741,12 +2792,11 @@ mod tests {
             .with_denials(&denials);
         let output = formatter.format_footer(1);
 
-        assert!(output.contains("access mode was not granted"));
         assert!(output.contains(&format!(
             "Closest grant: {} (read, group:project_read)",
             dir_path.display()
         )));
-        assert!(output.contains(&format!("Try: --write-file {}", denied_path.display())));
+        assert!(output.contains(&format!("Fix: --write-file {}", denied_path.display())));
         assert!(!output.contains("Denied paths during this session:"));
     }
 
@@ -2778,7 +2828,6 @@ mod tests {
 
     #[test]
     fn test_protected_paths_shown_in_supervised_macos_fallback() {
-        // macOS supervised mode (no extensions) falls back to standard policy format
         let caps = make_test_caps(); // extensions_enabled defaults to false
         let protected = vec![PathBuf::from("/project/config.json")];
         let formatter = DiagnosticFormatter::new(&caps)
@@ -2786,8 +2835,7 @@ mod tests {
             .with_protected_paths(&protected);
         let output = formatter.format_footer(1);
 
-        assert!(output.contains("Write-protected"));
-        assert!(output.contains("config.json"));
+        assert!(!output.contains("Write-protected"));
     }
 
     // --- Exit code explanation tests ---
@@ -2895,9 +2943,7 @@ mod tests {
         let formatter = DiagnosticFormatter::new(&caps);
         let output = formatter.format_footer(1);
 
-        assert!(output.contains("The command failed."));
-        assert!(output.contains("(exit code 1)"));
-        assert!(output.contains("may be due to sandbox restrictions"));
+        assert!(output.contains("Command exited with code 1."));
     }
 
     #[test]
@@ -2951,8 +2997,6 @@ mod tests {
         let formatter = DiagnosticFormatter::new(&caps);
         let output = formatter.format_footer(42);
 
-        assert!(output.contains("The command failed."));
-        assert!(output.contains("(exit code 42)"));
-        assert!(output.contains("may be due to sandbox restrictions"));
+        assert!(output.contains("Command exited with code 42."));
     }
 }

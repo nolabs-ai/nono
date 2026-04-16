@@ -176,61 +176,52 @@ impl LearnResult {
             .map_err(|e| nono::NonoError::LearnError(format!("Failed to serialize JSON: {}", e)))
     }
 
-    /// Generate a complete profile JSON from discovered paths
-    ///
-    /// Creates a minimal profile with the discovered filesystem permissions,
-    /// working directory access, and network settings. The profile can be
-    /// saved directly to `~/.config/nono/profiles/<name>.json`.
-    pub fn to_profile(&self, name: &str, command: &str) -> Result<String> {
+    /// Generate a profile patch containing only learned filesystem grants.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub fn to_profile_patch(&self) -> Result<Profile> {
         let home = crate::config::validated_home()?;
         let home_path = std::path::Path::new(&home);
 
-        // Replace $HOME prefix with ~ for portability.
-        // Uses Path::starts_with() to avoid string prefix matching pitfalls.
-        let shorten = |p: &std::path::Path| -> String {
-            if p.starts_with(home_path) {
-                match p.strip_prefix(home_path) {
-                    Ok(relative) => format!("~/{}", relative.display()),
-                    Err(_) => p.display().to_string(),
-                }
+        let mut profile = Profile::default();
+        profile.filesystem.allow = shortened_paths(&self.readwrite_paths, home_path);
+        profile.filesystem.allow_file = shortened_paths(&self.readwrite_files, home_path);
+        profile.filesystem.read = shortened_paths(&self.read_paths, home_path);
+        profile.filesystem.read_file = shortened_paths(&self.read_files, home_path);
+        profile.filesystem.write = shortened_paths(&self.write_paths, home_path);
+        profile.filesystem.write_file = shortened_paths(&self.write_files, home_path);
+        profile.policy.override_deny = learned_override_deny_paths(self, home_path)?;
+
+        Ok(profile)
+    }
+
+    /// Generate a named profile from discovered paths.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub fn to_named_profile(
+        &self,
+        name: &str,
+        command: &str,
+        extends: Option<Vec<String>>,
+    ) -> Result<Profile> {
+        let mut profile = self.to_profile_patch()?;
+        let has_base = extends.is_some();
+        profile.extends = extends;
+        profile.meta = profile::ProfileMeta {
+            name: name.to_string(),
+            version: "1.0.0".to_string(),
+            description: Some(if has_base {
+                format!("Learned path additions for {}", command)
             } else {
-                p.display().to_string()
-            }
+                format!("Auto-generated profile for {}", command)
+            }),
+            author: None,
         };
 
-        let allow: Vec<String> = self.readwrite_paths.iter().map(|p| shorten(p)).collect();
-        let allow_file: Vec<String> = self.readwrite_files.iter().map(|p| shorten(p)).collect();
-        let read: Vec<String> = self.read_paths.iter().map(|p| shorten(p)).collect();
-        let read_file: Vec<String> = self.read_files.iter().map(|p| shorten(p)).collect();
-        let write: Vec<String> = self.write_paths.iter().map(|p| shorten(p)).collect();
-        let write_file: Vec<String> = self.write_files.iter().map(|p| shorten(p)).collect();
+        if !has_base {
+            profile.network.block = !self.has_network_activity();
+            profile.workdir.access = profile::WorkdirAccess::ReadWrite;
+        }
 
-        let has_network = self.has_network_activity();
-
-        let profile = serde_json::json!({
-            "meta": {
-                "name": name,
-                "version": "1.0.0",
-                "description": format!("Auto-generated profile for {}", command),
-            },
-            "filesystem": {
-                "allow": allow,
-                "read": read,
-                "write": write,
-                "allow_file": allow_file,
-                "read_file": read_file,
-                "write_file": write_file,
-            },
-            "network": {
-                "block": !has_network,
-            },
-            "workdir": {
-                "access": "readwrite",
-            },
-        });
-
-        serde_json::to_string_pretty(&profile)
-            .map_err(|e| nono::NonoError::LearnError(format!("Failed to serialize profile: {}", e)))
+        Ok(profile)
     }
 
     /// Format as human-readable summary with clear visual separation
@@ -353,6 +344,43 @@ fn push_fs_summary_section(
     for path in file_paths {
         lines.push(format!("  {} {}", file_flag, path.display()));
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn shortened_paths(paths: &BTreeSet<PathBuf>, home_path: &Path) -> Vec<String> {
+    paths
+        .iter()
+        .map(|path| crate::profile_save_runtime::shorten_path_for_profile(path, home_path))
+        .collect()
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn learned_override_deny_paths(result: &LearnResult, home_path: &Path) -> Result<Vec<String>> {
+    let mut override_deny = Vec::new();
+
+    for path in result
+        .readwrite_paths
+        .iter()
+        .chain(result.readwrite_files.iter())
+        .chain(result.read_paths.iter())
+        .chain(result.read_files.iter())
+        .chain(result.write_paths.iter())
+        .chain(result.write_files.iter())
+    {
+        let shortened = crate::profile_save_runtime::shorten_path_for_profile(path, home_path);
+        if crate::config::check_sensitive_path(&shortened)?.is_some()
+            && !override_deny.contains(&shortened)
+        {
+            override_deny.push(shortened);
+        }
+    }
+
+    Ok(override_deny)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn merge_learned_profile_patch(profile: &mut Profile, patch: &Profile) {
+    crate::profile_save_runtime::merge_profile_patch(profile, patch);
 }
 
 /// Format a single network connection summary line
@@ -2210,9 +2238,11 @@ mod tests {
         let mut result = LearnResult::new();
         result.write_files.insert(PathBuf::from("/tmp/output.txt"));
 
-        let profile = result.to_profile("touch", "touch")?;
-        assert!(profile.contains("\"write_file\""));
-        assert!(profile.contains("/tmp/output.txt"));
+        let profile = result.to_named_profile("touch", "touch", None)?;
+        let profile_json =
+            serde_json::to_string_pretty(&profile).expect("profile should serialize successfully");
+        assert!(profile_json.contains("\"write_file\""));
+        assert!(profile_json.contains("/tmp/output.txt"));
         Ok(())
     }
 

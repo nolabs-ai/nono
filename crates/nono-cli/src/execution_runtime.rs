@@ -319,6 +319,20 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         no_diagnostics: flags.no_diagnostics || flags.silent,
         threading,
         protected_paths: &trust.protected_paths,
+        profile_save_base: flags
+            .session
+            .profile_name
+            .as_deref()
+            .or(recommended_profile),
+        startup_timeout: if should_apply_startup_timeout(recommended_profile, &cmd_args) {
+            recommended_profile.map(|profile| exec_strategy::StartupTimeoutConfig {
+                timeout: PROFILE_HINT_STARTUP_TIMEOUT,
+                program: recommended_program_name,
+                profile,
+            })
+        } else {
+            None
+        },
         capability_elevation: flags.capability_elevation,
         #[cfg(target_os = "linux")]
         seccomp_proxy_fallback,

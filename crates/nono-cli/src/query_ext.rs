@@ -92,9 +92,8 @@ pub fn query_path(
             return Ok(QueryResult::Denied {
                 reason: "sensitive_path".to_string(),
                 details: Some(format!(
-                    "Path is blocked by security policy group '{}' ({}). It cannot be granted with path flags alone. If you need an exception, use a profile with policy.override_deny plus an explicit filesystem grant.",
-                    matched.group_name,
-                    matched.description
+                    "Blocked by policy group '{}': {} Use policy.override_deny to exempt specific paths when appropriate.",
+                    matched.group_name, matched.description
                 )),
                 policy_source: Some(format!("group:{}", matched.group_name)),
                 matching_capability: None,
@@ -172,8 +171,8 @@ pub fn query_path(
     Ok(QueryResult::Denied {
         reason: "path_not_granted".to_string(),
         details: Some(format!(
-            "Path is not covered by any capability. Add {} to grant the requested access.",
-            suggested_flag_for_path(&canonical, requested)
+            "Path is not covered by any capability: {}",
+            canonical.display()
         )),
         policy_source: None,
         matching_capability: None,
@@ -262,7 +261,7 @@ fn suggested_flag_for_path(path: &Path, requested: AccessMode) -> String {
     format!("{flag} {}", target.display())
 }
 
-fn suggested_flag_parts(path: &Path, requested: AccessMode) -> (&'static str, PathBuf) {
+pub(crate) fn suggested_flag_parts(path: &Path, requested: AccessMode) -> (&'static str, PathBuf) {
     let flag = if path.is_file() {
         match requested {
             AccessMode::Read => "--read-file",
@@ -280,7 +279,12 @@ fn suggested_flag_parts(path: &Path, requested: AccessMode) -> (&'static str, Pa
     let target = if path.exists() || path.is_dir() || path.parent().is_none() {
         path.to_path_buf()
     } else if let Some(parent) = path.parent() {
-        parent.to_path_buf()
+        // Never suggest granting access to the root filesystem
+        if parent == Path::new("/") {
+            path.to_path_buf()
+        } else {
+            parent.to_path_buf()
+        }
     } else {
         path.to_path_buf()
     };

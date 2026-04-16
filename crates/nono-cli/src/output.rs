@@ -319,6 +319,9 @@ pub fn print_applying_sandbox(silent: bool) {
 }
 
 /// Finish a pending inline status message before handing the terminal to a child UI.
+///
+/// Prints a delimiter line to visually separate the nono banner from the
+/// child's output.
 pub fn finish_status_line_for_handoff(silent: bool) {
     if silent {
         return;
@@ -326,12 +329,22 @@ pub fn finish_status_line_for_handoff(silent: bool) {
     if !take_pending_status_line() {
         return;
     }
+    let t = theme::current();
     let mut stderr = std::io::stderr();
     if stderr.is_terminal() {
         let _ = write!(stderr, "\r\n");
     } else {
         let _ = writeln!(stderr);
     }
+    let _ = writeln!(
+        stderr,
+        "  {}",
+        fg(
+            "────────────────────────────────────────────────────",
+            t.subtext
+        )
+    );
+    let _ = writeln!(stderr);
     let _ = stderr.flush();
 }
 

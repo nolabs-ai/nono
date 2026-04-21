@@ -81,8 +81,8 @@
     },
     "AccessMode": {
       "type": "string",
-      "enum": ["read", "write", "readwrite"],
-      "description": "Filesystem access mode. 'read' grants read-only access, 'write' grants write-only access, 'readwrite' grants both."
+      "enum": ["read", "write", "readwrite", "execute", "readexecute", "readwriteexecute"],
+      "description": "Filesystem access mode. 'read' grants read-only access, 'write' grants write-only access, 'readwrite' grants both. 'execute' grants execute-only, 'readexecute' grants read+execute, 'readwriteexecute' grants all three."
     },
     "FsEntryType": {
       "type": "string",

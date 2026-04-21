@@ -851,7 +851,7 @@ mod tests {
         caps.add_fs(FsCapability {
             original: PathBuf::from("/test"),
             resolved: PathBuf::from("/test"),
-            access: AccessMode::ReadWrite,
+            access: AccessMode::ReadWriteExecute,
             is_file: false,
             source: CapabilitySource::User,
         });
@@ -861,6 +861,24 @@ mod tests {
         assert!(profile.contains("(allow file-read* (subpath \"/test\"))"));
         assert!(profile.contains("(allow file-write* (subpath \"/test\"))"));
         assert!(profile.contains("(allow file-map-executable (subpath \"/test\"))"));
+    }
+
+    #[test]
+    fn test_readwrite_dir_does_not_grant_executable_mapping() {
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(FsCapability {
+            original: PathBuf::from("/test"),
+            resolved: PathBuf::from("/test"),
+            access: AccessMode::ReadWrite,
+            is_file: false,
+            source: CapabilitySource::User,
+        });
+
+        let profile = generate_profile(&caps).unwrap();
+
+        assert!(profile.contains("(allow file-read* (subpath \"/test\"))"));
+        assert!(profile.contains("(allow file-write* (subpath \"/test\"))"));
+        assert!(!profile.contains("file-map-executable"));
     }
 
     #[test]

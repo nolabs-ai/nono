@@ -33,5 +33,6 @@ pub mod tls_intercept;
 pub mod token;
 
 pub use config::ProxyConfig;
+pub use connect::ApprovalChannelRequest;
 pub use error::{ProxyError, Result};
-pub use server::{ProxyHandle, start};
+pub use server::{start, start_with_approval, ProxyHandle};

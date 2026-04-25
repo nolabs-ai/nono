@@ -100,6 +100,8 @@ pub enum SupervisorMessage {
     Request(CapabilityRequest),
     /// A request to open a URL in the user's browser (e.g., OAuth2 login)
     OpenUrl(UrlOpenRequest),
+    /// A request to approve network access to a blocked host
+    NetworkApproval(NetworkApprovalRequest),
 }
 
 /// IPC message envelope sent from supervisor to child.
@@ -121,4 +123,70 @@ pub enum SupervisorResponse {
         /// Error message if the open failed
         error: Option<String>,
     },
+    /// Response to a network approval request
+    NetworkDecision {
+        /// The request_id this responds to
+        request_id: String,
+        /// The network approval decision
+        decision: NetworkApprovalDecision,
+    },
+}
+
+/// Scope of a network approval — affects whether the host is persisted.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ApprovalScope {
+    /// Approved for a single request only; next request to the same host will prompt again.
+    Once,
+    /// Approved for this sandbox session only (in-memory)
+    Session,
+    /// Approved and persisted to config for future sessions
+    Persistent,
+}
+
+/// A request to approve network access to a host that is not on the allowlist.
+///
+/// Sent when the proxy intercepts a request to a blocked host and
+/// interactive approval is enabled (`--network-approval ask`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkApprovalRequest {
+    /// Unique identifier for this request
+    pub request_id: String,
+    /// The hostname being requested
+    pub host: String,
+    /// The port being requested (if known)
+    pub port: Option<u16>,
+    /// Human-readable reason for the request
+    pub reason: Option<String>,
+    /// PID of the requesting child process
+    pub child_pid: u32,
+    /// Session identifier for correlating requests within a single run
+    pub session_id: String,
+}
+
+/// The supervisor's response to a [`NetworkApprovalRequest`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum NetworkApprovalDecision {
+    /// Access was granted with the given scope.
+    Granted(ApprovalScope),
+    /// Access was denied with a reason.
+    Denied {
+        /// Why the request was denied
+        reason: String,
+    },
+    /// The approval request timed out without a decision.
+    Timeout,
+}
+
+impl NetworkApprovalDecision {
+    /// Returns true if access was granted (in any scope).
+    #[must_use]
+    pub fn is_granted(&self) -> bool {
+        matches!(self, NetworkApprovalDecision::Granted(_))
+    }
+
+    /// Returns true if access was denied.
+    #[must_use]
+    pub fn is_denied(&self) -> bool {
+        matches!(self, NetworkApprovalDecision::Denied { .. })
+    }
 }

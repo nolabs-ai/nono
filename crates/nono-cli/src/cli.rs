@@ -879,6 +879,18 @@ pub struct CompletionsArgs {
 // / `ProfileShowArgs` / `ProfileDiffArgs` / `ProfileValidateArgs` via
 // `pub use` aliases so there is no parallel set of types to keep in sync.
 
+#[derive(clap::ValueEnum, Clone, Debug, PartialEq, Eq)]
+pub enum PolicyShowFormat {
+    Profile,
+    Manifest,
+}
+
+#[derive(clap::ValueEnum, Clone, Debug, PartialEq, Eq)]
+pub enum NetworkApprovalArg {
+    /// Prompt via OS notification/dialog with action buttons
+    Ask,
+}
+
 #[derive(Parser, Debug)]
 #[command(disable_help_flag = true)]
 pub struct ProfileCmdArgs {
@@ -1178,6 +1190,20 @@ pub struct SandboxArgs {
         help_heading = "NETWORK"
     )]
     pub network_profile: Option<String>,
+
+    /// Prompt to approve blocked network hosts at runtime
+    ///
+    /// When set to "ask", an OS notification/dialog appears when the
+    /// sandboxed process requests a host not on the allowlist. The user
+    /// can choose: Allow once, Always allow (persists to profile),
+    /// Deny once, or Always deny (adds to reject_domain in profile).
+    #[arg(
+        long,
+        value_name = "MODE",
+        env = "NONO_NETWORK_APPROVAL",
+        help_heading = "NETWORK"
+    )]
+    pub network_approval: Option<NetworkApprovalArg>,
 
     /// Add a domain to the proxy allowlist (repeatable).
     /// Use a plain hostname for unrestricted access, or a URL with a path glob
@@ -1613,6 +1639,7 @@ impl From<WrapSandboxArgs> for SandboxArgs {
             block_net: args.block_net,
             allow_net: false,
             network_profile: None,
+            network_approval: None,
             allow_proxy: Vec::new(),
             allow_bind: args.allow_bind,
             allow_port: args.allow_port,

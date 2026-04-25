@@ -733,6 +733,10 @@ GHSA-27vp-2mmc-vmh3
 
 - *(network)* Support GitLab developer domains
 
+- *(network)* Add interactive network approval with Deny/Approve and duration (Once/Session/Always)
+
+- *(network)* Auto-deny blacklisted (reject_domain) hosts without prompting
+
 
 ### Testing
 

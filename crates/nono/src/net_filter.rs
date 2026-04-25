@@ -103,22 +103,47 @@ const DENY_HOSTS: &[&str] = &[
 
 /// A filter for host-based network access control.
 ///
-/// Supports exact domain match and wildcard subdomains (`*.googleapis.com`).
+/// Supports exact domain match and wildcard subdomains (`*.googleapis.com`)
+/// for both allow and deny lists.
 ///
 /// Cloud metadata endpoints are always denied and cannot be overridden.
 /// The allowlist determines which hosts are permitted; everything else
-/// is denied by default.
+/// is denied by default. The deny list (including user-specified
+/// `reject_domain` entries) takes priority over the allowlist.
 #[derive(Debug, Clone)]
 pub struct HostFilter {
     /// Allowed exact hosts (lowercased)
     allowed_hosts: Vec<String>,
     /// Allowed wildcard suffixes (e.g., ".googleapis.com", lowercased)
     allowed_suffixes: Vec<String>,
-    /// Hostnames that are always denied
+    /// Hostnames that are always denied (cloud metadata + user-specified)
     deny_hosts: Vec<String>,
+    /// Wildcard suffixes that are always denied (e.g., ".evil.com")
+    deny_suffixes: Vec<String>,
 }
 
 impl HostFilter {
+    /// Separate a list of domain patterns into exact hosts and wildcard suffixes.
+    ///
+    /// Entries starting with `*.` are treated as wildcard subdomain patterns
+    /// (the `*` is stripped, producing `.example.com`). All other entries are
+    /// exact matches. All values are lowercased.
+    fn split_patterns(patterns: &[String]) -> (Vec<String>, Vec<String>) {
+        let mut exact = Vec::new();
+        let mut suffixes = Vec::new();
+
+        for pattern in patterns {
+            let lower = pattern.to_lowercase();
+            if let Some(suffix) = lower.strip_prefix('*') {
+                suffixes.push(suffix.to_string());
+            } else {
+                exact.push(lower);
+            }
+        }
+
+        (exact, suffixes)
+    }
+
     /// Create a new host filter with the given allowed hosts.
     ///
     /// Cloud metadata endpoints are automatically denied and cannot be removed.
@@ -127,23 +152,29 @@ impl HostFilter {
     /// All other entries are exact matches. Matching is case-insensitive.
     #[must_use]
     pub fn new(allowed_hosts: &[String]) -> Self {
-        let mut exact = Vec::new();
-        let mut suffixes = Vec::new();
+        Self::new_with_reject(allowed_hosts, &[])
+    }
 
-        for host in allowed_hosts {
-            let lower = host.to_lowercase();
-            if let Some(suffix) = lower.strip_prefix('*') {
-                // *.example.com -> .example.com
-                suffixes.push(suffix.to_string());
-            } else {
-                exact.push(lower);
-            }
-        }
+    /// Create a new host filter with both allowed and rejected hosts.
+    ///
+    /// Like [`new()`](Self::new), but also accepts a list of rejected domain
+    /// patterns. Rejected hosts are always denied, even if they appear in the
+    /// allow list. Supports wildcards (`*.evil.com`) just like the allow list.
+    ///
+    /// Cloud metadata endpoints are automatically included in the deny list.
+    #[must_use]
+    pub fn new_with_reject(allowed_hosts: &[String], rejected_hosts: &[String]) -> Self {
+        let (exact_allowed, allowed_suffixes) = Self::split_patterns(allowed_hosts);
+        let (exact_denied, deny_suffixes) = Self::split_patterns(rejected_hosts);
+
+        let mut deny_hosts: Vec<String> = DENY_HOSTS.iter().map(|s| s.to_lowercase()).collect();
+        deny_hosts.extend(exact_denied);
 
         Self {
-            allowed_hosts: exact,
-            allowed_suffixes: suffixes,
-            deny_hosts: DENY_HOSTS.iter().map(|s| s.to_lowercase()).collect(),
+            allowed_hosts: exact_allowed,
+            allowed_suffixes,
+            deny_hosts,
+            deny_suffixes,
         }
     }
 
@@ -156,6 +187,26 @@ impl HostFilter {
             allowed_hosts: Vec::new(),
             allowed_suffixes: Vec::new(),
             deny_hosts: DENY_HOSTS.iter().map(|s| s.to_lowercase()).collect(),
+            deny_suffixes: Vec::new(),
+        }
+    }
+
+    /// Create a host filter that denies everything by default.
+    ///
+    /// Unlike [`allow_all()`](Self::allow_all), no host is permitted unless
+    /// explicitly added via [`add_host()`](Self::add_host) or
+    /// [`add_suffix()`](Self::add_suffix). Cloud metadata endpoints remain
+    /// unconditionally denied.
+    ///
+    /// This is used for runtime approval filters where the filter starts
+    /// empty and only approved hosts are added dynamically.
+    #[must_use]
+    pub fn deny_all() -> Self {
+        Self {
+            allowed_hosts: vec!["__deny_all_sentinel__.invalid".to_string()],
+            allowed_suffixes: Vec::new(),
+            deny_hosts: DENY_HOSTS.iter().map(|s| s.to_lowercase()).collect(),
+            deny_suffixes: Vec::new(),
         }
     }
 
@@ -168,46 +219,56 @@ impl HostFilter {
     ///
     /// # Check Order
     ///
-    /// 1. Deny hosts (exact match against cloud metadata hostnames)
-    /// 2. Link-local IP check (resolved IPs in 169.254.0.0/16 or fe80::/10)
-    /// 3. Allowlist (exact host match, then wildcard subdomain match)
-    /// 4. Default deny (if not in allowlist and allowlist is non-empty)
+    /// 1. Deny hosts (exact match against deny list)
+    /// 2. Deny suffixes (wildcard match, e.g. `*.evil.com`)
+    /// 3. Link-local IP check (resolved IPs in 169.254.0.0/16 or fe80::/10)
+    /// 4. Allowlist (exact host match, then wildcard subdomain match)
+    /// 5. Default deny (if not in allowlist and allowlist is non-empty)
     #[must_use]
     pub fn check_host(&self, host: &str, resolved_ips: &[IpAddr]) -> FilterResult {
         let lower_host = host.to_lowercase();
 
-        // 1. Check deny hosts
+        // 1. Check deny hosts (exact match)
         if self.deny_hosts.contains(&lower_host) {
             return FilterResult::DenyHost {
                 host: host.to_string(),
             };
         }
 
-        // 2. Check resolved IPs for link-local addresses (cloud metadata protection)
+        // 2. Check deny suffixes (wildcard match)
+        for suffix in &self.deny_suffixes {
+            if lower_host.ends_with(suffix.as_str()) && lower_host.len() > suffix.len() {
+                return FilterResult::DenyHost {
+                    host: host.to_string(),
+                };
+            }
+        }
+
+        // 3. Check resolved IPs for link-local addresses (cloud metadata protection)
         for ip in resolved_ips {
             if is_link_local(ip) {
                 return FilterResult::DenyLinkLocal { ip: *ip };
             }
         }
 
-        // 3. If no allowlist is configured (allow_all mode), allow
+        // 4. If no allowlist is configured (allow_all mode), allow
         if self.allowed_hosts.is_empty() && self.allowed_suffixes.is_empty() {
             return FilterResult::Allow;
         }
 
-        // 4. Check exact host match
+        // 5. Check exact host match
         if self.allowed_hosts.contains(&lower_host) {
             return FilterResult::Allow;
         }
 
-        // 5. Check wildcard subdomain match
+        // 6. Check wildcard subdomain match
         for suffix in &self.allowed_suffixes {
             if lower_host.ends_with(suffix.as_str()) && lower_host.len() > suffix.len() {
                 return FilterResult::Allow;
             }
         }
 
-        // 6. Not in allowlist
+        // 7. Not in allowlist
         FilterResult::DenyNotAllowed {
             host: host.to_string(),
         }
@@ -219,6 +280,120 @@ impl HostFilter {
         self.allowed_hosts
             .len()
             .saturating_add(self.allowed_suffixes.len())
+    }
+
+    /// Add an exact host to the allowlist at runtime.
+    ///
+    /// The host is lowercased before insertion. If it already exists,
+    /// this is a no-op. Cloud metadata hosts in the deny list are
+    /// rejected — they can never be allowed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NonoError`](crate::NonoError) if the host is empty
+    /// or is a cloud metadata endpoint.
+    pub fn add_host(&mut self, host: &str) -> crate::Result<()> {
+        let lower = host.to_lowercase();
+        if lower.is_empty() {
+            return Err(crate::NonoError::InvalidConfig {
+                reason: "host must not be empty".to_string(),
+            });
+        }
+        if self.deny_hosts.contains(&lower) {
+            return Err(crate::NonoError::InvalidConfig {
+                reason: format!("host {host} is a cloud metadata endpoint and cannot be allowed"),
+            });
+        }
+        if !self.allowed_hosts.contains(&lower) {
+            self.allowed_hosts.push(lower);
+        }
+        Ok(())
+    }
+
+    /// Add a wildcard subdomain suffix to the allowlist at runtime.
+    ///
+    /// The suffix should be in the form `.example.com` (leading dot).
+    /// If it starts with `*`, the `*` is stripped. If it already exists,
+    /// this is a no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NonoError`](crate::NonoError) if the suffix is empty.
+    pub fn add_suffix(&mut self, suffix: &str) -> crate::Result<()> {
+        let lower = suffix.to_lowercase();
+        let normalized = lower.strip_prefix('*').unwrap_or(&lower);
+        if normalized.is_empty() {
+            return Err(crate::NonoError::InvalidConfig {
+                reason: "suffix must not be empty".to_string(),
+            });
+        }
+        let suffix_str = if normalized.starts_with('.') {
+            normalized.to_string()
+        } else {
+            format!(".{normalized}")
+        };
+        if !self.allowed_suffixes.contains(&suffix_str) {
+            self.allowed_suffixes.push(suffix_str);
+        }
+        Ok(())
+    }
+
+    /// Add a host to the deny list at runtime.
+    ///
+    /// The host is lowercased before insertion. If it already exists
+    /// in the deny list, this is a no-op. Cloud metadata hosts are
+    /// always present and cannot be removed — adding them again is
+    /// a no-op.
+    ///
+    /// Once denied, a host cannot pass the filter regardless of the
+    /// allowlist. This is useful for "always deny" decisions from the
+    /// network approval flow.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NonoError`](crate::NonoError) if the host is empty.
+    pub fn add_deny_host(&mut self, host: &str) -> crate::Result<()> {
+        let lower = host.to_lowercase();
+        if lower.is_empty() {
+            return Err(crate::NonoError::InvalidConfig {
+                reason: "host must not be empty".to_string(),
+            });
+        }
+        if !self.deny_hosts.contains(&lower) {
+            self.deny_hosts.push(lower);
+        }
+        Ok(())
+    }
+
+    /// Add a wildcard subdomain suffix to the deny list at runtime.
+    ///
+    /// The suffix should be in the form `.example.com` (leading dot).
+    /// If it starts with `*`, the `*` is stripped. If it already exists,
+    /// this is a no-op.
+    ///
+    /// Once denied, any subdomain matching the suffix cannot pass the
+    /// filter regardless of the allowlist.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NonoError`](crate::NonoError) if the suffix is empty.
+    pub fn add_deny_suffix(&mut self, suffix: &str) -> crate::Result<()> {
+        let lower = suffix.to_lowercase();
+        let normalized = lower.strip_prefix('*').unwrap_or(&lower);
+        if normalized.is_empty() {
+            return Err(crate::NonoError::InvalidConfig {
+                reason: "suffix must not be empty".to_string(),
+            });
+        }
+        let suffix_str = if normalized.starts_with('.') {
+            normalized.to_string()
+        } else {
+            format!(".{normalized}")
+        };
+        if !self.deny_suffixes.contains(&suffix_str) {
+            self.deny_suffixes.push(suffix_str);
+        }
+        Ok(())
     }
 }
 
@@ -299,6 +474,30 @@ mod tests {
         let filter = HostFilter::allow_all();
         let result = filter.check_host("any-host.example.com", &public_ip());
         assert!(result.is_allowed());
+    }
+
+    #[test]
+    fn test_deny_all_mode() {
+        let filter = HostFilter::deny_all();
+        let result = filter.check_host("any-host.example.com", &public_ip());
+        assert!(!result.is_allowed());
+        assert!(matches!(result, FilterResult::DenyNotAllowed { .. }));
+    }
+
+    #[test]
+    fn test_deny_all_then_add_host() {
+        let mut filter = HostFilter::deny_all();
+        assert!(!filter
+            .check_host("approved.example.com", &public_ip())
+            .is_allowed());
+
+        filter.add_host("approved.example.com").expect("add_host");
+        assert!(filter
+            .check_host("approved.example.com", &public_ip())
+            .is_allowed());
+        assert!(!filter
+            .check_host("other.example.com", &public_ip())
+            .is_allowed());
     }
 
     #[test]
@@ -433,5 +632,82 @@ mod tests {
             ip: IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254)),
         };
         assert!(link_local.reason().contains("link-local"));
+    }
+
+    #[test]
+    fn test_new_with_reject_exact() {
+        let filter =
+            HostFilter::new_with_reject(&["api.openai.com".to_string()], &["evil.com".to_string()]);
+        assert!(filter
+            .check_host("api.openai.com", &public_ip())
+            .is_allowed());
+        assert!(!filter.check_host("evil.com", &public_ip()).is_allowed());
+        assert!(matches!(
+            filter.check_host("evil.com", &public_ip()),
+            FilterResult::DenyHost { .. }
+        ));
+    }
+
+    #[test]
+    fn test_reject_overrides_allow() {
+        let filter =
+            HostFilter::new_with_reject(&["evil.com".to_string()], &["evil.com".to_string()]);
+        assert!(
+            !filter.check_host("evil.com", &public_ip()).is_allowed(),
+            "deny should override allow for same host"
+        );
+    }
+
+    #[test]
+    fn test_reject_wildcard_overrides_allow() {
+        let filter =
+            HostFilter::new_with_reject(&["api.evil.com".to_string()], &["*.evil.com".to_string()]);
+        assert!(
+            !filter.check_host("api.evil.com", &public_ip()).is_allowed(),
+            "deny wildcard should override allow for subdomain"
+        );
+    }
+
+    #[test]
+    fn test_add_deny_host() {
+        let mut filter = HostFilter::new(&["api.openai.com".to_string(), "evil.com".to_string()]);
+        filter.add_deny_host("evil.com").expect("add_deny_host");
+        assert!(
+            !filter.check_host("evil.com", &public_ip()).is_allowed(),
+            "deny should override allow"
+        );
+    }
+
+    #[test]
+    fn test_add_deny_suffix() {
+        let mut filter =
+            HostFilter::new(&["api.example.com".to_string(), "track.evil.com".to_string()]);
+        filter
+            .add_deny_suffix("*.evil.com")
+            .expect("add_deny_suffix");
+        assert!(
+            !filter
+                .check_host("track.evil.com", &public_ip())
+                .is_allowed(),
+            "deny suffix should override allow"
+        );
+        assert!(
+            !filter
+                .check_host("other.evil.com", &public_ip())
+                .is_allowed(),
+            "deny suffix should match other subdomains"
+        );
+    }
+
+    #[test]
+    fn test_deny_suffix_does_not_match_bare_domain() {
+        let mut filter = HostFilter::new(&["evil.com".to_string()]);
+        filter
+            .add_deny_suffix("*.evil.com")
+            .expect("add_deny_suffix");
+        assert!(
+            filter.check_host("evil.com", &public_ip()).is_allowed(),
+            "deny suffix should not match bare domain"
+        );
     }
 }

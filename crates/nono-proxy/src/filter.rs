@@ -6,8 +6,11 @@
 
 use crate::error::Result;
 use nono::net_filter::{FilterResult, HostFilter};
+use nono::RuntimeHostFilter;
 use std::net::{IpAddr, SocketAddr};
 use tracing::debug;
+
+pub const NO_IPS: &[IpAddr] = &[];
 
 /// Result of a filter check including resolved socket addresses.
 ///
@@ -33,6 +36,14 @@ impl ProxyFilter {
     pub fn new(allowed_hosts: &[String]) -> Self {
         Self {
             inner: HostFilter::new(allowed_hosts),
+        }
+    }
+
+    /// Create a new proxy filter with both allowed and rejected hosts.
+    #[must_use]
+    pub fn new_with_reject(allowed_hosts: &[String], rejected_hosts: &[String]) -> Self {
+        Self {
+            inner: HostFilter::new_with_reject(allowed_hosts, rejected_hosts),
         }
     }
 
@@ -96,6 +107,104 @@ impl ProxyFilter {
     }
 }
 
+/// Async wrapper around [`RuntimeHostFilter`] for runtime-mutable filtering.
+///
+/// Like [`ProxyFilter`] but backed by a [`RuntimeHostFilter`] that can be
+/// extended at runtime (e.g., when the user approves a new host via
+/// an OS notification). DNS resolution is still performed on each check.
+#[derive(Debug, Clone)]
+pub struct RuntimeProxyFilter {
+    inner: RuntimeHostFilter,
+}
+
+impl RuntimeProxyFilter {
+    /// Create a new runtime proxy filter from a [`RuntimeHostFilter`].
+    #[must_use]
+    pub fn new(inner: RuntimeHostFilter) -> Self {
+        Self { inner }
+    }
+
+    /// Check a host against the filter with async DNS resolution.
+    pub async fn check_host(&self, host: &str, port: u16) -> Result<CheckResult> {
+        let addr_str = format!("{}:{}", host, port);
+        let resolved: Vec<SocketAddr> = match tokio::net::lookup_host(&addr_str).await {
+            Ok(addrs) => addrs.collect(),
+            Err(e) => {
+                debug!("DNS resolution failed for {}: {}", host, e);
+                Vec::new()
+            }
+        };
+
+        let resolved_ips: Vec<IpAddr> = resolved.iter().map(|a| a.ip()).collect();
+        let result = self.inner.check_host(host, &resolved_ips);
+
+        let addrs = if result.is_allowed() {
+            resolved
+        } else {
+            Vec::new()
+        };
+
+        Ok(CheckResult {
+            result,
+            resolved_addrs: addrs,
+        })
+    }
+
+    /// Resolve a hostname to socket addresses via DNS without filter check.
+    ///
+    /// Used for "once" approvals where the host is not in the runtime filter
+    /// but we still need resolved addresses to connect.
+    pub async fn resolve_host(&self, host: &str, port: u16) -> Result<Vec<SocketAddr>> {
+        let addr_str = format!("{}:{}", host, port);
+        let result = tokio::net::lookup_host(&addr_str).await;
+        match result {
+            Ok(addrs) => Ok(addrs.collect()),
+            Err(e) => {
+                debug!("DNS resolution failed for {}: {}", host, e);
+                Ok(Vec::new())
+            }
+        }
+    }
+
+    /// Check a host with pre-resolved IPs (no DNS lookup).
+    #[must_use]
+    pub fn check_host_with_ips(&self, host: &str, resolved_ips: &[IpAddr]) -> FilterResult {
+        self.inner.check_host(host, resolved_ips)
+    }
+
+    /// Add a host to the runtime allowlist.
+    pub fn add_host(&self, host: &str) -> nono::Result<()> {
+        self.inner.add_host(host)
+    }
+
+    /// Add a wildcard suffix to the runtime allowlist.
+    pub fn add_suffix(&self, suffix: &str) -> nono::Result<()> {
+        self.inner.add_suffix(suffix)
+    }
+
+    /// Add a host to the runtime deny list.
+    ///
+    /// Once denied, the host cannot pass the filter regardless of the
+    /// allowlist. Used for "always deny" decisions.
+    pub fn add_deny_host(&self, host: &str) -> nono::Result<()> {
+        self.inner.add_deny_host(host)
+    }
+
+    /// Add a wildcard suffix to the runtime deny list.
+    ///
+    /// Once denied, any subdomain matching the suffix cannot pass the
+    /// filter regardless of the allowlist.
+    pub fn add_deny_suffix(&self, suffix: &str) -> nono::Result<()> {
+        self.inner.add_deny_suffix(suffix)
+    }
+
+    /// Get a reference to the underlying [`RuntimeHostFilter`].
+    #[must_use]
+    pub fn inner(&self) -> &RuntimeHostFilter {
+        &self.inner
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -136,5 +245,85 @@ mod tests {
         let link_local = vec![IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254))];
         let result = filter.check_host_with_ips("evil.com", &link_local);
         assert!(!result.is_allowed());
+    }
+
+    #[test]
+    fn test_proxy_filter_rejected_hosts_deny_even_if_allow_all() {
+        let filter = ProxyFilter::new_with_reject(&[], &["evil.com".to_string()]);
+        let public_ip = vec![IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))];
+        let result = filter.check_host_with_ips("evil.com", &public_ip);
+        assert!(matches!(result, FilterResult::DenyHost { .. }));
+    }
+
+    #[test]
+    fn test_proxy_filter_rejected_hosts_take_priority_over_allowed() {
+        let filter = ProxyFilter::new_with_reject(
+            &["api.openai.com".to_string(), "evil.com".to_string()],
+            &["evil.com".to_string()],
+        );
+        let public_ip = vec![IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))];
+        let result = filter.check_host_with_ips("evil.com", &public_ip);
+        assert!(matches!(result, FilterResult::DenyHost { .. }));
+
+        let result = filter.check_host_with_ips("api.openai.com", &public_ip);
+        assert!(result.is_allowed());
+    }
+
+    #[test]
+    fn test_proxy_filter_rejected_hosts_allow_non_blacklisted() {
+        let filter = ProxyFilter::new_with_reject(&[], &["evil.com".to_string()]);
+        let public_ip = vec![IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))];
+        let result = filter.check_host_with_ips("safe.com", &public_ip);
+        assert!(result.is_allowed());
+    }
+
+    #[test]
+    fn test_runtime_proxy_filter_add_deny_host_overrides_allow() {
+        let inner = RuntimeHostFilter::new(HostFilter::new(&[
+            "api.openai.com".to_string(),
+            "evil.com".to_string(),
+        ]));
+        let filter = RuntimeProxyFilter::new(inner);
+        let public_ip = vec![IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))];
+
+        let result = filter.check_host_with_ips("evil.com", &public_ip);
+        assert!(result.is_allowed());
+
+        filter.add_deny_host("evil.com").unwrap();
+
+        let result = filter.check_host_with_ips("evil.com", &public_ip);
+        assert!(matches!(result, FilterResult::DenyHost { .. }));
+
+        let result = filter.check_host_with_ips("api.openai.com", &public_ip);
+        assert!(result.is_allowed());
+    }
+
+    #[test]
+    fn test_runtime_proxy_filter_deny_suffix_blocks_subdomains() {
+        let inner = RuntimeHostFilter::new(HostFilter::allow_all());
+        let filter = RuntimeProxyFilter::new(inner);
+        let public_ip = vec![IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))];
+
+        filter.add_deny_suffix(".cloud2.influxdata.com").unwrap();
+
+        let result =
+            filter.check_host_with_ips("eu-central-1-1.aws.cloud2.influxdata.com", &public_ip);
+        assert!(matches!(result, FilterResult::DenyHost { .. }));
+
+        let result = filter.check_host_with_ips("influxdata.com", &public_ip);
+        assert!(result.is_allowed());
+    }
+
+    #[test]
+    fn test_runtime_proxy_filter_once_scope_host_not_in_filter() {
+        let inner = RuntimeHostFilter::new(HostFilter::new(&["allowed.com".to_string()]));
+        let filter = RuntimeProxyFilter::new(inner);
+        let public_ip = vec![IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))];
+
+        let result = filter.check_host_with_ips("once-approved.com", &public_ip);
+        assert!(!result.is_allowed());
+
+        let result = filter.check_host_with_ips("allowed.com", &public_ip);
+        assert!(result.is_allowed());
     }
 }

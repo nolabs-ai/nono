@@ -67,7 +67,7 @@ keyring = { version = "3", optional = true, default-features = false }
 
 # Keyless (Sigstore/Fulcio/Rekor) signing for instruction file attestation
 sigstore-sign = "0.8.0"
-tokio = { version = "1", features = ["rt"] }
+tokio = { version = "1", features = ["rt", "sync", "time", "rt-multi-thread"] }
 
 ureq = { version = "3", features = ["platform-verifier"] }
 semver = "1"
@@ -95,6 +95,7 @@ dns-lookup = "2"
 # Pure-Rust Secret Service backend (zbus) — no libdbus link. Keep in sync with
 # the keyring features in crates/nono/Cargo.toml.
 keyring = { version = "3", features = ["async-secret-service", "crypto-rust", "async-io"], optional = true, default-features = false }
+notify-rust = "4"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 nix = { workspace = true, features = ["process", "signal", "fs", "user", "term"] }
@@ -110,6 +111,7 @@ serde.workspace = true
 [dev-dependencies]
 jsonschema = "0.46"
 proptest = "1"
+futures = "0.3"
 
 [lints]
 workspace = true

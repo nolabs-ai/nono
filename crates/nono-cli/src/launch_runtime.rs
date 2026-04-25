@@ -75,6 +75,7 @@ pub(crate) struct ProxyLaunchOptions {
     pub(crate) active: bool,
     pub(crate) network_profile: Option<String>,
     pub(crate) allow_domain: Vec<profile::AllowDomainEntry>,
+    pub(crate) reject_domain: Vec<String>,
     pub(crate) credentials: Vec<String>,
     pub(crate) custom_credentials: HashMap<String, profile::CustomCredentialDef>,
     pub(crate) upstream_proxy: Option<String>,
@@ -87,6 +88,8 @@ pub(crate) struct ProxyLaunchOptions {
     #[cfg(target_os = "macos")]
     pub(crate) trust_proxy_ca: bool,
     pub(crate) proxy_ca_validity: Option<std::time::Duration>,
+    pub(crate) network_approval_mode: crate::network_approval::NetworkApprovalMode,
+    pub(crate) network_approval_timeout_secs: u64,
 }
 
 #[derive(Clone)]

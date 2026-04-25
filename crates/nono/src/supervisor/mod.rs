@@ -31,8 +31,8 @@ pub mod types;
 
 pub use socket::{SupervisorListener, SupervisorSocket};
 pub use types::{
-    ApprovalDecision, AuditEntry, CapabilityRequest, SupervisorMessage, SupervisorResponse,
-    UrlOpenRequest,
+    ApprovalDecision, ApprovalScope, AuditEntry, CapabilityRequest, NetworkApprovalDecision,
+    NetworkApprovalRequest, SupervisorMessage, SupervisorResponse, UrlOpenRequest,
 };
 
 use crate::error::Result;
@@ -88,6 +88,30 @@ pub trait ApprovalBackend: Send + Sync {
     /// Returns an error if the backend encounters a communication failure
     /// or internal error. The supervisor should treat errors as denials.
     fn request_capability(&self, request: &CapabilityRequest) -> Result<ApprovalDecision>;
+
+    /// Decide whether to grant or deny a network access request.
+    ///
+    /// Called when the proxy intercepts a request to a host not on the
+    /// allowlist and interactive approval is enabled. The backend may
+    /// show an OS notification, terminal prompt, or other UI to ask
+    /// the user.
+    ///
+    /// The default implementation denies all network requests, which
+    /// preserves the existing behavior when approval is not configured.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the backend encounters a communication failure
+    /// or internal error. The supervisor should treat errors as denials.
+    fn request_network_approval(
+        &self,
+        request: &NetworkApprovalRequest,
+    ) -> Result<NetworkApprovalDecision> {
+        let _ = request;
+        Ok(NetworkApprovalDecision::Denied {
+            reason: "network approval not configured".to_string(),
+        })
+    }
 
     /// Human-readable name for this backend (used in audit logs).
     fn backend_name(&self) -> &str;

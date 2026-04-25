@@ -122,6 +122,8 @@ pub struct HostFilter {
     deny_suffixes: Vec<String>,
     /// When true, an empty allowlist denies instead of allowing.
     strict: bool,
+    /// Wildcard suffixes that are always denied (e.g., ".evil.com")
+    deny_suffixes: Vec<String>,
 }
 
 impl HostFilter {
@@ -220,6 +222,27 @@ impl HostFilter {
             deny_hosts: DENY_HOSTS.iter().map(|s| s.to_lowercase()).collect(),
             deny_suffixes: Vec::new(),
             strict: false,
+            deny_suffixes: Vec::new(),
+        }
+    }
+
+    /// Create a host filter that denies everything by default.
+    ///
+    /// Unlike [`allow_all()`](Self::allow_all), no host is permitted unless
+    /// explicitly added via [`add_host()`](Self::add_host) or
+    /// [`add_suffix()`](Self::add_suffix). Cloud metadata endpoints remain
+    /// unconditionally denied.
+    ///
+    /// This is used for runtime approval filters where the filter starts
+    /// empty and only approved hosts are added dynamically.
+    #[must_use]
+    pub fn deny_all() -> Self {
+        Self {
+            allowed_hosts: vec!["__deny_all_sentinel__.invalid".to_string()],
+            allowed_suffixes: Vec::new(),
+            deny_hosts: DENY_HOSTS.iter().map(|s| s.to_lowercase()).collect(),
+            deny_suffixes: Vec::new(),
+            strict: true,
         }
     }
 
@@ -265,6 +288,7 @@ impl HostFilter {
         }
 
         // 4. Empty allowlist: deny when strict, allow otherwise.
+        // If no allowlist is configured (allow_all mode), allow.
         if self.allowed_hosts.is_empty() && self.allowed_suffixes.is_empty() {
             if self.strict {
                 return FilterResult::DenyNotAllowed {
@@ -751,5 +775,82 @@ mod tests {
         let filter = HostFilter::new(&[]);
         let result = filter.check_host("example.com", &public_ip());
         assert!(matches!(result, FilterResult::Allow));
+    }
+
+    #[test]
+    fn test_new_with_reject_exact() {
+        let filter =
+            HostFilter::new_with_reject(&["api.openai.com".to_string()], &["evil.com".to_string()]);
+        assert!(filter
+            .check_host("api.openai.com", &public_ip())
+            .is_allowed());
+        assert!(!filter.check_host("evil.com", &public_ip()).is_allowed());
+        assert!(matches!(
+            filter.check_host("evil.com", &public_ip()),
+            FilterResult::DenyHost { .. }
+        ));
+    }
+
+    #[test]
+    fn test_reject_overrides_allow() {
+        let filter =
+            HostFilter::new_with_reject(&["evil.com".to_string()], &["evil.com".to_string()]);
+        assert!(
+            !filter.check_host("evil.com", &public_ip()).is_allowed(),
+            "deny should override allow for same host"
+        );
+    }
+
+    #[test]
+    fn test_reject_wildcard_overrides_allow() {
+        let filter =
+            HostFilter::new_with_reject(&["api.evil.com".to_string()], &["*.evil.com".to_string()]);
+        assert!(
+            !filter.check_host("api.evil.com", &public_ip()).is_allowed(),
+            "deny wildcard should override allow for subdomain"
+        );
+    }
+
+    #[test]
+    fn test_add_deny_host() {
+        let mut filter = HostFilter::new(&["api.openai.com".to_string(), "evil.com".to_string()]);
+        filter.add_deny_host("evil.com").expect("add_deny_host");
+        assert!(
+            !filter.check_host("evil.com", &public_ip()).is_allowed(),
+            "deny should override allow"
+        );
+    }
+
+    #[test]
+    fn test_add_deny_suffix() {
+        let mut filter =
+            HostFilter::new(&["api.example.com".to_string(), "track.evil.com".to_string()]);
+        filter
+            .add_deny_suffix("*.evil.com")
+            .expect("add_deny_suffix");
+        assert!(
+            !filter
+                .check_host("track.evil.com", &public_ip())
+                .is_allowed(),
+            "deny suffix should override allow"
+        );
+        assert!(
+            !filter
+                .check_host("other.evil.com", &public_ip())
+                .is_allowed(),
+            "deny suffix should match other subdomains"
+        );
+    }
+
+    #[test]
+    fn test_deny_suffix_does_not_match_bare_domain() {
+        let mut filter = HostFilter::new(&["evil.com".to_string()]);
+        filter
+            .add_deny_suffix("*.evil.com")
+            .expect("add_deny_suffix");
+        assert!(
+            filter.check_host("evil.com", &public_ip()).is_allowed(),
+            "deny suffix should not match bare domain"
+        );
     }
 }

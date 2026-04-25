@@ -450,6 +450,8 @@ pub(crate) struct PreparedSandbox {
     /// through because a CLI proxy flag (e.g. `--credential`) may later
     /// override `caps` to `ProxyOnly`, losing the original intent.
     pub(crate) network_block_requested: bool,
+    pub(crate) profile_network_approval_mode: Option<String>,
+    pub(crate) profile_network_approval_timeout_secs: Option<u64>,
 }
 
 fn resolved_workdir(args: &SandboxArgs) -> PathBuf {
@@ -1085,6 +1087,8 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
                 profile_network_approval_timeout_secs: None,
                 set_vars: None,
                 network_block_requested: args.block_net,
+                profile_network_approval_mode: None,
+                profile_network_approval_timeout_secs: None,
             },
             &[],
             args,
@@ -1124,6 +1128,8 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         network_approval_mode: profile_network_approval_mode,
         network_approval_timeout_secs: profile_network_approval_timeout_secs,
         set_vars: profile_set_vars,
+        network_approval_mode: profile_network_approval_mode,
+        network_approval_timeout_secs: profile_network_approval_timeout_secs,
     } = prepared_profile;
 
     let session_hooks = loaded_profile
@@ -1408,6 +1414,8 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
             profile_network_approval_timeout_secs,
             set_vars: profile_set_vars,
             network_block_requested,
+            profile_network_approval_mode,
+            profile_network_approval_timeout_secs,
         },
         &blocked_grants,
         args,

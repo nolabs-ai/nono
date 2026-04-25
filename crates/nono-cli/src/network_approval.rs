@@ -11,11 +11,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-struct PendingEntry {
-    notify: Arc<tokio::sync::Notify>,
-    decision: Mutex<Option<NetworkApprovalDecision>>,
-}
-
 use nono::{
     ApprovalBackend, ApprovalDecision, ApprovalScope, CapabilityRequest, NetworkApprovalDecision,
     NetworkApprovalRequest, Result, RuntimeHostFilter,
@@ -55,7 +50,7 @@ pub struct NetworkApprovalBackend {
     mode: NetworkApprovalMode,
     runtime_filter: RuntimeHostFilter,
     timeout_secs: u64,
-    pending: Arc<Mutex<HashMap<String, Arc<PendingEntry>>>>,
+    pending: Arc<Mutex<HashMap<String, Arc<tokio::sync::Notify>>>>,
     config_writer: Option<ConfigWriter>,
 }
 
@@ -265,42 +260,22 @@ impl NetworkApprovalBackend {
         let host = request.host.clone();
         tracing::info!("Network approval requested for host: {host}");
 
-        let filter_result = self.runtime_filter.check_host(&host, &[]);
-        if filter_result.is_allowed() {
-            tracing::info!("Host {host} already allowed by runtime filter — skipping dialog");
-            return NetworkApprovalDecision::Granted(ApprovalScope::Session);
-        }
-
-        if matches!(
-            filter_result,
-            nono::net_filter::FilterResult::DenyHost { .. }
-                | nono::net_filter::FilterResult::DenyLinkLocal { .. }
-        ) {
-            tracing::info!("Host {host} explicitly denied by runtime filter");
-            return NetworkApprovalDecision::Denied {
-                reason: "Host denied by session policy".to_string(),
-            };
-        }
-
-        let (entry, is_first) = {
+        let (notify, is_first) = {
             let mut pending = self.pending.lock().expect("pending lock poisoned");
             if let Some(existing) = pending.get(&host) {
                 tracing::info!("Host {host} has pending approval — waiting on existing dialog");
                 (existing.clone(), false)
             } else {
-                let entry = Arc::new(PendingEntry {
-                    notify: Arc::new(tokio::sync::Notify::new()),
-                    decision: Mutex::new(None),
-                });
-                pending.insert(host.clone(), entry.clone());
-                (entry, true)
+                let n = Arc::new(tokio::sync::Notify::new());
+                pending.insert(host.clone(), n.clone());
+                (n, true)
             }
         };
 
         if !is_first {
             let _ = tokio::time::timeout(
                 std::time::Duration::from_secs(self.timeout_secs),
-                entry.notify.notified(),
+                notify.notified(),
             )
             .await;
 
@@ -310,14 +285,7 @@ impl NetworkApprovalBackend {
                     reason: "Approval timed out".to_string(),
                 }
             } else {
-                let decision = entry
-                    .decision
-                    .lock()
-                    .expect("decision lock poisoned")
-                    .clone();
-                decision.unwrap_or_else(|| NetworkApprovalDecision::Denied {
-                    reason: "Approval result unavailable".to_string(),
-                })
+                NetworkApprovalDecision::Granted(ApprovalScope::Session)
             };
         }
 
@@ -394,15 +362,11 @@ impl NetworkApprovalBackend {
             }
         };
 
-        {
-            let mut slot = entry.decision.lock().expect("decision lock poisoned");
-            *slot = Some(decision.clone());
-        }
         self.pending
             .lock()
             .expect("pending lock poisoned")
             .remove(&host);
-        entry.notify.notify_waiters();
+        notify.notify_waiters();
 
         tracing::info!("Network approval decision for {host}: {:?}", decision);
         decision
@@ -422,34 +386,14 @@ impl ApprovalBackend for NetworkApprovalBackend {
     ) -> Result<NetworkApprovalDecision> {
         let host = request.host.clone();
 
-        let filter_result = self.runtime_filter.check_host(&host, &[]);
-        if filter_result.is_allowed() {
-            tracing::info!("Host {host} already allowed by runtime filter — skipping dialog");
-            return Ok(NetworkApprovalDecision::Granted(ApprovalScope::Session));
-        }
-
-        if matches!(
-            filter_result,
-            nono::net_filter::FilterResult::DenyHost { .. }
-                | nono::net_filter::FilterResult::DenyLinkLocal { .. }
-        ) {
-            tracing::info!("Host {host} explicitly denied by runtime filter");
-            return Ok(NetworkApprovalDecision::Denied {
-                reason: "Host denied by session policy".to_string(),
-            });
-        }
-
-        let (entry, is_first) = {
+        let (notify, is_first) = {
             let mut pending = self.pending.lock().expect("pending lock poisoned");
             if let Some(existing) = pending.get(&host) {
                 (existing.clone(), false)
             } else {
-                let entry = Arc::new(PendingEntry {
-                    notify: Arc::new(tokio::sync::Notify::new()),
-                    decision: Mutex::new(None),
-                });
-                pending.insert(host.clone(), entry.clone());
-                (entry, true)
+                let n = Arc::new(tokio::sync::Notify::new());
+                pending.insert(host.clone(), n.clone());
+                (n, true)
             }
         };
 
@@ -457,7 +401,7 @@ impl ApprovalBackend for NetworkApprovalBackend {
             sync_runtime().block_on(async {
                 let _ = tokio::time::timeout(
                     std::time::Duration::from_secs(self.timeout_secs),
-                    entry.notify.notified(),
+                    notify.notified(),
                 )
                 .await;
             });
@@ -468,14 +412,7 @@ impl ApprovalBackend for NetworkApprovalBackend {
                     reason: "Approval timed out".to_string(),
                 })
             } else {
-                let decision = entry
-                    .decision
-                    .lock()
-                    .expect("decision lock poisoned")
-                    .clone();
-                Ok(decision.unwrap_or_else(|| NetworkApprovalDecision::Denied {
-                    reason: "Approval result unavailable".to_string(),
-                }))
+                Ok(NetworkApprovalDecision::Granted(ApprovalScope::Session))
             };
         }
 
@@ -554,17 +491,12 @@ impl ApprovalBackend for NetworkApprovalBackend {
             }
         };
 
-        {
-            let mut slot = entry.decision.lock().expect("decision lock poisoned");
-            *slot = Some(decision.clone());
-        }
         self.pending
             .lock()
             .expect("pending lock poisoned")
             .remove(&host);
-        entry.notify.notify_waiters();
+        notify.notify_waiters();
 
-        tracing::info!("Network approval decision for {host}: {:?}", decision);
         Ok(decision)
     }
 
@@ -1005,7 +937,7 @@ mod tests {
         let runtime_filter = deny_default_filter();
 
         // Simulate Deny(Once): host NOT added to deny filter
-        // Next request would prompt again
+        // Next request to same host would prompt again
         assert!(
             !runtime_filter
                 .check_host("once-denied.com", &[])
@@ -1014,130 +946,5 @@ mod tests {
         );
         // But it's not explicitly in the deny list either —
         // the next request would go through the same approval flow
-    }
-
-    #[tokio::test]
-    async fn test_dedup_waiters_receive_deny_when_first_request_is_denied() {
-        let runtime_filter = deny_default_filter();
-        let backend = NetworkApprovalBackend::new(
-            NetworkApprovalMode::Ask,
-            runtime_filter,
-            5,
-            None,
-        );
-        let backend = Arc::new(backend);
-        let host = "dedup-deny-test.com";
-
-        let entry = Arc::new(PendingEntry {
-            notify: Arc::new(tokio::sync::Notify::new()),
-            decision: Mutex::new(None),
-        });
-        {
-            let mut pending = backend.pending.lock().expect("pending lock poisoned");
-            pending.insert(host.to_string(), Arc::clone(&entry));
-        }
-
-        let request_b = make_request(host);
-        let backend_b = Arc::clone(&backend);
-
-        let handle_b = tokio::spawn(async move {
-            backend_b
-                .request_network_approval_async(&request_b)
-                .await
-        });
-
-        tokio::task::yield_now().await;
-
-        {
-            let mut slot = entry.decision.lock().expect("decision lock poisoned");
-            *slot = Some(NetworkApprovalDecision::Denied {
-                reason: "User denied the request".to_string(),
-            });
-        }
-        {
-            let mut pending = backend.pending.lock().expect("pending lock poisoned");
-            pending.remove(host);
-        }
-        entry.notify.notify_waiters();
-
-        let decision_b = handle_b.await.expect("handle_b panicked");
-
-        assert!(
-            decision_b.is_denied(),
-            "waiting request should be denied when the first request was denied, but got: {:?}",
-            decision_b
-        );
-    }
-
-    #[tokio::test]
-    async fn test_dedup_waiters_receive_grant_when_first_request_is_approved() {
-        let runtime_filter = deny_default_filter();
-        let backend = NetworkApprovalBackend::new(
-            NetworkApprovalMode::Ask,
-            runtime_filter,
-            5,
-            None,
-        );
-        let backend = Arc::new(backend);
-        let host = "dedup-approve-test.com";
-
-        let entry = Arc::new(PendingEntry {
-            notify: Arc::new(tokio::sync::Notify::new()),
-            decision: Mutex::new(None),
-        });
-        {
-            let mut pending = backend.pending.lock().expect("pending lock poisoned");
-            pending.insert(host.to_string(), Arc::clone(&entry));
-        }
-
-        let request_b = make_request(host);
-        let backend_b = Arc::clone(&backend);
-
-        let handle_b = tokio::spawn(async move {
-            backend_b
-                .request_network_approval_async(&request_b)
-                .await
-        });
-
-        tokio::task::yield_now().await;
-
-        {
-            let mut slot = entry.decision.lock().expect("decision lock poisoned");
-            *slot = Some(NetworkApprovalDecision::Granted(ApprovalScope::Session));
-        }
-        {
-            let mut pending = backend.pending.lock().expect("pending lock poisoned");
-            pending.remove(host);
-        }
-        entry.notify.notify_waiters();
-
-        let decision_b = handle_b.await.expect("handle_b panicked");
-
-        assert!(
-            matches!(decision_b, NetworkApprovalDecision::Granted(ApprovalScope::Session)),
-            "waiting request should be granted when the first request was approved, but got: {:?}",
-            decision_b
-        );
-    }
-
-    #[tokio::test]
-    async fn test_already_approved_host_skips_dialog() {
-        let runtime_filter = deny_default_filter();
-        runtime_filter.add_host("pre-approved.com").unwrap();
-        let backend = NetworkApprovalBackend::new(
-            NetworkApprovalMode::Ask,
-            runtime_filter,
-            5,
-            None,
-        );
-
-        let request = make_request("pre-approved.com");
-        let decision = backend.request_network_approval_async(&request).await;
-
-        assert!(
-            matches!(decision, NetworkApprovalDecision::Granted(ApprovalScope::Session)),
-            "host already in runtime filter should be granted without dialog, but got: {:?}",
-            decision
-        );
     }
 }

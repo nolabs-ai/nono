@@ -187,9 +187,6 @@ impl NetworkApprovalDecision {
     /// Returns true if access was denied.
     #[must_use]
     pub fn is_denied(&self) -> bool {
-        matches!(
-            self,
-            NetworkApprovalDecision::Denied { .. } | NetworkApprovalDecision::Timeout
-        )
+        matches!(self, NetworkApprovalDecision::Denied { .. })
     }
 }

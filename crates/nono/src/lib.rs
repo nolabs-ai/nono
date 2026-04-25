@@ -95,7 +95,7 @@ pub use scrub::{
 pub use state::SandboxState;
 pub use supervisor::{
     ApprovalBackend, ApprovalDecision, ApprovalScope, CapabilityRequest, NetworkApprovalDecision,
-    NetworkApprovalRequest, SupervisorListener, SupervisorSocket, UrlOpenRequest,
+    NetworkApprovalRequest, SupervisorSocket, UrlOpenRequest,
 };
 pub use trust::{
     Enforcement, IncludePatterns, Publisher, SignerIdentity, TrustPolicy, VerificationOutcome,

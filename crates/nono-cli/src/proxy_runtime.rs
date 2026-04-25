@@ -164,6 +164,9 @@ pub(crate) fn prepare_proxy_launch_options(
         None
     };
 
+    let approval_mode =
+        resolve_network_approval_mode(args, prepared.profile_network_approval_mode.as_deref());
+
     let opts = ProxyLaunchOptions {
         domain_filter,
         endpoint_filter,
@@ -179,6 +182,10 @@ pub(crate) fn prepare_proxy_launch_options(
         ),
         profile_name: args.profile.clone(),
         network_block: prepared.network_block_requested,
+        network_approval_mode: approval_mode,
+        network_approval_timeout_secs: resolve_approval_timeout_secs(
+            prepared.profile_network_approval_timeout_secs,
+        ),
     };
 
     // Infra-only flags make no sense without an activating proxy feature.
@@ -404,6 +411,11 @@ pub(crate) fn build_proxy_config_from_flags(
     let mut proxy_config =
         network_policy::build_proxy_config(&resolved, &expanded_allow_domain, reject_domain);
     proxy_config.strict_filter = proxy.network_block;
+    if let Some(ref domain_filter) = proxy.domain_filter {
+        if !domain_filter.reject_domain.is_empty() {
+            proxy_config.rejected_hosts = domain_filter.reject_domain.clone();
+        }
+    }
 
     if let Some(ref upstream) = proxy.upstream_proxy {
         proxy_config.external_proxy = Some(nono_proxy::config::ExternalProxyConfig {
@@ -481,15 +493,10 @@ pub(crate) fn start_proxy_runtime(
 
             let (tx, mut rx) = tokio::sync::mpsc::channel::<nono_proxy::ApprovalChannelRequest>(16);
 
-            let config_writer = match proxy
-                .domain_filter
-                .as_ref()
-                .and_then(|d| d.network_profile.as_deref())
-                .or_else(|| proxy.profile_name.as_deref())
-            {
-                Some(name) => Some(crate::network_approval::ConfigWriter::new(name)),
-                None => Some(crate::network_approval::ConfigWriter::new("default")),
-            };
+            let config_writer = proxy
+                .network_profile
+                .as_deref()
+                .map(crate::network_approval::ConfigWriter::new);
 
             let backend = NetworkApprovalBackend::new(
                 proxy.network_approval_mode,

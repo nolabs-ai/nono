@@ -51,6 +51,12 @@ pub struct ProxyConfig {
     #[serde(default)]
     pub strict_filter: bool,
 
+    /// Rejected hosts for CONNECT mode (exact match + wildcards).
+    /// Takes priority over `allowed_hosts`. Supports wildcards
+    /// (`*.evil.com`).
+    #[serde(default)]
+    pub rejected_hosts: Vec<String>,
+
     /// Reverse proxy credential routes.
     #[serde(default)]
     pub routes: Vec<RouteConfig>,
@@ -157,6 +163,7 @@ impl Default for ProxyConfig {
             allowed_hosts: Vec::new(),
             rejected_hosts: Vec::new(),
             strict_filter: false,
+            rejected_hosts: Vec::new(),
             routes: Vec::new(),
             external_proxy: None,
             direct_connect_ports: Vec::new(),

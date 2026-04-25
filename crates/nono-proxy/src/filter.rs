@@ -55,6 +55,15 @@ impl ProxyFilter {
         }
     }
 
+    /// Create a new proxy filter with both allowed and rejected hosts.
+    #[must_use]
+    pub fn new_with_reject(allowed_hosts: &[String], rejected_hosts: &[String]) -> Self {
+        Self {
+            inner: HostFilter::new_with_reject(allowed_hosts, rejected_hosts),
+        }
+        }
+    }
+
     /// Create a filter that allows all hosts (except cloud metadata).
     #[must_use]
     pub fn allow_all() -> Self {

@@ -490,6 +490,7 @@ pub async fn start_with_approval(
     let loaded_routes = credential_store.loaded_prefixes();
 
     // Build filter. Strict mode treats an empty allowlist as deny-all.
+    // With rejected hosts, use new_with_reject for deny-list support.
     let filter = if config.strict_filter {
         ProxyFilter::new_strict(&config.allowed_hosts)
     } else if config.allowed_hosts.is_empty() && config.rejected_hosts.is_empty() {

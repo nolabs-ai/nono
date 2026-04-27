@@ -90,10 +90,14 @@ pub fn validate_requested_path_against_protected_roots(
     // Fork divergence: retain resolve_path (Windows `\\?\` verbatim-prefix
     // normalization) — semantically equivalent to nono::try_canonicalize on
     // non-Windows; superset on Windows for safe component-wise comparison.
+    //
+    // Perf (upstream be384ee4): protected_roots are already resolved at
+    // construction time via ProtectedRoots::from_defaults → resolve_path,
+    // so iterate them directly instead of re-resolving per call. Fork's
+    // path_starts_with handles component-wise comparison safely on Windows.
     let requested_path = resolve_path(path);
-    let resolved_roots: Vec<PathBuf> = protected_roots.iter().map(|p| resolve_path(p)).collect();
 
-    for protected_root in &resolved_roots {
+    for protected_root in protected_roots {
         let inside_protected = path_starts_with(&requested_path, protected_root);
         let parent_of_protected = !is_file && path_starts_with(protected_root, &requested_path);
         if inside_protected || parent_of_protected {
@@ -120,10 +124,12 @@ pub fn overlapping_protected_root(
     // Fork divergence: retain resolve_path (Windows `\\?\` verbatim-prefix
     // normalization) — semantically equivalent to nono::try_canonicalize on
     // non-Windows; superset on Windows for safe component-wise comparison.
+    //
+    // Perf (upstream be384ee4): protected_roots are already resolved at
+    // construction time, so iterate them directly.
     let requested_path = resolve_path(path);
-    let resolved_roots: Vec<PathBuf> = protected_roots.iter().map(|p| resolve_path(p)).collect();
 
-    for protected_root in &resolved_roots {
+    for protected_root in protected_roots {
         let inside_protected = path_starts_with(&requested_path, protected_root);
         let parent_of_protected = !is_file && path_starts_with(protected_root, &requested_path);
         if inside_protected || parent_of_protected {

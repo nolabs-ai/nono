@@ -16,7 +16,14 @@ pub fn try_canonicalize(path: &Path) -> PathBuf {
     if let Ok(canonical) = path.canonicalize() {
         return canonical;
     }
+    try_canonicalize_ancestor_walk(path)
+}
 
+/// Ancestor-walk canonicalization, skipping the initial `canonicalize()` attempt.
+///
+/// Use this when `std::fs::canonicalize` has already been tried and failed,
+/// to avoid a redundant syscall.
+pub(crate) fn try_canonicalize_ancestor_walk(path: &Path) -> PathBuf {
     let mut remaining = Vec::new();
     let mut current = path.to_path_buf();
     loop {

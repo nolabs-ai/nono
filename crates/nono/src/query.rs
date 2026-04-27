@@ -4,7 +4,7 @@
 //! by a given capability set, without actually applying the sandbox.
 
 use crate::capability::{AccessMode, CapabilitySet};
-use crate::path::try_canonicalize;
+use crate::path::try_canonicalize_ancestor_walk;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -78,7 +78,9 @@ impl QueryContext {
         let query_path: &Path = if let Some(ref c) = full_canonical {
             c.as_path()
         } else {
-            query_path_buf = try_canonicalize(path);
+            // canonicalize already failed above; skip the redundant retry
+            // and go straight to the ancestor-walk fallback.
+            query_path_buf = try_canonicalize_ancestor_walk(path);
             query_path_buf.as_path()
         };
 

@@ -65,6 +65,11 @@ pub fn validate_caps_against_protected_roots(
     caps: &CapabilitySet,
     protected_roots: &[PathBuf],
 ) -> Result<()> {
+    // Fork divergence (upstream ee70922d): roots are already resolved at
+    // construction time via ProtectedRoots::from_defaults → resolve_path
+    // (which handles Windows verbatim-prefix normalization), so the
+    // upstream's pre-canonicalize-once pattern is unnecessary here. The
+    // fork's `resolve_path` is the Plan 22 Windows long-path defense.
     for cap in caps.fs_capabilities() {
         validate_requested_path_against_protected_roots(
             &cap.resolved,

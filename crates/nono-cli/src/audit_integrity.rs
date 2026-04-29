@@ -25,6 +25,30 @@ const HASH_ALGORITHM: &str = "sha256";
 #[allow(dead_code)] // consumed by audit verify in Task 6
 pub(crate) const MERKLE_SCHEME_LABEL: &str = "alpha";
 
+/// Windows-AIPC reject-stage discriminator (Phase 23 D-02).
+///
+/// Encodes whether a Denied capability decision was rejected BEFORE the
+/// approval backend was consulted (`BeforePrompt` — Event/Mutex/JobObject
+/// pre-broker mask gate at supervisor.rs:1891) or AFTER approval was
+/// granted but the per-kind broker helper failed (`AfterPrompt` — Pipe
+/// direction, Socket privileged-port + role allowlist; surfaced via the
+/// G-04 broker-failure flip at supervisor.rs:1997).
+///
+/// `None` (the absent-field case in NDJSON) covers: Approved decisions,
+/// the three pre-stage early rejections (duplicate replay, invalid token,
+/// unknown HandleKind), and all non-Windows entries.
+///
+/// Currently observable for exactly two HandleKinds: Pipe and Socket.
+/// Future kinds may extend this; until then the matrix is locked by the
+/// WR-01 verdict matrix in `exec_strategy_windows/supervisor.rs`'s
+/// `capability_handler_tests` module docstring (lines 2034-2076).
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum RejectStage {
+    BeforePrompt,
+    AfterPrompt,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[allow(dead_code)] // CapabilityDecision/UrlOpen/Network variants and their constructors land in
@@ -40,6 +64,17 @@ enum AuditEventPayload {
     },
     CapabilityDecision {
         entry: AuditEntry,
+        /// Windows-AIPC-specific reject-stage marker (Phase 23 D-02).
+        /// `None` for Approved decisions, for non-Windows ledger entries,
+        /// and for the three pre-stage rejections (duplicate replay, invalid
+        /// token, unknown HandleKind). `Some(BeforePrompt)` when the mask gate
+        /// at supervisor.rs:1891 denies before the approval backend is
+        /// consulted (Event/Mutex/JobObject). `Some(AfterPrompt)` when the
+        /// G-04 broker-failure flip at supervisor.rs:1997 denies after
+        /// approval (Pipe direction allowlist + Socket privileged port /
+        /// role allowlist).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reject_stage: Option<RejectStage>,
     },
     UrlOpen {
         request: UrlOpenRequest,
@@ -143,7 +178,16 @@ impl AuditRecorder {
     // `AuditRecorder` API is upstream-compatible.
     #[allow(dead_code)]
     pub(crate) fn record_capability_decision(&mut self, entry: AuditEntry) -> Result<()> {
-        self.append_event(AuditEventPayload::CapabilityDecision { entry })
+        // Phase 23 Task 1: the new `reject_stage` field defaults to `None`
+        // until Task 2 promotes this API to take it as an explicit second
+        // argument. Until then, the dispatcher does not call this function
+        // (#[allow(dead_code)] above), so the `None` default is structurally
+        // unreachable on the wire — included here only to satisfy the struct
+        // initializer. Task 2 deletes this single-arg shape entirely.
+        self.append_event(AuditEventPayload::CapabilityDecision {
+            entry,
+            reject_stage: None,
+        })
     }
 
     #[allow(dead_code)]
@@ -411,6 +455,138 @@ mod tests {
         assert!(result.merkle_root_matches);
         assert!(result.records_verified);
         assert_eq!(result.merkle_scheme, "alpha");
+    }
+
+    /// Phase 23 Task 1 Test 1: serialization tag rendering for `Some(BeforePrompt)`
+    /// and `Some(AfterPrompt)`. Asserts the field is emitted with the kebab-case
+    /// `"before-prompt"` / `"after-prompt"` discriminants (per D-02 +
+    /// `#[serde(rename_all = "kebab-case")]` on the enum).
+    #[test]
+    fn reject_stage_serializes_kebab_case_when_present() {
+        let entry = synthetic_entry();
+        let before = AuditEventPayload::CapabilityDecision {
+            entry: entry.clone(),
+            reject_stage: Some(RejectStage::BeforePrompt),
+        };
+        let json_before = serde_json::to_string(&before).unwrap();
+        assert!(
+            json_before.contains("\"reject_stage\":\"before-prompt\""),
+            "BeforePrompt must serialize to kebab-case, got: {json_before}",
+        );
+
+        let after = AuditEventPayload::CapabilityDecision {
+            entry,
+            reject_stage: Some(RejectStage::AfterPrompt),
+        };
+        let json_after = serde_json::to_string(&after).unwrap();
+        assert!(
+            json_after.contains("\"reject_stage\":\"after-prompt\""),
+            "AfterPrompt must serialize to kebab-case, got: {json_after}",
+        );
+    }
+
+    /// Phase 23 Task 1 Test 2: when `reject_stage` is `None`, the field MUST be
+    /// omitted from the wire — old NDJSON files written by Phase 22 (which lack
+    /// the field entirely) stay byte-identical for the None path.
+    #[test]
+    fn reject_stage_omitted_when_none() {
+        let payload = AuditEventPayload::CapabilityDecision {
+            entry: synthetic_entry(),
+            reject_stage: None,
+        };
+        let json = serde_json::to_string(&payload).unwrap();
+        assert!(
+            !json.contains("reject_stage"),
+            "reject_stage MUST be omitted when None (skip_serializing_if invariant); \
+             got: {json}",
+        );
+    }
+
+    /// Phase 23 Task 1 Test 3: round-trip every variant via serde to lock both
+    /// `Serialize` and `Deserialize` derives + the kebab-case rename rule.
+    #[test]
+    fn reject_stage_round_trips_via_serde() {
+        for stage in [
+            None,
+            Some(RejectStage::BeforePrompt),
+            Some(RejectStage::AfterPrompt),
+        ] {
+            let payload = AuditEventPayload::CapabilityDecision {
+                entry: synthetic_entry(),
+                reject_stage: stage,
+            };
+            let json = serde_json::to_string(&payload).unwrap();
+            let round_trip: AuditEventPayload = serde_json::from_str(&json).unwrap();
+            match round_trip {
+                AuditEventPayload::CapabilityDecision { reject_stage, .. } => {
+                    assert_eq!(
+                        reject_stage, stage,
+                        "round-trip must preserve reject_stage; original={stage:?}, got={reject_stage:?}",
+                    );
+                }
+                other => panic!(
+                    "expected CapabilityDecision, got: {}",
+                    std::any::type_name_of_val(&other),
+                ),
+            }
+        }
+    }
+
+    /// Phase 23 Task 1 Test 4: a Phase-22-shaped NDJSON record (no
+    /// `reject_stage` field) must deserialize cleanly with `reject_stage = None`.
+    /// Locks the `#[serde(default)]` backward-compat invariant.
+    #[test]
+    fn reject_stage_deserializes_old_records_as_none() {
+        // Construct a JSON literal mimicking a Phase-22 CapabilityDecision NDJSON
+        // line WITHOUT the reject_stage field. The entry payload uses the
+        // existing AuditEntry serde shape (timestamp + request + decision +
+        // backend + duration_ms).
+        let entry = synthetic_entry();
+        let entry_json = serde_json::to_string(&entry).unwrap();
+        let phase_22_shape = format!(r#"{{"type":"capability_decision","entry":{entry_json}}}"#);
+
+        let parsed: AuditEventPayload = serde_json::from_str(&phase_22_shape)
+            .expect("Phase-22-shape CapabilityDecision must deserialize cleanly");
+        match parsed {
+            AuditEventPayload::CapabilityDecision { reject_stage, .. } => {
+                assert_eq!(
+                    reject_stage, None,
+                    "old NDJSON records (without reject_stage) MUST deserialize as None; got {reject_stage:?}",
+                );
+            }
+            other => panic!(
+                "expected CapabilityDecision variant, got: {}",
+                std::any::type_name_of_val(&other),
+            ),
+        }
+    }
+
+    /// Phase 23 Task 1 helper: build a deterministic synthetic AuditEntry for
+    /// the new serde tests. Uses UNIX_EPOCH for the timestamp so the JSON
+    /// surface is stable across hosts; the assertions in the new tests do NOT
+    /// inspect the entry sub-fields, only the parent variant + `reject_stage`.
+    #[allow(deprecated)]
+    fn synthetic_entry() -> AuditEntry {
+        AuditEntry {
+            timestamp: std::time::SystemTime::UNIX_EPOCH,
+            request: nono::CapabilityRequest {
+                request_id: "synthetic-test".to_string(),
+                path: std::path::PathBuf::from("/tmp/synthetic"),
+                access: nono::AccessMode::Read,
+                reason: Some("phase 23 task 1 unit test".to_string()),
+                child_pid: 0,
+                session_id: "sess-synthetic".to_string(),
+                session_token: String::new(),
+                kind: nono::supervisor::HandleKind::File,
+                target: None,
+                access_mask: 0,
+            },
+            decision: nono::ApprovalDecision::Denied {
+                reason: "test".to_string(),
+            },
+            backend: "test-backend".to_string(),
+            duration_ms: 0,
+        }
     }
 
     #[test]

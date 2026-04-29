@@ -692,7 +692,9 @@ pub fn execute_supervised(
     audit_state: Option<AuditState>,
     rollback_state: Option<RollbackRuntimeState>,
     rollback_status: nono::undo::RollbackStatus,
-    audit_recorder: Option<&std::sync::Mutex<crate::audit_integrity::AuditRecorder>>,
+    audit_recorder: Option<
+        &std::sync::Arc<std::sync::Mutex<crate::audit_integrity::AuditRecorder>>,
+    >,
     audit_snapshot_state: Option<crate::rollback_runtime::AuditSnapshotState>,
     executable_identity: Option<nono::undo::ExecutableIdentity>,
     audit_signer: Option<&crate::audit_attestation::AuditSigner>,
@@ -736,6 +738,10 @@ pub fn execute_supervised(
         session_id,
         timeout_deadline,
         containment.job,
+        // Phase 23 D-01: thread the audit recorder Arc into the runtime so
+        // the capability-pipe-server thread can append capability_decision
+        // events to `<session_dir>/audit-events.ndjson`.
+        audit_recorder,
     )?;
     tracing::debug!(
         "Windows supervised approval backend: {}",

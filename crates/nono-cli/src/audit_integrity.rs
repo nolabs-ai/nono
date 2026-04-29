@@ -172,21 +172,23 @@ impl AuditRecorder {
         self.append_event(AuditEventPayload::SessionEnded { ended, exit_code })
     }
 
-    // Plan 22-05a Decision 5 minimal scope: capability-decision, URL-open,
-    // and network event constructors are wired into supervisor callsites by
-    // follow-up cherry-picks (4ec61c29..9db06336). They live here now so the
-    // `AuditRecorder` API is upstream-compatible.
-    #[allow(dead_code)]
-    pub(crate) fn record_capability_decision(&mut self, entry: AuditEntry) -> Result<()> {
-        // Phase 23 Task 1: the new `reject_stage` field defaults to `None`
-        // until Task 2 promotes this API to take it as an explicit second
-        // argument. Until then, the dispatcher does not call this function
-        // (#[allow(dead_code)] above), so the `None` default is structurally
-        // unreachable on the wire — included here only to satisfy the struct
-        // initializer. Task 2 deletes this single-arg shape entirely.
+    // Phase 23 D-02: capability-decision recorder now takes the
+    // Windows-AIPC reject-stage marker as an explicit second argument.
+    // Cross-platform callers and Windows callers in pre-stage / Approved
+    // sites pass `None`; Windows site-4 (mask gate) passes
+    // `Some(BeforePrompt)`; Windows site-5 G-04 broker-failure flip on
+    // Pipe/Socket passes `Some(AfterPrompt)`. The single 2-arg shape is
+    // the only `record_capability_decision` API surface; the dispatcher
+    // always knows the stage at the call site, so a no-arg shortcut would
+    // add zero callers but double the API surface.
+    pub(crate) fn record_capability_decision(
+        &mut self,
+        entry: AuditEntry,
+        reject_stage: Option<RejectStage>,
+    ) -> Result<()> {
         self.append_event(AuditEventPayload::CapabilityDecision {
             entry,
-            reject_stage: None,
+            reject_stage,
         })
     }
 

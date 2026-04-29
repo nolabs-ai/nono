@@ -284,6 +284,16 @@ pub(super) struct WindowsSupervisorRuntime {
     /// wiring that lets `nono run --profile <widened>` actually consume
     /// `capabilities.aipc` widening at the dispatcher.
     resolved_aipc_allowlist: std::sync::Arc<crate::profile::AipcResolvedAllowlist>,
+    /// Phase 23 D-01: optional ledger recorder cloned into the capability-
+    /// pipe-server thread closure so the dispatcher can append
+    /// `AuditEventPayload::CapabilityDecision` events to
+    /// `<session_dir>/audit-events.ndjson`. `None` for non-audit-integrity
+    /// sessions (zero-overhead path). Stored as
+    /// `Option<Arc<Mutex<AuditRecorder>>>` so cloning into the spawned
+    /// thread (per 23-PATTERNS.md § 3b) does not require a separate
+    /// lifetime — the recorder is shared-owned across the supervisor and
+    /// its capability-pipe thread for the duration of the session.
+    audit_recorder: Option<std::sync::Arc<std::sync::Mutex<crate::audit_integrity::AuditRecorder>>>,
 }
 
 /// Compute the absolute deadline `Instant` for a supervisor-side wall-clock
@@ -312,6 +322,14 @@ impl WindowsSupervisorRuntime {
         user_session_id: Option<&str>,
         timeout_deadline: Option<std::time::Instant>,
         containment_job: windows_sys::Win32::Foundation::HANDLE,
+        // Phase 23 D-01: optional ledger recorder. Cloned into the
+        // capability-pipe-server thread closure inside
+        // `start_capability_pipe_server`. `None` is the zero-overhead path
+        // (no audit-integrity), preserving byte-identical pre-Phase-23
+        // behavior.
+        audit_recorder: Option<
+            &std::sync::Arc<std::sync::Mutex<crate::audit_integrity::AuditRecorder>>,
+        >,
     ) -> Result<Self> {
         let started_at = Instant::now();
         let (parent_control, child_control) = initialize_supervisor_control_channel()?;
@@ -370,6 +388,10 @@ impl WindowsSupervisorRuntime {
             // `SupervisorConfig` carries the resolved allowlist inline.
             // Plan 18-03 Deferred Issue #1 is resolved here.
             resolved_aipc_allowlist: std::sync::Arc::new(supervisor.aipc_allowlist.clone()),
+            // Phase 23 D-01: clone the Arc so the runtime + the
+            // capability-pipe thread share ownership of the recorder.
+            // `cloned()` on `Option<&Arc<...>>` produces `Option<Arc<...>>`.
+            audit_recorder: audit_recorder.cloned(),
         };
 
         // Phase 17 reorder (RESEARCH.md Pitfall 5): start_control_pipe_server
@@ -458,6 +480,11 @@ impl WindowsSupervisorRuntime {
         // Phase 18 Plan 18-03: clone the resolved AIPC allowlist Arc into
         // the thread closure so all per-kind helpers consult it.
         let resolved_aipc_allowlist = self.resolved_aipc_allowlist.clone();
+        // Phase 23 D-01: clone the optional audit recorder Arc into the
+        // thread closure. `None` preserves byte-identical pre-Phase-23
+        // behavior; `Some(arc)` enables ledger emission at all 5 push sites
+        // inside `handle_windows_supervisor_message`.
+        let audit_recorder_for_thread = self.audit_recorder.clone();
 
         std::thread::spawn(move || {
             // Disjoint capture safety: bind the SendableHandle wrapper to a
@@ -535,6 +562,7 @@ impl WindowsSupervisorRuntime {
                             &user_session_id,
                             runtime_containment_job_local.0,
                             resolved_aipc_allowlist.as_ref(),
+                            audit_recorder_for_thread.as_ref(),
                         ) {
                             tracing::warn!(
                                 session_id = %session_id,
@@ -1784,7 +1812,47 @@ pub(super) fn handle_windows_supervisor_message(
     user_session_id: &str,
     runtime_containment_job: HANDLE,
     resolved_allowlist: &AipcResolvedAllowlist,
+    // Phase 23 D-01: optional ledger recorder for capability-decision events.
+    // `None` for callers that do not request audit-integrity (zero-overhead
+    // path). When `Some`, the dispatcher emits one
+    // `AuditEventPayload::CapabilityDecision` per request (with the
+    // WR-01-locked `reject_stage` discriminator) at each of the 5 push sites.
+    audit_recorder: Option<
+        &std::sync::Arc<std::sync::Mutex<crate::audit_integrity::AuditRecorder>>,
+    >,
 ) -> Result<()> {
+    // Phase 23 D-01 + Discretion #3: ledger emission helper. Recorder errors
+    // (lock-poison or write-failure) MUST NOT abort the supervisor — the
+    // wire response goes out regardless. T-23-03 mitigation: warn-and-continue
+    // shape, not `?` propagation.
+    let emit_to_ledger =
+        |entry: &AuditEntry,
+         request_id: &str,
+         reject_stage: Option<crate::audit_integrity::RejectStage>| {
+            if let Some(recorder_mutex) = audit_recorder {
+                match recorder_mutex.lock() {
+                    Ok(mut recorder) => {
+                        if let Err(e) =
+                            recorder.record_capability_decision(entry.clone(), reject_stage)
+                        {
+                            tracing::warn!(
+                                request_id = %request_id,
+                                error = %e,
+                                "Failed to append capability-decision event to audit ledger; \
+                                 wire response continues normally",
+                            );
+                        }
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            request_id = %request_id,
+                            "Audit recorder lock poisoned; skipping ledger emission",
+                        );
+                    }
+                }
+            }
+        };
+
     match msg {
         nono::supervisor::SupervisorMessage::Request(request) => {
             let started_at = Instant::now();
@@ -1792,12 +1860,14 @@ pub(super) fn handle_windows_supervisor_message(
                 let decision = nono::ApprovalDecision::Denied {
                     reason: "Duplicate request_id rejected (replay detected)".to_string(),
                 };
-                audit_log.push(audit_entry_with_redacted_token(
+                let entry = audit_entry_with_redacted_token(
                     &request,
                     &decision,
                     approval_backend.backend_name(),
                     started_at,
-                ));
+                );
+                emit_to_ledger(&entry, &request.request_id, None);
+                audit_log.push(entry);
                 return sock.send_response(&nono::supervisor::SupervisorResponse::Decision {
                     request_id: request.request_id,
                     decision,
@@ -1815,12 +1885,14 @@ pub(super) fn handle_windows_supervisor_message(
                 let decision = nono::ApprovalDecision::Denied {
                     reason: "Invalid session token".to_string(),
                 };
-                audit_log.push(audit_entry_with_redacted_token(
+                let entry = audit_entry_with_redacted_token(
                     &request,
                     &decision,
                     approval_backend.backend_name(),
                     started_at,
-                ));
+                );
+                emit_to_ledger(&entry, &request.request_id, None);
+                audit_log.push(entry);
                 return sock.send_response(&nono::supervisor::SupervisorResponse::Decision {
                     request_id: request.request_id,
                     decision,
@@ -1846,12 +1918,14 @@ pub(super) fn handle_windows_supervisor_message(
                 let decision = nono::ApprovalDecision::Denied {
                     reason: "unknown handle type".to_string(),
                 };
-                audit_log.push(audit_entry_with_redacted_token(
+                let entry = audit_entry_with_redacted_token(
                     &request,
                     &decision,
                     approval_backend.backend_name(),
                     started_at,
-                ));
+                );
+                emit_to_ledger(&entry, &request.request_id, None);
+                audit_log.push(entry);
                 return sock.send_response(&nono::supervisor::SupervisorResponse::Decision {
                     request_id: request.request_id,
                     decision,
@@ -1888,12 +1962,22 @@ pub(super) fn handle_windows_supervisor_message(
                             request.access_mask, request.kind, resolved
                         ),
                     };
-                    audit_log.push(audit_entry_with_redacted_token(
+                    let entry = audit_entry_with_redacted_token(
                         &request,
                         &decision,
                         approval_backend.backend_name(),
                         started_at,
-                    ));
+                    );
+                    // Phase 23 D-02: Site 4 — pre-broker mask gate fires
+                    // BEFORE the approval backend is consulted, so this is a
+                    // BeforePrompt rejection per the WR-01 verdict matrix
+                    // (Event/Mutex/JobObject only).
+                    emit_to_ledger(
+                        &entry,
+                        &request.request_id,
+                        Some(crate::audit_integrity::RejectStage::BeforePrompt),
+                    );
+                    audit_log.push(entry);
                     return sock.send_response(
                         &nono::supervisor::SupervisorResponse::Decision {
                             request_id: request.request_id,
@@ -1922,6 +2006,15 @@ pub(super) fn handle_windows_supervisor_message(
             // single site; the `Err` arm rewrites `decision` before the
             // audit push + send_response, so the audit log and the wire
             // response always record the same shape.
+            //
+            // Phase 23 D-02: track the WR-01 reject-stage discriminator
+            // alongside the (decision, grant) tuple so the ledger emission
+            // at the post-flip site can record `Some(AfterPrompt)` for
+            // Pipe/Socket G-04 broker-failure flips. All other site-5
+            // outcomes (Approved, File/Event/Mutex/JobObject Denied — the
+            // Event/Mutex/JobObject Denied case is unreachable here, gated
+            // at site 4) carry `None`.
+            let mut reject_stage: Option<crate::audit_integrity::RejectStage> = None;
             let (decision, grant) = if decision.is_granted() {
                 let result: Result<Option<nono::supervisor::ResourceGrant>> = match request.kind {
                     HandleKind::File => {
@@ -1987,6 +2080,19 @@ pub(super) fn handle_windows_supervisor_message(
                         let denied = nono::ApprovalDecision::Denied {
                             reason: format!("broker failed: {e}"),
                         };
+                        // Phase 23 D-02: AfterPrompt is currently
+                        // observable only for Pipe (direction allowlist)
+                        // and Socket (privileged port + role allowlist).
+                        // Event/Mutex/JobObject pre-broker mask gates at
+                        // site 4 short-circuit before reaching this Err
+                        // arm; their kernel-object-creation failures (if
+                        // any) are also AfterPrompt by construction, but
+                        // the WR-01 matrix is locked to Pipe|Socket per
+                        // Discretion #1 + the live wr01_* test set.
+                        if matches!(request.kind, HandleKind::Pipe | HandleKind::Socket) {
+                            reject_stage =
+                                Some(crate::audit_integrity::RejectStage::AfterPrompt);
+                        }
                         (denied, None)
                     }
                 }
@@ -1994,12 +2100,14 @@ pub(super) fn handle_windows_supervisor_message(
                 (decision, None)
             };
 
-            audit_log.push(audit_entry_with_redacted_token(
+            let entry = audit_entry_with_redacted_token(
                 &request,
                 &decision,
                 approval_backend.backend_name(),
                 started_at,
-            ));
+            );
+            emit_to_ledger(&entry, &request.request_id, reject_stage);
+            audit_log.push(entry);
 
             sock.send_response(&nono::supervisor::SupervisorResponse::Decision {
                 request_id: request.request_id,
@@ -2207,6 +2315,7 @@ mod capability_handler_tests {
             "testaipc12345678",
             std::ptr::null_mut(),
             &AipcResolvedAllowlist::default(),
+            None,
         )
         .expect("handle");
 
@@ -2249,6 +2358,7 @@ mod capability_handler_tests {
             "testaipc12345678",
             std::ptr::null_mut(),
             &AipcResolvedAllowlist::default(),
+            None,
         )
         .expect("handle");
 
@@ -2278,6 +2388,7 @@ mod capability_handler_tests {
             "testaipc12345678",
             std::ptr::null_mut(),
             &AipcResolvedAllowlist::default(),
+            None,
         )
         .expect("handle");
 
@@ -2314,6 +2425,7 @@ mod capability_handler_tests {
             "testaipc12345678",
             std::ptr::null_mut(),
             &AipcResolvedAllowlist::default(),
+            None,
         )
         .expect("handle");
 
@@ -2347,6 +2459,7 @@ mod capability_handler_tests {
             "testaipc12345678",
             std::ptr::null_mut(),
             &AipcResolvedAllowlist::default(),
+            None,
         )
         .expect("first handle");
 
@@ -2362,6 +2475,7 @@ mod capability_handler_tests {
             "testaipc12345678",
             std::ptr::null_mut(),
             &AipcResolvedAllowlist::default(),
+            None,
         )
         .expect("second handle");
 
@@ -2406,6 +2520,7 @@ mod capability_handler_tests {
             "testaipc12345678",
             std::ptr::null_mut(),
             &AipcResolvedAllowlist::default(),
+            None,
         )
         .expect("handle");
 
@@ -2445,6 +2560,7 @@ mod capability_handler_tests {
             "testaipc12345678",
             std::ptr::null_mut(),
             &AipcResolvedAllowlist::default(),
+            None,
         )
         .expect("handle");
 
@@ -2511,6 +2627,7 @@ mod capability_handler_tests {
             "testaipc12345678",
             std::ptr::null_mut(),
             &AipcResolvedAllowlist::default(),
+            None,
         )
         .expect("dispatch");
 
@@ -2575,6 +2692,7 @@ mod capability_handler_tests {
             "testaipc12345678",
             std::ptr::null_mut(),
             &AipcResolvedAllowlist::default(),
+            None,
         )
         .expect("dispatch");
 
@@ -2626,6 +2744,7 @@ mod capability_handler_tests {
             "testaipc12345678",
             std::ptr::null_mut(),
             &AipcResolvedAllowlist::default(),
+            None,
         )
         .expect("dispatch");
 
@@ -2678,6 +2797,7 @@ mod capability_handler_tests {
             "testaipc12345678",
             std::ptr::null_mut(),
             &AipcResolvedAllowlist::default(),
+            None,
         )
         .expect("dispatch");
         assert_eq!(backend.calls(), 0);
@@ -2723,6 +2843,7 @@ mod capability_handler_tests {
             "testaipc12345678",
             std::ptr::null_mut(),
             &AipcResolvedAllowlist::default(),
+            None,
         )
         .expect("dispatch");
 
@@ -2784,6 +2905,7 @@ mod capability_handler_tests {
             "testaipc12345678",
             std::ptr::null_mut(),
             &AipcResolvedAllowlist::default(),
+            None,
         )
         .expect("dispatch");
 
@@ -2839,6 +2961,7 @@ mod capability_handler_tests {
             "testaipc12345678",
             std::ptr::null_mut(),
             &AipcResolvedAllowlist::default(),
+            None,
         )
         .expect("dispatch");
 
@@ -2895,6 +3018,7 @@ mod capability_handler_tests {
             "testaipc12345678",
             std::ptr::null_mut(),
             &AipcResolvedAllowlist::default(),
+            None,
         )
         .expect("dispatch");
 
@@ -2963,6 +3087,7 @@ mod capability_handler_tests {
             "testaipc12345678",
             std::ptr::null_mut(),
             &AipcResolvedAllowlist::default(),
+            None,
         )
         .expect("dispatch");
 
@@ -3014,6 +3139,7 @@ mod capability_handler_tests {
             "testaipc12345678",
             std::ptr::null_mut(),
             &AipcResolvedAllowlist::default(),
+            None,
         )
         .expect("dispatch");
 
@@ -3098,6 +3224,7 @@ mod capability_handler_tests {
             "testaipc12345678",
             std::ptr::null_mut(), // no containment job — guard does not fire
             &AipcResolvedAllowlist::default(),
+            None,
         )
         .expect("dispatch");
 
@@ -3156,6 +3283,7 @@ mod capability_handler_tests {
             "testaipc12345678",
             std::ptr::null_mut(),
             &AipcResolvedAllowlist::default(),
+            None,
         )
         .expect("dispatch");
 
@@ -3244,6 +3372,7 @@ mod capability_handler_tests {
             "testaipc12345678",
             containment, // the runtime guard target
             &AipcResolvedAllowlist::default(),
+            None,
         )
         .expect("dispatch");
 
@@ -3318,6 +3447,7 @@ mod capability_handler_tests {
             "testaipc12345678",
             std::ptr::null_mut(),
             &allowlist,
+            None,
         )
         .expect("dispatch");
 
@@ -3390,6 +3520,7 @@ mod capability_handler_tests {
             "testaipc12345678",
             containment, // the runtime guard target
             &allowlist,
+            None,
         )
         .expect("dispatch");
 
@@ -3473,6 +3604,7 @@ mod capability_handler_tests {
             "testaipc12345678",
             std::ptr::null_mut(),
             &AipcResolvedAllowlist::default(),
+            None,
         )
         .expect("dispatch");
 
@@ -3535,6 +3667,7 @@ mod capability_handler_tests {
             "testaipc12345678",
             std::ptr::null_mut(),
             &AipcResolvedAllowlist::default(),
+            None,
         )
         .expect("dispatch");
 
@@ -3601,6 +3734,7 @@ mod capability_handler_tests {
             "testaipc12345678",
             std::ptr::null_mut(),
             &AipcResolvedAllowlist::default(),
+            None,
         )
         .expect("dispatch");
 
@@ -3670,6 +3804,7 @@ mod capability_handler_tests {
             "testaipc12345678",
             std::ptr::null_mut(),
             &AipcResolvedAllowlist::default(),
+            None,
         )
         .expect("dispatch");
 
@@ -3734,6 +3869,7 @@ mod capability_handler_tests {
             "testaipc12345678",
             std::ptr::null_mut(),
             &AipcResolvedAllowlist::default(),
+            None,
         )
         .expect("dispatch");
 
@@ -3864,6 +4000,7 @@ mod capability_handler_tests {
                 "testaipc12345678",
                 std::ptr::null_mut(),
                 &AipcResolvedAllowlist::default(),
+                None,
             )
             .expect("dispatch");
 
@@ -3986,6 +4123,7 @@ mod capability_handler_tests {
             "testaipc12345678",
             std::ptr::null_mut(),
             &allowlist,
+            None,
         )
         .expect("dispatch");
 
@@ -4051,6 +4189,7 @@ mod capability_handler_tests {
             "testaipc12345678",
             std::ptr::null_mut(),
             &allowlist,
+            None,
         )
         .expect("dispatch");
 
@@ -4124,6 +4263,7 @@ mod capability_handler_tests {
             "testaipc12345678",
             std::ptr::null_mut(),
             &allowlist,
+            None,
         )
         .expect("dispatch");
 
@@ -4206,6 +4346,7 @@ mod capability_handler_tests {
             "testaipc12345678",
             std::ptr::null_mut(),
             &AipcResolvedAllowlist::default(),
+            None,
         )
         .expect("dispatch");
 
@@ -4273,6 +4414,7 @@ mod capability_handler_tests {
             "testaipc12345678",
             std::ptr::null_mut(),
             &AipcResolvedAllowlist::default(),
+            None,
         )
         .expect("dispatch");
 
@@ -4345,6 +4487,7 @@ mod capability_handler_tests {
             "testaipc12345678",
             std::ptr::null_mut(),
             &AipcResolvedAllowlist::default(),
+            None,
         )
         .expect("dispatch");
 
@@ -4422,6 +4565,7 @@ mod capability_handler_tests {
             "testaipc12345678",
             std::ptr::null_mut(),
             &AipcResolvedAllowlist::default(),
+            None,
         )
         .expect("dispatch");
 
@@ -4503,6 +4647,7 @@ mod capability_handler_tests {
             "testaipc12345678",
             std::ptr::null_mut(),
             &AipcResolvedAllowlist::default(),
+            None,
         )
         .expect("dispatch");
 
@@ -4531,6 +4676,197 @@ mod capability_handler_tests {
             other => panic!("expected Denied, got {other:?}"),
         }
         let _ = child.recv_response().expect("drain");
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 23 D-04 layer-1 dispatcher tests (TDD).
+    //
+    // These three tests lock the new `audit_recorder: Option<&Arc<Mutex<...>>>`
+    // dispatcher parameter behavior:
+    // 1. `recorder_emits_one_capability_decision_per_dispatched_request` —
+    //    happy-path emission proof.
+    // 2. `recorder_does_not_abort_dispatcher_on_lock_poison` — supervisor
+    //    survives a poisoned recorder mutex (Discretion #3 / T-23-03).
+    // 3. `recorder_emission_is_optional_when_none` — passing `None`
+    //    preserves byte-identical pre-Phase-23 behavior (no NDJSON file
+    //    materializes; `audit_log: Vec<AuditEntry>` still populated).
+    // -----------------------------------------------------------------
+
+    /// Phase 23 Task 2 Test 1: dispatching a single Approved Event request
+    /// with a recorder produces exactly 1 `capability_decision` line in the
+    /// session NDJSON ledger.
+    #[test]
+    fn recorder_emits_one_capability_decision_per_dispatched_request() {
+        let backend = CountingGrantBackend::new();
+        let (mut supervisor, mut child) = new_pair();
+        let mut seen = HashSet::new();
+        let mut audit_log = Vec::new();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder = crate::audit_integrity::AuditRecorder::new(dir.path().to_path_buf())
+            .expect("audit recorder construction");
+        let recorder_arc = std::sync::Arc::new(std::sync::Mutex::new(recorder));
+
+        let token = "phase23-token-001";
+        let req = make_request_aipc(
+            token,
+            "phase23-emit-001",
+            HandleKind::Event,
+            Some(HandleTarget::EventName {
+                name: "phase23-event-emit".to_string(),
+            }),
+            policy::EVENT_DEFAULT_MASK,
+        );
+        handle_windows_supervisor_message(
+            &mut supervisor,
+            nono::supervisor::SupervisorMessage::Request(req),
+            &backend,
+            nono::BrokerTargetProcess::current(),
+            &mut seen,
+            &mut audit_log,
+            token,
+            "testaipc12345678",
+            std::ptr::null_mut(),
+            &AipcResolvedAllowlist::default(),
+            Some(&recorder_arc),
+        )
+        .expect("dispatch");
+        let _ = child.recv_response().expect("drain");
+
+        // Drop the local Arc clone so its inner File handle flushes cleanly
+        // before we read the ledger. The thread closure also holds an Arc
+        // reference (none here, since this test does not spawn the
+        // capability-pipe thread), so this clone-and-drop pattern is safe.
+        drop(recorder_arc);
+
+        let ledger_path = dir.path().join("audit-events.ndjson");
+        let ledger = std::fs::read_to_string(&ledger_path).expect("ledger file");
+        let cap_decision_lines: Vec<&str> = ledger
+            .lines()
+            .filter(|l| l.contains("\"type\":\"capability_decision\""))
+            .collect();
+        assert_eq!(
+            cap_decision_lines.len(),
+            1,
+            "expected exactly 1 capability_decision NDJSON line, got: {ledger}",
+        );
+        assert_eq!(audit_log.len(), 1);
+    }
+
+    /// Phase 23 Task 2 Test 2: lock-poison must NOT abort the dispatcher.
+    /// The wire response goes out and `audit_log` is still populated; only
+    /// the ledger emission is skipped (with a `tracing::warn!` recorded).
+    /// Locks T-23-03 (Discretion #3).
+    #[test]
+    fn recorder_does_not_abort_dispatcher_on_lock_poison() {
+        let backend = CountingGrantBackend::new();
+        let (mut supervisor, mut child) = new_pair();
+        let mut seen = HashSet::new();
+        let mut audit_log = Vec::new();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder = crate::audit_integrity::AuditRecorder::new(dir.path().to_path_buf())
+            .expect("audit recorder construction");
+        let recorder_arc = std::sync::Arc::new(std::sync::Mutex::new(recorder));
+
+        // Deliberately poison the mutex by panicking inside a held lock.
+        let poison_arc = recorder_arc.clone();
+        let join = std::thread::spawn(move || {
+            let _guard = poison_arc.lock().expect("acquire");
+            panic!("intentionally poison the mutex");
+        })
+        .join();
+        // The panic is expected; we only need to confirm the spawn returned.
+        assert!(join.is_err(), "the spawned thread must have panicked");
+
+        // Sanity check: the lock is now poisoned.
+        assert!(
+            recorder_arc.lock().is_err(),
+            "test setup: the mutex must be poisoned",
+        );
+
+        let token = "phase23-poison-token";
+        let req = make_request_aipc(
+            token,
+            "phase23-poison-001",
+            HandleKind::Event,
+            Some(HandleTarget::EventName {
+                name: "phase23-event-poison".to_string(),
+            }),
+            policy::EVENT_DEFAULT_MASK,
+        );
+        let result = handle_windows_supervisor_message(
+            &mut supervisor,
+            nono::supervisor::SupervisorMessage::Request(req),
+            &backend,
+            nono::BrokerTargetProcess::current(),
+            &mut seen,
+            &mut audit_log,
+            token,
+            "testaipc12345678",
+            std::ptr::null_mut(),
+            &AipcResolvedAllowlist::default(),
+            Some(&recorder_arc),
+        );
+        assert!(
+            result.is_ok(),
+            "dispatcher MUST return Ok(()) even when the recorder mutex is poisoned; got: {result:?}",
+        );
+        let _ = child.recv_response().expect("drain");
+        assert_eq!(
+            audit_log.len(),
+            1,
+            "the in-memory audit_log MUST still be populated even when ledger emission failed",
+        );
+    }
+
+    /// Phase 23 Task 2 Test 3: passing `None` preserves byte-identical
+    /// pre-Phase-23 behavior — no NDJSON file materializes (since we never
+    /// constructed an AuditRecorder), and the in-memory `audit_log` is
+    /// populated as before.
+    #[test]
+    fn recorder_emission_is_optional_when_none() {
+        let backend = CountingGrantBackend::new();
+        let (mut supervisor, mut child) = new_pair();
+        let mut seen = HashSet::new();
+        let mut audit_log = Vec::new();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let token = "phase23-none-token";
+        let req = make_request_aipc(
+            token,
+            "phase23-none-001",
+            HandleKind::Event,
+            Some(HandleTarget::EventName {
+                name: "phase23-event-none".to_string(),
+            }),
+            policy::EVENT_DEFAULT_MASK,
+        );
+        handle_windows_supervisor_message(
+            &mut supervisor,
+            nono::supervisor::SupervisorMessage::Request(req),
+            &backend,
+            nono::BrokerTargetProcess::current(),
+            &mut seen,
+            &mut audit_log,
+            token,
+            "testaipc12345678",
+            std::ptr::null_mut(),
+            &AipcResolvedAllowlist::default(),
+            None,
+        )
+        .expect("dispatch");
+        let _ = child.recv_response().expect("drain");
+
+        assert_eq!(audit_log.len(), 1, "audit_log MUST still be populated");
+        let ledger_path = dir.path().join("audit-events.ndjson");
+        assert!(
+            !ledger_path.exists(),
+            "no AuditRecorder was constructed and no ledger should exist; \
+             found unexpected file at {}",
+            ledger_path.display(),
+        );
     }
 }
 

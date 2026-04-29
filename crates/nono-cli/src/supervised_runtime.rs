@@ -232,10 +232,18 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
     // follow-up cherry-picks (4ec61c29..9db06336). Mutex follows upstream
     // 4f9552ec to permit future concurrent emissions from the supervisor IPC
     // dispatcher without revisiting the ownership shape.
+    // Phase 23 D-01: promote `Mutex<AuditRecorder>` to
+    // `Arc<Mutex<AuditRecorder>>` so the recorder can cross the Windows
+    // capability-pipe thread boundary (per 23-PATTERNS.md § 3b).
+    // Cross-platform consumers see only the additional `Arc` wrapper
+    // (D-21 invariance preserved).
     let audit_recorder = if rollback.audit_integrity {
         audit_state
             .as_ref()
-            .map(|state| AuditRecorder::new(state.session_dir.clone()).map(Mutex::new))
+            .map(|state| {
+                AuditRecorder::new(state.session_dir.clone())
+                    .map(|r| std::sync::Arc::new(Mutex::new(r)))
+            })
             .transpose()?
     } else {
         None

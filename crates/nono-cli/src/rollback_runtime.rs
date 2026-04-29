@@ -43,7 +43,7 @@ pub(crate) struct RollbackExitContext<'a> {
     /// `audit_event_count` + `audit_integrity` on `SessionMetadata`. `None`
     /// when audit-integrity was not requested (zero-overhead path; existing
     /// callers see byte-identical behavior to pre-22-05a).
-    pub(crate) audit_recorder: Option<&'a Mutex<AuditRecorder>>,
+    pub(crate) audit_recorder: Option<&'a std::sync::Arc<Mutex<AuditRecorder>>>,
     /// Upstream 4ec61c29: lightweight pre/post Merkle root capture for
     /// audit-only sessions. When `Some`, `finalize_supervised_exit`
     /// recomputes the root post-execution and stores both roots in

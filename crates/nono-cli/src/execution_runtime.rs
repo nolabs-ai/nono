@@ -125,7 +125,6 @@ fn recommended_builtin_profile(program: &Path) -> Option<&'static str> {
         "claude" => Some("claude-code"),
         "codex" => Some("codex"),
         "opencode" => Some("opencode"),
-        "openclaw" => Some("openclaw"),
         "swival" => Some("swival"),
         _ => None,
     }

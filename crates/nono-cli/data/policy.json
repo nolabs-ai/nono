@@ -645,32 +645,6 @@
       "workdir": { "access": "none" },
       "interactive": false
     },
-    "openclaw": {
-      "extends": "default",
-      "meta": {
-        "name": "openclaw",
-        "version": "1.0.0",
-        "description": "OpenClaw messaging gateway",
-        "author": "nono-project"
-      },
-      "security": {
-        "groups": ["node_runtime"],
-        "signal_mode": "isolated"
-      },
-      "filesystem": {
-        "allow": [
-          "$HOME/.openclaw",
-          "$HOME/.config/openclaw",
-          "$TMPDIR/openclaw-$UID"
-        ]
-      },
-      "network": { "block": false },
-      "workdir": { "access": "read" },
-      "undo": {
-        "exclude_patterns": ["node_modules", ".next"]
-      },
-      "interactive": false
-    },
     "opencode": {
       "extends": "default",
       "meta": {

@@ -77,7 +77,7 @@ Full details: `.planning/milestones/v2.2-ROADMAP.md`.
 
 **Requirement coverage:** 14 requirements across 6 categories (RESL-NIX, AIPC-NIX, PKGS, AAH, AUDC, WRU). All mapped; zero orphans.
 
-- [ ] **Phase 25: Cross-Platform RESL + AIPC Unix Design** (2 plans, candidate from gap-analysis quick task) — REQ-RESL-NIX-01..03 + REQ-AIPC-NIX-01. Plan 25-01 lands cgroup v2 (Linux) + setrlimit (macOS) backends; Plan 25-02 ships an AIPC Unix futures ADR documenting which 5 HandleKinds admit Unix backends. Subsumes v2.3 backlog row "Cross-platform RESL Unix backends" verbatim.
+- [ ] **Phase 25: Cross-Platform RESL + AIPC Unix Design** (1/2 plans complete, 2026-04-29) — REQ-RESL-NIX-01..03 + REQ-AIPC-NIX-01. Plan 25-02 (AIPC Unix Futures ADR) shipped 2026-04-29 closing REQ-AIPC-NIX-01 (commit `30d6fdb1`); ADR at `docs/architecture/aipc-unix-futures.md` locks verdicts for all 6 HandleKind discriminants. Plan 25-01 (cgroup v2 Linux + setrlimit macOS RESL backends — REQ-RESL-NIX-01..03) execution deferred until next session has Linux/macOS-host coverage; plan + CONTEXT committed (commit `3ed80d38`). Subsumes v2.3 backlog row "Cross-platform RESL Unix backends" verbatim.
 - [ ] **Phase 26: PKG Streaming Follow-Up** (1–2 plans TBD) — REQ-PKGS-01..04. Lands the 2 deferred upstream cherry-picks (`58b5a24e` `validate_relative_path`, `9ebad89a` streaming refactor) plus the architectural decisions skipped in v2.2 Plan 22-03 (`ArtifactType::Plugin` variant, `bundle_json` field, `validate_path_within` belt-and-suspenders, `load_registry_profile` auto-pull from `115b5cfa`).
 - [ ] **Phase 27: Audit-Attestation Hardening** (1 plan) — REQ-AAH-01. Re-enables 2 `#[ignore]`'d fixture-driven tests via Rule-4 architectural decision: sigstore-rs upgrade vs fork-internal pkcs8 parser. Required before publishing v2.2 attestation as production-ready.
 - [ ] **Phase 28: Authenticode Chain-Walker Subject Extraction** (1 plan) — REQ-AUDC-01..03. Adds `Win32_Security_Cryptography_Catalog` + `Win32_Security_Cryptography_Sip` features to `windows-sys`; implements `parse_signer_subject` + `parse_thumbprint`; re-enables `authenticode_signed_records_subject` test; upgrades AUD-03 acceptance to require populated subject + thumbprint on Valid signature.
@@ -201,7 +201,7 @@ Full details: `.planning/milestones/v2.2-ROADMAP.md`.
 | 22. UPST2 — Upstream v0.38–v0.40 Parity Sync | v2.2 | 6/6 | Complete (SECURED + REVIEW-FIX 7/7 + UAT 10/10 + 1 spec-error skipped; 22-03 partial close — 6/8 cherry-picks, 2 deferred to v2.3; Authenticode chain-walker deferred to v2.3) | 2026-04-28 |
 | 23. Windows Audit-Event Retrofit | v2.2 | 1/1 | Complete | 2026-04-29 |
 | 24. Parity-Drift Prevention | v2.2 | 2/2 | Complete | 2026-04-27 |
-| 25. Cross-Platform RESL + AIPC Unix Design | v2.3 | 0/2 | Not started | — |
+| 25. Cross-Platform RESL + AIPC Unix Design | v2.3 | 1/2 | In progress (25-02 ADR done; 25-01 RESL Unix deferred to Linux/macOS host) | 25-02: 2026-04-29 |
 | 26. PKG Streaming Follow-Up | v2.3 | 0/TBD | Not started | — |
 | 27. Audit-Attestation Hardening | v2.3 | 0/1 | Not started | — |
 | 28. Authenticode Chain-Walker Subject Extraction | v2.3 | 0/1 | Not started | — |

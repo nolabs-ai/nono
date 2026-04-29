@@ -2,15 +2,15 @@
 gsd_state_version: 1.0
 milestone: v2.3
 milestone_name: Linux POC Unblock + Deferreds Closure
-status: v2.3 scope-locked 2026-04-29. 5 phases (25–29) defined; 14 requirements across RESL-NIX / AIPC-NIX / PKGS / AAH / AUDC / WRU. Phase 25 ready for `/gsd-plan-phase 25`.
-stopped_at: v2.3 scope-lock complete. PROJECT.md evolved with v2.3 goal + target features; REQUIREMENTS.md created with 14 reqs + traceability; ROADMAP.md adds Phases 25–29 with success criteria; backlog refreshed for v2.4.
+status: v2.3 in progress. Phase 25 Plan 25-02 (AIPC Unix Futures ADR) shipped 2026-04-29 (commit 30d6fdb1); REQ-AIPC-NIX-01 closed. Plan 25-01 (RESL Unix backends — cgroup v2 + setrlimit) deferred to a Linux/macOS-host session because integration test gates can't run from Windows. Phases 26–29 not yet planned.
+stopped_at: Plan 25-02 done (3/3 tasks, 7/7 verification gates). Plan 25-01 plan + CONTEXT committed (commit 3ed80d38) but execution awaiting Linux/macOS host coverage.
 last_updated: "2026-04-29T00:00:00.000Z"
 last_activity: 2026-04-29
 progress:
   total_phases: 34
   completed_phases: 26
   total_plans: 88
-  completed_plans: 82
+  completed_plans: 83
   percent: 76
 ---
 
@@ -22,7 +22,7 @@ See: .planning/PROJECT.md (updated 2026-04-29 at v2.3 milestone scope-lock)
 
 **Core Value:** Every nono command that works on Linux/macOS should work on Windows with equivalent security guarantees, or be explicitly documented as intentionally unsupported with a clear rationale.
 
-**Current Focus:** Phase 25 (Cross-Platform RESL + AIPC Unix Design) is the recommended starting point — Plan 25-01 RESL Unix backends directly addresses the Linux POC credibility issue surfaced in `.planning/quick/260429-gap-v039-linux-poc-vs-windows-fork-tip/PLAN.md`.
+**Current Focus:** Phase 25 partially shipped — Plan 25-02 (AIPC Unix Futures ADR) closed REQ-AIPC-NIX-01 on 2026-04-29 (commit `30d6fdb1`). Plan 25-01 (RESL Unix backends) execution deferred until next session is on/has direct shell access to a Linux/macOS host so the cgroup v2 + `setrlimit` integration test gates can actually close.
 
 ## Current Position
 
@@ -192,17 +192,26 @@ Known deferred items at close: 20 (6 UAT bookkeeping gaps, 4 verification human_
 
 ## Session Continuity
 
-**Current Milestone:** v2.3 — Linux POC Unblock + Deferreds Closure (scope-locked 2026-04-29).
+**Current Milestone:** v2.3 — Linux POC Unblock + Deferreds Closure (scope-locked 2026-04-29; in progress).
 **Last Activity:** 2026-04-29
-**Stopped At:** v2.3 scope-lock complete via `/gsd-new-milestone`. 5 phases (25–29) defined with success criteria; 14 requirements + traceability in REQUIREMENTS.md; PROJECT.md Current Milestone section evolved; ROADMAP.md Phase Details (v2.3) section added; backlog refreshed for v2.4.
-**Next Steps:** Run `/gsd-plan-phase 25` to plan Cross-Platform RESL + AIPC Unix Design. Phase 25 is the recommended starting point because Plan 25-01 (RESL Unix backends) directly addresses the Linux POC credibility issue from the gap analysis. Phases 26–29 can be planned in any order relative to Phase 25 (no structural dependencies between them).
+**Stopped At:** Phase 25 Plan 25-02 (AIPC Unix Futures ADR) shipped end-to-end (commit `30d6fdb1`, 3/3 tasks, 7/7 verification gates). REQ-AIPC-NIX-01 closed. ADR at `docs/architecture/aipc-unix-futures.md` (251 lines, locked verdicts on all 6 HandleKind discriminants). PROJECT.md cross-link added. Plan 25-01 (RESL Unix backends — cgroup v2 + setrlimit) plan + CONTEXT committed (commit `3ed80d38`) but execution awaits Linux/macOS-host session.
 
-**v2.3 phase order recommendation:**
-1. Phase 25 (RESL Unix + AIPC ADR) — directly unblocks the Linux POC, biggest demo win.
-2. Phase 27 (audit-attestation hardening) — small, single-plan; closes the production-readiness gap on v2.2 attestation.
-3. Phase 26 (PKG streaming follow-up) — medium scope; closes v2.2's PKG-01 partial.
-4. Phase 28 (Authenticode chain-walker) — small; lights up v2.2's AUD-03 partial.
-5. Phase 29 (WR-01 unification) — last; product decision builds on whatever the audit-ledger surface looks like after Phases 25–28 land.
+**Next Steps (when on Linux/macOS host):**
+- Run `/gsd-execute-plan 25-01-RESL-NIX-PLAN` (or `/gsd-execute-phase 25` to pick up the remaining plan). Plan 25-01 has 8 tasks; integration tests require real cgroup v2 and `setrlimit` enforcement, both of which are unreachable from Windows.
+- Phase 25 is then complete; Phases 26–29 can proceed in any order (no structural dependencies between them).
+
+**Next Steps (Windows-host options):**
+- Phase 27 (audit-attestation hardening — REQ-AAH-01) is Windows-host-friendly: it's primarily a sigstore-rs vs in-tree pkcs8 architectural decision + 2 fixture-driven tests. Run `/gsd-plan-phase 27` to scope it next.
+- Phase 28 (Authenticode chain-walker — REQ-AUDC-01..03) is **Windows-host-required** because it touches `windows-sys` features and `WinVerifyTrust` chain walking — Windows is the right host for this.
+- Phase 26 (PKG streaming follow-up — REQ-PKGS-01..04) is cross-platform but the integration tests benefit from a real Linux/macOS host for streaming verification; can plan on Windows but defer execution similar to 25-01.
+- Phase 29 (WR-01 reject-stage unification — REQ-WRU-01..02) is product-decision-first; can plan on any host.
+
+**v2.3 recommended phase order (revised after Plan 25-02 completion):**
+1. Phase 25 Plan 25-01 (RESL Unix backends) — execute when on Linux/macOS host. Closes the Linux POC credibility issue.
+2. Phase 27 (audit-attestation hardening) — Windows-host-friendly; closes v2.2 attestation production-readiness gap.
+3. Phase 28 (Authenticode chain-walker) — Windows-host-required; lights up v2.2 AUD-03 partial.
+4. Phase 26 (PKG streaming follow-up) — closes v2.2 PKG-01 partial; integration tests prefer Linux/macOS host.
+5. Phase 29 (WR-01 unification) — last; product decision builds on whatever the audit-ledger surface looks like after the others land.
 
 **Status of Phase 19 CLEAN items:**
 

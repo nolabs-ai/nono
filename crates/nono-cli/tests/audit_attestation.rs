@@ -109,7 +109,6 @@ fn only_audit_session_id(home: &Path) -> String {
 // (D-13 satisfied) and they can be unignored in 22-05b after the trust
 // signing refactor (RESEARCH Contradiction #2 deferred-cleanly path).
 #[test]
-#[ignore = "Plan 22-05a deferred to 22-05b: requires from_pkcs8 KeyPair support + sign_statement_bundle (audit_ledger.rs)"]
 fn audit_verify_reports_signed_attestation_with_pinned_public_key() {
     let (_tmp, home, workspace) = setup_isolated_home();
     let key_path = generate_file_signing_key(&home, &workspace);
@@ -160,7 +159,6 @@ fn audit_verify_reports_signed_attestation_with_pinned_public_key() {
 // same upstream-feature-gap rationale; unignore in Plan 22-05b once the
 // trust-signing refactor lands.
 #[test]
-#[ignore = "Plan 22-05a deferred to 22-05b: requires from_pkcs8 KeyPair support + sign_statement_bundle (audit_ledger.rs)"]
 fn rollback_signed_session_verifies_from_audit_dir_bundle() {
     let (_tmp, home, workspace) = setup_isolated_home();
     fs::write(workspace.join("tracked.txt"), "before\n").expect("write tracked file");

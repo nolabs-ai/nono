@@ -1,8 +1,8 @@
 //! Profile system for pre-configured capability sets
 //!
 //! Profiles provide named configurations for common applications like
-//! claude-code, openclaw, and opencode. They can be built-in (compiled
-//! into the binary) or user-defined (in ~/.config/nono/profiles/).
+//! opencode and swival. They can be built-in (compiled into the binary),
+//! installed via registry packs, or user-defined (in ~/.config/nono/profiles/).
 
 pub(crate) mod builtin;
 
@@ -2694,12 +2694,14 @@ mod tests {
     #[test]
     fn test_list_profiles() {
         let profiles = list_profiles();
-        assert!(profiles.contains(&"openclaw".to_string()));
         assert!(profiles.contains(&"opencode".to_string()));
-        // claude-code and codex were removed from the inbuilt profiles in
-        // v0.43.0; they ship via registry packs.
+        // Profiles removed from built-ins; now ship via registry packs:
+        //   claude-code → always-further/claude   (removed v0.43.0)
+        //   codex       → always-further/codex    (removed v0.43.0)
+        //   openclaw    → always-further/openclaw (removed v0.44.0)
         assert!(!profiles.contains(&"claude-code".to_string()));
         assert!(!profiles.contains(&"codex".to_string()));
+        assert!(!profiles.contains(&"openclaw".to_string()));
     }
 
     #[test]

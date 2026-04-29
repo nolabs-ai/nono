@@ -39,14 +39,11 @@ mod tests {
     }
 
     #[test]
-    fn test_get_builtin_openclaw() {
-        let profile = get_builtin("openclaw").expect("Profile not found");
-        assert_eq!(profile.meta.name, "openclaw");
-        assert!(!profile.network.block); // network allowed
-        assert!(profile
-            .filesystem
-            .allow
-            .contains(&"$HOME/.openclaw".to_string()));
+    fn test_openclaw_no_longer_inbuilt() {
+        // Removed in v0.44.0: openclaw ships via the registry pack
+        // `always-further/openclaw` and is resolved through the user-profile
+        // symlink, not the embedded policy.json.
+        assert!(get_builtin("openclaw").is_none());
     }
 
     #[test]
@@ -96,15 +93,16 @@ mod tests {
         let profiles = list_builtin();
         assert!(profiles.contains(&"default".to_string()));
         assert!(profiles.contains(&"linux-host-compat".to_string()));
-        assert!(profiles.contains(&"openclaw".to_string()));
         assert!(profiles.contains(&"opencode".to_string()));
         assert!(profiles.contains(&"swival".to_string()));
         // Profiles that ship via registry packs instead of as built-ins:
-        //   claude-code → always-further/claude (removed v0.43.0)
-        //   codex       → always-further/codex  (removed v0.43.0)
+        //   claude-code → always-further/claude   (removed v0.43.0)
+        //   codex       → always-further/codex    (removed v0.43.0)
+        //   openclaw    → always-further/openclaw (removed v0.44.0)
         assert!(!profiles.contains(&"claude-code".to_string()));
         assert!(!profiles.contains(&"claude-no-kc".to_string()));
         assert!(!profiles.contains(&"codex".to_string()));
+        assert!(!profiles.contains(&"openclaw".to_string()));
     }
 
     #[test]
@@ -133,13 +131,13 @@ mod tests {
     fn test_profile_exclusion_mechanism() {
         // Verify that built-in profiles resolve exclusions through the shared
         // group-exclusion path. Current embedded profiles do not exclude any.
-        let profile = get_builtin("openclaw").expect("Profile not found");
+        let profile = get_builtin("opencode").expect("Profile not found");
         let default = get_builtin("default").expect("default profile");
         // All default groups should be present since embedded exclusions are empty.
         for group in &default.security.groups {
             assert!(
                 profile.security.groups.contains(group),
-                "openclaw should contain default profile group '{}'",
+                "opencode should contain default profile group '{}'",
                 group
             );
         }

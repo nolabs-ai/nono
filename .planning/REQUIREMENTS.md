@@ -251,8 +251,8 @@ To be filled by gsd-roadmapper at v2.3 phase scope-lock (currently at REQUIREMEN
 | AUDC-01 | Phase 28 (Plan 28-01) | Complete (2026-04-30; commits 67ba4a99/70593110/5a4a8443) — chain walker live; `parse_signer_subject` returns CERT_X500_NAME_STR keyed-RDN; `parse_thumbprint` returns 40-char UPPERCASE hex SHA-1 |
 | AUDC-02 | Phase 28 (Plan 28-01) | Complete (2026-04-30; commit 279c1b86) — `authenticode_signed_records_subject` test relocated inline (PATH-4 per CONTEXT override) and re-enabled; #[ignore] count → 0 |
 | AUDC-03 | Phase 28 (Plan 28-01) | Complete (2026-04-30; commit 70593110) — fail-closed `?` propagation in `query_authenticode_status` Valid branch; `<unknown>` sentinel fallback removed; reuses `NonoError::SandboxInit` (D-AUDC-02 deviation: `AuditIntegrity` variant doesn't exist on fork) |
-| WRU-01 | Phase 29 | Active |
-| WRU-02 | Phase 29 | Active |
+| WRU-01 | Phase 29 (Plan 29-01) | Complete (2026-04-30; commit a3734bb3) — locked as permanent design property (Option c). Mask-gate is O(1) profile lookup; broker-failure flip is O(syscall) post-approval; asymmetry not unifiable without security or UX regression. |
+| WRU-02 | Phase 29 (Plan 29-01) | Complete (2026-04-30; commit 9fcdf123) — chosen verdict matrix is the EXISTING matrix; all 5 `wr01_*` regression tests pass with assertions UNCHANGED; Phase 23 `RejectStage` wire shape preserved verbatim. |
 
 **Coverage target:**
 - v2.3 requirements: 14 total

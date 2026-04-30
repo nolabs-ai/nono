@@ -2,16 +2,16 @@
 gsd_state_version: 1.0
 milestone: v2.3
 milestone_name: Linux POC Unblock + Deferreds Closure
-status: v2.3 in progress. Phase 28 (Authenticode chain walker) shipped 2026-04-30 (commits 67ba4a99/70593110/5a4a8443/279c1b86/91a3f64a); REQ-AUDC-01..03 all closed. Earlier 2026-04-29: Phase 25 Plan 25-02 ADR (REQ-AIPC-NIX-01 closed); Phase 27 PARTIAL with Windows test-harness blockers (REQ-AAH-01 re-deferred to v2.4). 5/14 v2.3 reqs closed; remaining: RESL-NIX-01..03 (Plan 25-01 awaits Linux/macOS host), AAH-01 (deferred), PKGS-01..04 (Phase 26 unplanned), WRU-01..02 (Phase 29 unplanned).
-stopped_at: Phase 28 closed end-to-end. 5 atomic commits, 11 SAFETY blocks, 4 new unit tests against C:\Windows\explorer.exe fixture (notepad.exe catalog-signed on Win11). Behavior change: <unknown> sentinel fallback removed; users seeing <unknown> on Valid pre-Phase-28 will now see hard `NonoError::SandboxInit("authenticode chain-walk failed (REQ-AUDC-03 fail-closed): ...")` errors.
+status: v2.3 in progress. Phase 29 (WR-01 reject-stage Option c — locked design property) closed 2026-04-30 (commits a3734bb3/9fcdf123 + SUMMARY); REQ-WRU-01..02 closed. Earlier 2026-04-30: Phase 28 (Authenticode chain walker) closed (REQ-AUDC-01..03). Earlier 2026-04-29: Phase 25 Plan 25-02 (REQ-AIPC-NIX-01); Phase 27 PARTIAL (REQ-AAH-01 re-deferred to v2.4). 7/14 v2.3 reqs closed; remaining: RESL-NIX-01..03 (Plan 25-01 awaits Linux/macOS host), AAH-01 (deferred), PKGS-01..04 (Phase 26 unplanned).
+stopped_at: Phase 29 closed end-to-end. 3 atomic commits, 5/5 critical verification gates pass (clippy gate documented-skip per Phase 23 precedent — pre-existing nono::manifest issues out-of-scope). No behavior change; chosen verdict matrix is the existing matrix; all 5 `wr01_*` tests pass with assertions UNCHANGED.
 last_updated: "2026-04-29T00:00:00.000Z"
 last_activity: 2026-04-29
 progress:
   total_phases: 34
-  completed_phases: 27
+  completed_phases: 28
   total_plans: 88
-  completed_plans: 84
-  percent: 79
+  completed_plans: 85
+  percent: 82
 ---
 
 # Project State: nono — v2.3 Linux POC Unblock + Deferreds Closure

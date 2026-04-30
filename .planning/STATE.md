@@ -2,16 +2,16 @@
 gsd_state_version: 1.0
 milestone: v2.3
 milestone_name: Linux POC Unblock + Deferreds Closure
-status: v2.3 in progress. Phase 25 Plan 25-02 (AIPC Unix Futures ADR) shipped 2026-04-29 (commit 30d6fdb1); REQ-AIPC-NIX-01 closed. Phase 27 PARTIAL — Path B attempt 2026-04-29 surfaced 3 Windows-host test-harness blockers; REQ-AAH-01 re-deferred to v2.4 (commits c2247f79/16bae9ca/8aeabc08/329f313b; production code byte-identical preserved). Plan 25-01 awaiting Linux/macOS host. Phases 26/28/29 not yet planned.
-stopped_at: Phase 27 closed-with-deferral. Surfaced systemic Windows test-harness gap affecting any phase needing full integration tests (`dirs::home_dir()` ignores USERPROFILE; LOCALAPPDATA/USERPROFILE path-mismatch; audit-integrity exit-cleanup pre-existing).
+status: v2.3 in progress. Phase 28 (Authenticode chain walker) shipped 2026-04-30 (commits 67ba4a99/70593110/5a4a8443/279c1b86/91a3f64a); REQ-AUDC-01..03 all closed. Earlier 2026-04-29: Phase 25 Plan 25-02 ADR (REQ-AIPC-NIX-01 closed); Phase 27 PARTIAL with Windows test-harness blockers (REQ-AAH-01 re-deferred to v2.4). 5/14 v2.3 reqs closed; remaining: RESL-NIX-01..03 (Plan 25-01 awaits Linux/macOS host), AAH-01 (deferred), PKGS-01..04 (Phase 26 unplanned), WRU-01..02 (Phase 29 unplanned).
+stopped_at: Phase 28 closed end-to-end. 5 atomic commits, 11 SAFETY blocks, 4 new unit tests against C:\Windows\explorer.exe fixture (notepad.exe catalog-signed on Win11). Behavior change: <unknown> sentinel fallback removed; users seeing <unknown> on Valid pre-Phase-28 will now see hard `NonoError::SandboxInit("authenticode chain-walk failed (REQ-AUDC-03 fail-closed): ...")` errors.
 last_updated: "2026-04-29T00:00:00.000Z"
 last_activity: 2026-04-29
 progress:
   total_phases: 34
-  completed_phases: 26
+  completed_phases: 27
   total_plans: 88
-  completed_plans: 83
-  percent: 76
+  completed_plans: 84
+  percent: 79
 ---
 
 # Project State: nono — v2.3 Linux POC Unblock + Deferreds Closure

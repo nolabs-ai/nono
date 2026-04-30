@@ -103,10 +103,10 @@ Windows security must be as structurally impossible and feature-complete as Unix
 ### Active (v2.3)
 
 - **REQ-AIPC-NIX-01** — ✓ closed via Phase 25 Plan 25-02 (ADR shipped 2026-04-29).
+- **REQ-AUDC-01..03** — ✓ all closed via Phase 28 Plan 28-01 (chain walker shipped 2026-04-30; behavior change: `<unknown>` sentinel fallback removed → fail-closed on chain-walk failure when `WinVerifyTrust=Valid`).
 - **REQ-RESL-NIX-01..03** — Phase 25 Plan 25-01 (deferred to Linux/macOS-host session).
-- **REQ-PKGS-01..04** — Phase 26: PKG Streaming Follow-Up.
-- **REQ-AUDC-01..03** — Phase 28: Authenticode Chain-Walker Subject Extraction.
-- **REQ-WRU-01..02** — Phase 29: WR-01 Reject-Stage Unification.
+- **REQ-PKGS-01..04** — Phase 26: PKG Streaming Follow-Up (unplanned).
+- **REQ-WRU-01..02** — Phase 29: WR-01 Reject-Stage Unification (unplanned).
 
 (REQ-AAH-01 was Phase 27 active scope but re-deferred to v2.4 on 2026-04-29 after the Path B Windows-host attempt surfaced systemic test-harness blockers — see Deferred section below.)
 
@@ -210,4 +210,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-04-29 after Phase 27 partial close. v2.3 progress: REQ-AIPC-NIX-01 closed via Phase 25 Plan 25-02 (ADR shipped, commit `30d6fdb1`). Phase 27 Plan 27-01 attempted on Windows; surfaced 3 systemic test-harness blockers (`dirs::home_dir()` ignores `USERPROFILE`, LOCALAPPDATA/USERPROFILE mismatch, audit-integrity exit-cleanup pre-existing). REQ-AAH-01 re-deferred to v2.4 with concrete resumption path; production code byte-identical preserved; redesigned Test 1 body preserved in-tree for v2.4. v2.4 candidate: "Windows test-harness HOME redirection" via `NONO_TEST_HOME` production-code seam — unblocks all v2.3+ Windows-host integration testing. Recommended next phases on Windows: 28 (Authenticode chain-walker, mostly Windows-API unit tests, least exposed to harness gap), then 29 (WR-01 unification). Phases 25-01 + 27-01 resumption + 26 prefer Linux/macOS host. Earlier 2026-04-29 v2.2 close: 3 phases (22–24), 9 plans, 21 requirements; 146 commits since `v2.1`; +33,153 / −835 LOC.*
+*Last updated: 2026-04-30 after Phase 28 close. v2.3 progress: 5/14 requirements closed — REQ-AIPC-NIX-01 (Phase 25 Plan 25-02 ADR, commit `30d6fdb1`); REQ-AUDC-01..03 (Phase 28 Plan 28-01 chain walker, commits `67ba4a99`/`70593110`/`5a4a8443`/`279c1b86`/`91a3f64a`). Phase 28 behavior change: `<unknown>` sentinel fallback on Valid+chain-walk-failure removed → fail-closed via `NonoError::SandboxInit` (D-AUDC-02: `AuditIntegrity` variant doesn't exist on fork). Phase 27 partial-deferred 2026-04-29 (REQ-AAH-01 to v2.4 due to Windows test-harness blockers); v2.4 candidate phase: "Windows test-harness HOME redirection" via `NONO_TEST_HOME` seam. Remaining v2.3 work: REQ-RESL-NIX-01..03 (Plan 25-01 awaits Linux/macOS host), REQ-PKGS-01..04 (Phase 26 unplanned), REQ-WRU-01..02 (Phase 29 unplanned). Earlier 2026-04-29 v2.2 close: 3 phases (22–24), 9 plans, 21 requirements; 146 commits since `v2.1`; +33,153 / −835 LOC.*

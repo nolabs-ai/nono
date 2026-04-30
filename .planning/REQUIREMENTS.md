@@ -248,9 +248,9 @@ To be filled by gsd-roadmapper at v2.3 phase scope-lock (currently at REQUIREMEN
 | PKGS-03 | Phase 26 | Active |
 | PKGS-04 | Phase 26 | Active |
 | AAH-01 | Phase 27 (PARTIAL) | Re-deferred to v2.4 (2026-04-29) — Path B Windows attempt surfaced 3 systemic test-harness blockers; production code byte-identical preserved; redesigned Test 1 body preserved in-tree under `#[ignore]` for v2.4 resumption. See `.planning/phases/27-audit-attestation-hardening/27-01-SUMMARY.md`. |
-| AUDC-01 | Phase 28 | Active |
-| AUDC-02 | Phase 28 | Active |
-| AUDC-03 | Phase 28 | Active |
+| AUDC-01 | Phase 28 (Plan 28-01) | Complete (2026-04-30; commits 67ba4a99/70593110/5a4a8443) — chain walker live; `parse_signer_subject` returns CERT_X500_NAME_STR keyed-RDN; `parse_thumbprint` returns 40-char UPPERCASE hex SHA-1 |
+| AUDC-02 | Phase 28 (Plan 28-01) | Complete (2026-04-30; commit 279c1b86) — `authenticode_signed_records_subject` test relocated inline (PATH-4 per CONTEXT override) and re-enabled; #[ignore] count → 0 |
+| AUDC-03 | Phase 28 (Plan 28-01) | Complete (2026-04-30; commit 70593110) — fail-closed `?` propagation in `query_authenticode_status` Valid branch; `<unknown>` sentinel fallback removed; reuses `NonoError::SandboxInit` (D-AUDC-02 deviation: `AuditIntegrity` variant doesn't exist on fork) |
 | WRU-01 | Phase 29 | Active |
 | WRU-02 | Phase 29 | Active |
 

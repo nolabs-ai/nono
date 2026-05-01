@@ -243,10 +243,10 @@ To be filled by gsd-roadmapper at v2.3 phase scope-lock (currently at REQUIREMEN
 | RESL-NIX-02 | Phase 25 (Plan 25-01) | Active |
 | RESL-NIX-03 | Phase 25 (Plan 25-01) | Active |
 | AIPC-NIX-01 | Phase 25 (Plan 25-02) | Active |
-| PKGS-01 | Phase 26 | Active |
-| PKGS-02 | Phase 26 | Active |
-| PKGS-03 | Phase 26 | Active |
-| PKGS-04 | Phase 26 | Active |
+| PKGS-01 | Phase 26 (Plan 26-02) | Active — plan + CONTEXT committed (commit 86efcdeb); execution queued for Linux/macOS host (streaming RSS measurement + run_nono e2e tests hit Phase 27 dirs::home_dir() Windows blocker) |
+| PKGS-02 | Phase 26 (Plan 26-01) | Complete (2026-05-01; commits e5e1f2d7/8ff89923) — D-20 manual replay of upstream `58b5a24e` (cherry-pick would have deleted fork's `validate_path_within`, a security regression); both validators preserved as defense-in-depth; 2 unit tests (`validate_relative_path_rejects_traversal` + `validate_relative_path_rejects_absolute_path`) pass |
+| PKGS-03 | Phase 26 (Plan 26-01) | Complete (2026-05-01; commits dd7b28b3/797f3295/8ff89923) — `ArtifactType::Plugin` added as 7th variant (Script was missed in v2.3 REQUIREMENTS.md scope-lock; Plugin is 7th not 6th); plumbed via 1 match-arm site (cargo build cascade-driven); deferred-divergence comment removed atomically with the variant addition; 2 unit tests (`artifact_type_plugin_round_trips` + `artifact_type_unknown_fails_closed`) pass |
+| PKGS-04 | Phase 26 (Plan 26-02) | Active — plan + CONTEXT committed (commit 86efcdeb); execution queued for Linux/macOS host (auto-pull e2e tests hit Phase 27 Windows blocker) |
 | AAH-01 | Phase 27 (PARTIAL) | Re-deferred to v2.4 (2026-04-29) — Path B Windows attempt surfaced 3 systemic test-harness blockers; production code byte-identical preserved; redesigned Test 1 body preserved in-tree under `#[ignore]` for v2.4 resumption. See `.planning/phases/27-audit-attestation-hardening/27-01-SUMMARY.md`. |
 | AUDC-01 | Phase 28 (Plan 28-01) | Complete (2026-04-30; commits 67ba4a99/70593110/5a4a8443) — chain walker live; `parse_signer_subject` returns CERT_X500_NAME_STR keyed-RDN; `parse_thumbprint` returns 40-char UPPERCASE hex SHA-1 |
 | AUDC-02 | Phase 28 (Plan 28-01) | Complete (2026-04-30; commit 279c1b86) — `authenticode_signed_records_subject` test relocated inline (PATH-4 per CONTEXT override) and re-enabled; #[ignore] count → 0 |

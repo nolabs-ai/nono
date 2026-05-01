@@ -1336,6 +1336,75 @@ mod tests {
         assert_eq!(rw_cap.access, AccessMode::ReadWrite);
     }
 
+    /// Regression test for the `--allow-cwd` deny-bypass bug.
+    ///
+    /// A profile that denies `$WORKDIR/.ssh` must not be silently neutralised
+    /// when the caller adds the workdir as an allow path *after* `from_profile`
+    /// returns (which is what `--allow-cwd` does in `prepare_sandbox`). The
+    /// fix exposes `PreparedCaps::deny_paths` so the caller can re-run
+    /// `validate_deny_overlaps` against the full set of grants and fail closed
+    /// on Linux.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_prepared_caps_deny_paths_catch_post_profile_cwd_overlap() {
+        let dir = tempdir().expect("tmpdir");
+        let workdir = dir.path().join("project");
+        let denied = workdir.join(".ssh");
+        std::fs::create_dir_all(&denied).expect("mkdir denied child");
+
+        // Exclude `system_write_linux` (default group) — it grants write to
+        // `/tmp`, which the test's tempdir lives under. Without the exclusion
+        // the *initial* validate_deny_overlaps inside from_profile fires on
+        // that group's `/tmp` allow vs our deny under `/tmp/.../.ssh`, before
+        // we ever get to exercise the post-CWD validation that is the actual
+        // subject of this regression.
+        let profile_path = dir.path().join("post-cwd-deny.json");
+        std::fs::write(
+            &profile_path,
+            format!(
+                r#"{{
+                    "meta": {{ "name": "post-cwd-deny" }},
+                    "policy": {{
+                        "exclude_groups": ["system_write_linux"],
+                        "add_deny_access": ["{}"]
+                    }}
+                }}"#,
+                denied.display()
+            ),
+        )
+        .expect("write profile");
+        let profile = crate::profile::load_profile_from_path(&profile_path).expect("load profile");
+
+        with_env_lock(|| {
+            // from_profile succeeds because CWD is not yet present in caps.
+            let prepared = CapabilitySet::from_profile(&profile, &workdir, &sandbox_args())
+                .expect("profile builds (no CWD allow yet)");
+
+            assert!(
+                prepared.deny_paths.iter().any(|p| p == &denied),
+                "PreparedCaps::deny_paths must include profile add_deny_access entries; \
+                 got {:?}",
+                prepared.deny_paths,
+            );
+
+            // Simulate the --allow-cwd grant added by prepare_sandbox.
+            let mut caps = prepared.caps;
+            let cwd_canonical = workdir.canonicalize().expect("canonicalize workdir");
+            let cap = nono::FsCapability::new_dir(cwd_canonical, AccessMode::ReadWrite)
+                .expect("build cwd cap");
+            caps.add_fs(cap);
+
+            // Re-validating against the same deny set must now reject the
+            // configuration: Landlock cannot enforce a deny under an allow.
+            let err = crate::policy::validate_deny_overlaps(&prepared.deny_paths, &caps)
+                .expect_err("post-CWD validation must fail on linux");
+            assert!(
+                err.to_string().contains("Landlock deny-overlap"),
+                "unexpected error: {err}"
+            );
+        });
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn test_from_profile_policy_add_deny_access_participates_in_overlap_validation() {

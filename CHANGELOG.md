@@ -1,5 +1,604 @@
 # Changelog
 
+## [0.46.0] - 2026-05-01
+
+### Bug Fixes
+
+- *(policy)* Add XDG_STATE_HOME nix profiles path to nix_runtime group
+
+- *(policy)* Make nix_runtime group cross-platform
+
+- *(cli)* Re-validate deny overlaps after all grants
+
+- Update examples in setup.rs
+
+
+### Features
+
+- *(network)* Support GitLab developer domains
+
+
+### Testing
+
+- *(cli-tests)* Add workdir access to deny overlap test
+
+- Exclude system_write_linux in post-CWD overlap regression test
+
+## [0.45.0] - 2026-04-30
+
+### Features
+
+- *(packages)* Use native tls root certificates
+
+## [0.44.0] - 2026-04-29
+
+### Bug Fixes
+
+- *(package)* Harden re-pulls against user edits
+
+- *(wiring)* Harden install and uninstall wiring
+
+
+### Features
+
+- *(claude)* Detect and remove pre-0.43 inbuilt hook leftovers (`~/.claude/hooks/nono-hook.sh` and matching `settings.json::hooks` entry) on first
+   claude pack install/resolve, with a confirmation prompt and a per-item summary
+- *(profile, migration)* Move codex, claude-code to registry pack
+
+
+### Miscellaneous
+
+- *(ci)* Improve ci stability and profile test coverage
+
+
+### Refactoring
+
+- *(wiring)* Simplify string expansion
+
+## [0.43.1] - 2026-04-29
+
+### Bug Fixes
+
+- *(cli)* Char-aware truncation in truncate_command
+
+## [0.43.0] - 2026-04-28
+
+### Bug Fixes
+
+- *(cli)* Fail fast on --allow-connect-port on macOS
+
+- Set system-keyring as default feature for backward compatibility
+
+
+### Dependencies
+
+- *(deps)* Bump aws-lc-rs from 1.16.2 to 1.16.3
+
+- *(deps)* Bump hyper from 1.8.1 to 1.9.0
+
+
+### Features
+
+- *(cli)* Add --allow-connect-port for outbound TCP port allowlisting
+
+- Make system keyring optional for headless/container builds
+
+
+### Style
+
+- Run cargo fmt
+
+## [0.42.0] - 2026-04-25
+
+### Bug Fixes
+
+- *(proxy)* Stop adding allow_domain hosts to NO_PROXY without direct TCP grants
+
+
+### Documentation
+
+- Add --allow-unix-socket* flags and profile fields
+
+
+### Features
+
+- *(cli)* Add --allow-unix-socket flag family + profile schema
+
+- *(capability)* Add UnixSocketCapability and UnixSocketMode
+
+## [0.41.0] - 2026-04-24
+
+### Bug Fixes
+
+- *(cli)* Improve attach/detach scrollback and alt-screen
+
+- *(pty-proxy)* Ensure full scrollback on reattach for normal screen
+
+- *(cli)* Improve profile save resilience and policy suggestions
+
+- *(signals)* Prevent signal swallowing
+
+
+### Features
+
+- *(pty-proxy)* Scroll viewport to native scrollback on detach
+
+- *(pty)* Enhance detach notice and terminal cleanup
+
+- *(pty)* Preserve outer terminal scrollback on attach
+
+- *(cli)* Consolidate 'nono policy' subcommands under 'nono profile' with deprecation alias (#594)
+
+- *(cli)* Enhance prompts and denial diagnostics
+
+- *(cli)* Improve denial diagnostics and profile saving workflow
+
+
+### Refactoring
+
+- *(cli-startup-prompt)* Extract startup prompt functions
+
+## [0.40.1] - 2026-04-23
+
+### Bug Fixes
+
+- *(policy)* Improve unlink rules; add claude read path
+
+
+### Miscellaneous
+
+- Add gitignore entries and hiring badge
+
+## [0.40.0] - 2026-04-23
+
+### Bug Fixes
+
+- *(sandbox)* Downgrade unsafe seatbelt rules log from warn to info
+
+- Add unsafe_macos_seatbelt_rules to test Profile initializers
+
+- Address review feedback
+
+- *(reverse-proxy)* Disallow insecure http upstreams for unspecified local addresses
+
+- *(proxy)* Support local-only http upstreams safely
+
+- *(proxy)* Restrict insecure http upstreams to local-only targets
+
+- *(policy)* Update tests and claude-no-kc for allow_file move
+
+- *(policy)* Move .claude.lock to allow_file for least-privilege access
+
+- *(cli)* Skip non-existent profile deny overrides
+
+
+### Build
+
+- *(docker)* Harden user and create work dir
+
+
+### Dependencies
+
+- *(deps)* Update rustls-webpki
+
+- *(deps)* Bump rustls-webpki from 0.103.12 to 0.103.13
+
+
+### Documentation
+
+- *(agents)* Update agent contribution policy and project overview
+
+- Add documentation for agents and claude
+
+
+### Features
+
+- Add unsafe_macos_seatbelt_rules profile field
+
+- *(reverse-proxy)* Add http upstream support
+
+- *(audit)* Refine audit path derivation and documentation
+
+- *(audit)* Add audit attestation for session merkle roots
+
+- *(audit)* Record exec identity and unify audit integrity
+
+- *(audit)* Record executable identity and improve integrity
+
+- *(audit)* Add audit verify command for integrity checks
+
+- *(audit)* Add tamper-evident audit log integrity
+
+- *(rollback)* Refine snapshot exclusion and path tracking
+
+- *(audit)* Capture pre/post merkle roots in audit trail
+
+
+### Miscellaneous
+
+- *(cli)* Make path and policy messages informational
+
+- *(test-env)* Isolate integration tests from audit artifacts
+
+
+### Refactoring
+
+- *(docker)* Move dockerfiles and update build workflow
+
+- *(policy)* Enforce stricter policy for overrides, rollback
+
+
+### Testing
+
+- Improve profile and edge case test accuracy
+
+- *(profiles)* Add tests for missing codex profile
+
+
+### Style
+
+- Run cargo fmt
+
+## [0.39.0] - 2026-04-21
+
+### Bug Fixes
+
+- *(dry)* Duplicated allow_domain warning-print logic
+
+- *(tests)* Tests and format fixes
+
+- *(network)* Keep --allow-domain in strict proxy-only mode
+
+- *(policy)* Add entry for ~.local/share/claude/versions
+
+- *(learn)* Validate profile name and re-prompt on invalid input
+
+- *(oauth)* PR 517 rebase on main
+
+- Compilation against current main after rebase
+
+- *(proxy)* Return early after 413 in read_request_body
+
+
+### Dependencies
+
+- *(deps)* Bump clap from 4.6.0 to 4.6.1
+
+- *(deps)* Bump tokio from 1.51.0 to 1.52.1
+
+- *(deps)* Bump semver from 1.0.27 to 1.0.28
+
+- *(deps)* Bump actions/cache from 5.0.4 to 5.0.5
+
+
+### Features
+
+- *(policy)* Filter profile override deny entries without grants
+
+- *(claude)* Add no-keychain profile and expand existing access
+
+- *(profile)* Support OAuth2 auth config in custom_credentials
+
+- *(proxy)* Implement OAuth2 client_credentials token exchange with cache
+
+- *(config)* Add OAuth2Config type for client_credentials flow
+
+## [0.38.0] - 2026-04-20
+
+### Bug Fixes
+
+- *(trust)* Function or associated item not found in `TrustedRoot`
+
+- *(package)* Harden package installation security
+
+- *(hooks)* Invoke bash via env
+
+
+### Documentation
+
+- *(cli-package-publishing)* Add warning for unreleased feature
+
+- *(cli)* Add installation instructions for nix
+
+
+### Features
+
+- *(trust)* Prefer CI_CONFIG_REF_URI for GitLab workflow identity
+
+- *(claude-code)* Remove claude-code integration package
+
+- *(profile)* Add support for loading profiles from registry packs
+
+- *(profile)* Introduce packs and command_args for profiles
+
+- *(pack)* Introduce pack types and unify package naming
+
+- *(package)* Add install_dir artifact placement and hook unregistration
+
+- *(cli)* Add package management commands (pull, remove, search, list)
+
+- Implements environment variables filtering #688
+
+
+### Miscellaneous
+
+- Release v0.37.1
+
+
+### Refactoring
+
+- *(pkg)* Stream package artifact downloads
+
+- *(package)* Simplify artifact signer validation
+
+- *(package-cmd)* Centralize trust bundle for package verification
+
+- *(cli)* Improve artifact path validation
+
+
+### Style
+
+- Cargo fmt
+
+## [0.37.1] - 2026-04-17
+
+### Bug Fixes
+
+- *(macos)* Emit specific-op seatbelt rules for keychain DB allows
+
+- *(sandbox)* Allow Unix domain socket connections in restricted network modes
+
+- *(learn)* Print profile JSON as fallback when save fails
+
+
+### Documentation
+
+- Add github to credential route configuration
+
+
+### Miscellaneous
+
+- Upgrade rustls-webpki to 0.103.12 to fix RUSTSEC-2026-0098 and RUSTSEC-2026-0099
+
+- Upgrade rustls-webpki to 0.103.12 to fix RUSTSEC-2026-0098 and RUSTSEC-2026-0099
+
+
+### Style
+
+- Apply rustfmt
+
+## [0.37.0] - 2026-04-16
+
+### Bug Fixes
+
+- *(claude-code)* Enable token refresh via .claude.json symlink
+
+- *(profiles)* Prevent infinite recursion in profile extends check
+
+- *(sandbox)* Support claude-code profile extensions and simplify config
+
+
+### Features
+
+- *(claude-code)* Pre-create claude config lock directory
+
+
+### Refactoring
+
+- *(proxy-tls)* Remove rustls-pemfile and use pki_types for pem parsing
+
+## [0.36.0] - 2026-04-15
+
+### Bug Fixes
+
+- *(proxy)* Downgrade CONNECT-to-route-upstream log from warn to debug
+
+
+### Features
+
+- Add ?decode=go-keyring query param for keyring:// URIs
+
+- Add keyring:// URI scheme for custom-service credential lookup
+
+## [0.35.0] - 2026-04-14
+
+### Bug Fixes
+
+- Chore: lint
+
+- Chore: revert to json! obj syntax
+
+- Chore: split predicate out again for provider specific claims
+
+- Refactor: expose build config URI extension
+
+- *(pty)* Improve session gone error detection when connecting
+
+- *(cli)* Increase detached session startup timeout and order
+
+
+### Features
+
+- *(trust)* Support GitLab ID tokens for signing
+
+- Strip proxy artifacts and fix upstream connection handling
+
+
+### Miscellaneous
+
+- Revert doc string
+
+- Drop example workflow in comment
+
+- Mention GitLab tokens in doc comment
+
+
+### Refactoring
+
+- Use append to merge signer fields
+
+- Use build signer URI extension for trust
+
+## [0.34.0] - 2026-04-13
+
+### Bug Fixes
+
+- *(gpu)* Grant NVIDIA procfs paths required for CUDA init under --allow-gpu
+
+- *(gpu)* Add nvidia-uvm-tools to GPU device allowlist
+
+- *(proxy)* Add missing proxy field in regression tests
+
+- *(network-policy)* Activate anthropic credential in claude-code profile
+
+- *(proxy)* Set ANTHROPIC_API_KEY phantom token for anthropic credential
+
+- *(sandbox)* Use relative path for ~/.claude.json symlink
+
+- *(sandbox)* Redirect ~/.claude.json to ~/.claude/ via symlink on all unix platforms
+
+
+### Dependencies
+
+- *(deps)* Bump rustls from 0.23.37 to 0.23.38
+
+- *(deps)* Bump similar from 2.7.0 to 3.1.0
+
+- *(deps)* Bump rand from 0.10.0 to 0.10.1
+
+- *(deps)* Bump always-further/agent-sign from 0.0.8 to 0.0.11
+
+- *(deps)* Bump peter-evans/repository-dispatch from 3.0.0 to 4.0.1
+
+- *(deps)* Bump docker/build-push-action from 7.0.0 to 7.1.0
+
+- *(deps)* Bump softprops/action-gh-release from 2.6.1 to 3.0.0
+
+- *(deps)* Bump actions/upload-artifact from 7.0.0 to 7.0.1
+
+
+### Features
+
+- *(macos)* Auto-enable claude launch services, refine keychain access
+
+
+### Refactoring
+
+- *(policy)* Improve seatbelt path regex escaping
+
+
+### Testing
+
+- *(gpu)* Add unit + integration coverage for NVIDIA procfs grants
+
+- *(gpu)* Extract is_nvidia_compute_device predicate and add unit tests
+
+- *(proxy)* Add regression test for issue #624 phantom token bug
+
+
+### Style
+
+- Fix rustfmt formatting in sandbox_prepare.rs
+
+## [0.33.0] - 2026-04-12
+
+### Bug Fixes
+
+- Address review feedback on downstream bump workflows
+
+- *(fmt)* Sort imports alphabetically in command_runtime.rs
+
+- *(shell)* Initialize proxy runtime when credentials are configured
+
+- *(cli)* Decouple audit trail from rollback
+
+- *(proxy)* Guard macOS keychain hint with platform check
+
+- *(proxy)* Warn when keychain credential is not found
+
+- *(landlock)* Widen /proc/self Landlock rule to /proc for grandchild access
+
+- *(seccomp)* Resolve /proc/self correctly for grandchild processes
+
+- *(cli)* Adjust ps command output column widths
+
+- *(cli)* Align status and attach columns in ps output
+
+- *(test)* Add --allow-cwd to GPU integration tests
+
+- *(cli)* Compile dummy GPU function for non-macOS tests
+
+- *(pty-proxy)* Exit early if client socket cannot be set nonblocking
+
+- *(pty)* Correctly handle blocking state for attach streams
+
+- *(sandbox)* Prevent interactive CWD prompt in detached mode
+
+- Tighten GPU IOKit surface to AGXDeviceUserClient only
+
+- *(test)* Handle non-default TMPDIR in linux nested home grant test
+
+- *(policy)* Remove broad ~/.local allow from openclaw profile on Linux
+
+
+### CI/CD
+
+- Remove nono-registry from downstream dispatch
+
+- Add release automation for downstream SDK repos
+
+
+### Documentation
+
+- *(readme)* Add early alpha warning and remove separator
+
+- *(readme)* Overhaul content and visuals
+
+- *(cli)* Clarify --allow-gpu flag behavior and profile interaction
+
+
+### Features
+
+- *(macos)* Make parent-of-protected-root relaxation opt-in via profile
+
+- *(gpu)* Add WSL2 GPU support via /dev/dxg passthrough
+
+- *(gpu)* Add WSL2 GPU support via /dev/dxg passthrough
+
+- *(gpu)* Add Linux GPU access and improve macOS support
+
+- *(profile)* Introduce separate profile preparation for preflight
+
+- *(cli)* Introduce pre-flight CWD prompt for detached launches
+
+
+### Miscellaneous
+
+- Remove test results file
+
+
+### Performance
+
+- *(seccomp)* Skip read_tgid for direct child and use Cow for cap_check_path
+
+
+### Refactoring
+
+- *(cli-validation)* Propagate protected parent flag to cli validation
+
+- *(command-blocking)* Improve deprecation warning messages
+
+- *(command-blocking)* Deprecate startup-only command blocking
+
+
+### Testing
+
+- *(macos)* Address Gemini review feedback
+
+- *(macos)* Align GPU IOKit tests with tightened surface from #635
+
+- *(gpu)* Skip DRM tests if no render node permissions
+
 ## [Unreleased]
 
 ### Security

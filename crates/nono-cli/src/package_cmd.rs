@@ -610,6 +610,12 @@ fn install_manifest_artifact(
     artifact: &ArtifactEntry,
     bytes: &[u8],
 ) -> Result<Option<PathBuf>> {
+    // REQ-PKGS-02: input-string pre-check (cheap rejection of `..` Path
+    // components, absolute paths, Windows drive prefixes) BEFORE any
+    // filesystem syscall touches `artifact.path`. Defense-in-depth pair
+    // with `validate_path_within(staging_root, &store_path)?;` below.
+    validate_relative_path(&artifact.path)?;
+
     // Write into the package store (staging root) based on type.
     let store_path = match artifact.artifact_type {
         ArtifactType::Profile => {
@@ -1041,6 +1047,43 @@ fn validate_path_within(base: &Path, full: &Path) -> Result<()> {
             full.display(),
             base.display()
         )));
+    }
+    Ok(())
+}
+
+/// Input-string pre-check (REQ-PKGS-02; ported from upstream commit 58b5a24e).
+///
+/// Rejects absolute paths, root directories, Windows drive prefixes, and `..`
+/// `Path::Component::ParentDir` components BEFORE any filesystem syscall fires.
+/// This is a CHEAP-REJECTION layer that pairs with the canonicalize-and-
+/// component-compare `validate_path_within` (above) for defense-in-depth:
+/// the input-string check rejects obviously-bad shapes early; the canonicalize
+/// check fires post-write and catches symlink-traversal that an input-string
+/// check cannot see.
+///
+/// Per CLAUDE.md § Path Handling, both layers are kept — fork's stance is
+/// stricter than upstream and matches "Defense in Depth" + "Fail Secure".
+fn validate_relative_path(path: &str) -> Result<()> {
+    let p = Path::new(path);
+    if p.is_absolute() {
+        return Err(NonoError::PackageInstall(format!(
+            "artifact path must be relative, got '{path}'"
+        )));
+    }
+    for component in p.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                return Err(NonoError::PackageInstall(format!(
+                    "artifact path contains '..': '{path}'"
+                )));
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                return Err(NonoError::PackageInstall(format!(
+                    "artifact path must be relative, got '{path}'"
+                )));
+            }
+            _ => {}
+        }
     }
     Ok(())
 }

@@ -279,27 +279,34 @@ pub(crate) fn retains_missing_exact_file_grants() -> bool {
     cfg!(target_os = "macos")
 }
 
-/// Extension trait for CapabilitySet to add CLI-specific construction methods.
+/// Result of building a CapabilitySet from CLI args or a profile.
 ///
-/// Both methods return `(CapabilitySet, bool)` where the bool indicates whether
-/// `policy::apply_unlink_overrides()` must be called after all writable paths
-/// are finalized (including CWD). The caller is responsible for calling it.
+/// `needs_unlink_overrides` defers `policy::apply_unlink_overrides()` until the
+/// caller has added every writable path (including CWD).
+///
+/// `deny_paths` carries the resolved policy-deny set (groups + profile
+/// `add_deny_access`) so the caller can re-run `validate_deny_overlaps` after
+/// it adds further allow paths (e.g. `--allow-cwd`). Without this, a deny
+/// configured by the profile can silently be neutralised on Linux when a later
+/// allow path covers it — which Landlock cannot enforce.
+#[derive(Debug)]
+pub struct PreparedCaps {
+    pub caps: CapabilitySet,
+    pub needs_unlink_overrides: bool,
+    pub deny_paths: Vec<PathBuf>,
+}
+
+/// Extension trait for CapabilitySet to add CLI-specific construction methods.
 pub trait CapabilitySetExt {
     /// Create a capability set from CLI sandbox arguments.
-    /// Returns `(caps, needs_unlink_overrides)`.
-    fn from_args(args: &SandboxArgs) -> Result<(CapabilitySet, bool)>;
+    fn from_args(args: &SandboxArgs) -> Result<PreparedCaps>;
 
     /// Create a capability set from a profile with CLI overrides.
-    /// Returns `(caps, needs_unlink_overrides)`.
-    fn from_profile(
-        profile: &Profile,
-        workdir: &Path,
-        args: &SandboxArgs,
-    ) -> Result<(CapabilitySet, bool)>;
+    fn from_profile(profile: &Profile, workdir: &Path, args: &SandboxArgs) -> Result<PreparedCaps>;
 }
 
 impl CapabilitySetExt for CapabilitySet {
-    fn from_args(args: &SandboxArgs) -> Result<(CapabilitySet, bool)> {
+    fn from_args(args: &SandboxArgs) -> Result<PreparedCaps> {
         let mut caps = CapabilitySet::new();
         let protected_roots = ProtectedRoots::from_defaults()?;
 
@@ -386,14 +393,14 @@ impl CapabilitySetExt for CapabilitySet {
 
         finalize_caps(&mut caps, &mut resolved, &loaded_policy, args, &[])?;
 
-        Ok((caps, resolved.needs_unlink_overrides))
+        Ok(PreparedCaps {
+            caps,
+            needs_unlink_overrides: resolved.needs_unlink_overrides,
+            deny_paths: resolved.deny_paths,
+        })
     }
 
-    fn from_profile(
-        profile: &Profile,
-        workdir: &Path,
-        args: &SandboxArgs,
-    ) -> Result<(CapabilitySet, bool)> {
+    fn from_profile(profile: &Profile, workdir: &Path, args: &SandboxArgs) -> Result<PreparedCaps> {
         let mut caps = CapabilitySet::new();
         let protected_roots = ProtectedRoots::from_defaults()?;
 
@@ -607,7 +614,11 @@ impl CapabilitySetExt for CapabilitySet {
             &profile_overrides,
         )?;
 
-        Ok((caps, resolved.needs_unlink_overrides))
+        Ok(PreparedCaps {
+            caps,
+            needs_unlink_overrides: resolved.needs_unlink_overrides,
+            deny_paths: resolved.deny_paths,
+        })
     }
 }
 
@@ -765,7 +776,16 @@ mod tests {
     }
 
     fn from_args_locked(args: &SandboxArgs) -> Result<(CapabilitySet, bool)> {
-        with_env_lock(|| CapabilitySet::from_args(args))
+        with_env_lock(|| {
+            CapabilitySet::from_args(args).map(|prepared| {
+                let PreparedCaps {
+                    caps,
+                    needs_unlink_overrides,
+                    ..
+                } = prepared;
+                (caps, needs_unlink_overrides)
+            })
+        })
     }
 
     fn from_profile_locked(
@@ -773,7 +793,16 @@ mod tests {
         workdir: &Path,
         args: &SandboxArgs,
     ) -> Result<(CapabilitySet, bool)> {
-        with_env_lock(|| CapabilitySet::from_profile(profile, workdir, args))
+        with_env_lock(|| {
+            CapabilitySet::from_profile(profile, workdir, args).map(|prepared| {
+                let PreparedCaps {
+                    caps,
+                    needs_unlink_overrides,
+                    ..
+                } = prepared;
+                (caps, needs_unlink_overrides)
+            })
+        })
     }
 
     fn sandbox_args() -> SandboxArgs {
@@ -848,7 +877,8 @@ mod tests {
     fn test_from_args_uses_default_profile_groups_for_runtime_policy() {
         with_env_lock(|| {
             let args = sandbox_args();
-            let (caps, _) = CapabilitySet::from_args(&args).expect("build caps from args");
+            let PreparedCaps { caps, .. } =
+                CapabilitySet::from_args(&args).expect("build caps from args");
 
             let policy = crate::policy::load_embedded_policy().expect("load embedded policy");
             let default_groups = default_profile_groups().expect("get default profile groups");
@@ -979,7 +1009,7 @@ mod tests {
 
         let result = CapabilitySet::from_args(&args);
 
-        let (caps, _) = result.expect(
+        let PreparedCaps { caps, .. } = result.expect(
             "from_args should succeed when HOME is nested under TMPDIR and the user grants a sibling path",
         );
         let allowed_canonical = allowed.canonicalize().expect("canonicalize allowed dir");

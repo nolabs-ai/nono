@@ -727,8 +727,9 @@ mod tests {
             let profile = get_builtin(name)
                 .unwrap_or_else(|| panic!("built-in profile '{}' should load", name));
 
-            let (caps, _) = nono::CapabilitySet::from_profile(&profile, workdir.path(), &args)
+            let prepared = nono::CapabilitySet::from_profile(&profile, workdir.path(), &args)
                 .unwrap_or_else(|e| panic!("profile '{}' should build caps: {}", name, e));
+            let caps = prepared.caps;
 
             // Whether the profile uses Isolated or AllowSameSandbox, the
             // Seatbelt generator must emit same-sandbox signal rules.

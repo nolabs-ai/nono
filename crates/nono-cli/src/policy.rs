@@ -996,6 +996,7 @@ pub fn apply_unlink_overrides(caps: &mut CapabilitySet) {
 }
 
 /// Resolve deny.access paths for a group list without mutating caller capabilities.
+#[cfg(test)]
 pub fn resolve_deny_paths_for_groups(
     policy: &Policy,
     group_names: &[String],

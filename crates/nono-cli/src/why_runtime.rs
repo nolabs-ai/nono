@@ -60,9 +60,9 @@ pub(crate) fn run_why(args: WhyArgs) -> Result<()> {
             }
         }
 
-        let (mut caps, needs_unlink) =
-            CapabilitySet::from_profile(&profile, &workdir, &sandbox_args)?;
-        if needs_unlink {
+        let prepared = CapabilitySet::from_profile(&profile, &workdir, &sandbox_args)?;
+        let mut caps = prepared.caps;
+        if prepared.needs_unlink_overrides {
             policy::apply_unlink_overrides(&mut caps);
         }
         (caps, override_paths)
@@ -79,8 +79,9 @@ pub(crate) fn run_why(args: WhyArgs) -> Result<()> {
             ..SandboxArgs::default()
         };
 
-        let (mut caps, needs_unlink) = CapabilitySet::from_args(&sandbox_args)?;
-        if needs_unlink {
+        let prepared = CapabilitySet::from_args(&sandbox_args)?;
+        let mut caps = prepared.caps;
+        if prepared.needs_unlink_overrides {
             policy::apply_unlink_overrides(&mut caps);
         }
         (caps, vec![])

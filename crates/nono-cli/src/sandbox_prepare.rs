@@ -337,11 +337,17 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         precreate(&home_path.join(".cache/claude-cli-nodejs"), true);
     }
 
-    let (mut caps, needs_unlink_overrides) = if let Some(ref profile) = loaded_profile {
+    let prepared = if let Some(ref profile) = loaded_profile {
         CapabilitySet::from_profile(profile, &workdir, args)?
     } else {
         CapabilitySet::from_args(args)?
     };
+    let mut caps = prepared.caps;
+    let needs_unlink_overrides = prepared.needs_unlink_overrides;
+    // Resolved policy denies (groups + profile add_deny_access). Used to
+    // re-run validate_deny_overlaps after CWD/pack grants are added below,
+    // because Landlock cannot enforce a deny that lives under a later allow.
+    let prepared_deny_paths = prepared.deny_paths;
 
     // PROF-01 (Phase 22): apply raw Seatbelt rules from the profile (macOS only).
     // On Linux/Windows the field deserializes but is intentionally ignored —
@@ -411,17 +417,13 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         }
     }
 
-    let active_groups = if let Some(profile) = loaded_profile
-        .as_ref()
-        .filter(|profile| !profile.security.groups.is_empty())
-    {
-        profile.security.groups.clone()
-    } else {
-        capability_ext::default_profile_groups()?
-    };
-    let loaded_policy = policy::load_embedded_policy()?;
-    let deny_paths = policy::resolve_deny_paths_for_groups(&loaded_policy, &active_groups)?;
-    policy::validate_deny_overlaps(&deny_paths, &caps)?;
+    // Re-validate against the full deny set (groups + profile add_deny_access)
+    // now that CWD, pack dirs, and any GPU/launch-services grants have been
+    // added on top of the caps produced by from_profile/from_args. The initial
+    // validation inside finalize_caps did not see those later grants, so a
+    // profile deny that lands under e.g. --allow-cwd would otherwise be a
+    // silent no-op on Linux (Landlock cannot deny under an allow).
+    policy::validate_deny_overlaps(&prepared_deny_paths, &caps)?;
     let protected_roots = protected_paths::ProtectedRoots::from_defaults()?;
     protected_paths::validate_caps_against_protected_roots(&caps, protected_roots.as_paths())?;
 

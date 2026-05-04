@@ -44,7 +44,6 @@ similar = "2"
 rand = "0.10"
 which = "8"
 toml = "1.0"
-xdg-home = "1.3.0"
 dirs = "6"
 walkdir = "2"
 ignore.workspace = true

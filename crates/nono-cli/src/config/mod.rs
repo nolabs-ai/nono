@@ -117,7 +117,6 @@ pub fn validated_tmpdir() -> Result<String> {
 /// - `NonoError::EnvVarValidation` if `NONO_TEST_HOME` is set but not absolute.
 /// - `NonoError::HomeNotFound` if `NONO_TEST_HOME` is unset and
 ///   `dirs::home_dir()` returns `None`.
-#[allow(dead_code)]
 pub fn nono_home_dir() -> Result<PathBuf> {
     if let Ok(value) = std::env::var("NONO_TEST_HOME") {
         let path = PathBuf::from(&value);
@@ -133,7 +132,6 @@ pub fn nono_home_dir() -> Result<PathBuf> {
     dirs::home_dir().ok_or(NonoError::HomeNotFound)
 }
 
-#[allow(dead_code)]
 fn warn_once_test_home(path: &Path) {
     static WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     if WARNED.get().is_none() {

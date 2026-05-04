@@ -95,6 +95,55 @@ pub fn validated_tmpdir() -> Result<String> {
     }
 }
 
+/// Resolve the user's home directory, honoring the `NONO_TEST_HOME` test seam.
+///
+/// When `NONO_TEST_HOME` is set:
+///   - If the value is an absolute path, returns it directly.
+///   - If the value is not absolute, returns `NonoError::EnvVarValidation`
+///     (fail-closed; no silent fallthrough — see CLAUDE.md § Path Handling).
+///
+/// When `NONO_TEST_HOME` is unset, falls through to `dirs::home_dir()` and
+/// maps `None` to `NonoError::HomeNotFound` (matches the `?`-shape used by
+/// the 10 existing `dirs::home_dir().ok_or(NonoError::HomeNotFound)?`
+/// callsites that this helper replaces).
+///
+/// On first successful override resolution, emits exactly one
+/// `tracing::warn!` per process containing the resolved path. This provides
+/// a forensic mark in logs without changing the security model — the
+/// override is always-on in release binaries (Phase 27.1 D-27.1-08).
+///
+/// # Errors
+///
+/// - `NonoError::EnvVarValidation` if `NONO_TEST_HOME` is set but not absolute.
+/// - `NonoError::HomeNotFound` if `NONO_TEST_HOME` is unset and
+///   `dirs::home_dir()` returns `None`.
+#[allow(dead_code)]
+pub fn nono_home_dir() -> Result<PathBuf> {
+    if let Ok(value) = std::env::var("NONO_TEST_HOME") {
+        let path = PathBuf::from(&value);
+        if !path.is_absolute() {
+            return Err(NonoError::EnvVarValidation {
+                var: "NONO_TEST_HOME".to_string(),
+                reason: format!("must be an absolute path, got: {}", value),
+            });
+        }
+        warn_once_test_home(&path);
+        return Ok(path);
+    }
+    dirs::home_dir().ok_or(NonoError::HomeNotFound)
+}
+
+#[allow(dead_code)]
+fn warn_once_test_home(path: &Path) {
+    static WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    if WARNED.get().is_none() {
+        tracing::warn!("NONO_TEST_HOME override active: {}", path.display());
+        // Another thread may race; OnceLock keeps the first set, the rest
+        // become no-ops. Worst case: warn fires twice across racing threads.
+        let _ = WARNED.set(());
+    }
+}
+
 /// Get the user config directory path
 #[allow(dead_code)]
 pub fn user_config_dir() -> Option<PathBuf> {

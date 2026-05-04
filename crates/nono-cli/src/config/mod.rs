@@ -381,4 +381,81 @@ mod tests {
         let home = validated_home().expect("USERPROFILE should be accepted on Windows");
         assert_eq!(home, r"C:\Users\tester");
     }
+
+    // Phase 27.1 REQ-NTH-01 + REQ-NTH-02 — NONO_TEST_HOME helper coverage.
+    // The unit tests use the established test_env::EnvVarGuard + ENV_LOCK
+    // pattern (CLAUDE.md § Coding Standards: tests must save/restore env
+    // vars for parallel-test safety).
+
+    #[test]
+    fn nono_home_dir_returns_override_when_set() {
+        let _guard = test_env_lock().lock().expect("env lock");
+        #[cfg(target_os = "windows")]
+        let abs = r"C:\nono-test-home-override-1";
+        #[cfg(not(target_os = "windows"))]
+        let abs = "/tmp/nono-test-home-override-1";
+        let _env = EnvVarGuard::set_all(&[("NONO_TEST_HOME", abs)]);
+
+        let home = nono_home_dir().expect("override should be honored");
+        assert_eq!(home, PathBuf::from(abs));
+    }
+
+    #[test]
+    fn nono_home_dir_rejects_non_absolute_override() {
+        let _guard = test_env_lock().lock().expect("env lock");
+        let _env = EnvVarGuard::set_all(&[("NONO_TEST_HOME", "relative/path")]);
+
+        let err = nono_home_dir().expect_err("non-absolute override must fail closed");
+        match err {
+            NonoError::EnvVarValidation { var, reason } => {
+                assert_eq!(var, "NONO_TEST_HOME");
+                assert!(
+                    reason.contains("must be an absolute path"),
+                    "reason should mention absolute-path requirement, got: {reason}"
+                );
+            }
+            other => panic!("expected EnvVarValidation, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nono_home_dir_falls_through_when_unset() {
+        let _guard = test_env_lock().lock().expect("env lock");
+        // Set a sentinel value so set_all captures the original, then
+        // remove it so the helper sees an unset env var and falls
+        // through to dirs::home_dir(). EnvVarGuard::Drop restores the
+        // original on test exit.
+        let _env = EnvVarGuard::set_all(&[("NONO_TEST_HOME", "sentinel-removed-immediately")]);
+        _env.remove("NONO_TEST_HOME");
+
+        // Helper must not panic; result depends on dirs::home_dir() but
+        // should be either Ok(<dirs::home_dir() value>) or
+        // Err(NonoError::HomeNotFound). Either is acceptable as
+        // status-quo fallthrough behavior — assert the helper does NOT
+        // return EnvVarValidation, which would indicate the override
+        // branch fired incorrectly.
+        let result = nono_home_dir();
+        if let Err(NonoError::EnvVarValidation { .. }) = result {
+            panic!("unset NONO_TEST_HOME must not trigger EnvVarValidation");
+        }
+        // If dirs::home_dir() returns Some, helper returns Ok with that
+        // value verbatim.
+        if let Some(expected) = dirs::home_dir() {
+            assert_eq!(
+                result.expect("should be Ok when dirs::home_dir() is Some"),
+                expected
+            );
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn user_state_dir_honors_nono_test_home() {
+        let _guard = test_env_lock().lock().expect("env lock");
+        let abs = r"C:\nono-test-state-override";
+        let _env = EnvVarGuard::set_all(&[("NONO_TEST_HOME", abs)]);
+
+        let state = user_state_dir().expect("override should produce Some on Windows");
+        assert_eq!(state, PathBuf::from(r"C:\nono-test-state-override\.nono"));
+    }
 }

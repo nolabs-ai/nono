@@ -60,5 +60,5 @@ prettyplease = "0.2"
 
 [dev-dependencies]
 tempfile.workspace = true
-jsonschema = "0.45"
+jsonschema = "0.46"
 tokio = { version = "1", features = ["rt", "macros"] }

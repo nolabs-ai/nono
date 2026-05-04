@@ -100,6 +100,6 @@ serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 httpmock = "0.7"
-jsonschema = "0.45"
+jsonschema = "0.46"
 proptest = "1"
 rcgen = "0.13"

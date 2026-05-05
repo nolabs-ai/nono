@@ -67,6 +67,13 @@ const OFFICIAL_PACKS: &[OfficialPack] = &[
         description: Some("OpenAI Codex CLI sandbox profile + plugin"),
         installs_summary: Some("sandbox profile + Codex plugin (hooks, skill)"),
     },
+    OfficialPack {
+        profile_name: "openclaw",
+        namespace: "always-further",
+        pack_name: "openclaw",
+        description: Some("OpenClaw sandbox profile"),
+        installs_summary: Some("sandbox profile"),
+    },
 ];
 
 struct OfficialPack {
@@ -327,6 +334,7 @@ mod tests {
         assert!(official_pack_for("claude").is_some());
         assert!(official_pack_for("claude-code").is_some());
         assert!(official_pack_for("codex").is_some());
+        assert!(official_pack_for("openclaw").is_some());
         assert!(official_pack_for("definitely-not-real").is_none());
     }
 

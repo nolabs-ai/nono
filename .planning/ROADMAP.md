@@ -171,10 +171,13 @@ Plans:
 
 **Requirements:** REQ-AAHX-01 (audit-loader correctness for audit-only sessions), REQ-AAHX-02 (bundle-target architecture decision + ADR), REQ-AAHX-03 (audit-attestation test re-enablement closes REQ-AAH-01 + REQ-NTH-03 transitively). To be locked at `/gsd-plan-phase 27.2` per the planning-time requirements convention. See `.planning/REQUIREMENTS.md` § AAHX for full acceptance criteria.
 
-**Plans:** 0 plans (run `/gsd-plan-phase 27.2` to break down)
+**Plans:** 4 plans
 
 Plans:
-- [ ] TBD (run `/gsd-plan-phase 27.2` to break down)
+- [ ] 27.2-01-PLAN.md — `cmd_verify` audit-loader swap + one-shot legacy-bundle warning helper (REQ-AAHX-01; FU-1; Wave 1)
+- [ ] 27.2-02-PLAN.md — `create_audit_state` bundle-target migration to `<audit_root>/<id>/` (REQ-AAHX-02 implementation half; FU-2; Wave 1)
+- [ ] 27.2-03-PLAN.md — `docs/architecture/audit-bundle-target.md` ADR + v2.5 follow-up entries in `deferred-items.md` (REQ-AAHX-02 documentation half; FU-2; Wave 1)
+- [ ] 27.2-04-PLAN.md — Re-enable both `#[ignore]`'d audit-attestation tests + ScopedEnvVar RAII guard (WR-05) + Test 2 flat-JSON assertions (WR-04) (REQ-AAHX-03; FU-3; Wave 2 — depends on 27.2-01 + 27.2-02)
 
 **Cross-cutting constraints:**
 - `crates/nono/` remains byte-identical (D-19 invariant).

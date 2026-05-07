@@ -1021,6 +1021,57 @@ pub(super) fn should_use_low_integrity_windows_launch(caps: &CapabilitySet) -> b
     policy.has_rules()
 }
 
+/// Discriminant identifying which token-construction arm of `spawn_windows_child`'s
+/// cascade applies to a given (env, config, pty) triple. Pure-function output;
+/// no FFI side effects.
+///
+/// Branch ordering matters and is enforced here:
+///   1. Detached launch (NONO_DETACHED_LAUNCH=1) → Null token (Phase 15 waiver)
+///   2. PTY allocated (`pty.is_some()`) → Low-IL primary (Phase 30 D-01)
+///   3. Per-session SID present → WRITE_RESTRICTED (existing non-PTY supervised)
+///   4. Caps demand Low-IL (legacy Direct path) → Low-IL primary
+///   5. Fallback → Null (caller's identity)
+///
+/// (2) precedes (3) because `config.session_sid` is unconditionally `Some(...)`
+/// for Windows supervised launches (`execution_runtime.rs:334`); the new arm
+/// is reached *because* it short-circuits before the WRITE_RESTRICTED arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum WindowsTokenArm {
+    /// Caller's identity (CreateProcessW with null token). Phase 15 detached
+    /// path or final fallback.
+    Null,
+    /// WRITE_RESTRICTED + per-session restricting SID. Existing non-PTY
+    /// supervised path. Triggers STATUS_DLL_INIT_FAILED (0xC0000142) under
+    /// PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE — hence Phase 30 D-01 routes
+    /// PTY-allocating launches to LowIlPrimary instead.
+    WriteRestricted,
+    /// Low-IL primary token. Phase 30 D-01 supervised+PTY path; mandatory
+    /// label NO_WRITE_UP enforces write-deny via MIC pre-DACL kernel check.
+    LowIlPrimary,
+}
+
+/// Pure decision function for the `spawn_windows_child` cascade. Returns the
+/// token-construction arm that applies to the given inputs. No FFI calls; no
+/// env reads other than the explicit `is_detached` parameter.
+pub(super) fn select_windows_token_arm(
+    is_detached: bool,
+    has_pty: bool,
+    has_session_sid: bool,
+    caps_demand_low_il: bool,
+) -> WindowsTokenArm {
+    if is_detached {
+        WindowsTokenArm::Null
+    } else if has_pty {
+        WindowsTokenArm::LowIlPrimary
+    } else if has_session_sid {
+        WindowsTokenArm::WriteRestricted
+    } else if caps_demand_low_il {
+        WindowsTokenArm::LowIlPrimary
+    } else {
+        WindowsTokenArm::Null
+    }
+}
+
 pub(super) fn create_low_integrity_primary_token() -> Result<OwnedHandle> {
     let mut current_token = std::ptr::null_mut();
     let opened = unsafe {
@@ -1136,27 +1187,51 @@ pub(super) fn spawn_windows_child(
     // initializes the loader cleanly is a null token. Kernel-level network enforcement
     // falls back to AppID-based WFP filtering; per-session SID WFP is not available
     // on this path. See .planning/debug/resolved/windows-supervised-exec-cascade.md.
+    //
+    // Phase 30 D-01: When PTY is allocated (interactive `nono shell`), the cascade
+    // uses a Low-IL primary token instead of WRITE_RESTRICTED + session-SID. The
+    // WRITE_RESTRICTED + ConPTY combination triggers STATUS_DLL_INIT_FAILED
+    // (0xC0000142) — same class of bug Phase 15 hit on the detached path with
+    // DETACHED_PROCESS. Mandatory-label NO_WRITE_UP enforces write-deny because
+    // Low-IL subjects do not dominate Medium-IL files (MIC pre-DACL kernel check).
+    // Per-session WFP differentiation via FWPM_CONDITION_ALE_USER_ID is waived
+    // on this path (falls back to AppID-based filtering, same as Phase 15
+    // detached-path waiver). See .planning/phases/30-windows-nono-shell-architecture/30-CONTEXT.md.
     let is_windows_detached_launch = is_windows_detached_launch();
-    let h_token: HANDLE = if is_windows_detached_launch {
-        _restricted_holder = None;
-        _low_integrity_holder = None;
-        std::ptr::null_mut()
-    } else if let Some(ref sid) = config.session_sid {
-        let holder = restricted_token::create_restricted_token_with_sid(sid)?;
-        let raw = holder.h_token;
-        _restricted_holder = Some(holder);
-        _low_integrity_holder = None;
-        raw
-    } else if should_use_low_integrity_windows_launch(config.caps) {
-        let holder = create_low_integrity_primary_token()?;
-        let raw = holder.0;
-        _low_integrity_holder = Some(holder);
-        _restricted_holder = None;
-        raw
-    } else {
-        _restricted_holder = None;
-        _low_integrity_holder = None;
-        std::ptr::null_mut() // Use current process token (CreateProcessW)
+    let arm = select_windows_token_arm(
+        is_windows_detached_launch,
+        pty.is_some(),
+        config.session_sid.is_some(),
+        should_use_low_integrity_windows_launch(config.caps),
+    );
+    let h_token: HANDLE = match arm {
+        WindowsTokenArm::Null => {
+            _restricted_holder = None;
+            _low_integrity_holder = None;
+            std::ptr::null_mut()
+        }
+        WindowsTokenArm::WriteRestricted => {
+            // Safe: the cascade reaches this arm only when config.session_sid.is_some(),
+            // verified by select_windows_token_arm's has_session_sid input above.
+            let sid = config
+                .session_sid
+                .as_ref()
+                .ok_or_else(|| NonoError::SandboxInit(
+                    "session_sid disappeared between gate decision and use".into(),
+                ))?;
+            let holder = restricted_token::create_restricted_token_with_sid(sid)?;
+            let raw = holder.h_token;
+            _restricted_holder = Some(holder);
+            _low_integrity_holder = None;
+            raw
+        }
+        WindowsTokenArm::LowIlPrimary => {
+            let holder = create_low_integrity_primary_token()?;
+            let raw = holder.0;
+            _low_integrity_holder = Some(holder);
+            _restricted_holder = None;
+            raw
+        }
     };
     // NOTE: do NOT re-wrap h_token in a fresh OwnedHandle — the holder above
     // already owns the close. A second wrapper would double-close on Drop.
@@ -1433,6 +1508,197 @@ mod detached_token_gate_tests {
         assert!(!is_windows_detached_launch());
         let _g2 = EnvVarGuard::set_all(&[("NONO_DETACHED_LAUNCH", "true")]);
         assert!(!is_windows_detached_launch());
+    }
+}
+
+#[cfg(test)]
+mod pty_token_gate_tests {
+    use super::{select_windows_token_arm, WindowsTokenArm};
+
+    /// Wave 1 NEW path: PTY allocation triggers Low-IL primary token, even
+    /// when session_sid is also Some (which it always is on Windows supervised).
+    /// This test pins the branch-ordering rule documented in 30-CONTEXT D-01.
+    #[test]
+    fn pty_some_no_detach_selects_low_il() {
+        let arm = select_windows_token_arm(
+            /* is_detached */ false,
+            /* has_pty */ true,
+            /* has_session_sid */ true, // always true on Windows supervised
+            /* caps_demand_low_il */ false,
+        );
+        assert_eq!(arm, WindowsTokenArm::LowIlPrimary);
+    }
+
+    /// Detached path short-circuits BEFORE the PTY arm. Phase 15 waiver:
+    /// detached children get a null token regardless of PTY allocation.
+    #[test]
+    fn pty_some_with_detach_selects_null() {
+        let arm = select_windows_token_arm(
+            /* is_detached */ true,
+            /* has_pty */ true,
+            /* has_session_sid */ true,
+            /* caps_demand_low_il */ false,
+        );
+        assert_eq!(arm, WindowsTokenArm::Null);
+    }
+
+    /// Existing non-PTY supervised path (`nono run` without --interactive).
+    /// Wave 1 must NOT regress this — the new arm only fires when has_pty=true.
+    #[test]
+    fn pty_none_with_session_sid_selects_write_restricted() {
+        let arm = select_windows_token_arm(
+            /* is_detached */ false,
+            /* has_pty */ false,
+            /* has_session_sid */ true,
+            /* caps_demand_low_il */ false,
+        );
+        assert_eq!(arm, WindowsTokenArm::WriteRestricted);
+    }
+
+    /// Final fallback. Structurally unreachable today on Windows (session_sid
+    /// is always Some per execution_runtime.rs:334) but pinned for future
+    /// readers and for non-Windows platforms where the helper compiles cleanly.
+    #[test]
+    fn pty_none_no_session_sid_selects_null_fallback() {
+        let arm = select_windows_token_arm(
+            /* is_detached */ false,
+            /* has_pty */ false,
+            /* has_session_sid */ false,
+            /* caps_demand_low_il */ false,
+        );
+        assert_eq!(arm, WindowsTokenArm::Null);
+    }
+
+    /// Legacy Direct path (caps demand Low-IL, no session SID). Structurally
+    /// unreachable today (session_sid always Some) but kept testable so a
+    /// future refactor that loosens session_sid wiring doesn't silently
+    /// land in the wrong arm.
+    #[test]
+    fn pty_none_caps_demand_low_il_selects_low_il() {
+        let arm = select_windows_token_arm(
+            /* is_detached */ false,
+            /* has_pty */ false,
+            /* has_session_sid */ false,
+            /* caps_demand_low_il */ true,
+        );
+        assert_eq!(arm, WindowsTokenArm::LowIlPrimary);
+    }
+
+    /// Detached + session_sid + caps_demand_low_il → Null still wins.
+    /// Pins detached-arm priority across all input combinations.
+    #[test]
+    fn detach_dominates_other_signals() {
+        let arm = select_windows_token_arm(
+            /* is_detached */ true,
+            /* has_pty */ false,
+            /* has_session_sid */ true,
+            /* caps_demand_low_il */ true,
+        );
+        assert_eq!(arm, WindowsTokenArm::Null);
+    }
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod low_integrity_primary_token_tests {
+    use super::create_low_integrity_primary_token;
+    use windows_sys::Win32::Security::{
+        GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, TokenIntegrityLevel,
+        TOKEN_MANDATORY_LABEL,
+    };
+    use windows_sys::Win32::System::SystemServices::SECURITY_MANDATORY_LOW_RID;
+
+    /// Phase 30 D-01: Wave 1 is the FIRST live runtime use of
+    /// `create_low_integrity_primary_token`. The legacy Direct path callsite at
+    /// launch.rs (~1150 post-edit) (`should_use_low_integrity_windows_launch` arm) is
+    /// structurally unreachable today because `config.session_sid` is
+    /// unconditionally `Some(...)` for Windows supervised launches
+    /// (`execution_runtime.rs:334`). This test ensures the function actually
+    /// produces a Low-IL token, NOT silently a Medium-IL one. Acceptance #3
+    /// (write-deny) depends on this — RESEARCH Assumption A2.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn low_integrity_primary_token_sets_low_il() {
+        let token = create_low_integrity_primary_token()
+            .expect("create_low_integrity_primary_token must succeed in a normal user-logon test process");
+        assert!(
+            !token.0.is_null(),
+            "low-integrity primary token handle is non-null"
+        );
+
+        // Two-call GetTokenInformation pattern: first probe with null buffer
+        // to discover the required size, then fetch into an allocated buffer.
+        let mut needed: u32 = 0;
+        unsafe {
+            // SAFETY: First call with null buffer is the documented size-probe
+            // pattern. ERROR_INSUFFICIENT_BUFFER is expected and unchecked here;
+            // the buffer-size out-param `needed` is what we read.
+            GetTokenInformation(
+                token.0,
+                TokenIntegrityLevel,
+                std::ptr::null_mut(),
+                0,
+                &mut needed,
+            );
+        }
+        assert!(
+            needed >= std::mem::size_of::<TOKEN_MANDATORY_LABEL>() as u32,
+            "TokenIntegrityLevel buffer size should be at least \
+             size_of::<TOKEN_MANDATORY_LABEL>(); got {needed}"
+        );
+
+        let mut buf = vec![0u8; needed as usize];
+        let ok = unsafe {
+            // SAFETY: `buf` is sized by the probe call above and the allocation
+            // is non-null. `token.0` is a valid token handle owned by `token`.
+            GetTokenInformation(
+                token.0,
+                TokenIntegrityLevel,
+                buf.as_mut_ptr() as *mut _,
+                needed,
+                &mut needed,
+            )
+        };
+        assert!(
+            ok != 0,
+            "GetTokenInformation(TokenIntegrityLevel) must succeed on a duplicated token"
+        );
+
+        // SAFETY: `buf` was populated by GetTokenInformation with a
+        // TOKEN_MANDATORY_LABEL prefix; layout is documented in the Win32 SDK.
+        let label = unsafe { &*(buf.as_ptr() as *const TOKEN_MANDATORY_LABEL) };
+        // SAFETY: `label.Label.Sid` is a valid SID pointer for the duration of
+        // `buf`'s lifetime; `GetSidSubAuthorityCount` returns a pointer to a
+        // u8 within that SID structure.
+        let sub_authority_count = unsafe { *GetSidSubAuthorityCount(label.Label.Sid) };
+        assert!(
+            sub_authority_count > 0,
+            "integrity-label SID must have at least one sub-authority; got {sub_authority_count}"
+        );
+        // SAFETY: same SID pointer is still valid; `(count - 1)` is in-range.
+        let last_sub_authority = unsafe {
+            *GetSidSubAuthority(label.Label.Sid, (sub_authority_count - 1) as u32)
+        };
+        assert_eq!(
+            last_sub_authority,
+            SECURITY_MANDATORY_LOW_RID as u32,
+            "duplicated token must be at Low integrity (RID 0x1000); got 0x{last_sub_authority:x}"
+        );
+    }
+
+    /// Smoke-test for `OwnedHandle` Drop discipline. Explicit drop after
+    /// a successful construction must not panic or trigger an FFI failure.
+    /// This pins Pitfall 1 (UAF) and Pitfall 5 (double-close) at the unit-test
+    /// boundary.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn low_integrity_primary_token_drop_is_safe() {
+        let token = create_low_integrity_primary_token()
+            .expect("create_low_integrity_primary_token must succeed");
+        assert!(!token.0.is_null());
+        // Explicit drop closes the handle exactly once. If `OwnedHandle::Drop`
+        // were ill-formed, this would panic, abort, or surface in a later
+        // test as ERROR_INVALID_HANDLE on a recycled handle value.
+        drop(token);
     }
 }
 

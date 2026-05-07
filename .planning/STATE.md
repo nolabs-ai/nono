@@ -4,8 +4,8 @@ milestone: v2.3
 milestone_name: Linux POC Unblock + Deferreds Closure
 status: executing
 stopped_at: Phase 27.2 context gathered
-last_updated: "2026-05-06T14:54:44.435Z"
-last_activity: 2026-05-06
+last_updated: "2026-05-07T17:30:00.000Z"
+last_activity: 2026-05-07
 progress:
   total_phases: 7
   completed_phases: 4
@@ -161,6 +161,7 @@ Progress: [██████████] 100% (Phase 23 complete 2026-04-29; v
 | 260424-mrg | Merge windows-squash → main (fast-forward, local-only; Path C; nothing pushed; 46 DCO-missing commits preserved) | 2026-04-24 | 8213da64 | [260424-mrg-merge-windows-squash-to-main](./quick/260424-mrg-merge-windows-squash-to-main/) |
 | 260428-rsu | DEFERRED — Refresh PR 725/726 stack onto upstream/main (v0.43.0). Runbook ready; awaiting trigger: #785 merge OR #777+#778 merge OR human-review engagement OR 2026-05-12 deadline | 2026-04-28 | — (deferred) | [260428-rsu-refresh-stack-onto-upstream-tip](./quick/260428-rsu-refresh-stack-onto-upstream-tip/) |
 | 260429-gap | Gap matrix — upstream v0.39.0 (Linux POC) vs fork tip (post-v2.2) + proposed Phase 25 remediation outline (RESL Unix backends + AIPC Unix design sketch). Research-only. | 2026-04-29 | — | [260429-gap-v039-linux-poc-vs-windows-fork-tip](./quick/260429-gap-v039-linux-poc-vs-windows-fork-tip/) |
+| 260507-wix | Bump WiX 4.0.6 → 7.0.0 in Windows MSI build pipeline; add `-acceptEula wix7` for OSMF EULA acceptance; new docs/cli/development/windows-poc-handoff.mdx cookbook | 2026-05-07 | 7f2da598 | [260507-wix-bump-to-7-0-0](./quick/260507-wix-bump-to-7-0-0/) |
 
 ## Deferred Items
 

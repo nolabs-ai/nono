@@ -1,5 +1,159 @@
 # Changelog
 
+## [0.49.0] - 2026-05-07
+
+### Bug Fixes
+
+- *(trust)* Treat empty parent() as CWD when deriving scan_root
+
+- *(trust)* Reject symlink-escape in multi-subject bundle subject names
+
+- *(trust)* Reject path traversal in multi-subject bundle subject names
+
+- *(yaml-merge)* Pin serde_yaml_ng to 0.10.0 and add reversal failure test
+
+
+### Dependencies
+
+- *(deps)* Bump tokio from 1.52.1 to 1.52.2
+
+
+### Features
+
+- *(wiring)* Add yaml_merge directive for YAML config patching
+
+
+### Miscellaneous
+
+- Add PR template requiring linked issue
+
+
+### Style
+
+- Apply rustfmt to trust_cmd and trust_scan
+
+- Apply rustfmt
+
+## [0.48.0] - 2026-05-07
+
+### Bug Fixes
+
+- *(cli)* Prevent truncate_chars panic and spurious truncation
+
+- Demote --allow-launch-services log from warn to debug
+
+- *(profile)* Skip self-references in sibling extends resolution
+
+
+### Features
+
+- *(cli)* Add shell completion generation via `nono completion <shell>`
+
+
+### Miscellaneous
+
+- Harden CI workflows and fix stale metadata
+
+- Reduce nono run output verbosity
+
+
+### Refactoring
+
+- *(string-truncation)* Extract generic string truncation utility
+
+## [0.47.1] - 2026-05-06
+
+### Dependencies
+
+- *(deps)* Bump jsonschema from 0.45.1 to 0.46.4
+
+- *(deps)* Bump rustls from 0.23.39 to 0.23.40
+
+
+### Documentation
+
+- Fix stale references, deprecation wording, and built-in vs pack distinction
+
+## [0.47.0] - 2026-05-05
+
+### Bug Fixes
+
+- Doc changes + relax strict cap check
+
+- Resolve extends against sibling profiles in the same directory
+
+- *(capability)* Platform-specific dedup key (original on macOS, resolved on Linux)
+
+- *(ci)* Poll crates.io index instead of fixed sleep before publish
+
+- *(profile)* Emit serde-rendered values in show/diff JSON output
+
+- Migrate diagnostic.rs to shared try_canonicalize helper
+
+- Canonicalize protected roots at call sites to handle raw paths
+
+- Replace unwrap() with expect() in path tests for clippy
+
+- Unify path canonicalization with ancestor-walk fallback
+
+
+### Documentation
+
+- *(plans)* Design and implementation plan for #594 phase 2 schema restructure
+
+
+### Features
+
+- *(profile)* #594 phase 2 — canonical JSON schema restructure (#594)
+
+
+### Performance
+
+- Eliminate redundant canonicalize syscalls per review feedback
+
+
+### Policy
+
+- Normalize nix profile paths to tilde-style and add defexpr
+
+
+### Style
+
+- Remove extra blank line in diagnostic.rs
+
+- Run cargo fmt
+
+## [0.46.0] - 2026-05-01
+
+### Bug Fixes
+
+- *(policy)* Add XDG_STATE_HOME nix profiles path to nix_runtime group
+
+- *(policy)* Make nix_runtime group cross-platform
+
+- *(cli)* Re-validate deny overlaps after all grants
+
+- Update examples in setup.rs
+
+
+### Features
+
+- *(network)* Support GitLab developer domains
+
+
+### Testing
+
+- *(cli-tests)* Add workdir access to deny overlap test
+
+- Exclude system_write_linux in post-CWD overlap regression test
+
+## [0.45.0] - 2026-04-30
+
+### Features
+
+- *(packages)* Use native tls root certificates
+- *(ux)* Warn on macOS when `--allow` targets a path blocked by a deny group (e.g. `deny_credentials`), suggesting `--override-deny`
+
 ## [0.44.0] - 2026-04-29
 
 ### Bug Fixes

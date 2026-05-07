@@ -257,8 +257,8 @@ Checks performed:
 |-------|----------|-------------|
 | JSON syntax | Error | File must be valid JSON and deserialize into a profile |
 | Inheritance | Error | `extends` target must be a loadable profile |
-| Group references | Error | Every group in `security.groups` must exist in policy.json |
-| Required group exclusion | Error | `policy.exclude_groups` cannot exclude required groups |
+| Group references | Error | Every group in `groups.include` must exist in policy.json |
+| Required group exclusion | Error | `groups.exclude` cannot exclude required groups |
 | Empty paths | Warning | Empty strings in filesystem path arrays |
 
 Example output for a valid profile:

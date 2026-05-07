@@ -15,6 +15,7 @@
 //! - **Library code**: No process management, no CLI assumptions
 
 use crate::capability::{AccessMode, CapabilitySet, CapabilitySource};
+use crate::path::try_canonicalize;
 use std::path::{Path, PathBuf};
 
 /// Why a path access was denied during a supervised session.
@@ -1080,7 +1081,7 @@ impl<'a> DiagnosticFormatter<'a> {
         &self,
         path: &Path,
     ) -> Option<&crate::capability::FsCapability> {
-        let canonical = canonicalize_query_path(path);
+        let canonical = try_canonicalize(path);
         let mut best_covering: Option<&crate::capability::FsCapability> = None;
         let mut best_covering_score = 0usize;
 
@@ -1261,7 +1262,7 @@ impl<'a> DiagnosticFormatter<'a> {
             };
             lines.push("[nono]".to_string());
             lines.push(format!(
-                "[nono] {}{} permanently restricted — override via a user profile with policy.override_deny.",
+                "[nono] {}{} permanently restricted — override via a user profile with filesystem.bypass_protection.",
                 count_prefix, verb,
             ));
         }
@@ -1269,7 +1270,7 @@ impl<'a> DiagnosticFormatter<'a> {
 
     /// Return true when the denial cannot be fixed by a path flag alone —
     /// i.e. the path is blocked by the sensitive-path policy and requires a
-    /// profile with `policy.override_deny`.
+    /// profile with `filesystem.bypass_protection`.
     fn is_denial_policy_blocked(&self, denial: &DenialRecord) -> bool {
         if let Some(expl) = self
             .policy_explanations
@@ -1670,26 +1671,6 @@ fn merge_access_modes(existing: AccessMode, new: AccessMode) -> AccessMode {
         existing
     } else {
         AccessMode::ReadWrite
-    }
-}
-
-fn canonicalize_query_path(path: &Path) -> PathBuf {
-    if path.exists() {
-        path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
-    } else if let Some(parent) = path.parent() {
-        if parent.exists() {
-            match parent.canonicalize() {
-                Ok(parent_canonical) => match path.file_name() {
-                    Some(name) => parent_canonical.join(name),
-                    None => path.to_path_buf(),
-                },
-                Err(_) => path.to_path_buf(),
-            }
-        } else {
-            path.to_path_buf()
-        }
-    } else {
-        path.to_path_buf()
     }
 }
 

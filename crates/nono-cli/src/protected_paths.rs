@@ -3,7 +3,7 @@
 //! These checks enforce a hard fail if initial sandbox capabilities overlap
 //! with internal CLI state roots (currently `~/.nono`).
 
-use nono::{CapabilitySet, NonoError, Result};
+use nono::{try_canonicalize, CapabilitySet, NonoError, Result};
 use std::path::{Path, PathBuf};
 
 /// Resolved internal state roots that must not be accessible by the sandboxed child.
@@ -20,7 +20,7 @@ impl ProtectedRoots {
     /// Today this protects the full `~/.nono` subtree.
     pub fn from_defaults() -> Result<Self> {
         let home = dirs::home_dir().ok_or(NonoError::HomeNotFound)?;
-        let state_root = resolve_path(&home.join(".nono"));
+        let state_root = try_canonicalize(&home.join(".nono"));
         Ok(Self {
             roots: vec![state_root],
         })
@@ -44,12 +44,17 @@ pub fn validate_caps_against_protected_roots(
     protected_roots: &[PathBuf],
     allow_parent_of_protected: bool,
 ) -> Result<()> {
+    // Pre-canonicalize once so the per-capability loop doesn't repeat the work.
+    let resolved_roots: Vec<PathBuf> = protected_roots
+        .iter()
+        .map(|p| try_canonicalize(p))
+        .collect();
     for cap in caps.fs_capabilities() {
         validate_requested_path_against_protected_roots(
             &cap.resolved,
             cap.is_file,
             &cap.source.to_string(),
-            protected_roots,
+            &resolved_roots,
             allow_parent_of_protected,
         )?;
     }
@@ -74,12 +79,12 @@ pub fn validate_requested_path_against_protected_roots(
     protected_roots: &[PathBuf],
     allow_parent_of_protected: bool,
 ) -> Result<()> {
-    let requested_path = resolve_path(path);
-    let resolved_roots: Vec<PathBuf> = protected_roots.iter().map(|p| resolve_path(p)).collect();
+    let requested_path = try_canonicalize(path);
 
-    for protected_root in &resolved_roots {
-        let inside_protected = requested_path.starts_with(protected_root);
-        let parent_of_protected = !is_file && protected_root.starts_with(&requested_path);
+    for protected_root in protected_roots {
+        let resolved_root = try_canonicalize(protected_root);
+        let inside_protected = requested_path.starts_with(&resolved_root);
+        let parent_of_protected = !is_file && resolved_root.starts_with(&requested_path);
 
         // inside_protected is always a hard error on all platforms
         if inside_protected {
@@ -87,7 +92,7 @@ pub fn validate_requested_path_against_protected_roots(
                 "Refusing to grant '{}' (source: {}) because it overlaps protected nono state root '{}'.",
                 requested_path.display(),
                 source,
-                protected_root.display(),
+                resolved_root.display(),
             )));
         }
 
@@ -98,7 +103,7 @@ pub fn validate_requested_path_against_protected_roots(
                 "Refusing to grant '{}' (source: {}) because it overlaps protected nono state root '{}'.",
                 requested_path.display(),
                 source,
-                protected_root.display(),
+                resolved_root.display(),
             )));
         }
     }
@@ -124,18 +129,18 @@ pub fn overlapping_protected_root(
     is_file: bool,
     protected_roots: &[PathBuf],
 ) -> Option<PathBuf> {
-    let requested_path = resolve_path(path);
-    let resolved_roots: Vec<PathBuf> = protected_roots.iter().map(|p| resolve_path(p)).collect();
+    let requested_path = try_canonicalize(path);
 
-    for protected_root in &resolved_roots {
-        let inside_protected = requested_path.starts_with(protected_root);
+    for protected_root in protected_roots {
+        let resolved_root = try_canonicalize(protected_root);
+        let inside_protected = requested_path.starts_with(&resolved_root);
         if inside_protected {
-            return Some(protected_root.clone());
+            return Some(resolved_root);
         }
 
-        let parent_of_protected = !is_file && protected_root.starts_with(&requested_path);
+        let parent_of_protected = !is_file && resolved_root.starts_with(&requested_path);
         if parent_of_protected && !cfg!(target_os = "macos") {
-            return Some(protected_root.clone());
+            return Some(resolved_root);
         }
     }
 
@@ -159,7 +164,7 @@ pub(crate) fn emit_protected_root_deny_rules(
     }
 
     for root in protected_roots {
-        let resolved = resolve_path(root);
+        let resolved = try_canonicalize(root);
         emit_deny_rules_for_path(&resolved, caps)?;
 
         // Also emit for the canonical path if it differs (important on macOS
@@ -188,38 +193,6 @@ fn emit_deny_rules_for_path(path: &Path, caps: &mut CapabilitySet) -> Result<()>
 #[cfg(not(target_os = "macos"))]
 fn emit_deny_rules_for_path(_path: &Path, _caps: &mut CapabilitySet) -> Result<()> {
     Ok(())
-}
-
-/// Resolve path by canonicalizing the full path, or canonicalizing the longest
-/// existing ancestor and appending remaining components.
-fn resolve_path(path: &Path) -> PathBuf {
-    if let Ok(canonical) = path.canonicalize() {
-        return canonical;
-    }
-
-    let mut remaining = Vec::new();
-    let mut current = path.to_path_buf();
-    loop {
-        if let Ok(canonical) = current.canonicalize() {
-            let mut result = canonical;
-            for component in remaining.iter().rev() {
-                result = result.join(component);
-            }
-            return result;
-        }
-
-        match current.file_name() {
-            Some(name) => {
-                remaining.push(name.to_os_string());
-                if !current.pop() {
-                    break;
-                }
-            }
-            None => break,
-        }
-    }
-
-    path.to_path_buf()
 }
 
 #[cfg(test)]

@@ -174,6 +174,27 @@ pub struct PackageSearchResponse {
     pub packages: Vec<PackageSearchResult>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PackageStatusResponse {
+    pub schema_version: u32,
+    #[serde(default)]
+    pub latest: Option<String>,
+    #[serde(default)]
+    pub installed_status: Option<String>,
+    #[serde(default)]
+    pub yank_reason: Option<String>,
+    #[serde(default)]
+    pub advisory: Option<PackageAdvisory>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PackageAdvisory {
+    #[serde(default)]
+    pub severity: Option<String>,
+    #[serde(default)]
+    pub summary: Option<String>,
+}
+
 /// One pack that ships a given profile name (the `install_as` of a
 /// profile artifact in its manifest). Returned by
 /// `GET /api/v1/profiles/<name>/providers`. Used by the migration

@@ -88,11 +88,13 @@ pub struct DenyOps {
     pub commands: Vec<String>,
 }
 
-/// Profile definition as stored in policy.json.
+/// Profile definition as stored in `policy.json`.
 ///
-/// Separate from `profile::Profile` because built-in policy profiles allow
-/// profile-level group exclusion fields, while `security.groups` means
-/// "additional groups on top of base", not the complete merged list.
+/// Mirrors the canonical `profile::Profile` schema introduced by #594. All
+/// embedded profiles in `policy.json` use canonical sections
+/// (`groups.include`, `commands.allow/deny`, `filesystem.*`, narrow
+/// `security`); legacy keys have been migrated out of the data file, so this
+/// struct no longer carries the draining shim that earlier revisions used.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ProfileDef {
     #[serde(default)]
@@ -101,21 +103,22 @@ pub struct ProfileDef {
     pub meta: profile::ProfileMeta,
     #[serde(default)]
     pub security: profile::SecurityConfig,
-    /// Preferred built-in profile exclusions.
     #[serde(default)]
-    pub exclude_groups: Vec<String>,
+    pub groups: profile::GroupsConfig,
+    #[serde(default)]
+    pub commands: profile::CommandsConfig,
     #[serde(default)]
     pub filesystem: profile::FilesystemConfig,
     #[serde(default)]
-    pub policy: profile::PolicyPatchConfig,
-    #[serde(default)]
     pub network: profile::NetworkConfig,
+    /// ALIAS(canonical="env_credentials", introduced="v0.0.0", remove_by="indefinite", issue="#143")
     #[serde(default, alias = "secrets")]
     pub env_credentials: profile::SecretsConfig,
     #[serde(default)]
     pub workdir: profile::WorkdirConfig,
     #[serde(default)]
     pub hooks: profile::HooksConfig,
+    /// ALIAS(canonical="rollback", introduced="v0.0.0", remove_by="indefinite", issue="#124")
     #[serde(default, alias = "undo")]
     pub rollback: profile::RollbackConfig,
     #[serde(default)]
@@ -136,24 +139,17 @@ pub struct ProfileDef {
 
 impl ProfileDef {
     /// Convert to a raw Profile without merging implicit default groups.
+    ///
+    /// Straight field-for-field copy; no legacy draining happens here because
+    /// the embedded `policy.json` is already on the canonical #594 schema.
     pub fn to_raw_profile(&self) -> profile::Profile {
-        let mut policy = self.policy.clone();
-        policy.exclude_groups =
-            profile::dedup_append(&self.exclude_groups, &self.policy.exclude_groups);
         profile::Profile {
             extends: self.extends.as_ref().map(|s| vec![s.clone()]),
             meta: self.meta.clone(),
-            security: profile::SecurityConfig {
-                groups: self.security.groups.clone(),
-                allowed_commands: self.security.allowed_commands.clone(),
-                signal_mode: self.security.signal_mode,
-                process_info_mode: self.security.process_info_mode,
-                ipc_mode: self.security.ipc_mode,
-                capability_elevation: self.security.capability_elevation,
-                wsl2_proxy_policy: self.security.wsl2_proxy_policy,
-            },
+            security: self.security.clone(),
+            groups: self.groups.clone(),
+            commands: self.commands.clone(),
             filesystem: self.filesystem.clone(),
-            policy,
             network: self.network.clone(),
             env_credentials: self.env_credentials.clone(),
             environment: None,
@@ -898,7 +894,7 @@ pub fn apply_macos_keychain_db_exception(caps: &mut CapabilitySet) {
 /// 4. Warns to stderr for each override applied (security relaxation must be visible)
 ///
 /// The override path must also be explicitly granted via `--allow`, `--read`, or `--write`.
-/// `--override-deny` only removes the deny; it does not implicitly grant access.
+/// `--bypass-protection` only removes the deny; it does not implicitly grant access.
 pub fn apply_deny_overrides(
     overrides: &[std::path::PathBuf],
     deny_paths: &mut Vec<PathBuf>,
@@ -965,8 +961,8 @@ pub fn apply_deny_overrides(
         }
         if !grant_has_read && !grant_has_write {
             return Err(NonoError::SandboxInit(format!(
-                "override_deny '{}' has no matching grant. \
-                 Add a filesystem allow (--allow, --read, --write, or profile filesystem/policy) \
+                "bypass_protection '{}' has no matching grant. \
+                 Add a filesystem allow (--allow, --read, --write, or profile filesystem) \
                  for this path.",
                 override_path.display(),
             )));
@@ -974,7 +970,7 @@ pub fn apply_deny_overrides(
 
         // Warn about the security relaxation
         info!(
-            "override_deny relaxing deny rule for '{}'",
+            "bypass_protection relaxing deny rule for '{}'",
             canonical.display()
         );
 
@@ -1076,6 +1072,7 @@ pub fn apply_unlink_overrides(caps: &mut CapabilitySet) {
 }
 
 /// Resolve deny.access paths for a group list without mutating caller capabilities.
+#[cfg(test)]
 pub fn resolve_deny_paths_for_groups(
     policy: &Policy,
     group_names: &[String],
@@ -1150,6 +1147,70 @@ pub fn validate_deny_overlaps(deny_paths: &[PathBuf], caps: &CapabilitySet) -> R
          Conflicts:\n{}{}",
         preview, more
     )))
+}
+
+/// Find user-granted paths that are blocked by deny rules.
+///
+/// Returns a list of `(deny_path, group_name)` pairs where the deny path overlaps
+/// with an explicit user-intent grant (via `--allow`, `--read`, `--write`, or profile
+/// `filesystem`). On macOS, these grants are silently ineffective because Seatbelt
+/// deny rules override earlier allow rules for content access. The caller should
+/// warn the user to use `--bypass-protection`.
+///
+/// The group name is `None` when the deny comes from a profile-level
+/// `add_deny_access` rather than a named policy group.
+///
+/// This function is platform-independent (the overlap detection is pure logic),
+/// but the caller should only emit warnings on macOS where the conflict is real.
+pub fn find_denied_user_grants(
+    deny_paths: &[PathBuf],
+    caps: &CapabilitySet,
+    policy: &Policy,
+) -> Vec<(PathBuf, Option<String>)> {
+    let mut conflicts = Vec::new();
+
+    for deny_path in deny_paths {
+        let has_user_grant = caps.fs_capabilities().iter().any(|cap| {
+            if !cap.source.is_user_intent() {
+                return false;
+            }
+            if cap.is_file {
+                cap.resolved.starts_with(deny_path)
+            } else {
+                deny_path.starts_with(&cap.resolved)
+            }
+        });
+
+        if !has_user_grant {
+            continue;
+        }
+
+        let group_name = find_deny_group_for_path(policy, deny_path);
+        conflicts.push((deny_path.clone(), group_name));
+    }
+
+    conflicts
+}
+
+/// Find which deny group blocks a given path by cross-referencing the policy.
+fn find_deny_group_for_path(policy: &Policy, deny_path: &Path) -> Option<String> {
+    for (name, group) in &policy.groups {
+        if let Some(deny) = &group.deny {
+            for path_str in &deny.access {
+                if let Ok(expanded) = expand_path(path_str) {
+                    if expanded == deny_path {
+                        return Some(name.clone());
+                    }
+                    if let Ok(canonical) = expanded.canonicalize() {
+                        if canonical == *deny_path {
+                            return Some(name.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Get the list of all group names defined in the policy
@@ -2379,11 +2440,10 @@ mod tests {
     }
 
     #[test]
-    fn test_profile_def_to_raw_profile_combines_exclude_groups() {
+    fn test_profile_def_to_raw_profile_preserves_canonical_groups_exclude() {
         let def = ProfileDef {
-            exclude_groups: vec!["preferred".to_string()],
-            policy: profile::PolicyPatchConfig {
-                exclude_groups: vec!["policy".to_string()],
+            groups: profile::GroupsConfig {
+                exclude: vec!["excluded".to_string()],
                 ..Default::default()
             },
             ..Default::default()
@@ -2391,10 +2451,7 @@ mod tests {
 
         let raw = def.to_raw_profile();
 
-        assert_eq!(
-            raw.policy.exclude_groups,
-            vec!["preferred".to_string(), "policy".to_string()]
-        );
+        assert_eq!(raw.groups.exclude, vec!["excluded".to_string()]);
     }
 
     #[cfg(target_os = "linux")]
@@ -3027,7 +3084,7 @@ mod tests {
         let err = result.expect_err("expected error");
         assert!(
             err.to_string().contains("no matching grant"),
-            "group grant should not satisfy override_deny, got: {}",
+            "group grant should not satisfy bypass_protection, got: {}",
             err
         );
     }
@@ -3112,5 +3169,67 @@ mod tests {
             read_paths.contains(&"/nix/store".to_string()),
             "nix_runtime group must include /nix/store for NixOS compatibility"
         );
+    }
+
+    #[test]
+    fn test_find_denied_user_grants_detects_overlap() {
+        let path = PathBuf::from("/nonexistent/test/secret");
+        let policy = load_policy(
+            r#"{"meta":{"version":2,"schema_version":"2.0"},"groups":{
+                "deny_creds":{"description":"creds","deny":{"access":["/nonexistent/test/secret"]}}
+            }}"#,
+        )
+        .expect("parse policy");
+
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(FsCapability {
+            original: path.clone(),
+            resolved: path.clone(),
+            access: AccessMode::ReadWrite,
+            is_file: false,
+            source: CapabilitySource::User,
+        });
+
+        let conflicts = find_denied_user_grants(&[path], &caps, &policy);
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].1.as_deref(), Some("deny_creds"));
+    }
+
+    #[test]
+    fn test_find_denied_user_grants_ignores_non_user_grants() {
+        let path = PathBuf::from("/nonexistent/test/secret");
+        let policy = load_policy(sample_policy_json()).expect("parse policy");
+
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(FsCapability {
+            original: path.clone(),
+            resolved: path.clone(),
+            access: AccessMode::ReadWrite,
+            is_file: false,
+            source: CapabilitySource::Group("system".to_string()),
+        });
+
+        let conflicts = find_denied_user_grants(&[path], &caps, &policy);
+        assert!(conflicts.is_empty());
+    }
+
+    #[test]
+    fn test_find_denied_user_grants_profile_deny_without_group() {
+        let path = PathBuf::from("/nonexistent/test/profile_denied");
+        let policy = load_policy(r#"{"meta":{"version":2,"schema_version":"2.0"},"groups":{}}"#)
+            .expect("parse policy");
+
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(FsCapability {
+            original: path.clone(),
+            resolved: path.clone(),
+            access: AccessMode::ReadWrite,
+            is_file: false,
+            source: CapabilitySource::User,
+        });
+
+        let conflicts = find_denied_user_grants(&[path], &caps, &policy);
+        assert_eq!(conflicts.len(), 1);
+        assert!(conflicts[0].1.is_none());
     }
 }

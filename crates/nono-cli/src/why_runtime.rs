@@ -10,7 +10,7 @@ pub(crate) fn run_why(args: WhyArgs) -> Result<()> {
     let (caps, overridden_paths): (CapabilitySet, Vec<std::path::PathBuf>) = if args.self_query {
         match load_sandbox_state() {
             Some(state) => {
-                let paths = state.override_deny_as_paths();
+                let paths = state.bypass_protection_as_paths();
                 (state.to_caps()?, paths)
             }
             None => {
@@ -49,7 +49,7 @@ pub(crate) fn run_why(args: WhyArgs) -> Result<()> {
         };
 
         let mut override_paths = Vec::new();
-        for tmpl in &profile.policy.override_deny {
+        for tmpl in &profile.filesystem.bypass_protection {
             let expanded = profile::expand_vars(tmpl, &workdir)?;
             if expanded.exists() {
                 if let Ok(canonical) = expanded.canonicalize() {
@@ -60,9 +60,9 @@ pub(crate) fn run_why(args: WhyArgs) -> Result<()> {
             }
         }
 
-        let (mut caps, needs_unlink) =
-            CapabilitySet::from_profile(&profile, &workdir, &sandbox_args)?;
-        if needs_unlink {
+        let prepared = CapabilitySet::from_profile(&profile, &workdir, &sandbox_args)?;
+        let mut caps = prepared.caps;
+        if prepared.needs_unlink_overrides {
             policy::apply_unlink_overrides(&mut caps);
         }
         (caps, override_paths)
@@ -79,8 +79,9 @@ pub(crate) fn run_why(args: WhyArgs) -> Result<()> {
             ..SandboxArgs::default()
         };
 
-        let (mut caps, needs_unlink) = CapabilitySet::from_args(&sandbox_args)?;
-        if needs_unlink {
+        let prepared = CapabilitySet::from_args(&sandbox_args)?;
+        let mut caps = prepared.caps;
+        if prepared.needs_unlink_overrides {
             policy::apply_unlink_overrides(&mut caps);
         }
         (caps, vec![])

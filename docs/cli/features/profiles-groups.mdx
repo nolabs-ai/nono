@@ -53,8 +53,13 @@ Profiles use JSON format:
   "workdir": {
     "access": "readwrite"
   },
-  "security": {
-    "groups": ["node_runtime", "python_runtime", "git_config"]
+  "groups": {
+    "include": ["node_runtime", "python_runtime", "git_config"],
+    "exclude": []
+  },
+  "commands": {
+    "allow": [],
+    "deny": []
   },
   "filesystem": {
     "allow": ["$HOME/.config/my-agent"],
@@ -63,19 +68,12 @@ Profiles use JSON format:
     "allow_file": [],
     "read_file": [],
     "write_file": [],
+    "deny": [],
+    "bypass_protection": [],
     "unix_socket": [],
     "unix_socket_bind": [],
     "unix_socket_dir": [],
     "unix_socket_dir_bind": []
-  },
-  "policy": {
-    "exclude_groups": [],
-    "add_allow_read": [],
-    "add_allow_write": [],
-    "add_allow_readwrite": [],
-    "add_deny_access": [],
-    "add_deny_commands": [],
-    "override_deny": []
   },
   "network": {
     "block": false
@@ -119,19 +117,30 @@ The `workdir` section controls whether and how the current working directory is 
 
 When a profile specifies a workdir access level, nono will prompt the user to confirm CWD sharing (unless `--allow-cwd` is used to skip the prompt).
 
-### Policy Overrides
+### Filesystem Overrides and Group Composition
 
-The `policy` section provides fine-grained, additive and subtractive composition on top of inherited groups and filesystem configuration. This is the primary mechanism for surgically customizing inherited profiles without redefining everything from scratch.
+Fine-grained additive and subtractive composition lives across three canonical sections:
 
-| Field | Description |
-|-------|-------------|
-| `exclude_groups` | Remove groups from the resolved group set (exclusion wins over addition) |
-| `add_allow_read` | Additional read-only directories to allow |
-| `add_allow_write` | Additional write-only directories to allow |
-| `add_allow_readwrite` | Additional read+write directories to allow |
-| `add_deny_access` | Additional deny rules to apply (block read and write content). On macOS, Unix socket paths also emit a `network-outbound` deny so that `connect(2)` to the socket is blocked. |
-| `add_deny_commands` | Deprecated in v0.33.0. Startup-only command denylist extension. Not enforced for child processes; prefer `add_deny_access` and narrower grants. |
-| `override_deny` | Paths to exempt from deny groups (must also have a matching grant) |
+- `filesystem` — path-based allow, deny, and deny-exemption entries
+- `groups` — policy group inclusion (`include`) and removal (`exclude`)
+- `commands` — startup-time command allow/deny (deprecated since v0.33.0; not enforced on child processes)
+
+This is the primary mechanism for surgically customizing inherited profiles without redefining everything from scratch.
+
+| Field | Section | Description |
+|-------|---------|-------------|
+| `include` | `groups` | Policy group names to apply on top of inherited defaults |
+| `exclude` | `groups` | Remove groups from the resolved group set (exclusion wins over addition) |
+| `read` | `filesystem` | Additional read-only directories to allow |
+| `write` | `filesystem` | Additional write-only directories to allow |
+| `allow` | `filesystem` | Additional read+write directories to allow |
+| `deny` | `filesystem` | Additional deny rules to apply (block read and write content). On macOS, Unix socket paths also emit a `network-outbound` deny so that `connect(2)` to the socket is blocked. |
+| `deny` | `commands` | Deprecated in v0.33.0. Startup-only command denylist extension. Not enforced for child processes; prefer `filesystem.deny` and narrower grants. |
+| `bypass_protection` | `filesystem` | Paths exempted from deny groups. **Does not grant access** — each path must also appear in `filesystem.allow`, `filesystem.read`, or `filesystem.write`. |
+
+<Note>
+  **Renamed in issue #594.** The old top-level `policy` section was dissolved into `filesystem`, `groups`, and `commands` in the canonical schema. Legacy names still deserialize with a deprecation warning; see the migration table in `nono profile guide` for the full mapping. The legacy keys will be removed in v1.0.0.
+</Note>
 
 #### Adding a Deny Rule to an Inherited Profile
 
@@ -144,8 +153,8 @@ Block a specific path that a base profile would otherwise allow:
     "version": "1.0.0"
   },
   "extends": "claude-code",
-  "policy": {
-    "add_deny_access": ["$HOME/.gitconfig"]
+  "filesystem": {
+    "deny": ["$HOME/.gitconfig"]
   }
 }
 ```
@@ -156,20 +165,22 @@ nono run --profile claude-deny-git -- claude
 
 #### Blocking Container Access (Docker, Podman, kubectl)
 
-Use `add_deny_access` as the enforcement mechanism. `add_deny_commands` remains deprecated startup-only compatibility behavior:
+Use `filesystem.deny` as the enforcement mechanism. `commands.deny` remains deprecated startup-only compatibility behavior:
 
 ```json
 {
   "extends": "claude-code",
   "meta": { "name": "no-docker", "version": "1.0.0" },
-  "policy": {
-    "add_deny_access": ["/var/run/docker.sock"],
-    "add_deny_commands": ["docker", "docker-compose", "podman", "kubectl"]
+  "filesystem": {
+    "deny": ["/var/run/docker.sock"]
+  },
+  "commands": {
+    "deny": ["docker", "docker-compose", "podman", "kubectl"]
   }
 }
 ```
 
-On macOS, `add_deny_access` on a socket path also emits a `network-outbound` deny — Seatbelt classifies `connect(2)` as a network operation, so a file deny alone won't block it. Prefer path- and network-based controls; `add_deny_commands` is not enforced for child processes.
+On macOS, `filesystem.deny` on a socket path also emits a `network-outbound` deny — Seatbelt classifies `connect(2)` as a network operation, so a file deny alone won't block it. Prefer path- and network-based controls; `commands.deny` is not enforced for child processes.
 
 #### Adding Write-Only Access
 
@@ -182,8 +193,8 @@ Grant write-only access to a directory without granting read:
     "version": "1.0.0"
   },
   "extends": "default",
-  "policy": {
-    "add_allow_write": ["$HOME/.cache/my-agent-cache"]
+  "filesystem": {
+    "write": ["$HOME/.cache/my-agent-cache"]
   },
   "workdir": {
     "access": "none"
@@ -202,8 +213,8 @@ Remove the deprecated startup-only command-gating group to allow `rm`, `chmod`, 
     "version": "1.0.0"
   },
   "extends": "default",
-  "policy": {
-    "exclude_groups": [
+  "groups": {
+    "exclude": [
       "dangerous_commands",
       "dangerous_commands_linux",
       "dangerous_commands_macos"
@@ -214,7 +225,7 @@ Remove the deprecated startup-only command-gating group to allow `rm`, `chmod`, 
 
 #### Overriding a Deny Rule for a Specific Path
 
-Some deny groups (like `deny_credentials`) are marked as required and cannot be excluded. Use `override_deny` to punch a targeted hole through a deny group for a specific path. The path must also be explicitly granted via `filesystem` or `policy.add_allow_*`.
+Some deny groups (like `deny_credentials`) are marked as required and cannot be excluded. Use `filesystem.bypass_protection` to punch a targeted hole through a deny group for a specific path. The path must also be explicitly granted via another `filesystem` entry — `bypass_protection` only removes the deny rule, it does not implicitly grant access.
 
 ```json
 {
@@ -224,24 +235,22 @@ Some deny groups (like `deny_credentials`) are marked as required and cannot be 
   },
   "extends": "opencode",
   "filesystem": {
-    "allow": ["$HOME/.docker"]
-  },
-  "policy": {
-    "override_deny": ["$HOME/.docker"]
+    "allow": ["$HOME/.docker"],
+    "bypass_protection": ["$HOME/.docker"]
   }
 }
 ```
 
-This allows access to `~/.docker` even though `deny_credentials` blocks it by default. The deny override does not implicitly grant access -- the matching `filesystem.allow` entry is required.
+This allows access to `~/.docker` even though `deny_credentials` blocks it by default. The deny override does not implicitly grant access — the matching `filesystem.allow` entry is required.
 
-This is equivalent to the CLI flag `--override-deny`:
+This is equivalent to the CLI flag `--bypass-protection`:
 
 ```bash
-nono run --profile opencode --allow ~/.docker --override-deny ~/.docker -- opencode
+nono run --profile opencode --allow ~/.docker --bypass-protection ~/.docker -- opencode
 ```
 
 <Note>
-  `policy` fields are additive across inheritance. A child profile's `add_deny_access` is merged with the base profile's `add_deny_access`, and `exclude_groups` from both levels are combined. The `filesystem` section works the same way - use `policy` when you need deny rules or write-only access that `filesystem` cannot express.
+  `filesystem`, `groups`, and `commands` fields are additive across inheritance. A child profile's `filesystem.deny` is merged with the base profile's `filesystem.deny`, and `groups.exclude` from both levels are combined.
 </Note>
 
 ### Network Configuration
@@ -422,26 +431,25 @@ You can also create a user profile with the same name to override a built-in pro
 
 ## Groups
 
-Groups are named, composable collections of security rules. Profiles reference groups by name in their `security.groups` field.
+Groups are named, composable collections of security rules. Profiles reference groups by name in their `groups.include` field.
 
 ### How Groups Compose
 
 Every profile's effective capability set is built through composition:
 
 ```
-((default_profile_groups + profile.security.groups) - profile.policy.exclude_groups) + profile.policy.add_* + profile.filesystem - deny_groups + profile.policy.override_deny + CLI flags
+((default_profile_groups + profile.groups.include) - profile.groups.exclude) + profile.filesystem.{allow,read,write} + profile.commands.allow - (deny_groups + profile.filesystem.deny + profile.commands.deny) + profile.filesystem.bypass_protection + CLI flags
 ```
 
 1. **default_profile_groups** come from the built-in `default` profile
-2. **profile.security.groups** add additional groups on top
-3. **profile.policy.exclude_groups** removes groups from the composed set (exclusion wins)
-4. **profile.policy.add_allow_***, **profile.policy.add_deny_access**, and **profile.policy.add_deny_commands** apply additive overrides
-5. **profile.filesystem** entries are additive
-6. **profile.policy.override_deny** punches targeted holes through deny groups (requires matching grant)
-7. **CLI overrides** (`--allow`, `--read`, `--override-deny`, etc.) are applied last
+2. **profile.groups.include** adds additional groups on top
+3. **profile.groups.exclude** removes groups from the composed set (exclusion wins)
+4. **profile.filesystem.{allow,read,write}**, **profile.filesystem.deny**, and **profile.commands.{allow,deny}** apply additive overrides
+5. **profile.filesystem.bypass_protection** punches targeted holes through deny groups (requires a matching grant in `filesystem.allow`/`read`/`write`)
+6. **CLI overrides** (`--allow`, `--read`, `--bypass-protection`, etc.) are applied last
 
 Exclusions are applied after group addition. If the same group appears in both
-`security.groups` and `policy.exclude_groups`, the exclusion wins.
+`groups.include` and `groups.exclude`, the exclusion wins.
 
 ### Group Taxonomy
 

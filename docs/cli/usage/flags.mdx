@@ -557,14 +557,15 @@ nono run --allow-cwd --allow-command rm --allow-command mv -- my-script.sh
   and network policy.
 </Note>
 
-Commands can also be allowed temporarily via the deprecated `allowed_commands`
-field in a profile's security config:
+Commands can also be allowed temporarily via the deprecated `commands.allow`
+field (the older `security` placement is also accepted with a deprecation
+warning, see issue #594):
 
 ```json
 {
   "meta": { "name": "my-profile" },
   "filesystem": { "allow": ["/tmp"] },
-  "security": { "allowed_commands": ["rm", "chmod"] }
+  "commands": { "allow": ["rm", "chmod"] }
 }
 ```
 
@@ -584,23 +585,23 @@ nono run --allow-cwd --block-command my-dangerous-tool -- my-script.sh
 
 ### Deny Group Overrides
 
-#### `--override-deny`
+#### `--bypass-protection`
 
-Override a deny group rule for a specific path. Required groups like `deny_credentials` block access to paths such as `~/.aws`, `~/.config/gcloud`, etc. This flag punches a targeted hole through the deny without removing the entire group.
+Bypass a deny group rule for a specific path. Required groups like `deny_credentials` block access to paths such as `~/.aws`, `~/.config/gcloud`, etc. This flag punches a targeted hole through the deny without removing the entire group.
 
-The override path must also be explicitly granted via `--allow`, `--read`, `--write`, or their file equivalents. `--override-deny` only removes the deny rule — it does not implicitly grant access.
+The bypass path must also be explicitly granted via `--allow`, `--read`, `--write`, or their file equivalents. `--bypass-protection` only removes the deny rule — it does not implicitly grant access.
 
 ```bash
 # Allow an AWS agent to access credentials
-nono run --override-deny ~/.aws --allow ~/.aws -- my-aws-agent
+nono run --bypass-protection ~/.aws --allow ~/.aws -- my-aws-agent
 
 # Allow read-only access to GCP config
-nono run --override-deny ~/.config/gcloud --read ~/.config/gcloud -- gcloud-agent
+nono run --bypass-protection ~/.config/gcloud --read ~/.config/gcloud -- gcloud-agent
 
-# Multiple overrides
+# Multiple bypasses
 nono run \
-  --override-deny ~/.aws \
-  --override-deny ~/.config/gcloud \
+  --bypass-protection ~/.aws \
+  --bypass-protection ~/.config/gcloud \
   --allow ~/.aws \
   --read ~/.config/gcloud \
   -- multi-cloud-agent
@@ -611,12 +612,16 @@ Can be specified multiple times.
 <Warning>
 **Security guardrails:**
 
-- A warning is printed to stderr for each override applied, making security relaxations visible in logs.
+- A warning is printed to stderr for each bypass applied, making security relaxations visible in logs.
 - On macOS, Seatbelt allow rules more specific than the deny are emitted. On Linux, the deny path is removed from validation so Landlock allow rules take effect.
 </Warning>
 
 <Note>
-  `--override-deny` without a matching grant (`--allow`, `--read`, `--write`, etc.) is a hard error. This prevents silent no-ops on Linux and unintended implicit grants on macOS.
+  `--bypass-protection` without a matching grant (`--allow`, `--read`, `--write`, etc.) is a hard error. This prevents silent no-ops on Linux and unintended implicit grants on macOS.
+</Note>
+
+<Note>
+  **Renamed in issue #594.** This flag was renamed from its former deny-override name. The legacy name is still accepted as a deprecated alias and emits a warning on use; it will be removed in v1.0.0.
 </Note>
 
 ### Credential Options

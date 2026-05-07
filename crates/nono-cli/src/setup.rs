@@ -383,7 +383,7 @@ impl SetupRunner {
             println!("  nono run --allow-cwd -- <command>");
             println!();
             println!("  # Check why a sensitive path is blocked");
-            println!("  nono why ~/.ssh/id_rsa");
+            println!("  nono why --path ~/.ssh/id_rsa");
             println!();
 
             if self.generate_profiles {

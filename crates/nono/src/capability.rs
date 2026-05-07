@@ -1297,30 +1297,76 @@ impl CapabilitySet {
         !self.fs.is_empty()
     }
 
-    /// Deduplicate filesystem capabilities by resolved path.
+    /// Deduplicate filesystem capabilities in-place.
     ///
-    /// Priority rules:
-    /// 1. **User source wins over System/Group**: if the user explicitly chose
-    ///    `--read /tmp`, a system default of ReadWrite must not override it.
-    /// 2. **Among same-source entries**, highest access level wins
-    ///    (ReadWrite > Read/Write).
-    /// 3. **Symlink originals are preserved**: if any duplicate has
-    ///    `original != resolved` (e.g., `/tmp` -> `/private/tmp`), the surviving
-    ///    entry inherits that original so Seatbelt profile generation can emit
-    ///    rules for both the symlink and target paths.
+    /// The dedup key is **platform-specific** because the two sandbox
+    /// backends enforce path rules differently:
+    ///
+    /// - **macOS (Seatbelt)** — key is `(original, is_file)`.  Seatbelt
+    ///   matches rules against the *literal* path the process presents to
+    ///   the kernel, before symlink resolution.  Two distinct symlinks that
+    ///   resolve to the same canonical target therefore each need their own
+    ///   allow rule and must not be collapsed.  Non-symlink entries are
+    ///   unaffected because their `original` equals their `resolved`.
+    ///
+    /// - **Non-macOS (Landlock / Linux)** — key is `(resolved, is_file)`.
+    ///   Landlock rules are inode-based and the kernel unions all rules for
+    ///   the same inode.  If two symlinks to the same target survived with
+    ///   different access levels (e.g. User/Read and System/ReadWrite),
+    ///   Landlock would silently widen to ReadWrite, bypassing user intent.
+    ///   Keying on `resolved` ensures user-intent policy is enforced.  When
+    ///   a symlink entry is discarded its `original` is copied into the
+    ///   surviving entry so that logging and struct consumers stay accurate.
+    ///
+    /// Priority rules (both platforms):
+    /// 1. **User/Profile source beats System/Group** regardless of access level.
+    /// 2. **Same-source collisions** keep the highest access
+    ///    (`ReadWrite > Read | Write`); complementary modes merge
+    ///    (`Read + Write → ReadWrite`).
     pub fn deduplicate(&mut self) {
         use std::collections::HashMap;
 
-        // Group by (resolved path, is_file)
+        // Dedup key strategy differs by platform because the two sandboxes
+        // enforce path rules in fundamentally different ways:
+        //
+        // macOS / Seatbelt — key on (original, is_file)
+        //   Seatbelt evaluates rules against the *literal* path the process
+        //   presents to the kernel, before symlink resolution.  Two distinct
+        //   symlinks that point to the same canonical target therefore each
+        //   need their own allow rule.  Example:
+        //     ~/.local/state/nix/profiles  (symlink → /nix/var/…)
+        //     ~/.local/state/nix/profile   (symlink → …/profiles)
+        //   Both resolve to the same canonical path.  If we keyed on `resolved`
+        //   the second entry would be silently discarded, and Seatbelt would
+        //   deny any access made through that literal path.
+        //   Non-symlink entries (original == resolved) are unaffected.
+        //
+        // Linux / Landlock — key on (resolved, is_file)  [original behaviour]
+        //   Landlock rules are attached to inodes (resolved paths).  If we
+        //   kept two entries for the same resolved path but with different
+        //   access levels (e.g. User/Read via symlink-A and System/ReadWrite
+        //   via symlink-B), Landlock would union the two rules to ReadWrite,
+        //   silently bypassing the user-intent Read restriction.  Keying on
+        //   `resolved` ensures the user-intent policy (User/Read beats
+        //   System/ReadWrite for the same inode) is correctly enforced.
         let mut seen: HashMap<(PathBuf, bool), usize> = HashMap::new();
         let mut to_remove = Vec::new();
-        // Deferred updates: (target_index, new_original) to apply after iteration
+        // Deferred updates: (target_index, new_original) to apply after iteration.
+        // Only used on Linux, where we dedup by `resolved`: when merging
+        // duplicates for the same resolved path, we may still carry over a
+        // symlink-based `original` for diagnostics, logging, and struct semantics.
+        #[cfg(target_os = "linux")]
         let mut original_updates: Vec<(usize, PathBuf)> = Vec::new();
         // Deferred access upgrades: (target_index, new_access) for Read+Write merges
         let mut access_upgrades: Vec<(usize, AccessMode)> = Vec::new();
 
         for (i, cap) in self.fs.iter().enumerate() {
+            // Platform-specific dedup key (see comment above).
+            #[cfg(target_os = "macos")]
+            let key = (cap.original.clone(), cap.is_file);
+            #[cfg(target_os = "linux")]
             let key = (cap.resolved.clone(), cap.is_file);
+
             if let Some(&existing_idx) = seen.get(&key) {
                 let existing = &self.fs[existing_idx];
 
@@ -1353,7 +1399,9 @@ impl CapabilitySet {
                 if keep_new {
                     to_remove.push(existing_idx);
                     seen.insert(key, i);
-                    // Preserve symlink original from the removed entry
+                    // On Linux: preserve symlink original from the removed
+                    // entry into the kept entry so `original` stays meaningful.
+                    #[cfg(target_os = "linux")]
                     if cap.original == cap.resolved && existing.original != existing.resolved {
                         original_updates.push((i, existing.original.clone()));
                     }
@@ -1362,7 +1410,9 @@ impl CapabilitySet {
                         access_upgrades.push((i, access));
                     }
                 } else {
-                    // Inherit symlink original from the entry being discarded
+                    // On Linux: inherit symlink original from the entry
+                    // being discarded into the surviving entry.
+                    #[cfg(target_os = "linux")]
                     if existing.original == existing.resolved && cap.original != cap.resolved {
                         original_updates.push((existing_idx, cap.original.clone()));
                     }
@@ -1377,7 +1427,8 @@ impl CapabilitySet {
             }
         }
 
-        // Apply deferred symlink original updates
+        // Apply deferred symlink original updates (Linux only)
+        #[cfg(target_os = "linux")]
         for (idx, original) in original_updates {
             self.fs[idx].original = original;
         }
@@ -1884,10 +1935,221 @@ mod tests {
     }
 
     #[test]
-    fn test_deduplicate_preserves_symlink_original() {
-        // User adds --read /tmp (original: /tmp, resolved: /private/tmp, Read)
-        // System adds /private/tmp (original: /private/tmp, resolved: /private/tmp, ReadWrite)
-        // User wins: surviving entry should be Read with symlink original preserved
+    fn test_deduplicate_symlink_and_direct_are_kept_separately() {
+        // macOS only: Seatbelt enforces on literal (pre-resolution) paths.
+        // A symlink entry (original=/symlink/path → resolved=/real/path) and a
+        // direct entry (original=/real/path, resolved=/real/path) have different
+        // original paths.  Dedup keys on `original` on macOS, so both entries
+        // survive and each gets its own Seatbelt allow rule.
+        #[cfg(target_os = "macos")]
+        {
+            let symlink_path = PathBuf::from("/symlink/path");
+            let real_path = PathBuf::from("/real/path");
+
+            let mut caps = CapabilitySet::new();
+            caps.add_fs(FsCapability {
+                original: symlink_path.clone(),
+                resolved: real_path.clone(),
+                access: AccessMode::Read,
+                is_file: false,
+                source: CapabilitySource::User,
+            });
+            caps.add_fs(FsCapability {
+                original: real_path.clone(),
+                resolved: real_path.clone(),
+                access: AccessMode::ReadWrite,
+                is_file: false,
+                source: CapabilitySource::System,
+            });
+
+            caps.deduplicate();
+            // Both entries survive because they have different original paths.
+            assert_eq!(caps.fs_capabilities().len(), 2);
+            let originals: Vec<&PathBuf> =
+                caps.fs_capabilities().iter().map(|c| &c.original).collect();
+            assert!(originals.contains(&&symlink_path));
+            assert!(originals.contains(&&real_path));
+        }
+
+        // Linux: dedup keys on `resolved`, so a symlink entry and its direct
+        // counterpart collapse to one entry.  User-intent wins.
+        #[cfg(target_os = "linux")]
+        {
+            let symlink_path = PathBuf::from("/symlink/path");
+            let real_path = PathBuf::from("/real/path");
+
+            let mut caps = CapabilitySet::new();
+            caps.add_fs(FsCapability {
+                original: symlink_path.clone(),
+                resolved: real_path.clone(),
+                access: AccessMode::Read,
+                is_file: false,
+                source: CapabilitySource::User,
+            });
+            caps.add_fs(FsCapability {
+                original: real_path.clone(),
+                resolved: real_path.clone(),
+                access: AccessMode::ReadWrite,
+                is_file: false,
+                source: CapabilitySource::System,
+            });
+
+            caps.deduplicate();
+            // Collapsed to one entry; User/Read beats System/ReadWrite.
+            assert_eq!(caps.fs_capabilities().len(), 1);
+            let surviving = &caps.fs_capabilities()[0];
+            assert_eq!(surviving.access, AccessMode::Read);
+            assert!(matches!(surviving.source, CapabilitySource::User));
+            // Symlink original preserved into the surviving entry.
+            assert_eq!(surviving.original, symlink_path);
+            assert_eq!(surviving.resolved, real_path);
+        }
+    }
+
+    /// macOS only: the concrete bug that prompted this fix.
+    /// Two distinct symlinks resolving to the same canonical path
+    /// (e.g. ~/.local/state/nix/profile and ~/.local/state/nix/profiles
+    /// both pointing into the nix store) must each survive dedup so that
+    /// Seatbelt emits allow rules for both literal symlink paths.
+    ///
+    /// On Linux the Landlock sandbox uses resolved paths; having both
+    /// entries would union the Landlock rules, which is harmless when both
+    /// have the same access level but could bypass a user-intent restriction
+    /// if they differed.  The resolved-path key already prevents that.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_deduplicate_two_symlinks_same_target_both_kept() {
+        {
+            let link1 = PathBuf::from("/Users/me/.local/state/nix/profiles");
+            let link2 = PathBuf::from("/Users/me/.local/state/nix/profile");
+            let real_path = PathBuf::from("/nix/var/nix/profiles/per-user/me/profile");
+
+            let mut caps = CapabilitySet::new();
+            caps.add_fs(FsCapability {
+                original: link1.clone(),
+                resolved: real_path.clone(),
+                access: AccessMode::Read,
+                is_file: false,
+                source: CapabilitySource::User,
+            });
+            caps.add_fs(FsCapability {
+                original: link2.clone(),
+                resolved: real_path.clone(),
+                access: AccessMode::Read,
+                is_file: false,
+                source: CapabilitySource::User,
+            });
+
+            caps.deduplicate();
+            assert_eq!(
+                caps.fs_capabilities().len(),
+                2,
+                "both symlink entries must survive"
+            );
+            let originals: Vec<&PathBuf> =
+                caps.fs_capabilities().iter().map(|c| &c.original).collect();
+            assert!(originals.contains(&&link1), "link1 (profiles) must be kept");
+            assert!(originals.contains(&&link2), "link2 (profile) must be kept");
+        }
+    }
+
+    /// Linux-only: when a direct-path entry (original == resolved) survives
+    /// dedup over a discarded symlink entry, the surviving entry should adopt
+    /// the symlink's original so that `original` stays meaningful for logging
+    /// and any future consumers.
+    ///
+    /// Exercises the `original_updates` branch:
+    ///   `existing.original == existing.resolved && cap.original != cap.resolved`
+    /// (keep_new = false path — existing wins, discarded entry is the symlink).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_deduplicate_linux_surviving_direct_entry_inherits_symlink_original() {
+        let symlink_path = PathBuf::from("/symlink/path");
+        let real_path = PathBuf::from("/real/path");
+
+        let mut caps = CapabilitySet::new();
+        // Direct entry added first — becomes `existing` in the dedup loop.
+        // User source so it wins over the incoming System entry.
+        caps.add_fs(FsCapability {
+            original: real_path.clone(),
+            resolved: real_path.clone(),
+            access: AccessMode::ReadWrite,
+            is_file: false,
+            source: CapabilitySource::User,
+        });
+        // Symlink entry added second — same resolved path, System source.
+        // keep_new = false: User direct entry survives, symlink entry is discarded.
+        caps.add_fs(FsCapability {
+            original: symlink_path.clone(),
+            resolved: real_path.clone(),
+            access: AccessMode::Read,
+            is_file: false,
+            source: CapabilitySource::System,
+        });
+
+        caps.deduplicate();
+        assert_eq!(caps.fs_capabilities().len(), 1);
+        let surviving = &caps.fs_capabilities()[0];
+        // User wins with its access level.
+        assert_eq!(surviving.access, AccessMode::ReadWrite);
+        assert!(matches!(surviving.source, CapabilitySource::User));
+        // The surviving entry must have adopted the discarded symlink's original.
+        assert_eq!(
+            surviving.original, symlink_path,
+            "surviving direct entry must inherit the discarded symlink's original"
+        );
+        assert_eq!(surviving.resolved, real_path);
+    }
+
+    /// Linux-only: mirror of the above but with insertion order reversed —
+    /// the symlink entry is `existing` and is discarded in favour of the
+    /// incoming direct User entry.  Exercises the `original_updates` branch:
+    ///   `cap.original == cap.resolved && existing.original != existing.resolved`
+    /// (keep_new = true path — new direct entry wins, discarded entry is the symlink).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_deduplicate_linux_incoming_direct_entry_inherits_symlink_original_from_existing() {
+        let symlink_path = PathBuf::from("/symlink/path");
+        let real_path = PathBuf::from("/real/path");
+
+        let mut caps = CapabilitySet::new();
+        // Symlink entry added first — becomes `existing` in the dedup loop.
+        // System source so it loses to the incoming User entry.
+        caps.add_fs(FsCapability {
+            original: symlink_path.clone(),
+            resolved: real_path.clone(),
+            access: AccessMode::ReadWrite,
+            is_file: false,
+            source: CapabilitySource::System,
+        });
+        // Direct entry added second — same resolved path, User source.
+        // keep_new = true: User direct entry survives, symlink entry is discarded.
+        caps.add_fs(FsCapability {
+            original: real_path.clone(),
+            resolved: real_path.clone(),
+            access: AccessMode::Read,
+            is_file: false,
+            source: CapabilitySource::User,
+        });
+
+        caps.deduplicate();
+        assert_eq!(caps.fs_capabilities().len(), 1);
+        let surviving = &caps.fs_capabilities()[0];
+        // User wins with its access level.
+        assert_eq!(surviving.access, AccessMode::Read);
+        assert!(matches!(surviving.source, CapabilitySource::User));
+        // The surviving entry must have adopted the discarded symlink's original.
+        assert_eq!(
+            surviving.original, symlink_path,
+            "surviving direct entry must inherit the discarded symlink's original"
+        );
+        assert_eq!(surviving.resolved, real_path);
+    }
+
+    #[test]
+    fn test_deduplicate_identical_symlink_entries_collapsed() {
+        // Two entries with the *same* original symlink path are true duplicates
+        // and should still be collapsed to one.
         let symlink_path = PathBuf::from("/symlink/path");
         let real_path = PathBuf::from("/real/path");
 
@@ -1900,7 +2162,7 @@ mod tests {
             source: CapabilitySource::User,
         });
         caps.add_fs(FsCapability {
-            original: real_path.clone(),
+            original: symlink_path.clone(),
             resolved: real_path.clone(),
             access: AccessMode::ReadWrite,
             is_file: false,
@@ -1910,41 +2172,9 @@ mod tests {
         caps.deduplicate();
         assert_eq!(caps.fs_capabilities().len(), 1);
         let surviving = &caps.fs_capabilities()[0];
-        // User wins with Read access
+        // User wins: Read is kept, not the system's ReadWrite
         assert_eq!(surviving.access, AccessMode::Read);
         assert!(matches!(surviving.source, CapabilitySource::User));
-        // Symlink original preserved
-        assert_eq!(surviving.original, symlink_path);
-        assert_eq!(surviving.resolved, real_path);
-    }
-
-    #[test]
-    fn test_deduplicate_preserves_symlink_original_keep_existing() {
-        // System entry first (original == resolved),
-        // User entry second via symlink — User wins and inherits symlink
-        let symlink_path = PathBuf::from("/symlink/path");
-        let real_path = PathBuf::from("/real/path");
-
-        let mut caps = CapabilitySet::new();
-        caps.add_fs(FsCapability {
-            original: real_path.clone(),
-            resolved: real_path.clone(),
-            access: AccessMode::Read,
-            is_file: false,
-            source: CapabilitySource::System,
-        });
-        caps.add_fs(FsCapability {
-            original: symlink_path.clone(),
-            resolved: real_path.clone(),
-            access: AccessMode::Read,
-            is_file: false,
-            source: CapabilitySource::User,
-        });
-
-        caps.deduplicate();
-        assert_eq!(caps.fs_capabilities().len(), 1);
-        let surviving = &caps.fs_capabilities()[0];
-        // The symlink original must be inherited from the discarded entry
         assert_eq!(surviving.original, symlink_path);
         assert_eq!(surviving.resolved, real_path);
     }
@@ -2009,6 +2239,53 @@ mod tests {
         let surviving = &caps.fs_capabilities()[0];
         // User wins, and Read+Write should merge to ReadWrite
         assert_eq!(surviving.access, AccessMode::ReadWrite);
+        assert!(matches!(surviving.source, CapabilitySource::User));
+    }
+
+    /// Linux-only: verify that two different symlinks pointing to the same
+    /// resolved path with different access levels are collapsed to one entry
+    /// so that the user-intent Read restriction is not bypassed by a system
+    /// ReadWrite rule for the same inode.
+    ///
+    /// On macOS both entries would survive (Seatbelt needs literal-path rules
+    /// for each symlink), but on Linux Landlock unions all rules for the same
+    /// resolved path, so we must dedup by `resolved` to uphold the policy.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_deduplicate_linux_two_symlinks_same_resolved_user_intent_wins() {
+        let link1 = PathBuf::from("/link1");
+        let link2 = PathBuf::from("/link2");
+        let real_path = PathBuf::from("/real");
+
+        let mut caps = CapabilitySet::new();
+        // User grants Read via one symlink
+        caps.add_fs(FsCapability {
+            original: link1.clone(),
+            resolved: real_path.clone(),
+            access: AccessMode::Read,
+            is_file: false,
+            source: CapabilitySource::User,
+        });
+        // System grants ReadWrite via a different symlink to the same target
+        caps.add_fs(FsCapability {
+            original: link2.clone(),
+            resolved: real_path.clone(),
+            access: AccessMode::ReadWrite,
+            is_file: false,
+            source: CapabilitySource::System,
+        });
+
+        caps.deduplicate();
+        // Must collapse to one entry so Landlock only sees one rule (Read).
+        // If both survived, Landlock would union them to ReadWrite, bypassing
+        // the user-intent Read restriction.
+        assert_eq!(caps.fs_capabilities().len(), 1);
+        let surviving = &caps.fs_capabilities()[0];
+        assert_eq!(
+            surviving.access,
+            AccessMode::Read,
+            "user-intent Read must not be widened to ReadWrite by a system grant"
+        );
         assert!(matches!(surviving.source, CapabilitySource::User));
     }
 

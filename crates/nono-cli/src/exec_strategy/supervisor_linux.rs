@@ -11,7 +11,7 @@
 
 use super::*;
 use crate::trust_intercept::TrustInterceptor;
-use nono::AccessMode;
+use nono::{try_canonicalize, AccessMode};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct InitialCapability {
@@ -231,8 +231,7 @@ pub(super) fn handle_seccomp_notification(
             return Ok(());
         }
     };
-    let canonicalized =
-        std::fs::canonicalize(&resolved_path).unwrap_or_else(|_| resolved_path.clone());
+    let canonicalized = try_canonicalize(&resolved_path);
 
     // For the initial capability match, map a grandchild's /proc/<tgid> path back to the
     // direct child's /proc/<child_pid>, because initial_caps are built from the direct

@@ -300,21 +300,21 @@ nono run \
 
 ### Cloud Agent with Credential Access
 
-By default, `~/.aws` and `~/.config/gcloud` are blocked by the `deny_credentials` group. Use `--override-deny` to grant targeted access:
+By default, `~/.aws` and `~/.config/gcloud` are blocked by the `deny_credentials` group. Use `--bypass-protection` to grant targeted access:
 
 ```bash
 # AWS agent
 nono run \
   --allow-cwd \
-  --override-deny ~/.aws \
+  --bypass-protection ~/.aws \
   --allow ~/.aws \
   -- my-aws-agent
 
 # Multi-cloud agent
 nono run \
   --allow-cwd \
-  --override-deny ~/.aws \
-  --override-deny ~/.config/gcloud \
+  --bypass-protection ~/.aws \
+  --bypass-protection ~/.config/gcloud \
   --allow ~/.aws \
   --read ~/.config/gcloud \
   -- multi-cloud-agent

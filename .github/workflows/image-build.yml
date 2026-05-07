@@ -33,8 +33,9 @@ jobs:
     name: Resolve build parameters
     runs-on: ubuntu-latest
     if: >-
-      (github.event_name == 'workflow_dispatch') ||
-      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
+      github.repository == 'always-further/nono' &&
+      ((github.event_name == 'workflow_dispatch') ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success'))
     outputs:
       ref: ${{ steps.params.outputs.ref }}
       version: ${{ steps.params.outputs.version }}

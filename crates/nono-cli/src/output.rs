@@ -9,7 +9,6 @@ use nono::{AccessMode, CapabilitySet, NetworkMode, NonoError, Result};
 use std::ffi::{OsStr, OsString};
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -17,8 +16,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Dark foreground for badge text (works on both light and dark bg colors)
 const BADGE_FG_DARK: Rgb = Rgb(30, 30, 46);
-static PENDING_STATUS_LINE: AtomicBool = AtomicBool::new(false);
-
 /// Print a thin horizontal rule using overlay color
 fn rule() {
     let t = theme::current();
@@ -263,24 +260,6 @@ pub fn print_abi_info(silent: bool) {
     let t = theme::current();
     match nono::Sandbox::detect_abi() {
         Ok(detected) => {
-            let features = detected.feature_names();
-            let feature_summary: Vec<&str> = features.iter().skip(1).map(|s| s.as_str()).collect();
-            if feature_summary.is_empty() {
-                eprintln!(
-                    "  {} {}",
-                    badge(" kernel ", t.green, BADGE_FG_DARK),
-                    fg(&detected.to_string(), t.text),
-                );
-            } else {
-                eprintln!(
-                    "  {} {} {}",
-                    badge(" kernel ", t.green, BADGE_FG_DARK),
-                    fg(&detected.to_string(), t.text),
-                    fg(&format!("({})", feature_summary.join(", ")), t.subtext,),
-                );
-            }
-
-            // Show what's missing on degraded ABI versions
             type AbiFeatureCheck = (&'static str, fn(&nono::DetectedAbi) -> bool);
             const ALL_FEATURES: &[AbiFeatureCheck] = &[
                 ("Refer", nono::DetectedAbi::has_refer),
@@ -297,38 +276,42 @@ pub fn print_abi_info(silent: bool) {
                 .collect();
             let is_wsl2 = nono::sandbox::is_wsl2();
 
-            // On WSL2, seccomp notify is always unavailable (EBUSY) regardless
-            // of Landlock ABI level, so we show a banner even when all Landlock
-            // features are present.
-            if !missing.is_empty() || is_wsl2 {
-                let hint = if is_wsl2 {
-                    let pad = " ".repeat(10);
-                    let mut wsl2_missing: Vec<&str> = Vec::new();
-                    if !detected.has_network() {
-                        wsl2_missing.push("per-port filtering");
-                    }
-                    if !detected.has_ioctl_dev() {
-                        wsl2_missing.push("device ioctl");
-                    }
-                    if !detected.has_scoping() {
-                        wsl2_missing.push("process scoping");
-                    }
-                    // seccomp notify is always unavailable on WSL2 (EBUSY)
-                    wsl2_missing.push("capability elevation (seccomp notify)");
-                    format!(
-                        "degraded: {} unavailable on WSL2\n\
-                         {pad}(block-all network via --block-net still works)\n\
-                         {pad}details: https://nono.sh/docs/cli/internals/wsl2",
-                        wsl2_missing.join(", "),
-                    )
-                } else {
-                    format!(
-                        "degraded: {} (upgrade kernel for full support)",
-                        missing.join(", "),
-                    )
-                };
-                eprintln!("          {}", fg(&hint, t.yellow),);
+            if missing.is_empty() && !is_wsl2 {
+                return;
             }
+
+            eprintln!(
+                "  {} {}",
+                badge(" kernel ", t.yellow, BADGE_FG_DARK),
+                fg(&detected.to_string(), t.text),
+            );
+
+            let hint = if is_wsl2 {
+                let pad = " ".repeat(10);
+                let mut wsl2_missing: Vec<&str> = Vec::new();
+                if !detected.has_network() {
+                    wsl2_missing.push("per-port filtering");
+                }
+                if !detected.has_ioctl_dev() {
+                    wsl2_missing.push("device ioctl");
+                }
+                if !detected.has_scoping() {
+                    wsl2_missing.push("process scoping");
+                }
+                wsl2_missing.push("capability elevation (seccomp notify)");
+                format!(
+                    "degraded: {} unavailable on WSL2\n\
+                     {pad}(block-all network via --block-net still works)\n\
+                     {pad}details: https://nono.sh/docs/cli/internals/wsl2",
+                    wsl2_missing.join(", "),
+                )
+            } else {
+                format!(
+                    "degraded: {} (upgrade kernel for full support)",
+                    missing.join(", "),
+                )
+            };
+            eprintln!("          {}", fg(&hint, t.yellow));
         }
         Err(e) => {
             eprintln!(
@@ -346,7 +329,7 @@ pub fn print_abi_info(silent: bool) {
 
 /// Print supervised mode status
 pub fn print_supervised_info(silent: bool, rollback: bool, proxy_active: bool) {
-    if silent {
+    if silent || (!rollback && !proxy_active) {
         return;
     }
     let t = theme::current();
@@ -365,59 +348,13 @@ pub fn print_supervised_info(silent: bool, rollback: bool, proxy_active: bool) {
     );
 }
 
-/// Print status message for applying sandbox
+/// Print a minimal status line before handing off to the sandboxed child.
 pub fn print_applying_sandbox(silent: bool) {
     if silent {
         return;
     }
     let t = theme::current();
-    eprint!("  {}", fg("Applying sandbox...", t.subtext));
-    PENDING_STATUS_LINE.store(true, Ordering::SeqCst);
-    // Flush so it appears immediately (no newline yet)
-    std::io::stderr().flush().ok();
-}
-
-/// Finish a pending inline status message before handing the terminal to a child UI.
-///
-/// Prints a delimiter line to visually separate the nono banner from the
-/// child's output.
-pub fn finish_status_line_for_handoff(silent: bool) {
-    if silent {
-        return;
-    }
-    if !take_pending_status_line() {
-        return;
-    }
-    let t = theme::current();
-    let mut stderr = std::io::stderr();
-    if stderr.is_terminal() {
-        let _ = write!(stderr, "\r\n");
-    } else {
-        let _ = writeln!(stderr);
-    }
-    let _ = writeln!(
-        stderr,
-        "  {}",
-        fg(
-            "────────────────────────────────────────────────────",
-            t.subtext
-        )
-    );
-    let _ = writeln!(stderr);
-    let _ = stderr.flush();
-}
-
-/// Print success message when sandbox is active
-pub fn print_sandbox_active(silent: bool) {
-    if silent {
-        return;
-    }
-    let t = theme::current();
-    if take_pending_status_line() {
-        eprintln!(" {}", fg("active", t.green).bold());
-    } else {
-        eprintln!("  {}", fg("active", t.green).bold());
-    }
+    eprintln!("  {}", fg("Applying sandbox...", t.subtext));
     eprintln!();
 }
 
@@ -466,24 +403,18 @@ fn render_diagnostic_footer(footer: &str) -> String {
 
 fn print_terminal_block(message: &str, leading_blank_line: bool) {
     let mut stderr = std::io::stderr();
-    let had_pending_status = take_pending_status_line();
-    let needs_leading_break = had_pending_status || leading_blank_line;
     if stderr.is_terminal() {
         let normalized = normalize_terminal_line_endings(message);
-        if needs_leading_break {
+        if leading_blank_line {
             let _ = write!(stderr, "\r\n");
         }
         let _ = write!(stderr, "\r{}\r\n", normalized);
     } else {
-        if needs_leading_break {
+        if leading_blank_line {
             let _ = writeln!(stderr);
         }
         let _ = writeln!(stderr, "{}", message);
     }
-}
-
-fn take_pending_status_line() -> bool {
-    PENDING_STATUS_LINE.swap(false, Ordering::SeqCst)
 }
 
 fn normalize_terminal_line_endings(message: &str) -> String {
@@ -832,9 +763,8 @@ pub fn print_profile_hint(program: &str, profile: &str, silent: bool) {
 #[cfg(test)]
 mod tests {
     use super::{
-        finish_status_line_for_handoff, format_unix_socket_mode_badge,
-        normalize_terminal_line_endings, print_applying_sandbox, print_capabilities,
-        print_profile_hint, render_diagnostic_footer, take_pending_status_line,
+        format_unix_socket_mode_badge, normalize_terminal_line_endings, print_capabilities,
+        print_profile_hint, render_diagnostic_footer,
     };
     use nono::{CapabilitySet, UnixSocketMode};
     use tempfile::tempdir;
@@ -857,19 +787,6 @@ mod tests {
     #[test]
     fn print_profile_hint_is_noop_when_silent() {
         print_profile_hint("claude", "claude-code", true);
-    }
-
-    #[test]
-    fn finish_status_line_for_handoff_is_noop_when_silent() {
-        finish_status_line_for_handoff(true);
-    }
-
-    #[test]
-    fn applying_sandbox_marks_pending_status_line() {
-        let _ = take_pending_status_line();
-        print_applying_sandbox(false);
-        assert!(take_pending_status_line());
-        assert!(!take_pending_status_line());
     }
 
     #[test]

@@ -1,6 +1,7 @@
 use crate::audit_commands;
 use crate::cli::{Cli, Commands, RunArgs, SetupArgs};
 use crate::command_runtime::{run_sandbox, run_shell, run_wrap};
+use crate::completions::run_completions;
 use crate::deprecated_policy;
 use crate::learn_runtime::run_learn;
 use crate::open_url_runtime::run_open_url_helper;
@@ -108,6 +109,7 @@ fn dispatch_command(
             run_command_with_update(update_handle, silent, || package_cmd::run_list(args))
         }
         Commands::OpenUrlHelper(args) => run_open_url_helper(args),
+        Commands::Completions(args) => run_completions(args),
     }
 }
 

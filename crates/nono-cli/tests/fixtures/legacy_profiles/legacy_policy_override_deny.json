@@ -1,0 +1,6 @@
+{
+  "meta": {"name": "legacy-test", "version": "0.1.0"},
+  "extends": "default",
+  "filesystem": {"allow": ["$HOME/.docker"]},
+  "policy": {"override_deny": ["$HOME/.docker"]}
+}

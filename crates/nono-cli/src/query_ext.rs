@@ -5,7 +5,7 @@
 
 use crate::config;
 use colored::Colorize;
-use nono::{AccessMode, CapabilitySet, NonoError, Result};
+use nono::{try_canonicalize, AccessMode, CapabilitySet, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -57,7 +57,7 @@ pub enum QueryResult {
 /// Query whether a path operation is permitted
 ///
 /// `overridden_paths` contains canonicalized paths that have been exempted from
-/// deny groups via `override_deny`. The sensitive-path check is skipped for any
+/// deny groups via `bypass_protection`. The sensitive-path check is skipped for any
 /// query path that is equal to or a child of an overridden path.
 pub fn query_path(
     path: &Path,
@@ -65,34 +65,12 @@ pub fn query_path(
     caps: &CapabilitySet,
     overridden_paths: &[std::path::PathBuf],
 ) -> Result<QueryResult> {
-    // Canonicalize the path for proper comparison
-    let canonical = if path.exists() {
-        path.canonicalize()
-            .map_err(|e| NonoError::PathCanonicalization {
-                path: path.to_path_buf(),
-                source: e,
-            })?
-    } else {
-        // For non-existent paths, try to canonicalize the parent
-        if let Some(parent) = path.parent() {
-            if parent.exists() {
-                let parent_canonical =
-                    parent
-                        .canonicalize()
-                        .map_err(|e| NonoError::PathCanonicalization {
-                            path: parent.to_path_buf(),
-                            source: e,
-                        })?;
-                parent_canonical.join(path.file_name().unwrap_or_default())
-            } else {
-                path.to_path_buf()
-            }
-        } else {
-            path.to_path_buf()
-        }
-    };
+    // Canonicalize the path for proper comparison using ancestor-walk fallback
+    // so that macOS symlinks (/tmp → /private/tmp) are resolved correctly even
+    // when the leaf path doesn't exist yet.
+    let canonical = try_canonicalize(path);
 
-    // Check if this path is covered by an override_deny exemption
+    // Check if this path is covered by a bypass_protection exemption
     let is_overridden = overridden_paths
         .iter()
         .any(|op| canonical == *op || canonical.starts_with(op));
@@ -104,7 +82,7 @@ pub fn query_path(
             return Ok(QueryResult::Denied {
                 reason: "sensitive_path".to_string(),
                 details: Some(format!(
-                    "Blocked by policy group '{}': {} Use policy.override_deny to exempt specific paths when appropriate.",
+                    "Blocked by policy group '{}': {} Use filesystem.bypass_protection to exempt specific paths when appropriate.",
                     matched.group_name, matched.description
                 )),
                 policy_source: Some(format!("group:{}", matched.group_name)),
@@ -475,7 +453,7 @@ mod tests {
                     .is_some_and(|policy| policy.starts_with("group:")));
                 assert!(details
                     .as_deref()
-                    .is_some_and(|detail| detail.contains("policy.override_deny")));
+                    .is_some_and(|detail| detail.contains("filesystem.bypass_protection")));
                 assert!(suggested_flag.is_none());
             }
             _ => panic!("expected denied result"),

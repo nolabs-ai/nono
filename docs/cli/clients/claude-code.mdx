@@ -54,8 +54,8 @@ If you need different permissions, create a custom profile at `~/.config/nono/pr
     "version": "1.0.0",
     "description": "Claude Code with additional project access"
   },
-  "security": {
-    "groups": ["git_config"]
+  "groups": {
+    "include": ["git_config"]
   },
   "filesystem": {
     "allow": ["$WORKDIR", "$HOME/.claude"],
@@ -301,10 +301,8 @@ Save as `~/.config/nono/profiles/claude-code-secretive.json`:
       "$HOME/.ssh/config",
       "$HOME/Library/Containers/com.maxgoedjen.Secretive.SecretAgent/Data/socket.ssh"
     ],
-    "allow_file": ["$HOME/.ssh/known_hosts"]
-  },
-  "policy": {
-    "add_allow_readwrite": ["$HOME/.ssh/known_hosts"]
+    "allow_file": ["$HOME/.ssh/known_hosts"],
+    "allow": ["$HOME/.ssh/known_hosts"]
   }
 }
 ```

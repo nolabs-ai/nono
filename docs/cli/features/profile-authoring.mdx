@@ -43,8 +43,8 @@ A minimal skeleton includes the core sections most profiles need:
     "name": "my-agent",
     "description": "Profile for my agent"
   },
-  "security": {
-    "groups": [
+  "groups": {
+    "include": [
       "deny_credentials"
     ]
   },
@@ -67,8 +67,13 @@ With `--full`, additional sections are included as empty stubs for all additive 
   "meta": {
     "name": "my-agent"
   },
-  "security": {
-    "groups": []
+  "groups": {
+    "include": [],
+    "exclude": []
+  },
+  "commands": {
+    "allow": [],
+    "deny": []
   },
   "workdir": {
     "access": "readwrite"
@@ -79,17 +84,11 @@ With `--full`, additional sections are included as empty stubs for all additive 
     "write": [],
     "allow_file": [],
     "read_file": [],
-    "write_file": []
+    "write_file": [],
+    "deny": [],
+    "bypass_protection": []
   },
-  "policy": {
-    "exclude_groups": [],
-    "add_allow_read": [],
-    "add_allow_write": [],
-    "add_allow_readwrite": [],
-    "add_deny_access": [],
-    "add_deny_commands": [],
-    "override_deny": []
-  },
+  "security": {},
   "network": {
     "block": false,
     "allow_domain": [],
@@ -231,7 +230,11 @@ Use `nono profile groups` to list all available security groups. To see details 
 nono profile groups deny_credentials
 ```
 
-Groups are referenced by name in the `security.groups` field. See [Profiles & Groups](/cli/features/profiles-groups#groups) for the full group taxonomy and built-in group list.
+Groups are referenced by name in the `groups.include` field. See [Profiles & Groups](/cli/features/profiles-groups#groups) for the full group taxonomy and built-in group list.
+
+<Note>
+  The `groups.include` key was renamed from its former location under `security` in issue #594. The legacy key still deserializes with a deprecation warning; see `nono profile guide` for the full migration table. Legacy keys will be removed in v1.0.0.
+</Note>
 
 ## Common Patterns
 
@@ -262,8 +265,8 @@ Groups are referenced by name in the `security.groups` field. See [Profiles & Gr
     "name": "ci-build",
     "description": "Locked-down CI environment"
   },
-  "security": {
-    "groups": ["deny_credentials"]
+  "groups": {
+    "include": ["deny_credentials"]
   },
   "workdir": { "access": "readwrite" },
   "network": { "block": true }
@@ -281,16 +284,14 @@ Groups are referenced by name in the `security.groups` field. See [Profiles & Gr
   },
   "workdir": { "access": "readwrite" },
   "filesystem": {
-    "allow": ["$HOME/.docker"]
-  },
-  "policy": {
-    "override_deny": ["$HOME/.docker"]
+    "allow": ["$HOME/.docker"],
+    "bypass_protection": ["$HOME/.docker"]
   }
 }
 ```
 
 <Note>
-  `override_deny` only removes the deny rule. You must also grant access via `filesystem` or `policy.add_allow_*` for the path to be accessible.
+  `filesystem.bypass_protection` only removes the deny rule. You must also grant access via `filesystem.allow`, `filesystem.read`, or `filesystem.write` (or the matching `*_file` variant) for the path to be accessible.
 </Note>
 
 ### Exclude Inherited Groups
@@ -303,8 +304,8 @@ Groups are referenced by name in the `security.groups` field. See [Profiles & Gr
     "description": "Agent without deprecated startup-only command gating"
   },
   "workdir": { "access": "readwrite" },
-  "policy": {
-    "exclude_groups": [
+  "groups": {
+    "exclude": [
       "dangerous_commands",
       "dangerous_commands_macos",
       "dangerous_commands_linux"

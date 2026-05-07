@@ -39,20 +39,13 @@
 > Early alpha -- not yet security audited for production use. Active development may cause breakage.
 
 
-> [!NOTE]
-> Claude Code Logins from within the sandbox -  there has been a regression in v0.36.0 impacting claude code logins - which we hope is now fixed in v0.37.0. If however, you're still seeing the issue, please open an issue outlining with your installation method (npm, curl, brew) along with your OS. Thanks for your patience! 
-
----
-
-Most sandboxes feel like sandboxes. Rigid, sluggish, and designed for a different problem entirely. nono was built from the ground up for AI agents - and the developer workfows they need to thrive - agent multiplexing, snapshots, credential injection, supply chain security out of the box. Develop alongside nono, then deploy anywhere: CI pipelines, Kubernetes, cloud VMs, microVMs. The one stop shop for all your clankers.
+Most sandboxes feel like sandboxes. Rigid, sluggish, and designed for a different problem entirely. nono was built from the ground up for AI agents - and the developer workflows they need to thrive - agent multiplexing, snapshots, credential injection, supply chain security out of the box. Develop alongside nono, then deploy anywhere: CI pipelines, Kubernetes, cloud VMs, microVMs. The one stop shop for all your clankers.
 
 ---
 
 ## Latest News
 
-- **nono registry** - we will be bringing online a skill and policy registry to allow uses to contribute agent skills (SKILLS.md, hooks, scripts etc), and policy - this will allow us to more easily scale to supporting all of the different agents, installers and linux dists. Security will be baked in from the start. [Read more here](https://github.com/always-further/nono/issues/630)
-
-- **WSL2 support** -- Auto-detection with ~84% feature coverage out of the box. Run `nono setup --check-only` to see what's available. ([#522](https://github.com/always-further/nono/pull/522))
+- **nono registry** — The nono registry is now in alpha and available to try out. Host your skills, hooks, policies, and more in your own repository, then securely distribute them through the registry. This gives you the ability to run `nono pull org/repo` to pull agent skills and sandbox policies directly into the nono runtime. We are now in the process of migrating profiles out of tree and into their own packages. Check out the registry at: registry.nono.sh
 
 [All updates](https://github.com/always-further/nono/discussions/categories/announcements)
 
@@ -71,7 +64,7 @@ Other options in the [Installation Guide](https://docs.nono.sh/cli/getting_start
 
 ## Quick Start
 
-Built-in profiles for [Claude Code](https://docs.nono.sh/cli/clients/claude-code), [Codex](https://docs.nono.sh/cli/clients/codex), [OpenCode](https://docs.nono.sh/cli/clients/opencode), [OpenClaw](https://docs.nono.sh/cli/clients/openclaw), and [Swival](https://docs.nono.sh/cli/clients/swival) -- or [define your own](https://docs.nono.sh/cli/features/profiles-groups).
+Profiles for [Claude Code](https://docs.nono.sh/cli/clients/claude-code), [Codex](https://docs.nono.sh/cli/clients/codex), [OpenCode](https://docs.nono.sh/cli/clients/opencode), [OpenClaw](https://docs.nono.sh/cli/clients/openclaw), and Swival -- or [define your own](https://docs.nono.sh/cli/features/profiles-groups).
 
 ## Libraries and Bindings
 

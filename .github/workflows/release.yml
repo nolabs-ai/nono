@@ -12,7 +12,7 @@ on:
         type: string
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -20,6 +20,7 @@ env:
 
 jobs:
   build:
+    if: github.repository == 'always-further/nono'
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     strategy:
@@ -121,6 +122,8 @@ jobs:
     name: Create Release
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
@@ -174,16 +177,32 @@ jobs:
 
       - name: Publish nono-proxy
         run: |
-          # Wait for crates.io to index the core library
-          sleep 30
+          VERSION="${RELEASE_TAG#v}"
+          echo "Waiting for nono $VERSION to appear on crates.io..."
+          for i in $(seq 1 30); do
+            if cargo search nono --limit 1 2>/dev/null | grep -q "\"$VERSION\""; then
+              echo "Found nono $VERSION on crates.io"
+              break
+            fi
+            echo "Attempt $i: not yet indexed, retrying in 10s..."
+            sleep 10
+          done
           cargo publish -p nono-proxy --allow-dirty --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
       - name: Publish nono-cli
         run: |
-          # Wait for crates.io to index nono-proxy
-          sleep 30
+          VERSION="${RELEASE_TAG#v}"
+          echo "Waiting for nono-proxy $VERSION to appear on crates.io..."
+          for i in $(seq 1 30); do
+            if cargo search nono-proxy --limit 1 2>/dev/null | grep -q "\"$VERSION\""; then
+              echo "Found nono-proxy $VERSION on crates.io"
+              break
+            fi
+            echo "Attempt $i: not yet indexed, retrying in 10s..."
+            sleep 10
+          done
           cargo publish -p nono-cli --allow-dirty --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

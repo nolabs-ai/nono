@@ -58,6 +58,14 @@
         "pkg-containers.githubusercontent.com"
       ]
     },
+    "gitlab": {
+      "description": "GitLab API, AI Gateway, Packages, and Registries",
+      "hosts": [
+        "gitlab.com",
+        "cloud.gitlab.com",
+        "registry.gitlab.com"
+      ]
+    },
     "sigstore": {
       "description": "Sigstore transparency and signing infrastructure",
       "hosts": [
@@ -107,40 +115,44 @@
         "llm_apis",
         "package_registries",
         "github",
+        "gitlab",
         "sigstore",
         "documentation"
       ],
-      "credentials": ["google-ai", "github"]
+      "credentials": ["google-ai", "github", "gitlab"]
     },
     "developer": {
       "groups": [
         "llm_apis",
         "package_registries",
         "github",
+        "gitlab",
         "sigstore",
         "documentation"
       ],
-      "credentials": ["github"]
+      "credentials": ["github", "gitlab"]
     },
     "codex": {
       "groups": [
         "llm_apis",
         "package_registries",
         "github",
+        "gitlab",
         "sigstore",
         "documentation"
       ],
-      "credentials": ["openai", "github"]
+      "credentials": ["openai", "github", "gitlab"]
     },
     "claude-code": {
       "groups": [
         "llm_apis",
         "package_registries",
         "github",
+        "gitlab",
         "sigstore",
         "documentation"
       ],
-      "credentials": ["anthropic", "github"]
+      "credentials": ["anthropic", "github", "gitlab"]
     },
     "minimal": {
       "groups": [
@@ -152,6 +164,7 @@
         "llm_apis",
         "package_registries",
         "github",
+        "gitlab",
         "sigstore",
         "documentation",
         "google_cloud",
@@ -189,6 +202,13 @@
       "inject_header": "Authorization",
       "credential_format": "token {}",
       "env_var": "GITHUB_TOKEN"
+    },
+    "gitlab": {
+      "upstream": "https://gitlab.com/api",
+      "credential_key": "env://GITLAB_TOKEN",
+      "inject_header": "Authorization",
+      "credential_format": "Bearer {}",
+      "env_var": "GITLAB_TOKEN"
     }
   }
 }

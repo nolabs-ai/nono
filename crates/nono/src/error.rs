@@ -165,6 +165,11 @@ pub enum NonoError {
     #[error("Package install error: {0}")]
     PackageInstall(String),
 
+    /// User-facing stop where nono needs the user to take an explicit
+    /// corrective action before continuing.
+    #[error("{0}")]
+    ActionRequired(String),
+
     #[error("Package verification failed for {package}: {reason}")]
     PackageVerification { package: String, reason: String },
 

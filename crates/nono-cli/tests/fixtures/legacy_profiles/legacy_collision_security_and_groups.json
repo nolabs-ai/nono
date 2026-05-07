@@ -1,0 +1,14 @@
+{
+  "meta": { "name": "collision-test", "version": "0.1.0" },
+  "extends": "default",
+  "groups": {
+    "include": ["node_runtime"]
+  },
+  "security": {
+    "groups": ["python_runtime"],
+    "allowed_commands": ["pip"]
+  },
+  "commands": {
+    "allow": ["npm"]
+  }
+}

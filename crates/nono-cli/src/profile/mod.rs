@@ -72,39 +72,62 @@ pub struct FilesystemConfig {
     /// or bound. Non-recursive. Implies read+write access on the directory.
     #[serde(default)]
     pub unix_socket_dir_bind: Vec<String>,
+    /// Paths denied filesystem access. Canonical location for deny entries
+    /// in the #594 schema; the legacy deny-access key drains here via
+    /// `deprecated_schema::LegacyPolicyPatch`.
+    #[serde(default)]
+    pub deny: Vec<String>,
+    /// Paths exempted from group-level deny rules.
+    ///
+    /// **This flag does not implicitly grant access** — `bypass_protection`
+    /// only removes the deny rule. Each path must also appear in
+    /// `filesystem.allow`, `filesystem.read`, or `filesystem.write` (or the
+    /// matching `*_file` variant) to become accessible. CLI equivalent:
+    /// `--bypass-protection`.
+    ///
+    /// Renamed from the legacy deny-override key in the #594 schema;
+    /// the new name makes the "does not grant access" semantics explicit.
+    #[serde(default)]
+    pub bypass_protection: Vec<String>,
 }
 
-/// Policy patch configuration in a profile.
-///
-/// These fields provide explicit subtractive/additive composition on top of
-/// inherited groups and existing filesystem configuration.
+/// Group composition — include/exclude pair for policy groups.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct PolicyPatchConfig {
-    /// Group names to remove from the resolved group set.
+pub struct GroupsConfig {
     #[serde(default)]
-    pub exclude_groups: Vec<String>,
-    /// Additional read-only directories to allow.
+    pub include: Vec<String>,
     #[serde(default)]
-    pub add_allow_read: Vec<String>,
-    /// Additional write-only directories to allow.
+    pub exclude: Vec<String>,
+}
+
+/// Command allow/deny pair.
+///
+/// **Deprecated in v0.33.0.** Both fields gate only the directly-invoked
+/// startup command. They are not enforced for child processes, so they
+/// cannot serve as a security boundary. Configured values still parse and
+/// are surfaced via runtime warnings (see [`crate::command_blocking_deprecation`]).
+/// Prefer resource-based controls: filesystem deny rules, narrower filesystem
+/// grants, `unlink_protection`, and network policy.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommandsConfig {
+    /// Startup-only command allowlist override. Not enforced for child
+    /// processes; prefer resource-based controls.
     #[serde(default)]
-    pub add_allow_write: Vec<String>,
-    /// Additional read-write directories to allow.
+    #[deprecated(
+        since = "0.33.0",
+        note = "startup-only, not enforced for child processes; prefer resource-based controls"
+    )]
+    pub allow: Vec<String>,
+    /// Startup-only command denylist extension. Not enforced for child
+    /// processes; prefer resource-based controls.
     #[serde(default)]
-    pub add_allow_readwrite: Vec<String>,
-    /// Additional deny.access paths to apply.
-    #[serde(default)]
-    pub add_deny_access: Vec<String>,
-    /// Deprecated startup-only command denylist extension.
-    /// Parsed for compatibility in v0.33.0, but not enforced for child processes.
-    #[serde(default)]
-    pub add_deny_commands: Vec<String>,
-    /// Paths to exempt from deny groups.
-    /// Each path must also be explicitly granted via `filesystem` or `policy.add_allow_*`.
-    /// Does not implicitly grant access; only removes the deny rule.
-    #[serde(default)]
-    pub override_deny: Vec<String>,
+    #[deprecated(
+        since = "0.33.0",
+        note = "startup-only, not enforced for child processes; prefer resource-based controls"
+    )]
+    pub deny: Vec<String>,
 }
 
 /// Custom credential route definition for reverse proxy.
@@ -835,6 +858,7 @@ pub struct NetworkConfig {
     /// Additional domains to allow through the proxy (on top of profile hosts).
     /// Canonical profile key: `allow_domain` (legacy `proxy_allow` and
     /// `allow_proxy` are also accepted).
+    /// ALIAS(canonical="allow_domain", introduced="v0.0.0", remove_by="indefinite", issue="#415")
     #[serde(
         default,
         rename = "allow_domain",
@@ -848,6 +872,7 @@ pub struct NetworkConfig {
     /// When `None` (absent from profile), inherits parent credentials during merge.
     /// When `Some([])` (explicitly set to empty array), overrides parent to disable
     /// all inherited credential routes.
+    /// ALIAS(canonical="credentials", introduced="v0.0.0", remove_by="indefinite", issue="#415")
     #[serde(
         default,
         rename = "credentials",
@@ -859,6 +884,7 @@ pub struct NetworkConfig {
     /// Equivalent to `--open-port` CLI flag.
     /// Canonical profile key: `open_port` (legacy `port_allow` and `allow_port`
     /// are also accepted).
+    /// ALIAS(canonical="open_port", introduced="v0.0.0", remove_by="indefinite", issue="#415")
     #[serde(
         default,
         rename = "open_port",
@@ -882,11 +908,13 @@ pub struct NetworkConfig {
     /// Upstream proxy address (host:port) for enterprise proxy passthrough.
     /// Canonical profile key: `upstream_proxy` (legacy `external_proxy`
     /// accepted).
+    /// ALIAS(canonical="upstream_proxy", introduced="v0.0.0", remove_by="indefinite", issue="#415")
     #[serde(default, rename = "upstream_proxy", alias = "external_proxy")]
     pub upstream_proxy: Option<String>,
     /// Hosts to bypass the upstream proxy and route directly.
     /// Canonical profile key: `upstream_bypass` (legacy
     /// `external_proxy_bypass` accepted).
+    /// ALIAS(canonical="upstream_bypass", introduced="v0.0.0", remove_by="indefinite", issue="#415")
     #[serde(default, rename = "upstream_bypass", alias = "external_proxy_bypass")]
     pub upstream_bypass: Vec<String>,
 }
@@ -1069,17 +1097,17 @@ pub struct WorkdirConfig {
     pub access: WorkdirAccess,
 }
 
-/// Security configuration referencing policy.json groups
+/// Security configuration — process-level isolation knobs.
+///
+/// The legacy `groups` and `allowed_commands` fields were removed in phase 2
+/// of #594. Policy group membership now lives in `Profile.groups.include`
+/// (written by `merge_implicit_default_groups` at load time). Command
+/// allowlists live in `Profile.commands.allow`. Legacy JSON keys still
+/// deserialize via `deprecated_schema::RawSecurityConfig` and drain into
+/// those canonical sections.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SecurityConfig {
-    /// Policy group names to resolve (from policy.json)
-    #[serde(default)]
-    pub groups: Vec<String>,
-    /// Deprecated startup-only command allowlist override.
-    /// Parsed for compatibility in v0.33.0, but not enforced for child processes.
-    #[serde(default)]
-    pub allowed_commands: Vec<String>,
     /// Signal isolation mode. Controls whether the sandboxed process can signal
     /// other processes. When `None`, inherits from the base profile during merge
     /// (defaults to `Isolated` if no base sets it).
@@ -1226,11 +1254,14 @@ pub struct Profile {
     #[serde(default)]
     pub security: SecurityConfig,
     #[serde(default)]
+    pub groups: GroupsConfig,
+    #[serde(default)]
+    pub commands: CommandsConfig,
+    #[serde(default)]
     pub filesystem: FilesystemConfig,
     #[serde(default)]
-    pub policy: PolicyPatchConfig,
-    #[serde(default)]
     pub network: NetworkConfig,
+    /// ALIAS(canonical="env_credentials", introduced="v0.0.0", remove_by="indefinite", issue="#143")
     #[serde(default, alias = "secrets")]
     pub env_credentials: SecretsConfig,
     #[serde(default)]
@@ -1239,6 +1270,7 @@ pub struct Profile {
     pub workdir: WorkdirConfig,
     #[serde(default)]
     pub hooks: HooksConfig,
+    /// ALIAS(canonical="rollback", introduced="v0.0.0", remove_by="indefinite", issue="#124")
     #[serde(default, alias = "undo")]
     pub rollback: RollbackConfig,
     /// Supervisor-delegated URL opening (e.g., for OAuth2 login flows).
@@ -1304,13 +1336,18 @@ struct ProfileDeserialize {
     #[serde(default)]
     meta: ProfileMeta,
     #[serde(default)]
-    security: SecurityConfig,
+    security: crate::deprecated_schema::RawSecurityConfig,
+    #[serde(default)]
+    groups: GroupsConfig,
+    #[serde(default)]
+    commands: CommandsConfig,
     #[serde(default)]
     filesystem: FilesystemConfig,
     #[serde(default)]
-    policy: PolicyPatchConfig,
+    policy: crate::deprecated_schema::LegacyPolicyPatch,
     #[serde(default)]
     network: NetworkConfig,
+    /// ALIAS(canonical="env_credentials", introduced="v0.0.0", remove_by="indefinite", issue="#143")
     #[serde(default, alias = "secrets")]
     env_credentials: SecretsConfig,
     #[serde(default)]
@@ -1319,6 +1356,7 @@ struct ProfileDeserialize {
     workdir: WorkdirConfig,
     #[serde(default)]
     hooks: HooksConfig,
+    /// ALIAS(canonical="rollback", introduced="v0.0.0", remove_by="indefinite", issue="#124")
     #[serde(default, alias = "undo")]
     rollback: RollbackConfig,
     #[serde(default)]
@@ -1334,6 +1372,7 @@ struct ProfileDeserialize {
     skipdirs: Vec<String>,
     #[serde(default)]
     packs: Vec<String>,
+    /// ALIAS(canonical="command_args", introduced="v0.0.0", remove_by="indefinite", issue="N/A")
     #[serde(default)]
     #[serde(alias = "brokered_commands")]
     command_args: Vec<String>,
@@ -1343,12 +1382,18 @@ struct ProfileDeserialize {
 
 impl From<ProfileDeserialize> for Profile {
     fn from(raw: ProfileDeserialize) -> Self {
-        Self {
+        // NOTE: During the transition, `SecurityConfig::from(&raw.security)` also
+        // copies legacy_groups/legacy_allowed_commands into the canonical
+        // SecurityConfig fields (removed in C2). The drains below extend
+        // canonical sections so both views carry the data until C2 narrows
+        // SecurityConfig.
+        let mut profile = Self {
             extends: raw.extends,
             meta: raw.meta,
-            security: raw.security,
+            security: crate::profile::SecurityConfig::from(&raw.security),
+            groups: raw.groups,
+            commands: raw.commands,
             filesystem: raw.filesystem,
-            policy: raw.policy,
             network: raw.network,
             env_credentials: raw.env_credentials,
             environment: raw.environment,
@@ -1364,7 +1409,16 @@ impl From<ProfileDeserialize> for Profile {
             packs: raw.packs,
             command_args: raw.command_args,
             unsafe_macos_seatbelt_rules: raw.unsafe_macos_seatbelt_rules,
-        }
+        };
+
+        // Drain legacy keys into canonical sections (no-op unless the legacy
+        // keys are populated). Each populated key emits one deprecation
+        // warning to stderr and extends (does not replace) the canonical
+        // section.
+        crate::deprecated_schema::drain_legacy_security_into_canonical(&raw.security, &mut profile);
+        crate::deprecated_schema::drain_legacy_policy_into_canonical(&raw.policy, &mut profile);
+
+        profile
     }
 }
 
@@ -1396,6 +1450,16 @@ pub fn is_user_override(name: &str) -> bool {
 /// Returns `Some(base_names)` if the profile declares `extends`, `None` otherwise.
 /// This reads the raw profile definition before inheritance resolution clears the field.
 pub fn load_profile_extends(name_or_path: &str) -> Option<Vec<String>> {
+    // This is a metadata-only preview parse: the caller is asking for the
+    // `extends` field, not the full resolved profile. The caller almost
+    // always follows up with a real `load_profile` call (see e.g.
+    // `cmd_show`, `cmd_list`, `print_profile_line`, `prepare_sandbox`),
+    // and that real load is the one whose deprecation warnings should
+    // reach the user. Without suppression we'd emit each warning twice
+    // for the same file. Drains still run, populating canonical state;
+    // only stderr emission and counter increments are suppressed.
+    let _suppress = crate::deprecation_warnings::WarningSuppressionGuard::begin();
+
     // Direct file path
     if name_or_path.contains('/') || name_or_path.ends_with(".json") {
         return parse_profile_file(Path::new(name_or_path))
@@ -1798,7 +1862,7 @@ pub(crate) fn finalize_profile(mut profile: Profile) -> Result<Profile> {
 
 /// Resolve inheritance and apply implicit default-group merging for a raw profile.
 pub(crate) fn resolve_and_finalize_profile(profile: Profile) -> Result<Profile> {
-    finalize_profile(resolve_extends(profile, &mut Vec::new(), 0)?)
+    finalize_profile(resolve_extends(profile, &mut Vec::new(), 0, None, None)?)
 }
 
 /// Get the implicit default groups for a finalized profile.
@@ -1812,28 +1876,28 @@ fn implicit_default_groups(profile: &Profile) -> Result<Vec<String>> {
 
     let default = crate::policy::get_policy_profile("default")?
         .ok_or_else(|| NonoError::ProfileNotFound("default".to_string()))?;
-    Ok(default.security.groups)
+    Ok(default.groups.include)
 }
 
 /// Merge the implicit default profile groups into a finalized profile.
 ///
 /// User profiles loaded from file only declare their own groups in
-/// `security.groups`. Built-in profiles also resolve through the same raw
+/// `groups.include`. Built-in profiles also resolve through the same raw
 /// profile pipeline before implicit default groups are merged.
 /// This function applies:
-/// `((implicit_default_groups + profile.groups) - profile.policy.exclude_groups)`.
+/// `((implicit_default_groups + profile.groups.include) - profile.groups.exclude)`.
 ///
 /// This means exclusions win even if the same group is also added explicitly in
-/// `security.groups`.
+/// `groups.include`.
 fn merge_implicit_default_groups(profile: &mut Profile) -> Result<()> {
     let policy = crate::policy::load_embedded_policy()?;
-    let exclusions = &profile.policy.exclude_groups;
+    let exclusions = &profile.groups.exclude;
     crate::policy::validate_group_exclusions(&policy, exclusions)?;
 
     let mut merged = implicit_default_groups(profile)?;
     // Append profile-specific groups (avoiding duplicates)
     let mut seen: std::collections::HashSet<String> = merged.iter().cloned().collect();
-    for g in &profile.security.groups {
+    for g in &profile.groups.include {
         if seen.insert(g.clone()) {
             merged.push(g.clone());
         }
@@ -1842,7 +1906,7 @@ fn merge_implicit_default_groups(profile: &mut Profile) -> Result<()> {
         let exclude_set: std::collections::HashSet<&String> = exclusions.iter().collect();
         merged.retain(|g| !exclude_set.contains(g));
     }
-    profile.security.groups = merged;
+    profile.groups.include = merged;
     Ok(())
 }
 
@@ -1852,13 +1916,16 @@ fn merge_implicit_default_groups(profile: &mut Profile) -> Result<()> {
 /// Used during inheritance resolution to load base profiles without
 /// triggering infinite recursion.
 fn parse_profile_file(path: &Path) -> Result<Profile> {
-    let content = fs::read_to_string(path).map_err(|e| NonoError::ProfileRead {
+    let content = fs::read(path).map_err(|e| NonoError::ProfileRead {
         path: path.to_path_buf(),
         source: e,
     })?;
+    parse_profile_bytes(&content)
+}
 
+pub(crate) fn parse_profile_bytes(content: &[u8]) -> Result<Profile> {
     let profile: Profile =
-        serde_json::from_str(&content).map_err(|e| NonoError::ProfileParse(e.to_string()))?;
+        serde_json::from_slice(content).map_err(|e| NonoError::ProfileParse(e.to_string()))?;
 
     // Validate custom credentials for security issues
     validate_profile_custom_credentials(&profile)?;
@@ -1869,10 +1936,12 @@ fn parse_profile_file(path: &Path) -> Result<Profile> {
     Ok(profile)
 }
 
-/// Load a profile from a JSON file, resolving inheritance.
+/// Load a profile from a JSON file, resolving inheritance. The parent
+/// directory is passed as context so `extends` can resolve sibling profiles.
 fn load_from_file(path: &Path) -> Result<Profile> {
     let profile = parse_profile_file(path)?;
-    resolve_extends(profile, &mut Vec::new(), 0)
+    let context_dir = path.parent();
+    resolve_extends(profile, &mut Vec::new(), 0, context_dir, Some(path))
 }
 
 // ============================================================================
@@ -1886,15 +1955,26 @@ const MAX_INHERITANCE_DEPTH: usize = 10;
 ///
 /// If the profile declares `extends` (one or more base names), each base is
 /// loaded and resolved recursively, then they are fold-merged left-to-right.
-/// The accumulated base is finally merged with the child. The `visited` vec
-/// tracks profile names already in the chain to detect circular dependencies.
+/// The accumulated base is finally merged with the child. When `context_dir`
+/// is set, sibling `<name>.json` files are checked first so project-local
+/// profiles can reference each other by name. `source_file` is the path of
+/// the file whose extends are being resolved so sibling lookup can skip
+/// self-references (e.g. `.nono/codex.json` extending `"codex"` should not
+/// resolve to itself). The `visited` vec tracks profile names already in the
+/// chain to detect circular dependencies.
 ///
 /// Shared transitive bases are handled naturally: `visited` tracks only the
 /// current ancestor chain (push before recurse, pop after). When two siblings
 /// share a transitive base, it is resolved once per sibling; because
 /// `merge_profiles` is idempotent, the result is correct. Only true cycles
 /// (a profile extending one of its own ancestors) are rejected.
-fn resolve_extends(child: Profile, visited: &mut Vec<String>, depth: usize) -> Result<Profile> {
+fn resolve_extends(
+    child: Profile,
+    visited: &mut Vec<String>,
+    depth: usize,
+    context_dir: Option<&Path>,
+    source_file: Option<&Path>,
+) -> Result<Profile> {
     let base_names = match child.extends {
         Some(ref names) => names.clone(),
         None => return Ok(child),
@@ -1921,8 +2001,18 @@ fn resolve_extends(child: Profile, visited: &mut Vec<String>, depth: usize) -> R
 
         visited.push(base_name.clone());
 
-        let base = load_base_profile_raw(base_name)?;
-        let resolved_base = resolve_extends(base, visited, depth + 1)?;
+        let resolved = load_base_profile_raw(base_name, context_dir, source_file)?;
+        let (base, next_context, next_source) = match resolved {
+            ResolvedBase::Sibling(p, path) => (p, context_dir, Some(path)),
+            ResolvedBase::Global(p) => (p, None, None),
+        };
+        let resolved_base = resolve_extends(
+            base,
+            visited,
+            depth + 1,
+            next_context,
+            next_source.as_deref(),
+        )?;
         // Pop to restore the stack to the pre-base state. On the error path
         // above (? propagation), visited is abandoned so the missing pop is harmless.
         visited.pop();
@@ -1939,16 +2029,27 @@ fn resolve_extends(child: Profile, visited: &mut Vec<String>, depth: usize) -> R
     }
 }
 
+/// Distinguishes where a base profile was resolved from so `resolve_extends`
+/// can propagate `context_dir` only for sibling-resolved profiles. Global
+/// sources (user dir, pack-store, built-in) clear the context to prevent
+/// project-local files from hijacking built-in inheritance chains. `Sibling`
+/// carries the file path so the next recursion level can skip self-references.
+enum ResolvedBase {
+    Sibling(Profile, PathBuf),
+    Global(Profile),
+}
+
 /// Load a base profile by name WITHOUT applying implicit default-group merging.
 ///
-/// Checks user profiles, then installed packs, then built-in profiles.
-/// Built-in profiles are loaded as raw profile definitions so inheritance
-/// can resolve before implicit default groups are merged. The pack-store
-/// branch lets a user profile do `"extends": "claude-code"` and pick up
-/// the pack-shipped profile transparently — same precedence as
-/// `load_profile`.
+/// Checks sibling profiles in `context_dir` first (so project-local profiles
+/// can reference each other by name), then user profiles, installed packs,
+/// and built-in profiles. Built-in profiles are loaded as raw profile
+/// definitions so inheritance can resolve before implicit default groups are
+/// merged. The pack-store branch lets a user profile do
+/// `"extends": "claude-code"` and pick up the pack-shipped profile
+/// transparently — same precedence as `load_profile`.
 ///
-/// If all three resolvers miss AND the requested name is in
+/// If all resolvers miss AND the requested name is in
 /// `migration::PACK_PROVIDED_PROFILES` AND we were entered via
 /// `load_profile` (not `load_profile_no_migrate`), prompt the user to
 /// install the providing pack, then retry the pack-store lookup once.
@@ -1957,7 +2058,11 @@ fn resolve_extends(child: Profile, visited: &mut Vec<String>, depth: usize) -> R
 /// instead of an inscrutable "base profile not found" error, the user
 /// sees the same install prompt that `--profile claude-code` would
 /// produce, with the chain still resolving cleanly on accept.
-fn load_base_profile_raw(name: &str) -> Result<Profile> {
+fn load_base_profile_raw(
+    name: &str,
+    context_dir: Option<&Path>,
+    source_file: Option<&Path>,
+) -> Result<ResolvedBase> {
     if !is_valid_profile_name(name) {
         return Err(NonoError::ProfileInheritance(format!(
             "invalid base profile name '{}'",
@@ -1965,21 +2070,40 @@ fn load_base_profile_raw(name: &str) -> Result<Profile> {
         )));
     }
 
+    // 0. Sibling in the same directory as the child profile.
+    //    Skip if the sibling path is the source file itself to avoid
+    //    self-references (e.g. `.nono/codex.json` extending "codex").
+    if let Some(dir) = context_dir {
+        let sibling_path = dir.join(format!("{name}.json"));
+        let is_self = source_file.is_some_and(|src| sibling_path == src);
+        if !is_self && sibling_path.is_file() {
+            tracing::debug!(
+                "Resolved '{}' from sibling: {}",
+                name,
+                sibling_path.display()
+            );
+            return Ok(ResolvedBase::Sibling(
+                parse_profile_file(&sibling_path)?,
+                sibling_path,
+            ));
+        }
+    }
+
     // 1. User profiles take precedence.
     let profile_path = get_user_profile_path(name)?;
     if profile_path.exists() {
-        return parse_profile_file(&profile_path);
+        return Ok(ResolvedBase::Global(parse_profile_file(&profile_path)?));
     }
 
     // 2. Pack-store: any installed pack with a matching `install_as`.
     if let Some(profile_path) = find_pack_store_profile(name) {
-        return parse_profile_file(&profile_path);
+        return Ok(ResolvedBase::Global(parse_profile_file(&profile_path)?));
     }
 
     // 3. Built-in profile from embedded policy.
     let policy = crate::policy::load_embedded_policy()?;
     if let Some(def) = policy.profiles.get(name) {
-        return Ok(def.to_raw_profile());
+        return Ok(ResolvedBase::Global(def.to_raw_profile()));
     }
 
     // 4. Pack-provided rescue: when we were entered through
@@ -1997,7 +2121,7 @@ fn load_base_profile_raw(name: &str) -> Result<Profile> {
         match outcome {
             crate::migration::MigrationOutcome::Migrated => {
                 if let Some(profile_path) = find_pack_store_profile(name) {
-                    return parse_profile_file(&profile_path);
+                    return Ok(ResolvedBase::Global(parse_profile_file(&profile_path)?));
                 }
             }
             crate::migration::MigrationOutcome::Skipped => {
@@ -2022,16 +2146,12 @@ fn load_base_profile_raw(name: &str) -> Result<Profile> {
 ///
 /// The child's values take precedence for scalar fields. Collection fields
 /// are appended and deduplicated. The `extends` field is consumed (set to `None`).
+#[allow(deprecated)] // reads/writes commands.{allow,deny} (deprecated v0.33.0)
 fn merge_profiles(base: Profile, child: Profile) -> Profile {
     Profile {
         extends: None,
         meta: child.meta,
         security: SecurityConfig {
-            groups: dedup_append(&base.security.groups, &child.security.groups),
-            allowed_commands: dedup_append(
-                &base.security.allowed_commands,
-                &child.security.allowed_commands,
-            ),
             signal_mode: child.security.signal_mode.or(base.security.signal_mode),
             process_info_mode: child
                 .security
@@ -2046,6 +2166,14 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
                 .security
                 .wsl2_proxy_policy
                 .or(base.security.wsl2_proxy_policy),
+        },
+        groups: GroupsConfig {
+            include: dedup_append(&base.groups.include, &child.groups.include),
+            exclude: dedup_append(&base.groups.exclude, &child.groups.exclude),
+        },
+        commands: CommandsConfig {
+            allow: dedup_append(&base.commands.allow, &child.commands.allow),
+            deny: dedup_append(&base.commands.deny, &child.commands.deny),
         },
         filesystem: FilesystemConfig {
             allow: dedup_append(&base.filesystem.allow, &child.filesystem.allow),
@@ -2067,27 +2195,11 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
                 &base.filesystem.unix_socket_dir_bind,
                 &child.filesystem.unix_socket_dir_bind,
             ),
-        },
-        policy: PolicyPatchConfig {
-            exclude_groups: dedup_append(&base.policy.exclude_groups, &child.policy.exclude_groups),
-            add_allow_read: dedup_append(&base.policy.add_allow_read, &child.policy.add_allow_read),
-            add_allow_write: dedup_append(
-                &base.policy.add_allow_write,
-                &child.policy.add_allow_write,
+            deny: dedup_append(&base.filesystem.deny, &child.filesystem.deny),
+            bypass_protection: dedup_append(
+                &base.filesystem.bypass_protection,
+                &child.filesystem.bypass_protection,
             ),
-            add_allow_readwrite: dedup_append(
-                &base.policy.add_allow_readwrite,
-                &child.policy.add_allow_readwrite,
-            ),
-            add_deny_access: dedup_append(
-                &base.policy.add_deny_access,
-                &child.policy.add_deny_access,
-            ),
-            add_deny_commands: dedup_append(
-                &base.policy.add_deny_commands,
-                &child.policy.add_deny_commands,
-            ),
-            override_deny: dedup_append(&base.policy.override_deny, &child.policy.override_deny),
         },
         network: NetworkConfig {
             block: base.network.block || child.network.block,
@@ -2203,12 +2315,25 @@ pub(crate) fn dedup_append<T: Eq + std::hash::Hash + Clone>(base: &[T], child: &
 
 /// Get the path to a user profile
 pub(crate) fn get_user_profile_path(name: &str) -> Result<PathBuf> {
-    let config_dir = resolve_user_config_dir()?;
+    Ok(user_profile_dir()?.join(format!("{}.json", name)))
+}
 
-    Ok(config_dir
+pub(crate) fn user_profile_dir() -> Result<PathBuf> {
+    Ok(resolve_user_config_dir()?.join("nono").join("profiles"))
+}
+
+pub(crate) fn user_profile_draft_dir() -> Result<PathBuf> {
+    Ok(resolve_user_config_dir()?
         .join("nono")
-        .join("profiles")
-        .join(format!("{}.json", name)))
+        .join("profile-drafts"))
+}
+
+pub(crate) fn get_user_profile_draft_path(name: &str) -> Result<PathBuf> {
+    Ok(user_profile_draft_dir()?.join(format!("{}.json", name)))
+}
+
+pub(crate) fn get_user_profile_draft_base_path(name: &str) -> Result<PathBuf> {
+    Ok(user_profile_draft_dir()?.join(format!("{}.base", name)))
 }
 
 /// Resolve the user config directory with secure validation.
@@ -2469,6 +2594,7 @@ pub fn list_pack_store_profiles() -> Vec<(String, String)> {
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
+#[allow(deprecated)] // tests assert against commands.{allow,deny} (deprecated v0.33.0)
 mod tests {
     use super::*;
     use tempfile::tempdir;
@@ -2512,6 +2638,48 @@ mod tests {
             "always-further",
             "claude"
         ));
+    }
+
+    #[test]
+    fn test_groups_config_deserializes() {
+        let json = r#"{
+            "meta": {"name": "t"},
+            "groups": {"include": ["node_runtime"], "exclude": ["dangerous_commands"]}
+        }"#;
+        let profile: Profile = serde_json::from_str(json).expect("parse");
+        assert_eq!(profile.groups.include, vec!["node_runtime"]);
+        assert_eq!(profile.groups.exclude, vec!["dangerous_commands"]);
+    }
+
+    #[test]
+    fn test_commands_config_deserializes() {
+        let json = r#"{
+            "meta": {"name": "t"},
+            "commands": {"allow": ["pip"], "deny": ["docker"]}
+        }"#;
+        let profile: Profile = serde_json::from_str(json).expect("parse");
+        assert_eq!(profile.commands.allow, vec!["pip"]);
+        assert_eq!(profile.commands.deny, vec!["docker"]);
+    }
+
+    // Note: in-process unit tests covering the drain (legacy → canonical)
+    // live in `crates/nono-cli/tests/legacy_drain_unit_tests.rs` so the
+    // legacy JSON literals stay confined to a path the lint-docs script
+    // explicitly allows. The serde_json parse path exercised there is the
+    // same one used here.
+
+    #[test]
+    fn test_filesystem_config_deny_and_bypass_protection() {
+        let json = r#"{
+            "meta": {"name": "t"},
+            "filesystem": {
+                "deny": ["/blocked"],
+                "bypass_protection": ["$HOME/.docker"]
+            }
+        }"#;
+        let profile: Profile = serde_json::from_str(json).expect("parse");
+        assert_eq!(profile.filesystem.deny, vec!["/blocked"]);
+        assert_eq!(profile.filesystem.bypass_protection, vec!["$HOME/.docker"]);
     }
 
     #[test]
@@ -2676,13 +2844,10 @@ mod tests {
         assert!(profile.network.block);
         // implicit default profile groups should be merged in
         assert!(profile
-            .security
             .groups
+            .include
             .contains(&"deny_credentials".to_string()));
-        assert!(profile
-            .security
-            .groups
-            .contains(&"node_runtime".to_string()));
+        assert!(profile.groups.include.contains(&"node_runtime".to_string()));
     }
 
     #[test]
@@ -2968,8 +3133,8 @@ mod tests {
     #[test]
     fn test_merge_implicit_default_groups_into_user_profile() {
         let mut profile = Profile {
-            security: SecurityConfig {
-                groups: vec!["node_runtime".to_string()],
+            groups: GroupsConfig {
+                include: vec!["node_runtime".to_string()],
                 ..Default::default()
             },
             ..Default::default()
@@ -2980,37 +3145,34 @@ mod tests {
         // Should contain base groups
         assert!(
             profile
-                .security
                 .groups
+                .include
                 .contains(&"deny_credentials".to_string()),
             "Expected base group 'deny_credentials'"
         );
         assert!(
             profile
-                .security
                 .groups
+                .include
                 .contains(&"system_read_macos".to_string())
                 || profile
-                    .security
                     .groups
+                    .include
                     .contains(&"system_read_linux_core".to_string()),
             "Expected platform system_read group"
         );
 
         // Should still contain the profile's own group
         assert!(
-            profile
-                .security
-                .groups
-                .contains(&"node_runtime".to_string()),
+            profile.groups.include.contains(&"node_runtime".to_string()),
             "Expected profile group 'node_runtime'"
         );
 
         // No duplicates
-        let unique: std::collections::HashSet<_> = profile.security.groups.iter().collect();
+        let unique: std::collections::HashSet<_> = profile.groups.include.iter().collect();
         assert_eq!(
             unique.len(),
-            profile.security.groups.len(),
+            profile.groups.include.len(),
             "Groups should have no duplicates"
         );
     }
@@ -3018,13 +3180,9 @@ mod tests {
     #[test]
     fn test_merge_implicit_default_groups_respects_policy_exclude_groups() {
         let mut profile = Profile {
-            security: SecurityConfig {
-                groups: vec!["node_runtime".to_string()],
-                ..Default::default()
-            },
-            policy: PolicyPatchConfig {
-                exclude_groups: vec!["dangerous_commands".to_string()],
-                ..Default::default()
+            groups: GroupsConfig {
+                include: vec!["node_runtime".to_string()],
+                exclude: vec!["dangerous_commands".to_string()],
             },
             ..Default::default()
         };
@@ -3033,8 +3191,8 @@ mod tests {
 
         assert!(
             !profile
-                .security
                 .groups
+                .include
                 .contains(&"dangerous_commands".to_string()),
             "excluded group 'dangerous_commands' should be removed"
         );
@@ -3049,8 +3207,8 @@ mod tests {
             r#"{
                 "meta": { "name": "no-dangerous-commands", "version": "1.0.0" },
                 "extends": "default",
-                "policy": {
-                    "exclude_groups": [
+                "groups": {
+                    "exclude": [
                         "dangerous_commands",
                         "dangerous_commands_linux",
                         "dangerous_commands_macos"
@@ -3065,15 +3223,15 @@ mod tests {
 
         assert!(
             !profile
-                .security
                 .groups
+                .include
                 .contains(&"dangerous_commands".to_string()),
             "excluded dangerous_commands should not be present in finalized groups"
         );
         assert!(
             !profile
-                .security
                 .groups
+                .include
                 .contains(&"dangerous_commands_macos".to_string()),
             "excluded dangerous_commands_macos should not be present in finalized groups"
         );
@@ -3843,19 +4001,10 @@ mod tests {
         assert!(err.contains("mutually exclusive"));
     }
 
-    #[test]
-    fn test_security_config_allowed_commands_deserializes() {
-        let json = r#"{
-            "meta": { "name": "rm-test" },
-            "filesystem": { "allow": ["/tmp"] },
-            "security": { "allowed_commands": ["rm", "dd"] }
-        }"#;
-        let dir = tempdir().expect("tmpdir");
-        let path = dir.path().join("rm-test.json");
-        std::fs::write(&path, json).expect("write profile");
-        let profile = load_profile_from_path(&path).expect("parse profile");
-        assert_eq!(profile.security.allowed_commands, vec!["rm", "dd"]);
-    }
+    // Note: the legacy `allowed_commands` placement (under the security
+    // section) is covered by an in-process unit test in
+    // `deprecated_schema::tests::legacy_security_allowed_commands_drains_to_canonical_commands_allow`,
+    // keeping legacy JSON literals confined to that module.
 
     #[test]
     fn test_security_config_allowed_commands_defaults_empty() {
@@ -3867,7 +4016,7 @@ mod tests {
         let path = dir.path().join("no-cmds.json");
         std::fs::write(&path, json).expect("write profile");
         let profile = load_profile_from_path(&path).expect("parse profile");
-        assert!(profile.security.allowed_commands.is_empty());
+        assert!(profile.commands.allow.is_empty());
     }
     // ============================================================================
     // Profile inheritance (extends) tests
@@ -3877,19 +4026,21 @@ mod tests {
     fn base_profile() -> Profile {
         Profile {
             extends: None,
+            groups: GroupsConfig {
+                include: vec!["base_group".to_string()],
+                exclude: vec!["base_excluded".to_string()],
+            },
+            commands: CommandsConfig::default(),
             meta: ProfileMeta {
                 name: "base".to_string(),
                 version: "1.0".to_string(),
                 description: Some("Base profile".to_string()),
                 author: None,
             },
-            security: SecurityConfig {
-                groups: vec!["base_group".to_string()],
-                ..Default::default()
-            },
+            security: SecurityConfig::default(),
             filesystem: FilesystemConfig {
                 allow: vec!["/base/rw".to_string()],
-                read: vec!["/base/read".to_string()],
+                read: vec!["/base/read".to_string(), "/base/policy-read".to_string()],
                 write: vec![],
                 allow_file: vec![],
                 read_file: vec!["/base/file.txt".to_string()],
@@ -3898,15 +4049,8 @@ mod tests {
                 unix_socket_bind: vec![],
                 unix_socket_dir: vec![],
                 unix_socket_dir_bind: vec![],
-            },
-            policy: PolicyPatchConfig {
-                exclude_groups: vec!["base_excluded".to_string()],
-                add_allow_read: vec!["/base/policy-read".to_string()],
-                add_allow_write: vec![],
-                add_allow_readwrite: vec![],
-                add_deny_access: vec!["/base/policy-deny".to_string()],
-                add_deny_commands: vec![],
-                override_deny: vec!["/base/override-deny".to_string()],
+                deny: vec!["/base/policy-deny".to_string()],
+                bypass_protection: vec!["/base/override-deny".to_string()],
             },
             network: NetworkConfig {
                 block: false,
@@ -3956,20 +4100,22 @@ mod tests {
     fn child_profile() -> Profile {
         Profile {
             extends: Some(vec!["base".to_string()]),
+            groups: GroupsConfig {
+                include: vec!["child_group".to_string()],
+                exclude: vec!["child_excluded".to_string()],
+            },
+            commands: CommandsConfig::default(),
             meta: ProfileMeta {
                 name: "child".to_string(),
                 version: "2.0".to_string(),
                 description: Some("Child profile".to_string()),
                 author: None,
             },
-            security: SecurityConfig {
-                groups: vec!["child_group".to_string()],
-                ..Default::default()
-            },
+            security: SecurityConfig::default(),
             filesystem: FilesystemConfig {
-                allow: vec!["/child/rw".to_string()],
+                allow: vec!["/child/rw".to_string(), "/child/policy-rw".to_string()],
                 read: vec![],
-                write: vec![],
+                write: vec!["/child/policy-write".to_string()],
                 allow_file: vec![],
                 read_file: vec![],
                 write_file: vec![],
@@ -3977,15 +4123,8 @@ mod tests {
                 unix_socket_bind: vec![],
                 unix_socket_dir: vec![],
                 unix_socket_dir_bind: vec![],
-            },
-            policy: PolicyPatchConfig {
-                exclude_groups: vec!["child_excluded".to_string()],
-                add_allow_read: vec![],
-                add_allow_write: vec!["/child/policy-write".to_string()],
-                add_allow_readwrite: vec!["/child/policy-rw".to_string()],
-                add_deny_access: vec!["/child/policy-deny".to_string()],
-                add_deny_commands: vec![],
-                override_deny: vec!["/child/override-deny".to_string()],
+                deny: vec!["/child/policy-deny".to_string()],
+                bypass_protection: vec!["/child/override-deny".to_string()],
             },
             network: NetworkConfig {
                 block: false,
@@ -4056,8 +4195,8 @@ mod tests {
     #[test]
     fn test_merge_profiles_appends_security_groups() {
         let merged = merge_profiles(base_profile(), child_profile());
-        assert!(merged.security.groups.contains(&"base_group".to_string()));
-        assert!(merged.security.groups.contains(&"child_group".to_string()));
+        assert!(merged.groups.include.contains(&"base_group".to_string()));
+        assert!(merged.groups.include.contains(&"child_group".to_string()));
     }
 
     #[test]
@@ -4065,12 +4204,12 @@ mod tests {
         let mut base = base_profile();
         let mut child = child_profile();
         // Both have the same group
-        base.security.groups = vec!["shared_group".to_string(), "base_only".to_string()];
-        child.security.groups = vec!["shared_group".to_string(), "child_only".to_string()];
+        base.groups.include = vec!["shared_group".to_string(), "base_only".to_string()];
+        child.groups.include = vec!["shared_group".to_string(), "child_only".to_string()];
 
         let merged = merge_profiles(base, child);
         assert_eq!(
-            merged.security.groups,
+            merged.groups.include,
             vec![
                 "shared_group".to_string(),
                 "base_only".to_string(),
@@ -4413,7 +4552,8 @@ mod tests {
         };
 
         // Resolve B first
-        let resolved_b = resolve_extends(b_profile, &mut Vec::new(), 0).expect("resolve b");
+        let resolved_b =
+            resolve_extends(b_profile, &mut Vec::new(), 0, None, None).expect("resolve b");
         // Then merge A on top
         let merged = merge_profiles(resolved_b, a_profile);
 
@@ -4429,7 +4569,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = resolve_extends(profile, &mut Vec::new(), 0);
+        let result = resolve_extends(profile, &mut Vec::new(), 0, None, None);
         assert!(result.is_err());
         let err = result.expect_err("missing base should error");
         assert!(
@@ -4448,7 +4588,7 @@ mod tests {
         };
 
         let mut visited = vec!["a".to_string(), "b".to_string()];
-        let result = resolve_extends(profile, &mut visited, 2);
+        let result = resolve_extends(profile, &mut visited, 2, None, None);
         assert!(result.is_err());
         let err = result.expect_err("circular dep should error");
         assert!(
@@ -4466,7 +4606,7 @@ mod tests {
         };
 
         let mut visited = vec!["self-ref".to_string()];
-        let result = resolve_extends(profile, &mut visited, 1);
+        let result = resolve_extends(profile, &mut visited, 1, None, None);
         assert!(result.is_err());
         let err = result.expect_err("self-reference should error");
         assert!(
@@ -4486,7 +4626,13 @@ mod tests {
         let visited: Vec<String> = (0..MAX_INHERITANCE_DEPTH)
             .map(|i| format!("level-{}", i))
             .collect();
-        let result = resolve_extends(profile, &mut visited.clone(), MAX_INHERITANCE_DEPTH);
+        let result = resolve_extends(
+            profile,
+            &mut visited.clone(),
+            MAX_INHERITANCE_DEPTH,
+            None,
+            None,
+        );
         assert!(result.is_err());
         let err = result.expect_err("depth limit should error");
         assert!(
@@ -4510,7 +4656,7 @@ mod tests {
         assert_eq!(merged.filesystem.read, base.filesystem.read);
         assert_eq!(merged.filesystem.read_file, base.filesystem.read_file);
         // Should inherit base security groups
-        assert_eq!(merged.security.groups, base.security.groups);
+        assert_eq!(merged.groups.include, base.groups.include);
         // Should inherit base workdir
         assert_eq!(merged.workdir.access, base.workdir.access);
         // Should inherit base network settings
@@ -4698,41 +4844,39 @@ mod tests {
     #[test]
     fn test_merge_profiles_merges_policy_patches() {
         let merged = merge_profiles(base_profile(), child_profile());
+        // Canonical equivalents of the old `policy.*` patch fields.
+        assert!(merged.groups.exclude.contains(&"base_excluded".to_string()));
         assert!(merged
-            .policy
-            .exclude_groups
-            .contains(&"base_excluded".to_string()));
-        assert!(merged
-            .policy
-            .exclude_groups
+            .groups
+            .exclude
             .contains(&"child_excluded".to_string()));
         assert!(merged
-            .policy
-            .add_allow_read
+            .filesystem
+            .read
             .contains(&"/base/policy-read".to_string()));
         assert!(merged
-            .policy
-            .add_allow_write
+            .filesystem
+            .write
             .contains(&"/child/policy-write".to_string()));
         assert!(merged
-            .policy
-            .add_allow_readwrite
+            .filesystem
+            .allow
             .contains(&"/child/policy-rw".to_string()));
         assert!(merged
-            .policy
-            .add_deny_access
+            .filesystem
+            .deny
             .contains(&"/base/policy-deny".to_string()));
         assert!(merged
-            .policy
-            .add_deny_access
+            .filesystem
+            .deny
             .contains(&"/child/policy-deny".to_string()));
         assert!(merged
-            .policy
-            .override_deny
+            .filesystem
+            .bypass_protection
             .contains(&"/base/override-deny".to_string()));
         assert!(merged
-            .policy
-            .override_deny
+            .filesystem
+            .bypass_protection
             .contains(&"/child/override-deny".to_string()));
     }
 
@@ -4846,7 +4990,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = resolve_extends(profile, &mut Vec::new(), 0);
+        let result = resolve_extends(profile, &mut Vec::new(), 0, None, None);
         assert!(result.is_err());
         let err = result.expect_err("empty string base should error");
         assert!(
@@ -4867,8 +5011,8 @@ mod tests {
                 name: "a".to_string(),
                 ..Default::default()
             },
-            security: SecurityConfig {
-                groups: vec!["group_a".to_string()],
+            groups: GroupsConfig {
+                include: vec!["group_a".to_string()],
                 ..Default::default()
             },
             filesystem: FilesystemConfig {
@@ -4884,8 +5028,8 @@ mod tests {
                 name: "b".to_string(),
                 ..Default::default()
             },
-            security: SecurityConfig {
-                groups: vec!["group_b".to_string()],
+            groups: GroupsConfig {
+                include: vec!["group_b".to_string()],
                 ..Default::default()
             },
             filesystem: FilesystemConfig {
@@ -4918,8 +5062,8 @@ mod tests {
         assert!(merged.filesystem.allow.contains(&"/b/path".to_string()));
         assert!(merged.filesystem.allow.contains(&"/child/path".to_string()));
         assert!(merged.filesystem.read.contains(&"/b/read".to_string()));
-        assert!(merged.security.groups.contains(&"group_a".to_string()));
-        assert!(merged.security.groups.contains(&"group_b".to_string()));
+        assert!(merged.groups.include.contains(&"group_a".to_string()));
+        assert!(merged.groups.include.contains(&"group_b".to_string()));
         assert!(merged.extends.is_none());
     }
 
@@ -4975,7 +5119,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = resolve_extends(profile, &mut Vec::new(), 0);
+        let result = resolve_extends(profile, &mut Vec::new(), 0, None, None);
         assert!(
             result.is_ok(),
             "duplicate base should be deduplicated, not error: {:?}",
@@ -5029,6 +5173,76 @@ mod tests {
         );
         let profile = result.expect("shared base profile");
         assert_eq!(profile.meta.name, "shared-base-test");
+    }
+
+    #[test]
+    fn test_extends_resolves_sibling_in_same_directory() {
+        let dir = tempdir().expect("tmpdir");
+        std::fs::write(
+            dir.path().join("shared.json"),
+            r#"{ "meta": { "name": "shared" }, "filesystem": { "allow": ["/tmp/shared"] } }"#,
+        )
+        .expect("write");
+        let child_path = dir.path().join("child.json");
+        std::fs::write(
+            &child_path,
+            r#"{ "extends": "shared", "meta": { "name": "child" } }"#,
+        )
+        .expect("write");
+
+        let profile = load_from_file(&child_path).expect("resolve");
+        assert_eq!(profile.meta.name, "child");
+        assert!(profile
+            .filesystem
+            .allow
+            .contains(&"/tmp/shared".to_string()));
+    }
+
+    #[test]
+    fn test_extends_same_name_as_base_skips_self() {
+        // A file named "default.json" extending "default" should resolve to
+        // the built-in default profile, not itself (which would be circular).
+        let dir = tempdir().expect("tmpdir");
+        let self_path = dir.path().join("default.json");
+        std::fs::write(
+            &self_path,
+            r#"{ "extends": "default", "meta": { "name": "my-default" }, "filesystem": { "read": ["/tmp/mine"] } }"#,
+        )
+        .expect("write");
+
+        let profile = load_from_file(&self_path).expect("should not be circular");
+        assert_eq!(profile.meta.name, "my-default");
+        assert!(
+            !profile.groups.include.is_empty(),
+            "should inherit default groups"
+        );
+        assert!(profile.filesystem.read.contains(&"/tmp/mine".to_string()));
+    }
+
+    #[test]
+    fn test_extends_same_name_still_resolves_other_siblings() {
+        // "default.json" extends ["default", "extra"]. "default" should skip
+        // self and resolve globally; "extra" should resolve as a sibling.
+        let dir = tempdir().expect("tmpdir");
+        std::fs::write(
+            dir.path().join("extra.json"),
+            r#"{ "meta": { "name": "extra" }, "filesystem": { "allow": ["/tmp/extra"] } }"#,
+        )
+        .expect("write");
+        let self_path = dir.path().join("default.json");
+        std::fs::write(
+            &self_path,
+            r#"{ "extends": ["default", "extra"], "meta": { "name": "my-combo" } }"#,
+        )
+        .expect("write");
+
+        let profile = load_from_file(&self_path).expect("should resolve both bases");
+        assert_eq!(profile.meta.name, "my-combo");
+        assert!(
+            !profile.groups.include.is_empty(),
+            "should inherit default groups"
+        );
+        assert!(profile.filesystem.allow.contains(&"/tmp/extra".to_string()));
     }
 
     #[test]
@@ -5092,44 +5306,26 @@ mod tests {
 
     #[test]
     fn test_unknown_fields_rejected_in_top_level_profile() {
-        // Unknown top-level keys must also be rejected.
+        // Unknown top-level keys must also be rejected. The body content
+        // is irrelevant — the test exercises the top-level
+        // `deny_unknown_fields` guard against a misspelled section name.
         let json = r#"{
             "meta": { "name": "top-level-typo" },
-            "polcy": {
-                "add_deny_access": ["~/.local/state"]
+            "filesytsem": {
+                "allow": ["~/.local/state"]
             }
         }"#;
         let result: std::result::Result<Profile, _> = serde_json::from_str(json);
         assert!(
             result.is_err(),
-            "unknown top-level field 'polcy' must be rejected, not silently ignored"
+            "unknown top-level field 'filesytsem' must be rejected, not silently ignored"
         );
     }
 
-    #[test]
-    fn test_policy_patch_deserialization() {
-        let profile: Profile = serde_json::from_str(
-            r#"{
-                "meta": { "name": "patchy" },
-                "policy": {
-                    "exclude_groups": ["deny_shell_configs"],
-                    "add_allow_read": ["/tmp/read"],
-                    "add_allow_write": ["/tmp/write"],
-                    "add_allow_readwrite": ["/tmp/rw"],
-                    "add_deny_access": ["/tmp/deny"],
-                    "override_deny": ["~/.docker"]
-                }
-            }"#,
-        )
-        .expect("parse profile with policy patch");
-
-        assert_eq!(profile.policy.exclude_groups, vec!["deny_shell_configs"]);
-        assert_eq!(profile.policy.add_allow_read, vec!["/tmp/read"]);
-        assert_eq!(profile.policy.add_allow_write, vec!["/tmp/write"]);
-        assert_eq!(profile.policy.add_allow_readwrite, vec!["/tmp/rw"]);
-        assert_eq!(profile.policy.add_deny_access, vec!["/tmp/deny"]);
-        assert_eq!(profile.policy.override_deny, vec!["~/.docker"]);
-    }
+    // Note: legacy `policy` patch deserialization (the full set of
+    // `add_allow_*`, `add_deny_*`, `override_deny`, `exclude_groups`)
+    // draining into canonical sections is covered by integration tests in
+    // `tests/legacy_drain_unit_tests.rs`.
 
     #[test]
     fn test_network_config_accepts_verb_noun_collection_aliases() {
@@ -5425,19 +5621,18 @@ mod tests {
                 "author": "test"
             },
             "security": {
-                "groups": ["git_config", "node_runtime"],
                 "signal_mode": "isolated",
                 "capability_elevation": false
             },
+            "groups": {
+                "include": ["git_config", "node_runtime"],
+                "exclude": ["dangerous_commands"]
+            },
             "filesystem": {
                 "allow": ["/tmp/project"],
-                "read": ["/etc"],
-                "allow_file": ["/tmp/config.json"]
-            },
-            "policy": {
-                "exclude_groups": ["dangerous_commands"],
-                "add_allow_read": ["/opt/data"],
-                "override_deny": ["/etc/hosts"]
+                "read": ["/etc", "/opt/data"],
+                "allow_file": ["/tmp/config.json"],
+                "bypass_protection": ["/etc/hosts"]
             },
             "network": {
                 "block": false,

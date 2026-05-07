@@ -21,8 +21,8 @@ User profiles take precedence over built-in profiles of the same name.
     "name": "my-agent",
     "description": "Profile for my agent"
   },
-  "security": {
-    "groups": []
+  "groups": {
+    "include": []
   },
   "workdir": {
     "access": "readwrite"
@@ -53,18 +53,34 @@ Inherit from another profile by name:
 
 - Inheritance chain max depth: 10.
 - Scalar fields: child overrides base.
-- Array fields (`groups`, `filesystem.*`, `policy.*`, `allow_domain`, `open_port`, `listen_port`, `rollback.*`, `upstream_bypass`): child values are appended to base values and deduplicated. To remove inherited entries, use `policy.exclude_groups` for groups; there is no mechanism to remove inherited filesystem paths.
+- Array fields (`groups.include`, `groups.exclude`, `commands.allow`, `commands.deny`, `filesystem.*`, `allow_domain`, `open_port`, `listen_port`, `rollback.*`, `upstream_bypass`): child values are appended to base values and deduplicated. To remove inherited entries, use `groups.exclude` for groups; there is no mechanism to remove inherited filesystem paths.
 - Map fields (`env_credentials`, `hooks`, `custom_credentials`): child entries are merged into base; child keys override matching base keys.
 - `network_profile` supports three-state inheritance via `InheritableValue`: absent = inherit base value, `null` = explicitly clear, string = override. This is the only field that supports null-clearing.
 - `open_urls`: if the child provides the field (even as `{}`), it replaces the base entirely. If absent, the base value is inherited. Setting to `null` in JSON is equivalent to omitting it (both inherit the base).
 - `workdir`: child overrides base unless child is `"none"` (which inherits the base value instead).
 
+### groups
+
+Controls which policy groups apply to the profile. Group definitions live in `policy.json`; list available groups with `nono profile groups`.
+
+| Field     | Type            | Default | Description |
+|-----------|-----------------|---------|-------------|
+| `include` | array of string | `[]`    | Policy group names to apply. |
+| `exclude` | array of string | `[]`    | Group names to remove from the resolved group set, including inherited defaults. |
+
+### commands
+
+Controls startup-time command gating. These checks run only at launch time and are not enforced on child processes — prefer path-based controls in `filesystem` for strong enforcement.
+
+| Field   | Type            | Default | Description |
+|---------|-----------------|---------|-------------|
+| `allow` | array of string | `[]`    | Startup-only command allowlist. Deprecated in v0.33.0; retained for existing profiles. |
+| `deny`  | array of string | `[]`    | Startup-only command denylist extension. Deprecated in v0.33.0; prefer `filesystem.deny` and narrower grants instead. |
+
 ### security
 
 | Field                 | Type            | Default      | Description |
 |-----------------------|-----------------|--------------|-------------|
-| `groups`              | array of string | `[]`         | Policy group names from `policy.json`. Use `nono profile groups` to list available groups. |
-| `allowed_commands`    | array of string | `[]`         | Deprecated in v0.33.0. Startup-only command allowlist override. Not enforced for child processes. |
 | `signal_mode`         | string          | `"isolated"` | One of: `"isolated"`, `"allow_same_sandbox"`, `"allow_all"`. |
 | `process_info_mode`   | string          | `"isolated"` | One of: `"isolated"`, `"allow_same_sandbox"`, `"allow_all"`. |
 | `ipc_mode`            | string          | `"shared_memory_only"` | One of: `"shared_memory_only"`, `"full"`. Use `"full"` for multiprocessing (enables POSIX semaphores). macOS only. |
@@ -73,14 +89,18 @@ Inherit from another profile by name:
 
 ### filesystem
 
-| Field        | Type            | Description |
-|--------------|-----------------|-------------|
-| `allow`      | array of string | Directories with read+write access. |
-| `read`       | array of string | Directories with read-only access. |
-| `write`      | array of string | Directories with write-only access. |
-| `allow_file` | array of string | Single files with read+write access. |
-| `read_file`  | array of string | Single files with read-only access. |
-| `write_file` | array of string | Single files with write-only access. |
+All filesystem grants, denials, and deny-rule exemptions live under this single section.
+
+| Field               | Type            | Description |
+|---------------------|-----------------|-------------|
+| `allow`             | array of string | Directories with read+write access. |
+| `read`              | array of string | Directories with read-only access. |
+| `write`             | array of string | Directories with write-only access. |
+| `allow_file`        | array of string | Single files with read+write access. |
+| `read_file`         | array of string | Single files with read-only access. |
+| `write_file`        | array of string | Single files with write-only access. |
+| `deny`              | array of string | Paths denied filesystem access. |
+| `bypass_protection` | array of string | Paths exempted from deny groups. **This flag does not implicitly grant access** — `bypass_protection` only removes the deny rule; each path must also appear in `filesystem.allow`, `filesystem.read`, or `filesystem.write` (or the matching `*_file` variant) to become accessible. |
 
 All path fields support variable expansion (see Section 6).
 
@@ -89,20 +109,6 @@ All path fields support variable expansion (see Section 6).
 | Field    | Type   | Default  | Description |
 |----------|--------|----------|-------------|
 | `access` | string | `"none"` | One of: `"none"`, `"read"`, `"write"`, `"readwrite"`. Controls automatic CWD sharing with the sandboxed process. |
-
-### policy (patches)
-
-Provides subtractive and additive composition on top of inherited groups and filesystem configuration.
-
-| Field                | Type            | Description |
-|----------------------|-----------------|-------------|
-| `exclude_groups`     | array of string | Group names to remove from the resolved group set, including inherited defaults. |
-| `add_allow_read`     | array of string | Additional read-only path grants. |
-| `add_allow_write`    | array of string | Additional write-only path grants. |
-| `add_allow_readwrite`| array of string | Additional read+write path grants. |
-| `add_deny_access`    | array of string | Additional deny paths. |
-| `add_deny_commands`  | array of string | Deprecated in v0.33.0. Startup-only command denylist extension. Not enforced for child processes; prefer `add_deny_access` and narrower grants instead. |
-| `override_deny`      | array of string | Paths to exempt from deny groups. Each path must also be granted via `filesystem` or `add_allow_*`. Does not implicitly grant access; only removes the deny rule. |
 
 ### network
 
@@ -260,8 +266,8 @@ To replace inherited URL-opening permissions, provide `open_urls` with an explic
     "name": "ci-build",
     "description": "CI build environment"
   },
-  "security": {
-    "groups": ["deny_credentials", "deny_ssh_keys"]
+  "groups": {
+    "include": ["deny_credentials", "deny_ssh_keys"]
   },
   "workdir": {
     "access": "readwrite"
@@ -312,7 +318,7 @@ On Linux, the built-in `default` profile keeps host runtime, sysfs, and shared t
 
 ### Profile with deny overrides
 
-When a deny group blocks a path you need access to, use `override_deny` together with an explicit grant:
+When a deny group blocks a path you need access to, use `filesystem.bypass_protection` together with an explicit grant. Remember: `bypass_protection` only removes the deny rule — it does not grant access on its own.
 
 ```json
 {
@@ -325,10 +331,8 @@ When a deny group blocks a path you need access to, use `override_deny` together
     "access": "readwrite"
   },
   "filesystem": {
-    "read_file": ["$HOME/.bashrc", "$HOME/.zshrc"]
-  },
-  "policy": {
-    "override_deny": ["$HOME/.bashrc", "$HOME/.zshrc"]
+    "read_file": ["$HOME/.bashrc", "$HOME/.zshrc"],
+    "bypass_protection": ["$HOME/.bashrc", "$HOME/.zshrc"]
   }
 }
 ```
@@ -344,8 +348,8 @@ Block access to a file in the working directory while keeping the rest accessibl
     "name": "no-dotenv",
     "description": "Claude Code without .env access"
   },
-  "policy": {
-    "add_deny_access": ["$WORKDIR/.env"]
+  "filesystem": {
+    "deny": ["$WORKDIR/.env"]
   }
 }
 ```
@@ -364,8 +368,8 @@ Block access to a file in the working directory while keeping the rest accessibl
   "security": {
     "capability_elevation": true
   },
-  "policy": {
-    "add_deny_access": ["$WORKDIR/.env"]
+  "filesystem": {
+    "deny": ["$WORKDIR/.env"]
   }
 }
 ```
@@ -374,7 +378,7 @@ With `capability_elevation` enabled, nono runs in supervised mode where every fi
 
 ### Blocking container access (Docker, Podman, kubectl)
 
-Use `add_deny_access` to prevent an agent from reaching the Docker daemon or similar container runtimes. `add_deny_commands` is deprecated startup-only gating and should not be relied on as enforcement:
+Use `filesystem.deny` to prevent an agent from reaching the Docker daemon or similar container runtimes. `commands.deny` is deprecated startup-only gating and should not be relied on as enforcement:
 
 ```json
 {
@@ -383,14 +387,16 @@ Use `add_deny_access` to prevent an agent from reaching the Docker daemon or sim
     "name": "no-docker",
     "description": "Claude Code without Docker access"
   },
-  "policy": {
-    "add_deny_access": ["/var/run/docker.sock"],
-    "add_deny_commands": ["docker", "docker-compose", "podman", "kubectl"]
+  "filesystem": {
+    "deny": ["/var/run/docker.sock"]
+  },
+  "commands": {
+    "deny": ["docker", "docker-compose", "podman", "kubectl"]
   }
 }
 ```
 
-On macOS, `add_deny_access` on a socket path also emits a Seatbelt `network-outbound` deny — Seatbelt treats `connect(2)` as a network operation so a file deny alone won't block it. Prefer path- and network-based controls; `add_deny_commands` remains as deprecated startup-only compatibility behavior and is visible in `nono profile show` under **Policy patches**.
+On macOS, `filesystem.deny` on a socket path also emits a Seatbelt `network-outbound` deny — Seatbelt treats `connect(2)` as a network operation so a file deny alone won't block it. Prefer path- and network-based controls; `commands.deny` remains as deprecated startup-only compatibility behavior and is visible in `nono profile show` under the commands section.
 
 ### Allowing parent-of-protected-root grants (macOS only)
 
@@ -423,8 +429,8 @@ Remove an inherited deny group that is too restrictive for your use case:
   "workdir": {
     "access": "readwrite"
   },
-  "policy": {
-    "exclude_groups": ["deny_browser_data_macos", "deny_browser_data_linux"]
+  "groups": {
+    "exclude": ["deny_browser_data_macos", "deny_browser_data_linux"]
   }
 }
 ```
@@ -469,7 +475,7 @@ nono profile diff <a> <b>         # Compare two profiles
 
 ## 6. Variable Expansion
 
-The following variables are expanded in all path fields (`filesystem.*`, `policy.add_allow_*`, `policy.add_deny_access`, `policy.override_deny`).
+The following variables are expanded in all path fields (`filesystem.*`, including `filesystem.allow`, `filesystem.read`, `filesystem.write`, `filesystem.deny`, and `filesystem.bypass_protection`).
 
 | Variable           | Expands to |
 |--------------------|------------|
@@ -487,10 +493,34 @@ Always use these variables instead of hardcoded absolute paths to keep profiles 
 
 ## 7. Key Rules
 
-- A profile with no `security.groups` has no deny rules. Always include appropriate deny groups for untrusted workloads.
-- `override_deny` only removes the deny rule. It does not grant access. You must also add the path via `filesystem` or `policy.add_allow_*`.
-- `exclude_groups` removes groups from the resolved set. This weakens the sandbox. Use it only when you understand which protections you are removing.
+- A profile with no `groups.include` has no deny rules. Always include appropriate deny groups for untrusted workloads.
+- `filesystem.bypass_protection` only removes the deny rule. It does not grant access. You must also add the path via `filesystem.allow`, `filesystem.read`, or `filesystem.write` (or the matching `*_file` variant).
+- `groups.exclude` removes groups from the resolved set. This weakens the sandbox. Use it only when you understand which protections you are removing.
 - `extends` chains resolve recursively up to depth 10. Circular inheritance is an error.
 - Platform-specific groups (suffix `_macos` or `_linux`) are filtered at resolution time. Include both variants for cross-platform profiles.
 - `network.block: true` blocks all network access. It cannot be combined with proxy settings.
 - `custom_credentials` upstream URLs must use HTTPS. HTTP is only accepted for loopback addresses (localhost, 127.0.0.1, ::1).
+
+## 8. Migration from previous schema
+
+Issue [#594](https://github.com/always-further/nono/issues/594) restructured the profile JSON schema. The old `policy.*` namespace has been dissolved into `filesystem`, `groups`, and `commands`; `security.groups` and `security.allowed_commands` have moved to top-level `groups.include` and `commands.allow`.
+
+Legacy keys still deserialize — profiles using the old names continue to load and emit a single deprecation warning — but they are scheduled for removal in **v1.0.0**. New profiles and edits should use the canonical keys below.
+
+| OLD                          | NEW                             |
+|------------------------------|---------------------------------|
+| `security.groups`            | `groups.include`                |
+| `security.allowed_commands`  | `commands.allow`                |
+| `policy.add_allow_read`      | `filesystem.read`               |
+| `policy.add_allow_write`     | `filesystem.write`              |
+| `policy.add_allow_readwrite` | `filesystem.allow`              |
+| `policy.add_deny_access`     | `filesystem.deny`               |
+| `policy.add_deny_commands`   | `commands.deny`                 |
+| `policy.override_deny`       | `filesystem.bypass_protection`  |
+| `policy.exclude_groups`      | `groups.exclude`                |
+| `--override-deny` (CLI)      | `--bypass-protection` (CLI)     |
+
+Notes:
+- The old `policy` key is no longer recognized as a top-level section. Its former fields now live directly under `filesystem`, `groups`, or `commands` as shown above.
+- The CLI flag renamed from `--override-deny` to `--bypass-protection` for the same reason the JSON key was renamed: to make the "does not grant access" semantics explicit. The old flag remains as a deprecated alias until v1.0.0.
+- When mechanically migrating a profile, move each `policy.*` entry up one level and rename per the table. Array values are preserved unchanged.

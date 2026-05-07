@@ -329,3 +329,160 @@ fn test_show_format_manifest_all_builtins_succeed() {
         );
     }
 }
+
+// ----------------------------------------------------------------------------
+// `profile show --json` / `profile diff --json` — Debug-format leak regression
+//
+// Historically the hand-rolled JSON emitter rendered five enum-valued fields
+// via `format!("{:?}", …)`, leaking Rust Debug syntax (`"Some(Isolated)"`,
+// `"ReadWrite"`, `"None"`-as-string) into output that `profile validate`
+// rejects. These tests guard against any future regression on the same code
+// path. See docs/policy-show-json-serialization-leak.md.
+// ----------------------------------------------------------------------------
+
+const SECURITY_TRI_MODE: &[&str] = &["isolated", "allow_same_sandbox", "allow_all"];
+const IPC_MODES: &[&str] = &["shared_memory_only", "full"];
+const WSL2_POLICIES: &[&str] = &["error", "insecure_proxy"];
+const WORKDIR_ACCESS: &[&str] = &["none", "read", "write", "readwrite"];
+
+/// Asserts a security-mode field is either omitted (None became absent) or a
+/// known snake_case variant. JSON `null` is treated as a failure because the
+/// show emitter omits None rather than nulling.
+fn assert_security_mode(security: &serde_json::Value, field: &str, valid: &[&str], ctx: &str) {
+    let Some(v) = security.get(field) else {
+        return;
+    };
+    assert!(
+        !v.is_null(),
+        "{ctx}: security.{field} is null; expected omitted when absent"
+    );
+    let Some(s) = v.as_str() else {
+        panic!("{ctx}: security.{field} = {v} (expected string)");
+    };
+    assert!(
+        valid.contains(&s),
+        "{ctx}: security.{field} = {s:?} not in {valid:?}"
+    );
+}
+
+/// Catches any leftover Rust Debug syntax in the raw JSON text. Belt and
+/// suspenders to the structural checks above.
+fn assert_no_debug_tokens(stdout: &str, ctx: &str) {
+    for needle in [
+        r#""Some("#,
+        r#""None""#,
+        r#""ReadWrite""#,
+        r#""Read""#,
+        r#""Write""#,
+        r#""Isolated""#,
+        r#""AllowSameSandbox""#,
+        r#""AllowAll""#,
+        r#""SharedMemoryOnly""#,
+        r#""Full""#,
+        r#""Error""#,
+        r#""InsecureProxy""#,
+    ] {
+        assert!(
+            !stdout.contains(needle),
+            "{ctx}: output contains Debug-formatted token {needle}\n--- stdout ---\n{stdout}"
+        );
+    }
+}
+
+#[test]
+fn test_show_profile_json_no_debug_leaks() {
+    for profile in ["default", "node-dev"] {
+        let output = nono_bin()
+            .args(["profile", "show", profile, "--json"])
+            .output()
+            .expect("failed to run nono");
+
+        assert!(
+            output.status.success(),
+            "{profile}: expected exit 0, stderr:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let val: serde_json::Value = serde_json::from_str(&stdout)
+            .unwrap_or_else(|e| panic!("{profile}: invalid JSON: {e}\n{stdout}"));
+
+        let security = val
+            .get("security")
+            .unwrap_or_else(|| panic!("{profile}: missing security block"));
+        assert_security_mode(security, "signal_mode", SECURITY_TRI_MODE, profile);
+        assert_security_mode(security, "process_info_mode", SECURITY_TRI_MODE, profile);
+        assert_security_mode(security, "ipc_mode", IPC_MODES, profile);
+        assert_security_mode(security, "wsl2_proxy_policy", WSL2_POLICIES, profile);
+
+        let workdir = val
+            .get("workdir")
+            .unwrap_or_else(|| panic!("{profile}: missing workdir block"));
+        let access = workdir
+            .get("access")
+            .and_then(|v| v.as_str())
+            .unwrap_or_else(|| panic!("{profile}: workdir.access missing or not a string"));
+        assert!(
+            WORKDIR_ACCESS.contains(&access),
+            "{profile}: workdir.access = {access:?} not in {WORKDIR_ACCESS:?}"
+        );
+
+        assert_no_debug_tokens(&stdout, &format!("show {profile}"));
+    }
+}
+
+#[test]
+fn test_diff_profile_json_no_debug_leaks() {
+    let output = nono_bin()
+        .args(["profile", "diff", "default", "node-dev", "--json"])
+        .output()
+        .expect("failed to run nono");
+
+    assert!(
+        output.status.success(),
+        "expected exit 0, stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let val: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("invalid diff JSON: {e}\n{stdout}"));
+
+    // wsl2_proxy_policy.profileN: null (when None) or a known variant.
+    let wsl2 = val
+        .get("wsl2_proxy_policy")
+        .unwrap_or_else(|| panic!("missing wsl2_proxy_policy block"));
+    for side in ["profile1", "profile2"] {
+        let v = wsl2
+            .get(side)
+            .unwrap_or_else(|| panic!("wsl2_proxy_policy.{side} missing"));
+        if v.is_null() {
+            continue;
+        }
+        let s = v
+            .as_str()
+            .unwrap_or_else(|| panic!("wsl2_proxy_policy.{side} = {v} (expected string)"));
+        assert!(
+            WSL2_POLICIES.contains(&s),
+            "wsl2_proxy_policy.{side} = {s:?} not in {WSL2_POLICIES:?}"
+        );
+    }
+
+    // workdir.profileN: always present, lowercase variant. WorkdirAccess is
+    // not Option-wrapped in the profile struct, so null isn't expected.
+    let workdir = val
+        .get("workdir")
+        .unwrap_or_else(|| panic!("missing workdir block"));
+    for side in ["profile1", "profile2"] {
+        let v = workdir
+            .get(side)
+            .unwrap_or_else(|| panic!("workdir.{side} missing"));
+        let s = v
+            .as_str()
+            .unwrap_or_else(|| panic!("workdir.{side} = {v} (expected string)"));
+        assert!(
+            WORKDIR_ACCESS.contains(&s),
+            "workdir.{side} = {s:?} not in {WORKDIR_ACCESS:?}"
+        );
+    }
+
+    assert_no_debug_tokens(&stdout, "diff default node-dev");
+}

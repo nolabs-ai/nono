@@ -1,6 +1,8 @@
 //! Registry client for package hosting.
 
-use crate::package::{PackageRef, PackageSearchResponse, PackageSearchResult, PullResponse};
+use crate::package::{
+    PackageRef, PackageSearchResponse, PackageSearchResult, PackageStatusResponse, PullResponse,
+};
 use nono::{NonoError, Result};
 use serde::de::DeserializeOwned;
 use sha2::Digest;
@@ -24,18 +26,29 @@ pub struct RegistryClient {
 }
 
 impl RegistryClient {
+    /// Build a registry client whose TLS verifier delegates to the OS-native
+    /// trust store at handshake time (SecTrust on macOS, system CA stores on
+    /// Linux). This picks up corporate or MDM-installed root CAs — including
+    /// the kind injected by VPN-based TLS-inspecting proxies — that the bundled
+    /// webpki roots wouldn't recognize, without any startup-time enumeration of
+    /// the keychain (which can spuriously fail in restricted environments).
     #[must_use]
     pub fn new(base_url: String) -> Self {
+        let tls_config = ureq::tls::TlsConfig::builder()
+            .root_certs(ureq::tls::RootCerts::PlatformVerifier)
+            .build();
+        let http = ureq::Agent::config_builder()
+            .timeout_global(Some(REGISTRY_CALL_TIMEOUT))
+            .timeout_resolve(Some(REGISTRY_CONNECT_TIMEOUT))
+            .timeout_connect(Some(REGISTRY_CONNECT_TIMEOUT))
+            .timeout_recv_response(Some(REGISTRY_RESPONSE_TIMEOUT))
+            .timeout_recv_body(Some(REGISTRY_BODY_TIMEOUT))
+            .tls_config(tls_config)
+            .build()
+            .new_agent();
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
-            http: ureq::Agent::config_builder()
-                .timeout_global(Some(REGISTRY_CALL_TIMEOUT))
-                .timeout_resolve(Some(REGISTRY_CONNECT_TIMEOUT))
-                .timeout_connect(Some(REGISTRY_CONNECT_TIMEOUT))
-                .timeout_recv_response(Some(REGISTRY_RESPONSE_TIMEOUT))
-                .timeout_recv_body(Some(REGISTRY_BODY_TIMEOUT))
-                .build()
-                .new_agent(),
+            http,
         }
     }
 
@@ -54,6 +67,24 @@ impl RegistryClient {
         let response: PackageSearchResponse =
             self.get_json(&format!("/api/v1/packages?q={query}"))?;
         Ok(response.packages)
+    }
+
+    pub fn fetch_package_status(
+        &self,
+        package_ref: &PackageRef,
+        installed: Option<&str>,
+    ) -> Result<PackageStatusResponse> {
+        let mut path = format!(
+            "/api/v1/packages/{}/{}/status",
+            package_ref.namespace, package_ref.name
+        );
+        if let Some(installed) = installed {
+            let encoded: String =
+                url::form_urlencoded::byte_serialize(installed.as_bytes()).collect();
+            path.push_str("?installed=");
+            path.push_str(&encoded);
+        }
+        self.get_json(&path)
     }
 
     /// Look up which packs (if any) ship a profile with the given
@@ -198,4 +229,17 @@ fn enforce_content_length(content_length: Option<u64>, limit: u64, url: &str) ->
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn registry_client_normalizes_base_url() {
+        // Trailing slash should be stripped. Construction is infallible because
+        // TLS verification is delegated to the OS verifier at handshake time.
+        let client = RegistryClient::new("https://example.invalid/".to_string());
+        assert_eq!(client.base_url, "https://example.invalid");
+    }
 }

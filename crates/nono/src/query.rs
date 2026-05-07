@@ -4,6 +4,7 @@
 //! by a given capability set, without actually applying the sandbox.
 
 use crate::capability::{AccessMode, CapabilitySet};
+use crate::path::try_canonicalize_ancestor_walk;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -70,22 +71,31 @@ impl QueryContext {
     #[must_use]
     pub fn query_path(&self, path: &Path, requested: AccessMode) -> QueryResult {
         // Try to canonicalize for the most accurate comparison.
-        // Falls back to raw path if the target doesn't exist yet.
-        let canonical = std::fs::canonicalize(path).ok();
-        let query_path = canonical.as_deref().unwrap_or(path);
+        // Falls back to ancestor-walk if the target doesn't exist yet so that
+        // macOS symlinks (/tmp → /private/tmp) are resolved correctly.
+        let full_canonical = std::fs::canonicalize(path).ok();
+        let query_path_buf;
+        let query_path: &Path = if let Some(ref c) = full_canonical {
+            c.as_path()
+        } else {
+            // canonicalize already failed above; skip the redundant retry
+            // and go straight to the ancestor-walk fallback.
+            query_path_buf = try_canonicalize_ancestor_walk(path);
+            query_path_buf.as_path()
+        };
 
         for cap in self.caps.fs_capabilities() {
             let covers = if cap.is_file {
                 // File capability: exact match against resolved, or if not
                 // canonicalized, also check against original
                 query_path == cap.resolved
-                    || (canonical.is_none() && path == cap.original.as_path())
+                    || (full_canonical.is_none() && path == cap.original.as_path())
             } else {
                 // Directory capability: path must be under the directory.
                 // Check resolved first (canonical path), then original
                 // (symlink path) for non-existent paths.
                 query_path.starts_with(&cap.resolved)
-                    || (canonical.is_none() && path.starts_with(&cap.original))
+                    || (full_canonical.is_none() && path.starts_with(&cap.original))
             };
 
             if covers {

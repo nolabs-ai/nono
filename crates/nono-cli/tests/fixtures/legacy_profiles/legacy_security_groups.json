@@ -1,0 +1,5 @@
+{
+  "meta": {"name": "legacy-test", "version": "0.1.0"},
+  "extends": "default",
+  "security": {"groups": ["node_runtime"]}
+}

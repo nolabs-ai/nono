@@ -861,7 +861,32 @@ mod tests {
     }
 
     #[test]
-    fn test_claude_code_profile_includes_github_credential() {
+    fn test_resolve_gitlab_credential() {
+        let json = embedded_network_policy_json();
+        let policy = load_network_policy(json).expect("policy should load");
+
+        let custom = HashMap::new();
+        let routes =
+            resolve_credentials(&policy, &["gitlab".to_string()], &custom).expect("should resolve");
+        assert_eq!(routes.len(), 1);
+
+        let gitlab = &routes[0];
+        assert_eq!(gitlab.prefix, "gitlab");
+        assert_eq!(gitlab.upstream, "https://gitlab.com/api");
+        assert_eq!(
+            gitlab.credential_key,
+            Some("env://GITLAB_TOKEN".to_string())
+        );
+        assert_eq!(gitlab.credential_format, "Bearer {}");
+        assert_eq!(
+            gitlab.env_var,
+            Some("GITLAB_TOKEN".to_string()),
+            "gitlab credential must have explicit env_var for phantom token"
+        );
+    }
+
+    #[test]
+    fn test_claude_code_profile_includes_git_provider_credential() {
         let json = embedded_network_policy_json();
         let policy = load_network_policy(json).expect("policy should load");
 
@@ -871,10 +896,15 @@ mod tests {
             "claude-code profile should include github credential, got: {:?}",
             resolved.profile_credentials
         );
+        assert!(
+            resolved.profile_credentials.contains(&"gitlab".to_string()),
+            "claude-code profile should include gitlab credential, got: {:?}",
+            resolved.profile_credentials
+        );
     }
 
     #[test]
-    fn test_codex_profile_includes_openai_and_github_credentials() {
+    fn test_codex_profile_includes_openai_and_git_provider_credentials() {
         let json = embedded_network_policy_json();
         let policy = load_network_policy(json).expect("policy should load");
 
@@ -887,6 +917,11 @@ mod tests {
         assert!(
             resolved.profile_credentials.contains(&"github".to_string()),
             "codex profile should include github credential, got: {:?}",
+            resolved.profile_credentials
+        );
+        assert!(
+            resolved.profile_credentials.contains(&"gitlab".to_string()),
+            "codex profile should include gitlab credential, got: {:?}",
             resolved.profile_credentials
         );
     }
@@ -939,6 +974,19 @@ mod tests {
         assert!(
             resolved.profile_credentials.contains(&"github".to_string()),
             "developer profile should include github credential, got: {:?}",
+            resolved.profile_credentials
+        );
+    }
+
+    #[test]
+    fn test_developer_profile_includes_gitlab_credential() {
+        let json = embedded_network_policy_json();
+        let policy = load_network_policy(json).expect("policy should load");
+
+        let resolved = resolve_network_profile(&policy, "developer").expect("should resolve");
+        assert!(
+            resolved.profile_credentials.contains(&"gitlab".to_string()),
+            "developer profile should include gitlab credential, got: {:?}",
             resolved.profile_credentials
         );
     }

@@ -21,6 +21,7 @@ pub struct TrustPolicy {
     /// Policy format version
     pub version: u32,
     /// Glob patterns identifying files under attestation (relative to working directory)
+    /// ALIAS(canonical="includes", introduced="v0.0.0", remove_by="indefinite", issue="#435")
     #[serde(alias = "instruction_patterns")]
     pub includes: Vec<String>,
     /// Explicit file paths at arbitrary locations to attest.

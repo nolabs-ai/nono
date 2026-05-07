@@ -1,0 +1,19 @@
+{
+  "meta": {"name": "legacy-all", "version": "0.1.0"},
+  "extends": "default",
+  "filesystem": {
+    "allow": ["/rw-base", "/rw"],
+    "read": ["/r"],
+    "write": ["/w"],
+    "deny": ["/d"],
+    "bypass_protection": ["/rw-base"]
+  },
+  "groups": {
+    "include": ["node_runtime"],
+    "exclude": ["dangerous_commands"]
+  },
+  "commands": {
+    "allow": ["pip"],
+    "deny": ["docker"]
+  }
+}

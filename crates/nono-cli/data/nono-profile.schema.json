@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://nono.dev/schemas/nono-profile.schema.json",
+  "$id": "https://nono.sh/schemas/nono-profile.schema.json",
   "title": "nono Profile",
   "description": "A nono profile definition that configures sandbox capabilities, filesystem access, network policy, and other security settings for running untrusted processes.",
   "type": "object",
@@ -27,15 +27,19 @@
     },
     "security": {
       "$ref": "#/$defs/SecurityConfig",
-      "description": "Security configuration referencing policy.json groups, allowed commands, and isolation modes."
+      "description": "Security configuration for process-level isolation modes (signal, IPC, process info, capability elevation, WSL2 proxy policy)."
+    },
+    "groups": {
+      "$ref": "#/$defs/GroupsConfig",
+      "description": "Group composition: include and exclude policy group names resolved from policy.json."
+    },
+    "commands": {
+      "$ref": "#/$defs/CommandsConfig",
+      "description": "Command allow/deny lists applied during sandbox setup."
     },
     "filesystem": {
       "$ref": "#/$defs/FilesystemConfig",
       "description": "Filesystem access rules specifying which directories and files the sandboxed process can read or write."
-    },
-    "policy": {
-      "$ref": "#/$defs/PolicyPatchConfig",
-      "description": "Policy patch configuration for subtractive and additive composition on top of inherited groups."
     },
     "network": {
       "$ref": "#/$defs/NetworkConfig",
@@ -139,20 +143,9 @@
     },
     "SecurityConfig": {
       "type": "object",
-      "description": "Security configuration referencing policy.json groups and isolation modes.",
+      "description": "Security configuration for process-level isolation modes.",
       "additionalProperties": false,
       "properties": {
-        "groups": {
-          "type": "array",
-          "items": { "type": "string" },
-          "description": "Policy group names to resolve from policy.json. Groups define sets of allow/deny rules for filesystem paths, commands, and platform-specific behaviors."
-        },
-        "allowed_commands": {
-          "type": "array",
-          "items": { "type": "string" },
-          "description": "Deprecated in v0.33.0. Startup-only command allowlist override. Not enforced for child processes; prefer resource-based controls instead.",
-          "deprecated": true
-        },
         "signal_mode": {
           "oneOf": [
             { "$ref": "#/$defs/ProfileSignalMode" },
@@ -244,49 +237,52 @@
           "type": "array",
           "items": { "type": "string" },
           "description": "Single files with write-only access."
+        },
+        "deny": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Paths denied filesystem access. Denies apply regardless of other allow rules."
+        },
+        "bypass_protection": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Paths exempted from group-level deny rules. Each path must also appear in an allow/read/write section to actually grant access; bypass_protection only removes the deny."
         }
       }
     },
-    "PolicyPatchConfig": {
+    "GroupsConfig": {
       "type": "object",
-      "description": "Policy patch configuration for subtractive and additive composition on top of inherited groups and existing filesystem configuration.",
+      "description": "Group composition for the sandboxed process.",
       "additionalProperties": false,
       "properties": {
-        "exclude_groups": {
+        "include": {
           "type": "array",
           "items": { "type": "string" },
-          "description": "Group names to remove from the resolved group set."
+          "description": "Policy group names to include. Groups are resolved against policy.json."
         },
-        "add_allow_read": {
+        "exclude": {
           "type": "array",
           "items": { "type": "string" },
-          "description": "Additional read-only directories to allow."
-        },
-        "add_allow_write": {
+          "description": "Policy group names to remove from the resolved group set (subtractive composition)."
+        }
+      }
+    },
+    "CommandsConfig": {
+      "type": "object",
+      "description": "Command allow/deny lists applied during sandbox setup.",
+      "additionalProperties": false,
+      "properties": {
+        "allow": {
           "type": "array",
           "items": { "type": "string" },
-          "description": "Additional write-only directories to allow."
+          "description": "Deprecated in v0.33.0. Startup-only command allowlist override. Not enforced for child processes; prefer resource-based controls instead.",
+          "deprecated": true
         },
-        "add_allow_readwrite": {
-          "type": "array",
-          "items": { "type": "string" },
-          "description": "Additional read-write directories to allow."
-        },
-        "add_deny_access": {
-          "type": "array",
-          "items": { "type": "string" },
-          "description": "Additional deny.access paths to apply."
-        },
-        "add_deny_commands": {
+        "deny": {
           "type": "array",
           "items": { "type": "string" },
           "description": "Deprecated in v0.33.0. Startup-only command denylist extension. Not enforced for child processes; prefer resource-based controls instead.",
           "deprecated": true
-        },
-        "override_deny": {
-          "type": "array",
-          "items": { "type": "string" },
-          "description": "Paths to exempt from deny groups. Each path must also be explicitly granted via filesystem or policy.add_allow_* fields. Does not implicitly grant access; only removes the deny rule."
         }
       }
     },

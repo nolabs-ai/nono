@@ -484,11 +484,13 @@
     },
     "nix_runtime": {
       "description": "Nix package manager runtime paths",
-      "platform": "linux",
       "allow": {
         "read": [
           "~/.nix-profile",
+          "~/.local/state/nix/profile",
+          "~/.local/state/nix/profiles",
           "~/.nix-defexpr",
+          "~/.local/state/nix/defexpr",
           "/run/current-system/sw",
           "/etc/profiles/per-user",
           "/nix/var/nix/profiles",
@@ -594,10 +596,10 @@
         "name": "default",
         "version": "1.0.0",
         "description": "Default conservative base profile",
-        "author": "nono-project"
+        "author": "always-further"
       },
-      "security": {
-        "groups": [
+      "groups": {
+        "include": [
           "deny_credentials",
           "deny_keychains_macos",
           "deny_keychains_linux",
@@ -616,7 +618,9 @@
           "dangerous_commands",
           "dangerous_commands_macos",
           "dangerous_commands_linux"
-        ],
+        ]
+      },
+      "security": {
         "signal_mode": "isolated"
       },
       "filesystem": {},
@@ -630,14 +634,16 @@
         "name": "linux-host-compat",
         "version": "1.0.0",
         "description": "Linux compatibility profile for host runtime, sysfs, and temp access",
-        "author": "nono-project"
+        "author": "always-further"
       },
-      "security": {
-        "groups": [
+      "groups": {
+        "include": [
           "linux_runtime_state",
           "linux_sysfs_read",
           "linux_temp_read"
-        ],
+        ]
+      },
+      "security": {
         "signal_mode": "isolated"
       },
       "filesystem": {},
@@ -651,10 +657,12 @@
         "name": "openclaw",
         "version": "1.0.0",
         "description": "OpenClaw messaging gateway",
-        "author": "nono-project"
+        "author": "always-further"
+      },
+      "groups": {
+        "include": ["node_runtime"]
       },
       "security": {
-        "groups": ["node_runtime"],
         "signal_mode": "isolated"
       },
       "filesystem": {
@@ -677,10 +685,12 @@
         "name": "opencode",
         "version": "1.0.0",
         "description": "OpenCode AI coding assistant",
-        "author": "nono-project"
+        "author": "always-further"
+      },
+      "groups": {
+        "include": ["user_caches_macos", "user_caches_linux", "node_runtime", "opencode_linux", "linux_sysfs_read", "git_config", "unlink_protection"]
       },
       "security": {
-        "groups": ["user_caches_macos", "user_caches_linux", "node_runtime", "opencode_linux", "linux_sysfs_read", "git_config", "unlink_protection"],
         "signal_mode": "isolated"
       },
       "filesystem": {
@@ -707,10 +717,12 @@
         "name": "python-dev",
         "version": "1.0.0",
         "description": "Python SDK development profile with pyenv, conda, and pip support",
-        "author": "nono-project"
+        "author": "always-further"
+      },
+      "groups": {
+        "include": ["python_runtime"]
       },
       "security": {
-        "groups": ["python_runtime"],
         "signal_mode": "isolated",
         "ipc_mode": "full"
       },
@@ -725,10 +737,12 @@
         "name": "node-dev",
         "version": "1.0.0",
         "description": "Node.js SDK development profile with nvm, fnm, pnpm, and npm support",
-        "author": "nono-project"
+        "author": "always-further"
+      },
+      "groups": {
+        "include": ["node_runtime"]
       },
       "security": {
-        "groups": ["node_runtime"],
         "signal_mode": "isolated"
       },
       "filesystem": {},
@@ -742,10 +756,12 @@
         "name": "go-dev",
         "version": "1.0.0",
         "description": "Go SDK development profile with GOPATH and module support",
-        "author": "nono-project"
+        "author": "always-further"
+      },
+      "groups": {
+        "include": ["go_runtime"]
       },
       "security": {
-        "groups": ["go_runtime"],
         "signal_mode": "isolated"
       },
       "filesystem": {},
@@ -759,10 +775,12 @@
         "name": "rust-dev",
         "version": "1.0.0",
         "description": "Rust SDK development profile with cargo and rustup support",
-        "author": "nono-project"
+        "author": "always-further"
+      },
+      "groups": {
+        "include": ["rust_runtime"]
       },
       "security": {
-        "groups": ["rust_runtime"],
         "signal_mode": "isolated"
       },
       "filesystem": {},
@@ -776,10 +794,10 @@
         "name": "swival",
         "version": "1.0.0",
         "description": "Swival CLI coding agent",
-        "author": "nono-project"
+        "author": "always-further"
       },
-      "security": {
-        "groups": [
+      "groups": {
+        "include": [
           "python_runtime",
           "node_runtime",
           "user_caches_macos",
@@ -787,7 +805,9 @@
           "linux_sysfs_read",
           "git_config",
           "unlink_protection"
-        ],
+        ]
+      },
+      "security": {
         "signal_mode": "isolated",
         "capability_elevation": false
       },

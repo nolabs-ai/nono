@@ -3,8 +3,8 @@ gsd_state_version: 1.0
 milestone: v2.3
 milestone_name: Linux POC Unblock + Deferreds Closure
 status: executing
-stopped_at: "Phase 30 (Windows nono shell Interactive Enforcement Architecture) context gathered. The `nono shell` 0xC0000142 field-failure became a planning checkpoint via `/gsd-discuss-phase`; CONTEXT.md captures the locked decisions: Wave 1 is Option 3 (Low-IL primary token + ConPTY), Wave 2 is ProcMon investigation conditional on Wave 1 failure. TUI rendering and OS-level write-deny are both locked acceptance criteria; Phase 15's detached-path waiver is explicitly rejected for the long-lived interactive shell. Phase 30 is NOT yet in ROADMAP.md — user decides v2.3 vs v2.4 placement via `/gsd-phase add 30`."
-last_updated: "2026-05-07T22:53:55.700Z"
+stopped_at: Phase 30 in flight — bookkeeping prelude complete, cascade edit pending (Plan 30-02)
+last_updated: "2026-05-07T23:22:36.000Z"
 last_activity: 2026-05-07
 progress:
   total_phases: 8

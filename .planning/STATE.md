@@ -4,7 +4,7 @@ milestone: v2.3
 milestone_name: Linux POC Unblock + Deferreds Closure
 status: executing
 stopped_at: "Phase 30 (Windows nono shell Interactive Enforcement Architecture) context gathered. The `nono shell` 0xC0000142 field-failure became a planning checkpoint via `/gsd-discuss-phase`; CONTEXT.md captures the locked decisions: Wave 1 is Option 3 (Low-IL primary token + ConPTY), Wave 2 is ProcMon investigation conditional on Wave 1 failure. TUI rendering and OS-level write-deny are both locked acceptance criteria; Phase 15's detached-path waiver is explicitly rejected for the long-lived interactive shell. Phase 30 is NOT yet in ROADMAP.md — user decides v2.3 vs v2.4 placement via `/gsd-phase add 30`."
-last_updated: "2026-05-07T22:53:55.700Z"
+last_updated: "2026-05-07T23:20:21.210Z"
 last_activity: 2026-05-07
 progress:
   total_phases: 8
@@ -22,13 +22,13 @@ See: .planning/PROJECT.md (updated 2026-04-29 at v2.3 milestone scope-lock)
 
 **Core Value:** Every nono command that works on Linux/macOS should work on Windows with equivalent security guarantees, or be explicitly documented as intentionally unsupported with a clear rationale.
 
-**Current Focus:** Phase 27.1 — nono-test-home-seam
+**Current Focus:** Phase 30 — windows-nono-shell-architecture
 
 ## Current Position
 
-Phase: 28
-Plan: Not started
-Status: Ready to execute
+Phase: 30 (windows-nono-shell-architecture) — EXECUTING
+Plan: 1 of 5
+Status: Executing Phase 30
 Milestone: v2.2 — 3/3 phases complete (Phase 22 ✓ 2026-04-28, Phase 23 ✓ 2026-04-29, Phase 24 ✓ 2026-04-27), 9/9 plans complete. v2.2 ready to ship.
 
   - v1.0 Windows Alpha — shipped 2026-03-31 (tag `v1.0`).
@@ -48,7 +48,7 @@ Next actions:
   - After Phase 23 closes, `/gsd-complete-milestone v2.2` to archive the milestone.
   - Pre-merge `windows-squash` → `main` quick task remains a candidate for milestone-close timing.
 
-Last activity: 2026-05-07 -- Phase 30 planning complete
+Last activity: 2026-05-07 -- Phase 30 execution started
 
 Prior activity: 2026-04-28 — Phase 22 closed end-to-end (UAT 10/10 + 1 spec-error skipped, commit e60ab093). Quick task 260428-rsu created as deferred runbook for upstream-stack rebase (awaiting trigger).
 

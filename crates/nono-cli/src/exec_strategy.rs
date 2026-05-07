@@ -585,6 +585,26 @@ pub fn execute_supervised(
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     let _keep_browser_shim_alive = browser_shim;
 
+    // Diagnostic-only: stamp the parent's CLOCK_MONOTONIC nanos into the child's
+    // env when ETI_PROFILE_HOTPATH is active. The shim reads it at run_shim() entry
+    // to measure shim Rust-runtime startup (execve + linker + Rust init).
+    #[cfg(target_os = "linux")]
+    if config.eti_runtime.is_some() && std::env::var_os("ETI_PROFILE_HOTPATH").is_some() {
+        let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
+        let rc = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+        if rc == 0 {
+            let nanos = (ts.tv_sec as i128)
+                .saturating_mul(1_000_000_000)
+                .saturating_add(ts.tv_nsec as i128);
+            if let Ok(cstr) = CString::new(format!(
+                "{}={nanos}",
+                crate::eti_runtime::ETI_PARENT_MONOTONIC_ENV
+            )) {
+                env_c.push(cstr);
+            }
+        }
+    }
+
     // Create null-terminated pointer arrays for execve
     let argv_ptrs: Vec<*const libc::c_char> = argv_c
         .iter()
@@ -2218,6 +2238,34 @@ fn run_supervisor_loop(
     Vec<DenialRecord>,
     Vec<nono::diagnostic::IpcDenialRecord>,
 )> {
+    struct LoopTimer {
+        start: Instant,
+        iterations: u64,
+        sock_inactive_at: Option<Instant>,
+    }
+    impl Drop for LoopTimer {
+        fn drop(&mut self) {
+            if std::env::var_os("ETI_PROFILE_HOTPATH").is_some() {
+                let after_sock_close = self
+                    .sock_inactive_at
+                    .map(|t| t.elapsed())
+                    .map(|d| format!("{d:?}"))
+                    .unwrap_or_else(|| "n/a".to_string());
+                eprintln!(
+                    "[eti-prof] supervisor_loop:total: {:?} ({} iterations, after_sock_close: {})",
+                    self.start.elapsed(),
+                    self.iterations,
+                    after_sock_close
+                );
+            }
+        }
+    }
+    let mut loop_timer = LoopTimer {
+        start: Instant::now(),
+        iterations: 0,
+        sock_inactive_at: None,
+    };
+
     let sock_fd = sock.as_raw_fd();
     let notify_raw_fd = seccomp_fd.map(|fd| fd.as_raw_fd());
     let proxy_notify_raw_fd = proxy_seccomp_fd.map(|fd| fd.as_raw_fd());
@@ -2232,6 +2280,7 @@ fn run_supervisor_loop(
     let mut startup_prompted = false;
 
     loop {
+        loop_timer.iterations += 1;
         let mut pfds: Vec<libc::pollfd> = vec![libc::pollfd {
             fd: if sock_fd_active { sock_fd } else { -1 },
             events: libc::POLLIN,
@@ -2300,6 +2349,7 @@ fn run_supervisor_loop(
                     {
                         debug!("Supervisor socket closed, continuing for seccomp/proxy/PTY");
                         sock_fd_active = false;
+                        loop_timer.sock_inactive_at.get_or_insert(Instant::now());
                     } else {
                         debug!("Supervisor socket closed by child");
                         break;
@@ -2330,6 +2380,7 @@ fn run_supervisor_loop(
                                 break;
                             }
                             sock_fd_active = false;
+                            loop_timer.sock_inactive_at.get_or_insert(Instant::now());
                         }
                     }
                 }

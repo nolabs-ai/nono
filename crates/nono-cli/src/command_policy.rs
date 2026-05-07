@@ -69,6 +69,8 @@ pub(crate) struct ResolvedCommandBinary {
     pub canonical_path: PathBuf,
     pub dev: u64,
     pub ino: u64,
+    pub size: u64,
+    pub mtime_nanos: i128,
     pub sha256: String,
     pub duplicate_paths: Vec<PathBuf>,
     pub shape: ResolvedExecutableShape,
@@ -544,6 +546,8 @@ pub(crate) fn resolve_policy_command_binaries(
                 canonical_path: selected.canonical_path.clone(),
                 dev: selected.dev,
                 ino: selected.ino,
+                size: selected.size,
+                mtime_nanos: selected.mtime_nanos,
                 sha256: selected.sha256.clone(),
                 duplicate_paths,
                 shape: selected.shape.clone(),
@@ -919,6 +923,8 @@ struct CommandMatch {
     canonical_path: PathBuf,
     dev: u64,
     ino: u64,
+    size: u64,
+    mtime_nanos: i128,
     sha256: String,
     shape: ResolvedExecutableShape,
 }
@@ -1041,10 +1047,15 @@ fn candidate_command_match(candidate: &Path) -> nono::Result<Option<CommandMatch
         .collect::<String>();
     let shape = classify_executable_shape(&canonical_path, &bytes)?;
 
+    let mtime_nanos = (canonical_metadata.mtime() as i128)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(canonical_metadata.mtime_nsec() as i128);
     Ok(Some(CommandMatch {
         canonical_path,
         dev: canonical_metadata.dev(),
         ino: canonical_metadata.ino(),
+        size: canonical_metadata.size(),
+        mtime_nanos,
         sha256,
         shape,
     }))

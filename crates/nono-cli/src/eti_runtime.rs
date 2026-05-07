@@ -19,6 +19,12 @@ pub(crate) fn maybe_run_internal_eti_entrypoint() -> bool {
     false
 }
 
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn record_main_start() {}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn log_main_total() {}
+
 #[cfg(target_os = "linux")]
 mod linux {
     use crate::audit_integrity::{AuditRecorder, CommandPolicyAuditEvent};
@@ -62,6 +68,10 @@ mod linux {
     pub(crate) const ETI_SOCKET_ENV: &str = "NONO_ETI_SOCKET";
     pub(crate) const ETI_SHIM_DIR_ENV: &str = "NONO_ETI_SHIM_DIR";
     pub(crate) const ETI_LAUNCH_SPEC_ENV: &str = "NONO_ETI_LAUNCH_SPEC";
+    /// Diagnostic-only: parent's CLOCK_MONOTONIC nanos at the latest pre-fork point.
+    /// Set by exec_strategy on the supervised child's exec env when ETI_PROFILE_HOTPATH
+    /// is active, read by run_shim() on entry to measure shim Rust-runtime startup.
+    pub(crate) const ETI_PARENT_MONOTONIC_ENV: &str = "NONO_ETI_PARENT_MONOTONIC";
 
     const MAX_FRAME: usize = 1024 * 1024;
     const MAX_ARGC: usize = 4096;
@@ -86,6 +96,29 @@ mod linux {
         "TZ",
     ];
 
+    macro_rules! eti_profile_log {
+        ($($arg:tt)*) => {
+            if std::env::var_os("ETI_PROFILE_HOTPATH").is_some() {
+                eprintln!("[eti-prof] {}", format_args!($($arg)*));
+            }
+        };
+    }
+
+    pub(crate) static MAIN_START: std::sync::OnceLock<std::time::Instant> =
+        std::sync::OnceLock::new();
+
+    pub(crate) fn record_main_start() {
+        if std::env::var_os("ETI_PROFILE_HOTPATH").is_some() {
+            let _ = MAIN_START.get_or_init(std::time::Instant::now);
+        }
+    }
+
+    pub(crate) fn log_main_total() {
+        if let Some(start) = MAIN_START.get() {
+            eti_profile_log!("main_total: {:?}", start.elapsed());
+        }
+    }
+
     #[derive(Clone)]
     pub(crate) struct PreparedEtiRuntime {
         inner: Arc<EtiState>,
@@ -103,10 +136,19 @@ mod linux {
         shims_by_path: BTreeMap<PathBuf, String>,
         credential_handles: BTreeMap<String, ResolvedCredential>,
         allowed_outer_exec_files: Vec<PathBuf>,
+        baseline_cache: BaselineCache,
         active_children: Mutex<HashMap<u32, ActiveChild>>,
         active_count: AtomicUsize,
         queued_requests: AtomicUsize,
         emitted_error_response: AtomicBool,
+    }
+
+    /// Pre-computed runtime-baseline files (ELF dependency closures + system files)
+    /// granted to every ETI child. Built once at supervisor startup so the per-request
+    /// hot path does no recursive ELF parsing or directory walking.
+    struct BaselineCache {
+        closures: BTreeMap<PathBuf, Vec<PathBuf>>,
+        system_files: Vec<(PathBuf, AccessMode)>,
     }
 
     struct ResolvedEtiPlan {
@@ -253,15 +295,39 @@ mod linux {
             outer_caps: &CapabilitySet,
             policy_root: &Path,
         ) -> Result<Self> {
+            let start_total = std::time::Instant::now();
+            if let Some(start) = MAIN_START.get() {
+                eti_profile_log!("main_to_prepare: {:?}", start.elapsed());
+            }
+
+            let start_plan = std::time::Instant::now();
             let plan =
                 ResolvedEtiPlan::build(config, allowed_commands, blocked_commands, outer_caps)?;
+            eti_profile_log!(
+                "prepare:plan_build: {:?} ({} commands, {} deny_only)",
+                start_plan.elapsed(),
+                plan.resolved.commands.len(),
+                plan.deny_only.len()
+            );
+
+            let start_runtime_dir = std::time::Instant::now();
             let runtime_dir = create_runtime_dir()?;
             let mut runtime_cleanup = RuntimeDirCleanup::new(runtime_dir.clone());
             let socket_path = runtime_dir.join("supervisor.sock");
             let listener = bind_runtime_socket(&socket_path)?;
             let shim_dir = runtime_dir.clone();
             let session_path = build_session_path(&shim_dir);
+            eti_profile_log!(
+                "prepare:runtime_dir_and_socket: {:?}",
+                start_runtime_dir.elapsed()
+            );
+
+            let start_credentials = std::time::Instant::now();
             let credential_handles = resolve_credentials(&plan.config.credentials)?;
+            eti_profile_log!(
+                "prepare:resolve_credentials: {:?}",
+                start_credentials.elapsed()
+            );
 
             let mut excluded_ids: HashSet<FileId> = plan
                 .resolved
@@ -274,17 +340,25 @@ mod linux {
                 .collect();
             excluded_ids.extend(plan.deny_only.values().map(|entry| entry.id));
 
+            let start_shims = std::time::Instant::now();
             let mut shims_by_command = BTreeMap::new();
             let mut shims_by_path = BTreeMap::new();
             let mut shim_names: BTreeSet<String> = plan.resolved.commands.keys().cloned().collect();
             shim_names.extend(plan.deny_only.keys().cloned());
             let shim_source = materialize_shim_source(&runtime_dir)?;
+            let shim_count = shim_names.len();
             for name in shim_names {
                 let identity = materialize_shim(&shim_source, &runtime_dir, &name)?;
                 shims_by_path.insert(identity.path.clone(), name.clone());
                 shims_by_command.insert(name, identity);
             }
+            eti_profile_log!(
+                "prepare:materialize_shims: {:?} ({} shims)",
+                start_shims.elapsed(),
+                shim_count
+            );
 
+            let start_outer_exec = std::time::Instant::now();
             let allowed_outer_exec_files = build_outer_exec_files(
                 &excluded_ids,
                 &plan.original_exec_dirs,
@@ -292,6 +366,19 @@ mod linux {
                 shims_by_command.values(),
                 &plan.allowed_direct_bypasses,
             )?;
+            eti_profile_log!(
+                "prepare:build_outer_exec_files: {:?} ({} paths)",
+                start_outer_exec.elapsed(),
+                allowed_outer_exec_files.len()
+            );
+
+            let start_baseline_cache = std::time::Instant::now();
+            let baseline_cache = build_baseline_cache(&plan, &shims_by_command, &shim_source)?;
+            eti_profile_log!(
+                "build_baseline_cache: {:?} ({} closures cached)",
+                start_baseline_cache.elapsed(),
+                baseline_cache.closures.len()
+            );
 
             let runtime = Self {
                 inner: Arc::new(EtiState {
@@ -305,6 +392,7 @@ mod linux {
                     shims_by_path,
                     credential_handles,
                     allowed_outer_exec_files,
+                    baseline_cache,
                     active_children: Mutex::new(HashMap::new()),
                     active_count: AtomicUsize::new(0),
                     queued_requests: AtomicUsize::new(0),
@@ -313,6 +401,7 @@ mod linux {
                 listener: Arc::new(listener),
             };
             runtime_cleanup.disarm();
+            eti_profile_log!("prepare:total: {:?}", start_total.elapsed());
             Ok(runtime)
         }
 
@@ -537,6 +626,33 @@ mod linux {
         }
     }
 
+    fn log_cross_process_shim_startup() {
+        let Some(parent) = std::env::var_os(ETI_PARENT_MONOTONIC_ENV) else {
+            return;
+        };
+        let Some(parent_str) = parent.to_str() else {
+            return;
+        };
+        let Ok(parent_nanos) = parent_str.parse::<i128>() else {
+            return;
+        };
+        let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
+        let rc = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+        if rc != 0 {
+            return;
+        }
+        let now_nanos = (ts.tv_sec as i128)
+            .saturating_mul(1_000_000_000)
+            .saturating_add(ts.tv_nsec as i128);
+        let delta = now_nanos.saturating_sub(parent_nanos);
+        let delta_clamped = delta.max(0).min(i128::from(u64::MAX)) as u64;
+        let dur = std::time::Duration::from_nanos(delta_clamped);
+        eti_profile_log!(
+            "shim:cross_process_startup: {:?} (parent_pre_fork → shim entry)",
+            dur
+        );
+    }
+
     fn current_exe_is_eti_shim() -> bool {
         let Some(shim_dir) = std::env::var_os(ETI_SHIM_DIR_ENV).map(PathBuf::from) else {
             return false;
@@ -548,6 +664,8 @@ mod linux {
     }
 
     fn run_shim() -> Result<()> {
+        let start_shim = std::time::Instant::now();
+        log_cross_process_shim_startup();
         let socket_path = std::env::var_os(ETI_SOCKET_ENV)
             .map(PathBuf::from)
             .ok_or_else(|| NonoError::SandboxInit("ETI shim socket env missing".to_string()))?;
@@ -556,6 +674,7 @@ mod linux {
             .and_then(|path| path.file_name().map(OsStr::to_os_string))
             .and_then(|name| name.into_string().ok())
             .ok_or_else(|| NonoError::SandboxInit("ETI shim command name invalid".to_string()))?;
+        let start_env = std::time::Instant::now();
         let argv = std::env::args_os()
             .map(OsStringExt::into_vec)
             .collect::<Vec<_>>();
@@ -571,6 +690,12 @@ mod linux {
             .map_err(|err| NonoError::SandboxInit(format!("ETI shim cwd failed: {err}")))?
             .into_os_string()
             .into_vec();
+        eti_profile_log!(
+            "shim:env_collect: {:?} ({} args, {} env entries)",
+            start_env.elapsed(),
+            argv.len(),
+            env.len()
+        );
 
         let request = EtiShimRequest {
             command,
@@ -585,14 +710,22 @@ mod linux {
         };
         validate_ipc_request(&request)?;
 
+        let start_connect = std::time::Instant::now();
         let mut stream = UnixStream::connect(&socket_path).map_err(|err| {
             NonoError::SandboxInit(format!(
                 "ETI shim failed to connect to {}: {err}",
                 socket_path.display()
             ))
         })?;
+        eti_profile_log!("shim:socket_connect: {:?}", start_connect.elapsed());
+        let start_send = std::time::Instant::now();
         write_frame(&mut stream, &request)?;
         send_stdio_fds(&stream)?;
+        eti_profile_log!(
+            "shim:send_request: {:?} (entry-to-request: {:?})",
+            start_send.elapsed(),
+            start_shim.elapsed()
+        );
         let response: EtiShimResponse = read_frame(&mut stream)?;
         if let Some(error) = response.error {
             eprintln!("nono: ETI denied {}: {error}", request.command);
@@ -601,9 +734,11 @@ mod linux {
     }
 
     fn run_child_launcher() -> Result<()> {
+        let start_launcher = std::time::Instant::now();
         let spec_path = std::env::var_os(ETI_LAUNCH_SPEC_ENV)
             .map(PathBuf::from)
             .ok_or_else(|| NonoError::SandboxInit("ETI launch spec env missing".to_string()))?;
+        let start_parse = std::time::Instant::now();
         let bytes = fs::read(&spec_path).map_err(|err| NonoError::ConfigRead {
             path: spec_path.clone(),
             source: err,
@@ -611,6 +746,11 @@ mod linux {
         let spec: EtiChildLaunchSpec = serde_json::from_slice(&bytes).map_err(|err| {
             NonoError::ConfigParse(format!("failed to parse ETI launch spec: {err}"))
         })?;
+        eti_profile_log!(
+            "launcher:read_and_parse_spec: {:?} ({} bytes)",
+            start_parse.elapsed(),
+            bytes.len()
+        );
         match spec.stdio_mode.as_str() {
             "pty" => unsafe {
                 crate::pty_proxy::setup_child_pty(libc::STDIN_FILENO);
@@ -636,8 +776,16 @@ mod linux {
             NonoError::SandboxInit(format!("ETI child chdir failed before sandbox: {err}"))
         })?;
 
+        let start_caps_from = std::time::Instant::now();
         let caps = caps_from_spec(&spec.caps)?;
+        eti_profile_log!("launcher:caps_from_spec: {:?}", start_caps_from.elapsed());
+        let start_sandbox_apply = std::time::Instant::now();
         Sandbox::apply(&caps)?;
+        eti_profile_log!(
+            "launcher:sandbox_apply: {:?}",
+            start_sandbox_apply.elapsed()
+        );
+        eti_profile_log!("launcher:total_to_exec: {:?}", start_launcher.elapsed());
 
         let mut command = Command::new(&real_binary);
         command.env_clear();
@@ -1155,7 +1303,13 @@ mod linux {
             .ok_or_else(|| {
                 NonoError::SandboxInit(format!("missing resolved binary for {}", request.command))
             })?;
+        let start_vbi = std::time::Instant::now();
         verify_binary_identity(binary)?;
+        eti_profile_log!(
+            "verify_binary_identity({}): {:?}",
+            binary.canonical_path.display(),
+            start_vbi.elapsed()
+        );
         let cwd = PathBuf::from(OsString::from_vec(request.cwd.clone()));
         let cwd = cwd
             .canonicalize()
@@ -1164,7 +1318,9 @@ mod linux {
                 source,
             })?;
 
+        let start_caps = std::time::Instant::now();
         let mut caps = build_child_caps(state, binary, policy)?;
+        eti_profile_log!("build_child_caps total: {:?}", start_caps.elapsed());
         caps.deduplicate();
 
         let env = filter_child_env(state, request, policy)?;
@@ -1195,8 +1351,8 @@ mod linux {
             &binary.canonical_path,
             AccessMode::Read,
         )?);
-        add_runtime_baseline(&mut caps, &binary.canonical_path)?;
-        add_executable_shape_baseline(&mut caps, binary)?;
+        add_runtime_baseline(&mut caps, &state.baseline_cache, &binary.canonical_path)?;
+        add_executable_shape_baseline(&mut caps, state, binary)?;
         add_chaining_control_caps(&mut caps, state)?;
         add_policy_fs(&mut caps, policy, &state.policy_root)?;
         add_policy_network(&mut caps, policy);
@@ -1206,6 +1362,7 @@ mod linux {
 
     fn add_executable_shape_baseline(
         caps: &mut CapabilitySet,
+        state: &EtiState,
         binary: &ResolvedCommandBinary,
     ) -> Result<()> {
         if binary.shape.kind != ResolvedExecutableKind::ShebangScript {
@@ -1222,7 +1379,7 @@ mod linux {
                     source,
                 })?;
         caps.add_fs(FsCapability::new_file(&interpreter, AccessMode::Read)?);
-        add_runtime_baseline(caps, &interpreter)
+        add_runtime_baseline(caps, &state.baseline_cache, &interpreter)
     }
 
     fn add_chaining_control_caps(caps: &mut CapabilitySet, state: &EtiState) -> Result<()> {
@@ -1231,7 +1388,7 @@ mod linux {
             caps.add_fs(FsCapability::new_file(&shim.path, AccessMode::Read)?);
         }
         if let Some(shim) = state.shims_by_command.values().next() {
-            add_runtime_baseline(caps, &shim.path)?;
+            add_runtime_baseline(caps, &state.baseline_cache, &shim.path)?;
         }
         caps.add_unix_socket(UnixSocketCapability::new_file(
             &state.socket_path,
@@ -1341,10 +1498,74 @@ mod linux {
         Ok(())
     }
 
-    fn add_runtime_baseline(caps: &mut CapabilitySet, binary: &Path) -> Result<()> {
-        for file in elf_dependency_closure(binary)? {
+    fn add_runtime_baseline(
+        caps: &mut CapabilitySet,
+        baseline: &BaselineCache,
+        binary: &Path,
+    ) -> Result<()> {
+        let start_baseline = std::time::Instant::now();
+        let closure = baseline.closures.get(binary).ok_or_else(|| {
+            NonoError::SandboxInit(format!(
+                "ETI runtime baseline cache missing entry for {}",
+                binary.display()
+            ))
+        })?;
+        for file in closure {
             caps.add_fs(FsCapability::new_file(file, AccessMode::Read)?);
         }
+        for (path, access) in &baseline.system_files {
+            caps.add_fs(FsCapability::new_file(path, *access)?);
+        }
+        eti_profile_log!(
+            "add_runtime_baseline({}): {:?} ({} closure files)",
+            binary.display(),
+            start_baseline.elapsed(),
+            closure.len()
+        );
+        Ok(())
+    }
+
+    fn build_baseline_cache(
+        plan: &ResolvedEtiPlan,
+        shims_by_command: &BTreeMap<String, ShimIdentity>,
+        shim_source: &Path,
+    ) -> Result<BaselineCache> {
+        let system_files = compute_system_baseline_files()?;
+        let mut closures: BTreeMap<PathBuf, Vec<PathBuf>> = BTreeMap::new();
+
+        for binary in plan.resolved.commands.values() {
+            if !closures.contains_key(&binary.canonical_path) {
+                closures.insert(
+                    binary.canonical_path.clone(),
+                    elf_dependency_closure(&binary.canonical_path)?,
+                );
+            }
+            if let Some(interpreter) = binary.shape.interpreter.as_ref() {
+                let canonical = interpreter.canonicalize().map_err(|source| {
+                    NonoError::PathCanonicalization {
+                        path: interpreter.clone(),
+                        source,
+                    }
+                })?;
+                if !closures.contains_key(&canonical) {
+                    closures.insert(canonical.clone(), elf_dependency_closure(&canonical)?);
+                }
+            }
+        }
+
+        let shim_closure = elf_dependency_closure(shim_source)?;
+        for shim in shims_by_command.values() {
+            closures.insert(shim.path.clone(), shim_closure.clone());
+        }
+
+        Ok(BaselineCache {
+            closures,
+            system_files,
+        })
+    }
+
+    fn compute_system_baseline_files() -> Result<Vec<(PathBuf, AccessMode)>> {
+        let mut files = Vec::new();
         for file in [
             "/etc/ld.so.cache",
             "/etc/ld.so.conf",
@@ -1356,7 +1577,7 @@ mod linux {
         ] {
             let path = Path::new(file);
             if path.exists() && path.is_file() {
-                caps.add_fs(FsCapability::new_file(path, AccessMode::Read)?);
+                files.push((path.to_path_buf(), AccessMode::Read));
             }
         }
         for (file, access) in [
@@ -1366,7 +1587,7 @@ mod linux {
         ] {
             let path = Path::new(file);
             if path.exists() {
-                caps.add_fs(FsCapability::new_file(path, access)?);
+                files.push((path.to_path_buf(), access));
             }
         }
         if Path::new("/etc/ld.so.conf.d").is_dir() {
@@ -1382,11 +1603,11 @@ mod linux {
                 })?;
                 let path = entry.path();
                 if path.is_file() {
-                    caps.add_fs(FsCapability::new_file(path, AccessMode::Read)?);
+                    files.push((path, AccessMode::Read));
                 }
             }
         }
-        Ok(())
+        Ok(files)
     }
 
     fn effective_argv(
@@ -1529,7 +1750,11 @@ mod linux {
         spec: EtiChildLaunchSpec,
         stdio: StdioFds,
     ) -> Result<i32> {
+        let start_total = std::time::Instant::now();
+        let start_write = std::time::Instant::now();
         let spec_path = write_launch_spec(&state.runtime_dir, &spec)?;
+        eti_profile_log!("launch_child:write_spec: {:?}", start_write.elapsed());
+        let start_spawn_wait = std::time::Instant::now();
         let result = match spec.stdio_mode.as_str() {
             "pty" => launch_child_with_pty(state, command_name, &spec_path, stdio),
             "direct_fds" => launch_child_with_direct_fds(state, command_name, &spec_path, stdio),
@@ -1537,7 +1762,12 @@ mod linux {
                 "invalid ETI stdio mode '{other}'"
             ))),
         };
+        eti_profile_log!(
+            "launch_child:spawn_and_wait: {:?}",
+            start_spawn_wait.elapsed()
+        );
         let _ = fs::remove_file(&spec_path);
+        eti_profile_log!("launch_child:total: {:?}", start_total.elapsed());
         result
     }
 
@@ -1547,6 +1777,9 @@ mod linux {
         })?;
         let mut command = Command::new(nono_exe);
         command.env_clear().env(ETI_LAUNCH_SPEC_ENV, spec_path);
+        if let Some(value) = std::env::var_os("ETI_PROFILE_HOTPATH") {
+            command.env("ETI_PROFILE_HOTPATH", value);
+        }
         Ok(command)
     }
 
@@ -2580,6 +2813,7 @@ mod linux {
     }
 
     fn apply_outer_exec_gate(allowed_exec_files: &[PathBuf]) -> Result<()> {
+        let start_total = std::time::Instant::now();
         let abi = nono::detect_abi()?.abi;
         let handled: BitFlags<AccessFs> =
             BitFlags::from_flag(AccessFs::Execute) & AccessFs::from_all(abi);
@@ -2599,6 +2833,7 @@ mod linux {
             .map_err(|err| {
                 NonoError::SandboxInit(format!("failed to create ETI exec gate: {err}"))
             })?;
+        let start_rules = std::time::Instant::now();
         for path in allowed_exec_files {
             let path_fd = PathFd::new(path)?;
             ruleset = ruleset
@@ -2610,9 +2845,20 @@ mod linux {
                     ))
                 })?;
         }
+        eti_profile_log!(
+            "apply_outer_exec_gate:add_rules: {:?} ({} paths)",
+            start_rules.elapsed(),
+            allowed_exec_files.len()
+        );
+        let start_restrict = std::time::Instant::now();
         let status = ruleset
             .restrict_self()
             .map_err(|err| NonoError::SandboxInit(format!("ETI exec gate failed: {err}")))?;
+        eti_profile_log!(
+            "apply_outer_exec_gate:restrict_self: {:?}",
+            start_restrict.elapsed()
+        );
+        eti_profile_log!("apply_outer_exec_gate:total: {:?}", start_total.elapsed());
         if !matches!(
             status.ruleset,
             landlock::RulesetStatus::FullyEnforced | landlock::RulesetStatus::PartiallyEnforced
@@ -2637,25 +2883,19 @@ mod linux {
                 binary.canonical_path.display()
             )));
         }
-        let sha256 = hash_file(&binary.canonical_path)?;
-        if sha256 != binary.sha256 {
+        if metadata.size() != binary.size || mtime_nanos(&metadata) != binary.mtime_nanos {
             return Err(NonoError::SandboxInit(format!(
-                "ETI command binary changed digest before launch: {}",
+                "ETI command binary changed metadata before launch: {}",
                 binary.canonical_path.display()
             )));
         }
         Ok(())
     }
 
-    fn hash_file(path: &Path) -> Result<String> {
-        let bytes = fs::read(path).map_err(|source| NonoError::ConfigRead {
-            path: path.to_path_buf(),
-            source,
-        })?;
-        Ok(Sha256::digest(&bytes)
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect())
+    fn mtime_nanos(metadata: &fs::Metadata) -> i128 {
+        let secs = metadata.mtime() as i128;
+        let nanos = metadata.mtime_nsec() as i128;
+        secs.saturating_mul(1_000_000_000).saturating_add(nanos)
     }
 
     fn file_id(metadata: &fs::Metadata) -> FileId {
@@ -3141,4 +3381,7 @@ mod linux {
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) use linux::{PreparedEtiRuntime, maybe_run_internal_eti_entrypoint};
+pub(crate) use linux::{
+    ETI_PARENT_MONOTONIC_ENV, PreparedEtiRuntime, log_main_total,
+    maybe_run_internal_eti_entrypoint, record_main_start,
+};

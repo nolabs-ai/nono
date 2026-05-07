@@ -451,6 +451,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
             // session directory under `~/.nono/sessions/`. Without this
             // every supervised-mode session leaks a file + directory.
             drop(proxy_handle);
+            crate::eti_runtime::log_main_total();
             std::process::exit(exit_code);
         }
     }

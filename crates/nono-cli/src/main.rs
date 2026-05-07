@@ -100,6 +100,7 @@ fn main() {
     if eti_runtime::maybe_run_internal_eti_entrypoint() {
         return;
     }
+    eti_runtime::record_main_start();
 
     let legacy_network_warnings = collect_legacy_network_warnings();
     normalize_legacy_flag_env_vars();
@@ -115,7 +116,9 @@ fn main() {
     let command_blocking_warnings = collect_cli_warnings(&cli);
     print_deprecation_warnings(&command_blocking_warnings, cli.silent);
 
-    if let Err(e) = run_cli(cli) {
+    let cli_result = run_cli(cli);
+    eti_runtime::log_main_total();
+    if let Err(e) = cli_result {
         if let nono::NonoError::ActionRequired(message) = &e {
             eprintln!("{message}");
             std::process::exit(1);

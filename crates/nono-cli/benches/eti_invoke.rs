@@ -14,7 +14,7 @@
 //!
 //! Skips silently on non-Linux platforms and when Landlock or `/usr/bin/git` is unavailable.
 
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 
 #[cfg(not(target_os = "linux"))]
 fn run(_c: &mut Criterion) {
@@ -67,45 +67,50 @@ fn run(c: &mut Criterion) {
 
 #[cfg(target_os = "linux")]
 fn run_eti_git_version() {
-    let status = Command::new(nono_bin())
-        .args([
+    run_and_assert(
+        "ETI git --version",
+        Command::new(nono_bin()).args([
             "run",
             "--profile",
             "linux-eti-git-ssh",
             "--",
             "git",
             "--version",
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .expect("spawn nono under ETI");
-    assert!(status.success(), "ETI git --version exit: {status}");
+        ]),
+    );
 }
 
 #[cfg(target_os = "linux")]
 fn run_nono_no_eti_git_version() {
-    let status = Command::new(nono_bin())
-        .args(["run", "--profile", "default", "--", "git", "--version"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .expect("spawn nono without ETI");
-    assert!(status.success(), "nono no-ETI git --version exit: {status}");
+    run_and_assert(
+        "nono no-ETI git --version",
+        Command::new(nono_bin()).args(["run", "--profile", "default", "--", "git", "--version"]),
+    );
 }
 
 #[cfg(target_os = "linux")]
 fn run_direct_git_version() {
-    let status = Command::new("/usr/bin/git")
-        .arg("--version")
+    run_and_assert(
+        "direct git --version",
+        Command::new("/usr/bin/git").arg("--version"),
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn run_and_assert(label: &str, cmd: &mut Command) {
+    let output = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .expect("spawn git directly");
-    assert!(status.success(), "direct git --version exit: {status}");
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap_or_else(|err| panic!("{label}: spawn failed: {err}"));
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        panic!(
+            "{label}: exit {}\n--- captured stderr ---\n{}\n--- end stderr ---",
+            output.status, stderr
+        );
+    }
 }
 
 #[cfg(target_os = "linux")]

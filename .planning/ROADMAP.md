@@ -232,7 +232,21 @@ Plans:
 
 **Requirements:** No formal REQ-IDs at scope-lock; phase tracked via CONTEXT.md decisions D-01..D-10 (token shape, investigation gating, TUI/security envelope acceptance, POC ship gating, bookkeeping correction). Decision-coverage gate enforces D-01..D-10 through plans.
 
-**Plans:** TBD (locked at `/gsd-plan-phase 30`).
+**Plans:** 5 plans (Wave 1 prelude/edit/smoke/outcome + Wave 2 conditional ProcMon)
+
+Plans:
+**Wave 1**
+- [ ] 30-01-PLAN.md — Bookkeeping prelude: SHELL-01 → needs-rework, debug-session frontmatter cross-link, STATE.md stopped_at update (D-10 first half + D-08/D-09 out-of-scope encoding)
+- [ ] 30-02-PLAN.md — Token cascade 6th arm: WindowsTokenArm enum + select_windows_token_arm helper + pty_token_gate_tests (6 tests) + low_integrity_primary_token_sets_low_il (Windows-only FFI test, first runtime exercise of create_low_integrity_primary_token) (D-01 + D-02 + D-03)
+
+**Wave 2** *(blocked on Wave 1 completion)*
+- [ ] 30-03-PLAN.md — Field-smoke harness: scripts/test-windows-shell-write-deny.ps1 + scripts/test-windows-shell-tui.ps1 + 30-FIELD-SMOKE.md runbook (D-05 + D-06 + D-09 hygiene; manual-only, runs on Windows test box)
+
+**Wave 3** *(blocked on Wave 2 completion)*
+- [ ] 30-04-PLAN.md — Field-smoke execution + outcome flip (3 human checkpoints): runs Plan 30-03 harnesses; on success-path adds cookbook security-envelope paragraph + flips SHELL-01 → ✔ validated v2.X Phase 30 + moves debug session to resolved/; on Wave 2 trigger leaves cookbook unchanged + flags Plan 30-05 (D-05 + D-06 + D-07 + D-10 second half)
+
+**Wave 4** *(blocked on Wave 3 completion)*
+- [ ] 30-05-PLAN.md — Wave 2 ProcMon (CONDITIONAL — runs only on Wave 2 trigger from Plan 30-04): trace capture + analysis + sixth-option synthesis OR exhaust-without-fix; 3-5 working day timebox per D-04. Failure path triggers RESEARCH §Cookbook Rollback Path Option Rev-B (D-04 + D-07 failure path + D-10 terminal)
 
 **Success Criteria:**
 

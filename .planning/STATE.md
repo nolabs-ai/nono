@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v2.3
 milestone_name: Linux POC Unblock + Deferreds Closure
 status: executing
-stopped_at: Phase 27.2 context gathered
-last_updated: "2026-05-07T19:30:00.000Z"
+stopped_at: "Phase 30 (Windows nono shell Interactive Enforcement Architecture) context gathered. The `nono shell` 0xC0000142 field-failure became a planning checkpoint via `/gsd-discuss-phase`; CONTEXT.md captures the locked decisions: Wave 1 is Option 3 (Low-IL primary token + ConPTY), Wave 2 is ProcMon investigation conditional on Wave 1 failure. TUI rendering and OS-level write-deny are both locked acceptance criteria; Phase 15's detached-path waiver is explicitly rejected for the long-lived interactive shell. Phase 30 is NOT yet in ROADMAP.md — user decides v2.3 vs v2.4 placement via `/gsd-phase add 30`."
+last_updated: "2026-05-07T22:53:55.700Z"
 last_activity: 2026-05-07
 progress:
-  total_phases: 7
+  total_phases: 8
   completed_phases: 4
-  total_plans: 14
+  total_plans: 19
   completed_plans: 8
-  percent: 57
+  percent: 42
 ---
 
 # Project State: nono — v2.3 Linux POC Unblock + Deferreds Closure
@@ -48,7 +48,7 @@ Next actions:
   - After Phase 23 closes, `/gsd-complete-milestone v2.2` to archive the milestone.
   - Pre-merge `windows-squash` → `main` quick task remains a candidate for milestone-close timing.
 
-Last activity: 2026-05-06 -- Phase 27.2 planning complete
+Last activity: 2026-05-07 -- Phase 30 planning complete
 
 Prior activity: 2026-04-28 — Phase 22 closed end-to-end (UAT 10/10 + 1 spec-error skipped, commit e60ab093). Quick task 260428-rsu created as deferred runbook for upstream-stack rebase (awaiting trigger).
 
@@ -205,6 +205,7 @@ Known deferred items at close: 20 (6 UAT bookkeeping gaps, 4 verification human_
 **Separate concern surfaced (not blocking the architectural decision):** Claude Code PreToolUse hook did not fire when Claude (inside an Option-A sandboxed shell) read a path outside the grant set. `nono setup --check-only` doesn't surface hook installation status. Worth a separate debug session before declaring the Windows POC end-to-end working. Reference: `crates/nono-cli/src/hooks.rs`, `crates/nono-cli/data/hooks/nono-hook.sh`.
 
 **Stale handoffs to clean up next session:**
+
 - `.planning/HANDOFF.json` — written this morning when only the WiX/TUI/UoW quick tasks were pending. Field-validation step was completed; `apply_unlink_overrides` fix (`48a2abcb`) is verified live on the rebuild path. The handoff's "MSI build" next-step is invalidated by this debug session's findings (do NOT build POC MSI until the `nono shell` architectural decision is resolved).
 - `.planning/phases/03-promote-windows-to-first-class-release-target/.continue-here.md` — v1.0 era artifact (2026-04-01); v1.0 already shipped. Safe to delete.
 - `.planning/phases/27.2-audit-attestation-test-re-enablement/.continue-here.md` — paused-before-execution; routed to gsd-pi when ready. Independent of this debug session.

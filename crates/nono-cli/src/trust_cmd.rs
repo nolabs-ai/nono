@@ -836,8 +836,7 @@ fn run_verify(args: TrustVerifyArgs) -> Result<()> {
                     // defense-in-depth so that the canonicalize-then-insert
                     // step cannot be reached with a traversal name even if
                     // the inner guard is somehow bypassed in the future.
-                    if let Ok(subject_path) =
-                        crate::trust_scan::safe_subject_path(scan_root, name)
+                    if let Ok(subject_path) = crate::trust_scan::safe_subject_path(scan_root, name)
                     {
                         if let Ok(canon) = std::fs::canonicalize(&subject_path) {
                             multi_verified_paths.insert(canon);

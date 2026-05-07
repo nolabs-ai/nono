@@ -934,9 +934,7 @@ fn verify_multi_subject_bundle(
                 results.push(VerificationResult {
                     path: scan_root.to_path_buf(),
                     digest: String::new(),
-                    outcome: VerificationOutcome::InvalidSignature {
-                        detail: reason,
-                    },
+                    outcome: VerificationOutcome::InvalidSignature { detail: reason },
                 });
                 continue;
             }
@@ -1714,10 +1712,7 @@ mod tests {
     fn safe_subject_path_rejects_relative_dotdot_traversal() {
         let root = std::path::Path::new("/tmp/scan");
         let err = safe_subject_path(root, "../../../etc/shadow").unwrap_err();
-        assert!(
-            err.contains(".."),
-            "error should mention '..': {err}"
-        );
+        assert!(err.contains(".."), "error should mention '..': {err}");
     }
 
     #[test]
@@ -1725,20 +1720,14 @@ mod tests {
         let root = std::path::Path::new("/tmp/scan");
         // Embedded traversal: starts inside root then climbs out.
         let err = safe_subject_path(root, "subdir/../../etc/passwd").unwrap_err();
-        assert!(
-            err.contains(".."),
-            "error should mention '..': {err}"
-        );
+        assert!(err.contains(".."), "error should mention '..': {err}");
     }
 
     #[test]
     fn safe_subject_path_rejects_trailing_dotdot() {
         let root = std::path::Path::new("/tmp/scan");
         let err = safe_subject_path(root, "subdir/..").unwrap_err();
-        assert!(
-            err.contains(".."),
-            "error should mention '..': {err}"
-        );
+        assert!(err.contains(".."), "error should mention '..': {err}");
     }
 
     /// Regression test: a bundle with a path-traversal subject name must be
@@ -1785,7 +1774,11 @@ mod tests {
         };
 
         let results = verify_multi_subject_bundle(&bundle_path, &scan_root, &policy);
-        assert_eq!(results.len(), 1, "expected one result for the traversal subject");
+        assert_eq!(
+            results.len(),
+            1,
+            "expected one result for the traversal subject"
+        );
         let outcome = &results[0].outcome;
         // Must be rejected as InvalidSignature (traversal is a policy violation).
         assert!(
@@ -1793,6 +1786,9 @@ mod tests {
             "traversal subject must yield InvalidSignature, got: {outcome:?}"
         );
         // Must NOT be Verified.
-        assert!(!outcome.is_verified(), "traversal must not pass as verified");
+        assert!(
+            !outcome.is_verified(),
+            "traversal must not pass as verified"
+        );
     }
 }

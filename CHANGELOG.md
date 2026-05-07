@@ -1,5 +1,32 @@
 # Changelog
 
+## [0.48.0] - 2026-05-07
+
+### Bug Fixes
+
+- *(cli)* Prevent truncate_chars panic and spurious truncation
+
+- Demote --allow-launch-services log from warn to debug
+
+- *(profile)* Skip self-references in sibling extends resolution
+
+
+### Features
+
+- *(cli)* Add shell completion generation via `nono completion <shell>`
+
+
+### Miscellaneous
+
+- Harden CI workflows and fix stale metadata
+
+- Reduce nono run output verbosity
+
+
+### Refactoring
+
+- *(string-truncation)* Extract generic string truncation utility
+
 ## [0.47.1] - 2026-05-06
 
 ### Dependencies

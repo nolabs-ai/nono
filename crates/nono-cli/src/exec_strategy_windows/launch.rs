@@ -1099,7 +1099,11 @@ pub(super) fn create_low_integrity_primary_token() -> Result<OwnedHandle> {
             current_token.raw(),
             TOKEN_ASSIGN_PRIMARY | TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ADJUST_DEFAULT,
             std::ptr::null(),
-            SecurityImpersonation as SECURITY_IMPERSONATION_LEVEL,
+            // Per Win32 docs (DuplicateTokenEx remarks): ImpersonationLevel is
+            // ignored when TokenType is TokenPrimary. SecurityAnonymous (0) is the
+            // idiomatic choice — empirically equivalent here, and the conventional
+            // marker for "primary token, not for impersonation use" (CR-01 hygiene).
+            SecurityAnonymous as SECURITY_IMPERSONATION_LEVEL,
             TokenPrimary,
             &mut primary_token,
         )

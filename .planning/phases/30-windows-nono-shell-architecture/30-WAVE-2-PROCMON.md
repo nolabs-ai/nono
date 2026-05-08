@@ -166,6 +166,48 @@ Result is REPARSE              Exclude   (drops registry-symlink redirect noise)
 
 The original recipe (broad Path-contains rules + 4-process Process-Name list) over-captured WMI service activity (`svchost.exe` + `WmiPrvSE.exe` background work). PID-based filtering on the specific child process (35976 in this trace) is sharper.
 
+## Critical caveat for Phase 31 inheritance — `Out-File` false-PASS on Acceptance #3
+
+The harness `scripts/test-windows-shell-write-deny.ps1:130-137` injects:
+
+```powershell
+$injected = @"
+try {
+  Out-File '$targetFile' 'phase 30 write-deny test' -ErrorAction Stop
+} catch {
+  Write-Host "[harness] Out-File threw: `$_"
+}
+if (Test-Path '$targetFile') { exit 1 } else { exit 42 }
+"@
+```
+
+The `Out-File '<path>' '<content>'` syntax is **invalid PowerShell** — `Out-File` does not accept content as a positional parameter. PowerShell binds the second positional to `-Encoding`, which `ValidateSet` rejects (the same `Out-File : Cannot validate argument on parameter 'Encoding'` error surfaced when manually testing the CLI gap).
+
+**Consequence: Acceptance #3 always exits 42 (PASS) regardless of whether the write would actually be blocked by mandatory-label enforcement.** The injected script flow is:
+
+1. `Out-File` throws `ParameterBindingValidationException` immediately
+2. `catch` block writes a harness message and falls through (no exit)
+3. The file was never created (because of the parameter error, NOT because of OS-level write-deny)
+4. `Test-Path` returns False
+5. `exit 42` fires — the PASS sentinel
+
+**The test never measures what it claims to measure.** Even if the cascade arm produced a Medium-IL child that COULD write to ~/Desktop, the harness would still report PASS. This was masked in Plan 30-04 because Acceptance #1 silent-launch failure short-circuited the harness before the `Out-File` even fired (the harness flow exited at INDETERMINATE due to the unrelated `nono shell -- -NoLogo` CLI mismatch).
+
+**Phase 31 must rewrite this assertion** before any Wave-2 ProcMon work can claim a write-deny verdict. Recommended replacement (PowerShell-correct):
+
+```powershell
+$injected = @"
+try {
+  Set-Content -Path '$targetFile' -Value 'phase 30 write-deny test' -ErrorAction Stop
+} catch {
+  Write-Host "[harness] Set-Content threw: `$_"
+}
+if (Test-Path '$targetFile') { exit 1 } else { exit 42 }
+"@
+```
+
+`Set-Content -Path -Value` is the canonical positional-parameter shape; `-ErrorAction Stop` ensures the write attempt becomes a terminating error if denied, taking the catch path; `Test-Path` then accurately reflects whether the OS allowed the write.
+
 ## RESEARCH cross-references
 
 - Filter recipe: 30-RESEARCH.md § "Filter recipe for ConPTY + restricted-token failures" (lines 232-243; iterated above to PID-scoped form)

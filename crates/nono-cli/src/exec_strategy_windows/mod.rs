@@ -68,9 +68,9 @@ use std::time::Duration;
 use std::time::SystemTime;
 use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE};
 use windows_sys::Win32::Security::{
-    CreateWellKnownSid, DuplicateTokenEx, GetTokenInformation, SecurityImpersonation,
-    SetTokenInformation, TokenElevation, TokenIntegrityLevel, TokenPrimary, WinLowLabelSid,
-    SECURITY_IMPERSONATION_LEVEL, SECURITY_MAX_SID_SIZE, TOKEN_ADJUST_DEFAULT,
+    CreateWellKnownSid, DuplicateTokenEx, GetTokenInformation, SecurityAnonymous,
+    SecurityImpersonation, SetTokenInformation, TokenElevation, TokenIntegrityLevel, TokenPrimary,
+    WinLowLabelSid, SECURITY_IMPERSONATION_LEVEL, SECURITY_MAX_SID_SIZE, TOKEN_ADJUST_DEFAULT,
     TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_ELEVATION, TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
 };
 use windows_sys::Win32::System::JobObjects::{

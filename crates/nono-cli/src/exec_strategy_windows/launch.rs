@@ -11,23 +11,12 @@ use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Threading::STARTF_USESTDHANDLES;
 
-impl OwnedHandle {
-    fn raw(&self) -> HANDLE {
-        self.0
-    }
-}
-
-impl Drop for OwnedHandle {
-    fn drop(&mut self) {
-        if !self.0.is_null() {
-            unsafe {
-                // SAFETY: This handle is owned by the wrapper and is closed
-                // exactly once on drop.
-                CloseHandle(self.0);
-            }
-        }
-    }
-}
+// Phase 31 D-06: `OwnedHandle` and its `raw()` / `Drop` impls were lifted into
+// the `nono` crate (`nono::OwnedHandle`); both `nono-cli` and
+// `nono-shell-broker` consume the same RAII wrapper. The local impls were
+// removed (orphan-rule incompatible after the lift); see the
+// `pub(crate) use nono::OwnedHandle;` re-export in
+// `crates/nono-cli/src/exec_strategy_windows/mod.rs`.
 
 impl Drop for ProcessContainment {
     fn drop(&mut self) {
@@ -1072,99 +1061,10 @@ pub(super) fn select_windows_token_arm(
     }
 }
 
-pub(super) fn create_low_integrity_primary_token() -> Result<OwnedHandle> {
-    let mut current_token = std::ptr::null_mut();
-    let opened = unsafe {
-        // SAFETY: We pass a valid mutable out-pointer and request access on the
-        // current process token only.
-        OpenProcessToken(
-            GetCurrentProcess(),
-            TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ASSIGN_PRIMARY | TOKEN_ADJUST_DEFAULT,
-            &mut current_token,
-        )
-    };
-    if opened == 0 {
-        return Err(NonoError::SandboxInit(format!(
-            "Failed to open Windows process token for low-integrity launch (GetLastError={})",
-            unsafe { GetLastError() }
-        )));
-    }
-    let current_token = OwnedHandle(current_token);
-
-    let mut primary_token = std::ptr::null_mut();
-    let duplicated = unsafe {
-        // SAFETY: We duplicate the current process token into a primary token
-        // for child process creation.
-        DuplicateTokenEx(
-            current_token.raw(),
-            TOKEN_ASSIGN_PRIMARY | TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ADJUST_DEFAULT,
-            std::ptr::null(),
-            // Per Win32 docs (DuplicateTokenEx remarks): ImpersonationLevel is
-            // ignored when TokenType is TokenPrimary. SecurityAnonymous (0) is the
-            // idiomatic choice — empirically equivalent here, and the conventional
-            // marker for "primary token, not for impersonation use" (CR-01 hygiene).
-            SecurityAnonymous as SECURITY_IMPERSONATION_LEVEL,
-            TokenPrimary,
-            &mut primary_token,
-        )
-    };
-    if duplicated == 0 {
-        return Err(NonoError::SandboxInit(format!(
-            "Failed to duplicate Windows process token for low-integrity launch (GetLastError={})",
-            unsafe { GetLastError() }
-        )));
-    }
-    let primary_token = OwnedHandle(primary_token);
-
-    let mut sid_buffer = [0u8; SECURITY_MAX_SID_SIZE as usize];
-    let mut sid_size = sid_buffer.len() as u32;
-    let created = unsafe {
-        // SAFETY: The destination buffer is valid and sized per
-        // SECURITY_MAX_SID_SIZE for a well-known SID.
-        CreateWellKnownSid(
-            WinLowLabelSid,
-            std::ptr::null_mut(),
-            sid_buffer.as_mut_ptr() as *mut _,
-            &mut sid_size,
-        )
-    };
-    if created == 0 {
-        return Err(NonoError::SandboxInit(format!(
-            "Failed to create Windows low-integrity SID (GetLastError={})",
-            unsafe { GetLastError() }
-        )));
-    }
-
-    let label_size = size_of::<TOKEN_MANDATORY_LABEL>() + sid_size as usize;
-    let mut label_buffer = vec![0u8; label_size];
-    let label_ptr = label_buffer.as_mut_ptr() as *mut TOKEN_MANDATORY_LABEL;
-    let sid_ptr = unsafe {
-        label_buffer
-            .as_mut_ptr()
-            .add(size_of::<TOKEN_MANDATORY_LABEL>()) as *mut _
-    };
-    unsafe {
-        std::ptr::copy_nonoverlapping(sid_buffer.as_ptr(), sid_ptr as *mut u8, sid_size as usize);
-        (*label_ptr).Label.Sid = sid_ptr;
-        (*label_ptr).Label.Attributes = SE_GROUP_INTEGRITY as u32;
-    }
-    let adjusted = unsafe {
-        SetTokenInformation(
-            primary_token.raw(),
-            TokenIntegrityLevel,
-            label_ptr as *mut _,
-            label_size as u32,
-        )
-    };
-    if adjusted == 0 {
-        return Err(NonoError::SandboxInit(format!(
-            "Failed to lower Windows child token integrity level (GetLastError={})",
-            unsafe { GetLastError() }
-        )));
-    }
-
-    Ok(primary_token)
-}
+// Phase 31 D-06: `create_low_integrity_primary_token` was lifted into the `nono`
+// crate as `nono::create_low_integrity_primary_token` so that both `nono-cli`
+// and `nono-shell-broker` consume the same source-of-truth implementation.
+// The local definition was removed; callsites here use the re-exported symbol.
 
 pub(super) fn spawn_windows_child(
     config: &ExecConfig<'_>,
@@ -1184,7 +1084,7 @@ pub(super) fn spawn_windows_child(
     // dropped (closing the handle) before it was passed to the Win32 API,
     // yielding ERROR_INVALID_HANDLE (6).
     let _restricted_holder: Option<restricted_token::RestrictedToken>;
-    let _low_integrity_holder: Option<OwnedHandle>;
+    let _low_integrity_holder: Option<nono::OwnedHandle>;
     // On the Windows detached launch path, the WRITE_RESTRICTED + session-SID
     // token combines with DETACHED_PROCESS + no-PTY to trigger STATUS_DLL_INIT_FAILED
     // (0xC0000142) in console-application grandchildren. The only configuration that
@@ -1230,7 +1130,8 @@ pub(super) fn spawn_windows_child(
             raw
         }
         WindowsTokenArm::LowIlPrimary => {
-            let holder = create_low_integrity_primary_token()?;
+            // Phase 31 D-06: function moved to nono::create_low_integrity_primary_token
+            let holder = nono::create_low_integrity_primary_token()?;
             let raw = holder.0;
             _low_integrity_holder = Some(holder);
             _restricted_holder = None;
@@ -1604,7 +1505,10 @@ mod pty_token_gate_tests {
 
 #[cfg(all(test, target_os = "windows"))]
 mod low_integrity_primary_token_tests {
-    use super::create_low_integrity_primary_token;
+    // Phase 31 D-06: function lifted to the `nono` crate; the test exercises
+    // the re-exported symbol so the LowIlPrimary arm's behavior is still pinned
+    // here for nono-cli regression coverage.
+    use nono::create_low_integrity_primary_token;
     use windows_sys::Win32::Security::{
         GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, TokenIntegrityLevel,
         TOKEN_MANDATORY_LABEL,

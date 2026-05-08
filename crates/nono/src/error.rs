@@ -42,6 +42,15 @@ pub enum NonoError {
     #[error("Command '{command}' is blocked: {reason}")]
     BlockedCommand { command: String, reason: String },
 
+    /// Broker binary (`nono-shell-broker.exe`) not found as sibling of the
+    /// running `nono.exe`. Resolved via `std::env::current_exe()` parent +
+    /// platform-specific filename (Phase 31 D-07).
+    ///
+    /// No env-var override surface (D-07): env-poisoning would let an attacker
+    /// redirect the broker to a malicious binary.
+    #[error("Broker binary not found: {path:?}")]
+    BrokerNotFound { path: PathBuf },
+
     // Landlock errors (Linux only)
     #[cfg(target_os = "linux")]
     #[error("Landlock error: {0}")]
@@ -250,5 +259,36 @@ mod tests {
         }
         let err = producer().expect_err("must error");
         assert!(matches!(err, NonoError::LabelApplyFailed { .. }));
+    }
+}
+
+#[cfg(test)]
+mod broker_not_found_tests {
+    use super::NonoError;
+    use std::path::PathBuf;
+
+    /// Phase 31 D-07: BrokerNotFound display surfaces the resolved path so
+    /// operators can see exactly which sibling lookup failed.
+    #[test]
+    fn broker_not_found_displays_path() {
+        let err = NonoError::BrokerNotFound {
+            path: PathBuf::from("/tmp/missing-broker.exe"),
+        };
+        let s = err.to_string();
+        assert!(
+            s.contains("missing-broker.exe"),
+            "BrokerNotFound display should include the path; got: {s}"
+        );
+    }
+
+    /// Phase 31 D-07: BrokerNotFound carries Debug derivation through
+    /// `#[derive(Error, Debug)]` on NonoError. Smoke check that
+    /// formatting the error via `{err:?}` does not panic.
+    #[test]
+    fn broker_not_found_is_debug() {
+        let err = NonoError::BrokerNotFound {
+            path: PathBuf::from("foo.exe"),
+        };
+        let _ = format!("{err:?}");
     }
 }

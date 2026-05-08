@@ -3,7 +3,7 @@ gsd_state_version: 1.0
 milestone: v2.3
 milestone_name: Linux POC Unblock + Deferreds Closure
 status: executing
-last_updated: "2026-05-08T23:22:02.141Z"
+last_updated: "2026-05-08T23:28:37.224Z"
 last_activity: 2026-05-08
 progress:
   total_phases: 8
@@ -21,13 +21,13 @@ See: .planning/PROJECT.md (updated 2026-04-29 at v2.3 milestone scope-lock)
 
 **Core Value:** Every nono command that works on Linux/macOS should work on Windows with equivalent security guarantees, or be explicitly documented as intentionally unsupported with a clear rationale.
 
-**Current Focus:** Phase 30 — windows-nono-shell-architecture
+**Current Focus:** Phase 31 — broker-process-architecture-shell-01
 
 ## Current Position
 
-Phase: 30
-Plan: Not started
-Status: Ready to execute
+Phase: 31 (broker-process-architecture-shell-01) — EXECUTING
+Plan: 1 of 6
+Status: Executing Phase 31
 Milestone: v2.2 — 3/3 phases complete (Phase 22 ✓ 2026-04-28, Phase 23 ✓ 2026-04-29, Phase 24 ✓ 2026-04-27), 9/9 plans complete. v2.2 ready to ship.
 
   - v1.0 Windows Alpha — shipped 2026-03-31 (tag `v1.0`).
@@ -47,7 +47,7 @@ Next actions:
   - After Phase 23 closes, `/gsd-complete-milestone v2.2` to archive the milestone.
   - Pre-merge `windows-squash` → `main` quick task remains a candidate for milestone-close timing.
 
-Last activity: 2026-05-08 -- Phase 31 planning complete
+Last activity: 2026-05-08 -- Phase 31 execution started
 
 Prior activity: 2026-04-28 — Phase 22 closed end-to-end (UAT 10/10 + 1 spec-error skipped, commit e60ab093). Quick task 260428-rsu created as deferred runbook for upstream-stack rebase (awaiting trigger).
 

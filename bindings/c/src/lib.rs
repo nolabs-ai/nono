@@ -125,6 +125,13 @@ pub(crate) fn map_error(e: &nono::NonoError) -> types::NonoErrorCode {
         nono::NonoError::NetworkFilterUnsupported { .. } => NonoErrorCode::ErrUnsupportedPlatform,
         nono::NonoError::PartialRestore { .. } => NonoErrorCode::ErrIo,
         nono::NonoError::LabelApplyFailed { .. } => NonoErrorCode::ErrSandboxInit,
+        // Phase 31 D-07: BrokerNotFound is a path-resolution failure (the
+        // broker.exe sibling lookup against std::env::current_exe() parent
+        // returned a path that does not exist on disk). Map to
+        // ErrPathNotFound for FFI consumers — same semantic class as
+        // PathNotFound, just specifically named for the broker discovery
+        // call site.
+        nono::NonoError::BrokerNotFound { .. } => NonoErrorCode::ErrPathNotFound,
     }
 }
 

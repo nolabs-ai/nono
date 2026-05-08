@@ -294,7 +294,7 @@ Plans:
 | 27.1. NONO_TEST_HOME Seam (INSERTED) | v2.3 | 3/3 | Complete    | 2026-05-05 |
 | 28. Authenticode Chain-Walker Subject Extraction | v2.3 | 1/1 | Complete (REQ-AUDC-01..03 closed; D-AUDC-02 SandboxInit fallback + D-AUDC-03 explorer.exe fixture switch) | 2026-04-30 |
 | 29. WR-01 Reject-Stage Unification | v2.3 | 1/1 | Complete (REQ-WRU-01..02 closed; Option c locked as permanent design property) | 2026-04-30 |
-| 30. Windows nono shell Interactive Enforcement Architecture | v2.3 | 5/5 | Complete   | 2026-05-08 |
+| 30. Windows nono shell Interactive Enforcement Architecture | v2.3 | 5/5 | Complete    | 2026-05-08 |
 
 ## Backlog (v2.4 carry-forward)
 

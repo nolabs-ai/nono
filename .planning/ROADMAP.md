@@ -232,12 +232,12 @@ Plans:
 
 **Requirements:** No formal REQ-IDs at scope-lock; phase tracked via CONTEXT.md decisions D-01..D-10 (token shape, investigation gating, TUI/security envelope acceptance, POC ship gating, bookkeeping correction). Decision-coverage gate enforces D-01..D-10 through plans.
 
-**Plans:** 5 plans (Wave 1 prelude/edit/smoke/outcome + Wave 2 conditional ProcMon)
+**Plans:** 2/5 plans executed
 
 Plans:
 **Wave 1**
-- [ ] 30-01-PLAN.md — Bookkeeping prelude: SHELL-01 → needs-rework, debug-session frontmatter cross-link, STATE.md stopped_at update (D-10 first half + D-08/D-09 out-of-scope encoding)
-- [ ] 30-02-PLAN.md — Token cascade 6th arm: WindowsTokenArm enum + select_windows_token_arm helper + pty_token_gate_tests (6 tests) + low_integrity_primary_token_sets_low_il (Windows-only FFI test, first runtime exercise of create_low_integrity_primary_token) (D-01 + D-02 + D-03)
+- [x] 30-01-PLAN.md — Bookkeeping prelude: SHELL-01 → needs-rework, debug-session frontmatter cross-link, STATE.md stopped_at update (D-10 first half + D-08/D-09 out-of-scope encoding)
+- [x] 30-02-PLAN.md — Token cascade 6th arm: WindowsTokenArm enum + select_windows_token_arm helper + pty_token_gate_tests (6 tests) + low_integrity_primary_token_sets_low_il (Windows-only FFI test, first runtime exercise of create_low_integrity_primary_token) (D-01 + D-02 + D-03)
 
 **Wave 2** *(blocked on Wave 1 completion)*
 - [ ] 30-03-PLAN.md — Field-smoke harness: scripts/test-windows-shell-write-deny.ps1 + scripts/test-windows-shell-tui.ps1 + 30-FIELD-SMOKE.md runbook (D-05 + D-06 + D-09 hygiene; manual-only, runs on Windows test box)
@@ -294,7 +294,7 @@ Plans:
 | 27.1. NONO_TEST_HOME Seam (INSERTED) | v2.3 | 3/3 | Complete    | 2026-05-05 |
 | 28. Authenticode Chain-Walker Subject Extraction | v2.3 | 1/1 | Complete (REQ-AUDC-01..03 closed; D-AUDC-02 SandboxInit fallback + D-AUDC-03 explorer.exe fixture switch) | 2026-04-30 |
 | 29. WR-01 Reject-Stage Unification | v2.3 | 1/1 | Complete (REQ-WRU-01..02 closed; Option c locked as permanent design property) | 2026-04-30 |
-| 30. Windows nono shell Interactive Enforcement Architecture | v2.3 | 0/0 | Planning (CONTEXT locked 2026-05-07; D-01 Wave 1 = Low-IL primary token + ConPTY, Wave 2 ProcMon conditional) | — |
+| 30. Windows nono shell Interactive Enforcement Architecture | v2.3 | 2/5 | In Progress|  |
 
 ## Backlog (v2.4 carry-forward)
 

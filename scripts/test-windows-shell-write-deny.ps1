@@ -118,7 +118,7 @@ if (-not $SkipLeakedLabelClear) {
 }
 
 # ---- Step 3: Acceptance #3 -- write to path OUTSIDE grant set ---------------
-Write-Log "==> Step 3: Acceptance #3 -- Out-File to ~/Desktop/nono-acceptance3.txt should fail"
+Write-Log "==> Step 3: Acceptance #3 -- Set-Content to ~/Desktop/nono-acceptance3.txt should fail (broker shell, mandatory-label NO_WRITE_UP)"
 
 $targetFile = Join-Path $env:USERPROFILE "Desktop\nono-acceptance3.txt"
 # Pre-clean any leftover file from a prior run.
@@ -127,11 +127,25 @@ if (Test-Path $targetFile) { Remove-Item $targetFile -Force -ErrorAction Silentl
 # One-shot script injected into the sandboxed PowerShell. Sentinel exit codes:
 #   42 = PASS (write blocked -> file does NOT exist)
 #    1 = FAIL (write succeeded -> file exists)
+#
+# Phase 31 Wave-0 fix (RESEARCH Open Q3 / 30-WAVE-2-PROCMON.md):
+# The previous invocation passed positional [path] [content] to the
+# Out-File cmdlet, which is NOT valid PowerShell — Out-File takes
+# -FilePath (and accepts pipeline input), not positional path+content.
+# Without -FilePath, PowerShell parses the second positional as the
+# encoding parameter; the parse error always throws, catch always runs,
+# the file is never created, and exit 42 (PASS) ALWAYS fires — masking
+# whether the write was OS-denied or never attempted.
+#
+# Set-Content -Path -Value with -ErrorAction Stop raises an OS-level
+# UnauthorizedAccessException through the catch when MIC NO_WRITE_UP
+# enforces (PASS path: file absent, exit 42). If MIC is broken,
+# Set-Content succeeds, the file exists, exit 1 (FAIL) fires.
 $injected = @"
 try {
-  Out-File '$targetFile' 'phase 30 write-deny test' -ErrorAction Stop
+  Set-Content -Path '$targetFile' -Value 'phase 31 write-deny test' -ErrorAction Stop
 } catch {
-  Write-Host "[harness] Out-File threw: `$_"
+  Write-Host "[harness] Set-Content threw: `$_"
 }
 if (Test-Path '$targetFile') { exit 1 } else { exit 42 }
 "@

@@ -104,55 +104,44 @@ pub fn run_ps(args: &PsArgs) -> Result<()> {
         .collect();
 
     // Compute each column width as max(header, data), capped for variable-length fields.
-    let session_w = rows
-        .iter()
-        .map(|r| r.session_id.len())
-        .max()
-        .unwrap_or(0)
-        .max("SESSION".len());
-    let name_w = rows
-        .iter()
-        .map(|r| r.name.len())
-        .max()
-        .unwrap_or(0)
-        .max("NAME".len())
-        .min(24);
-    let status_w = rows
-        .iter()
-        .map(|r| r.status_text.len())
-        .max()
-        .unwrap_or(0)
-        .max("STATUS".len());
-    let attach_w = rows
-        .iter()
-        .map(|r| r.attach_text.len())
-        .max()
-        .unwrap_or(0)
-        .max("ATTACH".len());
-    let pid_w = rows
-        .iter()
-        .map(|r| r.pid.len())
-        .max()
-        .unwrap_or(0)
-        .max("PID".len());
-    let uptime_w = rows
-        .iter()
-        .map(|r| r.uptime.len())
-        .max()
-        .unwrap_or(0)
-        .max("UPTIME".len());
-    let profile_w = rows
-        .iter()
-        .map(|r| r.profile.len())
-        .max()
-        .unwrap_or(0)
-        .max("PROFILE".len())
-        .min(16);
+    let mut session_w = "SESSION".len();
+    let mut name_w = "NAME".len();
+    let mut status_w = "STATUS".len();
+    let mut attach_w = "ATTACH".len();
+    let mut pid_w = "PID".len();
+    let mut uptime_w = "UPTIME".len();
+    let mut profile_w = "PROFILE".len();
+
+    for row in &rows {
+        session_w = session_w.max(row.session_id.len());
+        name_w = name_w.max(row.name.len());
+        status_w = status_w.max(row.status_text.len());
+        attach_w = attach_w.max(row.attach_text.len());
+        pid_w = pid_w.max(row.pid.len());
+        uptime_w = uptime_w.max(row.uptime.len());
+        profile_w = profile_w.max(row.profile.len());
+    }
+
+    name_w = name_w.min(24);
+    profile_w = profile_w.min(16);
 
     // Reserve space for the COMMAND column based on terminal width.
     let term_cols = terminal_columns().unwrap_or(120);
     // 7 separating spaces + "COMMAND" header (minimum 7 visible chars)
-    let fixed_w = session_w + 1 + name_w + 1 + status_w + 1 + attach_w + 1 + pid_w + 1 + uptime_w + 1 + profile_w + 1;
+    let fixed_w = session_w
+        + 1
+        + name_w
+        + 1
+        + status_w
+        + 1
+        + attach_w
+        + 1
+        + pid_w
+        + 1
+        + uptime_w
+        + 1
+        + profile_w
+        + 1;
     let cmd_w = term_cols.saturating_sub(fixed_w).max(7);
 
     // Header

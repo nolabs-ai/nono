@@ -68,10 +68,10 @@ use std::time::Duration;
 use std::time::SystemTime;
 use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE};
 use windows_sys::Win32::Security::{
-    CreateWellKnownSid, DuplicateTokenEx, GetTokenInformation, SecurityAnonymous,
-    SecurityImpersonation, SetTokenInformation, TokenElevation, TokenIntegrityLevel, TokenPrimary,
-    WinLowLabelSid, SECURITY_IMPERSONATION_LEVEL, SECURITY_MAX_SID_SIZE, TOKEN_ADJUST_DEFAULT,
-    TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_ELEVATION, TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
+    CreateWellKnownSid, DuplicateTokenEx, GetTokenInformation, SecurityImpersonation,
+    SetTokenInformation, TokenElevation, TokenIntegrityLevel, TokenPrimary, WinLowLabelSid,
+    SECURITY_MAX_SID_SIZE, TOKEN_ADJUST_DEFAULT, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE,
+    TOKEN_ELEVATION, TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
 };
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectCpuRateControlInformation,
@@ -451,8 +451,11 @@ struct ProcessContainment {
     job: HANDLE,
 }
 
-#[derive(Debug)]
-struct OwnedHandle(HANDLE);
+// Phase 31 D-06: `OwnedHandle` lifted into the `nono` crate. Re-exported here
+// so existing nono-cli callsites (this module, `launch.rs`, `restricted_token.rs`,
+// `supervisor.rs`) continue to compile unchanged via `OwnedHandle(token)` /
+// `_token_guard.0` field access. The lifted struct is `pub struct OwnedHandle(pub HANDLE)`.
+pub(crate) use nono::OwnedHandle;
 
 mod labels_guard;
 mod launch;

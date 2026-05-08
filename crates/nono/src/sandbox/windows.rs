@@ -15,22 +15,28 @@ use crate::sandbox::{
     WindowsPreviewEntryPoint, WindowsSupervisorContext, WindowsSupervisorFeatureKind,
     WindowsSupervisorSupport,
 };
+use std::mem::size_of;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
-use windows_sys::Win32::Foundation::LocalFree;
+use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, LocalFree, HANDLE};
 use windows_sys::Win32::Security::Authorization::{
     ConvertStringSecurityDescriptorToSecurityDescriptorW, GetNamedSecurityInfoW,
     SetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT,
 };
 use windows_sys::Win32::Security::{
-    GetAce, GetSecurityDescriptorSacl, GetSidSubAuthority, GetSidSubAuthorityCount, ACE_HEADER,
-    ACL, LABEL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SYSTEM_MANDATORY_LABEL_ACE,
+    CreateWellKnownSid, DuplicateTokenEx, GetAce, GetSecurityDescriptorSacl, GetSidSubAuthority,
+    GetSidSubAuthorityCount, SecurityAnonymous, SetTokenInformation, TokenIntegrityLevel,
+    TokenPrimary, WinLowLabelSid, ACE_HEADER, ACL, LABEL_SECURITY_INFORMATION,
+    PSECURITY_DESCRIPTOR, SECURITY_IMPERSONATION_LEVEL, SECURITY_MAX_SID_SIZE,
+    SYSTEM_MANDATORY_LABEL_ACE, TOKEN_ADJUST_DEFAULT, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE,
+    TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
 };
 use windows_sys::Win32::System::SystemServices::{
-    SECURITY_MANDATORY_LOW_RID, SYSTEM_MANDATORY_LABEL_ACE_TYPE,
+    SECURITY_MANDATORY_LOW_RID, SE_GROUP_INTEGRITY, SYSTEM_MANDATORY_LABEL_ACE_TYPE,
     SYSTEM_MANDATORY_LABEL_NO_EXECUTE_UP, SYSTEM_MANDATORY_LABEL_NO_READ_UP,
     SYSTEM_MANDATORY_LABEL_NO_WRITE_UP,
 };
+use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 const WINDOWS_PREVIEW_SUPPORTED: bool = true;
 const WINDOWS_SUPPORTED_DETAILS: &str =
@@ -468,6 +474,163 @@ impl Drop for OwnedSecurityDescriptor {
             }
         }
     }
+}
+
+/// RAII wrapper around a Win32 `HANDLE` — closes via `CloseHandle` on Drop
+/// exactly once.
+///
+/// Used by [`create_low_integrity_primary_token`] (Phase 31 D-06 lift) and any
+/// downstream consumer that needs token handle ownership without manually
+/// auditing every error path. The wrapper is `pub` so `nono-shell-broker`
+/// (Phase 31 D-05) and `nono-cli` consume the same type.
+///
+/// Null handles are skipped on Drop (idiomatic Win32: zero handle = no-op).
+#[derive(Debug)]
+pub struct OwnedHandle(pub HANDLE);
+
+impl OwnedHandle {
+    /// Returns the raw `HANDLE` for FFI use without transferring ownership.
+    #[must_use]
+    pub fn raw(&self) -> HANDLE {
+        self.0
+    }
+}
+
+impl Drop for OwnedHandle {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                // SAFETY: This handle is owned by the wrapper and is closed
+                // exactly once on drop; null was checked above.
+                let _ = CloseHandle(self.0);
+            }
+        }
+    }
+}
+
+/// Construct a Low Mandatory Integrity Level primary token by duplicating the
+/// current process's token and lowering its integrity level via
+/// `SetTokenInformation(TokenIntegrityLevel, ..)`.
+///
+/// Used by `nono-shell-broker.exe` (Phase 31 D-05) to lower its own duplicate
+/// token to Low IL before passing it to `CreateProcessAsUserW` for the
+/// sandboxed shell child. Also reachable from `nono-cli`'s legacy Direct
+/// path (structurally unreachable today; see Phase 31 D-15).
+///
+/// Library boundary preserved: function is parameterless and policy-free.
+///
+/// Mechanism MUST stay byte-equivalent to the validated PoC at
+/// `.planning/quick/260508-m99-broker-process-poc-minimal-rust-binary-t/poc-broker/src/main.rs:36-103`
+/// and to the pre-lift source at
+/// `crates/nono-cli/src/exec_strategy_windows/launch.rs:1075-1167` (D-06:
+/// single source of truth).
+///
+/// # Errors
+///
+/// Returns [`NonoError::SandboxInit`] with a Windows `GetLastError` code if any
+/// of `OpenProcessToken`, `DuplicateTokenEx`, `CreateWellKnownSid`, or
+/// `SetTokenInformation` fail.
+#[must_use = "the returned OwnedHandle owns a Win32 HANDLE and must be retained until CreateProcess[AsUser]W has consumed it"]
+pub fn create_low_integrity_primary_token() -> Result<OwnedHandle> {
+    let mut current_token: HANDLE = std::ptr::null_mut();
+    let opened = unsafe {
+        // SAFETY: We pass a valid mutable out-pointer and request access on the
+        // current process token only.
+        OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ASSIGN_PRIMARY | TOKEN_ADJUST_DEFAULT,
+            &mut current_token,
+        )
+    };
+    if opened == 0 {
+        return Err(NonoError::SandboxInit(format!(
+            "Failed to open Windows process token for low-integrity launch (GetLastError={})",
+            unsafe { GetLastError() }
+        )));
+    }
+    let current_token = OwnedHandle(current_token);
+
+    let mut primary_token: HANDLE = std::ptr::null_mut();
+    let duplicated = unsafe {
+        // SAFETY: We duplicate the current process token into a primary token
+        // for child process creation.
+        DuplicateTokenEx(
+            current_token.raw(),
+            TOKEN_ASSIGN_PRIMARY | TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ADJUST_DEFAULT,
+            std::ptr::null(),
+            // Per Win32 docs (DuplicateTokenEx remarks): ImpersonationLevel is
+            // ignored when TokenType is TokenPrimary. SecurityAnonymous (0) is the
+            // idiomatic choice — empirically equivalent here, and the conventional
+            // marker for "primary token, not for impersonation use" (CR-01 hygiene).
+            SecurityAnonymous as SECURITY_IMPERSONATION_LEVEL,
+            TokenPrimary,
+            &mut primary_token,
+        )
+    };
+    if duplicated == 0 {
+        return Err(NonoError::SandboxInit(format!(
+            "Failed to duplicate Windows process token for low-integrity launch (GetLastError={})",
+            unsafe { GetLastError() }
+        )));
+    }
+    let primary_token = OwnedHandle(primary_token);
+
+    let mut sid_buffer = [0u8; SECURITY_MAX_SID_SIZE as usize];
+    let mut sid_size = sid_buffer.len() as u32;
+    let created = unsafe {
+        // SAFETY: The destination buffer is valid and sized per
+        // SECURITY_MAX_SID_SIZE for a well-known SID.
+        CreateWellKnownSid(
+            WinLowLabelSid,
+            std::ptr::null_mut(),
+            sid_buffer.as_mut_ptr() as *mut _,
+            &mut sid_size,
+        )
+    };
+    if created == 0 {
+        return Err(NonoError::SandboxInit(format!(
+            "Failed to create Windows low-integrity SID (GetLastError={})",
+            unsafe { GetLastError() }
+        )));
+    }
+
+    let label_size = size_of::<TOKEN_MANDATORY_LABEL>() + sid_size as usize;
+    let mut label_buffer = vec![0u8; label_size];
+    let label_ptr = label_buffer.as_mut_ptr() as *mut TOKEN_MANDATORY_LABEL;
+    let sid_ptr = unsafe {
+        // SAFETY: `label_buffer` is sized to hold a TOKEN_MANDATORY_LABEL prefix
+        // plus the SID bytes; the offset stays inside the allocation.
+        label_buffer
+            .as_mut_ptr()
+            .add(size_of::<TOKEN_MANDATORY_LABEL>()) as *mut _
+    };
+    unsafe {
+        // SAFETY: `sid_ptr` lives inside `label_buffer`, sized to fit
+        // `sid_size` bytes from `sid_buffer`. `label_ptr` aliases the same
+        // buffer with the documented Win32 layout.
+        std::ptr::copy_nonoverlapping(sid_buffer.as_ptr(), sid_ptr as *mut u8, sid_size as usize);
+        (*label_ptr).Label.Sid = sid_ptr;
+        (*label_ptr).Label.Attributes = SE_GROUP_INTEGRITY as u32;
+    }
+    let adjusted = unsafe {
+        // SAFETY: `primary_token` is a valid duplicated token; `label_ptr`
+        // points to a fully populated TOKEN_MANDATORY_LABEL structure of
+        // `label_size` bytes inside `label_buffer`.
+        SetTokenInformation(
+            primary_token.raw(),
+            TokenIntegrityLevel,
+            label_ptr as *mut _,
+            label_size as u32,
+        )
+    };
+    if adjusted == 0 {
+        return Err(NonoError::SandboxInit(format!(
+            "Failed to lower Windows child token integrity level (GetLastError={})",
+            unsafe { GetLastError() }
+        )));
+    }
+
+    Ok(primary_token)
 }
 
 /// Maps an `AccessMode` to the `SYSTEM_MANDATORY_LABEL_ACE.Mask` bits per
@@ -3271,5 +3434,113 @@ mod tests {
             "an unprivileged user must not be reported as the owner of {}",
             system_root.display()
         );
+    }
+}
+
+// Phase 31 D-06: library-side guarantor that the lifted function still produces
+// a token at Low IL (RID 0x1000). Mirrors the pre-lift assertion that lived in
+// nono-cli's `low_integrity_primary_token_sets_low_il`; this version proves the
+// new home crate works without going through `nono-cli`.
+#[cfg(all(test, target_os = "windows"))]
+mod create_low_integrity_primary_token_tests {
+    use super::{create_low_integrity_primary_token, OwnedHandle};
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Security::{
+        GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, TokenIntegrityLevel,
+        TOKEN_MANDATORY_LABEL,
+    };
+    use windows_sys::Win32::System::SystemServices::SECURITY_MANDATORY_LOW_RID;
+
+    /// Phase 31 D-06: library-side guarantor that the lifted function still
+    /// produces a token at Low IL (RID 0x1000). Acceptance #3 (write-deny)
+    /// depends on this — RESEARCH Assumption A2.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn create_low_integrity_primary_token_returns_low_il_token() {
+        let token = create_low_integrity_primary_token().expect(
+            "create_low_integrity_primary_token must succeed in a normal user-logon test process",
+        );
+        assert!(
+            !token.0.is_null(),
+            "low-integrity primary token handle is non-null"
+        );
+
+        // Two-call GetTokenInformation pattern: probe size, then fetch.
+        let mut needed: u32 = 0;
+        unsafe {
+            // SAFETY: Probe call with a null buffer is the documented
+            // size-discovery pattern. ERROR_INSUFFICIENT_BUFFER is expected.
+            GetTokenInformation(
+                token.0,
+                TokenIntegrityLevel,
+                std::ptr::null_mut(),
+                0,
+                &mut needed,
+            );
+        }
+        assert!(
+            needed >= std::mem::size_of::<TOKEN_MANDATORY_LABEL>() as u32,
+            "TokenIntegrityLevel buffer size should be at least \
+             size_of::<TOKEN_MANDATORY_LABEL>(); got {needed}"
+        );
+
+        let mut buf = vec![0u8; needed as usize];
+        let ok = unsafe {
+            // SAFETY: `buf` is sized by the probe call above; `token.0` is a
+            // valid HANDLE owned by `token`.
+            GetTokenInformation(
+                token.0,
+                TokenIntegrityLevel,
+                buf.as_mut_ptr() as *mut _,
+                needed,
+                &mut needed,
+            )
+        };
+        assert!(
+            ok != 0,
+            "GetTokenInformation(TokenIntegrityLevel) must succeed on a duplicated token"
+        );
+
+        // SAFETY: GetTokenInformation populated `buf` with a
+        // TOKEN_MANDATORY_LABEL prefix; layout is documented in the Win32 SDK.
+        let label = unsafe { &*(buf.as_ptr() as *const TOKEN_MANDATORY_LABEL) };
+        // SAFETY: `label.Label.Sid` is a valid SID pointer for the duration of
+        // `buf`'s lifetime; `GetSidSubAuthorityCount` returns a valid pointer.
+        let count = unsafe { *GetSidSubAuthorityCount(label.Label.Sid) };
+        assert!(
+            count > 0,
+            "integrity-label SID must have at least one sub-authority; got {count}"
+        );
+        // SAFETY: same SID pointer is still valid; `(count - 1)` is in-range.
+        let last = unsafe { *GetSidSubAuthority(label.Label.Sid, (count - 1) as u32) };
+        assert_eq!(
+            last, SECURITY_MANDATORY_LOW_RID as u32,
+            "duplicated token must be at Low integrity (RID 0x1000); got 0x{last:x}"
+        );
+    }
+
+    /// Phase 31 D-06: validate `OwnedHandle::Drop` does not panic / double-close.
+    /// Exercises the lifted RAII wrapper directly.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn owned_handle_drop_is_safe_for_low_il_token() {
+        let token = create_low_integrity_primary_token()
+            .expect("create_low_integrity_primary_token must succeed");
+        assert!(!token.0.is_null());
+        // Explicit drop closes the handle exactly once. If `OwnedHandle::Drop`
+        // were ill-formed, this would panic, abort, or surface as
+        // ERROR_INVALID_HANDLE on a recycled handle value in a later test.
+        drop(token);
+    }
+
+    /// Phase 31 D-06: confirm `OwnedHandle` Drop is a no-op when the inner
+    /// HANDLE is null. This guards Pitfall 5 (double-close) at the
+    /// boundary where a null sentinel can flow through.
+    #[test]
+    fn owned_handle_drop_on_null_is_noop() {
+        let null_handle: HANDLE = std::ptr::null_mut();
+        let owned = OwnedHandle(null_handle);
+        // Must not panic, abort, or call CloseHandle(null).
+        drop(owned);
     }
 }

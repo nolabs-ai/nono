@@ -4,7 +4,7 @@
 //! `nono inspect`, and `nono prune`.
 
 use crate::cli::{AttachArgs, DetachArgs, InspectArgs, LogsArgs, PruneArgs, PsArgs, StopArgs};
-use crate::command_display::{format_command_line, truncate_command};
+use crate::command_display::{format_command_line, truncate_chars};
 use crate::session::{self, SessionAttachment, SessionRecord, SessionStatus};
 use colored::Colorize;
 use nono::{NonoError, Result};
@@ -147,45 +147,203 @@ pub fn run_ps(args: &PsArgs) -> Result<()> {
         return Ok(());
     }
 
-    // Table header
+    // Collect plain-text cell values first so we can measure column widths.
+    struct PsRow {
+        session_id: String,
+        name: String,
+        status_text: String,
+        attach_text: String,
+        pid: String,
+        uptime: String,
+        profile: String,
+        command: String,
+        // originals needed for colour decisions
+        status: SessionStatus,
+        attachment: SessionAttachment,
+        exit_code: i32,
+    }
+
+    let rows: Vec<PsRow> = filtered
+        .iter()
+        .map(|s| {
+            let exit_code = s.exit_code.unwrap_or(-1);
+            let status_text = match s.status {
+                SessionStatus::Running => "running".to_string(),
+                SessionStatus::Paused => "paused".to_string(),
+                SessionStatus::Exited => format!("exited({exit_code})"),
+            };
+            let attach_text = match s.status {
+                SessionStatus::Exited => "-".to_string(),
+                _ => match s.attachment {
+                    SessionAttachment::Attached => "attached".to_string(),
+                    SessionAttachment::Detached => "detached".to_string(),
+                },
+            };
+            PsRow {
+                session_id: s.session_id.clone(),
+                name: s.name.as_deref().unwrap_or("-").to_string(),
+                status_text,
+                attach_text,
+                pid: s.child_pid.to_string(),
+                uptime: format_uptime(&s.started),
+                profile: s.profile.as_deref().unwrap_or("-").to_string(),
+                command: format_command_line(&s.command),
+                status: s.status.clone(),
+                attachment: s.attachment.clone(),
+                exit_code,
+            }
+        })
+        .collect();
+
+    // Compute each column width as max(header, data), capped for variable-length fields.
+    let mut session_w = "SESSION".len();
+    let mut name_w = "NAME".len();
+    let mut status_w = "STATUS".len();
+    let mut attach_w = "ATTACH".len();
+    let mut pid_w = "PID".len();
+    let mut uptime_w = "UPTIME".len();
+    let mut profile_w = "PROFILE".len();
+
+    for row in &rows {
+        session_w = session_w.max(row.session_id.len());
+        name_w = name_w.max(row.name.len());
+        status_w = status_w.max(row.status_text.len());
+        attach_w = attach_w.max(row.attach_text.len());
+        pid_w = pid_w.max(row.pid.len());
+        uptime_w = uptime_w.max(row.uptime.len());
+        profile_w = profile_w.max(row.profile.len());
+    }
+
+    name_w = name_w.min(24);
+    profile_w = profile_w.min(16);
+
+    // Reserve space for the COMMAND column based on terminal width.
+    let term_cols = terminal_columns().unwrap_or(120);
+    // 7 separating spaces + "COMMAND" header (minimum 7 visible chars)
+    let fixed_w = session_w
+        + 1
+        + name_w
+        + 1
+        + status_w
+        + 1
+        + attach_w
+        + 1
+        + pid_w
+        + 1
+        + uptime_w
+        + 1
+        + profile_w
+        + 1;
+    let cmd_w = term_cols.saturating_sub(fixed_w).max(7);
+
+    // Header
     println!(
-        "{:<16} {:<12} {:<10} {:<10} {:<8} {:<10} {:<14} COMMAND",
-        "SESSION", "NAME", "STATUS", "ATTACH", "PID", "UPTIME", "PROFILE"
+        "{} {} {} {} {} {} {} COMMAND",
+        pad_right("SESSION", session_w),
+        pad_right("NAME", name_w),
+        pad_right("STATUS", status_w),
+        pad_right("ATTACH", attach_w),
+        pad_right("PID", pid_w),
+        pad_right("UPTIME", uptime_w),
+        pad_right("PROFILE", profile_w),
     );
 
-    for session in &filtered {
-        let name = session.name.as_deref().unwrap_or("-");
-        let status = match session.status {
-            SessionStatus::Running => "running".green().to_string(),
-            SessionStatus::Paused => "paused".yellow().to_string(),
-            SessionStatus::Exited => {
-                let code = session.exit_code.unwrap_or(-1);
-                if code == 0 {
-                    "exited(0)".to_string()
-                } else {
-                    format!("exited({})", code).red().to_string()
-                }
-            }
+    for row in &rows {
+        let name_cell = pad_right(&truncate_chars(&row.name, name_w), name_w);
+        let profile_cell = pad_right(&truncate_chars(&row.profile, profile_w), profile_w);
+        let cmd_cell = truncate_chars(&row.command, cmd_w);
+
+        // Pad status/attach to their column width *before* applying colour so
+        // ANSI escape bytes don't upset the visible alignment.
+        let status_padded = pad_right(&row.status_text, status_w);
+        let status_colored = match row.status {
+            SessionStatus::Running => status_padded.green().to_string(),
+            SessionStatus::Paused => status_padded.yellow().to_string(),
+            SessionStatus::Exited if row.exit_code != 0 => status_padded.red().to_string(),
+            _ => status_padded,
         };
-        let attach = match session.status {
-            SessionStatus::Exited => "-".to_string(),
-            _ => match session.attachment {
-                SessionAttachment::Attached => "attached".green().to_string(),
-                SessionAttachment::Detached => "detached".yellow().to_string(),
-            },
+
+        let attach_padded = pad_right(&row.attach_text, attach_w);
+        let attach_colored = match (&row.status, &row.attachment) {
+            (SessionStatus::Exited, _) => attach_padded,
+            (_, SessionAttachment::Attached) => attach_padded.green().to_string(),
+            (_, SessionAttachment::Detached) => attach_padded.yellow().to_string(),
         };
-        let pid = session.child_pid;
-        let uptime = format_uptime(&session.started);
-        let profile = session.profile.as_deref().unwrap_or("-");
-        let command = truncate_command(&session.command, 40);
 
         println!(
-            "{:<16} {:<12} {:<10} {:<10} {:<8} {:<10} {:<14} {}",
-            session.session_id, name, status, attach, pid, uptime, profile, command
+            "{} {} {} {} {} {} {} {}",
+            pad_right(&row.session_id, session_w),
+            name_cell,
+            status_colored,
+            attach_colored,
+            pad_right(&row.pid, pid_w),
+            pad_right(&row.uptime, uptime_w),
+            profile_cell,
+            cmd_cell,
         );
     }
 
     Ok(())
+}
+
+/// Left-align `s` in a field of `width` visible characters.
+fn pad_right(s: &str, width: usize) -> String {
+    format!("{:<width$}", s, width = width)
+}
+
+/// Return the terminal column count, or `None` when stdout is not a terminal.
+///
+/// Honours the conventional `COLUMNS` env-var override (used by pipes, scripts,
+/// and tests). On Unix falls back to the `TIOCGWINSZ` ioctl on STDOUT_FILENO;
+/// on Windows uses the console screen buffer info API (`GetConsoleScreenBufferInfo`).
+fn terminal_columns() -> Option<usize> {
+    // Honour the conventional COLUMNS override (pipes, scripts, tests).
+    if let Ok(val) = std::env::var("COLUMNS") {
+        return val.parse::<usize>().ok();
+    }
+    terminal_columns_native()
+}
+
+#[cfg(unix)]
+fn terminal_columns_native() -> Option<usize> {
+    use nix::libc;
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    // SAFETY: TIOCGWINSZ writes one `winsize` struct into `ws`; the fd is
+    // STDOUT_FILENO which is always a valid open fd for a CLI process.
+    let ret = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) };
+    if ret == 0 && ws.ws_col > 0 {
+        Some(ws.ws_col as usize)
+    } else {
+        None
+    }
+}
+
+#[cfg(windows)]
+fn terminal_columns_native() -> Option<usize> {
+    // Windows does not have TIOCGWINSZ; query the console screen buffer info
+    // via the Win32 console API. STD_OUTPUT_HANDLE -> CONSOLE_SCREEN_BUFFER_INFO.
+    use windows_sys::Win32::System::Console::{
+        GetConsoleScreenBufferInfo, GetStdHandle, CONSOLE_SCREEN_BUFFER_INFO, STD_OUTPUT_HANDLE,
+    };
+    // SAFETY: GetStdHandle returns either a valid handle or INVALID_HANDLE_VALUE;
+    // GetConsoleScreenBufferInfo writes one CONSOLE_SCREEN_BUFFER_INFO struct.
+    unsafe {
+        let h = GetStdHandle(STD_OUTPUT_HANDLE);
+        if h.is_null() {
+            return None;
+        }
+        let mut info: CONSOLE_SCREEN_BUFFER_INFO = std::mem::zeroed();
+        if GetConsoleScreenBufferInfo(h, &mut info) == 0 {
+            return None;
+        }
+        // srWindow.{Right,Left} are inclusive coordinates.
+        let cols = (info.srWindow.Right - info.srWindow.Left + 1) as i32;
+        if cols > 0 {
+            Some(cols as usize)
+        } else {
+            None
+        }
+    }
 }
 
 /// Format uptime from an ISO 8601 start time string.

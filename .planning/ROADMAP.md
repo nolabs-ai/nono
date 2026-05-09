@@ -295,7 +295,7 @@ Plans:
 | 28. Authenticode Chain-Walker Subject Extraction | v2.3 | 1/1 | Complete (REQ-AUDC-01..03 closed; D-AUDC-02 SandboxInit fallback + D-AUDC-03 explorer.exe fixture switch) | 2026-04-30 |
 | 29. WR-01 Reject-Stage Unification | v2.3 | 1/1 | Complete (REQ-WRU-01..02 closed; Option c locked as permanent design property) | 2026-04-30 |
 | 30. Windows nono shell Interactive Enforcement Architecture | v2.3 | 5/5 | Complete    | 2026-05-08 |
-| 31. Broker-Process Architecture (SHELL-01) | v2.3 | 1/6 | In Progress|  |
+| 31. Broker-Process Architecture (SHELL-01) | v2.3 | 3/6 | In Progress|  |
 
 ## Backlog (v2.4 carry-forward)
 
@@ -323,15 +323,15 @@ The four major v2.2-deferred items (PKG streaming, audit-attestation hardening, 
 
 **Requirements:** No formal REQ-IDs at scope-lock; phase tracked via CONTEXT.md decisions D-01..D-16 (token shape, broker placement + token-helper lift, scope boundary, failure-mode response). Decision-coverage gate enforces D-01..D-16 through plans.
 **Depends on:** Phase 30 (precedent + harness reuse + invalidates SHELL-01 "validated" claim).
-**Plans:** 1/6 plans executed
+**Plans:** 3/6 plans executed
 
 Plans:
 **Wave 1**
 - [x] 31-01-PLAN.md — Foundation: D-06 lift (`create_low_integrity_primary_token` + `OwnedHandle` to `crates/nono/src/sandbox/windows.rs`) + D-07 `NonoError::BrokerNotFound` variant + Wave-0 harness `Out-File`→`Set-Content` fix (Wave 1)
 
 **Wave 2** *(blocked on Wave 1 completion)*
-- [ ] 31-02-PLAN.md — `crates/nono-shell-broker/` workspace member + production `main.rs` (D-05, D-08, D-01: 8-step PoC sequence + argv-only IPC + HANDLE_LIST broker→child) (Wave 2; depends on 31-01)
-- [ ] 31-03-PLAN.md — `WindowsTokenArm::BrokerLaunch` cascade arm in `launch.rs` + PROC_THREAD_ATTRIBUTE_HANDLE_LIST nono.exe→broker discipline + Job Object containment (D-04) + sibling broker resolution via `current_exe()` (D-07) + rewrite `pty_token_gate_tests` for new dispatch (D-15) (Wave 2; depends on 31-01)
+- [x] 31-02-PLAN.md — `crates/nono-shell-broker/` workspace member + production `main.rs` (D-05, D-08, D-01: 8-step PoC sequence + argv-only IPC + HANDLE_LIST broker→child) (Wave 2; depends on 31-01)
+- [x] 31-03-PLAN.md — `WindowsTokenArm::BrokerLaunch` cascade arm in `launch.rs` + PROC_THREAD_ATTRIBUTE_HANDLE_LIST nono.exe→broker discipline + Job Object containment (D-04) + sibling broker resolution via `current_exe()` (D-07) + rewrite `pty_token_gate_tests` for new dispatch (D-15) (Wave 2; depends on 31-01)
 
 **Wave 3** *(blocked on Wave 2 completion)*
 - [ ] 31-04-PLAN.md — Cross-compile + signed-binary release pipeline updates: `release.yml` builds/signs/verifies/uploads `nono-shell-broker.exe` alongside `nono.exe`; `build-windows-msi.ps1` packages broker as sibling MSI component (Wave 3; depends on 31-02 + 31-03)

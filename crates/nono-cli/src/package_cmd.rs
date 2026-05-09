@@ -1205,4 +1205,41 @@ mod tests {
         assert!(validate_relative_path("plugins/widget.so").is_ok());
         assert!(validate_relative_path("hooks/post-install.sh").is_ok());
     }
+
+    #[test]
+    fn validate_path_within_rejects_symlink_escape() {
+        // REQ-PKGS-02 truth #7: Defense-in-depth — symlink-traversal where the
+        // input string is innocuous but resolves through a symlink to outside
+        // staging_root is still rejected by validate_path_within
+        // (canonicalize-and-component-compare layer; runs AFTER the bytes are
+        // written, on the resolved path).
+        let staging = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("outside");
+        let staging_root = staging.path();
+        let outside_target = outside.path();
+
+        // Create a symlink inside staging_root pointing to a path outside.
+        let symlink_in_staging = staging_root.join("escape");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside_target, &symlink_in_staging).expect("create symlink");
+        #[cfg(windows)]
+        {
+            // On Windows, symlink creation requires elevated privilege OR
+            // developer mode. Gate via early-return — a privilege-missing
+            // host is documented behavior, NOT a skip-as-debt.
+            if std::os::windows::fs::symlink_dir(outside_target, &symlink_in_staging).is_err() {
+                eprintln!(
+                    "skipping symlink test — Windows symlink privilege missing (run as admin or enable developer mode)"
+                );
+                return;
+            }
+        }
+
+        // The symlink target (post-resolution) must reject:
+        let escape_attempt = symlink_in_staging.join("evil.bin");
+        assert!(
+            validate_path_within(staging_root, &escape_attempt).is_err(),
+            "validate_path_within must reject symlink-resolved path that escapes staging_root"
+        );
+    }
 }

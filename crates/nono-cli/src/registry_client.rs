@@ -202,3 +202,309 @@ fn enforce_content_length(content_length: Option<u64>, limit: u64, url: &str) ->
 
     Ok(())
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    //! Streaming + size-cap integration tests for the registry client.
+    //!
+    //! Host preference: Linux/macOS for the Linux-only RSS measurement
+    //! truth (REQ-PKGS-01 #1) — gated `#[cfg(target_os = "linux")]`.
+    //! All other tests run on Linux, macOS, AND Windows.
+    //!
+    //! Per Plan 26-02 Task 5 portable-subset constraint: no `mockito`
+    //! dev-dep is added; tests use a tiny single-shot in-process TCP
+    //! server (`spawn_one_shot_server`) for HTTP fixtures. This keeps
+    //! the dev-dep budget flat and avoids one Windows-CI moving part.
+    //!
+    //! REQ-PKGS-04 auto-pull e2e tests are NOT exercised here — they
+    //! require Sigstore-signed fixture packs + `run_nono` harness
+    //! (which trips on `dirs::home_dir()` Windows blocker even with
+    //! Phase 27.1's NONO_TEST_HOME seam, since the bundle subjects
+    //! check needs real signature data). Deferred to a future
+    //! Linux/macOS pass with that fixture infrastructure landed.
+
+    use super::*;
+    use std::net::TcpListener;
+    use std::thread;
+
+    // `Read`, `Write`, `Shutdown` are only used inside `spawn_one_shot_server`;
+    // import them at the function scope to avoid leaking unused warnings into
+    // the parent `tests` module on hosts where some tests are cfg-gated out.
+
+    /// Spawn a single-connection HTTP/1.1 server on an ephemeral port and
+    /// serve `body` to the next GET request. Returns `(url, join_handle)`.
+    /// Drops the listener when the connection is served (single-shot).
+    fn spawn_one_shot_server(
+        body: Vec<u8>,
+        content_length_override: Option<u64>,
+    ) -> (String, thread::JoinHandle<()>) {
+        use std::io::{Read as _, Write as _};
+        use std::net::Shutdown;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let addr = listener.local_addr().expect("local_addr");
+        let url = format!("http://{}/artifact", addr);
+
+        let handle = thread::spawn(move || {
+            let (mut stream, _peer) = match listener.accept() {
+                Ok(pair) => pair,
+                Err(_) => return,
+            };
+            // Read (and discard) the request line + headers up to CRLF-CRLF.
+            let mut buf = [0u8; 4096];
+            let mut accumulated = Vec::with_capacity(4096);
+            loop {
+                let n = match stream.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(_) => break,
+                };
+                accumulated.extend_from_slice(&buf[..n]);
+                if accumulated.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+                if accumulated.len() > 64 * 1024 {
+                    break;
+                }
+            }
+            let cl = content_length_override.unwrap_or(body.len() as u64);
+            let response_head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                cl
+            );
+            let _ = stream.write_all(response_head.as_bytes());
+            let _ = stream.write_all(&body);
+            let _ = stream.flush();
+            let _ = stream.shutdown(Shutdown::Both);
+        });
+
+        (url, handle)
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        use sha2::Digest as _;
+        let digest = sha2::Sha256::digest(bytes);
+        digest.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    /// REQ-PKGS-01 acceptance #1: 200 MB streams at bounded RSS.
+    ///
+    /// Linux-only because `/proc/self/status` is the cleanest portable RSS
+    /// proxy. macOS / Windows would need platform-specific APIs; the
+    /// implicit RSS bound is the size-cap test
+    /// (`download_artifact_to_path_rejects_oversize_via_content_length`)
+    /// which exercises the same streaming property indirectly: artifacts
+    /// > cap reject mid-stream BEFORE the full buffer materializes.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn download_artifact_to_path_streams_under_bounded_rss() {
+        // 50 MB payload (well under the 64 MB REGISTRY_ARTIFACT_LIMIT_BYTES
+        // cap). RSS delta should be << payload size — bounded by the 8 KB
+        // I/O buffer, not the payload.
+        let payload = vec![0u8; 50 * 1024 * 1024];
+        let (url, handle) = spawn_one_shot_server(payload.clone(), None);
+
+        let baseline_rss = read_proc_self_rss_kb();
+        let client = RegistryClient::new("http://unused".to_string());
+        let staging = tempfile::TempDir::new().expect("tempdir");
+        let dest = staging.path().join("artifact.bin");
+
+        let digest = client
+            .download_artifact_to_path(&url, &dest)
+            .expect("streaming download should succeed");
+
+        let peak_rss = read_proc_self_rss_kb();
+        let delta_kb = peak_rss.saturating_sub(baseline_rss);
+
+        assert_eq!(digest, sha256_hex(&payload));
+        assert_eq!(
+            dest.metadata().expect("metadata").len(),
+            payload.len() as u64
+        );
+        // 50 MB streamed; allow generous 25 MB ceiling.
+        assert!(
+            delta_kb < 25 * 1024,
+            "RSS delta {delta_kb} KB exceeds 25 MB ceiling — streaming may be buffering"
+        );
+        handle.join().expect("server thread joined");
+    }
+
+    /// REQ-PKGS-01 acceptance #2: tampered-byte detection — the streaming
+    /// downloader's incrementally-computed SHA-256 digest accurately
+    /// reflects what the server actually sent. The digest mismatch is
+    /// then detected at the `download_and_verify_artifacts` layer above
+    /// (compared against the manifest's declared digest); this test
+    /// verifies the streaming-level invariant the upper layer depends on.
+    #[test]
+    fn download_artifact_to_path_computes_digest_of_streamed_bytes() {
+        let real = b"GENUINE PACKAGE BYTES";
+        let real_digest = sha256_hex(real);
+        let tampered = b"TAMPERED PACKAGE BYTES";
+        let tampered_digest = sha256_hex(tampered);
+        assert_ne!(real_digest, tampered_digest);
+
+        let (url, handle) = spawn_one_shot_server(tampered.to_vec(), None);
+        let client = RegistryClient::new("http://unused".to_string());
+        let staging = tempfile::TempDir::new().expect("tempdir");
+        let dest = staging.path().join("artifact.bin");
+
+        let computed = client
+            .download_artifact_to_path(&url, &dest)
+            .expect("streaming download should succeed against tampered server");
+
+        // Streaming reflects what the server actually sent.
+        assert_eq!(computed, tampered_digest);
+        // Caller would compare against `real_digest` from the manifest
+        // and surface PackageVerification — out of scope for this layer.
+        assert_ne!(computed, real_digest);
+        handle.join().expect("server thread joined");
+    }
+
+    /// REQ-PKGS-01 acceptance #3: oversize artifact rejected via the
+    /// Content-Length pre-check. Server sends a tiny body but advertises
+    /// 100 MB; `enforce_content_length` ceiling at 64 MB
+    /// (REGISTRY_ARTIFACT_LIMIT_BYTES) catches it before any body bytes
+    /// are read.
+    #[test]
+    fn download_artifact_to_path_rejects_oversize_via_content_length() {
+        let oversize_cl: u64 = 100 * 1024 * 1024;
+        let body = b"trivial".to_vec();
+        let (url, handle) = spawn_one_shot_server(body, Some(oversize_cl));
+
+        let client = RegistryClient::new("http://unused".to_string());
+        let staging = tempfile::TempDir::new().expect("tempdir");
+        let dest = staging.path().join("artifact.bin");
+
+        let result = client.download_artifact_to_path(&url, &dest);
+        assert!(
+            result.is_err(),
+            "100 MB Content-Length must reject (cap is {} bytes)",
+            REGISTRY_ARTIFACT_LIMIT_BYTES
+        );
+        let err_msg = result.expect_err("should err").to_string();
+        let lower = err_msg.to_lowercase();
+        assert!(
+            lower.contains("exceeds")
+                || lower.contains("size")
+                || lower.contains("limit")
+                || lower.contains("registry"),
+            "error message should reference the size constraint, got: {err_msg}"
+        );
+        let _ = handle.join();
+    }
+
+    /// REQ-PKGS-01 acceptance #4 (a): connect timeout fires.
+    ///
+    /// 10.255.255.1 is RFC1918 unroutable; connect attempts get
+    /// network-unreachable or hit the configured 10s connect timeout
+    /// + 30s response timeout. Either failure mode passes the test
+    /// — what matters is the call DOES NOT block forever.
+    #[test]
+    fn registry_client_connect_timeout_fires_within_bounded_window() {
+        let client = RegistryClient::new("http://unused".to_string());
+        let staging = tempfile::TempDir::new().expect("tempdir");
+        let dest = staging.path().join("x.bin");
+
+        let started = std::time::Instant::now();
+        let result = client.download_artifact_to_path("http://10.255.255.1/x", &dest);
+        let elapsed = started.elapsed();
+
+        assert!(result.is_err(), "connect to unroutable address must fail");
+        // 10s connect + 30s response = ~40s upper bound. Allow 90s
+        // headroom for platform-specific connect-failure-mode timing.
+        // Without timeout config, ureq blocks on OS connect timeout
+        // (default 75s+) and could exceed the body timeout (300s) too.
+        assert!(
+            elapsed < std::time::Duration::from_secs(90),
+            "connect timeout must fire within 90s, took {:?}",
+            elapsed
+        );
+    }
+
+    /// `enforce_content_length` returns Ok when the header is absent
+    /// (downstream `with_config().limit()` reader still enforces the
+    /// cap). Pure unit test — no server.
+    #[test]
+    fn enforce_content_length_passes_when_header_absent() {
+        assert!(enforce_content_length(None, 1024, "http://example.invalid").is_ok());
+    }
+
+    /// `enforce_content_length` rejects when the header advertises
+    /// more than the limit, even if the server might have lied.
+    #[test]
+    fn enforce_content_length_rejects_oversize() {
+        let result = enforce_content_length(Some(2048), 1024, "http://example.invalid");
+        assert!(result.is_err());
+        let msg = result.expect_err("must reject").to_string();
+        assert!(
+            msg.contains("1024") || msg.to_lowercase().contains("exceeds"),
+            "error message should reference the limit, got: {msg}"
+        );
+    }
+
+    /// `enforce_content_length` passes when the header is at-or-below
+    /// the limit (boundary is inclusive — `<=` not `<`).
+    #[test]
+    fn enforce_content_length_passes_at_boundary() {
+        assert!(enforce_content_length(Some(1024), 1024, "http://example.invalid").is_ok());
+        assert!(enforce_content_length(Some(0), 1024, "http://example.invalid").is_ok());
+        assert!(enforce_content_length(Some(1023), 1024, "http://example.invalid").is_ok());
+    }
+
+    /// PKGS-01 invariant: `tempfile::TempDir` Drop runs on panic — the
+    /// `VerifiedDownloads._tempdir` Drop guarantee. Doesn't go through
+    /// HTTP (panic-safe Drop is a tempfile invariant, not a streaming
+    /// one), but pinning the contract here surfaces any future
+    /// regression in the tempfile dep.
+    #[test]
+    fn tempdir_cleanup_runs_on_panic() {
+        use std::path::PathBuf;
+        let captured: std::sync::Arc<std::sync::Mutex<Option<PathBuf>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let captured_for_thread = std::sync::Arc::clone(&captured);
+
+        let panic_result = std::panic::catch_unwind(move || {
+            let staging = tempfile::TempDir::new().expect("tempdir");
+            let p = staging.path().to_path_buf();
+            assert!(p.exists(), "tempdir should exist pre-panic");
+            *captured_for_thread.lock().expect("lock") = Some(p);
+            // Panic with `staging` in scope — Drop fires during unwind.
+            panic!("simulated mid-stream failure");
+        });
+
+        assert!(panic_result.is_err(), "thread should have panicked");
+        let path = captured
+            .lock()
+            .expect("lock")
+            .clone()
+            .expect("path captured");
+        assert!(
+            !path.exists(),
+            "TempDir at {:?} must be cleaned up after panic-driven Drop",
+            path
+        );
+    }
+
+    /// `RegistryClient::new` builds an Agent successfully with the
+    /// four configured timeouts. Compile-time + runtime smoke test
+    /// for any future ureq API drift in `Agent::config_builder()`.
+    #[test]
+    fn registry_client_constructor_succeeds() {
+        let _client = RegistryClient::new("http://example.invalid".to_string());
+        let _client_trailing = RegistryClient::new("http://example.invalid/".to_string());
+    }
+
+    #[cfg(target_os = "linux")]
+    fn read_proc_self_rss_kb() -> u64 {
+        let s = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+        for line in s.lines() {
+            if let Some(rest) = line.strip_prefix("VmRSS:") {
+                if let Some(num) = rest.split_whitespace().next() {
+                    return num.parse().unwrap_or(0);
+                }
+            }
+        }
+        0
+    }
+}

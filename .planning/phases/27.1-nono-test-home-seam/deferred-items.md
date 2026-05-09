@@ -97,3 +97,24 @@ be removed. The `setup_isolated_home` directory pre-creation should remain (it's
 defensive against future canonicalize-before-exists patterns).
 
 **Estimated effort:** 15 min including running the suite on a Windows host.
+
+## Phase 27.2 v2.5 production follow-ups (audit-verify surface coordinated bump)
+
+**Created during:** Phase 27.2 close (REQ-AAHX-01..03 closed via D-27.2-01..13)
+**Status:** Surfaced; deferred to v2.5 milestone
+
+### v2.5-FU-1: Remove `cmd_verify` back-compat shim
+
+**Issue:** D-27.2-02 introduces a one-shot `tracing::warn!`-on-fallback shim in `audit_session::load_session` (consumed by `audit_commands::cmd_verify` per Phase 27.2 Plan 01) that lets verification succeed when bundles live at the legacy `<rollback>/<id>/audit-attestation.bundle` path (older `nono` versions, pre-Phase-27.2). The shim is intentionally narrow but adds a `Path::exists` + `canonicalize` check on the cold-path verify per session.
+
+**Fix:** Hard cutover. `cmd_verify` (via `audit_session::load_session`) looks up bundles ONLY at `<audit_root>/<id>/audit-attestation.bundle`; the rollback-root fallback iteration is deleted. The `warn_once_legacy_bundle_path` helper and its `OnceLock<()>` guard are deleted. Pairs with v2.5-FU-2 below as a coordinated `cmd_verify` v2 schema bump (see `docs/architecture/audit-bundle-target.md` § "Backward-compat shim contract" for the locked removal milestone).
+
+**Estimated effort:** 15-30 min (delete the rollback-root entry from the `roots` array in `audit_session::load_session`, delete the `warn_once_legacy_bundle_path` helper and its sole call site, delete any unit test that exercises the fallback path).
+
+### v2.5-FU-2: `cmd_verify` v2 JSON schema (nested `attestation` object)
+
+**Issue:** D-27.2-08 keeps `cmd_verify`'s flat JSON shape (`json["attestation_present"]`, `json["attestation_valid"]`) for Phase 27.2 to avoid coupling Test 2's re-enablement to a schema bump. The semantically richer nested shape (`json["attestation"]["present"]`, `json["attestation"]["signature_verified"]`, `json["attestation"]["merkle_root_matches"]`, `json["attestation"]["session_id_matches"]`, `json["attestation"]["verification_error"]`) was preserved in Test 2's original assertion intent (now adapted to the flat shape per Phase 27.2 Plan 04) and is the natural output once the audit-vs-rollback architectural split is fully landed.
+
+**Fix:** Bump `cmd_verify` to a v2 schema with nested `attestation` object. Flat keys deprecated for one version with parallel emission, then removed in v2.6 (or per the deprecation policy decided at v2.5 scope-lock). Coordinate release with v2.5-FU-1 since both affect the audit-verify surface; recommend a single schema-version-bump commit landing both changes.
+
+**Estimated effort:** 1-2 hours including schema-bump migration tests, `docs/cli/audit-verify.md` schema documentation update, and Test 2 re-asserting the nested shape.

@@ -1005,6 +1005,34 @@ pub(super) fn build_command_line(resolved_program: &Path, args: &[String]) -> Ve
         .collect()
 }
 
+/// Build a Win32 command line for spawning `nono-shell-broker.exe` with flat
+/// argv. Mirrors `build_command_line`'s quoting rules but accepts `OsString`
+/// values so the broker's `--shell` payload (a `Path`) and the `--cwd` value
+/// (also a `Path`) round-trip cleanly through OS-specific path encoding.
+///
+/// Quoting follows the existing `quote_windows_arg` rules: any argument
+/// containing whitespace, quotes, or other special characters is double-quoted
+/// with embedded quotes doubled. The broker's argv parser (Plan 31-02) treats
+/// every value after a flag as an opaque string; it does NOT re-parse values
+/// as flags (T-31-20 mitigation).
+///
+/// Phase 31 D-08 contract.
+pub(super) fn build_broker_command_line(
+    broker_exe: &Path,
+    args: &[std::ffi::OsString],
+) -> Vec<u16> {
+    let broker_exe = normalize_windows_launch_path(broker_exe);
+    let mut command_line = quote_windows_arg(&broker_exe.to_string_lossy());
+    for a in args {
+        command_line.push(' ');
+        command_line.push_str(&quote_windows_arg(&a.to_string_lossy()));
+    }
+    OsStr::new(&command_line)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
+}
+
 pub(super) fn should_use_low_integrity_windows_launch(caps: &CapabilitySet) -> bool {
     let policy = Sandbox::windows_filesystem_policy(caps);
     policy.has_rules()
@@ -1198,105 +1226,324 @@ pub(super) fn spawn_windows_child(
     // close_child_ends() call and the eventual return.
     let mut detached_stdio: Option<DetachedStdioPipes> = None;
 
+    // Phase 31 D-01/D-15: BrokerLaunch path replaces the Phase 30 direct
+    // PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE+CreateProcessAsUserW(low_il_token)
+    // shape (which triggered STATUS_DLL_INIT_FAILED 0xC0000142 at CSRSS
+    // console-attach time during KernelBase.dll DllMain). The broker spawns
+    // at caller's identity (Medium IL), inherits ONLY the ConPTY pipe handles
+    // via PROC_THREAD_ATTRIBUTE_HANDLE_LIST (D-02; capability-pipe handles
+    // are NOT inheritable past nono.exe), self-degrades to Low IL via
+    // `nono::create_low_integrity_primary_token`, and spawns the actual
+    // sandboxed shell child. PoC validation: 2026-05-08 broker-pattern
+    // PASSED on Windows test box (RESEARCH §1b A1 empirically validated).
+    //
+    // The legacy PSEUDOCONSOLE block (else-arm below) is preserved per D-15
+    // as a structurally-unreachable fallback for the legacy LowIlPrimary
+    // Direct path; it remains the only direct runtime exercise of the lifted
+    // `nono::create_low_integrity_primary_token` via the
+    // `low_integrity_primary_token_tests` module.
     let created = if let Some(pty_pair) = pty {
-        let mut attr_size: usize = 0;
-        unsafe {
-            // SAFETY: First call with a null list queries the required buffer size.
-            InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &mut attr_size);
-        }
+        if matches!(arm, WindowsTokenArm::BrokerLaunch) {
+            // D-07: Resolve broker path as sibling of the running nono.exe.
+            // No env-var override surface — env-poisoning attack rejected.
+            // Plan 31-01 added `NonoError::BrokerNotFound { path }` for the
+            // fail-fast structured error.
+            let nono_exe = std::env::current_exe().map_err(|e| {
+                NonoError::SandboxInit(format!(
+                    "Failed to resolve current_exe for broker location: {e}"
+                ))
+            })?;
+            let exe_dir = nono_exe.parent().ok_or_else(|| {
+                NonoError::SandboxInit(format!(
+                    "Failed to resolve parent dir for broker location: {}",
+                    nono_exe.display()
+                ))
+            })?;
+            let broker_path = exe_dir.join("nono-shell-broker.exe");
+            if !broker_path.exists() {
+                return Err(NonoError::BrokerNotFound { path: broker_path });
+            }
 
-        let mut attr_buf = vec![0u8; attr_size];
-        let attr_list: LPPROC_THREAD_ATTRIBUTE_LIST =
-            attr_buf.as_mut_ptr() as LPPROC_THREAD_ATTRIBUTE_LIST;
+            // D-02: Mark ConPTY pipe handles inheritable BEFORE CreateProcessW;
+            // unmark AFTER (so they don't accidentally leak into other spawns).
+            // PtyPair shape per crates/nono-cli/src/pty_proxy_windows.rs:11-15:
+            //   pub struct PtyPair {
+            //       pub hpcon: HPCON,
+            //       pub input_write: HANDLE,
+            //       pub output_read: HANDLE,
+            //   }
+            // The two pipe HANDLEs (NOT hpcon — that is a pseudoconsole, not
+            // a pipe) are the values HANDLE_LIST whitelists for inheritance.
+            let inherit_handles: [HANDLE; 2] = [pty_pair.input_write, pty_pair.output_read];
 
-        let ok = unsafe {
-            // SAFETY: `attr_list` points to `attr_buf`, which was sized by the
-            // probe call immediately above for exactly one attribute.
-            InitializeProcThreadAttributeList(attr_list, 1, 0, &mut attr_size)
-        };
-        if ok == 0 {
-            return Err(NonoError::SandboxInit(format!(
-                "InitializeProcThreadAttributeList failed (error={})",
-                unsafe { GetLastError() }
-            )));
-        }
+            // Flip ConPTY pipe handles to inheritable. Track for cleanup
+            // along the success AND error paths so they don't leak into
+            // unrelated CreateProcess calls (T-31-17 mitigation).
+            for h in &inherit_handles {
+                let ok = unsafe {
+                    // SAFETY: Each handle is owned by `pty_pair` and lives
+                    // for at least the duration of this scope. Setting the
+                    // inheritance flag is documented to succeed on a valid
+                    // open handle. The matching unset call below restores
+                    // the prior state on both success and error paths.
+                    SetHandleInformation(*h, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT)
+                };
+                if ok == 0 {
+                    let last = unsafe { GetLastError() };
+                    // Best-effort revert on the partially-flipped handles
+                    // before propagating the error (defense-in-depth).
+                    for cleanup_h in &inherit_handles {
+                        unsafe {
+                            // SAFETY: same handle ownership rationale as above.
+                            let _ = SetHandleInformation(*cleanup_h, HANDLE_FLAG_INHERIT, 0);
+                        }
+                    }
+                    return Err(NonoError::SandboxInit(format!(
+                        "SetHandleInformation(HANDLE_FLAG_INHERIT) failed (error={last})"
+                    )));
+                }
+            }
 
-        let hpcon_value = pty_pair.hpcon;
-        let ok = unsafe {
-            // SAFETY: `attr_list` is initialized above and `hpcon_value` remains
-            // valid for the duration of process creation.
-            UpdateProcThreadAttribute(
-                attr_list,
-                0,
-                PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE as usize,
-                std::ptr::addr_of!(hpcon_value) as *mut _,
-                size_of::<windows_sys::Win32::System::Console::HPCON>(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            )
-        };
-        if ok == 0 {
+            // Build PROC_THREAD_ATTRIBUTE_HANDLE_LIST for nono.exe → broker.
+            let mut attr_size: usize = 0;
             unsafe {
-                // SAFETY: `attr_list` was initialized successfully above.
+                // SAFETY: First call with null list queries required size
+                // (Win32 idiom). The probe always returns 0 with
+                // ERROR_INSUFFICIENT_BUFFER; we don't read the return value.
+                InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &mut attr_size);
+            }
+            let mut attr_buf = vec![0u8; attr_size];
+            let attr_list: LPPROC_THREAD_ATTRIBUTE_LIST =
+                attr_buf.as_mut_ptr() as LPPROC_THREAD_ATTRIBUTE_LIST;
+            let ok = unsafe {
+                // SAFETY: `attr_list` points into `attr_buf` sized by the
+                // probe call above for exactly one attribute slot.
+                InitializeProcThreadAttributeList(attr_list, 1, 0, &mut attr_size)
+            };
+            if ok == 0 {
+                let last = unsafe { GetLastError() };
+                // Cleanup inheritance flags before propagating.
+                for h in &inherit_handles {
+                    unsafe {
+                        // SAFETY: handle ownership rationale as above.
+                        let _ = SetHandleInformation(*h, HANDLE_FLAG_INHERIT, 0);
+                    }
+                }
+                return Err(NonoError::SandboxInit(format!(
+                    "InitializeProcThreadAttributeList failed (error={last})"
+                )));
+            }
+            let ok = unsafe {
+                // SAFETY: `attr_list` initialized above; `inherit_handles`
+                // outlives the UpdateProcThreadAttribute call (still in
+                // scope through the CreateProcessW call below).
+                UpdateProcThreadAttribute(
+                    attr_list,
+                    0,
+                    PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+                    inherit_handles.as_ptr() as *mut _,
+                    std::mem::size_of_val(&inherit_handles[..]),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            };
+            if ok == 0 {
+                let last = unsafe { GetLastError() };
+                unsafe {
+                    // SAFETY: `attr_list` initialized above; safe to release.
+                    DeleteProcThreadAttributeList(attr_list);
+                }
+                for h in &inherit_handles {
+                    unsafe {
+                        // SAFETY: handle ownership rationale as above.
+                        let _ = SetHandleInformation(*h, HANDLE_FLAG_INHERIT, 0);
+                    }
+                }
+                return Err(NonoError::SandboxInit(format!(
+                    "UpdateProcThreadAttribute(HANDLE_LIST) failed (error={last})"
+                )));
+            }
+
+            // Build broker command line per D-08 contract (Plan 31-02 parses):
+            //   "<broker_exe>" --shell "<launch_program>" \
+            //     --shell-arg "<arg>"... \
+            //     --inherit-handle 0x<input_hex> --inherit-handle 0x<output_hex> \
+            //     --cwd "<cwd>"
+            let mut broker_args: Vec<std::ffi::OsString> = Vec::new();
+            broker_args.push(std::ffi::OsString::from("--shell"));
+            broker_args.push(launch_program.as_os_str().to_owned());
+            for a in cmd_args {
+                broker_args.push(std::ffi::OsString::from("--shell-arg"));
+                broker_args.push(std::ffi::OsString::from(a));
+            }
+            for h in &inherit_handles {
+                broker_args.push(std::ffi::OsString::from("--inherit-handle"));
+                broker_args.push(std::ffi::OsString::from(format!("0x{:016x}", *h as usize)));
+            }
+            broker_args.push(std::ffi::OsString::from("--cwd"));
+            broker_args.push(current_dir.as_os_str().to_owned());
+
+            let mut broker_command_line = build_broker_command_line(&broker_path, &broker_args);
+            let broker_application_name = to_u16_null_terminated(&broker_path.to_string_lossy());
+
+            let mut startup_info_ex: STARTUPINFOEXW = unsafe {
+                // SAFETY: STARTUPINFOEXW is a plain Win32 FFI struct;
+                // zero-init is documented in the Win32 SDK.
+                std::mem::zeroed()
+            };
+            startup_info_ex.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
+            startup_info_ex.lpAttributeList = attr_list;
+            let lp_startup_info = &startup_info_ex.StartupInfo as *const STARTUPINFOW;
+
+            // CreateProcessW (NOT AsUserW) — broker runs at caller's identity
+            // (Medium IL = nono.exe's token). dwCreationFlags: CREATE_SUSPENDED
+            // + CREATE_UNICODE_ENVIRONMENT + EXTENDED_STARTUPINFO_PRESENT.
+            // bInheritHandles=1 because HANDLE_LIST gates the actual inherited
+            // set (only the two ConPTY pipe handles flipped inheritable above).
+            let created_local = unsafe {
+                // SAFETY: All pointers are valid for the duration of the call.
+                // The startup struct uses EXTENDED_STARTUPINFO_PRESENT which
+                // matches the STARTUPINFOEXW layout we initialized.
+                CreateProcessW(
+                    broker_application_name.as_ptr(),
+                    broker_command_line.as_mut_ptr(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    1, // bInheritHandles=TRUE; HANDLE_LIST gates which handles inherit.
+                    CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT,
+                    environment_block.as_mut_ptr() as *mut _,
+                    current_dir_u16.as_ptr(),
+                    lp_startup_info,
+                    &mut process_info,
+                )
+            };
+
+            unsafe {
+                // SAFETY: `attr_list` initialized above; safe to release
+                // after CreateProcessW (the kernel has copied the relevant
+                // attribute data into the new process's PEB).
                 DeleteProcThreadAttributeList(attr_list);
             }
-            return Err(NonoError::SandboxInit(format!(
-                "UpdateProcThreadAttribute (PSEUDOCONSOLE) failed (error={})",
-                unsafe { GetLastError() }
-            )));
-        }
 
-        let mut startup_info_ex: STARTUPINFOEXW = unsafe {
-            // SAFETY: STARTUPINFOEXW is a plain Win32 FFI struct; zero-init is valid.
-            std::mem::zeroed()
-        };
-        startup_info_ex.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
-        startup_info_ex.lpAttributeList = attr_list;
-
-        let lp_startup_info = &startup_info_ex.StartupInfo as *const STARTUPINFOW;
-
-        let created = if !h_token.is_null() {
-            unsafe {
-                // SAFETY: All pointers are valid for the duration of the call and
-                // EXTENDED_STARTUPINFO_PRESENT matches the provided startup struct.
-                CreateProcessAsUserW(
-                    h_token,
-                    application_name.as_ptr(),
-                    command_line.as_mut_ptr(),
-                    std::ptr::null(),
-                    std::ptr::null(),
-                    0,
-                    CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT,
-                    environment_block.as_mut_ptr() as *mut _,
-                    current_dir_u16.as_ptr(),
-                    lp_startup_info,
-                    &mut process_info,
-                )
+            // T-31-17 mitigation: unmark the ConPTY pipe handles non-inheritable
+            // on BOTH success and failure paths so subsequent CreateProcess
+            // calls in the supervisor don't accidentally leak them.
+            for h in &inherit_handles {
+                unsafe {
+                    // SAFETY: handle ownership rationale as above.
+                    let _ = SetHandleInformation(*h, HANDLE_FLAG_INHERIT, 0);
+                }
             }
+
+            created_local
         } else {
+            // Phase 30 LEGACY path (structurally unreachable today but
+            // preserved per D-15 fallback): direct Low-IL primary token spawn
+            // with PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE. Kept verbatim from
+            // pre-Plan-31-03 source.
+            let mut attr_size: usize = 0;
             unsafe {
-                // SAFETY: All pointers are valid for the duration of the call and
-                // EXTENDED_STARTUPINFO_PRESENT matches the provided startup struct.
-                CreateProcessW(
-                    application_name.as_ptr(),
-                    command_line.as_mut_ptr(),
-                    std::ptr::null(),
-                    std::ptr::null(),
-                    0,
-                    CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT,
-                    environment_block.as_mut_ptr() as *mut _,
-                    current_dir_u16.as_ptr(),
-                    lp_startup_info,
-                    &mut process_info,
-                )
+                // SAFETY: First call with a null list queries the required buffer size.
+                InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &mut attr_size);
             }
-        };
 
-        unsafe {
-            // SAFETY: `attr_list` was initialized above and can now be released.
-            DeleteProcThreadAttributeList(attr_list);
+            let mut attr_buf = vec![0u8; attr_size];
+            let attr_list: LPPROC_THREAD_ATTRIBUTE_LIST =
+                attr_buf.as_mut_ptr() as LPPROC_THREAD_ATTRIBUTE_LIST;
+
+            let ok = unsafe {
+                // SAFETY: `attr_list` points to `attr_buf`, which was sized by the
+                // probe call immediately above for exactly one attribute.
+                InitializeProcThreadAttributeList(attr_list, 1, 0, &mut attr_size)
+            };
+            if ok == 0 {
+                return Err(NonoError::SandboxInit(format!(
+                    "InitializeProcThreadAttributeList failed (error={})",
+                    unsafe { GetLastError() }
+                )));
+            }
+
+            let hpcon_value = pty_pair.hpcon;
+            let ok = unsafe {
+                // SAFETY: `attr_list` is initialized above and `hpcon_value` remains
+                // valid for the duration of process creation.
+                UpdateProcThreadAttribute(
+                    attr_list,
+                    0,
+                    PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE as usize,
+                    std::ptr::addr_of!(hpcon_value) as *mut _,
+                    size_of::<windows_sys::Win32::System::Console::HPCON>(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            };
+            if ok == 0 {
+                unsafe {
+                    // SAFETY: `attr_list` was initialized successfully above.
+                    DeleteProcThreadAttributeList(attr_list);
+                }
+                return Err(NonoError::SandboxInit(format!(
+                    "UpdateProcThreadAttribute (PSEUDOCONSOLE) failed (error={})",
+                    unsafe { GetLastError() }
+                )));
+            }
+
+            let mut startup_info_ex: STARTUPINFOEXW = unsafe {
+                // SAFETY: STARTUPINFOEXW is a plain Win32 FFI struct; zero-init is valid.
+                std::mem::zeroed()
+            };
+            startup_info_ex.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
+            startup_info_ex.lpAttributeList = attr_list;
+
+            let lp_startup_info = &startup_info_ex.StartupInfo as *const STARTUPINFOW;
+
+            let created = if !h_token.is_null() {
+                unsafe {
+                    // SAFETY: All pointers are valid for the duration of the call and
+                    // EXTENDED_STARTUPINFO_PRESENT matches the provided startup struct.
+                    CreateProcessAsUserW(
+                        h_token,
+                        application_name.as_ptr(),
+                        command_line.as_mut_ptr(),
+                        std::ptr::null(),
+                        std::ptr::null(),
+                        0,
+                        CREATE_SUSPENDED
+                            | CREATE_UNICODE_ENVIRONMENT
+                            | EXTENDED_STARTUPINFO_PRESENT,
+                        environment_block.as_mut_ptr() as *mut _,
+                        current_dir_u16.as_ptr(),
+                        lp_startup_info,
+                        &mut process_info,
+                    )
+                }
+            } else {
+                unsafe {
+                    // SAFETY: All pointers are valid for the duration of the call and
+                    // EXTENDED_STARTUPINFO_PRESENT matches the provided startup struct.
+                    CreateProcessW(
+                        application_name.as_ptr(),
+                        command_line.as_mut_ptr(),
+                        std::ptr::null(),
+                        std::ptr::null(),
+                        0,
+                        CREATE_SUSPENDED
+                            | CREATE_UNICODE_ENVIRONMENT
+                            | EXTENDED_STARTUPINFO_PRESENT,
+                        environment_block.as_mut_ptr() as *mut _,
+                        current_dir_u16.as_ptr(),
+                        lp_startup_info,
+                        &mut process_info,
+                    )
+                }
+            };
+
+            unsafe {
+                // SAFETY: `attr_list` was initialized above and can now be released.
+                DeleteProcThreadAttributeList(attr_list);
+            }
+            created
         }
-        created
     } else {
         // Phase 17 (ATCH-01): on the Windows detached path (no PTY,
         // NONO_DETACHED_LAUNCH=1), allocate three anonymous pipe pairs and
@@ -1915,5 +2162,74 @@ mod detached_stdio_tests {
                 DetachedStdioPipes::create().expect("create second DetachedStdioPipes");
             unsafe { pipes2.close_child_ends() };
         }
+    }
+}
+
+#[cfg(all(test, target_os = "windows"))]
+#[allow(clippy::unwrap_used)]
+mod broker_dispatch_tests {
+    // `IsProcessInJob` is the runtime acceptance for Plan 31-03 D-04: child of
+    // broker is in the Job Object. The test that uses it is `#[ignore]`'d
+    // pending Plan 31-05 field-test on the user's Windows test box (broker
+    // artifact must be built and present alongside the test binary). Importing
+    // it inside the test module keeps the production binary free of
+    // unused-import warnings under -D warnings.
+    use nono::NonoError;
+    use std::path::PathBuf;
+    #[allow(unused_imports)]
+    use windows_sys::Win32::System::JobObjects::IsProcessInJob;
+
+    /// Phase 31 D-07: `NonoError::BrokerNotFound { path }` is the structured
+    /// error variant returned when the sibling broker binary is absent. This
+    /// test pins the variant's wire shape (display-formats the path payload,
+    /// includes the literal "Broker binary not found" prefix) so future
+    /// readers can rely on the exact error text in operator-facing diagnostics.
+    ///
+    /// The full end-to-end "dispatch fails fast when sibling broker.exe is
+    /// missing" path is exercised by Plan 31-05 field-test against a real
+    /// `nono shell` invocation; this unit test is the always-on guarantor
+    /// that the variant is wired into the error chain and Plan 31-01's
+    /// contract is satisfied for use by the cascade.
+    #[test]
+    fn broker_not_found_error_variant_is_constructible_and_displays_path() {
+        let err = NonoError::BrokerNotFound {
+            path: PathBuf::from(r"C:\does\not\exist\nono-shell-broker.exe"),
+        };
+        let s = err.to_string();
+        assert!(
+            s.contains("nono-shell-broker.exe"),
+            "BrokerNotFound display should include the sibling filename; got: {s}"
+        );
+        assert!(
+            s.contains("Broker binary not found"),
+            "BrokerNotFound display should carry the canonical prefix; got: {s}"
+        );
+    }
+
+    /// Phase 31 D-04 acceptance: child of broker is in the Job Object.
+    ///
+    /// E2E test: requires the broker artifact present + a controlled spawn
+    /// through the BrokerLaunch dispatch. Implemented as `#[ignore]`'d for
+    /// Plan 31-05 field execution because it requires:
+    ///   (a) the broker binary built and present at
+    ///       `target/<triple>/release/nono-shell-broker.exe`,
+    ///   (b) a real ConPTY allocation,
+    ///   (c) the existing process-containment plumbing.
+    ///
+    /// Plan 31-05 lifts the `#[ignore]` for the field-test runner; Plan 31-04
+    /// release pipeline ensures the broker artifact is present before the
+    /// test runs in CI. Acceptance: spawn a controlled broker via the
+    /// dispatch with `--shell <test-helper> --shell-arg --noop`, capture the
+    /// broker PID + child PID, call
+    /// `IsProcessInJob(child_pid, containment.job, &mut in_job)`, assert
+    /// `in_job != 0`.
+    #[test]
+    #[ignore]
+    fn broker_launch_assigns_child_to_job_object() {
+        // EXECUTOR: implement when the test helper binary and broker artifact
+        // are guaranteed available. See Plan 31-05 Task body for the exact
+        // dispatch + IsProcessInJob assertion. The `IsProcessInJob` import
+        // above is kept under `#[allow(unused_imports)]` so it's wired and
+        // ready when this body lands.
     }
 }

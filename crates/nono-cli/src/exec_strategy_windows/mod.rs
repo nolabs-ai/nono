@@ -82,6 +82,10 @@ use windows_sys::Win32::System::JobObjects::{
     JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION, JOB_OBJECT_LIMIT_JOB_MEMORY,
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
+// `IsProcessInJob` is consumed only by Plan 31-03's broker_dispatch_tests
+// (gated under `#[cfg(all(test, target_os = "windows"))]`); the import lives
+// inside that test module via a `use` to keep the production binary free of
+// unused-import warnings under -D warnings.
 use windows_sys::Win32::System::Services::{
     OpenSCManagerW, OpenServiceW, QueryServiceStatusEx, SC_MANAGER_CONNECT, SC_STATUS_PROCESS_INFO,
     SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_STATUS_PROCESS,
@@ -92,7 +96,8 @@ use windows_sys::Win32::System::Threading::{
     InitializeProcThreadAttributeList, OpenProcessToken, ResumeThread, TerminateProcess,
     UpdateProcThreadAttribute, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
     EXTENDED_STARTUPINFO_PRESENT, LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION,
-    PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, STARTUPINFOEXW, STARTUPINFOW,
+    PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, STARTUPINFOEXW,
+    STARTUPINFOW,
 };
 
 pub(crate) use env_sanitization::is_dangerous_env_var;

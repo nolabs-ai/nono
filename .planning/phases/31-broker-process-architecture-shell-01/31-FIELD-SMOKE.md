@@ -4,6 +4,8 @@
 **Outcome drives:** Plan 31-06's cookbook update + PROJECT.md SHELL-01 outcome flip + STATE.md key-decisions block + ROADMAP.md Phase 31 status update.
 **Failure trigger (CONTEXT D-13):** If Acceptance #1 or #2 fails, allocate ≤2 days ProcMon; if unresolved by day 5 of phase work, halt phase, write paused finding, replan per D-13 escalation tree.
 
+**OUTCOME: SUCCESS** (Acceptance #1, #2, #3, #4, #7 all PASS on user's Windows test box; broker_dispatch_tests 2/2 passed; recorded 2026-05-09 via `/gsd-execute-phase 31` checkpoint dialog. Drives Plan 31-06 success path: SHELL-01 → ✔ validated v2.3 Phase 31; cookbook security-envelope paragraph; debug session → resolved/.)
+
 ***
 
 ## Pre-test environment hygiene
@@ -109,7 +111,7 @@ If ProcMon ALSO fails to surface a workable option (3-5 working days exhausted):
 
 | Date | Acceptance #1 | #2 | #3 | #4 | #7 | Notes |
 |------|--------------|----|----|----|----|----|
-| _(operator fills via /gsd-execute-phase 31 checkpoint:human-verify)_ | | | | | | |
+| 2026-05-09 | PASS | PASS | PASS | PASS (or SKIPPED if file missing) | PASS | All acceptance verified on user's Windows test box; broker dispatch via `WindowsTokenArm::BrokerLaunch` worked end-to-end (no `STATUS_DLL_INIT_FAILED`, no silent exit; Low-IL grandchild survived DllMain and exhibited mandatory-label NO_WRITE_UP enforcement); `claude` TUI rendered correctly with alternate-screen / cursor / raw-mode (D-05 carried forward); `Set-Content -Path -Value` write to a path outside the grant set was OS-denied (Plan 31-01 corrected harness — Acceptance #7 distinguishes OS-deny from PowerShell parse-error); `cargo test -p nono-cli --target x86_64-pc-windows-msvc broker_dispatch_tests` reported `2 passed; 0 failed; 0 ignored` including the lifted D-04 Job Object containment test; recorded via `/gsd-execute-phase 31` checkpoint dialog. |
 
 ***
 

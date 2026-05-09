@@ -155,8 +155,27 @@ pub fn discover_sessions() -> Result<Vec<SessionInfo>> {
     Ok(sessions)
 }
 
+/// One-shot deprecation warning when load_session resolves a session via
+/// the legacy `<rollback>/<id>/` path instead of the canonical
+/// `<audit>/<id>/`. The shim is removed in v2.5 (D-27.2-02,
+/// docs/architecture/audit-bundle-target.md).
+fn warn_once_legacy_bundle_path(legacy_dir: &Path, canonical_dir: &Path) {
+    static WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    if WARNED.get().is_none() {
+        tracing::warn!(
+            "audit-attestation bundle found at legacy {} path; canonical \
+             location is {}. This compatibility shim is removed in v2.5 \
+             -- re-sign affected sessions if needed.",
+            legacy_dir.display(),
+            canonical_dir.display(),
+        );
+        // Another thread may race; OnceLock keeps the first set, the rest
+        // become no-ops. Worst case: warn fires twice across racing threads.
+        let _ = WARNED.set(());
+    }
+}
+
 /// Load a specific audit session by ID.
-#[allow(dead_code)]
 pub fn load_session(session_id: &str) -> Result<SessionInfo> {
     validate_session_id(session_id)?;
     let primary_root = audit_root()?;
@@ -189,6 +208,9 @@ pub fn load_session(session_id: &str) -> Result<SessionInfo> {
         let is_primary = dir.starts_with(&primary_root);
         if !is_primary && metadata.snapshot_count > 0 {
             continue;
+        }
+        if !is_primary {
+            warn_once_legacy_bundle_path(&dir, &primary_root.join(session_id));
         }
 
         return Ok(build_session_info(dir, metadata));

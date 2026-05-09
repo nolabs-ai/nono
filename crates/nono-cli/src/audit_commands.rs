@@ -9,7 +9,8 @@ use crate::audit_integrity::verify_audit_log;
 use crate::cli::{
     AuditArgs, AuditCleanupArgs, AuditCommands, AuditListArgs, AuditShowArgs, AuditVerifyArgs,
 };
-use crate::rollback_session::{discover_sessions, load_session, remove_session, SessionInfo};
+use crate::audit_session::load_session;
+use crate::rollback_session::{discover_sessions, remove_session, SessionInfo};
 use crate::theme;
 use colored::Colorize;
 use nono::undo::SnapshotManager;
@@ -348,7 +349,23 @@ fn read_capability_decisions_from_ledger(
 }
 
 fn cmd_show(args: AuditShowArgs) -> Result<()> {
-    let session = load_session(&args.session_id)?;
+    // D-27.2-04 cascade: cmd_show, like cmd_verify, uses the audit-aware
+    // loader so audit-only sessions written under <home>/.nono/audit/<id>/
+    // are findable. The local `SessionInfo` here is the rollback_session
+    // shape (used by helpers like print_show_json / session_status_label
+    // that are also called from cmd_list); both structs have the identical
+    // {metadata, dir, disk_size, is_alive, is_stale} field shape, so we
+    // shim the audit-side hit into the rollback-side type at this single
+    // boundary. Keeps the helper signatures untouched (out of Phase 27.2
+    // scope) while honoring D-27.2-04 always-audit-first.
+    let audit_session_info = load_session(&args.session_id)?;
+    let session = SessionInfo {
+        metadata: audit_session_info.metadata,
+        dir: audit_session_info.dir,
+        disk_size: audit_session_info.disk_size,
+        is_alive: audit_session_info.is_alive,
+        is_stale: audit_session_info.is_stale,
+    };
 
     if args.json {
         return print_show_json(&session);

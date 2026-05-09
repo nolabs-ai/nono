@@ -63,10 +63,12 @@ pub fn ensure_audit_session_dir(session_id: &str) -> Result<PathBuf> {
 
 /// Ensure the rollback session directory exists for the given session id.
 ///
-/// Returns the rollback-backed session directory under `~/.nono/rollbacks/<id>`
-/// (or the override path when provided). Used when rollback snapshots are
-/// captured alongside audit metadata.
-#[allow(dead_code)]
+/// Returns the rollback-backed session directory under
+/// `<rollback_root>/<id>/` (or the override path when provided), where
+/// `rollback_root` is the same canonical path consulted by
+/// `rollback_session::discover_sessions`, `nono rollback list`, and
+/// `nono rollback restore`. Used by `create_audit_state` when rollback
+/// snapshots are captured alongside audit metadata.
 pub fn ensure_rollback_session_dir(
     session_id: &str,
     rollback_destination: Option<&PathBuf>,

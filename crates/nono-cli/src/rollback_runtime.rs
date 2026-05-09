@@ -233,31 +233,19 @@ pub(crate) fn create_audit_state(
     // CONTEXT § Claude's Discretion permits this minimal-diff: expose the
     // rollback path as AuditState.rollback_dir and route the rollback-active
     // SnapshotManager call site through it.
+    // BL-02 fix (27.2-REVIEW): the canonical rollback root differs from
+    // `nono_home_dir().join(".nono").join("rollbacks")` on Windows
+    // production (`%LOCALAPPDATA%\nono\rollbacks` vs
+    // `%USERPROFILE%\.nono\rollbacks`). Route through
+    // `ensure_rollback_session_dir`, which uses `rollback_session::rollback_root()`
+    // — the same helper that `discover_sessions` / `nono rollback list` /
+    // `restore` consult — so combo sessions stay visible to the rollback
+    // commands.
     let rollback_dir = if rollback_active {
-        let rollback_root = match rollback_destination {
-            Some(path) => path.clone(),
-            None => {
-                let home = crate::config::nono_home_dir()?;
-                home.join(".nono").join("rollbacks")
-            }
-        };
-        let dir = rollback_root.join(&session_id);
-        std::fs::create_dir_all(&dir).map_err(|e| {
-            nono::NonoError::Snapshot(format!(
-                "Failed to create rollback session directory {}: {}",
-                dir.display(),
-                e
-            ))
-        })?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::Permissions::from_mode(0o700);
-            if let Err(e) = std::fs::set_permissions(&dir, perms) {
-                warn!("Failed to set rollback session directory permissions to 0700: {e}");
-            }
-        }
+        let dir = crate::audit_session::ensure_rollback_session_dir(
+            &session_id,
+            rollback_destination,
+        )?;
         Some(dir)
     } else {
         None
@@ -666,6 +654,21 @@ pub(crate) fn finalize_supervised_exit(ctx: RollbackExitContext<'_>) -> Result<(
         };
         manager.save_session_metadata(&meta)?;
         audit_saved = true;
+
+        // BL-01 fix (27.2-REVIEW): when rollback snapshots live at a
+        // different dir from audit-attestation bundles, mirror session.json
+        // to the audit dir so `audit_session::load_session` finds combo
+        // sessions by their audit-side ID. The audit-only branch below
+        // already writes to `audit_state.session_dir` directly; this branch
+        // covers the `--rollback --audit-integrity` combo case.
+        if let Some(state) = audit_state {
+            if state.rollback_dir.is_some() {
+                nono::undo::SnapshotManager::write_session_metadata(
+                    &state.session_dir,
+                    &meta,
+                )?;
+            }
+        }
 
         if !changes.is_empty() {
             output::print_rollback_session_summary(&changes, silent);

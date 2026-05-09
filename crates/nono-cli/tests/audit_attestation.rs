@@ -245,79 +245,52 @@ fn only_audit_session_id(home: &Path) -> String {
     session_ids.remove(0)
 }
 
-// Plan 22-05a Task 8 (upstream `9db06336`): the 188 LOC integration test
-// fixture imports verbatim from upstream but exercises features that
-// require upstream's full audit_ledger.rs + nono::trust::signing
-// `sign_statement_bundle` API surface, neither of which are available in
-// the fork's v2.1 baseline (Decision 5 deferred audit_ledger to 22-05b
-// and the trust signing API rename was never landed in v2.1).
-//
-// In particular both fixtures call `nono trust keygen --keyref file://...`
-// which produces a PKCS8-format signing key on disk; the upstream
-// `--audit-sign-key file://...` path then loads that PKCS8 via a from_pkcs8
-// constructor on KeyPair. The fork's sigstore-crypto 0.6.4 has no such
-// constructor (only generate_ecdsa_p256), so the manual port in
-// `crates/nono-cli/src/audit_attestation.rs` uses generate_signing_key
-// per-session instead.
-//
-// Phase 27 Plan 01 (REQ-AAH-01) — Path B fixture redesign attempted on
-// Windows host on 2026-04-29; surfaced 3 platform blockers (dirs::home_dir
-// not env-overridable on Windows, audit/rollback path mismatch under
-// partial env redirection, audit-integrity exit-cleanup "Session not found").
-// Tests re-#[ignore]'d with v2.4-deferral note; production code preserved
-// byte-identical. See `.planning/phases/27-audit-attestation-hardening/
-// 27-01-SUMMARY.md` for full Phase 27 surfaced report.
-//
-// Phase 27.1 (REQ-NTH-01..03, 2026-05-04) — Production-code NONO_TEST_HOME
-// seam landed in `crates/nono-cli/src/config/mod.rs::nono_home_dir()`. The
-// helper honors NONO_TEST_HOME on all platforms (including Windows, where
-// `dirs::home_dir()` ignores `USERPROFILE` via `SHGetKnownFolderPath`).
-// 15 callsites in `crates/nono-cli/src/` migrated. The seam closes
-// Blockers 1 and 2; this plan re-enables both deferred tests below using
-// the seam. Blocker 3 (audit-integrity exit-cleanup `Session not found`)
-// is handled per D-27.1-14: small fixes in-scope, larger investigation
-// surfaces as a v2.4 follow-up. See
-// `.planning/phases/27.1-nono-test-home-seam/27.1-CONTEXT.md` for the
-// full Phase 27.1 decision set.
-//
-// Phase 27.1 Plan 03 Task 3 (D-27.1-14 large-fix branch, 2026-05-04):
-// the NONO_TEST_HOME seam itself now reaches every audit/rollback path
-// (verified by Plan 01's unit tests + Plan 02's callsite migration). The
-// seam works as designed; however, running these two re-enabled tests on
-// the Windows host surfaced a SEPARATE production-code bug downstream of
-// the seam:
-//
-//   `nono audit verify <session_id>` (and `nono audit show`) call
-//   `crate::rollback_session::load_session()` which only inspects
-//   `<home>/.nono/rollbacks/<id>/`. Audit-only sessions created by
-//   `--audit-integrity` (without `--rollback`) live at
-//   `<home>/.nono/audit/<id>/` and are therefore not findable by the
-//   verify path. The audit-aware loader `audit_session::load_session()`
-//   already exists with correct dual-root semantics (it checks both
-//   `<home>/.nono/audit/` and `<home>/.nono/rollbacks/`) but is gated
-//   behind `#[allow(dead_code)]` and is NOT wired into `audit_commands.rs`.
-//   See `crates/nono-cli/src/audit_commands.rs:12` (current import) and
-//   `crates/nono-cli/src/audit_session.rs:160` (the correct loader).
-//
-// A second production-code gap surfaced for Test 2 (`rollback_signed_..`):
-// the test asserts `<audit>/<id>/audit-attestation.bundle` exists for a
-// `--rollback --audit-sign-key` session, but `sign_session_attestation`
-// writes the bundle to `session_dir` (which is `<rollback>/<id>/` when
-// `rollback_active`) and does NOT mirror to the audit dir. Either the
-// supervisor needs a bundle-mirror step or `audit verify` needs to look
-// in both roots — non-trivial production architecture either way.
-//
-// Both gaps are independent of the NONO_TEST_HOME seam; they are surface
-// bugs that the seam exposes by isolating tests properly. Per
-// D-27.1-14, these are NOT in scope for Phase 27.1 — small `dirs::home_dir`
-// missed-callsite fixes were the in-scope contingency, but a loader-swap
-// or a sign-target-architecture change is broader work. Tests are
-// re-#[ignore]'d with this Blocker-3-resurfaced note; the seam itself
-// (Plans 01 + 02) is the deliverable. The tests will be re-enabled in a
-// v2.4 follow-up phase that addresses the audit-loader and bundle-target
-// architecture. See `27.1-03-SUMMARY.md` for the full surfaced report.
+/// Local RAII env-var guard for the integration test (Phase 27.2 D-27.2-09).
+///
+/// `crate::test_env::EnvVarGuard` lives under `#[cfg(test)]` in
+/// `crates/nono-cli/src/test_env.rs` and is therefore not visible from the
+/// integration test compilation unit. Duplicating the Drop-restore shape
+/// here is the lightest landing per CONTEXT § Claude's Discretion (single
+/// test file; no shared `tests/common.rs` module yet).
+///
+/// The integration test uses dynamically-named env vars
+/// (`format!("NONO_TEST_AUDIT_KEY_VERIFY_{suffix}")`) so the key type is
+/// `String`, not `&'static str` like the unit-test guard. Restoration on
+/// `Drop` ensures a panic in `run_nono` does not leak the test secret env
+/// var (closes Phase 27.1 REVIEW WR-05).
+struct ScopedEnvVar {
+    key: String,
+    original: Option<String>,
+}
+
+impl ScopedEnvVar {
+    #[allow(clippy::disallowed_methods)] // This is the safe wrapper for env-var mutation.
+    fn set(key: String, value: &str) -> Self {
+        let original = std::env::var(&key).ok();
+        std::env::set_var(&key, value);
+        Self { key, original }
+    }
+}
+
+impl Drop for ScopedEnvVar {
+    #[allow(clippy::disallowed_methods)] // Restoration is the other half of the safe wrapper.
+    fn drop(&mut self) {
+        match &self.original {
+            Some(value) => std::env::set_var(&self.key, value),
+            None => std::env::remove_var(&self.key),
+        }
+    }
+}
+
+// Phase 27.2 (REQ-AAHX-01..03, 2026-05-05): the v2.4 follow-ups surfaced by
+// Phase 27.1 D-27.1-14 — audit-loader swap (FU-1) and bundle-target
+// migration (FU-2) — landed in Plans 27.2-01 and 27.2-02. Both
+// previously-deferred ignore attributes are removed below; tests run
+// end-to-end against the NONO_TEST_HOME seam on Windows host. Bundle
+// target locked at <audit_root>/<id>/audit-attestation.bundle regardless
+// of --rollback per docs/architecture/audit-bundle-target.md (D-27.2-01
+// Option A).
 #[test]
-#[ignore = "Phase 27.1 Plan 03 Blocker 3 resurfaced: audit verify uses rollback_session::load_session which can't find audit-only sessions; production loader swap queued for v2.4 follow-up"]
 fn audit_verify_reports_signed_attestation_with_pinned_public_key() {
     let (_tmp, home, workspace) = setup_isolated_home();
 
@@ -338,15 +311,11 @@ fn audit_verify_reports_signed_attestation_with_pinned_public_key() {
     let env_var = format!("NONO_TEST_AUDIT_KEY_VERIFY_{suffix}");
     let secret = format!("phase-27-path-b-test-secret-{suffix}");
     // Per-invocation env-var name (PID + nanos suffix above) avoids
-    // collisions across parallel test runs. ENV_LOCK from
-    // `crates/nono-cli/src/test_env.rs` is unit-test-only (the module is
-    // `#[cfg(test)]`-gated to the unit-test compilation unit), so this
-    // integration test relies on per-invocation env-var names instead.
-    // Disallowed-methods lint is locally allowed for the same reason.
-    #[allow(clippy::disallowed_methods)]
-    {
-        std::env::set_var(&env_var, &secret);
-    }
+    // collisions across parallel test runs. Phase 27.2 D-27.2-09: wrap
+    // the set/remove pair in a local ScopedEnvVar RAII guard so a panic
+    // in run_nono doesn't leak the test secret env var (closes Phase 27.1
+    // REVIEW WR-05).
+    let _env_guard = ScopedEnvVar::set(env_var.clone(), &secret);
     let keyref = format!("env://{env_var}");
 
     let cmd_args = run_command_args();
@@ -359,10 +328,6 @@ fn audit_verify_reports_signed_attestation_with_pinned_public_key() {
     ];
     args.extend(cmd_args.iter().copied());
     let run_output = run_nono(&args, &home, &workspace);
-    #[allow(clippy::disallowed_methods)]
-    {
-        std::env::remove_var(&env_var);
-    }
     assert_success(&run_output);
 
     // Phase 27.1: NONO_TEST_HOME isolates the test's audit_root to <home>/.nono/audit
@@ -486,7 +451,6 @@ fn audit_verify_reports_signed_attestation_with_pinned_public_key() {
 }
 
 #[test]
-#[ignore = "Phase 27.1 Plan 03 Blocker 3 resurfaced: --rollback session writes bundle to <rollback>/<id> not <audit>/<id>; production sign-target architecture or audit-loader fix queued for v2.4 follow-up"]
 fn rollback_signed_session_verifies_from_audit_dir_bundle() {
     let (_tmp, home, workspace) = setup_isolated_home();
     fs::write(workspace.join("tracked.txt"), "before\n").expect("write tracked file");
@@ -531,9 +495,18 @@ fn rollback_signed_session_verifies_from_audit_dir_bundle() {
     assert_success(&verify_output);
 
     let json: Value = serde_json::from_slice(&verify_output.stdout).expect("parse verify json");
-    assert_eq!(json["attestation"]["present"], true);
-    assert_eq!(json["attestation"]["signature_verified"], true);
-    assert_eq!(json["attestation"]["merkle_root_matches"], true);
-    assert_eq!(json["attestation"]["session_id_matches"], true);
-    assert_eq!(json["attestation"]["verification_error"], Value::Null);
+    // Phase 27.2 D-27.2-08 (closes Phase 27.1 REVIEW WR-04): cmd_verify
+    // emits a flat JSON shape (`attestation_present`, `attestation_valid`)
+    // per audit_commands.rs:634-639. The richer nested shape (
+    // `json["attestation"]["signature_verified"]` etc.) is deferred to
+    // v2.5-FU-2 (cmd_verify v2 JSON schema) per
+    // .planning/phases/27.1-nono-test-home-seam/deferred-items.md
+    // § "Phase 27.2 v2.5 production follow-ups". Production JSON shape is
+    // NOT changed in Phase 27.2; only the test assertion is corrected to
+    // match the existing flat output.
+    assert_eq!(json["attestation_present"], true);
+    assert_eq!(json["attestation_valid"], true);
+    // TODO(v2.5-FU-2): when cmd_verify ships the v2 nested schema, restore
+    // assertions on signature_verified, merkle_root_matches,
+    // session_id_matches, verification_error.
 }

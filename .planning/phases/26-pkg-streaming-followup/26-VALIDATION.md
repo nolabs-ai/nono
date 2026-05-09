@@ -110,3 +110,24 @@ One privilege-conditional behavior:
 - [ ] `nyquist_compliant: true` — set to `partial` because Plan 26-02 is unexecuted; will flip to `true` only after Plan 26-02 executes and a follow-up validation pass closes PKGS-01 + PKGS-04 truths.
 
 **Approval:** approved 2026-05-09 (Plan 26-01 surface only)
+
+---
+
+## Validation Audit 2026-05-09 (re-audit)
+
+Re-confirmed compliance at HEAD via fresh `cargo test -p nono-cli --bin nono -- validate_relative_path_rejects_traversal validate_relative_path_rejects_absolute_path validate_path_within_rejects_symlink_escape artifact_type_plugin_round_trips artifact_type_unknown_fails_closed`: **5 passed; 0 failed; 0 ignored** (~9 s targeted, includes build). All Per-Task Map runtime rows remain green.
+
+Documentation drift corrected on one must-have grep gate (cosmetic only — runtime behavior was always satisfied):
+
+| Row | Drift | Fix |
+|-----|-------|-----|
+| Plan must-have truth #2 | Documented `grep -c 'fn validate_path_within' crates/nono-cli/src/package_cmd.rs` = "exactly 1" (production fn definition only). At HEAD this returns 2 — production fn at line 1043 + new test fn name `validate_path_within_rejects_symlink_escape` at line 1210, which shares the `fn validate_path_within` substring. Same overlap pattern truth #1 already documents for `fn validate_relative_path` (3 matches: 1 production + 2 test fn names). | Production-fn count of 1 verifiable by line-by-line inspection: `crates/nono-cli/src/package_cmd.rs:1043` is the only `fn validate_path_within(base: &Path, full: &Path) -> Result<()>` definition. The line-1210 match is the regression test added during the original 2026-05-09 audit to close truth #7 — its function-name overlap with truth #2's grep pattern is benign. Defense-in-depth posture (truth #2 substance) is unchanged. |
+
+| Metric | Count |
+|--------|-------|
+| Gaps found | 0 (runtime); 1 (cosmetic grep-gate drift on truth #2) |
+| Resolved | 1 (cosmetic — documented inline above) |
+| Escalated | 0 |
+| New tests written | 0 |
+| Existing tests verified | 5 (all green at HEAD) |
+| `nyquist_compliant` status | unchanged: `partial` (Plan 26-02 still queued for v2.4; will flip to `true` only after Plan 26-02 executes and a follow-up validation pass closes PKGS-01 + PKGS-04 truths) |

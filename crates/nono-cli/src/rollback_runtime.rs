@@ -11,7 +11,17 @@ use tracing::warn;
 
 pub(crate) struct AuditState {
     pub(crate) session_id: String,
+    /// Audit-side directory: `<audit_root>/<id>/`. Always populated when
+    /// `--audit-integrity` is requested (per Phase 27.2 D-27.2-01). The
+    /// signed audit-attestation bundle and the audit-events ledger always
+    /// land under this path so they outlive `rm -rf <rollback_root>/<id>/`.
     pub(crate) session_dir: PathBuf,
+    /// Rollback-side directory: `<rollback_root>/<id>/`. `Some` only when
+    /// `--rollback` is active. Snapshot artifacts (`changes/`, `snapshots/`,
+    /// `session.json`) land here, preserving the pre-Phase-27.2 snapshot
+    /// storage layout while `session_dir` is repointed to the audit root
+    /// for the bundle-target migration (D-27.2-01).
+    pub(crate) rollback_dir: Option<PathBuf>,
 }
 
 pub(crate) type RollbackRuntimeState = (
@@ -195,7 +205,35 @@ pub(crate) fn create_audit_state(
         std::process::id()
     );
 
-    let session_dir = if rollback_active {
+    // Phase 27.2 D-27.2-01 (Option A): the audit attestation bundle ALWAYS
+    // lands at <audit_root>/<id>/audit-attestation.bundle regardless of
+    // --rollback. This closes the non-repudiation hole where
+    // `rm -rf <rollback>/<id>/` would delete the bundle along with the
+    // snapshot. Snapshot files (changes/, snapshots/, session.json) continue
+    // to live under <rollback>/<id>/ when --rollback is set; only the
+    // bundle (and the audit-events ledger that the bundle signs) move.
+    // ADR: docs/architecture/audit-bundle-target.md (supersedes Plan 22-05a
+    // Decision 5 "for backward compatibility" dual-location rationale).
+    let session_dir = crate::audit_session::ensure_audit_session_dir(&session_id)?;
+
+    // When --rollback is active, ALSO create <rollback_root>/<id>/ for the
+    // SnapshotManager (which stores `changes/`, `snapshots/`, `session.json`
+    // under its `session_dir` argument). The created path is exposed via
+    // AuditState.rollback_dir; it is NOT bound to session_dir and is NOT
+    // the attestation-bundle target.
+    //
+    // Deviation note (Plan 27.2-02 Rule 1): the plan's interfaces block
+    // claimed snapshot creation uses a separate variable (not
+    // AuditState.session_dir). At execution time, two SnapshotManager::new
+    // call sites (initialize_rollback_state, initialize_audit_snapshots)
+    // were found to consume audit_state.session_dir for snapshot-storage
+    // root. Naively repointing session_dir to the audit dir would have
+    // moved snapshot artifacts under <audit_root>/<id>/ — violating the
+    // must_have "snapshot files continue to land under <rollback_root>/<id>/".
+    // CONTEXT § Claude's Discretion permits this minimal-diff: expose the
+    // rollback path as AuditState.rollback_dir and route the rollback-active
+    // SnapshotManager call site through it.
+    let rollback_dir = if rollback_active {
         let rollback_root = match rollback_destination {
             Some(path) => path.clone(),
             None => {
@@ -206,7 +244,7 @@ pub(crate) fn create_audit_state(
         let dir = rollback_root.join(&session_id);
         std::fs::create_dir_all(&dir).map_err(|e| {
             nono::NonoError::Snapshot(format!(
-                "Failed to create session directory {}: {}",
+                "Failed to create rollback session directory {}: {}",
                 dir.display(),
                 e
             ))
@@ -217,18 +255,18 @@ pub(crate) fn create_audit_state(
             use std::os::unix::fs::PermissionsExt;
             let perms = std::fs::Permissions::from_mode(0o700);
             if let Err(e) = std::fs::set_permissions(&dir, perms) {
-                warn!("Failed to set session directory permissions to 0700: {e}");
+                warn!("Failed to set rollback session directory permissions to 0700: {e}");
             }
         }
-        dir
+        Some(dir)
     } else {
-        // Audit-only session: route to ~/.nono/audit/<id>.
-        crate::audit_session::ensure_audit_session_dir(&session_id)?
+        None
     };
 
     Ok(Some(AuditState {
         session_id,
         session_dir,
+        rollback_dir,
     }))
 }
 
@@ -452,8 +490,23 @@ pub(crate) fn initialize_rollback_state(
     }
 
     // D-04: snapshot manager init failure → warning-only, execution continues.
+    //
+    // Phase 27.2 D-27.2-01: snapshot artifacts (`changes/`, `snapshots/`,
+    // `session.json`) MUST land at `<rollback_root>/<id>/` so the audit
+    // attestation bundle's relocation to `<audit_root>/<id>/` does not also
+    // move snapshot storage. `audit_state.rollback_dir` is `Some` whenever
+    // `initialize_rollback_state` reaches this point: the early-return at
+    // `if !rollback.requested || rollback.disabled` gates rollback-inactive
+    // callers out, and `create_audit_state` populates `rollback_dir` under
+    // the same condition (`rollback_active`). The `unwrap_or_else` fallback
+    // to `session_dir` is a defense-in-depth failsafe; under correct gating
+    // it never fires.
+    let snapshot_session_dir = audit_state
+        .rollback_dir
+        .clone()
+        .unwrap_or_else(|| audit_state.session_dir.clone());
     let mut manager = match nono::undo::SnapshotManager::new(
-        audit_state.session_dir.clone(),
+        snapshot_session_dir,
         tracked_paths.clone(),
         exclusion,
         nono::undo::WalkBudget::default(),

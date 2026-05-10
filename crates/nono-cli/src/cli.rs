@@ -248,10 +248,10 @@ const ROOT_HELP_TEMPLATE: &str = "\
   why        Check why a path or network operation would be allowed or denied
 
 \x1b[1mSESSION MANAGEMENT\x1b[0m
-  ps         List running agent sessions
+  ps         Inspect the unsupported Windows session-management surface
   stop       Stop a running agent session
-  detach     Detach from an active session
-  attach     Re-attach to a running session
+  detach     Inspect the unsupported Windows session-management surface
+  attach     Inspect the unsupported Windows session-management surface
   logs       View runtime session event logs
   inspect    Show detailed runtime session state
   session    Manage runtime session storage (cleanup)
@@ -366,7 +366,13 @@ IN-BAND DETACH:
 ";
 
 #[cfg(target_os = "windows")]
-const LOGS_AFTER_HELP: &str = "\x1b[1mEXAMPLES\x1b[0m
+const LOGS_AFTER_HELP: &str = "\x1b[1mWINDOWS LIMITATION\x1b[0m
+  `nono logs` is intentionally unavailable on Windows.
+  Runtime session event-log inspection depends on detached-session infrastructure
+  that is not available on Windows.
+  Use `nono run` for supported execution instead.
+
+\x1b[1mEXAMPLES\x1b[0m
   nono logs a3f7c2                             # View event log for session
   nono logs --tail 20 a3f7c2                   # Show last 20 events
   nono logs --json a3f7c2                      # JSON output
@@ -409,7 +415,13 @@ const LOGS_USAGE: &str = "\
 {after-help}";
 
 #[cfg(target_os = "windows")]
-const INSPECT_AFTER_HELP: &str = "\x1b[1mEXAMPLES\x1b[0m
+const INSPECT_AFTER_HELP: &str = "\x1b[1mWINDOWS LIMITATION\x1b[0m
+  `nono inspect` is intentionally unavailable on Windows.
+  Detailed runtime session inspection depends on detached-session infrastructure
+  that is not available on Windows.
+  Use `nono run` for supported execution instead.
+
+\x1b[1mEXAMPLES\x1b[0m
   nono inspect a3f7c2                          # Show session details
   nono inspect --json a3f7c2                   # JSON output
 ";
@@ -447,7 +459,13 @@ const INSPECT_USAGE: &str = "\
 {after-help}";
 
 #[cfg(target_os = "windows")]
-const PRUNE_AFTER_HELP: &str = "\x1b[1mDEPRECATED\x1b[0m
+const PRUNE_AFTER_HELP: &str = "\x1b[1mWINDOWS LIMITATION\x1b[0m
+  `nono prune` is intentionally unavailable on Windows.
+  Runtime session file cleanup depends on session-management infrastructure
+  that is not available on Windows.
+  Use `nono session cleanup` on a supported platform.
+
+\x1b[1mDEPRECATED\x1b[0m
   `nono prune` is deprecated; use `nono session cleanup` instead.
   This alias is hidden from `nono --help` and will emit a deprecation
   note to stderr on every invocation. Survival horizon: v2.3-milestone
@@ -455,9 +473,8 @@ const PRUNE_AFTER_HELP: &str = "\x1b[1mDEPRECATED\x1b[0m
 
 \x1b[1mEXAMPLES\x1b[0m
   nono prune --dry-run                         # Preview what would be cleaned
-  nono prune --older-than 7d                   # Remove exited sessions older than 7 days
-  nono prune --older-than 12h                  # Remove exited sessions older than 12 hours
-  nono prune --all-exited                      # Remove every exited session (escape hatch)
+  nono prune --older-than 7d                   # Remove exited sessions
+  nono prune --all-exited                      # Remove every exited session
   nono prune --keep 10                         # Keep only 10 most recent sessions
 ";
 

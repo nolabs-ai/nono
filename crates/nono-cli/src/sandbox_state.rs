@@ -30,6 +30,9 @@ pub struct SandboxState {
     /// backward compat with existing NONO_CAP_FILE JSON from running sessions.
     #[serde(default, alias = "override_deny_paths")]
     pub bypass_protection_paths: Vec<String>,
+    /// Proxy domain allowlist at sandbox creation time
+    #[serde(default)]
+    pub allowed_domains: Vec<String>,
 }
 
 /// Serializable filesystem capability state
@@ -46,8 +49,12 @@ pub struct FsCapState {
 }
 
 impl SandboxState {
-    /// Create sandbox state from a CapabilitySet and bypass_protection paths
-    pub fn from_caps(caps: &CapabilitySet, bypass_protection_paths: &[PathBuf]) -> Self {
+    /// Create sandbox state from a CapabilitySet, bypass_protection paths, and domain allowlist
+    pub fn from_caps(
+        caps: &CapabilitySet,
+        bypass_protection_paths: &[PathBuf],
+        allowed_domains: &[String],
+    ) -> Self {
         Self {
             fs: caps
                 .fs_capabilities()
@@ -70,6 +77,7 @@ impl SandboxState {
                 .iter()
                 .map(|p| p.display().to_string())
                 .collect(),
+            allowed_domains: allowed_domains.to_vec(),
         }
     }
 
@@ -111,7 +119,14 @@ impl SandboxState {
             caps.add_fs(cap);
         }
 
-        caps.set_network_blocked(self.net_blocked);
+        if !self.allowed_domains.is_empty() {
+            caps.set_network_mode_mut(nono::NetworkMode::ProxyOnly {
+                port: 0,
+                bind_ports: vec![],
+            });
+        } else {
+            caps.set_network_blocked(self.net_blocked);
+        }
         for cmd in &self.allowed_commands {
             caps.add_allowed_command(cmd.clone());
         }
@@ -388,7 +403,7 @@ mod tests {
         let mut caps = CapabilitySet::new().block_network();
         caps.add_allowed_command("pip".to_string());
 
-        let state = SandboxState::from_caps(&caps, &[]);
+        let state = SandboxState::from_caps(&caps, &[], &[]);
         assert!(state.net_blocked);
         assert_eq!(state.allowed_commands, vec!["pip"]);
 
@@ -406,7 +421,7 @@ mod tests {
 
         let caps = CapabilitySet::new().block_network();
 
-        let state = SandboxState::from_caps(&caps, &[]);
+        let state = SandboxState::from_caps(&caps, &[], &[]);
         state
             .write_to_file(&file_path)
             .expect("Failed to write state");

@@ -247,6 +247,17 @@ fn validate_requested_dir(
     source: &str,
     protected_roots: &ProtectedRoots,
 ) -> Result<()> {
+    if path.exists() && !path.is_dir() {
+        return Err(NonoError::ConfigParse(format!(
+            "{} path '{}' is not a directory. \
+             Use --allow-file for single files.",
+            source,
+            path.display()
+        )));
+    }
+    if !path.exists() && source == "CLI" {
+        warn!("'{}' does not exist and will be ignored.", path.display());
+    }
     protected_paths::validate_requested_path_against_protected_roots(
         path,
         false,

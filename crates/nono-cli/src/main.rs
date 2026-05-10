@@ -105,7 +105,6 @@ use cli_bootstrap::{
     print_legacy_network_warnings,
 };
 use nono::Result;
-use tracing::error;
 
 const DETACHED_LAUNCH_ENV: &str = "NONO_DETACHED_LAUNCH";
 const DETACHED_SESSION_ID_ENV: &str = "NONO_DETACHED_SESSION_ID";
@@ -128,7 +127,6 @@ fn main() {
     command_blocking_deprecation::print_warnings(&deprecation_warnings, cli.silent);
 
     if let Err(e) = run_cli(cli) {
-        error!("{}", e);
         // Phase 36.5 D-36.5-A3 / D-36.5-D3: ActionRequired surfaces the
         // multi-line resolution text from `resolve_via` to stderr, then exits
         // non-zero. C FFI consumers see this as ErrConfigParse (-9) per D-36.5-B3.

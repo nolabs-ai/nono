@@ -146,6 +146,10 @@ mod linux {
         /// Token broker for credential isolation. Holds real credential values;
         /// nonces in the agent env are resolved to real values by filter_child_env.
         token_broker: Mutex<crate::eti_token_broker::TokenBroker>,
+        /// Approval backend for the `Approve` intercept action.
+        /// Defaults to `TerminalApproval`; callers may replace it before
+        /// calling `handle_listener`.
+        approval_backend: Arc<dyn nono::ApprovalBackend>,
     }
 
     /// Pre-computed runtime-baseline files (ELF dependency closures + system files)
@@ -435,6 +439,7 @@ mod linux {
                     queued_requests: AtomicUsize::new(0),
                     emitted_error_response: AtomicBool::new(false),
                     token_broker: Mutex::new(crate::eti_token_broker::TokenBroker::new()),
+                    approval_backend: Arc::new(crate::terminal_approval::TerminalApproval),
                 }),
                 listener: Arc::new(listener),
             };
@@ -1155,6 +1160,62 @@ mod linux {
             return Ok(0);
         }
 
+        if let crate::command_policy::InterceptActionConfig::Approve { timeout_secs } =
+            intercept_action
+        {
+            let argv_display: Vec<String> = request
+                .argv
+                .iter()
+                .filter_map(|a| std::str::from_utf8(a).ok().map(str::to_owned))
+                .collect();
+            let approval_request = nono::supervisor::ApprovalRequest::Command {
+                request_id: format!(
+                    "eti-approve-{}-{}",
+                    request.command,
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_nanos())
+                        .unwrap_or(0)
+                ),
+                command: request.command.clone(),
+                args: argv_display,
+                caller: caller_label(&caller),
+                intercept_rule: "approve".to_string(),
+                reason: None,
+                child_pid: auth.peer_pid,
+                session_id: session_id.to_string(),
+            };
+
+            let backend = Arc::clone(&state.approval_backend);
+            let timeout = std::time::Duration::from_secs(timeout_secs.unwrap_or(60));
+            let decision = run_with_timeout(timeout, move || {
+                backend.request_approval(&approval_request)
+            })?;
+
+            let (audit_decision, deny_reason) = if decision.is_granted() {
+                ("approve_granted", None)
+            } else {
+                ("approve_denied", Some("approval_denied".to_string()))
+            };
+            record_command_policy_audit(
+                audit_recorder.as_ref(),
+                &request,
+                session_id,
+                auth.peer_pid,
+                session_root_pid,
+                Some(&caller),
+                audit_decision,
+                deny_reason.clone(),
+                None,
+            )?;
+            if !decision.is_granted() {
+                return Err(NonoError::BlockedCommand {
+                    command: request.command,
+                    reason: deny_reason.unwrap_or_else(|| "approval_denied".to_string()),
+                });
+            }
+        }
+
         let active = state.active_count.fetch_add(1, Ordering::SeqCst);
         if active >= MAX_ACTIVE_ETI_CHILDREN {
             state.active_count.fetch_sub(1, Ordering::SeqCst);
@@ -1297,6 +1358,29 @@ mod linux {
             return Ok(status == 0);
         }
         Ok(Path::new(&format!("/proc/{pid}")).exists())
+    }
+
+    /// Run `f` in a background thread and block until it returns or the timeout
+    /// elapses. On timeout the thread is abandoned (detached) and
+    /// `ApprovalDecision::Timeout` is returned, which the caller treats as a
+    /// denial.
+    fn run_with_timeout<F>(timeout: std::time::Duration, f: F) -> Result<nono::ApprovalDecision>
+    where
+        F: FnOnce() -> Result<nono::ApprovalDecision> + Send + 'static,
+    {
+        use std::sync::mpsc;
+
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = f();
+            // Ignore send error: receiver may have dropped on timeout.
+            let _ = tx.send(result);
+        });
+
+        match rx.recv_timeout(timeout) {
+            Ok(result) => result,
+            Err(_) => Ok(nono::ApprovalDecision::Timeout),
+        }
     }
 
     fn parent_pid(pid: u32) -> Result<u32> {

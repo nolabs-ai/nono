@@ -64,3 +64,17 @@ pub use types::{
     BlockedPublisher, Blocklist, BlocklistEntry, Enforcement, IncludePatterns, Publisher,
     SignerIdentity, TrustPolicy, VerificationOutcome, VerificationResult, TRUST_POLICY_VERSION,
 };
+
+// Phase 32 D-32-15 #2: Test-only helper that loads a frozen TUF root
+// fixture from the crate's tests/fixtures/ directory. Production code
+// calls bundle::load_production_trusted_root() (which reads the user's
+// refreshed cache). Tests call this helper because the cache doesn't
+// exist in CI environments. See .planning/phases/32-sigstore-integration/.
+#[cfg(test)]
+pub(crate) fn load_test_trusted_root() -> crate::Result<crate::trust::TrustedRoot> {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("trust-root-frozen.json");
+    crate::trust::bundle::load_trusted_root(&path)
+}

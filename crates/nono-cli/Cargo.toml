@@ -97,5 +97,6 @@ toml = "1.0"
 serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
+httpmock = "0.7"
 jsonschema = "0.45"
 proptest = "1"

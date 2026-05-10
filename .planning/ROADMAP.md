@@ -96,10 +96,12 @@ Full details: `.planning/milestones/v2.2-ROADMAP.md`.
 
 **Requirements:** REQ-RESL-NIX-01, REQ-RESL-NIX-02, REQ-RESL-NIX-03, REQ-AIPC-NIX-01 (4 reqs).
 
-**Plans (planned):** 2
+**Plans:** 4 (2 original + 2 gap-closure)
 
 1. **Plan 25-01 — Cross-platform RESL Unix backends.** Linux cgroup v2 (`memory.max` / `cpu.max` / `pids.max` / `cgroup.kill`); macOS `setrlimit` (`RLIMIT_AS` / `RLIMIT_NPROC`; `RLIMIT_CPU` documented gap; `--cpu-percent` fail-closed unsupported on macOS). Removes 4 "not enforced on linux" stderr warnings. Reuses v2.1 Phase 16 acceptance shape.
 2. **Plan 25-02 — AIPC Unix futures ADR.** Design-only document at `docs/architecture/aipc-unix-futures.md` (or equivalent). Decision per-HandleKind: Socket/Pipe admit Unix backends via Unix-domain socket + `SCM_RIGHTS`; JobObject/Event/Mutex are Windows-only by design. Cross-linked from PROJECT.md.
+3. **Plan 25-03-RESL-NIX-FIXES (gap-closure).** Fix CR-01 (format!() in post-fork child branch → const &[u8] static messages) and CR-02 (--timeout silent non-enforcement in Direct mode → warn!() + eprintln!()). Both touch `exec_strategy.rs`.
+4. **Plan 25-04-RESL-NIX-HARDENING (gap-closure).** Fix WR-03 (cgroup path traversal guard in detect_from_str + regression tests), WR-02 (setrlimit fail-closed in macOS child branch), WR-04 (getpgid fallback removal), WR-05 (idiomatic errno conversion).
 
 **Success Criteria** (what must be TRUE when Phase 25 completes):
 

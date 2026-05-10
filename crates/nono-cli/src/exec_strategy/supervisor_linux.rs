@@ -853,8 +853,6 @@ pub(super) mod cgroup {
         pub(crate) path: PathBuf,
         /// Resource limits to apply (stored for `apply_limits`).
         pub(crate) limits: ResourceLimits,
-        /// When true, `Drop` removes the cgroup directory.
-        armed: bool,
     }
 
     impl CgroupSession {
@@ -984,7 +982,7 @@ pub(super) mod cgroup {
         ///    (read-modify-write to avoid clobbering existing controllers).
         /// 3. Creates `<delegated>/nono-<session-id>/` — fails fast on `EEXIST`
         ///    (duplicate session ID is a bug, not a retry target).
-        /// 4. Stores the path, limits, and armed flag for later use.
+        /// 4. Stores the path and limits for later use.
         ///
         /// # Errors
         ///
@@ -1040,15 +1038,7 @@ pub(super) mod cgroup {
             Ok(Self {
                 path: child_path,
                 limits: limits.clone(),
-                armed: true,
             })
-        }
-
-        /// Disarm the drop cleanup. After calling this, `Drop` will NOT remove the
-        /// cgroup directory. Use only when cleanup responsibility has been transferred.
-        #[allow(dead_code)]
-        pub(crate) fn disarm(&mut self) {
-            self.armed = false;
         }
 
         /// Apply resource limits to the cgroup pseudo-files.
@@ -1249,10 +1239,6 @@ pub(super) mod cgroup {
 
     impl Drop for CgroupSession {
         fn drop(&mut self) {
-            if !self.armed {
-                return;
-            }
-            self.armed = false;
             // Check for surviving processes (should be empty after cgroup.kill).
             let procs_path = self.path.join("cgroup.procs");
             if let Ok(contents) = std::fs::read_to_string(&procs_path) {

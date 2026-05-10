@@ -904,6 +904,37 @@ pub(super) mod cgroup {
             })?;
             let abs_path = PathBuf::from("/sys/fs/cgroup")
                 .join(cgroup_rel.trim_start_matches('/').trim_end_matches('/'));
+            // WR-03: Validate the constructed path stays within /sys/fs/cgroup.
+            //
+            // We perform two complementary component-level checks (NOT string
+            // operations) per CLAUDE.md § Path Handling:
+            //
+            //   1. `Path::starts_with("/sys/fs/cgroup")` rejects entries that, after
+            //      `trim_start_matches('/')`, somehow produce a path that does not
+            //      have `/sys/fs/cgroup` as a component prefix. Note that this check
+            //      alone is NOT sufficient to catch `..` traversal because
+            //      `Path::starts_with` does not normalize parent-dir references —
+            //      `/sys/fs/cgroup/../../etc` has the components `[/, sys, fs,
+            //      cgroup, .., .., etc]` and DOES start with `/sys/fs/cgroup`.
+            //
+            //   2. We additionally reject any path containing a `Component::ParentDir`
+            //      (`..`). A well-formed cgroup-v2 delegated path from
+            //      `/proc/self/cgroup` never contains `..`; its presence indicates a
+            //      malicious or compromised /proc entry attempting to redirect path
+            //      construction outside `/sys/fs/cgroup` (e.g., `0::/../../etc`).
+            //
+            // Both checks fail closed with `NonoError::UnsupportedPlatform`.
+            use std::path::Component;
+            if !abs_path.starts_with("/sys/fs/cgroup")
+                || abs_path
+                    .components()
+                    .any(|c| matches!(c, Component::ParentDir))
+            {
+                return Err(NonoError::UnsupportedPlatform(format!(
+                    "cgroup_v2: constructed cgroup path {abs_path:?} escapes /sys/fs/cgroup \
+                     (path traversal detected in /proc/self/cgroup content)"
+                )));
+            }
             Ok(abs_path)
         }
 
@@ -1293,6 +1324,51 @@ pub(super) mod cgroup {
             assert!(
                 matches!(err, NonoError::UnsupportedPlatform(_)),
                 "expected UnsupportedPlatform, got: {err:?}"
+            );
+        }
+
+        // ── WR-03 traversal-guard regression tests ──────────────────────────────
+        //
+        // These tests defend the fix for code-review finding WR-03: a malicious
+        // /proc/self/cgroup entry containing `..` components could redirect the
+        // path-construction in `detect_from_str` outside `/sys/fs/cgroup`. The
+        // production fix uses `Path::starts_with("/sys/fs/cgroup")` (component-
+        // level comparison, NOT string `starts_with`) per CLAUDE.md § Path Handling.
+
+        #[test]
+        fn cgroup_path_rejects_parent_dir_traversal() {
+            // Attacker-controlled /proc/self/cgroup with .. to escape /sys/fs/cgroup.
+            let err = CgroupSession::detect_from_str("0::/../../etc")
+                .expect_err("must reject path traversal");
+            match err {
+                NonoError::UnsupportedPlatform(msg) => {
+                    assert!(
+                        msg.contains("path traversal") || msg.contains("escapes"),
+                        "error message must mention traversal, got: {msg}"
+                    );
+                }
+                other => panic!("expected UnsupportedPlatform, got: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn cgroup_path_rejects_encoded_traversal() {
+            // Variant: leading ../ after trim_start_matches strips the slash.
+            let err = CgroupSession::detect_from_str("0::/../../../proc/self")
+                .expect_err("must reject path traversal with leading slash");
+            assert!(matches!(err, NonoError::UnsupportedPlatform(_)));
+        }
+
+        #[test]
+        fn cgroup_path_accepts_normal_path() {
+            // Normal systemd-delegated cgroup path must still construct successfully.
+            // detect_from_str does NOT check filesystem existence — that is detect()'s job.
+            let path =
+                CgroupSession::detect_from_str("0::/user.slice/user-1000.slice/session-1.scope")
+                    .expect("normal cgroup path must be accepted");
+            assert!(
+                path.starts_with("/sys/fs/cgroup"),
+                "path must be under /sys/fs/cgroup, got: {path:?}"
             );
         }
 

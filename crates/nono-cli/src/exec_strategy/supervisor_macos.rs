@@ -87,7 +87,15 @@ impl MacosResourceLimits {
     /// All values (`memory_bytes`, `max_processes`) are `Copy` types captured by value.
     ///
     /// The `nix::errno::Errno` → `std::io::Error` conversion uses
-    /// `std::io::Error::from_raw_os_error` which is also safe in `pre_exec`.
+    /// `std::io::Error::from` (nix's public `From<Errno> for std::io::Error` impl)
+    /// which is also safe in `pre_exec` — internally it constructs an
+    /// `io::Error` from the errno's raw integer value, without allocating or
+    /// invoking async-signal-unsafe machinery.
+    ///
+    /// We prefer `From<Errno> for std::io::Error` over the prior `e as i32` cast
+    /// because the cast relied on `nix::errno::Errno` being `#[repr(i32)]` —
+    /// an internal nix detail. The `From` impl is the documented public API and
+    /// is stable across nix's representation changes (WR-05).
     ///
     /// # T-25-01-05 mitigation
     ///
@@ -111,12 +119,12 @@ impl MacosResourceLimits {
                         // T-25-01-05: guard against overflow on 32-bit (belt-and-suspenders).
                         let limit = bytes.try_into().unwrap_or(nix::libc::rlim_t::MAX);
                         setrlimit(Resource::RLIMIT_AS, limit, limit)
-                            .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
+                            .map_err(std::io::Error::from)?;
                     }
                     if let Some(n) = max_processes {
                         let limit = u64::from(n);
                         setrlimit(Resource::RLIMIT_NPROC, limit, limit)
-                            .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
+                            .map_err(std::io::Error::from)?;
                     }
                 }
                 #[cfg(not(target_os = "macos"))]

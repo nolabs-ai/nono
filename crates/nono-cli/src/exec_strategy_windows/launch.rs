@@ -1264,6 +1264,22 @@ pub(super) fn spawn_windows_child(
                 return Err(NonoError::BrokerNotFound { path: broker_path });
             }
 
+            // Phase 32 D-32-11/13/14: Authenticode self-trust-anchor.
+            // On every dispatch (no cache, D-32-14), require broker.exe's Authenticode
+            // signer subject + thumbprint to match nono.exe's own. Fail-closed; no
+            // escape hatch (D-32-12). Dev-build skip via install-layout detector
+            // (Pitfall 6 — #[cfg(debug_assertions)] would false-trigger under cargo
+            // test --release).
+            if !is_dev_build_layout(&nono_exe) {
+                verify_broker_authenticode(&nono_exe, &broker_path)?;
+            } else {
+                tracing::info!(
+                    target: "broker_authenticode",
+                    "skipping broker Authenticode verify: dev-build layout detected at {}",
+                    nono_exe.display()
+                );
+            }
+
             // D-02: Mark ConPTY pipe handles inheritable BEFORE CreateProcessW;
             // unmark AFTER (so they don't accidentally leak into other spawns).
             // PtyPair shape per crates/nono-cli/src/pty_proxy_windows.rs:11-15:
@@ -1663,6 +1679,97 @@ pub(super) fn spawn_windows_child(
     ))
 }
 
+/// Returns `true` when `nono.exe` is running from a Cargo `target` directory
+/// (dev build layout). Returns `false` for production install layouts such as
+/// `Program Files\nono\` or `LocalAppData\Programs\nono\`.
+///
+/// Used to skip broker Authenticode self-trust-anchor verification in dev builds
+/// (Phase 32 D-32-12 implementation note + Pitfall 6). Using an install-layout
+/// substring detector instead of `#[cfg(debug_assertions)]` is critical:
+/// `cargo test --release` compiles WITHOUT debug_assertions, so a
+/// `#[cfg(debug_assertions)]` gate would falsely apply strict Authenticode checks
+/// to release-mode test runs where `nono-shell-broker.exe` is unsigned.
+///
+/// Detection strings cover Windows-style backslashes AND Unix-style forward
+/// slashes (the latter for macOS/Linux test suite runs).
+fn is_dev_build_layout(nono_exe_path: &std::path::Path) -> bool {
+    let s = nono_exe_path.to_string_lossy();
+    s.contains(r"\target\debug\")
+        || s.contains(r"\target\release\")
+        || s.contains("/target/debug/")
+        || s.contains("/target/release/")
+}
+
+/// Perform the Authenticode self-trust-anchor verification for broker.exe.
+///
+/// Extracts `nono.exe`'s own Authenticode signer subject + thumbprint via the
+/// Phase 28 chain-walker, then requires `broker.exe`'s signature to match
+/// (subject AND thumbprint). Fails-closed on any non-Valid status or mismatch
+/// (Phase 32 D-32-12 / D-32-13). No caching — called on every dispatch
+/// (D-32-14). No escape hatch: there is no env-var or CLI flag that bypasses
+/// this check in production-layout builds.
+///
+/// The `tracing::debug!` event with `target: "broker_authenticode"` on success
+/// is the dynamic sentinel for `each_dispatch_revalidates` (P32-CHK-009 —
+/// structural grep for absence of any per-process cache).
+pub(crate) fn verify_broker_authenticode(
+    nono_exe: &std::path::Path,
+    broker_path: &std::path::Path,
+) -> nono::Result<()> {
+    use crate::exec_identity::AuthenticodeStatus;
+    use crate::exec_identity_windows::query_authenticode_status;
+
+    let nono_status = query_authenticode_status(nono_exe)?;
+    let broker_status = query_authenticode_status(broker_path)?;
+
+    let (nono_subject, nono_thumbprint) = match nono_status {
+        AuthenticodeStatus::Valid {
+            signer_subject,
+            thumbprint,
+        } => (signer_subject, thumbprint),
+        other => {
+            return Err(nono::NonoError::TrustVerification {
+                path: nono_exe.display().to_string(),
+                reason: format!(
+                    "nono.exe Authenticode status is {other:?} (expected Valid). \
+                     Self-trust-anchor unavailable; refusing to spawn broker."
+                ),
+            })
+        }
+    };
+    let (broker_subject, broker_thumbprint) = match broker_status {
+        AuthenticodeStatus::Valid {
+            signer_subject,
+            thumbprint,
+        } => (signer_subject, thumbprint),
+        other => {
+            return Err(nono::NonoError::TrustVerification {
+                path: broker_path.display().to_string(),
+                reason: format!(
+                    "broker.exe Authenticode status is {other:?} (expected Valid). \
+                     Refusing to spawn."
+                ),
+            })
+        }
+    };
+    if nono_subject != broker_subject || nono_thumbprint != broker_thumbprint {
+        return Err(nono::NonoError::TrustVerification {
+            path: broker_path.display().to_string(),
+            reason: format!(
+                "broker.exe Authenticode signature does not match nono.exe — \
+                 expected subject `{nono_subject}` thumbprint `{nono_thumbprint}`, \
+                 got subject `{broker_subject}` thumbprint `{broker_thumbprint}`. \
+                 Refusing to spawn."
+            ),
+        });
+    }
+    tracing::debug!(
+        target: "broker_authenticode",
+        "broker.exe Authenticode self-trust-anchor verified: subject={nono_subject} thumbprint={nono_thumbprint}"
+    );
+    Ok(())
+}
+
 /// Returns true when the current process is the inner detached supervisor launched by
 /// `startup_runtime::run_detached_launch`. The outer `nono run --detached` invocation
 /// re-execs itself with `NONO_DETACHED_LAUNCH=1` + `DETACHED_PROCESS`; the inner
@@ -1703,6 +1810,65 @@ mod detached_token_gate_tests {
         assert!(!is_windows_detached_launch());
         let _g2 = EnvVarGuard::set_all(&[("NONO_DETACHED_LAUNCH", "true")]);
         assert!(!is_windows_detached_launch());
+    }
+}
+
+#[cfg(test)]
+mod broker_authenticode_layout_tests {
+    use super::is_dev_build_layout;
+
+    /// D-32-12 dev-skip mechanism unit acceptance.
+    /// Verifies that the install-layout substring detector matches Cargo
+    /// target directories (dev-build) and does NOT match production install
+    /// paths (Program Files, AppData).
+    #[test]
+    fn is_dev_build_layout_detection() {
+        // Dev-build paths (should match → true)
+        assert!(
+            is_dev_build_layout(std::path::Path::new(
+                r"C:\Users\dev\nono\target\debug\nono.exe"
+            )),
+            "Windows debug target path should be detected as dev-build"
+        );
+        assert!(
+            is_dev_build_layout(std::path::Path::new(
+                r"C:\Users\dev\nono\target\release\nono.exe"
+            )),
+            "Windows release target path should be detected as dev-build"
+        );
+        assert!(
+            is_dev_build_layout(std::path::Path::new(
+                "/home/dev/nono/target/debug/nono"
+            )),
+            "Unix debug target path should be detected as dev-build"
+        );
+        assert!(
+            is_dev_build_layout(std::path::Path::new(
+                "/home/dev/nono/target/release/nono"
+            )),
+            "Unix release target path should be detected as dev-build"
+        );
+        // Production install paths (should NOT match → false)
+        assert!(
+            !is_dev_build_layout(std::path::Path::new(
+                r"C:\Program Files\nono\nono.exe"
+            )),
+            "Program Files install path must NOT be detected as dev-build"
+        );
+        assert!(
+            !is_dev_build_layout(std::path::Path::new(
+                r"C:\Users\op\AppData\Local\Programs\nono\nono.exe"
+            )),
+            "AppData local install path must NOT be detected as dev-build"
+        );
+        assert!(
+            !is_dev_build_layout(std::path::Path::new("/usr/local/bin/nono")),
+            "/usr/local/bin/nono must NOT be detected as dev-build"
+        );
+        assert!(
+            !is_dev_build_layout(std::path::Path::new("/opt/nono/nono")),
+            "/opt/nono/nono must NOT be detected as dev-build"
+        );
     }
 }
 

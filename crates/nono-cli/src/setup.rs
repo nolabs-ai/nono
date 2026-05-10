@@ -900,8 +900,44 @@ fn print_check_only_summary() {
     print_windows_foundation_report("");
     print_windows_wfp_readiness_report("", &wfp);
     print_trust_root_status("");
+    // P32-CHK-003 / D-32-13: surface nono.exe's own Authenticode status so
+    // operators can verify the install matches expectations. Also enables the
+    // `broker_authenticode.rs::self_authenticode_extracts_subject_and_thumbprint`
+    // integration test which cannot directly link the bin-only nono-cli crate.
+    print_self_authenticode_status();
     let wfp_ready = wfp.status_label == "ready";
     print!("{}", trailing_usage_guidance(wfp_ready));
+}
+
+/// Print nono.exe's own Authenticode subject and thumbprint to stdout.
+/// Both lines always appear; the value is `<Unsigned>`, `<InvalidSignature>`,
+/// `<QueryFailed: …>`, or a live signer subject / 40-char SHA-1 hex thumbprint.
+/// Fail-open (display the diagnostic) — if `current_exe()` fails, the path
+/// `<unknown>` is shown and `query_authenticode_status` returns `QueryFailed`.
+#[cfg(target_os = "windows")]
+fn print_self_authenticode_status() {
+    use crate::exec_identity::AuthenticodeStatus;
+    use crate::exec_identity_windows::query_authenticode_status;
+
+    let exe_path = std::env::current_exe()
+        .unwrap_or_else(|_| std::path::PathBuf::from("<unknown>"));
+    match query_authenticode_status(&exe_path) {
+        Ok(AuthenticodeStatus::Valid {
+            signer_subject,
+            thumbprint,
+        }) => {
+            println!("self-authenticode-subject: {signer_subject}");
+            println!("self-authenticode-thumbprint: {thumbprint}");
+        }
+        Ok(other) => {
+            println!("self-authenticode-subject: <{other:?}>");
+            println!("self-authenticode-thumbprint: <unavailable>");
+        }
+        Err(e) => {
+            println!("self-authenticode-subject: <query-failed: {e}>");
+            println!("self-authenticode-thumbprint: <unavailable>");
+        }
+    }
 }
 
 /// Shape A helper for the Windows `nono setup --check-only` trailing guidance.

@@ -12,6 +12,7 @@
 
 use crate::config::{CompiledEndpointRules, RouteConfig};
 use crate::error::{ProxyError, Result};
+use nono::undo::{NetworkAuditAuthMechanism, NetworkAuditInjectionMode};
 use rustls::pki_types::pem::PemObject;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -41,6 +42,27 @@ pub struct LoadedRoute {
     /// Built once at startup from the route's `tls_ca` certificate file.
     /// When `None`, the shared default connector (webpki roots only) is used.
     pub tls_connector: Option<tokio_rustls::TlsConnector>,
+
+    /// `true` if this route requires L7 visibility — i.e. it declares
+    /// `credential_key`, `oauth2`, or non-empty `endpoint_rules` and would
+    /// not function as a transparent CONNECT tunnel. Computed once at load
+    /// time so the CONNECT dispatch path doesn't have to re-derive it on
+    /// every request.
+    pub requires_intercept: bool,
+
+    /// `true` if this route was configured to use a managed credential
+    /// source (`credential_key` or `oauth2`). Unlike `requires_intercept`,
+    /// this specifically captures whether the proxy must supply upstream
+    /// authentication itself rather than accept agent-provided credentials.
+    pub requires_managed_credential: bool,
+
+    /// Audit auth mechanism implied by the managed credential configuration.
+    /// Kept even if credential material failed to load so fail-closed denial
+    /// events can describe what auth shape the route expected.
+    pub managed_auth_mechanism: Option<NetworkAuditAuthMechanism>,
+
+    /// Audit injection mode implied by the managed credential configuration.
+    pub managed_injection_mode: Option<NetworkAuditInjectionMode>,
 }
 
 impl std::fmt::Debug for LoadedRoute {
@@ -50,8 +72,55 @@ impl std::fmt::Debug for LoadedRoute {
             .field("upstream_host_port", &self.upstream_host_port)
             .field("endpoint_rules", &self.endpoint_rules)
             .field("has_custom_tls_ca", &self.tls_connector.is_some())
+            .field("requires_intercept", &self.requires_intercept)
+            .field(
+                "requires_managed_credential",
+                &self.requires_managed_credential,
+            )
+            .field("managed_auth_mechanism", &self.managed_auth_mechanism)
+            .field("managed_injection_mode", &self.managed_injection_mode)
             .finish()
     }
+}
+
+fn auth_mechanism_for_route(route: &RouteConfig) -> Option<NetworkAuditAuthMechanism> {
+    if route.oauth2.is_some() {
+        return Some(NetworkAuditAuthMechanism::PhantomHeader);
+    }
+
+    if route.credential_key.is_some() {
+        let proxy_mode = route
+            .proxy
+            .as_ref()
+            .and_then(|p| p.inject_mode.clone())
+            .unwrap_or_else(|| route.inject_mode.clone());
+        return Some(match proxy_mode {
+            crate::config::InjectMode::Header | crate::config::InjectMode::BasicAuth => {
+                NetworkAuditAuthMechanism::PhantomHeader
+            }
+            crate::config::InjectMode::UrlPath => NetworkAuditAuthMechanism::PhantomPath,
+            crate::config::InjectMode::QueryParam => NetworkAuditAuthMechanism::PhantomQuery,
+        });
+    }
+
+    None
+}
+
+fn injection_mode_for_route(route: &RouteConfig) -> Option<NetworkAuditInjectionMode> {
+    if route.oauth2.is_some() {
+        return Some(NetworkAuditInjectionMode::OAuth2);
+    }
+
+    if route.credential_key.is_some() {
+        return Some(match route.inject_mode {
+            crate::config::InjectMode::Header => NetworkAuditInjectionMode::Header,
+            crate::config::InjectMode::UrlPath => NetworkAuditInjectionMode::UrlPath,
+            crate::config::InjectMode::QueryParam => NetworkAuditInjectionMode::QueryParam,
+            crate::config::InjectMode::BasicAuth => NetworkAuditInjectionMode::BasicAuth,
+        });
+    }
+
+    None
 }
 
 /// Store of all configured routes, keyed by normalised prefix.
@@ -105,6 +174,19 @@ impl RouteStore {
 
             let upstream_host_port = extract_host_port(&route.upstream);
 
+            // A route needs L7 visibility if it carries credentials to inject
+            // (`credential_key` or `oauth2`) or if it enforces method/path
+            // rules. Routes without any of these are purely declarative —
+            // they exist to provide a `*_BASE_URL` env var or appear in
+            // `route_upstream_hosts()` — and CONNECT to those still gets
+            // blocked with 403 (the "force SDK cooperation" path).
+            let requires_managed_credential =
+                route.credential_key.is_some() || route.oauth2.is_some();
+            let requires_intercept =
+                requires_managed_credential || !route.endpoint_rules.is_empty();
+            let managed_auth_mechanism = auth_mechanism_for_route(route);
+            let managed_injection_mode = injection_mode_for_route(route);
+
             loaded.insert(
                 normalized_prefix,
                 LoadedRoute {
@@ -112,6 +194,10 @@ impl RouteStore {
                     upstream_host_port,
                     endpoint_rules,
                     tls_connector,
+                    requires_intercept,
+                    requires_managed_credential,
+                    managed_auth_mechanism,
+                    managed_injection_mode,
                 },
             );
         }
@@ -159,6 +245,36 @@ impl RouteStore {
         })
     }
 
+    /// Look up the route prefix and loaded entry for a CONNECT-style
+    /// `host:port`. Returns `Some((prefix, route))` on a match.
+    ///
+    /// Used by the TLS-intercept CONNECT branch to map the agent's
+    /// `CONNECT api.openai.com:443` target back to a route prefix
+    /// (`"openai"`) so the credential store can be consulted.
+    #[must_use]
+    pub fn lookup_by_upstream(&self, host_port: &str) -> Option<(&str, &LoadedRoute)> {
+        let normalised = host_port.to_lowercase();
+        self.routes.iter().find_map(|(prefix, route)| {
+            route
+                .upstream_host_port
+                .as_ref()
+                .filter(|hp| **hp == normalised)
+                .map(|_| (prefix.as_str(), route))
+        })
+    }
+
+    /// Returns `true` if the `host:port` matches a route that requires
+    /// TLS interception (has `credential_key`, `oauth2`, or non-empty
+    /// `endpoint_rules`).
+    ///
+    /// Used in the CONNECT dispatch path to choose between transparent
+    /// tunnelling, the existing 403, and the new intercept handler.
+    #[must_use]
+    pub fn has_intercept_route(&self, host_port: &str) -> bool {
+        self.lookup_by_upstream(host_port)
+            .is_some_and(|(_, route)| route.requires_intercept)
+    }
+
     /// Return the set of normalised `host:port` strings for all route
     /// upstreams. Uses pre-normalised values computed at load time.
     #[must_use]
@@ -167,6 +283,19 @@ impl RouteStore {
             .values()
             .filter_map(|route| route.upstream_host_port.clone())
             .collect()
+    }
+}
+
+impl LoadedRoute {
+    /// Whether this route is configured to require a proxy-managed credential
+    /// but the credential material is currently unavailable.
+    #[must_use]
+    pub fn missing_managed_credential(
+        &self,
+        has_static_credential: bool,
+        has_oauth2: bool,
+    ) -> bool {
+        self.requires_managed_credential && !has_static_credential && !has_oauth2
     }
 }
 
@@ -555,10 +684,170 @@ mod tests {
             upstream_host_port: Some("api.openai.com:443".to_string()),
             endpoint_rules: CompiledEndpointRules::compile(&[]).unwrap(),
             tls_connector: None,
+            requires_intercept: false,
+            requires_managed_credential: false,
+            managed_auth_mechanism: None,
+            managed_injection_mode: None,
         };
         let debug_output = format!("{:?}", route);
         assert!(debug_output.contains("api.openai.com"));
         assert!(debug_output.contains("has_custom_tls_ca"));
+        assert!(debug_output.contains("requires_intercept"));
+        assert!(debug_output.contains("requires_managed_credential"));
+        assert!(debug_output.contains("managed_auth_mechanism"));
+        assert!(debug_output.contains("managed_injection_mode"));
+    }
+
+    #[test]
+    fn test_requires_intercept_credential_only() {
+        let routes = vec![RouteConfig {
+            prefix: "openai".to_string(),
+            upstream: "https://api.openai.com".to_string(),
+            credential_key: Some("openai_api_key".to_string()),
+            inject_mode: Default::default(),
+            inject_header: "Authorization".to_string(),
+            credential_format: "Bearer {}".to_string(),
+            path_pattern: None,
+            path_replacement: None,
+            query_param_name: None,
+            proxy: None,
+            env_var: None,
+            endpoint_rules: vec![],
+            tls_ca: None,
+            tls_client_cert: None,
+            tls_client_key: None,
+            oauth2: None,
+        }];
+        let store = RouteStore::load(&routes).unwrap();
+        let hit = store.lookup_by_upstream("api.openai.com:443").unwrap();
+        assert!(store.has_intercept_route("api.openai.com:443"));
+        assert!(hit.1.requires_managed_credential);
+        assert_eq!(
+            hit.1.managed_auth_mechanism,
+            Some(NetworkAuditAuthMechanism::PhantomHeader)
+        );
+        assert_eq!(
+            hit.1.managed_injection_mode,
+            Some(NetworkAuditInjectionMode::Header)
+        );
+        assert!(!store.has_intercept_route("api.example.com:443"));
+    }
+
+    #[test]
+    fn test_requires_intercept_endpoint_rules_only() {
+        // L7-only route (no credential): rules alone are enough to require
+        // interception.
+        let routes = vec![RouteConfig {
+            prefix: "internal".to_string(),
+            upstream: "https://internal.example.com".to_string(),
+            credential_key: None,
+            inject_mode: Default::default(),
+            inject_header: "Authorization".to_string(),
+            credential_format: "Bearer {}".to_string(),
+            path_pattern: None,
+            path_replacement: None,
+            query_param_name: None,
+            proxy: None,
+            env_var: None,
+            endpoint_rules: vec![EndpointRule {
+                method: "GET".to_string(),
+                path: "/v1/items".to_string(),
+            }],
+            tls_ca: None,
+            tls_client_cert: None,
+            tls_client_key: None,
+            oauth2: None,
+        }];
+        let store = RouteStore::load(&routes).unwrap();
+        let hit = store
+            .lookup_by_upstream("internal.example.com:443")
+            .unwrap();
+        assert!(store.has_intercept_route("internal.example.com:443"));
+        assert!(!hit.1.requires_managed_credential);
+    }
+
+    #[test]
+    fn test_requires_intercept_declarative_only() {
+        // No credential, no rules — purely declarative route. CONNECT to
+        // this upstream still gets the existing 403 (not intercepted).
+        let routes = vec![RouteConfig {
+            prefix: "alias".to_string(),
+            upstream: "https://aliased.example.com".to_string(),
+            credential_key: None,
+            inject_mode: Default::default(),
+            inject_header: "Authorization".to_string(),
+            credential_format: "Bearer {}".to_string(),
+            path_pattern: None,
+            path_replacement: None,
+            query_param_name: None,
+            proxy: None,
+            env_var: None,
+            endpoint_rules: vec![],
+            tls_ca: None,
+            tls_client_cert: None,
+            tls_client_key: None,
+            oauth2: None,
+        }];
+        let store = RouteStore::load(&routes).unwrap();
+        assert!(store.is_route_upstream("aliased.example.com:443"));
+        assert!(!store.has_intercept_route("aliased.example.com:443"));
+    }
+
+    #[test]
+    fn test_missing_managed_credential_policy() {
+        let managed = LoadedRoute {
+            upstream: "https://api.openai.com".to_string(),
+            upstream_host_port: Some("api.openai.com:443".to_string()),
+            endpoint_rules: CompiledEndpointRules::compile(&[]).unwrap(),
+            tls_connector: None,
+            requires_intercept: true,
+            requires_managed_credential: true,
+            managed_auth_mechanism: Some(NetworkAuditAuthMechanism::PhantomHeader),
+            managed_injection_mode: Some(NetworkAuditInjectionMode::Header),
+        };
+        assert!(managed.missing_managed_credential(false, false));
+        assert!(!managed.missing_managed_credential(true, false));
+        assert!(!managed.missing_managed_credential(false, true));
+
+        let l7_only = LoadedRoute {
+            upstream: "https://internal.example.com".to_string(),
+            upstream_host_port: Some("internal.example.com:443".to_string()),
+            endpoint_rules: CompiledEndpointRules::compile(&[]).unwrap(),
+            tls_connector: None,
+            requires_intercept: true,
+            requires_managed_credential: false,
+            managed_auth_mechanism: None,
+            managed_injection_mode: None,
+        };
+        assert!(!l7_only.missing_managed_credential(false, false));
+    }
+
+    #[test]
+    fn test_lookup_by_upstream_returns_prefix() {
+        let routes = vec![RouteConfig {
+            prefix: "openai".to_string(),
+            upstream: "https://api.openai.com".to_string(),
+            credential_key: Some("openai_api_key".to_string()),
+            inject_mode: Default::default(),
+            inject_header: "Authorization".to_string(),
+            credential_format: "Bearer {}".to_string(),
+            path_pattern: None,
+            path_replacement: None,
+            query_param_name: None,
+            proxy: None,
+            env_var: None,
+            endpoint_rules: vec![],
+            tls_ca: None,
+            tls_client_cert: None,
+            tls_client_key: None,
+            oauth2: None,
+        }];
+        let store = RouteStore::load(&routes).unwrap();
+        let hit = store.lookup_by_upstream("api.openai.com:443").unwrap();
+        assert_eq!(hit.0, "openai");
+        assert!(hit.1.requires_intercept);
+        assert!(hit.1.requires_managed_credential);
+        assert!(store.lookup_by_upstream("api.example.com:443").is_none());
     }
 
     /// Self-signed CA for testing. Generated with:

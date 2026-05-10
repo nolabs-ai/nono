@@ -3,8 +3,6 @@ title: CLI Reference
 description: Complete reference for all nono command-line flags
 ---
 
-Complete reference for all nono command-line flags.
-
 ## Global Options
 
 These options work with all commands.
@@ -91,14 +89,6 @@ nono why --host <HOST> [--port <PORT>] [OPTIONS]
 nono why --self --path <PATH> --op <OP> [OPTIONS]  # Inside sandbox
 ```
 
-### `nono learn`
-
-Trace a command to discover required filesystem paths and network activity. Uses `strace` on Linux and `fs_usage` + `nettop` on macOS to monitor accesses and outputs paths and connections that would need to be allowed in a nono profile.
-
-```bash
-nono learn [OPTIONS] -- <COMMAND> [ARGS...]
-```
-
 ### `nono setup`
 
 Set up nono on this system. Verifies installation, tests sandbox support, and optionally generates example profiles.
@@ -117,7 +107,7 @@ nono profile <SUBCOMMAND>
 
 Subcommands:
 - `init` - Generate a skeleton profile JSON file
-- `list` - List all available profiles (built-in and user)
+- `list` - List all available profiles (preset, pack, and user)
 - `show` - Show a fully resolved profile
 - `diff` - Diff two profiles
 - `validate` - Validate a profile JSON file
@@ -143,52 +133,6 @@ Subcommands:
 - `list` - List files and their verification status
 - `keygen` - Generate a new signing key pair
 - `export-key` - Export the public key for a signing key
-
-## `nono learn` Options
-
-<Note>
-  `nono learn` runs WITHOUT sandbox restrictions to discover what paths and network connections your application needs. On Linux it uses `strace` (install with `apt install strace`). On macOS it uses `fs_usage` and `nettop` for filesystem and network discovery (requires `sudo`).
-</Note>
-
-### `--profile`, `-p`
-
-Compare against an existing profile to show only missing paths.
-
-```bash
-nono learn --profile opencode -- opencode
-```
-
-### `--json`
-
-Output discovered paths as a JSON fragment suitable for a profile.
-
-```bash
-nono learn --json -- my-app > paths.json
-```
-
-### `--timeout`
-
-Limit trace duration in seconds.
-
-```bash
-nono learn --timeout 30 -- my-long-running-app
-```
-
-### `--all`
-
-Show all accessed paths, not just those that would be blocked by the sandbox.
-
-```bash
-nono learn --all -- my-app
-```
-
-### `--verbose`, `-v`
-
-Enable verbose output. Can be specified multiple times.
-
-```bash
-nono learn -vv -- my-app
-```
 
 ## `nono run` Options
 
@@ -359,7 +303,7 @@ nono run --allow-cwd --network-profile minimal --allow-domain custom-api.example
 
 #### `--credential`
 
-Enable credential injection for a named service via the reverse proxy. The service must be either a built-in service (`openai`, `anthropic`, `gemini`, `google-ai`) or defined as a custom credential in your profile. Credentials are loaded from the system keyring under the `nono` service name, from 1Password when `credential_key` is an `op://` URI, or from Apple Passwords on macOS when `credential_key` is an `apple-password://` URI.
+Enable credential injection for a named service via the reverse proxy. The service must be either a preset service (`openai`, `anthropic`, `gemini`, `google-ai`) or defined as a custom credential in your profile. Credentials are loaded from the system keyring under the `nono` service name, from 1Password when `credential_key` is an `op://` URI, from Apple Passwords on macOS when `credential_key` is an `apple-password://` URI, from a file when `credential_key` is a `file://` URI, or from the host environment when `credential_key` is an `env://` URI.
 
 ```bash
 # Inject OpenAI credentials (loads from keyring account "openai_api_key")
@@ -372,7 +316,7 @@ nono run --allow-cwd --network-profile claude-code \
 
 The proxy sets `OPENAI_BASE_URL`, `ANTHROPIC_BASE_URL`, etc. in the child environment so SDKs route through the proxy automatically.
 
-Custom credentials can be defined in profiles for APIs not covered by the built-in services:
+Custom credentials can be defined in profiles for APIs not covered by the preset services:
 
 ```json
 {
@@ -557,14 +501,15 @@ nono run --allow-cwd --allow-command rm --allow-command mv -- my-script.sh
   and network policy.
 </Note>
 
-Commands can also be allowed temporarily via the deprecated `allowed_commands`
-field in a profile's security config:
+Commands can also be allowed temporarily via the deprecated `commands.allow`
+field (the older `security` placement is also accepted with a deprecation
+warning, see issue #594):
 
 ```json
 {
   "meta": { "name": "my-profile" },
   "filesystem": { "allow": ["/tmp"] },
-  "security": { "allowed_commands": ["rm", "chmod"] }
+  "commands": { "allow": ["rm", "chmod"] }
 }
 ```
 
@@ -584,23 +529,23 @@ nono run --allow-cwd --block-command my-dangerous-tool -- my-script.sh
 
 ### Deny Group Overrides
 
-#### `--override-deny`
+#### `--bypass-protection`
 
-Override a deny group rule for a specific path. Required groups like `deny_credentials` block access to paths such as `~/.aws`, `~/.config/gcloud`, etc. This flag punches a targeted hole through the deny without removing the entire group.
+Bypass a deny group rule for a specific path. Required groups like `deny_credentials` block access to paths such as `~/.aws`, `~/.config/gcloud`, etc. This flag punches a targeted hole through the deny without removing the entire group.
 
-The override path must also be explicitly granted via `--allow`, `--read`, `--write`, or their file equivalents. `--override-deny` only removes the deny rule — it does not implicitly grant access.
+The bypass path must also be explicitly granted via `--allow`, `--read`, `--write`, or their file equivalents. `--bypass-protection` only removes the deny rule — it does not implicitly grant access.
 
 ```bash
 # Allow an AWS agent to access credentials
-nono run --override-deny ~/.aws --allow ~/.aws -- my-aws-agent
+nono run --bypass-protection ~/.aws --allow ~/.aws -- my-aws-agent
 
 # Allow read-only access to GCP config
-nono run --override-deny ~/.config/gcloud --read ~/.config/gcloud -- gcloud-agent
+nono run --bypass-protection ~/.config/gcloud --read ~/.config/gcloud -- gcloud-agent
 
-# Multiple overrides
+# Multiple bypasses
 nono run \
-  --override-deny ~/.aws \
-  --override-deny ~/.config/gcloud \
+  --bypass-protection ~/.aws \
+  --bypass-protection ~/.config/gcloud \
   --allow ~/.aws \
   --read ~/.config/gcloud \
   -- multi-cloud-agent
@@ -611,12 +556,16 @@ Can be specified multiple times.
 <Warning>
 **Security guardrails:**
 
-- A warning is printed to stderr for each override applied, making security relaxations visible in logs.
+- A warning is printed to stderr for each bypass applied, making security relaxations visible in logs.
 - On macOS, Seatbelt allow rules more specific than the deny are emitted. On Linux, the deny path is removed from validation so Landlock allow rules take effect.
 </Warning>
 
 <Note>
-  `--override-deny` without a matching grant (`--allow`, `--read`, `--write`, etc.) is a hard error. This prevents silent no-ops on Linux and unintended implicit grants on macOS.
+  `--bypass-protection` without a matching grant (`--allow`, `--read`, `--write`, etc.) is a hard error. This prevents silent no-ops on Linux and unintended implicit grants on macOS.
+</Note>
+
+<Note>
+  **Renamed in issue #594.** This flag was renamed from its former deny-override name. The legacy name is still accepted as a deprecated alias and emits a warning on use; it will be removed in v1.0.0.
 </Note>
 
 ### Credential Options
@@ -671,7 +620,7 @@ See [Credential Injection](/cli/features/credential-injection) for full document
 
 #### `--profile`, `-p`
 
-Use a named profile (built-in or from `~/.config/nono/profiles/`).
+Use a named profile (from installed packs or `~/.config/nono/profiles/`).
 
 ```bash
 nono run --profile claude-code -- claude

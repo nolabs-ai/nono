@@ -1262,7 +1262,7 @@ impl<'a> DiagnosticFormatter<'a> {
             };
             lines.push("[nono]".to_string());
             lines.push(format!(
-                "[nono] {}{} permanently restricted — override via a user profile with policy.override_deny.",
+                "[nono] {}{} permanently restricted — override via a user profile with filesystem.bypass_protection.",
                 count_prefix, verb,
             ));
         }
@@ -1270,7 +1270,7 @@ impl<'a> DiagnosticFormatter<'a> {
 
     /// Return true when the denial cannot be fixed by a path flag alone —
     /// i.e. the path is blocked by the sensitive-path policy and requires a
-    /// profile with `policy.override_deny`.
+    /// profile with `filesystem.bypass_protection`.
     fn is_denial_policy_blocked(&self, denial: &DenialRecord) -> bool {
         if let Some(expl) = self
             .policy_explanations

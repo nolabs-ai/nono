@@ -6,6 +6,7 @@
 use globset::Glob;
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
+use std::path::PathBuf;
 
 /// Credential injection mode determining how credentials are inserted into requests.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -56,6 +57,36 @@ pub struct ProxyConfig {
     /// Maximum concurrent connections (0 = unlimited).
     #[serde(default)]
     pub max_connections: usize,
+
+    /// Directory the proxy will write the TLS-intercept trust bundle into.
+    ///
+    /// When set together with at least one route requiring L7 visibility
+    /// (`endpoint_rules`, `credential_key`, or `oauth2`), the proxy generates
+    /// an ephemeral session CA and writes a PEM bundle (system roots +
+    /// optional parent `SSL_CERT_FILE` + ephemeral CA) into this directory at
+    /// startup. The path is exposed via `ProxyHandle::intercept_ca_path()`
+    /// so the CLI can grant the sandboxed child a Landlock/Seatbelt read
+    /// capability for it.
+    ///
+    /// The directory must exist and be owner-only readable (mode `0o700`)
+    /// before `start()` is called. The CLI conventionally points this at
+    /// `~/.nono/sessions/<session_id>/`.
+    ///
+    /// `None` disables TLS interception entirely; CONNECT requests behave
+    /// as before (transparent tunnel for non-route hosts; 403 for routes
+    /// without L7 requirements).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intercept_ca_dir: Option<PathBuf>,
+
+    /// Optional contents of the parent process's `SSL_CERT_FILE`, merged
+    /// into the trust bundle so any corporate CA configured on the host
+    /// remains trusted by the sandboxed child.
+    ///
+    /// The CLI reads this from `std::env::var("SSL_CERT_FILE")` and
+    /// `std::fs::read(...)` before calling `start()`. Skipped during
+    /// (de)serialisation: it's not part of any user-authored config file.
+    #[serde(default, skip)]
+    pub intercept_parent_ca_pems: Option<Vec<u8>>,
 }
 
 impl Default for ProxyConfig {
@@ -68,6 +99,8 @@ impl Default for ProxyConfig {
             external_proxy: None,
             direct_connect_ports: Vec::new(),
             max_connections: 256,
+            intercept_ca_dir: None,
+            intercept_parent_ca_pems: None,
         }
     }
 }

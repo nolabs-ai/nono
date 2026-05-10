@@ -1,7 +1,7 @@
 //! Tests for manifest round-trip fidelity.
 //!
 //! These tests verify that:
-//! 1. `resolve_to_manifest()` includes all capabilities from security.groups and workdir
+//! 1. `resolve_to_manifest()` includes all capabilities from groups.include and workdir
 //! 2. The `--config` manifest path properly activates proxy machinery
 //! 3. `rollback.enabled` validation works correctly with exec_strategy checking
 //! 4. Manifest grants are deduplicated and `override_deny` paths are excluded
@@ -15,7 +15,7 @@ fn nono_bin() -> Command {
 }
 
 // ---------------------------------------------------------------------------
-// Gap 1: resolve_to_manifest() must include security.groups and workdir
+// Gap 1: resolve_to_manifest() must include groups.include and workdir
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -72,9 +72,8 @@ fn manifest_override_deny_removes_deny_from_export() {
         format!(
             r#"{{
             "meta": {{ "name": "override-test", "description": "test" }},
-            "security": {{ "groups": ["deny_credentials"] }},
-            "filesystem": {{ "read": ["{denied_str}"] }},
-            "policy": {{ "override_deny": ["{denied_str}"] }}
+            "groups": {{ "include": ["deny_credentials"] }},
+            "filesystem": {{ "read": ["{denied_str}"], "bypass_protection": ["{denied_str}"] }}
         }}"#
         ),
     )
@@ -114,7 +113,7 @@ fn manifest_override_deny_removes_deny_from_export() {
     // The overridden path should NOT appear in deny
     assert!(
         !deny_paths.iter().any(|p| p.contains(denied_str)),
-        "override_deny path '{denied_str}' should not appear in manifest deny list, got: {deny_paths:?}"
+        "bypass_protection path '{denied_str}' should not appear in manifest deny list, got: {deny_paths:?}"
     );
 }
 
@@ -648,7 +647,7 @@ fn arb_profile_json(
 ) -> serde_json::Value {
     let mut profile = serde_json::json!({
         "meta": { "name": "proptest-generated", "description": "auto" },
-        "security": { "groups": groups },
+        "groups": { "include": groups },
         "workdir": { "access": workdir_access },
     });
 
@@ -661,7 +660,7 @@ fn arb_profile_json(
     }
 
     if !blocked_commands.is_empty() {
-        profile["policy"] = serde_json::json!({ "add_deny_commands": blocked_commands });
+        profile["commands"] = serde_json::json!({ "deny": blocked_commands });
     }
 
     profile
@@ -734,7 +733,7 @@ fn assert_manifest_covers_profile(
         );
     }
 
-    // 3. Extra blocked commands from policy.add_deny_commands must appear
+    // 3. Extra blocked commands from commands.deny must appear
     if !extra_blocked.is_empty() {
         let blocked: Vec<&str> = manifest
             .pointer("/process/blocked_commands")

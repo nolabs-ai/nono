@@ -77,18 +77,35 @@ mod tests {
             .allow
             .contains(&"$HOME/.config/swival".to_string()));
         assert!(profile
-            .security
             .groups
+            .include
             .contains(&"python_runtime".to_string()));
         assert!(profile
-            .security
             .groups
+            .include
             .contains(&"unlink_protection".to_string()));
     }
 
     #[test]
     fn test_get_builtin_nonexistent() {
         assert!(get_builtin("nonexistent").is_none());
+    }
+
+    /// Canonical-schema invariant: every built-in profile must resolve to
+    /// non-empty canonical sections after the #594 migration. Either the
+    /// profile contributes groups to `groups.include` (directly or through
+    /// `extends: default`), or it carries filesystem.allow entries — any
+    /// empty profile here likely lost data during JSON migration.
+    #[test]
+    fn test_all_builtins_use_canonical_schema_only() {
+        for name in list_builtin() {
+            let profile =
+                get_builtin(&name).unwrap_or_else(|| panic!("built-in '{}' should load", name));
+            assert!(
+                !profile.groups.include.is_empty() || !profile.filesystem.allow.is_empty(),
+                "{name} has empty canonical sections"
+            );
+        }
     }
 
     #[test]
@@ -115,17 +132,14 @@ mod tests {
         let profile = get_builtin("opencode").expect("Profile not found");
         // Should have default profile groups (inherited via extends).
         assert!(profile
-            .security
             .groups
+            .include
             .contains(&"deny_credentials".to_string()));
-        // Should have profile-specific groups.
+        // Should have profile-specific groups
+        assert!(profile.groups.include.contains(&"node_runtime".to_string()));
         assert!(profile
-            .security
             .groups
-            .contains(&"node_runtime".to_string()));
-        assert!(profile
-            .security
-            .groups
+            .include
             .contains(&"unlink_protection".to_string()));
     }
 
@@ -136,9 +150,9 @@ mod tests {
         let profile = get_builtin("openclaw").expect("Profile not found");
         let default = get_builtin("default").expect("default profile");
         // All default groups should be present since embedded exclusions are empty.
-        for group in &default.security.groups {
+        for group in &default.groups.include {
             assert!(
-                profile.security.groups.contains(group),
+                profile.groups.include.contains(group),
                 "openclaw should contain default profile group '{}'",
                 group
             );
@@ -168,7 +182,7 @@ mod tests {
             "system_write_macos".to_string(),
             "user_tools".to_string(),
         ];
-        let mut actual = profile.security.groups.clone();
+        let mut actual = profile.groups.include.clone();
         expected.sort();
         actual.sort();
         assert_eq!(actual, expected);
@@ -194,16 +208,16 @@ mod tests {
     fn test_linux_host_compat_profile_groups() {
         let profile = get_builtin("linux-host-compat").expect("Profile not found");
         assert!(profile
-            .security
             .groups
+            .include
             .contains(&"linux_runtime_state".to_string()));
         assert!(profile
-            .security
             .groups
+            .include
             .contains(&"linux_sysfs_read".to_string()));
         assert!(profile
-            .security
             .groups
+            .include
             .contains(&"linux_temp_read".to_string()));
     }
 
@@ -213,24 +227,24 @@ mod tests {
             let profile = get_builtin(name).expect("Profile not found");
             assert!(
                 !profile
-                    .security
                     .groups
+                    .include
                     .contains(&"linux_runtime_state".to_string()),
                 "{} should not include linux_runtime_state",
                 name
             );
             assert!(
                 profile
-                    .security
                     .groups
+                    .include
                     .contains(&"linux_sysfs_read".to_string()),
                 "{} should include linux_sysfs_read",
                 name
             );
             assert!(
                 !profile
-                    .security
                     .groups
+                    .include
                     .contains(&"linux_temp_read".to_string()),
                 "{} should not include linux_temp_read",
                 name

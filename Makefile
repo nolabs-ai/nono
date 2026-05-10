@@ -106,8 +106,20 @@ doc-lib:
 audit:
 	cargo audit
 
+# Lint: enforce /// ALIAS marker convention for every serde/clap alias
+# (see scripts/test-list-aliases.sh and docs/plans/2026-04-24-issue-594-phase-2-schema-plan.md Part F).
+.PHONY: lint-aliases
+lint-aliases:
+	bash scripts/test-list-aliases.sh
+
+# Lint: forbid legacy #594 schema tokens in docs and rustdoc outside the
+# allowlist (see scripts/lint-docs.sh).
+.PHONY: lint-docs
+lint-docs:
+	bash scripts/lint-docs.sh
+
 # CI simulation (what CI would run)
-ci: check test audit
+ci: check test audit lint-aliases lint-docs
 	@echo "CI checks passed"
 
 # Help
@@ -137,6 +149,10 @@ help:
 	@echo ""
 	@echo "Security:"
 	@echo "  make audit          Run cargo audit for vulnerabilities"
+	@echo ""
+	@echo "Lint:"
+	@echo "  make lint-aliases   Enforce /// ALIAS marker convention"
+	@echo "  make lint-docs      Forbid legacy #594 schema tokens in docs"
 	@echo ""
 	@echo "Other:"
 	@echo "  make install        Install CLI to ~/.cargo/bin"

@@ -16,8 +16,10 @@ use crate::external;
 use crate::filter::ProxyFilter;
 use crate::reverse;
 use crate::route::RouteStore;
+use crate::tls_intercept::{self, CertCache, EphemeralCa};
 use crate::token;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -50,6 +52,12 @@ pub struct ProxyHandle {
     /// Non-credential allowed hosts that should bypass the proxy (NO_PROXY).
     /// Computed at startup: `allowed_hosts` minus credential upstream hosts.
     no_proxy_hosts: Vec<String>,
+    /// Path to the TLS-intercept trust bundle written at startup, when
+    /// interception is active. The CLI passes this path to the sandboxed
+    /// child via env vars (`SSL_CERT_FILE` etc.) and grants a Landlock /
+    /// Seatbelt read capability on it. `None` when interception is not
+    /// configured (no `intercept_ca_dir`) or no route requires L7 visibility.
+    intercept_ca_path: Option<PathBuf>,
 }
 
 impl ProxyHandle {
@@ -64,6 +72,75 @@ impl ProxyHandle {
         audit::drain_audit_events(&self.audit_log)
     }
 
+    /// Path to the TLS-intercept trust bundle, when interception is active.
+    ///
+    /// The CLI uses this to:
+    /// * point `SSL_CERT_FILE` / `REQUESTS_CA_BUNDLE` / `NODE_EXTRA_CA_CERTS`
+    ///   / `CURL_CA_BUNDLE` at the file in the child env;
+    /// * grant the sandboxed child a Landlock / Seatbelt read capability
+    ///   on the file before applying the sandbox.
+    ///
+    /// `None` when interception is not configured (no `intercept_ca_dir`
+    /// in `ProxyConfig`) or when no configured route requires L7 visibility.
+    #[must_use]
+    pub fn intercept_ca_path(&self) -> Option<&std::path::Path> {
+        self.intercept_ca_path.as_deref()
+    }
+
+    /// One-line-per-route diagnostic summary suitable for surfacing at
+    /// session start. Returns `(prefix, summary)` pairs.
+    ///
+    /// Each summary names: upstream URL, credential resolution status
+    /// (✓ / ✗ + source label), TLS-intercept on/off, and `endpoint_rules`
+    /// count. Designed to make silent credential-resolution failures
+    /// noisy by default, addressing the common "I created the keychain
+    /// entry but the warn at debug level got missed" footgun.
+    ///
+    /// `config` is the same `ProxyConfig` that was passed to `start()`;
+    /// the handle doesn't keep a copy, so the CLI passes it back in.
+    #[must_use]
+    pub fn route_diagnostics(&self, config: &ProxyConfig) -> Vec<(String, String)> {
+        let mut rows = Vec::with_capacity(config.routes.len());
+        for route in &config.routes {
+            let prefix = route.prefix.trim_matches('/').to_string();
+            let cred_summary = if let Some(ref key) = route.credential_key {
+                let resolved = self.loaded_routes.contains(&prefix);
+                if resolved {
+                    format!("creds: {} ✓", key)
+                } else {
+                    format!("creds: {} ✗ (not found)", key)
+                }
+            } else if route.oauth2.is_some() {
+                let resolved = self.loaded_routes.contains(&prefix);
+                if resolved {
+                    "creds: oauth2 ✓".to_string()
+                } else {
+                    "creds: oauth2 ✗ (token exchange failed)".to_string()
+                }
+            } else {
+                "creds: none".to_string()
+            };
+
+            let intercept_summary = if self.intercept_ca_path.is_some()
+                && (route.credential_key.is_some()
+                    || route.oauth2.is_some()
+                    || !route.endpoint_rules.is_empty())
+            {
+                "intercept: on"
+            } else {
+                "intercept: off"
+            };
+
+            let rules_summary = format!("endpoint_rules: {}", route.endpoint_rules.len());
+            let summary = format!(
+                "→ {} | {} | {} | {}",
+                route.upstream, cred_summary, intercept_summary, rules_summary
+            );
+            rows.push((prefix, summary));
+        }
+        rows
+    }
+
     /// Environment variables to inject into the child process.
     ///
     /// The proxy URL includes `nono:<token>@` userinfo so that standard HTTP
@@ -71,6 +148,11 @@ impl ProxyHandle {
     /// `Proxy-Authorization: Basic ...` on every request. The raw token is
     /// also provided via `NONO_PROXY_TOKEN` for nono-aware clients that
     /// prefer Bearer auth.
+    ///
+    /// When TLS interception is active (`intercept_ca_path()` is `Some`),
+    /// the standard runtime CA-trust env vars are also set so the agent
+    /// trusts the proxy's ephemeral CA when minted leaf certs are
+    /// presented during interception.
     #[must_use]
     pub fn env_vars(&self) -> Vec<(String, String)> {
         let proxy_url = format!("http://nono:{}@127.0.0.1:{}", &*self.token, self.port);
@@ -109,6 +191,28 @@ impl ProxyHandle {
         vars.push(("http_proxy".to_string(), proxy_url.clone()));
         vars.push(("https_proxy".to_string(), proxy_url));
         vars.push(("no_proxy".to_string(), no_proxy));
+
+        // TLS-intercept trust injection. The bundle file at this path
+        // contains the parent's `SSL_CERT_FILE` (if any) + the host's
+        // system trust store + the ephemeral session CA, so standard
+        // runtimes see a superset of the trust they had before nono.
+        //
+        // Replacement semantics (swap out the default store entirely):
+        //   SSL_CERT_FILE, REQUESTS_CA_BUNDLE, CURL_CA_BUNDLE, GIT_SSL_CAINFO
+        // Additive semantics (default + this file):
+        //   NODE_EXTRA_CA_CERTS
+        //
+        // Pointing all five at the same bundle is safe: Node sees system
+        // roots twice (harmless), and all other runtimes get the union of
+        // trust they need.
+        if let Some(path) = self.intercept_ca_path.as_deref() {
+            let path_str = path.to_string_lossy().to_string();
+            vars.push(("SSL_CERT_FILE".to_string(), path_str.clone()));
+            vars.push(("REQUESTS_CA_BUNDLE".to_string(), path_str.clone()));
+            vars.push(("NODE_EXTRA_CA_CERTS".to_string(), path_str.clone()));
+            vars.push(("CURL_CA_BUNDLE".to_string(), path_str.clone()));
+            vars.push(("GIT_SSL_CAINFO".to_string(), path_str));
+        }
 
         vars
     }
@@ -163,6 +267,31 @@ impl ProxyHandle {
     }
 }
 
+impl Drop for ProxyHandle {
+    /// Best-effort cleanup of the TLS-intercept trust bundle on shutdown.
+    ///
+    /// The CA private key was never persisted to disk (it lives only in a
+    /// `Zeroizing<Vec<u8>>` inside the running proxy task and is zeroized
+    /// when that task drops). Here we remove the public certificate file
+    /// so the next session doesn't inherit a stale bundle path.
+    ///
+    /// Errors are intentionally swallowed — `Drop` has no good way to
+    /// surface them, and the file may already be gone if the user invoked
+    /// `shutdown()` from another path.
+    fn drop(&mut self) {
+        if let Some(path) = self.intercept_ca_path.take() {
+            let _ = std::fs::remove_file(&path);
+            // If the parent dir is now empty (we may have been the only
+            // tenant in `~/.nono/sessions/<id>/`), tidy up. A non-empty
+            // dir simply fails the rmdir and leaves unrelated contents
+            // in place — exactly what we want.
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::remove_dir(parent);
+            }
+        }
+    }
+}
+
 /// Shared state for the proxy server.
 struct ProxyState {
     filter: ProxyFilter,
@@ -182,6 +311,11 @@ struct ProxyState {
     /// Matcher for hosts that bypass the external proxy and route direct.
     /// Built once at startup from `ExternalProxyConfig.bypass_hosts`.
     bypass_matcher: external::BypassMatcher,
+    /// Per-hostname leaf-certificate cache backed by the session ephemeral
+    /// CA, when TLS interception is active. `None` disables the intercept
+    /// CONNECT branch (CONNECTs fall through to the existing 403/tunnel
+    /// dispatch even for routes that would otherwise require L7).
+    cert_cache: Option<Arc<CertCache>>,
 }
 
 /// Start the proxy server.
@@ -314,6 +448,61 @@ pub async fn start(config: ProxyConfig) -> Result<ProxyHandle> {
         debug!("Smart NO_PROXY bypass hosts: {:?}", no_proxy_hosts);
     }
 
+    // Initialise TLS interception if a directory was supplied AND at least
+    // one configured route actually requires L7 visibility. Routes are
+    // checked here (rather than relying solely on the CLI's decision) so a
+    // misconfigured `intercept_ca_dir` without intercept-bearing routes
+    // doesn't generate a useless CA on disk.
+    let any_intercept_route = route_store
+        .route_upstream_hosts()
+        .iter()
+        .any(|hp| route_store.has_intercept_route(hp));
+    let (cert_cache, intercept_ca_path) = match (&config.intercept_ca_dir, any_intercept_route) {
+        (Some(dir), true) => {
+            let intercept_route_count = route_store
+                .route_upstream_hosts()
+                .iter()
+                .filter(|hp| route_store.has_intercept_route(hp))
+                .count();
+            match EphemeralCa::generate().and_then(|ca| {
+                let ca = Arc::new(ca);
+                let cache = Arc::new(CertCache::new(Arc::clone(&ca)));
+                let path = tls_intercept::write_bundle(tls_intercept::BundleInputs {
+                    dir,
+                    filename: "intercept-ca.pem",
+                    parent_ssl_cert_file: config.intercept_parent_ca_pems.as_deref(),
+                    ephemeral_ca_pem: ca.cert_pem(),
+                })?;
+                Ok((cache, path))
+            }) {
+                Ok((cache, path)) => {
+                    info!(
+                        "TLS interception active for {} route(s); trust bundle at {}",
+                        intercept_route_count,
+                        path.display()
+                    );
+                    (Some(cache), Some(path))
+                }
+                Err(e) => {
+                    warn!(
+                        "TLS interception setup failed for {} route(s): {}. \
+                         Continuing with interception disabled; reverse-proxy routes remain available.",
+                        intercept_route_count, e
+                    );
+                    (None, None)
+                }
+            }
+        }
+        (Some(_), false) => {
+            debug!(
+                "TLS interception requested but no configured route requires L7 visibility; \
+                 skipping CA generation"
+            );
+            (None, None)
+        }
+        (None, _) => (None, None),
+    };
+
     let state = Arc::new(ProxyState {
         filter,
         session_token: session_token.clone(),
@@ -324,6 +513,7 @@ pub async fn start(config: ProxyConfig) -> Result<ProxyHandle> {
         active_connections: AtomicUsize::new(0),
         audit_log: Arc::clone(&audit_log),
         bypass_matcher,
+        cert_cache,
     });
 
     // Spawn accept loop as a task within the current runtime.
@@ -338,6 +528,7 @@ pub async fn start(config: ProxyConfig) -> Result<ProxyHandle> {
         shutdown_tx,
         loaded_routes,
         no_proxy_hosts,
+        intercept_ca_path,
     })
 }
 
@@ -434,16 +625,26 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
 
     // Dispatch by method
     if first_line.starts_with("CONNECT ") {
-        // Block CONNECT tunnels to route upstreams. These must go
-        // through the reverse proxy path so L7 path filtering and
-        // credential injection are enforced. A CONNECT tunnel would
-        // bypass both (raw TLS pipe, proxy never sees HTTP method/path).
+        // CONNECT requests targeting a configured route's upstream get
+        // special handling. There are three sub-cases:
+        //
+        // 1. Route requires L7 visibility (`endpoint_rules`, `credential_key`,
+        //    or `oauth2`) AND TLS interception is configured: terminate TLS
+        //    locally so credential injection / endpoint filtering can run.
+        // 2. Route requires L7 visibility but interception is *not* configured:
+        //    fall back to the existing 403 — the agent must use the reverse
+        //    proxy path. Without interception we can't enforce L7 over CONNECT.
+        // 3. Route exists but is purely declarative (no L7 requirements):
+        //    keep the existing 403 — the route exists to provide a `*_BASE_URL`
+        //    env var, and CONNECT would bypass that intent.
+        //
+        // Anything else (host not matching any route) falls through to the
+        // existing transparent-tunnel / external-proxy paths.
         if !state.route_store.is_empty() {
             if let Some(authority) = first_line.split_whitespace().nth(1) {
                 // Normalise authority to host:port. Handle IPv6 brackets:
                 // "[::1]:443" already has port, "[::1]" needs default, "host:443" has port.
                 let host_port = if authority.starts_with('[') {
-                    // IPv6 literal
                     if authority.contains("]:") {
                         authority.to_lowercase()
                     } else {
@@ -454,25 +655,99 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
                 } else {
                     format!("{}:443", authority.to_lowercase())
                 };
+
                 if state.route_store.is_route_upstream(&host_port) {
+                    let route_id = state
+                        .route_store
+                        .lookup_by_upstream(&host_port)
+                        .map(|(prefix, _)| prefix);
                     let (host, port) = host_port
                         .rsplit_once(':')
-                        .map(|(h, p)| (h, p.parse::<u16>().unwrap_or(443)))
-                        .unwrap_or((&host_port, 443));
-                    debug!(
-                        "Blocked CONNECT to route upstream {} — use reverse proxy path instead",
-                        authority
-                    );
-                    audit::log_denied(
-                        Some(&state.audit_log),
-                        audit::ProxyMode::Connect,
-                        host,
-                        port,
-                        "route upstream: CONNECT bypasses L7 filtering",
-                    );
-                    let response = "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n";
-                    stream.write_all(response.as_bytes()).await?;
-                    return Ok(());
+                        .map(|(h, p)| (h.to_string(), p.parse::<u16>().unwrap_or(443)))
+                        .unwrap_or_else(|| (host_port.clone(), 443));
+
+                    let intercept_eligible = state.route_store.has_intercept_route(&host_port);
+
+                    match (intercept_eligible, state.cert_cache.as_ref()) {
+                        // Case 1: intercept-eligible route + cert cache available.
+                        (true, Some(cache)) => {
+                            // Strict OUTER auth: intercept is a privileged op
+                            // (we mint a leaf cert and decrypt traffic), so
+                            // unlike the lenient transparent-tunnel path we
+                            // require Proxy-Authorization here.
+                            if let Err(e) =
+                                token::validate_proxy_auth(&header_bytes, &state.session_token)
+                            {
+                                debug!(
+                                    "tls_intercept: rejecting CONNECT to {}:{} — {}",
+                                    host, port, e
+                                );
+                                audit::log_denied(
+                                    Some(&state.audit_log),
+                                    audit::ProxyMode::ConnectIntercept,
+                                    &audit::EventContext {
+                                        route_id,
+                                        auth_mechanism: Some(
+                                            nono::undo::NetworkAuditAuthMechanism::ProxyAuthorization,
+                                        ),
+                                        auth_outcome: Some(
+                                            nono::undo::NetworkAuditAuthOutcome::Failed,
+                                        ),
+                                        denial_category: Some(
+                                            nono::undo::NetworkAuditDenialCategory::AuthenticationFailed,
+                                        ),
+                                        ..audit::EventContext::default()
+                                    },
+                                    &host,
+                                    port,
+                                    "proxy auth missing or invalid",
+                                );
+                                let response = "HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"nono\"\r\nContent-Length: 0\r\n\r\n";
+                                stream.write_all(response.as_bytes()).await?;
+                                return Ok(());
+                            }
+
+                            let ctx = tls_intercept::InterceptCtx {
+                                route_id,
+                                host: &host,
+                                port,
+                                route_store: &state.route_store,
+                                credential_store: &state.credential_store,
+                                session_token: &state.session_token,
+                                cert_cache: Arc::clone(cache),
+                                tls_connector: &state.tls_connector,
+                                filter: &state.filter,
+                                audit_log: Some(&state.audit_log),
+                            };
+                            return tls_intercept::handle_intercept_connect(&mut stream, ctx).await;
+                        }
+                        // Case 2 & 3: route exists but interception is unavailable
+                        // or the route is purely declarative — keep the existing
+                        // 403 to force SDK cooperation with the reverse-proxy path.
+                        _ => {
+                            debug!(
+                                "Blocked CONNECT to route upstream {} — use reverse proxy path instead",
+                                authority
+                            );
+                            audit::log_denied(
+                                Some(&state.audit_log),
+                                audit::ProxyMode::Connect,
+                                &audit::EventContext {
+                                    route_id,
+                                    denial_category: Some(
+                                        nono::undo::NetworkAuditDenialCategory::ConnectBypassesL7,
+                                    ),
+                                    ..audit::EventContext::default()
+                                },
+                                &host,
+                                port,
+                                "route upstream: CONNECT bypasses L7 filtering",
+                            );
+                            let response = "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n";
+                            stream.write_all(response.as_bytes()).await?;
+                            return Ok(());
+                        }
+                    }
                 }
             }
         }
@@ -579,6 +854,236 @@ mod tests {
         handle.shutdown();
     }
 
+    /// End-to-end smoke test: when `intercept_ca_dir` is set AND a route
+    /// requires L7 visibility, the proxy:
+    /// 1. generates an ephemeral CA;
+    /// 2. writes a trust bundle file with at least the ephemeral cert + system roots;
+    /// 3. exposes the path via `intercept_ca_path()`;
+    /// 4. emits trust env vars (`SSL_CERT_FILE` etc.) pointing at it;
+    /// 5. cleans the file on `Drop`.
+    #[tokio::test]
+    async fn test_intercept_lifecycle_end_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca_path_clone;
+
+        {
+            let config = ProxyConfig {
+                routes: vec![crate::config::RouteConfig {
+                    prefix: "openai".to_string(),
+                    upstream: "https://api.openai.com".to_string(),
+                    credential_key: Some("env://NONO_TEST_TOTALLY_MISSING".to_string()),
+                    inject_mode: Default::default(),
+                    inject_header: "Authorization".to_string(),
+                    credential_format: "Bearer {}".to_string(),
+                    path_pattern: None,
+                    path_replacement: None,
+                    query_param_name: None,
+                    proxy: None,
+                    env_var: None,
+                    endpoint_rules: vec![],
+                    tls_ca: None,
+                    tls_client_cert: None,
+                    tls_client_key: None,
+                    oauth2: None,
+                }],
+                intercept_ca_dir: Some(dir.path().to_path_buf()),
+                ..Default::default()
+            };
+            let handle = start(config).await.unwrap();
+            assert!(
+                handle.intercept_ca_path().is_some(),
+                "intercept-eligible route + intercept_ca_dir → bundle path should be Some"
+            );
+            ca_path_clone = handle.intercept_ca_path().unwrap().to_path_buf();
+            assert!(
+                ca_path_clone.exists(),
+                "bundle file should have been written"
+            );
+
+            let contents = std::fs::read_to_string(&ca_path_clone).unwrap();
+            assert!(
+                contents.contains("BEGIN CERTIFICATE"),
+                "bundle should contain at least one PEM block"
+            );
+
+            // Trust env vars should reference the bundle.
+            let vars = handle.env_vars();
+            let ssl = vars
+                .iter()
+                .find(|(k, _)| k == "SSL_CERT_FILE")
+                .expect("SSL_CERT_FILE should be set when intercept active");
+            assert_eq!(std::path::Path::new(&ssl.1), ca_path_clone);
+            assert!(vars.iter().any(|(k, _)| k == "REQUESTS_CA_BUNDLE"));
+            assert!(vars.iter().any(|(k, _)| k == "NODE_EXTRA_CA_CERTS"));
+            assert!(vars.iter().any(|(k, _)| k == "CURL_CA_BUNDLE"));
+
+            handle.shutdown();
+        }
+        // After `handle` is dropped, the bundle file should be gone.
+        assert!(
+            !ca_path_clone.exists(),
+            "bundle should be removed when ProxyHandle drops"
+        );
+    }
+
+    /// When `intercept_ca_dir` is set but no route requires L7 visibility,
+    /// the proxy should NOT generate a CA (it would just be wasted material).
+    #[tokio::test]
+    async fn test_intercept_skipped_for_purely_declarative_routes() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = ProxyConfig {
+            routes: vec![crate::config::RouteConfig {
+                prefix: "alias".to_string(),
+                upstream: "https://aliased.example.com".to_string(),
+                credential_key: None,
+                inject_mode: Default::default(),
+                inject_header: "Authorization".to_string(),
+                credential_format: "Bearer {}".to_string(),
+                path_pattern: None,
+                path_replacement: None,
+                query_param_name: None,
+                proxy: None,
+                env_var: None,
+                endpoint_rules: vec![],
+                tls_ca: None,
+                tls_client_cert: None,
+                tls_client_key: None,
+                oauth2: None,
+            }],
+            intercept_ca_dir: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        };
+        let handle = start(config).await.unwrap();
+        assert!(
+            handle.intercept_ca_path().is_none(),
+            "no L7-bearing route → no CA should be generated"
+        );
+        let vars = handle.env_vars();
+        assert!(
+            vars.iter().all(|(k, _)| k != "SSL_CERT_FILE"),
+            "trust env vars must not be set when intercept inactive"
+        );
+        handle.shutdown();
+    }
+
+    /// Intercept setup failures must not abort proxy startup for reverse-proxy
+    /// routes. We degrade to "intercept off" so credential routes still work,
+    /// while CONNECT interception remains unavailable and will keep its
+    /// existing deny behaviour.
+    #[tokio::test]
+    async fn test_intercept_setup_failure_degrades_without_aborting_proxy() {
+        let missing_dir = tempfile::tempdir()
+            .unwrap()
+            .path()
+            .join("missing")
+            .join("intercept");
+        let config = ProxyConfig {
+            routes: vec![crate::config::RouteConfig {
+                prefix: "openai".to_string(),
+                upstream: "https://api.openai.com".to_string(),
+                credential_key: Some("env://NONO_TEST_TOTALLY_MISSING".to_string()),
+                inject_mode: Default::default(),
+                inject_header: "Authorization".to_string(),
+                credential_format: "Bearer {}".to_string(),
+                path_pattern: None,
+                path_replacement: None,
+                query_param_name: None,
+                proxy: None,
+                env_var: None,
+                endpoint_rules: vec![],
+                tls_ca: None,
+                tls_client_cert: None,
+                tls_client_key: None,
+                oauth2: None,
+            }],
+            intercept_ca_dir: Some(missing_dir),
+            ..Default::default()
+        };
+        let handle = start(config.clone()).await.unwrap();
+        assert!(
+            handle.intercept_ca_path().is_none(),
+            "intercept setup failure should disable interception instead of aborting startup"
+        );
+        let vars = handle.env_vars();
+        assert!(
+            vars.iter().all(|(k, _)| k != "SSL_CERT_FILE"),
+            "trust env vars must not be set when interception setup fails"
+        );
+        let route_vars = handle.credential_env_vars(&config);
+        assert!(
+            route_vars.iter().any(|(k, _)| k == "OPENAI_BASE_URL"),
+            "reverse-proxy route env vars should still be emitted"
+        );
+        handle.shutdown();
+    }
+
+    /// `route_diagnostics()` returns one row per route summarising
+    /// upstream, credential resolution, intercept on/off, and rule count.
+    #[tokio::test]
+    async fn test_route_diagnostics_summarises_each_route() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = ProxyConfig {
+            routes: vec![
+                crate::config::RouteConfig {
+                    prefix: "openai".to_string(),
+                    upstream: "https://api.openai.com".to_string(),
+                    credential_key: Some("env://NONO_TEST_MISSING".to_string()),
+                    inject_mode: Default::default(),
+                    inject_header: "Authorization".to_string(),
+                    credential_format: "Bearer {}".to_string(),
+                    path_pattern: None,
+                    path_replacement: None,
+                    query_param_name: None,
+                    proxy: None,
+                    env_var: None,
+                    endpoint_rules: vec![],
+                    tls_ca: None,
+                    tls_client_cert: None,
+                    tls_client_key: None,
+                    oauth2: None,
+                },
+                crate::config::RouteConfig {
+                    prefix: "alias".to_string(),
+                    upstream: "https://aliased.example.com".to_string(),
+                    credential_key: None,
+                    inject_mode: Default::default(),
+                    inject_header: "Authorization".to_string(),
+                    credential_format: "Bearer {}".to_string(),
+                    path_pattern: None,
+                    path_replacement: None,
+                    query_param_name: None,
+                    proxy: None,
+                    env_var: None,
+                    endpoint_rules: vec![],
+                    tls_ca: None,
+                    tls_client_cert: None,
+                    tls_client_key: None,
+                    oauth2: None,
+                },
+            ],
+            intercept_ca_dir: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        };
+        let handle = start(config.clone()).await.unwrap();
+        let rows = handle.route_diagnostics(&config);
+        assert_eq!(rows.len(), 2);
+
+        let openai = rows.iter().find(|(p, _)| p == "openai").unwrap();
+        assert!(openai.1.contains("api.openai.com"));
+        assert!(openai.1.contains("intercept: on"));
+        assert!(
+            openai.1.contains("✗") || openai.1.contains("not found"),
+            "missing credential should show ✗, got: {}",
+            openai.1
+        );
+
+        let alias = rows.iter().find(|(p, _)| p == "alias").unwrap();
+        assert!(alias.1.contains("creds: none"));
+        assert!(alias.1.contains("intercept: off"));
+
+        handle.shutdown();
+    }
+
     #[tokio::test]
     async fn test_proxy_env_vars() {
         let config = ProxyConfig::default();
@@ -648,6 +1153,7 @@ mod tests {
             shutdown_tx,
             loaded_routes: ["openai".to_string()].into_iter().collect(),
             no_proxy_hosts: Vec::new(),
+            intercept_ca_path: None,
         };
         let config = ProxyConfig {
             routes: vec![crate::config::RouteConfig {
@@ -702,6 +1208,7 @@ mod tests {
             shutdown_tx,
             loaded_routes: ["openai".to_string()].into_iter().collect(),
             no_proxy_hosts: Vec::new(),
+            intercept_ca_path: None,
         };
         let config = ProxyConfig {
             routes: vec![crate::config::RouteConfig {
@@ -761,6 +1268,7 @@ mod tests {
             // Only "openai" was loaded; "github" credential was unavailable
             loaded_routes: ["openai".to_string()].into_iter().collect(),
             no_proxy_hosts: Vec::new(),
+            intercept_ca_path: None,
         };
         let config = ProxyConfig {
             routes: vec![
@@ -840,6 +1348,7 @@ mod tests {
             shutdown_tx,
             loaded_routes: std::collections::HashSet::new(),
             no_proxy_hosts: Vec::new(),
+            intercept_ca_path: None,
         };
 
         // Test leading slash
@@ -927,6 +1436,7 @@ mod tests {
             shutdown_tx: shutdown_tx.clone(),
             loaded_routes: ["anthropic".to_string()].into_iter().collect(),
             no_proxy_hosts: Vec::new(),
+            intercept_ca_path: None,
         };
         let config_no_env_var = ProxyConfig {
             routes: vec![crate::config::RouteConfig {
@@ -965,6 +1475,7 @@ mod tests {
             shutdown_tx: shutdown_tx2,
             loaded_routes: ["anthropic".to_string()].into_iter().collect(),
             no_proxy_hosts: Vec::new(),
+            intercept_ca_path: None,
         };
         let config_fixed = ProxyConfig {
             routes: vec![crate::config::RouteConfig {
@@ -1009,6 +1520,7 @@ mod tests {
                 "nats.internal:4222".to_string(),
                 "opencode.internal:4096".to_string(),
             ],
+            intercept_ca_path: None,
         };
 
         let vars = handle.env_vars();
@@ -1037,6 +1549,7 @@ mod tests {
             shutdown_tx,
             loaded_routes: std::collections::HashSet::new(),
             no_proxy_hosts: Vec::new(),
+            intercept_ca_path: None,
         };
 
         let vars = handle.env_vars();

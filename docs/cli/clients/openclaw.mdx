@@ -67,7 +67,7 @@ nono run --profile openclaw-strict -- openclaw gateway
 ```
 
 <Note>
-Custom profiles override built-in profiles of the same name. If you create `~/.config/nono/profiles/openclaw.json`, it will be used instead of the built-in.
+Custom profiles override pack profiles of the same name. If you create `~/.config/nono/profiles/openclaw.json`, it will be used instead of the pack-provided profile.
 </Note>
 
 See [Security Profiles](/cli/features/profiles-groups) for the full profile format reference.
@@ -81,7 +81,7 @@ OpenClaw stores sensitive data in `~/.openclaw/` including:
 - OAuth credentials
 - API keys for AI providers
 
-The built-in profile grants **read+write** access to this directory so OpenClaw can update its state. If you need stricter isolation, use a custom profile with read-only access (see the custom profile example above).
+The profile grants **read+write** access to this directory so OpenClaw can update its state. If you need stricter isolation, use a custom profile with read-only access (see the custom profile example above).
 
 For maximum security, use nono's secrets management to load API keys from the system keystore. This keeps credentials out of config files and environment variable exports where they could be leaked.
 
@@ -126,7 +126,7 @@ See [Credential Injection](/cli/features/credential-injection) for complete docu
 
 ### Limit Agent Filesystem Access
 
-The built-in profile grants access to OpenClaw's config directories. To also grant access to a project directory:
+The profile grants access to OpenClaw's config directories. To also grant access to a project directory:
 
 ```bash
 # Restrict to specific project directory only

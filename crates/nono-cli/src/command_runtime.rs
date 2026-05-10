@@ -141,7 +141,7 @@ pub(crate) fn run_shell(args: ShellArgs, silent: bool) -> Result<()> {
             capability_elevation: prepared.capability_elevation,
             #[cfg(target_os = "linux")]
             wsl2_proxy_policy: prepared.wsl2_proxy_policy,
-            override_deny_paths: prepared.override_deny_paths,
+            bypass_protection_paths: prepared.bypass_protection_paths,
             allowed_env_vars: prepared.allowed_env_vars,
             proxy,
             session: SessionLaunchOptions {
@@ -210,7 +210,7 @@ pub(crate) fn run_wrap(wrap_args: WrapArgs, silent: bool) -> Result<()> {
             strategy: exec_strategy::ExecStrategy::Direct,
             workdir: resolve_requested_workdir(args.workdir.as_ref()),
             no_diagnostics,
-            override_deny_paths: prepared.override_deny_paths,
+            bypass_protection_paths: prepared.bypass_protection_paths,
             allowed_env_vars: prepared.allowed_env_vars,
             ..ExecutionFlags::defaults(silent)?
         },

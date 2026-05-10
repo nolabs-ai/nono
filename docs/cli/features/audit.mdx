@@ -5,7 +5,7 @@ description: Session tracking, filtering, and compliance reporting
 
 Every `nono run` session is recorded by default. nono records the command that ran, the audit events observed during the session, optional filesystem changes, and network events outside the sandbox in the trusted parent process. This gives you a history of agent activity for debugging, compliance, and forensics.
 
-The details of how that record is protected are explained in the [Security Model](/docs/cli/internals/security-model): the trusted supervisor records the session, the event log is committed with a Merkleized integrity structure, and optional signing lets a key holder attest to the completed session.
+The details of how that record is protected are explained in the [Security Model](/cli/internals/security-model): the trusted supervisor records the session, the event log is committed with a Merkleized integrity structure, and optional signing lets a key holder attest to the completed session.
 
 ## How It Works
 
@@ -193,17 +193,17 @@ nono audit list --json
 Example output:
 
 ```
-[nono] 14 session(s)
+nono 14 command(s)
 
-  ~/dev/sprockets (11 sessions)
-    20260219-092017-8117 completed claude
-    20260219-091403-90291 completed claude
-    20260218-134433-28210 completed claude
+  ~/dev/sprockets (11 commands)
+    20260219-092017-8117  just now  completed  claude
+    20260219-091403-90291  5m ago  completed  claude
+    20260218-134433-28210  1d ago  completed  claude
     ...
 
-  ~/dev/widgets (3 sessions)
-    20260219-100000-1234 completed claude
-    20260218-120000-5678 completed my-agent
+  ~/dev/widgets (3 commands)
+    20260219-100000-1234  2d ago  completed  claude
+    20260218-120000-5678  3d ago  completed  my-agent
     ...
 ```
 

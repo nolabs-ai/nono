@@ -1,0 +1,139 @@
+---
+title: Managing Packs
+description: Install, update, remove, search, and list nono packs
+---
+
+Packs are signed bundles of profiles, hooks, plugins, and other artifacts distributed through the nono registry. This page covers the consumer side — installing and managing packs on your machine.
+
+For the producer side (creating and publishing packs), see [Publishing Packs](/cli/features/package-publishing).
+
+## Installing a Pack
+
+Use `nono pull` to install a pack from the registry:
+
+```bash
+nono pull always-further/claude
+```
+
+On install, the CLI:
+
+1. Fetches the pull manifest from the registry.
+2. Downloads artifacts and matching `.bundle` signature files.
+3. Verifies Sigstore bundles locally.
+4. Checks that the signer repository org matches the pack namespace.
+5. Pins the signer identity in a local lockfile.
+6. Installs verified artifacts into the pack store (`~/.config/nono/packages/`).
+
+### Pinning a Version
+
+By default `nono pull` installs the latest version. Pin to a specific version with `@`:
+
+```bash
+nono pull always-further/claude@1.2.0
+```
+
+### Initializing Project Files
+
+Some packs include project-level instructions (e.g. a `CLAUDE.md` context file). Use `--init` to copy them into the current directory:
+
+```bash
+nono pull always-further/claude --init
+```
+
+Without `--init`, project-level instructions are installed into the pack store but not copied into your working directory.
+
+### Force Reinstall
+
+Use `--force` to overwrite conflicts and accept signer changes:
+
+```bash
+nono pull always-further/claude --force
+```
+
+<Warning>
+  `--force` bypasses the signer-change prompt. Only use this when you trust the new signer identity.
+</Warning>
+
+## Updating Packs
+
+Update all installed packs to their latest versions:
+
+```bash
+nono update
+```
+
+Or update a specific pack:
+
+```bash
+nono update always-further/claude
+```
+
+The update checks the registry for newer versions, verifies signatures, and replaces local artifacts. Signer identity changes trigger a confirmation prompt (use `--force` to skip).
+
+## Removing a Pack
+
+```bash
+nono remove always-further/claude
+```
+
+This removes all artifacts installed by the pack (profiles, plugins, hooks, wiring) and cleans up the lockfile entry.
+
+If the pack applied wiring directives (e.g. injected hook entries into `hooks.json`), removal reverses them. If reversal partially fails, the lockfile entry is kept so you can retry. Use `--force` to proceed anyway:
+
+```bash
+nono remove always-further/claude --force
+```
+
+## Searching the Registry
+
+Find packs by keyword:
+
+```bash
+nono search claude
+```
+
+Machine-readable output:
+
+```bash
+nono search sandbox --json
+```
+
+## Listing Installed Packs
+
+```bash
+nono list --installed
+```
+
+Machine-readable output:
+
+```bash
+nono list --installed --json
+```
+
+## Custom Registry
+
+All pack commands accept `--registry` to target a different registry (useful for development or enterprise registries):
+
+```bash
+nono pull --registry http://localhost:3001/api/v1 acme-corp/internal-agent
+nono search --registry http://localhost:3001/api/v1 agent
+```
+
+Or set it globally via environment variable:
+
+```bash
+export NONO_REGISTRY=https://registry.example.com/api/v1
+nono pull acme-corp/internal-agent
+```
+
+## Pack Store Layout
+
+Installed packs live under `~/.config/nono/packages/<namespace>/<name>/`. Each pack directory contains the verified artifacts and a lockfile entry tracking the installed version and signer identity.
+
+Profiles from packs are automatically available to `--profile`. Use `nono profile list` to see all available profiles and their source (user, pack, or preset).
+
+## Next Steps
+
+- [Publishing Packs](/cli/features/package-publishing) — Create and publish your own packs
+- [Profiles & Groups](/cli/features/profiles-groups) — Understand profile resolution order
+- [Supply Chain Security](/cli/features/trust) — How signature verification works

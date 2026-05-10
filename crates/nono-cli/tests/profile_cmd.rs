@@ -62,7 +62,7 @@ fn test_init_creates_valid_profile() {
     assert_eq!(val["meta"]["name"], "test-agent");
     assert_eq!(val["extends"], "default");
     assert_eq!(val["meta"]["description"], "Integration test profile");
-    assert_eq!(val["security"]["groups"][0], "deny_credentials");
+    assert_eq!(val["groups"]["include"][0], "deny_credentials");
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -90,7 +90,7 @@ fn test_init_full_creates_all_additive_sections() {
     let val: serde_json::Value = serde_json::from_str(&content).expect("parse json");
 
     // Full skeleton must include these additive sections
-    assert!(val.get("policy").is_some(), "missing policy section");
+    assert!(val.get("commands").is_some(), "missing commands section");
     assert!(val.get("network").is_some(), "missing network section");
     assert!(
         val.get("env_credentials").is_some(),

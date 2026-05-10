@@ -433,7 +433,7 @@ pub(crate) struct PreparedSandbox {
     pub(crate) allow_gpu_active: bool,
     pub(crate) open_url_origins: Vec<String>,
     pub(crate) open_url_allow_localhost: bool,
-    pub(crate) override_deny_paths: Vec<PathBuf>,
+    pub(crate) bypass_protection_paths: Vec<PathBuf>,
     pub(crate) allowed_env_vars: Option<Vec<String>>,
 }
 
@@ -590,7 +590,9 @@ pub(crate) fn maybe_enable_macos_launch_services(
     }
 
     caps.add_platform_rule("(allow lsopen)")?;
-    warn!("--allow-launch-services enabled: allowing direct LaunchServices opens on macOS");
+    tracing::debug!(
+        "--allow-launch-services enabled: allowing direct LaunchServices opens on macOS"
+    );
     Ok(true)
 }
 
@@ -1009,7 +1011,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
                 allow_gpu_active: false,
                 open_url_origins: Vec::new(),
                 open_url_allow_localhost: false,
-                override_deny_paths: Vec::new(),
+                bypass_protection_paths: Vec::new(),
                 allowed_env_vars: None,
             },
             args,
@@ -1038,7 +1040,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         allow_launch_services: profile_allow_launch_services,
         allow_gpu: profile_allow_gpu,
         allow_parent_of_protected: profile_allow_parent_of_protected,
-        override_deny_paths,
+        bypass_protection_paths,
         allowed_env_vars: profile_allowed_env_vars,
     } = prepared_profile;
 
@@ -1280,7 +1282,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
             allow_gpu_active,
             open_url_origins,
             open_url_allow_localhost,
-            override_deny_paths,
+            bypass_protection_paths,
             allowed_env_vars: profile_allowed_env_vars,
         },
         args,

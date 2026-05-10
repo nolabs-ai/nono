@@ -51,7 +51,17 @@ pub async fn handle_connect(
     let check = filter.check_host(&host, port).await?;
     if !check.result.is_allowed() {
         let reason = check.result.reason();
-        audit::log_denied(audit_log, audit::ProxyMode::Connect, &host, port, &reason);
+        audit::log_denied(
+            audit_log,
+            audit::ProxyMode::Connect,
+            &audit::EventContext {
+                denial_category: Some(nono::undo::NetworkAuditDenialCategory::HostDenied),
+                ..audit::EventContext::default()
+            },
+            &host,
+            port,
+            &reason,
+        );
         send_response(stream, 403, &format!("Forbidden: {}", reason)).await?;
         return Err(ProxyError::HostDenied { host, reason });
     }
@@ -62,7 +72,19 @@ pub async fn handle_connect(
     let resolved = &check.resolved_addrs;
     if resolved.is_empty() {
         let reason = "DNS resolution returned no addresses".to_string();
-        audit::log_denied(audit_log, audit::ProxyMode::Connect, &host, port, &reason);
+        audit::log_denied(
+            audit_log,
+            audit::ProxyMode::Connect,
+            &audit::EventContext {
+                denial_category: Some(
+                    nono::undo::NetworkAuditDenialCategory::UpstreamConnectFailed,
+                ),
+                ..audit::EventContext::default()
+            },
+            &host,
+            port,
+            &reason,
+        );
         send_response(stream, 502, "DNS resolution failed").await?;
         return Err(ProxyError::UpstreamConnect {
             host: host.clone(),
@@ -74,7 +96,14 @@ pub async fn handle_connect(
 
     // Send 200 Connection Established
     send_response(stream, 200, "Connection Established").await?;
-    audit::log_allowed(audit_log, audit::ProxyMode::Connect, &host, port, "CONNECT");
+    audit::log_allowed(
+        audit_log,
+        audit::ProxyMode::Connect,
+        &audit::EventContext::default(),
+        &host,
+        port,
+        "CONNECT",
+    );
 
     // Bidirectional relay
     let result = tokio::io::copy_bidirectional(stream, &mut upstream).await;

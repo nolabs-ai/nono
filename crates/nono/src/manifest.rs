@@ -74,7 +74,8 @@ impl CapabilityManifest {
         for cred in &self.credentials {
             // URI manager sources (op://, apple-password://, file://) need an
             // explicit env_var because uppercasing the URI produces a nonsensical
-            // environment variable name.
+            // environment variable name. env:// is exempt: the var name is derived
+            // from the URI itself.
             let source = cred.source.as_str();
             if (crate::keystore::is_op_uri(source)
                 || crate::keystore::is_apple_password_uri(source)

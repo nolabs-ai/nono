@@ -3,8 +3,6 @@ title: Troubleshooting
 description: Common issues and solutions when using nono
 ---
 
-Common issues and solutions when using nono.
-
 ## Permission Denied Errors
 
 ### Symptom
@@ -37,13 +35,13 @@ Command fails with "Permission denied" or "Operation not permitted" errors.
 | Cause | Solution |
 |-------|----------|
 | Path not in allowed list | Add path with `--allow`, `--read`, or `--write` |
-| Sensitive path blocked | These paths cannot be granted (see below) |
+| Sensitive path blocked | Use `--bypass-protection` with your grant (see below) |
 | Relative path resolved differently | Use absolute paths |
 | Symlink target outside sandbox | Grant access to the symlink target |
 
 ### Sensitive Paths
 
-These paths are always blocked, even if a parent directory is allowed:
+These paths are blocked by default, even if a parent directory is allowed:
 
 - `~/.ssh/` - SSH keys
 - `~/.aws/` - AWS credentials
@@ -54,6 +52,18 @@ These paths are always blocked, even if a parent directory is allowed:
 - Shell configuration files
 
 **Why?** These paths commonly contain secrets that an AI agent should never access.
+
+If you grant one of these paths with `--allow`, nono will warn you on macOS:
+
+```
+WARN '~/.gnupg' is blocked by 'deny_credentials'; use --bypass-protection ~/.gnupg to allow access
+```
+
+To intentionally access a blocked path, use `--bypass-protection` alongside your grant:
+
+```bash
+nono run --allow ~/.gnupg --bypass-protection ~/.gnupg -- gpg --list-keys
+```
 
 ---
 
@@ -303,49 +313,6 @@ uname -r
 
 # If < 6.7, network filtering is unavailable via Landlock
 ```
-
----
-
-## Using `nono learn` to Discover Required Paths
-
-If you're getting permission errors and aren't sure which paths your application needs, use `nono learn` to trace file accesses:
-
-```bash
-# Discover all paths accessed by your app
-nono learn -- my-app
-
-# Compare against an existing profile to see what's missing
-nono learn --profile my-profile -- my-app
-
-# Output as JSON for easy profile creation
-nono learn --json -- my-app
-```
-
-<Note>
-  `nono learn` is available on Linux (requires `strace`) and macOS (requires `sudo` for `fs_usage` and `nettop`). The command runs WITHOUT sandbox restrictions to accurately trace file and network accesses.
-</Note>
-
-### Example Workflow
-
-1. Run learn mode to discover paths:
-   ```bash
-   nono learn -- opencode
-   ```
-
-2. Review the output to see which paths are needed:
-   ```
-   Read paths needed:
-     /usr/share/locale-langpack
-     /home/user/.config/opencode
-
-   Write paths needed:
-     /home/user/.cache/opencode
-   ```
-
-3. Add the paths to your nono command or profile:
-   ```bash
-   nono run --read /usr/share/locale-langpack --allow ~/.config/opencode -- opencode
-   ```
 
 ---
 

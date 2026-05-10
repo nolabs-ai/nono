@@ -182,7 +182,7 @@ impl LearnResult {
         profile.filesystem.read_file = shortened_paths(&self.read_files, home_path);
         profile.filesystem.write = shortened_paths(&self.write_paths, home_path);
         profile.filesystem.write_file = shortened_paths(&self.write_files, home_path);
-        profile.policy.override_deny = learned_override_deny_paths(self, home_path)?;
+        profile.filesystem.bypass_protection = learned_bypass_protection_paths(self, home_path)?;
 
         Ok(profile)
     }
@@ -345,8 +345,8 @@ fn shortened_paths(paths: &BTreeSet<PathBuf>, home_path: &Path) -> Vec<String> {
         .collect()
 }
 
-fn learned_override_deny_paths(result: &LearnResult, home_path: &Path) -> Result<Vec<String>> {
-    let mut override_deny = Vec::new();
+fn learned_bypass_protection_paths(result: &LearnResult, home_path: &Path) -> Result<Vec<String>> {
+    let mut bypass_protection = Vec::new();
 
     for path in result
         .readwrite_paths
@@ -359,13 +359,13 @@ fn learned_override_deny_paths(result: &LearnResult, home_path: &Path) -> Result
     {
         let shortened = crate::profile_save_runtime::shorten_path_for_profile(path, home_path);
         if crate::config::check_sensitive_path(&shortened)?.is_some()
-            && !override_deny.contains(&shortened)
+            && !bypass_protection.contains(&shortened)
         {
-            override_deny.push(shortened);
+            bypass_protection.push(shortened);
         }
     }
 
-    Ok(override_deny)
+    Ok(bypass_protection)
 }
 
 pub(crate) fn merge_learned_profile_patch(profile: &mut Profile, patch: &Profile) {

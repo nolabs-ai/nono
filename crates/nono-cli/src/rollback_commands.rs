@@ -6,7 +6,7 @@ use crate::cli::{
     RollbackArgs, RollbackCleanupArgs, RollbackCommands, RollbackListArgs, RollbackRestoreArgs,
     RollbackShowArgs, RollbackVerifyArgs,
 };
-use crate::command_display::format_command_line;
+use crate::command_display::{format_command_line, truncate_chars};
 use crate::config::user::load_user_config;
 use crate::rollback_base_exclusions;
 use crate::rollback_session::{
@@ -239,7 +239,6 @@ fn get_session_total_changes(s: &SessionInfo) -> (usize, usize, usize) {
     (total_created, total_modified, total_deleted)
 }
 
-/// Truncate command for display, adding ... if too long
 /// Format change summary for display
 fn format_change_summary(created: usize, modified: usize, deleted: usize) -> String {
     let mut parts = Vec::new();
@@ -494,7 +493,7 @@ fn print_side_by_side_diff(
 
             match change_op.tag() {
                 ChangeTag::Equal => {
-                    let truncated = truncate_str(line_trimmed, col_width);
+                    let truncated = truncate_chars(line_trimmed, col_width);
                     eprintln!(
                         "{:<width$} | {:<width$}",
                         truncated,
@@ -503,11 +502,11 @@ fn print_side_by_side_diff(
                     );
                 }
                 ChangeTag::Delete => {
-                    let truncated = truncate_str(line_trimmed, col_width);
+                    let truncated = truncate_chars(line_trimmed, col_width);
                     eprintln!("{} < {:<width$}", truncated.red(), "", width = col_width);
                 }
                 ChangeTag::Insert => {
-                    let truncated = truncate_str(line_trimmed, col_width);
+                    let truncated = truncate_chars(line_trimmed, col_width);
                     eprintln!("{:<width$} > {}", "", truncated.green(), width = col_width);
                 }
             }
@@ -563,14 +562,6 @@ fn count_lines(content: &[u8]) -> usize {
         .filter(|&&b| b == b'\n')
         .count()
         .saturating_add(1)
-}
-
-fn truncate_str(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
-        s.to_string()
-    } else {
-        format!("{}...", &s[..max_len.saturating_sub(3)])
-    }
 }
 
 fn print_show_json(session: &SessionInfo) -> Result<()> {

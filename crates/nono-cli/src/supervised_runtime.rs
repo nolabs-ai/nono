@@ -219,10 +219,6 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
         },
     };
 
-    if !session.detached_start {
-        output::finish_status_line_for_handoff(silent);
-    }
-
     let exit_code = {
         let mut on_fork = |child_pid: u32| {
             if let Some(ref mut guard) = session_guard {

@@ -12,7 +12,7 @@ on:
         type: string
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -20,6 +20,7 @@ env:
 
 jobs:
   build:
+    if: github.repository == 'always-further/nono'
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     strategy:
@@ -121,6 +122,8 @@ jobs:
     name: Create Release
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:

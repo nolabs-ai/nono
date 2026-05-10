@@ -3,6 +3,9 @@
 //! Chains CONNECT requests to an upstream enterprise proxy (Squid, Cisco WSA,
 //! Zscaler, etc.). Cloud metadata endpoints are still denied before forwarding.
 //! The enterprise proxy makes the final allow/deny decision.
+//!
+//! The CONNECT-handshake-against-the-enterprise-proxy logic is extracted into
+//! [`connect_via_proxy`] so the TLS-intercept upstream leg can reuse it.
 
 use crate::audit;
 use crate::config::ExternalProxyConfig;
@@ -13,6 +16,82 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tracing::debug;
 use zeroize::Zeroizing;
+
+/// TCP-connect to an enterprise proxy and CONNECT through it to `target_host:target_port`.
+///
+/// Returns the resulting TCP stream after a successful `200 Connection Established`.
+/// Used by:
+///
+/// * [`handle_external_proxy`] for the transparent passthrough mode (the
+///   stream is then byte-relayed to the agent).
+/// * The TLS-intercept upstream leg ([`crate::tls_intercept`]) which wraps
+///   the returned stream in a TLS handshake to the real upstream.
+///
+/// `proxy_auth_header` is the literal value to send in `Proxy-Authorization`
+/// when authenticating to the enterprise proxy (e.g. `"Basic dXNlcjpwYXNz"`).
+/// Pass `None` for unauthenticated proxies.
+pub async fn connect_via_proxy(
+    proxy_addr: &str,
+    target_host: &str,
+    target_port: u16,
+    proxy_auth_header: Option<&str>,
+) -> Result<TcpStream> {
+    let mut proxy_stream = TcpStream::connect(proxy_addr).await.map_err(|e| {
+        ProxyError::ExternalProxy(format!(
+            "cannot connect to external proxy {}: {}",
+            proxy_addr, e
+        ))
+    })?;
+
+    let mut connect_req = format!(
+        "CONNECT {}:{} HTTP/1.1\r\nHost: {}:{}\r\n",
+        target_host, target_port, target_host, target_port
+    );
+    if let Some(auth) = proxy_auth_header {
+        connect_req.push_str(&format!("Proxy-Authorization: {}\r\n", auth));
+    }
+    connect_req.push_str("\r\n");
+
+    proxy_stream
+        .write_all(connect_req.as_bytes())
+        .await
+        .map_err(|e| {
+            ProxyError::ExternalProxy(format!("failed to send CONNECT to external proxy: {}", e))
+        })?;
+
+    let mut buf_reader = BufReader::new(&mut proxy_stream);
+    let mut response_line = String::new();
+    buf_reader
+        .read_line(&mut response_line)
+        .await
+        .map_err(|e| {
+            ProxyError::ExternalProxy(format!(
+                "failed to read response from external proxy: {}",
+                e
+            ))
+        })?;
+
+    let status = parse_status_code(&response_line)?;
+    if status != 200 {
+        return Err(ProxyError::ExternalProxy(format!(
+            "enterprise proxy rejected CONNECT to {}:{} with status {}",
+            target_host, target_port, status
+        )));
+    }
+
+    // Drain headers up to the empty line.
+    loop {
+        let mut line = String::new();
+        buf_reader.read_line(&mut line).await.map_err(|e| {
+            ProxyError::ExternalProxy(format!("failed to drain proxy response headers: {}", e))
+        })?;
+        if line.trim().is_empty() {
+            break;
+        }
+    }
+    drop(buf_reader);
+    Ok(proxy_stream)
+}
 
 /// Matcher for hosts that should bypass the external proxy.
 ///
@@ -113,26 +192,22 @@ pub async fn handle_external_proxy(
     let check = filter.check_host(&host, port).await?;
     if !check.result.is_allowed() {
         let reason = check.result.reason();
-        audit::log_denied(audit_log, audit::ProxyMode::External, &host, port, &reason);
+        audit::log_denied(
+            audit_log,
+            audit::ProxyMode::External,
+            &audit::EventContext {
+                auth_mechanism: Some(nono::undo::NetworkAuditAuthMechanism::ProxyAuthorization),
+                auth_outcome: Some(nono::undo::NetworkAuditAuthOutcome::Succeeded),
+                denial_category: Some(nono::undo::NetworkAuditDenialCategory::HostDenied),
+                ..audit::EventContext::default()
+            },
+            &host,
+            port,
+            &reason,
+        );
         send_response(stream, 403, &format!("Forbidden: {}", reason)).await?;
         return Err(ProxyError::HostDenied { host, reason });
     }
-
-    // Connect to enterprise proxy
-    let mut proxy_stream = TcpStream::connect(&external_config.address)
-        .await
-        .map_err(|e| {
-            ProxyError::ExternalProxy(format!(
-                "cannot connect to external proxy {}: {}",
-                external_config.address, e
-            ))
-        })?;
-
-    // Build CONNECT request for enterprise proxy
-    let mut connect_req = format!(
-        "CONNECT {}:{} HTTP/1.1\r\nHost: {}:{}\r\n",
-        host, port, host, port
-    );
 
     // External proxy authentication is not yet implemented. If auth is
     // configured, fail loudly rather than silently sending unauthenticated
@@ -146,75 +221,72 @@ pub async fn handle_external_proxy(
         ));
     }
 
-    connect_req.push_str("\r\n");
-    proxy_stream
-        .write_all(connect_req.as_bytes())
+    // Connect to enterprise proxy and CONNECT through it to the upstream.
+    // Auth is gated above; pass None until configurable proxy auth lands.
+    let mut proxy_stream = match connect_via_proxy(&external_config.address, &host, port, None)
         .await
-        .map_err(|e| {
-            ProxyError::ExternalProxy(format!("failed to send CONNECT to external proxy: {}", e))
-        })?;
-
-    // Read enterprise proxy response
-    let mut buf_reader = BufReader::new(&mut proxy_stream);
-    let mut response_line = String::new();
-    buf_reader
-        .read_line(&mut response_line)
-        .await
-        .map_err(|e| {
-            ProxyError::ExternalProxy(format!(
-                "failed to read response from external proxy: {}",
-                e
-            ))
-        })?;
-
-    // Parse status code from response
-    let status = parse_status_code(&response_line)?;
-    if status != 200 {
-        audit::log_denied(
-            audit_log,
-            audit::ProxyMode::External,
-            &host,
-            port,
-            &format!("external proxy rejected with status {}", status),
-        );
-        send_response(
-            stream,
-            status,
-            &format!("Blocked by upstream proxy (status {})", status),
-        )
-        .await?;
-        return Err(ProxyError::ExternalProxy(format!(
-            "enterprise proxy rejected CONNECT to {}:{} with status {}",
-            host, port, status
-        )));
-    }
-
-    // Drain remaining response headers from enterprise proxy
-    loop {
-        let mut line = String::new();
-        buf_reader.read_line(&mut line).await.map_err(|e| {
-            ProxyError::ExternalProxy(format!("failed to drain proxy response headers: {}", e))
-        })?;
-        if line.trim().is_empty() {
-            break;
+    {
+        Ok(s) => s,
+        Err(ProxyError::ExternalProxy(msg)) if msg.contains("rejected CONNECT") => {
+            // Enterprise proxy returned non-200. Surface the same status
+            // back to the agent so it can react sensibly (e.g. blocked
+            // by corporate policy).
+            audit::log_denied(
+                audit_log,
+                audit::ProxyMode::External,
+                &audit::EventContext {
+                    auth_mechanism: Some(nono::undo::NetworkAuditAuthMechanism::ProxyAuthorization),
+                    auth_outcome: Some(nono::undo::NetworkAuditAuthOutcome::Succeeded),
+                    denial_category: Some(
+                        nono::undo::NetworkAuditDenialCategory::ExternalProxyRejected,
+                    ),
+                    ..audit::EventContext::default()
+                },
+                &host,
+                port,
+                &msg,
+            );
+            send_response(stream, 502, "Bad Gateway").await?;
+            return Err(ProxyError::ExternalProxy(msg));
         }
-    }
-
-    // Get the inner stream back from BufReader
-    let proxy_stream = buf_reader.into_inner();
+        Err(e) => {
+            audit::log_denied(
+                audit_log,
+                audit::ProxyMode::External,
+                &audit::EventContext {
+                    auth_mechanism: Some(nono::undo::NetworkAuditAuthMechanism::ProxyAuthorization),
+                    auth_outcome: Some(nono::undo::NetworkAuditAuthOutcome::Succeeded),
+                    denial_category: Some(
+                        nono::undo::NetworkAuditDenialCategory::UpstreamConnectFailed,
+                    ),
+                    ..audit::EventContext::default()
+                },
+                &host,
+                port,
+                &e.to_string(),
+            );
+            send_response(stream, 502, "Bad Gateway").await?;
+            return Err(e);
+        }
+    };
 
     // Send 200 to agent
     send_response(stream, 200, "Connection Established").await?;
     audit::log_allowed(
         audit_log,
         audit::ProxyMode::External,
+        &audit::EventContext {
+            auth_mechanism: Some(nono::undo::NetworkAuditAuthMechanism::ProxyAuthorization),
+            auth_outcome: Some(nono::undo::NetworkAuditAuthOutcome::Succeeded),
+            ..audit::EventContext::default()
+        },
         &host,
         port,
         "CONNECT",
     );
 
     // Bidirectional tunnel: agent <-> enterprise proxy <-> upstream
-    let result = tokio::io::copy_bidirectional(stream, proxy_stream).await;
+    let result = tokio::io::copy_bidirectional(stream, &mut proxy_stream).await;
     debug!(
         "External proxy tunnel closed for {}:{}: {:?}",
         host, port, result

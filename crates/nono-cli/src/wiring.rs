@@ -8,7 +8,7 @@
 //! Design rules:
 //!   - The CLI knows nothing about specific agents. The directives
 //!     are agent-agnostic file ops; the pack supplies the inputs.
-//!   - The vocabulary is fixed and small (5 types). New directive
+//!   - The vocabulary is fixed and small (6 types). New directive
 //!     types require a CLI release; new agents do not.
 //!   - Every directive records what it did into a `WiringRecord`,
 //!     stored in the lockfile. `nono remove` replays records in
@@ -24,6 +24,7 @@ use chrono::Utc;
 use nono::{NonoError, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use serde_yaml_ng as yaml;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -75,6 +76,17 @@ pub enum WiringDirective {
         marker_id: String,
         content: String,
     },
+
+    /// Read a YAML mapping from a pack-relative `patch` file and
+    /// merge it into the YAML file at `file`. Mapping keys are deep-
+    /// merged (last writer wins); sequences are replaced wholesale
+    /// (use a future `YamlArrayAppend` for additive sequence merges).
+    /// Internally projects YAML onto the JSON value model so merge
+    /// and reversal logic is shared with `JsonMerge`. Comments and
+    /// anchors in the target file are not preserved (lossy round-
+    /// trip, same as `JsonMerge` on formatting). Mapping keys must
+    /// be strings; custom YAML tags are rejected.
+    YamlMerge { file: String, patch: String },
 }
 
 /// What a single directive did, recorded into the lockfile so removal
@@ -92,6 +104,9 @@ pub enum WiringDirective {
 ///  - `JsonArrayAppend` stores per-entry prior value when an existing
 ///    entry was replaced, so removal restores it instead of deleting
 ///    a user-owned entry that happened to share a dedup key.
+///  - `YamlMerge` stores per-leaf (path, prior_value) — identical
+///    semantics to `JsonMerge` but operates on YAML files via the
+///    JSON value model.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WiringRecord {
@@ -131,6 +146,15 @@ pub enum WiringRecord {
     },
     /// TOML fenced block we wrote in `file` under `marker_id`.
     TomlBlock { file: String, marker_id: String },
+    /// YAML leaves we touched in `file`. Uses `JsonLeaf` because
+    /// the merge operates on the JSON value model internally.
+    /// Reversal semantics are identical to `JsonMerge`.
+    YamlMerge {
+        file: String,
+        leaves: Vec<JsonLeaf>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        created_parents: Vec<Vec<String>>,
+    },
 }
 
 /// Per-leaf record for `JsonMerge`. `path` is the chain of object
@@ -358,6 +382,20 @@ fn execute_one(
                 marker_id: marker_id.clone(),
             });
         }
+        WiringDirective::YamlMerge { file, patch } => {
+            let file_path = expand_to_path(file, ctx)?;
+            let patch_path = pack_relative(patch, ctx)?;
+            let patch_value = read_pack_yaml(&patch_path, ctx)?;
+            let outcome = merge_yaml_into_file(&file_path, &patch_value)?;
+            if outcome.leaves.iter().any(leaf_changed_disk) || !outcome.created_parents.is_empty() {
+                report.changed = true;
+            }
+            report.records.push(WiringRecord::YamlMerge {
+                file: file_path.to_string_lossy().into_owned(),
+                leaves: outcome.leaves,
+                created_parents: outcome.created_parents,
+            });
+        }
     }
     Ok(())
 }
@@ -395,6 +433,7 @@ fn summarise_record(record: &WiringRecord) -> String {
         WiringRecord::TomlBlock { file, marker_id } => {
             format!("toml_block {file} #{marker_id}")
         }
+        WiringRecord::YamlMerge { file, .. } => format!("yaml_merge {file}"),
     }
 }
 
@@ -444,6 +483,13 @@ fn reverse_one(record: &WiringRecord) -> Result<()> {
         }
         WiringRecord::TomlBlock { file, marker_id } => {
             strip_toml_block(Path::new(file), marker_id)?;
+        }
+        WiringRecord::YamlMerge {
+            file,
+            leaves,
+            created_parents,
+        } => {
+            restore_yaml_leaves(Path::new(file), leaves, created_parents)?;
         }
     }
     Ok(())
@@ -1088,6 +1134,197 @@ fn restore_json_array_entries(
     *array = new_array;
     if changed {
         write_json(file, &doc)?;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// YAML merge primitives
+// ---------------------------------------------------------------------------
+
+/// Convert a `serde_yaml_ng::Value` to a `serde_json::Value` so that
+/// the shared `walk_and_merge` / `restore_one_leaf` /
+/// `prune_empty_object_at` logic can be reused unchanged.
+///
+/// Strict rules per Luke's design:
+///   - Mapping keys must be strings (non-string keys → error).
+///   - Custom YAML tags (`!foo value`) → error.
+fn yaml_to_json(v: yaml::Value) -> Result<Value> {
+    match v {
+        yaml::Value::Null => Ok(Value::Null),
+        yaml::Value::Bool(b) => Ok(Value::Bool(b)),
+        yaml::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Ok(Value::Number(i.into()))
+            } else if let Some(u) = n.as_u64() {
+                Ok(Value::Number(u.into()))
+            } else if let Some(f) = n.as_f64() {
+                // Reject non-finite values (.inf, -.inf, .nan): JSON has no
+                // representation for them and silently coercing to null would
+                // corrupt the user's file on the write-back.
+                serde_json::Number::from_f64(f)
+                    .map(Value::Number)
+                    .ok_or_else(|| {
+                        NonoError::PackageInstall(
+                            "yaml_merge: non-finite float (.inf/.nan) is not representable \
+                         in the JSON value model; use a string instead"
+                                .to_string(),
+                        )
+                    })
+            } else {
+                Err(NonoError::PackageInstall(
+                    "yaml_merge: unrepresentable number in YAML".to_string(),
+                ))
+            }
+        }
+        yaml::Value::String(s) => Ok(Value::String(s)),
+        yaml::Value::Sequence(seq) => {
+            let arr: Result<Vec<Value>> = seq.into_iter().map(yaml_to_json).collect();
+            Ok(Value::Array(arr?))
+        }
+        yaml::Value::Mapping(map) => {
+            let mut obj = serde_json::Map::new();
+            for (k, v) in map {
+                let key = match k {
+                    yaml::Value::String(s) => s,
+                    other => {
+                        return Err(NonoError::PackageInstall(format!(
+                            "yaml_merge: mapping key must be a string, got {:?}",
+                            other
+                        )))
+                    }
+                };
+                obj.insert(key, yaml_to_json(v)?);
+            }
+            Ok(Value::Object(obj))
+        }
+        yaml::Value::Tagged(_) => Err(NonoError::PackageInstall(
+            "yaml_merge: custom YAML tags are not supported".to_string(),
+        )),
+    }
+}
+
+/// Convert a `serde_json::Value` back to `serde_yaml_ng::Value` for
+/// writing. All JSON value types map cleanly to YAML; no information
+/// is lost (though YAML comments and anchors from the original file
+/// are already gone at this point — lossy round-trip, same as
+/// `JsonMerge` on formatting).
+fn json_to_yaml(v: Value) -> yaml::Value {
+    match v {
+        Value::Null => yaml::Value::Null,
+        Value::Bool(b) => yaml::Value::Bool(b),
+        Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                yaml::Value::Number(i.into())
+            } else if let Some(u) = n.as_u64() {
+                yaml::Value::Number(u.into())
+            } else if let Some(f) = n.as_f64() {
+                yaml::Value::Number(f.into())
+            } else {
+                yaml::Value::String(n.to_string())
+            }
+        }
+        Value::String(s) => yaml::Value::String(s),
+        Value::Array(arr) => yaml::Value::Sequence(arr.into_iter().map(json_to_yaml).collect()),
+        Value::Object(obj) => {
+            let mut map = yaml::Mapping::new();
+            for (k, v) in obj {
+                map.insert(yaml::Value::String(k), json_to_yaml(v));
+            }
+            yaml::Value::Mapping(map)
+        }
+    }
+}
+
+fn read_yaml(path: &Path) -> Result<Value> {
+    let content = fs::read_to_string(path).map_err(NonoError::Io)?;
+    let yaml_val: yaml::Value = yaml::from_str(&content).map_err(|e| {
+        NonoError::PackageInstall(format!("invalid YAML in {}: {e}", path.display()))
+    })?;
+    yaml_to_json(yaml_val)
+}
+
+fn read_pack_yaml(path: &Path, ctx: &WiringContext) -> Result<Value> {
+    let mut value = read_yaml(path)?;
+    expand_json_strings(&mut value, ctx)?;
+    Ok(value)
+}
+
+fn write_yaml(path: &Path, value: &Value) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(NonoError::Io)?;
+    }
+    let yaml_val = json_to_yaml(value.clone());
+    let serialized = yaml::to_string(&yaml_val)
+        .map_err(|e| NonoError::PackageInstall(format!("serialize {}: {e}", path.display())))?;
+    let tmp = path.with_extension("yaml.nono-tmp");
+    fs::write(&tmp, &serialized).map_err(NonoError::Io)?;
+    fs::rename(&tmp, path).map_err(NonoError::Io)?;
+    Ok(())
+}
+
+fn merge_yaml_into_file(file: &Path, patch: &Value) -> Result<MergeOutcome> {
+    let mut existing = if file.exists() {
+        read_yaml(file)?
+    } else {
+        Value::Object(serde_json::Map::new())
+    };
+    if !patch.is_object() || !existing.is_object() {
+        return Err(NonoError::PackageInstall(format!(
+            "yaml_merge: {} must be a YAML mapping at the root",
+            file.display()
+        )));
+    }
+    let before = existing.clone();
+    let mut leaves = Vec::new();
+    let mut created_parents = Vec::new();
+    walk_and_merge(
+        &mut existing,
+        patch,
+        &mut Vec::new(),
+        &mut leaves,
+        &mut created_parents,
+    );
+    if existing != before {
+        write_yaml(file, &existing)?;
+    }
+    Ok(MergeOutcome {
+        leaves,
+        created_parents,
+    })
+}
+
+/// Reverse of `merge_yaml_into_file`: identical logic to
+/// `restore_json_leaves` but reads/writes the file as YAML.
+fn restore_yaml_leaves(
+    file: &Path,
+    leaves: &[JsonLeaf],
+    created_parents: &[Vec<String>],
+) -> Result<()> {
+    if !file.exists() {
+        return Ok(());
+    }
+    let mut doc = read_yaml(file)?;
+    let mut changed = false;
+    for leaf in leaves.iter().rev() {
+        if restore_one_leaf(
+            &mut doc,
+            &leaf.path,
+            &leaf.installed_value,
+            &leaf.prior_value,
+        ) {
+            changed = true;
+        }
+    }
+    let mut sorted_parents: Vec<&Vec<String>> = created_parents.iter().collect();
+    sorted_parents.sort_by_key(|p| std::cmp::Reverse(p.len()));
+    for parent_path in sorted_parents {
+        if prune_empty_object_at(&mut doc, parent_path) {
+            changed = true;
+        }
+    }
+    if changed {
+        write_yaml(file, &doc)?;
     }
     Ok(())
 }
@@ -1755,6 +1992,162 @@ mod tests {
             assert_eq!(
                 fs::read_to_string(home.join("dest")).expect("read"),
                 "user edited",
+            );
+        });
+    }
+
+    #[test]
+    fn yaml_merge_and_strip_round_trip() {
+        with_fake_home(|home| {
+            let pack = home.join("pack");
+            fs::create_dir_all(&pack).expect("mkdir pack");
+            fs::write(
+                pack.join("patch.yaml"),
+                "plugins:\n  enabled:\n    - nono-sandbox\n",
+            )
+            .expect("write patch");
+            // Seed existing YAML with an unrelated key.
+            let target = home.join("config.yaml");
+            fs::write(&target, "level: info\n").expect("seed target");
+
+            let ctx = ctx_in(home, pack);
+            let directives = vec![WiringDirective::YamlMerge {
+                file: "$HOME/config.yaml".to_string(),
+                patch: "patch.yaml".to_string(),
+            }];
+            let report = exec(&directives, &ctx).expect("execute");
+            assert!(report.changed);
+
+            let after: yaml::Value =
+                yaml::from_str(&fs::read_to_string(&target).expect("read")).expect("parse");
+            assert_eq!(after["level"], yaml::Value::String("info".to_string()));
+            assert!(after["plugins"]["enabled"].is_sequence());
+
+            rev(&report.records);
+            let restored: yaml::Value =
+                yaml::from_str(&fs::read_to_string(&target).expect("read")).expect("parse");
+            assert_eq!(restored["level"], yaml::Value::String("info".to_string()));
+            assert!(
+                restored.get("plugins").is_none(),
+                "merged keys gone after reverse"
+            );
+        });
+    }
+
+    #[test]
+    fn yaml_merge_is_idempotent() {
+        with_fake_home(|home| {
+            let pack = home.join("pack");
+            fs::create_dir_all(&pack).expect("mkdir pack");
+            fs::write(pack.join("patch.yaml"), "foo:\n  bar: true\n").expect("write patch");
+            let ctx = ctx_in(home, pack);
+            let directives = vec![WiringDirective::YamlMerge {
+                file: "$HOME/config.yaml".to_string(),
+                patch: "patch.yaml".to_string(),
+            }];
+            let _ = exec(&directives, &ctx).expect("first");
+            let r2 = exec(&directives, &ctx).expect("second");
+            assert!(!r2.changed, "second run must be no-op");
+        });
+    }
+
+    #[test]
+    fn yaml_merge_preserves_sibling_keys_on_reverse() {
+        with_fake_home(|home| {
+            let pack = home.join("pack");
+            fs::create_dir_all(&pack).expect("mkdir pack");
+            fs::write(pack.join("patch.yaml"), "plugins:\n  nono: true\n").expect("write patch");
+            let target = home.join("config.yaml");
+            fs::write(&target, "plugins:\n  user-plugin: true\n").expect("seed");
+
+            let ctx = ctx_in(home, pack);
+            let directives = vec![WiringDirective::YamlMerge {
+                file: "$HOME/config.yaml".to_string(),
+                patch: "patch.yaml".to_string(),
+            }];
+            let report = exec(&directives, &ctx).expect("install");
+            rev(&report.records);
+
+            let restored: yaml::Value =
+                yaml::from_str(&fs::read_to_string(&target).expect("read")).expect("parse");
+            assert_eq!(
+                restored["plugins"]["user-plugin"],
+                yaml::Value::Bool(true),
+                "sibling key must survive removal"
+            );
+            assert!(
+                restored["plugins"].get("nono").is_none(),
+                "only our leaf should be gone"
+            );
+        });
+    }
+
+    #[test]
+    fn yaml_merge_rejects_non_string_keys() {
+        with_fake_home(|home| {
+            let pack = home.join("pack");
+            fs::create_dir_all(&pack).expect("mkdir pack");
+            // YAML allows integer keys; we must reject them.
+            fs::write(pack.join("patch.yaml"), "123: bad\n").expect("write patch");
+            let ctx = ctx_in(home, pack);
+            let directives = vec![WiringDirective::YamlMerge {
+                file: "$HOME/config.yaml".to_string(),
+                patch: "patch.yaml".to_string(),
+            }];
+            let err = exec(&directives, &ctx).expect_err("must reject non-string keys");
+            assert!(
+                err.to_string().contains("mapping key must be a string"),
+                "error must mention key type: {err}"
+            );
+        });
+    }
+
+    #[test]
+    fn yaml_merge_rejects_custom_tags() {
+        with_fake_home(|home| {
+            let pack = home.join("pack");
+            fs::create_dir_all(&pack).expect("mkdir pack");
+            fs::write(pack.join("patch.yaml"), "key: !MyTag value\n").expect("write patch");
+            let ctx = ctx_in(home, pack);
+            let directives = vec![WiringDirective::YamlMerge {
+                file: "$HOME/config.yaml".to_string(),
+                patch: "patch.yaml".to_string(),
+            }];
+            let err = exec(&directives, &ctx).expect_err("must reject custom tags");
+            assert!(
+                err.to_string().contains("custom YAML tags"),
+                "error must mention tags: {err}"
+            );
+        });
+    }
+
+    #[test]
+    fn yaml_reverse_collects_failures_instead_of_swallowing() {
+        // Mirror of `reverse_collects_failures_instead_of_swallowing` for
+        // `YamlMerge`: inject a malformed YAML target file so that
+        // `restore_yaml_leaves` → `read_yaml` returns an error. The
+        // `reverse` function must surface the error rather than silently
+        // skipping it, so the caller knows the rollback is incomplete and
+        // the file was not left in a misformatted state.
+        with_fake_home(|home| {
+            let target = home.join("broken.yaml");
+            fs::write(&target, "key: [unclosed").expect("seed broken");
+
+            let records = vec![WiringRecord::YamlMerge {
+                file: target.to_string_lossy().into_owned(),
+                leaves: vec![JsonLeaf {
+                    path: vec!["k".to_string()],
+                    installed_value: Value::Bool(true),
+                    prior_value: None,
+                }],
+                created_parents: Vec::new(),
+            }];
+            let failures = reverse(&records);
+            assert_eq!(failures.len(), 1, "broken YAML must surface as failure");
+            assert!(
+                failures[0].record_summary.contains("yaml_merge"),
+                "summary should identify the directive: {}",
+                failures[0].record_summary
             );
         });
     }

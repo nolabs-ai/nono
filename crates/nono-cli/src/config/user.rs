@@ -24,6 +24,7 @@ pub struct UserConfig {
     pub extensions: UserExtensions,
     #[serde(default)]
     pub trusted_keys: HashMap<String, TrustedKeyInfo>,
+    /// ALIAS(canonical="rollback", introduced="v0.0.0", remove_by="indefinite", issue="#124")
     #[serde(default, alias = "undo")]
     pub rollback: RollbackSettings,
     #[serde(default)]

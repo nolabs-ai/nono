@@ -20,14 +20,14 @@ The `--` separator is recommended. Everything after it is the command to run.
 nono run --allow . -- claude
 ```
 
-Or use a built-in profile that bundles the right permissions for a known tool:
+Or use a profile that bundles the right permissions for a known tool:
 
 ```bash
 nono run --profile claude-code -- claude
 nono run --profile codex -- codex
 ```
 
-See [Profiles & Groups](/cli/features/profiles-groups) for all built-in profiles and how to create your own.
+See [Profiles & Groups](/cli/features/profiles-groups) for all available profiles and how to create your own.
 
 ## Commands
 
@@ -40,7 +40,6 @@ See [Profiles & Groups](/cli/features/profiles-groups) for all built-in profiles
 | `nono why` | Check why a path/network operation would be allowed or denied |
 | `nono rollback` | [Manage rollback sessions](/cli/features/atomic-rollbacks) - list, show, restore, verify, cleanup snapshots |
 | `nono audit` | [View audit trail](/cli/features/audit) - list and inspect past supervised sessions, including optional integrity metadata |
-| `nono learn` | [Discover required paths](/cli/features/learn) - trace a command to find what it accesses |
 | `nono trust` | [Manage instruction file trust](/cli/features/trust) - sign, verify, and manage attestation |
 | `nono setup` | System setup and verification - generate profiles, check shell integration |
 
@@ -138,11 +137,11 @@ This is particularly useful for AI agents - when an operation fails, the agent c
 
 ## What Happens at Runtime
 
-1. **Parse** - nono parses your capability flags
-2. **Canonicalize** - All paths are resolved to absolute paths (prevents symlink escapes)
-3. **Apply Sandbox** - Kernel sandbox is initialized (irreversible)
-4. **Execute** - nono exec()s into your command, inheriting the sandbox
-5. **Enforce** - Kernel blocks any unauthorized access attempts
+1. **Parse** — nono parses your capability flags
+2. **Canonicalize** — All paths are resolved to absolute paths (prevents symlink escapes)
+3. **Apply Sandbox** — Kernel sandbox is initialized (irreversible)
+4. **Fork & Execute** — nono forks a sandboxed child process and runs your command inside it. The unsandboxed parent stays alive for audit recording, rollback, and diagnostics.
+5. **Enforce** — Kernel blocks any unauthorized access attempts
 
 ## Sensitive Paths
 

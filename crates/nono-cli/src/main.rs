@@ -14,9 +14,12 @@ mod cli_bootstrap;
 mod command_blocking_deprecation;
 mod command_display;
 mod command_runtime;
+mod completions;
 mod config;
 mod credential_runtime;
 mod deprecated_policy;
+mod deprecated_schema;
+mod deprecation_warnings;
 mod exec_strategy;
 mod execution_runtime;
 mod instruction_deny;
@@ -30,6 +33,7 @@ mod open_url_runtime;
 mod output;
 mod package;
 mod package_cmd;
+mod package_status;
 mod policy;
 mod profile;
 mod profile_cmd;
@@ -91,6 +95,11 @@ pub(crate) use proxy_runtime::merge_dedup_ports;
 fn main() {
     let legacy_network_warnings = collect_legacy_network_warnings();
     normalize_legacy_flag_env_vars();
+    // Emit one deprecation warning per distinct legacy long flag before clap
+    // parses. clap's `alias` rebinds `--override-deny` to `--bypass-protection`
+    // silently; without this scan the user would never see a removal notice.
+    let os_args: Vec<_> = std::env::args_os().collect();
+    deprecated_schema::warn_for_deprecated_flags(&os_args);
     let cli = Cli::parse();
     init_tracing(&cli);
     init_theme(&cli);
@@ -99,6 +108,10 @@ fn main() {
     print_deprecation_warnings(&command_blocking_warnings, cli.silent);
 
     if let Err(e) = run_cli(cli) {
+        if let nono::NonoError::ActionRequired(message) = &e {
+            eprintln!("{message}");
+            std::process::exit(1);
+        }
         // User-initiated stops (declined prompt, non-TTY without
         // NONO_AUTO_MIGRATE) are surfaced as `NonoError::Cancelled`.
         // Their stderr message has already been printed at the call
@@ -238,7 +251,7 @@ mod tests {
             allow_gpu_active: false,
             open_url_origins: Vec::new(),
             open_url_allow_localhost: false,
-            override_deny_paths: Vec::new(),
+            bypass_protection_paths: Vec::new(),
             allowed_env_vars: None,
         };
 
@@ -281,7 +294,7 @@ mod tests {
             allow_gpu_active: false,
             open_url_origins: Vec::new(),
             open_url_allow_localhost: false,
-            override_deny_paths: Vec::new(),
+            bypass_protection_paths: Vec::new(),
             allowed_env_vars: None,
         };
 
@@ -372,6 +385,17 @@ mod tests {
 
         let wrap = Cli::parse_from(["nono", "wrap", "--allow", "/tmp", "--", "/bin/sh"]);
         assert!(!allows_pre_exec_update_check(&wrap.command));
+    }
+
+    #[test]
+    fn test_pre_exec_update_check_disabled_for_completions() {
+        // `nono completions` is used in shell init scripts such as
+        // `eval "$(nono completions zsh)"`.  It never shows an update
+        // notification (it is dispatched directly without
+        // run_command_with_update), so spawning the background update-check
+        // thread would incur network I/O with no benefit.
+        let completions = Cli::parse_from(["nono", "completion", "zsh"]);
+        assert!(!allows_pre_exec_update_check(&completions.command));
     }
 
     #[test]

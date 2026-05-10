@@ -24,7 +24,7 @@ pub(crate) struct PreparedProfileSave {
 struct PatchGrant {
     access: AccessMode,
     is_file: bool,
-    override_deny: bool,
+    bypass_protection: bool,
 }
 
 /// Env var that suppresses the "save denied paths as user profile?"
@@ -318,12 +318,12 @@ pub(crate) fn print_profile_save(prepared: &PreparedProfileSave, command: &[Stri
         prepared.profile_path.display()
     ));
 
-    let override_count = prepared.profile.policy.override_deny.len();
+    let override_count = prepared.profile.filesystem.bypass_protection.len();
     if override_count > 0 {
         prompt_println(&format!(
             "{}",
             format!(
-                "  ({} path{} with policy.override_deny — review the profile before sharing)",
+                "  ({} path{} with filesystem.bypass_protection — review the profile before sharing)",
                 override_count,
                 if override_count == 1 { "" } else { "s" }
             )
@@ -341,7 +341,7 @@ pub(crate) fn print_profile_save(prepared: &PreparedProfileSave, command: &[Stri
 
 /// Print a preview of what paths will be written to the profile.
 ///
-/// Highlights `override_deny` entries with a visible warning since those
+/// Highlights `bypass_protection` entries with a visible warning since those
 /// bypass nono's built-in sensitive-path protection.
 pub(crate) fn print_patch_preview(patch: &profile::Profile) {
     let sections: &[(&str, &[String])] = &[
@@ -354,14 +354,14 @@ pub(crate) fn print_patch_preview(patch: &profile::Profile) {
     ];
 
     let has_entries = sections.iter().any(|(_, paths)| !paths.is_empty());
-    if !has_entries && patch.policy.override_deny.is_empty() {
+    if !has_entries && patch.filesystem.bypass_protection.is_empty() {
         return;
     }
 
     prompt_println("[nono] Paths to be saved:");
     for (label, paths) in sections {
         for path in *paths {
-            let is_override = patch.policy.override_deny.contains(path);
+            let is_override = patch.filesystem.bypass_protection.contains(path);
             if is_override {
                 prompt_println(&format!("  {}  {} ({})", "⚠".red(), path, label));
             } else {
@@ -370,22 +370,22 @@ pub(crate) fn print_patch_preview(patch: &profile::Profile) {
         }
     }
 
-    if !patch.policy.override_deny.is_empty() {
+    if !patch.filesystem.bypass_protection.is_empty() {
         prompt_println(&format!(
             "{}",
             "\n[nono] ⚠  The marked paths are normally blocked by security policy.".red()
         ));
         prompt_println(&format!(
             "{}",
-            "[nono]    Saving them adds policy.override_deny, which weakens sandbox protection."
+            "[nono]    Saving them adds filesystem.bypass_protection, which weakens sandbox protection."
                 .red()
         ));
     }
 }
 
-/// Return true if the patch includes any `policy.override_deny` entries.
+/// Return true if the patch includes any `filesystem.bypass_protection` entries.
 pub(crate) fn patch_has_policy_overrides(patch: &profile::Profile) -> bool {
-    !patch.policy.override_deny.is_empty()
+    !patch.filesystem.bypass_protection.is_empty()
 }
 
 fn prompt_print(template: &str, args: &[&str]) {
@@ -632,12 +632,12 @@ fn build_run_profile_patch(
     let mut allow_file = BTreeSet::new();
     let mut read_file = BTreeSet::new();
     let mut write_file = BTreeSet::new();
-    let mut override_deny = BTreeSet::new();
+    let mut bypass_protection = BTreeSet::new();
 
     for (path, grant) in grants {
         let shortened = shorten_path_for_profile(&path, home_path);
-        if grant.override_deny {
-            override_deny.insert(shortened.clone());
+        if grant.bypass_protection {
+            bypass_protection.insert(shortened.clone());
         }
 
         match (grant.access, grant.is_file) {
@@ -669,7 +669,7 @@ fn build_run_profile_patch(
     patch.filesystem.allow_file = allow_file.into_iter().collect();
     patch.filesystem.read_file = read_file.into_iter().collect();
     patch.filesystem.write_file = write_file.into_iter().collect();
-    patch.policy.override_deny = override_deny.into_iter().collect();
+    patch.filesystem.bypass_protection = bypass_protection.into_iter().collect();
 
     Ok(Some(patch))
 }
@@ -687,7 +687,7 @@ fn add_patch_grant(
         Some(existing) => {
             existing.access = merge_access(existing.access, access);
             existing.is_file |= is_file;
-            existing.override_deny |= reason == "sensitive_path";
+            existing.bypass_protection |= reason == "sensitive_path";
         }
         None => {
             grants.insert(
@@ -695,7 +695,7 @@ fn add_patch_grant(
                 PatchGrant {
                     access,
                     is_file,
-                    override_deny: reason == "sensitive_path",
+                    bypass_protection: reason == "sensitive_path",
                 },
             );
         }
@@ -723,8 +723,10 @@ pub(crate) fn merge_profile_patch(profile: &mut profile::Profile, patch: &profil
         profile::dedup_append(&profile.filesystem.read_file, &patch.filesystem.read_file);
     profile.filesystem.write_file =
         profile::dedup_append(&profile.filesystem.write_file, &patch.filesystem.write_file);
-    profile.policy.override_deny =
-        profile::dedup_append(&profile.policy.override_deny, &patch.policy.override_deny);
+    profile.filesystem.bypass_protection = profile::dedup_append(
+        &profile.filesystem.bypass_protection,
+        &patch.filesystem.bypass_protection,
+    );
 }
 
 pub(crate) fn shorten_path_for_profile(path: &Path, home_path: &Path) -> String {
@@ -745,7 +747,7 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn build_run_profile_patch_adds_override_deny_for_sensitive_file() {
+    fn build_run_profile_patch_adds_bypass_protection_for_sensitive_file() {
         let _env_lock = ENV_LOCK.lock().expect("env lock");
         let temp_home = TempDir::new().expect("temp home");
         let _env = EnvVarGuard::set_all(&[("HOME", temp_home.path().to_str().expect("home path"))]);
@@ -772,7 +774,10 @@ mod tests {
         .expect("patch");
 
         assert_eq!(patch.filesystem.read_file, vec!["~/.claude/settings.json"]);
-        assert_eq!(patch.policy.override_deny, vec!["~/.claude/settings.json"]);
+        assert_eq!(
+            patch.filesystem.bypass_protection,
+            vec!["~/.claude/settings.json"]
+        );
     }
 
     #[test]
@@ -832,13 +837,13 @@ mod tests {
         std::fs::create_dir_all(existing_path.parent().expect("profile dir")).expect("mkdir");
         std::fs::write(
             &existing_path,
-            "{\n  \"meta\": {\n    \"name\": \"claude-code-local\",\n    \"version\": \"1.0.0\"\n  },\n  \"filesystem\": {\n    \"read_file\": [\"~/old.json\"]\n  },\n  \"policy\": {\n    \"override_deny\": [\"~/old.json\"]\n  }\n}\n",
+            "{\n  \"meta\": {\n    \"name\": \"claude-code-local\",\n    \"version\": \"1.0.0\"\n  },\n  \"filesystem\": {\n    \"read_file\": [\"~/old.json\"],\n    \"bypass_protection\": [\"~/old.json\"]\n  }\n}\n",
         )
         .expect("write profile");
 
         let mut patch = profile::Profile::default();
         patch.filesystem.read_file = vec!["~/.claude/settings.json".to_string()];
-        patch.policy.override_deny = vec!["~/.claude/settings.json".to_string()];
+        patch.filesystem.bypass_protection = vec!["~/.claude/settings.json".to_string()];
 
         let prepared = prepare_profile_save_from_patch(
             &patch,
@@ -857,7 +862,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            prepared.profile.policy.override_deny,
+            prepared.profile.filesystem.bypass_protection,
             vec![
                 "~/old.json".to_string(),
                 "~/.claude/settings.json".to_string()

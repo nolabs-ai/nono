@@ -1,3 +1,7 @@
+//! This module exists to surface runtime warnings for the deprecated
+//! `commands.{allow,deny}` fields, so it deliberately reads them.
+#![allow(deprecated)]
+
 use crate::cli::{Cli, Commands};
 use crate::output;
 use crate::profile::Profile;
@@ -70,16 +74,16 @@ pub(crate) fn collect_profile_warnings(profile: &Profile) -> Vec<String> {
     let mut warnings = Vec::new();
     let profile_name = format!("profile `{}`", profile.meta.name);
 
-    if !profile.security.allowed_commands.is_empty() {
+    if !profile.commands.allow.is_empty() {
         warnings.push(warning_for_surface(
-            &format!("{profile_name} field `security.allowed_commands`"),
-            &profile.security.allowed_commands,
+            &format!("{profile_name} field `commands.allow`"),
+            &profile.commands.allow,
         ));
     }
-    if !profile.policy.add_deny_commands.is_empty() {
+    if !profile.commands.deny.is_empty() {
         warnings.push(warning_for_surface(
-            &format!("{profile_name} field `policy.add_deny_commands`"),
-            &profile.policy.add_deny_commands,
+            &format!("{profile_name} field `commands.deny`"),
+            &profile.commands.deny,
         ));
     }
 
@@ -165,8 +169,8 @@ mod tests {
 
         let warnings = collect_profile_warnings(&profile);
         assert_eq!(warnings.len(), 2);
-        assert!(warnings[0].contains("security.allowed_commands"));
-        assert!(warnings[1].contains("policy.add_deny_commands"));
+        assert!(warnings[0].contains("commands.allow"));
+        assert!(warnings[1].contains("commands.deny"));
     }
 
     #[test]

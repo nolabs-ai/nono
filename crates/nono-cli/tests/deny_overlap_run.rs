@@ -68,7 +68,7 @@ fn run_allow_cwd_with_profile_deny_under_workdir_fails_closed() {
     fs::write(&secret_path, secret).expect("write fake secret");
 
     // Minimal profile: no `extends` so we don't depend on a registry pack
-    // being installed under the test HOME. `add_deny_access` is what we are
+    // being installed under the test HOME. `filesystem.deny` is what we are
     // exercising; the implicit default groups merged in by the loader do
     // not allow $WORKDIR, so the only allow that covers `.ssh` is the one
     // injected by `--allow-cwd`.
@@ -77,8 +77,8 @@ fn run_allow_cwd_with_profile_deny_under_workdir_fails_closed() {
         r#"{{
             "meta": {{ "name": "deny-overlap-repro" }},
             "workdir": {{ "access": "readwrite" }},
-            "policy": {{
-                "add_deny_access": ["{workspace}/.ssh"]
+            "filesystem": {{
+                "deny": ["{workspace}/.ssh"]
             }}
         }}"#,
         workspace = workspace.display()

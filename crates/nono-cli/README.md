@@ -39,11 +39,11 @@ nono run --allow ./project-a --allow ./project-b -- command
 # Block network access
 nono run --allow-cwd --block-net -- command
 
-# Use a built-in profile
+# Use a pack profile (requires: nono pull always-further/claude)
 nono run --profile claude-code -- claude
 
-# Use the Codex profile
-nono run --profile codex -- codex
+# Use a built-in profile
+nono run --profile opencode -- opencode
 
 # Keep a profile but temporarily allow unrestricted network
 nono run --profile claude-code --allow-net -- claude
@@ -79,20 +79,26 @@ export NONO_THEME=latte
 
 Precedence is: CLI flag, then `NONO_THEME`, then config file, then the default `mocha`.
 
-## Built-in Profiles
+## Profiles
+
+### Pack profiles (install via `nono pull`)
+
+| Profile | Install | Command |
+|---------|---------|---------|
+| Claude Code | `nono pull always-further/claude` | `nono run --profile claude-code -- claude` |
+| Codex | `nono pull always-further/codex` | `nono run --profile codex -- codex` |
+
+### Built-in profiles
 
 | Profile | Command |
 |---------|---------|
-| Claude Code | `nono run --profile claude-code -- claude` |
-| Claude Code (No Keychain) | `nono run --profile claude-no-kc -- claude` |
-| Codex | `nono run --profile codex -- codex` |
 | OpenCode | `nono run --profile opencode -- opencode` |
 | OpenClaw | `nono run --profile openclaw -- openclaw gateway` |
 | Swival | `nono run --profile swival -- swival` |
 
 ## Profile Inheritance
 
-User profiles can extend built-in or other user profiles with the `extends` field. The child inherits all settings from the base and only declares additions or overrides.
+User profiles can extend built-in, pack, or other user profiles with the `extends` field. The child inherits all settings from the base and only declares additions or overrides.
 
 ```json
 {
@@ -136,7 +142,7 @@ When extending multiple bases, they are merged left-to-right using the same rule
 Profiles can form chains (up to 10 levels deep). Circular dependencies are detected and rejected. Shared transitive bases are deduplicated.
 
 ```
-my-dev.json → team-base.json → claude-code (built-in)
+my-dev.json → team-base.json → claude-code (pack)
 ```
 
 ## Deprecated Command Blocking
@@ -165,14 +171,14 @@ cat > ~/.config/nono/profiles/my-profile.json << 'EOF'
 {
   "meta": { "name": "my-profile" },
   "filesystem": { "allow": ["/tmp"] },
-  "security": { "allowed_commands": ["rm"] }
+  "commands": { "allow": ["rm"] }
 }
 EOF
 nono run --profile my-profile -- rm /tmp/old-file.txt
 ```
 
 Prefer resource-based controls instead: narrower filesystem grants,
-`add_deny_access`, `unlink_protection`, and network policy.
+`filesystem.deny`, `unlink_protection`, and network policy.
 
 ## Documentation
 

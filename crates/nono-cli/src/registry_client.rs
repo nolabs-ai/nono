@@ -1,6 +1,8 @@
 //! Registry client for package hosting.
 
-use crate::package::{PackageRef, PackageSearchResponse, PackageSearchResult, PullResponse};
+use crate::package::{
+    PackageRef, PackageSearchResponse, PackageSearchResult, PackageStatusResponse, PullResponse,
+};
 use nono::{NonoError, Result};
 use serde::de::DeserializeOwned;
 use sha2::Digest;
@@ -65,6 +67,24 @@ impl RegistryClient {
         let response: PackageSearchResponse =
             self.get_json(&format!("/api/v1/packages?q={query}"))?;
         Ok(response.packages)
+    }
+
+    pub fn fetch_package_status(
+        &self,
+        package_ref: &PackageRef,
+        installed: Option<&str>,
+    ) -> Result<PackageStatusResponse> {
+        let mut path = format!(
+            "/api/v1/packages/{}/{}/status",
+            package_ref.namespace, package_ref.name
+        );
+        if let Some(installed) = installed {
+            let encoded: String =
+                url::form_urlencoded::byte_serialize(installed.as_bytes()).collect();
+            path.push_str("?installed=");
+            path.push_str(&encoded);
+        }
+        self.get_json(&path)
     }
 
     /// Look up which packs (if any) ship a profile with the given

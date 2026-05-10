@@ -14,7 +14,6 @@ Legend: **Full** = identical to native Linux | **Blocked (default)** = fails sec
 | `nono run` (supervised mode) | Full | Fork + Landlock + exec works |
 | `nono shell` (interactive shell) | Full | Same as `run` with $SHELL |
 | `nono wrap` (direct mode) | Full | No fork, no supervisor |
-| `nono learn` | Full | strace-based tracing works |
 | `nono why` | Full | Policy queries are pure logic |
 | `nono setup` | Full | Reports WSL2 feature matrix |
 | `nono rollback` (list/show/restore/verify/cleanup) | Full | Pure userspace |
@@ -41,7 +40,7 @@ Legend: **Full** = identical to native Linux | **Blocked (default)** = fails sec
 | `--write-file` (write-only single file) | Full | Landlock V1+ |
 | `--allow-cwd` | Full | |
 | `--workdir` | Full | Variable expansion only |
-| `--override-deny` | Full | |
+| `--bypass-protection` | Full | Renamed in #594; legacy alias accepted until v1.0.0 |
 | `--skip-dir` | Full | |
 | File rename across directories | Full | Landlock V2 (Refer) |
 | File truncation control | Full | Landlock V3 (Truncate) |
@@ -151,7 +150,7 @@ Legend: **Full** = identical to native Linux | **Blocked (default)** = fails sec
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| Built-in profiles (claude-code, codex, etc.) | Full | |
+| Agent profiles (claude-code, codex, etc.) | Full | |
 | Custom user profiles | Full | |
 | Profile inheritance (`extends`) | Full | |
 | Variable expansion ($WORKDIR, $HOME, $TMPDIR) | Full | |
@@ -171,15 +170,6 @@ Legend: **Full** = identical to native Linux | **Blocked (default)** = fails sec
 | Hook script embedding | Full | |
 | Settings.json registration | Full | |
 
-## Learn Mode
-
-| Feature | Status | Notes |
-|---------|--------|-------|
-| `nono learn -- COMMAND` | Full | strace available on WSL2 |
-| `--profile` (compare against profile) | Full | |
-| `--json` (profile fragment output) | Full | |
-| `--timeout` | Full | |
-| Network connection tracing | Full | strace captures connect/bind |
 | Listening port detection | Full | |
 
 ## Output & UX

@@ -20,7 +20,7 @@ nono run --profile claude-code -- claude
 ```
 
 <Warning>
-**macOS users:** Claude Code needs LaunchServices access when a session will need browser login. `nono` now auto-enables this for the built-in `claude-code` profile when it does not detect refresh-capable local auth. You can also pass the flag explicitly for first use or `claude /login`:
+**macOS users:** Claude Code needs LaunchServices access when a session will need browser login. `nono` now auto-enables this for the `claude-code` profile when it does not detect refresh-capable local auth. You can also pass the flag explicitly for first use or `claude /login`:
 
 ```bash
 nono run --profile claude-code --allow-launch-services -- claude
@@ -29,7 +29,7 @@ After login completes, rerun without `--allow-launch-services` if you no longer 
 See [OAuth2 Login](#oauth2-login) for details.
 </Warning>
 
-The built-in profile provides:
+The profile provides:
 - **Read+write access** to the current working directory
 - **Read+write access** to `~/.claude` (agent state, debug logs, project config)
 - **Read+write access** to `~/.claude.json` (settings file)
@@ -54,8 +54,8 @@ If you need different permissions, create a custom profile at `~/.config/nono/pr
     "version": "1.0.0",
     "description": "Claude Code with additional project access"
   },
-  "security": {
-    "groups": ["git_config"]
+  "groups": {
+    "include": ["git_config"]
   },
   "filesystem": {
     "allow": ["$WORKDIR", "$HOME/.claude"],
@@ -71,7 +71,7 @@ If you need different permissions, create a custom profile at `~/.config/nono/pr
 }
 ```
 
-If you want to inherit the built-in Claude Code profile but remove its network filtering, create a separate extending profile and explicitly clear the inherited network profile:
+If you want to inherit the Claude Code profile but remove its network filtering, create a separate extending profile and explicitly clear the inherited network profile:
 
 ```json
 {
@@ -93,7 +93,7 @@ nono run --profile claude-code -- claude
 ```
 
 <Note>
-Custom profiles with the same name override the built-in. Remove or rename the file to revert to the built-in profile.
+Custom profiles with the same name override the pack profile. Remove or rename the file to revert to the pack-provided profile.
 </Note>
 
 ## Multiple Claude Profiles (`CLAUDE_CONFIG_DIR`)
@@ -126,7 +126,7 @@ Do not set `CLAUDE_CONFIG_DIR` to its default value (`~/.claude`) explicitly —
 </Note>
 
 <Note>
-For the default `~/.claude` config directory, no extra flags or directories are needed — the built-in profile already grants access to both `~/.claude` and `~/.claude.lock`.
+For the default `~/.claude` config directory, no extra flags or directories are needed — the profile already grants access to both `~/.claude` and `~/.claude.lock`.
 </Note>
 
 ## Security Tips
@@ -154,7 +154,7 @@ See [Credential Injection](/cli/features/credential-injection) for full document
 
 ### Restrict to Specific Projects
 
-The built-in profile grants access to the current working directory (wherever you run the command). To limit access to a specific directory regardless of where you invoke it:
+The profile grants access to the current working directory (wherever you run the command). To limit access to a specific directory regardless of where you invoke it:
 
 ```bash
 nono run --allow ~/projects/my-app --read ~/.claude -- claude
@@ -188,7 +188,7 @@ nono run --profile claude-code --allow-domain my-internal-api.example.com -- cla
 
 Running `claude /login` inside a sandbox requires the browser to open outside the sandboxed process. On Linux (Landlock), `nono` can delegate approved URLs to the unsandboxed parent process. On macOS (Seatbelt), Claude's login flow needs a temporary LaunchServices permission to open the browser.
 
-The built-in `claude-code` profile includes an origin allowlist that controls which URLs may be opened during supervised login flows:
+The `claude-code` profile includes an origin allowlist that controls which URLs may be opened during supervised login flows:
 
 - `https://claude.ai` (OAuth2 authorize endpoint)
 - `localhost` callbacks (for the OAuth2 redirect)
@@ -199,7 +199,7 @@ On Linux, no additional flags are needed:
 nono run --profile claude-code -- claude
 ```
 
-On macOS, `nono` auto-enables LaunchServices for the built-in `claude-code` profile when no refresh-capable local auth is detected. You can also enable it explicitly for the login session:
+On macOS, `nono` auto-enables LaunchServices for the `claude-code` profile when no refresh-capable local auth is detected. You can also enable it explicitly for the login session:
 
 ```bash
 nono run --profile claude-code --allow-launch-services -- claude
@@ -276,15 +276,15 @@ You only need `--read` (not `--allow`) for these directories. This permits PATH 
 
 ### VS Code Extension
 
-Claude Code installs a VS Code extension on startup. The built-in profile already grants write access to `~/.vscode` plus the OS-specific VS Code data directory: `~/Library/Application Support/Code` on macOS or `~/.config/Code` on Linux. No additional flags are needed for VS Code extension installation.
+Claude Code installs a VS Code extension on startup. The profile already grants write access to `~/.vscode` plus the OS-specific VS Code data directory: `~/Library/Application Support/Code` on macOS or `~/.config/Code` on Linux. No additional flags are needed for VS Code extension installation.
 
 ### Git Configuration
 
-Claude Code reads git configuration for repository operations. The built-in profile includes the `git_config` group, which grants read access to `~/.gitconfig`, `~/.gitignore_global`, and `~/.config/git/ignore`. No additional flags are needed for git operations.
+Claude Code reads git configuration for repository operations. The profile includes the `git_config` group, which grants read access to `~/.gitconfig`, `~/.gitignore_global`, and `~/.config/git/ignore`. No additional flags are needed for git operations.
 
 ## Secretive (SSH Keys in Secure Enclave)
 
-If you use [Secretive](https://github.com/maxgoedjen/secretive) to store SSH keys in the macOS Secure Enclave, git commit signing (`git commit -S`) needs access to the Secretive agent socket. Create a custom profile that extends the built-in Claude Code profile:
+If you use [Secretive](https://github.com/maxgoedjen/secretive) to store SSH keys in the macOS Secure Enclave, git commit signing (`git commit -S`) needs access to the Secretive agent socket. Create a custom profile that extends the Claude Code profile:
 
 Save as `~/.config/nono/profiles/claude-code-secretive.json`:
 
@@ -301,10 +301,8 @@ Save as `~/.config/nono/profiles/claude-code-secretive.json`:
       "$HOME/.ssh/config",
       "$HOME/Library/Containers/com.maxgoedjen.Secretive.SecretAgent/Data/socket.ssh"
     ],
-    "allow_file": ["$HOME/.ssh/known_hosts"]
-  },
-  "policy": {
-    "add_allow_readwrite": ["$HOME/.ssh/known_hosts"]
+    "allow_file": ["$HOME/.ssh/known_hosts"],
+    "allow": ["$HOME/.ssh/known_hosts"]
   }
 }
 ```

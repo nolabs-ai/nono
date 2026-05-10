@@ -173,7 +173,7 @@ macOS supervised mode provides rollback snapshots and diagnostic output, but doe
 
 ### macOS Claude Code keychain scope
 
-The built-in `claude-code` profile on macOS grants read-write access to the **user** keychain root:
+The `claude-code` profile on macOS grants read-write access to the **user** keychain root:
 
 - `~/Library/Keychains`
 
@@ -190,9 +190,9 @@ Security implication:
 
 - a process running under the macOS `claude-code` profile can interact with the user's keychain subtree, not just Claude-specific entries
 
-This was chosen as a compatibility tradeoff for the built-in Claude profile. Users who need a tighter boundary should use a custom profile instead of relying on the built-in `claude-code` profile.
+This was chosen as a compatibility tradeoff for the Claude profile. Users who need a tighter boundary should use a custom profile instead of relying on the pack-provided `claude-code` profile.
 
-For users who want the built-in Claude profile shape without macOS keychain access, nono also provides:
+For users who want the Claude profile shape without macOS keychain access, nono also provides:
 
 - `claude-no-kc`
 
@@ -391,6 +391,14 @@ If the child's traffic is captured (e.g., by a rogue library logging HTTP reques
 | Upstream TLS failure | Proxy returns 502 | Safe — no fallback to plaintext |
 
 The invariant matches the filesystem model: **if anything goes wrong, the child does not get access**.
+
+### Audit Durability Boundary
+
+Network proxy events are captured during the session, but the durable append-only audit log is finalized after the session ends rather than updated on every proxied request.
+
+This is an intentional performance tradeoff: the live request path only pays the cost of lightweight event capture, while the append-only hash chain and Merkleized audit summary are written during session finalization. The result is good post-run audit integrity, but not per-request durability.
+
+The security implication is narrow but real: if the supervisor or proxy is forcibly terminated mid-session, recent network events may be lost before they are committed into the append-only audit record. This does not weaken sandbox enforcement or credential isolation, but it does leave a temporary gap in forensic durability. Tightening that window is future work.
 
 ## macOS Model
 

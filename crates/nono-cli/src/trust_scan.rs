@@ -761,6 +761,82 @@ fn verify_keyless_crypto(
 }
 
 // ---------------------------------------------------------------------------
+// Path safety for multi-subject bundle subject names
+// ---------------------------------------------------------------------------
+
+/// Resolve a bundle subject `name` to a path within `scan_root`.
+///
+/// Rejects names that would escape the scan root before any filesystem I/O,
+/// covering three distinct vectors:
+///
+/// - **Absolute paths** (`/etc/passwd`): `Path::join` discards `scan_root`
+///   entirely for absolute inputs, so the join itself escapes the root.
+/// - **`..` traversal** (`../../etc/shadow`): parent-directory components
+///   climb above `scan_root` after OS resolution.
+/// - **Symlink escape** (`link/passwd` where `scan_root/link → /etc`):
+///   passes the component checks above but resolves outside the root when
+///   the OS follows the symlink at I/O time.  Caught by canonicalizing both
+///   `scan_root` and the joined path and asserting containment.
+///
+/// If the target file does not yet exist (`canonicalize` on the joined path
+/// returns `Err`), the symlink check is skipped and the caller's own file I/O
+/// will produce the appropriate error.  `scan_root` itself must be resolvable;
+/// an error is returned immediately if it cannot be canonicalized.
+///
+/// # Errors
+///
+/// Returns a descriptive `String` error when the name is rejected.
+pub(crate) fn safe_subject_path(
+    scan_root: &Path,
+    name: &str,
+) -> std::result::Result<PathBuf, String> {
+    let name_path = std::path::Path::new(name);
+
+    // Reject absolute paths: Path::join replaces the base entirely for
+    // absolute inputs, e.g. scan_root.join("/etc/passwd") == "/etc/passwd".
+    if name_path.is_absolute() {
+        return Err(format!(
+            "subject name '{name}' rejected: absolute paths are not permitted in bundle subjects"
+        ));
+    }
+
+    // Reject any `..` component so relative traversal cannot climb above
+    // scan_root regardless of nesting depth.
+    for component in name_path.components() {
+        if component == std::path::Component::ParentDir {
+            return Err(format!(
+                "subject name '{name}' rejected: '..' components are not permitted in bundle subjects"
+            ));
+        }
+    }
+
+    let joined = scan_root.join(name_path);
+
+    // Symlink-escape check: canonicalize scan_root and the joined subject
+    // path, then require the resolved subject to remain within the resolved
+    // root.  A subject like "link/passwd" passes the component checks above
+    // when scan_root/link is a symlink pointing outside scan_root; the OS
+    // follows it and the digest computation reads the target.
+    //
+    // scan_root is canonicalized unconditionally — if it cannot be resolved
+    // we return an error immediately.  The joined path is canonicalized only
+    // when the file exists; a missing file is not an escape, and the
+    // caller's I/O will produce the appropriate not-found error.
+    let canon_root = std::fs::canonicalize(scan_root)
+        .map_err(|e| format!("failed to canonicalize scan root: {e}"))?;
+
+    if let Ok(canon_path) = std::fs::canonicalize(&joined) {
+        if !canon_path.starts_with(&canon_root) {
+            return Err(format!(
+                "subject '{name}' resolves outside scan root via symlink"
+            ));
+        }
+    }
+
+    Ok(joined)
+}
+
+// ---------------------------------------------------------------------------
 // Multi-subject bundle verification
 // ---------------------------------------------------------------------------
 
@@ -883,7 +959,17 @@ fn verify_multi_subject_bundle(
     let mut results = Vec::with_capacity(subjects.len());
 
     for (name, expected_digest) in &subjects {
-        let file_path = scan_root.join(name);
+        let file_path = match safe_subject_path(scan_root, name) {
+            Ok(p) => p,
+            Err(reason) => {
+                results.push(VerificationResult {
+                    path: scan_root.to_path_buf(),
+                    digest: String::new(),
+                    outcome: VerificationOutcome::InvalidSignature { detail: reason },
+                });
+                continue;
+            }
+        };
 
         let actual_digest = match trust::file_digest(&file_path) {
             Ok(d) => d,
@@ -1631,5 +1717,213 @@ mod tests {
         assert!(is_glob_pattern(".claude/**/*.md"));
         assert!(is_glob_pattern("test[0-9].md"));
         assert!(is_glob_pattern("{a,b}.md"));
+    }
+
+    // -----------------------------------------------------------------------
+    // safe_subject_path — path traversal prevention
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn safe_subject_path_accepts_plain_filename() {
+        // scan_root must exist on disk because safe_subject_path now calls
+        // canonicalize(scan_root).  The file itself need not exist — when
+        // canonicalize(joined) fails the symlink check is skipped and the
+        // caller's I/O will handle the missing-file error.
+        let dir = tempfile::tempdir().unwrap();
+        let result = safe_subject_path(dir.path(), "SKILLS.md").unwrap();
+        assert_eq!(result, dir.path().join("SKILLS.md"));
+    }
+
+    #[test]
+    fn safe_subject_path_accepts_subdirectory() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = safe_subject_path(dir.path(), ".claude/commands/deploy.md").unwrap();
+        assert_eq!(result, dir.path().join(".claude/commands/deploy.md"));
+    }
+
+    #[test]
+    fn safe_subject_path_rejects_absolute_path() {
+        let root = std::path::Path::new("/tmp/scan");
+        let err = safe_subject_path(root, "/etc/passwd").unwrap_err();
+        assert!(
+            err.contains("absolute"),
+            "error should mention 'absolute': {err}"
+        );
+    }
+
+    #[test]
+    fn safe_subject_path_rejects_relative_dotdot_traversal() {
+        let root = std::path::Path::new("/tmp/scan");
+        let err = safe_subject_path(root, "../../../etc/shadow").unwrap_err();
+        assert!(err.contains(".."), "error should mention '..': {err}");
+    }
+
+    #[test]
+    fn safe_subject_path_rejects_embedded_dotdot() {
+        let root = std::path::Path::new("/tmp/scan");
+        // Embedded traversal: starts inside root then climbs out.
+        let err = safe_subject_path(root, "subdir/../../etc/passwd").unwrap_err();
+        assert!(err.contains(".."), "error should mention '..': {err}");
+    }
+
+    #[test]
+    fn safe_subject_path_rejects_trailing_dotdot() {
+        let root = std::path::Path::new("/tmp/scan");
+        let err = safe_subject_path(root, "subdir/..").unwrap_err();
+        assert!(err.contains(".."), "error should mention '..': {err}");
+    }
+
+    /// A subject name that is syntactically clean but resolves outside
+    /// scan_root via a symlink must be rejected.
+    #[cfg(unix)]
+    #[test]
+    fn safe_subject_path_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let outer = tempfile::tempdir().unwrap();
+        let scan_root = outer.path().join("scan");
+        std::fs::create_dir_all(&scan_root).unwrap();
+
+        // Target file lives outside scan_root.
+        let outside = outer.path().join("secret.txt");
+        std::fs::write(&outside, "SECRET").unwrap();
+
+        // Symlink inside scan_root points to the outside file.
+        let link = scan_root.join("link.txt");
+        symlink(&outside, &link).unwrap();
+
+        let err = safe_subject_path(&scan_root, "link.txt").unwrap_err();
+        assert!(
+            err.contains("symlink") || err.contains("outside"),
+            "error must describe the escape: {err}"
+        );
+    }
+
+    /// Regression test: a bundle whose subject name escapes scan_root through a
+    /// symlink must be blocked end-to-end by verify_multi_subject_bundle.
+    #[cfg(unix)]
+    #[test]
+    fn multi_subject_bundle_rejects_symlink_escape() {
+        use nono::trust;
+        use std::os::unix::fs::symlink;
+
+        let outer = tempfile::tempdir().unwrap();
+        let scan_root = outer.path().join("scan");
+        std::fs::create_dir_all(&scan_root).unwrap();
+
+        // Real file outside scan_root; attacker knows its digest.
+        let content = b"SYMLINK_SECRET";
+        let outside = outer.path().join("secret.txt");
+        std::fs::write(&outside, content).unwrap();
+        let secret_digest = trust::bytes_digest(content);
+
+        // Symlink inside scan_root → outside file.
+        let link_name = "link.txt";
+        symlink(&outside, scan_root.join(link_name)).unwrap();
+
+        // Craft a valid, correctly-signed bundle whose subject is the symlink.
+        let key_pair = trust::generate_signing_key().unwrap();
+        let key_id = trust::key_id_hex(&key_pair).unwrap();
+        let pub_key_bytes = trust::export_public_key(&key_pair).unwrap();
+        let pub_key_b64 = nono::trust::base64::base64_encode(pub_key_bytes.as_bytes());
+
+        let files = vec![(std::path::PathBuf::from(link_name), secret_digest)];
+        let bundle_json = trust::sign_files(&files, &key_pair, &key_id).unwrap();
+        let bundle_path = trust::multi_subject_bundle_path(&scan_root);
+        std::fs::write(&bundle_path, &bundle_json).unwrap();
+
+        let policy = TrustPolicy {
+            includes: Vec::new(),
+            enforcement: Enforcement::Deny,
+            publishers: vec![trust::Publisher {
+                name: "attacker".to_string(),
+                issuer: None,
+                repository: None,
+                workflow: None,
+                ref_pattern: None,
+                key_id: Some(key_id),
+                public_key: Some(pub_key_b64),
+                build_signer_uri: None,
+            }],
+            ..TrustPolicy::default()
+        };
+
+        let results = verify_multi_subject_bundle(&bundle_path, &scan_root, &policy);
+        assert_eq!(
+            results.len(),
+            1,
+            "expected one result for the symlink subject"
+        );
+        let outcome = &results[0].outcome;
+        assert!(
+            matches!(outcome, VerificationOutcome::InvalidSignature { .. }),
+            "symlink escape must yield InvalidSignature, got: {outcome:?}"
+        );
+        assert!(
+            !outcome.is_verified(),
+            "symlink escape must not pass as verified"
+        );
+    }
+
+    /// Regression test: a bundle with a path-traversal subject name must be
+    /// rejected by verify_multi_subject_bundle before any file I/O.
+    #[test]
+    fn multi_subject_bundle_rejects_traversal_subject_name() {
+        use nono::trust;
+
+        let outer = tempfile::tempdir().unwrap();
+        let scan_root = outer.path().join("scan");
+        std::fs::create_dir_all(&scan_root).unwrap();
+
+        // A real file outside scan_root that the attacker wants to read.
+        let secret = outer.path().join("secret.txt");
+        std::fs::write(&secret, "SECRET").unwrap();
+        let secret_digest = trust::bytes_digest(b"SECRET");
+
+        // Craft a bundle whose subject name traverses out of scan_root.
+        let traversal_name = "../secret.txt";
+        let key_pair = trust::generate_signing_key().unwrap();
+        let key_id = trust::key_id_hex(&key_pair).unwrap();
+        let pub_key_bytes = trust::export_public_key(&key_pair).unwrap();
+        let pub_key_b64 = nono::trust::base64::base64_encode(pub_key_bytes.as_bytes());
+
+        let files = vec![(std::path::PathBuf::from(traversal_name), secret_digest)];
+        let bundle_json = trust::sign_files(&files, &key_pair, &key_id).unwrap();
+        let bundle_path = trust::multi_subject_bundle_path(&scan_root);
+        std::fs::write(&bundle_path, &bundle_json).unwrap();
+
+        let policy = TrustPolicy {
+            includes: Vec::new(),
+            enforcement: Enforcement::Deny,
+            publishers: vec![trust::Publisher {
+                name: "attacker".to_string(),
+                issuer: None,
+                repository: None,
+                workflow: None,
+                ref_pattern: None,
+                key_id: Some(key_id),
+                public_key: Some(pub_key_b64),
+                build_signer_uri: None,
+            }],
+            ..TrustPolicy::default()
+        };
+
+        let results = verify_multi_subject_bundle(&bundle_path, &scan_root, &policy);
+        assert_eq!(
+            results.len(),
+            1,
+            "expected one result for the traversal subject"
+        );
+        let outcome = &results[0].outcome;
+        // Must be rejected as InvalidSignature (traversal is a policy violation).
+        assert!(
+            matches!(outcome, VerificationOutcome::InvalidSignature { .. }),
+            "traversal subject must yield InvalidSignature, got: {outcome:?}"
+        );
+        // Must NOT be Verified.
+        assert!(
+            !outcome.is_verified(),
+            "traversal must not pass as verified"
+        );
     }
 }

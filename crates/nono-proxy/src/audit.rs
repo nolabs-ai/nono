@@ -4,7 +4,10 @@
 //! Sensitive data (authorization headers, tokens, request bodies)
 //! is never included in audit logs.
 
-use nono::undo::{NetworkAuditDecision, NetworkAuditEvent, NetworkAuditMode};
+use nono::undo::{
+    NetworkAuditAuthMechanism, NetworkAuditAuthOutcome, NetworkAuditDecision,
+    NetworkAuditDenialCategory, NetworkAuditEvent, NetworkAuditInjectionMode, NetworkAuditMode,
+};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
@@ -18,18 +21,33 @@ pub type SharedAuditLog = Arc<Mutex<Vec<NetworkAuditEvent>>>;
 /// Proxy mode for audit logging.
 #[derive(Debug, Clone, Copy)]
 pub enum ProxyMode {
-    /// CONNECT tunnel (host filtering only)
+    /// CONNECT tunnel (host filtering only, no L7 visibility)
     Connect,
+    /// CONNECT tunnel that the proxy terminated locally for L7 inspection
+    /// and/or credential injection.
+    ConnectIntercept,
     /// Reverse proxy (credential injection)
     Reverse,
     /// External proxy passthrough (enterprise)
     External,
 }
 
+/// Optional structured audit context attached to a proxy event.
+#[derive(Debug, Clone, Default)]
+pub struct EventContext<'a> {
+    pub route_id: Option<&'a str>,
+    pub auth_mechanism: Option<NetworkAuditAuthMechanism>,
+    pub auth_outcome: Option<NetworkAuditAuthOutcome>,
+    pub managed_credential_active: Option<bool>,
+    pub injection_mode: Option<NetworkAuditInjectionMode>,
+    pub denial_category: Option<NetworkAuditDenialCategory>,
+}
+
 impl std::fmt::Display for ProxyMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ProxyMode::Connect => write!(f, "connect"),
+            ProxyMode::ConnectIntercept => write!(f, "connect_intercept"),
             ProxyMode::Reverse => write!(f, "reverse"),
             ProxyMode::External => write!(f, "external"),
         }
@@ -81,6 +99,7 @@ fn now_unix_millis() -> u64 {
 fn map_mode(mode: ProxyMode) -> NetworkAuditMode {
     match mode {
         ProxyMode::Connect => NetworkAuditMode::Connect,
+        ProxyMode::ConnectIntercept => NetworkAuditMode::ConnectIntercept,
         ProxyMode::Reverse => NetworkAuditMode::Reverse,
         ProxyMode::External => NetworkAuditMode::External,
     }
@@ -115,6 +134,7 @@ fn push_event(audit_log: Option<&SharedAuditLog>, event: NetworkAuditEvent) {
 pub fn log_allowed(
     audit_log: Option<&SharedAuditLog>,
     mode: ProxyMode,
+    ctx: &EventContext<'_>,
     host: &str,
     port: u16,
     method: &str,
@@ -135,6 +155,12 @@ pub fn log_allowed(
             timestamp_unix_ms: now_unix_millis(),
             mode: map_mode(mode),
             decision: NetworkAuditDecision::Allow,
+            route_id: ctx.route_id.map(str::to_string),
+            auth_mechanism: ctx.auth_mechanism.clone(),
+            auth_outcome: ctx.auth_outcome.clone(),
+            managed_credential_active: ctx.managed_credential_active,
+            injection_mode: ctx.injection_mode.clone(),
+            denial_category: None,
             target: host.to_string(),
             port: Some(port),
             method: Some(method.to_string()),
@@ -149,6 +175,7 @@ pub fn log_allowed(
 pub fn log_denied(
     audit_log: Option<&SharedAuditLog>,
     mode: ProxyMode,
+    ctx: &EventContext<'_>,
     host: &str,
     port: u16,
     reason: &str,
@@ -169,6 +196,12 @@ pub fn log_denied(
             timestamp_unix_ms: now_unix_millis(),
             mode: map_mode(mode),
             decision: NetworkAuditDecision::Deny,
+            route_id: ctx.route_id.map(str::to_string),
+            auth_mechanism: ctx.auth_mechanism.clone(),
+            auth_outcome: ctx.auth_outcome.clone(),
+            managed_credential_active: ctx.managed_credential_active,
+            injection_mode: ctx.injection_mode.clone(),
+            denial_category: ctx.denial_category.clone(),
             target: host.to_string(),
             port: Some(port),
             method: None,
@@ -179,7 +212,56 @@ pub fn log_denied(
     );
 }
 
-/// Log a reverse proxy request with service info.
+/// Log an L7 request that the proxy decoded (reverse proxy or intercepted CONNECT).
+///
+/// Used for both `Reverse` and `ConnectIntercept` modes. `External` and
+/// `Connect` (transparent tunnel) modes have no L7 visibility and use
+/// `log_allowed`/`log_denied` instead.
+pub fn log_l7_request(
+    audit_log: Option<&SharedAuditLog>,
+    mode: ProxyMode,
+    ctx: &EventContext<'_>,
+    target: &str,
+    method: &str,
+    path: &str,
+    status: u16,
+) {
+    info!(
+        target: "nono_proxy::audit",
+        mode = %mode,
+        target = target,
+        method = method,
+        path = path,
+        status = status,
+        "l7 proxy response"
+    );
+
+    push_event(
+        audit_log,
+        NetworkAuditEvent {
+            timestamp_unix_ms: now_unix_millis(),
+            mode: map_mode(mode),
+            decision: NetworkAuditDecision::Allow,
+            route_id: ctx.route_id.map(str::to_string),
+            auth_mechanism: ctx.auth_mechanism.clone(),
+            auth_outcome: ctx.auth_outcome.clone(),
+            managed_credential_active: ctx.managed_credential_active,
+            injection_mode: ctx.injection_mode.clone(),
+            denial_category: None,
+            target: target.to_string(),
+            port: None,
+            method: Some(method.to_string()),
+            path: Some(path.to_string()),
+            status: Some(status),
+            reason: None,
+        },
+    );
+}
+
+/// Compatibility shim for the previous `log_reverse_proxy` API. New code
+/// should call [`log_l7_request`] directly with the appropriate
+/// [`ProxyMode`] instead.
+#[deprecated(since = "0.46.0", note = "use log_l7_request with ProxyMode::Reverse")]
 pub fn log_reverse_proxy(
     audit_log: Option<&SharedAuditLog>,
     service: &str,
@@ -187,29 +269,17 @@ pub fn log_reverse_proxy(
     path: &str,
     status: u16,
 ) {
-    info!(
-        target: "nono_proxy::audit",
-        mode = "reverse",
-        service = service,
-        method = method,
-        path = path,
-        status = status,
-        "reverse proxy response"
-    );
-
-    push_event(
+    log_l7_request(
         audit_log,
-        NetworkAuditEvent {
-            timestamp_unix_ms: now_unix_millis(),
-            mode: NetworkAuditMode::Reverse,
-            decision: NetworkAuditDecision::Allow,
-            target: service.to_string(),
-            port: None,
-            method: Some(method.to_string()),
-            path: Some(path.to_string()),
-            status: Some(status),
-            reason: None,
+        ProxyMode::Reverse,
+        &EventContext {
+            route_id: Some(service),
+            ..EventContext::default()
         },
+        service,
+        method,
+        path,
+        status,
     );
 }
 
@@ -225,6 +295,7 @@ mod tests {
         log_allowed(
             Some(&log),
             ProxyMode::Connect,
+            &EventContext::default(),
             "api.openai.com",
             443,
             "CONNECT",
@@ -235,6 +306,8 @@ mod tests {
         let event = &events[0];
         assert_eq!(event.mode, NetworkAuditMode::Connect);
         assert_eq!(event.decision, NetworkAuditDecision::Allow);
+        assert_eq!(event.route_id, None);
+        assert_eq!(event.auth_mechanism, None);
         assert_eq!(event.target, "api.openai.com");
         assert_eq!(event.port, Some(443));
         assert_eq!(event.method.as_deref(), Some("CONNECT"));
@@ -248,6 +321,7 @@ mod tests {
         log_denied(
             Some(&log),
             ProxyMode::External,
+            &EventContext::default(),
             "169.254.169.254",
             80,
             "blocked by metadata deny list",
@@ -258,6 +332,8 @@ mod tests {
         let event = &events[0];
         assert_eq!(event.mode, NetworkAuditMode::External);
         assert_eq!(event.decision, NetworkAuditDecision::Deny);
+        assert_eq!(event.route_id, None);
+        assert_eq!(event.auth_mechanism, None);
         assert_eq!(
             event.reason.as_deref(),
             Some("blocked by metadata deny list")

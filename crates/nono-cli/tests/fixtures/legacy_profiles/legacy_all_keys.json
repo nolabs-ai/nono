@@ -1,0 +1,18 @@
+{
+  "meta": {"name": "legacy-all", "version": "0.1.0"},
+  "extends": "default",
+  "filesystem": {"allow": ["/rw-base"]},
+  "security": {
+    "groups": ["node_runtime"],
+    "allowed_commands": ["pip"]
+  },
+  "policy": {
+    "exclude_groups": ["dangerous_commands"],
+    "add_allow_read": ["/r"],
+    "add_allow_write": ["/w"],
+    "add_allow_readwrite": ["/rw"],
+    "add_deny_access": ["/d"],
+    "add_deny_commands": ["docker"],
+    "override_deny": ["/rw-base"]
+  }
+}

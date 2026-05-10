@@ -822,6 +822,96 @@ mod tests {
         assert!(profile.contains("(allow network-outbound)"));
     }
 
+    /// Repro for tls-intercept-qa T2 failure: `head <SSL_CERT_FILE>` returned
+    /// EPERM inside the sandbox even though the proxy granted a read cap on
+    /// the file. Verifies the literal `(allow file-read* (literal "..."))`
+    /// rule is actually emitted for a path under `~/.nono/sessions/`.
+    #[test]
+    fn repro_intercept_ca_read_rule_is_emitted() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("intercept-ca.pem");
+        std::fs::write(&file_path, b"fake").unwrap();
+
+        let mut caps = CapabilitySet::new();
+        caps.allow_file_mut(&file_path, AccessMode::Read).unwrap();
+
+        let profile = generate_profile(&caps).unwrap();
+        let canonical = file_path.canonicalize().unwrap();
+        let canonical_str = canonical.to_str().unwrap();
+        let expected = format!("(allow file-read* (literal \"{}\"))", canonical_str);
+
+        assert!(
+            profile.contains(&expected),
+            "expected profile to contain `{}`\n\n--- profile ---\n{}",
+            expected,
+            profile
+        );
+    }
+
+    /// Regression for the same T2 failure: when the intercept-CA path lives
+    /// under a protected root that emits `(deny file-read-data (subpath ...))`,
+    /// a plain `(allow file-read* (literal ...))` is shadowed because Seatbelt
+    /// ranks action specificity above path specificity. The proxy now emits
+    /// an action-matching `(allow file-read-data (literal ...))` platform rule
+    /// (plus metadata) so the per-file allow wins by both action specificity
+    /// and last-match. This test pins that ordering.
+    #[test]
+    fn intercept_ca_action_specific_allow_wins_over_protected_root_deny() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nono_root = tmp.path().join(".nono");
+        let session_dir = nono_root.join("sessions").join("intercept-test");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let ca_path = session_dir.join("intercept-ca.pem");
+        std::fs::write(&ca_path, b"fake").unwrap();
+
+        let canonical_root = nono_root.canonicalize().unwrap();
+        let canonical_ca = ca_path.canonicalize().unwrap();
+        let root_str = canonical_root.to_str().unwrap();
+        let ca_str = canonical_ca.to_str().unwrap();
+
+        let mut caps = CapabilitySet::new();
+        // Protected-root deny rules (mirroring `emit_protected_root_deny_rules`).
+        caps.add_platform_rule(format!(
+            "(allow file-read-metadata (subpath \"{}\"))",
+            root_str
+        ))
+        .unwrap();
+        caps.add_platform_rule(format!("(deny file-read-data (subpath \"{}\"))", root_str))
+            .unwrap();
+        caps.add_platform_rule(format!("(deny file-write* (subpath \"{}\"))", root_str))
+            .unwrap();
+        // Proxy's action-specific allow on the CA bundle.
+        caps.add_platform_rule(format!("(allow file-read-data (literal \"{}\"))", ca_str))
+            .unwrap();
+        caps.add_platform_rule(format!(
+            "(allow file-read-metadata (literal \"{}\"))",
+            ca_str
+        ))
+        .unwrap();
+
+        let profile = generate_profile(&caps).unwrap();
+        let allow_data = format!("(allow file-read-data (literal \"{}\"))", ca_str);
+        let deny_data = format!("(deny file-read-data (subpath \"{}\"))", root_str);
+
+        let allow_idx = profile.find(&allow_data).unwrap_or_else(|| {
+            panic!(
+                "profile missing action-specific allow `{}`\n\n--- profile ---\n{}",
+                allow_data, profile
+            )
+        });
+        let deny_idx = profile.find(&deny_data).unwrap_or_else(|| {
+            panic!(
+                "profile missing protected-root deny `{}`\n\n--- profile ---\n{}",
+                deny_data, profile
+            )
+        });
+        assert!(
+            allow_idx > deny_idx,
+            "action-specific allow must come AFTER the subpath deny so last-match wins.\n\
+             allow_idx={allow_idx}, deny_idx={deny_idx}\n\n--- profile ---\n{profile}"
+        );
+    }
+
     #[test]
     fn test_generate_profile_with_dir() {
         let mut caps = CapabilitySet::new();

@@ -120,9 +120,9 @@ pub(crate) fn map_error(e: &nono::NonoError) -> types::NonoErrorCode {
         | nono::NonoError::BlocklistBlocked { .. }
         | nono::NonoError::InstructionFileDenied { .. }
         | nono::NonoError::PackageVerification { .. } => NonoErrorCode::ErrTrustVerification,
-        nono::NonoError::PackageInstall(_) | nono::NonoError::RegistryError(_) => {
-            NonoErrorCode::ErrConfigParse
-        }
+        nono::NonoError::PackageInstall(_)
+        | nono::NonoError::RegistryError(_)
+        | nono::NonoError::ActionRequired(_) => NonoErrorCode::ErrConfigParse,
         nono::NonoError::NetworkFilterUnsupported { .. } => NonoErrorCode::ErrUnsupportedPlatform,
         // CLI-only user-cancellation marker. Library callers shouldn't
         // see it through the FFI in normal use, but if they do, surface

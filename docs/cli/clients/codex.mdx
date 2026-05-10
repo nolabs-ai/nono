@@ -164,7 +164,7 @@ The `extends` chain pulls in everything the pack profile declares (allow paths, 
 
 Codex login opens `https://auth.openai.com` during the OAuth flow.
 
-The built-in profile includes the required browser-open allowlist:
+The profile includes the required browser-open allowlist:
 
 - `https://auth.openai.com`
 - `localhost` callbacks for the OAuth redirect
@@ -189,7 +189,7 @@ After login completes, exit and rerun without `--allow-launch-services`.
 
 ### Restrict to a Specific Project
 
-The built-in profile grants access to the directory you run Codex from. To pin access to a specific repository:
+The profile grants access to the directory you run Codex from. To pin access to a specific repository:
 
 ```bash
 nono run --profile codex --workdir ~/projects/my-app -- codex --sandbox danger-full-access --ask-for-approval on-request
@@ -221,7 +221,7 @@ nono run --profile codex --network-profile codex -- codex --sandbox danger-full-
 
 ### Additional Home-Directory Tools
 
-The built-in profile covers common Rust, Node.js, Python, and Nix runtime locations under `~/`, but some developer tools still install into other home-directory paths such as `~/go/bin` or `~/.bun/bin`.
+The profile covers common Rust, Node.js, Python, and Nix runtime locations under `~/`, but some developer tools still install into other home-directory paths such as `~/go/bin` or `~/.bun/bin`.
 
 If a tool exists on your `PATH` but Codex cannot launch it inside the sandbox, grant read access to the specific path entry:
 
@@ -232,4 +232,4 @@ nono run --profile codex \
   -- codex --sandbox danger-full-access --ask-for-approval on-request
 ```
 
-See [Network Filtering](/cli/features/network-proxy) and [Security Profiles](/cli/features/profiles-groups) for details on host allowlists, profile format, and precedence rules.
+See [Network Filtering](/cli/features/networking) and [Security Profiles](/cli/features/profiles-groups) for details on host allowlists, profile format, and precedence rules.

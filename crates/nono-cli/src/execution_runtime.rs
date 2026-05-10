@@ -33,8 +33,6 @@ fn apply_pre_fork_sandbox(
         {
             Sandbox::apply(caps)?;
         }
-
-        output::print_sandbox_active(silent);
     }
     Ok(())
 }
@@ -187,7 +185,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
     if let Some(profile) = recommended_profile {
         output::print_profile_hint(recommended_program_name, profile, flags.silent);
     }
-    let cap_file = write_capability_state_file(&caps, &flags.override_deny_paths, flags.silent);
+    let cap_file = write_capability_state_file(&caps, &flags.bypass_protection_paths, flags.silent);
     let cap_file_path = cap_file.unwrap_or_else(|| std::path::PathBuf::from("/dev/null"));
 
     for secret in &loaded_secrets {
@@ -337,6 +335,12 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
             cleanup_capability_state_file(&cap_file_path);
             drop(config);
             drop(loaded_secrets);
+            // `std::process::exit` does NOT run destructors, so we must drop
+            // the proxy handle explicitly to fire its `Drop` impl — that's
+            // what removes the TLS-intercept trust bundle and its parent
+            // session directory under `~/.nono/sessions/`. Without this
+            // every supervised-mode session leaks a file + directory.
+            drop(proxy_handle);
             std::process::exit(exit_code);
         }
     }
@@ -344,10 +348,10 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
 
 fn write_capability_state_file(
     caps: &CapabilitySet,
-    override_deny_paths: &[std::path::PathBuf],
+    bypass_protection_paths: &[std::path::PathBuf],
     silent: bool,
 ) -> Option<std::path::PathBuf> {
-    let state = sandbox_state::SandboxState::from_caps(caps, override_deny_paths);
+    let state = sandbox_state::SandboxState::from_caps(caps, bypass_protection_paths);
 
     for _ in 0..8 {
         let cap_file = next_capability_state_file_path();

@@ -1,9 +1,23 @@
 ---
 title: Networking
-description: Network access control — blocking, domain filtering, upstream proxies, and localhost IPC
+description: Network access control — proxy modes, domain filtering, credential injection, and localhost IPC
 ---
 
-By default the sandboxed process has unrestricted network access. nono provides two ways to restrict it: block everything, or filter outbound traffic to a set of allowed domains.
+By default the sandboxed process has unrestricted network access. When you restrict networking, nono routes traffic through an HTTP proxy running in the unsandboxed supervisor process. The sandboxed child can only reach `localhost:<proxy-port>` — all other outbound TCP is blocked at the kernel level.
+
+## Proxy Modes
+
+The proxy supports three modes that can be combined in a single session:
+
+| Mode | What it does | Activated by |
+|------|-------------|--------------|
+| **CONNECT tunnel** | Domain-filtered HTTPS tunneling. Validates the target host against an allowlist, then relays raw TCP bytes. TLS is end-to-end — the proxy never sees plaintext. | `--allow-domain`, `--network-profile` |
+| **Reverse proxy** | Credential injection for API calls. Requests arrive at `http://localhost:<port>/<service>/...`, the proxy injects the real API key and forwards to the upstream over TLS. | `--credential` |
+| **External proxy** | Enterprise proxy passthrough. CONNECT requests are chained through a corporate proxy. Cloud metadata endpoints are still denied. | `--upstream-proxy` |
+
+When domain filtering or credential injection is active, the proxy starts automatically. `HTTP_PROXY` and `HTTPS_PROXY` are set in the child environment.
+
+A 256-bit session token is generated for each proxy session. The child must include it in every request (`Proxy-Authorization` header for CONNECT, `X-Nono-Token` for reverse proxy), preventing other localhost processes from using the proxy.
 
 ## Blocking All Network
 
@@ -21,9 +35,9 @@ In a profile, set `network.block` to `true`:
 }
 ```
 
-## Domain Filtering
+## CONNECT Tunnel (Domain Filtering)
 
-The proxy starts whenever any domain-filtering flag is present: `--network-profile`, `--allow-domain`, `--credential`, or `--upstream-proxy` (from CLI args or profile config). It restricts outbound traffic to a set of allowed domains.
+The CONNECT tunnel is the most common proxy mode. It validates outbound hostnames against an allowlist, then relays raw TCP bytes. TLS is end-to-end between the sandboxed process and the upstream server — the proxy never sees plaintext.
 
 `--allow-domain` is an HTTP(S) proxy allowlist, not a generic raw TCP `host:port` allow. When domain filtering is active, direct outbound connections are blocked and traffic must go through the proxy.
 
@@ -37,18 +51,7 @@ nono run --allow-cwd --network-profile claude-code -- claude
 
 ![Proxy architecture flow](/assets/proxy-flow.png)
 
-The proxy runs in the unsandboxed parent process. TLS is end-to-end between the child and upstream — the proxy never sees plaintext.
-
-### How It Works
-
-When domain filtering is active:
-
-1. An HTTP proxy starts on a random localhost port (or a fixed port via `--proxy-port`)
-2. The child sandbox restricts outbound to only `localhost:<port>`
-3. `HTTP_PROXY` and `HTTPS_PROXY` are set in the child environment
-4. Every CONNECT request is validated against the domain allowlist
-
-A 256-bit session token is generated for each proxy session. The child must include it in every request (`Proxy-Authorization` header), preventing other localhost processes from using the proxy.
+### DNS Rebinding Protection
 
 The proxy resolves DNS itself and checks all resolved IPs against the deny list before connecting. This prevents DNS rebinding attacks where a malicious DNS server maps an allowed hostname to an internal IP.
 
@@ -66,7 +69,7 @@ Applications that read `OPENAI_BASE_URL`, `ANTHROPIC_BASE_URL`, etc. from the en
 
 Network profiles are named sets of allowed domains composed from groups. They are defined in `network-policy.json` (embedded in the binary) and activated with `--network-profile` or via a profile's `network.network_profile` field.
 
-#### Built-in Profiles
+#### Preset Network Profiles
 
 | Profile | Groups | Use Case |
 |---------|--------|----------|
@@ -111,7 +114,17 @@ Use `--allow-domain` on the command line or `allow_domain` in a profile to add d
 nono run --allow-cwd --network-profile developer --allow-domain my-internal-api.example.com -- my-agent
 ```
 
-### Upstream Proxy
+## Reverse Proxy (Credential Injection)
+
+When `--credential` is active, the proxy runs a reverse proxy alongside the CONNECT tunnel. The sandboxed process sends plain HTTP requests to `http://localhost:<port>/<service>/...`, and the proxy injects the real API key and forwards to the upstream over TLS.
+
+```bash
+nono run --allow-cwd --credential openai -- my-agent
+```
+
+The agent never sees the real credential. A phantom session token is placed in the sandbox environment; the proxy swaps it for the real key at the HTTP header level. See [Credential Injection](/cli/features/credential-injection) for full details on credential sources, custom credentials, and endpoint filtering.
+
+## External Proxy (Enterprise Passthrough)
 
 For corporate environments with a mandatory outbound proxy, chain domain-filtered traffic through it with `--upstream-proxy`. This is typically paired with the `enterprise` network profile:
 
@@ -122,7 +135,7 @@ nono run --allow-cwd --network-profile enterprise \
 
 CONNECT requests are chained through the corporate proxy. Cloud metadata endpoints are still denied regardless.
 
-#### Bypassing the Upstream Proxy
+### Bypassing the External Proxy
 
 Some domains may need to bypass the upstream proxy and connect directly:
 

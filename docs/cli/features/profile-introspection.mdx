@@ -68,7 +68,7 @@ nono profile: group 'deny_credentials'
 
 ### `nono profile list`
 
-List all available profiles, showing built-in and user-defined profiles separately. User profiles that shadow a built-in name are flagged.
+List all available profiles, showing preset, pack-provided, and user-defined profiles separately. User profiles that shadow a preset or pack profile are flagged.
 
 ```bash
 nono profile list
@@ -101,7 +101,7 @@ Malformed user profiles are surfaced with their error instead of being silently 
 ```
 
 <Note>
-  Load precedence is user-first. If a user profile file exists at `~/.config/nono/profiles/claude-code.json`, it shadows the built-in `claude-code` profile. The `profiles` command reports the actual source: `"user (overrides built-in)"` in JSON output, and lists the profile under the User section.
+  Load precedence is user-first. If a user profile file exists at `~/.config/nono/profiles/claude-code.json`, it shadows the pack-provided `claude-code` profile. The `profiles` command reports the actual source in JSON output, and lists the profile under the User section.
 </Note>
 
 #### Options
@@ -115,7 +115,7 @@ Malformed user profiles are surfaced with their error instead of being silently 
 Display a fully resolved profile, including all inherited groups, filesystem grants, network configuration, hooks, and rollback settings.
 
 ```bash
-# Show a built-in profile
+# Show a profile
 nono profile show default
 
 # Show a user profile
@@ -182,10 +182,10 @@ The `--raw` flag shows path variables as written in the profile (e.g., `$HOME/.c
 Compare two profiles side-by-side. Shows additions, removals, and changes across all profile sections: groups, filesystem, policy patches, security settings, network, hooks, rollback, open URLs, env credentials, and custom credentials.
 
 ```bash
-# Compare two built-in profiles
+# Compare two profiles
 nono profile diff default claude-code
 
-# Compare a user profile against a built-in
+# Compare a user profile against a pack profile
 nono profile diff default ./my-profile.json
 
 # Machine-readable output
@@ -257,8 +257,8 @@ Checks performed:
 |-------|----------|-------------|
 | JSON syntax | Error | File must be valid JSON and deserialize into a profile |
 | Inheritance | Error | `extends` target must be a loadable profile |
-| Group references | Error | Every group in `security.groups` must exist in policy.json |
-| Required group exclusion | Error | `policy.exclude_groups` cannot exclude required groups |
+| Group references | Error | Every group in `groups.include` must exist in policy.json |
+| Required group exclusion | Error | `groups.exclude` cannot exclude required groups |
 | Empty paths | Warning | Empty strings in filesystem path arrays |
 
 Example output for a valid profile:
@@ -323,7 +323,7 @@ nono profile show claude-code
 # What groups protect sensitive data?
 nono profile groups deny_credentials
 
-# How does our custom profile differ from the built-in?
+# How does our custom profile differ from the pack profile?
 nono profile diff claude-code ./our-custom-profile.json
 ```
 
@@ -355,7 +355,7 @@ done
 
 ### Detecting user overrides
 
-Check whether built-in profiles have been shadowed by user files:
+Check whether pack profiles have been shadowed by user files:
 
 ```bash
 # JSON output flags the actual source

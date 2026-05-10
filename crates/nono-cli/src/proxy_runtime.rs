@@ -2,9 +2,11 @@ use crate::cli::SandboxArgs;
 use crate::launch_runtime::ProxyLaunchOptions;
 use crate::network_policy;
 use crate::sandbox_prepare::{validate_external_proxy_bypass, PreparedSandbox};
+#[cfg(not(target_os = "macos"))]
+use nono::AccessMode;
 use nono::{CapabilitySet, NonoError, Result};
-use tracing::info;
-use tracing::warn;
+use std::path::{Path, PathBuf};
+use tracing::{debug, info, warn};
 
 pub(crate) struct ActiveProxyRuntime {
     pub(crate) env_vars: Vec<(String, String)>,
@@ -192,6 +194,15 @@ pub(crate) fn start_proxy_runtime(
 
     let mut proxy_config = build_proxy_config_from_flags(proxy)?;
     proxy_config.direct_connect_ports = caps.tcp_connect_ports().to_vec();
+
+    // Wire up TLS interception: pick a session-scoped directory for the
+    // ephemeral CA bundle and merge any parent `SSL_CERT_FILE` so corporate
+    // trust survives our env-var override.
+    if let Some(dir) = prepare_intercept_ca_dir()? {
+        proxy_config.intercept_ca_dir = Some(dir);
+        proxy_config.intercept_parent_ca_pems = read_parent_ssl_cert_file();
+    }
+
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -210,10 +221,74 @@ pub(crate) fn start_proxy_runtime(
             port, proxy.allow_bind_ports
         );
     }
+
+    // Per-route diagnostic banner. Lifts credential resolution status —
+    // including misses — to the user-visible info level so the silent
+    // "WARN at debug" failure mode (issue #797) becomes immediately
+    // discoverable.
+    let route_rows = handle.route_diagnostics(&proxy_config);
+    if !route_rows.is_empty() {
+        info!("Proxy routes:");
+        for (prefix, summary) in &route_rows {
+            info!("  /{}  {}", prefix, summary);
+        }
+        if handle.intercept_ca_path().is_some() {
+            info!(
+                "TLS interception trust bundle: {}",
+                handle
+                    .intercept_ca_path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default()
+            );
+        }
+    }
     caps.set_network_mode_mut(nono::NetworkMode::ProxyOnly {
         port,
         bind_ports: proxy.allow_bind_ports.clone(),
     });
+
+    // Grant the sandboxed child a read capability on the ephemeral
+    // trust bundle so `SSL_CERT_FILE` etc. are actually openable after
+    // the sandbox is applied. Only when interception is active.
+    //
+    // The bundle lives under `~/.nono/sessions/...`, which the protected-root
+    // deny rules (`emit_protected_root_deny_rules`) cover with
+    // `(deny file-read-data (subpath "~/.nono"))`. On macOS, action specificity
+    // beats path specificity in Seatbelt: a `file-read*` allow on a literal
+    // path is shadowed by an action-specific `file-read-data` deny on a
+    // containing subpath. To override, emit action-matching `file-read-data`
+    // and `file-read-metadata` allows as platform rules, which are appended
+    // after the deny and win by both action specificity and last-match.
+    //
+    // On Linux, Landlock cannot express deny-within-allow, so the protected-
+    // root rules don't shadow the grant; a plain FS cap is sufficient.
+    if let Some(ca_path) = handle.intercept_ca_path() {
+        #[cfg(target_os = "macos")]
+        {
+            let path_str = crate::policy::path_to_utf8(ca_path)?;
+            let escaped = crate::policy::escape_seatbelt_path(path_str)?;
+            caps.add_platform_rule(format!("(allow file-read-data (literal \"{}\"))", escaped))?;
+            caps.add_platform_rule(format!(
+                "(allow file-read-metadata (literal \"{}\"))",
+                escaped
+            ))?;
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            caps.allow_file_mut(ca_path, AccessMode::Read)
+                .map_err(|e| {
+                    NonoError::SandboxInit(format!(
+                        "Failed to grant read capability on TLS-intercept bundle '{}': {}",
+                        ca_path.display(),
+                        e
+                    ))
+                })?;
+        }
+        debug!(
+            "Granted sandboxed child read access to TLS-intercept trust bundle: {}",
+            ca_path.display()
+        );
+    }
 
     let mut env_vars: Vec<(String, String)> = Vec::new();
     for (key, value) in handle.env_vars() {
@@ -230,4 +305,118 @@ pub(crate) fn start_proxy_runtime(
         env_vars,
         handle: Some(handle),
     })
+}
+
+/// Choose the directory the proxy will write the TLS-intercept trust bundle
+/// into. Conventionally `~/.nono/sessions/<random>/`, kept owner-only.
+///
+/// Returns `Ok(None)` if no `HOME` is set (rare edge cases like CI). We log
+/// a warning rather than failing because TLS interception is opt-in: a
+/// missing directory just means CONNECTs to L7-bearing routes will get the
+/// usual 403, which is a coherent fallback rather than a hard error.
+fn prepare_intercept_ca_dir() -> Result<Option<PathBuf>> {
+    let home = match dirs::home_dir() {
+        Some(h) => h,
+        None => {
+            warn!(
+                "no $HOME found; skipping TLS-intercept setup (CONNECTs to L7-bearing routes \
+                 will be denied with 403)"
+            );
+            return Ok(None);
+        }
+    };
+    // PID + start-time-nanos disambiguates concurrent invocations without
+    // pulling in a randomness dep. Cryptographic uniqueness isn't the
+    // goal; we just need two `nono` processes started at the same second
+    // not to share a directory.
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let suffix = format!("{}-{:09}", pid, nanos);
+    let dir = home
+        .join(".nono")
+        .join("sessions")
+        .join(format!("intercept-{}", suffix));
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        warn!(
+            "failed to create TLS-intercept dir '{}': {}; skipping interception",
+            dir.display(),
+            e
+        );
+        return Ok(None);
+    }
+    set_intercept_ca_dir_permissions(&dir)?;
+    Ok(Some(dir))
+}
+
+#[cfg(unix)]
+fn set_intercept_ca_dir_permissions(dir: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).map_err(|e| {
+        NonoError::SandboxInit(format!(
+            "failed to set owner-only permissions on TLS-intercept dir '{}': {e}",
+            dir.display()
+        ))
+    })
+}
+
+#[cfg(not(unix))]
+fn set_intercept_ca_dir_permissions(_dir: &Path) -> Result<()> {
+    Ok(())
+}
+
+/// Read the parent process's `SSL_CERT_FILE`, if set, so any corporate
+/// CAs configured on the host are merged into the intercept trust bundle.
+///
+/// On any read failure we log at warn and return `None` — the proxy will
+/// continue without merging, and the agent may lose trust for corp hosts.
+/// Aborting feels too aggressive: nono is opt-in, and TLS interception is
+/// opt-in within nono, so a corp-trust mismatch is a recoverable misconfig
+/// not a security failure.
+fn read_parent_ssl_cert_file() -> Option<Vec<u8>> {
+    let path = std::env::var_os("SSL_CERT_FILE")?;
+    match std::fs::read(&path) {
+        Ok(bytes) => {
+            debug!(
+                "merging parent SSL_CERT_FILE '{}' ({} bytes) into TLS-intercept trust bundle",
+                std::path::Path::new(&path).display(),
+                bytes.len()
+            );
+            Some(bytes)
+        }
+        Err(e) => {
+            warn!(
+                "could not read parent SSL_CERT_FILE '{}': {} — corporate CAs configured on \
+                 the host will not be trusted by the sandboxed child",
+                std::path::Path::new(&path).display(),
+                e
+            );
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn set_intercept_ca_dir_permissions_fails_closed() -> Result<()> {
+        let tmp = tempfile::tempdir().map_err(NonoError::Io)?;
+        let missing = tmp.path().join("missing");
+
+        let err = set_intercept_ca_dir_permissions(&missing)
+            .err()
+            .ok_or_else(|| {
+                NonoError::SandboxInit("expected missing intercept dir to fail".to_string())
+            })?;
+
+        assert!(matches!(err, NonoError::SandboxInit(_)));
+        assert!(err.to_string().contains("TLS-intercept dir"));
+        Ok(())
+    }
 }

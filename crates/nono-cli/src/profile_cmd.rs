@@ -6,7 +6,8 @@
 
 use crate::cli::{
     ProfileCmdArgs, ProfileCommands, ProfileDiffArgs, ProfileGroupsArgs, ProfileGuideArgs,
-    ProfileInitArgs, ProfileListArgs, ProfileSchemaArgs, ProfileShowArgs, ProfileValidateArgs,
+    ProfileInitArgs, ProfileListArgs, ProfilePromoteArgs, ProfileSchemaArgs, ProfileShowArgs,
+    ProfileValidateArgs,
 };
 use crate::config::embedded;
 use crate::policy::{self, AllowOps, DenyOps, Group};
@@ -14,9 +15,13 @@ use crate::profile::{self, Profile, WorkdirAccess};
 use crate::theme;
 use colored::Colorize;
 use nono::{NonoError, Result};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::Path;
 
 /// Serialize a value to pretty-printed JSON, propagating serialization errors.
 fn to_json(val: &serde_json::Value) -> Result<String> {
@@ -38,6 +43,7 @@ pub fn run_profile(args: ProfileCmdArgs) -> Result<()> {
         ProfileCommands::Show(args) => cmd_show(args),
         ProfileCommands::Diff(args) => cmd_diff(args),
         ProfileCommands::Validate(args) => cmd_validate(args),
+        ProfileCommands::Promote(args) => cmd_promote(args),
         ProfileCommands::Groups(args) => cmd_groups(args),
         ProfileCommands::Schema(args) => cmd_schema(args),
         ProfileCommands::Guide(args) => cmd_guide(args),
@@ -163,15 +169,27 @@ fn build_skeleton(args: &ProfileInitArgs) -> serde_json::Value {
     }
     root.insert("meta".to_string(), serde_json::Value::Object(meta));
 
-    // security
-    let mut security = serde_json::Map::new();
-    let groups: Vec<serde_json::Value> = args
+    // groups (canonical: top-level include/exclude pair)
+    let mut groups = serde_json::Map::new();
+    let include: Vec<serde_json::Value> = args
         .groups
         .iter()
         .map(|g| serde_json::Value::String(g.clone()))
         .collect();
-    security.insert("groups".to_string(), serde_json::Value::Array(groups));
-    root.insert("security".to_string(), serde_json::Value::Object(security));
+    groups.insert("include".to_string(), serde_json::Value::Array(include));
+    if args.full {
+        groups.insert("exclude".to_string(), serde_json::Value::Array(vec![]));
+    }
+    root.insert("groups".to_string(), serde_json::Value::Object(groups));
+
+    // commands (only included with --full; allow/deny are deprecated since
+    // v0.33.0 but remain the canonical home for command gating until removed).
+    if args.full {
+        let mut commands = serde_json::Map::new();
+        commands.insert("allow".to_string(), serde_json::Value::Array(vec![]));
+        commands.insert("deny".to_string(), serde_json::Value::Array(vec![]));
+        root.insert("commands".to_string(), serde_json::Value::Object(commands));
+    }
 
     // workdir
     let mut workdir = serde_json::Map::new();
@@ -181,7 +199,9 @@ fn build_skeleton(args: &ProfileInitArgs) -> serde_json::Value {
     );
     root.insert("workdir".to_string(), serde_json::Value::Object(workdir));
 
-    // filesystem (minimal has allow + read; full adds all fields)
+    // filesystem (minimal has allow + read; full adds all fields, including
+    // the canonical replacements for the legacy `policy` patch keys —
+    // see deprecated_schema.rs for the migration mapping).
     let mut filesystem = serde_json::Map::new();
     filesystem.insert("allow".to_string(), serde_json::Value::Array(vec![]));
     filesystem.insert("read".to_string(), serde_json::Value::Array(vec![]));
@@ -190,6 +210,11 @@ fn build_skeleton(args: &ProfileInitArgs) -> serde_json::Value {
         filesystem.insert("allow_file".to_string(), serde_json::Value::Array(vec![]));
         filesystem.insert("read_file".to_string(), serde_json::Value::Array(vec![]));
         filesystem.insert("write_file".to_string(), serde_json::Value::Array(vec![]));
+        filesystem.insert("deny".to_string(), serde_json::Value::Array(vec![]));
+        filesystem.insert(
+            "bypass_protection".to_string(),
+            serde_json::Value::Array(vec![]),
+        );
     }
     root.insert(
         "filesystem".to_string(),
@@ -198,38 +223,6 @@ fn build_skeleton(args: &ProfileInitArgs) -> serde_json::Value {
 
     // Full skeleton adds additional sections
     if args.full {
-        // policy
-        let mut pol = serde_json::Map::new();
-        pol.insert(
-            "exclude_groups".to_string(),
-            serde_json::Value::Array(vec![]),
-        );
-        pol.insert(
-            "add_allow_read".to_string(),
-            serde_json::Value::Array(vec![]),
-        );
-        pol.insert(
-            "add_allow_write".to_string(),
-            serde_json::Value::Array(vec![]),
-        );
-        pol.insert(
-            "add_allow_readwrite".to_string(),
-            serde_json::Value::Array(vec![]),
-        );
-        pol.insert(
-            "add_deny_access".to_string(),
-            serde_json::Value::Array(vec![]),
-        );
-        pol.insert(
-            "add_deny_commands".to_string(),
-            serde_json::Value::Array(vec![]),
-        );
-        pol.insert(
-            "override_deny".to_string(),
-            serde_json::Value::Array(vec![]),
-        );
-        root.insert("policy".to_string(), serde_json::Value::Object(pol));
-
         // network
         // NOTE: network_profile is intentionally omitted. Emitting null would
         // clear an inherited proxy profile (e.g., "developer" from python-dev),
@@ -799,7 +792,17 @@ fn print_profile_line(name: &str, result: &Result<Profile>, t: &theme::Theme) {
 // nono profile show
 // ---------------------------------------------------------------------------
 
+#[allow(deprecated)] // reads profile.commands.{allow,deny} (deprecated v0.33.0)
 pub(crate) fn cmd_show(args: ProfileShowArgs) -> Result<()> {
+    // Order matters: `load_profile_extends` opens an internal
+    // `WarningSuppressionGuard` for its preview parse, so deprecation
+    // warnings fire only on the subsequent real `load_profile` call —
+    // exactly once per legacy key per file (the design's contract,
+    // line 141). DO NOT swap or merge these two calls without
+    // preserving that suppression scope, or warnings will double-emit.
+    // See the regression test `legacy_all_keys_shows_byte_equal_canonical_equivalent`
+    // in tests/deprecated_schema.rs which asserts the exact 9-warning
+    // count on `legacy_all_keys.json`.
     let raw_extends = profile::load_profile_extends(&args.profile);
     let profile = profile::load_profile_no_migrate(&args.profile)?;
 
@@ -843,22 +846,22 @@ pub(crate) fn cmd_show(args: ProfileShowArgs) -> Result<()> {
         );
     }
 
-    // Security groups
-    if !profile.security.groups.is_empty() {
+    // Security groups (resolved into `groups.include` by profile loading).
+    if !profile.groups.include.is_empty() {
         println!();
         println!("  {}", theme::fg("Security groups:", t.subtext).bold());
-        for g in &profile.security.groups {
+        for g in &profile.groups.include {
             println!("    {}", theme::fg(g, t.text));
         }
     }
 
-    if !profile.security.allowed_commands.is_empty() {
+    if !profile.commands.allow.is_empty() {
         println!();
         println!(
             "  {}",
             theme::fg("Allowed commands (deprecated, startup-only):", t.subtext).bold()
         );
-        for cmd in &profile.security.allowed_commands {
+        for cmd in &profile.commands.allow {
             println!("    {}", theme::fg(cmd, t.text));
         }
     }
@@ -897,7 +900,9 @@ pub(crate) fn cmd_show(args: ProfileShowArgs) -> Result<()> {
         || !fs.write.is_empty()
         || !fs.allow_file.is_empty()
         || !fs.read_file.is_empty()
-        || !fs.write_file.is_empty();
+        || !fs.write_file.is_empty()
+        || !fs.deny.is_empty()
+        || !fs.bypass_protection.is_empty();
 
     if has_fs {
         println!();
@@ -908,44 +913,49 @@ pub(crate) fn cmd_show(args: ProfileShowArgs) -> Result<()> {
         print_fs_paths("allow_file (r+w)", &fs.allow_file, t, args.raw);
         print_fs_paths("read_file", &fs.read_file, t, args.raw);
         print_fs_paths("write_file", &fs.write_file, t, args.raw);
+        print_fs_paths("deny", &fs.deny, t, args.raw);
+        if !fs.bypass_protection.is_empty() {
+            println!(
+                "    {}: {}",
+                theme::fg("bypass_protection", t.yellow),
+                fs.bypass_protection.join(", ")
+            );
+        }
     }
 
-    // Policy patches
-    let pp = &profile.policy;
-    let has_policy = !pp.exclude_groups.is_empty()
-        || !pp.add_allow_read.is_empty()
-        || !pp.add_allow_write.is_empty()
-        || !pp.add_allow_readwrite.is_empty()
-        || !pp.add_deny_access.is_empty()
-        || !pp.add_deny_commands.is_empty()
-        || !pp.override_deny.is_empty();
-
-    if has_policy {
+    // Groups/commands (canonical additions)
+    let has_group_settings =
+        !profile.groups.include.is_empty() || !profile.groups.exclude.is_empty();
+    let has_cmd_settings = !profile.commands.allow.is_empty() || !profile.commands.deny.is_empty();
+    if has_group_settings || has_cmd_settings {
         println!();
         println!("  {}", theme::fg("Policy patches:", t.subtext).bold());
-        if !pp.exclude_groups.is_empty() {
+        if !profile.groups.include.is_empty() {
             println!(
                 "    {}: {}",
-                theme::fg("exclude_groups", t.yellow),
-                pp.exclude_groups.join(", ")
+                theme::fg("groups.include", t.subtext),
+                profile.groups.include.join(", ")
             );
         }
-        print_fs_paths("add_allow_read", &pp.add_allow_read, t, args.raw);
-        print_fs_paths("add_allow_write", &pp.add_allow_write, t, args.raw);
-        print_fs_paths("add_allow_readwrite", &pp.add_allow_readwrite, t, args.raw);
-        print_fs_paths("add_deny_access", &pp.add_deny_access, t, args.raw);
-        if !pp.add_deny_commands.is_empty() {
+        if !profile.groups.exclude.is_empty() {
             println!(
                 "    {}: {}",
-                theme::fg("add_deny_commands (deprecated, startup-only)", t.yellow),
-                pp.add_deny_commands.join(", ")
+                theme::fg("groups.exclude", t.yellow),
+                profile.groups.exclude.join(", ")
             );
         }
-        if !pp.override_deny.is_empty() {
+        if !profile.commands.allow.is_empty() {
             println!(
                 "    {}: {}",
-                theme::fg("override_deny", t.yellow),
-                pp.override_deny.join(", ")
+                theme::fg("commands.allow", t.subtext),
+                profile.commands.allow.join(", ")
+            );
+        }
+        if !profile.commands.deny.is_empty() {
+            println!(
+                "    {}: {}",
+                theme::fg("commands.deny (deprecated, startup-only)", t.yellow),
+                profile.commands.deny.join(", ")
             );
         }
     }
@@ -1109,28 +1119,28 @@ fn print_fs_paths(label: &str, paths: &[String], t: &theme::Theme, raw: bool) {
     }
 }
 
+#[allow(deprecated)] // reads profile.commands.{allow,deny} (deprecated v0.33.0)
 fn profile_to_json(
-    name: &str,
+    _name: &str,
     profile: &Profile,
     raw_extends: &Option<Vec<String>>,
 ) -> serde_json::Value {
+    // `name` is taken from `profile.meta.name` (resolved at load time) rather
+    // than the invocation argument, so byte-equal comparison between two
+    // fixtures at different paths with the same logical profile works.
     let mut val = serde_json::json!({
-        "name": name,
+        "name": profile.meta.name,
         "description": profile.meta.description.as_deref().unwrap_or(""),
         "extends": raw_extends.as_ref().map(|v| serde_json::json!(v)).unwrap_or(serde_json::Value::Null),
     });
 
-    // Security. Build via Map so that Option<…> mode fields are *omitted* when
-    // None, matching the shape of hand-authored profile files (e.g. those
-    // produced by users) and the input schema accepted by `profile validate`.
-    // The enum types derive Serialize with the right rename_all annotations,
-    // so values render as snake_case (`isolated`, `allow_same_sandbox`, …).
+    // Security — narrow, process-level knobs only. Build via Map so that
+    // Option<…> mode fields are *omitted* when None, matching the shape of
+    // hand-authored profile files (e.g. those produced by users) and the
+    // input schema accepted by `profile validate`. The enum types derive
+    // Serialize with the right rename_all annotations, so values render as
+    // snake_case (`isolated`, `allow_same_sandbox`, …).
     let mut security = serde_json::Map::new();
-    security.insert("groups".into(), serde_json::json!(profile.security.groups));
-    security.insert(
-        "allowed_commands".into(),
-        serde_json::json!(profile.security.allowed_commands),
-    );
     if let Some(v) = profile.security.signal_mode {
         security.insert("signal_mode".into(), serde_json::json!(v));
     }
@@ -1149,7 +1159,9 @@ fn profile_to_json(
     }
     val["security"] = serde_json::Value::Object(security);
 
-    // Filesystem
+    // Filesystem (canonical schema — `allow`/`read`/`write`/`*_file`/`deny`/
+    // `bypass_protection`). Legacy keys deserialize into these fields via
+    // `deprecated_schema::LegacyPolicyPatch` before reaching `Profile`.
     val["filesystem"] = serde_json::json!({
         "allow": profile.filesystem.allow,
         "read": profile.filesystem.read,
@@ -1157,18 +1169,24 @@ fn profile_to_json(
         "allow_file": profile.filesystem.allow_file,
         "read_file": profile.filesystem.read_file,
         "write_file": profile.filesystem.write_file,
+        "deny": profile.filesystem.deny,
+        "bypass_protection": profile.filesystem.bypass_protection,
     });
 
-    // Policy patches
-    val["policy"] = serde_json::json!({
-        "exclude_groups": profile.policy.exclude_groups,
-        "add_allow_read": profile.policy.add_allow_read,
-        "add_allow_write": profile.policy.add_allow_write,
-        "add_allow_readwrite": profile.policy.add_allow_readwrite,
-        "add_deny_access": profile.policy.add_deny_access,
-        "add_deny_commands": profile.policy.add_deny_commands,
-        "override_deny": profile.policy.override_deny,
-    });
+    // Groups and commands are emitted only when populated, so default-empty
+    // profiles don't carry noise. This matches the canonical input shape.
+    if !profile.groups.include.is_empty() || !profile.groups.exclude.is_empty() {
+        val["groups"] = serde_json::json!({
+            "include": profile.groups.include,
+            "exclude": profile.groups.exclude,
+        });
+    }
+    if !profile.commands.allow.is_empty() || !profile.commands.deny.is_empty() {
+        val["commands"] = serde_json::json!({
+            "allow": profile.commands.allow,
+            "deny": profile.commands.deny,
+        });
+    }
 
     // Network
     val["network"] = serde_json::json!({
@@ -1246,6 +1264,7 @@ fn profile_to_json(
 // nono profile diff
 // ---------------------------------------------------------------------------
 
+#[allow(deprecated)] // reads commands.{allow,deny} (deprecated v0.33.0)
 pub(crate) fn cmd_diff(args: ProfileDiffArgs) -> Result<()> {
     let p1 = profile::load_profile_no_migrate(&args.profile1)?;
     let p2 = profile::load_profile_no_migrate(&args.profile2)?;
@@ -1267,8 +1286,8 @@ pub(crate) fn cmd_diff(args: ProfileDiffArgs) -> Result<()> {
     let mut any_diff = false;
 
     // Groups
-    let g1: BTreeSet<&str> = p1.security.groups.iter().map(|s| s.as_str()).collect();
-    let g2: BTreeSet<&str> = p2.security.groups.iter().map(|s| s.as_str()).collect();
+    let g1: BTreeSet<&str> = p1.groups.include.iter().map(|s| s.as_str()).collect();
+    let g2: BTreeSet<&str> = p2.groups.include.iter().map(|s| s.as_str()).collect();
     let added_groups: BTreeSet<&&str> = g2.difference(&g1).collect();
     let removed_groups: BTreeSet<&&str> = g1.difference(&g2).collect();
 
@@ -1321,49 +1340,24 @@ pub(crate) fn cmd_diff(args: ProfileDiffArgs) -> Result<()> {
         }
     }
 
-    // Policy patches
+    // Additional filesystem, groups, and commands diffs (formerly grouped
+    // under the legacy `policy.*` patches; now read from their canonical
+    // sections).
     let pp_diffs = diff_string_vecs(&[
+        ("groups.exclude", &p1.groups.exclude, &p2.groups.exclude),
+        ("filesystem.deny", &p1.filesystem.deny, &p2.filesystem.deny),
         (
-            "exclude_groups",
-            &p1.policy.exclude_groups,
-            &p2.policy.exclude_groups,
+            "filesystem.bypass_protection",
+            &p1.filesystem.bypass_protection,
+            &p2.filesystem.bypass_protection,
         ),
-        (
-            "add_allow_read",
-            &p1.policy.add_allow_read,
-            &p2.policy.add_allow_read,
-        ),
-        (
-            "add_allow_write",
-            &p1.policy.add_allow_write,
-            &p2.policy.add_allow_write,
-        ),
-        (
-            "add_allow_readwrite",
-            &p1.policy.add_allow_readwrite,
-            &p2.policy.add_allow_readwrite,
-        ),
-        (
-            "add_deny_access",
-            &p1.policy.add_deny_access,
-            &p2.policy.add_deny_access,
-        ),
-        (
-            "add_deny_commands",
-            &p1.policy.add_deny_commands,
-            &p2.policy.add_deny_commands,
-        ),
-        (
-            "override_deny",
-            &p1.policy.override_deny,
-            &p2.policy.override_deny,
-        ),
+        ("commands.deny", &p1.commands.deny, &p2.commands.deny),
     ]);
 
     if !pp_diffs.is_empty() {
         any_diff = true;
         println!();
-        println!("  {}:", theme::fg("Policy patches", t.subtext).bold());
+        println!("  {}:", theme::fg("Composition", t.subtext).bold());
         for (label, sign, val) in &pp_diffs {
             let color = if *sign == "+" { t.green } else { t.red };
             println!(
@@ -1515,18 +1509,8 @@ pub(crate) fn cmd_diff(args: ProfileDiffArgs) -> Result<()> {
     }
 
     // Allowed commands
-    let cmd1: BTreeSet<&str> = p1
-        .security
-        .allowed_commands
-        .iter()
-        .map(|s| s.as_str())
-        .collect();
-    let cmd2: BTreeSet<&str> = p2
-        .security
-        .allowed_commands
-        .iter()
-        .map(|s| s.as_str())
-        .collect();
+    let cmd1: BTreeSet<&str> = p1.commands.allow.iter().map(|s| s.as_str()).collect();
+    let cmd2: BTreeSet<&str> = p2.commands.allow.iter().map(|s| s.as_str()).collect();
     let added_cmds: BTreeSet<&&str> = cmd2.difference(&cmd1).collect();
     let removed_cmds: BTreeSet<&&str> = cmd1.difference(&cmd2).collect();
 
@@ -1869,9 +1853,10 @@ fn diff_string_vecs<'a>(
     result
 }
 
+#[allow(deprecated)] // reads commands.{allow,deny} (deprecated v0.33.0)
 fn diff_to_json(name1: &str, name2: &str, p1: &Profile, p2: &Profile) -> serde_json::Value {
-    let g1: BTreeSet<&str> = p1.security.groups.iter().map(|s| s.as_str()).collect();
-    let g2: BTreeSet<&str> = p2.security.groups.iter().map(|s| s.as_str()).collect();
+    let g1: BTreeSet<&str> = p1.groups.include.iter().map(|s| s.as_str()).collect();
+    let g2: BTreeSet<&str> = p2.groups.include.iter().map(|s| s.as_str()).collect();
 
     let groups_added: Vec<&str> = g2.difference(&g1).copied().collect();
     let groups_removed: Vec<&str> = g1.difference(&g2).copied().collect();
@@ -1894,10 +1879,10 @@ fn diff_to_json(name1: &str, name2: &str, p1: &Profile, p2: &Profile) -> serde_j
             "added": groups_added,
             "removed": groups_removed,
         },
-        "allowed_commands": diff_vec(
-            &p1.security.allowed_commands,
-            &p2.security.allowed_commands,
-        ),
+        "commands": {
+            "allow": diff_vec(&p1.commands.allow, &p2.commands.allow),
+            "deny": diff_vec(&p1.commands.deny, &p2.commands.deny),
+        },
         "capability_elevation": {
             "profile1": p1.security.capability_elevation,
             "profile2": p2.security.capability_elevation,
@@ -2188,6 +2173,19 @@ fn resolve_validate_target(input: &std::path::Path) -> std::path::PathBuf {
     input.to_path_buf()
 }
 
+fn resolve_validate_draft_target(input: &std::path::Path) -> Result<std::path::PathBuf> {
+    let name = input.to_str().ok_or_else(|| {
+        NonoError::ProfileParse(format!("invalid draft profile name '{}'", input.display()))
+    })?;
+    if !profile::is_valid_profile_name(name) {
+        return Err(NonoError::ProfileParse(format!(
+            "invalid draft profile name '{}'",
+            name
+        )));
+    }
+    profile::get_user_profile_draft_path(name)
+}
+
 pub(crate) fn cmd_validate(args: ProfileValidateArgs) -> Result<()> {
     let pol = policy::load_embedded_policy()?;
     let mut errors: Vec<String> = Vec::new();
@@ -2198,9 +2196,21 @@ pub(crate) fn cmd_validate(args: ProfileValidateArgs) -> Result<()> {
     // `args.file = PathBuf::from("claude-docs")`. If that doesn't exist as
     // a file, treat it as a profile name and look it up the same way
     // `--profile` does.
-    let target_path = resolve_validate_target(&args.file);
+    let target_path = if args.draft {
+        resolve_validate_draft_target(&args.file)?
+    } else {
+        resolve_validate_target(&args.file)
+    };
 
-    // Step 1: Load profile (parse JSON + resolve inheritance)
+    // Step 1: Load profile (parse JSON + resolve inheritance).
+    //
+    // Open a WarningCounterGuard scope around the single parse so each
+    // `emit_deprecation_warning` call triggered inside the legacy drain is
+    // counted. `cmd_validate` only parses once (unlike `cmd_show`, which
+    // invokes `load_profile_extends` then `load_profile`), so the count
+    // matches exactly the number of deprecation lines printed — no
+    // dedupe or state walking required.
+    let guard = crate::deprecation_warnings::WarningCounterGuard::begin();
     let profile = match profile::load_profile_from_path(&target_path) {
         Ok(p) => Some(p),
         Err(e) => {
@@ -2209,17 +2219,18 @@ pub(crate) fn cmd_validate(args: ProfileValidateArgs) -> Result<()> {
             None
         }
     };
+    let deprecation_count = guard.finish();
 
     if let Some(ref profile) = profile {
         // Step 2: Check group references
-        for group_name in &profile.security.groups {
+        for group_name in &profile.groups.include {
             if !pol.groups.contains_key(group_name) {
                 errors.push(format!("Group '{}' not found in policy.json", group_name));
             }
         }
 
         // Step 3: Check exclude_groups
-        for excl in &profile.policy.exclude_groups {
+        for excl in &profile.groups.exclude {
             if let Some(group) = pol.groups.get(excl) {
                 if group.required {
                     errors.push(format!("Cannot exclude required group '{}'", excl));
@@ -2251,10 +2262,15 @@ pub(crate) fn cmd_validate(args: ProfileValidateArgs) -> Result<()> {
             "valid": errors.is_empty(),
             "errors": errors,
             "warnings": warnings,
+            "deprecated_keys": deprecation_count,
         });
         println!("{}", to_json(&val)?);
+        emit_deprecation_summary(deprecation_count);
         if !errors.is_empty() {
             return Err(NonoError::ProfileParse("validation failed".into()));
+        }
+        if args.strict && deprecation_count > 0 {
+            std::process::exit(2);
         }
         return Ok(());
     }
@@ -2273,12 +2289,12 @@ pub(crate) fn cmd_validate(args: ProfileValidateArgs) -> Result<()> {
 
     if let Some(ref profile) = profile {
         let valid_groups = profile
-            .security
             .groups
+            .include
             .iter()
             .filter(|g| pol.groups.contains_key(g.as_str()))
             .count();
-        let total_groups = profile.security.groups.len();
+        let total_groups = profile.groups.include.len();
         if valid_groups == total_groups && total_groups > 0 {
             println!(
                 "  {}  All {} group references valid",
@@ -2316,6 +2332,10 @@ pub(crate) fn cmd_validate(args: ProfileValidateArgs) -> Result<()> {
             theme::fg("valid", t.green).bold(),
             theme::fg(&suffix, t.yellow)
         );
+        emit_deprecation_summary(deprecation_count);
+        if args.strict && deprecation_count > 0 {
+            std::process::exit(2);
+        }
         Ok(())
     } else {
         println!(
@@ -2324,8 +2344,324 @@ pub(crate) fn cmd_validate(args: ProfileValidateArgs) -> Result<()> {
             errors.len(),
             if errors.len() == 1 { "" } else { "s" }
         );
+        emit_deprecation_summary(deprecation_count);
         Err(NonoError::ProfileParse("validation failed".into()))
     }
+}
+
+// ---------------------------------------------------------------------------
+// nono profile promote
+// ---------------------------------------------------------------------------
+
+pub(crate) fn cmd_promote(args: ProfilePromoteArgs) -> Result<()> {
+    if args.diff && args.yes {
+        return Err(NonoError::ProfileParse(
+            "`--diff` cannot be combined with `--yes`".to_string(),
+        ));
+    }
+    if !profile::is_valid_profile_name(&args.name) {
+        return Err(NonoError::ProfileParse(format!(
+            "invalid draft profile name '{}'",
+            args.name
+        )));
+    }
+
+    let draft_path = profile::get_user_profile_draft_path(&args.name)?;
+    let base_path = profile::get_user_profile_draft_base_path(&args.name)?;
+    let target_path = profile::get_user_profile_path(&args.name)?;
+
+    let draft_bytes = read_regular_file(&draft_path, "profile draft")?;
+    let raw_profile = profile::parse_profile_bytes(&draft_bytes)?;
+    if raw_profile.meta.name != args.name {
+        return Err(NonoError::ProfileParse(format!(
+            "draft meta.name '{}' does not match draft name '{}'",
+            raw_profile.meta.name, args.name
+        )));
+    }
+    let resolved_profile = profile::resolve_and_finalize_profile(raw_profile)?;
+    validate_promote_profile(&resolved_profile)?;
+
+    let target_exists = regular_file_exists(&target_path, "target profile")?;
+    let current_bytes = if target_exists {
+        Some(read_regular_file(&target_path, "target profile")?)
+    } else {
+        None
+    };
+
+    if current_bytes.is_none() {
+        if let Some(source) = reserved_profile_source(&args.name)? {
+            return Err(NonoError::ProfileParse(format!(
+                "refusing to promote '{}' because it would shadow a {source} profile. \
+                 Draft a derived profile such as '{}-local' with \"extends\": \"{}\" instead.",
+                args.name, args.name, args.name
+            )));
+        }
+    }
+
+    if let Some(current) = current_bytes.as_deref() {
+        verify_base_hash(&base_path, current)?;
+    }
+
+    print_promote_diff(&args.name, current_bytes.as_deref(), &draft_bytes);
+    if args.diff {
+        return Ok(());
+    }
+
+    if !args.yes && !crate::profile_save_runtime::confirm("Promote this draft? [y/N] ", false)? {
+        eprintln!("{} promotion skipped", prefix());
+        return Ok(());
+    }
+
+    atomic_write_file(&target_path, &draft_bytes)?;
+    let _ = fs::remove_file(&draft_path);
+    let _ = fs::remove_file(&base_path);
+
+    eprintln!(
+        "{} Promoted draft to {}",
+        prefix(),
+        target_path.display().to_string().bold()
+    );
+    Ok(())
+}
+
+fn validate_promote_profile(profile: &Profile) -> Result<()> {
+    let pol = policy::load_embedded_policy()?;
+    let mut errors = Vec::new();
+
+    for group_name in &profile.groups.include {
+        if !pol.groups.contains_key(group_name) {
+            errors.push(format!("group '{}' not found in policy.json", group_name));
+        }
+    }
+
+    for excluded in &profile.groups.exclude {
+        match pol.groups.get(excluded) {
+            Some(group) if group.required => {
+                errors.push(format!("cannot exclude required group '{}'", excluded));
+            }
+            Some(_) | None => {}
+        }
+    }
+
+    for (label, paths) in [
+        ("filesystem.allow", &profile.filesystem.allow),
+        ("filesystem.read", &profile.filesystem.read),
+        ("filesystem.write", &profile.filesystem.write),
+        ("filesystem.allow_file", &profile.filesystem.allow_file),
+        ("filesystem.read_file", &profile.filesystem.read_file),
+        ("filesystem.write_file", &profile.filesystem.write_file),
+    ] {
+        if paths.iter().any(|path| path.trim().is_empty()) {
+            errors.push(format!("empty path in {label}"));
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(NonoError::ProfileParse(format!(
+            "draft profile failed validation: {}",
+            errors.join("; ")
+        )))
+    }
+}
+
+fn reserved_profile_source(name: &str) -> Result<Option<&'static str>> {
+    let pol = policy::load_embedded_policy()?;
+    if pol.profiles.contains_key(name) {
+        return Ok(Some("built-in"));
+    }
+    if profile::find_pack_store_profile(name).is_some() {
+        return Ok(Some("installed pack"));
+    }
+    Ok(None)
+}
+
+fn verify_base_hash(base_path: &Path, current_bytes: &[u8]) -> Result<()> {
+    let base_bytes = read_regular_file(base_path, "profile draft base hash")?;
+    let provided = std::str::from_utf8(&base_bytes)
+        .map_err(|e| NonoError::ProfileParse(format!("base hash is not UTF-8: {e}")))?
+        .trim();
+    if provided.len() != 64 || !provided.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(NonoError::ProfileParse(format!(
+            "invalid base hash in {}",
+            base_path.display()
+        )));
+    }
+
+    let current = sha256_hex(current_bytes);
+    if !provided.eq_ignore_ascii_case(&current) {
+        return Err(NonoError::ProfileParse(
+            "draft base hash does not match current profile. The profile changed after the draft was written; regenerate or review the draft before promoting."
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn read_regular_file(path: &Path, label: &str) -> Result<Vec<u8>> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        options.custom_flags(nix::libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(path).map_err(|e| NonoError::ProfileRead {
+        path: path.to_path_buf(),
+        source: e,
+    })?;
+    let metadata = file.metadata().map_err(|e| NonoError::ProfileRead {
+        path: path.to_path_buf(),
+        source: e,
+    })?;
+    if !metadata.file_type().is_file() {
+        return Err(NonoError::ProfileParse(format!(
+            "{label} is not a regular file: {}",
+            path.display()
+        )));
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|e| NonoError::ProfileRead {
+            path: path.to_path_buf(),
+            source: e,
+        })?;
+    Ok(bytes)
+}
+
+fn regular_file_exists(path: &Path, label: &str) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                return Err(NonoError::ProfileParse(format!(
+                    "{label} must not be a symlink: {}",
+                    path.display()
+                )));
+            }
+            if !metadata.file_type().is_file() {
+                return Err(NonoError::ProfileParse(format!(
+                    "{label} is not a regular file: {}",
+                    path.display()
+                )));
+            }
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(NonoError::ProfileRead {
+            path: path.to_path_buf(),
+            source: error,
+        }),
+    }
+}
+
+fn atomic_write_file(path: &Path, contents: &[u8]) -> Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        NonoError::ProfileParse(format!("invalid profile path {}", path.display()))
+    })?;
+    fs::create_dir_all(parent).map_err(|e| NonoError::ProfileRead {
+        path: parent.to_path_buf(),
+        source: e,
+    })?;
+
+    let file_name = path.file_name().ok_or_else(|| {
+        NonoError::ProfileParse(format!("invalid profile path {}", path.display()))
+    })?;
+    let mut tmp_name = std::ffi::OsString::from(".");
+    tmp_name.push(file_name);
+    tmp_name.push(format!(".tmp.{}", std::process::id()));
+    let tmp_path = parent.join(tmp_name);
+
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&tmp_path)
+        .map_err(|e| NonoError::ProfileRead {
+            path: tmp_path.clone(),
+            source: e,
+        })?;
+    if let Err(error) = file.write_all(contents) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(NonoError::ProfileRead {
+            path: tmp_path,
+            source: error,
+        });
+    }
+    if let Err(error) = file.sync_all() {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(NonoError::ProfileRead {
+            path: tmp_path,
+            source: error,
+        });
+    }
+    drop(file);
+
+    if let Err(error) = fs::rename(&tmp_path, path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(NonoError::ProfileRead {
+            path: path.to_path_buf(),
+            source: error,
+        });
+    }
+    Ok(())
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn print_promote_diff(name: &str, current: Option<&[u8]>, draft: &[u8]) {
+    use similar::{ChangeTag, TextDiff};
+
+    let old_text = current
+        .map(String::from_utf8_lossy)
+        .unwrap_or_else(|| "".into());
+    let new_text = String::from_utf8_lossy(draft);
+    let t = theme::current();
+
+    println!(
+        "{}: promote draft '{}'",
+        prefix(),
+        theme::fg(name, t.text).bold()
+    );
+    println!();
+    println!("  {}", theme::fg("Diff:", t.subtext).bold());
+    println!("--- profiles/{name}.json");
+    println!("+++ profile-drafts/{name}.json");
+
+    let diff = TextDiff::from_lines(&old_text, &new_text);
+    let mut changed = false;
+    for change in diff.iter_all_changes() {
+        match change.tag() {
+            ChangeTag::Delete => {
+                changed = true;
+                print!("{}", format!("-{change}").red());
+            }
+            ChangeTag::Insert => {
+                changed = true;
+                print!("{}", format!("+{change}").green());
+            }
+            ChangeTag::Equal => print!(" {change}"),
+        }
+    }
+    if !changed {
+        println!("  {}", theme::fg("(no differences)", t.subtext));
+    }
+    println!();
+}
+
+/// Print the deprecation summary line to stderr when any legacy keys were
+/// encountered during `cmd_validate`'s parse. No-op when `count == 0` to
+/// keep canonical profiles silent.
+fn emit_deprecation_summary(count: usize) {
+    if count == 0 {
+        return;
+    }
+    let _ = writeln!(
+        std::io::stderr(),
+        "found {count} deprecated keys; run 'nono profile guide' for migration mapping"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -2336,6 +2672,7 @@ pub(crate) fn cmd_validate(args: ProfileValidateArgs) -> Result<()> {
 ///
 /// This produces a fully-resolved, portable manifest with absolute paths.
 /// Environment variables (`~`, `$HOME`, `$TMPDIR`, etc.) are expanded.
+#[allow(deprecated)] // reads commands.{allow,deny} (deprecated v0.33.0)
 fn resolve_to_manifest(
     prof: &Profile,
     workdir: &std::path::Path,
@@ -2371,21 +2708,6 @@ fn resolve_to_manifest(
             manifest::AccessMode::Write,
             true,
         ),
-        (
-            &prof.policy.add_allow_read,
-            manifest::AccessMode::Read,
-            false,
-        ),
-        (
-            &prof.policy.add_allow_write,
-            manifest::AccessMode::Write,
-            false,
-        ),
-        (
-            &prof.policy.add_allow_readwrite,
-            manifest::AccessMode::Readwrite,
-            false,
-        ),
     ];
 
     for (paths, access, is_file) in fs_sources {
@@ -2393,8 +2715,8 @@ fn resolve_to_manifest(
             grants.push(make_fs_grant(&expand(p)?, *access, *is_file)?);
         }
     }
-    // Deny paths from policy patches
-    for p in &prof.policy.add_deny_access {
+    // Deny paths from canonical `filesystem.deny`
+    for p in &prof.filesystem.deny {
         let expanded = expand(p)?;
         deny.push(manifest::FsDeny {
             path: expanded
@@ -2403,13 +2725,14 @@ fn resolve_to_manifest(
         });
     }
 
-    // Resolve security.groups → filesystem grants, deny paths, and blocked commands.
-    // Groups are the primary source of system read paths, deny rules, and dangerous
-    // command blocks. Without this, the exported manifest is weaker than the profile.
+    // Resolve groups.include → filesystem grants, deny paths, and blocked
+    // commands. Groups are the primary source of system read paths, deny
+    // rules, and dangerous command blocks. Without this, the exported
+    // manifest is weaker than the profile.
     let loaded_policy = policy::load_embedded_policy()?;
     let mut scratch_caps = nono::CapabilitySet::new();
     let resolved_groups =
-        policy::resolve_groups(&loaded_policy, &prof.security.groups, &mut scratch_caps)?;
+        policy::resolve_groups(&loaded_policy, &prof.groups.include, &mut scratch_caps)?;
 
     // Add filesystem grants from resolved groups
     for cap in scratch_caps.fs_capabilities() {
@@ -2422,12 +2745,13 @@ fn resolve_to_manifest(
         grants.push(make_fs_grant(&path_str, access, cap.is_file)?);
     }
 
-    // Expand override_deny paths so we can filter them out of the deny list.
-    // The manifest is the fully-resolved output — overridden denies must not
-    // appear, otherwise the manifest re-applies restrictions the profile relaxed.
-    let override_deny_expanded: Vec<std::path::PathBuf> = prof
-        .policy
-        .override_deny
+    // Expand bypass_protection paths so we can filter them out of the deny
+    // list. The manifest is the fully-resolved output — overridden denies
+    // must not appear, otherwise the manifest re-applies restrictions the
+    // profile relaxed.
+    let bypass_protection_expanded: Vec<std::path::PathBuf> = prof
+        .filesystem
+        .bypass_protection
         .iter()
         .filter_map(|tmpl| profile::expand_vars(tmpl, workdir).ok())
         .map(|p| {
@@ -2440,11 +2764,11 @@ fn resolve_to_manifest(
         .collect();
 
     // Add deny paths from resolved groups, filtering out overridden paths.
-    for deny_path in resolved_groups
-        .deny_paths
-        .iter()
-        .filter(|dp| !override_deny_expanded.iter().any(|ovr| dp.starts_with(ovr)))
-    {
+    for deny_path in resolved_groups.deny_paths.iter().filter(|dp| {
+        !bypass_protection_expanded
+            .iter()
+            .any(|ovr| dp.starts_with(ovr))
+    }) {
         let path_str = deny_path.to_string_lossy().into_owned();
         deny.push(manifest::FsDeny {
             path: path_str
@@ -2570,10 +2894,10 @@ fn resolve_to_manifest(
     };
 
     let process = Some(manifest::Process {
-        allowed_commands: prof.security.allowed_commands.clone(),
+        allowed_commands: prof.commands.allow.clone(),
         blocked_commands: {
             let mut cmds = group_blocked_commands;
-            cmds.extend(prof.policy.add_deny_commands.clone());
+            cmds.extend(prof.commands.deny.clone());
             cmds.sort();
             cmds.dedup();
             cmds
@@ -2786,7 +3110,7 @@ mod tests {
             force: false,
         };
         let skeleton = build_skeleton(&args);
-        let groups = skeleton["security"]["groups"].as_array().expect("array");
+        let groups = skeleton["groups"]["include"].as_array().expect("array");
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0], "deny_credentials");
     }
@@ -2928,8 +3252,13 @@ mod tests {
         // Full has more keys than minimal
         assert!(full_obj.len() > minimal_obj.len());
 
-        // Full has sections that minimal does not
-        assert!(full_obj.contains_key("policy"));
+        // Full has sections that minimal does not.
+        // No top-level `policy` key: per #594 the legacy `policy.*` keys
+        // (exclude_groups, add_allow_*, add_deny_*, override_deny) are gone
+        // and their canonical homes are top-level `groups.exclude`,
+        // `commands.deny`, and `filesystem.{deny,bypass_protection,read,write,allow}`.
+        assert!(!full_obj.contains_key("policy"));
+        assert!(full_obj.contains_key("commands"));
         assert!(full_obj.contains_key("network"));
         assert!(full_obj.contains_key("env_credentials"));
         assert!(full_obj.contains_key("hooks"));
@@ -2941,25 +3270,41 @@ mod tests {
         assert!(!full_obj.contains_key("allow_launch_services"));
         assert!(!full_obj.contains_key("allow_gpu"));
 
-        assert!(!minimal_obj.contains_key("policy"));
+        assert!(!minimal_obj.contains_key("commands"));
         assert!(!minimal_obj.contains_key("network"));
         assert!(!minimal_obj.contains_key("hooks"));
 
-        // Full filesystem has all fields
+        // Full filesystem has all canonical fields, including the new
+        // `deny` and `bypass_protection` (canonical replacements for the
+        // legacy `policy` patch — see deprecated_schema.rs).
         let full_fs = full_obj["filesystem"].as_object().expect("fs object");
         assert!(full_fs.contains_key("write"));
         assert!(full_fs.contains_key("allow_file"));
         assert!(full_fs.contains_key("read_file"));
         assert!(full_fs.contains_key("write_file"));
+        assert!(full_fs.contains_key("deny"));
+        assert!(full_fs.contains_key("bypass_protection"));
 
-        // Minimal filesystem has only allow + read
+        // Minimal filesystem has only allow + read; the canonical deny /
+        // bypass_protection appear only with --full.
         let min_fs = minimal_obj["filesystem"].as_object().expect("fs object");
         assert!(!min_fs.contains_key("write"));
         assert!(!min_fs.contains_key("allow_file"));
+        assert!(!min_fs.contains_key("deny"));
+        assert!(!min_fs.contains_key("bypass_protection"));
 
-        // Full policy has add_deny_access
-        let full_pol = full_obj["policy"].as_object().expect("policy object");
-        assert!(full_pol.contains_key("add_deny_access"));
+        // Full groups has both include and exclude; minimal has only include.
+        let full_groups = full_obj["groups"].as_object().expect("groups object");
+        assert!(full_groups.contains_key("include"));
+        assert!(full_groups.contains_key("exclude"));
+        let min_groups = minimal_obj["groups"].as_object().expect("groups object");
+        assert!(min_groups.contains_key("include"));
+        assert!(!min_groups.contains_key("exclude"));
+
+        // Full commands has both allow and deny.
+        let full_cmds = full_obj["commands"].as_object().expect("commands object");
+        assert!(full_cmds.contains_key("allow"));
+        assert!(full_cmds.contains_key("deny"));
 
         // Full network has all fields
         let full_net = full_obj["network"].as_object().expect("network object");
@@ -2968,6 +3313,60 @@ mod tests {
         assert!(full_net.contains_key("open_port"));
         assert!(full_net.contains_key("listen_port"));
         assert!(full_net.contains_key("custom_credentials"));
+    }
+
+    #[test]
+    fn test_full_skeleton_emits_zero_deprecation_warnings() {
+        // The init skeleton is the canonical "how do I write a profile"
+        // entrypoint. It must not teach any deprecated keys; loading it
+        // through the normal Profile parse path must emit zero deprecation
+        // warnings via WarningCounterGuard.
+        use crate::deprecation_warnings::WarningCounterGuard;
+
+        let args = ProfileInitArgs {
+            name: "skeleton-zero-warn".to_string(),
+            extends: Some("default".to_string()),
+            groups: vec![],
+            description: None,
+            full: true,
+            output: None,
+            force: false,
+        };
+        let skeleton = build_skeleton(&args);
+        let json = serde_json::to_string(&skeleton).expect("serialize");
+
+        let guard = WarningCounterGuard::begin();
+        let _profile: Profile = serde_json::from_str(&json).expect("deserialize");
+        let count = guard.finish();
+        assert_eq!(
+            count, 0,
+            "build_skeleton --full produced {count} deprecation warning(s); skeleton must use canonical schema only"
+        );
+    }
+
+    #[test]
+    fn test_minimal_skeleton_emits_zero_deprecation_warnings() {
+        use crate::deprecation_warnings::WarningCounterGuard;
+
+        let args = ProfileInitArgs {
+            name: "skeleton-min-zero-warn".to_string(),
+            extends: None,
+            groups: vec![],
+            description: None,
+            full: false,
+            output: None,
+            force: false,
+        };
+        let skeleton = build_skeleton(&args);
+        let json = serde_json::to_string(&skeleton).expect("serialize");
+
+        let guard = WarningCounterGuard::begin();
+        let _profile: Profile = serde_json::from_str(&json).expect("deserialize");
+        let count = guard.finish();
+        assert_eq!(
+            count, 0,
+            "build_skeleton minimal produced {count} deprecation warning(s)"
+        );
     }
 
     #[test]
@@ -3026,12 +3425,12 @@ mod tests {
     fn test_show_resolves_inheritance() {
         let profile = profile::load_profile("opencode").expect("opencode profile should load");
         assert!(
-            !profile.security.groups.is_empty(),
-            "codex should have security groups"
+            !profile.groups.include.is_empty(),
+            "opencode should have groups"
         );
-        // codex extends default, so it should have default's base groups
-        let has_deny = profile.security.groups.iter().any(|g| g.contains("deny"));
-        assert!(has_deny, "codex should inherit deny groups");
+        // opencode extends default, so it should have default's base groups
+        let has_deny = profile.groups.include.iter().any(|g| g.contains("deny"));
+        assert!(has_deny, "opencode should inherit deny groups");
     }
 
     #[test]
@@ -3039,8 +3438,8 @@ mod tests {
         let p1 = profile::load_profile("default").expect("default should load");
         let p2 = profile::load_profile("opencode").expect("opencode should load");
 
-        let g1: BTreeSet<&str> = p1.security.groups.iter().map(|s| s.as_str()).collect();
-        let g2: BTreeSet<&str> = p2.security.groups.iter().map(|s| s.as_str()).collect();
+        let g1: BTreeSet<&str> = p1.groups.include.iter().map(|s| s.as_str()).collect();
+        let g2: BTreeSet<&str> = p2.groups.include.iter().map(|s| s.as_str()).collect();
 
         let added: BTreeSet<&&str> = g2.difference(&g1).collect();
         assert!(
@@ -3057,7 +3456,7 @@ mod tests {
             &path,
             r#"{
                 "meta": { "name": "test", "description": "test profile" },
-                "security": { "groups": ["deny_credentials"] },
+                "groups": { "include": ["deny_credentials"] },
                 "workdir": { "access": "readwrite" }
             }"#,
         )
@@ -3065,7 +3464,10 @@ mod tests {
 
         let args = ProfileValidateArgs {
             file: path,
+            draft: false,
             json: false,
+            strict: false,
+            help: None,
         };
         let result = cmd_validate(args);
         assert!(result.is_ok(), "valid profile should pass validation");
@@ -3079,14 +3481,17 @@ mod tests {
             &path,
             r#"{
                 "meta": { "name": "test" },
-                "security": { "groups": ["nonexistent_group_xyz"] }
+                "groups": { "include": ["nonexistent_group_xyz"] }
             }"#,
         )
         .expect("write");
 
         let args = ProfileValidateArgs {
             file: path,
+            draft: false,
             json: false,
+            strict: false,
+            help: None,
         };
         let result = cmd_validate(args);
         assert!(result.is_err(), "invalid group should fail validation");
@@ -3100,20 +3505,150 @@ mod tests {
             &path,
             r#"{
                 "meta": { "name": "test" },
-                "security": { "groups": [] },
-                "policy": { "exclude_groups": ["deny_credentials"] }
+                "groups": { "include": [], "exclude": ["deny_credentials"] }
             }"#,
         )
         .expect("write");
 
         let args = ProfileValidateArgs {
             file: path,
+            draft: false,
             json: false,
+            strict: false,
+            help: None,
         };
         let result = cmd_validate(args);
         assert!(
             result.is_err(),
             "excluding required group should fail validation"
+        );
+    }
+
+    #[test]
+    fn promote_creates_new_profile_from_draft_and_removes_draft() {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let xdg = dir.path().join("config");
+        std::fs::create_dir_all(&xdg).expect("create xdg");
+        let xdg_str = xdg.to_str().expect("utf8 xdg");
+        let _env = crate::test_env::EnvVarGuard::set_all(&[("XDG_CONFIG_HOME", xdg_str)]);
+
+        let draft_dir = profile::user_profile_draft_dir().expect("draft dir");
+        std::fs::create_dir_all(&draft_dir).expect("create drafts");
+        let draft_path = profile::get_user_profile_draft_path("agent-local").expect("draft path");
+        std::fs::write(
+            &draft_path,
+            r#"{
+  "meta": { "name": "agent-local" },
+  "filesystem": { "read": ["/tmp"] }
+}
+"#,
+        )
+        .expect("write draft");
+
+        let result = cmd_promote(ProfilePromoteArgs {
+            name: "agent-local".to_string(),
+            diff: false,
+            yes: true,
+            help: None,
+        });
+        assert!(result.is_ok(), "promote should succeed: {result:?}");
+        let target = profile::get_user_profile_path("agent-local").expect("target path");
+        assert!(target.exists(), "target profile should exist");
+        assert!(
+            !draft_path.exists(),
+            "draft should be removed after promote"
+        );
+    }
+
+    #[test]
+    fn promote_existing_profile_requires_matching_base_hash() {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let xdg = dir.path().join("config");
+        std::fs::create_dir_all(&xdg).expect("create xdg");
+        let xdg_str = xdg.to_str().expect("utf8 xdg");
+        let _env = crate::test_env::EnvVarGuard::set_all(&[("XDG_CONFIG_HOME", xdg_str)]);
+
+        let profiles_dir = profile::user_profile_dir().expect("profile dir");
+        let draft_dir = profile::user_profile_draft_dir().expect("draft dir");
+        std::fs::create_dir_all(&profiles_dir).expect("create profiles");
+        std::fs::create_dir_all(&draft_dir).expect("create drafts");
+
+        let target = profile::get_user_profile_path("agent-local").expect("target path");
+        let old = b"{\n  \"meta\": { \"name\": \"agent-local\" },\n  \"filesystem\": { \"read\": [\"/tmp\"] }\n}\n";
+        std::fs::write(&target, old).expect("write target");
+        let draft = profile::get_user_profile_draft_path("agent-local").expect("draft path");
+        std::fs::write(
+            &draft,
+            "{\n  \"meta\": { \"name\": \"agent-local\" },\n  \"filesystem\": { \"read\": [\"/var/tmp\"] }\n}\n",
+        )
+        .expect("write draft");
+
+        let missing_base = cmd_promote(ProfilePromoteArgs {
+            name: "agent-local".to_string(),
+            diff: false,
+            yes: true,
+            help: None,
+        });
+        assert!(
+            missing_base.is_err(),
+            "existing profile promote must require .base"
+        );
+
+        let base = profile::get_user_profile_draft_base_path("agent-local").expect("base path");
+        std::fs::write(&base, sha256_hex(old)).expect("write base");
+        let result = cmd_promote(ProfilePromoteArgs {
+            name: "agent-local".to_string(),
+            diff: false,
+            yes: true,
+            help: None,
+        });
+        assert!(result.is_ok(), "promote should succeed: {result:?}");
+        let promoted = std::fs::read_to_string(&target).expect("read promoted");
+        assert!(promoted.contains("/var/tmp"));
+    }
+
+    #[test]
+    fn promote_refuses_to_shadow_builtin_profile() {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let xdg = dir.path().join("config");
+        std::fs::create_dir_all(&xdg).expect("create xdg");
+        let xdg_str = xdg.to_str().expect("utf8 xdg");
+        let _env = crate::test_env::EnvVarGuard::set_all(&[("XDG_CONFIG_HOME", xdg_str)]);
+
+        let draft_dir = profile::user_profile_draft_dir().expect("draft dir");
+        std::fs::create_dir_all(&draft_dir).expect("create drafts");
+        let draft_path = profile::get_user_profile_draft_path("default").expect("draft path");
+        std::fs::write(
+            &draft_path,
+            r#"{
+  "meta": { "name": "default" },
+  "filesystem": { "read": ["/tmp"] }
+}
+"#,
+        )
+        .expect("write draft");
+
+        let result = cmd_promote(ProfilePromoteArgs {
+            name: "default".to_string(),
+            diff: false,
+            yes: true,
+            help: None,
+        });
+        assert!(
+            result.is_err(),
+            "promote should refuse to shadow built-in profiles"
         );
     }
 }

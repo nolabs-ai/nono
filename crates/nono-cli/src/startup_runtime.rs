@@ -15,7 +15,7 @@ use std::process::{Child, Command, Stdio};
 pub(crate) fn allows_pre_exec_update_check(command: &Commands) -> bool {
     !matches!(
         command,
-        Commands::Run(_) | Commands::Shell(_) | Commands::Wrap(_)
+        Commands::Run(_) | Commands::Shell(_) | Commands::Wrap(_) | Commands::Completions(_)
     )
 }
 

@@ -1,11 +1,11 @@
 ---
-title: Pack Publishing Setup
+title: Publishing Packs
 description: End-to-end setup for nono packs, trusted publishing, and the GitHub Action
 ---
 
 This guide is the producer-side setup for nono packs. It covers pack layout, trusted publisher registration, GitHub Actions publishing, releases for monorepos that ship multiple packs, and the checks `nono pull` performs on the consumer side.
 
-A nono pack is a signed bundle of artifacts — profiles, hooks, plugins, instructions, scripts, trust policies, groups — distributed via the registry and verified with Sigstore at install time. Packs are the recommended way to ship anything that used to be a built-in profile or a hand-installed agent integration.
+A nono pack is a signed bundle of artifacts — profiles, hooks, plugins, instructions, scripts, trust policies, groups — distributed via the registry and verified with Sigstore at install time. Packs are the recommended way to ship agent profiles, plugins, and integrations.
 
 If you're authoring a Claude Code plugin pack specifically (the most common case today), read this guide for the publishing scaffolding and then jump to [Claude Code Plugin Packs](/cli/clients/claude-code) for the marketplace wiring details that nono synthesises automatically on `nono pull`.
 
@@ -32,7 +32,7 @@ A pack is a signed bundle of artifacts. The CLI supports these artifact types:
 - `hook` — a hook script for an agent (legacy; new packs should use `plugin`)
 - `instruction` — a markdown context file (e.g. `CLAUDE.md`) optionally copied into the project on `nono pull --init`
 - `trust_policy` — a trust policy bundle merged into the user's local trust state
-- `groups` — additional capability groups, prefixed to avoid collision with built-ins
+- `groups` — additional capability groups, prefixed to avoid collision with preset groups
 - `script` — a helper script installed under the pack's script directory
 - `plugin` — a file that lives at its declared path inside the pack store. Used for assets that live alongside the profile (a Claude Code plugin's `.claude-plugin/plugin.json`, `hooks/hooks.json`, `bin/*.sh`, `skills/*/SKILL.md`, etc.). Files with an `install_dir` are also fan-out copied into the user's home; without one, they stay in the pack store and are exposed to the agent via a single symlink.
 
@@ -87,14 +87,14 @@ Important constraints:
 - `name` must match the pack name registered with the registry.
 - Every `artifacts[].path` must exactly match an uploaded filename.
 - `profile` artifacts need `install_as` — the name users type after `--profile`.
-- `groups` artifacts need `prefix` — must namespace your group names so they don't clash with built-ins.
+- `groups` artifacts need `prefix` — must namespace your group names so they don't clash with preset groups.
 - `instruction` artifacts with `placement: "project"` are copied into the current working directory when users run `nono pull --init`.
 - `plugin` artifacts without `install_dir` install at their relative path inside the pack store. With `install_dir`, they're also fan-out copied into the user's home — useful for shared scripts but rarely needed for Claude Code packs (the marketplace symlink exposes the whole pack tree).
 - `min_nono_version` should be set to the lowest CLI version your pack will work on. Older clients refuse to install.
 
-### Profiles That Replace a Former Built-in
+### Profiles That Replace a Former Preset
 
-If your pack ships a profile with an `install_as` name that used to be compiled into the CLI (e.g. `claude-code` was built-in until v0.43), you also need to register it in the migration table so users on older versions get a friendly auto-pull prompt instead of a "profile not found" error. See [PACK_PROVIDED_PROFILES](#registering-a-pack-provided-profile) below.
+If your pack ships a profile with an `install_as` name that used to be compiled into the CLI (e.g. `claude-code` was a preset until v0.43), you also need to register it in the migration table so users on older versions get a friendly auto-pull prompt instead of a "profile not found" error. See [PACK_PROVIDED_PROFILES](#registering-a-pack-provided-profile) below.
 
 ## Step 3: Create the Pack in the Registry
 
@@ -415,7 +415,7 @@ Check:
 
 ## Registering a Pack-Provided Profile
 
-If your pack ships a `profile` artifact whose `install_as` name was previously a built-in (e.g. `claude-code` was compiled into the CLI before v0.43), you should register it in `nono`'s migration table so users on older versions get a friendly auto-pull prompt rather than a "profile not found" error when they upgrade.
+If your pack ships a `profile` artifact whose `install_as` name was previously a preset (e.g. `claude-code` was compiled into the CLI before v0.43), you should register it in `nono`'s migration table so users on older versions get a friendly auto-pull prompt rather than a "profile not found" error when they upgrade.
 
 The table lives at `crates/nono-cli/src/migration.rs` as `PACK_PROVIDED_PROFILES`. Each entry is a `PackProvidedProfile` struct with three fields:
 

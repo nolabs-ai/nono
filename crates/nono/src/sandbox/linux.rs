@@ -761,10 +761,10 @@ const SECCOMP_FILTER_FLAG_NEW_LISTENER: libc::c_uint = 1 << 3;
 const SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV: libc::c_uint = 1 << 4;
 
 // ioctl request codes for seccomp notifications
-const SECCOMP_IOCTL_NOTIF_RECV: libc::c_ulong = 0xc0502100;
-const SECCOMP_IOCTL_NOTIF_SEND: libc::c_ulong = 0xc0182101;
-const SECCOMP_IOCTL_NOTIF_ID_VALID: libc::c_ulong = 0x40082102;
-const SECCOMP_IOCTL_NOTIF_ADDFD: libc::c_ulong = 0x40182103;
+const SECCOMP_IOCTL_NOTIF_RECV: libc::Ioctl = 0xc0502100 as libc::Ioctl;
+const SECCOMP_IOCTL_NOTIF_SEND: libc::Ioctl = 0xc0182101 as libc::Ioctl;
+const SECCOMP_IOCTL_NOTIF_ID_VALID: libc::Ioctl = 0x40082102 as libc::Ioctl;
+const SECCOMP_IOCTL_NOTIF_ADDFD: libc::Ioctl = 0x40182103 as libc::Ioctl;
 
 // Seccomp addfd flags
 const SECCOMP_ADDFD_FLAG_SEND: u32 = 1 << 1;

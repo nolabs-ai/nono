@@ -798,16 +798,29 @@ fn run_verify(args: TrustVerifyArgs) -> Result<()> {
         std::collections::HashSet::new();
 
     for bundle_path in &multi_bundles {
-        let scan_root = bundle_path.parent().unwrap_or_else(|| Path::new("."));
+        // Path::parent() returns Some("") for a bare filename (e.g.
+        // ".nono-trust.bundle" with no directory component).  An empty path
+        // cannot be canonicalized; treat it as the current directory.
+        let scan_root = bundle_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
         match verify_multi_subject_file(bundle_path, scan_root, &policy) {
             Ok(subjects) => {
                 for (name, signer) in &subjects {
                     eprintln!("  {} {} (signer: {})", "VERIFIED".green(), name, signer);
                     verified = verified.saturating_add(1);
-                    // Track the canonical path so per-file check can skip it
-                    let subject_path = scan_root.join(name);
-                    if let Ok(canon) = std::fs::canonicalize(&subject_path) {
-                        multi_verified_paths.insert(canon);
+                    // Track the canonical path so per-file check can skip it.
+                    // safe_subject_path was already enforced inside
+                    // verify_multi_subject_file; this second call is
+                    // defense-in-depth so that the canonicalize-then-insert
+                    // step cannot be reached with a traversal name even if
+                    // the inner guard is somehow bypassed in the future.
+                    if let Ok(subject_path) = crate::trust_scan::safe_subject_path(scan_root, name)
+                    {
+                        if let Ok(canon) = std::fs::canonicalize(&subject_path) {
+                            multi_verified_paths.insert(canon);
+                        }
                     }
                 }
             }
@@ -940,7 +953,8 @@ fn verify_multi_subject_file(
     let mut results = Vec::with_capacity(subjects.len());
 
     for (name, expected_digest) in &subjects {
-        let file_path = scan_root.join(name);
+        let file_path = crate::trust_scan::safe_subject_path(scan_root, name)
+            .map_err(|reason| format!("rejected subject '{name}': {reason}"))?;
         let actual_digest = trust::file_digest(&file_path)
             .map_err(|e| format!("failed to read subject '{}': {e}", name))?;
         if actual_digest != *expected_digest {

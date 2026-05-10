@@ -60,7 +60,7 @@ cargo build -p nono-cli --release --target x86_64-pc-windows-msvc
 Output: `dist\windows\nono-v0.37.1-poc.1-x86_64-pc-windows-msvc-user.msi`.
 
 <Warning>
-The **machine** MSI (`-Scope machine`) tries to register `nono-wfp-service` and expects `nono-wfp-service.exe` to live next to `nono.exe`. The current public release lane does not produce that binary, so machine MSI builds fail or install with a missing-service. Stay on `-Scope user` for the POC.
+The **machine** MSI (`-Scope machine`) registers `nono-wfp-service` only when you explicitly pass `-ServiceBinaryPath .\target\x86_64-pc-windows-msvc\release\nono-wfp-service.exe`. The release build DOES produce that binary (`make build-release-cli` → `cargo build --release -p nono-cli`), but the MSI script defaults `-ServiceBinaryPath` to empty — so a machine MSI built without that flag installs successfully but never registers the WFP service. Stay on `-Scope user` for the POC; per-user is the right choice anyway (no admin install, no service to undo).
 </Warning>
 
 If you want a portable archive instead of MSI:
@@ -128,7 +128,7 @@ Communicate one of these in your POC handoff. Do not let users discover the warn
 
 ```powershell
 # Dry-run first — verify the policy is what you expect
-nono run --dry-run --profile claude-code -- claude
+nono run --dry-run --profile claude-code -- claude --version
 ```
 
 Expected output shape:
@@ -142,7 +142,7 @@ nono v0.37.x
        + 6 system/group paths (-v to show)
    net  outbound allowed
   dry-run sandbox would be applied with above capabilities
-  $ claude
+  $ claude --version
 ```
 
 The `Updating claude-code hook` line indicates that `~/.claude/hooks/nono-hook.sh` and the upfront sandbox section in `~/.claude/CLAUDE.md` were written. The install is idempotent and is skipped on subsequent runs unless the hook version changed.
@@ -162,8 +162,8 @@ nono --help | Select-String "shell|wrap|run"
 nono setup --check-only
 
 # Dry-run shapes (verify capability lists print as expected)
-nono run --dry-run --profile claude-code -- claude
-nono run --dry-run --allow . --read $env:USERPROFILE\.claude -- claude
+nono run --dry-run --profile claude-code -- claude --version
+nono run --dry-run --allow . --read $env:USERPROFILE\.claude -- claude --version
 
 # Live, narrowest grant — works without profile (non-interactive child, pipes are fine)
 nono run --allow . -- cmd /c echo hello
@@ -199,19 +199,31 @@ nono run --profile claude-code --network-profile claude-code -- claude --version
 nono run --profile claude-code --allow-domain api.openai.com -- claude --version
 ```
 
+Expected stderr (paraphrase — exact text varies by target/path/backend summary):
+
+```text
+Windows WFP runtime activation is required for <target> but the WFP service binary
+`<path>` is missing from this build output. Run `cargo build -p nono-cli --bins` first
+(<backend_summary>). This request remains fail-closed until WFP activation is implemented.
+```
+
+Grep operators can anchor on: `This request remains fail-closed until WFP activation is implemented`. If you see exit code 0 and no stderr line containing that anchor, the fail-closed gate has regressed — stop the POC.
+
 If either of those silently runs, **stop the POC**. That is a fail-closed regression and worth a bug report before any user sees it.
 
 ## Known limitation: `nono run` cannot host TUI agents on Windows
 
 `nono run` on Windows always opens anonymous pipes for the child process — never a ConPTY. Non-interactive children (`cmd /c echo`, `cargo build`, `python -c '...'`, `claude --version`) work fine through pipes. Full-screen TUI agents (`claude`, `codex`, anything that needs cursor positioning, alternate screen buffer, or interactive stdin) cannot render through `nono run` and will appear to hang.
 
-The constraint is documented in `crates/nono-cli/src/supervised_runtime.rs:101-111`: combining `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE` with `DETACHED_PROCESS` historically crashed grandchildren with `STATUS_DLL_INIT_FAILED (0xC0000142)` (see `.planning/debug/resolved/windows-supervised-exec-cascade.md`). The conservative fix at the time disabled PTY allocation entirely on the Windows supervised path. Restoring PTY allocation for non-detached `nono run` is feasible but needs a regression-proof debug session — out of scope for the POC cookbook.
+The constraint is documented in `crates/nono-cli/src/supervised_runtime.rs:101-111`: combining `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE` with `DETACHED_PROCESS` historically crashed grandchildren with `STATUS_DLL_INIT_FAILED (0xC0000142)` (see `.planning/debug/resolved/windows-supervised-exec-cascade.md`). The conservative Phase-15 fix disabled PTY allocation on the **detached** Windows supervised path. Interactive `nono shell` does allocate ConPTY post-Phase 31 via the broker process — see security envelope below.
 
 **For the POC: use `nono run -- <non-TUI command>` for any non-interactive child on Windows. For TUI agents (claude, codex, etc.), use `nono shell --profile claude-code --allow-cwd`** — see [Windows `nono shell` — security envelope](#windows-nono-shell--security-envelope-phase-31-validated-2026-05-09) below for the broker-process architecture that delivers full TUI rendering with OS-level mandatory-label write enforcement intact.
 
 ## Windows `nono shell` — security envelope (Phase 31, validated 2026-05-09)
 
 `nono shell --profile claude-code --allow-cwd` on Windows 10/11 is the recommended interactive TUI host for `claude` and similar agents. The supported token shape ships via the broker-process architecture (Phase 31, validated on the user's Windows test box on 2026-05-09 after a same-day PoC validation 2026-05-08). It addresses the Phase 30 final-state finding that no **direct** Low-IL primary-token spawn from `nono.exe` can host a ConPTY child without tripping `STATUS_DLL_INIT_FAILED (0xC0000142)` at the CSRSS console-subsystem ALPC handshake during `KernelBase.dll` DllMain.
+
+> **Freshness note:** Phase 31 production validation completed on 2026-05-09 (the day this cookbook was written). The broker path has minimal soak time on `main`. Day-1 POC users should report any anomalies promptly via the [Windows Preview Pilot § Debugging Inputs](/cli/development/windows-preview-pilot#debugging-inputs) triage payload, and operators should consider deferring the actual handoff by 24-48h to allow follow-up patches to land.
 
 ### Token shape
 
@@ -241,6 +253,8 @@ The constraint is documented in `crates/nono-cli/src/supervised_runtime.rs:101-1
 
 The Authenticode chain-walker (`AUDC-01..03`, Phase 28) records `signer_subject` + SHA-1 thumbprint for both `nono.exe` AND the broker process — both signed with the same key, so the audit trail records a consistent identity for the supervisor stack across the launch chain.
 
+Operators can verify post-run with `nono audit list --recent 5` (or `nono audit list --json` for structured output, plus `nono audit show <session-id> --json` for per-session detail) to see the recorded `signer_subject` and SHA-1 thumbprint per launch. If the audit trail is empty after a `nono shell` invocation, the AUDC chain-walker is misconfigured — out of scope for the POC smoke but worth flagging in the triage payload.
+
 ### Recommended invocation
 
 ```powershell
@@ -251,7 +265,9 @@ claude  # full TUI rendering — alternate screen buffer, cursor positioning, ra
 
 For non-TUI commands, `nono run --profile claude-code -- <command>` remains the supported invocation (anonymous-pipe stdio; `WRITE_RESTRICTED` + per-session SID; full WFP per-session differentiation).
 
-### References
+### Operator references (internal)
+
+> These references live in the GSD `.planning/` tree; they are operator-internal and are not part of the POC user handoff bundle. Listed here for nono-team triage and history.
 
 - Phase 31 plans: `.planning/phases/31-broker-process-architecture-shell-01/31-{01..06}-PLAN.md`
 - PoC validation (2026-05-08): `.planning/quick/260508-m99-broker-process-poc-minimal-rust-binary-t/SUMMARY.md`
@@ -266,11 +282,11 @@ Drop the table below into the README you ship alongside the MSI. These are the i
 | Item | What to tell users |
 |------|---|
 | Install | `msiexec /i nono-vX-x86_64-pc-windows-msvc-user.msi`, then open a fresh PowerShell |
-| First-time symlink warning | Enable Developer Mode (`Settings → System → For developers`); benign if skipped, but token refresh writes leak outside `~/.claude\` |
+| First-time symlink warning | Enable Developer Mode (`Settings → System → For developers`) **or** run `nono setup` once as admin to create the symlink. Benign if skipped, but token refresh writes leak outside `~/.claude\`. |
 | Non-TUI commands (cargo, npm, scripts) | `nono run --profile claude-code -- <command>` is the supported invocation for non-interactive children |
 | Quick verification | `nono run --profile claude-code -- claude --version` exercises the full sandbox + profile path without needing a TUI |
 | TUI agents (claude, codex, etc.) | `nono shell --profile claude-code --allow-cwd`, then run `claude` (or other TUI) inside. The broker-process architecture (Phase 31, validated 2026-05-09) delivers full TUI rendering with OS-level mandatory-label `NO_WRITE_UP` write-deny intact. See [Windows `nono shell` — security envelope](#windows-nono-shell--security-envelope-phase-31-validated-2026-05-09) for the security model and what's enforced vs. defense-in-depth. |
-| Triage payload on a bug | Exact command line, full stdout, full stderr, `nono --version` output, `nono setup --check-only` output, whether WFP was reported missing |
+| Triage payload on a bug | Exact command line, full stdout, full stderr, `nono --version`, `claude --version`, `nono setup --check-only` output, Windows build (`(Get-CimInstance Win32_OperatingSystem).BuildNumber` or `[Environment]::OSVersion.Version.Build`), whether WFP was reported missing. |
 | Not yet supported on this build | Domain-level network filtering (`--network-profile`, `--allow-domain`) — needs WFP service, which the per-user MSI does not ship today. Use `--block-net` for offline or unrestricted network for online. (`nono shell` per-session WFP differentiation is waived on the broker path; falls back to AppID-based filtering — see security envelope above.) |
 | Uninstall | Apps & Features → "nono" → Uninstall (MSI). For zip: delete the extracted directory and remove from PATH. |
 

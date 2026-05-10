@@ -39,7 +39,7 @@ use tracing::{debug, info, warn};
 
 pub(crate) use env_sanitization::is_dangerous_env_var;
 use env_sanitization::should_skip_env_var;
-pub(crate) use env_sanitization::validate_allow_vars_pattern;
+pub(crate) use env_sanitization::validate_env_var_patterns;
 
 /// Resolve a program name to its absolute path.
 ///
@@ -221,6 +221,10 @@ pub struct ExecConfig<'a> {
     /// matching an exact name or prefix pattern (e.g. `"AWS_*"`) are
     /// passed to the child. Nono-injected credentials always bypass this.
     pub allowed_env_vars: Option<Vec<String>>,
+    /// Deny-list of environment variable names. Variables matching an exact
+    /// name or prefix pattern (e.g. `"GITHUB_*"`) are stripped even if they
+    /// also appear in `allowed_env_vars`. Nono-injected credentials bypass this.
+    pub denied_env_vars: Option<Vec<String>>,
 }
 
 #[derive(Clone, Copy)]
@@ -308,6 +312,11 @@ pub fn execute_direct(config: &ExecConfig<'_>) -> Result<()> {
             ],
         ) {
             continue;
+        }
+        if let Some(ref denied) = config.denied_env_vars {
+            if env_sanitization::is_env_var_denied(&key, denied) {
+                continue;
+            }
         }
         if let Some(ref allowed) = config.allowed_env_vars {
             if !env_sanitization::is_env_var_allowed(&key, allowed) {
@@ -436,6 +445,11 @@ pub fn execute_supervised(
                 ],
             ) {
                 continue;
+            }
+            if let Some(ref denied) = config.denied_env_vars {
+                if env_sanitization::is_env_var_denied(k, denied) {
+                    continue;
+                }
             }
             if let Some(ref allowed) = config.allowed_env_vars {
                 if !env_sanitization::is_env_var_allowed(k, allowed) {

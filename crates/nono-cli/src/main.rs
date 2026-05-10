@@ -253,6 +253,7 @@ mod tests {
             open_url_allow_localhost: false,
             bypass_protection_paths: Vec::new(),
             allowed_env_vars: None,
+            denied_env_vars: None,
         };
 
         let effective = resolve_effective_proxy_settings(&args, &prepared);
@@ -296,6 +297,7 @@ mod tests {
             open_url_allow_localhost: false,
             bypass_protection_paths: Vec::new(),
             allowed_env_vars: None,
+            denied_env_vars: None,
         };
 
         let effective = resolve_effective_proxy_settings(&args, &prepared);

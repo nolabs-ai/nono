@@ -88,7 +88,46 @@ In this case, `OPENAI_API_KEY` is passed through even though it's not in `allow_
   If you inject a secret via `env_credentials` and also list it in `allow_vars`, it will be present once (deduplicated). There is no conflict.
 </Warning>
 
-## Interaction with the Deny-List
+## Operator-configured deny-list
+
+Use `deny_vars` to strip specific variables while keeping everything else inherited — without having to enumerate an explicit allow-list:
+
+```json
+{
+  "environment": {
+    "deny_vars": ["GH_TOKEN", "GITHUB_TOKEN", "ANTHROPIC_API_KEY"]
+  }
+}
+```
+
+Prefix patterns work the same as in `allow_vars` — only trailing `*` is supported:
+
+```json
+{
+  "environment": {
+    "deny_vars": ["GITHUB_*", "ANTHROPIC_*", "OPENAI_*"]
+  }
+}
+```
+
+This strips `GITHUB_TOKEN`, `GITHUB_ACTIONS`, any var starting with `ANTHROPIC_` or `OPENAI_`, etc. Patterns like `*_TOKEN` (leading wildcard) are **not** supported — nono will print a warning and ignore them.
+
+**Precedence:** `deny_vars` wins over `allow_vars`. If a variable appears in both, it is stripped:
+
+```json
+{
+  "environment": {
+    "allow_vars": ["AWS_*"],
+    "deny_vars": ["AWS_SECRET_ACCESS_KEY"]
+  }
+}
+```
+
+`AWS_REGION` passes through; `AWS_SECRET_ACCESS_KEY` is stripped.
+
+**Inheritance:** like `allow_vars`, `deny_vars` is additive across profile inheritance — a child profile appends to the base's list, and duplicates are removed.
+
+## Interaction with the Built-in Deny-List
 
 nono maintains a built-in deny-list of dangerous environment variables (e.g., `LD_PRELOAD`, `DYLD_INSERT_LIBRARIES`, `PYTHONPATH`, `NODE_OPTIONS`). These variables are **always blocked**, even if they appear in `allow_vars`. This prevents a compromised profile from disabling sandbox protections.
 
@@ -106,9 +145,11 @@ nono maintains a built-in deny-list of dangerous environment variables (e.g., `L
 
 - **Default-allow**: Without the `environment` section, all variables are passed through (no regression)
 - **Empty allow-list restricts all**: `"allow_vars": []` passes zero inherited variables — only nono-injected credentials reach the child
-- **Explicit allow-list**: When configured with entries, only listed variables reach the child process
-- **Injected credentials bypass the allow-list**: `env_credentials` variables always pass through
-- **Deny-list is non-overridable**: Dangerous variables like `LD_PRELOAD` are always blocked
+- **Explicit allow-list**: When `allow_vars` has entries, only matching variables reach the child process
+- **Operator deny-list**: `deny_vars` strips named variables even when `allow_vars` would otherwise pass them through
+- **Injected credentials bypass both lists**: `env_credentials` variables always pass through, regardless of `allow_vars` or `deny_vars`
+- **Built-in deny-list is non-overridable**: Dangerous variables like `LD_PRELOAD` are always blocked and cannot be re-allowed
+- **Precedence**: built-in blocklist > `deny_vars` > `allow_vars`
 - **Prefix patterns reduce misconfiguration**: Only `*` suffix is supported (no regex), reducing risk of accidental over-permission
 - **Bare `*` matches everything**: Use as an escape hatch, but prefer explicit lists
 

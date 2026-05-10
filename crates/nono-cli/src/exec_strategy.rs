@@ -856,16 +856,20 @@ pub fn execute_supervised(
             // async-signal-safe libc calls.
             #[cfg(target_os = "linux")]
             if !linux_cgroup_procs_path_nul.is_empty() {
-                if let Err(e) = supervisor_linux::cgroup::CgroupSession::place_self_in_cgroup_raw(
+                if let Err(_e) = supervisor_linux::cgroup::CgroupSession::place_self_in_cgroup_raw(
                     &linux_cgroup_procs_path_nul,
                 ) {
-                    let detail = format!("nono: failed to place child in cgroup: {}\n", e);
-                    let msg = detail.as_bytes();
+                    // CR-01: static byte string — `format!()` is unsafe in the post-fork
+                    // child (heap allocation can deadlock if parent held allocator mutex
+                    // at fork() time).
+                    const MSG_CGROUP: &[u8] = b"nono: failed to place child in cgroup\n";
+                    // SAFETY: write and _exit are async-signal-safe; we are in the
+                    // post-fork child branch where heap allocation is unsafe.
                     unsafe {
                         libc::write(
                             libc::STDERR_FILENO,
-                            msg.as_ptr().cast::<libc::c_void>(),
-                            msg.len(),
+                            MSG_CGROUP.as_ptr().cast::<libc::c_void>(),
+                            MSG_CGROUP.len(),
                         );
                         libc::_exit(126);
                     }
@@ -895,17 +899,16 @@ pub fn execute_supervised(
             // IPC back to the unsandboxed parent. `UnixStream::pair()` creates
             // fds with close-on-exec set, so clear it on the child end here.
             if let Some(fd) = child_sock_fd {
-                if let Err(e) = clear_close_on_exec(fd) {
-                    let detail = format!(
-                        "nono: failed to clear close-on-exec on supervisor socket: {}\n",
-                        e
-                    );
-                    let msg = detail.as_bytes();
+                if let Err(_e) = clear_close_on_exec(fd) {
+                    // CR-01: static byte string in post-fork child.
+                    const MSG_SOCK: &[u8] =
+                        b"nono: failed to clear close-on-exec on supervisor socket\n";
+                    // SAFETY: write and _exit are async-signal-safe.
                     unsafe {
                         libc::write(
                             libc::STDERR_FILENO,
-                            msg.as_ptr().cast::<libc::c_void>(),
-                            msg.len(),
+                            MSG_SOCK.as_ptr().cast::<libc::c_void>(),
+                            MSG_SOCK.len(),
                         );
                         libc::_exit(126);
                     }
@@ -928,15 +931,16 @@ pub fn execute_supervised(
             {
                 match Sandbox::apply(effective_caps) {
                     Ok(_fallback) => {}
-                    Err(e) => {
-                        let detail =
-                            format!("nono: failed to apply sandbox in supervised child: {}\n", e);
-                        let msg = detail.as_bytes();
+                    Err(_e) => {
+                        // CR-01: static byte string in post-fork child.
+                        const MSG_SANDBOX_LINUX: &[u8] =
+                            b"nono: failed to apply sandbox in supervised child\n";
+                        // SAFETY: write and _exit are async-signal-safe.
                         unsafe {
                             libc::write(
                                 libc::STDERR_FILENO,
-                                msg.as_ptr().cast::<libc::c_void>(),
-                                msg.len(),
+                                MSG_SANDBOX_LINUX.as_ptr().cast::<libc::c_void>(),
+                                MSG_SANDBOX_LINUX.len(),
                             );
                             libc::_exit(126);
                         }
@@ -946,15 +950,16 @@ pub fn execute_supervised(
 
             #[cfg(not(target_os = "linux"))]
             {
-                if let Err(e) = Sandbox::apply(effective_caps) {
-                    let detail =
-                        format!("nono: failed to apply sandbox in supervised child: {}\n", e);
-                    let msg = detail.as_bytes();
+                if let Err(_e) = Sandbox::apply(effective_caps) {
+                    // CR-01: static byte string in post-fork child.
+                    const MSG_SANDBOX_OTHER: &[u8] =
+                        b"nono: failed to apply sandbox in supervised child\n";
+                    // SAFETY: write and _exit are async-signal-safe.
                     unsafe {
                         libc::write(
                             libc::STDERR_FILENO,
-                            msg.as_ptr().cast::<libc::c_void>(),
-                            msg.len(),
+                            MSG_SANDBOX_OTHER.as_ptr().cast::<libc::c_void>(),
+                            MSG_SANDBOX_OTHER.len(),
                         );
                         libc::_exit(126);
                     }
@@ -987,37 +992,36 @@ pub fn execute_supervised(
                     if let Some(fd) = child_sock_fd {
                         match nono::sandbox::install_seccomp_notify() {
                             Ok(notify_fd) => {
-                                if let Err(e) = nono::supervisor::socket::send_fd_via_socket(
+                                if let Err(_e) = nono::supervisor::socket::send_fd_via_socket(
                                     fd,
                                     notify_fd.as_raw_fd(),
                                 ) {
-                                    let detail = format!(
-                                        "nono: failed to send seccomp notify fd to supervisor: {}\n",
-                                        e
-                                    );
-                                    let msg = detail.as_bytes();
+                                    // CR-01: static byte string in post-fork child.
+                                    const MSG_SECCOMP_SEND: &[u8] =
+                                        b"nono: failed to send seccomp notify fd to supervisor\n";
+                                    // SAFETY: write and _exit are async-signal-safe.
                                     unsafe {
                                         libc::write(
                                             libc::STDERR_FILENO,
-                                            msg.as_ptr().cast::<libc::c_void>(),
-                                            msg.len(),
+                                            MSG_SECCOMP_SEND.as_ptr().cast::<libc::c_void>(),
+                                            MSG_SECCOMP_SEND.len(),
                                         );
                                         libc::_exit(126);
                                     }
                                 }
                             }
-                            Err(e) => {
+                            Err(_e) => {
                                 // seccomp not available -- proceed without transparent expansion
-                                let detail = format!(
-                                    "nono: seccomp-notify not available, expansion disabled: {}\n",
-                                    e
-                                );
-                                let msg = detail.as_bytes();
+                                // CR-01: static byte string in post-fork child.
+                                const MSG_SECCOMP_FAIL: &[u8] =
+                                    b"nono: seccomp-notify not available, expansion disabled\n";
+                                // SAFETY: write is async-signal-safe; this is a non-fatal
+                                // warning (no _exit).
                                 unsafe {
                                     libc::write(
                                         libc::STDERR_FILENO,
-                                        msg.as_ptr().cast::<libc::c_void>(),
-                                        msg.len(),
+                                        MSG_SECCOMP_FAIL.as_ptr().cast::<libc::c_void>(),
+                                        MSG_SECCOMP_FAIL.len(),
                                     );
                                 }
                             }
@@ -1047,34 +1051,34 @@ pub fn execute_supervised(
                     if let Some(fd) = child_sock_fd {
                         match nono::sandbox::install_seccomp_proxy_filter(has_bind) {
                             Ok(proxy_notify_fd) => {
-                                if let Err(e) = nono::supervisor::socket::send_fd_via_socket(
+                                if let Err(_e) = nono::supervisor::socket::send_fd_via_socket(
                                     fd,
                                     proxy_notify_fd.as_raw_fd(),
                                 ) {
-                                    let detail = format!(
-                                        "nono: failed to send proxy seccomp notify fd: {}\n",
-                                        e
-                                    );
-                                    let msg = detail.as_bytes();
+                                    // CR-01: static byte string in post-fork child.
+                                    const MSG_PROXY_SEND: &[u8] =
+                                        b"nono: failed to send proxy seccomp notify fd\n";
+                                    // SAFETY: write and _exit are async-signal-safe.
                                     unsafe {
                                         libc::write(
                                             libc::STDERR_FILENO,
-                                            msg.as_ptr().cast::<libc::c_void>(),
-                                            msg.len(),
+                                            MSG_PROXY_SEND.as_ptr().cast::<libc::c_void>(),
+                                            MSG_PROXY_SEND.len(),
                                         );
                                         libc::_exit(126);
                                     }
                                 }
                             }
-                            Err(e) => {
-                                let detail =
-                                    format!("nono: seccomp proxy filter not available: {}\n", e);
-                                let msg = detail.as_bytes();
+                            Err(_e) => {
+                                // CR-01: static byte string in post-fork child.
+                                const MSG_PROXY_FAIL: &[u8] =
+                                    b"nono: seccomp proxy filter not available\n";
+                                // SAFETY: write and _exit are async-signal-safe.
                                 unsafe {
                                     libc::write(
                                         libc::STDERR_FILENO,
-                                        msg.as_ptr().cast::<libc::c_void>(),
-                                        msg.len(),
+                                        MSG_PROXY_FAIL.as_ptr().cast::<libc::c_void>(),
+                                        MSG_PROXY_FAIL.len(),
                                     );
                                     libc::_exit(126);
                                 }
@@ -1089,17 +1093,16 @@ pub fn execute_supervised(
                 ) {
                     use nix::sys::prctl;
 
-                    if let Err(e) = prctl::set_dumpable(false) {
-                        let detail = format!(
-                            "nono: failed to set PR_SET_DUMPABLE(0) in supervised child: {}\n",
-                            e
-                        );
-                        let msg = detail.as_bytes();
+                    if let Err(_e) = prctl::set_dumpable(false) {
+                        // CR-01: static byte string in post-fork child.
+                        const MSG_DUMPABLE: &[u8] =
+                            b"nono: failed to set PR_SET_DUMPABLE(0) in supervised child\n";
+                        // SAFETY: write and _exit are async-signal-safe.
                         unsafe {
                             libc::write(
                                 libc::STDERR_FILENO,
-                                msg.as_ptr().cast::<libc::c_void>(),
-                                msg.len(),
+                                MSG_DUMPABLE.as_ptr().cast::<libc::c_void>(),
+                                MSG_DUMPABLE.len(),
                             );
                             libc::_exit(126);
                         }

@@ -33,7 +33,9 @@ use std::path::PathBuf;
 fn read_exec_strategy() -> String {
     // CARGO_MANIFEST_DIR points at the nono-cli crate root.
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let path = PathBuf::from(manifest_dir).join("src").join("exec_strategy.rs");
+    let path = PathBuf::from(manifest_dir)
+        .join("src")
+        .join("exec_strategy.rs");
     std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()))
 }

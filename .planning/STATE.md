@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v2.3
 milestone_name: Linux POC Unblock + Deferreds Closure
 status: executing
-last_updated: "2026-05-10T21:34:51.047Z"
+last_updated: "2026-05-10T21:47:33.721Z"
 last_activity: 2026-05-10
 progress:
   total_phases: 8
   completed_phases: 7
   total_plans: 23
-  completed_plans: 21
-  percent: 91
+  completed_plans: 22
+  percent: 96
 ---
 
 # Project State: nono — v2.3 Linux POC Unblock + Deferreds Closure
@@ -26,8 +26,8 @@ See: .planning/PROJECT.md (updated 2026-04-29 at v2.3 milestone scope-lock)
 ## Current Position
 
 Phase: 25 (cross-platform-resl-aipc-unix-design) — EXECUTING
-Plan: 1 of 6
-Status: Executing Phase 25
+Plan: 2 of 6
+Status: Ready to execute
 Milestone: v2.2 — 3/3 phases complete (Phase 22 ✓ 2026-04-28, Phase 23 ✓ 2026-04-29, Phase 24 ✓ 2026-04-27), 9/9 plans complete. v2.2 ready to ship.
 
   - v1.0 Windows Alpha — shipped 2026-03-31 (tag `v1.0`).
@@ -47,12 +47,12 @@ Next actions:
   - After Phase 23 closes, `/gsd-complete-milestone v2.2` to archive the milestone.
   - Pre-merge `windows-squash` → `main` quick task remains a candidate for milestone-close timing.
 
-Last activity: 2026-05-10 -- Phase 25 execution started
+Last activity: 2026-05-10
 
 Prior activity: 2026-04-28 — Phase 22 closed end-to-end (UAT 10/10 + 1 spec-error skipped, commit e60ab093). Quick task 260428-rsu created as deferred runbook for upstream-stack rebase (awaiting trigger).
 
 ```
-Progress: [█████████░] 89%
+Progress: [██████████] 96%
 ```
 
 ## Accumulated Context

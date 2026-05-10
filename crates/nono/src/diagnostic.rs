@@ -396,8 +396,27 @@ fn extract_denied_path_from_error_line(line: &str) -> Option<PathBuf> {
         }
     }
 
-    extract_path_from_segment(prefix)
+    extract_path_from_segment(prefix).or_else(|| extract_path_from_segment(line))
 }
+
+// NOTE (P34-DEFER-08b-2): upstream `b5f0a3ab` + `bbdf7b85` together add a
+// structured-property parsing pipeline (extract_path_after_syscall_word,
+// infer_access_from_structured_syscall_line, extract_structured_path_property,
+// extract_structured_string_property) plus the wiring into `analyze_error_output`
+// that consumes them. The wiring lives in the ~244-line `b5f0a3ab` refactor of
+// the diagnostic engine which conflicts with fork's heavily-extended
+// ExecConfig + SupervisedRuntimeContext + macOS-Seatbelt-violations surface.
+//
+// Plan 34-08b scope-trim removes the orphaned helpers + the two structured-path
+// tests (test_analyze_error_output_detects_structured_node_eperm_mkdir_path,
+// test_analyze_error_output_detects_structured_path_with_escaped_quote) so the
+// workspace stays clippy-clean (-D warnings forbids dead_code) and tests pass.
+//
+// Restoration plan: a dedicated D-20 manual-replay plan will (1) port the
+// `b5f0a3ab` analyze_error_output refactor on top of fork's diagnostic engine,
+// (2) restore the four helper functions, and (3) restore both tests. The
+// `bbdf7b85` escape-quote fix is structurally part of (1) — the function body
+// rewrite cannot be applied without the surrounding wiring.
 
 fn extract_relative_write_path_from_line(line: &str, current_dir: &Path) -> Option<PathBuf> {
     let lower = line.to_ascii_lowercase();
@@ -2235,6 +2254,17 @@ mod tests {
             }]
         );
     }
+
+    // NOTE (P34-DEFER-08b-2): upstream tests
+    //   test_analyze_error_output_detects_node_eperm_mkdir_as_write
+    //   test_analyze_error_output_detects_structured_node_eperm_mkdir_path
+    //   test_analyze_error_output_detects_structured_path_with_escaped_quote
+    // are deferred — they expect AccessMode::Write inference for mkdir EPERM,
+    // which requires the `extract_path_after_syscall_word` +
+    // `infer_access_from_structured_syscall_line` helpers from `b5f0a3ab` and
+    // their wiring into `analyze_error_output`. Without the wiring, fork's
+    // engine returns AccessMode::ReadWrite (the conservative default). See the
+    // matching note above `extract_relative_write_path_from_line`.
 
     #[test]
     fn test_analyze_error_output_merges_access_modes() {

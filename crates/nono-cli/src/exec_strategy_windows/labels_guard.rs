@@ -502,12 +502,13 @@ mod tests {
     /// the guard, and assert the ledger snapshot already contained both
     /// events.
     ///
-    /// 22-05a's minimal AuditRecorder lifecycle (`record_session_started`
-    /// + `record_session_ended`) is sufficient surface to exercise Drop
-    /// ordering; capability-decision and URL-open hooks (deferred per
-    /// 22-05a Decision 5) follow the same flush-before-Drop contract
-    /// structurally because every `append_event` call ends with
-    /// `self.file.flush()` (audit_integrity.rs:200).
+    /// Phase `22-05a`'s minimal AuditRecorder lifecycle
+    /// (`record_session_started` and `record_session_ended`) is sufficient
+    /// surface to exercise the Drop ordering contract. Capability-decision
+    /// and URL-open hooks (deferred per `22-05a` Decision 5) follow the
+    /// same flush-before-Drop contract structurally because every
+    /// `append_event` call ends with `self.file.flush()`
+    /// (`audit_integrity.rs:200`).
     #[test]
     fn audit_flush_before_drop() {
         use crate::audit_integrity::AuditRecorder;

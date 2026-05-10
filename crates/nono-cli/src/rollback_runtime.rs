@@ -242,10 +242,8 @@ pub(crate) fn create_audit_state(
     // `restore` consult — so combo sessions stay visible to the rollback
     // commands.
     let rollback_dir = if rollback_active {
-        let dir = crate::audit_session::ensure_rollback_session_dir(
-            &session_id,
-            rollback_destination,
-        )?;
+        let dir =
+            crate::audit_session::ensure_rollback_session_dir(&session_id, rollback_destination)?;
         Some(dir)
     } else {
         None
@@ -663,10 +661,7 @@ pub(crate) fn finalize_supervised_exit(ctx: RollbackExitContext<'_>) -> Result<(
         // covers the `--rollback --audit-integrity` combo case.
         if let Some(state) = audit_state {
             if state.rollback_dir.is_some() {
-                nono::undo::SnapshotManager::write_session_metadata(
-                    &state.session_dir,
-                    &meta,
-                )?;
+                nono::undo::SnapshotManager::write_session_metadata(&state.session_dir, &meta)?;
             }
         }
 

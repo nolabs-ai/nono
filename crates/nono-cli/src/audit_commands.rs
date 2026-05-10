@@ -6,10 +6,10 @@
 
 use crate::audit_attestation::verify_audit_attestation;
 use crate::audit_integrity::verify_audit_log;
+use crate::audit_session::load_session;
 use crate::cli::{
     AuditArgs, AuditCleanupArgs, AuditCommands, AuditListArgs, AuditShowArgs, AuditVerifyArgs,
 };
-use crate::audit_session::load_session;
 use crate::rollback_session::{discover_sessions, remove_session, SessionInfo};
 use crate::theme;
 use colored::Colorize;
@@ -868,7 +868,7 @@ mod tests {
         // "capability_decision"`, so the per-line entry shape is irrelevant
         // to the test (we use serde_json::Value end-to-end, not typed
         // AuditEntry).
-        let lines = vec![
+        let lines = [
             r#"{"sequence":0,"timestamp":"2026-04-28T00:00:00Z","event":{"type":"session_started","started":"2026-04-28T00:00:00Z","command":["test"]}}"#,
             r#"{"sequence":1,"timestamp":"2026-04-28T00:00:01Z","event":{"type":"capability_decision","entry":{"timestamp":"2026-04-28T00:00:01Z","request":{"request_id":"a"},"decision":{"Denied":{"reason":"x"}},"backend":"t","duration_ms":0},"reject_stage":"before-prompt"}}"#,
             r#"{"sequence":2,"timestamp":"2026-04-28T00:00:02Z","event":{"type":"capability_decision","entry":{"timestamp":"2026-04-28T00:00:02Z","request":{"request_id":"b"},"decision":{"Denied":{"reason":"y"}},"backend":"t","duration_ms":0},"reject_stage":"after-prompt"}}"#,

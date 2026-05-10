@@ -116,8 +116,9 @@ fn project_md_cross_links_the_adr() {
         .join("..")
         .join(".planning")
         .join("PROJECT.md");
-    let body = std::fs::read_to_string(&project_md)
-        .unwrap_or_else(|err| panic!("REQ-AIPC-NIX-01: PROJECT.md missing at {project_md:?}: {err}"));
+    let body = std::fs::read_to_string(&project_md).unwrap_or_else(|err| {
+        panic!("REQ-AIPC-NIX-01: PROJECT.md missing at {project_md:?}: {err}")
+    });
     assert!(
         body.contains("aipc-unix-futures"),
         "REQ-AIPC-NIX-01: PROJECT.md must cross-link the ADR (grep for 'aipc-unix-futures'). Without the back-reference future readers can't navigate from the key-decisions table to the locked verdict."

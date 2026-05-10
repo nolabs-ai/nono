@@ -125,18 +125,192 @@ pub fn load_trusted_root_from_str(json: &str) -> Result<TrustedRoot> {
         .map_err(|e| NonoError::TrustPolicy(format!("failed to parse trusted root: {e}")))
 }
 
-/// Load the production Sigstore trusted root (embedded).
+/// Load the cached Sigstore trusted root from disk.
 ///
-/// This uses the Sigstore public good instance trusted root that is
-/// embedded in the `sigstore-trust-root` crate.
+/// Reads `<nono_home_dir()>/.nono/trust-root/trusted_root.json` synchronously.
+/// The cache is hydrated by `nono setup --refresh-trust-root` (which fetches
+/// fresh TUF metadata from `https://tuf-repo-cdn.sigstore.dev`).
+///
+/// **Diverges from upstream** `sigstore_verify::TrustedRoot::production()` per
+/// Phase 32 D-32-01: this fork caches the trusted root explicitly under a
+/// per-user path to keep the verify path offline. See
+/// `.planning/phases/32-sigstore-integration/32-CONTEXT.md` (D-32-01 / D-32-15).
+/// The upstream-drift sentinel at `tests/integration/test_upstream_drift.sh:257`
+/// is annotated `# intentional fork: Phase 32 D-32-01`.
 ///
 /// # Errors
 ///
-/// Returns `NonoError::TrustPolicy` if the embedded root cannot be loaded.
-pub async fn load_production_trusted_root() -> Result<TrustedRoot> {
-    TrustedRoot::production()
-        .await
-        .map_err(|e| NonoError::TrustPolicy(format!("failed to load production trusted root: {e}")))
+/// * `NonoError::TrustPolicy` — when the cache file does not exist (D-32-05
+///   first-run UX). Recovery: `nono setup --refresh-trust-root`.
+/// * `NonoError::TrustVerification` — when the cache exists but all tlog keys
+///   have a `valid_for.end` in the past (D-32-03 expiry gate). Recovery: same.
+pub fn load_production_trusted_root() -> Result<TrustedRoot> {
+    let cache_path = nono_trust_root_cache_path()?;
+
+    if !cache_path.exists() {
+        return Err(NonoError::TrustPolicy(
+            "Sigstore trusted root not initialized; run \
+             `nono setup --refresh-trust-root` (requires network)."
+                .to_string(),
+        ));
+    }
+
+    let trusted_root = TrustedRoot::from_file(&cache_path).map_err(|e| {
+        NonoError::TrustPolicy(format!(
+            "failed to load cached trusted root from {}: {e}",
+            cache_path.display()
+        ))
+    })?;
+
+    check_trusted_root_freshness(&trusted_root, &cache_path)?;
+    Ok(trusted_root)
+}
+
+/// Resolve the path of the on-disk TUF trusted-root cache.
+///
+/// Honors `NONO_TEST_HOME` (Phase 27.1 D-27.1-08) first, then falls back
+/// to the standard user home directory via `home_dir_from_env()`.
+///
+/// Per P32-CHK-002 / D-32-15: `crates/nono` must NOT add `dirs` as a
+/// production dependency. This function uses `std::env` only.
+fn nono_trust_root_cache_path() -> Result<std::path::PathBuf> {
+    // Honor NONO_TEST_HOME (Phase 27.1 D-27.1-08 cross-cut convention) FIRST.
+    if let Ok(test_home) = std::env::var("NONO_TEST_HOME") {
+        let p = std::path::PathBuf::from(&test_home);
+        if !p.is_absolute() {
+            return Err(NonoError::TrustPolicy(format!(
+                "NONO_TEST_HOME must be an absolute path, got: {test_home}"
+            )));
+        }
+        return Ok(p.join(".nono").join("trust-root").join("trusted_root.json"));
+    }
+    // Fallback: resolve user home via std::env (mirrors dirs::home_dir()
+    // logic but with NO new dep). Per P32-CHK-002 / D-32-15.
+    let home = home_dir_from_env().ok_or_else(|| {
+        NonoError::TrustPolicy(
+            "could not resolve user home directory (set NONO_TEST_HOME, USERPROFILE, or HOME)"
+                .to_string(),
+        )
+    })?;
+    Ok(home
+        .join(".nono")
+        .join("trust-root")
+        .join("trusted_root.json"))
+}
+
+/// Resolve the user home directory using `std::env` only (no `dirs` dep).
+///
+/// Mirrors the resolution order of `dirs::home_dir()`:
+/// - Windows: `USERPROFILE`, falling back to `HOMEDRIVE` + `HOMEPATH`.
+/// - Unix:    `HOME`.
+///
+/// Honors P32-CHK-002 / D-32-15: `crates/nono` MUST NOT add `dirs` as a
+/// production dependency. NONO_TEST_HOME is checked by the caller BEFORE
+/// this function runs (Phase 27.1 D-27.1-08 convention).
+fn home_dir_from_env() -> Option<std::path::PathBuf> {
+    #[cfg(windows)]
+    {
+        if let Some(profile) = std::env::var_os("USERPROFILE") {
+            let p = std::path::PathBuf::from(&profile);
+            if !p.as_os_str().is_empty() {
+                return Some(p);
+            }
+        }
+        if let (Some(drive), Some(path)) =
+            (std::env::var_os("HOMEDRIVE"), std::env::var_os("HOMEPATH"))
+        {
+            let mut p = std::path::PathBuf::from(drive);
+            p.push(path);
+            if !p.as_os_str().is_empty() {
+                return Some(p);
+            }
+        }
+        None
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .filter(|p| !p.as_os_str().is_empty())
+    }
+}
+
+/// Check that the cached TUF trusted root is still fresh.
+///
+/// Succeeds if AT LEAST ONE tlog has `valid_for.end > now` (or has no `end`,
+/// meaning no expiry is asserted). Per Research Pitfall 3: expired RETIRED
+/// tlog keys are normal — they are kept for historical bundle verification.
+/// Only the absence of any current key indicates a stale cache.
+///
+/// Returns `Err(TrustVerification)` when ALL tlog keys have an explicit
+/// `valid_for.end` that is in the past.
+fn check_trusted_root_freshness(root: &TrustedRoot, cache_path: &std::path::Path) -> Result<()> {
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let now_iso10 = current_date_iso_prefix_for_secs(now_secs);
+
+    let any_active = root.tlogs.iter().any(|tlog| {
+        tlog.public_key
+            .valid_for
+            .as_ref()
+            .and_then(|v| v.end.as_ref())
+            .map(|end| {
+                let end_date = &end[..end.len().min(10)];
+                now_iso10.as_str() < end_date
+            })
+            .unwrap_or(true) // missing end = no expiry asserted; treat as active
+    });
+
+    if any_active {
+        return Ok(());
+    }
+
+    let latest_end = root
+        .tlogs
+        .iter()
+        .filter_map(|tlog| tlog.public_key.valid_for.as_ref())
+        .filter_map(|v| v.end.as_ref())
+        .max()
+        .cloned()
+        .unwrap_or_else(|| "unknown".to_string());
+
+    Err(NonoError::TrustVerification {
+        path: cache_path.display().to_string(),
+        reason: format!(
+            "Sigstore trusted root expired {latest_end}; run \
+             `nono setup --refresh-trust-root` (requires network)."
+        ),
+    })
+}
+
+/// Convert seconds-since-UNIX-epoch to an ISO-8601 date prefix `YYYY-MM-DD`.
+///
+/// Avoids `chrono` to preserve D-19. Uses the Howard Hinnant civil-from-days
+/// algorithm (https://howardhinnant.github.io/date_algorithms.html).
+///
+/// Exposed as `pub(crate)` for the P32-CHK-013 regression guard in tests.
+/// The production path (`check_trusted_root_freshness`) calls this directly
+/// with the live `SystemTime` value.
+pub(crate) fn current_date_iso_prefix_for_secs(now_secs: u64) -> String {
+    // Days since epoch, then convert to civil date.
+    let days = (now_secs / 86_400) as i64;
+    let z = days + 719_468;
+    let era = if z >= 0 {
+        z / 146_097
+    } else {
+        (z - 146_096) / 146_097
+    };
+    let doe: u64 = (z - era * 146_097) as u64;
+    let yoe: u64 = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y: i64 = (yoe as i64) + era * 400;
+    let doy: u64 = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp: u64 = (5 * doy + 2) / 153;
+    let d: u64 = doy - (153 * mp + 2) / 5 + 1;
+    let m: u64 = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y: i64 = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02}")
 }
 
 // ---------------------------------------------------------------------------
@@ -873,10 +1047,17 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[tokio::test]
-    async fn load_production_trusted_root_succeeds() {
-        let root = load_production_trusted_root().await;
-        assert!(root.is_ok());
+    // -----------------------------------------------------------------------
+    // load_production_trusted_root (Phase 32 D-32-02 fixture migration)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn load_production_trusted_root_succeeds() {
+        // Phase 32 D-32-02: exercises the test seam, not the production cache
+        // (which doesn't exist in CI). load_test_trusted_root reads the frozen
+        // fixture at crates/nono/tests/fixtures/trust-root-frozen.json.
+        let root = crate::trust::load_test_trusted_root();
+        assert!(root.is_ok(), "frozen fixture must load: {:?}", root.err());
     }
 
     // -----------------------------------------------------------------------
@@ -910,15 +1091,213 @@ mod tests {
     // verify_bundle_with_digest
     // -----------------------------------------------------------------------
 
-    #[tokio::test]
-    async fn verify_bundle_with_invalid_digest() {
+    #[test]
+    fn verify_bundle_with_invalid_digest() {
+        // Phase 32 D-32-02: uses frozen fixture instead of live production root.
         let json = make_public_key_bundle_json("key");
-        let bundle = Bundle::from_json(&json).unwrap();
-        let root = load_production_trusted_root().await.unwrap();
+        let bundle = Bundle::from_json(&json).expect("bundle parses (test fixture)");
+        let root = crate::trust::load_test_trusted_root()
+            .expect("frozen fixture loads (Plan 01 wave 0 dependency)");
         let policy = VerificationPolicy::default();
         let result =
             verify_bundle_with_digest("not-hex!", &bundle, &root, &policy, Path::new("test"));
         assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // load_production_trusted_root — cache round-trip + error cases (D-32-01/03/05)
+    // -----------------------------------------------------------------------
+
+    /// Process-global lock for tests that mutate NONO_TEST_HOME.
+    ///
+    /// Rust unit tests run in parallel within the same process, so concurrent
+    /// env var mutations cause flaky failures. All env-mutating tests below
+    /// acquire this lock before touching env vars.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// RAII guard that sets NONO_TEST_HOME for the duration of the test and
+    /// restores the original value (or removes it) on drop.
+    ///
+    /// The `#[allow(clippy::disallowed_methods)]` on the impl blocks is the
+    /// same pattern used in `nono-cli/src/test_env.rs::EnvVarGuard` — this IS
+    /// the safe wrapper around env var mutation.
+    struct TestHomeGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        prev: Option<String>,
+    }
+
+    impl TestHomeGuard {
+        #[allow(clippy::disallowed_methods)]
+        fn set(val: &str) -> Self {
+            let _lock = match ENV_LOCK.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            let prev = std::env::var("NONO_TEST_HOME").ok();
+            std::env::set_var("NONO_TEST_HOME", val);
+            Self { _lock, prev }
+        }
+    }
+
+    #[allow(clippy::disallowed_methods)]
+    impl Drop for TestHomeGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => std::env::set_var("NONO_TEST_HOME", v),
+                None => std::env::remove_var("NONO_TEST_HOME"),
+            }
+        }
+    }
+
+    #[test]
+    fn cache_round_trip() {
+        // D-32-01: write a TrustedRoot to a temp path, read it back via
+        // load_production_trusted_root(), assert structural non-error round-trip.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().to_path_buf();
+        let cache_dir = home.join(".nono").join("trust-root");
+        std::fs::create_dir_all(&cache_dir).expect("create cache dir");
+        let cache_path = cache_dir.join("trusted_root.json");
+
+        // Copy the frozen fixture into the cache location
+        let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("trust-root-frozen.json");
+        std::fs::copy(&fixture, &cache_path).expect("copy fixture to cache");
+
+        let _guard = TestHomeGuard::set(home.to_str().expect("home is valid UTF-8"));
+        let result = load_production_trusted_root();
+        drop(_guard);
+
+        assert!(
+            result.is_ok(),
+            "cache round-trip must succeed: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn missing_cache_fails_closed() {
+        // D-32-05: NONO_TEST_HOME points at an empty dir => TrustPolicy error.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().to_path_buf();
+        // create the .nono/trust-root dir but NOT the trusted_root.json
+        std::fs::create_dir_all(home.join(".nono").join("trust-root")).expect("create cache dir");
+
+        let _guard = TestHomeGuard::set(home.to_str().expect("home is valid UTF-8"));
+        let result = load_production_trusted_root();
+        drop(_guard);
+
+        assert!(result.is_err(), "missing cache must fail");
+        let err_str = result.unwrap_err().to_string();
+        assert!(
+            err_str.contains("Sigstore trusted root not initialized"),
+            "error must mention 'Sigstore trusted root not initialized', got: {err_str}"
+        );
+        assert!(
+            err_str.contains("nono setup --refresh-trust-root"),
+            "error must mention recovery command, got: {err_str}"
+        );
+    }
+
+    #[test]
+    fn expired_cache_fails_closed_with_recovery_hint() {
+        // D-32-03: all tlogs have valid_for.end in the past => TrustVerification error.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().to_path_buf();
+        let cache_dir = home.join(".nono").join("trust-root");
+        std::fs::create_dir_all(&cache_dir).expect("create cache dir");
+
+        // Build a minimal TrustedRoot JSON with all tlog keys expired.
+        // Uses a real ECDSA P-256 DER-encoded public key (from frozen fixture)
+        // to satisfy sigstore-rs's TrustedRoot parser.
+        let expired_root_json = r#"{
+            "mediaType": "application/vnd.dev.sigstore.trustedroot+json;version=0.1",
+            "tlogs": [
+                {
+                    "baseUrl": "https://rekor.sigstore.dev",
+                    "hashAlgorithm": "SHA2_256",
+                    "publicKey": {
+                        "rawBytes": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE2G2Y+2tabdTV5BcGiBIx0a9fAFwrkBbmLSGtks4L3qX6yYY0zufBnhC8Ur/iy55GhWP/9A/bY2LhC30M9+RYtw==",
+                        "keyDetails": "PKIX_ECDSA_P256_SHA_256",
+                        "validFor": {
+                            "start": "1970-01-01T00:00:00Z",
+                            "end": "1970-01-02T00:00:00Z"
+                        }
+                    },
+                    "logId": {
+                        "keyId": "wNI9atQGlz+VWfO6LRygH4QUfY/8W4RFwiT5i5WRgB0="
+                    }
+                }
+            ],
+            "certificateAuthorities": [],
+            "ctlogs": [],
+            "timestampAuthorities": []
+        }"#;
+
+        let cache_path = cache_dir.join("trusted_root.json");
+        std::fs::write(&cache_path, expired_root_json).expect("write expired root");
+
+        let _guard = TestHomeGuard::set(home.to_str().expect("home is valid UTF-8"));
+        let result = load_production_trusted_root();
+        drop(_guard);
+
+        assert!(result.is_err(), "expired cache must fail");
+        let err_str = result.unwrap_err().to_string();
+        assert!(
+            err_str.contains("expired"),
+            "error must mention 'expired', got: {err_str}"
+        );
+        assert!(
+            err_str.contains("nono setup --refresh-trust-root"),
+            "error must mention recovery command, got: {err_str}"
+        );
+    }
+
+    #[test]
+    fn load_test_trusted_root_smoke() {
+        // D-32-06 / D-32-15 #2: helper smoke test — must succeed against the
+        // frozen fixture committed by Plan 01.
+        let root = crate::trust::load_test_trusted_root();
+        assert!(
+            root.is_ok(),
+            "load_test_trusted_root must succeed: {:?}",
+            root.err()
+        );
+    }
+
+    #[test]
+    fn current_date_iso_prefix_pins_known_dates() {
+        // P32-CHK-013: regression guard for the hand-rolled civil-from-days
+        // arithmetic. Pinning known epoch seconds -> expected ISO-8601 date
+        // catches off-by-one drift if the formula is ever touched.
+        //
+        // Verified values (Python: calendar.timegm(datetime(Y,M,D).timetuple())):
+        // 2026-05-09 00:00:00 UTC = 1_778_284_800
+        // 2024-01-01 00:00:00 UTC = 1_704_067_200
+        // 2000-02-29 00:00:00 UTC =   951_782_400  (leap year sentinel)
+        // 1970-01-01 00:00:00 UTC =             0  (epoch sentinel)
+        assert_eq!(
+            current_date_iso_prefix_for_secs(1_778_284_800),
+            "2026-05-09",
+            "2026-05-09 epoch sentinel"
+        );
+        assert_eq!(
+            current_date_iso_prefix_for_secs(1_704_067_200),
+            "2024-01-01",
+            "2024-01-01 epoch sentinel"
+        );
+        assert_eq!(
+            current_date_iso_prefix_for_secs(951_782_400),
+            "2000-02-29",
+            "2000-02-29 leap year sentinel"
+        );
+        assert_eq!(
+            current_date_iso_prefix_for_secs(0),
+            "1970-01-01",
+            "UNIX epoch sentinel"
+        );
     }
 
     // -----------------------------------------------------------------------

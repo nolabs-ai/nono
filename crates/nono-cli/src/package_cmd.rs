@@ -443,13 +443,8 @@ fn download_and_verify_artifacts(
     package_ref: &PackageRef,
     pull: &PullResponse,
 ) -> Result<VerifiedDownloads> {
-    // load_production_trusted_root is async in this fork (TUF refresh in tokio).
-    // Mirrors the existing pattern at trust_cmd.rs:907-913 / trust_intercept.rs:373-378.
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| NonoError::RegistryError(format!("failed to create async runtime: {e}")))?;
-    let trusted_root = rt.block_on(nono::trust::load_production_trusted_root())?;
+    // Phase 32 D-32-01: load_production_trusted_root is now sync (reads from cache).
+    let trusted_root = nono::trust::load_production_trusted_root()?;
     let policy = nono::trust::VerificationPolicy::default();
     let bundle_path = Path::new(".nono-trust.bundle");
 

@@ -639,8 +639,7 @@ fn combo_rollback_audit_session_findable_by_audit_verify() {
         String::from_utf8_lossy(&verify_output.stdout),
     );
 
-    let json: Value =
-        serde_json::from_slice(&verify_output.stdout).expect("parse verify json");
+    let json: Value = serde_json::from_slice(&verify_output.stdout).expect("parse verify json");
     assert_eq!(
         json["attestation_present"], true,
         "verify output should report attestation_present=true; full json: {json}",
@@ -728,11 +727,7 @@ fn combo_rollback_audit_session_findable_by_rollback_list() {
     // inlined nono_home_dir() derivation would still break this test on
     // Windows production AND break the audit verify path
     // (combo_rollback_audit_session_findable_by_audit_verify).
-    let list_output = run_nono(
-        &["rollback", "list", "--all", "--json"],
-        &home,
-        &workspace,
-    );
+    let list_output = run_nono(&["rollback", "list", "--all", "--json"], &home, &workspace);
     assert!(
         list_output.status.success(),
         "BL-02 regression: `nono rollback list --all --json` should succeed. \
@@ -741,8 +736,8 @@ fn combo_rollback_audit_session_findable_by_rollback_list() {
         String::from_utf8_lossy(&list_output.stdout),
     );
 
-    let list_json: Value = serde_json::from_slice(&list_output.stdout)
-        .expect("parse rollback list json");
+    let list_json: Value =
+        serde_json::from_slice(&list_output.stdout).expect("parse rollback list json");
     let entries = list_json
         .as_array()
         .expect("rollback list json is an array");

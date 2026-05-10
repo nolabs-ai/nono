@@ -784,31 +784,27 @@ impl WindowsSupervisorRuntime {
                                     match msg {
                                         nono::supervisor::SupervisorMessage::Terminate {
                                             session_id: msg_session_id,
-                                        } => {
-                                            if msg_session_id == user_session_id {
-                                                tracing::info!(
-                                                    "Terminate requested via control pipe for session {}",
-                                                    user_session_id
-                                                );
-                                                terminate_requested.store(true, Ordering::SeqCst);
-                                                break;
-                                            }
+                                        } if msg_session_id == user_session_id => {
+                                            tracing::info!(
+                                                "Terminate requested via control pipe for session {}",
+                                                user_session_id
+                                            );
+                                            terminate_requested.store(true, Ordering::SeqCst);
+                                            break;
                                         }
                                         nono::supervisor::SupervisorMessage::Detach {
                                             session_id: msg_session_id,
-                                        } => {
-                                            if msg_session_id == user_session_id {
-                                                tracing::info!(
-                                                    "Detach requested via control pipe for session {}",
-                                                    user_session_id
-                                                );
-                                                let mut lock = active_attachment
-                                                    .lock()
-                                                    .unwrap_or_else(|p| p.into_inner());
-                                                if let Some(sendable) = lock.take() {
-                                                    unsafe {
-                                                        DisconnectNamedPipe(sendable.0);
-                                                    }
+                                        } if msg_session_id == user_session_id => {
+                                            tracing::info!(
+                                                "Detach requested via control pipe for session {}",
+                                                user_session_id
+                                            );
+                                            let mut lock = active_attachment
+                                                .lock()
+                                                .unwrap_or_else(|p| p.into_inner());
+                                            if let Some(sendable) = lock.take() {
+                                                unsafe {
+                                                    DisconnectNamedPipe(sendable.0);
                                                 }
                                             }
                                         }
@@ -2176,15 +2172,15 @@ mod capability_handler_tests {
     //! **Phase 29 (v2.3) — locked as permanent design property (Option c).**
     //! The mask-gate-before-prompt vs broker-failure-flip-after-prompt
     //! distinction is a structural reflection of what is checkable
-    //! upfront (O(1) profile lookup against the supervisor's mask
-    //! allowlist) vs only via OS interaction (O(syscall) post-approval —
+    //! upfront (`O(1)` profile lookup against the supervisor's mask
+    //! allowlist) vs only via OS interaction (`O(syscall)` post-approval:
     //! Pipe direction requires `GetNamedPipeInfo`; Socket privileged-port
-    //! + role allowlist requires `bind()` to attempt the kernel op). It
-    //! is NOT a bug to unify. Forcing pre-prompt rejection for Pipe/Socket
-    //! would require re-implementing kernel checks in supervisor space
-    //! (security regression — violates defense-in-depth) or deferring all
-    //! approval prompts until after broker attempts (UX regression —
-    //! breaks the approval-then-action contract Phase 18 shipped).
+    //! and role allowlist requires `bind()` to attempt the kernel op).
+    //! Unifying these two stages would not be correct. Forcing pre-prompt
+    //! rejection for Pipe/Socket would require re-implementing kernel checks
+    //! in supervisor space (security regression, violates defense-in-depth)
+    //! or deferring all approval prompts until after broker attempts
+    //! (UX regression, breaks the approval-then-action contract Phase 18 shipped).
     //!
     //! See `.planning/PROJECT.md § Key Decisions — WR-01 reject-stage
     //! asymmetry` for the locked verdict and `.planning/phases/29-wr01-

@@ -244,19 +244,12 @@ pub fn verify_policy_signature(policy_path: &Path) -> Result<()> {
             // the trust policy is the root document that defines which identities
             // are trusted, so there is no higher-level document to check against.
             // Operator/user acceptance of the initial policy is the bootstrap step.
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| nono::NonoError::TrustVerification {
-                    path: policy_path.display().to_string(),
-                    reason: format!("failed to create async runtime: {e}"),
-                })?;
-            let trusted_root = rt
-                .block_on(trust::load_production_trusted_root())
-                .map_err(|e| nono::NonoError::TrustVerification {
+            let trusted_root = trust::load_production_trusted_root().map_err(|e| {
+                nono::NonoError::TrustVerification {
                     path: policy_path.display().to_string(),
                     reason: format!("failed to load Sigstore trusted root: {e}"),
-                })?;
+                }
+            })?;
 
             let sigstore_policy = trust::VerificationPolicy::default();
 
@@ -750,17 +743,11 @@ fn verify_keyless_crypto(
     bundle: &trust::Bundle,
     bundle_path: &Path,
 ) -> std::result::Result<(), VerificationOutcome> {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| VerificationOutcome::InvalidSignature {
-            detail: format!("failed to create async runtime: {e}"),
-        })?;
-    let trusted_root = rt
-        .block_on(trust::load_production_trusted_root())
-        .map_err(|e| VerificationOutcome::InvalidSignature {
+    let trusted_root = trust::load_production_trusted_root().map_err(|e| {
+        VerificationOutcome::InvalidSignature {
             detail: format!("failed to load Sigstore trusted root: {e}"),
-        })?;
+        }
+    })?;
 
     let policy = trust::VerificationPolicy::default();
 

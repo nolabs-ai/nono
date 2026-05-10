@@ -904,12 +904,7 @@ fn verify_multi_subject_file(
                 .first()
                 .map(|(_, d)| d.as_str())
                 .ok_or("no subjects in bundle")?;
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| format!("failed to create async runtime: {e}"))?;
-            let trusted_root = rt
-                .block_on(trust::load_production_trusted_root())
+            let trusted_root = trust::load_production_trusted_root()
                 .map_err(|e| format!("failed to load Sigstore trusted root: {e}"))?;
             let sigstore_policy = trust::VerificationPolicy::default();
             trust::verify_bundle_with_digest(
@@ -1024,12 +1019,7 @@ fn verify_single_file(
                 .map_err(|e| format!("signature verification failed: {e}"))?;
         }
         trust::SignerIdentity::Keyless { .. } => {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| format!("failed to create async runtime: {e}"))?;
-            let trusted_root = rt
-                .block_on(trust::load_production_trusted_root())
+            let trusted_root = trust::load_production_trusted_root()
                 .map_err(|e| format!("failed to load Sigstore trusted root: {e}"))?;
             let sigstore_policy = trust::VerificationPolicy::default();
             trust::verify_bundle_with_digest(

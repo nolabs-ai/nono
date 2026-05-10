@@ -91,21 +91,17 @@ impl CapabilityManifest {
 
             if let Some(ref inject) = cred.inject {
                 match inject.mode {
-                    InjectMode::UrlPath => {
-                        if inject.path_pattern.is_none() {
-                            return Err(crate::NonoError::ConfigParse(format!(
-                                "credential '{}': url_path inject mode requires path_pattern",
-                                cred.name.as_str()
-                            )));
-                        }
+                    InjectMode::UrlPath if inject.path_pattern.is_none() => {
+                        return Err(crate::NonoError::ConfigParse(format!(
+                            "credential '{}': url_path inject mode requires path_pattern",
+                            cred.name.as_str()
+                        )));
                     }
-                    InjectMode::QueryParam => {
-                        if inject.query_param_name.is_none() {
-                            return Err(crate::NonoError::ConfigParse(format!(
-                                "credential '{}': query_param inject mode requires query_param_name",
-                                cred.name.as_str()
-                            )));
-                        }
+                    InjectMode::QueryParam if inject.query_param_name.is_none() => {
+                        return Err(crate::NonoError::ConfigParse(format!(
+                            "credential '{}': query_param inject mode requires query_param_name",
+                            cred.name.as_str()
+                        )));
                     }
                     _ => {}
                 }

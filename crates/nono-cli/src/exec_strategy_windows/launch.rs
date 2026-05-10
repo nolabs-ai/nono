@@ -2176,13 +2176,13 @@ mod broker_dispatch_tests {
     use nono::NonoError;
     use std::os::windows::ffi::OsStrExt;
     use std::path::PathBuf;
-    use windows_sys::Win32::Foundation::{BOOL, CloseHandle, GetLastError, HANDLE};
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, BOOL, HANDLE};
     use windows_sys::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob,
     };
     use windows_sys::Win32::System::Threading::{
-        CREATE_SUSPENDED, CreateProcessW, PROCESS_INFORMATION, ResumeThread, STARTUPINFOW,
-        TerminateProcess,
+        CreateProcessW, ResumeThread, TerminateProcess, CREATE_SUSPENDED, PROCESS_INFORMATION,
+        STARTUPINFOW,
     };
 
     /// Phase 31 D-07: `NonoError::BrokerNotFound { path }` is the structured
@@ -2362,9 +2362,7 @@ mod broker_dispatch_tests {
                 // releases the OS resource. We must clean up before panicking.
                 CloseHandle(job);
             }
-            panic!(
-                "CreateProcessW(broker) failed; GetLastError={err}; cmd was: {cmd}"
-            );
+            panic!("CreateProcessW(broker) failed; GetLastError={err}; cmd was: {cmd}");
         }
 
         // D-04: assign to Job Object BEFORE ResumeThread so the broker is

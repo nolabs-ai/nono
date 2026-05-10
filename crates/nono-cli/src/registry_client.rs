@@ -398,8 +398,8 @@ mod tests {
     ///
     /// 10.255.255.1 is RFC1918 unroutable; connect attempts get
     /// network-unreachable or hit the configured 10s connect timeout
-    /// + 30s response timeout. Either failure mode passes the test
-    /// — what matters is the call DOES NOT block forever.
+    /// (plus 30s response timeout). Either failure mode passes the test;
+    /// what matters is the call DOES NOT block forever.
     #[test]
     fn registry_client_connect_timeout_fires_within_bounded_window() {
         let client = RegistryClient::new("http://unused".to_string());

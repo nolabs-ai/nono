@@ -254,7 +254,7 @@ fi
 # ===========================================================================
 echo ""
 echo "Fork-divergence catalog explicit entries:"
-for entry in 'validate_path_within' 'load_production_trusted_root' 'hooks.rs' '#[cfg(target_os = "windows")]'; do
+for entry in 'validate_path_within' 'load_production_trusted_root' 'hooks.rs' '#[cfg(target_os = "windows")]'; do  # intentional fork: Phase 32 D-32-01
     if grep -qF "$entry" "$TEMPLATE_PATH"; then
         pass "fork-divergence catalog mentions: $entry"
     else

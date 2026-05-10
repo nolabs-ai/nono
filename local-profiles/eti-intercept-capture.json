@@ -1,0 +1,17 @@
+{
+  "extends": "linux-eti-git-ssh",
+  "meta": {
+    "name": "eti-intercept-capture",
+    "version": "1.0.0",
+    "description": "Test profile: Capture intercept action buffers git credential output through the token broker."
+  },
+  "command_policies": {
+    "commands": {
+      "git": {
+        "intercept": [
+          { "args": ["version"], "action": { "type": "capture" } }
+        ]
+      }
+    }
+  }
+}

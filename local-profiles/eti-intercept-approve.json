@@ -1,0 +1,17 @@
+{
+  "extends": "linux-eti-git-ssh",
+  "meta": {
+    "name": "eti-intercept-approve",
+    "version": "1.0.0",
+    "description": "Test profile: Approve intercept action blocks git push for terminal approval."
+  },
+  "command_policies": {
+    "commands": {
+      "git": {
+        "intercept": [
+          { "args": ["push"], "action": { "type": "approve", "timeout_secs": 30 } }
+        ]
+      }
+    }
+  }
+}

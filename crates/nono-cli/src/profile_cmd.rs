@@ -2304,6 +2304,18 @@ pub(crate) fn cmd_validate(args: ProfileValidateArgs) -> Result<()> {
             "filesystem.suppress_save_prompt",
             &mut warnings,
         );
+
+        // Step 6: Validate command_policies (intercept rules, identifiers, etc.)
+        let cp_report = crate::command_policy::validate_command_policies(
+            profile.command_policies.as_ref(),
+            crate::command_policy::CommandPolicyValidationScope::Syntax,
+        );
+        for f in &cp_report.errors {
+            errors.push(format!("[{}] {}", f.code, f.message));
+        }
+        for f in &cp_report.warnings {
+            warnings.push(format!("[{}] {}", f.code, f.message));
+        }
     }
 
     if args.json {
@@ -3759,6 +3771,117 @@ mod tests {
         assert!(
             result.is_err(),
             "promote should refuse to shadow built-in profiles"
+        );
+    }
+
+    #[test]
+    fn test_validate_intercept_catch_all_not_last_is_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("bad-intercept.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "meta": { "name": "test" },
+                "command_policies": {
+                    "commands": {
+                        "git": {
+                            "executable": "/usr/bin/git",
+                            "intercept": [
+                                { "args": [], "action": { "type": "passthrough" } },
+                                { "args": ["version"], "action": { "type": "respond", "stdout": "git version 0\n" } }
+                            ]
+                        }
+                    }
+                }
+            }"#,
+        )
+        .expect("write");
+
+        let args = ProfileValidateArgs {
+            file: path,
+            draft: false,
+            json: false,
+            strict: false,
+            help: None,
+        };
+        let result = cmd_validate(args);
+        assert!(
+            result.is_err(),
+            "catch-all before other rules must fail validation"
+        );
+    }
+
+    #[test]
+    fn test_validate_intercept_valid_rules_pass() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("valid-intercept.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "meta": { "name": "test" },
+                "command_policies": {
+                    "commands": {
+                        "git": {
+                            "executable": "/usr/bin/git",
+                            "intercept": [
+                                { "args": ["version"], "action": { "type": "respond", "stdout": "git version 0\n" } },
+                                { "args": ["push"], "action": { "type": "approve", "timeout_secs": 30 } },
+                                { "args": ["credential", "fill"], "action": { "type": "capture" } }
+                            ]
+                        }
+                    }
+                }
+            }"#,
+        )
+        .expect("write");
+
+        let args = ProfileValidateArgs {
+            file: path,
+            draft: false,
+            json: false,
+            strict: false,
+            help: None,
+        };
+        assert!(
+            cmd_validate(args).is_ok(),
+            "valid intercept rules should pass"
+        );
+    }
+
+    #[test]
+    fn test_validate_intercept_json_output_includes_findings() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("bad-intercept-json.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "meta": { "name": "test" },
+                "command_policies": {
+                    "commands": {
+                        "git": {
+                            "executable": "/usr/bin/git",
+                            "intercept": [
+                                { "args": [], "action": { "type": "passthrough" } },
+                                { "args": ["push"], "action": { "type": "approve" } }
+                            ]
+                        }
+                    }
+                }
+            }"#,
+        )
+        .expect("write");
+
+        let args = ProfileValidateArgs {
+            file: path,
+            draft: false,
+            json: true,
+            strict: false,
+            help: None,
+        };
+        let result = cmd_validate(args);
+        assert!(
+            result.is_err(),
+            "catch-all before other rules must fail in JSON mode too"
         );
     }
 }

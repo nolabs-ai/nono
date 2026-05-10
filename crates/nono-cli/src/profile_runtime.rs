@@ -611,16 +611,21 @@ fn validate_command_policy_runtime_support(profile: &profile::Profile) -> crate:
         return Ok(());
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         Err(nono::NonoError::UnsupportedPlatform(
-            "ETI command_policies are Linux-only in v1; profile validation can inspect them, but run/shell/wrap require Linux enforcement".to_string(),
+            "ETI command_policies are only supported on Linux and macOS".to_string(),
         ))
     }
 
     #[cfg(target_os = "linux")]
     {
         validate_linux_command_policy_runtime_support(profile)
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        validate_macos_command_policy_runtime_support(profile)
     }
 }
 
@@ -647,6 +652,17 @@ fn validate_linux_command_policy_runtime_support(profile: &profile::Profile) -> 
             "ETI profile uses TCP port network rules but {} lacks Landlock TCP support (requires ABI V4+)",
             abi
         )));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn validate_macos_command_policy_runtime_support(profile: &profile::Profile) -> crate::Result<()> {
+    if let Some(command_policies) = profile.command_policies.as_ref() {
+        let _resolved = crate::command_policy::resolve_policy_command_binaries(
+            command_policies,
+            std::env::var_os("PATH"),
+        )?;
     }
     Ok(())
 }
@@ -749,15 +765,15 @@ mod tests {
         assert!(validate_command_policy_runtime_support(&profile::Profile::default()).is_ok());
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     #[test]
-    fn active_command_policy_runtime_support_rejects_non_linux() {
+    fn active_command_policy_runtime_support_rejects_unsupported_platform() {
         let err = validate_command_policy_runtime_support(&active_command_policy_profile())
-            .expect_err("active ETI runtime must fail on non-Linux");
+            .expect_err("active ETI runtime must fail on unsupported platforms");
 
         assert!(
-            err.to_string().contains("Linux-only"),
-            "error should describe Linux-only ETI runtime: {err}"
+            err.to_string().contains("Linux and macOS"),
+            "error should describe supported platforms: {err}"
         );
     }
 

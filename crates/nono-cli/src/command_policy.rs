@@ -6,17 +6,17 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-#[cfg(any(test, target_os = "linux"))]
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
 use std::ffi::OsString;
-#[cfg(any(test, target_os = "linux"))]
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
 use std::fs;
-#[cfg(any(test, target_os = "linux"))]
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
-#[cfg(any(test, target_os = "linux"))]
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
 use std::path::PathBuf;
 
-#[cfg(any(test, target_os = "linux"))]
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
 use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,14 +55,14 @@ pub(crate) struct CommandPolicyValidationReport {
     pub info: Vec<CommandPolicyFinding>,
 }
 
-#[cfg(any(test, target_os = "linux"))]
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ResolvedCommandBinaries {
     pub commands: BTreeMap<String, ResolvedCommandBinary>,
     pub warnings: Vec<CommandPolicyFinding>,
 }
 
-#[cfg(any(test, target_os = "linux"))]
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ResolvedCommandBinary {
     pub name: String,
@@ -76,7 +76,7 @@ pub(crate) struct ResolvedCommandBinary {
     pub shape: ResolvedExecutableShape,
 }
 
-#[cfg(any(test, target_os = "linux"))]
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ResolvedExecutableKind {
@@ -85,7 +85,7 @@ pub(crate) enum ResolvedExecutableKind {
     Other,
 }
 
-#[cfg(any(test, target_os = "linux"))]
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct ResolvedExecutableShape {
     pub kind: ResolvedExecutableKind,
@@ -538,7 +538,7 @@ pub(crate) fn validate_legacy_blocked_command_interactions(
     report
 }
 
-#[cfg(any(test, target_os = "linux"))]
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
 pub(crate) fn resolve_policy_command_binaries(
     config: &CommandPoliciesConfig,
     path_env: Option<OsString>,
@@ -997,14 +997,14 @@ fn validate_resolved_references(
     }
 }
 
-#[cfg(any(test, target_os = "linux"))]
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
 #[derive(Debug, Clone)]
 struct CommandSearchDir {
     path: PathBuf,
     explicit: bool,
 }
 
-#[cfg(any(test, target_os = "linux"))]
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
 #[derive(Debug, Clone)]
 struct CommandMatch {
     canonical_path: PathBuf,
@@ -1016,7 +1016,7 @@ struct CommandMatch {
     shape: ResolvedExecutableShape,
 }
 
-#[cfg(any(test, target_os = "linux"))]
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
 fn command_search_dirs(
     config: &CommandPoliciesConfig,
     path_env: Option<OsString>,
@@ -1056,7 +1056,7 @@ fn command_search_dirs(
     Ok(dirs)
 }
 
-#[cfg(any(test, target_os = "linux"))]
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
 fn find_command_matches(
     command_name: &str,
     search_dirs: &[CommandSearchDir],
@@ -1086,7 +1086,7 @@ fn find_command_matches(
     Ok(matches)
 }
 
-#[cfg(any(test, target_os = "linux"))]
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
 fn exact_command_match(command_name: &str, executable: &str) -> nono::Result<CommandMatch> {
     let path = PathBuf::from(executable);
     match candidate_command_match(&path)? {
@@ -1098,7 +1098,7 @@ fn exact_command_match(command_name: &str, executable: &str) -> nono::Result<Com
     }
 }
 
-#[cfg(any(test, target_os = "linux"))]
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
 fn candidate_command_match(candidate: &Path) -> nono::Result<Option<CommandMatch>> {
     let metadata = match fs::metadata(candidate) {
         Ok(metadata) => metadata,
@@ -1148,7 +1148,7 @@ fn candidate_command_match(candidate: &Path) -> nono::Result<Option<CommandMatch
     }))
 }
 
-#[cfg(any(test, target_os = "linux"))]
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
 fn classify_executable_shape(path: &Path, bytes: &[u8]) -> nono::Result<ResolvedExecutableShape> {
     if bytes.starts_with(b"\x7fELF") {
         return Ok(ResolvedExecutableShape {
@@ -1194,7 +1194,7 @@ fn classify_executable_shape(path: &Path, bytes: &[u8]) -> nono::Result<Resolved
     })
 }
 
-#[cfg(any(test, target_os = "linux"))]
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
 fn duplicate_distinct_inode_paths(
     selected: &CommandMatch,
     matches: &[CommandMatch],
@@ -2022,17 +2022,24 @@ mod tests {
 
     #[test]
     fn intercept_action_default_is_passthrough() {
-        assert_eq!(InterceptActionConfig::default(), InterceptActionConfig::Passthrough);
+        assert_eq!(
+            InterceptActionConfig::default(),
+            InterceptActionConfig::Passthrough
+        );
     }
 
     #[test]
     fn intercept_action_serde_roundtrip() {
-        let respond = InterceptActionConfig::Respond { stdout: "hello\n".to_string() };
+        let respond = InterceptActionConfig::Respond {
+            stdout: "hello\n".to_string(),
+        };
         let json = serde_json::to_string(&respond).expect("serialize");
         let back: InterceptActionConfig = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(respond, back);
 
-        let approve = InterceptActionConfig::Approve { timeout_secs: Some(30) };
+        let approve = InterceptActionConfig::Approve {
+            timeout_secs: Some(30),
+        };
         let json = serde_json::to_string(&approve).expect("serialize");
         let back: InterceptActionConfig = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(approve, back);
@@ -2088,7 +2095,10 @@ mod tests {
         let mut config = active_git_config();
         if let Some(git) = config.commands.get_mut("git") {
             git.intercept = vec![
-                InterceptRuleConfig { args: vec![], action: InterceptActionConfig::Passthrough },
+                InterceptRuleConfig {
+                    args: vec![],
+                    action: InterceptActionConfig::Passthrough,
+                },
                 InterceptRuleConfig {
                     args: vec!["push".to_string()],
                     action: InterceptActionConfig::Approve { timeout_secs: None },
@@ -2098,7 +2108,10 @@ mod tests {
         let report =
             validate_command_policies(Some(&config), CommandPolicyValidationScope::Resolved);
         assert!(
-            report.errors.iter().any(|f| f.code == "intercept_rule_after_catch_all"),
+            report
+                .errors
+                .iter()
+                .any(|f| f.code == "intercept_rule_after_catch_all"),
             "expected intercept_rule_after_catch_all error"
         );
     }
@@ -2112,13 +2125,19 @@ mod tests {
                     args: vec!["push".to_string()],
                     action: InterceptActionConfig::Approve { timeout_secs: None },
                 },
-                InterceptRuleConfig { args: vec![], action: InterceptActionConfig::Passthrough },
+                InterceptRuleConfig {
+                    args: vec![],
+                    action: InterceptActionConfig::Passthrough,
+                },
             ];
         }
         let report =
             validate_command_policies(Some(&config), CommandPolicyValidationScope::Resolved);
         assert!(
-            !report.errors.iter().any(|f| f.code == "intercept_rule_after_catch_all"),
+            !report
+                .errors
+                .iter()
+                .any(|f| f.code == "intercept_rule_after_catch_all"),
             "unexpected intercept_rule_after_catch_all error"
         );
     }

@@ -113,7 +113,9 @@ impl TokenBroker {
 fn is_nonce(s: &str) -> bool {
     s.len() == NONCE_LEN
         && s.starts_with(NONCE_PREFIX)
-        && s[NONCE_PREFIX.len()..].bytes().all(|b| b.is_ascii_hexdigit())
+        && s[NONCE_PREFIX.len()..]
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit())
 }
 
 #[cfg(test)]
@@ -128,7 +130,9 @@ mod tests {
         assert!(is_nonce(&nonce), "issued nonce must be well-formed");
 
         let entry = format!("MY_SECRET={nonce}").into_bytes();
-        let resolved = broker.resolve_env_entry(&entry).expect("nonce should resolve");
+        let resolved = broker
+            .resolve_env_entry(&entry)
+            .expect("nonce should resolve");
         assert_eq!(resolved, b"MY_SECRET=hunter2");
     }
 
@@ -158,7 +162,10 @@ mod tests {
         let result_str = std::str::from_utf8(&result).expect("utf8");
 
         // The original nonce must be replaced with a fresh nonce
-        assert!(!result_str.contains(&nonce), "original nonce must not appear in output");
+        assert!(
+            !result_str.contains(&nonce),
+            "original nonce must not appear in output"
+        );
         // But the fresh nonce is there and resolves to the same secret
         let new_nonce_start = result_str.find(NONCE_PREFIX).expect("new nonce in output");
         let new_nonce = &result_str[new_nonce_start..new_nonce_start + NONCE_LEN];

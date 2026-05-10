@@ -256,7 +256,7 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
         } else {
             exec_strategy::LinuxNetworkNotifyMode::AfUnixOnly
         },
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         eti_runtime: config.eti_runtime,
     };
 

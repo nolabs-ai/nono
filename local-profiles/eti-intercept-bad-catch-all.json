@@ -1,0 +1,18 @@
+{
+  "meta": {
+    "name": "eti-intercept-bad-catch-all",
+    "version": "1.0.0",
+    "description": "Invalid profile: catch-all intercept rule appears before specific rules. Used to test profile validate error reporting."
+  },
+  "command_policies": {
+    "commands": {
+      "git": {
+        "executable": "/usr/bin/git",
+        "intercept": [
+          { "args": [], "action": { "type": "passthrough" } },
+          { "args": ["push"], "action": { "type": "approve" } }
+        ]
+      }
+    }
+  }
+}

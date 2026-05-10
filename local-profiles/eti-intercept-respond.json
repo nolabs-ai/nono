@@ -1,0 +1,17 @@
+{
+  "extends": "linux-eti-git-ssh",
+  "meta": {
+    "name": "eti-intercept-respond",
+    "version": "1.0.0",
+    "description": "Test profile: Respond intercept action returns static stdout without forking git."
+  },
+  "command_policies": {
+    "commands": {
+      "git": {
+        "intercept": [
+          { "args": ["version"], "action": { "type": "respond", "stdout": "git version 99.0.0-fake\n" } }
+        ]
+      }
+    }
+  }
+}

@@ -38,7 +38,7 @@ impl ApprovalBackend for TerminalApproval {
                     sanitize_for_terminal(&path.display().to_string())
                 );
                 eprintln!("[nono]   Access: {}", format_access_mode(access));
-                if let Some(ref r) = reason {
+                if let Some(r) = reason {
                     eprintln!("[nono]   Reason: {}", sanitize_for_terminal(r));
                 }
             }
@@ -50,13 +50,10 @@ impl ApprovalBackend for TerminalApproval {
                 ..
             } => {
                 eprintln!("[nono] The sandboxed process is requesting network access:");
-                eprintln!(
-                    "[nono]   Host:     {}",
-                    sanitize_for_terminal(host)
-                );
+                eprintln!("[nono]   Host:     {}", sanitize_for_terminal(host));
                 eprintln!("[nono]   Port:     {port}");
                 eprintln!("[nono]   Protocol: {protocol}");
-                if let Some(ref r) = reason {
+                if let Some(r) = reason {
                     eprintln!("[nono]   Reason: {}", sanitize_for_terminal(r));
                 }
             }
@@ -69,10 +66,7 @@ impl ApprovalBackend for TerminalApproval {
                 ..
             } => {
                 eprintln!("[nono] ETI command launch requires approval:");
-                eprintln!(
-                    "[nono]   Command: {}",
-                    sanitize_for_terminal(command)
-                );
+                eprintln!("[nono]   Command: {}", sanitize_for_terminal(command));
                 let display_args: Vec<String> = args
                     .iter()
                     .skip(1)
@@ -82,8 +76,11 @@ impl ApprovalBackend for TerminalApproval {
                     eprintln!("[nono]   Args:    {}", display_args.join(" "));
                 }
                 eprintln!("[nono]   Caller:  {}", sanitize_for_terminal(caller));
-                eprintln!("[nono]   Rule:    {}", sanitize_for_terminal(intercept_rule));
-                if let Some(ref r) = reason {
+                eprintln!(
+                    "[nono]   Rule:    {}",
+                    sanitize_for_terminal(intercept_rule)
+                );
+                if let Some(r) = reason {
                     eprintln!("[nono]   Reason: {}", sanitize_for_terminal(r));
                 }
             }
@@ -182,13 +179,165 @@ fn format_access_mode(access: &AccessMode) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nono::AccessMode;
+    use nono::{AccessMode, ApprovalRequest};
+
+    // ── helpers ──────────────────────────────────────────────────────────────
+
+    fn capability_request() -> ApprovalRequest {
+        ApprovalRequest::Capability {
+            request_id: "cap-001".to_string(),
+            path: "/tmp/test".into(),
+            access: AccessMode::ReadWrite,
+            reason: Some("need scratch space".to_string()),
+            child_pid: 42,
+            session_id: "sess-001".to_string(),
+        }
+    }
+
+    fn network_request() -> ApprovalRequest {
+        ApprovalRequest::Network {
+            request_id: "net-001".to_string(),
+            host: "api.example.com".to_string(),
+            port: 443,
+            protocol: "tcp".to_string(),
+            resolved_ips: vec!["93.184.216.34".to_string()],
+            reason: Some("fetch credentials".to_string()),
+            child_pid: 42,
+            session_id: "sess-001".to_string(),
+        }
+    }
+
+    fn command_request() -> ApprovalRequest {
+        ApprovalRequest::Command {
+            request_id: "cmd-001".to_string(),
+            command: "git".to_string(),
+            args: vec!["git".to_string(), "push".to_string(), "--force".to_string()],
+            caller: "session".to_string(),
+            intercept_rule: "push --force".to_string(),
+            reason: None,
+            child_pid: 42,
+            session_id: "sess-001".to_string(),
+        }
+    }
+
+    // ── backend name ─────────────────────────────────────────────────────────
 
     #[test]
     fn test_terminal_approval_backend_name() {
         let backend = TerminalApproval;
         assert_eq!(backend.backend_name(), "terminal");
     }
+
+    // ── non-TTY auto-deny (all three variants) ────────────────────────────────
+    //
+    // When stderr is not a terminal (e.g. in CI or when redirected), the
+    // backend must return Denied for every request type without attempting to
+    // read from /dev/tty. These tests run fully automated.
+
+    #[test]
+    fn non_tty_auto_denies_capability_request() {
+        // In a test runner stderr is never a terminal.
+        let backend = TerminalApproval;
+        let decision = backend
+            .request_approval(&capability_request())
+            .expect("no error");
+        assert!(
+            decision.is_denied(),
+            "expected Denied when stderr is not a terminal"
+        );
+    }
+
+    #[test]
+    fn non_tty_auto_denies_network_request() {
+        let backend = TerminalApproval;
+        let decision = backend
+            .request_approval(&network_request())
+            .expect("no error");
+        assert!(decision.is_denied());
+    }
+
+    #[test]
+    fn non_tty_auto_denies_command_request() {
+        let backend = TerminalApproval;
+        let decision = backend
+            .request_approval(&command_request())
+            .expect("no error");
+        assert!(decision.is_denied());
+    }
+
+    // ── auto-deny reason is populated ─────────────────────────────────────────
+
+    #[test]
+    fn non_tty_denial_carries_reason() {
+        let backend = TerminalApproval;
+        let decision = backend
+            .request_approval(&command_request())
+            .expect("no error");
+        match decision {
+            nono::ApprovalDecision::Denied { reason } => {
+                assert!(!reason.is_empty(), "denial reason must not be empty");
+            }
+            other => panic!("expected Denied, got {other:?}"),
+        }
+    }
+
+    // ── sanitize_for_terminal: adversarial network/command fields ──────────────
+    //
+    // The host, command, caller, and intercept_rule fields come from untrusted
+    // IPC input (the shim or the policy) and must be sanitised before display.
+
+    #[test]
+    fn sanitize_network_host_strips_ansi() {
+        let malicious_host = "api.example.com\x1b[2K\x1b[1Aevil.host";
+        let sanitized = sanitize_for_terminal(malicious_host);
+        assert!(!sanitized.contains('\x1b'));
+        assert!(sanitized.contains("api.example.com"));
+    }
+
+    #[test]
+    fn sanitize_network_host_strips_carriage_return() {
+        let malicious = "real.host\r\nevil.host";
+        let sanitized = sanitize_for_terminal(malicious);
+        assert!(!sanitized.contains('\r'));
+        assert!(!sanitized.contains('\n'));
+        assert!(sanitized.contains("real.host"));
+    }
+
+    #[test]
+    fn sanitize_command_name_strips_escape_sequences() {
+        let malicious_cmd = "git\x1b[1mgit\x1b[0m";
+        let sanitized = sanitize_for_terminal(malicious_cmd);
+        assert!(!sanitized.contains('\x1b'));
+        assert!(sanitized.contains("git"));
+    }
+
+    #[test]
+    fn sanitize_command_args_strips_null_bytes() {
+        let malicious_arg = "push\0--force";
+        let sanitized = sanitize_for_terminal(malicious_arg);
+        assert!(!sanitized.contains('\0'));
+    }
+
+    #[test]
+    fn sanitize_intercept_rule_strips_osc_title_change() {
+        // OSC sequence that would change the terminal title to disguise the rule
+        let malicious_rule = "push\x1b]0;harmless rule\x07--force";
+        let sanitized = sanitize_for_terminal(malicious_rule);
+        assert!(!sanitized.contains('\x1b'));
+        assert!(!sanitized.contains('\x07'));
+        assert!(sanitized.contains("push"));
+    }
+
+    #[test]
+    fn sanitize_caller_strips_control_chars() {
+        // Caller name from ETI IPC — must not contain control characters
+        let malicious_caller = "session\x01\x02\x03injected";
+        let sanitized = sanitize_for_terminal(malicious_caller);
+        assert!(!sanitized.chars().any(|c| c.is_control()));
+        assert!(sanitized.contains("session"));
+    }
+
+    // ── access-mode display ───────────────────────────────────────────────────
 
     #[test]
     fn test_format_access_mode() {

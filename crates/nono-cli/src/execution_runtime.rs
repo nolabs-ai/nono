@@ -272,16 +272,34 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
     } else {
         None
     };
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    let eti_runtime = if let Some(command_policies) = flags
+        .command_policies
+        .as_ref()
+        .filter(|config| config.is_active())
+    {
+        let runtime = crate::eti_runtime::PreparedEtiRuntime::prepare(
+            command_policies,
+            caps.allowed_commands(),
+            caps.blocked_commands(),
+            &caps,
+            &requested_workdir,
+        )?;
+        runtime.grant_outer_caps(&mut caps)?;
+        Some(runtime)
+    } else {
+        None
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let eti_runtime: Option<crate::eti_runtime::PreparedEtiRuntime> = None;
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     let exec_resolved_program = eti_runtime
         .as_ref()
         .and_then(|runtime| runtime.shim_for_initial_command(&command[0]))
         .map(std::path::Path::to_path_buf)
         .unwrap_or_else(|| resolved_program.clone());
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let exec_resolved_program = resolved_program.clone();
 
     #[cfg(target_os = "linux")]
@@ -311,12 +329,12 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
     for (key, value) in &proxy_env_vars {
         env_vars.push((key.as_str(), value.as_str()));
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     let eti_env_vars = eti_runtime
         .as_ref()
         .map(crate::eti_runtime::PreparedEtiRuntime::env_overrides)
         .unwrap_or_default();
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     for (key, value) in &eti_env_vars {
         env_vars.push((key.as_str(), value.as_str()));
     }
@@ -417,6 +435,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         af_unix_mediation: flags.af_unix_mediation,
         allowed_env_vars: flags.allowed_env_vars,
         denied_env_vars: flags.denied_env_vars,
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         eti_runtime: eti_runtime.as_ref(),
     };
 

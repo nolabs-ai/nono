@@ -1328,10 +1328,7 @@ mod tests {
 
         struct DenyAllBackend;
         impl ApprovalBackend for DenyAllBackend {
-            fn request_approval(
-                &self,
-                _req: &ApprovalRequest,
-            ) -> nono::Result<ApprovalDecision> {
+            fn request_approval(&self, _req: &ApprovalRequest) -> nono::Result<ApprovalDecision> {
                 Ok(ApprovalDecision::Denied {
                     reason: "test".to_string(),
                 })

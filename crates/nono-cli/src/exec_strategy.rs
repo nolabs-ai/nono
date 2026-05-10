@@ -251,7 +251,7 @@ pub struct ExecConfig<'a> {
     pub denied_env_vars: Option<Vec<String>>,
     /// Prepared ETI runtime. When present, the outer child gets shims on PATH
     /// and an additional Linux execute-only Landlock gate.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub eti_runtime: Option<&'a crate::eti_runtime::PreparedEtiRuntime>,
 }
 
@@ -308,7 +308,7 @@ pub struct SupervisorConfig<'a> {
     #[cfg(target_os = "linux")]
     pub linux_network_notify_mode: LinuxNetworkNotifyMode,
     /// Prepared ETI runtime listener for command-policy shim requests.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub eti_runtime: Option<&'a crate::eti_runtime::PreparedEtiRuntime>,
 }
 
@@ -2058,6 +2058,18 @@ fn run_supervisor_loop(
     mut trust_interceptor: Option<crate::trust_intercept::TrustInterceptor>,
     mut pty: Option<&mut crate::pty_proxy::PtyProxy>,
 ) -> Result<(WaitStatus, Vec<DenialRecord>)> {
+    // Start the macOS ETI background listener thread (no-op if ETI not active).
+    #[cfg(target_os = "macos")]
+    if let Some(eti_runtime) = config.eti_runtime {
+        if let Err(e) = eti_runtime.handle_listener(
+            child.as_raw() as u32,
+            config.session_id,
+            config.audit_recorder.clone(),
+        ) {
+            debug!("ETI handle_listener error: {e}");
+        }
+    }
+
     let sock_fd = sock.as_raw_fd();
     let mut denials = Vec::new();
     let mut seen_request_ids = HashSet::new();
@@ -2660,7 +2672,9 @@ fn handle_supervisor_message(
                         // Stash the verified digest for TOCTOU re-check at open time
                         verified_digest = Some(verified.digest);
                         // Instruction file verified — proceed to approval backend
-                        match config.approval_backend.request_approval(&nono::supervisor::ApprovalRequest::from(request.clone())) {
+                        match config.approval_backend.request_approval(
+                            &nono::supervisor::ApprovalRequest::from(request.clone()),
+                        ) {
                             Ok(d) => {
                                 if d.is_denied() {
                                     record_denial(
@@ -2712,7 +2726,10 @@ fn handle_supervisor_message(
                 }
             } else {
                 // 3. Delegate to approval backend (non-instruction files)
-                match config.approval_backend.request_approval(&nono::supervisor::ApprovalRequest::from(request.clone())) {
+                match config
+                    .approval_backend
+                    .request_approval(&nono::supervisor::ApprovalRequest::from(request.clone()))
+                {
                     Ok(d) => {
                         if d.is_denied() {
                             record_denial(
@@ -3998,6 +4015,7 @@ mod tests {
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
             linux_network_notify_mode: LinuxNetworkNotifyMode::ProxyOnly,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             eti_runtime: None,
         };
 
@@ -4113,6 +4131,7 @@ mod tests {
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
             linux_network_notify_mode: LinuxNetworkNotifyMode::ProxyOnly,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             eti_runtime: None,
         };
 
@@ -4196,6 +4215,7 @@ mod tests {
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
             linux_network_notify_mode: LinuxNetworkNotifyMode::ProxyOnly,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             eti_runtime: None,
         };
 
@@ -4238,6 +4258,7 @@ mod tests {
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
             linux_network_notify_mode: LinuxNetworkNotifyMode::ProxyOnly,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             eti_runtime: None,
         };
 
@@ -4278,6 +4299,7 @@ mod tests {
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
             linux_network_notify_mode: LinuxNetworkNotifyMode::ProxyOnly,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             eti_runtime: None,
         };
         let config_deny = SupervisorConfig {
@@ -4300,6 +4322,7 @@ mod tests {
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
             linux_network_notify_mode: LinuxNetworkNotifyMode::ProxyOnly,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             eti_runtime: None,
         };
 
@@ -4345,6 +4368,7 @@ mod tests {
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
             linux_network_notify_mode: LinuxNetworkNotifyMode::ProxyOnly,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             eti_runtime: None,
         };
 
@@ -4493,6 +4517,7 @@ mod tests {
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
             linux_network_notify_mode: LinuxNetworkNotifyMode::ProxyOnly,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             eti_runtime: None,
         };
 

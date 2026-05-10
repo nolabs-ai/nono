@@ -23,7 +23,7 @@ mod deprecated_policy;
 mod deprecated_schema;
 mod deprecation_warnings;
 mod eti_runtime;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod eti_token_broker;
 mod exec_strategy;
 mod execution_runtime;

@@ -267,6 +267,16 @@ fn check_trusted_root_freshness(root: &TrustedRoot, cache_path: &std::path::Path
             .and_then(|v| v.end.as_ref())
             .map(|end| {
                 let end_date = &end[..end.len().min(10)];
+                // WR-05 fail-closed format guard: lexicographic `<` on ISO-8601
+                // dates is equivalent to chronological order ONLY when the
+                // string is shaped `YYYY-MM-DD`. If the upstream TUF root ever
+                // ships a non-standard format (e.g., zero-padding loss, locale
+                // variants), the comparison would silently mis-classify
+                // freshness. Refuse to trust an unrecognized shape and treat
+                // the key as expired (security gate stays closed).
+                if !is_iso8601_date_prefix(end_date) {
+                    return false;
+                }
                 now_iso10.as_str() < end_date
             })
             .unwrap_or(true) // missing end = no expiry asserted; treat as active
@@ -292,6 +302,26 @@ fn check_trusted_root_freshness(root: &TrustedRoot, cache_path: &std::path::Path
              `nono setup --refresh-trust-root` (requires network)."
         ),
     })
+}
+
+/// WR-05 guard: validate that a string is in `YYYY-MM-DD` lexicographic-
+/// orderable form before using it for chronological comparison. Lexicographic
+/// `<` on ISO-8601 dates equals chronological `<` ONLY for the canonical
+/// shape: 4 digits, `-`, 2 digits, `-`, 2 digits. Any deviation (locale
+/// variants, missing zero-pad, non-ASCII digits) silently breaks the
+/// comparison; the security gate must refuse to trust unknown shapes.
+fn is_iso8601_date_prefix(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    if bytes.len() != 10 {
+        return false;
+    }
+    if bytes[4] != b'-' || bytes[7] != b'-' {
+        return false;
+    }
+    // Positions 0-3 (year), 5-6 (month), 8-9 (day) must all be ASCII digits.
+    bytes[..4].iter().all(|b| b.is_ascii_digit())
+        && bytes[5..7].iter().all(|b| b.is_ascii_digit())
+        && bytes[8..10].iter().all(|b| b.is_ascii_digit())
 }
 
 /// Convert seconds-since-UNIX-epoch to an ISO-8601 date prefix `YYYY-MM-DD`.

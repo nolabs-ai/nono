@@ -40,7 +40,7 @@
 //! Task 2 Step 1 + 32-RESEARCH.md Pattern 4.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 fn setup_isolated_home() -> (tempfile::TempDir, PathBuf, PathBuf) {
     let temp_root = std::env::current_dir()
@@ -163,8 +163,11 @@ async fn mock_servers_only_no_real_network() {
     );
 }
 
-/// Confirm `setup_isolated_home` seeding works and the frozen fixture is findable.
-fn _verify_fixture_path(_workspace: &Path) {
+/// Frozen TUF fixture must exist (replaces the previous unused
+/// `_verify_fixture_path` helper from WR-01 review). The assertion now actually
+/// runs in CI rather than being suppressed by a leading-underscore name.
+#[test]
+fn frozen_tuf_fixture_is_present() {
     let frozen = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("nono")

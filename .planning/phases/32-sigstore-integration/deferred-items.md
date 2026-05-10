@@ -155,3 +155,118 @@ must-haves but were CLOSED during Plans 03 and 04 implementation:
 - `docs/templates/trust-policy-keyless-template.json` — Plan 03 baked-in template; the consumer-side trust policy that a future keyless migration would reference
 - `docs/cli/development/windows-signing-guide.mdx` — referenced by release.yml's signing-secrets check; current operator docs for keyed posture
 - `.planning/phases/32-sigstore-integration/32-CONTEXT.md` (D-32-10 verbatim)
+
+---
+
+## P32-DEFER-003: SystemDrive env corrupts child env on Windows (pre-existing CR-01)
+
+**Tracking ID:** P32-DEFER-003
+**Plan:** Out of Phase 32 scope (surfaced by Phase 32 code review; bug introduced 2026-04-10 commit `cf5a60a1`)
+**Deferred to:** Standalone follow-up plan (next Windows-area phase or hotfix)
+**Status:** open
+**Severity:** Critical (corrupts child env)
+**Surfaced:** 2026-05-10 by Phase 32 code review
+
+### What is the bug
+
+`crates/nono-cli/src/exec_strategy_windows/launch.rs:695-698` in
+`append_windows_runtime_env` sets the `SystemDrive` child environment variable
+to `windows_system32.display()` — which resolves to e.g. `C:\Windows\System32`.
+The Windows convention for `SystemDrive` is the bare drive specifier (e.g.
+`C:`). Any sandboxed child process that expands `%SystemDrive%\ProgramData`
+gets `C:\Windows\System32\ProgramData` instead of `C:\ProgramData`, breaking
+binaries that rely on `SystemDrive` for path construction (which is most of
+them on Windows — installers, service-manager bootstrap, default-tool path
+resolution, etc.).
+
+### Why deferred from Phase 32
+
+Phase 32 scope is sigstore integration + broker self-trust-anchor. The bug
+is in `append_windows_runtime_env`, which is unrelated to Phase 32 trust
+work — it predates Phase 32 by a month (commit `cf5a60a1` 2026-04-10) and
+affects every sandboxed Windows invocation regardless of trust posture.
+Including this fix in Phase 32 would expand scope and entangle the Phase 32
+verification with an unrelated subsystem.
+
+### Fix sketch (for future plan)
+
+Derive the drive letter from `system_root` (which already comes from
+`SystemRoot` / `windir`):
+
+```rust
+let system_drive = system_root
+    .components()
+    .next()
+    .map(|c| c.as_os_str().to_string_lossy().trim_end_matches('\\').to_string())
+    .unwrap_or_else(|| "C:".to_string());
+env_pairs.push(("SystemDrive".to_string(), system_drive));
+```
+
+Add a regression test that asserts the env pair contains a 2-character
+drive specifier (e.g., `C:`) rather than a path with separators.
+
+### Related files
+
+- `crates/nono-cli/src/exec_strategy_windows/launch.rs` (the bug)
+- `.planning/phases/32-sigstore-integration/32-REVIEW.md` § CR-01 (full review writeup)
+
+---
+
+## P32-DEFER-004: trust_intercept.rs platform-conditional dead-code masking (pre-existing CR-04)
+
+**Tracking ID:** P32-DEFER-004
+**Plan:** Out of Phase 32 scope (surfaced by Phase 32 code review; attribute introduced 2026-04-10 commit `cf5a60a1`)
+**Deferred to:** Standalone follow-up plan (next Windows-area phase or trust-system audit)
+**Status:** open
+**Severity:** Warning (CLAUDE.md violation, security-relevant gap)
+**Surfaced:** 2026-05-10 by Phase 32 code review
+
+### What is the violation
+
+`crates/nono-cli/src/trust_intercept.rs` carries 7 instances of
+`#[cfg_attr(target_os = "windows", allow(dead_code))]` on `CacheEntry`,
+`CachedOutcome`, `TrustVerified`, `TrustInterceptor`, its `impl` block,
+`load_signer`, and `format_outcome`. CLAUDE.md is explicit:
+
+> "Avoid `#[allow(dead_code)]`. If code is unused, either remove it or
+> write tests that use it."
+
+Because the suppression is platform-conditional, the entire trust-interception
+subsystem may be unused on Windows without any compile-time signal. If the
+Windows supervisor loop never calls `TrustInterceptor::check_path`, Windows
+sandboxed sessions silently get zero runtime trust enforcement while the
+Unix path does — a security parity gap concealed by the attribute.
+
+### Why deferred from Phase 32
+
+The attribute predates Phase 32 by a month and is on a code path Phase 32
+does not modify (Phase 32's broker Authenticode self-trust-anchor is at the
+spawn site in `launch.rs`, not the file-instruction trust interceptor).
+Investigating whether the Windows supervisor wires `TrustInterceptor` (and
+fixing the wiring or gating the module appropriately) requires a focused
+Windows-area audit that's outside Phase 32's sigstore scope.
+
+### Fix path (for future plan)
+
+Two acceptable resolutions:
+
+**(a) Gate the entire module Linux/macOS-only** if the Windows supervisor
+does not call it (and is not planned to call it):
+
+```rust
+// Top of trust_intercept.rs
+#![cfg(not(target_os = "windows"))]
+```
+
+This documents the gap explicitly at the module boundary.
+
+**(b) Wire `TrustInterceptor` into the Windows supervisor runtime** and add
+an integration test that exercises the Windows path (`#[cfg(windows)]` test
+that calls `check_path` and asserts the outcome).
+
+A follow-up plan should pick one based on the broader Windows trust roadmap.
+
+### Related files
+
+- `crates/nono-cli/src/trust_intercept.rs` (the file with the masked code)
+- `.planning/phases/32-sigstore-integration/32-REVIEW.md` § CR-04 (full review writeup)

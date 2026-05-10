@@ -23,6 +23,8 @@ mod deprecated_policy;
 mod deprecated_schema;
 mod deprecation_warnings;
 mod eti_runtime;
+#[cfg(target_os = "linux")]
+mod eti_token_broker;
 mod exec_strategy;
 mod execution_runtime;
 mod instruction_deny;

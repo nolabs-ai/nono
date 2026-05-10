@@ -143,6 +143,9 @@ mod linux {
         active_count: AtomicUsize,
         queued_requests: AtomicUsize,
         emitted_error_response: AtomicBool,
+        /// Token broker for credential isolation. Holds real credential values;
+        /// nonces in the agent env are resolved to real values by filter_child_env.
+        token_broker: Mutex<crate::eti_token_broker::TokenBroker>,
     }
 
     /// Pre-computed runtime-baseline files (ELF dependency closures + system files)
@@ -431,6 +434,7 @@ mod linux {
                     active_count: AtomicUsize::new(0),
                     queued_requests: AtomicUsize::new(0),
                     emitted_error_response: AtomicBool::new(false),
+                    token_broker: Mutex::new(crate::eti_token_broker::TokenBroker::new()),
                 }),
                 listener: Arc::new(listener),
             };
@@ -1975,6 +1979,11 @@ mod linux {
                     .map(|value| value.to_string())
                     .collect()
             });
+
+        let broker = state.token_broker.lock().map_err(|_| {
+            NonoError::SandboxInit("ETI token broker lock poisoned".to_string())
+        })?;
+
         let mut env = Vec::new();
         let mut has_path = false;
         for entry in &request.env {
@@ -1997,9 +2006,12 @@ mod linux {
                 has_path = true;
             }
             if crate::exec_strategy::is_env_var_allowed(key_str, &allowed_patterns) {
-                env.push(entry.clone());
+                // Resolve broker nonces to real values immediately before execve.
+                let resolved = broker.resolve_env_entry(entry);
+                env.push(resolved.unwrap_or_else(|| entry.clone()));
             }
         }
+        drop(broker);
         if !has_path {
             env.push(format!("PATH={}", state.session_path).into_bytes());
         } else {

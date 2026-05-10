@@ -176,11 +176,18 @@ $tmp = New-TemporaryFile
 "hello" | Out-File $tmp.FullName
 nono run --read-file $tmp.FullName -- cmd /c type $tmp.FullName
 
-# Block-net works on Windows without WFP service (Job Object + token-level).
+# Block-net requires the WFP service to be registered + running first. Run this ONCE,
+# in an elevated PowerShell (admin), before any block-net or network-profile smoke:
+#   nono setup --install-wfp-service
+#   nono setup --start-wfp-service
+# (Skip if `nono setup --check-only` already shows the service is registered & running.)
 # Use a non-interactive child so the smoke is a one-liner. (Interactive `nono shell` is
 # also supported as of Phase 31 — see the security-envelope section for the broker path.)
 nono run --profile claude-code --block-net -- cmd /c "echo block-net ok && curl -m 3 https://example.com"
 # The curl call should fail/timeout since outbound is blocked. Verify exit and no body returned.
+# If you instead see the diagnostic `This request remains fail-closed until WFP activation
+# is implemented`, the WFP service prereq above was skipped — fix that and re-run. (This
+# is fail-closed-correct behavior, NOT a regression.)
 
 # Why-query: structured policy introspection
 nono why --path $env:USERPROFILE\.ssh\id_rsa --op read

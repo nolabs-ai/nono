@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.47.1] - 2026-05-06
+
+### Dependencies
+
+- *(deps)* Bump jsonschema from 0.45.1 to 0.46.4
+
+- *(deps)* Bump rustls from 0.23.39 to 0.23.40
+
+
+### Documentation
+
+- Fix stale references, deprecation wording, and built-in vs pack distinction
+
 ## [0.47.0] - 2026-05-05
 
 ### Bug Fixes

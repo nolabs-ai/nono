@@ -5,6 +5,22 @@
 ### Changed
 - Bump fork workspace version 0.37.1 → 0.53.0. Reflects milestone v2.1/v2.2/v2.3 progress and signals fork has reached upstream v0.52 parity (v0.52.0 CHANGELOG absorbed in Phase 34-08b; v0.53.0 divergence ledger written in Phase 39-01). Fork continues to track its own version separately from upstream per Phase 34 convention.
 
+## [0.52.2] - 2026-05-11
+
+### Bug Fixes
+
+- *(profile-save)* Address suppression review feedback
+
+
+### Features
+
+- *(profile-save)* Suppress save-profile prompts for denied paths
+
+
+### Miscellaneous
+
+- Release v0.52.1
+
 ## [0.52.1] - 2026-05-11
 
 ### Bug Fixes

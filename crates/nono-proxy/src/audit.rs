@@ -29,8 +29,21 @@ const MAX_AUDIT_EVENTS: usize = 4096;
 pub trait NetworkAuditSink: Send + Sync {
     fn record(&self, event: &NetworkAuditEvent);
 
-    /// Drain any buffered events. Returns only after every event passed to
-    /// `record` before this call is durable in the sink's destination.
+    /// Drain buffered events and seal the sink against late writes.
+    ///
+    /// Returns only after every event passed to `record` *before this call
+    /// started* is durable in the sink's destination.
+    ///
+    /// After `flush()` returns, implementations are permitted to silently
+    /// drop any event submitted via subsequent `record()` calls. This lets
+    /// the caller append further records to the same store without racing
+    /// the sink's background writer. The `close()` race is unavoidable —
+    /// a producer thread may pass the `is_closed()` check, lose the CPU,
+    /// and only enqueue its event after this method has been called — so
+    /// honouring the seal is how implementations preserve any external
+    /// integrity boundary (hash chains, content roots) anchored at the
+    /// flush point.
+    ///
     /// Default no-op for sinks that write synchronously inside `record`.
     fn flush(&self) {}
 }
@@ -80,9 +93,15 @@ impl AuditLog {
     /// extend the file past the stored root and cause `verify_audit_log` to
     /// fail with a Merkle mismatch.
     ///
-    /// The `closed` flag is set with release ordering before `flush` so that
-    /// no in-flight `push_event` can enqueue a new event after the sink
-    /// confirms its queue is empty.
+    /// The `closed` flag is set with release ordering *before* `flush()` so
+    /// that any producer that has not yet read `is_closed()` sees the seal
+    /// on the next access. Producers that have already passed the
+    /// `is_closed()` check (in `push_event`) but not yet called
+    /// `sink.record()` are unavoidable: their event can still reach the
+    /// sink after `close()` returns. The trait contract on
+    /// `NetworkAuditSink::flush` makes this benign — sinks may silently
+    /// drop post-flush events, which is exactly how
+    /// `RecorderStreamingSink` preserves the Merkle root invariant.
     pub fn close(&self) {
         self.closed.store(true, Ordering::Release);
         if let Some(sink) = self.streaming_sink.get() {

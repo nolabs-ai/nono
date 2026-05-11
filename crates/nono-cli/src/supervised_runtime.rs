@@ -202,21 +202,19 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
     } else {
         None
     };
-    let audit_recorder: Option<Arc<Mutex<AuditRecorder>>> =
-        if audit_state.is_some() && !rollback.no_audit_integrity {
-            audit_state
-                .as_ref()
-                .map(|state| {
-                    AuditRecorder::new_with_policy(
-                        state.session_dir.clone(),
-                        redaction_policy.clone(),
-                    )
+    let audit_recorder: Option<Arc<Mutex<AuditRecorder>>> = if audit_state.is_some()
+        && !rollback.no_audit_integrity
+    {
+        audit_state
+            .as_ref()
+            .map(|state| {
+                AuditRecorder::new_with_policy(state.session_dir.clone(), redaction_policy.clone())
                     .map(|r| Arc::new(Mutex::new(r)))
-                })
-                .transpose()?
-        } else {
-            None
-        };
+            })
+            .transpose()?
+    } else {
+        None
+    };
     if let Some(recorder_mutex) = audit_recorder.as_ref() {
         let mut recorder = recorder_mutex
             .lock()
@@ -227,12 +225,29 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
     // Stream network audit events into the recorder as they occur. Without
     // this, events sit in the proxy's in-memory buffer until session exit and
     // are lost on crash or once `MAX_AUDIT_EVENTS` is reached.
+    //
+    // Streaming is best-effort: if the writer thread fails to spawn we log
+    // and continue with the legacy "drain at session_ended" path rather than
+    // aborting the run. The session still gets a complete audit log on
+    // clean shutdown; only the crash-durability and unbounded-buffer wins
+    // are forfeited.
     if let (Some(recorder_mutex), Some(handle)) = (audit_recorder.as_ref(), proxy_handle) {
-        let sink: Arc<dyn nono_proxy::audit::NetworkAuditSink> = Arc::new(
-            crate::audit_integrity::RecorderStreamingSink::new(Arc::clone(recorder_mutex))?,
-        );
-        if handle.set_audit_streaming_sink(sink).is_err() {
-            tracing::warn!("Network audit streaming sink already attached; refusing to overwrite");
+        match crate::audit_integrity::RecorderStreamingSink::new(Arc::clone(recorder_mutex)) {
+            Ok(sink) => {
+                let sink: Arc<dyn nono_proxy::audit::NetworkAuditSink> = Arc::new(sink);
+                if handle.set_audit_streaming_sink(sink).is_err() {
+                    tracing::warn!(
+                        "Network audit streaming sink already attached; refusing to overwrite"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to start network audit streaming writer; continuing without live \
+                     streaming (events will still be drained at session end): {}",
+                    e
+                );
+            }
         }
     }
 

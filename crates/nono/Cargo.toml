@@ -52,11 +52,11 @@ der = { version = "0.7", default-features = false }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4"
-nix = { version = "0.31.2", features = ["fs", "user"] }
+nix = { version = "0.31.3", features = ["fs", "user"] }
 keyring = { version = "3", features = ["sync-secret-service"], optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-nix = { version = "0.31.2", features = ["fs", "user"] }
+nix = { version = "0.31.3", features = ["fs", "user"] }
 keyring = { version = "3", features = ["apple-native"], optional = true }
 
 [build-dependencies]

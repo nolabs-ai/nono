@@ -68,6 +68,8 @@ const TERMINAL_RESTORE_NORMAL: &[u8] = concat!(
     "\x1b[?1005l\x1b[?1006l\x1b[?1015l", // disable mouse encodings
     "\x1b[?1004l", // disable focus events
     "\x1b[?2004l", // disable bracketed paste
+    "\x1b[?1l", // disable application cursor keys
+    "\x1b>",   // normal keypad mode
     "\x1b[?25h", // show cursor
 )
 .as_bytes();

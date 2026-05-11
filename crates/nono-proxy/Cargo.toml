@@ -46,7 +46,7 @@ webpki-roots = "1"
 # ephemeral session CA + per-host leaf certificate generation. `ring` matches
 # the rustls crypto provider used elsewhere; `aws_lc_rs` is disabled to avoid
 # a second, redundant crypto stack in the dependency tree.
-rcgen = { version = "0.13", default-features = false, features = ["pem", "ring"] }
+rcgen = { version = "0.14", default-features = false, features = ["pem", "ring"] }
 # Read the host's system trust store (used to compose the trust bundle that
 # the sandboxed child consumes via SSL_CERT_FILE / REQUESTS_CA_BUNDLE / etc.).
 # We need full DER certs for PEM emission; webpki-roots only ships parsed

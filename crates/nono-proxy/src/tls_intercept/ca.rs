@@ -24,8 +24,8 @@
 
 use crate::error::{ProxyError, Result};
 use rcgen::{
-    BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair, KeyUsagePurpose,
-    PKCS_ECDSA_P256_SHA256,
+    BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, Issuer, KeyPair,
+    KeyUsagePurpose, PKCS_ECDSA_P256_SHA256,
 };
 use std::time::{Duration, SystemTime};
 use time::OffsetDateTime;
@@ -41,14 +41,12 @@ const CA_VALIDITY: Duration = Duration::from_secs(24 * 60 * 60);
 /// via [`EphemeralCa::cert_pem`] for inclusion in the trust bundle written
 /// for the sandboxed child.
 pub struct EphemeralCa {
-    /// Parsed key pair used by `rcgen` to sign minted leaves.
-    key_pair: KeyPair,
     /// Raw PKCS#8 DER bytes of the CA private key, kept solely so `Drop`
     /// can zeroize them. Never written to disk, never logged, never returned.
     #[allow(dead_code)]
     key_pkcs8_der: Zeroizing<Vec<u8>>,
-    /// The CA certificate in `rcgen` form so leaves can be signed against it.
-    ca_cert: rcgen::Certificate,
+    /// Issuer for signing minted leaf certificates (owns CA params and key pair).
+    issuer: Issuer<'static, KeyPair>,
     /// Cached PEM encoding of the public certificate.
     cert_pem: String,
 }
@@ -81,15 +79,15 @@ impl EphemeralCa {
         dn.push(DnType::CommonName, "nono-session-ca");
         params.distinguished_name = dn;
 
-        let ca_cert = params
+        let cert_pem = params
             .self_signed(&key_pair)
-            .map_err(|e| ProxyError::Config(format!("failed to self-sign ephemeral CA: {}", e)))?;
-        let cert_pem = ca_cert.pem();
+            .map_err(|e| ProxyError::Config(format!("failed to self-sign ephemeral CA: {}", e)))?
+            .pem();
+        let issuer = Issuer::new(params, key_pair);
 
         Ok(Self {
-            key_pair,
             key_pkcs8_der,
-            ca_cert,
+            issuer,
             cert_pem,
         })
     }
@@ -100,15 +98,9 @@ impl EphemeralCa {
         &self.cert_pem
     }
 
-    /// Borrow the parsed CA certificate (used by [`super::cert_cache`] to
-    /// sign minted leaves).
-    pub(super) fn ca_cert(&self) -> &rcgen::Certificate {
-        &self.ca_cert
-    }
-
-    /// Borrow the parsed key pair (used by [`super::cert_cache`] to sign).
-    pub(super) fn key_pair(&self) -> &KeyPair {
-        &self.key_pair
+    /// Issuer used by [`super::cert_cache`] to sign minted leaf certificates.
+    pub(super) fn issuer(&self) -> &Issuer<'static, KeyPair> {
+        &self.issuer
     }
 }
 
@@ -116,7 +108,7 @@ impl std::fmt::Debug for EphemeralCa {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EphemeralCa")
             .field("subject", &"CN=nono-session-ca")
-            .field("key_pair", &"[REDACTED]")
+            .field("issuer", &"[REDACTED]")
             .field("key_pkcs8_der", &"[REDACTED]")
             .field("cert_pem_len", &self.cert_pem.len())
             .finish()

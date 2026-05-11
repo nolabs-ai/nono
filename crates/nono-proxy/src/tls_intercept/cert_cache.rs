@@ -149,7 +149,7 @@ fn mint_leaf(ca: &EphemeralCa, hostname: &str) -> Result<Arc<CertifiedKey>> {
     params.distinguished_name = dn;
 
     let cert = params
-        .signed_by(&leaf_key, ca.ca_cert(), ca.key_pair())
+        .signed_by(&leaf_key, ca.issuer())
         .map_err(|e| ProxyError::Config(format!("failed to sign leaf certificate: {}", e)))?;
     let leaf_der = cert.der().clone();
 

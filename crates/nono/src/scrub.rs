@@ -157,17 +157,15 @@ impl ScrubPolicy {
     }
 
     fn is_sensitive_flag(&self, flag: &str) -> bool {
-        self.sensitive_flags.contains(normalize_name(flag).as_str())
+        contains_normalized_ascii(&self.sensitive_flags, flag)
     }
 
     fn is_sensitive_header(&self, name: &str) -> bool {
-        self.sensitive_headers
-            .contains(normalize_name(name).as_str())
+        contains_normalized_ascii(&self.sensitive_headers, name)
     }
 
     fn is_sensitive_query_key(&self, name: &str) -> bool {
-        self.sensitive_query_keys
-            .contains(normalize_name(name).as_str())
+        contains_normalized_ascii(&self.sensitive_query_keys, name)
     }
 }
 
@@ -184,13 +182,13 @@ pub fn scrub_value(s: &str) -> Cow<'_, str> {
 #[must_use]
 pub fn scrub_value_with_policy<'a>(s: &'a str, policy: &ScrubPolicy) -> Cow<'a, str> {
     let header_scrubbed = scrub_header_line(s, policy);
-    let url_scrubbed = scrub_url_userinfo(header_scrubbed.as_ref());
-    let query_scrubbed = scrub_query_params(url_scrubbed.as_ref(), policy);
+    let url_scrubbed = scrub_url_userinfo(header_scrubbed.as_ref() as &str);
+    let query_scrubbed = scrub_query_params(url_scrubbed.as_ref() as &str, policy);
 
-    if query_scrubbed == s {
+    if query_scrubbed.as_ref() as &str == s {
         Cow::Borrowed(s)
     } else {
-        Cow::Owned(query_scrubbed)
+        Cow::Owned(query_scrubbed.into_owned())
     }
 }
 
@@ -224,8 +222,7 @@ pub fn scrub_argv_with_policy(args: &[String], policy: &ScrubPolicy) -> Vec<Stri
             continue;
         }
 
-        let lower = arg.to_ascii_lowercase();
-        if policy.is_sensitive_flag(&lower) {
+        if policy.is_sensitive_flag(arg) {
             scrubbed.push(arg.clone());
             redact_next = true;
             continue;
@@ -237,22 +234,15 @@ pub fn scrub_argv_with_policy(args: &[String], policy: &ScrubPolicy) -> Vec<Stri
             continue;
         }
 
-        if let Some((name, _)) = lower.split_once('=') {
+        if let Some((name, value)) = arg.split_once('=') {
             if policy.is_sensitive_flag(name) {
-                if let Some((original_name, _)) = arg.split_once('=') {
-                    scrubbed.push(format!("{original_name}={REDACTED}"));
-                    continue;
-                }
+                scrubbed.push(format!("{name}={REDACTED}"));
+                continue;
             }
 
-            if is_header_flag(&arg[..name.len()]) {
-                if let Some((original_name, value)) = arg.split_once('=') {
-                    scrubbed.push(format!(
-                        "{original_name}={}",
-                        scrub_header_arg(value, policy)
-                    ));
-                    continue;
-                }
+            if is_header_flag(name) {
+                scrubbed.push(format!("{name}={}", scrub_header_arg(value, policy)));
+                continue;
             }
         }
 
@@ -307,6 +297,10 @@ fn scrub_header_line<'a>(value: &'a str, policy: &ScrubPolicy) -> Cow<'a, str> {
 }
 
 fn scrub_url_userinfo(value: &str) -> Cow<'_, str> {
+    if !value.contains("://") {
+        return Cow::Borrowed(value);
+    }
+
     let mut result = String::with_capacity(value.len());
     let mut changed = false;
     let mut cursor = 0;
@@ -346,7 +340,11 @@ fn scrub_url_userinfo(value: &str) -> Cow<'_, str> {
     }
 }
 
-fn scrub_query_params(value: &str, policy: &ScrubPolicy) -> String {
+fn scrub_query_params<'a>(value: &'a str, policy: &ScrubPolicy) -> Cow<'a, str> {
+    if !value.contains('?') {
+        return Cow::Borrowed(value);
+    }
+
     let mut result = String::with_capacity(value.len());
     let mut cursor = 0;
     let mut changed = false;
@@ -378,9 +376,9 @@ fn scrub_query_params(value: &str, policy: &ScrubPolicy) -> String {
     result.push_str(&value[cursor..]);
 
     if changed {
-        result
+        Cow::Owned(result)
     } else {
-        value.to_string()
+        Cow::Borrowed(value)
     }
 }
 
@@ -422,6 +420,12 @@ fn insert_normalized(set: &mut BTreeSet<String>, value: &str) {
 
 fn remove_normalized(set: &mut BTreeSet<String>, value: &str) {
     set.remove(normalize_name(value).as_str());
+}
+
+fn contains_normalized_ascii(set: &BTreeSet<String>, value: &str) -> bool {
+    let trimmed = value.trim();
+    set.iter()
+        .any(|candidate| candidate.eq_ignore_ascii_case(trimmed))
 }
 
 fn set_difference(left: &BTreeSet<String>, right: &BTreeSet<String>) -> Vec<String> {

@@ -32,13 +32,13 @@ use nono::{
 };
 use std::collections::HashSet;
 use std::ffi::{CString, OsStr};
-use std::sync::Mutex;
 use std::os::fd::FromRawFd;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 

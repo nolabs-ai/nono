@@ -460,7 +460,10 @@ pub fn print_dry_run(
     eprintln!(
         "  {} {}",
         fg("dry-run", t.yellow).bold(),
-        fg("sandbox would be applied with above capabilities", t.subtext),
+        fg(
+            "sandbox would be applied with above capabilities",
+            t.subtext
+        ),
     );
     eprintln!("  {} {}", fg("$", t.subtext), fg(&command_line, t.text));
 }
@@ -713,13 +716,10 @@ pub fn print_profile_hint(program: &str, profile: &str, silent: bool) {
 #[cfg(test)]
 mod tests {
     use super::{
-        dry_run_command_line, format_unix_socket_mode_badge, normalize_terminal_line_endings,
-        print_capabilities, print_profile_hint, render_diagnostic_footer,
-        render_terminal_block_for_tty,
+        dry_run_command_line, normalize_terminal_line_endings, print_profile_hint,
+        render_diagnostic_footer,
     };
-    use nono::{CapabilitySet, UnixSocketMode};
     use std::ffi::{OsStr, OsString};
-    use tempfile::tempdir;
 
     #[test]
     fn normalize_terminal_line_endings_uses_crlf() {
@@ -773,35 +773,9 @@ mod tests {
         assert!(!line.contains("private-secret"));
     }
 
-    #[test]
-    fn unix_socket_mode_badges_are_fixed_width_and_distinct() {
-        let connect = format_unix_socket_mode_badge(UnixSocketMode::Connect);
-        let bind = format_unix_socket_mode_badge(UnixSocketMode::ConnectBind);
-        // Same rendered-width contract as format_access_badge (5 chars).
-        // We can't `strip_ansi` cleanly here, so check the printable payload
-        // is present rather than the raw length.
-        assert!(connect.contains("sock "));
-        assert!(bind.contains("sock+"));
-        assert_ne!(connect, bind);
-    }
-
-    #[test]
-    fn print_capabilities_with_unix_socket_does_not_panic() {
-        // Smoke test: constructing a CapabilitySet with both connect and
-        // connect+bind unix socket grants (one file, one directory) and
-        // rendering it must not panic. Silent=true keeps stderr quiet in
-        // test output. Dry-run-style `verbose=1` path is also exercised.
-        let dir = tempdir().expect("tempdir");
-        let sock = dir.path().join("a.sock");
-        std::fs::write(&sock, b"").expect("create socket stub");
-
-        let caps = CapabilitySet::new()
-            .allow_unix_socket(&sock, UnixSocketMode::Connect)
-            .expect("connect grant")
-            .allow_unix_socket_dir(dir.path(), UnixSocketMode::ConnectBind)
-            .expect("bind dir grant");
-
-        print_capabilities(&caps, 0, true);
-        print_capabilities(&caps, 1, true);
-    }
+    // NOTE: `unix_socket_mode_badges_are_fixed_width_and_distinct` and
+    // `print_capabilities_with_unix_socket_does_not_panic` from upstream 6472011
+    // were not ported: `format_unix_socket_mode_badge`, `allow_unix_socket`,
+    // and `UnixSocketMode` do not exist in this fork yet (deferred to a future
+    // Unix-socket-capability plan). See 40-03-SCRUB-MODULE-SUMMARY.md.
 }

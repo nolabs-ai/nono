@@ -812,7 +812,6 @@ mod tests {
             InitialCapabilityMatch::Insufficient(_)
         ));
     }
-
 }
 
 /// cgroup v2 session management for Linux resource limits.

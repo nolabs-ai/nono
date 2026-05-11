@@ -442,6 +442,11 @@ pub(crate) fn verify_audit_log(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use nono::supervisor::{ApprovalDecision, CapabilityRequest};
+    use nono::undo::{NetworkAuditDecision, NetworkAuditMode};
+    use nono::AccessMode;
+    use std::path::PathBuf;
+    use std::time::{Duration, UNIX_EPOCH};
 
     #[test]
     fn recorder_produces_integrity_summary() {
@@ -535,23 +540,31 @@ mod tests {
                 vec!["claude".to_string(), "--debug".to_string()],
             )
             .unwrap();
+        #[allow(deprecated)]
         recorder
-            .record_capability_decision(AuditEntry {
-                timestamp: UNIX_EPOCH + Duration::from_secs(5),
-                request: CapabilityRequest {
-                    request_id: "req-1".to_string(),
-                    path: PathBuf::from("/tmp/example"),
-                    access: AccessMode::ReadWrite,
-                    reason: Some("need scratch space".to_string()),
-                    child_pid: 42,
-                    session_id: "sess-1".to_string(),
+            .record_capability_decision(
+                AuditEntry {
+                    timestamp: UNIX_EPOCH + Duration::from_secs(5),
+                    request: CapabilityRequest {
+                        request_id: "req-1".to_string(),
+                        path: PathBuf::from("/tmp/example"),
+                        access: AccessMode::ReadWrite,
+                        reason: Some("need scratch space".to_string()),
+                        child_pid: 42,
+                        session_id: "sess-1".to_string(),
+                        session_token: String::new(),
+                        kind: nono::supervisor::HandleKind::File,
+                        target: None,
+                        access_mask: 0,
+                    },
+                    decision: ApprovalDecision::Denied {
+                        reason: "outside policy".to_string(),
+                    },
+                    backend: "terminal".to_string(),
+                    duration_ms: 12,
                 },
-                decision: ApprovalDecision::Denied {
-                    reason: "outside policy".to_string(),
-                },
-                backend: "terminal".to_string(),
-                duration_ms: 12,
-            })
+                None,
+            )
             .unwrap();
         recorder
             .record_open_url(

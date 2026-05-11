@@ -1,0 +1,71 @@
+{
+  "version": "1.0",
+  "timestamp": "2026-05-11T19:56:05.132Z",
+  "phase": "34",
+  "phase_name": "UPST3 — Upstream v0.41–v0.52 Sync Execution",
+  "phase_dir": ".planning/phases/34-upst3-upstream-v0-41-v0-52-sync-execution",
+  "workflow": "gsd-plan-phase",
+  "workflow_step": "8 (gsd-planner spawn) — partial completion",
+  "status": "paused",
+  "completed_tasks": [
+    {"id": 1, "name": "Initialize + parse args (steps 1-3.5)", "status": "done"},
+    {"id": 2, "name": "Load CONTEXT.md (step 4)", "status": "done"},
+    {"id": 3, "name": "Research decision — user chose skip (step 5)", "status": "done"},
+    {"id": 4, "name": "Pre-planner gates (4.5 AI-SPEC, 5.55 security, 5.6 UI, 5.7 schema)", "status": "done"},
+    {"id": 5, "name": "Spawn gsd-planner (step 8) — wrote 9 of 11 plans before interrupt", "status": "partial", "files_written": ["34-00-G25DRIFT-CLOSURE-PLAN.md", "34-01-CLI-CONSOLIDATION-PLAN.md", "34-02-PROXY-NET-PLAN.md", "34-03-KEYRING-PLAN.md", "34-04-PATH-CANON-SCHEMA-PLAN.md", "34-05-COMPLETION-PLAN.md", "34-06-TRUST-SCAN-PLAN.md", "34-07-PS-ENVURI-PLAN.md", "34-08-ENV-DENY-PLAN.md"]}
+  ],
+  "remaining_tasks": [
+    {"id": 6, "name": "Write 34-09-FP-PACKS-PLAN.md (C6 v0.44 pack migration manual replay; D-20 shape)", "status": "not_started", "wave": 3, "depends_on": ["34-04"]},
+    {"id": 7, "name": "Write 34-10-FP-PROXY-TLS-PLAN.md (C11 v0.51 proxy TLS + audit-context manual replay; D-20 shape; sequential after 34-09 reads C4/34-02 final state)", "status": "not_started", "wave": 3, "depends_on": ["34-02", "34-09"]},
+    {"id": 8, "name": "Document won't-sync clusters (C1 PTY, C3 Unix-socket) per D-34-A3 — addendum to DIVERGENCE-LEDGER.md OR new 34-PHASE-OUTCOMES.md; planner picks", "status": "not_started"},
+    {"id": 9, "name": "Run gsd-plan-checker (step 10)", "status": "not_started"},
+    {"id": 10, "name": "Revision loop if ISSUES FOUND (step 12; max 3 iterations)", "status": "not_started"},
+    {"id": 11, "name": "Commit plans + finalize (step 13)", "status": "not_started"}
+  ],
+  "blockers": [],
+  "human_actions_pending": [],
+  "decisions": [
+    {"decision": "Skip research", "rationale": "CONTEXT.md locks decisions D-34-A1..E5; Phase 33 DIVERGENCE-LEDGER.md is authoritative cluster inventory; Phase 22 is direct precedent. Research would duplicate existing artifacts.", "phase": "34"},
+    {"decision": "Skip pattern-mapper (step 7.8)", "rationale": "Phase 22 PATTERNS.md is the direct analog (same fork conflict-files); Phase 34 is cherry-pick-heavy not new-file-heavy. The upstream-sync-quick.md template § Fork-divergence catalog already documents the analogs the mapper would re-discover. Planner prompt references Phase 22 PATTERNS.md directly.", "phase": "34"},
+    {"decision": "Single-Task (non-chunked) planner spawn", "rationale": "User did not pass --chunked. Planner output expected ~10-12 KB per plan × 11 plans ≈ 130 KB total — within Task budget. Filesystem-fallback (step 9a) handles truncation if it occurs.", "phase": "34"},
+    {"decision": "Include security threat-model directive in planner prompt", "rationale": "security_enforcement config default = enabled (ASVS L1, block on `high`); 6 upstream-sync-specific threats specified (silent-drop of defense-in-depth, D-21 invariant, DCO/trailer tampering, path-traversal/symlink-escape regressions on C7+C9, OAuth2 credential-cache divergence on C11).", "phase": "34"}
+  ],
+  "uncommitted_files": [
+    ".planning/phases/34-upst3-upstream-v0-41-v0-52-sync-execution/34-00-G25DRIFT-CLOSURE-PLAN.md",
+    ".planning/phases/34-upst3-upstream-v0-41-v0-52-sync-execution/34-01-CLI-CONSOLIDATION-PLAN.md",
+    ".planning/phases/34-upst3-upstream-v0-41-v0-52-sync-execution/34-02-PROXY-NET-PLAN.md",
+    ".planning/phases/34-upst3-upstream-v0-41-v0-52-sync-execution/34-03-KEYRING-PLAN.md",
+    ".planning/phases/34-upst3-upstream-v0-41-v0-52-sync-execution/34-04-PATH-CANON-SCHEMA-PLAN.md",
+    ".planning/phases/34-upst3-upstream-v0-41-v0-52-sync-execution/34-05-COMPLETION-PLAN.md",
+    ".planning/phases/34-upst3-upstream-v0-41-v0-52-sync-execution/34-06-TRUST-SCAN-PLAN.md",
+    ".planning/phases/34-upst3-upstream-v0-41-v0-52-sync-execution/34-07-PS-ENVURI-PLAN.md",
+    ".planning/phases/34-upst3-upstream-v0-41-v0-52-sync-execution/34-08-ENV-DENY-PLAN.md"
+  ],
+  "next_action": "Spawn gsd-planner in single-plan chunked-mode to write 34-09-FP-PACKS-PLAN.md (C6 v0.44 pack migration manual replay per D-20; preserves Phase 18.1-03 Windows widening) and 34-10-FP-PROXY-TLS-PLAN.md (C11 v0.51 proxy TLS + audit-context manual replay per D-20; sequential after 34-09; reads C4/34-02 final state). Then run gsd-plan-checker. The planner_prompt_summary field in this JSON has the full prompt rubric; re-spawn with single-plan-mode wrapper.",
+  "planner_prompt_summary": {
+    "plan_34_09_FP_PACKS": {
+      "cluster_id": "C6",
+      "upstream_tag": "v0.44.0",
+      "disposition": "fork-preserve (D-20 manual replay)",
+      "wave": 3,
+      "depends_on": ["34-04"],
+      "files_modified_likely": ["crates/nono-cli/src/package_cmd.rs", "crates/nono/src/package*.rs"],
+      "preserve_invariants": ["Phase 18.1-03 Windows widening wiring", "validate_path_within retention (Phase 22-03 PKG-04)", "%LOCALAPPDATA%\\nono\\packages + long-path \\\\?\\ handling"],
+      "manual_replay_intent": "registry-pack format awareness + install/uninstall hardening WITHOUT deleting fork-only Windows wiring",
+      "analogs": [".planning/phases/22-upst2-upstream-v038-v040-parity-sync/22-03-PKG-PLAN.md", ".planning/phases/26-pkg-streaming-followup/26-01-*-PLAN.md"]
+    },
+    "plan_34_10_FP_PROXY_TLS": {
+      "cluster_id": "C11",
+      "upstream_tag": "v0.51.0",
+      "disposition": "fork-preserve (D-20 manual replay)",
+      "wave": 3,
+      "depends_on": ["34-02", "34-09"],
+      "files_modified_likely": ["crates/nono-proxy/src/oauth2.rs", "crates/nono-proxy/src/server.rs", "crates/nono-cli/src/audit_*.rs"],
+      "preserve_invariants": ["Windows credential-injection rewrite (the fork-only wiring upstream's TLS-interception cherry-pick would delete)", "Phase 22-04 OAuth2 + WSAStartup ordering"],
+      "manual_replay_intent": "structured audit context (9300de9) replayed via Phase 23 REQ-AUD-05 composition; TLS-interception commits (149abde, 879562c, 8db8919, dcf2d29) READ-AND-DOCUMENT only (commit body explains why straight cherry-pick was infeasible)",
+      "analogs": [".planning/phases/22-upst2-upstream-v038-v040-parity-sync/22-04-OAUTH-PLAN.md", ".planning/phases/22-upst2-upstream-v038-v040-parity-sync/22-05a-AUD-CORE-PLAN.md"]
+    },
+    "wont_sync_addendum": "D-34-A3 — C1 PTY attach/detach polish + C3 Unix-socket capability documented as inline addendum. Planner picks: DIVERGENCE-LEDGER.md appended addendum OR new .planning/phases/34-upst3-upstream-v0-41-v0-52-sync-execution/34-PHASE-OUTCOMES.md. The chosen plan that writes this addendum should be 34-10 (last plan to close)."
+  },
+  "context_notes": "All 9 written plans inspected: frontmatter is rich (phase, plan_number, slug, cluster_id, wave, depends_on, blocks, files_modified, autonomous, requirements, tags, must_haves with truths+artifacts+key_links). 34-04 is the heaviest plan (71KB, 23 cherry-picks; Wave 0 gate). 34-00 is the special-shape closure plan (no D-19 trailer, reduced close-gate). Wave dependencies wired correctly: 34-00 → 34-04 → all others. Planner honored D-34-B2 surgical retrofit posture (verified in 34-02, 34-05, 34-08 frontmatter via spot-checks of must_haves grep patterns). Pre-planner gates already walked: no AI keywords, no UI/frontend, no ORM. Security gate ON (threat-model directives in planner prompt). Pattern-mapper skipped (config-enabled but Phase 22 PATTERNS.md is the analog). Task #4 still in_progress in the TaskList. Resume by spawning the planner for the final 2 plans in single-plan/chunked mode, then run gsd-plan-checker (step 10), then commit + finalize."
+}

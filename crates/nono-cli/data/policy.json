@@ -66,10 +66,13 @@
       "deny": {
         "access": [
           "~/Library/Application Support/Google/Chrome",
+          "~/Library/Application Support/Chromium",
           "~/Library/Application Support/Firefox",
           "~/Library/Application Support/Microsoft Edge",
           "~/Library/Application Support/Arc",
-          "~/Library/Application Support/Brave Browser",
+          "~/Library/Application Support/BraveSoftware",
+          "~/Library/Application Support/Vivaldi",
+          "~/Library/Application Support/com.operasoftware.Opera",
           "~/Library/Safari"
         ]
       }
@@ -84,7 +87,9 @@
           "~/.config/chromium",
           "~/.mozilla/firefox",
           "~/.config/microsoft-edge",
-          "~/.config/BraveSoftware"
+          "~/.config/BraveSoftware",
+          "~/.config/vivaldi",
+          "~/.config/opera"
         ]
       }
     },

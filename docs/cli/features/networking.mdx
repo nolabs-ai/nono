@@ -15,7 +15,7 @@ The proxy supports three modes that can be combined in a single session:
 | **Reverse proxy** | Credential injection for API calls. Requests arrive at `http://localhost:<port>/<service>/...`, the proxy injects the real API key and forwards to the upstream over TLS. | `--credential` |
 | **External proxy** | Enterprise proxy passthrough. CONNECT requests are chained through a corporate proxy. Cloud metadata endpoints are still denied. | `--upstream-proxy` |
 
-When domain filtering or credential injection is active, the proxy starts automatically. `HTTP_PROXY` and `HTTPS_PROXY` are set in the child environment.
+When domain filtering or credential injection is active, the proxy starts automatically. `HTTP_PROXY` and `HTTPS_PROXY` are set in the child environment. For Node.js 26+, nono also sets `NODE_USE_ENV_PROXY=1` so built-in `fetch()` reads `HTTPS_PROXY`.
 
 A 256-bit session token is generated for each proxy session. The child must include it in every request (`Proxy-Authorization` header for CONNECT, `X-Nono-Token` for reverse proxy), preventing other localhost processes from using the proxy.
 

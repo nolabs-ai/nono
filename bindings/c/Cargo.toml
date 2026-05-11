@@ -15,7 +15,7 @@ name = "nono_ffi"
 crate-type = ["cdylib", "staticlib"]
 
 [dependencies]
-nono = { version = "0.52.0", path = "../../crates/nono" }
+nono = { version = "0.52.1", path = "../../crates/nono", default-features = false }
 
 [build-dependencies]
 cbindgen.workspace = true

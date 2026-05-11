@@ -192,6 +192,14 @@ impl ProxyHandle {
         vars.push(("https_proxy".to_string(), proxy_url));
         vars.push(("no_proxy".to_string(), no_proxy));
 
+        // Node.js 20.6+ needs an explicit hint to use HTTPS_PROXY for built-in
+        // fetch(). Without it, Node-based clients can bypass the proxy and hit
+        // the sandboxed network directly.
+        // NODE_USE_ENV_PROXY tells Node's built-in fetch() to read HTTPS_PROXY
+        // from the environment.
+        // Harmless to non-Node runtimes — they ignore unknown env vars.
+        vars.push(("NODE_USE_ENV_PROXY".to_string(), "1".to_string()));
+
         // TLS-intercept trust injection. The bundle file at this path
         // contains the parent's `SSL_CERT_FILE` (if any) + the host's
         // system trust store + the ephemeral session CA, so standard
@@ -1100,8 +1108,13 @@ mod tests {
 
         let node_proxy_flag = vars.iter().find(|(k, _)| k == "NODE_USE_ENV_PROXY");
         assert!(
-            node_proxy_flag.is_none(),
-            "proxy env should avoid Node-specific flags that can perturb non-Node runtimes"
+            node_proxy_flag.is_some(),
+            "proxy env must set NODE_USE_ENV_PROXY for Node 20.6+ (undici 5.22+) built-in fetch()"
+        );
+        assert_eq!(
+            node_proxy_flag.unwrap().1,
+            "1",
+            "NODE_USE_ENV_PROXY must be '1'"
         );
 
         handle.shutdown();

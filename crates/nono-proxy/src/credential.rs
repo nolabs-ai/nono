@@ -107,8 +107,9 @@ impl CredentialStore {
     ///
     /// The `tls_connector` is required for OAuth2 token exchange HTTPS calls.
     ///
-    /// Returns an error only for hard failures (keystore access errors,
-    /// config parse errors, non-UTF-8 values).
+    /// Returns an error only for hard failures (config parse errors,
+    /// non-UTF-8 values). Missing or inaccessible credentials are logged
+    /// as warnings and the route is skipped.
     pub fn load(routes: &[RouteConfig], tls_connector: &TlsConnector) -> Result<Self> {
         let mut credentials = HashMap::new();
         let mut oauth2_routes = HashMap::new();
@@ -131,6 +132,14 @@ impl CredentialStore {
                         warn!(
                             "Credential '{}' not found for route '{}' — managed-credential requests on this route will be denied until the credential is available.{}",
                             key, normalized_prefix, hint
+                        );
+                        continue;
+                    }
+                    Err(nono::NonoError::KeystoreAccess(msg)) => {
+                        warn!(
+                            "Credential '{}' not available for route '{}': {}. \
+                             Managed-credential requests on this route will be denied until the credential is available.",
+                            key, normalized_prefix, msg
                         );
                         continue;
                     }
@@ -207,7 +216,8 @@ impl CredentialStore {
                 let client_id =
                     match nono::keystore::load_secret_by_ref(KEYRING_SERVICE, &oauth2.client_id) {
                         Ok(s) => s,
-                        Err(nono::NonoError::SecretNotFound(msg)) => {
+                        Err(nono::NonoError::SecretNotFound(msg))
+                        | Err(nono::NonoError::KeystoreAccess(msg)) => {
                             warn!(
                                 "OAuth2 client_id not available for route '{}': {}. \
                                  Managed-credential requests on this route will be denied.",
@@ -223,7 +233,8 @@ impl CredentialStore {
                     &oauth2.client_secret,
                 ) {
                     Ok(s) => s,
-                    Err(nono::NonoError::SecretNotFound(msg)) => {
+                    Err(nono::NonoError::SecretNotFound(msg))
+                    | Err(nono::NonoError::KeystoreAccess(msg)) => {
                         warn!(
                             "OAuth2 client_secret not available for route '{}': {}. \
                              Managed-credential requests on this route will be denied.",

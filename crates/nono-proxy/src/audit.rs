@@ -20,8 +20,19 @@ const MAX_AUDIT_EVENTS: usize = 4096;
 /// occur. Implementations must be cheap to call from async request handlers
 /// and must not panic; failures should be logged and swallowed so audit
 /// recording cannot break network operations.
+///
+/// `record` is the hot path and must not block. Implementations that buffer
+/// or offload writes asynchronously must drain their buffer in `flush`,
+/// which the audit log calls during `close` so that the caller can safely
+/// append further events (e.g. a `session_ended` record) directly to the
+/// underlying store without racing the sink's background writer.
 pub trait NetworkAuditSink: Send + Sync {
     fn record(&self, event: &NetworkAuditEvent);
+
+    /// Drain any buffered events. Returns only after every event passed to
+    /// `record` before this call is durable in the sink's destination.
+    /// Default no-op for sinks that write synchronously inside `record`.
+    fn flush(&self) {}
 }
 
 /// Shared sink for network audit events.
@@ -60,8 +71,7 @@ impl AuditLog {
         self.streaming_sink.get().is_some()
     }
 
-    /// Stop accepting new events. Subsequent `push_event` calls drop their
-    /// event without forwarding to the sink or buffer.
+    /// Stop accepting new events, then drain the streaming sink.
     ///
     /// Called by the supervisor immediately before recording `session_ended`,
     /// so that late events (in-flight responses still being audited after the
@@ -69,8 +79,15 @@ impl AuditLog {
     /// into the session metadata. Without this, post-finalize events would
     /// extend the file past the stored root and cause `verify_audit_log` to
     /// fail with a Merkle mismatch.
+    ///
+    /// The `closed` flag is set with release ordering before `flush` so that
+    /// no in-flight `push_event` can enqueue a new event after the sink
+    /// confirms its queue is empty.
     pub fn close(&self) {
         self.closed.store(true, Ordering::Release);
+        if let Some(sink) = self.streaming_sink.get() {
+            sink.flush();
+        }
     }
 
     fn is_closed(&self) -> bool {
@@ -436,6 +453,7 @@ mod tests {
         log_allowed(
             Some(&log),
             ProxyMode::Connect,
+            &EventContext::default(),
             "api.openai.com",
             443,
             "CONNECT",
@@ -443,6 +461,7 @@ mod tests {
         log_denied(
             Some(&log),
             ProxyMode::Connect,
+            &EventContext::default(),
             "evil.example",
             443,
             "blocked",
@@ -468,6 +487,7 @@ mod tests {
         log_allowed(
             Some(&log),
             ProxyMode::Connect,
+            &EventContext::default(),
             "api.openai.com",
             443,
             "CONNECT",
@@ -501,6 +521,7 @@ mod tests {
         log_allowed(
             Some(&log),
             ProxyMode::Connect,
+            &EventContext::default(),
             "before.example",
             443,
             "CONNECT",
@@ -509,6 +530,7 @@ mod tests {
         log_allowed(
             Some(&log),
             ProxyMode::Connect,
+            &EventContext::default(),
             "after.example",
             443,
             "CONNECT",

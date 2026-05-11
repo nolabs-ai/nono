@@ -229,7 +229,7 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
     // are lost on crash or once `MAX_AUDIT_EVENTS` is reached.
     if let (Some(recorder_mutex), Some(handle)) = (audit_recorder.as_ref(), proxy_handle) {
         let sink: Arc<dyn nono_proxy::audit::NetworkAuditSink> = Arc::new(
-            crate::audit_integrity::RecorderStreamingSink::new(Arc::clone(recorder_mutex)),
+            crate::audit_integrity::RecorderStreamingSink::new(Arc::clone(recorder_mutex))?,
         );
         if handle.set_audit_streaming_sink(sink).is_err() {
             tracing::warn!("Network audit streaming sink already attached; refusing to overwrite");

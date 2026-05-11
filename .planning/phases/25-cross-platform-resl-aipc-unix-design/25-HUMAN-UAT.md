@@ -85,3 +85,10 @@ discovered_in: 25-HUMAN-UAT (test 1 attempt)
 - Phase 22 UPST2 SUMMARY (last upstream sync — through v0.40)
 - Phase 24 DRIFT-01 (`check-upstream-drift` tooling) + DRIFT-02 (quick-task template)
 - 260428-rsu deferred runbook (upstream-stack rebase pattern)
+
+**Update (Phase 33, 2026-05-11):**
+
+1. **Drift audit summary:** The Wave 1 drift audit walked upstream v0.40.1..v0.52.0 (97 commits across 12 themed clusters) for the 4 RESL-flag-rename keywords originally suspected (`--memory`, `--cpu-percent`, `--max-processes`, `--timeout`) and found zero matches. The renames G-25-DRIFT-01 anticipated do not exist in upstream HEAD `54f7c32a` as of 2026-05-11. See [`DIVERGENCE-LEDGER.md`](../33-windows-parity-upstream-0-52-divergence/DIVERGENCE-LEDGER.md) for the full audit data.
+2. **Parity-strategy ADR decision:** The strategic ADR landed at [`docs/architecture/upstream-parity-strategy.md`](../../../docs/architecture/upstream-parity-strategy.md) picked option A: `continue` bidirectional parity. Implication for this gap: with the rename hypothesis disproved, there is nothing for UPST3 (Phase 34) to sync for G-25-DRIFT-01 specifically. The gap can remain `open` as a documented audit finding (premise empirically disproved) until a future audit surfaces actual upstream RESL drift, OR closed administratively in a separate decision.
+3. **Closure handoff:** Gap stays `status: open` until a future audit cycle (UPST3-sync or a later UPST4+ cycle) either surfaces actual upstream RESL drift or formally re-classifies this entry. **Phase 33 does NOT close G-25-DRIFT-01** — the audit + decision artifacts ship without altering the gap's status per SPEC.md § Out of scope. Closure decision is deferred (closure rationale would be "premise disproved; no upstream renames to sync" rather than "work completed").
+4. **Audit-walk note:** Audit surfaced ZERO RESL-flag-rename commits — fewer than the 4 originally suspected from Phase 25 HUMAN-UAT. No cluster in DIVERGENCE-LEDGER.md covers this surface. The RESL flag rename hypothesis is empirically disproved against `upstream/main` HEAD `54f7c32a` at 2026-05-11.

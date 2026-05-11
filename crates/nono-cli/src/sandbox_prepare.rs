@@ -35,10 +35,11 @@ fn print_allow_domain_port_warnings(entries: &[String], context: &str, silent: b
     }
 }
 
-/// Returns `true` if `profile_name` is `"claude-code"` or transitively extends it.
+/// Returns `true` if `profile_name` is `"claude-code"` or `"claude-no-kc"`, or
+/// transitively extends either.
 fn is_claude_code_profile(profile_name: &str) -> bool {
     fn check(name: &str, visited: &mut Vec<String>) -> bool {
-        if name == "claude-code" {
+        if name == "claude-code" || name == "claude-no-kc" {
             return true;
         }
         if visited.iter().any(|v| v == name) {
@@ -1080,45 +1081,71 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         precreate(&home_path.join(".claude.json.lock"), false);
         precreate(&home_path.join(".cache/claude-cli-nodejs"), true);
 
-        // Claude Code writes ~/.claude.json atomically via temp files named
-        // ~/.claude.json.tmp.<pid>.<timestamp>.  Landlock/Seatbelt cannot
-        // grant permission for these dynamically-named files in ~/, so token
-        // refreshes silently fail and the user is logged out.
-        //
-        // Fix: redirect ~/.claude.json to ~/.claude/claude.json via a
-        // symlink.  Claude Code resolves symlinks before computing the temp
-        // file path, so temp files land in ~/.claude/ (already readwrite)
-        // instead of ~/ (not writable inside the sandbox).
-        let claude_json = home_path.join(".claude.json");
-        let claude_dir = home_path.join(".claude");
-        let redirect_target = claude_dir.join("claude.json");
+        // When CLAUDE_CONFIG_DIR is set, Claude Code reads/writes
+        // $CLAUDE_CONFIG_DIR/.claude.json directly and ignores ~/.claude.json.
+        // The symlink redirect is only relevant for the default-path case.
+        // The caller is expected to `--allow $CLAUDE_CONFIG_DIR` separately.
+        if std::env::var_os("CLAUDE_CONFIG_DIR").is_none() {
+            // Claude Code writes ~/.claude.json atomically via temp files named
+            // ~/.claude.json.tmp.<pid>.<timestamp>.  Landlock/Seatbelt cannot
+            // grant permission for these dynamically-named files in ~/, so
+            // token refreshes silently fail and the user is logged out.
+            //
+            // Fix: redirect ~/.claude.json to ~/.claude/claude.json via a
+            // symlink.  Claude Code resolves symlinks before computing the
+            // temp file path, so temp files land in ~/.claude/ (already
+            // readwrite) instead of ~/ (not writable inside the sandbox).
+            let claude_json = home_path.join(".claude.json");
+            let claude_dir = home_path.join(".claude");
+            let redirect_target = claude_dir.join("claude.json");
 
-        if let Err(e) = std::fs::create_dir_all(&claude_dir) {
-            warn!("Failed to create ~/.claude: {}", e);
-        } else if !claude_json.is_symlink() {
-            if claude_json.exists() {
-                // Regular file present — move it into ~/.claude/ then symlink.
-                if let Err(e) = std::fs::rename(&claude_json, &redirect_target) {
-                    warn!(
-                        "Failed to move ~/.claude.json to ~/.claude/claude.json: {}",
-                        e
-                    );
-                } else if let Err(e) =
-                    std::os::unix::fs::symlink(".claude/claude.json", &claude_json)
-                {
-                    warn!("Failed to create ~/.claude.json symlink: {}", e);
-                }
-            } else {
-                // File doesn't exist yet — pre-create the target so the
-                // sandbox can attach a path rule to it, then symlink.
-                precreate(&redirect_target, false);
-                if let Err(e) = std::os::unix::fs::symlink(".claude/claude.json", &claude_json) {
-                    if e.kind() != std::io::ErrorKind::AlreadyExists {
+            if let Err(e) = std::fs::create_dir_all(&claude_dir) {
+                warn!("Failed to create ~/.claude: {}", e);
+            } else if !claude_json.is_symlink() {
+                if claude_json.exists() {
+                    // Regular file present — move it into ~/.claude/ then symlink.
+                    if let Err(e) = std::fs::rename(&claude_json, &redirect_target) {
+                        warn!(
+                            "Failed to move ~/.claude.json to ~/.claude/claude.json: {}",
+                            e
+                        );
+                    } else if let Err(e) =
+                        std::os::unix::fs::symlink(".claude/claude.json", &claude_json)
+                    {
                         warn!("Failed to create ~/.claude.json symlink: {}", e);
+                    }
+                } else {
+                    // File doesn't exist yet — pre-create the target so the
+                    // sandbox can attach a path rule to it, then symlink.
+                    precreate(&redirect_target, false);
+                    if let Err(e) =
+                        std::os::unix::fs::symlink(".claude/claude.json", &claude_json)
+                    {
+                        if e.kind() != std::io::ErrorKind::AlreadyExists {
+                            warn!("Failed to create ~/.claude.json symlink: {}", e);
+                        }
                     }
                 }
             }
         }
+
+        // Precreate Claude Code's token-refresh lock directory at the path
+        // Claude Code actually uses: "${effective_config_dir}.lock/" where
+        // effective_config_dir = $CLAUDE_CONFIG_DIR if set, else ~/.claude.
+        // Claude Code mkdirs this to acquire the lock and rmdirs it afterwards;
+        // the sandbox can only attach a path rule to an existing inode, so
+        // pre-create it on every run.  Use string concatenation (not
+        // `with_extension`) to match Claude Code's "${config_dir}.lock"
+        // naming — `with_extension` would replace a pre-existing extension.
+        let lock_base = std::env::var_os("CLAUDE_CONFIG_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home_path.join(".claude"));
+        let lock_dir = {
+            let mut s = lock_base.into_os_string();
+            s.push(".lock");
+            PathBuf::from(s)
+        };
+        precreate(&lock_dir, true);
     }
 
     let prepared = if let Some(ref profile) = loaded_profile {

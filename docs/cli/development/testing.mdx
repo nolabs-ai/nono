@@ -175,11 +175,12 @@ The CI runs tests on both Ubuntu and macOS:
 
 ```yaml
 integration:
-  name: Integration Tests
+  name: Integration (${{ matrix.os }})
   runs-on: ${{ matrix.os }}
   strategy:
+    fail-fast: false
     matrix:
-      os: [ubuntu-latest, macos-latest]
+      os: [ubuntu-latest-m, macos-latest]
   steps:
     - uses: actions/checkout@v4
     - name: Install Rust toolchain

@@ -47,7 +47,9 @@ Next actions:
   - After Phase 23 closes, `/gsd-complete-milestone v2.2` to archive the milestone.
   - Pre-merge `windows-squash` → `main` quick task remains a candidate for milestone-close timing.
 
-Last activity: 2026-05-11 -- Phase 34 planning complete
+Last activity: 2026-05-11 -- Plan 34-00 (Phase 34 UPST3-sync) closed G-25-DRIFT-01 as no-divergence; audit walk surfaced zero matches for the RESL flag rename hypothesis in upstream v0.40.1..v0.52.0. See `.planning/phases/25-cross-platform-resl-aipc-unix-design/25-HUMAN-UAT.md` § G-25-DRIFT-01 § Closure for the rationale.
+
+Prior activity: 2026-05-11 -- Phase 34 planning complete
 
 Prior activity: 2026-05-11 -- Quick task 260511-gzq-keyring-windows-native completed: enabled `keyring v3.6.3` Windows-native backend in `crates/nono/Cargo.toml` + `crates/nono-cli/Cargo.toml` (added `keyring = { version = "3", features = ["windows-native"] }` to each Windows target block, matching the Linux `sync-secret-service` and macOS `apple-native` pattern); pre-fix, missing feature flag caused keyring v3 to fall back to in-memory mock backend per docs.rs/keyring/3.6.3 — keygen+sign+verify failed cross-process on Windows because keygen wrote to mock, sign found empty mock in next process; bug has been silent since v2.1 keyring v3 adoption (Phase 20 UPST-03); fix verified end-to-end via debug binary keyed sign roundtrip producing real `LegacyGeneric:target=*.nono-trust` entries in Credential Manager (vs zero pre-fix); blast radius covers all `nono trust` keyed flows + `keyring://service/account` URI scheme + AUD-02 audit-attestation key reads; new release binary sha256 `06c1156e...` (was `8742260...`); ready for POC reinstall
 

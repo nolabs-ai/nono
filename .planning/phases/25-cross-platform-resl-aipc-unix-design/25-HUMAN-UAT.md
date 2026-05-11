@@ -61,7 +61,7 @@ blocked: 6
 
 ### G-25-DRIFT-01 — Upstream parity drift on all 4 RESL flag names (v0.52)
 severity: warning
-status: open
+status: closed: no-divergence
 discovered: 2026-05-10
 discovered_in: 25-HUMAN-UAT (test 1 attempt)
 
@@ -92,3 +92,11 @@ discovered_in: 25-HUMAN-UAT (test 1 attempt)
 2. **Parity-strategy ADR decision:** The strategic ADR landed at [`docs/architecture/upstream-parity-strategy.md`](../../../docs/architecture/upstream-parity-strategy.md) picked option A: `continue` bidirectional parity. Implication for this gap: with the rename hypothesis disproved, there is nothing for UPST3 (Phase 34) to sync for G-25-DRIFT-01 specifically. The gap can remain `open` as a documented audit finding (premise empirically disproved) until a future audit surfaces actual upstream RESL drift, OR closed administratively in a separate decision.
 3. **Closure handoff:** Gap stays `status: open` until a future audit cycle (UPST3-sync or a later UPST4+ cycle) either surfaces actual upstream RESL drift or formally re-classifies this entry. **Phase 33 does NOT close G-25-DRIFT-01** — the audit + decision artifacts ship without altering the gap's status per SPEC.md § Out of scope. Closure decision is deferred (closure rationale would be "premise disproved; no upstream renames to sync" rather than "work completed").
 4. **Audit-walk note:** Audit surfaced ZERO RESL-flag-rename commits — fewer than the 4 originally suspected from Phase 25 HUMAN-UAT. No cluster in DIVERGENCE-LEDGER.md covers this surface. The RESL flag rename hypothesis is empirically disproved against `upstream/main` HEAD `54f7c32a` at 2026-05-11.
+
+**Closure (Phase 34, 2026-05-11):**
+
+This gap is hereby closed with disposition `no-divergence`. The Phase 33 drift audit walked upstream `v0.40.1..v0.52.0` (97 non-merge commits across 12 themed clusters) for the four RESL flag rename keywords originally suspected at Phase 25 HUMAN-UAT time (`--memory`, `--cpu-percent`, `--max-processes`, `--timeout`) and surfaced **zero matches**. The renames G-25-DRIFT-01 anticipated do not exist in upstream HEAD `54f7c32a` as of 2026-05-11. Upstream v0.52.0 still ships all four flags under their original Phase 25 names; the fork's RESL surface is **not** diverged from upstream. The Phase 25 HUMAN-UAT premise was speculative-reading-of-churn, not an audit-grounded finding.
+
+Implication: there is no upstream RESL rename work for Phase 34 UPST3-sync to absorb. The six blocked HUMAN-UAT tests (Tests 1-6) can be re-validated on a Linux/macOS host as soon as Plan 25-01 (queued for v2.3 close) executes — the flag names listed in 25-HUMAN-UAT.md Tests 1-6 match upstream verbatim.
+
+Authoritative source: [`DIVERGENCE-LEDGER.md`](../33-windows-parity-upstream-0-52-divergence/DIVERGENCE-LEDGER.md) § Headline (CRITICAL audit finding paragraph) + § Cluster: Env deny_vars + macOS learn diagnostics + nono learn deprecation § Audit finding paragraph. Cross-references: [Phase 33 33-CONTEXT.md](../33-windows-parity-upstream-0-52-divergence/33-CONTEXT.md) D-33-D2; [Phase 34 34-CONTEXT.md](../34-upst3-upstream-v0-41-v0-52-sync-execution/34-CONTEXT.md) D-34-C1.

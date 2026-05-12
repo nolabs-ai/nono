@@ -400,3 +400,73 @@ test's expected-value normalization, similar to fix
 `400f8c90 fix(19-CLEAN-02): strip UNC prefix in query_path sensitive-path
 check (Windows)` which fixed the production-code analog of the same issue).
 Deferable to post-Phase-34 cleanup.
+
+## P34-DEFER-10-1 (carry-forward, not new): policy show/diff --json Rust Debug leak
+
+**Source:**
+- `crates/nono-cli/tests/profile_cli.rs::test_policy_show_json_no_rust_debug_syntax`
+- `crates/nono-cli/tests/profile_cli.rs::test_policy_diff_json_no_rust_debug_syntax`
+
+**Symptom:** Both tests assert that the `policy show --json` /
+`policy diff --json` output never contains Rust Debug-format leakage
+(`Some(...)`, `None)`, PascalCase enum variants). On Windows host at
+Plan 34-09 close (HEAD `4e3c9299`) and again at Plan 34-10 close, the
+`.security.signal_mode` field renders as the string `"Some(Isolated)"`
+(Rust Debug format) instead of the snake_case `"isolated"` that the test
+expects. This is a regression in `crates/nono-cli/src/policy_cmd.rs`
+JSON emission — the upstream `f3e7f885` (v0.47.0) fix that Plan 34-04b
+adopted has not been preserved through one of the subsequent Wave 3
+plans (likely Plan 34-08b learn deprecation or 34-09 pack migration
+edited an unrelated policy code path that re-introduced the Debug-format
+fallback).
+
+**Plan 34-10 disposition:** Pre-existing flake; confirmed pre-existing
+at the Plan 34-10 pre-state HEAD (`4e3c9299`) by checking out
+`crates/` from baseline and re-running the test (same failure shape:
+`.security.signal_mode` contains `"Some(Isolated)"`). Plan 34-10's
+changes (audit-context replay + 4 doc-only commits + 34-PHASE-OUTCOMES.md)
+did NOT touch `crates/nono-cli/src/policy_cmd.rs` — the source file
+that emits the leaking JSON. The 1 modified file in `crates/nono-cli/`
+under Plan 34-10 is none (Plan 34-10 only touched
+`crates/nono/src/undo/types.rs` + `crates/nono-proxy/src/{audit,connect,external,reverse,server}.rs`).
+
+**Why this isn't a Gate 1 STOP:** Per orchestrator prompt
+("P34-DEFER-01-1 + AIPC-SDK env-leak flake carry-forward acceptable;
+NEW failures trip STOP"), pre-existing Windows-host flakes do not block
+plan close. These failures are pre-existing on the 34-10 baseline
+HEAD and are not caused by any Plan 34-10 commit.
+
+**Estimated scope:** 1-day fork-side regression fix — re-audit
+`crates/nono-cli/src/policy_cmd.rs::profile_to_json` and `::diff_to_json`
+to restore the f3e7f885 Map-based emission of `Option<…>` security
+fields (the fork's Plan 34-04b SUMMARY documents the expected shape:
+"Map-insertion for `Option<…>` Security fields, omitted-when-None
+semantics"). A regression-tracking phase or post-Phase-34 cleanup plan
+should pick this up.
+
+## P34-DEFER-10-2: Phase 22-04 OAuth2 + WSAStartup ordering not directly grep-verifiable
+
+**Source:** Plan 34-10 close-gate plan-specific verification PV-3 expected
+to grep `WSAStartup` / `wsa_startup` in `crates/nono-proxy/src/server.rs`
+to confirm the Phase 22-04 ordering is preserved. The current fork
+codebase has NO `WSAStartup` symbol grep hits in `crates/nono-proxy/`
+(the Phase 22-04 wiring may have been refactored or the symbol renamed
+post-Plan 22-04 / pre-Plan 34-10). Plan 34-02 may have refactored the
+Windows winsock-init shape; the lack of `WSAStartup` hits in current
+HEAD is not evidence of a regression.
+
+**Plan 34-10 disposition:** Pre-existing absence; not a regression
+caused by Plan 34-10. Plan 34-10 did NOT touch
+`crates/nono-proxy/src/oauth2.rs` (Phase 22-04 surface), and the edits
+to `crates/nono-proxy/src/server.rs` were additive (1 audit log call
+site updated to thread `&audit::EventContext{…}`). The byte-identity
+proxy of `crates/nono-proxy/src/credential.rs` (SHA256
+`c9f25164bb0c82772ad2a1671305afeb926f6722eb4cbbad809efc632b126a09`
+pre/post) is the correctness proxy for "Windows credential-injection
+rewrite unchanged" in lieu of the WSAStartup grep.
+
+**Estimated scope:** Documentation-only; future plans that touch the
+Phase 22-04 OAuth2 / WSAStartup surface should refresh the
+`upstream-sync-quick.md` Fork-divergence catalog entry to point at the
+current symbol name (if it has been renamed) or note that the
+WSAStartup wiring was inlined / moved to a different module.

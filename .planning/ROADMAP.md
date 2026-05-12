@@ -151,9 +151,9 @@ Full details: `.planning/milestones/v2.3-ROADMAP.md`.
 
 **Requirements:** REQ-PORT-CLOSURE-02, REQ-PORT-CLOSURE-04, REQ-PORT-CLOSURE-05. See `.planning/REQUIREMENTS.md`.
 
-**Plans:** 6/6 plans created (0 complete) — Wave 1 (parallel by disjoint surface): 36-01a + 36-02 + 36-03; Wave 2 (sequential within REQ-02): 36-01b → 36-01c → 36-01d.
+**Plans:** 1/6 plans executed
 
-- [ ] 36-01a-DEPRECATED-SCHEMA-MODULE-PLAN.md — REQ-PORT-CLOSURE-02 foundation (LegacyPolicyPatch + DeprecationCounter + --strict mode; Wave 1)
+- [x] 36-01a-DEPRECATED-SCHEMA-MODULE-PLAN.md — REQ-PORT-CLOSURE-02 foundation (LegacyPolicyPatch + DeprecationCounter + --strict mode; Wave 1)
 - [ ] 36-01b-CANONICAL-PROFILE-SECTIONS-PLAN.md — REQ-PORT-CLOSURE-02 (canonical Profile struct sections: commands, filesystem.deny/bypass_protection; Wave 2; depends_on 36-01a)
 - [ ] 36-01c-OVERRIDE-DENY-RENAME-PLAN.md — REQ-PORT-CLOSURE-02 (atomic 17-file rename override_deny → bypass_protection, 183 callsites, single commit per D-36-B4; Wave 2; depends_on 36-01b)
 - [ ] 36-01d-PROFILE-DATA-DOCS-TOOLING-PLAN.md — REQ-PORT-CLOSURE-02 closure (built-in profile data + JSON schema + scripts/test-list-aliases.sh + scripts/lint-docs.sh + docs migration + Phase 34 deferred-items closure ledger; Wave 2; depends_on 36-01c)

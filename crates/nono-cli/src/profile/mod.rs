@@ -90,8 +90,20 @@ fn emit_legacy_override_deny_warning_once() {
 /// orthogonal to the main `Profile` deserialize. False positives (e.g. a
 /// custom JSON string literal containing the substring `"override_deny"`)
 /// are accepted as the lesser cost vs. mis-detecting a real legacy key.
+///
+/// Plan 36-01a: delegates to `deprecated_schema::GLOBAL_DEPRECATION_COUNTER`
+/// for per-key one-shot emission semantics. The legacy `LEGACY_OVERRIDE_DENY_WARNED`
+/// global is retired in Plan 36-01a Task 2 (Task 2 will remove it and this function
+/// entirely, routing detection through `cmd_validate`'s `LegacyPolicyPatch`).
 fn detect_legacy_override_deny_key(raw: &str) {
     if raw_profile_has_legacy_override_deny_key(raw) {
+        // Delegate to the new per-key DeprecationCounter (Plan 36-01a).
+        // This usage wires deprecated_schema::GLOBAL_DEPRECATION_COUNTER
+        // into the production code path ahead of Task 2's full migration.
+        crate::deprecated_schema::GLOBAL_DEPRECATION_COUNTER
+            .emit_once("override_deny", "bypass_protection");
+        // Keep the legacy AtomicBool emission path until Task 2 removes it
+        // to avoid any gap in the deprecation warning surface.
         emit_legacy_override_deny_warning_once();
     }
 }

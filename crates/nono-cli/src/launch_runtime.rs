@@ -179,6 +179,11 @@ pub(crate) struct ExecutionFlags {
     /// `exec_strategy_windows` and does not consume this field.
     #[cfg_attr(target_os = "windows", allow(dead_code))]
     pub(crate) allowed_env_vars: Option<Vec<String>>,
+    /// Plan 34-08a Task 4 (D-20 replay of v0.52.0 `3657c935`): deny-list
+    /// of environment variable names forwarded from
+    /// `PreparedSandbox.denied_env_vars`. Consumed by `ExecConfig.denied_env_vars`.
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
+    pub(crate) denied_env_vars: Option<Vec<String>>,
     pub(crate) session: SessionLaunchOptions,
     pub(crate) rollback: RollbackLaunchOptions,
     pub(crate) trust: TrustLaunchOptions,
@@ -200,6 +205,7 @@ impl ExecutionFlags {
             wsl2_proxy_policy: crate::profile::Wsl2ProxyPolicy::Error,
             override_deny_paths: Vec::new(),
             allowed_env_vars: None,
+            denied_env_vars: None,
             session: SessionLaunchOptions::default(),
             rollback: RollbackLaunchOptions::default(),
             trust: TrustLaunchOptions {
@@ -313,6 +319,7 @@ pub(crate) fn prepare_run_launch_plan(
             wsl2_proxy_policy: prepared.wsl2_proxy_policy,
             override_deny_paths: prepared.override_deny_paths,
             allowed_env_vars: prepared.allowed_env_vars,
+            denied_env_vars: prepared.denied_env_vars,
             session: SessionLaunchOptions {
                 detached_start: run_args.detached,
                 session_id: std::env::var(DETACHED_SESSION_ID_ENV)

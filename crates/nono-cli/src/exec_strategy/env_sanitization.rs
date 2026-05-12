@@ -102,27 +102,42 @@ pub(crate) fn is_env_var_allowed(key: &str, allowed_env_vars: &[String]) -> bool
     false
 }
 
-/// Validates that all allow-list patterns use `*` only as a trailing suffix.
+/// Validates that all env var patterns use `*` only as a trailing suffix.
+/// `field_name` is used in the error message (e.g. `"allow_vars"` or `"deny_vars"`).
 /// Returns an error message describing the first invalid pattern, or None if valid.
 ///
 /// Ported from upstream v0.37.0 `1b412a7` per Plan 34-08a Task 3 (D-20
-/// manual replay).
-pub(crate) fn validate_allow_vars_pattern(allow_vars: &[String]) -> Option<String> {
-    for pattern in allow_vars {
+/// manual replay); renamed from `validate_allow_vars_pattern` to
+/// `validate_env_var_patterns` with a `field_name` parameter per upstream
+/// v0.52.0 `3657c935` (Plan 34-08a Task 4).
+pub(crate) fn validate_env_var_patterns(patterns: &[String], field_name: &str) -> Option<String> {
+    for pattern in patterns {
         if pattern.contains('*') && !pattern.ends_with('*') {
             return Some(format!(
-                "Invalid allow_vars pattern '{}': '*' is only valid as a trailing suffix",
-                pattern
+                "Invalid {} pattern '{}': '*' is only valid as a trailing suffix",
+                field_name, pattern
             ));
         }
         if pattern.starts_with('*') && pattern.len() > 1 {
             return Some(format!(
-                "Invalid allow_vars pattern '{}': use a bare '*' to match all variables, or a specific prefix like 'AWS_*'",
-                pattern
+                "Invalid {} pattern '{}': use a bare '*' to match all variables, or a specific prefix like 'AWS_*'",
+                field_name, pattern
             ));
         }
     }
     None
+}
+
+/// Returns true if an environment variable matches the deny-list.
+///
+/// Uses the same pattern syntax as `is_env_var_allowed`: exact names and
+/// trailing-`*` prefix patterns.
+///
+/// Ported from upstream v0.52.0 `3657c935` per Plan 34-08a Task 4
+/// (D-20 manual-replay-by-escalation).
+#[allow(dead_code)] // Windows execution path uses exec_strategy_windows; deny-list wiring there ships separately.
+pub(crate) fn is_env_var_denied(key: &str, denied_env_vars: &[String]) -> bool {
+    is_env_var_allowed(key, denied_env_vars)
 }
 
 #[cfg(test)]
@@ -269,19 +284,20 @@ mod tests {
     }
 
     // ============================================================================
-    // Pattern validation — validate_allow_vars_pattern (ported v0.37.0 1b412a7)
+    // Pattern validation — validate_env_var_patterns (ported v0.37.0 1b412a7,
+    // renamed from validate_allow_vars_pattern in v0.52.0 3657c935)
     // ============================================================================
 
     #[test]
     fn test_validate_valid_patterns() {
         let patterns: Vec<String> = vec!["PATH".into(), "AWS_*".into(), "*".into()];
-        assert!(validate_allow_vars_pattern(&patterns).is_none());
+        assert!(validate_env_var_patterns(&patterns, "allow_vars").is_none());
     }
 
     #[test]
     fn test_validate_rejects_mid_star() {
         let patterns: Vec<String> = vec!["A*B".into()];
-        let err = validate_allow_vars_pattern(&patterns);
+        let err = validate_env_var_patterns(&patterns, "allow_vars");
         assert!(err.is_some());
         assert!(err.as_ref().is_some_and(|e| e.contains("A*B")));
     }
@@ -289,7 +305,7 @@ mod tests {
     #[test]
     fn test_validate_rejects_leading_star_with_suffix() {
         let patterns: Vec<String> = vec!["*X".into()];
-        let err = validate_allow_vars_pattern(&patterns);
+        let err = validate_env_var_patterns(&patterns, "allow_vars");
         assert!(err.is_some());
         assert!(err.as_ref().is_some_and(|e| e.contains("*X")));
     }
@@ -297,12 +313,65 @@ mod tests {
     #[test]
     fn test_validate_accepts_bare_star() {
         let patterns: Vec<String> = vec!["*".into()];
-        assert!(validate_allow_vars_pattern(&patterns).is_none());
+        assert!(validate_env_var_patterns(&patterns, "allow_vars").is_none());
     }
 
     #[test]
     fn test_validate_exact_name_no_star() {
         let patterns: Vec<String> = vec!["PATH".into()];
-        assert!(validate_allow_vars_pattern(&patterns).is_none());
+        assert!(validate_env_var_patterns(&patterns, "allow_vars").is_none());
+    }
+
+    #[test]
+    fn test_validate_deny_vars_field_name_in_error() {
+        let patterns: Vec<String> = vec!["A*B".into()];
+        let err = validate_env_var_patterns(&patterns, "deny_vars");
+        assert!(err.is_some());
+        let msg = err.expect("validation error");
+        assert!(msg.contains("deny_vars"));
+        assert!(msg.contains("A*B"));
+    }
+
+    // ============================================================================
+    // is_env_var_denied (ported v0.52.0 3657c935)
+    // ============================================================================
+
+    #[test]
+    fn test_env_var_denied_exact_match() {
+        let denied: Vec<String> = vec!["GH_TOKEN".into(), "ANTHROPIC_API_KEY".into()];
+        assert!(is_env_var_denied("GH_TOKEN", &denied));
+        assert!(is_env_var_denied("ANTHROPIC_API_KEY", &denied));
+    }
+
+    #[test]
+    fn test_env_var_denied_prefix_match() {
+        let denied: Vec<String> = vec!["GITHUB_*".into()];
+        assert!(is_env_var_denied("GITHUB_TOKEN", &denied));
+        assert!(is_env_var_denied("GITHUB_ACTIONS", &denied));
+        assert!(!is_env_var_denied("GH_TOKEN", &denied));
+    }
+
+    #[test]
+    fn test_env_var_denied_no_match() {
+        let denied: Vec<String> = vec!["GH_TOKEN".into()];
+        assert!(!is_env_var_denied("PATH", &denied));
+        assert!(!is_env_var_denied("HOME", &denied));
+    }
+
+    #[test]
+    fn test_env_var_denied_empty_list() {
+        let denied: Vec<String> = vec![];
+        assert!(!is_env_var_denied("GH_TOKEN", &denied));
+    }
+
+    #[test]
+    fn test_env_var_denied_overrides_allowed() {
+        // Simulates: deny_vars has GH_TOKEN, allow_vars has GH_TOKEN
+        // deny wins: denied should return true regardless of allowed
+        let denied: Vec<String> = vec!["GH_TOKEN".into()];
+        let allowed: Vec<String> = vec!["GH_TOKEN".into()];
+        assert!(is_env_var_denied("GH_TOKEN", &denied));
+        assert!(is_env_var_allowed("GH_TOKEN", &allowed));
+        // In exec path, deny is checked before allow, so GH_TOKEN is stripped
     }
 }

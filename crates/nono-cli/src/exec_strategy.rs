@@ -43,7 +43,9 @@ use tracing::{debug, info, warn};
 
 pub(crate) use env_sanitization::is_dangerous_env_var;
 use env_sanitization::should_skip_env_var;
-pub(crate) use env_sanitization::validate_allow_vars_pattern;
+#[allow(unused_imports)]
+// Re-exported for cross-module consumers; profile_runtime uses a local copy.
+pub(crate) use env_sanitization::validate_env_var_patterns;
 
 /// Platform-specific guard returned by [`apply_resource_limits_unix`].
 ///
@@ -315,6 +317,12 @@ pub struct ExecConfig<'a> {
     /// are passed to the child. `None` means inherit-all (default).
     /// Nono-injected credentials (`config.env_vars`) always bypass this list.
     pub allowed_env_vars: Option<Vec<String>>,
+    /// Plan 34-08a Task 4 (D-20 manual-replay-by-escalation of upstream
+    /// v0.52.0 `3657c935`): operator-controlled deny-list of environment
+    /// variable names. Variables matching an exact name or prefix pattern
+    /// (e.g. `"GITHUB_*"`) are stripped even if they also appear in
+    /// `allowed_env_vars`. Nono-injected credentials bypass this list.
+    pub denied_env_vars: Option<Vec<String>>,
 }
 
 #[derive(Clone, Copy)]
@@ -427,6 +435,15 @@ pub fn execute_direct(
     for (key, value) in std::env::vars() {
         if should_skip_env_var(&key, &config.env_vars, &["NONO_CAP_FILE"]) {
             continue;
+        }
+        // Plan 34-08a Task 4 (D-20 replay of v0.52.0 `3657c935`): deny-list
+        // checked BEFORE the allow-list. Precedence: dangerous-var blocklist
+        // > deny_vars > allow_vars. Nono-injected credentials bypass both
+        // (unconditionally added below).
+        if let Some(ref denied) = config.denied_env_vars {
+            if env_sanitization::is_env_var_denied(&key, denied) {
+                continue;
+            }
         }
         // Plan 34-08a Task 3 (D-20 replay of `1b412a7`): when an allow-list
         // is configured, only matching variables pass through. Profile-
@@ -586,6 +603,13 @@ pub fn execute_supervised(
                 &["NONO_CAP_FILE", "NONO_SUPERVISOR_FD"],
             ) {
                 continue;
+            }
+            // Plan 34-08a Task 4 (D-20 replay of v0.52.0 `3657c935`):
+            // deny-list filter (precedes the allow-list filter).
+            if let Some(ref denied) = config.denied_env_vars {
+                if env_sanitization::is_env_var_denied(k, denied) {
+                    continue;
+                }
             }
             // Plan 34-08a Task 3 (D-20 replay of `1b412a7`): allow-list
             // filter. Same semantics as execute_direct.

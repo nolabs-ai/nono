@@ -31,6 +31,11 @@ pub(crate) struct PreparedProfile {
     /// field; full Windows env-filter wiring tracked for a future plan
     /// (P34-DEFER-08a-1 if needed).
     pub(crate) allowed_env_vars: Option<Vec<String>>,
+    /// Plan 34-08a Task 4 (D-20 replay of v0.52.0 `3657c935`): operator-
+    /// controlled deny-list of environment variable names from
+    /// `profile.environment.deny_vars`. `None` means no deny filter active.
+    /// Wired to the Unix execution path via `ExecConfig.denied_env_vars`.
+    pub(crate) denied_env_vars: Option<Vec<String>>,
 }
 
 fn install_profile_hooks(profile_name: Option<&str>, profile: &profile::Profile, silent: bool) {
@@ -199,42 +204,62 @@ pub(crate) fn prepare_profile(
         ),
         // Plan 34-08a Task 3 (D-20 manual replay of upstream `1b412a7`):
         // surface `profile.environment.allow_vars` as a runtime allow-list.
-        // Validation is best-effort — invalid patterns emit a warning to
-        // stderr but the field is still forwarded (matching upstream
-        // semantics in `1b412a7`'s `prepare_profile_with_options`).
+        // Plan 34-08a Task 4 (D-20 replay of v0.52.0 `3657c935`) adds the
+        // empty-allow short-circuit (`if env_config.allow_vars.is_empty()
+        // { return None; }`) — Task 5 (`780965d7`) will revert this as a
+        // security regression fix. Validation is best-effort — invalid
+        // patterns emit a warning to stderr but the field is still forwarded.
         //
         // Validation logic is duplicated here from
-        // `exec_strategy::env_sanitization::validate_allow_vars_pattern`
-        // to avoid needing a Windows-side re-export (D-34-E1 invariant:
-        // `exec_strategy_windows/` files must remain untouched in this plan).
-        // Kept in lock-step with the canonical helper via tests in
-        // `exec_strategy/env_sanitization.rs`.
+        // `exec_strategy::env_sanitization::validate_env_var_patterns`
+        // to avoid crossing the `exec_strategy_windows` module boundary
+        // (D-34-E1 invariant: `exec_strategy_windows/` files must remain
+        // untouched in this plan). Kept in lock-step with the canonical
+        // helper via tests in `exec_strategy/env_sanitization.rs`.
         allowed_env_vars: loaded_profile.as_ref().and_then(|profile| {
-            profile.environment.as_ref().map(|env_config| {
-                if let Some(err) = validate_allow_vars_pattern_local(&env_config.allow_vars) {
+            profile.environment.as_ref().and_then(|env_config| {
+                if env_config.allow_vars.is_empty() {
+                    return None;
+                }
+                if let Some(err) =
+                    validate_env_var_patterns_local(&env_config.allow_vars, "allow_vars")
+                {
                     eprintln!("Warning: {}", err);
                 }
-                env_config.allow_vars.clone()
+                Some(env_config.allow_vars.clone())
+            })
+        }),
+        denied_env_vars: loaded_profile.as_ref().and_then(|profile| {
+            profile.environment.as_ref().and_then(|env_config| {
+                if env_config.deny_vars.is_empty() {
+                    return None;
+                }
+                if let Some(err) =
+                    validate_env_var_patterns_local(&env_config.deny_vars, "deny_vars")
+                {
+                    eprintln!("Warning: {}", err);
+                }
+                Some(env_config.deny_vars.clone())
             })
         }),
         loaded_profile,
     })
 }
 
-/// Local copy of `validate_allow_vars_pattern` to avoid crossing the
+/// Local copy of `validate_env_var_patterns` to avoid crossing the
 /// `exec_strategy_windows` module boundary (D-34-E1).
-fn validate_allow_vars_pattern_local(allow_vars: &[String]) -> Option<String> {
-    for pattern in allow_vars {
+fn validate_env_var_patterns_local(patterns: &[String], field_name: &str) -> Option<String> {
+    for pattern in patterns {
         if pattern.contains('*') && !pattern.ends_with('*') {
             return Some(format!(
-                "Invalid allow_vars pattern '{}': '*' is only valid as a trailing suffix",
-                pattern
+                "Invalid {} pattern '{}': '*' is only valid as a trailing suffix",
+                field_name, pattern
             ));
         }
         if pattern.starts_with('*') && pattern.len() > 1 {
             return Some(format!(
-                "Invalid allow_vars pattern '{}': use a bare '*' to match all variables, or a specific prefix like 'AWS_*'",
-                pattern
+                "Invalid {} pattern '{}': use a bare '*' to match all variables, or a specific prefix like 'AWS_*'",
+                field_name, pattern
             ));
         }
     }

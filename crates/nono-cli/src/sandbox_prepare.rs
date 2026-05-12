@@ -88,6 +88,10 @@ pub(crate) struct PreparedSandbox {
     /// `environment.allow_vars` block. See [`crate::profile_runtime::PreparedProfile::allowed_env_vars`]
     /// for semantics.
     pub(crate) allowed_env_vars: Option<Vec<String>>,
+    /// Plan 34-08a Task 4 (D-20 replay of v0.52.0 `3657c935`): operator-
+    /// controlled deny-list of environment variable names from the loaded
+    /// profile's `environment.deny_vars` block.
+    pub(crate) denied_env_vars: Option<Vec<String>>,
     /// Plan 18.1-03 G-06: the loaded profile (if any) is preserved past
     /// profile destructuring so its `capabilities.aipc` widening can be
     /// resolved at Windows supervisor construction time via
@@ -279,6 +283,9 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
                 // Plan 34-08a Task 3 (D-20 replay of `1b412a7`): manifest path
                 // has no loaded Profile and no env-filter block.
                 allowed_env_vars: None,
+                // Plan 34-08a Task 4 (D-20 replay of v0.52.0 `3657c935`):
+                // deny_vars also unset on the manifest path.
+                denied_env_vars: None,
                 // Plan 18.1-03 G-06: manifest path has no loaded Profile —
                 // AIPC widening defaults to hard-coded supervisor allowlist.
                 loaded_profile: None,
@@ -309,6 +316,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         allow_launch_services: profile_allow_launch_services,
         override_deny_paths,
         allowed_env_vars: profile_allowed_env_vars,
+        denied_env_vars: profile_denied_env_vars,
     } = prepared_profile;
 
     // OAUTH-03 (Plan 22-04): warn when allow_domain entries include `:port`
@@ -480,6 +488,9 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
             // Plan 34-08a Task 3 (D-20 replay of `1b412a7`): forward the
             // env-filter allow-list from PreparedProfile to PreparedSandbox.
             allowed_env_vars: profile_allowed_env_vars,
+            // Plan 34-08a Task 4 (D-20 replay of v0.52.0 `3657c935`):
+            // forward the env-filter deny-list.
+            denied_env_vars: profile_denied_env_vars,
             // Plan 18.1-03 G-06: preserve the loaded profile so
             // `Profile::resolve_aipc_allowlist` can be consulted at the
             // Windows supervisor construction site.

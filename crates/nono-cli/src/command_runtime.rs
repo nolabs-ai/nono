@@ -127,6 +127,7 @@ pub(crate) fn run_shell(args: ShellArgs, silent: bool) -> Result<()> {
             capability_elevation: prepared.capability_elevation,
             override_deny_paths: prepared.override_deny_paths,
             allowed_env_vars: prepared.allowed_env_vars,
+            denied_env_vars: prepared.denied_env_vars,
             session: SessionLaunchOptions {
                 session_name: args.name,
                 detach_sequence: load_configured_detach_sequence()?,
@@ -207,6 +208,7 @@ pub(crate) fn run_wrap(wrap_args: WrapArgs, silent: bool) -> Result<()> {
             no_diagnostics,
             override_deny_paths: prepared.override_deny_paths,
             allowed_env_vars: prepared.allowed_env_vars,
+            denied_env_vars: prepared.denied_env_vars,
             ..ExecutionFlags::defaults(silent)?
         },
     })

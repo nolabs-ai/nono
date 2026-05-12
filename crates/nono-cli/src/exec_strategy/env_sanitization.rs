@@ -75,6 +75,56 @@ pub(super) fn should_skip_env_var(
         || is_dangerous_env_var(key)
 }
 
+/// Returns true if an environment variable matches the allow-list.
+///
+/// Supports exact names (`"PATH"`) and prefix patterns ending with `*`
+/// (`"AWS_*"` matches `AWS_REGION`, `AWS_SECRET_ACCESS_KEY`, etc.).
+/// A bare `"*"` matches everything. The `*` wildcard is only valid as a
+/// trailing suffix — patterns like `"A*B"` or `"*X"` are rejected.
+///
+/// Ported from upstream v0.37.0 `1b412a7` per Plan 34-08a Task 3 (D-20
+/// manual replay). Phase 20-03 commit `b4762e63` ported only the CLI
+/// flag-parsing slice; this is part of the deferred surface.
+#[allow(dead_code)] // Windows execution path uses exec_strategy_windows; allow-list wiring there ships separately.
+pub(crate) fn is_env_var_allowed(key: &str, allowed_env_vars: &[String]) -> bool {
+    for pattern in allowed_env_vars {
+        if let Some(prefix) = pattern.strip_suffix('*') {
+            if prefix.contains('*') {
+                continue;
+            }
+            if key.starts_with(prefix) {
+                return true;
+            }
+        } else if !pattern.contains('*') && key == *pattern {
+            return true;
+        }
+    }
+    false
+}
+
+/// Validates that all allow-list patterns use `*` only as a trailing suffix.
+/// Returns an error message describing the first invalid pattern, or None if valid.
+///
+/// Ported from upstream v0.37.0 `1b412a7` per Plan 34-08a Task 3 (D-20
+/// manual replay).
+pub(crate) fn validate_allow_vars_pattern(allow_vars: &[String]) -> Option<String> {
+    for pattern in allow_vars {
+        if pattern.contains('*') && !pattern.ends_with('*') {
+            return Some(format!(
+                "Invalid allow_vars pattern '{}': '*' is only valid as a trailing suffix",
+                pattern
+            ));
+        }
+        if pattern.starts_with('*') && pattern.len() > 1 {
+            return Some(format!(
+                "Invalid allow_vars pattern '{}': use a bare '*' to match all variables, or a specific prefix like 'AWS_*'",
+                pattern
+            ));
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,5 +196,113 @@ mod tests {
             &[]
         ));
         assert!(should_skip_env_var("Path", &[], &["PATH"]));
+    }
+
+    // ============================================================================
+    // Environment variable allow-list — is_env_var_allowed (ported v0.37.0 1b412a7)
+    // ============================================================================
+
+    #[test]
+    fn test_env_var_allowed_exact_match() {
+        let allowed: Vec<String> = vec!["PATH".into(), "HOME".into()];
+        assert!(is_env_var_allowed("PATH", &allowed));
+        assert!(is_env_var_allowed("HOME", &allowed));
+    }
+
+    #[test]
+    fn test_env_var_allowed_exact_no_match() {
+        let allowed: Vec<String> = vec!["PATH".into(), "HOME".into()];
+        assert!(!is_env_var_allowed("SECRET", &allowed));
+    }
+
+    #[test]
+    fn test_env_var_allowed_prefix_match() {
+        let allowed: Vec<String> = vec!["AWS_*".into()];
+        assert!(is_env_var_allowed("AWS_REGION", &allowed));
+        assert!(is_env_var_allowed("AWS_SECRET_ACCESS_KEY", &allowed));
+    }
+
+    #[test]
+    fn test_env_var_allowed_prefix_no_match() {
+        let allowed: Vec<String> = vec!["AWS_*".into()];
+        assert!(!is_env_var_allowed("GCP_REGION", &allowed));
+    }
+
+    #[test]
+    fn test_env_var_allowed_empty_list() {
+        let allowed: Vec<String> = vec![];
+        assert!(!is_env_var_allowed("PATH", &allowed));
+    }
+
+    #[test]
+    fn test_env_var_allowed_bare_star() {
+        let allowed: Vec<String> = vec!["*".into()];
+        assert!(is_env_var_allowed("ANYTHING", &allowed));
+        assert!(is_env_var_allowed("PATH", &allowed));
+    }
+
+    #[test]
+    fn test_env_var_allowed_prefix_does_not_match_partial() {
+        let allowed: Vec<String> = vec!["AWS_*".into()];
+        assert!(!is_env_var_allowed("AWS", &allowed));
+    }
+
+    #[test]
+    fn test_env_var_allowed_prefix_matches_empty_suffix() {
+        let allowed: Vec<String> = vec!["AWS_*".into()];
+        assert!(is_env_var_allowed("AWS_", &allowed));
+    }
+
+    #[test]
+    fn test_env_var_allowed_mixed_patterns() {
+        let allowed: Vec<String> = vec!["PATH".into(), "AWS_*".into()];
+        assert!(is_env_var_allowed("PATH", &allowed));
+        assert!(is_env_var_allowed("AWS_REGION", &allowed));
+        assert!(!is_env_var_allowed("HOME", &allowed));
+    }
+
+    #[test]
+    fn test_env_var_allowed_mid_star_ignored() {
+        let allowed: Vec<String> = vec!["A*B".into()];
+        assert!(!is_env_var_allowed("AXB", &allowed));
+        assert!(!is_env_var_allowed("A*B", &allowed));
+    }
+
+    // ============================================================================
+    // Pattern validation — validate_allow_vars_pattern (ported v0.37.0 1b412a7)
+    // ============================================================================
+
+    #[test]
+    fn test_validate_valid_patterns() {
+        let patterns: Vec<String> = vec!["PATH".into(), "AWS_*".into(), "*".into()];
+        assert!(validate_allow_vars_pattern(&patterns).is_none());
+    }
+
+    #[test]
+    fn test_validate_rejects_mid_star() {
+        let patterns: Vec<String> = vec!["A*B".into()];
+        let err = validate_allow_vars_pattern(&patterns);
+        assert!(err.is_some());
+        assert!(err.as_ref().is_some_and(|e| e.contains("A*B")));
+    }
+
+    #[test]
+    fn test_validate_rejects_leading_star_with_suffix() {
+        let patterns: Vec<String> = vec!["*X".into()];
+        let err = validate_allow_vars_pattern(&patterns);
+        assert!(err.is_some());
+        assert!(err.as_ref().is_some_and(|e| e.contains("*X")));
+    }
+
+    #[test]
+    fn test_validate_accepts_bare_star() {
+        let patterns: Vec<String> = vec!["*".into()];
+        assert!(validate_allow_vars_pattern(&patterns).is_none());
+    }
+
+    #[test]
+    fn test_validate_exact_name_no_star() {
+        let patterns: Vec<String> = vec!["PATH".into()];
+        assert!(validate_allow_vars_pattern(&patterns).is_none());
     }
 }

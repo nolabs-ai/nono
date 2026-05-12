@@ -334,6 +334,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         capability_elevation: flags.capability_elevation,
         #[cfg(target_os = "linux")]
         seccomp_proxy_fallback,
+        allowed_env_vars: flags.allowed_env_vars.clone(),
     };
     #[cfg(target_os = "windows")]
     let config = exec_strategy::ExecConfig {

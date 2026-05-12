@@ -43,6 +43,7 @@ use tracing::{debug, info, warn};
 
 pub(crate) use env_sanitization::is_dangerous_env_var;
 use env_sanitization::should_skip_env_var;
+pub(crate) use env_sanitization::validate_allow_vars_pattern;
 
 /// Platform-specific guard returned by [`apply_resource_limits_unix`].
 ///
@@ -308,6 +309,12 @@ pub struct ExecConfig<'a> {
     /// sends the notify fd; parent expects to receive it.
     #[cfg(target_os = "linux")]
     pub seccomp_proxy_fallback: bool,
+    /// Plan 34-08a Task 3 (D-20 manual replay of upstream `1b412a7`):
+    /// allow-list of environment variable names. When `Some`, only
+    /// variables matching an exact name or prefix pattern (e.g. `"AWS_*"`)
+    /// are passed to the child. `None` means inherit-all (default).
+    /// Nono-injected credentials (`config.env_vars`) always bypass this list.
+    pub allowed_env_vars: Option<Vec<String>>,
 }
 
 #[derive(Clone, Copy)]
@@ -418,9 +425,19 @@ pub fn execute_direct(
     cmd.current_dir(config.current_dir);
 
     for (key, value) in std::env::vars() {
-        if !should_skip_env_var(&key, &config.env_vars, &["NONO_CAP_FILE"]) {
-            cmd.env(&key, &value);
+        if should_skip_env_var(&key, &config.env_vars, &["NONO_CAP_FILE"]) {
+            continue;
         }
+        // Plan 34-08a Task 3 (D-20 replay of `1b412a7`): when an allow-list
+        // is configured, only matching variables pass through. Profile-
+        // injected env_vars are unconditionally added below (after this
+        // loop) — they always bypass the allow-list.
+        if let Some(ref allowed) = config.allowed_env_vars {
+            if !env_sanitization::is_env_var_allowed(&key, allowed) {
+                continue;
+            }
+        }
+        cmd.env(&key, &value);
     }
 
     cmd.args(cmd_args);
@@ -563,15 +580,22 @@ pub fn execute_supervised(
     // Copy current environment, filtering dangerous and overridden vars
     for (key, value) in std::env::vars_os() {
         if let (Some(k), Some(v)) = (key.to_str(), value.to_str()) {
-            let should_skip = should_skip_env_var(
+            if should_skip_env_var(
                 k,
                 &config.env_vars,
                 &["NONO_CAP_FILE", "NONO_SUPERVISOR_FD"],
-            );
-            if !should_skip {
-                if let Ok(cstr) = CString::new(format!("{}={}", k, v)) {
-                    env_c.push(cstr);
+            ) {
+                continue;
+            }
+            // Plan 34-08a Task 3 (D-20 replay of `1b412a7`): allow-list
+            // filter. Same semantics as execute_direct.
+            if let Some(ref allowed) = config.allowed_env_vars {
+                if !env_sanitization::is_env_var_allowed(k, allowed) {
+                    continue;
                 }
+            }
+            if let Ok(cstr) = CString::new(format!("{}={}", k, v)) {
+                env_c.push(cstr);
             }
         }
     }

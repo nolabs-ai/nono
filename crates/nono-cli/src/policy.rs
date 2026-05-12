@@ -167,6 +167,10 @@ impl ProfileDef {
             policy,
             network: self.network.clone(),
             env_credentials: self.env_credentials.clone(),
+            // Plan 34-08a Task 3 (D-20 manual replay of upstream `1b412a7`):
+            // built-in policy.json profiles don't declare env-filter today;
+            // the field is plumbed for struct-literal completeness.
+            environment: None,
             workdir: self.workdir.clone(),
             hooks: self.hooks.clone(),
             rollback: self.rollback.clone(),

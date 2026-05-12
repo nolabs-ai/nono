@@ -22,6 +22,15 @@ pub(crate) struct PreparedProfile {
     pub(crate) open_url_allow_localhost: bool,
     pub(crate) allow_launch_services: bool,
     pub(crate) override_deny_paths: Vec<PathBuf>,
+    /// Plan 34-08a Task 3 (D-20 manual replay of upstream `1b412a7`):
+    /// allow-list of environment variable names from `profile.environment.allow_vars`.
+    /// `None` means inherit-all (default upstream behaviour); `Some([])`
+    /// means strip all (fail-closed). Wired to the Unix execution path via
+    /// `ExecConfig.allowed_env_vars`. Windows execution path uses the
+    /// separate `exec_strategy_windows` module and does not consume this
+    /// field; full Windows env-filter wiring tracked for a future plan
+    /// (P34-DEFER-08a-1 if needed).
+    pub(crate) allowed_env_vars: Option<Vec<String>>,
 }
 
 fn install_profile_hooks(profile_name: Option<&str>, profile: &profile::Profile, silent: bool) {
@@ -188,6 +197,46 @@ pub(crate) fn prepare_profile(
             &args.override_deny,
             workdir,
         ),
+        // Plan 34-08a Task 3 (D-20 manual replay of upstream `1b412a7`):
+        // surface `profile.environment.allow_vars` as a runtime allow-list.
+        // Validation is best-effort — invalid patterns emit a warning to
+        // stderr but the field is still forwarded (matching upstream
+        // semantics in `1b412a7`'s `prepare_profile_with_options`).
+        //
+        // Validation logic is duplicated here from
+        // `exec_strategy::env_sanitization::validate_allow_vars_pattern`
+        // to avoid needing a Windows-side re-export (D-34-E1 invariant:
+        // `exec_strategy_windows/` files must remain untouched in this plan).
+        // Kept in lock-step with the canonical helper via tests in
+        // `exec_strategy/env_sanitization.rs`.
+        allowed_env_vars: loaded_profile.as_ref().and_then(|profile| {
+            profile.environment.as_ref().map(|env_config| {
+                if let Some(err) = validate_allow_vars_pattern_local(&env_config.allow_vars) {
+                    eprintln!("Warning: {}", err);
+                }
+                env_config.allow_vars.clone()
+            })
+        }),
         loaded_profile,
     })
+}
+
+/// Local copy of `validate_allow_vars_pattern` to avoid crossing the
+/// `exec_strategy_windows` module boundary (D-34-E1).
+fn validate_allow_vars_pattern_local(allow_vars: &[String]) -> Option<String> {
+    for pattern in allow_vars {
+        if pattern.contains('*') && !pattern.ends_with('*') {
+            return Some(format!(
+                "Invalid allow_vars pattern '{}': '*' is only valid as a trailing suffix",
+                pattern
+            ));
+        }
+        if pattern.starts_with('*') && pattern.len() > 1 {
+            return Some(format!(
+                "Invalid allow_vars pattern '{}': use a bare '*' to match all variables, or a specific prefix like 'AWS_*'",
+                pattern
+            ));
+        }
+    }
+    None
 }

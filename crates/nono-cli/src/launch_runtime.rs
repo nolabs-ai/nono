@@ -171,6 +171,14 @@ pub(crate) struct ExecutionFlags {
     #[cfg(target_os = "linux")]
     pub(crate) wsl2_proxy_policy: crate::profile::Wsl2ProxyPolicy,
     pub(crate) override_deny_paths: Vec<PathBuf>,
+    /// Plan 34-08a Task 3 (D-20 manual replay of upstream `1b412a7`):
+    /// allow-list of environment variable names forwarded from
+    /// `PreparedSandbox.allowed_env_vars`. Consumed by the Unix
+    /// `ExecConfig.allowed_env_vars` field in execute_direct /
+    /// execute_supervised. Windows execution path uses
+    /// `exec_strategy_windows` and does not consume this field.
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
+    pub(crate) allowed_env_vars: Option<Vec<String>>,
     pub(crate) session: SessionLaunchOptions,
     pub(crate) rollback: RollbackLaunchOptions,
     pub(crate) trust: TrustLaunchOptions,
@@ -191,6 +199,7 @@ impl ExecutionFlags {
             #[cfg(target_os = "linux")]
             wsl2_proxy_policy: crate::profile::Wsl2ProxyPolicy::Error,
             override_deny_paths: Vec::new(),
+            allowed_env_vars: None,
             session: SessionLaunchOptions::default(),
             rollback: RollbackLaunchOptions::default(),
             trust: TrustLaunchOptions {
@@ -303,6 +312,7 @@ pub(crate) fn prepare_run_launch_plan(
             #[cfg(target_os = "linux")]
             wsl2_proxy_policy: prepared.wsl2_proxy_policy,
             override_deny_paths: prepared.override_deny_paths,
+            allowed_env_vars: prepared.allowed_env_vars,
             session: SessionLaunchOptions {
                 detached_start: run_args.detached,
                 session_id: std::env::var(DETACHED_SESSION_ID_ENV)

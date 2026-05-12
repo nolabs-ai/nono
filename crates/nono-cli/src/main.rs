@@ -252,6 +252,9 @@ mod tests {
             open_url_origins: Vec::new(),
             open_url_allow_localhost: false,
             override_deny_paths: Vec::new(),
+            // Plan 34-08a Task 3 (D-20 replay of `1b412a7`): test fixture
+            // has no env-filter allow-list.
+            allowed_env_vars: None,
             // Plan 18.1-03 G-06: test fixture has no loaded profile.
             loaded_profile: None,
         };
@@ -295,6 +298,9 @@ mod tests {
             open_url_origins: Vec::new(),
             open_url_allow_localhost: false,
             override_deny_paths: Vec::new(),
+            // Plan 34-08a Task 3 (D-20 replay of `1b412a7`): test fixture
+            // has no env-filter allow-list.
+            allowed_env_vars: None,
             // Plan 18.1-03 G-06: test fixture has no loaded profile.
             loaded_profile: None,
         };

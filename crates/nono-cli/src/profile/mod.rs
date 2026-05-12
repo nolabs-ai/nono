@@ -1418,6 +1418,29 @@ pub struct RollbackConfig {
     pub exclude_globs: Vec<String>,
 }
 
+/// Controls which environment variables are passed to the sandboxed process.
+///
+/// By default, all environment variables are inherited from the parent process.
+/// When `allow_vars` is set, only the listed variables (and nono-injected
+/// credentials) are passed through. Supports exact names (`"PATH"`) and
+/// prefix patterns (`"AWS_*"`).
+///
+/// Ported from upstream v0.37.0 `1b412a7` per Plan 34-08a Task 3 (D-20 manual
+/// replay). Phase 20-03 commit `b4762e63` ported only the CLI flag-parsing
+/// slice; this is part of the deferred surface.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct EnvironmentConfig {
+    /// Allow-list of environment variable names passed to the sandboxed process.
+    ///
+    /// Supports exact names (`"PATH"`) and prefix patterns ending with `*`
+    /// (`"AWS_*"` matches `AWS_REGION`, `AWS_SECRET_ACCESS_KEY`, etc.).
+    /// When empty, all variables are allowed (default).
+    /// Nono-injected credentials always bypass this list.
+    #[serde(default)]
+    pub allow_vars: Vec<String>,
+}
+
 /// Configuration for supervisor-delegated URL opening.
 ///
 /// Controls which URLs the sandboxed child can request the supervisor to
@@ -1490,6 +1513,12 @@ pub struct Profile {
     pub network: NetworkConfig,
     #[serde(default, alias = "secrets")]
     pub env_credentials: SecretsConfig,
+    /// Environment variable allow-list (ported from upstream v0.37.0 `1b412a7`).
+    /// When `None` (absent from JSON), all parent env vars are inherited (default).
+    /// When `Some(EnvironmentConfig { allow_vars: [...] })`, only matching vars
+    /// pass through. Nono-injected credentials always bypass.
+    #[serde(default)]
+    pub environment: Option<EnvironmentConfig>,
     #[serde(default)]
     pub workdir: WorkdirConfig,
     #[serde(default)]
@@ -1569,6 +1598,8 @@ struct ProfileDeserialize {
     #[serde(default, alias = "secrets")]
     env_credentials: SecretsConfig,
     #[serde(default)]
+    environment: Option<EnvironmentConfig>,
+    #[serde(default)]
     workdir: WorkdirConfig,
     #[serde(default)]
     hooks: HooksConfig,
@@ -1603,6 +1634,7 @@ impl From<ProfileDeserialize> for Profile {
             policy: raw.policy,
             network: raw.network,
             env_credentials: raw.env_credentials,
+            environment: raw.environment,
             workdir: raw.workdir,
             hooks: raw.hooks,
             rollback: raw.rollback,
@@ -2213,6 +2245,14 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
                 merged
             },
         },
+        environment: match (&base.environment, &child.environment) {
+            (None, None) => None,
+            (Some(base_env), None) => Some(base_env.clone()),
+            (None, Some(child_env)) => Some(child_env.clone()),
+            (Some(base_env), Some(child_env)) => Some(EnvironmentConfig {
+                allow_vars: dedup_append(&base_env.allow_vars, &child_env.allow_vars),
+            }),
+        },
         // NOTE: WorkdirAccess::None serves as both "not specified" and "explicitly no access".
         // A child cannot override a base's workdir grant to None. This is a v1 limitation;
         // fixing it requires wrapping in Option<WorkdirAccess> and updating all consumers.
@@ -2816,6 +2856,72 @@ mod tests {
             profile.env_credentials.mappings.get("anthropic_api_key"),
             Some(&"ANTHROPIC_API_KEY".to_string())
         );
+    }
+
+    // ============================================================================
+    // EnvironmentConfig — ported from upstream v0.37.0 `1b412a7`
+    // (Plan 34-08a Task 3, D-20 manual replay)
+    // ============================================================================
+
+    #[test]
+    fn test_environment_config_default() {
+        let json_str = r#"{
+            "meta": { "name": "test-profile" }
+        }"#;
+
+        let profile: Profile = serde_json::from_str(json_str).expect("Failed to parse profile");
+        assert!(profile.environment.is_none());
+    }
+
+    #[test]
+    fn test_environment_config_with_allow_vars() {
+        let json_str = r#"{
+            "meta": { "name": "test-profile" },
+            "environment": {
+                "allow_vars": ["PATH", "HOME", "AWS_*"]
+            }
+        }"#;
+
+        let profile: Profile = serde_json::from_str(json_str).expect("Failed to parse profile");
+        assert_eq!(
+            profile
+                .environment
+                .as_ref()
+                .expect("environment")
+                .allow_vars,
+            vec!["PATH", "HOME", "AWS_*"]
+        );
+    }
+
+    #[test]
+    fn test_environment_config_deny_unknown_fields() {
+        let json_str = r#"{
+            "meta": { "name": "test-profile" },
+            "environment": {
+                "allow_vars": ["PATH"],
+                "unknown_field": true
+            }
+        }"#;
+
+        let result = serde_json::from_str::<Profile>(json_str);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_environment_config_empty_allow_vars() {
+        let json_str = r#"{
+            "meta": { "name": "test-profile" },
+            "environment": {
+                "allow_vars": []
+            }
+        }"#;
+
+        let profile: Profile = serde_json::from_str(json_str).expect("Failed to parse profile");
+        let env_config = profile
+            .environment
+            .as_ref()
+            .expect("environment should be Some");
+        assert!(env_config.allow_vars.is_empty());
     }
 
     #[test]
@@ -3587,6 +3693,7 @@ mod tests {
                     m
                 },
             },
+            environment: None,
             workdir: WorkdirConfig {
                 access: WorkdirAccess::ReadWrite,
             },
@@ -3660,6 +3767,7 @@ mod tests {
                     m
                 },
             },
+            environment: None,
             workdir: WorkdirConfig {
                 access: WorkdirAccess::None,
             },

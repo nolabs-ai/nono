@@ -1627,6 +1627,8 @@ mod tests {
             interactive_shell: false,
             session_token: None,
             cap_pipe_rendezvous_path: None,
+            allowed_env_vars: None,
+            denied_env_vars: None,
         };
         let probe_config = make_test_probe_config();
 
@@ -1681,6 +1683,8 @@ mod tests {
             interactive_shell: false,
             session_token: None,
             cap_pipe_rendezvous_path: None,
+            allowed_env_vars: None,
+            denied_env_vars: None,
         };
         let probe_config = make_test_probe_config();
 

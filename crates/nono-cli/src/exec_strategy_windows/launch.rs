@@ -642,6 +642,22 @@ pub(super) fn build_child_env(config: &ExecConfig<'_>) -> Vec<(String, String)> 
                 "TF_DATA_DIR",
             ],
         ) {
+            // Plan 35-01 (REQ-PORT-CLOSURE-01 / P34-DEFER-08a-1 closure):
+            // mirror the Unix env-filter precedence from
+            // exec_strategy.rs:443-456 (Plan 34-08a Wave 2 / D-20 replay
+            // of upstream 1b412a7 + 3657c935). Deny-list checked BEFORE
+            // allow-list; both bypassed by nono-injected credentials
+            // (config.env_vars appended unconditionally below).
+            if let Some(ref denied) = config.denied_env_vars {
+                if is_env_var_denied(&key, denied) {
+                    continue;
+                }
+            }
+            if let Some(ref allowed) = config.allowed_env_vars {
+                if !is_env_var_allowed(&key, allowed) {
+                    continue;
+                }
+            }
             env_pairs.push((key, value));
         }
     }
@@ -2683,6 +2699,204 @@ mod broker_dispatch_tests {
             wide.last(),
             Some(&0),
             "command line buffer must be null-terminated UTF-16"
+        );
+    }
+}
+
+/// Plan 35-01 (REQ-PORT-CLOSURE-01 / P34-DEFER-08a-1): Windows-gated regression
+/// tests locking the empty-allow fail-closed invariant + deny/allow precedence +
+/// nono-injected-credential bypass. All four tests mirror the Unix env-filter
+/// behavior specified in exec_strategy.rs:435-457 (D-20 replay of upstream
+/// 1b412a7 + 3657c935 + 780965d7).
+///
+/// Per CLAUDE.md "Environment variables in tests": each test that seeds a fixture
+/// env var uses the project-wide `EnvVarGuard` RAII struct (crate::test_env) which
+/// saves and restores the prior value on Drop, and acquires `ENV_LOCK` to prevent
+/// data races between parallel test threads. Tests are parallel-safe.
+#[cfg(all(test, target_os = "windows"))]
+#[allow(clippy::unwrap_used)]
+mod env_filter_tests {
+    use super::{build_child_env, ExecConfig};
+    use crate::test_env::{lock_env, EnvVarGuard};
+    use nono::CapabilitySet;
+    use std::path::Path;
+
+    /// Construct a minimal `ExecConfig` for env-filter unit testing.
+    /// Fields not relevant to `build_child_env`'s env-filter logic are
+    /// set to safe sentinel values (empty command, stub resolved_program,
+    /// empty CapabilitySet, no cap_file, no session state).
+    fn make_minimal_exec_config<'a>(
+        command: &'a [String],
+        resolved_program: &'a Path,
+        caps: &'a CapabilitySet,
+        current_dir: &'a Path,
+        allowed_env_vars: Option<Vec<String>>,
+        denied_env_vars: Option<Vec<String>>,
+        env_vars: Vec<(&'a str, &'a str)>,
+    ) -> ExecConfig<'a> {
+        ExecConfig {
+            command,
+            resolved_program,
+            caps,
+            env_vars,
+            cap_file: None,
+            current_dir,
+            session_sid: None,
+            interactive_shell: false,
+            session_token: None,
+            cap_pipe_rendezvous_path: None,
+            allowed_env_vars,
+            denied_env_vars,
+        }
+    }
+
+    /// Plan 35-01 T-35-01-01 mitigation: empty allow-list MUST fail closed —
+    /// all inherited user env vars are stripped (the only vars that survive are
+    /// the Windows runtime block from `append_windows_runtime_env` and
+    /// nono-injected credentials, both of which bypass the filter by construction).
+    ///
+    /// Locks upstream 780965d7's fail-closed invariant on the Windows execution
+    /// path (REQ-PORT-CLOSURE-01 Acceptance Criterion 3).
+    #[test]
+    fn test_windows_empty_allow_denies_all_env_vars() {
+        let _lock = lock_env();
+        let _guard =
+            EnvVarGuard::set_all(&[("NONO_TEST_EMPTY_ALLOW_FIXTURE", "should_be_stripped")]);
+
+        let command: Vec<String> = vec![];
+        let resolved_program = Path::new(r"C:\tools\agent.exe");
+        let caps = CapabilitySet::new();
+        let current_dir = Path::new(r"C:\workspace");
+        let config = make_minimal_exec_config(
+            &command,
+            resolved_program,
+            &caps,
+            current_dir,
+            /* allowed */ Some(vec![]),
+            /* denied */ None,
+            /* env_vars */ vec![],
+        );
+
+        let env_pairs = build_child_env(&config);
+
+        // The runtime allowlist (PATH, SystemRoot, etc.) and
+        // append_windows_runtime_env both bypass the new allow/deny filter,
+        // but the fixture key (which is NOT in the runtime allowlist) MUST NOT
+        // appear when the allow-list is empty.
+        assert!(
+            !env_pairs
+                .iter()
+                .any(|(k, _)| k == "NONO_TEST_EMPTY_ALLOW_FIXTURE"),
+            "Empty allow-list MUST strip non-runtime inherited env vars \
+             (fail-closed invariant from upstream 780965d7)"
+        );
+    }
+
+    /// Plan 35-01 T-35-01-02 mitigation (deny wins): a key matching the deny-list
+    /// MUST be stripped from the child environment regardless of allow-list state.
+    /// Locks the deny-before-allow precedence mirrored from exec_strategy.rs:443-456.
+    #[test]
+    fn test_windows_deny_strips_matching_env_vars() {
+        let _lock = lock_env();
+        let _guard = EnvVarGuard::set_all(&[("NONO_TEST_DENY_FIXTURE_A", "should_be_stripped")]);
+
+        let command: Vec<String> = vec![];
+        let resolved_program = Path::new(r"C:\tools\agent.exe");
+        let caps = CapabilitySet::new();
+        let current_dir = Path::new(r"C:\workspace");
+        let config = make_minimal_exec_config(
+            &command,
+            resolved_program,
+            &caps,
+            current_dir,
+            /* allowed */ None,
+            /* denied */ Some(vec!["NONO_TEST_DENY_FIXTURE_*".to_string()]),
+            /* env_vars */ vec![],
+        );
+
+        let env_pairs = build_child_env(&config);
+
+        assert!(
+            !env_pairs
+                .iter()
+                .any(|(k, _)| k == "NONO_TEST_DENY_FIXTURE_A"),
+            "deny_vars pattern 'NONO_TEST_DENY_FIXTURE_*' must strip \
+             NONO_TEST_DENY_FIXTURE_A from the child env"
+        );
+    }
+
+    /// Plan 35-01 (REQ-PORT-CLOSURE-01 Acceptance Criterion 2): allow-list with
+    /// specific keys MUST pass through the matching key and strip unmatched keys.
+    #[test]
+    fn test_windows_allow_passes_only_matching_env_vars() {
+        let _lock = lock_env();
+        let _guard = EnvVarGuard::set_all(&[
+            ("NONO_TEST_ALLOW_FIXTURE_KEEP", "passes"),
+            ("NONO_TEST_ALLOW_FIXTURE_DROP", "stripped"),
+        ]);
+
+        let command: Vec<String> = vec![];
+        let resolved_program = Path::new(r"C:\tools\agent.exe");
+        let caps = CapabilitySet::new();
+        let current_dir = Path::new(r"C:\workspace");
+        let config = make_minimal_exec_config(
+            &command,
+            resolved_program,
+            &caps,
+            current_dir,
+            /* allowed */ Some(vec!["NONO_TEST_ALLOW_FIXTURE_KEEP".to_string()]),
+            /* denied */ None,
+            /* env_vars */ vec![],
+        );
+
+        let env_pairs = build_child_env(&config);
+
+        assert!(
+            env_pairs
+                .iter()
+                .any(|(k, v)| k == "NONO_TEST_ALLOW_FIXTURE_KEEP" && v == "passes"),
+            "NONO_TEST_ALLOW_FIXTURE_KEEP must pass through the allow-list filter"
+        );
+        assert!(
+            !env_pairs
+                .iter()
+                .any(|(k, _)| k == "NONO_TEST_ALLOW_FIXTURE_DROP"),
+            "NONO_TEST_ALLOW_FIXTURE_DROP must be stripped when not in allow-list"
+        );
+    }
+
+    /// Plan 35-01 T-35-01-04 mitigation: nono-injected credentials (config.env_vars)
+    /// MUST bypass BOTH the deny-list and the allow-list. The credentials are
+    /// appended unconditionally after the filter loop (launch.rs:672-674).
+    ///
+    /// This locks the documented invariant from exec_strategy.rs:465-467 on the
+    /// Windows execution path. Operators relying on --env-deny to strip
+    /// nono-injected secrets would be misled; by design, injected creds are
+    /// always forwarded to the sandboxed child.
+    #[test]
+    fn test_windows_nono_injected_credentials_bypass_both() {
+        let command: Vec<String> = vec![];
+        let resolved_program = Path::new(r"C:\tools\agent.exe");
+        let caps = CapabilitySet::new();
+        let current_dir = Path::new(r"C:\workspace");
+        let config = make_minimal_exec_config(
+            &command,
+            resolved_program,
+            &caps,
+            current_dir,
+            /* allowed */ Some(vec![]),
+            /* denied */ Some(vec!["NONO_INJECTED_CRED".to_string()]),
+            /* env_vars */ vec![("NONO_INJECTED_CRED", "secret")],
+        );
+
+        let env_pairs = build_child_env(&config);
+
+        assert!(
+            env_pairs
+                .iter()
+                .any(|(k, v)| k == "NONO_INJECTED_CRED" && v == "secret"),
+            "Nono-injected credentials MUST bypass both allow-list and deny-list \
+             filters (config.env_vars appended unconditionally per design)"
         );
     }
 }

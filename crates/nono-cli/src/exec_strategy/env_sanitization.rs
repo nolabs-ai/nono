@@ -110,7 +110,8 @@ fn matches_env_var_patterns(key: &str, patterns: &[String]) -> bool {
 /// Ported from upstream v0.37.0 `1b412a7` per Plan 34-08a Task 3 (D-20
 /// manual replay). Refactored to delegate to `matches_env_var_patterns`
 /// per upstream v0.52.0 `a022e5c7` (Plan 34-08a Task 6).
-#[allow(dead_code)] // Windows execution path uses exec_strategy_windows; allow-list wiring there ships separately.
+/// Wired into Unix (`exec_strategy.rs:435-457`) AND Windows
+/// (`exec_strategy_windows/launch.rs::build_child_env`) execution paths.
 pub(crate) fn is_env_var_allowed(key: &str, allowed_env_vars: &[String]) -> bool {
     matches_env_var_patterns(key, allowed_env_vars)
 }
@@ -150,7 +151,8 @@ pub(crate) fn validate_env_var_patterns(patterns: &[String], field_name: &str) -
 /// (D-20 manual-replay-by-escalation). Refactored to delegate directly to
 /// `matches_env_var_patterns` (avoiding coupling to `is_env_var_allowed`)
 /// per upstream v0.52.0 `a022e5c7` (Plan 34-08a Task 6).
-#[allow(dead_code)] // Windows execution path uses exec_strategy_windows; deny-list wiring there ships separately.
+/// Wired into Unix (`exec_strategy.rs:435-457`) AND Windows
+/// (`exec_strategy_windows/launch.rs::build_child_env`) execution paths.
 pub(crate) fn is_env_var_denied(key: &str, denied_env_vars: &[String]) -> bool {
     matches_env_var_patterns(key, denied_env_vars)
 }

@@ -75,7 +75,7 @@ use windows_sys::Win32::System::Threading::{
 };
 
 pub(crate) use env_sanitization::is_dangerous_env_var;
-use env_sanitization::should_skip_env_var;
+use env_sanitization::{is_env_var_allowed, is_env_var_denied, should_skip_env_var};
 
 pub(crate) fn to_u16_null_terminated(s: &str) -> Vec<u16> {
     OsStr::new(s)
@@ -142,6 +142,28 @@ pub struct ExecConfig<'a> {
     pub session_token: Option<String>,
     /// Rendezvous file path the capability pipe server binds.
     pub cap_pipe_rendezvous_path: Option<PathBuf>,
+    /// Plan 34-08a Task 3 (D-20 manual replay of upstream `1b412a7`):
+    /// allow-list of environment variable names. When `Some`, only
+    /// variables matching an exact name or prefix pattern (e.g. `"AWS_*"`)
+    /// are passed to the child. `None` means inherit-all (default).
+    /// Nono-injected credentials (`config.env_vars`) always bypass this list.
+    ///
+    /// Plan 35-01 (REQ-PORT-CLOSURE-01, P34-DEFER-08a-1 closure): wired into
+    /// Windows execution path via `launch::build_child_env`. Mirrors the
+    /// Unix consumption site at `exec_strategy.rs:435-457` (Plan 34-08a
+    /// Wave 2).
+    pub allowed_env_vars: Option<Vec<String>>,
+    /// Plan 34-08a Task 4 (D-20 manual-replay-by-escalation of upstream
+    /// v0.52.0 `3657c935`): operator-controlled deny-list of environment
+    /// variable names. Variables matching an exact name or prefix pattern
+    /// (e.g. `"GITHUB_*"`) are stripped even if they also appear in
+    /// `allowed_env_vars`. Nono-injected credentials bypass this list.
+    ///
+    /// Plan 35-01 (REQ-PORT-CLOSURE-01): wired into Windows execution path
+    /// per Plan 35-01 — empty-allow fail-closed invariant from upstream
+    /// `780965d7` is locked by the `test_windows_empty_allow_denies_all_env_vars`
+    /// Windows-gated unit test.
+    pub denied_env_vars: Option<Vec<String>>,
 }
 
 pub struct SupervisorConfig<'a> {

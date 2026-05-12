@@ -349,6 +349,8 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         interactive_shell: flags.interactive_shell,
         session_token: Some(windows_session_token.clone()),
         cap_pipe_rendezvous_path: Some(windows_cap_pipe_path.clone()),
+        allowed_env_vars: flags.allowed_env_vars.clone(),
+        denied_env_vars: flags.denied_env_vars.clone(),
     };
 
     // Resource limits are now kernel-enforced on Linux (cgroup v2) and macOS

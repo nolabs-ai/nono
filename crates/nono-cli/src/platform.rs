@@ -149,9 +149,19 @@ fn parse_windows_registry_value(output: &str, name: &str) -> Option<String> {
         if parts.next() != Some(name) {
             continue;
         }
-        let _kind = parts.next()?;
+        let kind = parts.next()?;
         let value = parts.collect::<Vec<_>>().join(" ");
         if !value.is_empty() {
+            if kind == "REG_DWORD" {
+                if let Some(hex) = value
+                    .strip_prefix("0x")
+                    .or_else(|| value.strip_prefix("0X"))
+                {
+                    if let Ok(number) = u64::from_str_radix(hex, 16) {
+                        return Some(number.to_string());
+                    }
+                }
+            }
             return Some(value);
         }
     }
@@ -470,7 +480,7 @@ impl Predicate {
             }
         }
         if let Some(build) = &self.build {
-            let build_version = info.version.rsplit('.').next().unwrap_or_default();
+            let build_version = info.version.rsplit('.').next().map_or("", |part| part);
             if !build.matches(build_version) {
                 return false;
             }
@@ -682,6 +692,18 @@ VARIANT_ID=workstation
         assert!(!When::parse("windows:>=10:>30000")
             .expect("parse")
             .matches(&platform));
+    }
+
+    #[test]
+    fn windows_registry_dword_values_are_decimalized() {
+        let output = r#"
+HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion
+    CurrentMajorVersionNumber    REG_DWORD    0xa
+"#;
+        assert_eq!(
+            parse_windows_registry_value(output, "CurrentMajorVersionNumber").as_deref(),
+            Some("10")
+        );
     }
 
     #[test]

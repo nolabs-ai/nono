@@ -2784,7 +2784,9 @@ mod env_filter_tests {
         // but the fixture key (which is NOT in the runtime allowlist) MUST NOT
         // appear when the allow-list is empty.
         assert!(
-            !env_pairs.iter().any(|(k, _)| k == "NONO_TEST_EMPTY_ALLOW_FIXTURE"),
+            !env_pairs
+                .iter()
+                .any(|(k, _)| k == "NONO_TEST_EMPTY_ALLOW_FIXTURE"),
             "Empty allow-list MUST strip non-runtime inherited env vars \
              (fail-closed invariant from upstream 780965d7)"
         );
@@ -2796,8 +2798,7 @@ mod env_filter_tests {
     #[test]
     fn test_windows_deny_strips_matching_env_vars() {
         let _lock = lock_env();
-        let _guard =
-            EnvVarGuard::set_all(&[("NONO_TEST_DENY_FIXTURE_A", "should_be_stripped")]);
+        let _guard = EnvVarGuard::set_all(&[("NONO_TEST_DENY_FIXTURE_A", "should_be_stripped")]);
 
         let command: Vec<String> = vec![];
         let resolved_program = Path::new(r"C:\tools\agent.exe");
@@ -2816,7 +2817,9 @@ mod env_filter_tests {
         let env_pairs = build_child_env(&config);
 
         assert!(
-            !env_pairs.iter().any(|(k, _)| k == "NONO_TEST_DENY_FIXTURE_A"),
+            !env_pairs
+                .iter()
+                .any(|(k, _)| k == "NONO_TEST_DENY_FIXTURE_A"),
             "deny_vars pattern 'NONO_TEST_DENY_FIXTURE_*' must strip \
              NONO_TEST_DENY_FIXTURE_A from the child env"
         );
@@ -2855,7 +2858,9 @@ mod env_filter_tests {
             "NONO_TEST_ALLOW_FIXTURE_KEEP must pass through the allow-list filter"
         );
         assert!(
-            !env_pairs.iter().any(|(k, _)| k == "NONO_TEST_ALLOW_FIXTURE_DROP"),
+            !env_pairs
+                .iter()
+                .any(|(k, _)| k == "NONO_TEST_ALLOW_FIXTURE_DROP"),
             "NONO_TEST_ALLOW_FIXTURE_DROP must be stripped when not in allow-list"
         );
     }

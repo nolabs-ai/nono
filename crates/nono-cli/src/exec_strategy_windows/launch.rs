@@ -642,6 +642,22 @@ pub(super) fn build_child_env(config: &ExecConfig<'_>) -> Vec<(String, String)> 
                 "TF_DATA_DIR",
             ],
         ) {
+            // Plan 35-01 (REQ-PORT-CLOSURE-01 / P34-DEFER-08a-1 closure):
+            // mirror the Unix env-filter precedence from
+            // exec_strategy.rs:443-456 (Plan 34-08a Wave 2 / D-20 replay
+            // of upstream 1b412a7 + 3657c935). Deny-list checked BEFORE
+            // allow-list; both bypassed by nono-injected credentials
+            // (config.env_vars appended unconditionally below).
+            if let Some(ref denied) = config.denied_env_vars {
+                if is_env_var_denied(&key, denied) {
+                    continue;
+                }
+            }
+            if let Some(ref allowed) = config.allowed_env_vars {
+                if !is_env_var_allowed(&key, allowed) {
+                    continue;
+                }
+            }
             env_pairs.push((key, value));
         }
     }

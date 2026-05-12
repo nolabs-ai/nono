@@ -1769,8 +1769,7 @@ mod tests {
     #[test]
     fn safe_subject_path_rejects_absolute_path_windows() {
         let dir = tempfile::tempdir().unwrap();
-        let err = safe_subject_path(dir.path(), "C:\\Windows\\System32\\config\\SAM")
-            .unwrap_err();
+        let err = safe_subject_path(dir.path(), "C:\\Windows\\System32\\config\\SAM").unwrap_err();
         assert!(
             err.contains("absolute"),
             "error should mention 'absolute': {err}"

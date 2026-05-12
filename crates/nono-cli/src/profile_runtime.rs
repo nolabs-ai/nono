@@ -120,11 +120,34 @@ fn collect_override_deny_paths(
     paths
 }
 
+/// Plan 35-02 (REQ-PORT-CLOSURE-06 / P34-DEFER-09-1): cherry-pick of
+/// upstream `bdf183e9` (v0.44.0) — pre-create `~/.config/nono/profiles/`
+/// BEFORE the caller (sandbox_prepare.rs:298 → Sandbox::apply →
+/// landlock::restrict_self) locks the filesystem ruleset. Landlock is
+/// strictly allow-list and requires the parent directory of any
+/// granted child path to exist at ruleset-apply time, even when the
+/// child path is explicitly granted write. Without this pre-create,
+/// first-run `nono run` on a clean install (with `~/.config/nono/`
+/// missing) produces a confusing `No such file or directory` error
+/// pointing at the profiles path.
+///
+/// macOS and Windows are compile-time no-ops (Seatbelt and Windows
+/// Job-Object sandbox have no equivalent restriction).
+#[cfg(target_os = "linux")]
+fn pre_create_landlock_profiles_dir() -> crate::Result<()> {
+    let dir = crate::config::user_profiles_dir()?;
+    std::fs::create_dir_all(&dir)?;
+    Ok(())
+}
+
 pub(crate) fn prepare_profile(
     args: &SandboxArgs,
     silent: bool,
     workdir: &Path,
 ) -> crate::Result<PreparedProfile> {
+    #[cfg(target_os = "linux")]
+    pre_create_landlock_profiles_dir()?;
+
     let loaded_profile = if let Some(ref profile_name) = args.profile {
         let profile = profile::load_profile(profile_name)?;
         install_profile_hooks(Some(profile_name.as_str()), &profile, silent);
@@ -266,6 +289,78 @@ fn validate_env_var_patterns_local(patterns: &[String], field_name: &str) -> Opt
 #[cfg(test)]
 mod tests {
     use crate::profile::{EnvironmentConfig, Profile};
+
+    /// RAII guard that saves and restores an environment variable.
+    ///
+    /// Required per CLAUDE.md § "Environment variables in tests": tests that
+    /// modify `HOME`, `XDG_CONFIG_HOME`, or other env vars MUST save and
+    /// restore the original value, because Rust runs unit tests in parallel
+    /// within the same process.
+    #[cfg(target_os = "linux")]
+    struct EnvGuard {
+        key: String,
+        prior: Option<std::ffi::OsString>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl EnvGuard {
+        fn set(key: &str, value: &std::path::Path) -> Self {
+            let prior = std::env::var_os(key);
+            // SAFETY per CLAUDE.md: set_var is sound in single-threaded test
+            // setup; the Drop impl unwinds the change before parallel tests
+            // resume. The modified window is as short as possible.
+            std::env::set_var(key, value);
+            Self {
+                key: key.to_string(),
+                prior,
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match self.prior.take() {
+                Some(val) => std::env::set_var(&self.key, val),
+                None => std::env::remove_var(&self.key),
+            }
+        }
+    }
+
+    /// Plan 35-02 (REQ-PORT-CLOSURE-06): regression test locking the
+    /// idempotent + first-run-creates-dir invariant for the Landlock
+    /// pre-create hunk. Runs in CI Linux lane (D-35-D3); compile-time
+    /// no-op on Windows/macOS.
+    ///
+    /// Verifies:
+    /// 1. Calling `pre_create_landlock_profiles_dir()` creates
+    ///    `<XDG_CONFIG_HOME>/nono/profiles/` on a clean fixture.
+    /// 2. A second call succeeds without error (idempotency via
+    ///    `std::fs::create_dir_all`).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_pre_create_landlock_profiles_dir_idempotent() {
+        let tmp = tempfile::TempDir::new().expect("create tempdir");
+        let _xdg_guard = EnvGuard::set("XDG_CONFIG_HOME", tmp.path());
+
+        // First call — creates <tmp>/nono/profiles/
+        super::pre_create_landlock_profiles_dir()
+            .expect("first pre-create call must succeed on clean fixture");
+        let expected = tmp.path().join("nono").join("profiles");
+        assert!(
+            expected.is_dir(),
+            "Expected profiles dir at {} after first pre-create call",
+            expected.display(),
+        );
+
+        // Second call — idempotent (create_dir_all succeeds on existing dir)
+        super::pre_create_landlock_profiles_dir()
+            .expect("second pre-create call must succeed (idempotent on existing dir)");
+        assert!(
+            expected.is_dir(),
+            "Profiles dir should still exist after second call",
+        );
+    }
 
     /// Plan 34-08a Task 5 regression test (v0.52.0 `780965d7`):
     /// an `EnvironmentConfig` with empty `allow_vars` MUST surface as

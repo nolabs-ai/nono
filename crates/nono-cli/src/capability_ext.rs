@@ -2269,8 +2269,8 @@ mod tests {
         let workdir = tempdir().expect("workdir");
         let args = sandbox_args();
 
-        let err = from_profile_locked(&profile, workdir.path(), &args)
-            .expect_err("should fail on macOS");
+        let err =
+            from_profile_locked(&profile, workdir.path(), &args).expect_err("should fail on macOS");
         assert!(
             err.to_string().contains("not supported on macOS"),
             "unexpected error: {err}"

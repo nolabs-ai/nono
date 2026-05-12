@@ -1,4 +1,35 @@
 //! Pack manifest, lockfile, and local store helpers.
+//!
+//! # Upstream registry-pack format awareness (v0.44.0, manual-replay of 24d8b924)
+//!
+//! In upstream nono v0.44.0 (commit `24d8b924`, "feat(profile, migration): move codex,
+//! claude-code to registry pack"), the upstream project migrated the `claude-code` and
+//! `claude-no-kc` profiles from `data/policy.json` builtins into a separate "registry
+//! pack" distribution shape (`always-further/*`). That commit also introduced four
+//! upstream-only files implementing a `wiring` abstraction (SHA-256-keyed install
+//! records, `WriteFile` / `JsonMerge` / `JsonArrayAppend` directives, lockfile v3+v4
+//! with strict overwrite policy):
+//!   - `crates/nono-cli/src/wiring.rs`     (~1102 lines)
+//!   - `crates/nono-cli/src/migration.rs`  (~337 lines)
+//!   - `crates/nono-cli/src/pull_ui.rs`    (~260 lines)
+//!   - `crates/nono-cli/src/legacy_cleanup.rs` (~573 lines, added by 5654b0f9)
+//!
+//! The fork does NOT carry that structural rewrite. Per Phase 33's DIVERGENCE-LEDGER.md
+//! cluster C6 "fork-preserve" disposition and the upstream-sync-quick.md catalog entries
+//! "Hooks subsystem ownership" + "validate_path_within retention", the fork retains:
+//!   - `crates/nono-cli/src/hooks.rs` as the sole centralized hook installer (Phase 22-03 PKG-03)
+//!   - `crates/nono-cli/data/policy.json` claude-code + codex builtins (Phase 18.1-03 dependency)
+//!   - 9 `validate_path_within(...)` defense-in-depth callsites in `package_cmd.rs`
+//!     (Phase 22-03 PKG-04 + Phase 26-01 PKGS-02)
+//!   - Phase 18.1-03 Windows widening wiring (`cfg(target_os = "windows")` arms in `package_cmd.rs`)
+//!   - `ArtifactType::Plugin` variant (Phase 26-01 PKGS-02)
+//!
+//! Plan 34-09 (Manual-replay: 24d8b924) acknowledges upstream's registry-pack shape but
+//! does NOT port the structural rewrite. The fork's existing `ArtifactType`, `PackageManifest`,
+//! `Lockfile`, and `ArtifactEntry` types are sufficient for Phase 34 needs; the upstream
+//! `wiring.rs` abstraction is deferred to a future plan (post-Phase-34) if/when the fork
+//! needs idempotent JSON-merge install records. See the Plan 34-09 SUMMARY for the full
+//! per-commit disposition table and the catalog-driven preservation rationale.
 
 use crate::profile;
 use chrono::Utc;

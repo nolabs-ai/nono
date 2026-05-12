@@ -11,75 +11,46 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 
 // ============================================================================
-// Plan 34-04b: upstream f0abd413 canonical-schema rename (override_deny ->
-// bypass_protection) — Option C deprecation runway
+// Plan 36-01a: upstream f0abd413 deprecated_schema module port
 // ============================================================================
 //
-// Upstream commit f0abd413 (v0.47.0, #594) renamed the JSON profile key
-// `override_deny` -> `bypass_protection` and renamed the CLI flag
-// `--override-deny` -> `--bypass-protection`. Plan 34-04b's Option C
-// disposition (chosen 2026-05-11) lands the *deprecation runway*:
+// Plan 34-04b (2026-05-11) shipped a pragmatic Option C:
+//   - serde alias `bypass_protection` on `PolicyPatchConfig::override_deny`
+//   - clap `alias = "bypass-protection"` on the CLI flag
+//   - single per-process AtomicBool emitting one stderr WARN when the
+//     legacy `override_deny` key was encountered
 //
-//   1. The Rust struct field `PolicyPatchConfig::override_deny` carries
-//      `#[serde(alias = "bypass_protection")]` so JSON profiles using
-//      either key deserialize cleanly. The internal Rust identifier
-//      remains `override_deny` (210-callsite flag-day rename deferred to
-//      P34-DEFER-04b).
-//   2. The CLI flag `--override-deny` carries clap `alias = "bypass-protection"`
-//      so both forms work at the CLI surface.
-//   3. When the legacy `override_deny` JSON key is observed in a profile,
-//      `emit_legacy_override_deny_warning_once()` emits a single
-//      `WARN: profile field `override_deny` is deprecated...` line to
-//      stderr (once per process — matches upstream's
-//      `deprecation_warnings::DeprecationCounter` semantics).
+// Plan 36-01a (D-20 manual-replay of upstream f0abd413 v0.47.0) replaces
+// the above with the full upstream surface:
+//   - `deprecated_schema::LegacyPolicyPatch` rewriter (serde-driven,
+//     deny_unknown_fields, rewrite() → CanonicalPolicy)
+//   - `deprecated_schema::DeprecationCounter` per-key OnceLock<HashMap<...>>
+//   - `nono profile validate --strict` fail-closed lever
 //
-// The full upstream `deprecated_schema` module (824 LOC) + LegacyPolicyPatch
-// rewriter + canonical sections `groups`/`commands`/`filesystem` is the
-// follow-up surface (P34-DEFER-04b); this commit lands the rename-acceptance
-// contract only. See the commit body for the full rationale.
-
-/// Set to `true` after the first legacy `override_deny` key is observed.
-/// Ensures the deprecation warning prints exactly once per process even
-/// when many profiles are loaded sequentially (e.g. via `extends` chains).
-static LEGACY_OVERRIDE_DENY_WARNED: AtomicBool = AtomicBool::new(false);
+// Plan 36-01a Task 2 retired the single-key AtomicBool seed and the
+// one-shot-emit helper that were present in Plan 34-04b. The warning-emission
+// concern now lives in deprecated_schema.rs::DeprecationCounter per D-36-B1.
+//
+// Tombstone (Plan 36-01a): emit_legacy_override_deny_warning_once +
+// single-key AtomicBool retired; now lives in
+// crates/nono-cli/src/deprecated_schema.rs::DeprecationCounter per D-36-B1
+// (upstream f0abd413).
 
 /// Returns `true` if the raw JSON contains a legacy `override_deny` key.
 ///
 /// Pure function — no side effects, no global state. The production path
-/// passes the result through `emit_legacy_override_deny_warning_once` to
-/// emit a one-time stderr warning; tests can call this directly to verify
-/// detection logic without race conditions on the global flag (which is
-/// flipped exactly once per process during normal use, but tests run in
-/// parallel and would race).
+/// passes the result to `detect_legacy_override_deny_key` which calls
+/// `GLOBAL_DEPRECATION_COUNTER.emit_once(...)`. Tests call this directly
+/// to verify detection logic without side effects on global counter state
+/// (which is shared per-process and would race in parallel test runs).
 fn raw_profile_has_legacy_override_deny_key(raw: &str) -> bool {
     let value: serde_json::Value = match serde_json::from_str(raw) {
         Ok(v) => v,
         Err(_) => return false, // main parser will surface the real error
     };
     json_value_has_key(&value, "override_deny")
-}
-
-/// Emit a one-time stderr deprecation warning when a legacy `override_deny`
-/// JSON key is observed in a loaded profile.
-///
-/// Matches upstream f0abd413's `deprecation_warnings::DeprecationCounter`
-/// semantics (one warning per legacy key per process), modulo the fork's
-/// pragmatic scope: we report the rename but do not (yet) track a per-key
-/// counter for `--strict` mode. `--strict` is part of P34-DEFER-04b
-/// follow-up.
-fn emit_legacy_override_deny_warning_once() {
-    if !LEGACY_OVERRIDE_DENY_WARNED.swap(true, Ordering::Relaxed) {
-        eprintln!(
-            "WARN: profile field `override_deny` is deprecated (upstream #594, \
-             v0.47.0); the canonical key is `bypass_protection`. Both keys \
-             continue to deserialize identically in v2.3; the legacy key may \
-             be removed in a future major release. Migrate your profiles to \
-             use `bypass_protection`."
-        );
-    }
 }
 
 /// Scan a raw JSON profile string for the legacy `override_deny` key and
@@ -92,19 +63,11 @@ fn emit_legacy_override_deny_warning_once() {
 /// are accepted as the lesser cost vs. mis-detecting a real legacy key.
 ///
 /// Plan 36-01a: delegates to `deprecated_schema::GLOBAL_DEPRECATION_COUNTER`
-/// for per-key one-shot emission semantics. The legacy `LEGACY_OVERRIDE_DENY_WARNED`
-/// global is retired in Plan 36-01a Task 2 (Task 2 will remove it and this function
-/// entirely, routing detection through `cmd_validate`'s `LegacyPolicyPatch`).
+/// for per-key one-shot emission semantics.
 fn detect_legacy_override_deny_key(raw: &str) {
     if raw_profile_has_legacy_override_deny_key(raw) {
-        // Delegate to the new per-key DeprecationCounter (Plan 36-01a).
-        // This usage wires deprecated_schema::GLOBAL_DEPRECATION_COUNTER
-        // into the production code path ahead of Task 2's full migration.
         crate::deprecated_schema::GLOBAL_DEPRECATION_COUNTER
             .emit_once("override_deny", "bypass_protection");
-        // Keep the legacy AtomicBool emission path until Task 2 removes it
-        // to avoid any gap in the deprecation warning surface.
-        emit_legacy_override_deny_warning_once();
     }
 }
 
@@ -129,11 +92,12 @@ fn json_value_has_key(v: &serde_json::Value, target: &str) -> bool {
 mod canonical_schema_rename_tests {
     use super::*;
 
-    // NB: these tests avoid touching the global LEGACY_OVERRIDE_DENY_WARNED
-    // flag because Rust test runners parallelize within the same process and
-    // a previous test (or any production-side load) may have already flipped
-    // the flag. We instead test the pure detection helper
+    // NB: these tests avoid touching the global GLOBAL_DEPRECATION_COUNTER
+    // (process-wide state) because Rust test runners parallelize within the
+    // same process and a previous test may have already triggered an emission.
+    // We instead test the pure detection helper
     // `raw_profile_has_legacy_override_deny_key` which has no side effects.
+    // (Plan 36-01a: the single-key AtomicBool global was retired in Task 2.)
 
     #[test]
     fn legacy_override_deny_key_detected() {

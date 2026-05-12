@@ -1304,6 +1304,10 @@ pub struct ProfileValidateArgs {
     /// Output as JSON
     #[arg(long)]
     pub json: bool,
+    /// Fail closed on legacy profile fields (e.g. `override_deny`). Default
+    /// mode warns to stderr but continues; `--strict` exits non-zero.
+    #[arg(long)]
+    pub strict: bool,
 }
 
 #[derive(Parser, Debug)]

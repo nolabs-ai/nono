@@ -74,10 +74,14 @@ pub struct LegacyPolicyPatch {
     /// key deserializes into this struct (the canonical key is then
     /// emitted by `rewrite()`).
     ///
-    /// Note: `#[serde(deny_unknown_fields)]` means ONLY `override_deny` (and
-    /// its alias `bypass_protection`) are accepted at the top level of this
-    /// struct. Any other key causes a deserialization error.
-    #[serde(default, alias = "bypass_protection")]
+    /// Note: `#[serde(deny_unknown_fields)]` means ONLY `override_deny` is
+    /// accepted at the top level of this struct. Any other key (including the
+    /// canonical `bypass_protection`) causes a deserialization error — that
+    /// is intentional: `LegacyPolicyPatch` is ONLY used to detect and rewrite
+    /// the legacy `override_deny` key. Profiles using the canonical
+    /// `bypass_protection` key will fail to deserialize into this struct,
+    /// which is the correct outcome (no legacy-key detection triggered).
+    #[serde(default)]
     pub(crate) override_deny: Vec<String>,
 }
 
@@ -305,8 +309,10 @@ mod tests {
     /// T-36-01-LEGACY-KEY acceptance criteria #4 (`#[serde(deny_unknown_fields)]`).
     ///
     /// Verifies that `LegacyPolicyPatch` rejects unknown JSON keys at
-    /// deserialization time. Preserves the invariant from `PolicyPatchConfig`
-    /// at `profile/mod.rs:441` (successor struct).
+    /// deserialization time, AND that the canonical `bypass_protection` key
+    /// is intentionally NOT accepted by `LegacyPolicyPatch` (it is the
+    /// detection struct for legacy keys only — profiles using the canonical
+    /// key should NOT trigger legacy-key detection).
     #[test]
     fn legacy_policy_patch_passes_through_unknown_legacy_keys() {
         // An unknown top-level key MUST cause a deserialization error because
@@ -318,15 +324,26 @@ mod tests {
             "LegacyPolicyPatch must reject unknown fields (deny_unknown_fields invariant)"
         );
 
-        // The canonical alias must also work (bypass_protection → override_deny field).
+        // The canonical `bypass_protection` key is INTENTIONALLY rejected by
+        // `LegacyPolicyPatch` (it only matches the legacy `override_deny` key).
+        // Profiles using `bypass_protection` should NOT trigger legacy-key detection.
         let raw_canonical = r#"{"bypass_protection":["/var/log"]}"#;
-        let patch: LegacyPolicyPatch = serde_json::from_str(raw_canonical)
-            .expect("bypass_protection alias must deserialize into LegacyPolicyPatch");
-        let canonical = patch.rewrite().expect("rewrite should succeed");
-        assert_eq!(
-            canonical.bypass_protection,
-            vec!["/var/log".to_string()],
-            "canonical alias must also rewrite correctly"
+        let result: std::result::Result<LegacyPolicyPatch, _> =
+            serde_json::from_str(raw_canonical);
+        assert!(
+            result.is_err(),
+            "LegacyPolicyPatch must reject canonical bypass_protection key \
+             (only override_deny triggers legacy detection)"
+        );
+
+        // Verify that an empty LegacyPolicyPatch (no legacy keys) has no
+        // legacy keys to rewrite.
+        let raw_empty = r#"{}"#;
+        let patch: LegacyPolicyPatch =
+            serde_json::from_str(raw_empty).expect("empty object must deserialize");
+        assert!(
+            !patch.has_legacy_keys(),
+            "empty LegacyPolicyPatch should have no legacy keys"
         );
     }
 }

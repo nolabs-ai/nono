@@ -2145,37 +2145,48 @@ pub(crate) fn cmd_validate(args: ProfileValidateArgs) -> Result<()> {
     let mut errors: Vec<String> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
 
-    // Plan 36-01a: Detect legacy keys via LegacyPolicyPatch before loading
-    // the full profile. This is the Task 1 wire; Task 2 (Plan 36-01a) adds
-    // `args.strict` fork that routes legacy keys to `errors` when `--strict`.
+    // Plan 36-01a (Task 2): Detect legacy keys via LegacyPolicyPatch and
+    // route to errors (--strict) or warnings (default) based on args.strict.
     //
     // We attempt to deserialize the `policy` sub-object of the profile JSON as
     // a `LegacyPolicyPatch`. If the sub-object contains `override_deny`, the
-    // `has_legacy_keys()` predicate returns `true` and we emit the deprecation
-    // counter + push a warning. Failure to deserialize the sub-object (e.g.,
-    // profile has no `policy` key or uses a different shape) is silently
-    // ignored — the main parse in Step 1 surfaces real parse errors.
+    // `has_legacy_keys()` predicate returns `true`. In strict mode, we push
+    // a clear error message naming both the legacy key and canonical key onto
+    // `errors` (fail-closed, non-zero exit). In non-strict mode, we emit the
+    // one-shot stderr WARN via DeprecationCounter and push onto `warnings`.
+    //
+    // Failure to deserialize the sub-object (e.g., profile has no `policy` key
+    // or uses a different shape) is silently ignored — the main parse in Step 1
+    // surfaces real parse errors.
     {
         let counter: &DeprecationCounter = &GLOBAL_DEPRECATION_COUNTER;
         if let Ok(raw) = fs::read_to_string(&args.file) {
             if let Ok(root) = serde_json::from_str::<serde_json::Value>(&raw) {
                 if let Some(policy_val) = root.get("policy") {
-                    if let Ok(patch) = serde_json::from_value::<LegacyPolicyPatch>(policy_val.clone()) {
+                    if let Ok(patch) =
+                        serde_json::from_value::<LegacyPolicyPatch>(policy_val.clone())
+                    {
                         if patch.has_legacy_keys() {
+                            // Rewrite to canonical form to get the bypass_protection paths.
+                            let canonical = patch.rewrite()?;
                             counter.emit_once("override_deny", "bypass_protection");
-                            // Rewrite to canonical form; the canonical struct will be
-                            // consumed by the args.strict path in Task 2.
-                            if let Ok(canonical) = patch.rewrite() {
-                                // Canonical paths available for strict-mode rejection
-                                // (Task 2 wires args.strict → errors vs warnings split).
-                                // Suppress unused-variable warning until Task 2 lands.
-                                let _ = canonical.bypass_protection.len();
+                            if args.strict {
+                                // Strict mode: fail closed with a clear error message.
+                                errors.push(format!(
+                                    "legacy key `override_deny` rejected by --strict; \
+                                     use canonical `bypass_protection` instead (found {} \
+                                     path(s))",
+                                    canonical.bypass_protection.len()
+                                ));
+                            } else {
+                                // Non-strict mode: the emit_once call above already
+                                // wrote the WARN to stderr; record as warning.
+                                warnings.push(
+                                    "legacy key `override_deny` found; migrate to canonical \
+                                     `bypass_protection`"
+                                        .to_string(),
+                                );
                             }
-                            warnings.push(
-                                "legacy key `override_deny` found; migrate to canonical \
-                                 `bypass_protection`"
-                                    .to_string(),
-                            );
                         }
                     }
                 }
@@ -3049,6 +3060,7 @@ mod tests {
         let args = ProfileValidateArgs {
             file: path,
             json: false,
+            strict: false,
         };
         let result = cmd_validate(args);
         assert!(result.is_ok(), "valid profile should pass validation");
@@ -3070,6 +3082,7 @@ mod tests {
         let args = ProfileValidateArgs {
             file: path,
             json: false,
+            strict: false,
         };
         let result = cmd_validate(args);
         assert!(result.is_err(), "invalid group should fail validation");
@@ -3092,6 +3105,7 @@ mod tests {
         let args = ProfileValidateArgs {
             file: path,
             json: false,
+            strict: false,
         };
         let result = cmd_validate(args);
         assert!(

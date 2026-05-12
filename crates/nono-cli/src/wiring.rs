@@ -39,6 +39,7 @@ pub enum WiringDirective {
     /// Internal no-op produced when a manifest directive's `when`
     /// predicate does not match this host. This variant is never
     /// recorded in the lockfile.
+    #[serde(skip_serializing)]
     Skipped,
 
     /// Create a symlink at `link` pointing to `target`. Both fields
@@ -112,6 +113,9 @@ impl<'de> Deserialize<'de> for WiringDirective {
             }
         }
 
+        // Keep this in lockstep with `WiringDirective`. The duplicate raw
+        // enum lets deserialization remove manifest-only `when` before
+        // applying the closed tagged directive vocabulary.
         #[derive(Deserialize)]
         #[serde(tag = "type", rename_all = "snake_case")]
         enum RawWiringDirective {

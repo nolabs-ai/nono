@@ -87,6 +87,12 @@ where
                     ),
                     None => None,
                 };
+                if !object.is_empty() {
+                    let keys = object.keys().cloned().collect::<Vec<_>>().join(", ");
+                    return Err(serde::de::Error::custom(format!(
+                        "conditional entry has unknown field(s): {keys}"
+                    )));
+                }
                 if crate::platform::when_matches_current(when.as_ref())
                     .map_err(serde::de::Error::custom)?
                 {
@@ -1049,30 +1055,45 @@ impl<'de> Deserialize<'de> for SecretsConfig {
     where
         D: Deserializer<'de>,
     {
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum CredentialValue {
-            EnvVar(String),
-            Conditional {
-                env_var: String,
-                #[serde(default)]
-                when: Option<crate::platform::When>,
-            },
-        }
-
-        let raw = HashMap::<String, CredentialValue>::deserialize(deserializer)?;
+        let raw = HashMap::<String, serde_json::Value>::deserialize(deserializer)?;
         let mut mappings = HashMap::with_capacity(raw.len());
         for (key, value) in raw {
             match value {
-                CredentialValue::EnvVar(env_var) => {
+                serde_json::Value::String(env_var) => {
                     mappings.insert(key, env_var);
                 }
-                CredentialValue::Conditional { env_var, when } => {
+                serde_json::Value::Object(mut object) => {
+                    let env_var = object
+                        .remove("env_var")
+                        .and_then(|value| value.as_str().map(str::to_string))
+                        .ok_or_else(|| {
+                            serde::de::Error::custom(
+                                "conditional credential entry is missing string 'env_var'",
+                            )
+                        })?;
+                    let when = match object.remove("when") {
+                        Some(when_value) => Some(
+                            crate::platform::When::deserialize(when_value)
+                                .map_err(serde::de::Error::custom)?,
+                        ),
+                        None => None,
+                    };
+                    if !object.is_empty() {
+                        let keys = object.keys().cloned().collect::<Vec<_>>().join(", ");
+                        return Err(serde::de::Error::custom(format!(
+                            "conditional credential entry has unknown field(s): {keys}"
+                        )));
+                    }
                     if crate::platform::when_matches_current(when.as_ref())
                         .map_err(serde::de::Error::custom)?
                     {
                         mappings.insert(key, env_var);
                     }
+                }
+                _ => {
+                    return Err(serde::de::Error::custom(
+                        "credential entry must be a string or object with 'env_var'",
+                    ));
                 }
             }
         }
@@ -6128,6 +6149,24 @@ mod tests {
                 "https://always.example".to_string(),
                 "https://match.example".to_string()
             ]
+        );
+    }
+
+    #[test]
+    fn conditional_profile_entries_reject_unknown_fields() {
+        let json = br#"{
+            "meta": { "name": "conditional-unknown-field-test" },
+            "filesystem": {
+                "read": [
+                    { "path": "/tmp/example", "whenn": "linux" }
+                ]
+            }
+        }"#;
+
+        let err = parse_profile_bytes(json).expect_err("unknown conditional field should error");
+        assert!(
+            err.to_string().contains("unknown field"),
+            "unexpected error: {err}"
         );
     }
 }

@@ -219,7 +219,7 @@
           "minItems": 1
         }
       ],
-      "description": "Platform predicate string or any-of array, e.g. linux, macos:>=15, linux:fedora-like:>=43, or !linux:nixos."
+      "description": "Platform predicate string or any-of array, e.g. linux, macos:>=15, linux:fedora-like:>=43, linux:fedora:>=43:workstation, or !linux:nixos."
     },
     "ConditionalPath": {
       "oneOf": [

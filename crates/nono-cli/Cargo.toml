@@ -62,6 +62,8 @@ keyring = { version = "3", optional = true }
 
 # Keyless (Sigstore/Fulcio/Rekor) signing for instruction file attestation
 sigstore-sign = "0.6.5"
+# YAML-merge directive support (Plan 36-02; upstream-aligned at v0.10.0 per 242d4917)
+serde_yaml_ng = "=0.10.0"
 tokio = { version = "1", features = ["rt", "net", "io-util"] }
 
 ureq = { version = "3", features = ["platform-verifier"] }

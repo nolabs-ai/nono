@@ -91,6 +91,7 @@ mod update_check;
 mod why_runtime;
 #[cfg(target_os = "windows")]
 mod windows_wfp_contract;
+mod wiring;
 
 #[cfg(test)]
 mod test_env;

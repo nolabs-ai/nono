@@ -6,7 +6,8 @@
 
 use crate::cli::{
     ProfileCmdArgs, ProfileCommands, ProfileDiffArgs, ProfileGroupsArgs, ProfileGuideArgs,
-    ProfileInitArgs, ProfileListArgs, ProfileSchemaArgs, ProfileShowArgs, ProfileValidateArgs,
+    ProfileInitArgs, ProfileListArgs, ProfilePatchArgs, ProfileSchemaArgs, ProfileShowArgs,
+    ProfileValidateArgs,
 };
 use crate::config::embedded;
 use crate::deprecated_schema::{DeprecationCounter, LegacyPolicyPatch, GLOBAL_DEPRECATION_COUNTER};
@@ -36,6 +37,7 @@ pub fn run_profile(args: ProfileCmdArgs) -> Result<()> {
     match args.command {
         ProfileCommands::Init(args) => cmd_init(args),
         ProfileCommands::List(args) => cmd_list(args),
+        ProfileCommands::Patch(args) => cmd_patch(args),
         ProfileCommands::Show(args) => cmd_show(args),
         ProfileCommands::Diff(args) => cmd_diff(args),
         ProfileCommands::Validate(args) => cmd_validate(args),
@@ -723,6 +725,75 @@ fn print_profile_line(name: &str, result: &Result<Profile>, t: &theme::Theme) {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// nono profile patch
+// ---------------------------------------------------------------------------
+
+/// Apply a YAML overlay to a profile file via `yaml_merge` directives.
+///
+/// The overlay file must contain a `yaml_merge:` key at the top level. The
+/// directive's `target` path is resolved relative to `profile_dir` and validated
+/// against it before any write occurs (defense-in-depth via
+/// `wiring::apply_yaml_merge`'s `validate_target_path` primitive — uses
+/// `Path::components()` iteration + `canonicalize()`, NOT `str::starts_with`
+/// per CLAUDE.md § Common Footguns #1).
+///
+/// # Wiring note (Plan 36-02, D-36-C2 D-20 manual-replay)
+///
+/// Upstream `d44f5541` (v0.49.0) introduced the `yaml_merge` directive in a
+/// 1761-LOC `wiring.rs`. Fork carries ONLY the yaml_merge machinery (D-36-C1
+/// scope-trim). Full wiring.rs (WriteFile / JsonMerge / JsonArrayAppend /
+/// idempotent install records) deferred to v2.5-FU-3.
+pub(crate) fn cmd_patch(args: ProfilePatchArgs) -> Result<()> {
+    // Determine the profile_dir: either the --profile-dir arg or the default
+    // nono profiles config directory.
+    let profile_dir = match args.profile_dir {
+        Some(dir) => dir,
+        None => {
+            let home = dirs::home_dir().ok_or(NonoError::HomeNotFound)?;
+            home.join(".config").join("nono").join("profiles")
+        }
+    };
+
+    // Read and parse the YAML overlay file.
+    let overlay_raw = std::fs::read_to_string(&args.yaml).map_err(|e| {
+        NonoError::ProfileParse(format!(
+            "yaml overlay: cannot read '{}': {}",
+            args.yaml.display(),
+            e
+        ))
+    })?;
+
+    let overlay: crate::wiring::YamlOverlay =
+        serde_yaml_ng::from_str(&overlay_raw).map_err(|e| {
+            NonoError::ProfileParse(format!(
+                "yaml overlay: cannot parse '{}': {}",
+                args.yaml.display(),
+                e
+            ))
+        })?;
+
+    // Apply yaml_merge directive if present.
+    if let Some(ref directive) = overlay.yaml_merge {
+        // wiring::apply_yaml_merge calls validate_target_path internally
+        // (Path::components() + canonicalize; NO str::starts_with).
+        // This is the primary path-validation layer for yaml_merge targets.
+        crate::wiring::apply_yaml_merge(directive, &profile_dir)?;
+        eprintln!(
+            "yaml_merge applied: '{}' merged into '{}'",
+            directive.source.display(),
+            directive.target.display()
+        );
+    } else {
+        eprintln!(
+            "yaml overlay: no yaml_merge directive found in '{}'",
+            args.yaml.display()
+        );
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

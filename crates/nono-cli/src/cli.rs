@@ -1210,6 +1210,8 @@ pub enum ProfileCommands {
     Init(ProfileInitArgs),
     /// List all available profiles (built-in and user)
     List(ProfileListArgs),
+    /// Apply a YAML overlay to a profile file via yaml_merge directive
+    Patch(ProfilePatchArgs),
     /// Show a fully resolved profile
     Show(ProfileShowArgs),
     /// Diff two profiles
@@ -1257,6 +1259,21 @@ pub struct ProfileSchemaArgs {
 
 #[derive(Parser, Debug)]
 pub struct ProfileGuideArgs {}
+
+#[derive(Parser, Debug)]
+pub struct ProfilePatchArgs {
+    /// Path to a YAML overlay file containing yaml_merge directives.
+    ///
+    /// Plan 36-02 (D-20 manual-replay of upstream d44f5541 + 242d4917): accepts
+    /// `yaml_merge:` directives matching upstream semantics (REQ-PORT-CLOSURE-04
+    /// acceptance #2). Idempotent JSON-merge install records are deferred to
+    /// v2.5-FU-3 (REQ-PORT-CLOSURE-04 acceptance #1, per D-36-C1).
+    #[arg(long, value_name = "OVERLAY")]
+    pub yaml: PathBuf,
+    /// Profile directory to resolve target paths against (default: profile config dir)
+    #[arg(long, value_name = "DIR")]
+    pub profile_dir: Option<PathBuf>,
+}
 
 #[derive(Parser, Debug)]
 pub struct ProfileListArgs {

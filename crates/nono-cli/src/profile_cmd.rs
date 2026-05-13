@@ -2240,11 +2240,18 @@ pub(crate) fn cmd_validate(args: ProfileValidateArgs) -> Result<()> {
                         if patch.has_legacy_keys() {
                             // Rewrite to canonical form to get the bypass_protection paths.
                             let canonical = patch.rewrite()?;
-                            counter.emit_once("bypass_protection", "bypass_protection");
+                            // CR-02 fix (REVIEW.md): the legacy key is
+                            // `override_deny`, the canonical replacement is
+                            // `bypass_protection`. The previous call passed
+                            // ("bypass_protection", "bypass_protection") which
+                            // (a) is logically incoherent and (b) is a silent
+                            // no-op because the DeprecationCounter map only
+                            // registers `override_deny` as a known legacy key.
+                            counter.emit_once("override_deny", "bypass_protection");
                             if args.strict {
                                 // Strict mode: fail closed with a clear error message.
                                 errors.push(format!(
-                                    "legacy key `bypass_protection` rejected by --strict; \
+                                    "legacy key `override_deny` rejected by --strict; \
                                      use canonical `bypass_protection` instead (found {} \
                                      path(s))",
                                     canonical.bypass_protection.len()
@@ -2253,7 +2260,7 @@ pub(crate) fn cmd_validate(args: ProfileValidateArgs) -> Result<()> {
                                 // Non-strict mode: the emit_once call above already
                                 // wrote the WARN to stderr; record as warning.
                                 warnings.push(
-                                    "legacy key `bypass_protection` found; migrate to canonical \
+                                    "legacy key `override_deny` found; migrate to canonical \
                                      `bypass_protection`"
                                         .to_string(),
                                 );

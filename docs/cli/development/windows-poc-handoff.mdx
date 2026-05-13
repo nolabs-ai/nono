@@ -46,13 +46,17 @@ Result: `target\release\nono.exe`.
 Per-user is the right choice for a POC — no admin install, no machine-wide footprint, no service registration to undo.
 
 ```powershell
-# Build for the explicit Windows MSVC target
-cargo build -p nono-cli --release --target x86_64-pc-windows-msvc
+# Build BOTH binaries for the explicit Windows MSVC target. nono-shell-broker.exe
+# is required by the MSI as of Phase 31 Plan 04 — it installs as a sibling of
+# nono.exe so the runtime cascade in spawn_windows_child can resolve it via
+# current_exe().parent() (D-07).
+cargo build --release --target x86_64-pc-windows-msvc -p nono-cli -p nono-shell-broker
 
 # Per-user MSI
 .\scripts\build-windows-msi.ps1 `
   -VersionTag v0.37.1-poc.1 `
   -BinaryPath .\target\x86_64-pc-windows-msvc\release\nono.exe `
+  -BrokerPath .\target\x86_64-pc-windows-msvc\release\nono-shell-broker.exe `
   -Scope user `
   -OutputDir dist\windows
 ```
@@ -67,7 +71,8 @@ If you want a portable archive instead of MSI:
 
 ```powershell
 Compress-Archive `
-  -Path .\target\x86_64-pc-windows-msvc\release\nono.exe `
+  -Path .\target\x86_64-pc-windows-msvc\release\nono.exe, `
+        .\target\x86_64-pc-windows-msvc\release\nono-shell-broker.exe `
   -DestinationPath .\dist\nono-v0.37.1-poc.1-x86_64-pc-windows-msvc.zip
 ```
 

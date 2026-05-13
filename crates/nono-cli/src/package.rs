@@ -287,6 +287,19 @@ pub fn profiles_dir() -> Result<PathBuf> {
     Ok(nono_config_dir()?.join("profiles"))
 }
 
+/// Returns the cross-platform path to the profile-drafts directory
+/// (sibling of `profiles/`). Resolves to `%APPDATA%\nono\profile-drafts\`
+/// on Windows, `~/.config/nono/profile-drafts/` on Linux/macOS (honors
+/// `XDG_CONFIG_HOME`). Reuses `nono_config_dir()` so no duplicate env-var
+/// surface. Phase 36.5 D-36.5-B1.
+///
+/// Callers MUST validate the profile name with `profile::is_valid_profile_name`
+/// before constructing per-name paths inside this directory.
+#[must_use = "directory path should be used or stored"]
+pub fn profile_drafts_dir() -> Result<PathBuf> {
+    Ok(nono_config_dir()?.join("profile-drafts"))
+}
+
 pub fn lockfile_path() -> Result<PathBuf> {
     Ok(package_store_dir()?.join("lockfile.json"))
 }
@@ -352,8 +365,85 @@ pub fn is_profile_symlink_into_package_store(profile_name: &str) -> Option<PathB
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    // ---------------------------------------------------------------------------
+    // profile_drafts_dir tests (Phase 36.5 D-36.5-B1)
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn profile_drafts_dir_resolves_under_config_dir() {
+        let dir = profile_drafts_dir().expect("profile_drafts_dir must succeed");
+        // The last component must be "profile-drafts"
+        assert_eq!(
+            dir.file_name().and_then(|n| n.to_str()),
+            Some("profile-drafts"),
+            "profile_drafts_dir must end in 'profile-drafts', got: {}",
+            dir.display()
+        );
+        // The parent must be the nono config dir component
+        let parent_name = dir
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str());
+        assert_eq!(
+            parent_name,
+            Some("nono"),
+            "profile-drafts parent must be 'nono', got: {:?}",
+            parent_name
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn profile_drafts_dir_windows_appdata() {
+        use crate::test_env::{lock_env, EnvVarGuard};
+        let _lock = lock_env();
+        let tmp = tempfile::TempDir::new().expect("create temp dir");
+        let _guard = EnvVarGuard::set_all(&[("APPDATA", tmp.path().to_str().expect("utf8 path"))]);
+        let dir = profile_drafts_dir().expect("profile_drafts_dir must succeed");
+        // Canonicalize tmp.path() to handle Windows \\?\ prefix added by resolve_user_config_dir
+        let canonical_tmp = tmp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| tmp.path().to_path_buf());
+        assert!(
+            dir.starts_with(&canonical_tmp),
+            "profile_drafts_dir must resolve under APPDATA tempdir (canonical: {}), got: {}",
+            canonical_tmp.display(),
+            dir.display()
+        );
+        assert_eq!(
+            dir.file_name().and_then(|n| n.to_str()),
+            Some("profile-drafts")
+        );
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn profile_drafts_dir_unix_xdg_override() {
+        use crate::test_env::{lock_env, EnvVarGuard};
+        let _lock = lock_env();
+        let tmp = tempfile::TempDir::new().expect("create temp dir");
+        let _guard =
+            EnvVarGuard::set_all(&[("XDG_CONFIG_HOME", tmp.path().to_str().expect("utf8 path"))]);
+        let dir = profile_drafts_dir().expect("profile_drafts_dir must succeed");
+        assert!(
+            dir.starts_with(tmp.path()),
+            "profile_drafts_dir must resolve under XDG_CONFIG_HOME tempdir, got: {}",
+            dir.display()
+        );
+        assert_eq!(
+            dir.file_name().and_then(|n| n.to_str()),
+            Some("profile-drafts")
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Existing tests
+    // ---------------------------------------------------------------------------
 
     #[test]
     fn parses_package_ref_with_version() {

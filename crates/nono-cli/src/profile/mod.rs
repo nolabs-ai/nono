@@ -90,8 +90,7 @@ fn raw_profile_has_both_bypass_and_override_keys(raw: &str) -> bool {
         Err(_) => return false, // main parser will surface the real error
     };
     if let Some(policy) = value.get("policy").and_then(|v| v.as_object()) {
-        return policy.contains_key("bypass_protection")
-            && policy.contains_key("override_deny");
+        return policy.contains_key("bypass_protection") && policy.contains_key("override_deny");
     }
     false
 }
@@ -2619,6 +2618,40 @@ pub(crate) fn get_user_profile_path(name: &str) -> Result<PathBuf> {
         .join("nono")
         .join("profiles")
         .join(format!("{}.json", name)))
+}
+
+/// Returns the path to a user profile draft (under `profile-drafts/` sibling
+/// of `profiles/`). Mirror of `get_user_profile_path` — see Phase 36.5
+/// D-36.5-B1.
+///
+/// **Callers MUST validate the `name` argument with `is_valid_profile_name`**
+/// before calling this helper. This helper does NOT validate the name itself;
+/// path security relies on the caller's pre-validation gate.
+#[must_use = "draft path should be used or stored"]
+pub(crate) fn get_user_profile_draft_path(name: &str) -> Result<PathBuf> {
+    let config_dir = resolve_user_config_dir()?;
+    Ok(config_dir
+        .join("nono")
+        .join("profile-drafts")
+        .join(format!("{}.json", name)))
+}
+
+/// Returns the path to a profile draft's sidecar base-hash file (`<name>.base`).
+///
+/// Sidecar layout (vs. inline JSON field) keeps the draft JSON valid against
+/// the existing `Profile` schema; promote-time hash extraction is a separate
+/// file read. Phase 36.5 D-36.5-B4 + RESEARCH § Pitfall 5.
+///
+/// **Callers MUST validate the `name` argument with `is_valid_profile_name`**
+/// before calling this helper. This helper does NOT validate the name itself;
+/// path security relies on the caller's pre-validation gate.
+#[must_use = "draft base path should be used or stored"]
+pub(crate) fn get_user_profile_draft_base_path(name: &str) -> Result<PathBuf> {
+    let config_dir = resolve_user_config_dir()?;
+    Ok(config_dir
+        .join("nono")
+        .join("profile-drafts")
+        .join(format!("{}.base", name)))
 }
 
 /// Resolve the user config directory with secure validation.
@@ -6411,6 +6444,93 @@ mod tests {
         assert!(
             nono::keystore::is_keyring_uri(secret_uri),
             "client_secret must accept keyring:// URIs for keystore resolution"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Phase 36.5 D-36.5-B1: get_user_profile_draft_path + get_user_profile_draft_base_path
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn get_user_profile_draft_path_ends_in_json() {
+        let _lock = env_lock();
+        let tmp = tempfile::TempDir::new().expect("create temp dir");
+        #[cfg(target_os = "windows")]
+        let _env = EnvVarGuard::set_all(&[("APPDATA", tmp.path().to_str().expect("utf8"))]);
+        #[cfg(not(target_os = "windows"))]
+        let _env = EnvVarGuard::set_all(&[("XDG_CONFIG_HOME", tmp.path().to_str().expect("utf8"))]);
+        let path = get_user_profile_draft_path("myagent").expect("must succeed");
+        assert_eq!(
+            path.extension().and_then(|e| e.to_str()),
+            Some("json"),
+            "draft path must end in .json, got: {}",
+            path.display()
+        );
+        // parent directory must be profile-drafts
+        assert_eq!(
+            path.parent()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str()),
+            Some("profile-drafts"),
+            "draft path parent must be profile-drafts, got: {}",
+            path.display()
+        );
+        // file stem must be the profile name
+        assert_eq!(
+            path.file_stem().and_then(|n| n.to_str()),
+            Some("myagent"),
+            "draft path stem must be 'myagent', got: {}",
+            path.display()
+        );
+    }
+
+    #[test]
+    fn get_user_profile_draft_base_path_ends_in_base() {
+        let _lock = env_lock();
+        let tmp = tempfile::TempDir::new().expect("create temp dir");
+        #[cfg(target_os = "windows")]
+        let _env = EnvVarGuard::set_all(&[("APPDATA", tmp.path().to_str().expect("utf8"))]);
+        #[cfg(not(target_os = "windows"))]
+        let _env = EnvVarGuard::set_all(&[("XDG_CONFIG_HOME", tmp.path().to_str().expect("utf8"))]);
+        let path = get_user_profile_draft_base_path("myagent").expect("must succeed");
+        assert_eq!(
+            path.extension().and_then(|e| e.to_str()),
+            Some("base"),
+            "draft base path must end in .base, got: {}",
+            path.display()
+        );
+        assert_eq!(
+            path.parent()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str()),
+            Some("profile-drafts"),
+            "draft base path parent must be profile-drafts, got: {}",
+            path.display()
+        );
+        assert_eq!(
+            path.file_stem().and_then(|n| n.to_str()),
+            Some("myagent"),
+            "draft base path stem must be 'myagent', got: {}",
+            path.display()
+        );
+    }
+
+    #[test]
+    fn draft_path_and_canonical_path_differ_in_parent() {
+        let _lock = env_lock();
+        let tmp = tempfile::TempDir::new().expect("create temp dir");
+        #[cfg(target_os = "windows")]
+        let _env = EnvVarGuard::set_all(&[("APPDATA", tmp.path().to_str().expect("utf8"))]);
+        #[cfg(not(target_os = "windows"))]
+        let _env = EnvVarGuard::set_all(&[("XDG_CONFIG_HOME", tmp.path().to_str().expect("utf8"))]);
+        let canonical = get_user_profile_path("myagent").expect("must succeed");
+        let draft = get_user_profile_draft_path("myagent").expect("must succeed");
+        // Same filename, different parent directories
+        assert_eq!(canonical.file_name(), draft.file_name());
+        assert_ne!(
+            canonical.parent(),
+            draft.parent(),
+            "canonical and draft must live in different directories"
         );
     }
 }

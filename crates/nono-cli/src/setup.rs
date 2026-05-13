@@ -530,6 +530,19 @@ impl SetupRunner {
 
         println!("  * Created directory: {}", profile_dir.display());
 
+        // Phase 36.5 D-36.5-B1: Create profile-drafts directory alongside profiles/
+        let drafts_dir = crate::package::profile_drafts_dir()?;
+
+        fs::create_dir_all(&drafts_dir).map_err(|e| {
+            NonoError::Setup(format!(
+                "Failed to create profile-drafts directory {}: {}",
+                drafts_dir.display(),
+                e
+            ))
+        })?;
+
+        println!("  * Created directory: {}", drafts_dir.display());
+
         // Generate example profiles
         self.write_example_profile(&profile_dir, "example-agent.json", EXAMPLE_AGENT_PROFILE)?;
         self.write_example_profile(&profile_dir, "offline-build.json", OFFLINE_BUILD_PROFILE)?;

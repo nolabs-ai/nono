@@ -10,14 +10,13 @@ use crate::cli::{
     ProfileValidateArgs,
 };
 use crate::config::embedded;
-use crate::deprecated_schema::{
-    DeprecationCounter, LegacyPolicyPatch, GLOBAL_DEPRECATION_COUNTER,
-};
+use crate::deprecated_schema::{DeprecationCounter, LegacyPolicyPatch, GLOBAL_DEPRECATION_COUNTER};
 use crate::policy::{self, AllowOps, DenyOps, Group};
 use crate::profile::{self, Profile, WorkdirAccess};
 use crate::theme;
 use colored::Colorize;
 use nono::{NonoError, Result};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::Write;
@@ -50,6 +49,20 @@ pub fn run_profile(args: ProfileCmdArgs) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// SHA-256 helper (Phase 36.5 D-36.5-B4 — canonical helper; consolidated here,
+// used by Commit 1 refresh + Commit 2 verify_base_hash / cmd_promote)
+// ---------------------------------------------------------------------------
+
+/// Compute SHA-256 of `bytes` and return the lowercase hex digest (64 chars).
+/// Per D-36.5-B4 — `sha2` workspace dep; matches Phase 22-03 PKG-04 + Phase 32
+/// sigstore TUF root hashing; one algorithm across codebase.
+#[must_use]
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+// ---------------------------------------------------------------------------
 // nono profile init
 // ---------------------------------------------------------------------------
 
@@ -62,9 +75,15 @@ fn cmd_init(args: ProfileInitArgs) -> Result<()> {
         )));
     }
 
+    // Phase 36.5 D-36.5-A1: --refresh mode rewrites the sidecar without touching draft.
+    if args.refresh {
+        return cmd_init_refresh(&args.name);
+    }
+
     // Determine output path
     let output_path = match &args.output {
         Some(path) => path.clone(),
+        None if args.draft => profile::get_user_profile_draft_path(&args.name)?,
         None => profile::get_user_profile_path(&args.name)?,
     };
 
@@ -125,6 +144,25 @@ fn cmd_init(args: ProfileInitArgs) -> Result<()> {
         ))
     })?;
 
+    // Phase 36.5 D-36.5-B4: If creating a draft AND a canonical profile already
+    // exists, write the sidecar .base file containing SHA-256 of canonical bytes.
+    // This seeds the base-hash for promote-time staleness detection.
+    if args.draft && args.output.is_none() {
+        let canonical = profile::get_user_profile_path(&args.name)?;
+        if canonical.exists() {
+            let canonical_bytes = fs::read(&canonical).map_err(|e| NonoError::ProfileRead {
+                path: canonical.clone(),
+                source: e,
+            })?;
+            let hash = sha256_hex(&canonical_bytes);
+            let base_path = profile::get_user_profile_draft_base_path(&args.name)?;
+            // Atomic-write sidecar (.base file)
+            let tmp_path = base_path.with_extension("base.tmp");
+            fs::write(&tmp_path, &hash).map_err(NonoError::Io)?;
+            fs::rename(&tmp_path, &base_path).map_err(NonoError::Io)?;
+        }
+    }
+
     eprintln!(
         "{} Created profile at {}",
         prefix(),
@@ -140,6 +178,40 @@ fn cmd_init(args: ProfileInitArgs) -> Result<()> {
         prefix()
     );
 
+    Ok(())
+}
+
+/// Refresh a draft's recorded base-hash from the current canonical profile.
+///
+/// Preserves draft JSON content; rewrites only the sidecar `<name>.base`.
+/// Errors if either the draft or the canonical profile is missing.
+/// Phase 36.5 RESEARCH §`--refresh` recommendation.
+fn cmd_init_refresh(name: &str) -> Result<()> {
+    let draft_path = profile::get_user_profile_draft_path(name)?;
+    if !draft_path.exists() {
+        return Err(NonoError::ProfileParse(format!(
+            "no draft to refresh; use `nono profile init --draft {name}` without `--refresh`"
+        )));
+    }
+    let canonical_path = profile::get_user_profile_path(name)?;
+    if !canonical_path.exists() {
+        return Err(NonoError::ProfileParse(format!(
+            "no canonical profile to refresh against at {} \
+             (the draft is already a first-time promote candidate)",
+            canonical_path.display()
+        )));
+    }
+    let canonical_bytes = fs::read(&canonical_path).map_err(|e| NonoError::ProfileRead {
+        path: canonical_path.clone(),
+        source: e,
+    })?;
+    let hash_hex = sha256_hex(&canonical_bytes);
+    let base_path = profile::get_user_profile_draft_base_path(name)?;
+    // Atomic-write sidecar
+    let tmp_path = base_path.with_extension("base.tmp");
+    fs::write(&tmp_path, &hash_hex).map_err(NonoError::Io)?;
+    fs::rename(&tmp_path, &base_path).map_err(NonoError::Io)?;
+    eprintln!("{}: refreshed base-hash for draft '{name}'", prefix());
     Ok(())
 }
 
@@ -2241,10 +2313,7 @@ pub(crate) fn cmd_validate(args: ProfileValidateArgs) -> Result<()> {
         let counter: &DeprecationCounter = &GLOBAL_DEPRECATION_COUNTER;
         if let Ok(raw) = fs::read_to_string(&args.file) {
             if let Ok(root) = serde_json::from_str::<serde_json::Value>(&raw) {
-                if let Some(legacy_val) = root
-                    .get("policy")
-                    .and_then(|p| p.get("override_deny"))
-                {
+                if let Some(legacy_val) = root.get("policy").and_then(|p| p.get("override_deny")) {
                     // Build a synthetic {"override_deny": [...]} value so we
                     // can keep the canonical rewrite path centralised in
                     // LegacyPolicyPatch::rewrite. Per WR-05, this avoids
@@ -2253,9 +2322,7 @@ pub(crate) fn cmd_validate(args: ProfileValidateArgs) -> Result<()> {
                     let mut synthetic = serde_json::Map::new();
                     synthetic.insert("override_deny".to_string(), legacy_val.clone());
                     let synthetic_val = serde_json::Value::Object(synthetic);
-                    if let Ok(patch) =
-                        serde_json::from_value::<LegacyPolicyPatch>(synthetic_val)
-                    {
+                    if let Ok(patch) = serde_json::from_value::<LegacyPolicyPatch>(synthetic_val) {
                         if patch.has_legacy_keys() {
                             // Rewrite to canonical form to get the
                             // bypass_protection paths for the error message.
@@ -2834,6 +2901,8 @@ mod tests {
             full: false,
             output: None,
             force: false,
+            draft: false,
+            refresh: false,
         };
         let skeleton = build_skeleton(&args);
         let json = serde_json::to_string(&skeleton).expect("serialize");
@@ -2851,6 +2920,8 @@ mod tests {
             full: true,
             output: None,
             force: false,
+            draft: false,
+            refresh: false,
         };
         let skeleton = build_skeleton(&args);
         let json = serde_json::to_string(&skeleton).expect("serialize");
@@ -2873,6 +2944,8 @@ mod tests {
             full: false,
             output: None,
             force: false,
+            draft: false,
+            refresh: false,
         };
         let skeleton = build_skeleton(&args);
         let groups = skeleton["security"]["groups"].as_array().expect("array");
@@ -2890,6 +2963,8 @@ mod tests {
             full: false,
             output: None,
             force: false,
+            draft: false,
+            refresh: false,
         };
         let skeleton = build_skeleton(&args);
         // $schema is not emitted because the URL is not hosted;
@@ -2907,6 +2982,8 @@ mod tests {
             full: false,
             output: Some(PathBuf::from("/tmp/nono-test-bad.json")),
             force: false,
+            draft: false,
+            refresh: false,
         });
         assert!(result.is_err());
         let err = result.expect_err("error");
@@ -2923,6 +3000,8 @@ mod tests {
             full: false,
             output: Some(PathBuf::from("/tmp/nono-test-badgroup.json")),
             force: false,
+            draft: false,
+            refresh: false,
         });
         assert!(result.is_err());
         let err = result.expect_err("error");
@@ -2939,6 +3018,8 @@ mod tests {
             full: false,
             output: Some(PathBuf::from("/tmp/nono-test-badextends.json")),
             force: false,
+            draft: false,
+            refresh: false,
         });
         assert!(result.is_err());
         let err = result.expect_err("error");
@@ -2964,6 +3045,8 @@ mod tests {
             full: false,
             output: Some(tmp.clone()),
             force: false,
+            draft: false,
+            refresh: false,
         });
         assert!(result.is_err());
 
@@ -2976,6 +3059,8 @@ mod tests {
             full: false,
             output: Some(tmp.clone()),
             force: true,
+            draft: false,
+            refresh: false,
         });
         assert!(result.is_ok());
 
@@ -2998,6 +3083,8 @@ mod tests {
             full: false,
             output: None,
             force: false,
+            draft: false,
+            refresh: false,
         };
         let full_args = ProfileInitArgs {
             name: "full".to_string(),
@@ -3007,6 +3094,8 @@ mod tests {
             full: true,
             output: None,
             force: false,
+            draft: false,
+            refresh: false,
         };
         let minimal = build_skeleton(&minimal_args);
         let full = build_skeleton(&full_args);

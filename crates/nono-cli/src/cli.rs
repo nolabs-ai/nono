@@ -1248,6 +1248,15 @@ pub struct ProfileInitArgs {
     /// Overwrite existing file
     #[arg(long)]
     pub force: bool,
+    /// Create the profile as a draft under profile-drafts/ instead of profiles/.
+    /// Phase 36.5 D-36.5-A1.
+    #[arg(long)]
+    pub draft: bool,
+    /// Refresh an existing draft's recorded base-hash from the current canonical
+    /// profile. Preserves draft JSON content; rewrites the sidecar `<name>.base`
+    /// only. Requires `--draft`. Phase 36.5 RESEARCH §`--refresh`.
+    #[arg(long, requires = "draft")]
+    pub refresh: bool,
 }
 
 #[derive(Parser, Debug)]

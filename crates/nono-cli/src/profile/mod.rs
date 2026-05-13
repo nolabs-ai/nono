@@ -71,6 +71,31 @@ fn detect_legacy_override_deny_key(raw: &str) {
     }
 }
 
+/// WR-01 fail-closed (REVIEW.md): returns an error when the same `policy`
+/// object contains BOTH the canonical `bypass_protection` key and the legacy
+/// `override_deny` key simultaneously.
+///
+/// Serde's `#[serde(alias = "override_deny")]` on `bypass_protection` makes
+/// "last key wins" the deserialise outcome when both keys appear, which is
+/// non-deterministic across serde_json versions and silently drops one of
+/// the two lists — a fail-open condition during legacy-to-canonical
+/// migration. CLAUDE.md § Fail Secure mandates an explicit error here.
+///
+/// Scope: only checks `policy.{bypass_protection, override_deny}` siblings
+/// at the top level of the `policy` object. Does NOT recurse — the schema
+/// only declares the keys at that one location.
+fn raw_profile_has_both_bypass_and_override_keys(raw: &str) -> bool {
+    let value: serde_json::Value = match serde_json::from_str(raw) {
+        Ok(v) => v,
+        Err(_) => return false, // main parser will surface the real error
+    };
+    if let Some(policy) = value.get("policy").and_then(|v| v.as_object()) {
+        return policy.contains_key("bypass_protection")
+            && policy.contains_key("override_deny");
+    }
+    false
+}
+
 /// Recursive walk: returns `true` if any object in `v` contains `target` as
 /// a key. Visits arrays and nested objects.
 fn json_value_has_key(v: &serde_json::Value, target: &str) -> bool {
@@ -136,6 +161,45 @@ mod canonical_schema_rename_tests {
         let cfg: PolicyPatchConfig =
             serde_json::from_str(raw).expect("legacy override_deny must continue to deserialize");
         assert_eq!(cfg.bypass_protection, vec!["/etc/hosts".to_string()]);
+    }
+
+    /// WR-01 regression (REVIEW.md): a profile with BOTH
+    /// `policy.bypass_protection` AND `policy.override_deny` must trip the
+    /// raw-JSON pre-check at parse time so the caller can fail-closed
+    /// rather than silently dropping one of the two lists.
+    #[test]
+    fn raw_profile_has_both_bypass_and_override_keys_detects_both() {
+        let raw = r#"{
+            "meta": {"name": "t"},
+            "policy": {
+                "bypass_protection": ["/a"],
+                "override_deny": ["/b"]
+            }
+        }"#;
+        assert!(
+            raw_profile_has_both_bypass_and_override_keys(raw),
+            "both keys present in policy must trip the pre-check"
+        );
+    }
+
+    /// WR-01 negative regression: canonical-only must not trip.
+    #[test]
+    fn raw_profile_has_both_bypass_and_override_keys_canonical_only() {
+        let raw = r#"{"policy":{"bypass_protection":["/a"]}}"#;
+        assert!(
+            !raw_profile_has_both_bypass_and_override_keys(raw),
+            "canonical-only must not trip the dual-key check"
+        );
+    }
+
+    /// WR-01 negative regression: legacy-only must not trip.
+    #[test]
+    fn raw_profile_has_both_bypass_and_override_keys_legacy_only() {
+        let raw = r#"{"policy":{"override_deny":["/a"]}}"#;
+        assert!(
+            !raw_profile_has_both_bypass_and_override_keys(raw),
+            "legacy-only must not trip the dual-key check"
+        );
     }
 
     #[test]
@@ -2141,6 +2205,21 @@ fn parse_profile_file(path: &Path) -> Result<Profile> {
     // renamed it to `bypass_protection`; both continue to deserialize for
     // v2.3 backwards-compat via the serde alias on PolicyPatchConfig).
     detect_legacy_override_deny_key(&content);
+
+    // WR-01 fail-closed (REVIEW.md): reject profiles that include BOTH
+    // `policy.bypass_protection` AND `policy.override_deny`. The serde alias
+    // would silently keep one list and drop the other (non-deterministic by
+    // JSON key order), which is a security-relevant fail-open during
+    // migration.  Use only the canonical key.
+    if raw_profile_has_both_bypass_and_override_keys(&content) {
+        return Err(NonoError::ProfileParse(format!(
+            "profile '{}': `policy.bypass_protection` and `policy.override_deny` \
+             must not be set simultaneously. Use only `bypass_protection`; \
+             `override_deny` is the legacy alias and cannot coexist with the \
+             canonical key (D-36-B3 / WR-01).",
+            path.display()
+        )));
+    }
 
     let profile: Profile =
         serde_json::from_str(&content).map_err(|e| NonoError::ProfileParse(e.to_string()))?;

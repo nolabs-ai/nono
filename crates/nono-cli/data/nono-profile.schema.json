@@ -357,6 +357,10 @@
           "items": { "type": "string" },
           "description": "Legacy alias for bypass_protection (deprecated since v0.47.0 / upstream f0abd413). Accepted indefinitely per D-36-B3. Use bypass_protection in new profiles."
         }
+      },
+      "not": {
+        "required": ["bypass_protection", "override_deny"],
+        "description": "WR-01 fail-closed: bypass_protection and override_deny must not be set simultaneously. Use only bypass_protection; override_deny is the legacy alias and cannot coexist with the canonical key."
       }
     },
     "NetworkConfig": {

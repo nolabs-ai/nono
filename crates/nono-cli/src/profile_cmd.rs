@@ -10,7 +10,9 @@ use crate::cli::{
     ProfileValidateArgs,
 };
 use crate::config::embedded;
-use crate::deprecated_schema::{DeprecationCounter, LegacyPolicyPatch, GLOBAL_DEPRECATION_COUNTER};
+use crate::deprecated_schema::{
+    DeprecationCounter, LegacyPolicyPatch, GLOBAL_DEPRECATION_COUNTER,
+};
 use crate::policy::{self, AllowOps, DenyOps, Group};
 use crate::profile::{self, Profile, WorkdirAccess};
 use crate::theme;
@@ -2216,37 +2218,52 @@ pub(crate) fn cmd_validate(args: ProfileValidateArgs) -> Result<()> {
     let mut errors: Vec<String> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
 
-    // Plan 36-01a (Task 2): Detect legacy keys via LegacyPolicyPatch and
+    // Plan 36-01a (Task 2): Detect the legacy `override_deny` key and
     // route to errors (--strict) or warnings (default) based on args.strict.
     //
-    // We attempt to deserialize the `policy` sub-object of the profile JSON as
-    // a `LegacyPolicyPatch`. If the sub-object contains `bypass_protection`, the
-    // `has_legacy_keys()` predicate returns `true`. In strict mode, we push
-    // a clear error message naming both the legacy key and canonical key onto
-    // `errors` (fail-closed, non-zero exit). In non-strict mode, we emit the
-    // one-shot stderr WARN via DeprecationCounter and push onto `warnings`.
+    // WR-05 fix (REVIEW.md): inspect the parsed JSON directly to detect the
+    // legacy key, sidestepping the coupling between LegacyPolicyPatch's
+    // `#[serde(deny_unknown_fields)]` schema and the validation logic.
+    // Previously, `serde_json::from_value::<LegacyPolicyPatch>(policy_val)`
+    // would fail (silently!) if the policy object contained ANY other
+    // PolicyPatchConfig fields — `--strict` would skip dual-key profiles
+    // entirely. Direct `policy_val.get("override_deny")` extracts the
+    // legacy field robustly regardless of which other keys coexist.
     //
-    // Failure to deserialize the sub-object (e.g., profile has no `policy` key
-    // or uses a different shape) is silently ignored — the main parse in Step 1
-    // surfaces real parse errors.
+    // The actual rewrite still goes through `LegacyPolicyPatch::rewrite`
+    // so the canonical-form contract stays centralised in
+    // `deprecated_schema`. We build a synthetic single-field JSON object
+    // to feed the deserializer.
+    //
+    // Failure to read or parse the file is silently ignored here — the
+    // main parse in Step 1 below surfaces real parse errors.
     {
         let counter: &DeprecationCounter = &GLOBAL_DEPRECATION_COUNTER;
         if let Ok(raw) = fs::read_to_string(&args.file) {
             if let Ok(root) = serde_json::from_str::<serde_json::Value>(&raw) {
-                if let Some(policy_val) = root.get("policy") {
+                if let Some(legacy_val) = root
+                    .get("policy")
+                    .and_then(|p| p.get("override_deny"))
+                {
+                    // Build a synthetic {"override_deny": [...]} value so we
+                    // can keep the canonical rewrite path centralised in
+                    // LegacyPolicyPatch::rewrite. Per WR-05, this avoids
+                    // failing-deserialise when sibling canonical keys are
+                    // present in the real `policy` object.
+                    let mut synthetic = serde_json::Map::new();
+                    synthetic.insert("override_deny".to_string(), legacy_val.clone());
+                    let synthetic_val = serde_json::Value::Object(synthetic);
                     if let Ok(patch) =
-                        serde_json::from_value::<LegacyPolicyPatch>(policy_val.clone())
+                        serde_json::from_value::<LegacyPolicyPatch>(synthetic_val)
                     {
                         if patch.has_legacy_keys() {
-                            // Rewrite to canonical form to get the bypass_protection paths.
+                            // Rewrite to canonical form to get the
+                            // bypass_protection paths for the error message.
                             let canonical = patch.rewrite()?;
-                            // CR-02 fix (REVIEW.md): the legacy key is
-                            // `override_deny`, the canonical replacement is
-                            // `bypass_protection`. The previous call passed
-                            // ("bypass_protection", "bypass_protection") which
-                            // (a) is logically incoherent and (b) is a silent
-                            // no-op because the DeprecationCounter map only
-                            // registers `override_deny` as a known legacy key.
+                            // CR-02 fix: emit the one-shot WARN with the
+                            // correct legacy / canonical key pair. The
+                            // DeprecationCounter map only registers
+                            // `override_deny` as a known legacy key.
                             counter.emit_once("override_deny", "bypass_protection");
                             if args.strict {
                                 // Strict mode: fail closed with a clear error message.

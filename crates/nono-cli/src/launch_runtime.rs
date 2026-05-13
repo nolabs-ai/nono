@@ -2,7 +2,7 @@ use crate::cli::RunArgs;
 use crate::config;
 use crate::proxy_runtime::prepare_proxy_launch_options;
 use crate::sandbox_prepare::{
-    prepare_sandbox, print_allow_gpu_warning, print_allow_launch_services_warning, PreparedSandbox,
+    PreparedSandbox, prepare_sandbox, print_allow_gpu_warning, print_allow_launch_services_warning,
 };
 use crate::{exec_strategy, instruction_deny, profile, trust_scan};
 use colored::Colorize;

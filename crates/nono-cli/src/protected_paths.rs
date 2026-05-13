@@ -3,7 +3,7 @@
 //! These checks enforce a hard fail if initial sandbox capabilities overlap
 //! with internal CLI state roots (currently `~/.nono`).
 
-use nono::{try_canonicalize, CapabilitySet, NonoError, Result};
+use nono::{CapabilitySet, NonoError, Result, try_canonicalize};
 use std::path::{Path, PathBuf};
 
 /// Resolved internal state roots that must not be accessible by the sandboxed child.
@@ -169,10 +169,10 @@ pub(crate) fn emit_protected_root_deny_rules(
 
         // Also emit for the canonical path if it differs (important on macOS
         // where paths like /var resolve to /private/var).
-        if let Ok(canonical) = resolved.canonicalize() {
-            if canonical != resolved {
-                emit_deny_rules_for_path(&canonical, caps)?;
-            }
+        if let Ok(canonical) = resolved.canonicalize()
+            && canonical != resolved
+        {
+            emit_deny_rules_for_path(&canonical, caps)?;
         }
     }
 

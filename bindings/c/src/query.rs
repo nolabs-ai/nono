@@ -4,7 +4,7 @@ use std::os::raw::c_char;
 
 use crate::capability_set::NonoCapabilitySet;
 use crate::types::{
-    validate_access_mode, NonoErrorCode, NonoQueryReason, NonoQueryResult, NonoQueryStatus,
+    NonoErrorCode, NonoQueryReason, NonoQueryResult, NonoQueryStatus, validate_access_mode,
 };
 use crate::{c_str_to_str, rust_string_to_c, set_last_error};
 
@@ -78,7 +78,7 @@ fn query_result_to_c(result: &nono::query::QueryResult) -> NonoQueryResult {
 ///
 /// `caps` must be a valid pointer from `nono_capability_set_new()`.
 /// Returns NULL if `caps` is NULL.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn nono_query_context_new(
     caps: *const NonoCapabilitySet,
 ) -> *mut NonoQueryContext {
@@ -100,7 +100,7 @@ pub unsafe extern "C" fn nono_query_context_new(
 ///
 /// `ctx` must be NULL or a pointer previously returned by
 /// `nono_query_context_new()`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn nono_query_context_free(ctx: *mut NonoQueryContext) {
     if !ctx.is_null() {
         // SAFETY: The pointer was created by Box::into_raw() in
@@ -123,7 +123,7 @@ pub unsafe extern "C" fn nono_query_context_free(ctx: *mut NonoQueryContext) {
 /// - `ctx` must be a valid pointer from `nono_query_context_new()`.
 /// - `path` must be a valid null-terminated UTF-8 string.
 /// - `out_result` must be a valid writable pointer.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn nono_query_context_query_path(
     ctx: *const NonoQueryContext,
     path: *const c_char,
@@ -167,7 +167,7 @@ pub unsafe extern "C" fn nono_query_context_query_path(
 ///
 /// - `ctx` must be a valid pointer from `nono_query_context_new()`.
 /// - `out_result` must be a valid writable pointer.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn nono_query_context_query_network(
     ctx: *const NonoQueryContext,
     out_result: *mut NonoQueryResult,

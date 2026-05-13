@@ -641,12 +641,16 @@ mod tests {
         };
         let config = build_proxy_config(&resolved, &["extra.example.com".to_string()]);
         assert!(config.allowed_hosts.contains(&"api.openai.com".to_string()));
-        assert!(config
-            .allowed_hosts
-            .contains(&"*.googleapis.com".to_string()));
-        assert!(config
-            .allowed_hosts
-            .contains(&"extra.example.com".to_string()));
+        assert!(
+            config
+                .allowed_hosts
+                .contains(&"*.googleapis.com".to_string())
+        );
+        assert!(
+            config
+                .allowed_hosts
+                .contains(&"extra.example.com".to_string())
+        );
     }
 
     #[test]

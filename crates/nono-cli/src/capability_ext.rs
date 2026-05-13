@@ -5,7 +5,7 @@
 
 use crate::cli::SandboxArgs;
 use crate::policy;
-use crate::profile::{expand_vars, Profile};
+use crate::profile::{Profile, expand_vars};
 use crate::protected_paths::{self, ProtectedRoots};
 use nono::{
     AccessMode, CapabilitySet, CapabilitySource, FsCapability, NonoError, Result,
@@ -155,14 +155,14 @@ fn add_cli_unix_socket_caps(
                 if let Some(cap) = try_new_file(path, AccessMode::ReadWrite, LBL_FS_FILE_IMPLIED)? {
                     caps.add_fs(cap);
                 }
-            } else if let Some(parent) = path.parent() {
-                if let Some(cap) = try_new_dir(
+            } else if let Some(parent) = path.parent()
+                && let Some(cap) = try_new_dir(
                     parent,
                     AccessMode::ReadWrite,
                     LBL_FS_DIR_IMPLIED_BIND_PARENT,
-                )? {
-                    caps.add_fs(cap);
-                }
+                )?
+            {
+                caps.add_fs(cap);
             }
         }
     }
@@ -762,11 +762,11 @@ impl CapabilitySetExt for CapabilitySet {
                         cap.source = CapabilitySource::Profile;
                         caps.add_fs(cap);
                     }
-                } else if let Some(parent) = path.parent() {
-                    if let Some(mut cap) = try_new_dir(parent, AccessMode::ReadWrite, &label)? {
-                        cap.source = CapabilitySource::Profile;
-                        caps.add_fs(cap);
-                    }
+                } else if let Some(parent) = path.parent()
+                    && let Some(mut cap) = try_new_dir(parent, AccessMode::ReadWrite, &label)?
+                {
+                    cap.source = CapabilitySource::Profile;
+                    caps.add_fs(cap);
                 }
             }
         }

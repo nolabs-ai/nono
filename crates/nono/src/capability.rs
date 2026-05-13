@@ -2342,9 +2342,10 @@ mod tests {
     fn test_platform_rule_validation_valid_deny() {
         let mut caps = CapabilitySet::new();
         assert!(caps.add_platform_rule("(deny file-write-unlink)").is_ok());
-        assert!(caps
-            .add_platform_rule("(deny file-read-data (subpath \"/secret\"))")
-            .is_ok());
+        assert!(
+            caps.add_platform_rule("(deny file-read-data (subpath \"/secret\"))")
+                .is_ok()
+        );
     }
 
     #[test]
@@ -2357,46 +2358,54 @@ mod tests {
     #[test]
     fn test_platform_rule_validation_rejects_root_access() {
         let mut caps = CapabilitySet::new();
-        assert!(caps
-            .add_platform_rule("(allow file-read* (subpath \"/\"))")
-            .is_err());
-        assert!(caps
-            .add_platform_rule("(allow file-write* (subpath \"/\"))")
-            .is_err());
+        assert!(
+            caps.add_platform_rule("(allow file-read* (subpath \"/\"))")
+                .is_err()
+        );
+        assert!(
+            caps.add_platform_rule("(allow file-write* (subpath \"/\"))")
+                .is_err()
+        );
         // Specific subpaths should be fine
-        assert!(caps
-            .add_platform_rule("(allow file-read* (subpath \"/usr\"))")
-            .is_ok());
+        assert!(
+            caps.add_platform_rule("(allow file-read* (subpath \"/usr\"))")
+                .is_ok()
+        );
     }
 
     #[test]
     fn test_platform_rule_validation_rejects_whitespace_bypass() {
         let mut caps = CapabilitySet::new();
         // Tab-separated
-        assert!(caps
-            .add_platform_rule("(allow\tfile-read*\t(subpath\t\"/\"))")
-            .is_err());
+        assert!(
+            caps.add_platform_rule("(allow\tfile-read*\t(subpath\t\"/\"))")
+                .is_err()
+        );
         // Extra spaces
-        assert!(caps
-            .add_platform_rule("(allow  file-read*  (subpath  \"/\"))")
-            .is_err());
+        assert!(
+            caps.add_platform_rule("(allow  file-read*  (subpath  \"/\"))")
+                .is_err()
+        );
         // Mixed whitespace
-        assert!(caps
-            .add_platform_rule("(allow \t file-write* \t (subpath \"/\"))")
-            .is_err());
+        assert!(
+            caps.add_platform_rule("(allow \t file-write* \t (subpath \"/\"))")
+                .is_err()
+        );
     }
 
     #[test]
     fn test_platform_rule_validation_rejects_comment_bypass() {
         let mut caps = CapabilitySet::new();
         // Block comment between tokens
-        assert!(caps
-            .add_platform_rule("(allow file-read* #| comment |# (subpath \"/\"))")
-            .is_err());
+        assert!(
+            caps.add_platform_rule("(allow file-read* #| comment |# (subpath \"/\"))")
+                .is_err()
+        );
         // Block comment inside nested expression
-        assert!(caps
-            .add_platform_rule("(allow #| sneaky |# file-write* (subpath \"/\"))")
-            .is_err());
+        assert!(
+            caps.add_platform_rule("(allow #| sneaky |# file-write* (subpath \"/\"))")
+                .is_err()
+        );
     }
 
     #[test]
@@ -2409,12 +2418,14 @@ mod tests {
     #[test]
     fn test_platform_rule_validation_rejects_unterminated_constructs() {
         let mut caps = CapabilitySet::new();
-        assert!(caps
-            .add_platform_rule("(deny file-read* #| unterminated comment")
-            .is_err());
-        assert!(caps
-            .add_platform_rule("(deny file-read* (subpath \"/usr))")
-            .is_err());
+        assert!(
+            caps.add_platform_rule("(deny file-read* #| unterminated comment")
+                .is_err()
+        );
+        assert!(
+            caps.add_platform_rule("(deny file-read* (subpath \"/usr))")
+                .is_err()
+        );
     }
 
     #[test]
@@ -2423,16 +2434,18 @@ mod tests {
         // Minimal IOKit surface: AGXDeviceUserClient is the only class required
         // for Metal compute on Apple Silicon. IOSurfaceRootUserClient is tried
         // opportunistically but Metal continues without it when denied.
-        assert!(caps
-            .add_platform_rule(
+        assert!(
+            caps.add_platform_rule(
                 "(allow iokit-open \
                     (iokit-user-client-class \
                         \"AGXDeviceUserClient\"))"
             )
-            .is_ok());
-        assert!(caps
-            .add_platform_rule("(allow iokit-get-properties)")
-            .is_ok());
+            .is_ok()
+        );
+        assert!(
+            caps.add_platform_rule("(allow iokit-get-properties)")
+                .is_ok()
+        );
         assert_eq!(caps.platform_rules().len(), 2);
     }
 

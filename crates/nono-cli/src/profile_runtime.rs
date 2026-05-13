@@ -575,14 +575,18 @@ mod tests {
             preflight.bypass_protection_paths
         );
         assert_eq!(runtime.ignored_denial_paths, preflight.ignored_denial_paths);
-        assert!(runtime
-            .ignored_denial_paths
-            .contains(&nono::try_canonicalize(
-                &workdir.path().join(".copilot/settings.json")
-            )));
-        assert!(runtime
-            .ignored_denial_paths
-            .contains(&nono::try_canonicalize(&workdir.path().join("cli-ignore"))));
+        assert!(
+            runtime
+                .ignored_denial_paths
+                .contains(&nono::try_canonicalize(
+                    &workdir.path().join(".copilot/settings.json")
+                ))
+        );
+        assert!(
+            runtime
+                .ignored_denial_paths
+                .contains(&nono::try_canonicalize(&workdir.path().join("cli-ignore")))
+        );
         assert_eq!(runtime.allowed_env_vars, preflight.allowed_env_vars);
         assert_eq!(runtime.denied_env_vars, preflight.denied_env_vars);
         assert_eq!(

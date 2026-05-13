@@ -667,8 +667,8 @@ fn arb_profile_json(
 }
 
 /// Strategy producing `(profile_json, groups, workdir_access, network_block, extra_blocked)`.
-fn arb_profile(
-) -> impl Strategy<Value = (serde_json::Value, Vec<String>, String, bool, Vec<String>)> {
+fn arb_profile()
+-> impl Strategy<Value = (serde_json::Value, Vec<String>, String, bool, Vec<String>)> {
     let groups = arb_subset(AVAILABLE_GROUPS);
     let workdir = proptest::sample::select(WORKDIR_ACCESS).prop_map(String::from);
     let network_block = proptest::bool::ANY;

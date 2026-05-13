@@ -128,7 +128,7 @@ impl SetupRunner {
 
             if pid == 0 {
                 // Child process: try to apply sandbox
-                extern "C" {
+                unsafe extern "C" {
                     fn sandbox_init(
                         profile: *const std::os::raw::c_char,
                         flags: u64,
@@ -207,7 +207,9 @@ impl SetupRunner {
             if detected.has_network() {
                 println!("    - Per-port network filtering: available (Landlock V4+)");
             } else {
-                println!("    - Per-port network filtering: unavailable (needs kernel 6.7+ for Landlock V4)");
+                println!(
+                    "    - Per-port network filtering: unavailable (needs kernel 6.7+ for Landlock V4)"
+                );
             }
             println!(
                 "    - Credential proxy (--credential): requires wsl2_proxy_policy profile opt-in"
@@ -561,9 +563,11 @@ mod tests {
     fn test_detected_abi_has_network_for_v4_plus() {
         let detected = nono::DetectedAbi::new(landlock::ABI::V4);
         assert!(detected.has_network());
-        assert!(detected
-            .feature_names()
-            .iter()
-            .any(|n| n.starts_with("TCP network filtering")));
+        assert!(
+            detected
+                .feature_names()
+                .iter()
+                .any(|n| n.starts_with("TCP network filtering"))
+        );
     }
 }

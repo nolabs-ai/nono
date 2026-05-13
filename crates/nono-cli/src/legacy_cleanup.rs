@@ -101,11 +101,11 @@ fn scan(home: &Path) -> LegacyArtifacts {
     }
 
     let settings_path = home.join(".claude").join("settings.json");
-    if let Some(entries) = scan_settings(&settings_path, home) {
-        if !entries.is_empty() {
-            artifacts.settings_entries = entries;
-            artifacts.settings_path = Some(settings_path);
-        }
+    if let Some(entries) = scan_settings(&settings_path, home)
+        && !entries.is_empty()
+    {
+        artifacts.settings_entries = entries;
+        artifacts.settings_path = Some(settings_path);
     }
 
     artifacts

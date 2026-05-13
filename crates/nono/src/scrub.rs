@@ -89,11 +89,7 @@ impl ScrubPolicyDiff {
 
     #[must_use]
     pub fn into_option(self) -> Option<Self> {
-        if self.is_empty() {
-            None
-        } else {
-            Some(self)
-        }
+        if self.is_empty() { None } else { Some(self) }
     }
 }
 

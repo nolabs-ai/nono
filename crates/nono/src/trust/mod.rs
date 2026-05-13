@@ -37,30 +37,30 @@ pub mod signing;
 pub mod types;
 
 pub use bundle::{
-    bundle_path_for, extract_all_subjects, extract_bundle_digest, extract_predicate_type,
-    extract_signer_identity, load_bundle, load_bundle_from_str, load_production_trusted_root,
-    load_trusted_root, load_trusted_root_from_str, multi_subject_bundle_path, parse_cert_info,
-    verify_bundle, verify_bundle_keyed, verify_bundle_subject_name, verify_bundle_with_digest,
-    verify_keyed_signature, Bundle, CertificateInfo, DerPublicKey, Sha256Hash,
-    SigstoreVerificationResult, TrustedRoot, VerificationPolicy,
+    Bundle, CertificateInfo, DerPublicKey, Sha256Hash, SigstoreVerificationResult, TrustedRoot,
+    VerificationPolicy, bundle_path_for, extract_all_subjects, extract_bundle_digest,
+    extract_predicate_type, extract_signer_identity, load_bundle, load_bundle_from_str,
+    load_production_trusted_root, load_trusted_root, load_trusted_root_from_str,
+    multi_subject_bundle_path, parse_cert_info, verify_bundle, verify_bundle_keyed,
+    verify_bundle_subject_name, verify_bundle_with_digest, verify_keyed_signature,
 };
 pub use digest::{bytes_digest, file_digest};
 pub use dsse::{
-    new_envelope, new_instruction_statement, new_multi_subject_statement, new_policy_statement,
-    new_statement, pae, DsseEnvelope, DsseSignature, InTotoStatement, InTotoSubject,
-    IN_TOTO_PAYLOAD_TYPE, IN_TOTO_STATEMENT_TYPE, NONO_MULTI_SUBJECT_PREDICATE_TYPE,
-    NONO_POLICY_PREDICATE_TYPE, NONO_PREDICATE_TYPE,
+    DsseEnvelope, DsseSignature, IN_TOTO_PAYLOAD_TYPE, IN_TOTO_STATEMENT_TYPE, InTotoStatement,
+    InTotoSubject, NONO_MULTI_SUBJECT_PREDICATE_TYPE, NONO_POLICY_PREDICATE_TYPE,
+    NONO_PREDICATE_TYPE, new_envelope, new_instruction_statement, new_multi_subject_statement,
+    new_policy_statement, new_statement, pae,
 };
 pub use policy::{
     evaluate_file, find_included_files, find_included_files_with_skip_dirs, load_policy_from_file,
     load_policy_from_str, merge_policies,
 };
 pub use signing::{
-    export_public_key, generate_signing_key, key_id_hex, public_key_id_hex, sign_bytes, sign_files,
-    sign_instruction_file, sign_policy_bytes, sign_policy_file, sign_statement_bundle,
-    write_bundle, KeyPair, SigningScheme, MAX_MULTI_SUBJECT_FILES,
+    KeyPair, MAX_MULTI_SUBJECT_FILES, SigningScheme, export_public_key, generate_signing_key,
+    key_id_hex, public_key_id_hex, sign_bytes, sign_files, sign_instruction_file,
+    sign_policy_bytes, sign_policy_file, sign_statement_bundle, write_bundle,
 };
 pub use types::{
     BlockedPublisher, Blocklist, BlocklistEntry, Enforcement, IncludePatterns, Publisher,
-    SignerIdentity, TrustPolicy, VerificationOutcome, VerificationResult, TRUST_POLICY_VERSION,
+    SignerIdentity, TRUST_POLICY_VERSION, TrustPolicy, VerificationOutcome, VerificationResult,
 };

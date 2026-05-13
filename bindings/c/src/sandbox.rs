@@ -14,7 +14,7 @@ use crate::{map_error, rust_string_to_c, set_last_error};
 /// # Safety
 ///
 /// `caps` must be a valid pointer from `nono_capability_set_new()`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn nono_sandbox_apply(caps: *const NonoCapabilitySet) -> NonoErrorCode {
     if caps.is_null() {
         set_last_error("caps pointer is NULL");
@@ -28,7 +28,7 @@ pub unsafe extern "C" fn nono_sandbox_apply(caps: *const NonoCapabilitySet) -> N
 }
 
 /// Check if sandboxing is supported on this platform.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nono_sandbox_is_supported() -> bool {
     nono::Sandbox::is_supported()
 }
@@ -37,7 +37,7 @@ pub extern "C" fn nono_sandbox_is_supported() -> bool {
 ///
 /// Caller must free `platform` and `details` fields with
 /// `nono_string_free()`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nono_sandbox_support_info() -> NonoSupportInfo {
     let info = nono::Sandbox::support_info();
     NonoSupportInfo {

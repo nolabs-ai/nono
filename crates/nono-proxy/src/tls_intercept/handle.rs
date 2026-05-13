@@ -232,34 +232,34 @@ where
     let cred = service.and_then(|s| ctx.credential_store.get(s));
     let oauth2_route = service.and_then(|s| ctx.credential_store.get_oauth2(s));
 
-    if let Some(rt) = route {
-        if rt.missing_managed_credential(cred.is_some(), oauth2_route.is_some()) {
-            let svc = service.unwrap_or("unknown");
-            let reason = format!(
-                "managed credential unavailable for route '{}': intercepted request requires proxy-supplied auth",
-                svc
-            );
-            warn!("tls_intercept: {}", reason);
-            audit::log_denied(
-                ctx.audit_log,
-                audit::ProxyMode::ConnectIntercept,
-                &audit::EventContext {
-                    route_id: service,
-                    auth_mechanism: rt.managed_auth_mechanism.clone(),
-                    auth_outcome: Some(nono::undo::NetworkAuditAuthOutcome::Failed),
-                    managed_credential_active: Some(false),
-                    injection_mode: rt.managed_injection_mode.clone(),
-                    denial_category: Some(
-                        nono::undo::NetworkAuditDenialCategory::ManagedCredentialUnavailable,
-                    ),
-                },
-                ctx.host,
-                ctx.port,
-                &reason,
-            );
-            reverse::send_error_generic(tls_stream, 503, "Service Unavailable").await?;
-            return Ok(());
-        }
+    if let Some(rt) = route
+        && rt.missing_managed_credential(cred.is_some(), oauth2_route.is_some())
+    {
+        let svc = service.unwrap_or("unknown");
+        let reason = format!(
+            "managed credential unavailable for route '{}': intercepted request requires proxy-supplied auth",
+            svc
+        );
+        warn!("tls_intercept: {}", reason);
+        audit::log_denied(
+            ctx.audit_log,
+            audit::ProxyMode::ConnectIntercept,
+            &audit::EventContext {
+                route_id: service,
+                auth_mechanism: rt.managed_auth_mechanism.clone(),
+                auth_outcome: Some(nono::undo::NetworkAuditAuthOutcome::Failed),
+                managed_credential_active: Some(false),
+                injection_mode: rt.managed_injection_mode.clone(),
+                denial_category: Some(
+                    nono::undo::NetworkAuditDenialCategory::ManagedCredentialUnavailable,
+                ),
+            },
+            ctx.host,
+            ctx.port,
+            &reason,
+        );
+        reverse::send_error_generic(tls_stream, 503, "Service Unavailable").await?;
+        return Ok(());
     }
 
     // --- Path / credential transformation ---
@@ -332,12 +332,11 @@ where
     }
     let auth_header_lower = cred.map(|c| c.header_name.to_lowercase());
     for (name, value) in &filtered_headers {
-        if let (Some(cred), Some(hdr)) = (cred, auth_header_lower.as_ref()) {
-            if matches!(cred.inject_mode, InjectMode::Header | InjectMode::BasicAuth)
-                && name.to_lowercase() == *hdr
-            {
-                continue;
-            }
+        if let (Some(cred), Some(hdr)) = (cred, auth_header_lower.as_ref())
+            && matches!(cred.inject_mode, InjectMode::Header | InjectMode::BasicAuth)
+            && name.to_lowercase() == *hdr
+        {
+            continue;
         }
         request.push_str(&format!("{}: {}\r\n", name, value));
     }

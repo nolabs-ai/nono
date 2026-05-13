@@ -370,7 +370,7 @@ fn hash_ledger_link(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::test_env::{EnvVarGuard, ENV_LOCK};
+    use crate::test_env::{ENV_LOCK, EnvVarGuard};
     use nono::undo::{
         AuditAttestationSummary, ExecutableIdentity, NetworkAuditDecision, NetworkAuditMode,
     };

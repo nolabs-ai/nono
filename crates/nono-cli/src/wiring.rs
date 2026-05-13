@@ -101,15 +101,15 @@ impl<'de> Deserialize<'de> for WiringDirective {
         D: serde::Deserializer<'de>,
     {
         let mut value = serde_json::Value::deserialize(deserializer)?;
-        if let serde_json::Value::Object(object) = &mut value {
-            if let Some(when_value) = object.remove("when") {
-                let when = crate::platform::When::deserialize(when_value)
-                    .map_err(serde::de::Error::custom)?;
-                if !crate::platform::when_matches_current(Some(&when))
-                    .map_err(serde::de::Error::custom)?
-                {
-                    return Ok(Self::Skipped);
-                }
+        if let serde_json::Value::Object(object) = &mut value
+            && let Some(when_value) = object.remove("when")
+        {
+            let when =
+                crate::platform::When::deserialize(when_value).map_err(serde::de::Error::custom)?;
+            if !crate::platform::when_matches_current(Some(&when))
+                .map_err(serde::de::Error::custom)?
+            {
+                return Ok(Self::Skipped);
             }
         }
 
@@ -532,10 +532,10 @@ fn reverse_one(record: &WiringRecord) -> Result<()> {
     match record {
         WiringRecord::Symlink { link } => {
             let path = Path::new(link);
-            if let Ok(meta) = path.symlink_metadata() {
-                if meta.file_type().is_symlink() {
-                    fs::remove_file(path).map_err(NonoError::Io)?;
-                }
+            if let Ok(meta) = path.symlink_metadata()
+                && meta.file_type().is_symlink()
+            {
+                fs::remove_file(path).map_err(NonoError::Io)?;
             }
         }
         WiringRecord::WriteFile { dest, sha256 } => {
@@ -768,13 +768,13 @@ fn copy_file_atomic(source: &Path, dest: &Path) -> Result<CopyOutcome> {
     // Skip-no-op only if existing content matches exactly. Caller has
     // already enforced the conflict policy (only owned files reach
     // here when dest exists), so a hash match is a real no-op re-pull.
-    if let Ok(existing) = fs::read(dest) {
-        if existing == source_bytes {
-            return Ok(CopyOutcome {
-                mutated: false,
-                sha256,
-            });
-        }
+    if let Ok(existing) = fs::read(dest)
+        && existing == source_bytes
+    {
+        return Ok(CopyOutcome {
+            mutated: false,
+            sha256,
+        });
     }
     let tmp = dest.with_extension("nono-tmp");
     fs::write(&tmp, &source_bytes).map_err(NonoError::Io)?;
@@ -1282,7 +1282,7 @@ fn yaml_to_json(v: yaml::Value) -> Result<Value> {
                         return Err(NonoError::PackageInstall(format!(
                             "yaml_merge: mapping key must be a string, got {:?}",
                             other
-                        )))
+                        )));
                     }
                 };
                 obj.insert(key, yaml_to_json(v)?);
@@ -1524,7 +1524,7 @@ fn _suppress_unused() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_env::{EnvVarGuard, ENV_LOCK};
+    use crate::test_env::{ENV_LOCK, EnvVarGuard};
     use tempfile::TempDir;
 
     fn ctx_in(home: &Path, pack_dir: PathBuf) -> WiringContext {
@@ -1623,11 +1623,12 @@ mod tests {
             assert!(report.changed);
             assert_eq!(report.records.len(), 1);
             let link = home.join("link");
-            assert!(link
-                .symlink_metadata()
-                .expect("meta")
-                .file_type()
-                .is_symlink());
+            assert!(
+                link.symlink_metadata()
+                    .expect("meta")
+                    .file_type()
+                    .is_symlink()
+            );
             assert_eq!(fs::read_link(&link).expect("readlink"), pack);
 
             rev(&report.records);

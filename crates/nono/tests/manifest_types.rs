@@ -1,13 +1,13 @@
 //! Tests for the manifest module (typify-generated types) and manifest_convert
 //! (TryFrom<&CapabilityManifest> for CapabilitySet).
 
+use nono::CapabilitySet;
 use nono::capability::{
     AccessMode as InternalAccessMode, IpcMode as InternalIpcMode,
     NetworkMode as InternalNetworkMode, ProcessInfoMode as InternalProcessInfoMode,
     SignalMode as InternalSignalMode,
 };
 use nono::manifest::CapabilityManifest;
-use nono::CapabilitySet;
 
 // ─── manifest deserialization ───
 

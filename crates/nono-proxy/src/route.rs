@@ -565,13 +565,17 @@ mod tests {
 
         let route = store.get("openai").unwrap();
         assert_eq!(route.upstream, "https://api.openai.com");
-        assert!(route
-            .endpoint_rules
-            .is_allowed("POST", "/v1/chat/completions"));
+        assert!(
+            route
+                .endpoint_rules
+                .is_allowed("POST", "/v1/chat/completions")
+        );
         assert!(route.endpoint_rules.is_allowed("GET", "/v1/models"));
-        assert!(!route
-            .endpoint_rules
-            .is_allowed("DELETE", "/v1/files/file-123"));
+        assert!(
+            !route
+                .endpoint_rules
+                .is_allowed("DELETE", "/v1/files/file-123")
+        );
     }
 
     #[test]

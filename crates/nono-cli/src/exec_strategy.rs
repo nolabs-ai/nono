@@ -18,8 +18,8 @@ use crate::startup_prompt::{print_terminal_safe_stderr, prompt_startup_terminati
 use crate::{DETACHED_CWD_PROMPT_RESPONSE_ENV, DETACHED_LAUNCH_ENV, DETACHED_SESSION_ID_ENV};
 use nix::libc;
 use nix::sys::signal::{self, Signal};
-use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
-use nix::unistd::{fork, ForkResult, Pid};
+use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
+use nix::unistd::{ForkResult, Pid, fork};
 use nono::supervisor::{ApprovalDecision, AuditEntry, SupervisorMessage, SupervisorResponse};
 use nono::{
     ApprovalBackend, CapabilitySet, DenialReason, DenialRecord, DiagnosticFormatter,
@@ -330,15 +330,15 @@ pub fn execute_direct(config: &ExecConfig<'_>) -> Result<()> {
         ) {
             continue;
         }
-        if let Some(ref denied) = config.denied_env_vars {
-            if env_sanitization::is_env_var_denied(&key, denied) {
-                continue;
-            }
+        if let Some(ref denied) = config.denied_env_vars
+            && env_sanitization::is_env_var_denied(&key, denied)
+        {
+            continue;
         }
-        if let Some(ref allowed) = config.allowed_env_vars {
-            if !env_sanitization::is_env_var_allowed(&key, allowed) {
-                continue;
-            }
+        if let Some(ref allowed) = config.allowed_env_vars
+            && !env_sanitization::is_env_var_allowed(&key, allowed)
+        {
+            continue;
         }
         cmd.env(&key, &value);
     }
@@ -464,15 +464,15 @@ pub fn execute_supervised(
             ) {
                 continue;
             }
-            if let Some(ref denied) = config.denied_env_vars {
-                if env_sanitization::is_env_var_denied(k, denied) {
-                    continue;
-                }
+            if let Some(ref denied) = config.denied_env_vars
+                && env_sanitization::is_env_var_denied(k, denied)
+            {
+                continue;
             }
-            if let Some(ref allowed) = config.allowed_env_vars {
-                if !env_sanitization::is_env_var_allowed(k, allowed) {
-                    continue;
-                }
+            if let Some(ref allowed) = config.allowed_env_vars
+                && !env_sanitization::is_env_var_allowed(k, allowed)
+            {
+                continue;
             }
             if let Ok(cstr) = CString::new(format!("{}={}", k, v)) {
                 env_c.push(cstr);
@@ -481,10 +481,10 @@ pub fn execute_supervised(
     }
 
     // Add NONO_CAP_FILE
-    if let Some(cap_file_str) = config.cap_file.to_str() {
-        if let Ok(cstr) = CString::new(format!("NONO_CAP_FILE={}", cap_file_str)) {
-            env_c.push(cstr);
-        }
+    if let Some(cap_file_str) = config.cap_file.to_str()
+        && let Ok(cstr) = CString::new(format!("NONO_CAP_FILE={}", cap_file_str))
+    {
+        env_c.push(cstr);
     }
 
     // Add user-specified environment variables (secrets, etc.)
@@ -508,46 +508,42 @@ pub fn execute_supervised(
     // `/usr/bin/open`. Seatbelt blocks that from launching URLs. Instead, we
     // create a shim script named `open` in a temp directory and prepend it to
     // PATH so the npm `open` package hits our shim first.
-    if supervisor.is_some() {
-        if let Ok(nono_exe) = std::env::current_exe() {
-            #[cfg(target_os = "linux")]
+    if supervisor.is_some()
+        && let Ok(nono_exe) = std::env::current_exe()
+    {
+        #[cfg(target_os = "linux")]
+        {
+            if let Some(fd) = child_sock_fd
+                && let Some(shim) = create_linux_browser_shim(&nono_exe, fd)
             {
-                if let Some(fd) = child_sock_fd {
-                    if let Some(shim) = create_linux_browser_shim(&nono_exe, fd) {
-                        let browser_cmd = format!("BROWSER={}", shim.launcher.display());
-                        if let Ok(cstr) = CString::new(browser_cmd) {
-                            env_c.push(cstr);
-                        }
-                        browser_shim = Some(shim);
-                    }
+                let browser_cmd = format!("BROWSER={}", shim.launcher.display());
+                if let Ok(cstr) = CString::new(browser_cmd) {
+                    env_c.push(cstr);
                 }
+                browser_shim = Some(shim);
             }
+        }
 
-            #[cfg(target_os = "macos")]
-            {
-                if should_install_macos_open_shim(supervisor) {
-                    // Create a shim `open` script that delegates to nono open-url-helper.
-                    // The npm `open` package spawns `open <url>` on macOS; by placing our
-                    // shim earlier in PATH, we intercept the call.
-                    if let Some(fd) = child_sock_fd {
-                        if let Some(shim) = create_open_shim(&nono_exe, fd) {
-                            // Prepend shim dir to PATH and also set BROWSER for any tool
-                            // that does respect it.
-                            let current_path = std::env::var("PATH").unwrap_or_default();
-                            let new_path =
-                                format!("PATH={}:{current_path}", shim.dir.path().display());
-                            if let Ok(cstr) = CString::new(new_path) {
-                                // Remove existing PATH from env_c, then add our modified one
-                                env_c.retain(|c| !c.as_bytes().starts_with(b"PATH="));
-                                env_c.push(cstr);
-                            }
-                            let browser_cmd = format!("BROWSER={}", shim.launcher.display());
-                            if let Ok(cstr) = CString::new(browser_cmd) {
-                                env_c.push(cstr);
-                            }
-                            browser_shim = Some(shim);
-                        }
+        #[cfg(target_os = "macos")]
+        {
+            if should_install_macos_open_shim(supervisor) {
+                // Create a shim `open` script that delegates to nono open-url-helper.
+                // The npm `open` package spawns `open <url>` on macOS; by placing our
+                // shim earlier in PATH, we intercept the call.
+                if let Some(fd) = child_sock_fd
+                    && let Some(shim) = create_open_shim(&nono_exe, fd)
+                {
+                    let current_path = std::env::var("PATH").unwrap_or_default();
+                    let new_path = format!("PATH={}:{current_path}", shim.dir.path().display());
+                    if let Ok(cstr) = CString::new(new_path) {
+                        env_c.retain(|c| !c.as_bytes().starts_with(b"PATH="));
+                        env_c.push(cstr);
                     }
+                    let browser_cmd = format!("BROWSER={}", shim.launcher.display());
+                    if let Ok(cstr) = CString::new(browser_cmd) {
+                        env_c.push(cstr);
+                    }
+                    browser_shim = Some(shim);
                 }
             }
         }
@@ -678,21 +674,21 @@ pub fn execute_supervised(
             // and later into any helper (`open-url-helper`) that needs to speak
             // IPC back to the unsandboxed parent. `UnixStream::pair()` creates
             // fds with close-on-exec set, so clear it on the child end here.
-            if let Some(fd) = child_sock_fd {
-                if let Err(e) = clear_close_on_exec(fd) {
-                    let detail = format!(
-                        "nono: failed to clear close-on-exec on supervisor socket: {}\n",
-                        e
+            if let Some(fd) = child_sock_fd
+                && let Err(e) = clear_close_on_exec(fd)
+            {
+                let detail = format!(
+                    "nono: failed to clear close-on-exec on supervisor socket: {}\n",
+                    e
+                );
+                let msg = detail.as_bytes();
+                unsafe {
+                    libc::write(
+                        libc::STDERR_FILENO,
+                        msg.as_ptr().cast::<libc::c_void>(),
+                        msg.len(),
                     );
-                    let msg = detail.as_bytes();
-                    unsafe {
-                        libc::write(
-                            libc::STDERR_FILENO,
-                            msg.as_ptr().cast::<libc::c_void>(),
-                            msg.len(),
-                        );
-                        libc::_exit(126);
-                    }
+                    libc::_exit(126);
                 }
             }
 
@@ -767,33 +763,17 @@ pub fn execute_supervised(
                             msg.len(),
                         );
                     }
-                } else if config.capability_elevation {
-                    if let Some(fd) = child_sock_fd {
-                        match nono::sandbox::install_seccomp_notify() {
-                            Ok(notify_fd) => {
-                                if let Err(e) = nono::supervisor::socket::send_fd_via_socket(
-                                    fd,
-                                    notify_fd.as_raw_fd(),
-                                ) {
-                                    let detail = format!(
-                                        "nono: failed to send seccomp notify fd to supervisor: {}\n",
-                                        e
-                                    );
-                                    let msg = detail.as_bytes();
-                                    unsafe {
-                                        libc::write(
-                                            libc::STDERR_FILENO,
-                                            msg.as_ptr().cast::<libc::c_void>(),
-                                            msg.len(),
-                                        );
-                                        libc::_exit(126);
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                // seccomp not available -- proceed without transparent expansion
+                } else if config.capability_elevation
+                    && let Some(fd) = child_sock_fd
+                {
+                    match nono::sandbox::install_seccomp_notify() {
+                        Ok(notify_fd) => {
+                            if let Err(e) = nono::supervisor::socket::send_fd_via_socket(
+                                fd,
+                                notify_fd.as_raw_fd(),
+                            ) {
                                 let detail = format!(
-                                    "nono: seccomp-notify not available, expansion disabled: {}\n",
+                                    "nono: failed to send seccomp notify fd to supervisor: {}\n",
                                     e
                                 );
                                 let msg = detail.as_bytes();
@@ -803,7 +783,23 @@ pub fn execute_supervised(
                                         msg.as_ptr().cast::<libc::c_void>(),
                                         msg.len(),
                                     );
+                                    libc::_exit(126);
                                 }
+                            }
+                        }
+                        Err(e) => {
+                            // seccomp not available -- proceed without transparent expansion
+                            let detail = format!(
+                                "nono: seccomp-notify not available, expansion disabled: {}\n",
+                                e
+                            );
+                            let msg = detail.as_bytes();
+                            unsafe {
+                                libc::write(
+                                    libc::STDERR_FILENO,
+                                    msg.as_ptr().cast::<libc::c_void>(),
+                                    msg.len(),
+                                );
                             }
                         }
                     }
@@ -1293,8 +1289,8 @@ fn build_policy_explanations(
     sandbox_violations: &[nono::SandboxViolation],
     caps: &nono::CapabilitySet,
 ) -> Vec<nono::diagnostic::PolicyExplanation> {
-    use nono::diagnostic::PolicyExplanation;
     use nono::AccessMode;
+    use nono::diagnostic::PolicyExplanation;
     use std::collections::BTreeMap;
 
     // Merge access modes per path so a path denied for both Read and Write
@@ -1332,13 +1328,13 @@ fn build_policy_explanations(
             .or_insert(access);
     }
 
-    if has_keychain_service_violation(sandbox_violations) {
-        if let Some(path) = login_keychain_db_path() {
-            paths
-                .entry(path)
-                .and_modify(|a| *a = merge(*a, AccessMode::Read))
-                .or_insert(AccessMode::Read);
-        }
+    if has_keychain_service_violation(sandbox_violations)
+        && let Some(path) = login_keychain_db_path()
+    {
+        paths
+            .entry(path)
+            .and_modify(|a| *a = merge(*a, AccessMode::Read))
+            .or_insert(AccessMode::Read);
     }
 
     let mut explanations = Vec::new();
@@ -1575,13 +1571,14 @@ fn wait_for_child_with_startup_timeout(
     loop {
         match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
             Ok(WaitStatus::StillAlive) => {
-                if let Some((deadline, timeout_cfg)) = startup_deadline {
-                    if Instant::now() >= deadline && !startup_prompted {
-                        startup_prompted = true;
-                        if prompt_startup_termination_for_child(child, timeout_cfg, true, None) {
-                            let _ = signal::kill(child, Signal::SIGKILL);
-                            return wait_for_child(child);
-                        }
+                if let Some((deadline, timeout_cfg)) = startup_deadline
+                    && Instant::now() >= deadline
+                    && !startup_prompted
+                {
+                    startup_prompted = true;
+                    if prompt_startup_termination_for_child(child, timeout_cfg, true, None) {
+                        let _ = signal::kill(child, Signal::SIGKILL);
+                        return wait_for_child(child);
                     }
                 }
                 std::thread::sleep(Duration::from_millis(200));
@@ -1670,13 +1667,13 @@ fn setup_signal_forwarding(child: Pid, pty_master_fd: Option<i32>) {
             }
         }
 
-        if pty_master_fd.is_some() {
-            if let Err(e) = signal::signal(
+        if pty_master_fd.is_some()
+            && let Err(e) = signal::signal(
                 Signal::SIGWINCH,
                 signal::SigHandler::Handler(forward_signal),
-            ) {
-                debug!("Failed to install SIGWINCH handler: {:?}", e);
-            }
+            )
+        {
+            debug!("Failed to install SIGWINCH handler: {:?}", e);
         }
     }
 }
@@ -1819,12 +1816,12 @@ fn handle_pty_detach_request(
     if in_band_detach_requested {
         info!("PTY detach requested via in-band key sequence");
     }
-    if let Some(p) = pty {
-        if pause_requested || in_band_detach_requested {
-            let in_alt_screen = p.in_alt_screen();
-            if detach_client_for_session(p) {
-                restore_terminal_after_detach(in_alt_screen);
-            }
+    if let Some(p) = pty
+        && (pause_requested || in_band_detach_requested)
+    {
+        let in_alt_screen = p.in_alt_screen();
+        if detach_client_for_session(p) {
+            restore_terminal_after_detach(in_alt_screen);
         }
     }
 }
@@ -1975,17 +1972,17 @@ fn run_supervisor_loop(
                 }
             }
 
-            if let Some(ref mut p) = pty {
-                if !handle_pty_poll_events(
+            if let Some(ref mut p) = pty
+                && !handle_pty_poll_events(
                     p,
                     pfds[1].revents,
                     pfds[2].revents,
                     pfds[3].revents,
                     pfds[4].revents,
                     "supervisor loop",
-                ) {
-                    break;
-                }
+                )
+            {
+                break;
             }
         } else if ret < 0 {
             let err = std::io::Error::last_os_error();
@@ -1996,10 +1993,10 @@ fn run_supervisor_loop(
         }
 
         let pause_requested = drain_pause_pipe();
-        if let Some(ref mut p) = pty {
-            if pause_requested {
-                p.sync_current_terminal_winsize();
-            }
+        if let Some(ref mut p) = pty
+            && pause_requested
+        {
+            p.sync_current_terminal_winsize();
         }
         let in_band_detach_requested = pty.as_mut().is_some_and(|p| p.take_detach_request());
         handle_pty_detach_request(
@@ -2184,49 +2181,45 @@ fn run_supervisor_loop(
                     }
                 }
 
-                if let Some(notify_idx) = notify_idx {
-                    if pfds[notify_idx].revents & libc::POLLIN != 0 {
-                        if let Some(nfd) = notify_raw_fd {
-                            if let Err(e) = supervisor_linux::handle_seccomp_notification(
-                                nfd,
-                                child,
-                                config,
-                                initial_caps,
-                                &mut rate_limiter,
-                                &mut denials,
-                                trust_interceptor.as_mut(),
-                            ) {
-                                debug!("Error handling seccomp notification: {}", e);
-                            }
-                        }
-                    }
+                if let Some(notify_idx) = notify_idx
+                    && pfds[notify_idx].revents & libc::POLLIN != 0
+                    && let Some(nfd) = notify_raw_fd
+                    && let Err(e) = supervisor_linux::handle_seccomp_notification(
+                        nfd,
+                        child,
+                        config,
+                        initial_caps,
+                        &mut rate_limiter,
+                        &mut denials,
+                        trust_interceptor.as_mut(),
+                    )
+                {
+                    debug!("Error handling seccomp notification: {}", e);
                 }
 
-                if let Some(proxy_notify_idx) = proxy_notify_idx {
-                    if pfds[proxy_notify_idx].revents & libc::POLLIN != 0 {
-                        if let Some(pfd) = proxy_notify_raw_fd {
-                            if let Err(e) = supervisor_linux::handle_network_notification(
-                                pfd,
-                                config,
-                                &mut rate_limiter,
-                            ) {
-                                debug!("Error handling proxy seccomp notification: {}", e);
-                            }
-                        }
-                    }
+                if let Some(proxy_notify_idx) = proxy_notify_idx
+                    && pfds[proxy_notify_idx].revents & libc::POLLIN != 0
+                    && let Some(pfd) = proxy_notify_raw_fd
+                    && let Err(e) = supervisor_linux::handle_network_notification(
+                        pfd,
+                        config,
+                        &mut rate_limiter,
+                    )
+                {
+                    debug!("Error handling proxy seccomp notification: {}", e);
                 }
 
-                if let Some(ref mut p) = pty {
-                    if !handle_pty_poll_events(
+                if let Some(ref mut p) = pty
+                    && !handle_pty_poll_events(
                         p,
                         pfds[pty_base_idx].revents,
                         pfds[pty_base_idx + 1].revents,
                         pfds[pty_base_idx + 2].revents,
                         pfds[pty_base_idx + 3].revents,
                         "supervisor loop",
-                    ) {
-                        break;
-                    }
+                    )
+                {
+                    break;
                 }
             }
             std::cmp::Ordering::Less => {
@@ -2240,10 +2233,10 @@ fn run_supervisor_loop(
         }
 
         let pause_requested = drain_pause_pipe();
-        if let Some(ref mut p) = pty {
-            if pause_requested {
-                p.sync_current_terminal_winsize();
-            }
+        if let Some(ref mut p) = pty
+            && pause_requested
+        {
+            p.sync_current_terminal_winsize();
         }
         let in_band_detach_requested = pty.as_mut().is_some_and(|p| p.take_detach_request());
         handle_pty_detach_request(
@@ -2999,13 +2992,13 @@ fn validate_procfs_access(
         )));
     }
 
-    if let Some(component) = sensitive_component {
-        if SELF_BLOCKED_PROC_NAMES.contains(&component) {
-            return Err(OpenPathError::policy_blocked(format!(
-                "Access to {} is blocked by policy",
-                resolved_path.display(),
-            )));
-        }
+    if let Some(component) = sensitive_component
+        && SELF_BLOCKED_PROC_NAMES.contains(&component)
+    {
+        return Err(OpenPathError::policy_blocked(format!(
+            "Access to {} is blocked by policy",
+            resolved_path.display(),
+        )));
     }
 
     Ok(())
@@ -3299,12 +3292,16 @@ mod tests {
 
         crate::profile_save_runtime::configure_prompt_termios(&mut termios);
 
-        assert!(termios
-            .input_flags
-            .contains(InputFlags::ICRNL | InputFlags::IXON));
-        assert!(!termios
-            .input_flags
-            .intersects(InputFlags::IGNBRK | InputFlags::INLCR | InputFlags::IGNCR));
+        assert!(
+            termios
+                .input_flags
+                .contains(InputFlags::ICRNL | InputFlags::IXON)
+        );
+        assert!(
+            !termios
+                .input_flags
+                .intersects(InputFlags::IGNBRK | InputFlags::INLCR | InputFlags::IGNCR)
+        );
         assert!(termios.output_flags.contains(OutputFlags::OPOST));
         assert!(termios.local_flags.contains(
             LocalFlags::ECHO
@@ -3891,11 +3888,13 @@ mod tests {
         // Disallowed origin: must fail validation
         let result = validate_url("https://evil.example.com/phishing", &config);
         assert!(result.is_err());
-        assert!(result
-            .as_ref()
-            .err()
-            .map(|e| e.contains("not in the profile"))
-            .unwrap_or(false));
+        assert!(
+            result
+                .as_ref()
+                .err()
+                .map(|e| e.contains("not in the profile"))
+                .unwrap_or(false)
+        );
     }
 
     #[test]
@@ -3920,11 +3919,13 @@ mod tests {
 
         let result = validate_url("file:///etc/passwd", &config);
         assert!(result.is_err());
-        assert!(result
-            .as_ref()
-            .err()
-            .map(|e| e.contains("Only https://"))
-            .unwrap_or(false));
+        assert!(
+            result
+                .as_ref()
+                .err()
+                .map(|e| e.contains("Only https://"))
+                .unwrap_or(false)
+        );
 
         let result = validate_url("javascript:alert(1)", &config);
         assert!(result.is_err());
@@ -3969,11 +3970,13 @@ mod tests {
         // Localhost denied when not allowed
         let result = validate_url("http://localhost:8080/callback", &config_deny);
         assert!(result.is_err());
-        assert!(result
-            .as_ref()
-            .err()
-            .map(|e| e.contains("not allowed"))
-            .unwrap_or(false));
+        assert!(
+            result
+                .as_ref()
+                .err()
+                .map(|e| e.contains("not allowed"))
+                .unwrap_or(false)
+        );
 
         // Localhost allowed when configured
         let result = validate_url("http://localhost:8080/callback", &config_allow);
@@ -4006,11 +4009,13 @@ mod tests {
         let long_url = format!("https://example.com/{}", "a".repeat(MAX_URL_LENGTH));
         let result = validate_url(&long_url, &config);
         assert!(result.is_err());
-        assert!(result
-            .as_ref()
-            .err()
-            .map(|e| e.contains("maximum length"))
-            .unwrap_or(false));
+        assert!(
+            result
+                .as_ref()
+                .err()
+                .map(|e| e.contains("maximum length"))
+                .unwrap_or(false)
+        );
     }
 
     #[test]

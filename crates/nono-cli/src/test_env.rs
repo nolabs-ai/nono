@@ -25,7 +25,8 @@ impl EnvVarGuard {
             .collect::<Vec<_>>();
 
         for (key, value) in vars {
-            std::env::set_var(key, value);
+            // SAFETY: all callers hold ENV_LOCK, preventing concurrent env mutation.
+            unsafe { std::env::set_var(key, value) };
         }
 
         Self { original }
@@ -42,7 +43,8 @@ impl EnvVarGuard {
             "EnvVarGuard::remove called with unmanaged key: '{key}'. \
              Only keys passed to set_all can be removed."
         );
-        std::env::remove_var(key);
+        // SAFETY: callers hold ENV_LOCK.
+        unsafe { std::env::remove_var(key) };
     }
 }
 
@@ -50,9 +52,10 @@ impl EnvVarGuard {
 impl Drop for EnvVarGuard {
     fn drop(&mut self) {
         for (key, value) in self.original.iter().rev() {
+            // SAFETY: drop runs while ENV_LOCK is still held by the test.
             match value {
-                Some(value) => std::env::set_var(key, value),
-                None => std::env::remove_var(key),
+                Some(value) => unsafe { std::env::set_var(key, value) },
+                None => unsafe { std::env::remove_var(key) },
             }
         }
     }

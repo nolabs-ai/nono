@@ -173,11 +173,7 @@ fn proc_bsd_info(pid: u32) -> Option<ProcBsdInfo> {
             size,
         )
     };
-    if ret == size {
-        Some(info)
-    } else {
-        None
-    }
+    if ret == size { Some(info) } else { None }
 }
 
 fn reconcile_session_record(record: &mut SessionRecord) -> bool {

@@ -235,7 +235,7 @@ fn calculate_dir_size(dir: &Path) -> u64 {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::test_env::{EnvVarGuard, ENV_LOCK};
+    use crate::test_env::{ENV_LOCK, EnvVarGuard};
     use nono::undo::SessionMetadata;
 
     #[test]

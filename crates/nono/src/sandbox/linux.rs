@@ -4,8 +4,8 @@ use crate::capability::{AccessMode, CapabilitySet, NetworkMode, SignalMode};
 use crate::error::{NonoError, Result};
 use crate::sandbox::SupportInfo;
 use landlock::{
-    Access, AccessFs, AccessNet, BitFlags, CompatLevel, Compatible, NetPort, PathBeneath, PathFd,
-    Ruleset, RulesetAttr, RulesetCreatedAttr, Scope, ABI,
+    ABI, Access, AccessFs, AccessNet, BitFlags, CompatLevel, Compatible, NetPort, PathBeneath,
+    PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr, Scope,
 };
 use std::path::Path;
 use std::sync::OnceLock;
@@ -216,11 +216,11 @@ fn detect_wsl2() -> bool {
 
     // Secondary: kernel version string contains "microsoft" or "WSL2"
     // This is written by the kernel build and cannot be spoofed from userspace.
-    if let Ok(version) = std::fs::read_to_string("/proc/version") {
-        if version.contains("microsoft") || version.contains("WSL") {
-            info!("WSL2 detected via /proc/version kernel string");
-            return true;
-        }
+    if let Ok(version) = std::fs::read_to_string("/proc/version")
+        && (version.contains("microsoft") || version.contains("WSL"))
+    {
+        info!("WSL2 detected via /proc/version kernel string");
+        return true;
     }
 
     // WSL_DISTRO_NAME env var is NOT trusted on its own — it is caller-controlled
@@ -2425,9 +2425,11 @@ mod tests {
         let v4 = DetectedAbi::new(ABI::V4);
         let names = v4.feature_names();
         assert!(names.iter().any(|n| n.starts_with("TCP network filtering")));
-        assert!(names
-            .iter()
-            .any(|n| n == "File rename across directories (Refer)"));
+        assert!(
+            names
+                .iter()
+                .any(|n| n == "File rename across directories (Refer)")
+        );
         assert!(names.iter().any(|n| n == "File truncation (Truncate)"));
     }
 

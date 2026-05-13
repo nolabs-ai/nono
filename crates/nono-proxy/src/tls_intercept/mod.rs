@@ -37,7 +37,7 @@ pub mod cert_cache;
 pub mod handle;
 
 pub use acceptor::build_server_config;
-pub use bundle::{write_bundle, BundleInputs};
+pub use bundle::{BundleInputs, write_bundle};
 pub use ca::EphemeralCa;
 pub use cert_cache::CertCache;
-pub use handle::{handle_intercept_connect, InterceptCtx};
+pub use handle::{InterceptCtx, handle_intercept_connect};

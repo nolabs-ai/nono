@@ -29,10 +29,10 @@ serde_json.workspace = true
 tracing.workspace = true
 zeroize.workspace = true
 sha2.workspace = true
-getrandom = "0.4"
+getrandom.workspace = true
 base64 = "0.22"
 subtle = "2"
-url = "2"
+url.workspace = true
 urlencoding = "2"
 globset.workspace = true
 
@@ -60,3 +60,6 @@ time = { version = "0.3", default-features = false, features = ["std"] }
 [dev-dependencies]
 tempfile.workspace = true
 tokio = { version = "1", features = ["test-util", "rt-multi-thread", "macros"] }
+
+[lints]
+workspace = true

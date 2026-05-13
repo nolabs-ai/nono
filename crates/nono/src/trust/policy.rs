@@ -357,10 +357,10 @@ fn find_files_recursive(
             #[cfg(not(unix))]
             let file_id: Option<(u64, u64)> = None;
 
-            if let Some(file_id) = file_id {
-                if !visited.insert(file_id) {
-                    continue;
-                }
+            if let Some(file_id) = file_id
+                && !visited.insert(file_id)
+            {
+                continue;
             }
 
             find_files_recursive(
@@ -377,10 +377,10 @@ fn find_files_recursive(
                 continue;
             }
 
-            if let Ok(relative) = path.strip_prefix(root) {
-                if matcher.is_match(relative) {
-                    results.push(path);
-                }
+            if let Ok(relative) = path.strip_prefix(root)
+                && matcher.is_match(relative)
+            {
+                results.push(path);
             }
         }
     }
@@ -1090,8 +1090,10 @@ mod tests {
         let files = find_included_files(&policy, dir.path()).unwrap();
 
         assert_eq!(files.len(), 2);
-        assert!(files
-            .iter()
-            .all(|path| !path.to_string_lossy().ends_with(".bundle")));
+        assert!(
+            files
+                .iter()
+                .all(|path| !path.to_string_lossy().ends_with(".bundle"))
+        );
     }
 }

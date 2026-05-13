@@ -5,7 +5,7 @@
 //! to be allowed in a nono profile.
 
 use crate::cli::LearnArgs;
-use nono::{try_canonicalize, AccessMode, NonoError, Result};
+use nono::{AccessMode, NonoError, Result, try_canonicalize};
 use std::collections::BTreeSet;
 use std::net::IpAddr;
 use std::path::PathBuf;
@@ -812,10 +812,10 @@ fn parse_nettop_line(line: &str, listening_ports: &HashSet<u16>) -> Option<Netwo
         // than an outbound connection. If the local port matches a known
         // listening port, this is an accepted client connection — the remote
         // address is the client, not a server we're connecting to.
-        if let Some((_, local_port)) = parse_nettop_endpoint(local_part, is_ipv6) {
-            if listening_ports.contains(&local_port) {
-                return None;
-            }
+        if let Some((_, local_port)) = parse_nettop_endpoint(local_part, is_ipv6)
+            && listening_ports.contains(&local_port)
+        {
+            return None;
         }
 
         // Outbound connection — extract remote address and port
@@ -1222,12 +1222,12 @@ fn run_strace(
 
     for line in reader.lines() {
         // Check timeout
-        if let Some(timeout) = timeout_duration {
-            if start.elapsed() > timeout {
-                warn!("Timeout reached, killing child process");
-                let _ = child.kill();
-                break;
-            }
+        if let Some(timeout) = timeout_duration
+            && start.elapsed() > timeout
+        {
+            warn!("Timeout reached, killing child process");
+            let _ = child.kill();
+            break;
         }
 
         let line = match line {
@@ -1442,7 +1442,7 @@ fn unescape_strace_string(s: &str) -> String {
                 }
                 Some('x') => {
                     chars.next(); // consume 'x'
-                                  // Hex escape \xNN - must have exactly 2 hex digits
+                    // Hex escape \xNN - must have exactly 2 hex digits
                     let mut hex = String::new();
                     for _ in 0..2 {
                         if chars.peek().is_some_and(|c| c.is_ascii_hexdigit()) {
@@ -1666,10 +1666,10 @@ fn minimize_learned_entries(learned_entries: &mut BTreeMap<PathBuf, LearnedPathE
 fn is_covered_by_set(path: &Path, allowed: &HashSet<&str>) -> Result<bool> {
     for allowed_path in allowed {
         let allowed_expanded = expand_home(allowed_path)?;
-        if let Ok(allowed_canonical) = std::fs::canonicalize(&allowed_expanded) {
-            if path.starts_with(&allowed_canonical) {
-                return Ok(true);
-            }
+        if let Ok(allowed_canonical) = std::fs::canonicalize(&allowed_expanded)
+            && path.starts_with(&allowed_canonical)
+        {
+            return Ok(true);
         }
         // Also check without canonicalization for paths that may not exist
         let allowed_path_buf = PathBuf::from(&allowed_expanded);
@@ -1685,10 +1685,10 @@ fn is_covered_by_set(path: &Path, allowed: &HashSet<&str>) -> Result<bool> {
 fn is_covered_by_profile(path: &Path, profile_paths: &HashSet<String>) -> Result<bool> {
     for profile_path in profile_paths {
         let expanded = expand_home(profile_path)?;
-        if let Ok(canonical) = std::fs::canonicalize(&expanded) {
-            if path.starts_with(&canonical) {
-                return Ok(true);
-            }
+        if let Ok(canonical) = std::fs::canonicalize(&expanded)
+            && path.starts_with(&canonical)
+        {
+            return Ok(true);
         }
         let path_buf = PathBuf::from(&expanded);
         if path.starts_with(&path_buf) {
@@ -2855,8 +2855,7 @@ mod macos_tests {
 
     #[test]
     fn test_parse_fs_usage_getattrlist() {
-        let line =
-            "14:23:45.123456  getattrlist       /Applications/Safari.app    0.000004   Finder.12345";
+        let line = "14:23:45.123456  getattrlist       /Applications/Safari.app    0.000004   Finder.12345";
         let access = parse_fs_usage_line(line).expect("should parse getattrlist");
         assert_eq!(access.path, PathBuf::from("/Applications/Safari.app"));
         assert!(!access.is_write);

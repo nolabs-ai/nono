@@ -297,10 +297,10 @@ fn parse_violation_line(filter: &ViolationFilter, line: &str) -> Option<SandboxV
 
 #[cfg(target_os = "macos")]
 fn parse_violation_value(filter: &ViolationFilter, value: &Value) -> Option<SandboxViolation> {
-    if let Some(message) = value.get("eventMessage").and_then(Value::as_str) {
-        if let Some(violation) = parse_event_message(filter, message) {
-            return Some(violation);
-        }
+    if let Some(message) = value.get("eventMessage").and_then(Value::as_str)
+        && let Some(violation) = parse_event_message(filter, message)
+    {
+        return Some(violation);
     }
 
     let metadata = value.get("eventMessage").and_then(|event_message| {
@@ -402,7 +402,7 @@ fn parse_event_message(filter: &ViolationFilter, message: &str) -> Option<Sandbo
 
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
-    use super::{parse_event_message, parse_violation_line, ViolationFilter};
+    use super::{ViolationFilter, parse_event_message, parse_violation_line};
 
     fn pid_filter(pid: i32) -> ViolationFilter {
         ViolationFilter {

@@ -405,12 +405,16 @@ mod tests {
         let policy = TrustPolicy::default();
         let mut interceptor = TrustInterceptor::new(policy, dir.path().to_path_buf()).unwrap();
 
-        assert!(interceptor
-            .check_path(Path::new("/tmp/README.md"))
-            .is_none());
-        assert!(interceptor
-            .check_path(Path::new("/tmp/src/main.rs"))
-            .is_none());
+        assert!(
+            interceptor
+                .check_path(Path::new("/tmp/README.md"))
+                .is_none()
+        );
+        assert!(
+            interceptor
+                .check_path(Path::new("/tmp/src/main.rs"))
+                .is_none()
+        );
     }
 
     #[test]
@@ -419,12 +423,16 @@ mod tests {
         let policy = TrustPolicy::default();
         let mut interceptor = TrustInterceptor::new(policy, dir.path().to_path_buf()).unwrap();
 
-        assert!(interceptor
-            .check_path(Path::new("/tmp/SKILLS.md.bundle"))
-            .is_none());
-        assert!(interceptor
-            .check_path(Path::new("/tmp/CLAUDE.md.bundle"))
-            .is_none());
+        assert!(
+            interceptor
+                .check_path(Path::new("/tmp/SKILLS.md.bundle"))
+                .is_none()
+        );
+        assert!(
+            interceptor
+                .check_path(Path::new("/tmp/CLAUDE.md.bundle"))
+                .is_none()
+        );
     }
 
     #[test]
@@ -522,18 +530,24 @@ mod tests {
     #[test]
     fn format_outcome_variants() {
         assert!(format_outcome(&VerificationOutcome::Unsigned).contains("unsigned"));
-        assert!(format_outcome(&VerificationOutcome::Blocked {
-            reason: "test".to_string()
-        })
-        .contains("blocklisted"));
-        assert!(format_outcome(&VerificationOutcome::InvalidSignature {
-            detail: "bad sig".to_string()
-        })
-        .contains("bad sig"));
-        assert!(format_outcome(&VerificationOutcome::DigestMismatch {
-            expected: "a".to_string(),
-            actual: "b".to_string()
-        })
-        .contains("does not match"));
+        assert!(
+            format_outcome(&VerificationOutcome::Blocked {
+                reason: "test".to_string()
+            })
+            .contains("blocklisted")
+        );
+        assert!(
+            format_outcome(&VerificationOutcome::InvalidSignature {
+                detail: "bad sig".to_string()
+            })
+            .contains("bad sig")
+        );
+        assert!(
+            format_outcome(&VerificationOutcome::DigestMismatch {
+                expected: "a".to_string(),
+                actual: "b".to_string()
+            })
+            .contains("does not match")
+        );
     }
 }

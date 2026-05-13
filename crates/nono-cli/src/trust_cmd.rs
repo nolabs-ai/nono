@@ -8,10 +8,10 @@ use crate::cli::{
 };
 use crate::trust_keystore::{self, TrustKeyRef};
 use aws_lc_rs::rand::SystemRandom;
-use aws_lc_rs::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
+use aws_lc_rs::signature::{ECDSA_P256_SHA256_ASN1_SIGNING, EcdsaKeyPair};
 use colored::Colorize;
-use nono::trust;
 use nono::Result;
+use nono::trust;
 use std::path::{Path, PathBuf};
 use tracing::debug;
 use zeroize::Zeroizing;
@@ -817,10 +817,9 @@ fn run_verify(args: TrustVerifyArgs) -> Result<()> {
                     // step cannot be reached with a traversal name even if
                     // the inner guard is somehow bypassed in the future.
                     if let Ok(subject_path) = crate::trust_scan::safe_subject_path(scan_root, name)
+                        && let Ok(canon) = std::fs::canonicalize(&subject_path)
                     {
-                        if let Ok(canon) = std::fs::canonicalize(&subject_path) {
-                            multi_verified_paths.insert(canon);
-                        }
+                        multi_verified_paths.insert(canon);
                     }
                 }
             }
@@ -1354,12 +1353,12 @@ fn load_trust_policy(explicit_path: Option<&Path>) -> Result<trust::TrustPolicy>
         verify_policy_if_exists(&cwd_policy)?;
         let project_policy = trust::load_policy_from_file(&cwd_policy)?;
         // Try to load user-level policy and merge
-        if let Some(user_policy_path) = user_trust_policy_path() {
-            if user_policy_path.exists() {
-                verify_policy_if_exists(&user_policy_path)?;
-                let user_policy = trust::load_policy_from_file(&user_policy_path)?;
-                return trust::merge_policies(&[user_policy, project_policy]);
-            }
+        if let Some(user_policy_path) = user_trust_policy_path()
+            && user_policy_path.exists()
+        {
+            verify_policy_if_exists(&user_policy_path)?;
+            let user_policy = trust::load_policy_from_file(&user_policy_path)?;
+            return trust::merge_policies(&[user_policy, project_policy]);
         }
         let user_path = user_trust_policy_path()
             .map(|p| p.display().to_string())
@@ -1385,11 +1384,11 @@ fn load_trust_policy(explicit_path: Option<&Path>) -> Result<trust::TrustPolicy>
     }
 
     // User-level only
-    if let Some(user_path) = user_trust_policy_path() {
-        if user_path.exists() {
-            verify_policy_if_exists(&user_path)?;
-            return trust::load_policy_from_file(&user_path);
-        }
+    if let Some(user_path) = user_trust_policy_path()
+        && user_path.exists()
+    {
+        verify_policy_if_exists(&user_path)?;
+        return trust::load_policy_from_file(&user_path);
     }
 
     // No policy found — return a default empty policy
@@ -1421,19 +1420,19 @@ fn verify_policy_if_exists(policy_path: &Path) -> Result<()> {
 pub(crate) fn user_trust_policy_path() -> Option<PathBuf> {
     #[cfg(feature = "test-trust-overrides")]
     {
-        if let Some(raw_path) = std::env::var_os(TEST_USER_POLICY_PATH_ENV) {
-            if !raw_path.is_empty() {
-                let path = PathBuf::from(&raw_path);
-                if path.is_absolute() {
-                    return Some(path);
-                }
-
-                tracing::warn!(
-                    "Ignoring invalid {}='{}' (must be absolute), falling back to user config dir",
-                    TEST_USER_POLICY_PATH_ENV,
-                    path.display()
-                );
+        if let Some(raw_path) = std::env::var_os(TEST_USER_POLICY_PATH_ENV)
+            && !raw_path.is_empty()
+        {
+            let path = PathBuf::from(&raw_path);
+            if path.is_absolute() {
+                return Some(path);
             }
+
+            tracing::warn!(
+                "Ignoring invalid {}='{}' (must be absolute), falling back to user config dir",
+                TEST_USER_POLICY_PATH_ENV,
+                path.display()
+            );
         }
     }
 

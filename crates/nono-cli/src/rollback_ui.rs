@@ -5,8 +5,8 @@
 
 use crate::theme;
 use colored::Colorize;
-use nono::undo::{Change, ChangeType, SnapshotManager, SnapshotManifest};
 use nono::Result;
+use nono::undo::{Change, ChangeType, SnapshotManager, SnapshotManifest};
 use std::io::{BufRead, IsTerminal, Write};
 
 /// Run the post-exit rollback review UI.

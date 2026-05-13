@@ -17,7 +17,7 @@ use crate::startup_runtime::{
 use crate::trust_cmd;
 use crate::update_check;
 use crate::why_runtime::run_why;
-use crate::{Result, DETACHED_LAUNCH_ENV};
+use crate::{DETACHED_LAUNCH_ENV, Result};
 
 pub(crate) fn run(cli: Cli) -> Result<()> {
     let mut update_handle = start_update_check_handle(&cli);

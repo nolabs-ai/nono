@@ -436,13 +436,13 @@ fn resolve_single_group(
     }
 
     // Process symlink pairs (Seatbelt-only: macOS symlink → target path handling)
-    if cfg!(target_os = "macos") {
-        if let Some(pairs) = &group.symlink_pairs {
-            for symlink in pairs.keys() {
-                let expanded = expand_path(symlink)?;
-                let escaped = escape_seatbelt_path(path_to_utf8(&expanded)?)?;
-                caps.add_platform_rule(format!("(allow file-read* (subpath \"{}\"))", escaped))?;
-            }
+    if cfg!(target_os = "macos")
+        && let Some(pairs) = &group.symlink_pairs
+    {
+        for symlink in pairs.keys() {
+            let expanded = expand_path(symlink)?;
+            let escaped = escape_seatbelt_path(path_to_utf8(&expanded)?)?;
+            caps.add_platform_rule(format!("(allow file-read* (subpath \"{}\"))", escaped))?;
         }
     }
 
@@ -617,17 +617,17 @@ pub(crate) fn add_deny_access_rules(
     // Seatbelt operates on kernel-resolved paths, so deny rules must use
     // the canonical form. We also keep the original to cover both forms.
     let canonical = path.canonicalize().ok();
-    if let Some(ref canonical) = canonical {
-        if *canonical != path {
-            if should_skip_resolved_deny_target(canonical) {
-                debug!(
-                    "Skipping deny canonical path '{}' (Nix store immutable symlink target of '{}')",
-                    canonical.display(),
-                    path.display(),
-                );
-            } else {
-                deny_paths.push(canonical.clone());
-            }
+    if let Some(ref canonical) = canonical
+        && *canonical != path
+    {
+        if should_skip_resolved_deny_target(canonical) {
+            debug!(
+                "Skipping deny canonical path '{}' (Nix store immutable symlink target of '{}')",
+                canonical.display(),
+                path.display(),
+            );
+        } else {
+            deny_paths.push(canonical.clone());
         }
     }
 
@@ -684,28 +684,27 @@ pub(crate) fn add_deny_access_rules(
         emit_deny_rules(&path, caps)?;
 
         // Emit deny rules for the canonical path too (covers parent symlinks on existing paths)
-        if let Some(ref canonical) = canonical {
-            if *canonical != path {
-                if let Err(e) = emit_deny_rules(canonical, caps) {
-                    warn!(
-                        "Skipping canonical deny rules for {}: {}",
-                        canonical.display(),
-                        e
-                    );
-                }
-            }
+        if let Some(ref canonical) = canonical
+            && *canonical != path
+            && let Err(e) = emit_deny_rules(canonical, caps)
+        {
+            warn!(
+                "Skipping canonical deny rules for {}: {}",
+                canonical.display(),
+                e
+            );
         }
 
         // Emit deny rules for the parent-resolved path (covers non-existent paths
         // whose parents contain symlinks, e.g. /var/run/future.sock -> /private/var/run/future.sock)
-        if let Some(ref resolved) = parent_resolved {
-            if let Err(e) = emit_deny_rules(resolved, caps) {
-                warn!(
-                    "Skipping parent-resolved deny rules for {}: {}",
-                    resolved.display(),
-                    e
-                );
-            }
+        if let Some(ref resolved) = parent_resolved
+            && let Err(e) = emit_deny_rules(resolved, caps)
+        {
+            warn!(
+                "Skipping parent-resolved deny rules for {}: {}",
+                resolved.display(),
+                e
+            );
         }
     }
 
@@ -741,10 +740,10 @@ pub fn apply_macos_keychain_db_exception(caps: &mut CapabilitySet) {
         {
             return true;
         }
-        if let Some(ref user_keychain_dbs) = user_keychain_dbs {
-            if user_keychain_dbs.iter().any(|candidate| path == candidate) {
-                return true;
-            }
+        if let Some(ref user_keychain_dbs) = user_keychain_dbs
+            && user_keychain_dbs.iter().any(|candidate| path == candidate)
+        {
+            return true;
         }
         false
     };
@@ -1207,10 +1206,10 @@ fn find_deny_group_for_path(policy: &Policy, deny_path: &Path) -> Option<String>
                     if expanded == deny_path {
                         return Some(name.clone());
                     }
-                    if let Ok(canonical) = expanded.canonicalize() {
-                        if canonical == *deny_path {
-                            return Some(name.clone());
-                        }
+                    if let Ok(canonical) = expanded.canonicalize()
+                        && canonical == *deny_path
+                    {
+                        return Some(name.clone());
                     }
                 }
             }
@@ -1274,16 +1273,16 @@ pub fn get_sensitive_paths(policy: &Policy) -> Result<Vec<SensitivePathRule>> {
                 // those paths (see add_deny_access_rules). Marking the Nix store
                 // target as sensitive would cause `nono why` to report a false
                 // denial for paths the sandbox actually permits.
-                if expanded.is_symlink() {
-                    if let Ok(resolved) = expanded.canonicalize() {
-                        if resolved != expanded && !should_skip_resolved_deny_target(&resolved) {
-                            result.push(SensitivePathRule {
-                                expanded_path: resolved.to_string_lossy().into_owned(),
-                                group_name: group_name.clone(),
-                                description: group.description.clone(),
-                            });
-                        }
-                    }
+                if expanded.is_symlink()
+                    && let Ok(resolved) = expanded.canonicalize()
+                    && resolved != expanded
+                    && !should_skip_resolved_deny_target(&resolved)
+                {
+                    result.push(SensitivePathRule {
+                        expanded_path: resolved.to_string_lossy().into_owned(),
+                        group_name: group_name.clone(),
+                        description: group.description.clone(),
+                    });
                 }
             }
         }
@@ -1543,35 +1542,45 @@ mod tests {
             .as_ref()
             .expect("claude_code_macos allow missing")
             .readwrite;
-        assert!(claude_code_macos
-            .allow
-            .as_ref()
-            .expect("claude_code_macos allow missing")
-            .read
-            .contains(&"$HOME/.local/share/claude".to_string()));
-        assert!(claude_code_macos
-            .allow
-            .as_ref()
-            .expect("claude_code_macos allow missing")
-            .read
-            .contains(&"$HOME/Applications/Claude Code URL Handler.app".to_string()));
+        assert!(
+            claude_code_macos
+                .allow
+                .as_ref()
+                .expect("claude_code_macos allow missing")
+                .read
+                .contains(&"$HOME/.local/share/claude".to_string())
+        );
+        assert!(
+            claude_code_macos
+                .allow
+                .as_ref()
+                .expect("claude_code_macos allow missing")
+                .read
+                .contains(&"$HOME/Applications/Claude Code URL Handler.app".to_string())
+        );
         assert!(claude_code_macos_paths.contains(&"$HOME/Library/Keychains".to_string()));
-        assert!(claude_code_macos_paths
-            .contains(&"$HOME/Library/Keychains/login.keychain-db".to_string()));
-        assert!(claude_code_macos_paths
-            .contains(&"$HOME/Library/Keychains/metadata.keychain-db".to_string()));
+        assert!(
+            claude_code_macos_paths
+                .contains(&"$HOME/Library/Keychains/login.keychain-db".to_string())
+        );
+        assert!(
+            claude_code_macos_paths
+                .contains(&"$HOME/Library/Keychains/metadata.keychain-db".to_string())
+        );
 
         let claude_code_linux = policy
             .groups
             .get("claude_code_linux")
             .expect("claude_code_linux group missing");
         assert_eq!(claude_code_linux.platform.as_deref(), Some("linux"));
-        assert!(claude_code_linux
-            .allow
-            .as_ref()
-            .expect("claude_code_linux allow missing")
-            .read
-            .contains(&"$HOME/.local/share/claude".to_string()));
+        assert!(
+            claude_code_linux
+                .allow
+                .as_ref()
+                .expect("claude_code_linux allow missing")
+                .read
+                .contains(&"$HOME/.local/share/claude".to_string())
+        );
 
         let vscode_macos = policy
             .groups
@@ -1709,16 +1718,19 @@ mod tests {
         assert!(resolved.is_ok());
 
         if cfg!(target_os = "macos") {
-            assert!(caps
-                .platform_rules()
-                .iter()
-                .any(|r| r.contains("deny file-write-unlink")));
+            assert!(
+                caps.platform_rules()
+                    .iter()
+                    .any(|r| r.contains("deny file-write-unlink"))
+            );
         } else {
             // On Linux, unlink protection is Seatbelt-only
-            assert!(!caps
-                .platform_rules()
-                .iter()
-                .any(|r| r.contains("deny file-write-unlink")));
+            assert!(
+                !caps
+                    .platform_rules()
+                    .iter()
+                    .any(|r| r.contains("deny file-write-unlink"))
+            );
         }
     }
 

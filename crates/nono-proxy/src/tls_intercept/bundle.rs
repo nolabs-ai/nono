@@ -199,7 +199,7 @@ fn write_with_restrictive_perms(path: &Path, contents: &[u8]) -> Result<()> {
 /// a dep but its config API has churned across versions; doing it ourselves
 /// keeps this stable).
 fn base64_chunked(bytes: &[u8]) -> String {
-    use base64::engine::{general_purpose::STANDARD, Engine};
+    use base64::engine::{Engine, general_purpose::STANDARD};
     let encoded = STANDARD.encode(bytes);
     let mut out = String::with_capacity(encoded.len() + encoded.len() / 64 + 1);
     for chunk in encoded.as_bytes().chunks(64) {

@@ -380,7 +380,7 @@ pub fn recv_fd_via_socket(sock_fd: RawFd) -> Result<OwnedFd> {
 pub fn peer_credentials(sock_fd: RawFd) -> Result<PeerCredentials> {
     #[cfg(target_os = "linux")]
     {
-        use libc::{getsockopt, socklen_t, ucred, SOL_SOCKET, SO_PEERCRED};
+        use libc::{SO_PEERCRED, SOL_SOCKET, getsockopt, socklen_t, ucred};
 
         // SAFETY: `ucred` is plain old data and will be written by `getsockopt`.
         let mut cred: ucred = unsafe { std::mem::zeroed() };
@@ -507,16 +507,15 @@ fn umask_guard() -> &'static Mutex<()> {
 impl Drop for SupervisorSocket {
     fn drop(&mut self) {
         // Clean up the socket file if we created one
-        if let Some(ref path) = self.socket_path {
-            if let Err(e) = std::fs::remove_file(path) {
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    warn!(
-                        "Failed to remove supervisor socket path {}: {}",
-                        path.display(),
-                        e
-                    );
-                }
-            }
+        if let Some(ref path) = self.socket_path
+            && let Err(e) = std::fs::remove_file(path)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            warn!(
+                "Failed to remove supervisor socket path {}: {}",
+                path.display(),
+                e
+            );
         }
     }
 }

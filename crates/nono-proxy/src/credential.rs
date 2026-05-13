@@ -406,7 +406,9 @@ mod tests {
                 .collect::<Vec<_>>();
 
             for (key, value) in vars {
-                std::env::set_var(key, value);
+                // SAFETY: test-only helper; tests using EnvVarGuard are
+                // serialised via #[serial] so no concurrent env mutation.
+                unsafe { std::env::set_var(key, value) };
             }
 
             Self { original }
@@ -417,9 +419,10 @@ mod tests {
     impl Drop for EnvVarGuard {
         fn drop(&mut self) {
             for (key, value) in self.original.iter().rev() {
+                // SAFETY: test-only restore; same serialisation guarantee as set_all.
                 match value {
-                    Some(value) => std::env::set_var(key, value),
-                    None => std::env::remove_var(key),
+                    Some(value) => unsafe { std::env::set_var(key, value) },
+                    None => unsafe { std::env::remove_var(key) },
                 }
             }
         }

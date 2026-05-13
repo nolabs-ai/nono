@@ -24,7 +24,7 @@
 use crate::error::{ProxyError, Result};
 use crate::tls_intercept::ca::EphemeralCa;
 use rcgen::{
-    CertificateParams, DistinguishedName, DnType, KeyPair, SanType, PKCS_ECDSA_P256_SHA256,
+    CertificateParams, DistinguishedName, DnType, KeyPair, PKCS_ECDSA_P256_SHA256, SanType,
 };
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert};

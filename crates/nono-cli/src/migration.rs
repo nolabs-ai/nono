@@ -16,7 +16,7 @@
 use crate::cli::PullArgs;
 use crate::package::ProfileProvider;
 use crate::package_cmd;
-use crate::registry_client::{resolve_registry_url, RegistryClient};
+use crate::registry_client::{RegistryClient, resolve_registry_url};
 use colored::Colorize;
 use nono::Result;
 use std::io::{self, BufRead, IsTerminal, Write};
@@ -301,7 +301,7 @@ fn run_pull(pack_ref: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_env::{EnvVarGuard, ENV_LOCK};
+    use crate::test_env::{ENV_LOCK, EnvVarGuard};
 
     #[test]
     fn registry_ref_skips_migration() {

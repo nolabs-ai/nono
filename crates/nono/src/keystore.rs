@@ -129,7 +129,8 @@ const FORBIDDEN_URI_CHARS: &[char] = &[
 ///
 /// let secrets = load_secrets(DEFAULT_SERVICE, &mappings)?;
 /// for secret in secrets {
-///     std::env::set_var(&secret.env_var, secret.value.as_str());
+///     // SAFETY: single-threaded setup before spawning workers.
+///     unsafe { std::env::set_var(&secret.env_var, secret.value.as_str()) };
 /// }
 /// # Ok::<(), nono::NonoError>(())
 /// ```
@@ -534,14 +535,15 @@ pub fn redact_keyring_uri(uri: &str) -> String {
             None => (path, None),
         };
         let mut segments = path_part.splitn(2, '/');
-        if let Some(service) = segments.next() {
-            if !service.is_empty() && segments.next().is_some() {
-                let suffix = match query_part {
-                    Some(q) => format!("?{}", q),
-                    None => String::new(),
-                };
-                return format!("keyring://{}/<redacted>{}", service, suffix);
-            }
+        if let Some(service) = segments.next()
+            && !service.is_empty()
+            && segments.next().is_some()
+        {
+            let suffix = match query_part {
+                Some(q) => format!("?{}", q),
+                None => String::new(),
+            };
+            return format!("keyring://{}/<redacted>{}", service, suffix);
         }
     }
     "keyring://***".to_string()
@@ -964,11 +966,9 @@ fn load_from_op(uri: &str) -> Result<Zeroizing<String>> {
         "1Password CLI",
         "Is 1Password waiting for authentication?",
     )
-    .map_err(|e| {
-        // Kill the process if it timed out
+    .inspect_err(|_| {
         let _ = child.kill();
         let _ = child.wait();
-        e
     })?;
 
     if !output.status.success() {
@@ -1033,10 +1033,9 @@ fn load_from_apple_password(uri: &str) -> Result<Zeroizing<String>> {
             "macOS security CLI",
             "Is Keychain access waiting for user approval?",
         )
-        .map_err(|e| {
+        .inspect_err(|_| {
             let _ = child.kill();
             let _ = child.wait();
-            e
         })?;
 
         if !output.status.success() {
@@ -1222,10 +1221,11 @@ pub fn redact_op_uri(uri: &str) -> String {
 pub fn redact_apple_password_uri(uri: &str) -> String {
     if let Some(path) = strip_apple_password_prefix(uri) {
         let mut segments = path.splitn(2, '/');
-        if let Some(server) = segments.next() {
-            if !server.is_empty() && segments.next().is_some() {
-                return format!("apple-password://{}/<redacted>", server);
-            }
+        if let Some(server) = segments.next()
+            && !server.is_empty()
+            && segments.next().is_some()
+        {
+            return format!("apple-password://{}/<redacted>", server);
         }
     }
     "apple-password://***".to_string()
@@ -1235,10 +1235,10 @@ pub fn redact_apple_password_uri(uri: &str) -> String {
 /// Keeps the directory structure but replaces the filename.
 /// `file:///run/secrets/api-token` → `file:///run/secrets/[REDACTED]`
 pub fn redact_file_uri(uri: &str) -> String {
-    if let Some(path) = uri.strip_prefix(FILE_URI_PREFIX) {
-        if let Some(last_slash) = path.rfind('/') {
-            return format!("{}{}[REDACTED]", FILE_URI_PREFIX, &path[..=last_slash]);
-        }
+    if let Some(path) = uri.strip_prefix(FILE_URI_PREFIX)
+        && let Some(last_slash) = path.rfind('/')
+    {
+        return format!("{}{}[REDACTED]", FILE_URI_PREFIX, &path[..=last_slash]);
     }
     format!("{}[REDACTED]", FILE_URI_PREFIX)
 }

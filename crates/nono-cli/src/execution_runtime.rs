@@ -1,7 +1,7 @@
 use crate::audit_attestation::prepare_audit_signer;
-use crate::launch_runtime::{select_threading_context, LaunchPlan};
+use crate::launch_runtime::{LaunchPlan, select_threading_context};
 use crate::proxy_runtime::start_proxy_runtime;
-use crate::supervised_runtime::{execute_supervised_runtime, SupervisedRuntimeContext};
+use crate::supervised_runtime::{SupervisedRuntimeContext, execute_supervised_runtime};
 use crate::{command_blocking_deprecation, config, exec_strategy, output, sandbox_state};
 use nono::undo::{ContentHash, ExecutableIdentity};
 use nono::{CapabilitySet, NonoError, Result, Sandbox};
@@ -141,10 +141,10 @@ fn startup_timeout_profile<'a>(
     explicit_profile: Option<&str>,
 ) -> Option<&'a str> {
     let recommended = recommended_profile?;
-    if let Some(explicit) = explicit_profile {
-        if explicit == recommended || explicit == format!("{recommended}-local") {
-            return None;
-        }
+    if let Some(explicit) = explicit_profile
+        && (explicit == recommended || explicit == format!("{recommended}-local"))
+    {
+        return None;
     }
     Some(recommended)
 }

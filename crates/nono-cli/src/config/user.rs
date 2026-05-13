@@ -388,10 +388,12 @@ alice = { name = "Alice", fingerprint = "abc123" }
         assert_eq!(config.meta.version, 1);
 
         // Check overrides
-        assert!(config
-            .overrides
-            .sensitive_paths
-            .contains_key("~/.ssh/id_rsa.pub"));
+        assert!(
+            config
+                .overrides
+                .sensitive_paths
+                .contains_key("~/.ssh/id_rsa.pub")
+        );
         let ssh_override = &config.overrides.sensitive_paths["~/.ssh/id_rsa.pub"];
         assert_eq!(ssh_override.reason, "Public key for git");
         assert_eq!(ssh_override.access.as_deref(), Some("read"));

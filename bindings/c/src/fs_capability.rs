@@ -4,7 +4,7 @@ use std::os::raw::c_char;
 
 use crate::capability_set::NonoCapabilitySet;
 use crate::rust_string_to_c;
-use crate::types::{access_mode_to_raw, NonoCapabilitySourceTag, NONO_ACCESS_MODE_INVALID};
+use crate::types::{NONO_ACCESS_MODE_INVALID, NonoCapabilitySourceTag, access_mode_to_raw};
 
 /// Get the number of filesystem capabilities in the set.
 ///
@@ -13,7 +13,7 @@ use crate::types::{access_mode_to_raw, NonoCapabilitySourceTag, NONO_ACCESS_MODE
 /// # Safety
 ///
 /// `caps` must be a valid pointer or NULL.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn nono_capability_set_fs_count(caps: *const NonoCapabilitySet) -> usize {
     if caps.is_null() {
         return 0;
@@ -30,7 +30,7 @@ pub unsafe extern "C" fn nono_capability_set_fs_count(caps: *const NonoCapabilit
 /// # Safety
 ///
 /// `caps` must be a valid pointer or NULL.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn nono_capability_set_fs_original(
     caps: *const NonoCapabilitySet,
     index: usize,
@@ -53,7 +53,7 @@ pub unsafe extern "C" fn nono_capability_set_fs_original(
 /// # Safety
 ///
 /// `caps` must be a valid pointer or NULL.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn nono_capability_set_fs_resolved(
     caps: *const NonoCapabilitySet,
     index: usize,
@@ -77,7 +77,7 @@ pub unsafe extern "C" fn nono_capability_set_fs_resolved(
 /// # Safety
 ///
 /// `caps` must be a valid pointer or NULL.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn nono_capability_set_fs_access(
     caps: *const NonoCapabilitySet,
     index: usize,
@@ -103,7 +103,7 @@ pub unsafe extern "C" fn nono_capability_set_fs_access(
 /// # Safety
 ///
 /// `caps` must be a valid pointer or NULL.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn nono_capability_set_fs_is_file(
     caps: *const NonoCapabilitySet,
     index: usize,
@@ -127,7 +127,7 @@ pub unsafe extern "C" fn nono_capability_set_fs_is_file(
 /// # Safety
 ///
 /// `caps` must be a valid pointer or NULL.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn nono_capability_set_fs_source_tag(
     caps: *const NonoCapabilitySet,
     index: usize,
@@ -161,7 +161,7 @@ pub unsafe extern "C" fn nono_capability_set_fs_source_tag(
 /// # Safety
 ///
 /// `caps` must be a valid pointer or NULL.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn nono_capability_set_fs_source_group_name(
     caps: *const NonoCapabilitySet,
     index: usize,

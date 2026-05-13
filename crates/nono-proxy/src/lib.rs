@@ -34,4 +34,4 @@ pub mod token;
 
 pub use config::ProxyConfig;
 pub use error::{ProxyError, Result};
-pub use server::{start, ProxyHandle};
+pub use server::{ProxyHandle, start};

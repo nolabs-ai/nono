@@ -2,8 +2,8 @@ use crate::cli::LearnArgs;
 #[cfg(target_os = "macos")]
 use crate::command_display::format_command_line;
 use crate::profile_save_runtime::{
-    command_name, confirm, patch_has_policy_overrides, print_patch_preview, print_profile_save,
-    suggested_profile_name, write_profile, PreparedProfileSave, SaveAction,
+    PreparedProfileSave, SaveAction, command_name, confirm, patch_has_policy_overrides,
+    print_patch_preview, print_profile_save, suggested_profile_name, write_profile,
 };
 use crate::{learn, profile};
 use colored::Colorize;
@@ -145,7 +145,9 @@ fn print_macos_run_guidance(args: &LearnArgs, silent: bool) -> Result<()> {
     }
 
     eprintln!();
-    eprintln!("When a path is denied, `nono run` will show diagnostics and offer to save a user profile patch.");
+    eprintln!(
+        "When a path is denied, `nono run` will show diagnostics and offer to save a user profile patch."
+    );
     eprintln!("Legacy unsandboxed tracing remains available with:");
     eprintln!("  nono learn --trace -- {}", command);
 

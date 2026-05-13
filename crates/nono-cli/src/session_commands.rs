@@ -486,14 +486,14 @@ pub fn run_prune(args: &PruneArgs) -> Result<()> {
                     e
                 );
             }
-            if events_file.exists() {
-                if let Err(e) = std::fs::remove_file(&events_file) {
-                    debug!(
-                        "Failed to remove events file {}: {}",
-                        events_file.display(),
-                        e
-                    );
-                }
+            if events_file.exists()
+                && let Err(e) = std::fs::remove_file(&events_file)
+            {
+                debug!(
+                    "Failed to remove events file {}: {}",
+                    events_file.display(),
+                    e
+                );
             }
             eprintln!("Removed: {} (started {})", s.session_id, s.started);
         }

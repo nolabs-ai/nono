@@ -376,12 +376,11 @@ pub async fn handle_reverse_proxy(
 
     let auth_header_lower = cred.map(|c| c.header_name.to_lowercase());
     for (name, value) in &filtered_headers {
-        if let (Some(cred), Some(header_lower)) = (cred, auth_header_lower.as_ref()) {
-            if matches!(cred.inject_mode, InjectMode::Header | InjectMode::BasicAuth)
-                && name.to_lowercase() == *header_lower
-            {
-                continue;
-            }
+        if let (Some(cred), Some(header_lower)) = (cred, auth_header_lower.as_ref())
+            && matches!(cred.inject_mode, InjectMode::Header | InjectMode::BasicAuth)
+            && name.to_lowercase() == *header_lower
+        {
+            continue;
         }
         request.push_str(&format!("{}: {}\r\n", name, value));
     }
@@ -1002,16 +1001,15 @@ fn validate_phantom_token_in_query(
     if let Some(query_start) = path.find('?') {
         let query = &path[query_start + 1..];
         for pair in query.split('&') {
-            if let Some((name, value)) = pair.split_once('=') {
-                if name == param_name {
-                    // URL-decode the value
-                    let decoded = urlencoding::decode(value).unwrap_or_else(|_| value.into());
-                    if token::constant_time_eq(decoded.as_bytes(), session_token.as_bytes()) {
-                        return Ok(());
-                    }
-                    warn!("Invalid phantom token in query parameter '{}'", param_name);
-                    return Err(ProxyError::InvalidToken);
+            if let Some((name, value)) = pair.split_once('=')
+                && name == param_name
+            {
+                let decoded = urlencoding::decode(value).unwrap_or_else(|_| value.into());
+                if token::constant_time_eq(decoded.as_bytes(), session_token.as_bytes()) {
+                    return Ok(());
                 }
+                warn!("Invalid phantom token in query parameter '{}'", param_name);
+                return Err(ProxyError::InvalidToken);
             }
         }
     }
@@ -1141,11 +1139,11 @@ fn transform_query_param(
         let new_query: Vec<String> = query
             .split('&')
             .map(|pair| {
-                if let Some((name, _)) = pair.split_once('=') {
-                    if name == param_name {
-                        found = true;
-                        return format!("{}={}", param_name, encoded_value);
-                    }
+                if let Some((name, _)) = pair.split_once('=')
+                    && name == param_name
+                {
+                    found = true;
+                    return format!("{}={}", param_name, encoded_value);
                 }
                 pair.to_string()
             })
@@ -1837,16 +1835,18 @@ mod tests {
         let path = "/session456/api/v1/namespaces";
 
         // 1. Proxy-side validation succeeds
-        assert!(validate_phantom_token_for_mode(
-            &InjectMode::UrlPath,
-            b"\r\n\r\n", // no auth header needed for url_path mode
-            path,
-            "Authorization",
-            Some("/{}/"),
-            None,
-            &token,
-        )
-        .is_ok());
+        assert!(
+            validate_phantom_token_for_mode(
+                &InjectMode::UrlPath,
+                b"\r\n\r\n", // no auth header needed for url_path mode
+                path,
+                "Authorization",
+                Some("/{}/"),
+                None,
+                &token,
+            )
+            .is_ok()
+        );
 
         // 2. Strip proxy artifacts
         let cleaned = strip_proxy_artifacts(
@@ -1873,16 +1873,18 @@ mod tests {
         let path = "/api/v1/pods?token=session789&limit=100";
 
         // 1. Proxy-side validation succeeds
-        assert!(validate_phantom_token_for_mode(
-            &InjectMode::QueryParam,
-            b"\r\n\r\n",
-            path,
-            "Authorization",
-            None,
-            Some("token"),
-            &token,
-        )
-        .is_ok());
+        assert!(
+            validate_phantom_token_for_mode(
+                &InjectMode::QueryParam,
+                b"\r\n\r\n",
+                path,
+                "Authorization",
+                None,
+                Some("token"),
+                &token,
+            )
+            .is_ok()
+        );
 
         // 2. Strip proxy artifacts
         let cleaned = strip_proxy_artifacts(

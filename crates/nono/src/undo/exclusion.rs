@@ -150,10 +150,10 @@ impl ExclusionFilter {
             } else {
                 // Single component: exact match against each path component
                 for component in path.components() {
-                    if let std::path::Component::Normal(name) = component {
-                        if name.to_string_lossy() == *pattern {
-                            return true;
-                        }
+                    if let std::path::Component::Normal(name) = component
+                        && name.to_string_lossy() == *pattern
+                    {
+                        return true;
                     }
                 }
             }
@@ -163,10 +163,10 @@ impl ExclusionFilter {
 
     /// Check if the filename matches any client-supplied glob pattern.
     fn matches_exclude_globs(&self, path: &Path) -> bool {
-        if let Some(ref globs) = self.exclude_globs {
-            if let Some(filename) = path.file_name() {
-                return globs.is_match(filename);
-            }
+        if let Some(ref globs) = self.exclude_globs
+            && let Some(filename) = path.file_name()
+        {
+            return globs.is_match(filename);
         }
         false
     }
@@ -179,18 +179,16 @@ impl ExclusionFilter {
     fn matches_force_include(&self, path: &Path) -> bool {
         for pattern in &self.force_include {
             if pattern.contains('/') {
-                // Multi-component pattern: substring match on full path
                 let path_str = path.to_string_lossy();
                 if path_str.contains(pattern.as_str()) {
                     return true;
                 }
             } else {
-                // Single component: exact match against each path component
                 for component in path.components() {
-                    if let std::path::Component::Normal(name) = component {
-                        if name.to_string_lossy() == *pattern {
-                            return true;
-                        }
+                    if let std::path::Component::Normal(name) = component
+                        && name.to_string_lossy() == *pattern
+                    {
+                        return true;
                     }
                 }
             }

@@ -143,8 +143,8 @@ fn system_time_to_offset(t: SystemTime) -> Result<OffsetDateTime> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use rustls::pki_types::pem::PemObject;
     use rustls::pki_types::CertificateDer;
+    use rustls::pki_types::pem::PemObject;
 
     #[test]
     fn generate_produces_valid_pem() {

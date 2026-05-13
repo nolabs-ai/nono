@@ -92,8 +92,8 @@ pub fn validate_proxy_auth(header_bytes: &[u8], session_token: &Zeroizing<String
 /// Expected format: base64("username:token"). The username is ignored;
 /// only the password portion is compared against the session token.
 fn validate_basic_auth(encoded: &str, session_token: &Zeroizing<String>) -> Result<()> {
-    use base64::engine::general_purpose::STANDARD;
     use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
 
     let decoded = STANDARD
         .decode(encoded)
@@ -189,8 +189,8 @@ mod tests {
 
     #[test]
     fn test_validate_proxy_auth_basic() {
-        use base64::engine::general_purpose::STANDARD;
         use base64::Engine;
+        use base64::engine::general_purpose::STANDARD;
         let token = Zeroizing::new("abc123".to_string());
         let encoded = STANDARD.encode("nono:abc123");
         let header = format!("Proxy-Authorization: Basic {}\r\n\r\n", encoded);
@@ -199,8 +199,8 @@ mod tests {
 
     #[test]
     fn test_validate_proxy_auth_basic_wrong_password() {
-        use base64::engine::general_purpose::STANDARD;
         use base64::Engine;
+        use base64::engine::general_purpose::STANDARD;
         let token = Zeroizing::new("abc123".to_string());
         let encoded = STANDARD.encode("nono:wrong");
         let header = format!("Proxy-Authorization: Basic {}\r\n\r\n", encoded);
@@ -209,8 +209,8 @@ mod tests {
 
     #[test]
     fn test_validate_proxy_auth_basic_any_username() {
-        use base64::engine::general_purpose::STANDARD;
         use base64::Engine;
+        use base64::engine::general_purpose::STANDARD;
         let token = Zeroizing::new("abc123".to_string());
         // Any username should work — only password matters
         let encoded = STANDARD.encode("whatever:abc123");

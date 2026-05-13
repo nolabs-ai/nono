@@ -277,14 +277,12 @@ fn parse_response_status(data: &[u8]) -> u16 {
 
     if let Ok(line) = std::str::from_utf8(first_line) {
         let mut parts = line.split_whitespace();
-        if let Some(version) = parts.next() {
-            if version.starts_with("HTTP/") {
-                if let Some(code_str) = parts.next() {
-                    if code_str.len() == 3 {
-                        return code_str.parse().unwrap_or(502);
-                    }
-                }
-            }
+        if let Some(version) = parts.next()
+            && version.starts_with("HTTP/")
+            && let Some(code_str) = parts.next()
+            && code_str.len() == 3
+        {
+            return code_str.parse().unwrap_or(502);
         }
     }
     502

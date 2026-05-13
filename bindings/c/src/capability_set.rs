@@ -2,7 +2,7 @@
 
 use std::os::raw::c_char;
 
-use crate::types::{validate_access_mode, NonoErrorCode};
+use crate::types::{NonoErrorCode, validate_access_mode};
 use crate::{c_str_to_str, map_error, rust_string_to_c, set_last_error};
 
 /// Opaque handle to a capability set.
@@ -25,7 +25,7 @@ impl Default for NonoCapabilitySet {
 ///
 /// The returned pointer is never NULL. Caller must free with
 /// `nono_capability_set_free()`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nono_capability_set_new() -> *mut NonoCapabilitySet {
     Box::into_raw(Box::new(NonoCapabilitySet::default()))
 }
@@ -38,7 +38,7 @@ pub extern "C" fn nono_capability_set_new() -> *mut NonoCapabilitySet {
 ///
 /// `caps` must be NULL or a pointer previously returned by
 /// `nono_capability_set_new()` or a factory function.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn nono_capability_set_free(caps: *mut NonoCapabilitySet) {
     if !caps.is_null() {
         // SAFETY: The pointer was created by Box::into_raw() in
@@ -59,7 +59,7 @@ pub unsafe extern "C" fn nono_capability_set_free(caps: *mut NonoCapabilitySet) 
 ///
 /// - `caps` must be a valid pointer from `nono_capability_set_new()`.
 /// - `path` must be a valid null-terminated UTF-8 string.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn nono_capability_set_allow_path(
     caps: *mut NonoCapabilitySet,
     path: *const c_char,
@@ -106,7 +106,7 @@ pub unsafe extern "C" fn nono_capability_set_allow_path(
 ///
 /// - `caps` must be a valid pointer from `nono_capability_set_new()`.
 /// - `path` must be a valid null-terminated UTF-8 string.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn nono_capability_set_allow_file(
     caps: *mut NonoCapabilitySet,
     path: *const c_char,
@@ -151,7 +151,7 @@ pub unsafe extern "C" fn nono_capability_set_allow_file(
 /// # Safety
 ///
 /// `caps` must be a valid pointer from `nono_capability_set_new()`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn nono_capability_set_set_network_blocked(
     caps: *mut NonoCapabilitySet,
     blocked: bool,
@@ -174,7 +174,7 @@ pub unsafe extern "C" fn nono_capability_set_set_network_blocked(
 /// # Safety
 ///
 /// `caps` must be a valid pointer from `nono_capability_set_new()`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn nono_capability_set_set_network_mode(
     caps: *mut NonoCapabilitySet,
     mode: u32,
@@ -203,7 +203,7 @@ pub unsafe extern "C" fn nono_capability_set_set_network_mode(
 /// # Safety
 ///
 /// `caps` must be a valid pointer or NULL.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn nono_capability_set_network_mode(caps: *const NonoCapabilitySet) -> u32 {
     if caps.is_null() {
         return crate::types::NONO_NETWORK_MODE_ALLOW_ALL;
@@ -219,7 +219,7 @@ pub unsafe extern "C" fn nono_capability_set_network_mode(caps: *const NonoCapab
 /// # Safety
 ///
 /// `caps` must be a valid pointer from `nono_capability_set_new()`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn nono_capability_set_set_proxy_port(
     caps: *mut NonoCapabilitySet,
     port: u16,
@@ -244,7 +244,7 @@ pub unsafe extern "C" fn nono_capability_set_set_proxy_port(
 /// # Safety
 ///
 /// `caps` must be a valid pointer or NULL.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn nono_capability_set_proxy_port(caps: *const NonoCapabilitySet) -> u16 {
     if caps.is_null() {
         return 0;
@@ -262,7 +262,7 @@ pub unsafe extern "C" fn nono_capability_set_proxy_port(caps: *const NonoCapabil
 ///
 /// - `caps` must be a valid pointer.
 /// - `cmd` must be a valid null-terminated UTF-8 string.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn nono_capability_set_allow_command(
     caps: *mut NonoCapabilitySet,
     cmd: *const c_char,
@@ -291,7 +291,7 @@ pub unsafe extern "C" fn nono_capability_set_allow_command(
 ///
 /// - `caps` must be a valid pointer.
 /// - `cmd` must be a valid null-terminated UTF-8 string.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn nono_capability_set_block_command(
     caps: *mut NonoCapabilitySet,
     cmd: *const c_char,
@@ -324,7 +324,7 @@ pub unsafe extern "C" fn nono_capability_set_block_command(
 ///
 /// - `caps` must be a valid pointer.
 /// - `rule` must be a valid null-terminated UTF-8 string.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn nono_capability_set_add_platform_rule(
     caps: *mut NonoCapabilitySet,
     rule: *const c_char,
@@ -354,7 +354,7 @@ pub unsafe extern "C" fn nono_capability_set_add_platform_rule(
 /// # Safety
 ///
 /// `caps` must be a valid pointer.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn nono_capability_set_deduplicate(caps: *mut NonoCapabilitySet) {
     if caps.is_null() {
         return;
@@ -371,7 +371,7 @@ pub unsafe extern "C" fn nono_capability_set_deduplicate(caps: *mut NonoCapabili
 ///
 /// - `caps` must be a valid pointer or NULL.
 /// - `path` must be a valid null-terminated UTF-8 string or NULL.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn nono_capability_set_path_covered(
     caps: *const NonoCapabilitySet,
     path: *const c_char,
@@ -396,7 +396,7 @@ pub unsafe extern "C" fn nono_capability_set_path_covered(
 /// # Safety
 ///
 /// `caps` must be a valid pointer or NULL.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn nono_capability_set_is_network_blocked(
     caps: *const NonoCapabilitySet,
 ) -> bool {
@@ -415,7 +415,7 @@ pub unsafe extern "C" fn nono_capability_set_is_network_blocked(
 /// # Safety
 ///
 /// `caps` must be a valid pointer or NULL.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn nono_capability_set_summary(
     caps: *const NonoCapabilitySet,
 ) -> *mut c_char {

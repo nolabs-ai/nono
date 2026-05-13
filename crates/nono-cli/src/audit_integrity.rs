@@ -365,20 +365,20 @@ pub(crate) fn verify_audit_log(
         .map(|count| count == event_count)
         .unwrap_or(true);
 
-    if let Some(stored_head) = stored_chain_head {
-        if Some(stored_head) != computed_chain_head {
-            return Err(NonoError::Snapshot(
-                "Alpha audit log chain head mismatch".to_string(),
-            ));
-        }
+    if let Some(stored_head) = stored_chain_head
+        && Some(stored_head) != computed_chain_head
+    {
+        return Err(NonoError::Snapshot(
+            "Alpha audit log chain head mismatch".to_string(),
+        ));
     }
 
-    if let Some(stored_root) = stored_merkle_root {
-        if Some(stored_root) != computed_merkle_root {
-            return Err(NonoError::Snapshot(
-                "Alpha audit log Merkle root mismatch".to_string(),
-            ));
-        }
+    if let Some(stored_root) = stored_merkle_root
+        && Some(stored_root) != computed_merkle_root
+    {
+        return Err(NonoError::Snapshot(
+            "Alpha audit log Merkle root mismatch".to_string(),
+        ));
     }
 
     Ok(AuditVerificationResult {
@@ -399,9 +399,9 @@ pub(crate) fn verify_audit_log(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use nono::AccessMode;
     use nono::supervisor::{ApprovalDecision, AuditEntry, CapabilityRequest, UrlOpenRequest};
     use nono::undo::{NetworkAuditDecision, NetworkAuditEvent, NetworkAuditMode};
-    use nono::AccessMode;
     use std::path::PathBuf;
     use std::time::{Duration, UNIX_EPOCH};
 
@@ -587,8 +587,9 @@ mod tests {
             Ok(_) => panic!("alpha verification should reject records missing event_json"),
             Err(err) => err,
         };
-        assert!(err
-            .to_string()
-            .contains("missing canonical event_json bytes"));
+        assert!(
+            err.to_string()
+                .contains("missing canonical event_json bytes")
+        );
     }
 }

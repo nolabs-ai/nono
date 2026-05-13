@@ -1,8 +1,8 @@
 use crate::command_display::format_command_line;
 use crate::{profile, query_ext};
 use colored::Colorize;
-use nono::diagnostic::{ErrorObservation, PolicyExplanation};
 use nono::SandboxViolation;
+use nono::diagnostic::{ErrorObservation, PolicyExplanation};
 use nono::{AccessMode, CapabilitySet, NonoError, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, IsTerminal, Write};
@@ -1085,7 +1085,7 @@ pub(crate) fn shorten_path_for_profile(path: &Path, home_path: &Path) -> String 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_env::{EnvVarGuard, ENV_LOCK};
+    use crate::test_env::{ENV_LOCK, EnvVarGuard};
     use tempfile::TempDir;
 
     #[test]

@@ -2,7 +2,7 @@
 
 use crate::package::{self, PackageRef, PackageStatusResponse};
 use crate::profile;
-use crate::registry_client::{resolve_registry_url, RegistryClient};
+use crate::registry_client::{RegistryClient, resolve_registry_url};
 use nono::{NonoError, Result};
 
 #[derive(Clone, Copy, Debug)]

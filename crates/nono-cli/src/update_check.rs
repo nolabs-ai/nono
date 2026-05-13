@@ -140,10 +140,11 @@ pub fn start_background_check() -> Option<UpdateCheckHandle> {
             };
             let _ = save_state(&updated_state);
 
-            if info.update_available && is_newer_version(current, &info.latest_version) {
-                if let Ok(mut guard) = result_clone.lock() {
-                    *guard = Some(info);
-                }
+            if info.update_available
+                && is_newer_version(current, &info.latest_version)
+                && let Ok(mut guard) = result_clone.lock()
+            {
+                *guard = Some(info);
             }
         }
     });

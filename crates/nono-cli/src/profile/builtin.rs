@@ -43,10 +43,12 @@ mod tests {
         let profile = get_builtin("openclaw").expect("Profile not found");
         assert_eq!(profile.meta.name, "openclaw");
         assert!(!profile.network.block); // network allowed
-        assert!(profile
-            .filesystem
-            .allow
-            .contains(&"$HOME/.openclaw".to_string()));
+        assert!(
+            profile
+                .filesystem
+                .allow
+                .contains(&"$HOME/.openclaw".to_string())
+        );
     }
 
     #[test]
@@ -55,14 +57,18 @@ mod tests {
         assert_eq!(profile.meta.name, "opencode");
         assert_eq!(profile.workdir.access, WorkdirAccess::ReadWrite);
         assert!(profile.interactive);
-        assert!(profile
-            .filesystem
-            .allow
-            .contains(&"$HOME/.opencode".to_string()));
-        assert!(profile
-            .filesystem
-            .allow
-            .contains(&"$HOME/.local/share/opentui".to_string()));
+        assert!(
+            profile
+                .filesystem
+                .allow
+                .contains(&"$HOME/.opencode".to_string())
+        );
+        assert!(
+            profile
+                .filesystem
+                .allow
+                .contains(&"$HOME/.local/share/opentui".to_string())
+        );
     }
 
     #[test]
@@ -72,18 +78,24 @@ mod tests {
         assert_eq!(profile.workdir.access, WorkdirAccess::ReadWrite);
         assert!(profile.interactive);
         assert!(!profile.network.block);
-        assert!(profile
-            .filesystem
-            .allow
-            .contains(&"$HOME/.config/swival".to_string()));
-        assert!(profile
-            .groups
-            .include
-            .contains(&"python_runtime".to_string()));
-        assert!(profile
-            .groups
-            .include
-            .contains(&"unlink_protection".to_string()));
+        assert!(
+            profile
+                .filesystem
+                .allow
+                .contains(&"$HOME/.config/swival".to_string())
+        );
+        assert!(
+            profile
+                .groups
+                .include
+                .contains(&"python_runtime".to_string())
+        );
+        assert!(
+            profile
+                .groups
+                .include
+                .contains(&"unlink_protection".to_string())
+        );
     }
 
     #[test]
@@ -131,16 +143,20 @@ mod tests {
         // in v0.43.0 alongside claude-code).
         let profile = get_builtin("opencode").expect("Profile not found");
         // Should have default profile groups (inherited via extends).
-        assert!(profile
-            .groups
-            .include
-            .contains(&"deny_credentials".to_string()));
+        assert!(
+            profile
+                .groups
+                .include
+                .contains(&"deny_credentials".to_string())
+        );
         // Should have profile-specific groups
         assert!(profile.groups.include.contains(&"node_runtime".to_string()));
-        assert!(profile
-            .groups
-            .include
-            .contains(&"unlink_protection".to_string()));
+        assert!(
+            profile
+                .groups
+                .include
+                .contains(&"unlink_protection".to_string())
+        );
     }
 
     #[test]
@@ -207,18 +223,24 @@ mod tests {
     #[test]
     fn test_linux_host_compat_profile_groups() {
         let profile = get_builtin("linux-host-compat").expect("Profile not found");
-        assert!(profile
-            .groups
-            .include
-            .contains(&"linux_runtime_state".to_string()));
-        assert!(profile
-            .groups
-            .include
-            .contains(&"linux_sysfs_read".to_string()));
-        assert!(profile
-            .groups
-            .include
-            .contains(&"linux_temp_read".to_string()));
+        assert!(
+            profile
+                .groups
+                .include
+                .contains(&"linux_runtime_state".to_string())
+        );
+        assert!(
+            profile
+                .groups
+                .include
+                .contains(&"linux_sysfs_read".to_string())
+        );
+        assert!(
+            profile
+                .groups
+                .include
+                .contains(&"linux_temp_read".to_string())
+        );
     }
 
     #[test]

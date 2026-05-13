@@ -350,11 +350,7 @@ impl Enforcement {
     /// Used during policy merging: project-level cannot weaken user-level.
     #[must_use]
     pub fn strictest(self, other: Self) -> Self {
-        if self >= other {
-            self
-        } else {
-            other
-        }
+        if self >= other { self } else { other }
     }
 
     /// Whether this enforcement mode blocks access on failure.

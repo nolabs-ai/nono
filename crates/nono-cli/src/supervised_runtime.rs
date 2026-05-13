@@ -4,12 +4,12 @@ use crate::launch_runtime::{
     ProxyLaunchOptions, RollbackLaunchOptions, SessionLaunchOptions, TrustLaunchOptions,
 };
 use crate::rollback_runtime::{
-    create_audit_state, finalize_supervised_exit, initialize_audit_snapshots,
-    initialize_rollback_state, warn_if_rollback_flags_ignored, AuditState, RollbackExitContext,
+    AuditState, RollbackExitContext, create_audit_state, finalize_supervised_exit,
+    initialize_audit_snapshots, initialize_rollback_state, warn_if_rollback_flags_ignored,
 };
 use crate::{
-    exec_strategy, output, protected_paths, pty_proxy, session, terminal_approval, trust_intercept,
-    DETACHED_SESSION_ID_ENV,
+    DETACHED_SESSION_ID_ENV, exec_strategy, output, protected_paths, pty_proxy, session,
+    terminal_approval, trust_intercept,
 };
 use colored::Colorize;
 use nono::undo::ExecutableIdentity;

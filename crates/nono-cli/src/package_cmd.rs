@@ -5,7 +5,7 @@ use crate::package::{
     self, ArtifactEntry, ArtifactType, LockedArtifact, LockedPackage, PackageManifest,
     PackageProvenance, PackageRef, PullResponse,
 };
-use crate::registry_client::{resolve_registry_url, RegistryClient};
+use crate::registry_client::{RegistryClient, resolve_registry_url};
 use chrono::{DateTime, Local, Utc};
 use nono::{NonoError, Result, SignerIdentity};
 use semver::Version;
@@ -25,15 +25,16 @@ pub fn run_pull(args: PullArgs) -> Result<()> {
     validate_pull_response(&package_ref, &pull)?;
 
     let lockfile = package::read_lockfile()?;
-    if let Some(existing) = lockfile.packages.get(&package_ref.key()) {
-        if existing.version == pull.version && !args.force {
-            eprintln!(
-                "  {} is already at {} (use --force to reinstall)",
-                package_ref.key(),
-                pull.version
-            );
-            return Ok(());
-        }
+    if let Some(existing) = lockfile.packages.get(&package_ref.key())
+        && existing.version == pull.version
+        && !args.force
+    {
+        eprintln!(
+            "  {} is already at {} (use --force to reinstall)",
+            package_ref.key(),
+            pull.version
+        );
+        return Ok(());
     }
 
     let printer = crate::pull_ui::ProgressPrinter::new(&pull);
@@ -61,20 +62,20 @@ pub fn run_pull(args: PullArgs) -> Result<()> {
     // If reversal fails for any record, abort the re-pull (do not
     // proceed to apply the new directives). The lockfile entry stays
     // intact so the user can investigate.
-    if let Some(prior_pkg) = lockfile.packages.get(&package_ref.key()) {
-        if !prior_pkg.wiring_record.is_empty() {
-            let failures = crate::wiring::reverse(&prior_pkg.wiring_record);
-            if !failures.is_empty() {
-                for f in &failures {
-                    eprintln!("    failed: {} — {}", f.record_summary, f.error);
-                }
-                return Err(NonoError::PackageInstall(format!(
-                    "re-pull of {} aborted — {} prior wiring directive(s) failed to reverse. \
-                     Resolve the failures above (or `nono remove --force` first) before retrying.",
-                    package_ref.key(),
-                    failures.len()
-                )));
+    if let Some(prior_pkg) = lockfile.packages.get(&package_ref.key())
+        && !prior_pkg.wiring_record.is_empty()
+    {
+        let failures = crate::wiring::reverse(&prior_pkg.wiring_record);
+        if !failures.is_empty() {
+            for f in &failures {
+                eprintln!("    failed: {} — {}", f.record_summary, f.error);
             }
+            return Err(NonoError::PackageInstall(format!(
+                "re-pull of {} aborted — {} prior wiring directive(s) failed to reverse. \
+                     Resolve the failures above (or `nono remove --force` first) before retrying.",
+                package_ref.key(),
+                failures.len()
+            )));
         }
     }
 
@@ -151,32 +152,32 @@ pub fn run_remove(args: RemoveArgs) -> Result<()> {
     // the failures and proceed — the lockfile entry is still
     // dropped, leaving any orphaned wiring as the user's problem
     // (typically because the user already cleaned it up by hand).
-    if let Some(pkg) = locked_pkg {
-        if !pkg.wiring_record.is_empty() {
-            let failures = crate::wiring::reverse(&pkg.wiring_record);
-            let total = pkg.wiring_record.len();
-            let succeeded = total.saturating_sub(failures.len());
-            eprintln!("  reversed {succeeded}/{total} wiring directive(s)",);
-            if !failures.is_empty() {
-                for f in &failures {
-                    eprintln!("    failed: {} — {}", f.record_summary, f.error);
-                }
-                if !args.force {
-                    return Err(NonoError::PackageInstall(format!(
-                        "remove of {} aborted — {} wiring directive(s) failed to reverse. \
+    if let Some(pkg) = locked_pkg
+        && !pkg.wiring_record.is_empty()
+    {
+        let failures = crate::wiring::reverse(&pkg.wiring_record);
+        let total = pkg.wiring_record.len();
+        let succeeded = total.saturating_sub(failures.len());
+        eprintln!("  reversed {succeeded}/{total} wiring directive(s)",);
+        if !failures.is_empty() {
+            for f in &failures {
+                eprintln!("    failed: {} — {}", f.record_summary, f.error);
+            }
+            if !args.force {
+                return Err(NonoError::PackageInstall(format!(
+                    "remove of {} aborted — {} wiring directive(s) failed to reverse. \
                          The lockfile entry has been preserved so you can retry. \
                          Inspect the failures above and either resolve them and re-run, \
                          or pass --force to drop the lockfile entry and accept any \
                          orphaned wiring.",
-                        package_ref.key(),
-                        failures.len()
-                    )));
-                }
-                eprintln!(
-                    "  --force: dropping lockfile entry despite {} failed reversal(s)",
+                    package_ref.key(),
                     failures.len()
-                );
+                )));
             }
+            eprintln!(
+                "  --force: dropping lockfile entry despite {} failed reversal(s)",
+                failures.len()
+            );
         }
     }
 
@@ -186,10 +187,11 @@ pub fn run_remove(args: RemoveArgs) -> Result<()> {
     }
 
     // Clean up empty namespace directory.
-    if let Some(ns_dir) = install_dir.parent() {
-        if ns_dir.exists() && is_dir_empty(ns_dir) {
-            let _ = fs::remove_dir(ns_dir);
-        }
+    if let Some(ns_dir) = install_dir.parent()
+        && ns_dir.exists()
+        && is_dir_empty(ns_dir)
+    {
+        let _ = fs::remove_dir(ns_dir);
     }
 
     package::remove_package_from_lockfile(&package_ref)?;
@@ -471,14 +473,14 @@ fn validate_manifest(manifest: &PackageManifest) -> Result<()> {
         )));
     }
 
-    if let Some(min_version) = &manifest.min_nono_version {
-        if compare_versions(env!("CARGO_PKG_VERSION"), min_version)?.is_lt() {
-            return Err(NonoError::PackageInstall(format!(
-                "package requires nono >= {}, current version is {}",
-                min_version,
-                env!("CARGO_PKG_VERSION")
-            )));
-        }
+    if let Some(min_version) = &manifest.min_nono_version
+        && compare_versions(env!("CARGO_PKG_VERSION"), min_version)?.is_lt()
+    {
+        return Err(NonoError::PackageInstall(format!(
+            "package requires nono >= {}, current version is {}",
+            min_version,
+            env!("CARGO_PKG_VERSION")
+        )));
     }
 
     Ok(())
@@ -778,20 +780,18 @@ fn enforce_signer_pinning(
         return Ok(());
     }
 
-    if let Some(existing) = existing {
-        if let Some(provenance) = &existing.provenance {
-            if canonical_signer_identity(&provenance.signer_identity)
-                != canonical_signer_identity(signer_identity)
-            {
-                return Err(NonoError::PackageVerification {
-                    package: provenance.repository.clone(),
-                    reason: format!(
-                        "signer identity changed from '{}' to '{}'",
-                        provenance.signer_identity, signer_identity
-                    ),
-                });
-            }
-        }
+    if let Some(existing) = existing
+        && let Some(provenance) = &existing.provenance
+        && canonical_signer_identity(&provenance.signer_identity)
+            != canonical_signer_identity(signer_identity)
+    {
+        return Err(NonoError::PackageVerification {
+            package: provenance.repository.clone(),
+            reason: format!(
+                "signer identity changed from '{}' to '{}'",
+                provenance.signer_identity, signer_identity
+            ),
+        });
     }
 
     Ok(())

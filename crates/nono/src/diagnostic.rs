@@ -157,12 +157,12 @@ fn sanitize_for_diagnostic(s: &str) -> String {
     while let Some(c) = chars.next() {
         if c == '\x1b' {
             // Skip ESC and the entire escape sequence
-            if let Some(next) = chars.next() {
-                if next == '[' {
-                    for seq_char in chars.by_ref() {
-                        if seq_char.is_ascii_alphabetic() {
-                            break;
-                        }
+            if let Some(next) = chars.next()
+                && next == '['
+            {
+                for seq_char in chars.by_ref() {
+                    if seq_char.is_ascii_alphabetic() {
+                        break;
                     }
                 }
             }
@@ -313,10 +313,10 @@ fn detect_protected_file_in_error_line(
     error_line: &str,
 ) -> Option<String> {
     for path in protected_paths {
-        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-            if error_line.contains(name) {
-                return Some(name.to_string());
-            }
+        if let Some(name) = path.file_name().and_then(|n| n.to_str())
+            && error_line.contains(name)
+        {
+            return Some(name.to_string());
         }
     }
     None
@@ -556,13 +556,13 @@ fn extract_path_from_segment(segment: &str) -> Option<PathBuf> {
 fn infer_access_from_error_line(line: &str, path: &Path) -> AccessMode {
     let lower = line.to_ascii_lowercase();
 
-    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-        if matches!(
+    if let Some(name) = path.file_name().and_then(|n| n.to_str())
+        && matches!(
             name,
             ".profile" | ".bash_profile" | ".bashrc" | ".zprofile" | ".zshrc" | ".zlogin"
-        ) {
-            return AccessMode::Read;
-        }
+        )
+    {
+        return AccessMode::Read;
     }
 
     if lower.contains("cannot create")
@@ -1029,11 +1029,11 @@ impl<'a> DiagnosticFormatter<'a> {
         }
         lines.push("[nono]".to_string());
 
-        if self.blocked_protected_file.is_none() {
-            if let Some(verdict) = primary_verdict.as_ref() {
-                self.format_primary_verdict_guidance(&mut lines, verdict);
-                lines.push("[nono]".to_string());
-            }
+        if self.blocked_protected_file.is_none()
+            && let Some(verdict) = primary_verdict.as_ref()
+        {
+            self.format_primary_verdict_guidance(&mut lines, verdict);
+            lines.push("[nono]".to_string());
         }
 
         // Concise policy summary: show user paths, summarize system/group paths
@@ -1977,11 +1977,7 @@ fn stricter_reason(a: DenialReason, b: DenialReason) -> DenialReason {
             DenialReason::BackendError => 1,
         }
     }
-    if rank(&a) >= rank(&b) {
-        a
-    } else {
-        b
-    }
+    if rank(&a) >= rank(&b) { a } else { b }
 }
 
 /// Map a Seatbelt operation name to an `AccessMode`.
@@ -2900,7 +2896,9 @@ mod tests {
         );
         assert!(output.contains(&missing.display().to_string()));
         assert!(output.contains("To grant additional access, re-run with:"));
-        assert!(output.contains("Query policy: nono why --path <path> --op <read|write|readwrite>"));
+        assert!(
+            output.contains("Query policy: nono why --path <path> --op <read|write|readwrite>")
+        );
     }
 
     #[test]

@@ -675,10 +675,12 @@ mod tests {
         let envelope = DsseEnvelope::from_json(&json).unwrap();
         let result = envelope.extract_statement();
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("unexpected DSSE payloadType"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("unexpected DSSE payloadType")
+        );
     }
 
     #[test]
@@ -884,10 +886,12 @@ mod tests {
         let stmt = InTotoStatement::from_json(&json).unwrap();
         let result = stmt.extract_signer();
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("unknown signer kind"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("unknown signer kind")
+        );
     }
 
     #[test]

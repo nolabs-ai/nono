@@ -4,8 +4,8 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use tracing_subscriber::fmt::writer::MakeWriter;
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::fmt::writer::MakeWriter;
 
 pub(crate) fn normalize_legacy_flag_env_vars() {
     copy_legacy_env_var("NONO_NET_BLOCK", "NONO_BLOCK_NET");
@@ -123,7 +123,9 @@ fn copy_legacy_env_var(old: &str, new: &str) {
     }
 
     if let Some(value) = std::env::var_os(old) {
-        std::env::set_var(new, value);
+        // SAFETY: called during single-threaded CLI bootstrap, before any
+        // threads are spawned.
+        unsafe { std::env::set_var(new, value) };
     }
 }
 

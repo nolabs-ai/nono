@@ -20,8 +20,8 @@ use crate::tls_intercept::{self, CertCache, EphemeralCa};
 use crate::token;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
@@ -664,49 +664,50 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
         //
         // Anything else (host not matching any route) falls through to the
         // existing transparent-tunnel / external-proxy paths.
-        if !state.route_store.is_empty() {
-            if let Some(authority) = first_line.split_whitespace().nth(1) {
-                // Normalise authority to host:port. Handle IPv6 brackets:
-                // "[::1]:443" already has port, "[::1]" needs default, "host:443" has port.
-                let host_port = if authority.starts_with('[') {
-                    if authority.contains("]:") {
-                        authority.to_lowercase()
-                    } else {
-                        format!("{}:443", authority.to_lowercase())
-                    }
-                } else if authority.contains(':') {
+        if !state.route_store.is_empty()
+            && let Some(authority) = first_line.split_whitespace().nth(1)
+        {
+            // Normalise authority to host:port. Handle IPv6 brackets:
+            // "[::1]:443" already has port, "[::1]" needs default, "host:443" has port.
+            let host_port = if authority.starts_with('[') {
+                if authority.contains("]:") {
                     authority.to_lowercase()
                 } else {
                     format!("{}:443", authority.to_lowercase())
-                };
+                }
+            } else if authority.contains(':') {
+                authority.to_lowercase()
+            } else {
+                format!("{}:443", authority.to_lowercase())
+            };
 
-                if state.route_store.is_route_upstream(&host_port) {
-                    let route_id = state
-                        .route_store
-                        .lookup_by_upstream(&host_port)
-                        .map(|(prefix, _)| prefix);
-                    let (host, port) = host_port
-                        .rsplit_once(':')
-                        .map(|(h, p)| (h.to_string(), p.parse::<u16>().unwrap_or(443)))
-                        .unwrap_or_else(|| (host_port.clone(), 443));
+            if state.route_store.is_route_upstream(&host_port) {
+                let route_id = state
+                    .route_store
+                    .lookup_by_upstream(&host_port)
+                    .map(|(prefix, _)| prefix);
+                let (host, port) = host_port
+                    .rsplit_once(':')
+                    .map(|(h, p)| (h.to_string(), p.parse::<u16>().unwrap_or(443)))
+                    .unwrap_or_else(|| (host_port.clone(), 443));
 
-                    let intercept_eligible = state.route_store.has_intercept_route(&host_port);
+                let intercept_eligible = state.route_store.has_intercept_route(&host_port);
 
-                    match (intercept_eligible, state.cert_cache.as_ref()) {
-                        // Case 1: intercept-eligible route + cert cache available.
-                        (true, Some(cache)) => {
-                            // Strict OUTER auth: intercept is a privileged op
-                            // (we mint a leaf cert and decrypt traffic), so
-                            // unlike the lenient transparent-tunnel path we
-                            // require Proxy-Authorization here.
-                            if let Err(e) =
-                                token::validate_proxy_auth(&header_bytes, &state.session_token)
-                            {
-                                debug!(
-                                    "tls_intercept: rejecting CONNECT to {}:{} — {}",
-                                    host, port, e
-                                );
-                                audit::log_denied(
+                match (intercept_eligible, state.cert_cache.as_ref()) {
+                    // Case 1: intercept-eligible route + cert cache available.
+                    (true, Some(cache)) => {
+                        // Strict OUTER auth: intercept is a privileged op
+                        // (we mint a leaf cert and decrypt traffic), so
+                        // unlike the lenient transparent-tunnel path we
+                        // require Proxy-Authorization here.
+                        if let Err(e) =
+                            token::validate_proxy_auth(&header_bytes, &state.session_token)
+                        {
+                            debug!(
+                                "tls_intercept: rejecting CONNECT to {}:{} — {}",
+                                host, port, e
+                            );
+                            audit::log_denied(
                                     Some(&state.audit_log),
                                     audit::ProxyMode::ConnectIntercept,
                                     &audit::EventContext {
@@ -726,51 +727,50 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
                                     port,
                                     "proxy auth missing or invalid",
                                 );
-                                let response = "HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"nono\"\r\nContent-Length: 0\r\n\r\n";
-                                stream.write_all(response.as_bytes()).await?;
-                                return Ok(());
-                            }
-
-                            let ctx = tls_intercept::InterceptCtx {
-                                route_id,
-                                host: &host,
-                                port,
-                                route_store: &state.route_store,
-                                credential_store: &state.credential_store,
-                                session_token: &state.session_token,
-                                cert_cache: Arc::clone(cache),
-                                tls_connector: &state.tls_connector,
-                                filter: &state.filter,
-                                audit_log: Some(&state.audit_log),
-                            };
-                            return tls_intercept::handle_intercept_connect(&mut stream, ctx).await;
-                        }
-                        // Case 2 & 3: route exists but interception is unavailable
-                        // or the route is purely declarative — keep the existing
-                        // 403 to force SDK cooperation with the reverse-proxy path.
-                        _ => {
-                            debug!(
-                                "Blocked CONNECT to route upstream {} — use reverse proxy path instead",
-                                authority
-                            );
-                            audit::log_denied(
-                                Some(&state.audit_log),
-                                audit::ProxyMode::Connect,
-                                &audit::EventContext {
-                                    route_id,
-                                    denial_category: Some(
-                                        nono::undo::NetworkAuditDenialCategory::ConnectBypassesL7,
-                                    ),
-                                    ..audit::EventContext::default()
-                                },
-                                &host,
-                                port,
-                                "route upstream: CONNECT bypasses L7 filtering",
-                            );
-                            let response = "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n";
+                            let response = "HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"nono\"\r\nContent-Length: 0\r\n\r\n";
                             stream.write_all(response.as_bytes()).await?;
                             return Ok(());
                         }
+
+                        let ctx = tls_intercept::InterceptCtx {
+                            route_id,
+                            host: &host,
+                            port,
+                            route_store: &state.route_store,
+                            credential_store: &state.credential_store,
+                            session_token: &state.session_token,
+                            cert_cache: Arc::clone(cache),
+                            tls_connector: &state.tls_connector,
+                            filter: &state.filter,
+                            audit_log: Some(&state.audit_log),
+                        };
+                        return tls_intercept::handle_intercept_connect(&mut stream, ctx).await;
+                    }
+                    // Case 2 & 3: route exists but interception is unavailable
+                    // or the route is purely declarative — keep the existing
+                    // 403 to force SDK cooperation with the reverse-proxy path.
+                    _ => {
+                        debug!(
+                            "Blocked CONNECT to route upstream {} — use reverse proxy path instead",
+                            authority
+                        );
+                        audit::log_denied(
+                            Some(&state.audit_log),
+                            audit::ProxyMode::Connect,
+                            &audit::EventContext {
+                                route_id,
+                                denial_category: Some(
+                                    nono::undo::NetworkAuditDenialCategory::ConnectBypassesL7,
+                                ),
+                                ..audit::EventContext::default()
+                            },
+                            &host,
+                            port,
+                            "route upstream: CONNECT bypasses L7 filtering",
+                        );
+                        let response = "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n";
+                        stream.write_all(response.as_bytes()).await?;
+                        return Ok(());
                     }
                 }
             }
@@ -1490,7 +1490,9 @@ mod tests {
         };
         let vars_no_env_var = handle_no_env_var.credential_env_vars(&config_no_env_var);
         assert!(
-            vars_no_env_var.iter().all(|(k, _)| k != "ANTHROPIC_API_KEY"),
+            vars_no_env_var
+                .iter()
+                .all(|(k, _)| k != "ANTHROPIC_API_KEY"),
             "pre-fix: ANTHROPIC_API_KEY must not be set when neither env_var nor credential_key is defined (bug reproduced)"
         );
 

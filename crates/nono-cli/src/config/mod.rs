@@ -140,74 +140,102 @@ mod tests {
 
     #[test]
     fn test_check_blocked_command_basic() {
-        assert!(check_blocked_command("echo", &[], &[])
-            .expect("should not fail")
-            .is_none());
-        assert!(check_blocked_command("ls", &[], &[])
-            .expect("should not fail")
-            .is_none());
+        assert!(
+            check_blocked_command("echo", &[], &[])
+                .expect("should not fail")
+                .is_none()
+        );
+        assert!(
+            check_blocked_command("ls", &[], &[])
+                .expect("should not fail")
+                .is_none()
+        );
     }
 
     #[test]
     fn test_check_blocked_command_with_path() {
         let blocked = vec!["rm".to_string(), "dd".to_string()];
-        assert!(check_blocked_command("/bin/rm", &[], &blocked)
-            .expect("should not fail")
-            .is_some());
-        assert!(check_blocked_command("/usr/bin/dd", &[], &blocked)
-            .expect("should not fail")
-            .is_some());
+        assert!(
+            check_blocked_command("/bin/rm", &[], &blocked)
+                .expect("should not fail")
+                .is_some()
+        );
+        assert!(
+            check_blocked_command("/usr/bin/dd", &[], &blocked)
+                .expect("should not fail")
+                .is_some()
+        );
     }
 
     #[test]
     fn test_check_blocked_command_with_override() {
         let allowed = vec!["rm".to_string()];
         let blocked = vec!["rm".to_string(), "dd".to_string()];
-        assert!(check_blocked_command("rm", &allowed, &blocked)
-            .expect("should not fail")
-            .is_none());
-        assert!(check_blocked_command("dd", &allowed, &blocked)
-            .expect("should not fail")
-            .is_some());
+        assert!(
+            check_blocked_command("rm", &allowed, &blocked)
+                .expect("should not fail")
+                .is_none()
+        );
+        assert!(
+            check_blocked_command("dd", &allowed, &blocked)
+                .expect("should not fail")
+                .is_some()
+        );
     }
 
     #[test]
     fn test_check_blocked_command_extra_blocked() {
         let extra = vec!["custom-dangerous".to_string()];
-        assert!(check_blocked_command("custom-dangerous", &[], &extra)
-            .expect("should not fail")
-            .is_some());
-        assert!(check_blocked_command("rm", &[], &extra)
-            .expect("should not fail")
-            .is_none());
+        assert!(
+            check_blocked_command("custom-dangerous", &[], &extra)
+                .expect("should not fail")
+                .is_some()
+        );
+        assert!(
+            check_blocked_command("rm", &[], &extra)
+                .expect("should not fail")
+                .is_none()
+        );
     }
 
     #[test]
     fn test_check_blocked_command_only_uses_resolved_policy() {
-        assert!(check_blocked_command("rm", &[], &[])
-            .expect("should not fail")
-            .is_none());
+        assert!(
+            check_blocked_command("rm", &[], &[])
+                .expect("should not fail")
+                .is_none()
+        );
     }
 
     #[test]
     fn test_check_sensitive_path() {
-        assert!(check_sensitive_path("~/.ssh")
-            .expect("should not fail")
-            .is_some());
-        assert!(check_sensitive_path("~/.aws")
-            .expect("should not fail")
-            .is_some());
-        assert!(check_sensitive_path("~/.bashrc")
-            .expect("should not fail")
-            .is_some());
+        assert!(
+            check_sensitive_path("~/.ssh")
+                .expect("should not fail")
+                .is_some()
+        );
+        assert!(
+            check_sensitive_path("~/.aws")
+                .expect("should not fail")
+                .is_some()
+        );
+        assert!(
+            check_sensitive_path("~/.bashrc")
+                .expect("should not fail")
+                .is_some()
+        );
         // /tmp is a system path, not sensitive
-        assert!(check_sensitive_path("/tmp")
-            .expect("should not fail")
-            .is_none());
+        assert!(
+            check_sensitive_path("/tmp")
+                .expect("should not fail")
+                .is_none()
+        );
         // ~/Documents is not sensitive
-        assert!(check_sensitive_path("~/Documents")
-            .expect("should not fail")
-            .is_none());
+        assert!(
+            check_sensitive_path("~/Documents")
+                .expect("should not fail")
+                .is_none()
+        );
     }
 
     #[test]
@@ -215,13 +243,17 @@ mod tests {
         // ~/.sshevil must NOT match ~/.ssh (component-wise comparison)
         let home = validated_home().expect("HOME must be set");
         let evil_path = format!("{}/.sshevil", home);
-        assert!(check_sensitive_path(&evil_path)
-            .expect("should not fail")
-            .is_none());
+        assert!(
+            check_sensitive_path(&evil_path)
+                .expect("should not fail")
+                .is_none()
+        );
 
         // But ~/.ssh/id_rsa should match ~/.ssh
-        assert!(check_sensitive_path("~/.ssh/id_rsa")
-            .expect("should not fail")
-            .is_some());
+        assert!(
+            check_sensitive_path("~/.ssh/id_rsa")
+                .expect("should not fail")
+                .is_some()
+        );
     }
 }

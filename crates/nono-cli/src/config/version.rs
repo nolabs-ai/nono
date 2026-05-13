@@ -77,14 +77,14 @@ impl VersionTracker {
     ///
     /// Returns Ok(()) if version is acceptable, Err if it's a downgrade attack.
     pub fn check_version(&self, name: &str, version: u64) -> Result<()> {
-        if let Some(state) = self.configs.get(name) {
-            if version < state.version {
-                return Err(NonoError::VersionDowngrade {
-                    config: name.to_string(),
-                    current: state.version,
-                    attempted: version,
-                });
-            }
+        if let Some(state) = self.configs.get(name)
+            && version < state.version
+        {
+            return Err(NonoError::VersionDowngrade {
+                config: name.to_string(),
+                current: state.version,
+                attempted: version,
+            });
         }
         Ok(())
     }

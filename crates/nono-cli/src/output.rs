@@ -3,7 +3,7 @@
 //! All colors are drawn from the active theme via `theme::current()`.
 
 use crate::command_display::format_command_line;
-use crate::theme::{self, badge, fg, Rgb};
+use crate::theme::{self, Rgb, badge, fg};
 use colored::Colorize;
 use nono::{AccessMode, CapabilitySet, NetworkMode, NonoError, Result};
 use std::ffi::{OsStr, OsString};
@@ -661,17 +661,17 @@ fn sanitize_terminal_output(s: &str) -> String {
     while let Some(c) = chars.next() {
         if c == '\x1b' {
             // Skip ESC and the entire escape sequence
-            if let Some(next) = chars.next() {
-                if next == '[' {
-                    // CSI sequence: skip until a letter is found
-                    for seq_char in chars.by_ref() {
-                        if seq_char.is_ascii_alphabetic() {
-                            break;
-                        }
+            if let Some(next) = chars.next()
+                && next == '['
+            {
+                // CSI sequence: skip until a letter is found
+                for seq_char in chars.by_ref() {
+                    if seq_char.is_ascii_alphabetic() {
+                        break;
                     }
                 }
-                // OSC, other sequences: already consumed the next char, continue
             }
+            // OSC, other sequences: already consumed the next char, continue
         } else if c.is_control() && c != '\n' {
             // Strip control characters (except newline)
         } else {

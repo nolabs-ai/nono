@@ -5,7 +5,7 @@
 
 use crate::config;
 use colored::Colorize;
-use nono::{try_canonicalize, AccessMode, CapabilitySet, Result};
+use nono::{AccessMode, CapabilitySet, Result, try_canonicalize};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -77,19 +77,19 @@ pub fn query_path(
 
     // Check if this is a sensitive path (CLI security policy), but skip
     // the check for paths that have been explicitly overridden.
-    if !is_overridden {
-        if let Some(matched) = config::check_sensitive_path(&canonical.to_string_lossy())? {
-            return Ok(QueryResult::Denied {
-                reason: "sensitive_path".to_string(),
-                details: Some(format!(
-                    "Blocked by policy group '{}': {} Use filesystem.bypass_protection to exempt specific paths when appropriate.",
-                    matched.group_name, matched.description
-                )),
-                policy_source: Some(format!("group:{}", matched.group_name)),
-                matching_capability: None,
-                suggested_flag: None,
-            });
-        }
+    if !is_overridden
+        && let Some(matched) = config::check_sensitive_path(&canonical.to_string_lossy())?
+    {
+        return Ok(QueryResult::Denied {
+            reason: "sensitive_path".to_string(),
+            details: Some(format!(
+                "Blocked by policy group '{}': {} Use filesystem.bypass_protection to exempt specific paths when appropriate.",
+                matched.group_name, matched.description
+            )),
+            policy_source: Some(format!("group:{}", matched.group_name)),
+            matching_capability: None,
+            suggested_flag: None,
+        });
     }
 
     // Check capabilities. Prefer the most specific matching grant so broad system
@@ -463,9 +463,11 @@ mod tests {
                 let capability = matching_capability.expect("expected matching capability");
                 assert_eq!(capability.access, "read");
                 assert_eq!(capability.source, "group:dev");
-                assert!(details
-                    .as_deref()
-                    .is_some_and(|d| d.contains("group:dev") && d.contains("write was requested")));
+                assert!(
+                    details.as_deref().is_some_and(
+                        |d| d.contains("group:dev") && d.contains("write was requested")
+                    )
+                );
             }
             _ => panic!("expected denied result"),
         }
@@ -493,12 +495,16 @@ mod tests {
                 ..
             } => {
                 assert_eq!(reason, "sensitive_path");
-                assert!(policy_source
-                    .as_deref()
-                    .is_some_and(|policy| policy.starts_with("group:")));
-                assert!(details
-                    .as_deref()
-                    .is_some_and(|detail| detail.contains("filesystem.bypass_protection")));
+                assert!(
+                    policy_source
+                        .as_deref()
+                        .is_some_and(|policy| policy.starts_with("group:"))
+                );
+                assert!(
+                    details
+                        .as_deref()
+                        .is_some_and(|detail| detail.contains("filesystem.bypass_protection"))
+                );
                 assert!(suggested_flag.is_none());
             }
             _ => panic!("expected denied result"),

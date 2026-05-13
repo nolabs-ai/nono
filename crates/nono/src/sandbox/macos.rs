@@ -18,7 +18,7 @@ use tracing::{debug, info};
 // These are private APIs but have been stable for years
 // Reference: https://reverse.put.as/wp-content/uploads/2011/09/Apple-Sandbox-Guide-v1.0.pdf
 
-extern "C" {
+unsafe extern "C" {
     fn sandbox_init(profile: *const c_char, flags: u64, errorbuf: *mut *mut c_char) -> i32;
     fn sandbox_free_error(errorbuf: *mut c_char);
 }
@@ -27,7 +27,7 @@ extern "C" {
 // These are documented in <sandbox.h> and stable across macOS versions.
 // Extensions allow an unsandboxed supervisor to issue tokens that expand
 // a sandboxed process's access for specific paths.
-extern "C" {
+unsafe extern "C" {
     fn sandbox_extension_issue_file(
         extension_class: *const c_char,
         path: *const c_char,
@@ -237,11 +237,11 @@ fn path_filters_for_cap(cap: &crate::capability::FsCapability) -> Result<Vec<Str
 
     // If the original path differs (e.g. /tmp vs /private/tmp), emit a rule
     // for the original too so Seatbelt allows traversing the symlink.
-    if cap.original != cap.resolved {
-        if let Some(original_str) = cap.original.to_str() {
-            let escaped_original = escape_path(original_str)?;
-            filters.push(format!("{} \"{}\"", kind, escaped_original));
-        }
+    if cap.original != cap.resolved
+        && let Some(original_str) = cap.original.to_str()
+    {
+        let escaped_original = escape_path(original_str)?;
+        filters.push(format!("{} \"{}\"", kind, escaped_original));
     }
 
     Ok(filters)
@@ -269,10 +269,10 @@ fn has_explicit_keychain_db_access(caps: &CapabilitySet) -> bool {
         {
             return true;
         }
-        if let Some(ref user_keychain_dbs) = user_keychain_dbs {
-            if user_keychain_dbs.iter().any(|candidate| path == candidate) {
-                return true;
-            }
+        if let Some(ref user_keychain_dbs) = user_keychain_dbs
+            && user_keychain_dbs.iter().any(|candidate| path == candidate)
+        {
+            return true;
         }
         false
     };
@@ -1225,8 +1225,10 @@ mod tests {
         assert!(
             profile.contains("(allow file-read* (extension \"com.apple.app-sandbox.read-write\"))")
         );
-        assert!(profile
-            .contains("(allow file-write* (extension \"com.apple.app-sandbox.read-write\"))"));
+        assert!(
+            profile
+                .contains("(allow file-write* (extension \"com.apple.app-sandbox.read-write\"))")
+        );
     }
 
     #[test]
@@ -1330,8 +1332,11 @@ mod tests {
             profile.contains("(allow network-outbound (path \"/private/var/run/mDNSResponder\"))")
         );
         assert!(profile.contains("(allow network-outbound (path \"/var/run/mDNSResponder\"))"));
-        assert!(profile
-            .contains("(allow system-socket (socket-domain AF_UNIX) (socket-type SOCK_STREAM))"));
+        assert!(
+            profile.contains(
+                "(allow system-socket (socket-domain AF_UNIX) (socket-type SOCK_STREAM))"
+            )
+        );
         // Should NOT have general outbound allow
         assert!(!profile.contains("(allow network-outbound)\n"));
         // Should NOT have bind/inbound without bind_ports
@@ -1708,8 +1713,11 @@ mod tests {
             profile.contains("(allow network-outbound (path \"/private/var/run/mDNSResponder\"))")
         );
         assert!(profile.contains("(allow network-outbound (path \"/var/run/mDNSResponder\"))"));
-        assert!(profile
-            .contains("(allow system-socket (socket-domain AF_UNIX) (socket-type SOCK_STREAM))"));
+        assert!(
+            profile.contains(
+                "(allow system-socket (socket-domain AF_UNIX) (socket-type SOCK_STREAM))"
+            )
+        );
     }
 
     #[test]

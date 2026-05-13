@@ -193,7 +193,7 @@ pub(crate) fn verify_audit_attestation(
                 summary,
                 expected_public_key_file.map(|_| true),
                 err.to_string(),
-            ))
+            ));
         }
     };
     let predicate_type = match trust::extract_predicate_type(&bundle, &bundle_path) {
@@ -203,7 +203,7 @@ pub(crate) fn verify_audit_attestation(
                 summary,
                 expected_public_key_file.map(|_| true),
                 err.to_string(),
-            ))
+            ));
         }
     };
     if predicate_type != AUDIT_ATTESTATION_PREDICATE_TYPE_ALPHA {
@@ -224,7 +224,7 @@ pub(crate) fn verify_audit_attestation(
                 summary,
                 expected_public_key_file.map(|_| true),
                 err.to_string(),
-            ))
+            ));
         }
     };
     let signer_key_id = match signer_identity {
@@ -234,7 +234,7 @@ pub(crate) fn verify_audit_attestation(
                 summary,
                 expected_public_key_file.map(|_| true),
                 "audit attestation must be keyed".to_string(),
-            ))
+            ));
         }
     };
     let public_key_der = match trust::base64::base64_decode(&summary.public_key) {
@@ -244,7 +244,7 @@ pub(crate) fn verify_audit_attestation(
                 summary,
                 expected_public_key_file.map(|_| true),
                 format!("invalid attested public key encoding: {err}"),
-            ))
+            ));
         }
     };
     let recomputed_key_id = trust::public_key_id_hex(&public_key_der);
@@ -293,7 +293,7 @@ pub(crate) fn verify_audit_attestation(
                 summary,
                 expected_public_key_file.map(|_| true),
                 err.to_string(),
-            ))
+            ));
         }
     };
     if attested_root != integrity.merkle_root.to_string() {
@@ -311,7 +311,7 @@ pub(crate) fn verify_audit_attestation(
                 summary,
                 expected_public_key_file.map(|_| true),
                 err.to_string(),
-            ))
+            ));
         }
     };
     let Some(statement_session_id) = statement

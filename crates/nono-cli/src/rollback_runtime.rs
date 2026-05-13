@@ -1,7 +1,7 @@
-use crate::audit_attestation::{write_audit_attestation, AuditSigner};
+use crate::audit_attestation::{AuditSigner, write_audit_attestation};
 use crate::audit_integrity::AuditRecorder;
 use crate::audit_ledger;
-use crate::launch_runtime::{rollback_base_exclusions, RollbackLaunchOptions};
+use crate::launch_runtime::{RollbackLaunchOptions, rollback_base_exclusions};
 use crate::{config, output, rollback_preflight, rollback_session, rollback_ui};
 use nono::undo::ExecutableIdentity;
 use nono::{AccessMode, CapabilitySet, Result};
@@ -552,41 +552,39 @@ pub(crate) fn finalize_supervised_exit(ctx: RollbackExitContext<'_>) -> Result<(
         let _ = manager.cleanup_new_atomic_temp_files(&atomic_temp_before);
     }
 
-    if !audit_saved {
-        if let Some(audit_state) = audit_state {
-            let (tracked_paths, merkle_roots) = match audit_snapshot_state {
-                Some(snap) => {
-                    let final_root = snap.manager.compute_merkle_root()?;
-                    (snap.tracked_paths, vec![snap.baseline_root, final_root])
-                }
-                None => (audit_tracked_paths, Vec::new()),
-            };
-            let mut meta = nono::undo::SessionMetadata {
-                session_id: audit_state.session_id.clone(),
-                started: started.to_string(),
-                ended: Some(ended.to_string()),
-                command: scrubbed_command,
-                executable_identity: executable_identity.cloned(),
-                tracked_paths,
-                snapshot_count: 0,
-                exit_code: Some(exit_code),
-                merkle_roots,
-                network_events,
-                audit_event_count,
-                audit_integrity,
-                audit_attestation: None,
-            };
-            if let Some(signer) = audit_signer {
-                meta.audit_attestation = Some(write_audit_attestation(
-                    &audit_state.session_dir,
-                    &meta,
-                    signer,
-                    redaction_policy,
-                )?);
+    if !audit_saved && let Some(audit_state) = audit_state {
+        let (tracked_paths, merkle_roots) = match audit_snapshot_state {
+            Some(snap) => {
+                let final_root = snap.manager.compute_merkle_root()?;
+                (snap.tracked_paths, vec![snap.baseline_root, final_root])
             }
-            nono::undo::SnapshotManager::write_session_metadata(&audit_state.session_dir, &meta)?;
-            audit_ledger::append_session(&meta)?;
+            None => (audit_tracked_paths, Vec::new()),
+        };
+        let mut meta = nono::undo::SessionMetadata {
+            session_id: audit_state.session_id.clone(),
+            started: started.to_string(),
+            ended: Some(ended.to_string()),
+            command: scrubbed_command,
+            executable_identity: executable_identity.cloned(),
+            tracked_paths,
+            snapshot_count: 0,
+            exit_code: Some(exit_code),
+            merkle_roots,
+            network_events,
+            audit_event_count,
+            audit_integrity,
+            audit_attestation: None,
+        };
+        if let Some(signer) = audit_signer {
+            meta.audit_attestation = Some(write_audit_attestation(
+                &audit_state.session_dir,
+                &meta,
+                signer,
+                redaction_policy,
+            )?);
         }
+        nono::undo::SnapshotManager::write_session_metadata(&audit_state.session_dir, &meta)?;
+        audit_ledger::append_session(&meta)?;
     }
 
     Ok(())
@@ -597,10 +595,10 @@ pub(crate) fn finalize_supervised_exit(ctx: RollbackExitContext<'_>) -> Result<(
 mod tests {
     use super::*;
     use crate::audit_attestation::{
-        signer_from_key_pair, verify_audit_attestation, write_audit_attestation,
-        AUDIT_ATTESTATION_BUNDLE_FILENAME,
+        AUDIT_ATTESTATION_BUNDLE_FILENAME, signer_from_key_pair, verify_audit_attestation,
+        write_audit_attestation,
     };
-    use crate::test_env::{EnvVarGuard, ENV_LOCK};
+    use crate::test_env::{ENV_LOCK, EnvVarGuard};
     use nono::trust;
     use nono::undo::{AuditIntegritySummary, SessionMetadata};
     use nono::{CapabilitySet, CapabilitySource, FsCapability};
@@ -882,9 +880,11 @@ mod tests {
         let mut attested_metadata = metadata.clone();
         attested_metadata.audit_attestation = Some(summary);
 
-        assert!(!rollback_dir
-            .join(AUDIT_ATTESTATION_BUNDLE_FILENAME)
-            .exists());
+        assert!(
+            !rollback_dir
+                .join(AUDIT_ATTESTATION_BUNDLE_FILENAME)
+                .exists()
+        );
         assert!(audit_dir.join(AUDIT_ATTESTATION_BUNDLE_FILENAME).exists());
 
         let verification =

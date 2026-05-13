@@ -219,13 +219,13 @@ fn map_ureq_error(error: ureq::Error) -> NonoError {
 }
 
 fn enforce_content_length(content_length: Option<u64>, limit: u64, url: &str) -> Result<()> {
-    if let Some(content_length) = content_length {
-        if content_length > limit {
-            return Err(NonoError::RegistryError(format!(
-                "registry response from {} exceeds {} bytes",
-                url, limit
-            )));
-        }
+    if let Some(content_length) = content_length
+        && content_length > limit
+    {
+        return Err(NonoError::RegistryError(format!(
+            "registry response from {} exceeds {} bytes",
+            url, limit
+        )));
     }
 
     Ok(())

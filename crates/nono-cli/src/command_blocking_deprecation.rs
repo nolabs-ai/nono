@@ -8,12 +8,10 @@ use crate::profile::Profile;
 use nono::manifest::CapabilityManifest;
 use std::path::Path;
 
-const DEPRECATION_SUMMARY: &str =
-    "deprecated in v0.33.0: startup-only command gating, not kernel-enforced. \
+const DEPRECATION_SUMMARY: &str = "deprecated in v0.33.0: startup-only command gating, not kernel-enforced. \
      Child processes can bypass it. Prefer resource-based controls such as \
      add_deny_access, narrower filesystem grants, unlink_protection, and network policy.";
-pub(crate) const BLOCKED_COMMAND_REASON: &str =
-    "Command blocking is deprecated in v0.33.0 and only checks the directly-invoked \
+pub(crate) const BLOCKED_COMMAND_REASON: &str = "Command blocking is deprecated in v0.33.0 and only checks the directly-invoked \
      startup command. Child processes can bypass it. Prefer resource-based controls \
      such as add_deny_access, narrower filesystem grants, unlink_protection, and \
      network policy.";

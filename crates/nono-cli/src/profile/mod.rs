@@ -1622,12 +1622,12 @@ pub fn load_profile_extends(name_or_path: &str) -> Option<Vec<String>> {
     }
 
     // User profile
-    if let Ok(profile_path) = get_user_profile_path(name_or_path) {
-        if profile_path.exists() {
-            return parse_profile_file(&profile_path)
-                .ok()
-                .and_then(|p| p.extends);
-        }
+    if let Ok(profile_path) = get_user_profile_path(name_or_path)
+        && profile_path.exists()
+    {
+        return parse_profile_file(&profile_path)
+            .ok()
+            .and_then(|p| p.extends);
     }
 
     // Pack-store: any installed pack that declares a profile artifact with
@@ -1639,10 +1639,10 @@ pub fn load_profile_extends(name_or_path: &str) -> Option<Vec<String>> {
     }
 
     // Built-in profile
-    if let Ok(policy) = crate::policy::load_embedded_policy() {
-        if let Some(def) = policy.profiles.get(name_or_path) {
-            return def.extends.as_ref().map(|s| vec![s.clone()]);
-        }
+    if let Ok(policy) = crate::policy::load_embedded_policy()
+        && let Some(def) = policy.profiles.get(name_or_path)
+    {
+        return def.extends.as_ref().map(|s| vec![s.clone()]);
     }
 
     None
@@ -2652,18 +2652,16 @@ pub fn list_profiles() -> Vec<String> {
     let mut profiles = builtin::list_builtin();
 
     // Add user profiles (if home directory is available)
-    if let Ok(profile_path) = get_user_profile_path("") {
-        if let Some(dir) = profile_path.parent() {
-            if dir.exists() {
-                if let Ok(entries) = fs::read_dir(dir) {
-                    for entry in entries.flatten() {
-                        if let Some(name) = entry.path().file_stem() {
-                            let name_str = name.to_string_lossy().to_string();
-                            if !profiles.contains(&name_str) {
-                                profiles.push(name_str);
-                            }
-                        }
-                    }
+    if let Ok(profile_path) = get_user_profile_path("")
+        && let Some(dir) = profile_path.parent()
+        && dir.exists()
+        && let Ok(entries) = fs::read_dir(dir)
+    {
+        for entry in entries.flatten() {
+            if let Some(name) = entry.path().file_stem() {
+                let name_str = name.to_string_lossy().to_string();
+                if !profiles.contains(&name_str) {
+                    profiles.push(name_str);
                 }
             }
         }
@@ -3017,10 +3015,12 @@ mod tests {
         assert_eq!(profile.meta.name, "custom-test");
         assert!(profile.network.block);
         // implicit default profile groups should be merged in
-        assert!(profile
-            .groups
-            .include
-            .contains(&"deny_credentials".to_string()));
+        assert!(
+            profile
+                .groups
+                .include
+                .contains(&"deny_credentials".to_string())
+        );
         assert!(profile.groups.include.contains(&"node_runtime".to_string()));
     }
 
@@ -3880,9 +3880,10 @@ mod tests {
 
         let result = validate_custom_credential("test", &cred);
         let err = result.expect_err("proxy query_param_name should be required");
-        assert!(err
-            .to_string()
-            .contains("proxy.query_param_name is required"));
+        assert!(
+            err.to_string()
+                .contains("proxy.query_param_name is required")
+        );
     }
 
     #[test]
@@ -4355,10 +4356,12 @@ mod tests {
         assert!(merged.filesystem.allow.contains(&"/base/rw".to_string()));
         assert!(merged.filesystem.allow.contains(&"/child/rw".to_string()));
         assert!(merged.filesystem.read.contains(&"/base/read".to_string()));
-        assert!(merged
-            .filesystem
-            .read_file
-            .contains(&"/base/file.txt".to_string()));
+        assert!(
+            merged
+                .filesystem
+                .read_file
+                .contains(&"/base/file.txt".to_string())
+        );
     }
 
     #[test]
@@ -4642,10 +4645,12 @@ mod tests {
             "Expected inherited paths from codex, got: {:?}",
             profile.filesystem.allow
         );
-        assert!(profile
-            .filesystem
-            .allow
-            .contains(&"/tmp/ext-test".to_string()));
+        assert!(
+            profile
+                .filesystem
+                .allow
+                .contains(&"/tmp/ext-test".to_string())
+        );
         // extends should be consumed
         assert!(profile.extends.is_none());
     }
@@ -4933,9 +4938,11 @@ mod tests {
         let merged = merge_profiles(base_profile(), child_profile());
         let urls = merged.open_urls.expect("should have open_urls");
         assert_eq!(urls.allow_origins, vec!["https://child.example.com"]);
-        assert!(!urls
-            .allow_origins
-            .contains(&"https://base.example.com".to_string()));
+        assert!(
+            !urls
+                .allow_origins
+                .contains(&"https://base.example.com".to_string())
+        );
         assert!(urls.allow_localhost);
     }
 
@@ -5022,46 +5029,66 @@ mod tests {
         let merged = merge_profiles(base_profile(), child_profile());
         // Canonical equivalents of the old `policy.*` patch fields.
         assert!(merged.groups.exclude.contains(&"base_excluded".to_string()));
-        assert!(merged
-            .groups
-            .exclude
-            .contains(&"child_excluded".to_string()));
-        assert!(merged
-            .filesystem
-            .read
-            .contains(&"/base/policy-read".to_string()));
-        assert!(merged
-            .filesystem
-            .write
-            .contains(&"/child/policy-write".to_string()));
-        assert!(merged
-            .filesystem
-            .allow
-            .contains(&"/child/policy-rw".to_string()));
-        assert!(merged
-            .filesystem
-            .deny
-            .contains(&"/base/policy-deny".to_string()));
-        assert!(merged
-            .filesystem
-            .deny
-            .contains(&"/child/policy-deny".to_string()));
-        assert!(merged
-            .filesystem
-            .bypass_protection
-            .contains(&"/base/override-deny".to_string()));
-        assert!(merged
-            .filesystem
-            .bypass_protection
-            .contains(&"/child/override-deny".to_string()));
-        assert!(merged
-            .filesystem
-            .suppress_save_prompt
-            .contains(&"/base/no-prompt".to_string()));
-        assert!(merged
-            .filesystem
-            .suppress_save_prompt
-            .contains(&"/child/no-prompt".to_string()));
+        assert!(
+            merged
+                .groups
+                .exclude
+                .contains(&"child_excluded".to_string())
+        );
+        assert!(
+            merged
+                .filesystem
+                .read
+                .contains(&"/base/policy-read".to_string())
+        );
+        assert!(
+            merged
+                .filesystem
+                .write
+                .contains(&"/child/policy-write".to_string())
+        );
+        assert!(
+            merged
+                .filesystem
+                .allow
+                .contains(&"/child/policy-rw".to_string())
+        );
+        assert!(
+            merged
+                .filesystem
+                .deny
+                .contains(&"/base/policy-deny".to_string())
+        );
+        assert!(
+            merged
+                .filesystem
+                .deny
+                .contains(&"/child/policy-deny".to_string())
+        );
+        assert!(
+            merged
+                .filesystem
+                .bypass_protection
+                .contains(&"/base/override-deny".to_string())
+        );
+        assert!(
+            merged
+                .filesystem
+                .bypass_protection
+                .contains(&"/child/override-deny".to_string())
+        );
+        assert!(
+            merged
+                .filesystem
+                .suppress_save_prompt
+                .contains(&"/base/no-prompt".to_string())
+        );
+        assert!(
+            merged
+                .filesystem
+                .suppress_save_prompt
+                .contains(&"/child/no-prompt".to_string())
+        );
     }
 
     #[test]
@@ -5328,10 +5355,12 @@ mod tests {
 
         let profile = load_from_file(&profile_path).expect("load extended profile");
         assert_eq!(profile.meta.name, "multi-ext-test");
-        assert!(profile
-            .filesystem
-            .allow
-            .contains(&"/tmp/multi-ext".to_string()));
+        assert!(
+            profile
+                .filesystem
+                .allow
+                .contains(&"/tmp/multi-ext".to_string())
+        );
         assert!(profile.extends.is_none());
     }
 
@@ -5376,10 +5405,12 @@ mod tests {
 
         let profile = load_from_file(&child_path).expect("resolve");
         assert_eq!(profile.meta.name, "child");
-        assert!(profile
-            .filesystem
-            .allow
-            .contains(&"/tmp/shared".to_string()));
+        assert!(
+            profile
+                .filesystem
+                .allow
+                .contains(&"/tmp/shared".to_string())
+        );
     }
 
     #[test]

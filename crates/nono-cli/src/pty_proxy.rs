@@ -16,7 +16,7 @@
 //! The supervisor proxies I/O between whoever is connected and the PTY master.
 
 use nix::libc;
-use nix::pty::{openpty, OpenptyResult, Winsize};
+use nix::pty::{OpenptyResult, Winsize, openpty};
 use nix::sys::signal::{self, SigHandler, Signal};
 use nono::{NonoError, Result};
 use std::collections::VecDeque;
@@ -247,50 +247,55 @@ pub fn open_pty() -> Result<PtyPair> {
     Ok(PtyPair { master, slave })
 }
 
+/// Write a message to stderr and abort the child process.
+///
+/// Async-signal-safe: only uses raw `write(2)` and `_exit(2)`.
+fn child_setup_pty_fatal(message: &[u8]) -> ! {
+    // SAFETY: message slice pointer is valid for its length; write(2) and
+    // _exit(2) are async-signal-safe and cannot cause memory unsafety.
+    unsafe {
+        let _ = libc::write(
+            libc::STDERR_FILENO,
+            message.as_ptr().cast::<libc::c_void>(),
+            message.len(),
+        );
+        libc::_exit(126);
+    }
+}
+
 /// Set up the slave PTY as the child's controlling terminal.
 ///
 /// Must be called in the child after fork, before exec.
-/// This is async-signal-safe (only uses raw libc calls).
 ///
 /// # Safety
-/// Must be called in the child process after fork. The slave_fd must be valid.
-unsafe fn child_setup_pty_fatal(message: &[u8]) -> ! {
-    let _ = libc::write(
-        libc::STDERR_FILENO,
-        message.as_ptr().cast::<libc::c_void>(),
-        message.len(),
-    );
-    libc::_exit(126);
-}
-
-/// # Safety
-/// Must be called in the child process after fork. The slave_fd must be valid.
+/// Must be called in a freshly-forked child process. `slave_fd` must be a
+/// valid open file descriptor for the slave side of a PTY pair.
 pub unsafe fn setup_child_pty(slave_fd: RawFd) {
-    // Create a new session so the child can acquire a controlling terminal.
-    if libc::setsid() < 0 {
+    if nix::unistd::setsid().is_err() {
         child_setup_pty_fatal(b"nono: setsid() failed while configuring child PTY\n");
     }
 
-    // Set the slave as the controlling terminal (TIOCSCTTY).
-    // The arg 0 means "don't steal if another process has it".
-    if libc::ioctl(slave_fd, libc::TIOCSCTTY as libc::c_ulong, 0) < 0 {
-        child_setup_pty_fatal(b"nono: ioctl(TIOCSCTTY) failed while configuring child PTY\n");
-    }
+    // SAFETY: post-fork child; slave_fd is valid per caller contract.
+    // ioctl/dup2/close operate on raw fd integers — nix's IO-safe wrappers
+    // require AsFd/OwnedFd which aren't available for STDIN_FILENO et al.
+    unsafe {
+        if libc::ioctl(slave_fd, libc::TIOCSCTTY as libc::c_ulong, 0) < 0 {
+            child_setup_pty_fatal(b"nono: ioctl(TIOCSCTTY) failed while configuring child PTY\n");
+        }
 
-    // Redirect stdin/stdout/stderr to the slave PTY
-    if libc::dup2(slave_fd, libc::STDIN_FILENO) < 0 {
-        child_setup_pty_fatal(b"nono: dup2(stdin) failed while configuring child PTY\n");
-    }
-    if libc::dup2(slave_fd, libc::STDOUT_FILENO) < 0 {
-        child_setup_pty_fatal(b"nono: dup2(stdout) failed while configuring child PTY\n");
-    }
-    if libc::dup2(slave_fd, libc::STDERR_FILENO) < 0 {
-        child_setup_pty_fatal(b"nono: dup2(stderr) failed while configuring child PTY\n");
-    }
+        if libc::dup2(slave_fd, libc::STDIN_FILENO) < 0 {
+            child_setup_pty_fatal(b"nono: dup2(stdin) failed while configuring child PTY\n");
+        }
+        if libc::dup2(slave_fd, libc::STDOUT_FILENO) < 0 {
+            child_setup_pty_fatal(b"nono: dup2(stdout) failed while configuring child PTY\n");
+        }
+        if libc::dup2(slave_fd, libc::STDERR_FILENO) < 0 {
+            child_setup_pty_fatal(b"nono: dup2(stderr) failed while configuring child PTY\n");
+        }
 
-    // Close the original slave fd if it's not one of 0/1/2
-    if slave_fd > 2 {
-        libc::close(slave_fd);
+        if slave_fd > 2 {
+            libc::close(slave_fd);
+        }
     }
 }
 
@@ -632,20 +637,20 @@ impl PtyProxy {
 
         self.record_output(&buf[..n]);
 
-        if let Some((write_fd, is_terminal)) = client {
-            if let Err(err) = write_all_fd(write_fd, &buf[..n]) {
-                if is_terminal {
-                    warn!(
-                        "PTY proxy: terminal output write failed for session {}: {}; detaching terminal client",
-                        self.session_id, err
-                    );
-                    self.detach();
-                    return MasterProxyOutcome::Data;
-                } else {
-                    debug!("PTY proxy: attached socket client disconnected: {}", err);
-                    self.detach();
-                    return MasterProxyOutcome::Data;
-                }
+        if let Some((write_fd, is_terminal)) = client
+            && let Err(err) = write_all_fd(write_fd, &buf[..n])
+        {
+            if is_terminal {
+                warn!(
+                    "PTY proxy: terminal output write failed for session {}: {}; detaching terminal client",
+                    self.session_id, err
+                );
+                self.detach();
+                return MasterProxyOutcome::Data;
+            } else {
+                debug!("PTY proxy: attached socket client disconnected: {}", err);
+                self.detach();
+                return MasterProxyOutcome::Data;
             }
         }
 
@@ -748,14 +753,14 @@ impl PtyProxy {
         };
 
         let forwarded = self.filter_client_input(&buf[..n]);
-        if !forwarded.is_empty() {
-            if let Err(err) = write_all_fd(self.master.as_raw_fd(), &forwarded) {
-                warn!(
-                    "PTY proxy: failed forwarding client input to PTY master for session {}: {}",
-                    self.session_id, err
-                );
-                return false;
-            }
+        if !forwarded.is_empty()
+            && let Err(err) = write_all_fd(self.master.as_raw_fd(), &forwarded)
+        {
+            warn!(
+                "PTY proxy: failed forwarding client input to PTY master for session {}: {}",
+                self.session_id, err
+            );
+            return false;
         }
 
         true
@@ -823,10 +828,9 @@ impl PtyProxy {
             .client
             .as_ref()
             .is_some_and(AttachedClient::is_terminal)
+            && let Some(winsize) = get_terminal_winsize()
         {
-            if let Some(winsize) = get_terminal_winsize() {
-                let _ = self.apply_winsize(&winsize);
-            }
+            let _ = self.apply_winsize(&winsize);
         }
     }
 
@@ -2107,11 +2111,11 @@ where
         // Scroll Up so the user can reach the full final session view by
         // scrolling back. Then restore terminal modes without touching the
         // alternate screen buffer.
-        if let Some(winsize) = get_terminal_winsize() {
-            if winsize.ws_row > 0 {
-                let scroll_up = format!("\x1b[{}S", winsize.ws_row);
-                let _ = write_all_fd(libc::STDOUT_FILENO, scroll_up.as_bytes());
-            }
+        if let Some(winsize) = get_terminal_winsize()
+            && winsize.ws_row > 0
+        {
+            let scroll_up = format!("\x1b[{}S", winsize.ws_row);
+            let _ = write_all_fd(libc::STDOUT_FILENO, scroll_up.as_bytes());
         }
     }
     let _ = write_all_fd(
@@ -2229,53 +2233,53 @@ fn run_attach_loop(
     let mut last_winsize = get_terminal_winsize();
 
     loop {
-        if let Some(deadline) = stdin_deadline {
-            if std::time::Instant::now() < deadline {
-                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-                let timeout_ms = remaining.as_millis().min(i32::MAX as u128) as i32;
-                let mut warmup_pfd = libc::pollfd {
-                    fd: sock_fd,
-                    events: libc::POLLIN,
-                    revents: 0,
-                };
-                let ret = unsafe { libc::poll(&mut warmup_pfd, 1, timeout_ms) };
-                if ret < 0 {
-                    let err = std::io::Error::last_os_error();
-                    if err.kind() == std::io::ErrorKind::Interrupted {
-                        continue;
-                    }
-                    return Err(NonoError::SandboxInit(format!(
-                        "poll() error in attach warm-up: {}",
-                        err
-                    )));
+        if let Some(deadline) = stdin_deadline
+            && std::time::Instant::now() < deadline
+        {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let timeout_ms = remaining.as_millis().min(i32::MAX as u128) as i32;
+            let mut warmup_pfd = libc::pollfd {
+                fd: sock_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let ret = unsafe { libc::poll(&mut warmup_pfd, 1, timeout_ms) };
+            if ret < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
                 }
-                if warmup_pfd.revents & libc::POLLIN != 0 {
-                    match read_fd_once(sock_fd, &mut buf) {
-                        Ok(ReadFdOutcome::Data(n)) => {
-                            if let Err(err) = write_stdout_tracked(alt_screen_tracker, &buf[..n]) {
-                                return Err(NonoError::SandboxInit(format!(
-                                    "attach stdout write failed: {}",
-                                    err
-                                )));
-                            }
-                        }
-                        Ok(ReadFdOutcome::Eof) => break,
-                        Ok(ReadFdOutcome::Retry) => continue,
-                        Err(err) if is_socket_disconnect(&err) => break,
-                        Err(err) => {
+                return Err(NonoError::SandboxInit(format!(
+                    "poll() error in attach warm-up: {}",
+                    err
+                )));
+            }
+            if warmup_pfd.revents & libc::POLLIN != 0 {
+                match read_fd_once(sock_fd, &mut buf) {
+                    Ok(ReadFdOutcome::Data(n)) => {
+                        if let Err(err) = write_stdout_tracked(alt_screen_tracker, &buf[..n]) {
                             return Err(NonoError::SandboxInit(format!(
-                                "attach socket read failed: {}",
+                                "attach stdout write failed: {}",
                                 err
                             )));
                         }
                     }
+                    Ok(ReadFdOutcome::Eof) => break,
+                    Ok(ReadFdOutcome::Retry) => continue,
+                    Err(err) if is_socket_disconnect(&err) => break,
+                    Err(err) => {
+                        return Err(NonoError::SandboxInit(format!(
+                            "attach socket read failed: {}",
+                            err
+                        )));
+                    }
                 }
-                if warmup_pfd.revents & (libc::POLLHUP | libc::POLLERR) != 0 {
-                    info!("PTY attach client observed attach socket close during warm-up");
-                    break;
-                }
-                continue;
             }
+            if warmup_pfd.revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+                info!("PTY attach client observed attach socket close during warm-up");
+                break;
+            }
+            continue;
         }
 
         // SAFETY: pfds is a valid array on the stack
@@ -2361,15 +2365,15 @@ fn run_attach_loop(
 
         if pfds[2].revents & libc::POLLIN != 0 {
             drain_attach_resize_pipe();
-            if let Some(socket) = resize_socket {
-                if let Some(winsize) = get_terminal_winsize() {
-                    let changed = last_winsize
-                        .map(|last| last.ws_row != winsize.ws_row || last.ws_col != winsize.ws_col)
-                        .unwrap_or(true);
-                    if changed {
-                        let _ = send_attach_resize(socket, winsize);
-                        last_winsize = Some(winsize);
-                    }
+            if let Some(socket) = resize_socket
+                && let Some(winsize) = get_terminal_winsize()
+            {
+                let changed = last_winsize
+                    .map(|last| last.ws_row != winsize.ws_row || last.ws_col != winsize.ws_col)
+                    .unwrap_or(true);
+                if changed {
+                    let _ = send_attach_resize(socket, winsize);
+                    last_winsize = Some(winsize);
                 }
             }
         }
@@ -2381,11 +2385,11 @@ fn run_attach_loop(
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_attach_handshake, encode_attach_request_frame, read_fd_once,
-        select_attach_replay_bytes, terminal_restore_escape, write_all_fd, AltScreenTracker,
-        AttachedClient, PtyProxy, ReadFdOutcome, ScreenState, ATTACH_HANDSHAKE_MAGIC,
-        ATTACH_REQUEST_ATTACH, ATTACH_SCREEN_ENTER_ESCAPE, DEFAULT_DETACH_SEQUENCE,
-        ERASE_NATIVE_SCROLLBACK, TERMINAL_RESTORE_NORMAL,
+        ATTACH_HANDSHAKE_MAGIC, ATTACH_REQUEST_ATTACH, ATTACH_SCREEN_ENTER_ESCAPE,
+        AltScreenTracker, AttachedClient, DEFAULT_DETACH_SEQUENCE, ERASE_NATIVE_SCROLLBACK,
+        PtyProxy, ReadFdOutcome, ScreenState, TERMINAL_RESTORE_NORMAL, decode_attach_handshake,
+        encode_attach_request_frame, read_fd_once, select_attach_replay_bytes,
+        terminal_restore_escape, write_all_fd,
     };
     use nix::libc;
     use std::collections::VecDeque;

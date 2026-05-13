@@ -55,19 +55,19 @@ impl CapabilityManifest {
     /// - `query_param` inject mode requires `query_param_name`
     pub fn validate(&self) -> crate::Result<()> {
         // rollback.enabled requires exec_strategy: "supervised"
-        if let Some(ref rb) = self.rollback {
-            if rb.enabled {
-                let exec_strategy = self
-                    .process
-                    .as_ref()
-                    .map_or(ExecStrategy::Monitor, |p| p.exec_strategy);
-                if exec_strategy != ExecStrategy::Supervised {
-                    return Err(crate::NonoError::ConfigParse(
-                        "rollback.enabled: true requires exec_strategy: \"supervised\" \
-                         (rollback needs a parent process for snapshots)"
-                            .to_string(),
-                    ));
-                }
+        if let Some(ref rb) = self.rollback
+            && rb.enabled
+        {
+            let exec_strategy = self
+                .process
+                .as_ref()
+                .map_or(ExecStrategy::Monitor, |p| p.exec_strategy);
+            if exec_strategy != ExecStrategy::Supervised {
+                return Err(crate::NonoError::ConfigParse(
+                    "rollback.enabled: true requires exec_strategy: \"supervised\" \
+                     (rollback needs a parent process for snapshots)"
+                        .to_string(),
+                ));
             }
         }
 

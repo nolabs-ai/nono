@@ -79,12 +79,12 @@ fn cmd_init(args: ProfileInitArgs) -> Result<()> {
 
     // Validate --extends target exists in any of the three sources the
     // resolver knows about (user dir, pack store, built-in).
-    if let Some(ref base) = args.extends {
-        if !profile_exists(base) {
-            return Err(NonoError::ProfileParse(extends_target_not_found_message(
-                base,
-            )));
-        }
+    if let Some(ref base) = args.extends
+        && !profile_exists(base)
+    {
+        return Err(NonoError::ProfileParse(extends_target_not_found_message(
+            base,
+        )));
     }
 
     // Validate --groups against embedded policy
@@ -295,10 +295,10 @@ fn profile_exists(name: &str) -> bool {
     if profile::builtin::get_builtin(name).is_some() {
         return true;
     }
-    if let Ok(path) = profile::get_user_profile_path(name) {
-        if path.exists() {
-            return true;
-        }
+    if let Ok(path) = profile::get_user_profile_path(name)
+        && path.exists()
+    {
+        return true;
     }
     profile::find_pack_store_profile(name).is_some()
 }
@@ -485,19 +485,19 @@ fn cmd_groups_detail(pol: &policy::Policy, name: &str, json: bool) -> Result<()>
         }
     }
 
-    if let Some(ref pairs) = group.symlink_pairs {
-        if !pairs.is_empty() {
-            println!();
-            println!("  {}", theme::fg("symlink_pairs:", t.subtext).bold());
-            let mut sorted: Vec<(&String, &String)> = pairs.iter().collect();
-            sorted.sort_by_key(|(k, _)| k.as_str());
-            for (from, to) in sorted {
-                println!(
-                    "    {} -> {}",
-                    theme::fg(from, t.text),
-                    theme::fg(to, t.subtext)
-                );
-            }
+    if let Some(ref pairs) = group.symlink_pairs
+        && !pairs.is_empty()
+    {
+        println!();
+        println!("  {}", theme::fg("symlink_pairs:", t.subtext).bold());
+        let mut sorted: Vec<(&String, &String)> = pairs.iter().collect();
+        sorted.sort_by_key(|(k, _)| k.as_str());
+        for (from, to) in sorted {
+            println!(
+                "    {} -> {}",
+                theme::fg(from, t.text),
+                theme::fg(to, t.subtext)
+            );
         }
     }
 
@@ -598,10 +598,10 @@ fn group_to_json(name: &str, group: &Group) -> serde_json::Value {
         val["deny"] = serde_json::Value::Object(deny_val);
     }
 
-    if let Some(ref pairs) = group.symlink_pairs {
-        if !pairs.is_empty() {
-            val["symlink_pairs"] = serde_json::json!(pairs);
-        }
+    if let Some(ref pairs) = group.symlink_pairs
+        && !pairs.is_empty()
+    {
+        val["symlink_pairs"] = serde_json::json!(pairs);
     }
 
     val
@@ -1834,10 +1834,10 @@ fn diff_scalar_option(
     }
     println!();
     println!("  {}:", theme::fg(label, t.subtext).bold());
-    if let Some(ref old) = v1 {
+    if let Some(old) = v1 {
         println!("    {}", theme::fg(&format!("- {old}"), t.red));
     }
-    if let Some(ref new) = v2 {
+    if let Some(new) = v2 {
         println!("    {}", theme::fg(&format!("+ {new}"), t.green));
     }
     true
@@ -2173,10 +2173,10 @@ fn resolve_validate_target(input: &std::path::Path) -> std::path::PathBuf {
     if name.contains('/') || name.ends_with(".json") {
         return input.to_path_buf();
     }
-    if let Ok(p) = profile::get_user_profile_path(name) {
-        if p.exists() {
-            return p;
-        }
+    if let Ok(p) = profile::get_user_profile_path(name)
+        && p.exists()
+    {
+        return p;
     }
     if let Some(p) = profile::find_pack_store_profile(name) {
         return p;
@@ -2404,14 +2404,14 @@ pub(crate) fn cmd_promote(args: ProfilePromoteArgs) -> Result<()> {
         None
     };
 
-    if current_bytes.is_none() {
-        if let Some(source) = reserved_profile_source(&args.name)? {
-            return Err(NonoError::ProfileParse(format!(
-                "refusing to promote '{}' because it would shadow a {source} profile. \
+    if current_bytes.is_none()
+        && let Some(source) = reserved_profile_source(&args.name)?
+    {
+        return Err(NonoError::ProfileParse(format!(
+            "refusing to promote '{}' because it would shadow a {source} profile. \
                  Draft a derived profile such as '{}-local' with \"extends\": \"{}\" instead.",
-                args.name, args.name, args.name
-            )));
-        }
+            args.name, args.name, args.name
+        )));
     }
 
     if let Some(current) = current_bytes.as_deref() {

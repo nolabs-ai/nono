@@ -19,18 +19,17 @@ fn resolve_allowed_domains(profile: &profile::Profile) -> Vec<String> {
 
     let mut domains = Vec::new();
 
-    if let Some(net_profile_name) = profile.network.resolved_network_profile() {
-        if let Ok(resolved) = network_policy::resolve_network_profile(&net_policy, net_profile_name)
-        {
-            domains.extend(resolved.hosts);
-            for suffix in &resolved.suffixes {
-                let wildcard = if suffix.starts_with('.') {
-                    format!("*{}", suffix)
-                } else {
-                    format!("*.{}", suffix)
-                };
-                domains.push(wildcard);
-            }
+    if let Some(net_profile_name) = profile.network.resolved_network_profile()
+        && let Ok(resolved) = network_policy::resolve_network_profile(&net_policy, net_profile_name)
+    {
+        domains.extend(resolved.hosts);
+        for suffix in &resolved.suffixes {
+            let wildcard = if suffix.starts_with('.') {
+                format!("*{}", suffix)
+            } else {
+                format!("*.{}", suffix)
+            };
+            domains.push(wildcard);
         }
     }
 
@@ -43,7 +42,7 @@ fn resolve_allowed_domains(profile: &profile::Profile) -> Vec<String> {
 }
 
 pub(crate) fn run_why(args: WhyArgs) -> Result<()> {
-    use query_ext::{print_result, query_network, query_path, QueryResult};
+    use query_ext::{QueryResult, print_result, query_network, query_path};
     use sandbox_state::load_sandbox_state;
 
     let ctx: WhyContext = if args.self_query {

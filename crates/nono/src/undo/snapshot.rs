@@ -773,13 +773,13 @@ impl SnapshotManager {
             let exclusion = self.filter_for_root(tracked);
 
             if tracked.is_file() {
-                if !exclusion.is_excluded(tracked) {
-                    if let Ok(state) = file_state_from_metadata(tracked) {
-                        entries_visited = entries_visited.saturating_add(1);
-                        total_bytes = total_bytes.saturating_add(state.size);
-                        self.check_budget(entries_visited, total_bytes)?;
-                        files.insert(tracked.clone(), state);
-                    }
+                if !exclusion.is_excluded(tracked)
+                    && let Ok(state) = file_state_from_metadata(tracked)
+                {
+                    entries_visited = entries_visited.saturating_add(1);
+                    total_bytes = total_bytes.saturating_add(state.size);
+                    self.check_budget(entries_visited, total_bytes)?;
+                    files.insert(tracked.clone(), state);
                 }
                 continue;
             }

@@ -10,8 +10,8 @@
 //! read instruction files at initialization.
 
 use colored::Colorize;
-use nono::trust::{self, Enforcement, TrustPolicy, VerificationOutcome, VerificationResult};
 use nono::Result;
+use nono::trust::{self, Enforcement, TrustPolicy, VerificationOutcome, VerificationResult};
 use std::path::{Path, PathBuf};
 
 /// Load the trust policy for scanning, auto-discovering from the given root and user config.
@@ -431,10 +431,10 @@ pub fn run_pre_exec_scan(
         let file_path = std::path::PathBuf::from(&expanded);
 
         // Skip if already verified via the multi-subject bundle above
-        if let Ok(canon) = std::fs::canonicalize(&file_path) {
-            if multi_verified_paths.contains(&canon) {
-                continue;
-            }
+        if let Ok(canon) = std::fs::canonicalize(&file_path)
+            && multi_verified_paths.contains(&canon)
+        {
+            continue;
         }
 
         let result = verify_instruction_file(&file_path, policy);
@@ -475,10 +475,10 @@ fn expand_home(path: &str) -> String {
         if let Some(home) = dirs::home_dir() {
             return home.join(rest).to_string_lossy().into_owned();
         }
-    } else if path == "~" {
-        if let Some(home) = dirs::home_dir() {
-            return home.to_string_lossy().into_owned();
-        }
+    } else if path == "~"
+        && let Some(home) = dirs::home_dir()
+    {
+        return home.to_string_lossy().into_owned();
     }
     path.to_string()
 }
@@ -825,12 +825,12 @@ pub(crate) fn safe_subject_path(
     let canon_root = std::fs::canonicalize(scan_root)
         .map_err(|e| format!("failed to canonicalize scan root: {e}"))?;
 
-    if let Ok(canon_path) = std::fs::canonicalize(&joined) {
-        if !canon_path.starts_with(&canon_root) {
-            return Err(format!(
-                "subject '{name}' resolves outside scan root via symlink"
-            ));
-        }
+    if let Ok(canon_path) = std::fs::canonicalize(&joined)
+        && !canon_path.starts_with(&canon_root)
+    {
+        return Err(format!(
+            "subject '{name}' resolves outside scan root via symlink"
+        ));
     }
 
     Ok(joined)
@@ -923,7 +923,7 @@ fn verify_multi_subject_bundle(
                     }];
                 }
             };
-            if let Some((_, ref digest)) = subjects.first() {
+            if let Some((_, digest)) = subjects.first() {
                 verify_keyless_crypto(bundle_path, digest, &bundle, bundle_path)
             } else {
                 Err(VerificationOutcome::InvalidSignature {

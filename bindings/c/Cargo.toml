@@ -19,3 +19,6 @@ nono = { version = "0.53.0", path = "../../crates/nono", default-features = fals
 
 [build-dependencies]
 cbindgen.workspace = true
+
+[lints]
+workspace = true

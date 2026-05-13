@@ -76,13 +76,13 @@ fn add_literal_write_deny(caps: &mut CapabilitySet, path: &Path) -> Result<()> {
     caps.add_platform_rule(deny_rule)?;
 
     // Handle macOS symlinks: emit rule for canonical path too
-    if let Ok(canonical) = std::fs::canonicalize(path) {
-        if canonical != path {
-            let canonical_str = canonical.display().to_string();
-            validate_seatbelt_path(&canonical_str)?;
-            let canonical_rule = format!("(deny file-write-data (literal \"{canonical_str}\"))");
-            caps.add_platform_rule(canonical_rule)?;
-        }
+    if let Ok(canonical) = std::fs::canonicalize(path)
+        && canonical != path
+    {
+        let canonical_str = canonical.display().to_string();
+        validate_seatbelt_path(&canonical_str)?;
+        let canonical_rule = format!("(deny file-write-data (literal \"{canonical_str}\"))");
+        caps.add_platform_rule(canonical_rule)?;
     }
 
     Ok(())

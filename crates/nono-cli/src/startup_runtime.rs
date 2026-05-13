@@ -1,8 +1,8 @@
 use crate::cli::{Commands, RunArgs};
 use crate::sandbox_prepare::resolve_detached_cwd_prompt_response;
 use crate::{
-    output, session, update_check, DETACHED_CWD_PROMPT_RESPONSE_ENV, DETACHED_LAUNCH_ENV,
-    DETACHED_SESSION_ID_ENV,
+    DETACHED_CWD_PROMPT_RESPONSE_ENV, DETACHED_LAUNCH_ENV, DETACHED_SESSION_ID_ENV, output,
+    session, update_check,
 };
 #[cfg(unix)]
 use nix::libc;
@@ -89,10 +89,10 @@ pub(crate) fn show_update_notification(
     handle: &mut Option<update_check::UpdateCheckHandle>,
     silent: bool,
 ) {
-    if let Some(handle) = handle.take() {
-        if let Some(info) = handle.take_result() {
-            output::print_update_notification(&info, silent);
-        }
+    if let Some(handle) = handle.take()
+        && let Some(info) = handle.take_result()
+    {
+        output::print_update_notification(&info, silent);
     }
 }
 
@@ -330,7 +330,9 @@ Capabilities:
 
         assert_eq!(
             summarize_startup_log_contents(contents).as_deref(),
-            Some("2026-03-23T18:08:00.249207Z ERROR Sandbox initialization failed: Profile inheritance error: circular dependency detected: claude-code -> claude-code")
+            Some(
+                "2026-03-23T18:08:00.249207Z ERROR Sandbox initialization failed: Profile inheritance error: circular dependency detected: claude-code -> claude-code"
+            )
         );
     }
 

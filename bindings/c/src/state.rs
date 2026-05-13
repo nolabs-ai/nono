@@ -22,7 +22,7 @@ pub struct NonoSandboxState {
 /// # Safety
 ///
 /// `caps` must be a valid pointer or NULL.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn nono_sandbox_state_from_caps(
     caps: *const NonoCapabilitySet,
 ) -> *mut NonoSandboxState {
@@ -44,7 +44,7 @@ pub unsafe extern "C" fn nono_sandbox_state_from_caps(
 ///
 /// `state` must be NULL or a pointer previously returned by
 /// `nono_sandbox_state_from_caps()` or `nono_sandbox_state_from_json()`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn nono_sandbox_state_free(state: *mut NonoSandboxState) {
     if !state.is_null() {
         // SAFETY: The pointer was created by Box::into_raw() in a factory
@@ -64,7 +64,7 @@ pub unsafe extern "C" fn nono_sandbox_state_free(state: *mut NonoSandboxState) {
 /// # Safety
 ///
 /// `state` must be a valid pointer or NULL.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn nono_sandbox_state_to_json(state: *const NonoSandboxState) -> *mut c_char {
     if state.is_null() {
         return std::ptr::null_mut();
@@ -87,7 +87,7 @@ pub unsafe extern "C" fn nono_sandbox_state_to_json(state: *const NonoSandboxSta
 /// # Safety
 ///
 /// `json` must be a valid null-terminated UTF-8 string.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn nono_sandbox_state_from_json(
     json: *const c_char,
 ) -> *mut NonoSandboxState {
@@ -117,7 +117,7 @@ pub unsafe extern "C" fn nono_sandbox_state_from_json(
 /// # Safety
 ///
 /// `state` must be a valid pointer or NULL.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn nono_sandbox_state_to_caps(
     state: *const NonoSandboxState,
 ) -> *mut NonoCapabilitySet {

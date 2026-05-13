@@ -1,7 +1,7 @@
 use crate::cli::SandboxArgs;
 use crate::launch_runtime::ProxyLaunchOptions;
 use crate::network_policy;
-use crate::sandbox_prepare::{validate_external_proxy_bypass, PreparedSandbox};
+use crate::sandbox_prepare::{PreparedSandbox, validate_external_proxy_bypass};
 #[cfg(not(target_os = "macos"))]
 use nono::AccessMode;
 use nono::{CapabilitySet, NonoError, Result};

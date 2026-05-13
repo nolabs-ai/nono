@@ -152,15 +152,13 @@ fn parse_windows_registry_value(output: &str, name: &str) -> Option<String> {
         let kind = parts.next()?;
         let value = parts.collect::<Vec<_>>().join(" ");
         if !value.is_empty() {
-            if kind == "REG_DWORD" {
-                if let Some(hex) = value
+            if kind == "REG_DWORD"
+                && let Some(hex) = value
                     .strip_prefix("0x")
                     .or_else(|| value.strip_prefix("0X"))
-                {
-                    if let Ok(number) = u64::from_str_radix(hex, 16) {
-                        return Some(number.to_string());
-                    }
-                }
+                && let Ok(number) = u64::from_str_radix(hex, 16)
+            {
+                return Some(number.to_string());
             }
             return Some(value);
         }
@@ -291,7 +289,7 @@ impl<'de> Deserialize<'de> for When {
 }
 
 pub fn when_matches_current(when: Option<&When>) -> Result<bool> {
-    Ok(when.map_or(true, |predicate| predicate.matches(current())))
+    Ok(when.is_none_or(|predicate| predicate.matches(current())))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -413,11 +411,7 @@ impl Predicate {
             PredicateOs::Windows => self.matches_windows(platform),
             PredicateOs::Unknown(_) => false,
         };
-        if self.negated {
-            !matched
-        } else {
-            matched
-        }
+        if self.negated { !matched } else { matched }
     }
 
     fn matches_linux(&self, platform: &PlatformInfo) -> bool {
@@ -446,10 +440,10 @@ impl Predicate {
                 return false;
             }
         }
-        if let Some(variant) = &self.variant {
-            if info.variant_id.as_deref() != Some(variant.as_str()) {
-                return false;
-            }
+        if let Some(variant) = &self.variant
+            && info.variant_id.as_deref() != Some(variant.as_str())
+        {
+            return false;
         }
         true
     }
@@ -474,10 +468,10 @@ impl Predicate {
         let Some(info) = &platform.windows else {
             return false;
         };
-        if let Some(version) = &self.version {
-            if !version.matches(&info.version) {
-                return false;
-            }
+        if let Some(version) = &self.version
+            && !version.matches(&info.version)
+        {
+            return false;
         }
         if let Some(build) = &self.build {
             let build_version = info.version.rsplit('.').next().map_or("", |part| part);
@@ -646,21 +640,31 @@ VARIANT_ID=workstation
     fn linux_predicates_match_distro_like_version_and_variant() {
         let platform = fedora();
         assert!(When::parse("linux").expect("parse").matches(&platform));
-        assert!(When::parse("linux:fedora")
-            .expect("parse")
-            .matches(&platform));
-        assert!(When::parse("linux:rhel-like")
-            .expect("parse")
-            .matches(&platform));
-        assert!(When::parse("linux:fedora:>=42")
-            .expect("parse")
-            .matches(&platform));
-        assert!(When::parse("linux:fedora:43:workstation")
-            .expect("parse")
-            .matches(&platform));
-        assert!(!When::parse("linux:ubuntu")
-            .expect("parse")
-            .matches(&platform));
+        assert!(
+            When::parse("linux:fedora")
+                .expect("parse")
+                .matches(&platform)
+        );
+        assert!(
+            When::parse("linux:rhel-like")
+                .expect("parse")
+                .matches(&platform)
+        );
+        assert!(
+            When::parse("linux:fedora:>=42")
+                .expect("parse")
+                .matches(&platform)
+        );
+        assert!(
+            When::parse("linux:fedora:43:workstation")
+                .expect("parse")
+                .matches(&platform)
+        );
+        assert!(
+            !When::parse("linux:ubuntu")
+                .expect("parse")
+                .matches(&platform)
+        );
     }
 
     #[test]
@@ -683,15 +687,21 @@ VARIANT_ID=workstation
                 edition: Some("Professional".to_string()),
             }),
         };
-        assert!(When::parse("windows:>=10:>=22000")
-            .expect("parse")
-            .matches(&platform));
-        assert!(When::parse("windows:>=10:22631")
-            .expect("parse")
-            .matches(&platform));
-        assert!(!When::parse("windows:>=10:>30000")
-            .expect("parse")
-            .matches(&platform));
+        assert!(
+            When::parse("windows:>=10:>=22000")
+                .expect("parse")
+                .matches(&platform)
+        );
+        assert!(
+            When::parse("windows:>=10:22631")
+                .expect("parse")
+                .matches(&platform)
+        );
+        assert!(
+            !When::parse("windows:>=10:>30000")
+                .expect("parse")
+                .matches(&platform)
+        );
     }
 
     #[test]

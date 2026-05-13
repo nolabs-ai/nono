@@ -10,12 +10,12 @@ use crate::command_display::{format_command_line, truncate_chars};
 use crate::config::user::load_user_config;
 use crate::rollback_base_exclusions;
 use crate::rollback_session::{
-    discover_sessions, format_bytes, load_session, remove_session, rollback_root, SessionInfo,
+    SessionInfo, discover_sessions, format_bytes, load_session, remove_session, rollback_root,
 };
 use crate::theme;
 use colored::Colorize;
 use nono::undo::{MerkleTree, ObjectStore, SnapshotManager};
-use nono::{try_canonicalize, NonoError, Result};
+use nono::{NonoError, Result, try_canonicalize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -535,19 +535,19 @@ fn print_full_content(changes: &[nono::undo::Change], object_store: &ObjectStore
             _ => change.new_hash.as_ref(),
         };
 
-        if let Some(hash) = content_hash {
-            if let Ok(content) = object_store.retrieve(hash) {
-                if let Ok(text) = String::from_utf8(content) {
-                    for (i, line) in text.lines().enumerate() {
-                        eprintln!(
-                            "  {} {}",
-                            format!("{:4}", i + 1).truecolor(100, 100, 100),
-                            line
-                        );
-                    }
-                } else {
-                    eprintln!("  (binary file)");
+        if let Some(hash) = content_hash
+            && let Ok(content) = object_store.retrieve(hash)
+        {
+            if let Ok(text) = String::from_utf8(content) {
+                for (i, line) in text.lines().enumerate() {
+                    eprintln!(
+                        "  {} {}",
+                        format!("{:4}", i + 1).truecolor(100, 100, 100),
+                        line
+                    );
                 }
+            } else {
+                eprintln!("  (binary file)");
             }
         }
         eprintln!();
@@ -822,10 +822,11 @@ fn cmd_cleanup(args: RollbackCleanupArgs) -> Result<()> {
             .as_secs();
 
         for s in &sessions {
-            if let Some(started) = parse_session_start_time(s) {
-                if now.saturating_sub(started) > cutoff_secs && !s.is_alive {
-                    to_remove.push(s);
-                }
+            if let Some(started) = parse_session_start_time(s)
+                && now.saturating_sub(started) > cutoff_secs
+                && !s.is_alive
+            {
+                to_remove.push(s);
             }
         }
     } else {
@@ -838,12 +839,11 @@ fn cmd_cleanup(args: RollbackCleanupArgs) -> Result<()> {
 
         // Orphaned sessions (process crashed/killed before clean exit)
         for s in &sessions {
-            if s.is_stale {
-                if let Some(started) = parse_session_start_time(s) {
-                    if now.saturating_sub(started) > orphan_grace_secs {
-                        to_remove.push(s);
-                    }
-                }
+            if s.is_stale
+                && let Some(started) = parse_session_start_time(s)
+                && now.saturating_sub(started) > orphan_grace_secs
+            {
+                to_remove.push(s);
             }
         }
 

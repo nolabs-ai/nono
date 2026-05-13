@@ -3442,12 +3442,12 @@ mod tests {
         let cli =
             Cli::try_parse_from(["nono", "profile", "show", "default", "--format", "manifest"])
                 .expect("profile show --format manifest must parse");
-        if let Commands::Profile(args) = cli.command {
-            if let ProfileCommands::Show(a) = args.command {
-                assert_eq!(a.profile, "default");
-                assert!(matches!(a.format, Some(ProfileShowFormat::Manifest)));
-                return;
-            }
+        if let Commands::Profile(args) = cli.command
+            && let ProfileCommands::Show(a) = args.command
+        {
+            assert_eq!(a.profile, "default");
+            assert!(matches!(a.format, Some(ProfileShowFormat::Manifest)));
+            return;
         }
         panic!("expected Commands::Profile(Show(..))");
     }
@@ -3456,12 +3456,12 @@ mod tests {
     fn test_profile_show_parses_with_json_and_raw() {
         let cli = Cli::try_parse_from(["nono", "profile", "show", "default", "--json", "--raw"])
             .expect("profile show --json --raw must parse");
-        if let Commands::Profile(args) = cli.command {
-            if let ProfileCommands::Show(a) = args.command {
-                assert!(a.json);
-                assert!(a.raw);
-                return;
-            }
+        if let Commands::Profile(args) = cli.command
+            && let ProfileCommands::Show(a) = args.command
+        {
+            assert!(a.json);
+            assert!(a.raw);
+            return;
         }
         panic!("expected Commands::Profile(Show(..))");
     }
@@ -3470,12 +3470,12 @@ mod tests {
     fn test_profile_groups_parses() {
         let cli = Cli::try_parse_from(["nono", "profile", "groups", "--json", "--all-platforms"])
             .expect("profile groups --json --all-platforms must parse");
-        if let Commands::Profile(args) = cli.command {
-            if let ProfileCommands::Groups(a) = args.command {
-                assert!(a.json);
-                assert!(a.all_platforms);
-                return;
-            }
+        if let Commands::Profile(args) = cli.command
+            && let ProfileCommands::Groups(a) = args.command
+        {
+            assert!(a.json);
+            assert!(a.all_platforms);
+            return;
         }
         panic!("expected Commands::Profile(Groups(..))");
     }
@@ -3484,11 +3484,11 @@ mod tests {
     fn test_profile_groups_with_name() {
         let cli = Cli::try_parse_from(["nono", "profile", "groups", "deny_credentials"])
             .expect("profile groups <name> must parse");
-        if let Commands::Profile(args) = cli.command {
-            if let ProfileCommands::Groups(a) = args.command {
-                assert_eq!(a.name.as_deref(), Some("deny_credentials"));
-                return;
-            }
+        if let Commands::Profile(args) = cli.command
+            && let ProfileCommands::Groups(a) = args.command
+        {
+            assert_eq!(a.name.as_deref(), Some("deny_credentials"));
+            return;
         }
         panic!("expected Commands::Profile(Groups(..))");
     }
@@ -3497,12 +3497,12 @@ mod tests {
     fn test_profile_diff_parses() {
         let cli = Cli::try_parse_from(["nono", "profile", "diff", "a", "b"])
             .expect("profile diff must parse");
-        if let Commands::Profile(args) = cli.command {
-            if let ProfileCommands::Diff(a) = args.command {
-                assert_eq!(a.profile1, "a");
-                assert_eq!(a.profile2, "b");
-                return;
-            }
+        if let Commands::Profile(args) = cli.command
+            && let ProfileCommands::Diff(a) = args.command
+        {
+            assert_eq!(a.profile1, "a");
+            assert_eq!(a.profile2, "b");
+            return;
         }
         panic!("expected Commands::Profile(Diff(..))");
     }
@@ -3511,11 +3511,11 @@ mod tests {
     fn test_profile_validate_parses() {
         let cli = Cli::try_parse_from(["nono", "profile", "validate", "/tmp/p.json"])
             .expect("profile validate must parse");
-        if let Commands::Profile(args) = cli.command {
-            if let ProfileCommands::Validate(a) = args.command {
-                assert_eq!(a.file.to_string_lossy(), "/tmp/p.json");
-                return;
-            }
+        if let Commands::Profile(args) = cli.command
+            && let ProfileCommands::Validate(a) = args.command
+        {
+            assert_eq!(a.file.to_string_lossy(), "/tmp/p.json");
+            return;
         }
         panic!("expected Commands::Profile(Validate(..))");
     }

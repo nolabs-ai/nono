@@ -566,7 +566,18 @@ pub fn execute_supervised(
                 if let Some(fd) = child_sock_fd
                     && let Some(shim) = create_open_shim(&nono_exe, fd)
                 {
-                    let current_path = std::env::var("PATH").unwrap_or_default();
+                    // Respect any PATH already built for the child, including
+                    // ETI and profile environment filtering.
+                    let current_path = env_c
+                        .iter()
+                        .find_map(|entry| {
+                            entry
+                                .to_str()
+                                .ok()
+                                .and_then(|value| value.strip_prefix("PATH="))
+                                .map(ToString::to_string)
+                        })
+                        .unwrap_or_else(|| std::env::var("PATH").unwrap_or_default());
                     let new_path = format!("PATH={}:{current_path}", shim.dir.path().display());
                     if let Ok(cstr) = CString::new(new_path) {
                         env_c.retain(|c| !c.as_bytes().starts_with(b"PATH="));

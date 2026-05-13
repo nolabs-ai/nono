@@ -167,35 +167,37 @@ rules.
 
 ## Chained Tools
 
-This profile lets the session run `sh`, and lets that shell-shaped caller invoke `git`. Direct session `git` remains denied.
+This profile lets the session run `git`, and lets the `git` child invoke `ssh`.
+Direct session `ssh` remains denied. A shell wrapper is not part of the authority
+chain; `sh -c 'git ls-remote ...'` still reaches the same `git` policy through
+the shim-prefixed `PATH`.
 
 ```json
 {
   "extends": "default",
   "meta": {
-    "name": "eti-sh-git",
-    "description": "Allow sh to call git without direct session git"
+    "name": "eti-git-ssh",
+    "description": "Allow git to call ssh without direct session ssh"
   },
   "workdir": {
     "access": "none"
   },
   "command_policies": {
-    "session_can_use": ["sh"],
+    "session_can_use": ["git"],
     "commands": {
-      "sh": {
-        "executable": "/bin/sh",
-        "can_use": ["git"],
+      "git": {
+        "can_use": ["ssh"],
         "sandbox": {
           "fs_read": ["."],
           "fs_write": ["."],
           "environment": {
-            "allow_vars": ["PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_*", "PYTHONPATH"]
+            "allow_vars": ["PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_*"]
           }
         }
       },
-      "git": {
+      "ssh": {
         "from": {
-          "sh": {
+          "git": {
             "fs_read": ["."],
             "environment": {
               "allow_vars": ["PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_*"]
@@ -212,14 +214,14 @@ This profile lets the session run `sh`, and lets that shell-shaped caller invoke
 Run:
 
 ```bash
-nono run --profile eti-sh-git -- sh -c 'git --version'
-nono run --profile eti-sh-git -- git --version
+nono run --profile eti-git-ssh -- git ls-remote git@github.com:owner/repo.git
+nono run --profile eti-git-ssh -- ssh -T git@github.com
 ```
 
 Expected:
 
-- `sh` calling `git` succeeds;
-- direct session `git` is denied.
+- `git` calling `ssh` succeeds;
+- direct session `ssh` is denied.
 
 ## Build Tool Chains
 

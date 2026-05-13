@@ -1,9 +1,9 @@
 {
   "extends": "default",
   "meta": {
-    "name": "kubectl-helm-bash-demo",
+    "name": "kubectl-helm-demo",
     "version": "1.0.0",
-    "description": "Kubernetes deployment pipeline with progressive privilege reduction",
+    "description": "Kubernetes command policy demo keyed on kubectl and helm identities",
     "author": "k8s-automation"
   },
   "security": {
@@ -19,7 +19,8 @@
   "interactive": false,
   "command_policies": {
     "session_can_use": [
-      "sh"
+      "kubectl",
+      "helm"
     ],
     "credentials": {
       "kubeconfig": {
@@ -28,145 +29,134 @@
       }
     },
     "commands": {
-      "sh": {
-        "executable": "/bin/sh",
-        "can_use": [
-          "kubectl",
-          "helm"
-        ],
-        "from": {
-          "kubectl": {
-            "fs_read": [
-              "."
-            ],
-            "fs_write": [
-              ".",
-              "$TMPDIR"
-            ],
-            "environment": {
-              "allow_vars": [
-                "PATH",
-                "HOME",
-                "TMPDIR",
-                "KUBECONFIG",
-                "KUBE_NAMESPACE",
-                "KUBE_CONTEXT",
-                "HELM_*"
-              ]
-            }
-          },
-          "helm": {
-            "fs_read": [
-              "."
-            ],
-            "fs_write": [
-              ".",
-              "$TMPDIR"
-            ],
-            "environment": {
-              "allow_vars": [
-                "PATH",
-                "HOME",
-                "TMPDIR",
-                "KUBECONFIG",
-                "KUBE_NAMESPACE",
-                "KUBE_CONTEXT",
-                "HELM_*"
-              ]
-            }
-          }
-        },
+      "kubectl": {
         "sandbox": {
+          "use_credentials": [
+            "kubeconfig"
+          ],
           "fs_read": [
-            "."
+            ".",
+            "$HOME/.kube"
           ],
           "fs_write": [
-            "."
+            ".",
+            "$TMPDIR"
+          ],
+          "fs_read_file": [
+            "$HOME/.kube/config"
           ],
           "environment": {
             "allow_vars": [
               "PATH",
               "HOME",
-              "USER",
+              "TMPDIR",
               "KUBECONFIG",
-              "KUBE_*"
+              "KUBE_NAMESPACE",
+              "KUBE_CONTEXT"
             ]
+          },
+          "network": {
+            "allow_all": true
           }
-        }
-      },
-      "kubectl": {
-        "can_use": [
-          "sh"
-        ],
-        "from": {
-          "sh": {
-            "allow_raw_file_credentials_in_chained_policy": true,
-            "use_credentials": [
-              "kubeconfig"
+        },
+        "intercept": [
+          {
+            "args": [
+              "delete"
             ],
-            "fs_read": [
-              ".",
-              "$HOME/.kube"
-            ],
-            "fs_write": [
-              ".",
-              "$TMPDIR"
-            ],
-            "fs_read_file": [
-              "$HOME/.kube/config"
-            ],
-            "environment": {
-              "allow_vars": [
-                "PATH",
-                "HOME",
-                "KUBECONFIG",
-                "KUBE_NAMESPACE",
-                "KUBE_CONTEXT"
-              ]
-            },
-            "network": {
-              "allow_all": true
+            "action": {
+              "type": "approve",
+              "timeout_secs": 60
             }
           },
-          "session": "deny"
-        }
+          {
+            "args": [
+              "drain"
+            ],
+            "action": {
+              "type": "approve",
+              "timeout_secs": 60
+            }
+          },
+          {
+            "args": [
+              "cordon"
+            ],
+            "action": {
+              "type": "approve",
+              "timeout_secs": 60
+            }
+          },
+          {
+            "args": [
+              "uncordon"
+            ],
+            "action": {
+              "type": "approve",
+              "timeout_secs": 60
+            }
+          },
+          {
+            "args": [
+              "create",
+              "clusterrolebinding"
+            ],
+            "action": {
+              "type": "approve",
+              "timeout_secs": 60
+            }
+          },
+          {
+            "args": [
+              "auth",
+              "reconcile"
+            ],
+            "action": {
+              "type": "approve",
+              "timeout_secs": 60
+            }
+          },
+          {
+            "args": [
+              "replace",
+              "--force"
+            ],
+            "action": {
+              "type": "approve",
+              "timeout_secs": 60
+            }
+          }
+        ]
       },
       "helm": {
-        "can_use": [
-          "sh"
-        ],
-        "from": {
-          "sh": {
-            "allow_raw_file_credentials_in_chained_policy": true,
-            "use_credentials": [
-              "kubeconfig"
-            ],
-            "fs_read": [
-              "."
-            ],
-            "fs_write": [
-              ".",
-              "$TMPDIR"
-            ],
-            "fs_read_file": [
-              "$HOME/.config/helm/repositories.yaml",
-              "$HOME/.kube/config"
-            ],
-            "environment": {
-              "allow_vars": [
-                "PATH",
-                "HOME",
-                "HELM_*",
-                "KUBECONFIG",
-                "KUBE_NAMESPACE",
-                "TMPDIR"
-              ]
-            },
-            "network": {
-              "allow_all": true
-            }
+        "sandbox": {
+          "use_credentials": [
+            "kubeconfig"
+          ],
+          "fs_read": [
+            "."
+          ],
+          "fs_write": [
+            ".",
+            "$TMPDIR"
+          ],
+          "fs_read_file": [
+            "$HOME/.config/helm/repositories.yaml",
+            "$HOME/.kube/config"
+          ],
+          "environment": {
+            "allow_vars": [
+              "PATH",
+              "HOME",
+              "TMPDIR",
+              "HELM_*",
+              "KUBECONFIG",
+              "KUBE_NAMESPACE"
+            ]
           },
-          "session": "deny"
+          "network": {
+            "allow_all": true
+          }
         }
       }
     }

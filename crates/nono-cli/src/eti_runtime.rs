@@ -167,6 +167,7 @@ mod linux {
         config: CommandPoliciesConfig,
         resolved: ResolvedCommandBinaries,
         deny_only: BTreeMap<String, ResolvedDenyOnlyCommand>,
+        executable_dirs: Vec<PathBuf>,
         allowed_direct_bypasses: Vec<PathBuf>,
         allowed_direct_bypass_ids: HashSet<FileId>,
     }
@@ -315,11 +316,10 @@ mod linux {
             let path_env = std::env::var_os("PATH");
             let resolved =
                 crate::command_policy::resolve_policy_command_binaries(config, path_env.clone())?;
-            // Validate that PATH directories used by the deny_only resolver are
-            // not group/world writable. We no longer sweep PATH into the outer
-            // exec gate, but resolve_deny_only_commands still uses these dirs to
-            // shadow dangerous binaries with deny shims, so the trust still
-            // matters.
+            // Validate PATH/configured executable directories before using them
+            // for deny-only resolution and the outer executable identity gate.
+            // The gate allows non-controlled executables while excluding
+            // controlled command identities by path/inode.
             let search_dirs = command_search_dirs(config, path_env)?;
             validate_trusted_executable_dirs(&search_dirs)?;
             let deny_only = resolve_deny_only_commands(config, blocked_commands, allowed_commands)?;
@@ -332,6 +332,7 @@ mod linux {
                 config: config.clone(),
                 resolved,
                 deny_only,
+                executable_dirs: search_dirs,
                 allowed_direct_bypasses,
                 allowed_direct_bypass_ids,
             })
@@ -399,11 +400,8 @@ mod linux {
             );
 
             let start_outer_exec = std::time::Instant::now();
-            let allowed_outer_exec_files = build_outer_exec_files(
-                shims_by_command.values(),
-                &plan.allowed_direct_bypasses,
-                &shim_source,
-            )?;
+            let allowed_outer_exec_files =
+                build_outer_exec_files(shims_by_command.values(), &plan, &shim_source)?;
             eti_profile_log!(
                 "prepare:build_outer_exec_files: {:?} ({} paths)",
                 start_outer_exec.elapsed(),
@@ -525,16 +523,16 @@ mod linux {
                 .map(|identity| identity.path.as_path())
         }
 
-        /// Default-deny gate for the initial command when ETI is active.
+        /// Initial command identity gate when ETI is active.
         ///
         /// Allowed cases:
         /// - bare command name (no `/`) that is a policy command — runs through its shim
         /// - any path or name whose canonical inode is in `allow_direct_exec_bypass`
+        /// - non-controlled executable identities, which continue under the
+        ///   outer session sandbox
         ///
-        /// Everything else is rejected. In particular, this prevents
-        /// `session_can_use` from being bypassed by invoking a non-policy
-        /// executable on `PATH` (e.g. `python`, `node`, `openssl`) or by
-        /// targeting a controlled / deny-only binary directly by path.
+        /// Direct execution of a controlled or deny-only binary is rejected by
+        /// the binary identity, independent of the wrapper that attempted it.
         pub(crate) fn validate_initial_exec(
             &self,
             original_program: &str,
@@ -3304,19 +3302,36 @@ mod linux {
 
     /// Build the Landlock execute allow-list applied in the supervised child.
     ///
-    /// When ETI is active we deliberately do NOT sweep `PATH`. The supervised
-    /// child only execs one of: a shim (for policy commands) or an explicit
-    /// `allow_direct_exec_bypass` path. Allowing every executable on `PATH`
-    /// would let non-policy binaries (python, node, openssl, …) run under
-    /// outer caps, bypassing `session_can_use`, and would also trust binaries
-    /// that the session may have outer write access to (e.g. `~/.local/bin`).
+    /// This is the v4 file-identity boundary: non-controlled executables in
+    /// trusted executable dirs remain runnable under the outer session sandbox,
+    /// while policy-controlled and deny-only command identities are excluded.
+    /// PATH shims are the cooperative route for those controlled identities.
     fn build_outer_exec_files<'a>(
         shims: impl Iterator<Item = &'a ShimIdentity>,
-        allowed_direct_bypasses: &[PathBuf],
+        plan: &ResolvedEtiPlan,
         shim_source: &Path,
     ) -> Result<Vec<PathBuf>> {
         let mut seen = HashSet::new();
         let mut files = Vec::new();
+
+        let mut controlled_ids: HashSet<FileId> = plan
+            .resolved
+            .commands
+            .values()
+            .map(|binary| FileId {
+                dev: binary.dev,
+                ino: binary.ino,
+            })
+            .collect();
+        controlled_ids.extend(plan.deny_only.values().map(|entry| entry.id));
+
+        add_non_controlled_executables(
+            &mut files,
+            &mut seen,
+            &plan.executable_dirs,
+            &controlled_ids,
+        )?;
+
         for shim in shims {
             add_exact_exec_file(&mut files, &mut seen, &shim.path)?;
         }
@@ -3327,11 +3342,49 @@ mod linux {
         for dep in &shim_closure {
             let _ = add_exact_exec_file(&mut files, &mut seen, dep);
         }
-        for bypass in allowed_direct_bypasses {
+        for bypass in &plan.allowed_direct_bypasses {
             add_exact_exec_file(&mut files, &mut seen, bypass)?;
         }
         files.sort();
         Ok(files)
+    }
+
+    fn add_non_controlled_executables(
+        files: &mut Vec<PathBuf>,
+        seen: &mut HashSet<FileId>,
+        dirs: &[PathBuf],
+        controlled_ids: &HashSet<FileId>,
+    ) -> Result<()> {
+        for dir in dirs {
+            let entries = fs::read_dir(dir).map_err(|source| NonoError::ConfigRead {
+                path: dir.clone(),
+                source,
+            })?;
+            for entry in entries {
+                let entry = entry.map_err(|source| NonoError::ConfigRead {
+                    path: dir.clone(),
+                    source,
+                })?;
+                let path = entry.path();
+                let Ok(canonical) = path.canonicalize() else {
+                    continue;
+                };
+                let Ok(metadata) = fs::metadata(&canonical) else {
+                    continue;
+                };
+                if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
+                    continue;
+                }
+                let id = file_id(&metadata);
+                if controlled_ids.contains(&id) {
+                    continue;
+                }
+                if seen.insert(id) {
+                    files.push(canonical);
+                }
+            }
+        }
+        Ok(())
     }
 
     fn add_exact_exec_file(
@@ -3458,7 +3511,7 @@ mod linux {
         resolved_commands: &BTreeMap<String, ResolvedCommandBinary>,
         deny_only: &BTreeMap<String, ResolvedDenyOnlyCommand>,
         original_program: &str,
-        resolved_program: &Path,
+        _resolved_program: &Path,
         id: FileId,
     ) -> Option<NonoError> {
         if allowed_bypass_ids.contains(&id) {
@@ -3482,15 +3535,7 @@ mod linux {
                 });
             }
         }
-        Some(NonoError::BlockedCommand {
-            command: original_program.to_string(),
-            reason: format!(
-                "ETI denies non-policy initial exec of '{}'; add the command name to \
-                 command_policies.session_can_use or its canonical path to \
-                 allow_direct_exec_bypass",
-                resolved_program.display()
-            ),
-        })
+        None
     }
 
     fn is_tty(fd: i32) -> bool {
@@ -4065,7 +4110,7 @@ mod linux {
         }
 
         #[test]
-        fn unknown_inode_is_blocked() {
+        fn unknown_inode_is_allowed_as_non_controlled_executable() {
             let id = FileId { dev: 3, ino: 1 };
             let bypass = HashSet::new();
             let resolved = BTreeMap::new();
@@ -4079,7 +4124,10 @@ mod linux {
                 Path::new("/tmp/unknown"),
                 id,
             );
-            assert!(result.is_some(), "unknown inode must be blocked");
+            assert!(
+                result.is_none(),
+                "non-controlled executable identities must not be blocked by ETI policy"
+            );
         }
 
         // ── apply_environment_set_vars: dangerous key rejection ───────────────
@@ -4381,6 +4429,7 @@ mod macos {
 
     #[derive(Debug, Clone)]
     struct ResolvedDenyOnlyCommand {
+        path: PathBuf,
         id: FileId,
     }
 
@@ -4577,7 +4626,7 @@ mod macos {
                 .map(|identity| identity.path.as_path())
         }
 
-        /// Default-deny gate for the initial command when macOS ETI is active.
+        /// Initial command identity gate when macOS ETI is active.
         pub(crate) fn validate_initial_exec(
             &self,
             original_program: &str,
@@ -5454,23 +5503,22 @@ mod macos {
     }
 
     fn add_outer_process_exec_gate(caps: &mut CapabilitySet, state: &EtiState) -> Result<()> {
-        let mut allowed = Vec::new();
-        allowed.extend(
-            state
-                .shims_by_command
-                .values()
-                .map(|identity| identity.path.clone()),
-        );
+        let mut denied = BTreeSet::new();
         for binary in state.plan.resolved.commands.values() {
             let id = FileId {
                 dev: binary.dev,
                 ino: binary.ino,
             };
-            if state.plan.allowed_direct_bypass_ids.contains(&id) {
-                allowed.push(binary.canonical_path.clone());
+            if !state.plan.allowed_direct_bypass_ids.contains(&id) {
+                add_macos_path_variants(&binary.canonical_path, &mut denied)?;
+                denied.insert(binary.canonical_path.clone());
             }
         }
-        add_process_exec_gate(caps, allowed)
+        for deny_only in state.plan.deny_only.values() {
+            add_macos_path_variants(&deny_only.path, &mut denied)?;
+            denied.insert(deny_only.path.clone());
+        }
+        add_controlled_source_denies(caps, denied)
     }
 
     fn add_child_process_exec_gate(
@@ -5508,7 +5556,7 @@ mod macos {
                         path: path.clone(),
                         source,
                     })?;
-            add_macos_exec_variants(&canonical, &mut allowed)?;
+            add_macos_path_variants(&canonical, &mut allowed)?;
             allowed.insert(canonical);
         }
 
@@ -5520,9 +5568,35 @@ mod macos {
         Ok(())
     }
 
-    fn add_macos_exec_variants(path: &Path, allowed: &mut BTreeSet<PathBuf>) -> Result<()> {
+    fn add_controlled_source_denies(
+        caps: &mut CapabilitySet,
+        denied_paths: impl IntoIterator<Item = PathBuf>,
+    ) -> Result<()> {
+        let mut denied = BTreeSet::new();
+        for path in denied_paths {
+            let canonical =
+                path.canonicalize()
+                    .map_err(|source| NonoError::PathCanonicalization {
+                        path: path.clone(),
+                        source,
+                    })?;
+            denied.insert(canonical);
+        }
+
+        for path in denied {
+            let escaped = crate::policy::escape_seatbelt_path(crate::policy::path_to_utf8(&path)?)?;
+            caps.add_platform_rule(format!("(deny file-read-data (literal \"{escaped}\"))"))?;
+            caps.add_platform_rule(format!(
+                "(deny file-map-executable (literal \"{escaped}\"))"
+            ))?;
+            caps.add_platform_rule(format!("(deny process-exec* (literal \"{escaped}\"))"))?;
+        }
+        Ok(())
+    }
+
+    fn add_macos_path_variants(path: &Path, variants: &mut BTreeSet<PathBuf>) -> Result<()> {
         if path == Path::new("/bin/sh") && Path::new("/bin/bash").exists() {
-            allowed.insert(
+            variants.insert(
                 PathBuf::from("/bin/bash")
                     .canonicalize()
                     .map_err(|source| NonoError::PathCanonicalization {
@@ -5533,7 +5607,7 @@ mod macos {
             for selector in ["/private/var/select/sh", "/var/select/sh"] {
                 let selector = PathBuf::from(selector);
                 if selector.exists() {
-                    allowed.insert(selector);
+                    variants.insert(selector);
                 }
             }
         }
@@ -5544,7 +5618,7 @@ mod macos {
             ] {
                 let variant = PathBuf::from(variant);
                 if variant.exists() {
-                    allowed.insert(variant);
+                    variants.insert(variant);
                 }
             }
         }
@@ -6377,6 +6451,7 @@ mod macos {
                 deny_only.insert(
                     name.clone(),
                     ResolvedDenyOnlyCommand {
+                        path,
                         id: file_id(&metadata),
                     },
                 );
@@ -6572,7 +6647,7 @@ mod macos {
         resolved_commands: &BTreeMap<String, ResolvedCommandBinary>,
         deny_only: &BTreeMap<String, ResolvedDenyOnlyCommand>,
         original_program: &str,
-        resolved_program: &Path,
+        _resolved_program: &Path,
         id: FileId,
     ) -> Option<NonoError> {
         if allowed_bypass_ids.contains(&id) {
@@ -6596,14 +6671,7 @@ mod macos {
                 });
             }
         }
-        Some(NonoError::BlockedCommand {
-            command: original_program.to_string(),
-            reason: format!(
-                "ETI denies non-policy initial exec of '{}'; add the command name to \
-                 command_policies.session_can_use or configure allow_direct_exec_bypass",
-                resolved_program.display()
-            ),
-        })
+        None
     }
 
     // ── Runtime dir + socket ──────────────────────────────────────────────────
@@ -6955,7 +7023,37 @@ mod macos {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use crate::command_policy::CommandEnvironmentConfig;
+        use crate::command_policy::{
+            CommandEnvironmentConfig, ResolvedExecutableKind, ResolvedExecutableShape,
+        };
+
+        fn test_binary(name: &str, path: &Path) -> Result<ResolvedCommandBinary> {
+            let canonical =
+                path.canonicalize()
+                    .map_err(|source| NonoError::PathCanonicalization {
+                        path: path.to_path_buf(),
+                        source,
+                    })?;
+            let metadata = fs::metadata(&canonical).map_err(|source| NonoError::ConfigRead {
+                path: canonical.clone(),
+                source,
+            })?;
+            Ok(ResolvedCommandBinary {
+                name: name.to_string(),
+                canonical_path: canonical,
+                dev: metadata.dev(),
+                ino: metadata.ino(),
+                size: metadata.size(),
+                mtime_nanos: mtime_nanos(&metadata),
+                sha256: String::new(),
+                duplicate_paths: vec![],
+                shape: ResolvedExecutableShape {
+                    kind: ResolvedExecutableKind::Other,
+                    interpreter: None,
+                    interpreter_args: vec![],
+                },
+            })
+        }
 
         fn test_state() -> EtiState {
             let runtime_dir = PathBuf::from("/tmp/nono-eti-test");
@@ -7047,6 +7145,46 @@ mod macos {
                 }));
             }
             Ok(())
+        }
+
+        #[test]
+        fn outer_process_exec_gate_denies_controlled_source_only() -> Result<()> {
+            let mut state = test_state();
+            state.plan.resolved.commands.insert(
+                "echo".to_string(),
+                test_binary("echo", Path::new("/bin/echo"))?,
+            );
+            let mut caps = CapabilitySet::new();
+            add_outer_process_exec_gate(&mut caps, &state)?;
+
+            let rules = caps.platform_rules();
+            assert!(!rules
+                .iter()
+                .any(|rule| rule.as_str() == "(deny process-exec*)"));
+            assert!(rules
+                .iter()
+                .any(|rule| rule.as_str() == "(deny file-read-data (literal \"/bin/echo\"))"));
+            assert!(rules.iter().any(|rule| {
+                rule.as_str() == "(deny file-map-executable (literal \"/bin/echo\"))"
+            }));
+            assert!(rules
+                .iter()
+                .any(|rule| rule.as_str() == "(deny process-exec* (literal \"/bin/echo\"))"));
+            Ok(())
+        }
+
+        #[test]
+        fn exec_gate_allows_non_controlled_initial_exec() {
+            let id = FileId { dev: 42, ino: 7 };
+            let result = check_exec_gate(
+                &HashSet::new(),
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                "/usr/bin/env",
+                Path::new("/usr/bin/env"),
+                id,
+            );
+            assert!(result.is_none());
         }
 
         #[test]

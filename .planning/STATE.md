@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v2.4
 milestone_name: Complete the Partial Ports + UPST4
 status: executing
-last_updated: "2026-05-13T00:41:19.857Z"
+last_updated: "2026-05-13T02:00:00.000Z"
 last_activity: 2026-05-13
 progress:
   total_phases: 7
   completed_phases: 1
   total_plans: 9
-  completed_plans: 6
-  percent: 67
+  completed_plans: 7
+  percent: 78
 ---
 
 # Project State: nono — v2.4 Complete the Partial Ports + UPST4
@@ -26,8 +26,8 @@ See: .planning/PROJECT.md (updated 2026-05-12 at v2.4 milestone start; v2.3 ship
 ## Current Position
 
 Phase: 36 (upst3-deep-closure) — EXECUTING
-Plan: 4 of 6
-Status: Ready to execute
+Plan: 5 of 6
+Status: Executing (36-01b complete; 36-01c next)
 Last activity: 2026-05-13
 
 ## Accumulated Context
@@ -63,6 +63,8 @@ Last activity: 2026-05-13
 - **Phase 12-03 STOP on pre-existing CI failure:** `make ci` fallback surfaced 48 `disallowed_methods` clippy errors in `profile/mod.rs`, `config/mod.rs`, `sandbox_state.rs`. Root-caused to revert `cf5a60a` (2026-04-10), predates Phase 12. Phase 12's own files (`crates/nono/src/sandbox/windows.rs`, `crates/nono-cli/tests/wfp_port_integration.rs`) produce zero clippy diagnostics. Did NOT auto-fix per plan STOP directive (2026-04-11).
 
 ### Key Decisions (v2.4)
+
+- **Phase 36 Plan 36-01b (REQ-PORT-CLOSURE-02) — canonical Profile sections landed (CommandsConfig + FilesystemConfig.deny/bypass_protection, D-20 manual-replay of f0abd413 v0.47.0):** Plan 36-01b extended `FilesystemConfig` with `deny: Vec<String>` and `bypass_protection: Vec<String>` fields (serde alias `override_deny` → `bypass_protection` per D-36-B3 indefinite acceptance), introduced new `CommandsConfig { allow, deny }` sub-struct (mirroring `CapabilitiesConfig` shape precedent, `#[serde(deny_unknown_fields)]`), added `pub commands: CommandsConfig` to `Profile` and `ProfileDeserialize`, and updated `From<ProfileDeserialize> for Profile` exhaustively. `GroupsConfig` wrapper intentionally skipped — `security.groups: Vec<String>` already correct; Plan 36-01c will handle any rename atomically. 9 new canonical-section serde tests (16 total in `canonical_schema_rename_tests`). Key decisions: (1) bypass_protection alias lives on FilesystemConfig, NOT on PolicyPatchConfig::override_deny (that rename is Plan 36-01c); (2) merge_profiles unions commands.allow + commands.deny lists; (3) policy.rs::ProfileDef::to_raw_profile uses CommandsConfig::default() (no commands policy in built-in profiles yet). Phase 35 Map-shape preserved (19 profile_cmd tests green). Cross-target clippy skipped (no cross-compilers on Windows host, same skip as 36-01a). Commits: `7f7d23a4` (test TDD RED) + `0dec5b5d` (feat GREEN) + `47ab31ae` (chore fmt fix). Plan 36 position: 5/6 complete, Plan 36-01c (183-callsite rename) next (2026-05-13).
 
 - **Phase 36 Plan 36-01a (REQ-PORT-CLOSURE-02) — deprecated_schema module foundation landed (D-20 manual-replay of f0abd413 v0.47.0):** Plan 36-01a created `crates/nono-cli/src/deprecated_schema.rs` with `LegacyPolicyPatch` (serde-driven legacy-key rewriter, `#[serde(deny_unknown_fields)]`, `#[must_use] rewrite() -> Result<CanonicalPolicy>`) and `DeprecationCounter` (`OnceLock<HashMap<&'static str, AtomicBool>>` for wait-free per-key one-shot stderr WARN). Wired `--strict` flag on `nono profile validate` (fail-closed on legacy keys). Retired `LEGACY_OVERRIDE_DENY_WARNED: AtomicBool` from `profile/mod.rs` (tombstone cites Plan 36-01a + D-36-B1). 4 unit tests + 3 integration tests all passing. Key decision: `LegacyPolicyPatch` intentionally has NO serde alias for `bypass_protection` — detection ONLY fires on the literal `override_deny` JSON key to avoid false-positive flagging of canonical profiles. Cross-target Linux/macOS clippy skipped (missing cross-compilers on Windows host; CI matrix will catch). Release-mode builds used throughout (pre-existing debug-mode rustc ICE in `x509_cert::builder` unrelated to Phase 36). REQ-PORT-CLOSURE-02 acceptance criteria #1, #2, #3 met; criteria #4-#6 deferred to Plans 36-01b/c/d. Commits: `18aca09b` + `cbe9708b` + `ed09a586` + `1805bff2` (fmt fix). Plan 36 position: 1/6 complete, Plan 2 next (2026-05-12).
 

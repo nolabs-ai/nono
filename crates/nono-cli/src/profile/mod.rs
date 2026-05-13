@@ -220,6 +220,95 @@ mod canonical_schema_rename_tests {
             "CommandsConfig must reject unknown fields via deny_unknown_fields"
         );
     }
+
+    // ----------------------------------------------------------------
+    // Plan 36-01b Task 2: Profile / From<ProfileDeserialize> wiring tests
+    // ----------------------------------------------------------------
+
+    /// T-36-01b-6: canonical Profile JSON with commands + filesystem.deny
+    /// round-trips through From<ProfileDeserialize> without field loss.
+    #[test]
+    fn profile_round_trip_with_canonical_sections() {
+        let json = r#"{
+            "meta": {"name": "test"},
+            "filesystem": {"deny": ["/etc"]},
+            "commands": {"allow": ["git"]}
+        }"#;
+        let profile: Profile =
+            serde_json::from_str(json).expect("canonical Profile must deserialize");
+        assert_eq!(
+            profile.filesystem.deny,
+            vec!["/etc".to_string()],
+            "filesystem.deny must survive From<ProfileDeserialize>"
+        );
+        assert_eq!(
+            profile.commands.allow,
+            vec!["git".to_string()],
+            "commands.allow must survive From<ProfileDeserialize>"
+        );
+    }
+
+    /// T-36-01b-7: legacy filesystem.override_deny key normalizes to
+    /// Profile::filesystem.bypass_protection via serde alias (D-36-B3).
+    #[test]
+    fn legacy_filesystem_override_deny_normalizes_to_bypass_protection() {
+        let json = r#"{"filesystem": {"override_deny": ["/var/log"]}}"#;
+        let profile: Profile =
+            serde_json::from_str(json).expect("legacy alias must deserialize into Profile");
+        assert_eq!(
+            profile.filesystem.bypass_protection,
+            vec!["/var/log".to_string()],
+            "legacy override_deny must populate filesystem.bypass_protection via serde alias"
+        );
+    }
+
+    /// T-36-01b-8: Profile with canonical commands + filesystem sections
+    /// re-serializes with both keys present at expected nesting depth.
+    /// Verifies Phase 35 Plan 35-03 Map-insertion JSON shape composes
+    /// cleanly with the new canonical fields (T-36-01-MAP-SHAPE-REGRESS).
+    #[test]
+    fn profile_canonical_sections_serialize_at_correct_nesting() {
+        let json = r#"{
+            "meta": {"name": "nest-test"},
+            "filesystem": {"deny": ["/proc"], "bypass_protection": ["/tmp/safe"]},
+            "commands": {"deny": ["rm"]}
+        }"#;
+        let profile: Profile =
+            serde_json::from_str(json).expect("Profile must deserialize");
+        let serialized = serde_json::to_value(&profile)
+            .expect("Profile must serialize to JSON value");
+        // commands must be a top-level key with a deny sub-key
+        assert!(
+            serialized["commands"]["deny"].as_array().is_some(),
+            "commands.deny must appear at top-level nesting in serialized JSON"
+        );
+        // filesystem.deny must still exist
+        assert!(
+            serialized["filesystem"]["deny"].as_array().is_some(),
+            "filesystem.deny must appear in serialized JSON"
+        );
+        // filesystem.bypass_protection must still exist
+        assert!(
+            serialized["filesystem"]["bypass_protection"].as_array().is_some(),
+            "filesystem.bypass_protection must appear in serialized JSON"
+        );
+    }
+
+    /// T-36-01b-9: empty commands block defaults both allow and deny to vec![].
+    #[test]
+    fn profile_empty_commands_block_defaults_correctly() {
+        let json = r#"{"commands": {}}"#;
+        let profile: Profile =
+            serde_json::from_str(json).expect("empty commands block must deserialize");
+        assert!(
+            profile.commands.allow.is_empty(),
+            "commands.allow must default to empty vec"
+        );
+        assert!(
+            profile.commands.deny.is_empty(),
+            "commands.deny must default to empty vec"
+        );
+    }
 }
 
 // Re-export InjectMode and OAuth2Config from nono-proxy for use in profiles
@@ -1672,6 +1761,15 @@ pub struct Profile {
     /// first-class capability.
     #[serde(default)]
     pub unsafe_macos_seatbelt_rules: Vec<String>,
+    /// Commands configuration — canonical section per upstream f0abd413 (v0.47.0).
+    ///
+    /// Provides structured allow/deny command lists at the profile level. These
+    /// compose with the group-based command policy from `security.groups` and
+    /// the CLI `--allow-command` / add_deny_commands flags. Plan 36-01c follows
+    /// with the callsite rename that wires this field into the capability
+    /// construction path; this field is the canonical target shape.
+    #[serde(default)]
+    pub commands: CommandsConfig,
 }
 
 #[derive(Deserialize)]
@@ -1719,6 +1817,8 @@ struct ProfileDeserialize {
     #[serde(default)]
     #[serde(alias = "brokered_commands")]
     command_args: Vec<String>,
+    #[serde(default)]
+    commands: CommandsConfig,
 }
 
 impl From<ProfileDeserialize> for Profile {
@@ -1743,6 +1843,10 @@ impl From<ProfileDeserialize> for Profile {
             unsafe_macos_seatbelt_rules: raw.unsafe_macos_seatbelt_rules,
             packs: raw.packs,
             command_args: raw.command_args,
+            // Plan 36-01b: canonical section per upstream f0abd413 (v0.47.0).
+            // Exhaustively enumerated here so rustc's struct-literal completeness
+            // check (T-36-01-CANONICAL) catches any future field additions.
+            commands: raw.commands,
         }
     }
 }
@@ -2416,6 +2520,11 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
         ),
         packs: dedup_append(&base.packs, &child.packs),
         command_args: dedup_append(&base.command_args, &child.command_args),
+        // Plan 36-01b: merge canonical commands sections — union allow + deny lists.
+        commands: CommandsConfig {
+            allow: dedup_append(&base.commands.allow, &child.commands.allow),
+            deny: dedup_append(&base.commands.deny, &child.commands.deny),
+        },
     }
 }
 
@@ -3913,6 +4022,7 @@ mod tests {
             unsafe_macos_seatbelt_rules: Vec::new(),
             packs: Vec::new(),
             command_args: Vec::new(),
+            commands: CommandsConfig::default(),
         }
     }
 
@@ -3989,6 +4099,7 @@ mod tests {
             unsafe_macos_seatbelt_rules: Vec::new(),
             packs: Vec::new(),
             command_args: Vec::new(),
+            commands: CommandsConfig::default(),
         }
     }
 

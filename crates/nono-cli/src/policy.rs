@@ -190,6 +190,11 @@ impl ProfileDef {
             // command_args. Resolution + variable expansion land in Plan 22-03.
             packs: self.packs.clone(),
             command_args: self.command_args.clone(),
+            // Plan 36-01b: canonical commands section per upstream f0abd413.
+            // Built-in policy.json profiles don't declare this section today;
+            // default (empty CommandsConfig) means no additional command
+            // policy beyond the group-based allow/deny lists.
+            commands: profile::CommandsConfig::default(),
         }
     }
 }

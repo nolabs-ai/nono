@@ -141,6 +141,32 @@ impl ProxyHandle {
         rows
     }
 
+    /// Attach a streaming sink for live forwarding of network audit events.
+    ///
+    /// Once attached, every recorded event is also forwarded to `sink` as it
+    /// occurs (in addition to the in-memory buffer drained at session end).
+    /// Returns `Err` if a sink was already attached.
+    pub fn set_audit_streaming_sink(
+        &self,
+        sink: std::sync::Arc<dyn audit::NetworkAuditSink>,
+    ) -> std::result::Result<(), std::sync::Arc<dyn audit::NetworkAuditSink>> {
+        self.audit_log.set_streaming_sink(sink)
+    }
+
+    /// True when a streaming sink has been attached. Used by the supervisor to
+    /// avoid double-recording drained events that were already streamed.
+    #[must_use]
+    pub fn audit_streaming_active(&self) -> bool {
+        self.audit_log.streaming_active()
+    }
+
+    /// Stop accepting new audit events. Must be called before the session's
+    /// final integrity summary is computed; further events would extend the
+    /// file past the recorded Merkle root and break verification.
+    pub fn close_audit_log(&self) {
+        self.audit_log.close();
+    }
+
     /// Environment variables to inject into the child process.
     ///
     /// The proxy URL includes `nono:<token>@` userinfo so that standard HTTP

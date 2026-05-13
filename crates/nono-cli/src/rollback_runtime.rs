@@ -473,16 +473,32 @@ pub(crate) fn finalize_supervised_exit(ctx: RollbackExitContext<'_>) -> Result<(
         rollback_prompt_disabled,
     } = ctx;
 
+    // Stop accepting further proxy audit events before draining and recording
+    // session_ended. Any in-flight response still being audited at this point
+    // would otherwise extend the audit file past the Merkle root we are about
+    // to commit to session metadata.
+    if let Some(handle) = proxy_handle {
+        handle.close_audit_log();
+    }
     let mut network_events = proxy_handle.map_or_else(
         Vec::new,
         nono_proxy::server::ProxyHandle::drain_audit_events,
     );
+    // When the proxy was streaming events into the recorder live, the drained
+    // buffer is already in the file — re-recording would produce duplicates
+    // and break the chain hash. The buffer is still kept for SessionMetadata
+    // below as a snapshot of network activity.
+    let streaming_already_recorded = proxy_handle
+        .map(nono_proxy::server::ProxyHandle::audit_streaming_active)
+        .unwrap_or(false);
     let (audit_event_count, audit_integrity) = if let Some(recorder_mutex) = audit_recorder {
         let mut recorder = recorder_mutex
             .lock()
             .map_err(|_| nono::NonoError::Snapshot("Audit recorder lock poisoned".to_string()))?;
-        for event in &network_events {
-            recorder.record_network_event(event.clone())?;
+        if !streaming_already_recorded {
+            for event in &network_events {
+                recorder.record_network_event(event.clone())?;
+            }
         }
         recorder.record_session_ended(ended.to_string(), exit_code)?;
         let event_count = recorder.event_count();

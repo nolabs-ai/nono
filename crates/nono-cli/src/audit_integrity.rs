@@ -6,6 +6,10 @@ use sha2::{Digest, Sha256};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 
 pub(crate) const AUDIT_EVENTS_FILENAME: &str = "audit-events.ndjson";
 const EVENT_DOMAIN: &[u8] = b"nono.audit.event.alpha\n";
@@ -186,6 +190,199 @@ impl AuditRecorder {
         self.previous_chain = Some(chain_hash);
         self.leaf_hashes.push(leaf_hash);
         Ok(())
+    }
+}
+
+/// Bounded queue capacity for the audit writer channel.
+///
+/// A typical event is a few hundred bytes; this bound caps in-flight memory
+/// well under 10 MB even for the largest events. Bursts from a runaway
+/// agent fit here; sustained overflow drops events with rate-limited
+/// `warn!`s and bumps `dropped_events`.
+const AUDIT_WRITER_QUEUE: usize = 16_384;
+
+enum WriterCmd {
+    /// A network event to append to the recorder. Dropped silently by the
+    /// writer once `done` has been set (see `RecorderStreamingSink` docs).
+    Event(NetworkAuditEvent),
+    /// Drain marker. The writer flips `done` and acks via the included
+    /// `SyncSender<()>`; `flush()` blocks on the ack to provide a
+    /// synchronous "everything before this is on disk" barrier.
+    Flush(SyncSender<()>),
+    /// Terminate the writer loop. Sent from `Drop`.
+    Shutdown,
+}
+
+/// Streaming sink that forwards each network audit event into an
+/// `AuditRecorder` via a bounded channel drained by a dedicated writer
+/// thread, instead of buffering until session exit.
+///
+/// `record()` is non-blocking: it `try_send`s into the queue and returns
+/// immediately. The writer thread is the sole owner of the recorder mutex
+/// on the audit path, so concurrent proxied connections never contend on
+/// disk I/O. Order is preserved because a single consumer drains FIFO,
+/// which is required by the recorder's hash chain and Merkle accumulator.
+///
+/// `flush()` seals the sink: once it returns, the writer has marked itself
+/// `done` and silently drops any event that was enqueued during the
+/// `AuditLog::close` race window. This guarantees the caller can append
+/// further records (e.g. `session_ended`) directly to the same recorder
+/// without the writer racing them through the recorder mutex and
+/// extending the file past the Merkle root captured in `SessionMetadata`.
+///
+/// Errors are logged (not propagated) because audit recording must never
+/// abort an in-flight network request — a poisoned mutex or transient I/O
+/// failure should drop a single event rather than break the proxy.
+pub(crate) struct RecorderStreamingSink {
+    tx: SyncSender<WriterCmd>,
+    /// Count of events rejected because the queue was full or the writer
+    /// was gone. Surfaced via `dropped_events()` and a final `warn!` on
+    /// `Drop` so the operator never silently loses count.
+    dropped: AtomicU64,
+    /// Set by the writer when it processes a `Flush` command. Subsequent
+    /// `Event`s are silently ignored — see struct-level docs.
+    done: Arc<AtomicBool>,
+    writer: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl RecorderStreamingSink {
+    pub(crate) fn new(recorder: Arc<Mutex<AuditRecorder>>) -> Result<Self> {
+        Self::with_capacity(recorder, AUDIT_WRITER_QUEUE)
+    }
+
+    fn with_capacity(recorder: Arc<Mutex<AuditRecorder>>, capacity: usize) -> Result<Self> {
+        let (tx, rx) = sync_channel::<WriterCmd>(capacity);
+        let done = Arc::new(AtomicBool::new(false));
+        let done_writer = Arc::clone(&done);
+        let writer = std::thread::Builder::new()
+            .name("nono-audit-writer".to_string())
+            .spawn(move || writer_loop(recorder, rx, done_writer))
+            .map_err(|e| {
+                NonoError::Snapshot(format!("Failed to spawn audit writer thread: {e}"))
+            })?;
+        Ok(Self {
+            tx,
+            dropped: AtomicU64::new(0),
+            done,
+            writer: Mutex::new(Some(writer)),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_capacity(
+        recorder: Arc<Mutex<AuditRecorder>>,
+        capacity: usize,
+    ) -> Result<Self> {
+        Self::with_capacity(recorder, capacity)
+    }
+
+    /// Number of events dropped because the bounded queue was full or the
+    /// writer thread had already terminated. Exposed mainly for tests and
+    /// for surfacing in diagnostics; the final value is logged on `Drop`.
+    pub(crate) fn dropped_events(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
+}
+
+fn writer_loop(
+    recorder: Arc<Mutex<AuditRecorder>>,
+    rx: Receiver<WriterCmd>,
+    done: Arc<AtomicBool>,
+) {
+    while let Ok(cmd) = rx.recv() {
+        match cmd {
+            WriterCmd::Event(event) => {
+                // Once Flush has sealed the sink, any Event that lost the
+                // is_closed/record race in `push_event` and reached the
+                // queue after the seal must NOT be appended — doing so
+                // would extend the file past the Merkle root that
+                // `finalize_supervised_exit` is about to commit, breaking
+                // `verify_audit_log`.
+                if done.load(Ordering::Acquire) {
+                    continue;
+                }
+                match recorder.lock() {
+                    Ok(mut r) => {
+                        if let Err(e) = r.record_network_event(event) {
+                            tracing::warn!("Audit writer: record_network_event failed: {}", e);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Audit writer: recorder mutex poisoned: {}", e);
+                    }
+                }
+            }
+            WriterCmd::Flush(ack) => {
+                // Set `done` *before* acking so that any concurrent
+                // producer that enqueues an Event after this Flush
+                // observes the seal by the time the writer dequeues it.
+                done.store(true, Ordering::Release);
+                let _ = ack.send(());
+            }
+            WriterCmd::Shutdown => break,
+        }
+    }
+}
+
+impl nono_proxy::audit::NetworkAuditSink for RecorderStreamingSink {
+    fn record(&self, event: &NetworkAuditEvent) {
+        match self.tx.try_send(WriterCmd::Event(event.clone())) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                let prev = self.dropped.fetch_add(1, Ordering::Relaxed);
+                if prev == 0 || prev.is_power_of_two() {
+                    tracing::warn!(
+                        "Audit writer queue full (cap {}); dropped {} events so far",
+                        AUDIT_WRITER_QUEUE,
+                        prev.saturating_add(1)
+                    );
+                }
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                let prev = self.dropped.fetch_add(1, Ordering::Relaxed);
+                if prev == 0 || prev.is_power_of_two() {
+                    tracing::warn!(
+                        "Audit writer thread terminated; dropped {} events so far",
+                        prev.saturating_add(1)
+                    );
+                }
+            }
+        }
+    }
+
+    fn flush(&self) {
+        let (ack_tx, ack_rx) = sync_channel::<()>(1);
+        if self.tx.send(WriterCmd::Flush(ack_tx)).is_err() {
+            tracing::warn!("Audit writer thread is gone; flush is a no-op");
+            // Seal locally so callers that observe a successful flush
+            // (even degraded) cannot have late events appended — there
+            // is no writer to append anything, but the contract still
+            // holds.
+            self.done.store(true, Ordering::Release);
+            return;
+        }
+        if ack_rx.recv().is_err() {
+            tracing::warn!("Audit writer disconnected before flush ack");
+            self.done.store(true, Ordering::Release);
+        }
+    }
+}
+
+impl Drop for RecorderStreamingSink {
+    fn drop(&mut self) {
+        let dropped = self.dropped_events();
+        if dropped > 0 {
+            tracing::warn!(
+                "Audit writer sink dropped {} events total over the session",
+                dropped
+            );
+        }
+        let _ = self.tx.send(WriterCmd::Shutdown);
+        if let Ok(mut writer) = self.writer.lock() {
+            if let Some(h) = writer.take() {
+                let _ = h.join();
+            }
+        }
     }
 }
 
@@ -554,6 +751,369 @@ mod tests {
         let verified = verify_audit_log(dir.path(), Some(&summary)).unwrap();
         assert_eq!(verified.event_count, 5);
         assert_eq!(verified.merkle_scheme, "alpha");
+        assert!(verified.records_verified);
+    }
+
+    #[test]
+    fn recorder_streaming_sink_writes_events_to_ndjson() {
+        use nono_proxy::audit::NetworkAuditSink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = Arc::new(Mutex::new(
+            AuditRecorder::new(dir.path().to_path_buf()).unwrap(),
+        ));
+        recorder
+            .lock()
+            .unwrap()
+            .record_session_started("2026-04-21T00:00:00Z".to_string(), vec!["pwd".to_string()])
+            .unwrap();
+
+        let sink = RecorderStreamingSink::new(Arc::clone(&recorder)).unwrap();
+        sink.record(&NetworkAuditEvent {
+            timestamp_unix_ms: 1000,
+            mode: NetworkAuditMode::Connect,
+            decision: NetworkAuditDecision::Allow,
+            route_id: None,
+            auth_mechanism: None,
+            auth_outcome: None,
+            managed_credential_active: None,
+            injection_mode: None,
+            denial_category: None,
+            target: "api.example.com".to_string(),
+            port: Some(443),
+            method: Some("CONNECT".to_string()),
+            path: None,
+            status: None,
+            reason: None,
+        });
+        sink.record(&NetworkAuditEvent {
+            timestamp_unix_ms: 2000,
+            mode: NetworkAuditMode::Connect,
+            decision: NetworkAuditDecision::Deny,
+            route_id: None,
+            auth_mechanism: None,
+            auth_outcome: None,
+            managed_credential_active: None,
+            injection_mode: None,
+            denial_category: None,
+            target: "evil.example".to_string(),
+            port: Some(443),
+            method: None,
+            path: None,
+            status: None,
+            reason: Some("blocked".to_string()),
+        });
+        // Drain the writer queue before appending session_ended directly.
+        // In production this happens via AuditLog::close -> sink.flush().
+        sink.flush();
+
+        recorder
+            .lock()
+            .unwrap()
+            .record_session_ended("2026-04-21T00:00:02Z".to_string(), 0)
+            .unwrap();
+
+        let summary = recorder.lock().unwrap().finalize().unwrap();
+        assert_eq!(
+            summary.event_count, 4,
+            "session_started + 2 network + session_ended"
+        );
+        let verified = verify_audit_log(dir.path(), Some(&summary)).unwrap();
+        assert_eq!(verified.event_count, 4);
+        assert!(verified.records_verified);
+    }
+
+    #[test]
+    fn recorder_streaming_sink_preserves_order_under_concurrent_writers() {
+        use nono_proxy::audit::NetworkAuditSink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = Arc::new(Mutex::new(
+            AuditRecorder::new(dir.path().to_path_buf()).unwrap(),
+        ));
+        recorder
+            .lock()
+            .unwrap()
+            .record_session_started("2026-04-21T00:00:00Z".to_string(), vec!["pwd".to_string()])
+            .unwrap();
+
+        let sink = Arc::new(RecorderStreamingSink::new(Arc::clone(&recorder)).unwrap());
+
+        // Simulate the proxy hot path: many concurrent senders, none of
+        // which should block waiting on the recorder mutex. With sync I/O
+        // inside record() this would serialize through one lock + one
+        // file.flush() per event.
+        let threads: usize = 8;
+        let per_thread: usize = 100;
+        let handles: Vec<_> = (0..threads)
+            .map(|t| {
+                let sink = Arc::clone(&sink);
+                std::thread::spawn(move || {
+                    for i in 0..per_thread {
+                        sink.record(&NetworkAuditEvent {
+                            timestamp_unix_ms: (t * per_thread + i) as u64,
+                            mode: NetworkAuditMode::Connect,
+                            decision: NetworkAuditDecision::Allow,
+                            route_id: None,
+                            auth_mechanism: None,
+                            auth_outcome: None,
+                            managed_credential_active: None,
+                            injection_mode: None,
+                            denial_category: None,
+                            target: format!("t{t}.example"),
+                            port: Some(443),
+                            method: Some("CONNECT".to_string()),
+                            path: None,
+                            status: None,
+                            reason: None,
+                        });
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        sink.flush();
+
+        recorder
+            .lock()
+            .unwrap()
+            .record_session_ended("2026-04-21T00:00:02Z".to_string(), 0)
+            .unwrap();
+
+        let summary = recorder.lock().unwrap().finalize().unwrap();
+        let expected = 1 + threads * per_thread + 1;
+        assert_eq!(summary.event_count as usize, expected);
+        // The recorder builds its hash chain by appending in the order it
+        // receives events. verify_audit_log re-derives that chain from the
+        // file and refuses to validate if any link is broken — so a passing
+        // verification proves the writer thread preserved FIFO order.
+        let verified = verify_audit_log(dir.path(), Some(&summary)).unwrap();
+        assert_eq!(verified.event_count as usize, expected);
+        assert!(verified.records_verified);
+    }
+
+    fn make_audit_event(target: &str, ts: u64) -> NetworkAuditEvent {
+        NetworkAuditEvent {
+            timestamp_unix_ms: ts,
+            mode: NetworkAuditMode::Connect,
+            decision: NetworkAuditDecision::Allow,
+            route_id: None,
+            auth_mechanism: None,
+            auth_outcome: None,
+            managed_credential_active: None,
+            injection_mode: None,
+            denial_category: None,
+            target: target.to_string(),
+            port: Some(443),
+            method: Some("CONNECT".to_string()),
+            path: None,
+            status: None,
+            reason: None,
+        }
+    }
+
+    #[test]
+    fn recorder_streaming_sink_drops_events_when_queue_full() {
+        use nono_proxy::audit::NetworkAuditSink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = Arc::new(Mutex::new(
+            AuditRecorder::new(dir.path().to_path_buf()).unwrap(),
+        ));
+        recorder
+            .lock()
+            .unwrap()
+            .record_session_started("2026-04-21T00:00:00Z".to_string(), vec!["pwd".to_string()])
+            .unwrap();
+
+        // Block the writer thread by holding the recorder mutex. The
+        // writer will dequeue at most one event before parking on the
+        // recorder lock; everything else queues up to `capacity`, then
+        // try_send starts returning Full and the sink increments
+        // `dropped`.
+        let blocker = recorder.lock().unwrap();
+        let capacity: usize = 4;
+        let sink =
+            RecorderStreamingSink::new_with_capacity(Arc::clone(&recorder), capacity).unwrap();
+
+        let burst: usize = 200;
+        for i in 0..burst {
+            sink.record(&make_audit_event("api.example.com", i as u64));
+        }
+
+        // The sink may not have observed every Full *yet* — the writer
+        // is still parked. Just assert that the writer's drop accounting
+        // saw at least some drops.
+        let dropped_during_burst = sink.dropped_events();
+        assert!(
+            dropped_during_burst > 0,
+            "expected the bounded queue to drop events when writer is parked, got 0"
+        );
+
+        // Releasing the blocker lets the writer drain whatever made it
+        // into the queue.
+        drop(blocker);
+        sink.flush();
+
+        recorder
+            .lock()
+            .unwrap()
+            .record_session_ended("2026-04-21T00:00:02Z".to_string(), 0)
+            .unwrap();
+
+        let summary = recorder.lock().unwrap().finalize().unwrap();
+        // session_started + at most (capacity + 1 in-flight on the
+        // writer) network events + session_ended.
+        let max_recorded = 1 + capacity + 1 + 1;
+        assert!(
+            (summary.event_count as usize) <= max_recorded,
+            "wrote {} events; expected at most {} given queue cap {}",
+            summary.event_count,
+            max_recorded,
+            capacity
+        );
+        let verified = verify_audit_log(dir.path(), Some(&summary)).unwrap();
+        assert!(verified.records_verified);
+        // dropped_events + recorded_network_events should match the burst.
+        let recorded_network = (summary.event_count as usize).saturating_sub(2);
+        assert_eq!(
+            sink.dropped_events() as usize + recorded_network,
+            burst,
+            "every event must be either recorded or counted as dropped"
+        );
+    }
+
+    #[test]
+    fn recorder_streaming_sink_drops_post_flush_events() {
+        use nono_proxy::audit::NetworkAuditSink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = Arc::new(Mutex::new(
+            AuditRecorder::new(dir.path().to_path_buf()).unwrap(),
+        ));
+        recorder
+            .lock()
+            .unwrap()
+            .record_session_started("2026-04-21T00:00:00Z".to_string(), vec!["pwd".to_string()])
+            .unwrap();
+
+        let sink = RecorderStreamingSink::new(Arc::clone(&recorder)).unwrap();
+        sink.record(&make_audit_event("before.example", 1));
+        sink.flush();
+        let count_after_flush = recorder.lock().unwrap().event_count();
+
+        // After flush() returns the sink is sealed: events submitted now
+        // must be silently dropped, otherwise they would land in the file
+        // after the Merkle root that finalize_supervised_exit is about to
+        // commit, breaking verify_audit_log.
+        for i in 0..20 {
+            sink.record(&make_audit_event("after.example", 100 + i));
+        }
+
+        // Give the writer enough wall-clock time to *try* appending the
+        // post-flush events if the seal were missing.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let count_now = recorder.lock().unwrap().event_count();
+        assert_eq!(
+            count_now, count_after_flush,
+            "post-flush events must not extend the audit log"
+        );
+
+        // Append session_ended directly — this is the production pattern
+        // that the seal protects.
+        recorder
+            .lock()
+            .unwrap()
+            .record_session_ended("2026-04-21T00:00:02Z".to_string(), 0)
+            .unwrap();
+        let summary = recorder.lock().unwrap().finalize().unwrap();
+        // session_started + 1 network + session_ended = 3.
+        assert_eq!(summary.event_count, 3);
+        let verified = verify_audit_log(dir.path(), Some(&summary)).unwrap();
+        assert!(verified.records_verified);
+    }
+
+    #[test]
+    fn recorder_streaming_sink_flush_is_idempotent() {
+        use nono_proxy::audit::NetworkAuditSink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = Arc::new(Mutex::new(
+            AuditRecorder::new(dir.path().to_path_buf()).unwrap(),
+        ));
+        recorder
+            .lock()
+            .unwrap()
+            .record_session_started("2026-04-21T00:00:00Z".to_string(), vec!["pwd".to_string()])
+            .unwrap();
+
+        let sink = RecorderStreamingSink::new(Arc::clone(&recorder)).unwrap();
+        sink.record(&make_audit_event("api.example.com", 1));
+        sink.flush();
+        let after_first = recorder.lock().unwrap().event_count();
+
+        // Second flush on an already-sealed sink must not panic, deadlock,
+        // or otherwise affect the recorder. The writer keeps acking
+        // Flush commands; the seal is sticky.
+        sink.flush();
+        sink.flush();
+        let after_extra = recorder.lock().unwrap().event_count();
+        assert_eq!(
+            after_first, after_extra,
+            "extra flushes must not change the recorder state"
+        );
+
+        // Late events stay dropped, as before.
+        sink.record(&make_audit_event("late.example", 999));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert_eq!(after_extra, recorder.lock().unwrap().event_count());
+    }
+
+    #[test]
+    fn recorder_streaming_sink_drop_joins_writer_cleanly() {
+        use nono_proxy::audit::NetworkAuditSink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = Arc::new(Mutex::new(
+            AuditRecorder::new(dir.path().to_path_buf()).unwrap(),
+        ));
+        recorder
+            .lock()
+            .unwrap()
+            .record_session_started("2026-04-21T00:00:00Z".to_string(), vec!["pwd".to_string()])
+            .unwrap();
+
+        {
+            let sink = RecorderStreamingSink::new(Arc::clone(&recorder)).unwrap();
+            for i in 0..5 {
+                sink.record(&make_audit_event("api.example.com", i));
+            }
+            sink.flush();
+            // sink dropped here: writer thread receives Shutdown and
+            // joins synchronously inside Drop. After this block the
+            // recorder is sole-owned by `recorder`.
+        }
+
+        // If the writer were still alive, this Arc count would be 2.
+        assert_eq!(
+            Arc::strong_count(&recorder),
+            1,
+            "writer thread must release its Arc clone on shutdown"
+        );
+
+        // Recorder is fully usable post-shutdown — no leftover state.
+        recorder
+            .lock()
+            .unwrap()
+            .record_session_ended("2026-04-21T00:00:02Z".to_string(), 0)
+            .unwrap();
+        let summary = recorder.lock().unwrap().finalize().unwrap();
+        assert_eq!(summary.event_count, 1 + 5 + 1);
+        let verified = verify_audit_log(dir.path(), Some(&summary)).unwrap();
         assert!(verified.records_verified);
     }
 

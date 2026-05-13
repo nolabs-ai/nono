@@ -15,7 +15,7 @@ use colored::Colorize;
 use nono::undo::ExecutableIdentity;
 use nono::{CapabilitySet, Result};
 use std::io::IsTerminal;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 struct SessionRuntimeState {
     started: String,
@@ -202,12 +202,14 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
     } else {
         None
     };
-    let audit_recorder = if audit_state.is_some() && !rollback.no_audit_integrity {
+    let audit_recorder: Option<Arc<Mutex<AuditRecorder>>> = if audit_state.is_some()
+        && !rollback.no_audit_integrity
+    {
         audit_state
             .as_ref()
             .map(|state| {
                 AuditRecorder::new_with_policy(state.session_dir.clone(), redaction_policy.clone())
-                    .map(Mutex::new)
+                    .map(|r| Arc::new(Mutex::new(r)))
             })
             .transpose()?
     } else {
@@ -218,6 +220,35 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
             .lock()
             .map_err(|_| nono::NonoError::Snapshot("Audit recorder lock poisoned".to_string()))?;
         recorder.record_session_started(started.clone(), command.to_vec())?;
+    }
+
+    // Stream network audit events into the recorder as they occur. Without
+    // this, events sit in the proxy's in-memory buffer until session exit and
+    // are lost on crash or once `MAX_AUDIT_EVENTS` is reached.
+    //
+    // Streaming is best-effort: if the writer thread fails to spawn we log
+    // and continue with the legacy "drain at session_ended" path rather than
+    // aborting the run. The session still gets a complete audit log on
+    // clean shutdown; only the crash-durability and unbounded-buffer wins
+    // are forfeited.
+    if let (Some(recorder_mutex), Some(handle)) = (audit_recorder.as_ref(), proxy_handle) {
+        match crate::audit_integrity::RecorderStreamingSink::new(Arc::clone(recorder_mutex)) {
+            Ok(sink) => {
+                let sink: Arc<dyn nono_proxy::audit::NetworkAuditSink> = Arc::new(sink);
+                if handle.set_audit_streaming_sink(sink).is_err() {
+                    tracing::warn!(
+                        "Network audit streaming sink already attached; refusing to overwrite"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to start network audit streaming writer; continuing without live \
+                     streaming (events will still be drained at session end): {}",
+                    e
+                );
+            }
+        }
     }
 
     let protected_roots = protected_paths::ProtectedRoots::from_defaults()?;
@@ -231,7 +262,7 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
         detach_sequence: session.detach_sequence.as_deref(),
         open_url_origins: &proxy.open_url_origins,
         open_url_allow_localhost: proxy.open_url_allow_localhost,
-        audit_recorder: audit_recorder.as_ref(),
+        audit_recorder: audit_recorder.as_deref(),
         redaction_policy,
         allow_launch_services_active: proxy.allow_launch_services_active,
         #[cfg(target_os = "linux")]
@@ -272,7 +303,7 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
         rollback_state,
         audit_snapshot_state,
         audit_tracked_paths,
-        audit_recorder: audit_recorder.as_ref(),
+        audit_recorder: audit_recorder.as_deref(),
         audit_integrity_enabled: !rollback.no_audit_integrity,
         proxy_handle,
         executable_identity,

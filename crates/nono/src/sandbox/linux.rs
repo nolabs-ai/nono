@@ -2256,8 +2256,15 @@ pub fn read_notif_sockaddr(pid: u32, addr_ptr: u64, addrlen: u64) -> Result<Sock
     let requested_len = usize::try_from(addrlen).map_err(|_| {
         NonoError::SandboxInit(format!("sockaddr length too large to parse: {addrlen}"))
     })?;
+    const SOCKADDR_STACK_LEN: usize = 128;
+    if max_sockaddr_len > SOCKADDR_STACK_LEN {
+        return Err(NonoError::SandboxInit(format!(
+            "maximum sockaddr length {} exceeds stack buffer {}",
+            max_sockaddr_len, SOCKADDR_STACK_LEN
+        )));
+    }
     let read_len = std::cmp::min(requested_len, max_sockaddr_len);
-    let mut buf = vec![0u8; read_len];
+    let mut buf = [0u8; SOCKADDR_STACK_LEN];
     let n = file.read(&mut buf[..read_len]).map_err(|e| {
         NonoError::SandboxInit(format!("Failed to read sockaddr from {}: {}", mem_path, e))
     })?;

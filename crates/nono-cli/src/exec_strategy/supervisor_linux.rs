@@ -568,6 +568,7 @@ pub(super) enum NetworkDecision {
 ///    - `bind()` is allowed only on ports in `proxy_bind_ports`.
 ///    - Everything else is denied.
 pub(super) fn decide_network_notification(
+    child_pid: u32,
     syscall: i32,
     sockaddr: &nono::sandbox::SockaddrInfo,
     config: &SupervisorConfig<'_>,
@@ -580,7 +581,7 @@ pub(super) fn decide_network_notification(
     if sockaddr.family == libc::AF_UNIX as u16 {
         match sockaddr.unix_kind {
             Some(UnixSocketKind::Pathname) => {
-                return decide_af_unix_pathname(syscall, sockaddr, config);
+                return decide_af_unix_pathname(child_pid, syscall, sockaddr, config);
             }
             Some(UnixSocketKind::Abstract) => {
                 debug!(
@@ -641,6 +642,7 @@ pub(super) fn decide_network_notification(
 }
 
 fn decide_af_unix_pathname(
+    child_pid: u32,
     syscall: i32,
     sockaddr: &nono::sandbox::SockaddrInfo,
     config: &SupervisorConfig<'_>,
@@ -661,24 +663,37 @@ fn decide_af_unix_pathname(
         return NetworkDecision::Deny;
     };
 
+    let resolved_path = match resolve_af_unix_sockaddr_path(child_pid, path) {
+        Ok(path) => path,
+        Err(err) => {
+            debug!(
+                "Proxy seccomp: denying AF_UNIX {} on {}: child-relative resolution failed: {}",
+                op,
+                path.display(),
+                err
+            );
+            return NetworkDecision::Deny;
+        }
+    };
+
     let canonical = match op {
-        UnixSocketOp::Connect => match path.canonicalize() {
+        UnixSocketOp::Connect => match resolved_path.canonicalize() {
             Ok(path) => path,
             Err(err) => {
                 debug!(
                     "Proxy seccomp: denying AF_UNIX connect to {}: canonicalize failed: {}",
-                    path.display(),
+                    resolved_path.display(),
                     err
                 );
                 return NetworkDecision::Deny;
             }
         },
-        UnixSocketOp::Bind => match canonicalize_unix_socket_bind_path(path) {
+        UnixSocketOp::Bind => match canonicalize_unix_socket_bind_path(&resolved_path) {
             Ok(path) => path,
             Err(err) => {
                 debug!(
                     "Proxy seccomp: denying AF_UNIX bind to {}: canonicalize failed: {}",
-                    path.display(),
+                    resolved_path.display(),
                     err
                 );
                 return NetworkDecision::Deny;
@@ -701,6 +716,16 @@ fn decide_af_unix_pathname(
         );
         NetworkDecision::Deny
     }
+}
+
+fn resolve_af_unix_sockaddr_path(
+    child_pid: u32,
+    path: &std::path::Path,
+) -> nono::Result<std::path::PathBuf> {
+    use nono::sandbox::resolve_notif_path;
+
+    let at_fdcwd = libc::AT_FDCWD as i64 as u64;
+    resolve_notif_path(child_pid, at_fdcwd, path)
 }
 
 fn unix_socket_op_for_syscall(syscall: i32) -> Option<UnixSocketOp> {
@@ -802,7 +827,7 @@ pub(super) fn handle_network_notification(
         return Ok(());
     }
 
-    match decide_network_notification(notif.data.nr, &sockaddr, config) {
+    match decide_network_notification(notif.pid, notif.data.nr, &sockaddr, config) {
         NetworkDecision::Allow => {
             // SECCOMP_USER_NOTIF_FLAG_CONTINUE: let the kernel proceed with its
             // already-copied sockaddr. Safe for connect/bind (move_addr_to_kernel).
@@ -1159,6 +1184,10 @@ mod tests {
             dir.path().join(name)
         }
 
+        fn test_pid() -> u32 {
+            std::process::id()
+        }
+
         /// Pathname `bind(AF_UNIX, "/tmp/…")` is mediated by explicit
         /// Unix-socket grants, not TCP bind ports.
         #[test]
@@ -1172,7 +1201,7 @@ mod tests {
             ];
             let config = make_config(&backend, 0, Vec::new(), &allowlist);
             assert_eq!(
-                decide_network_notification(SYS_BIND, &unix_pathname(&path), &config),
+                decide_network_notification(test_pid(), SYS_BIND, &unix_pathname(&path), &config),
                 NetworkDecision::Allow,
                 "pathname AF_UNIX bind must be allowed when a connect+bind grant covers it"
             );
@@ -1192,7 +1221,12 @@ mod tests {
             ];
             let config = make_config(&backend, 8080, Vec::new(), &allowlist);
             assert_eq!(
-                decide_network_notification(SYS_CONNECT, &unix_pathname(&path), &config),
+                decide_network_notification(
+                    test_pid(),
+                    SYS_CONNECT,
+                    &unix_pathname(&path),
+                    &config,
+                ),
                 NetworkDecision::Allow,
                 "pathname AF_UNIX connect must be allowed when a connect grant covers it"
             );
@@ -1206,7 +1240,12 @@ mod tests {
             let _listener = UnixListener::bind(&path).expect("bind unix listener");
             let config = make_config(&backend, 8080, Vec::new(), &[]);
             assert_eq!(
-                decide_network_notification(SYS_CONNECT, &unix_pathname(&path), &config),
+                decide_network_notification(
+                    test_pid(),
+                    SYS_CONNECT,
+                    &unix_pathname(&path),
+                    &config,
+                ),
                 NetworkDecision::Deny
             );
         }
@@ -1223,7 +1262,7 @@ mod tests {
             ];
             let config = make_config(&backend, 0, Vec::new(), &allowlist);
             assert_eq!(
-                decide_network_notification(SYS_BIND, &unix_pathname(&path), &config),
+                decide_network_notification(test_pid(), SYS_BIND, &unix_pathname(&path), &config),
                 NetworkDecision::Deny
             );
         }
@@ -1242,11 +1281,21 @@ mod tests {
             ];
             let config = make_config(&backend, 0, Vec::new(), &allowlist);
             assert_eq!(
-                decide_network_notification(SYS_BIND, &unix_pathname(&direct_path), &config),
+                decide_network_notification(
+                    test_pid(),
+                    SYS_BIND,
+                    &unix_pathname(&direct_path),
+                    &config,
+                ),
                 NetworkDecision::Allow
             );
             assert_eq!(
-                decide_network_notification(SYS_BIND, &unix_pathname(&nested_path), &config),
+                decide_network_notification(
+                    test_pid(),
+                    SYS_BIND,
+                    &unix_pathname(&nested_path),
+                    &config,
+                ),
                 NetworkDecision::Deny
             );
         }
@@ -1264,7 +1313,12 @@ mod tests {
             ];
             let config = make_config(&backend, 0, Vec::new(), &allowlist);
             assert_eq!(
-                decide_network_notification(SYS_BIND, &unix_pathname(&nested_path), &config),
+                decide_network_notification(
+                    test_pid(),
+                    SYS_BIND,
+                    &unix_pathname(&nested_path),
+                    &config,
+                ),
                 NetworkDecision::Allow
             );
         }
@@ -1277,12 +1331,12 @@ mod tests {
             let backend = DenyAllBackend;
             let config = make_config(&backend, 0, Vec::new(), &[]);
             assert_eq!(
-                decide_network_notification(SYS_BIND, &unix_abstract(), &config),
+                decide_network_notification(test_pid(), SYS_BIND, &unix_abstract(), &config),
                 NetworkDecision::Deny,
                 "abstract AF_UNIX must be denied because pathname grants do not cover it"
             );
             assert_eq!(
-                decide_network_notification(SYS_CONNECT, &unix_abstract(), &config),
+                decide_network_notification(test_pid(), SYS_CONNECT, &unix_abstract(), &config),
                 NetworkDecision::Deny,
             );
         }
@@ -1294,7 +1348,7 @@ mod tests {
             let backend = DenyAllBackend;
             let config = make_config(&backend, 0, Vec::new(), &[]);
             assert_eq!(
-                decide_network_notification(SYS_BIND, &unix_unnamed(), &config),
+                decide_network_notification(test_pid(), SYS_BIND, &unix_unnamed(), &config),
                 NetworkDecision::Deny
             );
         }
@@ -1308,7 +1362,7 @@ mod tests {
             let backend = DenyAllBackend;
             let config = make_config(&backend, 8080, Vec::new(), &[]);
             assert_eq!(
-                decide_network_notification(SYS_CONNECT, &inet_external(8080), &config),
+                decide_network_notification(test_pid(), SYS_CONNECT, &inet_external(8080), &config),
                 NetworkDecision::Deny
             );
         }
@@ -1320,7 +1374,7 @@ mod tests {
             let backend = DenyAllBackend;
             let config = make_config(&backend, 0, vec![3000], &[]);
             assert_eq!(
-                decide_network_notification(SYS_BIND, &inet_loopback(4000), &config),
+                decide_network_notification(test_pid(), SYS_BIND, &inet_loopback(4000), &config),
                 NetworkDecision::Deny
             );
         }

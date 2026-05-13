@@ -141,20 +141,92 @@ emit_table() {
 }
 
 emit_json() {
-    local drift_arr="["
-    for i in "${!DRIFT_FILES[@]}"; do
-        [[ $i -gt 0 ]] && drift_arr+=','
-        # Escape quotes in text
-        local escaped_text="${DRIFT_TEXT[$i]//\"/\\\"}"
-        drift_arr+="{\"file\":\"${DRIFT_FILES[$i]}\",\"line\":${DRIFT_LINES[$i]},\"text\":\"${escaped_text}\"}"
-    done
-    drift_arr+="]"
-
+    # WR-04 fix (REVIEW.md): the previous hand-rolled JSON escape only
+    # handled double-quote characters, producing invalid JSON for lines
+    # containing backslashes, control chars, or already-escaped quotes.
+    # Delegate to python3 (or jq as a fallback) so the JSON encoder
+    # handles every edge case correctly.
     local status
-    status=$([ "$DRIFT_COUNT" -eq 0 ] && echo "clean" || echo "drift")
+    if [[ "$DRIFT_COUNT" -eq 0 ]]; then
+        status="clean"
+    else
+        status="drift"
+    fi
 
-    printf '{"status":"%s","drift_count":%d,"drift":%s}\n' \
-        "$status" "$DRIFT_COUNT" "$drift_arr"
+    if command -v python3 >/dev/null 2>&1; then
+        # Stream files / lines / texts as three null-separated arrays via
+        # stdin so we don't hit argv length limits and we keep newline-free
+        # framing.  python3 does the JSON encoding.
+        {
+            printf '%s\n' "$status"
+            printf '%s\n' "$DRIFT_COUNT"
+            printf '%s\0' "${DRIFT_FILES[@]}"
+            printf '\n'
+            printf '%s\0' "${DRIFT_LINES[@]}"
+            printf '\n'
+            printf '%s\0' "${DRIFT_TEXT[@]}"
+            printf '\n'
+        } | python3 -c '
+import json
+import sys
+
+raw = sys.stdin.buffer.read()
+parts = raw.split(b"\n", 4)
+# parts[0]=status, parts[1]=count, parts[2]=files-z, parts[3]=lines-z, parts[4]=texts-z
+status = parts[0].decode("utf-8", errors="replace")
+count = int(parts[1].decode("utf-8", errors="replace"))
+
+
+def split_z(blob: bytes) -> list[str]:
+    if not blob:
+        return []
+    # trailing NUL produces an empty tail entry that we drop.
+    items = blob.split(b"\0")
+    if items and items[-1] == b"":
+        items = items[:-1]
+    return [item.decode("utf-8", errors="replace") for item in items]
+
+
+files = split_z(parts[2]) if len(parts) > 2 else []
+lines = split_z(parts[3]) if len(parts) > 3 else []
+texts = split_z(parts[4]) if len(parts) > 4 else []
+
+drift = []
+for i, f in enumerate(files):
+    drift.append({
+        "file": f,
+        "line": int(lines[i]) if i < len(lines) and lines[i] else 0,
+        "text": texts[i] if i < len(texts) else "",
+    })
+
+print(json.dumps({"status": status, "drift_count": count, "drift": drift}))
+'
+        return
+    fi
+
+    if command -v jq >/dev/null 2>&1; then
+        # jq fallback path. Build the drift array via repeated --arg pairs
+        # so each text field is treated as a literal string (no shell
+        # escape rules applied).
+        local jq_args=(-n --arg status "$status" --argjson count "$DRIFT_COUNT")
+        local jq_filter='{status: $status, drift_count: $count, drift: []}'
+        for i in "${!DRIFT_FILES[@]}"; do
+            jq_args+=(
+                --arg "file_$i"  "${DRIFT_FILES[$i]}"
+                --arg "line_$i"  "${DRIFT_LINES[$i]}"
+                --arg "text_$i"  "${DRIFT_TEXT[$i]}"
+            )
+            jq_filter+=" | .drift += [{file: \$file_$i, line: (\$line_$i|tonumber), text: \$text_$i}]"
+        done
+        jq "${jq_args[@]}" "$jq_filter"
+        return
+    fi
+
+    # No JSON encoder available — the CI script requires set -euo pipefail
+    # and refuses to emit a malformed JSON document.  Fail loudly rather
+    # than silently producing invalid JSON.
+    echo 'lint-docs.sh: --format json requires either python3 or jq on PATH' >&2
+    exit 3
 }
 
 case "$FORMAT" in

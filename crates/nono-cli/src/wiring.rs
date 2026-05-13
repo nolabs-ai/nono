@@ -243,6 +243,22 @@ pub fn apply_yaml_merge(directive: &YamlMergeDirective, profile_dir: &Path) -> R
     let canonical_target = validate_target_path(&target_abs, profile_dir)?;
     let canonical_source = validate_target_path(&source_abs, profile_dir)?;
 
+    // WR-06 fix (REVIEW.md): reject yaml_merge directives whose source and
+    // target canonicalize to the same path. Without this guard, the function
+    // would read the file, parse it, merge the parsed value with itself
+    // (formally a no-op for the parsed YAML graph), and then rewrite the
+    // file via serde_yaml_ng. The round-trip is not formatting-stable:
+    // comments, anchors, key ordering, and quoting style are all lost.
+    // Users who declare a self-merge expecting a no-op silently lose their
+    // file's formatting. Symlink shenanigans can also alias source and
+    // target via `../`; canonicalize-then-compare catches all variants.
+    if canonical_target == canonical_source {
+        return Err(NonoError::ProfileParse(format!(
+            "yaml_merge: source and target must differ, both resolve to '{}'",
+            canonical_target.display()
+        )));
+    }
+
     // Read and parse the target YAML file.
     let target_raw = std::fs::read_to_string(&canonical_target).map_err(|e| {
         NonoError::ProfileParse(format!(
@@ -355,6 +371,31 @@ mod tests {
         assert_eq!(
             map[&serde_yaml_ng::Value::String("c".into())],
             serde_yaml_ng::Value::Number(4.into())
+        );
+    }
+
+    /// WR-06 regression (REVIEW.md): apply_yaml_merge must reject a
+    /// directive whose source and target canonicalize to the same path.
+    /// Without the guard, the function would round-trip the file through
+    /// serde_yaml_ng and silently corrupt formatting (comments, anchors,
+    /// quoting style all lost on a YAML "self-merge").
+    #[test]
+    fn apply_yaml_merge_rejects_self_merge() {
+        let dir = TempDir::new().unwrap();
+        let profile_dir = dir.path();
+
+        write_yaml(profile_dir, "profile.yaml", "a: 1\nb: 2\n");
+
+        let directive = YamlMergeDirective {
+            target: PathBuf::from("profile.yaml"),
+            source: PathBuf::from("profile.yaml"),
+        };
+        let err = apply_yaml_merge(&directive, profile_dir)
+            .expect_err("self-merge must be rejected");
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("source and target must differ"),
+            "error must explain why self-merge is rejected; got: {msg}"
         );
     }
 }

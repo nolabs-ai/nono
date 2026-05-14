@@ -434,6 +434,23 @@ pub struct FilesystemConfig {
     /// identifier; the serde alias preserves legacy JSON deserialization.
     #[serde(default, alias = "override_deny")]
     pub bypass_protection: Vec<String>,
+    /// Paths whose runtime denials should not be offered as grants in the
+    /// interactive save-profile prompt.
+    ///
+    /// Replayed from upstream `9b07bf7` (v0.52.2 — feat(profile-save):
+    /// suppress save-profile prompts for denied paths). This is a UX gate,
+    /// not a security gate — paths listed here are STILL DENIED at runtime;
+    /// the field only controls whether the path appears as a save candidate
+    /// in the interactive prompt. Listed paths produce ZERO new grants and
+    /// ZERO new bypass entries when saved.
+    ///
+    /// Serde alias `ignore` is accepted indefinitely so existing upstream
+    /// users who hand-author profiles using either name continue to work
+    /// (mirrors the `override_deny → bypass_protection` D-36-B3 alias
+    /// discipline). Phase 40 Plan 40-05 (D-20 manual replay; D-19 trailer
+    /// upgrade rule did not fire — see plan's `## Disposition resolution`).
+    #[serde(default, alias = "ignore")]
+    pub suppress_save_prompt: Vec<String>,
 }
 
 /// Commands configuration in a profile — canonical section per upstream
@@ -2496,6 +2513,14 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
                 &base.filesystem.bypass_protection,
                 &child.filesystem.bypass_protection,
             ),
+            // Phase 40 Plan 40-05 (D-20 manual replay of upstream 9b07bf7):
+            // merge `suppress_save_prompt` across base + child profiles so a
+            // child profile that extends a parent inherits the parent's
+            // UX-suppression list and may add its own entries.
+            suppress_save_prompt: dedup_append(
+                &base.filesystem.suppress_save_prompt,
+                &child.filesystem.suppress_save_prompt,
+            ),
         },
         policy: PolicyPatchConfig {
             exclude_groups: dedup_append(&base.policy.exclude_groups, &child.policy.exclude_groups),
@@ -4121,6 +4146,7 @@ mod tests {
                 write_file: vec![],
                 deny: vec![],
                 bypass_protection: vec![],
+                suppress_save_prompt: vec![],
             },
             policy: PolicyPatchConfig {
                 exclude_groups: vec!["base_excluded".to_string()],
@@ -4198,6 +4224,7 @@ mod tests {
                 write_file: vec![],
                 deny: vec![],
                 bypass_protection: vec![],
+                suppress_save_prompt: vec![],
             },
             policy: PolicyPatchConfig {
                 exclude_groups: vec!["child_excluded".to_string()],

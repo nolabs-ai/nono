@@ -60,7 +60,31 @@ pub(crate) fn offer_save_run_profile(
         return Ok(());
     }
 
-    let Some(patch) = build_run_profile_patch(policy_explanations, error_observation, caps)? else {
+    // Phase 40 Plan 40-05 (D-20 manual replay of upstream 9b07bf7):
+    // load the compared profile's `filesystem.suppress_save_prompt` list
+    // so candidate denials matching those paths are filtered out of the
+    // save-profile patch before the prompt sees them.
+    //
+    // Failure to load the compared profile here is non-fatal — the
+    // prompt still proceeds with an empty suppression filter (the field
+    // is purely a UX gate; missing suppression list = no suppression,
+    // which is the conservative default).
+    let suppress_save_prompt = compared_profile
+        .and_then(|name| profile::load_profile(name).ok())
+        .map(|profile| profile.filesystem.suppress_save_prompt.clone())
+        .unwrap_or_default();
+    let ignored_denial_paths: Vec<PathBuf> = suppress_save_prompt
+        .iter()
+        .map(|raw| canonicalize_suppress_entry(raw))
+        .collect();
+
+    let Some(patch) = build_run_profile_patch(
+        policy_explanations,
+        error_observation,
+        caps,
+        &ignored_denial_paths,
+    )?
+    else {
         return Ok(());
     };
 
@@ -604,6 +628,7 @@ fn build_run_profile_patch(
     policy_explanations: &[PolicyExplanation],
     error_observation: &ErrorObservation,
     caps: &CapabilitySet,
+    ignored_denial_paths: &[PathBuf],
 ) -> Result<Option<profile::Profile>> {
     let mut grants: BTreeMap<PathBuf, PatchGrant> = BTreeMap::new();
 
@@ -613,6 +638,7 @@ fn build_run_profile_patch(
             &explanation.path,
             explanation.access,
             &explanation.reason,
+            ignored_denial_paths,
         );
     }
 
@@ -624,7 +650,13 @@ fn build_run_profile_patch(
                     "sensitive_path" | "insufficient_access" | "path_not_granted"
                 ) =>
             {
-                add_patch_grant(&mut grants, &hint.path, hint.access, &reason);
+                add_patch_grant(
+                    &mut grants,
+                    &hint.path,
+                    hint.access,
+                    &reason,
+                    ignored_denial_paths,
+                );
             }
             _ => {}
         }
@@ -689,8 +721,21 @@ fn add_patch_grant(
     path: &Path,
     access: AccessMode,
     reason: &str,
+    ignored_denial_paths: &[PathBuf],
 ) {
     let (flag, target) = query_ext::suggested_flag_parts(path, access);
+
+    // Phase 40 Plan 40-05 (D-20 manual replay of upstream 9b07bf7):
+    // skip denied paths that the user's compared profile lists under
+    // `filesystem.suppress_save_prompt` (or its `ignore` serde alias).
+    // Match both the raw path and the suggested target so prefix-style
+    // suppression entries (e.g. `/etc`) cover sub-paths (`/etc/foo`).
+    if matches_ignored_denial(path, ignored_denial_paths)
+        || matches_ignored_denial(&target, ignored_denial_paths)
+    {
+        return;
+    }
+
     let is_file = matches!(flag, "--read-file" | "--write-file" | "--allow-file");
 
     match grants.get_mut(&target) {
@@ -710,6 +755,51 @@ fn add_patch_grant(
             );
         }
     }
+}
+
+/// Returns true if `path` matches any entry in `ignored_denial_paths` —
+/// either as an exact canonical-path match OR a `Path::starts_with`
+/// component-wise prefix match. Mirrors upstream 9b07bf7's
+/// `matches_ignored_denial` semantics.
+///
+/// Uses `nono::try_canonicalize` to resolve symlinks at the comparison
+/// boundary (CLAUDE.md § Path Security: canonicalize at enforcement
+/// boundary). Component-wise `Path::starts_with` (not string
+/// `starts_with`) prevents the classic `/home` vs `/homeevil` footgun.
+fn matches_ignored_denial(path: &Path, ignored_denial_paths: &[PathBuf]) -> bool {
+    if ignored_denial_paths.is_empty() {
+        return false;
+    }
+    let canonical = nono::try_canonicalize(path);
+    ignored_denial_paths
+        .iter()
+        .any(|ignored| canonical == *ignored || canonical.starts_with(ignored))
+}
+
+/// Expand a `suppress_save_prompt` entry (as authored in JSON) into a
+/// canonicalized `PathBuf` for comparison against runtime denial paths.
+///
+/// Handles the `~/...` shorthand emitted by `shorten_path_for_profile`
+/// (the inverse direction) and then defers to `nono::try_canonicalize`
+/// so symlinks resolve at the comparison boundary. Best-effort: a
+/// non-existent path yields its (expanded) literal form — this is the
+/// correct fail-safe for a UX suppression list (no canonical resolution
+/// means no prefix collapse, which is the conservative shape).
+fn canonicalize_suppress_entry(raw: &str) -> PathBuf {
+    let expanded = if let Some(rest) = raw.strip_prefix("~/") {
+        match crate::config::validated_home() {
+            Ok(home) => Path::new(&home).join(rest),
+            Err(_) => PathBuf::from(raw),
+        }
+    } else if raw == "~" {
+        match crate::config::validated_home() {
+            Ok(home) => PathBuf::from(home),
+            Err(_) => PathBuf::from(raw),
+        }
+    } else {
+        PathBuf::from(raw)
+    };
+    nono::try_canonicalize(&expanded)
 }
 
 fn merge_access(existing: AccessMode, requested: AccessMode) -> AccessMode {
@@ -779,6 +869,7 @@ mod tests {
             &[explanation],
             &ErrorObservation::default(),
             &CapabilitySet::new(),
+            &[],
         )
         .expect("build patch")
         .expect("patch");
@@ -820,6 +911,7 @@ mod tests {
             &[read, write],
             &ErrorObservation::default(),
             &CapabilitySet::new(),
+            &[],
         )
         .expect("build patch")
         .expect("patch");
@@ -827,6 +919,157 @@ mod tests {
         assert_eq!(patch.filesystem.allow_file, vec!["~/config.json"]);
         assert!(patch.filesystem.read_file.is_empty());
         assert!(patch.filesystem.write_file.is_empty());
+    }
+
+    #[test]
+    fn build_run_profile_patch_suppresses_paths_in_ignored_denial_list() {
+        // Phase 40 Plan 40-05 (D-20 manual replay of upstream 9b07bf7):
+        // verify that paths matching `suppress_save_prompt` entries are
+        // filtered out of the save-profile patch before they reach the
+        // interactive prompt.
+        let _env_lock = ENV_LOCK.lock().expect("env lock");
+        let temp_home = TempDir::new().expect("temp home");
+        let _env = EnvVarGuard::set_all(&[("HOME", temp_home.path().to_str().expect("home path"))]);
+
+        let suppressed_target = temp_home.path().join("secret.json");
+        std::fs::write(&suppressed_target, b"{}").expect("write secret");
+        let visible_target = temp_home.path().join("visible.json");
+        std::fs::write(&visible_target, b"{}").expect("write visible");
+
+        // Canonicalize the suppressed path the same way the runtime does
+        // (mirrors `canonicalize_suppress_entry` after `~/...` expansion).
+        let canonical_suppressed = nono::try_canonicalize(&suppressed_target);
+
+        let suppressed_denial = PolicyExplanation {
+            path: suppressed_target,
+            access: AccessMode::Read,
+            reason: "path_not_granted".to_string(),
+            details: None,
+            policy_source: None,
+            suggested_flag: None,
+        };
+        let visible_denial = PolicyExplanation {
+            path: visible_target,
+            access: AccessMode::Read,
+            reason: "path_not_granted".to_string(),
+            details: None,
+            policy_source: None,
+            suggested_flag: None,
+        };
+
+        let patch = build_run_profile_patch(
+            &[suppressed_denial, visible_denial],
+            &ErrorObservation::default(),
+            &CapabilitySet::new(),
+            &[canonical_suppressed],
+        )
+        .expect("build patch")
+        .expect("patch");
+
+        // visible.json must appear; secret.json must be filtered out.
+        assert_eq!(patch.filesystem.read_file, vec!["~/visible.json"]);
+        assert!(
+            !patch
+                .filesystem
+                .read_file
+                .iter()
+                .any(|p| p.contains("secret.json")),
+            "secret.json must be suppressed from save-profile patch"
+        );
+    }
+
+    #[test]
+    fn build_run_profile_patch_suppresses_via_directory_prefix() {
+        // Phase 40 Plan 40-05: directory-prefix entries in
+        // `suppress_save_prompt` should cover sub-paths via
+        // component-wise `Path::starts_with` (not string starts_with).
+        let _env_lock = ENV_LOCK.lock().expect("env lock");
+        let temp_home = TempDir::new().expect("temp home");
+        let _env = EnvVarGuard::set_all(&[("HOME", temp_home.path().to_str().expect("home path"))]);
+
+        let nested_dir = temp_home.path().join(".secrets");
+        std::fs::create_dir_all(&nested_dir).expect("mkdir");
+        let nested_target = nested_dir.join("creds.toml");
+        std::fs::write(&nested_target, b"").expect("write nested");
+
+        let canonical_dir = nono::try_canonicalize(&nested_dir);
+
+        let denial = PolicyExplanation {
+            path: nested_target,
+            access: AccessMode::Read,
+            reason: "path_not_granted".to_string(),
+            details: None,
+            policy_source: None,
+            suggested_flag: None,
+        };
+
+        let patch = build_run_profile_patch(
+            &[denial],
+            &ErrorObservation::default(),
+            &CapabilitySet::new(),
+            &[canonical_dir],
+        )
+        .expect("build patch");
+
+        assert!(
+            patch.is_none(),
+            "directory-prefix suppression must filter the only candidate, leaving no patch"
+        );
+    }
+
+    #[test]
+    fn build_run_profile_patch_empty_ignored_list_is_noop() {
+        // Phase 40 Plan 40-05: empty `ignored_denial_paths` must short-circuit
+        // (no syscall traffic from canonicalization) and pass all denials through.
+        let _env_lock = ENV_LOCK.lock().expect("env lock");
+        let temp_home = TempDir::new().expect("temp home");
+        let _env = EnvVarGuard::set_all(&[("HOME", temp_home.path().to_str().expect("home path"))]);
+
+        let target = temp_home.path().join("file.json");
+        std::fs::write(&target, b"").expect("write");
+
+        let denial = PolicyExplanation {
+            path: target,
+            access: AccessMode::Read,
+            reason: "path_not_granted".to_string(),
+            details: None,
+            policy_source: None,
+            suggested_flag: None,
+        };
+
+        let patch = build_run_profile_patch(
+            &[denial],
+            &ErrorObservation::default(),
+            &CapabilitySet::new(),
+            &[],
+        )
+        .expect("build patch")
+        .expect("patch present");
+
+        assert_eq!(patch.filesystem.read_file, vec!["~/file.json"]);
+    }
+
+    #[test]
+    fn filesystem_config_accepts_suppress_save_prompt_and_ignore_alias() {
+        // Phase 40 Plan 40-05: serde deserialize round-trip for the new
+        // `suppress_save_prompt` field — both the canonical key and the
+        // upstream-compatible `ignore` alias should produce identical
+        // FilesystemConfig values (mirrors D-36-B3 bypass_protection /
+        // override_deny alias discipline).
+        let canonical = r#"{"suppress_save_prompt": ["/etc", "~/.secrets"]}"#;
+        let aliased = r#"{"ignore": ["/etc", "~/.secrets"]}"#;
+        let from_canonical: profile::FilesystemConfig =
+            serde_json::from_str(canonical).expect("canonical");
+        let from_aliased: profile::FilesystemConfig =
+            serde_json::from_str(aliased).expect("aliased");
+        assert_eq!(
+            from_canonical.suppress_save_prompt, from_aliased.suppress_save_prompt,
+            "ignore alias must yield identical suppress_save_prompt"
+        );
+        assert_eq!(
+            from_canonical.suppress_save_prompt,
+            vec!["/etc".to_string(), "~/.secrets".to_string()]
+        );
     }
 
     #[test]

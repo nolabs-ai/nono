@@ -297,6 +297,11 @@
           "type": "array",
           "items": { "type": "string" },
           "description": "Paths to exempt from deny groups within this filesystem section. Each path must also be explicitly granted via allow/read/write. Does not implicitly grant access; only removes the deny rule. Canonical key (since v0.47.0 / upstream f0abd413). Legacy key 'override_deny' is accepted indefinitely per D-36-B3."
+        },
+        "suppress_save_prompt": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Paths whose runtime denials should not be offered in the save-profile prompt. Replayed from upstream 9b07bf7 (v0.52.2). Does NOT grant access, does NOT remove deny rules, does NOT hide diagnostic output — only affects whether the path is offered as a grant in the interactive save-profile prompt. Serde-accepts the legacy upstream alias 'ignore' indefinitely."
         }
       }
     },

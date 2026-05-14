@@ -1,6 +1,6 @@
 [package]
 name = "nono-shell-broker"
-version = "0.37.1"
+version = "0.53.0"
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
@@ -16,7 +16,7 @@ name = "nono-shell-broker"
 path = "src/main.rs"
 
 [dependencies]
-nono = { version = "0.37.1", path = "../nono" }
+nono = { version = "0.53.0", path = "../nono" }
 thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

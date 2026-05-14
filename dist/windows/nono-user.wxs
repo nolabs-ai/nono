@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+      Name="nono"
+      Manufacturer="Luke Hinds"
+      Version="0.53.0"
+      UpgradeCode="5451E72C-E0C4-4BF8-B9EA-0D6A22AA80E4"
+      Scope="perUser">
+    <SummaryInformation
+        Description="nono Windows native installer (end-user install)"
+        Manufacturer="Luke Hinds" />
+    <MajorUpgrade
+        DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+    <Property Id="ARPCOMMENTS" Value="nono Windows native installer (end-user install)" />
+    <Property Id="ARPCONTACT" Value="Luke Hinds" />
+    <Property Id="ARPURLHELP" Value="https://docs.nono.sh/cli/getting_started/installation" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/always-further/nono" />
+    <Property Id="ARPURLUPDATEINFO" Value="https://github.com/always-further/nono/releases" />
+    <Property Id="ARPNOMODIFY" Value="1" />
+    <Property Id="ARPNOREPAIR" Value="1" />
+    <Feature Id="MainFeature" Title="nono" Level="1">
+      <ComponentGroupRef Id="ProductComponents" />
+    </Feature>
+  </Package>
+
+  <Fragment>
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="USERPROGRAMS" Name="Programs">
+        <Directory Id="INSTALLFOLDER" Name="nono" />
+      </Directory>
+    </StandardDirectory>
+  </Fragment>
+
+  <Fragment>
+    <ComponentGroup Id="ProductComponents" Directory="INSTALLFOLDER">
+      <Component Id="cmpNonoExe" Guid="*">
+        <File Id="filNonoExe" Source="C:\Users\OMack\nono\target\x86_64-pc-windows-msvc\release\nono.exe" KeyPath="yes" />
+      </Component>
+      <Component Id="cmpNonoShellBrokerExe" Guid="*">
+        <!-- Phase 31 Plan 04: nono-shell-broker.exe lives under INSTALLFOLDER
+             (the ComponentGroup's Directory attribute) so both binaries install
+             to the same dir at runtime. Satisfies D-07 sibling resolution
+             (current_exe().parent() finds the broker) for both machine scope
+             (Program Files\nono\) and user scope (LocalAppData\Programs\nono\).
+             No scope guard needed â€” broker is required for both MSIs. -->
+        <File Id="filNonoShellBrokerExe" Source="C:\Users\OMack\nono\target\x86_64-pc-windows-msvc\release\nono-shell-broker.exe" KeyPath="yes" />
+      </Component>
+      <Component Id="cmpReadme" Guid="*">
+        <File Id="filReadme" Source="C:\Users\OMack\nono\README.md" Name="README.md" KeyPath="yes" />
+      </Component>
+      <Component Id="cmpLicense" Guid="*">
+        <File Id="filLicense" Source="C:\Users\OMack\nono\LICENSE" Name="LICENSE" KeyPath="yes" />
+      </Component>
+      <Component Id="cmpPath" Guid="*">
+        <RegistryValue
+            Root="HKCU"
+            Key="Software\always-further\nono\user"
+            Name="InstallDir"
+            Type="string"
+            Value="[INSTALLFOLDER]"
+            KeyPath="yes" />
+        <Environment
+            Id="EnvPath"
+            Name="PATH"
+            Action="set"
+            Part="last"
+            Permanent="no"
+            System="no"
+            Value="[INSTALLFOLDER]" />
+      </Component>
+    </ComponentGroup>
+  </Fragment>
+</Wix>

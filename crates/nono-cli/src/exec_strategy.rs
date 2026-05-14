@@ -554,13 +554,13 @@ pub fn execute_supervised(
     started: &str,
     silent: bool,
     rollback_prompt_disabled: bool,
-    /// Resource limits to enforce on the child process tree. On Linux, enforced via
-    /// cgroup v2 (requires systemd delegation); on macOS via setrlimit.
-    /// Pass `&ResourceLimits::default()` to skip enforcement.
+    // Resource limits to enforce on the child process tree. On Linux, enforced via
+    // cgroup v2 (requires systemd delegation); on macOS via setrlimit.
+    // Pass `&ResourceLimits::default()` to skip enforcement.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     resource_limits: &crate::launch_runtime::ResourceLimits,
-    /// Session identifier used for naming the cgroup (Linux) or correlation.
-    /// Typically the audit session ID or a generated UUID.
+    // Session identifier used for naming the cgroup (Linux) or correlation.
+    // Typically the audit session ID or a generated UUID.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     resource_session_id: &str,
 ) -> Result<i32> {

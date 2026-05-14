@@ -15,7 +15,7 @@ use crate::error::{ProxyError, Result};
 use crate::external;
 use crate::filter::ProxyFilter;
 use crate::reverse;
-use crate::route::RouteStore;
+use crate::route::{self, RouteStore};
 use crate::token;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -241,8 +241,13 @@ pub async fn start(config: ProxyConfig) -> Result<ProxyHandle> {
     // Build shared TLS connector (root cert store is expensive to construct).
     // Use the ring provider explicitly to avoid ambiguity when multiple
     // crypto providers are in the dependency tree.
-    let mut root_store = rustls::RootCertStore::empty();
-    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    //
+    // Combines webpki roots with the OS trust store via the shared
+    // `route::build_base_root_store()` helper. This replays the security
+    // intent of upstream 8ddb143 (TLS trust on corporate networks with
+    // MITM inspection) WITHOUT pulling in the tls_intercept module
+    // (per D-40-B2 fork-preserve lock; fork has no tls_intercept).
+    let root_store = route::build_base_root_store();
     let tls_config = rustls::ClientConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))

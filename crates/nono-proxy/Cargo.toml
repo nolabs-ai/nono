@@ -42,6 +42,12 @@ tokio-rustls = "0.26"
 rustls = { version = "0.23", features = ["ring"] }
 rustls-pemfile = "2"
 webpki-roots = "1"
+# Read the host's system trust store. Combined with webpki-roots so upstream
+# TLS handshakes succeed on corporate networks with TLS-inspection MITM
+# (which trust their own root via the OS trust store, not webpki defaults).
+# Replays the security intent of upstream 8ddb143 / 54c7552 native-CA loading
+# WITHOUT pulling in upstream's tls_intercept module (not in fork; per D-40-B2).
+rustls-native-certs = "0.8"
 
 [dev-dependencies]
 tempfile.workspace = true

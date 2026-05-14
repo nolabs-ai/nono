@@ -177,6 +177,40 @@ fn extract_host_port(url: &str) -> Option<String> {
     Some(format!("{}:{}", host.to_lowercase(), port))
 }
 
+/// Build a root cert store combining webpki roots with the OS trust store.
+///
+/// Replays the security intent of upstream 8ddb143 ("Load native system CAs
+/// alongside webpki_roots for upstream TLS connections, fixing UnknownIssuer
+/// on corporate networks with TLS inspection") and the 54c7552 factoring of
+/// the shared base store, WITHOUT pulling in upstream's tls_intercept module
+/// or multi-route dispatch surface (per D-40-B2 fork-preserve lock).
+///
+/// Errors loading individual native certificates are logged at debug level
+/// and skipped; the webpki roots are always present so this never fails to
+/// produce a usable root store.
+pub(crate) fn build_base_root_store() -> rustls::RootCertStore {
+    let mut store = rustls::RootCertStore::empty();
+    store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let native = rustls_native_certs::load_native_certs();
+    if !native.errors.is_empty() {
+        debug!(
+            "failed to load {} native cert(s) for route connector base store; \
+             continuing with webpki roots + any that succeeded",
+            native.errors.len()
+        );
+    }
+    let native_count = native.certs.len();
+    for cert in native.certs {
+        if let Err(e) = store.add(cert) {
+            debug!("skipping unparseable native cert in route connector: {e}");
+        }
+    }
+    if native_count > 0 {
+        debug!("added {native_count} native system CA(s) to route connector trust store");
+    }
+    store
+}
+
 /// Build a `TlsConnector` that trusts the system roots plus a custom CA certificate.
 ///
 /// The CA file must be PEM-encoded and contain at least one certificate.
@@ -200,10 +234,9 @@ fn build_tls_connector_with_ca(ca_path: &str) -> Result<tokio_rustls::TlsConnect
         }
     })?);
 
-    let mut root_store = rustls::RootCertStore::empty();
-
-    // Add system roots first
-    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    // Start from the shared base store (webpki + native system CAs) so the
+    // custom CA is added on top of the OS trust store rather than replacing it.
+    let mut root_store = build_base_root_store();
 
     // Parse and add custom CA certificates from PEM file
     let certs: Vec<_> = rustls_pemfile::certs(&mut ca_pem.as_slice())

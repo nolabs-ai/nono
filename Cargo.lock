@@ -2332,6 +2332,7 @@ dependencies = [
  "hyper-util",
  "nono",
  "rustls",
+ "rustls-native-certs",
  "rustls-pemfile",
  "serde",
  "serde_json",

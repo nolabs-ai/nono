@@ -1006,7 +1006,7 @@ fn record_network_audit_denial(
         events.push(event.clone());
     }
 
-    if let Some(recorder_mutex) = config.audit_recorder {
+    if let Some(recorder_mutex) = config.audit_recorder.as_ref() {
         let mut recorder = recorder_mutex
             .lock()
             .map_err(|_| NonoError::Snapshot("Audit recorder lock poisoned".to_string()))?;

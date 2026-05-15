@@ -279,7 +279,7 @@ pub unsafe fn setup_child_pty(slave_fd: RawFd) {
     // ioctl/dup2/close operate on raw fd integers — nix's IO-safe wrappers
     // require AsFd/OwnedFd which aren't available for STDIN_FILENO et al.
     unsafe {
-        if libc::ioctl(slave_fd, libc::TIOCSCTTY as libc::c_ulong, 0) < 0 {
+        if libc::ioctl(slave_fd, libc::TIOCSCTTY as _, 0) < 0 {
             child_setup_pty_fatal(b"nono: ioctl(TIOCSCTTY) failed while configuring child PTY\n");
         }
 
@@ -887,7 +887,7 @@ impl PtyProxy {
         unsafe {
             let _ = libc::ioctl(
                 self.master.as_raw_fd(),
-                libc::TIOCSWINSZ as libc::c_ulong,
+                libc::TIOCSWINSZ,
                 winsize as *const Winsize,
             );
         }

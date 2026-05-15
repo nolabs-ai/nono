@@ -1,0 +1,53 @@
+# syntax=docker/dockerfile:1.7
+#
+# Musl (statically linked) build — no glibc dependency.
+#
+# Uses Alpine Linux as the builder so musl is the native libc — no
+# cross-compilation or special linker wrappers needed. The resulting binary
+# is statically linked against musl libc, making it portable across any
+# Linux distribution without shared library requirements.
+# Credentials must be supplied via env://, file://, or op:// references
+# instead of the system keyring (D-Bus is unavailable in this build).
+#
+# Build with:
+#   docker buildx build -f docker/Dockerfile-musl -t nono-musl .
+
+FROM rust:alpine3.21 AS builder
+
+# cmake + clang — required by aws-lc-rs to compile AWS-LC crypto library
+# perl + make   — required by ring's build script
+# g++           — required by aws-lc-rs cmake build
+RUN apk add --no-cache \
+    cmake \
+    clang \
+    clang-dev \
+    musl-dev \
+    pkgconfig \
+    perl \
+    make \
+    g++
+
+WORKDIR /build
+COPY . .
+
+# Alpine is musl-native: build for the host target, no --target flag needed.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/build/target \
+    cargo build --release -p nono-cli --no-default-features && \
+    cp target/release/nono /usr/local/bin/nono
+
+FROM alpine:3.21
+
+LABEL org.opencontainers.image.source="https://github.com/always-further/nono"
+LABEL org.opencontainers.image.description="Capability-based sandboxing for untrusted AI agents (musl, statically linked)"
+LABEL org.opencontainers.image.licenses="Apache-2.0"
+
+RUN addgroup -S nono && adduser -S -G nono -s /sbin/nologin nono && \
+    apk add --no-cache ca-certificates && \
+    mkdir /work
+
+COPY --from=builder /usr/local/bin/nono /usr/bin/nono
+
+WORKDIR /work
+USER nono
+ENTRYPOINT ["nono"]

@@ -1767,7 +1767,7 @@ extern "C" fn forward_signal(sig: libc::c_int) {
                 let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
                 unsafe {
                     if libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) == 0 {
-                        libc::ioctl(master_fd, libc::TIOCSWINSZ as libc::c_ulong, &ws);
+                        libc::ioctl(master_fd, libc::TIOCSWINSZ, &ws);
                     }
                 }
             }

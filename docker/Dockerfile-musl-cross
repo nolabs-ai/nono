@@ -1,0 +1,62 @@
+# syntax=docker/dockerfile:1.7
+#
+# Cross-compile to x86_64-unknown-linux-musl from a Debian builder.
+#
+# Unlike Dockerfile-musl (which uses Alpine as a musl-native builder),
+# this file uses rust:bookworm and explicitly cross-compiles to the
+# x86_64-unknown-linux-musl Rust target. Useful when you need to
+# produce a musl binary from a glibc-based CI environment or want to
+# pin to a specific Rust toolchain version on Debian.
+#
+# Credentials must be supplied via env://, file://, or op:// references
+# instead of the system keyring (D-Bus is unavailable in this build).
+#
+# Build with:
+#   docker buildx build -f docker/Dockerfile-musl-cross -t nono-musl-cross .
+
+# Force x86_64 so musl-gcc is native and understands -m64 (passed by ring/aws-lc-rs).
+# On Apple Silicon Docker runs ARM64 by default; without this, musl-gcc rejects -m64.
+FROM --platform=linux/amd64 rust:1-bookworm AS builder
+
+# musl-tools — provides musl-gcc, the GCC wrapper that links against musl
+# cmake + clang — required by aws-lc-rs to compile the AWS-LC crypto library
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        musl-tools \
+        cmake \
+        clang \
+        pkg-config && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN rustup target add x86_64-unknown-linux-musl
+
+# cc-rs looks for "x86_64-linux-musl-gcc" by convention, but Debian's
+# musl-tools only ships "musl-gcc". Point cc-rs and the cargo linker at it
+# explicitly so ring, aws-lc-rs, and other C-using crates find the compiler.
+ENV CC_x86_64_unknown_linux_musl=musl-gcc
+ENV CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc
+
+WORKDIR /build
+COPY . .
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/build/target \
+    cargo build --release -p nono-cli --no-default-features \
+        --target x86_64-unknown-linux-musl && \
+    cp target/x86_64-unknown-linux-musl/release/nono /usr/local/bin/nono
+
+FROM --platform=linux/amd64 alpine:3.21
+
+LABEL org.opencontainers.image.source="https://github.com/always-further/nono"
+LABEL org.opencontainers.image.description="Capability-based sandboxing for untrusted AI agents (x86_64-unknown-linux-musl)"
+LABEL org.opencontainers.image.licenses="Apache-2.0"
+
+RUN addgroup -S nono && adduser -S -G nono -s /sbin/nologin nono && \
+    apk add --no-cache ca-certificates && \
+    mkdir /work
+
+COPY --from=builder /usr/local/bin/nono /usr/bin/nono
+
+WORKDIR /work
+USER nono
+ENTRYPOINT ["nono"]

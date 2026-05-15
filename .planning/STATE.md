@@ -2,15 +2,14 @@
 gsd_state_version: 1.0
 milestone: v2.5
 milestone_name: Backlog Drain + UPST5
-status: planning
-last_updated: "2026-05-15T19:39:23.741Z"
+status: completed
+last_updated: "2026-05-15T23:31:48.179Z"
 last_activity: 2026-05-15
 progress:
-  total_phases: 0
+  total_phases: 4
   completed_phases: 0
   total_plans: 0
   completed_plans: 0
-  percent: 0
 ---
 
 # Project State: nono — v2.5 Backlog Drain + UPST5
@@ -25,10 +24,11 @@ See: .planning/PROJECT.md (updated 2026-05-12 at v2.4 milestone start; v2.3 ship
 
 ## Current Position
 
-Phase: 41 — ci-cleanup-and-broker-cr (planning) | Phase 37 — linux-resl-pkgs-autopull (planning, parallel)
-Plan: — (roadmap landed; plans not yet decomposed)
-Status: Roadmap approved; ready for /gsd-plan-phase 41 (priority) or /gsd-plan-phase 37 (parallel)
-Last activity: 2026-05-15 — v2.5 ROADMAP.md landed (4 phases: 37 parallel + 41 first + 42 audit + 43 sync; 13/13 requirements mapped; BROKER-CR folded into Phase 41)
+Phase: 41 — ci-cleanup-and-broker-cr (context gathered) | Phase 37 — linux-resl-pkgs-autopull (planning, parallel)
+Plan: — (roadmap landed; CONTEXT.md captured; plans not yet decomposed)
+Status: Phase 41 context gathered; ready for /gsd-plan-phase 41 (priority) or /gsd-plan-phase 37 (parallel)
+Resume file: .planning/phases/41-ci-cleanup-v24-broker-code-review-closure/41-CONTEXT.md
+Last activity: 2026-05-15 — Phase 41 CONTEXT.md gathered (7-plan layout: 41-01 API migration first, 41-06 broker CR-01/02/03 hygiene, 41-07 CR-04 + baseline reset; 16 decisions captured)
 
 ### v2.5 phase queue
 

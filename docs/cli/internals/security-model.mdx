@@ -422,7 +422,7 @@ nono provides fine-grained, kernel-enforced capability control, but it is not a 
 
 ### What nono is
 
-nono is a capability-based sandbox that provides fine-grained isolation controls and operates at the OS syscall level: It uses Landlock on Linux and Seatbelt on macOS. It gives precise, per-path, per-operation control over what a process can touch, finer than anything a container or microVM can express at the policy layer. A container can restrict network namespaces; nono can restrict which specific files within a directory a process may read or write, and deny access to all others. That granularity is the core value proposition.
+nono is a capability-based sandbox that provides fine-grained isolation controls and operates at the OS syscall level. It uses Landlock on Linux and Seatbelt on macOS. It gives precise, per-path, per-domain, per-socket, per-env-var, per-operation control over what a process can touch and see. It's designed for the nuances of an agent acting within its operating context—something not practical or even possible with a microVM or container.
 
 ### What nono is not
 

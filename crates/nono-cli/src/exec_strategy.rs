@@ -2627,6 +2627,21 @@ fn run_supervisor_loop(
     Ok((status, denials))
 }
 
+/// Reads the request's path using the AIPC-01 shape (target = Some(FilePath{path}))
+/// with fallback to the Phase 11 deprecated `path` field. Localizes the
+/// deprecation surface to ONE place: once Phase 11 wire-shape is retired,
+/// only this helper changes.
+fn request_path(request: &nono::CapabilityRequest) -> &std::path::Path {
+    use nono::HandleTarget;
+    match &request.target {
+        Some(HandleTarget::FilePath { path }) => path.as_path(),
+        _ => {
+            #[allow(deprecated)]
+            { &request.path }
+        }
+    }
+}
+
 /// Handle a single supervisor IPC message.
 ///
 /// Flow:
@@ -2659,7 +2674,7 @@ fn handle_supervisor_message(
                 record_denial(
                     denials,
                     DenialRecord {
-                        path: request.path.clone(),
+                        path: request_path(&request).to_path_buf(),
                         access: request.access,
                         reason: DenialReason::PolicyBlocked,
                     },
@@ -2681,19 +2696,19 @@ fn handle_supervisor_message(
 
             let decision = if let Some(protected_root) =
                 crate::protected_paths::overlapping_protected_root(
-                    &request.path,
+                    request_path(&request),
                     false,
                     config.protected_roots,
                 ) {
                 debug!(
                     "Supervisor: path {} blocked by protected root {}",
-                    request.path.display(),
+                    request_path(&request).display(),
                     protected_root.display()
                 );
                 record_denial(
                     denials,
                     DenialRecord {
-                        path: request.path.clone(),
+                        path: request_path(&request).to_path_buf(),
                         access: request.access,
                         reason: DenialReason::PolicyBlocked,
                     },
@@ -2702,19 +2717,19 @@ fn handle_supervisor_message(
                     reason: format!(
                         "Path overlaps protected nono state root '{}': {}",
                         protected_root.display(),
-                        request.path.display()
+                        request_path(&request).display()
                     ),
                 }
             } else if let Some(trust_result) = trust_interceptor
                 .as_mut()
-                .and_then(|ti| ti.check_path(&request.path))
+                .and_then(|ti| ti.check_path(request_path(&request)))
             {
                 // 2. Trust verification for instruction files
                 match trust_result {
                     Ok(verified) => {
                         debug!(
                             "Supervisor: instruction file {} verified (publisher: {})",
-                            request.path.display(),
+                            request_path(&request).display(),
                             verified.publisher,
                         );
                         // Stash the verified digest for TOCTOU re-check at open time
@@ -2726,7 +2741,7 @@ fn handle_supervisor_message(
                                     record_denial(
                                         denials,
                                         DenialRecord {
-                                            path: request.path.clone(),
+                                            path: request_path(&request).to_path_buf(),
                                             access: request.access,
                                             reason: DenialReason::UserDenied,
                                         },
@@ -2739,7 +2754,7 @@ fn handle_supervisor_message(
                                 record_denial(
                                     denials,
                                     DenialRecord {
-                                        path: request.path.clone(),
+                                        path: request_path(&request).to_path_buf(),
                                         access: request.access,
                                         reason: DenialReason::BackendError,
                                     },
@@ -2754,13 +2769,13 @@ fn handle_supervisor_message(
                         // Instruction file failed trust verification — auto-deny
                         debug!(
                             "Supervisor: instruction file {} failed trust verification: {}",
-                            request.path.display(),
+                            request_path(&request).display(),
                             reason
                         );
                         record_denial(
                             denials,
                             DenialRecord {
-                                path: request.path.clone(),
+                                path: request_path(&request).to_path_buf(),
                                 access: request.access,
                                 reason: DenialReason::PolicyBlocked,
                             },
@@ -2778,7 +2793,7 @@ fn handle_supervisor_message(
                             record_denial(
                                 denials,
                                 DenialRecord {
-                                    path: request.path.clone(),
+                                    path: request_path(&request).to_path_buf(),
                                     access: request.access,
                                     reason: DenialReason::UserDenied,
                                 },
@@ -2791,7 +2806,7 @@ fn handle_supervisor_message(
                         record_denial(
                             denials,
                             DenialRecord {
-                                path: request.path.clone(),
+                                path: request_path(&request).to_path_buf(),
                                 access: request.access,
                                 reason: DenialReason::BackendError,
                             },
@@ -2806,7 +2821,7 @@ fn handle_supervisor_message(
             // 3. If granted, open the path and send fd before the response
             if decision.is_granted() {
                 match open_path_for_access(
-                    &request.path,
+                    request_path(&request),
                     &request.access,
                     config.protected_roots,
                     verified_digest.as_deref(),

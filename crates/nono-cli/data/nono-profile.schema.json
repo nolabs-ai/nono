@@ -880,7 +880,7 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "allowed_hosts": {
+        "allow_domain": {
           "type": "array",
           "items": { "type": "string" },
           "description": "Hostname egress allow-list. Valid only with an enforceable nono proxy/helper mode."
@@ -897,7 +897,7 @@
         },
         "proxy_helper": {
           "type": "string",
-          "description": "Nono-controlled helper/proxy mode used to make allowed_hosts enforceable."
+          "description": "Nono-controlled helper/proxy mode used to make allow_domain enforceable."
         }
       }
     },
@@ -1096,7 +1096,7 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "allowed_hosts": {
+        "allow_domain": {
           "type": "array",
           "items": { "type": "string" },
           "description": "Hostname egress allow-list. Valid only with an enforceable nono proxy/helper mode."
@@ -1113,7 +1113,7 @@
         },
         "proxy_helper": {
           "type": "string",
-          "description": "Nono-controlled helper/proxy mode used to make allowed_hosts enforceable."
+          "description": "Nono-controlled helper/proxy mode used to make allow_domain enforceable."
         }
       }
     },

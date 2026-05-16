@@ -388,7 +388,7 @@ pub struct CommandNetworkConfig {
     #[serde(default)]
     pub allow_all: bool,
     #[serde(default)]
-    pub allowed_hosts: Vec<String>,
+    pub allow_domain: Vec<String>,
     #[serde(default)]
     pub tcp_connect_ports: Vec<u16>,
     #[serde(default)]
@@ -401,7 +401,7 @@ impl CommandNetworkConfig {
     fn merge_child(&self, child: &Self) -> Self {
         Self {
             allow_all: self.allow_all || child.allow_all,
-            allowed_hosts: dedup_append(&self.allowed_hosts, &child.allowed_hosts),
+            allow_domain: dedup_append(&self.allow_domain, &child.allow_domain),
             tcp_connect_ports: dedup_append(&self.tcp_connect_ports, &child.tcp_connect_ports),
             tcp_bind_ports: dedup_append(&self.tcp_bind_ports, &child.tcp_bind_ports),
             proxy_helper: child
@@ -888,7 +888,7 @@ fn validate_network(
     report: &mut CommandPolicyValidationReport,
 ) {
     if network.allow_all
-        && (!network.allowed_hosts.is_empty()
+        && (!network.allow_domain.is_empty()
             || !network.tcp_connect_ports.is_empty()
             || !network.tcp_bind_ports.is_empty()
             || network.proxy_helper.is_some())
@@ -909,11 +909,11 @@ fn validate_network(
     }
 
     let proxy_helper = network.proxy_helper.as_deref().unwrap_or_default();
-    if !network.allowed_hosts.is_empty() && proxy_helper.is_empty() {
+    if !network.allow_domain.is_empty() && proxy_helper.is_empty() {
         report.error(
-            "unenforceable_allowed_hosts",
+            "unenforceable_allow_domain",
             format!(
-                "command '{command_name}' from.{caller} uses allowed_hosts without proxy_helper"
+                "command '{command_name}' from.{caller} uses allow_domain without proxy_helper"
             ),
         );
     }
@@ -1509,12 +1509,12 @@ mod tests {
     }
 
     #[test]
-    fn allowed_hosts_without_proxy_helper_is_invalid() {
+    fn allow_domain_without_proxy_helper_is_invalid() {
         let mut config = active_git_config();
         if let Some(git) = config.commands.get_mut("git") {
             git.sandbox = Some(CommandSandboxConfig {
                 network: Some(CommandNetworkConfig {
-                    allowed_hosts: vec!["github.com".to_string()],
+                    allow_domain: vec!["github.com".to_string()],
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -1528,7 +1528,7 @@ mod tests {
             report
                 .errors
                 .iter()
-                .any(|finding| finding.code == "unenforceable_allowed_hosts")
+                .any(|finding| finding.code == "unenforceable_allow_domain")
         );
     }
 

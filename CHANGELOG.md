@@ -2,10 +2,6 @@
 
 ## Unreleased
 
-### Bug Fixes
-
-- *(cli)* Fix `nono why --self` for macOS future-file grants in sandbox state
-
 ### Notes
 
 - Socket grant state now records explicit socket scope. New subtree socket

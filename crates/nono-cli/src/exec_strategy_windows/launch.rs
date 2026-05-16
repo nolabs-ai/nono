@@ -2447,16 +2447,15 @@ mod broker_dispatch_tests {
         } else if candidate_default.exists() {
             candidate_default
         } else {
-            eprintln!(
-                "SKIP: broker artifact missing at {} and {} — pre-build via \
-                 `cargo build -p nono-shell-broker --release --target x86_64-pc-windows-msvc` \
-                 to exercise D-04 Job Object containment locally. The Plan 31-05 \
-                 field-test runner has the artifact via Plan 31-04's release \
-                 pipeline guarantee.",
+            panic!(
+                "nono-shell-broker.exe missing at {} and {}; pre-build with \
+                 `cargo build -p nono-shell-broker --release` (or set the broker pre-build \
+                 via crates/nono-cli/build.rs per Phase 41 D-14). This test asserts \
+                 Job Object containment is enforced before ResumeThread and cannot be \
+                 silently skipped — see Phase 41 CR-04 disposition.",
                 candidate_triple.display(),
                 candidate_default.display()
             );
-            return;
         };
 
         // Create a fresh Job Object (no resource limits — pure containment

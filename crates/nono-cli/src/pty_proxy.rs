@@ -102,8 +102,6 @@ const TERMINAL_RESTORE_AND_CLEAR_ESCAPE: &[u8] = concat!(
     "\x1b[?1005l\x1b[?1006l\x1b[?1015l", // disable mouse encodings
     "\x1b[?1004l", // disable focus events
     "\x1b[?2004l", // disable bracketed paste
-    "\x1b[?1l", // disable application cursor keys
-    "\x1b>",   // normal keypad mode
     "\x1b[?1049l", // exit alternate screen
     "\x1b[?25h", // show cursor
     "\x1b[2J\x1b[H", // clear screen + cursor home
@@ -1691,7 +1689,7 @@ fn leave_attach_screen(in_alt_screen: bool) {
         TERMINAL_RESTORE_NORMAL
     };
     let _ = write_all_fd(libc::STDOUT_FILENO, esc);
-    if !in_alt_screen && !is_inside_multiplexer() {
+    if !is_inside_multiplexer() {
         let _ = write_all_fd(libc::STDOUT_FILENO, KEYBOARD_MODE_RESET);
     }
     drain_terminal_output(libc::STDOUT_FILENO);
@@ -1709,7 +1707,7 @@ pub(crate) fn write_detach_terminal_reset(fd: RawFd, in_alt_screen: bool) {
         TERMINAL_RESTORE_NORMAL
     };
     let _ = write_all_fd(fd, esc);
-    if !in_alt_screen && !is_inside_multiplexer() {
+    if !is_inside_multiplexer() {
         let _ = write_all_fd(fd, KEYBOARD_MODE_RESET);
     }
 }
@@ -2418,7 +2416,8 @@ mod tests {
     use super::{
         ATTACH_HANDSHAKE_MAGIC, ATTACH_REQUEST_ATTACH, ATTACH_SCREEN_ENTER_ESCAPE,
         AltScreenTracker, AttachedClient, DEFAULT_DETACH_SEQUENCE, ERASE_NATIVE_SCROLLBACK,
-        KEYBOARD_MODE_RESET, PtyProxy, ReadFdOutcome, ScreenState, TERMINAL_RESTORE_NORMAL,
+        KEYBOARD_MODE_RESET, PtyProxy, ReadFdOutcome, ScreenState, TERMINAL_RESTORE_AND_CLEAR_ESCAPE,
+        TERMINAL_RESTORE_ESCAPE, TERMINAL_RESTORE_NORMAL,
         decode_attach_handshake, encode_attach_request_frame, read_fd_once,
         select_attach_replay_bytes, terminal_restore_escape, write_all_fd,
     };
@@ -2504,16 +2503,25 @@ mod tests {
     }
 
     #[test]
-    fn terminal_restore_normal_excludes_keyboard_mode_reset() {
-        let esc = std::str::from_utf8(TERMINAL_RESTORE_NORMAL).unwrap_or("");
-        assert!(
-            !esc.contains("\u{1b}[?1l"),
-            "TERMINAL_RESTORE_NORMAL must not contain DECCKM-off; use KEYBOARD_MODE_RESET separately"
-        );
-        assert!(
-            !esc.contains("\u{1b}>"),
-            "TERMINAL_RESTORE_NORMAL must not contain DECPNM; use KEYBOARD_MODE_RESET separately"
-        );
+    fn terminal_restore_constants_exclude_keyboard_mode_reset() {
+        for (name, bytes) in [
+            ("TERMINAL_RESTORE_NORMAL", TERMINAL_RESTORE_NORMAL),
+            (
+                "TERMINAL_RESTORE_AND_CLEAR_ESCAPE",
+                TERMINAL_RESTORE_AND_CLEAR_ESCAPE,
+            ),
+            ("TERMINAL_RESTORE_ESCAPE", TERMINAL_RESTORE_ESCAPE),
+        ] {
+            let esc = std::str::from_utf8(bytes).unwrap_or("");
+            assert!(
+                !esc.contains("\u{1b}[?1l"),
+                "{name} must not contain DECCKM-off; use KEYBOARD_MODE_RESET separately"
+            );
+            assert!(
+                !esc.contains("\u{1b}>"),
+                "{name} must not contain DECPNM; use KEYBOARD_MODE_RESET separately"
+            );
+        }
     }
 
     #[test]

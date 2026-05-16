@@ -11,10 +11,15 @@ use nix::libc;
 
 pub struct SetupRunner {
     check_only: bool,
+    #[cfg(target_os = "windows")]
     register_wfp_service: bool,
+    #[cfg(target_os = "windows")]
     install_wfp_service: bool,
+    #[cfg(target_os = "windows")]
     install_wfp_driver: bool,
+    #[cfg(target_os = "windows")]
     start_wfp_service: bool,
+    #[cfg(target_os = "windows")]
     start_wfp_driver: bool,
     refresh_trust_root: bool,
     generate_profiles: bool,
@@ -25,10 +30,15 @@ impl SetupRunner {
     pub fn new(args: &SetupArgs) -> Self {
         Self {
             check_only: args.check_only,
+            #[cfg(target_os = "windows")]
             register_wfp_service: args.register_wfp_service,
+            #[cfg(target_os = "windows")]
             install_wfp_service: args.install_wfp_service,
+            #[cfg(target_os = "windows")]
             install_wfp_driver: args.install_wfp_driver,
+            #[cfg(target_os = "windows")]
             start_wfp_service: args.start_wfp_service,
+            #[cfg(target_os = "windows")]
             start_wfp_driver: args.start_wfp_driver,
             refresh_trust_root: args.refresh_trust_root,
             generate_profiles: args.profiles,
@@ -734,14 +744,17 @@ impl SetupRunner {
         4 + usize::from(!self.check_only && self.refresh_trust_root)
     }
 
+    #[cfg(target_os = "windows")]
     fn register_phase_index(&self) -> usize {
         3
     }
 
+    #[cfg(target_os = "windows")]
     fn install_phase_index(&self) -> usize {
         3 + usize::from(self.register_wfp_service)
     }
 
+    #[cfg(target_os = "windows")]
     fn start_phase_index(&self) -> usize {
         3 + usize::from(self.register_wfp_service)
             + usize::from(self.install_wfp_service)
@@ -749,10 +762,12 @@ impl SetupRunner {
             + usize::from(self.start_wfp_driver)
     }
 
+    #[cfg(target_os = "windows")]
     fn install_driver_phase_index(&self) -> usize {
         3 + usize::from(self.register_wfp_service) + usize::from(self.install_wfp_service)
     }
 
+    #[cfg(target_os = "windows")]
     fn start_driver_phase_index(&self) -> usize {
         3 + usize::from(self.register_wfp_service)
             + usize::from(self.install_wfp_service)
@@ -768,6 +783,7 @@ impl SetupRunner {
             || self.start_wfp_service
     }
 
+    #[cfg(target_os = "windows")]
     fn recheck_wfp_phase_index(&self) -> usize {
         3 + usize::from(self.register_wfp_service)
             + usize::from(self.install_wfp_service)
@@ -1216,10 +1232,15 @@ mod tests {
         // Run the actual setup code that writes example profiles.
         let runner = SetupRunner {
             check_only: false,
+            #[cfg(target_os = "windows")]
             register_wfp_service: false,
+            #[cfg(target_os = "windows")]
             install_wfp_service: false,
+            #[cfg(target_os = "windows")]
             install_wfp_driver: false,
+            #[cfg(target_os = "windows")]
             start_wfp_service: false,
+            #[cfg(target_os = "windows")]
             start_wfp_driver: false,
             refresh_trust_root: false,
             generate_profiles: true,

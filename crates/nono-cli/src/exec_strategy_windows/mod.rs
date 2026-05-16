@@ -36,7 +36,6 @@ use std::mem::size_of;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-#[cfg(debug_assertions)]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use std::time::SystemTime;
@@ -373,7 +372,9 @@ struct WfpProbeConfig {
     backend_service_args: &'static [&'static str],
 }
 
-#[cfg(debug_assertions)]
+// Phase 41 (REQ-CI-02): ungated from #[cfg(debug_assertions)] so the flag is
+// available in all build profiles (release and debug). Runtime access is
+// guarded by set_windows_wfp_test_force_ready which checks NONO_TEST_HARNESS.
 static WINDOWS_WFP_TEST_FORCE_READY: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -393,23 +394,30 @@ enum WfpRuntimeActivationProbeStatus {
     NotImplemented,
 }
 
-#[cfg(debug_assertions)]
+/// Set the WFP test-force-ready flag for the integration test harness.
+///
+/// Phase 41 (REQ-CI-02): promoted out of `#[cfg(debug_assertions)]` so the
+/// flag is respected in all build profiles (release and debug). A runtime
+/// guard (`NONO_TEST_HARNESS` env var) replaces the compile-time gate to
+/// mitigate threat T-41-04-01: the flag only takes effect when the test
+/// harness explicitly opts in via the environment, not on arbitrary invocations.
 pub(crate) fn set_windows_wfp_test_force_ready(force_ready: bool) {
+    // Runtime guard: only allow the test-force-ready flag when the process
+    // was launched inside the nono integration test harness. This prevents
+    // a curious user from invoking --dangerous-force-wfp-ready on a
+    // production binary and bypassing real WFP readiness checks.
+    if force_ready && std::env::var_os("NONO_TEST_HARNESS").is_none() {
+        tracing::warn!(
+            "--dangerous-force-wfp-ready has no effect outside the test harness \
+             (NONO_TEST_HARNESS env var not set)"
+        );
+        return;
+    }
     WINDOWS_WFP_TEST_FORCE_READY.store(force_ready, Ordering::Relaxed);
 }
 
-#[cfg(not(debug_assertions))]
-pub(crate) fn set_windows_wfp_test_force_ready(_force_ready: bool) {}
-
 fn windows_wfp_test_force_ready() -> bool {
-    #[cfg(debug_assertions)]
-    {
-        WINDOWS_WFP_TEST_FORCE_READY.load(Ordering::Relaxed)
-    }
-    #[cfg(not(debug_assertions))]
-    {
-        false
-    }
+    WINDOWS_WFP_TEST_FORCE_READY.load(Ordering::Relaxed)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

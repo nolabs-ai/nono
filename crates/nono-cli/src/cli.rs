@@ -1635,7 +1635,12 @@ pub struct SandboxArgs {
     pub allow_gpu: bool,
 
     /// Internal: force WFP readiness for test-built Windows binaries.
-    #[cfg(debug_assertions)]
+    /// Hidden from --help (hide = true); intended only for the nono-cli
+    /// integration test harness. Phase 41 (REQ-CI-02): promoted out of
+    /// #[cfg(debug_assertions)] so the Windows Security CI job's block-net
+    /// probe tests can invoke the flag against any build profile. The runtime
+    /// path at exec_strategy_windows::set_windows_wfp_test_force_ready is
+    /// guarded by NONO_TEST_HARNESS at runtime (ungated in the same commit).
     #[arg(long, hide = true, help_heading = "OPTIONS")]
     pub dangerous_force_wfp_ready: bool,
 
@@ -1965,7 +1970,6 @@ impl From<WrapSandboxArgs> for SandboxArgs {
             allow_gpu: args.allow_gpu,
             config: args.config,
             verbose: args.verbose,
-            #[cfg(debug_assertions)]
             dangerous_force_wfp_ready: false,
             dry_run: args.dry_run,
         }

@@ -19,6 +19,15 @@ pub(crate) fn run_sandbox(run_args: RunArgs, silent: bool) -> Result<()> {
     let args = run_args.sandbox.clone();
     let command = run_args.command.clone();
 
+    // Phase 41 (REQ-CI-02): wire the --dangerous-force-wfp-ready flag to the
+    // Windows WFP test-force-ready runtime setter. Previously the flag was
+    // parsed by clap but never forwarded (the wiring was absent). The setter
+    // checks for NONO_TEST_HARNESS at runtime so production builds are guarded.
+    #[cfg(target_os = "windows")]
+    if args.dangerous_force_wfp_ready {
+        exec_strategy::set_windows_wfp_test_force_ready(true);
+    }
+
     if command.is_empty() {
         return Err(NonoError::NoCommand);
     }

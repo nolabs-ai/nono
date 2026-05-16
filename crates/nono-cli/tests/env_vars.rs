@@ -787,6 +787,10 @@ fn windows_run_block_net_blocks_probe_connection() {
     let workdir = probe_dir.to_string_lossy().into_owned();
 
     let output = nono_bin()
+        // NONO_TEST_HARNESS: required by set_windows_wfp_test_force_ready runtime
+        // guard (Phase 41 REQ-CI-02) — enables --dangerous-force-wfp-ready to set
+        // the WFP test-force-ready atomic from integration tests.
+        .env("NONO_TEST_HARNESS", "1")
         .args([
             "run",
             "--allow",
@@ -843,6 +847,9 @@ fn windows_run_block_net_cleans_up_promoted_wfp_filters_after_exit() {
     let workdir = probe_dir.to_string_lossy().into_owned();
 
     let blocked_output = nono_bin()
+        // NONO_TEST_HARNESS: required by set_windows_wfp_test_force_ready runtime
+        // guard (Phase 41 REQ-CI-02).
+        .env("NONO_TEST_HARNESS", "1")
         .args([
             "run",
             "--allow",
@@ -931,6 +938,9 @@ fn windows_run_block_net_blocks_probe_connection_through_cmd_host() {
     let probe_text = probe.to_string_lossy().into_owned();
 
     let output = nono_bin()
+        // NONO_TEST_HARNESS: required by set_windows_wfp_test_force_ready runtime
+        // guard (Phase 41 REQ-CI-02).
+        .env("NONO_TEST_HARNESS", "1")
         .args([
             "run",
             "--allow",
@@ -2961,6 +2971,9 @@ fn windows_run_supervised_rollback_block_net_uses_promoted_wfp_backend() {
     let probe = probe.to_string_lossy().into_owned();
 
     let output = nono_bin()
+        // NONO_TEST_HARNESS: required by set_windows_wfp_test_force_ready runtime
+        // guard (Phase 41 REQ-CI-02).
+        .env("NONO_TEST_HARNESS", "1")
         .args([
             "run",
             "--rollback",

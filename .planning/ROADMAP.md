@@ -45,7 +45,18 @@ granularity: standard
   3. The baseline-aware CI gate baseline SHA in `.planning/templates/upstream-sync-quick.md` is updated to the Phase 41 close SHA, and the SUMMARY frontmatter convention (`skipped_gates_load_bearing` vs `_environmental`) is documented at the top of Phase 41's SUMMARY for Phase 43's inheritance.
   4. `NonoError::BrokerNotFound` maps to a semantically correct C-FFI error code (per `.planning/todos/pending/v24-cr-01-broker-not-found-ffi-mapping.md`), broker-side FFI handle arguments are validated non-null before crossing the boundary (CR-02), and the empty-handle-list path is handled explicitly in the broker dispatch (CR-03).
   5. The Job-object test skip policy for `broker_launch_assigns_child_to_job_object` is resolved with an explicit decision (a/b/c per `.planning/todos/pending/v24-cr-04-job-object-test-skip-policy.md`), and STATE.md `## Deferred Items` is cleared of the v24 CR-A class entries that were waiting on a clean baseline.
-**Plans**: TBD (PHASE-41-TRACKER.md § Suggested phase structure gives a 5-sub-plan starting shape; v24-cr-0[1-4]-*.md todos slot in as 1-2 additional sub-plans)
+**Plans**: 7 plans
+Plans:
+**Wave 1**
+- [ ] 41-01-PLAN.md — API migration: CapabilityRequest::path -> HandleTarget::FilePath helper (14 sites)
+- [ ] 41-03-PLAN.md — Windows MSI validator: thread mandatory -BrokerPath through validate-windows-msi-contract.ps1
+- [ ] 41-04-PLAN.md — Windows block-net probe triage: confirm cfg(debug_assertions) hypothesis + promote flag
+- [ ] 41-05-PLAN.md — env_vars parallel flake fix via EnvVarGuard::set_all
+- [ ] 41-06-PLAN.md — Broker hygiene CR-01 + CR-02 + CR-03 (FFI remap + null-handle reject + empty-list reject)
+
+**Wave 2** *(blocked on Wave 1 completion)*
+- [ ] 41-02-PLAN.md — Unix simple: dead-code dispositions + disallowed_methods + unreachable expression (3 atomic commits)
+- [ ] 41-07-PLAN.md — Broker CR-04 + baseline reset close gate (SKIP->FAIL + build.rs + baseline SHA + skipped-gates convention + STATE.md cleanup)
 **UI hint**: no
 
 ### Phase 42: UPST5 audit

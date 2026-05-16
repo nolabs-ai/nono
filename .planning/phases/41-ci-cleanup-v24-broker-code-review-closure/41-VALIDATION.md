@@ -45,7 +45,7 @@ created: 2026-05-15
 | 41-03-XX | 03 | 1 | REQ-CI-02 | — | MSI validator passes mandatory `-BrokerPath` correctly | integration | `pwsh ./scripts/validate-windows-msi-contract.ps1 …` | ✅ (existing) | ⬜ pending |
 | 41-04-XX | 04 | 1 | REQ-CI-02 | — | Block-net probe spawns and reaches the connect call | integration | `cargo test --test env_vars windows_run_block_net_blocks_probe_connection -- --nocapture` | ✅ (existing) | ⬜ pending |
 | 41-05-XX | 05 | 1 | REQ-CI-02 | — | env_vars parallel test does not race; uses `EnvVarGuard` | unit | `cargo test --test env_vars windows_run_redirects_profile_state_vars_into_writable_allowlist -- --test-threads=1` | ✅ (existing) | ⬜ pending |
-| 41-06-XX | 06 | 0 | REQ-BROKER-CR-01 | T-BROKER-FFI | `NonoError::BrokerNotFound` → `ErrSandboxInit` (-6), not `ErrPathNotFound` (-1) | unit (FFI) | `cargo test -p nono-ffi ffi_brokernotfound_maps_to_errsandboxinit` | ❌ W0 (new) | ⬜ pending |
+| 41-06-XX | 06 | 0 | REQ-BROKER-CR-01 | T-BROKER-FFI | `NonoError::BrokerNotFound` → `ErrSandboxInit` (-6), not `ErrPathNotFound` (-1) | unit (FFI, inline in `bindings/c/src/lib.rs` mod tests) | `cargo test -p <bindings-c-crate-name> broker_not_found_maps_to_err_sandbox_init` (replace crate name with the actual one from `bindings/c/Cargo.toml`) | ❌ W0 (new, inline) | ⬜ pending |
 | 41-06-XX | 06 | 0 | REQ-BROKER-CR-02 | T-BROKER-NULL | Broker argv parser rejects `--inherit-handle 0x0` with `SandboxInit` error | unit | `cargo test -p nono-shell-broker parse_args_null_inherit_handle_returns_error` | ❌ W0 (new) | ⬜ pending |
 | 41-06-XX | 06 | 0 | REQ-BROKER-CR-03 | T-BROKER-EMPTY | Broker argv parser rejects empty `--inherit-handle` list with `SandboxInit` error | unit | `cargo test -p nono-shell-broker parse_args_empty_inherit_handle_list_returns_error` | ⚠️ flip existing | ⬜ pending |
 | 41-07-XX | 07 | 1 | REQ-BROKER-CR-04 | — | Job-object test FAILS loudly when broker artifact missing | unit | `cargo test -p nono-cli --test exec_strategy_windows broker_launch_assigns_child_to_job_object` | ✅ (existing) | ⬜ pending |
@@ -59,7 +59,7 @@ created: 2026-05-15
 
 Wave 0 lands the 3 new broker-hygiene tests so subsequent CR fixes have a place to live. Per CONTEXT D-11 + D-12:
 
-- [ ] `crates/nono-ffi/tests/error_mapping.rs` — FFI test for `BrokerNotFound → ErrSandboxInit` (CR-01)
+- [ ] `bindings/c/src/lib.rs` (inline `#[cfg(test)] mod tests` block) — add FFI test for `BrokerNotFound → ErrSandboxInit` (CR-01); workspace has no `crates/nono-ffi/` — FFI tests live inline alongside the FFI code per PATTERNS verification.
 - [ ] `crates/nono-shell-broker/src/main.rs` — add `parse_args_null_inherit_handle_returns_error` unit test (CR-02)
 - [ ] `crates/nono-shell-broker/src/main.rs` — flip existing `parse_args_empty_inherit_handle_list_is_ok` → `_returns_error` at ~line 489 (CR-03; RESEARCH.md verified 489-502)
 - [x] `cargo test` framework — already installed via Rust toolchain

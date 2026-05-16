@@ -3593,7 +3593,7 @@ mod linux {
                 .fs_capabilities()
                 .iter()
                 .map(|cap| FsGrantSpec {
-                    path: cap.original.as_os_str().as_bytes().to_vec(),
+                    path: cap.resolved.as_os_str().as_bytes().to_vec(),
                     access: cap.access.to_string(),
                     is_file: cap.is_file,
                 })
@@ -3602,7 +3602,7 @@ mod linux {
                 .unix_socket_capabilities()
                 .iter()
                 .map(|cap| UnixSocketGrantSpec {
-                    path: cap.original.as_os_str().as_bytes().to_vec(),
+                    path: cap.resolved.as_os_str().as_bytes().to_vec(),
                     mode: cap.mode.to_string(),
                     is_directory: cap.is_directory(),
                 })
@@ -4079,6 +4079,27 @@ mod linux {
             }
         }
 
+        fn test_tempdir() -> Result<tempfile::TempDir> {
+            tempfile::tempdir().map_err(|source| NonoError::ConfigWrite {
+                path: PathBuf::from("/tmp"),
+                source,
+            })
+        }
+
+        fn create_dir(path: &Path) -> Result<()> {
+            fs::create_dir(path).map_err(|source| NonoError::ConfigWrite {
+                path: path.to_path_buf(),
+                source,
+            })
+        }
+
+        fn symlink_path(target: &Path, link: &Path) -> Result<()> {
+            std::os::unix::fs::symlink(target, link).map_err(|source| NonoError::ConfigWrite {
+                path: link.to_path_buf(),
+                source,
+            })
+        }
+
         #[test]
         fn outer_exec_gate_rejects_partial_enforcement() {
             let result =
@@ -4167,6 +4188,79 @@ mod linux {
                 result.is_none(),
                 "non-controlled executable identities must not be blocked by ETI policy"
             );
+        }
+
+        #[test]
+        fn child_cap_spec_serializes_resolved_filesystem_paths() -> Result<()> {
+            let temp = test_tempdir()?;
+            let real = temp.path().join("real");
+            let link = temp.path().join("link");
+            create_dir(&real)?;
+            symlink_path(&real, &link)?;
+            let resolved =
+                real.canonicalize()
+                    .map_err(|source| NonoError::PathCanonicalization {
+                        path: real.clone(),
+                        source,
+                    })?;
+
+            let mut caps = CapabilitySet::new();
+            caps.add_fs(FsCapability::new_dir(&link, AccessMode::Read)?);
+
+            let spec = caps_to_spec(&caps);
+            let grant = spec.fs.first().ok_or_else(|| {
+                NonoError::SandboxInit("missing filesystem grant in child spec".to_string())
+            })?;
+            let serialized_path = PathBuf::from(OsString::from_vec(grant.path.clone()));
+            assert_eq!(serialized_path, resolved);
+            assert_ne!(serialized_path, link);
+
+            let restored = caps_from_spec(&spec)?;
+            let restored_cap = restored.fs_capabilities().first().ok_or_else(|| {
+                NonoError::SandboxInit("missing restored filesystem grant".to_string())
+            })?;
+            assert_eq!(restored_cap.original, resolved);
+            assert_eq!(restored_cap.resolved, resolved);
+
+            Ok(())
+        }
+
+        #[test]
+        fn child_cap_spec_serializes_resolved_unix_socket_paths() -> Result<()> {
+            let temp = test_tempdir()?;
+            let real = temp.path().join("sockets-real");
+            let link = temp.path().join("sockets-link");
+            create_dir(&real)?;
+            symlink_path(&real, &link)?;
+            let resolved =
+                real.canonicalize()
+                    .map_err(|source| NonoError::PathCanonicalization {
+                        path: real.clone(),
+                        source,
+                    })?;
+
+            let mut caps = CapabilitySet::new();
+            caps.add_unix_socket(UnixSocketCapability::new_dir(
+                &link,
+                UnixSocketMode::Connect,
+            )?);
+
+            let spec = caps_to_spec(&caps);
+            let grant = spec.unix_sockets.first().ok_or_else(|| {
+                NonoError::SandboxInit("missing unix socket grant in child spec".to_string())
+            })?;
+            let serialized_path = PathBuf::from(OsString::from_vec(grant.path.clone()));
+            assert_eq!(serialized_path, resolved);
+            assert_ne!(serialized_path, link);
+
+            let restored = caps_from_spec(&spec)?;
+            let restored_cap = restored.unix_socket_capabilities().first().ok_or_else(|| {
+                NonoError::SandboxInit("missing restored unix socket grant".to_string())
+            })?;
+            assert_eq!(restored_cap.original, resolved);
+            assert_eq!(restored_cap.resolved, resolved);
+
+            Ok(())
         }
 
         // ── apply_environment_set_vars: dangerous key rejection ───────────────
@@ -6225,7 +6319,7 @@ mod macos {
                 .fs_capabilities()
                 .iter()
                 .map(|cap| FsGrantSpec {
-                    path: cap.original.as_os_str().as_bytes().to_vec(),
+                    path: cap.resolved.as_os_str().as_bytes().to_vec(),
                     access: cap.access.to_string(),
                     is_file: cap.is_file,
                 })
@@ -6234,7 +6328,7 @@ mod macos {
                 .unix_socket_capabilities()
                 .iter()
                 .map(|cap| UnixSocketGrantSpec {
-                    path: cap.original.as_os_str().as_bytes().to_vec(),
+                    path: cap.resolved.as_os_str().as_bytes().to_vec(),
                     mode: cap.mode.to_string(),
                     is_directory: cap.is_directory(),
                 })
@@ -7165,6 +7259,27 @@ mod macos {
             env.iter().any(|entry| entry.starts_with(prefix))
         }
 
+        fn test_tempdir() -> Result<tempfile::TempDir> {
+            tempfile::tempdir().map_err(|source| NonoError::ConfigWrite {
+                path: PathBuf::from("/tmp"),
+                source,
+            })
+        }
+
+        fn create_dir(path: &Path) -> Result<()> {
+            fs::create_dir(path).map_err(|source| NonoError::ConfigWrite {
+                path: path.to_path_buf(),
+                source,
+            })
+        }
+
+        fn symlink_path(target: &Path, link: &Path) -> Result<()> {
+            std::os::unix::fs::symlink(target, link).map_err(|source| NonoError::ConfigWrite {
+                path: link.to_path_buf(),
+                source,
+            })
+        }
+
         #[test]
         fn process_exec_gate_denies_by_default_and_allows_exact_paths() -> Result<()> {
             let mut caps = CapabilitySet::new();
@@ -7240,6 +7355,79 @@ mod macos {
                 id,
             );
             assert!(result.is_none());
+        }
+
+        #[test]
+        fn child_cap_spec_serializes_resolved_filesystem_paths() -> Result<()> {
+            let temp = test_tempdir()?;
+            let real = temp.path().join("real");
+            let link = temp.path().join("link");
+            create_dir(&real)?;
+            symlink_path(&real, &link)?;
+            let resolved =
+                real.canonicalize()
+                    .map_err(|source| NonoError::PathCanonicalization {
+                        path: real.clone(),
+                        source,
+                    })?;
+
+            let mut caps = CapabilitySet::new();
+            caps.add_fs(FsCapability::new_dir(&link, AccessMode::Read)?);
+
+            let spec = caps_to_spec(&caps);
+            let grant = spec.fs.first().ok_or_else(|| {
+                NonoError::SandboxInit("missing filesystem grant in child spec".to_string())
+            })?;
+            let serialized_path = PathBuf::from(OsString::from_vec(grant.path.clone()));
+            assert_eq!(serialized_path, resolved);
+            assert_ne!(serialized_path, link);
+
+            let restored = caps_from_spec(&spec)?;
+            let restored_cap = restored.fs_capabilities().first().ok_or_else(|| {
+                NonoError::SandboxInit("missing restored filesystem grant".to_string())
+            })?;
+            assert_eq!(restored_cap.original, resolved);
+            assert_eq!(restored_cap.resolved, resolved);
+
+            Ok(())
+        }
+
+        #[test]
+        fn child_cap_spec_serializes_resolved_unix_socket_paths() -> Result<()> {
+            let temp = test_tempdir()?;
+            let real = temp.path().join("sockets-real");
+            let link = temp.path().join("sockets-link");
+            create_dir(&real)?;
+            symlink_path(&real, &link)?;
+            let resolved =
+                real.canonicalize()
+                    .map_err(|source| NonoError::PathCanonicalization {
+                        path: real.clone(),
+                        source,
+                    })?;
+
+            let mut caps = CapabilitySet::new();
+            caps.add_unix_socket(UnixSocketCapability::new_dir(
+                &link,
+                UnixSocketMode::Connect,
+            )?);
+
+            let spec = caps_to_spec(&caps);
+            let grant = spec.unix_sockets.first().ok_or_else(|| {
+                NonoError::SandboxInit("missing unix socket grant in child spec".to_string())
+            })?;
+            let serialized_path = PathBuf::from(OsString::from_vec(grant.path.clone()));
+            assert_eq!(serialized_path, resolved);
+            assert_ne!(serialized_path, link);
+
+            let restored = caps_from_spec(&spec)?;
+            let restored_cap = restored.unix_socket_capabilities().first().ok_or_else(|| {
+                NonoError::SandboxInit("missing restored unix socket grant".to_string())
+            })?;
+            assert_eq!(restored_cap.original, resolved);
+            assert_eq!(restored_cap.resolved, resolved);
+
+            Ok(())
         }
 
         #[test]

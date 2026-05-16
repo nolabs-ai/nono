@@ -2416,8 +2416,8 @@ mod tests {
     use super::{
         ATTACH_HANDSHAKE_MAGIC, ATTACH_REQUEST_ATTACH, ATTACH_SCREEN_ENTER_ESCAPE,
         AltScreenTracker, AttachedClient, DEFAULT_DETACH_SEQUENCE, ERASE_NATIVE_SCROLLBACK,
-        KEYBOARD_MODE_RESET, PtyProxy, ReadFdOutcome, ScreenState, TERMINAL_RESTORE_AND_CLEAR_ESCAPE,
-        TERMINAL_RESTORE_ESCAPE, TERMINAL_RESTORE_NORMAL,
+        KEYBOARD_MODE_RESET, PtyProxy, ReadFdOutcome, ScreenState,
+        TERMINAL_RESTORE_AND_CLEAR_ESCAPE, TERMINAL_RESTORE_ESCAPE, TERMINAL_RESTORE_NORMAL,
         decode_attach_handshake, encode_attach_request_frame, read_fd_once,
         select_attach_replay_bytes, terminal_restore_escape, write_all_fd,
     };

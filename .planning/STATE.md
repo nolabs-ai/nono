@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v2.5
 milestone_name: Backlog Drain + UPST5
 status: executing
-last_updated: "2026-05-16T02:20:06.861Z"
+last_updated: "2026-05-16T21:42:00.855Z"
 last_activity: 2026-05-16
 progress:
   total_phases: 4
-  completed_phases: 0
-  total_plans: 7
-  completed_plans: 0
-  percent: 0
+  completed_phases: 1
+  total_plans: 9
+  completed_plans: 10
+  percent: 100
 ---
 
 # Project State: nono — v2.5 Backlog Drain + UPST5
@@ -26,10 +26,10 @@ See: .planning/PROJECT.md (updated 2026-05-12 at v2.4 milestone start; v2.3 ship
 ## Current Position
 
 Phase: 41 (ci-cleanup-v24-broker-code-review-closure) — EXECUTING
-Plan: 1 of 7
-Status: Executing Phase 41
-Resume file: .planning/phases/41-ci-cleanup-v24-broker-code-review-closure/41-CONTEXT.md
-Last activity: 2026-05-16 -- Phase 41 execution started
+Plan: 9 of 9 (Plan 41-09 complete — gap closure for 6 -Dwarnings findings from CI run 25972316892)
+Status: Codebase-level fix complete; awaiting live CI verification on Linux Test / Linux Clippy / macOS Clippy lanes (REQ-CI-01 SC#1 + SC#3)
+Resume file: None
+Last activity: 2026-05-16 -- Phase 41 Plan 09 closed (6 cross-target gaps + WR-06)
 
 ### v2.5 phase queue
 

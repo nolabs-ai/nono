@@ -59,10 +59,10 @@ Plans:
 - [x] 41-07-PLAN.md — Broker CR-04 + baseline reset close gate (SKIP->FAIL + build.rs + baseline SHA + skipped-gates convention + STATE.md cleanup)
 
 **Wave 3** *(gap closure — extends Plan 41-03 to the second validator caller)*
-- [ ] 41-08-PLAN.md — REQ-CI-02 gap closure: thread mandatory -BrokerPath into windows-test-harness.ps1 build suite + regression guard
+- [x] 41-08-PLAN.md — REQ-CI-02 gap closure: thread mandatory -BrokerPath into windows-test-harness.ps1 build suite + regression guard
 
 **Wave 4** *(gap closure — closes 6 cross-target -Dwarnings findings from CI run 25972316892)*
-- [ ] 41-09-PLAN.md — REQ-CI-01 gap closure: wire profile_runtime to canonical validate_env_var_patterns + cfg-gate Windows-only SetupRunner WFP surface + interactive_shell field + test_env mirror + map_err→inspect_err keystore swap (closes Gaps 1-6 + WR-06)
+- [x] 41-09-PLAN.md — REQ-CI-01 gap closure: wire profile_runtime to canonical validate_env_var_patterns + cfg-gate Windows-only SetupRunner WFP surface + interactive_shell field + test_env mirror + map_err→inspect_err keystore swap (closes Gaps 1-6 + WR-06)
 **UI hint**: no
 
 ### Phase 42: UPST5 audit
@@ -143,7 +143,7 @@ These invariants are inherited from prior milestones and remain in force across 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 37. Linux RESL + PKGS auto-pull | 0/TBD | Not started | - |
-| 41. CI cleanup + broker CR | 8/7 | Complete   | 2026-05-16 |
+| 41. CI cleanup + broker CR | 10/9 | Complete   | 2026-05-16 |
 | 42. UPST5 audit | 0/TBD | Not started | - |
 | 43. UPST5 sync execution | 0/TBD | Not started | - |
 

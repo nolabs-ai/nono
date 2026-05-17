@@ -209,7 +209,7 @@ mod linux {
 
     struct ActiveChild {
         command: String,
-        pidfd: Option<OwnedFd>,
+        pidfd: OwnedFd,
     }
 
     #[derive(Debug, Serialize, Deserialize)]
@@ -1449,22 +1449,19 @@ mod linux {
     }
 
     fn active_child_is_live(pid: u32, active: &ActiveChild) -> Result<bool> {
-        if let Some(pidfd) = active.pidfd.as_ref() {
-            let mut pfd = libc::pollfd {
-                fd: pidfd.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            let status = unsafe { libc::poll(&mut pfd, 1, 0) };
-            if status < 0 {
-                return Err(NonoError::SandboxInit(format!(
-                    "ETI pidfd poll failed for pid {pid}: {}",
-                    std::io::Error::last_os_error()
-                )));
-            }
-            return Ok(status == 0);
+        let mut pfd = libc::pollfd {
+            fd: active.pidfd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let status = unsafe { libc::poll(&mut pfd, 1, 0) };
+        if status < 0 {
+            return Err(NonoError::SandboxInit(format!(
+                "ETI pidfd poll failed for pid {pid}: {}",
+                std::io::Error::last_os_error()
+            )));
         }
-        Ok(Path::new(&format!("/proc/{pid}")).exists())
+        Ok(status == 0)
     }
 
     /// Run `f` in a background thread and block until it returns or the timeout
@@ -2389,7 +2386,10 @@ mod linux {
         // the parent, so reading from pipe_read will yield EOF when the child
         // closes its stdout (on exit or explicit close).
 
-        track_child(state, child.id(), command_name)?;
+        if let Err(err) = track_spawned_child(state, command_name, &mut child) {
+            let _ = fs::remove_file(&spec_path);
+            return Err(err);
+        }
 
         let mut captured = Vec::new();
         let mut pipe_reader =
@@ -2433,7 +2433,7 @@ mod linux {
             .stderr(Stdio::from(File::from(stderr_slave)));
         let mut child = command.spawn().map_err(NonoError::CommandExecution)?;
         drop(pty.slave);
-        track_child(state, child.id(), command_name)?;
+        track_spawned_child(state, command_name, &mut child)?;
         let status = relay_pty_and_wait(&mut child, pty.master, stdio);
         untrack_child(state, child.id())?;
         status
@@ -2444,10 +2444,19 @@ mod linux {
         command_name: &str,
         child: &mut Child,
     ) -> Result<i32> {
-        track_child(state, child.id(), command_name)?;
+        track_spawned_child(state, command_name, child)?;
         let status = child.wait().map_err(NonoError::CommandExecution);
         untrack_child(state, child.id())?;
         status.map(exit_status_code)
+    }
+
+    fn track_spawned_child(state: &EtiState, command_name: &str, child: &mut Child) -> Result<()> {
+        if let Err(err) = track_child(state, child.id(), command_name) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(err);
+        }
+        Ok(())
     }
 
     fn track_child(state: &EtiState, child_pid: u32, command_name: &str) -> Result<()> {
@@ -2475,19 +2484,23 @@ mod linux {
         Ok(())
     }
 
-    fn open_pidfd(pid: u32) -> Result<Option<OwnedFd>> {
+    fn open_pidfd(pid: u32) -> Result<OwnedFd> {
         let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
         if fd >= 0 {
             // SAFETY: pidfd_open returned a fresh owned file descriptor on success.
-            return Ok(Some(unsafe { OwnedFd::from_raw_fd(fd as i32) }));
+            return Ok(unsafe { OwnedFd::from_raw_fd(fd as i32) });
         }
         let err = std::io::Error::last_os_error();
-        match err.raw_os_error() {
-            Some(code) if code == libc::ENOSYS || code == libc::EINVAL => Ok(None),
-            _ => Err(NonoError::SandboxInit(format!(
-                "ETI pidfd_open failed for pid {pid}: {err}"
-            ))),
-        }
+        let reason = match err.raw_os_error() {
+            Some(code) if code == libc::ENOSYS => {
+                "kernel does not support pidfd_open (requires Linux 5.3+)"
+            }
+            Some(code) if code == libc::EINVAL => "pidfd_open rejected flags",
+            _ => "pidfd_open failed",
+        };
+        Err(NonoError::SandboxInit(format!(
+            "ETI child liveness requires pidfd_open for pid {pid} to avoid PID reuse races; {reason}: {err}"
+        )))
     }
 
     fn exit_status_code(status: std::process::ExitStatus) -> i32 {

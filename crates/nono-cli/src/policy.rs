@@ -283,7 +283,7 @@ fn should_skip_resolved_deny_target(resolved: &Path) -> bool {
 ///
 /// Non-UTF-8 paths would produce incorrect Seatbelt rules via lossy conversion,
 /// potentially targeting the wrong path in deny rules.
-fn path_to_utf8(path: &Path) -> Result<&str> {
+pub(crate) fn path_to_utf8(path: &Path) -> Result<&str> {
     path.to_str().ok_or_else(|| {
         NonoError::ConfigParse(format!("Path contains non-UTF-8 bytes: {}", path.display()))
     })
@@ -295,7 +295,7 @@ fn path_to_utf8(path: &Path) -> Result<&str> {
 /// are the significant characters. Control characters are rejected (not stripped)
 /// to match the library's escape_path behavior — silently stripping could cause
 /// deny rules to target wrong paths.
-fn escape_seatbelt_path(path: &str) -> Result<String> {
+pub(crate) fn escape_seatbelt_path(path: &str) -> Result<String> {
     let mut result = String::with_capacity(path.len());
     for c in path.chars() {
         if c.is_control() {

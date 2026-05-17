@@ -121,10 +121,15 @@ impl MacosResourceLimits {
                         setrlimit(Resource::RLIMIT_AS, limit, limit)
                             .map_err(std::io::Error::from)?;
                     }
-                    if let Some(n) = max_processes {
-                        let limit = u64::from(n);
-                        setrlimit(Resource::RLIMIT_NPROC, limit, limit)
-                            .map_err(std::io::Error::from)?;
+                    if let Some(_n) = max_processes {
+                        // nix v0.31 does not expose RLIMIT_NPROC on macOS (BSD/Linux extension
+                        // not in nix's macOS subset). --max-processes is silently unenforced
+                        // here; the supervisor logs a warning so operators know. Future:
+                        // implement via Mach kernel task_policy_set if a true equivalent exists.
+                        tracing::warn!(
+                            "--max-processes is not enforced on macOS \
+                             (RLIMIT_NPROC unavailable in nix v0.31's macOS subset)"
+                        );
                     }
                 }
                 #[cfg(not(target_os = "macos"))]

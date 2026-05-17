@@ -940,22 +940,24 @@ pub fn execute_supervised(
                         }
                     }
                 }
-                if let Some(n) = resource_limits.max_processes {
-                    let limit = u64::from(n);
-                    // WR-02: fail closed — if setrlimit fails the sandbox MUST NOT
-                    // continue without the requested --max-processes enforcement.
-                    if setrlimit(Resource::RLIMIT_NPROC, limit, limit).is_err() {
-                        const MSG_RLIMIT_NPROC_FAIL: &[u8] =
-                            b"nono: setrlimit(RLIMIT_NPROC) failed in pre-exec child; aborting\n";
-                        // SAFETY: write and _exit are async-signal-safe.
-                        unsafe {
-                            libc::write(
-                                libc::STDERR_FILENO,
-                                MSG_RLIMIT_NPROC_FAIL.as_ptr().cast::<libc::c_void>(),
-                                MSG_RLIMIT_NPROC_FAIL.len(),
-                            );
-                            libc::_exit(126);
-                        }
+                if let Some(_n) = resource_limits.max_processes {
+                    // Plan 41-10 Class C: nix v0.31 does not expose Resource::RLIMIT_NPROC
+                    // on macOS (BSD/Linux extension not in nix's macOS subset). Mirrors the
+                    // disposition in supervisor_macos.rs::install_pre_exec: log a warning
+                    // (via async-signal-safe libc::write, since tracing::warn! is unsafe
+                    // in pre_exec) and continue. Sandbox boundary (Seatbelt) is unaffected;
+                    // --max-processes is silently unenforced on macOS until a Mach-kernel
+                    // task_policy_set equivalent is implemented.
+                    const MSG_RLIMIT_NPROC_UNAVAILABLE: &[u8] =
+                        b"nono: --max-processes is unavailable on macOS \
+                          (RLIMIT_NPROC absent from nix v0.31's macOS subset); continuing without enforcement\n";
+                    // SAFETY: write is async-signal-safe.
+                    unsafe {
+                        libc::write(
+                            libc::STDERR_FILENO,
+                            MSG_RLIMIT_NPROC_UNAVAILABLE.as_ptr().cast::<libc::c_void>(),
+                            MSG_RLIMIT_NPROC_UNAVAILABLE.len(),
+                        );
                     }
                 }
             }

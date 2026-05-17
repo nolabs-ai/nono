@@ -1391,37 +1391,38 @@ pub(super) mod cgroup {
         }
 
         #[test]
-        fn cgroup_session_apply_limits() {
+        fn cgroup_session_apply_limits() -> Result<(), Box<dyn std::error::Error>> {
             let Some(session) = try_cgroup_session("test-apply-001") else {
-                return;
+                return Ok(());
             };
-            session.apply_limits().unwrap();
-            let memory_max = std::fs::read_to_string(session.path.join("memory.max")).unwrap();
+            session.apply_limits()?;
+            let memory_max = std::fs::read_to_string(session.path.join("memory.max"))?;
             assert_eq!(
                 memory_max.trim(),
                 "268435456",
                 "memory.max should be 256*1024*1024 bytes"
             );
-            let cpu_max = std::fs::read_to_string(session.path.join("cpu.max")).unwrap();
+            let cpu_max = std::fs::read_to_string(session.path.join("cpu.max"))?;
             assert_eq!(
                 cpu_max.trim(),
                 "50000 100000",
                 "cpu.max should be quota=50000 period=100000"
             );
-            let pids_max = std::fs::read_to_string(session.path.join("pids.max")).unwrap();
+            let pids_max = std::fs::read_to_string(session.path.join("pids.max"))?;
             assert_eq!(pids_max.trim(), "10", "pids.max should be 10");
+            Ok(())
         }
 
         #[test]
-        fn cgroup_session_pre_exec_places_pid() {
+        fn cgroup_session_pre_exec_places_pid() -> Result<(), Box<dyn std::error::Error>> {
             let Some(session) = try_cgroup_session("test-pre-exec-001") else {
-                return;
+                return Ok(());
             };
-            session.apply_limits().unwrap();
+            session.apply_limits()?;
             let mut cmd = std::process::Command::new("sleep");
             cmd.arg("5");
             session.install_pre_exec(&mut cmd);
-            let child = cmd.spawn().unwrap();
+            let mut child = cmd.spawn()?;
             let child_pid = child.id();
             // Poll cgroup.procs for up to 500ms for the PID to appear.
             let procs_path = session.path.join("cgroup.procs");
@@ -1431,32 +1432,37 @@ pub(super) mod cgroup {
                     .map(|c| c.lines().any(|l| l.trim() == child_pid.to_string()))
                     .unwrap_or(false)
             });
-            // Kill the child regardless of assertion result.
+            // Kill the child and reap regardless of assertion result —
+            // closes clippy::zombie_processes by waiting on the Child handle.
             let _ = session.kill_all();
+            let _ = child.kill();
+            let _ = child.wait();
             assert!(
                 found,
                 "child PID {child_pid} should appear in cgroup.procs within 500ms"
             );
+            Ok(())
         }
 
         #[test]
-        fn cgroup_kill_terminates_grandchildren() {
+        fn cgroup_kill_terminates_grandchildren() -> Result<(), Box<dyn std::error::Error>> {
             let Some(session) = try_cgroup_session("test-kill-001") else {
-                return;
+                return Ok(());
             };
-            session.apply_limits().unwrap();
+            session.apply_limits()?;
             let mut cmd = std::process::Command::new("bash");
             cmd.args(["-c", "for i in 1 2 3; do sleep 60 & done; wait"]);
             session.install_pre_exec(&mut cmd);
-            let mut child = cmd.spawn().unwrap();
+            let mut child = cmd.spawn()?;
             // Give bash time to fork the sleep children.
             std::thread::sleep(std::time::Duration::from_millis(200));
-            session.kill_all().unwrap();
-            let result = child.wait().unwrap();
+            session.kill_all()?;
+            let result = child.wait()?;
             assert!(
                 !result.success(),
                 "bash should have been killed (non-zero exit)"
             );
+            Ok(())
         }
     }
 }

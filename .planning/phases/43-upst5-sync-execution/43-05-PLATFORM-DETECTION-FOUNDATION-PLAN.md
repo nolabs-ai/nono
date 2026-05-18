@@ -10,7 +10,7 @@ cluster_id: 5
 disposition: fork-preserve
 disposition_resolution_at_plan_open: true
 final_disposition_field_name: resolved_disposition
-resolved_disposition: null  # populated by Task 1 verdict — values: will-sync | fork-preserve
+resolved_disposition: fork-preserve  # Task 1 verdict 2026-05-18 — D-40-B1 clauses (a)+(b) both FAIL; see 43-05-DISPOSITION-RESOLUTION.md
 upstream_range: v0.53.0..v0.54.0
 upstream_shas: [ce06bd59]
 upstream_tag: v0.54.0

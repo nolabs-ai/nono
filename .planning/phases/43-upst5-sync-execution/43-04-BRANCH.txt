@@ -1,0 +1,8 @@
+branch=worktree-agent-addcdb9c2805c07b9 from=5e5f1005d8e63e7be2eea6037e40717496b0c4ea
+# Note: orchestrator-managed worktree branch (Claude Code Wave 1 parallel executor).
+# Plan frontmatter `wave_1_parallel_branch_strategy.branch_name: 43-04-cluster-3` will
+# be materialized by the orchestrator post-merge; this worktree branch is the
+# pre-merge container per parallel_execution protocol.
+# Base SHA is the post-43-01b-foundation-merge head; Plan 43-02 has not landed in
+# this base (orchestrator scheduled 43-03 + 43-04 against the 43-01b merge head
+# directly per current wave coordination).

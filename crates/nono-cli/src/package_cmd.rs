@@ -1,6 +1,8 @@
 //! Pack command handlers.
 
-use crate::cli::{ListArgs, PullArgs, RemoveArgs, SearchArgs, UpdateArgs};
+use crate::cli::{
+    ListArgs, OutdatedArgs, PinArgs, PullArgs, RemoveArgs, SearchArgs, UnpinArgs, UpdateArgs,
+};
 use crate::package::{
     self, ArtifactEntry, ArtifactType, LockedArtifact, LockedPackage, PackageManifest,
     PackageProvenance, PackageRef, PullResponse,
@@ -297,17 +299,139 @@ fn is_dir_empty(path: &Path) -> bool {
 }
 
 pub fn run_update(args: UpdateArgs) -> Result<()> {
-    if let Some(package_ref) = args.package_ref {
-        let package_ref = package::parse_package_ref(&package_ref)?;
-        return Err(NonoError::PackageInstall(format!(
-            "package update flow for {} is not implemented yet",
-            package_ref.key()
-        )));
+    let lockfile = package::read_lockfile()?;
+
+    if lockfile.packages.is_empty() {
+        eprintln!("No installed nono packs.");
+        return Ok(());
     }
 
-    Err(NonoError::PackageInstall(
-        "bulk package update is not implemented yet".to_string(),
-    ))
+    let registry_url = resolve_registry_url(args.registry.as_deref());
+    let client = RegistryClient::new(registry_url.clone());
+
+    // Collect the keys to process: either one specific pack or all installed.
+    let keys: Vec<String> = if let Some(ref pkg_ref_str) = args.package_ref {
+        let pkg_ref = package::parse_package_ref(pkg_ref_str)?;
+        if pkg_ref.version.is_some() {
+            return Err(NonoError::PackageInstall(
+                "nono update does not accept a version — use `nono pull <ns>/<name>@<version>` for exact installs".to_string(),
+            ));
+        }
+        if !lockfile.packages.contains_key(&pkg_ref.key()) {
+            return Err(NonoError::PackageInstall(format!(
+                "{} is not installed",
+                pkg_ref.key()
+            )));
+        }
+        vec![pkg_ref.key()]
+    } else {
+        lockfile.packages.keys().cloned().collect()
+    };
+
+    let mut updated = 0usize;
+    let mut skipped = 0usize;
+    let mut failed = 0usize;
+
+    for key in &keys {
+        let pkg = match lockfile.packages.get(key) {
+            Some(p) => p,
+            None => continue,
+        };
+
+        let parts: Vec<&str> = key.splitn(2, '/').collect();
+        if parts.len() != 2 {
+            eprintln!("  warning: skipping malformed lockfile key '{key}'");
+            continue;
+        }
+        let (namespace, name) = (parts[0], parts[1]);
+
+        if pkg.pinned && !args.force {
+            eprintln!(
+                "  {key}@{} pinned — skipped (use --force to update pinned packs)",
+                pkg.version
+            );
+            skipped = skipped.saturating_add(1);
+            continue;
+        }
+
+        let pkg_ref = package::PackageRef {
+            namespace: namespace.to_string(),
+            name: name.to_string(),
+            version: None,
+        };
+
+        let status = match client.fetch_package_status(&pkg_ref, Some(&pkg.version)) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("  warning: could not check status for {key}: {e}");
+                failed = failed.saturating_add(1);
+                continue;
+            }
+        };
+
+        match status.installed_status.as_deref() {
+            Some("current") => {
+                eprintln!("  {key} {} — up to date", pkg.version);
+                skipped = skipped.saturating_add(1);
+            }
+            Some("ahead") => {
+                eprintln!("  {key} {} is ahead of registry — skipped", pkg.version);
+                skipped = skipped.saturating_add(1);
+            }
+            Some("yanked") => {
+                eprintln!(
+                    "  {key}@{} has been yanked — run `nono pull {key}` to install the latest safe release",
+                    pkg.version
+                );
+                failed = failed.saturating_add(1);
+            }
+            _ => {
+                // "outdated" or "unknown" — attempt update.
+                let latest = status.latest_version.as_deref().unwrap_or("latest");
+                if args.dry_run {
+                    eprintln!("  {key} {} → {latest} (dry run)", pkg.version);
+                    updated = updated.saturating_add(1);
+                } else {
+                    if pkg.pinned {
+                        eprintln!(
+                            "  {key}@{} is pinned — updating anyway (--force)",
+                            pkg.version
+                        );
+                    }
+                    eprintln!("  updating {key} {} → {latest}", pkg.version);
+                    match run_pull(PullArgs {
+                        package_ref: key.clone(),
+                        registry: args.registry.clone(),
+                        force: args.force,
+                        init: false,
+                        help: None,
+                    }) {
+                        Ok(()) => {
+                            updated = updated.saturating_add(1);
+                        }
+                        Err(e) => {
+                            eprintln!("  failed to update {key}: {e}");
+                            failed = failed.saturating_add(1);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if args.dry_run {
+        eprintln!("\n  dry run: {updated} would be updated, {skipped} skipped");
+    } else {
+        eprintln!("\n  {updated} updated, {skipped} skipped, {failed} failed");
+    }
+
+    if failed > 0 && !args.dry_run {
+        Err(NonoError::PackageInstall(format!(
+            "{failed} pack(s) failed to update"
+        )))
+    } else {
+        Ok(())
+    }
 }
 
 pub fn run_search(args: SearchArgs) -> Result<()> {
@@ -369,6 +493,159 @@ pub fn run_list(args: ListArgs) -> Result<()> {
     Err(NonoError::PackageInstall(
         "only `nono list --installed` is currently supported".to_string(),
     ))
+}
+
+pub fn run_pin(args: PinArgs) -> Result<()> {
+    let package_ref = package::parse_package_ref(&args.package_ref)?;
+    if package_ref.version.is_some() {
+        return Err(NonoError::PackageInstall(
+            "pin takes a pack name without a version — it pins the currently installed version"
+                .to_string(),
+        ));
+    }
+
+    let mut lockfile = package::read_lockfile()?;
+    let pkg = lockfile
+        .packages
+        .get_mut(&package_ref.key())
+        .ok_or_else(|| {
+            NonoError::PackageInstall(format!("{} is not installed", package_ref.key()))
+        })?;
+
+    let pinned_version = pkg.version.clone();
+    pkg.pinned = true;
+    package::write_lockfile(&lockfile)?;
+
+    eprintln!(
+        "  pinned {}@{} — excluded from nono update",
+        package_ref.key(),
+        pinned_version
+    );
+    Ok(())
+}
+
+pub fn run_unpin(args: UnpinArgs) -> Result<()> {
+    let package_ref = package::parse_package_ref(&args.package_ref)?;
+    if package_ref.version.is_some() {
+        return Err(NonoError::PackageInstall(
+            "unpin takes a pack name without a version".to_string(),
+        ));
+    }
+
+    let mut lockfile = package::read_lockfile()?;
+    let pkg = lockfile
+        .packages
+        .get_mut(&package_ref.key())
+        .ok_or_else(|| {
+            NonoError::PackageInstall(format!("{} is not installed", package_ref.key()))
+        })?;
+
+    pkg.pinned = false;
+    package::write_lockfile(&lockfile)?;
+
+    eprintln!(
+        "  unpinned {} — will be included in nono update",
+        package_ref.key()
+    );
+    Ok(())
+}
+
+#[derive(serde::Serialize)]
+struct OutdatedEntry {
+    key: String,
+    installed: String,
+    latest: Option<String>,
+    status: String,
+    pinned: bool,
+}
+
+pub fn run_outdated(args: OutdatedArgs) -> Result<()> {
+    let lockfile = package::read_lockfile()?;
+
+    if lockfile.packages.is_empty() {
+        if args.json {
+            println!("[]");
+        } else {
+            println!("No installed nono packs.");
+        }
+        return Ok(());
+    }
+
+    let registry_url = resolve_registry_url(args.registry.as_deref());
+    let client = RegistryClient::new(registry_url);
+
+    let mut entries: Vec<OutdatedEntry> = Vec::new();
+
+    for (key, pkg) in &lockfile.packages {
+        let parts: Vec<&str> = key.splitn(2, '/').collect();
+        let (namespace, name) = if parts.len() == 2 {
+            (parts[0], parts[1])
+        } else {
+            eprintln!("  warning: skipping malformed lockfile key '{key}'");
+            continue;
+        };
+
+        let pkg_ref = package::PackageRef {
+            namespace: namespace.to_string(),
+            name: name.to_string(),
+            version: None,
+        };
+
+        match client.fetch_package_status(&pkg_ref, Some(&pkg.version)) {
+            Ok(status) => {
+                let status_str = status.installed_status.as_deref().unwrap_or("unknown");
+                entries.push(OutdatedEntry {
+                    key: key.clone(),
+                    installed: pkg.version.clone(),
+                    latest: status.latest_version.clone(),
+                    status: status_str.to_string(),
+                    pinned: pkg.pinned,
+                });
+            }
+            Err(e) => {
+                eprintln!("  warning: could not check status for {key}: {e}");
+                entries.push(OutdatedEntry {
+                    key: key.clone(),
+                    installed: pkg.version.clone(),
+                    latest: None,
+                    status: "unknown".to_string(),
+                    pinned: pkg.pinned,
+                });
+            }
+        }
+    }
+
+    if args.json {
+        let json = serde_json::to_string_pretty(&entries).map_err(|e| {
+            NonoError::ConfigParse(format!("failed to serialize outdated results: {e}"))
+        })?;
+        println!("{json}");
+        return Ok(());
+    }
+
+    let needs_attention = entries
+        .iter()
+        .any(|e| e.status != "current" && e.status != "unknown");
+
+    if !needs_attention && entries.iter().all(|e| e.status == "current") {
+        println!("All installed packs are up to date.");
+        return Ok(());
+    }
+
+    println!("{:<40} {:<12} {:<12} STATUS", "PACK", "INSTALLED", "LATEST");
+    for entry in &entries {
+        let latest_display = entry.latest.as_deref().unwrap_or("-");
+        let mut status_display = entry.status.clone();
+        if entry.pinned {
+            status_display.push_str(" (pinned)");
+        }
+        println!(
+            "{:<40} {:<12} {:<12} {}",
+            entry.key, entry.installed, latest_display, status_display
+        );
+    }
+
+    Ok(())
 }
 
 struct DownloadedArtifact {
@@ -902,6 +1179,12 @@ fn update_lockfile(
     lockfile.lockfile_version = package::LOCKFILE_VERSION;
     lockfile.registry = registry_url.to_string();
 
+    let was_pinned = lockfile
+        .packages
+        .get(&package_ref.key())
+        .map(|p| p.pinned)
+        .unwrap_or(false);
+
     let artifacts = downloads
         .iter()
         .filter(|artifact| artifact.filename != "package.json")
@@ -925,6 +1208,7 @@ fn update_lockfile(
         LockedPackage {
             version: pull.version.clone(),
             installed_at: Utc::now().to_rfc3339(),
+            pinned: was_pinned,
             provenance: Some(PackageProvenance {
                 signer_identity: signer_identity.to_string(),
                 repository: pull.provenance.repository.clone(),

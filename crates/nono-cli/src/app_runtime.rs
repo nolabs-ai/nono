@@ -131,6 +131,15 @@ fn dispatch_command(
         Commands::List(args) => {
             run_command_with_update(update_handle, silent, || package_cmd::run_list(args))
         }
+        Commands::Pin(args) => {
+            run_command_with_update(update_handle, silent, || package_cmd::run_pin(args))
+        }
+        Commands::Unpin(args) => {
+            run_command_with_update(update_handle, silent, || package_cmd::run_unpin(args))
+        }
+        Commands::Outdated(args) => {
+            run_command_with_update(update_handle, silent, || package_cmd::run_outdated(args))
+        }
         Commands::OpenUrlHelper(args) => run_open_url_helper(args),
         Commands::Completions(args) => run_completions(args),
     }

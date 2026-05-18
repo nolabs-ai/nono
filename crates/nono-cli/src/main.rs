@@ -41,6 +41,7 @@ mod open_url_runtime;
 #[path = "open_url_runtime_windows.rs"]
 mod open_url_runtime;
 mod output;
+mod pack_update_hint;
 mod package;
 mod package_cmd;
 mod package_status;

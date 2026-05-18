@@ -108,6 +108,10 @@ fn finalize_prepared_sandbox(
     output::print_skipped_requested_paths(&collect_missing_cli_requested_paths(args), silent);
     output::print_capabilities(&prepared.caps, args.verbose, silent);
 
+    if let Some(ref profile_name) = args.profile {
+        crate::pack_update_hint::show_pack_update_hints(profile_name, silent);
+    }
+
     #[cfg(target_os = "linux")]
     output::print_abi_info(silent);
 

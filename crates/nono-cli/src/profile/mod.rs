@@ -2919,6 +2919,79 @@ fn current_uid_string() -> String {
     "0".to_string()
 }
 
+/// Enumerate pack-store-installed profiles as `(profile_name, pack_ref)` pairs.
+///
+/// Walks `package_store_dir()` for every `<namespace>/<pack>/package.json`,
+/// reads the manifest, and for each `ArtifactType::Profile` entry with a
+/// non-empty `install_as` emits `(install_as, "namespace/pack")`. Pack refs
+/// without a usable `install_as` are skipped (fork's installer always sets it
+/// when installing a profile artifact).
+///
+/// Fork-divergence note: this function is the fork-side port of upstream's
+/// `crate::profile::list_pack_store_profiles` (introduced in `24d8b924` and
+/// referenced by `pack_update_hint.rs` brought in by Plan 43-03 Cluster 1
+/// cherry-pick `5098fc10`). Phase 34 Plan 34-04 D-20 manual-replay
+/// deliberately omitted upstream's pack-store subsystem; this adapter
+/// provides the minimal surface `pack_update_hint.rs` needs, using fork's
+/// existing `crate::package::package_store_dir` + `PackageManifest`
+/// primitives. Fork's `ArtifactEntry` does not carry an `aliases` field
+/// (upstream-only addition), so alias enumeration is structurally absent.
+pub fn list_pack_store_profiles() -> Vec<(String, String)> {
+    let store = match crate::package::package_store_dir() {
+        Ok(s) if s.exists() => s,
+        _ => return Vec::new(),
+    };
+    let mut out: Vec<(String, String)> = Vec::new();
+    let Ok(ns_entries) = fs::read_dir(&store) else {
+        return out;
+    };
+    for ns_entry in ns_entries.flatten() {
+        let ns_path = ns_entry.path();
+        if !ns_path.is_dir() {
+            continue;
+        }
+        let Ok(pack_entries) = fs::read_dir(&ns_path) else {
+            continue;
+        };
+        for pack_entry in pack_entries.flatten() {
+            let pack_path = pack_entry.path();
+            if !pack_path.is_dir() {
+                continue;
+            }
+            let manifest_path = pack_path.join("package.json");
+            if !manifest_path.exists() {
+                continue;
+            }
+            let Ok(manifest_str) = fs::read_to_string(&manifest_path) else {
+                continue;
+            };
+            let Ok(manifest): std::result::Result<crate::package::PackageManifest, _> =
+                serde_json::from_str(&manifest_str)
+            else {
+                continue;
+            };
+            let pack_ref = format!(
+                "{}/{}",
+                ns_entry.file_name().to_string_lossy(),
+                pack_entry.file_name().to_string_lossy()
+            );
+            for artifact in &manifest.artifacts {
+                if artifact.artifact_type != crate::package::ArtifactType::Profile {
+                    continue;
+                }
+                if let Some(name) = artifact.install_as.as_deref() {
+                    let install_path = pack_path.join("profiles").join(format!("{name}.json"));
+                    if install_path.exists() {
+                        out.push((name.to_string(), pack_ref.clone()));
+                    }
+                }
+            }
+        }
+    }
+    out.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+    out
+}
+
 /// List available profiles (built-in + user)
 pub fn list_profiles() -> Vec<String> {
     let mut profiles = builtin::list_builtin();

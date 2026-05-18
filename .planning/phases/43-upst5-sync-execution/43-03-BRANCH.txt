@@ -1,0 +1,3 @@
+branch=worktree-agent-a7fcb300371d56aaf (serves as 43-03-cluster-1) from=5e5f1005d8e63e7be2eea6037e40717496b0c4ea
+note=Worktree mode per parallel_execution protocol; orchestrator merges this worktree branch back to main, fulfilling the per-plan-feature-branch logical role of `43-03-cluster-1`.
+wave_0b_status=Plan 43-02 (66c69f86 snapshot symlink fix) NOT yet merged into Wave 1 base. Orchestrator dispatched Wave 1 worktrees concurrently with Wave 0b; Cluster 1 commits are file-disjoint from snapshot.rs so the merge order will resolve cleanly. Documented as planning-deviation (orchestrator-coordination) in SUMMARY.

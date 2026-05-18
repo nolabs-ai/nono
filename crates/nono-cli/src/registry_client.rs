@@ -1,8 +1,7 @@
 //! Registry client for package hosting.
 
 use crate::package::{
-    PackageRef, PackageSearchResponse, PackageSearchResult, PackageStatusResponse, PullResponse,
-    YankedErrorResponse,
+    PackageRef, PackageSearchResponse, PackageSearchResult, PullResponse, YankedErrorResponse,
 };
 use nono::{NonoError, Result};
 use serde::de::DeserializeOwned;
@@ -104,8 +103,12 @@ impl RegistryClient {
                 msg.push_str(&format!(" (reason: {reason})"));
             }
             if let Some(advisory) = &yanked.advisory {
-                let severity = advisory.severity.as_deref().unwrap_or("unknown");
-                let summary = advisory.summary.as_deref().unwrap_or("");
+                // Fork-side adjustment: fork's PackageAdvisory has bare `String` fields
+                // (severity, summary) per Phase 36.5 D-36.5-C3 port, where upstream uses
+                // Option<String>. Replace as_deref().unwrap_or() with as_str() to match
+                // fork's struct shape.
+                let severity = advisory.severity.as_str();
+                let summary = advisory.summary.as_str();
                 if !summary.is_empty() {
                     msg.push_str(&format!("\nadvisory: {severity} — {summary}"));
                 } else {

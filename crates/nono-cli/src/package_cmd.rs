@@ -473,7 +473,7 @@ pub fn run_outdated(args: OutdatedArgs) -> Result<()> {
                 entries.push(OutdatedEntry {
                     key: key.clone(),
                     installed: pkg.version.clone(),
-                    latest: status.latest.clone(),
+                    latest: status.latest_version.clone(),
                     status: status_str.to_string(),
                     pinned: pkg.pinned,
                 });

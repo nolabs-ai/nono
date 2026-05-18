@@ -55,7 +55,8 @@ pub fn show_pack_update_hints(profile_name: &str, silent: bool) {
         return;
     }
 
-    let state = load_state();
+    let cache_existed = state_file_path().is_some_and(|p| p.exists());
+    let mut state = load_state();
     let now = Utc::now();
 
     let mut hints: Vec<(String, String, String)> = Vec::new(); // (pack_ref, installed, latest)
@@ -75,15 +76,33 @@ pub fn show_pack_update_hints(profile_name: &str, silent: bool) {
                 }
             }
             _ => {
-                // Missing or stale — queue for background refresh.
                 stale.push((pack_ref.clone(), installed.clone()));
             }
         }
     }
 
     if !stale.is_empty() {
-        let shared = Arc::new(Mutex::new(state));
-        refresh_in_background(stale, shared);
+        if !cache_existed {
+            // No cache file at all — first run after install or CLI upgrade.
+            // Do a synchronous check so the hint is visible immediately rather
+            // than silently deferring to the next run.
+            refresh_synchronous(&stale, &mut state);
+            save_state(&state);
+            for (pack_ref, installed) in &stale {
+                if let Some(entry) = state.entries.get(pack_ref) {
+                    if let Some(ref latest) = entry.latest {
+                        if is_newer(installed, latest) {
+                            hints.push((pack_ref.clone(), installed.clone(), latest.clone()));
+                        }
+                    }
+                }
+            }
+        } else {
+            // Cache exists but some entries are stale — refresh in background
+            // so startup latency is unaffected.
+            let shared = Arc::new(Mutex::new(state));
+            refresh_in_background(stale, shared);
+        }
     }
 
     print_hints(&hints);
@@ -137,6 +156,29 @@ fn collect_profile_packs(profile_name: &str) -> Vec<(String, String)> {
 // ---------------------------------------------------------------------------
 // Background refresh
 // ---------------------------------------------------------------------------
+
+fn refresh_synchronous(packs: &[(String, String)], state: &mut PackHintsState) {
+    let registry_url = crate::registry_client::resolve_registry_url(None);
+    let client = crate::registry_client::RegistryClient::new(registry_url);
+    for (pack_ref, installed) in packs {
+        let pkg_ref = match crate::package::parse_package_ref(pack_ref) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        let latest = client
+            .fetch_package_status(&pkg_ref, Some(installed))
+            .ok()
+            .and_then(|s| s.latest);
+        state.entries.insert(
+            pack_ref.clone(),
+            PackHintEntry {
+                last_check: Utc::now(),
+                installed_at_check: installed.clone(),
+                latest,
+            },
+        );
+    }
+}
 
 fn refresh_in_background(stale: Vec<(String, String)>, state: Arc<Mutex<PackHintsState>>) {
     let registry_url = crate::registry_client::resolve_registry_url(None);

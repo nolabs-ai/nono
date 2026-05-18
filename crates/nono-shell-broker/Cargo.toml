@@ -29,3 +29,6 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Console",
     "Win32_System_SystemServices",
 ] }
+
+[lints]
+workspace = true

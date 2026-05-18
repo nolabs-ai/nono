@@ -566,13 +566,13 @@ fn format_bytes_human(bytes: u64) -> String {
     const M: u64 = K * 1024;
     const G: u64 = M * 1024;
     const T: u64 = G * 1024;
-    if bytes >= T && bytes % T == 0 {
+    if bytes >= T && bytes.is_multiple_of(T) {
         format!("{} TiB", bytes / T)
-    } else if bytes >= G && bytes % G == 0 {
+    } else if bytes >= G && bytes.is_multiple_of(G) {
         format!("{} GiB", bytes / G)
-    } else if bytes >= M && bytes % M == 0 {
+    } else if bytes >= M && bytes.is_multiple_of(M) {
         format!("{} MiB", bytes / M)
-    } else if bytes >= K && bytes % K == 0 {
+    } else if bytes >= K && bytes.is_multiple_of(K) {
         format!("{} KiB", bytes / K)
     } else {
         format!("{bytes} bytes")
@@ -584,13 +584,13 @@ fn format_bytes_human(bytes: u64) -> String {
 /// (s/m/h/d), which always produce whole-second durations.
 fn format_duration_human(d: std::time::Duration) -> String {
     let secs = d.as_secs();
-    if secs >= 86_400 && secs % 86_400 == 0 {
+    if secs >= 86_400 && secs.is_multiple_of(86_400) {
         let n = secs / 86_400;
         format!("{n} {}", if n == 1 { "day" } else { "days" })
-    } else if secs >= 3600 && secs % 3600 == 0 {
+    } else if secs >= 3600 && secs.is_multiple_of(3600) {
         let n = secs / 3600;
         format!("{n} {}", if n == 1 { "hour" } else { "hours" })
-    } else if secs >= 60 && secs % 60 == 0 {
+    } else if secs >= 60 && secs.is_multiple_of(60) {
         let n = secs / 60;
         format!("{n} {}", if n == 1 { "minute" } else { "minutes" })
     } else {

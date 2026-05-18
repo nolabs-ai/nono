@@ -228,7 +228,7 @@ pub(crate) fn verify_audit_attestation(
             Err(_) => return Ok(false),
         },
         None => {
-            if summary.public_key.is_empty() || summary.public_key.len() % 2 != 0 {
+            if summary.public_key.is_empty() || !summary.public_key.len().is_multiple_of(2) {
                 return Ok(false);
             }
             match hex_decode(&summary.public_key) {
@@ -295,7 +295,7 @@ fn synthetic_subjects(
 /// Decode a lowercase hex string into bytes. Returns `None` on any
 /// non-hex character.
 fn hex_decode(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return None;
     }
     let mut out = Vec::with_capacity(s.len() / 2);

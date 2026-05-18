@@ -10,7 +10,7 @@ members = [
 
 [workspace.package]
 edition = "2021"
-rust-version = "1.77"
+rust-version = "1.95"
 authors = ["Luke Hinds"]
 license = "Apache-2.0"
 repository = "https://github.com/always-further/nono"
@@ -53,6 +53,19 @@ tempfile = "3"
 
 # C FFI bindings
 cbindgen = "0.29"
+
+# Unix-platform deps centralized at the workspace level (Plan 43-01b fork-authored
+# split of upstream 8b888a1c Cluster 2). Per-crate feature flags remain in the
+# crate Cargo.toml via `{ workspace = true, features = [...] }` table form.
+nix = "0.31.3"
+landlock = "0.4"
+getrandom = "0.4"
+
+[workspace.lints.clippy]
+# Formalize CLAUDE.md § Unwrap Policy at the manifest level. Equivalent to the
+# `-D clippy::unwrap_used` clippy flag enforced via CI + `make clippy`; this
+# declaration makes the deny audit-visible in the workspace manifest.
+unwrap_used = "deny"
 
 [profile.release]
 opt-level = 3

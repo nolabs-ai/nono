@@ -29,7 +29,7 @@ serde_json.workspace = true
 tracing.workspace = true
 zeroize.workspace = true
 sha2.workspace = true
-getrandom = "0.4"
+getrandom = { workspace = true }
 base64 = "0.22"
 subtle = "2"
 url = "2"
@@ -52,3 +52,6 @@ rustls-native-certs = "0.8"
 [dev-dependencies]
 tempfile.workspace = true
 tokio = { version = "1", features = ["test-util", "rt-multi-thread", "macros"] }
+
+[lints]
+workspace = true

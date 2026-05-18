@@ -132,7 +132,7 @@ fn run_command_args() -> Vec<&'static str> {
 /// session.json's audit_attestation.public_key into the raw DER bytes that
 /// `nono audit verify --public-key-file` accepts.
 fn hex_decode_test(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return None;
     }
     let mut out = Vec::with_capacity(s.len() / 2);
@@ -379,7 +379,7 @@ fn audit_verify_reports_signed_attestation_with_pinned_public_key() {
         .as_str()
         .expect("audit_attestation.key_id in session.json");
     assert!(
-        !pub_key_hex.is_empty() && pub_key_hex.len() % 2 == 0,
+        !pub_key_hex.is_empty() && pub_key_hex.len().is_multiple_of(2),
         "public_key hex must be non-empty even-length"
     );
     let pub_key_der = hex_decode_test(pub_key_hex).expect("decode pubkey hex DER");

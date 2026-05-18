@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use tracing::info;
 
 fn parse_env_credential_map_args(values: &[String]) -> Result<Vec<(String, String)>> {
-    if values.len() % 2 != 0 {
+    if !values.len().is_multiple_of(2) {
         return Err(NonoError::ConfigParse(
             "--env-credential-map expects pairs: <CREDENTIAL_REF> <ENV_VAR>".to_string(),
         ));

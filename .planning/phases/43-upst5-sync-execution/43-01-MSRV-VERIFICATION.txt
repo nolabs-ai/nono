@@ -1,0 +1,109 @@
+Plan 43-01 — MSRV / Edition Verification Artifact (Task 1)
+============================================================
+
+Recorded: 2026-05-17
+Verifier: gsd-executor (parallel worktree agent)
+
+UPSTREAM VALUES AT v0.54.0 (git show v0.54.0:Cargo.toml [workspace.package]):
+------------------------------------------------------------------------------
+  edition = "2024"
+  rust-version = "1.95"
+  authors = ["Luke Hinds"]
+  license = "Apache-2.0"
+  repository = "https://github.com/always-further/nono"
+  homepage = "https://github.com/always-further/nono"
+
+WORKSPACE_VERSION_SHAPE:
+------------------------
+  Upstream [workspace.package] does NOT contain a `version` field — kept per-crate
+  literal pins. Upstream per-crate Cargo.toml files declare `version = "0.54.0"`
+  literally (verified at v0.54.0 for crates/nono, crates/nono-cli, crates/nono-proxy).
+
+  Fork shape parallel: fork per-crate Cargo.toml files declare `version = "0.53.0"`
+  literally. Fork's [workspace.package] also has no `version` field.
+
+  Conclusion: NEITHER shape introduces `version.workspace = true`. The cherry-pick
+  must preserve fork's literal per-crate `version = "0.53.0"` on all 5 crates and
+  must NOT introduce `version = "0.54.0"` or any version bump.
+
+UPSTREAM COMMIT VERIFICATION (git log -1 --format='%H %s' 8b888a1c):
+--------------------------------------------------------------------
+  Full SHA:  8b888a1c0224d3dd6ca790ef6d2554b0676b036d
+  Short SHA: 8b888a1c (matches Phase 42 DIVERGENCE-LEDGER cluster 2 record)
+  Subject:   feat: upgrade to Rust edition 2024, centralize workspace dependencies
+            (matches Phase 42 ledger exactly)
+  Author:    SequeI <asiek@redhat.com>
+  Date:      2026-05-12 13:23:44 +0100
+  Tag:       v0.54.0 (commit reachable from this tag — verified via `git tag --list v0.54.0`)
+  Files changed: 98 (vs Phase 42 ledger estimate of 86 — close enough; ledger note
+                     said "+2,234/-1,470"; actual stat shows +1,892/-1,674)
+
+LOCAL RUSTC TOOLCHAIN (rustc --version):
+----------------------------------------
+  rustc 1.95.0 (59807616e 2026-04-14)
+  cargo 1.95.0 (f2d3ce0bd 2026-03-21)
+
+  Local rustc 1.95.0 == upstream MSRV 1.95 → satisfies (equal).
+  No `rustup update stable` needed.
+
+WINDOWS-ONLY-FILES INVARIANT CHECK (D-43-E1):
+---------------------------------------------
+  Upstream commit `git show 8b888a1c --name-only` did NOT touch:
+    *_windows.rs              — NONE FOUND
+    exec_strategy_windows/     — NONE FOUND
+    nono-shell-broker/         — NONE FOUND
+  Result: D-43-E1 invariant holds at the upstream commit level.
+  No 4-condition addendum invocation expected.
+
+CHERRY-PICK CONFLICT FORECAST:
+------------------------------
+  Anticipated `Cargo.toml` (root) conflicts:
+    1. `rust-version` hunk: fork has "1.77" (Phase 04 plan 02 bump); upstream's
+       diff shows "1.74" → "1.95". Need to keep upstream's "1.95".
+    2. `serde_json` pin: fork has 1.0.149 (matches upstream's pre-diff value);
+       upstream relaxes to "1". Take upstream's relaxed pin.
+    3. `nix`, `landlock`, `url`, `getrandom` workspace-deps additions: fork already
+       has `url = "2.5"` in [workspace.dependencies] (line 49). Upstream adds
+       `url = "2"`. Need to KEEP fork's `url = "2.5"` to avoid downgrading.
+       For nix/landlock/getrandom: fork does NOT have these in workspace deps
+       (verified — nix is per-crate in crates/nono-cli + crates/nono/Cargo.toml,
+       landlock similarly). Upstream's centralization additions land cleanly.
+
+  Anticipated per-crate `Cargo.toml` conflicts:
+    Each upstream per-crate file has `version = "0.54.0"` literal. Fork has
+    `version = "0.53.0"` literal. Must keep fork's 0.53.0 on every per-crate file.
+
+  Fork-only file (crates/nono-shell-broker/Cargo.toml): upstream did not touch
+    this file (D-43-E1 invariant). Fork shape preserved as-is post-cherry-pick.
+
+  Anticipated source-file conflicts:
+    None expected on Windows-only files. Cross-platform edition-migration boilerplate
+    (dyn keyword, #[unsafe(no_mangle)], unsafe-blocks around env::set_var) should
+    apply cleanly on all platform-agnostic code. Fork-only files that don't exist
+    upstream (e.g., fork-only modules under crates/nono-shell-broker, *_windows.rs)
+    are not touched by the cherry-pick.
+
+D-19 TRAILER BLOCK DATA (extracted for Task 2 commit message):
+--------------------------------------------------------------
+  Upstream-commit: 8b888a1c
+  Upstream-tag:    v0.54.0
+  Upstream-author: SequeI <asiek@redhat.com>
+  Upstream-date:   2026-05-12T13:23:44+01:00
+  Upstream-subject: feat: upgrade to Rust edition 2024, centralize workspace dependencies
+  Upstream-categories: other,profile,policy,proxy,audit
+
+TASK 1 ACCEPTANCE CRITERIA — ALL PASS:
+--------------------------------------
+  [x] git remote -v | grep upstream | grep -c 'always-further/nono.git'  → 2 (fetch + push)
+  [x] git tag --list 'v0.54.0' | wc -l                                    → 1
+  [x] git rev-parse v0.54.0 → upstream commit at tip; cherry-pick SHA 8b888a1c
+      is the only commit in cluster 2 per Phase 42 ledger; subject matches.
+  [x] 43-01-MSRV-VERIFICATION.txt exists with all required lines.
+  [x] Local rustc 1.95.0 ≥ upstream MSRV 1.95.
+
+NOTES:
+------
+  - rustup update was NOT run — local toolchain already at upstream MSRV.
+  - workspace_version_shape: per-crate-literal (NEITHER fork nor upstream centralizes
+    version into [workspace.package]). Task 2 dual-shape acceptance still works: the
+    `version = "0.53.0"` literal-pin branch matches all 5 crates.

@@ -1,6 +1,9 @@
 //! Registry client for package hosting.
 
-use crate::package::{PackageRef, PackageSearchResponse, PackageSearchResult, PullResponse};
+use crate::package::{
+    PackageRef, PackageSearchResponse, PackageSearchResult, PackageStatusResponse, PullResponse,
+    YankedErrorResponse,
+};
 use nono::{NonoError, Result};
 use serde::de::DeserializeOwned;
 use std::fs;
@@ -55,10 +58,96 @@ impl RegistryClient {
         package_ref: &PackageRef,
         version: &str,
     ) -> Result<PullResponse> {
-        self.get_json(&format!(
-            "/api/v1/packages/{}/{}/versions/{version}/pull",
-            package_ref.namespace, package_ref.name
-        ))
+        let url = format!(
+            "{}/api/v1/packages/{}/{}/versions/{version}/pull",
+            self.base_url, package_ref.namespace, package_ref.name
+        );
+        let mut response = self
+            .http
+            .get(&url)
+            .config()
+            .http_status_as_error(false)
+            .build()
+            .call()
+            .map_err(map_ureq_error)?;
+
+        if response.status().as_u16() == 410 {
+            enforce_content_length(
+                response.body().content_length(),
+                REGISTRY_JSON_LIMIT_BYTES,
+                &url,
+            )?;
+            let body = response
+                .body_mut()
+                .with_config()
+                .limit(REGISTRY_JSON_LIMIT_BYTES)
+                .read_to_string()
+                .map_err(|e| {
+                    NonoError::RegistryError(format!(
+                        "failed to read registry response from {}: {}",
+                        url, e
+                    ))
+                })?;
+            let yanked: YankedErrorResponse = serde_json::from_str(&body).unwrap_or_else(|_| {
+                YankedErrorResponse {
+                    error: None,
+                    yanked: true,
+                    yank_reason: None,
+                    advisory: None,
+                }
+            });
+            let mut msg = format!(
+                "{}/{}@{} has been yanked",
+                package_ref.namespace, package_ref.name, version
+            );
+            if let Some(reason) = &yanked.yank_reason {
+                msg.push_str(&format!(" (reason: {reason})"));
+            }
+            if let Some(advisory) = &yanked.advisory {
+                let severity = advisory.severity.as_deref().unwrap_or("unknown");
+                let summary = advisory.summary.as_deref().unwrap_or("");
+                if !summary.is_empty() {
+                    msg.push_str(&format!("\nadvisory: {severity} — {summary}"));
+                } else {
+                    msg.push_str(&format!("\nadvisory severity: {severity}"));
+                }
+            }
+            msg.push_str(&format!(
+                "\ninstall the latest safe release: nono pull {}/{}",
+                package_ref.namespace, package_ref.name
+            ));
+            return Err(NonoError::RegistryError(msg));
+        }
+
+        if !response.status().is_success() {
+            return Err(NonoError::RegistryError(format!(
+                "registry returned HTTP {} for {}/{}@{}",
+                response.status().as_u16(),
+                package_ref.namespace,
+                package_ref.name,
+                version
+            )));
+        }
+
+        enforce_content_length(
+            response.body().content_length(),
+            REGISTRY_JSON_LIMIT_BYTES,
+            &url,
+        )?;
+        let body = response
+            .body_mut()
+            .with_config()
+            .limit(REGISTRY_JSON_LIMIT_BYTES)
+            .read_to_string()
+            .map_err(|e| {
+                NonoError::RegistryError(format!(
+                    "failed to read registry response from {}: {}",
+                    url, e
+                ))
+            })?;
+        serde_json::from_str(&body).map_err(|e| {
+            NonoError::RegistryError(format!("failed to decode registry response: {e}"))
+        })
     }
 
     pub fn search_packages(&self, query: &str) -> Result<Vec<PackageSearchResult>> {

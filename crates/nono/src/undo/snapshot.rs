@@ -265,6 +265,17 @@ impl SnapshotManager {
         let mut applied_changes = Vec::new();
         let mut restore_failures: Vec<(std::path::PathBuf, String)> = Vec::new();
 
+        for (path, state) in &manifest.files {
+            let needs_restore = match current_files.get(path) {
+                Some(current) => current.hash != state.hash,
+                None => true,
+            };
+
+            if needs_restore {
+                self.validate_restore_target(path)?;
+            }
+        }
+
         // Restore files from manifest
         for (path, state) in &manifest.files {
             let needs_restore = match current_files.get(path) {
@@ -571,6 +582,107 @@ impl SnapshotManager {
                 )));
             }
         }
+        Ok(())
+    }
+
+    /// Validate the live filesystem path that restore will write through.
+    ///
+    /// Manifest validation is lexical: it proves stored paths are under tracked
+    /// roots, but it cannot see symlinks created after the snapshot. Restore
+    /// runs outside the sandbox, so every existing parent component at or below
+    /// the tracked root must be a real directory before `create_dir_all`,
+    /// temp-file creation, rename, or chmod touches the path.
+    fn validate_restore_target(&self, path: &Path) -> Result<()> {
+        let tracked = self
+            .tracked_paths
+            .iter()
+            .filter(|tracked| path.starts_with(tracked))
+            .max_by_key(|tracked| tracked.components().count())
+            .ok_or_else(|| {
+                NonoError::Snapshot(format!(
+                    "Manifest contains path outside tracked directories: {}",
+                    path.display()
+                ))
+            })?;
+
+        let parent = path.parent().ok_or_else(|| {
+            NonoError::Snapshot(format!("Restore target has no parent: {}", path.display()))
+        })?;
+
+        if tracked == path {
+            return Ok(());
+        }
+
+        match fs::symlink_metadata(tracked) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    return Err(NonoError::Snapshot(format!(
+                        "Refusing to restore through symlinked tracked path: {}",
+                        tracked.display()
+                    )));
+                }
+                if !meta.is_dir() {
+                    return Err(NonoError::Snapshot(format!(
+                        "Tracked restore root is not a directory: {}",
+                        tracked.display()
+                    )));
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => {
+                return Err(NonoError::Snapshot(format!(
+                    "Failed to inspect tracked path {} before restore: {e}",
+                    tracked.display()
+                )));
+            }
+        }
+
+        let relative_parent = parent.strip_prefix(tracked).map_err(|_| {
+            NonoError::Snapshot(format!(
+                "Restore target parent {} is outside tracked root {}",
+                parent.display(),
+                tracked.display()
+            ))
+        })?;
+
+        let mut current = tracked.clone();
+        for component in relative_parent.components() {
+            match component {
+                std::path::Component::CurDir => continue,
+                std::path::Component::Normal(name) => current.push(name),
+                _ => {
+                    return Err(NonoError::Snapshot(format!(
+                        "Restore target contains unsupported path component: {}",
+                        path.display()
+                    )));
+                }
+            }
+
+            match fs::symlink_metadata(&current) {
+                Ok(meta) => {
+                    if meta.file_type().is_symlink() {
+                        return Err(NonoError::Snapshot(format!(
+                            "Refusing to restore through symlinked directory: {}",
+                            current.display()
+                        )));
+                    }
+                    if !meta.is_dir() {
+                        return Err(NonoError::Snapshot(format!(
+                            "Restore parent component is not a directory: {}",
+                            current.display()
+                        )));
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(e) => {
+                    return Err(NonoError::Snapshot(format!(
+                        "Failed to inspect restore parent {}: {e}",
+                        current.display()
+                    )));
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -1181,6 +1293,69 @@ mod tests {
                 // This is not a test failure — root bypasses permission checks.
             }
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn restore_rejects_symlinked_parent_directory() {
+        let dir = TempDir::new().expect("tempdir");
+        let tracked = dir.path().join("project");
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(tracked.join("subdir")).expect("create tracked subdir");
+        fs::create_dir_all(&outside).expect("create outside dir");
+        fs::write(tracked.join("subdir/config.txt"), b"ORIGINAL").expect("write tracked file");
+        fs::write(outside.join("config.txt"), b"SHOULD_NOT_CHANGE").expect("write outside file");
+
+        let session_dir = dir.path().join("session");
+        fs::create_dir_all(&session_dir).expect("create session dir");
+
+        let mut manager = make_manager(&session_dir, &tracked);
+        let baseline = manager.create_baseline().expect("baseline");
+
+        fs::remove_dir_all(tracked.join("subdir")).expect("remove tracked subdir");
+        std::os::unix::fs::symlink(&outside, tracked.join("subdir")).expect("create symlink");
+
+        let result = manager.restore_to(&baseline);
+        assert!(result.is_err());
+        let err_msg = result
+            .expect_err("restore should reject symlink")
+            .to_string();
+        assert!(
+            err_msg.contains("symlinked directory"),
+            "Expected symlink rejection, got: {err_msg}"
+        );
+
+        let outside_content =
+            fs::read_to_string(outside.join("config.txt")).expect("read outside file");
+        assert_eq!(outside_content, "SHOULD_NOT_CHANGE");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn restore_rejects_symlink_before_create_dir_all() {
+        let dir = TempDir::new().expect("tempdir");
+        let tracked = dir.path().join("project");
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(tracked.join("subdir/deep/nested")).expect("create tracked nested dir");
+        fs::create_dir_all(&outside).expect("create outside dir");
+        fs::write(tracked.join("subdir/deep/nested/config.txt"), b"ORIGINAL")
+            .expect("write nested tracked file");
+
+        let session_dir = dir.path().join("session");
+        fs::create_dir_all(&session_dir).expect("create session dir");
+
+        let mut manager = make_manager(&session_dir, &tracked);
+        let baseline = manager.create_baseline().expect("baseline");
+
+        fs::remove_dir_all(tracked.join("subdir")).expect("remove tracked subdir");
+        std::os::unix::fs::symlink(&outside, tracked.join("subdir")).expect("create symlink");
+
+        let result = manager.restore_to(&baseline);
+        assert!(result.is_err());
+        assert!(
+            !outside.join("deep").exists(),
+            "restore must not create directories through a symlink"
+        );
     }
 
     #[test]

@@ -64,9 +64,7 @@ pub fn show_pack_update_hints(profile_name: &str, silent: bool) {
     for (pack_ref, installed) in &packs {
         match state.entries.get(pack_ref) {
             Some(entry)
-                if now
-                    .signed_duration_since(entry.last_check)
-                    .num_seconds()
+                if now.signed_duration_since(entry.last_check).num_seconds()
                     < CHECK_INTERVAL_SECS =>
             {
                 // Cache is fresh — use it.
@@ -101,8 +99,9 @@ pub fn show_pack_update_hints(profile_name: &str, silent: bool) {
 /// User and builtin profiles in the chain are walked but not collected — only
 /// entries that map to an installed pack are returned.
 fn collect_profile_packs(profile_name: &str) -> Vec<(String, String)> {
-    let pack_map: HashMap<String, String> =
-        crate::profile::list_pack_store_profiles().into_iter().collect();
+    let pack_map: HashMap<String, String> = crate::profile::list_pack_store_profiles()
+        .into_iter()
+        .collect();
 
     let lockfile = match crate::package::read_lockfile() {
         Ok(lf) => lf,

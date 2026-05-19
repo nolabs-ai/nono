@@ -51,6 +51,22 @@ pub enum NonoError {
     #[error("Feature not supported on this platform: {feature}")]
     NotSupportedOnPlatform { feature: String },
 
+    /// The host kernel does not support a feature nono requires.
+    ///
+    /// This is distinct from [`UnsupportedPlatform`] in that the platform itself
+    /// is supported, and distinct from [`NotSupportedOnPlatform`] in that the
+    /// feature exists on this OS but the kernel is misconfigured (e.g., Linux
+    /// cgroup v1 instead of v2). The `hint` field carries an actionable
+    /// remediation pointer (e.g., a boot-flag suggestion).
+    ///
+    /// Phase 37 D-05 / D-07: introduced for the `cgroup_v2` detection sites in
+    /// `exec_strategy/supervisor_linux.rs` so cgroup-v1 hosts that pass
+    /// `--memory` / `--cpu-percent` / `--max-processes` fail closed with a typed
+    /// variant carrying the LOCKED `cgroup_no_v1=all` boot-flag hint per
+    /// REQ-RESL-NIX-01 acceptance #3.
+    #[error("Kernel feature not supported: {feature} ({hint})")]
+    UnsupportedKernelFeature { feature: String, hint: String },
+
     #[error("Command '{command}' is blocked: {reason}")]
     BlockedCommand { command: String, reason: String },
 
@@ -396,6 +412,57 @@ mod broker_not_found_tests {
     fn broker_not_found_is_debug() {
         let err = NonoError::BrokerNotFound {
             path: PathBuf::from("foo.exe"),
+        };
+        let _ = format!("{err:?}");
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod unsupported_kernel_feature_tests {
+    use super::NonoError;
+
+    const LOCKED_HINT: &str =
+        "cgroup v2 required; boot with systemd.unified_cgroup_hierarchy=1 or cgroup_no_v1=all";
+
+    #[test]
+    fn unsupported_kernel_feature_display_contains_cgroup_no_v1_hint() {
+        let err = NonoError::UnsupportedKernelFeature {
+            feature: "cgroup_v2".into(),
+            hint: LOCKED_HINT.into(),
+        };
+        let s = err.to_string();
+        assert!(
+            s.starts_with("Kernel feature not supported:"),
+            "Display must start with the Phase 37 D-05 prefix; got: {s}"
+        );
+        assert!(
+            s.contains("cgroup_v2"),
+            "Display must contain the feature id; got: {s}"
+        );
+        assert!(
+            s.contains("cgroup_no_v1=all"),
+            "Display must contain the LOCKED D-07 boot-flag hint substring; got: {s}"
+        );
+    }
+
+    #[test]
+    fn unsupported_kernel_feature_is_pattern_matchable() {
+        let err = NonoError::UnsupportedKernelFeature {
+            feature: "cgroup_v2".into(),
+            hint: LOCKED_HINT.into(),
+        };
+        assert!(matches!(
+            err,
+            NonoError::UnsupportedKernelFeature { .. }
+        ));
+    }
+
+    #[test]
+    fn unsupported_kernel_feature_is_debug() {
+        let err = NonoError::UnsupportedKernelFeature {
+            feature: "cgroup_v2".into(),
+            hint: LOCKED_HINT.into(),
         };
         let _ = format!("{err:?}");
     }

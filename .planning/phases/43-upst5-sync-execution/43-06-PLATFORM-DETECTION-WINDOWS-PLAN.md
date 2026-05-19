@@ -11,7 +11,7 @@ cluster_id: 4
 disposition: fork-preserve
 disposition_resolution_at_plan_open: true
 final_disposition_field_name: resolved_disposition
-resolved_disposition: null  # populated by Task 1 verdict — values: will-sync | fork-preserve
+resolved_disposition: fork-preserve  # Task 1 verdict 2026-05-18: foundation-constraint-forced + trial-pick 2 content conflicts (W-8 canonical value)
 upstream_range: v0.53.0..v0.54.0
 upstream_shas: [0748cced, 5d821c12]
 upstream_tag: v0.54.0

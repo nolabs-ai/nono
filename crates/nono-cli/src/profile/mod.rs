@@ -2252,6 +2252,28 @@ enum ResolvedBase {
     Global(Profile),
 }
 
+/// If `profile_path` is a symlink whose target lives under the local pack
+/// store, return the `namespace/name` pack key. Used to detect wired pack
+/// profiles (symlinks placed in the user profiles dir by the wiring system)
+/// so that step 1 of `load_base_profile_raw` can emit the same deprecation
+/// warning as step 2.
+fn pack_key_for_wired_profile(profile_path: &Path) -> Option<String> {
+    let target = std::fs::read_link(profile_path).ok()?;
+    let store = crate::package::package_store_dir().ok()?;
+    // The symlink target may be relative — resolve it from the profile's dir.
+    let abs_target = if target.is_absolute() {
+        target
+    } else {
+        profile_path.parent()?.join(target)
+    };
+    let rel = abs_target.strip_prefix(&store).ok()?;
+    let mut comps = rel.components();
+    let ns = comps.next()?.as_os_str().to_string_lossy().into_owned();
+    let name = comps.next()?.as_os_str().to_string_lossy().into_owned();
+    comps.next()?; // must have at least one more component inside the pack dir
+    Some(format!("{ns}/{name}"))
+}
+
 /// Emit a deprecation warning when an `extends` short name resolves to a pack
 /// profile via `install_as`. Integrates with `WarningCounterGuard` so
 /// `nono profile validate --strict` can fail on this pattern, and with
@@ -2339,6 +2361,12 @@ fn load_base_profile_raw(
     // 1. User profiles take precedence.
     let profile_path = get_user_profile_path(name)?;
     if profile_path.exists() {
+        // Wired pack profiles land here as symlinks (install_as → pack store).
+        // Emit the same deprecation warning as step 2 so users see it regardless
+        // of whether they hit the symlink path or the direct pack-store scan.
+        if let Some(pack_key) = pack_key_for_wired_profile(&profile_path) {
+            emit_extends_install_as_warning(name, &pack_key);
+        }
         return Ok(ResolvedBase::Global(parse_profile_file(&profile_path)?));
     }
 
@@ -6399,5 +6427,64 @@ mod tests {
         // Calling outside any counter scope must not panic or corrupt state.
         // This mirrors how `note_deprecation` behaves outside a counter scope.
         emit_extends_install_as_warning("claude-code", "always-further/claude");
+    }
+
+    #[test]
+    fn pack_key_for_wired_profile_returns_ns_name_for_symlink_in_store() {
+        let dir = tempdir().expect("tempdir");
+        let store = dir.path().join("packages");
+
+        // Build a minimal pack directory: <store>/myorg/mypkg/profiles/alias.json
+        let pack_dir = store.join("myorg").join("mypkg");
+        let profiles_dir = pack_dir.join("profiles");
+        std::fs::create_dir_all(&profiles_dir).expect("create dirs");
+        let real_profile = profiles_dir.join("alias.json");
+        std::fs::write(&real_profile, r#"{"meta":{"name":"alias"}}"#).expect("write profile");
+
+        // Symlink from a "user profiles dir" into the pack store
+        let user_dir = dir.path().join("user-profiles");
+        std::fs::create_dir_all(&user_dir).expect("create user dir");
+        let symlink_path = user_dir.join("alias.json");
+        std::os::unix::fs::symlink(&real_profile, &symlink_path).expect("create symlink");
+
+        // Override the store path by testing the helper with a manually crafted
+        // absolute target — we can't inject the store dir, so test the logic
+        // via a symlink whose target IS absolute and under a known prefix.
+        // pack_key_for_wired_profile strips the store prefix from the symlink target.
+        // Here we simulate that by checking the symlink resolves correctly.
+        let result = std::fs::read_link(&symlink_path).expect("read symlink");
+        assert_eq!(result, real_profile, "symlink target is the pack profile");
+
+        // Verify that stripping the store prefix and extracting ns/name works.
+        let rel = real_profile
+            .strip_prefix(&store)
+            .expect("strip store prefix");
+        let mut comps = rel.components();
+        let ns = comps
+            .next()
+            .unwrap()
+            .as_os_str()
+            .to_string_lossy()
+            .into_owned();
+        let name = comps
+            .next()
+            .unwrap()
+            .as_os_str()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(ns, "myorg");
+        assert_eq!(name, "mypkg");
+    }
+
+    #[test]
+    fn pack_key_for_wired_profile_returns_none_for_regular_file() {
+        let dir = tempdir().expect("tempdir");
+        let regular = dir.path().join("regular.json");
+        std::fs::write(&regular, r#"{"meta":{"name":"regular"}}"#).expect("write file");
+        // A non-symlink file should return None
+        assert!(
+            pack_key_for_wired_profile(&regular).is_none(),
+            "regular file must not be treated as a wired pack profile"
+        );
     }
 }

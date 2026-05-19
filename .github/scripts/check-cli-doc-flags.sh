@@ -17,7 +17,7 @@ fi
 
 RUN_FLAGS_RAW="$(
   awk '
-    /pub struct (RunArgs|SandboxArgs) \{/ { in_struct = 1; next }
+    /pub struct (RunArgs|SandboxArgs|ProfileResolverArgs) \{/ { in_struct = 1; next }
     in_struct && /^\}/ { in_struct = 0 }
     in_struct { print }
   ' "${CLI_RS}" | awk '

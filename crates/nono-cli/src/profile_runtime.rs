@@ -150,10 +150,19 @@ fn pre_create_drafts_dir() {
     }
 }
 
-pub(crate) fn prepare_profile(
+/// Prepare the profile-derived configuration for sandbox execution.
+///
+/// Phase 37 D-12: takes a [`profile::ResolveContext`] so callers in the
+/// `nono run` / `nono wrap` handlers can honor `--no-auto-pull`. Sites that
+/// don't care about auto-pull suppression supply
+/// `&profile::ResolveContext::default()` (or go through the
+/// [`crate::sandbox_prepare::prepare_sandbox`] legacy wrapper, which does so
+/// automatically).
+pub(crate) fn prepare_profile_with_context(
     args: &SandboxArgs,
     silent: bool,
     workdir: &Path,
+    resolve_ctx: &profile::ResolveContext,
 ) -> crate::Result<PreparedProfile> {
     #[cfg(target_os = "linux")]
     pre_create_landlock_profiles_dir()?;
@@ -162,7 +171,7 @@ pub(crate) fn prepare_profile(
     pre_create_drafts_dir();
 
     let loaded_profile = if let Some(ref profile_name) = args.profile {
-        let profile = profile::load_profile(profile_name)?;
+        let profile = profile::load_profile_with_context(profile_name, resolve_ctx)?;
         // Phase 36.5: enforce package status (e.g., refuse load if installed
         // pack is yanked). Mitigates T-36.5-06 (registry-spoof — RegistryClient
         // routes through resolve_registry_url allowlist) and provides the

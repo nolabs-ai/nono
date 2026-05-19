@@ -3,9 +3,7 @@
 use crate::cli::RunArgs;
 use crate::config;
 use crate::proxy_runtime::prepare_proxy_launch_options;
-use crate::sandbox_prepare::{
-    prepare_sandbox, print_allow_launch_services_warning, PreparedSandbox,
-};
+use crate::sandbox_prepare::{print_allow_launch_services_warning, PreparedSandbox};
 use crate::{
     exec_strategy, instruction_deny, profile, session, trust_scan, DETACHED_SESSION_ID_ENV,
 };
@@ -244,6 +242,12 @@ pub(crate) fn prepare_run_launch_plan(
     // limit fields are still owned by `run_args` at this point. `ResourceLimits`
     // takes `&RunArgs` so the borrow ends before the moves below.
     let resource_limits = ResourceLimits::from_run_args(&run_args);
+    // Phase 37 D-12: thread `--no-auto-pull` into the profile resolver via
+    // `ResolveContext` BEFORE `run_args.sandbox` and `run_args.profile_resolver`
+    // are moved out of `run_args` below.
+    let resolve_ctx = crate::profile::ResolveContext {
+        no_auto_pull: run_args.profile_resolver.no_auto_pull,
+    };
     let args = run_args.sandbox;
     let no_diagnostics = run_args.no_diagnostics;
     let rollback = run_args.rollback;
@@ -253,7 +257,8 @@ pub(crate) fn prepare_run_launch_plan(
     let audit_sign_key = run_args.audit_sign_key.clone();
     let trust_override = run_args.trust_override;
 
-    let mut prepared = prepare_sandbox(&args, silent)?;
+    let mut prepared =
+        crate::sandbox_prepare::prepare_sandbox_with_context(&args, silent, &resolve_ctx)?;
     validate_rollback_destination(run_args.rollback_dest.as_ref(), &prepared)?;
 
     if prepared.allow_launch_services_active {

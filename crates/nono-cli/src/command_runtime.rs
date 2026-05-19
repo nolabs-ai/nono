@@ -18,6 +18,12 @@ use std::ffi::OsString;
 pub(crate) fn run_sandbox(run_args: RunArgs, silent: bool) -> Result<()> {
     let args = run_args.sandbox.clone();
     let command = run_args.command.clone();
+    // Phase 37 D-12: capture --no-auto-pull for the dry-run path so the
+    // dry-run preview behaves identically to a real run with respect to
+    // profile resolution (i.e. dry-run must NOT trigger auto-pull either).
+    let resolve_ctx = crate::profile::ResolveContext {
+        no_auto_pull: run_args.profile_resolver.no_auto_pull,
+    };
 
     // Phase 41 (REQ-CI-02): wire the --dangerous-force-wfp-ready flag to the
     // Windows WFP test-force-ready runtime setter. Previously the flag was
@@ -37,7 +43,8 @@ pub(crate) fn run_sandbox(run_args: RunArgs, silent: bool) -> Result<()> {
     let cmd_args: Vec<OsString> = command_iter.map(OsString::from).collect();
 
     if args.dry_run {
-        let prepared = prepare_sandbox(&args, silent)?;
+        let prepared =
+            crate::sandbox_prepare::prepare_sandbox_with_context(&args, silent, &resolve_ctx)?;
         validate_external_proxy_bypass(&args, &prepared)?;
         if !prepared.secrets.is_empty() && !silent {
             eprintln!(
@@ -147,6 +154,11 @@ pub(crate) fn run_shell(args: ShellArgs, silent: bool) -> Result<()> {
 }
 
 pub(crate) fn run_wrap(wrap_args: WrapArgs, silent: bool) -> Result<()> {
+    // Phase 37 D-12: capture `--no-auto-pull` BEFORE `wrap_args.sandbox` and
+    // `wrap_args.profile_resolver` are consumed by the conversion below.
+    let resolve_ctx = crate::profile::ResolveContext {
+        no_auto_pull: wrap_args.profile_resolver.no_auto_pull,
+    };
     let args: SandboxArgs = wrap_args.sandbox.into();
     let command = wrap_args.command;
     let no_diagnostics = wrap_args.no_diagnostics;
@@ -160,7 +172,8 @@ pub(crate) fn run_wrap(wrap_args: WrapArgs, silent: bool) -> Result<()> {
     let cmd_args: Vec<OsString> = command_iter.map(OsString::from).collect();
 
     if args.dry_run {
-        let prepared = prepare_sandbox(&args, silent)?;
+        let prepared =
+            crate::sandbox_prepare::prepare_sandbox_with_context(&args, silent, &resolve_ctx)?;
         if !prepared.secrets.is_empty() && !silent {
             eprintln!(
                 "  Would inject {} credential(s) as environment variables",
@@ -172,7 +185,8 @@ pub(crate) fn run_wrap(wrap_args: WrapArgs, silent: bool) -> Result<()> {
         return Ok(());
     }
 
-    let prepared = prepare_sandbox(&args, silent)?;
+    let prepared =
+        crate::sandbox_prepare::prepare_sandbox_with_context(&args, silent, &resolve_ctx)?;
 
     #[cfg(target_os = "windows")]
     Sandbox::validate_windows_preview_entry_point(

@@ -690,6 +690,27 @@ nono run --profile claude-code -- claude
 nono run -p openclaw -- openclaw gateway
 ```
 
+#### `--no-auto-pull`
+
+Disable cargo-install-style auto-pull when `--profile` references a registry pack
+that is not yet installed locally. With this flag set, nono falls back to the
+legacy `profile not found` error instead of fetching the pack from the registry.
+
+```bash
+nono run --no-auto-pull --profile namespace/foo -- my-agent
+```
+
+Useful for audit/airgap workflows and CI environments where implicit network
+access during profile resolution is undesirable. The flag is accepted on
+`nono run` and `nono wrap` only; `nono pull` is an explicit-install command and
+does not get the flag.
+
+| Environment Variable | `NONO_NO_AUTO_PULL` |
+|---------------------|---------------------|
+| Example | `NONO_NO_AUTO_PULL=1` |
+
+The CLI flag takes precedence over the environment variable.
+
 #### `--workdir`
 
 Working directory for `$WORKDIR` expansion in profiles (defaults to current directory).
@@ -1334,6 +1355,7 @@ CLI flags always take precedence over environment variables.
 | `--credential` | `NONO_CREDENTIAL` | `NONO_CREDENTIAL=openai` |
 | `--env-credential` | `NONO_ENV_CREDENTIAL` | `NONO_ENV_CREDENTIAL=key1,key2` |
 | `--capability-elevation` | `NONO_CAPABILITY_ELEVATION` | `NONO_CAPABILITY_ELEVATION=true` |
+| `--no-auto-pull` | `NONO_NO_AUTO_PULL` | `NONO_NO_AUTO_PULL=1` |
 | `--upstream-proxy` | `NONO_UPSTREAM_PROXY` | `NONO_UPSTREAM_PROXY=squid.corp:3128` |
 | `--upstream-bypass` | `NONO_UPSTREAM_BYPASS` | `NONO_UPSTREAM_BYPASS=internal.corp,*.private.net` (comma-separated) |
 

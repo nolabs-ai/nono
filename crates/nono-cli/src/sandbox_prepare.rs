@@ -6,7 +6,6 @@ use crate::credential_runtime::load_env_credentials;
 use crate::network_policy;
 use crate::profile;
 use crate::profile::WorkdirAccess;
-use crate::profile_runtime::prepare_profile;
 use crate::{output, policy, protected_paths, sandbox_state};
 use colored::Colorize;
 use nono::{AccessMode, CapabilitySet, FsCapability, NonoError, Result, Sandbox};
@@ -205,7 +204,21 @@ pub(crate) fn print_allow_launch_services_warning(silent: bool) {
     eprintln!("  Prefer using it from a trusted directory, not inside an untrusted project.");
 }
 
+/// Phase 37 D-12: legacy entry point — thin wrapper that supplies the default
+/// [`crate::profile::ResolveContext`]. Sites outside `nono run` / `nono wrap`
+/// (e.g. `nono shell`, dry-run paths, internal tooling) call this and inherit
+/// pre-Phase-37 behavior (auto-pull enabled). The `nono run` and `nono wrap`
+/// handlers MUST use [`prepare_sandbox_with_context`] so the `--no-auto-pull`
+/// flag and `NONO_NO_AUTO_PULL=1` env var are honored.
 pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<PreparedSandbox> {
+    prepare_sandbox_with_context(args, silent, &crate::profile::ResolveContext::default())
+}
+
+pub(crate) fn prepare_sandbox_with_context(
+    args: &SandboxArgs,
+    silent: bool,
+    resolve_ctx: &crate::profile::ResolveContext,
+) -> Result<PreparedSandbox> {
     sandbox_state::cleanup_stale_state_files();
 
     let workdir = args
@@ -299,7 +312,8 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         );
     }
 
-    let prepared_profile = prepare_profile(args, silent, &workdir)?;
+    let prepared_profile =
+        crate::profile_runtime::prepare_profile_with_context(args, silent, &workdir, resolve_ctx)?;
     let crate::profile_runtime::PreparedProfile {
         loaded_profile,
         capability_elevation,

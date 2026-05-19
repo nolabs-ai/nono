@@ -1907,11 +1907,12 @@ pub(crate) fn find_pack_store_profile(name: &str) -> Option<(PathBuf, String)> {
             if !pack_path.is_dir() {
                 return None;
             }
-            let manifest_str =
-                std::fs::read_to_string(pack_path.join("package.json")).ok()?;
+            let manifest_str = std::fs::read_to_string(pack_path.join("package.json")).ok()?;
             let manifest: crate::package::PackageManifest =
                 serde_json::from_str(&manifest_str).ok()?;
-            manifest.artifacts.iter()
+            manifest
+                .artifacts
+                .iter()
                 .filter(|a| a.artifact_type == crate::package::ArtifactType::Profile)
                 .find_map(|a| {
                     let install_as = a.install_as.as_deref()?;

@@ -1455,11 +1455,11 @@ mod tests {
         )
         .expect("write pack profile");
 
-        // "hermes" matches a pack install_as but is not a built-in, so a
-        // "hermes-local" suggestion is valid.
+        // "hermes" matches a pack install_as but is not a built-in, so
+        // suggesting it directly as a profile name is valid.
         assert_eq!(
             suggested_run_profile_name(None, "hermes"),
-            Some("hermes-local".to_string())
+            Some("hermes".to_string())
         );
     }
 

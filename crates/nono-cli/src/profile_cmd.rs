@@ -59,7 +59,10 @@ fn cmd_init(args: ProfileInitArgs) -> Result<()> {
     // an installed pack before falling through to the generic name-validation
     // error — this gives the user actionable guidance.
     if profile::is_registry_ref(&args.name) {
-        let short_name = args.name.split_once('/').map_or(args.name.as_str(), |(_, n)| n);
+        let short_name = args
+            .name
+            .split_once('/')
+            .map_or(args.name.as_str(), |(_, n)| n);
         let suggested = format!("{}-local", short_name);
         let extends_target = args.extends.as_deref().unwrap_or(args.name.as_str());
         crate::output::print_warning(&format!(

@@ -2300,10 +2300,8 @@ fn load_base_profile_raw(
         let package_ref = crate::package::parse_package_ref(name).map_err(|e| {
             NonoError::ProfileInheritance(format!("invalid pack ref '{name}': {e}"))
         })?;
-        let install_dir = crate::package::package_install_dir(
-            &package_ref.namespace,
-            &package_ref.name,
-        )?;
+        let install_dir =
+            crate::package::package_install_dir(&package_ref.namespace, &package_ref.name)?;
         if install_dir.join("package.json").exists() || missing_base_prompt_enabled() {
             return load_registry_profile(name).map(ResolvedBase::Global);
         }

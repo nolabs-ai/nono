@@ -371,3 +371,180 @@ fn auto_pull_no_auto_pull_flag_falls_back_to_profile_not_found() {
         "expected 0 requests with --no-auto-pull; got {req_count}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// REQ-PKGS-04 acceptance #3: signature failure aborts. CI signs the fixture
+// pack at runtime; the test corrupts the artifact bytes mid-transit so the
+// SHA-256 / sigstore bundle verification fails. The binary must exit
+// non-zero with a signature/verification-flavored error AND the install
+// directory must NOT contain package.json (verification aborts BEFORE
+// install lands any bytes in the package store).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn auto_pull_signature_failure_aborts() {
+    let Some(_dir) = fixture_pack_dir() else {
+        eprintln!("SKIP: NONO_FIXTURE_PACK_DIR not set — Phase 37 CI workflow required");
+        return;
+    };
+
+    let tmp_home = TempDir::new().expect("tempdir");
+    let _g_home = EnvGuard::set("NONO_TEST_HOME", tmp_home.path().to_str().unwrap());
+    let _g_no_pull = EnvGuard::remove("NONO_NO_AUTO_PULL");
+
+    let bundle_body = read_fixture("bundle.json");
+    let manifest_body = read_fixture("manifest.json");
+    // CORRUPTED artifact — flip the first byte; SHA-256 will mismatch.
+    let mut artifact_body = read_fixture("artifact.tar.gz");
+    if !artifact_body.is_empty() {
+        artifact_body[0] ^= 0xFF;
+    }
+    let sigstore_body = read_fixture("artifact.tar.gz.sigstore.json");
+
+    let mut routes = HashMap::new();
+    routes.insert("/bundle.json".into(), (200, bundle_body));
+    routes.insert(
+        "/mock-ns/mock-pack/manifest.json".into(),
+        (200, manifest_body),
+    );
+    routes.insert(
+        "/mock-ns/mock-pack/artifact.tar.gz".into(),
+        (200, artifact_body),
+    );
+    routes.insert(
+        "/mock-ns/mock-pack/artifact.tar.gz.sigstore.json".into(),
+        (200, sigstore_body),
+    );
+
+    let (base_url, _handle, _counter) = spawn_multi_endpoint_server(routes);
+    let _g_reg = EnvGuard::set("NONO_REGISTRY", &base_url);
+
+    let output = Command::new(NONO_BIN)
+        .args([
+            "run",
+            "--profile",
+            "mock-ns/mock-pack",
+            "--",
+            "/bin/true",
+        ])
+        .output()
+        .expect("spawn nono");
+
+    assert!(
+        !output.status.success(),
+        "signature failure must abort; stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let lower = stderr.to_lowercase();
+    assert!(
+        lower.contains("signature")
+            || lower.contains("verif")
+            || lower.contains("digest")
+            || lower.contains("trust"),
+        "expected signature/verification-flavored error; got: {stderr}"
+    );
+
+    // Phase 37 D-16 + Phase 27.1: NONO_TEST_HOME plumbing resolves the
+    // package install directory under <NONO_TEST_HOME>/.config/nono/packages/...
+    // (see crates/nono-cli/src/profile/mod.rs::resolve_user_config_dir and
+    // crates/nono-cli/src/package.rs::package_install_dir).
+    let install_check = tmp_home
+        .path()
+        .join(".config")
+        .join("nono")
+        .join("packages")
+        .join("mock-ns")
+        .join("mock-pack")
+        .join("package.json");
+    assert!(
+        !install_check.exists(),
+        "signature failure must abort BEFORE install; found {install_check:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Researcher Open Q3 #5: non-Policy pack rejection. CI emits a separate
+// fixture manifest with pack_type="agent" (the only other PackType variant
+// per package.rs:80-83). The binary must reject the pack — either via
+// load_registry_profile's pack-type check (profile/mod.rs:2322-2330) or
+// via signature failure if the signing step signs only the Policy manifest
+// (the mutated manifest will invalidate the bundle). EITHER rejection is
+// fail-closed — the test accepts both because the LOCKED requirement is
+// rejection, not a specific check-ordering path.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn auto_pull_rejects_non_policy_pack_type() {
+    let Some(dir) = fixture_pack_dir() else {
+        eprintln!("SKIP: NONO_FIXTURE_PACK_DIR not set — Phase 37 CI workflow required");
+        return;
+    };
+    if !dir.join("manifest-non-policy.json").is_file() {
+        eprintln!(
+            "SKIP: manifest-non-policy.json missing from fixture dir — Task 4 CI step did not generate it"
+        );
+        return;
+    }
+
+    let tmp_home = TempDir::new().expect("tempdir");
+    let _g_home = EnvGuard::set("NONO_TEST_HOME", tmp_home.path().to_str().unwrap());
+    let _g_no_pull = EnvGuard::remove("NONO_NO_AUTO_PULL");
+
+    let bundle_body = read_fixture("bundle.json");
+    let manifest_body = read_fixture("manifest-non-policy.json");
+    let artifact_body = read_fixture("artifact.tar.gz");
+    let sigstore_body = read_fixture("artifact.tar.gz.sigstore.json");
+
+    let mut routes = HashMap::new();
+    routes.insert("/bundle.json".into(), (200, bundle_body));
+    routes.insert(
+        "/mock-ns/mock-pack/manifest.json".into(),
+        (200, manifest_body),
+    );
+    routes.insert(
+        "/mock-ns/mock-pack/artifact.tar.gz".into(),
+        (200, artifact_body),
+    );
+    routes.insert(
+        "/mock-ns/mock-pack/artifact.tar.gz.sigstore.json".into(),
+        (200, sigstore_body),
+    );
+
+    let (base_url, _handle, _counter) = spawn_multi_endpoint_server(routes);
+    let _g_reg = EnvGuard::set("NONO_REGISTRY", &base_url);
+
+    let output = Command::new(NONO_BIN)
+        .args([
+            "run",
+            "--profile",
+            "mock-ns/mock-pack",
+            "--",
+            "/bin/true",
+        ])
+        .output()
+        .expect("spawn nono");
+
+    assert!(
+        !output.status.success(),
+        "non-Policy pack type must be rejected; stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // load_registry_profile rejection (profile/mod.rs:2322-2330) emits:
+    //   "'mock-ns/mock-pack' is a agent pack — only policy packs can be used with --profile."
+    // OR signature verification fires first and we see:
+    //   "signature/verification failed ..."
+    // EITHER is acceptable — the LOCKED requirement is fail-closed rejection.
+    let lower = stderr.to_lowercase();
+    let pack_type_rejected = lower.contains("agent pack")
+        || (lower.contains("policy") && lower.contains("pack"));
+    let signature_rejected =
+        lower.contains("signature") || lower.contains("verif") || lower.contains("digest");
+    assert!(
+        pack_type_rejected || signature_rejected,
+        "expected pack-type or signature rejection; got: {stderr}"
+    );
+}

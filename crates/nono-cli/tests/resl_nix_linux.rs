@@ -52,6 +52,37 @@ macro_rules! require_cgroup_v2 {
     };
 }
 
+/// Phase 37 Plan 37-04: confirm the `cpu` controller is delegated to this
+/// user-session. On default Ubuntu only `memory pids` are delegated; the
+/// Phase 37 RESL CI workflow installs a `Delegate=cpu cpuset io memory pids`
+/// drop-in (research finding #2 — without this, REQ-RESL-NIX-02 silently
+/// fails because `cpu.max` cannot be written by the unprivileged user
+/// session). The macro reads the user-session controller list from the
+/// cgroup hierarchy and skips the test (rather than fails) if `cpu` is
+/// missing — this keeps the test resilient on local dev machines that
+/// haven't installed the drop-in while still hard-asserting on CI where
+/// the workflow's verify step has already confirmed `cpu` is delegated.
+macro_rules! require_cpu_controller {
+    () => {
+        let cg_line = std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
+        let rel = cg_line
+            .lines()
+            .next()
+            .and_then(|l| l.strip_prefix("0::/"))
+            .unwrap_or("");
+        let controllers_path = format!("/sys/fs/cgroup/{rel}/cgroup.controllers");
+        let controllers = std::fs::read_to_string(&controllers_path).unwrap_or_default();
+        if !controllers.split_whitespace().any(|c| c == "cpu") {
+            eprintln!(
+                "SKIP: cpu controller not delegated (got controllers: {:?}); \
+                 see Phase 37 Plan 37-04 Delegate= drop-in.",
+                controllers.trim()
+            );
+            return;
+        }
+    };
+}
+
 /// REQ-RESL-NIX-01 criterion 1: `--memory 256m` OOM-kills a large allocation.
 ///
 /// Spawns `bash -c 'tail -c 1G </dev/urandom'` which tries to read 1GiB into memory.
@@ -262,5 +293,184 @@ fn linux_timeout_atomic_kill_grandchildren() {
         "expected cgroup.kill to atomically kill grandchildren within 12s, took {:.1}s. \
          This may indicate grandchildren survived the kill and `wait` was not interrupted.",
         elapsed.as_secs_f64()
+    );
+}
+
+/// Phase 37 Plan 37-04 / VALIDATION task 37-04-03 / REQ-RESL-NIX-02:
+///
+/// Verifies `--cpu-percent 25` actually throttles a CPU-bound workload to
+/// approximately 25% on cgroup-v2 + cpu-controller-delegated runner. This is
+/// the FIRST functional test exercising `cpu.max`; prior to Phase 37,
+/// REQ-RESL-NIX-02 had no test covering the runtime throttling behavior.
+///
+/// The workload (`yes >/dev/null`) is a tight CPU loop that would consume
+/// 100% of one core uncapped. Under `--cpu-percent 25`, the cgroup v2
+/// `cpu.max` quota of `25000 100000` (25ms per 100ms period) limits the
+/// average CPU% to ~25% over a multi-second window.
+///
+/// Sampling strategy: spawn nono, wait briefly for the cgroup to apply,
+/// then use `pgrep -f 'yes'` to locate the actual workload PID (NOT the
+/// supervisor's PID — nono may stay alive in Monitor exec strategy or
+/// exec into the child in Direct strategy; the workload pid is what's
+/// being throttled by the cgroup). Sample `top -p <pid>` for 5 iterations
+/// at 1s intervals and average the `%CPU` column.
+///
+/// Tolerance band [15, 40] accommodates GitHub Actions runner load
+/// variance. If this test flakes on a per-runner basis, widen the band
+/// or raise the sampling window — but do NOT switch to a pass-without-
+/// asserting shape (Phase 37 D-08 + T-37-14 mitigation: a silent no-op
+/// would invalidate ALL of Phase 37's REQ-RESL-NIX-02 verification).
+#[test]
+fn linux_cpu_percent_throttles_yes_loop() {
+    require_cgroup_v2!();
+    require_cpu_controller!();
+
+    // Run yes for ~6 seconds capped at 25% CPU.
+    let mut child = Command::new(NONO_BIN)
+        .args([
+            "run",
+            "--cpu-percent",
+            "25",
+            "--allow-fs-exec=/bin",
+            "--allow-fs-exec=/usr",
+            "--allow-fs-read=/bin",
+            "--allow-fs-read=/usr",
+            "--allow-fs-read=/lib",
+            "--allow-fs-read=/lib64",
+            "--",
+            "timeout",
+            "6",
+            "sh",
+            "-c",
+            "yes >/dev/null",
+        ])
+        .spawn()
+        .expect("spawn nono");
+
+    // Allow nono to start the child + apply the cgroup before sampling.
+    std::thread::sleep(std::time::Duration::from_millis(750));
+
+    // Locate the actual workload PID via pgrep. We match `yes` rather than
+    // using `child.id()` because the supervisor may stay alive on the
+    // parent side (Monitor strategy) while the workload runs in a forked
+    // descendant; the workload pid is the one in the throttled cgroup.
+    let pgrep = Command::new("pgrep")
+        .args(["-x", "yes"])
+        .output()
+        .expect("invoke pgrep");
+    let pgrep_stdout = String::from_utf8_lossy(&pgrep.stdout);
+    let workload_pid: Option<u32> = pgrep_stdout.lines().next().and_then(|l| l.trim().parse().ok());
+
+    let workload_pid = match workload_pid {
+        Some(p) => p,
+        None => {
+            // If pgrep returned nothing, fall back to the supervisor pid so
+            // we still produce a deterministic diagnostic on failure rather
+            // than passing vacuously.
+            let _ = child.wait();
+            panic!(
+                "REQ-RESL-NIX-02: pgrep -x yes returned no PID; the workload \
+                 either didn't start or exited before sampling. pgrep stdout: {:?}",
+                pgrep_stdout
+            );
+        }
+    };
+
+    // Sample CPU% via top: -b batch, -n 5 iterations, -d 1 1-second delay,
+    // -p <pid> filtered. The %CPU column position varies with top version;
+    // accept any line that begins with the PID and parse the first column
+    // that looks like a floating-point percentage in [0, 200].
+    let output = Command::new("top")
+        .args(["-b", "-n", "5", "-d", "1", "-p", &workload_pid.to_string()])
+        .output()
+        .expect("invoke top");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let samples: Vec<f32> = stdout
+        .lines()
+        .filter_map(|l| {
+            let cols: Vec<&str> = l.split_whitespace().collect();
+            if cols.is_empty() || cols[0] != workload_pid.to_string() {
+                return None;
+            }
+            // Walk columns looking for a plausible CPU% value.
+            cols.iter().skip(1).find_map(|c| {
+                c.parse::<f32>()
+                    .ok()
+                    .filter(|v| (0.0..=200.0).contains(v) && c.contains('.'))
+            })
+        })
+        .collect();
+
+    let _ = child.wait();
+
+    assert!(
+        !samples.is_empty(),
+        "REQ-RESL-NIX-02: top produced no samples for pid {workload_pid}; stdout:\n{stdout}"
+    );
+    let avg = samples.iter().sum::<f32>() / samples.len() as f32;
+
+    assert!(
+        (15.0..=40.0).contains(&avg),
+        "REQ-RESL-NIX-02: expected ~25% CPU (band [15,40] for runner noise); \
+         got {avg:.1}% from samples {samples:?}"
+    );
+}
+
+/// Phase 37 Plan 37-04 / VALIDATION task 37-04-04 / REQ-RESL-NIX-03:
+///
+/// Exercises the LOCKED REQ-RESL-NIX-03 N=5 case (the value the LOCKED
+/// `nono inspect` string `max_processes: 5 (cgroup v2 pids.max)` reports).
+///
+/// This test SITS ALONGSIDE the existing `linux_max_processes_blocks_eleventh_fork`
+/// (which covers the N=10 boundary case) — both coverages are preserved
+/// per revision-1 checker W8 path b. The N=5 case matches the LOCKED
+/// inspect string and the canonical example throughout Phase 37 docs.
+///
+/// Workload: a small shell loop that backgrounds 8 `sleep` processes.
+/// With `--max-processes 5` the parent shell already counts toward the
+/// pids.max budget, so the 5th-or-later background fork is rejected by
+/// the kernel with EAGAIN (which `sh` surfaces as a non-zero rc from the
+/// `(sleep 5 &)` subshell). The test asserts the overall command exits
+/// non-zero — proof that at least one fork failure occurred.
+#[test]
+fn linux_max_processes_5_fork_bomb_contained() {
+    require_cgroup_v2!();
+
+    let output = Command::new(NONO_BIN)
+        .args([
+            "run",
+            "--max-processes",
+            "5",
+            "--allow-fs-exec=/bin",
+            "--allow-fs-exec=/usr",
+            "--allow-fs-read=/bin",
+            "--allow-fs-read=/usr",
+            "--allow-fs-read=/lib",
+            "--allow-fs-read=/lib64",
+            "--",
+            "sh",
+            "-c",
+            // Background 8 sleeps; with pids.max=5 the kernel must reject
+            // some of them. Track the worst rc so a single fork failure
+            // surfaces as a non-zero exit even if later forks succeed.
+            "i=0; rc=0; while [ $i -lt 8 ]; do (sleep 5 &) || rc=1; i=$((i+1)); done; exit $rc",
+        ])
+        .output()
+        .expect("failed to run nono binary");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Production code path either: (a) the inner shell fails to fork past
+    // N=5 and exits non-zero, OR (b) the kernel surfaces an EAGAIN /
+    // "resource temporarily unavailable" string on stderr. Either is
+    // sufficient evidence the pids.max cap is enforced.
+    assert!(
+        !output.status.success()
+            || stderr.to_lowercase().contains("resource")
+            || stderr.to_lowercase().contains("again"),
+        "REQ-RESL-NIX-03 N=5: expected fork rejection past 5 processes; \
+         exit_success={} stdout={stdout} stderr={stderr}",
+        output.status.success(),
     );
 }

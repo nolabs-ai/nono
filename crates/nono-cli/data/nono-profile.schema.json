@@ -262,7 +262,7 @@
           "minItems": 1
         }
       ],
-      "description": "Platform predicate string or any-of array, e.g. linux, macos:>=15, linux:fedora-like:>=43, or !linux:nixos. Replayed from upstream ce06bd59 (v0.54.0) per Plan 43-05."
+      "description": "Platform predicate string or any-of array, e.g. linux, macos:>=15, linux:fedora-like:>=43, linux:fedora:>=43:workstation, or !linux:nixos. Replayed from upstream ce06bd59 (v0.54.0) per Plan 43-05; description example extended per Plan 43-06 (Cluster 4 replay of 0748cced)."
     },
     "ConditionalPath": {
       "oneOf": [

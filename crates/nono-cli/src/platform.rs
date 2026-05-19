@@ -82,7 +82,7 @@ fn detect() -> PlatformInfo {
             os: Os::Windows,
             linux: None,
             macos: None,
-            windows: Some(WindowsInfo::default()),
+            windows: Some(detect_windows()),
         }
     } else {
         PlatformInfo {
@@ -106,6 +106,66 @@ fn detect_macos() -> MacosInfo {
         product_version: run_sw_vers("-productVersion").unwrap_or_default(),
         build_version: run_sw_vers("-buildVersion").unwrap_or_default(),
     }
+}
+
+fn detect_windows() -> WindowsInfo {
+    WindowsInfo {
+        product_name: query_windows_registry_value("ProductName").unwrap_or_default(),
+        version: detect_windows_version(),
+        edition: query_windows_registry_value("EditionID"),
+    }
+}
+
+fn detect_windows_version() -> String {
+    let major = query_windows_registry_value("CurrentMajorVersionNumber");
+    let minor = query_windows_registry_value("CurrentMinorVersionNumber");
+    let build = query_windows_registry_value("CurrentBuildNumber");
+    match (major, minor, build) {
+        (Some(major), Some(minor), Some(build)) => format!("{major}.{minor}.{build}"),
+        (Some(major), None, Some(build)) => format!("{major}.0.{build}"),
+        _ => query_windows_registry_value("CurrentVersion").unwrap_or_default(),
+    }
+}
+
+fn query_windows_registry_value(name: &str) -> Option<String> {
+    let output = std::process::Command::new("reg")
+        .args([
+            "query",
+            r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion",
+            "/v",
+            name,
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_windows_registry_value(&String::from_utf8(output.stdout).ok()?, name)
+}
+
+fn parse_windows_registry_value(output: &str, name: &str) -> Option<String> {
+    for line in output.lines() {
+        let mut parts = line.split_whitespace();
+        if parts.next() != Some(name) {
+            continue;
+        }
+        let kind = parts.next()?;
+        let value = parts.collect::<Vec<_>>().join(" ");
+        if !value.is_empty() {
+            if kind == "REG_DWORD" {
+                if let Some(hex) = value
+                    .strip_prefix("0x")
+                    .or_else(|| value.strip_prefix("0X"))
+                {
+                    if let Ok(number) = u64::from_str_radix(hex, 16) {
+                        return Some(number.to_string());
+                    }
+                }
+            }
+            return Some(value);
+        }
+    }
+    None
 }
 
 fn run_sw_vers(arg: &str) -> Option<String> {
@@ -166,8 +226,7 @@ pub struct When {
 }
 
 impl When {
-    #[cfg(test)]
-    pub fn parse(input: &str) -> Result<Self> {
+    pub(crate) fn parse(input: &str) -> Result<Self> {
         Ok(Self {
             predicates: vec![Predicate::parse(input)?],
         })
@@ -219,6 +278,9 @@ impl<'de> Deserialize<'de> for When {
             return Err(serde::de::Error::custom(
                 "when predicate array must not be empty",
             ));
+        }
+        if values.len() == 1 {
+            return Self::parse(&values[0]).map_err(serde::de::Error::custom);
         }
         let mut predicates = Vec::with_capacity(values.len());
         for value in values {
@@ -418,7 +480,7 @@ impl Predicate {
             }
         }
         if let Some(build) = &self.build {
-            let build_version = info.version.rsplit('.').next().unwrap_or(&info.version);
+            let build_version = info.version.rsplit('.').next().map_or("", |part| part);
             if !build.matches(build_version) {
                 return false;
             }
@@ -524,7 +586,8 @@ fn compare_versions(left: &str, right: &str) -> Ordering {
     for (left_part, right_part) in left_parts.iter().zip(right_parts.iter()) {
         let ordering = match (left_part.parse::<u64>(), right_part.parse::<u64>()) {
             (Ok(left_num), Ok(right_num)) => left_num.cmp(&right_num),
-            _ => left_part.cmp(right_part),
+            _ if left_part == right_part => Ordering::Equal,
+            _ => Ordering::Less,
         };
         if ordering != Ordering::Equal {
             return ordering;
@@ -654,6 +717,19 @@ VARIANT_ID=workstation
     fn version_segments_compare_numerically_when_possible() {
         assert_eq!(compare_versions("24.10", "24.4"), Ordering::Greater);
         assert_eq!(compare_versions("24", "24.04"), Ordering::Less);
-        assert_eq!(compare_versions("unstable", "25.05"), Ordering::Greater);
+        assert_eq!(compare_versions("unstable", "25.05"), Ordering::Less);
+        assert_eq!(compare_versions("unstable", "unstable"), Ordering::Equal);
+    }
+
+    #[test]
+    fn windows_registry_dword_values_are_decimalized() {
+        let output = r#"
+HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion
+    CurrentMajorVersionNumber    REG_DWORD    0xa
+"#;
+        assert_eq!(
+            parse_windows_registry_value(output, "CurrentMajorVersionNumber").as_deref(),
+            Some("10")
+        );
     }
 }

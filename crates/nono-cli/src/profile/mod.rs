@@ -6949,3 +6949,98 @@ mod tests {
         );
     }
 }
+
+// ============================================================================
+// Phase 37 Plan 37-02 Task 2: ResolveContext + load_profile_with_context tests
+//
+// Verifies the wrapper-with-default pattern (D-12), the --no-auto-pull
+// suppression branch (D-11), and that the legacy load_profile entry point
+// continues to behave identically (zero-impact extension).
+// ============================================================================
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod resolve_context_tests {
+    use super::*;
+    use crate::test_env::{lock_env, EnvVarGuard};
+    use tempfile::tempdir;
+
+    #[test]
+    fn resolve_context_default_does_not_suppress_auto_pull() {
+        let ctx = ResolveContext::default();
+        assert!(
+            !ctx.no_auto_pull,
+            "default ResolveContext must NOT suppress auto-pull (preserves \
+             legacy behavior for callers that don't care)"
+        );
+    }
+
+    #[test]
+    fn resolve_context_is_pattern_matchable() {
+        // Smoke test that ResolveContext is a regular struct (not a global,
+        // not a thread-local) and can be field-matched. Enforces D-12
+        // structural placement.
+        let ctx = ResolveContext { no_auto_pull: true };
+        assert!(ctx.no_auto_pull);
+    }
+
+    #[test]
+    fn load_profile_with_context_suppresses_auto_pull_when_flag_set() {
+        // D-11: when --no-auto-pull is set AND the registry pack is not
+        // installed locally, load_profile_with_context returns
+        // NonoError::ProfileNotFound(name) verbatim — NO network attempt is
+        // made (run_pull is NOT invoked). The "verbatim" check ensures the
+        // existing error message format from the legacy code path is
+        // preserved (REQ-PKGS-04 acceptance #4).
+        let _lock = lock_env();
+        let tmp = tempdir().expect("tmpdir");
+        let _guard = EnvVarGuard::set_all(&[
+            ("XDG_CONFIG_HOME", tmp.path().to_str().expect("utf8 path")),
+            ("APPDATA", tmp.path().to_str().expect("utf8 path")),
+            ("HOME", tmp.path().to_str().expect("utf8 path")),
+            ("USERPROFILE", tmp.path().to_str().expect("utf8 path")),
+            // Defensively unset NONO_TEST_HOME so home_dir() does not divert
+            // into a pre-existing test fixture.
+            ("NONO_TEST_HOME", ""),
+        ]);
+        _guard.remove("NONO_TEST_HOME");
+
+        let ctx = ResolveContext { no_auto_pull: true };
+        let result = load_profile_with_context("phase37-test/fixture-pack", &ctx);
+
+        match result {
+            Err(NonoError::ProfileNotFound(name)) => {
+                assert_eq!(
+                    name, "phase37-test/fixture-pack",
+                    "D-11 demands the package-ref string is preserved verbatim"
+                );
+            }
+            Err(other) => panic!(
+                "expected ProfileNotFound under --no-auto-pull suppression, got: {other:?}"
+            ),
+            Ok(_) => panic!(
+                "load_profile_with_context must NOT succeed when the pack is \
+                 not installed and --no-auto-pull is set"
+            ),
+        }
+    }
+
+    #[test]
+    fn load_profile_legacy_entry_uses_default_context() {
+        // D-12: the existing load_profile(name) thin-wrapper continues to
+        // behave identically to its pre-Phase-37 implementation (does NOT
+        // suppress auto-pull when the default ResolveContext is used). We
+        // can't easily exercise the auto-pull branch in unit tests (it would
+        // do real HTTP), but we CAN assert that for a non-registry-ref name,
+        // load_profile and load_profile_with_context(default) produce
+        // identical errors.
+        let result_legacy = load_profile("nonexistent-profile-37-02-test");
+        let result_ctx = load_profile_with_context(
+            "nonexistent-profile-37-02-test",
+            &ResolveContext::default(),
+        );
+
+        // Both must return ProfileNotFound for the same input.
+        assert!(matches!(result_legacy, Err(NonoError::ProfileNotFound(_))));
+        assert!(matches!(result_ctx, Err(NonoError::ProfileNotFound(_))));
+    }
+}

@@ -136,10 +136,17 @@ impl CredentialStore {
                         continue;
                     }
                     Err(nono::NonoError::KeystoreAccess(msg)) => {
+                        let redacted = redact_credential_ref(key);
                         warn!(
                             "Credential '{}' not available for route '{}': {}. \
                              Managed-credential requests on this route will be denied until the credential is available.",
-                            key, normalized_prefix, msg
+                            redacted, normalized_prefix, msg
+                        );
+                        eprintln!(
+                            "[nono] Credential '{}' not available for route '{}': {}\n\
+                             \x20      Managed-credential requests on this route will be denied.\n\
+                             \x20      Set NONO_KEYRING_TIMEOUT_SECS=N (default 120) to wait longer for keychain unlock; 0 disables the timeout.",
+                            redacted, normalized_prefix, msg
                         );
                         continue;
                     }
@@ -205,20 +212,29 @@ impl CredentialStore {
                     route.prefix
                 );
 
-                let client_id =
-                    match nono::keystore::load_secret_by_ref(KEYRING_SERVICE, &oauth2.client_id) {
-                        Ok(s) => s,
-                        Err(nono::NonoError::SecretNotFound(msg))
-                        | Err(nono::NonoError::KeystoreAccess(msg)) => {
-                            warn!(
-                                "OAuth2 client_id not available for route '{}': {}. \
+                let client_id = match nono::keystore::load_secret_by_ref(
+                    KEYRING_SERVICE,
+                    &oauth2.client_id,
+                ) {
+                    Ok(s) => s,
+                    Err(nono::NonoError::SecretNotFound(msg))
+                    | Err(nono::NonoError::KeystoreAccess(msg)) => {
+                        let redacted = redact_credential_ref(&oauth2.client_id);
+                        warn!(
+                            "OAuth2 client_id '{}' not available for route '{}': {}. \
                                  Managed-credential requests on this route will be denied.",
-                                route.prefix, msg
-                            );
-                            continue;
-                        }
-                        Err(e) => return Err(ProxyError::Credential(e.to_string())),
-                    };
+                            redacted, route.prefix, msg
+                        );
+                        eprintln!(
+                            "[nono] OAuth2 client_id '{}' not available for route '{}': {}\n\
+                                 \x20      Managed-credential requests on this route will be denied.\n\
+                                 \x20      Set NONO_KEYRING_TIMEOUT_SECS=N (default 120) to wait longer for keychain unlock; 0 disables the timeout.",
+                            redacted, route.prefix, msg
+                        );
+                        continue;
+                    }
+                    Err(e) => return Err(ProxyError::Credential(e.to_string())),
+                };
 
                 let client_secret = match nono::keystore::load_secret_by_ref(
                     KEYRING_SERVICE,
@@ -227,10 +243,17 @@ impl CredentialStore {
                     Ok(s) => s,
                     Err(nono::NonoError::SecretNotFound(msg))
                     | Err(nono::NonoError::KeystoreAccess(msg)) => {
+                        let redacted = redact_credential_ref(&oauth2.client_secret);
                         warn!(
-                            "OAuth2 client_secret not available for route '{}': {}. \
+                            "OAuth2 client_secret '{}' not available for route '{}': {}. \
                              Managed-credential requests on this route will be denied.",
-                            route.prefix, msg
+                            redacted, route.prefix, msg
+                        );
+                        eprintln!(
+                            "[nono] OAuth2 client_secret '{}' not available for route '{}': {}\n\
+                             \x20      Managed-credential requests on this route will be denied.\n\
+                             \x20      Set NONO_KEYRING_TIMEOUT_SECS=N (default 120) to wait longer for keychain unlock; 0 disables the timeout.",
+                            redacted, route.prefix, msg
                         );
                         continue;
                     }
@@ -320,6 +343,24 @@ impl CredentialStore {
 /// The keyring service name used by nono for all credentials.
 /// Uses the same constant as `nono::keystore::DEFAULT_SERVICE` to ensure consistency.
 const KEYRING_SERVICE: &str = nono::keystore::DEFAULT_SERVICE;
+
+/// Redact a credential reference for safe display in warnings.
+///
+/// Delegates to the appropriate URI-specific redaction helper so that
+/// secrets (account names, file paths, field names) are never echoed raw.
+fn redact_credential_ref(key: &str) -> String {
+    if nono::keystore::is_op_uri(key) {
+        nono::keystore::redact_op_uri(key)
+    } else if nono::keystore::is_apple_password_uri(key) {
+        nono::keystore::redact_apple_password_uri(key)
+    } else if nono::keystore::is_keyring_uri(key) {
+        nono::keystore::redact_keyring_uri(key)
+    } else if nono::keystore::is_file_uri(key) {
+        nono::keystore::redact_file_uri(key)
+    } else {
+        key.to_string()
+    }
+}
 
 /// Build a hint for the credential-not-found warning that probes other
 /// credential sources for the same name.

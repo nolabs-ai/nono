@@ -28,14 +28,14 @@
 
 ### REVIEW.md Polish
 
-- [ ] **REQ-REVIEW-FU-01**: 16 REVIEW.md warnings resolved via single `chore(v2.6-followup):` plan — Phase 37 (10 warnings, incl. WR-09 OIDC issuer-pin production-verifier wiring) + Phase 43 (6 warnings, incl. WR-05 pack-update sync startup-latency CLAUDE.md hit, WR-04 platform.rs Ord antisymmetry, WR-06 case-sensitive registry name match).
+- [x] **REQ-REVIEW-FU-01**: 16 REVIEW.md warnings resolved via single `chore(v2.6-followup):` plan — Phase 37 (10 warnings, incl. WR-09 OIDC issuer-pin production-verifier wiring) + Phase 43 (6 warnings, incl. WR-05 pack-update sync startup-latency CLAUDE.md hit, WR-04 platform.rs Ord antisymmetry, WR-06 case-sensitive registry name match).
 
 ### Test Hygiene
 
-- [ ] **REQ-TEST-HYG-01**: Class D Linux deny-overlap regression diagnosed and fixed.
-- [ ] **REQ-TEST-HYG-02**: Class E Windows `env_vars` parallel flakes (2) resolved via cargo-nextest follow-on (v2.5 Plan 41-10 deferral).
-- [ ] **REQ-TEST-HYG-03**: v24 broker CR-01 cross-binding lockstep with `../nono-py/` + `../nono-ts/` synced.
-- [ ] **REQ-TEST-HYG-04**: v24 broker CR-02 cross-binding lockstep with `../nono-py/` + `../nono-ts/` synced.
+- [x] **REQ-TEST-HYG-01**: Class D Linux deny-overlap regression diagnosed and fixed.
+- [x] **REQ-TEST-HYG-02**: Class E Windows `env_vars` parallel flakes (2) resolved via cargo-nextest follow-on (v2.5 Plan 41-10 deferral).
+- [x] **REQ-TEST-HYG-03**: v24 broker CR-01 cross-binding lockstep with `../nono-py/` + `../nono-ts/` synced.
+- [x] **REQ-TEST-HYG-04**: v24 broker CR-02 cross-binding lockstep with `../nono-py/` + `../nono-ts/` synced.
 
 ### Branch Merge
 
@@ -83,11 +83,11 @@ Populated 2026-05-20 by gsd-roadmapper during ROADMAP.md creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| REQ-REVIEW-FU-01 | Phase 44 | Pending |
-| REQ-TEST-HYG-01 | Phase 44 | Pending |
-| REQ-TEST-HYG-02 | Phase 44 | Pending |
-| REQ-TEST-HYG-03 | Phase 44 | Pending |
-| REQ-TEST-HYG-04 | Phase 44 | Pending |
+| REQ-REVIEW-FU-01 | Phase 44 | Complete |
+| REQ-TEST-HYG-01 | Phase 44 | Complete |
+| REQ-TEST-HYG-02 | Phase 44 | Complete |
+| REQ-TEST-HYG-03 | Phase 44 | Complete |
+| REQ-TEST-HYG-04 | Phase 44 | Complete |
 | REQ-PORT-CLOSURE-08 | Phase 45 | Pending |
 | REQ-AIPC-G04-01 | Phase 45 | Pending |
 | REQ-RESL-NIX-04 | Phase 45 | Pending |

@@ -172,7 +172,7 @@ These invariants are inherited from prior milestones and remain in force across 
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 44. REVIEW polish + test hygiene | 2/2 | Complete   | 2026-05-20 |
+| 44. REVIEW polish + test hygiene | 2/2 | Complete    | 2026-05-20 |
 | 45. Source migration + AIPC G-04 + RESL native re-validation | 0/TBD | Not started | — |
 | 46. windows-squash merge + post-merge CI + UAT backlog | 0/TBD | Not started | — |
 | 47. UPST6 audit + v0.41–v0.43 drift ingestion | 0/TBD | Not started | — |

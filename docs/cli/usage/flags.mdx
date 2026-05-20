@@ -679,6 +679,34 @@ For network API keys, prefer `--credential` instead for credential isolation —
 
 See [Credential Injection](/cli/features/credential-injection) for full documentation on storing and using credentials.
 
+### Environment Filtering
+
+These flags control which host environment variables the sandboxed child inherits. They run **before** the sandbox is launched, so the filter applies to the very first `exec` of the sandboxed command.
+
+#### `--env-allow`
+
+Allow-list pattern for environment variables inherited by the sandboxed child. Accepts an exact name or a trailing-prefix glob (e.g. `AWS_*`). Repeatable. Malformed patterns fail closed at parse time. When any `--env-allow` is set, only variables matching at least one pattern are inherited; everything else is removed before `exec`.
+
+```bash
+# Only pass through AWS_* variables and a specific PATH
+nono run --env-allow 'AWS_*' --env-allow PATH --allow-cwd -- my-agent
+
+# Combine with deny to forbid known-sensitive subsets
+nono run --env-allow '*' --env-deny 'AWS_*' --allow-cwd -- my-agent
+```
+
+#### `--env-deny`
+
+Deny-list pattern for environment variables inherited by the sandboxed child. Accepts an exact name or a trailing-prefix glob (e.g. `AWS_*`). Repeatable. Malformed patterns fail closed at parse time. When both `--env-allow` and `--env-deny` match, deny takes precedence — this prevents an overly-broad allow from accidentally admitting something listed in deny.
+
+```bash
+# Strip all AWS_* variables, pass everything else
+nono run --env-deny 'AWS_*' --allow-cwd -- my-agent
+
+# Strip credentials and tokens
+nono run --env-deny 'AWS_*' --env-deny 'GITHUB_TOKEN' --allow-cwd -- my-agent
+```
+
 ### Profile Options
 
 #### `--profile`, `-p`
@@ -960,6 +988,19 @@ Include ALL directories in rollback snapshots, overriding all auto-exclusions. T
 nono run --rollback --rollback-all -- cargo test
 ```
 
+#### `--rollback-dest`
+
+Override the rollback snapshot destination directory. By default, snapshots are stored under the platform's nono rollback directory. The destination must be within a path already granted write access via `--allow` (or by an active profile); nono fails with a clear error if not. Useful for Docker volume mounts or shared storage paths.
+
+```bash
+# Store snapshots in an explicitly granted shared volume
+nono run --rollback --allow /mnt/snapshots --rollback-dest /mnt/snapshots --allow-cwd -- my-agent
+```
+
+<Note>
+  `--rollback-dest` requires `--rollback`. The destination directory inherits sandbox permission rules: writes to it from inside the sandbox MUST be covered by an existing capability grant.
+</Note>
+
 #### `--skip-dir`
 
 Skip a directory name during pre-exec trust scanning and rollback preflight. Repeatable. Matches exact path components, not full paths. This is useful for large generated trees that are safe to exclude in your workflow.
@@ -999,6 +1040,40 @@ Profiles can set this via `capability_elevation` in their security config. The C
 | Environment Variable | `NONO_CAPABILITY_ELEVATION` |
 |---------------------|---------------------------|
 | Example | `NONO_CAPABILITY_ELEVATION=true` |
+
+### Resource Limits
+
+These flags cap CPU, memory, and process resources for the sandboxed agent tree. On Windows they are kernel-enforced through Job Objects (REQUIREMENTS.md § RESL-01..RESL-03). On Linux/macOS they are accepted with a warning pending cross-platform follow-up.
+
+#### `--cpu-percent`
+
+Cap the sandboxed agent tree's CPU usage as a percentage of one logical CPU (1..=99). Kernel-enforced on Windows via `CpuRateControlInformation`. On Linux/macOS the value is accepted with a warning pending cross-platform follow-up.
+
+```bash
+# Limit a build to ~50% of one core
+nono run --cpu-percent 50 --allow-cwd -- cargo test
+```
+
+#### `--memory`
+
+Cap the sandboxed agent tree's total memory. Accepts size suffixes (`512M`, `1G`, `256K`, `2T`) or raw bytes. Kernel-enforced job-wide on Windows via `JobMemoryLimit`. On Linux/macOS the value is accepted with a warning pending cross-platform follow-up. See REQUIREMENTS.md § RESL-02.
+
+```bash
+# Cap memory at 2 GiB
+nono run --memory 2G --allow-cwd -- cargo build
+
+# Raw byte value (1 MiB)
+nono run --memory 1048576 --allow-cwd -- my-agent
+```
+
+#### `--max-processes`
+
+Cap the number of active processes in the sandboxed agent tree. Range: 1..=65535. Kernel-enforced on Windows via `ActiveProcessLimit`. On Linux/macOS the value is accepted with a warning pending cross-platform follow-up.
+
+```bash
+# Hard-cap a noisy build at 32 processes
+nono run --max-processes 32 --allow-cwd -- make -j32
+```
 
 ### Operational Flags
 

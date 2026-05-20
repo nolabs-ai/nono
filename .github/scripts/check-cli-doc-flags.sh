@@ -21,10 +21,52 @@ RUN_FLAGS_RAW="$(
     in_struct && /^\}/ { in_struct = 0 }
     in_struct { print }
   ' "${CLI_RS}" | awk '
-    /#\[arg\(/ && /long/ { attr = $0; next }
+    # Phase 44 WR-01 P37: accumulate multi-line #[arg(...)] blocks until
+    # the closing )]. The pre-44 parser only matched #[arg(...)] when the
+    # `long` keyword landed on the SAME source line as `#[arg(`, silently
+    # exempting every multi-line attribute (~30 flags including
+    # SandboxArgs::allow and ProfileResolverArgs::no_auto_pull) from
+    # doc-parity validation. The accumulator captures the full attribute
+    # spec across however many source lines clap-fmt wraps it across.
+    /#\[arg\(/ {
+      attr = $0
+      if (attr ~ /\)\]/) {
+        in_arg = 0
+      } else {
+        in_arg = 1
+      }
+      next
+    }
+
+    in_arg {
+      attr = attr " " $0
+      if ($0 ~ /\)\]/) {
+        in_arg = 0
+      }
+      next
+    }
 
     /^[[:space:]]*pub[[:space:]]+[a-zA-Z0-9_]+:/ {
       if (attr == "") {
+        next
+      }
+
+      # Phase 44 WR-10 P37: skip fields whose #[arg(...)] sets hide = true.
+      # Hidden flags (e.g. --dangerous-force-wfp-ready) are intentionally
+      # excluded from the public CLI surface; the doc-parity script must
+      # not flag them as "missing" — they are missing by design.
+      if (attr ~ /hide[[:space:]]*=[[:space:]]*true/) {
+        attr = ""
+        next
+      }
+
+      # Skip fields whose accumulated attr does not declare a long flag
+      # (clap allows #[arg(short = ...)] only, or #[arg()] for positional
+      # arguments). The pre-44 guard was implicit in the single-line
+      # /long/ pattern; the accumulator now matches every #[arg(...)],
+      # so re-introduce the guard explicitly here.
+      if (attr !~ /long/) {
+        attr = ""
         next
       }
 

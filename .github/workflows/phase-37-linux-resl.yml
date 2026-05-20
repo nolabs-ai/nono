@@ -129,10 +129,18 @@ jobs:
       # the production code path writes to `cpu.max` / `memory.max` / `pids.max`
       # in the user's delegated cgroup. `machinectl shell ${USER}@.host`
       # activates the user@.service and runs the command inside it.
+      #
+      # Phase 44 WR-08 P37: ${{ github.workspace }} is routed through a
+      # workflow `env:` block (WORKSPACE) instead of being interpolated
+      # directly into the shell command — keeps GitHub Actions expression
+      # boundaries explicit and prevents accidental shell-quoting glitches
+      # if the workspace path ever contains spaces.
       - name: Run RESL-NIX integration tests under systemd user session
+        env:
+          WORKSPACE: ${{ github.workspace }}
         run: |
           sudo machinectl shell ${USER}@.host /usr/bin/env bash -c \
-            "cd ${{ github.workspace }} && cargo test -p nono-cli --test resl_nix_linux --test resl_nix_async_signal_safety --release -- --nocapture"
+            "cd \"$WORKSPACE\" && cargo test -p nono-cli --test resl_nix_linux --test resl_nix_async_signal_safety --release -- --nocapture"
 
       # Cross-target clippy gate (Linux-from-Linux sanity). The companion
       # Windows/macOS clippy gates run in the umbrella ci.yml.

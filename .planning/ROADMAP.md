@@ -59,7 +59,9 @@ Audit: [`milestones/v2.5-MILESTONE-AUDIT.md`](milestones/v2.5-MILESTONE-AUDIT.md
   3. Class E Windows `env_vars` parallel test flakes (2 — Plan 41-10 deferrals) are eliminated via cargo-nextest subprocess-per-test isolation follow-on; both flakes pass deterministically across 50 consecutive runs on a Windows host.
   4. v24 broker CR-01 (`BrokerNotFound` FFI remap) + CR-02 (broker-side FFI handle null/INVALID validation) cross-binding lockstep updates land in `../nono-py/` + `../nono-ts/` siblings; both bindings ship a regression test mirroring the fork-side coverage at `bindings/c/src/lib.rs:285-291` + `nono-shell-broker/src/main.rs:535,562`.
   5. Phase 44 close SHA is recorded as the v2.6 quiet-baseline anchor; STATE.md `## Deferred Items` is cleared of the 5 todos that motivated this phase (`41-10-linux-deny-overlap-regression.md`, `41-10-windows-integration-env-vars-flake.md`, `41-10-windows-regression-temp-vars-flake.md`, `v24-cr-01-broker-not-found-ffi-mapping.md`, `v24-cr-02-broker-null-handle-validation.md`).
-**Plans**: TBD
+**Plans**: 2 plans
+- [ ] 44-01-review-polish-PLAN.md — REVIEW.md polish drain (REQ-REVIEW-FU-01, 28-row canonical disposition table covering all 16 WARN + 12 INFO findings from Phase 37 + Phase 43)
+- [ ] 44-02-test-hygiene-drain-PLAN.md — test hygiene drain (REQ-TEST-HYG-01..04, Class D Linux deny-overlap + Class E Windows env_vars flakes + v24 broker CR-01/CR-02 cross-binding lockstep in nono-py + nono-ts siblings)
 **UI hint**: no
 
 ### Phase 45: Source migration + AIPC G-04 + RESL native re-validation

@@ -5,6 +5,7 @@
 
 use crate::cli::{AttachArgs, DetachArgs, InspectArgs, LogsArgs, PruneArgs, PsArgs, StopArgs};
 use crate::command_display::{format_command_line, truncate_chars};
+use crate::format_util::format_bytes_short;
 use crate::session::{self, SessionAttachment, SessionRecord, SessionStatus};
 use colored::Colorize;
 use nono::{NonoError, Result};
@@ -681,37 +682,10 @@ fn format_bytes_human(bytes: u64) -> String {
     }
 }
 
-/// Phase 37 D-17: short-form binary-prefix bytes formatter (round-trip parity
-/// with `crate::cli::parse_byte_size`).
-///
-/// Examples:
-/// - `100 * 1024 * 1024` -> `"100M"`
-/// - `1024 * 1024 * 1024` -> `"1G"`
-/// - `1024` -> `"1K"`
-/// - `1500` -> `"1500"` (non-round fall-through, no suffix)
-///
-/// Used by `format_limits_block` to emit the LOCKED REQ-RESL-NIX-01
-/// acceptance #2 string `memory: 100M (cgroup v2 memory.max)`. The short
-/// form (no space, no `"iB"` suffix) matches the way `--memory 100M` is
-/// accepted on the command line, giving round-trip-readable output.
-fn format_bytes_short(bytes: u64) -> String {
-    const KIB: u64 = 1024;
-    const MIB: u64 = 1024 * 1024;
-    const GIB: u64 = 1024 * 1024 * 1024;
-    const TIB: u64 = 1024 * 1024 * 1024 * 1024;
-
-    if bytes >= TIB && bytes % TIB == 0 {
-        format!("{}T", bytes / TIB)
-    } else if bytes >= GIB && bytes % GIB == 0 {
-        format!("{}G", bytes / GIB)
-    } else if bytes >= MIB && bytes % MIB == 0 {
-        format!("{}M", bytes / MIB)
-    } else if bytes >= KIB && bytes % KIB == 0 {
-        format!("{}K", bytes / KIB)
-    } else {
-        format!("{bytes}")
-    }
-}
+// Phase 44 IN-03 P37 (REQ-REVIEW-FU-01 D-44-B5): `format_bytes_short`
+// was moved to `crate::format_util` so the Unix + Windows copies cannot
+// drift. The original docstring is preserved at the new home; callsites
+// in this file `use crate::format_util::format_bytes_short` below.
 
 /// Render a `Duration` as `"5 minutes"` / `"1 hour"` / `"45 seconds"`. Not a
 /// general-purpose formatter — tuned for the `parse_duration` accepted forms

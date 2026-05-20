@@ -70,8 +70,21 @@ impl Drop for EnvVarGuard {
 /// Mirrors `crates/nono-cli/src/test_env.rs::lock_env` which is not
 /// visible from integration tests (binary-crate `cfg(test)` modules
 /// do not export across the crate boundary).
+///
+/// Phase 44 D-44-E5 dead-code justification: on Windows the only current
+/// consumer is `tests/env_vars.rs`, which uses `EnvVarGuard::set_all`
+/// but does NOT yet call `lock_env()` (Plan 44-02 wires that via
+/// cargo-nextest subprocess-per-test isolation). On Linux the
+/// `tests/auto_pull_e2e_linux.rs` consumers acquire `lock_env()`
+/// directly per Plan 44-01 Task 2. The function therefore appears
+/// dead in the Windows integration-test binary until Plan 44-02
+/// lands; the `#[allow(dead_code)]` is a transitional justified
+/// allowance that will be removed once Plan 44-02 wires a Windows
+/// consumer.
+#[allow(dead_code)]
 pub static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+#[allow(dead_code)]
 pub fn lock_env() -> std::sync::MutexGuard<'static, ()> {
     match ENV_LOCK.lock() {
         Ok(guard) => guard,

@@ -1,5 +1,11 @@
 use crate::cli::{AttachArgs, DetachArgs, InspectArgs, LogsArgs, PruneArgs, PsArgs, StopArgs};
 use crate::exec_strategy::{to_u16_null_terminated, JOB_OBJECT_QUERY, JOB_OBJECT_TERMINATE};
+// Phase 44 IN-03 P37: `format_bytes_short` lives in `crate::format_util`
+// and is only used by the test module below on Windows (production
+// Windows code keeps the `"100 MiB"` shape). Gate the import to test
+// builds so the helper does not warn dead on the Windows non-test build.
+#[cfg(test)]
+use crate::format_util::format_bytes_short;
 use crate::session::{self, SessionAttachment, SessionRecord, SessionStatus};
 use colored::Colorize;
 use nono::{NonoError, Result};
@@ -600,34 +606,11 @@ fn format_bytes_human(bytes: u64) -> String {
     }
 }
 
-/// Phase 37 D-17 (Windows mirror): short-form binary-prefix bytes formatter.
-///
-/// Mirrors the Unix helper in `session_commands.rs`. Not used by the legacy
-/// Windows Limits emission (which keeps the `100 MiB` shape), but kept here
-/// for test parity (the limits_block_format_tests module asserts round-trip
-/// values on both Unix and Windows).
-///
-/// `#[cfg(test)]`-gated to avoid a `dead_code` warning in the non-test build
-/// — production Windows code does not currently call this helper.
-#[cfg(test)]
-fn format_bytes_short(bytes: u64) -> String {
-    const KIB: u64 = 1024;
-    const MIB: u64 = 1024 * 1024;
-    const GIB: u64 = 1024 * 1024 * 1024;
-    const TIB: u64 = 1024 * 1024 * 1024 * 1024;
-
-    if bytes >= TIB && bytes.is_multiple_of(TIB) {
-        format!("{}T", bytes / TIB)
-    } else if bytes >= GIB && bytes.is_multiple_of(GIB) {
-        format!("{}G", bytes / GIB)
-    } else if bytes >= MIB && bytes.is_multiple_of(MIB) {
-        format!("{}M", bytes / MIB)
-    } else if bytes >= KIB && bytes.is_multiple_of(KIB) {
-        format!("{}K", bytes / KIB)
-    } else {
-        format!("{bytes}")
-    }
-}
+// Phase 44 IN-03 P37 (REQ-REVIEW-FU-01 D-44-B5): `format_bytes_short`
+// moved to `crate::format_util` so the Unix + Windows copies cannot
+// drift. The original docstring + test-parity rationale live at the
+// new home; tests in this file reference the shared helper via
+// `use crate::format_util::format_bytes_short` above.
 
 /// Render a `Duration` as `"5 minutes"` / `"1 hour"` / `"45 seconds"`. Not a
 /// general-purpose formatter — tuned for the `parse_duration` accepted forms

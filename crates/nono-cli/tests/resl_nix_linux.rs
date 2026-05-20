@@ -31,12 +31,18 @@ fn cgroup_v2_available() -> bool {
     if !lines[0].starts_with("0::/") {
         return false;
     }
-    // Also confirm the cgroup directory is writable (delegation check).
+    // Phase 44 WR-06 P37 (REQ-REVIEW-FU-01 D-44-A4): confirm the cgroup
+    // directory is genuinely writable by the current process via
+    // `nix::unistd::access(W_OK)` instead of the pre-44
+    // `!Permissions::readonly()` heuristic. The pre-44 check only
+    // inspected mode bits, which can return true for paths the kernel
+    // would still reject at write time (e.g. mount-readonly bind mounts
+    // that retain rw mode bits). The access(2) syscall consults the
+    // kernel's actual write-permission check, including immutable bit
+    // and mount flags.
     let cg_path_rel = lines[0].trim_start_matches("0::/");
     let cg_path = format!("/sys/fs/cgroup/{cg_path_rel}/cgroup.subtree_control");
-    std::fs::metadata(&cg_path)
-        .map(|m| !m.permissions().readonly())
-        .unwrap_or(false)
+    nix::unistd::access(cg_path.as_str(), nix::unistd::AccessFlags::W_OK).is_ok()
 }
 
 /// Macro to skip test with an explanatory message if cgroup v2 is not available.
@@ -210,8 +216,15 @@ fn linux_timeout_kills_at_deadline() {
 /// was not removed.
 #[test]
 fn linux_no_warnings_on_resource_flags() {
-    // This test does NOT require cgroup v2 — it tests warning-string absence, which
-    // should be true even on cgroup v1 hosts (the error is a different kind).
+    // Phase 44 WR-07 P37 (REQ-REVIEW-FU-01 D-44-A4): require cgroup v2.
+    // The pre-44 test ran on cgroup v1 hosts too, passing vacuously
+    // because the binary fails with UnsupportedKernelFeature long
+    // before emitting the warning strings this test asserts absent.
+    // A future regression that re-introduces "is not enforced on linux"
+    // on a cgroup-v2 host would have been masked. Gate the test so it
+    // actually exercises the success path.
+    require_cgroup_v2!();
+
     let output = Command::new(NONO_BIN)
         .args([
             "run",

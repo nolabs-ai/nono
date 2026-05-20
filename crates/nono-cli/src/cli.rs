@@ -1484,6 +1484,11 @@ pub struct ProfileResolverArgs {
     /// Disable cargo-install-style auto-pull when --profile references a
     /// registry pack not yet installed locally. Falls back to the legacy
     /// "profile not found" error.
+    // Phase 44 IN-04 P37 (REQ-REVIEW-FU-01 D-44-B5): clap auto-renders
+    // `[env: NONO_NO_AUTO_PULL=]` below the help text from the `env = ...`
+    // attribute. Verified at plan-execute time via
+    // `cargo run -- run --help | grep -A2 no-auto-pull` — the env hint
+    // is present. No doc-comment change is required.
     #[arg(
         long,
         env = "NONO_NO_AUTO_PULL",

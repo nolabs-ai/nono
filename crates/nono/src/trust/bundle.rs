@@ -1143,6 +1143,23 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// Phase 44 WR-05 P37 (REQ-REVIEW-FU-01 D-44-B5): lock the
+    /// sigstore-verify default `verify_sct` posture to TRUE. The pin
+    /// guards against an upstream minor bump silently flipping the
+    /// default to FALSE — if that ever happens, this test fails and
+    /// forces a security audit before the bump can merge. Mirrors the
+    /// trust posture documented in `crates/nono/Cargo.toml`.
+    #[test]
+    fn verification_policy_default_enables_sct_verification() {
+        let policy = VerificationPolicy::default();
+        assert!(
+            policy.verify_sct,
+            "VerificationPolicy::default().verify_sct must remain true; \
+             sigstore-verify default flipped — audit the security posture \
+             before bumping further (Phase 44 WR-05 P37)."
+        );
+    }
+
     // -----------------------------------------------------------------------
     // load_production_trusted_root — cache round-trip + error cases (D-32-01/03/05)
     // -----------------------------------------------------------------------

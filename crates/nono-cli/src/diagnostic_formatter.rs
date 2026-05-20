@@ -25,6 +25,17 @@ use nono::NonoError;
 /// The returned text contains both `--no-auto-pull` and `set` so callers
 /// (and tests) can grep for the suppression-cause marker independently of
 /// the exact phrasing.
+///
+/// # Grep contract
+///
+/// Phase 44 IN-07 P37 (REQ-REVIEW-FU-01): the integration test at
+/// `crates/nono-cli/tests/auto_pull_e2e_linux.rs::auto_pull_no_auto_pull_flag_falls_back_to_profile_not_found`
+/// (assertion ~lines 362-365) greps the formatted stderr for the literal
+/// `--no-auto-pull`. Future refactors of this function MUST keep that
+/// token present in the returned string for the "set" suggestion to
+/// remain discoverable. Removing or rewording the `--no-auto-pull` token
+/// would silently break the integration test and is the single hardest-
+/// to-spot grep contract in the diagnostic-formatter module.
 #[must_use]
 pub fn format_error_footer(err: &NonoError, ctx: &ResolveContext) -> Option<String> {
     if !ctx.no_auto_pull {

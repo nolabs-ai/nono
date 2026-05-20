@@ -28,6 +28,7 @@ mod exec_strategy;
 #[path = "exec_strategy_windows/mod.rs"]
 mod exec_strategy;
 mod execution_runtime;
+mod format_util;
 mod hooks;
 mod instruction_deny;
 mod launch_runtime;

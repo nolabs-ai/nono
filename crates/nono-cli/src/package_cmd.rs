@@ -339,7 +339,14 @@ pub fn run_update(args: UpdateArgs) -> Result<()> {
         };
 
         let parts: Vec<&str> = key.splitn(2, '/').collect();
-        if parts.len() != 2 {
+        // Phase 44 IN-03 P43 (REQ-REVIEW-FU-01 D-44-B5): defense-in-depth
+        // guard. `splitn(2, '/')` on `"/foo"` or `"foo/"` returns 2 parts
+        // — one of which is the empty string — which would otherwise be
+        // accepted as a valid namespace/name pair. Reject empty
+        // segments alongside the wrong-length case so a malformed
+        // lockfile key cannot resolve to a `PackageRef` with an empty
+        // namespace or name.
+        if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
             eprintln!("  warning: skipping malformed lockfile key '{key}'");
             continue;
         }
@@ -578,7 +585,13 @@ pub fn run_outdated(args: OutdatedArgs) -> Result<()> {
 
     for (key, pkg) in &lockfile.packages {
         let parts: Vec<&str> = key.splitn(2, '/').collect();
-        let (namespace, name) = if parts.len() == 2 {
+        // Phase 44 IN-03 P43 (REQ-REVIEW-FU-01 D-44-B5): defense-in-depth
+        // guard mirroring `run_update`. Reject keys whose `splitn(2, '/')`
+        // produces an empty namespace or name segment.
+        let (namespace, name) = if parts.len() == 2
+            && !parts[0].is_empty()
+            && !parts[1].is_empty()
+        {
             (parts[0], parts[1])
         } else {
             eprintln!("  warning: skipping malformed lockfile key '{key}'");
@@ -623,6 +636,17 @@ pub fn run_outdated(args: OutdatedArgs) -> Result<()> {
         return Ok(());
     }
 
+    // Phase 44 IN-04 P43 (REQ-REVIEW-FU-01 D-44-B5): the two iterator
+    // passes intentionally distinguish "no entry needs action" (no
+    // status that is not `"current"` nor `"unknown"`) from
+    // "everything is genuinely current" (`all(status == "current")`).
+    // The asymmetry is load-bearing: an entry with `status == "unknown"`
+    // (typically an untracked sibling pack or a registry lookup that
+    // failed silently) should NOT short-circuit into the
+    // "All installed packs are up to date." green path — that line is
+    // only emitted when EVERY entry is known-current. Future readers:
+    // do NOT collapse these two passes into a single classifier without
+    // preserving the unknown vs current distinction.
     let needs_attention = entries
         .iter()
         .any(|e| e.status != "current" && e.status != "unknown");

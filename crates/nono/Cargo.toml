@@ -41,7 +41,12 @@ libc = "0.2"
 keyring = { version = "3", optional = true }
 
 # Sigstore bundle verification
-sigstore-verify = { version = "0.6.5", default-features = false, features = ["tuf"] }
+# Phase 37 Plan 37-06: bumped 0.6.5 → 0.7.0 to pick up upstream sigstore-rust PR #85
+# (merged 2026-04-29, released 2026-05-13). Breaking API: `VerificationPolicy::verify_sct: bool`
+# field added — `::default()` and builder methods (`with_issuer`, `skip_sct`) are unaffected,
+# and nono uses only those constructors (no struct-literal `VerificationPolicy { ... }` sites
+# in-tree, verified via `grep -rnE "VerificationPolicy\s*\{" crates/`).
+sigstore-verify = { version = "0.7.0", default-features = false, features = ["tuf"] }
 x509-cert = { version = "0.2", default-features = false }
 der = { version = "0.7", default-features = false }
 

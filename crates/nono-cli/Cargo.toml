@@ -61,7 +61,11 @@ aws-lc-rs = "1"
 keyring = { version = "3", optional = true }
 
 # Keyless (Sigstore/Fulcio/Rekor) signing for instruction file attestation
-sigstore-sign = "0.6.5"
+# Phase 37 Plan 37-06: bumped 0.6.5 → 0.7.0 alongside sigstore-verify 0.7.0
+# (upstream sigstore-rust PR #85, released 2026-05-13). Adds "API for fetching /
+# using the trust root (#69)" + "Avoid hashing the payload twice"; consumers
+# (`crates/nono-cli/src/trust_cmd.rs`) call `sign_blob`-style APIs unchanged.
+sigstore-sign = "0.7.0"
 # YAML-merge directive support (Plan 36-02; upstream-aligned at v0.10.0 per 242d4917)
 serde_yaml_ng = "=0.10.0"
 tokio = { version = "1", features = ["rt", "net", "io-util"] }

@@ -2,9 +2,9 @@
 title: "Investigate why validate_deny_overlaps does not fire pre-flight in CI for run_allow_cwd_with_profile_deny_under_workdir_fails_closed"
 created: 2026-05-16
 source: CI run 25973911653 job 76350640312 (Test ubuntu-latest)
-target_milestone: v2.5
+target_milestone: v2.6
 priority: medium
-resolves_phase: 42
+resolves_phase: 44
 parent_plan: 41-10
 ---
 

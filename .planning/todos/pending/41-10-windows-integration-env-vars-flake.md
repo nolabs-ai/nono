@@ -2,9 +2,9 @@
 title: "Windows Integration: windows_run_redirects_profile_state_vars_into_writable_allowlist parallel env_vars flake"
 created: 2026-05-16
 source: CI run 25973911653 job 76350640287 (Windows Integration)
-target_milestone: v2.5
+target_milestone: v2.6
 priority: medium
-resolves_phase: 42
+resolves_phase: 44
 parent_plan: 41-10
 ---
 

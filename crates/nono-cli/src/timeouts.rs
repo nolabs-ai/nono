@@ -97,7 +97,10 @@ fn env_duration_secs(var: &str, default: Duration) -> Duration {
             Ok(secs) => {
                 let d = Duration::from_secs(secs);
                 if d > MAX_TIMEOUT {
-                    warn!("{var}={val} exceeds maximum ({} s), clamping", MAX_TIMEOUT.as_secs());
+                    warn!(
+                        "{var}={val} exceeds maximum ({} s), clamping",
+                        MAX_TIMEOUT.as_secs()
+                    );
                     MAX_TIMEOUT
                 } else {
                     d
@@ -118,7 +121,10 @@ fn env_duration_millis(var: &str, default: Duration) -> Duration {
             Ok(ms) => {
                 let d = Duration::from_millis(ms);
                 if d > MAX_TIMEOUT {
-                    warn!("{var}={val} exceeds maximum ({} s), clamping", MAX_TIMEOUT.as_secs());
+                    warn!(
+                        "{var}={val} exceeds maximum ({} s), clamping",
+                        MAX_TIMEOUT.as_secs()
+                    );
                     MAX_TIMEOUT
                 } else {
                     d

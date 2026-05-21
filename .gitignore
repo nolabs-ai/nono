@@ -48,3 +48,36 @@ ci-logs-local/
 .planning/quick/*/poc-broker/Cargo.lock
 .planning/quick/*/poc-broker/target/
 
+# Log files (build, test, clippy, debug output)
+*.log
+
+# GSD/background-shell scratch state
+.bg-shell/
+.gsd/
+
+# Build artifacts and binaries
+*.exe
+*.dll
+*.so
+*.dylib
+*.a
+*.rlib
+*.pdb
+*.wixpdb
+*.msi
+*.exp
+*.lib
+*.o
+*.obj
+
+# Archives commonly produced by release tooling
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+
+# Editor / OS noise
+*.swp
+*.swo
+Thumbs.db
+

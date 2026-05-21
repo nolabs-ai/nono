@@ -2130,4 +2130,135 @@ mod tests {
             "OIDC_NO_AMBIENT_TOKEN_MSG must name the GitHub Actions OIDC permission claim; got: {msg}"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Phase 44.1 — T-44-01 / CR-01 verify-path fail-closed regression gate
+    // -----------------------------------------------------------------------
+    //
+    // These tests pin the fail-closed contract on `read_required_oidc_issuer`
+    // (the small private helper introduced in Task 2). Phase 44 Plan 44-01's
+    // WR-09 production-wiring of `NONO_TRUST_OIDC_ISSUER` silently substituted
+    // the canonical GitHub Actions OIDC issuer at the verify trust-anchor
+    // boundary when both `--issuer` and the env-var were unset — a Spoofing-
+    // class regression (T-44-01) flagged by `/gsd-secure-phase` and
+    // `/gsd-code-review` (CR-01) that violated CLAUDE.md § Fail Secure and
+    // § Explicit Over Implicit. This module restores the pre-Phase-44
+    // fail-closed contract by reading the env-var without any hard-coded
+    // default fallback at the verify boundary.
+
+    // Phase 44.1 — env-var test isolation. Replicates the OidcEnvGuard
+    // pattern from crates/nono/src/trust/signing.rs:1155-1201 because Rust
+    // unit tests run in parallel within the same process and concurrent
+    // mutation of NONO_TRUST_OIDC_ISSUER across sibling tests would race.
+    // CLAUDE.md § "Environment variables in tests" save/restore pattern.
+    static OIDC_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct OidcEnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        prev: Option<String>,
+    }
+
+    impl OidcEnvGuard {
+        #[allow(clippy::disallowed_methods)]
+        fn set(val: &str) -> Self {
+            let _lock = match OIDC_ENV_LOCK.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            let prev = std::env::var("NONO_TRUST_OIDC_ISSUER").ok();
+            std::env::set_var("NONO_TRUST_OIDC_ISSUER", val);
+            Self { _lock, prev }
+        }
+
+        #[allow(clippy::disallowed_methods)]
+        fn remove() -> Self {
+            let _lock = match OIDC_ENV_LOCK.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            let prev = std::env::var("NONO_TRUST_OIDC_ISSUER").ok();
+            std::env::remove_var("NONO_TRUST_OIDC_ISSUER");
+            Self { _lock, prev }
+        }
+    }
+
+    impl Drop for OidcEnvGuard {
+        #[allow(clippy::disallowed_methods)]
+        fn drop(&mut self) {
+            match self.prev.take() {
+                Some(v) => std::env::set_var("NONO_TRUST_OIDC_ISSUER", v),
+                None => std::env::remove_var("NONO_TRUST_OIDC_ISSUER"),
+            }
+        }
+    }
+
+    // Phase 44.1 — T-44-01 / CR-01 regression gate. When the operator
+    // passes --issuer explicitly, that value wins; the env-var is not
+    // consulted.
+    #[test]
+    fn read_required_oidc_issuer_returns_user_issuer_when_set() {
+        let _g = OidcEnvGuard::remove();
+        let got = read_required_oidc_issuer(Some("https://gitlab.com"))
+            .expect("explicit --issuer should succeed");
+        assert_eq!(got, "https://gitlab.com");
+    }
+
+    // Phase 44.1 — D-44-B3 opt-in env-var fallback preserved.
+    #[test]
+    fn read_required_oidc_issuer_returns_env_value_when_user_unset_and_env_set() {
+        let _g = OidcEnvGuard::set("https://token.actions.githubusercontent.com");
+        let got = read_required_oidc_issuer(None)
+            .expect("explicitly-set env-var should succeed");
+        assert_eq!(got, "https://token.actions.githubusercontent.com");
+    }
+
+    // Phase 44.1 — T-44-01 / CR-01 PRIMARY REGRESSION GATE.
+    // CLAUDE.md § Fail Secure + § Explicit Over Implicit: when both
+    // --issuer and NONO_TRUST_OIDC_ISSUER are absent the verify path
+    // MUST error, NOT silently substitute a canonical default.
+    #[test]
+    fn read_required_oidc_issuer_fails_closed_when_both_unset() {
+        let _g = OidcEnvGuard::remove();
+        let err = read_required_oidc_issuer(None)
+            .expect_err("both inputs absent should fail closed");
+        assert!(
+            err.contains("keyless bundle requires --issuer"),
+            "error must name --issuer; got: {err}"
+        );
+        assert!(
+            err.contains("NONO_TRUST_OIDC_ISSUER"),
+            "error must name NONO_TRUST_OIDC_ISSUER; got: {err}"
+        );
+    }
+
+    // Phase 44.1 — whitespace-only env-var is the "accidentally exported
+    // empty value" trap; treat as unset, fail closed.
+    #[test]
+    fn read_required_oidc_issuer_fails_closed_when_user_unset_and_env_whitespace_only() {
+        let _g = OidcEnvGuard::set("   ");
+        let err = read_required_oidc_issuer(None)
+            .expect_err("whitespace-only env-var should fail closed");
+        assert!(
+            err.contains("keyless bundle requires --issuer"),
+            "error must name --issuer; got: {err}"
+        );
+    }
+
+    // Phase 44.1 — migrated from
+    // `crates/nono/src/trust/signing.rs::configured_oidc_issuer_rejects_malformed_env_value`.
+    // Preserves CLAUDE.md § Fail Secure coverage on malformed URL values.
+    #[test]
+    fn read_required_oidc_issuer_rejects_malformed_env_url() {
+        let _g = OidcEnvGuard::set("not a valid url at all");
+        let err = read_required_oidc_issuer(None)
+            .expect_err("malformed URL should fail closed");
+        assert!(
+            err.contains("NONO_TRUST_OIDC_ISSUER"),
+            "error must name the env-var; got: {err}"
+        );
+        assert!(
+            err.contains("is not a valid URL"),
+            "error must say 'is not a valid URL'; got: {err}"
+        );
+    }
 }

@@ -244,7 +244,14 @@ fn home_dir_from_env() -> Option<std::path::PathBuf> {
 ///
 /// Returns `Err(TrustVerification)` when ALL tlog keys have an explicit
 /// `valid_for.end` that is in the past.
-fn check_trusted_root_freshness(root: &TrustedRoot, cache_path: &std::path::Path) -> Result<()> {
+///
+/// Per-tlog `validFor.end` missing = no expiry asserted = treated as active
+/// (WR-05 fail-closed format guard). Visibility is `pub` so `nono-cli` can
+/// reuse this gate from `nono setup --from-file` (Phase 49 D-49-A1).
+pub fn check_trusted_root_freshness(
+    root: &TrustedRoot,
+    cache_path: &std::path::Path,
+) -> Result<()> {
     // Fail-closed on clock failure (CR-02): if SystemTime is before UNIX_EPOCH
     // we cannot reason about expiry. Returning Ok(0) here would silently pass
     // every freshness gate (1970-01-01 < every real cert end date), so a

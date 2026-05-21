@@ -37,12 +37,13 @@ pub mod signing;
 pub mod types;
 
 pub use bundle::{
-    bundle_path_for, extract_all_subjects, extract_bundle_digest, extract_predicate_type,
-    extract_signer_identity, load_bundle, load_bundle_from_str, load_production_trusted_root,
-    load_trusted_root, load_trusted_root_from_str, multi_subject_bundle_path, parse_cert_info,
-    verify_bundle, verify_bundle_keyed, verify_bundle_subject_name, verify_bundle_with_digest,
-    verify_keyed_signature, Bundle, CertificateInfo, DerPublicKey, Sha256Hash,
-    SigstoreVerificationResult, TrustedRoot, VerificationPolicy,
+    bundle_path_for, check_trusted_root_freshness, extract_all_subjects, extract_bundle_digest,
+    extract_predicate_type, extract_signer_identity, load_bundle, load_bundle_from_str,
+    load_production_trusted_root, load_trusted_root, load_trusted_root_from_str,
+    multi_subject_bundle_path, parse_cert_info, verify_bundle, verify_bundle_keyed,
+    verify_bundle_subject_name, verify_bundle_with_digest, verify_keyed_signature, Bundle,
+    CertificateInfo, DerPublicKey, Sha256Hash, SigstoreVerificationResult, TrustedRoot,
+    VerificationPolicy,
 };
 pub use digest::{bytes_digest, file_digest};
 pub use dsse::{

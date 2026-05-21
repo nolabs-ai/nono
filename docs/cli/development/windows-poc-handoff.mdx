@@ -163,15 +163,21 @@ inline network refresh. Mirror of the WFP service prereq pattern from Step 5
 (below): explicit operator action up front, fail-closed-with-recovery-hint at
 runtime, no implicit network on the verify path.
 
-Run once after install:
+Run once after install (pick ONE — Path A for network-reachable hosts, Path B with `--from-file` for offline / network-restricted hosts):
 
 ```powershell
+# Path A — network-reachable host (fetches from https://tuf-repo-cdn.sigstore.dev):
 nono setup --refresh-trust-root
+
+# Path B — offline host (download the trusted_root.json release asset, then):
+nono setup --from-file C:\path\to\downloaded\trusted_root.json
 ```
 
-The command fetches TUF metadata from `https://tuf-repo-cdn.sigstore.dev` and
-writes the verified trusted root to your per-user cache. Subsequent keyless
-`nono trust verify` invocations run offline against that cache.
+Path B is also the recovery path when Path A fails with a stale-embedded-anchor
+error — see the Known issue section below.
+
+Either path writes a verified trusted root to your per-user cache. Subsequent
+keyless `nono trust verify` invocations run offline against that cache.
 
 **Fail-closed contract:** if the cache is absent or expired, keyless
 `nono trust verify` fails with a recovery message naming the exact command
@@ -179,7 +185,7 @@ writes the verified trusted root to your per-user cache. Subsequent keyless
 for the design rationale (Phase 32 D-32-01). Verify-is-offline is structural
 and dynamic — there is no inline network call on the verify path at all.
 
-#### Known issue: Sigstore TUF root rotation (sigstore-verify 0.6.5)
+#### Known issue: Sigstore TUF root rotation
 
 If `nono setup --refresh-trust-root` fails with:
 
@@ -190,35 +196,52 @@ ERROR Setup error: Failed to fetch Sigstore trusted root from
   Signature threshold of 3 not met for role root (0 valid signatures)
 ```
 
-…then your binary is hitting a known upstream issue: `sigstore-verify 0.6.5`
-(the fork's pinned dependency) embeds a TUF trust anchor that Sigstore has
-since rotated out. The TUF fetch succeeds; signature validation fails because
-zero of the embedded anchor keys are present in the current published root.
+…then your binary is hitting a Sigstore TUF root rotation. Sigstore periodically
+rotates the root signing keys; once `sigstore-verify`'s embedded trust anchor
+loses all of its valid keys against the published `root.json`, every
+`--refresh-trust-root` invocation fails until the dep ships a new anchor.
 
 The verify path is structurally offline (Phase 32 D-32-15), so a manually-placed
-`trusted_root.json` works around this. The repo ships a maintainer-captured
-known-good root at `crates/nono/tests/fixtures/trust-root-frozen.json`
-(captured 2026-05-10 from `sigstore/root-signing@main`). Drop it into your
-cache directly:
+`trusted_root.json` works around this without waiting on the dep. Phase 49 ships
+two supported recovery paths in priority order.
+
+**Primary path — `nono setup --from-file` against the release-asset
+`trusted_root.json`:**
+
+1. Open the most recent GitHub Release for the fork:
+   `https://github.com/oscarmackjr-twg/nono/releases/latest`
+2. Download `trusted_root.json` from the release assets list (sibling to `nono.exe`).
+3. Run:
 
 ```powershell
-# Workaround until the fork upgrades to sigstore-verify 0.6.6+ (tracked as
-# P32-DEFER-005 in .planning/phases/32-sigstore-integration/deferred-items.md).
+nono setup --from-file C:\path\to\downloaded\trusted_root.json
+```
+
+The flag validates the JSON (schema + tlog freshness gate, same code path
+`nono trust verify` uses) and writes a byte-identical copy to your per-user
+cache. The asset is covered by the release-integrity gate in `SHA256SUMS.txt`
+(Phase 49-02 release-workflow change).
+
+**Fallback path — direct `Invoke-WebRequest` into the cache directory:**
+
+If you cannot reach `github.com/releases` (network-restricted host, offline
+POC environment), capture the fixture directly from the fork's repository:
+
+```powershell
+# Phase 49 ships --from-file as the supported path; this Invoke-WebRequest
+# fallback remains for hosts that cannot reach the GitHub Releases page.
+# Maintainer-cadence procedure for refreshing the upstream fixture lives at
+# .planning/templates/sigstore-rotation-refresh.md.
 $cacheDir = "$env:USERPROFILE\.nono\trust-root"
 New-Item -ItemType Directory -Force -Path $cacheDir | Out-Null
 Invoke-WebRequest -UseBasicParsing `
-  -Uri "https://raw.githubusercontent.com/oscarmackjr-twg/nono/281f71ab/crates/nono/tests/fixtures/trust-root-frozen.json" `
+  -Uri "https://raw.githubusercontent.com/oscarmackjr-twg/nono/main/crates/nono/tests/fixtures/trust-root-frozen.json" `
   -OutFile "$cacheDir\trusted_root.json"
 ```
 
-After that, `nono trust verify` with `--issuer` + `--identity` works offline
-against the cached file. `nono setup --check-only` should report
+After either path, `nono trust verify` with `--issuer` + `--identity` works
+offline against the cached file. `nono setup --check-only` should report
 `Trust root cache: OK` once the file is in place.
-
-The `--refresh-trust-root` path will start working again once the fork's
-`sigstore-verify` dep is upgraded to 0.6.6+ (which embeds the rotated TUF
-anchor); until then, the manual file drop is the supported workaround for
-POC use.
 
 **Check status:**
 

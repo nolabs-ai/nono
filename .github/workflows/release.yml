@@ -307,12 +307,31 @@ jobs:
 
       - name: Generate checksums
         run: |
+          set -euo pipefail
           cd artifacts
           find . -name "*.tar.gz" -exec mv {} . \;
           find . -name "*.zip" -exec mv {} . \;
           find . -name "*.msi" -exec mv {} . \;
           find . -name "*.exe" -exec mv {} . \;
           find . -name "*.deb" -exec mv {} . \;
+
+          # Phase 49 REQ-POC-TRUST-02: ship trusted_root.json as a release asset
+          # alongside the binaries. Byte-identity assert closes the maintainer-side
+          # provenance chain (D-49-B1) - what the maintainer commits to the frozen
+          # fixture is what CI uploads.
+          SRC=../crates/nono/tests/fixtures/trust-root-frozen.json
+          DST=trusted_root.json
+          cp "$SRC" "$DST"
+          SRC_SHA=$(sha256sum "$SRC" | cut -d' ' -f1)
+          DST_SHA=$(sha256sum "$DST" | cut -d' ' -f1)
+          if [ "$SRC_SHA" != "$DST_SHA" ]; then
+            echo "ERROR: trusted_root.json byte-identity assert failed" >&2
+            echo "  src ($SRC): $SRC_SHA" >&2
+            echo "  dst ($DST): $DST_SHA" >&2
+            exit 1
+          fi
+          echo "trusted_root.json byte-identity verified: $SRC_SHA"
+
           sha256sum *.tar.gz > SHA256SUMS.txt
           if ls *.zip >/dev/null 2>&1; then
             sha256sum *.zip >> SHA256SUMS.txt
@@ -322,6 +341,9 @@ jobs:
           fi
           if ls *.exe >/dev/null 2>&1; then
             sha256sum *.exe >> SHA256SUMS.txt
+          fi
+          if ls trusted_root.json >/dev/null 2>&1; then
+            sha256sum trusted_root.json >> SHA256SUMS.txt
           fi
           cat SHA256SUMS.txt
 
@@ -337,6 +359,7 @@ jobs:
             artifacts/*.msi
             artifacts/*.exe
             artifacts/*.deb
+            artifacts/trusted_root.json
             artifacts/SHA256SUMS.txt
 
   docker:

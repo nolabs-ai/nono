@@ -2,15 +2,15 @@
 gsd_state_version: 1.0
 milestone: v2.6
 milestone_name: UPST6 + v2.5 Drain
-status: milestone_complete
-last_updated: "2026-05-21T19:12:38.351Z"
+status: completed
+last_updated: "2026-05-21T22:36:51.173Z"
 last_activity: 2026-05-21
 progress:
   total_phases: 7
   completed_phases: 3
   total_plans: 9
-  completed_plans: 3
-  percent: 43
+  completed_plans: 6
+  percent: 67
 ---
 
 # Project State: nono — v2.6 UPST6 + v2.5 Drain

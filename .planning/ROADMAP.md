@@ -77,7 +77,7 @@ Audit: [`milestones/v2.5-MILESTONE-AUDIT.md`](milestones/v2.5-MILESTONE-AUDIT.md
   5. `/gsd-secure-phase` re-run on Phase 44 flips T-44-01 from OPEN to CLOSED; Phase 44 SECURITY.md verdict moves from `OPEN_THREATS` to `SECURED`. Re-running the Phase 44 code review on the changed sites no longer surfaces CR-01.
   6. Cross-target clippy passes per CLAUDE.md MUST/NEVER bullet: workspace clippy on Windows host AND `--target x86_64-unknown-linux-gnu` AND `--target x86_64-apple-darwin` (PARTIAL allowed only if cross-toolchain unavailable, per `.planning/templates/cross-target-verify-checklist.md`). No `#[allow(dead_code)]` introduced.
 **Plans**: 1 plan
-- [ ] 44.1-01-oidc-fail-closed-remediation-PLAN.md — restore D-32-08 fail-closed contract on keyless trust verify; delete dead configured_oidc_issuer; update CLI doc
+- [x] 44.1-01-oidc-fail-closed-remediation-PLAN.md — restore D-32-08 fail-closed contract on keyless trust verify; delete dead configured_oidc_issuer; update CLI doc
 **UI hint**: no
 
 ### Phase 45: Source migration + AIPC G-04 + RESL native re-validation

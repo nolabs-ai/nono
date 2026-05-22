@@ -859,9 +859,26 @@ impl SetupRunner {
                 ))
             })?;
 
+        let cache_path = cache_dir.join("trusted_root.json");
+
+        // WR-01: mirror the freshness gate `from_file_step` enforces (D-32-03
+        // tlog `validFor.end` expiry, `nono::trust::bundle::check_trusted_root_freshness`).
+        // The asymmetric absence here would let a network-fetched
+        // `trusted_root.json` with an expired embedded tlog be cached while
+        // the same JSON via `--from-file` would be rejected. Sigstore root
+        // rotations have happened and the embedded TUF anchor in
+        // `sigstore-trust-root 0.7.0` can ship a soon-to-expire payload, so
+        // Path A and Path B must enforce the same validity contract.
+        nono::trust::bundle::check_trusted_root_freshness(&trusted_root, &cache_path).map_err(
+            |e| {
+                NonoError::Setup(format!(
+                    "fetched Sigstore trusted root failed freshness check: {e}"
+                ))
+            },
+        )?;
+
         let json = serde_json::to_string_pretty(&trusted_root)
             .map_err(|e| NonoError::Setup(format!("serialize trusted root: {e}")))?;
-        let cache_path = cache_dir.join("trusted_root.json");
         std::fs::write(&cache_path, &json).map_err(NonoError::Io)?;
 
         println!(

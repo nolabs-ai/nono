@@ -1851,12 +1851,7 @@ fn extract_sendto_buffer(line: &str) -> Option<String> {
     let search_start = if let Some(pos) = line.find("iov_base=") {
         // sendmsg: buffer is in iov_base="..."
         pos
-    } else if let Some(pos) = line.find("sendto(") {
-        // sendto: buffer is the second argument
-        pos
-    } else {
-        return None;
-    };
+    } else { line.find("sendto(")? };
 
     let after = &line[search_start..];
 

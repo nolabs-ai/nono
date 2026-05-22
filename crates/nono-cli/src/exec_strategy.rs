@@ -113,7 +113,7 @@ pub(crate) fn apply_resource_limits_unix(
         let cgroup = supervisor_linux::cgroup::CgroupSession::new(session_id, limits)?;
         cgroup.apply_limits()?;
         cgroup.install_pre_exec(cmd);
-        return Ok(UnixResourceLimitGuard::Linux(cgroup));
+        Ok(UnixResourceLimitGuard::Linux(cgroup))
     }
     #[cfg(target_os = "macos")]
     {
@@ -1352,15 +1352,14 @@ pub fn execute_supervised(
             // macOS: sends SIGKILL to child process group at deadline.
             #[cfg(target_os = "linux")]
             let _timeout_watchdog = timeout_deadline
-                .map(|deadline| {
+                .and_then(|deadline| {
                     if let Some(ref session) = unix_resource_guard {
                         let cgroup_path = session.path.clone();
                         Some(spawn_linux_timeout_watchdog(deadline, cgroup_path))
                     } else {
                         None
                     }
-                })
-                .flatten();
+                });
             #[cfg(target_os = "macos")]
             let _timeout_watchdog = timeout_deadline
                 .map(|deadline| {

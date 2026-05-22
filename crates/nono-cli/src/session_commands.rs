@@ -664,18 +664,25 @@ fn format_limits_block(limits: &crate::session::ResourceLimitsRecord) -> String 
 /// yields an integer representation; falls back to raw bytes for values that
 /// are not a clean multiple of any unit. Mirrors the input parser
 /// (`crate::cli::parse_byte_size`) which uses the same K/M/G/T multipliers.
+///
+/// Cfg-gate: used only by the macOS and Windows branches of
+/// `format_limits_block` (lines 626 + 631 above) plus the test module below;
+/// the Linux branch uses `format_bytes_short` instead (D-17 + REQ-RESL-NIX-01).
+/// Gating prevents a `dead_code` lint on Linux non-test builds (Phase 50-05
+/// Task 3 cross-target clippy HARD-pass — D-50-13 + Codex R-50-04).
+#[cfg(any(test, target_os = "macos", target_os = "windows"))]
 fn format_bytes_human(bytes: u64) -> String {
     const K: u64 = 1024;
     const M: u64 = K * 1024;
     const G: u64 = M * 1024;
     const T: u64 = G * 1024;
-    if bytes >= T && bytes % T == 0 {
+    if bytes >= T && bytes.is_multiple_of(T) {
         format!("{} TiB", bytes / T)
-    } else if bytes >= G && bytes % G == 0 {
+    } else if bytes >= G && bytes.is_multiple_of(G) {
         format!("{} GiB", bytes / G)
-    } else if bytes >= M && bytes % M == 0 {
+    } else if bytes >= M && bytes.is_multiple_of(M) {
         format!("{} MiB", bytes / M)
-    } else if bytes >= K && bytes % K == 0 {
+    } else if bytes >= K && bytes.is_multiple_of(K) {
         format!("{} KiB", bytes / K)
     } else {
         format!("{bytes} bytes")
@@ -692,13 +699,13 @@ fn format_bytes_human(bytes: u64) -> String {
 /// (s/m/h/d), which always produce whole-second durations.
 fn format_duration_human(d: std::time::Duration) -> String {
     let secs = d.as_secs();
-    if secs >= 86_400 && secs % 86_400 == 0 {
+    if secs >= 86_400 && secs.is_multiple_of(86_400) {
         let n = secs / 86_400;
         format!("{n} {}", if n == 1 { "day" } else { "days" })
-    } else if secs >= 3600 && secs % 3600 == 0 {
+    } else if secs >= 3600 && secs.is_multiple_of(3600) {
         let n = secs / 3600;
         format!("{n} {}", if n == 1 { "hour" } else { "hours" })
-    } else if secs >= 60 && secs % 60 == 0 {
+    } else if secs >= 60 && secs.is_multiple_of(60) {
         let n = secs / 60;
         format!("{n} {}", if n == 1 { "minute" } else { "minutes" })
     } else {

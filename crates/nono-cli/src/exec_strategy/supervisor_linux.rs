@@ -850,9 +850,10 @@ mod tests {
 /// 2. `detect_from_str` multi-line guard (cgroup v1/hybrid)
 /// 3. `detect_from_str` missing `0::` prefix guard
 /// 4. (intentionally UnsupportedPlatform — `detect_from_str` traversal guard)
-/// 5a. `detect` failed to read `/proc/self/cgroup`
-/// 5b. `detect` resolved path is not a directory
-/// 5c. `detect` resolved path metadata failed
+/// 5. `detect` cases:
+///    5a. `detect` failed to read `/proc/self/cgroup`
+///    5b. `detect` resolved path is not a directory
+///    5c. `detect` resolved path metadata failed
 pub(super) mod cgroup {
     use crate::launch_runtime::ResourceLimits;
     use nono::{NonoError, Result, CGROUP_V2_HINT};

@@ -34,7 +34,9 @@ use zeroize::Zeroizing;
 /// Maximum request body size (16 MiB). Prevents DoS from malicious Content-Length.
 const MAX_REQUEST_BODY: usize = 16 * 1024 * 1024;
 
-fn auth_mechanism_for_inject_mode(mode: &InjectMode) -> nono::undo::NetworkAuditAuthMechanism {
+pub(crate) fn auth_mechanism_for_inject_mode(
+    mode: &InjectMode,
+) -> nono::undo::NetworkAuditAuthMechanism {
     match mode {
         InjectMode::Header | InjectMode::BasicAuth => {
             nono::undo::NetworkAuditAuthMechanism::PhantomHeader
@@ -44,7 +46,7 @@ fn auth_mechanism_for_inject_mode(mode: &InjectMode) -> nono::undo::NetworkAudit
     }
 }
 
-fn audit_injection_mode_for_inject_mode(
+pub(crate) fn audit_injection_mode_for_inject_mode(
     mode: &InjectMode,
 ) -> nono::undo::NetworkAuditInjectionMode {
     match mode {

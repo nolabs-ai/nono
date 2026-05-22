@@ -11,7 +11,7 @@ members = [
 [workspace.package]
 edition = "2021"
 rust-version = "1.95"
-authors = ["Luke Hinds"]
+authors = ["Luke Hinds", "Oscar Mack Jr <oscar.mack.jr@gmail.com>"]
 license = "Apache-2.0"
 repository = "https://github.com/always-further/nono"
 homepage = "https://github.com/always-further/nono"

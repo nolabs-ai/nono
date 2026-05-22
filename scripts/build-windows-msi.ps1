@@ -17,7 +17,7 @@ param(
 
     [string]$OutputDir = "dist/windows",
 
-    [string]$Manufacturer = "Luke Hinds",
+    [string]$Manufacturer = "Luke Hinds and Oscar Mack Jr",
 
     [string]$ServiceBinaryPath = "",
 

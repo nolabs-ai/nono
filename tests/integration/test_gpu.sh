@@ -254,6 +254,22 @@ with open(f'/proc/self/task/{tid}/comm', 'wb') as f:
 print('OK: wrote thread comm under --allow-gpu')
 "
 
+    # Issue #924 regression: grandchild process (different PID from the
+    # direct child) must also be able to write to its own
+    # /proc/<pid>/task/<tid>/comm. Without the widening of
+    # /proc/self/task → /proc inside widen_procfs_self_to_proc(), this
+    # write would be denied because the Landlock rule is bound to the
+    # direct child's PID inode, surfacing as CUDA Error 304.
+    expect_success "grandchild /proc/self/task/<tid>/comm write allowed with --allow-gpu (#924)" \
+        "$NONO_BIN" run --silent --allow-cwd --allow "$TMPDIR" --allow-gpu -- \
+        sh -c "python3 -c \"
+import os
+tid = os.gettid() if hasattr(os, 'gettid') else os.getpid()
+with open(f'/proc/self/task/{tid}/comm', 'wb') as f:
+    f.write(b'probe\n')
+print(f'OK: grandchild (pid={os.getpid()}) wrote thread comm')
+\""
+
     # /proc/driver/nvidia — CUDA UVM init read. Only test if the driver is
     # loaded (the grant itself skips the path when it doesn't exist).
     if [[ -d /proc/driver/nvidia ]]; then

@@ -1325,28 +1325,58 @@ impl CapabilitySet {
         self.deduplicate();
     }
 
-    /// Widen `/proc/<pid>` READ-only Landlock rules to `/proc` so that
-    /// grandchild processes can access their own procfs entries.
+    /// Widen `/proc/<pid>` Landlock rules to `/proc` so that grandchild
+    /// processes can access their own procfs entries.
     ///
-    /// This is needed because Landlock rules are fixed at sandbox setup time with
-    /// the direct child's PID. When a grandchild (e.g. nono→sh→bun) forks, it
-    /// gets a new PID and its `/proc/self` resolves to a different inode than the
-    /// direct child's `/proc/<sh_pid>`. By widening to `/proc`, we allow any
-    /// descendant to read its own procfs entries.
+    /// This is needed because Landlock rules are fixed at sandbox setup time
+    /// with the direct child's PID. When a grandchild (e.g. nono→sh→bun) forks,
+    /// it gets a new PID and its `/proc/self` resolves to a different inode
+    /// than the direct child's `/proc/<sh_pid>`. By widening to `/proc`, we
+    /// allow any descendant to access its own procfs entries.
     ///
-    /// Only applies to READ capabilities at the `/proc/self` level (not
-    /// subdirectories like `/proc/self/fd` which may have write access).
+    /// Two narrow rewrites are performed:
+    ///
+    /// 1. **`/proc/self` (Read)** → `/proc` (Read). Reads under `/proc/<pid>`
+    ///    are essentially free to widen: the kernel already permits cross-PID
+    ///    reads on most procfs entries (subject to `hidepid` and
+    ///    `ptrace_scope`), so coarsening the Landlock rule does not hand out
+    ///    anything the kernel would not already allow.
+    ///
+    /// 2. **`/proc/self/task` (ReadWrite)** → `/proc` (ReadWrite). This rule
+    ///    is granted by `--allow-gpu` on NVIDIA systems so the CUDA driver
+    ///    can write `/proc/self/task/<tid>/comm` (the thread name) during
+    ///    `cuInit()`. Without widening, only the direct child can perform
+    ///    that write; a grandchild's `/proc/self/task/<tid>/comm` resolves
+    ///    to a different inode and gets `EACCES`, surfacing as CUDA Error 304
+    ///    (`cudaErrorOperatingSystem`). See issue #924.
+    ///
+    ///    Trade-off: widening to `/proc` necessarily covers other writable
+    ///    per-process knobs under `/proc/<pid>/` (e.g. `oom_score_adj`,
+    ///    `coredump_filter`). Two factors bound the impact:
+    ///
+    ///    - Landlock cannot express "any `/proc/<pid>/task`" without covering
+    ///      the parent — it is a filesystem-tree allowlist, not a glob.
+    ///    - The kernel still enforces per-file ownership: a process can only
+    ///      write to its own `/proc/<pid>/*` writable knobs, not another
+    ///      process's. So the widened Landlock rule defers to kernel
+    ///      ownership checks rather than handing out cross-process write.
+    ///
+    /// Other capabilities (e.g. `/proc/self/fd` writes, profile-specific
+    /// grants) are unaffected.
     pub fn widen_procfs_self_to_proc(&mut self) {
         for cap in &mut self.fs {
-            if cap.access == AccessMode::Read {
-                let is_proc_self_dir = cap
-                    .original
-                    .to_str()
-                    .map(|s| s == "/proc/self" || s == "/proc/self/")
-                    .unwrap_or(false);
-                if is_proc_self_dir {
-                    cap.resolved = std::path::PathBuf::from("/proc");
-                }
+            let original_str = cap.original.to_str().unwrap_or("");
+            let is_proc_self_dir = original_str == "/proc/self" || original_str == "/proc/self/";
+            let is_proc_self_task_dir =
+                original_str == "/proc/self/task" || original_str == "/proc/self/task/";
+
+            if is_proc_self_dir && cap.access == AccessMode::Read {
+                cap.resolved = std::path::PathBuf::from("/proc");
+            } else if is_proc_self_task_dir {
+                // NVIDIA --allow-gpu grant: keep the original access mode
+                // (ReadWrite today) so kernel ownership checks remain the
+                // effective limit; see function doc for the trade-off.
+                cap.resolved = std::path::PathBuf::from("/proc");
             }
         }
         self.deduplicate();
@@ -1875,6 +1905,141 @@ mod procfs_remap_tests {
         assert_eq!(
             caps.fs_capabilities()[1].resolved,
             PathBuf::from("/proc/4242/fd/1")
+        );
+    }
+
+    /// Widening rewrites the `/proc/self` Read rule to `/proc`.
+    #[test]
+    fn widen_procfs_self_to_proc_widens_read_rule() {
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(FsCapability {
+            original: PathBuf::from("/proc/self"),
+            resolved: PathBuf::from("/proc/4242"),
+            access: AccessMode::Read,
+            is_file: false,
+            source: CapabilitySource::Group("system_read_linux".to_string()),
+        });
+
+        caps.widen_procfs_self_to_proc();
+
+        let proc_self = caps
+            .fs_capabilities()
+            .iter()
+            .find(|c| c.original == Path::new("/proc/self"))
+            .expect("/proc/self capability must survive widening");
+        assert_eq!(
+            proc_self.resolved,
+            PathBuf::from("/proc"),
+            "Read /proc/self must widen to /proc so grandchildren can read their own procfs"
+        );
+        assert_eq!(proc_self.access, AccessMode::Read);
+    }
+
+    /// Issue #924 regression: widening must also rewrite the
+    /// `/proc/self/task` ReadWrite rule (the NVIDIA --allow-gpu grant) to
+    /// `/proc`. Without this, a grandchild process (e.g. `claude → python`)
+    /// cannot write to its own `/proc/<pid>/task/<tid>/comm`, surfacing as
+    /// CUDA Error 304 during `cuInit()`.
+    #[test]
+    fn widen_procfs_self_to_proc_widens_proc_self_task_write_rule() {
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(FsCapability {
+            original: PathBuf::from("/proc/self/task"),
+            resolved: PathBuf::from("/proc/4242/task"),
+            access: AccessMode::ReadWrite,
+            is_file: false,
+            source: CapabilitySource::Group("nvidia_gpu_procfs".to_string()),
+        });
+
+        caps.widen_procfs_self_to_proc();
+
+        let proc_self_task = caps
+            .fs_capabilities()
+            .iter()
+            .find(|c| c.original == Path::new("/proc/self/task"))
+            .expect("/proc/self/task capability must survive widening");
+        assert_eq!(
+            proc_self_task.resolved,
+            PathBuf::from("/proc"),
+            "/proc/self/task ReadWrite must widen to /proc so grandchild CUDA \
+             init can write task/<tid>/comm (issue #924)"
+        );
+        assert_eq!(
+            proc_self_task.access,
+            AccessMode::ReadWrite,
+            "widening must preserve the original ReadWrite access mode"
+        );
+    }
+
+    /// The combined widening + dedup case: both the `/proc/self` Read rule
+    /// and the `/proc/self/task` ReadWrite rule rewrite to `/proc`. After
+    /// dedup, a single `/proc` ReadWrite rule should remain (Linux dedup
+    /// keys on `resolved` and merges complementary access modes).
+    #[test]
+    fn widen_procfs_self_to_proc_merges_after_dedup_on_linux() {
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(FsCapability {
+            original: PathBuf::from("/proc/self"),
+            resolved: PathBuf::from("/proc/4242"),
+            access: AccessMode::Read,
+            is_file: false,
+            source: CapabilitySource::Group("system_read_linux".to_string()),
+        });
+        caps.add_fs(FsCapability {
+            original: PathBuf::from("/proc/self/task"),
+            resolved: PathBuf::from("/proc/4242/task"),
+            access: AccessMode::ReadWrite,
+            is_file: false,
+            source: CapabilitySource::Group("nvidia_gpu_procfs".to_string()),
+        });
+
+        caps.widen_procfs_self_to_proc();
+
+        // Both originals must still appear so output and audit code stay
+        // accurate; dedup behaviour itself is platform-specific and tested
+        // elsewhere — here we only assert that no /proc/self/task ReadWrite
+        // rule remains pinned to a stale PID.
+        for cap in caps.fs_capabilities() {
+            let original_str = cap.original.to_str().unwrap_or("");
+            if matches!(
+                original_str,
+                "/proc/self" | "/proc/self/" | "/proc/self/task" | "/proc/self/task/"
+            ) {
+                assert_eq!(
+                    cap.resolved,
+                    PathBuf::from("/proc"),
+                    "{original_str} must widen to /proc after widen_procfs_self_to_proc()"
+                );
+            }
+        }
+    }
+
+    /// Defence-in-depth: widening must NOT touch `/proc/self/fd` (or other
+    /// `/proc/self/<sub>` paths that are not `task`). Those capabilities
+    /// have legitimate per-PID inode bindings and must keep their direct
+    /// child resolution.
+    #[test]
+    fn widen_procfs_self_to_proc_leaves_proc_self_fd_alone() {
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(FsCapability {
+            original: PathBuf::from("/proc/self/fd"),
+            resolved: PathBuf::from("/proc/4242/fd"),
+            access: AccessMode::ReadWrite,
+            is_file: false,
+            source: CapabilitySource::Group("system_read_linux".to_string()),
+        });
+
+        caps.widen_procfs_self_to_proc();
+
+        let proc_self_fd = caps
+            .fs_capabilities()
+            .iter()
+            .find(|c| c.original == Path::new("/proc/self/fd"))
+            .expect("/proc/self/fd capability must survive widening");
+        assert_eq!(
+            proc_self_fd.resolved,
+            PathBuf::from("/proc/4242/fd"),
+            "/proc/self/fd must NOT be widened — it is per-PID by design"
         );
     }
 }

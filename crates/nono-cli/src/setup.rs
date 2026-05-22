@@ -838,15 +838,20 @@ impl SetupRunner {
         );
 
         // ONE-SHOT tokio runtime — the rest of `nono setup` is sync.
-        // TrustedRoot::production() runs full TUF verification (signature
-        // threshold 3, root-of-trust pinned in sigstore-rs) before returning.
-        // The bytes we persist are post-verification per T-32-02-01.
+        // Phase 50: tough::RepositoryLoader::load, Repository::read_target,
+        // and IntoVec::into_vec are ALL async (tough-0.22.0/src/lib.rs:206,
+        // :458; transport.rs:21-36). The runtime is PRESERVED; the only
+        // change is the rt.block_on() argument. Signature threshold + TUF
+        // chain walk now happens inside crate::trust_refresh, which uses
+        // a ureq + platform-verifier transport that consults the OS root
+        // store (fixes corp-network failure documented in
+        // .planning/debug/resolved/sigstore-tuf-fetch-transport.md).
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|e| NonoError::Setup(format!("tokio runtime: {e}")))?;
         let trusted_root = rt
-            .block_on(nono::trust::TrustedRoot::production())
+            .block_on(crate::trust_refresh::refresh_production_trusted_root())
             .map_err(|e| {
                 NonoError::Setup(format!(
                     "Failed to fetch Sigstore trusted root from \

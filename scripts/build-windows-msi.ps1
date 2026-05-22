@@ -21,6 +21,19 @@ param(
 
     [string]$ServiceBinaryPath = "",
 
+    # Quick task 260522-c9c: -DriverBinaryPath ships the pre-signed WFP kernel
+    # driver (nono-wfp-driver.sys) as a flat data file in the machine-scope MSI.
+    # The driver source MUST be the checked-in pre-signed copy under
+    # `crates/nono-cli/data/windows/nono-wfp-driver.sys` (NOT a dev-build
+    # artifact under target/) so the shipped MSI carries the WHQL-signed driver.
+    # User scope MUST omit this parameter — a kernel driver cannot load from
+    # per-user LocalAppData; the script throws fail-closed if user scope
+    # receives this flag. Machine scope requires this flag whenever
+    # -ServiceBinaryPath is supplied (and vice-versa): a half-installed WFP
+    # backend is worse than none — the runtime probe already fail-closes with a
+    # directive message when BOTH binaries are absent.
+    [string]$DriverBinaryPath = "",
+
     [switch]$EmitOnly
 )
 
@@ -144,6 +157,38 @@ if ($ServiceBinaryPath -ne "") {
     $serviceBinaryFullPath = (Resolve-Path -LiteralPath $ServiceBinaryPath).Path
 }
 
+# Quick task 260522-c9c: resolve the pre-signed WFP kernel driver path.
+# Fail-closed if the caller passes a non-empty path that does not exist on
+# disk (CLAUDE.md "Fail Secure": never silently degrade).
+$driverBinaryFullPath = ""
+if ($DriverBinaryPath -ne "") {
+    if (-not (Test-Path -LiteralPath $DriverBinaryPath)) {
+        throw "Driver binary not found at '$DriverBinaryPath'."
+    }
+    $driverBinaryFullPath = (Resolve-Path -LiteralPath $DriverBinaryPath).Path
+}
+
+# Quick task 260522-c9c: scope-coherence guards for the WFP backend.
+#   - Service + driver are machine-scope only. The driver is a kernel-mode
+#     component and the service runs under LocalSystem; neither can run from
+#     per-user LocalAppData. Refuse user-scope invocations that try to ship
+#     them so a misconfigured CI cannot silently produce a broken user MSI.
+#   - If machine-scope and a service path is provided, the driver path MUST
+#     also be provided (and vice-versa). A half-installed WFP backend is worse
+#     than none — the runtime probe (exec_strategy_windows::network) already
+#     emits a clear directive message when BOTH binaries are absent at
+#     INSTALLFOLDER, but cannot recover from a partial install.
+if ($Scope -eq "user" -and ($serviceBinaryFullPath -ne "" -or $driverBinaryFullPath -ne "")) {
+    throw "WFP service/driver binaries are machine-scope only. Drop -ServiceBinaryPath/-DriverBinaryPath when -Scope user."
+}
+if ($Scope -eq "machine") {
+    $hasService = $serviceBinaryFullPath -ne ""
+    $hasDriver  = $driverBinaryFullPath -ne ""
+    if ($hasService -xor $hasDriver) {
+        throw "Machine-scope MSI requires both -ServiceBinaryPath and -DriverBinaryPath, or neither (got service='$serviceBinaryFullPath', driver='$driverBinaryFullPath')."
+    }
+}
+
 $readmePath = Join-Path $repoRoot "README.md"
 $licensePath = Join-Path $repoRoot "LICENSE"
 
@@ -174,6 +219,7 @@ $msiPath = Join-Path $outputFullPath $packageName
 #                       During upgrade, the new version's install re-creates the entry.
 #   Wait="yes"        - Each SCM operation is synchronous; MSI sequence waits for completion.
 $serviceComponentXml = ""
+$driverComponentXml = ""
 $eventLogComponentXml = ""
 if ($Scope -eq "machine" -and $serviceBinaryFullPath -ne "") {
     $serviceComponentXml = @"
@@ -219,6 +265,28 @@ if ($Scope -eq "machine" -and $serviceBinaryFullPath -ne "") {
               Type="integer"
               Value="7" />
         </RegistryKey>
+      </Component>
+"@
+
+    # Quick task 260522-c9c: ship the pre-signed WFP kernel driver as a flat
+    # data file alongside nono-wfp-service.exe. The runtime probe
+    # (exec_strategy_windows::network::probe_wfp_runtime) checks for the
+    # presence of nono-wfp-driver.sys at INSTALLFOLDER\nono-wfp-driver.sys as a
+    # sibling of nono.exe before attempting driver activation.
+    #
+    # We deliberately do NOT emit a <ServiceInstall> entry for the driver here:
+    # kernel driver registration uses sc.exe / CreateService with the
+    # SERVICE_KERNEL_DRIVER service type, which WiX's <ServiceInstall> cannot
+    # represent (it only models user-mode services). The CLI command
+    # `nono setup --install-wfp-driver` performs the kernel driver registration
+    # post-install; the MSI's responsibility here is solely to land the .sys
+    # file at a well-known sibling path so that command can find it.
+    if ($driverBinaryFullPath -eq "") {
+        throw "Internal error: machine scope reached driver-component emission with empty driver path. Scope coherence guard above is broken."
+    }
+    $driverComponentXml = @"
+      <Component Id="cmpWfpDriverSys" Guid="*">
+        <File Id="filWfpDriverSys" Source="$driverBinaryFullPath" Name="nono-wfp-driver.sys" KeyPath="yes" />
       </Component>
 "@
 }
@@ -291,7 +359,7 @@ $($scopeInfo.DirectoryXml)
             System="$($scopeInfo.SystemPath)"
             Value="[INSTALLFOLDER]" />
       </Component>
-$($serviceComponentXml)$($eventLogComponentXml)    </ComponentGroup>
+$($serviceComponentXml)$($driverComponentXml)$($eventLogComponentXml)    </ComponentGroup>
   </Fragment>
 </Wix>
 "@

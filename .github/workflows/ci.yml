@@ -340,10 +340,22 @@ jobs:
       - name: Validate Windows MSI contract
         shell: pwsh
         run: |
+          # Quick task 260522-c9c: thread the pre-signed WFP driver path so the
+          # validator exercises the new cmpWfpDriverSys component and the
+          # scope-coherence guard inside build-windows-msi.ps1. The driver
+          # source is the checked-in pre-signed copy under
+          # crates/nono-cli/data/windows/ (NOT the dev build artifact under
+          # target/) so CI verifies the release MSI's actual driver layout.
+          $driver = ".\crates\nono-cli\data\windows\nono-wfp-driver.sys"
+          if (-not (Test-Path $driver)) {
+            Write-Error "Missing checked-in WFP driver binary: $driver"
+            exit 1
+          }
           .\scripts\validate-windows-msi-contract.ps1 `
             -BinaryPath .\target\release\nono.exe `
             -BrokerPath .\target\release\nono-shell-broker.exe `
-            -ServiceBinaryPath .\target\release\nono-wfp-service.exe
+            -ServiceBinaryPath .\target\release\nono-wfp-service.exe `
+            -DriverBinaryPath $driver
 
   fmt:
     name: Rustfmt

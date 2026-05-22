@@ -8,7 +8,14 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$BrokerPath,
 
-    [string]$ServiceBinaryPath = ""
+    [string]$ServiceBinaryPath = "",
+
+    # Quick task 260522-c9c: -DriverBinaryPath threads the pre-signed WFP
+    # kernel driver path through to build-windows-msi.ps1. CI must pass this
+    # whenever it also passes -ServiceBinaryPath: build-windows-msi.ps1's
+    # scope-coherence guard throws if machine scope gets one without the
+    # other.
+    [string]$DriverBinaryPath = ""
 )
 
 Set-StrictMode -Version Latest
@@ -25,7 +32,13 @@ function Get-WixDocumentForScope {
         [Parameter(Mandatory = $true)]
         [string]$BrokerBinary,
 
-        [string]$ServiceBinary = ""
+        [string]$ServiceBinary = "",
+
+        # Quick task 260522-c9c: pre-signed WFP driver path threaded through to
+        # build-windows-msi.ps1 -DriverBinaryPath. Machine scope MUST receive
+        # this whenever it also receives ServiceBinary; build-windows-msi.ps1
+        # enforces this and the caller below maps the parameter accordingly.
+        [string]$DriverBinary = ""
     )
 
     $repoRoot = Split-Path -Parent $PSScriptRoot
@@ -47,6 +60,9 @@ function Get-WixDocumentForScope {
         }
         if ($ServiceBinary -ne "") {
             $buildArgs["ServiceBinaryPath"] = $ServiceBinary
+        }
+        if ($DriverBinary -ne "") {
+            $buildArgs["DriverBinaryPath"] = $DriverBinary
         }
         & (Join-Path $PSScriptRoot "build-windows-msi.ps1") @buildArgs
 
@@ -127,7 +143,17 @@ if ($ServiceBinaryPath -ne "") {
     $serviceBinaryFullPath = (Resolve-Path -LiteralPath $ServiceBinaryPath).Path
 }
 
-$machineDoc = Get-WixDocumentForScope -Scope "machine" -Binary $binaryFullPath -BrokerBinary $brokerFullPath -ServiceBinary $serviceBinaryFullPath
+# Quick task 260522-c9c: resolve the checked-in pre-signed WFP driver path.
+# Same fail-closed pattern as the service binary above.
+$driverBinaryFullPath = ""
+if ($DriverBinaryPath -ne "") {
+    if (-not (Test-Path -LiteralPath $DriverBinaryPath)) {
+        throw "Driver binary not found at '$DriverBinaryPath'."
+    }
+    $driverBinaryFullPath = (Resolve-Path -LiteralPath $DriverBinaryPath).Path
+}
+
+$machineDoc = Get-WixDocumentForScope -Scope "machine" -Binary $binaryFullPath -BrokerBinary $brokerFullPath -ServiceBinary $serviceBinaryFullPath -DriverBinary $driverBinaryFullPath
 $userDoc = Get-WixDocumentForScope -Scope "user" -Binary $binaryFullPath -BrokerBinary $brokerFullPath
 
 $machinePackage = Get-FirstNodeByLocalName -Document $machineDoc -LocalName "Package"
@@ -235,6 +261,35 @@ if ($serviceBinaryFullPath -ne "") {
     }
     Assert-True -Condition ($null -eq $userEventLogKey) `
         -Message "User MSI must not register any EventLog registry keys"
+}
+
+# Quick task 260522-c9c: WFP kernel driver component assertions (machine MSI only).
+# The driver is a flat data file (no <ServiceInstall>) at INSTALLFOLDER\nono-wfp-driver.sys.
+# Without it, the runtime probe in exec_strategy_windows::network fails with
+# BackendDriverBinaryMissing before any sandbox can be applied.
+if ($driverBinaryFullPath -ne "") {
+    # Machine MSI must have a Component with Id=cmpWfpDriverSys whose <File>
+    # child has Name="nono-wfp-driver.sys" (the sibling-of-nono.exe name the
+    # runtime probe checks for).
+    $machineDriverFiles = $machineDoc.SelectNodes("//*[local-name()='File' and @Name='nono-wfp-driver.sys']")
+    Assert-True -Condition ($null -ne $machineDriverFiles -and $machineDriverFiles.Count -ge 1) `
+        -Message "Machine MSI must contain a <File Name='nono-wfp-driver.sys' /> element"
+
+    # The driver MUST NOT receive a <ServiceInstall> — WiX's element only models
+    # user-mode services and cannot represent SERVICE_KERNEL_DRIVER. The CLI
+    # command `nono setup install-wfp-driver` performs the kernel registration
+    # post-install instead.
+    $machineComponents = $machineDoc.SelectNodes("//*[local-name()='Component' and @Id='cmpWfpDriverSys']")
+    Assert-True -Condition ($null -ne $machineComponents -and $machineComponents.Count -ge 1) `
+        -Message "Machine MSI must contain a Component with Id='cmpWfpDriverSys'"
+    $driverServiceInstalls = $machineComponents[0].SelectNodes("*[local-name()='ServiceInstall']")
+    Assert-True -Condition ($null -eq $driverServiceInstalls -or $driverServiceInstalls.Count -eq 0) `
+        -Message "cmpWfpDriverSys must not contain ServiceInstall (kernel driver registration is post-install via the CLI)"
+
+    # User MSI must not carry the driver component.
+    $userDriverFiles = $userDoc.SelectNodes("//*[local-name()='File' and @Name='nono-wfp-driver.sys']")
+    Assert-True -Condition ($null -eq $userDriverFiles -or $userDriverFiles.Count -eq 0) `
+        -Message "User MSI must not contain nono-wfp-driver.sys file element"
 }
 
 Write-Host "Validated Windows MSI contract for machine and user scopes."

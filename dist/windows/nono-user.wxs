@@ -34,6 +34,15 @@
 
   <Fragment>
     <ComponentGroup Id="ProductComponents" Directory="INSTALLFOLDER">
+      <!-- Quick task 260522-c9c: user-scope MSI deliberately ships ONLY nono.exe,
+           the shell broker, README, LICENSE, and the PATH/registry entry. The
+           nono-wfp-service Windows service must run under LocalSystem and the
+           nono-wfp-driver.sys kernel driver cannot load from per-user
+           LocalAppData; both are machine-scope only. Users who need network
+           filtering must install the machine-scope MSI. The runtime probe
+           (exec_strategy_windows::network::probe_wfp_runtime) already fails
+           closed with a directive message when the backend binaries are
+           absent — DO NOT add cmpWfpServiceExe / cmpWfpDriverSys here. -->
       <Component Id="cmpNonoExe" Guid="*">
         <File Id="filNonoExe" Source="C:\Users\OMack\Nono\target\x86_64-pc-windows-msvc\release\nono.exe" KeyPath="yes" />
       </Component>

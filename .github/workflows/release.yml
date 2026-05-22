@@ -148,6 +148,15 @@ jobs:
         run: |
           $binary = Join-Path $PWD "target\\${{ matrix.target }}\\release\\${{ matrix.artifact }}"
           $broker = Join-Path $PWD "target\\${{ matrix.target }}\\release\\nono-shell-broker.exe"
+          # Quick task 260522-c9c: machine-scope MSI must bundle BOTH the WFP
+          # backend service and the pre-signed kernel driver. The driver source
+          # is the checked-in pre-signed copy under crates/nono-cli/data/windows/
+          # (NOT the dev build artifact under target/) so released MSIs always
+          # ship the WHQL-signed driver. User-scope invocation below MUST NOT
+          # pass either flag — build-windows-msi.ps1 throws fail-closed on that
+          # combination.
+          $service = Join-Path $PWD "target\\${{ matrix.target }}\\release\\nono-wfp-service.exe"
+          $driver  = Join-Path $PWD "crates\\nono-cli\\data\\windows\\nono-wfp-driver.sys"
           if (-not (Test-Path $binary)) {
             Write-Error "Missing release binary: $binary"
             exit 1
@@ -156,10 +165,20 @@ jobs:
             Write-Error "Missing broker binary: $broker"
             exit 1
           }
+          if (-not (Test-Path $service)) {
+            Write-Error "Missing WFP service binary: $service"
+            exit 1
+          }
+          if (-not (Test-Path $driver)) {
+            Write-Error "Missing WFP driver binary (checked-in pre-signed copy): $driver"
+            exit 1
+          }
           .\scripts\build-windows-msi.ps1 `
             -VersionTag "${{ env.RELEASE_TAG }}" `
             -BinaryPath $binary `
             -BrokerPath $broker `
+            -ServiceBinaryPath $service `
+            -DriverBinaryPath $driver `
             -Scope machine `
             -OutputDir artifact_staging
           .\scripts\build-windows-msi.ps1 `

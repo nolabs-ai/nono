@@ -454,12 +454,19 @@ fn validate_credential_key(context_name: &str, key: &str) -> Result<()> {
                 context_name, e
             ))
         })
+    } else if nono::keystore::is_cmd_uri(key) {
+        nono::keystore::validate_cmd_uri(key).map_err(|e| {
+            NonoError::ProfileParse(format!(
+                "invalid cmd:// URI for custom credential '{}': {}",
+                context_name, e
+            ))
+        })
     } else {
         // Validate as keyring account name (alphanumeric + underscore)
         if !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
             return Err(NonoError::ProfileParse(format!(
                 "credential_key '{}' for custom credential '{}' must contain only \
-                 alphanumeric characters and underscores (or use op:// / apple-password:// / file:// / env:// URI)",
+                 alphanumeric characters and underscores (or use op:// / apple-password:// / file:// / env:// / cmd:// URI)",
                 key, context_name
             )));
         }

@@ -572,6 +572,31 @@ pub fn is_file_uri(credential_ref: &str) -> bool {
     credential_ref.starts_with(FILE_URI_PREFIX)
 }
 
+/// Check if a credential reference uses the `cmd://` scheme.
+#[must_use]
+pub fn is_cmd_uri(credential_ref: &str) -> bool {
+    credential_ref.starts_with(CMD_URI_PREFIX)
+}
+
+/// Validate a `cmd://<name>` URI.
+///
+/// The name portion must be non-empty and contain only ASCII alphanumeric
+/// characters and underscores (`[A-Za-z0-9_]+`).
+pub fn validate_cmd_uri(uri: &str) -> Result<()> {
+    let name = uri.strip_prefix(CMD_URI_PREFIX).unwrap_or("");
+    if name.is_empty() {
+        return Err(NonoError::ConfigParse(
+            "cmd:// URI must include a credential name (e.g., cmd://github)".to_string(),
+        ));
+    }
+    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return Err(NonoError::ConfigParse(format!(
+            "cmd:// credential name '{name}' must contain only alphanumeric characters and underscores"
+        )));
+    }
+    Ok(())
+}
+
 /// Validate an `env://VAR_NAME` URI.
 ///
 /// Accepts variable names containing only ASCII alphanumeric characters and

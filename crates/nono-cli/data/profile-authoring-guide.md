@@ -146,7 +146,7 @@ Define a custom reverse proxy credential route for services not in `network-poli
 | Field               | Type            | Required    | Description |
 |---------------------|-----------------|-------------|-------------|
 | `upstream`          | string          | yes         | Upstream URL. Must be HTTPS (HTTP only for loopback). |
-| `credential_key`    | string          | yes         | Keystore account name, `op://` URI, `apple-password://` URI, `file://` URI, or `env://` URI. |
+| `credential_key`    | string          | yes         | Keystore account name, `op://` URI, `apple-password://` URI, `file://` URI, `env://` URI, or `cmd://` URI (references `credential_capture` entry). |
 | `inject_mode`       | string          | no          | One of: `"header"` (default), `"url_path"`, `"query_param"`, `"basic_auth"`. |
 | `inject_header`     | string          | header mode | HTTP header name. Default: `"Authorization"`. |
 | `credential_format` | string          | header mode | Format string with `{}` placeholder. Default: `"Bearer {}"`. |
@@ -154,13 +154,74 @@ Define a custom reverse proxy credential route for services not in `network-poli
 | `path_replacement`  | string          | url_path    | Replacement pattern. Defaults to `path_pattern`. |
 | `query_param_name`  | string          | query_param | Query parameter name for credential injection. |
 | `proxy`             | object          | no          | Optional proxy-side overrides for phantom token parsing. Omitted fields inherit from top-level values. |
-| `env_var`           | string          | URI keys    | Environment variable name for SDK API key. Required when `credential_key` is `op://`, `apple-password://`, or `file://`. Optional for `env://`. |
+| `env_var`           | string          | URI keys    | Environment variable name for SDK API key. Required when `credential_key` is `op://`, `apple-password://`, `file://`, or `cmd://`. Optional for `env://`. |
 | `endpoint_rules`    | array           | no          | L7 allow-list of `{"method": "GET", "path": "/**"}` rules. When non-empty, only matching requests are forwarded (default-deny). |
 | `tls_ca`            | string (path)   | no          | Path to a PEM-encoded CA certificate. Use for upstreams with self-signed or private CA certs (e.g. a Kubernetes API server). |
 | `tls_client_cert`   | string (path)   | no          | Path to a PEM-encoded client certificate for mutual TLS (mTLS). Must be set together with `tls_client_key`. |
 | `tls_client_key`    | string (path)   | no          | Path to the PEM-encoded private key matching `tls_client_cert`. |
 
 `proxy` overrides apply only to how the local proxy validates incoming phantom tokens from the sandboxed process. Outbound upstream credential injection continues to use top-level fields.
+
+### credential_capture
+
+Defines host-side CLI commands that produce credentials on stdout. Used with `cmd://` credential keys in `custom_credentials`. The supervisor runs these commands outside the sandbox and injects the result through the proxy — the sandboxed process never sees the command or its output.
+
+```json
+{
+  "credential_capture": {
+    "github": {
+      "command": ["gh", "auth", "token"],
+      "timeout_secs": 5,
+      "ttl_secs": 900
+    },
+    "gcloud": {
+      "command": ["gcloud", "auth", "print-access-token"],
+      "timeout_secs": 10,
+      "ttl_secs": 3600
+    }
+  }
+}
+```
+
+| Field          | Type            | Required | Default | Description |
+|----------------|-----------------|----------|---------|-------------|
+| `command`      | array of string | yes      | —       | Command and arguments. First element is resolved to an absolute path via PATH at profile-load time. No shell interpolation. |
+| `timeout_secs` | integer        | no       | `5`     | Maximum seconds to wait for the command (range: 1–300). |
+| `ttl_secs`     | integer        | no       | `900`   | How long to cache the result in seconds (range: 0–3600, 0 = no cache). |
+
+To use a capture command as a credential source, reference it with `cmd://<name>` in a `custom_credentials` entry's `credential_key`:
+
+```json
+{
+  "network": {
+    "custom_credentials": {
+      "github": {
+        "upstream": "https://api.github.com",
+        "credential_key": "cmd://github",
+        "env_var": "GITHUB_TOKEN",
+        "inject_header": "Authorization",
+        "credential_format": "token {}"
+      }
+    },
+    "credentials": ["github"]
+  },
+  "credential_capture": {
+    "github": {
+      "command": ["gh", "auth", "token"]
+    }
+  }
+}
+```
+
+Security properties:
+- Commands are allow-listed in the profile. The sandboxed process names a logical credential, not a command.
+- The first element of `command` is resolved to an absolute path at profile-load time. No PATH lookup happens at capture time.
+- No shell interpretation. Arguments are passed directly via execve-style invocation — no metacharacters, no variable expansion.
+- Stderr from the command is never returned to the proxy or child. It is logged (scrubbed) for debugging only.
+- All credential values use `Zeroizing<String>` and are cleared from memory after use or on session exit.
+- Credentials are fetched lazily on first proxy request and cached for `ttl_secs`, reducing the window during which secrets live in memory.
+
+Inheritance: child `credential_capture` entries are merged into base; child keys override matching base keys.
 
 ### env_credentials (alias: secrets)
 
@@ -459,6 +520,90 @@ Remove an inherited deny group that is too restrictive for your use case:
 }
 ```
 
+### Agent with CLI-based credentials (cmd://)
+
+Route credentials from a host CLI tool through the proxy without the sandbox ever seeing the command or its output:
+
+```json
+{
+  "extends": "default",
+  "meta": {
+    "name": "gh-agent",
+    "description": "Agent with GitHub access via gh CLI token"
+  },
+  "workdir": {
+    "access": "readwrite"
+  },
+  "network": {
+    "network_profile": "standard",
+    "credentials": ["github"],
+    "custom_credentials": {
+      "github": {
+        "upstream": "https://api.github.com",
+        "credential_key": "cmd://github",
+        "env_var": "GITHUB_TOKEN",
+        "inject_header": "Authorization",
+        "credential_format": "token {}"
+      }
+    }
+  },
+  "credential_capture": {
+    "github": {
+      "command": ["gh", "auth", "token"],
+      "timeout_secs": 5,
+      "ttl_secs": 900
+    }
+  }
+}
+```
+
+### Agent with multiple CLI-based credentials
+
+```json
+{
+  "extends": "default",
+  "meta": {
+    "name": "cloud-agent",
+    "description": "Agent with GitHub and GCP access via CLI tools"
+  },
+  "workdir": {
+    "access": "readwrite"
+  },
+  "network": {
+    "network_profile": "standard",
+    "credentials": ["github", "gcp"],
+    "custom_credentials": {
+      "github": {
+        "upstream": "https://api.github.com",
+        "credential_key": "cmd://github",
+        "env_var": "GITHUB_TOKEN",
+        "inject_header": "Authorization",
+        "credential_format": "token {}"
+      },
+      "gcp": {
+        "upstream": "https://oauth2.googleapis.com",
+        "credential_key": "cmd://gcloud",
+        "env_var": "GCP_TOKEN",
+        "inject_header": "Authorization",
+        "credential_format": "Bearer {}"
+      }
+    }
+  },
+  "credential_capture": {
+    "github": {
+      "command": ["gh", "auth", "token"],
+      "timeout_secs": 5,
+      "ttl_secs": 900
+    },
+    "gcloud": {
+      "command": ["gcloud", "auth", "print-access-token"],
+      "timeout_secs": 10,
+      "ttl_secs": 3600
+    }
+  }
+}
+```
+
 ### Profile with custom credential routing
 
 ```json
@@ -553,6 +698,8 @@ Supported predicate forms include `linux`, `macos`, `linux:fedora`, `linux:rhel-
 - Prefer `when` predicates for package-specific platform differences. Put shared OS baseline paths in built-in policy groups instead.
 - `network.block: true` blocks all network access. It cannot be combined with proxy settings.
 - `custom_credentials` upstream URLs must use HTTPS. HTTP is only accepted for loopback addresses (localhost, 127.0.0.1, ::1).
+- `credential_capture` commands are resolved to absolute paths at profile-load time. If the command is not found in PATH, profile loading fails. No shell interpretation is performed on arguments.
+- A `cmd://` credential key in `custom_credentials` must have a corresponding entry in `credential_capture` with the same name. Missing entries are a validation error.
 
 ## 9. Migration from previous schema
 

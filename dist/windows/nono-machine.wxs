@@ -4,15 +4,15 @@
       Name="nono"
       Manufacturer="Luke Hinds"
       Version="0.53.0"
-      UpgradeCode="5451E72C-E0C4-4BF8-B9EA-0D6A22AA80E4"
-      Scope="perUser">
+      UpgradeCode="D5948D55-89A4-4F09-AB43-44DBA9D25D1A"
+      Scope="perMachine">
     <SummaryInformation
-        Description="nono Windows native installer (end-user install)"
+        Description="nono Windows native installer (administrative install)"
         Manufacturer="Luke Hinds" />
     <MajorUpgrade
         DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
     <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
-    <Property Id="ARPCOMMENTS" Value="nono Windows native installer (end-user install)" />
+    <Property Id="ARPCOMMENTS" Value="nono Windows native installer (administrative install)" />
     <Property Id="ARPCONTACT" Value="Luke Hinds" />
     <Property Id="ARPURLHELP" Value="https://docs.nono.sh/cli/getting_started/installation" />
     <Property Id="ARPURLINFOABOUT" Value="https://github.com/always-further/nono" />
@@ -25,10 +25,8 @@
   </Package>
 
   <Fragment>
-    <StandardDirectory Id="LocalAppDataFolder">
-      <Directory Id="USERPROGRAMS" Name="Programs">
-        <Directory Id="INSTALLFOLDER" Name="nono" />
-      </Directory>
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="nono" />
     </StandardDirectory>
   </Fragment>
 
@@ -54,8 +52,8 @@
       </Component>
       <Component Id="cmpPath" Guid="*">
         <RegistryValue
-            Root="HKCU"
-            Key="Software\always-further\nono\user"
+            Root="HKLM"
+            Key="Software\always-further\nono\machine"
             Name="InstallDir"
             Type="string"
             Value="[INSTALLFOLDER]"
@@ -66,7 +64,7 @@
             Action="set"
             Part="last"
             Permanent="no"
-            System="no"
+            System="yes"
             Value="[INSTALLFOLDER]" />
       </Component>
     </ComponentGroup>

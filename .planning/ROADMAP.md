@@ -13,8 +13,8 @@ granularity: standard
 
 Plans:
 **Wave 1**
-- [ ] 50-01-PLAN.md — Wave 0 skeleton: promote tough to direct dep, declare trust_refresh module, create skeleton (SPEC-50-REQ-1 partial)
-- [ ] 50-02-PLAN.md — Wave 1 production code: UreqTransport + tough RepositoryLoader chain-walk (SPEC-50-REQ-1, 2, 3, 4)
+- [x] 50-01-PLAN.md — Wave 0 skeleton: promote tough to direct dep, declare trust_refresh module, create skeleton (SPEC-50-REQ-1 partial)
+- [x] 50-02-PLAN.md — Wave 1 production code: UreqTransport + tough RepositoryLoader chain-walk (SPEC-50-REQ-1, 2, 3, 4)
 
 **Wave 2** *(blocked on Wave 1 completion)*
 - [ ] 50-03-PLAN.md — Wave 2 call-site swap in setup.rs preserving tokio runtime + cache contract (SPEC-50-REQ-1, 4)

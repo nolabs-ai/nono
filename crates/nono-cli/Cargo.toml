@@ -68,7 +68,10 @@ keyring = { version = "3", optional = true }
 sigstore-sign = "0.7.0"
 # YAML-merge directive support (Plan 36-02; upstream-aligned at v0.10.0 per 242d4917)
 serde_yaml_ng = "=0.10.0"
-tokio = { version = "1", features = ["rt", "net", "io-util"] }
+# Phase 50 Plan 04 (Task 3): added `macros` feature so `#[tokio::test]`
+# is available to the colocated tests in src/trust_refresh.rs. Other
+# features unchanged.
+tokio = { version = "1", features = ["rt", "net", "io-util", "macros"] }
 
 # Phase 50 D-50-05: promoted from transitive (via sigstore-trust-root 0.7.0 ->
 # tough 0.22.0 in Cargo.lock) to direct dep so we can call

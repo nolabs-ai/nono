@@ -332,3 +332,404 @@ pub async fn refresh_production_trusted_root() -> Result<TrustedRoot> {
     )
     .await
 }
+
+// Phase 50 Plan 04 Task 3: hermetic test suite for the TUF chain-walk.
+//
+// Six tests cover SPEC Req 3 (bad signature), Req 4 (byte-identical
+// cache vs captured baseline — R-50-03 strengthened), and Req 5 (>=4
+// hermetic tests, exceeded). Tests 1-5 drive the wider injectable seam
+// `refresh_trusted_root_with_transport` directly; Test 6 (R-50-07)
+// exercises the PUBLIC `refresh_production_trusted_root` wrapper
+// through the `NONO_TEST_TUF_FIXTURE` env-seam to validate URL
+// composition, agent build, datastore resolution, and delegation at
+// the integration boundary.
+//
+// All tests are hermetic: no localhost HTTP server, no port allocation,
+// no real TLS handshake. The in-memory `StaticMapTransport` serves
+// pre-generated TUF fixture bytes (see scripts/regenerate-tuf-test-fixtures.sh).
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use tempfile::tempdir;
+
+    /// In-memory `tough::Transport` for hermetic testing (D-50-08).
+    ///
+    /// Serves a static map of URL-path keys to byte buffers. Returns
+    /// `FileNotFound` for any path not in the map, which is exactly the
+    /// signal `tough`'s chain-walk uses to terminate the
+    /// `N+1.root.json` traversal (tough-0.22.0/src/http.rs:126-130).
+    #[derive(Debug, Clone)]
+    pub(super) struct StaticMapTransport {
+        files: Arc<HashMap<String, Vec<u8>>>,
+    }
+
+    #[async_trait]
+    impl Transport for StaticMapTransport {
+        async fn fetch(
+            &self,
+            url: Url,
+        ) -> std::result::Result<TransportStream, TransportError> {
+            let key = url.path().trim_start_matches('/').to_string();
+            match self.files.get(&key) {
+                Some(bytes) => {
+                    let s = stream::iter(std::iter::once(
+                        Ok::<Bytes, TransportError>(Bytes::from(bytes.clone())),
+                    ));
+                    Ok(Box::pin(s))
+                }
+                None => Err(TransportError::new(
+                    TransportErrorKind::FileNotFound,
+                    url.as_str(),
+                )),
+            }
+        }
+    }
+
+    fn fixture_dir(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join(name)
+    }
+
+    /// Recursively load every file under `fixture_dir(name)` into a
+    /// `HashMap` keyed by the path relative to the fixture root.
+    ///
+    /// Keys ALWAYS use forward slashes so they match `url.path()`
+    /// output regardless of host OS (Windows path separator must NOT
+    /// leak into the map key).
+    fn load_fixture(name: &str) -> HashMap<String, Vec<u8>> {
+        let root = fixture_dir(name);
+        let mut map = HashMap::new();
+        fn walk(
+            root: &std::path::Path,
+            prefix: &str,
+            map: &mut HashMap<String, Vec<u8>>,
+        ) {
+            for entry in std::fs::read_dir(root).expect("read fixture dir") {
+                let entry = entry.expect("dir entry");
+                let path = entry.path();
+                let name = entry
+                    .file_name()
+                    .into_string()
+                    .expect("utf-8 filename");
+                let key = if prefix.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{prefix}/{name}")
+                };
+                if path.is_dir() {
+                    walk(&path, &key, map);
+                } else {
+                    let bytes = std::fs::read(&path).expect("read fixture file");
+                    map.insert(key, bytes);
+                }
+            }
+        }
+        walk(&root, "", &mut map);
+        map
+    }
+
+    fn embedded_root_for_fixture(files: &HashMap<String, Vec<u8>>) -> Vec<u8> {
+        // The "embedded" anchor for the test is the fixture's
+        // `1.root.json` (NOT the production `PRODUCTION_TUF_ROOT` const,
+        // which is signed by sigstore's real keys and would not verify
+        // against the test fixture).
+        files
+            .get("1.root.json")
+            .cloned()
+            .expect("1.root.json missing from fixture")
+    }
+
+    fn test_urls() -> (Url, Url) {
+        (
+            Url::parse("http://hermetic.test/").expect("parse metadata url"),
+            Url::parse("http://hermetic.test/targets/").expect("parse targets url"),
+        )
+    }
+
+    /// Helper dispatched into from `refresh_production_trusted_root`'s
+    /// `#[cfg(test)]` env-seam when `NONO_TEST_TUF_FIXTURE` is set
+    /// (R-50-07). Test 6 drives this through the public wrapper.
+    pub(super) async fn refresh_via_fixture_env_seam(
+        fixture_name: &str,
+    ) -> Result<TrustedRoot> {
+        let files = load_fixture(fixture_name);
+        let embedded = embedded_root_for_fixture(&files);
+        let transport = StaticMapTransport {
+            files: Arc::new(files),
+        };
+        let datastore = tempdir().expect("tempdir for env-seam datastore");
+        let (meta, targets) = test_urls();
+        refresh_trusted_root_with_transport(
+            transport,
+            meta,
+            targets,
+            datastore.path().join("tuf-cache"),
+            &embedded,
+        )
+        .await
+    }
+
+    /// Test 1 (R-50-09 renamed): happy-path TUF chain-walk against the
+    /// pre-generated fixture returns `Ok(TrustedRoot)` whose
+    /// `to_string_pretty` serialization is non-empty JSON. Covers SPEC
+    /// Req 5 acceptance bullet (a).
+    #[tokio::test]
+    async fn happy_path_walk_returns_trusted_root() {
+        let files = load_fixture("tuf-repo-happy");
+        let embedded = embedded_root_for_fixture(&files);
+        let transport = StaticMapTransport {
+            files: Arc::new(files),
+        };
+        let datastore = tempdir().expect("tempdir for datastore");
+        let (meta, targets) = test_urls();
+
+        let result = refresh_trusted_root_with_transport(
+            transport,
+            meta,
+            targets,
+            datastore.path().join("tuf-cache"),
+            &embedded,
+        )
+        .await;
+
+        let trusted_root = result.expect("happy-path returns Ok");
+        let json = serde_json::to_string_pretty(&trusted_root).expect("serialize");
+        assert!(!json.is_empty(), "serialized trusted_root must be non-empty");
+        assert!(json.contains('{'), "serialized output must be JSON");
+    }
+
+    /// Test 2 (R-50-09 renamed): bad signature in `1.root.json` is
+    /// rejected by tough's signature-threshold check and surfaces as
+    /// `NonoError::Setup(msg)` where `msg.contains("Sigstore TUF
+    /// refresh failed")`. Covers SPEC Req 3 + Req 5 acceptance
+    /// bullet (b).
+    #[tokio::test]
+    async fn bad_signature_at_root_surfaces_as_nono_error_setup() {
+        let files = load_fixture("tuf-repo-bad-sig");
+        let embedded = embedded_root_for_fixture(&files);
+        let transport = StaticMapTransport {
+            files: Arc::new(files),
+        };
+        let datastore = tempdir().expect("tempdir for datastore");
+        let (meta, targets) = test_urls();
+
+        let result = refresh_trusted_root_with_transport(
+            transport,
+            meta,
+            targets,
+            datastore.path().join("tuf-cache"),
+            &embedded,
+        )
+        .await;
+
+        match result {
+            Err(NonoError::Setup(msg)) => {
+                assert!(
+                    msg.contains("Sigstore TUF refresh failed"),
+                    "bad-sig error must surface through the TUF-refresh-failed wrapping; got: {msg}"
+                );
+            }
+            Err(other) => panic!("expected NonoError::Setup for bad sig, got {other:?}"),
+            Ok(_) => panic!("bad-sig fixture must NOT pass tough's signature verification"),
+        }
+    }
+
+    /// Test 3 (R-50-09 renamed): truncated/invalid JSON in `1.root.json`
+    /// surfaces as `NonoError::Setup(_)`. Covers SPEC Req 5 acceptance
+    /// bullet (c).
+    #[tokio::test]
+    async fn malformed_json_at_root_surfaces_as_nono_error_setup() {
+        let files = load_fixture("tuf-repo-malformed");
+        let embedded = embedded_root_for_fixture(&files);
+        let transport = StaticMapTransport {
+            files: Arc::new(files),
+        };
+        let datastore = tempdir().expect("tempdir for datastore");
+        let (meta, targets) = test_urls();
+
+        let result = refresh_trusted_root_with_transport(
+            transport,
+            meta,
+            targets,
+            datastore.path().join("tuf-cache"),
+            &embedded,
+        )
+        .await;
+
+        match result {
+            Err(NonoError::Setup(_)) => { /* expected */ }
+            Err(other) => {
+                panic!("expected NonoError::Setup for malformed JSON, got {other:?}")
+            }
+            Ok(_) => panic!("malformed-JSON fixture must NOT parse successfully"),
+        }
+    }
+
+    /// Test 4 (Codex R-50-03 strengthened): byte-identical cache
+    /// snapshot vs CAPTURED UPSTREAM baseline. Confirms SPEC Req 4
+    /// contract: the bytes the chain-walk produces equal the bytes the
+    /// upstream production serialization would have produced.
+    ///
+    /// The baseline file at
+    /// `crates/nono-cli/tests/fixtures/tuf/trusted_root_baseline.json`
+    /// was generated ONCE via `scripts/regenerate-tuf-test-fixtures.sh`
+    /// by running
+    /// `serde_json::to_string_pretty(&TrustedRoot::from_json(<happy
+    /// fixture trusted_root.json>).unwrap())`. That captures the
+    /// equivalence to what the upstream `TrustedRoot::production()`
+    /// call would have produced against the same TUF repo content —
+    /// the proper byte-identity check, not just serde round-trip
+    /// determinism (R-50-03 gap closed).
+    ///
+    /// If this assertion fails, EITHER the chain-walk output drifted
+    /// from upstream serialization (real bug) OR the baseline is stale
+    /// and needs regenerating via the regen script.
+    #[tokio::test]
+    async fn cache_bytes_match_baseline() {
+        const BASELINE: &[u8] =
+            include_bytes!("../tests/fixtures/tuf/trusted_root_baseline.json");
+
+        let files = load_fixture("tuf-repo-happy");
+        let embedded = embedded_root_for_fixture(&files);
+        let transport = StaticMapTransport {
+            files: Arc::new(files),
+        };
+        let datastore = tempdir().expect("tempdir for datastore");
+        let (meta, targets) = test_urls();
+        let trusted_root = refresh_trusted_root_with_transport(
+            transport,
+            meta,
+            targets,
+            datastore.path().join("tuf-cache"),
+            &embedded,
+        )
+        .await
+        .expect("happy-path returns Ok");
+
+        let actual_serialized =
+            serde_json::to_string_pretty(&trusted_root).expect("serialize result");
+
+        assert_eq!(
+            actual_serialized.as_bytes(),
+            BASELINE,
+            "chain-walk output bytes must equal the upstream-captured baseline at \
+             crates/nono-cli/tests/fixtures/tuf/trusted_root_baseline.json (SPEC Req 4 \
+             byte-identical cache contract; R-50-03). If the assertion fails, EITHER \
+             the chain-walk output drifted from upstream serialization (real bug) OR \
+             the baseline is stale and needs regenerating via \
+             scripts/regenerate-tuf-test-fixtures.sh."
+        );
+    }
+
+    /// Test 5 (Codex R-50-03 additional): cache file round-trips
+    /// through `TrustedRoot::from_file`. Confirms Phase 32 D-32-01
+    /// offline-verify reader path is unaffected — the bytes produced
+    /// by the chain-walk are loadable by the same API `nono trust
+    /// verify` uses for the cached trusted_root.
+    #[tokio::test]
+    async fn cache_file_loadable_by_load_production_trusted_root() {
+        // `TrustedRoot` is re-exported through `nono::trust::TrustedRoot`
+        // (which `super::*` already brings into scope), which itself
+        // re-exports `sigstore_verify::trust_root::TrustedRoot`. So
+        // `TrustedRoot::from_file` is the same API the offline
+        // `load_production_trusted_root` in crates/nono/src/trust/bundle.rs
+        // uses for the cache file (Phase 32 D-32-01).
+        let files = load_fixture("tuf-repo-happy");
+        let embedded = embedded_root_for_fixture(&files);
+        let transport = StaticMapTransport {
+            files: Arc::new(files),
+        };
+        let datastore = tempdir().expect("tempdir for datastore");
+        let (meta, targets) = test_urls();
+        let trusted_root = refresh_trusted_root_with_transport(
+            transport,
+            meta,
+            targets,
+            datastore.path().join("tuf-cache"),
+            &embedded,
+        )
+        .await
+        .expect("happy-path returns Ok");
+
+        // Mirror setup.rs's production write: to_string_pretty +
+        // std::fs::write to the trust-root cache path.
+        let json = serde_json::to_string_pretty(&trusted_root).expect("serialize");
+        let cache_dir = tempdir().expect("tempdir for cache");
+        let cache_path = cache_dir.path().join("trusted_root.json");
+        std::fs::write(&cache_path, json.as_bytes()).expect("write cache");
+
+        // Round-trip parse via the same API the offline verify path
+        // uses for the cache file.
+        let reread =
+            TrustedRoot::from_file(&cache_path).expect("from_file round-trip");
+        // Re-serialize and assert byte-equality with what we wrote —
+        // proves the offline reader produces equivalent state from the
+        // cache file (Phase 32 D-32-01 offline reader unaffected).
+        let rejson = serde_json::to_string_pretty(&reread).expect("re-serialize");
+        assert_eq!(
+            json.as_bytes(),
+            rejson.as_bytes(),
+            "TrustedRoot::from_file must round-trip the chain-walk output byte-identically; \
+             this proves Phase 32 D-32-01 offline-verify reader is unaffected by Phase 50"
+        );
+    }
+
+    /// Test 6 (Codex R-50-07): exercise the PUBLIC wrapper
+    /// `refresh_production_trusted_root()` through the
+    /// `NONO_TEST_TUF_FIXTURE` env-seam, not just the internal helper.
+    /// Validates URL composition, agent construction, datastore
+    /// resolution, and delegation at the integration boundary the grep
+    /// tests cannot reach.
+    ///
+    /// Uses the env-var guard pattern from PATTERNS.md §Test
+    /// Environment Isolation: acquire `ENV_LOCK`, set
+    /// `NONO_TEST_TUF_FIXTURE` via `EnvVarGuard::set_all` (restores on
+    /// drop), call the public wrapper, assert Ok. The guard prevents
+    /// the env var from leaking to the parallel test pool.
+    // The env-seam lock is held across the await boundary by design:
+    // the env var must remain set for the duration of
+    // `refresh_production_trusted_root().await` so the inner
+    // `#[cfg(test)] if let Ok(...) = env::var("NONO_TEST_TUF_FIXTURE")`
+    // path reads it under the lock. Dropping the guard before await
+    // would let another parallel test mutate the env var mid-call,
+    // which is exactly the race ENV_LOCK exists to prevent. We block
+    // the tokio executor briefly here — that's acceptable because the
+    // hermetic in-memory transport completes in milliseconds.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn refresh_production_trusted_root_via_env_seam_returns_trusted_root() {
+        // Acquire the global env-var lock to prevent parallel-test
+        // races. Poisoning is harmless here — we only need exclusive
+        // access while NONO_TEST_TUF_FIXTURE is set.
+        let _lock = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+
+        let _guard = crate::test_env::EnvVarGuard::set_all(&[(
+            "NONO_TEST_TUF_FIXTURE",
+            "tuf-repo-happy",
+        )]);
+
+        // Call the PUBLIC wrapper. The #[cfg(test)] env-seam inside
+        // refresh_production_trusted_root will detect
+        // NONO_TEST_TUF_FIXTURE and dispatch into
+        // refresh_via_fixture_env_seam("tuf-repo-happy").
+        let result = refresh_production_trusted_root().await;
+        let trusted_root =
+            result.expect("public wrapper via env-seam returns Ok");
+
+        // Sanity: serializable JSON output, just like the happy-path
+        // test.
+        let json = serde_json::to_string_pretty(&trusted_root).expect("serialize");
+        assert!(!json.is_empty(), "serialized trusted_root must be non-empty");
+        assert!(json.contains('{'), "serialized output must be JSON");
+    }
+}

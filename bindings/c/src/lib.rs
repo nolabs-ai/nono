@@ -195,7 +195,7 @@ pub(crate) unsafe fn c_str_to_str<'a>(ptr: *const c_char) -> Option<&'a str> {
 /// null-terminated UTF-8 string, or NULL if no error has occurred.
 ///
 /// Caller must free the returned string with `nono_string_free()`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nono_last_error() -> *mut c_char {
     LAST_ERROR.with(|cell| {
         let borrow = cell.borrow();
@@ -215,7 +215,7 @@ pub extern "C" fn nono_last_error() -> *mut c_char {
 }
 
 /// Clear the last error for the current thread.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nono_clear_error() {
     LAST_ERROR.with(|cell| {
         *cell.borrow_mut() = None;
@@ -231,7 +231,7 @@ pub extern "C" fn nono_clear_error() {
 /// # Safety
 ///
 /// `s` must be NULL or a pointer previously returned by a nono FFI function.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn nono_string_free(s: *mut c_char) {
     if !s.is_null() {
         // SAFETY: The pointer was created by CString::into_raw() in this
@@ -246,7 +246,7 @@ pub unsafe extern "C" fn nono_string_free(s: *mut c_char) {
 /// Get the nono library version string.
 ///
 /// Caller must free the returned string with `nono_string_free()`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nono_version() -> *mut c_char {
     rust_string_to_c(env!("CARGO_PKG_VERSION").to_string())
 }

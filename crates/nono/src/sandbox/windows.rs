@@ -3695,6 +3695,262 @@ mod tests {
             system_root.display()
         );
     }
+
+    /// 260522-v14 positive case: a directory created by the current user
+    /// under `%TEMP%` (which inherits the user-profile tree's explicit
+    /// `<user>: FullControl` ACE — that ACE includes WRITE_OWNER /
+    /// 0x00080000) must report WRITE_OWNER present. This is the "happy
+    /// path" the POC docs steer Windows pilot users toward.
+    #[test]
+    fn path_has_write_owner_returns_true_for_userprofile_tempdir() {
+        let dir = tempdir().expect("tempdir");
+        let has_write_owner = path_has_write_owner(dir.path())
+            .expect("DACL read + effective-rights query must succeed for a user-created tempdir");
+        assert!(
+            has_write_owner,
+            "tempdir under %TEMP% must report WRITE_OWNER present for the current user (got false for {})",
+            dir.path().display()
+        );
+    }
+
+    /// 260522-v14 negative case: synthesize the `C:\poc\temp` failure mode
+    /// in a sandboxed location — create a tempdir, then programmatically
+    /// replace its DACL with one that grants the **current user's explicit
+    /// SID** `Modify` only (mask `0x1301BF`, missing the `WRITE_OWNER`
+    /// bit). Assert that `try_set_mandatory_label` bails out at the new
+    /// pre-flight check with the WRITE_OWNER directive hint, BEFORE
+    /// attempting `SetNamedSecurityInfoW(LABEL_SECURITY_INFORMATION)`.
+    ///
+    /// **Why explicit user SID (not `BUILTIN\Administrators` + AU):**
+    /// `GetEffectiveRightsFromAclW` walks the trustee's group memberships
+    /// from the **full** token (not the UAC-filtered token). If the test
+    /// runner is a local admin (typical Windows dev environment), a DACL
+    /// granting `BUILTIN\Administrators: FullControl` would return WRITE_
+    /// OWNER as present for the user trustee — false positive that lets
+    /// the pre-flight pass while the actual label-apply fails under the
+    /// filtered token. Using the explicit current-user SID and Modify-only
+    /// rights bypasses this group-membership false positive entirely.
+    ///
+    /// **Cleanup:** `0x1301BF` includes `DELETE` (0x00010000), so tempfile's
+    /// Drop can still remove the dir. To allow Drop's recursive cleanup
+    /// past the protected DACL we restore inheritance + Authenticated
+    /// Users FullControl at end-of-test (best effort).
+    ///
+    /// The synthesized-DACL approach is preferred over a drive-root
+    /// reproduction because it does NOT depend on the test runner's
+    /// drive-root permissions or default `C:\` ACL state — it builds the
+    /// failure shape from scratch inside a tempdir the test owns.
+    #[test]
+    fn try_set_mandatory_label_surfaces_directive_when_write_owner_missing() {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, LocalFree};
+        use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+        use windows_sys::Win32::Security::{
+            GetSecurityDescriptorDacl, GetTokenInformation, TokenUser, PSID,
+            PROTECTED_DACL_SECURITY_INFORMATION, TOKEN_USER,
+        };
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().to_path_buf();
+
+        // 1. Resolve the current user SID, then format it as an SDDL-style
+        //    string ("S-1-5-21-...") so we can embed it as the ACE trustee.
+        let mut token: HANDLE = std::ptr::null_mut();
+        let ok = unsafe {
+            // SAFETY: GetCurrentProcess() returns a pseudo-handle; `&mut token`
+            // is a valid out-pointer.
+            OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token)
+        };
+        assert_ne!(ok, 0, "test setup: OpenProcessToken must succeed");
+
+        let mut required: u32 = 0;
+        let _ = unsafe {
+            // SAFETY: documented null+0 size-probe pattern.
+            GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut required)
+        };
+        assert!(required > 0, "test setup: TokenUser size probe failed");
+        let mut buffer: Vec<u8> = vec![0u8; required as usize];
+        let ok = unsafe {
+            // SAFETY: `buffer` sized per probe; `&mut required` is a valid out-pointer.
+            GetTokenInformation(
+                token,
+                TokenUser,
+                buffer.as_mut_ptr().cast(),
+                required,
+                &mut required,
+            )
+        };
+        assert_ne!(ok, 0, "test setup: GetTokenInformation(TokenUser) must succeed");
+        let token_user = unsafe {
+            // SAFETY: GetTokenInformation populated `buffer` with TOKEN_USER.
+            &*(buffer.as_ptr() as *const TOKEN_USER)
+        };
+        let user_sid: PSID = token_user.User.Sid;
+        assert!(!user_sid.is_null(), "test setup: TokenUser.Sid must not be null");
+
+        let mut sid_string_ptr: *mut u16 = std::ptr::null_mut();
+        let ok = unsafe {
+            // SAFETY: `user_sid` is a valid SID; out-pointer is valid local storage.
+            // Returned PWSTR must be freed with LocalFree.
+            ConvertSidToStringSidW(user_sid, &mut sid_string_ptr)
+        };
+        assert_ne!(ok, 0, "test setup: ConvertSidToStringSidW must succeed");
+        assert!(!sid_string_ptr.is_null());
+        let user_sid_string: String = unsafe {
+            // SAFETY: `sid_string_ptr` was just populated by Convert...W with a
+            // nul-terminated UTF-16 string.
+            let mut len = 0usize;
+            while *sid_string_ptr.add(len) != 0 {
+                len += 1;
+            }
+            let slice = std::slice::from_raw_parts(sid_string_ptr, len);
+            String::from_utf16(slice).expect("valid UTF-16 SID string")
+        };
+        unsafe {
+            // SAFETY: `sid_string_ptr` was allocated by ConvertSidToStringSidW.
+            let _ = LocalFree(sid_string_ptr as _);
+        }
+        unsafe {
+            // SAFETY: `token` was opened above; closing exactly once.
+            let _ = CloseHandle(token);
+        }
+
+        // 2. Build SDDL granting the explicit current-user SID Modify only
+        //    (mask 0x1301BF). Mask bits enumerated:
+        //      0x00000001 FILE_READ_DATA
+        //      0x00000002 FILE_WRITE_DATA
+        //      0x00000004 FILE_APPEND_DATA
+        //      0x00000008 FILE_READ_EA
+        //      0x00000010 FILE_WRITE_EA
+        //      0x00000020 FILE_EXECUTE
+        //      0x00000080 FILE_READ_ATTRIBUTES
+        //      0x00000100 FILE_WRITE_ATTRIBUTES
+        //      0x00010000 DELETE
+        //      0x00020000 READ_CONTROL
+        //      0x00100000 SYNCHRONIZE
+        //    Total: 0x001301BF (NO WRITE_OWNER, NO WRITE_DAC).
+        let sddl = format!(
+            "D:PAI(A;OICI;0x1301BF;;;{user_sid_string})"
+        );
+        let wide_sddl: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
+
+        let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        let ok = unsafe {
+            // SAFETY: `wide_sddl` is nul-terminated; `&mut sd` is a valid out-pointer.
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                wide_sddl.as_ptr(),
+                SDDL_REVISION_1,
+                &mut sd,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_ne!(ok, 0, "test setup: SDDL parse must succeed for {sddl}");
+        let _sd_guard = OwnedSecurityDescriptor(sd);
+
+        // Extract the DACL from the synthetic SD.
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let mut dacl_present: i32 = 0;
+        let mut dacl_defaulted: i32 = 0;
+        let ok = unsafe {
+            // SAFETY: `sd` is valid; out-pointers are valid local storage.
+            GetSecurityDescriptorDacl(sd, &mut dacl_present, &mut dacl, &mut dacl_defaulted)
+        };
+        assert_ne!(ok, 0, "test setup: DACL extract must succeed");
+        assert_ne!(
+            dacl_present, 0,
+            "test setup: DACL must be present in synthetic SD"
+        );
+
+        // Apply the restricted DACL with PROTECTED_DACL_SECURITY_INFORMATION so
+        // inheritance from the parent tempdir does not restore WRITE_OWNER.
+        let wide_path: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let status = unsafe {
+            // SAFETY: `wide_path` nul-terminated; `dacl` lives in `sd`.
+            SetNamedSecurityInfoW(
+                wide_path.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                dacl,
+                std::ptr::null(),
+            )
+        };
+        assert_eq!(
+            status, 0,
+            "test setup: SetNamedSecurityInfoW(DACL) must succeed (status=0x{status:08X})"
+        );
+
+        // 3. The actual assertion: try_set_mandatory_label must return the new
+        //    directive error WITHOUT reaching SetNamedSecurityInfoW(LABEL_).
+        let result = try_set_mandatory_label(&path, 0x4);
+
+        // 4. Best-effort cleanup BEFORE re-asserting: restore inheritance so
+        //    tempfile::tempdir() Drop can remove the dir. We do this here
+        //    (before the asserts) so a failed assertion still leaves the
+        //    dir in a deletable state.
+        let restore_sddl = "D:AI";
+        let wide_restore_sddl: Vec<u16> =
+            restore_sddl.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut restore_sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        let restore_parse = unsafe {
+            // SAFETY: nul-terminated UTF-16 buffer; valid out-pointer.
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                wide_restore_sddl.as_ptr(),
+                SDDL_REVISION_1,
+                &mut restore_sd,
+                std::ptr::null_mut(),
+            )
+        };
+        if restore_parse != 0 {
+            let _restore_guard = OwnedSecurityDescriptor(restore_sd);
+            let mut restore_dacl: *mut ACL = std::ptr::null_mut();
+            let mut rp: i32 = 0;
+            let mut rd: i32 = 0;
+            let extract = unsafe {
+                // SAFETY: `restore_sd` valid; out-pointers valid.
+                GetSecurityDescriptorDacl(restore_sd, &mut rp, &mut restore_dacl, &mut rd)
+            };
+            if extract != 0 {
+                let _ = unsafe {
+                    // SAFETY: wide_path nul-terminated; restore_dacl lives in restore_sd.
+                    // UNPROTECTED_DACL_SECURITY_INFORMATION = 0x20000000 — drops the
+                    // Protected flag so inheritance resumes.
+                    SetNamedSecurityInfoW(
+                        wide_path.as_ptr(),
+                        SE_FILE_OBJECT,
+                        DACL_SECURITY_INFORMATION | 0x2000_0000,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        restore_dacl,
+                        std::ptr::null(),
+                    )
+                };
+            }
+        }
+
+        // 5. Asserts (after cleanup, so a failure still allows tempdir drop).
+        let err = result
+            .expect_err("try_set_mandatory_label must fail on a WRITE_OWNER-stripped path");
+        let msg = err.to_string();
+        assert!(
+            matches!(err, NonoError::LabelApplyFailed { .. }),
+            "must be LabelApplyFailed variant; got {err:?}"
+        );
+        assert!(
+            msg.contains("WRITE_OWNER"),
+            "directive hint must name WRITE_OWNER literally; got: {msg}"
+        );
+        assert!(
+            msg.contains("%USERPROFILE%") || msg.contains("%TEMP%"),
+            "directive hint must point user to a profile-tree working dir; got: {msg}"
+        );
+    }
 }
 
 // Phase 31 D-06: library-side guarantor that the lifted function still produces

@@ -427,6 +427,53 @@ the production-mode strict path correctly (Phase 32 Pitfall 6).
 
 Run these from a fresh PowerShell. Capture stdout, stderr, and `nono --version` for each — that is the minimum triage payload from [Windows Preview Pilot § Debugging Inputs](/cli/development/windows-preview-pilot#debugging-inputs).
 
+### Working directory choice (Windows)
+
+On Windows, `nono run` and `nono shell` apply a mandatory integrity label (Low-IL
+SACL) to the working directory before spawning the child process. The Win32 call
+`SetNamedSecurityInfoW(LABEL_SECURITY_INFORMATION)` requires the calling user to
+hold `WRITE_OWNER` (0x00080000) on the target — a right that is NOT implicit for
+path owners, despite owner status granting implicit `WRITE_DAC` and `READ_CONTROL`.
+
+**Failure mode:** User-created subdirectories of a drive root (e.g. `C:\poc\temp`,
+`C:\projects\foo`) inherit the default `C:\` ACL, which grants `Authenticated Users:
+Modify` — a 14-bit mask (`0x1301BF`) that does NOT include `WRITE_OWNER`. Running
+`nono run --allow . -- cmd /c echo hello` from such a path fails with a directive
+error naming `WRITE_OWNER` and pointing you to a supported working directory.
+
+**Recommended POC working directories** (both have explicit `<user>: FullControl`
+ACEs from profile creation, which include `WRITE_OWNER`):
+
+```powershell
+# Option A — under your user profile (persistent)
+mkdir $env:USERPROFILE\nono-poc
+cd $env:USERPROFILE\nono-poc
+
+# Option B — under %TEMP% (transient)
+$poc = Join-Path $env:TEMP "nono-poc-$(Get-Random)"
+mkdir $poc | Out-Null
+cd $poc
+```
+
+**Local override (explicit user choice, NOT a default):** If you need to keep a
+working directory outside the user-profile tree, you can widen the DACL beyond
+default inheritance with `icacls`. This grants your user FullControl (including
+`WRITE_OWNER`) on the path:
+
+```powershell
+icacls C:\poc\temp /grant ${env:USERNAME}:(OI)(CI)F
+```
+
+This is a one-shot setup step per directory — nono itself never mutates DACLs;
+the runtime fails closed if WRITE_OWNER is missing rather than silently widening.
+
+**cmd.exe UNC-path note:** When nono spawns `cmd /c` with a cwd under
+`%TEMP%`, cmd.exe may print `'\\?\C:\Users\<you>\AppData\Local\Temp\...' UNC
+paths are not supported. Defaulting to Windows directory.` before running the
+command — nono passes cwd as the extended-length form `\\?\C:\...` and cmd.exe
+rejects that shape but proceeds with the command. The label apply is unaffected;
+this is a cosmetic cmd.exe quirk tracked separately as a UX nit, not a nono bug.
+
 ### Must-pass
 
 ```powershell

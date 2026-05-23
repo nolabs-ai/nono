@@ -2,18 +2,18 @@
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
   <Package
       Name="nono"
-      Manufacturer="Luke Hinds"
+      Manufacturer="Luke Hinds and Oscar Mack Jr"
       Version="0.53.1"
       UpgradeCode="D5948D55-89A4-4F09-AB43-44DBA9D25D1A"
       Scope="perMachine">
     <SummaryInformation
         Description="nono Windows native installer (administrative install)"
-        Manufacturer="Luke Hinds" />
+        Manufacturer="Luke Hinds and Oscar Mack Jr" />
     <MajorUpgrade
         DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
     <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
     <Property Id="ARPCOMMENTS" Value="nono Windows native installer (administrative install)" />
-    <Property Id="ARPCONTACT" Value="Luke Hinds" />
+    <Property Id="ARPCONTACT" Value="Luke Hinds and Oscar Mack Jr" />
     <Property Id="ARPURLHELP" Value="https://docs.nono.sh/cli/getting_started/installation" />
     <Property Id="ARPURLINFOABOUT" Value="https://github.com/always-further/nono" />
     <Property Id="ARPURLUPDATEINFO" Value="https://github.com/always-further/nono/releases" />

@@ -61,7 +61,7 @@ Audit: [`milestones/v2.5-MILESTONE-AUDIT.md`](milestones/v2.5-MILESTONE-AUDIT.md
 **Phase numbering:** continues from Phase 43 (v2.5 close). Phase 38 number reserved from v2.4 ROADMAP for REQ-AAHX-HOST-01 — folded into Phase 45 as REQ-RESL-NIX-04 native re-validation per scope-lock. v2.6 executes Phases 44, 45, 46, 47, 48, 49. Phase 49 added mid-milestone (2026-05-21) after POC user hit `nono setup --refresh-trust-root` signature-threshold failure for the third time post-`sigstore-verify` upgrade — empirical evidence that the embedded-TUF-anchor staleness class of bug is recurring, not a one-off; structural POC-resilience fix rather than another dep bump.
 
 - [x] **Phase 44: REVIEW polish + test hygiene drain** — Close 16 REVIEW.md warnings via a single chore plan and resolve the 4 test-hygiene follow-ups (Class D Linux deny-overlap + Class E Windows env_vars flakes + v24 broker CR-01/02 cross-binding lockstep). (completed 2026-05-20)
-- [ ] **Phase 45: Source migration + AIPC G-04 + RESL native re-validation** — Rule-4 architectural items: 39 `#[unsafe(no_mangle)]` Edition 2024 rewrites in `bindings/c/src/` (Cluster 2 split-disposition closure); AIPC G-04 wire-protocol compile-time tightening (`Approved(ResourceGrant)` inline); Phase 38 REQ-AAHX-HOST-01 native re-validation on Linux/macOS host (folded in as RESL-NIX-04).
+- [x] **Phase 45: Source migration + AIPC G-04 + RESL native re-validation** — Rule-4 architectural items: 39 `#[unsafe(no_mangle)]` Edition 2024 rewrites in `bindings/c/src/` (Cluster 2 split-disposition closure); AIPC G-04 wire-protocol compile-time tightening (`Approved(ResourceGrant)` inline); Phase 38 REQ-AAHX-HOST-01 native re-validation on Linux/macOS host (folded in as RESL-NIX-04). (completed 2026-05-23)
 - [ ] **Phase 46: windows-squash merge + post-merge CI verifications + UAT backlog** — Orchestrator-coordinated: `windows-squash` → `main` merge (PR-583 gate moved OR feature-flag-equivalent rollout); Phase 37 workflow live run + Phase 43 umbrella PR + baseline-aware CI lane diff vs `13cc0628`; Phase 35 + 36 human-UAT backlog (11 scenarios + 7 verification items) on native Linux/macOS host.
 - [ ] **Phase 47: UPST6 audit + v0.41–v0.43 drift ingestion** — Mirror Phase 33 / 39 / 42 audit shape for upstream `v0.54.0..v0.55.0+`; first real load of the v2.2 DRIFT-01/02 tooling on the long-deferred `v0.41–v0.43` backfill (treat as cleanup, not parity-sync).
 - [ ] **Phase 48: UPST6 sync execution** — Cherry-picks + D-20 manual replays per UPST6 audit dispositions; D-19 trailer convention + Windows-only-files invariant + baseline-aware CI gate inherited from Phase 22/34/40/43.
@@ -112,9 +112,9 @@ Audit: [`milestones/v2.5-MILESTONE-AUDIT.md`](milestones/v2.5-MILESTONE-AUDIT.md
   4. No Windows-only-files invariant violations (D-34-E1 / D-40-E1) introduced; phase commits do not touch `*_windows.rs` / `exec_strategy_windows/` / `crates/nono-shell-broker/` beyond what is strictly required by Edition 2024 source-syntax migration (codified addendum exceptions allowed only under the Phase 40 4-condition rule).
   5. Workspace builds and tests green on Windows host (`cargo test --workspace`) post-phase close; cross-target Linux/macOS clippy verified per CLAUDE.md MUST/NEVER enforcement bullet.
 **Plans**: 3 plans
-- [ ] 45-01-edition-2024-source-migration-PLAN.md — Edition 2024 #[unsafe(no_mangle)] sweep across bindings/c/src/ (39 sites) + DIVERGENCE-LEDGER Cluster 2 split→closed + cbindgen byte-identical gate (REQ-PORT-CLOSURE-08)
-- [ ] 45-02-aipc-g-04-wire-protocol-tightening-PLAN.md — Inline ApprovalDecision::Approved(ResourceGrant); drop SupervisorResponse::Decision.grant; cascade through aipc_sdk.rs + 22 supervisor.rs sites + 23±2 tests + CHANGELOG BREAKING + ADR amendment; AUD-05 verified-pass (REQ-AIPC-G04-01)
-- [ ] 45-03-resl-native-revalidation-PLAN.md — Author .github/workflows/phase-45-resl-native-host.yml (workflow_dispatch-only) + 45-03-NATIVE-RESL-PROTOCOL.md; STRUCTURALLY-COMPLETE-PENDING-LIVE-RUN; live run deferred to Phase 46 orchestrator (REQ-RESL-NIX-04)
+- [x] 45-01-edition-2024-source-migration-PLAN.md — Edition 2024 #[unsafe(no_mangle)] sweep across bindings/c/src/ (39 sites) + DIVERGENCE-LEDGER Cluster 2 split→closed + cbindgen byte-identical gate (REQ-PORT-CLOSURE-08)
+- [x] 45-02-aipc-g-04-wire-protocol-tightening-PLAN.md — Inline ApprovalDecision::Approved(ResourceGrant); drop SupervisorResponse::Decision.grant; cascade through aipc_sdk.rs + 22 supervisor.rs sites + 23±2 tests + CHANGELOG BREAKING + ADR amendment; AUD-05 verified-pass (REQ-AIPC-G04-01)
+- [x] 45-03-resl-native-revalidation-PLAN.md — Author .github/workflows/phase-45-resl-native-host.yml (workflow_dispatch-only) + 45-03-NATIVE-RESL-PROTOCOL.md; STRUCTURALLY-COMPLETE-PENDING-LIVE-RUN; live run deferred to Phase 46 orchestrator (REQ-RESL-NIX-04)
 **UI hint**: no
 
 ### Phase 46: windows-squash merge + post-merge CI verifications + UAT backlog
@@ -233,7 +233,7 @@ These invariants are inherited from prior milestones and remain in force across 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 44. REVIEW polish + test hygiene | 2/2 | Complete    | 2026-05-20 |
-| 45. Source migration + AIPC G-04 + RESL native re-validation | 0/3 | Not started | — |
+| 45. Source migration + AIPC G-04 + RESL native re-validation | 3/3 | Complete   | 2026-05-23 |
 | 46. windows-squash merge + post-merge CI + UAT backlog | 0/TBD | Not started | — |
 | 47. UPST6 audit + v0.41–v0.43 drift ingestion | 0/TBD | Not started | — |
 | 48. UPST6 sync execution | 0/TBD | Not started | — |

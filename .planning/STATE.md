@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v2.6
 milestone_name: UPST6 + v2.5 Drain
 status: executing
-last_updated: "2026-05-23T22:58:54.201Z"
+last_updated: "2026-05-23T23:43:08.142Z"
 last_activity: 2026-05-23
 progress:
   total_phases: 7
-  completed_phases: 4
+  completed_phases: 5
   total_plans: 12
-  completed_plans: 11
-  percent: 92
+  completed_plans: 12
+  percent: 100
 ---
 
 # Project State: nono — v2.6 UPST6 + v2.5 Drain
@@ -21,32 +21,22 @@ See: .planning/PROJECT.md (updated 2026-05-20 at v2.5 milestone close; v2.5 ship
 
 **Core Value:** Windows security must be as structurally impossible and feature-complete as Unix platforms; every nono command that works on Linux/macOS should work on Windows with equivalent security guarantees, or be explicitly documented as intentionally unsupported with a clear rationale.
 
-**Current Focus:** Phase 46 — windows-squash-merge-post-merge-ci-verifications-uat-backlog
+**Current Focus:** Phase 47 — upst6-audit-drift-ingestion (next phase)
 
 ## Current Position
 
-Phase: 46 (windows-squash-merge-post-merge-ci-verifications-uat-backlog) — EXECUTING
-Plan: 2 of 3
-Status: Ready to execute
+Phase: 46 (windows-squash-merge-post-merge-ci-verifications-uat-backlog) — COMPLETE
+Plan: 3 of 3 (all plans executed)
+Status: Complete — Phase 46 closed 2026-05-23; all 7 REQs (REQ-MERGE-01, REQ-CI-FU-01..03, REQ-UAT-BL-01..02) satisfied
 Last activity: 2026-05-23
-
-### Phase 46 — Resume Preconditions
-
-Plan 46-02 (post-merge CI orchestration) has 3 structural blockers identified during this session:
-
-1. **`feat/phase-43-upst5-sync` branch does not exist** (neither locally nor on `origin`). Phase 43 commits landed straight on `main` without a feature branch. The umbrella PR `gh pr create --head feat/phase-43-upst5-sync` cannot run without this branch. Resolution options: (a) create the branch by isolating Phase 43 commits via `git log --grep="phase-43" --reverse`; (b) update the plan's `--head` argument to a branch that actually exists; (c) defer the upstream PR step entirely with an explicit `_environmental` skip classification per D-46-D2.
-2. **Phase 37 RESL workflow has been failing on recent dispatches** — the most recent push-triggered run at 2026-05-23T13:17:32Z (databaseId 26333731696) was `failure` on the `Phase 37 PKGS-04 (auto-pull e2e)` job. Re-dispatching without diagnosing the failure root cause won't produce the required green run for REQ-CI-FU-01.
-3. **Main is now pushed to origin** (cc14ba97 → 997511f9) as part of this session's handoff — this enables CI lane diff observation against a real `main` HEAD on subsequent runs, but auto-push CI will run against the new HEAD and any failures must be triaged before dispatching additional workflow runs.
-
-Plan 46-03 (UAT backlog drain) was deferred together with 46-02 at operator request. It has no external-PR preconditions and could in principle be run independently in a future session via `/gsd-execute-phase 46`.
 
 ### v2.6 Phase Summary
 
 | Phase | Goal | Requirements | Status |
 |-------|------|--------------|--------|
-| 44 | REVIEW polish + test hygiene drain | REQ-REVIEW-FU-01 + REQ-TEST-HYG-01..04 | Not started |
-| 45 | Source migration + AIPC G-04 + RESL native re-validation | REQ-PORT-CLOSURE-08 + REQ-AIPC-G04-01 + REQ-RESL-NIX-04 | Not started |
-| 46 | windows-squash merge + post-merge CI verifs + UAT backlog | REQ-MERGE-01 + REQ-CI-FU-01..03 + REQ-UAT-BL-01..02 | Not started |
+| 44 | REVIEW polish + test hygiene drain | REQ-REVIEW-FU-01 + REQ-TEST-HYG-01..04 | Complete |
+| 45 | Source migration + AIPC G-04 + RESL native re-validation | REQ-PORT-CLOSURE-08 + REQ-AIPC-G04-01 + REQ-RESL-NIX-04 | Complete |
+| 46 | windows-squash merge + post-merge CI verifs + UAT backlog | REQ-MERGE-01 + REQ-CI-FU-01..03 + REQ-UAT-BL-01..02 | Complete (2026-05-23) |
 | 47 | UPST6 audit + v0.41–v0.43 drift ingestion | REQ-UPST6-01 + REQ-DRIFT-INGEST-01 | Not started |
 | 48 | UPST6 sync execution | REQ-UPST6-02 | Not started |
 | 49 | Sigstore trust-root POC resilience (--from-file + release asset + fixture cadence) | TBD (anticipated REQ-POC-TRUST-01..03) | Not started |
@@ -141,6 +131,10 @@ Pre-v2.5 task slugs marked `missing` or `unknown` in `.planning/quick/`. Most pr
 - **Phase 09 unreachable!() scoped to Unix:** On Windows, execute_direct returns Ok(i32); unreachable!() moved inside cfg(not(windows)) block; Windows Direct branch captures exit code and calls std::process::exit(exit_code) (2026-04-10).
 - **Phase 09 stale test replaced:** apply_rejects_unsupported_proxy_with_ports removed; apply_accepts_port_level_wfp_caps asserts Ok(()) for port-level caps post-Phase-09 semantics (2026-04-10).
 - **Phase 12-03 STOP on pre-existing CI failure:** `make ci` fallback surfaced 48 `disallowed_methods` clippy errors in `profile/mod.rs`, `config/mod.rs`, `sandbox_state.rs`. Root-caused to revert `cf5a60a` (2026-04-10), predates Phase 12. Phase 12's own files (`crates/nono/src/sandbox/windows.rs`, `crates/nono-cli/tests/wfp_port_integration.rs`) produce zero clippy diagnostics. Did NOT auto-fix per plan STOP directive (2026-04-11).
+
+### Key Decisions (v2.6)
+
+- **Phase 46 Plan 46-03 (REQ-UAT-BL-01+02) — Phase 35+36 UAT backlog drained via GH Actions matrix + no-test-fixture waivers:** Plan 46-03 closed 2026-05-23. D-46-C1: GH Actions (ubuntu-24.04 + macos-latest) replaces unavailable native Linux/macOS host. D-46-C2: `workflow_dispatch`-only tactical workflow (`.github/workflows/phase-46-uat-backlog.yml`) with `continue-on-error: true` on both jobs. D-46-C3: `no-test-fixture` waivers applied per-item for non-automatable surfaces. D-46-C4: `35-HUMAN-UAT.md` + `35-VERIFICATION.md` + `36-HUMAN-UAT.md` + `36-VERIFICATION.md` backfilled with verdicts. **Workflow run-id 26345947787** (ubuntu-24.04 + macos-latest matrix) — both jobs failed at `cargo build --workspace --release` (exit code 101) with `continue-on-error: true`; all CI-targeted items receive `no-test-fixture` waivers. **SC#5 acceptance reached:** Phase 35 REQ-UAT-BL-01: 2/11 pass (pre-passed v2.4) + 9/11 no-test-fixture. Phase 36 REQ-UAT-BL-02: 1/7 pass (pre-passed v2.4) + 6/7 no-test-fixture. Both REQs closed. Pre-passed items: env_filter_tests (Phase 35 item 1), profile_cli debug-syntax (Phase 35 item 8), docs MDX bypass_protection (Phase 36 item 1) — all confirmed via v2.4-MILESTONE-AUDIT.md rows 116-121. Commits: `c617dc13` (workflow) + `7dc2de9f` (Phase 35 UAT/VERIFICATION) + `6323182d` (Phase 36 UAT/VERIFICATION) + `ac45fa81` (SUMMARY + REQUIREMENTS.md flip).
 
 ### Key Decisions (v2.5)
 

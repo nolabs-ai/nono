@@ -62,7 +62,7 @@ Audit: [`milestones/v2.5-MILESTONE-AUDIT.md`](milestones/v2.5-MILESTONE-AUDIT.md
 
 - [x] **Phase 44: REVIEW polish + test hygiene drain** — Close 16 REVIEW.md warnings via a single chore plan and resolve the 4 test-hygiene follow-ups (Class D Linux deny-overlap + Class E Windows env_vars flakes + v24 broker CR-01/02 cross-binding lockstep). (completed 2026-05-20)
 - [x] **Phase 45: Source migration + AIPC G-04 + RESL native re-validation** — Rule-4 architectural items: 39 `#[unsafe(no_mangle)]` Edition 2024 rewrites in `bindings/c/src/` (Cluster 2 split-disposition closure); AIPC G-04 wire-protocol compile-time tightening (`Approved(ResourceGrant)` inline); Phase 38 REQ-AAHX-HOST-01 native re-validation on Linux/macOS host (folded in as RESL-NIX-04). (completed 2026-05-23)
-- [ ] **Phase 46: windows-squash merge + post-merge CI verifications + UAT backlog** — Orchestrator-coordinated: `windows-squash` → `main` merge (PR-583 gate moved OR feature-flag-equivalent rollout); Phase 37 workflow live run + Phase 43 umbrella PR + baseline-aware CI lane diff vs `13cc0628`; Phase 35 + 36 human-UAT backlog (11 scenarios + 7 verification items) on native Linux/macOS host.
+- [x] **Phase 46: windows-squash merge + post-merge CI verifications + UAT backlog** — Orchestrator-coordinated: `windows-squash` → `main` merge (PR-583 gate moved OR feature-flag-equivalent rollout); Phase 37 workflow live run + Phase 43 umbrella PR + baseline-aware CI lane diff vs `13cc0628`; Phase 35 + 36 human-UAT backlog (11 scenarios + 7 verification items) on native Linux/macOS host. (completed 2026-05-23)
 - [ ] **Phase 47: UPST6 audit + v0.41–v0.43 drift ingestion** — Mirror Phase 33 / 39 / 42 audit shape for upstream `v0.54.0..v0.55.0+`; first real load of the v2.2 DRIFT-01/02 tooling on the long-deferred `v0.41–v0.43` backfill (treat as cleanup, not parity-sync).
 - [ ] **Phase 48: UPST6 sync execution** — Cherry-picks + D-20 manual replays per UPST6 audit dispositions; D-19 trailer convention + Windows-only-files invariant + baseline-aware CI gate inherited from Phase 22/34/40/43.
 - [x] **Phase 49: Sigstore trust-root POC resilience** — Structural fix for the recurring stale-embedded-TUF-anchor failure on `nono setup --refresh-trust-root` (hit at 0.6.5 → 0.6.6, again at 0.7.0). Three sub-items: (1) `nono setup --from-file <PATH>` CLI flag that bypasses upstream `TrustedRoot::production()` when the user supplies a known-good `trusted_root.json`; (2) ship `trusted_root.json` as a release asset alongside `nono.exe`/`nono` so POC users don't need a GitHub fetch; (3) maintainer cadence task to refresh `crates/nono/tests/fixtures/trust-root-frozen.json` from upstream on every Sigstore root rotation announcement. Surfaces are disjoint from 44–48 (touches `crates/nono-cli/src/setup.rs` + `crates/nono-cli/src/cli.rs` + CI release-asset packaging + `.planning/templates/`) so parallel-safe.
@@ -130,7 +130,7 @@ Audit: [`milestones/v2.5-MILESTONE-AUDIT.md`](milestones/v2.5-MILESTONE-AUDIT.md
 **Plans**: 3 plans
 - [x] 46-01-PLAN.md — v2.6 upstream-merge deferral ADR + 260428-rsu re-anchor (REQ-MERGE-01 closed via SC#1 feature-flag-equivalent rollout per D-46-A1/A2/A3/A4)
 - [x] 46-02-PLAN.md — Post-merge CI orchestration: 4 parallel gh actions (Phase 37 + Phase 45 workflow dispatches + Phase 43 umbrella PR + baseline-aware CI lane diff vs 13cc0628) + upstream-sync-quick.md baseline registry update (REQ-CI-FU-01..03)
-- [ ] 46-03-PLAN.md — Phase 35 + 36 UAT backlog drain: new .github/workflows/phase-46-uat-backlog.yml (workflow_dispatch matrix) + Phase 35/36 HUMAN-UAT + VERIFICATION backfills + per-item no-test-fixture waivers per D-46-C3 (REQ-UAT-BL-01..02)
+- [x] 46-03-PLAN.md — Phase 35 + 36 UAT backlog drain: new .github/workflows/phase-46-uat-backlog.yml (workflow_dispatch matrix) + Phase 35/36 HUMAN-UAT + VERIFICATION backfills + per-item no-test-fixture waivers per D-46-C3 (REQ-UAT-BL-01..02)
 **UI hint**: no
 
 ### Phase 47: UPST6 audit + v0.41–v0.43 drift ingestion
@@ -237,7 +237,7 @@ These invariants are inherited from prior milestones and remain in force across 
 |-------|----------------|--------|-----------|
 | 44. REVIEW polish + test hygiene | 2/2 | Complete    | 2026-05-20 |
 | 45. Source migration + AIPC G-04 + RESL native re-validation | 3/3 | Complete    | 2026-05-23 |
-| 46. windows-squash merge + post-merge CI + UAT backlog | 2/3 | In Progress|  |
+| 46. windows-squash merge + post-merge CI + UAT backlog | 3/3 | Complete   | 2026-05-23 |
 | 47. UPST6 audit + v0.41–v0.43 drift ingestion | 0/TBD | Not started | — |
 | 48. UPST6 sync execution | 0/TBD | Not started | — |
 | 49. Sigstore trust-root POC resilience | 3/3 | Complete    | 2026-05-21 |

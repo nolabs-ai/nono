@@ -17,6 +17,13 @@
 
 #![cfg(target_os = "linux")]
 #![allow(clippy::unwrap_used)]
+// `EnvVarGuard::set_all` cannot express the "explicit-remove" semantic
+// these tests need for `NONO_NO_AUTO_PULL`: passing an empty string would
+// leave the var defined-but-empty (truthy under some checks), but the
+// tests need the var truly unset so the auto-pull default fires. The
+// EnvVarGuard Drop still restores the baseline at test end. The 5 sites
+// (lines ~227, 284, 344, 439, 542) are intentional and symmetric.
+#![allow(clippy::disallowed_methods)]
 
 use std::collections::HashMap;
 use std::io::{Read as _, Write as _};

@@ -264,6 +264,89 @@ pub fn print_abi_info(silent: bool) {
     }
 }
 
+/// Print the Landlock scope policy derived from the current capabilities.
+#[cfg(target_os = "linux")]
+pub fn print_landlock_scope_policy(caps: &CapabilitySet, verbose: u8, silent: bool) {
+    if silent || verbose == 0 {
+        return;
+    }
+
+    let t = theme::current();
+    match nono::landlock_scope_policy(caps) {
+        Ok(policy) => {
+            eprintln!(
+                "  {} {}",
+                badge(" scope ", t.blue, BADGE_FG_DARK),
+                fg(
+                    &format!("Landlock {} detected", policy.abi_version),
+                    t.subtext,
+                )
+            );
+            eprintln!(
+                "          {} {}",
+                fg("signal:", t.subtext),
+                fg(
+                    &format_scope_status(
+                        policy.signal_requested,
+                        policy.signal_enforced,
+                        policy.scoping_supported,
+                    ),
+                    scope_status_color(
+                        policy.signal_requested,
+                        policy.signal_enforced,
+                        policy.scoping_supported,
+                        t,
+                    ),
+                )
+            );
+            eprintln!(
+                "          {} {}",
+                fg("abstract-unix-socket:", t.subtext),
+                fg(
+                    &format_scope_status(
+                        policy.abstract_unix_socket_requested,
+                        policy.abstract_unix_socket_enforced,
+                        policy.scoping_supported,
+                    ),
+                    scope_status_color(
+                        policy.abstract_unix_socket_requested,
+                        policy.abstract_unix_socket_enforced,
+                        policy.scoping_supported,
+                        t,
+                    ),
+                )
+            );
+        }
+        Err(err) => {
+            eprintln!(
+                "  {} {}",
+                badge(" scope ", t.red, BADGE_FG_DARK),
+                fg(&format!("Landlock scope policy unavailable: {err}"), t.red),
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn format_scope_status(requested: bool, enforced: bool, supported: bool) -> String {
+    match (requested, enforced, supported) {
+        (true, true, _) => "requested, enforced".to_string(),
+        (true, false, false) => "requested, unsupported by detected ABI".to_string(),
+        (true, false, true) => "requested, not enforced".to_string(),
+        (false, _, true) => "not requested".to_string(),
+        (false, _, false) => "not requested; detected ABI has no scope support".to_string(),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn scope_status_color(requested: bool, enforced: bool, supported: bool, t: &theme::Theme) -> Rgb {
+    match (requested, enforced, supported) {
+        (true, true, _) => t.green,
+        (true, false, _) => t.yellow,
+        (false, _, _) => t.subtext,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Status messages
 // ---------------------------------------------------------------------------

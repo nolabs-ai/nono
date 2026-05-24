@@ -85,7 +85,7 @@ pub use sandbox::windows::{
     path_is_owned_by_current_user, try_set_mandatory_label, OwnedHandle,
 };
 #[cfg(target_os = "linux")]
-pub use sandbox::{detect_abi, is_wsl2, DetectedAbi};
+pub use sandbox::{detect_abi, is_wsl2, landlock_scope_policy, DetectedAbi, LandlockScopePolicy};
 pub use sandbox::{PreviewRuntimeStatus, Sandbox, SupportInfo, SupportStatus};
 #[cfg(target_os = "windows")]
 pub use sandbox::{

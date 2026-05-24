@@ -230,6 +230,33 @@ nono profile groups deny_credentials
 
 Groups are referenced by name in the `security.groups` field. See [Profiles & Groups](/cli/features/profiles-groups#groups) for the full group taxonomy and built-in group list.
 
+## Process and IPC Isolation
+
+The `security` section controls process-level isolation knobs that are not filesystem path grants:
+
+```json
+{
+  "security": {
+    "signal_mode": "isolated",
+    "process_info_mode": "isolated",
+    "ipc_mode": "shared_memory_only"
+  }
+}
+```
+
+| Field | Values | Description |
+|-------|--------|-------------|
+| `signal_mode` | `isolated`, `allow_same_sandbox`, `allow_all` | Controls which processes the sandboxed command may signal. On Linux V6, restricted modes use Landlock signal scoping when available. |
+| `process_info_mode` | `isolated`, `allow_same_sandbox`, `allow_all` | Controls visibility of other process metadata. |
+| `ipc_mode` | `shared_memory_only`, `full` | Controls IPC compatibility. On Linux V6, `shared_memory_only` requests abstract UNIX socket scoping; `full` leaves abstract UNIX sockets unscoped for runtimes that require broader IPC compatibility. |
+
+Use `nono why --scope` to inspect the effective scope policy for a profile:
+
+```bash
+nono why --scope signal --profile my-agent
+nono why --scope abstract-unix-socket --profile my-agent
+```
+
 ## Common Patterns
 
 ### Agent with API Credentials

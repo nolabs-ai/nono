@@ -1,6 +1,6 @@
 //! Linux sandbox implementation using Landlock LSM
 
-use crate::capability::{AccessMode, CapabilitySet, NetworkMode, SignalMode};
+use crate::capability::{AccessMode, CapabilitySet, IpcMode, NetworkMode, SignalMode};
 use crate::error::{NonoError, Result};
 use crate::sandbox::SupportInfo;
 use landlock::{
@@ -19,6 +19,23 @@ use tracing::{debug, info, warn};
 pub struct DetectedAbi {
     /// The detected ABI version
     pub abi: ABI,
+}
+
+/// Landlock scope policy derived from a capability set and kernel ABI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LandlockScopePolicy {
+    /// Detected Landlock ABI version string.
+    pub abi_version: &'static str,
+    /// Whether this kernel supports Landlock scope flags.
+    pub scoping_supported: bool,
+    /// Whether signal scoping was requested by the capability set.
+    pub signal_requested: bool,
+    /// Whether signal scoping will be enforced.
+    pub signal_enforced: bool,
+    /// Whether abstract UNIX socket scoping was requested by the capability set.
+    pub abstract_unix_socket_requested: bool,
+    /// Whether abstract UNIX socket scoping will be enforced.
+    pub abstract_unix_socket_enforced: bool,
 }
 
 impl DetectedAbi {
@@ -52,7 +69,7 @@ impl DetectedAbi {
         AccessFs::from_all(self.abi).contains(AccessFs::IoctlDev)
     }
 
-    /// Whether process scoping (signals and abstract UNIX sockets) is supported (V6+).
+    /// Whether scoped signals and abstract UNIX sockets are supported (V6+).
     #[must_use]
     pub fn has_scoping(&self) -> bool {
         !Scope::from_all(self.abi).is_empty()
@@ -92,10 +109,42 @@ impl DetectedAbi {
             features.push("Device ioctl filtering".to_string());
         }
         if self.has_scoping() {
-            features.push("Process scoping".to_string());
+            features.push("Signal and abstract UNIX socket scoping".to_string());
         }
         features
     }
+}
+
+/// Report the Landlock scope policy that would be applied for these capabilities.
+///
+/// # Errors
+///
+/// Returns an error if ABI detection fails, or if the capability set requests a
+/// mandatory scope that the detected ABI cannot enforce.
+pub fn landlock_scope_policy(caps: &CapabilitySet) -> Result<LandlockScopePolicy> {
+    let detected = detect_abi()?;
+    landlock_scope_policy_with_abi(caps, &detected)
+}
+
+/// Report the Landlock scope policy for an already-detected ABI.
+///
+/// # Errors
+///
+/// Returns an error if the capability set requests a mandatory scope that this
+/// ABI cannot enforce.
+pub fn landlock_scope_policy_with_abi(
+    caps: &CapabilitySet,
+    abi: &DetectedAbi,
+) -> Result<LandlockScopePolicy> {
+    let scopes = requested_scopes(caps, abi)?;
+    Ok(LandlockScopePolicy {
+        abi_version: abi.version_string(),
+        scoping_supported: abi.has_scoping(),
+        signal_requested: !matches!(caps.signal_mode(), SignalMode::AllowAll),
+        signal_enforced: scopes.contains(Scope::Signal),
+        abstract_unix_socket_requested: caps.ipc_mode() == IpcMode::SharedMemoryOnly,
+        abstract_unix_socket_enforced: scopes.contains(Scope::AbstractUnixSocket),
+    })
 }
 
 impl std::fmt::Display for DetectedAbi {
@@ -518,17 +567,21 @@ fn collect_linux_gpu_paths() -> (Vec<(std::path::PathBuf, AccessMode, bool)>, bo
 
 /// Determine which Landlock scopes must be enabled for these capabilities.
 ///
-/// Only `SignalMode::AllowSameSandbox` has an exact Landlock mapping today.
-/// `SignalMode::Isolated` cannot be represented because Landlock scopes to the
-/// sandbox domain, not to the calling process alone.
+/// `SignalMode::AllowSameSandbox` has an exact Landlock mapping.
+/// `SignalMode::Isolated` cannot be represented exactly because Landlock scopes
+/// to the sandbox domain, not to the calling process alone.
+///
+/// Landlock's abstract UNIX socket scope is all-or-nothing. `IpcMode::Full`
+/// therefore leaves abstract sockets unscoped as the explicit compatibility
+/// mode, while `IpcMode::SharedMemoryOnly` requests the V6 IPC hardening.
 fn requested_scopes(caps: &CapabilitySet, abi: &DetectedAbi) -> Result<BitFlags<Scope>> {
+    let mut scopes = BitFlags::EMPTY;
+
     match caps.signal_mode() {
-        SignalMode::AllowAll => Ok(BitFlags::EMPTY),
+        SignalMode::AllowAll => {}
         SignalMode::Isolated => {
             if abi.has_scoping() {
-                Ok(Scope::Signal.into())
-            } else {
-                Ok(BitFlags::EMPTY)
+                scopes |= BitFlags::from(Scope::Signal);
             }
         }
         SignalMode::AllowSameSandbox => {
@@ -539,9 +592,15 @@ fn requested_scopes(caps: &CapabilitySet, abi: &DetectedAbi) -> Result<BitFlags<
                         .to_string(),
                 ));
             }
-            Ok(Scope::Signal.into())
+            scopes |= BitFlags::from(Scope::Signal);
         }
     }
+
+    if caps.ipc_mode() == IpcMode::SharedMemoryOnly && abi.has_scoping() {
+        scopes |= BitFlags::from(Scope::AbstractUnixSocket);
+    }
+
+    Ok(scopes)
 }
 
 /// Apply Landlock sandbox with the given capabilities, auto-detecting ABI.
@@ -659,7 +718,7 @@ pub fn apply_with_abi(caps: &CapabilitySet, abi: &DetectedAbi) -> Result<Seccomp
             .scope(scopes)
             .map_err(|e| {
                 NonoError::SandboxInit(format!(
-                    "Signal scoping requested but unsupported by this kernel: {}",
+                    "Landlock scoping requested but unsupported by this kernel: {}",
                     e
                 ))
             })?
@@ -2358,14 +2417,18 @@ mod tests {
 
     #[test]
     fn test_requested_scopes_allow_all_is_empty() {
-        let caps = CapabilitySet::new().set_signal_mode(SignalMode::AllowAll);
+        let caps = CapabilitySet::new()
+            .set_signal_mode(SignalMode::AllowAll)
+            .set_ipc_mode(IpcMode::Full);
         let scopes = requested_scopes(&caps, &DetectedAbi::new(ABI::V6));
         assert!(matches!(scopes, Ok(actual) if actual.is_empty()));
     }
 
     #[test]
     fn test_requested_scopes_isolated_uses_signal_scope_on_v6() {
-        let caps = CapabilitySet::new().set_signal_mode(SignalMode::Isolated);
+        let caps = CapabilitySet::new()
+            .set_signal_mode(SignalMode::Isolated)
+            .set_ipc_mode(IpcMode::Full);
         let scopes = requested_scopes(&caps, &DetectedAbi::new(ABI::V6));
         assert!(matches!(scopes, Ok(actual) if actual == BitFlags::from(Scope::Signal)));
     }
@@ -2388,9 +2451,289 @@ mod tests {
 
     #[test]
     fn test_requested_scopes_allow_same_sandbox_uses_signal_scope() {
-        let caps = CapabilitySet::new().set_signal_mode(SignalMode::AllowSameSandbox);
+        let caps = CapabilitySet::new()
+            .set_signal_mode(SignalMode::AllowSameSandbox)
+            .set_ipc_mode(IpcMode::Full);
         let scopes = requested_scopes(&caps, &DetectedAbi::new(ABI::V6));
         assert!(matches!(scopes, Ok(actual) if actual == BitFlags::from(Scope::Signal)));
+    }
+
+    #[test]
+    fn test_requested_scopes_shared_memory_only_uses_abstract_socket_scope_on_v6() {
+        let caps = CapabilitySet::new()
+            .set_signal_mode(SignalMode::AllowAll)
+            .set_ipc_mode(IpcMode::SharedMemoryOnly);
+        let scopes = requested_scopes(&caps, &DetectedAbi::new(ABI::V6));
+        assert!(
+            matches!(scopes, Ok(actual) if actual == BitFlags::from(Scope::AbstractUnixSocket))
+        );
+    }
+
+    #[test]
+    fn test_requested_scopes_full_ipc_does_not_use_abstract_socket_scope() {
+        let caps = CapabilitySet::new()
+            .set_signal_mode(SignalMode::AllowAll)
+            .set_ipc_mode(IpcMode::Full);
+        let scopes = requested_scopes(&caps, &DetectedAbi::new(ABI::V6));
+        assert!(matches!(scopes, Ok(actual) if actual.is_empty()));
+    }
+
+    #[test]
+    fn test_requested_scopes_combines_signal_and_abstract_socket_scopes() {
+        let caps = CapabilitySet::new()
+            .set_signal_mode(SignalMode::AllowSameSandbox)
+            .set_ipc_mode(IpcMode::SharedMemoryOnly);
+        let scopes = requested_scopes(&caps, &DetectedAbi::new(ABI::V6));
+        let expected = BitFlags::from(Scope::Signal) | BitFlags::from(Scope::AbstractUnixSocket);
+        assert!(matches!(scopes, Ok(actual) if actual == expected));
+    }
+
+    #[test]
+    fn test_requested_scopes_shared_memory_only_degrades_without_v6() {
+        let caps = CapabilitySet::new()
+            .set_signal_mode(SignalMode::AllowAll)
+            .set_ipc_mode(IpcMode::SharedMemoryOnly);
+        let scopes = requested_scopes(&caps, &DetectedAbi::new(ABI::V5));
+        assert!(matches!(scopes, Ok(actual) if actual.is_empty()));
+    }
+
+    #[test]
+    fn test_landlock_scope_policy_reports_requested_and_enforced_scopes() {
+        let caps = CapabilitySet::new()
+            .set_signal_mode(SignalMode::AllowSameSandbox)
+            .set_ipc_mode(IpcMode::SharedMemoryOnly);
+        let policy = match landlock_scope_policy_with_abi(&caps, &DetectedAbi::new(ABI::V6)) {
+            Ok(policy) => policy,
+            Err(err) => panic!("V6 should support requested scopes: {err}"),
+        };
+
+        assert_eq!(policy.abi_version, "V6");
+        assert!(policy.scoping_supported);
+        assert!(policy.signal_requested);
+        assert!(policy.signal_enforced);
+        assert!(policy.abstract_unix_socket_requested);
+        assert!(policy.abstract_unix_socket_enforced);
+    }
+
+    #[test]
+    fn test_landlock_scope_policy_reports_unsupported_abstract_socket_scope() {
+        let caps = CapabilitySet::new()
+            .set_signal_mode(SignalMode::AllowAll)
+            .set_ipc_mode(IpcMode::SharedMemoryOnly);
+        let policy = match landlock_scope_policy_with_abi(&caps, &DetectedAbi::new(ABI::V5)) {
+            Ok(policy) => policy,
+            Err(err) => panic!("SharedMemoryOnly should degrade without V6: {err}"),
+        };
+
+        assert_eq!(policy.abi_version, "V5");
+        assert!(!policy.scoping_supported);
+        assert!(!policy.signal_requested);
+        assert!(!policy.signal_enforced);
+        assert!(policy.abstract_unix_socket_requested);
+        assert!(!policy.abstract_unix_socket_enforced);
+    }
+
+    #[cfg(target_os = "linux")]
+    struct FdGuard(libc::c_int);
+
+    #[cfg(target_os = "linux")]
+    impl Drop for FdGuard {
+        fn drop(&mut self) {
+            if self.0 >= 0 {
+                // SAFETY: fd ownership is held by FdGuard and close is safe for a valid fd.
+                unsafe {
+                    libc::close(self.0);
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn abstract_sockaddr(name: &[u8]) -> Option<(libc::sockaddr_un, libc::socklen_t)> {
+        // SAFETY: sockaddr_un is a plain C struct; zero initialization is valid.
+        let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        if name.len().saturating_add(1) > addr.sun_path.len() {
+            return None;
+        }
+
+        addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        addr.sun_path[0] = 0;
+        for (index, byte) in name.iter().enumerate() {
+            addr.sun_path[index + 1] = *byte as libc::c_char;
+        }
+
+        let addr_len = std::mem::size_of::<libc::sa_family_t>() + 1 + name.len();
+        Some((addr, addr_len as libc::socklen_t))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn bind_abstract_listener(name: &[u8]) -> FdGuard {
+        // SAFETY: socket is called with constant domain/type/protocol values.
+        let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+        assert!(fd >= 0, "socket(AF_UNIX) failed");
+        let guard = FdGuard(fd);
+
+        let (addr, addr_len) = match abstract_sockaddr(name) {
+            Some(sockaddr) => sockaddr,
+            None => {
+                panic!("abstract socket name is too long");
+            }
+        };
+
+        // SAFETY: addr points to a valid sockaddr_un and addr_len covers initialized bytes.
+        let bind_result = unsafe {
+            libc::bind(
+                guard.0,
+                (&addr as *const libc::sockaddr_un).cast::<libc::sockaddr>(),
+                addr_len,
+            )
+        };
+        assert_eq!(bind_result, 0, "bind(AF_UNIX abstract) failed");
+
+        // SAFETY: guard.0 is a valid stream socket created above.
+        let listen_result = unsafe { libc::listen(guard.0, 4) };
+        assert_eq!(listen_result, 0, "listen(AF_UNIX abstract) failed");
+        guard
+    }
+
+    #[cfg(target_os = "linux")]
+    fn connect_abstract_socket(name: &[u8]) -> (bool, i32) {
+        // SAFETY: socket is called with constant domain/type/protocol values.
+        let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+        if fd < 0 {
+            let errno = std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(255);
+            return (false, errno);
+        }
+        let guard = FdGuard(fd);
+
+        let (addr, addr_len) = match abstract_sockaddr(name) {
+            Some(sockaddr) => sockaddr,
+            None => return (false, libc::EINVAL),
+        };
+
+        // SAFETY: addr points to a valid sockaddr_un and addr_len covers initialized bytes.
+        let connect_result = unsafe {
+            libc::connect(
+                guard.0,
+                (&addr as *const libc::sockaddr_un).cast::<libc::sockaddr>(),
+                addr_len,
+            )
+        };
+        if connect_result == 0 {
+            (true, 0)
+        } else {
+            (
+                false,
+                std::io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or(255),
+            )
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn errno_to_u8(errno: i32) -> u8 {
+        match u8::try_from(errno) {
+            Ok(value) => value,
+            Err(_) => u8::MAX,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn run_abstract_connect_probe(
+        name: &[u8],
+        listener_fd: libc::c_int,
+        caps: CapabilitySet,
+        detected: DetectedAbi,
+    ) -> [u8; 2] {
+        let mut report_pipe = [0; 2];
+        // SAFETY: report_pipe points to two writable file descriptor slots.
+        let pipe_result = unsafe { libc::pipe(report_pipe.as_mut_ptr()) };
+        assert_eq!(pipe_result, 0, "pipe() failed");
+
+        // SAFETY: fork is used in a test helper; child exits via _exit.
+        let child_pid = unsafe { libc::fork() };
+        assert!(child_pid >= 0, "fork() for abstract socket probe failed");
+
+        if child_pid == 0 {
+            let mut payload = [0_u8; 2];
+            // SAFETY: these are inherited file descriptors in the child process.
+            unsafe {
+                libc::close(report_pipe[0]);
+                libc::close(listener_fd);
+            }
+
+            match apply_with_abi(&caps, &detected) {
+                Ok(_) => {
+                    let (connected, errno) = connect_abstract_socket(name);
+                    payload[0] = if connected { 0 } else { 1 };
+                    payload[1] = errno_to_u8(errno);
+                }
+                Err(_) => {
+                    payload[0] = 2;
+                    payload[1] = 0;
+                }
+            }
+
+            let write_len = payload.len();
+            // SAFETY: payload is a valid buffer and report_pipe[1] is the pipe write end.
+            let wrote = unsafe {
+                libc::write(
+                    report_pipe[1],
+                    payload.as_ptr().cast::<libc::c_void>(),
+                    write_len,
+                )
+            };
+            let expected_write = isize::try_from(write_len).unwrap_or(-1);
+            let exit_code = if wrote == expected_write { 0 } else { 3 };
+            // SAFETY: close operates on the inherited pipe fd; _exit terminates the child.
+            unsafe {
+                libc::close(report_pipe[1]);
+                libc::_exit(exit_code);
+            }
+        }
+
+        // SAFETY: parent no longer writes to the pipe.
+        unsafe {
+            libc::close(report_pipe[1]);
+        }
+
+        let mut child_status = 0;
+        // SAFETY: child_pid is the pid returned by fork in the parent.
+        let waited = unsafe { libc::waitpid(child_pid, &mut child_status, 0) };
+        assert_eq!(waited, child_pid, "waitpid() for probe child failed");
+        assert!(
+            libc::WIFEXITED(child_status),
+            "abstract socket probe child did not exit normally"
+        );
+        assert_eq!(
+            libc::WEXITSTATUS(child_status),
+            0,
+            "abstract socket probe child returned failure"
+        );
+
+        let mut payload = [0_u8; 2];
+        let read_len = payload.len();
+        // SAFETY: payload is a valid writable buffer and report_pipe[0] is the read end.
+        let read_result = unsafe {
+            libc::read(
+                report_pipe[0],
+                payload.as_mut_ptr().cast::<libc::c_void>(),
+                read_len,
+            )
+        };
+        // SAFETY: parent is done reading from the pipe.
+        unsafe {
+            libc::close(report_pipe[0]);
+        }
+        assert_eq!(
+            read_result,
+            isize::try_from(read_len).unwrap_or(-1),
+            "failed to read abstract socket probe report"
+        );
+        payload
     }
 
     #[cfg(target_os = "linux")]
@@ -2546,6 +2889,46 @@ mod tests {
         cleanup.target_pid = None;
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_abstract_unix_socket_scope_blocks_external_connect_on_v6() {
+        let detected = match detect_abi() {
+            Ok(detected) => detected,
+            Err(_) => return,
+        };
+
+        if !detected.has_scoping() {
+            return;
+        }
+
+        let socket_name = format!(
+            "nono-landlock-v6-abstract-{}-{}",
+            std::process::id(),
+            // SAFETY: getpid has no preconditions.
+            unsafe { libc::getpid() }
+        );
+        let listener = bind_abstract_listener(socket_name.as_bytes());
+
+        let scoped_caps = CapabilitySet::new()
+            .set_signal_mode(SignalMode::AllowAll)
+            .set_ipc_mode(IpcMode::SharedMemoryOnly);
+        let scoped_report =
+            run_abstract_connect_probe(socket_name.as_bytes(), listener.0, scoped_caps, detected);
+        assert_eq!(scoped_report[0], 1, "scoped abstract connect succeeded");
+        assert_eq!(
+            i32::from(scoped_report[1]),
+            libc::EPERM,
+            "scoped abstract connect should fail with EPERM"
+        );
+
+        let full_ipc_caps = CapabilitySet::new()
+            .set_signal_mode(SignalMode::AllowAll)
+            .set_ipc_mode(IpcMode::Full);
+        let full_report =
+            run_abstract_connect_probe(socket_name.as_bytes(), listener.0, full_ipc_caps, detected);
+        assert_eq!(full_report[0], 0, "IpcMode::Full connect was denied");
+    }
+
     #[test]
     fn test_detected_abi_version_string() {
         assert_eq!(DetectedAbi::new(ABI::V1).version_string(), "V1");
@@ -2573,6 +2956,14 @@ mod tests {
             .iter()
             .any(|n| n == "File rename across directories (Refer)"));
         assert!(names.iter().any(|n| n == "File truncation (Truncate)"));
+
+        let v6 = DetectedAbi::new(ABI::V6);
+        let names = v6.feature_names();
+        assert!(
+            names
+                .iter()
+                .any(|n| n == "Signal and abstract UNIX socket scoping")
+        );
     }
 
     #[test]

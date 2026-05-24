@@ -393,6 +393,13 @@ impl SetupRunner {
         for feature in detected.feature_names() {
             println!("      - {}", feature);
         }
+        if detected.has_scoping() {
+            println!("  * Landlock scoping policy:");
+            println!("    - Signal scoping: enforced for same-sandbox signal isolation modes");
+            println!(
+                "    - Abstract UNIX socket scoping: enforced for shared-memory-only IPC mode"
+            );
+        }
 
         println!("  * Filesystem ruleset creation verified");
 

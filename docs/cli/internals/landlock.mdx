@@ -43,7 +43,8 @@ Landlock capabilities have evolved across kernel versions:
 | 5.19+ | v2 | `REFER` - rename/link across directories |
 | 6.2+ | v3 | `TRUNCATE` - file truncation |
 | 6.7+ | v4 | TCP `bind` and `connect` filtering |
-| 6.10+ | v5 | `IOCTL_DEV`, signal/socket scoping |
+| 6.10+ | v5 | `IOCTL_DEV` - device ioctl filtering |
+| 6.12+ | v6 | Signal and abstract UNIX socket scoping |
 
 nono automatically detects the highest available ABI and uses it. On older kernels, some features are unavailable but core filesystem sandboxing still works.
 
@@ -94,6 +95,40 @@ AccessNet::ConnectTcp // Control outbound connections
 <Warning>
   Network filtering requires kernel 6.7+. On older kernels, nono cannot enforce network restrictions via Landlock and will warn you.
 </Warning>
+
+## Signal and IPC Scoping
+
+Landlock ABI v6 added scope restrictions for process signals and abstract UNIX sockets:
+
+```rust
+Scope::Signal
+Scope::AbstractUnixSocket
+```
+
+nono derives these scopes from the effective capability set:
+
+| Profile / capability setting | Linux V6 behavior |
+|------------------------------|-------------------|
+| `security.signal_mode: "allow_same_sandbox"` | Requests signal scoping and fails closed if the kernel cannot enforce it |
+| `security.signal_mode: "isolated"` | Requests signal scoping when available |
+| `security.signal_mode: "allow_all"` | Does not request signal scoping |
+| `security.ipc_mode: "shared_memory_only"` | Requests abstract UNIX socket scoping when available |
+| `security.ipc_mode: "full"` | Does not request abstract UNIX socket scoping |
+
+`shared_memory_only` is the default IPC mode. On V6 kernels it prevents connecting to abstract UNIX sockets created outside the current Landlock domain. Profiles that need broader runtime IPC compatibility can opt into `ipc_mode: "full"`.
+
+Use verbose dry-run output to see what would be requested and enforced:
+
+```bash
+nono run --dry-run -v --profile claude-code -- claude
+```
+
+Use `nono why` for a focused scope query:
+
+```bash
+nono why --scope signal --profile claude-code
+nono why --scope abstract-unix-socket --profile claude-code
+```
 
 ## Enforcement Status
 
@@ -176,6 +211,7 @@ If a command fails with permission errors:
 - Basic sandboxing requires kernel 5.13+
 - Full filesystem control requires kernel 6.2+
 - Network filtering requires kernel 6.7+
+- Signal and abstract UNIX socket scoping requires Landlock ABI v6
 
 ### No Network Filtering on Older Kernels
 

@@ -1702,7 +1702,9 @@ fn build_policy_explanations(
                 // Path is actually allowed by policy — the denial came from
                 // a different layer (e.g. Landlock timing). Skip.
             }
-            Ok(crate::query_ext::QueryResult::NotSandboxed { .. }) | Err(_) => {}
+            Ok(crate::query_ext::QueryResult::NotSandboxed { .. })
+            | Ok(crate::query_ext::QueryResult::Scope { .. })
+            | Err(_) => {}
         }
     }
 

@@ -109,6 +109,7 @@ Check why a path or network operation would be allowed or denied. Designed for b
 ```bash
 nono why --path <PATH> --op <OP> [OPTIONS]
 nono why --host <HOST> [--port <PORT>] [OPTIONS]
+nono why --scope <SCOPE> [OPTIONS]
 nono why --self --path <PATH> --op <OP> [OPTIONS]  # Inside sandbox
 ```
 
@@ -1095,6 +1096,12 @@ Capabilities that would be granted:
 Would execute: my-agent
 ```
 
+On Linux, combine `--dry-run` with `-v` to include detected Landlock ABI details and requested/enforced scope state:
+
+```bash
+nono run --dry-run -v --profile claude-code -- claude
+```
+
 #### `--verbose`, `-v`
 
 Increase logging verbosity. Can be specified multiple times.
@@ -1180,6 +1187,17 @@ Network port (default: 443). Used with `--host`.
 ```bash
 nono why --host example.com --port 8080
 ```
+
+### `--scope`
+
+Landlock scope to check. Supported values are `signal` and `abstract-unix-socket`.
+
+```bash
+nono why --scope signal --profile claude-code
+nono why --scope abstract-unix-socket --profile claude-code
+```
+
+On Linux, scope queries report whether the effective capability set requested the scope, whether the detected Landlock ABI can support it, and whether nono will enforce it. On non-Linux platforms, scope queries return `not_applicable`.
 
 ### `--json`
 

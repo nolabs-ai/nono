@@ -2415,6 +2415,10 @@ pub struct WhyArgs {
     #[arg(long, help_heading = "QUERY")]
     pub host: Option<String>,
 
+    /// Landlock scope to check
+    #[arg(long, value_enum, value_name = "SCOPE", help_heading = "QUERY")]
+    pub scope: Option<WhyScope>,
+
     /// Network port (default 443)
     #[arg(long, default_value = "443", help_heading = "QUERY")]
     pub port: u16,
@@ -2537,6 +2541,16 @@ pub enum WhyOp {
     /// Read and write access
     #[value(name = "readwrite")]
     ReadWrite,
+}
+
+/// Landlock scope type for why command
+#[derive(Clone, Debug, ValueEnum)]
+pub enum WhyScope {
+    /// Signal scoping
+    Signal,
+    /// Abstract UNIX socket scoping
+    #[value(name = "abstract-unix-socket")]
+    AbstractUnixSocket,
 }
 
 #[derive(Parser, Debug)]
@@ -4345,6 +4359,14 @@ mod tests {
         match cli.command {
             Commands::Why(args) => {
                 assert!(args.block_net);
+            }
+            _ => panic!("Expected Why command"),
+        }
+
+        let cli = Cli::parse_from(["nono", "why", "--scope", "abstract-unix-socket"]);
+        match cli.command {
+            Commands::Why(args) => {
+                assert!(matches!(args.scope, Some(WhyScope::AbstractUnixSocket)));
             }
             _ => panic!("Expected Why command"),
         }

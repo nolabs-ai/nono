@@ -421,10 +421,10 @@ pub enum ProcessInfoMode {
 
 /// IPC mode for the sandbox.
 ///
-/// Controls whether the sandboxed process can use POSIX IPC primitives
-/// (semaphores) beyond shared memory. Shared memory (`shm_open`) is always
-/// allowed; this mode gates semaphore operations needed by multiprocessing
-/// runtimes (e.g., Python `multiprocessing`, Ruby `parallel`).
+/// Controls whether the sandboxed process can use IPC primitives beyond
+/// shared memory. Shared memory (`shm_open`) is always allowed; this mode gates
+/// semaphore operations needed by multiprocessing runtimes (e.g., Python
+/// `multiprocessing`, Ruby `parallel`) and Linux abstract UNIX socket access.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IpcMode {
     /// POSIX shared memory only (default). Semaphore operations are denied.
@@ -432,7 +432,8 @@ pub enum IpcMode {
     /// On macOS: only `ipc-posix-shm-*` rules emitted. `sem_open()` etc.
     /// are blocked by the `(deny default)` baseline.
     ///
-    /// On Linux: no-op (Landlock does not restrict IPC primitives).
+    /// On Linux: requests Landlock V6 abstract UNIX socket scoping when
+    /// available. Older kernels cannot enforce this and continue without it.
     #[default]
     SharedMemoryOnly,
     /// Full POSIX IPC: shared memory + semaphores.
@@ -441,7 +442,8 @@ pub enum IpcMode {
     /// Required for Python `multiprocessing`, Node `worker_threads` with
     /// shared memory, and similar multiprocess coordination.
     ///
-    /// On Linux: no-op (Landlock does not restrict IPC primitives).
+    /// On Linux: does not request abstract UNIX socket scoping, preserving
+    /// compatibility with runtimes that use external abstract socket IPC.
     Full,
 }
 

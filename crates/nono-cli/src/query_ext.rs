@@ -21,6 +21,24 @@ pub struct CapabilityMatch {
     pub source: String,
 }
 
+/// Scope type for Landlock scope policy queries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScopeQuery {
+    /// `LANDLOCK_SCOPE_SIGNAL`.
+    Signal,
+    /// `LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET`.
+    AbstractUnixSocket,
+}
+
+impl ScopeQuery {
+    fn as_str(self) -> &'static str {
+        match self {
+            ScopeQuery::Signal => "signal",
+            ScopeQuery::AbstractUnixSocket => "abstract-unix-socket",
+        }
+    }
+}
+
 /// Result of querying whether an operation is permitted
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "status")]
@@ -52,6 +70,19 @@ pub enum QueryResult {
     /// Not running inside a sandbox
     #[serde(rename = "not_sandboxed")]
     NotSandboxed { message: String },
+    /// Landlock scope policy status.
+    #[serde(rename = "scope")]
+    Scope {
+        scope: String,
+        state: String,
+        requested: bool,
+        enforced: bool,
+        supported: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        kernel_abi: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        details: Option<String>,
+    },
 }
 
 /// Query whether a path operation is permitted
@@ -263,6 +294,91 @@ pub fn query_network(
     }
 }
 
+/// Query whether a Landlock scope is requested and enforced.
+#[cfg(target_os = "linux")]
+pub fn query_scope(scope: ScopeQuery, caps: &CapabilitySet) -> QueryResult {
+    match nono::landlock_scope_policy(caps) {
+        Ok(policy) => {
+            let (requested, enforced) = match scope {
+                ScopeQuery::Signal => (policy.signal_requested, policy.signal_enforced),
+                ScopeQuery::AbstractUnixSocket => (
+                    policy.abstract_unix_socket_requested,
+                    policy.abstract_unix_socket_enforced,
+                ),
+            };
+            QueryResult::Scope {
+                scope: scope.as_str().to_string(),
+                state: scope_state(requested, enforced, policy.scoping_supported).to_string(),
+                requested,
+                enforced,
+                supported: policy.scoping_supported,
+                kernel_abi: Some(policy.abi_version.to_string()),
+                details: Some(scope_details(
+                    scope,
+                    requested,
+                    enforced,
+                    policy.scoping_supported,
+                )),
+            }
+        }
+        Err(err) => QueryResult::Scope {
+            scope: scope.as_str().to_string(),
+            state: "unavailable".to_string(),
+            requested: false,
+            enforced: false,
+            supported: false,
+            kernel_abi: None,
+            details: Some(format!(
+                "Landlock scope policy could not be resolved: {err}"
+            )),
+        },
+    }
+}
+
+/// Query whether a Landlock scope is requested and enforced.
+#[cfg(not(target_os = "linux"))]
+pub fn query_scope(scope: ScopeQuery, _caps: &CapabilitySet) -> QueryResult {
+    QueryResult::Scope {
+        scope: scope.as_str().to_string(),
+        state: "not_applicable".to_string(),
+        requested: false,
+        enforced: false,
+        supported: false,
+        kernel_abi: None,
+        details: Some("Landlock scope queries are only available on Linux.".to_string()),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn scope_state(requested: bool, enforced: bool, supported: bool) -> &'static str {
+    match (requested, enforced, supported) {
+        (true, true, _) => "enforced",
+        (true, false, false) => "unsupported",
+        (true, false, true) => "not_enforced",
+        (false, _, _) => "not_requested",
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn scope_details(scope: ScopeQuery, requested: bool, enforced: bool, supported: bool) -> String {
+    let label = scope.as_str();
+    match (requested, enforced, supported) {
+        (true, true, _) => {
+            format!("{label} scope is requested by the capability set and enforced.")
+        }
+        (true, false, false) => {
+            format!("{label} scope is requested, but this Landlock ABI does not support scoping.")
+        }
+        (true, false, true) => {
+            format!("{label} scope is requested, but it is not enforced.")
+        }
+        (false, _, true) => format!("{label} scope is not requested by the capability set."),
+        (false, _, false) => {
+            format!("{label} scope is not requested; this Landlock ABI has no scope support.")
+        }
+    }
+}
+
 /// Print a query result in human-readable format
 pub fn print_result(result: &QueryResult) {
     match result {
@@ -312,6 +428,28 @@ pub fn print_result(result: &QueryResult) {
         QueryResult::NotSandboxed { message } => {
             println!("{}", "NOT SANDBOXED".yellow().bold());
             println!("  {}", message);
+        }
+        QueryResult::Scope {
+            scope,
+            state,
+            requested,
+            enforced,
+            supported,
+            kernel_abi,
+            details,
+        } => {
+            println!("{}", "SCOPE".blue().bold());
+            println!("  Scope: {}", scope);
+            println!("  State: {}", state);
+            println!("  Requested: {}", requested);
+            println!("  Enforced: {}", enforced);
+            println!("  Supported: {}", supported);
+            if let Some(abi) = kernel_abi {
+                println!("  Kernel ABI: {}", abi);
+            }
+            if let Some(detail) = details {
+                println!("  Details: {}", detail);
+            }
         }
     }
 }
@@ -642,6 +780,26 @@ mod tests {
         let caps = CapabilitySet::new().block_network();
         let result = query_network("example.com", 443, &caps, &[]);
         assert!(matches!(result, QueryResult::Denied { .. }));
+    }
+
+    #[test]
+    fn test_query_scope_returns_structured_result() {
+        let caps = CapabilitySet::new();
+        let result = query_scope(ScopeQuery::AbstractUnixSocket, &caps);
+        match result {
+            QueryResult::Scope {
+                scope,
+                state,
+                requested,
+                enforced,
+                ..
+            } => {
+                assert_eq!(scope, "abstract-unix-socket");
+                assert!(!state.is_empty());
+                assert!(!enforced || requested);
+            }
+            _ => panic!("expected scope result"),
+        }
     }
 
     #[test]

@@ -357,6 +357,10 @@ fn tokenize_sexp(input: &str) -> Result<Vec<String>> {
 ///
 /// Controls whether the sandboxed process can send signals to processes
 /// outside its own sandbox.
+///
+/// On Linux, restricted signal modes use Landlock V6 signal scoping when
+/// available. Older kernels cannot enforce process signal filtering; see each
+/// variant for whether nono degrades or fails closed.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SignalMode {
     /// Signals restricted to the current sandbox.
@@ -368,10 +372,11 @@ pub enum SignalMode {
     /// generated signals (e.g., Ctrl+C delivering SIGINT to the foreground
     /// process group) are delivered by the kernel and bypass the sandbox.
     ///
-    /// On Linux: Landlock V6 `LANDLOCK_SCOPE_SIGNAL` restricts signaling
-    /// to processes in the same sandbox. Landlock cannot distinguish "self
-    /// only" from "same sandbox", so `Isolated` and `AllowSameSandbox`
-    /// produce identical enforcement.
+    /// On Linux: requests Landlock V6 `LANDLOCK_SCOPE_SIGNAL` when available,
+    /// restricting signals to processes in the same sandbox domain. Landlock
+    /// cannot distinguish "self only" from "same sandbox", so `Isolated` and
+    /// `AllowSameSandbox` produce identical enforcement on V6. Older kernels
+    /// cannot enforce this mode and continue without signal scoping.
     #[default]
     Isolated,
     /// Signals allowed to child processes in the same sandbox only.
@@ -380,11 +385,14 @@ pub enum SignalMode {
     /// Permits signaling any process that inherited the sandbox (i.e., forked
     /// or exec'd children), but blocks signals to external processes.
     ///
-    /// On Linux: enforced on Landlock V6+ with `LANDLOCK_SCOPE_SIGNAL`.
-    /// This blocks signaling processes outside the current sandbox while
-    /// still allowing signals to same-sandbox descendants.
+    /// On Linux: requests Landlock V6 `LANDLOCK_SCOPE_SIGNAL`, blocking
+    /// signals to processes outside the current sandbox domain while still
+    /// allowing signals to same-sandbox descendants. This mode requires V6
+    /// support and fails closed if the detected kernel cannot enforce it.
     AllowSameSandbox,
     /// Signals allowed to any process (no filtering).
+    ///
+    /// On Linux: does not request Landlock signal scoping.
     AllowAll,
 }
 

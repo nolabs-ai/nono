@@ -2635,10 +2635,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     fn errno_to_u8(errno: i32) -> u8 {
-        match u8::try_from(errno) {
-            Ok(value) => value,
-            Err(_) => u8::MAX,
-        }
+        u8::try_from(errno).unwrap_or(u8::MAX)
     }
 
     #[cfg(target_os = "linux")]

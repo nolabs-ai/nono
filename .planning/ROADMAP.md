@@ -237,7 +237,7 @@ These invariants are inherited from prior milestones and remain in force across 
 |-------|----------------|--------|-----------|
 | 44. REVIEW polish + test hygiene | 2/2 | Complete    | 2026-05-20 |
 | 45. Source migration + AIPC G-04 + RESL native re-validation | 3/3 | Complete    | 2026-05-23 |
-| 46. windows-squash merge + post-merge CI + UAT backlog | 3/3 | Complete   | 2026-05-23 |
+| 46. windows-squash merge + post-merge CI + UAT backlog | 3/3 | Complete    | 2026-05-24 |
 | 47. UPST6 audit + v0.41–v0.43 drift ingestion | 0/TBD | Not started | — |
 | 48. UPST6 sync execution | 0/TBD | Not started | — |
 | 49. Sigstore trust-root POC resilience | 3/3 | Complete    | 2026-05-21 |

@@ -35,6 +35,7 @@ use nono::{NonoError, Result};
 /// The limits are applied inside the forked child's `pre_exec` hook, before
 /// `execve`, so the resource caps are in effect from the first instruction
 /// of the sandboxed binary.
+#[derive(Debug)]
 pub(crate) struct MacosResourceLimits {
     /// `RLIMIT_AS` soft + hard limit in bytes (from `--memory`). None = no limit.
     memory_bytes: Option<u64>,

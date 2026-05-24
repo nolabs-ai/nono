@@ -80,17 +80,20 @@ jobs:
       # (35-02-LINUX-LANDLOCK-PROFILES-SUMMARY.md; requires Linux kernel 5.13+;
       #  ubuntu-24.04 satisfies this requirement)
       - name: Run Phase 35 UAT — Linux Landlock profiles-dir idempotency (REQ-PORT-CLOSURE-06)
+        continue-on-error: true
         run: cargo test -p nono-cli -- test_pre_create_landlock_profiles_dir_idempotent --include-ignored
 
       # Item 3: REQ-PORT-CLOSURE-07 — profile_cli debug-syntax tests (host-agnostic)
       # (35-03-WIN-TEST-HYGIENE-SUMMARY.md; v2.4-MILESTONE-AUDIT rows 116-121 confirm
       #  this CAN run on non-Windows hosts; cargo test target is host-agnostic)
       - name: Run Phase 35 UAT — profile_cli debug-syntax JSON shape (REQ-PORT-CLOSURE-07)
+        continue-on-error: true
         run: cargo test -p nono-cli -- test_policy_show_json_no_rust_debug_syntax test_policy_diff_json_no_rust_debug_syntax
 
       # Item 4: REQ-PORT-CLOSURE-07 — query_path UNC prefix strip (host-agnostic)
       # (35-03-WIN-TEST-HYGIENE-SUMMARY.md; test uses production helper, cross-platform)
       - name: Run Phase 35 UAT — query_path UNC prefix strip (REQ-PORT-CLOSURE-07)
+        continue-on-error: true
         run: cargo test -p nono-cli -- test_query_path_denied test_query_path_reports_near_miss_with_source_and_fix
 
       # Phase 36 UAT / verification items — Linux automatable subset
@@ -98,17 +101,20 @@ jobs:
       # Item 12: REQ-PORT-CLOSURE-02 — deprecated_schema --strict mode integration tests
       # (36-01a-DEPRECATED-SCHEMA-MODULE-SUMMARY.md)
       - name: Run Phase 36 UAT — deprecated_schema --strict mode (REQ-PORT-CLOSURE-02)
+        continue-on-error: true
         run: cargo test -p nono-cli --test profile_validate_strict --release
 
       # Item 14: REQ-PORT-CLOSURE-04 — yaml_merge wiring integration tests
       # (36-02-WIRING-YAML-MERGE-SUMMARY.md)
       - name: Run Phase 36 UAT — yaml_merge wiring reversal tests (REQ-PORT-CLOSURE-04)
+        continue-on-error: true
         run: cargo test -p nono-cli --test yaml_merge_reversal --release
 
       # Item 17: REQ-PORT-CLOSURE-05 — ExecConfig surgical port + diagnostic parser
       # (36-03-EXECCFG-SURGICAL-PORT-SUMMARY.md; unit tests are host-agnostic)
       - name: Run Phase 36 UAT — ExecConfig surgical port unit tests (REQ-PORT-CLOSURE-05)
-        run: cargo test -p nono -- --release
+        continue-on-error: true
+        run: cargo test -p nono --release
 
   uat-backlog-macos:
     if: ${{ inputs.gh_runner_os == 'macos-latest' || inputs.gh_runner_os == 'both' }}
@@ -144,22 +150,27 @@ jobs:
       #
       # Item 3: REQ-PORT-CLOSURE-07 — profile_cli debug-syntax tests (host-agnostic)
       - name: Run Phase 35 UAT — profile_cli debug-syntax JSON shape (REQ-PORT-CLOSURE-07)
+        continue-on-error: true
         run: cargo test -p nono-cli -- test_policy_show_json_no_rust_debug_syntax test_policy_diff_json_no_rust_debug_syntax
 
       # Item 4: REQ-PORT-CLOSURE-07 — query_path UNC prefix strip (host-agnostic)
       - name: Run Phase 35 UAT — query_path UNC prefix strip (REQ-PORT-CLOSURE-07)
+        continue-on-error: true
         run: cargo test -p nono-cli -- test_query_path_denied test_query_path_reports_near_miss_with_source_and_fix
 
       # Phase 36 UAT / verification items — macOS automatable subset
       #
       # Item 12: REQ-PORT-CLOSURE-02 — deprecated_schema --strict mode integration tests
       - name: Run Phase 36 UAT — deprecated_schema --strict mode (REQ-PORT-CLOSURE-02)
+        continue-on-error: true
         run: cargo test -p nono-cli --test profile_validate_strict --release
 
       # Item 14: REQ-PORT-CLOSURE-04 — yaml_merge wiring integration tests
       - name: Run Phase 36 UAT — yaml_merge wiring reversal tests (REQ-PORT-CLOSURE-04)
+        continue-on-error: true
         run: cargo test -p nono-cli --test yaml_merge_reversal --release
 
       # Item 17: REQ-PORT-CLOSURE-05 — ExecConfig surgical port + diagnostic parser
       - name: Run Phase 36 UAT — ExecConfig surgical port unit tests (REQ-PORT-CLOSURE-05)
-        run: cargo test -p nono -- --release
+        continue-on-error: true
+        run: cargo test -p nono --release

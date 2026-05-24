@@ -716,6 +716,11 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
         NetworkMode::Blocked => {
             profile.push_str("(deny network*)\n");
             profile.push_str(MDNS_RULES);
+            // Unix socket grants (see #685 / #696). Only explicit
+            // UnixSocketCapability entries emit network-outbound rules;
+            // generic FsCapability grants no longer implicitly grant
+            // connect()/bind() to sockets inside them.
+            emit_unix_socket_rules(&mut profile, caps)?;
             if !localhost_ports.is_empty() {
                 // Allow system-socket for TCP (required for connect/bind)
                 profile.push_str(
@@ -739,6 +744,8 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
             // Block all network, then allow only localhost TCP to the proxy port.
             profile.push_str("(deny network*)\n");
             profile.push_str(MDNS_RULES);
+            // Unix socket grants (see Blocked branch above).
+            emit_unix_socket_rules(&mut profile, caps)?;
             profile.push_str(&format!(
                 "(allow network-outbound (remote tcp \"localhost:{}\"))\n",
                 port

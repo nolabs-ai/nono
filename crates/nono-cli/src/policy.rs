@@ -1065,9 +1065,17 @@ pub fn validate_deny_overlaps(deny_paths: &[PathBuf], caps: &CapabilitySet) -> R
     fatal_conflicts.dedup();
 
     let count = fatal_conflicts.len();
-    let first = &fatal_conflicts[0];
-    let more = if count > 1 {
-        format!("\n(+ {} more conflict(s))", count - 1)
+    const PREVIEW_LIMIT: usize = 5;
+    let preview = fatal_conflicts
+        .iter()
+        .take(PREVIEW_LIMIT)
+        .map(|conflict| format!("- {conflict}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let remainder = count.saturating_sub(PREVIEW_LIMIT);
+    let more = if remainder > 0 {
+        format!("\n- ... and {remainder} more conflict(s)")
     } else {
         String::new()
     };
@@ -1075,7 +1083,7 @@ pub fn validate_deny_overlaps(deny_paths: &[PathBuf], caps: &CapabilitySet) -> R
     Err(NonoError::SandboxInit(format!(
         "Landlock deny-overlap is not enforceable on Linux. Refusing to start with conflicting policy.\n\
          {count} deny rule(s) cannot apply under an allowed parent directory.\n\
-         First conflict: {first}{more}\n\
+         Conflicts:\n{preview}{more}\n\
          Remove the broad allow path, remove the deny path, or restructure permissions.",
     )))
 }

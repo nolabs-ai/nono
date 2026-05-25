@@ -299,7 +299,9 @@ mod tests {
     #[test]
     fn blocks_parent_directory_capability() {
         let tmp = TempDir::new().expect("tmpdir");
-        let parent = tmp.path().to_path_buf();
+        // Canonicalize to resolve platform symlinks (e.g. macOS /var -> /private/var)
+        // so that the protected root path matches the resolved capability path.
+        let parent = tmp.path().canonicalize().expect("canonical tmpdir");
         let protected = parent.join(".nono");
 
         let mut caps = CapabilitySet::new();
@@ -317,7 +319,8 @@ mod tests {
     #[test]
     fn blocks_child_directory_capability() {
         let tmp = TempDir::new().expect("tmpdir");
-        let protected = tmp.path().join(".nono");
+        let canonical_tmp = tmp.path().canonicalize().expect("canonical tmpdir");
+        let protected = canonical_tmp.join(".nono");
         let child = protected.join("rollbacks");
         std::fs::create_dir_all(&child).expect("mkdir");
 
@@ -331,8 +334,9 @@ mod tests {
     #[test]
     fn allows_unrelated_capability() {
         let tmp = TempDir::new().expect("tmpdir");
-        let protected = tmp.path().join(".nono");
-        let workspace = tmp.path().join("workspace");
+        let canonical_tmp = tmp.path().canonicalize().expect("canonical tmpdir");
+        let protected = canonical_tmp.join(".nono");
+        let workspace = canonical_tmp.join("workspace");
         std::fs::create_dir_all(&workspace).expect("mkdir");
 
         let mut caps = CapabilitySet::new();
@@ -345,7 +349,8 @@ mod tests {
     #[test]
     fn requested_path_blocks_nonexistent_child_under_protected_root() {
         let tmp = TempDir::new().expect("tmpdir");
-        let protected = tmp.path().join(".nono");
+        let canonical_tmp = tmp.path().canonicalize().expect("canonical tmpdir");
+        let protected = canonical_tmp.join(".nono");
         std::fs::create_dir_all(&protected).expect("mkdir");
         let child = protected.join("rollbacks").join("future-session");
 
@@ -363,7 +368,8 @@ mod tests {
     #[test]
     fn overlapping_protected_root_reports_match() {
         let tmp = TempDir::new().expect("tmpdir");
-        let protected = tmp.path().join(".nono");
+        let canonical_tmp = tmp.path().canonicalize().expect("canonical tmpdir");
+        let protected = canonical_tmp.join(".nono");
         std::fs::create_dir_all(&protected).expect("mkdir");
         let child = protected.join("rollbacks");
 

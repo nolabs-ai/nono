@@ -475,9 +475,15 @@ mod tests {
         let _guard =
             EnvVarGuard::set_all(&[("XDG_CONFIG_HOME", tmp.path().to_str().expect("utf8 path"))]);
         let dir = profile_drafts_dir().expect("profile_drafts_dir must succeed");
+        // Canonicalize to resolve platform symlinks (e.g. macOS /var -> /private/var)
+        let canonical_tmp = tmp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| tmp.path().to_path_buf());
         assert!(
-            dir.starts_with(tmp.path()),
-            "profile_drafts_dir must resolve under XDG_CONFIG_HOME tempdir, got: {}",
+            dir.starts_with(&canonical_tmp),
+            "profile_drafts_dir must resolve under XDG_CONFIG_HOME tempdir (canonical: {}), got: {}",
+            canonical_tmp.display(),
             dir.display()
         );
         assert_eq!(

@@ -849,12 +849,12 @@ pub(crate) fn shorten_path_for_profile(path: &Path, home_path: &Path) -> String 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_env::{EnvVarGuard, ENV_LOCK};
+    use crate::test_env::{lock_env, EnvVarGuard};
     use tempfile::TempDir;
 
     #[test]
     fn build_run_profile_patch_adds_override_deny_for_sensitive_file() {
-        let _env_lock = ENV_LOCK.lock().expect("env lock");
+        let _env_lock = lock_env();
         let temp_home = TempDir::new().expect("temp home");
         let _env = EnvVarGuard::set_all(&[("HOME", temp_home.path().to_str().expect("home path"))]);
 
@@ -889,7 +889,7 @@ mod tests {
 
     #[test]
     fn build_run_profile_patch_merges_read_and_write_to_allow_file() {
-        let _env_lock = ENV_LOCK.lock().expect("env lock");
+        let _env_lock = lock_env();
         let temp_home = TempDir::new().expect("temp home");
         let _env = EnvVarGuard::set_all(&[("HOME", temp_home.path().to_str().expect("home path"))]);
 
@@ -933,7 +933,7 @@ mod tests {
         // verify that paths matching `suppress_save_prompt` entries are
         // filtered out of the save-profile patch before they reach the
         // interactive prompt.
-        let _env_lock = ENV_LOCK.lock().expect("env lock");
+        let _env_lock = lock_env();
         let temp_home = TempDir::new().expect("temp home");
         let _env = EnvVarGuard::set_all(&[("HOME", temp_home.path().to_str().expect("home path"))]);
 
@@ -989,7 +989,7 @@ mod tests {
         // Phase 40 Plan 40-05: directory-prefix entries in
         // `suppress_save_prompt` should cover sub-paths via
         // component-wise `Path::starts_with` (not string starts_with).
-        let _env_lock = ENV_LOCK.lock().expect("env lock");
+        let _env_lock = lock_env();
         let temp_home = TempDir::new().expect("temp home");
         let _env = EnvVarGuard::set_all(&[("HOME", temp_home.path().to_str().expect("home path"))]);
 
@@ -1027,7 +1027,7 @@ mod tests {
     fn build_run_profile_patch_empty_ignored_list_is_noop() {
         // Phase 40 Plan 40-05: empty `ignored_denial_paths` must short-circuit
         // (no syscall traffic from canonicalization) and pass all denials through.
-        let _env_lock = ENV_LOCK.lock().expect("env lock");
+        let _env_lock = lock_env();
         let temp_home = TempDir::new().expect("temp home");
         let _env = EnvVarGuard::set_all(&[("HOME", temp_home.path().to_str().expect("home path"))]);
 
@@ -1080,7 +1080,7 @@ mod tests {
 
     #[test]
     fn prepare_profile_save_from_patch_updates_existing_user_profile() {
-        let _env_lock = ENV_LOCK.lock().expect("env lock");
+        let _env_lock = lock_env();
         let temp_home = TempDir::new().expect("temp home");
         let temp_config = TempDir::new().expect("temp config");
         let _env = EnvVarGuard::set_all(&[
@@ -1131,7 +1131,7 @@ mod tests {
 
     #[test]
     fn would_shadow_existing_profile_flags_known_builtin_names() {
-        let _env_lock = ENV_LOCK.lock().expect("env lock");
+        let _env_lock = lock_env();
         let temp_home = TempDir::new().expect("temp home");
         let temp_config = TempDir::new().expect("temp config");
         let _env = EnvVarGuard::set_all(&[
@@ -1150,7 +1150,7 @@ mod tests {
 
     #[test]
     fn would_shadow_existing_profile_allows_short_name_matching_pack_install_as() {
-        let _env_lock = ENV_LOCK.lock().expect("env lock");
+        let _env_lock = lock_env();
         let temp_home = TempDir::new().expect("temp home");
         let temp_config = TempDir::new().expect("temp config");
         let _env = EnvVarGuard::set_all(&[
@@ -1192,7 +1192,7 @@ mod tests {
 
     #[test]
     fn would_shadow_existing_profile_allows_update_of_existing_user_override() {
-        let _env_lock = ENV_LOCK.lock().expect("env lock");
+        let _env_lock = lock_env();
         let temp_home = TempDir::new().expect("temp home");
         let temp_config = TempDir::new().expect("temp config");
         let _env = EnvVarGuard::set_all(&[

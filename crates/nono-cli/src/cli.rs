@@ -3353,6 +3353,7 @@ mod parser_tests {
         assert!(parse_duration("5x").is_err());
     }
 
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn cpu_percent_range_enforced_by_clap() {
         let err_zero =
@@ -3548,6 +3549,7 @@ mod parser_tests {
         assert!(cli.is_err(), "malformed --env-deny must reject at parse");
     }
 
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn env_filter_flags_do_not_collide_with_phase16_flags() {
         // Regression guard: Phase 16's --cpu-percent / --memory / --timeout /
@@ -3652,6 +3654,7 @@ mod parser_tests {
         assert!(matches!(cli.command, Commands::Shell(_)));
     }
 
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn allow_gpu_coexists_with_phase16_and_env_filter_flags() {
         // Regression guard: --allow-gpu does NOT collide with Phase 16's

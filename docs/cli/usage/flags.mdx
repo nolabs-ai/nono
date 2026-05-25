@@ -1124,6 +1124,29 @@ nono run --skip-dir vendor-cache --skip-dir generated --allow-cwd -- my-agent
   `--skip-dir` does not change sandbox permissions. It only prunes trust discovery and rollback preflight traversal. Hidden directories are still scanned unless they are in the built-in heavy-dir list or explicitly named here.
 </Note>
 
+#### `--startup-timeout`
+
+Set a startup timeout in seconds for the sandboxed process. If the process does not enter interactive (alt-screen) mode within the given time, nono prints a warning and terminates it. Set to `0` to disable entirely.
+
+Applies to `nono run`, `nono shell`, and `nono wrap`.
+
+| Environment Variable | `NONO_STARTUP_TIMEOUT` |
+|---------------------|------------------------|
+| Example | `NONO_STARTUP_TIMEOUT=10` |
+
+```bash
+# Kill the process if it hasn't become interactive after 10 seconds
+nono run --startup-timeout 10 --allow-cwd -- opencode
+
+# Disable the timeout entirely
+nono run --startup-timeout 0 --allow-cwd -- opencode
+
+# Via environment variable
+NONO_STARTUP_TIMEOUT=10 nono run --allow-cwd -- opencode
+```
+
+No timeout is applied by default. When a known built-in profile exists for the binary (e.g. `opencode`, `claude`), the warning message also suggests the recommended profile.
+
 #### `--no-diagnostics`
 
 Suppress the diagnostic footer when the command exits non-zero. Useful for scripts that parse stderr and need stable output.
@@ -1555,6 +1578,7 @@ CLI flags always take precedence over environment variables.
 | `--env-credential` | `NONO_ENV_CREDENTIAL` | `NONO_ENV_CREDENTIAL=key1,key2` |
 | `--capability-elevation` | `NONO_CAPABILITY_ELEVATION` | `NONO_CAPABILITY_ELEVATION=true` |
 | `--no-auto-pull` | `NONO_NO_AUTO_PULL` | `NONO_NO_AUTO_PULL=1` |
+| `--startup-timeout` | `NONO_STARTUP_TIMEOUT` | `NONO_STARTUP_TIMEOUT=10` |
 | `--upstream-proxy` | `NONO_UPSTREAM_PROXY` | `NONO_UPSTREAM_PROXY=squid.corp:3128` |
 | `--upstream-bypass` | `NONO_UPSTREAM_BYPASS` | `NONO_UPSTREAM_BYPASS=internal.corp,*.private.net` (comma-separated) |
 

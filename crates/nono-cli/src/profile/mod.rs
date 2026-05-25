@@ -3308,17 +3308,18 @@ pub(crate) fn find_pack_store_profile(name: &str) -> Option<(PathBuf, String)> {
         return None;
     }
 
-    // Fast path: if name is in `org/pack-name` format, look up the pack directly
-    // rather than scanning every pack's install_as values.
+    // Fast path: if name is in `org/pack-name[@version]` format, look up the
+    // pack directly rather than scanning every pack's install_as values.
+    // parse_package_ref strips the optional @version so we always look under
+    // the installed `packages/org/pack` directory, not `packages/org/pack@ver`.
     if is_registry_ref(name) {
         return (|| {
-            let (ns, pack_name) = name.split_once('/')?;
-            let pack_path = store.join(ns).join(pack_name);
+            let pkg = crate::package::parse_package_ref(name).ok()?;
+            let pack_path = store.join(&pkg.namespace).join(&pkg.name);
             if !pack_path.is_dir() {
                 return None;
             }
-            let manifest_str =
-                std::fs::read_to_string(pack_path.join("package.json")).ok()?;
+            let manifest_str = std::fs::read_to_string(pack_path.join("package.json")).ok()?;
             let manifest: crate::package::PackageManifest =
                 serde_json::from_str(&manifest_str).ok()?;
             manifest
@@ -3330,7 +3331,7 @@ pub(crate) fn find_pack_store_profile(name: &str) -> Option<(PathBuf, String)> {
                     let profile_file = pack_path
                         .join("profiles")
                         .join(format!("{install_as}.json"));
-                    profile_file.exists().then(|| (profile_file, name.to_owned()))
+                    profile_file.exists().then(|| (profile_file, pkg.key()))
                 })
         })();
     }

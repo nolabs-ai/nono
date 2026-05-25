@@ -28,7 +28,7 @@ toml = "1.0"
 tracing = "0.1"
 
 # Secure credential handling
-zeroize = { version = "1", features = ["alloc"] }
+zeroize = { version = "1", features = ["alloc", "serde"] }
 
 # Hashing
 sha2 = "0.11"

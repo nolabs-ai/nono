@@ -55,17 +55,22 @@ pub(crate) fn load_env_credentials(
         .keys()
         .filter(|credential| nono::keystore::is_op_uri(credential))
         .count();
+    let bw_count = secret_mappings
+        .keys()
+        .filter(|credential| nono::keystore::is_bw_uri(credential))
+        .count();
     let apple_password_count = secret_mappings
         .keys()
         .filter(|credential| nono::keystore::is_apple_password_uri(credential))
         .count();
-    let keyring_count = secret_mappings.len() - op_count - apple_password_count;
+    let keyring_count = secret_mappings.len() - op_count - bw_count - apple_password_count;
 
     info!(
-        "Loading {} credential(s) (keyring: {}, 1Password: {}, Apple Passwords: {})",
+        "Loading {} credential(s) (keyring: {}, 1Password: {}, Bitwarden: {}, Apple Passwords: {})",
         secret_mappings.len(),
         keyring_count,
         op_count,
+        bw_count,
         apple_password_count
     );
     if !silent {
@@ -75,6 +80,9 @@ pub(crate) fn load_env_credentials(
         }
         if op_count > 0 {
             source_parts.push(format!("{} from 1Password", op_count));
+        }
+        if bw_count > 0 {
+            source_parts.push(format!("{} from Bitwarden", bw_count));
         }
         if apple_password_count > 0 {
             source_parts.push(format!("{} from Apple Passwords", apple_password_count));
@@ -89,6 +97,8 @@ pub(crate) fn load_env_credentials(
         for account in secret_mappings.keys() {
             let display_account = if nono::keystore::is_op_uri(account) {
                 nono::keystore::redact_op_uri(account)
+            } else if nono::keystore::is_bw_uri(account) {
+                nono::keystore::redact_bw_uri(account)
             } else if nono::keystore::is_apple_password_uri(account) {
                 nono::keystore::redact_apple_password_uri(account)
             } else {

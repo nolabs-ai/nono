@@ -72,11 +72,11 @@ pub use diagnostic::{
 };
 pub use error::{NonoError, Result};
 pub use keystore::{
-    LoadedSecret, is_apple_password_uri, is_env_uri, is_file_uri, is_keyring_uri, is_op_uri,
-    load_secret_by_ref, load_secret_file, load_secrets, redact_apple_password_uri, redact_file_uri,
-    redact_keyring_uri, redact_op_uri, store_secret_file, validate_apple_password_uri,
-    validate_destination_env_var, validate_env_uri, validate_file_uri, validate_keyring_uri,
-    validate_op_uri,
+    LoadedSecret, is_apple_password_uri, is_bw_uri, is_env_uri, is_file_uri, is_keyring_uri,
+    is_op_uri, load_secret_by_ref, load_secret_file, load_secrets, redact_apple_password_uri,
+    redact_bw_uri, redact_file_uri, redact_keyring_uri, redact_op_uri, store_secret_file,
+    validate_apple_password_uri, validate_bw_uri, validate_destination_env_var, validate_env_uri,
+    validate_file_uri, validate_keyring_uri, validate_op_uri,
 };
 pub use net_filter::{FilterResult, HostFilter};
 pub use path::try_canonicalize;

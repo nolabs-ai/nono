@@ -45,8 +45,8 @@ keyring = { version = "3", optional = true }
 # on sigstore-sign or sigstore-trust-root in our own code; this pin
 # exists purely to keep the resolver on a coherent 0.6.3-era set
 # until the upstream API churn settles.
-sigstore-verify = { version = "0.6", default-features = false }
-sigstore-trust-root = "=0.6.3"
+sigstore-verify = { version = "0.8.0", default-features = false }
+sigstore-trust-root = "=0.8.0"
 x509-cert = { version = "0.2", default-features = false }
 der = { version = "0.7", default-features = false }
 

@@ -146,7 +146,7 @@ Define a custom reverse proxy credential route for services not in `network-poli
 | Field               | Type            | Required    | Description |
 |---------------------|-----------------|-------------|-------------|
 | `upstream`          | string          | yes         | Upstream URL. Must be HTTPS (HTTP only for loopback). |
-| `credential_key`    | string          | yes         | Keystore account name, `op://` URI, `apple-password://` URI, `file://` URI, `env://` URI, or `cmd://` URI (references `credential_capture` entry). |
+| `credential_key`    | string          | yes         | Keystore account name, `op://` URI, `bw://` URI, `apple-password://` URI, `file://` URI, `env://` URI, or `cmd://` URI (references `credential_capture` entry). |
 | `inject_mode`       | string          | no          | One of: `"header"` (default), `"url_path"`, `"query_param"`, `"basic_auth"`. |
 | `inject_header`     | string          | header mode | HTTP header name. Default: `"Authorization"`. |
 | `credential_format` | string          | header mode | Format string with `{}` placeholder. Default: `"Bearer {}"`. |
@@ -154,7 +154,7 @@ Define a custom reverse proxy credential route for services not in `network-poli
 | `path_replacement`  | string          | url_path    | Replacement pattern. Defaults to `path_pattern`. |
 | `query_param_name`  | string          | query_param | Query parameter name for credential injection. |
 | `proxy`             | object          | no          | Optional proxy-side overrides for phantom token parsing. Omitted fields inherit from top-level values. |
-| `env_var`           | string          | URI keys    | Environment variable name for SDK API key. Required when `credential_key` is `op://`, `apple-password://`, `file://`, or `cmd://`. Optional for `env://`. |
+| `env_var`           | string          | URI keys    | Environment variable name for SDK API key. Required when `credential_key` is `op://`, `bw://`, `apple-password://`, `file://`, or `cmd://`. Optional for `env://`. |
 | `endpoint_rules`    | array           | no          | L7 allow-list of `{"method": "GET", "path": "/**"}` rules. When non-empty, only matching requests are forwarded (default-deny). |
 | `tls_ca`            | string (path)   | no          | Path to a PEM-encoded CA certificate. Use for upstreams with self-signed or private CA certs (e.g. a Kubernetes API server). |
 | `tls_client_cert`   | string (path)   | no          | Path to a PEM-encoded client certificate for mutual TLS (mTLS). Must be set together with `tls_client_key`. |

@@ -51,7 +51,7 @@
     },
     "env_credentials": {
       "$ref": "#/$defs/SecretsConfig",
-      "description": "Maps keystore account names (or op://, apple-password://, env:// URIs) to environment variable names. Secrets are loaded from the system keystore at startup."
+      "description": "Maps keystore account names (or op://, bw://, apple-password://, env:// URIs) to environment variable names. Secrets are loaded from the system keystore at startup."
     },
     "secrets": {
       "$ref": "#/$defs/SecretsConfig",
@@ -524,7 +524,7 @@
         },
         "credential_key": {
           "type": "string",
-          "description": "Keystore account name for the credential (e.g., \"telegram_bot_token\"), or a 1Password op:// URI, apple-password:// URI, file:// URI, or env:// URI (e.g., \"env://MY_TOKEN\"). Mutually exclusive with auth."
+          "description": "Keystore account name for the credential (e.g., \"telegram_bot_token\"), or a 1Password op:// URI, Bitwarden bw:// URI, apple-password:// URI, file:// URI, or env:// URI (e.g., \"env://MY_TOKEN\"). Mutually exclusive with auth."
         },
         "auth": {
           "$ref": "#/$defs/OAuth2Config",
@@ -580,7 +580,7 @@
             { "type": "string" },
             { "type": "null" }
           ],
-          "description": "Explicit environment variable name for the phantom token (e.g., \"OPENAI_API_KEY\"). Required when credential_key is a URI manager reference (op://, apple-password://, or file://). Optional for env:// (derived from the URI)."
+          "description": "Explicit environment variable name for the phantom token (e.g., \"OPENAI_API_KEY\"). Required when credential_key is a URI manager reference (op://, bw://, apple-password://, or file://). Optional for env:// (derived from the URI)."
         },
         "endpoint_rules": {
           "type": "array",
@@ -711,7 +711,7 @@
     },
     "SecretsConfig": {
       "type": "object",
-      "description": "Maps keystore account names (or op://, apple-password://, env:// URIs) to environment variable names. Secrets are loaded from the system keystore under the service name \"nono\".",
+      "description": "Maps keystore account names (or op://, bw://, apple-password://, env:// URIs) to environment variable names. Secrets are loaded from the system keystore under the service name \"nono\".",
       "additionalProperties": {
         "oneOf": [
           {

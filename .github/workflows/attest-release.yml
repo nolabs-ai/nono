@@ -1,0 +1,41 @@
+name: Attest Existing Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to attest (e.g., v0.2.3)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  attest:
+    if: github.repository == 'always-further/nono'
+    name: Attest Release Artifacts
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download release artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          mkdir -p artifacts
+          gh release download "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern "*.tar.gz" \
+            --pattern "*.deb" \
+            --dir artifacts
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@96b4a1ef7235a096b17240c259729fdd70c83d45 # v2
+        with:
+          subject-path: |
+            artifacts/*.tar.gz
+            artifacts/*.deb

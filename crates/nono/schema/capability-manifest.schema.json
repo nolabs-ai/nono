@@ -214,7 +214,7 @@
         },
         "source": {
           "type": "string",
-          "description": "Credential source URI. Supported schemes: 'env://VAR_NAME' (environment variable), 'file:///path' (file contents), 'op://vault/item/field' (1Password), 'apple-password://server/account' (macOS Keychain), or a bare account name for the system keystore.",
+          "description": "Credential source URI. Supported schemes: 'env://VAR_NAME' (environment variable), 'file:///path' (file contents), 'op://vault/item/field' (1Password), 'bw://item-id' or 'bw://item-id/field' (Bitwarden), 'apple-password://server/account' (macOS Keychain), or a bare account name for the system keystore.",
           "minLength": 1
         },
         "inject": {
@@ -223,7 +223,7 @@
         },
         "env_var": {
           "type": "string",
-          "description": "SDK API key environment variable name for phantom token injection (e.g., 'OPENAI_API_KEY'). Required when source is a URI manager reference (op://, apple-password://, file://) because those URIs cannot be meaningfully uppercased into an environment variable name. When absent for keystore-backed credentials, derived from credential_key.to_uppercase().",
+          "description": "SDK API key environment variable name for phantom token injection (e.g., 'OPENAI_API_KEY'). Required when source is a URI manager reference (op://, bw://, apple-password://, file://) because those URIs cannot be meaningfully uppercased into an environment variable name. When absent for keystore-backed credentials, derived from credential_key.to_uppercase().",
           "minLength": 1
         },
         "endpoint_rules": {

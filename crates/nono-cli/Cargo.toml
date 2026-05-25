@@ -62,7 +62,7 @@ aws-lc-rs = "1"
 keyring = { version = "3", optional = true }
 
 # Keyless (Sigstore/Fulcio/Rekor) signing for instruction file attestation
-sigstore-sign = "0.6"
+sigstore-sign = "0.8.0"
 tokio = { version = "1", features = ["rt"] }
 
 ureq = { version = "3", features = ["platform-verifier"] }

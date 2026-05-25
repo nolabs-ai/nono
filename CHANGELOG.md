@@ -16,6 +16,159 @@
   grants require this metadata; rolling back to older nono builds may read
   those state entries as file-scoped grants.
 
+## [0.57.0] - 2026-05-19
+
+### Bug Fixes
+
+- *(profile)* Fix fmt and test assertion after shadow-check refactor
+
+- *(profile)* Handle versioned package refs in fast path
+
+- *(profiles)* Block profile init when name shadows builtin or pack profile
+
+- *(profiles)* Address review points on shadow-check PR
+
+
+### Dependencies
+
+- *(deps)* Bump aws-lc-rs from 1.16.3 to 1.17.0
+
+
+### Features
+
+- *(profile)* Refine profile name resolution and init validation
+
+- *(profiles)* Expand shadowing checks to include pack profiles
+
+## [0.56.0] - 2026-05-18
+
+### Bug Fixes
+
+- *(startup)* Use SIGKILL consistently and remove dead prompt infrastructure
+
+
+### CI/CD
+
+- Add standalone homebrew-bump workflow; pin to AvesAlight fork for 3xx redirect fix
+
+
+### Documentation
+
+- *(cli)* Clarify startup timeout definition of interactive
+
+
+### Features
+
+- *(cli)* Expand startup timeout interactive detection
+
+- *(cli)* Add option to configure process startup timeout
+
+
+### Refactoring
+
+- *(cli)* Simplify startup timeout check
+
+- *(cli-exec-strategy)* Simplify startup timeout checks
+
+- *(cli)* Require alt-screen for startup timeout
+
+## [0.55.0] - 2026-05-17
+
+
+### Security
+- Sandbox escape on Linux via D-Bus ([GHSA-27vp-2mmc-vmh3](https://github.com/always-further/nono/security/advisories/GHSA-27vp-2mmc-vmh3)) — reported by @cgwalters
+
+GHSA-27vp-2mmc-vmh3 
+
+### Bug Fixes
+
+- *(cli)* Unify macOS exact-path grant restore
+
+- *(cli)* Preserve macOS future-file grants in why --self
+
+- *(pty)* Forward bare ESC immediately in filter_client_input
+
+- *(docker)* Pin Alpine version and add --platform to musl Dockerfiles
+
+- *(musl)* Use as _ for TIOCSCTTY ioctl cast to support all platforms
+
+- *(musl)* Fix libc::Ioctl type mismatches for x86_64-unknown-linux-musl target
+
+- Code review
+
+- *(proxy)* Honor explicit credential_format on custom inject headers
+
+- *(profile-verification)* Strengthen profile and pack verification checks
+
+- *(sandbox)* Correctly resolve af_unix socket paths for seccomp
+
+- Preserve child output without trailing newline (#881)
+
+
+### Dependencies
+
+- *(deps)* Bump clap_complete from 4.6.3 to 4.6.5
+
+
+### Documentation
+
+- *(cli-security-model)* Correct typo in nono description
+
+- *(cli)* Correct grammar in security model doc
+
+- *(cli-security)* Add isolation scope and deployment model
+
+- *(installation)* Add makepkg instructions and Note disclaimer
+
+- *(installation)* Add Arch Linux (AUR) section
+
+- *(capability)* Clarify linux signal mode behavior with landlock
+
+
+### Features
+
+- *(macos)* Treat open_port 0 as localhost:* outbound
+
+- *(package)* Prevent artifact install path conflicts
+
+- *(profile)* Ensure source pack is included for verification
+
+- *(profiles)* Verify pack signer identities
+
+- *(linux)* Implement af_unix pathname mediation
+
+- *(sandbox)* Add explicit allowlist for pathname af_unix sockets
+
+- *(unix-socket)* Record explicit scope for grants
+
+- *(cli)* Add recursive unix socket directory grants
+
+- *(landlock)* Add landlock v6 signal and abstract unix socket scoping
+
+
+### Miscellaneous
+
+- Drop changelog update for issue 943
+
+
+### Refactoring
+
+- *(package)* Base installs on package manifest
+
+- *(supervisor)* Refine ipc denial reporting and audit timestamps
+
+
+### Testing
+
+- *(integration-tests)* Use CARGO_TARGET_DIR in runner
+
+- *(supervisor-linux)* Add unix listener for connect capability test
+
+
+### Cli
+
+- Quiet Landlock deny-overlap diagnostics on Linux
+
 ## [0.54.0] - 2026-05-13
 
 ### BREAKING (fork — Phase 45 Plan 45-02)

@@ -52,7 +52,7 @@
 ### UPST6 Cycle
 
 - [x] **REQ-UPST6-01**: Upstream `v0.54.0..v0.55.0+` audit — DIVERGENCE-LEDGER.md inventory + per-cluster dispositions + `## ADR review` per-cell L/M/H verdict table on 5 dimensions (security/windows/maintenance/divergence/contributor); outcome confirms or revises Phase 33 ADR Option A `continue` strategy.
-- [ ] **REQ-UPST6-02**: Upstream `v0.54.0..v0.55.0+` sync execution — D-19 cherry-picks + D-20 manual replays per UPST6 audit dispositions; D-19 trailer convention + Windows-only-files invariant inherited from Phase 22+34+43; baseline-aware CI gate verified. **IN PROGRESS — 1 of 9 clusters done** (Phase 48 Plan 48-01 / Cluster C4: 9 cherry-picks regression-free after 3 CR-A rounds). Clusters C1/C2/C5/C6/C7/C8/C9/C3 (Plans 48-02..48-09, ~33 commits) remain.
+- [x] **REQ-UPST6-02**: Upstream `v0.54.0..v0.55.0+` sync execution — D-19 cherry-picks + D-20 manual replays per UPST6 audit dispositions; D-19 trailer convention + Windows-only-files invariant inherited from Phase 22+34+43; baseline-aware CI gate verified. **Complete (2026-05-25)** — all 9 clusters absorbed: C4 (9 cherry-picks), C1 (9 cherry-picks), C2 (7 cherry-picks), C5 (3 cherry-picks), C6 (3 cherry-picks), C7 (4 cherry-picks), C8 (2 cherry-picks), C9 (2 D-20 manual-replays; disposition: deferred upgrade), C3 (1 stacked-trailer release-ride commit).
 
 ## v2 Requirements (Deferred)
 
@@ -99,7 +99,7 @@ Populated 2026-05-20 by gsd-roadmapper during ROADMAP.md creation.
 | REQ-UAT-BL-02 | Phase 46 | Complete |
 | REQ-UPST6-01 | Phase 47 | Complete |
 | REQ-DRIFT-INGEST-01 | Phase 47 | Complete |
-| REQ-UPST6-02 | Phase 48 | In progress (1/9 clusters — Plan 48-01/C4 done 2026-05-24) |
+| REQ-UPST6-02 | Phase 48 | Complete (2026-05-25) |
 
 **Coverage:**
 - v1 requirements: 17 total

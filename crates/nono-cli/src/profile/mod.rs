@@ -2756,7 +2756,7 @@ fn load_base_profile_raw(
     context_dir: Option<&Path>,
     source_file: Option<&Path>,
 ) -> Result<ResolvedBase> {
-    if !is_valid_profile_name(name) {
+    if !is_valid_profile_name(name) && !is_registry_ref(name) {
         return Err(NonoError::ProfileInheritance(format!(
             "invalid base profile name '{}'",
             name
@@ -3307,6 +3307,34 @@ pub(crate) fn find_pack_store_profile(name: &str) -> Option<(PathBuf, String)> {
     if !store.exists() {
         return None;
     }
+
+    // Fast path: if name is in `org/pack-name` format, look up the pack directly
+    // rather than scanning every pack's install_as values.
+    if is_registry_ref(name) {
+        return (|| {
+            let (ns, pack_name) = name.split_once('/')?;
+            let pack_path = store.join(ns).join(pack_name);
+            if !pack_path.is_dir() {
+                return None;
+            }
+            let manifest_str =
+                std::fs::read_to_string(pack_path.join("package.json")).ok()?;
+            let manifest: crate::package::PackageManifest =
+                serde_json::from_str(&manifest_str).ok()?;
+            manifest
+                .artifacts
+                .iter()
+                .filter(|a| a.artifact_type == crate::package::ArtifactType::Profile)
+                .find_map(|a| {
+                    let install_as = a.install_as.as_deref()?;
+                    let profile_file = pack_path
+                        .join("profiles")
+                        .join(format!("{install_as}.json"));
+                    profile_file.exists().then(|| (profile_file, name.to_owned()))
+                })
+        })();
+    }
+
     let mut matches: Vec<(String, PathBuf)> = Vec::new();
     let ns_entries = std::fs::read_dir(&store).ok()?;
     for ns_entry in ns_entries.flatten() {

@@ -145,6 +145,10 @@ pub(crate) fn map_error(e: &nono::NonoError) -> types::NonoErrorCode {
         // FFI consumer reads the typed feature+hint via nono_last_error() Display
         // string. NO new NonoErrorCode is added (ABI-stable).
         nono::NonoError::UnsupportedKernelFeature { .. } => NonoErrorCode::ErrUnsupportedPlatform,
+        // Cancelled is a user-facing pre-condition refusal (e.g. shadow-check
+        // in `profile init`). The caller already printed a diagnostic; map to
+        // ErrInvalidArg so FFI consumers see a structured error code.
+        nono::NonoError::Cancelled(_) => NonoErrorCode::ErrInvalidArg,
     }
 }
 

@@ -264,16 +264,13 @@ pub(crate) fn would_shadow_existing_profile(profile_name: &str) -> bool {
     if profile::is_user_override(profile_name) {
         return false;
     }
-    // Check embedded built-in profiles. Treat load failure as fail-safe.
-    let is_builtin = crate::policy::load_embedded_policy()
+    // Only block names that match embedded built-ins. Pack profiles are
+    // referenced by their full `org/name` key (e.g. `always-further/hermes`),
+    // which is an invalid profile name, so a short user profile name like
+    // `hermes` cannot shadow a pack profile.
+    crate::policy::load_embedded_policy()
         .map(|policy| policy.profiles.contains_key(profile_name))
-        .unwrap_or(true);
-    if is_builtin {
-        return true;
-    }
-    // Check pack-store profiles. A user profile with the same name would
-    // shadow the pack profile and break any "extends": "<name>" chains.
-    profile::find_pack_store_profile(profile_name).is_some()
+        .unwrap_or(true)
 }
 
 pub(crate) fn write_profile(prepared: &PreparedProfileSave) -> Result<()> {
@@ -1152,7 +1149,7 @@ mod tests {
     }
 
     #[test]
-    fn would_shadow_existing_profile_flags_installed_pack_profile() {
+    fn would_shadow_existing_profile_allows_short_name_matching_pack_install_as() {
         let _env_lock = ENV_LOCK.lock().expect("env lock");
         let temp_home = TempDir::new().expect("temp home");
         let temp_config = TempDir::new().expect("temp config");
@@ -1173,7 +1170,6 @@ mod tests {
             .join("test-pack");
         std::fs::create_dir_all(pack_dir.join("profiles")).expect("mkdir pack");
 
-        // Write a minimal package.json that declares a profile artifact with install_as "hermes".
         let manifest = r#"{
             "schema_version": 1,
             "name": "test-pack",
@@ -1188,9 +1184,9 @@ mod tests {
         )
         .expect("write pack profile");
 
-        // Saving a user profile named "hermes" would shadow the pack profile.
-        assert!(would_shadow_existing_profile("hermes"));
-        // Unrelated names are still fine.
+        // Pack profiles are referenced by `org/name` (an invalid profile name),
+        // so a user profile named "hermes" does not shadow the pack.
+        assert!(!would_shadow_existing_profile("hermes"));
         assert!(!would_shadow_existing_profile("my-unique-saved-profile"));
     }
 

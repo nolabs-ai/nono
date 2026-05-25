@@ -292,6 +292,12 @@ pub enum NonoError {
     #[error("Per-port network filtering not supported on {platform}: {reason}")]
     NetworkFilterUnsupported { platform: String, reason: String },
 
+    /// Operation cancelled by the user or a pre-condition check. The message
+    /// is displayed to the user if non-empty; an empty string means "silent
+    /// cancel" (the caller already printed a diagnostic).
+    #[error("{0}")]
+    Cancelled(String),
+
     // I/O errors
     #[error("I/O error: {0}")]
     Io(std::io::Error),

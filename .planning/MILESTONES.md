@@ -1,5 +1,36 @@
 # Milestones
 
+## v2.6 UPST6 + v2.5 Drain (Shipped: 2026-05-25)
+
+**Phases completed:** 7 phases, 23 plans, 28 tasks
+
+**Key accomplishments:**
+
+- Drained the 16-WARNING + 12-INFO REVIEW.md backlog inherited from Phase 37 + Phase 43; wired NONO_TRUST_OIDC_ISSUER as production code; deleted the synchronous pack-update path; promoted CGROUP_V2_HINT to a single source of truth; closed every REVIEW finding with an explicit disposition.
+- Drained the v2.5 test-hygiene backlog: Class D deny-overlap re-enabled with security-equivalent either-or assertion, Class E env_vars flakes pinned to subprocess isolation, and cross-binding regression tests landed in both nono-py and nono-ts to lock the v24 broker FFI mapping.
+- 1. [Documentation polish] CLI doc grep gate
+- One-liner:
+- One-liner:
+- One-liner:
+- One-liner:
+- URL:
+- Outcome:
+- Zero `absorbed-via: unmatched` rows detected across the v0.41.0..v0.43.0 backfill ledger.
+- REQ-UPST6-02: IN PROGRESS — this plan closes 1 of 9 clusters.
+- One-liner:
+- Fork SHA:
+- 1. linux.rs test section conflict (C5-01)
+- 1. [Rule 1 - Bug] Edition 2024 `if let` guard syntax in `parse_capability_source`
+- One-liner:
+- One-liner:
+- One-liner:
+- One-liner:
+- One-liner:
+- `nono setup --from-file <PATH>` populates the cached Sigstore trusted root from a local JSON via the existing `load_trusted_root` + `check_trusted_root_freshness` pipeline (D-32-03 expiry gate); byte-identical `std::fs::copy` with best-effort cleanup on failure; clap-mutex with `--refresh-trust-root`. Exits the sigstore-verify dep-bump treadmill for POC users.
+- 1. [Rule 1 - Bug] PowerShell exit-code corruption with `Write-Error` + `$ErrorActionPreference='Stop'`
+
+---
+
 ## v2.5 Backlog Drain + UPST5 (Shipped: 2026-05-20)
 
 **Phases:** 4 phases shipped (37, 41, 42, 43).

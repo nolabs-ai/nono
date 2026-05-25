@@ -2232,6 +2232,14 @@ pub fn load_profile_extends(name_or_path: &str) -> Option<Vec<String>> {
         }
     }
 
+    // Pack-store: any installed pack that declares a profile artifact with
+    // matching `install_as`.
+    if let Some((profile_path, _)) = find_pack_store_profile(name_or_path) {
+        return parse_profile_file(&profile_path)
+            .ok()
+            .and_then(|p| p.extends);
+    }
+
     // Built-in profile
     if let Ok(policy) = crate::policy::load_embedded_policy() {
         if let Some(def) = policy.profiles.get(name_or_path) {
@@ -2313,7 +2321,22 @@ pub fn load_profile_with_context(
         return finalize_profile(load_from_file(&profile_path)?);
     }
 
-    // 2. Fall back to built-in profiles
+    // 2. Pack-store: any installed pack that declares a profile artifact with
+    // matching `install_as`. Inject the source pack ref into `profile.packs`
+    // so it is always present in the verification list.
+    if let Some((profile_path, pack_key)) = find_pack_store_profile(name_or_path) {
+        tracing::info!(
+            "Loading pack-store profile from: {}",
+            profile_path.display()
+        );
+        let mut profile = finalize_profile(load_from_file(&profile_path)?)?;
+        if !profile.packs.contains(&pack_key) {
+            profile.packs.push(pack_key);
+        }
+        return Ok(profile);
+    }
+
+    // 3. Fall back to built-in profiles
     if let Some(profile) = builtin::get_builtin(name_or_path) {
         tracing::info!("Using built-in profile: {}", name_or_path);
         return Ok(profile);
@@ -2765,7 +2788,19 @@ fn load_base_profile_raw(
         return Ok(ResolvedBase::Global(parse_profile_file(&profile_path)?));
     }
 
-    // 2. Built-in profile from embedded policy.
+    // 2. Pack-store: any installed pack with a matching `install_as`.
+    // Inject the source pack key into `packs` so it propagates through
+    // the merge chain and reaches verification even if the profile JSON
+    // doesn't declare its own pack.
+    if let Some((profile_path, pack_key)) = find_pack_store_profile(name) {
+        let mut base = parse_profile_file(&profile_path)?;
+        if !base.packs.contains(&pack_key) {
+            base.packs.push(pack_key);
+        }
+        return Ok(ResolvedBase::Global(base));
+    }
+
+    // 3. Built-in profile from embedded policy.
     let policy = crate::policy::load_embedded_policy()?;
     if let Some(def) = policy.profiles.get(name) {
         return Ok(ResolvedBase::Global(def.to_raw_profile()));
@@ -3253,6 +3288,81 @@ fn current_uid_string() -> String {
 #[cfg(not(unix))]
 fn current_uid_string() -> String {
     "0".to_string()
+}
+
+/// Scan installed packs for a profile artifact whose `install_as` matches
+/// the requested name. Returns `(profile_path, pack_key)` for the first
+/// installed pack that provides a matching profile artifact, or `None` if no
+/// pack provides it. Multiple matches are resolved by returning the first
+/// alphabetically by `<namespace>/<name>` — collisions are rare and the
+/// resolver is best-effort; the operator can pin via the user profile dir
+/// if needed.
+///
+/// Fork-divergence note: upstream's equivalent (introduced before `0015f348`)
+/// also checks `artifact.aliases`; fork's `ArtifactEntry` does not carry an
+/// `aliases` field (upstream-only addition), so alias enumeration is
+/// structurally absent. Only canonical `install_as` matches are returned.
+pub(crate) fn find_pack_store_profile(name: &str) -> Option<(PathBuf, String)> {
+    let store = crate::package::package_store_dir().ok()?;
+    if !store.exists() {
+        return None;
+    }
+    let mut matches: Vec<(String, PathBuf)> = Vec::new();
+    let ns_entries = std::fs::read_dir(&store).ok()?;
+    for ns_entry in ns_entries.flatten() {
+        let ns_path = ns_entry.path();
+        if !ns_path.is_dir() {
+            continue;
+        }
+        let pack_entries = match std::fs::read_dir(&ns_path) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for pack_entry in pack_entries.flatten() {
+            let pack_path = pack_entry.path();
+            if !pack_path.is_dir() {
+                continue;
+            }
+            let manifest_path = pack_path.join("package.json");
+            if !manifest_path.exists() {
+                continue;
+            }
+            let manifest_str = match std::fs::read_to_string(&manifest_path) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let manifest: crate::package::PackageManifest =
+                match serde_json::from_str(&manifest_str) {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+            for artifact in &manifest.artifacts {
+                if artifact.artifact_type != crate::package::ArtifactType::Profile {
+                    continue;
+                }
+                let install_as = match artifact.install_as.as_deref() {
+                    Some(n) => n,
+                    None => continue,
+                };
+                if install_as != name {
+                    continue;
+                }
+                let profile_file = pack_path
+                    .join("profiles")
+                    .join(format!("{install_as}.json"));
+                if profile_file.exists() {
+                    let key = format!(
+                        "{}/{}",
+                        ns_entry.file_name().to_string_lossy(),
+                        pack_entry.file_name().to_string_lossy()
+                    );
+                    matches.push((key, profile_file));
+                }
+            }
+        }
+    }
+    matches.sort_by(|a, b| a.0.cmp(&b.0));
+    matches.into_iter().next().map(|(key, path)| (path, key))
 }
 
 /// Enumerate pack-store-installed profiles as `(profile_name, pack_ref)` pairs.

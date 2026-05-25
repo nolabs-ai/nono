@@ -406,28 +406,22 @@ pub(crate) fn prepare_profile_with_context(
         // upstream's ActionRequired second-callsite for yanked packs.
         // Advisory-only by default; strict via NONO_REQUIRE_PACK_STATUS=1.
         crate::package_status::enforce_for_active_profile(Some(profile_name.as_str()), silent)?;
-        // Ensure the source pack is always verified, regardless of how the
-        // profile was addressed:
-        //   - Direct registry ref (--profile always-further/hermes): strip
-        //     any @version suffix and add the pack key.
-        //   - Profile name or alias (--profile claude): look up which pack
-        //     provides it via the pack store index and add that pack key.
-        // In both cases we skip adding if already listed in profile.packs.
+        // If the profile was addressed by pack ref (e.g. --profile always-further/hermes),
+        // ensure that pack is verified even if the profile JSON doesn't list it in `packs`.
+        // Pack refs are injected into profile.packs at load time for every
+        // pack-store resolution — both direct registry refs and name/alias
+        // paths — so no post-hoc lookup is needed here.
         let mut packs_to_verify = profile.packs.clone();
-        let source_pack_key: Option<String> = if profile::is_registry_ref(profile_name) {
+
+        // For direct registry refs the pack key may not yet be in packs if
+        // load_registry_profile found the pack installed but the profile JSON
+        // predates the injection convention. Guard with a fallback.
+        if profile::is_registry_ref(profile_name) {
             let key = profile_name
                 .as_str()
                 .split_once('@')
                 .map_or(profile_name.as_str(), |(p, _)| p)
                 .to_string();
-            Some(key)
-        } else {
-            profile::list_pack_store_profiles()
-                .into_iter()
-                .find(|(pname, _)| pname == profile_name.as_str())
-                .map(|(_, pack_ref)| pack_ref)
-        };
-        if let Some(key) = source_pack_key {
             if !packs_to_verify.contains(&key) {
                 packs_to_verify.push(key);
             }

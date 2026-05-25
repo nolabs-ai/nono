@@ -416,10 +416,9 @@ fn reserved_profile_source(name: &str) -> nono::Result<Option<&'static str>> {
     if shadows_builtin {
         return Ok(Some("built-in"));
     }
-    // Package-managed check: get_package_for_profile returns Option<PathBuf>.
-    // Drift correction (RESEARCH §Pitfall 2): upstream uses find_pack_store_profile
-    // which does NOT exist in fork. Use get_package_for_profile at profile/mod.rs:1936.
-    if crate::profile::get_package_for_profile(name).is_some() {
+    // Package-managed check: walk the pack store for a profile artifact
+    // matching `name`. Upstream uses find_pack_store_profile directly.
+    if crate::profile::find_pack_store_profile(name).is_some() {
         return Ok(Some("package-managed"));
     }
     Ok(None)

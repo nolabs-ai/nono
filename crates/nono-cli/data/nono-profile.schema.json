@@ -573,9 +573,11 @@
           "default": "Authorization"
         },
         "credential_format": {
-          "type": "string",
-          "description": "Format string for the credential value, using {} as placeholder. Only used when inject_mode is \"header\".",
-          "default": "Bearer {}"
+          "oneOf": [
+            { "type": "string" },
+            { "type": "null" }
+          ],
+          "description": "Template with {} for the secret (header inject mode). If set, used as-is. If omitted: Authorization header (case-insensitive) defaults to Bearer {}; other headers default to {} (secret only)."
         },
         "path_pattern": {
           "oneOf": [

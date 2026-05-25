@@ -300,7 +300,7 @@ mod tests {
             credential_key: None,
             inject_mode: Default::default(),
             inject_header: "Authorization".to_string(),
-            credential_format: "Bearer {}".to_string(),
+            credential_format: Some("Bearer {}".to_string()),
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
@@ -341,7 +341,7 @@ mod tests {
             credential_key: None,
             inject_mode: Default::default(),
             inject_header: "Authorization".to_string(),
-            credential_format: "Bearer {}".to_string(),
+            credential_format: Some("Bearer {}".to_string()),
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
@@ -364,7 +364,7 @@ mod tests {
             credential_key: None,
             inject_mode: Default::default(),
             inject_header: "Authorization".to_string(),
-            credential_format: "Bearer {}".to_string(),
+            credential_format: Some("Bearer {}".to_string()),
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
@@ -388,7 +388,7 @@ mod tests {
                 credential_key: None,
                 inject_mode: Default::default(),
                 inject_header: "Authorization".to_string(),
-                credential_format: "Bearer {}".to_string(),
+                credential_format: Some("Bearer {}".to_string()),
                 path_pattern: None,
                 path_replacement: None,
                 query_param_name: None,
@@ -403,7 +403,7 @@ mod tests {
                 credential_key: None,
                 inject_mode: Default::default(),
                 inject_header: "Authorization".to_string(),
-                credential_format: "Bearer {}".to_string(),
+                credential_format: Some("Bearer {}".to_string()),
                 path_pattern: None,
                 path_replacement: None,
                 query_param_name: None,
@@ -455,6 +455,9 @@ mod tests {
 
     #[test]
     fn test_loaded_route_debug() {
+        // Fork: LoadedRoute has upstream, upstream_host_port, endpoint_rules, tls_connector.
+        // Upstream fields (requires_intercept, requires_managed_credential,
+        // managed_auth_mechanism, managed_injection_mode) are not present in the fork.
         let route = LoadedRoute {
             upstream: "https://api.openai.com".to_string(),
             upstream_host_port: Some("api.openai.com:443".to_string()),
@@ -465,6 +468,14 @@ mod tests {
         assert!(debug_output.contains("api.openai.com"));
         assert!(debug_output.contains("has_custom_tls_ca"));
     }
+
+    // Fork divergence: tests for requires_intercept, requires_managed_credential,
+    // managed_auth_mechanism, managed_injection_mode, lookup_by_upstream,
+    // lookup_all_by_upstream, has_intercept_route, missing_managed_credential,
+    // NetworkAuditAuthMechanism, NetworkAuditInjectionMode, and mTLS
+    // (tls_client_cert/tls_client_key) are not ported. These fields and methods
+    // belong to the upstream tls_intercept module not present in this fork.
+    // Deferred to a future plan that ports the intercept surface.
 
     /// Self-signed CA for testing. Generated with:
     /// openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
@@ -534,4 +545,19 @@ AAAAAAAICAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
             err
         );
     }
+
+    // Fork divergence: mTLS (client certificate) tests omitted.
+    // Fork's route.rs does not have build_tls_connector (4-arg: base+ca+cert+key);
+    // only build_tls_connector_with_ca exists. The mTLS feature
+    // (RouteConfig::tls_client_cert, RouteConfig::tls_client_key,
+    // build_tls_connector multi-arg API) is not yet ported to this fork.
+    // Tests omitted: test_build_tls_connector_cert_without_key_errors,
+    // test_build_tls_connector_key_without_cert_errors,
+    // test_build_tls_connector_missing_client_cert_file,
+    // test_build_tls_connector_missing_client_key_file,
+    // test_build_tls_connector_permission_denied,
+    // test_build_tls_connector_empty_client_cert_pem,
+    // test_build_tls_connector_empty_client_key_pem,
+    // test_route_store_loads_mtls_route.
+    // Deferred to a future plan.
 }

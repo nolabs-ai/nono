@@ -869,11 +869,14 @@ pub struct CustomCredentialDef {
     /// Only used when inject_mode is "header".
     #[serde(default = "default_inject_header")]
     pub inject_header: String,
-    /// Format string for the credential value (default: "Bearer {}")
-    /// Use {} as placeholder for the credential value.
+    /// Format string for the credential value (default: inferred at proxy load).
+    ///
+    /// When omitted, the proxy uses `Bearer {}` for the `Authorization` header and
+    /// `{}` for other header names. When set, the value is used exactly (including
+    /// explicit `Bearer {}` on a custom header).
     /// Only used when inject_mode is "header".
-    #[serde(default = "default_credential_format")]
-    pub credential_format: String,
+    #[serde(default)]
+    pub credential_format: Option<String>,
 
     // --- URL path mode fields ---
     /// Pattern to match in incoming URL path. Use {} as placeholder for phantom token.
@@ -922,10 +925,6 @@ pub struct CustomCredentialDef {
 
 fn default_inject_header() -> String {
     "Authorization".to_string()
-}
-
-fn default_credential_format() -> String {
-    "Bearer {}".to_string()
 }
 
 /// Check if a character is a valid HTTP token character per RFC 7230.
@@ -1103,6 +1102,9 @@ fn validate_custom_credential(name: &str, cred: &CustomCredentialDef) -> Result<
         }
     }
 
+    // Fork divergence: upstream has `cred.proxy` (ProxyInjectConfig) field and
+    // `validate_proxy_override` function here. Fork's CustomCredentialDef does not
+    // yet have the `proxy` field — deferred to a future plan that ports ProxyInjectConfig.
     Ok(())
 }
 
@@ -1168,8 +1170,12 @@ fn validate_header_mode(name: &str, cred: &CustomCredentialDef) -> Result<()> {
         )));
     }
 
-    // Validate credential_format (no CRLF injection)
-    if cred.credential_format.contains('\r') || cred.credential_format.contains('\n') {
+    // Validate effective credential_format (no CRLF injection)
+    let effective_format = nono_proxy::config::resolved_credential_format(
+        cred.inject_header.as_str(),
+        cred.credential_format.as_deref(),
+    );
+    if effective_format.contains('\r') || effective_format.contains('\n') {
         return Err(NonoError::ProfileParse(format!(
             "credential_format for custom credential '{}' contains invalid CRLF characters; \
              this could enable header injection attacks",
@@ -4210,7 +4216,7 @@ mod tests {
             auth: None,
             inject_mode: InjectMode::Header,
             inject_header: "Authorization".to_string(),
-            credential_format: "Bearer {}".to_string(),
+            credential_format: Some("Bearer {}".to_string()),
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
@@ -4255,7 +4261,7 @@ mod tests {
     #[test]
     fn test_validate_custom_credential_invalid_format_rejected() {
         let mut cred = header_cred_builder();
-        cred.credential_format = "Bearer {}\r\nEvil: header".to_string();
+        cred.credential_format = Some("Bearer {}\r\nEvil: header".to_string());
         let result = validate_custom_credential("test", &cred);
         let err = result.expect_err("CRLF in format should be rejected");
         assert!(err.to_string().contains("CRLF"));
@@ -4307,7 +4313,7 @@ mod tests {
     #[test]
     fn test_validate_custom_credential_format_with_cr_rejected() {
         let mut cred = header_cred_builder();
-        cred.credential_format = "Bearer {}\rEvil: header".to_string();
+        cred.credential_format = Some("Bearer {}\rEvil: header".to_string());
         let result = validate_custom_credential("test", &cred);
         let err = result.expect_err("CR in format should be rejected");
         assert!(err.to_string().contains("CRLF"));
@@ -4316,7 +4322,7 @@ mod tests {
     #[test]
     fn test_validate_custom_credential_format_with_lf_rejected() {
         let mut cred = header_cred_builder();
-        cred.credential_format = "Bearer {}\nEvil: header".to_string();
+        cred.credential_format = Some("Bearer {}\nEvil: header".to_string());
         let result = validate_custom_credential("test", &cred);
         let err = result.expect_err("LF in format should be rejected");
         assert!(err.to_string().contains("CRLF"));
@@ -4326,7 +4332,7 @@ mod tests {
     fn test_validate_custom_credential_various_valid_formats() {
         for format in ["Bearer {}", "Token {}", "{}", "Basic {}", "ApiKey={}"] {
             let mut cred = header_cred_builder();
-            cred.credential_format = format.to_string();
+            cred.credential_format = Some(format.to_string());
             assert!(
                 validate_custom_credential("test", &cred).is_ok(),
                 "Expected format '{}' to be valid",
@@ -4387,7 +4393,7 @@ mod tests {
             auth: None,
             inject_mode: InjectMode::UrlPath,
             inject_header: "Authorization".to_string(),
-            credential_format: "Bearer {}".to_string(),
+            credential_format: Some("Bearer {}".to_string()),
             path_pattern: Some("/bot{}/".to_string()),
             path_replacement: None,
             query_param_name: None,
@@ -4406,7 +4412,7 @@ mod tests {
             auth: None,
             inject_mode: InjectMode::UrlPath,
             inject_header: "Authorization".to_string(),
-            credential_format: "Bearer {}".to_string(),
+            credential_format: Some("Bearer {}".to_string()),
             path_pattern: None, // Missing required field
             path_replacement: None,
             query_param_name: None,
@@ -4427,7 +4433,7 @@ mod tests {
             auth: None,
             inject_mode: InjectMode::UrlPath,
             inject_header: "Authorization".to_string(),
-            credential_format: "Bearer {}".to_string(),
+            credential_format: Some("Bearer {}".to_string()),
             path_pattern: Some("/bot/token/".to_string()), // No {} placeholder
             path_replacement: None,
             query_param_name: None,
@@ -4448,7 +4454,7 @@ mod tests {
             auth: None,
             inject_mode: InjectMode::UrlPath,
             inject_header: "Authorization".to_string(),
-            credential_format: "Bearer {}".to_string(),
+            credential_format: Some("Bearer {}".to_string()),
             path_pattern: Some("/bot{}/".to_string()),
             path_replacement: Some("/v2/bot{}/".to_string()),
             query_param_name: None,
@@ -4467,7 +4473,7 @@ mod tests {
             auth: None,
             inject_mode: InjectMode::UrlPath,
             inject_header: "Authorization".to_string(),
-            credential_format: "Bearer {}".to_string(),
+            credential_format: Some("Bearer {}".to_string()),
             path_pattern: Some("/bot{}/".to_string()),
             path_replacement: Some("/v2/bot/fixed/".to_string()), // No {} placeholder
             query_param_name: None,
@@ -4488,7 +4494,7 @@ mod tests {
             auth: None,
             inject_mode: InjectMode::QueryParam,
             inject_header: "Authorization".to_string(),
-            credential_format: "Bearer {}".to_string(),
+            credential_format: Some("Bearer {}".to_string()),
             path_pattern: None,
             path_replacement: None,
             query_param_name: Some("key".to_string()),
@@ -4507,7 +4513,7 @@ mod tests {
             auth: None,
             inject_mode: InjectMode::QueryParam,
             inject_header: "Authorization".to_string(),
-            credential_format: "Bearer {}".to_string(),
+            credential_format: Some("Bearer {}".to_string()),
             path_pattern: None,
             path_replacement: None,
             query_param_name: None, // Missing required field
@@ -4528,7 +4534,7 @@ mod tests {
             auth: None,
             inject_mode: InjectMode::QueryParam,
             inject_header: "Authorization".to_string(),
-            credential_format: "Bearer {}".to_string(),
+            credential_format: Some("Bearer {}".to_string()),
             path_pattern: None,
             path_replacement: None,
             query_param_name: Some("".to_string()), // Empty
@@ -4549,7 +4555,7 @@ mod tests {
             auth: None,
             inject_mode: InjectMode::BasicAuth,
             inject_header: "Authorization".to_string(),
-            credential_format: "Bearer {}".to_string(),
+            credential_format: Some("Bearer {}".to_string()),
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
@@ -4637,6 +4643,34 @@ mod tests {
         let mut cred = header_cred_builder();
         cred.env_var = Some("MY_CUSTOM_VAR".to_string());
         assert!(validate_custom_credential("test", &cred).is_ok());
+    }
+
+    // ============================================================================
+    // OAuth2 auth validation tests
+    // ============================================================================
+
+    fn oauth2_cred_builder() -> CustomCredentialDef {
+        // Fork adaptation: upstream includes proxy/tls_client_cert/tls_client_key fields
+        // not yet in fork's CustomCredentialDef (proxy: ProxyInjectConfig not yet ported).
+        CustomCredentialDef {
+            upstream: "https://api.example.com".to_string(),
+            credential_key: None,
+            auth: Some(OAuth2Config {
+                token_url: "https://auth.example.com/oauth/token".to_string(),
+                client_id: "my-client".to_string(),
+                client_secret: "env://CLIENT_SECRET".to_string(),
+                scope: "read write".to_string(),
+            }),
+            inject_mode: InjectMode::Header,
+            inject_header: "Authorization".to_string(),
+            credential_format: Some("Bearer {}".to_string()),
+            path_pattern: None,
+            path_replacement: None,
+            query_param_name: None,
+            env_var: None,
+            endpoint_rules: vec![],
+            tls_ca: None,
+        }
     }
 
     #[test]
@@ -4931,7 +4965,7 @@ mod tests {
                 auth: None,
                 inject_mode: InjectMode::Header,
                 inject_header: "Authorization".to_string(),
-                credential_format: "Bearer {}".to_string(),
+                credential_format: Some("Bearer {}".to_string()),
                 path_pattern: None,
                 path_replacement: None,
                 query_param_name: None,
@@ -4950,7 +4984,7 @@ mod tests {
                 auth: None,
                 inject_mode: InjectMode::Header,
                 inject_header: "Authorization".to_string(),
-                credential_format: "Token {}".to_string(),
+                credential_format: Some("Token {}".to_string()),
                 path_pattern: None,
                 path_replacement: None,
                 query_param_name: None,
@@ -5087,7 +5121,7 @@ mod tests {
                 auth: None,
                 inject_mode: InjectMode::Header,
                 inject_header: "Authorization".to_string(),
-                credential_format: "Bearer {}".to_string(),
+                credential_format: Some("Bearer {}".to_string()),
                 path_pattern: None,
                 path_replacement: None,
                 query_param_name: None,
@@ -5106,7 +5140,7 @@ mod tests {
                 auth: None,
                 inject_mode: InjectMode::Header,
                 inject_header: "Authorization".to_string(),
-                credential_format: "Token {}".to_string(),
+                credential_format: Some("Token {}".to_string()),
                 path_pattern: None,
                 path_replacement: None,
                 query_param_name: None,
@@ -6350,7 +6384,7 @@ mod tests {
             auth: None,
             inject_mode: InjectMode::Header,
             inject_header: "Authorization".to_string(),
-            credential_format: "Bearer {}".to_string(),
+            credential_format: Some("Bearer {}".to_string()),
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
@@ -6372,7 +6406,7 @@ mod tests {
             auth: None,
             inject_mode: InjectMode::Header,
             inject_header: "Authorization".to_string(),
-            credential_format: "Bearer {}".to_string(),
+            credential_format: Some("Bearer {}".to_string()),
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
@@ -6397,7 +6431,7 @@ mod tests {
             auth: None,
             inject_mode: InjectMode::Header,
             inject_header: "Authorization".to_string(),
-            credential_format: "Bearer {}".to_string(),
+            credential_format: Some("Bearer {}".to_string()),
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
@@ -6422,7 +6456,7 @@ mod tests {
             auth: None,
             inject_mode: InjectMode::Header,
             inject_header: "Authorization".to_string(),
-            credential_format: "Bearer {}".to_string(),
+            credential_format: Some("Bearer {}".to_string()),
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
@@ -6479,7 +6513,7 @@ mod tests {
             auth: None,
             inject_mode: InjectMode::Header,
             inject_header: "Authorization".to_string(),
-            credential_format: "Bearer {}".to_string(),
+            credential_format: Some("Bearer {}".to_string()),
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
@@ -6498,7 +6532,7 @@ mod tests {
             auth: None,
             inject_mode: InjectMode::Header,
             inject_header: "Authorization".to_string(),
-            credential_format: "Bearer {}".to_string(),
+            credential_format: Some("Bearer {}".to_string()),
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
@@ -7054,7 +7088,7 @@ mod tests {
             }),
             inject_mode: InjectMode::Header,
             inject_header: "Authorization".to_string(),
-            credential_format: "Bearer {}".to_string(),
+            credential_format: Some("Bearer {}".to_string()),
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
@@ -7074,7 +7108,7 @@ mod tests {
             auth: None,
             inject_mode: InjectMode::Header,
             inject_header: "Authorization".to_string(),
-            credential_format: "Bearer {}".to_string(),
+            credential_format: Some("Bearer {}".to_string()),
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,

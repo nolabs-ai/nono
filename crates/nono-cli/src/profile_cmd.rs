@@ -2399,12 +2399,15 @@ pub(crate) fn cmd_diff(args: ProfileDiffArgs) -> Result<()> {
                 println!(
                     "      {} credential_format: {}",
                     theme::fg("-", t.red),
-                    theme::fg(&old.credential_format, t.red)
+                    theme::fg(&credential_format_diff_label(&old.credential_format), t.red)
                 );
                 println!(
                     "      {} credential_format: {}",
                     theme::fg("+", t.green),
-                    theme::fg(&new.credential_format, t.green)
+                    theme::fg(
+                        &credential_format_diff_label(&new.credential_format),
+                        t.green
+                    )
                 );
             }
             if old.path_pattern != new.path_pattern {
@@ -2460,6 +2463,14 @@ pub(crate) fn cmd_diff(args: ProfileDiffArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Human-readable label for optional credential_format in profile diffs.
+fn credential_format_diff_label(f: &Option<String>) -> String {
+    match f {
+        None => "(default)".to_string(),
+        Some(s) => s.clone(),
+    }
 }
 
 /// Print a diff for an optional scalar field. Returns true if there was a difference.
@@ -3357,7 +3368,10 @@ fn resolve_to_manifest(
             inject: Some(manifest::CredentialInject {
                 mode: inject_mode,
                 header: cred.inject_header.clone(),
-                format: cred.credential_format.clone(),
+                format: nono_proxy::config::resolved_credential_format(
+                    &cred.inject_header,
+                    cred.credential_format.as_deref(),
+                ),
                 path_pattern: cred.path_pattern.clone(),
                 path_replacement: cred.path_replacement.clone(),
                 query_param_name: cred.query_param_name.clone(),

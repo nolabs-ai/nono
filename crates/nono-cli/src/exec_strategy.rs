@@ -19,7 +19,7 @@ mod supervisor_macos;
 use crate::rollback_runtime::{
     finalize_supervised_exit, AuditState, RollbackExitContext, RollbackRuntimeState,
 };
-use crate::startup_prompt::{print_terminal_safe_stderr, prompt_startup_termination_for_child};
+use crate::startup_prompt::{notify_startup_termination_for_child, print_terminal_safe_stderr};
 #[cfg(target_os = "windows")]
 use crate::{DETACHED_LAUNCH_ENV, DETACHED_SESSION_ID_ENV};
 use nix::libc;
@@ -1859,7 +1859,6 @@ fn wait_for_child_with_pty(
         None => return wait_for_child_with_startup_timeout(child, startup_timeout, killed_by_timeout),
     };
     let startup_deadline = startup_timeout.map(|cfg| (Instant::now() + cfg.timeout, cfg));
-    let mut startup_prompted = false;
 
     loop {
         let (master_fd, client_fd, attach_fd, resize_fd) = pty.poll_fds();
@@ -1917,20 +1916,16 @@ fn wait_for_child_with_pty(
         match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
             Ok(WaitStatus::StillAlive) => {
                 if let Some((deadline, timeout_cfg)) = startup_deadline {
-                    if Instant::now() >= deadline && !pty.is_interactive() && !startup_prompted {
-                        startup_prompted = true;
-                        let terminate = prompt_startup_termination_for_child(
-                            child,
+                    if Instant::now() >= deadline && !pty.is_interactive() {
+                        notify_startup_termination_for_child(
                             timeout_cfg,
                             pty.has_visible_output(),
                             Some(pty),
                         );
-                        if terminate {
-                            *killed_by_timeout = true;
-                            let _ = signal::kill(child, Signal::SIGKILL);
-                            let status = wait_for_child(child)?;
-                            return Ok(status);
-                        }
+                        *killed_by_timeout = true;
+                        let _ = signal::kill(child, Signal::SIGKILL);
+                        let status = wait_for_child(child)?;
+                        return Ok(status);
                     }
                 }
                 continue;
@@ -1960,19 +1955,16 @@ fn wait_for_child_with_startup_timeout(
     killed_by_timeout: &mut bool,
 ) -> Result<WaitStatus> {
     let startup_deadline = startup_timeout.map(|cfg| (Instant::now() + cfg.timeout, cfg));
-    let mut startup_prompted = false;
 
     loop {
         match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
             Ok(WaitStatus::StillAlive) => {
                 if let Some((deadline, timeout_cfg)) = startup_deadline {
-                    if Instant::now() >= deadline && !startup_prompted {
-                        startup_prompted = true;
-                        if prompt_startup_termination_for_child(child, timeout_cfg, true, None) {
-                            *killed_by_timeout = true;
-                            let _ = signal::kill(child, Signal::SIGKILL);
-                            return wait_for_child(child);
-                        }
+                    if Instant::now() >= deadline {
+                        notify_startup_termination_for_child(timeout_cfg, true, None);
+                        *killed_by_timeout = true;
+                        let _ = signal::kill(child, Signal::SIGKILL);
+                        return wait_for_child(child);
                     }
                 }
                 std::thread::sleep(Duration::from_millis(200));
@@ -2298,7 +2290,6 @@ fn run_supervisor_loop(
     let mut denials = Vec::new();
     let mut seen_request_ids = HashSet::new();
     let startup_deadline = startup_timeout.map(|cfg| (Instant::now() + cfg.timeout, cfg));
-    let mut startup_prompted = false;
 
     loop {
         let (pty_master, pty_client, pty_attach, pty_resize) =
@@ -2398,20 +2389,15 @@ fn run_supervisor_loop(
                 if let Some((deadline, timeout_cfg)) = startup_deadline {
                     if Instant::now() >= deadline
                         && !pty.as_ref().is_some_and(|p| p.is_interactive())
-                        && !startup_prompted
                     {
-                        startup_prompted = true;
-                        let terminate = prompt_startup_termination_for_child(
-                            child,
+                        notify_startup_termination_for_child(
                             timeout_cfg,
                             pty.as_ref().is_some_and(|p| p.has_visible_output()),
                             pty.as_deref_mut(),
                         );
-                        if terminate {
-                            *killed_by_timeout = true;
-                            let _ = signal::kill(child, Signal::SIGKILL);
-                            return Ok((wait_for_child(child)?, denials));
-                        }
+                        *killed_by_timeout = true;
+                        let _ = signal::kill(child, Signal::SIGKILL);
+                        return Ok((wait_for_child(child)?, denials));
                     }
                 }
                 continue;
@@ -2487,7 +2473,6 @@ fn run_supervisor_loop(
     let mut seen_request_ids = HashSet::new();
     let mut sock_fd_active = true;
     let startup_deadline = startup_timeout.map(|cfg| (Instant::now() + cfg.timeout, cfg));
-    let mut startup_prompted = false;
 
     loop {
         let mut pfds: Vec<libc::pollfd> = vec![libc::pollfd {
@@ -2653,20 +2638,15 @@ fn run_supervisor_loop(
                 if let Some((deadline, timeout_cfg)) = startup_deadline {
                     if Instant::now() >= deadline
                         && !pty.as_ref().is_some_and(|p| p.is_interactive())
-                        && !startup_prompted
                     {
-                        startup_prompted = true;
-                        let terminate = prompt_startup_termination_for_child(
-                            child,
+                        notify_startup_termination_for_child(
                             timeout_cfg,
                             pty.as_ref().is_some_and(|p| p.has_visible_output()),
                             pty.as_deref_mut(),
                         );
-                        if terminate {
-                            *killed_by_timeout = true;
-                            let _ = signal::kill(child, Signal::SIGTERM);
-                            return Ok((wait_for_child(child)?, denials, ipc_denials));
-                        }
+                        *killed_by_timeout = true;
+                        let _ = signal::kill(child, Signal::SIGKILL);
+                        return Ok((wait_for_child(child)?, denials, ipc_denials));
                     }
                 }
                 continue;

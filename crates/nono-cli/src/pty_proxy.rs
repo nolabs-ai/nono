@@ -612,10 +612,7 @@ impl PtyProxy {
         std::mem::take(&mut self.detach_requested)
     }
 
-    /// Temporarily restore the local terminal so the parent can prompt.
-    ///
-    /// Returns true when a terminal-backed client was paused and must later
-    /// be resumed with [`Self::resume_terminal_after_prompt`].
+    /// Temporarily restore the local terminal so the parent can print a message.
     pub fn pause_terminal_for_prompt(&mut self) -> bool {
         if self
             .client
@@ -627,24 +624,6 @@ impl PtyProxy {
             true
         } else {
             false
-        }
-    }
-
-    /// Re-enter raw mode and redraw the current PTY screen after a prompt.
-    pub fn resume_terminal_after_prompt(&mut self) {
-        if !self
-            .client
-            .as_ref()
-            .is_some_and(AttachedClient::is_terminal)
-        {
-            return;
-        }
-
-        self.saved_termios = set_terminal_raw();
-        enter_attach_screen();
-        let replay = self.attach_replay_bytes();
-        if let Some(client) = self.client.as_ref() {
-            let _ = write_all_fd(client.write_fd(), &replay);
         }
     }
 

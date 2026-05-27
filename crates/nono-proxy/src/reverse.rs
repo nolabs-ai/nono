@@ -859,6 +859,23 @@ async fn handle_cmd_credential(
     {
         warn!("Upstream connection failed: {}", e);
         send_error(stream, 502, "Bad Gateway").await?;
+        audit::log_denied(
+            ctx.audit_log,
+            audit::ProxyMode::Reverse,
+            &audit::EventContext {
+                route_id: Some(service),
+                auth_mechanism: Some(auth_mechanism_for_inject_mode(&cmd_cfg.inject_mode)),
+                auth_outcome: Some(nono::undo::NetworkAuditAuthOutcome::Succeeded),
+                managed_credential_active: Some(true),
+                injection_mode: Some(audit_injection_mode_for_inject_mode(&cmd_cfg.inject_mode)),
+                denial_category: Some(
+                    nono::undo::NetworkAuditDenialCategory::UpstreamConnectFailed,
+                ),
+            },
+            service,
+            0,
+            &e.to_string(),
+        );
     }
 
     Ok(())

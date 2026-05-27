@@ -26,6 +26,7 @@ mod execution_runtime;
 #[cfg(unix)]
 mod hook_runtime;
 mod instruction_deny;
+mod jsonc;
 mod launch_runtime;
 mod learn;
 mod learn_runtime;

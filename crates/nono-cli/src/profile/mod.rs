@@ -2336,14 +2336,7 @@ pub(crate) fn parse_profile_bytes(content: &[u8]) -> Result<Profile> {
     let text = std::str::from_utf8(content)
         .map_err(|e| NonoError::ProfileParse(format!("invalid UTF-8: {e}")))?;
 
-    let parse_options = jsonc_parser::ParseOptions {
-        allow_comments: true,
-        allow_trailing_commas: true,
-        ..Default::default()
-    };
-
-    let profile: Profile = jsonc_parser::parse_to_serde_value(text, &parse_options)
-        .map_err(|e| NonoError::ProfileParse(e.to_string()))?;
+    let profile: Profile = crate::jsonc::parse(text).map_err(NonoError::ProfileParse)?;
 
     // Validate custom credentials for security issues
     validate_profile_custom_credentials(&profile)?;

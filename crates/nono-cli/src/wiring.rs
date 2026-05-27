@@ -791,7 +791,7 @@ fn copy_file_atomic(source: &Path, dest: &Path) -> Result<CopyOutcome> {
 
 fn read_json(path: &Path) -> Result<Value> {
     let content = fs::read_to_string(path).map_err(NonoError::Io)?;
-    serde_json::from_str(&content)
+    crate::jsonc::parse(&content)
         .map_err(|e| NonoError::PackageInstall(format!("invalid JSON in {}: {e}", path.display())))
 }
 
@@ -1686,6 +1686,50 @@ mod tests {
     }
 
     #[test]
+    fn json_merge_accepts_jsonc_in_target_and_patch() {
+        with_fake_home(|home| {
+            let pack = home.join("pack");
+            fs::create_dir_all(&pack).expect("mkdir pack");
+            fs::write(
+                pack.join("patch.json"),
+                r#"{
+                    // Pack patches may carry comments too.
+                    "enabledPlugins": {
+                        "nono": true,
+                    },
+                }"#,
+            )
+            .expect("write patch");
+            let target = home.join("settings.json");
+            fs::write(
+                &target,
+                r#"{
+                    // User config comments must not break package wiring.
+                    "effortLevel": "xhigh",
+                }"#,
+            )
+            .expect("seed target");
+
+            let ctx = ctx_in(home, pack);
+            let directives = vec![WiringDirective::JsonMerge {
+                file: "$HOME/settings.json".to_string(),
+                patch: "patch.json".to_string(),
+            }];
+            let report = exec(&directives, &ctx).expect("execute");
+            let v: Value =
+                serde_json::from_str(&fs::read_to_string(&target).expect("read")).expect("parse");
+            assert_eq!(v["effortLevel"], "xhigh", "preserve unrelated keys");
+            assert_eq!(v["enabledPlugins"]["nono"], true);
+
+            rev(&report.records);
+            let v2: Value =
+                serde_json::from_str(&fs::read_to_string(&target).expect("read")).expect("parse");
+            assert_eq!(v2["effortLevel"], "xhigh", "unrelated keys still present");
+            assert!(v2.get("enabledPlugins").is_none(), "merged keys gone");
+        });
+    }
+
+    #[test]
     fn json_array_append_dedups_by_key_field() {
         with_fake_home(|home| {
             let pack = home.join("pack");
@@ -1717,6 +1761,56 @@ mod tests {
             );
 
             rev(&r1.records);
+            let v2: Value =
+                serde_json::from_str(&fs::read_to_string(&target).expect("read")).expect("parse");
+            assert_eq!(
+                v2["hooks"]["PostToolUse"].as_array().expect("array").len(),
+                0
+            );
+        });
+    }
+
+    #[test]
+    fn json_array_append_accepts_jsonc_in_target_and_patch() {
+        with_fake_home(|home| {
+            let pack = home.join("pack");
+            fs::create_dir_all(&pack).expect("mkdir pack");
+            fs::write(
+                pack.join("entries.json"),
+                r#"[
+                    // Pack-provided append entries can be JSONC.
+                    { "name": "nono", "command": "x" },
+                ]"#,
+            )
+            .expect("write entries");
+
+            let target = home.join("hooks.json");
+            fs::write(
+                &target,
+                r#"{
+                    // Mirrors user-owned config files such as Copilot config.
+                    "hooks": {
+                        "PostToolUse": [],
+                    },
+                }"#,
+            )
+            .expect("seed target");
+            let ctx = ctx_in(home, pack);
+            let directives = vec![WiringDirective::JsonArrayAppend {
+                file: "$HOME/hooks.json".to_string(),
+                path: "hooks.PostToolUse".to_string(),
+                patch_entries: "entries.json".to_string(),
+                key_field: "name".to_string(),
+            }];
+            let report = exec(&directives, &ctx).expect("execute");
+
+            let v: Value =
+                serde_json::from_str(&fs::read_to_string(&target).expect("read")).expect("parse");
+            let entries = v["hooks"]["PostToolUse"].as_array().expect("array");
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0]["name"], "nono");
+
+            rev(&report.records);
             let v2: Value =
                 serde_json::from_str(&fs::read_to_string(&target).expect("read")).expect("parse");
             assert_eq!(

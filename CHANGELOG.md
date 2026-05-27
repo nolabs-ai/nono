@@ -1,5 +1,54 @@
 # Changelog
 
+## [0.59.0] - 2026-05-27
+
+### Bug Fixes
+
+- *(proxy)* Enforce endpoint rules before credential selection in TLS intercept
+
+- Formatting
+
+- Tighten up overflow checks
+
+- Use rfind for access mode spliting; add test
+
+- Annotate suppressed denials and style save prompt paths (#984)
+
+- Restore jsonc-parser dep
+
+- Use fully qualified pack name in Quick Start example
+
+- Correct Quick Start profile reference in README
+
+
+### Dependencies
+
+- *(deps)* Bump shlex from 1.3.0 to 2.0.1
+
+
+### Documentation
+
+- Note [save skipped] annotation in suppress_save_prompt sections
+
+
+### Features
+
+- *(cli)* Allow-domain accepts URL with path for endpoint restrictions
+
+- *(cli)* Support fine-grained method+path restrictions in allow_domain (#960)
+
+- *(cli)* Centralize timeout constants and make user-facing timeouts configurable
+
+
+### Refactoring
+
+- *(profile)* Extract opencode profile from built-ins
+
+
+### Diagnostic
+
+- Pre-compute canonical denial paths to avoid repeated fs I/O
+
 ## [0.58.0] - 2026-05-26
 
 ### Bug Fixes

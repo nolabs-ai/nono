@@ -38,10 +38,12 @@ pub mod bundle;
 pub mod ca;
 pub mod cert_cache;
 pub(crate) mod h2_forward;
+pub(crate) mod h2_probe;
 pub mod handle;
 
 pub use acceptor::build_server_config;
 pub use bundle::{BundleInputs, write_bundle};
 pub use ca::EphemeralCa;
 pub use cert_cache::CertCache;
+pub(crate) use h2_probe::UpstreamH2Cache;
 pub use handle::{InterceptCtx, InterceptUpstreamProxy, handle_intercept_connect};

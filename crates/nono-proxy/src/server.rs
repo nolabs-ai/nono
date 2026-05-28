@@ -18,7 +18,7 @@ use crate::filter::ProxyFilter;
 use crate::pool::UpstreamPool;
 use crate::reverse;
 use crate::route::RouteStore;
-use crate::tls_intercept::{self, CertCache, EphemeralCa};
+use crate::tls_intercept::{self, CertCache, EphemeralCa, UpstreamH2Cache};
 use crate::token;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -411,6 +411,9 @@ struct ProxyState {
     cert_cache: Option<Arc<CertCache>>,
     /// Whether HTTP/2 is enabled for upstream connections and intercept ALPN.
     enable_h2: bool,
+    /// Per-host HTTP/2 capability cache. Populated by pre-flight probes so
+    /// the inbound acceptor only advertises h2 when the upstream supports it.
+    h2_cache: Arc<UpstreamH2Cache>,
 }
 
 /// Start the proxy server.
@@ -696,6 +699,7 @@ pub async fn start_with_nonce_resolver(
         bypass_matcher,
         cert_cache,
         enable_h2,
+        h2_cache: UpstreamH2Cache::new(),
     });
 
     // Spawn accept loop as a task within the current runtime.
@@ -993,6 +997,17 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
                                 None
                             };
 
+                        // Pre-flight h2 probe: only advertise h2 to the agent
+                        // when the upstream actually negotiates it, avoiding
+                        // NoApplicationProtocol against h1-only upstreams.
+                        let upstream_h2 = if state.enable_h2 {
+                            state
+                                .h2_cache
+                                .get_or_probe(&host, port, &state.filter, &state.tls_connector_h2)
+                                .await
+                        } else {
+                            false
+                        };
                         let ctx = tls_intercept::InterceptCtx {
                             route_id,
                             host: &host,
@@ -1009,7 +1024,7 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
                             approval_backends: state.approval_backends.clone(),
                             credential_capture_backend: state.credential_capture_backend.clone(),
                             nonce_resolver: state.nonce_resolver.clone(),
-                            enable_h2: state.enable_h2,
+                            enable_h2: upstream_h2,
                         };
                         return tls_intercept::handle_intercept_connect(&mut stream, ctx).await;
                     }

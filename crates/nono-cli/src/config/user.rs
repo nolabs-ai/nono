@@ -33,6 +33,20 @@ pub struct UserConfig {
     pub ui: UiSettings,
     #[serde(default)]
     pub redaction: RedactionSettings,
+    #[serde(default)]
+    pub network: NetworkApprovalConfig,
+}
+
+/// Network approval configuration
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct NetworkApprovalConfig {
+    /// Whether to prompt the user when a blocked host is requested.
+    /// Values: "off" (default), "ask"
+    #[serde(default)]
+    pub approval_mode: Option<String>,
+    /// Seconds to wait for user approval before denying (default: 60)
+    #[serde(default)]
+    pub approval_timeout_secs: Option<u64>,
 }
 
 /// UI display settings
@@ -527,5 +541,25 @@ detach_sequence = "ctrl-]"
             .map(|e| e.to_string())
             .unwrap_or_default();
         assert!(err.contains("detach sequence must contain at least two key presses"));
+    }
+
+    #[test]
+    fn test_network_approval_config_defaults() {
+        let toml = "";
+        let config: UserConfig = toml::from_str(toml).expect("Failed to parse");
+        assert!(config.network.approval_mode.is_none());
+        assert!(config.network.approval_timeout_secs.is_none());
+    }
+
+    #[test]
+    fn test_network_approval_config_custom() {
+        let toml = r#"
+[network]
+approval_mode = "ask"
+approval_timeout_secs = 120
+"#;
+        let config: UserConfig = toml::from_str(toml).expect("Failed to parse");
+        assert_eq!(config.network.approval_mode.as_deref(), Some("ask"));
+        assert_eq!(config.network.approval_timeout_secs, Some(120));
     }
 }

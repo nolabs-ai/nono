@@ -2738,6 +2738,25 @@ fn handle_supervisor_message(
                 recorder.record_open_url(url_request, success, error)?;
             }
         }
+        SupervisorMessage::NetworkApproval(request) => {
+            let request_id = request.request_id.clone();
+
+            let decision = match config.approval_backend.request_network_approval(&request) {
+                Ok(d) => d,
+                Err(e) => {
+                    warn!("Network approval backend error, denying: {e}");
+                    nono::NetworkApprovalDecision::Denied {
+                        reason: format!("Approval backend error: {e}"),
+                    }
+                }
+            };
+
+            let response = SupervisorResponse::NetworkDecision {
+                request_id,
+                decision,
+            };
+            sock.send_response(&response)?;
+        }
     }
 
     Ok(())
@@ -2815,6 +2834,9 @@ fn response_decision(response: &SupervisorResponse) -> ApprovalDecision {
     match response {
         SupervisorResponse::Decision { decision, .. } => decision.clone(),
         SupervisorResponse::UrlOpened { .. } => ApprovalDecision::Denied {
+            reason: "invalid supervisor response type for capability decision".to_string(),
+        },
+        SupervisorResponse::NetworkDecision { .. } => ApprovalDecision::Denied {
             reason: "invalid supervisor response type for capability decision".to_string(),
         },
     }

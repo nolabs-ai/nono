@@ -300,7 +300,11 @@ pub fn resolve_credentials(
 ///
 /// Combines resolved hosts/suffixes with credential routes and optional
 /// CLI overrides (extra hosts).
-pub fn build_proxy_config(resolved: &ResolvedNetworkPolicy, extra_hosts: &[String]) -> ProxyConfig {
+pub fn build_proxy_config(
+    resolved: &ResolvedNetworkPolicy,
+    extra_hosts: &[String],
+    rejected_hosts: &[String],
+) -> ProxyConfig {
     let mut allowed_hosts = resolved.hosts.clone();
     // Convert suffixes to wildcard format for the proxy filter
     for suffix in &resolved.suffixes {
@@ -316,6 +320,7 @@ pub fn build_proxy_config(resolved: &ResolvedNetworkPolicy, extra_hosts: &[Strin
 
     ProxyConfig {
         allowed_hosts,
+        rejected_hosts: rejected_hosts.to_vec(),
         routes: resolved.routes.clone(),
         ..Default::default()
     }
@@ -709,7 +714,7 @@ mod tests {
             routes: vec![],
             profile_credentials: vec![],
         };
-        let config = build_proxy_config(&resolved, &["extra.example.com".to_string()]);
+        let config = build_proxy_config(&resolved, &["extra.example.com".to_string()], &[]);
         assert!(config.allowed_hosts.contains(&"api.openai.com".to_string()));
         assert!(
             config

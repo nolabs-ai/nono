@@ -162,6 +162,9 @@ pub enum NonoError {
     #[error("Instruction file denied: {path}: {reason}")]
     InstructionFileDenied { path: String, reason: String },
 
+    #[error("Invalid configuration: {reason}")]
+    InvalidConfig { reason: String },
+
     #[error("Package install error: {0}")]
     PackageInstall(String),
 

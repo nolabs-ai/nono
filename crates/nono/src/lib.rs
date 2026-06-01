@@ -54,6 +54,7 @@ pub mod manifest_convert;
 pub mod net_filter;
 pub mod path;
 pub mod query;
+pub mod runtime_filter;
 pub mod sandbox;
 pub mod scrub;
 pub mod state;
@@ -80,6 +81,7 @@ pub use keystore::{
 };
 pub use net_filter::{FilterResult, HostFilter};
 pub use path::try_canonicalize;
+pub use runtime_filter::RuntimeHostFilter;
 #[cfg(target_os = "linux")]
 pub use sandbox::{DetectedAbi, LandlockScopePolicy, detect_abi, is_wsl2, landlock_scope_policy};
 pub use sandbox::{Sandbox, SupportInfo};
@@ -89,8 +91,8 @@ pub use scrub::{
 };
 pub use state::SandboxState;
 pub use supervisor::{
-    ApprovalBackend, ApprovalDecision, CapabilityRequest, SupervisorListener, SupervisorSocket,
-    UrlOpenRequest,
+    ApprovalBackend, ApprovalDecision, ApprovalScope, CapabilityRequest, NetworkApprovalDecision,
+    NetworkApprovalRequest, SupervisorListener, SupervisorSocket, UrlOpenRequest,
 };
 pub use trust::{
     Enforcement, IncludePatterns, Publisher, SignerIdentity, TrustPolicy, VerificationOutcome,

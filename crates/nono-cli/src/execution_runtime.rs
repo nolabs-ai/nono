@@ -420,6 +420,10 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
                 audit_signer: audit_signer.as_ref(),
                 redaction_policy: &flags.redaction_policy,
                 silent: flags.silent,
+                approval_backend: active_proxy
+                    .approval_backend
+                    .as_ref()
+                    .map(|a| a.as_ref() as &dyn nono::ApprovalBackend),
             })?;
 
             // ---- After-hook execution (Unix-only) ----

@@ -19,7 +19,7 @@ system-keyring = ["nono/system-keyring"]
 
 [dependencies]
 nono = { version = "0.60.0", path = "../nono", default-features = false }
-tokio.workspace = true
+tokio = { workspace = true, features = ["sync", "time"] }
 hyper.workspace = true
 hyper-util.workspace = true
 http-body-util.workspace = true

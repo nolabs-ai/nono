@@ -118,12 +118,28 @@ All path fields support variable expansion (see Section 6).
 | `block`                 | boolean                           | `false`  | Block all network access. |
 | `network_profile`       | string or null                    | inherit  | Name from `network-policy.json` for proxy filtering. Set to `null` to clear inherited value. |
 | `allow_domain`          | array of string or object         | `[]`     | Additional domains to allow through the proxy. Entries can be plain strings (CONNECT tunnel) or objects with endpoint rules (TLS-intercepted L7 filtering). Aliases: `proxy_allow`, `allow_proxy`. |
+| `reject_domain`         | array of string                   | `[]`     | Domains to always reject, even if they appear in `allow_domain`. Supports `*.` wildcard suffixes (e.g. `*.tracker.com`). |
 | `credentials`           | array of string                   | `[]`     | Credential services to enable via reverse proxy. Alias: `proxy_credentials`. |
 | `open_port`             | array of integer                  | `[]`     | Localhost TCP IPC. Aliases: `port_allow`, `allow_port`. Port **0**: macOS only (`localhost:*` outbound); Linux: explicit ports. |
 | `listen_port`           | array of integer                  | `[]`     | TCP ports the sandboxed child may listen on. |
 | `custom_credentials`    | map of string to credential def   | `{}`     | Custom credential route definitions (see below). |
 | `upstream_proxy`        | string                            | `null`   | Enterprise proxy address (`host:port`). Alias: `external_proxy`. |
 | `upstream_bypass`       | array of string                   | `[]`     | Hosts to bypass the upstream proxy. Supports `*.` wildcard suffixes. Alias: `external_proxy_bypass`. |
+| `approval_mode`         | string                            | `"off"`  | How to handle requests to blocked hosts: `"off"` (deny immediately), `"ask"` (OS notification with action buttons). |
+| `approval_timeout_secs` | integer                           | `60`     | Seconds to wait for user approval before denying. Only applies when `approval_mode` is not `"off"`. |
+
+Example — allow API access but block known trackers, with runtime approval for unknown hosts:
+
+```json
+{
+  "network": {
+    "allow_domain": ["api.openai.com", "*.googleapis.com"],
+    "reject_domain": ["*.tracker.io", "ads.example.com"],
+    "approval_mode": "ask",
+    "approval_timeout_secs": 30
+  }
+}
+```
 
 #### allow_domain with endpoint restrictions
 

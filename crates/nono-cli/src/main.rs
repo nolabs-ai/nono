@@ -33,7 +33,9 @@ mod legacy_cleanup;
 #[cfg(target_os = "macos")]
 mod macos_trust;
 mod migration;
+mod network_approval;
 mod network_policy;
+mod notification;
 mod open_url_runtime;
 mod output;
 mod pack_update_hint;
@@ -268,6 +270,7 @@ mod tests {
             allow_domain: vec![profile::AllowDomainEntry::Plain(
                 "docs.python.org".to_string(),
             )],
+            reject_domain: vec![],
             credentials: vec!["github".to_string()],
             custom_credentials: std::collections::HashMap::new(),
             upstream_proxy: None,
@@ -286,6 +289,8 @@ mod tests {
             ignored_denial_paths: Vec::new(),
             allowed_env_vars: None,
             denied_env_vars: None,
+            profile_network_approval_mode: None,
+            profile_network_approval_timeout_secs: None,
         };
 
         let effective = resolve_effective_proxy_settings(&args, &prepared);
@@ -295,6 +300,7 @@ mod tests {
             EffectiveProxySettings {
                 network_profile: None,
                 allow_domain: Vec::new(),
+                reject_domain: Vec::new(),
                 credentials: Vec::new(),
             }
         );
@@ -318,6 +324,7 @@ mod tests {
             allow_domain: vec![profile::AllowDomainEntry::Plain(
                 "docs.python.org".to_string(),
             )],
+            reject_domain: vec![],
             credentials: vec!["github".to_string()],
             custom_credentials: std::collections::HashMap::new(),
             upstream_proxy: None,
@@ -336,6 +343,8 @@ mod tests {
             ignored_denial_paths: Vec::new(),
             allowed_env_vars: None,
             denied_env_vars: None,
+            profile_network_approval_mode: None,
+            profile_network_approval_timeout_secs: None,
         };
 
         let effective = resolve_effective_proxy_settings(&args, &prepared);
@@ -348,6 +357,7 @@ mod tests {
                     profile::AllowDomainEntry::Plain("docs.python.org".to_string()),
                     profile::AllowDomainEntry::Plain("example.com".to_string()),
                 ],
+                reject_domain: vec![],
                 credentials: vec!["github".to_string(), "openai".to_string()],
             }
         );

@@ -13,7 +13,7 @@ use crate::{
 };
 use colored::Colorize;
 use nono::undo::ExecutableIdentity;
-use nono::{CapabilitySet, Result};
+use nono::{ApprovalBackend, CapabilitySet, Result};
 use std::io::IsTerminal;
 use std::sync::Mutex;
 
@@ -37,6 +37,7 @@ pub(crate) struct SupervisedRuntimeContext<'a> {
     pub(crate) audit_signer: Option<&'a AuditSigner>,
     pub(crate) redaction_policy: &'a nono::ScrubPolicy,
     pub(crate) silent: bool,
+    pub(crate) approval_backend: Option<&'a dyn ApprovalBackend>,
 }
 
 fn build_supervisor_session_id(audit_state: Option<&AuditState>) -> String {
@@ -164,6 +165,7 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
         audit_signer,
         redaction_policy,
         silent,
+        approval_backend,
     } = ctx;
 
     output::print_applying_sandbox(silent);
@@ -171,12 +173,6 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
     let audit_state = create_audit_state(rollback.audit_disabled, rollback.destination.as_ref())?;
     warn_if_rollback_flags_ignored(rollback, silent);
 
-    // Create the session guard (writes session file) and PTY pair BEFORE
-    // rollback initialization.  Rollback's baseline snapshot can take many
-    // seconds on large repos.  In detached mode the launcher is polling for
-    // the session file and attach socket — if we delay session registration
-    // until after the baseline walk, the 30-second startup timeout can fire
-    // before the session becomes attachable.
     let trust_interceptor = create_trust_interceptor(trust);
     let session_runtime = create_session_runtime_state(
         command,
@@ -224,11 +220,12 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
     }
 
     let protected_roots = protected_paths::ProtectedRoots::from_defaults()?;
-    let approval_backend = terminal_approval::TerminalApproval;
+    let terminal_fallback = terminal_approval::TerminalApproval;
+    let backend: &dyn ApprovalBackend = approval_backend.unwrap_or(&terminal_fallback);
     let supervisor_session_id = build_supervisor_session_id(audit_state.as_ref());
     let supervisor_cfg = exec_strategy::SupervisorConfig {
         protected_roots: protected_roots.as_paths(),
-        approval_backend: &approval_backend,
+        approval_backend: backend,
         session_id: &supervisor_session_id,
         attach_initial_client: !session.detached_start,
         detach_sequence: session.detach_sequence.as_deref(),

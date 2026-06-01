@@ -422,6 +422,7 @@ pub(crate) struct PreparedSandbox {
     pub(crate) rollback_exclude_globs: Vec<String>,
     pub(crate) network_profile: Option<String>,
     pub(crate) allow_domain: Vec<profile::AllowDomainEntry>,
+    pub(crate) reject_domain: Vec<String>,
     pub(crate) credentials: Vec<String>,
     pub(crate) custom_credentials: HashMap<String, profile::CustomCredentialDef>,
     pub(crate) upstream_proxy: Option<String>,
@@ -440,6 +441,8 @@ pub(crate) struct PreparedSandbox {
     pub(crate) ignored_denial_paths: Vec<PathBuf>,
     pub(crate) allowed_env_vars: Option<Vec<String>>,
     pub(crate) denied_env_vars: Option<Vec<String>>,
+    pub(crate) profile_network_approval_mode: Option<String>,
+    pub(crate) profile_network_approval_timeout_secs: Option<u64>,
 }
 
 fn resolved_workdir(args: &SandboxArgs) -> PathBuf {
@@ -1050,6 +1053,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
                 rollback_exclude_globs,
                 network_profile: None,
                 allow_domain,
+                reject_domain: Vec::new(),
                 credentials,
                 custom_credentials: HashMap::new(),
                 upstream_proxy: None,
@@ -1068,6 +1072,8 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
                 ignored_denial_paths: Vec::new(),
                 allowed_env_vars: None,
                 denied_env_vars: None,
+                profile_network_approval_mode: None,
+                profile_network_approval_timeout_secs: None,
             },
             args,
             silent,
@@ -1087,6 +1093,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         rollback_exclude_globs: profile_rollback_globs,
         network_profile: profile_network_profile,
         allow_domain: profile_allow_domain,
+        reject_domain: profile_reject_domain,
         credentials: profile_credentials,
         custom_credentials: profile_custom_credentials,
         upstream_proxy: profile_upstream_proxy,
@@ -1101,6 +1108,8 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         ignored_denial_paths,
         allowed_env_vars: profile_allowed_env_vars,
         denied_env_vars: profile_denied_env_vars,
+        network_approval_mode: profile_network_approval_mode,
+        network_approval_timeout_secs: profile_network_approval_timeout_secs,
     } = prepared_profile;
 
     let session_hooks = loaded_profile
@@ -1350,6 +1359,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
             rollback_exclude_globs: profile_rollback_globs,
             network_profile: profile_network_profile,
             allow_domain: profile_allow_domain,
+            reject_domain: profile_reject_domain,
             credentials: profile_credentials,
             custom_credentials: profile_custom_credentials,
             upstream_proxy: profile_upstream_proxy,
@@ -1368,6 +1378,8 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
             ignored_denial_paths,
             allowed_env_vars: profile_allowed_env_vars,
             denied_env_vars: profile_denied_env_vars,
+            profile_network_approval_mode,
+            profile_network_approval_timeout_secs,
         },
         args,
         silent,

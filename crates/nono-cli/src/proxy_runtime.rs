@@ -353,10 +353,10 @@ pub(crate) fn start_proxy_runtime(
 
             let (tx, mut rx) = tokio::sync::mpsc::channel::<nono_proxy::ApprovalChannelRequest>(16);
 
-            let config_writer = proxy
-                .network_profile
-                .as_deref()
-                .map(crate::network_approval::ConfigWriter::new);
+            let config_writer = match proxy.network_profile.as_deref() {
+                Some(name) => Some(crate::network_approval::ConfigWriter::new(name)),
+                None => Some(crate::network_approval::ConfigWriter::new("default")),
+            };
 
             let backend = NetworkApprovalBackend::new(
                 proxy.network_approval_mode,

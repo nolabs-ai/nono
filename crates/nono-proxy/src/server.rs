@@ -480,17 +480,10 @@ pub async fn start(
     // checked here (rather than relying solely on the CLI's decision) so a
     // misconfigured `intercept_ca_dir` without intercept-bearing routes
     // doesn't generate a useless CA on disk.
-    let any_intercept_route = route_store
-        .route_upstream_hosts()
-        .iter()
-        .any(|hp| route_store.has_intercept_route(hp));
+    let any_intercept_route = route_store.has_any_intercept_route();
     let (cert_cache, intercept_ca_path) = match (&config.intercept_ca_dir, any_intercept_route) {
         (Some(dir), true) => {
-            let intercept_route_count = route_store
-                .route_upstream_hosts()
-                .iter()
-                .filter(|hp| route_store.has_intercept_route(hp))
-                .count();
+            let intercept_route_count = route_store.intercept_route_count();
             let ca_result = if let Some(ref preloaded) = config.preloaded_ca {
                 EphemeralCa::from_existing(&preloaded.key_der, &preloaded.cert_pem)
             } else {

@@ -860,6 +860,28 @@ fn validate_query_param_mode(name: &str, cred: &CustomCredentialDef) -> Result<(
 /// - `0.0.0.0` (unspecified IPv4, binds to all interfaces)
 /// - `::` (unspecified IPv6)
 fn validate_upstream_url(url: &str, service_name: &str) -> Result<()> {
+    // Wildcard upstreams (e.g. "https://*.example.com") match many hosts under
+    // TLS interception. `*` is not a valid URL host character, so url::Url
+    // would reject them — validate the shape directly. HTTPS-only, since a
+    // wildcard has no concrete forward target and only works intercepted.
+    if let Some((scheme, rest)) = url.split_once("://*.") {
+        if scheme != "https" {
+            return Err(NonoError::ProfileParse(format!(
+                "Wildcard upstream for custom credential '{}' must use HTTPS: {}",
+                service_name, url
+            )));
+        }
+        let domain = rest.split(['/', ':', '?', '#']).next().unwrap_or("");
+        if domain.is_empty() || !domain.contains('.') {
+            return Err(NonoError::ProfileParse(format!(
+                "Invalid wildcard upstream for custom credential '{}': \
+                 expected 'https://*.<domain>': {}",
+                service_name, url
+            )));
+        }
+        return Ok(());
+    }
+
     let parsed = url::Url::parse(url).map_err(|e| {
         NonoError::ProfileParse(format!(
             "Invalid upstream URL for custom credential '{}': {}",
@@ -3986,6 +4008,32 @@ mod tests {
         let result = validate_custom_credential("test", &cred);
         let err = result.expect_err("HTTP to remote should be rejected");
         assert!(err.to_string().contains("HTTPS"));
+    }
+
+    #[test]
+    fn test_validate_custom_credential_wildcard_upstream_allowed() {
+        let mut cred = header_cred_builder();
+        cred.upstream = "https://*.example.com".to_string();
+        assert!(validate_custom_credential("example", &cred).is_ok());
+    }
+
+    #[test]
+    fn test_validate_custom_credential_wildcard_http_rejected() {
+        let mut cred = header_cred_builder();
+        cred.upstream = "http://*.example.com".to_string();
+        let err = validate_custom_credential("example", &cred)
+            .expect_err("HTTP wildcard should be rejected");
+        assert!(err.to_string().contains("HTTPS"));
+    }
+
+    #[test]
+    fn test_validate_custom_credential_wildcard_bare_domain_rejected() {
+        // "*." must be followed by a dotted domain.
+        let mut cred = header_cred_builder();
+        cred.upstream = "https://*.localhost".to_string();
+        let err = validate_custom_credential("example", &cred)
+            .expect_err("wildcard without a dotted domain should be rejected");
+        assert!(err.to_string().contains("wildcard"));
     }
 
     #[test]

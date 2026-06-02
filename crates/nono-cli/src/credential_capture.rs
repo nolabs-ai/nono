@@ -76,7 +76,15 @@ struct CachedCredential {
     expires_at: Instant,
 }
 
-/// In-memory credential cache keyed by `"session_id\0credential_name"`.
+/// In-memory credential cache keyed by
+/// `"session_id\0credential_name\0host\0path_suffix"`.
+///
+/// Including the request host in the key keeps credentials isolated per
+/// upstream host. This matters when one `cmd://name` credential serves
+/// multiple hosts (e.g. via a wildcard upstream): the capture command sees
+/// `NONO_REQUEST_HOST` and may mint host-specific tokens, so cached values
+/// must not collide across hosts. When no host context is available the host
+/// component is empty, preserving prior single-value behaviour.
 pub struct CredentialCaptureCache {
     entries: HashMap<String, CachedCredential>,
 }
@@ -92,9 +100,10 @@ impl CredentialCaptureCache {
         &self,
         session_id: &str,
         name: &str,
+        host: &str,
         path_suffix: &str,
     ) -> Option<Zeroizing<String>> {
-        let key = Self::make_key(session_id, name, path_suffix);
+        let key = Self::make_key(session_id, name, host, path_suffix);
         self.entries.get(&key).and_then(|cached| {
             if Instant::now() < cached.expires_at {
                 Some(cached.value.clone())
@@ -108,12 +117,13 @@ impl CredentialCaptureCache {
         &mut self,
         session_id: &str,
         name: &str,
+        host: &str,
         path_suffix: &str,
         value: Zeroizing<String>,
         ttl: Duration,
     ) {
         self.entries.insert(
-            Self::make_key(session_id, name, path_suffix),
+            Self::make_key(session_id, name, host, path_suffix),
             CachedCredential {
                 value,
                 expires_at: Instant::now() + ttl,
@@ -127,8 +137,8 @@ impl CredentialCaptureCache {
         self.entries.retain(|k, _| !k.starts_with(&prefix));
     }
 
-    fn make_key(session_id: &str, name: &str, path_suffix: &str) -> String {
-        format!("{}\0{}\0{}", session_id, name, path_suffix)
+    fn make_key(session_id: &str, name: &str, host: &str, path_suffix: &str) -> String {
+        format!("{}\0{}\0{}\0{}", session_id, name, host, path_suffix)
     }
 }
 
@@ -258,6 +268,9 @@ impl CredentialCaptureBroker {
     /// `NONO_REQUEST_PATH`, and `NONO_REQUEST_METHOD` are set on the spawned
     /// command. If the credential has a `cache_path_regex`, the first capture
     /// group from the request path is used as part of the cache key.
+    ///
+    /// The request host (when present in `context`) is also part of the cache
+    /// key, so credentials are isolated per upstream host.
     pub fn capture_or_cache(
         &self,
         session_id: &str,
@@ -281,12 +294,17 @@ impl CredentialCaptureBroker {
         });
         let path_suffix = cache_suffix.as_deref().unwrap_or("");
 
+        // Isolate cached credentials per upstream host. Absent context (e.g.
+        // non-intercept callers) maps to an empty host, matching prior
+        // behaviour and never colliding with host-bearing entries.
+        let host = context.map(|c| c.host.as_str()).unwrap_or("");
+
         // Check cache first
         {
             let cache = self.cache.lock().map_err(|_| {
                 NonoError::SandboxInit("credential cache lock poisoned".to_string())
             })?;
-            if let Some(cached) = cache.get(session_id, credential_name, path_suffix) {
+            if let Some(cached) = cache.get(session_id, credential_name, host, path_suffix) {
                 debug!("credential capture cache hit: {}", credential_name);
                 return Ok(cached);
             }
@@ -303,6 +321,7 @@ impl CredentialCaptureBroker {
             cache.insert(
                 session_id,
                 credential_name,
+                host,
                 path_suffix,
                 Zeroizing::new(credential.as_str().to_string()),
                 config.ttl,
@@ -464,10 +483,11 @@ mod tests {
             "session1",
             "github",
             "",
+            "",
             Zeroizing::new("token123".to_string()),
             Duration::from_secs(60),
         );
-        let result = cache.get("session1", "github", "");
+        let result = cache.get("session1", "github", "", "");
         assert!(result.is_some());
         assert_eq!(result.unwrap().as_str(), "token123");
     }
@@ -479,10 +499,11 @@ mod tests {
             "session1",
             "github",
             "",
+            "",
             Zeroizing::new("token123".to_string()),
             Duration::from_secs(60),
         );
-        assert!(cache.get("session2", "github", "").is_none());
+        assert!(cache.get("session2", "github", "", "").is_none());
     }
 
     #[test]
@@ -492,10 +513,11 @@ mod tests {
             "session1",
             "github",
             "",
+            "",
             Zeroizing::new("token123".to_string()),
             Duration::from_secs(60),
         );
-        assert!(cache.get("session1", "gcloud", "").is_none());
+        assert!(cache.get("session1", "gcloud", "", "").is_none());
     }
 
     #[test]
@@ -505,11 +527,12 @@ mod tests {
             "session1",
             "github",
             "",
+            "",
             Zeroizing::new("token123".to_string()),
             Duration::from_secs(0), // Immediately expired
         );
         // TTL of 0 means expires_at == now, which won't pass the < check
-        assert!(cache.get("session1", "github", "").is_none());
+        assert!(cache.get("session1", "github", "", "").is_none());
     }
 
     #[test]
@@ -518,12 +541,87 @@ mod tests {
         cache.insert(
             "session1",
             "github",
+            "",
             "repos",
             Zeroizing::new("token-repos".to_string()),
             Duration::from_secs(60),
         );
-        assert!(cache.get("session1", "github", "users").is_none());
-        assert!(cache.get("session1", "github", "repos").is_some());
+        assert!(cache.get("session1", "github", "", "users").is_none());
+        assert!(cache.get("session1", "github", "", "repos").is_some());
+    }
+
+    #[test]
+    fn test_cache_miss_different_host() {
+        let mut cache = CredentialCaptureCache::new();
+        cache.insert(
+            "session1",
+            "token",
+            "api.example.com",
+            "",
+            Zeroizing::new("token-api".to_string()),
+            Duration::from_secs(60),
+        );
+        // Same session/name/path but a different host must not hit.
+        assert!(
+            cache
+                .get("session1", "token", "app.example.com", "")
+                .is_none()
+        );
+        assert!(
+            cache
+                .get("session1", "token", "api.example.com", "")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn test_cache_multiple_hosts_same_credential_name() {
+        let mut cache = CredentialCaptureCache::new();
+        cache.insert(
+            "session1",
+            "token",
+            "api.example.com",
+            "",
+            Zeroizing::new("token-api".to_string()),
+            Duration::from_secs(60),
+        );
+        cache.insert(
+            "session1",
+            "token",
+            "app.example.com",
+            "",
+            Zeroizing::new("token-app".to_string()),
+            Duration::from_secs(60),
+        );
+        assert_eq!(
+            cache
+                .get("session1", "token", "api.example.com", "")
+                .unwrap()
+                .as_str(),
+            "token-api"
+        );
+        assert_eq!(
+            cache
+                .get("session1", "token", "app.example.com", "")
+                .unwrap()
+                .as_str(),
+            "token-app"
+        );
+    }
+
+    #[test]
+    fn test_cache_empty_host_does_not_collide_with_host_entry() {
+        let mut cache = CredentialCaptureCache::new();
+        cache.insert(
+            "session1",
+            "token",
+            "api.example.com",
+            "",
+            Zeroizing::new("token-api".to_string()),
+            Duration::from_secs(60),
+        );
+        // A context-less lookup (empty host) must not see the host-bearing entry.
+        assert!(cache.get("session1", "token", "", "").is_none());
     }
 
     #[test]
@@ -533,12 +631,14 @@ mod tests {
             "session1",
             "github",
             "",
+            "",
             Zeroizing::new("token1".to_string()),
             Duration::from_secs(60),
         );
         cache.insert(
             "session1",
             "gcloud",
+            "",
             "",
             Zeroizing::new("token2".to_string()),
             Duration::from_secs(60),
@@ -547,15 +647,16 @@ mod tests {
             "session2",
             "github",
             "",
+            "",
             Zeroizing::new("token3".to_string()),
             Duration::from_secs(60),
         );
 
         cache.flush_session("session1");
 
-        assert!(cache.get("session1", "github", "").is_none());
-        assert!(cache.get("session1", "gcloud", "").is_none());
-        assert!(cache.get("session2", "github", "").is_some());
+        assert!(cache.get("session1", "github", "", "").is_none());
+        assert!(cache.get("session1", "gcloud", "", "").is_none());
+        assert!(cache.get("session2", "github", "", "").is_some());
     }
 
     #[test]
@@ -822,6 +923,53 @@ mod tests {
         assert!(result3.is_ok());
         // Should be cached value from first call (same "repos" prefix)
         assert_eq!(result3.unwrap().as_str(), "token-/repos/owner/name");
+    }
+
+    #[test]
+    fn test_broker_caches_per_host() {
+        // One credential, no path regex: distinct hosts must get distinct
+        // cached values, each capturing with its own NONO_REQUEST_HOST.
+        let mut configs = HashMap::new();
+        configs.insert(
+            "token".to_string(),
+            CredentialCaptureDef {
+                command_path: PathBuf::from("/bin/sh"),
+                command_args: vec![
+                    "-c".to_string(),
+                    "echo token-$NONO_REQUEST_HOST".to_string(),
+                ],
+                timeout_secs: 5,
+                ttl: Duration::from_secs(60),
+                cache_path_regex: None,
+            },
+        );
+        let broker = CredentialCaptureBroker::new(configs);
+
+        let ctx_api = CaptureContext {
+            host: "api.example.com".to_string(),
+            path: "/data".to_string(),
+            method: "GET".to_string(),
+        };
+        let ctx_app = CaptureContext {
+            host: "app.example.com".to_string(),
+            path: "/data".to_string(),
+            method: "GET".to_string(),
+        };
+
+        let api = broker.capture_or_cache("s1", "token", Some(&ctx_api));
+        assert_eq!(api.unwrap().as_str(), "token-api.example.com");
+
+        let app = broker.capture_or_cache("s1", "token", Some(&ctx_app));
+        assert_eq!(app.unwrap().as_str(), "token-app.example.com");
+
+        // Repeat api host → cached value from the first api call.
+        let ctx_api2 = CaptureContext {
+            host: "api.example.com".to_string(),
+            path: "/other".to_string(),
+            method: "POST".to_string(),
+        };
+        let api2 = broker.capture_or_cache("s1", "token", Some(&ctx_api2));
+        assert_eq!(api2.unwrap().as_str(), "token-api.example.com");
     }
 
     #[test]

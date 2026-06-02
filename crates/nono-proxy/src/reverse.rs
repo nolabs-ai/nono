@@ -696,8 +696,8 @@ async fn handle_cmd_credential(
     // Resolve the credential via the supervisor capture channel
     let request_context = CaptureRequestContext {
         host: route
-            .upstream_host_port
-            .as_deref()
+            .upstream_host_matcher
+            .as_exact()
             .unwrap_or("")
             .to_string(),
         path: upstream_path.to_string(),

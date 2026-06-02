@@ -50,10 +50,6 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install system dependencies (Linux)
-        if: runner.os == 'Linux' && !matrix.cross
-        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
-
       - name: Install cross (Linux ARM64)
         if: matrix.cross
         run: cargo install cross

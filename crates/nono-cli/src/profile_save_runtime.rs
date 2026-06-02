@@ -36,6 +36,126 @@ enum ProfileSaveChoice {
     Skip,
 }
 
+// ─── Interactive denial selector types ────────────────────────────────────
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ItemAction {
+    Grant,
+    Suppress,
+    Skip,
+}
+
+impl ItemAction {
+    fn cycle(self) -> Self {
+        match self {
+            Self::Grant => Self::Suppress,
+            Self::Suppress => Self::Skip,
+            Self::Skip => Self::Grant,
+        }
+    }
+
+    fn padded_label(self) -> &'static str {
+        match self {
+            Self::Grant => "grant   ",
+            Self::Suppress => "suppress",
+            Self::Skip => "skip    ",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProfileSection {
+    Allow,
+    Read,
+    Write,
+    AllowFile,
+    ReadFile,
+    WriteFile,
+    UnsafeSeatbelt,
+}
+
+impl ProfileSection {
+    fn display_label(self) -> &'static str {
+        match self {
+            Self::Allow => "read+write dirs",
+            Self::Read => "read dirs",
+            Self::Write => "write dirs",
+            Self::AllowFile => "read+write files",
+            Self::ReadFile => "read files",
+            Self::WriteFile => "write files",
+            Self::UnsafeSeatbelt => "unsafe seatbelt rule",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct DenialItem {
+    path: String,
+    section: ProfileSection,
+    is_bypass: bool,
+    action: ItemAction,
+}
+
+const DENIAL_SELECTOR_MAX_VISIBLE_ITEMS: usize = 15;
+
+fn denial_selector_visible_range(
+    item_count: usize,
+    cursor: usize,
+    max_visible: usize,
+) -> (usize, usize) {
+    if item_count <= max_visible || max_visible == 0 {
+        return (0, item_count);
+    }
+
+    let half_window = max_visible / 2;
+    let start = if cursor < half_window {
+        0
+    } else if cursor + half_window >= item_count {
+        item_count - max_visible
+    } else {
+        cursor - half_window
+    };
+
+    (start, start + max_visible)
+}
+
+fn extract_denial_items(patch: &profile::Profile) -> Vec<DenialItem> {
+    let mut items = Vec::new();
+    let fs = &patch.filesystem;
+
+    let sections: &[(&[String], ProfileSection)] = &[
+        (&fs.allow, ProfileSection::Allow),
+        (&fs.read, ProfileSection::Read),
+        (&fs.write, ProfileSection::Write),
+        (&fs.allow_file, ProfileSection::AllowFile),
+        (&fs.read_file, ProfileSection::ReadFile),
+        (&fs.write_file, ProfileSection::WriteFile),
+    ];
+
+    for (paths, section) in sections {
+        for path in *paths {
+            let is_bypass = fs.bypass_protection.contains(path);
+            items.push(DenialItem {
+                path: path.clone(),
+                section: *section,
+                is_bypass,
+                action: ItemAction::Grant,
+            });
+        }
+    }
+
+    for rule in &patch.unsafe_macos_seatbelt_rules {
+        items.push(DenialItem {
+            path: rule.clone(),
+            section: ProfileSection::UnsafeSeatbelt,
+            is_bypass: false,
+            action: ItemAction::Grant,
+        });
+    }
+
+    items
+}
+
 /// Env var that suppresses the "save denied paths as user profile?"
 /// prompt entirely. Set by integration tests and CI runs that have an
 /// openable `/dev/tty` (so `terminal_prompts_available` would otherwise
@@ -81,26 +201,93 @@ pub(crate) fn offer_save_run_profile(
     };
 
     let cmd_name = command_name(command)?;
-    let has_overrides = patch_has_policy_overrides(&patch);
-    let suppress_patch = build_suppress_save_prompt_patch(&patch);
+
+    // Try the interactive selector first; fall back to the text prompt when
+    // raw mode is unavailable (e.g. a dumb terminal or a redirected TTY).
+    match interactive_denial_selector(&patch)? {
+        Some(items) => {
+            let Some(combined_patch) = build_combined_patch_from_items(&items) else {
+                return Ok(());
+            };
+            offer_save_with_patch(&combined_patch, &cmd_name, command, compared_profile)
+        }
+        None => offer_save_text_prompt(&patch, &cmd_name, command, compared_profile),
+    }
+}
+
+fn offer_save_with_patch(
+    patch: &profile::Profile,
+    cmd_name: &str,
+    command: &[String],
+    compared_profile: Option<&str>,
+) -> Result<()> {
+    let has_overrides = patch_has_policy_overrides(patch);
+    if has_overrides
+        && !confirm_typed_word(
+            "Granting the shown entries includes policy overrides. Type 'override' to confirm: ",
+            "override",
+        )?
+    {
+        return Ok(());
+    }
+
+    let has_suppressions = !patch.filesystem.suppress_save_prompt.is_empty();
+
+    if let Some(existing_profile) = compared_profile
+        .filter(|name| profile::is_valid_profile_name(name) && profile::is_user_override(name))
+    {
+        let prepared =
+            prepare_profile_save_from_patch(patch, cmd_name, existing_profile, compared_profile)?;
+        write_profile(&prepared)?;
+        print_profile_save(&prepared, command);
+        if has_suppressions {
+            print_suppression_save_note(patch);
+        }
+        return Ok(());
+    }
+
+    let suggested = suggested_run_profile_name(compared_profile, cmd_name);
+    let Some(profile_name) = prompt_profile_name(suggested.as_deref())? else {
+        return Ok(());
+    };
+
+    let prepared =
+        prepare_profile_save_from_patch(patch, cmd_name, &profile_name, compared_profile)?;
+    write_profile(&prepared)?;
+    print_profile_save(&prepared, command);
+    if has_suppressions {
+        print_suppression_save_note(patch);
+    }
+
+    Ok(())
+}
+
+fn offer_save_text_prompt(
+    patch: &profile::Profile,
+    cmd_name: &str,
+    command: &[String],
+    compared_profile: Option<&str>,
+) -> Result<()> {
+    let has_overrides = patch_has_policy_overrides(patch);
+    let suppress_patch = build_suppress_save_prompt_patch(patch);
     let _prompt_terminal = prepare_prompt_terminal();
 
     prompt_println("");
-    print_patch_preview(&patch);
+    print_patch_preview(patch);
 
     if let Some(existing_profile) = compared_profile
         .filter(|name| profile::is_valid_profile_name(name) && profile::is_user_override(name))
     {
         let choice = prompt_profile_save_choice(Some(existing_profile), suppress_patch.is_some())?;
         let Some(selected_patch) =
-            selected_profile_save_patch(choice, &patch, suppress_patch.as_ref(), has_overrides)?
+            selected_profile_save_patch(choice, patch, suppress_patch.as_ref(), has_overrides)?
         else {
             return Ok(());
         };
 
         let prepared = prepare_profile_save_from_patch(
             selected_patch,
-            &cmd_name,
+            cmd_name,
             existing_profile,
             compared_profile,
         )?;
@@ -114,22 +301,18 @@ pub(crate) fn offer_save_run_profile(
 
     let choice = prompt_profile_save_choice(None, suppress_patch.is_some())?;
     let Some(selected_patch) =
-        selected_profile_save_patch(choice, &patch, suppress_patch.as_ref(), has_overrides)?
+        selected_profile_save_patch(choice, patch, suppress_patch.as_ref(), has_overrides)?
     else {
         return Ok(());
     };
 
-    let suggested = suggested_run_profile_name(compared_profile, &cmd_name);
+    let suggested = suggested_run_profile_name(compared_profile, cmd_name);
     let Some(profile_name) = prompt_profile_name(suggested.as_deref())? else {
         return Ok(());
     };
 
-    let prepared = prepare_profile_save_from_patch(
-        selected_patch,
-        &cmd_name,
-        &profile_name,
-        compared_profile,
-    )?;
+    let prepared =
+        prepare_profile_save_from_patch(selected_patch, cmd_name, &profile_name, compared_profile)?;
     write_profile(&prepared)?;
     print_profile_save(&prepared, command);
     if choice == ProfileSaveChoice::Suppress {
@@ -772,6 +955,358 @@ pub(crate) fn configure_prompt_termios(termios: &mut nix::sys::termios::Termios)
     termios.control_chars[SpecialCharacterIndices::VTIME as usize] = 0;
 }
 
+// ─── Raw terminal mode for interactive selector ───────────────────────────
+
+enum Key {
+    Up,
+    Down,
+    Space,
+    Enter,
+    CtrlC,
+    Char(char),
+}
+
+struct RawTtyGuard {
+    tty: std::fs::File,
+    saved: nix::sys::termios::Termios,
+}
+
+impl RawTtyGuard {
+    fn open() -> Result<Self> {
+        let tty = open_tty_prompt_device()?;
+        let saved = nix::sys::termios::tcgetattr(&tty)
+            .map_err(|e| NonoError::LearnError(format!("tcgetattr: {e}")))?;
+        let mut raw = saved.clone();
+        configure_raw_termios(&mut raw);
+        nix::sys::termios::tcsetattr(&tty, nix::sys::termios::SetArg::TCSANOW, &raw)
+            .map_err(|e| NonoError::LearnError(format!("tcsetattr: {e}")))?;
+        Ok(Self { tty, saved })
+    }
+
+    fn read_key(&mut self) -> Result<Key> {
+        use std::io::Read;
+        let mut buf = [0u8; 1];
+        self.tty
+            .read_exact(&mut buf)
+            .map_err(|e| NonoError::LearnError(format!("tty read: {e}")))?;
+        match buf[0] {
+            0x1b => {
+                // Switch to short-timeout non-blocking to detect escape sequences
+                self.set_vmin_vtime(0, 1)?;
+                let key = self.try_read_escape_sequence();
+                let _ = self.set_vmin_vtime(1, 0);
+                key
+            }
+            b' ' => Ok(Key::Space),
+            b'\r' | b'\n' => Ok(Key::Enter),
+            0x03 => Ok(Key::CtrlC),
+            c => Ok(Key::Char(c as char)),
+        }
+    }
+
+    fn try_read_escape_sequence(&mut self) -> Result<Key> {
+        use std::io::Read;
+        let mut buf = [0u8; 1];
+        if self.tty.read(&mut buf).unwrap_or(0) == 0 {
+            return Ok(Key::Char('\x1b'));
+        }
+        if buf[0] != b'[' {
+            return Ok(Key::Char('\x1b'));
+        }
+        if self.tty.read(&mut buf).unwrap_or(0) == 0 {
+            return Ok(Key::Char('\x1b'));
+        }
+        Ok(match buf[0] {
+            b'A' => Key::Up,
+            b'B' => Key::Down,
+            _ => Key::Char('\x1b'),
+        })
+    }
+
+    fn set_vmin_vtime(&self, vmin: u8, vtime: u8) -> Result<()> {
+        use nix::sys::termios::SpecialCharacterIndices;
+        let mut t = nix::sys::termios::tcgetattr(&self.tty)
+            .map_err(|e| NonoError::LearnError(format!("tcgetattr: {e}")))?;
+        t.control_chars[SpecialCharacterIndices::VMIN as usize] = vmin;
+        t.control_chars[SpecialCharacterIndices::VTIME as usize] = vtime;
+        nix::sys::termios::tcsetattr(&self.tty, nix::sys::termios::SetArg::TCSANOW, &t)
+            .map_err(|e| NonoError::LearnError(format!("tcsetattr: {e}")))?;
+        Ok(())
+    }
+}
+
+impl Drop for RawTtyGuard {
+    fn drop(&mut self) {
+        let _ = write!(self.tty, "\x1b[?25h"); // restore cursor visibility
+        let _ = self.tty.flush();
+        let _ = nix::sys::termios::tcsetattr(
+            &self.tty,
+            nix::sys::termios::SetArg::TCSANOW,
+            &self.saved,
+        );
+    }
+}
+
+fn configure_raw_termios(t: &mut nix::sys::termios::Termios) {
+    use nix::sys::termios::{InputFlags, LocalFlags, SpecialCharacterIndices};
+    t.local_flags
+        .remove(LocalFlags::ICANON | LocalFlags::ECHO | LocalFlags::ECHONL | LocalFlags::ISIG);
+    t.input_flags.remove(InputFlags::ICRNL | InputFlags::IXON);
+    t.control_chars[SpecialCharacterIndices::VMIN as usize] = 1;
+    t.control_chars[SpecialCharacterIndices::VTIME as usize] = 0;
+}
+
+// ─── Interactive selector rendering ───────────────────────────────────────
+
+fn render_denial_selector(
+    tty: &mut std::fs::File,
+    items: &[DenialItem],
+    cursor: usize,
+    line_count: &mut usize,
+    first_render: bool,
+) -> Result<()> {
+    if !first_render && *line_count > 0 {
+        write!(tty, "\x1b[{}A", line_count)
+            .map_err(|e| NonoError::LearnError(format!("tty write: {e}")))?;
+    }
+
+    let t = theme::current();
+    let mut n = 0usize;
+
+    macro_rules! tty_ln {
+        ($($arg:tt)*) => {{
+            write!(tty, "\r{}\x1b[K\r\n", format!($($arg)*))
+                .map_err(|e| NonoError::LearnError(format!("tty write: {e}")))?;
+            n += 1;
+        }};
+    }
+
+    // Limit visible rows to prevent the list from exceeding the terminal
+    // height. When the list is taller than the viewport the cursor-up escape
+    // sequence is capped at the top of the screen, which corrupts the UI and
+    // erases prior terminal history on subsequent redraws.
+    let (start, end) =
+        denial_selector_visible_range(items.len(), cursor, DENIAL_SELECTOR_MAX_VISIBLE_ITEMS);
+
+    if items.len() > DENIAL_SELECTOR_MAX_VISIBLE_ITEMS {
+        tty_ln!(
+            "{}  {}",
+            theme::fg(" [nono] Review denied paths", t.brand).bold(),
+            theme::fg(
+                &format!("({}-{} of {})", start + 1, end, items.len()),
+                t.subtext
+            )
+        );
+    } else {
+        tty_ln!(
+            "{}",
+            theme::fg(" [nono] Review denied paths", t.brand).bold()
+        );
+    }
+    tty_ln!(
+        "  {}",
+        "↑/↓ move  ·  Space cycle  ·  a grant-all  ·  d deny-all  ·  Enter confirm  ·  Esc cancel"
+            .dimmed()
+    );
+    tty_ln!("");
+
+    for (offset, item) in items[start..end].iter().enumerate() {
+        let i = start + offset;
+        let selected = i == cursor;
+
+        let cursor_glyph = if selected {
+            format!("{}", theme::fg("▶", t.brand))
+        } else {
+            " ".to_string()
+        };
+
+        let action_str = match item.action {
+            ItemAction::Grant => {
+                format!("{}", theme::fg(item.action.padded_label(), t.green).bold())
+            }
+            ItemAction::Suppress => {
+                format!("{}", theme::fg(item.action.padded_label(), t.yellow))
+            }
+            ItemAction::Skip => {
+                format!("{}", theme::fg(item.action.padded_label(), t.overlay))
+            }
+        };
+
+        let bypass_prefix = if item.is_bypass {
+            format!("{} ", "⚠".red())
+        } else {
+            String::new()
+        };
+
+        let path_str = if selected {
+            format!("{}", theme::fg(&item.path, t.text).bold())
+        } else {
+            format!("{}", theme::fg(&item.path, t.subtext))
+        };
+
+        let label_str = format!("  ({})", theme::fg(item.section.display_label(), t.overlay));
+
+        tty_ln!(
+            "  {}  {}  {}{}{}",
+            cursor_glyph,
+            action_str,
+            bypass_prefix,
+            path_str,
+            label_str
+        );
+    }
+
+    tty_ln!("");
+    *line_count = n;
+
+    tty.flush()
+        .map_err(|e| NonoError::LearnError(format!("tty flush: {e}")))?;
+    Ok(())
+}
+
+fn erase_selector(tty: &mut std::fs::File, line_count: usize) -> Result<()> {
+    if line_count == 0 {
+        return Ok(());
+    }
+    write!(tty, "\x1b[{}A", line_count)
+        .map_err(|e| NonoError::LearnError(format!("tty write: {e}")))?;
+    for _ in 0..line_count {
+        write!(tty, "\x1b[2K\r\n").map_err(|e| NonoError::LearnError(format!("tty write: {e}")))?;
+    }
+    write!(tty, "\x1b[{}A", line_count)
+        .map_err(|e| NonoError::LearnError(format!("tty write: {e}")))?;
+    tty.flush()
+        .map_err(|e| NonoError::LearnError(format!("tty flush: {e}")))?;
+    Ok(())
+}
+
+/// Run the keyboard-driven per-path denial selector.
+///
+/// Returns `None` when raw mode cannot be established (caller should fall back
+/// to the text-based prompt). Returns `Some(items)` with the user's per-item
+/// decisions when the interactive session completes.
+fn interactive_denial_selector(patch: &profile::Profile) -> Result<Option<Vec<DenialItem>>> {
+    let mut items = extract_denial_items(patch);
+    if items.is_empty() {
+        return Ok(Some(items));
+    }
+
+    let mut raw = match RawTtyGuard::open() {
+        Ok(guard) => guard,
+        Err(_) => return Ok(None),
+    };
+
+    write!(raw.tty, "\x1b[?25l") // hide cursor during interaction
+        .map_err(|e| NonoError::LearnError(format!("tty write: {e}")))?;
+
+    let mut cursor: usize = 0;
+    let mut line_count: usize = 0;
+    let mut first_render = true;
+
+    loop {
+        render_denial_selector(&mut raw.tty, &items, cursor, &mut line_count, first_render)?;
+        first_render = false;
+
+        match raw.read_key()? {
+            Key::Up => {
+                cursor = cursor.saturating_sub(1);
+            }
+            Key::Down => {
+                if cursor + 1 < items.len() {
+                    cursor += 1;
+                }
+            }
+            Key::Space => {
+                let next = items[cursor].action.cycle();
+                // UnsafeSeatbelt items have no suppress mechanism — skip that state
+                items[cursor].action = if items[cursor].section == ProfileSection::UnsafeSeatbelt
+                    && next == ItemAction::Suppress
+                {
+                    next.cycle()
+                } else {
+                    next
+                };
+            }
+            Key::Char('a') => {
+                for item in &mut items {
+                    item.action = ItemAction::Grant;
+                }
+            }
+            Key::Char('d') => {
+                for item in &mut items {
+                    item.action = if item.section == ProfileSection::UnsafeSeatbelt {
+                        ItemAction::Skip
+                    } else {
+                        ItemAction::Suppress
+                    };
+                }
+            }
+            Key::Enter => break,
+            Key::CtrlC | Key::Char('\x1b') => {
+                for item in &mut items {
+                    item.action = ItemAction::Skip;
+                }
+                break;
+            }
+            Key::Char(_) => {}
+        }
+    }
+
+    erase_selector(&mut raw.tty, line_count)?;
+    Ok(Some(items))
+}
+
+// ─── Build patch from per-item decisions ──────────────────────────────────
+
+fn build_combined_patch_from_items(items: &[DenialItem]) -> Option<profile::Profile> {
+    let has_grants = items.iter().any(|i| i.action == ItemAction::Grant);
+    let has_suppresses = items
+        .iter()
+        .any(|i| i.action == ItemAction::Suppress && i.section != ProfileSection::UnsafeSeatbelt);
+
+    if !has_grants && !has_suppresses {
+        return None;
+    }
+
+    let mut patch = profile::Profile::default();
+
+    for item in items {
+        match item.action {
+            ItemAction::Grant => {
+                match item.section {
+                    ProfileSection::Allow => patch.filesystem.allow.push(item.path.clone()),
+                    ProfileSection::Read => patch.filesystem.read.push(item.path.clone()),
+                    ProfileSection::Write => patch.filesystem.write.push(item.path.clone()),
+                    ProfileSection::AllowFile => {
+                        patch.filesystem.allow_file.push(item.path.clone())
+                    }
+                    ProfileSection::ReadFile => patch.filesystem.read_file.push(item.path.clone()),
+                    ProfileSection::WriteFile => {
+                        patch.filesystem.write_file.push(item.path.clone())
+                    }
+                    ProfileSection::UnsafeSeatbelt => {
+                        patch.unsafe_macos_seatbelt_rules.push(item.path.clone())
+                    }
+                }
+                if item.is_bypass && !patch.filesystem.bypass_protection.contains(&item.path) {
+                    patch.filesystem.bypass_protection.push(item.path.clone());
+                }
+            }
+            ItemAction::Suppress => {
+                if item.section != ProfileSection::UnsafeSeatbelt {
+                    patch
+                        .filesystem
+                        .suppress_save_prompt
+                        .push(item.path.clone());
+                }
+            }
+            ItemAction::Skip => {}
+        }
+    }
+
+    Some(patch)
+}
+
 fn prompt_write(message: &str) {
     if let Some(mut tty) = open_tty_writer() {
         let _ = write!(tty, "{}", prompt_inline_for_tty(message));
@@ -829,7 +1364,10 @@ pub(crate) fn prepare_profile_save_from_patch(
     let profile_path = profile::get_user_profile_path(profile_name)?;
     let mut new_profile = patch.clone();
     let extends = compared_profile
-        .filter(|name| profile::is_valid_profile_name(name) && *name != profile_name)
+        .filter(|name| {
+            (profile::is_valid_profile_name(name) || profile::is_registry_ref(name))
+                && *name != profile_name
+        })
         .map(|name| vec![name.to_string()]);
     let has_base = extends.is_some();
     let suppression_only = patch_is_suppression_only(patch);
@@ -1500,6 +2038,42 @@ mod tests {
     }
 
     #[test]
+    fn denial_selector_visible_range_keeps_short_lists_unscrolled() {
+        assert_eq!(
+            denial_selector_visible_range(10, 9, DENIAL_SELECTOR_MAX_VISIBLE_ITEMS),
+            (0, 10)
+        );
+    }
+
+    #[test]
+    fn denial_selector_visible_range_centers_cursor_when_possible() {
+        assert_eq!(
+            denial_selector_visible_range(50, 25, DENIAL_SELECTOR_MAX_VISIBLE_ITEMS),
+            (18, 33)
+        );
+    }
+
+    #[test]
+    fn denial_selector_visible_range_pins_to_top_and_bottom_edges() {
+        assert_eq!(
+            denial_selector_visible_range(50, 0, DENIAL_SELECTOR_MAX_VISIBLE_ITEMS),
+            (0, 15)
+        );
+        assert_eq!(
+            denial_selector_visible_range(50, 49, DENIAL_SELECTOR_MAX_VISIBLE_ITEMS),
+            (35, 50)
+        );
+    }
+
+    #[test]
+    fn denial_selector_visible_range_handles_empty_lists() {
+        assert_eq!(
+            denial_selector_visible_range(0, 0, DENIAL_SELECTOR_MAX_VISIBLE_ITEMS),
+            (0, 0)
+        );
+    }
+
+    #[test]
     fn prepare_profile_save_from_patch_updates_existing_user_profile() {
         let _env_lock = ENV_LOCK.lock().expect("env lock");
         let temp_home = TempDir::new().expect("temp home");
@@ -1594,6 +2168,95 @@ mod tests {
             vec!["~/.copilot/settings.json"]
         );
         assert!(prepared.profile.filesystem.read_file.is_empty());
+    }
+
+    #[test]
+    fn prepare_profile_save_from_patch_preserves_registry_ref_as_extends() {
+        let _env_lock = ENV_LOCK.lock().expect("env lock");
+        let temp_home = TempDir::new().expect("temp home");
+        let temp_config = TempDir::new().expect("temp config");
+        let _env = EnvVarGuard::set_all(&[
+            ("HOME", temp_home.path().to_str().expect("home path")),
+            (
+                "XDG_CONFIG_HOME",
+                temp_config.path().to_str().expect("config path"),
+            ),
+        ]);
+
+        let patch = profile::Profile {
+            filesystem: profile::FilesystemConfig {
+                suppress_save_prompt: vec!["~/.copilot/settings.json".to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let prepared = prepare_profile_save_from_patch(
+            &patch,
+            "claude",
+            "claude-test",
+            Some("always-further/claude"),
+        )
+        .expect("prepare");
+
+        assert!(matches!(prepared.action, SaveAction::Created));
+        assert_eq!(
+            prepared.profile.extends,
+            Some(vec!["always-further/claude".to_string()])
+        );
+    }
+
+    #[test]
+    fn prepare_profile_save_from_patch_preserves_versioned_registry_ref() {
+        let _env_lock = ENV_LOCK.lock().expect("env lock");
+        let temp_home = TempDir::new().expect("temp home");
+        let temp_config = TempDir::new().expect("temp config");
+        let _env = EnvVarGuard::set_all(&[
+            ("HOME", temp_home.path().to_str().expect("home path")),
+            (
+                "XDG_CONFIG_HOME",
+                temp_config.path().to_str().expect("config path"),
+            ),
+        ]);
+
+        let mut patch = profile::Profile::default();
+        patch.filesystem.read = vec!["~/workspace".to_string()];
+
+        let prepared = prepare_profile_save_from_patch(
+            &patch,
+            "claude",
+            "claude-test",
+            Some("always-further/claude@1.2.0"),
+        )
+        .expect("prepare");
+
+        assert_eq!(
+            prepared.profile.extends,
+            Some(vec!["always-further/claude@1.2.0".to_string()])
+        );
+    }
+
+    #[test]
+    fn prepare_profile_save_from_patch_still_avoids_self_reference() {
+        let _env_lock = ENV_LOCK.lock().expect("env lock");
+        let temp_home = TempDir::new().expect("temp home");
+        let temp_config = TempDir::new().expect("temp config");
+        let _env = EnvVarGuard::set_all(&[
+            ("HOME", temp_home.path().to_str().expect("home path")),
+            (
+                "XDG_CONFIG_HOME",
+                temp_config.path().to_str().expect("config path"),
+            ),
+        ]);
+
+        let mut patch = profile::Profile::default();
+        patch.filesystem.read = vec!["~/workspace".to_string()];
+
+        let prepared =
+            prepare_profile_save_from_patch(&patch, "claude", "my-profile", Some("my-profile"))
+                .expect("prepare");
+
+        assert!(prepared.profile.extends.is_none());
     }
 
     #[test]

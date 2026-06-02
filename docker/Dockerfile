@@ -9,7 +9,7 @@
 FROM rust:1-bookworm AS builder
 
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends libdbus-1-dev pkg-config && \
+    apt-get install -y --no-install-recommends pkg-config && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
@@ -28,7 +28,7 @@ LABEL org.opencontainers.image.licenses="Apache-2.0"
 
 RUN groupadd -r nono && useradd -r -g nono -s /usr/sbin/nologin nono && \
     apt-get update && \
-    apt-get install -y --no-install-recommends libdbus-1-3 ca-certificates && \
+    apt-get install -y --no-install-recommends ca-certificates && \
     mkdir /work && \
     rm -rf /var/lib/apt/lists/*
 

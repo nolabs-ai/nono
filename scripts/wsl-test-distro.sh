@@ -73,7 +73,7 @@ install_deps() {
         ubuntu|debian|linuxmint|pop)
             sudo apt-get update -qq
             sudo apt-get install -y --no-install-recommends \
-                build-essential pkg-config libdbus-1-dev curl git ca-certificates rsync netcat-openbsd
+                build-essential pkg-config curl git ca-certificates rsync netcat-openbsd
 
             # Ubuntu 20.04 ships GCC 9 which triggers aws-lc-sys bug
             gcc_ver=$(gcc -dumpversion 2>/dev/null || echo "0")
@@ -86,20 +86,20 @@ install_deps() {
             fi
             ;;
         fedora)
-            sudo dnf install -y gcc gcc-c++ pkgconfig dbus-devel curl git rsync nmap-ncat
+            sudo dnf install -y gcc gcc-c++ pkgconfig curl git rsync nmap-ncat
             ;;
         arch|archlinux|manjaro)
-            sudo pacman -Sy --noconfirm base-devel pkgconf dbus curl git rsync openbsd-netcat
+            sudo pacman -Sy --noconfirm base-devel pkgconf curl git rsync openbsd-netcat
             ;;
         alpine)
-            sudo apk add --no-cache build-base pkgconf dbus-dev curl git rsync
+            sudo apk add --no-cache build-base pkgconf curl git rsync
             ;;
         opensuse*|suse*)
-            sudo zypper install -y gcc gcc-c++ pkg-config dbus-1-devel curl git rsync netcat-openbsd
+            sudo zypper install -y gcc gcc-c++ pkg-config curl git rsync netcat-openbsd
             ;;
         *)
             warn "Unknown distro '$DISTRO_NAME' — skipping dependency install"
-            warn "Ensure build-essential, pkg-config, libdbus-dev, curl, git are installed"
+            warn "Ensure build-essential, pkg-config, curl, git are installed"
             ;;
     esac
 

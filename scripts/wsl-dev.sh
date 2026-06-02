@@ -77,7 +77,7 @@ cmd_setup() {
     # Install build deps (Ubuntu/Debian)
     if command -v apt-get &>/dev/null; then
         log "Checking build dependencies..."
-        for pkg in build-essential pkg-config libdbus-1-dev; do
+        for pkg in build-essential pkg-config; do
             if ! dpkg -s "$pkg" &>/dev/null; then
                 log "Installing $pkg..."
                 sudo apt-get install -y "$pkg"

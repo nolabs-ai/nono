@@ -1,6 +1,6 @@
 [package]
 name = "nono"
-version = "0.59.0"
+version = "0.61.1"
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
@@ -34,8 +34,13 @@ regress = "0.11"
 # Unix socket IPC for supervisor
 libc = "0.2"
 
-# Keychain access (optional: requires libdbus on Linux)
-keyring = { version = "3", optional = true }
+# Keychain access (optional). On Linux the Secret Service is reached via the
+# pure-Rust zbus backend (see the linux target deps below), so the default
+# build has no libdbus runtime dependency. default-features = false is set on
+# every keyring declaration so only the explicitly-listed backend is ever
+# compiled — guarding against a future keyring release adding a libdbus
+# backend to its defaults.
+keyring = { version = "3", optional = true, default-features = false }
 
 # Sigstore bundle verification.
 # `sigstore-trust-root` is pinned to 0.6.3 because 0.6.5 made
@@ -53,11 +58,15 @@ der = { version = "0.7", default-features = false }
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock.workspace = true
 nix = { workspace = true, features = ["fs", "user"] }
-keyring = { version = "3", features = ["sync-secret-service"], optional = true }
+# Pure-Rust Secret Service backend (zbus over the D-Bus socket) so the binary
+# does not link libdbus and starts on hosts without it. crypto-rust keeps
+# session encryption pure-Rust; async-io is the runtime (avoids a tokio
+# block_on-within-runtime panic since a tokio runtime is already active).
+keyring = { version = "3", features = ["async-secret-service", "crypto-rust", "async-io"], optional = true, default-features = false }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 nix = { workspace = true, features = ["fs", "user"] }
-keyring = { version = "3", features = ["apple-native"], optional = true }
+keyring = { version = "3", features = ["apple-native"], optional = true, default-features = false }
 
 [build-dependencies]
 typify = "0.6"

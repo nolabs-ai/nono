@@ -16,11 +16,24 @@ brew install nono
 Download the `.deb` package from [GitHub Releases](https://github.com/always-further/nono/releases):
 
 ```bash
-VERSION=$(curl -sI https://github.com/always-further/nono/releases/latest | grep -i location | grep -oP 'v\K[0-9.]+')
+VERSION=$(curl -sI https://github.com/always-further/nono/releases/latest | grep -i location | grep -oP 'v\K[0-9a-zA-Z.-]+')
 ARCH=$(dpkg --print-architecture)
 wget https://github.com/always-further/nono/releases/download/v${VERSION}/nono-cli_${VERSION}_${ARCH}.deb
 sudo dpkg -i nono-cli_${VERSION}_${ARCH}.deb
 ```
+
+### Fedora/RHEL/openSUSE
+
+Download the `.rpm` package from [GitHub Releases](https://github.com/always-further/nono/releases):
+
+```bash
+VERSION=$(curl -sI https://github.com/always-further/nono/releases/latest | grep -i location | grep -oP 'v\K[0-9a-zA-Z.-]+')
+ARCH=$(uname -m)
+wget https://github.com/always-further/nono/releases/download/v${VERSION}/nono-cli-${VERSION}-1.${ARCH}.rpm
+sudo dnf install ./nono-cli-${VERSION}-1.${ARCH}.rpm
+```
+
+For openSUSE, use `sudo zypper install ./nono-cli-${VERSION}-1.${ARCH}.rpm` instead.
 
 ### Nix
 

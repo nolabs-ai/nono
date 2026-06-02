@@ -8,7 +8,7 @@ LABEL org.opencontainers.image.licenses="Apache-2.0"
 
 RUN groupadd -r nono && useradd -r -g nono -s /bin/bash nono && \
     apt-get update && \
-    apt-get install -y --no-install-recommends libdbus-1-3 ca-certificates && \
+    apt-get install -y --no-install-recommends ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
 COPY nono-${TARGETARCH} /usr/bin/nono

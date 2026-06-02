@@ -31,6 +31,7 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --pattern "*.tar.gz" \
             --pattern "*.deb" \
+            --pattern "*.rpm" \
             --dir artifacts
 
       - name: Attest build provenance
@@ -39,3 +40,4 @@ jobs:
           subject-path: |
             artifacts/*.tar.gz
             artifacts/*.deb
+            artifacts/*.rpm

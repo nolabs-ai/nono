@@ -93,6 +93,11 @@ pub(crate) fn prepare_proxy_launch_options(
         open_url_origins: prepared.open_url_origins.clone(),
         open_url_allow_localhost: prepared.open_url_allow_localhost,
         allow_launch_services_active: prepared.allow_launch_services_active,
+        #[cfg(target_os = "macos")]
+        trust_proxy_ca: args.trust_proxy_ca,
+        proxy_ca_validity: args
+            .proxy_ca_validity
+            .map(|days| std::time::Duration::from_secs(u64::from(days) * 24 * 60 * 60)),
     })
 }
 
@@ -217,6 +222,8 @@ pub(crate) fn build_proxy_config_from_flags(
         proxy_config.bind_port = port;
     }
 
+    proxy_config.ca_validity = proxy.proxy_ca_validity;
+
     Ok(proxy_config)
 }
 
@@ -240,6 +247,20 @@ pub(crate) fn start_proxy_runtime(
     if let Some(dir) = prepare_intercept_ca_dir()? {
         proxy_config.intercept_ca_dir = Some(dir);
         proxy_config.intercept_parent_ca_pems = read_parent_ssl_cert_file();
+    }
+
+    #[cfg(target_os = "macos")]
+    if proxy.trust_proxy_ca {
+        if proxy_config.intercept_ca_dir.is_some() {
+            let validity = proxy
+                .proxy_ca_validity
+                .unwrap_or(nono_proxy::tls_intercept::ca::CA_VALIDITY_DEFAULT);
+            proxy_config.preloaded_ca = crate::macos_trust::load_or_generate_proxy_ca(validity);
+        } else {
+            tracing::warn!(
+                "--trust-proxy-ca has no effect without TLS-intercepting credential routes"
+            );
+        }
     }
 
     // Set up credential capture channel if any cmd:// routes are configured

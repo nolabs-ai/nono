@@ -43,8 +43,8 @@ This section covers development topics for contributors and maintainers of nono.
 
 - Rust (stable toolchain)
 - Platform-specific dependencies:
-  - **Linux**: `libdbus-1-dev`, `pkg-config`
-  - **macOS**: `dbus`, `pkg-config` (via Homebrew)
+  - **Linux**: `pkg-config` and a C toolchain (e.g. `build-essential`) for building `aws-lc-sys`. libdbus is **not** required — the Secret Service keyring backend is pure-Rust (zbus).
+  - **macOS**: none beyond the Xcode command-line tools.
 
 ### Building
 

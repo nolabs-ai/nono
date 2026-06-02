@@ -1,0 +1,16 @@
+FROM cgr.dev/chainguard/rust:latest-dev AS builder
+
+USER root
+RUN apk add --no-cache build-base pkgconf
+
+WORKDIR /build
+COPY . .
+RUN cargo build --release -p nono-cli
+
+# The default build uses the pure-Rust zbus Secret Service backend, so the
+# binary has no libdbus runtime dependency.
+FROM cgr.dev/chainguard/wolfi-base:latest
+
+COPY --from=builder /build/target/release/nono /usr/bin/nono
+
+ENTRYPOINT ["/usr/bin/nono"]

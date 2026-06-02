@@ -1248,6 +1248,23 @@ pub struct SandboxArgs {
     #[arg(long, value_name = "PORT", help_heading = "NETWORK")]
     pub proxy_port: Option<u16>,
 
+    /// Add the proxy CA to the macOS user trust store (enables Go CLI tools).
+    /// Shares the CA across sessions via Keychain; regenerates daily.
+    #[cfg(target_os = "macos")]
+    #[arg(long, env = "NONO_TRUST_PROXY_CA", help_heading = "NETWORK")]
+    pub trust_proxy_ca: bool,
+
+    /// Proxy CA certificate validity in days (1–365, default: 1).
+    /// Controls how long the ephemeral CA (and its leaf certificates) remain valid.
+    #[arg(
+        long,
+        value_name = "DAYS",
+        env = "NONO_PROXY_CA_VALIDITY",
+        value_parser = clap::value_parser!(u32).range(1..=365),
+        help_heading = "NETWORK"
+    )]
+    pub proxy_ca_validity: Option<u32>,
+
     // ── Credentials ──────────────────────────────────────────────────────
     /// Inject credentials via reverse proxy for a service (repeatable)
     /// ALIAS(canonical="--credential", introduced="v0.0.0", remove_by="indefinite", issue="#143")
@@ -1603,6 +1620,9 @@ impl From<WrapSandboxArgs> for SandboxArgs {
             external_proxy: None,
             external_proxy_bypass: Vec::new(),
             proxy_port: None,
+            #[cfg(target_os = "macos")]
+            trust_proxy_ca: false,
+            proxy_ca_validity: None,
             proxy_credential: Vec::new(),
             allow_endpoint: Vec::new(),
             env_credential: args.env_credential,

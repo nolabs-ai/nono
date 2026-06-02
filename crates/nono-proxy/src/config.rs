@@ -7,6 +7,7 @@ use globset::Glob;
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 use std::path::PathBuf;
+use zeroize::Zeroizing;
 
 /// Credential injection mode determining how credentials are inserted into requests.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -87,6 +88,54 @@ pub struct ProxyConfig {
     /// (de)serialisation: it's not part of any user-authored config file.
     #[serde(default, skip)]
     pub intercept_parent_ca_pems: Option<Vec<u8>>,
+
+    /// Pre-generated CA material for cross-session reuse (`--trust-proxy-ca`).
+    ///
+    /// When `Some`, the proxy uses this CA instead of generating a fresh
+    /// ephemeral one. The private key was loaded from macOS Keychain by the
+    /// CLI supervisor; the cert is already trusted in the user's trust store.
+    #[serde(default, skip)]
+    pub preloaded_ca: Option<PreloadedCa>,
+
+    /// Optional CA validity override for TLS interception.
+    /// Default (`None`) uses `CA_VALIDITY_DEFAULT` (24h).
+    /// Set by CLI `--proxy-ca-validity` flag.
+    #[serde(default, skip)]
+    pub ca_validity: Option<std::time::Duration>,
+}
+
+/// Pre-generated CA key material for cross-session CA reuse.
+///
+/// Used by `--trust-proxy-ca` on macOS: the CLI persists the CA in Keychain
+/// and passes it to the proxy so all sessions within the CA's validity window
+/// share the same signing key (and the same trusted cert in the system store).
+///
+/// ## Security note
+///
+/// The Keychain item's access control depends on the binary's code-signing
+/// identity. Release-signed builds get per-app isolation; unsigned dev builds
+/// allow any local process to read the key.
+///
+/// Because the CA is trusted user-wide during its validity window, any
+/// same-user process that can read the Keychain item could mint certificates
+/// trusted by macOS trust consumers. Release-signed builds are expected to
+/// receive stronger Keychain access isolation than unsigned development builds.
+/// The configurable CA validity (`--proxy-ca-validity`) limits exposure.
+#[derive(Clone)]
+pub struct PreloadedCa {
+    /// PKCS#8 DER-encoded private key for the CA. Zeroized on drop.
+    pub key_der: Zeroizing<Vec<u8>>,
+    /// PEM-encoded CA certificate (public).
+    pub cert_pem: String,
+}
+
+impl std::fmt::Debug for PreloadedCa {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreloadedCa")
+            .field("key_der", &"[REDACTED]")
+            .field("cert_pem_len", &self.cert_pem.len())
+            .finish()
+    }
 }
 
 impl Default for ProxyConfig {
@@ -101,6 +150,8 @@ impl Default for ProxyConfig {
             max_connections: 256,
             intercept_ca_dir: None,
             intercept_parent_ca_pems: None,
+            preloaded_ca: None,
+            ca_validity: None,
         }
     }
 }

@@ -550,6 +550,41 @@ nono run --profile openclaw --proxy-port 19999 --listen-port 18789 -- openclaw g
 Without `--proxy-port`, nono uses an OS-assigned ephemeral port and sets environment variables like `GEMINI_BASE_URL=http://127.0.0.1:PORT/gemini`. Applications that read these env vars don't need `--proxy-port`. Use it only when the application requires manual base URL configuration.
 </Note>
 
+#### `--trust-proxy-ca`
+
+*macOS only.* Add the proxy's TLS interception CA to the macOS user trust store via Keychain. This enables Go CLI tools (`gh`, `terraform`) that ignore `SSL_CERT_FILE` and only verify certificates via the system trust store (`com.apple.trustd`).
+
+```bash
+nono run --allow-cwd --credential github --trust-proxy-ca -- gh api /user
+```
+
+The CA is persisted in macOS Keychain and shared across sessions. It regenerates automatically when expired (default: 1 day, configurable via `--proxy-ca-validity`):
+
+- **First run**: Generates a new ECDSA P-256 CA, stores it in Keychain, and adds it to the user trust store (one biometric/password prompt)
+- **Subsequent runs**: Loads from Keychain with zero prompts
+- **After expiry**: Removes the expired CA and regenerates
+
+<Note>
+This flag has no effect without `--credential` (or another TLS-intercepting route). If no credential routes are configured, nono warns and skips CA generation.
+</Note>
+
+Environment variable: `NONO_TRUST_PROXY_CA=1`
+
+#### `--proxy-ca-validity`
+
+Set the ephemeral proxy CA certificate validity in days (1–365, default: 1). Leaf certificates minted for intercepted hosts share the same expiry as the CA.
+
+```bash
+# CA valid for 7 days (useful for long-running sessions)
+nono run --credential github --proxy-ca-validity 7 -- gh api /user
+```
+
+<Note>
+When used with `--trust-proxy-ca`, the validity only applies when generating a new CA. An existing Keychain CA that is still valid will be reused regardless of this setting.
+</Note>
+
+Environment variable: `NONO_PROXY_CA_VALIDITY=<days>`
+
 #### `--listen-port`
 
 Allow the sandboxed process to listen on a TCP port. Required when running server applications (like AI gateways) in proxy mode.

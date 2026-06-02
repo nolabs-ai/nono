@@ -1,6 +1,6 @@
 [package]
 name = "nono-cli"
-version = "0.59.0"
+version = "0.61.1"
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
@@ -33,15 +33,16 @@ path = "src/main.rs"
 [features]
 default = ["system-keyring"]
 # Enables OS system keyring access (macOS Keychain / Linux Secret Service).
-# Disable this for headless/container environments without libdbus.
+# The Linux backend is pure-Rust (zbus), so the default build needs no libdbus;
+# disable this only for fully-static/distroless builds with no Secret Service.
 # Controls keyring for nono-cli, nono, and nono-proxy in one flag.
 system-keyring = ["dep:keyring", "nono/system-keyring", "nono-proxy/system-keyring"]
 # Enables test-only trust root overrides used by the integration harness.
 test-trust-overrides = []
 
 [dependencies]
-nono = { version = "0.59.0", path = "../nono", default-features = false }
-nono-proxy = { version = "0.59.0", path = "../nono-proxy", default-features = false }
+nono = { version = "0.61.1", path = "../nono", default-features = false }
+nono-proxy = { version = "0.61.1", path = "../nono-proxy", default-features = false }
 clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"
 colored = "3"
@@ -58,8 +59,11 @@ chrono = { version = "0.4", features = ["serde"] }
 # Signing key PKCS#8 serialization (already transitive via sigstore-verify)
 aws-lc-rs = "1"
 
-# Keystore access for trust signing keys (optional: requires libdbus on Linux)
-keyring = { version = "3", optional = true }
+# Keystore access for trust signing keys (optional). Linux uses the pure-Rust
+# zbus Secret Service backend (see linux target deps), so no libdbus is linked.
+# default-features = false on every keyring declaration ensures only the
+# explicitly-listed backend is compiled, even if keyring later adds a default.
+keyring = { version = "3", optional = true, default-features = false }
 
 # Keyless (Sigstore/Fulcio/Rekor) signing for instruction file attestation
 sigstore-sign = "0.8.0"
@@ -89,12 +93,16 @@ jsonc-parser = { version = "0.32", features = ["serde"] }
 nix = { workspace = true, features = ["process", "signal", "fs", "user", "term"] }
 landlock.workspace = true
 dns-lookup = "2"
-keyring = { version = "3", features = ["sync-secret-service"], optional = true }
+# Pure-Rust Secret Service backend (zbus) — no libdbus link. Keep in sync with
+# the keyring features in crates/nono/Cargo.toml.
+keyring = { version = "3", features = ["async-secret-service", "crypto-rust", "async-io"], optional = true, default-features = false }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 nix = { workspace = true, features = ["process", "signal", "fs", "user", "term"] }
 dns-lookup = "2"
-keyring = { version = "3", features = ["apple-native"], optional = true }
+keyring = { version = "3", features = ["apple-native"], optional = true, default-features = false }
+security-framework = "3"
+x509-parser = "0.16"
 
 [build-dependencies]
 toml.workspace = true

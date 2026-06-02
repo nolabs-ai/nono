@@ -1,18 +1,7 @@
 # cross-rs configuration for cross-compilation
 # https://github.com/cross-rs/cross/wiki/Configuration
 #
-# The aarch64-unknown-linux-gnu image is x86_64 with aarch64 cross-compiler;
-# we must install libdbus for arm64, not the host (x86_64).
-
-[target.aarch64-unknown-linux-gnu]
-# Install aarch64 libdbus so the cross-linker can find -ldbus-1
-pre-build = [
-    "dpkg --add-architecture arm64",
-    "sh -c 'apt-get update && apt-get install -y --no-install-recommends libdbus-1-dev:arm64 && apt-get clean && rm -rf /var/lib/apt/lists/*'",
-]
-# Point linker and pkg-config at aarch64 libs (installed under /usr/lib/aarch64-linux-gnu)
-[target.aarch64-unknown-linux-gnu.env]
-passthrough = [
-    "LIBRARY_PATH=/usr/lib/aarch64-linux-gnu",
-    "PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig",
-]
+# The aarch64-unknown-linux-gnu build needs no extra system libraries: the
+# Linux keyring backend is pure-Rust (zbus Secret Service), so nothing links
+# libdbus, and aws-lc-sys builds with the cross image's own toolchain. The
+# default cross images are sufficient; no target-specific setup is required.

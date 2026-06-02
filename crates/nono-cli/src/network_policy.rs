@@ -960,42 +960,27 @@ mod tests {
     }
 
     #[test]
-    fn test_claude_code_profile_includes_git_provider_credential() {
+    fn test_claude_code_profile_does_not_enable_credentials_by_default() {
         let json = embedded_network_policy_json();
         let policy = load_network_policy(json).expect("policy should load");
 
         let resolved = resolve_network_profile(&policy, "claude-code").expect("should resolve");
         assert!(
-            resolved.profile_credentials.contains(&"github".to_string()),
-            "claude-code profile should include github credential, got: {:?}",
-            resolved.profile_credentials
-        );
-        assert!(
-            resolved.profile_credentials.contains(&"gitlab".to_string()),
-            "claude-code profile should include gitlab credential, got: {:?}",
+            resolved.profile_credentials.is_empty(),
+            "network profiles should not implicitly enable credential routes, got: {:?}",
             resolved.profile_credentials
         );
     }
 
     #[test]
-    fn test_codex_profile_includes_openai_and_git_provider_credentials() {
+    fn test_codex_profile_does_not_enable_credentials_by_default() {
         let json = embedded_network_policy_json();
         let policy = load_network_policy(json).expect("policy should load");
 
         let resolved = resolve_network_profile(&policy, "codex").expect("should resolve");
         assert!(
-            resolved.profile_credentials.contains(&"openai".to_string()),
-            "codex profile should include openai credential, got: {:?}",
-            resolved.profile_credentials
-        );
-        assert!(
-            resolved.profile_credentials.contains(&"github".to_string()),
-            "codex profile should include github credential, got: {:?}",
-            resolved.profile_credentials
-        );
-        assert!(
-            resolved.profile_credentials.contains(&"gitlab".to_string()),
-            "codex profile should include gitlab credential, got: {:?}",
+            resolved.profile_credentials.is_empty(),
+            "network profiles should not implicitly enable credential routes, got: {:?}",
             resolved.profile_credentials
         );
     }
@@ -1040,29 +1025,46 @@ mod tests {
     }
 
     #[test]
-    fn test_developer_profile_includes_github_credential() {
+    fn test_developer_profile_does_not_enable_github_credential_by_default() {
         let json = embedded_network_policy_json();
         let policy = load_network_policy(json).expect("policy should load");
 
         let resolved = resolve_network_profile(&policy, "developer").expect("should resolve");
         assert!(
-            resolved.profile_credentials.contains(&"github".to_string()),
-            "developer profile should include github credential, got: {:?}",
+            !resolved.profile_credentials.contains(&"github".to_string()),
+            "developer profile should not include github credential by default, got: {:?}",
             resolved.profile_credentials
         );
     }
 
     #[test]
-    fn test_developer_profile_includes_gitlab_credential() {
+    fn test_developer_profile_does_not_enable_gitlab_credential_by_default() {
         let json = embedded_network_policy_json();
         let policy = load_network_policy(json).expect("policy should load");
 
         let resolved = resolve_network_profile(&policy, "developer").expect("should resolve");
         assert!(
-            resolved.profile_credentials.contains(&"gitlab".to_string()),
-            "developer profile should include gitlab credential, got: {:?}",
+            !resolved.profile_credentials.contains(&"gitlab".to_string()),
+            "developer profile should not include gitlab credential by default, got: {:?}",
             resolved.profile_credentials
         );
+    }
+
+    #[test]
+    fn test_embedded_network_profiles_do_not_enable_credentials_by_default() {
+        let json = embedded_network_policy_json();
+        let policy = load_network_policy(json).expect("policy should load");
+
+        for profile_name in policy.profiles.keys() {
+            let resolved =
+                resolve_network_profile(&policy, profile_name).expect("profile should resolve");
+            assert!(
+                resolved.profile_credentials.is_empty(),
+                "network profile '{}' should not implicitly enable credential routes, got: {:?}",
+                profile_name,
+                resolved.profile_credentials
+            );
+        }
     }
 
     #[test]

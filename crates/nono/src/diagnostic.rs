@@ -658,6 +658,9 @@ pub struct DiagnosticFormatter<'a> {
     /// denied paths with `[save skipped]` so the diagnostic footer is
     /// self-explanatory without requiring the user to cross-reference their profile.
     suppressed_paths: &'a [PathBuf],
+    /// Non-filesystem sandbox operations suppressed from the diagnostic footer.
+    /// The sandbox still denies these operations; this only controls reporting.
+    suppressed_system_service_operations: &'a [String],
     /// Canonicalized forms of the denied paths, parallel to `denials`. When
     /// provided, used in place of on-demand `try_canonicalize` calls inside the
     /// render loop so filesystem I/O is done once (by the caller, after the
@@ -686,6 +689,7 @@ impl<'a> DiagnosticFormatter<'a> {
             session_id: None,
             policy_explanations: Vec::new(),
             suppressed_paths: &[],
+            suppressed_system_service_operations: &[],
             canonical_denial_paths: Vec::new(),
         }
     }
@@ -708,6 +712,13 @@ impl<'a> DiagnosticFormatter<'a> {
     #[must_use]
     pub fn with_suppressed_paths(mut self, paths: &'a [PathBuf]) -> Self {
         self.suppressed_paths = paths;
+        self
+    }
+
+    /// Set non-filesystem sandbox operations suppressed from the diagnostic footer.
+    #[must_use]
+    pub fn with_suppressed_system_service_operations(mut self, operations: &'a [String]) -> Self {
+        self.suppressed_system_service_operations = operations;
         self
     }
 
@@ -1139,7 +1150,13 @@ impl<'a> DiagnosticFormatter<'a> {
 
         // Convert macOS Seatbelt violations (operation + target) into
         // DenialRecords so the same rendering logic handles both platforms.
-        let (violation_denials, non_fs_violations) = violations_to_denials(self.sandbox_violations);
+        let (violation_denials, mut non_fs_violations) =
+            violations_to_denials(self.sandbox_violations);
+        non_fs_violations.retain(|violation| {
+            !self
+                .suppressed_system_service_operations
+                .contains(&violation.operation)
+        });
 
         // Merge supervisor denials (Linux seccomp) with violation-derived
         // denials (macOS Seatbelt) into a single unified list.
@@ -1396,7 +1413,7 @@ impl<'a> DiagnosticFormatter<'a> {
     ///
     /// Shows every denied path (truncated past `MAX_INLINE_LIST` entries) with
     /// a `[permanently restricted]` marker for paths that are blocked by the
-    /// sensitive-path policy, and emits a single `Fix:` line combining the
+    /// sensitive-path policy, and emits a single `Fix flags:` line combining the
     /// `--read`/`--write`/`--allow` flags for all actionable denials.
     ///
     /// Classification: if a policy explanation with `reason == "sensitive_path"`
@@ -1433,7 +1450,7 @@ impl<'a> DiagnosticFormatter<'a> {
                 .iter()
                 .map(|d| self.suggested_flag_for_denial(d))
                 .collect();
-            lines.push(format!("[nono] Fix: {}", flags.join(" ")));
+            lines.push(format!("[nono] Fix flags: {}", flags.join(" ")));
         }
 
         if path_denials.is_empty() {
@@ -1488,7 +1505,7 @@ impl<'a> DiagnosticFormatter<'a> {
                 .iter()
                 .map(|d| self.suggested_flag_for_denial(d))
                 .collect();
-            lines.push(format!("[nono] Fix: {}", flags.join(" ")));
+            lines.push(format!("[nono] Fix flags: {}", flags.join(" ")));
         }
 
         if !policy_blocked.is_empty() {
@@ -1537,7 +1554,7 @@ impl<'a> DiagnosticFormatter<'a> {
             .filter_map(|denial| denial.suggested_flag.as_deref())
             .collect();
         if !flags.is_empty() {
-            lines.push(format!("[nono] Fix: {}", flags.join(" ")));
+            lines.push(format!("[nono] Fix flags: {}", flags.join(" ")));
         }
     }
 
@@ -1605,9 +1622,10 @@ impl<'a> DiagnosticFormatter<'a> {
             .and_then(|e| e.suggested_flag.clone())
         {
             // explanations' suggested_flag is of the form "--read /path".
-            // Strip any leading "Fix: " that callers may have prepended.
+            // Strip any leading fix label that callers may have prepended.
             return flag
                 .strip_prefix("Fix: ")
+                .or_else(|| flag.strip_prefix("Fix flags: "))
                 .map(str::to_string)
                 .unwrap_or(flag);
         }
@@ -3171,8 +3189,8 @@ mod tests {
         let output = formatter.format_footer(1);
 
         assert!(output.contains(&format!("{} (read+write)", denied.display())));
-        assert!(output.contains(&format!("Fix: --allow {}", pkg.display())));
-        assert!(!output.contains(&format!("Fix: --read {}", denied.display())));
+        assert!(output.contains(&format!("Fix flags: --allow {}", pkg.display())));
+        assert!(!output.contains(&format!("Fix flags: --read {}", denied.display())));
     }
 
     #[test]
@@ -3258,6 +3276,31 @@ mod tests {
     }
 
     #[test]
+    fn test_suppressed_system_service_violation_is_hidden_from_footer() {
+        let caps = make_test_caps();
+        let violations = vec![
+            SandboxViolation {
+                operation: "forbidden-exec-sugid".to_string(),
+                target: None,
+            },
+            SandboxViolation {
+                operation: "mach-lookup".to_string(),
+                target: Some("com.apple.logd".to_string()),
+            },
+        ];
+        let suppressed = vec!["forbidden-exec-sugid".to_string()];
+        let formatter = DiagnosticFormatter::new(&caps)
+            .with_mode(DiagnosticMode::Supervised)
+            .with_sandbox_violations(&violations)
+            .with_suppressed_system_service_operations(&suppressed);
+        let output = formatter.format_footer(1);
+
+        assert!(!output.contains("forbidden-exec-sugid"));
+        assert!(!output.contains("Setuid/setgid executable blocked"));
+        assert!(output.contains("mach-lookup (com.apple.logd)"));
+    }
+
+    #[test]
     fn test_supervised_policy_blocked_denial() {
         let caps = make_test_caps();
         let denials = vec![DenialRecord {
@@ -3274,7 +3317,7 @@ mod tests {
         assert!(output.contains("/etc/shadow (read)  [permanently restricted]"));
         assert!(output.contains("permanently restricted — override via a user profile"));
         // Policy-blocked paths cannot be fixed with a path flag.
-        assert!(!output.contains("Fix: --read /etc/shadow"));
+        assert!(!output.contains("Fix flags: --read /etc/shadow"));
         assert!(!output.contains("--allow <path>"));
     }
 
@@ -3293,7 +3336,7 @@ mod tests {
 
         assert!(output.contains("IPC denial: 1 pathname Unix socket blocked."));
         assert!(output.contains("/run/user/1000/bus"));
-        assert!(output.contains("Fix: --allow-unix-socket /run/user/1000/bus"));
+        assert!(output.contains("Fix flags: --allow-unix-socket /run/user/1000/bus"));
         assert!(!output.contains("No path denials were observed"));
         assert!(!output.contains("--read /run/user/1000/bus"));
     }
@@ -3316,7 +3359,7 @@ mod tests {
 
         assert!(output.contains("Sandbox denial: 1 path blocked."));
         assert!(output.contains(&denied_path.display().to_string()));
-        assert!(output.contains(&format!("Fix: --read-file {}", denied_path.display())));
+        assert!(output.contains(&format!("Fix flags: --read-file {}", denied_path.display())));
         // User-denied paths are actionable, not policy-blocked.
         assert!(!output.contains("[permanently restricted]"));
     }
@@ -3350,8 +3393,8 @@ mod tests {
         // Consolidated Fix line covers only the actionable path. The suggested
         // target falls back to the nearest existing parent directory since the
         // path itself doesn't exist in the test environment.
-        assert!(output.contains("Fix: --read "));
-        assert!(!output.contains("Fix: --read /etc/shadow"));
+        assert!(output.contains("Fix flags: --read "));
+        assert!(!output.contains("Fix flags: --read /etc/shadow"));
         // The permanent-restriction note appears once for the policy-blocked path.
         assert!(output.contains("1 path is permanently restricted"));
     }
@@ -3409,7 +3452,7 @@ mod tests {
         // Single Fix line covers both paths.
         let fix_lines: Vec<&str> = output
             .lines()
-            .filter(|line| line.contains("Fix: "))
+            .filter(|line| line.contains("Fix flags: "))
             .collect();
         assert_eq!(
             fix_lines.len(),
@@ -3445,9 +3488,9 @@ mod tests {
         assert!(output.contains("… and 5 more"));
         // Fix line still covers all 15 paths.
         assert_eq!(
-            output.lines().filter(|l| l.contains("Fix: ")).count(),
+            output.lines().filter(|l| l.contains("Fix flags: ")).count(),
             1,
-            "expected one consolidated Fix line"
+            "expected one consolidated Fix flags line"
         );
     }
 
@@ -3486,7 +3529,7 @@ mod tests {
         // Rate-limited denials are still actionable via a path flag. The
         // suggested target falls back to the nearest existing parent since
         // /tmp/flood itself doesn't exist.
-        assert!(output.contains("Fix: --read "));
+        assert!(output.contains("Fix flags: --read "));
         assert!(!output.contains("[permanently restricted]"));
     }
 
@@ -3522,7 +3565,10 @@ mod tests {
         // The "Closest grant" hint moved out of the consolidated footer;
         // users can recover it with `nono why` if they want the detail.
         assert!(!output.contains("Closest grant:"));
-        assert!(output.contains(&format!("Fix: --write-file {}", denied_path.display())));
+        assert!(output.contains(&format!(
+            "Fix flags: --write-file {}",
+            denied_path.display()
+        )));
         assert!(!output.contains("Denied paths during this session:"));
     }
 

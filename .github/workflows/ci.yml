@@ -98,10 +98,6 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
-      - name: Install system dependencies (Ubuntu)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
-
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
         with:
@@ -120,6 +116,21 @@ jobs:
 
       - name: Build
         run: cargo build --workspace --verbose
+
+      - name: Verify nono does not link libdbus (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="target/debug/nono"
+          needed="$(objdump -p "$bin" | awk '/NEEDED/ {print $2}')"
+          echo "NEEDED libraries:"
+          echo "$needed"
+          if echo "$needed" | grep -qi '^libdbus'; then
+            echo "::error::$bin links libdbus — the Linux keyring backend regressed off the pure-Rust zbus path"
+            exit 1
+          fi
+          echo "OK: no libdbus dependency"
 
       - name: Run tests
         run: cargo test --workspace --verbose
@@ -149,9 +160,6 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
-      - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
-
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
         with:
@@ -179,10 +187,6 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-
-      - name: Install system dependencies (Ubuntu)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable

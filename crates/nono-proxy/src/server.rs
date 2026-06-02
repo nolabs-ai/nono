@@ -491,7 +491,15 @@ pub async fn start(
                 .iter()
                 .filter(|hp| route_store.has_intercept_route(hp))
                 .count();
-            match EphemeralCa::generate().and_then(|ca| {
+            let ca_result = if let Some(ref preloaded) = config.preloaded_ca {
+                EphemeralCa::from_existing(&preloaded.key_der, &preloaded.cert_pem)
+            } else {
+                let validity = config
+                    .ca_validity
+                    .unwrap_or(crate::tls_intercept::ca::CA_VALIDITY_DEFAULT);
+                EphemeralCa::generate_with_cn("nono-session-ca", validity)
+            };
+            match ca_result.and_then(|ca| {
                 let ca = Arc::new(ca);
                 let cache = Arc::new(CertCache::new(Arc::clone(&ca)));
                 let path = tls_intercept::write_bundle(tls_intercept::BundleInputs {

@@ -34,7 +34,6 @@ build-release-cli:
 
 # Cross-compilation: Linux ARM64 (aarch64-unknown-linux-gnu)
 # Uses `cross` which handles both native (ARM64) and cross-compilation (e.g. x86_64).
-# On native Linux ARM64, you may need to install `libdbus-1-dev` and `pkg-config`.
 # If `cross` fails with "may not be able to run on this system",
 # install from git: cargo install cross --git https://github.com/cross-rs/cross
 build-arm64:

@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.61.0] - 2026-06-02
+
+### Features
+
+- *(diagnostic)* Add profile option to suppress system service diagnostics (#1059) ([#1059](https://github.com/always-further/nono/pull/1059))
+
+
+### Refactoring
+
+- *(network-policy)* Do not enable credentials by default in profiles
+
 ## [0.60.0] - 2026-06-01
 
 ### Bug Fixes

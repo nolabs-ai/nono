@@ -163,6 +163,7 @@ impl ProfileDef {
             commands: self.commands.clone(),
             filesystem: self.filesystem.clone(),
             network: self.network.clone(),
+            diagnostics: profile::DiagnosticsConfig::default(),
             linux: profile::LinuxConfig::default(),
             env_credentials: self.env_credentials.clone(),
             environment: None,

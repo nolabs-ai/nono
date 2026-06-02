@@ -45,6 +45,10 @@
       "$ref": "#/$defs/NetworkConfig",
       "description": "Network access configuration including proxy settings, credential injection, and port allowlists."
     },
+    "diagnostics": {
+      "$ref": "#/$defs/DiagnosticsConfig",
+      "description": "Diagnostic output controls. These settings do not change sandbox enforcement."
+    },
     "linux": {
       "$ref": "#/$defs/LinuxConfig",
       "description": "Linux-specific hardening controls."
@@ -746,6 +750,18 @@
           "$ref": "#/$defs/WorkdirAccess",
           "description": "Access level for the current working directory.",
           "default": "none"
+        }
+      }
+    },
+    "DiagnosticsConfig": {
+      "type": "object",
+      "description": "Diagnostic output controls. Suppressions only affect nono's footer; the sandbox still denies the underlying operations.",
+      "additionalProperties": false,
+      "properties": {
+        "suppress_system_services": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Non-filesystem sandbox operation names to hide from diagnostic footers, such as forbidden-exec-sugid."
         }
       }
     },

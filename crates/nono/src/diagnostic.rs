@@ -658,6 +658,9 @@ pub struct DiagnosticFormatter<'a> {
     /// denied paths with `[save skipped]` so the diagnostic footer is
     /// self-explanatory without requiring the user to cross-reference their profile.
     suppressed_paths: &'a [PathBuf],
+    /// Non-filesystem sandbox operations suppressed from the diagnostic footer.
+    /// The sandbox still denies these operations; this only controls reporting.
+    suppressed_system_service_operations: &'a [String],
     /// Canonicalized forms of the denied paths, parallel to `denials`. When
     /// provided, used in place of on-demand `try_canonicalize` calls inside the
     /// render loop so filesystem I/O is done once (by the caller, after the
@@ -686,6 +689,7 @@ impl<'a> DiagnosticFormatter<'a> {
             session_id: None,
             policy_explanations: Vec::new(),
             suppressed_paths: &[],
+            suppressed_system_service_operations: &[],
             canonical_denial_paths: Vec::new(),
         }
     }
@@ -708,6 +712,13 @@ impl<'a> DiagnosticFormatter<'a> {
     #[must_use]
     pub fn with_suppressed_paths(mut self, paths: &'a [PathBuf]) -> Self {
         self.suppressed_paths = paths;
+        self
+    }
+
+    /// Set non-filesystem sandbox operations suppressed from the diagnostic footer.
+    #[must_use]
+    pub fn with_suppressed_system_service_operations(mut self, operations: &'a [String]) -> Self {
+        self.suppressed_system_service_operations = operations;
         self
     }
 
@@ -1139,7 +1150,13 @@ impl<'a> DiagnosticFormatter<'a> {
 
         // Convert macOS Seatbelt violations (operation + target) into
         // DenialRecords so the same rendering logic handles both platforms.
-        let (violation_denials, non_fs_violations) = violations_to_denials(self.sandbox_violations);
+        let (violation_denials, mut non_fs_violations) =
+            violations_to_denials(self.sandbox_violations);
+        non_fs_violations.retain(|violation| {
+            !self
+                .suppressed_system_service_operations
+                .contains(&violation.operation)
+        });
 
         // Merge supervisor denials (Linux seccomp) with violation-derived
         // denials (macOS Seatbelt) into a single unified list.
@@ -3256,6 +3273,31 @@ mod tests {
         assert!(output.contains("not a path grant"));
         assert!(output.contains("does not save this automatically"));
         assert!(!output.contains("unsafe_macos_seatbelt_rules"));
+    }
+
+    #[test]
+    fn test_suppressed_system_service_violation_is_hidden_from_footer() {
+        let caps = make_test_caps();
+        let violations = vec![
+            SandboxViolation {
+                operation: "forbidden-exec-sugid".to_string(),
+                target: None,
+            },
+            SandboxViolation {
+                operation: "mach-lookup".to_string(),
+                target: Some("com.apple.logd".to_string()),
+            },
+        ];
+        let suppressed = vec!["forbidden-exec-sugid".to_string()];
+        let formatter = DiagnosticFormatter::new(&caps)
+            .with_mode(DiagnosticMode::Supervised)
+            .with_sandbox_violations(&violations)
+            .with_suppressed_system_service_operations(&suppressed);
+        let output = formatter.format_footer(1);
+
+        assert!(!output.contains("forbidden-exec-sugid"));
+        assert!(!output.contains("Setuid/setgid executable blocked"));
+        assert!(output.contains("mach-lookup (com.apple.logd)"));
     }
 
     #[test]

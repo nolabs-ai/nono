@@ -29,6 +29,7 @@ pub(crate) struct PreparedProfile {
     pub(crate) allow_parent_of_protected: bool,
     pub(crate) bypass_protection_paths: Vec<PathBuf>,
     pub(crate) ignored_denial_paths: Vec<PathBuf>,
+    pub(crate) suppressed_system_service_operations: Vec<String>,
     pub(crate) allowed_env_vars: Option<Vec<String>>,
     pub(crate) denied_env_vars: Option<Vec<String>>,
     pub(crate) network_approval_mode: Option<String>,
@@ -575,6 +576,10 @@ fn prepare_profile_with_options(
             &args.suppress_save_prompt,
             workdir,
         ),
+        suppressed_system_service_operations: loaded_profile
+            .as_ref()
+            .map(|profile| profile.diagnostics.suppress_system_services.clone())
+            .unwrap_or_default(),
         allowed_env_vars: loaded_profile.as_ref().and_then(|profile| {
             profile.environment.as_ref().map(|env_config| {
                 if let Some(err) = crate::exec_strategy::validate_env_var_patterns(

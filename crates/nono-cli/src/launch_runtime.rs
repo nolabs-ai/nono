@@ -105,6 +105,7 @@ pub(crate) struct ExecutionFlags {
     pub(crate) af_unix_mediation: crate::profile::LinuxAfUnixMediation,
     pub(crate) bypass_protection_paths: Vec<PathBuf>,
     pub(crate) ignored_denial_paths: Vec<PathBuf>,
+    pub(crate) suppressed_system_service_operations: Vec<String>,
     pub(crate) session: SessionLaunchOptions,
     pub(crate) rollback: RollbackLaunchOptions,
     pub(crate) trust: TrustLaunchOptions,
@@ -131,6 +132,7 @@ impl ExecutionFlags {
             af_unix_mediation: crate::profile::LinuxAfUnixMediation::Off,
             bypass_protection_paths: Vec::new(),
             ignored_denial_paths: Vec::new(),
+            suppressed_system_service_operations: Vec::new(),
             session: SessionLaunchOptions::default(),
             rollback: RollbackLaunchOptions::default(),
             trust: TrustLaunchOptions {
@@ -256,6 +258,7 @@ pub(crate) fn prepare_run_launch_plan(
             af_unix_mediation: prepared.af_unix_mediation,
             bypass_protection_paths: prepared.bypass_protection_paths,
             ignored_denial_paths: prepared.ignored_denial_paths,
+            suppressed_system_service_operations: prepared.suppressed_system_service_operations,
             session: SessionLaunchOptions {
                 detached_start: run_args.detached,
                 session_name: run_args.name,

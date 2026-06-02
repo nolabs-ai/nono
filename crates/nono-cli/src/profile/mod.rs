@@ -1198,6 +1198,14 @@ pub struct SessionHook {
     /// If absent, no timeout is enforced.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_secs: Option<u64>,
+
+    /// Internal state to track which pack (from a registry) the session hook originated
+    /// If set, the value is namespace/pack
+    /// If absent, the key was set by a local (non-registry based) pack
+    /// This needs to be tracked per-hook, because a profile extending another profile can override
+    /// a key. The originating source pack is used to track provenance and $PACK_DIR substitution
+    #[serde(skip)]
+    pub(crate) source_pack: Option<String>,
 }
 
 /// Session lifecycle hooks for a profile.
@@ -2175,7 +2183,20 @@ fn load_registry_profile(name_or_path: &str) -> Result<Profile> {
                 .join(format!("{install_name}.json"));
             if profile_path.exists() {
                 tracing::info!("Loading registry profile from: {}", profile_path.display());
-                return finalize_profile(load_from_file(&profile_path)?);
+                let mut profile = load_from_file(&profile_path)?;
+                if let Some(ref mut before_hook) = profile.session_hooks.before {
+                    before_hook.source_pack = Some(package_ref.key());
+                    if let Ok(rest) = before_hook.script.strip_prefix("$PACK_DIR") {
+                        before_hook.script = install_dir.join(rest)
+                    }
+                }
+                if let Some(ref mut after_hook) = profile.session_hooks.after {
+                    after_hook.source_pack = Some(package_ref.key());
+                    if let Ok(rest) = after_hook.script.strip_prefix("$PACK_DIR") {
+                        after_hook.script = install_dir.join(rest)
+                    }
+                }
+                return finalize_profile(profile);
             }
         }
     }
@@ -4908,10 +4929,12 @@ mod tests {
             before: Some(SessionHook {
                 script: PathBuf::from("/base/before.sh"),
                 timeout_secs: Some(5),
+                source_pack: None,
             }),
             after: Some(SessionHook {
                 script: PathBuf::from("/base/after.sh"),
                 timeout_secs: None,
+                source_pack: None,
             }),
         };
         let mut child = child_profile();
@@ -4919,6 +4942,7 @@ mod tests {
             before: Some(SessionHook {
                 script: PathBuf::from("/child/before.sh"),
                 timeout_secs: None,
+                source_pack: None,
             }),
             after: None,
         };
@@ -4941,6 +4965,7 @@ mod tests {
             before: Some(SessionHook {
                 script: PathBuf::from("/base/before.sh"),
                 timeout_secs: Some(7),
+                source_pack: None,
             }),
             after: None,
         };
@@ -6966,6 +6991,189 @@ mod tests {
         assert!(
             resolved.extension().and_then(|e| e.to_str()) == Some("jsonc"),
             "should prefer .jsonc: {resolved:?}"
+        );
+    }
+
+    // ============================================================================
+    // Registry pack: $PACK_DIR expansion and source_pack assignment
+    // ============================================================================
+
+    /// Build a minimal pack store under `config_dir` (used as XDG_CONFIG_HOME).
+    ///
+    /// Creates:
+    ///   <config_dir>/nono/packages/<ns>/<name>/package.json
+    ///   <config_dir>/nono/packages/<ns>/<name>/profiles/<install_as>.json
+    ///   <config_dir>/nono/packages/<ns>/<name>/hooks/<hook_file>  (empty, for path validity)
+    ///
+    /// Returns the install directory path.
+    fn build_fake_pack_store(
+        config_dir: &Path,
+        ns: &str,
+        pack_name: &str,
+        install_as: &str,
+        profile_json: &str,
+        hook_file: Option<&str>,
+    ) -> PathBuf {
+        let install_dir = config_dir
+            .join("nono")
+            .join("packages")
+            .join(ns)
+            .join(pack_name);
+        std::fs::create_dir_all(install_dir.join("profiles")).expect("create profiles dir");
+        if let Some(hf) = hook_file {
+            let hooks_dir = install_dir.join("hooks");
+            std::fs::create_dir_all(&hooks_dir).expect("create hooks dir");
+            std::fs::write(hooks_dir.join(hf), "#!/bin/sh\n").expect("write hook file");
+        }
+        // Write package.json manifest
+        let manifest = format!(
+            r#"{{
+              "schema_version": 1,
+              "name": "{pack_name}",
+              "artifacts": [{{
+                "type": "profile",
+                "path": "profiles/{install_as}.json",
+                "install_as": "{install_as}"
+              }}]
+            }}"#
+        );
+        std::fs::write(install_dir.join("package.json"), &manifest)
+            .expect("write package.json");
+        // Write profile JSON
+        std::fs::write(
+            install_dir.join("profiles").join(format!("{install_as}.json")),
+            profile_json,
+        )
+        .expect("write profile json");
+        install_dir
+    }
+
+    /// Test 1: A hook script starting with `$PACK_DIR` in a registry-pack profile
+    /// is expanded to the full path `<install_dir>/<rest>`.
+    #[test]
+    fn test_registry_pack_pack_dir_in_hook_script_is_expanded() {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let tmp = tempdir().expect("tmpdir");
+        let config_dir = tmp.path().canonicalize().expect("canonicalize");
+        let _env = crate::test_env::EnvVarGuard::set_all(&[(
+            "XDG_CONFIG_HOME",
+            config_dir.to_str().expect("utf8"),
+        )]);
+
+        let install_dir = build_fake_pack_store(
+            &config_dir,
+            "test-ns",
+            "mypk",
+            "mypk",
+            r#"{
+                "meta": { "name": "mypk" },
+                "session_hooks": {
+                    "before": { "script": "$PACK_DIR/hooks/setup.sh" },
+                    "after":  { "script": "$PACK_DIR/hooks/teardown.sh" }
+                }
+            }"#,
+            None,
+        );
+
+        let profile = load_profile("test-ns/mypk").expect("load registry profile");
+
+        let before = profile.session_hooks.before.as_ref().expect("before hook");
+        assert_eq!(
+            before.script,
+            install_dir.join("hooks").join("setup.sh"),
+            "before hook $PACK_DIR should be expanded to install_dir"
+        );
+
+        let after = profile.session_hooks.after.as_ref().expect("after hook");
+        assert_eq!(
+            after.script,
+            install_dir.join("hooks").join("teardown.sh"),
+            "after hook $PACK_DIR should be expanded to install_dir"
+        );
+    }
+
+    /// Test 2: Both before and after hooks in a registry-pack profile have
+    /// `source_pack` set to `<namespace>/<pack>`, even when the script does
+    /// not contain `$PACK_DIR`.
+    #[test]
+    fn test_registry_pack_hooks_have_source_pack_set() {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let tmp = tempdir().expect("tmpdir");
+        let config_dir = tmp.path().canonicalize().expect("canonicalize");
+        let _env = crate::test_env::EnvVarGuard::set_all(&[(
+            "XDG_CONFIG_HOME",
+            config_dir.to_str().expect("utf8"),
+        )]);
+
+        build_fake_pack_store(
+            &config_dir,
+            "acme",
+            "widget",
+            "widget",
+            r#"{
+                "meta": { "name": "widget" },
+                "session_hooks": {
+                    "before": { "script": "/absolute/path/before.sh" },
+                    "after":  { "script": "/absolute/path/after.sh" }
+                }
+            }"#,
+            None,
+        );
+
+        let profile = load_profile("acme/widget").expect("load registry profile");
+
+        let before = profile.session_hooks.before.as_ref().expect("before hook");
+        assert_eq!(
+            before.source_pack.as_deref(),
+            Some("acme/widget"),
+            "before hook source_pack should be set to the registry pack key"
+        );
+
+        let after = profile.session_hooks.after.as_ref().expect("after hook");
+        assert_eq!(
+            after.source_pack.as_deref(),
+            Some("acme/widget"),
+            "after hook source_pack should be set to the registry pack key"
+        );
+    }
+
+    /// Test 3: A profile loaded from a plain file path (non-registry) does NOT
+    /// set `source_pack` on either hook — `source_pack` is `None` for both.
+    #[test]
+    fn test_non_registry_pack_hooks_have_no_source_pack() {
+        let dir = tempdir().expect("tmpdir");
+        let profile_path = dir.path().join("local.json");
+        std::fs::write(
+            &profile_path,
+            r#"{
+                "meta": { "name": "local" },
+                "session_hooks": {
+                    "before": { "script": "/usr/local/bin/setup.sh" },
+                    "after":  { "script": "/usr/local/bin/cleanup.sh" }
+                }
+            }"#,
+        )
+        .expect("write profile");
+
+        let profile =
+            load_profile_from_path(&profile_path).expect("load profile from path");
+
+        let before = profile.session_hooks.before.as_ref().expect("before hook");
+        assert!(
+            before.source_pack.is_none(),
+            "non-registry before hook must not have source_pack set"
+        );
+
+        let after = profile.session_hooks.after.as_ref().expect("after hook");
+        assert!(
+            after.source_pack.is_none(),
+            "non-registry after hook must not have source_pack set"
         );
     }
 

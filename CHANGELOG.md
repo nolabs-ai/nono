@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.61.1] - 2026-06-02
+
+### Features
+
+- *(profile)* Allow registry refs in profile extends (#1061) ([#1061](https://github.com/always-further/nono/pull/1061))
+
 ## [0.61.0] - 2026-06-02
 
 ### Features

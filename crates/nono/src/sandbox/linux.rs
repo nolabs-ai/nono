@@ -3292,9 +3292,37 @@ mod tests {
         }
         let mut caps = CapabilitySet::new().proxy_only(8080);
         caps.add_localhost_port(0);
-        // Should not return an error; port 0 is the Landlock wildcard.
-        apply_with_abi(&caps, &detected)
-            .expect("port 0 in ProxyOnly mode must be accepted on Linux");
+
+        // Fork a child to isolate the irreversible sandbox application.
+        // apply_with_abi() calls restrict_self(), which permanently sandboxes the
+        // calling process. Running it in a child prevents corrupting the test runner.
+        // SAFETY: fork() is used in a test helper; the child exits via _exit without
+        // running parent process destructors after fork.
+        let child_pid = unsafe { libc::fork() };
+        assert!(child_pid >= 0, "fork() failed");
+
+        if child_pid == 0 {
+            let exit_code = match apply_with_abi(&caps, &detected) {
+                Ok(_) => 0,
+                Err(_) => 1,
+            };
+            // SAFETY: _exit terminates the child without running parent destructors.
+            unsafe { libc::_exit(exit_code) };
+        }
+
+        let mut child_status = 0;
+        // SAFETY: child_pid is the PID returned by fork() in the parent branch.
+        let waited = unsafe { libc::waitpid(child_pid, &mut child_status, 0) };
+        assert_eq!(waited, child_pid, "waitpid() failed");
+        assert!(
+            libc::WIFEXITED(child_status),
+            "child did not exit normally"
+        );
+        assert_eq!(
+            libc::WEXITSTATUS(child_status),
+            0,
+            "port 0 in ProxyOnly mode must be accepted on Linux"
+        );
     }
 
     #[test]

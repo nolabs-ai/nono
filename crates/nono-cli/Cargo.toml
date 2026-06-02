@@ -102,7 +102,7 @@ nix = { workspace = true, features = ["process", "signal", "fs", "user", "term"]
 dns-lookup = "2"
 keyring = { version = "3", features = ["apple-native"], optional = true, default-features = false }
 security-framework = "3"
-x509-parser = "0.16"
+x509-parser = "0.18"
 
 [build-dependencies]
 toml.workspace = true

@@ -675,7 +675,6 @@ mod tests {
 mod cap_file_validation_tests {
     use super::*;
     use crate::test_env::{ENV_LOCK, EnvVarGuard};
-    use tempfile::tempdir;
 
     /// Write a valid `.nono-<hex>.json` capability file into `dir`.
     fn write_cap_file(dir: &Path) -> PathBuf {
@@ -718,7 +717,7 @@ mod cap_file_validation_tests {
 
     #[test]
     fn test_validate_accepts_file_in_tempdir() {
-        let dir = tempdir().expect("tempdir");
+        let dir = tempfile::tempdir_in("/tmp").expect("tempdir");
         let path = write_cap_file(dir.path());
         let path_str = path.to_str().expect("utf8 path");
 
@@ -766,7 +765,7 @@ mod cap_file_validation_tests {
 
     #[test]
     fn test_validate_rejects_nonexistent_file() {
-        let dir = tempdir().expect("tempdir");
+        let dir = tempfile::tempdir_in("/tmp").expect("tempdir");
         let missing = dir.path().join(".nono-0000000000000000.json");
         let err = validate_cap_file_path(missing.to_str().expect("utf8"))
             .expect_err("nonexistent file rejected");
@@ -791,7 +790,12 @@ mod cap_file_validation_tests {
 
     #[test]
     fn test_validate_rejects_wrong_filename_pattern() {
-        let dir = tempdir().expect("tempdir");
+        // Anchor under `/tmp` so the test is immune to parallel tests that
+        // modify `$TMPDIR` — a bare `tempdir()` would inherit the altered
+        // `$TMPDIR` and the backing directory may be deleted by the other
+        // test's TempDir drop, causing `canonicalize` to fail with ENOENT
+        // before the filename-pattern check is reached.
+        let dir = tempfile::tempdir_in("/tmp").expect("tempdir");
         let caps = CapabilitySet::new().block_network();
         let state = SandboxState::from_caps(&caps, &[], &[], &[]);
         let path = dir.path().join("not-a-nono-file.json");
@@ -807,7 +811,7 @@ mod cap_file_validation_tests {
 
     #[test]
     fn test_validate_rejects_directory() {
-        let dir = tempdir().expect("tempdir");
+        let dir = tempfile::tempdir_in("/tmp").expect("tempdir");
         let err = validate_cap_file_path(dir.path().to_str().expect("utf8"))
             .expect_err("directory rejected");
         // A directory in a temp root fails the filename-pattern check before the

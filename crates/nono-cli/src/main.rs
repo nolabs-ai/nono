@@ -284,6 +284,7 @@ mod tests {
             open_url_allow_localhost: false,
             bypass_protection_paths: Vec::new(),
             ignored_denial_paths: Vec::new(),
+            suppressed_system_service_operations: Vec::new(),
             allowed_env_vars: None,
             denied_env_vars: None,
         };
@@ -334,6 +335,7 @@ mod tests {
             open_url_allow_localhost: false,
             bypass_protection_paths: Vec::new(),
             ignored_denial_paths: Vec::new(),
+            suppressed_system_service_operations: Vec::new(),
             allowed_env_vars: None,
             denied_env_vars: None,
         };

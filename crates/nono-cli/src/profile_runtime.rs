@@ -167,7 +167,7 @@ fn verify_profile_packs(packs: &[String], profile: &profile::Profile) -> crate::
                     })?;
                 if !locked_pkg.artifacts.contains_key(relative_path) {
                     return Err(nono::NonoError::PackageInstall(format!(
-                        "session_hook with path {} is not within the pack",
+                        "session_hook with path {} is not a declared artifact in the pack lockfile",
                         script_path.display()
                     )));
                 }

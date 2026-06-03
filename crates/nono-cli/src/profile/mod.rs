@@ -7545,6 +7545,131 @@ mod tests {
         );
     }
 
+    /// Loading a pack-store profile by its `install_as` short name (e.g. "claude-code")
+    /// must expand `$PACK_DIR` in session hook scripts, just as loading by the full
+    /// registry ref (`namespace/pack`) does.
+    ///
+    /// The code path under test is the `find_pack_store_profile` branch inside
+    /// `load_profile_inner`, reached when:
+    ///   1. The name contains no `/`     → `is_registry_ref` is false
+    ///   2. The name contains no ext     → `is_file_path_ref` is false
+    ///   3. No user-profile file exists  → `resolve_user_profile_path` returns None
+    ///   4. A pack is installed whose manifest declares `install_as == name`
+    ///
+    /// This is exactly the user scenario for `--profile claude-code` or
+    /// `--profile widget` when those names are shipped by a registry pack.
+    #[test]
+    fn test_pack_store_short_name_pack_dir_is_expanded() {
+        let (profile, install_dir) = {
+            let _guard = match crate::test_env::ENV_LOCK.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            let tmp = tempdir().expect("tmpdir");
+            let config_dir = tmp.path().canonicalize().expect("canonicalize");
+            let _env = crate::test_env::EnvVarGuard::set_all(&[(
+                "XDG_CONFIG_HOME",
+                config_dir.to_str().expect("utf8"),
+            )]);
+
+            // The pack registry key is "acme/my-tools" but its profile artifact
+            // is installed under the short name "claude-code".  Loading by
+            // "claude-code" (no slash) bypasses load_registry_profile entirely
+            // and hits the find_pack_store_profile slow-path scanner in
+            // load_profile_inner — the path that was missing the
+            // resolve_store_pack_session_hooks call.
+            let install_dir = build_fake_pack_store(
+                &config_dir,
+                "acme",
+                "my-tools",
+                "claude-code",
+                r#"{
+                    "meta": { "name": "claude-code" },
+                    "session_hooks": {
+                        "before": { "script": "$PACK_DIR/hooks/setup.sh" },
+                        "after":  { "script": "$PACK_DIR/hooks/teardown.sh" }
+                    }
+                }"#,
+                None,
+            );
+
+            // Load by the short install_as name, NOT the registry ref.
+            let profile = load_profile("claude-code").expect("load by short name");
+            (profile, install_dir)
+        }; // _guard and _env dropped here — lock released before assertions
+
+        let before = profile.session_hooks.before.as_ref().expect("before hook");
+        assert_eq!(
+            before.script,
+            install_dir.join("hooks").join("setup.sh"),
+            "before hook $PACK_DIR must be expanded when loading by install_as short name"
+        );
+
+        let after = profile.session_hooks.after.as_ref().expect("after hook");
+        assert_eq!(
+            after.script,
+            install_dir.join("hooks").join("teardown.sh"),
+            "after hook $PACK_DIR must be expanded when loading by install_as short name"
+        );
+    }
+
+    /// Loading a pack-store profile by its `install_as` short name must also
+    /// stamp `source_pack` provenance on session hooks, enabling verification
+    /// at sandbox start time.
+    ///
+    /// Mirrors `test_registry_pack_hooks_have_source_pack_set` but exercises
+    /// the `find_pack_store_profile` branch in `load_profile_inner` (reached
+    /// when the user supplies a bare name like `--profile widget`) rather than
+    /// the `load_registry_profile` branch (reached for `--profile acme/widget`).
+    #[test]
+    fn test_pack_store_short_name_source_pack_is_set() {
+        let profile = {
+            let _guard = match crate::test_env::ENV_LOCK.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            let tmp = tempdir().expect("tmpdir");
+            let config_dir = tmp.path().canonicalize().expect("canonicalize");
+            let _env = crate::test_env::EnvVarGuard::set_all(&[(
+                "XDG_CONFIG_HOME",
+                config_dir.to_str().expect("utf8"),
+            )]);
+
+            // Pack "acme/widget-pack" installs its profile under install_as "widget".
+            // The user will invoke `--profile widget` (no namespace prefix).
+            build_fake_pack_store(
+                &config_dir,
+                "acme",
+                "widget-pack",
+                "widget",
+                r#"{
+                    "meta": { "name": "widget" },
+                    "session_hooks": {
+                        "before": { "script": "/absolute/before.sh" },
+                        "after":  { "script": "/absolute/after.sh" }
+                    }
+                }"#,
+                None,
+            );
+
+            load_profile("widget").expect("load by short name")
+        }; // _guard and _env dropped here
+
+        let before = profile.session_hooks.before.as_ref().expect("before hook");
+        assert_eq!(
+            before.source_pack.as_ref().map(PackageRef::key).as_deref(),
+            Some("acme/widget-pack"),
+            "before hook source_pack must be set when loading by install_as short name"
+        );
+
+        let after = profile.session_hooks.after.as_ref().expect("after hook");
+        assert_eq!(
+            after.source_pack.as_ref().map(PackageRef::key).as_deref(),
+            Some("acme/widget-pack"),
+            "after hook source_pack must be set when loading by install_as short name"
+        );
+    }
+
     #[test]
     fn profile_binary_field_parses_and_inherits() {
         let base = br#"{

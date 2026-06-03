@@ -64,7 +64,7 @@ fn install_profile_hooks(_profile_name: Option<&str>, profile: &profile::Profile
 /// 1. Check the pack directory exists
 /// 2. Verify artifact SHA-256 digests against the lockfile
 /// 3. Re-verify Sigstore bundles from the stored `.nono-trust.bundle` file
-fn verify_profile_packs(packs: &[String]) -> crate::Result<()> {
+fn verify_profile_packs(packs: &[String], _session_hooks: &profile::SessionHooks) -> crate::Result<()> {
     if packs.is_empty() {
         return Ok(());
     }
@@ -468,7 +468,7 @@ fn prepare_profile_with_options(
             }
         }
 
-        verify_profile_packs(&packs_to_verify)?;
+        verify_profile_packs(&packs_to_verify, &profile.session_hooks)?;
 
         if !packs_to_verify.is_empty() && !options.hook_output_silent {
             eprintln!("  Verified {} pack(s)", packs_to_verify.len());
@@ -634,8 +634,371 @@ pub(crate) fn prepare_profile_for_preflight(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use profile::{SessionHook, SessionHooks};
+    use sha2::{Digest, Sha256};
+    use std::collections::BTreeMap;
     use std::fs;
     use tempfile::tempdir;
+
+    // -------------------------------------------------------------------------
+    // Test helpers
+    // -------------------------------------------------------------------------
+
+    /// Build a minimal pack on disk under `<config_dir>/nono/packages/<ns>/<name>/`
+    /// and return the install directory.
+    ///
+    /// `scripts` is a list of `(relative_path, content)` pairs.  Each file is
+    /// written under the install directory and its SHA-256 is recorded in the
+    /// returned `BTreeMap<String, package::LockedArtifact>` so the caller can
+    /// incorporate it into a lockfile entry.
+    fn build_pack_with_scripts(
+        config_dir: &std::path::Path,
+        ns: &str,
+        pack_name: &str,
+        scripts: &[(&str, &str)],
+    ) -> (PathBuf, BTreeMap<String, package::LockedArtifact>) {
+        let install_dir = config_dir
+            .join("nono")
+            .join("packages")
+            .join(ns)
+            .join(pack_name);
+
+        let mut artifacts: BTreeMap<String, package::LockedArtifact> = BTreeMap::new();
+
+        for (rel_path, content) in scripts {
+            let full_path = install_dir.join(rel_path);
+            if let Some(parent) = full_path.parent() {
+                fs::create_dir_all(parent).expect("create script dir");
+            }
+            fs::write(&full_path, content.as_bytes()).expect("write script");
+
+            let digest = Sha256::digest(content.as_bytes());
+            let sha256 = digest.iter().map(|b| format!("{b:02x}")).collect::<String>();
+
+            artifacts.insert(
+                rel_path.to_string(),
+                package::LockedArtifact {
+                    sha256,
+                    artifact_type: package::ArtifactType::Profile,
+                },
+            );
+        }
+
+        (install_dir, artifacts)
+    }
+
+    /// Write a lockfile at `<config_dir>/nono/packages/lockfile.json` containing
+    /// the given entries.  Merges with any existing lockfile so multiple packs
+    /// can be added across calls.
+    fn write_test_lockfile(
+        config_dir: &std::path::Path,
+        entries: &[(&str, BTreeMap<String, package::LockedArtifact>)],
+    ) {
+        let lockfile_path = config_dir
+            .join("nono")
+            .join("packages")
+            .join("lockfile.json");
+        fs::create_dir_all(lockfile_path.parent().expect("parent")).expect("create packages dir");
+
+        let mut lockfile = if lockfile_path.exists() {
+            let content = fs::read_to_string(&lockfile_path).expect("read lockfile");
+            serde_json::from_str::<package::Lockfile>(&content).expect("parse lockfile")
+        } else {
+            package::Lockfile {
+                lockfile_version: package::LOCKFILE_VERSION,
+                registry: String::new(),
+                packages: BTreeMap::new(),
+            }
+        };
+
+        for (pack_ref, artifacts) in entries {
+            let mut pkg = package::LockedPackage::default();
+            pkg.artifacts = artifacts.clone();
+            lockfile.packages.insert(pack_ref.to_string(), pkg);
+        }
+
+        let json = serde_json::to_string_pretty(&lockfile).expect("serialize lockfile");
+        fs::write(&lockfile_path, format!("{json}\n")).expect("write lockfile");
+    }
+
+    /// Construct a `SessionHook` with the given script path and optional
+    /// `source_pack`.  Used to build `SessionHooks` directly in tests without
+    /// going through profile loading.
+    fn make_hook(script: PathBuf, source_pack: Option<&str>) -> SessionHook {
+        SessionHook {
+            script,
+            timeout_secs: None,
+            source_pack: source_pack.map(str::to_string),
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Test 1: local profile with an absolute-path hook
+    //
+    // A local (non-store) profile has source_pack = None on its hooks.
+    // packs_to_verify is empty so verify_profile_packs returns Ok(()) immediately
+    // without reading the lockfile.  The hook is never checked — this is
+    // intentional: local hooks are validated at execution time by
+    // validate_hook_script, not here.
+    // -------------------------------------------------------------------------
+    #[test]
+    fn test_verify_local_profile_hook_not_checked() {
+        let result = {
+            let _guard = match crate::test_env::ENV_LOCK.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            let tmp = tempdir().expect("tmpdir");
+            let config_dir = tmp.path().canonicalize().expect("canonicalize");
+            let _env = crate::test_env::EnvVarGuard::set_all(&[(
+                "XDG_CONFIG_HOME",
+                config_dir.to_str().expect("utf8"),
+            )]);
+
+            // Local hook pointing at an absolute path that is not in any pack.
+            let hooks = SessionHooks {
+                before: Some(make_hook(
+                    PathBuf::from("/usr/local/bin/my-setup.sh"),
+                    None, // source_pack = None → local hook
+                )),
+                after: None,
+            };
+
+            // No packs: verify_profile_packs returns Ok(()) immediately.
+            verify_profile_packs(&[], &hooks)
+        };
+
+        assert!(
+            result.is_ok(),
+            "local profile hooks must not be checked by verify_profile_packs"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Test 2: store pack whose hook script is a declared, locked artifact
+    //
+    // $PACK_DIR/scripts/before.sh was expanded at load time and appears in the
+    // lockfile artifacts.  verify_profile_packs must return Ok(()).
+    // -------------------------------------------------------------------------
+    #[test]
+    fn test_verify_store_pack_hook_in_artifacts_passes() {
+        let result = {
+            let _guard = match crate::test_env::ENV_LOCK.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            let tmp = tempdir().expect("tmpdir");
+            let config_dir = tmp.path().canonicalize().expect("canonicalize");
+            let _env = crate::test_env::EnvVarGuard::set_all(&[(
+                "XDG_CONFIG_HOME",
+                config_dir.to_str().expect("utf8"),
+            )]);
+
+            let (install_dir, artifacts) = build_pack_with_scripts(
+                &config_dir,
+                "acme",
+                "widget",
+                &[("scripts/before.sh", "#!/bin/sh\necho before\n")],
+            );
+            write_test_lockfile(&config_dir, &[("acme/widget", artifacts)]);
+
+            let hooks = SessionHooks {
+                before: Some(make_hook(
+                    install_dir.join("scripts/before.sh"),
+                    Some("acme/widget"),
+                )),
+                after: None,
+            };
+
+            verify_profile_packs(&["acme/widget".to_string()], &hooks)
+        };
+
+        assert!(
+            result.is_ok(),
+            "hook script that is a declared artifact must pass: {result:?}"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Test 3: store pack hook script exists on disk but is NOT in artifacts
+    //
+    // An attacker (or a mistaken author) places a script inside the pack
+    // directory that was never declared in the lockfile.  verify_profile_packs
+    // must reject this with an error.
+    // -------------------------------------------------------------------------
+    #[test]
+    fn test_verify_store_pack_hook_not_in_artifacts_fails() {
+        let result = {
+            let _guard = match crate::test_env::ENV_LOCK.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            let tmp = tempdir().expect("tmpdir");
+            let config_dir = tmp.path().canonicalize().expect("canonicalize");
+            let _env = crate::test_env::EnvVarGuard::set_all(&[(
+                "XDG_CONFIG_HOME",
+                config_dir.to_str().expect("utf8"),
+            )]);
+
+            // Lockfile only declares "scripts/real.sh"; the profile hook
+            // points at "scripts/non-existing.sh" which is not locked.
+            let (install_dir, artifacts) = build_pack_with_scripts(
+                &config_dir,
+                "acme",
+                "widget",
+                &[("scripts/real.sh", "#!/bin/sh\necho real\n")],
+            );
+            // Also write the unlocked file on disk to confirm presence alone
+            // is not sufficient for the check to pass.
+            let unlocked = install_dir.join("scripts/non-existing.sh");
+            fs::write(&unlocked, "#!/bin/sh\necho unlocked\n").expect("write unlocked");
+
+            write_test_lockfile(&config_dir, &[("acme/widget", artifacts)]);
+
+            let hooks = SessionHooks {
+                before: Some(make_hook(
+                    install_dir.join("scripts/non-existing.sh"),
+                    Some("acme/widget"),
+                )),
+                after: None,
+            };
+
+            verify_profile_packs(&["acme/widget".to_string()], &hooks)
+        };
+
+        assert!(
+            result.is_err(),
+            "hook script not in lockfile artifacts must be rejected"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Test 4: store-extends-store — each hook from its own pack's artifacts
+    //
+    // acme/base provides the before hook; acme/top provides the after hook.
+    // Both scripts are in their respective packs' lockfile artifacts.
+    // verify_profile_packs must return Ok(()).
+    // -------------------------------------------------------------------------
+    #[test]
+    fn test_verify_store_extends_store_hooks_in_correct_packs_passes() {
+        let result = {
+            let _guard = match crate::test_env::ENV_LOCK.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            let tmp = tempdir().expect("tmpdir");
+            let config_dir = tmp.path().canonicalize().expect("canonicalize");
+            let _env = crate::test_env::EnvVarGuard::set_all(&[(
+                "XDG_CONFIG_HOME",
+                config_dir.to_str().expect("utf8"),
+            )]);
+
+            let (base_install_dir, base_artifacts) = build_pack_with_scripts(
+                &config_dir,
+                "acme",
+                "base",
+                &[("hooks/setup.sh", "#!/bin/sh\necho setup\n")],
+            );
+            let (top_install_dir, top_artifacts) = build_pack_with_scripts(
+                &config_dir,
+                "acme",
+                "top",
+                &[("hooks/teardown.sh", "#!/bin/sh\necho teardown\n")],
+            );
+            write_test_lockfile(
+                &config_dir,
+                &[
+                    ("acme/base", base_artifacts),
+                    ("acme/top", top_artifacts),
+                ],
+            );
+
+            let hooks = SessionHooks {
+                before: Some(make_hook(
+                    base_install_dir.join("hooks/setup.sh"),
+                    Some("acme/base"),
+                )),
+                after: Some(make_hook(
+                    top_install_dir.join("hooks/teardown.sh"),
+                    Some("acme/top"),
+                )),
+            };
+
+            verify_profile_packs(
+                &["acme/base".to_string(), "acme/top".to_string()],
+                &hooks,
+            )
+        };
+
+        assert!(
+            result.is_ok(),
+            "hooks from their correct packs must pass: {result:?}"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Test 5: pack confusion — hook source_pack does not match the pack that
+    // owns the script on disk
+    //
+    // The before hook has source_pack = "acme/top" but its script path lives
+    // inside acme/base's install directory (i.e. not in acme/top's artifacts).
+    // verify_profile_packs must reject this.
+    // -------------------------------------------------------------------------
+    #[test]
+    fn test_verify_store_extends_store_pack_confusion_fails() {
+        let result = {
+            let _guard = match crate::test_env::ENV_LOCK.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            let tmp = tempdir().expect("tmpdir");
+            let config_dir = tmp.path().canonicalize().expect("canonicalize");
+            let _env = crate::test_env::EnvVarGuard::set_all(&[(
+                "XDG_CONFIG_HOME",
+                config_dir.to_str().expect("utf8"),
+            )]);
+
+            let (base_install_dir, base_artifacts) = build_pack_with_scripts(
+                &config_dir,
+                "acme",
+                "base",
+                &[("hooks/setup.sh", "#!/bin/sh\necho setup\n")],
+            );
+            let (_top_install_dir, top_artifacts) = build_pack_with_scripts(
+                &config_dir,
+                "acme",
+                "top",
+                &[("hooks/teardown.sh", "#!/bin/sh\necho teardown\n")],
+            );
+            write_test_lockfile(
+                &config_dir,
+                &[
+                    ("acme/base", base_artifacts),
+                    ("acme/top", top_artifacts),
+                ],
+            );
+
+            // Confusion: the script lives in acme/base but source_pack claims
+            // acme/top.  acme/top's artifacts do not include hooks/setup.sh.
+            let hooks = SessionHooks {
+                before: Some(make_hook(
+                    base_install_dir.join("hooks/setup.sh"),
+                    Some("acme/top"), // wrong pack
+                )),
+                after: None,
+            };
+
+            verify_profile_packs(
+                &["acme/base".to_string(), "acme/top".to_string()],
+                &hooks,
+            )
+        };
+
+        assert!(
+            result.is_err(),
+            "hook script not in the claimed pack's artifacts must be rejected"
+        );
+    }
 
     #[test]
     fn prepare_profile_for_preflight_matches_runtime_resolution() {

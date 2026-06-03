@@ -786,8 +786,10 @@ mod tests {
         };
 
         for (pack_ref, artifacts) in entries {
-            let mut pkg = package::LockedPackage::default();
-            pkg.artifacts = artifacts.clone();
+            let pkg = package::LockedPackage {
+                artifacts: artifacts.clone(),
+                ..package::LockedPackage::default()
+            };
             lockfile.packages.insert(pack_ref.to_string(), pkg);
         }
 
@@ -837,7 +839,8 @@ mod tests {
             result.is_err(),
             "source_pack not in packs list must be a hard error"
         );
-        let msg = result.unwrap_err().to_string();
+        let err = result.expect_err("expected an error from verify_profile_packs");
+        let msg = err.to_string();
         assert!(
             msg.contains("/some/path/script.sh"),
             "error must reference the offending hook script: {msg}"

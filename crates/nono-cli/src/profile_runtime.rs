@@ -144,7 +144,11 @@ fn verify_profile_packs(packs: &[String], profile: &profile::Profile) -> crate::
             for script_path in [&profile.session_hooks.before, &profile.session_hooks.after]
                 .into_iter()
                 .flatten()
-                .filter(|hook| hook.source_pack.as_ref().is_some_and(|sp| sp.key() == *pack_ref))
+                .filter(|hook| {
+                    hook.source_pack
+                        .as_ref()
+                        .is_some_and(|sp| sp.key() == *pack_ref)
+                })
                 .map(|hook| hook.script.as_path())
             {
                 let relative_path = script_path
@@ -157,7 +161,9 @@ fn verify_profile_packs(packs: &[String], profile: &profile::Profile) -> crate::
                     })?
                     .to_str()
                     .ok_or_else(|| {
-                        nono::NonoError::PackageInstall(format!("Invalid script_path characters"))
+                        nono::NonoError::PackageInstall(
+                            "Invalid script_path characters".to_string(),
+                        )
                     })?;
                 if !locked_pkg.artifacts.contains_key(relative_path) {
                     return Err(nono::NonoError::PackageInstall(format!(

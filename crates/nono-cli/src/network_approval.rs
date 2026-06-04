@@ -265,6 +265,22 @@ impl NetworkApprovalBackend {
         let host = request.host.clone();
         tracing::info!("Network approval requested for host: {host}");
 
+        if self.runtime_filter.check_host(&host, &[]).is_allowed() {
+            tracing::info!("Host {host} already allowed by runtime filter — skipping dialog");
+            return NetworkApprovalDecision::Granted(ApprovalScope::Session);
+        }
+
+        if matches!(
+            self.runtime_filter.check_host(&host, &[]),
+            nono::net_filter::FilterResult::DenyHost { .. }
+                | nono::net_filter::FilterResult::DenyLinkLocal { .. }
+        ) {
+            tracing::info!("Host {host} explicitly denied by runtime filter");
+            return NetworkApprovalDecision::Denied {
+                reason: "Host denied by session policy".to_string(),
+            };
+        }
+
         let (entry, is_first) = {
             let mut pending = self.pending.lock().expect("pending lock poisoned");
             if let Some(existing) = pending.get(&host) {
@@ -404,6 +420,22 @@ impl ApprovalBackend for NetworkApprovalBackend {
         request: &NetworkApprovalRequest,
     ) -> Result<NetworkApprovalDecision> {
         let host = request.host.clone();
+
+        if self.runtime_filter.check_host(&host, &[]).is_allowed() {
+            tracing::info!("Host {host} already allowed by runtime filter — skipping dialog");
+            return Ok(NetworkApprovalDecision::Granted(ApprovalScope::Session));
+        }
+
+        if matches!(
+            self.runtime_filter.check_host(&host, &[]),
+            nono::net_filter::FilterResult::DenyHost { .. }
+                | nono::net_filter::FilterResult::DenyLinkLocal { .. }
+        ) {
+            tracing::info!("Host {host} explicitly denied by runtime filter");
+            return Ok(NetworkApprovalDecision::Denied {
+                reason: "Host denied by session policy".to_string(),
+            });
+        }
 
         let (entry, is_first) = {
             let mut pending = self.pending.lock().expect("pending lock poisoned");
@@ -1083,6 +1115,27 @@ mod tests {
             matches!(decision_b, NetworkApprovalDecision::Granted(ApprovalScope::Session)),
             "waiting request should be granted when the first request was approved, but got: {:?}",
             decision_b
+        );
+    }
+
+    #[tokio::test]
+    async fn test_already_approved_host_skips_dialog() {
+        let runtime_filter = deny_default_filter();
+        runtime_filter.add_host("pre-approved.com").unwrap();
+        let backend = NetworkApprovalBackend::new(
+            NetworkApprovalMode::Ask,
+            runtime_filter,
+            5,
+            None,
+        );
+
+        let request = make_request("pre-approved.com");
+        let decision = backend.request_network_approval_async(&request).await;
+
+        assert!(
+            matches!(decision, NetworkApprovalDecision::Granted(ApprovalScope::Session)),
+            "host already in runtime filter should be granted without dialog, but got: {:?}",
+            decision
         );
     }
 }

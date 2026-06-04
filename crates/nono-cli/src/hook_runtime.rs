@@ -11,7 +11,7 @@
 //!
 //! - Script paths are validated before every execution
 //!   (absolute, canonical, regular file, executable, owned by user, not world-writable)
-//! - Hooks run as subprocesses with minimal environment
+//! - Hooks run as subprocesses
 //! - Process group isolation for timeout-based killing
 //! - NONO_ENV_FILE is used for env var export (not stdout parsing)
 //! - Dangerous env vars are filtered before injection
@@ -168,7 +168,6 @@ fn build_hook_command(
     kind: &HookKind<'_>,
 ) -> Command {
     let mut cmd = Command::new(script);
-    cmd.env_clear();
     cmd.env("NONO_SESSION_ID", session_id);
     cmd.env("NONO_WORKDIR", workdir);
     cmd.env("NONO_HOOK_TYPE", kind.type_env());

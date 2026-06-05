@@ -1,6 +1,6 @@
 [package]
 name = "nono"
-version = "0.61.1"
+version = "0.61.2"
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true

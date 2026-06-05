@@ -426,8 +426,10 @@ pub async fn start_with_approval(
     };
     let loaded_routes = credential_store.loaded_prefixes();
 
-    // Build filter
-    let filter = if config.allowed_hosts.is_empty() && config.rejected_hosts.is_empty() {
+    // Build filter. Strict mode treats an empty allowlist as deny-all.
+    let filter = if config.strict_filter {
+        ProxyFilter::new_strict(&config.allowed_hosts)
+    } else if config.allowed_hosts.is_empty() && config.rejected_hosts.is_empty() {
         ProxyFilter::allow_all()
     } else {
         ProxyFilter::new_with_reject(&config.allowed_hosts, &config.rejected_hosts)
@@ -1733,6 +1735,49 @@ mod tests {
         assert!(
             !no_proxy.1.contains("server.internal"),
             "host on port 4222 should NOT be in NO_PROXY when only 443 is allowed"
+        );
+
+        handle.shutdown();
+    }
+
+    /// Regression test: when `strict_filter` is true and `allowed_hosts` is
+    /// empty, the proxy must deny CONNECT instead of falling back to allow-all.
+    #[tokio::test]
+    async fn test_strict_filter_with_empty_allowlist_denies_connect() {
+        use tokio::io::AsyncReadExt;
+        use tokio::net::TcpStream;
+
+        let config = ProxyConfig {
+            strict_filter: true,
+            allowed_hosts: Vec::new(),
+            ..ProxyConfig::default()
+        };
+        let handle = start(config).await.unwrap();
+        let addr = format!("127.0.0.1:{}", handle.port);
+
+        let mut stream = TcpStream::connect(&addr).await.unwrap();
+        let request = b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n";
+        tokio::io::AsyncWriteExt::write_all(&mut stream, request)
+            .await
+            .unwrap();
+
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        let response_str = String::from_utf8_lossy(&response);
+        assert!(
+            response_str.starts_with("HTTP/1.1 403"),
+            "strict filter with empty allowlist must deny CONNECT, got: {}",
+            response_str
+        );
+
+        let events = handle.drain_audit_events();
+        assert!(
+            events
+                .iter()
+                .any(|e| e.decision == nono::undo::NetworkAuditDecision::Deny
+                    && e.target == "example.com"),
+            "expected a Deny audit event for example.com, got: {:?}",
+            events
         );
 
         handle.shutdown();

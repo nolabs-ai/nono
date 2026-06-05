@@ -111,6 +111,7 @@ pub(crate) fn prepare_proxy_launch_options(
         network_approval_timeout_secs: resolve_approval_timeout_secs(
             prepared.profile_network_approval_timeout_secs,
         ),
+        network_block: prepared.network_block_requested,
     })
 }
 
@@ -282,6 +283,7 @@ pub(crate) fn build_proxy_config_from_flags(
         network_policy::expand_proxy_allow(&net_policy, &proxy.allow_domain.iter().map(|e| e.domain().to_string()).collect::<Vec<_>>());
     let mut proxy_config =
         network_policy::build_proxy_config(&resolved, &expanded_allow_domain, &proxy.reject_domain);
+    proxy_config.strict_filter = proxy.network_block;
 
     if let Some(ref addr) = proxy.upstream_proxy {
         proxy_config.external_proxy = Some(nono_proxy::config::ExternalProxyConfig {
@@ -654,5 +656,34 @@ mod tests {
             }
             _ => panic!("expected WithEndpoints"),
         }
+    }
+
+    /// `network_block: true` must set `strict_filter` on the generated `ProxyConfig`.
+    #[test]
+    fn test_build_proxy_config_propagates_network_block_to_strict_filter() {
+        let proxy = ProxyLaunchOptions {
+            active: true,
+            network_block: true,
+            ..ProxyLaunchOptions::default()
+        };
+        let config = build_proxy_config_from_flags(&proxy).expect("build_proxy_config_from_flags");
+        assert!(
+            config.strict_filter,
+            "network_block: true must set strict_filter on ProxyConfig"
+        );
+    }
+
+    #[test]
+    fn test_build_proxy_config_strict_filter_off_when_no_block() {
+        let proxy = ProxyLaunchOptions {
+            active: true,
+            network_block: false,
+            ..ProxyLaunchOptions::default()
+        };
+        let config = build_proxy_config_from_flags(&proxy).expect("build_proxy_config_from_flags");
+        assert!(
+            !config.strict_filter,
+            "strict_filter must default off when network_block is false"
+        );
     }
 }

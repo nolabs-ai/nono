@@ -90,6 +90,10 @@ pub(crate) struct ProxyLaunchOptions {
     pub(crate) proxy_ca_validity: Option<std::time::Duration>,
     pub(crate) network_approval_mode: crate::network_approval::NetworkApprovalMode,
     pub(crate) network_approval_timeout_secs: u64,
+    /// True when the user requested `network.block` or `--block-net`.
+    /// Propagated to `ProxyConfig.strict_filter` so the filter denies
+    /// unlisted hosts instead of falling back to allow-all.
+    pub(crate) network_block: bool,
 }
 
 #[derive(Clone)]

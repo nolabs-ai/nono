@@ -292,6 +292,7 @@ mod tests {
             denied_env_vars: None,
             profile_network_approval_mode: None,
             profile_network_approval_timeout_secs: None,
+            network_block_requested: false,
         };
 
         let effective = resolve_effective_proxy_settings(&args, &prepared);
@@ -347,6 +348,7 @@ mod tests {
             denied_env_vars: None,
             profile_network_approval_mode: None,
             profile_network_approval_timeout_secs: None,
+            network_block_requested: false,
         };
 
         let effective = resolve_effective_proxy_settings(&args, &prepared);

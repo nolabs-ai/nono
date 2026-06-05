@@ -36,7 +36,8 @@ pub struct ProxyConfig {
     pub bind_port: u16,
 
     /// Allowed hosts for CONNECT mode (exact match + wildcards).
-    /// Empty = allow all hosts (except deny list).
+    /// Empty = allow all hosts (except deny list), unless `strict_filter`
+    /// is `true`.
     #[serde(default)]
     pub allowed_hosts: Vec<String>,
 
@@ -45,6 +46,10 @@ pub struct ProxyConfig {
     /// (`*.evil.com`).
     #[serde(default)]
     pub rejected_hosts: Vec<String>,
+    /// When `true`, an empty `allowed_hosts` denies every host instead of
+    /// falling back to allow-all.
+    #[serde(default)]
+    pub strict_filter: bool,
 
     /// Reverse proxy credential routes.
     #[serde(default)]
@@ -151,6 +156,7 @@ impl Default for ProxyConfig {
             bind_port: 0,
             allowed_hosts: Vec::new(),
             rejected_hosts: Vec::new(),
+            strict_filter: false,
             routes: Vec::new(),
             external_proxy: None,
             direct_connect_ports: Vec::new(),

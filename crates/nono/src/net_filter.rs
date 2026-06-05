@@ -120,6 +120,8 @@ pub struct HostFilter {
     deny_hosts: Vec<String>,
     /// Wildcard suffixes that are always denied (e.g., ".evil.com")
     deny_suffixes: Vec<String>,
+    /// When true, an empty allowlist denies instead of allowing.
+    strict: bool,
 }
 
 impl HostFilter {
@@ -175,7 +177,16 @@ impl HostFilter {
             allowed_suffixes,
             deny_hosts,
             deny_suffixes,
+            strict: false,
         }
+    }
+
+    /// Create a strict host filter: empty allowlist denies everything.
+    #[must_use]
+    pub fn new_strict(allowed_hosts: &[String]) -> Self {
+        let mut filter = Self::new(allowed_hosts);
+        filter.strict = true;
+        filter
     }
 
     /// Create a host filter that allows everything (no filtering).
@@ -188,6 +199,7 @@ impl HostFilter {
             allowed_suffixes: Vec::new(),
             deny_hosts: DENY_HOSTS.iter().map(|s| s.to_lowercase()).collect(),
             deny_suffixes: Vec::new(),
+            strict: false,
         }
     }
 
@@ -207,6 +219,7 @@ impl HostFilter {
             allowed_suffixes: Vec::new(),
             deny_hosts: DENY_HOSTS.iter().map(|s| s.to_lowercase()).collect(),
             deny_suffixes: Vec::new(),
+            strict: false,
         }
     }
 
@@ -251,8 +264,13 @@ impl HostFilter {
             }
         }
 
-        // 4. If no allowlist is configured (allow_all mode), allow
+        // 4. Empty allowlist: deny when strict, allow otherwise.
         if self.allowed_hosts.is_empty() && self.allowed_suffixes.is_empty() {
+            if self.strict {
+                return FilterResult::DenyNotAllowed {
+                    host: host.to_string(),
+                };
+            }
             return FilterResult::Allow;
         }
 
@@ -709,5 +727,29 @@ mod tests {
             filter.check_host("evil.com", &public_ip()).is_allowed(),
             "deny suffix should not match bare domain"
         );
+    }
+
+    #[test]
+    fn test_strict_filter_empty_allowlist_denies() {
+        let filter = HostFilter::new_strict(&[]);
+        let result = filter.check_host("example.com", &public_ip());
+        assert!(matches!(result, FilterResult::DenyNotAllowed { .. }));
+    }
+
+    #[test]
+    fn test_strict_filter_respects_explicit_allowlist() {
+        let filter = HostFilter::new_strict(&["api.openai.com".to_string()]);
+        let allowed = filter.check_host("api.openai.com", &public_ip());
+        assert!(matches!(allowed, FilterResult::Allow));
+
+        let denied = filter.check_host("evil.com", &public_ip());
+        assert!(matches!(denied, FilterResult::DenyNotAllowed { .. }));
+    }
+
+    #[test]
+    fn test_non_strict_empty_allowlist_allows() {
+        let filter = HostFilter::new(&[]);
+        let result = filter.check_host("example.com", &public_ip());
+        assert!(matches!(result, FilterResult::Allow));
     }
 }

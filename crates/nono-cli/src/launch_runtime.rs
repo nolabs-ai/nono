@@ -87,6 +87,10 @@ pub(crate) struct ProxyLaunchOptions {
     #[cfg(target_os = "macos")]
     pub(crate) trust_proxy_ca: bool,
     pub(crate) proxy_ca_validity: Option<std::time::Duration>,
+    /// True when the user requested `network.block` or `--block-net`.
+    /// Propagated to `ProxyConfig.strict_filter` so the filter denies
+    /// unlisted hosts instead of falling back to allow-all.
+    pub(crate) network_block: bool,
 }
 
 #[derive(Clone)]

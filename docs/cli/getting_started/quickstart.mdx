@@ -12,22 +12,49 @@ nono run --allow . -- <COMMAND> [ARGS...]
 ```
 
 <Note>
-The `--` separator is recommended. Everything after it is the command to run.
+The `--` separator is for the reader to visually separate nono flags from the command and its arguments. It's not strictly required if there is no ambiguity, but it's a good habit to get into to avoid mistakes as you add more flags.
 </Note>
 
+Anything which is a process, can be run inside a nono sandbox - CLI tools, scripts, even interactive shells. The sandbox is applied to the entire process tree, so any child processes will also be restricted by the same permissions.
+
+## Pre-Built Profiles
+
+To get you going quickly, we provide pre-built profiles for popular AI agents and tools. These profiles bundle the right permissions for each tool, so you can get up and running with a single command.
+
+Just search for your favorite coding agent from the registry
+
 ```bash
-# Grant read+write access to current directory, run claude
-nono run --allow . -- claude
+nono search opencode
+always-further/opencode	-	Official Always Further Opencode Plugin
 ```
 
-Or use a profile that bundles the right permissions for a known tool:
+And then run..
 
 ```bash
-nono run --profile claude-code -- claude
-nono run --profile codex -- codex
+nono run --profile always-further/claude -- claude
+nono run --profile always-further/codex -- codex
+nono run --profile always-further/pi -- pi
 ```
 
-See [Profiles & Groups](/cli/features/profiles-groups) for all available profiles and how to create your own.
+<Note> 
+  If the agent you want to use cannot be found, create an [issue](https://github.com/always-further/nono/issues) to request consideration for adding it to the registry, or better yet, fork an existing profile and submit a PR with the new agent profile! See [Profiles & Groups](/cli/features/package-publishing) for details on how to create your own profiles.
+</Note>
+
+### Build your own profile
+
+It's likely that you are going to want to customize the pre-built profiles or create your own for different tools and needs. You can do this easily with `nono profile init` which will create a new profile based on an existing one, with the option to customize it interactively.
+
+```bash
+nono profile init claude --extends always-further/claude --full
+
+nono profile Created profile at /Users/jdoe/.config/nono/profiles/claude.json
+nono profile Validate with: nono profile validate claude
+nono profile For editor autocomplete: nono profile schema -o nono-profile.schema.json
+```
+
+You can now call your own profile with `--profile claude` just like the pre-built ones.
+
+From here, move to [Profiles & Groups](/cli/features/profiles-groups) for all available profiles and how to create your own.
 
 ## Commands
 

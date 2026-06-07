@@ -1,0 +1,38 @@
+Name:           nono-cli
+Version:        @RPM_VERSION@
+Release:        @RPM_RELEASE@
+Summary:        CLI for nono capability-based sandbox
+
+License:        Apache-2.0
+URL:            https://github.com/always-further/nono
+Source0:        nono-%{version}.tar.gz
+
+# This spec has no changelog; avoid distro macros trying to derive
+# SOURCE_DATE_EPOCH from one.
+%global source_date_epoch_from_changelog 0
+
+BuildRequires:  cargo >= 1.95
+BuildRequires:  rust >= 1.95
+BuildRequires:  gcc
+BuildRequires:  gcc-c++
+BuildRequires:  cmake
+BuildRequires:  make
+BuildRequires:  perl
+
+%description
+nono is a capability-based sandboxing system for running untrusted AI agents
+with OS-enforced isolation.
+
+%prep
+%autosetup -n nono-%{version}
+
+%build
+cargo build --release --locked --offline -p nono-cli
+
+%install
+install -Dm0755 target/release/nono %{buildroot}%{_bindir}/nono
+
+%files
+%{_bindir}/nono
+%doc README.md
+%license LICENSE

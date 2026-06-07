@@ -92,6 +92,7 @@ pub fn run_pull(args: PullArgs) -> Result<()> {
         &manifest,
         &downloads,
         args.init,
+        args.force,
         &pack_owned_files,
     )?;
     update_lockfile(
@@ -769,6 +770,7 @@ fn install_package(
     manifest: &PackageManifest,
     downloads: &VerifiedDownloads,
     init: bool,
+    force: bool,
     pack_owned_files: &HashMap<PathBuf, String>,
 ) -> Result<InstallSummary> {
     let staging_parent = package::package_store_dir()?
@@ -831,7 +833,18 @@ fn install_package(
             namespace: package_ref.namespace.clone(),
             pack_name: package_ref.name.clone(),
         };
-        let report = crate::wiring::execute(&manifest.wiring, &ctx, pack_owned_files)?;
+        let report = if force {
+            crate::wiring::execute_with_options(
+                &manifest.wiring,
+                &ctx,
+                pack_owned_files,
+                crate::wiring::ExecuteOptions {
+                    allow_unmanaged_identical_write_files: true,
+                },
+            )?
+        } else {
+            crate::wiring::execute(&manifest.wiring, &ctx, pack_owned_files)?
+        };
         for conflict in &report.conflicts {
             eprintln!("  warning: {conflict}");
         }

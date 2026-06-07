@@ -1,5 +1,32 @@
 # Changelog
 
+## [0.62.0] - 2026-06-07
+
+### Bug Fixes
+
+- *(proxy)* Deny-by-default when network.block is set (#1082) ([#1082](https://github.com/always-further/nono/pull/1082))
+
+
+### Dependencies
+
+- *(deps)* Bump actions/checkout from 6.0.2 to 6.0.3
+
+- *(deps)* Bump docker/setup-qemu-action from 4.0.0 to 4.1.0
+
+- *(deps)* Bump jsonschema from 0.46.4 to 0.46.5
+
+- *(deps)* Bump rustls-native-certs from 0.8.3 to 0.8.4
+
+
+### Features
+
+- *(packaging)* Add automated AUR package publishing (#917) (#1083) ([#1083](https://github.com/always-further/nono/pull/1083))
+
+
+### Miscellaneous
+
+- Release v0.61.2
+
 ## [0.61.2] - 2026-06-05
 
 ### Bug Fixes

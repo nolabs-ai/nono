@@ -901,6 +901,13 @@ pub const SYS_CONNECT: i32 = libc::SYS_connect as i32;
 #[cfg(target_os = "linux")]
 pub const SYS_BIND: i32 = libc::SYS_bind as i32;
 
+// Syscall numbers for sendto/sendmsg (public for CLI supervisor handler)
+// Needed to mediate AF_UNIX datagram sends (issue #1089).
+#[cfg(target_os = "linux")]
+pub const SYS_SENDTO: i32 = libc::SYS_sendto as i32;
+#[cfg(target_os = "linux")]
+pub const SYS_SENDMSG: i32 = libc::SYS_sendmsg as i32;
+
 /// struct open_how from <linux/openat2.h>
 ///
 /// Used by openat2() syscall. args[2] is a pointer to this struct, NOT the flags integer.
@@ -949,6 +956,7 @@ pub fn validate_openat2_size(how_size: usize) -> bool {
 // Offset of `nr` field in seccomp_data (used by BPF)
 const SECCOMP_DATA_NR_OFFSET: u32 = 0;
 const SECCOMP_DATA_ARG0_OFFSET: u32 = 16;
+const SECCOMP_DATA_ARG4_OFFSET: u32 = 48;
 
 /// A single BPF instruction.
 #[repr(C)]
@@ -1782,26 +1790,37 @@ fn build_seccomp_proxy_filter(_has_bind_ports: bool) -> Vec<SockFilterInsn> {
     // supervisor's `decide_network_notification` is the sole arbiter.
     let bind_action = SECCOMP_RET_USER_NOTIF;
 
+    // sendto() routes to USER_NOTIF when args[4] (dest_addr) is non-NULL.
+    // When NULL, the socket is already connected and no mediation is needed.
+    // sendmsg() routes unconditionally to USER_NOTIF because BPF cannot
+    // dereference the msghdr to check msg_name. The supervisor fast-paths
+    // NULL msg_name (connected socket, no destination).
+    //
     // Target instruction index table (jt/jf are offsets from next insn):
     //  0: ld [nr]
-    //  1: jeq SOCKET     jt=6  -> insn 8
-    //  2: jeq CONNECT    jt=13 -> insn 16
-    //  3: jeq BIND       jt=13 -> insn 17
-    //  4: jeq SOCKETPAIR jt=8  -> insn 13
-    //  5: jeq IO_URING   jt=1  -> insn 7
-    //  6: ret ALLOW
-    //  7: ret ERRNO
-    //  8: ld [args[0]]
-    //  9: jeq AF_UNIX    jt=8  -> insn 18
-    // 10: jeq AF_INET    jt=7  -> insn 18
-    // 11: jeq AF_INET6   jt=6  -> insn 18
-    // 12: ret ERRNO            (bad socket family)
-    // 13: ld [args[0]]
-    // 14: jeq AF_UNIX    jt=3  -> insn 18
-    // 15: ret ERRNO            (bad socketpair family)
-    // 16: ret USER_NOTIF       (connect)
-    // 17: ret bind_action      (bind)
-    // 18: ret ALLOW            (good socket/socketpair)
+    //  1: jeq SOCKET     jt=8  -> insn 10
+    //  2: jeq CONNECT    jt=15 -> insn 18
+    //  3: jeq BIND       jt=15 -> insn 19
+    //  4: jeq SOCKETPAIR jt=10 -> insn 15
+    //  5: jeq SENDTO    jt=14 -> insn 20
+    //  6: jeq SENDMSG    jt=15 -> insn 22
+    //  7: jeq IO_URING   jt=1  -> insn 9
+    //  8: ret ALLOW
+    //  9: ret ERRNO
+    // 10: ld [args[0]]
+    // 11: jeq AF_UNIX    jt=11 -> insn 23
+    // 12: jeq AF_INET    jt=10 -> insn 23
+    // 13: jeq AF_INET6   jt=9  -> insn 23
+    // 14: ret ERRNO            (bad socket family)
+    // 15: ld [args[0]]
+    // 16: jeq AF_UNIX    jt=6  -> insn 23
+    // 17: ret ERRNO            (bad socketpair family)
+    // 18: ret USER_NOTIF       (connect)
+    // 19: ret bind_action      (bind)
+    // 20: ld [args[4]]         (sendto dest_addr)
+    // 21: jeq 0        jt=1  -> insn 23 (ALLOW if NULL dest)
+    // 22: ret USER_NOTIF       (sendto non-NULL dest, sendmsg)
+    // 23: ret ALLOW            (good socket/socketpair, sendto NULL dest)
 
     vec![
         // 0: ld [nr]
@@ -1811,126 +1830,161 @@ fn build_seccomp_proxy_filter(_has_bind_ports: bool) -> Vec<SockFilterInsn> {
             jf: 0,
             k: SECCOMP_DATA_NR_OFFSET,
         },
-        // 1: jeq SYS_SOCKET -> 8 (jt = 8-1-1 = 6)
-        SockFilterInsn {
-            code: BPF_JMP | BPF_JEQ | BPF_K,
-            jt: 6,
-            jf: 0,
-            k: SYS_SOCKET as u32,
-        },
-        // 2: jeq SYS_CONNECT -> 16 (jt = 16-2-1 = 13)
-        SockFilterInsn {
-            code: BPF_JMP | BPF_JEQ | BPF_K,
-            jt: 13,
-            jf: 0,
-            k: SYS_CONNECT as u32,
-        },
-        // 3: jeq SYS_BIND -> 17 (jt = 17-3-1 = 13)
-        SockFilterInsn {
-            code: BPF_JMP | BPF_JEQ | BPF_K,
-            jt: 13,
-            jf: 0,
-            k: SYS_BIND as u32,
-        },
-        // 4: jeq SYS_SOCKETPAIR -> 13 (jt = 13-4-1 = 8)
+        // 1: jeq SYS_SOCKET -> 10 (jt = 10-1-1 = 8)
         SockFilterInsn {
             code: BPF_JMP | BPF_JEQ | BPF_K,
             jt: 8,
             jf: 0,
+            k: SYS_SOCKET as u32,
+        },
+        // 2: jeq SYS_CONNECT -> 18 (jt = 18-2-1 = 15)
+        SockFilterInsn {
+            code: BPF_JMP | BPF_JEQ | BPF_K,
+            jt: 15,
+            jf: 0,
+            k: SYS_CONNECT as u32,
+        },
+        // 3: jeq SYS_BIND -> 19 (jt = 19-3-1 = 15)
+        SockFilterInsn {
+            code: BPF_JMP | BPF_JEQ | BPF_K,
+            jt: 15,
+            jf: 0,
+            k: SYS_BIND as u32,
+        },
+        // 4: jeq SYS_SOCKETPAIR -> 15 (jt = 15-4-1 = 10)
+        SockFilterInsn {
+            code: BPF_JMP | BPF_JEQ | BPF_K,
+            jt: 10,
+            jf: 0,
             k: SYS_SOCKETPAIR as u32,
         },
-        // 5: jeq SYS_IO_URING_SETUP -> 7 (jt = 7-5-1 = 1)
+        // 5: jeq SYS_SENDTO -> 20 (jt = 20-5-1 = 14) check dest_addr
+        SockFilterInsn {
+            code: BPF_JMP | BPF_JEQ | BPF_K,
+            jt: 14,
+            jf: 0,
+            k: SYS_SENDTO as u32,
+        },
+        // 6: jeq SYS_SENDMSG -> 22 (jt = 22-6-1 = 15) unconditional notify
+        SockFilterInsn {
+            code: BPF_JMP | BPF_JEQ | BPF_K,
+            jt: 15,
+            jf: 0,
+            k: SYS_SENDMSG as u32,
+        },
+        // 7: jeq SYS_IO_URING_SETUP -> 9 (jt = 9-7-1 = 1)
         SockFilterInsn {
             code: BPF_JMP | BPF_JEQ | BPF_K,
             jt: 1,
             jf: 0,
             k: SYS_IO_URING_SETUP as u32,
         },
-        // 6: ret ALLOW
+        // 8: ret ALLOW
         SockFilterInsn {
             code: BPF_RET | BPF_K,
             jt: 0,
             jf: 0,
             k: SECCOMP_RET_ALLOW,
         },
-        // 7: ret ERRNO(EACCES)
+        // 9: ret ERRNO(EACCES)
         SockFilterInsn {
             code: BPF_RET | BPF_K,
             jt: 0,
             jf: 0,
             k: errno_ret,
         },
-        // 8: ld [args[0]] — socket() family
+        // 10: ld [args[0]] — socket() family
         SockFilterInsn {
             code: BPF_LD | BPF_W | BPF_ABS,
             jt: 0,
             jf: 0,
             k: SECCOMP_DATA_ARG0_OFFSET,
         },
-        // 9: jeq AF_UNIX -> 18 (jt = 18-9-1 = 8)
+        // 11: jeq AF_UNIX -> 23 (jt = 23-11-1 = 11)
         SockFilterInsn {
             code: BPF_JMP | BPF_JEQ | BPF_K,
-            jt: 8,
+            jt: 11,
             jf: 0,
             k: libc::AF_UNIX as u32,
         },
-        // 10: jeq AF_INET -> 18 (jt = 18-10-1 = 7)
+        // 12: jeq AF_INET -> 23 (jt = 23-12-1 = 10)
         SockFilterInsn {
             code: BPF_JMP | BPF_JEQ | BPF_K,
-            jt: 7,
+            jt: 10,
             jf: 0,
             k: libc::AF_INET as u32,
         },
-        // 11: jeq AF_INET6 -> 18 (jt = 18-11-1 = 6)
+        // 13: jeq AF_INET6 -> 23 (jt = 23-13-1 = 9)
+        SockFilterInsn {
+            code: BPF_JMP | BPF_JEQ | BPF_K,
+            jt: 9,
+            jf: 0,
+            k: libc::AF_INET6 as u32,
+        },
+        // 14: ret ERRNO(EACCES) — bad socket family
+        SockFilterInsn {
+            code: BPF_RET | BPF_K,
+            jt: 0,
+            jf: 0,
+            k: errno_ret,
+        },
+        // 15: ld [args[0]] — socketpair() family
+        SockFilterInsn {
+            code: BPF_LD | BPF_W | BPF_ABS,
+            jt: 0,
+            jf: 0,
+            k: SECCOMP_DATA_ARG0_OFFSET,
+        },
+        // 16: jeq AF_UNIX -> 23 (jt = 23-16-1 = 6)
         SockFilterInsn {
             code: BPF_JMP | BPF_JEQ | BPF_K,
             jt: 6,
             jf: 0,
-            k: libc::AF_INET6 as u32,
-        },
-        // 12: ret ERRNO(EACCES) — bad socket family
-        SockFilterInsn {
-            code: BPF_RET | BPF_K,
-            jt: 0,
-            jf: 0,
-            k: errno_ret,
-        },
-        // 13: ld [args[0]] — socketpair() family
-        SockFilterInsn {
-            code: BPF_LD | BPF_W | BPF_ABS,
-            jt: 0,
-            jf: 0,
-            k: SECCOMP_DATA_ARG0_OFFSET,
-        },
-        // 14: jeq AF_UNIX -> 18 (jt = 18-14-1 = 3)
-        SockFilterInsn {
-            code: BPF_JMP | BPF_JEQ | BPF_K,
-            jt: 3,
-            jf: 0,
             k: libc::AF_UNIX as u32,
         },
-        // 15: ret ERRNO(EACCES) — bad socketpair family
+        // 17: ret ERRNO(EACCES) — bad socketpair family
         SockFilterInsn {
             code: BPF_RET | BPF_K,
             jt: 0,
             jf: 0,
             k: errno_ret,
         },
-        // 16: ret USER_NOTIF — connect()
+        // 18: ret USER_NOTIF — connect()
         SockFilterInsn {
             code: BPF_RET | BPF_K,
             jt: 0,
             jf: 0,
             k: SECCOMP_RET_USER_NOTIF,
         },
-        // 17: ret bind_action — bind()
+        // 19: ret bind_action — bind()
         SockFilterInsn {
             code: BPF_RET | BPF_K,
             jt: 0,
             jf: 0,
             k: bind_action,
         },
-        // 18: ret ALLOW — good socket/socketpair family
+        // 20: ld [args[4]] — sendto dest_addr pointer
+        SockFilterInsn {
+            code: BPF_LD | BPF_W | BPF_ABS,
+            jt: 0,
+            jf: 0,
+            k: SECCOMP_DATA_ARG4_OFFSET,
+        },
+        // 21: jeq 0 -> 23 (jt = 23-21-1 = 1) ALLOW if NULL dest
+        SockFilterInsn {
+            code: BPF_JMP | BPF_JEQ | BPF_K,
+            jt: 1,
+            jf: 0,
+            k: 0,
+        },
+        // 22: ret USER_NOTIF — sendto (non-NULL dest) / sendmsg
+        SockFilterInsn {
+            code: BPF_RET | BPF_K,
+            jt: 0,
+            jf: 0,
+            k: SECCOMP_RET_USER_NOTIF,
+        },
+        // 23: ret ALLOW — good socket/socketpair, sendto NULL dest
         SockFilterInsn {
             code: BPF_RET | BPF_K,
             jt: 0,
@@ -1942,49 +1996,103 @@ fn build_seccomp_proxy_filter(_has_bind_ports: bool) -> Vec<SockFilterInsn> {
 
 /// Build a BPF filter for opt-in pathname AF_UNIX mediation.
 ///
-/// The filter routes `connect()` and `bind()` to the supervisor so it can
-/// inspect `sockaddr_un` paths. Everything else is allowed by this filter:
-/// TCP policy remains Landlock's job on V4+ kernels.
+/// The filter routes `connect()`, `bind()`, `sendto()`, and `sendmsg()`
+/// to the supervisor so it can inspect `sockaddr_un` paths. Everything
+/// else is allowed by this filter: TCP policy remains Landlock's job on
+/// V4+ kernels.
+///
+/// For `sendto`, the filter checks `args[4]` (the destination address
+/// pointer): if NULL, the call is on an already-connected socket and is
+/// allowed without mediation. If non-NULL, it routes to the supervisor.
+///
+/// For `sendmsg`, the filter cannot check `msg_name` inside the `msghdr`
+/// struct (BPF cannot dereference pointers), so it routes unconditionally
+/// to the supervisor. The supervisor fast-paths NULL `msg_name`.
 ///
 /// Instruction layout:
 /// ```text
 ///  0: ld  [nr]
-///  1: jeq SYS_CONNECT jt=+2 (-> 4: notify)
-///  2: jeq SYS_BIND    jt=+1 (-> 4: notify)
-///  3: ret ALLOW
-///  4: ret USER_NOTIF
+///  1: jeq SYS_CONNECT  jt=+5 (-> 7: notify)
+///  2: jeq SYS_BIND     jt=+4 (-> 7: notify)
+///  3: jeq SYS_SENDTO  jt=+2 (-> 6: check dest_addr)
+///  4: jeq SYS_SENDMSG  jt=+3 (-> 8: notify)
+///  5: ret ALLOW
+///  6: ld  [args[4]] (dest_addr for sendto)
+///  7: jeq 0 jt=+1 (-> 9: ALLOW if NULL dest)
+///  8: ret USER_NOTIF
+///  9: ret ALLOW
 /// ```
 fn build_seccomp_af_unix_filter() -> Vec<SockFilterInsn> {
     vec![
+        // 0: ld [nr]
         SockFilterInsn {
             code: BPF_LD | BPF_W | BPF_ABS,
             jt: 0,
             jf: 0,
             k: SECCOMP_DATA_NR_OFFSET,
         },
+        // 1: jeq SYS_CONNECT -> 7 (jt = 7-1-1 = 5)
+        SockFilterInsn {
+            code: BPF_JMP | BPF_JEQ | BPF_K,
+            jt: 5,
+            jf: 0,
+            k: SYS_CONNECT as u32,
+        },
+        // 2: jeq SYS_BIND -> 7 (jt = 7-2-1 = 4)
+        SockFilterInsn {
+            code: BPF_JMP | BPF_JEQ | BPF_K,
+            jt: 4,
+            jf: 0,
+            k: SYS_BIND as u32,
+        },
+        // 3: jeq SYS_SENDTO -> 6 (jt = 6-3-1 = 2) check dest_addr
         SockFilterInsn {
             code: BPF_JMP | BPF_JEQ | BPF_K,
             jt: 2,
             jf: 0,
-            k: SYS_CONNECT as u32,
+            k: SYS_SENDTO as u32,
         },
+        // 4: jeq SYS_SENDMSG -> 8 (jt = 8-4-1 = 3) unconditional notify
         SockFilterInsn {
             code: BPF_JMP | BPF_JEQ | BPF_K,
-            jt: 1,
+            jt: 3,
             jf: 0,
-            k: SYS_BIND as u32,
+            k: SYS_SENDMSG as u32,
         },
+        // 5: ret ALLOW
         SockFilterInsn {
             code: BPF_RET | BPF_K,
             jt: 0,
             jf: 0,
             k: SECCOMP_RET_ALLOW,
         },
+        // 6: ld [args[4]] -- sendto dest_addr pointer
+        SockFilterInsn {
+            code: BPF_LD | BPF_W | BPF_ABS,
+            jt: 0,
+            jf: 0,
+            k: SECCOMP_DATA_ARG4_OFFSET,
+        },
+        // 7: jeq 0 -> 9 (jt = 9-7-1 = 1) ALLOW if NULL dest
+        SockFilterInsn {
+            code: BPF_JMP | BPF_JEQ | BPF_K,
+            jt: 1,
+            jf: 0,
+            k: 0,
+        },
+        // 8: ret USER_NOTIF
         SockFilterInsn {
             code: BPF_RET | BPF_K,
             jt: 0,
             jf: 0,
             k: SECCOMP_RET_USER_NOTIF,
+        },
+        // 9: ret ALLOW (sendto with NULL dest_addr)
+        SockFilterInsn {
+            code: BPF_RET | BPF_K,
+            jt: 0,
+            jf: 0,
+            k: SECCOMP_RET_ALLOW,
         },
     ]
 }
@@ -2233,6 +2341,68 @@ pub fn read_notif_sockaddr(pid: u32, addr_ptr: u64, addrlen: u64) -> Result<Sock
             unix_path: None,
         }),
     }
+}
+
+/// Read the destination sockaddr pointer and length from a `struct msghdr`
+/// in the child process's memory.
+///
+/// Used by the supervisor when handling `sendmsg(2)` seccomp notifications.
+/// `sendmsg(fd, msghdr*, flags)` stores the destination address in
+/// `msghdr.msg_name` (a pointer to sockaddr) and `msghdr.msg_namelen`.
+/// The supervisor cannot dereference pointers in BPF, so this helper reads
+/// the `msghdr` struct from the child's `/proc/PID/mem` and returns the
+/// two fields needed to call [`read_notif_sockaddr`].
+///
+/// Returns `None` if `msg_name` is NULL (no destination address, meaning
+/// the socket is already connected and the send does not specify a target).
+///
+/// # Errors
+///
+/// Returns an error if reading `/proc/PID/mem` fails, or if the `msghdr`
+/// layout is too short to contain the `msg_name` and `msg_namelen` fields.
+pub fn read_msghdr_dest(pid: u32, msghdr_ptr: u64) -> Result<Option<(u64, u64)>> {
+    use std::io::Read;
+
+    // struct msghdr (x86_64 Linux):
+    //   void         *msg_name;      // offset 0,  8 bytes
+    //   socklen_t     msg_namelen;   // offset 8,  4 bytes
+    //
+    // We only need the first 12 bytes.
+    const MSGHDR_MIN_READ: usize = 12;
+
+    let mem_path = format!("/proc/{}/mem", pid);
+    let mut file = std::fs::File::open(&mem_path)
+        .map_err(|e| NonoError::SandboxInit(format!("Failed to open {}: {}", mem_path, e)))?;
+
+    std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(msghdr_ptr))
+        .map_err(|e| NonoError::SandboxInit(format!("Failed to seek in {}: {}", mem_path, e)))?;
+
+    let mut buf = [0u8; MSGHDR_MIN_READ];
+    let n = file.read(&mut buf).map_err(|e| {
+        NonoError::SandboxInit(format!("Failed to read msghdr from {}: {}", mem_path, e))
+    })?;
+
+    if n < MSGHDR_MIN_READ {
+        return Err(NonoError::SandboxInit(format!(
+            "Short read for msghdr: got {} bytes, need {}",
+            n, MSGHDR_MIN_READ
+        )));
+    }
+
+    // msg_name is a pointer (8 bytes, native endian on Linux)
+    let msg_name = u64::from_ne_bytes([
+        buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+    ]);
+    // msg_namelen is socklen_t (4 bytes, native endian)
+    let msg_namelen = u64::from_ne_bytes([buf[8], buf[9], buf[10], buf[11], 0, 0, 0, 0]);
+
+    if msg_name == 0 {
+        // No destination address: the socket is connected, sendmsg just
+        // sends data to the already-connected peer. No mediation needed.
+        return Ok(None);
+    }
+
+    Ok(Some((msg_name, msg_namelen)))
 }
 
 #[cfg(test)]
@@ -3285,20 +3455,24 @@ mod tests {
     #[test]
     fn test_build_seccomp_proxy_filter_with_bind() {
         let filter = build_seccomp_proxy_filter(true);
-        // 19 instructions
-        assert_eq!(filter.len(), 19);
+        // 24 instructions
+        assert_eq!(filter.len(), 24);
 
         // Instruction 0 should be ld [nr]
         assert_eq!(filter[0].code, BPF_LD | BPF_W | BPF_ABS);
         assert_eq!(filter[0].k, SECCOMP_DATA_NR_OFFSET);
 
-        // Instruction 16 should be USER_NOTIF (connect)
-        assert_eq!(filter[16].code, BPF_RET | BPF_K);
-        assert_eq!(filter[16].k, SECCOMP_RET_USER_NOTIF);
+        // Instruction 18 should be USER_NOTIF (connect)
+        assert_eq!(filter[18].code, BPF_RET | BPF_K);
+        assert_eq!(filter[18].k, SECCOMP_RET_USER_NOTIF);
 
-        // Instruction 17 should be USER_NOTIF (bind; supervisor decides).
-        assert_eq!(filter[17].code, BPF_RET | BPF_K);
-        assert_eq!(filter[17].k, SECCOMP_RET_USER_NOTIF);
+        // Instruction 19 should be USER_NOTIF (bind; supervisor decides).
+        assert_eq!(filter[19].code, BPF_RET | BPF_K);
+        assert_eq!(filter[19].k, SECCOMP_RET_USER_NOTIF);
+
+        // Instruction 22 should be USER_NOTIF (sendto non-NULL dest / sendmsg)
+        assert_eq!(filter[22].code, BPF_RET | BPF_K);
+        assert_eq!(filter[22].k, SECCOMP_RET_USER_NOTIF);
     }
 
     /// Regression test for the Landlock V2 + `has_bind_ports=false`
@@ -3309,29 +3483,38 @@ mod tests {
     #[test]
     fn test_build_seccomp_proxy_filter_without_bind() {
         let filter = build_seccomp_proxy_filter(false);
-        assert_eq!(filter.len(), 19);
+        assert_eq!(filter.len(), 24);
 
-        // Instruction 17 (bind) must ALSO route to USER_NOTIF — the
+        // Instruction 19 (bind) must ALSO route to USER_NOTIF -- the
         // supervisor is the sole gate. This is the fix: previously this
         // emitted ERRNO, which skipped the supervisor entirely.
-        assert_eq!(filter[17].code, BPF_RET | BPF_K);
+        assert_eq!(filter[19].code, BPF_RET | BPF_K);
         assert_eq!(
-            filter[17].k, SECCOMP_RET_USER_NOTIF,
+            filter[19].k, SECCOMP_RET_USER_NOTIF,
             "bind must route to USER_NOTIF regardless of has_bind_ports so \
              the supervisor can permit AF_UNIX pathname bind (#685)"
         );
     }
 
     #[test]
-    fn test_build_seccomp_af_unix_filter_notifies_connect_bind_only() {
+    fn test_build_seccomp_af_unix_filter_notifies_connect_bind_sendto_sendmsg() {
         let filter = build_seccomp_af_unix_filter();
-        assert_eq!(filter.len(), 5);
+        assert_eq!(filter.len(), 10);
         assert_eq!(filter[0].code, BPF_LD | BPF_W | BPF_ABS);
         assert_eq!(filter[0].k, SECCOMP_DATA_NR_OFFSET);
         assert_eq!(filter[1].k, SYS_CONNECT as u32);
         assert_eq!(filter[2].k, SYS_BIND as u32);
-        assert_eq!(filter[3].k, SECCOMP_RET_ALLOW);
-        assert_eq!(filter[4].k, SECCOMP_RET_USER_NOTIF);
+        assert_eq!(filter[3].k, SYS_SENDTO as u32);
+        assert_eq!(filter[4].k, SYS_SENDMSG as u32);
+        assert_eq!(filter[5].k, SECCOMP_RET_ALLOW);
+        // Instruction 6 loads args[4] for sendto dest_addr check
+        assert_eq!(filter[6].k, SECCOMP_DATA_ARG4_OFFSET);
+        // Instruction 7: jeq 0 -> ALLOW if NULL dest
+        assert_eq!(filter[7].k, 0);
+        // Instruction 8: ret USER_NOTIF
+        assert_eq!(filter[8].k, SECCOMP_RET_USER_NOTIF);
+        // Instruction 9: ret ALLOW (sendto with NULL dest_addr)
+        assert_eq!(filter[9].k, SECCOMP_RET_ALLOW);
     }
 
     #[test]

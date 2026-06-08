@@ -214,13 +214,20 @@ impl std::fmt::Display for UnixSocketMode {
 /// Kept distinct from [`UnixSocketMode`] so the grant-side (what a
 /// capability permits) and the query-side (what the caller is about to
 /// do) are not conflated. The supervisor's seccomp-notify handler maps
-/// `SYS_CONNECT` → `Connect`, `SYS_BIND` → `Bind`.
+/// `SYS_CONNECT` -> `Connect`, `SYS_BIND` -> `Bind`,
+/// `SYS_SENDTO`/`SYS_SENDMSG` -> `Send`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnixSocketOp {
     /// About to call `connect(2)`.
     Connect,
     /// About to call `bind(2)`.
     Bind,
+    /// About to call `sendto(2)` or `sendmsg(2)` with a destination address.
+    ///
+    /// Datagram AF_UNIX sockets use `sendto`/`sendmsg` to specify the
+    /// target per-message instead of calling `connect()` first. This
+    /// variant covers those datagram sends (issue #1089).
+    Send,
 }
 
 impl std::fmt::Display for UnixSocketOp {
@@ -228,6 +235,7 @@ impl std::fmt::Display for UnixSocketOp {
         match self {
             UnixSocketOp::Connect => write!(f, "connect"),
             UnixSocketOp::Bind => write!(f, "bind"),
+            UnixSocketOp::Send => write!(f, "send"),
         }
     }
 }
@@ -1295,14 +1303,15 @@ impl CapabilitySet {
     /// permits `op` on it.
     ///
     /// Used by the Linux supervisor's seccomp-notify handler:
-    /// `SYS_CONNECT` → [`UnixSocketOp::Connect`], `SYS_BIND`
-    /// → [`UnixSocketOp::Bind`].
+    /// `SYS_CONNECT` -> [`UnixSocketOp::Connect`], `SYS_BIND`
+    /// -> [`UnixSocketOp::Bind`], `SYS_SENDTO`/`SYS_SENDMSG`
+    /// -> [`UnixSocketOp::Send`].
     #[must_use]
     pub fn unix_socket_allowed(&self, sockaddr_path: &Path, op: UnixSocketOp) -> bool {
         self.unix_sockets.iter().any(|cap| {
             cap.covers(sockaddr_path)
                 && match op {
-                    UnixSocketOp::Connect => true, // any grant allows connect
+                    UnixSocketOp::Connect | UnixSocketOp::Send => true, // any grant allows connect/send
                     UnixSocketOp::Bind => cap.mode.permits_bind(),
                 }
         })
@@ -2937,6 +2946,13 @@ mod tests {
     }
 
     #[test]
+    fn test_unix_socket_op_display() {
+        assert_eq!(UnixSocketOp::Connect.to_string(), "connect");
+        assert_eq!(UnixSocketOp::Bind.to_string(), "bind");
+        assert_eq!(UnixSocketOp::Send.to_string(), "send");
+    }
+
+    #[test]
     fn test_unix_socket_connect_requires_existing_path() {
         let dir = tempdir().unwrap();
         let missing = dir.path().join("ghost.sock");
@@ -3230,6 +3246,28 @@ mod tests {
         assert!(caps.unix_socket_allowed(&direct_child, UnixSocketOp::Connect));
         assert!(caps.unix_socket_allowed(&grandchild, UnixSocketOp::Connect));
         assert!(!caps.unix_socket_allowed(&direct_child, UnixSocketOp::Bind));
+    }
+
+    /// Send (sendto/sendmsg) is covered by Connect grants (issue #1089).
+    /// A Connect-mode grant allows both connect and datagram send operations.
+    #[test]
+    fn test_capability_set_unix_socket_send_covered_by_connect_grant() {
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("dgram.sock");
+        fs::write(&sock, b"").unwrap();
+
+        let caps = CapabilitySet::new()
+            .allow_unix_socket(&sock, UnixSocketMode::Connect)
+            .unwrap();
+
+        let resolved = sock.canonicalize().unwrap();
+
+        // Connect grant covers both connect and send
+        assert!(caps.unix_socket_allowed(&resolved, UnixSocketOp::Connect));
+        assert!(caps.unix_socket_allowed(&resolved, UnixSocketOp::Send));
+
+        // Connect-only grant does not cover bind
+        assert!(!caps.unix_socket_allowed(&resolved, UnixSocketOp::Bind));
     }
 
     #[test]

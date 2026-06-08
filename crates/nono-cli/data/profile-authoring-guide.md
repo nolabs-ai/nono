@@ -80,6 +80,156 @@ Controls startup-time command gating. These checks run only at launch time and a
 | `allow` | array of string | `[]`    | Startup-only command allowlist. Deprecated in v0.33.0; retained for existing profiles. |
 | `deny`  | array of string | `[]`    | Startup-only command denylist extension. Deprecated in v0.33.0; prefer `filesystem.deny` and narrower grants instead. |
 
+### command_policies
+
+tool-sandbox policies live under `command_policies`. Use `commands.<name>.executable` to bind a command name to one exact executable file instead of the first PATH match. By default, tool-sandbox rejects pinned executables and direct parent directories that are writable by the supervisor user, group, or world. If that pinned executable lives in a writable location, `commands.<name>.allow_writable_executable` is available as a per-command trust downgrade. It is valid only with an absolute `executable` path; relative paths and bare command names fail validation. For local demos or low-assurance user-writable toolchains, `command_policies.allow_writable_executables` disables the writable executable and parent-directory trust check across policy, deny-only, and outer executable allow-list paths, including outer capability-set writability. The agent still invokes the command name through the tool-sandbox shim. On macOS, tool-sandbox verifies the file before sandboxing but must still exec by path, so writable pinned executables are not suitable for high-assurance policies.
+
+```json
+{
+  "command_policies": {
+    "entrypoint": "demonator",
+    "commands": {
+      "demonator": {
+        "executable": "/opt/homebrew/bin/demonator",
+        "allow_writable_executable": true
+      }
+    }
+  }
+}
+```
+
+#### ETI command-policy denials
+
+Ephemeral tool invocation (ETI) denials are not filesystem denials. A message like:
+
+```text
+nono: tool-sandbox denied gh: Command 'gh' is blocked: agents may read issues but not comment on them
+```
+
+means the tool-sandbox command policy blocked the resolved command invocation. `nono why --path ...` only explains filesystem grants and denials, and `nono why --host ...` only explains network/proxy reachability. For command-policy denials, query the command edge directly:
+
+```sh
+nono why --profile <profile> --command gh -- issue comment 1052
+nono profile show <profile>
+nono profile validate <profile>
+```
+
+Look under `command_policies.commands.<command>.from.<caller>.invocation_policy` for argv or environment rules. For commands started directly by the sandboxed session, the caller is usually `session`; for a child tool launched by another controlled tool, the caller is the parent command name.
+
+`invocation_policy` evaluates in this order: `deny`, then `approve`, then `allow`, then `default`. The `argv` matcher compares against the command arguments after the command name, so `gh issue comment 1052` matches `{"argv": {"prefix": ["issue", "comment"]}}`.
+
+```json
+{
+  "command_policies": {
+    "commands": {
+      "gh": {
+        "from": {
+          "session": {
+            "sandbox": {
+              "fs_read": ["."],
+              "network": {
+                "allow_domain": ["api.github.com"]
+              }
+            },
+            "invocation_policy": {
+              "default": "deny",
+              "deny": [
+                {
+                  "argv": { "prefix": ["issue", "comment"] },
+                  "reason": "agents may read issues but not comment on them"
+                }
+              ],
+              "allow": [
+                {
+                  "argv": { "prefix": ["issue", "list"] },
+                  "reason": "agents may list GitHub issues"
+                },
+                {
+                  "argv": { "prefix": ["issue", "view"] },
+                  "reason": "agents may view GitHub issues"
+                }
+              ]
+            }
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+To allow a previously denied subcommand, remove or narrow the matching `deny` rule and add a matching `allow` rule, or change `default` if that is the intended policy. Adding a child-profile `allow` does not override an inherited `deny`. When profiles are merged, command policy permissions widen monotonically in most places, and an inherited `invocation_policy` on the same command edge is retained rather than replaced. If the resolved profile already contains the deny you want to remove, edit the profile that owns that rule or extend a base profile that does not include it.
+
+#### Proxy credential endpoint policy
+
+Some ETI policies intentionally use two layers:
+
+1. `invocation_policy` blocks obvious high-level CLI mutations before the child process runs.
+2. `sandbox.credentials[].endpoint_policy` blocks the underlying HTTP method and path even if the CLI uses a broad subcommand such as `gh api`.
+
+If a command uses a proxy credential, both layers must allow the operation. For example, permitting `gh issue comment` at the argv layer is not enough if the GitHub API proxy still denies `POST /repos/<owner>/<repo>/issues/**`.
+
+```json
+{
+  "command_policies": {
+    "credentials": {
+      "github-api": {
+        "type": "proxy",
+        "upstream": "https://api.github.com",
+        "credential_key": "keyring://gh:github.com/example?decode=go-keyring",
+        "env_var": "GH_TOKEN",
+        "inject_header": "Authorization",
+        "credential_format": "Bearer {}"
+      }
+    },
+    "commands": {
+      "gh": {
+        "from": {
+          "session": {
+            "sandbox": {
+              "credentials": [
+                {
+                  "name": "github-api",
+                  "endpoint_policy": {
+                    "default": "deny",
+                    "allow": [
+                      { "method": "GET", "path": "/repos/always-further/nono/issues" },
+                      { "method": "GET", "path": "/repos/always-further/nono/issues/*" },
+                      { "method": "POST", "path": "/repos/always-further/nono/issues/*/comments" }
+                    ],
+                    "deny": [
+                      {
+                        "method": "DELETE",
+                        "path": "/**",
+                        "reason": "destructive GitHub API calls are denied"
+                      }
+                    ]
+                  }
+                }
+              ]
+            },
+            "invocation_policy": {
+              "default": "deny",
+              "allow": [
+                { "argv": { "prefix": ["issue", "list"] } },
+                { "argv": { "prefix": ["issue", "view"] } },
+                { "argv": { "prefix": ["issue", "comment"] } },
+                {
+                  "argv": { "prefix": ["api"] },
+                  "reason": "gh api is constrained by endpoint_policy"
+                }
+              ]
+            }
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+Endpoint policy uses the same decision order as invocation policy: `deny`, then `approve`, then `allow`, then `default`. A broad `deny` such as `{"method": "POST", "path": "/repos/always-further/nono/issues/**"}` will still win over a later `allow` for issue comments. Remove or narrow the deny when the mutation is intentionally allowed.
+
 ### security
 
 | Field                 | Type            | Default      | Description |

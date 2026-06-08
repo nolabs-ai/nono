@@ -60,6 +60,9 @@ pub struct RedactionSettings {
     /// Additional URL query parameter names whose value should be redacted.
     #[serde(default)]
     pub extra_query_keys: Vec<String>,
+    /// Additional environment variable names whose value should be redacted.
+    #[serde(default)]
+    pub extra_env_vars: Vec<String>,
     /// Required before any secure default redaction names can be removed.
     #[serde(default)]
     pub unsafe_redaction_overrides: bool,
@@ -88,12 +91,16 @@ impl RedactionSettings {
         for key in &self.extra_query_keys {
             redactions.add_query_key(key);
         }
+        for name in &self.extra_env_vars {
+            redactions.add_env_var(name);
+        }
 
         if self.unsafe_redaction_overrides {
             for name in &self.allow_unredacted_defaults {
                 redactions.remove_flag(name);
                 redactions.remove_header(name);
                 redactions.remove_query_key(name);
+                redactions.remove_env_var(name);
             }
         }
 
@@ -419,6 +426,7 @@ alice = { name = "Alice", fingerprint = "abc123" }
         assert!(config.overrides.commands.is_empty());
         assert!(config.ui.detach_sequence.is_none());
         assert!(config.redaction.extra_flags.is_empty());
+        assert!(config.redaction.extra_env_vars.is_empty());
     }
 
     #[test]
@@ -428,6 +436,7 @@ alice = { name = "Alice", fingerprint = "abc123" }
 extra_flags = ["--private-token"]
 extra_headers = ["Private-Token"]
 extra_query_keys = ["signature"]
+extra_env_vars = ["CONFIGURED_ENV"]
 "#;
         let config: UserConfig = toml::from_str(toml).expect("Failed to parse");
         let policy = config
@@ -439,6 +448,7 @@ extra_query_keys = ["signature"]
         assert_eq!(diff.added_flags, vec!["--private-token".to_string()]);
         assert_eq!(diff.added_headers, vec!["private-token".to_string()]);
         assert_eq!(diff.added_query_keys, vec!["signature".to_string()]);
+        assert_eq!(diff.added_env_vars, vec!["configured_env".to_string()]);
     }
 
     #[test]

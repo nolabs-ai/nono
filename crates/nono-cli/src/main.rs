@@ -3,8 +3,10 @@
 //! This is the CLI binary that uses the nono library for OS-level sandboxing.
 
 mod app_runtime;
+mod approval_runtime;
 mod audit_attestation;
 mod audit_commands;
+mod audit_event_reader;
 mod audit_integrity;
 mod audit_ledger;
 mod audit_session;
@@ -13,6 +15,7 @@ mod cli;
 mod cli_bootstrap;
 mod command_blocking_deprecation;
 mod command_display;
+mod command_policy;
 mod command_runtime;
 mod completions;
 mod config;
@@ -71,6 +74,8 @@ mod supervised_runtime;
 mod terminal_approval;
 mod theme;
 mod timeouts;
+#[path = "tool-sandbox/mod.rs"]
+mod tool_sandbox;
 mod trust_cmd;
 mod trust_intercept;
 mod trust_keystore;
@@ -102,6 +107,11 @@ pub(crate) use launch_runtime::rollback_base_exclusions;
 pub(crate) use proxy_runtime::merge_dedup_ports;
 
 fn main() {
+    if tool_sandbox::maybe_run_internal_tool_sandbox_entrypoint() {
+        return;
+    }
+    tool_sandbox::record_main_start();
+
     let legacy_network_warnings = collect_legacy_network_warnings();
     normalize_legacy_flag_env_vars();
     // Emit one deprecation warning per distinct legacy long flag before clap
@@ -116,7 +126,9 @@ fn main() {
     let command_blocking_warnings = collect_cli_warnings(&cli);
     print_deprecation_warnings(&command_blocking_warnings, cli.silent);
 
-    if let Err(e) = run_cli(cli) {
+    let cli_result = run_cli(cli);
+    tool_sandbox::log_main_total();
+    if let Err(e) = cli_result {
         if let nono::NonoError::ActionRequired(message) = &e {
             eprintln!("{message}");
             std::process::exit(1);
@@ -263,6 +275,8 @@ mod tests {
         let prepared = PreparedSandbox {
             caps: CapabilitySet::new(),
             secrets: Vec::new(),
+            profile_display_name: None,
+            command_policies: None,
             session_hooks: crate::profile::SessionHooks::default(),
             rollback_exclude_patterns: Vec::new(),
             rollback_exclude_globs: Vec::new(),
@@ -272,6 +286,7 @@ mod tests {
             )],
             credentials: vec!["github".to_string()],
             custom_credentials: std::collections::HashMap::new(),
+            tls_intercept: None,
             upstream_proxy: None,
             upstream_bypass: Vec::new(),
             listen_ports: Vec::new(),
@@ -316,6 +331,8 @@ mod tests {
         let prepared = PreparedSandbox {
             caps: CapabilitySet::new(),
             secrets: Vec::new(),
+            profile_display_name: None,
+            command_policies: None,
             session_hooks: crate::profile::SessionHooks::default(),
             rollback_exclude_patterns: Vec::new(),
             rollback_exclude_globs: Vec::new(),
@@ -325,6 +342,7 @@ mod tests {
             )],
             credentials: vec!["github".to_string()],
             custom_credentials: std::collections::HashMap::new(),
+            tls_intercept: None,
             upstream_proxy: None,
             upstream_bypass: Vec::new(),
             listen_ports: Vec::new(),

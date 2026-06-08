@@ -6,8 +6,12 @@
 
 pub(crate) mod builtin;
 
+use crate::command_policy::{
+    CommandPoliciesConfig, CommandPolicyValidationScope, validate_command_policies,
+    validate_legacy_blocked_command_interactions,
+};
 use nono::{NonoError, Result};
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as DeError};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -312,6 +316,10 @@ pub struct CustomCredentialDef {
     /// When non-empty, only matching method+path combinations are allowed.
     #[serde(default)]
     pub endpoint_rules: Vec<nono_proxy::config::EndpointRule>,
+
+    /// Optional explicit L7 endpoint policy with allow/deny/approve routes.
+    #[serde(default)]
+    pub endpoint_policy: Option<nono_proxy::config::EndpointPolicyConfig>,
 
     /// Optional path to a PEM-encoded CA certificate file for upstream TLS.
     ///
@@ -916,6 +924,54 @@ fn validate_profile_custom_credentials(profile: &Profile) -> Result<()> {
     Ok(())
 }
 
+fn validate_profile_tls_intercept(profile: &Profile) -> Result<()> {
+    let Some(tls) = &profile.network.tls_intercept else {
+        return Ok(());
+    };
+    if let Some(value) = &tls.ca_validity {
+        parse_tls_duration("network.tls_intercept.ca_validity", value)?;
+    }
+    if let Some(value) = &tls.leaf_validity {
+        parse_tls_duration("network.tls_intercept.leaf_validity", value)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn parse_tls_duration(field: &str, value: &str) -> Result<std::time::Duration> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(NonoError::ProfileParse(format!(
+            "{field} must not be empty"
+        )));
+    }
+    let (number, multiplier) = match value.as_bytes().last().copied() {
+        Some(b's') => (&value[..value.len() - 1], 1_u64),
+        Some(b'm') => (&value[..value.len() - 1], 60_u64),
+        Some(b'h') => (&value[..value.len() - 1], 60 * 60),
+        Some(b'd') => (&value[..value.len() - 1], 24 * 60 * 60),
+        Some(byte) if byte.is_ascii_digit() => (value, 1_u64),
+        _ => {
+            return Err(NonoError::ProfileParse(format!(
+                "{field} must be a positive duration like 30s, 15m, 24h, or 1d"
+            )));
+        }
+    };
+    let amount = number.parse::<u64>().map_err(|_| {
+        NonoError::ProfileParse(format!(
+            "{field} must be a positive duration like 30s, 15m, 24h, or 1d"
+        ))
+    })?;
+    if amount == 0 {
+        return Err(NonoError::ProfileParse(format!(
+            "{field} must be greater than zero"
+        )));
+    }
+    let secs = amount
+        .checked_mul(multiplier)
+        .ok_or_else(|| NonoError::ProfileParse(format!("{field} is too large: {value}")))?;
+    Ok(std::time::Duration::from_secs(secs))
+}
+
 /// Validate env_credentials keys in a profile.
 ///
 /// Keys can be keyring account names, `op://` URIs, `bw://` URIs,
@@ -1128,6 +1184,9 @@ pub struct NetworkConfig {
     /// how to route and inject credentials for that service.
     #[serde(default)]
     pub custom_credentials: HashMap<String, CustomCredentialDef>,
+    /// TLS interception controls for L7 proxy routes.
+    #[serde(default)]
+    pub tls_intercept: Option<TlsInterceptConfig>,
     /// Upstream proxy address (host:port) for enterprise proxy passthrough.
     /// Canonical profile key: `upstream_proxy` (legacy `external_proxy`
     /// accepted).
@@ -1140,6 +1199,25 @@ pub struct NetworkConfig {
     /// ALIAS(canonical="upstream_bypass", introduced="v0.0.0", remove_by="indefinite", issue="#415")
     #[serde(default, rename = "upstream_bypass", alias = "external_proxy_bypass")]
     pub upstream_bypass: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TlsInterceptConfig {
+    #[serde(default)]
+    pub ca_lifecycle: TlsCaLifecycle,
+    #[serde(default)]
+    pub ca_validity: Option<String>,
+    #[serde(default)]
+    pub leaf_validity: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TlsCaLifecycle {
+    #[default]
+    Session,
+    Trusted,
 }
 
 impl NetworkConfig {
@@ -1618,6 +1696,24 @@ where
     })
 }
 
+fn deserialize_command_policies<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<CommandPoliciesConfig>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    let Some(value) = value else {
+        return Err(D::Error::custom(
+            "command_policies cannot be null; omit the field or use an empty object",
+        ));
+    };
+
+    CommandPoliciesConfig::deserialize(value)
+        .map(Some)
+        .map_err(D::Error::custom)
+}
+
 /// A complete profile definition
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Profile {
@@ -1648,6 +1744,8 @@ pub struct Profile {
     pub env_credentials: SecretsConfig,
     #[serde(default)]
     pub environment: Option<EnvironmentConfig>,
+    #[serde(default)]
+    pub command_policies: Option<CommandPoliciesConfig>,
     #[serde(default)]
     pub workdir: WorkdirConfig,
     #[serde(default)]
@@ -1748,6 +1846,8 @@ struct ProfileDeserialize {
     env_credentials: SecretsConfig,
     #[serde(default)]
     environment: Option<EnvironmentConfig>,
+    #[serde(default, deserialize_with = "deserialize_command_policies")]
+    command_policies: Option<CommandPoliciesConfig>,
     #[serde(default)]
     workdir: WorkdirConfig,
     #[serde(default)]
@@ -1799,6 +1899,7 @@ impl From<ProfileDeserialize> for Profile {
             linux: raw.linux,
             env_credentials: raw.env_credentials,
             environment: raw.environment,
+            command_policies: raw.command_policies,
             workdir: raw.workdir,
             hooks: raw.hooks,
             session_hooks: raw.session_hooks,
@@ -2336,8 +2437,21 @@ pub(crate) fn load_raw_profile_from_path(path: &Path) -> Result<Profile> {
 }
 
 /// Resolve inheritance and apply implicit default-group merging for a raw profile.
+#[allow(deprecated)]
 pub(crate) fn finalize_profile(mut profile: Profile) -> Result<Profile> {
     merge_implicit_default_groups(&mut profile)?;
+    validate_profile_tls_intercept(&profile)?;
+    validate_command_policies(
+        profile.command_policies.as_ref(),
+        CommandPolicyValidationScope::Resolved,
+    )
+    .into_result()?;
+    validate_legacy_blocked_command_interactions(
+        profile.command_policies.as_ref(),
+        &profile.commands.deny,
+        &profile.commands.allow,
+    )
+    .into_result()?;
     Ok(profile)
 }
 
@@ -2404,6 +2518,7 @@ fn parse_profile_file(path: &Path) -> Result<Profile> {
     parse_profile_bytes(&content)
 }
 
+#[allow(deprecated)]
 pub(crate) fn parse_profile_bytes(content: &[u8]) -> Result<Profile> {
     let text = std::str::from_utf8(content)
         .map_err(|e| NonoError::ProfileParse(format!("invalid UTF-8: {e}")))?;
@@ -2412,6 +2527,7 @@ pub(crate) fn parse_profile_bytes(content: &[u8]) -> Result<Profile> {
 
     // Validate custom credentials for security issues
     validate_profile_custom_credentials(&profile)?;
+    validate_profile_tls_intercept(&profile)?;
 
     // Validate env_credentials keys (URI entries need structural validation)
     validate_env_credential_keys(&profile)?;
@@ -2423,6 +2539,18 @@ pub(crate) fn parse_profile_bytes(content: &[u8]) -> Result<Profile> {
     {
         return Err(NonoError::ProfileParse(err));
     }
+
+    validate_command_policies(
+        profile.command_policies.as_ref(),
+        CommandPolicyValidationScope::Syntax,
+    )
+    .into_result()?;
+    validate_legacy_blocked_command_interactions(
+        profile.command_policies.as_ref(),
+        &profile.commands.deny,
+        &profile.commands.allow,
+    )
+    .into_result()?;
 
     Ok(profile)
 }
@@ -2752,6 +2880,7 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
                 merged.extend(child.network.custom_credentials);
                 merged
             },
+            tls_intercept: child.network.tls_intercept.or(base.network.tls_intercept),
             // Child overrides base upstream proxy; if child has None, inherit base
             upstream_proxy: child.network.upstream_proxy.or(base.network.upstream_proxy),
             upstream_bypass: dedup_append(
@@ -2792,6 +2921,7 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
                 },
             }),
         },
+        command_policies: merge_command_policies(&base.command_policies, &child.command_policies),
         // NOTE: WorkdirAccess::None serves as both "not specified" and "explicitly no access".
         // A child cannot override a base's workdir grant to None. This is a v1 limitation;
         // fixing it requires wrapping in Option<WorkdirAccess> and updating all consumers.
@@ -2839,6 +2969,18 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
             &base.unsafe_macos_seatbelt_rules,
             &child.unsafe_macos_seatbelt_rules,
         ),
+    }
+}
+
+fn merge_command_policies(
+    base: &Option<CommandPoliciesConfig>,
+    child: &Option<CommandPoliciesConfig>,
+) -> Option<CommandPoliciesConfig> {
+    match (base, child) {
+        (None, None) => None,
+        (Some(base), None) => Some(base.clone()),
+        (None, Some(child)) => Some(child.clone()),
+        (Some(base), Some(child)) => Some(base.merge_child(child)),
     }
 }
 
@@ -3280,6 +3422,50 @@ mod tests {
         let profile: Profile = serde_json::from_str(json).expect("parse");
         assert_eq!(profile.commands.allow, vec!["pip"]);
         assert_eq!(profile.commands.deny, vec!["docker"]);
+    }
+
+    #[test]
+    fn test_network_tls_intercept_deserializes() {
+        let json = br#"{
+            "meta": {"name": "t"},
+            "network": {
+                "tls_intercept": {
+                    "ca_lifecycle": "trusted",
+                    "ca_validity": "24h",
+                    "leaf_validity": "15m"
+                }
+            }
+        }"#;
+        let profile = parse_profile_bytes(json).expect("parse");
+        let tls = profile
+            .network
+            .tls_intercept
+            .expect("tls_intercept should parse");
+        assert_eq!(tls.ca_lifecycle, TlsCaLifecycle::Trusted);
+        assert_eq!(tls.ca_validity.as_deref(), Some("24h"));
+        assert_eq!(tls.leaf_validity.as_deref(), Some("15m"));
+        assert_eq!(
+            parse_tls_duration("test", tls.leaf_validity.as_deref().unwrap_or_default()).unwrap(),
+            std::time::Duration::from_secs(15 * 60)
+        );
+    }
+
+    #[test]
+    fn test_network_tls_intercept_rejects_invalid_duration() {
+        let json = br#"{
+            "meta": {"name": "t"},
+            "network": {
+                "tls_intercept": {
+                    "ca_validity": "forever"
+                }
+            }
+        }"#;
+        let err = parse_profile_bytes(json).expect_err("invalid duration should fail");
+        assert!(
+            err.to_string()
+                .contains("network.tls_intercept.ca_validity"),
+            "{err}"
+        );
     }
 
     // Note: in-process unit tests covering the drain (legacy → canonical)
@@ -4062,6 +4248,7 @@ mod tests {
             proxy: None,
             env_var: None,
             endpoint_rules: vec![],
+            endpoint_policy: None,
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
@@ -4227,6 +4414,7 @@ mod tests {
             proxy: None,
             env_var: None,
             endpoint_rules: vec![],
+            endpoint_policy: None,
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
@@ -4250,6 +4438,7 @@ mod tests {
             proxy: None,
             env_var: None,
             endpoint_rules: vec![],
+            endpoint_policy: None,
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
@@ -4275,6 +4464,7 @@ mod tests {
             proxy: None,
             env_var: None,
             endpoint_rules: vec![],
+            endpoint_policy: None,
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
@@ -4300,6 +4490,7 @@ mod tests {
             proxy: None,
             env_var: None,
             endpoint_rules: vec![],
+            endpoint_policy: None,
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
@@ -4323,6 +4514,7 @@ mod tests {
             proxy: None,
             env_var: None,
             endpoint_rules: vec![],
+            endpoint_policy: None,
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
@@ -4348,6 +4540,7 @@ mod tests {
             proxy: None,
             env_var: None,
             endpoint_rules: vec![],
+            endpoint_policy: None,
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
@@ -4371,6 +4564,7 @@ mod tests {
             proxy: None,
             env_var: None,
             endpoint_rules: vec![],
+            endpoint_policy: None,
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
@@ -4396,6 +4590,7 @@ mod tests {
             proxy: None,
             env_var: None,
             endpoint_rules: vec![],
+            endpoint_policy: None,
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
@@ -4421,6 +4616,7 @@ mod tests {
             proxy: None,
             env_var: None,
             endpoint_rules: vec![],
+            endpoint_policy: None,
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
@@ -4623,6 +4819,7 @@ mod tests {
             proxy: None,
             env_var: None,
             endpoint_rules: vec![],
+            endpoint_policy: None,
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
@@ -4845,6 +5042,7 @@ mod tests {
                 connect_port: vec![],
                 credentials: Some(vec!["base_cred".to_string()]),
                 custom_credentials: HashMap::new(),
+                tls_intercept: None,
                 upstream_proxy: None,
                 upstream_bypass: Vec::new(),
             },
@@ -4858,6 +5056,7 @@ mod tests {
                 },
             },
             environment: None,
+            command_policies: None,
             workdir: WorkdirConfig {
                 access: WorkdirAccess::ReadWrite,
             },
@@ -4926,6 +5125,7 @@ mod tests {
                 connect_port: vec![],
                 credentials: None,
                 custom_credentials: HashMap::new(),
+                tls_intercept: None,
                 upstream_proxy: None,
                 upstream_bypass: Vec::new(),
             },
@@ -4939,6 +5139,7 @@ mod tests {
                 },
             },
             environment: None,
+            command_policies: None,
             workdir: WorkdirConfig {
                 access: WorkdirAccess::None,
             },
@@ -5188,6 +5389,7 @@ mod tests {
                 proxy: None,
                 env_var: None,
                 endpoint_rules: vec![],
+                endpoint_policy: None,
                 tls_ca: None,
                 tls_client_cert: None,
                 tls_client_key: None,
@@ -5211,6 +5413,7 @@ mod tests {
                 proxy: None,
                 env_var: None,
                 endpoint_rules: vec![],
+                endpoint_policy: None,
                 tls_ca: None,
                 tls_client_cert: None,
                 tls_client_key: None,
@@ -5352,6 +5555,7 @@ mod tests {
                 proxy: None,
                 env_var: None,
                 endpoint_rules: vec![],
+                endpoint_policy: None,
                 tls_ca: None,
                 tls_client_cert: None,
                 tls_client_key: None,
@@ -5375,6 +5579,7 @@ mod tests {
                 proxy: None,
                 env_var: None,
                 endpoint_rules: vec![],
+                endpoint_policy: None,
                 tls_ca: None,
                 tls_client_cert: None,
                 tls_client_key: None,
@@ -6295,6 +6500,23 @@ mod tests {
     }
 
     #[test]
+    fn test_command_policies_null_rejected() {
+        let result: std::result::Result<Profile, _> = serde_json::from_str(
+            r#"{
+                "meta": { "name": "null-command-policies" },
+                "command_policies": null
+            }"#,
+        );
+
+        assert!(result.is_err());
+        let err = result.expect_err("command_policies null should be rejected");
+        assert!(
+            err.to_string().contains("command_policies cannot be null"),
+            "error should describe null rejection: {err}"
+        );
+    }
+
+    #[test]
     fn test_unknown_fields_rejected_in_profile() {
         // A typo like "add_deny_acces" (missing 's') must be caught at parse
         // time. For a security tool, silently discarding unknown keys means a
@@ -6841,6 +7063,7 @@ mod tests {
             proxy: None,
             endpoint_rules: vec![],
             env_var: Some("EXAMPLE_API_KEY".to_string()),
+            endpoint_policy: None,
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
@@ -6867,6 +7090,7 @@ mod tests {
             proxy: None,
             endpoint_rules: vec![],
             env_var: None,
+            endpoint_policy: None,
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
@@ -6896,6 +7120,7 @@ mod tests {
             proxy: None,
             endpoint_rules: vec![],
             env_var: Some("EXAMPLE_API_KEY".to_string()),
+            endpoint_policy: None,
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
@@ -6925,6 +7150,7 @@ mod tests {
             proxy: None,
             endpoint_rules: vec![],
             env_var: Some("EXAMPLE_API_KEY".to_string()),
+            endpoint_policy: None,
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
@@ -6986,6 +7212,7 @@ mod tests {
             proxy: None,
             endpoint_rules: vec![],
             env_var: None,
+            endpoint_policy: None,
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
@@ -7009,6 +7236,7 @@ mod tests {
             proxy: None,
             endpoint_rules: vec![],
             env_var: None,
+            endpoint_policy: None,
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,

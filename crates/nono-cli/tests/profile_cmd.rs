@@ -325,4 +325,20 @@ fn test_guide_outputs_markdown() {
         stdout.contains("Variable Expansion"),
         "guide should cover variable expansion"
     );
+    assert!(
+        stdout.contains("ETI command-policy denials"),
+        "guide should cover ETI command-policy denials"
+    );
+    assert!(
+        stdout.contains("Proxy credential endpoint policy"),
+        "guide should cover proxy credential endpoint policy"
+    );
+    assert!(
+        stdout.contains("invocation_policy"),
+        "guide should cover invocation_policy rules"
+    );
+    assert!(
+        stdout.contains("nono why --profile <profile> --command gh -- issue comment 1052"),
+        "guide should show command-policy diagnostic query"
+    );
 }

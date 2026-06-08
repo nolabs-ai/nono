@@ -44,16 +44,35 @@ const SENSITIVE_QUERY_KEYS: &[&str] = &[
     "client_secret",
 ];
 
+const SENSITIVE_ENV_VARS: &[&str] = &[
+    "ANTHROPIC_API_KEY",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AZURE_OPENAI_API_KEY",
+    "COHERE_API_KEY",
+    "GEMINI_API_KEY",
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "GOOGLE_API_KEY",
+    "HUGGINGFACE_API_TOKEN",
+    "MISTRAL_API_KEY",
+    "NONO_PROXY_TOKEN",
+    "OPENAI_API_KEY",
+    "TOGETHER_API_KEY",
+];
+
 /// Redaction policy for diagnostics and persisted command context.
 ///
 /// The secure default policy redacts well-known secret-bearing flags,
-/// headers, and URL query keys. Callers may add entries for local tools, or
-/// explicitly remove defaults when they need unsafe debugging output.
+/// headers, URL query keys, and common secret-bearing environment variable
+/// names. Callers may add entries for local tools, or explicitly remove
+/// defaults when they need unsafe debugging output.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScrubPolicy {
     sensitive_flags: BTreeSet<String>,
     sensitive_headers: BTreeSet<String>,
     sensitive_query_keys: BTreeSet<String>,
+    sensitive_env_vars: BTreeSet<String>,
 }
 
 /// Difference between a scrub policy and the secure default policy.
@@ -74,6 +93,10 @@ pub struct ScrubPolicyDiff {
     pub added_query_keys: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub removed_query_keys: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub added_env_vars: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub removed_env_vars: Vec<String>,
 }
 
 impl ScrubPolicyDiff {
@@ -85,6 +108,8 @@ impl ScrubPolicyDiff {
             && self.removed_headers.is_empty()
             && self.added_query_keys.is_empty()
             && self.removed_query_keys.is_empty()
+            && self.added_env_vars.is_empty()
+            && self.removed_env_vars.is_empty()
     }
 
     #[must_use]
@@ -106,6 +131,7 @@ impl ScrubPolicy {
             sensitive_flags: normalized_set(SENSITIVE_FLAGS),
             sensitive_headers: normalized_set(SENSITIVE_HEADERS),
             sensitive_query_keys: normalized_set(SENSITIVE_QUERY_KEYS),
+            sensitive_env_vars: normalized_set(SENSITIVE_ENV_VARS),
         }
     }
 
@@ -121,6 +147,10 @@ impl ScrubPolicy {
         insert_normalized(&mut self.sensitive_query_keys, key.as_ref());
     }
 
+    pub fn add_env_var(&mut self, name: impl AsRef<str>) {
+        insert_normalized(&mut self.sensitive_env_vars, name.as_ref());
+    }
+
     pub fn remove_flag(&mut self, flag: &str) {
         remove_normalized(&mut self.sensitive_flags, flag);
     }
@@ -131,6 +161,10 @@ impl ScrubPolicy {
 
     pub fn remove_query_key(&mut self, key: &str) {
         remove_normalized(&mut self.sensitive_query_keys, key);
+    }
+
+    pub fn remove_env_var(&mut self, name: &str) {
+        remove_normalized(&mut self.sensitive_env_vars, name);
     }
 
     #[must_use]
@@ -149,6 +183,8 @@ impl ScrubPolicy {
                 &default.sensitive_query_keys,
                 &self.sensitive_query_keys,
             ),
+            added_env_vars: set_difference(&self.sensitive_env_vars, &default.sensitive_env_vars),
+            removed_env_vars: set_difference(&default.sensitive_env_vars, &self.sensitive_env_vars),
         }
     }
 
@@ -162,6 +198,10 @@ impl ScrubPolicy {
 
     fn is_sensitive_query_key(&self, name: &str) -> bool {
         contains_normalized_ascii(&self.sensitive_query_keys, name)
+    }
+
+    fn is_sensitive_env_var(&self, name: &str) -> bool {
+        contains_normalized_ascii(&self.sensitive_env_vars, name)
     }
 }
 
@@ -185,6 +225,42 @@ pub fn scrub_value_with_policy<'a>(s: &'a str, policy: &ScrubPolicy) -> Cow<'a, 
         Cow::Borrowed(s)
     } else {
         Cow::Owned(query_scrubbed.into_owned())
+    }
+}
+
+/// Redact an environment variable name when it is sensitive.
+#[must_use]
+pub fn scrub_env_name<'a>(name: &'a str) -> Cow<'a, str> {
+    scrub_env_name_with_policy(name, &ScrubPolicy::secure_default())
+}
+
+/// Redact an environment variable name with a configured policy.
+#[must_use]
+pub fn scrub_env_name_with_policy<'a>(name: &'a str, policy: &ScrubPolicy) -> Cow<'a, str> {
+    if policy.is_sensitive_env_var(name) {
+        Cow::Borrowed(REDACTED)
+    } else {
+        Cow::Borrowed(name)
+    }
+}
+
+/// Redact an environment variable value when its name is sensitive.
+#[must_use]
+pub fn scrub_env_value<'a>(name: &str, value: &'a str) -> Cow<'a, str> {
+    scrub_env_value_with_policy(name, value, &ScrubPolicy::secure_default())
+}
+
+/// Redact an environment variable value with a configured policy.
+#[must_use]
+pub fn scrub_env_value_with_policy<'a>(
+    name: &str,
+    value: &'a str,
+    policy: &ScrubPolicy,
+) -> Cow<'a, str> {
+    if policy.is_sensitive_env_var(name) {
+        Cow::Borrowed(REDACTED)
+    } else {
+        scrub_value_with_policy(value, policy)
     }
 }
 
@@ -518,6 +594,7 @@ mod tests {
         redactions.add_flag("--private-token");
         redactions.add_header("Private-Token");
         redactions.add_query_key("signature");
+        redactions.add_env_var("CONFIGURED_ENV");
 
         let args = vec![
             "curl".to_string(),
@@ -537,6 +614,27 @@ mod tests {
                 "https://example.com/api?signature=[REDACTED]&format=json".to_string(),
             ]
         );
+
+        assert_eq!(
+            scrub_env_value_with_policy("CONFIGURED_ENV", "redacted-value", &redactions),
+            REDACTED
+        );
+        assert_eq!(
+            scrub_env_value_with_policy("OBSERVED_ENV", "visible-value", &redactions),
+            "visible-value"
+        );
+    }
+
+    #[test]
+    fn secure_default_redacts_common_provider_env_vars() {
+        let redactions = ScrubPolicy::secure_default();
+        for name in ["OPENAI_API_KEY", "GEMINI_API_KEY"] {
+            assert_eq!(scrub_env_name_with_policy(name, &redactions), REDACTED);
+            assert_eq!(
+                scrub_env_value_with_policy(name, "provider-secret", &redactions),
+                REDACTED
+            );
+        }
     }
 
     #[test]

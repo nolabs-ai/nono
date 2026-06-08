@@ -13,9 +13,15 @@ verify_nono_binary
 
 # Detect whether Landlock has native TCP filtering (V4+).
 # With V4+, per-port network filtering and proxy enforcement work natively.
-# Uses --dry-run to avoid sandbox application or forking.
+# Probes `setup --check-only`, which performs a real TCP-rule support probe
+# without applying a sandbox or forking. The `nono run` banner does not print
+# the feature list, so grepping it misclassifies V4+ kernels as pre-V4.
+# Output is captured first (not piped into `grep -q`): under `set -o pipefail`
+# grep's early exit would SIGPIPE nono and make the pipeline fail spuriously.
 has_landlock_network() {
-    "$NONO_BIN" run --dry-run --allow /tmp -- true </dev/null 2>&1 | grep -q "TCP network filtering"
+    local _setup_out
+    _setup_out="$("$NONO_BIN" setup --check-only 2>&1)"
+    grep -q "TCP network rule support verified" <<<"$_setup_out"
 }
 
 echo ""

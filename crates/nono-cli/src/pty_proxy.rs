@@ -1000,13 +1000,12 @@ impl PtyProxy {
             .any(|ch| !ch.is_whitespace())
     }
 
-    /// Returns true once the child has entered alt-screen mode. This is the
-    /// reliable signal that a TUI has become interactive. Plain log lines or
-    /// startup banners written to the PTY do not activate alt-screen and do
-    /// not count, so a process that prints output and then hangs is still
-    /// subject to the startup timeout.
+    /// Returns true once the child appears interactive: either it has entered
+    /// alt-screen (TUI) or it has written visible non-whitespace output (REPL,
+    /// shell, readline prompt). Both signals mean the process is running and
+    /// the startup-timeout should not fire.
     pub fn is_interactive(&self) -> bool {
-        self.screen.alternate_screen_active()
+        self.screen.alternate_screen_active() || self.has_visible_output()
     }
 
     fn attach_replay_bytes(&self) -> Vec<u8> {

@@ -467,10 +467,28 @@ fn prepare_profile_with_options(
             }
         }
 
-        verify_profile_packs(&packs_to_verify)?;
+        // `--dry-run` resolves the profile and prints the capabilities it
+        // *would* apply, then exits without ever building the sandbox or
+        // executing the target command (see command_runtime::run_command).
+        // Pack verification (lockfile digest + signed trust bundle) gates the
+        // execution of pack-shipped code; a preview executes nothing, so it is
+        // not a verification boundary. Skipping it here keeps `--dry-run`
+        // usable to inspect a pack's profile before a managed `nono pull`
+        // completes (or while recovering missing metadata). A real run still
+        // hits verify_profile_packs below and is rejected if unverified.
+        if args.dry_run {
+            if !packs_to_verify.is_empty() && !options.hook_output_silent {
+                eprintln!(
+                    "  Skipping pack verification on --dry-run ({} pack(s)); a real run verifies them",
+                    packs_to_verify.len()
+                );
+            }
+        } else {
+            verify_profile_packs(&packs_to_verify)?;
 
-        if !packs_to_verify.is_empty() && !options.hook_output_silent {
-            eprintln!("  Verified {} pack(s)", packs_to_verify.len());
+            if !packs_to_verify.is_empty() && !options.hook_output_silent {
+                eprintln!("  Verified {} pack(s)", packs_to_verify.len());
+            }
         }
 
         if options.install_hooks {

@@ -64,8 +64,15 @@ git -C "${ROOT}" archive --format=tar --prefix="${SOURCE_NAME}/" HEAD | tar -C "
 mkdir -p "${SOURCE_ROOT}/.cargo"
 (
     cd "${SOURCE_ROOT}"
-    cargo vendor --quiet --locked --versioned-dirs vendor >> .cargo/config.toml
+    cargo vendor --quiet --locked --versioned-dirs vendor >/dev/null
 )
+cat > "${SOURCE_ROOT}/.cargo/config.toml" <<'EOF'
+[source.crates-io]
+replace-with = "vendored-sources"
+
+[source.vendored-sources]
+directory = "vendor"
+EOF
 
 sed \
     -e "s|@RPM_VERSION@|${RPM_VERSION}|g" \

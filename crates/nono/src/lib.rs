@@ -45,6 +45,7 @@
 //! - **macOS**: Uses Seatbelt sandbox
 //! - **Other platforms**: Returns `UnsupportedPlatform` error
 
+pub mod audit;
 pub mod capability;
 pub mod diagnostic;
 pub mod error;

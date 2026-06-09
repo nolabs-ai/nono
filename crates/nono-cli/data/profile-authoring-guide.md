@@ -213,11 +213,18 @@ Defines host-side CLI commands that produce credentials on stdout. Used with `cm
 }
 ```
 
-| Field          | Type            | Required | Default | Description |
-|----------------|-----------------|----------|---------|-------------|
-| `command`      | array of string | yes      | —       | Command and arguments. First element is resolved to an absolute path via PATH at profile-load time. No shell interpolation. |
-| `timeout_secs` | integer        | no       | `5`     | Maximum seconds to wait for the command (range: 1–300). |
-| `ttl_secs`     | integer        | no       | `900`   | How long to cache the result in seconds (range: 0–3600, 0 = no cache). |
+| Field                | Type            | Required | Default    | Description |
+|----------------------|-----------------|----------|------------|-------------|
+| `command`            | array of string | yes      | —          | Command and arguments. First element is resolved to an absolute path via PATH at profile-load time. No shell interpolation. |
+| `timeout_secs`       | integer         | no       | `5`        | Maximum seconds to wait for the command (range: 1–300). |
+| `ttl_secs`           | integer         | no       | `900`      | How long to cache the result in seconds (range: 0–3600, 0 = no cache). |
+| `cache_path_pattern` | string          | no       | —          | Regex applied to the request path; the first capture group becomes part of the cache key. Must contain at least one capture group. |
+| `output`             | string          | no       | `"string"` | How stdout is interpreted: `"string"` (single secret) or `"json"` (a JSON header map — see below). |
+
+The command runs with these environment variables set:
+
+- `NONO_SESSION_ID` — the current session identifier (always set).
+- `NONO_REQUEST_HOST`, `NONO_REQUEST_PATH`, `NONO_REQUEST_METHOD` — the upstream request that triggered the capture (set when request context is available).
 
 To use a capture command as a credential source, reference it with `cmd://<name>` in a `custom_credentials` entry's `credential_key`:
 
@@ -242,6 +249,47 @@ To use a capture command as a credential source, reference it with `cmd://<name>
   }
 }
 ```
+
+#### Injecting multiple headers (`output: "json"`)
+
+By default a capture command's stdout is a single secret, injected via the route's `inject_header` / `credential_format`. Set `output: "json"` to have one command supply **several headers** for the same upstream — useful when an API needs two correlated secrets (e.g. a bearer token and an API key) that are produced together.
+
+With `output: "json"`, the command must print a JSON object mapping header name to string value. The proxy injects each entry as a literal header (the route's `credential_format` is **not** applied — the command supplies fully-formed values):
+
+```json
+{
+  "network": {
+    "custom_credentials": {
+      "example": {
+        "upstream": "https://api.example.com",
+        "credential_key": "cmd://example_headers",
+        "env_var": "EXAMPLE_TOKEN"
+      }
+    },
+    "credentials": ["example"]
+  },
+  "credential_capture": {
+    "example_headers": {
+      "command": ["/usr/local/bin/get-example-headers"],
+      "output": "json"
+    }
+  }
+}
+```
+
+where `get-example-headers` prints, e.g.:
+
+```json
+{"Authorization": "Bearer abc123", "X-Api-Key": "key-xyz"}
+```
+
+Rules and validation:
+- `output: "json"` requires the referencing route's `inject_mode` to be `header` (the default). Combining it with `url_path` / `query_param` is a profile-load error.
+- The JSON must be an object with string values. An empty object, a non-object, or non-string values cause the request to be denied.
+- Each header name must be a valid HTTP token, and neither name nor value may contain CR/LF.
+- Reserved framing / hop-by-hop headers cannot be set: `Host`, `Content-Length`, `Connection`, `Transfer-Encoding`, `Content-Encoding`, `Trailer`, `TE`, `Upgrade`, `Keep-Alive`, `Proxy-Authenticate`, `Proxy-Authorization`.
+- Any client-supplied copy of an injected header is stripped before the injected value is added.
+- The inbound phantom token (the sandboxed process's session-token auth) is still validated and stripped on the route's configured header, independent of the command output.
 
 Security properties:
 - Commands are allow-listed in the profile. The sandboxed process names a logical credential, not a command.

@@ -21,7 +21,6 @@ use crate::reverse;
 use crate::route::RouteStore;
 use crate::tls_intercept::acceptor;
 use crate::tls_intercept::cert_cache::CertCache;
-use base64::Engine;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
@@ -544,7 +543,7 @@ where
         path: path.to_string(),
         method: method.to_string(),
     };
-    let credential = match ctx
+    let resolved = match ctx
         .credential_store
         .resolve_cmd_credential(svc, ctx.session_token.as_str(), Some(&request_context))
         .await
@@ -582,6 +581,48 @@ where
         }
     };
 
+    // For `output: "json"` credentials the value is a header map. Parse and
+    // validate it up front so a bad map fails closed. Header-map routes are
+    // header-mode only (enforced at profile-validation time).
+    let header_map = if resolved.is_header_map {
+        match reverse::parse_header_map(&resolved.value) {
+            Ok(headers) => Some(headers),
+            Err(e) => {
+                warn!(
+                    "tls_intercept: cmd:// JSON header map invalid for '{}': {}",
+                    svc, e
+                );
+                let deny_ctx = audit::EventContext {
+                    route_id: service,
+                    auth_mechanism: Some(reverse::auth_mechanism_for_inject_mode(
+                        &cmd_cfg.inject_mode,
+                    )),
+                    auth_outcome: Some(nono::undo::NetworkAuditAuthOutcome::Failed),
+                    managed_credential_active: Some(true),
+                    injection_mode: Some(reverse::audit_injection_mode_for_inject_mode(
+                        &cmd_cfg.inject_mode,
+                    )),
+                    denial_category: Some(
+                        nono::undo::NetworkAuditDenialCategory::ManagedCredentialUnavailable,
+                    ),
+                };
+                audit::log_denied(
+                    ctx.audit_log,
+                    audit::ProxyMode::ConnectIntercept,
+                    &deny_ctx,
+                    ctx.host,
+                    ctx.port,
+                    &e.to_string(),
+                );
+                reverse::send_error_generic(tls_stream, 503, "Service Unavailable").await?;
+                return Ok(());
+            }
+        }
+    } else {
+        None
+    };
+    let credential = &resolved.value;
+
     debug!("tls_intercept: cmd:// credential resolved for '{}'", svc);
 
     // Strip proxy artifacts and build the cleaned upstream path
@@ -598,7 +639,7 @@ where
         cmd_cfg.path_pattern.as_deref(),
         cmd_cfg.path_replacement.as_deref(),
         cmd_cfg.query_param_name.as_deref(),
-        &credential,
+        credential,
     )?;
 
     // Resolve upstream IPs (DNS-rebind-safe via filter)
@@ -626,8 +667,11 @@ where
         return Ok(());
     }
 
-    // Filter headers (strip the header carrying the phantom token)
-    let filtered_headers = reverse::filter_headers(header_bytes, &cmd_cfg.proxy_header_name);
+    // Filter headers (strip the header carrying the phantom token), then strip
+    // any client-supplied copy of every header the proxy injects.
+    let mut filtered_headers = reverse::filter_headers(header_bytes, &cmd_cfg.proxy_header_name);
+    let injected_names = reverse::injected_header_names(cmd_cfg, &header_map);
+    filtered_headers.retain(|(name, _)| !injected_names.contains(&name.to_lowercase()));
     let content_length = reverse::extract_content_length(header_bytes);
 
     // Read request body
@@ -644,40 +688,10 @@ where
     ));
 
     // Inject real credential
-    match cmd_cfg.inject_mode {
-        InjectMode::Header => {
-            let header_value = Zeroizing::new(cmd_cfg.credential_format.replace("{}", &credential));
-            request.push_str(&format!(
-                "{}: {}\r\n",
-                cmd_cfg.header_name,
-                header_value.as_str()
-            ));
-        }
-        InjectMode::BasicAuth => {
-            let encoded = Zeroizing::new(
-                base64::engine::general_purpose::STANDARD.encode(credential.as_bytes()),
-            );
-            request.push_str(&format!(
-                "{}: Basic {}\r\n",
-                cmd_cfg.header_name,
-                encoded.as_str()
-            ));
-        }
-        InjectMode::UrlPath | InjectMode::QueryParam => {
-            // Already handled via transform_path_for_mode above
-        }
-    }
+    reverse::inject_cmd_credential(&mut request, cmd_cfg, credential, &header_map);
 
-    // Forward filtered headers (skip the credential header we just injected)
-    let auth_header_lower = cmd_cfg.header_name.to_lowercase();
+    // Forward filtered headers (client copies of injected headers already stripped)
     for (name, value) in &filtered_headers {
-        if matches!(
-            cmd_cfg.inject_mode,
-            InjectMode::Header | InjectMode::BasicAuth
-        ) && name.to_lowercase() == auth_header_lower
-        {
-            continue;
-        }
         request.push_str(&format!("{}: {}\r\n", name, value));
     }
 

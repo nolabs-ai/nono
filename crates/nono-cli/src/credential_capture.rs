@@ -70,6 +70,11 @@ pub struct CredentialCaptureDef {
     /// Compiled regex for extracting a cache key suffix from the request path.
     /// First capture group becomes the cache suffix.
     pub cache_path_regex: Option<Regex>,
+    /// When true, the command's stdout is a JSON object of header → value that
+    /// the proxy injects as multiple headers. When false (default), stdout is a
+    /// single secret value. Parsing/validation happens proxy-side; this flag is
+    /// only propagated so the proxy knows how to interpret the value.
+    pub output_is_header_map: bool,
 }
 
 /// A cached credential value with expiry.
@@ -151,10 +156,12 @@ impl CredentialCaptureExecutor {
     pub fn execute(
         &self,
         config: &CredentialCaptureDef,
+        session_id: &str,
         context: Option<&CaptureContext>,
     ) -> Result<Zeroizing<String>> {
         let mut cmd = Command::new(&config.command_path);
         cmd.args(&config.command_args);
+        cmd.env("NONO_SESSION_ID", session_id);
         if let Some(ctx) = context {
             cmd.env("NONO_REQUEST_HOST", &ctx.host);
             cmd.env("NONO_REQUEST_PATH", &ctx.path);
@@ -313,7 +320,7 @@ impl CredentialCaptureBroker {
         }
 
         // Execute command
-        let credential = self.executor.execute(config, context)?;
+        let credential = self.executor.execute(config, session_id, context)?;
 
         // Cache result
         {
@@ -331,6 +338,15 @@ impl CredentialCaptureBroker {
         }
 
         Ok(credential)
+    }
+
+    /// Whether the named credential's command emits a JSON header map
+    /// (`output: "json"`). Returns `false` for unknown names or string output.
+    #[must_use]
+    pub fn output_is_header_map(&self, credential_name: &str) -> bool {
+        self.configs
+            .get(credential_name)
+            .is_some_and(|c| c.output_is_header_map)
     }
 
     /// Flush all cached credentials for a session (call on session exit).
@@ -358,6 +374,7 @@ pub fn validate_capture_command(
     timeout_secs: Option<u64>,
     ttl_secs: Option<u64>,
     cache_path_pattern: Option<&str>,
+    output_is_header_map: bool,
 ) -> Result<CredentialCaptureDef> {
     if command.is_empty() {
         return Err(NonoError::ConfigParse(format!(
@@ -425,6 +442,7 @@ pub fn validate_capture_command(
         timeout_secs: timeout,
         ttl: Duration::from_secs(ttl),
         cache_path_regex,
+        output_is_header_map,
     })
 }
 
@@ -663,14 +681,14 @@ mod tests {
 
     #[test]
     fn test_validate_empty_command_rejected() {
-        let result = validate_capture_command("test", &[], None, None, None);
+        let result = validate_capture_command("test", &[], None, None, None, false);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_validate_shell_metacharacters_rejected() {
         let cmd = vec!["echo".to_string(), "hello; rm -rf /".to_string()];
-        let result = validate_capture_command("test", &cmd, None, None, None);
+        let result = validate_capture_command("test", &cmd, None, None, None, false);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("forbidden shell metacharacters"));
@@ -679,24 +697,24 @@ mod tests {
     #[test]
     fn test_validate_timeout_out_of_range() {
         let cmd = vec!["/bin/echo".to_string(), "hello".to_string()];
-        let result = validate_capture_command("test", &cmd, Some(0), None, None);
+        let result = validate_capture_command("test", &cmd, Some(0), None, None, false);
         assert!(result.is_err());
 
-        let result = validate_capture_command("test", &cmd, Some(301), None, None);
+        let result = validate_capture_command("test", &cmd, Some(301), None, None, false);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_validate_ttl_out_of_range() {
         let cmd = vec!["/bin/echo".to_string(), "hello".to_string()];
-        let result = validate_capture_command("test", &cmd, None, Some(3601), None);
+        let result = validate_capture_command("test", &cmd, None, Some(3601), None, false);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_validate_nonexistent_absolute_path_rejected() {
         let cmd = vec!["/nonexistent/binary".to_string()];
-        let result = validate_capture_command("test", &cmd, None, None, None);
+        let result = validate_capture_command("test", &cmd, None, None, None, false);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("does not exist"));
@@ -705,7 +723,7 @@ mod tests {
     #[test]
     fn test_validate_valid_absolute_command() {
         let cmd = vec!["/bin/echo".to_string(), "hello".to_string()];
-        let result = validate_capture_command("test", &cmd, Some(5), Some(300), None);
+        let result = validate_capture_command("test", &cmd, Some(5), Some(300), None, false);
         assert!(result.is_ok());
         let def = result.unwrap();
         assert_eq!(def.command_path, PathBuf::from("/bin/echo"));
@@ -718,7 +736,8 @@ mod tests {
     #[test]
     fn test_validate_cache_path_pattern_compiled() {
         let cmd = vec!["/bin/echo".to_string(), "hello".to_string()];
-        let result = validate_capture_command("test", &cmd, Some(5), Some(300), Some("^/([^/]+)"));
+        let result =
+            validate_capture_command("test", &cmd, Some(5), Some(300), Some("^/([^/]+)"), false);
         assert!(result.is_ok());
         let def = result.unwrap();
         assert!(def.cache_path_regex.is_some());
@@ -730,7 +749,7 @@ mod tests {
     #[test]
     fn test_validate_invalid_regex_rejected() {
         let cmd = vec!["/bin/echo".to_string()];
-        let result = validate_capture_command("test", &cmd, None, None, Some("[invalid("));
+        let result = validate_capture_command("test", &cmd, None, None, Some("[invalid("), false);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("invalid cache_path_pattern"));
@@ -739,7 +758,7 @@ mod tests {
     #[test]
     fn test_validate_regex_without_capture_group_rejected() {
         let cmd = vec!["/bin/echo".to_string()];
-        let result = validate_capture_command("test", &cmd, None, None, Some("^/[^/]+"));
+        let result = validate_capture_command("test", &cmd, None, None, Some("^/[^/]+"), false);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("capture group"));
@@ -753,9 +772,10 @@ mod tests {
             timeout_secs: 5,
             ttl: Duration::from_secs(60),
             cache_path_regex: None,
+            output_is_header_map: false,
         };
         let executor = CredentialCaptureExecutor;
-        let result = executor.execute(&config, None);
+        let result = executor.execute(&config, "test-session", None);
         assert!(result.is_ok());
         assert_eq!(result.unwrap().as_str(), "test-credential");
     }
@@ -768,6 +788,7 @@ mod tests {
             timeout_secs: 5,
             ttl: Duration::from_secs(60),
             cache_path_regex: None,
+            output_is_header_map: false,
         };
         let ctx = CaptureContext {
             host: "api.example.com".to_string(),
@@ -775,7 +796,7 @@ mod tests {
             method: "POST".to_string(),
         };
         let executor = CredentialCaptureExecutor;
-        let result = executor.execute(&config, Some(&ctx));
+        let result = executor.execute(&config, "test-session", Some(&ctx));
         assert!(result.is_ok());
         assert_eq!(result.unwrap().as_str(), "api.example.com");
     }
@@ -791,6 +812,7 @@ mod tests {
             timeout_secs: 5,
             ttl: Duration::from_secs(60),
             cache_path_regex: None,
+            output_is_header_map: false,
         };
         let ctx = CaptureContext {
             host: "api.github.com".to_string(),
@@ -798,12 +820,31 @@ mod tests {
             method: "GET".to_string(),
         };
         let executor = CredentialCaptureExecutor;
-        let result = executor.execute(&config, Some(&ctx));
+        let result = executor.execute(&config, "test-session", Some(&ctx));
         assert!(result.is_ok());
         assert_eq!(
             result.unwrap().as_str(),
             "api.github.com /repos/owner/name GET"
         );
+    }
+
+    #[test]
+    fn test_executor_session_id_injected() {
+        let config = CredentialCaptureDef {
+            command_path: PathBuf::from("/bin/sh"),
+            command_args: vec![
+                "-c".to_string(),
+                "printf '%s' \"$NONO_SESSION_ID\"".to_string(),
+            ],
+            timeout_secs: 5,
+            ttl: Duration::from_secs(60),
+            cache_path_regex: None,
+            output_is_header_map: false,
+        };
+        let executor = CredentialCaptureExecutor;
+        let result = executor.execute(&config, "sess-abc123", None);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().as_str(), "sess-abc123");
     }
 
     #[test]
@@ -814,9 +855,10 @@ mod tests {
             timeout_secs: 5,
             ttl: Duration::from_secs(60),
             cache_path_regex: None,
+            output_is_header_map: false,
         };
         let executor = CredentialCaptureExecutor;
-        let result = executor.execute(&config, None);
+        let result = executor.execute(&config, "test-session", None);
         assert!(result.is_err());
     }
 
@@ -828,9 +870,10 @@ mod tests {
             timeout_secs: 5,
             ttl: Duration::from_secs(60),
             cache_path_regex: None,
+            output_is_header_map: false,
         };
         let executor = CredentialCaptureExecutor;
-        let result = executor.execute(&config, None);
+        let result = executor.execute(&config, "test-session", None);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("empty output"));
@@ -844,9 +887,10 @@ mod tests {
             timeout_secs: 5,
             ttl: Duration::from_secs(60),
             cache_path_regex: None,
+            output_is_header_map: false,
         };
         let executor = CredentialCaptureExecutor;
-        let result = executor.execute(&config, None);
+        let result = executor.execute(&config, "test-session", None);
         assert!(result.is_ok());
         assert_eq!(result.unwrap().as_str(), "token");
     }
@@ -862,6 +906,7 @@ mod tests {
                 timeout_secs: 5,
                 ttl: Duration::from_secs(60),
                 cache_path_regex: None,
+                output_is_header_map: false,
             },
         );
         let broker = CredentialCaptureBroker::new(configs);
@@ -891,6 +936,7 @@ mod tests {
                 timeout_secs: 5,
                 ttl: Duration::from_secs(60),
                 cache_path_regex: Some(Regex::new("^/([^/]+)").unwrap()),
+                output_is_header_map: false,
             },
         );
         let broker = CredentialCaptureBroker::new(configs);
@@ -943,6 +989,7 @@ mod tests {
                 timeout_secs: 5,
                 ttl: Duration::from_secs(60),
                 cache_path_regex: None,
+                output_is_header_map: false,
             },
         );
         let broker = CredentialCaptureBroker::new(configs);
@@ -994,6 +1041,7 @@ mod tests {
                 timeout_secs: 5,
                 ttl: Duration::from_secs(60),
                 cache_path_regex: None,
+                output_is_header_map: false,
             },
         );
         let broker = CredentialCaptureBroker::new(configs);
@@ -1012,6 +1060,7 @@ mod tests {
                 timeout_secs: 5,
                 ttl: Duration::from_secs(60),
                 cache_path_regex: None,
+                output_is_header_map: false,
             },
         );
         let broker = CredentialCaptureBroker::new(configs);
@@ -1037,9 +1086,10 @@ mod tests {
             timeout_secs: 1,
             ttl: Duration::from_secs(60),
             cache_path_regex: None,
+            output_is_header_map: false,
         };
         let executor = CredentialCaptureExecutor;
-        let result = executor.execute(&config, None);
+        let result = executor.execute(&config, "test-session", None);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -1053,7 +1103,7 @@ mod tests {
     fn test_validate_path_resolution_from_path_env() {
         // "echo" should be resolvable via PATH on any Unix system
         let cmd = vec!["echo".to_string(), "hello".to_string()];
-        let result = validate_capture_command("test", &cmd, Some(5), Some(60), None);
+        let result = validate_capture_command("test", &cmd, Some(5), Some(60), None, false);
         assert!(
             result.is_ok(),
             "echo should resolve via PATH: {:?}",
@@ -1071,7 +1121,7 @@ mod tests {
     #[test]
     fn test_validate_nonexistent_command_in_path_rejected() {
         let cmd = vec!["nonexistent-cmd-xyz-9876543".to_string()];
-        let result = validate_capture_command("test", &cmd, None, None, None);
+        let result = validate_capture_command("test", &cmd, None, None, None, false);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -1091,7 +1141,7 @@ mod tests {
         // File exists but is NOT executable (mode 0o644 by default)
 
         let cmd = vec![script.to_str().unwrap().to_string()];
-        let result = validate_capture_command("test", &cmd, None, None, None);
+        let result = validate_capture_command("test", &cmd, None, None, None, false);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(

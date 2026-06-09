@@ -45,6 +45,11 @@ pub struct ProxyCaptureResponse {
     pub credential: Option<Zeroizing<String>>,
     /// Error description if capture failed.
     pub error: Option<String>,
+    /// When true, `credential` is a JSON object of header name → value that the
+    /// proxy must parse and inject as multiple headers (the credential's
+    /// `output: "json"` mode). When false (default), `credential` is a single
+    /// secret value injected via the route's header configuration.
+    pub is_header_map: bool,
 }
 
 impl std::fmt::Debug for ProxyCaptureResponse {
@@ -55,6 +60,7 @@ impl std::fmt::Debug for ProxyCaptureResponse {
                 &self.credential.as_ref().map(|_| "[REDACTED]"),
             )
             .field("error", &self.error)
+            .field("is_header_map", &self.is_header_map)
             .finish()
     }
 }

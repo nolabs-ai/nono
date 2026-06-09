@@ -273,6 +273,7 @@ pub(crate) fn start_proxy_runtime(
                 Some(entry.timeout_secs),
                 Some(entry.ttl_secs),
                 entry.cache_path_pattern.as_deref(),
+                entry.output == crate::profile::CaptureOutput::Json,
             ) {
                 Ok(def) => {
                     configs.insert(name.clone(), def);
@@ -316,6 +317,7 @@ pub(crate) fn start_proxy_runtime(
                                     }
                                     _ => None,
                                 };
+                            let is_header_map = broker.output_is_header_map(&req.credential_name);
                             let result = broker.capture_or_cache(
                                 &req.session_id,
                                 &req.credential_name,
@@ -325,10 +327,12 @@ pub(crate) fn start_proxy_runtime(
                                 Ok(credential) => nono_proxy::capture::ProxyCaptureResponse {
                                     credential: Some(credential),
                                     error: None,
+                                    is_header_map,
                                 },
                                 Err(e) => nono_proxy::capture::ProxyCaptureResponse {
                                     credential: None,
                                     error: Some(e.to_string()),
+                                    is_header_map: false,
                                 },
                             };
                             let _ = response_tx.send(response);

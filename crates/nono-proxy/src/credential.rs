@@ -36,6 +36,28 @@ pub struct CaptureRequestContext {
     pub method: String,
 }
 
+/// A resolved `cmd://` credential plus how to interpret it.
+///
+/// `value` is either a single secret string (`is_header_map == false`) or a
+/// JSON object of header name → value (`is_header_map == true`, the credential's
+/// `output: "json"` mode).
+pub struct ResolvedCmdCredential {
+    /// The captured value (single secret or JSON header map).
+    pub value: Zeroizing<String>,
+    /// Whether `value` is a JSON header map to be parsed and injected as
+    /// multiple headers.
+    pub is_header_map: bool,
+}
+
+impl std::fmt::Debug for ResolvedCmdCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolvedCmdCredential")
+            .field("value", &"[REDACTED]")
+            .field("is_header_map", &self.is_header_map)
+            .finish()
+    }
+}
+
 /// A loaded credential ready for injection.
 ///
 /// Contains only credential-specific fields (injection mode, header name/value,
@@ -430,12 +452,16 @@ impl CredentialStore {
     /// Sends a request to the supervisor, which runs the allow-listed command
     /// and returns the credential. Returns an error if the channel is unavailable,
     /// the supervisor denies the request, or the timeout is reached.
+    ///
+    /// The returned [`ResolvedCmdCredential`] carries both the value and whether
+    /// it is a JSON header map (`output: "json"`) that the caller must parse and
+    /// inject as multiple headers.
     pub async fn resolve_cmd_credential(
         &self,
         prefix: &str,
         session_id: &str,
         context: Option<&CaptureRequestContext>,
-    ) -> Result<Zeroizing<String>> {
+    ) -> Result<ResolvedCmdCredential> {
         let cmd_config = self.cmd_routes.get(prefix).ok_or_else(|| {
             ProxyError::Credential(format!("no cmd:// route configured for '{prefix}'"))
         })?;
@@ -466,7 +492,10 @@ impl CredentialStore {
             })?;
 
         match response.credential {
-            Some(cred) => Ok(cred),
+            Some(value) => Ok(ResolvedCmdCredential {
+                value,
+                is_header_map: response.is_header_map,
+            }),
             None => Err(ProxyError::Credential(
                 response
                     .error

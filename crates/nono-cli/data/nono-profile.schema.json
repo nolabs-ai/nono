@@ -196,6 +196,11 @@
         "cache_path_pattern": {
           "type": "string",
           "description": "Optional regex applied to the request path (NONO_REQUEST_PATH). The first capture group becomes part of the cache key, enabling per-path-segment credential caching. Must contain at least one capture group. Example: \"^/([^/]+)\" caches by the first path segment."
+        },
+        "output": {
+          "enum": ["string", "json"],
+          "default": "string",
+          "description": "How the command's stdout is interpreted. \"string\" (default): a single secret value injected via the route's inject_header/credential_format. \"json\": a JSON object mapping header name to string value (e.g. {\"Authorization\": \"Bearer x\", \"X-Api-Key\": \"y\"}); the proxy injects each entry as a literal header. JSON output requires the referencing custom_credentials route to use inject_mode \"header\"."
         }
       }
     },

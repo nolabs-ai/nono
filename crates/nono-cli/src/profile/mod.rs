@@ -383,6 +383,29 @@ pub struct CredentialCaptureEntry {
     /// key is just the credential name (one cached value per route).
     #[serde(default)]
     pub cache_path_pattern: Option<String>,
+    /// How the command's stdout is interpreted (default: `string`).
+    ///
+    /// - `string`: stdout is a single secret value, injected via the route's
+    ///   `inject_header` / `credential_format` / `inject_mode` (the original
+    ///   behavior).
+    /// - `json`: stdout must be a JSON object mapping header name → string
+    ///   value (e.g. `{"Authorization": "Bearer x", "X-Api-Key": "y"}`). The
+    ///   proxy injects each entry as a literal header. The route's
+    ///   `credential_format` is not applied. Only valid for routes whose
+    ///   `inject_mode` is `header`.
+    #[serde(default)]
+    pub output: CaptureOutput,
+}
+
+/// Interpretation of a credential capture command's stdout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CaptureOutput {
+    /// stdout is a single secret value (default; original behavior).
+    #[default]
+    String,
+    /// stdout is a JSON object mapping header name → string value.
+    Json,
 }
 
 fn default_capture_timeout() -> u64 {
@@ -922,6 +945,25 @@ fn validate_upstream_url(url: &str, service_name: &str) -> Result<()> {
 fn validate_profile_custom_credentials(profile: &Profile) -> Result<()> {
     for (name, cred) in &profile.network.custom_credentials {
         validate_custom_credential(name, cred)?;
+
+        // A `cmd://` route whose capture command emits a JSON header map
+        // (`output: "json"`) injects header *names* itself, so the route must
+        // be in header mode — url_path/query_param injection is incoherent
+        // with a header map.
+        if let Some(cap_name) = cred
+            .credential_key
+            .as_deref()
+            .and_then(|k| k.strip_prefix("cmd://"))
+            && let Some(entry) = profile.credential_capture.get(cap_name)
+            && entry.output == CaptureOutput::Json
+            && cred.inject_mode != InjectMode::Header
+        {
+            return Err(NonoError::ProfileParse(format!(
+                "custom credential '{}' uses cmd://{} with output: \"json\" but \
+                 inject_mode is '{:?}'; JSON header-map output requires inject_mode 'header'",
+                name, cap_name, cred.inject_mode
+            )));
+        }
     }
     Ok(())
 }
@@ -3239,6 +3281,86 @@ mod tests {
         assert_eq!(gcloud.command, vec!["gcloud", "auth", "print-access-token"]);
         assert_eq!(gcloud.timeout_secs, 5); // default
         assert_eq!(gcloud.ttl_secs, 900); // default
+    }
+
+    #[test]
+    fn test_capture_output_defaults_to_string() {
+        let json = r#"{
+            "meta": {"name": "t"},
+            "credential_capture": {
+                "github": {"command": ["gh", "auth", "token"]}
+            }
+        }"#;
+        let profile: Profile = serde_json::from_str(json).expect("parse");
+        assert_eq!(
+            profile.credential_capture["github"].output,
+            CaptureOutput::String
+        );
+    }
+
+    #[test]
+    fn test_capture_output_json_deserializes() {
+        let json = r#"{
+            "meta": {"name": "t"},
+            "credential_capture": {
+                "multi": {"command": ["get-headers"], "output": "json"}
+            }
+        }"#;
+        let profile: Profile = serde_json::from_str(json).expect("parse");
+        assert_eq!(
+            profile.credential_capture["multi"].output,
+            CaptureOutput::Json
+        );
+    }
+
+    #[test]
+    fn test_capture_output_json_with_header_mode_ok() {
+        let json = br#"{
+            "meta": {"name": "t"},
+            "network": {
+                "custom_credentials": {
+                    "multi": {
+                        "upstream": "https://api.example.com",
+                        "credential_key": "cmd://multi",
+                        "env_var": "MULTI_TOKEN",
+                        "inject_header": "Authorization"
+                    }
+                }
+            },
+            "credential_capture": {
+                "multi": {"command": ["get-headers"], "output": "json"}
+            }
+        }"#;
+        parse_profile_bytes(json).expect("json output with header mode should validate");
+    }
+
+    #[test]
+    fn test_capture_output_json_with_non_header_mode_rejected() {
+        // url_path mode is incoherent with a JSON header map → must be rejected.
+        let json = br#"{
+            "meta": {"name": "t"},
+            "network": {
+                "custom_credentials": {
+                    "multi": {
+                        "upstream": "https://api.example.com",
+                        "credential_key": "cmd://multi",
+                        "env_var": "MULTI_TOKEN",
+                        "inject_mode": "url_path",
+                        "path_pattern": "/bot{}/"
+                    }
+                }
+            },
+            "credential_capture": {
+                "multi": {"command": ["get-headers"], "output": "json"}
+            }
+        }"#;
+        let err = parse_profile_bytes(json)
+            .expect_err("json output with url_path mode should be rejected");
+        assert!(
+            err.to_string().contains("JSON header-map output requires"),
+            "unexpected error: {}",
+            err
+        );
     }
 
     #[test]

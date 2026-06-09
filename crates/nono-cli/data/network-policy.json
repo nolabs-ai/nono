@@ -118,8 +118,7 @@
         "gitlab",
         "sigstore",
         "documentation"
-      ],
-      "credentials": ["google-ai", "github", "gitlab"]
+      ]
     },
     "developer": {
       "groups": [
@@ -129,8 +128,7 @@
         "gitlab",
         "sigstore",
         "documentation"
-      ],
-      "credentials": ["github", "gitlab"]
+      ]
     },
     "codex": {
       "groups": [
@@ -140,8 +138,7 @@
         "gitlab",
         "sigstore",
         "documentation"
-      ],
-      "credentials": ["openai", "github", "gitlab"]
+      ]
     },
     "claude-code": {
       "groups": [
@@ -151,8 +148,7 @@
         "gitlab",
         "sigstore",
         "documentation"
-      ],
-      "credentials": ["anthropic", "github", "gitlab"]
+      ]
     },
     "minimal": {
       "groups": [

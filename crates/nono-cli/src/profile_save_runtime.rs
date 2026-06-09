@@ -1364,7 +1364,10 @@ pub(crate) fn prepare_profile_save_from_patch(
     let profile_path = profile::get_user_profile_path(profile_name)?;
     let mut new_profile = patch.clone();
     let extends = compared_profile
-        .filter(|name| profile::is_valid_profile_name(name) && *name != profile_name)
+        .filter(|name| {
+            (profile::is_valid_profile_name(name) || profile::is_registry_ref(name))
+                && *name != profile_name
+        })
         .map(|name| vec![name.to_string()]);
     let has_base = extends.is_some();
     let suppression_only = patch_is_suppression_only(patch);
@@ -2165,6 +2168,95 @@ mod tests {
             vec!["~/.copilot/settings.json"]
         );
         assert!(prepared.profile.filesystem.read_file.is_empty());
+    }
+
+    #[test]
+    fn prepare_profile_save_from_patch_preserves_registry_ref_as_extends() {
+        let _env_lock = ENV_LOCK.lock().expect("env lock");
+        let temp_home = TempDir::new().expect("temp home");
+        let temp_config = TempDir::new().expect("temp config");
+        let _env = EnvVarGuard::set_all(&[
+            ("HOME", temp_home.path().to_str().expect("home path")),
+            (
+                "XDG_CONFIG_HOME",
+                temp_config.path().to_str().expect("config path"),
+            ),
+        ]);
+
+        let patch = profile::Profile {
+            filesystem: profile::FilesystemConfig {
+                suppress_save_prompt: vec!["~/.copilot/settings.json".to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let prepared = prepare_profile_save_from_patch(
+            &patch,
+            "claude",
+            "claude-test",
+            Some("always-further/claude"),
+        )
+        .expect("prepare");
+
+        assert!(matches!(prepared.action, SaveAction::Created));
+        assert_eq!(
+            prepared.profile.extends,
+            Some(vec!["always-further/claude".to_string()])
+        );
+    }
+
+    #[test]
+    fn prepare_profile_save_from_patch_preserves_versioned_registry_ref() {
+        let _env_lock = ENV_LOCK.lock().expect("env lock");
+        let temp_home = TempDir::new().expect("temp home");
+        let temp_config = TempDir::new().expect("temp config");
+        let _env = EnvVarGuard::set_all(&[
+            ("HOME", temp_home.path().to_str().expect("home path")),
+            (
+                "XDG_CONFIG_HOME",
+                temp_config.path().to_str().expect("config path"),
+            ),
+        ]);
+
+        let mut patch = profile::Profile::default();
+        patch.filesystem.read = vec!["~/workspace".to_string()];
+
+        let prepared = prepare_profile_save_from_patch(
+            &patch,
+            "claude",
+            "claude-test",
+            Some("always-further/claude@1.2.0"),
+        )
+        .expect("prepare");
+
+        assert_eq!(
+            prepared.profile.extends,
+            Some(vec!["always-further/claude@1.2.0".to_string()])
+        );
+    }
+
+    #[test]
+    fn prepare_profile_save_from_patch_still_avoids_self_reference() {
+        let _env_lock = ENV_LOCK.lock().expect("env lock");
+        let temp_home = TempDir::new().expect("temp home");
+        let temp_config = TempDir::new().expect("temp config");
+        let _env = EnvVarGuard::set_all(&[
+            ("HOME", temp_home.path().to_str().expect("home path")),
+            (
+                "XDG_CONFIG_HOME",
+                temp_config.path().to_str().expect("config path"),
+            ),
+        ]);
+
+        let mut patch = profile::Profile::default();
+        patch.filesystem.read = vec!["~/workspace".to_string()];
+
+        let prepared =
+            prepare_profile_save_from_patch(&patch, "claude", "my-profile", Some("my-profile"))
+                .expect("prepare");
+
+        assert!(prepared.profile.extends.is_none());
     }
 
     #[test]

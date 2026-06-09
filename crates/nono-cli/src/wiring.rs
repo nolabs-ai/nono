@@ -311,6 +311,14 @@ pub struct WiringReport {
     pub changed: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ExecuteOptions {
+    /// Allows `WriteFile` to claim an existing unmanaged destination only when
+    /// its content already exactly matches the pack source. Used for
+    /// `nono pull --force` recovery after local package metadata loss.
+    pub allow_unmanaged_identical_write_files: bool,
+}
+
 /// Execute a list of directives in order. Stops on hard errors; soft
 /// conflicts (a real file where we'd symlink) are recorded and
 /// execution continues with the next directive.
@@ -328,9 +336,18 @@ pub fn execute(
     ctx: &WiringContext,
     pack_owned_files: &HashMap<PathBuf, String>,
 ) -> Result<WiringReport> {
+    execute_with_options(directives, ctx, pack_owned_files, ExecuteOptions::default())
+}
+
+pub fn execute_with_options(
+    directives: &[WiringDirective],
+    ctx: &WiringContext,
+    pack_owned_files: &HashMap<PathBuf, String>,
+    options: ExecuteOptions,
+) -> Result<WiringReport> {
     let mut report = WiringReport::default();
     for directive in directives {
-        execute_one(directive, ctx, pack_owned_files, &mut report)?;
+        execute_one(directive, ctx, pack_owned_files, options, &mut report)?;
     }
     Ok(report)
 }
@@ -339,6 +356,7 @@ fn execute_one(
     directive: &WiringDirective,
     ctx: &WiringContext,
     pack_owned_files: &HashMap<PathBuf, String>,
+    options: ExecuteOptions,
     report: &mut WiringReport,
 ) -> Result<()> {
     match directive {
@@ -384,12 +402,20 @@ fn execute_one(
                 };
                 match recorded_hash {
                     None => {
-                        return Err(NonoError::PackageInstall(format!(
-                            "write_file: refusing to overwrite '{}' — \
-                             file already exists and was not written by a \
-                             managed pack. Move/remove it manually then re-pull.",
-                            dest_path.display()
-                        )));
+                        let source_hash = match fs::read(&source_path) {
+                            Ok(bytes) => hash_bytes(&bytes),
+                            Err(e) => return Err(NonoError::Io(e)),
+                        };
+                        if !options.allow_unmanaged_identical_write_files
+                            || source_hash != current_hash
+                        {
+                            return Err(NonoError::PackageInstall(format!(
+                                "write_file: refusing to overwrite '{}' — \
+                                 file already exists and was not written by a \
+                                 managed pack. Move/remove it manually then re-pull.",
+                                dest_path.display()
+                            )));
+                        }
                     }
                     Some(prior) if prior != &current_hash => {
                         return Err(NonoError::PackageInstall(format!(
@@ -2072,6 +2098,72 @@ mod tests {
             assert!(
                 failures[0].record_summary.contains("json_merge"),
                 "summary should identify the directive"
+            );
+        });
+    }
+
+    #[test]
+    fn write_file_force_recovery_accepts_identical_unmanaged_file() {
+        with_fake_home(|home| {
+            let pack = home.join("pack");
+            fs::create_dir_all(&pack).expect("mkdir pack");
+            fs::write(pack.join("file"), "from-pack").expect("seed source");
+            fs::write(home.join("dest"), "from-pack").expect("seed matching dest");
+
+            let ctx = ctx_in(home, pack);
+            let directives = vec![WiringDirective::WriteFile {
+                source: "file".to_string(),
+                dest: "$HOME/dest".to_string(),
+            }];
+            let report = execute_with_options(
+                &directives,
+                &ctx,
+                &HashMap::new(),
+                ExecuteOptions {
+                    allow_unmanaged_identical_write_files: true,
+                },
+            )
+            .expect("identical unmanaged file should be adopted during force recovery");
+
+            assert!(
+                !report.changed,
+                "identical destination should not be rewritten"
+            );
+            assert_eq!(report.records.len(), 1);
+            assert_eq!(
+                fs::read_to_string(home.join("dest")).expect("read"),
+                "from-pack"
+            );
+        });
+    }
+
+    #[test]
+    fn write_file_force_recovery_refuses_mismatched_unmanaged_file() {
+        with_fake_home(|home| {
+            let pack = home.join("pack");
+            fs::create_dir_all(&pack).expect("mkdir pack");
+            fs::write(pack.join("file"), "from-pack").expect("seed source");
+            fs::write(home.join("dest"), "user content").expect("seed user file");
+
+            let ctx = ctx_in(home, pack);
+            let directives = vec![WiringDirective::WriteFile {
+                source: "file".to_string(),
+                dest: "$HOME/dest".to_string(),
+            }];
+            let err = execute_with_options(
+                &directives,
+                &ctx,
+                &HashMap::new(),
+                ExecuteOptions {
+                    allow_unmanaged_identical_write_files: true,
+                },
+            )
+            .expect_err("mismatched unmanaged file must still be refused");
+
+            assert!(err.to_string().contains("refusing to overwrite"));
+            assert_eq!(
+                fs::read_to_string(home.join("dest")).expect("read"),
+                "user content"
             );
         });
     }

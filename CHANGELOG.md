@@ -1,5 +1,123 @@
 # Changelog
 
+## [0.62.0] - 2026-06-07
+
+### Bug Fixes
+
+- *(proxy)* Deny-by-default when network.block is set (#1082) ([#1082](https://github.com/always-further/nono/pull/1082))
+
+
+### Dependencies
+
+- *(deps)* Bump actions/checkout from 6.0.2 to 6.0.3
+
+- *(deps)* Bump docker/setup-qemu-action from 4.0.0 to 4.1.0
+
+- *(deps)* Bump jsonschema from 0.46.4 to 0.46.5
+
+- *(deps)* Bump rustls-native-certs from 0.8.3 to 0.8.4
+
+
+### Features
+
+- *(packaging)* Add automated AUR package publishing (#917) (#1083) ([#1083](https://github.com/always-further/nono/pull/1083))
+
+
+### Miscellaneous
+
+- Release v0.61.2
+
+## [0.61.2] - 2026-06-05
+
+### Bug Fixes
+
+- *(proxy)* Deny-by-default when network.block is set (#1082) ([#1082](https://github.com/always-further/nono/pull/1082))
+
+
+### Dependencies
+
+- *(deps)* Bump actions/checkout from 6.0.2 to 6.0.3
+
+- *(deps)* Bump docker/setup-qemu-action from 4.0.0 to 4.1.0
+
+- *(deps)* Bump jsonschema from 0.46.4 to 0.46.5
+
+- *(deps)* Bump rustls-native-certs from 0.8.3 to 0.8.4
+
+## [0.61.1] - 2026-06-02
+
+### Features
+
+- *(profile)* Allow registry refs in profile extends (#1061) ([#1061](https://github.com/always-further/nono/pull/1061))
+
+## [0.61.0] - 2026-06-02
+
+### Features
+
+- *(diagnostic)* Add profile option to suppress system service diagnostics (#1059) ([#1059](https://github.com/always-further/nono/pull/1059))
+
+
+### Refactoring
+
+- *(network-policy)* Do not enable credentials by default in profiles
+
+## [0.60.0] - 2026-06-01
+
+### Bug Fixes
+
+- *(cli)* Accept cap file under any known temp root for why --self
+
+- Ci
+
+- *(proxy)* Clean up Keychain on trust failure and expand security docs
+
+- *(proxy)* Disambiguate AsRef call on Cow<[u8]> for typed_path compat
+
+- *(proxy)* Detect user-cancelled trust prompts via OSStatus codes
+
+- *(cli)* Limit visible items in denial selector
+
+
+### Build
+
+- Add rpm release artifacts
+
+
+### Documentation
+
+- *(cli)* Update credential injection with bitwarden and custom keyring
+
+
+### Features
+
+- Remove libdbus dependency on linux
+
+- *(proxy)* Align leaf cert expiry with CA and add --proxy-ca-validity flag
+
+- *(proxy)* Add --trust-proxy-ca for macOS system trust store integration
+
+- *(cli)* Introduce interactive denied path selector
+
+- *(wiring)* Support jsonc in wiring directives
+
+
+### Miscellaneous
+
+- Remove PR description file
+
+### Refactoring
+
+- *(proxy)* Consolidate Keychain CA storage to single combined PEM entry
+
+- *(denial-selector)* Extract visible range logic
+
+- *(jsonc)* Centralize jsonc parsing
+
+
+### Style
+
+- *(formatting)* Make expressions more compact
+
 ## [0.59.0] - 2026-05-27
 
 ### Bug Fixes

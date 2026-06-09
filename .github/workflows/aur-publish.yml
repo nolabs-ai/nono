@@ -1,0 +1,168 @@
+name: AUR Publish
+
+on:
+  workflow_run:
+    workflows: ["Release"]
+    types:
+      - completed
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to publish to the AUR (e.g., v0.61.1)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+# Serialize publishes so two close releases cannot race the AUR repository.
+concurrency:
+  group: aur-publish
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    name: Resolve publish parameters
+    runs-on: ubuntu-latest
+    if: >-
+      github.repository == 'always-further/nono' &&
+      ((github.event_name == 'workflow_dispatch') ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success'))
+    outputs:
+      tag: ${{ steps.params.outputs.tag }}
+      publish: ${{ steps.params.outputs.publish }}
+    steps:
+      - name: Compute parameters
+        id: params
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          WR_HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          WD_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "workflow_run" ]; then
+            TAG="$WR_HEAD_BRANCH"
+          else
+            TAG="$WD_TAG"
+          fi
+
+          # Only stable vX.Y.Z release tags are published to the AUR. This
+          # rejects prereleases (alpha/beta/rc) and workflow_run events for
+          # Release runs started from a branch, where head_branch is the
+          # branch name instead of a tag.
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Not a stable release tag: '$TAG' — skipping AUR publish."
+            echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "publish=true" >> "$GITHUB_OUTPUT"
+
+  publish:
+    name: Publish to AUR
+    needs: resolve
+    if: ${{ needs.resolve.outputs.publish == 'true' }}
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:latest
+    steps:
+      # git must be installed before actions/checkout so it produces a real
+      # git checkout; base-devel provides makepkg and sudo, pacman-contrib
+      # provides updpkgsums.
+      - name: Install dependencies
+        run: pacman -Syu --noconfirm --needed base-devel git pacman-contrib openssh
+
+      # The PKGBUILD template and update.sh are always taken from the branch
+      # the workflow runs on (the default branch), not from the release tag:
+      # packaging fixes must flow into the next publish, and tags that predate
+      # this workflow have no packaging/aur directory at all.
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - name: Create build user
+        # makepkg and updpkgsums refuse to run as root. The workspace is
+        # handed to an unprivileged user; safe.directory keeps the
+        # actions/checkout post-job cleanup (running as root) working on it.
+        run: |
+          set -euo pipefail
+          useradd -m builder
+          git config --global --add safe.directory '*'
+          chown -R builder:builder .
+
+      - name: Verify AUR host keys and configure SSH
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          # Official AUR SSH host key fingerprints, published on
+          # https://aur.archlinux.org/ ("The following SSH fingerprints are
+          # used for the AUR"). Every key returned by ssh-keyscan must match
+          # one of these pinned fingerprints or the job fails (no trust on
+          # first use). If Arch Linux rotates its keys, update these values
+          # from that page (see packaging/aur/README.md).
+          expected='SHA256:RFzBCUItH9LZS0cKB5UE6ceAYhBD5C8GeOBip8Z11+4 SHA256:uTa/0PndEgPZTf76e1DFqXKJEXKsn7m9ivhLQtzGOCI SHA256:5s5cIyReIfNNVGRFdDbe3hdYiI5OelHGpw2rOUud3Q8'
+
+          install -d -m 700 -o builder -g builder /home/builder/.ssh
+
+          ssh-keyscan -t ed25519,ecdsa,rsa aur.archlinux.org > /home/builder/.ssh/scanned
+          if [ ! -s /home/builder/.ssh/scanned ]; then
+            echo "::error::ssh-keyscan returned no host keys for aur.archlinux.org"
+            exit 1
+          fi
+
+          while IFS= read -r hostkey; do
+            fp="$(printf '%s\n' "$hostkey" | ssh-keygen -lf - | awk '{print $2}')"
+            if [[ " $expected " != *" $fp "* ]]; then
+              echo "::error::Unexpected SSH host key fingerprint for aur.archlinux.org: $fp"
+              exit 1
+            fi
+            echo "Verified host key: $fp"
+          done < /home/builder/.ssh/scanned
+
+          mv /home/builder/.ssh/scanned /home/builder/.ssh/known_hosts
+
+          # Private key comes from the repository secret; it is written
+          # straight to disk and never echoed to the log.
+          printf '%s\n' "$AUR_SSH_PRIVATE_KEY" > /home/builder/.ssh/aur
+
+          cat > /home/builder/.ssh/config <<'EOF'
+          Host aur.archlinux.org
+            User aur
+            IdentityFile ~/.ssh/aur
+            IdentitiesOnly yes
+            StrictHostKeyChecking yes
+          EOF
+
+          chmod 600 /home/builder/.ssh/aur /home/builder/.ssh/config /home/builder/.ssh/known_hosts
+          chown -R builder:builder /home/builder/.ssh
+
+      - name: Clone AUR repository
+        run: sudo -u builder git clone ssh://aur@aur.archlinux.org/nono-ai-bin.git /home/builder/aur
+
+      - name: Generate PKGBUILD and .SRCINFO
+        env:
+          RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
+        run: sudo -u builder ./packaging/aur/update.sh "$RELEASE_TAG"
+
+      - name: Push to AUR if changed
+        run: |
+          set -euo pipefail
+          install -m 644 -o builder -g builder \
+            packaging/aur/PKGBUILD packaging/aur/.SRCINFO /home/builder/aur/
+          # The version comes from the freshly generated PKGBUILD rather than
+          # from an environment variable: sudo's default policy resets the
+          # environment, and the PKGBUILD value is what actually gets published.
+          sudo -u builder bash -euo pipefail <<'EOS'
+          cd /home/builder/aur
+          ver="$(awk -F= '/^pkgver=/{print $2; exit}' PKGBUILD)"
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "AUR is already up to date with v${ver}; nothing to push."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add PKGBUILD .SRCINFO
+          git commit -m "Update to ${ver}"
+          git push origin master
+          EOS

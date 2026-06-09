@@ -36,6 +36,14 @@ impl ProxyFilter {
         }
     }
 
+    /// Create a strict proxy filter: an empty allowlist denies every host.
+    #[must_use]
+    pub fn new_strict(allowed_hosts: &[String]) -> Self {
+        Self {
+            inner: HostFilter::new_strict(allowed_hosts),
+        }
+    }
+
     /// Create a filter that allows all hosts (except cloud metadata).
     #[must_use]
     pub fn allow_all() -> Self {

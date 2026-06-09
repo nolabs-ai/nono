@@ -1,6 +1,6 @@
 [package]
 name = "nono-proxy"
-version = "0.59.0"
+version = "0.62.0"
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
@@ -18,7 +18,7 @@ default = ["system-keyring"]
 system-keyring = ["nono/system-keyring"]
 
 [dependencies]
-nono = { version = "0.59.0", path = "../nono", default-features = false }
+nono = { version = "0.62.0", path = "../nono", default-features = false }
 tokio.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
@@ -47,7 +47,7 @@ webpki-roots = "1"
 # the rustls crypto provider used elsewhere; `aws_lc_rs` is disabled to avoid
 # a second, redundant crypto stack in the dependency tree.
 rcgen = { version = "0.14", default-features = false, features = ["pem", "ring", "x509-parser"] }
-x509-parser = "0.16"
+x509-parser = "0.18"
 # Read the host's system trust store (used to compose the trust bundle that
 # the sandboxed child consumes via SSL_CERT_FILE / REQUESTS_CA_BUNDLE / etc.).
 # We need full DER certs for PEM emission; webpki-roots only ships parsed

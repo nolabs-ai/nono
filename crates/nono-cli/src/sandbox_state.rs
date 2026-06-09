@@ -285,6 +285,49 @@ fn restore_directory_capability(
 /// Maximum size for capability state files (1 MB is more than enough)
 const MAX_CAP_FILE_SIZE: u64 = 1_048_576;
 
+/// Collect the set of acceptable temp-directory roots a capability state file
+/// may legitimately live under.
+///
+/// The capability file is created by the outer `nono` process under *its*
+/// `std::env::temp_dir()`, but `nono why --self` may run in a child shell whose
+/// `$TMPDIR` was overridden (e.g. Claude Code sets a per-session `/tmp/...`).
+/// Validating against only the reading process's temp dir then rejects a
+/// perfectly valid file. We instead accept any of the known per-user,
+/// OS-provided temp roots:
+///
+/// - `std::env::temp_dir()` — honors the reading process's `$TMPDIR`.
+/// - `/tmp` — canonicalizes to `/private/tmp` on macOS; standard on Linux.
+/// - macOS only: `/var/folders` — canonicalizes to `/private/var/folders`, the
+///   parent of the OS-native per-user temp dir (`/var/folders/.../T/`).
+///
+/// Each root is canonicalized so symlinks (`/tmp` -> `/private/tmp`) resolve;
+/// roots that fail to canonicalize are skipped. This stays within safe Rust and
+/// preserves the security property that `NONO_CAP_FILE` cannot point outside a
+/// trusted temp location. If no root can be canonicalized the set is empty and
+/// the containment check fails closed.
+fn acceptable_temp_roots() -> Vec<PathBuf> {
+    // On macOS the OS-native per-user temp dir lives under `/var/folders`
+    // (e.g. `/var/folders/.../T/`), so include it as an accepted root.
+    #[cfg(target_os = "macos")]
+    let candidates = vec![
+        std::env::temp_dir(),
+        PathBuf::from("/tmp"),
+        PathBuf::from("/var/folders"),
+    ];
+    #[cfg(not(target_os = "macos"))]
+    let candidates = vec![std::env::temp_dir(), PathBuf::from("/tmp")];
+
+    let mut roots: Vec<PathBuf> = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        if let Ok(canonical) = candidate.canonicalize()
+            && !roots.contains(&canonical)
+        {
+            roots.push(canonical);
+        }
+    }
+    roots
+}
+
 /// Validate the NONO_CAP_FILE path for security
 fn validate_cap_file_path(path_str: &str) -> Result<PathBuf> {
     let path = PathBuf::from(path_str);
@@ -301,19 +344,14 @@ fn validate_cap_file_path(path_str: &str) -> Result<PathBuf> {
             reason: format!("failed to canonicalize path: {}", e),
         })?;
 
-    // Must be in system temp directory
-    let temp_dir =
-        std::env::temp_dir()
-            .canonicalize()
-            .map_err(|e| NonoError::CapFileValidation {
-                reason: format!("failed to canonicalize temp directory: {}", e),
-            })?;
-
-    if !canonical.starts_with(&temp_dir) {
+    // Must be under one of the known per-user temp roots. The file may have
+    // been created under a different $TMPDIR than the reading process has, so
+    // we accept any acceptable temp root rather than only the current one.
+    let roots = acceptable_temp_roots();
+    if !roots.iter().any(|root| canonical.starts_with(root)) {
         return Err(NonoError::CapFileValidation {
             reason: format!(
-                "path must be in temp directory ({}), got: {}",
-                temp_dir.display(),
+                "path must be in a temp directory, got: {}",
                 canonical.display()
             ),
         });
@@ -629,6 +667,159 @@ mod tests {
         assert!(
             format!("{err}").contains("sandbox state path drifted"),
             "error should mention path drift"
+        );
+    }
+}
+
+#[cfg(test)]
+mod cap_file_validation_tests {
+    use super::*;
+    use crate::test_env::{ENV_LOCK, EnvVarGuard};
+
+    /// Write a valid `.nono-<hex>.json` capability file into `dir`.
+    fn write_cap_file(dir: &Path) -> PathBuf {
+        let caps = CapabilitySet::new().block_network();
+        let state = SandboxState::from_caps(&caps, &[], &[], &[]);
+        let path = dir.join(".nono-abcdef0123456789.json");
+        state.write_to_file(&path).expect("write cap file");
+        path
+    }
+
+    #[test]
+    fn test_acceptable_temp_roots_non_empty_and_deduped() {
+        let roots = acceptable_temp_roots();
+        assert!(
+            !roots.is_empty(),
+            "should have at least one acceptable temp root"
+        );
+        let mut seen = std::collections::HashSet::new();
+        for root in &roots {
+            assert!(
+                seen.insert(root.clone()),
+                "acceptable_temp_roots must not contain duplicates: {roots:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_acceptable_temp_roots_includes_var_folders_on_macos() {
+        let var_folders = PathBuf::from("/var/folders")
+            .canonicalize()
+            .expect("canonicalize /var/folders");
+        let roots = acceptable_temp_roots();
+        assert!(
+            roots.contains(&var_folders),
+            "macOS roots should include {}, got {roots:?}",
+            var_folders.display()
+        );
+    }
+
+    #[test]
+    fn test_validate_accepts_file_in_tempdir() {
+        let dir = tempfile::tempdir_in("/tmp").expect("tempdir");
+        let path = write_cap_file(dir.path());
+        let path_str = path.to_str().expect("utf8 path");
+
+        let validated = validate_cap_file_path(path_str).expect("valid cap file accepted");
+        let expected = path.canonicalize().expect("canonicalize cap file");
+        assert_eq!(validated, expected);
+    }
+
+    #[test]
+    fn test_validate_accepts_file_when_reading_tmpdir_differs() {
+        // Reproduces issue #1054: the file lives under the system temp dir, but
+        // the reading process's $TMPDIR points somewhere else. Validation must
+        // still accept the file.
+        let _lock = ENV_LOCK.lock().expect("env lock");
+
+        // Anchor both directories under `/tmp` explicitly rather than the
+        // ambient $TMPDIR. `/tmp` is a hardcoded accepted root, so the test is
+        // independent of whatever $TMPDIR the host/CI sets (e.g. a non-standard
+        // `/mnt/ephemeral/tmp` would otherwise leave the file under no root once
+        // $TMPDIR is overridden, spuriously failing this test).
+        let file_dir = tempfile::tempdir_in("/tmp").expect("file tempdir");
+        let path = write_cap_file(file_dir.path());
+        let path_str = path.to_str().expect("utf8 path").to_string();
+
+        // Point $TMPDIR at a *different* existing directory.
+        let other_dir = tempfile::tempdir_in("/tmp").expect("other tempdir");
+        let other = other_dir.path().to_str().expect("utf8 other");
+        let _env = EnvVarGuard::set_all(&[("TMPDIR", other)]);
+
+        // The cap file's canonical path is not under the overridden $TMPDIR, but
+        // it is under the canonicalized `/tmp` root, so it is accepted.
+        validate_cap_file_path(&path_str)
+            .expect("cap file under a known temp root accepted despite TMPDIR mismatch");
+    }
+
+    #[test]
+    fn test_validate_rejects_relative_path() {
+        let err = validate_cap_file_path(".nono-abcdef0123456789.json")
+            .expect_err("relative path rejected");
+        assert!(
+            format!("{err}").contains("must be absolute"),
+            "error should mention absolute path requirement: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_nonexistent_file() {
+        let dir = tempfile::tempdir_in("/tmp").expect("tempdir");
+        let missing = dir.path().join(".nono-0000000000000000.json");
+        let err = validate_cap_file_path(missing.to_str().expect("utf8"))
+            .expect_err("nonexistent file rejected");
+        assert!(
+            format!("{err}").contains("canonicalize"),
+            "error should mention canonicalize failure: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_path_outside_temp() {
+        // /etc/hosts exists on both macOS and Linux and is outside any temp root.
+        if !Path::new("/etc/hosts").exists() {
+            return;
+        }
+        let err = validate_cap_file_path("/etc/hosts").expect_err("path outside temp dir rejected");
+        assert!(
+            format!("{err}").contains("temp directory"),
+            "error should mention temp directory: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_wrong_filename_pattern() {
+        // Anchor under `/tmp` so the test is immune to parallel tests that
+        // modify `$TMPDIR` — a bare `tempdir()` would inherit the altered
+        // `$TMPDIR` and the backing directory may be deleted by the other
+        // test's TempDir drop, causing `canonicalize` to fail with ENOENT
+        // before the filename-pattern check is reached.
+        let dir = tempfile::tempdir_in("/tmp").expect("tempdir");
+        let caps = CapabilitySet::new().block_network();
+        let state = SandboxState::from_caps(&caps, &[], &[], &[]);
+        let path = dir.path().join("not-a-nono-file.json");
+        state.write_to_file(&path).expect("write file");
+
+        let err = validate_cap_file_path(path.to_str().expect("utf8"))
+            .expect_err("wrong filename pattern rejected");
+        assert!(
+            format!("{err}").contains(".nono-"),
+            "error should mention filename pattern: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_directory() {
+        let dir = tempfile::tempdir_in("/tmp").expect("tempdir");
+        let err = validate_cap_file_path(dir.path().to_str().expect("utf8"))
+            .expect_err("directory rejected");
+        // A directory in a temp root fails the filename-pattern check before the
+        // regular-file check; either rejection is acceptable.
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("regular file") || msg.contains(".nono-"),
+            "directory should be rejected: {msg}"
         );
     }
 }

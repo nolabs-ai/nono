@@ -1,6 +1,6 @@
 [package]
 name = "nono-cli"
-version = "0.59.0"
+version = "0.62.0"
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
@@ -41,8 +41,8 @@ system-keyring = ["dep:keyring", "nono/system-keyring", "nono-proxy/system-keyri
 test-trust-overrides = []
 
 [dependencies]
-nono = { version = "0.59.0", path = "../nono", default-features = false }
-nono-proxy = { version = "0.59.0", path = "../nono-proxy", default-features = false }
+nono = { version = "0.62.0", path = "../nono", default-features = false }
+nono-proxy = { version = "0.62.0", path = "../nono-proxy", default-features = false }
 clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"
 colored = "3"
@@ -101,7 +101,7 @@ nix = { workspace = true, features = ["process", "signal", "fs", "user", "term"]
 dns-lookup = "2"
 keyring = { version = "3", features = ["apple-native"], optional = true, default-features = false }
 security-framework = "3"
-x509-parser = "0.16"
+x509-parser = "0.18"
 
 [build-dependencies]
 toml.workspace = true

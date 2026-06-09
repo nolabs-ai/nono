@@ -6,12 +6,16 @@
 //! and Merkle root.
 
 use crate::supervisor::{AuditEntry, UrlOpenRequest};
-use crate::undo::{AuditIntegritySummary, ContentHash, NetworkAuditEvent};
+use crate::undo::{
+    AuditAttestationSummary, AuditIntegritySummary, ContentHash, NetworkAuditEvent, SessionMetadata,
+};
 use crate::{NonoError, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 /// Filename used for per-session audit event logs.
@@ -27,6 +31,10 @@ pub const MERKLE_NODE_DOMAIN_ALPHA: &[u8] = b"nono.audit.merkle.alpha\n";
 pub const MERKLE_SCHEME_ALPHA: &str = "alpha";
 /// Hash algorithm label emitted by alpha verification.
 pub const AUDIT_HASH_ALGORITHM: &str = "sha256";
+/// Domain separator for alpha session digests.
+pub const SESSION_DIGEST_DOMAIN_ALPHA: &[u8] = b"nono.audit.session-digest.alpha\n";
+/// Domain separator for alpha ledger chain links.
+pub const LEDGER_CHAIN_DOMAIN_ALPHA: &[u8] = b"nono.audit.ledger.chain.alpha\n";
 
 /// Event payloads written into the alpha audit log.
 #[derive(Clone, Serialize, Deserialize)]
@@ -111,6 +119,73 @@ pub struct AuditVerificationResult {
     pub event_count_matches: bool,
     /// True when all record-level checks passed.
     pub records_verified: bool,
+}
+
+#[derive(Serialize)]
+struct SessionDigestPayload<'a> {
+    session_id: &'a str,
+    started: &'a str,
+    ended: &'a Option<String>,
+    command: &'a [String],
+    executable_identity: Option<ExecutableIdentityDigestPayload>,
+    tracked_paths: Vec<Vec<u8>>,
+    snapshot_count: u32,
+    exit_code: &'a Option<i32>,
+    merkle_roots: &'a [ContentHash],
+    network_events: &'a [NetworkAuditEvent],
+    audit_event_count: u64,
+    audit_integrity: &'a Option<AuditIntegritySummary>,
+    audit_attestation: &'a Option<AuditAttestationSummary>,
+}
+
+#[derive(Serialize)]
+struct ExecutableIdentityDigestPayload {
+    resolved_path: Vec<u8>,
+    sha256: ContentHash,
+}
+
+/// One line of the append-only session ledger.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LedgerRecord {
+    /// Monotonic ledger sequence number.
+    pub sequence: u64,
+    /// Previous ledger record's chain hash, or `None` for the first record.
+    pub prev_chain: Option<ContentHash>,
+    /// Session ID committed by this ledger entry.
+    pub session_id: String,
+    /// Digest over protected session metadata fields.
+    pub session_digest: ContentHash,
+    /// Session completion timestamp used in the ledger link payload.
+    pub completed_at: String,
+    /// Rolling ledger chain hash.
+    pub chain_hash: ContentHash,
+}
+
+#[derive(Serialize)]
+struct LedgerLinkPayload<'a> {
+    sequence: u64,
+    session_id: &'a str,
+    session_digest: ContentHash,
+    completed_at: &'a str,
+}
+
+/// Result of checking a session against an append-only ledger.
+#[derive(Debug, Clone, Serialize)]
+pub struct LedgerVerificationResult {
+    /// Hash algorithm used by the ledger.
+    pub hash_algorithm: String,
+    /// Number of verified ledger entries.
+    pub entry_count: u64,
+    /// Expected digest for the provided session metadata.
+    pub session_digest: ContentHash,
+    /// Whether the session ID was present in the ledger.
+    pub session_found: bool,
+    /// Whether the ledger digest matched the current session metadata digest.
+    pub session_digest_matches: bool,
+    /// Whether every ledger chain link verified.
+    pub ledger_chain_verified: bool,
+    /// Final ledger chain head.
+    pub ledger_head: Option<ContentHash>,
 }
 
 /// Position of a sibling hash in an audit Merkle inclusion proof.
@@ -348,7 +423,7 @@ pub fn build_inclusion_proof(
     let mut index = leaf_index;
     let mut level: Vec<[u8; 32]> = leaves.iter().map(|leaf| *leaf.as_bytes()).collect();
     while level.len() > 1 {
-        let sibling_index = if index % 2 == 0 {
+        let sibling_index = if index.is_multiple_of(2) {
             index.saturating_add(1)
         } else {
             index.saturating_sub(1)
@@ -399,8 +474,8 @@ pub fn verify_inclusion_proof(proof: &AuditInclusionProof) -> bool {
     let mut siblings = proof.siblings.iter();
 
     while width > 1 {
-        let expected_direction = if index % 2 == 0 {
-            if index + 1 < width {
+        let expected_direction = if index.is_multiple_of(2) {
+            if index.saturating_add(1) < width {
                 Some(AuditProofDirection::Right)
             } else {
                 None
@@ -439,6 +514,249 @@ fn hash_merkle_node(left: [u8; 32], right: [u8; 32]) -> [u8; 32] {
     hasher.update(left);
     hasher.update(right);
     hasher.finalize().into()
+}
+
+/// Compute the alpha session digest used by the append-only ledger.
+pub fn compute_session_digest(metadata: &SessionMetadata) -> Result<ContentHash> {
+    let payload = SessionDigestPayload {
+        session_id: &metadata.session_id,
+        started: &metadata.started,
+        ended: &metadata.ended,
+        command: &metadata.command,
+        executable_identity: metadata.executable_identity.as_ref().map(|identity| {
+            ExecutableIdentityDigestPayload {
+                resolved_path: path_bytes(&identity.resolved_path),
+                sha256: identity.sha256,
+            }
+        }),
+        tracked_paths: metadata
+            .tracked_paths
+            .iter()
+            .map(|path| path_bytes(path))
+            .collect(),
+        snapshot_count: metadata.snapshot_count,
+        exit_code: &metadata.exit_code,
+        merkle_roots: &metadata.merkle_roots,
+        network_events: &metadata.network_events,
+        audit_event_count: metadata.audit_event_count,
+        audit_integrity: &metadata.audit_integrity,
+        audit_attestation: &metadata.audit_attestation,
+    };
+    let bytes = serde_json::to_vec(&payload).map_err(|e| {
+        NonoError::Snapshot(format!("Failed to serialize session digest payload: {e}"))
+    })?;
+    let mut hasher = Sha256::new();
+    hasher.update(SESSION_DIGEST_DOMAIN_ALPHA);
+    hasher.update(bytes);
+    Ok(ContentHash::from_bytes(hasher.finalize().into()))
+}
+
+#[cfg(unix)]
+fn path_bytes(path: &std::path::Path) -> Vec<u8> {
+    path.as_os_str().as_bytes().to_vec()
+}
+
+#[cfg(not(unix))]
+fn path_bytes(path: &std::path::Path) -> Vec<u8> {
+    path.to_string_lossy().into_owned().into_bytes()
+}
+
+/// Validate a session ID before committing it to the global audit ledger.
+pub fn validate_ledger_session_id(session_id: &str) -> Result<()> {
+    let valid = !session_id.is_empty()
+        && session_id.len() <= 64
+        && session_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'));
+    if valid {
+        Ok(())
+    } else {
+        Err(NonoError::ConfigParse(format!(
+            "invalid audit session id: {session_id}"
+        )))
+    }
+}
+
+/// Append one session to an already opened and locked ledger file.
+///
+/// The caller owns storage decisions: where the ledger lives, whether the
+/// file is locked, and how the parent directory is created.
+pub fn append_session_to_ledger_file(
+    file: &mut std::fs::File,
+    metadata: &SessionMetadata,
+) -> Result<LedgerRecord> {
+    validate_ledger_session_id(&metadata.session_id)?;
+
+    let mut contents = String::new();
+    file.seek(SeekFrom::Start(0))
+        .map_err(|e| NonoError::Snapshot(format!("Failed to seek audit ledger: {e}")))?;
+    file.read_to_string(&mut contents)
+        .map_err(|e| NonoError::Snapshot(format!("Failed to read audit ledger: {e}")))?;
+
+    let mut previous_chain = None;
+    let mut next_sequence = 0u64;
+    for (index, line) in contents.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let record: LedgerRecord = serde_json::from_str(line).map_err(|e| {
+            NonoError::Snapshot(format!(
+                "Failed to parse audit ledger line {}: {e}",
+                index.saturating_add(1)
+            ))
+        })?;
+        previous_chain = Some(record.chain_hash);
+        next_sequence = record.sequence.saturating_add(1);
+    }
+
+    let session_digest = compute_session_digest(metadata)?;
+    let completed_at = metadata
+        .ended
+        .clone()
+        .unwrap_or_else(|| metadata.started.clone());
+    let chain_hash = hash_ledger_link(
+        previous_chain.as_ref(),
+        next_sequence,
+        &metadata.session_id,
+        &session_digest,
+        &completed_at,
+    )?;
+    let record = LedgerRecord {
+        sequence: next_sequence,
+        prev_chain: previous_chain,
+        session_id: metadata.session_id.clone(),
+        session_digest,
+        completed_at,
+        chain_hash,
+    };
+
+    file.seek(SeekFrom::End(0))
+        .map_err(|e| NonoError::Snapshot(format!("Failed to seek audit ledger for append: {e}")))?;
+    let line = serde_json::to_vec(&record).map_err(|e| {
+        NonoError::Snapshot(format!("Failed to serialize audit ledger record: {e}"))
+    })?;
+    file.write_all(&line)
+        .and_then(|_| file.write_all(b"\n"))
+        .and_then(|_| file.sync_data())
+        .map_err(|e| NonoError::Snapshot(format!("Failed to append audit ledger record: {e}")))?;
+
+    Ok(record)
+}
+
+/// Verification result for a missing ledger file.
+pub fn missing_ledger_verification_result(
+    metadata: &SessionMetadata,
+) -> Result<LedgerVerificationResult> {
+    Ok(LedgerVerificationResult {
+        hash_algorithm: AUDIT_HASH_ALGORITHM.to_string(),
+        entry_count: 0,
+        session_digest: compute_session_digest(metadata)?,
+        session_found: false,
+        session_digest_matches: false,
+        ledger_chain_verified: false,
+        ledger_head: None,
+    })
+}
+
+/// Verify an opened ledger reader and check whether it contains `metadata`.
+pub fn verify_session_in_ledger_reader<R: BufRead>(
+    reader: R,
+    metadata: &SessionMetadata,
+) -> Result<LedgerVerificationResult> {
+    let expected_digest = compute_session_digest(metadata)?;
+
+    let mut previous_chain = None;
+    let mut entry_count = 0u64;
+    let mut ledger_head = None;
+    let mut session_found = false;
+    let mut session_digest_matches = false;
+
+    for (index, line) in reader.lines().enumerate() {
+        let line =
+            line.map_err(|e| NonoError::Snapshot(format!("Failed to read audit ledger: {e}")))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let record: LedgerRecord = serde_json::from_str(&line).map_err(|e| {
+            NonoError::Snapshot(format!(
+                "Failed to parse audit ledger line {}: {e}",
+                index.saturating_add(1)
+            ))
+        })?;
+        if record.sequence != entry_count {
+            return Err(NonoError::Snapshot(format!(
+                "Audit ledger sequence mismatch at line {}",
+                index.saturating_add(1)
+            )));
+        }
+        if record.prev_chain != previous_chain {
+            return Err(NonoError::Snapshot(format!(
+                "Audit ledger prev_chain mismatch at line {}",
+                index.saturating_add(1)
+            )));
+        }
+        let chain_hash = hash_ledger_link(
+            previous_chain.as_ref(),
+            record.sequence,
+            &record.session_id,
+            &record.session_digest,
+            &record.completed_at,
+        )?;
+        if chain_hash != record.chain_hash {
+            return Err(NonoError::Snapshot(format!(
+                "Audit ledger chain hash mismatch at line {}",
+                index.saturating_add(1)
+            )));
+        }
+
+        if record.session_id == metadata.session_id {
+            session_found = true;
+            session_digest_matches = record.session_digest == expected_digest;
+        }
+
+        previous_chain = Some(record.chain_hash);
+        ledger_head = Some(record.chain_hash);
+        entry_count = entry_count.saturating_add(1);
+    }
+
+    Ok(LedgerVerificationResult {
+        hash_algorithm: AUDIT_HASH_ALGORITHM.to_string(),
+        entry_count,
+        session_digest: expected_digest,
+        session_found,
+        session_digest_matches,
+        ledger_chain_verified: true,
+        ledger_head,
+    })
+}
+
+fn hash_ledger_link(
+    previous: Option<&ContentHash>,
+    sequence: u64,
+    session_id: &str,
+    session_digest: &ContentHash,
+    completed_at: &str,
+) -> Result<ContentHash> {
+    let payload = LedgerLinkPayload {
+        sequence,
+        session_id,
+        session_digest: *session_digest,
+        completed_at,
+    };
+    let payload_bytes = serde_json::to_vec(&payload).map_err(|e| {
+        NonoError::Snapshot(format!(
+            "Failed to serialize audit ledger link payload: {e}"
+        ))
+    })?;
+    let mut hasher = Sha256::new();
+    hasher.update(LEDGER_CHAIN_DOMAIN_ALPHA);
+    if let Some(prev) = previous {
+        hasher.update(prev.as_bytes());
+    } else {
+        hasher.update([0u8; 32]);
+    }
+    hasher.update(payload_bytes);
+    Ok(ContentHash::from_bytes(hasher.finalize().into()))
 }
 
 /// Verify an alpha audit log and optionally cross-check stored metadata.
@@ -608,7 +926,8 @@ mod tests {
     use super::*;
     use crate::AccessMode;
     use crate::supervisor::{ApprovalDecision, CapabilityRequest};
-    use crate::undo::{NetworkAuditDecision, NetworkAuditMode};
+    use crate::undo::{ExecutableIdentity, NetworkAuditDecision, NetworkAuditMode};
+    use std::io::BufReader;
     use std::time::{Duration, UNIX_EPOCH};
 
     #[test]
@@ -789,5 +1108,175 @@ mod tests {
         proof.leaf_hash = ContentHash::from_bytes([9; 32]);
 
         assert!(!verify_inclusion_proof(&proof));
+    }
+
+    fn sample_metadata(id: &str) -> SessionMetadata {
+        SessionMetadata {
+            session_id: id.to_string(),
+            started: "2026-04-21T20:00:00Z".to_string(),
+            ended: Some("2026-04-21T20:00:01Z".to_string()),
+            command: vec!["/bin/pwd".to_string()],
+            executable_identity: None,
+            tracked_paths: vec![PathBuf::from("/tmp/work")],
+            snapshot_count: 0,
+            exit_code: Some(0),
+            merkle_roots: Vec::new(),
+            network_events: Vec::new(),
+            audit_event_count: 2,
+            audit_integrity: None,
+            audit_attestation: None,
+        }
+    }
+
+    #[test]
+    fn ledger_appends_and_verifies_session_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.ndjson");
+        let mut file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .unwrap();
+
+        let meta = sample_metadata("20260421-200000-11111");
+        append_session_to_ledger_file(&mut file, &meta).unwrap();
+
+        let reader = BufReader::new(std::fs::File::open(&path).unwrap());
+        let verified = verify_session_in_ledger_reader(reader, &meta).unwrap();
+        assert!(verified.session_found);
+        assert!(verified.session_digest_matches);
+        assert!(verified.ledger_chain_verified);
+        assert_eq!(verified.entry_count, 1);
+    }
+
+    #[test]
+    fn ledger_rejects_malformed_session_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.ndjson");
+        let mut file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .unwrap();
+        let meta = sample_metadata("real-token\\|real-key");
+
+        let err = match append_session_to_ledger_file(&mut file, &meta) {
+            Ok(_) => panic!("malformed session id should be rejected"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("invalid audit session id"));
+    }
+
+    #[test]
+    fn session_digest_changes_when_protected_fields_change() {
+        let base = SessionMetadata {
+            session_id: "20260421-200000-11111".to_string(),
+            started: "2026-04-21T20:00:00Z".to_string(),
+            ended: Some("2026-04-21T20:00:01Z".to_string()),
+            command: vec!["/bin/pwd".to_string()],
+            executable_identity: Some(ExecutableIdentity {
+                resolved_path: PathBuf::from("/bin/pwd"),
+                sha256: ContentHash::from_bytes([9; 32]),
+            }),
+            tracked_paths: vec![PathBuf::from("/tmp/work")],
+            snapshot_count: 3,
+            exit_code: Some(7),
+            merkle_roots: vec![ContentHash::from_bytes([1; 32])],
+            network_events: vec![NetworkAuditEvent {
+                timestamp_unix_ms: 5,
+                mode: NetworkAuditMode::Connect,
+                decision: NetworkAuditDecision::Allow,
+                route_id: None,
+                auth_mechanism: None,
+                auth_outcome: None,
+                managed_credential_active: None,
+                injection_mode: None,
+                denial_category: None,
+                target: "example.com".to_string(),
+                port: Some(443),
+                method: Some("GET".to_string()),
+                path: Some("/".to_string()),
+                status: Some(200),
+                reason: None,
+            }],
+            audit_event_count: 9,
+            audit_integrity: Some(AuditIntegritySummary {
+                hash_algorithm: "sha256".to_string(),
+                event_count: 9,
+                chain_head: ContentHash::from_bytes([2; 32]),
+                merkle_root: ContentHash::from_bytes([3; 32]),
+            }),
+            audit_attestation: None,
+        };
+        let base_digest = compute_session_digest(&base).unwrap();
+
+        let mut changed = base.clone();
+        changed.session_id.push('x');
+        assert_ne!(base_digest, compute_session_digest(&changed).unwrap());
+
+        let mut changed = base.clone();
+        changed.network_events[0].target = "other.example.com".to_string();
+        assert_ne!(base_digest, compute_session_digest(&changed).unwrap());
+
+        let mut changed = base.clone();
+        changed.audit_integrity = Some(AuditIntegritySummary {
+            hash_algorithm: "sha256".to_string(),
+            event_count: 9,
+            chain_head: ContentHash::from_bytes([8; 32]),
+            merkle_root: ContentHash::from_bytes([3; 32]),
+        });
+        assert_ne!(base_digest, compute_session_digest(&changed).unwrap());
+    }
+
+    /// Golden vectors shared with the Python port in
+    /// nono-py/tests/test_audit.py (TestRustGoldenVectors keeps the same
+    /// values). If this test fails, the wire format diverged across
+    /// language bindings — fix the divergence, never the vector.
+    #[test]
+    fn rust_compatibility_golden_vectors() {
+        let meta = sample_metadata("20260421-200000-11111");
+        assert_eq!(
+            compute_session_digest(&meta).unwrap().to_string(),
+            "3a1ed53d426d6ea2544cec6cf6b95ccdc31fda4570d86931239ee0f7d7d39012"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(dir.path().join("ledger.ndjson"))
+            .unwrap();
+        let record = append_session_to_ledger_file(&mut file, &meta).unwrap();
+        assert_eq!(
+            record.chain_hash.to_string(),
+            "8b6dbc155d44df05e6b5e9948fb8fff142222b4b41fb37284fb0d1217000e9bb"
+        );
+
+        let leaves = vec![
+            ContentHash::from_bytes([1; 32]),
+            ContentHash::from_bytes([2; 32]),
+            ContentHash::from_bytes([3; 32]),
+            ContentHash::from_bytes([4; 32]),
+            ContentHash::from_bytes([5; 32]),
+        ];
+        let proof = build_inclusion_proof(&leaves, 2).unwrap();
+        assert_eq!(
+            serde_json::to_string(&proof).unwrap(),
+            concat!(
+                r#"{"leaf_index":2,"leaf_count":5,"#,
+                r#""leaf_hash":"0303030303030303030303030303030303030303030303030303030303030303","#,
+                r#""merkle_root":"87f9319b8dbb3d3fd55d419aabf3c218aafd2dfd82d5e30fb22e8e89c10c0160","#,
+                r#""siblings":[{"direction":"right","hash":"0404040404040404040404040404040404040404040404040404040404040404"},"#,
+                r#"{"direction":"left","hash":"85fb11ff61817c3aa118af30f054a3ea63c042902722cf8ae35e704fff9624fe"},"#,
+                r#"{"direction":"right","hash":"0505050505050505050505050505050505050505050505050505050505050505"}]}"#
+            )
+        );
     }
 }

@@ -6117,7 +6117,7 @@ mod tests {
     fn test_top_level_schema_field_allowed_in_profile() {
         let profile: Profile = serde_json::from_str(
             r#"{
-                "$schema": "https://nono.dev/schemas/nono-profile.schema.json",
+                "$schema": "https://nono.sh/schemas/nono-profile.schema.json",
                 "meta": { "name": "schema-ok" }
             }"#,
         )

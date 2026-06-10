@@ -133,8 +133,8 @@ pub enum Commands {
 {after-help}")]
     #[command(after_help = "\x1b[1mEXAMPLES\x1b[0m
   nono run --allow . claude                    # Read/write current dir, run claude
-  nono run --profile claude-code claude        # Use a profile
-  nono run --profile claude-code --allow-domain api.openai.com claude
+  nono run --profile always-further/claude claude        # Use a profile
+  nono run --profile always-further/claude --allow-domain api.openai.com claude
                                                # Restrict outbound access to listed domains
   nono run --read ./src --write ./output cargo build
                                                # Separate read/write permissions
@@ -155,7 +155,7 @@ pub enum Commands {
 {after-help}")]
     #[command(after_help = "\x1b[1mEXAMPLES\x1b[0m
   nono shell --allow .                         # Shell with read/write to current dir
-  nono shell --profile claude-code             # Use a named profile
+  nono shell --profile always-further/claude             # Use a named profile
   nono shell --allow . --shell /bin/zsh        # Override shell binary
 ")]
     Shell(Box<ShellArgs>),

@@ -156,7 +156,7 @@ To have the supervisor sign the completed session audit record, use `--audit-sig
 nono run --audit-sign-key default --allow-cwd -- my-agent
 
 # Sign with an explicit secret backend reference
-nono run --audit-sign-key op://Development/Nono/audit-key --profile claude-code -- claude
+nono run --audit-sign-key op://Development/Nono/audit-key --profile always-further/claude -- claude
 ```
 
 The signing key is loaded by the trusted supervisor before sandbox activation. After the session ends, the resulting keyed DSSE bundle is written into the audit session directory as `audit-attestation.bundle`, and a summary is stored in `session.json`.

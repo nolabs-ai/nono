@@ -24,7 +24,7 @@ Profiles simplify this:
 
 ```bash
 # With profiles - concise and auditable
-nono run --profile claude-code -- claude
+nono run --profile always-further/claude -- claude
 ```
 
 ### Profile Sources
@@ -306,7 +306,7 @@ This allows access to `~/.docker` even though `deny_credentials` blocks it by de
 This is equivalent to the CLI flag `--bypass-protection`:
 
 ```bash
-nono run --profile opencode --allow ~/.docker --bypass-protection ~/.docker -- opencode
+nono run --profile always-further/opencode --allow ~/.docker --bypass-protection ~/.docker -- opencode
 ```
 
 #### Suppressing Save Suggestions Without Granting Access
@@ -489,13 +489,13 @@ CLI flags always take precedence over profile settings:
 
 ```bash
 # Use claude-code profile but block network
-nono run --profile claude-code --block-net -- claude
+nono run --profile always-further/claude --block-net -- claude
 
 # Use claude-code profile but add a custom domain
-nono run --profile claude-code --allow-domain custom-api.example.com -- claude
+nono run --profile always-further/claude --allow-domain custom-api.example.com -- claude
 
 # Add extra directory access
-nono run --profile claude-code --allow ~/other-project -- claude
+nono run --profile always-further/claude --allow ~/other-project -- claude
 ```
 
 To keep a base profile but clear an inherited network profile, set `network.network_profile` to `null` in the child:
@@ -662,7 +662,7 @@ The base profile that all other profiles extend. Provides system path access, de
 ### claude-code
 
 ```bash
-nono run --profile claude-code -- claude
+nono run --profile always-further/claude -- claude
 ```
 
 **Groups:** `claude_code_macos`, `claude_code_linux`, `user_caches_macos`, `claude_cache_linux`, `node_runtime`, `rust_runtime`, `python_runtime`, `vscode_macos`, `vscode_linux`, `nix_runtime`, `git_config`, `unlink_protection` (plus `default` groups)
@@ -678,7 +678,7 @@ nono run --profile claude-code -- claude
 ### codex
 
 ```bash
-nono run --profile codex -- codex
+nono run --profile always-further/codex -- codex
 ```
 
 **Groups:** `codex_macos`, `node_runtime`, `rust_runtime`, `python_runtime`, `nix_runtime`, `git_config`, `unlink_protection` (plus `default` groups)
@@ -694,7 +694,7 @@ nono run --profile codex -- codex
 ### opencode
 
 ```bash
-nono run --profile opencode -- opencode
+nono run --profile always-further/opencode -- opencode
 ```
 
 **Groups:** `user_caches_macos`, `user_caches_linux`, `node_runtime`, `opencode_linux`, `git_config`, `unlink_protection` (plus `default` groups)

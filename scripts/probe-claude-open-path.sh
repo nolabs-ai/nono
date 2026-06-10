@@ -66,6 +66,6 @@ echo
 env \
     PATH="$PROBE_DIR:$PATH" \
     NONO_OPEN_WRAPPER_LOG="$WRAPPER_LOG" \
-    "$NONO_BIN" run --profile claude-code --allow-cwd --allow-launch-services \
+    "$NONO_BIN" run --profile always-further/claude --allow-cwd --allow-launch-services \
     --read-file "$CLAUDE_BIN" -- \
     "$CLAUDE_BIN"

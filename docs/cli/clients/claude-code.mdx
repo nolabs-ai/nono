@@ -16,14 +16,14 @@ Claude Code includes its own sandboxing, but Anthropic documents an intentional 
 ## Quick Start
 
 ```bash
-nono run --profile claude-code -- claude
+nono run --profile always-further/claude -- claude
 ```
 
 <Warning>
 **macOS users:** Claude Code needs LaunchServices access when a session will need browser login. `nono` now auto-enables this for the `claude-code` profile when it does not detect refresh-capable local auth. You can also pass the flag explicitly for first use or `claude /login`:
 
 ```bash
-nono run --profile claude-code --allow-launch-services -- claude
+nono run --profile always-further/claude --allow-launch-services -- claude
 ```
 After login completes, rerun without `--allow-launch-services` if you no longer need browser-opening help for that session.
 See [OAuth2 Login](#oauth2-login) for details.
@@ -84,12 +84,12 @@ If you want to inherit the Claude Code profile but remove its network filtering,
 Then run:
 
 ```bash
-nono run --profile claude-code-netopen -- claude
+nono run --profile always-further/claude-netopen -- claude
 ```
 
 **Usage:**
 ```bash
-nono run --profile claude-code -- claude
+nono run --profile always-further/claude -- claude
 ```
 
 <Note>
@@ -103,7 +103,7 @@ If you use multiple Claude Code configurations via the `CLAUDE_CONFIG_DIR` envir
 ```bash
 export CLAUDE_CONFIG_DIR=~/.claude-work
 
-nono run --profile claude-code \
+nono run --profile always-further/claude \
   --allow ~/.claude-work \
   --allow ~/.claude-work.lock \
   -- claude
@@ -147,7 +147,7 @@ secret-tool store --label="nono: anthropic_api_key" service nono username anthro
 
 Then run with secrets:
 ```bash
-nono run --profile claude-code --env-credential anthropic_api_key -- claude
+nono run --profile always-further/claude --env-credential anthropic_api_key -- claude
 ```
 
 See [Credential Injection](/cli/features/credential-injection) for full documentation.
@@ -173,7 +173,7 @@ nono run --read . --read ~/.claude --allow-file ~/.claude.json -- claude
 If you want to prevent any outbound connections (e.g., for reviewing local code without API calls):
 
 ```bash
-nono run --profile claude-code --block-net -- claude
+nono run --profile always-further/claude --block-net -- claude
 ```
 
 ### Add Extra Domains
@@ -181,7 +181,7 @@ nono run --profile claude-code --block-net -- claude
 If Claude Code needs to reach a domain not in the built-in network profile:
 
 ```bash
-nono run --profile claude-code --allow-domain my-internal-api.example.com -- claude
+nono run --profile always-further/claude --allow-domain my-internal-api.example.com -- claude
 ```
 
 ## OAuth2 Login
@@ -196,13 +196,13 @@ The `claude-code` profile includes an origin allowlist that controls which URLs 
 On Linux, no additional flags are needed:
 
 ```bash
-nono run --profile claude-code -- claude
+nono run --profile always-further/claude -- claude
 ```
 
 On macOS, `nono` auto-enables LaunchServices for the `claude-code` profile when no refresh-capable local auth is detected. You can also enable it explicitly for the login session:
 
 ```bash
-nono run --profile claude-code --allow-launch-services -- claude
+nono run --profile always-further/claude --allow-launch-services -- claude
 ```
 
 After login completes, rerun without `--allow-launch-services` unless you still need browser-opening help for that session.
@@ -264,7 +264,7 @@ echo "$PATH" | tr ':' '\n'
 Grant read access to any `~/` entry that appears before the directory containing your LSP binary:
 
 ```bash
-nono run --profile claude-code \
+nono run --profile always-further/claude \
   --read ~/.cargo/bin \
   --read ~/.local/bin \
   -- claude
@@ -309,7 +309,7 @@ Save as `~/.config/nono/profiles/claude-code-secretive.json`:
 
 **Usage:**
 ```bash
-nono run --profile claude-code-secretive --allow-cwd -- claude
+nono run --profile always-further/claude-secretive --allow-cwd -- claude
 ```
 
 The profile extends the standard Claude Code profile with:
@@ -326,13 +326,13 @@ CLI flags always take precedence over profile settings:
 
 ```bash
 # Use profile but add extra directory access
-nono run --profile claude-code --allow ~/other-project -- claude
+nono run --profile always-further/claude --allow ~/other-project -- claude
 
 # Use profile but block network
-nono run --profile claude-code --block-net -- claude
+nono run --profile always-further/claude --block-net -- claude
 
 # Use profile but add a custom domain
-nono run --profile claude-code --allow-domain custom-api.example.com -- claude
+nono run --profile always-further/claude --allow-domain custom-api.example.com -- claude
 ```
 
 See [Security Profiles](/cli/features/profiles-groups) for details on profile format and precedence rules.
@@ -341,7 +341,7 @@ See [Security Profiles](/cli/features/profiles-groups) for details on profile fo
 
 As of v0.43, the `claude-code` profile is no longer compiled into the CLI. It's distributed as a signed registry pack at `always-further/claude` along with a Claude Code plugin that provides sandbox-aware diagnostics.
 
-The first time you run `nono run --profile claude-code -- claude`, nono prompts to install the pack:
+The first time you run `nono run --profile always-further/claude -- claude`, nono prompts to install the pack:
 
 ```
   ⊕  Install always-further/claude?
@@ -375,7 +375,7 @@ The pack store is the single source of truth — every Claude-side path is a sym
 
 ### Subsequent Runs
 
-Once installed, `nono run --profile claude-code -- claude` runs silently — no prompt. nono's profile resolver finds `claude-code` in the pack store and re-asserts the marketplace wiring on every run, so deleting any of the symlinks above is recovered transparently on the next `nono run`.
+Once installed, `nono run --profile always-further/claude -- claude` runs silently — no prompt. nono's profile resolver finds `claude-code` in the pack store and re-asserts the marketplace wiring on every run, so deleting any of the symlinks above is recovered transparently on the next `nono run`.
 
 If a newer version of the pack is available, nono prints a one-line hint after the capabilities block:
 
@@ -468,4 +468,4 @@ These commands are read-only diagnostics — none of them modify state — so it
 nono remove always-further/claude
 ```
 
-This removes the pack store directory, the marketplace dir, the cache subtree, the entries in `known_marketplaces.json` / `installed_plugins.json`, and the `enabledPlugins["nono@always-further"]` toggle. Claude Code's view of the world is restored to what it was before the install. Re-running `nono run --profile claude-code` will prompt to re-install.
+This removes the pack store directory, the marketplace dir, the cache subtree, the entries in `known_marketplaces.json` / `installed_plugins.json`, and the `enabledPlugins["nono@always-further"]` toggle. Claude Code's view of the world is restored to what it was before the install. Re-running `nono run --profile always-further/claude` will prompt to re-install.

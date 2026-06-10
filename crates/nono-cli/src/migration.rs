@@ -52,7 +52,7 @@ const OFFICIAL_PACKS: &[OfficialPack] = &[
     // renamed to `claude` so it matches the pack name. Once the pack
     // is installed, the resolver also accepts `claude-code` via the
     // artifact's `aliases` field. This entry only matters for users
-    // who type `--profile claude-code` *before* the pack is installed.
+    // who type `--profile always-further/claude` *before* the pack is installed.
     OfficialPack {
         profile_name: "claude-code",
         namespace: "always-further",

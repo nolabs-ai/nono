@@ -1357,6 +1357,7 @@ mod tests {
                 detach_sequence: None,
                 open_url_origins: &[],
                 open_url_allow_localhost: false,
+                credential_access: &[],
                 audit_recorder: None,
                 network_audit_events: None,
                 redaction_policy: &REDACTION_POLICY,

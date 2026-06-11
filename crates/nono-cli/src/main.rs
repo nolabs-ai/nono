@@ -16,6 +16,7 @@ mod command_display;
 mod command_runtime;
 mod completions;
 mod config;
+mod credential_broker;
 mod credential_runtime;
 mod deprecated_policy;
 mod deprecated_schema;
@@ -282,6 +283,7 @@ mod tests {
             allow_gpu_active: false,
             open_url_origins: Vec::new(),
             open_url_allow_localhost: false,
+            credential_access: Vec::new(),
             bypass_protection_paths: Vec::new(),
             ignored_denial_paths: Vec::new(),
             suppressed_system_service_operations: Vec::new(),
@@ -334,6 +336,7 @@ mod tests {
             allow_gpu_active: false,
             open_url_origins: Vec::new(),
             open_url_allow_localhost: false,
+            credential_access: Vec::new(),
             bypass_protection_paths: Vec::new(),
             ignored_denial_paths: Vec::new(),
             suppressed_system_service_operations: Vec::new(),

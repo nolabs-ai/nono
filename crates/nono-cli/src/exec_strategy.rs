@@ -278,6 +278,8 @@ pub struct SupervisorConfig<'a> {
     pub open_url_origins: &'a [String],
     /// Whether to allow http://localhost and http://127.0.0.1 URLs.
     pub open_url_allow_localhost: bool,
+    /// Profile-scoped credential grants for supervisor-brokered Keychain access.
+    pub credential_access: &'a [crate::profile::CredentialAccessGrant],
     /// Optional append-only audit recorder for supervisor events.
     pub audit_recorder: Option<&'a Mutex<crate::audit_integrity::AuditRecorder>>,
     /// Optional in-memory network/IPC audit events persisted into session metadata.
@@ -468,7 +470,7 @@ pub fn execute_supervised(
     let mut env_c: Vec<CString> = Vec::new();
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    let mut browser_shim: Option<BrowserShim> = None;
+    let mut shims: Vec<BrowserShim> = Vec::new();
 
     // Copy current environment, filtering dangerous and overridden vars
     for (key, value) in std::env::vars_os() {
@@ -479,6 +481,8 @@ pub fn execute_supervised(
                 &[
                     "NONO_CAP_FILE",
                     "NONO_SUPERVISOR_PATH",
+                    "NONO_CREDENTIAL_BROKER",
+                    "NONO_CREDENTIAL_BROKER_VERSION",
                     DETACHED_LAUNCH_ENV,
                     DETACHED_SESSION_ID_ENV,
                     DETACHED_CWD_PROMPT_RESPONSE_ENV,
@@ -552,26 +556,47 @@ pub fn execute_supervised(
                         if let Ok(cstr) = CString::new(browser_cmd) {
                             env_c.push(cstr);
                         }
-                        browser_shim = Some(shim);
+                        shims.push(shim);
                     }
                 }
 
                 #[cfg(target_os = "macos")]
                 {
+                    let mut path_prefixes = Vec::new();
                     if should_install_macos_open_shim(supervisor)
                         && let Some(shim) = create_open_shim(&nono_exe, &socket_path)
                     {
-                        let current_path = std::env::var("PATH").unwrap_or_default();
-                        let new_path = format!("PATH={}:{current_path}", shim.dir.path().display());
-                        if let Ok(cstr) = CString::new(new_path) {
-                            env_c.retain(|c| !c.as_bytes().starts_with(b"PATH="));
-                            env_c.push(cstr);
-                        }
                         let browser_cmd = format!("BROWSER={}", shim.launcher.display());
                         if let Ok(cstr) = CString::new(browser_cmd) {
                             env_c.push(cstr);
                         }
-                        browser_shim = Some(shim);
+                        path_prefixes.push(shim.dir.path().display().to_string());
+                        shims.push(shim);
+                    }
+                    if std::env::var_os("NONO_EXPERIMENTAL_KEYCHAIN_BROKER").is_some()
+                        && supervisor.is_some_and(|cfg| !cfg.credential_access.is_empty())
+                        && let Some(shim) = create_security_shim(&nono_exe, &socket_path)
+                    {
+                        path_prefixes.push(shim.dir.path().display().to_string());
+                        shims.push(shim);
+                        if let Ok(cstr) = CString::new(format!(
+                            "NONO_CREDENTIAL_BROKER={}",
+                            socket_path.display()
+                        )) {
+                            env_c.push(cstr);
+                        }
+                        if let Ok(cstr) = CString::new("NONO_CREDENTIAL_BROKER_VERSION=1") {
+                            env_c.push(cstr);
+                        }
+                    }
+                    if !path_prefixes.is_empty() {
+                        let current_path = std::env::var("PATH").unwrap_or_default();
+                        path_prefixes.push(current_path);
+                        let new_path = format!("PATH={}", path_prefixes.join(":"));
+                        if let Ok(cstr) = CString::new(new_path) {
+                            env_c.retain(|c| !c.as_bytes().starts_with(b"PATH="));
+                            env_c.push(cstr);
+                        }
                     }
                 }
 
@@ -582,7 +607,7 @@ pub fn execute_supervised(
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    let _keep_browser_shim_alive = browser_shim;
+    let _keep_shims_alive = shims;
 
     // Create null-terminated pointer arrays for execve
     let argv_ptrs: Vec<*const libc::c_char> = argv_c
@@ -2765,6 +2790,15 @@ fn handle_supervisor_message(
                 recorder.record_open_url(url_request, success, error)?;
             }
         }
+        SupervisorMessage::Credential(request) => {
+            let response = SupervisorResponse::Credential(
+                crate::credential_broker::handle_credential_request(
+                    request,
+                    config.credential_access,
+                ),
+            );
+            sock.send_response(&response)?;
+        }
     }
 
     Ok(())
@@ -2829,9 +2863,20 @@ fn handle_url_listener_connection(
                 let _ = recorder.record_open_url(url_request, success, error);
             }
         }
+        SupervisorMessage::Credential(request) => {
+            let response = SupervisorResponse::Credential(
+                crate::credential_broker::handle_credential_request(
+                    request,
+                    config.credential_access,
+                ),
+            );
+            if let Err(e) = sock.send_response(&response) {
+                warn!("Failed to send credential listener response: {}", e);
+            }
+        }
         other => {
             warn!(
-                "Unexpected message on URL listener (expected OpenUrl): {:?}",
+                "Unexpected message on listener (expected OpenUrl or Credential): {:?}",
                 other
             );
         }
@@ -2842,6 +2887,9 @@ fn response_decision(response: &SupervisorResponse) -> ApprovalDecision {
     match response {
         SupervisorResponse::Decision { decision, .. } => decision.clone(),
         SupervisorResponse::UrlOpened { .. } => ApprovalDecision::Denied {
+            reason: "invalid supervisor response type for capability decision".to_string(),
+        },
+        SupervisorResponse::Credential(_) => ApprovalDecision::Denied {
             reason: "invalid supervisor response type for capability decision".to_string(),
         },
     }
@@ -3111,6 +3159,50 @@ if [ -n "$url_arg" ]; then
 else
     exec /usr/bin/open "$@"
 fi
+"#
+    );
+
+    if std::fs::write(&shim_path, script).is_err() {
+        return None;
+    }
+    if std::fs::set_permissions(&shim_path, std::fs::Permissions::from_mode(0o755)).is_err() {
+        return None;
+    }
+
+    Some(BrowserShim {
+        dir: shim_dir,
+        launcher: shim_path,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn create_security_shim(
+    nono_exe: &std::path::Path,
+    supervisor_socket_path: &std::path::Path,
+) -> Option<BrowserShim> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let shim_dir = tempfile::Builder::new()
+        .prefix("nono-security-")
+        .tempdir()
+        .ok()?;
+    let shim_dir_path = shim_dir.path();
+
+    let helper_path = shim_dir_path.join("nono-credential-helper");
+    if std::fs::copy(nono_exe, &helper_path).is_err() {
+        return None;
+    }
+    if std::fs::set_permissions(&helper_path, std::fs::Permissions::from_mode(0o755)).is_err() {
+        return None;
+    }
+
+    let shim_path = shim_dir_path.join("security");
+    let quoted_helper = shell_quote(&helper_path.display().to_string());
+    let quoted_socket_path = shell_quote(&supervisor_socket_path.display().to_string());
+
+    let script = format!(
+        r#"#!/bin/sh
+NONO_CREDENTIAL_BROKER={quoted_socket_path} NONO_CREDENTIAL_BROKER_VERSION=1 exec {quoted_helper} credential-helper "$@"
 "#
     );
 
@@ -3992,6 +4084,7 @@ mod tests {
             detach_sequence: None,
             open_url_origins: &[],
             open_url_allow_localhost: false,
+            credential_access: &[],
             audit_recorder: None,
             network_audit_events: None,
             redaction_policy: &nono::ScrubPolicy::secure_default(),
@@ -4110,6 +4203,7 @@ mod tests {
             detach_sequence: None,
             open_url_origins: &[],
             open_url_allow_localhost: false,
+            credential_access: &[],
             audit_recorder: None,
             network_audit_events: None,
             redaction_policy: &nono::ScrubPolicy::secure_default(),
@@ -4194,6 +4288,7 @@ mod tests {
             detach_sequence: None,
             open_url_origins: &origins,
             open_url_allow_localhost: false,
+            credential_access: &[],
             audit_recorder: None,
             network_audit_events: None,
             redaction_policy: &nono::ScrubPolicy::secure_default(),
@@ -4235,6 +4330,7 @@ mod tests {
             detach_sequence: None,
             open_url_origins: &[],
             open_url_allow_localhost: false,
+            credential_access: &[],
             audit_recorder: None,
             network_audit_events: None,
             redaction_policy: &nono::ScrubPolicy::secure_default(),
@@ -4274,6 +4370,7 @@ mod tests {
             detach_sequence: None,
             open_url_origins: &[],
             open_url_allow_localhost: true,
+            credential_access: &[],
             audit_recorder: None,
             network_audit_events: None,
             redaction_policy: &nono::ScrubPolicy::secure_default(),
@@ -4295,6 +4392,7 @@ mod tests {
             detach_sequence: None,
             open_url_origins: &[],
             open_url_allow_localhost: false,
+            credential_access: &[],
             audit_recorder: None,
             network_audit_events: None,
             redaction_policy: &nono::ScrubPolicy::secure_default(),
@@ -4339,6 +4437,7 @@ mod tests {
             detach_sequence: None,
             open_url_origins: &[],
             open_url_allow_localhost: false,
+            credential_access: &[],
             audit_recorder: None,
             network_audit_events: None,
             redaction_policy: &nono::ScrubPolicy::secure_default(),
@@ -4488,6 +4587,7 @@ mod tests {
             detach_sequence: None,
             open_url_origins: &[],
             open_url_allow_localhost: false,
+            credential_access: &[],
             audit_recorder: None,
             network_audit_events: None,
             redaction_policy: &nono::ScrubPolicy::secure_default(),
@@ -4537,6 +4637,7 @@ mod tests {
             detach_sequence: None,
             open_url_origins: &origins,
             open_url_allow_localhost: false,
+            credential_access: &[],
             audit_recorder: None,
             network_audit_events: None,
             redaction_policy: &nono::ScrubPolicy::secure_default(),
@@ -4575,6 +4676,7 @@ mod tests {
             detach_sequence: None,
             open_url_origins: &[],
             open_url_allow_localhost: true,
+            credential_access: &[],
             audit_recorder: None,
             network_audit_events: None,
             redaction_policy: &nono::ScrubPolicy::secure_default(),
@@ -4632,6 +4734,7 @@ mod tests {
             detach_sequence: None,
             open_url_origins: &[],
             open_url_allow_localhost: false,
+            credential_access: &[],
             audit_recorder: None,
             network_audit_events: None,
             redaction_policy: &nono::ScrubPolicy::secure_default(),

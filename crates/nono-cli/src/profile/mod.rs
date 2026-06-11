@@ -894,6 +894,54 @@ fn validate_env_credential_keys(profile: &Profile) -> Result<()> {
     Ok(())
 }
 
+fn validate_profile_credential_access(profile: &Profile) -> Result<()> {
+    for (index, grant) in profile.credential_access.iter().enumerate() {
+        if grant.classes.is_empty() {
+            return Err(NonoError::ProfileParse(format!(
+                "credential_access[{index}] must allow at least one class"
+            )));
+        }
+        if grant.operations.is_empty() {
+            return Err(NonoError::ProfileParse(format!(
+                "credential_access[{index}] must allow at least one operation"
+            )));
+        }
+        if grant.services.is_empty() && grant.service_prefixes.is_empty() {
+            return Err(NonoError::ProfileParse(format!(
+                "credential_access[{index}] must include services or service_prefixes"
+            )));
+        }
+        if grant.accounts.is_empty() {
+            return Err(NonoError::ProfileParse(format!(
+                "credential_access[{index}] must include accounts; use \"*\" explicitly to allow any account"
+            )));
+        }
+
+        for service in &grant.services {
+            if service.is_empty() {
+                return Err(NonoError::ProfileParse(format!(
+                    "credential_access[{index}] services must not contain empty strings"
+                )));
+            }
+        }
+        for prefix in &grant.service_prefixes {
+            if prefix.is_empty() {
+                return Err(NonoError::ProfileParse(format!(
+                    "credential_access[{index}] service_prefixes must not contain empty strings"
+                )));
+            }
+        }
+        for account in &grant.accounts {
+            if account.is_empty() {
+                return Err(NonoError::ProfileParse(format!(
+                    "credential_access[{index}] accounts must not contain empty strings"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Three-state value used for inheritable profile fields.
 ///
 /// - `Inherit`: field was absent in the child profile, so keep the base value
@@ -1494,6 +1542,29 @@ pub struct OpenUrlConfig {
     pub allow_localhost: bool,
 }
 
+/// A profile-scoped grant for supervisor-brokered credential access.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CredentialAccessGrant {
+    /// Credential provider. Initial implementation supports `macos-keychain`.
+    pub provider: nono::supervisor::CredentialProvider,
+    /// Allowed item classes, e.g. `generic-password`.
+    #[serde(default)]
+    pub classes: Vec<nono::supervisor::CredentialItemClass>,
+    /// Allowed operations, e.g. `read`, `upsert`, `delete`.
+    #[serde(default)]
+    pub operations: Vec<nono::supervisor::CredentialOperation>,
+    /// Exact service names that may be accessed.
+    #[serde(default)]
+    pub services: Vec<String>,
+    /// Service prefixes that may be accessed.
+    #[serde(default)]
+    pub service_prefixes: Vec<String>,
+    /// Exact account names that may be accessed. Use `"*"` explicitly to allow any account.
+    #[serde(default)]
+    pub accounts: Vec<String>,
+}
+
 /// Deserialize the `extends` field from either a single string or an array of strings.
 ///
 /// Accepts:
@@ -1575,6 +1646,10 @@ pub struct Profile {
     /// derived profiles to narrow permissions.
     #[serde(default)]
     pub open_urls: Option<OpenUrlConfig>,
+    /// Supervisor-brokered credential grants. These authorize opaque Keychain
+    /// access frontends such as the macOS `security` shim.
+    #[serde(default)]
+    pub credential_access: Vec<CredentialAccessGrant>,
     /// Opt-in gate for temporary direct LaunchServices opens on macOS.
     /// Must be paired with the CLI flag `--allow-launch-services`.
     /// When `None`, inherits from the base profile.
@@ -1669,6 +1744,8 @@ struct ProfileDeserialize {
     #[serde(default)]
     open_urls: Option<OpenUrlConfig>,
     #[serde(default)]
+    credential_access: Vec<CredentialAccessGrant>,
+    #[serde(default)]
     allow_launch_services: Option<bool>,
     #[serde(default)]
     allow_gpu: Option<bool>,
@@ -1713,6 +1790,7 @@ impl From<ProfileDeserialize> for Profile {
             session_hooks: raw.session_hooks,
             rollback: raw.rollback,
             open_urls: raw.open_urls,
+            credential_access: raw.credential_access,
             allow_launch_services: raw.allow_launch_services,
             allow_gpu: raw.allow_gpu,
             allow_parent_of_protected: raw.allow_parent_of_protected,
@@ -2296,6 +2374,8 @@ pub(crate) fn parse_profile_bytes(content: &[u8]) -> Result<Profile> {
     // Validate env_credentials keys (URI entries need structural validation)
     validate_env_credential_keys(&profile)?;
 
+    validate_profile_credential_access(&profile)?;
+
     Ok(profile)
 }
 
@@ -2690,6 +2770,7 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
             Some(child_urls) => Some(child_urls),
             None => base.open_urls,
         },
+        credential_access: dedup_append(&base.credential_access, &child.credential_access),
         allow_launch_services: child.allow_launch_services.or(base.allow_launch_services),
         allow_gpu: child.allow_gpu.or(base.allow_gpu),
         allow_parent_of_protected: child
@@ -4658,6 +4739,7 @@ mod tests {
                 allow_origins: vec!["https://base.example.com".to_string()],
                 allow_localhost: false,
             }),
+            credential_access: Vec::new(),
             allow_launch_services: Some(false),
             allow_gpu: Some(false),
             allow_parent_of_protected: None,
@@ -4739,6 +4821,7 @@ mod tests {
                 allow_origins: vec!["https://child.example.com".to_string()],
                 allow_localhost: true,
             }),
+            credential_access: Vec::new(),
             allow_launch_services: Some(true),
             allow_gpu: Some(true),
             allow_parent_of_protected: Some(true),
@@ -6891,6 +6974,84 @@ mod tests {
                 "https://match.example".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn parse_profile_with_credential_access_grant() {
+        let json = br#"{
+            "meta": { "name": "credential-access-test" },
+            "credential_access": [
+                {
+                    "provider": "macos-keychain",
+                    "classes": ["generic-password"],
+                    "operations": ["read", "upsert", "delete"],
+                    "services": ["example-service"],
+                    "service_prefixes": ["example-prefix-"],
+                    "accounts": ["alice"]
+                }
+            ]
+        }"#;
+
+        let profile = parse_profile_bytes(json).expect("credential access profile should parse");
+        let grant = profile
+            .credential_access
+            .first()
+            .expect("credential access grant should exist");
+        assert_eq!(
+            grant.provider,
+            nono::supervisor::CredentialProvider::MacosKeychain
+        );
+        assert_eq!(
+            grant.classes,
+            vec![nono::supervisor::CredentialItemClass::GenericPassword]
+        );
+        assert_eq!(
+            grant.operations,
+            vec![
+                nono::supervisor::CredentialOperation::Read,
+                nono::supervisor::CredentialOperation::Upsert,
+                nono::supervisor::CredentialOperation::Delete,
+            ]
+        );
+        assert_eq!(grant.services, vec!["example-service".to_string()]);
+        assert_eq!(grant.service_prefixes, vec!["example-prefix-".to_string()]);
+        assert_eq!(grant.accounts, vec!["alice".to_string()]);
+    }
+
+    #[test]
+    fn parse_profile_rejects_credential_access_without_accounts() {
+        let json = br#"{
+            "meta": { "name": "credential-access-test" },
+            "credential_access": [
+                {
+                    "provider": "macos-keychain",
+                    "classes": ["generic-password"],
+                    "operations": ["read"],
+                    "services": ["example-service"]
+                }
+            ]
+        }"#;
+
+        let err = parse_profile_bytes(json).expect_err("accounts should be required");
+        assert!(err.to_string().contains("must include accounts"));
+    }
+
+    #[test]
+    fn parse_profile_rejects_credential_access_without_classes() {
+        let json = br#"{
+            "meta": { "name": "credential-access-test" },
+            "credential_access": [
+                {
+                    "provider": "macos-keychain",
+                    "operations": ["read"],
+                    "services": ["example-service"],
+                    "accounts": ["alice"]
+                }
+            ]
+        }"#;
+
+        let err = parse_profile_bytes(json).expect_err("classes should be required");
+        assert!(err.to_string().contains("must allow at least one class"));
     }
 
     #[test]

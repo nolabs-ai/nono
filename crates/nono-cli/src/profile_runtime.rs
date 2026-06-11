@@ -23,6 +23,7 @@ pub(crate) struct PreparedProfile {
     pub(crate) listen_ports: Vec<u16>,
     pub(crate) open_url_origins: Vec<String>,
     pub(crate) open_url_allow_localhost: bool,
+    pub(crate) credential_access: Vec<profile::CredentialAccessGrant>,
     pub(crate) allow_launch_services: bool,
     pub(crate) allow_gpu: bool,
     pub(crate) allow_parent_of_protected: bool,
@@ -564,6 +565,10 @@ fn prepare_profile_with_options(
             .and_then(|profile| profile.open_urls.as_ref())
             .map(|open_urls| open_urls.allow_localhost)
             .unwrap_or(false),
+        credential_access: loaded_profile
+            .as_ref()
+            .map(|profile| profile.credential_access.clone())
+            .unwrap_or_default(),
         allow_launch_services: loaded_profile
             .as_ref()
             .and_then(|profile| profile.allow_launch_services)

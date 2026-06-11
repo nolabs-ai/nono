@@ -31,8 +31,9 @@ pub mod types;
 
 pub use socket::{SupervisorListener, SupervisorSocket};
 pub use types::{
-    ApprovalDecision, AuditEntry, CapabilityRequest, SupervisorMessage, SupervisorResponse,
-    UrlOpenRequest,
+    ApprovalDecision, AuditEntry, CapabilityRequest, CredentialFrontend, CredentialItemClass,
+    CredentialOperation, CredentialProvider, CredentialRequest, CredentialResponse, SecretBytes,
+    SupervisorMessage, SupervisorResponse, UrlOpenRequest,
 };
 
 use crate::error::Result;

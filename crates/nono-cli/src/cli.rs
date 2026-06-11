@@ -658,6 +658,10 @@ IN-BAND DETACH:
     #[command(hide = true)]
     OpenUrlHelper(OpenUrlHelperArgs),
 
+    /// Internal: broker macOS Keychain requests via supervisor IPC
+    #[command(hide = true, trailing_var_arg = true)]
+    CredentialHelper(CredentialHelperArgs),
+
     /// Internal: refresh cached pack update hints out of process
     #[command(hide = true)]
     PackUpdateHintHelper(PackUpdateHintHelperArgs),
@@ -832,6 +836,18 @@ pub struct OutdatedArgs {
 pub struct OpenUrlHelperArgs {
     /// The URL to open
     pub url: String,
+}
+
+/// Arguments for the hidden credential-helper subcommand.
+///
+/// Invoked by opaque shims such as a `security` PATH shim. Reads
+/// `NONO_CREDENTIAL_BROKER` from the environment, normalizes the native
+/// command into a credential broker request, and waits for a response.
+#[derive(Parser, Debug, Clone)]
+pub struct CredentialHelperArgs {
+    /// The original credential command arguments.
+    #[arg(allow_hyphen_values = true)]
+    pub args: Vec<String>,
 }
 
 /// Arguments for the hidden pack-update-hint-helper subcommand.
@@ -2569,6 +2585,36 @@ mod tests {
                 assert_eq!(args.command, vec!["echo", "hello"]);
             }
             _ => panic!("Expected Run command"),
+        }
+    }
+
+    #[test]
+    fn test_credential_helper_accepts_security_flags_as_args() {
+        let cli = Cli::parse_from([
+            "nono",
+            "credential-helper",
+            "find-generic-password",
+            "-a",
+            "alice",
+            "-w",
+            "-s",
+            "example-service",
+        ]);
+        match cli.command {
+            Commands::CredentialHelper(args) => {
+                assert_eq!(
+                    args.args,
+                    vec![
+                        "find-generic-password",
+                        "-a",
+                        "alice",
+                        "-w",
+                        "-s",
+                        "example-service"
+                    ]
+                );
+            }
+            _ => panic!("Expected CredentialHelper command"),
         }
     }
 

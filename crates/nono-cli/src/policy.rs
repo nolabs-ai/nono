@@ -136,6 +136,8 @@ pub struct ProfileDef {
     #[serde(default)]
     pub open_urls: Option<profile::OpenUrlConfig>,
     #[serde(default)]
+    pub credential_access: Vec<profile::CredentialAccessGrant>,
+    #[serde(default)]
     pub allow_launch_services: Option<bool>,
     #[serde(default)]
     pub allow_gpu: Option<bool>,
@@ -172,6 +174,7 @@ impl ProfileDef {
             session_hooks: profile::SessionHooks::default(),
             rollback: self.rollback.clone(),
             open_urls: self.open_urls.clone(),
+            credential_access: self.credential_access.clone(),
             allow_launch_services: self.allow_launch_services,
             allow_gpu: self.allow_gpu,
             allow_parent_of_protected: None,

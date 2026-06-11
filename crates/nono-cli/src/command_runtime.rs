@@ -214,6 +214,7 @@ pub(crate) fn run_shell(args: ShellArgs, silent: bool) -> Result<()> {
             allowed_env_vars: prepared.allowed_env_vars,
             denied_env_vars: prepared.denied_env_vars,
             startup_timeout_secs: args.startup_timeout_secs,
+            credential_access: prepared.credential_access,
             proxy,
             redaction_policy: load_configured_redaction_policy()?,
             session: SessionLaunchOptions {

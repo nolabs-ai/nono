@@ -416,6 +416,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
                 rollback,
                 trust,
                 proxy,
+                credential_access: &flags.credential_access,
                 proxy_handle: proxy_handle.as_ref(),
                 executable_identity: executable_identity.as_ref(),
                 audit_signer: audit_signer.as_ref(),

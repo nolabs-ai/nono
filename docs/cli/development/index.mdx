@@ -65,5 +65,6 @@ RUST_LOG=debug cargo run -- run --allow-cwd -- echo "test"
 - **Unwrap Policy**: Never use `.unwrap()` or `.expect()` - enforced by clippy
 - **Unsafe Code**: Restricted to FFI; must include `// SAFETY:` documentation
 - **Path Security**: All paths must be validated and canonicalized
+- **Adding a policy field**: New fields on `Profile` (and on any nested `*Config` struct) require an explicit entry in `crates/nono-cli/tests/schema_cli_parity.rs::mapping_table()`, categorized as `Flag(...)`, `ProfileOnly(...)`, or `Deprecated(...)`. The parity test fails CI on uncategorized fields. See the doc-comment on `Profile` in `crates/nono-cli/src/profile/mod.rs` for details.
 
 See [CLAUDE.md](https://github.com/always-further/nono/blob/main/CLAUDE.md) for complete coding standards.

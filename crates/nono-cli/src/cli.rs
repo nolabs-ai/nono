@@ -1341,6 +1341,44 @@ pub struct SandboxArgs {
     #[arg(long, help_heading = "OPTIONS")]
     pub allow_gpu: bool,
 
+    // ── Security ─────────────────────────────────────────────────────────
+    /// Signal isolation mode. Overrides the profile's security.signal_mode.
+    #[arg(long, value_name = "MODE", help_heading = "SECURITY")]
+    pub signal_mode: Option<crate::profile::ProfileSignalMode>,
+
+    /// Process inspection mode. Overrides the profile's security.process_info_mode.
+    #[arg(long, value_name = "MODE", help_heading = "SECURITY")]
+    pub process_info_mode: Option<crate::profile::ProfileProcessInfoMode>,
+
+    /// IPC mode. Overrides the profile's security.ipc_mode.
+    #[arg(long, value_name = "MODE", help_heading = "SECURITY")]
+    pub ipc_mode: Option<crate::profile::ProfileIpcMode>,
+
+    /// WSL2 fallback policy when ProxyOnly cannot be kernel-enforced.
+    /// Overrides the profile's security.wsl2_proxy_policy. Linux-only.
+    #[cfg(target_os = "linux")]
+    #[arg(long, value_name = "POLICY", help_heading = "SECURITY")]
+    pub wsl2_proxy_policy: Option<crate::profile::Wsl2ProxyPolicy>,
+
+    // ── Environment ──────────────────────────────────────────────────────
+    /// Allow an env var (or `PREFIX_*` pattern) into the sandbox. Repeatable.
+    /// Extends the profile's environment.allow_vars.
+    #[arg(
+        long = "allow-env-var",
+        value_name = "NAME",
+        help_heading = "ENVIRONMENT"
+    )]
+    pub allow_env_var: Vec<String>,
+
+    /// Strip an env var (or `PREFIX_*` pattern) from the sandbox. Repeatable.
+    /// Extends the profile's environment.deny_vars.
+    #[arg(
+        long = "deny-env-var",
+        value_name = "NAME",
+        help_heading = "ENVIRONMENT"
+    )]
+    pub deny_env_var: Vec<String>,
+
     /// Capability manifest file (JSON). A fully-resolved sandbox specification —
     /// mutually exclusive with all other sandbox configuration flags.
     #[arg(
@@ -1357,6 +1395,8 @@ pub struct SandboxArgs {
             "allow_bind", "allow_port", "allow_connect_port", "external_proxy", "proxy_port",
             "proxy_credential", "allow_endpoint", "env_credential", "env_credential_map",
             "allow_command", "block_command", "allow_launch_services", "allow_gpu",
+            "signal_mode", "process_info_mode", "ipc_mode",
+            "allow_env_var", "deny_env_var",
         ],
         help_heading = "OPTIONS"
     )]
@@ -1638,6 +1678,13 @@ impl From<WrapSandboxArgs> for SandboxArgs {
             profile: args.profile,
             allow_launch_services: args.allow_launch_services,
             allow_gpu: args.allow_gpu,
+            signal_mode: None,
+            process_info_mode: None,
+            ipc_mode: None,
+            #[cfg(target_os = "linux")]
+            wsl2_proxy_policy: None,
+            allow_env_var: Vec::new(),
+            deny_env_var: Vec::new(),
             config: args.config,
             verbose: args.verbose,
             dry_run: args.dry_run,
@@ -1684,6 +1731,11 @@ pub struct RunArgs {
     /// Exclude from snapshots. Globs match filenames; plain names match path components
     #[arg(long, value_name = "PATTERN", help_heading = "ROLLBACK")]
     pub rollback_exclude: Vec<String>,
+
+    /// Exclude files from snapshots by glob pattern matched against the filename
+    /// (e.g. `*.log`, `target/*`). Repeatable.
+    #[arg(long, value_name = "GLOB", help_heading = "ROLLBACK")]
+    pub rollback_exclude_glob: Vec<String>,
 
     /// Force-include an auto-excluded directory (name only, not full path)
     #[arg(long, value_name = "DIR_NAME", help_heading = "ROLLBACK")]

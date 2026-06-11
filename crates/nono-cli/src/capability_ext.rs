@@ -624,6 +624,21 @@ impl CapabilitySetExt for CapabilitySet {
             caps.add_blocked_command(cmd);
         }
 
+        let signal_mode = args
+            .signal_mode
+            .map(nono::SignalMode::from)
+            .unwrap_or_default();
+        caps = caps.set_signal_mode(signal_mode);
+
+        let process_info_mode = args
+            .process_info_mode
+            .map(nono::ProcessInfoMode::from)
+            .unwrap_or_default();
+        caps.set_process_info_mode_mut(process_info_mode);
+
+        let ipc_mode = args.ipc_mode.map(nono::IpcMode::from).unwrap_or_default();
+        caps.set_ipc_mode_mut(ipc_mode);
+
         finalize_caps(&mut caps, &mut resolved, &loaded_policy, args, &[])?;
 
         Ok(PreparedCaps {
@@ -1008,26 +1023,24 @@ impl CapabilitySetExt for CapabilitySet {
             caps.add_allowed_command(cmd.as_str());
         }
 
-        // Apply signal mode from profile (None defaults to Isolated)
-        let mode = profile
-            .security
+        // CLI overrides profile; profile None falls through to enum default.
+        let mode = args
             .signal_mode
+            .or(profile.security.signal_mode)
             .map(nono::SignalMode::from)
             .unwrap_or_default();
         caps = caps.set_signal_mode(mode);
 
-        // Apply process inspection mode from profile (None defaults to Isolated)
-        let process_info_mode = profile
-            .security
+        let process_info_mode = args
             .process_info_mode
+            .or(profile.security.process_info_mode)
             .map(nono::ProcessInfoMode::from)
             .unwrap_or_default();
         caps.set_process_info_mode_mut(process_info_mode);
 
-        // Apply IPC mode from profile (None defaults to SharedMemoryOnly)
-        let ipc_mode = profile
-            .security
+        let ipc_mode = args
             .ipc_mode
+            .or(profile.security.ipc_mode)
             .map(nono::IpcMode::from)
             .unwrap_or_default();
         caps.set_ipc_mode_mut(ipc_mode);
@@ -3138,5 +3151,130 @@ mod tests {
         assert_eq!(socks.len(), 1);
         assert_eq!(socks[0].mode, UnixSocketMode::ConnectBind);
         assert_eq!(socks[0].scope, SocketScope::DirSubtree);
+    }
+
+    // ---------------------------------------------------------------------
+    // Security mode merging: --signal-mode / --process-info-mode / --ipc-mode
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn test_from_args_signal_mode_defaults_to_isolated() {
+        let (caps, _) = from_args_locked(&sandbox_args()).expect("build caps");
+        assert_eq!(caps.signal_mode(), nono::SignalMode::Isolated);
+    }
+
+    #[test]
+    fn test_from_args_signal_mode_flag_takes_effect() {
+        let args = SandboxArgs {
+            signal_mode: Some(crate::profile::ProfileSignalMode::AllowAll),
+            ..sandbox_args()
+        };
+        let (caps, _) = from_args_locked(&args).expect("build caps");
+        assert_eq!(caps.signal_mode(), nono::SignalMode::AllowAll);
+    }
+
+    #[test]
+    fn test_from_args_process_info_mode_defaults_to_isolated() {
+        let (caps, _) = from_args_locked(&sandbox_args()).expect("build caps");
+        assert_eq!(caps.process_info_mode(), nono::ProcessInfoMode::Isolated);
+    }
+
+    #[test]
+    fn test_from_args_process_info_mode_flag_takes_effect() {
+        let args = SandboxArgs {
+            process_info_mode: Some(crate::profile::ProfileProcessInfoMode::AllowSameSandbox),
+            ..sandbox_args()
+        };
+        let (caps, _) = from_args_locked(&args).expect("build caps");
+        assert_eq!(
+            caps.process_info_mode(),
+            nono::ProcessInfoMode::AllowSameSandbox
+        );
+    }
+
+    #[test]
+    fn test_from_args_ipc_mode_defaults_to_shared_memory_only() {
+        let (caps, _) = from_args_locked(&sandbox_args()).expect("build caps");
+        assert_eq!(caps.ipc_mode(), nono::IpcMode::SharedMemoryOnly);
+    }
+
+    #[test]
+    fn test_from_args_ipc_mode_flag_takes_effect() {
+        let args = SandboxArgs {
+            ipc_mode: Some(crate::profile::ProfileIpcMode::Full),
+            ..sandbox_args()
+        };
+        let (caps, _) = from_args_locked(&args).expect("build caps");
+        assert_eq!(caps.ipc_mode(), nono::IpcMode::Full);
+    }
+
+    #[test]
+    fn test_from_profile_cli_signal_mode_overrides_profile() {
+        let dir = tempdir().expect("tmpdir");
+        let profile_path = dir.path().join("signal-profile.json");
+        std::fs::write(
+            &profile_path,
+            r#"{
+                "meta": { "name": "signal-profile" },
+                "security": { "signal_mode": "isolated" }
+            }"#,
+        )
+        .expect("write profile");
+        let profile = crate::profile::load_profile_from_path(&profile_path).expect("load profile");
+
+        let workdir = tempdir().expect("workdir");
+        let args = SandboxArgs {
+            signal_mode: Some(crate::profile::ProfileSignalMode::AllowAll),
+            ..sandbox_args()
+        };
+        let (caps, _) = from_profile_locked(&profile, workdir.path(), &args).expect("build caps");
+        assert_eq!(
+            caps.signal_mode(),
+            nono::SignalMode::AllowAll,
+            "CLI --signal-mode must override the profile value"
+        );
+    }
+
+    #[test]
+    fn test_from_profile_signal_mode_falls_back_to_profile_when_flag_absent() {
+        let dir = tempdir().expect("tmpdir");
+        let profile_path = dir.path().join("signal-profile.json");
+        std::fs::write(
+            &profile_path,
+            r#"{
+                "meta": { "name": "signal-profile" },
+                "security": { "signal_mode": "allow_same_sandbox" }
+            }"#,
+        )
+        .expect("write profile");
+        let profile = crate::profile::load_profile_from_path(&profile_path).expect("load profile");
+
+        let workdir = tempdir().expect("workdir");
+        let args = sandbox_args();
+        let (caps, _) = from_profile_locked(&profile, workdir.path(), &args).expect("build caps");
+        assert_eq!(caps.signal_mode(), nono::SignalMode::AllowSameSandbox);
+    }
+
+    #[test]
+    fn test_from_profile_ipc_mode_cli_overrides_profile() {
+        let dir = tempdir().expect("tmpdir");
+        let profile_path = dir.path().join("ipc-profile.json");
+        std::fs::write(
+            &profile_path,
+            r#"{
+                "meta": { "name": "ipc-profile" },
+                "security": { "ipc_mode": "shared_memory_only" }
+            }"#,
+        )
+        .expect("write profile");
+        let profile = crate::profile::load_profile_from_path(&profile_path).expect("load profile");
+
+        let workdir = tempdir().expect("workdir");
+        let args = SandboxArgs {
+            ipc_mode: Some(crate::profile::ProfileIpcMode::Full),
+            ..sandbox_args()
+        };
+        let (caps, _) = from_profile_locked(&profile, workdir.path(), &args).expect("build caps");
+        assert_eq!(caps.ipc_mode(), nono::IpcMode::Full);
     }
 }

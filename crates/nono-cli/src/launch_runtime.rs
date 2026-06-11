@@ -231,6 +231,7 @@ pub(crate) fn prepare_run_launch_plan(
     let proxy = prepare_proxy_launch_options(&args, &prepared, silent)?;
     let rollback_options = prepare_rollback_launch_options(
         &run_args.rollback_exclude,
+        &run_args.rollback_exclude_glob,
         run_args.rollback_all,
         &run_args.skip_dir,
         &run_args.rollback_include,
@@ -373,22 +374,45 @@ fn prepare_trust_launch_options(
     })
 }
 
+/// Merge profile-side rollback excludes with CLI-side ones. Entries from the
+/// legacy `--rollback-exclude` flag are auto-partitioned by shape (anything
+/// containing `*`, `?`, or `[` is a glob); `--rollback-exclude-glob` entries
+/// are always treated as globs.
+fn merge_rollback_excludes(
+    profile_patterns: &[String],
+    profile_globs: &[String],
+    cli_exclude: &[String],
+    cli_exclude_glob: &[String],
+) -> (Vec<String>, Vec<String>) {
+    let (cli_exclude_globs, cli_exclude_patterns): (Vec<_>, Vec<_>) = cli_exclude
+        .iter()
+        .cloned()
+        .partition(|v| v.contains('*') || v.contains('?') || v.contains('['));
+
+    let mut exclude_patterns = profile_patterns.to_vec();
+    exclude_patterns.extend(cli_exclude_patterns);
+
+    let mut exclude_globs = profile_globs.to_vec();
+    exclude_globs.extend(cli_exclude_globs);
+    exclude_globs.extend(cli_exclude_glob.iter().cloned());
+
+    (exclude_patterns, exclude_globs)
+}
+
 fn prepare_rollback_launch_options(
     rollback_exclude: &[String],
+    rollback_exclude_glob: &[String],
     rollback_all: bool,
     skip_dirs: &[String],
     rollback_include: &[String],
     prepared: &PreparedSandbox,
 ) -> RollbackLaunchOptions {
-    let is_glob = |v: &String| v.contains('*') || v.contains('?') || v.contains('[');
-    let (cli_exclude_globs, cli_exclude_patterns): (Vec<_>, Vec<_>) =
-        rollback_exclude.iter().cloned().partition(is_glob);
-
-    let mut exclude_patterns = prepared.rollback_exclude_patterns.clone();
-    exclude_patterns.extend(cli_exclude_patterns);
-
-    let mut exclude_globs = prepared.rollback_exclude_globs.clone();
-    exclude_globs.extend(cli_exclude_globs);
+    let (exclude_patterns, exclude_globs) = merge_rollback_excludes(
+        &prepared.rollback_exclude_patterns,
+        &prepared.rollback_exclude_globs,
+        rollback_exclude,
+        rollback_exclude_glob,
+    );
 
     RollbackLaunchOptions {
         track_all: rollback_all,
@@ -478,5 +502,59 @@ pub(crate) fn select_threading_context(
         exec_strategy::ThreadingContext::KeyringExpected
     } else {
         exec_strategy::ThreadingContext::Strict
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn s(v: &str) -> String {
+        v.to_string()
+    }
+
+    #[test]
+    fn merge_rollback_excludes_returns_only_profile_when_cli_empty() {
+        let (patterns, globs) = merge_rollback_excludes(&[s("target")], &[s("*.log")], &[], &[]);
+        assert_eq!(patterns, vec![s("target")]);
+        assert_eq!(globs, vec![s("*.log")]);
+    }
+
+    #[test]
+    fn merge_rollback_excludes_partitions_legacy_flag_by_shape() {
+        let (patterns, globs) = merge_rollback_excludes(
+            &[],
+            &[],
+            &[s("node_modules"), s("*.tmp"), s("dist"), s("[Bb]uild")],
+            &[],
+        );
+        assert_eq!(patterns, vec![s("node_modules"), s("dist")]);
+        assert_eq!(globs, vec![s("*.tmp"), s("[Bb]uild")]);
+    }
+
+    #[test]
+    fn merge_rollback_excludes_glob_flag_always_appended_to_globs() {
+        let (patterns, globs) =
+            merge_rollback_excludes(&[], &[], &[], &[s("plain-name-but-glob-flagged")]);
+        assert_eq!(patterns, Vec::<String>::new());
+        assert_eq!(globs, vec![s("plain-name-but-glob-flagged")]);
+    }
+
+    #[test]
+    fn merge_rollback_excludes_combines_all_four_sources() {
+        let (patterns, globs) = merge_rollback_excludes(
+            &[s("target")],
+            &[s("*.log")],
+            &[s("node_modules"), s("*.tmp")],
+            &[s("dist/**")],
+        );
+        assert_eq!(patterns, vec![s("target"), s("node_modules")]);
+        assert_eq!(globs, vec![s("*.log"), s("*.tmp"), s("dist/**")]);
+    }
+
+    #[test]
+    fn merge_rollback_excludes_preserves_profile_order_then_cli() {
+        let (patterns, _) = merge_rollback_excludes(&[s("a"), s("b")], &[], &[s("c"), s("d")], &[]);
+        assert_eq!(patterns, vec![s("a"), s("b"), s("c"), s("d")]);
     }
 }

@@ -1235,8 +1235,9 @@ pub struct SessionHooks {
 /// Signal isolation mode as specified in a profile.
 ///
 /// Maps to `nono::SignalMode` when building the `CapabilitySet`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]
+#[clap(rename_all = "snake_case")]
 pub enum ProfileSignalMode {
     /// Signals restricted to the current process only
     Isolated,
@@ -1259,8 +1260,9 @@ impl From<ProfileSignalMode> for nono::SignalMode {
 /// Process inspection mode as specified in a profile.
 ///
 /// Maps to `nono::ProcessInfoMode` when building the `CapabilitySet`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]
+#[clap(rename_all = "snake_case")]
 pub enum ProfileProcessInfoMode {
     /// Inspection restricted to self only (default)
     Isolated,
@@ -1283,8 +1285,9 @@ impl From<ProfileProcessInfoMode> for nono::ProcessInfoMode {
 /// IPC mode as specified in a profile.
 ///
 /// Maps to `nono::IpcMode` when building the `CapabilitySet`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]
+#[clap(rename_all = "snake_case")]
 pub enum ProfileIpcMode {
     /// POSIX shared memory only (default). Semaphores denied.
     SharedMemoryOnly,
@@ -1309,8 +1312,9 @@ impl From<ProfileIpcMode> for nono::IpcMode {
 /// networking. On WSL2, that enforcement is unavailable.
 ///
 /// Default: `Error` — refuse to run rather than silently losing enforcement.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]
+#[clap(rename_all = "snake_case")]
 pub enum Wsl2ProxyPolicy {
     /// Refuse to run if ProxyOnly cannot be kernel-enforced on WSL2.
     /// This is the secure default.
@@ -1551,7 +1555,14 @@ where
     })
 }
 
-/// A complete profile definition
+/// A complete profile definition.
+///
+/// New fields on this struct (and on any `*Config` struct transitively
+/// reachable through it) require a categorization in
+/// `crates/nono-cli/tests/schema_cli_parity.rs::mapping_table()`. Valid
+/// categories: `Flag("<long-name>")`, `ProfileOnly("reason")`,
+/// `Deprecated("reason")`. The parity test fails CI on uncategorized
+/// fields.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Profile {
     /// Optional base profile(s) to inherit from (by name).

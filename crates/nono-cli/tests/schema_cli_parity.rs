@@ -6,13 +6,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
-use std::process::Command;
 
 /// Categorize a new `Profile` field by adding a `mapping_table()` entry:
 /// `Flag("<long-name>")` if backed by a CLI flag, `ProfileOnly("reason")`
-/// if deliberately profile-only, `Deprecated("reason")` if a back-compat
-/// alias. The reason strings are documentation for reviewers, not used
-/// programmatically.
+/// if deliberately profile-only forever, `Deprecated("reason")` if a
+/// back-compat alias. The reason strings are documentation for reviewers,
+/// not used programmatically.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 enum Category {
@@ -104,21 +103,13 @@ fn mapping_table() -> Vec<(&'static str, &'static str, Category)> {
             "unsafe_macos_seatbelt_rules",
             ProfileOnly("deliberately unsafe expert escape hatch; profile-only by design"),
         ),
-        (
-            "SecurityConfig",
-            "signal_mode",
-            ProfileOnly("isolation mode selection; backsweep candidate (#1027 PR 2)"),
-        ),
+        ("SecurityConfig", "signal_mode", Flag("signal-mode")),
         (
             "SecurityConfig",
             "process_info_mode",
-            ProfileOnly("isolation mode selection; backsweep candidate (#1027 PR 2)"),
+            Flag("process-info-mode"),
         ),
-        (
-            "SecurityConfig",
-            "ipc_mode",
-            ProfileOnly("isolation mode selection; backsweep candidate (#1027 PR 2)"),
-        ),
+        ("SecurityConfig", "ipc_mode", Flag("ipc-mode")),
         (
             "SecurityConfig",
             "capability_elevation",
@@ -127,7 +118,7 @@ fn mapping_table() -> Vec<(&'static str, &'static str, Category)> {
         (
             "SecurityConfig",
             "wsl2_proxy_policy",
-            ProfileOnly("WSL2-specific fallback knob; backsweep candidate (#1027 PR 2)"),
+            Flag("wsl2-proxy-policy"),
         ),
         (
             "GroupsConfig",
@@ -228,7 +219,14 @@ fn mapping_table() -> Vec<(&'static str, &'static str, Category)> {
             "af_unix_mediation",
             ProfileOnly("opt-in Linux pathname AF_UNIX mediation mode; profile-only by design"),
         ),
-        ("WorkdirConfig", "access", Flag("allow-cwd")),
+        (
+            "WorkdirConfig",
+            "access",
+            ProfileOnly(
+                "the access level (None/Read/Write/ReadWrite) is profile-set; \
+                 --allow-cwd only suppresses the prompt, it does not set a level",
+            ),
+        ),
         (
             "RollbackConfig",
             "exclude_patterns",
@@ -237,18 +235,10 @@ fn mapping_table() -> Vec<(&'static str, &'static str, Category)> {
         (
             "RollbackConfig",
             "exclude_globs",
-            ProfileOnly("glob excludes are profile-only today; backsweep candidate (#1027 PR 2)"),
+            Flag("rollback-exclude-glob"),
         ),
-        (
-            "EnvironmentConfig",
-            "allow_vars",
-            ProfileOnly("env var allow-list; backsweep candidate (#1027 PR 2)"),
-        ),
-        (
-            "EnvironmentConfig",
-            "deny_vars",
-            ProfileOnly("env var deny-list; backsweep candidate (#1027 PR 2)"),
-        ),
+        ("EnvironmentConfig", "allow_vars", Flag("allow-env-var")),
+        ("EnvironmentConfig", "deny_vars", Flag("deny-env-var")),
         (
             "OpenUrlConfig",
             "allow_origins",
@@ -327,9 +317,9 @@ struct FieldInfo {
 
 /// Parse `profile/mod.rs` as the source of truth for the policy surface.
 /// We don't use `nono-profile.schema.json` because it's hand-maintained and
-/// drifts (e.g. `connect_port` exists in the struct but not the schema -
-/// itself a #1027-class drift). `syn` understands multi-line types, raw
-/// idents, attributes, etc. - anything `cargo check` accepts.
+/// drifts from the Rust struct (e.g. `connect_port` exists in the struct but
+/// not the schema). `syn` understands multi-line types, raw idents,
+/// attributes, etc. - anything `cargo check` accepts.
 fn parse_struct_fields(source: &str) -> BTreeMap<String, Vec<FieldInfo>> {
     let file: syn::File = syn::parse_file(source).expect("failed to parse profile/mod.rs as Rust");
     let mut out: BTreeMap<String, Vec<FieldInfo>> = BTreeMap::new();
@@ -390,50 +380,70 @@ fn collect_type_idents(ty: &syn::Type, out: &mut Vec<String>) {
     }
 }
 
-/// Scrape `--flag` long forms out of `nono run --help`. We shell out because
-/// `nono-cli` is `[[bin]]`-only - no library target - so tests can't import
-/// `Cli` to enumerate flags directly.
-fn parse_cli_flags() -> BTreeSet<String> {
-    let output = Command::new(env!("CARGO_BIN_EXE_nono"))
-        .args(["run", "--help"])
-        .output()
-        .expect("failed to invoke `nono run --help`");
-    assert!(
-        output.status.success(),
-        "`nono run --help` exited non-zero: {:?}\nstderr: {}",
-        output.status,
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let help = String::from_utf8_lossy(&output.stdout);
+fn cli_source() -> String {
+    let path = workspace_root()
+        .join("crates")
+        .join("nono-cli")
+        .join("src")
+        .join("cli.rs");
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()))
+}
 
+/// Parse `cli.rs` and collect every clap long-flag declared via `#[arg(long)]`
+/// or `#[arg(long = "name")]`. Source-based (not `--help`-scraping) so
+/// `cfg(target_os = "...")`-gated flags are included on every platform — the
+/// previous shell-out approach lost macOS-only flags on Linux and vice versa.
+fn parse_cli_flags(source: &str) -> BTreeSet<String> {
+    let file: syn::File = syn::parse_file(source).expect("failed to parse cli.rs as Rust");
     let mut flags = BTreeSet::new();
-    for line in help.lines() {
-        let mut rest = line;
-        while let Some(idx) = rest.find("--") {
-            // Only count `--` preceded by start-of-line or a separator -
-            // skips matches inside descriptive text like ALIAS(canonical="--foo")
-            // and (default: --foo).
-            let before_ok = idx == 0
-                || matches!(
-                    line.as_bytes().get(idx.wrapping_sub(1)),
-                    Some(b' ') | Some(b',') | Some(b'\t')
-                );
-            let after = &rest[idx + 2..];
-            if !before_ok {
-                rest = after;
+    for item in &file.items {
+        let syn::Item::Struct(item_struct) = item else {
+            continue;
+        };
+        let syn::Fields::Named(named) = &item_struct.fields else {
+            continue;
+        };
+        for field in &named.named {
+            let Some(field_name) = &field.ident else {
                 continue;
+            };
+            for attr in &field.attrs {
+                if !attr.path().is_ident("arg") {
+                    continue;
+                }
+                if let Some(name) = extract_long_flag(attr, &field_name.to_string()) {
+                    flags.insert(name);
+                }
             }
-            let name: String = after
-                .chars()
-                .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
-                .collect();
-            if !name.is_empty() {
-                flags.insert(name);
-            }
-            rest = after;
         }
     }
     flags
+}
+
+/// Inspect a single `#[arg(...)]` attribute. Returns the long-flag name if the
+/// attribute opts into one, either via bare `long` (auto-derived from the field
+/// name as kebab-case) or via `long = "explicit-name"`. Returns `None` if no
+/// `long` token is present (i.e. positional or short-only args).
+fn extract_long_flag(attr: &syn::Attribute, field_name: &str) -> Option<String> {
+    let mut has_long = false;
+    let mut explicit_long: Option<String> = None;
+    let _ = attr.parse_nested_meta(|meta| {
+        if !meta.path.is_ident("long") {
+            return Ok(());
+        }
+        has_long = true;
+        if let Ok(value) = meta.value()
+            && let Ok(lit_str) = value.parse::<syn::LitStr>()
+        {
+            explicit_long = Some(lit_str.value());
+        }
+        Ok(())
+    });
+    if !has_long {
+        return None;
+    }
+    Some(explicit_long.unwrap_or_else(|| field_name.replace('_', "-")))
 }
 
 #[test]
@@ -514,7 +524,7 @@ fn schema_fields_are_categorized() {
             errors.push(format!(
                 "uncategorized policy field: {struct_name}.{field_name} - \
                  add a Flag/Deprecated/ProfileOnly entry to mapping_table() \
-                 in crates/nono-cli/tests/schema_cli_parity.rs (issue #1027)"
+                 in crates/nono-cli/tests/schema_cli_parity.rs"
             ));
         }
     }
@@ -535,7 +545,7 @@ fn schema_fields_are_categorized() {
 /// We don't check the inverse (every CLI flag maps to a policy field).
 #[test]
 fn flag_backed_fields_have_real_cli_flags() {
-    let cli_flags = parse_cli_flags();
+    let cli_flags = parse_cli_flags(&cli_source());
     let table = mapping_table();
     let mut errors: Vec<String> = Vec::new();
 
@@ -544,9 +554,9 @@ fn flag_backed_fields_have_real_cli_flags() {
             && !cli_flags.contains(*name)
         {
             errors.push(format!(
-                "mapping says {s}.{f} → --{name}, but `nono run --help` \
-                 does not list --{name} (renamed flag? typo? \
-                 macOS-conditional flag absent on this build?)"
+                "mapping says {s}.{f} → --{name}, but no `#[arg(...)]` in \
+                 crates/nono-cli/src/cli.rs declares --{name} (flag missing? \
+                 typo? renamed?)"
             ));
         }
     }

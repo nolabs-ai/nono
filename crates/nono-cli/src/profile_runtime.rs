@@ -43,6 +43,31 @@ struct PrepareProfileOptions {
     hook_output_silent: bool,
 }
 
+/// Combine profile env-var patterns with CLI-supplied ones. Returns `None`
+/// (the "no list, everything passes" sentinel) only when both sources are
+/// empty AND the profile didn't explicitly opt into an empty list — matching
+/// the prior behavior where the field was untouched if neither side spoke.
+fn merge_env_var_patterns(
+    profile_patterns: &[String],
+    cli_patterns: &[String],
+    field_name: &str,
+) -> Option<Vec<String>> {
+    if profile_patterns.is_empty() && cli_patterns.is_empty() {
+        return None;
+    }
+    let mut combined = Vec::with_capacity(profile_patterns.len() + cli_patterns.len());
+    combined.extend_from_slice(profile_patterns);
+    for cli in cli_patterns {
+        if !combined.contains(cli) {
+            combined.push(cli.clone());
+        }
+    }
+    if let Some(err) = crate::exec_strategy::validate_env_var_patterns(&combined, field_name) {
+        eprintln!("Warning: {}", err);
+    }
+    Some(combined)
+}
+
 fn install_profile_hooks(_profile_name: Option<&str>, profile: &profile::Profile, silent: bool) {
     // In-binary hook installation was removed in v0.44.0 alongside
     // the hooks.rs module. Profiles that ship a `hooks.<target>`
@@ -590,9 +615,13 @@ fn prepare_profile_with_options(
             .and_then(|profile| profile.security.capability_elevation)
             .unwrap_or(false),
         #[cfg(target_os = "linux")]
-        wsl2_proxy_policy: loaded_profile
-            .as_ref()
-            .and_then(|profile| profile.security.wsl2_proxy_policy)
+        wsl2_proxy_policy: args
+            .wsl2_proxy_policy
+            .or_else(|| {
+                loaded_profile
+                    .as_ref()
+                    .and_then(|profile| profile.security.wsl2_proxy_policy)
+            })
             .unwrap_or_default(),
         #[cfg(target_os = "linux")]
         af_unix_mediation: loaded_profile
@@ -675,31 +704,24 @@ fn prepare_profile_with_options(
             .as_ref()
             .map(|profile| profile.diagnostics.suppress_system_services.clone())
             .unwrap_or_default(),
-        allowed_env_vars: loaded_profile.as_ref().and_then(|profile| {
-            profile.environment.as_ref().map(|env_config| {
-                if let Some(err) = crate::exec_strategy::validate_env_var_patterns(
-                    &env_config.allow_vars,
-                    "allow_vars",
-                ) {
-                    eprintln!("Warning: {}", err);
-                }
-                env_config.allow_vars.clone()
-            })
-        }),
-        denied_env_vars: loaded_profile.as_ref().and_then(|profile| {
-            profile.environment.as_ref().and_then(|env_config| {
-                if env_config.deny_vars.is_empty() {
-                    return None;
-                }
-                if let Some(err) = crate::exec_strategy::validate_env_var_patterns(
-                    &env_config.deny_vars,
-                    "deny_vars",
-                ) {
-                    eprintln!("Warning: {}", err);
-                }
-                Some(env_config.deny_vars.clone())
-            })
-        }),
+        allowed_env_vars: merge_env_var_patterns(
+            loaded_profile
+                .as_ref()
+                .and_then(|profile| profile.environment.as_ref())
+                .map(|env_config| env_config.allow_vars.as_slice())
+                .unwrap_or(&[]),
+            &args.allow_env_var,
+            "allow_vars",
+        ),
+        denied_env_vars: merge_env_var_patterns(
+            loaded_profile
+                .as_ref()
+                .and_then(|profile| profile.environment.as_ref())
+                .map(|env_config| env_config.deny_vars.as_slice())
+                .unwrap_or(&[]),
+            &args.deny_env_var,
+            "deny_vars",
+        ),
         set_vars: expand_profile_set_vars(loaded_profile.as_ref(), workdir)?,
         loaded_profile,
     })
@@ -1342,6 +1364,189 @@ mod tests {
                     profile.filesystem.allow.clone(),
                 )
             })
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // merge_env_var_patterns: profile + CLI source combinations
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn merge_env_var_patterns_returns_none_when_both_sources_empty() {
+        assert_eq!(merge_env_var_patterns(&[], &[], "allow_vars"), None);
+    }
+
+    #[test]
+    fn merge_env_var_patterns_uses_profile_only_when_cli_empty() {
+        let profile = vec!["PATH".to_string(), "HOME".to_string()];
+        let merged = merge_env_var_patterns(&profile, &[], "allow_vars");
+        assert_eq!(merged, Some(profile));
+    }
+
+    #[test]
+    fn merge_env_var_patterns_uses_cli_only_when_profile_empty() {
+        let cli = vec!["AWS_REGION".to_string()];
+        let merged = merge_env_var_patterns(&[], &cli, "allow_vars");
+        assert_eq!(merged, Some(cli));
+    }
+
+    #[test]
+    fn merge_env_var_patterns_concatenates_profile_then_cli() {
+        let profile = vec!["PATH".to_string()];
+        let cli = vec!["AWS_REGION".to_string()];
+        let merged = merge_env_var_patterns(&profile, &cli, "allow_vars");
+        assert_eq!(
+            merged,
+            Some(vec!["PATH".to_string(), "AWS_REGION".to_string()])
+        );
+    }
+
+    #[test]
+    fn merge_env_var_patterns_dedupes_cli_against_profile() {
+        let profile = vec!["PATH".to_string(), "HOME".to_string()];
+        let cli = vec!["HOME".to_string(), "AWS_REGION".to_string()];
+        let merged = merge_env_var_patterns(&profile, &cli, "allow_vars");
+        assert_eq!(
+            merged,
+            Some(vec![
+                "PATH".to_string(),
+                "HOME".to_string(),
+                "AWS_REGION".to_string(),
+            ])
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // prepare_profile integration: env var flags and (Linux) wsl2 flag
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn prepare_profile_extends_allow_env_var_with_cli_flag() {
+        let workdir = tempdir().expect("tempdir");
+        let profile_path = workdir.path().join("env-allow-profile.json");
+        fs::write(
+            &profile_path,
+            r#"{
+                "meta": { "name": "env-allow-profile" },
+                "environment": { "allow_vars": ["PATH"] }
+            }"#,
+        )
+        .expect("write profile");
+
+        let args = SandboxArgs {
+            profile: Some(profile_path.to_string_lossy().into_owned()),
+            allow_env_var: vec!["AWS_REGION".to_string()],
+            ..SandboxArgs::default()
+        };
+        let prepared =
+            prepare_profile_for_preflight(&args, workdir.path()).expect("prepare profile");
+        assert_eq!(
+            prepared.allowed_env_vars,
+            Some(vec!["PATH".to_string(), "AWS_REGION".to_string()])
+        );
+    }
+
+    #[test]
+    fn prepare_profile_extends_deny_env_var_with_cli_flag() {
+        let workdir = tempdir().expect("tempdir");
+        let profile_path = workdir.path().join("env-deny-profile.json");
+        fs::write(
+            &profile_path,
+            r#"{
+                "meta": { "name": "env-deny-profile" },
+                "environment": { "deny_vars": ["GH_TOKEN"] }
+            }"#,
+        )
+        .expect("write profile");
+
+        let args = SandboxArgs {
+            profile: Some(profile_path.to_string_lossy().into_owned()),
+            deny_env_var: vec!["AWS_SECRET_ACCESS_KEY".to_string()],
+            ..SandboxArgs::default()
+        };
+        let prepared =
+            prepare_profile_for_preflight(&args, workdir.path()).expect("prepare profile");
+        assert_eq!(
+            prepared.denied_env_vars,
+            Some(vec![
+                "GH_TOKEN".to_string(),
+                "AWS_SECRET_ACCESS_KEY".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn prepare_profile_env_vars_cli_only_with_no_profile_section() {
+        let workdir = tempdir().expect("tempdir");
+        let profile_path = workdir.path().join("env-empty-profile.json");
+        fs::write(
+            &profile_path,
+            r#"{ "meta": { "name": "env-empty-profile" } }"#,
+        )
+        .expect("write profile");
+
+        let args = SandboxArgs {
+            profile: Some(profile_path.to_string_lossy().into_owned()),
+            allow_env_var: vec!["PATH".to_string()],
+            deny_env_var: vec!["GH_TOKEN".to_string()],
+            ..SandboxArgs::default()
+        };
+        let prepared =
+            prepare_profile_for_preflight(&args, workdir.path()).expect("prepare profile");
+        assert_eq!(prepared.allowed_env_vars, Some(vec!["PATH".to_string()]));
+        assert_eq!(prepared.denied_env_vars, Some(vec!["GH_TOKEN".to_string()]));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn prepare_profile_wsl2_proxy_policy_cli_overrides_profile() {
+        let workdir = tempdir().expect("tempdir");
+        let profile_path = workdir.path().join("wsl2-profile.json");
+        fs::write(
+            &profile_path,
+            r#"{
+                "meta": { "name": "wsl2-profile" },
+                "security": { "wsl2_proxy_policy": "error" }
+            }"#,
+        )
+        .expect("write profile");
+
+        let args = SandboxArgs {
+            profile: Some(profile_path.to_string_lossy().into_owned()),
+            wsl2_proxy_policy: Some(profile::Wsl2ProxyPolicy::InsecureProxy),
+            ..SandboxArgs::default()
+        };
+        let prepared =
+            prepare_profile_for_preflight(&args, workdir.path()).expect("prepare profile");
+        assert_eq!(
+            prepared.wsl2_proxy_policy,
+            profile::Wsl2ProxyPolicy::InsecureProxy
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn prepare_profile_wsl2_proxy_policy_falls_back_to_profile_when_flag_absent() {
+        let workdir = tempdir().expect("tempdir");
+        let profile_path = workdir.path().join("wsl2-profile.json");
+        fs::write(
+            &profile_path,
+            r#"{
+                "meta": { "name": "wsl2-profile" },
+                "security": { "wsl2_proxy_policy": "insecure_proxy" }
+            }"#,
+        )
+        .expect("write profile");
+
+        let args = SandboxArgs {
+            profile: Some(profile_path.to_string_lossy().into_owned()),
+            ..SandboxArgs::default()
+        };
+        let prepared =
+            prepare_profile_for_preflight(&args, workdir.path()).expect("prepare profile");
+        assert_eq!(
+            prepared.wsl2_proxy_policy,
+            profile::Wsl2ProxyPolicy::InsecureProxy
         );
     }
 }

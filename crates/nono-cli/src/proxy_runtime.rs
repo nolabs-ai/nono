@@ -1,5 +1,6 @@
 use crate::cli::SandboxArgs;
 use crate::launch_runtime::ProxyLaunchOptions;
+use crate::network_intent::NetworkIntent;
 use crate::network_policy;
 use crate::sandbox_prepare::{PreparedSandbox, validate_external_proxy_bypass};
 #[cfg(not(target_os = "macos"))]
@@ -70,10 +71,7 @@ pub(crate) fn prepare_proxy_launch_options(
         }
         false
     } else {
-        matches!(
-            prepared.caps.network_mode(),
-            nono::NetworkMode::ProxyOnly { .. }
-        ) || !credentials.is_empty()
+        !credentials.is_empty()
             || network_profile.is_some()
             || !allow_domain.is_empty()
             || upstream_proxy.is_some()
@@ -97,7 +95,8 @@ pub(crate) fn prepare_proxy_launch_options(
         proxy_ca_validity: args
             .proxy_ca_validity
             .map(|days| std::time::Duration::from_secs(u64::from(days) * 24 * 60 * 60)),
-        network_block: prepared.network_block_requested,
+        network_block: matches!(prepared.network_intent, NetworkIntent::BlockAll),
+        network_intent: prepared.network_intent.clone(),
     })
 }
 
@@ -303,10 +302,14 @@ pub(crate) fn start_proxy_runtime(
             );
         }
     }
-    caps.set_network_mode_mut(nono::NetworkMode::ProxyOnly {
-        port,
-        bind_ports: proxy.allow_bind_ports.clone(),
-    });
+    // Credentials alone inject headers without OS-level isolation;
+    // only domain-filter/network-profile intent triggers ProxyOnly.
+    if matches!(proxy.network_intent, NetworkIntent::ProxyFiltered { .. }) {
+        caps.set_network_mode_mut(nono::NetworkMode::ProxyOnly {
+            port,
+            bind_ports: proxy.allow_bind_ports.clone(),
+        });
+    }
 
     // Grant the sandboxed child a read capability on the ephemeral
     // trust bundle so `SSL_CERT_FILE` etc. are actually openable after

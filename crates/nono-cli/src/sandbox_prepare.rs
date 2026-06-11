@@ -4,6 +4,7 @@ use crate::command_blocking_deprecation;
 #[cfg(unix)]
 use crate::config;
 use crate::credential_runtime::load_env_credentials;
+use crate::network_intent::{NetworkIntent, resolve_network_intent};
 use crate::network_policy;
 use crate::output;
 use crate::profile;
@@ -441,10 +442,7 @@ pub(crate) struct PreparedSandbox {
     pub(crate) suppressed_system_service_operations: Vec<String>,
     pub(crate) allowed_env_vars: Option<Vec<String>>,
     pub(crate) denied_env_vars: Option<Vec<String>>,
-    /// True when the profile or CLI requested `network.block`. Carried
-    /// through because a CLI proxy flag (e.g. `--credential`) may later
-    /// override `caps` to `ProxyOnly`, losing the original intent.
-    pub(crate) network_block_requested: bool,
+    pub(crate) network_intent: NetworkIntent,
 }
 
 fn resolved_workdir(args: &SandboxArgs) -> PathBuf {
@@ -573,7 +571,12 @@ fn finalize_prepared_sandbox(
     silent: bool,
 ) -> Result<PreparedSandbox> {
     output::print_skipped_requested_paths(&collect_missing_cli_requested_paths(args), silent);
-    output::print_capabilities(&prepared.caps, args.verbose, silent);
+    output::print_capabilities(
+        &prepared.caps,
+        &prepared.network_intent,
+        args.verbose,
+        silent,
+    );
 
     if let Some(ref profile_name) = args.profile {
         crate::pack_update_hint::show_pack_update_hints(profile_name, silent);
@@ -1074,7 +1077,13 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
                 suppressed_system_service_operations: Vec::new(),
                 allowed_env_vars: None,
                 denied_env_vars: None,
-                network_block_requested: args.block_net,
+                network_intent: resolve_network_intent(
+                    args.block_net,
+                    args.allow_net,
+                    false,
+                    false,
+                    false,
+                ),
             },
             args,
             silent,
@@ -1344,13 +1353,22 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         return Err(NonoError::NoCapabilities);
     }
 
-    // Capture the profile's `network.block` intent before `loaded_profile`
-    // is consumed below.
+    // Capture before `loaded_profile` is moved into the struct below.
     let profile_network_block = loaded_profile
         .as_ref()
         .map(|p| p.network.block)
         .unwrap_or(false);
-    let network_block_requested = args.block_net || profile_network_block;
+    let profile_has_proxy = loaded_profile
+        .as_ref()
+        .map(|p| p.network.has_proxy_flags())
+        .unwrap_or(false);
+    let network_intent = resolve_network_intent(
+        args.block_net,
+        args.allow_net,
+        args.has_proxy_flags(),
+        profile_network_block,
+        profile_has_proxy,
+    );
 
     let profile_secrets = loaded_profile
         .map(|profile| profile.env_credentials.mappings)
@@ -1385,7 +1403,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
             suppressed_system_service_operations,
             allowed_env_vars: profile_allowed_env_vars,
             denied_env_vars: profile_denied_env_vars,
-            network_block_requested,
+            network_intent,
         },
         args,
         silent,

@@ -1,5 +1,6 @@
 use crate::cli::RunArgs;
 use crate::config;
+use crate::network_intent::NetworkIntent;
 use crate::proxy_runtime::prepare_proxy_launch_options;
 use crate::sandbox_prepare::{
     PreparedSandbox, prepare_sandbox, print_allow_gpu_warning, print_allow_launch_services_warning,
@@ -91,6 +92,7 @@ pub(crate) struct ProxyLaunchOptions {
     /// Propagated to `ProxyConfig.strict_filter` so the filter denies
     /// unlisted hosts instead of falling back to allow-all.
     pub(crate) network_block: bool,
+    pub(crate) network_intent: NetworkIntent,
 }
 
 #[derive(Clone)]

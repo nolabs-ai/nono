@@ -1083,11 +1083,11 @@ impl NetworkConfig {
         self.credentials.as_deref().unwrap_or(&[])
     }
 
-    /// Whether any profile setting requires proxy mode activation.
+    /// Whether any profile setting activates proxy/domain-filter mode.
+    /// `credentials` is excluded — it injects headers without OS-level isolation.
     pub fn has_proxy_flags(&self) -> bool {
         self.resolved_network_profile().is_some()
             || !self.allow_domain.is_empty()
-            || !self.resolved_credentials().is_empty()
             || self.upstream_proxy.is_some()
     }
 }
@@ -5697,13 +5697,16 @@ mod tests {
     }
 
     #[test]
-    fn test_credentials_none_does_not_activate_proxy() {
+    fn test_credentials_do_not_activate_proxy_mode() {
+        // Credentials inject headers but do not impose OS-level ProxyOnly
+        // isolation. has_proxy_flags() must return false for credential-only
+        // configs so that network_intent stays Unrestricted.
         let mut config = NetworkConfig::default();
         assert!(!config.has_proxy_flags()); // None = no proxy
         config.credentials = Some(Vec::new());
         assert!(!config.has_proxy_flags()); // Some([]) = no proxy
         config.credentials = Some(vec!["openai".to_string()]);
-        assert!(config.has_proxy_flags()); // Some(["openai"]) = proxy
+        assert!(!config.has_proxy_flags()); // credentials alone = no ProxyOnly mode
     }
 
     #[test]

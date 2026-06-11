@@ -23,6 +23,7 @@ The library is a **pure sandbox primitive**. It applies ONLY what clients explic
 | `QueryContext` | All output and UX |
 | `keystore` | `learn` mode |
 | `undo` module (ObjectStore, SnapshotManager, MerkleTree, ExclusionFilter) | Rollback lifecycle, exclusion policy, rollback UI |
+| `NetworkMode` (enforcement detail — requires a bound port) | `NetworkIntent` (policy intent — resolved from flags and profile before proxy starts) |
 
 ## Build & Test
 
@@ -75,6 +76,8 @@ make fmt             # Auto-format
 3. **Capability resolution**: All paths are canonicalized at grant time to prevent symlink escapes.
 
 4. **Library is policy-free**: The library applies ONLY what's in `CapabilitySet`. No built-in sensitive paths, dangerous commands, or system paths. Clients define all policy.
+
+5. **Credential injection is not traffic isolation**: `--credential` injects headers transparently without setting `NetworkMode::ProxyOnly`. OS-level traffic isolation requires an explicit domain filter (`--allow-domain`, `--network-profile`). Do not couple credential features to `has_proxy_flags()` or `NetworkMode` changes.
 
 ## Platform-Specific Notes
 

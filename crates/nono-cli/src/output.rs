@@ -3,6 +3,7 @@
 //! All colors are drawn from the active theme via `theme::current()`.
 
 use crate::command_display::format_command_line;
+use crate::network_intent::NetworkIntent;
 use crate::theme::{self, Rgb, badge, fg};
 use colored::Colorize;
 use nono::{AccessMode, CapabilitySet, NetworkMode, NonoError, Result};
@@ -52,7 +53,12 @@ pub fn print_banner(silent: bool) {
 /// When `verbose` is 0, only user-specified capabilities are shown (CLI flags
 /// and profile filesystem entries). System paths and group-resolved paths are
 /// hidden to reduce noise. Use `-v` to show all capabilities.
-pub fn print_capabilities(caps: &CapabilitySet, verbose: u8, silent: bool) {
+pub fn print_capabilities(
+    caps: &CapabilitySet,
+    network_intent: &NetworkIntent,
+    verbose: u8,
+    silent: bool,
+) {
     if silent {
         return;
     }
@@ -191,11 +197,19 @@ pub fn print_capabilities(caps: &CapabilitySet, verbose: u8, silent: bool) {
             }
         }
         NetworkMode::AllowAll => {
-            eprintln!(
-                "  {} {}",
-                theme::badge(" net ", t.green, BADGE_FG_DARK),
-                theme::fg("outbound allowed", t.subtext),
-            );
+            if matches!(network_intent, NetworkIntent::ProxyFiltered { .. }) {
+                eprintln!(
+                    "  {} {}",
+                    theme::badge(" net ", t.yellow, BADGE_FG_DARK),
+                    theme::fg("domain filtered", t.subtext),
+                );
+            } else {
+                eprintln!(
+                    "  {} {}",
+                    theme::badge(" net ", t.green, BADGE_FG_DARK),
+                    theme::fg("outbound allowed", t.subtext),
+                );
+            }
         }
     }
     if !caps.localhost_ports().is_empty() {
@@ -917,6 +931,7 @@ mod tests {
         dry_run_command_line, format_unix_socket_mode_badge, print_capabilities,
         print_profile_hint, render_diagnostic_footer, render_terminal_block_for_tty,
     };
+    use crate::network_intent::NetworkIntent;
     use nono::{CapabilitySet, UnixSocketMode};
     use std::ffi::{OsStr, OsString};
     use tempfile::tempdir;
@@ -1018,7 +1033,7 @@ mod tests {
             .allow_unix_socket_dir(dir.path(), UnixSocketMode::ConnectBind)
             .expect("bind dir grant");
 
-        print_capabilities(&caps, 0, true);
-        print_capabilities(&caps, 1, true);
+        print_capabilities(&caps, &NetworkIntent::Unrestricted, 0, true);
+        print_capabilities(&caps, &NetworkIntent::Unrestricted, 1, true);
     }
 }

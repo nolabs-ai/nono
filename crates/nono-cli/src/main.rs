@@ -33,6 +33,7 @@ mod legacy_cleanup;
 #[cfg(target_os = "macos")]
 mod macos_trust;
 mod migration;
+mod network_intent;
 mod network_policy;
 mod open_url_runtime;
 mod output;
@@ -97,7 +98,6 @@ const DETACHED_CWD_PROMPT_RESPONSE_ENV: &str = "NONO_DETACHED_CWD_PROMPT_RESPONS
 const DETACHED_SESSION_ID_ENV: &str = "NONO_DETACHED_SESSION_ID";
 
 pub(crate) use launch_runtime::rollback_base_exclusions;
-pub(crate) use proxy_runtime::merge_dedup_ports;
 
 fn main() {
     let legacy_network_warnings = collect_legacy_network_warnings();
@@ -287,7 +287,7 @@ mod tests {
             suppressed_system_service_operations: Vec::new(),
             allowed_env_vars: None,
             denied_env_vars: None,
-            network_block_requested: false,
+            network_intent: crate::network_intent::NetworkIntent::Unrestricted,
         };
 
         let effective = resolve_effective_proxy_settings(&args, &prepared);
@@ -339,7 +339,7 @@ mod tests {
             suppressed_system_service_operations: Vec::new(),
             allowed_env_vars: None,
             denied_env_vars: None,
-            network_block_requested: false,
+            network_intent: crate::network_intent::NetworkIntent::Unrestricted,
         };
 
         let effective = resolve_effective_proxy_settings(&args, &prepared);

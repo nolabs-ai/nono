@@ -1366,11 +1366,11 @@ pub struct SandboxArgs {
 }
 
 impl SandboxArgs {
-    /// Whether any CLI flag requires proxy mode activation.
+    /// Whether any CLI flag activates proxy/domain-filter mode.
+    /// `--credential` is excluded — it injects headers without OS-level isolation.
     pub fn has_proxy_flags(&self) -> bool {
         self.network_profile.is_some()
             || !self.allow_proxy.is_empty()
-            || !self.proxy_credential.is_empty()
             || self.external_proxy.is_some()
     }
 }

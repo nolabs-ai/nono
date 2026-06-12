@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Clean up nono-managed Codex state for a fresh test of
-# `nono run --profile codex -- codex`. Removes:
+# `nono run --profile always-further/codex -- codex`. Removes:
 #   - the pulled pack at ~/.config/nono/packages/always-further/codex
 #   - the cache subtree at ~/.codex/plugins/cache/always-further
 #   - the nono-managed fenced block in ~/.codex/config.toml (between

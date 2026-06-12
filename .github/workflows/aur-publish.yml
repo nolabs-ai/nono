@@ -78,7 +78,7 @@ jobs:
       # the workflow runs on (the default branch), not from the release tag:
       # packaging fixes must flow into the next publish, and tags that predate
       # this workflow have no packaging/aur directory at all.
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
 
       - name: Create build user
         # makepkg and updpkgsums refuse to run as root. The workspace is
@@ -111,14 +111,23 @@ jobs:
             exit 1
           fi
 
-          while IFS= read -r hostkey; do
-            fp="$(printf '%s\n' "$hostkey" | ssh-keygen -lf - | awk '{print $2}')"
+          # ssh-keyscan (OpenSSH 10+) writes an informational "# host SSH-2.0-..."
+          # banner line to stdout for each scanned key. Feeding the whole file to
+          # ssh-keygen -lf (rather than each line to stdin) lets ssh-keygen skip
+          # those comments natively and emit one fingerprint per host key.
+          fingerprints="$(ssh-keygen -lf /home/builder/.ssh/scanned | awk '{print $2}')"
+          if [ -z "$fingerprints" ]; then
+            echo "::error::ssh-keygen produced no fingerprints for aur.archlinux.org"
+            exit 1
+          fi
+
+          while IFS= read -r fp; do
             if [[ " $expected " != *" $fp "* ]]; then
               echo "::error::Unexpected SSH host key fingerprint for aur.archlinux.org: $fp"
               exit 1
             fi
             echo "Verified host key: $fp"
-          done < /home/builder/.ssh/scanned
+          done <<< "$fingerprints"
 
           mv /home/builder/.ssh/scanned /home/builder/.ssh/known_hosts
 

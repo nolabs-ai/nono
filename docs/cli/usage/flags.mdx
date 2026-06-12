@@ -175,7 +175,7 @@ Subcommands:
 Compare against an existing profile to show only missing paths.
 
 ```bash
-nono learn --profile opencode -- opencode
+nono learn --profile always-further/opencode -- opencode
 ```
 
 ### `--json`
@@ -295,7 +295,7 @@ not grant access and does not remove the diagnostic footer; it only prevents
 the same denied path from being offered as a profile addition repeatedly.
 
 ```bash
-nono run --profile claude-code \
+nono run --profile always-further/claude \
   --suppress-save-prompt ~/.copilot/settings.json \
   -- claude
 ```
@@ -802,7 +802,7 @@ See [Credential Injection](/cli/features/credential-injection) for full document
 Use a named profile (from installed packs or `~/.config/nono/profiles/`).
 
 ```bash
-nono run --profile claude-code -- claude
+nono run --profile always-further/claude -- claude
 nono run -p openclaw -- openclaw gateway
 ```
 
@@ -811,7 +811,7 @@ nono run -p openclaw -- openclaw gateway
 Working directory for `$WORKDIR` expansion in profiles (defaults to current directory).
 
 ```bash
-nono run --profile claude-code --workdir ./my-project -- claude
+nono run --profile always-further/claude --workdir ./my-project -- claude
 ```
 
 #### `--allow-cwd`
@@ -820,10 +820,10 @@ Allow access to the current working directory without prompting. By default, non
 
 ```bash
 # Non-interactive mode (e.g., CI/CD)
-nono run --profile claude-code --allow-cwd -- claude
+nono run --profile always-further/claude --allow-cwd -- claude
 
 # Silent mode requires --allow-cwd (cannot prompt)
-nono -s run --profile claude-code --allow-cwd -- claude
+nono -s run --profile always-further/claude --allow-cwd -- claude
 ```
 
 #### `--allow-launch-services`
@@ -831,7 +831,7 @@ nono -s run --profile claude-code --allow-cwd -- claude
 Allow direct LaunchServices opens on macOS for this session. This is intended for temporary login or setup flows that need to open a browser from inside the sandbox.
 
 ```bash
-nono run --profile claude-code --allow-launch-services -- claude
+nono run --profile always-further/claude --allow-launch-services -- claude
 ```
 
 <Note>
@@ -861,7 +861,7 @@ Start the supervised session without attaching the current terminal. The command
 
 ```bash
 # Start in the background, then attach later
-nono run --detached --profile claude-code --allow-cwd -- claude
+nono run --detached --profile always-further/claude --allow-cwd -- claude
 
 # Detached launch with an explicit session name
 nono run --detached --name gold-core --allow-cwd -- my-agent
@@ -904,7 +904,7 @@ Session names must be unique among live sessions. If you omit `--name`, nono gen
 Enable [atomic rollback snapshots](/cli/features/atomic-rollbacks) for the session. Takes content-addressable snapshots of writable directories so you can restore to the pre-session state after the command exits. Automatically selects supervised execution.
 
 ```bash
-nono run --rollback --profile claude-code -- claude
+nono run --rollback --profile always-further/claude -- claude
 nono run --rollback --allow-cwd -- my-agent
 ```
 
@@ -979,7 +979,7 @@ nono run --no-audit-integrity --allow-cwd -- my-agent
 nono run --audit-integrity --allow-cwd -- my-agent
 
 # Strongest mode: audit + filesystem integrity + restoreable rollback snapshots
-nono run --audit-integrity --rollback --profile claude-code -- claude
+nono run --audit-integrity --rollback --profile always-further/claude -- claude
 ```
 
 <Note>
@@ -1018,7 +1018,7 @@ nono run --audit-sign-key default --allow-cwd -- my-agent
 nono run --audit-sign-key file:///tmp/nono-audit-key.pem --allow-cwd -- my-agent
 
 # Sign with a 1Password-backed key
-nono run --audit-sign-key op://Development/Nono/audit-key --profile claude-code -- claude
+nono run --audit-sign-key op://Development/Nono/audit-key --profile always-further/claude -- claude
 ```
 
 The corresponding attestation can be pinned during verification:
@@ -1157,7 +1157,7 @@ Would execute: my-agent
 On Linux, combine `--dry-run` with `-v` to include detected Landlock ABI details and requested/enforced scope state:
 
 ```bash
-nono run --dry-run -v --profile claude-code -- claude
+nono run --dry-run -v --profile always-further/claude -- claude
 ```
 
 #### `--verbose`, `-v`
@@ -1252,8 +1252,8 @@ nono why --host example.com --port 8080
 Landlock scope to check. Supported values are `signal` and `abstract-unix-socket`.
 
 ```bash
-nono why --scope signal --profile claude-code
-nono why --scope abstract-unix-socket --profile claude-code
+nono why --scope signal --profile always-further/claude
+nono why --scope abstract-unix-socket --profile always-further/claude
 ```
 
 On Linux, scope queries report whether the effective capability set requested the scope, whether the detected Landlock ABI can support it, and whether nono will enforce it. On non-Linux platforms, scope queries return `not_applicable`.
@@ -1285,7 +1285,7 @@ When checking paths outside a sandbox, you can simulate a capability context:
 nono why --path ./src --op write --allow .
 
 # Check against a profile
-nono why --path ~/.config --op read --profile claude-code
+nono why --path ~/.config --op read --profile always-further/claude
 ```
 
 Available context flags:

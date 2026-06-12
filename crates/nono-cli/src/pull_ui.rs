@@ -2,7 +2,7 @@
 //! happens, then renders the Sigstore provenance and install summary as
 //! a coherent trust-chain block. Same output for the explicit
 //! `nono pull <ref>` command and the auto-pull path triggered by
-//! `--profile claude-code`.
+//! `--profile always-further/claude`.
 //!
 //! Design rules (do not relax without thinking):
 //!   - No spinners, no in-place line rewrites — output stays readable in

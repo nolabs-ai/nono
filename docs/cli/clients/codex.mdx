@@ -11,7 +11,7 @@ When you run Codex under `nono`, prefer a single sandbox layer: let `nono` enfor
 Recommended invocation:
 
 ```bash
-nono run --profile codex -- codex --sandbox danger-full-access --ask-for-approval on-request
+nono run --profile always-further/codex -- codex --sandbox danger-full-access --ask-for-approval on-request
 ```
 
 This keeps Codex's approval flow while avoiding nested sandboxes that can make denials harder to diagnose. See OpenAI's [agent approvals and security docs](https://developers.openai.com/codex/agent-approvals-security).
@@ -30,7 +30,7 @@ nono makes those boundaries kernel-enforced instead of advisory.
 ## Quick Start
 
 ```bash
-nono run --profile codex -- codex --sandbox danger-full-access --ask-for-approval on-request
+nono run --profile always-further/codex -- codex --sandbox danger-full-access --ask-for-approval on-request
 ```
 
 If the registry pack `always-further/codex` isn't installed yet, nono prompts to pull it (see [Automatic Pack Install and Plugin Wiring](#automatic-pack-install-and-plugin-wiring) below).
@@ -48,7 +48,7 @@ The pack profile provides:
 
 The `codex` profile is distributed as a signed registry pack at `always-further/codex` along with a Codex plugin that provides sandbox-aware diagnostic hooks and a skill for guiding the user through denial-recovery.
 
-The first time you run `nono run --profile codex -- codex`, nono prompts to install the pack:
+The first time you run `nono run --profile always-further/codex -- codex`, nono prompts to install the pack:
 
 ```
   ⊕  Install always-further/codex?
@@ -105,7 +105,7 @@ note: Codex hooks need this in ~/.codex/config.toml to fire — add it once and 
 
 ### Subsequent runs
 
-Once installed, `nono run --profile codex -- codex` runs silently — no prompt. nono's profile resolver finds `codex` in the pack store and re-asserts the marketplace + cache wiring on every run, so deleting any of the entries above is recovered transparently on the next `nono run`.
+Once installed, `nono run --profile always-further/codex -- codex` runs silently — no prompt. nono's profile resolver finds `codex` in the pack store and re-asserts the marketplace + cache wiring on every run, so deleting any of the entries above is recovered transparently on the next `nono run`.
 
 If a newer version of the pack is available, nono prints a one-line hint after the capabilities block:
 
@@ -180,13 +180,13 @@ The profile includes the required browser-open allowlist:
 On Linux, no additional flags are needed:
 
 ```bash
-nono run --profile codex -- codex --sandbox danger-full-access --ask-for-approval on-request
+nono run --profile always-further/codex -- codex --sandbox danger-full-access --ask-for-approval on-request
 ```
 
 On macOS, enable LaunchServices temporarily for the login session:
 
 ```bash
-nono run --profile codex --allow-launch-services -- codex --sandbox danger-full-access --ask-for-approval on-request
+nono run --profile always-further/codex --allow-launch-services -- codex --sandbox danger-full-access --ask-for-approval on-request
 ```
 
 After login completes, exit and rerun without `--allow-launch-services`.
@@ -200,7 +200,7 @@ After login completes, exit and rerun without `--allow-launch-services`.
 The profile grants access to the directory you run Codex from. To pin access to a specific repository:
 
 ```bash
-nono run --profile codex --workdir ~/projects/my-app -- codex --sandbox danger-full-access --ask-for-approval on-request
+nono run --profile always-further/codex --workdir ~/projects/my-app -- codex --sandbox danger-full-access --ask-for-approval on-request
 ```
 
 ### Read-Only Workspace
@@ -216,7 +216,7 @@ nono run --read . --allow ~/.codex -- codex --sandbox danger-full-access --ask-f
 If you want to inspect local code without allowing outbound access:
 
 ```bash
-nono run --profile codex --block-net -- codex --sandbox danger-full-access --ask-for-approval on-request
+nono run --profile always-further/codex --block-net -- codex --sandbox danger-full-access --ask-for-approval on-request
 ```
 
 ### Use Network Filtering
@@ -224,7 +224,7 @@ nono run --profile codex --block-net -- codex --sandbox danger-full-access --ask
 If you want Codex limited to the built-in host allowlist for coding workflows:
 
 ```bash
-nono run --profile codex --network-profile codex -- codex --sandbox danger-full-access --ask-for-approval on-request
+nono run --profile always-further/codex --network-profile codex -- codex --sandbox danger-full-access --ask-for-approval on-request
 ```
 
 ### Additional Home-Directory Tools
@@ -234,7 +234,7 @@ The profile covers common Rust, Node.js, Python, and Nix runtime locations under
 If a tool exists on your `PATH` but Codex cannot launch it inside the sandbox, grant read access to the specific path entry:
 
 ```bash
-nono run --profile codex \
+nono run --profile always-further/codex \
   --read ~/.bun/bin \
   --read ~/go/bin \
   -- codex --sandbox danger-full-access --ask-for-approval on-request

@@ -92,6 +92,7 @@ pub fn run_pull(args: PullArgs) -> Result<()> {
         &manifest,
         &downloads,
         args.init,
+        args.force,
         &pack_owned_files,
     )?;
     update_lockfile(
@@ -117,7 +118,7 @@ pub fn run_pull(args: PullArgs) -> Result<()> {
     // pack (here, not via `migration::check_and_run`), also offer to
     // strip pre-0.43 inbuilt-hook leftovers. Idempotent — silent no-op
     // on a clean install. Mirrors the cleanup hook in `check_and_run`
-    // so power users who skip `--profile claude-code` don't end up with
+    // so power users who skip `--profile always-further/claude` don't end up with
     // both legacy and pack hooks firing.
     if package_ref.namespace == "always-further" && package_ref.name == "claude" {
         crate::legacy_cleanup::check_and_offer_cleanup()?;
@@ -769,6 +770,7 @@ fn install_package(
     manifest: &PackageManifest,
     downloads: &VerifiedDownloads,
     init: bool,
+    force: bool,
     pack_owned_files: &HashMap<PathBuf, String>,
 ) -> Result<InstallSummary> {
     let staging_parent = package::package_store_dir()?
@@ -831,7 +833,18 @@ fn install_package(
             namespace: package_ref.namespace.clone(),
             pack_name: package_ref.name.clone(),
         };
-        let report = crate::wiring::execute(&manifest.wiring, &ctx, pack_owned_files)?;
+        let report = if force {
+            crate::wiring::execute_with_options(
+                &manifest.wiring,
+                &ctx,
+                pack_owned_files,
+                crate::wiring::ExecuteOptions {
+                    allow_unmanaged_identical_write_files: true,
+                },
+            )?
+        } else {
+            crate::wiring::execute(&manifest.wiring, &ctx, pack_owned_files)?
+        };
         for conflict in &report.conflicts {
             eprintln!("  warning: {conflict}");
         }

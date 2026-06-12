@@ -1546,8 +1546,16 @@ impl CapabilitySet {
                     seen.insert(key, i);
                     // On Linux: preserve symlink original from the removed
                     // entry into the kept entry so `original` stays meaningful.
+                    // Guard: skip if the symlink original is one of the four
+                    // /dev aliases that remap_procfs_self_references() rewrites
+                    // to /proc/{pid}/fd/N — inheriting such an original would
+                    // cause a direct entry (e.g. /dev/null) to be misdirected
+                    // to a PTY slave inode when the remap runs in the child.
                     #[cfg(target_os = "linux")]
-                    if cap.original == cap.resolved && existing.original != existing.resolved {
+                    if cap.original == cap.resolved
+                        && existing.original != existing.resolved
+                        && !is_procfs_remap_original(&existing.original)
+                    {
                         original_updates.push((i, existing.original.clone()));
                     }
                     // Apply merged access to the new (kept) entry
@@ -1557,8 +1565,15 @@ impl CapabilitySet {
                 } else {
                     // On Linux: inherit symlink original from the entry
                     // being discarded into the surviving entry.
+                    // Guard: skip if the discarded entry's original is one of
+                    // the four /dev aliases that remap_procfs_self_references()
+                    // rewrites to /proc/{pid}/fd/N — see the keep_new branch
+                    // above for the rationale.
                     #[cfg(target_os = "linux")]
-                    if existing.original == existing.resolved && cap.original != cap.resolved {
+                    if existing.original == existing.resolved
+                        && cap.original != cap.resolved
+                        && !is_procfs_remap_original(&cap.original)
+                    {
                         original_updates.push((existing_idx, cap.original.clone()));
                     }
                     to_remove.push(i);
@@ -1764,6 +1779,19 @@ impl CapabilitySet {
     }
 }
 
+/// Returns `true` if `path` is any path that [`rewrite_procfs_self_reference`]
+/// would rewrite — i.e. inheriting it as an `original` in
+/// [`CapabilitySet::deduplicate`] would cause a subsequent
+/// `remap_procfs_self_references` call to misdirect the resolved inode.
+///
+/// Implemented by delegating to [`rewrite_procfs_self_reference`] so the two
+/// functions are always in sync: any path added to the rewriter is
+/// automatically covered here without a separate update.
+#[cfg(target_os = "linux")]
+fn is_procfs_remap_original(path: &Path) -> bool {
+    rewrite_procfs_self_reference(path, 0, None).is_some()
+}
+
 fn rewrite_procfs_self_reference(
     original: &Path,
     process_pid: u32,
@@ -1875,6 +1903,66 @@ mod procfs_remap_tests {
         assert_eq!(
             caps.fs_capabilities()[1].resolved,
             PathBuf::from("/proc/4242/fd/1")
+        );
+    }
+
+    /// Regression test for the --detached /dev/null denial bug (issue #1064).
+    ///
+    /// When nono runs in detached mode, stdin/stdout are both /dev/null.
+    /// `system_read_linux_core` therefore adds two capabilities whose
+    /// `resolved` path is `/dev/null`: one with `original = /dev/null`
+    /// (explicit entry) and one with `original = /dev/stdin` (symlink entry
+    /// whose canonicalised target is also `/dev/null`).
+    ///
+    /// Without the fix, `deduplicate()` would update the surviving entry's
+    /// `original` from `/dev/null` to `/dev/stdin`, causing
+    /// `remap_procfs_self_references()` to rewrite `resolved` to
+    /// `/proc/{pid}/fd/0` (the PTY slave), leaving no Landlock rule for
+    /// `/dev/null` itself.
+    ///
+    /// With the fix, the guard in `deduplicate()` prevents a `/dev/stdin`
+    /// original from being inherited, so `original` stays `/dev/null` and
+    /// `remap_procfs_self_references()` leaves `resolved` unchanged.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn remap_preserves_dev_null_when_deduped_with_dev_stdin() {
+        let dev_null = PathBuf::from("/dev/null");
+
+        let mut caps = CapabilitySet::new();
+        // Explicit /dev/null entry (direct — original == resolved).
+        caps.add_fs(FsCapability {
+            original: dev_null.clone(),
+            resolved: dev_null.clone(),
+            access: AccessMode::Read,
+            is_file: true,
+            source: CapabilitySource::Group("system_read_linux_core".to_string()),
+        });
+        // /dev/stdin entry whose canonicalised target is also /dev/null
+        // (happens in detached mode where stdin is redirected to /dev/null).
+        caps.add_fs(FsCapability {
+            original: PathBuf::from("/dev/stdin"),
+            resolved: dev_null.clone(),
+            access: AccessMode::Read,
+            is_file: true,
+            source: CapabilitySource::Group("system_read_linux_core".to_string()),
+        });
+
+        // deduplicate() must NOT update original to /dev/stdin.
+        caps.deduplicate();
+        assert_eq!(caps.fs_capabilities().len(), 1);
+        assert_eq!(
+            caps.fs_capabilities()[0].original,
+            dev_null,
+            "deduplicate must not rename /dev/null original to /dev/stdin"
+        );
+
+        // remap_procfs_self_references() must leave resolved as /dev/null,
+        // not rewrite it to /proc/4242/fd/0.
+        caps.remap_procfs_self_references(4242, None);
+        assert_eq!(
+            caps.fs_capabilities()[0].resolved,
+            dev_null,
+            "resolved must remain /dev/null after remap; was misdirected to PTY slave inode"
         );
     }
 }

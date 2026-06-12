@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://nono.dev/schemas/capability-manifest.schema.json",
+  "$id": "https://nono.sh/schemas/capability-manifest.schema.json",
   "title": "nono Capability Manifest",
   "description": "A fully-resolved, portable capability manifest describing what a nono sandbox enforces. Manifests are the machine-consumable contract for sandbox configuration — they contain no inheritance, no legacy aliases, and no composition. Profiles compile down to manifests. NOTE: additionalProperties is true during schema development to allow forward-compatible evolution without breaking existing consumers. Switch to false once the schema stabilizes (post-1.0).",
   "type": "object",

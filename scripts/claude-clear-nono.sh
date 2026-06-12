@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Clean up nono-managed Claude Code state for a fresh test of
-# `nono run --profile claude-code -- claude`. Removes:
+# `nono run --profile always-further/claude -- claude`. Removes:
 #   - the pulled pack at ~/.config/nono/packages/always-further/claude
 #   - any leftover legacy symlink at ~/.config/nono/profiles/claude-code.json
 #   - the bare pre-marketplace symlink at ~/.claude/plugins/nono

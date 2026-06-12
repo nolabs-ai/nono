@@ -2458,7 +2458,7 @@ enum ResolvedBase {
 /// This handles the v0.42 → v0.43 upgrade case where a user profile
 /// `extends: ["claude-code"]` and the inbuilt `claude-code` is gone:
 /// instead of an inscrutable "base profile not found" error, the user
-/// sees the same install prompt that `--profile claude-code` would
+/// sees the same install prompt that `--profile always-further/claude` would
 /// produce, with the chain still resolving cleanly on accept.
 fn load_base_profile_raw(
     name: &str,
@@ -3020,7 +3020,7 @@ pub fn list_profiles() -> Vec<String> {
     }
 
     // Add pack-store profiles — names exposed by installed packs via
-    // `install_as`. Without this, `--profile claude-code` works (the
+    // `install_as`. Without this, `--profile always-further/claude` works (the
     // resolver finds it) but `nono profile list` doesn't surface it,
     // confusing users who expect a one-stop catalogue.
     for (name, _pack_ref) in list_pack_store_profiles() {
@@ -6107,7 +6107,7 @@ mod tests {
     fn test_top_level_schema_field_allowed_in_profile() {
         let profile: Profile = serde_json::from_str(
             r#"{
-                "$schema": "https://nono.dev/schemas/nono-profile.schema.json",
+                "$schema": "https://nono.sh/schemas/nono-profile.schema.json",
                 "meta": { "name": "schema-ok" }
             }"#,
         )

@@ -22,7 +22,17 @@ wget https://github.com/always-further/nono/releases/download/v${VERSION}/nono-c
 sudo dpkg -i nono-cli_${VERSION}_${ARCH}.deb
 ```
 
-### Fedora/RHEL/openSUSE
+### Fedora (COPR)
+
+nono is available from the official [COPR repository](https://copr.fedorainfracloud.org/coprs/always-further/nono/):
+
+```bash
+sudo dnf install 'dnf-command(copr)'
+sudo dnf copr enable always-further/nono
+sudo dnf install nono-cli
+```
+
+### Manual RPM (RHEL/openSUSE and fallback)
 
 Download the `.rpm` package from [GitHub Releases](https://github.com/always-further/nono/releases):
 

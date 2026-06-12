@@ -18,7 +18,7 @@ body:
         - Installation (Homebrew / cargo / binary download)
         - First run (`nono run` returned an error immediately)
         - Writing or loading a profile (JSON)
-        - Using a built-in profile (e.g. `--profile claude-code`)
+        - Using a built-in profile (e.g. `--profile always-further/claude`)
         - nono ran but didn't seem to enforce anything
         - Something else (describe below)
     validations:
@@ -29,7 +29,7 @@ body:
     attributes:
       label: What happened?
       description: What did you try, and what went wrong?
-      placeholder: "I followed the quickstart and ran `nono run --profile claude-code -- claude` but got..."
+      placeholder: "I followed the quickstart and ran `nono run --profile always-further/claude -- claude` but got..."
     validations:
       required: true
 

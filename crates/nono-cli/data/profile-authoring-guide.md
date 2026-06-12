@@ -1032,6 +1032,7 @@ The following variables are expanded in all path fields (`filesystem.*`, includi
 |--------------------|------------|
 | `$HOME`            | User's home directory |
 | `$WORKDIR`         | Working directory (from `--workdir` flag or cwd) |
+| `$REPO_ROOT`       | Git repository root (`--repo-root`, `NONO_REPO_ROOT`, or auto-detected via `git rev-parse`). Left unexpanded when not in a git repo — path is then silently skipped. |
 | `$TMPDIR`          | System temporary directory |
 | `$UID`             | Current user ID |
 | `$XDG_CONFIG_HOME` | XDG config directory (default: `$HOME/.config`) |
@@ -1041,6 +1042,25 @@ The following variables are expanded in all path fields (`filesystem.*`, includi
 | `$XDG_RUNTIME_DIR` | XDG runtime directory (no default; left unexpanded when unset) |
 
 Always use these variables instead of hardcoded absolute paths to keep profiles portable across machines and users.
+
+### Monorepo example
+
+When running from a nested package directory, use `$REPO_ROOT` to reference
+files at the repository root without hardcoding `../` levels:
+
+```json
+{
+  "filesystem": {
+    "read_file": [
+      "$REPO_ROOT/AGENTS.md",
+      "$REPO_ROOT/.cursor/rules/AGENTS.md"
+    ]
+  }
+}
+```
+
+Override the detected root with `--repo-root /path/to/repo` or by setting
+`NONO_REPO_ROOT=/path/to/repo` in your environment.
 
 ## 7. Platform Predicates
 

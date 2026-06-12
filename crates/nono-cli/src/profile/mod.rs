@@ -3750,6 +3750,9 @@ pub(crate) fn is_valid_profile_name(name: &str) -> bool {
 ///
 /// Supported variables:
 /// - $WORKDIR: Working directory (--workdir or cwd)
+/// - $REPO_ROOT: Git repository root. Resolved from --repo-root, NONO_REPO_ROOT,
+///               or auto-detected via `git rev-parse`. Left unexpanded when unset
+///               or not in a git repo (path is then silently skipped).
 /// - $HOME: User's home directory
 /// - $XDG_CONFIG_HOME: XDG config directory
 /// - $NONO_CONFIG: nono config root (`$XDG_CONFIG_HOME/nono`)
@@ -3762,7 +3765,7 @@ pub(crate) fn is_valid_profile_name(name: &str) -> bool {
 ///
 /// If $HOME cannot be determined and the path uses $HOME or XDG variables,
 /// the unexpanded variable is left in place (which will cause the path to not exist).
-pub fn expand_vars(path: &str, workdir: &Path) -> Result<PathBuf> {
+pub fn expand_vars(path: &str, workdir: &Path, repo_root: Option<&Path>) -> Result<PathBuf> {
     use crate::config;
 
     let home = config::validated_home()?;
@@ -3777,6 +3780,14 @@ pub fn expand_vars(path: &str, workdir: &Path) -> Result<PathBuf> {
     };
 
     let expanded = path.replace("$WORKDIR", &workdir.to_string_lossy());
+
+    // $REPO_ROOT: left unexpanded when None (path won't exist → silently skipped
+    // by the existing "does not exist, skipping" logic in capability_ext).
+    let expanded = if let Some(root) = repo_root {
+        expanded.replace("$REPO_ROOT", &root.to_string_lossy())
+    } else {
+        expanded
+    };
 
     // Expand $TMPDIR and $UID
     let tmpdir = config::validated_tmpdir()?;
@@ -4127,10 +4138,10 @@ mod tests {
 
         let workdir = PathBuf::from("/projects/myapp");
 
-        let expanded = expand_vars("$WORKDIR/src", &workdir).expect("valid env");
+        let expanded = expand_vars("$WORKDIR/src", &workdir, None).expect("valid env");
         assert_eq!(expanded, PathBuf::from("/projects/myapp/src"));
 
-        let expanded = expand_vars("$HOME/.config", &workdir).expect("valid env");
+        let expanded = expand_vars("$HOME/.config", &workdir, None).expect("valid env");
         assert_eq!(expanded, PathBuf::from("/home/user/.config"));
     }
 
@@ -4150,12 +4161,12 @@ mod tests {
         ]);
 
         let workdir = PathBuf::from("/projects/myapp");
-        let expanded = expand_vars("$XDG_STATE_HOME/history", &workdir).expect("valid env");
+        let expanded = expand_vars("$XDG_STATE_HOME/history", &workdir, None).expect("valid env");
         assert_eq!(expanded, PathBuf::from("/custom/state/history"));
 
         // Fallback when env var is unset
         _env.remove("XDG_STATE_HOME");
-        let expanded = expand_vars("$XDG_STATE_HOME/history", &workdir).expect("valid env");
+        let expanded = expand_vars("$XDG_STATE_HOME/history", &workdir, None).expect("valid env");
         assert_eq!(expanded, PathBuf::from("/home/user/.local/state/history"));
     }
 
@@ -4171,11 +4182,11 @@ mod tests {
         ]);
 
         let workdir = PathBuf::from("/projects/myapp");
-        let expanded = expand_vars("$XDG_CONFIG_HOME/nono/profiles", &workdir).expect("valid env");
+        let expanded = expand_vars("$XDG_CONFIG_HOME/nono/profiles", &workdir, None).expect("valid env");
         assert_eq!(expanded, PathBuf::from("/custom/config/nono/profiles"));
 
         _env.remove("XDG_CONFIG_HOME");
-        let expanded = expand_vars("$XDG_CONFIG_HOME/nono/profiles", &workdir).expect("valid env");
+        let expanded = expand_vars("$XDG_CONFIG_HOME/nono/profiles", &workdir, None).expect("valid env");
         assert_eq!(expanded, PathBuf::from("/home/user/.config/nono/profiles"));
     }
 
@@ -4195,7 +4206,7 @@ mod tests {
         ]);
 
         let workdir = PathBuf::from("/projects/myapp");
-        let expanded = expand_vars("$NONO_CONFIG/profiles", &workdir).expect("valid env");
+        let expanded = expand_vars("$NONO_CONFIG/profiles", &workdir, None).expect("valid env");
         assert_eq!(
             nono::try_canonicalize(&expanded),
             nono::try_canonicalize(&config_home.join("nono").join("profiles"))
@@ -4214,12 +4225,12 @@ mod tests {
         ]);
 
         let workdir = PathBuf::from("/projects/myapp");
-        let expanded = expand_vars("$XDG_CACHE_HOME/pip", &workdir).expect("valid env");
+        let expanded = expand_vars("$XDG_CACHE_HOME/pip", &workdir, None).expect("valid env");
         assert_eq!(expanded, PathBuf::from("/custom/cache/pip"));
 
         // Fallback when env var is unset
         _env.remove("XDG_CACHE_HOME");
-        let expanded = expand_vars("$XDG_CACHE_HOME/pip", &workdir).expect("valid env");
+        let expanded = expand_vars("$XDG_CACHE_HOME/pip", &workdir, None).expect("valid env");
         assert_eq!(expanded, PathBuf::from("/home/user/.cache/pip"));
     }
 
@@ -4232,18 +4243,54 @@ mod tests {
         let _env = crate::test_env::EnvVarGuard::set_all(&[("XDG_RUNTIME_DIR", "/run/user/1000")]);
 
         let workdir = PathBuf::from("/projects/myapp");
-        let expanded = expand_vars("$XDG_RUNTIME_DIR/pulse", &workdir).expect("valid env");
+        let expanded = expand_vars("$XDG_RUNTIME_DIR/pulse", &workdir, None).expect("valid env");
         assert_eq!(expanded, PathBuf::from("/run/user/1000/pulse"));
 
         // When unset, $XDG_RUNTIME_DIR has no default per the spec — the
         // variable should be left unexpanded so the path won't resolve.
         _env.remove("XDG_RUNTIME_DIR");
-        let expanded = expand_vars("$XDG_RUNTIME_DIR/pulse", &workdir).expect("valid env");
+        let expanded = expand_vars("$XDG_RUNTIME_DIR/pulse", &workdir, None).expect("valid env");
         assert_eq!(
             expanded,
             PathBuf::from("$XDG_RUNTIME_DIR/pulse"),
             "unset XDG_RUNTIME_DIR should leave variable unexpanded"
         );
+    }
+
+    #[test]
+    fn test_expand_vars_repo_root_some() {
+        let workdir = PathBuf::from("/projects/myapp");
+        let repo_root = Path::new("/repo");
+        let expanded =
+            expand_vars("$REPO_ROOT/AGENTS.md", &workdir, Some(repo_root)).expect("valid env");
+        assert_eq!(expanded, PathBuf::from("/repo/AGENTS.md"));
+    }
+
+    #[test]
+    fn test_expand_vars_repo_root_none() {
+        let workdir = PathBuf::from("/projects/myapp");
+        let expanded =
+            expand_vars("$REPO_ROOT/AGENTS.md", &workdir, None).expect("valid env");
+        // When repo_root is None, $REPO_ROOT is left unexpanded so the path
+        // won't resolve (silently skipped by the capability layer).
+        assert_eq!(expanded, PathBuf::from("$REPO_ROOT/AGENTS.md"));
+    }
+
+    #[test]
+    fn test_expand_vars_repo_root_and_workdir_together() {
+        let workdir = PathBuf::from("/projects/myapp");
+        let repo_root = Path::new("/repos/monorepo");
+        let expanded = expand_vars(
+            "$REPO_ROOT/AGENTS.md",
+            &workdir,
+            Some(repo_root),
+        )
+        .expect("valid env");
+        assert_eq!(expanded, PathBuf::from("/repos/monorepo/AGENTS.md"));
+
+        // $WORKDIR expansion still works alongside $REPO_ROOT
+        let expanded = expand_vars("$WORKDIR/src", &workdir, Some(repo_root)).expect("valid env");
+        assert_eq!(expanded, PathBuf::from("/projects/myapp/src"));
     }
 
     #[test]

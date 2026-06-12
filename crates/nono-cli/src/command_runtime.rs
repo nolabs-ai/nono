@@ -204,7 +204,7 @@ pub(crate) fn run_sandbox(mut run_args: RunArgs, silent: bool) -> Result<()> {
                 .or_else(|| std::env::current_dir().ok())
                 .unwrap_or_else(|| PathBuf::from("."));
             for arg in &loaded.command_args {
-                let expanded = profile::expand_vars(arg, &workdir)?;
+                let expanded = profile::expand_vars(arg, &workdir, None)?;
                 cmd_args.push(OsString::from(expanded));
             }
         }

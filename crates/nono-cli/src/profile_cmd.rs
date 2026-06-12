@@ -2824,7 +2824,7 @@ fn resolve_to_manifest(
 
     // Helper: expand a path template and convert to string for the manifest
     let expand = |tmpl: &str| -> Result<String> {
-        let expanded = profile::expand_vars(tmpl, workdir)?;
+        let expanded = profile::expand_vars(tmpl, workdir, None)?;
         Ok(expanded.to_string_lossy().into_owned())
     };
 
@@ -2896,7 +2896,7 @@ fn resolve_to_manifest(
         .filesystem
         .bypass_protection
         .iter()
-        .filter_map(|tmpl| profile::expand_vars(tmpl, workdir).ok())
+        .filter_map(|tmpl| profile::expand_vars(tmpl, workdir, None).ok())
         .map(|p| {
             if p.exists() {
                 p.canonicalize().unwrap_or(p)

@@ -15,6 +15,19 @@ pub const POST_EXIT_PTY_DRAIN_TIMEOUT: Duration = Duration::from_millis(100);
 /// Poll interval for the non-blocking `waitpid` loop.
 pub const CHILD_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
+/// Maximum time to wait, before a supervised `fork()`, for transient worker
+/// threads (tokio blocking-pool DNS workers, aws-lc-rs crypto pool) to be
+/// reaped down to the fork-safe budget. These threads are spawned on demand
+/// during proxy startup / trust verification and parked or torn down shortly
+/// after, so a brief settle window turns the intermittent over-budget error
+/// into a reliable fork. The window is a ceiling: as soon as the count is
+/// within budget we proceed immediately.
+pub const FORK_THREAD_SETTLE_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Poll interval while waiting for the thread count to settle before a
+/// supervised `fork()`.
+pub const FORK_THREAD_SETTLE_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
 // pty_proxy
 
 /// Read timeout on the attach socket when reading the request-kind byte.

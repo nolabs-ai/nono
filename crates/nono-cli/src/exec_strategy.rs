@@ -597,50 +597,9 @@ pub fn execute_supervised(
         .chain(std::iter::once(std::ptr::null()))
         .collect();
 
-    // Validate threading before fork.
-    // Supervised mode applies sandbox in child (allocates), so threads holding
-    // allocator locks would cause deadlock. Both KeyringExpected and CryptoExpected
-    // threads are safe: keyring threads are idle XPC dispatch workers (macOS) or
-    // D-Bus workers (Linux) parked after the synchronous call completes; crypto
-    // threads are idle aws-lc-rs pool workers parked on condvars. Neither holds
-    // allocator locks.
-    let thread_count = get_thread_count()?;
-    match (config.threading, thread_count) {
-        (_, 1) => {}
-        (ThreadingContext::KeyringExpected, n) if n <= MAX_KEYRING_THREADS => {
-            debug!(
-                "Supervised fork with {} threads (keyring workers, idle after sync call)",
-                n
-            );
-        }
-        (ThreadingContext::CryptoExpected, n) if n <= MAX_CRYPTO_THREADS => {
-            debug!(
-                "Supervised fork with {} threads (crypto pool workers, idle on condvar)",
-                n
-            );
-        }
-        (ThreadingContext::Strict, n) => {
-            return Err(NonoError::SandboxInit(format!(
-                "Cannot fork in supervised mode: process has {} threads (expected 1). \
-                 This is a bug - fork() requires single-threaded execution.",
-                n
-            )));
-        }
-        (ThreadingContext::KeyringExpected, n) => {
-            return Err(NonoError::SandboxInit(format!(
-                "Cannot fork: process has {} threads (max {} with keyring). \
-                 Unexpected threading detected.",
-                n, MAX_KEYRING_THREADS
-            )));
-        }
-        (ThreadingContext::CryptoExpected, n) => {
-            return Err(NonoError::SandboxInit(format!(
-                "Cannot fork: process has {} threads (max {} with crypto pool). \
-                 Unexpected threading detected.",
-                n, MAX_CRYPTO_THREADS
-            )));
-        }
-    }
+    // Validate threading before fork. See `validate_fork_thread_count` for why
+    // a bounded settle window precedes the decision.
+    validate_fork_thread_count(config.threading)?;
 
     // NOTE: We do not set PR_SET_DUMPABLE(0) before fork because the parent may
     // need to inspect the child's memory for seccomp-notify requests. Instead,
@@ -1938,6 +1897,78 @@ impl Drop for SignalForwardingGuard {
 /// Used to verify single-threaded execution before fork().
 /// Returns an error if the count cannot be determined, since fork()
 /// safety depends on knowing the exact thread count.
+/// The fork-safe thread budget for a given threading context, or `None` if the
+/// context is open-ended (only the main thread is permitted).
+fn fork_thread_budget(threading: ThreadingContext) -> usize {
+    match threading {
+        ThreadingContext::Strict => 1,
+        ThreadingContext::KeyringExpected => MAX_KEYRING_THREADS,
+        ThreadingContext::CryptoExpected => MAX_CRYPTO_THREADS,
+    }
+}
+
+/// Validate that the process is safe to `fork()` in supervised mode.
+///
+/// Supervised mode applies the sandbox in the child (which allocates), so any
+/// parent thread holding an allocator lock at fork time would deadlock the
+/// child. We therefore cap the thread count at a context-specific budget. The
+/// permitted non-main threads are all known-idle: keyring workers are parked
+/// XPC/D-Bus dispatch threads after their synchronous call returns, and crypto
+/// workers are aws-lc-rs pool threads parked on condvars. Neither holds
+/// allocator locks.
+///
+/// The thread count can transiently exceed the budget: tokio's blocking pool
+/// spawns an on-demand worker for the first DNS lookup during proxy startup,
+/// and crypto verification spins up pool threads, both of which are reaped or
+/// parked shortly after. Rather than fail spuriously when the check lands in
+/// that window, we wait up to [`timeouts::FORK_THREAD_SETTLE_TIMEOUT`] for the
+/// count to settle into budget before deciding. This never relaxes the cap —
+/// if the count stays over budget for the whole window, we still refuse to
+/// fork.
+fn validate_fork_thread_count(threading: ThreadingContext) -> Result<()> {
+    let budget = fork_thread_budget(threading);
+
+    let start = Instant::now();
+    let mut thread_count = get_thread_count()?;
+    while thread_count > budget && start.elapsed() < timeouts::FORK_THREAD_SETTLE_TIMEOUT {
+        std::thread::sleep(timeouts::FORK_THREAD_SETTLE_POLL_INTERVAL);
+        thread_count = get_thread_count()?;
+    }
+
+    if thread_count <= budget {
+        match threading {
+            ThreadingContext::Strict => {}
+            ThreadingContext::KeyringExpected => debug!(
+                "Supervised fork with {} threads (keyring workers, idle after sync call)",
+                thread_count
+            ),
+            ThreadingContext::CryptoExpected => debug!(
+                "Supervised fork with {} threads (crypto pool workers, idle on condvar)",
+                thread_count
+            ),
+        }
+        return Ok(());
+    }
+
+    Err(match threading {
+        ThreadingContext::Strict => NonoError::SandboxInit(format!(
+            "Cannot fork in supervised mode: process has {} threads (expected 1). \
+             This is a bug - fork() requires single-threaded execution.",
+            thread_count
+        )),
+        ThreadingContext::KeyringExpected => NonoError::SandboxInit(format!(
+            "Cannot fork: process has {} threads (max {} with keyring). \
+             Unexpected threading detected.",
+            thread_count, MAX_KEYRING_THREADS
+        )),
+        ThreadingContext::CryptoExpected => NonoError::SandboxInit(format!(
+            "Cannot fork: process has {} threads (max {} with crypto pool). \
+             Unexpected threading detected.",
+            thread_count, MAX_CRYPTO_THREADS
+        )),
+    })
+}
+
 fn get_thread_count() -> Result<usize> {
     #[cfg(target_os = "linux")]
     {
@@ -3538,6 +3569,36 @@ mod tests {
     use nix::sys::termios::{
         ControlFlags, InputFlags, LocalFlags, OutputFlags, SpecialCharacterIndices,
     };
+
+    #[test]
+    fn test_fork_thread_budget_per_context() {
+        assert_eq!(fork_thread_budget(ThreadingContext::Strict), 1);
+        assert_eq!(
+            fork_thread_budget(ThreadingContext::KeyringExpected),
+            MAX_KEYRING_THREADS
+        );
+        assert_eq!(
+            fork_thread_budget(ThreadingContext::CryptoExpected),
+            MAX_CRYPTO_THREADS
+        );
+    }
+
+    #[test]
+    fn test_validate_fork_thread_count_returns_promptly_within_budget() {
+        // The crypto budget is large enough to cover the test runner's own
+        // worker threads, so validation should succeed without ever exhausting
+        // the settle window. This guards against the settle loop blocking for
+        // the full timeout when the count is already in budget.
+        let start = Instant::now();
+        let result = validate_fork_thread_count(ThreadingContext::CryptoExpected);
+        let elapsed = start.elapsed();
+        if result.is_ok() {
+            assert!(
+                elapsed < timeouts::FORK_THREAD_SETTLE_TIMEOUT,
+                "validation within budget should not consume the settle window (took {elapsed:?})"
+            );
+        }
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

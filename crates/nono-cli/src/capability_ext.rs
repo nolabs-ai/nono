@@ -650,10 +650,11 @@ impl CapabilitySetExt for CapabilitySet {
         // the banner but NOT tracked for rollback snapshots (only User-sourced paths
         // representing the project workspace are tracked).
         let fs = &profile.filesystem;
+        let repo_root = args.repo_root.as_deref();
 
         // Directories with read+write access
         for path_template in &fs.allow {
-            let path = expand_vars(path_template, workdir)?;
+            let path = expand_vars(path_template, workdir, repo_root)?;
             validate_requested_dir(
                 &path,
                 "Profile",
@@ -669,7 +670,7 @@ impl CapabilitySetExt for CapabilitySet {
 
         // Read-only filesystem entries (directory or file)
         for path_template in &fs.read {
-            let path = expand_vars(path_template, workdir)?;
+            let path = expand_vars(path_template, workdir, repo_root)?;
             let label = format!("Profile path '{}' does not exist, skipping", path_template);
 
             let reads_file = std::fs::metadata(&path)
@@ -702,7 +703,7 @@ impl CapabilitySetExt for CapabilitySet {
 
         // Directories with write-only access
         for path_template in &fs.write {
-            let path = expand_vars(path_template, workdir)?;
+            let path = expand_vars(path_template, workdir, repo_root)?;
             validate_requested_dir(
                 &path,
                 "Profile",
@@ -718,7 +719,7 @@ impl CapabilitySetExt for CapabilitySet {
 
         // Single files with read+write access
         for path_template in &fs.allow_file {
-            let path = expand_vars(path_template, workdir)?;
+            let path = expand_vars(path_template, workdir, repo_root)?;
             let label = format!("Profile file '{}' does not exist, skipping", path_template);
             if let Some(mut cap) = try_new_profile_exact_path(
                 &path,
@@ -737,7 +738,7 @@ impl CapabilitySetExt for CapabilitySet {
 
         // Single files with read-only access
         for path_template in &fs.read_file {
-            let path = expand_vars(path_template, workdir)?;
+            let path = expand_vars(path_template, workdir, repo_root)?;
             let label = format!("Profile file '{}' does not exist, skipping", path_template);
             if let Some(mut cap) = try_new_profile_exact_path(
                 &path,
@@ -753,7 +754,7 @@ impl CapabilitySetExt for CapabilitySet {
 
         // Single files with write-only access
         for path_template in &fs.write_file {
-            let path = expand_vars(path_template, workdir)?;
+            let path = expand_vars(path_template, workdir, repo_root)?;
             let label = format!("Profile file '{}' does not exist, skipping", path_template);
             if let Some(mut cap) = try_new_profile_exact_path(
                 &path,
@@ -775,7 +776,7 @@ impl CapabilitySetExt for CapabilitySet {
         // implied FsCapability with matching access mode. Source is
         // marked as Profile so `--dry-run -v` can show provenance.
         for path_template in &fs.unix_socket {
-            let path = expand_vars(path_template, workdir)?;
+            let path = expand_vars(path_template, workdir, repo_root)?;
             validate_requested_file(
                 &path,
                 "Profile",
@@ -802,7 +803,7 @@ impl CapabilitySetExt for CapabilitySet {
         }
 
         for path_template in &fs.unix_socket_bind {
-            let path = expand_vars(path_template, workdir)?;
+            let path = expand_vars(path_template, workdir, repo_root)?;
             validate_requested_file(
                 &path,
                 "Profile",
@@ -843,7 +844,7 @@ impl CapabilitySetExt for CapabilitySet {
         }
 
         for path_template in &fs.unix_socket_dir {
-            let path = expand_vars(path_template, workdir)?;
+            let path = expand_vars(path_template, workdir, repo_root)?;
             validate_requested_dir(
                 &path,
                 "Profile",
@@ -870,7 +871,7 @@ impl CapabilitySetExt for CapabilitySet {
         }
 
         for path_template in &fs.unix_socket_dir_bind {
-            let path = expand_vars(path_template, workdir)?;
+            let path = expand_vars(path_template, workdir, repo_root)?;
             validate_requested_dir(
                 &path,
                 "Profile",
@@ -897,7 +898,7 @@ impl CapabilitySetExt for CapabilitySet {
         }
 
         for path_template in &fs.unix_socket_subtree {
-            let path = expand_vars(path_template, workdir)?;
+            let path = expand_vars(path_template, workdir, repo_root)?;
             validate_requested_dir(
                 &path,
                 "Profile",
@@ -924,7 +925,7 @@ impl CapabilitySetExt for CapabilitySet {
         }
 
         for path_template in &fs.unix_socket_subtree_bind {
-            let path = expand_vars(path_template, workdir)?;
+            let path = expand_vars(path_template, workdir, repo_root)?;
             validate_requested_dir(
                 &path,
                 "Profile",
@@ -956,7 +957,7 @@ impl CapabilitySetExt for CapabilitySet {
         // allow/read/write entries are already applied above — these branches
         // apply the remaining deny and deny-command surfaces.
         for path_template in &profile.filesystem.deny {
-            let path = expand_vars(path_template, workdir)?;
+            let path = expand_vars(path_template, workdir, repo_root)?;
             let path_str = path.to_str().ok_or_else(|| {
                 NonoError::ConfigParse(format!(
                     "Profile filesystem deny path contains non-UTF-8 bytes: {}",
@@ -1048,7 +1049,7 @@ impl CapabilitySetExt for CapabilitySet {
         // while keeping the security posture unchanged.
         let mut profile_overrides = Vec::with_capacity(profile.filesystem.bypass_protection.len());
         for path_template in &profile.filesystem.bypass_protection {
-            let path = expand_vars(path_template, workdir)?;
+            let path = expand_vars(path_template, workdir, repo_root)?;
             if path.exists() {
                 profile_overrides.push(path);
             } else {
@@ -3138,5 +3139,69 @@ mod tests {
         assert_eq!(socks.len(), 1);
         assert_eq!(socks[0].mode, UnixSocketMode::ConnectBind);
         assert_eq!(socks[0].scope, SocketScope::DirSubtree);
+    }
+
+    #[test]
+    fn test_from_profile_repo_root_read_file() {
+        let dir = tempdir().expect("tmpdir");
+        // Create the file that $REPO_ROOT will expand to
+        let agents_file = dir.path().join("AGENTS.md");
+        std::fs::write(&agents_file, "# agents").expect("write AGENTS.md");
+
+        let profile_path = dir.path().join("repo-root-test.json");
+        std::fs::write(
+            &profile_path,
+            r#"{
+                "meta": { "name": "repo-root-test" },
+                "filesystem": { "read_file": ["$REPO_ROOT/AGENTS.md"] }
+            }"#,
+        )
+        .expect("write profile");
+        let profile = crate::profile::load_profile_from_path(&profile_path).expect("load profile");
+
+        let workdir = tempdir().expect("workdir");
+        let args = SandboxArgs {
+            repo_root: Some(dir.path().to_path_buf()),
+            ..SandboxArgs::default()
+        };
+
+        let (caps, _) =
+            from_profile_locked(&profile, workdir.path(), &args).expect("build caps");
+        let fs_caps: Vec<_> = caps
+            .fs_capabilities()
+            .iter()
+            .filter(|c| c.source == CapabilitySource::Profile)
+            .collect();
+        assert!(
+            !fs_caps.is_empty(),
+            "expected at least one profile fs capability for $REPO_ROOT/AGENTS.md"
+        );
+    }
+
+    #[test]
+    fn test_from_profile_repo_root_unexpanded_skipped() {
+        // When args.repo_root is None, $REPO_ROOT is left unexpanded and the path
+        // doesn't exist, so it should be silently skipped (no error, no cap).
+        let dir = tempdir().expect("tmpdir");
+        let profile_path = dir.path().join("repo-root-none.json");
+        std::fs::write(
+            &profile_path,
+            r#"{
+                "meta": { "name": "repo-root-none" },
+                "filesystem": { "read_file": ["$REPO_ROOT/AGENTS.md"] }
+            }"#,
+        )
+        .expect("write profile");
+        let profile = crate::profile::load_profile_from_path(&profile_path).expect("load profile");
+
+        let workdir = tempdir().expect("workdir");
+        let args = SandboxArgs::default(); // repo_root = None
+
+        // Should not error: unexpanded path doesn't exist → silently skipped
+        let result = from_profile_locked(&profile, workdir.path(), &args);
+        assert!(
+            result.is_ok(),
+            "from_profile should not error when $REPO_ROOT is unexpanded"
+        );
     }
 }

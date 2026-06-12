@@ -1,5 +1,14 @@
 # Changelog
 
+## [Unreleased]
+
+### Features
+
+- *(cli)* `$REPO_ROOT` variable expansion in profile path fields: resolves to the git
+  repository root, auto-detected via `git rev-parse --show-toplevel` with
+  worktree support. Override via `--repo-root DIR` flag or `NONO_REPO_ROOT` env
+  var. Left unexpanded (path silently skipped) when not in a git repo.
+
 ## [0.62.0] - 2026-06-07
 
 ### Bug Fixes

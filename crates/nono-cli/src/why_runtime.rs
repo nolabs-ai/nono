@@ -130,12 +130,13 @@ pub(crate) fn run_why(args: WhyArgs) -> Result<()> {
             write_file: args.write_file.clone(),
             block_net: args.block_net,
             workdir: args.workdir.clone(),
+            repo_root: args.repo_root.clone(),
             ..SandboxArgs::default()
         };
 
         let mut override_paths = Vec::new();
         for tmpl in &profile.filesystem.bypass_protection {
-            let expanded = profile::expand_vars(tmpl, &workdir)?;
+            let expanded = profile::expand_vars(tmpl, &workdir, None)?;
             if expanded.exists() {
                 if let Ok(canonical) = expanded.canonicalize() {
                     override_paths.push(canonical);
@@ -169,6 +170,7 @@ pub(crate) fn run_why(args: WhyArgs) -> Result<()> {
             write_file: args.write_file.clone(),
             block_net: args.block_net,
             workdir: args.workdir.clone(),
+            repo_root: args.repo_root.clone(),
             ..SandboxArgs::default()
         };
 

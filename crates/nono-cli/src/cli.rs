@@ -1134,6 +1134,11 @@ pub struct SandboxArgs {
     #[arg(long, value_name = "DIR", help_heading = "FILESYSTEM")]
     pub workdir: Option<PathBuf>,
 
+    /// Repository root for $REPO_ROOT expansion in profiles.
+    /// Auto-detected via git when unset. Override with NONO_REPO_ROOT env var.
+    #[arg(long, value_name = "DIR", env = "NONO_REPO_ROOT", help_heading = "FILESYSTEM")]
+    pub repo_root: Option<PathBuf>,
+
     // ── Network ──────────────────────────────────────────────────────────
     /// Block outbound network access (allowed by default)
     /// ALIAS(canonical="--block-net", introduced="v0.0.0", remove_by="indefinite", issue="#302")
@@ -1473,6 +1478,11 @@ pub struct WrapSandboxArgs {
     #[arg(long, value_name = "DIR", help_heading = "FILESYSTEM")]
     pub workdir: Option<PathBuf>,
 
+    /// Repository root for $REPO_ROOT expansion in profiles.
+    /// Auto-detected via git when unset. Override with NONO_REPO_ROOT env var.
+    #[arg(long, value_name = "DIR", env = "NONO_REPO_ROOT", help_heading = "FILESYSTEM")]
+    pub repo_root: Option<PathBuf>,
+
     // ── Network ──────────────────────────────────────────────────────────
     /// Block outbound network access (allowed by default)
     /// ALIAS(canonical="--block-net", introduced="v0.0.0", remove_by="indefinite", issue="#302")
@@ -1610,6 +1620,7 @@ impl From<WrapSandboxArgs> for SandboxArgs {
             suppress_save_prompt: args.suppress_save_prompt,
             allow_cwd: args.allow_cwd,
             workdir: args.workdir,
+            repo_root: args.repo_root,
             block_net: args.block_net,
             allow_net: false,
             network_profile: None,
@@ -1912,6 +1923,11 @@ pub struct WhyArgs {
     /// Working directory for $WORKDIR expansion in profiles
     #[arg(long, value_name = "DIR", help_heading = "CONTEXT")]
     pub workdir: Option<PathBuf>,
+
+    /// Repository root for $REPO_ROOT expansion in profiles.
+    /// Auto-detected via git when unset. Override with NONO_REPO_ROOT env var.
+    #[arg(long, value_name = "DIR", env = "NONO_REPO_ROOT", help_heading = "CONTEXT")]
+    pub repo_root: Option<PathBuf>,
 
     /// Print help
     #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]

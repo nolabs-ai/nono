@@ -3,7 +3,7 @@
 <img src="assets/logo.gif" alt="nono logo" width="600"/>
 
 <p>
-  From the creator of
+  Built by the team that brought you
   <a href="https://sigstore.dev"><strong>Sigstore</strong></a>
   <br/>
   <sub>The standard for secure software attestation, used by PyPI, npm, brew, and Maven Central</sub>
@@ -31,72 +31,60 @@
 > [!NOTE]
 > In the lead-up to a 1.0 release, APIs are stabilizing. API changes may still occur where necessary, but will be kept to a minimum.
 
-nono is a capability-based, policy-governed runtime for AI agents.
+**Run AI agents in a zero latency sandbox in seconds and with zero setup** — *Claude Code, Codex, Pi, CoPilot, Hermes, OpenCode, OpenClaw* and more — nono gets you up and running within seconds, with no daemon, no container, no VM, and no disk space usage. Out of the box, nono enforces a least-privilege sandbox and supports macOS, Linux, and Windows (WSL2).
 
-It gives a process narrowly scoped access to the host resources it actually needs: specific paths, network destinations, sockets, environment variables, credentials, and operations. Policies are explicit, composable, auditable, and enforced by kernel primitives.
+From here **fork the config**, tweak it, theme it, make it your own, and share it with your team or the community via the [nono registry](https://registry.nono.sh).
 
-nono fits the space between "run the agent directly on my machine with full access to keys and files" and "seal it inside a separate guest OS." Agents work inside real development environments, with host resources modeled as explicit capabilities.
+**Want to operationalise and run at scale or within your team?** Engineers at some of the largest tech companies in the world use nono as part of their workflows or to run AI agents in production.
 
-A profile states what the agent may touch, and nono applies it. The core library is policy-free: it applies only the capabilities a caller provides. The CLI, profiles, and registry packages carry the policy - and all inbuilt policy can be extended or overridden, since policy is fully composable.
-
-For organizations, that means policy can be reviewed, versioned, distributed, and reused. A team can ship a standard profile for a class of agents, collect supervised audit records, preserve rollback evidence, and keep sensitive credentials in a trusted proxy path instead of injecting them directly into the agent process.
-
+**Copied by many** — nono pioneered the zero-latency, zero-setup agent sandbox, and continues to innovate and lead the way in agent sandboxing.
 
 ---
 
-## Installation
+## Quickstart
 
-**Platform support:** macOS, Linux, and [WSL2](https://nono.sh/docs/cli/internals/wsl2).
-
-**Install:**
+#### macOS / Linux (Homebrew)
 ```bash
 brew install nono
 ```
 
-Other options in the [Installation Guide](https://docs.nono.sh/cli/getting_started/installation).
+**Other platforms** — Debian/Ubuntu, Fedora, Arch, RHEL, openSUSE, WSL2, and Nix: [see install instructions](https://docs.nono.sh/docs/installation).
 
----
+## Run it!
 
-## Quick Start
-
-`nono pull` agent packages from the [registry](https://registry.nono.sh) for all popular agents — Claude Code, Codex, Pi, Hermes, OpenCode, OpenClaw, and more — or [build your own](https://nono.sh/docs/cli/features/package-publishing) and securely share plugins, SKILLS, and hooks with the community or your team.
+Search for an agent in the registry, then run it:
 
 ```bash
-nono run --profile always-further/claude -- claude
+$ nono search opencode
+always-further/opencode	-	Official Always Further Opencode Plugin
+
+$ nono run --profile always-further/opencode -- opencode
 ```
 
-## Libraries and Bindings
+That's it. `opencode` now runs with read/write access to the current directory and **nothing else** — your SSH keys, your cloud credentials, the rest of your disk are invisible to it.
 
-The core is a Rust library that can be embedded into any application. Policy-free - it applies only what clients explicitly request.
+Profiles for all the popular agents live at [registry.nono.sh](https://registry.nono.sh), secured and ready to pull. Each one bundles the right filesystem scope, network allowlist, hooks, skills and more.
 
-```rust
-use nono::{CapabilitySet, Sandbox};
+## Make it your own!
 
-let mut caps = CapabilitySet::new();
-caps.allow_read("/data/models")?;
-caps.allow_write("/tmp/workspace")?;
+Outgrow the defaults? Scaffold a profile and tweak it — same command you already know:
 
-Sandbox::apply(&caps)?;  // Irreversible -- kernel-enforced from here on
+```bash
+nono profile init opencode --extends always-further/opencode
+nono run --profile opencode -- opencode
 ```
 
-Also available as [Python](https://github.com/always-further/nono-py) , [TypeScript](https://github.com/always-further/nono-ts), [Go](https://github.com/always-further/nono-go)  bindings.
+Are you an agent developer and want to publish your own agent package? We would love to have you and promote your work! [See the docs](https://nono.sh/docs/cli/features/package-publishing).
 
-## Key Features
+## Ready to go deep?
 
-| Feature | Description |
-|---------|-------------|
-| **Kernel sandbox** | Landlock (Linux) + Seatbelt (macOS). Irreversible, inherited by child processes. |
-| **Credential injection** | Proxy mode keeps API keys outside the sandbox entirely. Supports keystore, 1Password, Apple Passwords. |
-| **Attestation** | Sigstore-based signing and verification of instruction files (SKILLS.md, CLAUDE.md, etc.). |
-| **Network filtering** | Allowlist-based host and endpoint filtering via local proxy. Cloud metadata endpoints hard-denied. |
-| **Snapshots** | Content-addressable rollback with SHA-256 dedup and Merkle tree integrity. |
-| **Policy profiles** | Pre-built profiles for popular agents and use cases. Custom profile builder for your own needs. |
-| **Audit logs** | Default event audit for supervised runs, optional append-only integrity hashing, and optional rollback-backed filesystem evidence. |
-| **Cross-platform** | Support for macOS, Linux, and WSL2. Native Windows support in planning. |
-| **Multiplexing** | Run multiple agents in parallel with separate sandboxes. Attach/detach to long-running agents. |
-| **Runs anywhere** | Local CLI, CI pipelines, Containers / Kubernetes, cloud VMs, microVMs. |
+Head over to the [docs](https://nono.sh/docs) and discover nono's rich composable policy system, credentials injection, L7 filtering, supply chain security, rollback, multiplexing, audit and more.
 
-See the [full documentation](https://docs.nono.sh) for details and configuration.
+## Library support
+
+nono provides FFI bindings for Rust, Python, TypeScript, and Go.
+
+Also available as [Python](https://github.com/always-further/nono-py), [TypeScript](https://github.com/always-further/nono-ts), and [Go](https://github.com/always-further/nono-go) bindings.
 
 ## Contributing
 

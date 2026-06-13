@@ -52,11 +52,13 @@ brew install nono
 
 ## Run it!
 
-Find an agent in the registry and run it:
+Search for an agent in the registry, then run it:
 
 ```bash
-nono search opencode
-nono run --profile always-further/opencode -- opencode
+$ nono search opencode
+always-further/opencode	-	Official Always Further Opencode Plugin
+
+$ nono run --profile always-further/opencode -- opencode
 ```
 
 That's it. `opencode` now runs with read/write access to the current directory and **nothing else** — your SSH keys, your cloud credentials, the rest of your disk are invisible to it.
@@ -76,13 +78,7 @@ Are you an agent developer and want to publish your own agent package? We would 
 
 ## Ready to go deep?
 
-nono provides credentials injection, L7 filtering, supply chain security, rollback, multiplexing, audit and more. These features have since been copied by many other sandboxes, and nono continues to innovate.
-
-## Built by security experts
-
-There are many sandboxes out there, often vibe coded in a few evenings, but nono is built by security experts with decades of experience in the field. The team behind nono has been responsible for securing some of the largest software supply chains in the world, and they bring that expertise to every aspect of nono's design and implementation.
-
-If you plan on using nono in production, you can rest assured that it has been designed and implemented by a team with experience of building secure, stable, and scalable systems.
+Head over to the [docs](https://nono.sh/docs) and discover nono's rich composable policy system, credentials injection, L7 filtering, supply chain security, rollback, multiplexing, audit and more.
 
 ## Library support
 

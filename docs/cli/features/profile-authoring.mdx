@@ -137,6 +137,9 @@ With `--full`, additional sections are included as empty stubs for all additive 
   "rollback": {
     "exclude_patterns": [],
     "exclude_globs": []
+  },
+  "diagnostics": {
+    "suppress_system_services": []
   }
 }
 ```
@@ -376,6 +379,29 @@ allowing the denied path.
 The post-run save prompt offers the same behavior interactively: choose
 `suppress` to save all listed denied-path suggestions here instead of adding
 them as `read`, `read_file`, `allow`, or `allow_file` grants.
+
+### Suppressing Expected macOS System-Service Diagnostics
+
+Use `diagnostics.suppress_system_services` for macOS Seatbelt operations you
+intentionally deny but do not want to see in every diagnostic footer:
+
+```json
+{
+  "diagnostics": {
+    "suppress_system_services": ["user-preference-read"]
+  }
+}
+```
+
+Common values include `user-preference-read` (CFPreferences probes from npm and
+similar tools) and `forbidden-exec-sugid`. This does not grant access and does
+not change sandbox enforcement — it only hides matching violations from
+post-run output and save-profile prompts. Values merge additively across
+profile inheritance, like other list fields.
+
+For path denials that should stay visible but skip save prompts, use
+`filesystem.suppress_save_prompt` instead. To disable all diagnostic footers,
+use `--no-diagnostics`.
 
 ### Exclude Inherited Groups
 

@@ -3,7 +3,7 @@
 <img src="assets/logo.gif" alt="nono logo" width="600"/>
 
 <p>
-  From the creator of
+  Built by the team that brought you
   <a href="https://sigstore.dev"><strong>Sigstore</strong></a>
   <br/>
   <sub>The standard for secure software attestation, used by PyPI, npm, brew, and Maven Central</sub>
@@ -37,7 +37,7 @@ From here **fork the config**, tweak it, theme it, make it your own, and share i
 
 **Want to operationalise and run at scale or within your team?** Engineers at some of the largest tech companies in the world use nono as part of their workflows or to run AI agents in production.
 
-**The OG of agent sandboxing** — copied by many, nono continues to lead the way with new features and innovations: credential protection, L7 filtering, supply chain security, rollback, multiplexing, audit and more.
+**Copied by many** — nono pioneered the zero-latency, zero-setup agent sandbox, and continues to innovate and lead the way in agent sandboxing.
 
 ---
 

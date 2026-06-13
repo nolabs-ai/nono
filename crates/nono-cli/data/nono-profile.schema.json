@@ -738,6 +738,11 @@
           "type": "array",
           "items": { "type": "string", "pattern": "^([^*]+\\*?|\\*)$" },
           "description": "Deny-list of environment variable names stripped from the sandboxed process. Supports exact names (\"GH_TOKEN\") and prefix patterns ending with * (\"GITHUB_*\"). Denied vars are stripped even if they also appear in allow_vars."
+        },
+        "set_vars": {
+          "type": "object",
+          "additionalProperties": { "type": "string" },
+          "description": "Static environment variables injected after environment filtering and before credential injection. PATH and NONO_* are reserved. Values support variable expansion ($HOME, $WORKDIR, $TMPDIR, $XDG_*, $NONO_PACKAGES)."
         }
       }
     },

@@ -400,6 +400,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         af_unix_mediation: flags.af_unix_mediation,
         allowed_env_vars: flags.allowed_env_vars,
         denied_env_vars: flags.denied_env_vars,
+        set_vars: flags.set_vars.unwrap_or_default(),
     };
 
     match strategy {

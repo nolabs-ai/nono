@@ -41,6 +41,7 @@ use tracing::{debug, info, warn};
 pub(crate) use env_sanitization::is_dangerous_env_var;
 use env_sanitization::should_skip_env_var;
 pub(crate) use env_sanitization::validate_env_var_patterns;
+pub(crate) use env_sanitization::validate_set_vars;
 
 /// Resolve a program name to its absolute path.
 ///
@@ -244,6 +245,10 @@ pub struct ExecConfig<'a> {
     /// name or prefix pattern (e.g. `"GITHUB_*"`) are stripped even if they
     /// also appear in `allowed_env_vars`. Nono-injected credentials bypass this.
     pub denied_env_vars: Option<Vec<String>>,
+    /// Static environment variables (`environment.set_vars`) injected after host
+    /// env filtering and before `env_vars` (credentials/proxy/hooks). Values are
+    /// already variable-expanded. Bypasses allow/deny filtering by design.
+    pub set_vars: Vec<(String, String)>,
 }
 
 #[derive(Clone, Copy)]
@@ -366,6 +371,12 @@ pub fn execute_direct(config: &ExecConfig<'_>) -> Result<()> {
 
     cmd.args(cmd_args).env("NONO_CAP_FILE", config.cap_file);
 
+    // Static profile vars (set_vars): after host filtering, before credentials
+    // so injected credentials win on conflict.
+    for (key, value) in &config.set_vars {
+        cmd.env(key, value);
+    }
+
     for (key, value) in &config.env_vars {
         cmd.env(key, value);
     }
@@ -410,6 +421,43 @@ pub fn execute_direct(config: &ExecConfig<'_>) -> Result<()> {
 /// parent can capture terminal output for diagnostics while the child still sees
 /// a TTY. Otherwise the child inherits the parent's terminal directly.
 /// The parent prints diagnostics and rollback UI after the child exits.
+///
+/// Append `set_vars` to a raw `execve` environment vector, deduplicating by key.
+///
+/// `env_c` is a raw `KEY=VALUE` vector passed straight to `execve` — unlike
+/// [`std::process::Command::env`] it does not collapse duplicate keys, so we
+/// must dedupe by hand. Passing duplicate keys to `execve` is
+/// platform-dependent and a potential dynamic-linker-bypass vector.
+///
+/// Precedence matches `execute_direct`: credentials (`env_vars`) win over
+/// `set_vars`, which win over inherited host vars. A `set_vars` key already
+/// destined to be set by `env_vars` is skipped; any earlier entry (e.g. an
+/// inherited host var) with the same key is removed before the new value is
+/// pushed.
+fn push_set_vars(
+    env_c: &mut Vec<CString>,
+    set_vars: &[(String, String)],
+    env_vars: &[(&str, &str)],
+) {
+    for (key, value) in set_vars {
+        if env_vars.iter().any(|(ek, _)| ek == key) {
+            continue;
+        }
+        let mut prefix = Vec::with_capacity(key.len() + 1);
+        prefix.extend_from_slice(key.as_bytes());
+        prefix.push(b'=');
+        env_c.retain(|cstr| !cstr.as_bytes().starts_with(&prefix));
+
+        let mut kv = Vec::with_capacity(key.len() + 1 + value.len() + 1);
+        kv.extend_from_slice(key.as_bytes());
+        kv.push(b'=');
+        kv.extend_from_slice(value.as_bytes());
+        if let Ok(cstr) = CString::new(kv) {
+            env_c.push(cstr);
+        }
+    }
+}
+
 pub fn execute_supervised(
     config: &ExecConfig<'_>,
     supervisor: Option<&SupervisorConfig<'_>>,
@@ -508,6 +556,10 @@ pub fn execute_supervised(
     {
         env_c.push(cstr);
     }
+
+    // Static profile vars (set_vars): after host filtering, before credentials
+    // so injected credentials win on conflict.
+    push_set_vars(&mut env_c, &config.set_vars, &config.env_vars);
 
     // Add user-specified environment variables (secrets, etc.)
     for (key, value) in &config.env_vars {
@@ -3538,6 +3590,75 @@ mod tests {
     use nix::sys::termios::{
         ControlFlags, InputFlags, LocalFlags, OutputFlags, SpecialCharacterIndices,
     };
+
+    fn env_strings(env_c: &[CString]) -> Vec<String> {
+        env_c
+            .iter()
+            .map(|c| c.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn push_set_vars_appends_new_keys() {
+        let mut env_c = vec![CString::new("HOME=/home/x").expect("cstring")];
+        let set_vars = vec![("RUST_LOG".to_string(), "debug".to_string())];
+        push_set_vars(&mut env_c, &set_vars, &[]);
+        assert_eq!(env_strings(&env_c), vec!["HOME=/home/x", "RUST_LOG=debug"]);
+    }
+
+    #[test]
+    fn push_set_vars_overrides_inherited_host_var_without_duplicating() {
+        // An inherited host var with the same key must be replaced, not duplicated.
+        let mut env_c = vec![
+            CString::new("PRE=1").expect("cstring"),
+            CString::new("RUST_LOG=info").expect("cstring"),
+            CString::new("POST=2").expect("cstring"),
+        ];
+        let set_vars = vec![("RUST_LOG".to_string(), "debug".to_string())];
+        push_set_vars(&mut env_c, &set_vars, &[]);
+        // Exactly one RUST_LOG entry, carrying the set_vars value.
+        let entries = env_strings(&env_c);
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|e| e.starts_with("RUST_LOG="))
+                .count(),
+            1
+        );
+        assert!(entries.contains(&"RUST_LOG=debug".to_string()));
+        assert!(entries.contains(&"PRE=1".to_string()));
+        assert!(entries.contains(&"POST=2".to_string()));
+    }
+
+    #[test]
+    fn push_set_vars_skips_keys_overridden_by_env_vars() {
+        // A key also set via env_vars (credentials) is skipped entirely, so
+        // env_vars wins and there is no duplicate. The inherited host entry is
+        // left for env_vars (appended later) to override.
+        let mut env_c = vec![CString::new("TOKEN=host").expect("cstring")];
+        let set_vars = vec![("TOKEN".to_string(), "from_set_vars".to_string())];
+        let env_vars = vec![("TOKEN", "from_credentials")];
+        push_set_vars(&mut env_c, &set_vars, &env_vars);
+        // set_vars did not push its value...
+        let entries = env_strings(&env_c);
+        assert!(!entries.contains(&"TOKEN=from_set_vars".to_string()));
+        // ...and did not duplicate the key.
+        assert_eq!(
+            entries.iter().filter(|e| e.starts_with("TOKEN=")).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn push_set_vars_does_not_substring_match_other_keys() {
+        // PATH must not be removed when set_vars sets PA (prefix-collision guard).
+        let mut env_c = vec![CString::new("PATH=/usr/bin").expect("cstring")];
+        let set_vars = vec![("PA".to_string(), "x".to_string())];
+        push_set_vars(&mut env_c, &set_vars, &[]);
+        let entries = env_strings(&env_c);
+        assert!(entries.contains(&"PATH=/usr/bin".to_string()));
+        assert!(entries.contains(&"PA=x".to_string()));
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

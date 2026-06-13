@@ -292,6 +292,7 @@ mod tests {
             denied_env_vars: None,
             profile_network_approval_mode: None,
             profile_network_approval_timeout_secs: None,
+            set_vars: None,
             network_block_requested: false,
         };
 
@@ -348,6 +349,7 @@ mod tests {
             denied_env_vars: None,
             profile_network_approval_mode: None,
             profile_network_approval_timeout_secs: None,
+            set_vars: None,
             network_block_requested: false,
         };
 

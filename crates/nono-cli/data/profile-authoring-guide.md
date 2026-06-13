@@ -229,12 +229,14 @@ Supported key formats:
 
 ### environment
 
-Controls which environment variables are passed to the sandboxed process. When `allow_vars` is set, only the listed variables (and nono-injected credentials) are passed through.
+Controls which environment variables are passed to the sandboxed process. When `allow_vars` is set, only the listed variables (and nono-injected credentials) are passed through. `set_vars` injects explicit values regardless of filtering.
 
 ```json
 {
   "environment": {
-    "allow_vars": ["PATH", "HOME", "TERM", "AWS_*"]
+    "allow_vars": ["PATH", "HOME", "TERM", "AWS_*"],
+    "deny_vars": ["GH_TOKEN"],
+    "set_vars": { "RUST_LOG": "debug", "XDG_CONFIG_HOME": "$HOME/.config" }
   }
 }
 ```
@@ -242,8 +244,10 @@ Controls which environment variables are passed to the sandboxed process. When `
 | Field         | Type            | Default | Description |
 |---------------|-----------------|---------|-------------|
 | `allow_vars`  | array of string | `[]`    | Allow-list of environment variable names. Supports exact names (`"PATH"`) and prefix patterns ending with `*` (`"AWS_*"` matches `AWS_REGION`, `AWS_SECRET_ACCESS_KEY`, etc.). The `*` wildcard is only valid as a trailing suffix. When the `environment` section is omitted entirely, all variables are allowed. When present with an empty array, no inherited variables are passed (only nono-injected credentials). Nono-injected credentials always bypass this list. |
+| `deny_vars`   | array of string | `[]`    | Deny-list of environment variable names stripped from the child. Same pattern syntax as `allow_vars` (exact names and trailing `*`). Denied vars are stripped even if they also match `allow_vars`. |
+| `set_vars`    | object (string→string) | `{}` | Static environment variables injected after allow/deny filtering and before credential injection (injected credentials win on conflict). Values support the same expansion as profile paths (`$HOME`, `~`, `$WORKDIR`, `$TMPDIR`, `$XDG_*`, `$NONO_PACKAGES`); keys are not expanded. `PATH` and any `NONO_*` key are reserved and rejected at load time. Unlike inherited host vars, keys here are NOT subject to the dangerous-variable blocklist (`LD_PRELOAD`, `NODE_OPTIONS`, …) — setting one is an explicit operator decision. |
 
-Inheritance: child `allow_vars` are appended to base values and deduplicated.
+Inheritance: child `allow_vars` and `deny_vars` are appended to base values and deduplicated; `set_vars` merges as a map, with the child's value winning on key conflict.
 
 ### hooks
 
@@ -545,7 +549,7 @@ nono profile diff <a> <b>         # Compare two profiles
 
 ## 6. Variable Expansion
 
-The following variables are expanded in all path fields (`filesystem.*`, including `filesystem.allow`, `filesystem.read`, `filesystem.write`, `filesystem.deny`, `filesystem.bypass_protection`, and `filesystem.suppress_save_prompt`).
+The following variables are expanded in all path fields (`filesystem.*`, including `filesystem.allow`, `filesystem.read`, `filesystem.write`, `filesystem.deny`, `filesystem.bypass_protection`, and `filesystem.suppress_save_prompt`), in `command_args`, and in the values of `environment.set_vars`.
 
 | Variable           | Expands to |
 |--------------------|------------|

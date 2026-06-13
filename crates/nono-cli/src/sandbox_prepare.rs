@@ -444,6 +444,8 @@ pub(crate) struct PreparedSandbox {
     pub(crate) denied_env_vars: Option<Vec<String>>,
     pub(crate) profile_network_approval_mode: Option<String>,
     pub(crate) profile_network_approval_timeout_secs: Option<u64>,
+    /// Expanded `environment.set_vars` (key, expanded-value), `None` if absent.
+    pub(crate) set_vars: Option<Vec<(String, String)>>,
     /// True when the profile or CLI requested `network.block`. Carried
     /// through because a CLI proxy flag (e.g. `--credential`) may later
     /// override `caps` to `ProxyOnly`, losing the original intent.
@@ -1080,6 +1082,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
                 denied_env_vars: None,
                 profile_network_approval_mode: None,
                 profile_network_approval_timeout_secs: None,
+                set_vars: None,
                 network_block_requested: args.block_net,
             },
             args,
@@ -1118,6 +1121,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         denied_env_vars: profile_denied_env_vars,
         network_approval_mode: profile_network_approval_mode,
         network_approval_timeout_secs: profile_network_approval_timeout_secs,
+        set_vars: profile_set_vars,
     } = prepared_profile;
 
     let session_hooks = loaded_profile
@@ -1397,6 +1401,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
             denied_env_vars: profile_denied_env_vars,
             profile_network_approval_mode,
             profile_network_approval_timeout_secs,
+            set_vars: profile_set_vars,
             network_block_requested,
         },
         args,

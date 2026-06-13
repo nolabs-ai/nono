@@ -112,6 +112,57 @@ pub(crate) fn validate_env_var_patterns(patterns: &[String], field_name: &str) -
     None
 }
 
+/// Returns true if `name` is a valid POSIX environment variable name:
+/// a non-empty `[A-Za-z_][A-Za-z0-9_]*` with no `=` or NUL.
+fn is_valid_env_var_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Validates `environment.set_vars` keys before they are injected into the
+/// sandboxed child. Returns an error message describing the first invalid key,
+/// or `None` if all keys are acceptable.
+///
+/// Rejected keys:
+/// - `PATH` (reserved; controlled via allow/deny filtering, not injection)
+/// - any `NONO_*` key (reserved for nono's own injected variables)
+/// - empty or syntactically invalid names (must match `[A-Za-z_][A-Za-z0-9_]*`)
+///
+/// The dangerous-variable blocklist (`LD_PRELOAD`, `NODE_OPTIONS`, …) is
+/// intentionally NOT applied here: that defense targets injection from an
+/// untrusted parent shell, whereas `set_vars` is explicit operator intent.
+pub(crate) fn validate_set_vars(
+    set_vars: &std::collections::HashMap<String, String>,
+) -> Option<String> {
+    for key in set_vars.keys() {
+        if key == "PATH" {
+            return Some(
+                "Invalid set_vars key 'PATH': PATH is reserved; use allow_vars/deny_vars to \
+                 control it"
+                    .to_string(),
+            );
+        }
+        if key.starts_with("NONO_") {
+            return Some(format!(
+                "Invalid set_vars key '{}': the NONO_* prefix is reserved",
+                key
+            ));
+        }
+        if !is_valid_env_var_name(key) {
+            return Some(format!(
+                "Invalid set_vars key '{}': environment variable names must match \
+                 [A-Za-z_][A-Za-z0-9_]*",
+                key
+            ));
+        }
+    }
+    None
+}
+
 /// Decide whether an inherited env var should be dropped for sandbox execution.
 pub(super) fn should_skip_env_var(
     key: &str,
@@ -342,5 +393,65 @@ mod tests {
         assert!(is_env_var_denied("GH_TOKEN", &denied));
         assert!(is_env_var_allowed("GH_TOKEN", &allowed));
         // In exec path, deny is checked before allow, so GH_TOKEN is stripped
+    }
+
+    // ============================================================================
+    // set_vars validation
+    // ============================================================================
+
+    fn set_vars_from(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn test_set_vars_accepts_normal_keys() {
+        let set_vars = set_vars_from(&[("RUST_LOG", "debug"), ("MY_VAR", "value")]);
+        assert_eq!(validate_set_vars(&set_vars), None);
+    }
+
+    #[test]
+    fn test_set_vars_accepts_dangerous_keys() {
+        // set_vars is explicit operator intent: dangerous keys are NOT blocked.
+        let set_vars = set_vars_from(&[("LD_PRELOAD", "/tmp/x.so")]);
+        assert_eq!(validate_set_vars(&set_vars), None);
+        let set_vars = set_vars_from(&[("NODE_OPTIONS", "--max-old-space-size=4096")]);
+        assert_eq!(validate_set_vars(&set_vars), None);
+        let set_vars = set_vars_from(&[("DYLD_INSERT_LIBRARIES", "/tmp/x.dylib")]);
+        assert_eq!(validate_set_vars(&set_vars), None);
+    }
+
+    #[test]
+    fn test_set_vars_rejects_path() {
+        let set_vars = set_vars_from(&[("PATH", "/usr/bin")]);
+        assert!(validate_set_vars(&set_vars).is_some());
+    }
+
+    #[test]
+    fn test_set_vars_rejects_nono_prefix() {
+        let set_vars = set_vars_from(&[("NONO_FOO", "bar")]);
+        assert!(validate_set_vars(&set_vars).is_some());
+        let set_vars = set_vars_from(&[("NONO_CAP_FILE", "/tmp/cap")]);
+        assert!(validate_set_vars(&set_vars).is_some());
+    }
+
+    #[test]
+    fn test_set_vars_rejects_invalid_names() {
+        // empty name
+        assert!(validate_set_vars(&set_vars_from(&[("", "v")])).is_some());
+        // leading digit
+        assert!(validate_set_vars(&set_vars_from(&[("1FOO", "v")])).is_some());
+        // contains '='
+        assert!(validate_set_vars(&set_vars_from(&[("A=B", "v")])).is_some());
+        // contains a dash
+        assert!(validate_set_vars(&set_vars_from(&[("MY-VAR", "v")])).is_some());
+    }
+
+    #[test]
+    fn test_set_vars_empty_is_ok() {
+        let set_vars: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        assert_eq!(validate_set_vars(&set_vars), None);
     }
 }

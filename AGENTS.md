@@ -1,5 +1,7 @@
 # nono - Development Guide
 
+> Also available as [`CLAUDE.md`](CLAUDE.md) (symlink) for Claude Code and other tools that look for that filename.
+
 ## Project Overview
 
 nono is a capability-based sandboxing system for running untrusted AI agents with OS-enforced isolation. It uses Landlock (Linux) and Seatbelt (macOS) to create sandboxes, and then layers on top a policy system, diagnostic tools, and a rollback mechanism for recovery. The library is designed to be a pure sandbox primitive with no built-in policy, while the CLI implements all security policy and UX.

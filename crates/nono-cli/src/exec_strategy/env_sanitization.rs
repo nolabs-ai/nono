@@ -176,282 +176,278 @@ pub(super) fn should_skip_env_var(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    // Regression: 1Password credential vars must not reach the sandboxed child.
+    mod one_password_blocklist {
+        use super::super::*;
 
-    // ============================================================================
-    // 1Password env var blocklist — security-critical regression tests
-    //
-    // These vars are credential or session leaks that must NEVER reach a
-    // sandboxed child process. If a future refactor accidentally removes one,
-    // these tests will catch it.
-    // ============================================================================
+        #[test]
+        fn test_blocks_op_service_account_token() {
+            assert!(is_dangerous_env_var("OP_SERVICE_ACCOUNT_TOKEN"));
+        }
 
-    #[test]
-    fn test_blocks_op_service_account_token() {
-        assert!(is_dangerous_env_var("OP_SERVICE_ACCOUNT_TOKEN"));
+        #[test]
+        fn test_blocks_op_connect_token() {
+            assert!(is_dangerous_env_var("OP_CONNECT_TOKEN"));
+        }
+
+        #[test]
+        fn test_blocks_op_connect_host() {
+            assert!(is_dangerous_env_var("OP_CONNECT_HOST"));
+        }
+
+        #[test]
+        fn test_blocks_op_session_prefix() {
+            // OP_SESSION_* vars carry per-account bearer tokens
+            assert!(is_dangerous_env_var("OP_SESSION_my_team"));
+            assert!(is_dangerous_env_var("OP_SESSION_personal"));
+            assert!(is_dangerous_env_var("OP_SESSION_"));
+        }
+
+        #[test]
+        fn test_allows_unrelated_env_vars() {
+            // Env vars that happen to start with "OP" but aren't 1Password
+            assert!(!is_dangerous_env_var("OPENAI_API_KEY"));
+            assert!(!is_dangerous_env_var("OPERATOR_TOKEN"));
+            assert!(!is_dangerous_env_var("OPTIONS"));
+            assert!(!is_dangerous_env_var("HOME"));
+            assert!(!is_dangerous_env_var("PATH"));
+        }
     }
 
-    #[test]
-    fn test_blocks_op_connect_token() {
-        assert!(is_dangerous_env_var("OP_CONNECT_TOKEN"));
+    mod dangerous_env_var {
+        use super::super::*;
+
+        #[test]
+        fn test_blocks_linker_injection() {
+            assert!(is_dangerous_env_var("LD_PRELOAD"));
+            assert!(is_dangerous_env_var("DYLD_INSERT_LIBRARIES"));
+        }
+
+        #[test]
+        fn test_blocks_interpreter_injection() {
+            assert!(is_dangerous_env_var("NODE_OPTIONS"));
+            assert!(is_dangerous_env_var("PYTHONPATH"));
+            assert!(is_dangerous_env_var("RUBYOPT"));
+        }
     }
 
-    #[test]
-    fn test_blocks_op_connect_host() {
-        assert!(is_dangerous_env_var("OP_CONNECT_HOST"));
+    mod env_var_allowed {
+        use super::super::*;
+
+        #[test]
+        fn test_env_var_allowed_exact_match() {
+            let allowed: Vec<String> = vec!["PATH".into(), "HOME".into()];
+            assert!(is_env_var_allowed("PATH", &allowed));
+            assert!(is_env_var_allowed("HOME", &allowed));
+        }
+
+        #[test]
+        fn test_env_var_allowed_exact_no_match() {
+            let allowed: Vec<String> = vec!["PATH".into(), "HOME".into()];
+            assert!(!is_env_var_allowed("SECRET", &allowed));
+        }
+
+        #[test]
+        fn test_env_var_allowed_prefix_match() {
+            let allowed: Vec<String> = vec!["AWS_*".into()];
+            assert!(is_env_var_allowed("AWS_REGION", &allowed));
+            assert!(is_env_var_allowed("AWS_SECRET_ACCESS_KEY", &allowed));
+        }
+
+        #[test]
+        fn test_env_var_allowed_prefix_no_match() {
+            let allowed: Vec<String> = vec!["AWS_*".into()];
+            assert!(!is_env_var_allowed("GCP_REGION", &allowed));
+        }
+
+        #[test]
+        fn test_env_var_allowed_empty_list() {
+            let allowed: Vec<String> = vec![];
+            assert!(!is_env_var_allowed("PATH", &allowed));
+        }
+
+        #[test]
+        fn test_env_var_allowed_bare_star() {
+            let allowed: Vec<String> = vec!["*".into()];
+            assert!(is_env_var_allowed("ANYTHING", &allowed));
+            assert!(is_env_var_allowed("PATH", &allowed));
+        }
+
+        #[test]
+        fn test_env_var_allowed_prefix_does_not_match_partial() {
+            let allowed: Vec<String> = vec!["AWS_*".into()];
+            assert!(!is_env_var_allowed("AWS", &allowed));
+        }
+
+        #[test]
+        fn test_env_var_allowed_prefix_matches_empty_suffix() {
+            let allowed: Vec<String> = vec!["AWS_*".into()];
+            assert!(is_env_var_allowed("AWS_", &allowed));
+        }
+
+        #[test]
+        fn test_env_var_allowed_mixed_patterns() {
+            let allowed: Vec<String> = vec!["PATH".into(), "AWS_*".into()];
+            assert!(is_env_var_allowed("PATH", &allowed));
+            assert!(is_env_var_allowed("AWS_REGION", &allowed));
+            assert!(!is_env_var_allowed("HOME", &allowed));
+        }
+
+        #[test]
+        fn test_env_var_allowed_mid_star_ignored() {
+            let allowed: Vec<String> = vec!["A*B".into()];
+            assert!(!is_env_var_allowed("AXB", &allowed));
+            assert!(!is_env_var_allowed("A*B", &allowed));
+        }
     }
 
-    #[test]
-    fn test_blocks_op_session_prefix() {
-        // OP_SESSION_* vars carry per-account bearer tokens
-        assert!(is_dangerous_env_var("OP_SESSION_my_team"));
-        assert!(is_dangerous_env_var("OP_SESSION_personal"));
-        assert!(is_dangerous_env_var("OP_SESSION_"));
+    mod pattern_validation {
+        use super::super::*;
+
+        #[test]
+        fn test_validate_valid_patterns() {
+            let patterns: Vec<String> = vec!["PATH".into(), "AWS_*".into(), "*".into()];
+            assert!(validate_env_var_patterns(&patterns, "allow_vars").is_none());
+        }
+
+        #[test]
+        fn test_validate_rejects_mid_star() {
+            let patterns: Vec<String> = vec!["A*B".into()];
+            let err = validate_env_var_patterns(&patterns, "allow_vars");
+            assert!(err.is_some());
+            assert!(err.as_ref().is_some_and(|e| e.contains("A*B")));
+        }
+
+        #[test]
+        fn test_validate_rejects_leading_star_with_suffix() {
+            let patterns: Vec<String> = vec!["*X".into()];
+            let err = validate_env_var_patterns(&patterns, "allow_vars");
+            assert!(err.is_some());
+            assert!(err.as_ref().is_some_and(|e| e.contains("*X")));
+        }
+
+        #[test]
+        fn test_validate_accepts_bare_star() {
+            let patterns: Vec<String> = vec!["*".into()];
+            assert!(validate_env_var_patterns(&patterns, "allow_vars").is_none());
+        }
+
+        #[test]
+        fn test_validate_exact_name_no_star() {
+            let patterns: Vec<String> = vec!["PATH".into()];
+            assert!(validate_env_var_patterns(&patterns, "allow_vars").is_none());
+        }
+
+        #[test]
+        fn test_validate_deny_vars_field_name_in_error() {
+            let patterns: Vec<String> = vec!["A*B".into()];
+            let err = validate_env_var_patterns(&patterns, "deny_vars");
+            assert!(err.as_ref().is_some_and(|e| e.contains("deny_vars")));
+            assert!(err.as_ref().is_some_and(|e| e.contains("A*B")));
+        }
     }
 
-    #[test]
-    fn test_allows_unrelated_env_vars() {
-        // Env vars that happen to start with "OP" but aren't 1Password
-        assert!(!is_dangerous_env_var("OPENAI_API_KEY"));
-        assert!(!is_dangerous_env_var("OPERATOR_TOKEN"));
-        assert!(!is_dangerous_env_var("OPTIONS"));
-        assert!(!is_dangerous_env_var("HOME"));
-        assert!(!is_dangerous_env_var("PATH"));
+    mod env_var_denied {
+        use super::super::*;
+
+        #[test]
+        fn test_env_var_denied_exact_match() {
+            let denied: Vec<String> = vec!["GH_TOKEN".into(), "ANTHROPIC_API_KEY".into()];
+            assert!(is_env_var_denied("GH_TOKEN", &denied));
+            assert!(is_env_var_denied("ANTHROPIC_API_KEY", &denied));
+        }
+
+        #[test]
+        fn test_env_var_denied_prefix_match() {
+            let denied: Vec<String> = vec!["GITHUB_*".into()];
+            assert!(is_env_var_denied("GITHUB_TOKEN", &denied));
+            assert!(is_env_var_denied("GITHUB_ACTIONS", &denied));
+            assert!(!is_env_var_denied("GH_TOKEN", &denied));
+        }
+
+        #[test]
+        fn test_env_var_denied_no_match() {
+            let denied: Vec<String> = vec!["GH_TOKEN".into()];
+            assert!(!is_env_var_denied("PATH", &denied));
+            assert!(!is_env_var_denied("HOME", &denied));
+        }
+
+        #[test]
+        fn test_env_var_denied_empty_list() {
+            let denied: Vec<String> = vec![];
+            assert!(!is_env_var_denied("GH_TOKEN", &denied));
+        }
+
+        #[test]
+        fn test_env_var_denied_overrides_allowed() {
+            // Simulates: deny_vars has GH_TOKEN, allow_vars has GH_TOKEN
+            // deny wins: denied should return true regardless of allowed
+            let denied: Vec<String> = vec!["GH_TOKEN".into()];
+            let allowed: Vec<String> = vec!["GH_TOKEN".into()];
+            assert!(is_env_var_denied("GH_TOKEN", &denied));
+            assert!(is_env_var_allowed("GH_TOKEN", &allowed));
+            // In exec path, deny is checked before allow, so GH_TOKEN is stripped
+        }
     }
 
-    // ============================================================================
-    // Existing categories — spot-check that the broader blocklist still works
-    // ============================================================================
+    mod set_vars {
+        use super::super::*;
 
-    #[test]
-    fn test_blocks_linker_injection() {
-        assert!(is_dangerous_env_var("LD_PRELOAD"));
-        assert!(is_dangerous_env_var("DYLD_INSERT_LIBRARIES"));
-    }
+        fn set_vars_from(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect()
+        }
 
-    #[test]
-    fn test_blocks_interpreter_injection() {
-        assert!(is_dangerous_env_var("NODE_OPTIONS"));
-        assert!(is_dangerous_env_var("PYTHONPATH"));
-        assert!(is_dangerous_env_var("RUBYOPT"));
-    }
+        #[test]
+        fn test_set_vars_accepts_normal_keys() {
+            let set_vars = set_vars_from(&[("RUST_LOG", "debug"), ("MY_VAR", "value")]);
+            assert_eq!(validate_set_vars(&set_vars), None);
+        }
 
-    // ============================================================================
-    // Environment variable allow-list — is_env_var_allowed
-    // ============================================================================
+        #[test]
+        fn test_set_vars_accepts_dangerous_keys() {
+            // set_vars is explicit operator intent: dangerous keys are NOT blocked.
+            let set_vars = set_vars_from(&[("LD_PRELOAD", "/tmp/x.so")]);
+            assert_eq!(validate_set_vars(&set_vars), None);
+            let set_vars = set_vars_from(&[("NODE_OPTIONS", "--max-old-space-size=4096")]);
+            assert_eq!(validate_set_vars(&set_vars), None);
+            let set_vars = set_vars_from(&[("DYLD_INSERT_LIBRARIES", "/tmp/x.dylib")]);
+            assert_eq!(validate_set_vars(&set_vars), None);
+        }
 
-    #[test]
-    fn test_env_var_allowed_exact_match() {
-        let allowed: Vec<String> = vec!["PATH".into(), "HOME".into()];
-        assert!(is_env_var_allowed("PATH", &allowed));
-        assert!(is_env_var_allowed("HOME", &allowed));
-    }
+        #[test]
+        fn test_set_vars_rejects_path() {
+            let set_vars = set_vars_from(&[("PATH", "/usr/bin")]);
+            assert!(validate_set_vars(&set_vars).is_some());
+        }
 
-    #[test]
-    fn test_env_var_allowed_exact_no_match() {
-        let allowed: Vec<String> = vec!["PATH".into(), "HOME".into()];
-        assert!(!is_env_var_allowed("SECRET", &allowed));
-    }
+        #[test]
+        fn test_set_vars_rejects_nono_prefix() {
+            let set_vars = set_vars_from(&[("NONO_FOO", "bar")]);
+            assert!(validate_set_vars(&set_vars).is_some());
+            let set_vars = set_vars_from(&[("NONO_CAP_FILE", "/tmp/cap")]);
+            assert!(validate_set_vars(&set_vars).is_some());
+        }
 
-    #[test]
-    fn test_env_var_allowed_prefix_match() {
-        let allowed: Vec<String> = vec!["AWS_*".into()];
-        assert!(is_env_var_allowed("AWS_REGION", &allowed));
-        assert!(is_env_var_allowed("AWS_SECRET_ACCESS_KEY", &allowed));
-    }
+        #[test]
+        fn test_set_vars_rejects_invalid_names() {
+            // empty name
+            assert!(validate_set_vars(&set_vars_from(&[("", "v")])).is_some());
+            // leading digit
+            assert!(validate_set_vars(&set_vars_from(&[("1FOO", "v")])).is_some());
+            // contains '='
+            assert!(validate_set_vars(&set_vars_from(&[("A=B", "v")])).is_some());
+            // contains a dash
+            assert!(validate_set_vars(&set_vars_from(&[("MY-VAR", "v")])).is_some());
+        }
 
-    #[test]
-    fn test_env_var_allowed_prefix_no_match() {
-        let allowed: Vec<String> = vec!["AWS_*".into()];
-        assert!(!is_env_var_allowed("GCP_REGION", &allowed));
-    }
-
-    #[test]
-    fn test_env_var_allowed_empty_list() {
-        let allowed: Vec<String> = vec![];
-        assert!(!is_env_var_allowed("PATH", &allowed));
-    }
-
-    #[test]
-    fn test_env_var_allowed_bare_star() {
-        let allowed: Vec<String> = vec!["*".into()];
-        assert!(is_env_var_allowed("ANYTHING", &allowed));
-        assert!(is_env_var_allowed("PATH", &allowed));
-    }
-
-    #[test]
-    fn test_env_var_allowed_prefix_does_not_match_partial() {
-        let allowed: Vec<String> = vec!["AWS_*".into()];
-        assert!(!is_env_var_allowed("AWS", &allowed));
-    }
-
-    #[test]
-    fn test_env_var_allowed_prefix_matches_empty_suffix() {
-        let allowed: Vec<String> = vec!["AWS_*".into()];
-        assert!(is_env_var_allowed("AWS_", &allowed));
-    }
-
-    #[test]
-    fn test_env_var_allowed_mixed_patterns() {
-        let allowed: Vec<String> = vec!["PATH".into(), "AWS_*".into()];
-        assert!(is_env_var_allowed("PATH", &allowed));
-        assert!(is_env_var_allowed("AWS_REGION", &allowed));
-        assert!(!is_env_var_allowed("HOME", &allowed));
-    }
-
-    #[test]
-    fn test_env_var_allowed_mid_star_ignored() {
-        let allowed: Vec<String> = vec!["A*B".into()];
-        assert!(!is_env_var_allowed("AXB", &allowed));
-        assert!(!is_env_var_allowed("A*B", &allowed));
-    }
-
-    // ============================================================================
-    // Pattern validation — validate_env_var_patterns
-    // ============================================================================
-
-    #[test]
-    fn test_validate_valid_patterns() {
-        let patterns: Vec<String> = vec!["PATH".into(), "AWS_*".into(), "*".into()];
-        assert!(validate_env_var_patterns(&patterns, "allow_vars").is_none());
-    }
-
-    #[test]
-    fn test_validate_rejects_mid_star() {
-        let patterns: Vec<String> = vec!["A*B".into()];
-        let err = validate_env_var_patterns(&patterns, "allow_vars");
-        assert!(err.is_some());
-        assert!(err.as_ref().is_some_and(|e| e.contains("A*B")));
-    }
-
-    #[test]
-    fn test_validate_rejects_leading_star_with_suffix() {
-        let patterns: Vec<String> = vec!["*X".into()];
-        let err = validate_env_var_patterns(&patterns, "allow_vars");
-        assert!(err.is_some());
-        assert!(err.as_ref().is_some_and(|e| e.contains("*X")));
-    }
-
-    #[test]
-    fn test_validate_accepts_bare_star() {
-        let patterns: Vec<String> = vec!["*".into()];
-        assert!(validate_env_var_patterns(&patterns, "allow_vars").is_none());
-    }
-
-    #[test]
-    fn test_validate_exact_name_no_star() {
-        let patterns: Vec<String> = vec!["PATH".into()];
-        assert!(validate_env_var_patterns(&patterns, "allow_vars").is_none());
-    }
-
-    #[test]
-    fn test_validate_deny_vars_field_name_in_error() {
-        let patterns: Vec<String> = vec!["A*B".into()];
-        let err = validate_env_var_patterns(&patterns, "deny_vars");
-        assert!(err.as_ref().is_some_and(|e| e.contains("deny_vars")));
-        assert!(err.as_ref().is_some_and(|e| e.contains("A*B")));
-    }
-
-    // ============================================================================
-    // is_env_var_denied
-    // ============================================================================
-
-    #[test]
-    fn test_env_var_denied_exact_match() {
-        let denied: Vec<String> = vec!["GH_TOKEN".into(), "ANTHROPIC_API_KEY".into()];
-        assert!(is_env_var_denied("GH_TOKEN", &denied));
-        assert!(is_env_var_denied("ANTHROPIC_API_KEY", &denied));
-    }
-
-    #[test]
-    fn test_env_var_denied_prefix_match() {
-        let denied: Vec<String> = vec!["GITHUB_*".into()];
-        assert!(is_env_var_denied("GITHUB_TOKEN", &denied));
-        assert!(is_env_var_denied("GITHUB_ACTIONS", &denied));
-        assert!(!is_env_var_denied("GH_TOKEN", &denied));
-    }
-
-    #[test]
-    fn test_env_var_denied_no_match() {
-        let denied: Vec<String> = vec!["GH_TOKEN".into()];
-        assert!(!is_env_var_denied("PATH", &denied));
-        assert!(!is_env_var_denied("HOME", &denied));
-    }
-
-    #[test]
-    fn test_env_var_denied_empty_list() {
-        let denied: Vec<String> = vec![];
-        assert!(!is_env_var_denied("GH_TOKEN", &denied));
-    }
-
-    #[test]
-    fn test_env_var_denied_overrides_allowed() {
-        // Simulates: deny_vars has GH_TOKEN, allow_vars has GH_TOKEN
-        // deny wins: denied should return true regardless of allowed
-        let denied: Vec<String> = vec!["GH_TOKEN".into()];
-        let allowed: Vec<String> = vec!["GH_TOKEN".into()];
-        assert!(is_env_var_denied("GH_TOKEN", &denied));
-        assert!(is_env_var_allowed("GH_TOKEN", &allowed));
-        // In exec path, deny is checked before allow, so GH_TOKEN is stripped
-    }
-
-    // ============================================================================
-    // set_vars validation
-    // ============================================================================
-
-    fn set_vars_from(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
-        pairs
-            .iter()
-            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
-            .collect()
-    }
-
-    #[test]
-    fn test_set_vars_accepts_normal_keys() {
-        let set_vars = set_vars_from(&[("RUST_LOG", "debug"), ("MY_VAR", "value")]);
-        assert_eq!(validate_set_vars(&set_vars), None);
-    }
-
-    #[test]
-    fn test_set_vars_accepts_dangerous_keys() {
-        // set_vars is explicit operator intent: dangerous keys are NOT blocked.
-        let set_vars = set_vars_from(&[("LD_PRELOAD", "/tmp/x.so")]);
-        assert_eq!(validate_set_vars(&set_vars), None);
-        let set_vars = set_vars_from(&[("NODE_OPTIONS", "--max-old-space-size=4096")]);
-        assert_eq!(validate_set_vars(&set_vars), None);
-        let set_vars = set_vars_from(&[("DYLD_INSERT_LIBRARIES", "/tmp/x.dylib")]);
-        assert_eq!(validate_set_vars(&set_vars), None);
-    }
-
-    #[test]
-    fn test_set_vars_rejects_path() {
-        let set_vars = set_vars_from(&[("PATH", "/usr/bin")]);
-        assert!(validate_set_vars(&set_vars).is_some());
-    }
-
-    #[test]
-    fn test_set_vars_rejects_nono_prefix() {
-        let set_vars = set_vars_from(&[("NONO_FOO", "bar")]);
-        assert!(validate_set_vars(&set_vars).is_some());
-        let set_vars = set_vars_from(&[("NONO_CAP_FILE", "/tmp/cap")]);
-        assert!(validate_set_vars(&set_vars).is_some());
-    }
-
-    #[test]
-    fn test_set_vars_rejects_invalid_names() {
-        // empty name
-        assert!(validate_set_vars(&set_vars_from(&[("", "v")])).is_some());
-        // leading digit
-        assert!(validate_set_vars(&set_vars_from(&[("1FOO", "v")])).is_some());
-        // contains '='
-        assert!(validate_set_vars(&set_vars_from(&[("A=B", "v")])).is_some());
-        // contains a dash
-        assert!(validate_set_vars(&set_vars_from(&[("MY-VAR", "v")])).is_some());
-    }
-
-    #[test]
-    fn test_set_vars_empty_is_ok() {
-        let set_vars: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-        assert_eq!(validate_set_vars(&set_vars), None);
+        #[test]
+        fn test_set_vars_empty_is_ok() {
+            let set_vars: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
+            assert_eq!(validate_set_vars(&set_vars), None);
+        }
     }
 }

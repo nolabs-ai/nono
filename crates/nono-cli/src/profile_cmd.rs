@@ -50,10 +50,6 @@ pub fn run_profile(args: ProfileCmdArgs) -> Result<()> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// nono profile init
-// ---------------------------------------------------------------------------
-
 fn cmd_init(args: ProfileInitArgs) -> Result<()> {
     // If the name looks like an org/pack reference, check whether it matches
     // an installed pack before falling through to the generic name-validation
@@ -358,10 +354,6 @@ fn extends_target_not_found_message(name: &str) -> String {
     )
 }
 
-// ---------------------------------------------------------------------------
-// nono profile schema
-// ---------------------------------------------------------------------------
-
 fn cmd_schema(args: ProfileSchemaArgs) -> Result<()> {
     let schema = embedded::embedded_profile_schema();
 
@@ -392,10 +384,6 @@ fn cmd_schema(args: ProfileSchemaArgs) -> Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// nono profile guide
-// ---------------------------------------------------------------------------
-
 fn cmd_guide(_args: ProfileGuideArgs) -> Result<()> {
     let guide = embedded::embedded_profile_guide();
     let stdout = std::io::stdout();
@@ -405,10 +393,6 @@ fn cmd_guide(_args: ProfileGuideArgs) -> Result<()> {
         .map_err(|e| NonoError::ProfileParse(format!("Failed to write to stdout: {e}")))?;
     Ok(())
 }
-
-// ---------------------------------------------------------------------------
-// nono profile groups
-// ---------------------------------------------------------------------------
 
 pub(crate) fn cmd_groups(args: ProfileGroupsArgs) -> Result<()> {
     let pol = policy::load_embedded_policy()?;
@@ -669,9 +653,7 @@ fn expand_paths_json(paths: &[String]) -> serde_json::Value {
     serde_json::Value::Array(arr)
 }
 
-// ---------------------------------------------------------------------------
 // nono profile list
-// ---------------------------------------------------------------------------
 
 /// Determine the actual source of a loaded profile.
 ///
@@ -844,10 +826,6 @@ fn print_profile_line(name: &str, result: &Result<Profile>, t: &theme::Theme) {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// nono profile show
-// ---------------------------------------------------------------------------
 
 #[allow(deprecated)] // reads profile.commands.{allow,deny} (deprecated v0.33.0)
 pub(crate) fn cmd_show(args: ProfileShowArgs) -> Result<()> {
@@ -1327,10 +1305,6 @@ fn profile_to_json(
 
     val
 }
-
-// ---------------------------------------------------------------------------
-// nono profile diff
-// ---------------------------------------------------------------------------
 
 #[allow(deprecated)] // reads commands.{allow,deny} (deprecated v0.33.0)
 pub(crate) fn cmd_diff(args: ProfileDiffArgs) -> Result<()> {
@@ -2243,9 +2217,7 @@ fn diff_custom_credentials_json(
     })
 }
 
-// ---------------------------------------------------------------------------
 // nono profile validate
-// ---------------------------------------------------------------------------
 
 fn classify_profile_error(e: &NonoError) -> &'static str {
     match e {
@@ -2475,10 +2447,6 @@ pub(crate) fn cmd_validate(args: ProfileValidateArgs) -> Result<()> {
         Err(NonoError::ProfileParse("validation failed".into()))
     }
 }
-
-// ---------------------------------------------------------------------------
-// nono profile promote
-// ---------------------------------------------------------------------------
 
 pub(crate) fn cmd_promote(args: ProfilePromoteArgs) -> Result<()> {
     if args.diff && args.yes {
@@ -2791,9 +2759,7 @@ fn emit_deprecation_summary(count: usize) {
     );
 }
 
-// ---------------------------------------------------------------------------
 // Profile → Manifest compilation
-// ---------------------------------------------------------------------------
 
 /// Compile a resolved profile into a capability manifest.
 ///
@@ -3196,9 +3162,7 @@ fn make_fs_grant(
     })
 }
 
-// ---------------------------------------------------------------------------
 // Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {

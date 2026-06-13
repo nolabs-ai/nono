@@ -760,9 +760,7 @@ fn verify_keyless_crypto(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
 // Path safety for multi-subject bundle subject names
-// ---------------------------------------------------------------------------
 
 /// Resolve a bundle subject `name` to a path within `scan_root`.
 ///
@@ -836,9 +834,7 @@ pub(crate) fn safe_subject_path(
     Ok(joined)
 }
 
-// ---------------------------------------------------------------------------
 // Multi-subject bundle verification
-// ---------------------------------------------------------------------------
 
 /// Verify a multi-subject `.nono-trust.bundle` and return per-file results.
 ///
@@ -1022,9 +1018,7 @@ fn verify_multi_subject_bundle(
     results
 }
 
-// ---------------------------------------------------------------------------
 // Output helpers
-// ---------------------------------------------------------------------------
 
 fn print_verification_line(
     file_path: &Path,
@@ -1719,9 +1713,7 @@ mod tests {
         assert!(is_glob_pattern("{a,b}.md"));
     }
 
-    // -----------------------------------------------------------------------
     // safe_subject_path — path traversal prevention
-    // -----------------------------------------------------------------------
 
     #[test]
     fn safe_subject_path_accepts_plain_filename() {

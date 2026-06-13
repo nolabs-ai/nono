@@ -2668,8 +2668,6 @@ mod tests {
         assert_eq!(caps.platform_rules().len(), 2);
     }
 
-    // NetworkMode tests
-
     #[test]
     fn test_network_mode_default_is_allow_all() {
         let caps = CapabilitySet::new();
@@ -3015,8 +3013,6 @@ mod tests {
         assert_eq!(caps.fs_capabilities().len(), 1);
         assert!(!caps.fs_capabilities()[0].is_file);
     }
-
-    // --- UnixSocketCapability / UnixSocketMode tests -------------------------
 
     #[test]
     fn test_unix_socket_mode_permits_bind() {

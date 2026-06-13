@@ -771,14 +771,12 @@ pub fn apply_with_abi(caps: &CapabilitySet, abi: &DetectedAbi) -> Result<Seccomp
     Ok(seccomp_net_fallback)
 }
 
-// ==========================================================================
 // Seccomp user notification (SECCOMP_RET_USER_NOTIF) for transparent
 // capability expansion. These primitives install a BPF filter on
 // openat/openat2, receive notifications in the supervisor parent, and
 // inject opened fds into the child process.
 //
 // Requires kernel >= 5.14 for SECCOMP_ADDFD_FLAG_SEND (atomic fd injection).
-// ==========================================================================
 
 /// seccomp notification received from the kernel.
 ///
@@ -1608,13 +1606,11 @@ pub fn deny_notif(notify_fd: std::os::fd::RawFd, notif_id: u64) -> Result<()> {
     respond_notif_errno(notify_fd, notif_id, libc::EPERM)
 }
 
-// ==========================================================================
 // Seccomp proxy-only network fallback
 //
 // For kernels without Landlock AccessNet (ABI < V4), this provides a
 // seccomp-based alternative that allows connect() only to the proxy
 // port on localhost, blocking all other network activity.
-// ==========================================================================
 
 /// Kind of AF_UNIX socket, determined from `sun_path` and `addrlen`.
 ///
@@ -3384,7 +3380,7 @@ mod tests {
         assert_eq!(info.port, 0);
     }
 
-    // --- classify_af_unix tests (issue #685) --------------------------------
+    // classify_af_unix tests
 
     #[test]
     fn test_classify_af_unix_pathname() {
@@ -3952,10 +3948,6 @@ mod tests {
             buf[0]
         );
     }
-
-    // =========================================================================
-    // WSL2 detection tests
-    // =========================================================================
 
     #[test]
     fn test_is_wsl2_does_not_panic() {

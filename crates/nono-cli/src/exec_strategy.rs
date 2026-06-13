@@ -3586,11 +3586,7 @@ fn open_canonical_path_no_symlinks(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use nix::sys::termios::{
-        ControlFlags, InputFlags, LocalFlags, OutputFlags, SpecialCharacterIndices,
-    };
-
+    use std::ffi::CString;
     fn env_strings(env_c: &[CString]) -> Vec<String> {
         env_c
             .iter()
@@ -3598,995 +3594,693 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn push_set_vars_appends_new_keys() {
-        let mut env_c = vec![CString::new("HOME=/home/x").expect("cstring")];
-        let set_vars = vec![("RUST_LOG".to_string(), "debug".to_string())];
-        push_set_vars(&mut env_c, &set_vars, &[]);
-        assert_eq!(env_strings(&env_c), vec!["HOME=/home/x", "RUST_LOG=debug"]);
-    }
+    mod push_set_vars {
+        use super::super::*;
+        use super::env_strings;
+        use std::ffi::CString;
 
-    #[test]
-    fn push_set_vars_overrides_inherited_host_var_without_duplicating() {
-        // An inherited host var with the same key must be replaced, not duplicated.
-        let mut env_c = vec![
-            CString::new("PRE=1").expect("cstring"),
-            CString::new("RUST_LOG=info").expect("cstring"),
-            CString::new("POST=2").expect("cstring"),
-        ];
-        let set_vars = vec![("RUST_LOG".to_string(), "debug".to_string())];
-        push_set_vars(&mut env_c, &set_vars, &[]);
-        // Exactly one RUST_LOG entry, carrying the set_vars value.
-        let entries = env_strings(&env_c);
-        assert_eq!(
-            entries
-                .iter()
-                .filter(|e| e.starts_with("RUST_LOG="))
-                .count(),
-            1
-        );
-        assert!(entries.contains(&"RUST_LOG=debug".to_string()));
-        assert!(entries.contains(&"PRE=1".to_string()));
-        assert!(entries.contains(&"POST=2".to_string()));
-    }
+        #[test]
+        fn push_set_vars_appends_new_keys() {
+            let mut env_c = vec![CString::new("HOME=/home/x").expect("cstring")];
+            let set_vars = vec![("RUST_LOG".to_string(), "debug".to_string())];
+            push_set_vars(&mut env_c, &set_vars, &[]);
+            assert_eq!(env_strings(&env_c), vec!["HOME=/home/x", "RUST_LOG=debug"]);
+        }
 
-    #[test]
-    fn push_set_vars_skips_keys_overridden_by_env_vars() {
-        // A key also set via env_vars (credentials) is skipped entirely, so
-        // env_vars wins and there is no duplicate. The inherited host entry is
-        // left for env_vars (appended later) to override.
-        let mut env_c = vec![CString::new("TOKEN=host").expect("cstring")];
-        let set_vars = vec![("TOKEN".to_string(), "from_set_vars".to_string())];
-        let env_vars = vec![("TOKEN", "from_credentials")];
-        push_set_vars(&mut env_c, &set_vars, &env_vars);
-        // set_vars did not push its value...
-        let entries = env_strings(&env_c);
-        assert!(!entries.contains(&"TOKEN=from_set_vars".to_string()));
-        // ...and did not duplicate the key.
-        assert_eq!(
-            entries.iter().filter(|e| e.starts_with("TOKEN=")).count(),
-            1
-        );
-    }
+        #[test]
+        fn push_set_vars_overrides_inherited_host_var_without_duplicating() {
+            // An inherited host var with the same key must be replaced, not duplicated.
+            let mut env_c = vec![
+                CString::new("PRE=1").expect("cstring"),
+                CString::new("RUST_LOG=info").expect("cstring"),
+                CString::new("POST=2").expect("cstring"),
+            ];
+            let set_vars = vec![("RUST_LOG".to_string(), "debug".to_string())];
+            push_set_vars(&mut env_c, &set_vars, &[]);
+            // Exactly one RUST_LOG entry, carrying the set_vars value.
+            let entries = env_strings(&env_c);
+            assert_eq!(
+                entries
+                    .iter()
+                    .filter(|e| e.starts_with("RUST_LOG="))
+                    .count(),
+                1
+            );
+            assert!(entries.contains(&"RUST_LOG=debug".to_string()));
+            assert!(entries.contains(&"PRE=1".to_string()));
+            assert!(entries.contains(&"POST=2".to_string()));
+        }
 
-    #[test]
-    fn push_set_vars_does_not_substring_match_other_keys() {
-        // PATH must not be removed when set_vars sets PA (prefix-collision guard).
-        let mut env_c = vec![CString::new("PATH=/usr/bin").expect("cstring")];
-        let set_vars = vec![("PA".to_string(), "x".to_string())];
-        push_set_vars(&mut env_c, &set_vars, &[]);
-        let entries = env_strings(&env_c);
-        assert!(entries.contains(&"PATH=/usr/bin".to_string()));
-        assert!(entries.contains(&"PA=x".to_string()));
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn test_linux_child_requires_dumpable_only_for_seccomp_driven_features() {
-        assert!(!linux_child_requires_dumpable(false, false));
-        assert!(linux_child_requires_dumpable(true, false));
-        assert!(linux_child_requires_dumpable(false, true));
-        assert!(linux_child_requires_dumpable(true, true));
-    }
-
-    #[test]
-    fn test_exec_strategy_default_is_supervised() {
-        assert_eq!(ExecStrategy::default(), ExecStrategy::Supervised);
-    }
-
-    #[test]
-    fn test_configure_startup_prompt_termios_restores_cooked_input() {
-        let mut termios = unsafe { std::mem::zeroed::<nix::sys::termios::Termios>() };
-        termios.input_flags = InputFlags::IGNBRK | InputFlags::INLCR | InputFlags::IGNCR;
-        termios.output_flags = OutputFlags::empty();
-        termios.local_flags = LocalFlags::empty();
-        termios.control_flags = ControlFlags::CSIZE | ControlFlags::PARENB;
-        termios.control_chars[SpecialCharacterIndices::VMIN as usize] = 0;
-        termios.control_chars[SpecialCharacterIndices::VTIME as usize] = 9;
-
-        crate::profile_save_runtime::configure_prompt_termios(&mut termios);
-
-        assert!(
-            termios
-                .input_flags
-                .contains(InputFlags::ICRNL | InputFlags::IXON)
-        );
-        assert!(
-            !termios
-                .input_flags
-                .intersects(InputFlags::IGNBRK | InputFlags::INLCR | InputFlags::IGNCR)
-        );
-        assert!(termios.output_flags.contains(OutputFlags::OPOST));
-        assert!(termios.local_flags.contains(
-            LocalFlags::ECHO
-                | LocalFlags::ECHONL
-                | LocalFlags::ICANON
-                | LocalFlags::ISIG
-                | LocalFlags::IEXTEN
-        ));
-        assert!(!termios.control_flags.contains(ControlFlags::PARENB));
-        assert!(termios.control_flags.contains(ControlFlags::CS8));
-        assert_eq!(
-            termios.control_chars[SpecialCharacterIndices::VMIN as usize],
-            1
-        );
-        assert_eq!(
-            termios.control_chars[SpecialCharacterIndices::VTIME as usize],
-            0
-        );
-    }
-
-    #[test]
-    fn test_diagnostic_footer_triggers_on_successful_sandbox_violation() {
-        let violations = vec![nono::SandboxViolation {
-            operation: "file-read-data".to_string(),
-            target: Some("/tmp/secret.txt".to_string()),
-        }];
-        let denials = Vec::new();
-        let observation = nono::diagnostic::ErrorObservation::default();
-
-        assert!(should_print_diagnostic_footer(
-            false,
-            0,
-            &denials,
-            &[],
-            &violations,
-            &observation,
-        ));
-        assert!(!should_print_diagnostic_footer(
-            true,
-            0,
-            &denials,
-            &[],
-            &violations,
-            &observation,
-        ));
-    }
-
-    #[test]
-    fn test_profile_save_prompt_triggers_on_policy_explanation_with_zero_exit() {
-        let explanations = vec![nono::diagnostic::PolicyExplanation {
-            path: PathBuf::from("/tmp/secret.txt"),
-            access: nono::AccessMode::Read,
-            reason: "path_not_granted".to_string(),
-            details: None,
-            policy_source: None,
-            suggested_flag: Some("--read-file /tmp/secret.txt".to_string()),
-        }];
-        let observation = nono::diagnostic::ErrorObservation::default();
-
-        assert!(should_offer_profile_save(
-            false,
-            0,
-            &explanations,
-            &observation,
-            &[],
-        ));
-    }
-
-    #[test]
-    fn test_profile_save_prompt_triggers_on_user_preferences_violation_with_zero_exit() {
-        let explanations = Vec::new();
-        let observation = nono::diagnostic::ErrorObservation::default();
-        let violations = vec![nono::SandboxViolation {
-            operation: "user-preference-read".to_string(),
-            target: Some("kcfpreferencesanyapplication".to_string()),
-        }];
-
-        assert!(should_offer_profile_save(
-            false,
-            0,
-            &explanations,
-            &observation,
-            &violations,
-        ));
-    }
-
-    #[test]
-    fn test_suppressed_system_service_violations_do_not_offer_profile_save() {
-        let explanations = Vec::new();
-        let observation = nono::diagnostic::ErrorObservation::default();
-        let violations = vec![nono::SandboxViolation {
-            operation: "forbidden-exec-sugid".to_string(),
-            target: None,
-        }];
-        let suppressed = vec!["forbidden-exec-sugid".to_string()];
-        let visible = filter_suppressed_system_service_violations(&violations, &suppressed);
-
-        assert!(visible.is_empty());
-        assert!(!should_offer_profile_save(
-            false,
-            0,
-            &explanations,
-            &observation,
-            &visible,
-        ));
-    }
-
-    #[test]
-    fn test_keychain_mach_violation_adds_profile_save_explanation() {
-        let _env_lock = crate::test_env::ENV_LOCK.lock().expect("env lock");
-        let temp_home = tempfile::TempDir::new().expect("temp home");
-        let home = temp_home.path().canonicalize().expect("canonical home");
-        let _env =
-            crate::test_env::EnvVarGuard::set_all(&[("HOME", home.to_str().expect("home path"))]);
-        let keychain = home.join("Library/Keychains/login.keychain-db");
-        std::fs::create_dir_all(keychain.parent().expect("keychain parent")).expect("mkdir");
-        std::fs::write(&keychain, b"db").expect("write keychain fixture");
-
-        let violations = vec![nono::SandboxViolation {
-            operation: "mach-lookup".to_string(),
-            target: Some("com.apple.SecurityServer".to_string()),
-        }];
-
-        let explanations = build_policy_explanations(&[], &violations, &nono::CapabilitySet::new());
-
-        let explanation = explanations
-            .iter()
-            .find(|explanation| explanation.path == keychain)
-            .expect("keychain explanation");
-        assert_eq!(explanation.access, nono::AccessMode::Read);
-        #[cfg(target_os = "macos")]
-        assert_eq!(explanation.reason, "sensitive_path");
-    }
-
-    #[test]
-    fn test_profile_save_prompt_preserves_nonzero_exit_behavior() {
-        let explanations = Vec::new();
-        let observation = nono::diagnostic::ErrorObservation::default();
-
-        assert!(should_offer_profile_save(
-            false,
-            1,
-            &explanations,
-            &observation,
-            &[],
-        ));
-        assert!(!should_offer_profile_save(
-            true,
-            1,
-            &explanations,
-            &observation,
-            &[],
-        ));
-    }
-
-    #[test]
-    fn test_exec_strategy_variants() {
-        assert_ne!(ExecStrategy::Direct, ExecStrategy::Supervised);
-    }
-
-    #[test]
-    fn test_dangerous_env_vars_linker_injection() {
-        assert!(is_dangerous_env_var("LD_PRELOAD"));
-        assert!(is_dangerous_env_var("LD_LIBRARY_PATH"));
-        assert!(is_dangerous_env_var("LD_AUDIT"));
-        assert!(is_dangerous_env_var("DYLD_INSERT_LIBRARIES"));
-        assert!(is_dangerous_env_var("DYLD_LIBRARY_PATH"));
-        assert!(is_dangerous_env_var("DYLD_FRAMEWORK_PATH"));
-    }
-
-    #[test]
-    fn test_dangerous_env_vars_shell_injection() {
-        assert!(is_dangerous_env_var("BASH_ENV"));
-        assert!(is_dangerous_env_var("ENV"));
-        assert!(is_dangerous_env_var("CDPATH"));
-        assert!(is_dangerous_env_var("GLOBIGNORE"));
-        assert!(is_dangerous_env_var("BASH_FUNC_foo%%"));
-        assert!(is_dangerous_env_var("PROMPT_COMMAND"));
-    }
-
-    #[test]
-    fn test_dangerous_env_vars_interpreter_injection() {
-        assert!(is_dangerous_env_var("PYTHONSTARTUP"));
-        assert!(is_dangerous_env_var("PYTHONPATH"));
-        assert!(is_dangerous_env_var("NODE_OPTIONS"));
-        assert!(is_dangerous_env_var("NODE_PATH"));
-        assert!(is_dangerous_env_var("PERL5OPT"));
-        assert!(is_dangerous_env_var("PERL5LIB"));
-        assert!(is_dangerous_env_var("RUBYOPT"));
-        assert!(is_dangerous_env_var("RUBYLIB"));
-        assert!(is_dangerous_env_var("GEM_PATH"));
-        assert!(is_dangerous_env_var("GEM_HOME"));
-    }
-
-    #[test]
-    fn test_dangerous_env_vars_jvm_dotnet_go() {
-        assert!(is_dangerous_env_var("JAVA_TOOL_OPTIONS"));
-        assert!(is_dangerous_env_var("_JAVA_OPTIONS"));
-        assert!(is_dangerous_env_var("DOTNET_STARTUP_HOOKS"));
-        assert!(is_dangerous_env_var("GOFLAGS"));
-    }
-
-    #[test]
-    fn test_dangerous_env_vars_shell_ifs() {
-        assert!(is_dangerous_env_var("IFS"));
-    }
-
-    #[test]
-    fn test_exec_strategy_supervised_selection() {
-        let strategy = ExecStrategy::Supervised;
-        assert_eq!(strategy, ExecStrategy::Supervised);
-        assert_ne!(ExecStrategy::Supervised, ExecStrategy::Direct);
-    }
-
-    #[test]
-    fn test_safe_env_vars_allowed() {
-        assert!(!is_dangerous_env_var("HOME"));
-        assert!(!is_dangerous_env_var("PATH"));
-        assert!(!is_dangerous_env_var("SHELL"));
-        assert!(!is_dangerous_env_var("TERM"));
-        assert!(!is_dangerous_env_var("LANG"));
-        assert!(!is_dangerous_env_var("USER"));
-        assert!(!is_dangerous_env_var("TMPDIR"));
-        assert!(!is_dangerous_env_var("EDITOR"));
-        assert!(!is_dangerous_env_var("XDG_CONFIG_HOME"));
-        assert!(!is_dangerous_env_var("CARGO_HOME"));
-        assert!(!is_dangerous_env_var("RUST_LOG"));
-        assert!(!is_dangerous_env_var("SSH_AUTH_SOCK"));
-    }
-
-    #[test]
-    fn test_record_denial_is_capped() {
-        let mut denials = Vec::new();
-        for _ in 0..(MAX_DENIAL_RECORDS + 10) {
-            record_denial(
-                &mut denials,
-                DenialRecord {
-                    path: "/tmp/test".into(),
-                    access: nono::AccessMode::Read,
-                    reason: DenialReason::PolicyBlocked,
-                },
+        #[test]
+        fn push_set_vars_skips_keys_overridden_by_env_vars() {
+            // A key also set via env_vars (credentials) is skipped entirely, so
+            // env_vars wins and there is no duplicate. The inherited host entry is
+            // left for env_vars (appended later) to override.
+            let mut env_c = vec![CString::new("TOKEN=host").expect("cstring")];
+            let set_vars = vec![("TOKEN".to_string(), "from_set_vars".to_string())];
+            let env_vars = vec![("TOKEN", "from_credentials")];
+            push_set_vars(&mut env_c, &set_vars, &env_vars);
+            // set_vars did not push its value...
+            let entries = env_strings(&env_c);
+            assert!(!entries.contains(&"TOKEN=from_set_vars".to_string()));
+            // ...and did not duplicate the key.
+            assert_eq!(
+                entries.iter().filter(|e| e.starts_with("TOKEN=")).count(),
+                1
             );
         }
-        assert_eq!(denials.len(), MAX_DENIAL_RECORDS);
+
+        #[test]
+        fn push_set_vars_does_not_substring_match_other_keys() {
+            // PATH must not be removed when set_vars sets PA (prefix-collision guard).
+            let mut env_c = vec![CString::new("PATH=/usr/bin").expect("cstring")];
+            let set_vars = vec![("PA".to_string(), "x".to_string())];
+            push_set_vars(&mut env_c, &set_vars, &[]);
+            let entries = env_strings(&env_c);
+            assert!(entries.contains(&"PATH=/usr/bin".to_string()));
+            assert!(entries.contains(&"PA=x".to_string()));
+        }
     }
 
-    #[test]
-    fn test_resolve_procfs_self_for_child() {
-        let path = resolve_procfs_path_for_child(
-            Path::new("/proc/self/maps"),
-            Some(ProcfsAccessContext::new(4242, Some(4343))),
-        );
-        assert_eq!(path.ok(), Some(PathBuf::from("/proc/4242/maps")));
-    }
+    mod dangerous_env_vars {
+        use super::super::*;
 
-    #[test]
-    fn test_resolve_procfs_thread_self_for_child() {
-        let path = resolve_procfs_path_for_child(
-            Path::new("/proc/thread-self/maps"),
-            Some(ProcfsAccessContext::new(4242, Some(4343))),
-        );
-        assert_eq!(path.ok(), Some(PathBuf::from("/proc/4242/task/4343/maps")));
-    }
-
-    #[test]
-    fn test_resolve_procfs_thread_self_requires_thread_context() {
-        let result = resolve_procfs_path_for_child(
-            Path::new("/proc/thread-self/maps"),
-            Some(ProcfsAccessContext::new(4242, None)),
-        );
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_validate_procfs_access_allows_child_sensitive_proc_path() {
-        let result = validate_procfs_access(
-            Path::new("/proc/4242/maps"),
-            Some(ProcfsAccessContext::new(4242, Some(4343))),
-        );
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_validate_procfs_access_blocks_foreign_sensitive_proc_path() {
-        let result = validate_procfs_access(
-            Path::new("/proc/1/maps"),
-            Some(ProcfsAccessContext::new(4242, Some(4343))),
-        );
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_validate_procfs_access_allows_child_task_sensitive_proc_path() {
-        let result = validate_procfs_access(
-            Path::new("/proc/4242/task/9999/maps"),
-            Some(ProcfsAccessContext::new(4242, Some(4343))),
-        );
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_validate_procfs_access_blocks_foreign_proc_fd_path() {
-        let result = validate_procfs_access(
-            Path::new("/proc/1/fd/3"),
-            Some(ProcfsAccessContext::new(4242, Some(4343))),
-        );
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_validate_procfs_access_blocks_child_proc_fd_path() {
-        let result = validate_procfs_access(
-            Path::new("/proc/4242/fd/3"),
-            Some(ProcfsAccessContext::new(4242, Some(4343))),
-        );
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_validate_procfs_access_blocks_foreign_proc_cwd_path_before_canonicalization() {
-        let result = validate_procfs_access(
-            Path::new("/proc/1/cwd"),
-            Some(ProcfsAccessContext::new(4242, Some(4343))),
-        );
-        assert!(result.is_err());
-    }
-
-    // --- Grandchild procfs regression tests (issue #602) ---
-    //
-    // When bun is a grandchild (nono→sh→bun), notifying_tgid=bun's PID (e.g. 1001),
-    // not the direct child sh's PID (e.g. 1000). These tests verify the fix uses
-    // the correct PID for /proc/self resolution and access validation.
-
-    #[test]
-    fn test_resolve_procfs_self_for_grandchild_tgid() {
-        // After the fix, process_pid=notifying_tgid=1001 (bun).
-        // /proc/self/maps must resolve to /proc/1001/maps, not /proc/1000/maps.
-        let path = resolve_procfs_path_for_child(
-            Path::new("/proc/self/maps"),
-            Some(ProcfsAccessContext::new(1001, Some(1001))),
-        );
-        assert_eq!(path.ok(), Some(PathBuf::from("/proc/1001/maps")));
-    }
-
-    #[test]
-    fn test_validate_procfs_access_allows_grandchild_own_path() {
-        // notifying_tgid=1001 (bun): accessing /proc/1001/maps is allowed.
-        let result = validate_procfs_access(
-            Path::new("/proc/1001/maps"),
-            Some(ProcfsAccessContext::new(1001, Some(1001))),
-        );
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_validate_procfs_access_blocks_grandchild_accessing_sibling() {
-        // notifying_tgid=1001 (bun): accessing /proc/1000/maps (sh's maps) is blocked.
-        // This verifies the fix does NOT allow cross-process procfs reads.
-        let result = validate_procfs_access(
-            Path::new("/proc/1000/maps"),
-            Some(ProcfsAccessContext::new(1001, Some(1001))),
-        );
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_resolve_procfs_self_wrong_pid_demonstrates_bug() {
-        // Demonstrates the pre-fix bug: if process_pid=1000 (sh) but the requesting
-        // process is bun (1001), /proc/self/maps incorrectly resolves to /proc/1000/maps.
-        // After the fix, process_pid is always notifying_tgid, so this construction
-        // would never be used for bun's request.
-        let path = resolve_procfs_path_for_child(
-            Path::new("/proc/self/maps"),
-            Some(ProcfsAccessContext::new(1000, Some(1001))), // broken: sh's PID for bun's request
-        );
-        // This produces the wrong path (sh's maps instead of bun's maps).
-        assert_eq!(path.ok(), Some(PathBuf::from("/proc/1000/maps")));
-    }
-
-    /// Verify that the supervisor loop runs and exits cleanly without a PTY relay.
-    ///
-    /// This tests the `capability_elevation = false` code path where no PTY is
-    /// allocated but the supervisor loop must still service the IPC socket for
-    /// trust interception. The child fork closes its socket end and exits,
-    /// causing the loop to see POLLHUP and return.
-    #[test]
-    fn test_supervisor_loop_runs_without_pty_relay() {
-        use std::os::unix::net::UnixStream;
-
-        struct DenyAll;
-        impl ApprovalBackend for DenyAll {
-            fn request_capability(
-                &self,
-                _req: &nono::supervisor::CapabilityRequest,
-            ) -> nono::Result<ApprovalDecision> {
-                Ok(ApprovalDecision::Denied {
-                    reason: "test".to_string(),
-                })
-            }
-            fn backend_name(&self) -> &str {
-                "deny-all-test"
-            }
+        #[test]
+        fn test_dangerous_env_vars_linker_injection() {
+            assert!(is_dangerous_env_var("LD_PRELOAD"));
+            assert!(is_dangerous_env_var("LD_LIBRARY_PATH"));
+            assert!(is_dangerous_env_var("LD_AUDIT"));
+            assert!(is_dangerous_env_var("DYLD_INSERT_LIBRARIES"));
+            assert!(is_dangerous_env_var("DYLD_LIBRARY_PATH"));
+            assert!(is_dangerous_env_var("DYLD_FRAMEWORK_PATH"));
         }
 
-        let (parent_stream, child_stream) = UnixStream::pair()
-            .map_err(|e| format!("socketpair: {e}"))
-            .expect("socketpair failed in test");
+        #[test]
+        fn test_dangerous_env_vars_shell_injection() {
+            assert!(is_dangerous_env_var("BASH_ENV"));
+            assert!(is_dangerous_env_var("ENV"));
+            assert!(is_dangerous_env_var("CDPATH"));
+            assert!(is_dangerous_env_var("GLOBIGNORE"));
+            assert!(is_dangerous_env_var("BASH_FUNC_foo%%"));
+            assert!(is_dangerous_env_var("PROMPT_COMMAND"));
+        }
 
-        let backend = DenyAll;
-        let sup_cfg = SupervisorConfig {
-            protected_roots: &[],
-            approval_backend: &backend,
-            session_id: "test-session",
-            attach_initial_client: false,
-            detach_sequence: None,
-            open_url_origins: &[],
-            open_url_allow_localhost: false,
-            audit_recorder: None,
-            network_audit_events: None,
-            redaction_policy: &nono::ScrubPolicy::secure_default(),
-            allow_launch_services_active: false,
-            #[cfg(target_os = "linux")]
-            proxy_port: 0,
-            #[cfg(target_os = "linux")]
-            proxy_bind_ports: Vec::new(),
-            #[cfg(target_os = "linux")]
-            unix_socket_allowlist: &[],
-            #[cfg(target_os = "linux")]
-            linux_network_notify_mode: LinuxNetworkNotifyMode::ProxyOnly,
+        #[test]
+        fn test_dangerous_env_vars_interpreter_injection() {
+            assert!(is_dangerous_env_var("PYTHONSTARTUP"));
+            assert!(is_dangerous_env_var("PYTHONPATH"));
+            assert!(is_dangerous_env_var("NODE_OPTIONS"));
+            assert!(is_dangerous_env_var("NODE_PATH"));
+            assert!(is_dangerous_env_var("PERL5OPT"));
+            assert!(is_dangerous_env_var("PERL5LIB"));
+            assert!(is_dangerous_env_var("RUBYOPT"));
+            assert!(is_dangerous_env_var("RUBYLIB"));
+            assert!(is_dangerous_env_var("GEM_PATH"));
+            assert!(is_dangerous_env_var("GEM_HOME"));
+        }
+
+        #[test]
+        fn test_dangerous_env_vars_jvm_dotnet_go() {
+            assert!(is_dangerous_env_var("JAVA_TOOL_OPTIONS"));
+            assert!(is_dangerous_env_var("_JAVA_OPTIONS"));
+            assert!(is_dangerous_env_var("DOTNET_STARTUP_HOOKS"));
+            assert!(is_dangerous_env_var("GOFLAGS"));
+        }
+
+        #[test]
+        fn test_dangerous_env_vars_shell_ifs() {
+            assert!(is_dangerous_env_var("IFS"));
+        }
+
+        #[test]
+        fn test_safe_env_vars_allowed() {
+            assert!(!is_dangerous_env_var("HOME"));
+            assert!(!is_dangerous_env_var("PATH"));
+            assert!(!is_dangerous_env_var("SHELL"));
+            assert!(!is_dangerous_env_var("TERM"));
+            assert!(!is_dangerous_env_var("LANG"));
+            assert!(!is_dangerous_env_var("USER"));
+            assert!(!is_dangerous_env_var("TMPDIR"));
+            assert!(!is_dangerous_env_var("EDITOR"));
+            assert!(!is_dangerous_env_var("XDG_CONFIG_HOME"));
+            assert!(!is_dangerous_env_var("CARGO_HOME"));
+            assert!(!is_dangerous_env_var("RUST_LOG"));
+            assert!(!is_dangerous_env_var("SSH_AUTH_SOCK"));
+        }
+    }
+
+    mod exec_strategy {
+        use super::super::*;
+        use nix::sys::termios::{
+            ControlFlags, InputFlags, LocalFlags, OutputFlags, SpecialCharacterIndices,
         };
 
-        // Fork a child that closes its socket end and exits immediately.
-        // SAFETY: We are in a test; the child does minimal work and _exit()s.
-        match unsafe { fork() } {
-            Ok(ForkResult::Child) => {
-                drop(child_stream);
-                drop(parent_stream);
-                unsafe { libc::_exit(42) };
-            }
-            Ok(ForkResult::Parent { child }) => {
-                drop(child_stream);
-                let mut sock = SupervisorSocket::from_stream(parent_stream);
+        #[test]
+        fn test_exec_strategy_default_is_supervised() {
+            assert_eq!(ExecStrategy::default(), ExecStrategy::Supervised);
+        }
 
-                // Run supervisor loop with relay: None (the capability_elevation=false path).
-                // It should poll the socket, see POLLHUP when child exits, and return.
-                #[cfg(target_os = "linux")]
-                let result = run_supervisor_loop(
-                    child,
-                    &mut sock,
-                    &sup_cfg,
-                    None, // no startup timeout
-                    None, // no seccomp
-                    None, // no proxy seccomp
-                    &[],  // no initial caps
-                    None, // no trust interceptor
-                    None, // no PTY relay — this is what we're testing
-                    None, // no URL listener
-                    &mut false,
-                );
+        #[test]
+        fn test_configure_startup_prompt_termios_restores_cooked_input() {
+            let mut termios = unsafe { std::mem::zeroed::<nix::sys::termios::Termios>() };
+            termios.input_flags = InputFlags::IGNBRK | InputFlags::INLCR | InputFlags::IGNCR;
+            termios.output_flags = OutputFlags::empty();
+            termios.local_flags = LocalFlags::empty();
+            termios.control_flags = ControlFlags::CSIZE | ControlFlags::PARENB;
+            termios.control_chars[SpecialCharacterIndices::VMIN as usize] = 0;
+            termios.control_chars[SpecialCharacterIndices::VTIME as usize] = 9;
 
-                #[cfg(not(target_os = "linux"))]
-                let result = run_supervisor_loop(
-                    child, &mut sock, &sup_cfg, None, // no startup timeout
-                    None, // no trust interceptor
-                    None, // no PTY relay
-                    None, // no URL listener
-                    &mut false,
-                );
+            crate::profile_save_runtime::configure_prompt_termios(&mut termios);
 
-                #[cfg(target_os = "linux")]
-                let (status, denials, ipc_denials) = result
-                    .map_err(|e| format!("supervisor loop: {e}"))
-                    .expect("supervisor loop failed");
+            assert!(
+                termios
+                    .input_flags
+                    .contains(InputFlags::ICRNL | InputFlags::IXON)
+            );
+            assert!(
+                !termios
+                    .input_flags
+                    .intersects(InputFlags::IGNBRK | InputFlags::INLCR | InputFlags::IGNCR)
+            );
+            assert!(termios.output_flags.contains(OutputFlags::OPOST));
+            assert!(termios.local_flags.contains(
+                LocalFlags::ECHO
+                    | LocalFlags::ECHONL
+                    | LocalFlags::ICANON
+                    | LocalFlags::ISIG
+                    | LocalFlags::IEXTEN
+            ));
+            assert!(!termios.control_flags.contains(ControlFlags::PARENB));
+            assert!(termios.control_flags.contains(ControlFlags::CS8));
+            assert_eq!(
+                termios.control_chars[SpecialCharacterIndices::VMIN as usize],
+                1
+            );
+            assert_eq!(
+                termios.control_chars[SpecialCharacterIndices::VTIME as usize],
+                0
+            );
+        }
 
-                #[cfg(not(target_os = "linux"))]
-                let (status, denials) = result
-                    .map_err(|e| format!("supervisor loop: {e}"))
-                    .expect("supervisor loop failed");
+        #[test]
+        fn test_exec_strategy_variants() {
+            assert_ne!(ExecStrategy::Direct, ExecStrategy::Supervised);
+        }
 
-                assert!(denials.is_empty(), "no denials expected");
-                #[cfg(target_os = "linux")]
-                assert!(ipc_denials.is_empty(), "no IPC denials expected");
+        #[test]
+        fn test_exec_strategy_supervised_selection() {
+            let strategy = ExecStrategy::Supervised;
+            assert_eq!(strategy, ExecStrategy::Supervised);
+            assert_ne!(ExecStrategy::Supervised, ExecStrategy::Direct);
+        }
+    }
 
-                // Child exited with code 42
-                match status {
-                    WaitStatus::Exited(_, code) => assert_eq!(code, 42),
-                    other => panic!("unexpected wait status: {other:?}"),
+    mod diagnostics_and_profile_save {
+        use super::super::*;
+        use std::path::PathBuf;
+
+        #[test]
+        fn test_diagnostic_footer_triggers_on_successful_sandbox_violation() {
+            let violations = vec![nono::SandboxViolation {
+                operation: "file-read-data".to_string(),
+                target: Some("/tmp/secret.txt".to_string()),
+            }];
+            let denials = Vec::new();
+            let observation = nono::diagnostic::ErrorObservation::default();
+
+            assert!(should_print_diagnostic_footer(
+                false,
+                0,
+                &denials,
+                &[],
+                &violations,
+                &observation,
+            ));
+            assert!(!should_print_diagnostic_footer(
+                true,
+                0,
+                &denials,
+                &[],
+                &violations,
+                &observation,
+            ));
+        }
+
+        #[test]
+        fn test_profile_save_prompt_triggers_on_policy_explanation_with_zero_exit() {
+            let explanations = vec![nono::diagnostic::PolicyExplanation {
+                path: PathBuf::from("/tmp/secret.txt"),
+                access: nono::AccessMode::Read,
+                reason: "path_not_granted".to_string(),
+                details: None,
+                policy_source: None,
+                suggested_flag: Some("--read-file /tmp/secret.txt".to_string()),
+            }];
+            let observation = nono::diagnostic::ErrorObservation::default();
+
+            assert!(should_offer_profile_save(
+                false,
+                0,
+                &explanations,
+                &observation,
+                &[],
+            ));
+        }
+
+        #[test]
+        fn test_profile_save_prompt_triggers_on_user_preferences_violation_with_zero_exit() {
+            let explanations = Vec::new();
+            let observation = nono::diagnostic::ErrorObservation::default();
+            let violations = vec![nono::SandboxViolation {
+                operation: "user-preference-read".to_string(),
+                target: Some("kcfpreferencesanyapplication".to_string()),
+            }];
+
+            assert!(should_offer_profile_save(
+                false,
+                0,
+                &explanations,
+                &observation,
+                &violations,
+            ));
+        }
+
+        #[test]
+        fn test_suppressed_system_service_violations_do_not_offer_profile_save() {
+            let explanations = Vec::new();
+            let observation = nono::diagnostic::ErrorObservation::default();
+            let violations = vec![nono::SandboxViolation {
+                operation: "forbidden-exec-sugid".to_string(),
+                target: None,
+            }];
+            let suppressed = vec!["forbidden-exec-sugid".to_string()];
+            let visible = filter_suppressed_system_service_violations(&violations, &suppressed);
+
+            assert!(visible.is_empty());
+            assert!(!should_offer_profile_save(
+                false,
+                0,
+                &explanations,
+                &observation,
+                &visible,
+            ));
+        }
+
+        #[test]
+        fn test_keychain_mach_violation_adds_profile_save_explanation() {
+            let _env_lock = crate::test_env::ENV_LOCK.lock().expect("env lock");
+            let temp_home = tempfile::TempDir::new().expect("temp home");
+            let home = temp_home.path().canonicalize().expect("canonical home");
+            let _env = crate::test_env::EnvVarGuard::set_all(&[(
+                "HOME",
+                home.to_str().expect("home path"),
+            )]);
+            let keychain = home.join("Library/Keychains/login.keychain-db");
+            std::fs::create_dir_all(keychain.parent().expect("keychain parent")).expect("mkdir");
+            std::fs::write(&keychain, b"db").expect("write keychain fixture");
+
+            let violations = vec![nono::SandboxViolation {
+                operation: "mach-lookup".to_string(),
+                target: Some("com.apple.SecurityServer".to_string()),
+            }];
+
+            let explanations =
+                build_policy_explanations(&[], &violations, &nono::CapabilitySet::new());
+
+            let explanation = explanations
+                .iter()
+                .find(|explanation| explanation.path == keychain)
+                .expect("keychain explanation");
+            assert_eq!(explanation.access, nono::AccessMode::Read);
+            #[cfg(target_os = "macos")]
+            assert_eq!(explanation.reason, "sensitive_path");
+        }
+
+        #[test]
+        fn test_profile_save_prompt_preserves_nonzero_exit_behavior() {
+            let explanations = Vec::new();
+            let observation = nono::diagnostic::ErrorObservation::default();
+
+            assert!(should_offer_profile_save(
+                false,
+                1,
+                &explanations,
+                &observation,
+                &[],
+            ));
+            assert!(!should_offer_profile_save(
+                true,
+                1,
+                &explanations,
+                &observation,
+                &[],
+            ));
+        }
+    }
+
+    mod procfs {
+        use super::super::*;
+        use std::path::{Path, PathBuf};
+
+        #[test]
+        fn test_resolve_procfs_self_for_child() {
+            let path = resolve_procfs_path_for_child(
+                Path::new("/proc/self/maps"),
+                Some(ProcfsAccessContext::new(4242, Some(4343))),
+            );
+            assert_eq!(path.ok(), Some(PathBuf::from("/proc/4242/maps")));
+        }
+
+        #[test]
+        fn test_resolve_procfs_thread_self_for_child() {
+            let path = resolve_procfs_path_for_child(
+                Path::new("/proc/thread-self/maps"),
+                Some(ProcfsAccessContext::new(4242, Some(4343))),
+            );
+            assert_eq!(path.ok(), Some(PathBuf::from("/proc/4242/task/4343/maps")));
+        }
+
+        #[test]
+        fn test_resolve_procfs_thread_self_requires_thread_context() {
+            let result = resolve_procfs_path_for_child(
+                Path::new("/proc/thread-self/maps"),
+                Some(ProcfsAccessContext::new(4242, None)),
+            );
+            assert!(result.is_err());
+        }
+
+        #[test]
+        fn test_validate_procfs_access_allows_child_sensitive_proc_path() {
+            let result = validate_procfs_access(
+                Path::new("/proc/4242/maps"),
+                Some(ProcfsAccessContext::new(4242, Some(4343))),
+            );
+            assert!(result.is_ok());
+        }
+
+        #[test]
+        fn test_validate_procfs_access_blocks_foreign_sensitive_proc_path() {
+            let result = validate_procfs_access(
+                Path::new("/proc/1/maps"),
+                Some(ProcfsAccessContext::new(4242, Some(4343))),
+            );
+            assert!(result.is_err());
+        }
+
+        #[test]
+        fn test_validate_procfs_access_allows_child_task_sensitive_proc_path() {
+            let result = validate_procfs_access(
+                Path::new("/proc/4242/task/9999/maps"),
+                Some(ProcfsAccessContext::new(4242, Some(4343))),
+            );
+            assert!(result.is_ok());
+        }
+
+        #[test]
+        fn test_validate_procfs_access_blocks_foreign_proc_fd_path() {
+            let result = validate_procfs_access(
+                Path::new("/proc/1/fd/3"),
+                Some(ProcfsAccessContext::new(4242, Some(4343))),
+            );
+            assert!(result.is_err());
+        }
+
+        #[test]
+        fn test_validate_procfs_access_blocks_child_proc_fd_path() {
+            let result = validate_procfs_access(
+                Path::new("/proc/4242/fd/3"),
+                Some(ProcfsAccessContext::new(4242, Some(4343))),
+            );
+            assert!(result.is_err());
+        }
+
+        #[test]
+        fn test_validate_procfs_access_blocks_foreign_proc_cwd_path_before_canonicalization() {
+            let result = validate_procfs_access(
+                Path::new("/proc/1/cwd"),
+                Some(ProcfsAccessContext::new(4242, Some(4343))),
+            );
+            assert!(result.is_err());
+        }
+
+        #[test]
+        fn test_resolve_procfs_self_for_grandchild_tgid() {
+            // After the fix, process_pid=notifying_tgid=1001 (bun).
+            // /proc/self/maps must resolve to /proc/1001/maps, not /proc/1000/maps.
+            let path = resolve_procfs_path_for_child(
+                Path::new("/proc/self/maps"),
+                Some(ProcfsAccessContext::new(1001, Some(1001))),
+            );
+            assert_eq!(path.ok(), Some(PathBuf::from("/proc/1001/maps")));
+        }
+
+        #[test]
+        fn test_validate_procfs_access_allows_grandchild_own_path() {
+            // notifying_tgid=1001 (bun): accessing /proc/1001/maps is allowed.
+            let result = validate_procfs_access(
+                Path::new("/proc/1001/maps"),
+                Some(ProcfsAccessContext::new(1001, Some(1001))),
+            );
+            assert!(result.is_ok());
+        }
+
+        #[test]
+        fn test_validate_procfs_access_blocks_grandchild_accessing_sibling() {
+            // notifying_tgid=1001 (bun): accessing /proc/1000/maps (sh's maps) is blocked.
+            // This verifies the fix does NOT allow cross-process procfs reads.
+            let result = validate_procfs_access(
+                Path::new("/proc/1000/maps"),
+                Some(ProcfsAccessContext::new(1001, Some(1001))),
+            );
+            assert!(result.is_err());
+        }
+
+        #[test]
+        fn test_resolve_procfs_self_wrong_pid_demonstrates_bug() {
+            // Demonstrates the pre-fix bug: if process_pid=1000 (sh) but the requesting
+            // process is bun (1001), /proc/self/maps incorrectly resolves to /proc/1000/maps.
+            // After the fix, process_pid is always notifying_tgid, so this construction
+            // would never be used for bun's request.
+            let path = resolve_procfs_path_for_child(
+                Path::new("/proc/self/maps"),
+                Some(ProcfsAccessContext::new(1000, Some(1001))), // broken: sh's PID for bun's request
+            );
+            // This produces the wrong path (sh's maps instead of bun's maps).
+            assert_eq!(path.ok(), Some(PathBuf::from("/proc/1000/maps")));
+        }
+    }
+
+    mod supervisor_loop {
+        use super::super::*;
+        use nix::sys::wait::WaitStatus;
+        use nix::unistd::{ForkResult, fork};
+
+        #[test]
+        fn test_supervisor_loop_runs_without_pty_relay() {
+            use std::os::unix::net::UnixStream;
+
+            struct DenyAll;
+            impl ApprovalBackend for DenyAll {
+                fn request_capability(
+                    &self,
+                    _req: &nono::supervisor::CapabilityRequest,
+                ) -> nono::Result<ApprovalDecision> {
+                    Ok(ApprovalDecision::Denied {
+                        reason: "test".to_string(),
+                    })
+                }
+                fn backend_name(&self) -> &str {
+                    "deny-all-test"
                 }
             }
-            Err(e) => panic!("fork failed: {e}"),
+
+            let (parent_stream, child_stream) = UnixStream::pair()
+                .map_err(|e| format!("socketpair: {e}"))
+                .expect("socketpair failed in test");
+
+            let backend = DenyAll;
+            let sup_cfg = SupervisorConfig {
+                protected_roots: &[],
+                approval_backend: &backend,
+                session_id: "test-session",
+                attach_initial_client: false,
+                detach_sequence: None,
+                open_url_origins: &[],
+                open_url_allow_localhost: false,
+                audit_recorder: None,
+                network_audit_events: None,
+                redaction_policy: &nono::ScrubPolicy::secure_default(),
+                allow_launch_services_active: false,
+                #[cfg(target_os = "linux")]
+                proxy_port: 0,
+                #[cfg(target_os = "linux")]
+                proxy_bind_ports: Vec::new(),
+                #[cfg(target_os = "linux")]
+                unix_socket_allowlist: &[],
+                #[cfg(target_os = "linux")]
+                linux_network_notify_mode: LinuxNetworkNotifyMode::ProxyOnly,
+            };
+
+            // Fork a child that closes its socket end and exits immediately.
+            // SAFETY: We are in a test; the child does minimal work and _exit()s.
+            match unsafe { fork() } {
+                Ok(ForkResult::Child) => {
+                    drop(child_stream);
+                    drop(parent_stream);
+                    unsafe { libc::_exit(42) };
+                }
+                Ok(ForkResult::Parent { child }) => {
+                    drop(child_stream);
+                    let mut sock = SupervisorSocket::from_stream(parent_stream);
+
+                    // Run supervisor loop with relay: None (the capability_elevation=false path).
+                    // It should poll the socket, see POLLHUP when child exits, and return.
+                    #[cfg(target_os = "linux")]
+                    let result = run_supervisor_loop(
+                        child,
+                        &mut sock,
+                        &sup_cfg,
+                        None, // no startup timeout
+                        None, // no seccomp
+                        None, // no proxy seccomp
+                        &[],  // no initial caps
+                        None, // no trust interceptor
+                        None, // no PTY relay — this is what we're testing
+                        None, // no URL listener
+                        &mut false,
+                    );
+
+                    #[cfg(not(target_os = "linux"))]
+                    let result = run_supervisor_loop(
+                        child, &mut sock, &sup_cfg, None, // no startup timeout
+                        None, // no trust interceptor
+                        None, // no PTY relay
+                        None, // no URL listener
+                        &mut false,
+                    );
+
+                    #[cfg(target_os = "linux")]
+                    let (status, denials, ipc_denials) = result
+                        .map_err(|e| format!("supervisor loop: {e}"))
+                        .expect("supervisor loop failed");
+
+                    #[cfg(not(target_os = "linux"))]
+                    let (status, denials) = result
+                        .map_err(|e| format!("supervisor loop: {e}"))
+                        .expect("supervisor loop failed");
+
+                    assert!(denials.is_empty(), "no denials expected");
+                    #[cfg(target_os = "linux")]
+                    assert!(ipc_denials.is_empty(), "no IPC denials expected");
+
+                    // Child exited with code 42
+                    match status {
+                        WaitStatus::Exited(_, code) => assert_eq!(code, 42),
+                        other => panic!("unexpected wait status: {other:?}"),
+                    }
+                }
+                Err(e) => panic!("fork failed: {e}"),
+            }
         }
-    }
 
-    /// Verify that ProxyOnly mode on V4+ kernels does NOT deadlock.
-    ///
-    /// On Landlock V4+ kernels, ProxyOnly is handled by Landlock natively.
-    /// The seccomp_proxy_fallback flag should be false, so the parent must
-    /// NOT attempt to recv a proxy notify fd. This test verifies the
-    /// supervisor loop starts and exits cleanly with ProxyOnly caps but
-    /// no proxy seccomp filter.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn test_supervisor_loop_proxy_only_v4_no_deadlock() {
-        use std::os::unix::net::UnixStream;
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn test_supervisor_loop_proxy_only_v4_no_deadlock() {
+            use std::os::unix::net::UnixStream;
 
-        struct DenyAll;
-        impl ApprovalBackend for DenyAll {
-            fn request_capability(
-                &self,
-                _req: &nono::supervisor::CapabilityRequest,
-            ) -> nono::Result<ApprovalDecision> {
-                Ok(ApprovalDecision::Denied {
-                    reason: "test".to_string(),
-                })
-            }
-            fn backend_name(&self) -> &str {
-                "deny-all-test"
-            }
-        }
-
-        let (parent_stream, child_stream) = UnixStream::pair()
-            .map_err(|e| format!("socketpair: {e}"))
-            .expect("socketpair failed in test");
-
-        let backend = DenyAll;
-        // ProxyOnly mode with proxy_port set, but seccomp_proxy_fallback is false
-        // (simulating V4+ where Landlock handles networking).
-        let sup_cfg = SupervisorConfig {
-            protected_roots: &[],
-            approval_backend: &backend,
-            session_id: "test-proxy-v4",
-            attach_initial_client: false,
-            detach_sequence: None,
-            open_url_origins: &[],
-            open_url_allow_localhost: false,
-            audit_recorder: None,
-            network_audit_events: None,
-            redaction_policy: &nono::ScrubPolicy::secure_default(),
-            allow_launch_services_active: false,
-            #[cfg(target_os = "linux")]
-            proxy_port: 8080,
-            #[cfg(target_os = "linux")]
-            proxy_bind_ports: Vec::new(),
-            #[cfg(target_os = "linux")]
-            unix_socket_allowlist: &[],
-            #[cfg(target_os = "linux")]
-            linux_network_notify_mode: LinuxNetworkNotifyMode::ProxyOnly,
-        };
-
-        match unsafe { fork() } {
-            Ok(ForkResult::Child) => {
-                // Child: close socket and exit. Does NOT send a proxy notify fd.
-                drop(child_stream);
-                drop(parent_stream);
-                unsafe { libc::_exit(0) };
-            }
-            Ok(ForkResult::Parent { child }) => {
-                drop(child_stream);
-                let mut sock = SupervisorSocket::from_stream(parent_stream);
-
-                // Run supervisor loop with NO proxy seccomp fd.
-                // If the bug from before were present (unconditional recv_fd),
-                // this would deadlock because the child never sends a second fd.
-                let result = run_supervisor_loop(
-                    child,
-                    &mut sock,
-                    &sup_cfg,
-                    None, // no startup timeout
-                    None, // no openat seccomp
-                    None, // no proxy seccomp — V4+ Landlock handles it
-                    &[],  // no initial caps
-                    None, // no trust interceptor
-                    None, // no PTY relay
-                    None, // no URL listener
-                    &mut false,
-                );
-
-                let (status, denials, ipc_denials) = result
-                    .map_err(|e| format!("supervisor loop: {e}"))
-                    .expect("supervisor loop should not deadlock");
-                assert!(denials.is_empty());
-                assert!(ipc_denials.is_empty());
-
-                match status {
-                    WaitStatus::Exited(_, code) => assert_eq!(code, 0),
-                    other => panic!("unexpected wait status: {other:?}"),
+            struct DenyAll;
+            impl ApprovalBackend for DenyAll {
+                fn request_capability(
+                    &self,
+                    _req: &nono::supervisor::CapabilityRequest,
+                ) -> nono::Result<ApprovalDecision> {
+                    Ok(ApprovalDecision::Denied {
+                        reason: "test".to_string(),
+                    })
+                }
+                fn backend_name(&self) -> &str {
+                    "deny-all-test"
                 }
             }
-            Err(e) => panic!("fork failed: {e}"),
+
+            let (parent_stream, child_stream) = UnixStream::pair()
+                .map_err(|e| format!("socketpair: {e}"))
+                .expect("socketpair failed in test");
+
+            let backend = DenyAll;
+            // ProxyOnly mode with proxy_port set, but seccomp_proxy_fallback is false
+            // (simulating V4+ where Landlock handles networking).
+            let sup_cfg = SupervisorConfig {
+                protected_roots: &[],
+                approval_backend: &backend,
+                session_id: "test-proxy-v4",
+                attach_initial_client: false,
+                detach_sequence: None,
+                open_url_origins: &[],
+                open_url_allow_localhost: false,
+                audit_recorder: None,
+                network_audit_events: None,
+                redaction_policy: &nono::ScrubPolicy::secure_default(),
+                allow_launch_services_active: false,
+                #[cfg(target_os = "linux")]
+                proxy_port: 8080,
+                #[cfg(target_os = "linux")]
+                proxy_bind_ports: Vec::new(),
+                #[cfg(target_os = "linux")]
+                unix_socket_allowlist: &[],
+                #[cfg(target_os = "linux")]
+                linux_network_notify_mode: LinuxNetworkNotifyMode::ProxyOnly,
+            };
+
+            match unsafe { fork() } {
+                Ok(ForkResult::Child) => {
+                    // Child: close socket and exit. Does NOT send a proxy notify fd.
+                    drop(child_stream);
+                    drop(parent_stream);
+                    unsafe { libc::_exit(0) };
+                }
+                Ok(ForkResult::Parent { child }) => {
+                    drop(child_stream);
+                    let mut sock = SupervisorSocket::from_stream(parent_stream);
+
+                    // Run supervisor loop with NO proxy seccomp fd.
+                    // If the bug from before were present (unconditional recv_fd),
+                    // this would deadlock because the child never sends a second fd.
+                    let result = run_supervisor_loop(
+                        child,
+                        &mut sock,
+                        &sup_cfg,
+                        None, // no startup timeout
+                        None, // no openat seccomp
+                        None, // no proxy seccomp — V4+ Landlock handles it
+                        &[],  // no initial caps
+                        None, // no trust interceptor
+                        None, // no PTY relay
+                        None, // no URL listener
+                        &mut false,
+                    );
+
+                    let (status, denials, ipc_denials) = result
+                        .map_err(|e| format!("supervisor loop: {e}"))
+                        .expect("supervisor loop should not deadlock");
+                    assert!(denials.is_empty());
+                    assert!(ipc_denials.is_empty());
+
+                    match status {
+                        WaitStatus::Exited(_, code) => assert_eq!(code, 0),
+                        other => panic!("unexpected wait status: {other:?}"),
+                    }
+                }
+                Err(e) => panic!("fork failed: {e}"),
+            }
         }
     }
 
-    struct TestDenyBackend;
-    impl ApprovalBackend for TestDenyBackend {
-        fn request_capability(
-            &self,
-            _req: &nono::supervisor::CapabilityRequest,
-        ) -> nono::Result<ApprovalDecision> {
-            Ok(ApprovalDecision::Denied {
-                reason: "test".to_string(),
-            })
-        }
-        fn backend_name(&self) -> &str {
-            "test-deny"
-        }
-    }
+    mod validate_url {
+        use super::super::*;
 
-    #[test]
-    fn test_validate_url_allowed_origin() {
-        let backend = TestDenyBackend;
-        let origins = vec!["https://claude.ai".to_string()];
-        let config = SupervisorConfig {
-            protected_roots: &[],
-            approval_backend: &backend,
-            session_id: "test",
-            attach_initial_client: false,
-            detach_sequence: None,
-            open_url_origins: &origins,
-            open_url_allow_localhost: false,
-            audit_recorder: None,
-            network_audit_events: None,
-            redaction_policy: &nono::ScrubPolicy::secure_default(),
-            allow_launch_services_active: false,
-            #[cfg(target_os = "linux")]
-            proxy_port: 0,
-            #[cfg(target_os = "linux")]
-            proxy_bind_ports: Vec::new(),
-            #[cfg(target_os = "linux")]
-            unix_socket_allowlist: &[],
-            #[cfg(target_os = "linux")]
-            linux_network_notify_mode: LinuxNetworkNotifyMode::ProxyOnly,
-        };
-
-        // Allowed origin: validation passes
-        let result = validate_url("https://claude.ai/oauth/authorize?state=xyz", &config);
-        assert!(result.is_ok(), "Expected validation to pass: {result:?}");
-
-        // Disallowed origin: must fail validation
-        let result = validate_url("https://evil.example.com/phishing", &config);
-        assert!(result.is_err());
-        assert!(
-            result
-                .as_ref()
-                .err()
-                .map(|e| e.contains("not in the profile"))
-                .unwrap_or(false)
-        );
-    }
-
-    #[test]
-    fn test_validate_url_blocks_non_https() {
-        let backend = TestDenyBackend;
-        let config = SupervisorConfig {
-            protected_roots: &[],
-            approval_backend: &backend,
-            session_id: "test",
-            attach_initial_client: false,
-            detach_sequence: None,
-            open_url_origins: &[],
-            open_url_allow_localhost: false,
-            audit_recorder: None,
-            network_audit_events: None,
-            redaction_policy: &nono::ScrubPolicy::secure_default(),
-            allow_launch_services_active: false,
-            #[cfg(target_os = "linux")]
-            proxy_port: 0,
-            #[cfg(target_os = "linux")]
-            proxy_bind_ports: Vec::new(),
-            #[cfg(target_os = "linux")]
-            unix_socket_allowlist: &[],
-            #[cfg(target_os = "linux")]
-            linux_network_notify_mode: LinuxNetworkNotifyMode::ProxyOnly,
-        };
-
-        let result = validate_url("file:///etc/passwd", &config);
-        assert!(result.is_err());
-        assert!(
-            result
-                .as_ref()
-                .err()
-                .map(|e| e.contains("Only https://"))
-                .unwrap_or(false)
-        );
-
-        let result = validate_url("javascript:alert(1)", &config);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_validate_url_localhost() {
-        let backend = TestDenyBackend;
-        let config_allow = SupervisorConfig {
-            protected_roots: &[],
-            approval_backend: &backend,
-            session_id: "test",
-            attach_initial_client: false,
-            detach_sequence: None,
-            open_url_origins: &[],
-            open_url_allow_localhost: true,
-            audit_recorder: None,
-            network_audit_events: None,
-            redaction_policy: &nono::ScrubPolicy::secure_default(),
-            allow_launch_services_active: false,
-            #[cfg(target_os = "linux")]
-            proxy_port: 0,
-            #[cfg(target_os = "linux")]
-            proxy_bind_ports: Vec::new(),
-            #[cfg(target_os = "linux")]
-            unix_socket_allowlist: &[],
-            #[cfg(target_os = "linux")]
-            linux_network_notify_mode: LinuxNetworkNotifyMode::ProxyOnly,
-        };
-        let config_deny = SupervisorConfig {
-            protected_roots: &[],
-            approval_backend: &backend,
-            session_id: "test",
-            attach_initial_client: false,
-            detach_sequence: None,
-            open_url_origins: &[],
-            open_url_allow_localhost: false,
-            audit_recorder: None,
-            network_audit_events: None,
-            redaction_policy: &nono::ScrubPolicy::secure_default(),
-            allow_launch_services_active: false,
-            #[cfg(target_os = "linux")]
-            proxy_port: 0,
-            #[cfg(target_os = "linux")]
-            proxy_bind_ports: Vec::new(),
-            #[cfg(target_os = "linux")]
-            unix_socket_allowlist: &[],
-            #[cfg(target_os = "linux")]
-            linux_network_notify_mode: LinuxNetworkNotifyMode::ProxyOnly,
-        };
-
-        // Localhost denied when not allowed
-        let result = validate_url("http://localhost:8080/callback", &config_deny);
-        assert!(result.is_err());
-        assert!(
-            result
-                .as_ref()
-                .err()
-                .map(|e| e.contains("not allowed"))
-                .unwrap_or(false)
-        );
-
-        // Localhost allowed when configured
-        let result = validate_url("http://localhost:8080/callback", &config_allow);
-        assert!(
-            result.is_ok(),
-            "Expected localhost validation to pass: {result:?}"
-        );
-    }
-
-    #[test]
-    fn test_validate_url_max_length() {
-        let backend = TestDenyBackend;
-        let config = SupervisorConfig {
-            protected_roots: &[],
-            approval_backend: &backend,
-            session_id: "test",
-            attach_initial_client: false,
-            detach_sequence: None,
-            open_url_origins: &[],
-            open_url_allow_localhost: false,
-            audit_recorder: None,
-            network_audit_events: None,
-            redaction_policy: &nono::ScrubPolicy::secure_default(),
-            allow_launch_services_active: false,
-            #[cfg(target_os = "linux")]
-            proxy_port: 0,
-            #[cfg(target_os = "linux")]
-            proxy_bind_ports: Vec::new(),
-            #[cfg(target_os = "linux")]
-            unix_socket_allowlist: &[],
-            #[cfg(target_os = "linux")]
-            linux_network_notify_mode: LinuxNetworkNotifyMode::ProxyOnly,
-        };
-
-        let long_url = format!("https://example.com/{}", "a".repeat(MAX_URL_LENGTH));
-        let result = validate_url(&long_url, &config);
-        assert!(result.is_err());
-        assert!(
-            result
-                .as_ref()
-                .err()
-                .map(|e| e.contains("maximum length"))
-                .unwrap_or(false)
-        );
-    }
-
-    #[test]
-    fn test_shell_quote_simple_path() {
-        assert_eq!(shell_quote("/usr/bin/nono"), "/usr/bin/nono");
-    }
-
-    #[test]
-    fn test_shell_quote_path_with_spaces() {
-        assert_eq!(shell_quote("/opt/my app/nono"), "'/opt/my app/nono'");
-    }
-
-    #[test]
-    fn test_shell_quote_path_with_single_quote() {
-        assert_eq!(shell_quote("/opt/it's/nono"), "'/opt/it'\\''s/nono'");
-    }
-
-    #[test]
-    fn test_shell_quote_empty_string() {
-        assert_eq!(shell_quote(""), "''");
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn test_create_linux_browser_shim_installs_launcher_and_helper() {
-        let exe = std::env::current_exe().expect("current_exe");
-        let socket_path = std::path::Path::new("/tmp/nono-test/supervisor.sock");
-        let shim = create_linux_browser_shim(&exe, socket_path).expect("create shim");
-
-        assert!(shim.launcher.exists(), "browser launcher should exist");
-        assert_eq!(
-            shim.launcher.parent(),
-            Some(shim.dir.path()),
-            "launcher should live inside shim dir"
-        );
-
-        let script = std::fs::read_to_string(&shim.launcher).expect("read shim");
-        assert!(
-            script.contains("nono-open-url-helper"),
-            "launcher should reference the copied helper"
-        );
-        assert!(
-            script.contains("NONO_SUPERVISOR_PATH=/tmp/nono-test/supervisor.sock"),
-            "launcher should export the supervisor socket path for helper execution"
-        );
-        assert!(
-            script.contains("open-url-helper \"$@\""),
-            "launcher should exec the copied helper"
-        );
-    }
-
-    #[test]
-    fn test_clear_close_on_exec_clears_flag() {
-        use std::os::fd::AsRawFd;
-        use std::os::unix::net::UnixStream;
-
-        let (a, _b) = UnixStream::pair().expect("socketpair");
-        let fd = a.as_raw_fd();
-
-        let before = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-        assert!(before >= 0, "F_GETFD before failed");
-        assert_ne!(before & libc::FD_CLOEXEC, 0, "fd should start CLOEXEC");
-
-        clear_close_on_exec(fd).expect("clear cloexec");
-
-        let after = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-        assert!(after >= 0, "F_GETFD after failed");
-        assert_eq!(after & libc::FD_CLOEXEC, 0, "fd should not be CLOEXEC");
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn test_create_open_shim_installs_helper_in_shim_dir() {
-        let exe = std::env::current_exe().expect("current_exe");
-        let socket_path = std::path::Path::new("/tmp/nono-test/supervisor.sock");
-        let shim = create_open_shim(&exe, socket_path).expect("create shim");
-
-        assert!(shim.launcher.exists(), "open shim should exist");
-
-        let script = std::fs::read_to_string(&shim.launcher).expect("read shim");
-        assert!(
-            script.contains("for arg in \"$@\"; do"),
-            "shim should scan all arguments for a URL"
-        );
-        assert!(
-            script.contains("nono-open-url-helper"),
-            "shim should reference the copied helper"
-        );
-        assert!(
-            script.contains("NONO_SUPERVISOR_PATH=/tmp/nono-test/supervisor.sock"),
-            "shim should export the supervisor socket path for helper execution"
-        );
-        assert!(
-            script.contains("open-url-helper \"$url_arg\""),
-            "shim should exec the copied helper"
-        );
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn test_should_install_macos_open_shim_respects_launch_services_flag() {
-        struct TestBackend;
-        impl ApprovalBackend for TestBackend {
+        struct TestDenyBackend;
+        impl ApprovalBackend for TestDenyBackend {
             fn request_capability(
                 &self,
                 _req: &nono::supervisor::CapabilityRequest,
@@ -4596,178 +4290,518 @@ mod tests {
                 })
             }
             fn backend_name(&self) -> &str {
-                "test"
+                "test-deny"
             }
         }
 
-        let backend = TestBackend;
-        let config = SupervisorConfig {
-            protected_roots: &[],
-            approval_backend: &backend,
-            session_id: "test",
-            attach_initial_client: false,
-            detach_sequence: None,
-            open_url_origins: &[],
-            open_url_allow_localhost: false,
-            audit_recorder: None,
-            network_audit_events: None,
-            redaction_policy: &nono::ScrubPolicy::secure_default(),
-            allow_launch_services_active: true,
-            #[cfg(target_os = "linux")]
-            proxy_port: 0,
-            #[cfg(target_os = "linux")]
-            proxy_bind_ports: Vec::new(),
-            #[cfg(target_os = "linux")]
-            unix_socket_allowlist: &[],
-            #[cfg(target_os = "linux")]
-            linux_network_notify_mode: LinuxNetworkNotifyMode::ProxyOnly,
-        };
+        #[test]
+        fn test_validate_url_allowed_origin() {
+            let backend = TestDenyBackend;
+            let origins = vec!["https://claude.ai".to_string()];
+            let config = SupervisorConfig {
+                protected_roots: &[],
+                approval_backend: &backend,
+                session_id: "test",
+                attach_initial_client: false,
+                detach_sequence: None,
+                open_url_origins: &origins,
+                open_url_allow_localhost: false,
+                audit_recorder: None,
+                network_audit_events: None,
+                redaction_policy: &nono::ScrubPolicy::secure_default(),
+                allow_launch_services_active: false,
+                #[cfg(target_os = "linux")]
+                proxy_port: 0,
+                #[cfg(target_os = "linux")]
+                proxy_bind_ports: Vec::new(),
+                #[cfg(target_os = "linux")]
+                unix_socket_allowlist: &[],
+                #[cfg(target_os = "linux")]
+                linux_network_notify_mode: LinuxNetworkNotifyMode::ProxyOnly,
+            };
 
-        assert!(
-            !should_install_macos_open_shim(Some(&config)),
-            "launch services sessions should skip the macOS open shim"
-        );
-        assert!(
-            !should_install_macos_open_shim(None),
-            "without supervisor config, the helper should not install the macOS open shim"
-        );
-    }
+            // Allowed origin: validation passes
+            let result = validate_url("https://claude.ai/oauth/authorize?state=xyz", &config);
+            assert!(result.is_ok(), "Expected validation to pass: {result:?}");
 
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn test_open_shim_drop_cleans_up_directory() {
-        let exe = std::env::current_exe().expect("current_exe");
-        let socket_path = std::path::Path::new("/tmp/nono-test/supervisor.sock");
-        let shim = create_open_shim(&exe, socket_path).expect("create shim");
-        let dir = shim.dir.path().to_path_buf();
+            // Disallowed origin: must fail validation
+            let result = validate_url("https://evil.example.com/phishing", &config);
+            assert!(result.is_err());
+            assert!(
+                result
+                    .as_ref()
+                    .err()
+                    .map(|e| e.contains("not in the profile"))
+                    .unwrap_or(false)
+            );
+        }
 
-        assert!(dir.exists(), "shim dir should exist before drop");
-        drop(shim);
-        assert!(!dir.exists(), "shim dir should be removed on drop");
-    }
+        #[test]
+        fn test_validate_url_blocks_non_https() {
+            let backend = TestDenyBackend;
+            let config = SupervisorConfig {
+                protected_roots: &[],
+                approval_backend: &backend,
+                session_id: "test",
+                attach_initial_client: false,
+                detach_sequence: None,
+                open_url_origins: &[],
+                open_url_allow_localhost: false,
+                audit_recorder: None,
+                network_audit_events: None,
+                redaction_policy: &nono::ScrubPolicy::secure_default(),
+                allow_launch_services_active: false,
+                #[cfg(target_os = "linux")]
+                proxy_port: 0,
+                #[cfg(target_os = "linux")]
+                proxy_bind_ports: Vec::new(),
+                #[cfg(target_os = "linux")]
+                unix_socket_allowlist: &[],
+                #[cfg(target_os = "linux")]
+                linux_network_notify_mode: LinuxNetworkNotifyMode::ProxyOnly,
+            };
 
-    #[test]
-    fn test_validate_url_allows_origin_with_query_params_containing_localhost() {
-        let backend = TestDenyBackend;
-        let origins = vec!["https://idp.example.com".to_string()];
-        let config = SupervisorConfig {
-            protected_roots: &[],
-            approval_backend: &backend,
-            session_id: "test",
-            attach_initial_client: false,
-            detach_sequence: None,
-            open_url_origins: &origins,
-            open_url_allow_localhost: false,
-            audit_recorder: None,
-            network_audit_events: None,
-            redaction_policy: &nono::ScrubPolicy::secure_default(),
-            allow_launch_services_active: false,
-            #[cfg(target_os = "linux")]
-            proxy_port: 0,
-            #[cfg(target_os = "linux")]
-            proxy_bind_ports: Vec::new(),
-            #[cfg(target_os = "linux")]
-            unix_socket_allowlist: &[],
-            #[cfg(target_os = "linux")]
-            linux_network_notify_mode: LinuxNetworkNotifyMode::ProxyOnly,
-        };
+            let result = validate_url("file:///etc/passwd", &config);
+            assert!(result.is_err());
+            assert!(
+                result
+                    .as_ref()
+                    .err()
+                    .map(|e| e.contains("Only https://"))
+                    .unwrap_or(false)
+            );
 
-        // The redirect_uri in query params should not affect origin validation.
-        // This tests the scenario where an OAuth URL has a localhost redirect_uri
-        // encoded in the query string — validation only checks the main URL's origin.
-        let result = validate_url(
-            "https://idp.example.com/authorize?response_type=code&redirect_uri=http%3A%2F%2Flocalhost%3A63800%2Fcallback&state=abc",
-            &config,
-        );
-        assert!(
-            result.is_ok(),
-            "URL with localhost in query param redirect_uri should pass: {result:?}"
-        );
-    }
+            let result = validate_url("javascript:alert(1)", &config);
+            assert!(result.is_err());
+        }
 
-    #[test]
-    fn test_validate_url_ipv6_localhost() {
-        let backend = TestDenyBackend;
-        let config = SupervisorConfig {
-            protected_roots: &[],
-            approval_backend: &backend,
-            session_id: "test",
-            attach_initial_client: false,
-            detach_sequence: None,
-            open_url_origins: &[],
-            open_url_allow_localhost: true,
-            audit_recorder: None,
-            network_audit_events: None,
-            redaction_policy: &nono::ScrubPolicy::secure_default(),
-            allow_launch_services_active: false,
-            #[cfg(target_os = "linux")]
-            proxy_port: 0,
-            #[cfg(target_os = "linux")]
-            proxy_bind_ports: Vec::new(),
-            #[cfg(target_os = "linux")]
-            unix_socket_allowlist: &[],
-            #[cfg(target_os = "linux")]
-            linux_network_notify_mode: LinuxNetworkNotifyMode::ProxyOnly,
-        };
+        #[test]
+        fn test_validate_url_localhost() {
+            let backend = TestDenyBackend;
+            let config_allow = SupervisorConfig {
+                protected_roots: &[],
+                approval_backend: &backend,
+                session_id: "test",
+                attach_initial_client: false,
+                detach_sequence: None,
+                open_url_origins: &[],
+                open_url_allow_localhost: true,
+                audit_recorder: None,
+                network_audit_events: None,
+                redaction_policy: &nono::ScrubPolicy::secure_default(),
+                allow_launch_services_active: false,
+                #[cfg(target_os = "linux")]
+                proxy_port: 0,
+                #[cfg(target_os = "linux")]
+                proxy_bind_ports: Vec::new(),
+                #[cfg(target_os = "linux")]
+                unix_socket_allowlist: &[],
+                #[cfg(target_os = "linux")]
+                linux_network_notify_mode: LinuxNetworkNotifyMode::ProxyOnly,
+            };
+            let config_deny = SupervisorConfig {
+                protected_roots: &[],
+                approval_backend: &backend,
+                session_id: "test",
+                attach_initial_client: false,
+                detach_sequence: None,
+                open_url_origins: &[],
+                open_url_allow_localhost: false,
+                audit_recorder: None,
+                network_audit_events: None,
+                redaction_policy: &nono::ScrubPolicy::secure_default(),
+                allow_launch_services_active: false,
+                #[cfg(target_os = "linux")]
+                proxy_port: 0,
+                #[cfg(target_os = "linux")]
+                proxy_bind_ports: Vec::new(),
+                #[cfg(target_os = "linux")]
+                unix_socket_allowlist: &[],
+                #[cfg(target_os = "linux")]
+                linux_network_notify_mode: LinuxNetworkNotifyMode::ProxyOnly,
+            };
 
-        // The url crate's host_str() returns "::1" without brackets for IPv6.
-        // Verify that the validate_url function recognizes IPv6 loopback.
-        let parsed = url::Url::parse("http://[::1]:8080/callback").expect("parse URL");
-        let host = parsed.host_str().unwrap_or("");
+            // Localhost denied when not allowed
+            let result = validate_url("http://localhost:8080/callback", &config_deny);
+            assert!(result.is_err());
+            assert!(
+                result
+                    .as_ref()
+                    .err()
+                    .map(|e| e.contains("not allowed"))
+                    .unwrap_or(false)
+            );
 
-        // If the url crate returns brackets, the is_localhost check won't match.
-        // Adapt the assertion based on actual crate behavior.
-        if host == "::1" {
-            let result = validate_url("http://[::1]:8080/callback", &config);
+            // Localhost allowed when configured
+            let result = validate_url("http://localhost:8080/callback", &config_allow);
             assert!(
                 result.is_ok(),
-                "IPv6 localhost should be allowed when allow_localhost is true: {result:?}"
-            );
-        } else {
-            // url crate returns bracketed form — IPv6 localhost is currently not
-            // recognized. This is a known gap: the code at line ~2865 only checks
-            // for "::1" without brackets.
-            let result = validate_url("http://[::1]:8080/callback", &config);
-            assert!(
-                result.is_err(),
-                "IPv6 localhost not yet supported (brackets in host_str)"
+                "Expected localhost validation to pass: {result:?}"
             );
         }
 
-        // 127.0.0.1 always works regardless
-        let result = validate_url("http://127.0.0.1:8080/callback", &config);
-        assert!(
-            result.is_ok(),
-            "IPv4 localhost should be allowed: {result:?}"
-        );
+        #[test]
+        fn test_validate_url_max_length() {
+            let backend = TestDenyBackend;
+            let config = SupervisorConfig {
+                protected_roots: &[],
+                approval_backend: &backend,
+                session_id: "test",
+                attach_initial_client: false,
+                detach_sequence: None,
+                open_url_origins: &[],
+                open_url_allow_localhost: false,
+                audit_recorder: None,
+                network_audit_events: None,
+                redaction_policy: &nono::ScrubPolicy::secure_default(),
+                allow_launch_services_active: false,
+                #[cfg(target_os = "linux")]
+                proxy_port: 0,
+                #[cfg(target_os = "linux")]
+                proxy_bind_ports: Vec::new(),
+                #[cfg(target_os = "linux")]
+                unix_socket_allowlist: &[],
+                #[cfg(target_os = "linux")]
+                linux_network_notify_mode: LinuxNetworkNotifyMode::ProxyOnly,
+            };
+
+            let long_url = format!("https://example.com/{}", "a".repeat(MAX_URL_LENGTH));
+            let result = validate_url(&long_url, &config);
+            assert!(result.is_err());
+            assert!(
+                result
+                    .as_ref()
+                    .err()
+                    .map(|e| e.contains("maximum length"))
+                    .unwrap_or(false)
+            );
+        }
+
+        #[test]
+        fn test_validate_url_allows_origin_with_query_params_containing_localhost() {
+            let backend = TestDenyBackend;
+            let origins = vec!["https://idp.example.com".to_string()];
+            let config = SupervisorConfig {
+                protected_roots: &[],
+                approval_backend: &backend,
+                session_id: "test",
+                attach_initial_client: false,
+                detach_sequence: None,
+                open_url_origins: &origins,
+                open_url_allow_localhost: false,
+                audit_recorder: None,
+                network_audit_events: None,
+                redaction_policy: &nono::ScrubPolicy::secure_default(),
+                allow_launch_services_active: false,
+                #[cfg(target_os = "linux")]
+                proxy_port: 0,
+                #[cfg(target_os = "linux")]
+                proxy_bind_ports: Vec::new(),
+                #[cfg(target_os = "linux")]
+                unix_socket_allowlist: &[],
+                #[cfg(target_os = "linux")]
+                linux_network_notify_mode: LinuxNetworkNotifyMode::ProxyOnly,
+            };
+
+            // The redirect_uri in query params should not affect origin validation.
+            // This tests the scenario where an OAuth URL has a localhost redirect_uri
+            // encoded in the query string — validation only checks the main URL's origin.
+            let result = validate_url(
+                "https://idp.example.com/authorize?response_type=code&redirect_uri=http%3A%2F%2Flocalhost%3A63800%2Fcallback&state=abc",
+                &config,
+            );
+            assert!(
+                result.is_ok(),
+                "URL with localhost in query param redirect_uri should pass: {result:?}"
+            );
+        }
+
+        #[test]
+        fn test_validate_url_ipv6_localhost() {
+            let backend = TestDenyBackend;
+            let config = SupervisorConfig {
+                protected_roots: &[],
+                approval_backend: &backend,
+                session_id: "test",
+                attach_initial_client: false,
+                detach_sequence: None,
+                open_url_origins: &[],
+                open_url_allow_localhost: true,
+                audit_recorder: None,
+                network_audit_events: None,
+                redaction_policy: &nono::ScrubPolicy::secure_default(),
+                allow_launch_services_active: false,
+                #[cfg(target_os = "linux")]
+                proxy_port: 0,
+                #[cfg(target_os = "linux")]
+                proxy_bind_ports: Vec::new(),
+                #[cfg(target_os = "linux")]
+                unix_socket_allowlist: &[],
+                #[cfg(target_os = "linux")]
+                linux_network_notify_mode: LinuxNetworkNotifyMode::ProxyOnly,
+            };
+
+            // The url crate's host_str() returns "::1" without brackets for IPv6.
+            // Verify that the validate_url function recognizes IPv6 loopback.
+            let parsed = url::Url::parse("http://[::1]:8080/callback").expect("parse URL");
+            let host = parsed.host_str().unwrap_or("");
+
+            // If the url crate returns brackets, the is_localhost check won't match.
+            // Adapt the assertion based on actual crate behavior.
+            if host == "::1" {
+                let result = validate_url("http://[::1]:8080/callback", &config);
+                assert!(
+                    result.is_ok(),
+                    "IPv6 localhost should be allowed when allow_localhost is true: {result:?}"
+                );
+            } else {
+                // url crate returns bracketed form — IPv6 localhost is currently not
+                // recognized. This is a known gap: the code at line ~2865 only checks
+                // for "::1" without brackets.
+                let result = validate_url("http://[::1]:8080/callback", &config);
+                assert!(
+                    result.is_err(),
+                    "IPv6 localhost not yet supported (brackets in host_str)"
+                );
+            }
+
+            // 127.0.0.1 always works regardless
+            let result = validate_url("http://127.0.0.1:8080/callback", &config);
+            assert!(
+                result.is_ok(),
+                "IPv4 localhost should be allowed: {result:?}"
+            );
+        }
+
+        #[test]
+        fn test_validate_url_rejects_data_scheme() {
+            let backend = TestDenyBackend;
+            let config = SupervisorConfig {
+                protected_roots: &[],
+                approval_backend: &backend,
+                session_id: "test",
+                attach_initial_client: false,
+                detach_sequence: None,
+                open_url_origins: &[],
+                open_url_allow_localhost: false,
+                audit_recorder: None,
+                network_audit_events: None,
+                redaction_policy: &nono::ScrubPolicy::secure_default(),
+                allow_launch_services_active: false,
+                #[cfg(target_os = "linux")]
+                proxy_port: 0,
+                #[cfg(target_os = "linux")]
+                proxy_bind_ports: Vec::new(),
+                #[cfg(target_os = "linux")]
+                unix_socket_allowlist: &[],
+                #[cfg(target_os = "linux")]
+                linux_network_notify_mode: LinuxNetworkNotifyMode::ProxyOnly,
+            };
+
+            let result = validate_url("data:text/html,<script>alert(1)</script>", &config);
+            assert!(result.is_err(), "data: URLs must be rejected");
+        }
     }
 
-    #[test]
-    fn test_validate_url_rejects_data_scheme() {
-        let backend = TestDenyBackend;
-        let config = SupervisorConfig {
-            protected_roots: &[],
-            approval_backend: &backend,
-            session_id: "test",
-            attach_initial_client: false,
-            detach_sequence: None,
-            open_url_origins: &[],
-            open_url_allow_localhost: false,
-            audit_recorder: None,
-            network_audit_events: None,
-            redaction_policy: &nono::ScrubPolicy::secure_default(),
-            allow_launch_services_active: false,
-            #[cfg(target_os = "linux")]
-            proxy_port: 0,
-            #[cfg(target_os = "linux")]
-            proxy_bind_ports: Vec::new(),
-            #[cfg(target_os = "linux")]
-            unix_socket_allowlist: &[],
-            #[cfg(target_os = "linux")]
-            linux_network_notify_mode: LinuxNetworkNotifyMode::ProxyOnly,
-        };
+    mod shell_quote {
+        use super::super::*;
 
-        let result = validate_url("data:text/html,<script>alert(1)</script>", &config);
-        assert!(result.is_err(), "data: URLs must be rejected");
+        #[test]
+        fn test_shell_quote_simple_path() {
+            assert_eq!(shell_quote("/usr/bin/nono"), "/usr/bin/nono");
+        }
+
+        #[test]
+        fn test_shell_quote_path_with_spaces() {
+            assert_eq!(shell_quote("/opt/my app/nono"), "'/opt/my app/nono'");
+        }
+
+        #[test]
+        fn test_shell_quote_path_with_single_quote() {
+            assert_eq!(shell_quote("/opt/it's/nono"), "'/opt/it'\\''s/nono'");
+        }
+
+        #[test]
+        fn test_shell_quote_empty_string() {
+            assert_eq!(shell_quote(""), "''");
+        }
+    }
+
+    mod open_shim {
+        use super::super::*;
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn test_create_linux_browser_shim_installs_launcher_and_helper() {
+            let exe = std::env::current_exe().expect("current_exe");
+            let socket_path = std::path::Path::new("/tmp/nono-test/supervisor.sock");
+            let shim = create_linux_browser_shim(&exe, socket_path).expect("create shim");
+
+            assert!(shim.launcher.exists(), "browser launcher should exist");
+            assert_eq!(
+                shim.launcher.parent(),
+                Some(shim.dir.path()),
+                "launcher should live inside shim dir"
+            );
+
+            let script = std::fs::read_to_string(&shim.launcher).expect("read shim");
+            assert!(
+                script.contains("nono-open-url-helper"),
+                "launcher should reference the copied helper"
+            );
+            assert!(
+                script.contains("NONO_SUPERVISOR_PATH=/tmp/nono-test/supervisor.sock"),
+                "launcher should export the supervisor socket path for helper execution"
+            );
+            assert!(
+                script.contains("open-url-helper \"$@\""),
+                "launcher should exec the copied helper"
+            );
+        }
+
+        #[test]
+        fn test_clear_close_on_exec_clears_flag() {
+            use std::os::fd::AsRawFd;
+            use std::os::unix::net::UnixStream;
+
+            let (a, _b) = UnixStream::pair().expect("socketpair");
+            let fd = a.as_raw_fd();
+
+            let before = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            assert!(before >= 0, "F_GETFD before failed");
+            assert_ne!(before & libc::FD_CLOEXEC, 0, "fd should start CLOEXEC");
+
+            clear_close_on_exec(fd).expect("clear cloexec");
+
+            let after = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            assert!(after >= 0, "F_GETFD after failed");
+            assert_eq!(after & libc::FD_CLOEXEC, 0, "fd should not be CLOEXEC");
+        }
+
+        #[cfg(target_os = "macos")]
+        #[test]
+        fn test_create_open_shim_installs_helper_in_shim_dir() {
+            let exe = std::env::current_exe().expect("current_exe");
+            let socket_path = std::path::Path::new("/tmp/nono-test/supervisor.sock");
+            let shim = create_open_shim(&exe, socket_path).expect("create shim");
+
+            assert!(shim.launcher.exists(), "open shim should exist");
+
+            let script = std::fs::read_to_string(&shim.launcher).expect("read shim");
+            assert!(
+                script.contains("for arg in \"$@\"; do"),
+                "shim should scan all arguments for a URL"
+            );
+            assert!(
+                script.contains("nono-open-url-helper"),
+                "shim should reference the copied helper"
+            );
+            assert!(
+                script.contains("NONO_SUPERVISOR_PATH=/tmp/nono-test/supervisor.sock"),
+                "shim should export the supervisor socket path for helper execution"
+            );
+            assert!(
+                script.contains("open-url-helper \"$url_arg\""),
+                "shim should exec the copied helper"
+            );
+        }
+
+        #[cfg(target_os = "macos")]
+        #[test]
+        fn test_should_install_macos_open_shim_respects_launch_services_flag() {
+            struct TestBackend;
+            impl ApprovalBackend for TestBackend {
+                fn request_capability(
+                    &self,
+                    _req: &nono::supervisor::CapabilityRequest,
+                ) -> nono::Result<ApprovalDecision> {
+                    Ok(ApprovalDecision::Denied {
+                        reason: "test".to_string(),
+                    })
+                }
+                fn backend_name(&self) -> &str {
+                    "test"
+                }
+            }
+
+            let backend = TestBackend;
+            let config = SupervisorConfig {
+                protected_roots: &[],
+                approval_backend: &backend,
+                session_id: "test",
+                attach_initial_client: false,
+                detach_sequence: None,
+                open_url_origins: &[],
+                open_url_allow_localhost: false,
+                audit_recorder: None,
+                network_audit_events: None,
+                redaction_policy: &nono::ScrubPolicy::secure_default(),
+                allow_launch_services_active: true,
+                #[cfg(target_os = "linux")]
+                proxy_port: 0,
+                #[cfg(target_os = "linux")]
+                proxy_bind_ports: Vec::new(),
+                #[cfg(target_os = "linux")]
+                unix_socket_allowlist: &[],
+                #[cfg(target_os = "linux")]
+                linux_network_notify_mode: LinuxNetworkNotifyMode::ProxyOnly,
+            };
+
+            assert!(
+                !should_install_macos_open_shim(Some(&config)),
+                "launch services sessions should skip the macOS open shim"
+            );
+            assert!(
+                !should_install_macos_open_shim(None),
+                "without supervisor config, the helper should not install the macOS open shim"
+            );
+        }
+
+        #[cfg(target_os = "macos")]
+        #[test]
+        fn test_open_shim_drop_cleans_up_directory() {
+            let exe = std::env::current_exe().expect("current_exe");
+            let socket_path = std::path::Path::new("/tmp/nono-test/supervisor.sock");
+            let shim = create_open_shim(&exe, socket_path).expect("create shim");
+            let dir = shim.dir.path().to_path_buf();
+
+            assert!(dir.exists(), "shim dir should exist before drop");
+            drop(shim);
+            assert!(!dir.exists(), "shim dir should be removed on drop");
+        }
+    }
+
+    mod record_denial {
+        use super::super::*;
+
+        #[test]
+        fn test_record_denial_is_capped() {
+            let mut denials = Vec::new();
+            for _ in 0..(MAX_DENIAL_RECORDS + 10) {
+                record_denial(
+                    &mut denials,
+                    DenialRecord {
+                        path: "/tmp/test".into(),
+                        access: nono::AccessMode::Read,
+                        reason: DenialReason::PolicyBlocked,
+                    },
+                );
+            }
+            assert_eq!(denials.len(), MAX_DENIAL_RECORDS);
+        }
+    }
+
+    mod linux_child_dumpable {
+        #[cfg(target_os = "linux")]
+        use super::super::*;
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn test_linux_child_requires_dumpable_only_for_seccomp_driven_features() {
+            assert!(!linux_child_requires_dumpable(false, false));
+            assert!(linux_child_requires_dumpable(true, false));
+            assert!(linux_child_requires_dumpable(false, true));
+            assert!(linux_child_requires_dumpable(true, true));
+        }
     }
 }

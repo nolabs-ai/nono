@@ -8,10 +8,6 @@ fn nono_bin() -> Command {
     Command::new(env!("CARGO_BIN_EXE_nono"))
 }
 
-// ---------------------------------------------------------------------------
-// nono profile init
-// ---------------------------------------------------------------------------
-
 #[test]
 fn test_init_creates_valid_profile() {
     let dir = std::env::temp_dir().join("nono-test-profile-init");
@@ -240,10 +236,6 @@ fn test_init_invalid_extends_exits_error() {
     assert!(!out.exists(), "file should not be created");
 }
 
-// ---------------------------------------------------------------------------
-// nono profile schema
-// ---------------------------------------------------------------------------
-
 #[test]
 fn test_schema_outputs_valid_json() {
     let output = nono_bin()
@@ -298,10 +290,6 @@ fn test_schema_output_to_file() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
-
-// ---------------------------------------------------------------------------
-// nono profile guide
-// ---------------------------------------------------------------------------
 
 #[test]
 fn test_guide_outputs_markdown() {

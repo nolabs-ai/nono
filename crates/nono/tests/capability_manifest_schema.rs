@@ -24,8 +24,6 @@ fn validate_against_schema(json_str: &str) -> Result<(), String> {
     }
 }
 
-// --- Schema self-validation ---
-
 #[test]
 fn schema_is_valid_json() {
     let _: serde_json::Value = serde_json::from_str(SCHEMA_STR).expect("schema is valid JSON");
@@ -36,8 +34,6 @@ fn schema_compiles_as_json_schema() {
     let schema: serde_json::Value = serde_json::from_str(SCHEMA_STR).expect("schema is valid JSON");
     jsonschema::validator_for(&schema).expect("schema should compile as a JSON Schema validator");
 }
-
-// --- Minimal valid manifests ---
 
 #[test]
 fn minimal_manifest_with_version_only() {
@@ -57,8 +53,6 @@ fn manifest_with_empty_capabilities() {
     }"#;
     validate_against_schema(json).expect("manifest with empty capabilities should be valid");
 }
-
-// --- Filesystem grants ---
 
 #[test]
 fn filesystem_grant_read_directory() {
@@ -129,8 +123,6 @@ fn filesystem_grants_and_deny_combined() {
     }"#;
     validate_against_schema(json).expect("combined grants and deny should be valid");
 }
-
-// --- Filesystem rejection ---
 
 #[test]
 fn rejects_filesystem_grant_missing_path() {
@@ -211,8 +203,6 @@ fn rejects_filesystem_grant_invalid_type() {
         "invalid fs entry type should be rejected"
     );
 }
-
-// --- Network ---
 
 #[test]
 fn network_blocked_mode() {
@@ -340,8 +330,6 @@ fn rejects_network_port_above_max() {
         "port 65536 should be rejected"
     );
 }
-
-// --- Credentials ---
 
 #[test]
 fn credential_with_header_injection() {
@@ -507,8 +495,6 @@ fn rejects_credential_invalid_inject_mode() {
     );
 }
 
-// --- Process ---
-
 #[test]
 fn process_with_all_fields() {
     let json = r#"{
@@ -549,8 +535,6 @@ fn rejects_invalid_exec_strategy() {
     );
 }
 
-// --- Rollback ---
-
 #[test]
 fn rollback_config() {
     let json = r#"{
@@ -563,8 +547,6 @@ fn rollback_config() {
     }"#;
     validate_against_schema(json).expect("rollback config should be valid");
 }
-
-// --- Version ---
 
 #[test]
 fn rejects_missing_version() {
@@ -592,8 +574,6 @@ fn rejects_wrong_version_value() {
         "unsupported version should be rejected"
     );
 }
-
-// --- Full realistic manifest ---
 
 #[test]
 fn full_realistic_manifest() {

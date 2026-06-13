@@ -10,9 +10,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use tracing::debug;
 
-// ============================================================================
 // JSON schema types
-// ============================================================================
 
 /// Root network policy file structure
 #[derive(Debug, Clone, Deserialize)]
@@ -89,9 +87,7 @@ fn default_inject_header() -> String {
     "Authorization".to_string()
 }
 
-// ============================================================================
 // Resolution
-// ============================================================================
 
 /// Resolved network policy: flat host lists and credential routes
 #[derive(Debug, Clone)]
@@ -741,13 +737,11 @@ mod tests {
         assert_eq!(resolved.hosts.len(), 3);
     }
 
-    // ============================================================================
     // Integration tests for custom credentials via resolve_credentials
     // Note: Validation functions (is_loopback_host, validate_inject_header,
     // validate_credential_format) are tested in profile/mod.rs where they live.
     // These tests verify that resolve_credentials correctly processes already-
     // validated custom credentials.
-    // ============================================================================
 
     #[test]
     fn test_custom_credential_http_127_cidr_allowed() {

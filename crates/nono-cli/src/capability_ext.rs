@@ -1244,7 +1244,6 @@ fn add_cli_overrides(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nono::SocketScope;
     use tempfile::tempdir;
 
     fn with_env_lock<T>(f: impl FnOnce() -> T) -> T {
@@ -2755,388 +2754,398 @@ mod tests {
         );
     }
 
-    // --- --allow-unix-socket* flag tests (issue #685 / #696) -----------------
+    mod allow_unix_socket {
+        use super::super::*;
+        use super::{from_args_locked, from_profile_locked, sandbox_args};
+        use nono::SocketScope;
+        use tempfile::tempdir;
 
-    #[test]
-    fn test_allow_unix_socket_adds_cap_and_implied_read_fs_grant() {
-        let dir = tempdir().expect("tempdir");
-        let sock = dir.path().join("a.sock");
-        std::fs::write(&sock, b"").expect("create socket stub");
+        #[test]
+        fn test_allow_unix_socket_adds_cap_and_implied_read_fs_grant() {
+            let dir = tempdir().expect("tempdir");
+            let sock = dir.path().join("a.sock");
+            std::fs::write(&sock, b"").expect("create socket stub");
 
-        let args = SandboxArgs {
-            allow_unix_socket: vec![sock.clone()],
-            ..sandbox_args()
-        };
+            let args = SandboxArgs {
+                allow_unix_socket: vec![sock.clone()],
+                ..sandbox_args()
+            };
 
-        let (caps, _) = from_args_locked(&args).expect("from_args");
+            let (caps, _) = from_args_locked(&args).expect("from_args");
 
-        // One UnixSocketCapability with mode=Connect.
-        let socks = caps.unix_socket_capabilities();
-        assert_eq!(socks.len(), 1);
-        assert_eq!(socks[0].mode, UnixSocketMode::Connect);
-        assert!(!socks[0].is_directory());
+            // One UnixSocketCapability with mode=Connect.
+            let socks = caps.unix_socket_capabilities();
+            assert_eq!(socks.len(), 1);
+            assert_eq!(socks[0].mode, UnixSocketMode::Connect);
+            assert!(!socks[0].is_directory());
 
-        // Exactly one implied FsCapability at Read.
-        let fs_matches: Vec<_> = caps
-            .fs_capabilities()
-            .iter()
-            .filter(|c| c.is_file && c.resolved == sock.canonicalize().expect("canonicalize sock"))
-            .collect();
-        assert_eq!(fs_matches.len(), 1);
-        assert_eq!(fs_matches[0].access, AccessMode::Read);
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn test_allow_unix_socket_bind_rejects_dangling_symlink() {
-        // A dangling symlink is not a typical "future socket file" — bind(2)
-        // follows the link and creates at the target, which is usually not
-        // what the operator intended. Must reject loudly.
-        let dir = tempdir().expect("tempdir");
-        let link = dir.path().join("dangling.sock");
-        let missing_target = dir.path().join("does-not-exist");
-        std::os::unix::fs::symlink(&missing_target, &link).expect("create dangling symlink");
-
-        let args = SandboxArgs {
-            allow_unix_socket_bind: vec![link],
-            ..sandbox_args()
-        };
-
-        let err = from_args_locked(&args)
-            .expect_err("dangling symlink must be rejected by the bind guard");
-        assert!(
-            format!("{err}").contains("dangling symlink"),
-            "error message should mention dangling symlink"
-        );
-    }
-
-    #[test]
-    fn test_allow_unix_socket_missing_skips_both_socket_and_fs_grants() {
-        // On macOS, try_new_file's handle_missing_file_capability can
-        // manufacture an exact-file FsCapability even when the path
-        // doesn't exist. The unix-socket branch must NOT register that
-        // fs grant when the socket grant itself was skipped — otherwise
-        // the user gets a filesystem permission for a path they can't
-        // `connect()` to anyway.
-        let dir = tempdir().expect("tempdir");
-        let missing = dir.path().join("never-exists.sock");
-
-        let args = SandboxArgs {
-            allow_unix_socket: vec![missing.clone()],
-            ..sandbox_args()
-        };
-
-        let (caps, _) = from_args_locked(&args).expect("from_args");
-
-        assert!(
-            caps.unix_socket_capabilities().is_empty(),
-            "no unix-socket grant for missing path"
-        );
-        assert!(
-            !caps
+            // Exactly one implied FsCapability at Read.
+            let fs_matches: Vec<_> = caps
                 .fs_capabilities()
                 .iter()
-                .any(|c| c.original == missing || c.resolved == missing),
-            "no implied fs grant when the socket grant was skipped"
-        );
-    }
+                .filter(|c| {
+                    c.is_file && c.resolved == sock.canonicalize().expect("canonicalize sock")
+                })
+                .collect();
+            assert_eq!(fs_matches.len(), 1);
+            assert_eq!(fs_matches[0].access, AccessMode::Read);
+        }
 
-    #[test]
-    fn test_allow_unix_socket_bind_accepts_nonexistent_path_and_widens_fs_to_parent() {
-        // The normal bind(2) workflow: grant is registered before the
-        // socket file exists. The UnixSocketCapability is added
-        // (ConnectBind, file-scoped, canonical parent + filename), and
-        // the implied fs grant widens to ReadWrite on the parent
-        // directory since the kernel needs write on the parent to
-        // create the new inode.
-        let dir = tempdir().expect("tempdir");
-        let pending = dir.path().join("future.sock");
-        assert!(!pending.exists(), "test precondition: path must not exist");
+        #[test]
+        #[cfg(unix)]
+        fn test_allow_unix_socket_bind_rejects_dangling_symlink() {
+            // A dangling symlink is not a typical "future socket file" — bind(2)
+            // follows the link and creates at the target, which is usually not
+            // what the operator intended. Must reject loudly.
+            let dir = tempdir().expect("tempdir");
+            let link = dir.path().join("dangling.sock");
+            let missing_target = dir.path().join("does-not-exist");
+            std::os::unix::fs::symlink(&missing_target, &link).expect("create dangling symlink");
 
-        let args = SandboxArgs {
-            allow_unix_socket_bind: vec![pending.clone()],
-            ..sandbox_args()
-        };
+            let args = SandboxArgs {
+                allow_unix_socket_bind: vec![link],
+                ..sandbox_args()
+            };
 
-        let (caps, _) = from_args_locked(&args).expect("from_args");
+            let err = from_args_locked(&args)
+                .expect_err("dangling symlink must be rejected by the bind guard");
+            assert!(
+                format!("{err}").contains("dangling symlink"),
+                "error message should mention dangling symlink"
+            );
+        }
 
-        let socks = caps.unix_socket_capabilities();
-        assert_eq!(socks.len(), 1);
-        assert_eq!(socks[0].mode, UnixSocketMode::ConnectBind);
-        assert!(!socks[0].is_directory());
+        #[test]
+        fn test_allow_unix_socket_missing_skips_both_socket_and_fs_grants() {
+            // On macOS, try_new_file's handle_missing_file_capability can
+            // manufacture an exact-file FsCapability even when the path
+            // doesn't exist. The unix-socket branch must NOT register that
+            // fs grant when the socket grant itself was skipped — otherwise
+            // the user gets a filesystem permission for a path they can't
+            // `connect()` to anyway.
+            let dir = tempdir().expect("tempdir");
+            let missing = dir.path().join("never-exists.sock");
 
-        // Implied fs grant should cover the parent dir with ReadWrite.
-        let canonical_parent = dir.path().canonicalize().expect("canonicalize dir");
-        let parent_grant = caps
-            .fs_capabilities()
-            .iter()
-            .find(|c| !c.is_file && c.resolved == canonical_parent)
-            .expect("implied parent-dir fs grant missing");
-        assert_eq!(parent_grant.access, AccessMode::ReadWrite);
-    }
+            let args = SandboxArgs {
+                allow_unix_socket: vec![missing.clone()],
+                ..sandbox_args()
+            };
 
-    #[test]
-    fn test_allow_unix_socket_bind_existing_grants_readwrite_fs() {
-        let dir = tempdir().expect("tempdir");
-        let sock = dir.path().join("b.sock");
-        std::fs::write(&sock, b"").expect("create socket stub");
+            let (caps, _) = from_args_locked(&args).expect("from_args");
 
-        let args = SandboxArgs {
-            allow_unix_socket_bind: vec![sock.clone()],
-            ..sandbox_args()
-        };
+            assert!(
+                caps.unix_socket_capabilities().is_empty(),
+                "no unix-socket grant for missing path"
+            );
+            assert!(
+                !caps
+                    .fs_capabilities()
+                    .iter()
+                    .any(|c| c.original == missing || c.resolved == missing),
+                "no implied fs grant when the socket grant was skipped"
+            );
+        }
 
-        let (caps, _) = from_args_locked(&args).expect("from_args");
+        #[test]
+        fn test_allow_unix_socket_bind_accepts_nonexistent_path_and_widens_fs_to_parent() {
+            // The normal bind(2) workflow: grant is registered before the
+            // socket file exists. The UnixSocketCapability is added
+            // (ConnectBind, file-scoped, canonical parent + filename), and
+            // the implied fs grant widens to ReadWrite on the parent
+            // directory since the kernel needs write on the parent to
+            // create the new inode.
+            let dir = tempdir().expect("tempdir");
+            let pending = dir.path().join("future.sock");
+            assert!(!pending.exists(), "test precondition: path must not exist");
 
-        let socks = caps.unix_socket_capabilities();
-        assert_eq!(socks.len(), 1);
-        assert_eq!(socks[0].mode, UnixSocketMode::ConnectBind);
+            let args = SandboxArgs {
+                allow_unix_socket_bind: vec![pending.clone()],
+                ..sandbox_args()
+            };
 
-        let fs_match = caps
-            .fs_capabilities()
-            .iter()
-            .find(|c| c.is_file && c.resolved == sock.canonicalize().expect("canonicalize sock"))
-            .expect("implied fs cap not found");
-        assert_eq!(fs_match.access, AccessMode::ReadWrite);
-    }
+            let (caps, _) = from_args_locked(&args).expect("from_args");
 
-    #[test]
-    fn test_allow_unix_socket_dir_bind_directory_grants_readwrite_fs() {
-        // The tsx case (#685): runtime-generated socket filenames inside a
-        // known directory.
-        let dir = tempdir().expect("tempdir");
+            let socks = caps.unix_socket_capabilities();
+            assert_eq!(socks.len(), 1);
+            assert_eq!(socks[0].mode, UnixSocketMode::ConnectBind);
+            assert!(!socks[0].is_directory());
 
-        let args = SandboxArgs {
-            allow_unix_socket_dir_bind: vec![dir.path().to_path_buf()],
-            ..sandbox_args()
-        };
+            // Implied fs grant should cover the parent dir with ReadWrite.
+            let canonical_parent = dir.path().canonicalize().expect("canonicalize dir");
+            let parent_grant = caps
+                .fs_capabilities()
+                .iter()
+                .find(|c| !c.is_file && c.resolved == canonical_parent)
+                .expect("implied parent-dir fs grant missing");
+            assert_eq!(parent_grant.access, AccessMode::ReadWrite);
+        }
 
-        let (caps, _) = from_args_locked(&args).expect("from_args");
+        #[test]
+        fn test_allow_unix_socket_bind_existing_grants_readwrite_fs() {
+            let dir = tempdir().expect("tempdir");
+            let sock = dir.path().join("b.sock");
+            std::fs::write(&sock, b"").expect("create socket stub");
 
-        let socks = caps.unix_socket_capabilities();
-        assert_eq!(socks.len(), 1);
-        assert_eq!(socks[0].mode, UnixSocketMode::ConnectBind);
-        assert!(socks[0].is_directory());
-        assert_eq!(socks[0].scope, SocketScope::DirChildren);
+            let args = SandboxArgs {
+                allow_unix_socket_bind: vec![sock.clone()],
+                ..sandbox_args()
+            };
 
-        let fs_match = caps
-            .fs_capabilities()
-            .iter()
-            .find(|c| {
-                !c.is_file && c.resolved == dir.path().canonicalize().expect("canonicalize dir")
-            })
-            .expect("implied fs dir cap not found");
-        assert_eq!(fs_match.access, AccessMode::ReadWrite);
-    }
+            let (caps, _) = from_args_locked(&args).expect("from_args");
 
-    #[test]
-    fn test_allow_unix_socket_dir_implies_read_fs_grant() {
-        let dir = tempdir().expect("tempdir");
+            let socks = caps.unix_socket_capabilities();
+            assert_eq!(socks.len(), 1);
+            assert_eq!(socks[0].mode, UnixSocketMode::ConnectBind);
 
-        let args = SandboxArgs {
-            allow_unix_socket_dir: vec![dir.path().to_path_buf()],
-            ..sandbox_args()
-        };
+            let fs_match = caps
+                .fs_capabilities()
+                .iter()
+                .find(|c| {
+                    c.is_file && c.resolved == sock.canonicalize().expect("canonicalize sock")
+                })
+                .expect("implied fs cap not found");
+            assert_eq!(fs_match.access, AccessMode::ReadWrite);
+        }
 
-        let (caps, _) = from_args_locked(&args).expect("from_args");
+        #[test]
+        fn test_allow_unix_socket_dir_bind_directory_grants_readwrite_fs() {
+            // The tsx case (#685): runtime-generated socket filenames inside a
+            // known directory.
+            let dir = tempdir().expect("tempdir");
 
-        let socks = caps.unix_socket_capabilities();
-        assert_eq!(socks.len(), 1);
-        assert_eq!(socks[0].mode, UnixSocketMode::Connect);
-        assert!(socks[0].is_directory());
-        assert_eq!(socks[0].scope, SocketScope::DirChildren);
+            let args = SandboxArgs {
+                allow_unix_socket_dir_bind: vec![dir.path().to_path_buf()],
+                ..sandbox_args()
+            };
 
-        let fs_match = caps
-            .fs_capabilities()
-            .iter()
-            .find(|c| {
-                !c.is_file && c.resolved == dir.path().canonicalize().expect("canonicalize dir")
-            })
-            .expect("implied fs dir cap not found");
-        assert_eq!(fs_match.access, AccessMode::Read);
-    }
+            let (caps, _) = from_args_locked(&args).expect("from_args");
 
-    #[test]
-    fn test_allow_unix_socket_subtree_implies_read_fs_grant() {
-        let dir = tempdir().expect("tempdir");
+            let socks = caps.unix_socket_capabilities();
+            assert_eq!(socks.len(), 1);
+            assert_eq!(socks[0].mode, UnixSocketMode::ConnectBind);
+            assert!(socks[0].is_directory());
+            assert_eq!(socks[0].scope, SocketScope::DirChildren);
 
-        let args = SandboxArgs {
-            allow_unix_socket_subtree: vec![dir.path().to_path_buf()],
-            ..sandbox_args()
-        };
+            let fs_match = caps
+                .fs_capabilities()
+                .iter()
+                .find(|c| {
+                    !c.is_file && c.resolved == dir.path().canonicalize().expect("canonicalize dir")
+                })
+                .expect("implied fs dir cap not found");
+            assert_eq!(fs_match.access, AccessMode::ReadWrite);
+        }
 
-        let (caps, _) = from_args_locked(&args).expect("from_args");
+        #[test]
+        fn test_allow_unix_socket_dir_implies_read_fs_grant() {
+            let dir = tempdir().expect("tempdir");
 
-        let socks = caps.unix_socket_capabilities();
-        assert_eq!(socks.len(), 1);
-        assert_eq!(socks[0].mode, UnixSocketMode::Connect);
-        assert_eq!(socks[0].scope, SocketScope::DirSubtree);
+            let args = SandboxArgs {
+                allow_unix_socket_dir: vec![dir.path().to_path_buf()],
+                ..sandbox_args()
+            };
 
-        let fs_match = caps
-            .fs_capabilities()
-            .iter()
-            .find(|c| {
-                !c.is_file && c.resolved == dir.path().canonicalize().expect("canonicalize dir")
-            })
-            .expect("implied fs dir cap not found");
-        assert_eq!(fs_match.access, AccessMode::Read);
-    }
+            let (caps, _) = from_args_locked(&args).expect("from_args");
 
-    #[test]
-    fn test_allow_unix_socket_subtree_bind_implies_readwrite_fs_grant() {
-        let dir = tempdir().expect("tempdir");
+            let socks = caps.unix_socket_capabilities();
+            assert_eq!(socks.len(), 1);
+            assert_eq!(socks[0].mode, UnixSocketMode::Connect);
+            assert!(socks[0].is_directory());
+            assert_eq!(socks[0].scope, SocketScope::DirChildren);
 
-        let args = SandboxArgs {
-            allow_unix_socket_subtree_bind: vec![dir.path().to_path_buf()],
-            ..sandbox_args()
-        };
+            let fs_match = caps
+                .fs_capabilities()
+                .iter()
+                .find(|c| {
+                    !c.is_file && c.resolved == dir.path().canonicalize().expect("canonicalize dir")
+                })
+                .expect("implied fs dir cap not found");
+            assert_eq!(fs_match.access, AccessMode::Read);
+        }
 
-        let (caps, _) = from_args_locked(&args).expect("from_args");
+        #[test]
+        fn test_allow_unix_socket_subtree_implies_read_fs_grant() {
+            let dir = tempdir().expect("tempdir");
 
-        let socks = caps.unix_socket_capabilities();
-        assert_eq!(socks.len(), 1);
-        assert_eq!(socks[0].mode, UnixSocketMode::ConnectBind);
-        assert_eq!(socks[0].scope, SocketScope::DirSubtree);
+            let args = SandboxArgs {
+                allow_unix_socket_subtree: vec![dir.path().to_path_buf()],
+                ..sandbox_args()
+            };
 
-        let fs_match = caps
-            .fs_capabilities()
-            .iter()
-            .find(|c| {
-                !c.is_file && c.resolved == dir.path().canonicalize().expect("canonicalize dir")
-            })
-            .expect("implied fs dir cap not found");
-        assert_eq!(fs_match.access, AccessMode::ReadWrite);
-    }
+            let (caps, _) = from_args_locked(&args).expect("from_args");
 
-    /// Build a minimal profile JSON with a single filesystem field set,
-    /// then parse it into a [`crate::profile::Profile`].
-    fn profile_with_fs_field(field: &str, value: &str) -> crate::profile::Profile {
-        let json = format!(
-            r#"{{
+            let socks = caps.unix_socket_capabilities();
+            assert_eq!(socks.len(), 1);
+            assert_eq!(socks[0].mode, UnixSocketMode::Connect);
+            assert_eq!(socks[0].scope, SocketScope::DirSubtree);
+
+            let fs_match = caps
+                .fs_capabilities()
+                .iter()
+                .find(|c| {
+                    !c.is_file && c.resolved == dir.path().canonicalize().expect("canonicalize dir")
+                })
+                .expect("implied fs dir cap not found");
+            assert_eq!(fs_match.access, AccessMode::Read);
+        }
+
+        #[test]
+        fn test_allow_unix_socket_subtree_bind_implies_readwrite_fs_grant() {
+            let dir = tempdir().expect("tempdir");
+
+            let args = SandboxArgs {
+                allow_unix_socket_subtree_bind: vec![dir.path().to_path_buf()],
+                ..sandbox_args()
+            };
+
+            let (caps, _) = from_args_locked(&args).expect("from_args");
+
+            let socks = caps.unix_socket_capabilities();
+            assert_eq!(socks.len(), 1);
+            assert_eq!(socks[0].mode, UnixSocketMode::ConnectBind);
+            assert_eq!(socks[0].scope, SocketScope::DirSubtree);
+
+            let fs_match = caps
+                .fs_capabilities()
+                .iter()
+                .find(|c| {
+                    !c.is_file && c.resolved == dir.path().canonicalize().expect("canonicalize dir")
+                })
+                .expect("implied fs dir cap not found");
+            assert_eq!(fs_match.access, AccessMode::ReadWrite);
+        }
+
+        /// Build a minimal profile JSON with a single filesystem field set,
+        /// then parse it into a [`crate::profile::Profile`].
+        fn profile_with_fs_field(field: &str, value: &str) -> crate::profile::Profile {
+            let json = format!(
+                r#"{{
                 "meta": {{ "name": "test-unix-socket" }},
                 "security": {{ "groups": [] }},
                 "filesystem": {{ "{field}": ["{value}"] }}
             }}"#
-        );
-        serde_json::from_str(&json).expect("parse profile")
-    }
+            );
+            serde_json::from_str(&json).expect("parse profile")
+        }
 
-    #[test]
-    fn test_profile_unix_socket_field_connect_file() {
-        let dir = tempdir().expect("tempdir");
-        let sock = dir.path().join("a.sock");
-        std::fs::write(&sock, b"").expect("create socket stub");
-        let profile = profile_with_fs_field("unix_socket", &sock.display().to_string());
+        #[test]
+        fn test_profile_unix_socket_field_connect_file() {
+            let dir = tempdir().expect("tempdir");
+            let sock = dir.path().join("a.sock");
+            std::fs::write(&sock, b"").expect("create socket stub");
+            let profile = profile_with_fs_field("unix_socket", &sock.display().to_string());
 
-        let (caps, _) =
-            from_profile_locked(&profile, dir.path(), &sandbox_args()).expect("from_profile");
+            let (caps, _) =
+                from_profile_locked(&profile, dir.path(), &sandbox_args()).expect("from_profile");
 
-        let socks: Vec<_> = caps
-            .unix_socket_capabilities()
-            .iter()
-            .filter(|c| c.source == CapabilitySource::Profile)
-            .collect();
-        assert_eq!(socks.len(), 1);
-        assert_eq!(socks[0].mode, UnixSocketMode::Connect);
-        assert!(!socks[0].is_directory());
-    }
+            let socks: Vec<_> = caps
+                .unix_socket_capabilities()
+                .iter()
+                .filter(|c| c.source == CapabilitySource::Profile)
+                .collect();
+            assert_eq!(socks.len(), 1);
+            assert_eq!(socks[0].mode, UnixSocketMode::Connect);
+            assert!(!socks[0].is_directory());
+        }
 
-    #[test]
-    fn test_profile_unix_socket_field_connect_bind_file() {
-        let dir = tempdir().expect("tempdir");
-        let sock = dir.path().join("b.sock");
-        std::fs::write(&sock, b"").expect("create socket stub");
-        let profile = profile_with_fs_field("unix_socket_bind", &sock.display().to_string());
+        #[test]
+        fn test_profile_unix_socket_field_connect_bind_file() {
+            let dir = tempdir().expect("tempdir");
+            let sock = dir.path().join("b.sock");
+            std::fs::write(&sock, b"").expect("create socket stub");
+            let profile = profile_with_fs_field("unix_socket_bind", &sock.display().to_string());
 
-        let (caps, _) =
-            from_profile_locked(&profile, dir.path(), &sandbox_args()).expect("from_profile");
+            let (caps, _) =
+                from_profile_locked(&profile, dir.path(), &sandbox_args()).expect("from_profile");
 
-        let socks: Vec<_> = caps
-            .unix_socket_capabilities()
-            .iter()
-            .filter(|c| c.source == CapabilitySource::Profile)
-            .collect();
-        assert_eq!(socks.len(), 1);
-        assert_eq!(socks[0].mode, UnixSocketMode::ConnectBind);
-        assert!(!socks[0].is_directory());
-    }
+            let socks: Vec<_> = caps
+                .unix_socket_capabilities()
+                .iter()
+                .filter(|c| c.source == CapabilitySource::Profile)
+                .collect();
+            assert_eq!(socks.len(), 1);
+            assert_eq!(socks[0].mode, UnixSocketMode::ConnectBind);
+            assert!(!socks[0].is_directory());
+        }
 
-    #[test]
-    fn test_profile_unix_socket_field_connect_dir() {
-        let dir = tempdir().expect("tempdir");
-        let profile = profile_with_fs_field("unix_socket_dir", &dir.path().display().to_string());
+        #[test]
+        fn test_profile_unix_socket_field_connect_dir() {
+            let dir = tempdir().expect("tempdir");
+            let profile =
+                profile_with_fs_field("unix_socket_dir", &dir.path().display().to_string());
 
-        let (caps, _) =
-            from_profile_locked(&profile, dir.path(), &sandbox_args()).expect("from_profile");
+            let (caps, _) =
+                from_profile_locked(&profile, dir.path(), &sandbox_args()).expect("from_profile");
 
-        let socks: Vec<_> = caps
-            .unix_socket_capabilities()
-            .iter()
-            .filter(|c| c.source == CapabilitySource::Profile)
-            .collect();
-        assert_eq!(socks.len(), 1);
-        assert_eq!(socks[0].mode, UnixSocketMode::Connect);
-        assert!(socks[0].is_directory());
-    }
+            let socks: Vec<_> = caps
+                .unix_socket_capabilities()
+                .iter()
+                .filter(|c| c.source == CapabilitySource::Profile)
+                .collect();
+            assert_eq!(socks.len(), 1);
+            assert_eq!(socks[0].mode, UnixSocketMode::Connect);
+            assert!(socks[0].is_directory());
+        }
 
-    #[test]
-    fn test_profile_unix_socket_field_connect_bind_dir() {
-        // The tsx (#685) case, expressed via profile JSON.
-        let dir = tempdir().expect("tempdir");
-        let profile =
-            profile_with_fs_field("unix_socket_dir_bind", &dir.path().display().to_string());
+        #[test]
+        fn test_profile_unix_socket_field_connect_bind_dir() {
+            // The tsx (#685) case, expressed via profile JSON.
+            let dir = tempdir().expect("tempdir");
+            let profile =
+                profile_with_fs_field("unix_socket_dir_bind", &dir.path().display().to_string());
 
-        let (caps, _) =
-            from_profile_locked(&profile, dir.path(), &sandbox_args()).expect("from_profile");
+            let (caps, _) =
+                from_profile_locked(&profile, dir.path(), &sandbox_args()).expect("from_profile");
 
-        let socks: Vec<_> = caps
-            .unix_socket_capabilities()
-            .iter()
-            .filter(|c| c.source == CapabilitySource::Profile)
-            .collect();
-        assert_eq!(socks.len(), 1);
-        assert_eq!(socks[0].mode, UnixSocketMode::ConnectBind);
-        assert!(socks[0].is_directory());
-        assert_eq!(socks[0].scope, SocketScope::DirChildren);
-    }
+            let socks: Vec<_> = caps
+                .unix_socket_capabilities()
+                .iter()
+                .filter(|c| c.source == CapabilitySource::Profile)
+                .collect();
+            assert_eq!(socks.len(), 1);
+            assert_eq!(socks[0].mode, UnixSocketMode::ConnectBind);
+            assert!(socks[0].is_directory());
+            assert_eq!(socks[0].scope, SocketScope::DirChildren);
+        }
 
-    #[test]
-    fn test_profile_unix_socket_field_connect_subtree() {
-        let dir = tempdir().expect("tempdir");
-        let profile =
-            profile_with_fs_field("unix_socket_subtree", &dir.path().display().to_string());
+        #[test]
+        fn test_profile_unix_socket_field_connect_subtree() {
+            let dir = tempdir().expect("tempdir");
+            let profile =
+                profile_with_fs_field("unix_socket_subtree", &dir.path().display().to_string());
 
-        let (caps, _) =
-            from_profile_locked(&profile, dir.path(), &sandbox_args()).expect("from_profile");
+            let (caps, _) =
+                from_profile_locked(&profile, dir.path(), &sandbox_args()).expect("from_profile");
 
-        let socks: Vec<_> = caps
-            .unix_socket_capabilities()
-            .iter()
-            .filter(|c| c.source == CapabilitySource::Profile)
-            .collect();
-        assert_eq!(socks.len(), 1);
-        assert_eq!(socks[0].mode, UnixSocketMode::Connect);
-        assert_eq!(socks[0].scope, SocketScope::DirSubtree);
-    }
+            let socks: Vec<_> = caps
+                .unix_socket_capabilities()
+                .iter()
+                .filter(|c| c.source == CapabilitySource::Profile)
+                .collect();
+            assert_eq!(socks.len(), 1);
+            assert_eq!(socks[0].mode, UnixSocketMode::Connect);
+            assert_eq!(socks[0].scope, SocketScope::DirSubtree);
+        }
 
-    #[test]
-    fn test_profile_unix_socket_field_connect_bind_subtree() {
-        let dir = tempdir().expect("tempdir");
-        let profile = profile_with_fs_field(
-            "unix_socket_subtree_bind",
-            &dir.path().display().to_string(),
-        );
+        #[test]
+        fn test_profile_unix_socket_field_connect_bind_subtree() {
+            let dir = tempdir().expect("tempdir");
+            let profile = profile_with_fs_field(
+                "unix_socket_subtree_bind",
+                &dir.path().display().to_string(),
+            );
 
-        let (caps, _) =
-            from_profile_locked(&profile, dir.path(), &sandbox_args()).expect("from_profile");
+            let (caps, _) =
+                from_profile_locked(&profile, dir.path(), &sandbox_args()).expect("from_profile");
 
-        let socks: Vec<_> = caps
-            .unix_socket_capabilities()
-            .iter()
-            .filter(|c| c.source == CapabilitySource::Profile)
-            .collect();
-        assert_eq!(socks.len(), 1);
-        assert_eq!(socks[0].mode, UnixSocketMode::ConnectBind);
-        assert_eq!(socks[0].scope, SocketScope::DirSubtree);
+            let socks: Vec<_> = caps
+                .unix_socket_capabilities()
+                .iter()
+                .filter(|c| c.source == CapabilitySource::Profile)
+                .collect();
+            assert_eq!(socks.len(), 1);
+            assert_eq!(socks[0].mode, UnixSocketMode::ConnectBind);
+            assert_eq!(socks[0].scope, SocketScope::DirSubtree);
+        }
     }
 }

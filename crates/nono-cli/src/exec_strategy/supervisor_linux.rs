@@ -1308,7 +1308,7 @@ mod tests {
         ));
     }
 
-    // --- decide_network_notification tests (issue #685) ---------------------
+    // decide_network_notification tests
     //
     // These exercise the proxy-only seccomp fallback path that runs on
     // Landlock < V4 kernels. The key invariant: pathname `AF_UNIX` must be

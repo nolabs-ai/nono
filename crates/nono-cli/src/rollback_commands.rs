@@ -72,9 +72,7 @@ pub fn run_rollback(args: RollbackArgs) -> Result<()> {
     }
 }
 
-// ---------------------------------------------------------------------------
 // nono rollback list
-// ---------------------------------------------------------------------------
 
 fn cmd_list(args: RollbackListArgs) -> Result<()> {
     let mut sessions = discover_sessions()?;
@@ -286,9 +284,7 @@ fn print_sessions_json(sessions: &[&SessionInfo]) -> Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
 // nono rollback show
-// ---------------------------------------------------------------------------
 
 fn cmd_show(args: RollbackShowArgs) -> Result<()> {
     let session = load_session(&args.session_id)?;
@@ -610,9 +606,7 @@ fn print_show_json(session: &SessionInfo) -> Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
 // nono rollback restore
-// ---------------------------------------------------------------------------
 
 fn cmd_restore(args: RollbackRestoreArgs) -> Result<()> {
     let session = load_session(&args.session_id)?;
@@ -690,9 +684,7 @@ fn cmd_restore(args: RollbackRestoreArgs) -> Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
 // nono rollback verify
-// ---------------------------------------------------------------------------
 
 fn cmd_verify(args: RollbackVerifyArgs) -> Result<()> {
     let session = load_session(&args.session_id)?;
@@ -793,9 +785,7 @@ fn cmd_verify(args: RollbackVerifyArgs) -> Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
 // nono rollback cleanup
-// ---------------------------------------------------------------------------
 
 fn cmd_cleanup(args: RollbackCleanupArgs) -> Result<()> {
     if args.all {
@@ -982,9 +972,7 @@ fn cleanup_all(dry_run: bool) -> Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
 // Shared helpers
-// ---------------------------------------------------------------------------
 
 /// Parse session start time from either RFC3339 or epoch seconds format
 fn parse_session_start_time(s: &SessionInfo) -> Option<u64> {

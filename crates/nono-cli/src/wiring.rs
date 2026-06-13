@@ -631,9 +631,7 @@ fn leaf_changed_disk(leaf: &JsonLeaf) -> bool {
     leaf.prior_value.as_ref() != Some(&leaf.installed_value)
 }
 
-// ---------------------------------------------------------------------------
 // Variable expansion + path validation
-// ---------------------------------------------------------------------------
 
 /// Expand `$VAR` placeholders in a string against the closed set of
 /// allowed variables, then return as a path. Refuses unknown variables
@@ -737,9 +735,7 @@ fn expand_vars(template: &str, ctx: &WiringContext) -> Result<String> {
     Ok(out)
 }
 
-// ---------------------------------------------------------------------------
 // Symlink primitive
-// ---------------------------------------------------------------------------
 
 enum SymlinkOutcome {
     Created,
@@ -776,9 +772,7 @@ fn ensure_symlink(link: &Path, target: &Path) -> Result<SymlinkOutcome> {
     }
 }
 
-// ---------------------------------------------------------------------------
 // File copy primitive
-// ---------------------------------------------------------------------------
 
 struct CopyOutcome {
     mutated: bool,
@@ -811,9 +805,7 @@ fn copy_file_atomic(source: &Path, dest: &Path) -> Result<CopyOutcome> {
     })
 }
 
-// ---------------------------------------------------------------------------
 // JSON merge / append primitives
-// ---------------------------------------------------------------------------
 
 fn read_json(path: &Path) -> Result<Value> {
     let content = fs::read_to_string(path).map_err(NonoError::Io)?;
@@ -1255,9 +1247,7 @@ fn restore_json_array_entries(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
 // YAML merge primitives
-// ---------------------------------------------------------------------------
 
 /// Convert a `serde_yaml_ng::Value` to a `serde_json::Value` so that
 /// the shared `walk_and_merge` / `restore_one_leaf` /
@@ -1446,9 +1436,7 @@ fn restore_yaml_leaves(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
 // TOML fenced block primitive
-// ---------------------------------------------------------------------------
 
 fn block_markers(marker_id: &str) -> (String, String) {
     (

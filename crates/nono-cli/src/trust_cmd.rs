@@ -42,9 +42,7 @@ pub fn run_trust(args: TrustArgs) -> Result<()> {
     }
 }
 
-// ---------------------------------------------------------------------------
 // init
-// ---------------------------------------------------------------------------
 
 fn run_init(args: TrustInitArgs) -> Result<()> {
     let is_user = args.user;
@@ -176,9 +174,7 @@ fn run_init(args: TrustInitArgs) -> Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
 // keygen
-// ---------------------------------------------------------------------------
 
 fn run_keygen(args: TrustKeygenArgs) -> Result<()> {
     let key_ref = TrustKeyRef::resolve_id(args.keyref.as_deref(), &args.id)?;
@@ -234,9 +230,7 @@ fn run_keygen(args: TrustKeygenArgs) -> Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
 // export-key
-// ---------------------------------------------------------------------------
 
 fn run_export_key(args: TrustExportKeyArgs) -> Result<()> {
     let key_ref = TrustKeyRef::resolve_id(args.keyref.as_deref(), &args.id)?;
@@ -252,9 +246,7 @@ fn run_export_key(args: TrustExportKeyArgs) -> Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
 // sign
-// ---------------------------------------------------------------------------
 
 fn run_sign(args: TrustSignArgs) -> Result<()> {
     if args.keyless {
@@ -368,9 +360,7 @@ fn run_sign_multi_keyed(files: &[PathBuf], key_pair: &trust::KeyPair, key_id: &s
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
 // keyless sign (Sigstore Fulcio + Rekor)
-// ---------------------------------------------------------------------------
 
 fn run_sign_keyless(args: TrustSignArgs) -> Result<()> {
     let multi_subject = args.multi_subject;
@@ -687,9 +677,7 @@ fn discover_oidc_token(rt: &tokio::runtime::Runtime) -> Result<sigstore_sign::oi
     })
 }
 
-// ---------------------------------------------------------------------------
 // sign-policy
-// ---------------------------------------------------------------------------
 
 fn run_sign_policy(args: TrustSignPolicyArgs) -> Result<()> {
     let key_ref = TrustKeyRef::resolve_key(args.keyref.as_deref(), args.key.as_deref())?;
@@ -747,9 +735,7 @@ fn run_sign_policy(args: TrustSignPolicyArgs) -> Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
 // verify
-// ---------------------------------------------------------------------------
 
 fn run_verify(args: TrustVerifyArgs) -> Result<()> {
     let policy = load_trust_policy(args.policy.as_deref())?;
@@ -1063,9 +1049,7 @@ fn verify_single_file(
     Ok(format_identity(&identity))
 }
 
-// ---------------------------------------------------------------------------
 // list
-// ---------------------------------------------------------------------------
 
 fn run_list(args: TrustListArgs) -> Result<()> {
     let policy = load_trust_policy(args.policy.as_deref())?;
@@ -1145,9 +1129,7 @@ fn run_list(args: TrustListArgs) -> Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
 // Key loading from system keystore
-// ---------------------------------------------------------------------------
 
 /// Load only the public key bytes for a given key ID.
 ///
@@ -1222,9 +1204,7 @@ pub(crate) fn load_signing_key(key_id: &str) -> Result<trust::KeyPair> {
     reconstruct_key_pair(&pkcs8_bytes)
 }
 
-// ---------------------------------------------------------------------------
 // Key loading with TrustKeyRef dispatch
-// ---------------------------------------------------------------------------
 
 /// Load public key bytes for a given key reference.
 fn load_public_key_bytes_for_ref(key_ref: &TrustKeyRef) -> Result<Vec<u8>> {
@@ -1336,9 +1316,7 @@ pub(crate) fn reconstruct_key_pair(pkcs8_bytes: &[u8]) -> Result<trust::KeyPair>
     Ok(trust::KeyPair::EcdsaP256(ecdsa_kp))
 }
 
-// ---------------------------------------------------------------------------
 // Trust policy loading
-// ---------------------------------------------------------------------------
 
 fn load_trust_policy(explicit_path: Option<&Path>) -> Result<trust::TrustPolicy> {
     if let Some(path) = explicit_path {
@@ -1441,9 +1419,7 @@ pub(crate) fn user_trust_policy_path() -> Option<PathBuf> {
         .map(|d| d.join("nono").join("trust-policy.json"))
 }
 
-// ---------------------------------------------------------------------------
 // File resolution helpers
-// ---------------------------------------------------------------------------
 
 fn resolve_files(
     explicit: &[PathBuf],
@@ -1492,9 +1468,7 @@ fn canonicalize_paths(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
     Ok(resolved)
 }
 
-// ---------------------------------------------------------------------------
 // Formatting helpers
-// ---------------------------------------------------------------------------
 
 fn format_identity(identity: &trust::SignerIdentity) -> String {
     match identity {

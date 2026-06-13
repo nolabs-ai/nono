@@ -900,9 +900,7 @@ async fn send_error(stream: &mut TcpStream, status: u16, reason: &str) -> Result
     Ok(())
 }
 
-// ============================================================================
 // Injection mode helpers
-// ============================================================================
 
 /// Validate phantom token based on injection mode.
 ///
@@ -1519,10 +1517,6 @@ mod tests {
     // Status-line parsing moved to `crate::forward` along with the upstream
     // response-streaming pipeline; coverage continues there.
 
-    // ============================================================================
-    // URL Path Injection Mode Tests
-    // ============================================================================
-
     #[test]
     fn test_validate_phantom_token_in_path_valid() {
         let token = Zeroizing::new("session123".to_string());
@@ -1576,10 +1570,6 @@ mod tests {
         let result = transform_url_path(path, pattern, replacement, &credential).unwrap();
         assert_eq!(result, "/bot/real_token");
     }
-
-    // ============================================================================
-    // Query Param Injection Mode Tests
-    // ============================================================================
 
     #[test]
     fn test_validate_phantom_token_in_query_valid() {
@@ -1687,10 +1677,6 @@ mod tests {
 
         assert_eq!(transformed, "/api/data?api_key=real_key");
     }
-
-    // ========================================================================
-    // Proxy artifact stripping tests
-    // ========================================================================
 
     #[test]
     fn test_strip_proxy_path_token_basic() {

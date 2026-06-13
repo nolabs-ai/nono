@@ -129,7 +129,6 @@ async fn forward_inner_request<S>(tls_stream: &mut S, ctx: &InterceptCtx<'_>) ->
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    // --- Parse the inner request line + headers ---
     let mut buf_reader = BufReader::new(&mut *tls_stream);
     let mut first_line = String::new();
     buf_reader.read_line(&mut first_line).await?;
@@ -307,7 +306,6 @@ where
         return Ok(());
     }
 
-    // --- Path / credential transformation ---
     let transformed_path = if let Some(cred) = cred {
         let cleaned = reverse::strip_proxy_artifacts(
             &path,
@@ -328,7 +326,6 @@ where
         path.clone()
     };
 
-    // --- Resolve upstream IPs (DNS-rebind-safe via filter) ---
     let check = ctx.filter.check_host(ctx.host, ctx.port).await?;
     if !check.result.is_allowed() {
         let reason = check.result.reason();
@@ -366,7 +363,6 @@ where
         None => return Ok(()),
     };
 
-    // --- Build upstream request bytes ---
     let upstream_authority = reverse::format_host_header(UpstreamScheme::Https, ctx.host, ctx.port);
     let mut request = Zeroizing::new(format!(
         "{} {} {}\r\nHost: {}\r\n",
@@ -391,7 +387,6 @@ where
     }
     request.push_str("\r\n");
 
-    // --- Forward via shared pipeline ---
     let connector = route
         .and_then(|r| r.tls_connector.as_ref())
         .unwrap_or(ctx.tls_connector);

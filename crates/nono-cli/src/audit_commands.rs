@@ -36,9 +36,7 @@ pub fn run_audit(args: AuditArgs) -> Result<()> {
     }
 }
 
-// ---------------------------------------------------------------------------
 // nono audit list
-// ---------------------------------------------------------------------------
 
 fn cmd_list(args: AuditListArgs) -> Result<()> {
     let mut sessions = discover_sessions()?;
@@ -249,9 +247,7 @@ fn print_list_json(sessions: &[SessionInfo]) -> Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
 // nono audit show
-// ---------------------------------------------------------------------------
 
 fn cmd_show(args: AuditShowArgs) -> Result<()> {
     let session = load_session(&args.session_id)?;
@@ -520,9 +516,7 @@ fn cmd_verify(args: AuditVerifyArgs) -> Result<()> {
     }
 }
 
-// ---------------------------------------------------------------------------
 // nono audit cleanup
-// ---------------------------------------------------------------------------
 
 fn cmd_cleanup(args: AuditCleanupArgs) -> Result<()> {
     reject_if_sandboxed("audit cleanup")?;
@@ -678,9 +672,7 @@ fn print_show_json(session: &SessionInfo) -> Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
 // Helpers
-// ---------------------------------------------------------------------------
 
 fn session_status_label(s: &SessionInfo) -> colored::ColoredString {
     if s.is_alive {

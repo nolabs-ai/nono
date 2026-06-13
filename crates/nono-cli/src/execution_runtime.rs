@@ -263,8 +263,8 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
                 .unwrap_or_else(session::generate_session_id)
         });
 
-    // ---- Before-hook execution (Unix-only) ----
     #[cfg(unix)]
+    // Before-hook execution (Unix-only)
     let hook_env_vars_owned: Vec<(String, String)> = flags
         .session_hooks
         .before
@@ -424,8 +424,8 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
                 silent: flags.silent,
             })?;
 
-            // ---- After-hook execution (Unix-only) ----
             #[cfg(unix)]
+            // After-hook execution (Unix-only)
             if let (Some(after), Some(session_id)) = (
                 flags.session_hooks.after.as_ref(),
                 hook_session_id.as_deref(),

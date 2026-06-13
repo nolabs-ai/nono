@@ -2110,9 +2110,7 @@ pub struct RollbackCleanupArgs {
     pub help: Option<bool>,
 }
 
-// ---------------------------------------------------------------------------
 // Audit command args
-// ---------------------------------------------------------------------------
 
 #[derive(Parser, Debug)]
 #[command(disable_help_flag = true)]
@@ -2336,9 +2334,7 @@ pub struct PruneArgs {
     pub keep: Option<usize>,
 }
 
-// ---------------------------------------------------------------------------
 // Trust command args
-// ---------------------------------------------------------------------------
 
 #[derive(Parser, Debug)]
 #[command(disable_help_flag = true)]

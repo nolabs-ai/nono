@@ -37,9 +37,7 @@ pub use sandbox::*;
 pub use state::*;
 pub use types::*;
 
-// ---------------------------------------------------------------------------
 // Thread-local error store
-// ---------------------------------------------------------------------------
 
 thread_local! {
     static LAST_ERROR: RefCell<Option<CString>> = const { RefCell::new(None) };
@@ -131,9 +129,7 @@ pub(crate) fn map_error(e: &nono::NonoError) -> types::NonoErrorCode {
     }
 }
 
-// ---------------------------------------------------------------------------
 // String helpers
-// ---------------------------------------------------------------------------
 
 /// Convert a Rust `String` to a caller-owned C string.
 ///
@@ -168,9 +164,7 @@ pub(crate) unsafe fn c_str_to_str<'a>(ptr: *const c_char) -> Option<&'a str> {
     unsafe { CStr::from_ptr(ptr) }.to_str().ok()
 }
 
-// ---------------------------------------------------------------------------
 // Public FFI: Error and string management
-// ---------------------------------------------------------------------------
 
 /// Get the last error message for the current thread.
 ///
@@ -234,9 +228,7 @@ pub extern "C" fn nono_version() -> *mut c_char {
     rust_string_to_c(env!("CARGO_PKG_VERSION").to_string())
 }
 
-// ---------------------------------------------------------------------------
 // Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {

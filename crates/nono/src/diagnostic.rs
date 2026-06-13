@@ -2355,8 +2355,6 @@ mod tests {
         caps
     }
 
-    // --- Standard mode tests ---
-
     #[test]
     fn test_standard_footer_contains_exit_code() {
         let caps = make_test_caps();
@@ -2979,8 +2977,6 @@ mod tests {
         assert!(!output.contains("--read-file"));
     }
 
-    // --- Supervised mode tests ---
-
     #[test]
     fn test_supervised_no_denials_no_extensions() {
         let caps = make_test_caps(); // extensions_enabled defaults to false
@@ -3572,8 +3568,6 @@ mod tests {
         assert!(!output.contains("Denied paths during this session:"));
     }
 
-    // --- Protected paths tests ---
-
     #[test]
     fn test_protected_paths_shown_in_footer() {
         let caps = make_test_caps();
@@ -3609,8 +3603,6 @@ mod tests {
 
         assert!(!output.contains("Write-protected"));
     }
-
-    // --- Exit code explanation tests ---
 
     fn make_command_context(program: &str, path: &str) -> CommandContext {
         CommandContext {

@@ -14,9 +14,7 @@ fn nono_bin() -> Command {
     Command::new(env!("CARGO_BIN_EXE_nono"))
 }
 
-// ---------------------------------------------------------------------------
 // Gap 1: resolve_to_manifest() must include groups.include and workdir
-// ---------------------------------------------------------------------------
 
 #[test]
 fn manifest_includes_group_deny_paths() {
@@ -305,9 +303,7 @@ fn manifest_grants_are_deduplicated() {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Gap 2: --config manifest path must activate proxy machinery
-// ---------------------------------------------------------------------------
 
 #[test]
 fn manifest_proxy_mode_not_downgraded_to_blocked() {
@@ -507,9 +503,7 @@ fn manifest_uri_credential_without_env_var_fails_validation() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // Gap 3: rollback.enabled must be functional with validation
-// ---------------------------------------------------------------------------
 
 #[test]
 fn rollback_enabled_without_supervised_fails_validation() {
@@ -600,9 +594,7 @@ fn rollback_enabled_with_supervised_is_accepted() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // Property-based: randomly generated profiles must round-trip through manifest
-// ---------------------------------------------------------------------------
 
 use proptest::prelude::*;
 
@@ -835,9 +827,7 @@ proptest! {
     }
 }
 
-// ---------------------------------------------------------------------------
 // All built-in profiles must export and round-trip cleanly
-// ---------------------------------------------------------------------------
 
 #[test]
 fn all_builtin_profiles_manifest_round_trip_is_complete() {

@@ -11,9 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
 
-// ============================================================================
 // JSON schema types
-// ============================================================================
 
 /// Root policy file structure
 #[derive(Debug, Clone, Deserialize)]
@@ -185,9 +183,7 @@ impl ProfileDef {
     }
 }
 
-// ============================================================================
 // Platform detection
-// ============================================================================
 
 /// Current platform identifier
 pub(crate) fn current_platform() -> &'static str {
@@ -202,9 +198,7 @@ pub(crate) fn group_matches_platform(group: &Group) -> bool {
     }
 }
 
-// ============================================================================
 // Path expansion
-// ============================================================================
 
 /// Expand `~` to $HOME and `$TMPDIR` to the environment variable value.
 ///
@@ -312,9 +306,7 @@ fn escape_seatbelt_regex_path(path: &str) -> Result<String> {
     Ok(out)
 }
 
-// ============================================================================
 // Group resolution
-// ============================================================================
 
 /// Load policy from JSON string
 pub fn load_policy(json: &str) -> Result<Policy> {
@@ -1233,9 +1225,7 @@ pub fn group_description<'a>(policy: &'a Policy, name: &str) -> Option<&'a str> 
     policy.groups.get(name).map(|g| g.description.as_str())
 }
 
-// ============================================================================
 // Query helpers: extract flat lists from policy groups
-// ============================================================================
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SensitivePathRule {
@@ -1444,9 +1434,7 @@ pub fn load_package_groups(policy: &mut Policy) -> Result<()> {
     Ok(())
 }
 
-// ============================================================================
 // Tests
-// ============================================================================
 
 #[cfg(test)]
 mod tests {

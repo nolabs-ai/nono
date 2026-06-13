@@ -36,9 +36,7 @@
 
 use std::io::Write;
 
-// ---------------------------------------------------------------------------
 // Per-thread counter and suppression machinery
-// ---------------------------------------------------------------------------
 //
 // The `WarningCounterGuard` and `WarningSuppressionGuard` types — and the
 // thread-local cells they drive — moved to `crate::deprecation_warnings`
@@ -70,7 +68,7 @@ pub(crate) struct RawSecurityConfig {
     #[serde(flatten)]
     pub canonical: crate::profile::SecurityConfig,
 
-    // === Legacy fields (drained in `drain_legacy_security_into_canonical`) ===
+    // Legacy fields (drained in `drain_legacy_security_into_canonical`)
     /// ALIAS(canonical="groups.include", introduced="v0.41.0", remove_by="v1.0.0", issue="#594")
     #[serde(default, rename = "groups")]
     pub legacy_groups: Vec<String>,
@@ -747,9 +745,7 @@ mod tests {
         assert_eq!(n, 1, "only post-suppression emit counts");
     }
 
-    // -----------------------------------------------------------------
     // Drain integration: full `Profile` deserialization round-trip
-    // -----------------------------------------------------------------
     //
     // These tests live here (rather than `profile/mod.rs`) so the legacy
     // JSON literals stay confined to a file `lint-docs.sh` already

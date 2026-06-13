@@ -185,7 +185,6 @@ pub struct RouteConfig {
     #[serde(default)]
     pub inject_mode: InjectMode,
 
-    // --- Header mode fields ---
     /// HTTP header name for the credential (default: "Authorization")
     /// Only used when inject_mode is "header".
     #[serde(default = "default_inject_header")]
@@ -199,7 +198,6 @@ pub struct RouteConfig {
     #[serde(default)]
     pub credential_format: Option<String>,
 
-    // --- URL path mode fields ---
     /// Pattern to match in incoming URL path. Use {} as placeholder for phantom token.
     /// Example: "/bot{}/" matches "/bot<token>/getMe"
     /// Only used when inject_mode is "url_path".
@@ -212,7 +210,6 @@ pub struct RouteConfig {
     #[serde(default)]
     pub path_replacement: Option<String>,
 
-    // --- Query param mode fields ---
     /// Name of the query parameter to add/replace with the credential.
     /// Only used when inject_mode is "query_param".
     #[serde(default)]
@@ -553,10 +550,6 @@ mod tests {
         assert!(ext.bypass_hosts.is_empty());
     }
 
-    // ========================================================================
-    // EndpointRule + path matching tests
-    // ========================================================================
-
     #[test]
     fn test_endpoint_allowed_empty_rules_allows_all() {
         assert!(endpoint_allowed(&[], "GET", "/anything"));
@@ -830,10 +823,6 @@ mod tests {
         assert_eq!(deserialized.method, "GET");
         assert_eq!(deserialized.path, "/api/*/data");
     }
-
-    // ========================================================================
-    // OAuth2Config tests
-    // ========================================================================
 
     #[test]
     fn test_oauth2_config_deserialization() {

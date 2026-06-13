@@ -192,10 +192,6 @@ fn test_groups_json() {
     assert!(arr.len() > 10, "expected many groups in JSON output");
 }
 
-// ---------------------------------------------------------------------------
-// nono profile show --format manifest
-// ---------------------------------------------------------------------------
-
 #[test]
 fn test_show_format_manifest_default_profile() {
     let output = nono_bin()
@@ -338,7 +334,6 @@ fn test_show_format_manifest_all_builtins_succeed() {
     }
 }
 
-// ----------------------------------------------------------------------------
 // `profile show --json` / `profile diff --json` — Debug-format leak regression
 //
 // Historically the hand-rolled JSON emitter rendered five enum-valued fields
@@ -346,7 +341,6 @@ fn test_show_format_manifest_all_builtins_succeed() {
 // `"ReadWrite"`, `"None"`-as-string) into output that `profile validate`
 // rejects. These tests guard against any future regression on the same code
 // path. See docs/policy-show-json-serialization-leak.md.
-// ----------------------------------------------------------------------------
 
 const SECURITY_TRI_MODE: &[&str] = &["isolated", "allow_same_sandbox", "allow_all"];
 const IPC_MODES: &[&str] = &["shared_memory_only", "full"];

@@ -31,7 +31,6 @@ pub struct LoadedCredential {
     /// Raw credential value from keystore (for modes that need it directly)
     pub raw_credential: Zeroizing<String>,
 
-    // --- Header mode ---
     /// Header name to inject (e.g., "Authorization")
     pub header_name: String,
     /// Header name used for proxy-side phantom token validation.
@@ -39,7 +38,6 @@ pub struct LoadedCredential {
     /// Formatted header value (e.g., "Bearer sk-...")
     pub header_value: Zeroizing<String>,
 
-    // --- URL path mode ---
     /// Pattern to match in incoming path (with {} placeholder)
     pub path_pattern: Option<String>,
     /// Pattern to match in incoming proxy path (with {} placeholder)
@@ -47,7 +45,6 @@ pub struct LoadedCredential {
     /// Pattern for outgoing path (with {} placeholder)
     pub path_replacement: Option<String>,
 
-    // --- Query param mode ---
     /// Query parameter name
     pub query_param_name: Option<String>,
     /// Proxy-side query parameter name for phantom token validation.

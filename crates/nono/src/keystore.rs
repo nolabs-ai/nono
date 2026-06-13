@@ -1940,8 +1940,6 @@ mod tests {
         assert!(mappings.is_empty());
     }
 
-    // --- op:// URI support in build_mappings_from_list ---
-
     #[test]
     fn test_build_mappings_op_uri_with_var_name() {
         let mappings =
@@ -2000,8 +1998,6 @@ mod tests {
         );
     }
 
-    // --- apple-password:// URI handling in build_mappings_from_list ---
-
     #[test]
     fn test_build_mappings_apple_password_uri_rejected_in_list_mode() {
         let err = build_mappings_from_list("apple-password://github.com/alice@example.com")
@@ -2036,8 +2032,6 @@ mod tests {
             err
         );
     }
-
-    // --- apple-password:// URI validation tests ---
 
     #[test]
     fn test_validate_apple_password_uri_valid() {
@@ -2089,8 +2083,6 @@ mod tests {
         );
     }
 
-    // --- keyring:// URI handling in build_mappings_from_list ---
-
     #[test]
     fn test_build_mappings_keyring_uri_rejected_in_list_mode() {
         let err = build_mappings_from_list("keyring://gh:github.com/alice")
@@ -2123,8 +2115,6 @@ mod tests {
             err
         );
     }
-
-    // --- keyring:// URI validation tests ---
 
     #[test]
     fn test_validate_keyring_uri_valid() {
@@ -2227,8 +2217,6 @@ mod tests {
         assert!(err.to_string().contains("service/account"), "got: {}", err);
     }
 
-    // --- keyring:// URI redaction tests ---
-
     #[test]
     fn test_redact_keyring_uri_normal() {
         assert_eq!(
@@ -2262,8 +2250,6 @@ mod tests {
     fn test_redact_keyring_uri_non_prefix_input() {
         assert_eq!(redact_keyring_uri("not-a-keyring-uri"), "keyring://***");
     }
-
-    // --- keyring:// ?decode=go-keyring tests ---
 
     #[cfg(feature = "system-keyring")]
     #[test]
@@ -2322,8 +2308,6 @@ mod tests {
         assert_eq!(parts.decode, KeyringDecode::None);
     }
 
-    // --- keyring:// build_mappings_from_pairs tests ---
-
     #[test]
     fn test_build_pairs_keyring_uri_valid() {
         let pairs = vec![(
@@ -2361,8 +2345,6 @@ mod tests {
         assert!(err.to_string().contains("service/account"), "got: {}", err);
     }
 
-    // --- keyring:// length limit test ---
-
     #[test]
     fn test_validate_keyring_uri_too_long() {
         let long_account = "a".repeat(1024);
@@ -2371,7 +2353,6 @@ mod tests {
         assert!(err.to_string().contains("maximum length"), "got: {}", err);
     }
 
-    // --- op:// URI validation tests ---
     //
     // These tests verify that validate_op_uri correctly accepts valid 1Password
     // secret references and rejects malformed or dangerous ones. The rejection
@@ -2462,7 +2443,6 @@ mod tests {
         );
     }
 
-    // --- Injection prevention tests ---
     //
     // Although we use Command::new (no shell), these characters are still
     // rejected as defense-in-depth. A semicolon or pipe in a URI is never
@@ -2548,7 +2528,6 @@ mod tests {
         );
     }
 
-    // --- redact_op_uri tests ---
     //
     // The field segment (the actual secret name) is masked in logs to avoid
     // leaking what secret is being accessed. Vault and item names are kept
@@ -2582,8 +2561,6 @@ mod tests {
         // Non-op:// strings get fully redacted
         assert_eq!(redact_op_uri("keyring_account"), "op://***");
     }
-
-    // --- bw:// URI validation tests ---
 
     #[test]
     fn test_validate_bw_uri_valid_item_only() {
@@ -2750,8 +2727,6 @@ mod tests {
         );
     }
 
-    // --- is_bw_uri tests ---
-
     #[test]
     fn test_is_bw_uri_positive() {
         assert!(is_bw_uri("bw://my-item"));
@@ -2763,8 +2738,6 @@ mod tests {
         assert!(!is_bw_uri("keyring://service/account"));
         assert!(!is_bw_uri("my_api_key"));
     }
-
-    // --- redact_bw_uri tests ---
 
     #[test]
     fn test_redact_bw_uri_item_only() {
@@ -2788,8 +2761,6 @@ mod tests {
     fn test_redact_bw_uri_not_bw() {
         assert_eq!(redact_bw_uri("keyring_account"), "bw://***");
     }
-
-    // --- classify_bw_error tests ---
 
     #[test]
     fn test_classify_bw_error_not_authenticated() {
@@ -2884,8 +2855,6 @@ mod tests {
         );
     }
 
-    // --- build_mappings_from_list bw:// URI tests ---
-
     #[test]
     fn test_build_mappings_bw_uri_with_var_name() {
         let mappings = build_mappings_from_list("bw://my-api-key=MY_SECRET").expect("should parse");
@@ -2967,8 +2936,6 @@ mod tests {
         );
     }
 
-    // --- load_secret_by_ref dispatches bw:// ---
-
     #[test]
     fn test_load_secret_by_ref_dispatches_bw() {
         // bw:// should be recognized and dispatched to the Bitwarden backend.
@@ -2998,8 +2965,6 @@ mod tests {
             }
         }
     }
-
-    // --- extract_bw_field: hermetic JSON-parse tests (no bw invocation) ---
 
     #[test]
     fn test_extract_bw_field_login_password() {
@@ -3126,8 +3091,6 @@ mod tests {
         );
     }
 
-    // --- redact_file_uri tests ---
-
     #[test]
     fn test_redact_file_uri() {
         assert_eq!(
@@ -3145,7 +3108,6 @@ mod tests {
         assert_eq!(redact_file_uri("file:///secret"), "file:///[REDACTED]");
     }
 
-    // --- classify_op_error tests ---
     //
     // Verify that `op` CLI stderr messages are mapped to actionable errors
     // so users know whether to run `op signin`, fix a typo, or debug network.
@@ -3210,8 +3172,6 @@ mod tests {
         assert!(msg.contains("requires user approval"), "got: {}", msg);
     }
 
-    // --- is_op_uri tests ---
-
     #[test]
     fn test_is_op_uri_positive() {
         assert!(is_op_uri("op://vault/item/field"));
@@ -3238,8 +3198,6 @@ mod tests {
         assert!(!is_apple_password_uri("openai_api_key"));
         assert!(!is_apple_password_uri("op://vault/item/field"));
     }
-
-    // --- load_secret_by_ref dispatch ---
 
     #[test]
     fn test_load_secret_by_ref_dispatches_op() {
@@ -3272,10 +3230,6 @@ mod tests {
             err
         );
     }
-
-    // =========================================================================
-    // env:// URI tests
-    // =========================================================================
 
     #[test]
     fn test_is_env_uri_positive() {
@@ -3428,8 +3382,6 @@ mod tests {
         unsafe { std::env::remove_var(test_var) };
     }
 
-    // --- env:// in build_mappings_from_list ---
-
     #[test]
     fn test_build_mappings_env_uri_auto_derive() {
         let mappings = build_mappings_from_list("env://GITHUB_TOKEN").expect("should parse");
@@ -3484,9 +3436,7 @@ mod tests {
         );
     }
 
-    // =========================================================================
     // Case-insensitive dangerous env var bypass prevention
-    // =========================================================================
 
     #[test]
     fn test_validate_env_uri_dangerous_case_insensitive() {
@@ -3505,9 +3455,7 @@ mod tests {
         assert!(err.to_string().contains("dangerous"), "got: {}", err);
     }
 
-    // =========================================================================
     // Destination env var validation
-    // =========================================================================
 
     #[test]
     fn test_validate_destination_env_var_valid() {
@@ -3654,10 +3602,6 @@ mod tests {
         assert_eq!(merged.get("openai_api_key"), Some(&"FROM_MAP".to_string()));
     }
 
-    // =========================================================================
-    // file:// URI tests
-    // =========================================================================
-
     #[test]
     fn test_validate_file_uri_valid_absolute_path() {
         assert!(validate_file_uri("file:///run/secrets/api-token").is_ok());
@@ -3701,10 +3645,6 @@ mod tests {
         // Validation (absolute path check) happens in validate_file_uri.
         assert!(is_file_uri("file://relative"));
     }
-
-    // =========================================================================
-    // load_from_file tests
-    // =========================================================================
 
     #[test]
     fn test_load_from_file_reads_and_trims() {
@@ -3798,10 +3738,6 @@ mod tests {
         assert_eq!(mode, 0o600);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "top-secret");
     }
-
-    // =========================================================================
-    // file:// dispatch and CLI mapping tests
-    // =========================================================================
 
     #[test]
     fn test_load_secret_by_ref_dispatches_file_uri() {

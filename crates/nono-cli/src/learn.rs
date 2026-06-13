@@ -412,9 +412,7 @@ pub fn run_learn(_args: &LearnArgs) -> Result<LearnResult> {
     ))
 }
 
-// ---------------------------------------------------------------------------
 // macOS implementation (fs_usage)
-// ---------------------------------------------------------------------------
 
 /// Check if fs_usage is available
 #[cfg(target_os = "macos")]
@@ -2285,8 +2283,6 @@ mod tests {
         assert_eq!(unescape_strace_string(r#"hello\"#), r#"hello\"#);
     }
 
-    // --- Network parsing tests ---
-
     #[test]
     fn test_parse_connect_ipv4() {
         let line = r#"connect(3, {sa_family=AF_INET, sin_port=htons(443), sin_addr=inet_addr("93.184.216.34")}, 16) = 0"#;
@@ -2614,8 +2610,6 @@ mod tests {
         assert_eq!(line, "  10.0.0.1:8080");
     }
 
-    // --- DNS query parsing tests ---
-
     #[test]
     fn test_parse_dns_query_hostname_simple() {
         // DNS wire format for "example.com"
@@ -2743,8 +2737,6 @@ mod tests {
         );
     }
 
-    // --- PID extraction tests ---
-
     #[test]
     fn test_extract_strace_pid_with_prefix() {
         let line = r#"[pid 12345] sendto(5, "data", 4, 0, {sa_family=AF_INET, ...}, 16) = 4"#;
@@ -2763,8 +2755,6 @@ mod tests {
         let line = r#"[pid  1234] openat(AT_FDCWD, "/etc/passwd", O_RDONLY) = 3"#;
         assert_eq!(extract_strace_pid(line), Some(1234));
     }
-
-    // --- sendmsg buffer extraction tests ---
 
     #[test]
     fn test_extract_sendmsg_buffer() {
@@ -2941,8 +2931,6 @@ mod macos_tests {
         assert!(!is_fs_usage_write("readlink", ""));
         assert!(!is_fs_usage_write("access", ""));
     }
-
-    // --- nettop parsing tests ---
 
     #[test]
     fn test_parse_nettop_tcp4_established() {

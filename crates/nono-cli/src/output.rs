@@ -10,9 +10,7 @@ use std::ffi::{OsStr, OsString};
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::Path;
 
-// ---------------------------------------------------------------------------
 // Helpers
-// ---------------------------------------------------------------------------
 
 /// Dark foreground for badge text (works on both light and dark bg colors)
 const BADGE_FG_DARK: Rgb = Rgb(30, 30, 46);
@@ -22,9 +20,7 @@ fn rule() {
     eprintln!("  {}", theme::fg(&"\u{2500}".repeat(52), t.overlay));
 }
 
-// ---------------------------------------------------------------------------
 // Banner
-// ---------------------------------------------------------------------------
 
 /// Print the nono banner
 pub fn print_banner(silent: bool) {
@@ -43,9 +39,7 @@ pub fn print_banner(silent: bool) {
     );
 }
 
-// ---------------------------------------------------------------------------
 // Capabilities
-// ---------------------------------------------------------------------------
 
 /// Print the capability summary
 ///
@@ -110,7 +104,7 @@ pub fn print_capabilities(caps: &CapabilitySet, verbose: u8, silent: bool) {
         }
     }
 
-    // AF_UNIX socket capabilities (issue #685 / #696)
+    // AF_UNIX socket capabilities
     let unix_caps = caps.unix_socket_capabilities();
     if !unix_caps.is_empty() {
         let (user_caps, hidden_count) = if verbose > 0 {
@@ -244,9 +238,7 @@ fn format_access_inline(access: &AccessMode) -> colored::ColoredString {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Kernel / ABI
-// ---------------------------------------------------------------------------
 
 /// Print Landlock ABI information (Linux only).
 ///
@@ -406,9 +398,7 @@ fn scope_status_color(requested: bool, enforced: bool, supported: bool, t: &them
     }
 }
 
-// ---------------------------------------------------------------------------
 // Status messages
-// ---------------------------------------------------------------------------
 
 /// Print supervised mode status
 pub fn print_supervised_info(silent: bool, rollback: bool, proxy_active: bool) {
@@ -682,9 +672,7 @@ fn dry_run_command_line(
     format_command_line(&nono::scrub_argv_with_policy(&command, redaction_policy))
 }
 
-// ---------------------------------------------------------------------------
 // Rollback / Snapshots
-// ---------------------------------------------------------------------------
 
 /// Print rollback tracking status during session start
 pub fn print_rollback_tracking(paths: &[std::path::PathBuf], silent: bool) {
@@ -749,9 +737,7 @@ pub fn print_rollback_session_summary(changes: &[nono::undo::Change], silent: bo
     );
 }
 
-// ---------------------------------------------------------------------------
 // Update notification
-// ---------------------------------------------------------------------------
 
 /// Detect how nono was installed based on the binary's path.
 fn detect_install_command() -> &'static str {
@@ -846,9 +832,7 @@ pub fn print_update_notification(info: &crate::update_check::UpdateInfo, silent:
     eprintln!();
 }
 
-// ---------------------------------------------------------------------------
 // Interactive prompts
-// ---------------------------------------------------------------------------
 
 /// Prompt the user to confirm sharing the current working directory.
 ///

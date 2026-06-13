@@ -529,49 +529,6 @@ fn extract_ref_from_subject(subject: &str) -> String {
 mod tests {
     use super::*;
 
-    // -----------------------------------------------------------------------
-    // PAE
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn pae_spec_test_vector() {
-        // From the DSSE spec
-        let result = pae("http://example.com/HelloWorld", b"hello world");
-        let expected = b"DSSEv1 29 http://example.com/HelloWorld 11 hello world";
-        assert_eq!(result, expected.to_vec());
-    }
-
-    #[test]
-    fn pae_in_toto_type() {
-        let payload = b"test payload";
-        let result = pae(IN_TOTO_PAYLOAD_TYPE, payload);
-        let expected_prefix = format!(
-            "DSSEv1 {} {} {} ",
-            IN_TOTO_PAYLOAD_TYPE.len(),
-            IN_TOTO_PAYLOAD_TYPE,
-            payload.len()
-        );
-        assert!(result.starts_with(expected_prefix.as_bytes()));
-        assert!(result.ends_with(payload));
-    }
-
-    #[test]
-    fn pae_empty_payload() {
-        let result = pae("type", b"");
-        assert_eq!(result, b"DSSEv1 4 type 0 ".to_vec());
-    }
-
-    #[test]
-    fn pae_binary_payload() {
-        let payload = vec![0x00, 0x01, 0xFF, 0xFE];
-        let result = pae("binary", &payload);
-        assert!(result.ends_with(&payload));
-    }
-
-    // -----------------------------------------------------------------------
-    // DsseEnvelope
-    // -----------------------------------------------------------------------
-
     fn sample_statement_json() -> String {
         serde_json::json!({
             "_type": IN_TOTO_STATEMENT_TYPE,
@@ -604,193 +561,237 @@ mod tests {
         .to_string()
     }
 
-    #[test]
-    fn envelope_parse_valid() {
-        let json = sample_envelope_json();
-        let envelope = DsseEnvelope::from_json(&json).unwrap();
-        assert_eq!(envelope.payload_type, IN_TOTO_PAYLOAD_TYPE);
-        assert_eq!(envelope.signatures.len(), 1);
-    }
+    mod pae {
+        use super::super::*;
 
-    #[test]
-    fn envelope_parse_invalid_json() {
-        let result = DsseEnvelope::from_json("not json");
-        assert!(result.is_err());
-    }
+        #[test]
+        fn pae_spec_test_vector() {
+            // From the DSSE spec
+            let result = pae("http://example.com/HelloWorld", b"hello world");
+            let expected = b"DSSEv1 29 http://example.com/HelloWorld 11 hello world";
+            assert_eq!(result, expected.to_vec());
+        }
 
-    #[test]
-    fn envelope_parse_empty_payload() {
-        let json = serde_json::json!({
-            "payloadType": IN_TOTO_PAYLOAD_TYPE,
-            "payload": "",
-            "signatures": [{"sig": "abc"}]
-        })
-        .to_string();
-        let result = DsseEnvelope::from_json(&json);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("empty payload"));
-    }
+        #[test]
+        fn pae_in_toto_type() {
+            let payload = b"test payload";
+            let result = pae(IN_TOTO_PAYLOAD_TYPE, payload);
+            let expected_prefix = format!(
+                "DSSEv1 {} {} {} ",
+                IN_TOTO_PAYLOAD_TYPE.len(),
+                IN_TOTO_PAYLOAD_TYPE,
+                payload.len()
+            );
+            assert!(result.starts_with(expected_prefix.as_bytes()));
+            assert!(result.ends_with(payload));
+        }
 
-    #[test]
-    fn envelope_parse_no_signatures() {
-        let json = serde_json::json!({
-            "payloadType": IN_TOTO_PAYLOAD_TYPE,
-            "payload": "dGVzdA",
-            "signatures": []
-        })
-        .to_string();
-        let result = DsseEnvelope::from_json(&json);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("no signatures"));
-    }
+        #[test]
+        fn pae_empty_payload() {
+            let result = pae("type", b"");
+            assert_eq!(result, b"DSSEv1 4 type 0 ".to_vec());
+        }
 
-    #[test]
-    fn envelope_decode_payload() {
-        let json = sample_envelope_json();
-        let envelope = DsseEnvelope::from_json(&json).unwrap();
-        let decoded = envelope.decode_payload().unwrap();
-        let decoded_str = std::str::from_utf8(&decoded).unwrap();
-        assert!(decoded_str.contains(IN_TOTO_STATEMENT_TYPE));
-    }
-
-    #[test]
-    fn envelope_extract_statement() {
-        let json = sample_envelope_json();
-        let envelope = DsseEnvelope::from_json(&json).unwrap();
-        let stmt = envelope.extract_statement().unwrap();
-        assert_eq!(stmt.statement_type, IN_TOTO_STATEMENT_TYPE);
-        assert_eq!(stmt.subject.len(), 1);
-        assert_eq!(stmt.subject[0].name, "SKILLS.md");
-    }
-
-    #[test]
-    fn envelope_extract_statement_wrong_type() {
-        let payload = base64url_encode(b"{}");
-        let json = serde_json::json!({
-            "payloadType": "text/plain",
-            "payload": payload,
-            "signatures": [{"sig": "abc"}]
-        })
-        .to_string();
-        let envelope = DsseEnvelope::from_json(&json).unwrap();
-        let result = envelope.extract_statement();
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("unexpected DSSE payloadType")
-        );
-    }
-
-    #[test]
-    fn envelope_pae_bytes() {
-        let json = sample_envelope_json();
-        let envelope = DsseEnvelope::from_json(&json).unwrap();
-        let pae_result = envelope.pae_bytes().unwrap();
-        // Should start with DSSEv1
-        assert!(pae_result.starts_with(b"DSSEv1"));
-    }
-
-    #[test]
-    fn envelope_to_json_roundtrip() {
-        let original = sample_envelope_json();
-        let envelope = DsseEnvelope::from_json(&original).unwrap();
-        let serialized = envelope.to_json().unwrap();
-        let reparsed = DsseEnvelope::from_json(&serialized).unwrap();
-        assert_eq!(reparsed.payload_type, envelope.payload_type);
-        assert_eq!(reparsed.payload, envelope.payload);
-    }
-
-    // -----------------------------------------------------------------------
-    // DsseSignature
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn signature_decode() {
-        let sig = DsseSignature {
-            keyid: String::new(),
-            sig: base64url_encode(b"signature bytes"),
-        };
-        let decoded = sig.decode_sig().unwrap();
-        assert_eq!(decoded, b"signature bytes");
-    }
-
-    // -----------------------------------------------------------------------
-    // InTotoStatement
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn statement_parse_valid() {
-        let json = sample_statement_json();
-        let stmt = InTotoStatement::from_json(&json).unwrap();
-        assert_eq!(stmt.statement_type, IN_TOTO_STATEMENT_TYPE);
-        assert_eq!(stmt.predicate_type, NONO_PREDICATE_TYPE);
-    }
-
-    #[test]
-    fn statement_wrong_type() {
-        let json = serde_json::json!({
-            "_type": "https://wrong.type/v1",
-            "subject": [{ "name": "f", "digest": { "sha256": "abc" } }],
-            "predicateType": NONO_PREDICATE_TYPE,
-            "predicate": {}
-        })
-        .to_string();
-        let result = InTotoStatement::from_json(&json);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn statement_empty_subjects() {
-        let json = serde_json::json!({
-            "_type": IN_TOTO_STATEMENT_TYPE,
-            "subject": [],
-            "predicateType": NONO_PREDICATE_TYPE,
-            "predicate": {}
-        })
-        .to_string();
-        let result = InTotoStatement::from_json(&json);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("no subjects"));
-    }
-
-    #[test]
-    fn statement_subject_missing_digest() {
-        let json = serde_json::json!({
-            "_type": IN_TOTO_STATEMENT_TYPE,
-            "subject": [{ "name": "f", "digest": {} }],
-            "predicateType": NONO_PREDICATE_TYPE,
-            "predicate": {}
-        })
-        .to_string();
-        let result = InTotoStatement::from_json(&json);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("sha256 digest"));
-    }
-
-    #[test]
-    fn statement_first_subject_accessors() {
-        let stmt = InTotoStatement::from_json(&sample_statement_json()).unwrap();
-        assert_eq!(stmt.first_subject_name(), Some("SKILLS.md"));
-        assert_eq!(stmt.first_subject_digest(), Some("abcdef1234567890"));
-    }
-
-    #[test]
-    fn statement_extract_keyed_signer() {
-        let stmt = InTotoStatement::from_json(&sample_statement_json()).unwrap();
-        let identity = stmt.extract_signer().unwrap();
-        match identity {
-            super::super::types::SignerIdentity::Keyed { key_id } => {
-                assert_eq!(key_id, "nono-keystore:default");
-            }
-            _ => panic!("expected keyed signer"),
+        #[test]
+        fn pae_binary_payload() {
+            let payload = vec![0x00, 0x01, 0xFF, 0xFE];
+            let result = pae("binary", &payload);
+            assert!(result.ends_with(&payload));
         }
     }
 
-    #[test]
-    fn statement_extract_keyless_signer() {
-        let json = serde_json::json!({
+    mod dsse_envelope {
+        use super::super::*;
+        use super::sample_envelope_json;
+
+        #[test]
+        fn envelope_parse_valid() {
+            let json = sample_envelope_json();
+            let envelope = DsseEnvelope::from_json(&json).unwrap();
+            assert_eq!(envelope.payload_type, IN_TOTO_PAYLOAD_TYPE);
+            assert_eq!(envelope.signatures.len(), 1);
+        }
+
+        #[test]
+        fn envelope_parse_invalid_json() {
+            let result = DsseEnvelope::from_json("not json");
+            assert!(result.is_err());
+        }
+
+        #[test]
+        fn envelope_parse_empty_payload() {
+            let json = serde_json::json!({
+                "payloadType": IN_TOTO_PAYLOAD_TYPE,
+                "payload": "",
+                "signatures": [{"sig": "abc"}]
+            })
+            .to_string();
+            let result = DsseEnvelope::from_json(&json);
+            assert!(result.is_err());
+            assert!(result.unwrap_err().to_string().contains("empty payload"));
+        }
+
+        #[test]
+        fn envelope_parse_no_signatures() {
+            let json = serde_json::json!({
+                "payloadType": IN_TOTO_PAYLOAD_TYPE,
+                "payload": "dGVzdA",
+                "signatures": []
+            })
+            .to_string();
+            let result = DsseEnvelope::from_json(&json);
+            assert!(result.is_err());
+            assert!(result.unwrap_err().to_string().contains("no signatures"));
+        }
+
+        #[test]
+        fn envelope_decode_payload() {
+            let json = sample_envelope_json();
+            let envelope = DsseEnvelope::from_json(&json).unwrap();
+            let decoded = envelope.decode_payload().unwrap();
+            let decoded_str = std::str::from_utf8(&decoded).unwrap();
+            assert!(decoded_str.contains(IN_TOTO_STATEMENT_TYPE));
+        }
+
+        #[test]
+        fn envelope_extract_statement() {
+            let json = sample_envelope_json();
+            let envelope = DsseEnvelope::from_json(&json).unwrap();
+            let stmt = envelope.extract_statement().unwrap();
+            assert_eq!(stmt.statement_type, IN_TOTO_STATEMENT_TYPE);
+            assert_eq!(stmt.subject.len(), 1);
+            assert_eq!(stmt.subject[0].name, "SKILLS.md");
+        }
+
+        #[test]
+        fn envelope_extract_statement_wrong_type() {
+            let payload = base64url_encode(b"{}");
+            let json = serde_json::json!({
+                "payloadType": "text/plain",
+                "payload": payload,
+                "signatures": [{"sig": "abc"}]
+            })
+            .to_string();
+            let envelope = DsseEnvelope::from_json(&json).unwrap();
+            let result = envelope.extract_statement();
+            assert!(result.is_err());
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("unexpected DSSE payloadType")
+            );
+        }
+
+        #[test]
+        fn envelope_pae_bytes() {
+            let json = sample_envelope_json();
+            let envelope = DsseEnvelope::from_json(&json).unwrap();
+            let pae_result = envelope.pae_bytes().unwrap();
+            // Should start with DSSEv1
+            assert!(pae_result.starts_with(b"DSSEv1"));
+        }
+
+        #[test]
+        fn envelope_to_json_roundtrip() {
+            let original = sample_envelope_json();
+            let envelope = DsseEnvelope::from_json(&original).unwrap();
+            let serialized = envelope.to_json().unwrap();
+            let reparsed = DsseEnvelope::from_json(&serialized).unwrap();
+            assert_eq!(reparsed.payload_type, envelope.payload_type);
+            assert_eq!(reparsed.payload, envelope.payload);
+        }
+    }
+
+    mod dsse_signature {
+        use super::super::*;
+
+        #[test]
+        fn signature_decode() {
+            let sig = DsseSignature {
+                keyid: String::new(),
+                sig: base64url_encode(b"signature bytes"),
+            };
+            let decoded = sig.decode_sig().unwrap();
+            assert_eq!(decoded, b"signature bytes");
+        }
+    }
+
+    mod in_toto_statement {
+        use super::super::*;
+        use super::sample_statement_json;
+
+        #[test]
+        fn statement_parse_valid() {
+            let json = sample_statement_json();
+            let stmt = InTotoStatement::from_json(&json).unwrap();
+            assert_eq!(stmt.statement_type, IN_TOTO_STATEMENT_TYPE);
+            assert_eq!(stmt.predicate_type, NONO_PREDICATE_TYPE);
+        }
+
+        #[test]
+        fn statement_wrong_type() {
+            let json = serde_json::json!({
+                "_type": "https://wrong.type/v1",
+                "subject": [{ "name": "f", "digest": { "sha256": "abc" } }],
+                "predicateType": NONO_PREDICATE_TYPE,
+                "predicate": {}
+            })
+            .to_string();
+            let result = InTotoStatement::from_json(&json);
+            assert!(result.is_err());
+        }
+
+        #[test]
+        fn statement_empty_subjects() {
+            let json = serde_json::json!({
+                "_type": IN_TOTO_STATEMENT_TYPE,
+                "subject": [],
+                "predicateType": NONO_PREDICATE_TYPE,
+                "predicate": {}
+            })
+            .to_string();
+            let result = InTotoStatement::from_json(&json);
+            assert!(result.is_err());
+            assert!(result.unwrap_err().to_string().contains("no subjects"));
+        }
+
+        #[test]
+        fn statement_subject_missing_digest() {
+            let json = serde_json::json!({
+                "_type": IN_TOTO_STATEMENT_TYPE,
+                "subject": [{ "name": "f", "digest": {} }],
+                "predicateType": NONO_PREDICATE_TYPE,
+                "predicate": {}
+            })
+            .to_string();
+            let result = InTotoStatement::from_json(&json);
+            assert!(result.is_err());
+            assert!(result.unwrap_err().to_string().contains("sha256 digest"));
+        }
+
+        #[test]
+        fn statement_first_subject_accessors() {
+            let stmt = InTotoStatement::from_json(&sample_statement_json()).unwrap();
+            assert_eq!(stmt.first_subject_name(), Some("SKILLS.md"));
+            assert_eq!(stmt.first_subject_digest(), Some("abcdef1234567890"));
+        }
+
+        #[test]
+        fn statement_extract_keyed_signer() {
+            let stmt = InTotoStatement::from_json(&sample_statement_json()).unwrap();
+            let identity = stmt.extract_signer().unwrap();
+            match identity {
+                super::super::super::types::SignerIdentity::Keyed { key_id } => {
+                    assert_eq!(key_id, "nono-keystore:default");
+                }
+                _ => panic!("expected keyed signer"),
+            }
+        }
+
+        #[test]
+        fn statement_extract_keyless_signer() {
+            let json = serde_json::json!({
             "_type": IN_TOTO_STATEMENT_TYPE,
             "subject": [{ "name": "SKILLS.md", "digest": { "sha256": "abc" } }],
             "predicateType": NONO_PREDICATE_TYPE,
@@ -807,32 +808,32 @@ mod tests {
             }
         })
         .to_string();
-        let stmt = InTotoStatement::from_json(&json).unwrap();
-        let identity = stmt.extract_signer().unwrap();
-        match identity {
-            super::super::types::SignerIdentity::Keyless {
-                issuer,
-                repository,
-                workflow,
-                git_ref,
-                build_signer_uri,
-            } => {
-                assert_eq!(issuer, "https://token.actions.githubusercontent.com");
-                assert_eq!(repository, "org/repo");
-                assert_eq!(workflow, ".github/workflows/sign.yml");
-                assert_eq!(git_ref, "refs/tags/v1.0.0");
-                assert_eq!(
+            let stmt = InTotoStatement::from_json(&json).unwrap();
+            let identity = stmt.extract_signer().unwrap();
+            match identity {
+                super::super::super::types::SignerIdentity::Keyless {
+                    issuer,
+                    repository,
+                    workflow,
+                    git_ref,
                     build_signer_uri,
-                    "https://github.com/org/repo/.github/workflows/sign.yml@refs/heads/main"
-                );
+                } => {
+                    assert_eq!(issuer, "https://token.actions.githubusercontent.com");
+                    assert_eq!(repository, "org/repo");
+                    assert_eq!(workflow, ".github/workflows/sign.yml");
+                    assert_eq!(git_ref, "refs/tags/v1.0.0");
+                    assert_eq!(
+                        build_signer_uri,
+                        "https://github.com/org/repo/.github/workflows/sign.yml@refs/heads/main"
+                    );
+                }
+                _ => panic!("expected keyless signer"),
             }
-            _ => panic!("expected keyless signer"),
         }
-    }
 
-    #[test]
-    fn statement_extract_keyless_gitlab_signer() {
-        let json = serde_json::json!({
+        #[test]
+        fn statement_extract_keyless_gitlab_signer() {
+            let json = serde_json::json!({
             "_type": IN_TOTO_STATEMENT_TYPE,
             "subject": [{ "name": "SKILLS.md", "digest": { "sha256": "abc" } }],
             "predicateType": NONO_PREDICATE_TYPE,
@@ -849,232 +850,233 @@ mod tests {
             }
         })
         .to_string();
-        let stmt = InTotoStatement::from_json(&json).unwrap();
-        let identity = stmt.extract_signer().unwrap();
-        match identity {
-            super::super::types::SignerIdentity::Keyless {
-                issuer,
-                repository,
-                workflow,
-                git_ref,
-                build_signer_uri,
-            } => {
-                assert_eq!(issuer, "https://gitlab.com");
-                assert_eq!(repository, "my-group/my-project");
-                assert_eq!(workflow, "gitlab.com/my-group/my-project//.gitlab-ci.yml");
-                assert_eq!(git_ref, "main");
-                assert_eq!(
+            let stmt = InTotoStatement::from_json(&json).unwrap();
+            let identity = stmt.extract_signer().unwrap();
+            match identity {
+                super::super::super::types::SignerIdentity::Keyless {
+                    issuer,
+                    repository,
+                    workflow,
+                    git_ref,
                     build_signer_uri,
-                    "gitlab.com/my-group/my-project//.gitlab-ci.yml@refs/heads/main"
-                );
+                } => {
+                    assert_eq!(issuer, "https://gitlab.com");
+                    assert_eq!(repository, "my-group/my-project");
+                    assert_eq!(workflow, "gitlab.com/my-group/my-project//.gitlab-ci.yml");
+                    assert_eq!(git_ref, "main");
+                    assert_eq!(
+                        build_signer_uri,
+                        "gitlab.com/my-group/my-project//.gitlab-ci.yml@refs/heads/main"
+                    );
+                }
+                _ => panic!("expected keyless signer"),
             }
-            _ => panic!("expected keyless signer"),
+        }
+
+        #[test]
+        fn statement_extract_signer_unknown_kind() {
+            let json = serde_json::json!({
+                "_type": IN_TOTO_STATEMENT_TYPE,
+                "subject": [{ "name": "f", "digest": { "sha256": "abc" } }],
+                "predicateType": NONO_PREDICATE_TYPE,
+                "predicate": {
+                    "signer": { "kind": "unknown" }
+                }
+            })
+            .to_string();
+            let stmt = InTotoStatement::from_json(&json).unwrap();
+            let result = stmt.extract_signer();
+            assert!(result.is_err());
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("unknown signer kind")
+            );
+        }
+
+        #[test]
+        fn statement_extract_signer_missing() {
+            let json = serde_json::json!({
+                "_type": IN_TOTO_STATEMENT_TYPE,
+                "subject": [{ "name": "f", "digest": { "sha256": "abc" } }],
+                "predicateType": NONO_PREDICATE_TYPE,
+                "predicate": {}
+            })
+            .to_string();
+            let stmt = InTotoStatement::from_json(&json).unwrap();
+            let result = stmt.extract_signer();
+            assert!(result.is_err());
         }
     }
 
-    #[test]
-    fn statement_extract_signer_unknown_kind() {
-        let json = serde_json::json!({
-            "_type": IN_TOTO_STATEMENT_TYPE,
-            "subject": [{ "name": "f", "digest": { "sha256": "abc" } }],
-            "predicateType": NONO_PREDICATE_TYPE,
-            "predicate": {
-                "signer": { "kind": "unknown" }
-            }
-        })
-        .to_string();
-        let stmt = InTotoStatement::from_json(&json).unwrap();
-        let result = stmt.extract_signer();
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("unknown signer kind")
-        );
-    }
+    mod construction_helpers {
+        use super::super::*;
 
-    #[test]
-    fn statement_extract_signer_missing() {
-        let json = serde_json::json!({
-            "_type": IN_TOTO_STATEMENT_TYPE,
-            "subject": [{ "name": "f", "digest": { "sha256": "abc" } }],
-            "predicateType": NONO_PREDICATE_TYPE,
-            "predicate": {}
-        })
-        .to_string();
-        let stmt = InTotoStatement::from_json(&json).unwrap();
-        let result = stmt.extract_signer();
-        assert!(result.is_err());
-    }
+        #[test]
+        fn new_instruction_statement_structure() {
+            let predicate = serde_json::json!({
+                "version": 1,
+                "signer": { "kind": "keyed", "key_id": "test" }
+            });
+            let stmt = new_instruction_statement("SKILLS.md", "abcdef", predicate);
+            assert_eq!(stmt.statement_type, IN_TOTO_STATEMENT_TYPE);
+            assert_eq!(stmt.predicate_type, NONO_PREDICATE_TYPE);
+            assert_eq!(stmt.subject.len(), 1);
+            assert_eq!(stmt.subject[0].name, "SKILLS.md");
+            assert_eq!(stmt.subject[0].digest["sha256"], "abcdef");
+        }
 
-    // -----------------------------------------------------------------------
-    // Construction helpers
-    // -----------------------------------------------------------------------
+        #[test]
+        fn new_envelope_creates_valid_structure() {
+            let predicate = serde_json::json!({
+                "version": 1,
+                "signer": { "kind": "keyed", "key_id": "test" }
+            });
+            let stmt = new_instruction_statement("SKILLS.md", "abcdef", predicate);
+            let envelope = new_envelope(&stmt).unwrap();
+            assert_eq!(envelope.payload_type, IN_TOTO_PAYLOAD_TYPE);
+            assert!(envelope.signatures.is_empty());
+            // Verify payload roundtrips
+            let extracted = envelope.extract_statement().unwrap();
+            assert_eq!(extracted.first_subject_name(), Some("SKILLS.md"));
+        }
 
-    #[test]
-    fn new_instruction_statement_structure() {
-        let predicate = serde_json::json!({
-            "version": 1,
-            "signer": { "kind": "keyed", "key_id": "test" }
-        });
-        let stmt = new_instruction_statement("SKILLS.md", "abcdef", predicate);
-        assert_eq!(stmt.statement_type, IN_TOTO_STATEMENT_TYPE);
-        assert_eq!(stmt.predicate_type, NONO_PREDICATE_TYPE);
-        assert_eq!(stmt.subject.len(), 1);
-        assert_eq!(stmt.subject[0].name, "SKILLS.md");
-        assert_eq!(stmt.subject[0].digest["sha256"], "abcdef");
-    }
+        #[test]
+        fn new_policy_statement_uses_policy_predicate_type() {
+            let predicate = serde_json::json!({
+                "version": 1,
+                "signer": { "kind": "keyed", "key_id": "test" }
+            });
+            let stmt = new_policy_statement("trust-policy.json", "abcdef", predicate);
+            assert_eq!(stmt.statement_type, IN_TOTO_STATEMENT_TYPE);
+            assert_eq!(stmt.predicate_type, NONO_POLICY_PREDICATE_TYPE);
+            assert_eq!(stmt.subject[0].name, "trust-policy.json");
+            assert_eq!(stmt.subject[0].digest["sha256"], "abcdef");
+        }
 
-    #[test]
-    fn new_envelope_creates_valid_structure() {
-        let predicate = serde_json::json!({
-            "version": 1,
-            "signer": { "kind": "keyed", "key_id": "test" }
-        });
-        let stmt = new_instruction_statement("SKILLS.md", "abcdef", predicate);
-        let envelope = new_envelope(&stmt).unwrap();
-        assert_eq!(envelope.payload_type, IN_TOTO_PAYLOAD_TYPE);
-        assert!(envelope.signatures.is_empty());
-        // Verify payload roundtrips
-        let extracted = envelope.extract_statement().unwrap();
-        assert_eq!(extracted.first_subject_name(), Some("SKILLS.md"));
-    }
+        #[test]
+        fn new_statement_accepts_custom_predicate_type() {
+            let predicate = serde_json::json!({"version": 1});
+            let stmt = new_statement("file.txt", "digest", predicate, "custom/type/v1");
+            assert_eq!(stmt.predicate_type, "custom/type/v1");
+            assert_eq!(stmt.subject[0].name, "file.txt");
+        }
 
-    #[test]
-    fn new_policy_statement_uses_policy_predicate_type() {
-        let predicate = serde_json::json!({
-            "version": 1,
-            "signer": { "kind": "keyed", "key_id": "test" }
-        });
-        let stmt = new_policy_statement("trust-policy.json", "abcdef", predicate);
-        assert_eq!(stmt.statement_type, IN_TOTO_STATEMENT_TYPE);
-        assert_eq!(stmt.predicate_type, NONO_POLICY_PREDICATE_TYPE);
-        assert_eq!(stmt.subject[0].name, "trust-policy.json");
-        assert_eq!(stmt.subject[0].digest["sha256"], "abcdef");
-    }
+        #[test]
+        fn instruction_and_policy_predicate_types_differ() {
+            assert_ne!(NONO_PREDICATE_TYPE, NONO_POLICY_PREDICATE_TYPE);
+        }
 
-    #[test]
-    fn new_statement_accepts_custom_predicate_type() {
-        let predicate = serde_json::json!({"version": 1});
-        let stmt = new_statement("file.txt", "digest", predicate, "custom/type/v1");
-        assert_eq!(stmt.predicate_type, "custom/type/v1");
-        assert_eq!(stmt.subject[0].name, "file.txt");
-    }
-
-    #[test]
-    fn instruction_and_policy_predicate_types_differ() {
-        assert_ne!(NONO_PREDICATE_TYPE, NONO_POLICY_PREDICATE_TYPE);
-    }
-
-    #[test]
-    fn multi_subject_predicate_type_is_unique() {
-        assert_ne!(NONO_MULTI_SUBJECT_PREDICATE_TYPE, NONO_PREDICATE_TYPE);
-        assert_ne!(
-            NONO_MULTI_SUBJECT_PREDICATE_TYPE,
-            NONO_POLICY_PREDICATE_TYPE
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // new_multi_subject_statement
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn multi_subject_statement_structure() {
-        let subjects = vec![
-            ("SKILL.md".to_string(), "aaa111".to_string()),
-            ("lib/script.py".to_string(), "bbb222".to_string()),
-        ];
-        let predicate = serde_json::json!({
-            "version": 1,
-            "signer": { "kind": "keyed", "key_id": "test" }
-        });
-        let stmt = new_multi_subject_statement(&subjects, predicate);
-
-        assert_eq!(stmt.statement_type, IN_TOTO_STATEMENT_TYPE);
-        assert_eq!(stmt.predicate_type, NONO_MULTI_SUBJECT_PREDICATE_TYPE);
-        assert_eq!(stmt.subject.len(), 2);
-        assert_eq!(stmt.subject[0].name, "SKILL.md");
-        assert_eq!(stmt.subject[0].digest["sha256"], "aaa111");
-        assert_eq!(stmt.subject[1].name, "lib/script.py");
-        assert_eq!(stmt.subject[1].digest["sha256"], "bbb222");
-    }
-
-    #[test]
-    fn multi_subject_statement_single_subject() {
-        let subjects = vec![("only.md".to_string(), "digest123".to_string())];
-        let predicate = serde_json::json!({"version": 1});
-        let stmt = new_multi_subject_statement(&subjects, predicate);
-
-        assert_eq!(stmt.subject.len(), 1);
-        assert_eq!(stmt.subject[0].name, "only.md");
-    }
-
-    #[test]
-    fn multi_subject_statement_roundtrips_through_envelope() {
-        let subjects = vec![
-            ("a.md".to_string(), "aaa".to_string()),
-            ("b.py".to_string(), "bbb".to_string()),
-            ("c.json".to_string(), "ccc".to_string()),
-        ];
-        let predicate = serde_json::json!({
-            "version": 1,
-            "signer": { "kind": "keyed", "key_id": "test" }
-        });
-        let stmt = new_multi_subject_statement(&subjects, predicate);
-        let envelope = new_envelope(&stmt).unwrap();
-        let extracted = envelope.extract_statement().unwrap();
-
-        assert_eq!(extracted.subject.len(), 3);
-        assert_eq!(extracted.predicate_type, NONO_MULTI_SUBJECT_PREDICATE_TYPE);
-        assert_eq!(extracted.subject[0].name, "a.md");
-        assert_eq!(extracted.subject[1].name, "b.py");
-        assert_eq!(extracted.subject[2].name, "c.json");
-    }
-
-    #[test]
-    fn multi_subject_statement_preserves_signer_predicate() {
-        let subjects = vec![("f.md".to_string(), "ddd".to_string())];
-        let predicate = serde_json::json!({
-            "version": 1,
-            "signer": { "kind": "keyed", "key_id": "nono-keystore:default" }
-        });
-        let stmt = new_multi_subject_statement(&subjects, predicate);
-        let identity = stmt.extract_signer().unwrap();
-        match identity {
-            super::super::types::SignerIdentity::Keyed { key_id } => {
-                assert_eq!(key_id, "nono-keystore:default");
-            }
-            _ => panic!("expected keyed signer"),
+        #[test]
+        fn multi_subject_predicate_type_is_unique() {
+            assert_ne!(NONO_MULTI_SUBJECT_PREDICATE_TYPE, NONO_PREDICATE_TYPE);
+            assert_ne!(
+                NONO_MULTI_SUBJECT_PREDICATE_TYPE,
+                NONO_POLICY_PREDICATE_TYPE
+            );
         }
     }
 
-    // -----------------------------------------------------------------------
-    // extract_ref_from_subject
-    // -----------------------------------------------------------------------
+    mod new_multi_subject_statement {
+        use super::super::*;
 
-    #[test]
-    fn extract_ref_standard_format() {
-        assert_eq!(
-            extract_ref_from_subject("repo:org/repo:ref:refs/tags/v1.0.0"),
-            "refs/tags/v1.0.0"
-        );
+        #[test]
+        fn multi_subject_statement_structure() {
+            let subjects = vec![
+                ("SKILL.md".to_string(), "aaa111".to_string()),
+                ("lib/script.py".to_string(), "bbb222".to_string()),
+            ];
+            let predicate = serde_json::json!({
+                "version": 1,
+                "signer": { "kind": "keyed", "key_id": "test" }
+            });
+            let stmt = new_multi_subject_statement(&subjects, predicate);
+
+            assert_eq!(stmt.statement_type, IN_TOTO_STATEMENT_TYPE);
+            assert_eq!(stmt.predicate_type, NONO_MULTI_SUBJECT_PREDICATE_TYPE);
+            assert_eq!(stmt.subject.len(), 2);
+            assert_eq!(stmt.subject[0].name, "SKILL.md");
+            assert_eq!(stmt.subject[0].digest["sha256"], "aaa111");
+            assert_eq!(stmt.subject[1].name, "lib/script.py");
+            assert_eq!(stmt.subject[1].digest["sha256"], "bbb222");
+        }
+
+        #[test]
+        fn multi_subject_statement_single_subject() {
+            let subjects = vec![("only.md".to_string(), "digest123".to_string())];
+            let predicate = serde_json::json!({"version": 1});
+            let stmt = new_multi_subject_statement(&subjects, predicate);
+
+            assert_eq!(stmt.subject.len(), 1);
+            assert_eq!(stmt.subject[0].name, "only.md");
+        }
+
+        #[test]
+        fn multi_subject_statement_roundtrips_through_envelope() {
+            let subjects = vec![
+                ("a.md".to_string(), "aaa".to_string()),
+                ("b.py".to_string(), "bbb".to_string()),
+                ("c.json".to_string(), "ccc".to_string()),
+            ];
+            let predicate = serde_json::json!({
+                "version": 1,
+                "signer": { "kind": "keyed", "key_id": "test" }
+            });
+            let stmt = new_multi_subject_statement(&subjects, predicate);
+            let envelope = new_envelope(&stmt).unwrap();
+            let extracted = envelope.extract_statement().unwrap();
+
+            assert_eq!(extracted.subject.len(), 3);
+            assert_eq!(extracted.predicate_type, NONO_MULTI_SUBJECT_PREDICATE_TYPE);
+            assert_eq!(extracted.subject[0].name, "a.md");
+            assert_eq!(extracted.subject[1].name, "b.py");
+            assert_eq!(extracted.subject[2].name, "c.json");
+        }
+
+        #[test]
+        fn multi_subject_statement_preserves_signer_predicate() {
+            let subjects = vec![("f.md".to_string(), "ddd".to_string())];
+            let predicate = serde_json::json!({
+                "version": 1,
+                "signer": { "kind": "keyed", "key_id": "nono-keystore:default" }
+            });
+            let stmt = new_multi_subject_statement(&subjects, predicate);
+            let identity = stmt.extract_signer().unwrap();
+            match identity {
+                super::super::super::types::SignerIdentity::Keyed { key_id } => {
+                    assert_eq!(key_id, "nono-keystore:default");
+                }
+                _ => panic!("expected keyed signer"),
+            }
+        }
     }
 
-    #[test]
-    fn extract_ref_heads() {
-        assert_eq!(
-            extract_ref_from_subject("repo:org/repo:ref:refs/heads/main"),
-            "refs/heads/main"
-        );
-    }
+    mod extract_ref_from_subject {
+        use super::super::*;
 
-    #[test]
-    fn extract_ref_fallback() {
-        assert_eq!(
-            extract_ref_from_subject("no-ref-separator"),
-            "no-ref-separator"
-        );
+        #[test]
+        fn extract_ref_standard_format() {
+            assert_eq!(
+                extract_ref_from_subject("repo:org/repo:ref:refs/tags/v1.0.0"),
+                "refs/tags/v1.0.0"
+            );
+        }
+
+        #[test]
+        fn extract_ref_heads() {
+            assert_eq!(
+                extract_ref_from_subject("repo:org/repo:ref:refs/heads/main"),
+                "refs/heads/main"
+            );
+        }
+
+        #[test]
+        fn extract_ref_fallback() {
+            assert_eq!(
+                extract_ref_from_subject("no-ref-separator"),
+                "no-ref-separator"
+            );
+        }
     }
 }

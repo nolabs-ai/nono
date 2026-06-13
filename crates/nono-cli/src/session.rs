@@ -554,8 +554,6 @@ pub fn current_process_start_epoch() -> u64 {
     get_process_start_time(std::process::id()).unwrap_or(0)
 }
 
-// --- File I/O helpers ---
-
 fn validate_session_id(session_id: &str) -> Result<()> {
     let valid = !session_id.is_empty()
         && session_id.len() <= 64

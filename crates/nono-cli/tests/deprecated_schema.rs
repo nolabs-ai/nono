@@ -46,9 +46,7 @@ fn count_warnings(stderr: &str) -> usize {
     stderr.matches("warning: deprecated key").count()
 }
 
-// ---------------------------------------------------------------------------
 // Byte-equal semantic equivalence + warning-count contract on `profile show`
-// ---------------------------------------------------------------------------
 
 #[test]
 fn legacy_all_keys_shows_byte_equal_canonical_equivalent() {
@@ -196,9 +194,7 @@ fn test_validate_strict_with_real_validation_error_returns_one_not_two() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // CLI flag deprecation
-// ---------------------------------------------------------------------------
 
 #[test]
 fn deprecated_override_deny_flag_emits_single_warning_on_stderr() {
@@ -324,9 +320,7 @@ fn help_invocation_emits_no_deprecation_warning() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // Per-fixture warning content (Critical #1 + Important I3)
-// ---------------------------------------------------------------------------
 
 /// Expected (legacy_key, canonical_key) for each single-key fixture. Drives
 /// `each_legacy_single_key_fixture_emits_exact_warning_once` so a regression
@@ -449,9 +443,7 @@ fn fixture_expectations_cover_all_single_key_files() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // Cross-section collision (Important I5; design risk #4 lines 403-405)
-// ---------------------------------------------------------------------------
 
 #[test]
 fn collision_legacy_and_canonical_groups_merge_with_warnings() {
@@ -524,9 +516,7 @@ fn collision_legacy_and_canonical_groups_merge_with_warnings() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // `nono profile diff` legacy ↔ canonical (Important I4; design line 313)
-// ---------------------------------------------------------------------------
 
 #[test]
 fn legacy_all_keys_diff_canonical_shows_no_semantic_diff() {
@@ -582,9 +572,7 @@ fn legacy_all_keys_diff_canonical_shows_no_semantic_diff() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // Empty-array semantics
-// ---------------------------------------------------------------------------
 
 #[test]
 fn empty_legacy_arrays_emit_no_warnings() {
@@ -622,9 +610,7 @@ fn empty_legacy_arrays_emit_no_warnings() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // Built-ins regression: zero deprecation warnings on load
-// ---------------------------------------------------------------------------
 
 #[test]
 fn no_builtin_profile_emits_deprecation_warning() {
@@ -713,9 +699,7 @@ fn no_qa_profile_emits_deprecation_warning() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // Extends-chain attribution
-// ---------------------------------------------------------------------------
 
 #[test]
 fn legacy_keys_in_extends_parent_emit_warnings_once_via_child() {

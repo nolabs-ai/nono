@@ -399,463 +399,467 @@ pub fn export_public_key(key_pair: &KeyPair) -> Result<DerPublicKey> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::*;
-    use crate::trust::dsse::IN_TOTO_PAYLOAD_TYPE;
-
-    // -----------------------------------------------------------------------
-    // Key generation
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn generate_signing_key_produces_valid_keypair() {
-        let kp = generate_signing_key().unwrap();
-        assert!(!kp.public_key_bytes().is_empty());
-    }
-
-    #[test]
-    fn key_id_hex_is_deterministic() {
-        let kp = generate_signing_key().unwrap();
-        let id1 = key_id_hex(&kp).unwrap();
-        let id2 = key_id_hex(&kp).unwrap();
-        assert_eq!(id1, id2);
-        // SHA-256 hex is 64 characters
-        assert_eq!(id1.len(), 64);
-    }
-
-    #[test]
-    fn key_id_hex_differs_between_keys() {
-        let kp1 = generate_signing_key().unwrap();
-        let kp2 = generate_signing_key().unwrap();
-        let id1 = key_id_hex(&kp1).unwrap();
-        let id2 = key_id_hex(&kp2).unwrap();
-        assert_ne!(id1, id2);
-    }
-
-    // -----------------------------------------------------------------------
-    // sign_bytes
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn sign_bytes_produces_valid_bundle_json() {
-        let kp = generate_signing_key().unwrap();
-        let content = b"# SKILLS.md\nHello, world!";
-        let result = sign_bytes(content, "SKILLS.md", &kp, "test-key").unwrap();
-
-        // Should be valid JSON
-        let bundle: serde_json::Value = serde_json::from_str(&result).unwrap();
-
-        // Check media type
-        assert_eq!(
-            bundle["mediaType"].as_str().unwrap(),
-            "application/vnd.dev.sigstore.bundle.v0.3+json"
-        );
-
-        // Check verification material has public key hint
-        let hint = bundle["verificationMaterial"]["publicKey"]["hint"]
-            .as_str()
-            .unwrap();
-        assert_eq!(hint.len(), 64); // SHA-256 hex
-
-        // Check DSSE envelope is present
-        assert!(bundle["dsseEnvelope"].is_object());
-        assert_eq!(
-            bundle["dsseEnvelope"]["payloadType"].as_str().unwrap(),
-            IN_TOTO_PAYLOAD_TYPE
-        );
-
-        // Check signature is present and non-empty
-        let sigs = bundle["dsseEnvelope"]["signatures"].as_array().unwrap();
-        assert_eq!(sigs.len(), 1);
-        assert!(!sigs[0]["sig"].as_str().unwrap().is_empty());
-    }
-
-    #[test]
-    fn sign_bytes_bundle_contains_correct_digest() {
-        let kp = generate_signing_key().unwrap();
-        let content = b"test content for digest verification";
-        let result = sign_bytes(content, "test.md", &kp, "test-key").unwrap();
-
-        // Parse the bundle
-        let bundle: serde_json::Value = serde_json::from_str(&result).unwrap();
-
-        // Decode the DSSE payload (base64 standard)
-        let payload_b64 = bundle["dsseEnvelope"]["payload"].as_str().unwrap();
-        let payload_bytes = base64_decode(payload_b64);
-        let statement: serde_json::Value = serde_json::from_slice(&payload_bytes).unwrap();
-
-        // Compute expected digest
-        let expected_digest = sha256(content).to_hex();
-
-        // Check statement subject digest matches
-        assert_eq!(
-            statement["subject"][0]["digest"]["sha256"]
-                .as_str()
-                .unwrap(),
-            expected_digest
-        );
-        assert_eq!(statement["subject"][0]["name"].as_str().unwrap(), "test.md");
-    }
-
-    #[test]
-    fn sign_bytes_signature_verifies() {
-        use sigstore_verify::crypto::verification::VerificationKey;
-
-        let kp = generate_signing_key().unwrap();
-        let content = b"verify me";
-        let result = sign_bytes(content, "test.md", &kp, "test-key").unwrap();
-
-        // Parse the bundle
-        let bundle: serde_json::Value = serde_json::from_str(&result).unwrap();
-
-        // Extract the signature
-        let sig_b64 = bundle["dsseEnvelope"]["signatures"][0]["sig"]
-            .as_str()
-            .unwrap();
-        let sig_bytes = SignatureBytes::from_base64(sig_b64).unwrap();
-
-        // Extract the payload and compute PAE
-        let payload_b64 = bundle["dsseEnvelope"]["payload"].as_str().unwrap();
-        let payload_bytes = base64_decode(payload_b64);
-        let pae_bytes = sigstore_verify::types::dsse::pae(IN_TOTO_PAYLOAD_TYPE, &payload_bytes);
-
-        // Verify the signature with the public key
-        let pub_key = kp.public_key_der().unwrap();
-        let vk = VerificationKey::from_spki(&pub_key, kp.default_scheme()).unwrap();
-        vk.verify(&pae_bytes, &sig_bytes).unwrap();
-    }
-
-    #[test]
-    fn sign_bytes_bundle_roundtrips_through_sigstore_bundle() {
-        let kp = generate_signing_key().unwrap();
-        let content = b"roundtrip test";
-        let json = sign_bytes(content, "test.md", &kp, "test-key").unwrap();
-
-        // Should parse as a sigstore Bundle
-        let bundle = Bundle::from_json(&json).unwrap();
-        assert_eq!(
-            bundle.media_type,
-            "application/vnd.dev.sigstore.bundle.v0.3+json"
-        );
-        assert!(matches!(
-            bundle.verification_material.content,
-            VerificationMaterialContent::PublicKey { .. }
-        ));
-        assert!(matches!(bundle.content, SignatureContent::DsseEnvelope(_)));
-    }
-
-    // -----------------------------------------------------------------------
-    // sign_instruction_file
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn sign_instruction_file_works() {
-        let dir = tempfile::tempdir().unwrap();
-        let file_path = dir.path().join("SKILLS.md");
-        std::fs::write(&file_path, "# Skills\nDo something").unwrap();
-
-        let kp = generate_signing_key().unwrap();
-        let result = sign_instruction_file(&file_path, &kp, "test-key").unwrap();
-
-        // Verify it's valid JSON with expected structure
-        let bundle: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(
-            bundle["dsseEnvelope"]["payloadType"].as_str().unwrap(),
-            IN_TOTO_PAYLOAD_TYPE
-        );
-    }
-
-    #[test]
-    fn sign_instruction_file_nonexistent_returns_error() {
-        let kp = generate_signing_key().unwrap();
-        let result = sign_instruction_file(Path::new("/nonexistent/SKILLS.md"), &kp, "key");
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.to_string().contains("Signing failed"));
-    }
-
-    // -----------------------------------------------------------------------
-    // write_bundle
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn write_bundle_creates_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let file_path = dir.path().join("SKILLS.md");
-        std::fs::write(&file_path, "content").unwrap();
-
-        let kp = generate_signing_key().unwrap();
-        let json = sign_bytes(b"content", "SKILLS.md", &kp, "test").unwrap();
-
-        write_bundle(&file_path, &json).unwrap();
-
-        let bundle_path = dir.path().join("SKILLS.md.bundle");
-        assert!(bundle_path.exists());
-
-        let written = std::fs::read_to_string(&bundle_path).unwrap();
-        assert_eq!(written, json);
-    }
-
-    // -----------------------------------------------------------------------
-    // export_public_key
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn export_public_key_produces_valid_spki() {
-        let kp = generate_signing_key().unwrap();
-        let pub_key = export_public_key(&kp).unwrap();
-        assert!(!pub_key.is_empty());
-        // SPKI-encoded P-256 key is typically 91 bytes
-        assert!(pub_key.len() > 60);
-    }
-
-    #[test]
-    fn export_public_key_to_pem() {
-        let kp = generate_signing_key().unwrap();
-        let pub_key = export_public_key(&kp).unwrap();
-        let pem = pub_key.to_pem();
-        assert!(pem.contains("-----BEGIN PUBLIC KEY-----"));
-        assert!(pem.contains("-----END PUBLIC KEY-----"));
-    }
-
-    // -----------------------------------------------------------------------
-    // sign_policy_bytes
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn sign_policy_bytes_uses_policy_predicate_type() {
-        let kp = generate_signing_key().unwrap();
-        let content = b"{\"publishers\":[]}";
-        let result = sign_policy_bytes(content, "trust-policy.json", &kp, "test-key").unwrap();
-
-        let bundle: serde_json::Value = serde_json::from_str(&result).unwrap();
-        let payload_b64 = bundle["dsseEnvelope"]["payload"].as_str().unwrap();
-        let payload_bytes = base64_decode(payload_b64);
-        let statement: serde_json::Value = serde_json::from_slice(&payload_bytes).unwrap();
-
-        assert_eq!(
-            statement["predicateType"].as_str().unwrap(),
-            dsse::NONO_POLICY_PREDICATE_TYPE
-        );
-        assert_eq!(
-            statement["subject"][0]["name"].as_str().unwrap(),
-            "trust-policy.json"
-        );
-    }
-
-    #[test]
-    fn sign_policy_bytes_differs_from_instruction_bytes() {
-        let kp = generate_signing_key().unwrap();
-        let content = b"same content";
-
-        let instruction_bundle = sign_bytes(content, "file.md", &kp, "key").unwrap();
-        let policy_bundle = sign_policy_bytes(content, "file.md", &kp, "key").unwrap();
-
-        // Bundles should differ because predicate types differ
-        let instr_val: serde_json::Value = serde_json::from_str(&instruction_bundle).unwrap();
-        let policy_val: serde_json::Value = serde_json::from_str(&policy_bundle).unwrap();
-
-        let instr_payload = base64_decode(instr_val["dsseEnvelope"]["payload"].as_str().unwrap());
-        let policy_payload = base64_decode(policy_val["dsseEnvelope"]["payload"].as_str().unwrap());
-
-        let instr_stmt: serde_json::Value = serde_json::from_slice(&instr_payload).unwrap();
-        let policy_stmt: serde_json::Value = serde_json::from_slice(&policy_payload).unwrap();
-
-        assert_ne!(
-            instr_stmt["predicateType"].as_str().unwrap(),
-            policy_stmt["predicateType"].as_str().unwrap()
-        );
-    }
-
-    #[test]
-    fn sign_policy_bytes_signature_verifies() {
-        use sigstore_verify::crypto::verification::VerificationKey;
-
-        let kp = generate_signing_key().unwrap();
-        let content = b"{\"publishers\":[],\"enforcement\":\"deny\"}";
-        let result = sign_policy_bytes(content, "trust-policy.json", &kp, "key").unwrap();
-
-        let bundle: serde_json::Value = serde_json::from_str(&result).unwrap();
-        let sig_b64 = bundle["dsseEnvelope"]["signatures"][0]["sig"]
-            .as_str()
-            .unwrap();
-        let sig_bytes = SignatureBytes::from_base64(sig_b64).unwrap();
-
-        let payload_b64 = bundle["dsseEnvelope"]["payload"].as_str().unwrap();
-        let payload_bytes = base64_decode(payload_b64);
-        let pae_bytes = sigstore_verify::types::dsse::pae(IN_TOTO_PAYLOAD_TYPE, &payload_bytes);
-
-        let pub_key = kp.public_key_der().unwrap();
-        let vk = VerificationKey::from_spki(&pub_key, kp.default_scheme()).unwrap();
-        vk.verify(&pae_bytes, &sig_bytes).unwrap();
-    }
-
-    // -----------------------------------------------------------------------
-    // sign_policy_file
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn sign_policy_file_works() {
-        let dir = tempfile::tempdir().unwrap();
-        let file_path = dir.path().join("trust-policy.json");
-        std::fs::write(&file_path, "{\"publishers\":[]}").unwrap();
-
-        let kp = generate_signing_key().unwrap();
-        let result = sign_policy_file(&file_path, &kp, "test-key").unwrap();
-
-        let bundle: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(
-            bundle["dsseEnvelope"]["payloadType"].as_str().unwrap(),
-            IN_TOTO_PAYLOAD_TYPE
-        );
-
-        let payload_b64 = bundle["dsseEnvelope"]["payload"].as_str().unwrap();
-        let payload_bytes = base64_decode(payload_b64);
-        let statement: serde_json::Value = serde_json::from_slice(&payload_bytes).unwrap();
-        assert_eq!(
-            statement["predicateType"].as_str().unwrap(),
-            dsse::NONO_POLICY_PREDICATE_TYPE
-        );
-    }
-
-    #[test]
-    fn sign_policy_file_nonexistent_returns_error() {
-        let kp = generate_signing_key().unwrap();
-        let result = sign_policy_file(Path::new("/nonexistent/trust-policy.json"), &kp, "key");
-        assert!(result.is_err());
-    }
-
-    // -----------------------------------------------------------------------
-    // sign_files (multi-subject)
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn sign_files_produces_valid_multi_subject_bundle() {
-        let kp = generate_signing_key().unwrap();
-        let files = vec![
-            (
-                std::path::PathBuf::from("SKILL.md"),
-                crate::trust::digest::bytes_digest(b"skill content"),
-            ),
-            (
-                std::path::PathBuf::from("lib/helper.py"),
-                crate::trust::digest::bytes_digest(b"helper content"),
-            ),
-        ];
-        let result = sign_files(&files, &kp, "test-key").unwrap();
-
-        let bundle: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(
-            bundle["mediaType"].as_str().unwrap(),
-            "application/vnd.dev.sigstore.bundle.v0.3+json"
-        );
-
-        let payload_b64 = bundle["dsseEnvelope"]["payload"].as_str().unwrap();
-        let payload_bytes = base64_decode(payload_b64);
-        let statement: serde_json::Value = serde_json::from_slice(&payload_bytes).unwrap();
-
-        assert_eq!(
-            statement["predicateType"].as_str().unwrap(),
-            dsse::NONO_MULTI_SUBJECT_PREDICATE_TYPE
-        );
-
-        let subjects = statement["subject"].as_array().unwrap();
-        assert_eq!(subjects.len(), 2);
-        assert_eq!(subjects[0]["name"].as_str().unwrap(), "SKILL.md");
-        assert_eq!(subjects[1]["name"].as_str().unwrap(), "lib/helper.py");
-    }
-
-    #[test]
-    fn sign_files_signature_verifies() {
-        use sigstore_verify::crypto::verification::VerificationKey;
-
-        let kp = generate_signing_key().unwrap();
-        let files = vec![
-            (
-                std::path::PathBuf::from("a.md"),
-                crate::trust::digest::bytes_digest(b"aaa"),
-            ),
-            (
-                std::path::PathBuf::from("b.py"),
-                crate::trust::digest::bytes_digest(b"bbb"),
-            ),
-        ];
-        let result = sign_files(&files, &kp, "test-key").unwrap();
-
-        let bundle: serde_json::Value = serde_json::from_str(&result).unwrap();
-        let sig_b64 = bundle["dsseEnvelope"]["signatures"][0]["sig"]
-            .as_str()
-            .unwrap();
-        let sig_bytes = SignatureBytes::from_base64(sig_b64).unwrap();
-
-        let payload_b64 = bundle["dsseEnvelope"]["payload"].as_str().unwrap();
-        let payload_bytes = base64_decode(payload_b64);
-        let pae_bytes = sigstore_verify::types::dsse::pae(IN_TOTO_PAYLOAD_TYPE, &payload_bytes);
-
-        let pub_key = kp.public_key_der().unwrap();
-        let vk = VerificationKey::from_spki(&pub_key, kp.default_scheme()).unwrap();
-        vk.verify(&pae_bytes, &sig_bytes).unwrap();
-    }
-
-    #[test]
-    fn sign_files_roundtrips_through_sigstore_bundle() {
-        let kp = generate_signing_key().unwrap();
-        let files = vec![(
-            std::path::PathBuf::from("single.md"),
-            crate::trust::digest::bytes_digest(b"content"),
-        )];
-        let json = sign_files(&files, &kp, "test-key").unwrap();
-
-        let bundle = Bundle::from_json(&json).unwrap();
-        assert_eq!(
-            bundle.media_type,
-            "application/vnd.dev.sigstore.bundle.v0.3+json"
-        );
-        assert!(matches!(bundle.content, SignatureContent::DsseEnvelope(_)));
-    }
-
-    #[test]
-    fn sign_files_rejects_too_many_files() {
-        let kp = generate_signing_key().unwrap();
-        let files: Vec<_> = (0..MAX_MULTI_SUBJECT_FILES + 1)
-            .map(|i| {
-                (
-                    std::path::PathBuf::from(format!("file{i}.md")),
-                    crate::trust::digest::bytes_digest(format!("content{i}").as_bytes()),
-                )
-            })
-            .collect();
-
-        let result = sign_files(&files, &kp, "test-key");
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("too many files"));
-        assert!(err.contains(&MAX_MULTI_SUBJECT_FILES.to_string()));
-    }
-
-    #[test]
-    fn sign_files_accepts_max_files() {
-        // This test verifies the boundary condition - exactly MAX files should succeed
-        // We use a smaller subset to keep the test fast
-        let kp = generate_signing_key().unwrap();
-        let files: Vec<_> = (0..100)
-            .map(|i| {
-                (
-                    std::path::PathBuf::from(format!("file{i}.md")),
-                    crate::trust::digest::bytes_digest(format!("content{i}").as_bytes()),
-                )
-            })
-            .collect();
-
-        let result = sign_files(&files, &kp, "test-key");
-        assert!(result.is_ok());
-    }
-
-    // -----------------------------------------------------------------------
-    // Helpers
-    // -----------------------------------------------------------------------
-
     fn base64_decode(input: &str) -> Vec<u8> {
         use sigstore_verify::types::PayloadBytes;
         PayloadBytes::from_base64(input).unwrap().into_bytes()
+    }
+
+    mod key_generation {
+        use super::super::*;
+
+        #[test]
+        fn generate_signing_key_produces_valid_keypair() {
+            let kp = generate_signing_key().unwrap();
+            assert!(!kp.public_key_bytes().is_empty());
+        }
+
+        #[test]
+        fn key_id_hex_is_deterministic() {
+            let kp = generate_signing_key().unwrap();
+            let id1 = key_id_hex(&kp).unwrap();
+            let id2 = key_id_hex(&kp).unwrap();
+            assert_eq!(id1, id2);
+            // SHA-256 hex is 64 characters
+            assert_eq!(id1.len(), 64);
+        }
+
+        #[test]
+        fn key_id_hex_differs_between_keys() {
+            let kp1 = generate_signing_key().unwrap();
+            let kp2 = generate_signing_key().unwrap();
+            let id1 = key_id_hex(&kp1).unwrap();
+            let id2 = key_id_hex(&kp2).unwrap();
+            assert_ne!(id1, id2);
+        }
+    }
+
+    mod sign_bytes {
+        use super::super::*;
+        use super::base64_decode;
+        use crate::trust::dsse::IN_TOTO_PAYLOAD_TYPE;
+
+        #[test]
+        fn sign_bytes_produces_valid_bundle_json() {
+            let kp = generate_signing_key().unwrap();
+            let content = b"# SKILLS.md\nHello, world!";
+            let result = sign_bytes(content, "SKILLS.md", &kp, "test-key").unwrap();
+
+            // Should be valid JSON
+            let bundle: serde_json::Value = serde_json::from_str(&result).unwrap();
+
+            // Check media type
+            assert_eq!(
+                bundle["mediaType"].as_str().unwrap(),
+                "application/vnd.dev.sigstore.bundle.v0.3+json"
+            );
+
+            // Check verification material has public key hint
+            let hint = bundle["verificationMaterial"]["publicKey"]["hint"]
+                .as_str()
+                .unwrap();
+            assert_eq!(hint.len(), 64); // SHA-256 hex
+
+            // Check DSSE envelope is present
+            assert!(bundle["dsseEnvelope"].is_object());
+            assert_eq!(
+                bundle["dsseEnvelope"]["payloadType"].as_str().unwrap(),
+                IN_TOTO_PAYLOAD_TYPE
+            );
+
+            // Check signature is present and non-empty
+            let sigs = bundle["dsseEnvelope"]["signatures"].as_array().unwrap();
+            assert_eq!(sigs.len(), 1);
+            assert!(!sigs[0]["sig"].as_str().unwrap().is_empty());
+        }
+
+        #[test]
+        fn sign_bytes_bundle_contains_correct_digest() {
+            let kp = generate_signing_key().unwrap();
+            let content = b"test content for digest verification";
+            let result = sign_bytes(content, "test.md", &kp, "test-key").unwrap();
+
+            // Parse the bundle
+            let bundle: serde_json::Value = serde_json::from_str(&result).unwrap();
+
+            // Decode the DSSE payload (base64 standard)
+            let payload_b64 = bundle["dsseEnvelope"]["payload"].as_str().unwrap();
+            let payload_bytes = base64_decode(payload_b64);
+            let statement: serde_json::Value = serde_json::from_slice(&payload_bytes).unwrap();
+
+            // Compute expected digest
+            let expected_digest = sha256(content).to_hex();
+
+            // Check statement subject digest matches
+            assert_eq!(
+                statement["subject"][0]["digest"]["sha256"]
+                    .as_str()
+                    .unwrap(),
+                expected_digest
+            );
+            assert_eq!(statement["subject"][0]["name"].as_str().unwrap(), "test.md");
+        }
+
+        #[test]
+        fn sign_bytes_signature_verifies() {
+            use sigstore_verify::crypto::verification::VerificationKey;
+
+            let kp = generate_signing_key().unwrap();
+            let content = b"verify me";
+            let result = sign_bytes(content, "test.md", &kp, "test-key").unwrap();
+
+            // Parse the bundle
+            let bundle: serde_json::Value = serde_json::from_str(&result).unwrap();
+
+            // Extract the signature
+            let sig_b64 = bundle["dsseEnvelope"]["signatures"][0]["sig"]
+                .as_str()
+                .unwrap();
+            let sig_bytes = SignatureBytes::from_base64(sig_b64).unwrap();
+
+            // Extract the payload and compute PAE
+            let payload_b64 = bundle["dsseEnvelope"]["payload"].as_str().unwrap();
+            let payload_bytes = base64_decode(payload_b64);
+            let pae_bytes = sigstore_verify::types::dsse::pae(IN_TOTO_PAYLOAD_TYPE, &payload_bytes);
+
+            // Verify the signature with the public key
+            let pub_key = kp.public_key_der().unwrap();
+            let vk = VerificationKey::from_spki(&pub_key, kp.default_scheme()).unwrap();
+            vk.verify(&pae_bytes, &sig_bytes).unwrap();
+        }
+
+        #[test]
+        fn sign_bytes_bundle_roundtrips_through_sigstore_bundle() {
+            let kp = generate_signing_key().unwrap();
+            let content = b"roundtrip test";
+            let json = sign_bytes(content, "test.md", &kp, "test-key").unwrap();
+
+            // Should parse as a sigstore Bundle
+            let bundle = Bundle::from_json(&json).unwrap();
+            assert_eq!(
+                bundle.media_type,
+                "application/vnd.dev.sigstore.bundle.v0.3+json"
+            );
+            assert!(matches!(
+                bundle.verification_material.content,
+                VerificationMaterialContent::PublicKey { .. }
+            ));
+            assert!(matches!(bundle.content, SignatureContent::DsseEnvelope(_)));
+        }
+    }
+
+    mod sign_instruction_file {
+        use super::super::*;
+        use crate::trust::dsse::IN_TOTO_PAYLOAD_TYPE;
+
+        #[test]
+        fn sign_instruction_file_works() {
+            let dir = tempfile::tempdir().unwrap();
+            let file_path = dir.path().join("SKILLS.md");
+            std::fs::write(&file_path, "# Skills\nDo something").unwrap();
+
+            let kp = generate_signing_key().unwrap();
+            let result = sign_instruction_file(&file_path, &kp, "test-key").unwrap();
+
+            // Verify it's valid JSON with expected structure
+            let bundle: serde_json::Value = serde_json::from_str(&result).unwrap();
+            assert_eq!(
+                bundle["dsseEnvelope"]["payloadType"].as_str().unwrap(),
+                IN_TOTO_PAYLOAD_TYPE
+            );
+        }
+
+        #[test]
+        fn sign_instruction_file_nonexistent_returns_error() {
+            let kp = generate_signing_key().unwrap();
+            let result = sign_instruction_file(Path::new("/nonexistent/SKILLS.md"), &kp, "key");
+            assert!(result.is_err());
+            let err = result.unwrap_err();
+            assert!(err.to_string().contains("Signing failed"));
+        }
+    }
+
+    mod write_bundle {
+        use super::super::*;
+
+        #[test]
+        fn write_bundle_creates_file() {
+            let dir = tempfile::tempdir().unwrap();
+            let file_path = dir.path().join("SKILLS.md");
+            std::fs::write(&file_path, "content").unwrap();
+
+            let kp = generate_signing_key().unwrap();
+            let json = sign_bytes(b"content", "SKILLS.md", &kp, "test").unwrap();
+
+            write_bundle(&file_path, &json).unwrap();
+
+            let bundle_path = dir.path().join("SKILLS.md.bundle");
+            assert!(bundle_path.exists());
+
+            let written = std::fs::read_to_string(&bundle_path).unwrap();
+            assert_eq!(written, json);
+        }
+    }
+
+    mod export_public_key {
+        use super::super::*;
+
+        #[test]
+        fn export_public_key_produces_valid_spki() {
+            let kp = generate_signing_key().unwrap();
+            let pub_key = export_public_key(&kp).unwrap();
+            assert!(!pub_key.is_empty());
+            // SPKI-encoded P-256 key is typically 91 bytes
+            assert!(pub_key.len() > 60);
+        }
+
+        #[test]
+        fn export_public_key_to_pem() {
+            let kp = generate_signing_key().unwrap();
+            let pub_key = export_public_key(&kp).unwrap();
+            let pem = pub_key.to_pem();
+            assert!(pem.contains("-----BEGIN PUBLIC KEY-----"));
+            assert!(pem.contains("-----END PUBLIC KEY-----"));
+        }
+    }
+
+    mod sign_policy_bytes {
+        use super::super::*;
+        use super::base64_decode;
+        use crate::trust::dsse::IN_TOTO_PAYLOAD_TYPE;
+
+        #[test]
+        fn sign_policy_bytes_uses_policy_predicate_type() {
+            let kp = generate_signing_key().unwrap();
+            let content = b"{\"publishers\":[]}";
+            let result = sign_policy_bytes(content, "trust-policy.json", &kp, "test-key").unwrap();
+
+            let bundle: serde_json::Value = serde_json::from_str(&result).unwrap();
+            let payload_b64 = bundle["dsseEnvelope"]["payload"].as_str().unwrap();
+            let payload_bytes = base64_decode(payload_b64);
+            let statement: serde_json::Value = serde_json::from_slice(&payload_bytes).unwrap();
+
+            assert_eq!(
+                statement["predicateType"].as_str().unwrap(),
+                dsse::NONO_POLICY_PREDICATE_TYPE
+            );
+            assert_eq!(
+                statement["subject"][0]["name"].as_str().unwrap(),
+                "trust-policy.json"
+            );
+        }
+
+        #[test]
+        fn sign_policy_bytes_differs_from_instruction_bytes() {
+            let kp = generate_signing_key().unwrap();
+            let content = b"same content";
+
+            let instruction_bundle = sign_bytes(content, "file.md", &kp, "key").unwrap();
+            let policy_bundle = sign_policy_bytes(content, "file.md", &kp, "key").unwrap();
+
+            // Bundles should differ because predicate types differ
+            let instr_val: serde_json::Value = serde_json::from_str(&instruction_bundle).unwrap();
+            let policy_val: serde_json::Value = serde_json::from_str(&policy_bundle).unwrap();
+
+            let instr_payload =
+                base64_decode(instr_val["dsseEnvelope"]["payload"].as_str().unwrap());
+            let policy_payload =
+                base64_decode(policy_val["dsseEnvelope"]["payload"].as_str().unwrap());
+
+            let instr_stmt: serde_json::Value = serde_json::from_slice(&instr_payload).unwrap();
+            let policy_stmt: serde_json::Value = serde_json::from_slice(&policy_payload).unwrap();
+
+            assert_ne!(
+                instr_stmt["predicateType"].as_str().unwrap(),
+                policy_stmt["predicateType"].as_str().unwrap()
+            );
+        }
+
+        #[test]
+        fn sign_policy_bytes_signature_verifies() {
+            use sigstore_verify::crypto::verification::VerificationKey;
+
+            let kp = generate_signing_key().unwrap();
+            let content = b"{\"publishers\":[],\"enforcement\":\"deny\"}";
+            let result = sign_policy_bytes(content, "trust-policy.json", &kp, "key").unwrap();
+
+            let bundle: serde_json::Value = serde_json::from_str(&result).unwrap();
+            let sig_b64 = bundle["dsseEnvelope"]["signatures"][0]["sig"]
+                .as_str()
+                .unwrap();
+            let sig_bytes = SignatureBytes::from_base64(sig_b64).unwrap();
+
+            let payload_b64 = bundle["dsseEnvelope"]["payload"].as_str().unwrap();
+            let payload_bytes = base64_decode(payload_b64);
+            let pae_bytes = sigstore_verify::types::dsse::pae(IN_TOTO_PAYLOAD_TYPE, &payload_bytes);
+
+            let pub_key = kp.public_key_der().unwrap();
+            let vk = VerificationKey::from_spki(&pub_key, kp.default_scheme()).unwrap();
+            vk.verify(&pae_bytes, &sig_bytes).unwrap();
+        }
+    }
+
+    mod sign_policy_file {
+        use super::super::*;
+        use super::base64_decode;
+        use crate::trust::dsse::IN_TOTO_PAYLOAD_TYPE;
+
+        #[test]
+        fn sign_policy_file_works() {
+            let dir = tempfile::tempdir().unwrap();
+            let file_path = dir.path().join("trust-policy.json");
+            std::fs::write(&file_path, "{\"publishers\":[]}").unwrap();
+
+            let kp = generate_signing_key().unwrap();
+            let result = sign_policy_file(&file_path, &kp, "test-key").unwrap();
+
+            let bundle: serde_json::Value = serde_json::from_str(&result).unwrap();
+            assert_eq!(
+                bundle["dsseEnvelope"]["payloadType"].as_str().unwrap(),
+                IN_TOTO_PAYLOAD_TYPE
+            );
+
+            let payload_b64 = bundle["dsseEnvelope"]["payload"].as_str().unwrap();
+            let payload_bytes = base64_decode(payload_b64);
+            let statement: serde_json::Value = serde_json::from_slice(&payload_bytes).unwrap();
+            assert_eq!(
+                statement["predicateType"].as_str().unwrap(),
+                dsse::NONO_POLICY_PREDICATE_TYPE
+            );
+        }
+
+        #[test]
+        fn sign_policy_file_nonexistent_returns_error() {
+            let kp = generate_signing_key().unwrap();
+            let result = sign_policy_file(Path::new("/nonexistent/trust-policy.json"), &kp, "key");
+            assert!(result.is_err());
+        }
+    }
+
+    mod sign_files {
+        use super::super::*;
+        use super::base64_decode;
+        use crate::trust::dsse::IN_TOTO_PAYLOAD_TYPE;
+
+        #[test]
+        fn sign_files_produces_valid_multi_subject_bundle() {
+            let kp = generate_signing_key().unwrap();
+            let files = vec![
+                (
+                    std::path::PathBuf::from("SKILL.md"),
+                    crate::trust::digest::bytes_digest(b"skill content"),
+                ),
+                (
+                    std::path::PathBuf::from("lib/helper.py"),
+                    crate::trust::digest::bytes_digest(b"helper content"),
+                ),
+            ];
+            let result = sign_files(&files, &kp, "test-key").unwrap();
+
+            let bundle: serde_json::Value = serde_json::from_str(&result).unwrap();
+            assert_eq!(
+                bundle["mediaType"].as_str().unwrap(),
+                "application/vnd.dev.sigstore.bundle.v0.3+json"
+            );
+
+            let payload_b64 = bundle["dsseEnvelope"]["payload"].as_str().unwrap();
+            let payload_bytes = base64_decode(payload_b64);
+            let statement: serde_json::Value = serde_json::from_slice(&payload_bytes).unwrap();
+
+            assert_eq!(
+                statement["predicateType"].as_str().unwrap(),
+                dsse::NONO_MULTI_SUBJECT_PREDICATE_TYPE
+            );
+
+            let subjects = statement["subject"].as_array().unwrap();
+            assert_eq!(subjects.len(), 2);
+            assert_eq!(subjects[0]["name"].as_str().unwrap(), "SKILL.md");
+            assert_eq!(subjects[1]["name"].as_str().unwrap(), "lib/helper.py");
+        }
+
+        #[test]
+        fn sign_files_signature_verifies() {
+            use sigstore_verify::crypto::verification::VerificationKey;
+
+            let kp = generate_signing_key().unwrap();
+            let files = vec![
+                (
+                    std::path::PathBuf::from("a.md"),
+                    crate::trust::digest::bytes_digest(b"aaa"),
+                ),
+                (
+                    std::path::PathBuf::from("b.py"),
+                    crate::trust::digest::bytes_digest(b"bbb"),
+                ),
+            ];
+            let result = sign_files(&files, &kp, "test-key").unwrap();
+
+            let bundle: serde_json::Value = serde_json::from_str(&result).unwrap();
+            let sig_b64 = bundle["dsseEnvelope"]["signatures"][0]["sig"]
+                .as_str()
+                .unwrap();
+            let sig_bytes = SignatureBytes::from_base64(sig_b64).unwrap();
+
+            let payload_b64 = bundle["dsseEnvelope"]["payload"].as_str().unwrap();
+            let payload_bytes = base64_decode(payload_b64);
+            let pae_bytes = sigstore_verify::types::dsse::pae(IN_TOTO_PAYLOAD_TYPE, &payload_bytes);
+
+            let pub_key = kp.public_key_der().unwrap();
+            let vk = VerificationKey::from_spki(&pub_key, kp.default_scheme()).unwrap();
+            vk.verify(&pae_bytes, &sig_bytes).unwrap();
+        }
+
+        #[test]
+        fn sign_files_roundtrips_through_sigstore_bundle() {
+            let kp = generate_signing_key().unwrap();
+            let files = vec![(
+                std::path::PathBuf::from("single.md"),
+                crate::trust::digest::bytes_digest(b"content"),
+            )];
+            let json = sign_files(&files, &kp, "test-key").unwrap();
+
+            let bundle = Bundle::from_json(&json).unwrap();
+            assert_eq!(
+                bundle.media_type,
+                "application/vnd.dev.sigstore.bundle.v0.3+json"
+            );
+            assert!(matches!(bundle.content, SignatureContent::DsseEnvelope(_)));
+        }
+
+        #[test]
+        fn sign_files_rejects_too_many_files() {
+            let kp = generate_signing_key().unwrap();
+            let files: Vec<_> = (0..MAX_MULTI_SUBJECT_FILES + 1)
+                .map(|i| {
+                    (
+                        std::path::PathBuf::from(format!("file{i}.md")),
+                        crate::trust::digest::bytes_digest(format!("content{i}").as_bytes()),
+                    )
+                })
+                .collect();
+
+            let result = sign_files(&files, &kp, "test-key");
+            assert!(result.is_err());
+            let err = result.unwrap_err().to_string();
+            assert!(err.contains("too many files"));
+            assert!(err.contains(&MAX_MULTI_SUBJECT_FILES.to_string()));
+        }
+
+        #[test]
+        fn sign_files_accepts_max_files() {
+            // This test verifies the boundary condition - exactly MAX files should succeed
+            // We use a smaller subset to keep the test fast
+            let kp = generate_signing_key().unwrap();
+            let files: Vec<_> = (0..100)
+                .map(|i| {
+                    (
+                        std::path::PathBuf::from(format!("file{i}.md")),
+                        crate::trust::digest::bytes_digest(format!("content{i}").as_bytes()),
+                    )
+                })
+                .collect();
+
+            let result = sign_files(&files, &kp, "test-key");
+            assert!(result.is_ok());
+        }
     }
 }

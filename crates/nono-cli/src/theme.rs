@@ -60,9 +60,7 @@ pub struct Theme {
     pub surface: Rgb,
 }
 
-// ---------------------------------------------------------------------------
 // Built-in themes
-// ---------------------------------------------------------------------------
 
 /// Catppuccin Mocha (dark) - warm and rich
 pub const MOCHA: Theme = Theme {
@@ -154,9 +152,7 @@ pub const MINIMAL: Theme = Theme {
     surface: Rgb(55, 55, 55),
 };
 
-// ---------------------------------------------------------------------------
 // Global theme state
-// ---------------------------------------------------------------------------
 
 static THEME: OnceLock<Theme> = OnceLock::new();
 

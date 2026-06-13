@@ -37,9 +37,7 @@ struct PackHintsState {
     entries: HashMap<String, PackHintEntry>,
 }
 
-// ---------------------------------------------------------------------------
 // Public entry point
-// ---------------------------------------------------------------------------
 
 /// Print update hints for every pack-provided profile in the active extends
 /// chain, reading from a 24-hour local cache.
@@ -124,9 +122,7 @@ pub fn run_refresh_helper(args: crate::cli::PackUpdateHintHelperArgs) -> crate::
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
 // Extends-chain pack collection
-// ---------------------------------------------------------------------------
 
 /// Walk the extends chain from `profile_name` and return
 /// `(pack_ref, installed_version)` for each pack-provided profile encountered.
@@ -168,9 +164,7 @@ fn collect_profile_packs(profile_name: &str) -> Vec<(String, String)> {
     result
 }
 
-// ---------------------------------------------------------------------------
 // Background refresh
-// ---------------------------------------------------------------------------
 
 fn refresh_synchronous(packs: &[(String, String)], state: &mut PackHintsState) {
     let registry_url = crate::registry_client::resolve_registry_url(None);
@@ -229,9 +223,7 @@ fn parse_refresh_helper_args(args: Vec<String>) -> Option<Vec<(String, String)>>
     }
 }
 
-// ---------------------------------------------------------------------------
 // Output
-// ---------------------------------------------------------------------------
 
 fn print_hints(hints: &[(String, String, String)]) {
     if hints.is_empty() {
@@ -251,9 +243,7 @@ fn print_hints(hints: &[(String, String, String)]) {
     eprintln!();
 }
 
-// ---------------------------------------------------------------------------
 // Cache I/O
-// ---------------------------------------------------------------------------
 
 fn state_file_path() -> Option<std::path::PathBuf> {
     crate::package::nono_config_dir()
@@ -291,9 +281,7 @@ fn save_state(state: &PackHintsState) {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Helpers
-// ---------------------------------------------------------------------------
 
 fn is_opted_out() -> bool {
     if std::env::var(NO_PACK_UPDATE_HINTS_ENV).is_ok() {

@@ -18,9 +18,7 @@ use zeroize::Zeroizing;
 #[cfg(feature = "test-trust-overrides")]
 pub(crate) const TEST_KEYSTORE_DIR_ENV: &str = "NONO_TRUST_TEST_KEYSTORE_DIR";
 
-// ---------------------------------------------------------------------------
 // TrustKeyRef — user-facing key reference
-// ---------------------------------------------------------------------------
 
 const KEYSTORE_URI_PREFIX: &str = "keystore://";
 
@@ -138,9 +136,7 @@ impl std::fmt::Display for TrustKeyRef {
     }
 }
 
-// ---------------------------------------------------------------------------
 // TrustKeyStore — internal backend dispatcher
-// ---------------------------------------------------------------------------
 
 enum TrustKeyStore {
     /// OS keyring (Keychain / Secret Service).
@@ -322,9 +318,7 @@ impl TrustKeyStore {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Helpers
-// ---------------------------------------------------------------------------
 
 #[cfg(feature = "test-trust-overrides")]
 fn directory_path(root: &Path, service: &str, account: &str) -> PathBuf {
@@ -341,9 +335,7 @@ fn hex_component(value: &str) -> String {
     encoded
 }
 
-// ---------------------------------------------------------------------------
 // Public API — used by trust_cmd.rs
-// ---------------------------------------------------------------------------
 
 /// Human-readable description of the backend for a given key reference.
 pub(crate) fn backend_description_for_ref(key_ref: &TrustKeyRef, service: &str) -> String {
@@ -376,9 +368,7 @@ pub(crate) fn load_secret(service: &str, account: &str) -> Result<Zeroizing<Stri
     TrustKeyStore::selected().load(service, account)
 }
 
-// ---------------------------------------------------------------------------
 // Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {

@@ -258,7 +258,6 @@ pub struct CustomCredentialDef {
     #[serde(default)]
     pub inject_mode: InjectMode,
 
-    // --- Header mode fields ---
     /// HTTP header to inject the credential into (default: "Authorization")
     /// Only used when inject_mode is "header".
     #[serde(default = "default_inject_header")]
@@ -271,7 +270,6 @@ pub struct CustomCredentialDef {
     #[serde(default)]
     pub credential_format: Option<String>,
 
-    // --- URL path mode fields ---
     /// Pattern to match in incoming URL path. Use {} as placeholder for phantom token.
     /// Example: "/bot{}/" matches "/bot<token>/getMe"
     /// Only used when inject_mode is "url_path".
@@ -283,7 +281,6 @@ pub struct CustomCredentialDef {
     #[serde(default)]
     pub path_replacement: Option<String>,
 
-    // --- Query param mode fields ---
     /// Name of the query parameter to add/replace with the credential.
     /// Only used when inject_mode is "query_param".
     #[serde(default)]
@@ -2329,9 +2326,7 @@ fn load_from_file(path: &Path) -> Result<Profile> {
     resolve_extends(profile, &mut Vec::new(), 0, context_dir, Some(path))
 }
 
-// ============================================================================
-// Profile inheritance (extends)
-// ============================================================================
+// Profile inheritance (`extends`)
 
 /// Maximum depth for profile inheritance chains.
 const MAX_INHERITANCE_DEPTH: usize = 10;
@@ -3834,10 +3829,6 @@ mod tests {
         assert_eq!(profile.workdir.access, WorkdirAccess::None);
     }
 
-    // ============================================================================
-    // is_http_token_char tests (RFC 7230)
-    // ============================================================================
-
     #[test]
     fn test_http_token_char_alphanumeric() {
         assert!(is_http_token_char('a'));
@@ -3865,7 +3856,6 @@ mod tests {
         assert!(!is_http_token_char('\n'));
     }
 
-    // ============================================================================
     // Custom credential validation integration tests
     //
     // These test the full validation chain including:
@@ -3873,7 +3863,6 @@ mod tests {
     // - credential_format (CRLF injection prevention)
     // - credential_key (alphanumeric + underscore)
     // - upstream URL (HTTPS required, HTTP only for loopback)
-    // ============================================================================
 
     fn header_cred_builder() -> CustomCredentialDef {
         CustomCredentialDef {
@@ -4033,10 +4022,6 @@ mod tests {
         cred.credential_key = Some("local_key".to_string());
         assert!(validate_custom_credential("local", &cred).is_ok());
     }
-
-    // ============================================================================
-    // Injection Mode Validation Tests
-    // ============================================================================
 
     #[test]
     fn test_validate_url_path_mode_valid() {
@@ -4300,10 +4285,6 @@ mod tests {
         assert!(validate_custom_credential("test", &cred).is_ok());
     }
 
-    // ============================================================================
-    // env_var validation tests
-    // ============================================================================
-
     #[test]
     fn test_validate_env_var_with_op_uri_requires_env_var() {
         // When credential_key is a URI manager ref, env_var must be set because
@@ -4417,9 +4398,7 @@ mod tests {
         assert!(validate_custom_credential("test", &cred).is_ok());
     }
 
-    // ============================================================================
     // OAuth2 auth validation tests
-    // ============================================================================
 
     fn oauth2_cred_builder() -> CustomCredentialDef {
         CustomCredentialDef {
@@ -4615,9 +4594,7 @@ mod tests {
         let profile = load_profile_from_path(&path).expect("parse profile");
         assert!(profile.commands.allow.is_empty());
     }
-    // ============================================================================
     // Profile inheritance (extends) tests
-    // ============================================================================
 
     /// Helper: build a minimal Profile for merge testing.
     fn base_profile() -> Profile {
@@ -4782,8 +4759,6 @@ mod tests {
         }
     }
 
-    // --- merge_profiles unit tests ---
-
     #[test]
     fn test_merge_profiles_appends_filesystem_paths() {
         let merged = merge_profiles(base_profile(), child_profile());
@@ -4862,9 +4837,7 @@ mod tests {
         assert_eq!(merged.meta.version, "2.0");
     }
 
-    // ============================================================================
     // session_hooks: type-level + merge semantics
-    // ============================================================================
 
     #[test]
     fn test_session_hook_deserializes() {
@@ -5198,8 +5171,6 @@ mod tests {
         );
         assert_eq!(cred.credential_key, Some("key_child".to_string()));
     }
-
-    // --- Loading pipeline tests ---
 
     #[test]
     fn test_extends_builtin_profile() {
@@ -5811,8 +5782,6 @@ mod tests {
             err
         );
     }
-
-    // --- Multiple extends tests ---
 
     #[test]
     fn test_extends_multiple_bases() {
@@ -6464,8 +6433,6 @@ mod tests {
         );
     }
 
-    // --- JSON Schema validation tests ---
-
     /// Helper: validate a JSON string against the embedded profile schema.
     fn validate_against_schema(json_str: &str) -> std::result::Result<(), String> {
         let schema_str = crate::config::embedded::embedded_profile_schema();
@@ -6629,10 +6596,6 @@ mod tests {
             );
         }
     }
-
-    // ============================================================================
-    // file:// credential key validation tests
-    // ============================================================================
 
     #[test]
     fn test_validate_custom_credential_file_uri_accepted() {

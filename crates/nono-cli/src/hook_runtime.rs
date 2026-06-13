@@ -154,8 +154,6 @@ pub(crate) fn execute_after_hook(
     Ok(())
 }
 
-// ===================== Internal Helpers =====================
-
 /// Build a `Command` configured for a hook execution.
 ///
 /// Sets `NONO_SESSION_ID` / `NONO_WORKDIR` / `NONO_HOOK_TYPE` plus the
@@ -419,8 +417,6 @@ mod tests {
         (lock, env, home)
     }
 
-    // ---- Path validation ----
-
     #[test]
     fn test_validate_script_accepts_valid_path() {
         let dir = TempDir::new().unwrap();
@@ -465,8 +461,6 @@ mod tests {
         assert!(validate_hook_script(dir.path()).is_err());
     }
 
-    // ---- Env file parsing ----
-
     #[test]
     fn test_read_env_file_basic() {
         let dir = TempDir::new().unwrap();
@@ -505,8 +499,6 @@ mod tests {
         let vars = read_env_file(&file).unwrap();
         assert_eq!(vars, vec![("KEY".into(), "value".into())]);
     }
-
-    // ---- End-to-end before-hook ----
 
     #[test]
     fn test_execute_before_hook_basic() {

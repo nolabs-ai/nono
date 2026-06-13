@@ -426,9 +426,7 @@ pub unsafe extern "C" fn nono_capability_set_summary(
     rust_string_to_c(caps.inner.summary())
 }
 
-// ---------------------------------------------------------------------------
 // Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {

@@ -13,9 +13,7 @@ use crate::policy;
 use nono::{NonoError, Result};
 use std::path::{Path, PathBuf};
 
-// ============================================================================
 // Environment variable validation
-// ============================================================================
 
 /// Validate and return the HOME environment variable.
 ///
@@ -71,10 +69,8 @@ pub fn user_state_dir() -> Option<PathBuf> {
         .map(|p| p.join("nono"))
 }
 
-// ============================================================================
 // Helper functions for main.rs compatibility
 // These provide access to embedded config data without requiring full config loading
-// ============================================================================
 
 /// Check if a command is blocked by the default dangerous commands list
 /// Returns Some(command_name) if blocked, None if allowed

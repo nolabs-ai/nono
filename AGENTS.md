@@ -62,9 +62,39 @@ make fmt             # Auto-format
 - **Memory**: Use the `zeroize` crate for sensitive data (keys/passwords) in memory.
 - **Testing**: Write unit tests for all new capability types and sandbox logic.
 - **Environment variables in tests**: Tests that modify `HOME`, `TMPDIR`, `XDG_CONFIG_HOME`, or other env vars must save and restore the original value. Rust runs unit tests in parallel within the same process, so an unrestored env var causes flaky failures in unrelated tests (e.g. `config::check_sensitive_path` fails when another test temporarily sets `HOME` to a fake path). Always use save/restore pattern and keep the modified window as short as possible.
+- **Comments**: Code should be self-explanatory. Explain *why*, not *what*. See [Comments & documentation](#comments--documentation) below.
 - **Attributes**: Apply `#[must_use]` to functions returning critical Results.
 - **Lazy use of dead code**: Avoid `#[allow(dead_code)]`. If code is unused, either remove it or write tests that use it.
 - **Commits**: All commits must include a DCO sign-off line (`Signed-off-by: Name <email>`).
+
+## Comments & documentation
+
+Follow normal Rust conventions (stdlib, rustc, clippy style): no decorative banners, no essay comments.
+
+**Doc comments (`///`, `//!`)**
+- One-line summary on public items; add a second paragraph only for non-obvious invariants, security constraints, or platform differences.
+- Module docs (`//!`): purpose and threat model when the module is a security boundary; otherwise keep brief.
+- Do not use ASCII separator lines inside doc comments.
+
+**Inline comments (`//`)**
+- Prefer clearer names over comments.
+- Use `// SAFETY: …` for unsafe blocks and other safety-critical invariants (signal handlers, FFI, TOCTOU).
+- Multi-line `//` only when the *why* is not obvious from code or types.
+- No `// ===…===`, `// ---…---`, or similar section dividers.
+
+**Tests**
+- No banner blocks or faux “chapter” headers in test modules (`// ===`, `// ---`, multi-line dividers).
+- Group related tests in nested `mod group_name { … }` submodules (same pattern as `std`/`tokio`/`hyper`).
+- Parent `mod tests` holds shared helpers; nested mods use `use super::super::*;` for the item under test and `use super::{helper, …};` for shared test helpers.
+- Repeat any parent `use` imports a nested mod needs (`use crate::…`, trait imports, etc.); nested mods do not inherit the parent’s `use` lines.
+- At most one short `// Regression: …` line inside a nested mod when the target is non-obvious.
+- Rely on descriptive `test_*` / `fn_*` names and the submodule name for navigation.
+- User-facing explanation belongs in `docs/` or rustdoc, not in test preambles.
+
+**Review checklist**
+- [ ] No decorative comment banners
+- [ ] Doc comments are proportional to API surface
+- [ ] Security rationale uses `// SAFETY:` or a tight module doc, not a multi-paragraph inline essay
 
 ## Key Design Decisions
 

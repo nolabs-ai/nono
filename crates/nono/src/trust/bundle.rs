@@ -818,152 +818,6 @@ pub fn parse_cert_info(cert_der: &[u8], bundle_path: &Path) -> Result<Certificat
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::*;
-
-    // -----------------------------------------------------------------------
-    // bundle_path_for
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn bundle_path_for_appends_extension() {
-        let path = Path::new("SKILLS.md");
-        assert_eq!(bundle_path_for(path), Path::new("SKILLS.md.bundle"));
-    }
-
-    #[test]
-    fn bundle_path_for_nested_path() {
-        let path = Path::new(".claude/commands/deploy.md");
-        assert_eq!(
-            bundle_path_for(path),
-            Path::new(".claude/commands/deploy.md.bundle")
-        );
-    }
-
-    #[test]
-    fn bundle_path_for_absolute_path() {
-        let path = Path::new("/home/user/project/CLAUDE.md");
-        assert_eq!(
-            bundle_path_for(path),
-            Path::new("/home/user/project/CLAUDE.md.bundle")
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // load_bundle_from_str
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn load_bundle_invalid_json() {
-        let result = load_bundle_from_str("not json", Path::new("test.bundle"));
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.to_string().contains("failed to parse bundle"));
-    }
-
-    #[test]
-    fn load_bundle_missing_fields() {
-        let json = r#"{"mediaType": "test"}"#;
-        let result = load_bundle_from_str(json, Path::new("test.bundle"));
-        assert!(result.is_err());
-    }
-
-    // -----------------------------------------------------------------------
-    // load_bundle from file
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn load_bundle_nonexistent_file() {
-        let result = load_bundle(Path::new("/nonexistent/path/test.bundle"));
-        assert!(result.is_err());
-    }
-
-    // -----------------------------------------------------------------------
-    // load_trusted_root
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn load_trusted_root_invalid_json() {
-        let result = load_trusted_root_from_str("not json");
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.to_string().contains("failed to parse trusted root"));
-    }
-
-    #[test]
-    fn load_trusted_root_nonexistent_file() {
-        let result = load_trusted_root(Path::new("/nonexistent/trusted_root.json"));
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn load_production_trusted_root_succeeds() {
-        let root = load_production_trusted_root();
-        assert!(root.is_ok());
-    }
-
-    // -----------------------------------------------------------------------
-    // extract_signer_identity
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn extract_identity_public_key_bundle() {
-        let json = make_public_key_bundle_json("nono-keystore:my-key");
-        let bundle = Bundle::from_json(&json).unwrap();
-        let identity = extract_signer_identity(&bundle, Path::new("test.bundle")).unwrap();
-        match identity {
-            SignerIdentity::Keyed { key_id } => {
-                assert_eq!(key_id, "nono-keystore:my-key");
-            }
-            SignerIdentity::Keyless { .. } => panic!("expected keyed identity"),
-        }
-    }
-
-    #[test]
-    fn extract_identity_empty_cert_chain() {
-        let json = make_empty_cert_chain_bundle_json();
-        let bundle = Bundle::from_json(&json).unwrap();
-        let result = extract_signer_identity(&bundle, Path::new("test.bundle"));
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.to_string().contains("empty certificate chain"));
-    }
-
-    // -----------------------------------------------------------------------
-    // verify_bundle_with_digest
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn verify_bundle_with_invalid_digest() {
-        let json = make_public_key_bundle_json("key");
-        let bundle = Bundle::from_json(&json).unwrap();
-        let root = load_production_trusted_root().unwrap();
-        let policy = VerificationPolicy::default();
-        let result =
-            verify_bundle_with_digest("not-hex!", &bundle, &root, &policy, Path::new("test"));
-        assert!(result.is_err());
-    }
-
-    // -----------------------------------------------------------------------
-    // decode_utf8_extension
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn decode_utf8_extension_raw_bytes() {
-        let value = b"https://github.com/org/repo";
-        let result = decode_utf8_extension(value);
-        assert_eq!(result, Some("https://github.com/org/repo".to_string()));
-    }
-
-    #[test]
-    fn decode_utf8_extension_invalid_utf8() {
-        let value = &[0xFF, 0xFE, 0x00];
-        let result = decode_utf8_extension(value);
-        assert!(result.is_none());
-    }
-
-    // -----------------------------------------------------------------------
-    // Helpers for constructing test bundles
-    // -----------------------------------------------------------------------
 
     fn make_public_key_bundle_json(key_hint: &str) -> String {
         format!(
@@ -989,216 +843,356 @@ mod tests {
         )
     }
 
-    // -----------------------------------------------------------------------
-    // normalize_github_uri
-    // -----------------------------------------------------------------------
+    mod bundle_path_for {
+        use super::super::*;
 
-    #[test]
-    fn normalize_github_uri_strips_prefix() {
-        assert_eq!(
-            normalize_github_uri("https://github.com/always-further/test-sk-prov"),
-            "always-further/test-sk-prov"
-        );
-    }
+        #[test]
+        fn bundle_path_for_appends_extension() {
+            let path = Path::new("SKILLS.md");
+            assert_eq!(bundle_path_for(path), Path::new("SKILLS.md.bundle"));
+        }
 
-    #[test]
-    fn normalize_github_uri_passthrough_v1() {
-        assert_eq!(
-            normalize_github_uri("always-further/test-sk-prov"),
-            "always-further/test-sk-prov"
-        );
-    }
+        #[test]
+        fn bundle_path_for_nested_path() {
+            let path = Path::new(".claude/commands/deploy.md");
+            assert_eq!(
+                bundle_path_for(path),
+                Path::new(".claude/commands/deploy.md.bundle")
+            );
+        }
 
-    #[test]
-    fn normalize_github_uri_non_github() {
-        assert_eq!(
-            normalize_github_uri("https://gitlab.com/org/repo"),
-            "https://gitlab.com/org/repo"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // normalize_workflow_uri
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn normalize_workflow_uri_full_v2() {
-        assert_eq!(
-            normalize_workflow_uri(
-                "https://github.com/always-further/test-sk-prov/.github/workflows/sign-skills.yml@refs/heads/main"
-            ),
-            ".github/workflows/sign-skills.yml"
-        );
-    }
-
-    #[test]
-    fn normalize_workflow_uri_no_ref_suffix() {
-        assert_eq!(
-            normalize_workflow_uri("https://github.com/org/repo/.github/workflows/ci.yml"),
-            ".github/workflows/ci.yml"
-        );
-    }
-
-    #[test]
-    fn normalize_workflow_uri_relative_passthrough() {
-        assert_eq!(
-            normalize_workflow_uri(".github/workflows/sign.yml"),
-            ".github/workflows/sign.yml"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // Real Fulcio cert identity extraction (always-further/test-sk-prov)
-    // -----------------------------------------------------------------------
-
-    /// Base64-encoded Fulcio certificate from a real GitHub Actions keyless
-    /// signing run on always-further/test-sk-prov (2026-02-21).
-    const REAL_FULCIO_CERT_B64: &str = "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";
-
-    #[test]
-    fn extract_identity_from_real_fulcio_cert() {
-        let cert_der = crate::trust::base64::base64_decode(REAL_FULCIO_CERT_B64).unwrap();
-
-        let identity =
-            extract_identity_from_cert(&cert_der, Path::new("SKILLS.md.bundle")).unwrap();
-
-        match identity {
-            SignerIdentity::Keyless {
-                issuer,
-                repository,
-                workflow,
-                git_ref,
-                ..
-            } => {
-                assert_eq!(
-                    issuer, "https://token.actions.githubusercontent.com",
-                    "issuer mismatch"
-                );
-                assert_eq!(
-                    repository, "always-further/test-sk-prov",
-                    "repository mismatch — should be normalized from full URI"
-                );
-                assert_eq!(
-                    workflow, ".github/workflows/sign-skills.yml",
-                    "workflow mismatch — should be normalized from full URI"
-                );
-                assert_eq!(git_ref, "refs/heads/main", "git_ref mismatch");
-            }
-            SignerIdentity::Keyed { .. } => panic!("expected keyless identity"),
+        #[test]
+        fn bundle_path_for_absolute_path() {
+            let path = Path::new("/home/user/project/CLAUDE.md");
+            assert_eq!(
+                bundle_path_for(path),
+                Path::new("/home/user/project/CLAUDE.md.bundle")
+            );
         }
     }
 
-    #[test]
-    fn real_fulcio_cert_matches_trust_policy() {
-        let cert_der = crate::trust::base64::base64_decode(REAL_FULCIO_CERT_B64).unwrap();
+    mod load_bundle_from_str {
+        use super::super::*;
 
-        let identity =
-            extract_identity_from_cert(&cert_der, Path::new("SKILLS.md.bundle")).unwrap();
+        #[test]
+        fn load_bundle_invalid_json() {
+            let result = load_bundle_from_str("not json", Path::new("test.bundle"));
+            assert!(result.is_err());
+            let err = result.unwrap_err();
+            assert!(err.to_string().contains("failed to parse bundle"));
+        }
 
-        // Simulate a trust-policy.json publisher entry
-        let publisher = crate::trust::types::Publisher {
-            name: "test-sk-prov".to_string(),
-            issuer: Some("https://token.actions.githubusercontent.com".to_string()),
-            repository: Some("always-further/test-sk-prov".to_string()),
-            workflow: Some(".github/workflows/sign-skills.yml".to_string()),
-            ref_pattern: Some("refs/heads/main".to_string()),
-            key_id: None,
-            public_key: None,
-            build_signer_uri: None,
-        };
-
-        assert!(
-            publisher.matches(&identity),
-            "publisher should match extracted identity"
-        );
+        #[test]
+        fn load_bundle_missing_fields() {
+            let json = r#"{"mediaType": "test"}"#;
+            let result = load_bundle_from_str(json, Path::new("test.bundle"));
+            assert!(result.is_err());
+        }
     }
 
-    // -----------------------------------------------------------------------
-    // multi_subject_bundle_path
-    // -----------------------------------------------------------------------
+    mod load_bundle {
+        use super::super::*;
 
-    #[test]
-    fn multi_subject_bundle_path_in_cwd() {
-        let path = multi_subject_bundle_path(Path::new("."));
-        assert_eq!(path, Path::new("./.nono-trust.bundle"));
+        #[test]
+        fn load_bundle_nonexistent_file() {
+            let result = load_bundle(Path::new("/nonexistent/path/test.bundle"));
+            assert!(result.is_err());
+        }
     }
 
-    #[test]
-    fn multi_subject_bundle_path_in_dir() {
-        let path = multi_subject_bundle_path(Path::new("/home/user/project"));
-        assert_eq!(path, Path::new("/home/user/project/.nono-trust.bundle"));
+    mod load_trusted_root {
+        use super::super::*;
+
+        #[test]
+        fn load_trusted_root_invalid_json() {
+            let result = load_trusted_root_from_str("not json");
+            assert!(result.is_err());
+            let err = result.unwrap_err();
+            assert!(err.to_string().contains("failed to parse trusted root"));
+        }
+
+        #[test]
+        fn load_trusted_root_nonexistent_file() {
+            let result = load_trusted_root(Path::new("/nonexistent/trusted_root.json"));
+            assert!(result.is_err());
+        }
+
+        #[test]
+        fn load_production_trusted_root_succeeds() {
+            let root = load_production_trusted_root();
+            assert!(root.is_ok());
+        }
     }
 
-    // -----------------------------------------------------------------------
-    // extract_all_subjects
-    // -----------------------------------------------------------------------
+    mod extract_signer_identity {
+        use super::super::*;
+        use super::make_public_key_bundle_json;
 
-    #[test]
-    fn extract_all_subjects_single() {
-        // Create a real signed bundle with one subject
-        let kp = crate::trust::signing::generate_signing_key().unwrap();
-        let json = crate::trust::signing::sign_bytes(b"content", "file.md", &kp, "key").unwrap();
-        let bundle = Bundle::from_json(&json).unwrap();
-
-        let subjects = extract_all_subjects(&bundle, Path::new("test.bundle")).unwrap();
-        assert_eq!(subjects.len(), 1);
-        assert_eq!(subjects[0].0, "file.md");
-        assert_eq!(subjects[0].1.len(), 64); // SHA-256 hex
-    }
-
-    #[test]
-    fn extract_all_subjects_multi() {
-        // Create a real signed bundle with multiple subjects
-        let kp = crate::trust::signing::generate_signing_key().unwrap();
-        let files = vec![
-            (
-                std::path::PathBuf::from("SKILL.md"),
-                crate::trust::digest::bytes_digest(b"skill"),
-            ),
-            (
-                std::path::PathBuf::from("lib/helper.py"),
-                crate::trust::digest::bytes_digest(b"helper"),
-            ),
-            (
-                std::path::PathBuf::from("config.json"),
-                crate::trust::digest::bytes_digest(b"config"),
-            ),
-        ];
-        let json = crate::trust::signing::sign_files(&files, &kp, "key").unwrap();
-        let bundle = Bundle::from_json(&json).unwrap();
-
-        let subjects = extract_all_subjects(&bundle, Path::new("test.bundle")).unwrap();
-        assert_eq!(subjects.len(), 3);
-        assert_eq!(subjects[0].0, "SKILL.md");
-        assert_eq!(subjects[1].0, "lib/helper.py");
-        assert_eq!(subjects[2].0, "config.json");
-
-        // Digests should match what we computed
-        assert_eq!(subjects[0].1, crate::trust::digest::bytes_digest(b"skill"));
-        assert_eq!(subjects[1].1, crate::trust::digest::bytes_digest(b"helper"));
-        assert_eq!(subjects[2].1, crate::trust::digest::bytes_digest(b"config"));
-    }
-
-    fn make_empty_cert_chain_bundle_json() -> String {
-        r#"{
-            "mediaType": "application/vnd.dev.sigstore.bundle+json;version=0.1",
-            "verificationMaterial": {
-                "x509CertificateChain": {
-                    "certificates": []
+        fn make_empty_cert_chain_bundle_json() -> String {
+            r#"{
+                "mediaType": "application/vnd.dev.sigstore.bundle+json;version=0.1",
+                "verificationMaterial": {
+                    "x509CertificateChain": {
+                        "certificates": []
+                    },
+                    "tlogEntries": []
                 },
-                "tlogEntries": []
-            },
-            "dsseEnvelope": {
-                "payloadType": "application/vnd.in-toto+json",
-                "payload": "e30=",
-                "signatures": [
-                    {
-                        "keyid": "",
-                        "sig": "AAAA"
-                    }
-                ]
+                "dsseEnvelope": {
+                    "payloadType": "application/vnd.in-toto+json",
+                    "payload": "e30=",
+                    "signatures": [
+                        {
+                            "keyid": "",
+                            "sig": "AAAA"
+                        }
+                    ]
+                }
+            }"#
+            .to_string()
+        }
+
+        #[test]
+        fn extract_identity_public_key_bundle() {
+            let json = make_public_key_bundle_json("nono-keystore:my-key");
+            let bundle = Bundle::from_json(&json).unwrap();
+            let identity = extract_signer_identity(&bundle, Path::new("test.bundle")).unwrap();
+            match identity {
+                SignerIdentity::Keyed { key_id } => {
+                    assert_eq!(key_id, "nono-keystore:my-key");
+                }
+                SignerIdentity::Keyless { .. } => panic!("expected keyed identity"),
             }
-        }"#
-        .to_string()
+        }
+
+        #[test]
+        fn extract_identity_empty_cert_chain() {
+            let json = make_empty_cert_chain_bundle_json();
+            let bundle = Bundle::from_json(&json).unwrap();
+            let result = extract_signer_identity(&bundle, Path::new("test.bundle"));
+            assert!(result.is_err());
+            let err = result.unwrap_err();
+            assert!(err.to_string().contains("empty certificate chain"));
+        }
+    }
+
+    mod verify_bundle_with_digest {
+        use super::super::*;
+        use super::make_public_key_bundle_json;
+
+        #[test]
+        fn verify_bundle_with_invalid_digest() {
+            let json = make_public_key_bundle_json("key");
+            let bundle = Bundle::from_json(&json).unwrap();
+            let root = load_production_trusted_root().unwrap();
+            let policy = VerificationPolicy::default();
+            let result =
+                verify_bundle_with_digest("not-hex!", &bundle, &root, &policy, Path::new("test"));
+            assert!(result.is_err());
+        }
+    }
+
+    mod decode_utf8_extension {
+        use super::super::*;
+
+        #[test]
+        fn decode_utf8_extension_raw_bytes() {
+            let value = b"https://github.com/org/repo";
+            let result = decode_utf8_extension(value);
+            assert_eq!(result, Some("https://github.com/org/repo".to_string()));
+        }
+
+        #[test]
+        fn decode_utf8_extension_invalid_utf8() {
+            let value = &[0xFF, 0xFE, 0x00];
+            let result = decode_utf8_extension(value);
+            assert!(result.is_none());
+        }
+    }
+
+    mod normalize_github_uri {
+        use super::super::*;
+
+        #[test]
+        fn normalize_github_uri_strips_prefix() {
+            assert_eq!(
+                normalize_github_uri("https://github.com/always-further/test-sk-prov"),
+                "always-further/test-sk-prov"
+            );
+        }
+
+        #[test]
+        fn normalize_github_uri_passthrough_v1() {
+            assert_eq!(
+                normalize_github_uri("always-further/test-sk-prov"),
+                "always-further/test-sk-prov"
+            );
+        }
+
+        #[test]
+        fn normalize_github_uri_non_github() {
+            assert_eq!(
+                normalize_github_uri("https://gitlab.com/org/repo"),
+                "https://gitlab.com/org/repo"
+            );
+        }
+    }
+
+    mod normalize_workflow_uri {
+        use super::super::*;
+
+        #[test]
+        fn normalize_workflow_uri_full_v2() {
+            assert_eq!(
+                normalize_workflow_uri(
+                    "https://github.com/always-further/test-sk-prov/.github/workflows/sign-skills.yml@refs/heads/main"
+                ),
+                ".github/workflows/sign-skills.yml"
+            );
+        }
+
+        #[test]
+        fn normalize_workflow_uri_no_ref_suffix() {
+            assert_eq!(
+                normalize_workflow_uri("https://github.com/org/repo/.github/workflows/ci.yml"),
+                ".github/workflows/ci.yml"
+            );
+        }
+
+        #[test]
+        fn normalize_workflow_uri_relative_passthrough() {
+            assert_eq!(
+                normalize_workflow_uri(".github/workflows/sign.yml"),
+                ".github/workflows/sign.yml"
+            );
+        }
+    }
+
+    mod real_fulcio_cert {
+        use super::super::*;
+
+        /// Base64-encoded Fulcio certificate from a real GitHub Actions keyless
+        /// signing run on always-further/test-sk-prov (2026-02-21).
+        const REAL_FULCIO_CERT_B64: &str = "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";
+
+        #[test]
+        fn extract_identity_from_real_fulcio_cert() {
+            let cert_der = crate::trust::base64::base64_decode(REAL_FULCIO_CERT_B64).unwrap();
+
+            let identity =
+                extract_identity_from_cert(&cert_der, Path::new("SKILLS.md.bundle")).unwrap();
+
+            match identity {
+                SignerIdentity::Keyless {
+                    issuer,
+                    repository,
+                    workflow,
+                    git_ref,
+                    ..
+                } => {
+                    assert_eq!(
+                        issuer, "https://token.actions.githubusercontent.com",
+                        "issuer mismatch"
+                    );
+                    assert_eq!(
+                        repository, "always-further/test-sk-prov",
+                        "repository mismatch — should be normalized from full URI"
+                    );
+                    assert_eq!(
+                        workflow, ".github/workflows/sign-skills.yml",
+                        "workflow mismatch — should be normalized from full URI"
+                    );
+                    assert_eq!(git_ref, "refs/heads/main", "git_ref mismatch");
+                }
+                SignerIdentity::Keyed { .. } => panic!("expected keyless identity"),
+            }
+        }
+
+        #[test]
+        fn real_fulcio_cert_matches_trust_policy() {
+            let cert_der = crate::trust::base64::base64_decode(REAL_FULCIO_CERT_B64).unwrap();
+
+            let identity =
+                extract_identity_from_cert(&cert_der, Path::new("SKILLS.md.bundle")).unwrap();
+
+            let publisher = crate::trust::types::Publisher {
+                name: "test-sk-prov".to_string(),
+                issuer: Some("https://token.actions.githubusercontent.com".to_string()),
+                repository: Some("always-further/test-sk-prov".to_string()),
+                workflow: Some(".github/workflows/sign-skills.yml".to_string()),
+                ref_pattern: Some("refs/heads/main".to_string()),
+                key_id: None,
+                public_key: None,
+                build_signer_uri: None,
+            };
+
+            assert!(
+                publisher.matches(&identity),
+                "publisher should match extracted identity"
+            );
+        }
+    }
+
+    mod multi_subject_bundle_path {
+        use super::super::*;
+
+        #[test]
+        fn multi_subject_bundle_path_in_cwd() {
+            let path = multi_subject_bundle_path(Path::new("."));
+            assert_eq!(path, Path::new("./.nono-trust.bundle"));
+        }
+
+        #[test]
+        fn multi_subject_bundle_path_in_dir() {
+            let path = multi_subject_bundle_path(Path::new("/home/user/project"));
+            assert_eq!(path, Path::new("/home/user/project/.nono-trust.bundle"));
+        }
+    }
+
+    mod extract_all_subjects {
+        use super::super::*;
+
+        #[test]
+        fn extract_all_subjects_single() {
+            let kp = crate::trust::signing::generate_signing_key().unwrap();
+            let json =
+                crate::trust::signing::sign_bytes(b"content", "file.md", &kp, "key").unwrap();
+            let bundle = Bundle::from_json(&json).unwrap();
+
+            let subjects = extract_all_subjects(&bundle, Path::new("test.bundle")).unwrap();
+            assert_eq!(subjects.len(), 1);
+            assert_eq!(subjects[0].0, "file.md");
+            assert_eq!(subjects[0].1.len(), 64);
+        }
+
+        #[test]
+        fn extract_all_subjects_multi() {
+            let kp = crate::trust::signing::generate_signing_key().unwrap();
+            let files = vec![
+                (
+                    std::path::PathBuf::from("SKILL.md"),
+                    crate::trust::digest::bytes_digest(b"skill"),
+                ),
+                (
+                    std::path::PathBuf::from("lib/helper.py"),
+                    crate::trust::digest::bytes_digest(b"helper"),
+                ),
+                (
+                    std::path::PathBuf::from("config.json"),
+                    crate::trust::digest::bytes_digest(b"config"),
+                ),
+            ];
+            let json = crate::trust::signing::sign_files(&files, &kp, "key").unwrap();
+            let bundle = Bundle::from_json(&json).unwrap();
+
+            let subjects = extract_all_subjects(&bundle, Path::new("test.bundle")).unwrap();
+            assert_eq!(subjects.len(), 3);
+            assert_eq!(subjects[0].0, "SKILL.md");
+            assert_eq!(subjects[1].0, "lib/helper.py");
+            assert_eq!(subjects[2].0, "config.json");
+
+            assert_eq!(subjects[0].1, crate::trust::digest::bytes_digest(b"skill"));
+            assert_eq!(subjects[1].1, crate::trust::digest::bytes_digest(b"helper"));
+            assert_eq!(subjects[2].1, crate::trust::digest::bytes_digest(b"config"));
+        }
     }
 }

@@ -13,7 +13,7 @@ fn main() {
     let out_dir = env::var("OUT_DIR").expect("OUT_DIR not set");
     let out_path = Path::new(&out_dir);
 
-    // === Embed policy JSON ===
+    // Embed policy JSON
     let policy_path = Path::new("data/policy.json");
     if policy_path.exists() {
         let content = fs::read_to_string(policy_path).expect("Failed to read policy.json");
@@ -28,7 +28,7 @@ fn main() {
         println!("cargo:rustc-env=POLICY_JSON_EMBEDDED=0");
     }
 
-    // === Embed network policy JSON ===
+    // Embed network policy JSON
     let net_policy_path = Path::new("data/network-policy.json");
     if net_policy_path.exists() {
         let content =
@@ -41,7 +41,7 @@ fn main() {
         println!("cargo:rustc-env=NETWORK_POLICY_JSON_EMBEDDED=0");
     }
 
-    // === Embed profile JSON Schema ===
+    // Embed profile JSON Schema
     let schema_path = Path::new("data/nono-profile.schema.json");
     if schema_path.exists() {
         let content = fs::read_to_string(schema_path).expect("Failed to read profile schema");
@@ -49,7 +49,7 @@ fn main() {
             .expect("Failed to write profile schema to OUT_DIR");
     }
 
-    // === Embed profile authoring guide ===
+    // Embed profile authoring guide
     let guide_path = Path::new("data/profile-authoring-guide.md");
     if guide_path.exists() {
         let content =

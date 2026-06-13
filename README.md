@@ -72,7 +72,7 @@ nono profile init opencode --extends always-further/opencode
 nono run --profile opencode -- opencode
 ```
 
-Are you an agent developer and want to publish your own agent package? We would love to have you! [See the docs](https://docs.nono.sh/docs/registry).
+Are you an agent developer and want to publish your own agent package? We would love to have you and promote your work! [See the docs](https://nono.sh/docs/cli/features/package-publishing).
 
 ## Ready to go deep?
 

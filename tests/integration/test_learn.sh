@@ -17,6 +17,12 @@ if ! is_linux; then
     exit 0
 fi
 
+if ! command_exists strace; then
+    skip_test "learn mode suite" "strace not installed"
+    print_summary
+    exit 0
+fi
+
 echo ""
 
 # =============================================================================

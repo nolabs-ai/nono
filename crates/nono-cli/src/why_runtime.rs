@@ -330,7 +330,7 @@ fn query_command_policy(
         Ok(WhyInvocationPolicyOutcome::Deny { reason }) => query_ext::QueryResult::Denied {
             reason,
             details: Some(format!(
-                "Command '{command}' from '{caller}' with argv [{}] is denied by invocation_policy. This is an ETI command/argument policy denial, not a filesystem path denial.{endpoint_note}",
+                "Command '{command}' from '{caller}' with argv [{}] is denied by invocation_policy. This is an Tool Sandbox  command/argument policy denial, not a filesystem path denial.{endpoint_note}",
                 command_args.join(" ")
             )),
             policy_source: Some(format!(

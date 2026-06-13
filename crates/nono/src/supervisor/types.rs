@@ -5,7 +5,7 @@
 //! a Unix socket, and the supervisor responds with [`ApprovalDecision`]s.
 //!
 //! [`ApprovalRequest`] is the generalised form consumed by [`crate::supervisor::ApprovalBackend`].
-//! It covers file capability, network, and ETI command-launch requests.
+//! It covers file capability, network, and Tool Sandbox  command-launch requests.
 
 use crate::capability::AccessMode;
 use serde::{Deserialize, Serialize};
@@ -37,8 +37,8 @@ pub struct CapabilityRequest {
 /// [`crate::supervisor::ApprovalBackend`].
 ///
 /// The supervisor IPC wire type [`CapabilityRequest`] maps to the
-/// [`ApprovalRequest::Capability`] variant. ETI command launch uses the
-/// [`ApprovalRequest::Command`] variant, built directly in the ETI shim
+/// [`ApprovalRequest::Capability`] variant. Tool Sandbox  command launch uses the
+/// [`ApprovalRequest::Command`] variant, built directly in the Tool Sandbox  shim
 /// handler without going over the IPC socket.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "capability_type", rename_all = "snake_case")]
@@ -98,7 +98,7 @@ pub enum ApprovalRequest {
         /// Session identifier
         session_id: String,
     },
-    /// An ETI command-launch approval request (from the `Approve` intercept action).
+    /// An Tool Sandbox  command-launch approval request (from the `Approve` intercept action).
     Command {
         /// Unique identifier for this request
         request_id: String,
@@ -106,7 +106,7 @@ pub enum ApprovalRequest {
         command: String,
         /// Full argument list including argv[0]
         args: Vec<String>,
-        /// ETI caller identity (e.g. `"session"` or a chained command name)
+        /// Tool Sandbox  caller identity (e.g. `"session"` or a chained command name)
         caller: String,
         /// The intercept rule pattern that triggered this approval
         intercept_rule: String,

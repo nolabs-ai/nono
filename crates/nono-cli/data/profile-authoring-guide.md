@@ -98,9 +98,9 @@ tool-sandbox policies live under `command_policies`. Use `commands.<name>.execut
 }
 ```
 
-#### ETI command-policy denials
+#### Tool Sandbox  command-policy denials
 
-Ephemeral tool invocation (ETI) denials are not filesystem denials. A message like:
+Tool Sandbox denials are not filesystem denials. A message like:
 
 ```text
 nono: tool-sandbox denied gh: Command 'gh' is blocked: agents may read issues but not comment on them
@@ -162,7 +162,7 @@ To allow a previously denied subcommand, remove or narrow the matching `deny` ru
 
 #### Proxy credential endpoint policy
 
-Some ETI policies intentionally use two layers:
+Some Tool Sandbox  policies intentionally use two layers:
 
 1. `invocation_policy` blocks obvious high-level CLI mutations before the child process runs.
 2. `sandbox.credentials[].endpoint_policy` blocks the underlying HTTP method and path even if the CLI uses a broad subcommand such as `gh api`.

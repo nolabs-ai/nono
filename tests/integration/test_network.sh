@@ -47,7 +47,11 @@ if command_exists ping; then
     expect_failure "ping blocked with --block-net" \
         timeout 10 "$NONO_BIN" run --block-net --allow "$TMPDIR" -- ping -c 1 -W 2 8.8.8.8
 else
-    skip_test "ping blocked" "ping not installed"
+    if is_linux; then
+        skip_test "ping blocked with --block-net" "raw ICMP is host/kernel mediated on Linux"
+    else
+        skip_test "ping blocked" "ping not installed"
+    fi
 fi
 
 if command_exists nc; then
@@ -100,8 +104,12 @@ else
 fi
 
 if command_exists wget; then
-    expect_success "wget works by default" \
-        "$NONO_BIN" run --allow "$TMPDIR" -- wget -q --timeout=10 -O "$TMPDIR/wget_output" https://example.com
+    if ! wget -q --timeout=10 -O /dev/null http://example.com >/dev/null 2>&1; then
+        skip_test "wget works by default" "host wget cannot fetch http://example.com"
+    else
+        expect_success "wget works by default" \
+            "$NONO_BIN" run --allow "$TMPDIR" -- wget -q --timeout=10 -O "$TMPDIR/wget_output" http://example.com
+    fi
 else
     skip_test "wget works by default" "wget not installed"
 fi

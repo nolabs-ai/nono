@@ -40,7 +40,7 @@ use crate::error::Result;
 /// Trait for pluggable approval backends.
 ///
 /// Implementors decide whether to grant or deny an [`ApprovalRequest`], which
-/// covers filesystem capability expansion, network access, and ETI command
+/// covers filesystem capability expansion, network access, and Tool Sandbox  command
 /// launch (the `Approve` intercept action).
 ///
 /// # Built-in implementations (in nono-cli)
@@ -82,7 +82,7 @@ pub trait ApprovalBackend: Send + Sync {
     /// Decide whether to grant or deny an approval request.
     ///
     /// The request may be a filesystem capability expansion, a network access
-    /// request, or an ETI command-launch request. This may block (e.g.,
+    /// request, or an Tool Sandbox  command-launch request. This may block (e.g.,
     /// waiting for user input or a webhook response). The supervisor should
     /// apply a timeout and treat expiry as a denial.
     ///

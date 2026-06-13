@@ -9,21 +9,21 @@ This means a single tool, such as git, kubectl, or curl, can be scoped with spec
 
 ## Mental Model
 
-An ETI profile answers three questions:
+An Tool Sandbox  profile answers three questions:
 
 | Question | Field |
 |---|---|
 | What may the outer session run directly? | `command_policies.entrypoint` |
-| What may one ETI command run next? | `commands.<caller>.can_use` plus `commands.<callee>.from.<caller>` |
+| What may one Tool Sandbox  command run next? | `commands.<caller>.can_use` plus `commands.<callee>.from.<caller>` |
 | What does the selected child command receive? | `sandbox` or `from.<caller>` grants |
 
 Each child command starts from a minimal runtime baseline. It does not inherit outer `--allow`, CWD access, broad profile groups, raw credential paths, or outer network access.
 
-When ETI is active, the outer process can execute the initial program and the ETI shims. Further tool launches should be modeled as command-policy hops. This keeps direct executable-path bypasses blocked without building a host-wide allow-list of every executable on `PATH`.
+When Tool Sandbox  is active, the outer process can execute the initial program and the Tool Sandbox  shims. Further tool launches should be modeled as command-policy hops. This keeps direct executable-path bypasses blocked without building a host-wide allow-list of every executable on `PATH`.
 
 ## Resolution And Executables
 
-By default, ETI resolves a command to the first executable found on the original `PATH`, before the shim directory is prepended. Pin a command to an exact executable when PATH order should not decide the security boundary:
+By default, Tool Sandbox  resolves a command to the first executable found on the original `PATH`, before the shim directory is prepended. Pin a command to an exact executable when PATH order should not decide the security boundary:
 
 ```json
 {
@@ -40,7 +40,7 @@ By default, ETI resolves a command to the first executable found on the original
 
 `executable` is canonicalized at startup and bound by path, inode, and digest. The command name still uses the shim, so `nono run --profile my-profile -- aws ...` reaches the pinned executable.
 
-ETI rejects executables and executable parent directories that are writable by the supervisor user, group, or world. For a Homebrew-style or otherwise writable installation root that you intentionally trust for one command, pin the command to a full absolute executable path and set `allow_writable_executable: true`:
+Tool Sandbox  rejects executables and executable parent directories that are writable by the supervisor user, group, or world. For a Homebrew-style or otherwise writable installation root that you intentionally trust for one command, pin the command to a full absolute executable path and set `allow_writable_executable: true`:
 
 ```json
 {
@@ -53,9 +53,9 @@ ETI rejects executables and executable parent directories that are writable by t
 }
 ```
 
-This is a per-command trust downgrade. It is rejected unless `executable` is set to an absolute file path; a relative path or a bare command name fails validation. It does not cover other binaries in that directory and does not change invocation: the agent still calls `demonator ...` through the ETI shim.
+This is a per-command trust downgrade. It is rejected unless `executable` is set to an absolute file path; a relative path or a bare command name fails validation. It does not cover other binaries in that directory and does not change invocation: the agent still calls `demonator ...` through the Tool Sandbox  shim.
 
-For local demos or other low-assurance profiles that intentionally run from user-writable toolchains, a profile can disable the writable-executable trust check across ETI:
+For local demos or other low-assurance profiles that intentionally run from user-writable toolchains, a profile can disable the writable-executable trust check across Tool Sandbox :
 
 ```json
 {
@@ -70,15 +70,15 @@ For local demos or other low-assurance profiles that intentionally run from user
 }
 ```
 
-This is broader than `commands.<name>.allow_writable_executable`: it also covers deny-only commands and the outer executable allow-list used by ETI, including paths writable through the sandbox's own outer capability set.
+This is broader than `commands.<name>.allow_writable_executable`: it also covers deny-only commands and the outer executable allow-list used by Tool Sandbox , including paths writable through the sandbox's own outer capability set.
 
 Linux launches the verified executable object by file descriptor. macOS verifies the pinned file before sandboxing but must still call `execve()` by path, so a writable executable or parent directory remains replaceable before launch. Avoid `allow_writable_executable` for high-assurance macOS policies.
 
-Interpreter-packaged tools, such as a Python `aws` entrypoint, are classified as shebang scripts. ETI grants the selected script, its interpreter, and the interpreter's ELF loader closure. Language package directories, virtualenvs, SDK homes, and tool-specific data are not guessed by ETI; grant those explicitly with `fs_read`, `fs_read_file`, `fs_write`, or `fs_write_file`.
+Interpreter-packaged tools, such as a Python `aws` entrypoint, are classified as shebang scripts. Tool Sandbox  grants the selected script, its interpreter, and the interpreter's ELF loader closure. Language package directories, virtualenvs, SDK homes, and tool-specific data are not guessed by Tool Sandbox ; grant those explicitly with `fs_read`, `fs_read_file`, `fs_write`, or `fs_write_file`.
 
 ## Built-In Profile
 
-The first built-in ETI profile is:
+The first built-in Tool Sandbox  profile is:
 
 ```bash
 nono run --profile linux-tool-sandbox-git-ssh -- git --version
@@ -145,7 +145,7 @@ nono run --profile eti-jq-readonly -- jq '.name' package.json
 
 ## Direct Network Tool
 
-On Linux, this profile lets the session invoke `curl` and allows raw TCP connect on port 443. Hostname filtering is not implied by port rules. macOS ETI rejects raw TCP port rules because Seatbelt cannot enforce per-port filters for these child sandboxes.
+On Linux, this profile lets the session invoke `curl` and allows raw TCP connect on port 443. Hostname filtering is not implied by port rules. macOS Tool Sandbox  rejects raw TCP port rules because Seatbelt cannot enforce per-port filters for these child sandboxes.
 
 ```json
 {
@@ -306,11 +306,11 @@ Build tools often execute helper programs. Model each helper explicitly.
 }
 ```
 
-Compilers may invoke additional helpers such as assemblers, linkers, or language-specific drivers. When a build fails with an ETI denial for a helper command, add that helper as another policy-controlled command and caller edge.
+Compilers may invoke additional helpers such as assemblers, linkers, or language-specific drivers. When a build fails with an Tool Sandbox  denial for a helper command, add that helper as another policy-controlled command and caller edge.
 
 ## Environment Controls
 
-By default, ETI preserves a small safe environment set. Override it with `environment.allow_vars`:
+By default, Tool Sandbox  preserves a small safe environment set. Override it with `environment.allow_vars`:
 
 ```json
 {
@@ -363,7 +363,7 @@ This is useful for mode selection. It is not a substitute for sandbox grants; fi
 
 ## Credentials
 
-ETI supports two credential types:
+Tool Sandbox  supports two credential types:
 
 | Type | Typical use |
 |---|---|
@@ -387,11 +387,11 @@ hostname/network enforcement on macOS:
 }
 ```
 
-If `SSH_AUTH_SOCK` is unset, a command that selects this credential fails before launch with an ETI error. Raw private-key files are not granted by the built-in profile.
+If `SSH_AUTH_SOCK` is unset, a command that selects this credential fails before launch with an Tool Sandbox  error. Raw private-key files are not granted by the built-in profile.
 
 ## Stdio Output Mediation
 
-ETI treats stdout and stderr as output capabilities. A tool that can print
+Tool Sandbox  treats stdout and stderr as output capabilities. A tool that can print
 unbounded data can exfiltrate files or credentials, or destabilize the broker
 with excessive output.
 
@@ -454,8 +454,8 @@ Policy-controlled commands are meant to be reached through shims. A direct path 
 
 Direct bypass is a compatibility escape hatch:
 
-- `tool` through `PATH` still uses ETI;
-- `/usr/bin/tool` runs with outer session capabilities, not the child ETI sandbox;
+- `tool` through `PATH` still uses Tool Sandbox ;
+- `/usr/bin/tool` runs with outer session capabilities, not the child Tool Sandbox  sandbox;
 - deny-only blocked commands are never eligible;
 - credential-using commands require `allow_direct_exec_bypass_with_credentials: true`.
 
@@ -469,13 +469,13 @@ nono profile show my-eti-profile --json
 nono run --profile my-eti-profile --dry-run -- my-command --version
 ```
 
-The repository also includes a Linux witness harness for the current ETI examples:
+The repository also includes a Linux witness harness for the current Tool Sandbox  examples:
 
 ```bash
 BIN=./target/debug/nono bash scripts/eti-witness.sh
 ```
 
-For a step-by-step human witness runbook covering ETI audit evidence and `cmd://` supervisor credential capture, see [Manual Witness Guide](/cli/development/manual-witness-guide).
+For a step-by-step human witness runbook covering Tool Sandbox  audit evidence and `cmd://` supervisor credential capture, see [Manual Witness Guide](/cli/development/manual-witness-guide).
 
 For command-control behavior:
 
@@ -495,12 +495,12 @@ nono run --profile my-eti-profile -- "$REAL" --version
 
 | Symptom | Meaning |
 |---|---|
-| `nono: ETI denied <cmd>: entrypoint missing` | The outer session invoked a policy command that is not the configured entrypoint. |
-| `nono: ETI denied <cmd>: missing_from` | A caller was allowed to invoke a callee name, but the callee has no `from.<caller>` policy. |
-| `ETI credential '<name>' is unavailable: SSH_AUTH_SOCK is unset` | The selected policy references a local-socket credential backed by `SSH_AUTH_SOCK`, but no agent socket was available at session startup. |
+| `nono: Tool Sandbox  denied <cmd>: entrypoint missing` | The outer session invoked a policy command that is not the configured entrypoint. |
+| `nono: Tool Sandbox  denied <cmd>: missing_from` | A caller was allowed to invoke a callee name, but the callee has no `from.<caller>` policy. |
+| `Tool Sandbox  credential '<name>' is unavailable: SSH_AUTH_SOCK is unset` | The selected policy references a local-socket credential backed by `SSH_AUTH_SOCK`, but no agent socket was available at session startup. |
 | `Permission denied (publickey)` | SSH reached the remote server; authentication failed outside nono. |
 | `Host key verification failed` | SSH could not verify the host from the known-hosts files the policy grants. |
-| `ETI exec failed for script ... using interpreter ...` | The command resolved to a shebang script. Grant the required interpreter, package, and runtime data paths explicitly. |
-| `ETI direct exec bypass denied` | A policy-controlled command was invoked by absolute path instead of through its shim. |
-| `Seatbelt cannot enforce raw per-port TCP rules for ETI children` | The selected ETI policy uses raw TCP port filters on macOS. Use a Linux host or a proxy-backed policy instead. |
-| `legacy_blocked_command` | A deprecated blocked-command entry was folded into ETI as deny-only command control. |
+| `Tool Sandbox  exec failed for script ... using interpreter ...` | The command resolved to a shebang script. Grant the required interpreter, package, and runtime data paths explicitly. |
+| `Tool Sandbox  direct exec bypass denied` | A policy-controlled command was invoked by absolute path instead of through its shim. |
+| `Seatbelt cannot enforce raw per-port TCP rules for Tool Sandbox  children` | The selected Tool Sandbox  policy uses raw TCP port filters on macOS. Use a Linux host or a proxy-backed policy instead. |
+| `legacy_blocked_command` | A deprecated blocked-command entry was folded into Tool Sandbox  as deny-only command control. |

@@ -57,7 +57,7 @@ impl DetectedAbi {
         AccessFs::from_all(self.abi).contains(AccessFs::Truncate)
     }
 
-    /// Whether execute access control is supported strongly enough for ETI.
+    /// Whether execute access control is supported strongly enough for Tool Sandbox Execution.
     #[must_use]
     pub fn has_execute(&self) -> bool {
         matches!(self.abi, ABI::V3 | ABI::V4 | ABI::V5 | ABI::V6)
@@ -791,7 +791,7 @@ pub fn restrict_execute(paths: &[impl AsRef<Path>]) -> Result<()> {
     let abi = detect_abi()?;
     if !abi.has_execute() {
         return Err(NonoError::SandboxInit(format!(
-            "ETI execute restriction requires Landlock ABI V3+; detected {}",
+            "Tool Sandbox  execute restriction requires Landlock ABI V3+; detected {}",
             abi.version_string()
         )));
     }
@@ -801,14 +801,14 @@ pub fn restrict_execute(paths: &[impl AsRef<Path>]) -> Result<()> {
         .handle_access(AccessFs::Execute)
         .map_err(|e| {
             NonoError::SandboxInit(format!(
-                "ETI execute restriction: kernel does not support Landlock Execute: {e}"
+                "Tool Sandbox  execute restriction: kernel does not support Landlock Execute: {e}"
             ))
         })?
         .set_compatibility(CompatLevel::BestEffort)
         .create()
         .map_err(|e| {
             NonoError::SandboxInit(format!(
-                "ETI execute restriction: ruleset create failed: {e}"
+                "Tool Sandbox  execute restriction: ruleset create failed: {e}"
             ))
         })?;
 
@@ -816,7 +816,7 @@ pub fn restrict_execute(paths: &[impl AsRef<Path>]) -> Result<()> {
         let p = path.as_ref();
         let fd = PathFd::new(p).map_err(|e| {
             NonoError::SandboxInit(format!(
-                "ETI execute restriction: cannot open {}: {e}",
+                "Tool Sandbox  execute restriction: cannot open {}: {e}",
                 p.display()
             ))
         })?;
@@ -824,7 +824,7 @@ pub fn restrict_execute(paths: &[impl AsRef<Path>]) -> Result<()> {
             .add_rule(PathBeneath::new(fd, AccessFs::Execute))
             .map_err(|e| {
                 NonoError::SandboxInit(format!(
-                    "ETI execute restriction: add_rule for {}: {e}",
+                    "Tool Sandbox  execute restriction: add_rule for {}: {e}",
                     p.display()
                 ))
             })?;
@@ -832,7 +832,7 @@ pub fn restrict_execute(paths: &[impl AsRef<Path>]) -> Result<()> {
 
     let status = ruleset.restrict_self().map_err(|e| {
         NonoError::SandboxInit(format!(
-            "ETI execute restriction: restrict_self failed: {e}"
+            "Tool Sandbox  execute restriction: restrict_self failed: {e}"
         ))
     })?;
 
@@ -845,10 +845,10 @@ fn ensure_execute_restriction_fully_enforced(status: landlock::RulesetStatus) ->
     match status {
         landlock::RulesetStatus::FullyEnforced => Ok(()),
         landlock::RulesetStatus::PartiallyEnforced => Err(NonoError::SandboxInit(
-            "ETI execute restriction: Landlock was only partially enforced".to_string(),
+            "Tool Sandbox  execute restriction: Landlock was only partially enforced".to_string(),
         )),
         landlock::RulesetStatus::NotEnforced => Err(NonoError::SandboxInit(
-            "ETI execute restriction: Landlock was not enforced".to_string(),
+            "Tool Sandbox  execute restriction: Landlock was not enforced".to_string(),
         )),
     }
 }

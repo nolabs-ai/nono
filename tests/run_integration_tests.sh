@@ -156,6 +156,7 @@ SUITES=(
     "test_client_startup.sh:Client Startup"
     "test_silent_output.sh:Silent Output"
     "test_env_sanitization.sh:Env Sanitization"
+    "test_child_tool_boundaries.sh:Child / Tool Boundaries"
     "test_exec_strategy.sh:Exec Strategy"
     "test_trust_cli.sh:Trust CLI"
     "test_audit.sh:Audit Trail"

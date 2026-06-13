@@ -115,102 +115,100 @@ fn verify_profile_packs(packs: &[String], profile: &profile::Profile) -> crate::
             continue;
         }
 
-        let locked = lockfile.packages.get(pack_ref);
-        if let Some(locked_pkg) = locked {
-            for (artifact_name, locked_artifact) in &locked_pkg.artifacts {
-                let artifact_path = install_dir.join(artifact_name);
-                if !artifact_path.exists() {
-                    return Err(nono::NonoError::PackageInstall(format!(
-                        "pack '{}' is missing artifact '{}'. Reinstall with: nono pull {} --force",
-                        pack_ref, artifact_name, pack_ref
-                    )));
-                }
-
-                let bytes = std::fs::read(&artifact_path).map_err(|e| {
-                    nono::NonoError::PackageInstall(format!(
-                        "failed to read artifact '{}' in pack '{}': {}",
-                        artifact_name, pack_ref, e
-                    ))
-                })?;
-                let digest = Sha256::digest(&bytes);
-                let hash = digest
-                    .iter()
-                    .map(|b| format!("{b:02x}"))
-                    .collect::<String>();
-                if hash != locked_artifact.sha256 {
-                    return Err(nono::NonoError::PackageInstall(format!(
-                        "pack '{}' artifact '{}' has been tampered with.\n\
-                         Expected: {}\n\
-                         Found:    {}\n\
-                         Reinstall with: nono pull {} --force",
-                        pack_ref, artifact_name, locked_artifact.sha256, hash, pack_ref
-                    )));
-                }
+        let locked_pkg = lockfile.packages.get(pack_ref).ok_or_else(|| {
+            nono::NonoError::PackageVerification {
+                package: pack_ref.clone(),
+                reason: format!(
+                    "pack '{}' has no lockfile entry - reinstall with: nono pull {} --force",
+                    pack_ref, pack_ref
+                ),
             }
-            for script_path in [&profile.session_hooks.before, &profile.session_hooks.after]
-                .into_iter()
-                .flatten()
-                .filter(|hook| {
-                    hook.source_pack
-                        .as_ref()
-                        .is_some_and(|sp| sp.key() == *pack_ref)
-                })
-                .map(|hook| hook.script.as_path())
-            {
-                let relative_path = script_path
-                    .strip_prefix(&install_dir)
-                    .map_err(|_| {
-                        nono::NonoError::PackageInstall(format!(
-                            "session_hook with path {} is not within the pack",
-                            script_path.display()
-                        ))
-                    })?
-                    .to_str()
-                    .ok_or_else(|| {
-                        nono::NonoError::PackageInstall(
-                            "Invalid script_path characters".to_string(),
-                        )
-                    })?;
-                if !locked_pkg.artifacts.contains_key(relative_path) {
-                    return Err(nono::NonoError::PackageInstall(format!(
-                        "session_hook with path {} is not a declared artifact in the pack lockfile",
+        })?;
+
+        for (artifact_name, locked_artifact) in &locked_pkg.artifacts {
+            let artifact_path = install_dir.join(artifact_name);
+            if !artifact_path.exists() {
+                return Err(nono::NonoError::PackageInstall(format!(
+                    "pack '{}' is missing artifact '{}'. Reinstall with: nono pull {} --force",
+                    pack_ref, artifact_name, pack_ref
+                )));
+            }
+
+            let bytes = std::fs::read(&artifact_path).map_err(|e| {
+                nono::NonoError::PackageInstall(format!(
+                    "failed to read artifact '{}' in pack '{}': {}",
+                    artifact_name, pack_ref, e
+                ))
+            })?;
+            let digest = Sha256::digest(&bytes);
+            let hash = digest
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>();
+            if hash != locked_artifact.sha256 {
+                return Err(nono::NonoError::PackageInstall(format!(
+                    "pack '{}' artifact '{}' has been tampered with.\n\
+                     Expected: {}\n\
+                     Found:    {}\n\
+                     Reinstall with: nono pull {} --force",
+                    pack_ref, artifact_name, locked_artifact.sha256, hash, pack_ref
+                )));
+            }
+        }
+
+        for script_path in [&profile.session_hooks.before, &profile.session_hooks.after]
+            .into_iter()
+            .flatten()
+            .filter(|hook| {
+                hook.source_pack
+                    .as_ref()
+                    .is_some_and(|sp| sp.key() == *pack_ref)
+            })
+            .map(|hook| hook.script.as_path())
+        {
+            let relative_path = script_path
+                .strip_prefix(&install_dir)
+                .map_err(|_| {
+                    nono::NonoError::PackageInstall(format!(
+                        "session_hook with path {} is not within the pack",
                         script_path.display()
-                    )));
-                }
+                    ))
+                })?
+                .to_str()
+                .ok_or_else(|| {
+                    nono::NonoError::PackageInstall("Invalid script_path characters".to_string())
+                })?;
+            if !locked_pkg.artifacts.contains_key(relative_path) {
+                return Err(nono::NonoError::PackageInstall(format!(
+                    "session_hook with path {} is not a declared artifact in the pack lockfile",
+                    script_path.display()
+                )));
             }
         }
 
         let bundle_path = install_dir.join(".nono-trust.bundle");
-        if bundle_path.exists() {
-            // A trust bundle without a lockfile provenance record means we
-            // cannot verify who signed it. Fail hard rather than silently
-            // accepting any valid Sigstore signer.
-            let pinned_signer = match locked {
-                None => {
-                    return Err(nono::NonoError::PackageVerification {
-                        package: pack_ref.clone(),
-                        reason: format!(
-                            "pack '{}' has a trust bundle but no lockfile entry — \
-                             reinstall with: nono pull {} --force",
-                            pack_ref, pack_ref
-                        ),
-                    });
-                }
-                Some(pkg) => pkg
-                    .provenance
-                    .as_ref()
-                    .map(|p| p.signer_identity.as_str())
-                    .ok_or_else(|| nono::NonoError::PackageVerification {
-                        package: pack_ref.clone(),
-                        reason: format!(
-                            "pack '{}' has a trust bundle but no signer identity in the \
-                             lockfile — reinstall with: nono pull {} --force",
-                            pack_ref, pack_ref
-                        ),
-                    })?,
-            };
-            verify_stored_bundles(&install_dir, &bundle_path, pack_ref, Some(pinned_signer))?;
+        if !bundle_path.exists() {
+            return Err(nono::NonoError::PackageVerification {
+                package: pack_ref.clone(),
+                reason: format!(
+                    "pack '{}' is missing .nono-trust.bundle - reinstall with: nono pull {} --force",
+                    pack_ref, pack_ref
+                ),
+            });
         }
+
+        let pinned_signer = locked_pkg
+            .provenance
+            .as_ref()
+            .map(|p| p.signer_identity.as_str())
+            .ok_or_else(|| nono::NonoError::PackageVerification {
+                package: pack_ref.clone(),
+                reason: format!(
+                    "pack '{}' has no signer identity in the lockfile - reinstall with: nono pull {} --force",
+                    pack_ref, pack_ref
+                ),
+            })?;
+        verify_stored_bundles(&install_dir, &bundle_path, pack_ref, Some(pinned_signer))?;
     }
 
     Ok(())

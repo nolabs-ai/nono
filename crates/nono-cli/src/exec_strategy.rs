@@ -625,7 +625,7 @@ pub fn execute_supervised(
                             env_c.push(cstr);
                         }
                         // Respect any PATH already built for the child, including
-                        // ETI and profile environment filtering.
+                        // Tool Sandbox  and profile environment filtering.
                         let current_path = env_c
                             .iter()
                             .find_map(|entry| {

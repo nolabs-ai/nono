@@ -78,7 +78,7 @@ Exit the shell with `Ctrl-D` or `exit`.
 
 ## Checking Policy Access (`nono why`)
 
-The `why` command checks if a filesystem path, network operation, kernel scope, or ETI command invocation would be allowed or denied. It's designed for both human debugging and programmatic use by AI agents.
+The `why` command checks if a filesystem path, network operation, kernel scope, or Tool Sandbox  command invocation would be allowed or denied. It's designed for both human debugging and programmatic use by AI agents.
 
 ```bash
 # Check if a sensitive path would be blocked
@@ -93,7 +93,7 @@ nono why --path ./src --op write --allow .
 nono why --json --path ~/.aws --op read
 # {"status":"denied","reason":"sensitive_path","category":"AWS credentials",...}
 
-# Check an ETI command/argv policy denial
+# Check an Tool Sandbox  command/argv policy denial
 nono why --profile gh --command gh -- issue comment 1052
 # Output: DENIED - agents may read issues but not comment on them
 

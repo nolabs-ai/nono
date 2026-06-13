@@ -26,20 +26,23 @@ AUDIT_ROOT="${XDG_STATE_HOME:-$HOME/.local/state}/nono/audit"
 ROLLBACK_ROOT="${XDG_STATE_HOME:-$HOME/.local/state}/nono/rollbacks"
 mkdir -p "$AUDIT_ROOT" "$ROLLBACK_ROOT"
 
-# Helper: find the session.json for a specific nono PID.
-# Session dirs are named YYYYMMDD-HHMMSS-PID so we can grep for the PID suffix.
-find_audit_session_for_pid() {
-    local pid="$1"
+# Helper: find the session.json for a unique command marker. Session IDs may be
+# either legacy YYYYMMDD-HHMMSS-PID values or random hex IDs, so do not infer the
+# session from the launcher PID.
+find_session_for_marker() {
+    local root="$1"
+    local marker="$2"
     local match=""
-    match=$(grep -rl "\"session_id\": \"[^\"]*-${pid}\"" "$AUDIT_ROOT" --include='session.json' 2>/dev/null | head -1) || true
+    match=$(grep -rl "$marker" "$root" --include='session.json' 2>/dev/null | head -1) || true
     echo "$match"
 }
 
-find_rollback_session_for_pid() {
-    local pid="$1"
-    local match=""
-    match=$(grep -rl "\"session_id\": \"[^\"]*-${pid}\"" "$ROLLBACK_ROOT" --include='session.json' 2>/dev/null | head -1) || true
-    echo "$match"
+find_audit_session_for_marker() {
+    find_session_for_marker "$AUDIT_ROOT" "$1"
+}
+
+find_rollback_session_for_marker() {
+    find_session_for_marker "$ROLLBACK_ROOT" "$1"
 }
 
 # Helper: run nono and return its PID (waits for completion)
@@ -57,6 +60,8 @@ echo "Audit root: $AUDIT_ROOT"
 echo "Rollback root: $ROLLBACK_ROOT"
 echo ""
 
+AUDIT_MARKER_PREFIX="audit_it_$$_"
+
 # =============================================================================
 # Default execution creates audit sessions (#269)
 # =============================================================================
@@ -65,40 +70,43 @@ echo "--- Default Audit (Session Created) ---"
 
 # Test 1: Plain run creates an audit session by default
 TESTS_RUN=$((TESTS_RUN + 1))
-run_nono run --silent --allow-cwd --allow "$TMPDIR" -- echo "audit test"
-session_file=$(find_audit_session_for_pid "$LAST_NONO_PID")
+marker="${AUDIT_MARKER_PREFIX}plain"
+run_nono run --silent --allow-cwd --allow "$TMPDIR" -- echo "$marker"
+session_file=$(find_audit_session_for_marker "$marker")
 if [[ -n "$session_file" && -f "$session_file" ]]; then
     echo -e "  ${GREEN}PASS${NC}: plain run creates audit session"
     TESTS_PASSED=$((TESTS_PASSED + 1))
 else
     echo -e "  ${RED}FAIL${NC}: plain run creates audit session"
-    echo "       PID: $LAST_NONO_PID, session_file: ${session_file:-not found}"
+    echo "       marker: $marker, session_file: ${session_file:-not found}"
     TESTS_FAILED=$((TESTS_FAILED + 1))
 fi
 
 # Test 2: Read-only run creates an audit session
 TESTS_RUN=$((TESTS_RUN + 1))
-run_nono run --silent --allow-cwd --read "$TMPDIR" -- echo "readonly audit"
-session_file=$(find_audit_session_for_pid "$LAST_NONO_PID")
+marker="${AUDIT_MARKER_PREFIX}readonly"
+run_nono run --silent --allow-cwd --read "$TMPDIR" -- echo "$marker"
+session_file=$(find_audit_session_for_marker "$marker")
 if [[ -n "$session_file" && -f "$session_file" ]]; then
     echo -e "  ${GREEN}PASS${NC}: read-only run creates audit session"
     TESTS_PASSED=$((TESTS_PASSED + 1))
 else
     echo -e "  ${RED}FAIL${NC}: read-only run creates audit session"
-    echo "       PID: $LAST_NONO_PID, session_file: ${session_file:-not found}"
+    echo "       marker: $marker, session_file: ${session_file:-not found}"
     TESTS_FAILED=$((TESTS_FAILED + 1))
 fi
 
 # Test 3: Non-zero exit still creates an audit session
 TESTS_RUN=$((TESTS_RUN + 1))
-run_nono run --silent --allow-cwd --allow "$TMPDIR" -- sh -c "exit 42"
-session_file=$(find_audit_session_for_pid "$LAST_NONO_PID")
+marker="${AUDIT_MARKER_PREFIX}nonzero"
+run_nono run --silent --allow-cwd --allow "$TMPDIR" -- sh -c "exit 42" "$marker"
+session_file=$(find_audit_session_for_marker "$marker")
 if [[ -n "$session_file" && -f "$session_file" ]]; then
     echo -e "  ${GREEN}PASS${NC}: non-zero exit creates audit session"
     TESTS_PASSED=$((TESTS_PASSED + 1))
 else
     echo -e "  ${RED}FAIL${NC}: non-zero exit creates audit session"
-    echo "       PID: $LAST_NONO_PID, session_file: ${session_file:-not found}"
+    echo "       marker: $marker, session_file: ${session_file:-not found}"
     TESTS_FAILED=$((TESTS_FAILED + 1))
 fi
 
@@ -111,8 +119,9 @@ echo "--- Audit Opt-Out (--no-audit) ---"
 
 # Test 4: --no-audit suppresses audit session
 TESTS_RUN=$((TESTS_RUN + 1))
-run_nono run --silent --no-audit --allow-cwd --allow "$TMPDIR" -- echo "no audit"
-session_file=$(find_audit_session_for_pid "$LAST_NONO_PID")
+marker="${AUDIT_MARKER_PREFIX}noaudit"
+run_nono run --silent --no-audit --allow-cwd --allow "$TMPDIR" -- echo "$marker"
+session_file=$(find_audit_session_for_marker "$marker")
 if [[ -z "$session_file" ]]; then
     echo -e "  ${GREEN}PASS${NC}: --no-audit run does not create audit session"
     TESTS_PASSED=$((TESTS_PASSED + 1))
@@ -137,14 +146,15 @@ echo "--- Audit with Rollback ---"
 # We use --allow (not --read) because on Linux Landlock, a purely read-only
 # rollback session has nothing to snapshot and may not create a session file.
 TESTS_RUN=$((TESTS_RUN + 1))
-run_nono run --silent --rollback --no-rollback-prompt --allow-cwd --allow "$TMPDIR" -- echo "rollback audit"
-session_file=$(find_rollback_session_for_pid "$LAST_NONO_PID")
+marker="${AUDIT_MARKER_PREFIX}rollback_readonly"
+run_nono run --silent --rollback --no-rollback-prompt --allow-cwd --read "$TMPDIR" -- echo "$marker"
+session_file=$(find_audit_session_for_marker "$marker")
 if [[ -n "$session_file" && -f "$session_file" ]]; then
     echo -e "  ${GREEN}PASS${NC}: rollback session creates audit"
     TESTS_PASSED=$((TESTS_PASSED + 1))
 else
-    echo -e "  ${RED}FAIL${NC}: rollback session creates audit"
-    echo "       PID: $LAST_NONO_PID, session_file: ${session_file:-not found}"
+    echo -e "  ${RED}FAIL${NC}: rollback read-only session creates audit"
+    echo "       marker: $marker, session_file: ${session_file:-not found}"
     TESTS_FAILED=$((TESTS_FAILED + 1))
 fi
 
@@ -174,8 +184,9 @@ fi
 
 # Test 7: rollback session records correct exit code
 TESTS_RUN=$((TESTS_RUN + 1))
-run_nono run --silent --rollback --no-rollback-prompt --allow-cwd --allow "$TMPDIR" -- sh -c "exit 42"
-session_file=$(find_rollback_session_for_pid "$LAST_NONO_PID")
+marker="${AUDIT_MARKER_PREFIX}rollback_nonzero"
+run_nono run --silent --rollback --no-rollback-prompt --allow-cwd --allow "$TMPDIR" -- sh -c "exit 42" "$marker"
+session_file=$(find_rollback_session_for_marker "$marker")
 if [[ -n "$session_file" ]] && grep -q '"exit_code": 42' "$session_file"; then
     echo -e "  ${GREEN}PASS${NC}: rollback session records non-zero exit code"
     TESTS_PASSED=$((TESTS_PASSED + 1))
@@ -190,8 +201,10 @@ fi
 # Test 8: --rollback with writable path creates session with snapshot data
 TESTS_RUN=$((TESTS_RUN + 1))
 WRITE_DIR=$(mktemp -d "$TMPDIR/write-XXXXXX")
-run_nono run --silent --rollback --no-rollback-prompt --allow-cwd --allow "$WRITE_DIR" -- touch "$WRITE_DIR/testfile"
-session_file=$(find_rollback_session_for_pid "$LAST_NONO_PID")
+marker="${AUDIT_MARKER_PREFIX}rollback_snapshot"
+run_nono run --silent --rollback --no-rollback-prompt --allow-cwd --allow "$WRITE_DIR" -- \
+    sh -c 'touch "$1"' "$marker" "$WRITE_DIR/testfile"
+session_file=$(find_rollback_session_for_marker "$marker")
 if [[ -n "$session_file" ]] && grep -q '"snapshot_count"' "$session_file"; then
     snapshot_count=$(grep -o '"snapshot_count": [0-9]*' "$session_file" | grep -o '[0-9]*$')
     if [[ "$snapshot_count" -gt 0 ]]; then
@@ -221,8 +234,9 @@ echo "--- Direct Mode (nono wrap) ---"
 
 # Test 9: nono wrap does not create audit sessions (no parent process)
 TESTS_RUN=$((TESTS_RUN + 1))
-run_nono wrap --allow "$TMPDIR" -- echo "wrap no audit"
-session_file=$(find_audit_session_for_pid "$LAST_NONO_PID")
+marker="${AUDIT_MARKER_PREFIX}wrap"
+run_nono wrap --allow "$TMPDIR" -- echo "$marker"
+session_file=$(find_audit_session_for_marker "$marker")
 if [[ -z "$session_file" ]]; then
     echo -e "  ${GREEN}PASS${NC}: nono wrap does not create audit session"
     TESTS_PASSED=$((TESTS_PASSED + 1))

@@ -79,8 +79,9 @@ set +e
 session_list=$("$NONO_BIN" rollback list </dev/null 2>&1)
 set -e
 
-# Extract a session ID (format: YYYYMMDD-HHMMSS-PID)
-session_id=$(echo "$session_list" | grep -oE '[0-9]{8}-[0-9]{6}-[0-9]+' | head -1)
+# Extract a session ID. Current supervised runs use random 16-hex session IDs;
+# older standalone rollback entries used YYYYMMDD-HHMMSS-PID.
+session_id=$(echo "$session_list" | grep -oE '[0-9]{8}-[0-9]{6}-[0-9]+|[0-9a-f]{16}' | head -1)
 
 if [[ -n "$session_id" ]]; then
     expect_success "rollback show session succeeds" \
@@ -122,7 +123,7 @@ expect_success "rollback-dest creates session in custom dir" \
 
 # Verify a session directory was created under the custom destination
 run_test "session directory created under --rollback-dest" 0 \
-    bash -c "ls '$CUSTOM_DEST' | grep -qE '[0-9]{8}-[0-9]{6}-[0-9]+'"
+    bash -c "ls '$CUSTOM_DEST' | grep -qE '[0-9]{8}-[0-9]{6}-[0-9]+|[0-9a-f]{16}'"
 
 # --rollback-dest without write permission should fail.
 # We use a path under $HOME that is not covered by any system write group.

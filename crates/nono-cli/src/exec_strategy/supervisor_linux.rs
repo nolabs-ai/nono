@@ -1132,6 +1132,11 @@ fn record_network_audit_denial(
         credential_capture_duration_ms: None,
         credential_capture_stdout_bytes: None,
         credential_capture_stderr: None,
+        credential_capture_cache_scope: None,
+        credential_capture_output_format: None,
+        credential_capture_header_names: None,
+        credential_capture_stdin_mode: None,
+        credential_capture_interactive: None,
         target,
         upstream: None,
         port: if sockaddr.port == 0 {

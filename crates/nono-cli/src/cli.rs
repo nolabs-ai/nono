@@ -1277,7 +1277,13 @@ pub struct SandboxArgs {
     /// Add the proxy CA to the macOS user trust store (enables Go CLI tools).
     /// Shares the CA across sessions via Keychain; regenerates daily.
     #[cfg(target_os = "macos")]
-    #[arg(long, env = "NONO_TRUST_PROXY_CA", help_heading = "NETWORK")]
+    #[arg(
+        long,
+        env = "NONO_TRUST_PROXY_CA",
+        value_parser = clap::builder::BoolishValueParser::new(),
+        action = clap::ArgAction::SetTrue,
+        help_heading = "NETWORK"
+    )]
     pub trust_proxy_ca: bool,
 
     /// Proxy CA certificate validity in days (1–365, default: 1).
@@ -1775,7 +1781,13 @@ pub struct RunArgs {
     pub audit_sign_key: Option<String>,
 
     /// Disable trust verification (not recommended for production)
-    #[arg(long, help_heading = "OPTIONS")]
+    #[arg(
+        long,
+        env = "NONO_TRUST_OVERRIDE",
+        value_parser = clap::builder::BoolishValueParser::new(),
+        action = clap::ArgAction::SetTrue,
+        help_heading = "OPTIONS"
+    )]
     pub trust_override: bool,
 
     /// Name for this session (shown in `nono ps`)
@@ -1786,7 +1798,13 @@ pub struct RunArgs {
     /// Overrides the profile's capability_elevation setting.
     /// When enabled, the supervisor can grant access to paths not in the
     /// initial capability set via interactive prompts.
-    #[arg(long, env = "NONO_CAPABILITY_ELEVATION", help_heading = "OPTIONS")]
+    #[arg(
+        long,
+        env = "NONO_CAPABILITY_ELEVATION",
+        value_parser = clap::builder::BoolishValueParser::new(),
+        action = clap::ArgAction::SetTrue,
+        help_heading = "OPTIONS"
+    )]
     pub capability_elevation: bool,
 
     /// Command to run inside the sandbox (optional if profile specifies `binary`)
@@ -3556,6 +3574,47 @@ mod tests {
                         "GITHUB_PASSWORD".to_string()
                     ]
                 );
+            }
+            _ => panic!("Expected Run command"),
+        }
+    }
+
+    #[test]
+    fn test_capability_elevation_flag_sets_true() {
+        let cli = Cli::parse_from([
+            "nono",
+            "run",
+            "--allow",
+            ".",
+            "--capability-elevation",
+            "echo",
+        ]);
+        match cli.command {
+            Commands::Run(args) => {
+                assert!(args.capability_elevation);
+            }
+            _ => panic!("Expected Run command"),
+        }
+    }
+
+    #[test]
+    fn test_trust_override_flag_sets_true() {
+        let cli = Cli::parse_from(["nono", "run", "--allow", ".", "--trust-override", "echo"]);
+        match cli.command {
+            Commands::Run(args) => {
+                assert!(args.trust_override);
+            }
+            _ => panic!("Expected Run command"),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_trust_proxy_ca_flag_sets_true() {
+        let cli = Cli::parse_from(["nono", "run", "--allow", ".", "--trust-proxy-ca", "echo"]);
+        match cli.command {
+            Commands::Run(args) => {
+                assert!(args.sandbox.trust_proxy_ca);
             }
             _ => panic!("Expected Run command"),
         }

@@ -31,6 +31,10 @@ pub(crate) struct PreparedProfile {
     pub(crate) suppressed_system_service_operations: Vec<String>,
     pub(crate) allowed_env_vars: Option<Vec<String>>,
     pub(crate) denied_env_vars: Option<Vec<String>>,
+    /// Expanded `environment.set_vars` entries (key, expanded-value). `None`
+    /// when the profile has no `set_vars`. Values are expanded with
+    /// [`profile::expand_vars`] at prepare time.
+    pub(crate) set_vars: Option<Vec<(String, String)>>,
 }
 
 #[derive(Clone, Copy)]
@@ -436,6 +440,39 @@ fn expand_ignored_denial_path(path: &Path, workdir: &Path) -> PathBuf {
     nono::try_canonicalize(&expanded)
 }
 
+/// Expand the values of `environment.set_vars` using the same variable
+/// substitution as profile paths (`$HOME`, `~`, `$WORKDIR`, `$TMPDIR`,
+/// `$XDG_*`, `$NONO_PACKAGES`). Keys are preserved verbatim. Returns `None`
+/// when the profile has no `set_vars`. Expansion errors are fatal so a
+/// misconfigured value never silently reaches the child.
+fn expand_profile_set_vars(
+    loaded_profile: Option<&profile::Profile>,
+    workdir: &Path,
+) -> crate::Result<Option<Vec<(String, String)>>> {
+    let Some(env_config) = loaded_profile.and_then(|profile| profile.environment.as_ref()) else {
+        return Ok(None);
+    };
+    if env_config.set_vars.is_empty() {
+        return Ok(None);
+    }
+
+    // Sort keys for deterministic ordering (HashMap iteration order is random).
+    let mut keys: Vec<&String> = env_config.set_vars.keys().collect();
+    keys.sort();
+
+    let mut expanded = Vec::with_capacity(keys.len());
+    for key in keys {
+        let Some(value) = env_config.set_vars.get(key) else {
+            continue;
+        };
+        let expanded_value = profile::expand_vars(value, workdir)?
+            .to_string_lossy()
+            .into_owned();
+        expanded.push((key.clone(), expanded_value));
+    }
+    Ok(Some(expanded))
+}
+
 fn collect_ignored_denial_paths(
     loaded_profile: Option<&profile::Profile>,
     cli_ignored_denials: &[PathBuf],
@@ -663,6 +700,7 @@ fn prepare_profile_with_options(
                 Some(env_config.deny_vars.clone())
             })
         }),
+        set_vars: expand_profile_set_vars(loaded_profile.as_ref(), workdir)?,
         loaded_profile,
     })
 }
@@ -730,6 +768,47 @@ mod tests {
             config_dir.to_str().expect("utf8"),
         )]);
         f(&config_dir)
+    }
+
+    #[test]
+    fn expand_profile_set_vars_expands_home() {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let _env = crate::test_env::EnvVarGuard::set_all(&[("HOME", "/home/tester")]);
+
+        let mut profile = profile::Profile::default();
+        let mut set_vars = std::collections::HashMap::new();
+        set_vars.insert("RUST_LOG".to_string(), "debug".to_string());
+        set_vars.insert("CFG".to_string(), "$HOME/.config".to_string());
+        profile.environment = Some(profile::EnvironmentConfig {
+            allow_vars: vec![],
+            deny_vars: vec![],
+            set_vars,
+        });
+
+        let workdir = Path::new("/tmp/work");
+        let expanded = expand_profile_set_vars(Some(&profile), workdir)
+            .expect("expansion should succeed")
+            .expect("set_vars should be present");
+
+        // Keys are sorted for determinism: CFG before RUST_LOG.
+        assert_eq!(
+            expanded,
+            vec![
+                ("CFG".to_string(), "/home/tester/.config".to_string()),
+                ("RUST_LOG".to_string(), "debug".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn expand_profile_set_vars_none_when_absent() {
+        let profile = profile::Profile::default();
+        let result = expand_profile_set_vars(Some(&profile), Path::new("/tmp/work"))
+            .expect("expansion should succeed");
+        assert!(result.is_none());
     }
 
     /// Build a minimal pack on disk under `<config_dir>/nono/packages/<ns>/<name>/`

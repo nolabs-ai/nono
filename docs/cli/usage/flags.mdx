@@ -1118,6 +1118,11 @@ Suppress the diagnostic footer when the command exits non-zero. Useful for scrip
 nono run --no-diagnostics --allow-cwd -- my-command
 ```
 
+On macOS, to hide specific expected Seatbelt violations (such as
+`user-preference-read` from npm) without silencing all diagnostics, add the
+operation name to `diagnostics.suppress_system_services` in your profile
+instead. See [Profiles and Groups](/cli/features/profiles-groups#suppressing-expected-macos-system-service-diagnostics).
+
 #### `--capability-elevation`
 
 Enable runtime capability elevation for this session. When active, the sandbox installs a seccomp-notify filter (Linux) and a PTY multiplexer so that file access beyond the initial capability set can be approved interactively at runtime.

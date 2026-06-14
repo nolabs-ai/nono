@@ -24,6 +24,8 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
+#[cfg(feature = "system-keyring")]
+use std::sync::mpsc;
 use std::time::Duration;
 use zeroize::Zeroizing;
 
@@ -31,6 +33,86 @@ use zeroize::Zeroizing;
 ///
 /// Generous enough to allow biometric prompts in password manager CLIs.
 const SECRET_MANAGER_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Default timeout for system keyring calls (seconds).
+///
+/// 120 s covers the realistic worst-case keychain unlock workflow:
+/// notice the prompt, switch windows, type a master password, click approve.
+/// Rationale for choosing 120 over a shorter value: issue #967 reports that
+/// a shorter timeout fired before the user could complete the KeePassXC
+/// unlock sequence on Linux. We go materially longer while still bounding
+/// an unattended hang.
+///
+/// Override with `NONO_KEYRING_TIMEOUT_SECS`. Set to `0` to disable the
+/// timeout entirely and restore the old "block forever" behaviour.
+#[cfg(feature = "system-keyring")]
+const KEYRING_TIMEOUT_SECS: u64 = 120;
+
+/// Return the effective keyring timeout.
+///
+/// - `NONO_KEYRING_TIMEOUT_SECS` unset → `Some(120 s)` (the default).
+/// - `NONO_KEYRING_TIMEOUT_SECS=0` → `None` (wait forever).
+/// - `NONO_KEYRING_TIMEOUT_SECS=N` (N > 0) → `Some(N s)`.
+/// - Invalid value → logs a warning and returns `Some(120 s)`.
+#[cfg(feature = "system-keyring")]
+fn keyring_timeout() -> Option<Duration> {
+    match std::env::var("NONO_KEYRING_TIMEOUT_SECS") {
+        Err(_) => Some(Duration::from_secs(KEYRING_TIMEOUT_SECS)),
+        Ok(s) => match s.trim().parse::<u64>() {
+            Ok(0) => None,
+            Ok(n) => Some(Duration::from_secs(n)),
+            Err(_) => {
+                tracing::warn!(
+                    "NONO_KEYRING_TIMEOUT_SECS='{}' is not a valid integer; \
+                     using default {}s",
+                    s.trim(),
+                    KEYRING_TIMEOUT_SECS
+                );
+                Some(Duration::from_secs(KEYRING_TIMEOUT_SECS))
+            }
+        },
+    }
+}
+
+/// Call a blocking keyring function with an optional timeout.
+///
+/// When `timeout` is `None`, the closure is called inline on the current
+/// thread — no extra thread is spawned.
+///
+/// When `timeout` is `Some(d)`, the closure is moved onto a new thread and
+/// the result is sent back through an `mpsc` channel. If the channel
+/// `recv_timeout` fires, a `KeystoreAccess` error is returned.
+///
+/// **macOS note**: if the timeout fires while `Security.framework` is
+/// displaying a keychain unlock dialog, the spawned thread stays alive and
+/// blocked until the user responds or the process exits. Rust cannot cancel
+/// a blocking syscall; this is the expected behaviour. No secret material
+/// leaks because the `Zeroizing<String>` result is dropped on the thread
+/// side once the channel receiver is gone.
+#[cfg(feature = "system-keyring")]
+fn call_with_keyring_timeout<F, T>(timeout: Option<Duration>, label: &str, f: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    let Some(dur) = timeout else {
+        return f();
+    };
+
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+
+    rx.recv_timeout(dur).unwrap_or_else(|_| {
+        Err(NonoError::KeystoreAccess(format!(
+            "{} timed out after {}s waiting for keychain access. \
+             Set NONO_KEYRING_TIMEOUT_SECS=N to adjust (0 = wait forever).",
+            label,
+            dur.as_secs()
+        )))
+    })
+}
 
 /// A credential loaded from the keystore
 pub struct LoadedSecret {
@@ -980,32 +1062,36 @@ pub fn store_secret_file(path: &Path, secret: &str) -> Result<()> {
 /// keyring crate that we cannot address from the caller side.
 #[cfg(feature = "system-keyring")]
 fn load_single_secret(service: &str, account: &str) -> Result<Zeroizing<String>> {
-    let entry = keyring::Entry::new(service, account).map_err(|e| {
-        NonoError::KeystoreAccess(format!(
-            "Failed to access keystore for '{}': {}",
-            account, e
-        ))
-    })?;
+    let timeout = keyring_timeout();
+    let service = service.to_string();
+    let account = account.to_string();
+    let label = format!("keyring lookup for '{}'", account);
 
-    match entry.get_password() {
-        Ok(password) => {
-            // Immediately wrap in Zeroizing so the String's heap buffer is
-            // zeroed when the secret is dropped. The move does not copy the
-            // heap allocation - it transfers ownership of the same buffer.
-            tracing::debug!("Successfully loaded secret '{}'", account);
-            Ok(Zeroizing::new(password))
+    call_with_keyring_timeout(timeout, &label, move || {
+        let entry = keyring::Entry::new(&service, &account).map_err(|e| {
+            NonoError::KeystoreAccess(format!(
+                "Failed to access keystore for '{}': {}",
+                account, e
+            ))
+        })?;
+
+        match entry.get_password() {
+            Ok(password) => {
+                tracing::debug!("Successfully loaded secret '{}'", account);
+                Ok(Zeroizing::new(password))
+            }
+            Err(keyring::Error::NoEntry) => Err(NonoError::SecretNotFound(account.to_string())),
+            Err(keyring::Error::Ambiguous(creds)) => Err(NonoError::KeystoreAccess(format!(
+                "Multiple entries ({}) found for '{}' - please resolve manually",
+                creds.len(),
+                account
+            ))),
+            Err(e) => Err(NonoError::KeystoreAccess(format!(
+                "Cannot access '{}': {}",
+                account, e
+            ))),
         }
-        Err(keyring::Error::NoEntry) => Err(NonoError::SecretNotFound(account.to_string())),
-        Err(keyring::Error::Ambiguous(creds)) => Err(NonoError::KeystoreAccess(format!(
-            "Multiple entries ({}) found for '{}' - please resolve manually",
-            creds.len(),
-            account
-        ))),
-        Err(e) => Err(NonoError::KeystoreAccess(format!(
-            "Cannot access '{}': {}",
-            account, e
-        ))),
-    }
+    })
 }
 
 #[cfg(not(feature = "system-keyring"))]
@@ -1354,34 +1440,43 @@ fn load_from_keyring_uri(uri: &str) -> Result<Zeroizing<String>> {
     let redacted = redact_keyring_uri(uri);
     tracing::debug!("Loading secret from system keyring: {}", redacted);
 
-    let entry = keyring::Entry::new(parts.service, parts.account).map_err(|e| {
-        NonoError::KeystoreAccess(format!(
-            "Failed to access keyring for '{}': {}",
-            redacted, e
-        ))
-    })?;
+    let timeout = keyring_timeout();
+    let service = parts.service.to_string();
+    let account = parts.account.to_string();
+    let decode = parts.decode;
+    let redacted_clone = redacted.clone();
+    let label = format!("keyring lookup for '{}'", redacted);
 
-    match entry.get_password() {
-        Ok(password) => {
-            tracing::debug!("Successfully loaded secret '{}'", redacted);
-            let decoded = apply_keyring_decode(password, parts.decode, &redacted)?;
-            Ok(decoded)
+    call_with_keyring_timeout(timeout, &label, move || {
+        let entry = keyring::Entry::new(&service, &account).map_err(|e| {
+            NonoError::KeystoreAccess(format!(
+                "Failed to access keyring for '{}': {}",
+                redacted_clone, e
+            ))
+        })?;
+
+        match entry.get_password() {
+            Ok(password) => {
+                tracing::debug!("Successfully loaded secret '{}'", redacted_clone);
+                let decoded = apply_keyring_decode(password, decode, &redacted_clone)?;
+                Ok(decoded)
+            }
+            Err(keyring::Error::NoEntry) => Err(NonoError::SecretNotFound(format!(
+                "keyring entry not found: '{}'. \
+                 Verify the service and account match the stored credential.",
+                redacted_clone
+            ))),
+            Err(keyring::Error::Ambiguous(creds)) => Err(NonoError::KeystoreAccess(format!(
+                "Multiple entries ({}) found for '{}' - please resolve manually",
+                creds.len(),
+                redacted_clone
+            ))),
+            Err(e) => Err(NonoError::KeystoreAccess(format!(
+                "Cannot access '{}': {}",
+                redacted_clone, e
+            ))),
         }
-        Err(keyring::Error::NoEntry) => Err(NonoError::SecretNotFound(format!(
-            "keyring entry not found: '{}'. \
-             Verify the service and account match the stored credential.",
-            redacted
-        ))),
-        Err(keyring::Error::Ambiguous(creds)) => Err(NonoError::KeystoreAccess(format!(
-            "Multiple entries ({}) found for '{}' - please resolve manually",
-            creds.len(),
-            redacted
-        ))),
-        Err(e) => Err(NonoError::KeystoreAccess(format!(
-            "Cannot access '{}': {}",
-            redacted, e
-        ))),
-    }
+    })
 }
 
 #[cfg(not(feature = "system-keyring"))]
@@ -3639,6 +3734,112 @@ mod tests {
             "got: {}",
             err
         );
+    }
+
+    // =========================================================================
+    // keyring_timeout() and call_with_keyring_timeout() tests
+    // =========================================================================
+
+    #[cfg(feature = "system-keyring")]
+    mod keyring_timeout_tests {
+        use super::*;
+        use std::sync::Mutex;
+        use std::time::Duration;
+
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+        struct EnvGuard {
+            key: &'static str,
+            original: Option<String>,
+        }
+
+        impl EnvGuard {
+            #[allow(clippy::disallowed_methods)]
+            fn set(key: &'static str, val: &str) -> Self {
+                let original = std::env::var(key).ok();
+                // SAFETY: serialised via ENV_LOCK
+                unsafe { std::env::set_var(key, val) };
+                Self { key, original }
+            }
+
+            #[allow(clippy::disallowed_methods)]
+            fn remove(key: &'static str) -> Self {
+                let original = std::env::var(key).ok();
+                // SAFETY: serialised via ENV_LOCK
+                unsafe { std::env::remove_var(key) };
+                Self { key, original }
+            }
+        }
+
+        #[allow(clippy::disallowed_methods)]
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                match &self.original {
+                    // SAFETY: serialised via ENV_LOCK
+                    Some(v) => unsafe { std::env::set_var(self.key, v) },
+                    None => unsafe { std::env::remove_var(self.key) },
+                }
+            }
+        }
+
+        const KEY: &str = "NONO_KEYRING_TIMEOUT_SECS";
+
+        #[test]
+        fn keyring_timeout_unset_returns_default_120s() {
+            let _lock = ENV_LOCK.lock().unwrap();
+            let _g = EnvGuard::remove(KEY);
+            assert_eq!(keyring_timeout(), Some(Duration::from_secs(120)));
+        }
+
+        #[test]
+        fn keyring_timeout_zero_returns_none() {
+            let _lock = ENV_LOCK.lock().unwrap();
+            let _g = EnvGuard::set(KEY, "0");
+            assert_eq!(keyring_timeout(), None);
+        }
+
+        #[test]
+        fn keyring_timeout_valid_value_returns_some() {
+            let _lock = ENV_LOCK.lock().unwrap();
+            let _g = EnvGuard::set(KEY, "300");
+            assert_eq!(keyring_timeout(), Some(Duration::from_secs(300)));
+        }
+
+        #[test]
+        fn keyring_timeout_invalid_falls_back_to_default() {
+            let _lock = ENV_LOCK.lock().unwrap();
+            let _g = EnvGuard::set(KEY, "banana");
+            assert_eq!(keyring_timeout(), Some(Duration::from_secs(120)));
+        }
+
+        #[test]
+        fn call_with_keyring_timeout_none_runs_inline() {
+            // None = no timeout; closure runs directly, no thread spawned
+            let result: Result<u32> = call_with_keyring_timeout(None, "test", || Ok(42_u32));
+            assert_eq!(result.unwrap(), 42);
+        }
+
+        #[test]
+        fn call_with_keyring_timeout_fast_call_returns_value() {
+            let result: Result<u32> =
+                call_with_keyring_timeout(Some(Duration::from_secs(5)), "test", || Ok(99_u32));
+            assert_eq!(result.unwrap(), 99);
+        }
+
+        #[test]
+        fn call_with_keyring_timeout_slow_call_fires() {
+            let result: Result<u32> =
+                call_with_keyring_timeout(Some(Duration::from_millis(50)), "slow-test", || {
+                    std::thread::sleep(Duration::from_secs(10));
+                    Ok(0_u32)
+                });
+            let err = result.unwrap_err().to_string();
+            assert!(
+                err.contains("timed out") && err.contains("NONO_KEYRING_TIMEOUT_SECS"),
+                "got: {}",
+                err
+            );
+        }
     }
 
     #[test]

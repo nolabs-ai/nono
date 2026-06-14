@@ -215,16 +215,17 @@ impl std::fmt::Display for UnixSocketMode {
 /// capability permits) and the query-side (what the caller is about to
 /// do) are not conflated. The supervisor's seccomp-notify handler maps
 /// `SYS_CONNECT` -> `Connect`, `SYS_BIND` -> `Bind`,
-/// `SYS_SENDTO`/`SYS_SENDMSG` -> `Send`.
+/// `SYS_SENDTO`/`SYS_SENDMSG`/`SYS_SENDMMSG` -> `Send`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnixSocketOp {
     /// About to call `connect(2)`.
     Connect,
     /// About to call `bind(2)`.
     Bind,
-    /// About to call `sendto(2)` or `sendmsg(2)` with a destination address.
+    /// About to call `sendto(2)`, `sendmsg(2)`, or `sendmmsg(2)` with a
+    /// destination address.
     ///
-    /// Datagram AF_UNIX sockets use `sendto`/`sendmsg` to specify the
+    /// Datagram AF_UNIX sockets use `sendto`/`sendmsg`/`sendmmsg` to specify the
     /// target per-message instead of calling `connect()` first. This
     /// variant covers those datagram sends (issue #1089).
     Send,
@@ -1304,7 +1305,7 @@ impl CapabilitySet {
     ///
     /// Used by the Linux supervisor's seccomp-notify handler:
     /// `SYS_CONNECT` -> [`UnixSocketOp::Connect`], `SYS_BIND`
-    /// -> [`UnixSocketOp::Bind`], `SYS_SENDTO`/`SYS_SENDMSG`
+    /// -> [`UnixSocketOp::Bind`], `SYS_SENDTO`/`SYS_SENDMSG`/`SYS_SENDMMSG`
     /// -> [`UnixSocketOp::Send`].
     #[must_use]
     pub fn unix_socket_allowed(&self, sockaddr_path: &Path, op: UnixSocketOp) -> bool {
@@ -3336,7 +3337,7 @@ mod tests {
         assert!(!caps.unix_socket_allowed(&direct_child, UnixSocketOp::Bind));
     }
 
-    /// Send (sendto/sendmsg) is covered by Connect grants (issue #1089).
+    /// Send (sendto/sendmsg/sendmmsg) is covered by Connect grants (issue #1089).
     /// A Connect-mode grant allows both connect and datagram send operations.
     #[test]
     fn test_capability_set_unix_socket_send_covered_by_connect_grant() {

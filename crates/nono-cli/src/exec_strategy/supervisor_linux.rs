@@ -572,7 +572,9 @@ pub(super) fn decide_network_notification(
     sockaddr: &nono::sandbox::SockaddrInfo,
     config: &SupervisorConfig<'_>,
 ) -> NetworkDecision {
-    use nono::sandbox::{SYS_BIND, SYS_CONNECT, SYS_SENDMSG, SYS_SENDTO, UnixSocketKind};
+    use nono::sandbox::{
+        SYS_BIND, SYS_CONNECT, SYS_SENDMMSG, SYS_SENDMSG, SYS_SENDTO, UnixSocketKind,
+    };
 
     // AF_UNIX: allow only filesystem-backed (pathname) sockets that match an
     // explicit socket capability. Abstract/unnamed sockets bypass pathname
@@ -612,9 +614,9 @@ pub(super) fn decide_network_notification(
     }
 
     match syscall {
-        SYS_CONNECT | SYS_SENDTO | SYS_SENDMSG => {
-            // Allow connect/sendto/sendmsg only to loopback + proxy port.
-            // sendto/sendmsg with a destination address is semantically
+        SYS_CONNECT | SYS_SENDTO | SYS_SENDMSG | SYS_SENDMMSG => {
+            // Allow connect/sendto/sendmsg/sendmmsg only to loopback + proxy port.
+            // sendto/sendmsg/sendmmsg with a destination address is semantically
             // equivalent to connect for network reach-out (issue #1089).
             if sockaddr.is_loopback && sockaddr.port == config.proxy_port {
                 debug!(
@@ -742,12 +744,12 @@ fn resolve_af_unix_sockaddr_path(
 }
 
 fn unix_socket_op_for_syscall(syscall: i32) -> Option<UnixSocketOp> {
-    use nono::sandbox::{SYS_BIND, SYS_CONNECT, SYS_SENDMSG, SYS_SENDTO};
+    use nono::sandbox::{SYS_BIND, SYS_CONNECT, SYS_SENDMMSG, SYS_SENDMSG, SYS_SENDTO};
 
     match syscall {
         SYS_CONNECT => Some(UnixSocketOp::Connect),
         SYS_BIND => Some(UnixSocketOp::Bind),
-        SYS_SENDTO | SYS_SENDMSG => Some(UnixSocketOp::Send),
+        SYS_SENDTO | SYS_SENDMSG | SYS_SENDMMSG => Some(UnixSocketOp::Send),
         _ => None,
     }
 }
@@ -816,8 +818,9 @@ pub(super) fn handle_network_notification(
     ipc_denials: &mut Vec<nono::diagnostic::IpcDenialRecord>,
 ) -> nono::error::Result<()> {
     use nono::sandbox::{
-        SYS_BIND, SYS_CONNECT, SYS_SENDMSG, SYS_SENDTO, continue_notif, deny_notif, notif_id_valid,
-        read_msghdr_dest, read_notif_sockaddr, recv_notif, respond_notif_errno,
+        SYS_BIND, SYS_CONNECT, SYS_SENDMMSG, SYS_SENDMSG, SYS_SENDTO, continue_notif, deny_notif,
+        notif_id_valid, read_mmsghdr_dests, read_msghdr_dest, read_notif_sockaddr, recv_notif,
+        respond_notif_errno,
     };
 
     let notif = recv_notif(notify_fd)?;
@@ -836,10 +839,12 @@ pub(super) fn handle_network_notification(
     //       args[4] = sockaddr*, args[5] = addrlen
     //   sendmsg(fd, msghdr*, flags):        args[1] = msghdr*;
     //       sockaddr lives inside msghdr.msg_name / msg_namelen
-    let sockaddr = match notif.data.nr {
+    //   sendmmsg(fd, mmsghdr*, vlen, flags): args[1] = mmsghdr*;
+    //       each mmsghdr starts with an msghdr that may carry a destination
+    let sockaddrs = match notif.data.nr {
         SYS_CONNECT | SYS_BIND => {
             match read_notif_sockaddr(notif.pid, notif.data.args[1], notif.data.args[2]) {
-                Ok(info) => info,
+                Ok(info) => vec![info],
                 Err(e) => {
                     debug!(
                         "Failed to read sockaddr from seccomp notification (nr={}): {}",
@@ -852,8 +857,17 @@ pub(super) fn handle_network_notification(
         }
         SYS_SENDTO => {
             // args[4] = dest_addr pointer, args[5] = addrlen
+            if notif.data.args[4] == 0 {
+                // Full-width NULL check happens here rather than in BPF.
+                // No per-call destination is present.
+                if let Err(e) = continue_notif(notify_fd, notif.id) {
+                    debug!("continue_notif failed for sendto NULL dest_addr: {}", e);
+                    return deny_notif(notify_fd, notif.id);
+                }
+                return Ok(());
+            }
             match read_notif_sockaddr(notif.pid, notif.data.args[4], notif.data.args[5]) {
-                Ok(info) => info,
+                Ok(info) => vec![info],
                 Err(e) => {
                     debug!(
                         "Failed to read sendto sockaddr from seccomp notification: {}",
@@ -870,7 +884,7 @@ pub(super) fn handle_network_notification(
             match read_msghdr_dest(notif.pid, notif.data.args[1]) {
                 Ok(Some((addr_ptr, addrlen))) => {
                     match read_notif_sockaddr(notif.pid, addr_ptr, addrlen) {
-                        Ok(info) => info,
+                        Ok(info) => vec![info],
                         Err(e) => {
                             debug!(
                                 "Failed to read sendmsg sockaddr from seccomp notification: {}",
@@ -882,7 +896,7 @@ pub(super) fn handle_network_notification(
                     }
                 }
                 Ok(None) => {
-                    // msg_name is NULL: connected socket, no destination to
+                    // msg_name is NULL: no per-message destination to
                     // mediate. Allow immediately.
                     if let Err(e) = continue_notif(notify_fd, notif.id) {
                         debug!("continue_notif failed for sendmsg NULL msg_name: {}", e);
@@ -900,6 +914,48 @@ pub(super) fn handle_network_notification(
                 }
             }
         }
+        SYS_SENDMMSG => {
+            let dests = match read_mmsghdr_dests(notif.pid, notif.data.args[1], notif.data.args[2])
+            {
+                Ok(dests) => dests,
+                Err(e) => {
+                    debug!(
+                        "Failed to read sendmmsg message vector from seccomp notification: {}",
+                        e
+                    );
+                    let _ = deny_notif(notify_fd, notif.id);
+                    return Ok(());
+                }
+            };
+
+            let mut sockaddrs = Vec::new();
+            for (idx, dest) in dests.into_iter().enumerate() {
+                let Some((addr_ptr, addrlen)) = dest else {
+                    continue;
+                };
+                match read_notif_sockaddr(notif.pid, addr_ptr, addrlen) {
+                    Ok(info) => sockaddrs.push(info),
+                    Err(e) => {
+                        debug!("Failed to read sendmmsg sockaddr at message {}: {}", idx, e);
+                        let _ = deny_notif(notify_fd, notif.id);
+                        return Ok(());
+                    }
+                }
+            }
+
+            if sockaddrs.is_empty() {
+                if let Err(e) = continue_notif(notify_fd, notif.id) {
+                    debug!(
+                        "continue_notif failed for sendmmsg without destinations: {}",
+                        e
+                    );
+                    return deny_notif(notify_fd, notif.id);
+                }
+                return Ok(());
+            }
+
+            sockaddrs
+        }
         other => {
             warn!(
                 "Unexpected syscall {} in network seccomp handler, denying",
@@ -916,22 +972,25 @@ pub(super) fn handle_network_notification(
         return Ok(());
     }
 
-    match decide_network_notification(notif.pid, notif.data.nr, &sockaddr, config) {
-        NetworkDecision::Allow => {
-            if let Err(e) = continue_notif(notify_fd, notif.id) {
-                debug!("continue_notif failed for network notification: {}", e);
-                // Must respond to avoid leaving the child blocked. Propagate if
-                // deny also fails -- the notification is orphaned.
-                return deny_notif(notify_fd, notif.id);
+    for sockaddr in &sockaddrs {
+        match decide_network_notification(notif.pid, notif.data.nr, sockaddr, config) {
+            NetworkDecision::Allow => {}
+            NetworkDecision::Deny => {
+                record_af_unix_ipc_denial(sockaddr, notif.pid, notif.data.nr, denials, ipc_denials);
+                respond_notif_errno(notify_fd, notif.id, libc::EACCES)?;
+                if let Err(err) = record_network_audit_denial(config, sockaddr, notif.data.nr) {
+                    warn!("Failed to record network denial audit event: {}", err);
+                }
+                return Ok(());
             }
         }
-        NetworkDecision::Deny => {
-            record_af_unix_ipc_denial(&sockaddr, notif.pid, notif.data.nr, denials, ipc_denials);
-            respond_notif_errno(notify_fd, notif.id, libc::EACCES)?;
-            if let Err(err) = record_network_audit_denial(config, &sockaddr, notif.data.nr) {
-                warn!("Failed to record network denial audit event: {}", err);
-            }
-        }
+    }
+
+    if let Err(e) = continue_notif(notify_fd, notif.id) {
+        debug!("continue_notif failed for network notification: {}", e);
+        // Must respond to avoid leaving the child blocked. Propagate if
+        // deny also fails -- the notification is orphaned.
+        return deny_notif(notify_fd, notif.id);
     }
 
     Ok(())
@@ -1396,7 +1455,8 @@ mod tests {
         };
         use nix::libc;
         use nono::sandbox::{
-            SYS_BIND, SYS_CONNECT, SYS_SENDMSG, SYS_SENDTO, SockaddrInfo, UnixSocketKind,
+            SYS_BIND, SYS_CONNECT, SYS_SENDMMSG, SYS_SENDMSG, SYS_SENDTO, SockaddrInfo,
+            UnixSocketKind,
         };
         use nono::supervisor::{ApprovalDecision, CapabilityRequest};
         use nono::{ApprovalBackend, UnixSocketCapability, UnixSocketMode};
@@ -1719,10 +1779,10 @@ mod tests {
             );
         }
 
-        // --- sendto/sendmsg tests (issue #1089) ----------------------------
+        // --- sendto/sendmsg/sendmmsg tests (issue #1089) -------------------
         //
-        // Datagram AF_UNIX sockets use sendto/sendmsg instead of connect.
-        // These must be mediated against the same pathname allowlist.
+        // Datagram AF_UNIX sockets use sendto/sendmsg/sendmmsg instead of
+        // connect. These must be mediated against the same pathname allowlist.
 
         /// Pathname `sendto(AF_UNIX, "/tmp/...")` is allowed when a connect
         /// grant covers the path. Connect grants cover both connect and send.
@@ -1769,6 +1829,31 @@ mod tests {
             );
         }
 
+        /// Pathname `sendmmsg(AF_UNIX, "/tmp/...")` is allowed when a connect
+        /// grant covers the path. Same as sendmsg, but batched.
+        #[test]
+        fn af_unix_pathname_sendmmsg_is_allowed_by_connect_grant() {
+            let backend = DenyAllBackend;
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = socket_path(&dir, "dgram.sock");
+            let _listener = UnixListener::bind(&path).expect("bind unix listener");
+            let allowlist = vec![
+                UnixSocketCapability::new_file(&path, UnixSocketMode::Connect)
+                    .expect("socket grant"),
+            ];
+            let config = make_config(&backend, 8080, Vec::new(), &allowlist);
+            assert_eq!(
+                decide_network_notification(
+                    test_pid(),
+                    SYS_SENDMMSG,
+                    &unix_pathname(&path),
+                    &config,
+                ),
+                NetworkDecision::Allow,
+                "pathname AF_UNIX sendmmsg must be allowed when a connect grant covers it"
+            );
+        }
+
         /// `sendto(AF_UNIX)` without a matching grant is denied.
         #[test]
         fn af_unix_pathname_sendto_without_grant_is_denied() {
@@ -1801,6 +1886,26 @@ mod tests {
                 ),
                 NetworkDecision::Deny,
                 "pathname AF_UNIX sendmsg without grant must be denied"
+            );
+        }
+
+        /// `sendmmsg(AF_UNIX)` without a matching grant is denied.
+        #[test]
+        fn af_unix_pathname_sendmmsg_without_grant_is_denied() {
+            let backend = DenyAllBackend;
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = socket_path(&dir, "dgram.sock");
+            let _listener = UnixListener::bind(&path).expect("bind unix listener");
+            let config = make_config(&backend, 8080, Vec::new(), &[]);
+            assert_eq!(
+                decide_network_notification(
+                    test_pid(),
+                    SYS_SENDMMSG,
+                    &unix_pathname(&path),
+                    &config,
+                ),
+                NetworkDecision::Deny,
+                "pathname AF_UNIX sendmmsg without grant must be denied"
             );
         }
 
@@ -1849,6 +1954,23 @@ mod tests {
                 decide_network_notification(test_pid(), SYS_SENDMSG, &inet_external(8080), &config),
                 NetworkDecision::Deny,
                 "AF_INET sendmsg to external host must be denied"
+            );
+        }
+
+        /// AF_INET `sendmmsg` to an external host is denied (same as connect).
+        #[test]
+        fn af_inet_sendmmsg_to_external_host_denied() {
+            let backend = DenyAllBackend;
+            let config = make_config(&backend, 8080, Vec::new(), &[]);
+            assert_eq!(
+                decide_network_notification(
+                    test_pid(),
+                    SYS_SENDMMSG,
+                    &inet_external(8080),
+                    &config,
+                ),
+                NetworkDecision::Deny,
+                "AF_INET sendmmsg to external host must be denied"
             );
         }
 

@@ -644,6 +644,23 @@ async fn accept_loop(
     }
 }
 
+/// Normalise a CONNECT authority to lowercase `host:port`, defaulting the port
+/// to 443 when absent. Handles IPv6 brackets: `[::1]:443` already has a port,
+/// `[::1]` needs the default, `host:443` has a port.
+fn normalize_authority(authority: &str) -> String {
+    if authority.starts_with('[') {
+        if authority.contains("]:") {
+            authority.to_lowercase()
+        } else {
+            format!("{}:443", authority.to_lowercase())
+        }
+    } else if authority.contains(':') {
+        authority.to_lowercase()
+    } else {
+        format!("{}:443", authority.to_lowercase())
+    }
+}
+
 /// Handle a single client connection.
 ///
 /// Reads the first HTTP line to determine the proxy mode:
@@ -707,19 +724,7 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
         if !state.route_store.is_empty()
             && let Some(authority) = first_line.split_whitespace().nth(1)
         {
-            // Normalise authority to host:port. Handle IPv6 brackets:
-            // "[::1]:443" already has port, "[::1]" needs default, "host:443" has port.
-            let host_port = if authority.starts_with('[') {
-                if authority.contains("]:") {
-                    authority.to_lowercase()
-                } else {
-                    format!("{}:443", authority.to_lowercase())
-                }
-            } else if authority.contains(':') {
-                authority.to_lowercase()
-            } else {
-                format!("{}:443", authority.to_lowercase())
-            };
+            let host_port = normalize_authority(authority);
 
             if state.route_store.is_route_upstream(&host_port) {
                 let route_id = state
@@ -740,36 +745,89 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
                         // (we mint a leaf cert and decrypt traffic), so
                         // unlike the lenient transparent-tunnel path we
                         // require Proxy-Authorization here.
-                        if let Err(e) =
-                            token::validate_proxy_auth(&header_bytes, &state.session_token)
-                        {
-                            debug!(
-                                "tls_intercept: rejecting CONNECT to {}:{} — {}",
-                                host, port, e
-                            );
-                            audit::log_denied(
-                                    Some(&state.audit_log),
-                                    audit::ProxyMode::ConnectIntercept,
-                                    &audit::EventContext {
-                                        route_id,
-                                        auth_mechanism: Some(
-                                            nono::undo::NetworkAuditAuthMechanism::ProxyAuthorization,
-                                        ),
-                                        auth_outcome: Some(
-                                            nono::undo::NetworkAuditAuthOutcome::Failed,
-                                        ),
-                                        denial_category: Some(
-                                            nono::undo::NetworkAuditDenialCategory::AuthenticationFailed,
-                                        ),
-                                        ..audit::EventContext::default()
-                                    },
-                                    &host,
-                                    port,
-                                    "proxy auth missing or invalid",
-                                );
-                            let response = "HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"nono\"\r\nContent-Length: 0\r\n\r\n";
-                            stream.write_all(response.as_bytes()).await?;
-                            return Ok(());
+                        // Reactive proxy auth (RFC 7235 / RFC 9110 §15.5.8): a
+                        // client may send the first CONNECT without credentials,
+                        // receive the 407 challenge, then retry the CONNECT with
+                        // Proxy-Authorization on the SAME connection. Keep the
+                        // connection open across the 407 and re-read the retried
+                        // request head rather than dropping the socket — closing
+                        // it breaks reactive clients (Apache HttpClient, Java's
+                        // HttpClient, Maven's native resolver).
+                        let mut current_headers = header_bytes;
+                        loop {
+                            match token::validate_proxy_auth(&current_headers, &state.session_token)
+                            {
+                                Ok(()) => break,
+                                Err(e) => {
+                                    debug!(
+                                        "tls_intercept: CONNECT to {}:{} missing/invalid proxy auth — {}",
+                                        host, port, e
+                                    );
+                                    audit::log_denied(
+                                        Some(&state.audit_log),
+                                        audit::ProxyMode::ConnectIntercept,
+                                        &audit::EventContext {
+                                            route_id,
+                                            auth_mechanism: Some(
+                                                nono::undo::NetworkAuditAuthMechanism::ProxyAuthorization,
+                                            ),
+                                            auth_outcome: Some(
+                                                nono::undo::NetworkAuditAuthOutcome::Failed,
+                                            ),
+                                            denial_category: Some(
+                                                nono::undo::NetworkAuditDenialCategory::AuthenticationFailed,
+                                            ),
+                                            ..audit::EventContext::default()
+                                        },
+                                        &host,
+                                        port,
+                                        "proxy auth missing or invalid",
+                                    );
+                                    let response = "HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"nono\"\r\nContent-Length: 0\r\n\r\n";
+                                    stream.write_all(response.as_bytes()).await?;
+
+                                    // Read the client's retried request head on
+                                    // the same connection.
+                                    let mut buf_reader = BufReader::new(&mut stream);
+                                    let mut retry_line = String::new();
+                                    buf_reader.read_line(&mut retry_line).await?;
+                                    if retry_line.is_empty() {
+                                        return Ok(()); // client disconnected
+                                    }
+                                    let mut retry_headers = Vec::new();
+                                    loop {
+                                        let mut line = String::new();
+                                        let n = buf_reader.read_line(&mut line).await?;
+                                        if n == 0 || line.trim().is_empty() {
+                                            break;
+                                        }
+                                        retry_headers.extend_from_slice(line.as_bytes());
+                                        if retry_headers.len() > MAX_HEADER_SIZE {
+                                            drop(buf_reader);
+                                            let too_large = "HTTP/1.1 431 Request Header Fields Too Large\r\n\r\n";
+                                            stream.write_all(too_large.as_bytes()).await?;
+                                            return Ok(());
+                                        }
+                                    }
+                                    drop(buf_reader);
+
+                                    // host/port/route are reused from the first
+                                    // CONNECT, so the retry must target the same
+                                    // authority; anything else (or a non-CONNECT
+                                    // request) would desync routing.
+                                    let same_authority = retry_line
+                                        .trim_end()
+                                        .strip_prefix("CONNECT ")
+                                        .and_then(|rest| rest.split_whitespace().next())
+                                        .map(normalize_authority)
+                                        .as_deref()
+                                        == Some(host_port.as_str());
+                                    if !same_authority {
+                                        return Ok(());
+                                    }
+                                    current_headers = retry_headers;
+                                }
+                            }
                         }
 
                         let ctx = tls_intercept::InterceptCtx {
@@ -964,6 +1022,26 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalize_authority_normalises_case_and_default_port() {
+        assert_eq!(normalize_authority("API.OpenAI.com"), "api.openai.com:443");
+        assert_eq!(
+            normalize_authority("api.openai.com:443"),
+            "api.openai.com:443"
+        );
+        assert_eq!(
+            normalize_authority("api.openai.com:8443"),
+            "api.openai.com:8443"
+        );
+        assert_eq!(normalize_authority("[::1]"), "[::1]:443");
+        assert_eq!(normalize_authority("[::1]:8443"), "[::1]:8443");
+        // case- and port-insensitive equality is the point of the retry guard
+        assert_eq!(
+            normalize_authority("API.OPENAI.COM:443"),
+            normalize_authority("api.openai.com")
+        );
+    }
 
     #[tokio::test]
     async fn test_proxy_starts_and_binds() {
@@ -1779,6 +1857,94 @@ mod tests {
             "expected a Deny audit event for example.com, got: {:?}",
             events
         );
+
+        handle.shutdown();
+    }
+
+    /// Regression test for reactive proxy auth on the intercept CONNECT path.
+    /// After a 407 the proxy must keep the connection open and answer the
+    /// client's credentialed retry on the same socket, rather than closing it
+    /// (which breaks reactive clients such as Apache HttpClient / Maven's
+    /// native resolver).
+    #[tokio::test]
+    async fn reactive_proxy_auth_retry_answered_after_407() {
+        use base64::Engine;
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = ProxyConfig {
+            routes: vec![crate::config::RouteConfig {
+                prefix: "openai".to_string(),
+                upstream: "https://api.openai.com".to_string(),
+                credential_key: Some("env://NONO_TEST_TOTALLY_MISSING".to_string()),
+                inject_mode: Default::default(),
+                inject_header: "Authorization".to_string(),
+                credential_format: Some("Bearer {}".to_string()),
+                path_pattern: None,
+                path_replacement: None,
+                query_param_name: None,
+                proxy: None,
+                env_var: None,
+                endpoint_rules: vec![],
+                tls_ca: None,
+                tls_client_cert: None,
+                tls_client_key: None,
+                oauth2: None,
+            }],
+            intercept_ca_dir: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        };
+        let handle = start(config).await.unwrap();
+        assert!(
+            handle.intercept_ca_path().is_some(),
+            "precondition: interception must be active so the 407 path is reached"
+        );
+        let port = handle.port;
+        let token = handle.token.to_string();
+
+        let mut sock = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+
+        // 1) Unauthenticated CONNECT -> expect a 407 challenge.
+        sock.write_all(b"CONNECT api.openai.com:443 HTTP/1.1\r\nHost: api.openai.com:443\r\n\r\n")
+            .await
+            .unwrap();
+        sock.flush().await.unwrap();
+
+        let mut buf = [0u8; 4096];
+        let n = sock.read(&mut buf).await.unwrap();
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(
+            response.starts_with("HTTP/1.1 407 "),
+            "expected 407 challenge, got: {:?}",
+            response
+        );
+
+        // 2) Reactive retry WITH valid credentials on the SAME socket.
+        let creds = base64::engine::general_purpose::STANDARD.encode(format!("nono:{}", token));
+        let retry = format!(
+            "CONNECT api.openai.com:443 HTTP/1.1\r\nHost: api.openai.com:443\r\nProxy-Authorization: Basic {}\r\n\r\n",
+            creds
+        );
+        sock.write_all(retry.as_bytes()).await.unwrap();
+        sock.flush().await.unwrap();
+
+        // 3) The proxy must answer the retried CONNECT on the same socket
+        //    instead of returning EOF. (The upstream connect to api.openai.com
+        //    may fail in the test env, so we require a response, not a 200.)
+        let mut retry_buf = [0u8; 4096];
+        let read_result =
+            tokio::time::timeout(Duration::from_secs(5), sock.read(&mut retry_buf)).await;
+        match read_result {
+            Ok(Ok(0)) => panic!(
+                "regression: proxy closed the socket after the 407 instead of \
+                 answering the reactive retry"
+            ),
+            Ok(Ok(_)) => {} // answered -> reactive auth handled
+            Ok(Err(e)) => panic!("retry read errored: {e}"),
+            Err(_) => panic!("retry read timed out — proxy did not answer the retry"),
+        }
 
         handle.shutdown();
     }

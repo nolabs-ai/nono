@@ -13,12 +13,12 @@ use crate::undo::{
 use crate::{NonoError, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use sigstore_verify::types::bundle::SignatureContent;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use zeroize::Zeroizing;
 
 /// Filename used for per-session audit event logs.
 pub const AUDIT_EVENTS_FILENAME: &str = "audit-events.ndjson";
@@ -809,16 +809,13 @@ pub fn sign_audit_attestation_bundle(
             reason: "audit attestation requires audit integrity to be enabled".to_string(),
         })?;
 
-    let scrubbed_command = Zeroizing::new(crate::scrub_argv_with_policy(
-        &metadata.command,
-        redaction_policy,
-    ));
+    let scrubbed_command = crate::scrub_argv_with_policy(&metadata.command, redaction_policy);
     let predicate = serde_json::to_value(AuditAttestationPredicate {
         version: 1,
         session_id: &metadata.session_id,
         started: &metadata.started,
         ended: &metadata.ended,
-        command: scrubbed_command.as_slice(),
+        command: &scrubbed_command,
         redaction_policy: redaction_policy.diff_from_secure_default().into_option(),
         audit_log: AuditLogPredicate {
             hash_algorithm: &integrity.hash_algorithm,
@@ -1128,30 +1125,20 @@ fn attestation_failure(
 }
 
 fn extract_audit_attestation_statement(bundle: &trust::Bundle) -> Result<trust::InTotoStatement> {
-    let bundle_json = bundle.to_json().map_err(|e| NonoError::TrustVerification {
-        path: String::new(),
-        reason: format!("failed to serialize audit attestation bundle: {e}"),
-    })?;
-    let bundle_value: serde_json::Value =
-        serde_json::from_str(&bundle_json).map_err(|e| NonoError::TrustVerification {
-            path: String::new(),
-            reason: format!("invalid audit attestation bundle JSON: {e}"),
-        })?;
-    let envelope_value =
-        bundle_value
-            .get("dsseEnvelope")
-            .ok_or_else(|| NonoError::TrustVerification {
+    let envelope = match &bundle.content {
+        SignatureContent::DsseEnvelope(envelope) => envelope,
+        _ => {
+            return Err(NonoError::TrustVerification {
                 path: String::new(),
                 reason: "audit attestation bundle missing dsseEnvelope".to_string(),
-            })?;
-    let envelope: trust::DsseEnvelope =
-        serde_json::from_value(envelope_value.clone()).map_err(|e| {
-            NonoError::TrustVerification {
-                path: String::new(),
-                reason: format!("invalid audit attestation DSSE envelope: {e}"),
-            }
-        })?;
-    envelope.extract_statement()
+            });
+        }
+    };
+
+    serde_json::from_slice(envelope.payload.as_bytes()).map_err(|e| NonoError::TrustVerification {
+        path: String::new(),
+        reason: format!("invalid audit attestation statement JSON: {e}"),
+    })
 }
 
 fn hash_ledger_link(

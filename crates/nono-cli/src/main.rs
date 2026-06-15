@@ -20,6 +20,7 @@ mod credential_runtime;
 mod deprecated_policy;
 mod deprecated_schema;
 mod deprecation_warnings;
+mod diagnostic;
 mod exec_strategy;
 mod execution_runtime;
 #[cfg(unix)]

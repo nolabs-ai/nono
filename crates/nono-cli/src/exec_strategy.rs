@@ -14,6 +14,7 @@ mod env_sanitization;
 #[cfg(target_os = "linux")]
 mod supervisor_linux;
 
+use crate::diagnostic::{DiagnosticFormatter, DiagnosticMode};
 use crate::startup_prompt::{notify_startup_termination_for_child, print_terminal_safe_stderr};
 use crate::{DETACHED_CWD_PROMPT_RESPONSE_ENV, DETACHED_LAUNCH_ENV, DETACHED_SESSION_ID_ENV};
 use nix::libc;
@@ -22,9 +23,8 @@ use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::{ForkResult, Pid, fork};
 use nono::supervisor::{ApprovalDecision, AuditEntry, SupervisorMessage, SupervisorResponse};
 use nono::{
-    ApprovalBackend, CapabilitySet, DenialReason, DenialRecord, DiagnosticFormatter,
-    DiagnosticMode, NonoError, Result, Sandbox, SupervisorListener, SupervisorSocket,
-    UnixSocketCapability, UnixSocketMode,
+    ApprovalBackend, CapabilitySet, DenialReason, DenialRecord, NonoError, Result, Sandbox,
+    SupervisorListener, SupervisorSocket, UnixSocketCapability, UnixSocketMode,
 };
 use std::collections::HashSet;
 use std::ffi::{CString, OsStr};
@@ -74,8 +74,8 @@ const MAX_TRACKED_REQUEST_IDS: usize = 4096;
 use crate::timeouts;
 
 struct ProfileSaveOffer<'a> {
-    policy_explanations: &'a [nono::diagnostic::PolicyExplanation],
-    error_observation: &'a nono::diagnostic::ErrorObservation,
+    policy_explanations: &'a [crate::diagnostic::PolicyExplanation],
+    error_observation: &'a crate::diagnostic::ErrorObservation,
     caps: &'a CapabilitySet,
     command: &'a [String],
     compared_profile: Option<&'a str>,
@@ -1281,7 +1281,7 @@ pub fn execute_supervised(
             let error_observation = pty_proxy
                 .as_ref()
                 .map(|p| {
-                    nono::diagnostic::analyze_error_output(
+                    crate::diagnostic::analyze_error_output(
                         &p.screen_plaintext(),
                         config.protected_paths,
                         Some(config.current_dir),
@@ -1371,7 +1371,7 @@ pub fn execute_supervised(
                     )
                     .with_canonical_denial_paths(canonical_denial_paths);
                 if let Some(program) = config.command.first() {
-                    formatter = formatter.with_command(nono::diagnostic::CommandContext {
+                    formatter = formatter.with_command(crate::diagnostic::CommandContext {
                         program: program.clone(),
                         resolved_path: config.resolved_program.to_path_buf(),
                         args: nono::scrub_argv_with_policy(config.command, redaction_policy),
@@ -1421,9 +1421,9 @@ fn build_policy_explanations(
     denials: &[nono::diagnostic::DenialRecord],
     sandbox_violations: &[nono::SandboxViolation],
     caps: &nono::CapabilitySet,
-) -> Vec<nono::diagnostic::PolicyExplanation> {
+) -> Vec<crate::diagnostic::PolicyExplanation> {
+    use crate::diagnostic::PolicyExplanation;
     use nono::AccessMode;
-    use nono::diagnostic::PolicyExplanation;
     use std::collections::BTreeMap;
 
     // Merge access modes per path so a path denied for both Read and Write
@@ -1475,8 +1475,6 @@ fn build_policy_explanations(
         match crate::query_ext::query_path(&path, access, caps, &[]) {
             Ok(crate::query_ext::QueryResult::Denied {
                 reason,
-                details,
-                policy_source,
                 suggested_flag,
                 ..
             }) => {
@@ -1484,8 +1482,6 @@ fn build_policy_explanations(
                     path,
                     access,
                     reason,
-                    details,
-                    policy_source,
                     suggested_flag,
                 });
             }
@@ -1535,7 +1531,7 @@ fn should_print_diagnostic_footer(
     denials: &[nono::diagnostic::DenialRecord],
     ipc_denials: &[nono::diagnostic::IpcDenialRecord],
     sandbox_violations: &[nono::SandboxViolation],
-    error_observation: &nono::diagnostic::ErrorObservation,
+    error_observation: &crate::diagnostic::ErrorObservation,
 ) -> bool {
     !no_diagnostics
         && (exit_code != 0
@@ -1566,8 +1562,8 @@ fn filter_suppressed_system_service_violations(
 fn should_offer_profile_save(
     no_diagnostics: bool,
     exit_code: i32,
-    policy_explanations: &[nono::diagnostic::PolicyExplanation],
-    error_observation: &nono::diagnostic::ErrorObservation,
+    policy_explanations: &[crate::diagnostic::PolicyExplanation],
+    error_observation: &crate::diagnostic::ErrorObservation,
     sandbox_violations: &[nono::SandboxViolation],
 ) -> bool {
     !no_diagnostics
@@ -3745,7 +3741,7 @@ mod tests {
             target: Some("/tmp/secret.txt".to_string()),
         }];
         let denials = Vec::new();
-        let observation = nono::diagnostic::ErrorObservation::default();
+        let observation = crate::diagnostic::ErrorObservation::default();
 
         assert!(should_print_diagnostic_footer(
             false,
@@ -3767,15 +3763,13 @@ mod tests {
 
     #[test]
     fn test_profile_save_prompt_triggers_on_policy_explanation_with_zero_exit() {
-        let explanations = vec![nono::diagnostic::PolicyExplanation {
+        let explanations = vec![crate::diagnostic::PolicyExplanation {
             path: PathBuf::from("/tmp/secret.txt"),
             access: nono::AccessMode::Read,
             reason: "path_not_granted".to_string(),
-            details: None,
-            policy_source: None,
             suggested_flag: Some("--read-file /tmp/secret.txt".to_string()),
         }];
-        let observation = nono::diagnostic::ErrorObservation::default();
+        let observation = crate::diagnostic::ErrorObservation::default();
 
         assert!(should_offer_profile_save(
             false,
@@ -3789,7 +3783,7 @@ mod tests {
     #[test]
     fn test_profile_save_prompt_triggers_on_user_preferences_violation_with_zero_exit() {
         let explanations = Vec::new();
-        let observation = nono::diagnostic::ErrorObservation::default();
+        let observation = crate::diagnostic::ErrorObservation::default();
         let violations = vec![nono::SandboxViolation {
             operation: "user-preference-read".to_string(),
             target: Some("kcfpreferencesanyapplication".to_string()),
@@ -3807,7 +3801,7 @@ mod tests {
     #[test]
     fn test_suppressed_system_service_violations_do_not_offer_profile_save() {
         let explanations = Vec::new();
-        let observation = nono::diagnostic::ErrorObservation::default();
+        let observation = crate::diagnostic::ErrorObservation::default();
         let violations = vec![nono::SandboxViolation {
             operation: "forbidden-exec-sugid".to_string(),
             target: None,
@@ -3855,7 +3849,7 @@ mod tests {
     #[test]
     fn test_profile_save_prompt_preserves_nonzero_exit_behavior() {
         let explanations = Vec::new();
-        let observation = nono::diagnostic::ErrorObservation::default();
+        let observation = crate::diagnostic::ErrorObservation::default();
 
         assert!(should_offer_profile_save(
             false,

@@ -240,6 +240,14 @@ fn mapping_table() -> Vec<(&'static str, &'static str, Category)> {
         ("EnvironmentConfig", "allow_vars", Flag("allow-env-var")),
         ("EnvironmentConfig", "deny_vars", Flag("deny-env-var")),
         (
+            "EnvironmentConfig",
+            "set_vars",
+            ProfileOnly(
+                "static env injection (HashMap key=value); profile-authored auditable decision \
+                 with shell-style expansion - not exposed as a flag",
+            ),
+        ),
+        (
             "OpenUrlConfig",
             "allow_origins",
             ProfileOnly("URL origin allowlist for OAuth flows; profile-authored"),

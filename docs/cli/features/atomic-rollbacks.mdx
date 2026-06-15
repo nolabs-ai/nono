@@ -22,7 +22,7 @@ nono run --rollback --profile always-further/claude -- claude
 ```
 
 <Note>
-`--rollback` automatically selects supervised execution because the parent process needs to remain unsandboxed to write snapshots to `~/.nono/rollbacks/`.
+`--rollback` automatically selects supervised execution because the parent process needs to remain unsandboxed to write snapshots to `$XDG_STATE_HOME/nono/rollbacks/` (default `~/.local/state/nono/rollbacks/`).
 </Note>
 
 ## Snapshot Architecture
@@ -41,10 +41,10 @@ Each snapshot builds a Merkle tree over all tracked files. The root hash provide
 
 ### Session Structure
 
-Sessions are stored in `~/.nono/rollbacks/` with the following layout:
+Sessions are stored in `$XDG_STATE_HOME/nono/rollbacks/` (default `~/.local/state/nono/rollbacks/`). Older installs may still have data under `~/.nono/rollbacks/`; nono reads that path with a deprecation warning until v1.0.0. Layout:
 
 ```
-~/.nono/rollbacks/
+$XDG_STATE_HOME/nono/rollbacks/
   <session-id>/
     manifest.json       # Session metadata, Merkle roots, timestamps
     objects/            # Content-addressable file store

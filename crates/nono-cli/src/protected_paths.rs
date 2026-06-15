@@ -1,7 +1,7 @@
 //! Protection for nono's own state paths.
 //!
 //! These checks enforce a hard fail if initial sandbox capabilities overlap
-//! with internal CLI state roots (currently `~/.nono`).
+//! with internal CLI state roots (`~/.nono` and `$XDG_STATE_HOME/nono`).
 
 use nono::{CapabilitySet, NonoError, Result, try_canonicalize};
 use std::path::{Path, PathBuf};
@@ -17,12 +17,11 @@ pub struct ProtectedRoots {
 impl ProtectedRoots {
     /// Build protected roots from current defaults.
     ///
-    /// Today this protects the full `~/.nono` subtree.
+    /// Protects both the legacy `~/.nono` tree and the canonical `$XDG_STATE_HOME/nono`
+    /// runtime state directory (audit, sessions, rollbacks).
     pub fn from_defaults() -> Result<Self> {
-        let home = dirs::home_dir().ok_or(NonoError::HomeNotFound)?;
-        let state_root = try_canonicalize(&home.join(".nono"));
         Ok(Self {
-            roots: vec![state_root],
+            roots: crate::state_paths::protected_state_roots()?,
         })
     }
 

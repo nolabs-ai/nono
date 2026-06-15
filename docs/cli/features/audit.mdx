@@ -350,4 +350,4 @@ The audit trail is intentionally narrow in what it claims to prove.
 
 ## Storage
 
-Audit sessions are stored in `~/.nono/audit/`. Audit-only sessions are small (`session.json` and `audit-events.ndjson`). Signed sessions also include `audit-attestation.bundle`. Clean them up with `nono audit cleanup`.
+Audit sessions are stored in `$XDG_STATE_HOME/nono/audit/` (default `~/.local/state/nono/audit/`). Older installs may still have data under `~/.nono/audit/`; nono reads that path with a deprecation warning until v1.0.0. Audit-only sessions are small (`session.json` and `audit-events.ndjson`). Signed sessions also include `audit-attestation.bundle`. Clean them up with `nono audit cleanup`.

@@ -1,11 +1,13 @@
 //! Session discovery and management for the rollback system
 //!
-//! Provides functions to discover, load, and manage rollback sessions
-//! stored in `~/.nono/rollbacks/`. This is a CLI concern — the library
-//! provides primitives, the CLI provides session lifecycle management.
+//! Provides functions to discover, load, and manage rollback sessions stored
+//! under `$XDG_STATE_HOME/nono/rollbacks/` (default `~/.local/state/nono/rollbacks/`).
+//! Reads also check `~/.nono/rollbacks/` until v1.0.0.
 
+use crate::state_paths;
 use nono::undo::{SessionMetadata, SnapshotManager};
 use nono::{NonoError, Result};
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
@@ -25,66 +27,59 @@ pub struct SessionInfo {
     pub is_stale: bool,
 }
 
-/// Get the rollback root directory (`~/.nono/rollbacks/`)
+/// Get the canonical rollback root directory (`$XDG_STATE_HOME/nono/rollbacks/`).
 pub fn rollback_root() -> Result<PathBuf> {
-    let home = dirs::home_dir().ok_or(NonoError::HomeNotFound)?;
-    Ok(home.join(".nono").join("rollbacks"))
+    state_paths::rollback_root()
 }
 
-/// Discover all rollback sessions in `~/.nono/rollbacks/`.
+/// Discover all rollback sessions across canonical and legacy roots.
 ///
-/// Scans the rollback root directory, loads session metadata from each
+/// Scans rollback root directories, loads session metadata from each
 /// subdirectory, and enriches with derived data (disk size, alive status).
-/// Sessions with missing or corrupt metadata are skipped.
+/// Sessions with missing or corrupt metadata are skipped. When the same
+/// session ID exists in multiple roots, the canonical root wins.
 pub fn discover_sessions() -> Result<Vec<SessionInfo>> {
-    let root = rollback_root()?;
-    if !root.exists() {
-        return Ok(Vec::new());
-    }
-
     let mut sessions = Vec::new();
+    let mut seen_ids = BTreeSet::new();
 
-    let entries = fs::read_dir(&root).map_err(|e| {
-        NonoError::Snapshot(format!(
-            "Failed to read rollback directory {}: {e}",
-            root.display()
-        ))
-    })?;
-
-    for entry in entries {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-
-        let dir = entry.path();
-        if !dir.is_dir() {
+    for root in state_paths::rollback_discovery_roots()? {
+        if !root.exists() {
             continue;
         }
 
-        // Try to load session metadata
-        let metadata = match SnapshotManager::load_session_metadata(&dir) {
-            Ok(m) => m,
-            Err(_) => continue, // Skip corrupt or incomplete sessions
-        };
+        let entries = fs::read_dir(&root).map_err(|e| {
+            NonoError::Snapshot(format!(
+                "Failed to read rollback directory {}: {e}",
+                root.display()
+            ))
+        })?;
 
-        let pid = parse_pid_from_session_id(&metadata.session_id);
-        let is_alive = pid.map(is_process_alive).unwrap_or(false);
-        let is_stale = metadata.ended.is_none() && !is_alive;
-        let disk_size = calculate_dir_size(&dir);
+        for entry in entries {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
 
-        sessions.push(SessionInfo {
-            metadata,
-            dir,
-            disk_size,
-            is_alive,
-            is_stale,
-        });
+            let dir = entry.path();
+            if !dir.is_dir() {
+                continue;
+            }
+
+            let metadata = match SnapshotManager::load_session_metadata(&dir) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+
+            if !seen_ids.insert(metadata.session_id.clone()) {
+                continue;
+            }
+
+            state_paths::warn_if_legacy_rollback_data_read(&dir);
+            sessions.push(build_session_info(dir, metadata));
+        }
     }
 
-    // Sort by start time, newest first
     sessions.sort_by(|a, b| b.metadata.started.cmp(&a.metadata.started));
-
     Ok(sessions)
 }
 
@@ -92,56 +87,49 @@ pub fn discover_sessions() -> Result<Vec<SessionInfo>> {
 ///
 /// The session_id is validated to prevent path traversal — it must not
 /// contain path separators or `..` components. The resolved path is
-/// verified to be within the rollback root directory.
+/// verified to be within a rollback root directory.
 pub fn load_session(session_id: &str) -> Result<SessionInfo> {
     validate_session_id(session_id)?;
-    let root = rollback_root()?;
-    let dir = root.join(session_id);
 
-    // Defense in depth: verify the resolved path is within rollback root.
-    // Both canonicalizations must succeed -- fail closed if either cannot
-    // be resolved (prevents bypassing the traversal check).
-    let canonical_root = root.canonicalize().map_err(|e| {
-        NonoError::SessionNotFound(format!(
-            "Cannot canonicalize rollback root {}: {}",
-            root.display(),
-            e
-        ))
-    })?;
-    let canonical_dir = dir.canonicalize().map_err(|_| {
-        // Don't leak path details in error -- session simply doesn't exist
-        NonoError::SessionNotFound(session_id.to_string())
-    })?;
-    if !canonical_dir.starts_with(&canonical_root) {
-        return Err(NonoError::SessionNotFound(session_id.to_string()));
+    for root in state_paths::rollback_discovery_roots()? {
+        let dir = root.join(session_id);
+        if !dir.exists() {
+            continue;
+        }
+
+        let canonical_root = root.canonicalize().map_err(|e| {
+            NonoError::SessionNotFound(format!(
+                "Cannot canonicalize rollback root {}: {}",
+                root.display(),
+                e
+            ))
+        })?;
+        let canonical_dir = dir
+            .canonicalize()
+            .map_err(|_| NonoError::SessionNotFound(session_id.to_string()))?;
+        if !canonical_dir.starts_with(&canonical_root) {
+            continue;
+        }
+
+        let metadata = SnapshotManager::load_session_metadata(&dir)?;
+        state_paths::warn_if_legacy_rollback_data_read(&dir);
+        return Ok(build_session_info(dir, metadata));
     }
 
-    if !dir.exists() {
-        return Err(NonoError::SessionNotFound(session_id.to_string()));
-    }
-
-    let metadata = SnapshotManager::load_session_metadata(&dir)?;
-    let pid = parse_pid_from_session_id(&metadata.session_id);
-    let is_alive = pid.map(is_process_alive).unwrap_or(false);
-    let is_stale = metadata.ended.is_none() && !is_alive;
-    let disk_size = calculate_dir_size(&dir);
-
-    Ok(SessionInfo {
-        metadata,
-        dir,
-        disk_size,
-        is_alive,
-        is_stale,
-    })
+    Err(NonoError::SessionNotFound(session_id.to_string()))
 }
 
-/// Calculate the total disk usage of all sessions.
+/// Calculate the total disk usage of all sessions across rollback roots.
 pub fn total_storage_bytes() -> Result<u64> {
-    let root = rollback_root()?;
-    if !root.exists() {
-        return Ok(0);
+    let mut total: u64 = 0;
+    let mut seen_roots = BTreeSet::new();
+    for root in state_paths::rollback_discovery_roots()? {
+        if !seen_roots.insert(root.clone()) || !root.exists() {
+            continue;
+        }
+        total = total.saturating_add(calculate_dir_size(&root));
     }
-    Ok(calculate_dir_size(&root))
+    Ok(total)
 }
 
 /// Remove a session directory.
@@ -152,6 +140,21 @@ pub fn remove_session(dir: &Path) -> Result<()> {
             dir.display()
         ))
     })
+}
+
+fn build_session_info(dir: PathBuf, metadata: SessionMetadata) -> SessionInfo {
+    let pid = parse_pid_from_session_id(&metadata.session_id);
+    let is_alive = pid.map(is_process_alive).unwrap_or(false);
+    let is_stale = metadata.ended.is_none() && !is_alive;
+    let disk_size = calculate_dir_size(&dir);
+
+    SessionInfo {
+        metadata,
+        dir,
+        disk_size,
+        is_alive,
+        is_stale,
+    }
 }
 
 /// Validate a session ID to prevent path traversal.
@@ -218,6 +221,7 @@ pub fn format_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_env::{ENV_LOCK, EnvVarGuard};
 
     #[test]
     fn validate_session_id_rejects_traversal() {
@@ -260,7 +264,6 @@ mod tests {
     #[test]
     fn discover_sessions_empty_dir() {
         let dir = tempfile::TempDir::new().expect("tempdir");
-        // Override undo_root by testing calculate_dir_size directly
         let size = calculate_dir_size(dir.path());
         assert_eq!(size, 0);
     }
@@ -281,7 +284,48 @@ mod tests {
 
     #[test]
     fn dead_process_not_alive() {
-        // PID 99999999 is very unlikely to exist
         assert!(!is_process_alive(99_999_999));
+    }
+
+    #[test]
+    fn discover_sessions_reads_legacy_rollback_root() {
+        let _env_lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = tmp.path().join("state");
+        fs::create_dir_all(&state).expect("mkdir state");
+        let home = tmp.path().to_string_lossy().to_string();
+        let state_str = state.to_string_lossy().to_string();
+        let _env = EnvVarGuard::set_all(&[("HOME", &home), ("XDG_STATE_HOME", &state_str)]);
+
+        let legacy_dir = state_paths::legacy_rollback_root()
+            .expect("legacy rollback root")
+            .join("20260421-111111-30001");
+        fs::create_dir_all(&legacy_dir).expect("mkdir legacy rollback session");
+        SnapshotManager::write_session_metadata(
+            &legacy_dir,
+            &SessionMetadata {
+                session_id: "20260421-111111-30001".to_string(),
+                started: "2026-04-21T11:11:11+01:00".to_string(),
+                ended: Some("2026-04-21T11:11:12+01:00".to_string()),
+                command: vec!["/bin/true".to_string()],
+                executable_identity: None,
+                tracked_paths: vec![PathBuf::from("/tmp/work")],
+                snapshot_count: 2,
+                exit_code: Some(0),
+                merkle_roots: Vec::new(),
+                network_events: Vec::new(),
+                audit_event_count: 0,
+                audit_integrity: None,
+                audit_attestation: None,
+            },
+        )
+        .expect("write metadata");
+
+        let sessions = discover_sessions().expect("discover");
+        let ids: Vec<_> = sessions
+            .iter()
+            .map(|s| s.metadata.session_id.as_str())
+            .collect();
+        assert!(ids.contains(&"20260421-111111-30001"));
     }
 }

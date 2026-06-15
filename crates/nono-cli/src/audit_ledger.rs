@@ -1,4 +1,5 @@
 use crate::audit_session::audit_root;
+use crate::state_paths;
 use nix::fcntl::{Flock, FlockArg};
 use nono::audit::{
     LedgerRecord, LedgerVerificationResult, append_session_to_ledger_file,
@@ -9,7 +10,7 @@ use nono::undo::SessionMetadata;
 use nono::{NonoError, Result};
 use std::fs::OpenOptions;
 use std::io::BufReader;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const AUDIT_LEDGER_FILENAME: &str = "ledger.ndjson";
 const AUDIT_LEDGER_LOCK_FILENAME: &str = "ledger.lock";
@@ -18,6 +19,7 @@ pub(crate) fn append_session(metadata: &SessionMetadata) -> Result<LedgerRecord>
     validate_ledger_session_id(&metadata.session_id)?;
 
     let root = audit_root()?;
+    state_paths::maybe_migrate_legacy_audit_ledger()?;
     std::fs::create_dir_all(&root).map_err(|e| {
         NonoError::Snapshot(format!(
             "Failed to create audit root {}: {e}",
@@ -45,7 +47,29 @@ pub(crate) fn append_session(metadata: &SessionMetadata) -> Result<LedgerRecord>
 pub(crate) fn verify_session_in_ledger(
     metadata: &SessionMetadata,
 ) -> Result<LedgerVerificationResult> {
-    let root = audit_root()?;
+    let primary = audit_root()?;
+    let result = verify_session_in_ledger_at_root(&primary, metadata)?;
+    if result.session_found {
+        return Ok(result);
+    }
+
+    if let Ok(legacy) = state_paths::legacy_audit_root()
+        && legacy != primary
+    {
+        let legacy_ledger = legacy.join(AUDIT_LEDGER_FILENAME);
+        if legacy_ledger.exists() {
+            state_paths::warn_legacy_audit_path(&legacy);
+            return verify_session_in_ledger_at_root(&legacy, metadata);
+        }
+    }
+
+    Ok(result)
+}
+
+fn verify_session_in_ledger_at_root(
+    root: &Path,
+    metadata: &SessionMetadata,
+) -> Result<LedgerVerificationResult> {
     let path = root.join(AUDIT_LEDGER_FILENAME);
     if !path.exists() {
         return missing_ledger_verification_result(metadata);
@@ -125,8 +149,11 @@ mod tests {
     fn ledger_appends_and_verifies_session_digest() {
         let _env_lock = ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state");
+        std::fs::create_dir_all(&state).unwrap();
         let home = tmp.path().to_string_lossy().to_string();
-        let _env = EnvVarGuard::set_all(&[("HOME", &home)]);
+        let state_str = state.to_string_lossy().to_string();
+        let _env = EnvVarGuard::set_all(&[("HOME", &home), ("XDG_STATE_HOME", &state_str)]);
 
         let meta = sample_metadata("20260421-200000-11111");
         append_session(&meta).unwrap();
@@ -142,8 +169,11 @@ mod tests {
     fn ledger_rejects_malformed_session_id() {
         let _env_lock = ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state");
+        std::fs::create_dir_all(&state).unwrap();
         let home = tmp.path().to_string_lossy().to_string();
-        let _env = EnvVarGuard::set_all(&[("HOME", &home)]);
+        let state_str = state.to_string_lossy().to_string();
+        let _env = EnvVarGuard::set_all(&[("HOME", &home), ("XDG_STATE_HOME", &state_str)]);
 
         let meta = sample_metadata("real-token\\|real-key");
         let err = match append_session(&meta) {

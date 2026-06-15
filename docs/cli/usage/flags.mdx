@@ -926,7 +926,7 @@ nono run --no-rollback --allow . -- npm test
 
 #### `--no-audit`
 
-Disable the audit trail for this session. By default, every supervised execution records session metadata and audit events (command, timestamps, exit code, capability decisions, URL opens, network events) to `~/.nono/audit/`. Use this flag to suppress audit recording entirely.
+Disable the audit trail for this session. By default, every supervised execution records session metadata and audit events (command, timestamps, exit code, capability decisions, URL opens, network events) to `$XDG_STATE_HOME/nono/audit/` (default `~/.local/state/nono/audit/`). Use this flag to suppress audit recording entirely.
 
 ```bash
 nono run --no-audit --allow-cwd -- my-command

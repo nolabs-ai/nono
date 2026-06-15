@@ -614,6 +614,23 @@ async fn accept_loop(
     }
 }
 
+/// Normalise a CONNECT authority to lowercase `host:port`, defaulting the port
+/// to 443 when absent. Handles IPv6 brackets: `[::1]:443` already has a port,
+/// `[::1]` needs the default, `host:443` has a port.
+fn normalize_authority(authority: &str) -> String {
+    if authority.starts_with('[') {
+        if authority.contains("]:") {
+            authority.to_lowercase()
+        } else {
+            format!("{}:443", authority.to_lowercase())
+        }
+    } else if authority.contains(':') {
+        authority.to_lowercase()
+    } else {
+        format!("{}:443", authority.to_lowercase())
+    }
+}
+
 /// Handle a single client connection.
 ///
 /// Reads the first HTTP line to determine the proxy mode:
@@ -677,19 +694,7 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
         if !state.route_store.is_empty()
             && let Some(authority) = first_line.split_whitespace().nth(1)
         {
-            // Normalise authority to host:port. Handle IPv6 brackets:
-            // "[::1]:443" already has port, "[::1]" needs default, "host:443" has port.
-            let host_port = if authority.starts_with('[') {
-                if authority.contains("]:") {
-                    authority.to_lowercase()
-                } else {
-                    format!("{}:443", authority.to_lowercase())
-                }
-            } else if authority.contains(':') {
-                authority.to_lowercase()
-            } else {
-                format!("{}:443", authority.to_lowercase())
-            };
+            let host_port = normalize_authority(authority);
 
             if state.route_store.is_route_upstream(&host_port) {
                 let route_id = state
@@ -784,7 +789,9 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
                                         .trim_end()
                                         .strip_prefix("CONNECT ")
                                         .and_then(|rest| rest.split_whitespace().next())
-                                        == Some(authority);
+                                        .map(normalize_authority)
+                                        .as_deref()
+                                        == Some(host_port.as_str());
                                     if !same_authority {
                                         return Ok(());
                                     }
@@ -924,6 +931,26 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalize_authority_normalises_case_and_default_port() {
+        assert_eq!(normalize_authority("API.OpenAI.com"), "api.openai.com:443");
+        assert_eq!(
+            normalize_authority("api.openai.com:443"),
+            "api.openai.com:443"
+        );
+        assert_eq!(
+            normalize_authority("api.openai.com:8443"),
+            "api.openai.com:8443"
+        );
+        assert_eq!(normalize_authority("[::1]"), "[::1]:443");
+        assert_eq!(normalize_authority("[::1]:8443"), "[::1]:8443");
+        // case- and port-insensitive equality is the point of the retry guard
+        assert_eq!(
+            normalize_authority("API.OPENAI.COM:443"),
+            normalize_authority("api.openai.com")
+        );
+    }
 
     #[tokio::test]
     async fn test_proxy_starts_and_binds() {

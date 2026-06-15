@@ -435,7 +435,7 @@ fn validate_rollback_destination(
 
     Err(NonoError::ConfigParse(format!(
         "--rollback-dest '{}' is not covered by sandbox write permissions. \
-         Add --allow {} to grant access, or omit --rollback-dest to use the default path (~/.nono/rollbacks/).",
+         Add --allow {} to grant access, or omit --rollback-dest to use the default path ($XDG_STATE_HOME/nono/rollbacks/).",
         dest.display(),
         dest.display()
     )))

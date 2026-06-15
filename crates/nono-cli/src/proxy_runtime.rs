@@ -493,20 +493,17 @@ pub(crate) fn start_proxy_runtime(
 }
 
 /// Choose the directory the proxy will write the TLS-intercept trust bundle
-/// into. Conventionally `~/.nono/sessions/<random>/`, kept owner-only.
+/// into. Conventionally `$XDG_STATE_HOME/nono/sessions/<random>/`, kept owner-only.
 ///
 /// Returns `Ok(None)` if no `HOME` is set (rare edge cases like CI). We log
 /// a warning rather than failing because TLS interception is opt-in: a
 /// missing directory just means CONNECTs to L7-bearing routes will get the
 /// usual 403, which is a coherent fallback rather than a hard error.
 fn prepare_intercept_ca_dir() -> Result<Option<PathBuf>> {
-    let home = match dirs::home_dir() {
-        Some(h) => h,
-        None => {
-            warn!(
-                "no $HOME found; skipping TLS-intercept setup (CONNECTs to L7-bearing routes \
-                 will be denied with 403)"
-            );
+    let dir = match crate::session::ensure_sessions_dir() {
+        Ok(base) => base,
+        Err(e) => {
+            warn!("cannot resolve session registry for TLS-intercept setup: {e}; skipping");
             return Ok(None);
         }
     };
@@ -520,10 +517,7 @@ fn prepare_intercept_ca_dir() -> Result<Option<PathBuf>> {
         .map(|d| d.subsec_nanos())
         .unwrap_or(0);
     let suffix = format!("{}-{:09}", pid, nanos);
-    let dir = home
-        .join(".nono")
-        .join("sessions")
-        .join(format!("intercept-{}", suffix));
+    let dir = dir.join(format!("intercept-{suffix}"));
     if let Err(e) = std::fs::create_dir_all(&dir) {
         warn!(
             "failed to create TLS-intercept dir '{}': {}; skipping interception",

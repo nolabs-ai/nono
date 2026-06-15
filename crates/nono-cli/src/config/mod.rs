@@ -63,12 +63,9 @@ pub fn user_config_dir() -> Option<PathBuf> {
     dirs::config_dir().map(|p| p.join("nono"))
 }
 
-/// Get the user state directory path (for version tracking)
-#[allow(dead_code)]
+/// Get the user state directory path (for version tracking and runtime state)
 pub fn user_state_dir() -> Option<PathBuf> {
-    dirs::state_dir()
-        .or_else(dirs::data_local_dir)
-        .map(|p| p.join("nono"))
+    crate::state_paths::user_state_dir().ok()
 }
 
 // ============================================================================

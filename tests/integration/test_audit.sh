@@ -21,9 +21,9 @@ fi
 TMPDIR=$(setup_test_dir)
 trap 'cleanup_test_dir "$TMPDIR"' EXIT
 
-# Use the real audit and rollback roots (same as nono uses via dirs::home_dir)
-AUDIT_ROOT="$HOME/.nono/audit"
-ROLLBACK_ROOT="$HOME/.nono/rollbacks"
+# Use the real audit and rollback roots (same as nono uses via XDG state + legacy rollback)
+AUDIT_ROOT="${XDG_STATE_HOME:-$HOME/.local/state}/nono/audit"
+ROLLBACK_ROOT="${XDG_STATE_HOME:-$HOME/.local/state}/nono/rollbacks"
 mkdir -p "$AUDIT_ROOT" "$ROLLBACK_ROOT"
 
 # Helper: find the session.json for a specific nono PID.

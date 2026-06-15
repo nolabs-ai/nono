@@ -297,24 +297,6 @@ fn parse_violation_line(filter: &ViolationFilter, line: &str) -> Option<SandboxV
 
 #[cfg(target_os = "macos")]
 fn parse_violation_value(filter: &ViolationFilter, value: &Value) -> Option<SandboxViolation> {
-    if let Some(message) = value.get("eventMessage").and_then(Value::as_str)
-        && let Some(violation) = parse_event_message(filter, message)
-    {
-        return Some(violation);
-    }
-
-    let metadata = value.get("eventMessage").and_then(|event_message| {
-        event_message
-            .as_str()
-            .and_then(|text| serde_json::from_str::<Value>(text).ok())
-    });
-    if let Some(violation) = metadata
-        .as_ref()
-        .and_then(|metadata| parse_metadata_violation(filter, metadata))
-    {
-        return Some(violation);
-    }
-
     let metadata = value
         .get("metadata")
         .or_else(|| value.get("MetaData"))
@@ -329,9 +311,49 @@ fn parse_violation_value(filter: &ViolationFilter, value: &Value) -> Option<Sand
             }
         });
 
-    metadata
+    let metadata_violation = metadata
         .as_ref()
-        .and_then(|metadata| parse_metadata_violation(filter, metadata))
+        .and_then(|metadata| parse_metadata_violation(filter, metadata));
+    if metadata_violation
+        .as_ref()
+        .is_some_and(|violation| violation.target.is_some())
+    {
+        return metadata_violation;
+    }
+
+    let event_metadata = value.get("eventMessage").and_then(|event_message| {
+        event_message
+            .as_str()
+            .and_then(|text| serde_json::from_str::<Value>(text).ok())
+    });
+    let event_metadata_violation = event_metadata
+        .as_ref()
+        .and_then(|metadata| parse_metadata_violation(filter, metadata));
+    if event_metadata_violation
+        .as_ref()
+        .is_some_and(|violation| violation.target.is_some())
+    {
+        return event_metadata_violation;
+    }
+
+    let event_violation = value
+        .get("eventMessage")
+        .and_then(Value::as_str)
+        .and_then(|message| parse_event_message(filter, message));
+
+    // None of the candidates exposed a structured target above. Prefer any
+    // remaining candidate that still carries a target (e.g. an `eventMessage`
+    // that names the denied path) over a target-less metadata record, so a
+    // file denial is never downgraded to a non-filesystem violation and lose
+    // its actionable path.
+    [
+        metadata_violation,
+        event_metadata_violation,
+        event_violation,
+    ]
+    .into_iter()
+    .flatten()
+    .min_by_key(|violation| violation.target.is_none())
 }
 
 #[cfg(target_os = "macos")]
@@ -445,6 +467,36 @@ mod tests {
     fn parses_ndjson_metadata_violation() {
         let line = r#"{"eventMessage":"Sandbox: cat(1234) deny(1) file-read-data /Users/test/.ssh/id_rsa","subsystem":"com.apple.sandbox.reporting","category":"violation","MetaData":{"operation":"file-read-data","pid":1234,"target":"/Users/test/.ssh/id_rsa"}}"#;
         let violation = parse_violation_line(&pid_filter(1234), line).expect("violation");
+        assert_eq!(violation.operation, "file-read-data");
+        assert_eq!(violation.target.as_deref(), Some("/Users/test/.ssh/id_rsa"));
+    }
+
+    #[test]
+    fn prefers_structured_metadata_over_event_message() {
+        let line = r#"{"eventMessage":"Sandbox: nl(1234) deny(1) file-read-data /Users/test/workspace/readable.rs","subsystem":"com.apple.sandbox.reporting","category":"violation","MetaData":{"operation":"file-write-create","pid":1234,"target":"/Users/test/Library/Caches/nl/state"}}"#;
+        let violation = match parse_violation_line(&pid_filter(1234), line) {
+            Some(violation) => violation,
+            None => panic!("metadata violation should parse"),
+        };
+
+        assert_eq!(violation.operation, "file-write-create");
+        assert_eq!(
+            violation.target.as_deref(),
+            Some("/Users/test/Library/Caches/nl/state")
+        );
+    }
+
+    #[test]
+    fn falls_back_to_event_message_target_when_metadata_has_no_target() {
+        // Metadata matches the pid/operation but carries no target; the
+        // eventMessage names the denied path. The path must survive so the
+        // denial stays an actionable filesystem violation.
+        let line = r#"{"eventMessage":"Sandbox: cat(1234) deny(1) file-read-data /Users/test/.ssh/id_rsa","subsystem":"com.apple.sandbox.reporting","category":"violation","MetaData":{"operation":"file-read-data","pid":1234}}"#;
+        let violation = match parse_violation_line(&pid_filter(1234), line) {
+            Some(violation) => violation,
+            None => panic!("event message violation should parse"),
+        };
+
         assert_eq!(violation.operation, "file-read-data");
         assert_eq!(violation.target.as_deref(), Some("/Users/test/.ssh/id_rsa"));
     }

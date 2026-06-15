@@ -3151,6 +3151,74 @@ mod tests {
     }
 
     #[test]
+    fn test_violation_denial_keeps_file_read_target() {
+        let requested = PathBuf::from("/Users/alice/workspace/readable.rs");
+        let violations = vec![SandboxViolation {
+            operation: "file-read-data".to_string(),
+            target: Some(requested.display().to_string()),
+        }];
+
+        let (denials, non_fs) = violations_to_denials(&violations);
+
+        assert!(non_fs.is_empty());
+        assert_eq!(denials.len(), 1);
+        assert_eq!(denials[0].path, requested);
+        assert_eq!(denials[0].access, AccessMode::Read);
+    }
+
+    #[test]
+    fn test_logged_violation_target_wins_over_observed_requested_path() {
+        let caps = make_test_caps();
+        let requested = PathBuf::from("/Users/alice/workspace/readable.rs");
+        let actual = PathBuf::from("/Users/alice/Library/Caches/nl/state");
+        let violations = vec![SandboxViolation {
+            operation: "file-write-create".to_string(),
+            target: Some(actual.display().to_string()),
+        }];
+        let formatter = DiagnosticFormatter::new(&caps)
+            .with_mode(DiagnosticMode::Supervised)
+            .with_sandbox_violations(&violations)
+            .with_error_observation(ErrorObservation {
+                primary_verdict: Some(ErrorVerdict::LikelySandbox(ObservedPathHint {
+                    path: requested.clone(),
+                    access: AccessMode::Read,
+                })),
+                blocked_protected_file: None,
+                path_hints: vec![ObservedPathHint {
+                    path: requested.clone(),
+                    access: AccessMode::Read,
+                }],
+                missing_paths: Vec::new(),
+                non_sandbox_failure: None,
+            });
+
+        let output = formatter.format_footer(1);
+
+        assert!(output.contains(&format!("{} (write)", actual.display())));
+        assert!(!output.contains(&requested.display().to_string()));
+    }
+
+    #[test]
+    fn test_sandbox_violation_preserves_workspace_prefix() {
+        let caps = make_test_caps();
+        let actual = PathBuf::from(
+            "/Users/alice/workspace/flutter_photo_manager/lib/src/internal/plugin.dart",
+        );
+        let violations = vec![SandboxViolation {
+            operation: "file-read-data".to_string(),
+            target: Some(actual.display().to_string()),
+        }];
+        let formatter = DiagnosticFormatter::new(&caps)
+            .with_mode(DiagnosticMode::Supervised)
+            .with_sandbox_violations(&violations);
+
+        let output = formatter.format_footer(1);
+
+        assert!(output.contains(&format!("{} (read)", actual.display())));
+        assert!(!output.contains("[nono]   /src/internal/plugin.dart (read)"));
+    }
+
+    #[test]
     fn test_supervised_merges_mkdir_error_hint_with_logged_read_denial() {
         let temp = tempdir().expect("tempdir should be created");
         let pkg = temp.path().join("Library/Caches/copilot/pkg");

@@ -453,9 +453,9 @@
 
 
 ### Security
-- Sandbox escape on Linux via D-Bus ([GHSA-27vp-2mmc-vmh3](https://github.com/always-further/nono/security/advisories/GHSA-27vp-2mmc-vmh3)) - reported by @cgwalters
+- Sandbox escape on Linux via D-Bus ([GHSA-27vp-2mmc-vmh3](https://github.com/always-further/nono/security/advisories/GHSA-27vp-2mmc-vmh3)) — reported by @cgwalters
 
-GHSA-27vp-2mmc-vmh3
+GHSA-27vp-2mmc-vmh3 
 
 ### Bug Fixes
 
@@ -869,7 +869,7 @@ GHSA-27vp-2mmc-vmh3
 
 ### Features
 
-- *(profile)* #594 phase 2 - canonical JSON schema restructure (#594)
+- *(profile)* #594 phase 2 — canonical JSON schema restructure (#594)
 
 
 ### Performance
@@ -1551,7 +1551,7 @@ GHSA-27vp-2mmc-vmh3
 
 - Allow filesystem.read entries to be files
 
-- *(proxy)* Address review feedback - normalize prefix in CredentialStore
+- *(proxy)* Address review feedback — normalize prefix in CredentialStore
 
 - *(proxy)* Handle route prefixes with leading slashes
 

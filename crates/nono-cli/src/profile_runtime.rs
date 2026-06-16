@@ -467,7 +467,7 @@ fn expand_profile_set_vars(
         let Some(value) = env_config.set_vars.get(key) else {
             continue;
         };
-        let expanded_value = profile::expand_vars(value, workdir)?
+        let expanded_value = profile::expand_vars(value, workdir, None)?
             .to_string_lossy()
             .into_owned();
         expanded.push((key.clone(), expanded_value));

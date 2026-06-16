@@ -67,7 +67,7 @@ On macOS, supervised mode provides rollback snapshots and the diagnostic footer,
 
 ## Protected State
 
-The supervisor always blocks access to nono's own protected state roots, such as `~/.nono`, before consulting the approval backend. This prevents dynamic grants from exposing rollback data, audit state, or other internal nono files.
+The supervisor always blocks access to nono's own protected state roots, such as `~/.nono` and `$XDG_STATE_HOME/nono`, before consulting the approval backend. This prevents dynamic grants from exposing rollback data, audit state, or other internal nono files.
 
 ## Audit Responsibilities
 

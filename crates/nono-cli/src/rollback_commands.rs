@@ -10,8 +10,9 @@ use crate::command_display::{format_command_line, truncate_chars};
 use crate::config::user::load_user_config;
 use crate::rollback_base_exclusions;
 use crate::rollback_session::{
-    SessionInfo, discover_sessions, format_bytes, load_session, remove_session, rollback_root,
+    SessionInfo, discover_sessions, format_bytes, load_session, remove_session,
 };
+use crate::state_paths;
 use crate::theme;
 use colored::Colorize;
 use nono::undo::{MerkleTree, ObjectStore, SnapshotManager};
@@ -921,8 +922,7 @@ fn cmd_cleanup(args: RollbackCleanupArgs) -> Result<()> {
 }
 
 fn cleanup_all(dry_run: bool) -> Result<()> {
-    let root = rollback_root()?;
-    if !root.exists() {
+    if !state_paths::any_rollback_root_exists()? {
         eprintln!("{} No rollback directory found.", prefix());
         return Ok(());
     }

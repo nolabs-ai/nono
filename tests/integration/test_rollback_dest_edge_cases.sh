@@ -136,7 +136,7 @@ run_test "session created under nonexistent dest after creation" 0 \
     bash -c "ls '$NONEXISTENT_DEST' | grep -qE '[0-9]{8}-[0-9]{6}-[0-9]+'"
 
 # =============================================================================
-# 6. Session is isolated to custom dest (not written to default ~/.nono/rollbacks)
+# 6. Session is isolated to custom dest (not written to default rollback root)
 # =============================================================================
 echo ""
 echo "--- Isolation: Custom Dest Does Not Pollute Default ---"
@@ -145,7 +145,7 @@ ISOLATED_DEST="$TMPDIR/isolated_rollbacks"
 mkdir -p "$ISOLATED_DEST"
 
 # Count sessions in default rollback root before
-default_root="$HOME/.nono/rollbacks"
+default_root="${XDG_STATE_HOME:-$HOME/.local/state}/nono/rollbacks"
 before_count=$(ls "$default_root" 2>/dev/null | grep -cE '[0-9]{8}-[0-9]{6}-[0-9]+' || true)
 
 expect_success "rollback with --rollback-dest runs successfully" \
@@ -157,7 +157,7 @@ expect_success "rollback with --rollback-dest runs successfully" \
 after_count=$(ls "$default_root" 2>/dev/null | grep -cE '[0-9]{8}-[0-9]{6}-[0-9]+' || true)
 
 if [ "$before_count" -eq "$after_count" ]; then
-    echo -e "  ${GREEN}PASS${NC}: default ~/.nono/rollbacks not polluted"
+    echo -e "  ${GREEN}PASS${NC}: default rollback root not polluted"
     TESTS_PASSED=$((TESTS_PASSED + 1))
 else
     echo -e "  ${RED}FAIL${NC}: unexpected new session in default rollback root"

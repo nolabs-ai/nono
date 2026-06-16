@@ -20,6 +20,7 @@ mod credential_runtime;
 mod deprecated_policy;
 mod deprecated_schema;
 mod deprecation_warnings;
+mod diagnostic;
 mod exec_strategy;
 mod execution_runtime;
 #[cfg(unix)]
@@ -65,6 +66,7 @@ mod session_commands;
 mod setup;
 mod startup_prompt;
 mod startup_runtime;
+mod state_paths;
 mod supervised_runtime;
 mod terminal_approval;
 mod theme;

@@ -1,5 +1,107 @@
 # Changelog
 
+## [0.63.0] - 2026-06-15
+
+### Bug Fixes
+
+- *(proxy)* Keep connection open for reactive proxy auth on CONNECT (#1151) ([#1151](https://github.com/always-further/nono/pull/1151))
+
+- Report the actual blocked operation instead of the readable target path in sandbox denial diagnostics (#1150) ([#1150](https://github.com/always-further/nono/pull/1150))
+
+- *(linux)* Trap sendto/sendmsg to prevent AF_UNIX datagram bypass (#1096) ([#1096](https://github.com/always-further/nono/pull/1096))
+
+- *(cli)* Accept truthy env values for bool flags (#1136) ([#1136](https://github.com/always-further/nono/pull/1136))
+
+- Replace stale nono.dev schema domains with nono.sh
+
+- *(audit)* Address ledger review and clippy
+
+- Write cargo vendor config for copr srpms
+
+- *(aur)* Skip ssh-keyscan banner lines in host key check
+
+
+### Build
+
+- Add copr source rpm packaging (#1075) ([#1075](https://github.com/always-further/nono/pull/1075))
+
+
+### CI/CD
+
+- Use actions/attest
+
+
+### Dependencies
+
+- *(deps)* Bump ignore from 0.4.25 to 0.4.26 (#1160) ([#1160](https://github.com/always-further/nono/pull/1160))
+
+- *(deps)* Bump chrono from 0.4.44 to 0.4.45 (#1159) ([#1159](https://github.com/always-further/nono/pull/1159))
+
+- *(deps)* Bump time from 0.3.47 to 0.3.49 (#1158) ([#1158](https://github.com/always-further/nono/pull/1158))
+
+- *(deps)* Bump zeroize from 1.8.2 to 1.9.0 (#1157) ([#1157](https://github.com/always-further/nono/pull/1157))
+
+- *(deps)* Bump typify from 0.6.2 to 0.7.0 (#1156) ([#1156](https://github.com/always-further/nono/pull/1156))
+
+- *(deps)* Bump actions/checkout from 6.0.2 to 6.0.3
+
+- *(deps)* Bump x509-parser from 0.16.0 to 0.18.1
+
+- *(deps)* Bump cbindgen from 0.29.2 to 0.29.3
+
+- *(deps)* Bump hyper from 1.9.0 to 1.10.1
+
+
+### Documentation
+
+- Document diagnostics.suppress_system_services for macOS (#1076) (#1138) ([#1138](https://github.com/always-further/nono/pull/1138))
+
+- *(readme)* Update agent commands and enhance feature descriptions (#1145) ([#1145](https://github.com/always-further/nono/pull/1145))
+
+- *(readme)* Refine project description and history (#1143) ([#1143](https://github.com/always-further/nono/pull/1143))
+
+- *(readme)* Update agent package publishing link (#1142) ([#1142](https://github.com/always-further/nono/pull/1142))
+
+- *(cli-quickstart)* Add profile usage to quickstart guide
+
+- Add copr installation instructions
+
+
+### Features
+
+- *(cli)* Move runtime state to XDG state dirs (#1152) ([#1152](https://github.com/always-further/nono/pull/1152))
+
+- Add $PACK_DIR support to session_hooks for store pack support (#1073) ([#1073](https://github.com/always-further/nono/pull/1073))
+
+- *(keyring)* Add NONO_KEYRING_TIMEOUT_SECS for keychain access (#977) ([#977](https://github.com/always-further/nono/pull/977))
+
+- *(environment)* Add set_vars for static env injection (#1134) ([#1134](https://github.com/always-further/nono/pull/1134))
+
+- *(pack-verification)* Skip pack verification on dry runs
+
+
+### Miscellaneous
+
+- *(project)* Add new issue template for agent package requests (#1081) ([#1081](https://github.com/always-further/nono/pull/1081))
+
+
+### Refactoring
+
+- *(diagnostic)* Move diagnostic UX out of core nono crate (#1155) ([#1155](https://github.com/always-further/nono/pull/1155))
+
+- *(pull_ui)* Remove sigstore provenance display (#1144) ([#1144](https://github.com/always-further/nono/pull/1144))
+
+- *(profiles)* Standardize profile names with namespace
+
+- *(audit-ledger)* Move audit ledger logic to library crate
+
+- *(audit)* Move audit integrity logic to nono crate
+
+
+### Testing
+
+- *(wsl2)* Fix has_landlock_network V4+ detection
+
 ## [0.62.0] - 2026-06-07
 
 ### Bug Fixes

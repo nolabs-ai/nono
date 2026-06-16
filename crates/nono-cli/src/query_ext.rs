@@ -560,7 +560,7 @@ pub fn print_result(result: &QueryResult) {
     }
 }
 
-fn suggested_flag_for_path(path: &Path, requested: AccessMode) -> String {
+pub(crate) fn suggested_flag_for_path(path: &Path, requested: AccessMode) -> String {
     let (flag, target) = suggested_flag_parts(path, requested);
     format!("{flag} {}", target.display())
 }

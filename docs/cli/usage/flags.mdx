@@ -934,7 +934,7 @@ nono run --no-rollback --allow . -- npm test
 
 #### `--no-audit`
 
-Disable the audit trail for this session. By default, every supervised execution records session metadata and audit events (command, timestamps, exit code, capability decisions, URL opens, network events) to `~/.nono/audit/`. Use this flag to suppress audit recording entirely.
+Disable the audit trail for this session. By default, every supervised execution records session metadata and audit events (command, timestamps, exit code, capability decisions, URL opens, network events) to `$XDG_STATE_HOME/nono/audit/` (default `~/.local/state/nono/audit/`). Use this flag to suppress audit recording entirely.
 
 ```bash
 nono run --no-audit --allow-cwd -- my-command
@@ -1125,6 +1125,11 @@ Suppress the diagnostic footer when the command exits non-zero. Useful for scrip
 ```bash
 nono run --no-diagnostics --allow-cwd -- my-command
 ```
+
+On macOS, to hide specific expected Seatbelt violations (such as
+`user-preference-read` from npm) without silencing all diagnostics, add the
+operation name to `diagnostics.suppress_system_services` in your profile
+instead. See [Profiles and Groups](/cli/features/profiles-groups#suppressing-expected-macos-system-service-diagnostics).
 
 #### `--capability-elevation`
 

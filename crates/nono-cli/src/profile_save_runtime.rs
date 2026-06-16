@@ -1,9 +1,9 @@
 use crate::command_display::format_command_line;
+use crate::diagnostic::{ErrorObservation, PolicyExplanation};
 use crate::theme;
 use crate::{profile, query_ext};
 use colored::Colorize;
 use nono::SandboxViolation;
-use nono::diagnostic::{ErrorObservation, PolicyExplanation};
 use nono::{AccessMode, CapabilitySet, NonoError, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, IsTerminal, Write};
@@ -1675,8 +1675,6 @@ mod tests {
             path: target,
             access: AccessMode::Read,
             reason: "sensitive_path".to_string(),
-            details: None,
-            policy_source: None,
             suggested_flag: None,
         };
 
@@ -1710,16 +1708,12 @@ mod tests {
             path: target.clone(),
             access: AccessMode::Read,
             reason: "path_not_granted".to_string(),
-            details: None,
-            policy_source: None,
             suggested_flag: Some(format!("--read-file {}", target.display())),
         };
         let write = PolicyExplanation {
             path: target,
             access: AccessMode::Write,
             reason: "insufficient_access".to_string(),
-            details: None,
-            policy_source: None,
             suggested_flag: None,
         };
 
@@ -1754,16 +1748,12 @@ mod tests {
             path: ignored.clone(),
             access: AccessMode::Read,
             reason: "path_not_granted".to_string(),
-            details: None,
-            policy_source: None,
             suggested_flag: None,
         };
         let saved_explanation = PolicyExplanation {
             path: saved,
             access: AccessMode::Read,
             reason: "path_not_granted".to_string(),
-            details: None,
-            policy_source: None,
             suggested_flag: None,
         };
 
@@ -1794,8 +1784,6 @@ mod tests {
             path: target.clone(),
             access: AccessMode::Read,
             reason: "path_not_granted".to_string(),
-            details: None,
-            policy_source: None,
             suggested_flag: None,
         };
 

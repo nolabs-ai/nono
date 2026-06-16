@@ -99,7 +99,7 @@ nono's trust boundary is agent containment — restricting what the sandboxed ch
 
 ### Session metadata on disk
 
-Session JSON files in `~/.nono/sessions/` contain supervisor and child PIDs, the command line, profile name, working directory, and network mode. These files are protected by directory permissions (`0o700`) and file permissions (`0o600`), but are readable by any process running as the same user.
+Session JSON files in `$XDG_STATE_HOME/nono/sessions/` (default `~/.local/state/nono/sessions/`) contain supervisor and child PIDs, the command line, profile name, working directory, and network mode. These files are protected by directory permissions (`0o700`) and file permissions (`0o600`), but are readable by any process running as the same user.
 
 nono applies best-effort redaction before persisting command arguments in session metadata, audit records, rollback metadata, and audit attestations. It scrubs common secret-bearing forms such as `--token VALUE`, `--api-key=VALUE`, sensitive HTTP headers, URL userinfo, and sensitive query parameters.
 

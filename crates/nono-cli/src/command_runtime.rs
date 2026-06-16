@@ -213,6 +213,7 @@ pub(crate) fn run_shell(args: ShellArgs, silent: bool) -> Result<()> {
             suppressed_system_service_operations: prepared.suppressed_system_service_operations,
             allowed_env_vars: prepared.allowed_env_vars,
             denied_env_vars: prepared.denied_env_vars,
+            set_vars: prepared.set_vars,
             startup_timeout_secs: args.startup_timeout_secs,
             proxy,
             redaction_policy: load_configured_redaction_policy()?,
@@ -297,6 +298,7 @@ pub(crate) fn run_wrap(wrap_args: WrapArgs, silent: bool) -> Result<()> {
             suppressed_system_service_operations: prepared.suppressed_system_service_operations,
             allowed_env_vars: prepared.allowed_env_vars,
             denied_env_vars: prepared.denied_env_vars,
+            set_vars: prepared.set_vars,
             ..ExecutionFlags::defaults(silent)?
         },
     })

@@ -197,6 +197,7 @@ This is the primary mechanism for surgically customizing inherited profiles with
 | `deny` | `commands` | Deprecated in v0.33.0. Startup-only command denylist extension. Not enforced for child processes; prefer `filesystem.deny` and narrower grants. |
 | `bypass_protection` | `filesystem` | Paths exempted from deny groups. **Does not grant access** — each path must also appear in `filesystem.allow`, `filesystem.read`, or `filesystem.write`. |
 | `suppress_save_prompt` | `filesystem` | Paths whose runtime denials should not be offered in save-profile prompts. **Does not grant access** and does not hide diagnostics. |
+| `suppress_system_services` | `diagnostics` | macOS Seatbelt operation names to hide from diagnostic footers and save-profile prompts. **Does not grant access** and does not change enforcement. |
 
 <Note>
   **Renamed in issue #594.** The old top-level `policy` section was dissolved into `filesystem`, `groups`, and `commands` in the canonical schema. Legacy names still deserialize with a deprecation warning; see the migration table in `nono profile guide` for the full mapping. The legacy keys will be removed in v1.0.0.
@@ -332,8 +333,34 @@ why the path does not appear in the save prompt.
 The interactive save prompt applies this to every listed path suggestion when
 you choose `suppress`; it does not create any allow/read/write grants.
 
+#### Suppressing Expected macOS System-Service Diagnostics
+
+Use `diagnostics.suppress_system_services` when a macOS Seatbelt operation is
+expected to be denied and you do not want nono to repeat the diagnostic footer
+(or offer a save-profile prompt) on every run:
+
+```json
+{
+  "extends": "default",
+  "meta": { "name": "node-local", "version": "1.0.0" },
+  "diagnostics": {
+    "suppress_system_services": ["user-preference-read"]
+  }
+}
+```
+
+This is macOS-only. Values are Seatbelt operation names from the sandbox log,
+such as `user-preference-read` (CFPreferences / NSUserDefaults probes from npm
+and other Node tools) or `forbidden-exec-sugid`. Suppression is output-only:
+the sandbox still denies the operation.
+
+Unlike `filesystem.suppress_save_prompt`, this hides matching violations from
+the diagnostic footer entirely. There is no CLI flag equivalent yet; add the
+operation name to your profile. To silence all post-run diagnostics instead,
+use `--no-diagnostics`.
+
 <Note>
-  `filesystem`, `groups`, and `commands` fields are additive across inheritance. A child profile's `filesystem.deny` is merged with the base profile's `filesystem.deny`, and `groups.exclude` from both levels are combined.
+  `filesystem`, `groups`, `commands`, and `diagnostics` fields are additive across inheritance. A child profile's `filesystem.deny` is merged with the base profile's `filesystem.deny`, `groups.exclude` from both levels are combined, and `diagnostics.suppress_system_services` entries from both profiles are appended and deduplicated.
 </Note>
 
 ### Network Configuration
@@ -536,6 +563,10 @@ prompt filters only; they do not participate in capability enforcement. The
 older `filesystem.ignore` and `--ignore-denied` forms are accepted as aliases,
 but new examples use the explicit suppress wording to avoid suggesting an
 access grant.
+
+`profile.diagnostics.suppress_system_services` is also output-only (macOS). It
+hides recurring non-filesystem Seatbelt violations from diagnostic footers and
+save-profile prompts without granting the underlying operation.
 
 Exclusions are applied after group addition. If the same group appears in both
 `groups.include` and `groups.exclude`, the exclusion wins.

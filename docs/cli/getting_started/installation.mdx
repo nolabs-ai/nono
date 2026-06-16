@@ -7,6 +7,7 @@ description: How to install nono on your system
 
 ```bash
 brew install nono
+nono --version
 ```
 
 ## Linux Package Managers
@@ -20,6 +21,7 @@ VERSION=$(curl -sI https://github.com/always-further/nono/releases/latest | grep
 ARCH=$(dpkg --print-architecture)
 wget https://github.com/always-further/nono/releases/download/v${VERSION}/nono-cli_${VERSION}_${ARCH}.deb
 sudo dpkg -i nono-cli_${VERSION}_${ARCH}.deb
+nono --version
 ```
 
 ### Fedora (COPR)
@@ -30,7 +32,12 @@ nono is available from the official [COPR repository](https://copr.fedorainfracl
 sudo dnf install 'dnf-command(copr)'
 sudo dnf copr enable always-further/nono
 sudo dnf install nono-cli
+nono --version
 ```
+
+<Note>
+  If your Fedora version isn't available in COPR, use the manual RPM install below.
+</Note>
 
 ### Manual RPM (RHEL/openSUSE and fallback)
 
@@ -41,6 +48,7 @@ VERSION=$(curl -sI https://github.com/always-further/nono/releases/latest | grep
 ARCH=$(uname -m)
 wget https://github.com/always-further/nono/releases/download/v${VERSION}/nono-cli-${VERSION}-1.${ARCH}.rpm
 sudo dnf install ./nono-cli-${VERSION}-1.${ARCH}.rpm
+nono --version
 ```
 
 For openSUSE, use `sudo zypper install ./nono-cli-${VERSION}-1.${ARCH}.rpm` instead.

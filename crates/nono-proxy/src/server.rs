@@ -27,11 +27,32 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
+use url::Url;
 use zeroize::Zeroizing;
 
 /// Maximum total size of HTTP headers (64 KiB). Prevents OOM from
 /// malicious clients sending unbounded header data.
 const MAX_HEADER_SIZE: usize = 64 * 1024;
+
+/// Parse host and port from a non-CONNECT proxy request line.
+///
+/// Example: `GET http://google.com/ HTTP/1.1` -> ("google.com", 80)
+///          `GET http://google.com:8080/path HTTP/1.1` -> ("google.com", 8080)
+fn parse_non_connect_target(line: &str) -> Result<(String, u16)> {
+    let mut parts = line.split_whitespace();
+    let _method = parts.next();
+    let url = parts
+        .next()
+        .ok_or_else(|| ProxyError::HttpParse(format!("malformed request line: {}", line)))?;
+    let parsed = Url::parse(url)
+        .map_err(|e| ProxyError::HttpParse(format!("invalid URL in request: {}: {}", url, e)))?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| ProxyError::HttpParse(format!("no host in URL: {}", url)))?
+        .to_string();
+    let port = parsed.port_or_known_default().unwrap_or(80);
+    Ok((host, port))
+}
 
 /// Handle returned when the proxy server starts.
 ///
@@ -1011,9 +1032,30 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
         };
         reverse::handle_reverse_proxy(first_line, &mut stream, &header_bytes, &ctx, &buffered).await
     } else {
-        // No routes configured, reject non-CONNECT requests
-        let response = "HTTP/1.1 400 Bad Request\r\n\r\n";
-        stream.write_all(response.as_bytes()).await?;
+        // No routes configured: filter, audit, and respond inline.
+        let (host, port) = parse_non_connect_target(first_line)?;
+        let check = state.filter.check_host(&host, port).await?;
+        if !check.result.is_allowed() {
+            let reason = check.result.reason();
+            audit::log_denied(
+                Some(&state.audit_log),
+                audit::ProxyMode::Connect,
+                &audit::EventContext {
+                    denial_category: Some(nono::undo::NetworkAuditDenialCategory::HostDenied),
+                    ..audit::EventContext::default()
+                },
+                &host,
+                port,
+                &reason,
+            );
+            let sanitised = reason.replace(['\r', '\n'], " ");
+            let response = format!("HTTP/1.1 403 Forbidden: {}\r\n\r\n", sanitised);
+            stream.write_all(response.as_bytes()).await?;
+        } else {
+            stream
+                .write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+                .await?;
+        }
         Ok(())
     }
 }
@@ -1945,6 +1987,68 @@ mod tests {
             Ok(Err(e)) => panic!("retry read errored: {e}"),
             Err(_) => panic!("retry read timed out — proxy did not answer the retry"),
         }
+
+        handle.shutdown();
+    }
+
+    #[test]
+    fn test_parse_non_connect_target_default_port_80() {
+        let (host, port) = parse_non_connect_target("GET http://google.com/ HTTP/1.1").unwrap();
+        assert_eq!(host, "google.com");
+        assert_eq!(port, 80);
+    }
+
+    #[test]
+    fn test_parse_non_connect_target_parses_url_with_port() {
+        let (host, port) =
+            parse_non_connect_target("GET http://google.com:8080/path HTTP/1.1").unwrap();
+        assert_eq!(host, "google.com");
+        assert_eq!(port, 8080);
+    }
+
+    #[test]
+    fn test_parse_non_connect_target_rejects_malformed_line() {
+        let err = parse_non_connect_target("garbage").unwrap_err();
+        assert!(err.to_string().contains("malformed request line"));
+    }
+
+    /// Regression for #1062: a denied non-CONNECT request must return 403
+    /// (not 400) and produce a `http` audit deny event.
+    #[tokio::test]
+    async fn test_denied_non_connect_returns_403_and_audits() {
+        use tokio::io::AsyncReadExt;
+        use tokio::net::TcpStream;
+
+        // allowed_hosts = ["example.com"] -> google.com is denied
+        let config = ProxyConfig {
+            allowed_hosts: vec!["example.com".to_string()],
+            ..ProxyConfig::default()
+        };
+        let handle = start(config).await.unwrap();
+        let addr = format!("127.0.0.1:{}", handle.port);
+
+        let mut stream = TcpStream::connect(&addr).await.unwrap();
+        let request = b"GET http://google.com/ HTTP/1.1\r\nHost: google.com\r\n\r\n";
+        tokio::io::AsyncWriteExt::write_all(&mut stream, request)
+            .await
+            .unwrap();
+
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        let response_str = String::from_utf8_lossy(&response);
+        assert!(
+            response_str.starts_with("HTTP/1.1 403"),
+            "expected 403 status, got: {}",
+            response_str
+        );
+
+        let events = handle.drain_audit_events();
+        assert_eq!(events.len(), 1, "expected one audit event");
+        let event = &events[0];
+        assert_eq!(event.mode, nono::undo::NetworkAuditMode::Connect);
+        assert_eq!(event.decision, nono::undo::NetworkAuditDecision::Deny);
+        assert_eq!(event.target, "google.com");
+        assert_eq!(event.port, Some(80));
 
         handle.shutdown();
     }

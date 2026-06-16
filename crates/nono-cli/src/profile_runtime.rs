@@ -404,7 +404,8 @@ fn validate_bundle_relative_path<'a>(
 
 fn expand_bypass_protection_path(path: &Path, workdir: &Path) -> PathBuf {
     let path_str = path.to_string_lossy();
-    let expanded = profile::expand_vars(&path_str, workdir, None).unwrap_or_else(|_| path.to_path_buf());
+    let expanded =
+        profile::expand_vars(&path_str, workdir, None).unwrap_or_else(|_| path.to_path_buf());
     if expanded.exists() {
         expanded.canonicalize().unwrap_or(expanded)
     } else {
@@ -450,7 +451,8 @@ fn collect_bypass_protection_paths(
 
 fn expand_ignored_denial_path(path: &Path, workdir: &Path) -> PathBuf {
     let path_str = path.to_string_lossy();
-    let expanded = profile::expand_vars(&path_str, workdir, None).unwrap_or_else(|_| path.to_path_buf());
+    let expanded =
+        profile::expand_vars(&path_str, workdir, None).unwrap_or_else(|_| path.to_path_buf());
     nono::try_canonicalize(&expanded)
 }
 

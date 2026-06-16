@@ -3751,8 +3751,8 @@ pub(crate) fn is_valid_profile_name(name: &str) -> bool {
 /// Supported variables:
 /// - $WORKDIR: Working directory (--workdir or cwd)
 /// - $REPO_ROOT: Git repository root. Resolved from --repo-root, NONO_REPO_ROOT,
-///               or auto-detected via `git rev-parse`. Left unexpanded when unset
-///               or not in a git repo (path is then silently skipped).
+///   or auto-detected via `git rev-parse`. Left unexpanded when unset
+///   or not in a git repo (path is then silently skipped).
 /// - $HOME: User's home directory
 /// - $XDG_CONFIG_HOME: XDG config directory
 /// - $NONO_CONFIG: nono config root (`$XDG_CONFIG_HOME/nono`)
@@ -4269,8 +4269,7 @@ mod tests {
     #[test]
     fn test_expand_vars_repo_root_none() {
         let workdir = PathBuf::from("/projects/myapp");
-        let expanded =
-            expand_vars("$REPO_ROOT/AGENTS.md", &workdir, None).expect("valid env");
+        let expanded = expand_vars("$REPO_ROOT/AGENTS.md", &workdir, None).expect("valid env");
         // When repo_root is None, $REPO_ROOT is left unexpanded so the path
         // won't resolve (silently skipped by the capability layer).
         assert_eq!(expanded, PathBuf::from("$REPO_ROOT/AGENTS.md"));
@@ -4280,12 +4279,8 @@ mod tests {
     fn test_expand_vars_repo_root_and_workdir_together() {
         let workdir = PathBuf::from("/projects/myapp");
         let repo_root = Path::new("/repos/monorepo");
-        let expanded = expand_vars(
-            "$REPO_ROOT/AGENTS.md",
-            &workdir,
-            Some(repo_root),
-        )
-        .expect("valid env");
+        let expanded =
+            expand_vars("$REPO_ROOT/AGENTS.md", &workdir, Some(repo_root)).expect("valid env");
         assert_eq!(expanded, PathBuf::from("/repos/monorepo/AGENTS.md"));
 
         // $WORKDIR expansion still works alongside $REPO_ROOT

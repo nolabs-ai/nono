@@ -3295,8 +3295,7 @@ mod tests {
             ..SandboxArgs::default()
         };
 
-        let (caps, _) =
-            from_profile_locked(&profile, workdir.path(), &args).expect("build caps");
+        let (caps, _) = from_profile_locked(&profile, workdir.path(), &args).expect("build caps");
         let fs_caps: Vec<_> = caps
             .fs_capabilities()
             .iter()

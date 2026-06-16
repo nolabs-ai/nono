@@ -1856,6 +1856,14 @@ enum SystemServiceTarget {
     Any,
     Exact(&'static str),
     Prefix(&'static str),
+    /// Matches targets that are filesystem paths (absolute or `~`-relative).
+    ///
+    /// On macOS, `connect(2)`/`bind(2)` to a Unix domain socket is classified
+    /// by Seatbelt as `network-outbound`/`network-bind`, with the socket path
+    /// as the target. TCP outbound targets are rendered as `host:port`, so a
+    /// path-shaped target distinguishes a Unix-socket denial from real network
+    /// access.
+    PathLike,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1863,6 +1871,7 @@ enum SystemServiceGuidance {
     Keychain,
     SetuidExec,
     UserPreferences,
+    UnixSocket,
 }
 
 const SYSTEM_SERVICE_DIAGNOSTICS: &[SystemServiceDiagnostic] = &[
@@ -1962,6 +1971,21 @@ const SYSTEM_SERVICE_DIAGNOSTICS: &[SystemServiceDiagnostic] = &[
         "Setuid/setgid executable blocked",
         Some(SystemServiceGuidance::SetuidExec),
     ),
+    // A `network-outbound`/`network-bind` denial whose target is a filesystem
+    // path is a Unix domain socket (e.g. Docker/OrbStack), not TCP. macOS
+    // classifies connect(2)/bind(2) on a Unix socket as these operations.
+    SystemServiceDiagnostic {
+        operation: "network-outbound",
+        target: SystemServiceTarget::PathLike,
+        description: "Unix domain socket (connect)",
+        guidance: Some(SystemServiceGuidance::UnixSocket),
+    },
+    SystemServiceDiagnostic {
+        operation: "network-bind",
+        target: SystemServiceTarget::PathLike,
+        description: "Unix domain socket (bind)",
+        guidance: Some(SystemServiceGuidance::UnixSocket),
+    },
 ];
 
 impl SystemServiceDiagnostic {
@@ -2028,6 +2052,7 @@ impl SystemServiceTarget {
             Self::Prefix(prefix) => target
                 .get(..prefix.len())
                 .is_some_and(|candidate| candidate.eq_ignore_ascii_case(prefix)),
+            Self::PathLike => target.starts_with('/') || target.starts_with('~'),
         }
     }
 }
@@ -2101,6 +2126,79 @@ fn format_non_fs_guidance(lines: &mut Vec<String>, violations: &[&SandboxViolati
         );
         lines.push(
             "[nono] nono does not save this automatically. Prefer a non-setuid helper, or run the privileged helper outside nono after review.".to_string(),
+        );
+    }
+
+    if has_guidance(SystemServiceGuidance::UnixSocket) {
+        format_unix_socket_guidance(lines, violations);
+    }
+}
+
+/// Guide the user to grant a blocked Unix domain socket via the profile's
+/// `unix_socket` / `unix_socket_bind` fields.
+///
+/// On macOS a `network-outbound`/`network-bind` denial to a filesystem path is
+/// a Unix socket, not TCP — adding network capabilities does not help, so we
+/// point at the socket-specific grants and surface the exact path(s) observed.
+fn format_unix_socket_guidance(lines: &mut Vec<String>, violations: &[&SandboxViolation]) {
+    let socket_targets = |operation: &str| -> Vec<&str> {
+        let mut targets: Vec<&str> = violations
+            .iter()
+            .filter(|v| v.operation == operation)
+            .filter_map(|v| v.target.as_deref())
+            .filter(|t| t.starts_with('/') || t.starts_with('~'))
+            .collect();
+        targets.sort_unstable();
+        targets.dedup();
+        targets
+    };
+
+    let connect_targets = socket_targets("network-outbound");
+    let bind_targets = socket_targets("network-bind");
+
+    lines.push(
+        "[nono] A blocked \"network-outbound\"/\"network-bind\" to a filesystem path is a Unix"
+            .to_string(),
+    );
+    lines.push(
+        "[nono] domain socket (common with Docker/OrbStack), not TCP — granting network"
+            .to_string(),
+    );
+    lines.push(
+        "[nono] access will not help. Grant the socket explicitly in your profile:".to_string(),
+    );
+
+    if !connect_targets.is_empty() {
+        lines.push(format!(
+            "[nono]   \"unix_socket\": [{}]",
+            connect_targets
+                .iter()
+                .map(|t| format!("\"{t}\""))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if !bind_targets.is_empty() {
+        lines.push(format!(
+            "[nono]   \"unix_socket_bind\": [{}]",
+            bind_targets
+                .iter()
+                .map(|t| format!("\"{t}\""))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+
+    if connect_targets.iter().any(|t| t.ends_with("docker.sock")) {
+        lines.push(
+            "[nono] Docker clients also fall back to /var/run/docker.sock — grant both paths."
+                .to_string(),
+        );
+    }
+    if bind_targets.is_empty() {
+        lines.push(
+            "[nono] Use \"unix_socket_bind\" instead if the process needs to bind/listen."
+                .to_string(),
         );
     }
 }
@@ -3298,6 +3396,63 @@ mod tests {
         assert!(!output.contains("forbidden-exec-sugid"));
         assert!(!output.contains("Setuid/setgid executable blocked"));
         assert!(output.contains("mach-lookup (com.apple.logd)"));
+    }
+
+    #[test]
+    fn test_unix_socket_network_outbound_guidance() {
+        // A blocked network-outbound to a filesystem path (Docker/OrbStack
+        // socket) must be recognized as a Unix socket and point at the
+        // `unix_socket` profile grant rather than network capabilities.
+        let caps = make_test_caps();
+        let violations = vec![SandboxViolation {
+            operation: "network-outbound".to_string(),
+            target: Some("/Users/wurbanski/.orbstack/run/docker.sock".to_string()),
+        }];
+        let formatter = DiagnosticFormatter::new(&caps)
+            .with_mode(DiagnosticMode::Supervised)
+            .with_sandbox_violations(&violations);
+        let output = formatter.format_footer(1);
+
+        assert!(output.contains("Unix domain socket (connect)"));
+        assert!(
+            output.contains("\"unix_socket\": [\"/Users/wurbanski/.orbstack/run/docker.sock\"]")
+        );
+        // Docker fallback path hint.
+        assert!(output.contains("/var/run/docker.sock"));
+    }
+
+    #[test]
+    fn test_unix_socket_bind_guidance() {
+        let caps = make_test_caps();
+        let violations = vec![SandboxViolation {
+            operation: "network-bind".to_string(),
+            target: Some("/private/var/run/app.sock".to_string()),
+        }];
+        let formatter = DiagnosticFormatter::new(&caps)
+            .with_mode(DiagnosticMode::Supervised)
+            .with_sandbox_violations(&violations);
+        let output = formatter.format_footer(1);
+
+        assert!(output.contains("Unix domain socket (bind)"));
+        assert!(output.contains("\"unix_socket_bind\": [\"/private/var/run/app.sock\"]"));
+    }
+
+    #[test]
+    fn test_tcp_network_outbound_not_treated_as_unix_socket() {
+        // A host:port target is real TCP, not a filesystem path, so it must
+        // not trigger Unix-socket guidance.
+        let caps = make_test_caps();
+        let violations = vec![SandboxViolation {
+            operation: "network-outbound".to_string(),
+            target: Some("example.com:443".to_string()),
+        }];
+        let formatter = DiagnosticFormatter::new(&caps)
+            .with_mode(DiagnosticMode::Supervised)
+            .with_sandbox_violations(&violations);
+        let output = formatter.format_footer(1);
+
+        assert!(!output.contains("Unix domain socket"));
+        assert!(!output.contains("\"unix_socket\""));
     }
 
     #[test]

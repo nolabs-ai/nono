@@ -240,6 +240,10 @@ fn is_capability_summary_line(line: &str) -> bool {
         return true;
     }
 
+    if trimmed.starts_with("deny") && trimmed.contains("kept blocked") {
+        return true;
+    }
+
     if trimmed == "outbound allowed"
         || trimmed == "outbound blocked"
         || trimmed.starts_with("proxy localhost:")

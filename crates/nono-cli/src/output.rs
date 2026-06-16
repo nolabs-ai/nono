@@ -52,7 +52,12 @@ pub fn print_banner(silent: bool) {
 /// When `verbose` is 0, only user-specified capabilities are shown (CLI flags
 /// and profile filesystem entries). System paths and group-resolved paths are
 /// hidden to reduce noise. Use `-v` to show all capabilities.
-pub fn print_capabilities(caps: &CapabilitySet, verbose: u8, silent: bool) {
+pub fn print_capabilities(
+    caps: &CapabilitySet,
+    blocked_grants: &[(std::path::PathBuf, Option<String>)],
+    verbose: u8,
+    silent: bool,
+) {
     if silent {
         return;
     }
@@ -109,6 +114,11 @@ pub fn print_capabilities(caps: &CapabilitySet, verbose: u8, silent: bool) {
             );
         }
     }
+
+    // Protected paths kept blocked despite a user grant (macOS deny groups).
+    // Folded into one row by default so a broad grant (e.g. ~/Library) that
+    // overlaps several deny groups does not produce a wall of warnings.
+    print_blocked_grants(blocked_grants, verbose, t);
 
     // AF_UNIX socket capabilities (issue #685 / #696)
     let unix_caps = caps.unix_socket_capabilities();
@@ -216,6 +226,72 @@ pub fn print_capabilities(caps: &CapabilitySet, verbose: u8, silent: bool) {
 }
 
 /// Format an access mode as a fixed-width colored badge
+/// Render the paths that a deny group keeps blocked despite a user grant.
+///
+/// Collapsed by default to a single row (a broad grant such as `~/Library`
+/// overlaps many deny groups and would otherwise emit one warning per path).
+/// `-v` expands to the full paths grouped by the deny rule that blocks them,
+/// with the `--bypass-protection` escape hatch shown once.
+fn print_blocked_grants(
+    blocked: &[(std::path::PathBuf, Option<String>)],
+    verbose: u8,
+    t: &theme::Theme,
+) {
+    if blocked.is_empty() {
+        return;
+    }
+
+    let badge = theme::badge("deny ", t.yellow, BADGE_FG_DARK);
+
+    if verbose == 0 {
+        let n = blocked.len();
+        let noun = if n == 1 { "path" } else { "paths" };
+        eprintln!(
+            "  {} {}",
+            badge,
+            theme::fg(
+                &format!("{n} sensitive {noun} kept blocked inside your grants (-v to show)"),
+                t.subtext,
+            ),
+        );
+        return;
+    }
+
+    eprintln!(
+        "  {} {}",
+        badge,
+        theme::fg("sensitive paths kept blocked despite your grants:", t.text),
+    );
+
+    // Group by the deny rule that blocks each path, preserving first-seen order.
+    let mut groups: Vec<(String, Vec<&std::path::Path>)> = Vec::new();
+    for (path, group) in blocked {
+        let label = group.as_deref().unwrap_or("a deny rule").to_string();
+        match groups.iter_mut().find(|(name, _)| *name == label) {
+            Some((_, paths)) => paths.push(path.as_path()),
+            None => groups.push((label, vec![path.as_path()])),
+        }
+    }
+
+    for (name, paths) in &groups {
+        eprintln!("       {}", theme::fg(name, t.subtext));
+        for path in paths {
+            eprintln!(
+                "         {}",
+                theme::fg(&path.display().to_string(), t.text),
+            );
+        }
+    }
+
+    eprintln!(
+        "       {}",
+        theme::fg(
+            "use --bypass-protection <path> to allow a specific path",
+            t.subtext,
+        ),
+    );
+}
+
 fn format_access_badge(access: &AccessMode) -> String {
     let t = theme::current();
     match access {
@@ -914,9 +990,11 @@ pub fn print_profile_hint(program: &str, profile: &str, silent: bool) {
 #[cfg(test)]
 mod tests {
     use super::{
-        dry_run_command_line, format_unix_socket_mode_badge, print_capabilities,
-        print_profile_hint, render_diagnostic_footer, render_terminal_block_for_tty,
+        dry_run_command_line, format_unix_socket_mode_badge, print_blocked_grants,
+        print_capabilities, print_profile_hint, render_diagnostic_footer,
+        render_terminal_block_for_tty,
     };
+    use super::theme;
     use nono::{CapabilitySet, UnixSocketMode};
     use std::ffi::{OsStr, OsString};
     use tempfile::tempdir;
@@ -1018,7 +1096,32 @@ mod tests {
             .allow_unix_socket_dir(dir.path(), UnixSocketMode::ConnectBind)
             .expect("bind dir grant");
 
-        print_capabilities(&caps, 0, true);
-        print_capabilities(&caps, 1, true);
+        print_capabilities(&caps, &[], 0, true);
+        print_capabilities(&caps, &[], 1, true);
+    }
+
+    #[test]
+    fn print_blocked_grants_collapsed_and_verbose_do_not_panic() {
+        // Blocked grants render as one folded row by default and expand under
+        // -v; both paths (and the empty case) must render without panicking.
+        let t = theme::current();
+        let blocked = vec![
+            (
+                std::path::PathBuf::from("/Users/x/Library/Application Support/Google/Chrome"),
+                Some("deny_browser_data_macos".to_string()),
+            ),
+            (
+                std::path::PathBuf::from("/Users/x/Library/Application Support/1Password"),
+                Some("deny_keychains_macos".to_string()),
+            ),
+            (
+                std::path::PathBuf::from("/Users/x/Library/Application Support/Unknown"),
+                None,
+            ),
+        ];
+
+        print_blocked_grants(&blocked, 0, t);
+        print_blocked_grants(&blocked, 1, t);
+        print_blocked_grants(&[], 0, t);
     }
 }

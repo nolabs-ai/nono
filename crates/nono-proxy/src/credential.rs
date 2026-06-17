@@ -90,6 +90,10 @@ pub struct CredentialStore {
     credentials: HashMap<String, LoadedCredential>,
     /// Map from route prefix to OAuth2 route (token cache + upstream)
     oauth2_routes: HashMap<String, OAuth2Route>,
+    /// Map from route prefix to AWS SigV4 route (placeholder until full
+    /// SigV4 signing is implemented; value is () because no runtime state
+    /// is needed yet).
+    aws_routes: HashMap<String, ()>,
 }
 
 impl CredentialStore {
@@ -113,6 +117,7 @@ impl CredentialStore {
     pub fn load(routes: &[RouteConfig], tls_connector: &TlsConnector) -> Result<Self> {
         let mut credentials = HashMap::new();
         let mut oauth2_routes = HashMap::new();
+        let mut aws_routes = HashMap::new();
 
         for route in routes {
             // Normalize prefix: strip leading/trailing slashes so it matches
@@ -271,12 +276,20 @@ impl CredentialStore {
                         continue;
                     }
                 }
+            } else if route.aws_auth.is_some() {
+                // AWS SigV4 path — no credentials to load yet. Register the
+                // prefix so get_aws() returns true and the proxy can return
+                // 501 Not Implemented. The () value is a placeholder; the
+                // real AwsRoute struct will replace it when SigV4 signing is
+                // implemented.
+                aws_routes.insert(normalized_prefix.clone(), ());
             }
         }
 
         Ok(Self {
             credentials,
             oauth2_routes,
+            aws_routes,
         })
     }
 
@@ -286,6 +299,7 @@ impl CredentialStore {
         Self {
             credentials: HashMap::new(),
             oauth2_routes: HashMap::new(),
+            aws_routes: HashMap::new(),
         }
     }
 
@@ -301,25 +315,35 @@ impl CredentialStore {
         self.oauth2_routes.get(prefix)
     }
 
-    /// Check if any credentials (static or OAuth2) are loaded.
+    /// Returns `Some(())` if an AWS SigV4 route is configured for the given
+    /// prefix, `None` otherwise. The `Option<&()>` return mirrors `get_oauth2`
+    /// so call sites can use `.is_some()` uniformly. The value will become
+    /// `Option<&AwsRoute>` when SigV4 signing is implemented.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.credentials.is_empty() && self.oauth2_routes.is_empty()
+    pub fn get_aws(&self, prefix: &str) -> Option<&()> {
+        self.aws_routes.get(prefix)
     }
 
-    /// Number of loaded credentials (static + OAuth2).
+    /// Check if any credentials (static, OAuth2, or AWS) are loaded.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.credentials.is_empty() && self.oauth2_routes.is_empty() && self.aws_routes.is_empty()
+    }
+
+    /// Number of loaded credentials (static + OAuth2 + AWS).
     #[must_use]
     pub fn len(&self) -> usize {
-        self.credentials.len() + self.oauth2_routes.len()
+        self.credentials.len() + self.oauth2_routes.len() + self.aws_routes.len()
     }
 
     /// Returns the set of route prefixes that have loaded credentials
-    /// (both static keystore and OAuth2 routes).
+    /// (static keystore, OAuth2, and AWS routes).
     #[must_use]
     pub fn loaded_prefixes(&self) -> std::collections::HashSet<String> {
         self.credentials
             .keys()
             .chain(self.oauth2_routes.keys())
+            .chain(self.aws_routes.keys())
             .cloned()
             .collect()
     }
@@ -575,6 +599,7 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             oauth2: None,
+            aws_auth: None,
         }];
         let store = CredentialStore::load(&routes, &tls);
         assert!(store.is_ok());
@@ -609,6 +634,7 @@ mod tests {
         let store = CredentialStore {
             credentials: HashMap::new(),
             oauth2_routes,
+            aws_routes: HashMap::new(),
         };
 
         assert!(
@@ -637,6 +663,7 @@ mod tests {
         let store = CredentialStore {
             credentials: HashMap::new(),
             oauth2_routes,
+            aws_routes: HashMap::new(),
         };
 
         let prefixes = store.loaded_prefixes();
@@ -665,6 +692,7 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             oauth2: None,
+            aws_auth: None,
         }];
         let store = CredentialStore::load(&routes, &tls).expect("credential load");
         let cred = store.get("litellm").expect("route should be loaded");
@@ -694,6 +722,7 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             oauth2: None,
+            aws_auth: None,
         }];
         let store = CredentialStore::load(&routes, &tls).expect("credential load");
         let cred = store.get("api").expect("route should be loaded");
@@ -734,6 +763,7 @@ mod tests {
                 client_secret: "env://TEST_OAUTH2_CLIENT_SECRET".to_string(),
                 scope: String::new(),
             }),
+            aws_auth: None,
         }];
 
         let store = CredentialStore::load(&routes, &tls);

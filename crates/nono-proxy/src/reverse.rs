@@ -130,6 +130,7 @@ pub async fn handle_reverse_proxy(
         })?;
     let static_cred = ctx.credential_store.get(&service);
     let oauth2_route = ctx.credential_store.get_oauth2(&service);
+    let aws_route = ctx.credential_store.get_aws(&service);
     let managed_ctx = static_cred.map(|cred| {
         managed_credential_event_ctx(
             &service,
@@ -153,7 +154,11 @@ pub async fn handle_reverse_proxy(
             ..audit::EventContext::default()
         });
 
-    if route.missing_managed_credential(static_cred.is_some(), oauth2_route.is_some()) {
+    if route.missing_managed_credential(
+        static_cred.is_some(),
+        oauth2_route.is_some(),
+        aws_route.is_some(),
+    ) {
         let reason = format!(
             "managed credential unavailable for service '{}': route is configured for proxy-supplied auth",
             service
@@ -219,6 +224,14 @@ pub async fn handle_reverse_proxy(
             ctx,
         )
         .await;
+    }
+
+    // AWS SigV4 signing is not yet implemented. Return 501 so the caller
+    // knows the route exists but is not functional. This branch will be
+    // replaced with real SigV4 signing in a follow-up.
+    if aws_route.is_some() {
+        send_error(stream, 501, "Not Implemented").await?;
+        return Ok(());
     }
 
     let cred = static_cred;

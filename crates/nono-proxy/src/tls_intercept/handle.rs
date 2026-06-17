@@ -279,9 +279,14 @@ where
 
     let cred = service.and_then(|s| ctx.credential_store.get(s));
     let oauth2_route = service.and_then(|s| ctx.credential_store.get_oauth2(s));
+    let aws_route = service.and_then(|s| ctx.credential_store.get_aws(s));
 
     if let Some(rt) = route
-        && rt.missing_managed_credential(cred.is_some(), oauth2_route.is_some())
+        && rt.missing_managed_credential(
+            cred.is_some(),
+            oauth2_route.is_some(),
+            aws_route.is_some(),
+        )
     {
         let svc = service.unwrap_or("unknown");
         let reason = format!(
@@ -307,6 +312,14 @@ where
             &reason,
         );
         reverse::send_error_generic(tls_stream, 503, "Service Unavailable").await?;
+        return Ok(());
+    }
+
+    // AWS SigV4 signing is not yet implemented. Return 501 so the caller
+    // knows the route exists but is not functional. This branch will be
+    // replaced with real SigV4 signing in a follow-up.
+    if aws_route.is_some() {
+        reverse::send_error_generic(tls_stream, 501, "Not Implemented").await?;
         return Ok(());
     }
 

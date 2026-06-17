@@ -1175,6 +1175,7 @@ mod tests {
                     tls_client_cert: None,
                     tls_client_key: None,
                     oauth2: None,
+                    aws_auth: None,
                 }],
                 intercept_ca_dir: Some(dir.path().to_path_buf()),
                 ..Default::default()
@@ -1239,6 +1240,7 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 oauth2: None,
+                aws_auth: None,
             }],
             intercept_ca_dir: Some(dir.path().to_path_buf()),
             ..Default::default()
@@ -1285,6 +1287,7 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 oauth2: None,
+                aws_auth: None,
             }],
             intercept_ca_dir: Some(missing_dir),
             ..Default::default()
@@ -1331,6 +1334,7 @@ mod tests {
                     tls_client_cert: None,
                     tls_client_key: None,
                     oauth2: None,
+                    aws_auth: None,
                 },
                 crate::config::RouteConfig {
                     prefix: "alias".to_string(),
@@ -1349,6 +1353,7 @@ mod tests {
                     tls_client_cert: None,
                     tls_client_key: None,
                     oauth2: None,
+                    aws_auth: None,
                 },
             ],
             intercept_ca_dir: Some(dir.path().to_path_buf()),
@@ -1422,6 +1427,7 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 oauth2: None,
+                aws_auth: None,
             }],
             ..Default::default()
         };
@@ -1468,6 +1474,7 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 oauth2: None,
+                aws_auth: None,
             }],
             ..Default::default()
         };
@@ -1523,6 +1530,7 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 oauth2: None,
+                aws_auth: None,
             }],
             ..Default::default()
         };
@@ -1584,6 +1592,7 @@ mod tests {
                     tls_client_cert: None,
                     tls_client_key: None,
                     oauth2: None,
+                    aws_auth: None,
                 },
                 crate::config::RouteConfig {
                     prefix: "github".to_string(),
@@ -1602,6 +1611,7 @@ mod tests {
                     tls_client_cert: None,
                     tls_client_key: None,
                     oauth2: None,
+                    aws_auth: None,
                 },
             ],
             ..Default::default()
@@ -1665,6 +1675,7 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 oauth2: None,
+                aws_auth: None,
             }],
             ..Default::default()
         };
@@ -1699,6 +1710,7 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 oauth2: None,
+                aws_auth: None,
             }],
             ..Default::default()
         };
@@ -1751,6 +1763,7 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 oauth2: None,
+                aws_auth: None,
             }],
             ..Default::default()
         };
@@ -1792,6 +1805,7 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 oauth2: None,
+                aws_auth: None,
             }],
             ..Default::default()
         };
@@ -1979,6 +1993,7 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 oauth2: None,
+                aws_auth: None,
             }],
             intercept_ca_dir: Some(dir.path().to_path_buf()),
             ..Default::default()

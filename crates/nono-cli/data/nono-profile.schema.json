@@ -486,24 +486,31 @@
         }
       }
     },
-    "CustomCredentialDef": {
-      "type": "object",
-      "description": "Custom credential route definition for the reverse proxy. Defines how to route requests and inject credentials for a service. Must have either credential_key or auth (mutually exclusive).",
-      "additionalProperties": false,
-      "required": ["upstream"],
-      "properties": {
-        "upstream": {
-          "type": "string",
-          "description": "Upstream URL to proxy requests to (e.g., \"https://api.telegram.org\"). Must use HTTPS, or HTTP only for loopback addresses."
-        },
-        "credential_key": {
-          "type": "string",
-          "description": "Keystore account name for the credential (e.g., \"telegram_bot_token\"), or a 1Password op:// URI, Bitwarden bw:// URI, apple-password:// URI, file:// URI, or env:// URI (e.g., \"env://MY_TOKEN\"). Mutually exclusive with auth."
-        },
-        "auth": {
-          "$ref": "#/$defs/OAuth2Config",
-          "description": "OAuth2 client_credentials configuration. When present, the proxy handles token exchange automatically. Mutually exclusive with credential_key."
-        },
+     "CustomCredentialDef": {
+       "type": "object",
+       "description": "Custom credential route definition for the reverse proxy. Defines how to route requests and inject credentials for a service. Must have exactly one of: credential_key, auth, or aws_auth (mutually exclusive).",
+       "additionalProperties": false,
+       "required": ["upstream"],
+       "properties": {
+         "upstream": {
+           "type": "string",
+           "description": "Upstream URL to proxy requests to (e.g., \"https://api.telegram.org\"). Must use HTTPS, or HTTP only for loopback addresses."
+         },
+         "credential_key": {
+           "type": "string",
+           "description": "Keystore account name for the credential (e.g., \"telegram_bot_token\"), or a 1Password op:// URI, Bitwarden bw:// URI, apple-password:// URI, file:// URI, or env:// URI (e.g., \"env://MY_TOKEN\"). Mutually exclusive with auth and aws_auth."
+         },
+         "auth": {
+           "$ref": "#/$defs/OAuth2Config",
+           "description": "OAuth2 client_credentials configuration. When present, the proxy handles token exchange automatically. Mutually exclusive with credential_key and aws_auth."
+         },
+         "aws_auth": {
+           "oneOf": [
+             { "$ref": "#/$defs/AwsAuthConfig" },
+             { "type": "null" }
+           ],
+           "description": "AWS SigV4 signing configuration. When present, the proxy signs outbound requests with AWS credentials. Mutually exclusive with credential_key and auth."
+         },
         "inject_mode": {
           "$ref": "#/$defs/InjectMode",
           "description": "Credential injection mode. Determines how the credential is inserted into outbound requests.",
@@ -676,30 +683,58 @@
       }
     },
     "OAuth2Config": {
-      "type": "object",
-      "description": "OAuth2 client_credentials configuration for automatic token exchange. The proxy exchanges client_id + client_secret for an access_token, caches it, and refreshes automatically before expiry.",
-      "additionalProperties": false,
-      "required": ["token_url", "client_id", "client_secret"],
-      "properties": {
-        "token_url": {
-          "type": "string",
-          "description": "Token endpoint URL (e.g., \"https://auth.example.com/oauth/token\"). Must use HTTPS, or HTTP only for loopback addresses."
-        },
-        "client_id": {
-          "type": "string",
-          "description": "Client ID — plain value or credential reference (env://, file://, op://)."
-        },
-        "client_secret": {
-          "type": "string",
-          "description": "Client secret — credential reference (env://, file://, op://)."
-        },
-        "scope": {
-          "type": "string",
-          "description": "OAuth2 scopes (space-separated). Empty or omitted means no scope parameter is sent.",
-          "default": ""
-        }
-      }
-    },
+       "type": "object",
+       "description": "OAuth2 client_credentials configuration for automatic token exchange. The proxy exchanges client_id + client_secret for an access_token, caches it, and refreshes automatically before expiry.",
+       "additionalProperties": false,
+       "required": ["token_url", "client_id", "client_secret"],
+       "properties": {
+         "token_url": {
+           "type": "string",
+           "description": "Token endpoint URL (e.g., \"https://auth.example.com/oauth/token\"). Must use HTTPS, or HTTP only for loopback addresses."
+         },
+         "client_id": {
+           "type": "string",
+           "description": "Client ID — plain value or credential reference (env://, file://, op://)."
+         },
+         "client_secret": {
+           "type": "string",
+           "description": "Client secret — credential reference (env://, file://, op://)."
+         },
+         "scope": {
+           "type": "string",
+           "description": "OAuth2 scopes (space-separated). Empty or omitted means no scope parameter is sent.",
+           "default": ""
+         }
+       }
+     },
+     "AwsAuthConfig": {
+       "type": "object",
+       "description": "AWS SigV4 signing configuration for a credential route. All fields are optional: an empty {} block uses the default credential chain with region and service auto-detected from the upstream URL.",
+       "additionalProperties": false,
+       "properties": {
+         "profile": {
+           "oneOf": [
+             { "type": "string" },
+             { "type": "null" }
+           ],
+           "description": "AWS profile name to use for credentials. If omitted, the default credential chain is used (environment variables → AWS_PROFILE → default profile → instance metadata). Must be non-empty if set."
+         },
+         "region": {
+           "oneOf": [
+             { "type": "string" },
+             { "type": "null" }
+           ],
+           "description": "Explicit SigV4 signing region (e.g., \"us-east-1\"). If omitted, auto-detected from the upstream URL. Must be non-empty and contain no whitespace if set."
+         },
+         "service": {
+           "oneOf": [
+             { "type": "string" },
+             { "type": "null" }
+           ],
+           "description": "Explicit SigV4 service name (e.g., \"bedrock\", \"s3\"). If omitted, auto-detected from the upstream URL. Must be non-empty and contain no whitespace if set."
+         }
+       }
+     },
     "SecretsConfig": {
       "type": "object",
       "description": "Maps keystore account names (or op://, bw://, apple-password://, env:// URIs) to environment variable names. Secrets are loaded from the system keystore under the service name \"nono\".",

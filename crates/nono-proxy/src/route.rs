@@ -88,6 +88,11 @@ fn auth_mechanism_for_route(route: &RouteConfig) -> Option<NetworkAuditAuthMecha
         return Some(NetworkAuditAuthMechanism::PhantomHeader);
     }
 
+    if route.aws_auth.is_some() {
+        // SigV4 signs via the Authorization header — same phantom token shape.
+        return Some(NetworkAuditAuthMechanism::PhantomHeader);
+    }
+
     if route.credential_key.is_some() {
         let proxy_mode = route
             .proxy
@@ -109,6 +114,11 @@ fn auth_mechanism_for_route(route: &RouteConfig) -> Option<NetworkAuditAuthMecha
 fn injection_mode_for_route(route: &RouteConfig) -> Option<NetworkAuditInjectionMode> {
     if route.oauth2.is_some() {
         return Some(NetworkAuditInjectionMode::OAuth2);
+    }
+
+    if route.aws_auth.is_some() {
+        // SigV4 injects via the Authorization header.
+        return Some(NetworkAuditInjectionMode::Header);
     }
 
     if route.credential_key.is_some() {
@@ -183,8 +193,9 @@ impl RouteStore {
             // they exist to provide a `*_BASE_URL` env var or appear in
             // `route_upstream_hosts()` — and CONNECT to those still gets
             // blocked with 403 (the "force SDK cooperation" path).
-            let requires_managed_credential =
-                route.credential_key.is_some() || route.oauth2.is_some();
+            let requires_managed_credential = route.credential_key.is_some()
+                || route.oauth2.is_some()
+                || route.aws_auth.is_some();
             let requires_intercept =
                 requires_managed_credential || !route.endpoint_rules.is_empty();
             let managed_auth_mechanism = auth_mechanism_for_route(route);
@@ -410,8 +421,9 @@ impl LoadedRoute {
         &self,
         has_static_credential: bool,
         has_oauth2: bool,
+        has_aws: bool,
     ) -> bool {
-        self.requires_managed_credential && !has_static_credential && !has_oauth2
+        self.requires_managed_credential && !has_static_credential && !has_oauth2 && !has_aws
     }
 }
 
@@ -653,6 +665,7 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             oauth2: None,
+            aws_auth: None,
         }];
 
         let store = RouteStore::load(&routes).unwrap();
@@ -692,6 +705,7 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             oauth2: None,
+            aws_auth: None,
         }];
 
         let store = RouteStore::load(&routes).unwrap();
@@ -718,6 +732,7 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             oauth2: None,
+            aws_auth: None,
         }];
 
         let store = RouteStore::load(&routes).unwrap();
@@ -745,6 +760,7 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 oauth2: None,
+                aws_auth: None,
             },
             RouteConfig {
                 prefix: "anthropic".to_string(),
@@ -763,6 +779,7 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 oauth2: None,
+                aws_auth: None,
             },
         ];
 
@@ -845,6 +862,7 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             oauth2: None,
+            aws_auth: None,
         }];
         let store = RouteStore::load(&routes).unwrap();
         let hit = store.lookup_by_upstream("api.openai.com:443").unwrap();
@@ -885,6 +903,7 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             oauth2: None,
+            aws_auth: None,
         }];
         let store = RouteStore::load(&routes).unwrap();
         let hit = store
@@ -915,6 +934,7 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             oauth2: None,
+            aws_auth: None,
         }];
         let store = RouteStore::load(&routes).unwrap();
         assert!(store.is_route_upstream("aliased.example.com:443"));
@@ -933,9 +953,10 @@ mod tests {
             managed_auth_mechanism: Some(NetworkAuditAuthMechanism::PhantomHeader),
             managed_injection_mode: Some(NetworkAuditInjectionMode::Header),
         };
-        assert!(managed.missing_managed_credential(false, false));
-        assert!(!managed.missing_managed_credential(true, false));
-        assert!(!managed.missing_managed_credential(false, true));
+        assert!(managed.missing_managed_credential(false, false, false));
+        assert!(!managed.missing_managed_credential(true, false, false));
+        assert!(!managed.missing_managed_credential(false, true, false));
+        assert!(!managed.missing_managed_credential(false, false, true));
 
         let l7_only = LoadedRoute {
             upstream: "https://internal.example.com".to_string(),
@@ -947,7 +968,7 @@ mod tests {
             managed_auth_mechanism: None,
             managed_injection_mode: None,
         };
-        assert!(!l7_only.missing_managed_credential(false, false));
+        assert!(!l7_only.missing_managed_credential(false, false, false));
     }
 
     #[test]
@@ -969,6 +990,7 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             oauth2: None,
+            aws_auth: None,
         }];
         let store = RouteStore::load(&routes).unwrap();
         let hit = store.lookup_by_upstream("api.openai.com:443").unwrap();
@@ -1001,6 +1023,7 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 oauth2: None,
+                aws_auth: None,
             },
             RouteConfig {
                 prefix: "github_org_b".to_string(),
@@ -1022,6 +1045,7 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 oauth2: None,
+                aws_auth: None,
             },
         ];
         let store = RouteStore::load(&routes).unwrap();
@@ -1097,6 +1121,7 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 oauth2: None,
+                aws_auth: None,
             }
         }
 
@@ -1509,6 +1534,7 @@ h56ZLEEqHfVWFhJWIKRSabtxYPV/VJyMv+lo3L0QwSKsouHs3dtF1zVQ
             tls_client_cert: Some(cert_path.to_str().unwrap().to_string()),
             tls_client_key: Some(key_path.to_str().unwrap().to_string()),
             oauth2: None,
+            aws_auth: None,
         }];
 
         let store = RouteStore::load(&routes).expect("should load mTLS route");

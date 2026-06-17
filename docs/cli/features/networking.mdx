@@ -5,6 +5,19 @@ description: Network access control — proxy modes, domain filtering, credentia
 
 By default the sandboxed process has unrestricted network access. When you restrict networking, nono routes traffic through an HTTP proxy running in the unsandboxed supervisor process. The sandboxed child can only reach `localhost:<proxy-port>` — all other outbound TCP is blocked at the kernel level.
 
+## Common cases
+
+```bash
+# Allow only specific domains — everything else is blocked
+nono run --allow-cwd --allow-domain api.openai.com -- my-agent
+
+# Block all outbound network
+nono run --allow-cwd --block-net -- my-agent
+
+# Inject an API key the sandbox never sees
+nono run --allow-cwd --credential openai -- my-agent
+```
+
 ## Proxy Modes
 
 The proxy supports three modes that can be combined in a single session:

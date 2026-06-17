@@ -24,7 +24,7 @@ Profiles simplify this:
 
 ```bash
 # With profiles - concise and auditable
-nono run --profile claude-code -- claude
+nono run --profile always-further/claude -- claude
 ```
 
 ### Profile Sources
@@ -174,7 +174,7 @@ The `workdir` section controls whether and how the current working directory is 
 | `"write"` | Write-only access to CWD |
 | `"readwrite"` | Full read+write access to CWD |
 
-When a profile specifies a workdir access level, nono will prompt the user to confirm CWD sharing (unless `--allow-cwd` is used to skip the prompt).
+When a profile specifies a workdir access level, nono will prompt the user to confirm CWD sharing (unless `--allow-cwd` is used to skip the prompt). `--allow-cwd` grants access to the directory at that profile's workdir level — so with `"none"` (the `default` profile) it grants nothing. Pair `--allow-cwd` with a profile that sets a workdir level, or grant the directory explicitly with `--allow`/`--read`.
 
 ### Filesystem Overrides and Group Composition
 
@@ -197,6 +197,7 @@ This is the primary mechanism for surgically customizing inherited profiles with
 | `deny` | `commands` | Deprecated in v0.33.0. Startup-only command denylist extension. Not enforced for child processes; prefer `filesystem.deny` and narrower grants. |
 | `bypass_protection` | `filesystem` | Paths exempted from deny groups. **Does not grant access** — each path must also appear in `filesystem.allow`, `filesystem.read`, or `filesystem.write`. |
 | `suppress_save_prompt` | `filesystem` | Paths whose runtime denials should not be offered in save-profile prompts. **Does not grant access** and does not hide diagnostics. |
+| `suppress_system_services` | `diagnostics` | macOS Seatbelt operation names to hide from diagnostic footers and save-profile prompts. **Does not grant access** and does not change enforcement. |
 
 <Note>
   **Renamed in issue #594.** The old top-level `policy` section was dissolved into `filesystem`, `groups`, and `commands` in the canonical schema. Legacy names still deserialize with a deprecation warning; see the migration table in `nono profile guide` for the full mapping. The legacy keys will be removed in v1.0.0.
@@ -306,7 +307,7 @@ This allows access to `~/.docker` even though `deny_credentials` blocks it by de
 This is equivalent to the CLI flag `--bypass-protection`:
 
 ```bash
-nono run --profile opencode --allow ~/.docker --bypass-protection ~/.docker -- opencode
+nono run --profile always-further/opencode --allow ~/.docker --bypass-protection ~/.docker -- opencode
 ```
 
 #### Suppressing Save Suggestions Without Granting Access
@@ -332,8 +333,34 @@ why the path does not appear in the save prompt.
 The interactive save prompt applies this to every listed path suggestion when
 you choose `suppress`; it does not create any allow/read/write grants.
 
+#### Suppressing Expected macOS System-Service Diagnostics
+
+Use `diagnostics.suppress_system_services` when a macOS Seatbelt operation is
+expected to be denied and you do not want nono to repeat the diagnostic footer
+(or offer a save-profile prompt) on every run:
+
+```json
+{
+  "extends": "default",
+  "meta": { "name": "node-local", "version": "1.0.0" },
+  "diagnostics": {
+    "suppress_system_services": ["user-preference-read"]
+  }
+}
+```
+
+This is macOS-only. Values are Seatbelt operation names from the sandbox log,
+such as `user-preference-read` (CFPreferences / NSUserDefaults probes from npm
+and other Node tools) or `forbidden-exec-sugid`. Suppression is output-only:
+the sandbox still denies the operation.
+
+Unlike `filesystem.suppress_save_prompt`, this hides matching violations from
+the diagnostic footer entirely. There is no CLI flag equivalent yet; add the
+operation name to your profile. To silence all post-run diagnostics instead,
+use `--no-diagnostics`.
+
 <Note>
-  `filesystem`, `groups`, and `commands` fields are additive across inheritance. A child profile's `filesystem.deny` is merged with the base profile's `filesystem.deny`, and `groups.exclude` from both levels are combined.
+  `filesystem`, `groups`, `commands`, and `diagnostics` fields are additive across inheritance. A child profile's `filesystem.deny` is merged with the base profile's `filesystem.deny`, `groups.exclude` from both levels are combined, and `diagnostics.suppress_system_services` entries from both profiles are appended and deduplicated.
 </Note>
 
 ### Network Configuration
@@ -489,13 +516,13 @@ CLI flags always take precedence over profile settings:
 
 ```bash
 # Use claude-code profile but block network
-nono run --profile claude-code --block-net -- claude
+nono run --profile always-further/claude --block-net -- claude
 
 # Use claude-code profile but add a custom domain
-nono run --profile claude-code --allow-domain custom-api.example.com -- claude
+nono run --profile always-further/claude --allow-domain custom-api.example.com -- claude
 
 # Add extra directory access
-nono run --profile claude-code --allow ~/other-project -- claude
+nono run --profile always-further/claude --allow ~/other-project -- claude
 ```
 
 To keep a base profile but clear an inherited network profile, set `network.network_profile` to `null` in the child:
@@ -536,6 +563,10 @@ prompt filters only; they do not participate in capability enforcement. The
 older `filesystem.ignore` and `--ignore-denied` forms are accepted as aliases,
 but new examples use the explicit suppress wording to avoid suggesting an
 access grant.
+
+`profile.diagnostics.suppress_system_services` is also output-only (macOS). It
+hides recurring non-filesystem Seatbelt violations from diagnostic footers and
+save-profile prompts without granting the underlying operation.
 
 Exclusions are applied after group addition. If the same group appears in both
 `groups.include` and `groups.exclude`, the exclusion wins.
@@ -662,7 +693,7 @@ The base profile that all other profiles extend. Provides system path access, de
 ### claude-code
 
 ```bash
-nono run --profile claude-code -- claude
+nono run --profile always-further/claude -- claude
 ```
 
 **Groups:** `claude_code_macos`, `claude_code_linux`, `user_caches_macos`, `claude_cache_linux`, `node_runtime`, `rust_runtime`, `python_runtime`, `vscode_macos`, `vscode_linux`, `nix_runtime`, `git_config`, `unlink_protection` (plus `default` groups)
@@ -678,7 +709,7 @@ nono run --profile claude-code -- claude
 ### codex
 
 ```bash
-nono run --profile codex -- codex
+nono run --profile always-further/codex -- codex
 ```
 
 **Groups:** `codex_macos`, `node_runtime`, `rust_runtime`, `python_runtime`, `nix_runtime`, `git_config`, `unlink_protection` (plus `default` groups)
@@ -694,7 +725,7 @@ nono run --profile codex -- codex
 ### opencode
 
 ```bash
-nono run --profile opencode -- opencode
+nono run --profile always-further/opencode -- opencode
 ```
 
 **Groups:** `user_caches_macos`, `user_caches_linux`, `node_runtime`, `opencode_linux`, `git_config`, `unlink_protection` (plus `default` groups)

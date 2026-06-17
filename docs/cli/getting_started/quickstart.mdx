@@ -12,170 +12,51 @@ nono run --allow . -- <COMMAND> [ARGS...]
 ```
 
 <Note>
-The `--` separator is recommended. Everything after it is the command to run.
+The `--` separator is for the reader to visually separate nono flags from the command and its arguments. It's not strictly required if there is no ambiguity, but it's a good habit to get into to avoid mistakes as you add more flags.
 </Note>
 
-```bash
-# Grant read+write access to current directory, run claude
-nono run --allow . -- claude
-```
+Anything which is a process, can be run inside a nono sandbox - CLI tools, scripts, even interactive shells. The sandbox is applied to the entire process tree, so any child processes will also be restricted by the same permissions.
 
-Or use a profile that bundles the right permissions for a known tool:
+## Pre-Built Profiles
 
-```bash
-nono run --profile claude-code -- claude
-nono run --profile codex -- codex
-```
+To get you going quickly, we provide pre-built profiles for popular AI agents and tools. These profiles bundle the right permissions for each tool, so you can get up and running with a single command.
 
-See [Profiles & Groups](/cli/features/profiles-groups) for all available profiles and how to create your own.
-
-## Commands
-
-| Command | Description |
-|---------|-------------|
-| `nono run` | Run a command inside the sandbox (supervised, default) |
-| `nono shell` | Start an interactive shell inside the sandbox |
-| `nono wrap` | Apply sandbox and exec into command (no parent process, minimal overhead) |
-| `nono ps` / `attach` / `detach` / `stop` / `inspect` / `prune` | [Manage runtime sessions](/cli/features/session-lifecycle) - discover, reattach, inspect, stop, and clean up long-lived sessions |
-| `nono why` | Check why a path/network operation would be allowed or denied |
-| `nono rollback` | [Manage rollback sessions](/cli/features/atomic-rollbacks) - list, show, restore, verify, cleanup snapshots |
-| `nono audit` | [View audit trail](/cli/features/audit) - list and inspect past supervised sessions, including optional integrity metadata |
-| `nono trust` | [Manage instruction file trust](/cli/features/trust) - sign, verify, and manage attestation |
-| `nono setup` | System setup and verification - generate profiles, check shell integration |
-
-## Permissions
-
-nono provides three levels of filesystem access:
-
-| Flag | Access Level | Use Case |
-|------|--------------|----------|
-| `--allow` / `-a` | Read + Write | Working directories, project folders |
-| `--read` / `-r` | Read Only | Source code, configuration |
-| `--write` / `-w` | Write Only | Output directories, logs |
-
-**Directory flags** (`--allow`, `--read`, `--write`) grant recursive access. **File flags** (`--allow-file`, `--read-file`, `--write-file`) grant access to a single file.
+Just search for your favorite coding agent from the registry
 
 ```bash
-# Recursive access to entire directory
-nono run --allow ./project -- command
-
-# Access to single config file only
-nono run --read-file ./config.toml -- command
+nono search opencode
+always-further/opencode	-	Official Always Further Opencode Plugin
 ```
 
-## Network Access
-
-Network is **allowed by default**. Use `--block-net` to disable outbound connections:
+And then run..
 
 ```bash
-nono run --allow . --block-net -- cargo build
+nono run --profile always-further/claude -- claude
+nono run --profile always-further/codex -- codex
+nono run --profile always-further/pi -- pi
 ```
 
-For granular control, use `--network-profile` for host-level filtering or `--open-port` for localhost IPC between sandboxes:
-
-```bash
-# Host-level filtering via proxy
-nono run --allow . --network-profile claude-code -- my-agent
-
-# Allow specific domains through the proxy
-nono run --allow . --allow-domain api.openai.com -- my-agent
-
-# Localhost IPC (e.g., MCP server on port 3000)
-nono run --block-net --open-port 3000 --allow . -- my-agent
-```
-
-See [Networking](/cli/features/networking) and [CLI Reference](/cli/usage/flags) for details.
-
-## Interactive Shell (`nono shell`)
-
-Start a shell with the same sandbox permissions as `nono run`:
-
-```bash
-# Shell with access only to current directory
-nono shell --allow .
-
-# Shell with a named profile
-nono shell --profile claude-code
-
-# Override the shell binary
-nono shell --allow-cwd --shell /bin/zsh
-```
-
-Exit the shell with `Ctrl-D` or `exit`.
-
-## Checking Path Access (`nono why`)
-
-The `why` command checks if a path or network operation would be allowed or denied. It's designed for both human debugging and programmatic use by AI agents.
-
-```bash
-# Check if a sensitive path would be blocked
-nono why --path ~/.ssh/id_rsa --op read
-# Output: DENIED - sensitive_path (SSH keys and config)
-
-# Check with capability context
-nono why --path ./src --op write --allow .
-# Output: ALLOWED - Granted by: --allow .
-
-# JSON output for AI agents
-nono why --json --path ~/.aws --op read
-# {"status":"denied","reason":"sensitive_path","category":"AWS credentials",...}
-
-# From inside a sandbox, query own capabilities
-nono run --allow-cwd -- nono why --self --path /tmp --op write --json
-```
-
-| Flag | Description |
-|------|-------------|
-| `--path` | Filesystem path to check |
-| `--op` | Operation: `read`, `write`, or `readwrite` (default: `read`) |
-| `--host` | Network host to check (instead of `--path`) |
-| `--port` | Network port (default: 443) |
-| `--json` | Output JSON for programmatic use |
-| `--self` | Query current sandbox state (inside sandbox) |
-
-This is particularly useful for AI agents - when an operation fails, the agent can call `nono why --self` to get a structured JSON response explaining why and how to fix it.
-
-## What Happens at Runtime
-
-1. **Parse** — nono parses your capability flags
-2. **Canonicalize** — All paths are resolved to absolute paths (prevents symlink escapes)
-3. **Apply Sandbox** — Kernel sandbox is initialized (irreversible)
-4. **Fork & Execute** — nono forks a sandboxed child process and runs your command inside it. The unsandboxed parent stays alive for audit recording, rollback, and diagnostics.
-5. **Enforce** — Kernel blocks any unauthorized access attempts
-
-## Sensitive Paths
-
-The following paths are always blocked by default to protect credentials:
-
-- `~/.ssh` - SSH keys
-- `~/.aws`, `~/.gcloud`, `~/.azure` - Cloud credentials
-- `~/.gnupg` - GPG keys
-- `~/.kube`, `~/.docker` - Container credentials
-- `~/.zshrc`, `~/.bashrc`, `~/.profile` - Shell configs (often contain secrets)
-- `~/.npmrc`, `~/.git-credentials` - Package manager tokens
-
-Use `nono why --path <path> --op read` to check if a specific path is blocked and why. See [Profiles & Groups](/cli/features/profiles-groups) for the full list and how group policy controls these.
-
-## Agent Integration
-
-For setting up nono with a specific AI agent:
-
-- [Claude Code](/cli/clients/claude-code)
-- [Codex](/cli/clients/codex)
-- [OpenCode](/cli/clients/opencode)
-- [OpenClaw](/cli/clients/openclaw)
-
-<Note>
-  If there is an Agent you want supported please open an issue or PR to add it!
+<Note> 
+  If the agent you want to use cannot be found, create an [issue](https://github.com/always-further/nono/issues) to request consideration for adding it to the registry, or better yet, fork an existing profile and submit a PR with the new agent profile! See [Profiles & Groups](/cli/features/profiles-groups) for details on how to create your own profiles.
 </Note>
+
+### Build your own profile
+
+It's likely that you are going to want to customize the pre-built profiles or create your own for different tools and needs. You can do this easily with `nono profile init` which will create a new profile based on an existing one, with the option to customize it interactively.
+
+```bash
+nono profile init claude --extends always-further/claude --full
+
+nono profile Created profile at /Users/jdoe/.config/nono/profiles/claude.json
+nono profile Validate with: nono profile validate claude
+nono profile For editor autocomplete: nono profile schema -o nono-profile.schema.json
+```
+
+You can now call your own profile with `--profile claude` just like the pre-built ones.
+
+From here, move to [Profiles & Groups](/cli/features/profiles-groups) for more indepth details on how to create and manage profiles, groups, and the policy engine.
 
 ## Next Steps
 
-- [Developer Workflows](/cli/usage/developer-workflows) - Recommended day-to-day patterns for coding agents
 - [CLI Reference](/cli/usage/flags) - Complete flag documentation
 - [Examples](/cli/usage/examples) - Common usage patterns
-- [Session Lifecycle](/cli/features/session-lifecycle) - Live detached sessions, attach/detach, inspection, and stop flows
-- [Profiles & Groups](/cli/features/profiles-groups) - Pre-configured capability sets and composable security groups
-- [Credential Injection](/cli/features/credential-injection) - Secure API key loading from system keystore
-- [Undo & Snapshots](/cli/features/atomic-rollbacks) - Filesystem snapshots with integrity verification
-- [Troubleshooting](/cli/usage/troubleshooting) - Common issues and solutions

@@ -1,6 +1,6 @@
 [package]
 name = "nono"
-version = "0.62.0"
+version = "0.63.0"
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
@@ -69,7 +69,7 @@ nix = { workspace = true, features = ["fs", "user"] }
 keyring = { version = "3", features = ["apple-native"], optional = true, default-features = false }
 
 [build-dependencies]
-typify = "0.6"
+typify = "0.7"
 serde_json.workspace = true
 syn = "2"
 prettyplease = "0.2"

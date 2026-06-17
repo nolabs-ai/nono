@@ -28,7 +28,7 @@ This does not mean turning off the agent's own approval UX. It means avoiding a 
 Recommended pattern:
 
 ```bash
-nono run --profile claude-code --allow-cwd -- claude
+nono run --profile always-further/claude --allow-cwd -- claude
 ```
 
 When running Claude Code under `nono`, prefer using `nono` as the real sandbox boundary and keep Claude Code's native sandbox disabled, or at minimum configured not to fall back to unsandboxed execution.
@@ -45,7 +45,7 @@ See [Claude Code](/cli/clients/claude-code) for the agent-specific details.
 Recommended pattern:
 
 ```bash
-nono run --profile codex --allow-cwd -- codex --sandbox danger-full-access --ask-for-approval on-request
+nono run --profile always-further/codex --allow-cwd -- codex --sandbox danger-full-access --ask-for-approval on-request
 ```
 
 The important part is the same: let `nono` enforce the filesystem and network boundary, and avoid layering another independent sandbox on top unless you have a specific reason.
@@ -75,7 +75,7 @@ The difference is that the session is still running inside the `nono` runtime mo
 ### Start Detached
 
 ```bash
-nono run --detached --profile claude-code --allow-cwd -- claude "Do some long-running work"
+nono run --detached --profile always-further/claude --allow-cwd -- claude "Do some long-running work"
 ```
 
 Then later:
@@ -88,7 +88,7 @@ nono attach <session-id>
 ### Start Attached, Then Detach
 
 ```bash
-nono run --profile claude-code --allow-cwd -- claude
+nono run --profile always-further/claude --allow-cwd -- claude
 ```
 
 Then detach with:
@@ -139,7 +139,7 @@ See [Session Lifecycle](/cli/features/session-lifecycle) for the full command re
 Use this when you expect to stay attached the whole time:
 
 ```bash
-nono run --profile claude-code --allow-cwd -- claude
+nono run --profile always-further/claude --allow-cwd -- claude
 ```
 
 Good for:
@@ -153,7 +153,7 @@ Good for:
 Use this when the agent may run for a while and you do not want to babysit the terminal:
 
 ```bash
-nono run --detached --profile claude-code --allow-cwd -- claude
+nono run --detached --profile always-further/claude --allow-cwd -- claude
 nono ps
 nono attach <session-id>
 ```
@@ -170,7 +170,7 @@ Good for:
 This is the safest default for agents that may modify a lot of code:
 
 ```bash
-nono run --detached --rollback --profile claude-code --allow-cwd -- claude
+nono run --detached --rollback --profile always-further/claude --allow-cwd -- claude
 ```
 
 This combines:
@@ -214,24 +214,24 @@ See [Session Lifecycle](/cli/features/session-lifecycle) for the full runtime co
 Use preset, pack, or custom profiles for repeatable workflows:
 
 ```bash
-nono run --profile claude-code -- claude
-nono run --profile codex -- codex --sandbox danger-full-access --ask-for-approval on-request
+nono run --profile always-further/claude -- claude
+nono run --profile always-further/codex -- codex --sandbox danger-full-access --ask-for-approval on-request
 ```
 
 Profiles make your workflow easier to repeat, share, and audit.
 
 ### Use `--allow-cwd` Deliberately
 
-`--allow-cwd` is convenient, but it means “grant the current repository read+write access”.
+`--allow-cwd` shares the current directory at the access level the active profile's [`workdir`](/cli/features/profiles-groups#working-directory) config declares: read+write for the coding profiles used here (`always-further/claude`, `always-further/codex`), read-only when no profile is specified, and nothing at all under the conservative `default` profile (`workdir: "none"`).
 
-That is often the right choice for coding agents, but treat it as an explicit workspace grant, not as boilerplate.
+That read+write grant is often the right choice for coding agents, but treat it as an explicit workspace grant, not as boilerplate.
 
 ### Keep Login/Bootstrap Permissions Temporary
 
 Some flows, especially browser-based login on macOS, need temporary extra permissions:
 
 ```bash
-nono run --profile claude-code --allow-launch-services -- claude
+nono run --profile always-further/claude --allow-launch-services -- claude
 ```
 
 Use those only for setup, then exit and rerun without them.
@@ -251,7 +251,7 @@ That preserves runtime cleanup, terminal cleanup, and rollback finalization.
 If you are going to let an agent run while detached, `--rollback` is usually worth the extra bookkeeping:
 
 ```bash
-nono run --detached --rollback --profile codex --allow-cwd -- codex --sandbox danger-full-access --ask-for-approval on-request
+nono run --detached --rollback --profile always-further/codex --allow-cwd -- codex --sandbox danger-full-access --ask-for-approval on-request
 ```
 
 This is the safer operational default for:
@@ -266,7 +266,7 @@ This is the safer operational default for:
 If you want one strong default workflow for powerful coding agents, use this:
 
 ```bash
-nono run --detached --rollback --profile claude-code --allow-cwd -- claude
+nono run --detached --rollback --profile always-further/claude --allow-cwd -- claude
 ```
 
 That gives you:

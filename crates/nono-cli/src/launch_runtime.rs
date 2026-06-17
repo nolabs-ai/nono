@@ -115,6 +115,8 @@ pub(crate) struct ExecutionFlags {
     pub(crate) session_hooks: profile::SessionHooks,
     pub(crate) allowed_env_vars: Option<Vec<String>>,
     pub(crate) denied_env_vars: Option<Vec<String>>,
+    /// Expanded `environment.set_vars` (key, expanded-value), `None` if absent.
+    pub(crate) set_vars: Option<Vec<(String, String)>>,
     pub(crate) startup_timeout_secs: Option<u64>,
 }
 
@@ -146,6 +148,7 @@ impl ExecutionFlags {
             session_hooks: profile::SessionHooks::default(),
             allowed_env_vars: None,
             denied_env_vars: None,
+            set_vars: None,
             startup_timeout_secs: None,
         })
     }
@@ -283,6 +286,7 @@ pub(crate) fn prepare_run_launch_plan(
             session_hooks: prepared.session_hooks,
             allowed_env_vars: prepared.allowed_env_vars,
             denied_env_vars: prepared.denied_env_vars,
+            set_vars: prepared.set_vars,
             startup_timeout_secs,
         },
     })
@@ -428,7 +432,7 @@ fn validate_rollback_destination(
 
     Err(NonoError::ConfigParse(format!(
         "--rollback-dest '{}' is not covered by sandbox write permissions. \
-         Add --allow {} to grant access, or omit --rollback-dest to use the default path (~/.nono/rollbacks/).",
+         Add --allow {} to grant access, or omit --rollback-dest to use the default path ($XDG_STATE_HOME/nono/rollbacks/).",
         dest.display(),
         dest.display()
     )))

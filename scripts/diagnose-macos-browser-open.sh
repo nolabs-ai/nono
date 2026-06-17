@@ -91,20 +91,20 @@ run_step \
 
 run_step \
     "nono claude-profile absolute-open" \
-    "$NONO_BIN" run --profile claude-code --allow-cwd -- /usr/bin/open -g "$URL"
+    "$NONO_BIN" run --profile always-further/claude --allow-cwd -- /usr/bin/open -g "$URL"
 
 run_step \
     "nono claude-profile path-open" \
-    "$NONO_BIN" run --profile claude-code --allow-cwd -- open -g "$URL"
+    "$NONO_BIN" run --profile always-further/claude --allow-cwd -- open -g "$URL"
 
 run_step \
     "nono claude-profile absolute-open with lsopen" \
-    "$NONO_BIN" run --profile claude-code --allow-cwd --allow-launch-services -- \
+    "$NONO_BIN" run --profile always-further/claude --allow-cwd --allow-launch-services -- \
     /usr/bin/open -g "$URL"
 
 run_step \
     "nono claude-profile path-open with lsopen" \
-    "$NONO_BIN" run --profile claude-code --allow-cwd --allow-launch-services -- \
+    "$NONO_BIN" run --profile always-further/claude --allow-cwd --allow-launch-services -- \
     open -g "$URL"
 
 log "Completed diagnostics. Full log: $LOG_FILE"

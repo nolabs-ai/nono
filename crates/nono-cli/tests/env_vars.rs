@@ -76,6 +76,52 @@ fn env_nono_block_net_accepts_true() {
 }
 
 #[test]
+fn env_nono_capability_elevation_accepts_truthy() {
+    let output = nono_bin()
+        .env("NONO_CAPABILITY_ELEVATION", "1")
+        .args(["run", "--allow", "/tmp", "--dry-run", "echo"])
+        .output()
+        .expect("failed to run nono");
+
+    assert!(
+        output.status.success(),
+        "NONO_CAPABILITY_ELEVATION=1 should be accepted, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn env_nono_trust_override_accepts_truthy() {
+    let output = nono_bin()
+        .env("NONO_TRUST_OVERRIDE", "1")
+        .args(["run", "--allow", "/tmp", "--dry-run", "echo"])
+        .output()
+        .expect("failed to run nono");
+
+    assert!(
+        output.status.success(),
+        "NONO_TRUST_OVERRIDE=1 should be accepted, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn env_nono_trust_proxy_ca_accepts_truthy() {
+    let output = nono_bin()
+        .env("NONO_TRUST_PROXY_CA", "1")
+        .args(["run", "--allow", "/tmp", "--dry-run", "echo"])
+        .output()
+        .expect("failed to run nono");
+
+    assert!(
+        output.status.success(),
+        "NONO_TRUST_PROXY_CA=1 should be accepted, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn legacy_env_nono_net_block_still_works() {
     let output = nono_bin()
         .env("NONO_NET_BLOCK", "1")

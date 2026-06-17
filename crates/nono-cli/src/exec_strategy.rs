@@ -14,6 +14,7 @@ mod env_sanitization;
 #[cfg(target_os = "linux")]
 mod supervisor_linux;
 
+use crate::diagnostic::{DiagnosticFormatter, DiagnosticMode};
 use crate::startup_prompt::{notify_startup_termination_for_child, print_terminal_safe_stderr};
 use crate::{DETACHED_CWD_PROMPT_RESPONSE_ENV, DETACHED_LAUNCH_ENV, DETACHED_SESSION_ID_ENV};
 use nix::libc;
@@ -22,9 +23,8 @@ use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::{ForkResult, Pid, fork};
 use nono::supervisor::{ApprovalDecision, AuditEntry, SupervisorMessage, SupervisorResponse};
 use nono::{
-    ApprovalBackend, CapabilitySet, DenialReason, DenialRecord, DiagnosticFormatter,
-    DiagnosticMode, NonoError, Result, Sandbox, SupervisorListener, SupervisorSocket,
-    UnixSocketCapability, UnixSocketMode,
+    ApprovalBackend, CapabilitySet, DenialReason, DenialRecord, NonoError, Result, Sandbox,
+    SupervisorListener, SupervisorSocket, UnixSocketCapability, UnixSocketMode,
 };
 use std::collections::HashSet;
 use std::ffi::{CString, OsStr};
@@ -41,6 +41,7 @@ use tracing::{debug, info, warn};
 pub(crate) use env_sanitization::is_dangerous_env_var;
 use env_sanitization::should_skip_env_var;
 pub(crate) use env_sanitization::validate_env_var_patterns;
+pub(crate) use env_sanitization::validate_set_vars;
 
 /// Resolve a program name to its absolute path.
 ///
@@ -73,8 +74,8 @@ const MAX_TRACKED_REQUEST_IDS: usize = 4096;
 use crate::timeouts;
 
 struct ProfileSaveOffer<'a> {
-    policy_explanations: &'a [nono::diagnostic::PolicyExplanation],
-    error_observation: &'a nono::diagnostic::ErrorObservation,
+    policy_explanations: &'a [crate::diagnostic::PolicyExplanation],
+    error_observation: &'a crate::diagnostic::ErrorObservation,
     caps: &'a CapabilitySet,
     command: &'a [String],
     compared_profile: Option<&'a str>,
@@ -244,6 +245,10 @@ pub struct ExecConfig<'a> {
     /// name or prefix pattern (e.g. `"GITHUB_*"`) are stripped even if they
     /// also appear in `allowed_env_vars`. Nono-injected credentials bypass this.
     pub denied_env_vars: Option<Vec<String>>,
+    /// Static environment variables (`environment.set_vars`) injected after host
+    /// env filtering and before `env_vars` (credentials/proxy/hooks). Values are
+    /// already variable-expanded. Bypasses allow/deny filtering by design.
+    pub set_vars: Vec<(String, String)>,
 }
 
 #[derive(Clone, Copy)]
@@ -366,6 +371,12 @@ pub fn execute_direct(config: &ExecConfig<'_>) -> Result<()> {
 
     cmd.args(cmd_args).env("NONO_CAP_FILE", config.cap_file);
 
+    // Static profile vars (set_vars): after host filtering, before credentials
+    // so injected credentials win on conflict.
+    for (key, value) in &config.set_vars {
+        cmd.env(key, value);
+    }
+
     for (key, value) in &config.env_vars {
         cmd.env(key, value);
     }
@@ -410,6 +421,43 @@ pub fn execute_direct(config: &ExecConfig<'_>) -> Result<()> {
 /// parent can capture terminal output for diagnostics while the child still sees
 /// a TTY. Otherwise the child inherits the parent's terminal directly.
 /// The parent prints diagnostics and rollback UI after the child exits.
+///
+/// Append `set_vars` to a raw `execve` environment vector, deduplicating by key.
+///
+/// `env_c` is a raw `KEY=VALUE` vector passed straight to `execve` — unlike
+/// [`std::process::Command::env`] it does not collapse duplicate keys, so we
+/// must dedupe by hand. Passing duplicate keys to `execve` is
+/// platform-dependent and a potential dynamic-linker-bypass vector.
+///
+/// Precedence matches `execute_direct`: credentials (`env_vars`) win over
+/// `set_vars`, which win over inherited host vars. A `set_vars` key already
+/// destined to be set by `env_vars` is skipped; any earlier entry (e.g. an
+/// inherited host var) with the same key is removed before the new value is
+/// pushed.
+fn push_set_vars(
+    env_c: &mut Vec<CString>,
+    set_vars: &[(String, String)],
+    env_vars: &[(&str, &str)],
+) {
+    for (key, value) in set_vars {
+        if env_vars.iter().any(|(ek, _)| ek == key) {
+            continue;
+        }
+        let mut prefix = Vec::with_capacity(key.len() + 1);
+        prefix.extend_from_slice(key.as_bytes());
+        prefix.push(b'=');
+        env_c.retain(|cstr| !cstr.as_bytes().starts_with(&prefix));
+
+        let mut kv = Vec::with_capacity(key.len() + 1 + value.len() + 1);
+        kv.extend_from_slice(key.as_bytes());
+        kv.push(b'=');
+        kv.extend_from_slice(value.as_bytes());
+        if let Ok(cstr) = CString::new(kv) {
+            env_c.push(cstr);
+        }
+    }
+}
+
 pub fn execute_supervised(
     config: &ExecConfig<'_>,
     supervisor: Option<&SupervisorConfig<'_>>,
@@ -508,6 +556,10 @@ pub fn execute_supervised(
     {
         env_c.push(cstr);
     }
+
+    // Static profile vars (set_vars): after host filtering, before credentials
+    // so injected credentials win on conflict.
+    push_set_vars(&mut env_c, &config.set_vars, &config.env_vars);
 
     // Add user-specified environment variables (secrets, etc.)
     for (key, value) in &config.env_vars {
@@ -1229,7 +1281,7 @@ pub fn execute_supervised(
             let error_observation = pty_proxy
                 .as_ref()
                 .map(|p| {
-                    nono::diagnostic::analyze_error_output(
+                    crate::diagnostic::analyze_error_output(
                         &p.screen_plaintext(),
                         config.protected_paths,
                         Some(config.current_dir),
@@ -1319,7 +1371,7 @@ pub fn execute_supervised(
                     )
                     .with_canonical_denial_paths(canonical_denial_paths);
                 if let Some(program) = config.command.first() {
-                    formatter = formatter.with_command(nono::diagnostic::CommandContext {
+                    formatter = formatter.with_command(crate::diagnostic::CommandContext {
                         program: program.clone(),
                         resolved_path: config.resolved_program.to_path_buf(),
                         args: nono::scrub_argv_with_policy(config.command, redaction_policy),
@@ -1369,9 +1421,9 @@ fn build_policy_explanations(
     denials: &[nono::diagnostic::DenialRecord],
     sandbox_violations: &[nono::SandboxViolation],
     caps: &nono::CapabilitySet,
-) -> Vec<nono::diagnostic::PolicyExplanation> {
+) -> Vec<crate::diagnostic::PolicyExplanation> {
+    use crate::diagnostic::PolicyExplanation;
     use nono::AccessMode;
-    use nono::diagnostic::PolicyExplanation;
     use std::collections::BTreeMap;
 
     // Merge access modes per path so a path denied for both Read and Write
@@ -1423,8 +1475,6 @@ fn build_policy_explanations(
         match crate::query_ext::query_path(&path, access, caps, &[]) {
             Ok(crate::query_ext::QueryResult::Denied {
                 reason,
-                details,
-                policy_source,
                 suggested_flag,
                 ..
             }) => {
@@ -1432,8 +1482,6 @@ fn build_policy_explanations(
                     path,
                     access,
                     reason,
-                    details,
-                    policy_source,
                     suggested_flag,
                 });
             }
@@ -1483,7 +1531,7 @@ fn should_print_diagnostic_footer(
     denials: &[nono::diagnostic::DenialRecord],
     ipc_denials: &[nono::diagnostic::IpcDenialRecord],
     sandbox_violations: &[nono::SandboxViolation],
-    error_observation: &nono::diagnostic::ErrorObservation,
+    error_observation: &crate::diagnostic::ErrorObservation,
 ) -> bool {
     !no_diagnostics
         && (exit_code != 0
@@ -1514,8 +1562,8 @@ fn filter_suppressed_system_service_violations(
 fn should_offer_profile_save(
     no_diagnostics: bool,
     exit_code: i32,
-    policy_explanations: &[nono::diagnostic::PolicyExplanation],
-    error_observation: &nono::diagnostic::ErrorObservation,
+    policy_explanations: &[crate::diagnostic::PolicyExplanation],
+    error_observation: &crate::diagnostic::ErrorObservation,
     sandbox_violations: &[nono::SandboxViolation],
 ) -> bool {
     !no_diagnostics
@@ -3658,6 +3706,75 @@ mod tests {
         ControlFlags, InputFlags, LocalFlags, OutputFlags, SpecialCharacterIndices,
     };
 
+    fn env_strings(env_c: &[CString]) -> Vec<String> {
+        env_c
+            .iter()
+            .map(|c| c.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn push_set_vars_appends_new_keys() {
+        let mut env_c = vec![CString::new("HOME=/home/x").expect("cstring")];
+        let set_vars = vec![("RUST_LOG".to_string(), "debug".to_string())];
+        push_set_vars(&mut env_c, &set_vars, &[]);
+        assert_eq!(env_strings(&env_c), vec!["HOME=/home/x", "RUST_LOG=debug"]);
+    }
+
+    #[test]
+    fn push_set_vars_overrides_inherited_host_var_without_duplicating() {
+        // An inherited host var with the same key must be replaced, not duplicated.
+        let mut env_c = vec![
+            CString::new("PRE=1").expect("cstring"),
+            CString::new("RUST_LOG=info").expect("cstring"),
+            CString::new("POST=2").expect("cstring"),
+        ];
+        let set_vars = vec![("RUST_LOG".to_string(), "debug".to_string())];
+        push_set_vars(&mut env_c, &set_vars, &[]);
+        // Exactly one RUST_LOG entry, carrying the set_vars value.
+        let entries = env_strings(&env_c);
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|e| e.starts_with("RUST_LOG="))
+                .count(),
+            1
+        );
+        assert!(entries.contains(&"RUST_LOG=debug".to_string()));
+        assert!(entries.contains(&"PRE=1".to_string()));
+        assert!(entries.contains(&"POST=2".to_string()));
+    }
+
+    #[test]
+    fn push_set_vars_skips_keys_overridden_by_env_vars() {
+        // A key also set via env_vars (credentials) is skipped entirely, so
+        // env_vars wins and there is no duplicate. The inherited host entry is
+        // left for env_vars (appended later) to override.
+        let mut env_c = vec![CString::new("TOKEN=host").expect("cstring")];
+        let set_vars = vec![("TOKEN".to_string(), "from_set_vars".to_string())];
+        let env_vars = vec![("TOKEN", "from_credentials")];
+        push_set_vars(&mut env_c, &set_vars, &env_vars);
+        // set_vars did not push its value...
+        let entries = env_strings(&env_c);
+        assert!(!entries.contains(&"TOKEN=from_set_vars".to_string()));
+        // ...and did not duplicate the key.
+        assert_eq!(
+            entries.iter().filter(|e| e.starts_with("TOKEN=")).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn push_set_vars_does_not_substring_match_other_keys() {
+        // PATH must not be removed when set_vars sets PA (prefix-collision guard).
+        let mut env_c = vec![CString::new("PATH=/usr/bin").expect("cstring")];
+        let set_vars = vec![("PA".to_string(), "x".to_string())];
+        push_set_vars(&mut env_c, &set_vars, &[]);
+        let entries = env_strings(&env_c);
+        assert!(entries.contains(&"PATH=/usr/bin".to_string()));
+        assert!(entries.contains(&"PA=x".to_string()));
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn test_linux_child_requires_dumpable_only_for_seccomp_driven_features() {
@@ -3721,7 +3838,7 @@ mod tests {
             target: Some("/tmp/secret.txt".to_string()),
         }];
         let denials = Vec::new();
-        let observation = nono::diagnostic::ErrorObservation::default();
+        let observation = crate::diagnostic::ErrorObservation::default();
 
         assert!(should_print_diagnostic_footer(
             false,
@@ -3743,15 +3860,13 @@ mod tests {
 
     #[test]
     fn test_profile_save_prompt_triggers_on_policy_explanation_with_zero_exit() {
-        let explanations = vec![nono::diagnostic::PolicyExplanation {
+        let explanations = vec![crate::diagnostic::PolicyExplanation {
             path: PathBuf::from("/tmp/secret.txt"),
             access: nono::AccessMode::Read,
             reason: "path_not_granted".to_string(),
-            details: None,
-            policy_source: None,
             suggested_flag: Some("--read-file /tmp/secret.txt".to_string()),
         }];
-        let observation = nono::diagnostic::ErrorObservation::default();
+        let observation = crate::diagnostic::ErrorObservation::default();
 
         assert!(should_offer_profile_save(
             false,
@@ -3765,7 +3880,7 @@ mod tests {
     #[test]
     fn test_profile_save_prompt_triggers_on_user_preferences_violation_with_zero_exit() {
         let explanations = Vec::new();
-        let observation = nono::diagnostic::ErrorObservation::default();
+        let observation = crate::diagnostic::ErrorObservation::default();
         let violations = vec![nono::SandboxViolation {
             operation: "user-preference-read".to_string(),
             target: Some("kcfpreferencesanyapplication".to_string()),
@@ -3783,7 +3898,7 @@ mod tests {
     #[test]
     fn test_suppressed_system_service_violations_do_not_offer_profile_save() {
         let explanations = Vec::new();
-        let observation = nono::diagnostic::ErrorObservation::default();
+        let observation = crate::diagnostic::ErrorObservation::default();
         let violations = vec![nono::SandboxViolation {
             operation: "forbidden-exec-sugid".to_string(),
             target: None,
@@ -3831,7 +3946,7 @@ mod tests {
     #[test]
     fn test_profile_save_prompt_preserves_nonzero_exit_behavior() {
         let explanations = Vec::new();
-        let observation = nono::diagnostic::ErrorObservation::default();
+        let observation = crate::diagnostic::ErrorObservation::default();
 
         assert!(should_offer_profile_save(
             false,

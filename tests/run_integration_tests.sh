@@ -76,14 +76,14 @@ export NONO_NO_MIGRATE=1
 export NONO_NO_SAVE_PROMPT=1
 
 # Audit is on by default, so every test invocation that does not pass
-# --no-audit writes a session under ~/.nono/audit/ (and ~/.nono/rollbacks/
-# for rollback tests), and appends to ~/.nono/audit/ledger.ndjson. There is
+# --no-audit writes a session under $XDG_STATE_HOME/nono/audit/ (and $XDG_STATE_HOME/nono/rollbacks/
+# for rollback tests), and appends to the audit ledger there. There is
 # no env-var override for the audit root, so snapshot the pre-run state and
 # restore it on exit. This removes only artefacts created during the run;
 # pre-existing user sessions and ledger entries are preserved.
 # Set NONO_TEST_KEEP_AUDIT=1 to skip cleanup for debugging.
-NONO_AUDIT_ROOT="$HOME/.nono/audit"
-NONO_ROLLBACK_ROOT="$HOME/.nono/rollbacks"
+NONO_AUDIT_ROOT="${XDG_STATE_HOME:-$HOME/.local/state}/nono/audit"
+NONO_ROLLBACK_ROOT="${XDG_STATE_HOME:-$HOME/.local/state}/nono/rollbacks"
 AUDIT_SNAPSHOT_DIR="$TEST_ENV_DIR/audit-snapshot"
 mkdir -p "$AUDIT_SNAPSHOT_DIR"
 

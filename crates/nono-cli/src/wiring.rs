@@ -1610,7 +1610,8 @@ mod tests {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
-        let _env = EnvVarGuard::set_all(&[("HOME", "/h")]);
+        let _env = EnvVarGuard::set_all(&[("HOME", "/h"), ("XDG_CONFIG_HOME", "__placeholder__")]);
+        _env.remove("XDG_CONFIG_HOME");
         assert_eq!(expand_vars("$PACK_DIR/x", &ctx).expect("expand"), "/p/x");
         assert_eq!(expand_vars("$NS/$PLUGIN", &ctx).expect("expand"), "ns/name");
         assert_eq!(

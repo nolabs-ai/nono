@@ -149,6 +149,43 @@ If a pack uses `when`, set `min_nono_version` to a CLI release that supports pre
 
 If your pack ships a profile with an `install_as` name that used to be compiled into the CLI (e.g. `claude-code` was a preset until v0.43), you also need to register it in the migration table so users on older versions get a friendly auto-pull prompt instead of a "profile not found" error. See [PACK_PROVIDED_PROFILES](#registering-a-pack-provided-profile) below.
 
+## Sideloading your profile to test it
+You can install the profile via the `nono sideload` command as-if it were already in the nono registry. This allows for testing as it would take place after a `nono pull` command. However, this requires extra setup to enable nono sideloading for profile development purposes
+
+### Build the nono CLI with sideloading capability
+
+To proceed with sideloading, you must build a local copy of nono with this ability available. Sideloading is ONLY for development purposes and is not available with the production version of nono. Clone the nono cli source code, then run
+```bash
+make build-sideload
+```
+
+This produces `target/debug/nono` with the `sideload` feature enabled.
+
+<Warning>
+  The sideload binary has all integrity protections disabled. Signature verification, digest checks, and credential validation are all skipped. Never use it outside local development.
+</Warning>
+
+### Sideload your pack
+
+```bash
+./target/debug/nono sideload ./path-to-your-pack
+```
+
+The pack directory must contain a `package.json`. The CLI reads the name, namespace, and version from it, then installs the artifacts into the pack store exactly as `nono pull` would — minus verification.
+
+To test the pack, you must continue to use the sideload-aware version of nono
+
+```bash
+./target/debug/nono run --profile <name> -- <agent>
+```
+
+If you try to use the production nono CLI, the sideloaded pack will fail verification.
+
+When you are finished verifying your pack, you can run
+```bash
+./target/debug/nono remove package-name
+```
+
 ## Step 3: Create the Pack in the Registry
 
 Create the pack in the registry UI first. You will need:

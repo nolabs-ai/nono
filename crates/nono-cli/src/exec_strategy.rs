@@ -1625,6 +1625,7 @@ fn wait_for_child_with_pty(
         }
         let in_band_detach_requested = pty.take_detach_request();
         handle_pty_detach_request(Some(pty), pause_requested, in_band_detach_requested);
+        handle_pty_suspension(Some(pty), child);
 
         match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
             Ok(WaitStatus::StillAlive) => {
@@ -1926,6 +1927,90 @@ fn handle_pty_detach_request(
     }
 }
 
+/// Handle a Ctrl-Z suspension request intercepted by the PtyProxy.
+///
+/// When the user presses Ctrl-Z, the PTY slave would normally generate
+/// SIGTSTP, but the child's process group is orphaned (setsid() creates a
+/// new session). The kernel refuses to deliver job control signals to
+/// orphaned PGs. We intercept the Ctrl-Z byte (0x1A) at the PtyProxy level
+/// and handle suspension manually:
+///
+/// 1. Send SIGSTOP to child (uncatchable; bash ignores SIGTSTP)
+/// 2. Wait for child to stop
+/// 3. Restore terminal to cooked mode
+/// 4. Stop nono itself via raise(SIGTSTP)
+/// 5. On resume: restore raw mode, forward SIGCONT to child
+fn handle_pty_suspension(pty: Option<&mut crate::pty_proxy::PtyProxy>, child: Pid) {
+    let pty = match pty {
+        Some(p) => p,
+        None => return,
+    };
+
+    if !pty.take_suspension_request() {
+        return;
+    }
+
+    // SIGSTOP is uncatchable — bash installs a handler for SIGTSTP that
+    // sets internal flags but does not stop the process. SIGSTOP guarantees
+    // the child enters the T (stopped) state immediately.
+    if let Err(e) = signal::kill(child, Signal::SIGSTOP) {
+        debug!("Failed to send SIGSTOP to child: {}", e);
+        return;
+    }
+
+    loop {
+        match waitpid(child, Some(WaitPidFlag::WUNTRACED)) {
+            Ok(WaitStatus::Stopped(_, sig)) => {
+                debug!("Child stopped by signal {:?} for suspension", sig);
+                break;
+            }
+            Ok(WaitStatus::Exited(..) | WaitStatus::Signaled(..)) => {
+                return;
+            }
+            Err(_) => return,
+            _ => {}
+        }
+    }
+
+    // Save raw settings for restore-on-resume, and preserve the
+    // cooked settings for later detach (restore_terminal consumes them).
+    let raw_termios = nix::sys::termios::tcgetattr(std::io::stdin()).ok();
+    let cooked_termios = pty.saved_termios.clone();
+    pty.restore_terminal();
+
+    // Stop nono itself. The shell shows "[1]+  Stopped   nono run ..."
+    // When user types 'fg', the shell sends SIGCONT and we resume here.
+    unsafe {
+        let _ = signal::signal(Signal::SIGTSTP, signal::SigHandler::SigDfl);
+    }
+    let _ = signal::raise(Signal::SIGTSTP);
+
+    // --- Resumed by SIGCONT from fg ---
+
+    // Restore raw mode for PTY I/O.
+    if let Some(termios) = raw_termios {
+        let _ = nix::sys::termios::tcsetattr(
+            std::io::stdin(),
+            nix::sys::termios::SetArg::TCSANOW,
+            &termios,
+        );
+    }
+    // Restore cooked settings so detach works correctly later.
+    pty.saved_termios = cooked_termios;
+
+    let _ = signal::kill(child, Signal::SIGCONT);
+
+    // SIGSTOP doesn't give the child a chance to clean up its terminal state.
+    // When resumed, TUI apps (opencode, vim, htop) don't know they need to
+    // redraw because they missed the TSTP/CONT cycle they normally rely on.
+    // Sending SIGWINCH triggers a full redraw in practically all TUI apps.
+    //
+    // The PTY proxy's SIGWINCH handler (setup_signal_forwarding) also forwards
+    // window-size ioctls to the PTY master, keeping the child's view of the
+    // terminal dimensions in sync after the suspend/resume cycle.
+    let _ = signal::kill(child, Signal::SIGWINCH);
+}
+
 struct SignalForwardingGuard;
 
 impl Drop for SignalForwardingGuard {
@@ -2125,6 +2210,7 @@ fn run_supervisor_loop(
             pause_requested,
             in_band_detach_requested,
         );
+        handle_pty_suspension(pty.as_deref_mut(), child);
 
         match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
             Ok(WaitStatus::StillAlive) => {
@@ -2396,6 +2482,7 @@ fn run_supervisor_loop(
             pause_requested,
             in_band_detach_requested,
         );
+        handle_pty_suspension(pty.as_deref_mut(), child);
 
         match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
             Ok(WaitStatus::StillAlive) => {

@@ -223,7 +223,7 @@ pub struct PtyProxy {
     /// Resize updates from a reattached terminal client.
     resize_notifier: Option<UnixDatagram>,
     /// Saved terminal settings (restored on detach)
-    saved_termios: Option<nix::sys::termios::Termios>,
+    pub(crate) saved_termios: Option<nix::sys::termios::Termios>,
     /// Recent PTY output replayed to newly attached clients.
     scrollback: VecDeque<u8>,
     /// Last visible screen state for attach restoration.
@@ -236,6 +236,8 @@ pub struct PtyProxy {
     pending_detach_escape: Vec<u8>,
     /// In-band detach requested from the attached client.
     detach_requested: bool,
+    /// Ctrl-Z suspension requested from a terminal client.
+    suspension_requested: bool,
 }
 
 /// Open a PTY pair, inheriting the current terminal's window size.
@@ -363,6 +365,7 @@ impl PtyProxy {
             pending_detach_match_len: 0,
             pending_detach_escape: Vec::new(),
             detach_requested: false,
+            suspension_requested: false,
         })
     }
 
@@ -783,6 +786,10 @@ impl PtyProxy {
         std::mem::take(&mut self.detach_requested)
     }
 
+    pub fn take_suspension_request(&mut self) -> bool {
+        std::mem::take(&mut self.suspension_requested)
+    }
+
     /// Temporarily restore the local terminal so the parent can prompt.
     ///
     /// Returns true when a terminal-backed client was paused and must later
@@ -802,7 +809,7 @@ impl PtyProxy {
     }
 
     /// Restore terminal settings.
-    fn restore_terminal(&mut self) {
+    pub(crate) fn restore_terminal(&mut self) {
         if let Some(ref termios) = self.saved_termios {
             let _ = nix::sys::termios::tcsetattr(
                 std::io::stdin(),
@@ -1024,7 +1031,15 @@ impl PtyProxy {
     }
     fn filter_client_input(&mut self, bytes: &[u8]) -> Vec<u8> {
         let mut forwarded = Vec::with_capacity(bytes.len());
+        let is_terminal = self
+            .client
+            .as_ref()
+            .is_some_and(AttachedClient::is_terminal);
         for (i, &byte) in bytes.iter().enumerate() {
+            if is_terminal && byte == 0x1A {
+                self.suspension_requested = true;
+                continue;
+            }
             if self.maybe_consume_enhanced_detach_byte(byte, &mut forwarded) {
                 continue;
             }
@@ -2423,6 +2438,7 @@ mod tests {
             pending_detach_match_len: 0,
             pending_detach_escape: Vec::new(),
             detach_requested: false,
+            suspension_requested: false,
         }
     }
 

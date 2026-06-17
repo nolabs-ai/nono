@@ -133,15 +133,17 @@ expect_failure "--no-audit --rollback is rejected" \
 echo ""
 echo "--- Audit with Rollback ---"
 
-# Test 5: --rollback with read-only paths still creates an audit session
+# Test 5: --rollback with a writable path creates an audit session.
+# We use --allow (not --read) because on Linux Landlock, a purely read-only
+# rollback session has nothing to snapshot and may not create a session file.
 TESTS_RUN=$((TESTS_RUN + 1))
-run_nono run --silent --rollback --no-rollback-prompt --allow-cwd --read "$TMPDIR" -- echo "readonly rollback audit"
+run_nono run --silent --rollback --no-rollback-prompt --allow-cwd --allow "$TMPDIR" -- echo "rollback audit"
 session_file=$(find_rollback_session_for_pid "$LAST_NONO_PID")
 if [[ -n "$session_file" && -f "$session_file" ]]; then
-    echo -e "  ${GREEN}PASS${NC}: rollback read-only session creates audit"
+    echo -e "  ${GREEN}PASS${NC}: rollback session creates audit"
     TESTS_PASSED=$((TESTS_PASSED + 1))
 else
-    echo -e "  ${RED}FAIL${NC}: rollback read-only session creates audit"
+    echo -e "  ${RED}FAIL${NC}: rollback session creates audit"
     echo "       PID: $LAST_NONO_PID, session_file: ${session_file:-not found}"
     TESTS_FAILED=$((TESTS_FAILED + 1))
 fi

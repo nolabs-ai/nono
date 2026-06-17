@@ -186,7 +186,7 @@ EOF
     "meta": { "name": "nono-test-docker-child", "version": "1.0.0" },
     "extends": "nono-test-docker-base",
     "filesystem": {
-        "read": ["\$HOME/.config"]
+        "read": ["\$HOME/.cache"]
     }
 }
 EOF

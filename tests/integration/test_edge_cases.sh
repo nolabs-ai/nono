@@ -137,7 +137,7 @@ if is_macos; then
     expect_output_not_contains "grant non-existent file does not warn on macOS" "Skipping non-existent file" \
         "$NONO_BIN" run --read-file /nonexistent/file.txt -- echo "should run"
 else
-    expect_output_contains "grant non-existent file is skipped with warning" "Skipping non-existent file" \
+    expect_output_contains "grant non-existent file is skipped with warning" "some requested sandbox grants were skipped because the path does not exist" \
         "$NONO_BIN" run --read-file /nonexistent/file.txt -- echo "should run"
 fi
 

@@ -198,10 +198,14 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings -D clippy::unwrap_used
 
   integration:
-    name: Integration Tests
+    name: Integration (${{ matrix.os }})
     needs: changes
     if: ${{ !startsWith(github.head_ref, 'dependabot/github_actions/') && needs.changes.outputs.run_code_jobs == 'true' }}
-    runs-on: macos-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest-m, macos-latest]
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
@@ -220,9 +224,6 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-
-
-      - name: Build release binary
-        run: cargo build --release
 
       - name: Run integration tests
         run: |

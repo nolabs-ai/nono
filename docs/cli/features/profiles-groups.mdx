@@ -174,7 +174,7 @@ The `workdir` section controls whether and how the current working directory is 
 | `"write"` | Write-only access to CWD |
 | `"readwrite"` | Full read+write access to CWD |
 
-When a profile specifies a workdir access level, nono will prompt the user to confirm CWD sharing (unless `--allow-cwd` is used to skip the prompt).
+When a profile specifies a workdir access level, nono will prompt the user to confirm CWD sharing (unless `--allow-cwd` is used to skip the prompt). `--allow-cwd` grants access to the directory at that profile's workdir level — so with `"none"` (the `default` profile) it grants nothing. Pair `--allow-cwd` with a profile that sets a workdir level, or grant the directory explicitly with `--allow`/`--read`.
 
 ### Filesystem Overrides and Group Composition
 

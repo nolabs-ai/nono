@@ -222,9 +222,9 @@ Profiles make your workflow easier to repeat, share, and audit.
 
 ### Use `--allow-cwd` Deliberately
 
-`--allow-cwd` is convenient, but it means “grant the current repository read+write access”.
+`--allow-cwd` shares the current directory at the access level the active profile's [`workdir`](/cli/features/profiles-groups#working-directory) config declares: read+write for the coding profiles used here (`always-further/claude`, `always-further/codex`), read-only when no profile is specified, and nothing at all under the conservative `default` profile (`workdir: "none"`).
 
-That is often the right choice for coding agents, but treat it as an explicit workspace grant, not as boilerplate.
+That read+write grant is often the right choice for coding agents, but treat it as an explicit workspace grant, not as boilerplate.
 
 ### Keep Login/Bootstrap Permissions Temporary
 

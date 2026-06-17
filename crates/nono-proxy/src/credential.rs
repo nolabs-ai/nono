@@ -174,25 +174,14 @@ impl CredentialStore {
                         continue;
                     }
                     Err(nono::NonoError::KeystoreAccess(msg)) => {
-                        let redacted = redact_credential_ref(key);
-                        let message = format!(
-                            "Credential not available for route '{normalized_prefix}': {msg}. \
-                             Managed-credential requests on this route will be denied until the \
-                             credential is available. Set NONO_KEYRING_TIMEOUT_SECS=N \
-                             (default 120) to wait longer for keychain unlock; 0 disables the timeout."
-                        );
-                        warn!(
-                            "Credential '{redacted}' not available for route '{normalized_prefix}': {msg}. \
-                             Managed-credential requests on this route will be denied until the credential is available. \
-                             Set NONO_KEYRING_TIMEOUT_SECS=N (default 120) to wait longer for keychain unlock; 0 disables the timeout."
-                        );
-                        diagnostics.push(
-                            ProxyDiagnostic::warning(
-                                ProxyDiagnosticCode::CredentialUnavailable,
-                                &normalized_prefix,
-                                message,
-                            )
-                            .with_credential_ref(redacted),
+                        push_secret_unavailable_diagnostic(
+                            &mut diagnostics,
+                            ProxyDiagnosticCode::CredentialUnavailable,
+                            &normalized_prefix,
+                            key,
+                            &msg,
+                            "Credential",
+                            true,
                         );
                         continue;
                     }
@@ -258,110 +247,26 @@ impl CredentialStore {
                     route.prefix
                 );
 
-                let client_id = match nono::keystore::load_secret_by_ref(
-                    KEYRING_SERVICE,
+                let Some(client_id) = load_oauth_keystore_ref(
+                    &mut diagnostics,
+                    &route.prefix,
                     &oauth2.client_id,
-                ) {
-                    Ok(s) => s,
-                    Err(nono::NonoError::SecretNotFound(msg)) => {
-                        let redacted = redact_credential_ref(&oauth2.client_id);
-                        let message = format!(
-                            "OAuth2 client_id not available for route '{}': {msg}. \
-                             Managed-credential requests on this route will be denied.",
-                            route.prefix
-                        );
-                        warn!(
-                            "OAuth2 client_id '{redacted}' not available for route '{}': {msg}. \
-                             Managed-credential requests on this route will be denied.",
-                            route.prefix
-                        );
-                        diagnostics.push(
-                            ProxyDiagnostic::warning(
-                                ProxyDiagnosticCode::OAuthClientIdUnavailable,
-                                &route.prefix,
-                                message,
-                            )
-                            .with_credential_ref(redacted),
-                        );
-                        continue;
-                    }
-                    Err(nono::NonoError::KeystoreAccess(msg)) => {
-                        let redacted = redact_credential_ref(&oauth2.client_id);
-                        let message = format!(
-                            "OAuth2 client_id not available for route '{}': {msg}. \
-                             Managed-credential requests on this route will be denied.",
-                            route.prefix
-                        );
-                        warn!(
-                            "OAuth2 client_id '{redacted}' not available for route '{}': {msg}. \
-                             Managed-credential requests on this route will be denied. \
-                             Set NONO_KEYRING_TIMEOUT_SECS=N (default 120) to wait longer for keychain unlock; 0 disables the timeout.",
-                            route.prefix
-                        );
-                        diagnostics.push(
-                            ProxyDiagnostic::warning(
-                                ProxyDiagnosticCode::OAuthClientIdUnavailable,
-                                &route.prefix,
-                                message,
-                            )
-                            .with_credential_ref(redacted),
-                        );
-                        continue;
-                    }
-                    Err(e) => return Err(ProxyError::Credential(e.to_string())),
+                    "OAuth2 client_id",
+                    ProxyDiagnosticCode::OAuthClientIdUnavailable,
+                )?
+                else {
+                    continue;
                 };
 
-                let client_secret = match nono::keystore::load_secret_by_ref(
-                    KEYRING_SERVICE,
+                let Some(client_secret) = load_oauth_keystore_ref(
+                    &mut diagnostics,
+                    &route.prefix,
                     &oauth2.client_secret,
-                ) {
-                    Ok(s) => s,
-                    Err(nono::NonoError::SecretNotFound(msg)) => {
-                        let redacted = redact_credential_ref(&oauth2.client_secret);
-                        let message = format!(
-                            "OAuth2 client_secret not available for route '{}': {msg}. \
-                             Managed-credential requests on this route will be denied.",
-                            route.prefix
-                        );
-                        warn!(
-                            "OAuth2 client_secret '{redacted}' not available for route '{}': {msg}. \
-                             Managed-credential requests on this route will be denied.",
-                            route.prefix
-                        );
-                        diagnostics.push(
-                            ProxyDiagnostic::warning(
-                                ProxyDiagnosticCode::OAuthClientSecretUnavailable,
-                                &route.prefix,
-                                message,
-                            )
-                            .with_credential_ref(redacted),
-                        );
-                        continue;
-                    }
-                    Err(nono::NonoError::KeystoreAccess(msg)) => {
-                        let redacted = redact_credential_ref(&oauth2.client_secret);
-                        let message = format!(
-                            "OAuth2 client_secret not available for route '{}': {msg}. \
-                             Managed-credential requests on this route will be denied.",
-                            route.prefix
-                        );
-                        warn!(
-                            "OAuth2 client_secret '{redacted}' not available for route '{}': {msg}. \
-                             Managed-credential requests on this route will be denied. \
-                             Set NONO_KEYRING_TIMEOUT_SECS=N (default 120) to wait longer for keychain unlock; 0 disables the timeout.",
-                            route.prefix
-                        );
-                        diagnostics.push(
-                            ProxyDiagnostic::warning(
-                                ProxyDiagnosticCode::OAuthClientSecretUnavailable,
-                                &route.prefix,
-                                message,
-                            )
-                            .with_credential_ref(redacted),
-                        );
-                        continue;
-                    }
-                    Err(e) => return Err(ProxyError::Credential(e.to_string())),
+                    "OAuth2 client_secret",
+                    ProxyDiagnosticCode::OAuthClientSecretUnavailable,
+                )?
+                else {
+                    continue;
                 };
 
                 let config = OAuth2ExchangeConfig {
@@ -485,6 +390,8 @@ impl CredentialStore {
 /// Uses the same constant as `nono::keystore::DEFAULT_SERVICE` to ensure consistency.
 const KEYRING_SERVICE: &str = nono::keystore::DEFAULT_SERVICE;
 
+const KEYRING_TIMEOUT_HINT: &str = " Set NONO_KEYRING_TIMEOUT_SECS=N (default 120) to wait longer for keychain unlock; 0 disables the timeout.";
+
 fn redact_credential_ref(key: &str) -> String {
     if nono::keystore::is_op_uri(key) {
         nono::keystore::redact_op_uri(key)
@@ -498,6 +405,82 @@ fn redact_credential_ref(key: &str) -> String {
         nono::keystore::redact_file_uri(key)
     } else {
         key.to_string()
+    }
+}
+
+/// Redact a credential ref and any verbatim repeat of it in a keystore error.
+fn keystore_error_detail(key: &str, msg: &str) -> (String, String) {
+    let redacted = redact_credential_ref(key);
+    let mut detail = msg.replace(key, &redacted);
+    // file:// errors quote the absolute path, not the full URI.
+    if nono::keystore::is_file_uri(key)
+        && let Some(path) = key.strip_prefix("file://")
+        && let Some(redacted_path) = redacted.strip_prefix("file://")
+    {
+        detail = detail.replace(path, redacted_path);
+    }
+    (redacted, detail)
+}
+
+fn push_secret_unavailable_diagnostic(
+    diagnostics: &mut Vec<ProxyDiagnostic>,
+    code: ProxyDiagnosticCode,
+    route_prefix: &str,
+    key: &str,
+    msg: &str,
+    subject: &str,
+    keyring_hint: bool,
+) {
+    let (redacted, detail) = keystore_error_detail(key, msg);
+    let timeout = if keyring_hint {
+        KEYRING_TIMEOUT_HINT
+    } else {
+        ""
+    };
+    let denied = " Managed-credential requests on this route will be denied.";
+    let message =
+        format!("{subject} not available for route '{route_prefix}': {detail}.{denied}{timeout}");
+    warn!(
+        "{subject} '{redacted}' not available for route '{route_prefix}': {detail}.{denied}{timeout}"
+    );
+    diagnostics
+        .push(ProxyDiagnostic::warning(code, route_prefix, message).with_credential_ref(redacted));
+}
+
+fn load_oauth_keystore_ref(
+    diagnostics: &mut Vec<ProxyDiagnostic>,
+    route_prefix: &str,
+    key: &str,
+    subject: &str,
+    code: ProxyDiagnosticCode,
+) -> Result<Option<Zeroizing<String>>> {
+    match nono::keystore::load_secret_by_ref(KEYRING_SERVICE, key) {
+        Ok(s) => Ok(Some(s)),
+        Err(nono::NonoError::SecretNotFound(msg)) => {
+            push_secret_unavailable_diagnostic(
+                diagnostics,
+                code,
+                route_prefix,
+                key,
+                &msg,
+                subject,
+                false,
+            );
+            Ok(None)
+        }
+        Err(nono::NonoError::KeystoreAccess(msg)) => {
+            push_secret_unavailable_diagnostic(
+                diagnostics,
+                code,
+                route_prefix,
+                key,
+                &msg,
+                subject,
+                true,
+            );
+            Ok(None)
+        }
+        Err(e) => Err(ProxyError::Credential(e.to_string())),
     }
 }
 
@@ -791,6 +774,35 @@ mod tests {
             redact_credential_ref("op://vault/item/secret"),
             "op://vault/item/<redacted>"
         );
+    }
+
+    #[test]
+    fn test_keystore_error_detail_redacts_credential_ref_in_message() {
+        let cases = [
+            (
+                "op://Vault/Item/secret",
+                "1Password lookup failed for 'op://Vault/Item/secret': timed out",
+                "op://Vault/Item/<redacted>",
+                "/secret",
+            ),
+            (
+                "file:///run/secrets/api-token",
+                "failed to read credential file '/run/secrets/api-token'",
+                "/run/secrets/[REDACTED]",
+                "api-token",
+            ),
+        ];
+        for (key, msg, want, leak) in cases {
+            let (_redacted, detail) = keystore_error_detail(key, msg);
+            assert!(
+                detail.contains(want),
+                "expected redacted fragment '{want}' in '{detail}'"
+            );
+            assert!(
+                !detail.contains(leak),
+                "raw credential fragment '{leak}' leaked in '{detail}'"
+            );
+        }
     }
 
     #[test]

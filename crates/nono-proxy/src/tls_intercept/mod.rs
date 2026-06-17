@@ -40,4 +40,4 @@ pub use acceptor::build_server_config;
 pub use bundle::{BundleInputs, write_bundle};
 pub use ca::EphemeralCa;
 pub use cert_cache::CertCache;
-pub use handle::{InterceptCtx, handle_intercept_connect};
+pub use handle::{InterceptCtx, InterceptUpstreamProxy, handle_intercept_connect};

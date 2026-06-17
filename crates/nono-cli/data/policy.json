@@ -413,6 +413,24 @@
         ]
       }
     },
+    "go_runtime_linux": {
+      "description": "Go build cache on Linux",
+      "platform": "linux",
+      "allow": {
+        "readwrite": [
+          "~/.cache/go-build"
+        ]
+      }
+    },
+    "go_runtime_macos": {
+      "description": "Go build cache on macOS",
+      "platform": "macos",
+      "allow": {
+        "readwrite": [
+          "~/Library/Caches/go-build"
+        ]
+      }
+    },
     "java_runtime": {
       "description": "Java runtime and build tool paths (SDKMAN, Maven, Gradle)",
       "allow": {
@@ -744,7 +762,7 @@
         "author": "always-further"
       },
       "groups": {
-        "include": ["go_runtime"]
+        "include": ["go_runtime", "go_runtime_linux", "go_runtime_macos"]
       },
       "security": {
         "signal_mode": "isolated"

@@ -6,12 +6,14 @@
 //! and Merkle root.
 
 use crate::supervisor::{AuditEntry, UrlOpenRequest};
+use crate::trust;
 use crate::undo::{
     AuditAttestationSummary, AuditIntegritySummary, ContentHash, NetworkAuditEvent, SessionMetadata,
 };
 use crate::{NonoError, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use sigstore_verify::types::bundle::SignatureContent;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 #[cfg(unix)]
@@ -35,6 +37,11 @@ pub const AUDIT_HASH_ALGORITHM: &str = "sha256";
 pub const SESSION_DIGEST_DOMAIN_ALPHA: &[u8] = b"nono.audit.session-digest.alpha\n";
 /// Domain separator for alpha ledger chain links.
 pub const LEDGER_CHAIN_DOMAIN_ALPHA: &[u8] = b"nono.audit.ledger.chain.alpha\n";
+/// Default filename used for audit attestation bundles in session directories.
+pub const AUDIT_ATTESTATION_BUNDLE_FILENAME: &str = "audit-attestation.bundle";
+/// Predicate type for alpha audit session attestations.
+pub const AUDIT_ATTESTATION_PREDICATE_TYPE_ALPHA: &str =
+    "https://nono.sh/attestation/audit-session/alpha";
 
 /// Event payloads written into the alpha audit log.
 #[derive(Clone, Serialize, Deserialize)]
@@ -186,6 +193,56 @@ pub struct LedgerVerificationResult {
     pub ledger_chain_verified: bool,
     /// Final ledger chain head.
     pub ledger_head: Option<ContentHash>,
+}
+
+/// Result of checking a signed audit attestation bundle against session metadata.
+#[derive(Debug, Clone, Serialize)]
+pub struct AuditAttestationVerificationResult {
+    /// Whether session metadata referenced an audit attestation.
+    pub present: bool,
+    /// Predicate type recorded in metadata or the verified bundle.
+    pub predicate_type: Option<String>,
+    /// Signer key identifier from the attestation metadata.
+    pub key_id: Option<String>,
+    /// Whether metadata, bundle signer identity, and public key digest agree.
+    pub key_id_matches: bool,
+    /// Whether the DSSE signature verified with the attested public key.
+    pub signature_verified: bool,
+    /// Whether the signed Merkle root matches the session integrity summary.
+    pub merkle_root_matches: bool,
+    /// Whether the signed predicate session ID matches the session metadata.
+    pub session_id_matches: bool,
+    /// Whether an externally provided public key matches the attested public key.
+    pub expected_public_key_matches: Option<bool>,
+    /// Human-readable verification failure, if verification did not succeed.
+    pub verification_error: Option<String>,
+}
+
+#[derive(Serialize)]
+struct AuditAttestationPredicate<'a> {
+    version: u32,
+    session_id: &'a str,
+    started: &'a str,
+    ended: &'a Option<String>,
+    command: &'a [String],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    redaction_policy: Option<crate::ScrubPolicyDiff>,
+    audit_log: AuditLogPredicate<'a>,
+    signer: AuditSignerPredicate<'a>,
+}
+
+#[derive(Serialize)]
+struct AuditLogPredicate<'a> {
+    hash_algorithm: &'a str,
+    event_count: u64,
+    chain_head: &'a ContentHash,
+    merkle_root: &'a ContentHash,
+}
+
+#[derive(Serialize)]
+struct AuditSignerPredicate<'a> {
+    kind: &'static str,
+    key_id: &'a str,
 }
 
 /// Position of a sibling hash in an audit Merkle inclusion proof.
@@ -732,6 +789,358 @@ pub fn verify_session_in_ledger_reader<R: BufRead>(
     })
 }
 
+/// Build and sign an alpha audit attestation bundle for a completed session.
+///
+/// The caller owns key loading and bundle storage. This primitive commits to
+/// the audit Merkle root, rolling chain head, event count, session identity,
+/// and scrubbed command context, then signs the in-toto statement as DSSE.
+pub fn sign_audit_attestation_bundle(
+    metadata: &SessionMetadata,
+    key_pair: &trust::KeyPair,
+    key_id: &str,
+    public_key_b64: &str,
+    redaction_policy: &crate::ScrubPolicy,
+) -> Result<(String, AuditAttestationSummary)> {
+    let integrity = metadata
+        .audit_integrity
+        .as_ref()
+        .ok_or_else(|| NonoError::TrustSigning {
+            path: metadata.session_id.clone(),
+            reason: "audit attestation requires audit integrity to be enabled".to_string(),
+        })?;
+
+    let scrubbed_command = crate::scrub_argv_with_policy(&metadata.command, redaction_policy);
+    let predicate = serde_json::to_value(AuditAttestationPredicate {
+        version: 1,
+        session_id: &metadata.session_id,
+        started: &metadata.started,
+        ended: &metadata.ended,
+        command: &scrubbed_command,
+        redaction_policy: redaction_policy.diff_from_secure_default().into_option(),
+        audit_log: AuditLogPredicate {
+            hash_algorithm: &integrity.hash_algorithm,
+            event_count: integrity.event_count,
+            chain_head: &integrity.chain_head,
+            merkle_root: &integrity.merkle_root,
+        },
+        signer: AuditSignerPredicate {
+            kind: "keyed",
+            key_id,
+        },
+    })
+    .map_err(|e| NonoError::TrustSigning {
+        path: metadata.session_id.clone(),
+        reason: format!("failed to serialize audit attestation predicate: {e}"),
+    })?;
+
+    let statement = trust::new_statement(
+        &format!("audit-session:{}", metadata.session_id),
+        &integrity.merkle_root.to_string(),
+        predicate,
+        AUDIT_ATTESTATION_PREDICATE_TYPE_ALPHA,
+    );
+    let bundle_json = trust::sign_statement_bundle(&statement, key_pair)?;
+
+    Ok((
+        bundle_json,
+        AuditAttestationSummary {
+            predicate_type: AUDIT_ATTESTATION_PREDICATE_TYPE_ALPHA.to_string(),
+            key_id: key_id.to_string(),
+            public_key: public_key_b64.to_string(),
+            bundle_filename: AUDIT_ATTESTATION_BUNDLE_FILENAME.to_string(),
+        },
+    ))
+}
+
+/// Verify an alpha audit attestation bundle against session metadata.
+///
+/// The caller is responsible for loading the bundle and any externally pinned
+/// public key. This function validates the keyed DSSE signature, key identity,
+/// signed Merkle root, and signed session ID. Supplying `expected_public_key`
+/// is what gives the result an external trust anchor; without it, verification
+/// proves only that the bundle, metadata summary, and embedded public key are
+/// internally self-consistent.
+pub fn verify_audit_attestation_bundle(
+    bundle: &trust::Bundle,
+    bundle_path: &Path,
+    metadata: &SessionMetadata,
+    expected_public_key: Option<&[u8]>,
+) -> Result<AuditAttestationVerificationResult> {
+    let Some(summary) = metadata.audit_attestation.as_ref() else {
+        return Ok(AuditAttestationVerificationResult {
+            present: false,
+            predicate_type: None,
+            key_id: None,
+            key_id_matches: false,
+            signature_verified: false,
+            merkle_root_matches: false,
+            session_id_matches: false,
+            expected_public_key_matches: expected_public_key.map(|_| false),
+            verification_error: expected_public_key.map(|_| {
+                "session has no audit attestation to verify against provided public key".to_string()
+            }),
+        });
+    };
+
+    let mut expected_public_key_matches = None;
+
+    let Some(integrity) = metadata.audit_integrity.as_ref() else {
+        return Ok(attestation_failure(
+            summary,
+            expected_public_key_matches,
+            "session has audit attestation metadata but no audit integrity summary".to_string(),
+        ));
+    };
+
+    let predicate_type = match trust::extract_predicate_type(bundle, bundle_path) {
+        Ok(predicate_type) => predicate_type,
+        Err(err) => {
+            return Ok(attestation_failure(
+                summary,
+                expected_public_key_matches,
+                err.to_string(),
+            ));
+        }
+    };
+    if predicate_type != AUDIT_ATTESTATION_PREDICATE_TYPE_ALPHA {
+        return Ok(attestation_failure(
+            summary,
+            expected_public_key_matches,
+            format!(
+                "wrong bundle type: expected {}, got {}",
+                AUDIT_ATTESTATION_PREDICATE_TYPE_ALPHA, predicate_type
+            ),
+        ));
+    }
+
+    let signer_identity = match trust::extract_signer_identity(bundle, bundle_path) {
+        Ok(identity) => identity,
+        Err(err) => {
+            return Ok(attestation_failure(
+                summary,
+                expected_public_key_matches,
+                err.to_string(),
+            ));
+        }
+    };
+    let signer_key_id = match signer_identity {
+        trust::SignerIdentity::Keyed { key_id } => key_id,
+        trust::SignerIdentity::Keyless { .. } => {
+            return Ok(attestation_failure(
+                summary,
+                expected_public_key_matches,
+                "audit attestation must be keyed".to_string(),
+            ));
+        }
+    };
+    let public_key_der = match trust::base64::base64_decode(&summary.public_key) {
+        Ok(public_key_der) => public_key_der,
+        Err(err) => {
+            return Ok(attestation_failure(
+                summary,
+                expected_public_key_matches,
+                format!("invalid attested public key encoding: {err}"),
+            ));
+        }
+    };
+    let recomputed_key_id = trust::public_key_id_hex(&public_key_der);
+    if recomputed_key_id != summary.key_id {
+        return Ok(attestation_failure(
+            summary,
+            expected_public_key_matches,
+            format!(
+                "audit attestation metadata key mismatch: expected {}, got {}",
+                summary.key_id, recomputed_key_id
+            ),
+        ));
+    }
+    if signer_key_id != summary.key_id {
+        return Ok(attestation_failure(
+            summary,
+            expected_public_key_matches,
+            format!(
+                "audit attestation signer key mismatch: expected {}, got {}",
+                summary.key_id, signer_key_id
+            ),
+        ));
+    }
+    if let Some(expected_public_key) = expected_public_key
+        && expected_public_key != public_key_der.as_slice()
+    {
+        return Ok(attestation_failure(
+            summary,
+            Some(false),
+            "provided public key does not match the attested signer key".to_string(),
+        ));
+    }
+    if expected_public_key.is_some() {
+        expected_public_key_matches = Some(true);
+    }
+    if let Err(err) = trust::verify_keyed_signature(bundle, &public_key_der, bundle_path) {
+        return Ok(attestation_failure(
+            summary,
+            expected_public_key_matches,
+            err.to_string(),
+        ));
+    }
+
+    let attested_root = match trust::extract_bundle_digest(bundle, bundle_path) {
+        Ok(attested_root) => attested_root,
+        Err(err) => {
+            return Ok(attestation_failure(
+                summary,
+                expected_public_key_matches,
+                err.to_string(),
+            ));
+        }
+    };
+    if attested_root != integrity.merkle_root.to_string() {
+        return Ok(attestation_failure(
+            summary,
+            expected_public_key_matches,
+            "audit attestation Merkle root does not match session integrity summary".to_string(),
+        ));
+    }
+
+    let statement = match extract_audit_attestation_statement(bundle) {
+        Ok(statement) => statement,
+        Err(err) => {
+            return Ok(attestation_failure(
+                summary,
+                expected_public_key_matches,
+                err.to_string(),
+            ));
+        }
+    };
+    let Some(statement_session_id) = statement
+        .predicate
+        .get("session_id")
+        .and_then(|value| value.as_str())
+    else {
+        return Ok(attestation_failure(
+            summary,
+            expected_public_key_matches,
+            "audit attestation predicate missing session_id".to_string(),
+        ));
+    };
+    if statement_session_id != metadata.session_id {
+        return Ok(attestation_failure(
+            summary,
+            expected_public_key_matches,
+            format!(
+                "audit attestation session_id mismatch: expected {}, got {}",
+                metadata.session_id, statement_session_id
+            ),
+        ));
+    }
+
+    let Some(audit_log) = statement
+        .predicate
+        .get("audit_log")
+        .and_then(|value| value.as_object())
+    else {
+        return Ok(attestation_failure(
+            summary,
+            expected_public_key_matches,
+            "audit attestation predicate missing audit_log".to_string(),
+        ));
+    };
+    if audit_log
+        .get("hash_algorithm")
+        .and_then(|value| value.as_str())
+        != Some(integrity.hash_algorithm.as_str())
+    {
+        return Ok(attestation_failure(
+            summary,
+            expected_public_key_matches,
+            "audit attestation hash_algorithm does not match session integrity summary".to_string(),
+        ));
+    }
+    if audit_log
+        .get("event_count")
+        .and_then(|value| value.as_u64())
+        != Some(integrity.event_count)
+    {
+        return Ok(attestation_failure(
+            summary,
+            expected_public_key_matches,
+            "audit attestation event_count does not match session integrity summary".to_string(),
+        ));
+    }
+    let chain_head = integrity.chain_head.to_string();
+    if audit_log.get("chain_head").and_then(|value| value.as_str()) != Some(chain_head.as_str()) {
+        return Ok(attestation_failure(
+            summary,
+            expected_public_key_matches,
+            "audit attestation chain_head does not match session integrity summary".to_string(),
+        ));
+    }
+    if statement
+        .predicate
+        .get("started")
+        .and_then(|value| value.as_str())
+        != Some(metadata.started.as_str())
+        || statement
+            .predicate
+            .get("ended")
+            .and_then(|value| value.as_str())
+            != metadata.ended.as_deref()
+    {
+        return Ok(attestation_failure(
+            summary,
+            expected_public_key_matches,
+            "audit attestation timestamps do not match session metadata".to_string(),
+        ));
+    }
+
+    Ok(AuditAttestationVerificationResult {
+        present: true,
+        predicate_type: Some(predicate_type),
+        key_id: Some(summary.key_id.clone()),
+        key_id_matches: true,
+        signature_verified: true,
+        merkle_root_matches: true,
+        session_id_matches: true,
+        expected_public_key_matches,
+        verification_error: None,
+    })
+}
+
+fn attestation_failure(
+    summary: &AuditAttestationSummary,
+    expected_public_key_matches: Option<bool>,
+    verification_error: String,
+) -> AuditAttestationVerificationResult {
+    AuditAttestationVerificationResult {
+        present: true,
+        predicate_type: Some(summary.predicate_type.clone()),
+        key_id: Some(summary.key_id.clone()),
+        key_id_matches: false,
+        signature_verified: false,
+        merkle_root_matches: false,
+        session_id_matches: false,
+        expected_public_key_matches,
+        verification_error: Some(verification_error),
+    }
+}
+
+fn extract_audit_attestation_statement(bundle: &trust::Bundle) -> Result<trust::InTotoStatement> {
+    let envelope = match &bundle.content {
+        SignatureContent::DsseEnvelope(envelope) => envelope,
+        _ => {
+            return Err(NonoError::TrustVerification {
+                path: String::new(),
+                reason: "audit attestation bundle missing dsseEnvelope".to_string(),
+            });
+        }
+    };
+
+    serde_json::from_slice(envelope.payload.as_bytes()).map_err(|e| NonoError::TrustVerification {
+        path: String::new(),
+        reason: format!("invalid audit attestation statement JSON: {e}"),
+    })
+}
+
 fn hash_ledger_link(
     previous: Option<&ContentHash>,
     sequence: u64,
@@ -1227,6 +1636,92 @@ mod tests {
             merkle_root: ContentHash::from_bytes([3; 32]),
         });
         assert_ne!(base_digest, compute_session_digest(&changed).unwrap());
+    }
+
+    #[test]
+    fn audit_attestation_bundle_round_trips_in_core() {
+        let key_pair = crate::trust::generate_signing_key().unwrap();
+        let key_id = crate::trust::key_id_hex(&key_pair).unwrap();
+        let public_key = crate::trust::export_public_key(&key_pair).unwrap();
+        let public_key_b64 = crate::trust::base64::base64_encode(public_key.as_bytes());
+
+        let mut meta = sample_metadata("20260421-200000-11111");
+        meta.audit_integrity = Some(AuditIntegritySummary {
+            hash_algorithm: AUDIT_HASH_ALGORITHM.to_string(),
+            event_count: 2,
+            chain_head: ContentHash::from_bytes([0x11; 32]),
+            merkle_root: ContentHash::from_bytes([0x22; 32]),
+        });
+
+        let (bundle_json, summary) = sign_audit_attestation_bundle(
+            &meta,
+            &key_pair,
+            &key_id,
+            &public_key_b64,
+            &crate::ScrubPolicy::secure_default(),
+        )
+        .unwrap();
+        meta.audit_attestation = Some(summary);
+
+        let bundle_path = Path::new("audit-attestation.bundle");
+        let bundle = crate::trust::load_bundle_from_str(&bundle_json, bundle_path).unwrap();
+        let verified = verify_audit_attestation_bundle(
+            &bundle,
+            bundle_path,
+            &meta,
+            Some(public_key.as_bytes()),
+        )
+        .unwrap();
+
+        assert!(verified.present);
+        assert!(verified.key_id_matches);
+        assert!(verified.signature_verified);
+        assert!(verified.merkle_root_matches);
+        assert!(verified.session_id_matches);
+        assert_eq!(verified.expected_public_key_matches, Some(true));
+        assert!(verified.verification_error.is_none());
+
+        let mut tampered_bundle_value: serde_json::Value =
+            serde_json::from_str(&bundle_json).unwrap();
+        tampered_bundle_value["dsseEnvelope"]["payload"] =
+            serde_json::Value::String(crate::trust::base64::base64_encode(b"tampered"));
+        let tampered_bundle = crate::trust::load_bundle_from_str(
+            &serde_json::to_string(&tampered_bundle_value).unwrap(),
+            bundle_path,
+        )
+        .unwrap();
+        let verified = verify_audit_attestation_bundle(
+            &tampered_bundle,
+            bundle_path,
+            &meta,
+            Some(public_key.as_bytes()),
+        )
+        .unwrap();
+        assert!(!verified.signature_verified);
+        assert_eq!(verified.expected_public_key_matches, None);
+
+        let mut changed = meta.clone();
+        changed.audit_integrity = Some(AuditIntegritySummary {
+            hash_algorithm: AUDIT_HASH_ALGORITHM.to_string(),
+            event_count: 3,
+            chain_head: ContentHash::from_bytes([0x11; 32]),
+            merkle_root: ContentHash::from_bytes([0x22; 32]),
+        });
+        let verified = verify_audit_attestation_bundle(
+            &bundle,
+            bundle_path,
+            &changed,
+            Some(public_key.as_bytes()),
+        )
+        .unwrap();
+        assert!(!verified.signature_verified);
+        assert_eq!(verified.expected_public_key_matches, Some(true));
+        assert!(
+            verified
+                .verification_error
+                .as_deref()
+                .is_some_and(|err| err.contains("event_count"))
+        );
     }
 
     /// Golden vectors shared with the Python port in

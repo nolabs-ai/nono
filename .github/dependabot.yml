@@ -1,12 +1,18 @@
 version: 2
 
+# Delay version-update PRs so freshly published packages are not pulled into
+# releases immediately. Security updates bypass cooldown automatically.
 updates:
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "weekly"
+    cooldown:
+      default-days: 3
 
   - package-ecosystem: "cargo"
     directory: "/"
     schedule:
       interval: "weekly"
+    cooldown:
+      default-days: 3

@@ -32,6 +32,41 @@ use zeroize::Zeroizing;
 /// memory ceiling consistent.
 const MAX_HEADER_SIZE: usize = 64 * 1024;
 
+/// Resolved upstream proxy for the intercept path.
+///
+/// When `Some`, the upstream leg of the intercepted request must chain
+/// through the corporate proxy via CONNECT instead of connecting directly.
+/// The caller ([`crate::server::handle_connection`]) is responsible for
+/// deciding whether the target host should use the upstream proxy or route
+/// direct (based on the bypass list).
+pub struct InterceptUpstreamProxy<'a> {
+    /// `host:port` of the corporate proxy (e.g. `"proxy.corporate.com:80"`).
+    pub proxy_addr: &'a str,
+    /// Literal value for `Proxy-Authorization` sent to the corporate proxy,
+    /// or `None` for unauthenticated proxies.
+    pub proxy_auth_header: Option<&'a str>,
+}
+
+/// Select the upstream strategy based on whether an upstream proxy is
+/// configured for this intercepted request.
+///
+/// When `upstream_proxy` is `Some`, returns #[`UpstreamStrategy::ExternalProxy`]
+/// to chain through the corporate proxy. Otherwise returns
+/// [`UpstreamStrategy::Direct`] with the caller-provided resolved addresses.
+pub fn select_upstream_strategy<'a>(
+    upstream_proxy: &'a Option<InterceptUpstreamProxy<'a>>,
+    resolved_addrs: &'a [std::net::SocketAddr],
+) -> UpstreamStrategy<'a> {
+    if let Some(proxy) = upstream_proxy {
+        UpstreamStrategy::ExternalProxy {
+            proxy_addr: proxy.proxy_addr,
+            proxy_auth_header: proxy.proxy_auth_header,
+        }
+    } else {
+        UpstreamStrategy::Direct { resolved_addrs }
+    }
+}
+
 /// Per-connection context passed to [`handle_intercept_connect`].
 pub struct InterceptCtx<'a> {
     pub route_id: Option<&'a str>,
@@ -44,6 +79,9 @@ pub struct InterceptCtx<'a> {
     pub tls_connector: &'a tokio_rustls::TlsConnector,
     pub filter: &'a ProxyFilter,
     pub audit_log: Option<&'a audit::SharedAuditLog>,
+    /// When `Some`, the upstream leg chains through an enterprise proxy
+    /// instead of connecting directly to the target.
+    pub upstream_proxy: Option<InterceptUpstreamProxy<'a>>,
 }
 
 /// Handle a CONNECT request that matched a route requiring L7 visibility.
@@ -395,13 +433,12 @@ where
     let connector = route
         .and_then(|r| r.tls_connector.as_ref())
         .unwrap_or(ctx.tls_connector);
+    let strategy = select_upstream_strategy(&ctx.upstream_proxy, &check.resolved_addrs);
     let upstream_spec = UpstreamSpec {
         scheme: UpstreamScheme::Https,
         host: ctx.host,
         port: ctx.port,
-        strategy: UpstreamStrategy::Direct {
-            resolved_addrs: &check.resolved_addrs,
-        },
+        strategy,
         tls_connector: connector,
     };
     let audit_ctx = AuditCtx {
@@ -506,5 +543,68 @@ mod tests {
     fn parse_request_line_rejects_malformed() {
         assert!(parse_request_line("malformed").is_err());
         assert!(parse_request_line("").is_err());
+    }
+
+    #[test]
+    fn upstream_strategy_selects_external_proxy_when_configured() {
+        // When InterceptUpstreamProxy is set, the strategy must be
+        // ExternalProxy, not Direct. Regression test for #1048.
+        let proxy = InterceptUpstreamProxy {
+            proxy_addr: "proxy.corp:80",
+            proxy_auth_header: None,
+        };
+        let some_proxy = Some(proxy);
+        let strategy = select_upstream_strategy(&some_proxy, &[]);
+        match strategy {
+            UpstreamStrategy::ExternalProxy {
+                proxy_addr,
+                proxy_auth_header,
+            } => {
+                assert_eq!(proxy_addr, "proxy.corp:80");
+                assert!(proxy_auth_header.is_none());
+            }
+            UpstreamStrategy::Direct { .. } => {
+                panic!("expected ExternalProxy strategy, got Direct");
+            }
+        }
+    }
+
+    #[test]
+    fn upstream_strategy_selects_direct_when_no_proxy() {
+        // When upstream_proxy is None, the strategy must fall back to
+        // Direct (pre-existing behaviour).
+        let addrs: Vec<std::net::SocketAddr> = vec![];
+        let strategy = select_upstream_strategy(&None, &addrs);
+        match strategy {
+            UpstreamStrategy::Direct { resolved_addrs } => {
+                assert!(resolved_addrs.is_empty());
+            }
+            UpstreamStrategy::ExternalProxy { .. } => {
+                panic!("expected Direct strategy, got ExternalProxy");
+            }
+        }
+    }
+
+    #[test]
+    fn upstream_strategy_external_proxy_with_auth_header() {
+        // When auth header is provided, it must be carried through.
+        let proxy = InterceptUpstreamProxy {
+            proxy_addr: "proxy.corp:3128",
+            proxy_auth_header: Some("Basic dXNlcjpwYXNz"),
+        };
+        let some_proxy = Some(proxy);
+        let strategy = select_upstream_strategy(&some_proxy, &[]);
+        match strategy {
+            UpstreamStrategy::ExternalProxy {
+                proxy_addr,
+                proxy_auth_header,
+            } => {
+                assert_eq!(proxy_addr, "proxy.corp:3128");
+                assert_eq!(proxy_auth_header, Some("Basic dXNlcjpwYXNz"));
+            }
+            UpstreamStrategy::Direct { .. } => {
+                panic!("expected ExternalProxy strategy, got Direct");
+            }
+        }
     }
 }

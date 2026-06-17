@@ -2010,7 +2010,7 @@ fn handle_pty_suspension(pty: Option<&mut crate::pty_proxy::PtyProxy>, child: Pi
     // immediate child. A shell (bash) that is running a nested TUI (vim) will
     // have put that TUI in its own foreground PG. Sending to the PG ensures
     // both the shell and any nested TUI receive the redraw signal.
-    if let Ok(pgid) = nix::unistd::tcgetpgrp(&pty.master) {
+    if let Ok(pgid) = nix::unistd::tcgetpgrp(pty.master_fd()) {
         let _ = signal::kill(Pid::from_raw(-pgid.as_raw()), Signal::SIGWINCH);
     } else {
         let _ = signal::kill(child, Signal::SIGWINCH);

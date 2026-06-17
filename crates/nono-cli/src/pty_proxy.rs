@@ -211,7 +211,7 @@ impl ScreenState {
 /// The running PTY proxy state managed by the supervisor.
 pub struct PtyProxy {
     /// PTY master fd
-    pub(crate) master: OwnedFd,
+    master: OwnedFd,
     /// Session identifier for updating registry state on detach.
     session_id: String,
     /// Attach socket for `nono attach`
@@ -622,7 +622,12 @@ impl PtyProxy {
         )
     }
 
-    /// Proxy data from the PTY master to the attached client (child → user).
+    /// Borrow the PTY master fd for ioctl operations (e.g. tcgetpgrp).
+    pub(crate) fn master_fd(&self) -> &OwnedFd {
+        &self.master
+    }
+
+    /// Proxy data from the PTY master to the attached client (child -> user).
     ///
     /// Returns false if the PTY master became unavailable.
     #[must_use = "false indicates the PTY master is no longer usable"]

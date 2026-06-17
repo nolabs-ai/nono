@@ -184,8 +184,10 @@ pub(crate) fn build_basic_proxy_auth_header(auth: &ExternalProxyAuth) -> Result<
             ))
         })?;
     let plaintext = Zeroizing::new(format!("{}:{}", auth.username, password.as_str()));
-    let encoded = base64::engine::general_purpose::STANDARD.encode(plaintext.as_bytes());
-    Ok(Zeroizing::new(format!("Basic {}", encoded)))
+    let mut encoded = base64::engine::general_purpose::STANDARD.encode(plaintext.as_bytes());
+    let header = Zeroizing::new(format!("Basic {}", encoded));
+    zeroize::Zeroize::zeroize(&mut encoded);
+    Ok(header)
 }
 
 /// Handle a CONNECT request by chaining it to an external proxy.
@@ -238,6 +240,23 @@ pub async fn handle_external_proxy(
         match build_basic_proxy_auth_header(auth) {
             Ok(h) => Some(h),
             Err(e) => {
+                audit::log_denied(
+                    audit_log,
+                    audit::ProxyMode::External,
+                    &audit::EventContext {
+                        auth_mechanism: Some(
+                            nono::undo::NetworkAuditAuthMechanism::ProxyAuthorization,
+                        ),
+                        auth_outcome: Some(nono::undo::NetworkAuditAuthOutcome::Failed),
+                        denial_category: Some(
+                            nono::undo::NetworkAuditDenialCategory::AuthenticationFailed,
+                        ),
+                        ..audit::EventContext::default()
+                    },
+                    &host,
+                    port,
+                    &e.to_string(),
+                );
                 send_response(stream, 502, "Bad Gateway").await?;
                 return Err(e);
             }
@@ -382,15 +401,16 @@ mod tests {
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     struct EnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
         key: &'static str,
     }
 
     impl EnvGuard {
         #[allow(clippy::disallowed_methods)]
         fn set(key: &'static str, value: &str) -> Self {
-            let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             unsafe { std::env::set_var(key, value) };
-            Self { key }
+            Self { _lock: lock, key }
         }
     }
 

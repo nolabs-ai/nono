@@ -10,15 +10,16 @@ use nono_proxy::config::{ExternalProxyAuth, ExternalProxyConfig, ProxyConfig};
 static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 struct EnvGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
     key: &'static str,
 }
 
 impl EnvGuard {
     #[allow(clippy::disallowed_methods)]
     fn set(key: &'static str, value: &str) -> Self {
-        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe { std::env::set_var(key, value) };
-        Self { key }
+        Self { _lock: lock, key }
     }
 }
 

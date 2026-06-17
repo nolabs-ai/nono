@@ -131,6 +131,20 @@ pub struct LockedPackage {
     /// removed from the registry between install and uninstall.
     #[serde(default)]
     pub wiring_record: Vec<WiringRecord>,
+    /// True when the pack was installed via `nono sideload` rather than pulled
+    /// from the registry. Sideloaded packs have no attestation, no bundle, and
+    /// no registry provenance. They are skipped by `nono update` / `nono
+    /// outdated` and their files are used as-is at runtime without signature
+    /// verification.
+    ///
+    /// Defense-in-depth: `read_lockfile` hard-errors on any entry with
+    /// `sideload: true` when the binary was compiled without the `sideload`
+    /// feature, so production binaries never silently accept unverified packs.
+    ///
+    /// Omitted from JSON output when `false` to avoid bloating the lockfile for
+    /// the common (registry-installed) case.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sideload: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -160,6 +174,7 @@ impl Default for LockedPackage {
             provenance: None,
             artifacts: BTreeMap::new(),
             wiring_record: Vec::new(),
+            sideload: false,
         }
     }
 }
@@ -347,8 +362,29 @@ pub fn read_lockfile() -> Result<Lockfile> {
         source: e,
     })?;
 
-    serde_json::from_str(&content)
-        .map_err(|e| NonoError::ConfigParse(format!("failed to parse {}: {e}", path.display())))
+    let lockfile: Lockfile = serde_json::from_str(&content)
+        .map_err(|e| NonoError::ConfigParse(format!("failed to parse {}: {e}", path.display())))?;
+
+    // Defense-in-depth: reject sideloaded packs on production binaries.
+    // A production binary compiled without `--features sideload` must never
+    // silently accept packs that bypassed attestation and signature checks.
+    #[cfg(not(feature = "sideload"))]
+    {
+        let sideloaded: Vec<&str> = lockfile
+            .packages
+            .iter()
+            .filter(|(_, pkg)| pkg.sideload)
+            .map(|(key, _)| key.as_str())
+            .collect();
+        if !sideloaded.is_empty() {
+            let names = sideloaded.join(", ");
+            return Err(NonoError::PackageInstall(format!(
+                "lockfile contains sideloaded pack(s) [{names}]; remove with `nono remove <pack>`."
+            )));
+        }
+    }
+
+    Ok(lockfile)
 }
 
 pub fn write_lockfile(lockfile: &Lockfile) -> Result<()> {

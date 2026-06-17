@@ -27,9 +27,18 @@ pub fn run_pull(args: PullArgs, reason: PullReason) -> Result<()> {
     validate_pull_response(&package_ref, &pull)?;
 
     let lockfile = package::read_lockfile()?;
-    if let Some(existing) = lockfile.packages.get(&package_ref.key())
+
+    let existing = lockfile.packages.get(&package_ref.key());
+
+    #[cfg(feature = "sideload")]
+    let is_sideloaded = existing.is_some_and(|p| p.sideload);
+    #[cfg(not(feature = "sideload"))]
+    let is_sideloaded = false;
+
+    if let Some(existing) = existing
         && existing.version == pull.version
         && !args.force
+        && !is_sideloaded
     {
         eprintln!(
             "  {} is already at {} (use --force to reinstall)",
@@ -201,6 +210,244 @@ pub fn run_remove(args: RemoveArgs) -> Result<()> {
 
     eprintln!("Removed {}", package_ref.key());
     Ok(())
+}
+
+/// Install a nono pack from a local directory, bypassing registry attestation.
+///
+/// This command is only available when the binary is compiled with
+/// `--features sideload`. It is intended for development and testing workflows
+/// where the pack has not yet been published to the registry. All attestation,
+/// signature, and digest verification is skipped — the on-disk files are used
+/// as-is.
+///
+/// Security: the resulting lockfile entry has `sideload: true` and `pinned:
+/// true`. A production binary (compiled without `sideload`) will hard-error if
+/// it encounters such an entry in the lockfile.
+#[cfg(feature = "sideload")]
+pub fn run_sideload(args: crate::cli::SideloadArgs) -> Result<()> {
+    let src_path = args
+        .path
+        .canonicalize()
+        .map_err(|e| NonoError::PackageInstall(format!("cannot resolve path: {e}")))?;
+
+    // Read package.json from the source directory to derive namespace/name/version.
+    let manifest_path = src_path.join("package.json");
+    if !manifest_path.exists() {
+        return Err(NonoError::PackageInstall(format!(
+            "no package.json found in {}",
+            src_path.display()
+        )));
+    }
+    let manifest_bytes = fs::read(&manifest_path).map_err(NonoError::Io)?;
+    let manifest: PackageManifest = serde_json::from_slice(&manifest_bytes)
+        .map_err(|e| NonoError::PackageInstall(format!("failed to parse package.json: {e}")))?;
+
+    // Derive namespace/name from manifest name field (expected "namespace/name").
+    let package_ref = derive_package_ref_from_manifest(&manifest)?;
+    let version = manifest
+        .version
+        .clone()
+        .unwrap_or_else(|| "0.0.0".to_string());
+
+    eprintln!(
+        "sideload: installing {}@{} from {}",
+        package_ref.key(),
+        version,
+        src_path.display()
+    );
+
+    // If the pack is already installed (registry or prior sideload), remove it
+    // first so wiring is cleanly reversed.
+    let lockfile = package::read_lockfile()?;
+    let install_dir = package::package_install_dir(&package_ref.namespace, &package_ref.name)?;
+    if lockfile.packages.contains_key(&package_ref.key()) || install_dir.exists() {
+        eprintln!(
+            "  sideload: {} already installed — removing existing install first",
+            package_ref.key()
+        );
+        run_remove(crate::cli::RemoveArgs {
+            package_ref: package_ref.key(),
+            force: false,
+            help: None,
+        })?;
+    }
+
+    // Re-read lockfile after remove.
+    let lockfile = package::read_lockfile()?;
+
+    validate_manifest(&manifest)?;
+
+    // Build a downloads-like structure from the local source directory so we
+    // can reuse `install_package`. We treat each artifact file as already
+    // "downloaded" (path is the source file, digest is computed locally).
+    let local_downloads = build_local_downloads(&src_path, &manifest)?;
+
+    let pack_owned_files = pack_owned_write_file_paths(&lockfile, &package_ref);
+    let install =
+        install_package_sideload(&package_ref, &manifest, &local_downloads, &pack_owned_files)?;
+
+    // Write the lockfile entry with sideload: true, pinned: true, no provenance.
+    write_sideload_lockfile_entry(
+        &package_ref,
+        &version,
+        &manifest,
+        &local_downloads,
+        &install.wiring_record,
+    )?;
+
+    let install_dir = package::package_install_dir(&package_ref.namespace, &package_ref.name)?;
+    eprintln!(
+        "  sideloaded {}@{} → {} ({} artifact(s))",
+        package_ref.key(),
+        version,
+        install_dir.display(),
+        install.installed_artifacts
+    );
+    eprintln!("  WARNING: this pack has no attestation — do not use on production systems");
+    Ok(())
+}
+
+/// Derive a `PackageRef` from a `PackageManifest`. The manifest's `name` field
+/// must be in `namespace/name` form (e.g. `"acme/my-pack"`).
+#[cfg(feature = "sideload")]
+fn derive_package_ref_from_manifest(manifest: &PackageManifest) -> Result<PackageRef> {
+    package::parse_package_ref(&manifest.name)
+}
+
+/// Represents a locally-sourced artifact (no download URL, digest computed
+/// from disk).
+#[cfg(feature = "sideload")]
+struct LocalArtifact {
+    filename: String,
+    path: PathBuf,
+    sha256_digest: String,
+}
+
+#[cfg(feature = "sideload")]
+struct LocalDownloads {
+    artifacts: Vec<LocalArtifact>,
+}
+
+/// Build local-artifact metadata from the source directory for a sideload.
+#[cfg(feature = "sideload")]
+fn build_local_downloads(src_path: &Path, manifest: &PackageManifest) -> Result<LocalDownloads> {
+    let mut artifacts = Vec::new();
+
+    // Include package.json itself.
+    let manifest_path = src_path.join("package.json");
+    let digest = local_file_digest(&manifest_path)?;
+    artifacts.push(LocalArtifact {
+        filename: "package.json".to_string(),
+        path: manifest_path,
+        sha256_digest: digest,
+    });
+
+    // Include every artifact declared in the manifest.
+    for artifact in &manifest.artifacts {
+        // Reject absolute paths and any '..' components before joining with
+        // the source directory.  Without this check, an attacker-controlled
+        // artifact.path such as "/etc/passwd" or "../../sensitive" would
+        // escape src_path and allow arbitrary file reads.
+        validate_relative_path(&artifact.path)?;
+        let src_file = src_path.join(&artifact.path);
+        if !src_file.exists() {
+            return Err(NonoError::PackageInstall(format!(
+                "manifest references missing artifact '{}' (expected at {})",
+                artifact.path,
+                src_file.display()
+            )));
+        }
+        let digest = local_file_digest(&src_file)?;
+        artifacts.push(LocalArtifact {
+            filename: artifact.path.clone(),
+            path: src_file,
+            sha256_digest: digest,
+        });
+    }
+
+    Ok(LocalDownloads { artifacts })
+}
+
+/// Compute SHA-256 hex digest of a local file.
+#[cfg(feature = "sideload")]
+fn local_file_digest(path: &Path) -> Result<String> {
+    nono::trust::file_digest(path)
+}
+
+/// Install a sideloaded pack into the pack store.
+#[cfg(feature = "sideload")]
+fn install_package_sideload(
+    package_ref: &PackageRef,
+    manifest: &PackageManifest,
+    downloads: &LocalDownloads,
+    pack_owned_files: &HashMap<PathBuf, String>,
+) -> Result<InstallSummary> {
+    install_package_inner(package_ref, manifest, downloads, false, pack_owned_files)
+}
+
+/// Write a lockfile entry for a sideloaded pack.
+#[cfg(feature = "sideload")]
+fn write_sideload_lockfile_entry(
+    package_ref: &PackageRef,
+    version: &str,
+    manifest: &PackageManifest,
+    downloads: &LocalDownloads,
+    wiring_record: &[crate::wiring::WiringRecord],
+) -> Result<()> {
+    let mut lockfile = package::read_lockfile()?;
+    lockfile.lockfile_version = package::LOCKFILE_VERSION;
+    // Sideload entries do not set a registry URL (no registry involved).
+
+    let downloaded_by_name = downloads
+        .artifacts
+        .iter()
+        .map(|a| (a.filename.as_str(), a))
+        .collect::<HashMap<_, _>>();
+
+    let mut artifacts = BTreeMap::new();
+    for artifact in &manifest.artifacts {
+        let downloaded = downloaded_by_name
+            .get(artifact.path.as_str())
+            .ok_or_else(|| {
+                NonoError::PackageInstall(format!(
+                    "manifest references missing artifact '{}'",
+                    artifact.path
+                ))
+            })?;
+        let installed_path = installed_artifact_relative_path(artifact)?;
+        if artifacts
+            .insert(
+                installed_path.clone(),
+                LockedArtifact {
+                    sha256: downloaded.sha256_digest.clone(),
+                    artifact_type: artifact.artifact_type.clone(),
+                },
+            )
+            .is_some()
+        {
+            return Err(NonoError::PackageInstall(format!(
+                "multiple artifacts install to the same path '{}' (conflict at '{}')",
+                installed_path, artifact.path
+            )));
+        }
+    }
+
+    lockfile.packages.insert(
+        package_ref.key(),
+        LockedPackage {
+            version: version.to_string(),
+            installed_at: Utc::now().to_rfc3339(),
+            // Sideloaded packs are pinned by default to prevent accidental
+            // upgrades. Users must explicitly re-sideload or `nono pull` to upgrade.
+            pinned: true,
+            provenance: None,
+            artifacts,
+            wiring_record: wiring_record.to_vec(),
+            sideload: true,
+        },
+    );
+
+    package::write_lockfile(&lockfile)
 }
 
 /// Collect the absolute paths and prior SHA-256 of `WriteFile`
@@ -421,7 +668,11 @@ pub fn run_list(args: ListArgs) -> Result<()> {
 
         for (name, pkg) in lockfile.packages {
             let installed_at = format_timestamp(&pkg.installed_at);
-            println!("{name}\t{}\t{installed_at}", pkg.version);
+            #[cfg(feature = "sideload")]
+            let annotation = if pkg.sideload { " [sideload]" } else { "" };
+            #[cfg(not(feature = "sideload"))]
+            let annotation = "";
+            println!("{name}\t{}{annotation}\t{installed_at}", pkg.version);
         }
         return Ok(());
     }
@@ -521,6 +772,12 @@ pub fn run_outdated(args: OutdatedArgs) -> Result<()> {
             continue;
         };
 
+        // Sideloaded packs have no registry record — skip them entirely.
+        #[cfg(feature = "sideload")]
+        if pkg.sideload {
+            continue;
+        }
+
         let pkg_ref = package::PackageRef {
             namespace: namespace.to_string(),
             name: name.to_string(),
@@ -603,6 +860,58 @@ struct InstallSummary {
     /// Records produced by the wiring interpreter, persisted into the
     /// lockfile so `nono remove` can reverse them.
     wiring_record: Vec<crate::wiring::WiringRecord>,
+}
+
+/// A borrowed view of a single artifact used by `install_package_inner`.
+struct ArtifactRef<'a> {
+    filename: &'a str,
+    path: &'a Path,
+}
+
+/// Abstraction over the two artifact sources: verified registry downloads and
+/// local sideload files. Implementations provide iteration over artifacts and
+/// handle the source-specific staging step (writing `package.json` and, for
+/// registry installs, the `.nono-trust.bundle`).
+trait ArtifactSource {
+    fn artifact_refs(&self) -> Vec<ArtifactRef<'_>>;
+    fn write_supporting(&self, staging_root: &Path, manifest: &PackageManifest) -> Result<()>;
+}
+
+impl ArtifactSource for VerifiedDownloads {
+    fn artifact_refs(&self) -> Vec<ArtifactRef<'_>> {
+        self.artifacts
+            .iter()
+            .map(|a| ArtifactRef {
+                filename: &a.filename,
+                path: &a.path,
+            })
+            .collect()
+    }
+
+    fn write_supporting(&self, staging_root: &Path, manifest: &PackageManifest) -> Result<()> {
+        write_supporting_artifacts(staging_root, manifest, self)
+    }
+}
+
+#[cfg(feature = "sideload")]
+impl ArtifactSource for LocalDownloads {
+    fn artifact_refs(&self) -> Vec<ArtifactRef<'_>> {
+        self.artifacts
+            .iter()
+            .map(|a| ArtifactRef {
+                filename: &a.filename,
+                path: &a.path,
+            })
+            .collect()
+    }
+
+    fn write_supporting(&self, staging_root: &Path, _manifest: &PackageManifest) -> Result<()> {
+        // Sideloaded packs: copy package.json only. No .nono-trust.bundle.
+        if let Some(pkg_json) = self.artifacts.iter().find(|a| a.filename == "package.json") {
+            copy_path(&pkg_json.path, &staging_root.join("package.json"))?;
+        }
+        Ok(())
+    }
 }
 
 fn validate_pull_response(package_ref: &PackageRef, pull: &PullResponse) -> Result<()> {
@@ -767,10 +1076,12 @@ fn validate_manifest(manifest: &PackageManifest) -> Result<()> {
     Ok(())
 }
 
-fn install_package(
+/// Shared staging, artifact installation, and wiring logic used by both
+/// `install_package` (registry) and `install_package_sideload` (local).
+fn install_package_inner<S: ArtifactSource>(
     package_ref: &PackageRef,
     manifest: &PackageManifest,
-    downloads: &VerifiedDownloads,
+    source: &S,
     init: bool,
     pack_owned_files: &HashMap<PathBuf, String>,
 ) -> Result<InstallSummary> {
@@ -782,14 +1093,12 @@ fn install_package(
     let staging_root = tempdir.path().join(&package_ref.name);
     fs::create_dir_all(&staging_root).map_err(NonoError::Io)?;
 
-    let mut downloaded_by_name: HashMap<&str, &DownloadedArtifact> =
-        HashMap::with_capacity(downloads.artifacts.len());
-    for artifact in &downloads.artifacts {
-        downloaded_by_name.insert(artifact.filename.as_str(), artifact);
-    }
+    let refs = source.artifact_refs();
+    let downloaded_by_name: HashMap<&str, &ArtifactRef<'_>> =
+        refs.iter().map(|a| (a.filename, a)).collect();
 
     validate_manifest_install_paths(manifest)?;
-    write_supporting_artifacts(&staging_root, manifest, downloads)?;
+    source.write_supporting(&staging_root, manifest)?;
 
     let mut copied_to_project = 0usize;
     for artifact in &manifest.artifacts {
@@ -801,12 +1110,12 @@ fn install_package(
                     artifact.path
                 ))
             })?;
-        install_manifest_artifact(&staging_root, artifact, &downloaded.path)?;
+        install_manifest_artifact(&staging_root, artifact, downloaded.path)?;
         if init
             && artifact.artifact_type == ArtifactType::Instruction
             && artifact.placement.as_deref() == Some("project")
         {
-            copy_instruction_to_project(artifact, &downloaded.path)?;
+            copy_instruction_to_project(artifact, downloaded.path)?;
             copied_to_project = copied_to_project.saturating_add(1);
         }
     }
@@ -846,6 +1155,16 @@ fn install_package(
         copied_to_project,
         wiring_record,
     })
+}
+
+fn install_package(
+    package_ref: &PackageRef,
+    manifest: &PackageManifest,
+    downloads: &VerifiedDownloads,
+    init: bool,
+    pack_owned_files: &HashMap<PathBuf, String>,
+) -> Result<InstallSummary> {
+    install_package_inner(package_ref, manifest, downloads, init, pack_owned_files)
 }
 
 fn write_supporting_artifacts(
@@ -1058,6 +1377,7 @@ fn update_lockfile(
             }),
             artifacts,
             wiring_record: wiring_record.to_vec(),
+            sideload: false,
         },
     );
 

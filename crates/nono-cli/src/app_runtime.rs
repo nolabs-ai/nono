@@ -117,6 +117,10 @@ fn dispatch_command(
         Commands::Outdated(args) => {
             run_command_with_update(update_handle, silent, || package_cmd::run_outdated(args))
         }
+        #[cfg(feature = "sideload")]
+        Commands::Sideload(args) => {
+            run_command_with_update(update_handle, silent, || package_cmd::run_sideload(args))
+        }
         Commands::OpenUrlHelper(args) => run_open_url_helper(args),
         Commands::PackUpdateHintHelper(args) => crate::pack_update_hint::run_refresh_helper(args),
         Commands::Completions(args) => run_completions(args),

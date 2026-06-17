@@ -185,6 +185,15 @@ fn verify_profile_packs(packs: &[String], profile: &profile::Profile) -> crate::
             }
         }
 
+        // Sideloaded packs are installed without a Sigstore bundle — skip
+        // attestation verification when the sideload feature is active and the
+        // lockfile entry is marked as sideloaded.  The SHA-256 digest checks
+        // above still run, preserving on-disk integrity verification.
+        #[cfg(feature = "sideload")]
+        if locked_pkg.sideload {
+            continue;
+        }
+
         let bundle_path = install_dir.join(".nono-trust.bundle");
         if !bundle_path.exists() {
             return Err(nono::NonoError::PackageVerification {

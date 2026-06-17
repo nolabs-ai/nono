@@ -39,6 +39,11 @@ default = ["system-keyring"]
 system-keyring = ["dep:keyring", "nono/system-keyring", "nono-proxy/system-keyring"]
 # Enables test-only trust root overrides used by the integration harness.
 test-trust-overrides = []
+# Enables the `nono sideload` subcommand which installs packs from a local
+# directory without registry attestation or cryptographic verification.
+# WARNING: integrity protections are DISABLED when this feature is active.
+# Do NOT ship production binaries built with this flag.
+sideload = []
 
 [dependencies]
 nono = { version = "0.63.0", path = "../nono", default-features = false }

@@ -174,7 +174,7 @@ fn default_bind_addr() -> IpAddr {
 }
 
 /// Configuration for a reverse proxy credential route.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RouteConfig {
     /// Path prefix for routing (e.g., "openai").
     /// Must NOT include leading or trailing slashes — it is a bare service name, not a URL path.

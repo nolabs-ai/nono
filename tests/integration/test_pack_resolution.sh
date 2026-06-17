@@ -54,7 +54,7 @@ if [[ ! -f "$FIXTURE_DIR/package.json" ]]; then
 fi
 
 # Use a per-run XDG_CONFIG_HOME so the test pack-store install never
-# touches the user's real ~/.config/nono. The pack-store resolver
+# touches the user's real $XDG_CONFIG_HOME/nono. The pack-store resolver
 # walks $XDG_CONFIG_HOME/nono/packages/, so by isolating that root
 # we get clean install + cleanup for free.
 TMPDIR=$(setup_test_dir)

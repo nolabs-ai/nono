@@ -2,7 +2,7 @@
 //!
 //! Profiles provide named configurations for common applications like
 //! claude-code, openclaw, and opencode. They can be built-in (compiled
-//! into the binary) or user-defined (in ~/.config/nono/profiles/).
+//! into the binary) or user-defined (in `$XDG_CONFIG_HOME/nono/profiles/`).
 
 pub(crate) mod builtin;
 
@@ -1504,7 +1504,7 @@ pub struct EnvironmentConfig {
     /// Maps variable names to values, set after allow/deny filtering and before
     /// credential injection (so injected credentials win on conflict). Values
     /// support the same expansion as profile paths (`$HOME`, `~`, `$WORKDIR`,
-    /// `$TMPDIR`, `$XDG_*`, `$NONO_PACKAGES`).
+    /// `$TMPDIR`, `$XDG_*`, `$NONO_CONFIG`, `$NONO_PACKAGES`).
     ///
     /// `PATH` and any `NONO_*` key are reserved and rejected at parse time.
     /// Unlike inherited host variables, keys here are NOT subject to the
@@ -1785,7 +1785,7 @@ impl<'de> Deserialize<'de> for Profile {
 
 /// Check whether a profile name is loaded from a user file rather than the built-in set.
 ///
-/// Returns `true` when a user profile file exists at `~/.config/nono/profiles/<name>.json`,
+/// Returns `true` when a user profile file exists at `$XDG_CONFIG_HOME/nono/profiles/<name>.json`,
 /// which means the user has overridden or shadowed any built-in profile of the same name.
 pub fn is_user_override(name: &str) -> bool {
     if !is_valid_profile_name(name) {
@@ -1880,7 +1880,7 @@ pub fn resolve_profile_path(name_or_path: &str) -> Option<PathBuf> {
 /// treated as a direct file path. Otherwise it is resolved as a profile name.
 ///
 /// Name loading precedence:
-/// 1. User profiles from `~/.config/nono/profiles/<name>.json` — never written
+/// 1. User profiles from `$XDG_CONFIG_HOME/nono/profiles/<name>.json` — never written
 ///    by nono. Users (and Claude's "Option B" guidance) own this directory.
 /// 2. Pack-store scan — any installed pack with a profile artifact whose
 ///    `install_as` matches the requested name. Self-heals Claude Code plugin
@@ -2897,13 +2897,30 @@ pub(crate) fn resolve_user_profile_path(name: &str) -> Result<PathBuf> {
 }
 
 pub(crate) fn user_profile_dir() -> Result<PathBuf> {
-    Ok(resolve_user_config_dir()?.join("nono").join("profiles"))
+    Ok(crate::package::nono_config_dir()?.join("profiles"))
+}
+
+/// Display hint for `$XDG_CONFIG_HOME/nono` when runtime resolution fails.
+pub const NONO_CONFIG_DIR_HINT: &str = "$XDG_CONFIG_HOME/nono (default ~/.config/nono)";
+
+/// Resolved user profile directory for user-facing output.
+#[must_use]
+pub fn display_user_profiles_dir() -> String {
+    user_profile_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| format!("{NONO_CONFIG_DIR_HINT}/profiles"))
+}
+
+/// Resolved user trust-policy path for user-facing output.
+#[must_use]
+pub fn display_trust_policy_path() -> String {
+    crate::package::nono_config_dir()
+        .map(|p| p.join("trust-policy.json").display().to_string())
+        .unwrap_or_else(|_| format!("{NONO_CONFIG_DIR_HINT}/trust-policy.json"))
 }
 
 pub(crate) fn user_profile_draft_dir() -> Result<PathBuf> {
-    Ok(resolve_user_config_dir()?
-        .join("nono")
-        .join("profile-drafts"))
+    Ok(crate::package::nono_config_dir()?.join("profile-drafts"))
 }
 
 pub(crate) fn get_user_profile_draft_path(name: &str) -> Result<PathBuf> {
@@ -2978,6 +2995,7 @@ pub(crate) fn is_valid_profile_name(name: &str) -> bool {
 /// - $WORKDIR: Working directory (--workdir or cwd)
 /// - $HOME: User's home directory
 /// - $XDG_CONFIG_HOME: XDG config directory
+/// - $NONO_CONFIG: nono config root (`$XDG_CONFIG_HOME/nono`)
 /// - $XDG_DATA_HOME: XDG data directory
 /// - $XDG_STATE_HOME: XDG state directory
 /// - $XDG_CACHE_HOME: XDG cache directory
@@ -3062,7 +3080,11 @@ pub fn expand_vars(path: &str, workdir: &Path) -> Result<PathBuf> {
         expanded = expanded.replace("$XDG_RUNTIME_DIR", rt);
     }
 
-    // Expand $NONO_PACKAGES to the package store directory
+    // Expand $NONO_CONFIG / $NONO_PACKAGES to resolved nono config paths
+    if expanded.contains("$NONO_CONFIG") {
+        let config_dir = crate::package::nono_config_dir()?;
+        expanded = expanded.replace("$NONO_CONFIG", &config_dir.to_string_lossy());
+    }
     if expanded.contains("$NONO_PACKAGES") {
         let packages_dir = crate::package::package_store_dir()?;
         expanded = expanded.replace("$NONO_PACKAGES", &packages_dir.to_string_lossy());
@@ -3334,6 +3356,49 @@ mod tests {
         _env.remove("XDG_STATE_HOME");
         let expanded = expand_vars("$XDG_STATE_HOME/history", &workdir).expect("valid env");
         assert_eq!(expanded, PathBuf::from("/home/user/.local/state/history"));
+    }
+
+    #[test]
+    fn test_expand_vars_xdg_config_home() {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let _env = crate::test_env::EnvVarGuard::set_all(&[
+            ("HOME", "/home/user"),
+            ("XDG_CONFIG_HOME", "/custom/config"),
+        ]);
+
+        let workdir = PathBuf::from("/projects/myapp");
+        let expanded = expand_vars("$XDG_CONFIG_HOME/nono/profiles", &workdir).expect("valid env");
+        assert_eq!(expanded, PathBuf::from("/custom/config/nono/profiles"));
+
+        _env.remove("XDG_CONFIG_HOME");
+        let expanded = expand_vars("$XDG_CONFIG_HOME/nono/profiles", &workdir).expect("valid env");
+        assert_eq!(expanded, PathBuf::from("/home/user/.config/nono/profiles"));
+    }
+
+    #[test]
+    fn test_expand_vars_nono_config() {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config_home = tmp.path().join("config");
+        std::fs::create_dir_all(&config_home).expect("create config home");
+        let config_home_str = config_home.to_string_lossy().to_string();
+        let _env = crate::test_env::EnvVarGuard::set_all(&[
+            ("HOME", "/home/user"),
+            ("XDG_CONFIG_HOME", &config_home_str),
+        ]);
+
+        let workdir = PathBuf::from("/projects/myapp");
+        let expanded = expand_vars("$NONO_CONFIG/profiles", &workdir).expect("valid env");
+        assert_eq!(
+            nono::try_canonicalize(&expanded),
+            nono::try_canonicalize(&config_home.join("nono").join("profiles"))
+        );
     }
 
     #[test]

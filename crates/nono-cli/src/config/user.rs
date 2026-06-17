@@ -1,6 +1,7 @@
 //! User configuration loading
 //!
-//! Loads user-level configuration from ~/.config/nono/config.toml
+//! Loads user-level configuration from `$XDG_CONFIG_HOME/nono/config.toml`
+//! (default `~/.config/nono/config.toml`).
 
 #![allow(dead_code)]
 
@@ -322,7 +323,8 @@ impl Default for RollbackSettings {
     }
 }
 
-/// Load user configuration from ~/.config/nono/config.toml
+/// Load user configuration from `$XDG_CONFIG_HOME/nono/config.toml`
+/// (default `~/.config/nono/config.toml`).
 ///
 /// Returns None if the config file doesn't exist.
 /// Returns Err if the file exists but is malformed.

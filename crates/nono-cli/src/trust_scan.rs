@@ -69,7 +69,7 @@ pub fn load_scan_policy(
             let policy_path = user_path
                 .as_deref()
                 .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "~/.config/nono/trust-policy.json".to_string());
+                .unwrap_or_else(crate::profile::display_trust_policy_path);
             eprintln!(
                 "  {}",
                 format!("Create a signed policy at {policy_path} to enforce verification.")

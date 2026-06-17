@@ -404,11 +404,10 @@ impl SetupRunner {
 
             if self.generate_profiles {
                 println!("Custom profiles:");
-                let profile_dir = crate::profile::resolve_user_config_dir()
-                    .map(|p| p.join("nono").join("profiles"))
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|_| "~/.config/nono/profiles".to_string());
-                println!("  Edit example profiles in: {}", profile_dir);
+                println!(
+                    "  Edit example profiles in: {}",
+                    crate::profile::display_user_profiles_dir()
+                );
                 println!();
             }
 

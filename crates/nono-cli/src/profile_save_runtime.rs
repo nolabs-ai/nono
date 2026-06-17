@@ -571,7 +571,7 @@ fn profile_name_from_command(cmd_name: &str) -> Option<String> {
     }
 }
 
-/// Return true when writing `~/.config/nono/profiles/<name>.json` would shadow
+/// Return true when writing `$XDG_CONFIG_HOME/nono/profiles/<name>.json` would shadow
 /// a built-in or installed pack profile of the same name. User files are loaded
 /// in preference to built-ins and pack-store profiles, so saving under an
 /// existing profile's name silently reroutes all future `--profile <name>`

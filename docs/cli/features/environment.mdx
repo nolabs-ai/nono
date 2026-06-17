@@ -144,7 +144,7 @@ Use `set_vars` to inject environment variables with specific values into the san
 
 **Ordering:** `set_vars` is applied **after** allow/deny filtering and **before** credential injection. If a key in `set_vars` collides with a variable injected via `env_credentials`, the injected credential wins. A `set_vars` value overrides any inherited value with the same name.
 
-**Variable expansion:** values support the same expansion as profile paths — `$HOME`, `~`, `$WORKDIR`, `$TMPDIR`, `$UID`, `$XDG_CONFIG_HOME`, `$XDG_DATA_HOME`, `$XDG_STATE_HOME`, `$XDG_CACHE_HOME`, `$XDG_RUNTIME_DIR`, and `$NONO_PACKAGES`. For example, `"$HOME/.config"` expands to the user's config directory. Keys are never expanded.
+**Variable expansion:** values support the same expansion as profile paths — `$HOME`, `~`, `$WORKDIR`, `$TMPDIR`, `$UID`, `$XDG_CONFIG_HOME`, `$XDG_DATA_HOME`, `$XDG_STATE_HOME`, `$XDG_CACHE_HOME`, `$XDG_RUNTIME_DIR`, `$NONO_CONFIG`, and `$NONO_PACKAGES`. When `XDG_CONFIG_HOME` is unset — typical on macOS — `$XDG_CONFIG_HOME` expands to `$HOME/.config`, so `"$XDG_CONFIG_HOME/nono"` is the same as `~/.config/nono`. Keys are never expanded.
 
 **Reserved keys:** `PATH` and any key starting with `NONO_` are reserved and rejected at profile load time (`PATH` is controlled via `allow_vars`/`deny_vars`; the `NONO_*` prefix is reserved for nono's own injected variables). Keys must be valid environment variable names (`[A-Za-z_][A-Za-z0-9_]*`).
 

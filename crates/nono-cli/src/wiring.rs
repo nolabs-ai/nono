@@ -15,8 +15,9 @@
 //!     reverse — the install plan never has to be re-derived.
 //!   - Variables expanded at execution time: `$PACK_DIR`, `$NS`
 //!     (pack namespace), `$PLUGIN` (pack name, the second segment
-//!     of `<ns>/<pack>`), `$HOME`, `$XDG_CONFIG_HOME`. No shell
-//!     evaluation, no user-controlled inputs flow in.
+//!     of `<ns>/<pack>`), `$HOME`, `$XDG_CONFIG_HOME`, `$NONO_CONFIG`,
+//!     `$NONO_PACKAGES`. No shell evaluation, no user-controlled inputs
+//!     flow in.
 //!   - Idempotent: re-running a directive with the same inputs is a
 //!     no-op and reports `wiring_changed = false`.
 
@@ -679,10 +680,16 @@ fn expand_vars(template: &str, ctx: &WiringContext) -> Result<String> {
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(".config"));
+    let nono_config = crate::package::nono_config_dir()
+        .map_err(|e| NonoError::PackageInstall(format!("failed to resolve $NONO_CONFIG: {e}")))?;
+    let nono_packages = crate::package::package_store_dir()
+        .map_err(|e| NonoError::PackageInstall(format!("failed to resolve $NONO_PACKAGES: {e}")))?;
 
     let pack_dir = ctx.pack_dir.to_string_lossy().into_owned();
     let home_str = home.to_string_lossy().into_owned();
     let xdg_str = xdg_config_home.to_string_lossy().into_owned();
+    let nono_config_str = nono_config.to_string_lossy().into_owned();
+    let nono_packages_str = nono_packages.to_string_lossy().into_owned();
 
     // `$` is a variable sigil only when followed by an ASCII uppercase
     // letter or underscore — i.e. the start of an identifier from the
@@ -719,6 +726,8 @@ fn expand_vars(template: &str, ctx: &WiringContext) -> Result<String> {
             "PLUGIN" => ctx.pack_name.clone(),
             "HOME" => home_str.clone(),
             "XDG_CONFIG_HOME" => xdg_str.clone(),
+            "NONO_CONFIG" => nono_config_str.clone(),
+            "NONO_PACKAGES" => nono_packages_str.clone(),
             // Install-time UTC timestamp (RFC3339, milliseconds), for
             // agents that require a `lastUpdated`-style field on their
             // config entries (Claude Code's marketplace registry being
@@ -1601,12 +1610,53 @@ mod tests {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
-        let _env = EnvVarGuard::set_all(&[("HOME", "/h")]);
+        let _env = EnvVarGuard::set_all(&[("HOME", "/h"), ("XDG_CONFIG_HOME", "__placeholder__")]);
+        _env.remove("XDG_CONFIG_HOME");
         assert_eq!(expand_vars("$PACK_DIR/x", &ctx).expect("expand"), "/p/x");
         assert_eq!(expand_vars("$NS/$PLUGIN", &ctx).expect("expand"), "ns/name");
         assert_eq!(
             expand_vars("$HOME/.config", &ctx).expect("expand"),
             "/h/.config"
+        );
+        assert_eq!(
+            expand_vars("$NONO_CONFIG/profile-drafts", &ctx).expect("expand"),
+            "/h/.config/nono/profile-drafts"
+        );
+        assert_eq!(
+            expand_vars("$NONO_PACKAGES/always-further/claude", &ctx).expect("expand"),
+            "/h/.config/nono/packages/always-further/claude"
+        );
+    }
+
+    #[test]
+    fn expand_vars_nono_config_respects_xdg_config_home() {
+        let _g = match ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let home = TempDir::new().expect("home tempdir");
+        let config = TempDir::new().expect("config tempdir");
+        let home_str = home.path().to_str().expect("home path");
+        let config_str = config.path().to_str().expect("config path");
+        let ctx = WiringContext {
+            pack_dir: PathBuf::from("/p"),
+            namespace: "always-further".to_string(),
+            pack_name: "claude".to_string(),
+        };
+        let _env = EnvVarGuard::set_all(&[("HOME", home_str), ("XDG_CONFIG_HOME", config_str)]);
+        let expected_config = format!("{config_str}/nono/profile-drafts");
+        let expected_packages = format!("{config_str}/nono/packages/always-further/claude");
+        assert_eq!(
+            nono::try_canonicalize(Path::new(
+                &expand_vars("$NONO_CONFIG/profile-drafts", &ctx).expect("expand")
+            )),
+            nono::try_canonicalize(Path::new(&expected_config))
+        );
+        assert_eq!(
+            nono::try_canonicalize(Path::new(
+                &expand_vars("$NONO_PACKAGES/always-further/claude", &ctx).expect("expand")
+            )),
+            nono::try_canonicalize(Path::new(&expected_packages))
         );
     }
 

@@ -2,7 +2,7 @@
 //!
 //! This module handles loading and merging configuration from multiple sources:
 //! - Embedded policy.json (composable security groups, single source of truth)
-//! - User-level config at ~/.config/nono/ (overrides with acknowledgment)
+//! - User-level config at `$XDG_CONFIG_HOME/nono/` (default `~/.config/nono/`)
 //! - CLI flags (highest precedence)
 
 pub mod embedded;
@@ -57,10 +57,14 @@ pub fn validated_tmpdir() -> Result<String> {
     }
 }
 
-/// Get the user config directory path
-#[allow(dead_code)]
+/// User-level nono config root (`$XDG_CONFIG_HOME/nono`, default `~/.config/nono`).
+///
+/// Uses the same XDG resolution as profiles and packages (`resolve_user_config_dir`),
+/// not platform-specific dirs such as macOS `~/Library/Application Support`.
 pub fn user_config_dir() -> Option<PathBuf> {
-    dirs::config_dir().map(|p| p.join("nono"))
+    crate::profile::resolve_user_config_dir()
+        .ok()
+        .map(|dir| dir.join("nono"))
 }
 
 /// Get the user state directory path (for version tracking and runtime state)
@@ -206,6 +210,11 @@ mod tests {
 
     #[test]
     fn test_check_sensitive_path() {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+
         assert!(
             check_sensitive_path("~/.ssh")
                 .expect("should not fail")
@@ -236,7 +245,34 @@ mod tests {
     }
 
     #[test]
+    fn test_user_config_dir_uses_xdg_fallback() {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().to_str().expect("temp path");
+        let _env = crate::test_env::EnvVarGuard::set_all(&[
+            ("HOME", home),
+            ("XDG_CONFIG_HOME", "__placeholder__"),
+        ]);
+        _env.remove("XDG_CONFIG_HOME");
+
+        let dir = user_config_dir().expect("user config dir");
+        let expected = tmp.path().join(".config").join("nono");
+        assert_eq!(
+            nono::try_canonicalize(&dir),
+            nono::try_canonicalize(&expected)
+        );
+    }
+
+    #[test]
     fn test_check_sensitive_path_component_wise() {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+
         // ~/.sshevil must NOT match ~/.ssh (component-wise comparison)
         let home = validated_home().expect("HOME must be set");
         let evil_path = format!("{}/.sshevil", home);

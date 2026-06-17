@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # Clean up nono-managed Claude Code state for a fresh test of
 # `nono run --profile always-further/claude -- claude`. Removes:
-#   - the pulled pack at ~/.config/nono/packages/always-further/claude
-#   - any leftover legacy symlink at ~/.config/nono/profiles/claude-code.json
+#   - the pulled pack at $XDG_CONFIG_HOME/nono/packages/always-further/claude
+#   - any leftover legacy symlink at $XDG_CONFIG_HOME/nono/profiles/claude-code.json
 #   - the bare pre-marketplace symlink at ~/.claude/plugins/nono
 #   - the synthesised marketplace at ~/.claude/plugins/marketplaces/always-further
 #   - the cache dir at ~/.claude/plugins/cache/always-further
 #   - the `always-further/claude` entry from
-#     ~/.config/nono/packages/lockfile.json (so `nono pull` re-installs
+#     $XDG_CONFIG_HOME/nono/packages/lockfile.json (so `nono pull` re-installs
 #     instead of short-circuiting on "already up to date")
 #   - the `nono@always-further` and bare `nono` entries in
 #     ~/.claude/plugins/installed_plugins.json,
@@ -16,8 +16,10 @@
 
 set -euo pipefail
 
-rm -f  "$HOME/.config/nono/profiles/claude-code.json" 2>/dev/null || true
-rm -rf "$HOME/.config/nono/packages/always-further/claude" 2>/dev/null || true
+NONO_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/nono"
+
+rm -f  "$NONO_CONFIG/profiles/claude-code.json" 2>/dev/null || true
+rm -rf "$NONO_CONFIG/packages/always-further/claude" 2>/dev/null || true
 rm -rf "$HOME/.claude/plugins/nono" 2>/dev/null || true
 rm -rf "$HOME/.claude/plugins/marketplaces/always-further" 2>/dev/null || true
 rm -rf "$HOME/.claude/plugins/cache/always-further" 2>/dev/null || true
@@ -50,7 +52,7 @@ strip_with_jq "$HOME/.claude/plugins/installed_plugins.json" \
     'del(.plugins["nono@always-further"])'
 strip_with_jq "$HOME/.claude/plugins/known_marketplaces.json" \
     'del(."always-further")'
-strip_with_jq "$HOME/.config/nono/packages/lockfile.json" \
+strip_with_jq "$NONO_CONFIG/packages/lockfile.json" \
     'del(.packages["always-further/claude"])'
 
 echo "cleared nono-managed Claude Code state."

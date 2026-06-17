@@ -2,6 +2,16 @@
 //!
 //! This is the CLI binary that uses the nono library for OS-level sandboxing.
 
+// The sideload feature disables integrity protections and must never appear in
+// a release binary. `debug_assertions` is false in `--release` builds, so this
+// fires exactly when someone runs `cargo build --release --features sideload`.
+#[cfg(all(feature = "sideload", not(debug_assertions)))]
+compile_error!(
+    "The `sideload` feature must not be enabled in release builds. \
+     Remove `--features sideload` from the release build command. \
+     Sideload binaries are for development and testing only."
+);
+
 mod app_runtime;
 mod approval_runtime;
 mod audit_attestation;
@@ -130,6 +140,21 @@ fn main() {
     print_legacy_network_warnings(&legacy_network_warnings, cli.silent);
     let command_blocking_warnings = collect_cli_warnings(&cli);
     print_deprecation_warnings(&command_blocking_warnings, cli.silent);
+
+    // Global sideload warning: printed before every command so there is no
+    // ambiguity about which binary is running. One banner per invocation,
+    // always on stderr, never suppressed by --silent (the risk is the reason
+    // for the warning).
+    #[cfg(feature = "sideload")]
+    {
+        use colored::Colorize;
+        eprintln!(
+            "{}",
+            "warning: nono was compiled with --features sideload, which means integrity \
+             protections are DISABLED. Do NOT use this binary on production systems."
+                .red()
+        );
+    }
 
     let cli_result = run_cli(cli);
     tool_sandbox::log_main_total();

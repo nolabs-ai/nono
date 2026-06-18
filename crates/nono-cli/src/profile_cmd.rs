@@ -787,7 +787,11 @@ pub(crate) fn cmd_list(args: ProfileListArgs) -> Result<()> {
         println!();
         println!(
             "  {}",
-            theme::fg("User (~/.config/nono/profiles/):", t.subtext).bold()
+            theme::fg(
+                &format!("User ({}):", profile::display_user_profiles_dir()),
+                t.subtext
+            )
+            .bold()
         );
         for (name, result) in &user_profiles {
             print_profile_line(name, result, t);

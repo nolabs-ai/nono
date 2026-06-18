@@ -519,6 +519,10 @@ pub struct PreparedCaps {
     pub caps: CapabilitySet,
     pub needs_unlink_overrides: bool,
     pub deny_paths: Vec<PathBuf>,
+    /// User-granted paths (macOS) that a deny group silently blocks, paired
+    /// with the deny group that blocks each. Surfaced as a single folded line
+    /// in the capability summary; `(path, Some(group_name))`.
+    pub blocked_grants: Vec<(PathBuf, Option<String>)>,
 }
 
 /// Extension trait for CapabilitySet to add CLI-specific construction methods.
@@ -624,12 +628,13 @@ impl CapabilitySetExt for CapabilitySet {
             caps.add_blocked_command(cmd);
         }
 
-        finalize_caps(&mut caps, &mut resolved, &loaded_policy, args, &[])?;
+        let blocked_grants = finalize_caps(&mut caps, &mut resolved, &loaded_policy, args, &[])?;
 
         Ok(PreparedCaps {
             caps,
             needs_unlink_overrides: resolved.needs_unlink_overrides,
             deny_paths: resolved.deny_paths,
+            blocked_grants,
         })
     }
 
@@ -1062,7 +1067,7 @@ impl CapabilitySetExt for CapabilitySet {
             }
         }
 
-        finalize_caps(
+        let blocked_grants = finalize_caps(
             &mut caps,
             &mut resolved,
             &loaded_policy,
@@ -1074,6 +1079,7 @@ impl CapabilitySetExt for CapabilitySet {
             caps,
             needs_unlink_overrides: resolved.needs_unlink_overrides,
             deny_paths: resolved.deny_paths,
+            blocked_grants,
         })
     }
 }
@@ -1089,7 +1095,7 @@ fn finalize_caps(
     loaded_policy: &policy::Policy,
     args: &SandboxArgs,
     profile_bypass_protection: &[PathBuf],
-) -> Result<()> {
+) -> Result<Vec<(PathBuf, Option<String>)>> {
     // Apply profile-level deny overrides first, then CLI overrides.
     // Profile overrides come from `filesystem.bypass_protection` in the
     // profile JSON. CLI `--bypass-protection` flags are applied on top.
@@ -1104,22 +1110,16 @@ fn finalize_caps(
     // Validate deny/allow overlaps (hard-fail on Linux where Landlock cannot enforce denies)
     policy::validate_deny_overlaps(&resolved.deny_paths, caps)?;
 
-    // On macOS, warn when user-granted paths are silently blocked by deny rules.
-    // Seatbelt deny rules override earlier allow rules for content access, so the
-    // user's --allow/--read/--write has no effect without --bypass-protection.
-    if cfg!(target_os = "macos") {
-        for (path, group) in
-            policy::find_denied_user_grants(&resolved.deny_paths, caps, loaded_policy)
-        {
-            let source = group.as_deref().unwrap_or("a deny rule");
-            warn!(
-                "'{}' is blocked by '{}'; use --bypass-protection {} to allow access",
-                path.display(),
-                source,
-                path.display(),
-            );
-        }
-    }
+    // On macOS, collect user-granted paths that are silently blocked by deny
+    // rules so the caller can surface them as one folded line in the capability
+    // summary (rather than a wall of per-path warnings). Seatbelt deny rules
+    // override earlier allow rules for content access, so the user's
+    // --allow/--read/--write has no effect without --bypass-protection.
+    let blocked_grants = if cfg!(target_os = "macos") {
+        policy::find_denied_user_grants(&resolved.deny_paths, caps, loaded_policy)
+    } else {
+        Vec::new()
+    };
 
     // Keep broad keychain deny groups active, but allow explicit
     // keychain DB read grants (profile/CLI) on macOS.
@@ -1128,7 +1128,7 @@ fn finalize_caps(
     // Deduplicate capabilities
     caps.deduplicate();
 
-    Ok(())
+    Ok(blocked_grants)
 }
 
 fn apply_cli_network_mode(caps: &mut CapabilitySet, args: &SandboxArgs) {

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Clean up nono-managed Codex state for a fresh test of
 # `nono run --profile always-further/codex -- codex`. Removes:
-#   - the pulled pack at ~/.config/nono/packages/always-further/codex
+#   - the pulled pack at $XDG_CONFIG_HOME/nono/packages/always-further/codex
 #   - the cache subtree at ~/.codex/plugins/cache/always-further
 #   - the nono-managed fenced block in ~/.codex/config.toml (between
 #     the `# >>> nono-managed (do not edit) >>>` markers — registers
@@ -9,7 +9,7 @@
 #   - hook entries in ~/.codex/hooks.json whose command path points
 #     into the nono pack store
 #   - the `always-further/codex` entry from
-#     ~/.config/nono/packages/lockfile.json (so `nono pull` re-installs
+#     $XDG_CONFIG_HOME/nono/packages/lockfile.json (so `nono pull` re-installs
 #     instead of short-circuiting on "already up to date")
 #
 # Does NOT touch:
@@ -17,14 +17,16 @@
 #     (so `[features] codex_hooks = true`, your model + project trust
 #     settings, etc. all stay)
 #   - ~/.codex/auth.json or ~/.codex/sessions/*
-#   - ~/.config/nono/profiles/ (your own profiles)
+#   - $XDG_CONFIG_HOME/nono/profiles/ (your own profiles)
 
 set -euo pipefail
 
-PACK_STORE="$HOME/.config/nono/packages/always-further/codex"
+NONO_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/nono"
+
+PACK_STORE="$NONO_CONFIG/packages/always-further/codex"
 CONFIG_TOML="$HOME/.codex/config.toml"
 HOOKS_JSON="$HOME/.codex/hooks.json"
-LOCKFILE="$HOME/.config/nono/packages/lockfile.json"
+LOCKFILE="$NONO_CONFIG/packages/lockfile.json"
 
 rm -rf "$PACK_STORE" 2>/dev/null || true
 rm -rf "$HOME/.codex/plugins/cache/always-further" 2>/dev/null || true

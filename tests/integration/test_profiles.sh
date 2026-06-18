@@ -59,8 +59,17 @@ expect_output_contains "dry-run output shows Capabilities section" "Capabilities
 # node-dev pulls the `node_runtime` capability group (paths like
 # ~/.npm, ~/.nvm). Those live inside the collapsed system/group
 # block in the default dry-run output and only show with -v.
-expect_output_contains "node-dev profile lists Node runtime paths in dry-run -v" ".npm" \
-    "$NONO_BIN" run -v --profile node-dev --dry-run -- echo "test"
+# On Linux CI runners ~/.npm may not exist; use /usr/local/lib/node_modules
+# (present when node is installed) as the assertion anchor instead.
+if is_linux && [[ -d /usr/local/lib/node_modules ]]; then
+    expect_output_contains "node-dev profile lists Node runtime paths in dry-run -v" "node_modules" \
+        "$NONO_BIN" run -v --profile node-dev --dry-run -- echo "test"
+elif is_linux; then
+    skip_test "node-dev profile lists Node runtime paths in dry-run -v" "no node_runtime paths present on this runner"
+else
+    expect_output_contains "node-dev profile lists Node runtime paths in dry-run -v" ".npm" \
+        "$NONO_BIN" run -v --profile node-dev --dry-run -- echo "test"
+fi
 
 # =============================================================================
 # Profile Enforcement

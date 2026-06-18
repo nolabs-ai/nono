@@ -52,8 +52,8 @@ echo -e "Platform: $(uname -s) $(uname -m)"
 echo ""
 
 # Make test scripts executable
-chmod +x "$SCRIPT_DIR"/integration/*.sh
-chmod +x "$SCRIPT_DIR"/lib/*.sh
+chmod +x "$SCRIPT_DIR"/integration/*.sh 2>/dev/null || true
+chmod +x "$SCRIPT_DIR"/lib/*.sh 2>/dev/null || true
 
 # =============================================================================
 # Run Test Suites in Parallel (with concurrency limit)

@@ -727,7 +727,7 @@ fn legacy_keys_in_extends_parent_emit_warnings_once_via_child() {
     // WarningSuppressionGuard fixes).
     //
     // `extends` resolves by profile name through the user-profiles dir
-    // (`$HOME/.config/nono/profiles/`) or built-ins, so we override HOME
+    // (`$XDG_CONFIG_HOME/nono/profiles/`) or built-ins, so we override HOME
     // to a tempdir for the spawned `nono` invocation and write the
     // parent there. The child references the parent by name.
     let dir = tempfile::tempdir().expect("tempdir");

@@ -10,7 +10,7 @@
 //! No IP addresses are logged by the update service.
 //!
 //! To disable the update check, set `NONO_NO_UPDATE_CHECK=1` or add
-//! `[updates] check = false` to `~/.config/nono/config.toml`.
+//! `[updates] check = false` to `$XDG_CONFIG_HOME/nono/config.toml` (default `~/.config/nono/config.toml`).
 
 use chrono::{DateTime, Utc};
 use nono::Result;

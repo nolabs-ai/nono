@@ -39,6 +39,14 @@ Profiles can come from three sources, in order of precedence:
 
 CLI flags always override profile settings.
 
+<Note>
+  nono resolves config paths via `$XDG_CONFIG_HOME/nono/` on every platform. If
+  you have not set `XDG_CONFIG_HOME` — typical on macOS — that is the same as
+  **`~/.config/nono/`** shown above. Set `XDG_CONFIG_HOME` only when you want
+  config elsewhere; profile JSON path grants should use `$XDG_CONFIG_HOME`,
+  `$NONO_CONFIG`, or `$NONO_PACKAGES` rather than hardcoded `$HOME/.config/...`.
+</Note>
+
 ### Profile Format
 
 Profiles use JSON format:
@@ -479,7 +487,9 @@ Profiles support these environment variables in path values:
 |----------|------------|
 | `$WORKDIR` | Current working directory (from `--workdir` or cwd) |
 | `$HOME` | User's home directory |
-| `$XDG_CONFIG_HOME` | XDG config directory (default: `~/.config`) |
+| `$XDG_CONFIG_HOME` | XDG config directory (default: `~/.config`; used for `~/.config/nono/` when unset) |
+| `$NONO_CONFIG` | nono config root (`$XDG_CONFIG_HOME/nono`, default `~/.config/nono`) |
+| `$NONO_PACKAGES` | Installed pack store (`$NONO_CONFIG/packages`) |
 | `$XDG_DATA_HOME` | XDG data directory (default: `~/.local/share`) |
 | `$XDG_STATE_HOME` | XDG state directory (default: `~/.local/state`) |
 | `$XDG_CACHE_HOME` | XDG cache directory (default: `~/.cache`) |

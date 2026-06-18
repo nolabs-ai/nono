@@ -8,7 +8,7 @@
 //!
 //! Respects `NONO_NO_PACK_UPDATE_HINTS=1`, plus the same opt-out as the CLI
 //! update check: `NONO_NO_UPDATE_CHECK=1` or `[updates] check = false` in
-//! `~/.config/nono/config.toml`.
+//! `$XDG_CONFIG_HOME/nono/config.toml` (default `~/.config/nono/config.toml`).
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};

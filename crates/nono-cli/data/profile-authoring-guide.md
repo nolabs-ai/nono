@@ -4,7 +4,10 @@ This guide is designed for LLM agents helping users create custom nono profiles.
 
 ## 1. Profile File Location
 
-User profiles live at `~/.config/nono/profiles/<name>.json`.
+User profiles live at **`~/.config/nono/profiles/<name>.json`** by default. If
+`XDG_CONFIG_HOME` is set, nono uses **`$XDG_CONFIG_HOME/nono/profiles/<name>.json`**
+instead. In profile JSON path grants, prefer `$XDG_CONFIG_HOME`, `$NONO_CONFIG`, or
+`$NONO_PACKAGES` over hardcoded `$HOME/.config/...`.
 
 Profile names must be alphanumeric with hyphens only. No leading or trailing hyphens.
 
@@ -229,7 +232,7 @@ Controls which environment variables are passed to the sandboxed process. When `
 |---------------|-----------------|---------|-------------|
 | `allow_vars`  | array of string | `[]`    | Allow-list of environment variable names. Supports exact names (`"PATH"`) and prefix patterns ending with `*` (`"AWS_*"` matches `AWS_REGION`, `AWS_SECRET_ACCESS_KEY`, etc.). The `*` wildcard is only valid as a trailing suffix. When the `environment` section is omitted entirely, all variables are allowed. When present with an empty array, no inherited variables are passed (only nono-injected credentials). Nono-injected credentials always bypass this list. |
 | `deny_vars`   | array of string | `[]`    | Deny-list of environment variable names stripped from the child. Same pattern syntax as `allow_vars` (exact names and trailing `*`). Denied vars are stripped even if they also match `allow_vars`. |
-| `set_vars`    | object (string→string) | `{}` | Static environment variables injected after allow/deny filtering and before credential injection (injected credentials win on conflict). Values support the same expansion as profile paths (`$HOME`, `~`, `$WORKDIR`, `$TMPDIR`, `$XDG_*`, `$NONO_PACKAGES`); keys are not expanded. `PATH` and any `NONO_*` key are reserved and rejected at load time. Unlike inherited host vars, keys here are NOT subject to the dangerous-variable blocklist (`LD_PRELOAD`, `NODE_OPTIONS`, …) — setting one is an explicit operator decision. |
+| `set_vars`    | object (string→string) | `{}` | Static environment variables injected after allow/deny filtering and before credential injection (injected credentials win on conflict). Values support the same expansion as profile paths (`$HOME`, `~`, `$WORKDIR`, `$TMPDIR`, `$XDG_*`, `$NONO_CONFIG`, `$NONO_PACKAGES`); keys are not expanded. `PATH` and any `NONO_*` key are reserved and rejected at load time. Unlike inherited host vars, keys here are NOT subject to the dangerous-variable blocklist (`LD_PRELOAD`, `NODE_OPTIONS`, …) — setting one is an explicit operator decision. |
 
 Inheritance: child `allow_vars` and `deny_vars` are appended to base values and deduplicated; `set_vars` merges as a map, with the child's value winning on key conflict.
 

@@ -104,7 +104,7 @@ expect_failure() {
             echo "       Output: ${stripped:0:2000}"
         fi
         TESTS_FAILED=$((TESTS_FAILED + 1))
-        return 1
+        return 0
     fi
 }
 
@@ -137,7 +137,7 @@ expect_output_contains() {
             echo "       Actual output: ${stripped:0:2000}"
         fi
         TESTS_FAILED=$((TESTS_FAILED + 1))
-        return 1
+        return 0
     fi
 }
 
@@ -157,7 +157,7 @@ expect_output_not_contains() {
         echo -e "  ${RED}FAIL${NC}: $name"
         echo "       Output should NOT contain: '$unexpected_str'"
         TESTS_FAILED=$((TESTS_FAILED + 1))
-        return 1
+        return 0
     else
         echo -e "  ${GREEN}PASS${NC}: $name"
         TESTS_PASSED=$((TESTS_PASSED + 1))

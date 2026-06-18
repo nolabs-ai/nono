@@ -9,6 +9,7 @@
 //! is handled by [`crate::route::RouteStore`], which loads independently of
 //! credentials. This module handles only credential-specific concerns.
 
+use crate::aws::route::{AwsRoute, AwsRouteTable};
 use crate::capture::CredentialCaptureMaterial;
 use crate::config::{InjectMode, RouteConfig};
 use crate::diagnostic::{ProxyDiagnostic, ProxyDiagnosticCode};
@@ -182,10 +183,8 @@ pub struct CredentialStore {
     cmd_routes: HashMap<String, CmdCredentialRoute>,
     /// Map from route prefix to OAuth2 route (token cache + upstream)
     oauth2_routes: HashMap<String, OAuth2Route>,
-    /// Map from route prefix to AWS SigV4 route (placeholder until full
-    /// SigV4 signing is implemented; value is () because no runtime state
-    /// is needed yet).
-    aws_routes: HashMap<String, ()>,
+    /// Map from route prefix to AWS SigV4 route (region, service, provider).
+    aws_routes: AwsRouteTable,
 }
 
 impl CredentialStore {
@@ -213,7 +212,7 @@ impl CredentialStore {
         let mut credentials = HashMap::new();
         let mut cmd_routes = HashMap::new();
         let mut oauth2_routes = HashMap::new();
-        let mut aws_routes = HashMap::new();
+        let mut aws_routes = AwsRouteTable::empty();
         let mut diagnostics = Vec::new();
 
         for route in routes {
@@ -414,13 +413,62 @@ impl CredentialStore {
                         continue;
                     }
                 }
-            } else if route.aws_auth.is_some() {
-                // AWS SigV4 path — no credentials to load yet. Register the
-                // prefix so get_aws() returns true and the proxy can return
-                // 501 Not Implemented. The () value is a placeholder; the
-                // real AwsRoute struct will replace it when SigV4 signing is
-                // implemented.
-                aws_routes.insert(normalized_prefix.clone(), ());
+            } else if let Some(ref aws_auth) = route.aws_auth {
+                debug!(
+                    "aws credential load: prefix='{}' upstream='{}' \
+                     explicit_region={:?} explicit_service={:?} profile={:?}",
+                    normalized_prefix,
+                    route.upstream,
+                    aws_auth.region,
+                    aws_auth.service,
+                    aws_auth.profile,
+                );
+
+                let Some((region, service)) = crate::aws::endpoints::resolve_signing_params(
+                    &normalized_prefix,
+                    aws_auth,
+                    &route.upstream,
+                ) else {
+                    continue;
+                };
+                debug!(
+                    "aws credential load: prefix='{}' region='{}' service='{}'",
+                    normalized_prefix, region, service
+                );
+
+                // Build or reuse the credential provider, then insert the route.
+                // Profile deduplication is handled inside AwsRouteTable.
+                let profile_opt = aws_auth.profile.as_deref();
+                debug!(
+                    "aws credential load: prefix='{}' building provider for profile={:?}",
+                    normalized_prefix, profile_opt
+                );
+
+                match aws_routes
+                    .insert_route(
+                        normalized_prefix.clone(),
+                        profile_opt,
+                        route.upstream.clone(),
+                        region,
+                        service,
+                    )
+                    .await
+                {
+                    Ok(()) => {
+                        debug!(
+                            "aws credential load: prefix='{}' route inserted (profile={:?})",
+                            normalized_prefix, profile_opt
+                        );
+                    }
+                    Err(msg) => {
+                        warn!(
+                            "AWS route '{}': could not build credential provider: {} — \
+                             managed-credential requests on this route will be denied.",
+                            normalized_prefix, msg
+                        );
+                        continue;
+                    }
+                }
             }
         }
 
@@ -456,7 +504,7 @@ impl CredentialStore {
             credentials: HashMap::new(),
             cmd_routes: HashMap::new(),
             oauth2_routes: HashMap::new(),
-            aws_routes: HashMap::new(),
+            aws_routes: AwsRouteTable::empty(),
         }
     }
 
@@ -478,12 +526,10 @@ impl CredentialStore {
         self.oauth2_routes.get(prefix)
     }
 
-    /// Returns `Some(())` if an AWS SigV4 route is configured for the given
-    /// prefix, `None` otherwise. The `Option<&()>` return mirrors `get_oauth2`
-    /// so call sites can use `.is_some()` uniformly. The value will become
-    /// `Option<&AwsRoute>` when SigV4 signing is implemented.
+    /// Returns `Some(&AwsRoute)` if an AWS SigV4 route is configured for the
+    /// given prefix, `None` otherwise.
     #[must_use]
-    pub fn get_aws(&self, prefix: &str) -> Option<&()> {
+    pub fn get_aws(&self, prefix: &str) -> Option<&AwsRoute> {
         self.aws_routes.get(prefix)
     }
 
@@ -531,6 +577,10 @@ const KEYRING_SERVICE: &str = nono::keystore::DEFAULT_SERVICE;
 
 const KEYRING_TIMEOUT_HINT: &str = " Set NONO_KEYRING_TIMEOUT_SECS=N (default 120) to wait longer for keychain unlock; 0 disables the timeout.";
 
+/// Redact a credential reference for safe display in warnings.
+///
+/// Delegates to the appropriate URI-specific redaction helper so that
+/// secrets (account names, file paths, field names) are never echoed raw.
 fn redact_credential_ref(key: &str) -> String {
     if nono::keystore::is_op_uri(key) {
         nono::keystore::redact_op_uri(key)
@@ -1092,7 +1142,7 @@ mod tests {
             credentials: HashMap::new(),
             cmd_routes: HashMap::new(),
             oauth2_routes,
-            aws_routes: HashMap::new(),
+            aws_routes: AwsRouteTable::empty(),
         };
 
         assert!(
@@ -1122,7 +1172,7 @@ mod tests {
             credentials: HashMap::new(),
             cmd_routes: HashMap::new(),
             oauth2_routes,
-            aws_routes: HashMap::new(),
+            aws_routes: AwsRouteTable::empty(),
         };
 
         let prefixes = store.loaded_prefixes();

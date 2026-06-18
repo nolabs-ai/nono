@@ -1,6 +1,6 @@
 [package]
 name = "nono-proxy"
-version = "0.63.0"
+version = "0.64.0"
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
@@ -18,7 +18,7 @@ default = ["system-keyring"]
 system-keyring = ["nono/system-keyring"]
 
 [dependencies]
-nono = { version = "0.63.0", path = "../nono", default-features = false }
+nono = { version = "0.64.0", path = "../nono", default-features = false }
 tokio = { workspace = true, features = ["sync", "time"] }
 hyper.workspace = true
 hyper-util.workspace = true

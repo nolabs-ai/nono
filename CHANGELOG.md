@@ -1,5 +1,75 @@
 # Changelog
 
+## [0.64.0] - 2026-06-18
+
+### Bug Fixes
+
+- *(pty)* Ctrl-z hangs when running with a PTY (#1135) ([#1135](https://github.com/always-further/nono/pull/1135))
+
+- Proxy should activate with customCredentials set (#1197) ([#1197](https://github.com/always-further/nono/pull/1197))
+
+- *(cli)* Use XDG config paths consistently (#1179) ([#1179](https://github.com/always-further/nono/pull/1179))
+
+- *(proxy)* Stop allow_domain endpoint route from shadowing credential catch-all (#1132) ([#1132](https://github.com/always-further/nono/pull/1132))
+
+- *(proxy)* Respect upstream_proxy in TLS CONNECT intercept path (#1048) (#1091) ([#1091](https://github.com/always-further/nono/pull/1091))
+
+- *(policy)* Allow go_runtime to readwrite go-build cache (#1173) ([#1173](https://github.com/always-further/nono/pull/1173))
+
+- *(diagnostic)* Replace deprecated nono learn with nono run (#1170) ([#1170](https://github.com/always-further/nono/pull/1170))
+
+- *(proxy)* Return 403 + audit for denied non-CONNECT requests (#1077) ([#1077](https://github.com/always-further/nono/pull/1077))
+
+
+### CI/CD
+
+- Run integration tests on ubuntu runner (#1185) ([#1185](https://github.com/always-further/nono/pull/1185))
+
+
+### Dependencies
+
+- *(deps)* Bump cbindgen from 0.29.3 to 0.29.4 (#1182) ([#1182](https://github.com/always-further/nono/pull/1182))
+
+- *(deps)* Bump which from 8.0.2 to 8.0.3 (#1181) ([#1181](https://github.com/always-further/nono/pull/1181))
+
+- *(deps)* Add 3-day Dependabot cooldown for cargo and github-actions (#1163) ([#1163](https://github.com/always-further/nono/pull/1163))
+
+
+### Documentation
+
+- *(allow-cwd)* Clarify access level is profile-driven (#1180) ([#1180](https://github.com/always-further/nono/pull/1180))
+
+- *(credential-injection)* Fix broken Proxy Overrides anchor (#1177) ([#1177](https://github.com/always-further/nono/pull/1177))
+
+- *(networking)* Lead with the common cases (#1174) ([#1174](https://github.com/always-further/nono/pull/1174))
+
+- *(install)* Add version check and COPR fallback note (#1169) ([#1169](https://github.com/always-further/nono/pull/1169))
+
+- *(quickstart)* Fix profiles link (#1168) ([#1168](https://github.com/always-further/nono/pull/1168))
+
+
+### Features
+
+- *(diagnostics)* Expose structured diagnostics for library and FFI clients (#1171) ([#1171](https://github.com/always-further/nono/pull/1171))
+
+- *(update-check)* Discover ci environments on update (#1113) ([#1113](https://github.com/always-further/nono/pull/1113))
+
+- [aws] implement aws_auth config (#1166) ([#1166](https://github.com/always-further/nono/pull/1166))
+
+- *(output)* Show blocked macos grants in capability summary (#1178) ([#1178](https://github.com/always-further/nono/pull/1178))
+
+
+### Miscellaneous
+
+- Import agents.md inside claude.md (#1153) ([#1153](https://github.com/always-further/nono/pull/1153))
+
+
+### Refactoring
+
+- *(proxy)* Separate proxy intent from activation (#1199) ([#1199](https://github.com/always-further/nono/pull/1199))
+
+- *(audit)* Move attestation logic to core library (#1148) ([#1148](https://github.com/always-further/nono/pull/1148))
+
 ## [0.63.0] - 2026-06-15
 
 ### Bug Fixes

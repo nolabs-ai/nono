@@ -184,11 +184,22 @@ pub fn resolve_credentials(
     service_names: &[String],
     custom_credentials: &HashMap<String, CustomCredentialDef>,
 ) -> Result<Vec<RouteConfig>> {
-    if service_names.is_empty() {
+    // Build the full set of names to resolve: explicitly requested names
+    // (from `credentials`) plus all custom_credentials keys. custom_credentials
+    // entries are always activated — they don't need to be listed in `credentials`.
+    let mut all_names: Vec<String> = custom_credentials.keys().cloned().collect();
+    for name in service_names {
+        if !all_names.contains(name) {
+            all_names.push(name.clone());
+        }
+    }
+
+    if all_names.is_empty() {
         return Ok(Vec::new());
     }
 
-    // Validate all requested services exist in either custom or built-in
+    // Validate all explicitly requested services exist in either custom or built-in.
+    // custom_credentials keys are always valid by definition.
     for name in service_names {
         if !custom_credentials.contains_key(name) && !policy.credentials.contains_key(name) {
             let mut available: Vec<_> = policy.credentials.keys().cloned().collect();
@@ -204,7 +215,7 @@ pub fn resolve_credentials(
 
     let mut routes = Vec::new();
 
-    for name in service_names {
+    for name in &all_names {
         // Custom credentials take precedence over built-in.
         // Note: Custom credentials are already validated at profile load time
         // in profile/mod.rs::validate_profile_custom_credentials(), so we don't

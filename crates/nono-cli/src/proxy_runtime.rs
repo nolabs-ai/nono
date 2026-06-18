@@ -51,8 +51,11 @@ pub(crate) fn prepare_proxy_launch_options(
         bypass
     };
 
+    let has_custom_credentials = !prepared.custom_credentials.is_empty();
+
     let active = if matches!(prepared.caps.network_mode(), nono::NetworkMode::Blocked) {
         if !credentials.is_empty()
+            || has_custom_credentials
             || network_profile.is_some()
             || !allow_domain.is_empty()
             || upstream_proxy.is_some()
@@ -74,6 +77,7 @@ pub(crate) fn prepare_proxy_launch_options(
             prepared.caps.network_mode(),
             nono::NetworkMode::ProxyOnly { .. }
         ) || !credentials.is_empty()
+            || has_custom_credentials
             || network_profile.is_some()
             || !allow_domain.is_empty()
             || upstream_proxy.is_some()

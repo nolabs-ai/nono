@@ -4,9 +4,11 @@
 //! background thread with a 3-second timeout and is throttled to once per 24 hours.
 //!
 //! Each request sends a randomly generated UUID (created on first run and stored
-//! locally), the current nono version, the OS name, and the CPU architecture.
-//! None of these values are derived from hardware identifiers or user accounts.
-//! No personally identifiable information is collected or transmitted.
+//! locally), the current nono version, the OS name, the CPU architecture, and a
+//! coarse CI environment classification. The CI classification is derived only
+//! from well-known environment variable names and never includes raw environment
+//! values. None of these values are derived from hardware identifiers or user
+//! accounts. No personally identifiable information is collected or transmitted.
 //! No IP addresses are logged by the update service.
 //!
 //! To disable the update check, set `NONO_NO_UPDATE_CHECK=1` or add
@@ -62,7 +64,31 @@ struct UpdateCheckRequest {
     version: String,
     platform: String,
     arch: String,
+    ci: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ci_provider: Option<&'static str>,
 }
+
+const CI_PROVIDER_ENV_VARS: &[(&str, &str)] = &[
+    ("GITHUB_ACTIONS", "github_actions"),
+    ("GITLAB_CI", "gitlab_ci"),
+    ("CIRCLECI", "circleci"),
+    ("BUILDKITE", "buildkite"),
+    ("TF_BUILD", "azure_pipelines"),
+    ("TRAVIS", "travis_ci"),
+    ("JENKINS_URL", "jenkins"),
+    ("JENKINS_HOME", "jenkins"),
+    ("BITBUCKET_BUILD_NUMBER", "bitbucket_pipelines"),
+    ("APPVEYOR", "appveyor"),
+    ("TEAMCITY_VERSION", "teamcity"),
+    ("DRONE", "drone"),
+    ("SEMAPHORE", "semaphore"),
+    ("CODESHIP", "codeship"),
+    ("WOODPECKER", "woodpecker"),
+    ("NETLIFY", "netlify"),
+    ("VERCEL", "vercel"),
+    ("RENDER", "render"),
+];
 
 /// Handle for a background update check.
 pub struct UpdateCheckHandle {
@@ -256,13 +282,38 @@ fn is_newer_version(current: &str, latest: &str) -> bool {
     }
 }
 
+fn detect_ci_provider() -> Option<&'static str> {
+    for (env_var, provider) in CI_PROVIDER_ENV_VARS {
+        if env_marker_present(env_var) {
+            return Some(provider);
+        }
+    }
+
+    if env_marker_present("CI") {
+        return Some("generic");
+    }
+
+    None
+}
+
+fn env_marker_present(key: &str) -> bool {
+    std::env::var_os(key).is_some_and(|value| {
+        let value = value.to_string_lossy();
+        let value = value.trim();
+        !value.is_empty() && !value.eq_ignore_ascii_case("false") && value != "0"
+    })
+}
+
 /// Perform the HTTP check against the update service
 fn perform_check(uuid: &str) -> Option<UpdateInfo> {
+    let ci_provider = detect_ci_provider();
     let request = UpdateCheckRequest {
         uuid: uuid.to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         platform: std::env::consts::OS.to_string(),
         arch: std::env::consts::ARCH.to_string(),
+        ci: ci_provider.is_some(),
+        ci_provider,
     };
 
     let body = serde_json::to_string(&request).ok()?;
@@ -379,6 +430,146 @@ mod tests {
         let _env = crate::test_env::EnvVarGuard::set_all(&[("NONO_NO_UPDATE_CHECK", "1")]);
         let handle = start_background_check();
         assert!(handle.is_none());
+    }
+
+    #[test]
+    fn test_detect_ci_environment_github_actions() {
+        let _lock = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let _env = crate::test_env::EnvVarGuard::set_all(&[
+            ("GITHUB_ACTIONS", "true"),
+            ("GITLAB_CI", ""),
+            ("CIRCLECI", ""),
+            ("BUILDKITE", ""),
+            ("TF_BUILD", ""),
+            ("TRAVIS", ""),
+            ("JENKINS_URL", ""),
+            ("JENKINS_HOME", ""),
+            ("BITBUCKET_BUILD_NUMBER", ""),
+            ("APPVEYOR", ""),
+            ("TEAMCITY_VERSION", ""),
+            ("DRONE", ""),
+            ("SEMAPHORE", ""),
+            ("CODESHIP", ""),
+            ("WOODPECKER", ""),
+            ("NETLIFY", ""),
+            ("VERCEL", ""),
+            ("RENDER", ""),
+            ("CI", ""),
+        ]);
+
+        assert_eq!(detect_ci_provider(), Some("github_actions"));
+    }
+
+    #[test]
+    fn test_detect_ci_environment_generic_ci() {
+        let _lock = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let _env = crate::test_env::EnvVarGuard::set_all(&[
+            ("GITHUB_ACTIONS", ""),
+            ("GITLAB_CI", ""),
+            ("CIRCLECI", ""),
+            ("BUILDKITE", ""),
+            ("TF_BUILD", ""),
+            ("TRAVIS", ""),
+            ("JENKINS_URL", ""),
+            ("JENKINS_HOME", ""),
+            ("BITBUCKET_BUILD_NUMBER", ""),
+            ("APPVEYOR", ""),
+            ("TEAMCITY_VERSION", ""),
+            ("DRONE", ""),
+            ("SEMAPHORE", ""),
+            ("CODESHIP", ""),
+            ("WOODPECKER", ""),
+            ("NETLIFY", ""),
+            ("VERCEL", ""),
+            ("RENDER", ""),
+            ("CI", "true"),
+        ]);
+
+        assert_eq!(detect_ci_provider(), Some("generic"));
+    }
+
+    #[test]
+    fn test_detect_ci_environment_falsey_markers_are_ignored() {
+        let _lock = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let _env = crate::test_env::EnvVarGuard::set_all(&[
+            ("GITHUB_ACTIONS", "false"),
+            ("GITLAB_CI", "0"),
+            ("CIRCLECI", ""),
+            ("BUILDKITE", ""),
+            ("TF_BUILD", ""),
+            ("TRAVIS", ""),
+            ("JENKINS_URL", ""),
+            ("JENKINS_HOME", ""),
+            ("BITBUCKET_BUILD_NUMBER", ""),
+            ("APPVEYOR", ""),
+            ("TEAMCITY_VERSION", ""),
+            ("DRONE", ""),
+            ("SEMAPHORE", ""),
+            ("CODESHIP", ""),
+            ("WOODPECKER", ""),
+            ("NETLIFY", ""),
+            ("VERCEL", ""),
+            ("RENDER", ""),
+            ("CI", "0"),
+        ]);
+
+        assert_eq!(detect_ci_provider(), None);
+    }
+
+    #[test]
+    fn test_detect_ci_environment_no_ci() {
+        let _lock = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let _env = crate::test_env::EnvVarGuard::set_all(&[
+            ("GITHUB_ACTIONS", ""),
+            ("GITLAB_CI", ""),
+            ("CIRCLECI", ""),
+            ("BUILDKITE", ""),
+            ("TF_BUILD", ""),
+            ("TRAVIS", ""),
+            ("JENKINS_URL", ""),
+            ("JENKINS_HOME", ""),
+            ("BITBUCKET_BUILD_NUMBER", ""),
+            ("APPVEYOR", ""),
+            ("TEAMCITY_VERSION", ""),
+            ("DRONE", ""),
+            ("SEMAPHORE", ""),
+            ("CODESHIP", ""),
+            ("WOODPECKER", ""),
+            ("NETLIFY", ""),
+            ("VERCEL", ""),
+            ("RENDER", ""),
+            ("CI", ""),
+        ]);
+
+        assert_eq!(detect_ci_provider(), None);
+    }
+
+    #[test]
+    fn test_update_request_serializes_ci_context() {
+        let request = UpdateCheckRequest {
+            uuid: "test-uuid".to_string(),
+            version: "1.2.3".to_string(),
+            platform: "linux".to_string(),
+            arch: "x86_64".to_string(),
+            ci: true,
+            ci_provider: Some("github_actions"),
+        };
+
+        let json = serde_json::to_value(&request).expect("serialize");
+        assert_eq!(json["ci"], true);
+        assert_eq!(json["ci_provider"], "github_actions");
     }
 
     #[test]

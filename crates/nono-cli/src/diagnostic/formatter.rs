@@ -18,6 +18,7 @@
 //! - **Actionable**: Provides specific flags to grant additional access
 //! - **Mode-aware**: Different guidance for supervised vs standard mode
 
+use globset::{Glob, GlobSetBuilder};
 use nono::SessionDiagnosticReport;
 use nono::diagnostic::{
     DenialReason, DenialRecord, IpcDenialRecord, NonoDiagnostic, NonoDiagnosticCode,
@@ -630,6 +631,16 @@ pub struct DiagnosticFormatter<'a> {
     /// Non-filesystem sandbox operations suppressed from the diagnostic footer.
     /// The sandbox still denies these operations; this only controls reporting.
     suppressed_system_service_operations: &'a [String],
+    /// Path globs of Unix sockets suppressed from the IPC-denial footer. A
+    /// blocked Unix-socket denial whose target matches one of these globs is
+    /// omitted from both the "Unix socket operation(s) blocked" and the
+    /// "pathname Unix socket(s) blocked" reports. The sandbox still denies
+    /// these sockets; this only controls reporting noise (e.g. silencing the
+    /// known-benign tmux control socket or glibc's nscd probe). Matching is
+    /// performed against the raw target string exactly as it appears in the
+    /// denial record — the target is never canonicalized, so non-existent
+    /// sockets (reported as "could not be canonicalized") still match.
+    suppressed_unix_socket_globs: &'a [String],
     /// Canonicalized forms of the denied paths, parallel to `denials`. When
     /// provided, used in place of on-demand `try_canonicalize` calls inside the
     /// render loop so filesystem I/O is done once (by the caller, after the
@@ -662,6 +673,7 @@ impl<'a> DiagnosticFormatter<'a> {
             policy_explanations: Vec::new(),
             suppressed_paths: &[],
             suppressed_system_service_operations: &[],
+            suppressed_unix_socket_globs: &[],
             canonical_denial_paths: Vec::new(),
             session_diagnostics: &[],
         }
@@ -692,6 +704,21 @@ impl<'a> DiagnosticFormatter<'a> {
     #[must_use]
     pub fn with_suppressed_system_service_operations(mut self, operations: &'a [String]) -> Self {
         self.suppressed_system_service_operations = operations;
+        self
+    }
+
+    /// Set path globs of Unix sockets to hide from the IPC-denial footer.
+    ///
+    /// Each blocked Unix-socket denial whose target matches one of `globs` is
+    /// omitted from the diagnostic footer. The sandbox still denies these
+    /// sockets; this only suppresses reporting noise. Globs support `*`
+    /// wildcards (e.g. `/tmp/tmux-*/default`) and exact paths
+    /// (e.g. `/var/run/nscd/socket`). Matching uses the raw target string as
+    /// printed — the path is never canonicalized — so sockets that do not
+    /// exist on disk still match.
+    #[must_use]
+    pub fn with_suppressed_unix_sockets(mut self, globs: &'a [String]) -> Self {
+        self.suppressed_unix_socket_globs = globs;
         self
     }
 
@@ -1225,7 +1252,7 @@ impl<'a> DiagnosticFormatter<'a> {
         lines.push("[nono]".to_string());
 
         if !ipc_diagnostics.is_empty() {
-            self.format_ipc_denial_guidance(&mut lines, &ipc_diagnostics, diagnostics);
+            self.format_ipc_denial_guidance(&mut lines, &ipc_diagnostics);
             if has_path_findings || !system_service_diagnostics.is_empty() {
                 lines.push("[nono]".to_string());
             }
@@ -1603,8 +1630,7 @@ impl<'a> DiagnosticFormatter<'a> {
                     lines.push(format!("[nono]   {}", path.display()));
                 }
             }
-            let flags = self
-                .fix_flags_for_codes(diagnostics, &[NonoDiagnosticCode::SandboxDeniedUnixSocket]);
+            let flags = self.fix_flags_for_diagnostic_refs(pathname_unix_diagnostics);
             if !flags.is_empty() {
                 lines.push(format!("[nono] Fix flags: {}", flags.join(" ")));
             }
@@ -1688,7 +1714,6 @@ impl<'a> DiagnosticFormatter<'a> {
         &self,
         lines: &mut Vec<String>,
         ipc_diagnostics: &[&NonoDiagnostic],
-        diagnostics: &[NonoDiagnostic],
     ) {
         const MAX_INLINE_LIST: usize = 10;
 
@@ -1713,11 +1738,62 @@ impl<'a> DiagnosticFormatter<'a> {
             }
         }
 
-        let flags =
-            self.fix_flags_for_codes(diagnostics, &[NonoDiagnosticCode::SandboxDeniedUnixSocket]);
+        let flags = self.fix_flags_for_diagnostic_refs(ipc_diagnostics);
         if !flags.is_empty() {
             lines.push(format!("[nono] Fix flags: {}", flags.join(" ")));
         }
+    }
+
+    /// Return true when `target` matches one of the configured
+    /// `diagnostics.suppress_unix_sockets` globs.
+    ///
+    /// Matching is performed against the target string as reported in the
+    /// diagnostic. Invalid glob entries are ignored so one malformed
+    /// suppression cannot hide unrelated denials.
+    fn unix_socket_target_suppressed(&self, target: &str) -> bool {
+        if self.suppressed_unix_socket_globs.is_empty() {
+            return false;
+        }
+
+        let mut builder = GlobSetBuilder::new();
+        let mut any = false;
+        for pattern in self.suppressed_unix_socket_globs {
+            if let Ok(glob) = Glob::new(pattern) {
+                builder.add(glob);
+                any = true;
+            }
+        }
+        if !any {
+            return false;
+        }
+
+        match builder.build() {
+            Ok(set) => set.is_match(target),
+            Err(_) => false,
+        }
+    }
+
+    fn unix_socket_diagnostic_suppressed(&self, diagnostic: &NonoDiagnostic) -> bool {
+        if self.suppressed_unix_socket_globs.is_empty() {
+            return false;
+        }
+
+        if let Some(NonoDiagnosticDetail::IpcDenial { target, .. }) = &diagnostic.detail
+            && self.unix_socket_target_suppressed(target)
+        {
+            return true;
+        }
+
+        if let Some(NonoDiagnosticDetail::SupervisedDenial {
+            reason: DenialReason::UnixSocketDenied,
+        }) = &diagnostic.detail
+            && let Some(path) = &diagnostic.path
+            && self.unix_socket_target_suppressed(&path.to_string_lossy())
+        {
+            return true;
+        }
+
+        false
     }
 
     fn ipc_diagnostics<'diag>(
@@ -1730,7 +1806,7 @@ impl<'a> DiagnosticFormatter<'a> {
                 matches!(
                     diagnostic.detail,
                     Some(NonoDiagnosticDetail::IpcDenial { .. })
-                )
+                ) && !self.unix_socket_diagnostic_suppressed(diagnostic)
             })
             .collect()
     }
@@ -1748,7 +1824,7 @@ impl<'a> DiagnosticFormatter<'a> {
                         reason: DenialReason::UnixSocketDenied,
                         ..
                     })
-                )
+                ) && !self.unix_socket_diagnostic_suppressed(diagnostic)
             })
             .collect()
     }
@@ -1851,6 +1927,28 @@ impl<'a> DiagnosticFormatter<'a> {
             if !codes.contains(&diagnostic.code) {
                 continue;
             }
+            if diagnostic.code == NonoDiagnosticCode::SandboxDeniedPath
+                && let Some(path) = &diagnostic.path
+                && self.is_path_policy_blocked(path)
+            {
+                continue;
+            }
+            let Some(ref remediation) = diagnostic.remediation else {
+                continue;
+            };
+            let Some(flag) = crate::query_ext::suggested_flag_for_remediation(remediation) else {
+                continue;
+            };
+            if !flags.iter().any(|existing| existing == &flag) {
+                flags.push(flag);
+            }
+        }
+        flags
+    }
+
+    fn fix_flags_for_diagnostic_refs(&self, diagnostics: &[&NonoDiagnostic]) -> Vec<String> {
+        let mut flags = Vec::new();
+        for diagnostic in diagnostics {
             if diagnostic.code == NonoDiagnosticCode::SandboxDeniedPath
                 && let Some(path) = &diagnostic.path
                 && self.is_path_policy_blocked(path)
@@ -3591,6 +3689,154 @@ mod tests {
         assert!(output.contains("Fix flags: --allow-unix-socket /run/user/1000/bus"));
         assert!(!output.contains("No path denials were observed"));
         assert!(!output.contains("--read /run/user/1000/bus"));
+    }
+
+    #[test]
+    fn test_suppress_unix_sockets_hides_matched_ipc_denials() {
+        let caps = make_test_caps();
+        // Two known-benign sockets (tmux control socket, nscd probe) plus one
+        // unrelated socket that must remain visible.
+        let ipc_denials = vec![
+            IpcDenialRecord {
+                target: "/tmp/tmux-1000/default".to_string(),
+                operation: "connect".to_string(),
+                reason: "denied by policy".to_string(),
+                remediation: None,
+                suggested_flag: None,
+            },
+            IpcDenialRecord {
+                // Reported as un-canonicalizable because the socket doesn't
+                // exist; matching must use the raw target verbatim.
+                target: "/var/run/nscd/socket".to_string(),
+                operation: "connect".to_string(),
+                reason: "target could not be canonicalized".to_string(),
+                remediation: None,
+                suggested_flag: None,
+            },
+            IpcDenialRecord {
+                target: "/run/other.sock".to_string(),
+                operation: "connect".to_string(),
+                reason: "denied by policy".to_string(),
+                remediation: None,
+                suggested_flag: None,
+            },
+        ];
+        let globs = vec![
+            "/tmp/tmux-*/default".to_string(),
+            "/var/run/nscd/socket".to_string(),
+        ];
+        let formatter = DiagnosticFormatter::new(&caps)
+            .with_mode(DiagnosticMode::Supervised)
+            .with_ipc_denials(&ipc_denials)
+            .with_suppressed_unix_sockets(&globs);
+        let output = formatter.format_footer(1);
+
+        // The two matched sockets are hidden, the unrelated one remains.
+        assert!(!output.contains("/tmp/tmux-1000/default"));
+        assert!(!output.contains("/var/run/nscd/socket"));
+        assert!(output.contains("/run/other.sock"));
+        // Header reflects only the single surviving denial.
+        assert!(output.contains("IPC denial: 1 Unix socket operation blocked."));
+    }
+
+    #[test]
+    fn test_suppress_unix_sockets_all_suppressed_omits_ipc_section() {
+        let caps = make_test_caps();
+        let ipc_denials = vec![
+            IpcDenialRecord {
+                target: "/tmp/tmux-1000/default".to_string(),
+                operation: "connect".to_string(),
+                reason: "denied by policy".to_string(),
+                remediation: None,
+                suggested_flag: None,
+            },
+            IpcDenialRecord {
+                target: "/var/run/nscd/socket".to_string(),
+                operation: "connect".to_string(),
+                reason: "target could not be canonicalized".to_string(),
+                remediation: None,
+                suggested_flag: None,
+            },
+        ];
+        let globs = vec![
+            "/tmp/tmux-*/default".to_string(),
+            "/var/run/nscd/socket".to_string(),
+        ];
+        let formatter = DiagnosticFormatter::new(&caps)
+            .with_mode(DiagnosticMode::Supervised)
+            .with_ipc_denials(&ipc_denials)
+            .with_suppressed_unix_sockets(&globs);
+        let output = formatter.format_footer(1);
+
+        // No header, no inline entries, no Fix-flags line for IPC denials.
+        assert!(!output.contains("IPC denial:"));
+        assert!(!output.contains("/tmp/tmux-1000/default"));
+        assert!(!output.contains("/var/run/nscd/socket"));
+        // The footer should behave as if there were no IPC denials at all.
+        assert!(output.contains("No path denials were observed during this session."));
+    }
+
+    #[test]
+    fn test_suppress_unix_sockets_empty_globs_is_byte_identical() {
+        let caps = make_test_caps();
+        let ipc_denials = vec![
+            IpcDenialRecord {
+                target: "/tmp/tmux-1000/default".to_string(),
+                operation: "connect".to_string(),
+                reason: "denied by policy".to_string(),
+                remediation: None,
+                suggested_flag: None,
+            },
+            IpcDenialRecord {
+                target: "/run/other.sock".to_string(),
+                operation: "connect".to_string(),
+                reason: "denied by policy".to_string(),
+                remediation: None,
+                suggested_flag: None,
+            },
+        ];
+        // Baseline: no suppression configured at all.
+        let baseline = DiagnosticFormatter::new(&caps)
+            .with_mode(DiagnosticMode::Supervised)
+            .with_ipc_denials(&ipc_denials)
+            .format_footer(1);
+        // An explicit empty glob list must produce identical output.
+        let empty: Vec<String> = Vec::new();
+        let with_empty = DiagnosticFormatter::new(&caps)
+            .with_mode(DiagnosticMode::Supervised)
+            .with_ipc_denials(&ipc_denials)
+            .with_suppressed_unix_sockets(&empty)
+            .format_footer(1);
+        assert_eq!(baseline, with_empty);
+    }
+
+    #[test]
+    fn test_suppress_unix_sockets_hides_matched_pathname_socket_denials() {
+        let caps = make_test_caps();
+        // Pathname Unix-socket denials flow through DenialRecord, not
+        // IpcDenialRecord, and are matched against `denial.path`.
+        let denials = vec![
+            DenialRecord {
+                path: PathBuf::from("/tmp/tmux-1000/default"),
+                access: AccessMode::Read,
+                reason: DenialReason::UnixSocketDenied,
+            },
+            DenialRecord {
+                path: PathBuf::from("/run/user/1000/bus"),
+                access: AccessMode::Read,
+                reason: DenialReason::UnixSocketDenied,
+            },
+        ];
+        let globs = vec!["/tmp/tmux-*/default".to_string()];
+        let formatter = DiagnosticFormatter::new(&caps)
+            .with_mode(DiagnosticMode::Supervised)
+            .with_denials(&denials)
+            .with_suppressed_unix_sockets(&globs);
+        let output = formatter.format_footer(1);
+
+        assert!(!output.contains("/tmp/tmux-1000/default"));
+        assert!(output.contains("/run/user/1000/bus"));
+        assert!(output.contains("IPC denial: 1 pathname Unix socket blocked."));
     }
 
     #[test]

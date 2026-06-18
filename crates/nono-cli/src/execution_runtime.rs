@@ -563,6 +563,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
             .or(recommended_profile),
         ignored_denial_paths: &flags.ignored_denial_paths,
         suppressed_system_service_operations: &flags.suppressed_system_service_operations,
+        suppressed_unix_socket_globs: &flags.suppressed_unix_socket_globs,
         startup_timeout: flags
             .startup_timeout_secs
             .filter(|&secs| secs > 0)

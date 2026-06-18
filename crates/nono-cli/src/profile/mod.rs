@@ -1779,6 +1779,19 @@ pub struct DiagnosticsConfig {
     /// `forbidden-exec-sugid`, from post-run output.
     #[serde(default)]
     pub suppress_system_services: Vec<String>,
+
+    /// Path globs of Unix sockets to hide from the IPC-denial footer.
+    ///
+    /// This does not grant access and does not change sandbox enforcement: the
+    /// listed sockets remain denied. It only suppresses reporting noise for
+    /// known-benign, intentionally-denied sockets (e.g. `/tmp/tmux-*/default`
+    /// for the deliberately-blocked tmux control socket, or
+    /// `/var/run/nscd/socket` for glibc's name-cache probe). Each entry is a
+    /// glob matched against the raw Unix-socket target string exactly as it
+    /// appears in the denial — the target is never canonicalized, so sockets
+    /// that do not exist on disk still match.
+    #[serde(default)]
+    pub suppress_unix_sockets: Vec<String>,
 }
 
 /// Linux-specific profile controls.
@@ -3179,6 +3192,10 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
             suppress_system_services: dedup_append(
                 &base.diagnostics.suppress_system_services,
                 &child.diagnostics.suppress_system_services,
+            ),
+            suppress_unix_sockets: dedup_append(
+                &base.diagnostics.suppress_unix_sockets,
+                &child.diagnostics.suppress_unix_sockets,
             ),
         },
         env_credentials: SecretsConfig {
@@ -5488,6 +5505,30 @@ mod tests {
         assert_eq!(
             profile.linux.af_unix_mediation,
             Some(LinuxAfUnixMediation::Pathname)
+        );
+    }
+
+    #[test]
+    fn test_merge_profiles_appends_and_dedups_suppress_unix_sockets() {
+        let mut base = base_profile();
+        base.diagnostics.suppress_unix_sockets = vec![
+            "/var/run/nscd/socket".to_string(),
+            "/tmp/tmux-*/default".to_string(),
+        ];
+        let mut child = child_profile();
+        child.diagnostics.suppress_unix_sockets = vec![
+            // Duplicate of a base entry — must be deduplicated.
+            "/tmp/tmux-*/default".to_string(),
+            "/run/extra.sock".to_string(),
+        ];
+        let merged = merge_profiles(base, child);
+        assert_eq!(
+            merged.diagnostics.suppress_unix_sockets,
+            vec![
+                "/var/run/nscd/socket".to_string(),
+                "/tmp/tmux-*/default".to_string(),
+                "/run/extra.sock".to_string(),
+            ]
         );
     }
 

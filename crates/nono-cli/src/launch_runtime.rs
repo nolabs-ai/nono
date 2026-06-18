@@ -177,6 +177,9 @@ pub(crate) struct ExecutionFlags {
     pub(crate) ignored_denial_paths: Vec<PathBuf>,
     pub(crate) suppressed_system_service_operations: Vec<String>,
     pub(crate) profile_display_name: Option<String>,
+    /// Path globs of Unix sockets to hide from the IPC-denial footer
+    /// (`diagnostics.suppress_unix_sockets`). Reporting-only.
+    pub(crate) suppressed_unix_socket_globs: Vec<String>,
     pub(crate) session: SessionLaunchOptions,
     pub(crate) rollback: RollbackLaunchOptions,
     pub(crate) trust: TrustLaunchOptions,
@@ -210,6 +213,7 @@ impl ExecutionFlags {
             ignored_denial_paths: Vec::new(),
             suppressed_system_service_operations: Vec::new(),
             profile_display_name: None,
+            suppressed_unix_socket_globs: Vec::new(),
             session: SessionLaunchOptions::default(),
             rollback: RollbackLaunchOptions::default(),
             trust: TrustLaunchOptions {
@@ -355,6 +359,7 @@ pub(crate) fn prepare_run_launch_plan(
             ignored_denial_paths: prepared.ignored_denial_paths,
             suppressed_system_service_operations: prepared.suppressed_system_service_operations,
             profile_display_name: prepared.profile_display_name,
+            suppressed_unix_socket_globs: prepared.suppressed_unix_socket_globs,
             session: SessionLaunchOptions {
                 session_id: Some(session_id),
                 detached_start: run_args.detached,

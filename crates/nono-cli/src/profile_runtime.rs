@@ -31,6 +31,10 @@ pub(crate) struct PreparedProfile {
     pub(crate) bypass_protection_paths: Vec<PathBuf>,
     pub(crate) ignored_denial_paths: Vec<PathBuf>,
     pub(crate) suppressed_system_service_operations: Vec<String>,
+    /// Path globs of Unix sockets to hide from the IPC-denial footer. From the
+    /// profile's `diagnostics.suppress_unix_sockets`. Reporting-only: the
+    /// sandbox still denies these sockets.
+    pub(crate) suppressed_unix_socket_globs: Vec<String>,
     pub(crate) allowed_env_vars: Option<Vec<String>>,
     pub(crate) denied_env_vars: Option<Vec<String>>,
     /// Expanded `environment.set_vars` entries (key, expanded-value). `None`
@@ -678,6 +682,10 @@ fn prepare_profile_with_options(
         suppressed_system_service_operations: loaded_profile
             .as_ref()
             .map(|profile| profile.diagnostics.suppress_system_services.clone())
+            .unwrap_or_default(),
+        suppressed_unix_socket_globs: loaded_profile
+            .as_ref()
+            .map(|profile| profile.diagnostics.suppress_unix_sockets.clone())
             .unwrap_or_default(),
         allowed_env_vars: loaded_profile.as_ref().and_then(|profile| {
             profile.environment.as_ref().map(|env_config| {

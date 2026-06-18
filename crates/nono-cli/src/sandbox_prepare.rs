@@ -443,6 +443,9 @@ pub(crate) struct PreparedSandbox {
     pub(crate) bypass_protection_paths: Vec<PathBuf>,
     pub(crate) ignored_denial_paths: Vec<PathBuf>,
     pub(crate) suppressed_system_service_operations: Vec<String>,
+    /// Path globs of Unix sockets to hide from the IPC-denial footer
+    /// (`diagnostics.suppress_unix_sockets`). Reporting-only.
+    pub(crate) suppressed_unix_socket_globs: Vec<String>,
     pub(crate) allowed_env_vars: Option<Vec<String>>,
     pub(crate) denied_env_vars: Option<Vec<String>>,
     /// Expanded `environment.set_vars` (key, expanded-value), `None` if absent.
@@ -1083,6 +1086,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
                 bypass_protection_paths: Vec::new(),
                 ignored_denial_paths: Vec::new(),
                 suppressed_system_service_operations: Vec::new(),
+                suppressed_unix_socket_globs: Vec::new(),
                 allowed_env_vars: None,
                 denied_env_vars: None,
                 set_vars: None,
@@ -1122,6 +1126,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         bypass_protection_paths,
         ignored_denial_paths,
         suppressed_system_service_operations,
+        suppressed_unix_socket_globs,
         allowed_env_vars: profile_allowed_env_vars,
         denied_env_vars: profile_denied_env_vars,
         set_vars: profile_set_vars,
@@ -1415,6 +1420,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
             bypass_protection_paths,
             ignored_denial_paths,
             suppressed_system_service_operations,
+            suppressed_unix_socket_globs,
             allowed_env_vars: profile_allowed_env_vars,
             denied_env_vars: profile_denied_env_vars,
             set_vars: profile_set_vars,

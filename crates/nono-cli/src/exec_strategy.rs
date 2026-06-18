@@ -228,6 +228,9 @@ pub struct ExecConfig<'a> {
     pub ignored_denial_paths: &'a [std::path::PathBuf],
     /// Non-filesystem sandbox operations suppressed from diagnostic footers.
     pub suppressed_system_service_operations: &'a [String],
+    /// Path globs of Unix sockets suppressed from the IPC-denial footer
+    /// (`diagnostics.suppress_unix_sockets`). Reporting-only.
+    pub suppressed_unix_socket_globs: &'a [String],
     /// Optional startup timeout for known interactive CLIs that were launched
     /// without their recommended built-in profile.
     pub startup_timeout: Option<StartupTimeoutConfig<'a>>,
@@ -1600,6 +1603,7 @@ pub fn execute_supervised(
                     .with_suppressed_system_service_operations(
                         config.suppressed_system_service_operations,
                     )
+                    .with_suppressed_unix_sockets(config.suppressed_unix_socket_globs)
                     .with_canonical_denial_paths(canonical_denial_paths);
                 if let Some(program) = config.command.first() {
                     base_formatter =

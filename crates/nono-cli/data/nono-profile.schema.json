@@ -1551,6 +1551,11 @@
           "type": "array",
           "items": { "type": "string" },
           "description": "Non-filesystem sandbox operation names to hide from diagnostic footers, such as forbidden-exec-sugid."
+        },
+        "suppress_unix_sockets": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Path globs (e.g. /tmp/tmux-*/default or /var/run/nscd/socket) of Unix sockets to hide from the IPC denial footer. Matched against the raw denial target verbatim (never canonicalized), so non-existent sockets still match. Sockets remain denied by the sandbox; this controls reporting only."
         }
       }
     },

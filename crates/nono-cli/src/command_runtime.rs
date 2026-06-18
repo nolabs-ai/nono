@@ -188,7 +188,7 @@ pub(crate) fn run_shell(args: ShellArgs, silent: bool) -> Result<()> {
     let proxy = prepare_proxy_launch_options(&args.sandbox, &prepared, silent)?;
     let strategy = select_exec_strategy(
         false,
-        proxy.active,
+        proxy.is_active(),
         prepared.capability_elevation,
         false,
         false,

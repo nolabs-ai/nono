@@ -182,15 +182,27 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
     if let Some(profile) = recommended_profile {
         output::print_profile_hint(recommended_program_name, profile, flags.silent);
     }
-    let allowed_domain_strs: Vec<String> = flags
+    let plain_domain_entries = flags
         .proxy
-        .allow_domain
+        .domain_filter
+        .as_ref()
+        .map(|d| d.allow_domain.as_slice())
+        .unwrap_or(&[]);
+    let endpoint_domain_entries = flags
+        .proxy
+        .endpoint_filter
+        .as_ref()
+        .map(|e| e.routes.as_slice())
+        .unwrap_or(&[]);
+    let all_domain_entries: Vec<_> = plain_domain_entries
+        .iter()
+        .chain(endpoint_domain_entries.iter())
+        .collect();
+    let allowed_domain_strs: Vec<String> = all_domain_entries
         .iter()
         .map(|e| e.domain().to_string())
         .collect();
-    let domain_endpoints: Vec<sandbox_state::DomainEndpointState> = flags
-        .proxy
-        .allow_domain
+    let domain_endpoints: Vec<sandbox_state::DomainEndpointState> = all_domain_entries
         .iter()
         .filter_map(|e| match e {
             crate::profile::AllowDomainEntry::WithEndpoints { domain, endpoints }
@@ -231,7 +243,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
     let strategy = flags.strategy;
 
     if matches!(strategy, exec_strategy::ExecStrategy::Supervised) {
-        output::print_supervised_info(flags.silent, rollback.requested, proxy.active);
+        output::print_supervised_info(flags.silent, rollback.requested, proxy.is_active());
     }
 
     let active_proxy = start_proxy_runtime(proxy, &mut caps)?;
@@ -307,7 +319,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
 
     let threading = select_threading_context(
         !loaded_secrets.is_empty(),
-        proxy.active,
+        proxy.is_active(),
         trust.scan_performed,
         trust.interception_active,
     );

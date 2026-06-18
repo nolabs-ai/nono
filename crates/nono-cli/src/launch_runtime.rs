@@ -70,30 +70,80 @@ pub(crate) struct TrustLaunchOptions {
     pub(crate) protected_paths: Vec<PathBuf>,
 }
 
+/// Plain CONNECT-tunnel domain allowlist entries and an optional network profile.
 #[derive(Clone, Default)]
-pub(crate) struct ProxyLaunchOptions {
-    pub(crate) active: bool,
+pub(crate) struct DomainFilterIntent {
     pub(crate) network_profile: Option<String>,
+    /// Only `AllowDomainEntry::Plain` entries — endpoint-bearing entries live in
+    /// `EndpointFilterIntent`.
     pub(crate) allow_domain: Vec<profile::AllowDomainEntry>,
     pub(crate) reject_domain: Vec<String>,
+}
+
+/// `WithEndpoints` allow-domain entries that require TLS interception so the
+/// proxy can inspect method and path before forwarding.
+/// All entries must be `AllowDomainEntry::WithEndpoints` (enforced by `debug_assert`
+/// at construction in `prepare_proxy_launch_options`).
+#[derive(Clone, Default)]
+pub(crate) struct EndpointFilterIntent {
+    pub(crate) routes: Vec<profile::AllowDomainEntry>,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct CredentialProxyIntent {
     pub(crate) credentials: Vec<String>,
     pub(crate) custom_credentials: HashMap<String, profile::CustomCredentialDef>,
-    pub(crate) upstream_proxy: Option<String>,
-    pub(crate) upstream_bypass: Vec<String>,
-    pub(crate) allow_bind_ports: Vec<u16>,
-    pub(crate) proxy_port: Option<u16>,
-    pub(crate) open_url_origins: Vec<String>,
-    pub(crate) open_url_allow_localhost: bool,
-    pub(crate) allow_launch_services_active: bool,
+}
+
+#[derive(Clone)]
+pub(crate) struct UpstreamProxyIntent {
+    pub(crate) address: String,
+    pub(crate) bypass: Vec<String>,
+}
+
+/// TLS interception configuration supplied by the user. Presence means the user
+/// configured TLS intercept settings; it does not by itself activate the proxy.
+#[derive(Clone, Default)]
+pub(crate) struct TlsInterceptIntent {
+    /// macOS only: reuse a persistent CA bundle across sessions.
     #[cfg(target_os = "macos")]
     pub(crate) trust_proxy_ca: bool,
-    pub(crate) proxy_ca_validity: Option<std::time::Duration>,
+    pub(crate) ca_validity: Option<std::time::Duration>,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct OpenUrlIntent {
+    pub(crate) origins: Vec<String>,
+    pub(crate) allow_localhost: bool,
+    pub(crate) allow_launch_services: bool,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct ProxyLaunchOptions {
+    pub(crate) domain_filter: Option<DomainFilterIntent>,
+    pub(crate) endpoint_filter: Option<EndpointFilterIntent>,
+    pub(crate) credentials: Option<CredentialProxyIntent>,
+    pub(crate) upstream_proxy: Option<UpstreamProxyIntent>,
+    pub(crate) tls_intercept: Option<TlsInterceptIntent>,
+    pub(crate) open_url: Option<OpenUrlIntent>,
+    pub(crate) allow_bind_ports: Vec<u16>,
+    pub(crate) proxy_port: Option<u16>,
     pub(crate) network_approval_mode: crate::network_approval::NetworkApprovalMode,
     pub(crate) network_approval_timeout_secs: u64,
+    pub(crate) profile_name: Option<String>,
     /// True when the user requested `network.block` or `--block-net`.
     /// Propagated to `ProxyConfig.strict_filter` so the filter denies
     /// unlisted hosts instead of falling back to allow-all.
     pub(crate) network_block: bool,
+}
+
+impl ProxyLaunchOptions {
+    pub(crate) fn is_active(&self) -> bool {
+        self.domain_filter.is_some()
+            || self.endpoint_filter.is_some()
+            || self.credentials.is_some()
+            || self.upstream_proxy.is_some()
+    }
 }
 
 #[derive(Clone)]
@@ -245,7 +295,7 @@ pub(crate) fn prepare_run_launch_plan(
 
     let strategy = select_exec_strategy(
         rollback,
-        proxy.active,
+        proxy.is_active(),
         prepared.capability_elevation,
         trust.interception_active,
         run_args.detached,

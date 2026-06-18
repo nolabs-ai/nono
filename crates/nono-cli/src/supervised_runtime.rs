@@ -229,12 +229,24 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
         session_id: &supervisor_session_id,
         attach_initial_client: !session.detached_start,
         detach_sequence: session.detach_sequence.as_deref(),
-        open_url_origins: &proxy.open_url_origins,
-        open_url_allow_localhost: proxy.open_url_allow_localhost,
+        open_url_origins: proxy
+            .open_url
+            .as_ref()
+            .map(|o| o.origins.as_slice())
+            .unwrap_or(&[]),
+        open_url_allow_localhost: proxy
+            .open_url
+            .as_ref()
+            .map(|o| o.allow_localhost)
+            .unwrap_or(false),
         audit_recorder: audit_recorder.as_ref(),
         network_audit_events: supervisor_network_audit_events.as_ref(),
         redaction_policy,
-        allow_launch_services_active: proxy.allow_launch_services_active,
+        allow_launch_services_active: proxy
+            .open_url
+            .as_ref()
+            .map(|o| o.allow_launch_services)
+            .unwrap_or(false),
         #[cfg(target_os = "linux")]
         proxy_port: match caps.network_mode() {
             nono::NetworkMode::ProxyOnly { port, .. } => *port,

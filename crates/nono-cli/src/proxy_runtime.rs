@@ -1,7 +1,10 @@
 use std::time::Duration;
 
 use crate::cli::SandboxArgs;
-use crate::launch_runtime::ProxyLaunchOptions;
+use crate::launch_runtime::{
+    CredentialProxyIntent, DomainFilterIntent, EndpointFilterIntent, OpenUrlIntent,
+    ProxyLaunchOptions, TlsInterceptIntent, UpstreamProxyIntent,
+};
 use crate::network_approval::{NetworkApprovalBackend, NetworkApprovalMode};
 use crate::network_policy;
 use crate::sandbox_prepare::{PreparedSandbox, validate_external_proxy_bypass};
@@ -39,7 +42,7 @@ pub(crate) fn prepare_proxy_launch_options(
     let credentials = effective_proxy.credentials;
     let allow_bind_ports = merge_dedup_ports(&prepared.listen_ports, &args.allow_bind);
 
-    let upstream_proxy = if args.allow_net {
+    let upstream_proxy_addr = if args.allow_net {
         None
     } else {
         args.external_proxy
@@ -58,14 +61,12 @@ pub(crate) fn prepare_proxy_launch_options(
     };
 
     let has_custom_credentials = !prepared.custom_credentials.is_empty();
+    let has_domain_filter = network_profile.is_some() || !allow_domain.is_empty();
+    let has_credentials = !credentials.is_empty() || has_custom_credentials;
+    let would_activate = has_domain_filter || has_credentials || upstream_proxy_addr.is_some();
 
-    let active = if matches!(prepared.caps.network_mode(), nono::NetworkMode::Blocked) {
-        if !credentials.is_empty()
-            || has_custom_credentials
-            || network_profile.is_some()
-            || !allow_domain.is_empty()
-            || upstream_proxy.is_some()
-        {
+    if matches!(prepared.caps.network_mode(), nono::NetworkMode::Blocked) {
+        if would_activate {
             warn!(
                 "--block-net is active; ignoring proxy configuration \
                  that would re-enable network access"
@@ -77,46 +78,129 @@ pub(crate) fn prepare_proxy_launch_options(
                 );
             }
         }
-        false
+        return Ok(ProxyLaunchOptions {
+            allow_bind_ports,
+            network_block: prepared.network_block_requested,
+            ..ProxyLaunchOptions::default()
+        });
+    }
+
+    let (plain_entries, endpoint_entries): (Vec<_>, Vec<_>) = allow_domain
+        .into_iter()
+        .partition(|e| !matches!(e, crate::profile::AllowDomainEntry::WithEndpoints { endpoints, .. } if !endpoints.is_empty()));
+
+    let domain_filter = if network_profile.is_some() || !plain_entries.is_empty() {
+        Some(DomainFilterIntent {
+            network_profile,
+            allow_domain: plain_entries,
+            reject_domain,
+        })
     } else {
-        matches!(
-            prepared.caps.network_mode(),
-            nono::NetworkMode::ProxyOnly { .. }
-        ) || !credentials.is_empty()
-            || has_custom_credentials
-            || network_profile.is_some()
-            || !allow_domain.is_empty()
-            || upstream_proxy.is_some()
+        None
     };
 
     let approval_mode =
         resolve_network_approval_mode(args, prepared.profile_network_approval_mode.as_deref());
 
-    Ok(ProxyLaunchOptions {
-        active,
-        network_profile,
-        allow_domain,
-        reject_domain,
-        credentials,
-        custom_credentials: prepared.custom_credentials.clone(),
+    let endpoint_filter = if !endpoint_entries.is_empty() {
+        debug_assert!(
+            endpoint_entries
+                .iter()
+                .all(|e| matches!(e, crate::profile::AllowDomainEntry::WithEndpoints { endpoints, .. } if !endpoints.is_empty())),
+            "EndpointFilterIntent invariant violated: all entries must have non-empty endpoints"
+        );
+        Some(EndpointFilterIntent {
+            routes: endpoint_entries,
+        })
+    } else {
+        None
+    };
+
+    let credentials_intent = if has_credentials {
+        Some(CredentialProxyIntent {
+            credentials,
+            custom_credentials: prepared.custom_credentials.clone(),
+        })
+    } else {
+        None
+    };
+
+    let upstream_proxy = upstream_proxy_addr.map(|address| UpstreamProxyIntent {
+        address,
+        bypass: upstream_bypass,
+    });
+
+    let proxy_ca_validity = args
+        .proxy_ca_validity
+        .map(|days| std::time::Duration::from_secs(u64::from(days) * 24 * 60 * 60));
+
+    #[cfg(target_os = "macos")]
+    let tls_intercept = if args.trust_proxy_ca || proxy_ca_validity.is_some() {
+        Some(TlsInterceptIntent {
+            trust_proxy_ca: args.trust_proxy_ca,
+            ca_validity: proxy_ca_validity,
+        })
+    } else {
+        None
+    };
+    #[cfg(not(target_os = "macos"))]
+    let tls_intercept = if proxy_ca_validity.is_some() {
+        Some(TlsInterceptIntent {
+            ca_validity: proxy_ca_validity,
+        })
+    } else {
+        None
+    };
+
+    let open_url = if !prepared.open_url_origins.is_empty()
+        || prepared.open_url_allow_localhost
+        || prepared.allow_launch_services_active
+    {
+        Some(OpenUrlIntent {
+            origins: prepared.open_url_origins.clone(),
+            allow_localhost: prepared.open_url_allow_localhost,
+            allow_launch_services: prepared.allow_launch_services_active,
+        })
+    } else {
+        None
+    };
+
+    let opts = ProxyLaunchOptions {
+        domain_filter,
+        endpoint_filter,
+        credentials: credentials_intent,
         upstream_proxy,
-        upstream_bypass,
+        tls_intercept,
+        open_url,
         allow_bind_ports,
         proxy_port: args.proxy_port,
-        open_url_origins: prepared.open_url_origins.clone(),
-        open_url_allow_localhost: prepared.open_url_allow_localhost,
-        allow_launch_services_active: prepared.allow_launch_services_active,
-        #[cfg(target_os = "macos")]
-        trust_proxy_ca: args.trust_proxy_ca,
-        proxy_ca_validity: args
-            .proxy_ca_validity
-            .map(|days| std::time::Duration::from_secs(u64::from(days) * 24 * 60 * 60)),
         network_approval_mode: approval_mode,
         network_approval_timeout_secs: resolve_approval_timeout_secs(
             prepared.profile_network_approval_timeout_secs,
         ),
+        profile_name: args.profile.clone(),
         network_block: prepared.network_block_requested,
-    })
+    };
+
+    // Infra-only flags make no sense without an activating proxy feature.
+    if !opts.is_active() {
+        if opts.tls_intercept.is_some() {
+            return Err(NonoError::ConfigParse(
+                "--trust-proxy-ca / --proxy-ca-validity require a proxy feature \
+                 (--allow-domain, --credential, or --upstream-proxy)"
+                    .to_string(),
+            ));
+        }
+        if args.proxy_port.is_some() {
+            return Err(NonoError::ConfigParse(
+                "--proxy-port requires a proxy feature (--allow-domain, --credential, \
+                 or --upstream-proxy)"
+                    .to_string(),
+            ));
+        }
+    }
+
+    Ok(opts)
 }
 
 pub(crate) fn resolve_effective_proxy_settings(
@@ -244,7 +328,11 @@ pub(crate) fn build_proxy_config_from_flags(
     let net_policy_json = crate::config::embedded::embedded_network_policy_json();
     let net_policy = network_policy::load_network_policy(net_policy_json)?;
 
-    let mut resolved = if let Some(ref profile_name) = proxy.network_profile {
+    let mut resolved = if let Some(profile_name) = proxy
+        .domain_filter
+        .as_ref()
+        .and_then(|d| d.network_profile.as_ref())
+    {
         network_policy::resolve_network_profile(&net_policy, profile_name)?
     } else {
         network_policy::ResolvedNetworkPolicy {
@@ -256,44 +344,73 @@ pub(crate) fn build_proxy_config_from_flags(
     };
 
     let mut all_credentials = resolved.profile_credentials.clone();
-    for cred in &proxy.credentials {
-        if !all_credentials.contains(cred) {
-            all_credentials.push(cred.clone());
+    if let Some(ref creds) = proxy.credentials {
+        for cred in &creds.credentials {
+            if !all_credentials.contains(cred) {
+                all_credentials.push(cred.clone());
+            }
         }
     }
 
-    let mut routes = network_policy::resolve_credentials(
-        &net_policy,
-        &all_credentials,
-        &proxy.custom_credentials,
-    )?;
+    let empty_custom_credentials = std::collections::HashMap::new();
+    let custom_credentials = proxy
+        .credentials
+        .as_ref()
+        .map(|c| &c.custom_credentials)
+        .unwrap_or(&empty_custom_credentials);
 
-    let (mut plain_hosts, endpoint_routes) =
-        network_policy::partition_allow_domain(&net_policy, &proxy.allow_domain)?;
+    let mut routes =
+        network_policy::resolve_credentials(&net_policy, &all_credentials, custom_credentials)?;
+
+    let plain_allow_domain = proxy
+        .domain_filter
+        .as_ref()
+        .map(|d| d.allow_domain.as_slice())
+        .unwrap_or(&[]);
+    let (mut plain_hosts, _) =
+        network_policy::partition_allow_domain(&net_policy, plain_allow_domain)?;
+
+    let endpoint_allow_domain = proxy
+        .endpoint_filter
+        .as_ref()
+        .map(|e| e.routes.as_slice())
+        .unwrap_or(&[]);
+    let (_, endpoint_routes) =
+        network_policy::partition_allow_domain(&net_policy, endpoint_allow_domain)?;
     // Endpoint-restricted domains need filter allowlist access so the proxy
     // can reach upstream after TLS interception (h2 checks the filter at
     // connection setup, before per-stream route matching).
     for route in &endpoint_routes {
-        if let Some(ref hp) = route.upstream.strip_prefix("https://") {
+        if let Some(hp) = route.upstream.strip_prefix("https://") {
             plain_hosts.push(hp.to_string());
-        } else if let Some(ref hp) = route.upstream.strip_prefix("http://") {
+        } else if let Some(hp) = route.upstream.strip_prefix("http://") {
             plain_hosts.push(hp.to_string());
         }
     }
     routes.extend(endpoint_routes);
     resolved.routes = routes;
 
+    let allow_domain_flat: Vec<String> = plain_allow_domain
+        .iter()
+        .chain(endpoint_allow_domain.iter())
+        .map(|e| e.domain().to_string())
+        .collect();
     let expanded_allow_domain =
-        network_policy::expand_proxy_allow(&net_policy, &proxy.allow_domain.iter().map(|e| e.domain().to_string()).collect::<Vec<_>>());
+        network_policy::expand_proxy_allow(&net_policy, &allow_domain_flat);
+    let reject_domain = proxy
+        .domain_filter
+        .as_ref()
+        .map(|d| d.reject_domain.as_slice())
+        .unwrap_or(&[]);
     let mut proxy_config =
-        network_policy::build_proxy_config(&resolved, &expanded_allow_domain, &proxy.reject_domain);
+        network_policy::build_proxy_config(&resolved, &expanded_allow_domain, reject_domain);
     proxy_config.strict_filter = proxy.network_block;
 
-    if let Some(ref addr) = proxy.upstream_proxy {
+    if let Some(ref upstream) = proxy.upstream_proxy {
         proxy_config.external_proxy = Some(nono_proxy::config::ExternalProxyConfig {
-            address: addr.clone(),
+            address: upstream.address.clone(),
             auth: None,
-            bypass_hosts: proxy.upstream_bypass.clone(),
+            bypass_hosts: upstream.bypass.clone(),
         });
     }
 
@@ -301,7 +418,7 @@ pub(crate) fn build_proxy_config_from_flags(
         proxy_config.bind_port = port;
     }
 
-    proxy_config.ca_validity = proxy.proxy_ca_validity;
+    proxy_config.ca_validity = proxy.tls_intercept.as_ref().and_then(|t| t.ca_validity);
 
     Ok(proxy_config)
 }
@@ -310,7 +427,7 @@ pub(crate) fn start_proxy_runtime(
     proxy: &ProxyLaunchOptions,
     caps: &mut CapabilitySet,
 ) -> Result<ActiveProxyRuntime> {
-    if !proxy.active {
+    if !proxy.is_active() {
         return Ok(ActiveProxyRuntime {
             env_vars: Vec::new(),
             handle: None,
@@ -330,10 +447,16 @@ pub(crate) fn start_proxy_runtime(
     }
 
     #[cfg(target_os = "macos")]
-    if proxy.trust_proxy_ca {
+    if proxy
+        .tls_intercept
+        .as_ref()
+        .is_some_and(|t| t.trust_proxy_ca)
+    {
         if proxy_config.intercept_ca_dir.is_some() {
             let validity = proxy
-                .proxy_ca_validity
+                .tls_intercept
+                .as_ref()
+                .and_then(|t| t.ca_validity)
                 .unwrap_or(nono_proxy::tls_intercept::ca::CA_VALIDITY_DEFAULT);
             proxy_config.preloaded_ca = crate::macos_trust::load_or_generate_proxy_ca(validity);
         } else {
@@ -359,7 +482,12 @@ pub(crate) fn start_proxy_runtime(
 
             let (tx, mut rx) = tokio::sync::mpsc::channel::<nono_proxy::ApprovalChannelRequest>(16);
 
-            let config_writer = match proxy.network_profile.as_deref() {
+            let config_writer = match proxy
+                .domain_filter
+                .as_ref()
+                .and_then(|d| d.network_profile.as_deref())
+                .or_else(|| proxy.profile_name.as_deref())
+            {
                 Some(name) => Some(crate::network_approval::ConfigWriter::new(name)),
                 None => Some(crate::network_approval::ConfigWriter::new("default")),
             };
@@ -665,7 +793,6 @@ mod tests {
     #[test]
     fn test_build_proxy_config_propagates_network_block_to_strict_filter() {
         let proxy = ProxyLaunchOptions {
-            active: true,
             network_block: true,
             ..ProxyLaunchOptions::default()
         };
@@ -679,7 +806,6 @@ mod tests {
     #[test]
     fn test_build_proxy_config_strict_filter_off_when_no_block() {
         let proxy = ProxyLaunchOptions {
-            active: true,
             network_block: false,
             ..ProxyLaunchOptions::default()
         };
@@ -688,6 +814,46 @@ mod tests {
             !config.strict_filter,
             "strict_filter must default off when network_block is false"
         );
+    }
+
+    /// `{ "domain": "cdn.example.com" }` (no `endpoints` key) deserializes via serde default
+    /// to `WithEndpoints { endpoints: [] }`, which is semantically identical to `Plain`.
+    /// The partition must route it to `plain_entries` — not `endpoint_entries` — or the
+    /// domain silently disappears from the allowlist.
+    #[test]
+    fn test_object_form_domain_with_no_endpoints_key_is_treated_as_plain() {
+        use crate::profile::AllowDomainEntry;
+
+        // Mirrors exactly: { "network": { "allow_domain": [ { "domain": "cdn.example.com" } ] } }
+        let entries: Vec<AllowDomainEntry> = serde_json::from_str(r#"[
+            "plain.example.com",
+            { "domain": "object.example.com" },
+            { "domain": "filtered.example.com", "endpoints": [{ "method": "GET", "path": "/v1/**" }] }
+        ]"#)
+        .expect("deserialize allow_domain entries");
+
+        let (plain, endpoint): (Vec<_>, Vec<_>) = entries
+            .into_iter()
+            .partition(|e| !matches!(e, AllowDomainEntry::WithEndpoints { endpoints, .. } if !endpoints.is_empty()));
+
+        assert_eq!(
+            plain.len(),
+            2,
+            "both Plain and no-endpoints-key object must land in plain bucket"
+        );
+        assert_eq!(
+            endpoint.len(),
+            1,
+            "only the entry with actual endpoint rules goes to endpoint bucket"
+        );
+
+        assert!(
+            plain
+                .iter()
+                .any(|e| matches!(e, AllowDomainEntry::Plain(d) if d == "plain.example.com"))
+        );
+        assert!(plain.iter().any(|e| matches!(e, AllowDomainEntry::WithEndpoints { domain, .. } if domain == "object.example.com")));
+        assert!(endpoint.iter().any(|e| matches!(e, AllowDomainEntry::WithEndpoints { domain, .. } if domain == "filtered.example.com")));
     }
 
     /// A profile with only `custom_credentials` set (no built-in `credentials`,
@@ -763,7 +929,7 @@ mod tests {
             .expect("prepare_proxy_launch_options");
 
         assert!(
-            opts.active,
+            opts.is_active(),
             "proxy must be active when custom_credentials is non-empty"
         );
     }

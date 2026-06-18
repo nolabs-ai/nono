@@ -48,11 +48,13 @@ class UpdateHandler(BaseHTTPRequestHandler):
         version = request.get("version", "0.0.0")
         platform = request.get("platform", "unknown")
         arch = request.get("arch", "unknown")
+        ci = request.get("ci", False)
+        ci_provider = request.get("ci_provider", "none")
 
         print(
             f"[{datetime.now(timezone.utc).isoformat()}] "
             f"uuid={uuid[:8]}... version={version} "
-            f"platform={platform} arch={arch}"
+            f"platform={platform} arch={arch} ci={ci} ci_provider={ci_provider}"
         )
 
         update_available = self._is_outdated(version)

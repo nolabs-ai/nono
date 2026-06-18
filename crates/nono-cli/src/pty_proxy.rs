@@ -223,7 +223,7 @@ pub struct PtyProxy {
     /// Resize updates from a reattached terminal client.
     resize_notifier: Option<UnixDatagram>,
     /// Saved terminal settings (restored on detach)
-    saved_termios: Option<nix::sys::termios::Termios>,
+    pub(crate) saved_termios: Option<nix::sys::termios::Termios>,
     /// Recent PTY output replayed to newly attached clients.
     scrollback: VecDeque<u8>,
     /// Last visible screen state for attach restoration.
@@ -236,6 +236,8 @@ pub struct PtyProxy {
     pending_detach_escape: Vec<u8>,
     /// In-band detach requested from the attached client.
     detach_requested: bool,
+    /// Ctrl-Z suspension requested from a terminal client.
+    suspension_requested: bool,
 }
 
 /// Open a PTY pair, inheriting the current terminal's window size.
@@ -363,6 +365,7 @@ impl PtyProxy {
             pending_detach_match_len: 0,
             pending_detach_escape: Vec::new(),
             detach_requested: false,
+            suspension_requested: false,
         })
     }
 
@@ -438,6 +441,33 @@ impl PtyProxy {
     /// Whether the child process is currently using the alternate screen buffer.
     pub fn in_alt_screen(&self) -> bool {
         self.screen.alternate_screen_active()
+    }
+
+    /// Before suspending, if the child is in the alternate screen buffer, exit
+    /// it so the shell's "[1]+ Stopped" prompt shows on the normal screen. Use
+    /// the clearing restore (same as detach) so the normal screen starts clean:
+    /// without the clear, the cursor lands at a stale position in the normal
+    /// buffer and the shell prompt mixes with leftover lines, drift that
+    /// accumulates across repeated Ctrl-Z/fg cycles.
+    pub(crate) fn leave_screen_for_suspension(&self) {
+        if self.screen.alternate_screen_active() {
+            let _ = write_all_fd(libc::STDOUT_FILENO, terminal_restore_escape(true));
+            drain_terminal_output(libc::STDOUT_FILENO);
+        }
+    }
+
+    /// On resume, re-enter the alternate screen and repaint it from nono's
+    /// captured screen state. Emitting only the alt-screen-enter sequence leaves
+    /// a blank buffer that TUIs which ignore SIGWINCH (e.g. opencode/opentui)
+    /// never repaint. Instead we reconstruct the screen the same way a
+    /// re-attaching client does: alt-screen enter + a full vt100 repaint of the
+    /// current contents (`ScreenState::render` -> `state_formatted`).
+    pub(crate) fn reenter_screen_for_resume(&self) {
+        if self.screen.alternate_screen_active() {
+            let _ = write_all_fd(libc::STDOUT_FILENO, ATTACH_SCREEN_ENTER_ESCAPE);
+            let _ = write_all_fd(libc::STDOUT_FILENO, &self.scrollback_snapshot());
+            drain_terminal_output(libc::STDOUT_FILENO);
+        }
     }
 
     /// Shut down the attach listener so no new connections can be accepted.
@@ -619,7 +649,12 @@ impl PtyProxy {
         )
     }
 
-    /// Proxy data from the PTY master to the attached client (child → user).
+    /// Borrow the PTY master fd for ioctl operations (e.g. tcgetpgrp).
+    pub(crate) fn master_fd(&self) -> &OwnedFd {
+        &self.master
+    }
+
+    /// Proxy data from the PTY master to the attached client (child -> user).
     ///
     /// Returns false if the PTY master became unavailable.
     #[must_use = "false indicates the PTY master is no longer usable"]
@@ -783,6 +818,10 @@ impl PtyProxy {
         std::mem::take(&mut self.detach_requested)
     }
 
+    pub fn take_suspension_request(&mut self) -> bool {
+        std::mem::take(&mut self.suspension_requested)
+    }
+
     /// Temporarily restore the local terminal so the parent can prompt.
     ///
     /// Returns true when a terminal-backed client was paused and must later
@@ -802,7 +841,7 @@ impl PtyProxy {
     }
 
     /// Restore terminal settings.
-    fn restore_terminal(&mut self) {
+    pub(crate) fn restore_terminal(&mut self) {
         if let Some(ref termios) = self.saved_termios {
             let _ = nix::sys::termios::tcsetattr(
                 std::io::stdin(),
@@ -1024,7 +1063,15 @@ impl PtyProxy {
     }
     fn filter_client_input(&mut self, bytes: &[u8]) -> Vec<u8> {
         let mut forwarded = Vec::with_capacity(bytes.len());
+        let is_terminal = self
+            .client
+            .as_ref()
+            .is_some_and(AttachedClient::is_terminal);
         for (i, &byte) in bytes.iter().enumerate() {
+            if is_terminal && byte == 0x1A {
+                self.suspension_requested = true;
+                continue;
+            }
             if self.maybe_consume_enhanced_detach_byte(byte, &mut forwarded) {
                 continue;
             }
@@ -1072,12 +1119,25 @@ impl PtyProxy {
     }
 
     fn should_start_enhanced_detach_match(&self, byte: u8) -> bool {
-        byte == b'\x1b'
-            && self
-                .detach_sequence
-                .get(self.pending_detach_match_len)
-                .copied()
-                .is_some_and(detach_key_supports_enhanced_match)
+        if byte != b'\x1b' {
+            return false;
+        }
+        // Terminal clients may send Ctrl-Z as a kitty-protocol CSI-u sequence
+        // (\x1b[122;5u or \x1b[90;5u) instead of raw 0x1A. Buffer any ESC from
+        // a terminal so maybe_consume_enhanced_detach_byte can check it for
+        // suspension. Socket clients only buffer when the detach key itself
+        // supports enhanced (CSI-u) matching.
+        if self
+            .client
+            .as_ref()
+            .is_some_and(AttachedClient::is_terminal)
+        {
+            return true;
+        }
+        self.detach_sequence
+            .get(self.pending_detach_match_len)
+            .copied()
+            .is_some_and(detach_key_supports_enhanced_match)
     }
 
     fn maybe_consume_enhanced_detach_byte(&mut self, byte: u8, forwarded: &mut Vec<u8>) -> bool {
@@ -1086,6 +1146,27 @@ impl PtyProxy {
         }
 
         self.pending_detach_escape.push(byte);
+
+        // Check for a kitty-protocol Ctrl-Z (\x1b[122;5u or \x1b[90;5u) before
+        // the detach key. control_key_candidates(0x1a) is [90, 122], so the
+        // existing matcher recognizes both encodings. Only a completed match is
+        // intercepted (swallowed + suspension requested); Pending and Invalid
+        // fall through to the detach logic below, which keeps the buffer-length
+        // guard and still recognizes a detach CSI-u sequence.
+        if self
+            .client
+            .as_ref()
+            .is_some_and(AttachedClient::is_terminal)
+            && matches!(
+                match_enhanced_key_sequence(&self.pending_detach_escape, 0x1a),
+                EnhancedKeyMatch::Matched
+            )
+        {
+            self.suspension_requested = true;
+            self.pending_detach_escape.clear();
+            return true;
+        }
+
         let Some(expected_key) = self
             .detach_sequence
             .get(self.pending_detach_match_len)
@@ -2423,6 +2504,7 @@ mod tests {
             pending_detach_match_len: 0,
             pending_detach_escape: Vec::new(),
             detach_requested: false,
+            suspension_requested: false,
         }
     }
 
@@ -2431,6 +2513,15 @@ mod tests {
         assert!(dup_fd >= 0);
         let master = unsafe { OwnedFd::from_raw_fd(dup_fd) };
         build_test_proxy_with_master(master, sequence)
+    }
+
+    fn build_test_proxy_with_terminal(sequence: &[u8]) -> PtyProxy {
+        let mut proxy = build_test_proxy(sequence);
+        proxy.client = Some(AttachedClient::terminal(
+            libc::STDIN_FILENO,
+            libc::STDOUT_FILENO,
+        ));
+        proxy
     }
 
     #[test]
@@ -2917,5 +3008,75 @@ mod tests {
 
         assert!(proxy.proxy_master_to_client());
         assert!(proxy.client.is_none());
+    }
+
+    // --- Ctrl-Z suspension detection ---
+
+    #[test]
+    fn filter_client_input_raw_ctrl_z_from_terminal_sets_suspension() {
+        let mut proxy = build_test_proxy_with_terminal(&DEFAULT_DETACH_SEQUENCE);
+        let forwarded = proxy.filter_client_input(b"\x1a");
+        assert!(forwarded.is_empty());
+        assert!(proxy.take_suspension_request());
+    }
+
+    #[test]
+    fn filter_client_input_csi_u_ctrl_z_lowercase_z_sets_suspension() {
+        // Kitty keyboard protocol: Ctrl-Z as \x1b[122;5u (codepoint 122 = 'z').
+        let mut proxy = build_test_proxy_with_terminal(&DEFAULT_DETACH_SEQUENCE);
+        let forwarded = proxy.filter_client_input(b"\x1b[122;5u");
+        assert!(forwarded.is_empty());
+        assert!(proxy.take_suspension_request());
+    }
+
+    #[test]
+    fn filter_client_input_csi_u_ctrl_z_uppercase_z_sets_suspension() {
+        // Alternative encoding: \x1b[90;5u (codepoint 90 = 'Z').
+        let mut proxy = build_test_proxy_with_terminal(&DEFAULT_DETACH_SEQUENCE);
+        let forwarded = proxy.filter_client_input(b"\x1b[90;5u");
+        assert!(forwarded.is_empty());
+        assert!(proxy.take_suspension_request());
+    }
+
+    #[test]
+    fn filter_client_input_csi_u_ctrl_z_chunked_across_reads_sets_suspension() {
+        let mut proxy = build_test_proxy_with_terminal(&DEFAULT_DETACH_SEQUENCE);
+        let forwarded = proxy.filter_client_input(b"\x1b[12");
+        assert!(forwarded.is_empty());
+        assert!(!proxy.take_suspension_request());
+
+        let forwarded = proxy.filter_client_input(b"2;5u");
+        assert!(forwarded.is_empty());
+        assert!(proxy.take_suspension_request());
+    }
+
+    #[test]
+    fn filter_client_input_unrelated_csi_u_does_not_set_suspension() {
+        // \x1b[97;5u = Ctrl-A (codepoint 97 = 'a'); must not suspend and must
+        // be forwarded unchanged.
+        let mut proxy = build_test_proxy_with_terminal(&DEFAULT_DETACH_SEQUENCE);
+        let forwarded = proxy.filter_client_input(b"\x1b[97;5u");
+        assert_eq!(forwarded, b"\x1b[97;5u");
+        assert!(!proxy.take_suspension_request());
+    }
+
+    #[test]
+    fn filter_client_input_raw_ctrl_z_from_non_terminal_is_forwarded() {
+        // Socket (non-terminal) clients do not suspend; raw 0x1A is data.
+        let mut proxy = build_test_proxy(&DEFAULT_DETACH_SEQUENCE);
+        let forwarded = proxy.filter_client_input(b"\x1a");
+        assert_eq!(forwarded, b"\x1a");
+        assert!(!proxy.take_suspension_request());
+    }
+
+    #[test]
+    fn filter_client_input_csi_u_detach_still_works_with_terminal_client() {
+        // Regression: a CSI-u detach key must still match for terminal clients.
+        // Default detach is [0x1d, 'd']; 0x1d = Ctrl-] encodes as \x1b[93;5u.
+        let mut proxy = build_test_proxy_with_terminal(&DEFAULT_DETACH_SEQUENCE);
+        let forwarded = proxy.filter_client_input(b"\x1b[93;5ud");
+        assert!(forwarded.is_empty());
+        assert!(!proxy.take_suspension_request());
+        assert!(proxy.take_detach_request());
     }
 }

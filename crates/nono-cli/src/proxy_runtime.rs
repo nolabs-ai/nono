@@ -696,10 +696,22 @@ mod tests {
             .into_iter()
             .partition(|e| !matches!(e, AllowDomainEntry::WithEndpoints { endpoints, .. } if !endpoints.is_empty()));
 
-        assert_eq!(plain.len(), 2, "both Plain and no-endpoints-key object must land in plain bucket");
-        assert_eq!(endpoint.len(), 1, "only the entry with actual endpoint rules goes to endpoint bucket");
+        assert_eq!(
+            plain.len(),
+            2,
+            "both Plain and no-endpoints-key object must land in plain bucket"
+        );
+        assert_eq!(
+            endpoint.len(),
+            1,
+            "only the entry with actual endpoint rules goes to endpoint bucket"
+        );
 
-        assert!(plain.iter().any(|e| matches!(e, AllowDomainEntry::Plain(d) if d == "plain.example.com")));
+        assert!(
+            plain
+                .iter()
+                .any(|e| matches!(e, AllowDomainEntry::Plain(d) if d == "plain.example.com"))
+        );
         assert!(plain.iter().any(|e| matches!(e, AllowDomainEntry::WithEndpoints { domain, .. } if domain == "object.example.com")));
         assert!(endpoint.iter().any(|e| matches!(e, AllowDomainEntry::WithEndpoints { domain, .. } if domain == "filtered.example.com")));
     }

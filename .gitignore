@@ -10,6 +10,7 @@
 proj/
 .worktrees
 .nono
+diagnostics.json
 
 
 # Library tests

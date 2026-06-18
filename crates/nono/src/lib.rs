@@ -68,7 +68,12 @@ pub use capability::{
     AccessMode, CapabilitySet, CapabilitySource, FsCapability, IpcMode, NetworkMode,
     ProcessInfoMode, SignalMode, SocketScope, UnixSocketCapability, UnixSocketMode, UnixSocketOp,
 };
-pub use diagnostic::{DenialReason, DenialRecord, IpcDenialRecord, SandboxViolation};
+pub use diagnostic::{
+    DenialReason, DenialRecord, IpcDenialRecord, NonoDiagnostic, NonoDiagnosticCode,
+    NonoDiagnosticDetail, NonoDiagnosticSeverity, NonoRemediation, SandboxViolation,
+    SessionDiagnosticReport, SessionObservationInput, StderrObservationKind, dedupe_denials,
+    filesystem_denials_from_violations, follow_up_diagnostics,
+};
 pub use error::{NonoError, Result};
 pub use keystore::{
     LoadedSecret, is_apple_password_uri, is_bw_uri, is_env_uri, is_file_uri, is_keyring_uri,

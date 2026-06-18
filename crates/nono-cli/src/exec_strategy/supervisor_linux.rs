@@ -11,7 +11,7 @@
 
 use super::*;
 use crate::trust_intercept::TrustInterceptor;
-use nono::{AccessMode, UnixSocketCapability, UnixSocketOp, try_canonicalize};
+use nono::{AccessMode, NonoRemediation, UnixSocketCapability, UnixSocketOp, try_canonicalize};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct InitialCapability {
@@ -1011,14 +1011,14 @@ fn record_af_unix_ipc_denial(
     let operation = op
         .map(|op| op.to_string())
         .unwrap_or_else(|| format!("syscall {syscall}"));
-    let (target, reason, suggested_flag, path_record) = ipc_denial_details(sockaddr, child_pid, op);
+    let (target, reason, remediation, path_record) = ipc_denial_details(sockaddr, child_pid, op);
 
-    ipc_denials.push(nono::diagnostic::IpcDenialRecord {
+    ipc_denials.push(nono::diagnostic::IpcDenialRecord::new(
         target,
         operation,
         reason,
-        suggested_flag,
-    });
+        remediation,
+    ));
 
     let Some((display_path, op)) = path_record else {
         return;
@@ -1044,7 +1044,7 @@ fn ipc_denial_details(
     sockaddr: &nono::sandbox::SockaddrInfo,
     child_pid: u32,
     op: Option<UnixSocketOp>,
-) -> (String, String, Option<String>, PathIpcDenial) {
+) -> (String, String, Option<NonoRemediation>, PathIpcDenial) {
     match sockaddr.unix_kind {
         Some(nono::sandbox::UnixSocketKind::Pathname) => {
             let Some(path) = sockaddr.unix_path.as_deref() else {
@@ -1078,14 +1078,14 @@ fn ipc_denial_details(
                     None,
                 );
             };
-            let flag = match op {
-                UnixSocketOp::Connect | UnixSocketOp::Send => "--allow-unix-socket",
-                UnixSocketOp::Bind => "--allow-unix-socket-bind",
-            };
+            let bind = matches!(op, UnixSocketOp::Bind);
             (
                 display_path.display().to_string(),
                 "no matching unix_socket capability".to_string(),
-                Some(format!("{flag} {}", display_path.display())),
+                Some(NonoRemediation::GrantUnixSocket {
+                    path: display_path.clone(),
+                    bind,
+                }),
                 Some((display_path, op)),
             )
         }

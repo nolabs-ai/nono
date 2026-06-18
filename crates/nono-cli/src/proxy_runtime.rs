@@ -430,6 +430,11 @@ pub(crate) fn start_proxy_runtime(
             );
         }
     }
+
+    let proxy_diagnostics = handle.diagnostics();
+    if !proxy_diagnostics.is_empty() {
+        crate::output::print_proxy_diagnostics(proxy_diagnostics);
+    }
     caps.set_network_mode_mut(nono::NetworkMode::ProxyOnly {
         port,
         bind_ports: proxy.allow_bind_ports.clone(),
@@ -727,6 +732,7 @@ mod tests {
             rollback_exclude_globs: Vec::new(),
             network_profile: None,
             allow_domain: Vec::new(),
+            reject_domain: Vec::new(),
             credentials: Vec::new(),
             custom_credentials,
             upstream_proxy: None,
@@ -748,6 +754,8 @@ mod tests {
             denied_env_vars: None,
             set_vars: None,
             network_block_requested: false,
+            profile_network_approval_mode: None,
+            profile_network_approval_timeout_secs: None,
         };
 
         let args = crate::cli::SandboxArgs::default();

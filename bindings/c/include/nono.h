@@ -111,6 +111,28 @@ typedef enum NonoErrorCode {
 } NonoErrorCode;
 
 /**
+ * Diagnostic code for sandbox and setup errors.
+ */
+typedef enum NonoDiagnosticCode {
+    NONO_DIAGNOSTIC_CODE_SANDBOX_DENIED_PATH = 0,
+    NONO_DIAGNOSTIC_CODE_SANDBOX_DENIED_NETWORK = 1,
+    NONO_DIAGNOSTIC_CODE_SANDBOX_DENIED_UNIX_SOCKET = 2,
+    NONO_DIAGNOSTIC_CODE_COMMAND_NOT_FOUND = 3,
+    NONO_DIAGNOSTIC_CODE_COMMAND_FAILED_LIKELY_SANDBOX = 4,
+    NONO_DIAGNOSTIC_CODE_COMMAND_FAILED_APPLICATION = 5,
+    NONO_DIAGNOSTIC_CODE_CREDENTIAL_NOT_FOUND = 6,
+    NONO_DIAGNOSTIC_CODE_CREDENTIAL_UNAVAILABLE = 7,
+    NONO_DIAGNOSTIC_CODE_UNSUPPORTED_PLATFORM_FEATURE = 8,
+    NONO_DIAGNOSTIC_CODE_ROLLBACK_BUDGET_EXCEEDED = 9,
+    NONO_DIAGNOSTIC_CODE_CWD_ACCESS_REQUIRED = 10,
+    NONO_DIAGNOSTIC_CODE_CONFIGURATION_ERROR = 11,
+    NONO_DIAGNOSTIC_CODE_TRUST_VERIFICATION_FAILED = 12,
+    NONO_DIAGNOSTIC_CODE_IO_ERROR = 13,
+    NONO_DIAGNOSTIC_CODE_CANCELLED = 14,
+    NONO_DIAGNOSTIC_CODE_OTHER = 99,
+} NonoDiagnosticCode;
+
+/**
  * Tag for capability source discriminant.
  */
 typedef enum NonoCapabilitySourceTag {
@@ -446,6 +468,53 @@ bool nono_capability_set_is_network_blocked(const struct NonoCapabilitySet *caps
  * `caps` must be a valid pointer or NULL.
  */
 char *nono_capability_set_summary(const struct NonoCapabilitySet *caps);
+
+/**
+ * Return the diagnostic code for the most recently mapped error on this thread.
+ *
+ * Returns `NonoDiagnosticCode::Other` when no error has been mapped.
+ */
+enum NonoDiagnosticCode nono_last_diagnostic_code(void);
+
+/**
+ * Return JSON for the remediation attached to the most recently mapped error.
+ *
+ * Caller must free with `nono_string_free()`. Returns NULL when no remediation exists.
+ */
+char *nono_last_remediation_json(void);
+
+/**
+ * Build a session diagnostic report JSON object from serialized denial inputs.
+ *
+ * Each `*_json` argument may be NULL, an empty string, or a JSON array of
+ * denial, IPC denial, or violation records.
+ *
+ * # Safety
+ *
+ * Pointer arguments must be null or valid null-terminated UTF-8 for the
+ * duration of the call. Caller frees the returned string with `nono_string_free()`.
+ * Returns NULL on failure; call `nono_last_error()`.
+ */
+char *nono_session_diagnostic_report_to_json(int32_t exit_code,
+                                             const char *denials_json,
+                                             const char *ipc_denials_json,
+                                             const char *violations_json);
+
+/**
+ * Merge session report JSON with an optional proxy diagnostics JSON array.
+ *
+ * `session_json` must be a report object from `nono_session_diagnostic_report_to_json`
+ * or `SessionDiagnosticReport::to_json()`. `proxy_diagnostics_json` may be NULL
+ * or empty to return `{ "session": ... }` only.
+ *
+ * # Safety
+ *
+ * Pointer arguments must be null or valid null-terminated UTF-8 for the
+ * duration of the call. Caller frees the returned string with `nono_string_free()`.
+ * Returns NULL on failure; call `nono_last_error()`.
+ */
+char *nono_merge_diagnostic_report_json(const char *session_json,
+                                        const char *proxy_diagnostics_json);
 
 /**
  * Get the number of filesystem capabilities in the set.

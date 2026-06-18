@@ -21,6 +21,7 @@ pub mod audit;
 pub mod config;
 pub mod connect;
 pub mod credential;
+pub mod diagnostic;
 pub mod error;
 pub mod external;
 pub mod filter;
@@ -34,5 +35,7 @@ pub mod token;
 
 pub use config::ProxyConfig;
 pub use connect::ApprovalChannelRequest;
+pub use credential::{CredentialLoadOutcome, CredentialStore};
+pub use diagnostic::{ProxyDiagnostic, ProxyDiagnosticCode, ProxyDiagnosticSeverity};
 pub use error::{ProxyError, Result};
 pub use server::{start, start_with_approval, ProxyHandle};

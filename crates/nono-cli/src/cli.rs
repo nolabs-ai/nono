@@ -1743,6 +1743,10 @@ pub struct RunArgs {
     #[arg(long, help_heading = "OPTIONS")]
     pub no_diagnostics: bool,
 
+    /// After the run, print session diagnostics as JSON on stderr (merged with proxy diagnostics when present).
+    #[arg(long = "diagnostics-json", help_heading = "OPTIONS")]
+    pub diagnostics_json: bool,
+
     /// Kill the process if it has not entered alt-screen mode after this many seconds.
     /// Startup banners and log lines do not count; only a full-screen TUI transition satisfies the check.
     /// Set to 0 to disable. Env: NONO_STARTUP_TIMEOUT.

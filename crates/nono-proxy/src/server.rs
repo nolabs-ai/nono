@@ -54,6 +54,11 @@ fn parse_non_connect_target(line: &str) -> Result<(String, u16)> {
     Ok((host, port))
 }
 
+#[must_use]
+fn proxy_diagnostic_code_label(code: crate::diagnostic::ProxyDiagnosticCode) -> &'static str {
+    code.as_str()
+}
+
 /// Handle returned when the proxy server starts.
 ///
 /// Contains the assigned port, session token, and a shutdown channel.
@@ -80,6 +85,8 @@ pub struct ProxyHandle {
     /// Seatbelt read capability on it. `None` when interception is not
     /// configured (no `intercept_ca_dir`) or no route requires L7 visibility.
     intercept_ca_path: Option<PathBuf>,
+    /// Credential load warnings collected at startup.
+    diagnostics: Vec<crate::diagnostic::ProxyDiagnostic>,
 }
 
 impl ProxyHandle {
@@ -109,6 +116,22 @@ impl ProxyHandle {
         self.intercept_ca_path.as_deref()
     }
 
+    /// Startup diagnostics from credential loading.
+    #[must_use]
+    pub fn diagnostics(&self) -> &[crate::diagnostic::ProxyDiagnostic] {
+        &self.diagnostics
+    }
+
+    /// Serialize startup diagnostics to JSON.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if JSON serialization fails.
+    pub fn diagnostics_json(&self) -> crate::Result<String> {
+        serde_json::to_string(&self.diagnostics)
+            .map_err(|e| ProxyError::Config(format!("proxy diagnostics JSON error: {e}")))
+    }
+
     /// One-line-per-route diagnostic summary suitable for surfacing at
     /// session start. Returns `(prefix, summary)` pairs.
     ///
@@ -125,23 +148,7 @@ impl ProxyHandle {
         let mut rows = Vec::with_capacity(config.routes.len());
         for route in &config.routes {
             let prefix = route.prefix.trim_matches('/').to_string();
-            let cred_summary = if let Some(ref key) = route.credential_key {
-                let resolved = self.loaded_routes.contains(&prefix);
-                if resolved {
-                    format!("creds: {} ✓", key)
-                } else {
-                    format!("creds: {} ✗ (not found)", key)
-                }
-            } else if route.oauth2.is_some() {
-                let resolved = self.loaded_routes.contains(&prefix);
-                if resolved {
-                    "creds: oauth2 ✓".to_string()
-                } else {
-                    "creds: oauth2 ✗ (token exchange failed)".to_string()
-                }
-            } else {
-                "creds: none".to_string()
-            };
+            let cred_summary = self.credential_status_summary(&prefix, route);
 
             let intercept_summary = if self.intercept_ca_path.is_some()
                 && (route.credential_key.is_some()
@@ -161,6 +168,40 @@ impl ProxyHandle {
             rows.push((prefix, summary));
         }
         rows
+    }
+
+    fn credential_status_summary(
+        &self,
+        prefix: &str,
+        route: &crate::config::RouteConfig,
+    ) -> String {
+        if let Some(diagnostic) = self
+            .diagnostics
+            .iter()
+            .find(|entry| entry.route_prefix == prefix)
+        {
+            let code = proxy_diagnostic_code_label(diagnostic.code);
+            let cred_ref = diagnostic.credential_ref.as_deref().unwrap_or("credential");
+            return format!("creds: {cred_ref} ✗ ({code})");
+        }
+
+        if let Some(ref key) = route.credential_key {
+            let resolved = self.loaded_routes.contains(prefix);
+            if resolved {
+                format!("creds: {} ✓", key)
+            } else {
+                format!("creds: {} ✗ (not found)", key)
+            }
+        } else if route.oauth2.is_some() {
+            let resolved = self.loaded_routes.contains(prefix);
+            if resolved {
+                "creds: oauth2 ✓".to_string()
+            } else {
+                "creds: oauth2 ✗ (token exchange failed)".to_string()
+            }
+        } else {
+            "creds: none".to_string()
+        }
     }
 
     /// Environment variables to inject into the child process.
@@ -410,7 +451,7 @@ pub async fn start_with_approval(
     // Build shared TLS connector (root cert store is expensive to construct).
     // Use the ring provider explicitly to avoid ambiguity when multiple
     // crypto providers are in the dependency tree.
-    // Must be created before CredentialStore::load() because OAuth2 token
+    // Must be created before CredentialStore::load_with_diagnostics() because OAuth2 token
     // exchange needs TLS.
     let mut root_store = rustls::RootCertStore::empty();
     root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
@@ -440,10 +481,11 @@ pub async fn start_with_approval(
     let tls_connector = tokio_rustls::TlsConnector::from(Arc::new(tls_config));
 
     // Load credentials for reverse proxy routes (static keystore + OAuth2)
-    let credential_store = if config.routes.is_empty() {
-        CredentialStore::empty()
+    let (credential_store, proxy_diagnostics) = if config.routes.is_empty() {
+        (CredentialStore::empty(), Vec::new())
     } else {
-        CredentialStore::load(&config.routes, &tls_connector)?
+        let outcome = CredentialStore::load_with_diagnostics(&config.routes, &tls_connector)?;
+        (outcome.store, outcome.diagnostics)
     };
     let loaded_routes = credential_store.loaded_prefixes();
 
@@ -614,6 +656,7 @@ pub async fn start_with_approval(
         loaded_routes,
         no_proxy_hosts,
         intercept_ca_path,
+        diagnostics: proxy_diagnostics,
     })
 }
 
@@ -1367,8 +1410,8 @@ mod tests {
         assert!(openai.1.contains("api.openai.com"));
         assert!(openai.1.contains("intercept: on"));
         assert!(
-            openai.1.contains("✗") || openai.1.contains("not found"),
-            "missing credential should show ✗, got: {}",
+            openai.1.contains("✗") || openai.1.contains("credential_not_found"),
+            "missing credential should show structured code, got: {}",
             openai.1
         );
 
@@ -1455,6 +1498,7 @@ mod tests {
             loaded_routes: ["openai".to_string()].into_iter().collect(),
             no_proxy_hosts: Vec::new(),
             intercept_ca_path: None,
+            diagnostics: vec![],
         };
         let config = ProxyConfig {
             routes: vec![crate::config::RouteConfig {
@@ -1511,6 +1555,7 @@ mod tests {
             loaded_routes: ["openai".to_string()].into_iter().collect(),
             no_proxy_hosts: Vec::new(),
             intercept_ca_path: None,
+            diagnostics: vec![],
         };
         let config = ProxyConfig {
             routes: vec![crate::config::RouteConfig {
@@ -1572,6 +1617,7 @@ mod tests {
             loaded_routes: ["openai".to_string()].into_iter().collect(),
             no_proxy_hosts: Vec::new(),
             intercept_ca_path: None,
+            diagnostics: vec![],
         };
         let config = ProxyConfig {
             routes: vec![
@@ -1654,6 +1700,7 @@ mod tests {
             loaded_routes: std::collections::HashSet::new(),
             no_proxy_hosts: Vec::new(),
             intercept_ca_path: None,
+            diagnostics: vec![],
         };
 
         // Test leading slash
@@ -1744,6 +1791,7 @@ mod tests {
             loaded_routes: ["anthropic".to_string()].into_iter().collect(),
             no_proxy_hosts: Vec::new(),
             intercept_ca_path: None,
+            diagnostics: vec![],
         };
         let config_no_env_var = ProxyConfig {
             routes: vec![crate::config::RouteConfig {
@@ -1786,6 +1834,7 @@ mod tests {
             loaded_routes: ["anthropic".to_string()].into_iter().collect(),
             no_proxy_hosts: Vec::new(),
             intercept_ca_path: None,
+            diagnostics: vec![],
         };
         let config_fixed = ProxyConfig {
             routes: vec![crate::config::RouteConfig {
@@ -1832,6 +1881,7 @@ mod tests {
                 "opencode.internal:4096".to_string(),
             ],
             intercept_ca_path: None,
+            diagnostics: vec![],
         };
 
         let vars = handle.env_vars();
@@ -1861,6 +1911,7 @@ mod tests {
             loaded_routes: std::collections::HashSet::new(),
             no_proxy_hosts: Vec::new(),
             intercept_ca_path: None,
+            diagnostics: vec![],
         };
 
         let vars = handle.env_vars();

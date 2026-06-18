@@ -1,9 +1,7 @@
-//! CLI-owned diagnostic rendering and stderr heuristics.
+//! CLI diagnostic footer and stderr parsing.
 //!
-//! The core `nono::diagnostic` module owns the structured denial records; this
-//! module owns all user-facing diagnostic UX: the `nono diagnostic` footer,
-//! CLI flag suggestions, policy explanations, and best-effort parsing of a
-//! command's own error output.
+//! Structured denial records live in `nono::diagnostic`. This module renders
+//! them and applies CLI-specific policy labels and flag formatting.
 
 mod formatter;
 

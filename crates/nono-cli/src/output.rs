@@ -520,6 +520,54 @@ pub fn print_warning(message: &str) {
     eprintln!("  {} {}", fg("warning:", t.red).bold(), fg(message, t.text),);
 }
 
+/// Print proxy credential warnings collected at startup.
+pub fn print_proxy_diagnostics(diagnostics: &[nono_proxy::ProxyDiagnostic]) {
+    if diagnostics.is_empty() {
+        return;
+    }
+
+    let t = theme::current();
+    eprintln!();
+    eprintln!(
+        "  {}",
+        theme::fg("Proxy credential warnings:", t.red).bold(),
+    );
+    for diagnostic in diagnostics {
+        let code = diagnostic.code.as_str();
+        eprintln!(
+            "  {} /{} — {}",
+            theme::fg(code, t.subtext),
+            diagnostic.route_prefix,
+            fg(&diagnostic.message, t.text),
+        );
+        if let Some(hint) = &diagnostic.hint {
+            eprintln!("    {}", theme::fg(hint, t.subtext));
+        } else if let Some(action) = proxy_diagnostic_action(&diagnostic.code) {
+            eprintln!("    {}", theme::fg(action, t.subtext));
+        }
+    }
+}
+
+fn proxy_diagnostic_action(code: &nono_proxy::ProxyDiagnosticCode) -> Option<&'static str> {
+    use nono_proxy::ProxyDiagnosticCode;
+    match code {
+        ProxyDiagnosticCode::CredentialNotFound => Some(
+            "Configure a valid credential reference for this route, or use an explicit upstream credential.",
+        ),
+        ProxyDiagnosticCode::CredentialUnavailable => Some(
+            "Unlock the system keychain or authenticate with your credential provider (e.g. `op signin`).",
+        ),
+        ProxyDiagnosticCode::OAuthClientIdUnavailable
+        | ProxyDiagnosticCode::OAuthClientSecretUnavailable => {
+            Some("Provide OAuth client credentials via env/keystore configuration for this route.")
+        }
+        ProxyDiagnosticCode::OAuthTokenExchangeFailed => {
+            Some("Verify OAuth client credentials and provider availability, then retry.")
+        }
+        _ => None,
+    }
+}
+
 /// Format startup-blocked lines for writing to /dev/tty or stderr.
 /// Returns a Vec of lines ready to write (without trailing newline).
 pub fn format_startup_blocked(

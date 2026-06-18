@@ -16,6 +16,8 @@ crate-type = ["cdylib", "staticlib"]
 
 [dependencies]
 nono = { version = "0.63.0", path = "../../crates/nono", default-features = false }
+serde.workspace = true
+serde_json.workspace = true
 
 [build-dependencies]
 cbindgen.workspace = true

@@ -560,6 +560,61 @@ pub fn print_result(result: &QueryResult) {
     }
 }
 
+/// Format a flag for a known grant target (file vs directory).
+pub(crate) fn suggested_flag_for_existing_target(
+    target: &Path,
+    is_file: bool,
+    requested: AccessMode,
+) -> String {
+    let flag = if is_file {
+        match requested {
+            AccessMode::Read => "--read-file",
+            AccessMode::Write => "--write-file",
+            AccessMode::ReadWrite => "--allow-file",
+        }
+    } else {
+        match requested {
+            AccessMode::Read => "--read",
+            AccessMode::Write => "--write",
+            AccessMode::ReadWrite => "--allow",
+        }
+    };
+
+    format!("{flag} {}", target.display())
+}
+
+/// Map a remediation to a CLI flag string when one applies.
+pub(crate) fn suggested_flag_for_remediation(rem: &nono::NonoRemediation) -> Option<String> {
+    match rem {
+        nono::NonoRemediation::GrantPath {
+            path,
+            access,
+            is_file,
+        } => {
+            if *is_file && !path.exists() {
+                Some(suggested_flag_for_path(path, *access))
+            } else {
+                Some(suggested_flag_for_existing_target(path, *is_file, *access))
+            }
+        }
+        nono::NonoRemediation::GrantUnixSocket { path, bind } => {
+            let flag = if *bind {
+                "--allow-unix-socket-bind"
+            } else {
+                "--allow-unix-socket"
+            };
+            Some(format!("{flag} {}", path.display()))
+        }
+        nono::NonoRemediation::AllowCwd => Some("--allow-cwd".to_string()),
+        nono::NonoRemediation::DisableRollback => Some("--no-rollback".to_string()),
+        nono::NonoRemediation::GrantNetwork => Some("--allow-net".to_string()),
+        nono::NonoRemediation::RunDiscovery
+        | nono::NonoRemediation::CheckPolicy
+        | nono::NonoRemediation::AuthenticateCredentialProvider { .. }
+        | nono::NonoRemediation::AdjustRollbackBudget { .. } => None,
+    }
+}
+
 pub(crate) fn suggested_flag_for_path(path: &Path, requested: AccessMode) -> String {
     let (flag, target) = suggested_flag_parts(path, requested);
     format!("{flag} {}", target.display())

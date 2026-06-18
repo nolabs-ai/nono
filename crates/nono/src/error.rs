@@ -198,3 +198,141 @@ pub enum NonoError {
 
 /// Result type alias for nono operations
 pub type Result<T> = std::result::Result<T, NonoError>;
+
+impl NonoError {
+    /// Map this error to a [`NonoDiagnosticCode`].
+    #[must_use]
+    pub fn diagnostic_code(&self) -> crate::diagnostic::NonoDiagnosticCode {
+        use crate::diagnostic::NonoDiagnosticCode;
+        match self {
+            Self::CwdPromptRequired => NonoDiagnosticCode::CwdAccessRequired,
+            Self::SecretNotFound(_) => NonoDiagnosticCode::CredentialNotFound,
+            Self::KeystoreAccess(_) => NonoDiagnosticCode::CredentialUnavailable,
+            Self::UnsupportedPlatform(_) | Self::NetworkFilterUnsupported { .. } => {
+                NonoDiagnosticCode::UnsupportedPlatformFeature
+            }
+            Self::SandboxInit(_) | Self::BlockedCommand { .. } => {
+                NonoDiagnosticCode::SandboxDeniedPath
+            }
+            Self::TrustVerification { .. }
+            | Self::TrustSigning { .. }
+            | Self::TrustPolicy(_)
+            | Self::BlocklistBlocked { .. }
+            | Self::InstructionFileDenied { .. }
+            | Self::PackageVerification { .. } => NonoDiagnosticCode::TrustVerificationFailed,
+            Self::Snapshot(msg) | Self::ObjectStore(msg) if msg.contains("budget exceeded") => {
+                NonoDiagnosticCode::RollbackBudgetExceeded
+            }
+            Self::Cancelled(_) => NonoDiagnosticCode::Cancelled,
+            Self::Io(_) | Self::CommandExecution(_) => NonoDiagnosticCode::IoError,
+            Self::ConfigParse(_)
+            | Self::ConfigWrite { .. }
+            | Self::ConfigRead { .. }
+            | Self::InvalidConfig { .. }
+            | Self::ProfileNotFound(_)
+            | Self::ProfileRead { .. }
+            | Self::ProfileParse(_)
+            | Self::ProfileInheritance(_)
+            | Self::HomeNotFound
+            | Self::Setup(_)
+            | Self::LearnError(_)
+            | Self::HookInstall(_)
+            | Self::EnvVarValidation { .. }
+            | Self::CapFileValidation { .. }
+            | Self::CapFileTooLarge { .. }
+            | Self::VersionDowngrade { .. }
+            | Self::PackageInstall(_)
+            | Self::ActionRequired(_)
+            | Self::RegistryError(_)
+            | Self::AttachBusy
+            | Self::SessionGone
+            | Self::NoCapabilities
+            | Self::NoCommand => NonoDiagnosticCode::ConfigurationError,
+            Self::PathNotFound(_)
+            | Self::ExpectedDirectory(_)
+            | Self::ExpectedFile(_)
+            | Self::PathCanonicalization { .. }
+            | Self::HashMismatch { .. }
+            | Self::SessionNotFound(_)
+            | Self::ObjectStore(_)
+            | Self::Snapshot(_) => NonoDiagnosticCode::Other,
+            #[cfg(target_os = "linux")]
+            Self::Landlock(_) | Self::LandlockPath(_) => NonoDiagnosticCode::SandboxDeniedPath,
+        }
+    }
+
+    /// Remediation action when the library can suggest one without CLI context.
+    #[must_use]
+    pub fn remediation(&self) -> Option<crate::diagnostic::NonoRemediation> {
+        use crate::diagnostic::NonoRemediation;
+        match self {
+            Self::CwdPromptRequired => Some(NonoRemediation::AllowCwd),
+            Self::SecretNotFound(_) | Self::KeystoreAccess(_) => {
+                Some(NonoRemediation::AuthenticateCredentialProvider {
+                    provider: "keystore".to_string(),
+                })
+            }
+            Self::Snapshot(msg) | Self::ObjectStore(msg) if msg.contains("budget exceeded") => {
+                Some(NonoRemediation::AdjustRollbackBudget {
+                    current_bytes: None,
+                    limit_bytes: None,
+                })
+            }
+            Self::Snapshot(msg) | Self::ObjectStore(msg)
+                if msg.contains("--no-rollback") || msg.contains("disable rollback") =>
+            {
+                Some(NonoRemediation::DisableRollback)
+            }
+            Self::NetworkFilterUnsupported { .. } => Some(NonoRemediation::GrantNetwork),
+            Self::ProfileNotFound(_)
+            | Self::ProfileParse(_)
+            | Self::NoCapabilities
+            | Self::ConfigParse(_) => Some(NonoRemediation::CheckPolicy),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::{NonoError, Result};
+    use crate::diagnostic::{NonoDiagnosticCode, NonoRemediation};
+
+    #[test]
+    fn cwd_prompt_maps_to_structured_code_and_remediation() {
+        let err = NonoError::CwdPromptRequired;
+        assert_eq!(err.diagnostic_code(), NonoDiagnosticCode::CwdAccessRequired);
+        assert_eq!(err.remediation(), Some(NonoRemediation::AllowCwd));
+    }
+
+    #[test]
+    fn secret_not_found_maps_to_credential_not_found() {
+        let err = NonoError::SecretNotFound("missing".to_string());
+        assert_eq!(
+            err.diagnostic_code(),
+            NonoDiagnosticCode::CredentialNotFound
+        );
+        assert!(matches!(
+            err.remediation(),
+            Some(NonoRemediation::AuthenticateCredentialProvider { .. })
+        ));
+    }
+
+    #[test]
+    fn rollback_budget_error_maps_to_structured_code() -> Result<()> {
+        let err = NonoError::Snapshot(
+            "Rollback budget exceeded: 10 bytes tracked (limit: 5 bytes). \
+             or disable rollback with --no-rollback."
+                .to_string(),
+        );
+        assert_eq!(
+            err.diagnostic_code(),
+            NonoDiagnosticCode::RollbackBudgetExceeded
+        );
+        assert!(matches!(
+            err.remediation(),
+            Some(NonoRemediation::AdjustRollbackBudget { .. })
+        ));
+        Ok(())
+    }
+}

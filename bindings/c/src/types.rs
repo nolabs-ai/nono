@@ -183,3 +183,53 @@ pub enum NonoErrorCode {
     /// Unknown or uncategorized error.
     ErrUnknown = -99,
 }
+
+/// Diagnostic code for sandbox and setup errors.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NonoDiagnosticCode {
+    SandboxDeniedPath = 0,
+    SandboxDeniedNetwork = 1,
+    SandboxDeniedUnixSocket = 2,
+    CommandNotFound = 3,
+    CommandFailedLikelySandbox = 4,
+    CommandFailedApplication = 5,
+    CredentialNotFound = 6,
+    CredentialUnavailable = 7,
+    UnsupportedPlatformFeature = 8,
+    RollbackBudgetExceeded = 9,
+    CwdAccessRequired = 10,
+    ConfigurationError = 11,
+    TrustVerificationFailed = 12,
+    IoError = 13,
+    Cancelled = 14,
+    Other = 99,
+}
+
+impl From<nono::NonoDiagnosticCode> for NonoDiagnosticCode {
+    fn from(code: nono::NonoDiagnosticCode) -> Self {
+        match code {
+            nono::NonoDiagnosticCode::SandboxDeniedPath => Self::SandboxDeniedPath,
+            nono::NonoDiagnosticCode::SandboxDeniedNetwork => Self::SandboxDeniedNetwork,
+            nono::NonoDiagnosticCode::SandboxDeniedUnixSocket => Self::SandboxDeniedUnixSocket,
+            nono::NonoDiagnosticCode::CommandNotFound => Self::CommandNotFound,
+            nono::NonoDiagnosticCode::CommandFailedLikelySandbox => {
+                Self::CommandFailedLikelySandbox
+            }
+            nono::NonoDiagnosticCode::CommandFailedApplication => Self::CommandFailedApplication,
+            nono::NonoDiagnosticCode::CredentialNotFound => Self::CredentialNotFound,
+            nono::NonoDiagnosticCode::CredentialUnavailable => Self::CredentialUnavailable,
+            nono::NonoDiagnosticCode::UnsupportedPlatformFeature => {
+                Self::UnsupportedPlatformFeature
+            }
+            nono::NonoDiagnosticCode::RollbackBudgetExceeded => Self::RollbackBudgetExceeded,
+            nono::NonoDiagnosticCode::CwdAccessRequired => Self::CwdAccessRequired,
+            nono::NonoDiagnosticCode::ConfigurationError => Self::ConfigurationError,
+            nono::NonoDiagnosticCode::TrustVerificationFailed => Self::TrustVerificationFailed,
+            nono::NonoDiagnosticCode::IoError => Self::IoError,
+            nono::NonoDiagnosticCode::Cancelled => Self::Cancelled,
+            nono::NonoDiagnosticCode::Other => Self::Other,
+            _ => Self::Other,
+        }
+    }
+}

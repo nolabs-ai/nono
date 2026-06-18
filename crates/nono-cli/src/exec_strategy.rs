@@ -24,7 +24,8 @@ use nix::unistd::{ForkResult, Pid, fork};
 use nono::supervisor::{ApprovalDecision, AuditEntry, SupervisorMessage, SupervisorResponse};
 use nono::{
     ApprovalBackend, CapabilitySet, DenialReason, DenialRecord, NonoError, Result, Sandbox,
-    SupervisorListener, SupervisorSocket, UnixSocketCapability, UnixSocketMode,
+    SessionDiagnosticReport, SupervisorListener, SupervisorSocket, UnixSocketCapability,
+    UnixSocketMode,
 };
 use std::collections::HashSet;
 use std::ffi::{CString, OsStr};
@@ -209,6 +210,10 @@ pub struct ExecConfig<'a> {
     pub current_dir: &'a std::path::Path,
     /// Whether to suppress diagnostic output.
     pub no_diagnostics: bool,
+    /// Emit session diagnostics as JSON on stderr after the run.
+    pub diagnostics_json: bool,
+    /// Proxy startup diagnostics when a credential proxy is active.
+    pub proxy_diagnostics: Option<&'a [nono_proxy::ProxyDiagnostic]>,
     /// Threading context for fork safety validation.
     pub threading: ThreadingContext,
     /// Paths that are write-protected (signed instruction files).
@@ -1334,7 +1339,7 @@ pub fn execute_supervised(
 
             // Print diagnostic footer on non-zero exit or when the PTY
             // output or OS sandbox logs show a likely sandbox-related issue.
-            if should_print_diagnostics {
+            if should_print_diagnostics || config.diagnostics_json {
                 let diag_session_id = if supervisor.is_some() {
                     pty_session_id
                         .or_else(|| supervisor.map(|s| s.session_id))
@@ -1355,7 +1360,7 @@ pub fn execute_supervised(
                     .iter()
                     .map(|d| nono::try_canonicalize(&d.path))
                     .collect();
-                let mut formatter = DiagnosticFormatter::new(config.caps)
+                let mut base_formatter = DiagnosticFormatter::new(config.caps)
                     .with_mode(mode)
                     .with_denials(&denials)
                     .with_ipc_denials(&ipc_denials)
@@ -1371,14 +1376,28 @@ pub fn execute_supervised(
                     )
                     .with_canonical_denial_paths(canonical_denial_paths);
                 if let Some(program) = config.command.first() {
-                    formatter = formatter.with_command(crate::diagnostic::CommandContext {
-                        program: program.clone(),
-                        resolved_path: config.resolved_program.to_path_buf(),
-                        args: nono::scrub_argv_with_policy(config.command, redaction_policy),
-                    });
+                    base_formatter =
+                        base_formatter.with_command(crate::diagnostic::CommandContext {
+                            program: program.clone(),
+                            resolved_path: config.resolved_program.to_path_buf(),
+                            args: nono::scrub_argv_with_policy(config.command, redaction_policy),
+                        });
                 }
-                let footer = formatter.format_footer(exit_code);
-                crate::output::print_diagnostic_footer(&footer);
+
+                let diagnostic_report = base_formatter.build_session_report(exit_code);
+
+                if config.diagnostics_json
+                    && let Err(e) =
+                        emit_merged_diagnostics_json(&diagnostic_report, config.proxy_diagnostics)
+                {
+                    warn!("Failed to emit diagnostics JSON: {e}");
+                }
+
+                if should_print_diagnostics {
+                    let formatter = base_formatter.with_session_report(&diagnostic_report);
+                    let footer = formatter.format_footer(exit_code);
+                    crate::output::print_diagnostic_footer(&footer);
+                }
             }
 
             if should_offer_profile_save(
@@ -1473,16 +1492,11 @@ fn build_policy_explanations(
     let mut explanations = Vec::new();
     for (path, access) in paths {
         match crate::query_ext::query_path(&path, access, caps, &[]) {
-            Ok(crate::query_ext::QueryResult::Denied {
-                reason,
-                suggested_flag,
-                ..
-            }) => {
+            Ok(crate::query_ext::QueryResult::Denied { reason, .. }) => {
                 explanations.push(PolicyExplanation {
                     path,
                     access,
                     reason,
-                    suggested_flag,
                 });
             }
             Ok(crate::query_ext::QueryResult::Allowed { .. }) => {
@@ -1523,6 +1537,28 @@ fn login_keychain_db_path() -> Option<PathBuf> {
     crate::config::validated_home()
         .ok()
         .map(|home| PathBuf::from(home).join("Library/Keychains/login.keychain-db"))
+}
+
+/// Write merged session and proxy diagnostics JSON to stderr.
+fn emit_merged_diagnostics_json(
+    report: &SessionDiagnosticReport,
+    proxy_diagnostics: Option<&[nono_proxy::ProxyDiagnostic]>,
+) -> Result<()> {
+    let proxy_json = proxy_diagnostics
+        .filter(|d| !d.is_empty())
+        .map(|diagnostics| {
+            serde_json::to_string(diagnostics)
+                .map_err(|e| NonoError::ConfigParse(format!("proxy diagnostics JSON error: {e}")))
+        });
+    let proxy_json = match proxy_json {
+        Some(Ok(json)) => Some(json),
+        Some(Err(e)) => return Err(e),
+        None => None,
+    };
+    let pretty =
+        SessionDiagnosticReport::merge_with_proxy_json(&report.to_json()?, proxy_json.as_deref())?;
+    print_terminal_safe_stderr(&pretty);
+    Ok(())
 }
 
 fn should_print_diagnostic_footer(
@@ -3735,6 +3771,67 @@ mod tests {
     }
 
     #[test]
+    fn test_session_diagnostic_report_matches_denial_sources() {
+        let denials = vec![DenialRecord {
+            path: PathBuf::from("/tmp/secret.txt"),
+            access: nono::AccessMode::Read,
+            reason: DenialReason::UserDenied,
+        }];
+        let ipc_denials = vec![nono::IpcDenialRecord::new(
+            "/run/user/1000/bus".to_string(),
+            "connect".to_string(),
+            "no matching unix_socket capability".to_string(),
+            Some(nono::NonoRemediation::GrantUnixSocket {
+                path: PathBuf::from("/run/user/1000/bus"),
+                bind: false,
+            }),
+        )];
+        let violations = vec![nono::SandboxViolation {
+            operation: "file-read-data".to_string(),
+            target: Some("/etc/hosts".to_string()),
+        }];
+
+        let report = SessionDiagnosticReport::from_session(1, denials, ipc_denials, violations);
+
+        assert_eq!(report.exit_code, 1);
+        assert_eq!(
+            report.denials.len(),
+            2,
+            "filesystem violations merge into denials"
+        );
+        assert_eq!(report.ipc_denials.len(), 1);
+        assert_eq!(report.violations.len(), 1);
+        assert_eq!(report.diagnostics.len(), 3);
+        assert_eq!(
+            report
+                .diagnostics
+                .iter()
+                .filter(|d| d.code == nono::NonoDiagnosticCode::SandboxDeniedPath)
+                .count(),
+            2,
+            "expected path diagnostics for logged denial and filesystem violation"
+        );
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|d| d.code == nono::NonoDiagnosticCode::SandboxDeniedUnixSocket)
+        );
+        assert!(
+            report
+                .denials
+                .iter()
+                .any(|d| d.path == Path::new("/tmp/secret.txt"))
+        );
+        assert!(
+            report
+                .denials
+                .iter()
+                .any(|d| d.path == Path::new("/etc/hosts"))
+        );
+    }
+
+    #[test]
     fn test_diagnostic_footer_triggers_on_successful_sandbox_violation() {
         let violations = vec![nono::SandboxViolation {
             operation: "file-read-data".to_string(),
@@ -3767,7 +3864,6 @@ mod tests {
             path: PathBuf::from("/tmp/secret.txt"),
             access: nono::AccessMode::Read,
             reason: "path_not_granted".to_string(),
-            suggested_flag: Some("--read-file /tmp/secret.txt".to_string()),
         }];
         let observation = crate::diagnostic::ErrorObservation::default();
 

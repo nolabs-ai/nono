@@ -1,4 +1,4 @@
-//! Diagnostic output formatter for sandbox policy (CLI-owned).
+//! Diagnostic footer rendering for sandboxed command failures.
 //!
 //! This module provides human and agent-readable diagnostic output
 //! when sandboxed commands fail. The output helps identify whether
@@ -18,8 +18,13 @@
 //! - **Actionable**: Provides specific flags to grant additional access
 //! - **Mode-aware**: Different guidance for supervised vs standard mode
 
+use nono::SessionDiagnosticReport;
 use nono::diagnostic::{
-    DenialReason, DenialRecord, IpcDenialRecord, SandboxViolation, seatbelt_operation_to_access,
+    DenialReason, DenialRecord, IpcDenialRecord, NonoDiagnostic, NonoDiagnosticCode,
+    NonoDiagnosticDetail, NonoRemediation, SandboxViolation, dedupe_denials,
+    diagnostic_application_failure, diagnostic_likely_sandbox_path, diagnostic_missing_path,
+    diagnostic_network_blocked, diagnostic_protected_file_write,
+    filesystem_denials_from_violations, follow_up_diagnostics,
 };
 use nono::try_canonicalize;
 use nono::{AccessMode, CapabilitySet, CapabilitySource};
@@ -38,8 +43,6 @@ pub struct PolicyExplanation {
     pub access: AccessMode,
     /// Why it was denied: "sensitive_path", "insufficient_access", or "path_not_granted".
     pub reason: String,
-    /// Suggested CLI flag to fix (e.g. "--read ~/.ssh/id_rsa").
-    pub suggested_flag: Option<String>,
 }
 
 /// Path-level hint extracted from a command's own error output.
@@ -75,6 +78,8 @@ pub struct ErrorObservation {
     pub missing_paths: Vec<PathBuf>,
     /// Error text that strongly suggests a non-sandbox application failure.
     pub non_sandbox_failure: Option<String>,
+    /// Stderr contains a pattern that might indicate network access was blocked.
+    pub network_blocked_hint: bool,
 }
 
 impl ErrorObservation {
@@ -85,6 +90,7 @@ impl ErrorObservation {
             || !self.path_hints.is_empty()
             || !self.missing_paths.is_empty()
             || self.non_sandbox_failure.is_some()
+            || self.network_blocked_hint
     }
 }
 
@@ -153,8 +159,12 @@ pub fn analyze_error_output(
     let mut pending_structured_access_denial = false;
     let mut pending_structured_access: Option<AccessMode> = None;
     let mut non_sandbox_failure = None;
+    let mut network_blocked_hint = false;
 
     for line in error_output.lines() {
+        if !network_blocked_hint && looks_like_network_denial(line) {
+            network_blocked_hint = true;
+        }
         if blocked_protected_file.is_none() {
             blocked_protected_file = detect_protected_file_in_error_line(protected_paths, line);
         }
@@ -243,6 +253,7 @@ pub fn analyze_error_output(
         path_hints,
         missing_paths: missing.into_iter().collect(),
         non_sandbox_failure,
+        network_blocked_hint,
     }
 }
 
@@ -284,6 +295,16 @@ fn detect_protected_file_in_error_line(
         }
     }
     None
+}
+
+fn looks_like_network_denial(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    (lower.contains("network") || lower.contains("socket") || lower.contains("connect"))
+        && (lower.contains("not permitted")
+            || lower.contains("permission denied")
+            || lower.contains("operation not permitted")
+            || lower.contains("connection refused")
+            || lower.contains("unreachable"))
 }
 
 fn looks_like_access_denial(line: &str) -> bool {
@@ -572,10 +593,7 @@ fn infer_access_from_error_line(line: &str, path: &Path) -> AccessMode {
     AccessMode::ReadWrite
 }
 
-/// Formats diagnostic information about sandbox policy.
-///
-/// This is library code that can be used by any parent process
-/// that wants to explain sandbox denials to users or AI agents.
+/// Renders sandbox policy diagnostics for stderr output.
 pub struct DiagnosticFormatter<'a> {
     caps: &'a CapabilitySet,
     mode: DiagnosticMode,
@@ -594,6 +612,8 @@ pub struct DiagnosticFormatter<'a> {
     missing_path_hints: Vec<PathBuf>,
     /// Error text that strongly suggests a non-sandbox application failure.
     non_sandbox_failure: Option<String>,
+    /// Stderr contains a pattern that might indicate network access was blocked.
+    network_blocked_hint: bool,
     /// Command that was executed (for context-aware diagnostics)
     command: Option<CommandContext>,
     /// Directory the child process started in.
@@ -615,6 +635,8 @@ pub struct DiagnosticFormatter<'a> {
     /// render loop so filesystem I/O is done once (by the caller, after the
     /// child exits) rather than once per denial per render method.
     canonical_denial_paths: Vec<PathBuf>,
+    /// Pre-built diagnostics; when empty, [`Self::format_footer`] builds a report on demand.
+    session_diagnostics: &'a [nono::NonoDiagnostic],
 }
 
 impl<'a> DiagnosticFormatter<'a> {
@@ -633,6 +655,7 @@ impl<'a> DiagnosticFormatter<'a> {
             observed_path_hints: Vec::new(),
             missing_path_hints: Vec::new(),
             non_sandbox_failure: None,
+            network_blocked_hint: false,
             command: None,
             current_dir: None,
             session_id: None,
@@ -640,6 +663,7 @@ impl<'a> DiagnosticFormatter<'a> {
             suppressed_paths: &[],
             suppressed_system_service_operations: &[],
             canonical_denial_paths: Vec::new(),
+            session_diagnostics: &[],
         }
     }
 
@@ -679,6 +703,99 @@ impl<'a> DiagnosticFormatter<'a> {
         self
     }
 
+    /// Diagnostics used for fix-flag rendering.
+    #[must_use]
+    pub fn with_session_diagnostics(mut self, diagnostics: &'a [nono::NonoDiagnostic]) -> Self {
+        self.session_diagnostics = diagnostics;
+        self
+    }
+
+    /// Attach diagnostics from a pre-built session report.
+    ///
+    /// Prefer [`Self::build_session_report`] so the footer and `--diagnostics-json`
+    /// share the same merge path.
+    #[must_use]
+    pub fn with_session_report(self, report: &'a SessionDiagnosticReport) -> Self {
+        self.with_session_diagnostics(&report.diagnostics)
+    }
+
+    /// Build a session report from this formatter's denial and observation inputs.
+    #[must_use]
+    pub fn build_session_report(&self, exit_code: i32) -> SessionDiagnosticReport {
+        let violations: Vec<SandboxViolation> = self
+            .sandbox_violations
+            .iter()
+            .filter(|violation| {
+                !self
+                    .suppressed_system_service_operations
+                    .contains(&violation.operation)
+            })
+            .cloned()
+            .collect();
+        let mut all_denials: Vec<DenialRecord> = self.denials.to_vec();
+        all_denials.extend(filesystem_denials_from_violations(&violations));
+        all_denials.extend(self.observed_denials_matching_logged_paths(&all_denials));
+        let deduped = dedupe_denials(&all_denials);
+        let mut report = SessionDiagnosticReport::from_merged_session(
+            exit_code,
+            deduped,
+            self.ipc_denials.to_vec(),
+            violations,
+        );
+        self.append_observation_diagnostics(&mut report.diagnostics);
+        report.diagnostics.extend(follow_up_diagnostics());
+        report
+    }
+
+    fn append_observation_diagnostics(&self, diagnostics: &mut Vec<NonoDiagnostic>) {
+        if let Some(ref file) = self.blocked_protected_file {
+            push_unique_diagnostic(diagnostics, diagnostic_protected_file_write(file.clone()));
+        }
+        for path in &self.missing_path_hints {
+            push_unique_diagnostic(diagnostics, diagnostic_missing_path(path.clone()));
+        }
+        if let Some(ref message) = self.non_sandbox_failure {
+            push_unique_diagnostic(diagnostics, diagnostic_application_failure(message.clone()));
+        }
+        if self.network_blocked_hint && self.caps.is_network_blocked() {
+            push_unique_diagnostic(diagnostics, diagnostic_network_blocked());
+        }
+        for hint in self.actionable_observed_path_hints() {
+            if observation_path_already_logged(diagnostics, &hint.path) {
+                continue;
+            }
+            let remediation = self.remediation_for_observed_hint(&hint);
+            push_unique_diagnostic(
+                diagnostics,
+                diagnostic_likely_sandbox_path(hint.path, hint.access, remediation),
+            );
+        }
+    }
+
+    fn remediation_for_observed_hint(&self, hint: &ObservedPathHint) -> NonoRemediation {
+        if self.observed_hint_points_to_ungranted_cwd(&hint.path) {
+            return NonoRemediation::AllowCwd;
+        }
+        if let Some(cap) = self.closest_covering_capability_any(&hint.path) {
+            let access = match (cap.access, hint.access) {
+                (AccessMode::Read, AccessMode::ReadWrite) => AccessMode::Write,
+                (AccessMode::Write, AccessMode::ReadWrite) => AccessMode::Read,
+                _ => hint.access,
+            };
+            return NonoRemediation::GrantPath {
+                is_file: cap.is_file,
+                path: cap.resolved.clone(),
+                access,
+            };
+        }
+        NonoRemediation::GrantPath {
+            is_file: hint.path.is_file()
+                || hint.path.file_name().is_some_and(|_| !hint.path.is_dir()),
+            path: hint.path.clone(),
+            access: hint.access,
+        }
+    }
+
     /// Add IPC denial records from a supervised session.
     #[must_use]
     pub fn with_ipc_denials(mut self, denials: &'a [IpcDenialRecord]) -> Self {
@@ -711,6 +828,7 @@ impl<'a> DiagnosticFormatter<'a> {
         self.observed_path_hints = observation.path_hints;
         self.missing_path_hints = observation.missing_paths;
         self.non_sandbox_failure = observation.non_sandbox_failure;
+        self.network_blocked_hint = observation.network_blocked_hint;
         self
     }
 
@@ -752,9 +870,20 @@ impl<'a> DiagnosticFormatter<'a> {
     /// The output is designed to be printed to stderr.
     #[must_use]
     pub fn format_footer(&self, exit_code: i32) -> String {
+        let report_storage;
+        let diagnostics = if self.session_diagnostics.is_empty() {
+            report_storage = self.build_session_report(exit_code);
+            &report_storage.diagnostics
+        } else {
+            self.session_diagnostics
+        };
         let body = match self.mode {
-            DiagnosticMode::Standard => self.format_standard_footer(exit_code),
-            DiagnosticMode::Supervised => self.format_supervised_footer(exit_code),
+            DiagnosticMode::Standard => {
+                self.format_standard_footer_with_diagnostics(exit_code, diagnostics)
+            }
+            DiagnosticMode::Supervised => {
+                self.format_supervised_footer_with_diagnostics(exit_code, diagnostics)
+            }
         };
         render_diagnostic_block(&body)
     }
@@ -987,19 +1116,22 @@ impl<'a> DiagnosticFormatter<'a> {
         lines
     }
 
-    /// Standard mode footer: concise policy summary with --allow suggestions.
-    fn format_standard_footer(&self, exit_code: i32) -> String {
+    /// Standard-mode footer from session diagnostics.
+    fn format_standard_footer_with_diagnostics(
+        &self,
+        exit_code: i32,
+        diagnostics: &[NonoDiagnostic],
+    ) -> String {
         let mut lines = Vec::new();
-        let observed_hints = self.actionable_observed_path_hints();
-        let primary_verdict = self.primary_observation_verdict();
-        let has_observation = self.has_error_observation();
+        let stderr_likely = stderr_likely_sandbox_diagnostics(diagnostics);
+        let has_stderr_findings = !stderr_likely.is_empty()
+            || stderr_missing_path_diagnostic(diagnostics).is_some()
+            || stderr_application_failure_diagnostic(diagnostics).is_some()
+            || stderr_protected_file_diagnostic(diagnostics).is_some()
+            || stderr_network_diagnostic(diagnostics).is_some();
 
-        // Check if this was a protected file write attempt
-        if let Some(ref blocked_file) = self.blocked_protected_file {
-            lines.push(format!(
-                "[nono] Write to '{}' blocked: file is a signed instruction file.",
-                blocked_file
-            ));
+        if let Some(diagnostic) = stderr_protected_file_diagnostic(diagnostics) {
+            lines.push(format!("[nono] {}", diagnostic.message));
             lines.push(
                 "[nono] Signed instruction files are write-protected to prevent tampering."
                     .to_string(),
@@ -1009,113 +1141,103 @@ impl<'a> DiagnosticFormatter<'a> {
                 "[nono] The command failed. (exit code {})",
                 exit_code
             ));
-        } else if matches!(
-            primary_verdict.as_ref(),
-            Some(ErrorVerdict::MissingPath(_)) | Some(ErrorVerdict::NonSandboxFailure(_))
-        ) {
+        } else if let Some(diagnostic) = stderr_missing_path_diagnostic(diagnostics) {
             lines.push(format_command_failed_not_sandbox_line(exit_code));
-        } else if exit_code == 0 && has_observation {
+            lines.push("[nono]".to_string());
+            self.format_missing_path_from_diagnostic(&mut lines, diagnostic);
+        } else if let Some(diagnostic) = stderr_application_failure_diagnostic(diagnostics) {
+            lines.push(format_command_failed_not_sandbox_line(exit_code));
+            lines.push("[nono]".to_string());
+            self.format_application_failure_from_diagnostic(&mut lines, diagnostic);
+        } else if exit_code == 0 && has_stderr_findings {
             lines.push(format_command_succeeded_with_stderr_line());
         } else {
             lines.extend(self.format_exit_explanation(exit_code));
         }
         lines.push("[nono]".to_string());
 
-        if self.blocked_protected_file.is_none()
-            && let Some(verdict) = primary_verdict.as_ref()
-        {
-            self.format_primary_verdict_guidance(&mut lines, verdict);
-            lines.push("[nono]".to_string());
+        if self.blocked_protected_file.is_none() {
+            if let Some(diagnostic) = stderr_likely.first().copied() {
+                self.format_likely_sandbox_from_diagnostic(&mut lines, diagnostic);
+                lines.push("[nono]".to_string());
+            } else if let Some(diagnostic) = stderr_network_diagnostic(diagnostics) {
+                self.format_network_denial_from_diagnostic(&mut lines, diagnostic);
+                lines.push("[nono]".to_string());
+            }
         }
 
-        // Concise policy summary: show user paths, summarize system/group paths
         lines.push("[nono] Sandbox policy:".to_string());
-
         self.format_allowed_paths_concise(&mut lines);
         self.format_network_status(&mut lines);
         self.format_protected_paths(&mut lines);
-        let additional_hints = if observed_hints.len() > 1 {
-            &observed_hints[1..]
+
+        let additional = if stderr_likely.len() > 1 {
+            &stderr_likely[1..]
         } else {
             &[]
         };
-        self.format_observed_path_hints(&mut lines, additional_hints);
+        self.format_likely_sandbox_list(&mut lines, additional);
 
-        // Help section (skip if the failure was specifically due to protected file)
-        if self.blocked_protected_file.is_none()
-            && observed_hints.is_empty()
-            && primary_verdict.is_none()
-        {
+        if self.blocked_protected_file.is_none() && !has_stderr_findings {
             lines.push("[nono]".to_string());
             self.format_grant_help(&mut lines);
             lines.push("[nono]".to_string());
-            self.format_follow_up_guidance(&mut lines, None);
+            self.format_follow_up_from_diagnostics(&mut lines, diagnostics);
         }
 
         lines.join("\n")
     }
 
-    /// Supervised mode footer: show denials and mode-specific guidance.
-    fn format_supervised_footer(&self, exit_code: i32) -> String {
+    /// Supervised-mode footer from session diagnostics.
+    fn format_supervised_footer_with_diagnostics(
+        &self,
+        exit_code: i32,
+        diagnostics: &[NonoDiagnostic],
+    ) -> String {
         let mut lines = Vec::new();
         let primary_verdict = self.primary_observation_verdict();
         let has_observation = self.has_error_observation();
 
-        let has_ipc_denials = !self.ipc_denials.is_empty();
+        let ipc_diagnostics = self.ipc_diagnostics(diagnostics);
+        let pathname_unix_diagnostics = self.pathname_unix_socket_diagnostics(diagnostics);
+        let path_diagnostics = self.path_diagnostics(diagnostics);
+        let system_service_diagnostics = self.system_service_diagnostics(diagnostics);
+        let has_path_findings =
+            !path_diagnostics.is_empty() || !pathname_unix_diagnostics.is_empty();
 
-        if self.denials.is_empty()
-            && !has_ipc_denials
+        if !has_path_findings
+            && ipc_diagnostics.is_empty()
             && matches!(
                 primary_verdict.as_ref(),
                 Some(ErrorVerdict::MissingPath(_)) | Some(ErrorVerdict::NonSandboxFailure(_))
             )
         {
             lines.push(format_command_failed_not_sandbox_line(exit_code));
-        } else if exit_code == 0 && has_observation && self.denials.is_empty() && !has_ipc_denials {
+        } else if exit_code == 0
+            && has_observation
+            && !has_path_findings
+            && ipc_diagnostics.is_empty()
+        {
             lines.push(format_command_succeeded_with_stderr_line());
         } else {
             lines.extend(self.format_exit_explanation(exit_code));
         }
         lines.push("[nono]".to_string());
 
-        // Convert macOS Seatbelt violations (operation + target) into
-        // DenialRecords so the same rendering logic handles both platforms.
-        let (violation_denials, mut non_fs_violations) =
-            violations_to_denials(self.sandbox_violations);
-        non_fs_violations.retain(|violation| {
-            !self
-                .suppressed_system_service_operations
-                .contains(&violation.operation)
-        });
-
-        // Merge supervisor denials (Linux seccomp) with violation-derived
-        // denials (macOS Seatbelt) into a single unified list.
-        let mut all_denials: Vec<DenialRecord> = self
-            .denials
-            .iter()
-            .cloned()
-            .chain(violation_denials)
-            .collect();
-        all_denials.extend(self.observed_denials_matching_logged_paths(&all_denials));
-
-        if !self.ipc_denials.is_empty() {
-            self.format_ipc_denial_guidance(&mut lines);
-            if !all_denials.is_empty() || !non_fs_violations.is_empty() {
+        if !ipc_diagnostics.is_empty() {
+            self.format_ipc_denial_guidance(&mut lines, &ipc_diagnostics, diagnostics);
+            if has_path_findings || !system_service_diagnostics.is_empty() {
                 lines.push("[nono]".to_string());
             }
         }
 
-        if all_denials.is_empty() && self.ipc_denials.is_empty() {
-            // No denials from either source.
-            if !non_fs_violations.is_empty() {
-                // Non-filesystem violations (mach-lookup, signal, etc.) —
-                // show them with human-readable descriptions.
+        if !has_path_findings && ipc_diagnostics.is_empty() {
+            if !system_service_diagnostics.is_empty() {
                 lines.push("[nono] Sandbox blocked system services:".to_string());
-                format_non_fs_violations(&mut lines, &non_fs_violations);
+                self.format_system_service_diagnostics(&mut lines, &system_service_diagnostics);
                 lines.push("[nono]".to_string());
-                format_non_fs_guidance(&mut lines, &non_fs_violations);
+                self.format_system_service_guidance(&mut lines, &system_service_diagnostics);
             } else {
-                // Genuinely no denials observed.
                 if let Some(verdict) = primary_verdict.as_ref() {
                     self.format_primary_verdict_guidance(&mut lines, verdict);
                     lines.push("[nono]".to_string());
@@ -1128,25 +1250,22 @@ impl<'a> DiagnosticFormatter<'a> {
             lines.push("[nono]".to_string());
             self.format_grant_help(&mut lines);
             lines.push("[nono]".to_string());
-            self.format_follow_up_guidance(&mut lines, None);
-        } else if !all_denials.is_empty() {
-            // Deduplicate by path, merging access modes. Classification into
-            // actionable vs. policy-blocked is done by the consolidated
-            // formatter using policy_explanations when available.
-            let deduped = dedupe_denials(&all_denials);
-            self.format_consolidated_denial_guidance(&mut lines, &deduped);
+            self.format_follow_up_from_diagnostics(&mut lines, diagnostics);
+        } else if has_path_findings {
+            self.format_consolidated_denial_guidance(
+                &mut lines,
+                &pathname_unix_diagnostics,
+                &path_diagnostics,
+                diagnostics,
+            );
 
-            // Show non-filesystem violations (mach-lookup, etc.) if any
-            if !non_fs_violations.is_empty() {
+            if !system_service_diagnostics.is_empty() {
                 lines.push("[nono]".to_string());
                 lines.push("[nono] Also blocked (system services):".to_string());
-                format_non_fs_violations(&mut lines, &non_fs_violations);
+                self.format_system_service_diagnostics(&mut lines, &system_service_diagnostics);
                 lines.push("[nono]".to_string());
-                format_non_fs_guidance(&mut lines, &non_fs_violations);
+                self.format_system_service_guidance(&mut lines, &system_service_diagnostics);
             }
-
-            // Note: `nono grant` suggestions are shown via desktop
-            // notifications during the session, not in the post-exit footer.
         }
 
         lines.join("\n")
@@ -1260,25 +1379,131 @@ impl<'a> DiagnosticFormatter<'a> {
         best_covering
     }
 
-    fn format_follow_up_guidance(
+    fn format_follow_up_from_diagnostics(
         &self,
         lines: &mut Vec<String>,
-        _hint: Option<(&Path, AccessMode)>,
+        diagnostics: &[NonoDiagnostic],
     ) {
         lines.push("[nono] Next steps:".to_string());
-        if let Some(command) = self.format_command_for_learn() {
-            lines.push(format!(
-                "[nono]   Add permissions: nono run --allow <path> -- {}",
-                command
-            ));
-        } else {
+        for diagnostic in diagnostics {
+            let Some(ref remediation) = diagnostic.remediation else {
+                continue;
+            };
+            match remediation {
+                NonoRemediation::RunDiscovery => {
+                    if let Some(command) = self.format_command_for_learn() {
+                        lines.push(format!(
+                            "[nono]   Add permissions: nono run --allow <path> -- {}",
+                            command
+                        ));
+                    } else {
+                        lines.push(
+                            "[nono]   Add permissions: nono run --allow <path> -- <your command>"
+                                .to_string(),
+                        );
+                    }
+                }
+                NonoRemediation::CheckPolicy => {
+                    lines.push(
+                        "[nono]   Query policy: nono why --path <path> --op <read|write|readwrite>"
+                            .to_string(),
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn format_likely_sandbox_from_diagnostic(
+        &self,
+        lines: &mut Vec<String>,
+        diagnostic: &NonoDiagnostic,
+    ) {
+        let Some(path) = diagnostic.path.as_ref() else {
+            return;
+        };
+        let access = diagnostic.access.unwrap_or(AccessMode::Read);
+        lines.push("[nono] Sandbox denial:".to_string());
+        if self.observed_hint_points_to_read_only_cwd(&ObservedPathHint {
+            path: path.clone(),
+            access,
+        }) {
             lines.push(
-                "[nono]   Add permissions: nono run --allow <path> -- <your command>".to_string(),
+                "[nono]   The command appears to be writing inside the current working directory,"
+                    .to_string(),
+            );
+            lines.push(
+                "[nono]   but the current working directory is read-only in this sandbox."
+                    .to_string(),
             );
         }
-        lines.push(
-            "[nono]   Query policy: nono why --path <path> --op <read|write|readwrite>".to_string(),
-        );
+        lines.push(format!(
+            "[nono]   {} ({})",
+            path.display(),
+            access_str(access),
+        ));
+        if let Some(ref remediation) = diagnostic.remediation
+            && let Some(flag) = crate::query_ext::suggested_flag_for_remediation(remediation)
+        {
+            lines.push(format!("[nono]   Try: {flag}"));
+        } else if diagnostic.remediation.is_none() {
+            lines.push(format!(
+                "[nono]   Try: {}",
+                self.suggested_flag_for_hint(path, access)
+            ));
+        }
+    }
+
+    fn format_likely_sandbox_list(&self, lines: &mut Vec<String>, diagnostics: &[&NonoDiagnostic]) {
+        if diagnostics.is_empty() {
+            return;
+        }
+        lines.push("[nono]   Likely blocked paths seen in the command output:".to_string());
+        for diagnostic in diagnostics {
+            if let (Some(path), Some(access)) = (&diagnostic.path, diagnostic.access) {
+                lines.push(format!(
+                    "[nono]     {} ({})",
+                    path.display(),
+                    access_str(access),
+                ));
+            }
+        }
+    }
+
+    fn format_missing_path_from_diagnostic(
+        &self,
+        lines: &mut Vec<String>,
+        diagnostic: &NonoDiagnostic,
+    ) {
+        if let Some(path) = &diagnostic.path {
+            self.format_primary_missing_path_guidance(lines, path);
+        }
+    }
+
+    fn format_application_failure_from_diagnostic(
+        &self,
+        lines: &mut Vec<String>,
+        diagnostic: &NonoDiagnostic,
+    ) {
+        let message = diagnostic
+            .message
+            .strip_prefix("command reported application error: ")
+            .unwrap_or(diagnostic.message.as_str());
+        self.format_non_sandbox_failure_guidance(lines, message);
+    }
+
+    fn format_network_denial_from_diagnostic(
+        &self,
+        lines: &mut Vec<String>,
+        diagnostic: &NonoDiagnostic,
+    ) {
+        lines.push("[nono] Sandbox denial:".to_string());
+        lines.push(format!("[nono]   {}", diagnostic.message));
+        if let Some(ref remediation) = diagnostic.remediation
+            && let Some(flag) = crate::query_ext::suggested_flag_for_remediation(remediation)
+        {
+            lines.push(format!("[nono]   Try: {flag}"));
+        }
     }
 
     fn format_primary_observed_guidance(&self, lines: &mut Vec<String>, hint: &ObservedPathHint) {
@@ -1356,48 +1581,48 @@ impl<'a> DiagnosticFormatter<'a> {
     fn format_consolidated_denial_guidance(
         &self,
         lines: &mut Vec<String>,
-        denials: &[DenialRecord],
+        pathname_unix_diagnostics: &[&NonoDiagnostic],
+        path_diagnostics: &[&NonoDiagnostic],
+        diagnostics: &[NonoDiagnostic],
     ) {
         const MAX_INLINE_LIST: usize = 10;
 
-        let (unix_socket_denials, path_denials): (Vec<&DenialRecord>, Vec<&DenialRecord>) = denials
-            .iter()
-            .partition(|denial| denial.reason == DenialReason::UnixSocketDenied);
-
-        if !unix_socket_denials.is_empty() {
-            let total = unix_socket_denials.len();
+        if !pathname_unix_diagnostics.is_empty() {
+            let total = pathname_unix_diagnostics.len();
             let plural_s = if total == 1 { "" } else { "s" };
             lines.push(format!(
                 "[nono] IPC denial: {} pathname Unix socket{} blocked.",
                 total, plural_s
             ));
-            for (idx, denial) in unix_socket_denials.iter().enumerate() {
+            for (idx, diagnostic) in pathname_unix_diagnostics.iter().enumerate() {
                 if idx >= MAX_INLINE_LIST {
                     lines.push(format!("[nono]   ... and {} more", total - idx));
                     break;
                 }
-                lines.push(format!("[nono]   {}", denial.path.display()));
+                if let Some(path) = &diagnostic.path {
+                    lines.push(format!("[nono]   {}", path.display()));
+                }
             }
-            let flags: Vec<String> = unix_socket_denials
-                .iter()
-                .map(|d| self.suggested_flag_for_denial(d))
-                .collect();
-            lines.push(format!("[nono] Fix flags: {}", flags.join(" ")));
+            let flags = self
+                .fix_flags_for_codes(diagnostics, &[NonoDiagnosticCode::SandboxDeniedUnixSocket]);
+            if !flags.is_empty() {
+                lines.push(format!("[nono] Fix flags: {}", flags.join(" ")));
+            }
         }
 
-        if path_denials.is_empty() {
+        if path_diagnostics.is_empty() {
             return;
         }
 
-        let total = path_denials.len();
-        let mut actionable: Vec<&DenialRecord> = Vec::new();
-        let mut policy_blocked: Vec<&DenialRecord> = Vec::new();
+        let total = path_diagnostics.len();
+        let mut actionable = 0usize;
+        let mut policy_blocked = 0usize;
 
-        for denial in &path_denials {
-            if self.is_denial_policy_blocked(denial) {
-                policy_blocked.push(denial);
+        for diagnostic in path_diagnostics {
+            if self.is_diagnostic_policy_blocked(diagnostic) {
+                policy_blocked += 1;
             } else {
-                actionable.push(denial);
+                actionable += 1;
             }
         }
 
@@ -1407,16 +1632,16 @@ impl<'a> DiagnosticFormatter<'a> {
             total, plural_s
         ));
 
-        for (idx, denial) in path_denials.iter().enumerate() {
+        for (idx, diagnostic) in path_diagnostics.iter().enumerate() {
             if idx >= MAX_INLINE_LIST {
                 lines.push(format!("[nono]   … and {} more", total - idx));
                 break;
             }
             let mut labels: Vec<&str> = Vec::new();
-            if self.is_denial_policy_blocked(denial) {
+            if self.is_diagnostic_policy_blocked(diagnostic) {
                 labels.push("permanently restricted");
             }
-            if self.is_denial_suppressed(denial) {
+            if self.is_diagnostic_suppressed(diagnostic) {
                 labels.push("save skipped");
             }
             let suffix = if labels.is_empty() {
@@ -1424,24 +1649,23 @@ impl<'a> DiagnosticFormatter<'a> {
             } else {
                 format!("  [{}]", labels.join(", "))
             };
-            lines.push(format!(
-                "[nono]   {} ({}){}",
-                denial.path.display(),
-                access_str(denial.access),
-                suffix,
-            ));
+            let path = diagnostic.path.as_deref().map(Path::display);
+            let access = diagnostic.access.map(access_str).unwrap_or("unknown");
+            if let Some(path) = path {
+                lines.push(format!("[nono]   {path} ({access}){suffix}"));
+            }
         }
 
-        if !actionable.is_empty() {
-            let flags: Vec<String> = actionable
-                .iter()
-                .map(|d| self.suggested_flag_for_denial(d))
-                .collect();
-            lines.push(format!("[nono] Fix flags: {}", flags.join(" ")));
+        if actionable > 0 {
+            let flags =
+                self.fix_flags_for_codes(diagnostics, &[NonoDiagnosticCode::SandboxDeniedPath]);
+            if !flags.is_empty() {
+                lines.push(format!("[nono] Fix flags: {}", flags.join(" ")));
+            }
         }
 
-        if !policy_blocked.is_empty() {
-            let n = policy_blocked.len();
+        if policy_blocked > 0 {
+            let n = policy_blocked;
             let (subject, verb) = if n == 1 {
                 ("1 path is", "")
             } else {
@@ -1460,108 +1684,201 @@ impl<'a> DiagnosticFormatter<'a> {
         }
     }
 
-    fn format_ipc_denial_guidance(&self, lines: &mut Vec<String>) {
+    fn format_ipc_denial_guidance(
+        &self,
+        lines: &mut Vec<String>,
+        ipc_diagnostics: &[&NonoDiagnostic],
+        diagnostics: &[NonoDiagnostic],
+    ) {
         const MAX_INLINE_LIST: usize = 10;
 
-        let total = self.ipc_denials.len();
+        let total = ipc_diagnostics.len();
         let plural_s = if total == 1 { "" } else { "s" };
         lines.push(format!(
             "[nono] IPC denial: {} Unix socket operation{} blocked.",
             total, plural_s
         ));
-        for (idx, denial) in self.ipc_denials.iter().enumerate() {
+        for (idx, diagnostic) in ipc_diagnostics.iter().enumerate() {
             if idx >= MAX_INLINE_LIST {
                 lines.push(format!("[nono]   ... and {} more", total - idx));
                 break;
             }
-            lines.push(format!(
-                "[nono]   {} {} ({})",
-                denial.operation, denial.target, denial.reason
-            ));
+            if let Some(NonoDiagnosticDetail::IpcDenial {
+                operation,
+                target,
+                ipc_reason,
+            }) = &diagnostic.detail
+            {
+                lines.push(format!("[nono]   {operation} {target} ({ipc_reason})"));
+            }
         }
 
-        let flags: Vec<&str> = self
-            .ipc_denials
-            .iter()
-            .filter_map(|denial| denial.suggested_flag.as_deref())
-            .collect();
+        let flags =
+            self.fix_flags_for_codes(diagnostics, &[NonoDiagnosticCode::SandboxDeniedUnixSocket]);
         if !flags.is_empty() {
             lines.push(format!("[nono] Fix flags: {}", flags.join(" ")));
         }
     }
 
-    /// Return the canonical form of `denial.path`, using the pre-computed
-    /// parallel vec when available to avoid repeated filesystem I/O.
-    fn canonical_for_denial<'b>(&'b self, denial: &DenialRecord) -> std::borrow::Cow<'b, Path> {
-        if let Some(canonical) = self
-            .denials
+    fn ipc_diagnostics<'diag>(
+        &self,
+        diagnostics: &'diag [NonoDiagnostic],
+    ) -> Vec<&'diag NonoDiagnostic> {
+        diagnostics
             .iter()
-            .position(|d| d.path == denial.path)
-            .and_then(|i| self.canonical_denial_paths.get(i))
-        {
-            return std::borrow::Cow::Borrowed(canonical.as_path());
-        }
-        std::borrow::Cow::Owned(nono::try_canonicalize(&denial.path))
+            .filter(|diagnostic| {
+                matches!(
+                    diagnostic.detail,
+                    Some(NonoDiagnosticDetail::IpcDenial { .. })
+                )
+            })
+            .collect()
     }
 
-    /// Return true when the denied path is in the caller-supplied suppression
-    /// list (i.e. `suppress_save_prompt` entries). Such paths are still denied
-    /// by the sandbox — this only controls whether they appear in the save
-    /// prompt and how they are labelled in the diagnostic footer.
-    fn is_denial_suppressed(&self, denial: &DenialRecord) -> bool {
+    fn pathname_unix_socket_diagnostics<'diag>(
+        &self,
+        diagnostics: &'diag [NonoDiagnostic],
+    ) -> Vec<&'diag NonoDiagnostic> {
+        diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                matches!(
+                    diagnostic.detail,
+                    Some(NonoDiagnosticDetail::SupervisedDenial {
+                        reason: DenialReason::UnixSocketDenied,
+                        ..
+                    })
+                )
+            })
+            .collect()
+    }
+
+    fn path_diagnostics<'diag>(
+        &self,
+        diagnostics: &'diag [NonoDiagnostic],
+    ) -> Vec<&'diag NonoDiagnostic> {
+        diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == NonoDiagnosticCode::SandboxDeniedPath)
+            .collect()
+    }
+
+    fn system_service_diagnostics<'diag>(
+        &self,
+        diagnostics: &'diag [NonoDiagnostic],
+    ) -> Vec<&'diag NonoDiagnostic> {
+        diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == NonoDiagnosticCode::UnsupportedPlatformFeature)
+            .collect()
+    }
+
+    fn is_diagnostic_policy_blocked(&self, diagnostic: &NonoDiagnostic) -> bool {
+        let Some(path) = &diagnostic.path else {
+            return false;
+        };
+        if !self.is_path_policy_blocked(path) {
+            return false;
+        }
+        matches!(
+            diagnostic.detail,
+            Some(NonoDiagnosticDetail::SupervisedDenial {
+                reason: DenialReason::PolicyBlocked,
+                ..
+            })
+        ) || self
+            .policy_explanations
+            .iter()
+            .any(|expl| expl.path == *path && expl.reason == "sensitive_path")
+    }
+
+    fn is_diagnostic_suppressed(&self, diagnostic: &NonoDiagnostic) -> bool {
+        let Some(path) = &diagnostic.path else {
+            return false;
+        };
         if self.suppressed_paths.is_empty() {
             return false;
         }
-        let canonical = self.canonical_for_denial(denial);
+        let canonical = self.canonical_for_diagnostic_path(path);
         self.suppressed_paths
             .iter()
             .any(|suppressed| canonical.starts_with(suppressed))
     }
 
-    /// Return true when the denial cannot be fixed by a path flag alone —
-    /// i.e. the path is blocked by the sensitive-path policy and requires a
-    /// profile with `filesystem.bypass_protection`.
-    fn is_denial_policy_blocked(&self, denial: &DenialRecord) -> bool {
-        if let Some(expl) = self
-            .policy_explanations
-            .iter()
-            .find(|e| e.path == denial.path)
+    fn canonical_for_diagnostic_path(&self, path: &Path) -> PathBuf {
+        if let Some(index) = self.denials.iter().position(|denial| denial.path == path)
+            && let Some(canonical) = self.canonical_denial_paths.get(index)
         {
-            return expl.reason == "sensitive_path";
+            return canonical.clone();
         }
-        // No explanation (e.g. Linux seccomp path without a matching lookup):
-        // trust the DenialRecord reason.
-        denial.reason == DenialReason::PolicyBlocked
+        nono::try_canonicalize(path)
     }
 
-    /// Build the CLI flag suggestion for a single denial. Prefers the
-    /// explanation's `suggested_flag` (which knows about parent-directory
-    /// canonicalization) and falls back to a local computation otherwise.
-    fn suggested_flag_for_denial(&self, denial: &DenialRecord) -> String {
-        if denial.reason == DenialReason::UnixSocketDenied {
-            let flag = if denial.access.contains(AccessMode::Write) {
-                "--allow-unix-socket-bind"
-            } else {
-                "--allow-unix-socket"
-            };
-            return format!("{} {}", flag, denial.path.display());
-        }
-
-        if let Some(flag) = self
-            .policy_explanations
+    fn format_system_service_diagnostics(
+        &self,
+        lines: &mut Vec<String>,
+        diagnostics: &[&NonoDiagnostic],
+    ) {
+        let violations: Vec<SandboxViolation> = diagnostics
             .iter()
-            .find(|e| e.path == denial.path && e.access == denial.access)
-            .and_then(|e| e.suggested_flag.clone())
-        {
-            // explanations' suggested_flag is of the form "--read /path".
-            // Strip any leading fix label that callers may have prepended.
-            return flag
-                .strip_prefix("Fix: ")
-                .or_else(|| flag.strip_prefix("Fix flags: "))
-                .map(str::to_string)
-                .unwrap_or(flag);
+            .filter_map(|diagnostic| sandbox_violation_owned_from_diagnostic(diagnostic))
+            .collect();
+        let borrowed: Vec<&SandboxViolation> = violations.iter().collect();
+        format_non_fs_violations(lines, &borrowed);
+    }
+
+    fn format_system_service_guidance(
+        &self,
+        lines: &mut Vec<String>,
+        diagnostics: &[&NonoDiagnostic],
+    ) {
+        let violations: Vec<SandboxViolation> = diagnostics
+            .iter()
+            .filter_map(|diagnostic| sandbox_violation_owned_from_diagnostic(diagnostic))
+            .collect();
+        let borrowed: Vec<&SandboxViolation> = violations.iter().collect();
+        format_non_fs_guidance(lines, &borrowed);
+    }
+
+    /// Collect CLI fix flags from structured session diagnostics.
+    fn fix_flags_for_codes(
+        &self,
+        diagnostics: &[NonoDiagnostic],
+        codes: &[NonoDiagnosticCode],
+    ) -> Vec<String> {
+        let mut flags = Vec::new();
+        for diagnostic in diagnostics {
+            if !codes.contains(&diagnostic.code) {
+                continue;
+            }
+            if diagnostic.code == NonoDiagnosticCode::SandboxDeniedPath
+                && let Some(path) = &diagnostic.path
+                && self.is_path_policy_blocked(path)
+            {
+                continue;
+            }
+            let Some(ref remediation) = diagnostic.remediation else {
+                continue;
+            };
+            let Some(flag) = crate::query_ext::suggested_flag_for_remediation(remediation) else {
+                continue;
+            };
+            if !flags.iter().any(|existing| existing == &flag) {
+                flags.push(flag);
+            }
         }
-        crate::query_ext::suggested_flag_for_path(&denial.path, denial.access)
+        flags
+    }
+
+    /// Return true when a path is permanently restricted by sensitive-path policy.
+    fn is_path_policy_blocked(&self, path: &Path) -> bool {
+        if let Some(expl) = self.policy_explanations.iter().find(|e| e.path == path) {
+            return expl.reason == "sensitive_path";
+        }
+        self.denials
+            .iter()
+            .find(|d| d.path == path)
+            .is_some_and(|d| d.reason == DenialReason::PolicyBlocked)
     }
 
     fn format_grant_help(&self, lines: &mut Vec<String>) {
@@ -1632,7 +1949,7 @@ impl<'a> DiagnosticFormatter<'a> {
             _ => requested,
         };
 
-        Some(suggested_flag_for_existing_target(
+        Some(crate::query_ext::suggested_flag_for_existing_target(
             &target,
             cap.is_file,
             requested,
@@ -1690,21 +2007,6 @@ impl<'a> DiagnosticFormatter<'a> {
             if group_count > 0 {
                 lines.push(format!("[nono]     + {} system/group path(s)", group_count));
             }
-        }
-    }
-
-    fn format_observed_path_hints(&self, lines: &mut Vec<String>, hints: &[ObservedPathHint]) {
-        if hints.is_empty() {
-            return;
-        }
-
-        lines.push("[nono]   Likely blocked paths seen in the command output:".to_string());
-        for hint in hints {
-            lines.push(format!(
-                "[nono]     {} ({})",
-                hint.path.display(),
-                access_str(hint.access),
-            ));
         }
     }
 
@@ -1954,6 +2256,20 @@ fn system_service_diagnostic_for(
         .find(|diagnostic| diagnostic.matches(violation))
 }
 
+fn sandbox_violation_owned_from_diagnostic(
+    diagnostic: &NonoDiagnostic,
+) -> Option<SandboxViolation> {
+    match &diagnostic.detail {
+        Some(NonoDiagnosticDetail::SeatbeltViolation { operation, target }) => {
+            Some(SandboxViolation {
+                operation: operation.clone(),
+                target: target.clone(),
+            })
+        }
+        _ => None,
+    }
+}
+
 /// Format non-filesystem violations with human-readable service descriptions.
 fn format_non_fs_violations(lines: &mut Vec<String>, violations: &[&SandboxViolation]) {
     for v in violations {
@@ -2036,83 +2352,6 @@ fn keychain_grant_guidance_for_path(path: &Path, display_path: &str) -> String {
     format!("[nono]   {flag} {display_path}")
 }
 
-/// Deduplicate denials by path, merging access modes. When the same path
-/// appears with multiple reasons, the most restrictive reason wins
-/// (`PolicyBlocked` > `InsufficientAccess` > `UserDenied` > `RateLimited` >
-/// `BackendError`). Output is sorted by path for stable rendering.
-fn dedupe_denials(denials: &[DenialRecord]) -> Vec<DenialRecord> {
-    let mut by_path = std::collections::BTreeMap::<PathBuf, (AccessMode, DenialReason)>::new();
-
-    for denial in denials {
-        by_path
-            .entry(denial.path.clone())
-            .and_modify(|(access, reason)| {
-                *access = merge_access_modes(*access, denial.access);
-                *reason = stricter_reason(reason.clone(), denial.reason.clone());
-            })
-            .or_insert_with(|| (denial.access, denial.reason.clone()));
-    }
-
-    by_path
-        .into_iter()
-        .map(|(path, (access, reason))| DenialRecord {
-            path,
-            access,
-            reason,
-        })
-        .collect()
-}
-
-fn stricter_reason(a: DenialReason, b: DenialReason) -> DenialReason {
-    fn rank(r: &DenialReason) -> u8 {
-        match r {
-            DenialReason::PolicyBlocked => 5,
-            DenialReason::UnixSocketDenied => 5,
-            DenialReason::InsufficientAccess => 4,
-            DenialReason::UserDenied => 3,
-            DenialReason::RateLimited => 2,
-            DenialReason::BackendError => 1,
-        }
-    }
-    if rank(&a) >= rank(&b) { a } else { b }
-}
-
-/// Convert `SandboxViolation`s with filesystem targets into `DenialRecord`s.
-///
-/// Non-filesystem violations (mach-lookup, signal, etc.) are returned
-/// separately since they can't be expressed as path grants.
-fn violations_to_denials(
-    violations: &[SandboxViolation],
-) -> (Vec<DenialRecord>, Vec<&SandboxViolation>) {
-    let mut denials = Vec::new();
-    let mut non_fs = Vec::new();
-    // Deduplicate: multiple operations on the same path merge into one denial
-    let mut seen = std::collections::BTreeMap::<PathBuf, AccessMode>::new();
-
-    for v in violations {
-        if let (Some(access), Some(target)) =
-            (seatbelt_operation_to_access(&v.operation), &v.target)
-        {
-            let path = PathBuf::from(target);
-            seen.entry(path)
-                .and_modify(|existing| *existing = merge_access_modes(*existing, access))
-                .or_insert(access);
-        } else {
-            non_fs.push(v);
-        }
-    }
-
-    for (path, access) in seen {
-        denials.push(DenialRecord {
-            path,
-            access,
-            reason: DenialReason::PolicyBlocked,
-        });
-    }
-
-    (denials, non_fs)
-}
-
 fn access_str(access: AccessMode) -> &'static str {
     match access {
         AccessMode::Read => "read",
@@ -2121,34 +2360,81 @@ fn access_str(access: AccessMode) -> &'static str {
     }
 }
 
+fn push_unique_diagnostic(diagnostics: &mut Vec<NonoDiagnostic>, diagnostic: NonoDiagnostic) {
+    if diagnostics.iter().any(|existing| existing == &diagnostic) {
+        return;
+    }
+    diagnostics.push(diagnostic);
+}
+
+fn observation_path_already_logged(diagnostics: &[NonoDiagnostic], path: &Path) -> bool {
+    diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.path.as_deref() == Some(path))
+}
+
+fn stderr_likely_sandbox_diagnostics(diagnostics: &[NonoDiagnostic]) -> Vec<&NonoDiagnostic> {
+    diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code == NonoDiagnosticCode::CommandFailedLikelySandbox)
+        .filter(|diagnostic| {
+            matches!(
+                diagnostic.detail,
+                Some(NonoDiagnosticDetail::StderrObservation {
+                    observation_kind: nono::StderrObservationKind::LikelySandboxPath,
+                })
+            )
+        })
+        .collect()
+}
+
+fn stderr_missing_path_diagnostic(diagnostics: &[NonoDiagnostic]) -> Option<&NonoDiagnostic> {
+    diagnostics.iter().find(|diagnostic| {
+        matches!(
+            diagnostic.detail,
+            Some(NonoDiagnosticDetail::StderrObservation {
+                observation_kind: nono::StderrObservationKind::MissingPath,
+            })
+        )
+    })
+}
+
+fn stderr_application_failure_diagnostic(
+    diagnostics: &[NonoDiagnostic],
+) -> Option<&NonoDiagnostic> {
+    diagnostics.iter().find(|diagnostic| {
+        matches!(
+            diagnostic.detail,
+            Some(NonoDiagnosticDetail::StderrObservation {
+                observation_kind: nono::StderrObservationKind::ApplicationFailure,
+            })
+        )
+    })
+}
+
+fn stderr_protected_file_diagnostic(diagnostics: &[NonoDiagnostic]) -> Option<&NonoDiagnostic> {
+    diagnostics.iter().find(|diagnostic| {
+        matches!(
+            diagnostic.detail,
+            Some(NonoDiagnosticDetail::StderrObservation {
+                observation_kind: nono::StderrObservationKind::ProtectedFileWrite,
+            })
+        )
+    })
+}
+
+fn stderr_network_diagnostic(diagnostics: &[NonoDiagnostic]) -> Option<&NonoDiagnostic> {
+    diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == NonoDiagnosticCode::SandboxDeniedNetwork)
+}
+
 fn merge_access_modes(existing: AccessMode, new: AccessMode) -> AccessMode {
     if existing == new {
         existing
     } else {
         AccessMode::ReadWrite
     }
-}
-
-fn suggested_flag_for_existing_target(
-    target: &Path,
-    is_file: bool,
-    requested: AccessMode,
-) -> String {
-    let flag = if is_file {
-        match requested {
-            AccessMode::Read => "--read-file",
-            AccessMode::Write => "--write-file",
-            AccessMode::ReadWrite => "--allow-file",
-        }
-    } else {
-        match requested {
-            AccessMode::Read => "--read",
-            AccessMode::Write => "--write",
-            AccessMode::ReadWrite => "--allow",
-        }
-    };
-
-    format!("{flag} {}", target.display())
 }
 
 fn shell_quote(s: &str) -> String {
@@ -2188,6 +2474,16 @@ mod tests {
             source: CapabilitySource::User,
         });
         caps
+    }
+
+    fn format_footer_with_session_report(
+        formatter: DiagnosticFormatter<'_>,
+        exit_code: i32,
+    ) -> String {
+        let report = formatter.build_session_report(exit_code);
+        formatter
+            .with_session_report(&report)
+            .format_footer(exit_code)
     }
 
     fn make_mixed_caps() -> CapabilitySet {
@@ -2621,6 +2917,7 @@ mod tests {
             }],
             missing_paths: Vec::new(),
             non_sandbox_failure: None,
+            network_blocked_hint: false,
         });
         let output = formatter.format_footer(1);
 
@@ -2646,6 +2943,7 @@ mod tests {
             }],
             missing_paths: Vec::new(),
             non_sandbox_failure: None,
+            network_blocked_hint: false,
         });
         let output = formatter.format_footer(0);
 
@@ -2666,6 +2964,7 @@ mod tests {
             path_hints: Vec::new(),
             missing_paths: vec![missing.clone()],
             non_sandbox_failure: None,
+            network_blocked_hint: false,
         });
         let output = formatter.format_footer(1);
         let missing_idx = match output.find("Missing path:") {
@@ -2702,6 +3001,7 @@ mod tests {
                 "EEXIST: file already exists, mkdir '/Users/luke/.local/share/opencode'"
                     .to_string(),
             ),
+            network_blocked_hint: false,
         });
         let output = formatter.format_footer(1);
 
@@ -2751,6 +3051,7 @@ mod tests {
             }],
             missing_paths: Vec::new(),
             non_sandbox_failure: None,
+            network_blocked_hint: false,
         });
         let output = formatter.format_footer(1);
 
@@ -2786,6 +3087,7 @@ mod tests {
                 }],
                 missing_paths: Vec::new(),
                 non_sandbox_failure: None,
+                network_blocked_hint: false,
             });
         let output = formatter.format_footer(1);
 
@@ -2829,6 +3131,7 @@ mod tests {
             }],
             missing_paths: Vec::new(),
             non_sandbox_failure: None,
+            network_blocked_hint: false,
         });
         let output = formatter.format_footer(1);
 
@@ -2878,6 +3181,7 @@ mod tests {
                 }],
                 missing_paths: Vec::new(),
                 non_sandbox_failure: None,
+                network_blocked_hint: false,
             });
         let output = formatter.format_footer(1);
 
@@ -2906,6 +3210,7 @@ mod tests {
                 }],
                 missing_paths: Vec::new(),
                 non_sandbox_failure: None,
+                network_blocked_hint: false,
             });
         let output = formatter.format_footer(0);
 
@@ -2929,6 +3234,7 @@ mod tests {
                 path_hints: Vec::new(),
                 missing_paths: vec![missing.clone()],
                 non_sandbox_failure: None,
+                network_blocked_hint: false,
             });
         let output = formatter.format_footer(1);
 
@@ -2959,6 +3265,7 @@ mod tests {
                     "EEXIST: file already exists, mkdir '/Users/luke/.local/share/opencode'"
                         .to_string(),
                 ),
+                network_blocked_hint: false,
             });
         let output = formatter.format_footer(1);
 
@@ -3016,12 +3323,12 @@ mod tests {
             target: Some(requested.display().to_string()),
         }];
 
-        let (denials, non_fs) = violations_to_denials(&violations);
+        let report = SessionDiagnosticReport::from_merged_session(1, vec![], vec![], violations);
 
-        assert!(non_fs.is_empty());
-        assert_eq!(denials.len(), 1);
-        assert_eq!(denials[0].path, requested);
-        assert_eq!(denials[0].access, AccessMode::Read);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.denials.len(), 1);
+        assert_eq!(report.denials[0].path, requested);
+        assert_eq!(report.denials[0].access, AccessMode::Read);
     }
 
     #[test]
@@ -3048,6 +3355,7 @@ mod tests {
                 }],
                 missing_paths: Vec::new(),
                 non_sandbox_failure: None,
+                network_blocked_hint: false,
             });
 
         let output = formatter.format_footer(1);
@@ -3103,14 +3411,14 @@ mod tests {
                 }],
                 missing_paths: Vec::new(),
                 non_sandbox_failure: None,
+                network_blocked_hint: false,
             })
             .with_policy_explanations(vec![PolicyExplanation {
                 path: denied.clone(),
                 access: AccessMode::Read,
                 reason: "path_not_granted".to_string(),
-                suggested_flag: Some(format!("--read {}", denied.display())),
             }]);
-        let output = formatter.format_footer(1);
+        let output = format_footer_with_session_report(formatter, 1);
 
         assert!(output.contains(&format!("{} (read+write)", denied.display())));
         assert!(output.contains(&format!("Fix flags: --allow {}", pkg.display())));
@@ -3246,6 +3554,26 @@ mod tests {
     }
 
     #[test]
+    fn test_ipc_denial_uses_remediation_for_flags() {
+        let caps = make_test_caps();
+        let ipc_denials = vec![nono::IpcDenialRecord::new(
+            "/run/user/1000/bus".to_string(),
+            "connect".to_string(),
+            "no matching unix_socket capability".to_string(),
+            Some(nono::NonoRemediation::GrantUnixSocket {
+                path: PathBuf::from("/run/user/1000/bus"),
+                bind: false,
+            }),
+        )];
+        let formatter = DiagnosticFormatter::new(&caps)
+            .with_mode(DiagnosticMode::Supervised)
+            .with_ipc_denials(&ipc_denials);
+        let output = format_footer_with_session_report(formatter, 1);
+
+        assert!(output.contains("Fix flags: --allow-unix-socket /run/user/1000/bus"));
+    }
+
+    #[test]
     fn test_supervised_unix_socket_denial_uses_ipc_guidance() {
         let caps = make_test_caps();
         let denials = vec![DenialRecord {
@@ -3256,7 +3584,7 @@ mod tests {
         let formatter = DiagnosticFormatter::new(&caps)
             .with_mode(DiagnosticMode::Supervised)
             .with_denials(&denials);
-        let output = formatter.format_footer(1);
+        let output = format_footer_with_session_report(formatter, 1);
 
         assert!(output.contains("IPC denial: 1 pathname Unix socket blocked."));
         assert!(output.contains("/run/user/1000/bus"));
@@ -3279,7 +3607,7 @@ mod tests {
         let formatter = DiagnosticFormatter::new(&caps)
             .with_mode(DiagnosticMode::Supervised)
             .with_denials(&denials);
-        let output = formatter.format_footer(1);
+        let output = format_footer_with_session_report(formatter, 1);
 
         assert!(output.contains("Sandbox denial: 1 path blocked."));
         assert!(output.contains(&denied_path.display().to_string()));
@@ -3306,7 +3634,7 @@ mod tests {
         let formatter = DiagnosticFormatter::new(&caps)
             .with_mode(DiagnosticMode::Supervised)
             .with_denials(&denials);
-        let output = formatter.format_footer(1);
+        let output = format_footer_with_session_report(formatter, 1);
 
         assert!(output.contains("Sandbox denial: 2 paths blocked."));
         // Policy-blocked path gets the marker.
@@ -3371,7 +3699,7 @@ mod tests {
         let formatter = DiagnosticFormatter::new(&caps)
             .with_mode(DiagnosticMode::Supervised)
             .with_denials(&denials);
-        let output = formatter.format_footer(1);
+        let output = format_footer_with_session_report(formatter, 1);
 
         // Single Fix line covers both paths.
         let fix_lines: Vec<&str> = output
@@ -3402,7 +3730,7 @@ mod tests {
         let formatter = DiagnosticFormatter::new(&caps)
             .with_mode(DiagnosticMode::Supervised)
             .with_denials(&denials);
-        let output = formatter.format_footer(1);
+        let output = format_footer_with_session_report(formatter, 1);
 
         assert!(output.contains("Sandbox denial: 15 paths blocked."));
         // First 10 paths listed, remaining 5 collapsed.
@@ -3446,7 +3774,7 @@ mod tests {
         let formatter = DiagnosticFormatter::new(&caps)
             .with_mode(DiagnosticMode::Supervised)
             .with_denials(&denials);
-        let output = formatter.format_footer(1);
+        let output = format_footer_with_session_report(formatter, 1);
 
         assert!(output.contains("Sandbox denial: 1 path blocked."));
         assert!(output.contains("/tmp/flood (read)"));
@@ -3484,7 +3812,7 @@ mod tests {
         let formatter = DiagnosticFormatter::new(&caps)
             .with_mode(DiagnosticMode::Supervised)
             .with_denials(&denials);
-        let output = formatter.format_footer(1);
+        let output = format_footer_with_session_report(formatter, 1);
 
         // The "Closest grant" hint moved out of the consolidated footer;
         // users can recover it with `nono why` if they want the detail.
@@ -3768,7 +4096,6 @@ mod tests {
             path: denied.clone(),
             access: AccessMode::Read,
             reason: "sensitive_path".to_string(),
-            suggested_flag: None,
         };
         let denials = vec![DenialRecord {
             path: denied,

@@ -357,7 +357,7 @@ const KEYRING_SERVICE: &str = nono::keystore::DEFAULT_SERVICE;
 ///
 /// Delegates to the appropriate URI-specific redaction helper so that
 /// secrets (account names, file paths, field names) are never echoed raw.
-fn redact_credential_ref(key: &str) -> String {
+pub(crate) fn redact_credential_ref(key: &str) -> String {
     if nono::keystore::is_op_uri(key) {
         nono::keystore::redact_op_uri(key)
     } else if nono::keystore::is_apple_password_uri(key) {

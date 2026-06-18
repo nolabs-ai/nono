@@ -474,7 +474,12 @@ pub struct ExternalProxyConfig {
 /// Authentication for an external proxy.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExternalProxyAuth {
-    /// Keystore account name for proxy credentials.
+    /// Proxy username (not secret; stored in config, not keyring).
+    pub username: String,
+
+    /// Keyring reference for the proxy password only.
+    /// Supports the same URI schemes as route `credential_key`
+    /// (plain account name, `op://`, `file://`, `env://`, etc.).
     pub keyring_account: String,
 
     /// Authentication scheme (only "basic" supported).
@@ -584,6 +589,22 @@ mod tests {
         assert_eq!(ext.bypass_hosts.len(), 2);
         assert_eq!(ext.bypass_hosts[0], "internal.corp");
         assert_eq!(ext.bypass_hosts[1], "*.private.net");
+    }
+
+    #[test]
+    fn test_external_proxy_auth_deserializes_with_username() {
+        let json = r#"{
+            "address": "proxy:3128",
+            "auth": {
+                "username": "alice",
+                "keyring_account": "corp-proxy-password"
+            }
+        }"#;
+        let ext: ExternalProxyConfig = serde_json::from_str(json).unwrap();
+        let auth = ext.auth.unwrap();
+        assert_eq!(auth.username, "alice");
+        assert_eq!(auth.keyring_account, "corp-proxy-password");
+        assert_eq!(auth.scheme, "basic");
     }
 
     #[test]

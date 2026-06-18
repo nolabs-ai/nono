@@ -1285,4 +1285,128 @@ mod tests {
         let result = partition_allow_domain(&policy, &entries);
         assert!(result.is_err());
     }
+
+    /// A profile with `custom_credentials` but no `credentials` list passes an
+    /// empty `service_names` slice.  `resolve_credentials` should still return
+    /// a route for each entry in `custom_credentials`.
+    #[test]
+    fn test_resolve_credentials_custom_credentials_without_service_names() {
+        use crate::profile::CustomCredentialDef;
+
+        let json = embedded_network_policy_json();
+        let policy = load_network_policy(json).unwrap();
+
+        let mut custom = HashMap::new();
+        custom.insert(
+            "mockhttp".to_string(),
+            CustomCredentialDef {
+                upstream: "https://mockhttp.org".to_string(),
+                credential_key: Some("env://MOCK_API_KEY".to_string()),
+                auth: None,
+                inject_mode: InjectMode::Header,
+                inject_header: "Authorization".to_string(),
+                credential_format: Some("Bearer {}".to_string()),
+                path_pattern: None,
+                path_replacement: None,
+                query_param_name: None,
+                proxy: None,
+                env_var: Some("MOCK_API_KEY".to_string()),
+                endpoint_rules: vec![],
+                tls_ca: None,
+                tls_client_cert: None,
+                tls_client_key: None,
+                aws_auth: None,
+            },
+        );
+
+        let routes = resolve_credentials(&policy, &[], &custom).unwrap();
+        assert_eq!(
+            routes.len(),
+            1,
+            "expected one route for the custom credential, got {}",
+            routes.len()
+        );
+        assert_eq!(routes[0].prefix, "mockhttp");
+        assert_eq!(routes[0].upstream, "https://mockhttp.org");
+        assert_eq!(
+            routes[0].env_var,
+            Some("MOCK_API_KEY".to_string()),
+            "env_var must be propagated from CustomCredentialDef"
+        );
+    }
+
+    /// When `service_names` is empty but multiple `custom_credentials` are
+    /// defined, `resolve_credentials` should return a route for every entry.
+    #[test]
+    fn test_resolve_credentials_all_custom_credentials_without_service_names() {
+        use crate::profile::CustomCredentialDef;
+
+        let json = embedded_network_policy_json();
+        let policy = load_network_policy(json).unwrap();
+
+        let mut custom = HashMap::new();
+        custom.insert(
+            "svc_a".to_string(),
+            CustomCredentialDef {
+                upstream: "https://svc-a.example.com".to_string(),
+                credential_key: Some("env://SVC_A_KEY".to_string()),
+                auth: None,
+                inject_mode: InjectMode::Header,
+                inject_header: "Authorization".to_string(),
+                credential_format: Some("Bearer {}".to_string()),
+                path_pattern: None,
+                path_replacement: None,
+                query_param_name: None,
+                proxy: None,
+                env_var: Some("SVC_A_KEY".to_string()),
+                endpoint_rules: vec![],
+                tls_ca: None,
+                tls_client_cert: None,
+                tls_client_key: None,
+                aws_auth: None,
+            },
+        );
+        custom.insert(
+            "svc_b".to_string(),
+            CustomCredentialDef {
+                upstream: "https://svc-b.example.com".to_string(),
+                credential_key: Some("env://SVC_B_KEY".to_string()),
+                auth: None,
+                inject_mode: InjectMode::Header,
+                inject_header: "Authorization".to_string(),
+                credential_format: Some("Bearer {}".to_string()),
+                path_pattern: None,
+                path_replacement: None,
+                query_param_name: None,
+                proxy: None,
+                env_var: Some("SVC_B_KEY".to_string()),
+                endpoint_rules: vec![],
+                tls_ca: None,
+                tls_client_cert: None,
+                tls_client_key: None,
+                aws_auth: None,
+            },
+        );
+
+        let routes = resolve_credentials(&policy, &[], &custom).unwrap();
+
+        assert_eq!(
+            routes.len(),
+            2,
+            "expected one route per custom credential, got {}",
+            routes.len()
+        );
+
+        let prefixes: Vec<&str> = routes.iter().map(|r| r.prefix.as_str()).collect();
+        assert!(
+            prefixes.contains(&"svc_a"),
+            "route for svc_a must be present; got: {:?}",
+            prefixes
+        );
+        assert!(
+            prefixes.contains(&"svc_b"),
+            "route for svc_b must be present; got: {:?}",
+            prefixes
+        );
+    }
 }

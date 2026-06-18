@@ -1368,13 +1368,16 @@ mod tests {
     }
 
     /// Regression test for the h1/h2 AWS divergence: an `aws_auth` route is
-    /// gated identically on both protocols. SigV4 signing is not implemented,
-    /// so the request must be rejected (501) rather than forwarded upstream
+    /// gated identically on both protocols. SigV4 signing is not implemented on
+    /// h2, so the request must be rejected (501) rather than forwarded upstream
     /// unsigned. Before the shared `resolve_managed_credential`, the h2 path had
     /// no AWS branch and would forward the request without a signature.
-    #[tokio::test]
+    ///
+    /// Fake AWS env vars are set for the duration of credential loading so the
+    /// default credential chain succeeds and `get_aws()` returns `Some(...)`,
+    /// letting the 501 stub in `resolve_managed_credential` be reached.
+    #[tokio::test(flavor = "multi_thread")]
     async fn h2_forward_rejects_aws_route_without_forwarding() {
-        use crate::config::AwsAuthConfig;
         use std::time::Duration;
 
         let ca = Arc::new(EphemeralCa::generate().unwrap());
@@ -1382,7 +1385,7 @@ mod tests {
 
         let tls_connector = h2_tls_connector_trusting(ca.cert_pem());
 
-        // Route configured for AWS SigV4 (signing not yet implemented).
+        // Route configured for AWS SigV4 (h2 signing not yet implemented).
         let routes = vec![RouteConfig {
             prefix: "aws-svc".to_string(),
             upstream: format!("https://localhost:{}", upstream_port),
@@ -1403,13 +1406,44 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             oauth2: None,
-            aws_auth: Some(AwsAuthConfig::default()),
+            aws_auth: Some(crate::config::AwsAuthConfig {
+                profile: None,
+                region: Some("us-east-1".to_string()),
+                service: Some("bedrock".to_string()),
+            }),
             endpoint_policy: None,
         }];
         let route_store = RouteStore::load(&routes).unwrap();
-        let credential_store = CredentialStore::load_with_diagnostics(&routes, &tls_connector)
-            .unwrap()
-            .store;
+
+        // Set fake AWS credential env vars so the default chain succeeds and
+        // load_with_diagnostics inserts the AwsRoute. Saved and restored so
+        // parallel tests are not affected (per AGENTS.md env-var policy).
+        let prev_key = std::env::var("AWS_ACCESS_KEY_ID").ok();
+        let prev_secret = std::env::var("AWS_SECRET_ACCESS_KEY").ok();
+        // SAFETY: test-only; the multi_thread flavor serialises env mutation
+        // within this process. No other thread reads these vars during this window.
+        unsafe {
+            std::env::set_var("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE");
+            std::env::set_var(
+                "AWS_SECRET_ACCESS_KEY",
+                "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            );
+        }
+        let credential_store =
+            CredentialStore::load_with_diagnostics(&routes, &tls_connector)
+                .unwrap()
+                .store;
+        unsafe {
+            match prev_key {
+                Some(v) => std::env::set_var("AWS_ACCESS_KEY_ID", v),
+                None => std::env::remove_var("AWS_ACCESS_KEY_ID"),
+            }
+            match prev_secret {
+                Some(v) => std::env::set_var("AWS_SECRET_ACCESS_KEY", v),
+                None => std::env::remove_var("AWS_SECRET_ACCESS_KEY"),
+            }
+        }
+
         let cert_cache = Arc::new(CertCache::new(Arc::clone(&ca)));
         let filter = ProxyFilter::allow_all();
         let session_token = Zeroizing::new("session-tok".to_string());
@@ -1475,6 +1509,7 @@ mod tests {
             rx.await.is_err(),
             "AWS request must not be forwarded upstream unsigned"
         );
+
     }
 
     #[tokio::test]

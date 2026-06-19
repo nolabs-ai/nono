@@ -63,7 +63,7 @@ A few fields have their own specific rules:
 | `open_urls` | Your value replaces the base entirely. Leave it out to inherit the base value. |
 | `network.credentials` | Leave it out to inherit. Set it to `[]` to explicitly disable inherited credentials. Otherwise your list is combined with the base. |
 | `network.network_profile` | Leave it out to inherit. Set it to `null` to explicitly clear the inherited proxy profile. |
-| `hooks.hooks`, `env_credentials.mappings`, `environment.set_vars` | Merged as key-value maps. Your keys win over the base on any conflict. |
+| `hooks`, `env_credentials`, `environment.set_vars` | Merged as key-value maps. Your keys win over the base on any conflict. |
 
 ### Extending multiple profiles
 

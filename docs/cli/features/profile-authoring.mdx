@@ -32,6 +32,90 @@ Profile files use **JSONC** (JSON with Comments): standard JSON plus `//` line c
   For an overview of what profiles are and how they compose with groups, see [Profiles & Groups](/cli/features/profiles-groups).
 </Tip>
 
+## How `extends` Works
+
+`extends` lets your profile build on top of an existing one. Instead of writing everything from scratch, you pick a base and only specify what you want to add or change.
+
+```json
+{
+  "extends": "default",
+  "filesystem": {
+    "allow": ["/opt/my-tools"]
+  }
+}
+```
+
+This profile inherits everything from `default` and adds one extra directory. The base profile is unchanged.
+
+### What happens when profiles are combined
+
+When nono loads a profile that extends a base, it merges the two together. Most fields fall into one of two patterns:
+
+**List fields grow.** Things like allowed paths, denied commands, and security groups are combined — the base list and your list are joined together. Duplicates are removed automatically. You can always *add* to a list, but you cannot remove something a base already includes.
+
+**Single-value fields can be overridden.** Things like `binary`, `allow_gpu`, `workdir`, and all `security.*` settings work differently: if you set them in your profile they replace the base value, and if you leave them out you inherit whatever the base had.
+
+A few fields have their own specific rules:
+
+| Field | How it works |
+|-------|----------|
+| `network.block` | Sticks once set. If any base sets this to `true`, your profile cannot set it back to `false`. |
+| `open_urls` | Your value replaces the base entirely. Leave it out to inherit the base value. |
+| `network.credentials` | Leave it out to inherit. Set it to `[]` to explicitly disable inherited credentials. Otherwise your list is combined with the base. |
+| `network.network_profile` | Leave it out to inherit. Set it to `null` to explicitly clear the inherited proxy profile. |
+| `hooks.hooks`, `env_credentials.mappings`, `environment.set_vars` | Merged as key-value maps. Your keys win over the base on any conflict. |
+
+### Extending multiple profiles
+
+You can extend more than one profile at once by passing an array:
+
+```json
+{ "extends": ["team-base", "python-tools"] }
+```
+
+The profiles are merged left-to-right, then your profile is applied on top. So for any single-value field where the bases conflict, the **rightmost** one wins. List fields are always combined from all of them.
+
+```
+team-base  →  python-tools  →  your profile
+                              (your settings win)
+```
+
+### What if two bases share a common ancestor?
+
+If you extend profiles A and B, and both of them extend a common base C, that's fine. List entries from C end up in the final profile once — duplicates are removed automatically. For single-value fields, the same rightmost-wins rule applies: if A and B both set the same field, B's value is what you get (assuming B is listed second in the array).
+
+The one thing to watch out for is if A and B intentionally set the same single-value field to *different* values, because only one can win and it might not be obvious which. If you're unsure what you're actually getting, run `nono profile show my-profile` to see the resolved result.
+
+### The `default` profile is always included
+
+Every profile automatically gets the `default` built-in merged in, even if you don't write `extends` at all. You don't need to add `"extends": "default"` — it's already there.
+
+If you want to remove a group that `default` includes, use `groups.exclude`:
+
+```json
+{
+  "groups": {
+    "exclude": ["dangerous_commands"]
+  }
+}
+```
+
+### Checking what your profile actually resolves to
+
+Inheritance can stack up. Use these commands to see the final result after all merging is done:
+
+```bash
+# Show the fully resolved profile
+nono profile show my-profile
+
+# See exactly what changed compared to default
+nono profile diff default my-profile
+```
+
+<Note>
+  Inheritance chains are capped at 10 levels. If you hit this limit, nono will fail with a `ProfileInheritance` error — that's usually a sign the profile structure needs simplifying.
+</Note>
+
 ## Generating a Profile
 
 Use `nono profile init` to scaffold a new profile:

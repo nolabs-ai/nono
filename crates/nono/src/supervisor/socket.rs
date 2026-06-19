@@ -178,6 +178,33 @@ impl SupervisorSocket {
         recv_fd_via_socket(self.stream.as_raw_fd())
     }
 
+    /// Read a raw fd number (4 bytes, native-endian) sent by the peer via `write()`.
+    ///
+    /// Used on the parent side to receive the proxy seccomp notify fd number
+    /// written by the child without `SCM_RIGHTS` (which would be intercepted
+    /// by the AF_UNIX BPF filter). The caller must use `pidfd_getfd` to
+    /// acquire the actual fd from the child process.
+    #[cfg(target_os = "linux")]
+    pub fn recv_raw_fd_number(&self) -> Result<std::os::unix::io::RawFd> {
+        let mut bytes = [0u8; 4];
+        // SAFETY: self.stream is a valid connected socket fd; bytes is a
+        // valid 4-byte buffer for the duration of the call.
+        let n = unsafe {
+            libc::read(
+                self.stream.as_raw_fd(),
+                bytes.as_mut_ptr().cast::<libc::c_void>(),
+                4,
+            )
+        };
+        if n != 4 {
+            return Err(crate::error::NonoError::SandboxInit(format!(
+                "recv_raw_fd_number: expected 4 bytes, got {}",
+                n
+            )));
+        }
+        Ok(i32::from_ne_bytes(bytes))
+    }
+
     /// Authenticate the peer using platform-specific mechanisms.
     ///
     /// On Linux, uses `SO_PEERCRED` to get the peer's PID/UID/GID.

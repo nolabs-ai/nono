@@ -18,10 +18,10 @@ use crate::tool_sandbox::launch::{
 use crate::tool_sandbox::protocol::{
     ChildCapsSpec, FsGrantSpec, StdioFds, StdioLimitActionSpec, StdioLimitSpec,
     StdioStreamLimitSpec, TOOL_SANDBOX_LAUNCH_SPEC_ENV, TOOL_SANDBOX_SHIM_DIR_ENV,
-    TOOL_SANDBOX_SOCKET_ENV, TOOL_SANDBOX_URL_IO_TIMEOUT,
-    ToolSandboxChildLaunchSpec, ToolSandboxOpenUrlRequest, ToolSandboxOpenUrlResponse,
-    ToolSandboxShimRequest, ToolSandboxShimResponse, UnixSocketGrantSpec, read_frame,
-    recv_stdio_fds, send_stdio_fds, validate_ipc_request, write_frame, write_response,
+    TOOL_SANDBOX_SOCKET_ENV, TOOL_SANDBOX_URL_IO_TIMEOUT, ToolSandboxChildLaunchSpec,
+    ToolSandboxOpenUrlRequest, ToolSandboxOpenUrlResponse, ToolSandboxShimRequest,
+    ToolSandboxShimResponse, UnixSocketGrantSpec, read_frame, recv_stdio_fds, send_stdio_fds,
+    validate_ipc_request, write_frame, write_response,
 };
 use landlock::{
     AccessFs, CompatLevel, Compatible, PathBeneath, PathFd, Ruleset, RulesetAttr,
@@ -34,6 +34,7 @@ use nono::{
     UnixSocketCapability, UnixSocketMode,
 };
 use sha2::{Digest, Sha256};
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::{CString, OsStr, OsString};
 use std::fs::{self, File};
@@ -2727,6 +2728,7 @@ fn build_outer_exec_files<'a>(
     plan: &ResolvedToolSandboxPlan,
     shim_source: &Path,
 ) -> Result<Vec<PathBuf>> {
+    reset_elf_resolution_cache();
     let controlled_ids = controlled_exec_ids(plan);
     let mut seen = HashSet::new();
     let mut paths = Vec::new();
@@ -3382,6 +3384,7 @@ fn build_baseline_cache<'a>(
     shims: impl IntoIterator<Item = &'a ShimIdentity>,
     shim_source: &Path,
 ) -> Result<BaselineCache> {
+    reset_elf_resolution_cache();
     let system_files = compute_system_baseline_files()?;
     let mut closures: BTreeMap<PathBuf, Vec<PathBuf>> = BTreeMap::new();
 
@@ -4519,6 +4522,50 @@ fn guarded_remove_runtime_dir(path: &Path) -> Result<()> {
     })
 }
 
+thread_local! {
+    /// Memoizes `canonicalize` during a single tool-sandbox prep pass.
+    ///
+    /// Shared-library resolution canonicalizes the same system paths (libc,
+    /// ld-linux, libglib, …) inside *every* binary's dependency closure, and the
+    /// closure is recomputed per command/interpreter/shim. Without this cache a
+    /// dense NSS/glib dependency graph re-canonicalizes the same handful of libs
+    /// tens of thousands of times — a readlink/statx storm that dominates Linux
+    /// launch latency. Canonicalization is a pure function of the (read-only,
+    /// during prep) filesystem, so caching is safe within a pass.
+    static ELF_CANON_CACHE: RefCell<HashMap<PathBuf, PathBuf>> = RefCell::new(HashMap::new());
+    /// Memoizes shared-library name resolution, keyed by `(soname, search_dirs)`
+    /// — the only inputs that determine the result.
+    static ELF_LIB_CACHE: RefCell<HashMap<(String, Vec<String>), PathBuf>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Clears the per-pass ELF-resolution memo caches. Called at the start of each
+/// batch that computes dependency closures so a fresh pass (or a later run in
+/// the same process, e.g. tests) never observes a stale resolution.
+fn reset_elf_resolution_cache() {
+    ELF_CANON_CACHE.with(|cache| cache.borrow_mut().clear());
+    ELF_LIB_CACHE.with(|cache| cache.borrow_mut().clear());
+}
+
+/// Canonicalize `path`, memoized via [`ELF_CANON_CACHE`] for the current pass.
+fn cached_canonicalize(path: &Path) -> Result<PathBuf> {
+    if let Some(canonical) = ELF_CANON_CACHE.with(|cache| cache.borrow().get(path).cloned()) {
+        return Ok(canonical);
+    }
+    let canonical = path
+        .canonicalize()
+        .map_err(|source| NonoError::PathCanonicalization {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    ELF_CANON_CACHE.with(|cache| {
+        cache
+            .borrow_mut()
+            .insert(path.to_path_buf(), canonical.clone());
+    });
+    Ok(canonical)
+}
+
 fn elf_dependency_closure(binary: &Path) -> Result<Vec<PathBuf>> {
     let mut seen = HashSet::new();
     let mut result = Vec::new();
@@ -4531,12 +4578,7 @@ fn resolve_elf_recursive(
     seen: &mut HashSet<FileId>,
     result: &mut Vec<PathBuf>,
 ) -> Result<()> {
-    let canonical = path
-        .canonicalize()
-        .map_err(|source| NonoError::PathCanonicalization {
-            path: path.to_path_buf(),
-            source,
-        })?;
+    let canonical = cached_canonicalize(path)?;
     let metadata = fs::metadata(&canonical).map_err(|source| NonoError::ConfigRead {
         path: canonical.clone(),
         source,
@@ -4723,6 +4765,13 @@ fn parse_dynamic(
 }
 
 fn resolve_shared_library(name: &str, search_dirs: &[String], binary: &Path) -> Result<PathBuf> {
+    // The result depends only on (soname, search_dirs); memoize it so a library
+    // referenced by many objects in the closure is searched + canonicalized once
+    // rather than once per referencing edge.
+    let cache_key = (name.to_string(), search_dirs.to_vec());
+    if let Some(resolved) = ELF_LIB_CACHE.with(|cache| cache.borrow().get(&cache_key).cloned()) {
+        return Ok(resolved);
+    }
     let defaults = [
         "/lib",
         "/lib64",
@@ -4742,12 +4791,11 @@ fn resolve_shared_library(name: &str, search_dirs: &[String], binary: &Path) -> 
     {
         let candidate = Path::new(dir).join(name);
         if candidate.is_file() {
-            return candidate
-                .canonicalize()
-                .map_err(|source| NonoError::PathCanonicalization {
-                    path: candidate,
-                    source,
-                });
+            let resolved = cached_canonicalize(&candidate)?;
+            ELF_LIB_CACHE.with(|cache| {
+                cache.borrow_mut().insert(cache_key, resolved.clone());
+            });
+            return Ok(resolved);
         }
     }
     Err(NonoError::SandboxInit(format!(

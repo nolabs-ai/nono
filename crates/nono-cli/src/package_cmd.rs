@@ -242,8 +242,23 @@ pub fn run_sideload(args: crate::cli::SideloadArgs) -> Result<()> {
     let manifest: PackageManifest = serde_json::from_slice(&manifest_bytes)
         .map_err(|e| NonoError::PackageInstall(format!("failed to parse package.json: {e}")))?;
 
-    // Derive namespace/name from manifest name field (expected "namespace/name").
-    let package_ref = derive_package_ref_from_manifest(&manifest)?;
+    // Resolve the namespace: explicit flag > git remote inference > error.
+    let namespace = if let Some(ns) = args.namespace.filter(|s| !s.is_empty()) {
+        ns
+    } else if let Some(ns) = infer_namespace_from_git_remote(&src_path) {
+        eprintln!("sideload: inferred namespace '{ns}' from origin git remote");
+        ns
+    } else {
+        return Err(NonoError::PackageInstall(
+            "cannot determine namespace: no --namespace flag provided and no \
+             'origin' git remote found in the pack directory. \
+             Re-run with: nono-sideload sideload --namespace <your-org> <path>"
+                .to_string(),
+        ));
+    };
+
+    // Derive the PackageRef from the bare manifest name + resolved namespace.
+    let package_ref = derive_package_ref_from_manifest(&manifest, &namespace)?;
     let version = manifest
         .version
         .clone()
@@ -307,11 +322,60 @@ pub fn run_sideload(args: crate::cli::SideloadArgs) -> Result<()> {
     Ok(())
 }
 
-/// Derive a `PackageRef` from a `PackageManifest`. The manifest's `name` field
-/// must be in `namespace/name` form (e.g. `"acme/my-pack"`).
+/// Derive a `PackageRef` from a `PackageManifest` and an explicit namespace.
+///
+/// `manifest.name` is treated as a bare pack name (e.g. `"python"`). The
+/// namespace is supplied externally — either via `--namespace` on the CLI or
+/// inferred from the `origin` git remote of the pack directory.
+///
+/// This mirrors how `agent-sign` works: `package-name` and `package-namespace`
+/// are separate inputs; `package.json`'s `name` field is never parsed for the
+/// namespace.
 #[cfg(feature = "sideload")]
-fn derive_package_ref_from_manifest(manifest: &PackageManifest) -> Result<PackageRef> {
-    package::parse_package_ref(&manifest.name)
+fn derive_package_ref_from_manifest(
+    manifest: &PackageManifest,
+    namespace: &str,
+) -> Result<PackageRef> {
+    package::parse_package_ref(&format!("{namespace}/{}", manifest.name))
+}
+
+/// Infer the registry namespace from the `origin` git remote of `dir`.
+///
+/// Shells out to `git remote get-url origin` and extracts the GitHub owner
+/// from either SSH (`git@github.com:owner/repo.git`) or HTTPS
+/// (`https://github.com/owner/repo.git`) remote URLs.
+///
+/// Returns `None` if git is unavailable, the directory is not a git repo,
+/// there is no `origin` remote, or the URL cannot be parsed.
+#[cfg(feature = "sideload")]
+fn infer_namespace_from_git_remote(dir: &std::path::Path) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(["remote", "get-url", "origin"])
+        .current_dir(dir)
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let url = std::str::from_utf8(&output.stdout).ok()?.trim();
+
+    // SSH: git@github.com:owner/repo.git
+    if let Some(rest) = url.strip_prefix("git@") {
+        let path = rest.split_once(':')?.1;
+        return path.split('/').next().map(|s| s.to_string());
+    }
+
+    // HTTPS: https://github.com/owner/repo.git  or  http://...
+    if url.starts_with("https://") || url.starts_with("http://") {
+        let without_scheme = url.split_once("://")?.1;
+        // skip host, take first path segment
+        let path = without_scheme.split_once('/')?.1;
+        return path.split('/').next().map(|s| s.to_string());
+    }
+
+    None
 }
 
 /// Represents a locally-sourced artifact (no download URL, digest computed

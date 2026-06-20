@@ -895,6 +895,14 @@ pub struct SideloadArgs {
     /// Path to the local pack directory (must contain package.json)
     pub path: PathBuf,
 
+    /// Namespace (registry owner) for the pack, e.g. `acme-corp`.
+    ///
+    /// If omitted, the namespace is inferred from the `origin` git remote of
+    /// the pack directory (the GitHub owner extracted from the remote URL).
+    /// Errors if the namespace cannot be determined from either source.
+    #[arg(long, value_name = "NAMESPACE", help_heading = "OPTIONS")]
+    pub namespace: Option<String>,
+
     /// Print help
     #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
     pub help: Option<bool>,

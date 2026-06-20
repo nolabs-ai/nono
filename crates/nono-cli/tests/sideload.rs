@@ -126,11 +126,12 @@ mod sideload_enabled {
     }
 
     /// Write a minimal valid pack fixture to `dir`.
-    /// The manifest `name` field must be `namespace/name` for `nono sideload`.
+    /// The manifest `name` field is a bare name (e.g. `"my-pack"`); the
+    /// namespace is supplied separately via `--namespace` when sideloading.
     fn write_fixture_pack(dir: &Path, namespace: &str, name: &str, version: &str) {
         let manifest = serde_json::json!({
             "schema_version": 1,
-            "name": format!("{namespace}/{name}"),
+            "name": name,
             "version": version,
             "description": "test fixture pack",
             "artifacts": [
@@ -202,7 +203,12 @@ mod sideload_enabled {
         write_fixture_pack(src.path(), "acme", "my-pack", "0.1.0");
 
         let (_, stderr, ok) = run_nono(
-            &["sideload", src.path().to_str().expect("path to str")],
+            &[
+                "sideload",
+                "--namespace",
+                "acme",
+                src.path().to_str().expect("path to str"),
+            ],
             cfg.path(),
         );
         assert!(ok, "sideload failed:\n{stderr}");
@@ -244,7 +250,12 @@ mod sideload_enabled {
         write_fixture_pack(src.path(), "acme", "replaceable", "0.1.0");
 
         let (_, _, ok) = run_nono(
-            &["sideload", src.path().to_str().expect("path to str")],
+            &[
+                "sideload",
+                "--namespace",
+                "acme",
+                src.path().to_str().expect("path to str"),
+            ],
             cfg.path(),
         );
         assert!(ok);
@@ -252,7 +263,12 @@ mod sideload_enabled {
         // Bump version, sideload again.
         write_fixture_pack(src.path(), "acme", "replaceable", "0.2.0");
         let (_, stderr, ok) = run_nono(
-            &["sideload", src.path().to_str().expect("path to str")],
+            &[
+                "sideload",
+                "--namespace",
+                "acme",
+                src.path().to_str().expect("path to str"),
+            ],
             cfg.path(),
         );
         assert!(ok, "re-sideload failed:\n{stderr}");
@@ -277,7 +293,12 @@ mod sideload_enabled {
         write_fixture_pack(src.path(), "acme", "listed", "1.0.0");
 
         let (_, _, ok) = run_nono(
-            &["sideload", src.path().to_str().expect("path to str")],
+            &[
+                "sideload",
+                "--namespace",
+                "acme",
+                src.path().to_str().expect("path to str"),
+            ],
             cfg.path(),
         );
         assert!(ok);
@@ -303,7 +324,12 @@ mod sideload_enabled {
         write_fixture_pack(src.path(), "acme", "skipped", "1.0.0");
 
         let (_, _, ok) = run_nono(
-            &["sideload", src.path().to_str().expect("path to str")],
+            &[
+                "sideload",
+                "--namespace",
+                "acme",
+                src.path().to_str().expect("path to str"),
+            ],
             cfg.path(),
         );
         assert!(ok);
@@ -329,7 +355,12 @@ mod sideload_enabled {
         write_fixture_pack(src.path(), "acme", "outdated-test", "1.0.0");
 
         let (_, _, ok) = run_nono(
-            &["sideload", src.path().to_str().expect("path to str")],
+            &[
+                "sideload",
+                "--namespace",
+                "acme",
+                src.path().to_str().expect("path to str"),
+            ],
             cfg.path(),
         );
         assert!(ok);
@@ -354,7 +385,7 @@ mod sideload_enabled {
         // Write a manifest with an absolute path in the artifact list.
         let manifest = serde_json::json!({
             "schema_version": 1,
-            "name": "acme/evil-abs",
+            "name": "evil-abs",
             "version": "1.0.0",
             "description": "adversarial fixture",
             "artifacts": [
@@ -372,7 +403,12 @@ mod sideload_enabled {
         .expect("write package.json");
 
         let (_, stderr, ok) = run_nono(
-            &["sideload", src.path().to_str().expect("path")],
+            &[
+                "sideload",
+                "--namespace",
+                "acme",
+                src.path().to_str().expect("path"),
+            ],
             cfg.path(),
         );
         assert!(!ok, "sideload must fail for absolute artifact path");
@@ -391,7 +427,7 @@ mod sideload_enabled {
 
         let manifest = serde_json::json!({
             "schema_version": 1,
-            "name": "acme/evil-dotdot",
+            "name": "evil-dotdot",
             "version": "1.0.0",
             "description": "adversarial fixture",
             "artifacts": [
@@ -409,7 +445,12 @@ mod sideload_enabled {
         .expect("write package.json");
 
         let (_, stderr, ok) = run_nono(
-            &["sideload", src.path().to_str().expect("path")],
+            &[
+                "sideload",
+                "--namespace",
+                "acme",
+                src.path().to_str().expect("path"),
+            ],
             cfg.path(),
         );
         assert!(!ok, "sideload must fail for '..'-containing artifact path");
@@ -429,7 +470,7 @@ mod sideload_enabled {
 
         let manifest = serde_json::json!({
             "schema_version": 1,
-            "name": "acme/evil-profile",
+            "name": "evil-profile",
             "version": "1.0.0",
             "description": "adversarial fixture",
             "artifacts": [
@@ -448,7 +489,12 @@ mod sideload_enabled {
         .expect("write package.json");
 
         let (_, stderr, ok) = run_nono(
-            &["sideload", src.path().to_str().expect("path")],
+            &[
+                "sideload",
+                "--namespace",
+                "acme",
+                src.path().to_str().expect("path"),
+            ],
             cfg.path(),
         );
         assert!(!ok, "sideload must fail for '..'-profile artifact path");
@@ -467,7 +513,12 @@ mod sideload_enabled {
         write_fixture_pack(src.path(), "acme", "removable", "1.0.0");
 
         let (_, _, ok) = run_nono(
-            &["sideload", src.path().to_str().expect("path to str")],
+            &[
+                "sideload",
+                "--namespace",
+                "acme",
+                src.path().to_str().expect("path to str"),
+            ],
             cfg.path(),
         );
         assert!(ok);

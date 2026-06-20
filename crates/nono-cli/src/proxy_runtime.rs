@@ -60,9 +60,8 @@ pub(crate) fn prepare_proxy_launch_options(
         bypass
     };
 
-    let has_custom_credentials = !prepared.custom_credentials.is_empty();
     let has_domain_filter = network_profile.is_some() || !allow_domain.is_empty();
-    let has_credentials = !credentials.is_empty() || has_custom_credentials;
+    let has_credentials = !credentials.is_empty();
     let would_activate = has_domain_filter || has_credentials || upstream_proxy_addr.is_some();
 
     if matches!(prepared.caps.network_mode(), nono::NetworkMode::Blocked) {
@@ -116,7 +115,7 @@ pub(crate) fn prepare_proxy_launch_options(
         None
     };
 
-    let credentials_intent = if has_credentials {
+    let credentials_intent = if has_credentials || !prepared.custom_credentials.is_empty() {
         Some(CredentialProxyIntent {
             credentials,
             custom_credentials: prepared.custom_credentials.clone(),
@@ -856,11 +855,12 @@ mod tests {
         assert!(endpoint.iter().any(|e| matches!(e, AllowDomainEntry::WithEndpoints { domain, .. } if domain == "filtered.example.com")));
     }
 
-    /// A profile with only `custom_credentials` set (no built-in `credentials`,
-    /// no `network_profile`, no `allow_domain`, no upstream proxy) should still
-    /// activate the proxy so that credential injection works.
+    /// A profile with only `custom_credentials` set (no enabled `credentials`,
+    /// no `network_profile`, no `allow_domain`, no upstream proxy) should not
+    /// activate the proxy. Custom credential entries are route definitions, not
+    /// enabled routes.
     #[test]
-    fn test_proxy_is_active_when_only_custom_credentials_are_set() {
+    fn test_proxy_is_inactive_when_only_custom_credentials_are_set() {
         use crate::profile::CustomCredentialDef;
         use crate::sandbox_prepare::PreparedSandbox;
         use nono::CapabilitySet;
@@ -929,8 +929,12 @@ mod tests {
             .expect("prepare_proxy_launch_options");
 
         assert!(
-            opts.is_active(),
-            "proxy must be active when custom_credentials is non-empty"
+            !opts.is_active(),
+            "proxy must stay inactive when only custom credential definitions are present"
+        );
+        assert!(
+            opts.credentials.is_some(),
+            "custom credential definitions should still be carried for network profile overrides"
         );
     }
 }

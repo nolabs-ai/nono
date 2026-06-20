@@ -141,7 +141,10 @@ impl ProxyLaunchOptions {
     pub(crate) fn is_active(&self) -> bool {
         self.domain_filter.is_some()
             || self.endpoint_filter.is_some()
-            || self.credentials.is_some()
+            || self
+                .credentials
+                .as_ref()
+                .is_some_and(|credentials| !credentials.credentials.is_empty())
             || self.upstream_proxy.is_some()
     }
 }

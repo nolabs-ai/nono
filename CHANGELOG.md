@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.64.1] - 2026-06-20
+
+### Refactoring
+
+- *(credentials)* Require explicit activation for custom credentials (#1215) ([#1215](https://github.com/always-further/nono/pull/1215))
+
 ## [0.64.0] - 2026-06-18
 
 ### Bug Fixes

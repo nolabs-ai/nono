@@ -186,6 +186,7 @@ pub(crate) fn prepare_proxy_launch_options(
         network_approval_timeout_secs: resolve_approval_timeout_secs(
             prepared.profile_network_approval_timeout_secs,
         ),
+        profile_name: args.profile.clone(),
     };
 
     // Infra-only flags make no sense without an activating proxy feature.
@@ -493,10 +494,10 @@ pub(crate) fn start_proxy_runtime(
 
             let (tx, mut rx) = tokio::sync::mpsc::channel::<nono_proxy::ApprovalChannelRequest>(16);
 
-            let config_writer = proxy
-                .network_profile
-                .as_deref()
-                .map(crate::network_approval::ConfigWriter::new);
+            let config_writer = match proxy.profile_name.as_deref() {
+                Some(name) => Some(crate::network_approval::ConfigWriter::new(name)),
+                None => Some(crate::network_approval::ConfigWriter::new("default")),
+            };
 
             let backend = NetworkApprovalBackend::new(
                 proxy.network_approval_mode,

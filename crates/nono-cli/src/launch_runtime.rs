@@ -137,6 +137,9 @@ pub(crate) struct ProxyLaunchOptions {
     pub(crate) network_block: bool,
     pub(crate) network_approval_mode: crate::network_approval::NetworkApprovalMode,
     pub(crate) network_approval_timeout_secs: u64,
+    /// The nono profile name (from `--profile`), used by ConfigWriter
+    /// to persist approved hosts to the correct user profile file.
+    pub(crate) profile_name: Option<String>,
 }
 
 impl ProxyLaunchOptions {

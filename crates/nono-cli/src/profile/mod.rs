@@ -1503,14 +1503,6 @@ impl NetworkConfig {
     pub fn resolved_credentials(&self) -> &[String] {
         self.credentials.as_deref().unwrap_or(&[])
     }
-
-    /// Whether any profile setting requires proxy mode activation.
-    pub fn has_proxy_flags(&self) -> bool {
-        self.resolved_network_profile().is_some()
-            || !self.allow_domain.is_empty()
-            || !self.resolved_credentials().is_empty()
-            || self.upstream_proxy.is_some()
-    }
 }
 
 /// Secrets configuration in a profile
@@ -6413,16 +6405,6 @@ mod tests {
     }
 
     #[test]
-    fn test_credentials_none_does_not_activate_proxy() {
-        let mut config = NetworkConfig::default();
-        assert!(!config.has_proxy_flags()); // None = no proxy
-        config.credentials = Some(Vec::new());
-        assert!(!config.has_proxy_flags()); // Some([]) = no proxy
-        config.credentials = Some(vec!["openai".to_string()]);
-        assert!(config.has_proxy_flags()); // Some(["openai"]) = proxy
-    }
-
-    #[test]
     fn test_credentials_deserialization_absent_vs_empty() {
         // Absent field → None (inherit)
         let json = r#"{ "meta": { "name": "no-creds" }, "network": {} }"#;
@@ -7053,7 +7035,8 @@ mod tests {
 
         let profile = load_profile_from_path(&profile_path).expect("load profile");
         assert_eq!(profile.network.resolved_network_profile(), None);
-        assert!(!profile.network.has_proxy_flags());
+        assert!(profile.network.resolved_credentials().is_empty());
+        assert!(profile.network.allow_domain.is_empty());
         assert!(
             profile
                 .filesystem

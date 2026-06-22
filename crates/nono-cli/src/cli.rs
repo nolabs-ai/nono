@@ -56,6 +56,7 @@ const STYLES: Styles = Styles::plain().header(Style::new().bold());
   unpin      Unpin a pack to re-include it in updates
   search     Search the registry for nono packs
   list       List installed nono packs
+  sideload   Install a pack from a local directory (--features sideload builds only)
 
 \x1b[1mPOLICY & PROFILES\x1b[0m
   policy     [deprecated] Use 'nono profile' instead
@@ -654,6 +655,25 @@ IN-BAND DETACH:
 ")]
     Completions(CompletionsArgs),
 
+    /// Install a nono pack from a local directory, bypassing registry attestation.
+    ///
+    /// WARNING: integrity protections are DISABLED for sideloaded packs.
+    /// Use `nono remove` to uninstall. Do NOT use on production systems.
+    #[cfg(feature = "sideload")]
+    #[command(help_template = "\
+{about}
+
+\x1b[1mUSAGE\x1b[0m
+  nono sideload <path>
+
+{all-args}
+{after-help}")]
+    #[command(after_help = "\x1b[1mEXAMPLES\x1b[0m
+  nono sideload ./my-pack                      # Install from local directory
+  nono sideload /abs/path/to/pack              # Install from absolute path
+")]
+    Sideload(SideloadArgs),
+
     /// Internal: open a URL via supervisor IPC
     #[command(hide = true)]
     OpenUrlHelper(OpenUrlHelperArgs),
@@ -832,6 +852,28 @@ pub struct OutdatedArgs {
 pub struct OpenUrlHelperArgs {
     /// The URL to open
     pub url: String,
+}
+
+/// Arguments for `nono sideload`. Only present when the binary is compiled
+/// with `--features sideload`. Do NOT use on production systems.
+#[cfg(feature = "sideload")]
+#[derive(Parser, Debug)]
+#[command(disable_help_flag = true)]
+pub struct SideloadArgs {
+    /// Path to the local pack directory (must contain package.json)
+    pub path: PathBuf,
+
+    /// Namespace (registry owner) for the pack, e.g. `acme-corp`.
+    ///
+    /// If omitted, the namespace is inferred from the `origin` git remote of
+    /// the pack directory (the GitHub owner extracted from the remote URL).
+    /// Errors if the namespace cannot be determined from either source.
+    #[arg(long, value_name = "NAMESPACE", help_heading = "OPTIONS")]
+    pub namespace: Option<String>,
+
+    /// Print help
+    #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
+    pub help: Option<bool>,
 }
 
 /// Arguments for the hidden pack-update-hint-helper subcommand.
@@ -3854,6 +3896,9 @@ mod tests {
         "search",
         "list",
         "completion",
+        // Only present when compiled with --features sideload.
+        #[cfg(feature = "sideload")]
+        "sideload",
     ];
 
     #[test]

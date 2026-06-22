@@ -182,6 +182,8 @@ fn cli_verbosity(cli: &Cli) -> u8 {
         | Commands::OpenUrlHelper(_)
         | Commands::PackUpdateHintHelper(_)
         | Commands::Completions(_) => 0,
+        #[cfg(feature = "sideload")]
+        Commands::Sideload(_) => 0,
     }
 }
 

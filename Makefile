@@ -6,7 +6,7 @@
 #   make check        Run clippy and format check
 #   make release      Build release binaries
 
-.PHONY: all build build-lib build-cli build-ffi build-arm64 test test-lib test-cli test-ffi check clippy fmt clean install audit help
+.PHONY: all build build-lib build-cli build-ffi build-arm64 build-sideload test test-lib test-cli test-ffi test-sideload check clippy fmt clean install audit help
 
 # Default target
 all: build
@@ -22,6 +22,12 @@ build-cli:
 
 build-ffi:
 	cargo build -p nono-ffi
+
+# Build nono-cli with the sideload feature for development/testing.
+# WARNING: the resulting binary has integrity protections disabled.
+# Do NOT ship this binary.
+build-sideload:
+	cargo build -p nono-cli --features sideload
 
 build-release:
 	cargo build --release
@@ -47,6 +53,11 @@ test-lib:
 
 test-cli:
 	cargo test -p nono-cli
+
+# Run the sideload-gated integration tests. Requires --features sideload so
+# both the test binary and the nono binary under test have the feature active.
+test-sideload:
+	cargo test -p nono-cli --features sideload
 
 test-ffi:
 	cargo test -p nono-ffi
@@ -118,7 +129,7 @@ lint-docs:
 	bash scripts/lint-docs.sh
 
 # CI simulation (what CI would run)
-ci: check test audit lint-aliases lint-docs
+ci: check test test-sideload audit lint-aliases lint-docs
 	@echo "CI checks passed"
 
 # Help
@@ -130,13 +141,15 @@ help:
 	@echo "  make build-lib      Build library only"
 	@echo "  make build-cli      Build CLI only"
 	@echo "  make build-ffi      Build C FFI bindings"
+	@echo "  make build-sideload Build CLI with --features sideload (dev/test only)"
 	@echo "  make build-release  Build release binaries"
 	@echo "  make build-arm64    Build CLI for Linux ARM64 (cargo on Linux ARM64; cross elsewhere)"
 	@echo ""
 	@echo "Test:"
 	@echo "  make test           Run all tests"
 	@echo "  make test-lib       Run library tests only"
-	@echo "  make test-cli       Run CLI tests only"
+	@echo "  make test-cli       Run CLI tests only (production build)"
+	@echo "  make test-sideload  Run CLI tests with --features sideload"
 	@echo "  make test-ffi       Run C FFI tests only"
 	@echo "  make test-doc       Run doc tests only"
 	@echo ""

@@ -580,14 +580,13 @@ fn finalize_prepared_sandbox(
     silent: bool,
 ) -> Result<PreparedSandbox> {
     output::print_skipped_requested_paths(&collect_missing_cli_requested_paths(args), silent);
-    let block_wins = args.block_net || (prepared.profile_network_block && !args.has_proxy_flags());
-    let proxy_pending = !block_wins
-        && !args.allow_net
-        && (args.has_proxy_flags()
-            || prepared.network_profile.is_some()
-            || !prepared.allow_domain.is_empty()
-            || !prepared.credentials.is_empty()
-            || prepared.upstream_proxy.is_some());
+    let has_proxy_intent = args.has_proxy_flags()
+        || prepared.network_profile.is_some()
+        || !prepared.allow_domain.is_empty()
+        || !prepared.credentials.is_empty()
+        || prepared.upstream_proxy.is_some();
+    let block_wins = args.block_net || (prepared.profile_network_block && !has_proxy_intent);
+    let proxy_pending = !block_wins && !args.allow_net && has_proxy_intent;
     output::print_capabilities(
         &prepared.caps,
         blocked_grants,

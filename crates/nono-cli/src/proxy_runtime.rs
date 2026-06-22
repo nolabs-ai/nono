@@ -1210,8 +1210,8 @@ pub(crate) fn prepare_proxy_launch_options(
     let has_credentials = !credentials.is_empty();
     let would_activate = has_domain_filter || has_credentials || upstream_proxy_addr.is_some();
 
-    // --block-net always wins; profile network.block yields to CLI proxy flags.
-    let block_wins = args.block_net || (prepared.profile_network_block && !args.has_proxy_flags());
+    // --block-net always wins; profile network.block yields to any proxy config.
+    let block_wins = args.block_net || (prepared.profile_network_block && !would_activate);
     if block_wins {
         if would_activate {
             warn!(

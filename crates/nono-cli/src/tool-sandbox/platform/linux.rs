@@ -5036,7 +5036,9 @@ mod tests {
         ToolSandboxState {
             runtime_dir,
             socket_path,
+            url_socket_path: None,
             shim_dir: shim_dir.clone(),
+            url_open_shim: None,
             session_path: format!("{}:/usr/bin", shim_dir.display()),
             profile_display_name: None,
             redaction_policy: nono::ScrubPolicy::secure_default(),
@@ -5065,7 +5067,7 @@ mod tests {
             active_count: AtomicUsize::new(0),
             queued_requests: AtomicUsize::new(0),
             emitted_error_response: AtomicBool::new(false),
-            token_broker: Mutex::new(crate::tool_sandbox::token_broker::TokenBroker::new()),
+            token_broker: crate::tool_sandbox::token_broker::new_shared_broker(),
             approval_backends: nono_proxy::approval::ApprovalBackendRegistry::singleton(Arc::new(
                 crate::terminal_approval::TerminalApproval,
             )),

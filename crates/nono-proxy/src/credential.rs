@@ -866,6 +866,7 @@ mod tests {
                 scope: String::new(),
             }),
             aws_auth: None,
+            spiffe: None,
         }
     }
 
@@ -891,6 +892,7 @@ mod tests {
             tls_client_key: None,
             oauth2: None,
             aws_auth: None,
+            spiffe: None,
         }];
         let outcome = CredentialStore::load_with_diagnostics(&routes, &tls).expect("load");
         assert!(outcome.store.is_empty());
@@ -1002,6 +1004,7 @@ mod tests {
             tls_client_key: None,
             oauth2: None,
             aws_auth: None,
+            spiffe: None,
         }];
         let outcome = CredentialStore::load_with_diagnostics(&routes, &tls);
         assert!(outcome.is_ok());
@@ -1043,6 +1046,7 @@ mod tests {
             tls_client_key: None,
             oauth2: None,
             aws_auth: None,
+            spiffe: None,
         }];
         let store = CredentialStore::load_with_diagnostics(&routes, &tls)
             .expect("credential store loads")
@@ -1139,6 +1143,7 @@ mod tests {
             tls_client_key: None,
             oauth2: None,
             aws_auth: None,
+            spiffe: None,
         }];
         let store = CredentialStore::load_with_diagnostics(&routes, &tls)
             .expect("credential load")
@@ -1172,6 +1177,7 @@ mod tests {
             tls_client_key: None,
             oauth2: None,
             aws_auth: None,
+            spiffe: None,
         }];
         let store = CredentialStore::load_with_diagnostics(&routes, &tls)
             .expect("credential load")
@@ -1216,6 +1222,7 @@ mod tests {
                 scope: String::new(),
             }),
             aws_auth: None,
+            spiffe: None,
         }];
 
         let outcome = CredentialStore::load_with_diagnostics(&routes, &tls);

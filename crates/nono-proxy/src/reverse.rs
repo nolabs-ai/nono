@@ -20,7 +20,8 @@ use crate::config::{EndpointPolicyOutcome, InjectMode};
 use crate::credential::{CmdCredentialRoute, CredentialStore, LoadedCredential};
 use crate::error::{ProxyError, Result};
 use crate::filter::ProxyFilter;
-use crate::forward::UpstreamScheme;
+use crate::forward;
+use crate::forward::{AuditCtx, UpstreamScheme, UpstreamSpec, UpstreamStrategy};
 use crate::route::RouteStore;
 use crate::token;
 use std::net::SocketAddr;
@@ -169,6 +170,10 @@ pub async fn handle_reverse_proxy(
         injection_mode: Some(nono::undo::NetworkAuditInjectionMode::OAuth2),
         ..audit::EventContext::default()
     });
+    #[cfg(feature = "spiffe")]
+    let has_spiffe = route.spiffe_x509.is_some() || route.spiffe_jwt.is_some();
+    #[cfg(not(feature = "spiffe"))]
+    let has_spiffe = false;
     let route_ctx = managed_ctx
         .clone()
         .or_else(|| oauth2_ctx.clone())
@@ -183,6 +188,7 @@ pub async fn handle_reverse_proxy(
         static_cred.is_some() || cmd_available,
         oauth2_route.is_some(),
         aws_route.is_some(),
+        has_spiffe,
     ) {
         let reason = format!(
             "managed credential unavailable for service '{}': route is configured for proxy-supplied auth",
@@ -248,6 +254,23 @@ pub async fn handle_reverse_proxy(
     if aws_route.is_some() {
         send_error(stream, 501, "Not Implemented").await?;
         return Ok(());
+    }
+
+    #[cfg(feature = "spiffe")]
+    if has_spiffe {
+        return handle_spiffe_route(
+            route,
+            &service,
+            &method,
+            &upstream_path,
+            &version,
+            remaining_header,
+            buffered_body,
+            stream,
+            ctx,
+            &route_ctx,
+        )
+        .await;
     }
 
     let cred = static_cred;
@@ -540,6 +563,286 @@ pub async fn handle_reverse_proxy(
                 &e.to_string(),
             );
         }
+    }
+    Ok(())
+}
+
+/// Handle a reverse-proxy request for a SPIFFE-authenticated route.
+///
+/// SPIFFE routes bypass the normal credential store entirely. The session token
+/// still authenticates the local client (via `Proxy-Authorization: Bearer`).
+/// The upstream is authenticated at the TLS layer (X.509 mTLS) or via a
+/// short-lived JWT injected as the configured HTTP header.
+#[cfg(feature = "spiffe")]
+pub(crate) struct SpiffeUpstreamAuth {
+    pub jwt_token: Option<Zeroizing<String>>,
+    pub inject_header: Option<String>,
+    pub tls_connector: Option<tokio_rustls::TlsConnector>,
+    pub spiffe_id: String,
+}
+
+/// Fetch SPIFFE material for an upstream request (JWT bearer or mTLS connector).
+#[cfg(feature = "spiffe")]
+pub(crate) async fn acquire_spiffe_upstream_auth(
+    route: &crate::route::LoadedRoute,
+) -> Result<SpiffeUpstreamAuth> {
+    if let Some(src) = &route.spiffe_x509 {
+        if !src.is_available() {
+            return Err(ProxyError::Credential(
+                "SPIFFE X.509 source unavailable: Workload API stream terminated".to_string(),
+            ));
+        }
+        return Ok(SpiffeUpstreamAuth {
+            jwt_token: None,
+            inject_header: None,
+            tls_connector: Some(src.tls_connector()),
+            spiffe_id: src.spiffe_id(),
+        });
+    }
+
+    if let Some(src) = &route.spiffe_jwt {
+        let token = src
+            .fetch_token(&src.audience)
+            .await
+            .map_err(|e| ProxyError::Credential(e.to_string()))?;
+        let header = src.inject_header.clone();
+        return Ok(SpiffeUpstreamAuth {
+            jwt_token: Some(token),
+            inject_header: Some(header),
+            tls_connector: None,
+            spiffe_id: String::new(),
+        });
+    }
+
+    Err(ProxyError::Credential(
+        "SPIFFE route has no active Workload API source".to_string(),
+    ))
+}
+
+/// Validate the localhost auth boundary for SPIFFE reverse-proxy requests.
+///
+/// Accepts `Proxy-Authorization` (forward-proxy style via `HTTP_PROXY`) or
+/// `Authorization: Bearer <session-token>` (SDK / `*_BASE_URL` style).
+fn validate_reverse_local_auth(
+    remaining_header: &[u8],
+    upstream_path: &str,
+    session_token: &Zeroizing<String>,
+) -> Result<()> {
+    if token::validate_proxy_auth(remaining_header, session_token).is_ok() {
+        return Ok(());
+    }
+    validate_phantom_token_for_mode(
+        &crate::config::InjectMode::Header,
+        remaining_header,
+        upstream_path,
+        "Authorization",
+        None,
+        None,
+        session_token,
+    )
+}
+
+#[cfg(feature = "spiffe")]
+#[allow(clippy::too_many_arguments)]
+async fn handle_spiffe_route(
+    route: &crate::route::LoadedRoute,
+    service: &str,
+    method: &str,
+    upstream_path: &str,
+    version: &str,
+    remaining_header: &[u8],
+    buffered_body: &[u8],
+    stream: &mut TcpStream,
+    ctx: &ReverseProxyCtx<'_>,
+    route_ctx: &audit::EventContext<'_>,
+) -> Result<()> {
+    // Validate the local session token before doing anything with the SPIFFE source.
+    if let Err(e) = validate_reverse_local_auth(remaining_header, upstream_path, ctx.session_token)
+    {
+        let deny_ctx = audit::EventContext {
+            auth_outcome: Some(nono::undo::NetworkAuditAuthOutcome::Failed),
+            denial_category: Some(nono::undo::NetworkAuditDenialCategory::AuthenticationFailed),
+            ..route_ctx.clone()
+        };
+        audit::log_denied(
+            ctx.audit_log,
+            audit::ProxyMode::Reverse,
+            &deny_ctx,
+            service,
+            0,
+            &e.to_string(),
+        );
+        send_error(stream, 407, "Proxy Authentication Required").await?;
+        return Ok(());
+    }
+
+    let spiffe_auth = match acquire_spiffe_upstream_auth(route).await {
+        Ok(auth) => auth,
+        Err(e) => {
+            warn!("SPIFFE credential unavailable: {}", e);
+            let deny_ctx = audit::EventContext {
+                auth_mechanism: route.managed_auth_mechanism.clone(),
+                auth_outcome: Some(nono::undo::NetworkAuditAuthOutcome::Failed),
+                denial_category: Some(
+                    nono::undo::NetworkAuditDenialCategory::ManagedCredentialUnavailable,
+                ),
+                ..route_ctx.clone()
+            };
+            audit::log_denied(
+                ctx.audit_log,
+                audit::ProxyMode::Reverse,
+                &deny_ctx,
+                service,
+                0,
+                &e.to_string(),
+            );
+            send_error(stream, 503, "Service Unavailable").await?;
+            return Ok(());
+        }
+    };
+
+    let jwt_token = spiffe_auth.jwt_token;
+    let inject_header = spiffe_auth.inject_header;
+    let tls_connector_owned = spiffe_auth.tls_connector;
+    let spiffe_id = spiffe_auth.spiffe_id;
+
+    let spiffe_ctx = nono::undo::SpiffeAuditContext {
+        workload_spiffe_id: spiffe_id,
+        trust_domain: String::new(),
+        upstream_spiffe_id: None,
+    };
+    let success_ctx = audit::EventContext {
+        route_id: Some(service),
+        auth_mechanism: route.managed_auth_mechanism.clone(),
+        auth_outcome: Some(nono::undo::NetworkAuditAuthOutcome::Succeeded),
+        managed_credential_active: Some(true),
+        injection_mode: route.managed_injection_mode.clone(),
+        spiffe_context: Some(spiffe_ctx),
+        ..audit::EventContext::default()
+    };
+
+    let upstream_url = format!("{}{}", route.upstream.trim_end_matches('/'), upstream_path);
+    debug!("SPIFFE forward to upstream: {} {}", method, upstream_url);
+    let (upstream_scheme, upstream_host, upstream_port, upstream_path_full) =
+        parse_upstream_url(&upstream_url)?;
+    let check = ctx.filter.check_host(&upstream_host, upstream_port).await?;
+    if !check.result.is_allowed() {
+        let reason = check.result.reason();
+        warn!("Upstream host denied by filter: {}", reason);
+        send_error(stream, 403, "Forbidden").await?;
+        let deny_ctx = audit::EventContext {
+            denial_category: Some(nono::undo::NetworkAuditDenialCategory::HostDenied),
+            ..route_ctx.clone()
+        };
+        audit::log_denied(
+            ctx.audit_log,
+            audit::ProxyMode::Reverse,
+            &deny_ctx,
+            service,
+            0,
+            &reason,
+        );
+        return Ok(());
+    }
+    if let Err(reason) =
+        validate_http_upstream_target(upstream_scheme, &upstream_host, &check.resolved_addrs)
+    {
+        warn!("{}", reason);
+        send_error(stream, 502, "Bad Gateway").await?;
+        let deny_ctx = audit::EventContext {
+            denial_category: Some(nono::undo::NetworkAuditDenialCategory::UpstreamConnectFailed),
+            ..route_ctx.clone()
+        };
+        audit::log_denied(
+            ctx.audit_log,
+            audit::ProxyMode::Reverse,
+            &deny_ctx,
+            service,
+            0,
+            &reason,
+        );
+        return Ok(());
+    }
+
+    let filtered_headers = filter_headers(remaining_header, "");
+    let content_length = extract_content_length(remaining_header);
+    let body = match read_request_body(stream, content_length, buffered_body).await? {
+        Some(body) => body,
+        None => return Ok(()),
+    };
+
+    let upstream_authority = format_host_header(upstream_scheme, &upstream_host, upstream_port);
+    let mut request = Zeroizing::new(format!(
+        "{} {} {}\r\nHost: {}\r\n",
+        method, upstream_path_full, version, upstream_authority
+    ));
+
+    // Inject JWT bearer token if this is a JWT-SVID route.
+    if let (Some(token), Some(header)) = (&jwt_token, &inject_header) {
+        request.push_str(&format!("{}: Bearer {}\r\n", header, token.as_str()));
+    }
+
+    for (name, value) in &filtered_headers {
+        // Strip the injection header so the sandboxed client cannot override it.
+        if let Some(ref h) = inject_header
+            && name.eq_ignore_ascii_case(h)
+        {
+            continue;
+        }
+        request.push_str(&format!("{}: {}\r\n", name, value));
+    }
+
+    request.push_str("Connection: close\r\n");
+    if !body.is_empty() {
+        request.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    }
+    request.push_str("\r\n");
+
+    let default_connector;
+    let connector = if let Some(ref owned) = tls_connector_owned {
+        owned
+    } else {
+        default_connector = route
+            .tls_connector
+            .as_ref()
+            .unwrap_or(ctx.tls_connector)
+            .clone();
+        &default_connector
+    };
+    let upstream_spec = UpstreamSpec {
+        scheme: upstream_scheme,
+        host: &upstream_host,
+        port: upstream_port,
+        strategy: UpstreamStrategy::Direct {
+            resolved_addrs: &check.resolved_addrs,
+        },
+        tls_connector: connector,
+    };
+    let audit_ctx = AuditCtx {
+        log: ctx.audit_log,
+        mode: audit::ProxyMode::Reverse,
+        event_ctx: success_ctx.clone(),
+        target: service,
+        method,
+        path: upstream_path,
+    };
+    if let Err(e) =
+        forward::forward_request(stream, request.as_bytes(), &body, upstream_spec, audit_ctx).await
+    {
+        warn!("SPIFFE upstream connection failed: {}", e);
+        send_error(stream, 502, "Bad Gateway").await?;
+        let deny_ctx = audit::EventContext {
+            denial_category: Some(nono::undo::NetworkAuditDenialCategory::UpstreamConnectFailed),
+            ..success_ctx
+        };
+        audit::log_denied(
+            ctx.audit_log,
+            audit::ProxyMode::Reverse,
+            &deny_ctx,
+            service,
+            0,
+            &e.to_string(),
+        );
     }
     Ok(())
 }

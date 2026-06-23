@@ -42,7 +42,7 @@ test-trust-overrides = []
 
 [dependencies]
 nono = { version = "0.65.1", path = "../nono", default-features = false }
-nono-proxy = { version = "0.65.1", path = "../nono-proxy", default-features = false }
+nono-proxy = { version = "0.65.1", path = "../nono-proxy", default-features = false, features = ["spiffe"] }
 clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"
 colored = "3"

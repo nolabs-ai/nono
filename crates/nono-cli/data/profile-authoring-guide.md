@@ -689,7 +689,11 @@ With `capability_elevation` enabled, nono runs in supervised mode where every fi
 
 ### Blocking container access (Docker, Podman, kubectl)
 
-Use `filesystem.deny` to prevent an agent from reaching the Docker daemon or similar container runtimes. `commands.deny` is deprecated startup-only gating and should not be relied on as enforcement:
+Socket access enforcement is platform-specific because macOS (Seatbelt) and Linux (Landlock + seccomp) have different capabilities.
+
+#### macOS
+
+Use `filesystem.deny` on the socket path. Seatbelt treats `connect(2)` as a network operation, so nono also emits a `network-outbound` deny for the path — the socket is blocked at both the filesystem and network layers:
 
 ```json
 {
@@ -700,14 +704,41 @@ Use `filesystem.deny` to prevent an agent from reaching the Docker daemon or sim
   },
   "filesystem": {
     "deny": ["/var/run/docker.sock"]
-  },
-  "commands": {
-    "deny": ["docker", "docker-compose", "podman", "kubectl"]
   }
 }
 ```
 
-On macOS, `filesystem.deny` on a socket path also emits a Seatbelt `network-outbound` deny — Seatbelt treats `connect(2)` as a network operation so a file deny alone won't block it. Prefer path- and network-based controls; `commands.deny` remains as deprecated startup-only compatibility behavior and is visible in `nono profile show` under the commands section.
+#### Linux
+
+Landlock cannot express deny-within-allow, so `filesystem.deny` is a no-op on Linux. Instead, enable `linux.af_unix_mediation` to switch to a default-deny seccomp supervisor for AF_UNIX pathname sockets, then add back only the sockets the agent needs via `filesystem.unix_socket`:
+
+```json
+{
+  "extends": "claude-code",
+  "meta": {
+    "name": "no-docker",
+    "description": "Claude Code without Docker access"
+  },
+  "linux": {
+    "af_unix_mediation": "pathname"
+  }
+}
+```
+
+With no `filesystem.unix_socket` entries, every AF_UNIX pathname connect and bind is blocked — including `/run/docker.sock`. To allow specific sockets back (e.g. tmux, D-Bus), add them explicitly:
+
+```json
+{
+  "linux": { "af_unix_mediation": "pathname" },
+  "filesystem": {
+    "unix_socket": ["/run/user/1000/bus"]
+  }
+}
+```
+
+#### Deprecation note
+
+`commands.deny` is deprecated startup-only gating — it blocks the command from launching but does not enforce socket access and should not be relied on as enforcement. It remains visible in `nono profile show` under the commands section for compatibility.
 
 ### Allowing parent-of-protected-root grants (macOS only)
 

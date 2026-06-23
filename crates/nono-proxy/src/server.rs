@@ -464,8 +464,14 @@ pub async fn start_with_nonce_resolver(
     credential_capture_backend: Option<Arc<dyn CredentialCaptureBackend>>,
     nonce_resolver: Option<Arc<dyn crate::token::NonceResolver>>,
 ) -> Result<ProxyHandle> {
-    // Generate session token
-    let session_token = token::generate_session_token()?;
+    // Use the caller-supplied password if one was provided (the standalone
+    // `nono proxy --pass` case), otherwise mint a fresh random session token.
+    // An empty override is treated as "not supplied" so a blank `--pass`
+    // can't silently produce an unguessable-but-empty credential.
+    let session_token = match config.session_token {
+        Some(ref token) if !token.is_empty() => token.clone(),
+        _ => token::generate_session_token()?,
+    };
 
     // Bind listener
     let bind_addr = SocketAddr::new(config.bind_addr, config.bind_port);
@@ -876,10 +882,17 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
                         // request head rather than dropping the socket — closing
                         // it breaks reactive clients (Apache HttpClient, Java's
                         // HttpClient, Maven's native resolver).
+                        //
+                        // When auth is disabled (standalone `nono proxy
+                        // --no-auth`), `enforce_proxy_auth` returns `Ok(())` on
+                        // the first pass and the loop exits without challenging.
                         let mut current_headers = header_bytes;
                         loop {
-                            match token::validate_proxy_auth(&current_headers, &state.session_token)
-                            {
+                            match token::enforce_proxy_auth(
+                                state.config.require_auth,
+                                &current_headers,
+                                &state.session_token,
+                            ) {
                                 Ok(()) => break,
                                 Err(e) => {
                                     debug!(
@@ -1124,6 +1137,7 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
                 &header_bytes,
                 &state.filter,
                 &state.session_token,
+                state.config.require_auth,
                 ext_config,
                 Some(&state.audit_log),
             )
@@ -1133,13 +1147,18 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
             // routing direct. Without this, bypassed hosts would inherit
             // connect::handle_connect()'s lenient auth (which tolerates
             // missing Proxy-Authorization for Node.js undici compat).
-            token::validate_proxy_auth(&header_bytes, &state.session_token)?;
+            token::enforce_proxy_auth(
+                state.config.require_auth,
+                &header_bytes,
+                &state.session_token,
+            )?;
             connect::handle_connect(
                 first_line,
                 &mut stream,
                 &state.filter,
                 &state.session_token,
                 &header_bytes,
+                state.config.require_auth,
                 Some(&state.audit_log),
             )
             .await
@@ -1150,6 +1169,7 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
                 &state.filter,
                 &state.session_token,
                 &header_bytes,
+                state.config.require_auth,
                 Some(&state.audit_log),
             )
             .await
@@ -1160,6 +1180,7 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
             route_store: &state.route_store,
             credential_store: &state.credential_store,
             session_token: &state.session_token,
+            require_auth: state.config.require_auth,
             filter: &state.filter,
             tls_connector: &state.tls_connector,
             default_tls_config: &state.default_tls_config,
@@ -1221,6 +1242,36 @@ mod tests {
             normalize_authority("API.OPENAI.COM:443"),
             normalize_authority("api.openai.com")
         );
+    }
+
+    #[tokio::test]
+    async fn test_proxy_uses_supplied_session_token() {
+        // A caller-supplied password (the `nono proxy --pass` case) must be
+        // used verbatim as the proxy credential instead of a random token.
+        let config = ProxyConfig {
+            session_token: Some(Zeroizing::new("my-fixed-password".to_string())),
+            ..Default::default()
+        };
+        let handle = start(config).await.unwrap();
+        assert_eq!(*handle.token, "my-fixed-password");
+        handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_proxy_ignores_empty_session_token() {
+        // An empty override must fall back to a random token, never an
+        // effectively-absent credential.
+        let config = ProxyConfig {
+            session_token: Some(Zeroizing::new(String::new())),
+            ..Default::default()
+        };
+        let handle = start(config).await.unwrap();
+        assert_eq!(
+            handle.token.len(),
+            64,
+            "empty --pass must fall back to a random token"
+        );
+        handle.shutdown();
     }
 
     #[tokio::test]

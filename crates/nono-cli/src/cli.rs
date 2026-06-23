@@ -34,6 +34,7 @@ const STYLES: Styles = Styles::plain().header(Style::new().bold());
 \x1b[1mEXPLORATION & DEBUGGING\x1b[0m
   learn      [deprecated] Use `nono run` to learn from sandbox denials
   why        Check why filesystem, network, scope, or command access would be allowed or denied
+  proxy      Run the network filtering / credential proxy as a standalone server
 
 \x1b[1mSESSION MANAGEMENT\x1b[0m
   ps         List running or detached sandbox sessions
@@ -236,6 +237,24 @@ pub enum Commands {
   and path rules.
 ")]
     Why(Box<WhyArgs>),
+
+    /// Run the network filtering / credential proxy as a standalone server
+    #[command(help_template = "\
+{about}
+
+\x1b[1mUSAGE\x1b[0m
+  nono proxy [flags]
+
+{all-args}
+{after-help}")]
+    #[command(after_help = "\x1b[1mEXAMPLES\x1b[0m
+  nono proxy                                   # Ephemeral port, token auth, prints connection info
+  nono proxy --port 8080                       # Fixed port
+  nono proxy --port 8080 --no-auth             # Open loopback proxy (no token required)
+  nono proxy --allow-domain github.com         # Allowlist a host
+  nono proxy --profile my-profile              # Load network settings from a profile
+")]
+    Proxy(Box<ProxyArgs>),
 
     // ── Session management ───────────────────────────────────────────────
     /// Manage rollback sessions (browse, restore, cleanup)
@@ -1419,6 +1438,130 @@ impl SandboxArgs {
             || !self.proxy_credential.is_empty()
             || self.external_proxy.is_some()
     }
+}
+
+/// Arguments for the standalone `nono proxy` command.
+///
+/// Runs the network-filtering / credential-injection proxy as a foreground
+/// server (no sandboxed child). Proxy settings can be loaded from a profile
+/// (`--profile`) and extended/overridden with explicit flags. The flag names
+/// mirror the `NETWORK` / `CREDENTIALS` flags on `nono run`.
+#[derive(Parser, Debug, Clone)]
+pub struct ProxyArgs {
+    /// Address the proxy listens on (loopback only unless --no-auth is omitted)
+    #[arg(
+        long,
+        value_name = "ADDR",
+        default_value = "127.0.0.1",
+        help_heading = "PROXY"
+    )]
+    pub listen: std::net::IpAddr,
+
+    /// Port to listen on (0 = OS-assigned ephemeral port)
+    #[arg(long, value_name = "PORT", default_value_t = 0, help_heading = "PROXY")]
+    pub port: u16,
+
+    /// Disable session-token auth: accept every request on the bind address.
+    /// Refused for non-loopback bind addresses. Use with care.
+    #[arg(long, conflicts_with = "pass", help_heading = "PROXY")]
+    pub no_auth: bool,
+
+    /// Use this exact password as the proxy credential instead of a randomly
+    /// generated session token. Clients present it via Proxy-Authorization
+    /// (Basic password or Bearer token). Prefer NONO_PROXY_PASS to avoid
+    /// leaking the secret in shell history / process listings.
+    #[arg(
+        long,
+        value_name = "PASSWORD",
+        env = "NONO_PROXY_PASS",
+        help_heading = "PROXY"
+    )]
+    pub pass: Option<String>,
+
+    /// Use a profile by name or file path (loads its network/credential settings)
+    #[arg(
+        long,
+        short = 'p',
+        value_name = "NAME_OR_PATH",
+        env = "NONO_PROFILE",
+        help_heading = "PROXY"
+    )]
+    pub profile: Option<String>,
+
+    // ── Network ──────────────────────────────────────────────────────────
+    /// Enable proxy filtering with a named network profile
+    #[arg(
+        long,
+        value_name = "PROFILE",
+        env = "NONO_NETWORK_PROFILE",
+        help_heading = "NETWORK"
+    )]
+    pub network_profile: Option<String>,
+
+    /// Add a domain to the proxy allowlist (repeatable).
+    /// Plain hostname for unrestricted access, or a URL with a path glob
+    /// to restrict to specific endpoints (e.g., https://github.com/org/**)
+    #[arg(
+        long = "allow-domain",
+        alias = "allow-proxy",
+        alias = "proxy-allow",
+        env = "NONO_ALLOW_DOMAIN",
+        value_name = "DOMAIN_OR_URL",
+        help_heading = "NETWORK"
+    )]
+    pub allow_proxy: Vec<String>,
+
+    /// Chain outbound traffic through an upstream proxy (host:port)
+    #[arg(
+        long = "upstream-proxy",
+        alias = "external-proxy",
+        value_name = "HOST:PORT",
+        env = "NONO_UPSTREAM_PROXY",
+        help_heading = "NETWORK"
+    )]
+    pub external_proxy: Option<String>,
+
+    /// Route these domains direct instead of through the upstream proxy
+    #[arg(
+        long = "upstream-bypass",
+        alias = "external-proxy-bypass",
+        value_name = "DOMAIN",
+        env = "NONO_UPSTREAM_BYPASS",
+        value_delimiter = ',',
+        help_heading = "NETWORK"
+    )]
+    pub external_proxy_bypass: Vec<String>,
+
+    /// Add the proxy CA to the macOS user trust store (enables Go CLI tools).
+    #[cfg(target_os = "macos")]
+    #[arg(long, env = "NONO_TRUST_PROXY_CA", help_heading = "NETWORK")]
+    pub trust_proxy_ca: bool,
+
+    /// Proxy CA certificate validity in days (1–365, default: 1).
+    #[arg(
+        long,
+        value_name = "DAYS",
+        env = "NONO_PROXY_CA_VALIDITY",
+        value_parser = clap::value_parser!(u32).range(1..=365),
+        help_heading = "NETWORK"
+    )]
+    pub proxy_ca_validity: Option<u32>,
+
+    // ── Credentials ──────────────────────────────────────────────────────
+    /// Inject credentials via reverse proxy for a service (repeatable)
+    #[arg(
+        long = "credential",
+        alias = "proxy-credential",
+        env = "NONO_CREDENTIAL",
+        value_name = "SERVICE",
+        help_heading = "CREDENTIALS"
+    )]
+    pub proxy_credential: Vec<String>,
+
+    // ── Options ──────────────────────────────────────────────────────────
+    /// Enable verbose output (-v info, -vv debug, -vvv trace)
+    #[arg(long, short = 'v', action = clap::ArgAction::Count, help_heading = "OPTIONS")]
+    pub verbose: u8,
 }
 
 #[derive(Parser, Debug, Clone, Default)]
@@ -3930,6 +4073,7 @@ mod tests {
         "wrap",
         "learn",
         "why",
+        "proxy",
         "ps",
         "stop",
         "detach",

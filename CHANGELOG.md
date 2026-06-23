@@ -1,5 +1,38 @@
 # Changelog
 
+## [0.65.0] - 2026-06-23
+
+### Bug Fixes
+
+- *(sandbox)* Exempt IPC fd from sendmsg trapping to resolve af_unix_mediation deadlock (#1210) ([#1210](https://github.com/always-further/nono/pull/1210))
+
+- *(docs)* Replace broken link in readme (#1221) ([#1221](https://github.com/always-further/nono/pull/1221))
+
+
+### Dependencies
+
+- *(deps)* Bump syn from 2.0.117 to 2.0.118 (#1230) ([#1230](https://github.com/always-further/nono/pull/1230))
+
+- *(deps)* Bump regex from 1.12.3 to 1.12.4 (#1231) ([#1231](https://github.com/always-further/nono/pull/1231))
+
+- *(deps)* Bump sigstore-verify from 0.8.0 to 0.9.0 (#1228) ([#1228](https://github.com/always-further/nono/pull/1228))
+
+- *(deps)* Bump softprops/action-gh-release from 3.0.0 to 3.0.1 (#1227) ([#1227](https://github.com/always-further/nono/pull/1227))
+
+- *(deps)* Bump actions/checkout from 6.0.3 to 7.0.0 (#1226) ([#1226](https://github.com/always-further/nono/pull/1226))
+
+
+### Features
+
+- *(sandbox)* Tool sandbox (#1105) ([#1105](https://github.com/always-further/nono/pull/1105))
+
+
+### Miscellaneous
+
+- *(docs)* Improve profile documentation (#1212) ([#1212](https://github.com/always-further/nono/pull/1212))
+
+- Release v0.64.1 (#1217) ([#1217](https://github.com/always-further/nono/pull/1217))
+
 ## [0.64.1] - 2026-06-20
 
 ### Refactoring

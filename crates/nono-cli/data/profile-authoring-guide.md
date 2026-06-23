@@ -421,7 +421,7 @@ Capture commands run with `NONO_SESSION_ID`, `NONO_REQUEST_HOST`, `NONO_REQUEST_
   "request_host": "api.github.com",
   "request_path": "/repos/nolabs-ai/nono/issues/787",
   "request_method": "GET",
-  "cache_scope": "always-further"
+  "cache_scope": "nolabs-ai"
 }
 ```
 

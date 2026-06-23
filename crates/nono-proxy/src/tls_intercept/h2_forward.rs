@@ -43,6 +43,9 @@ struct SharedH2Ctx {
     approval_backends: Option<crate::approval::ApprovalBackendRegistry>,
     credential_capture_backend: Option<Arc<dyn CredentialCaptureBackend>>,
     nonce_resolver: Option<Arc<dyn crate::token::NonceResolver>>,
+    /// Managed upstream auth source shared across all streams on this connection.
+    /// `None` for non-SPIFFE upstreams.
+    managed_auth: Option<Arc<crate::auth::ManagedUpstreamAuth>>,
 }
 
 /// Accept an h2 connection from the client, open an h2 connection to the
@@ -76,8 +79,30 @@ where
         return Ok(());
     }
 
-    // Open upstream TLS with h2 ALPN.
-    let upstream_tls = open_upstream_h2(ctx, &check.resolved_addrs).await?;
+    // Look up SPIFFE routes for this upstream to determine the correct TLS
+    // connector and JWT injection configuration.
+    let host_port = format!("{}:{}", ctx.host, ctx.port);
+    let spiffe_routes: Vec<(_, &crate::route::LoadedRoute)> =
+        ctx.route_store.lookup_all_by_upstream(&host_port);
+
+    // Find the first route with a ManagedUpstreamAuth source. All routes on the
+    // same upstream share the same SPIRE socket, so using the first match is correct.
+    let managed_auth: Option<Arc<crate::auth::ManagedUpstreamAuth>> = spiffe_routes
+        .iter()
+        .find_map(|(_, route)| route.managed_auth.as_ref().map(Arc::clone));
+
+    // No per-connection SPIFFE mTLS setup — X.509-SVID support is planned for
+    // a future PR once the TLS-intercept CONNECT path is fully wired.
+    let spiffe_connector: Option<tokio_rustls::TlsConnector> = None;
+
+    // Use the SPIFFE mTLS connector when available, otherwise fall back to the
+    // default h2 TLS connector.
+    let upstream_tls = open_upstream_h2(
+        ctx,
+        &check.resolved_addrs,
+        spiffe_connector.as_ref().unwrap_or(ctx.tls_connector_h2),
+    )
+    .await?;
 
     let (h2_client, h2_conn) = h2::client::Builder::new()
         .max_send_buffer_size(1024 * 1024)
@@ -109,6 +134,7 @@ where
         approval_backends: ctx.approval_backends.clone(),
         credential_capture_backend: ctx.credential_capture_backend.clone(),
         nonce_resolver: ctx.nonce_resolver.clone(),
+        managed_auth,
     };
 
     let mut tasks = tokio::task::JoinSet::new();
@@ -170,16 +196,19 @@ where
 }
 
 /// Open upstream TLS with h2 ALPN.
+///
+/// `tls_connector` is the connector to use for the upstream TLS handshake.
 async fn open_upstream_h2(
     ctx: &InterceptCtx<'_>,
     resolved_addrs: &[SocketAddr],
+    tls_connector: &tokio_rustls::TlsConnector,
 ) -> Result<tokio_rustls::client::TlsStream<tokio::net::TcpStream>> {
     let upstream_spec = UpstreamSpec {
         scheme: UpstreamScheme::Https,
         host: ctx.host,
         port: ctx.port,
         strategy: handle::select_upstream_strategy(&ctx.upstream_proxy, resolved_addrs),
-        tls_connector: ctx.tls_connector_h2,
+        tls_connector,
     };
     let tcp = forward::open_tcp_upstream(&upstream_spec).await?;
     let server_name =
@@ -189,7 +218,7 @@ async fn open_upstream_h2(
                 reason: "invalid server name for TLS".to_string(),
             }
         })?;
-    ctx.tls_connector_h2
+    tls_connector
         .connect(server_name, tcp)
         .await
         .map_err(|e| ProxyError::UpstreamConnect {
@@ -234,6 +263,9 @@ async fn handle_h2_stream(
     // legacy `endpoint_rules` API here would silently bypass endpoint_policy on
     // gRPC traffic.
     let method_str = method.as_str().to_string();
+
+    // Audit context is populated per-stream when credentials are acquired.
+    let mut spiffe_audit_ctx: Option<nono::undo::SpiffeAuditContext> = None;
     let selected = match handle::select_intercept_route(
         &ctx.route_store,
         &ctx.host,
@@ -279,6 +311,32 @@ async fn handle_h2_stream(
     };
     let cred = resolved.as_ref().map(|c| c.as_ref());
 
+    // SPIFFE assertion route: fetch access token, fail hard if SVID is gone.
+    let spiffe_assertion_route = service.and_then(|s| ctx.credential_store.get_spiffe_assertion(s));
+    let spiffe_assertion_token = if let Some(assertion_route) = spiffe_assertion_route {
+        match assertion_route.cache.get_or_refresh().await {
+            Ok(token) => {
+                let id = &assertion_route.cache.workload_spiffe_id;
+                spiffe_audit_ctx = Some(nono::undo::SpiffeAuditContext {
+                    trust_domain: crate::auth::extract_trust_domain(id),
+                    workload_spiffe_id: id.clone(),
+                    svid_type: "jwt".to_string(),
+                    source: "spire-workload-api".to_string(),
+                    upstream_spiffe_id: None,
+                    delegation: None,
+                });
+                Some(token)
+            }
+            Err(e) => {
+                warn!("h2_forward: SPIFFE assertion token unavailable: {}", e);
+                send_h2_error(&mut respond, 503)?;
+                return Ok(());
+            }
+        }
+    } else {
+        None
+    };
+
     // Build transformed path (credential injection into path/query if needed).
     // Shared with the HTTP/1.1 path so URL-mode injection cannot diverge.
     let transformed_path = reverse::transform_path_for_credential(cred, &path)?;
@@ -288,6 +346,12 @@ async fn handle_h2_stream(
     // computed by the shared helper so the h2 path strips/injects exactly the
     // same headers as HTTP/1.1 — including any `extra_headers`.
     let injected_header_names = reverse::injected_credential_header_names(cred);
+    // Strip the managed-auth inject header so a client-supplied copy cannot
+    // survive alongside the injected value.
+    let spiffe_inject_header_lower: Option<String> =
+        ctx.managed_auth.as_ref().map(|auth| match auth.as_ref() {
+            crate::auth::ManagedUpstreamAuth::SpiffeJwt(src) => src.inject_header.to_lowercase(),
+        });
     // Resolve tool-sandbox broker nonces (`nono_<64hex>`) in forwarded header
     // values, mirroring the HTTP/1.1 path. Without this, an h2/gRPC request that
     // carries a broker nonce in a header would forward the raw nonce upstream
@@ -297,13 +361,35 @@ async fn handle_h2_stream(
     for (name, value) in request.headers() {
         let name_lower = name.as_str().to_lowercase();
         // Skip hop-by-hop and connection-specific headers.
-        if name_lower == "host" || name_lower == "connection" || name_lower == "proxy-authorization"
-        {
+        // RFC 7540 §8.1.2.2: strip hop-by-hop headers before h2 forwarding.
+        if matches!(
+            name_lower.as_str(),
+            "host"
+                | "connection"
+                | "proxy-authorization"
+                | "te"
+                | "transfer-encoding"
+                | "upgrade"
+                | "keep-alive"
+                | "trailer"
+        ) {
             continue;
         }
         // Skip any header the credential will inject (primary + extra), so a
         // client-supplied copy cannot survive alongside the injected value.
         if injected_header_names.contains(&name_lower) {
+            continue;
+        }
+        // Strip the SPIFFE JWT inject header so a client-supplied copy cannot
+        // survive alongside the bearer token we inject below.
+        if spiffe_inject_header_lower
+            .as_deref()
+            .is_some_and(|h| h == name_lower)
+        {
+            continue;
+        }
+        // Strip authorization when the assertion route will inject its own Bearer.
+        if spiffe_assertion_token.is_some() && name_lower == "authorization" {
             continue;
         }
         // Substitute a broker nonce for the real credential when present and
@@ -346,6 +432,46 @@ async fn handle_h2_stream(
             {
                 upstream_headers.insert(name, val);
             }
+        }
+    }
+
+    // Inject managed credential (SpiffeJwt) per stream.
+    // On fetch failure, send 503 — forwarding an unsigned request would bypass the auth boundary.
+    if let Some(auth) = &ctx.managed_auth {
+        match auth.acquire().await {
+            Ok(
+                ref material @ crate::auth::UpstreamAuthMaterial::BearerToken {
+                    ref header,
+                    ref token,
+                    ref credential_format,
+                    ..
+                },
+            ) => {
+                let value =
+                    zeroize::Zeroizing::new(credential_format.replace("{}", token.as_str()));
+                if let Ok(val) = HeaderValue::from_str(value.as_str())
+                    && let Ok(name) = http::header::HeaderName::from_bytes(header.as_bytes())
+                {
+                    upstream_headers.insert(name, val);
+                }
+                spiffe_audit_ctx = Some(material.spiffe_audit_context());
+            }
+            Err(e) => {
+                warn!(
+                    "h2_forward: managed credential fetch failed for {}:{}: {}",
+                    ctx.host, ctx.port, e
+                );
+                send_h2_error(&mut respond, 503)?;
+                return Ok(());
+            }
+        }
+    }
+
+    // Inject SPIFFE assertion Bearer token (OAuth2 jwt-bearer exchange result).
+    if let Some(token) = spiffe_assertion_token {
+        let bearer = zeroize::Zeroizing::new(format!("Bearer {}", token.as_str()));
+        if let Ok(val) = HeaderValue::from_str(bearer.as_str()) {
+            upstream_headers.insert(http::header::AUTHORIZATION, val);
         }
     }
 
@@ -441,6 +567,7 @@ async fn handle_h2_stream(
             injection_mode: cred
                 .map(|c| reverse::audit_injection_mode_for_inject_mode(&c.inject_mode)),
             denial_category: None,
+            spiffe_context: spiffe_audit_ctx,
             ..audit::EventContext::default()
         },
         &ctx.host,
@@ -636,8 +763,9 @@ mod tests {
             oauth2: None,
             aws_auth: None,
             endpoint_policy: None,
+            spiffe: None,
         }];
-        let route_store = RouteStore::load(&routes).unwrap();
+        let route_store = RouteStore::load(&routes).await.unwrap();
         let credential_store = CredentialStore::load_with_diagnostics(&routes, tls_connector)
             .await
             .unwrap()
@@ -692,7 +820,7 @@ mod tests {
     }
 
     /// Build a RouteStore with a single route pointing at `host:port`.
-    fn make_route_store(host: &str, port: u16, rules: Vec<EndpointRule>) -> RouteStore {
+    async fn make_route_store(host: &str, port: u16, rules: Vec<EndpointRule>) -> RouteStore {
         let routes = vec![RouteConfig {
             prefix: "test-svc".to_string(),
             upstream: format!("https://{}:{}", host, port),
@@ -712,8 +840,9 @@ mod tests {
             oauth2: None,
             aws_auth: None,
             endpoint_policy: None,
+            spiffe: None,
         }];
-        RouteStore::load(&routes).unwrap()
+        RouteStore::load(&routes).await.unwrap()
     }
 
     /// Build a CredentialStore with a test credential.
@@ -954,7 +1083,8 @@ mod tests {
                 method: "POST".to_string(),
                 path: "/v1/chat/completions".to_string(),
             }],
-        );
+        )
+        .await;
         let credential_store = make_credential_store("sk-test-secret-key");
         let cert_cache = Arc::new(CertCache::new(Arc::clone(&ca)));
         let tls_connector = h2_tls_connector_trusting(ca.cert_pem());
@@ -1294,7 +1424,8 @@ mod tests {
                 method: "POST".to_string(),
                 path: "/v1/chat/completions".to_string(),
             }],
-        );
+        )
+        .await;
         // Credential carries a second managed header beyond Authorization.
         let credential_store =
             make_credential_store_with_extra("sk-test-secret-key", "x-api-key", "managed-key");
@@ -1430,8 +1561,9 @@ mod tests {
                 service: Some("bedrock".to_string()),
             }),
             endpoint_policy: None,
+            spiffe: None,
         }];
-        let route_store = RouteStore::load(&routes).unwrap();
+        let route_store = RouteStore::load(&routes).await.unwrap();
         // Set fake AWS credential env vars so the default chain succeeds and
         // load_with_diagnostics inserts the AwsRoute. The mutex lock is dropped
         // before the await point (holding a MutexGuard across an await is a
@@ -1528,7 +1660,7 @@ mod tests {
         let ca = Arc::new(EphemeralCa::generate().unwrap());
         let (upstream_port, rx) = spawn_mock_h2_upstream_echo(&ca).await;
 
-        let route_store = make_route_store("localhost", upstream_port, vec![]);
+        let route_store = make_route_store("localhost", upstream_port, vec![]).await;
         let credential_store = CredentialStore::empty();
         let cert_cache = Arc::new(CertCache::new(Arc::clone(&ca)));
         let tls_connector = h2_tls_connector_trusting(ca.cert_pem());
@@ -1814,6 +1946,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 endpoint_policy: None,
+                spiffe: None,
             },
             RouteConfig {
                 prefix: "svc-b".to_string(),
@@ -1837,9 +1970,10 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 endpoint_policy: None,
+                spiffe: None,
             },
         ];
-        let route_store = RouteStore::load(&routes).unwrap();
+        let route_store = RouteStore::load(&routes).await.unwrap();
         let credential_store = CredentialStore::empty();
         let cert_cache = Arc::new(CertCache::new(Arc::clone(&ca)));
         let tls_connector = h2_tls_connector_trusting(ca.cert_pem());
@@ -1917,7 +2051,8 @@ mod tests {
                 method: "POST".to_string(),
                 path: "/v1/chat/completions".to_string(),
             }],
-        );
+        )
+        .await;
         let credential_store = make_credential_store("sk-should-not-appear");
         let cert_cache = Arc::new(CertCache::new(Arc::clone(&ca)));
         let tls_connector = h2_tls_connector_trusting(ca.cert_pem());
@@ -1987,7 +2122,7 @@ mod tests {
 
     /// Build a RouteStore modeling an endpoint-only restriction route (no
     /// credential_key), as produced by `_ep_` routes from allow_domain.
-    fn make_endpoint_only_route_store(
+    async fn make_endpoint_only_route_store(
         host: &str,
         port: u16,
         rules: Vec<EndpointRule>,
@@ -2011,8 +2146,9 @@ mod tests {
             oauth2: None,
             aws_auth: None,
             endpoint_policy: None,
+            spiffe: None,
         }];
-        RouteStore::load(&routes).unwrap()
+        RouteStore::load(&routes).await.unwrap()
     }
 
     #[tokio::test]
@@ -2029,7 +2165,8 @@ mod tests {
                 method: "GET".to_string(),
                 path: "/repos/my-org/**".to_string(),
             }],
-        );
+        )
+        .await;
         let credential_store = CredentialStore::empty();
         let cert_cache = Arc::new(CertCache::new(Arc::clone(&ca)));
         let tls_connector = h2_tls_connector_trusting(ca.cert_pem());
@@ -2150,8 +2287,9 @@ mod tests {
                     timeout_secs: None,
                 }],
             }),
+            spiffe: None,
         }];
-        let route_store = RouteStore::load(&routes).unwrap();
+        let route_store = RouteStore::load(&routes).await.unwrap();
         let credential_store = CredentialStore::empty();
         let cert_cache = Arc::new(CertCache::new(Arc::clone(&ca)));
         let tls_connector = h2_tls_connector_trusting(ca.cert_pem());
@@ -2234,7 +2372,8 @@ mod tests {
                 method: "GET".to_string(),
                 path: "/repos/my-org/**".to_string(),
             }],
-        );
+        )
+        .await;
         let credential_store = CredentialStore::empty();
         let cert_cache = Arc::new(CertCache::new(Arc::clone(&ca)));
         let tls_connector = h2_tls_connector_trusting(ca.cert_pem());
@@ -2338,6 +2477,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 endpoint_policy: None,
+                spiffe: None,
             },
             // Endpoint-only restriction (_ep_ route)
             RouteConfig {
@@ -2368,9 +2508,10 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 endpoint_policy: None,
+                spiffe: None,
             },
         ];
-        let route_store = RouteStore::load(&routes).unwrap();
+        let route_store = RouteStore::load(&routes).await.unwrap();
         let credential_store = make_credential_store("gh-secret");
         let cert_cache = Arc::new(CertCache::new(Arc::clone(&ca)));
         let tls_connector = h2_tls_connector_trusting(ca.cert_pem());
@@ -2457,7 +2598,8 @@ mod tests {
                 method: "POST".to_string(),
                 path: "/v1/chat/completions".to_string(),
             }],
-        );
+        )
+        .await;
         // No managed credential — the secret arrives purely via nonce resolution.
         let credential_store = CredentialStore::empty();
         let cert_cache = Arc::new(CertCache::new(Arc::clone(&ca)));
@@ -2557,7 +2699,8 @@ mod tests {
                 method: "POST".to_string(),
                 path: "/v1/chat/completions".to_string(),
             }],
-        );
+        )
+        .await;
         let credential_store = CredentialStore::empty();
         let cert_cache = Arc::new(CertCache::new(Arc::clone(&ca)));
         let tls_connector = h2_tls_connector_trusting(ca.cert_pem());
@@ -2659,7 +2802,8 @@ mod tests {
                 method: "POST".to_string(),
                 path: "/pkg.Svc/BidiStream".to_string(),
             }],
-        );
+        )
+        .await;
         let credential_store = make_credential_store("sk-test-secret-key");
         let cert_cache = Arc::new(CertCache::new(Arc::clone(&ca)));
         let tls_connector = h2_tls_connector_trusting(ca.cert_pem());

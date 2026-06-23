@@ -20,7 +20,7 @@ use nono_proxy::config::{
 };
 use regex::Regex;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{
@@ -497,7 +497,17 @@ impl ProxyCredentialCaptureBackend {
             std::thread::sleep(Duration::from_millis(25));
         }
 
-        let output = child.wait_with_output().map_err(|err| {
+        const STDOUT_CAP: u64 = 64 * 1024;
+        const STDERR_CAP: u64 = 4 * 1024;
+        let mut stdout_buf = Vec::new();
+        let mut stderr_buf = Vec::new();
+        if let Some(out) = child.stdout.take() {
+            out.take(STDOUT_CAP + 1).read_to_end(&mut stdout_buf).ok();
+        }
+        if let Some(err) = child.stderr.take() {
+            err.take(STDERR_CAP).read_to_end(&mut stderr_buf).ok();
+        }
+        let status = child.wait().map_err(|err| {
             self.capture_error(
                 entry,
                 CaptureErrorDetails::new("collect_failed", start.elapsed()).reason(format!(
@@ -505,6 +515,21 @@ impl ProxyCredentialCaptureBackend {
                 )),
             )
         })?;
+        if stdout_buf.len() > STDOUT_CAP as usize {
+            stdout_buf.truncate(STDOUT_CAP as usize);
+            return Err(self.capture_error(
+                entry,
+                CaptureErrorDetails::new("output_too_large", start.elapsed()).reason(format!(
+                    "credential capture command stdout exceeded {} bytes",
+                    STDOUT_CAP
+                )),
+            ));
+        }
+        let output = std::process::Output {
+            status,
+            stdout: stdout_buf,
+            stderr: stderr_buf,
+        };
         let status_code = output.status.code();
         if !output.status.success() {
             let stderr_redacted = redacted_stderr(&output.stderr, &self.redaction_policy);
@@ -1859,6 +1884,7 @@ fn collect_tool_sandbox_proxy_grants(
                 })
                 .transpose()?,
             aws_auth: None,
+            spiffe: None,
         };
 
         if let Some(existing) = custom_credentials.get(&grant.name) {
@@ -1955,19 +1981,43 @@ fn load_command_credential_source(
         std::thread::sleep(Duration::from_millis(25));
     }
 
-    let output = child.wait_with_output().map_err(|err| {
+    let mut stdout_buf = Vec::new();
+    let mut stderr_buf = Vec::new();
+    if let Some(out) = child.stdout.take() {
+        out.take(64 * 1024 + 1).read_to_end(&mut stdout_buf).ok();
+    }
+    if let Some(err) = child.stderr.take() {
+        err.take(4 * 1024).read_to_end(&mut stderr_buf).ok();
+    }
+    let status = child.wait().map_err(|err| {
         NonoError::SandboxInit(format!(
             "failed to collect supervisor credential source '{command}': {err}"
         ))
     })?;
-    if !output.status.success() {
+    if stdout_buf.len() > 64 * 1024 {
         return Err(NonoError::SandboxInit(format!(
-            "supervisor credential source '{command}' failed with exit code {}",
-            output
-                .status
-                .code()
-                .map_or_else(|| "unknown".to_string(), |code| code.to_string())
+            "supervisor credential source '{command}' stdout exceeded 64 KiB"
         )));
+    }
+    let output = std::process::Output {
+        status,
+        stdout: stdout_buf,
+        stderr: stderr_buf,
+    };
+    if !output.status.success() {
+        let code = output
+            .status
+            .code()
+            .map_or_else(|| "unknown".to_string(), |c| c.to_string());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = stderr.trim();
+        return Err(NonoError::SandboxInit(if stderr.is_empty() {
+            format!("supervisor credential source '{command}' failed with exit code {code}")
+        } else {
+            format!(
+                "supervisor credential source '{command}' failed with exit code {code}: {stderr}"
+            )
+        }));
     }
     let value = String::from_utf8(output.stdout).map_err(|err| {
         NonoError::SandboxInit(format!(
@@ -2302,6 +2352,31 @@ pub(crate) fn build_proxy_config_from_flags(
         }
     }
     routes.extend(endpoint_routes);
+    // Credential route upstreams must also be reachable by the proxy filter
+    // when the child curls the real upstream URL (CONNECT + TLS intercept).
+    // Use url::Url::parse so credentials embedded in the URL (user:pass@host)
+    // don't end up in the allowlist as a garbled "user:pass@host:port" string.
+    for route in &routes {
+        if let Ok(parsed) = url::Url::parse(&route.upstream)
+            && let Some(host) = parsed.host_str()
+        {
+            let default_port = if parsed.scheme() == "https" {
+                443u16
+            } else {
+                80u16
+            };
+            let port = parsed.port().unwrap_or(default_port);
+            let host_port = format!("{}:{}", host, port);
+            if !plain_hosts.iter().any(|h| h == &host_port) {
+                plain_hosts.push(host_port);
+            }
+            // HostFilter matches on hostname only; also allow the bare host so
+            // CONNECT targets like localhost:19871 pass the filter as "localhost".
+            if !plain_hosts.iter().any(|h| h == host) {
+                plain_hosts.push(host.to_string());
+            }
+        }
+    }
     resolved.routes = routes;
 
     let deny_domain = proxy
@@ -2416,6 +2491,7 @@ fn synthesize_credential_provider_proxy_config(
                 tls_client_key: None,
                 oauth2: None,
                 aws_auth: None,
+                spiffe: None,
             });
             consumers_by_provider
                 .entry(route.provider.clone())
@@ -2512,6 +2588,98 @@ impl nono_proxy::NonceResolver for TokenBrokerNonceResolver {
     fn resolve(&self, nonce: &str, consumer: &str) -> Option<Zeroizing<Vec<u8>>> {
         self.0.lock().ok()?.resolve_nonce(nonce, consumer)
     }
+}
+
+/// Attempt to canonicalize `p`, falling back to the original path if the
+/// filesystem entry does not exist yet (e.g. a SPIRE socket that is not
+/// currently running). On macOS `/var` is a symlink to `/private/var`; without
+/// canonicalization the component-safe `starts_with` check would miss matches
+/// between `/var/run/spire.sock` and `/private/var/run/spire.sock`.
+fn try_canonicalize(p: &std::path::Path) -> std::path::PathBuf {
+    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+}
+
+/// Deny the sandboxed child direct access to SPIRE Workload API sockets used
+/// by SPIFFE-authenticated proxy routes.
+///
+/// The proxy supervisor holds the SPIFFE identity and mediates all SVIDs. The
+/// sandboxed child must not be able to reach the socket independently — doing
+/// so would let it obtain its own SVIDs and bypass the proxy's auth boundary.
+///
+/// Emits a Seatbelt `(deny network-outbound (path ...))` rule on macOS.
+/// On Linux, Landlock has no deny-within-allow semantics, so we rely on the
+/// unix_socket allowlist being absent (the child never has the socket granted).
+///
+/// Hard errors if a `unix_socket` capability already grants the socket —
+/// that combination would silently undermine the isolation guarantee.
+fn enforce_spiffe_socket_isolation(
+    proxy_config: &nono_proxy::config::ProxyConfig,
+    caps: &mut CapabilitySet,
+) -> Result<()> {
+    use nono_proxy::config::SpiffeAuthConfig;
+    use std::collections::BTreeSet;
+
+    // Collect unique SPIRE socket paths from all SPIFFE routes.
+    let mut socket_paths: BTreeSet<String> = BTreeSet::new();
+    for route in &proxy_config.routes {
+        if let Some(SpiffeAuthConfig::Jwt {
+            workload_api_socket,
+            ..
+        }) = &route.spiffe
+        {
+            socket_paths.insert(workload_api_socket.clone());
+        }
+    }
+
+    if socket_paths.is_empty() {
+        return Ok(());
+    }
+
+    // Hard error if any SPIRE socket is also in the unix_socket grant list.
+    // Using Path::starts_with for component-safe comparison.
+    let unix_caps = caps.unix_socket_capabilities();
+    for socket_path in &socket_paths {
+        let spire = try_canonicalize(std::path::Path::new(socket_path));
+        for uc in unix_caps {
+            let granted = try_canonicalize(uc.resolved.as_path());
+            if spire == granted || spire.starts_with(&granted) || granted.starts_with(&spire) {
+                return Err(NonoError::ConfigParse(format!(
+                    "SPIFFE route uses Workload API socket '{}' which is also \
+                     granted via unix_socket capability '{}'; this would allow \
+                     the sandboxed process to obtain SVIDs directly and bypass \
+                     the proxy auth boundary — remove the unix_socket grant",
+                    socket_path,
+                    uc.resolved.display()
+                )));
+            }
+        }
+    }
+
+    // On macOS, emit an explicit Seatbelt deny rule so the child cannot reach
+    // the socket even if a future capability accidentally grants the parent dir.
+    #[cfg(target_os = "macos")]
+    for socket_path in &socket_paths {
+        let escaped = crate::policy::escape_seatbelt_path(socket_path)?;
+        caps.add_platform_rule(format!("(deny network-outbound (path \"{}\"))", escaped))?;
+        debug!(
+            "SPIFFE: emitted Seatbelt deny for SPIRE socket {}",
+            socket_path
+        );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        // On Linux, log a debug note. The child never has the socket granted,
+        // so no active deny is needed. The conflict check above is the guard.
+        for socket_path in &socket_paths {
+            debug!(
+                "SPIFFE: SPIRE socket {} is not in unix_socket grants (Linux, no deny needed)",
+                socket_path
+            );
+        }
+    }
+
+    Ok(())
 }
 
 /// Wire up TLS interception on a `ProxyConfig`: pick a session-scoped
@@ -2655,6 +2823,15 @@ pub(crate) fn start_proxy_runtime(
         port,
         bind_ports: proxy.allow_bind_ports.clone(),
     });
+
+    // SPIFFE/SPIRE hardening: deny the sandboxed child direct access to the
+    // SPIRE Workload API socket. The proxy holds the SPIFFE identity; the
+    // child must not be able to obtain SVIDs independently. This prevents a
+    // compromised agent from escalating its own identity.
+    //
+    // Hard error if the user has explicitly granted the socket via unix_socket
+    // caps — that combination undermines the isolation guarantee.
+    enforce_spiffe_socket_isolation(&proxy_config, caps)?;
 
     // Grant the sandboxed child a read capability on the ephemeral
     // trust bundle so `SSL_CERT_FILE` etc. are actually openable after
@@ -3096,6 +3273,7 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 aws_auth: None,
+                spiffe: None,
             },
         );
 
@@ -3435,6 +3613,7 @@ mod tests {
             tls_client_key: None,
             oauth2: None,
             aws_auth: None,
+            spiffe: None,
         });
         let credential_env_vars = vec![
             (

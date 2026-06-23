@@ -202,6 +202,9 @@ pub struct ProxyHandle {
     /// Non-credential allowed hosts that should bypass the proxy (NO_PROXY).
     /// Computed at startup: `allowed_hosts` minus credential upstream hosts.
     no_proxy_hosts: Vec<String>,
+    /// When true, loopback must not appear in `NO_PROXY` because a managed
+    /// credential route targets a loopback upstream host.
+    managed_loopback_upstream: bool,
     /// Path to the TLS-intercept trust bundle written at startup, when
     /// interception is active. The CLI passes this path to the sandboxed
     /// child via env vars (`SSL_CERT_FILE` etc.) and grants a Landlock /
@@ -358,6 +361,7 @@ impl ProxyHandle {
                 && group.iter().any(|r| {
                     r.credential_key.is_some()
                         || r.oauth2.is_some()
+                        || r.spiffe.is_some()
                         || !r.endpoint_rules.is_empty()
                         || r.endpoint_policy.is_some()
                 }) {
@@ -409,6 +413,13 @@ impl ProxyHandle {
             } else {
                 "creds: oauth2 ✗ (token exchange failed)".to_string()
             }
+        } else if route.spiffe.is_some() {
+            let resolved = self.loaded_routes.contains(prefix);
+            if resolved {
+                "creds: spiffe ✓".to_string()
+            } else {
+                "creds: spiffe ✗ (Workload API unavailable)".to_string()
+            }
         } else {
             "creds: none".to_string()
         }
@@ -430,10 +441,14 @@ impl ProxyHandle {
     pub fn env_vars(&self) -> Vec<(String, String)> {
         let proxy_url = format!("http://nono:{}@127.0.0.1:{}", *self.token, self.port);
 
-        // Build NO_PROXY: always include loopback, plus non-credential
-        // allowed hosts. Credential upstreams are excluded so their traffic
-        // goes through the reverse proxy for L7 filtering + injection.
+        // Build NO_PROXY: include loopback unless a managed credential route
+        // targets a loopback upstream (those must traverse the proxy). Also add
+        // non-credential allowed hosts. Credential upstreams are excluded so
+        // their traffic goes through the reverse proxy for L7 filtering + injection.
         let mut no_proxy_parts = vec!["localhost".to_string(), "127.0.0.1".to_string()];
+        if self.managed_loopback_upstream {
+            no_proxy_parts.retain(|h| h != "localhost" && h != "127.0.0.1");
+        }
         for host in &self.no_proxy_hosts {
             // Strip port for NO_PROXY (most HTTP clients match on hostname).
             // Handle IPv6 brackets: "[::1]:443" → "[::1]", "host:443" → "host"
@@ -532,6 +547,22 @@ impl ProxyHandle {
                     let api_key_name = cred_key.to_uppercase();
                     vars.push((api_key_name, self.token.to_string()));
                 }
+            } else if route.spiffe.is_some() {
+                // SPIFFE routes use the same phantom token pattern for SDK-style
+                // `*_BASE_URL` clients even though upstream auth is SPIFFE.
+                let api_key_name = format!("{}_API_KEY", prefix.to_uppercase());
+                vars.push((api_key_name, self.token.to_string()));
+            } else if route
+                .oauth2
+                .as_ref()
+                .and_then(|o| o.client_assertion.as_ref())
+                .is_some()
+            {
+                // OAuth2 jwt-bearer assertion routes need the same phantom token
+                // pattern — the proxy validates session integrity before injecting
+                // the exchanged access token, so the child process must present it.
+                let api_key_name = format!("{}_API_KEY", prefix.to_uppercase());
+                vars.push((api_key_name, self.token.to_string()));
             }
         }
         vars
@@ -610,6 +641,11 @@ struct ProxyState {
     /// Per-host HTTP/2 capability cache. Populated by pre-flight probes so
     /// the inbound acceptor only advertises h2 when the upstream supports it.
     h2_cache: Arc<UpstreamH2Cache>,
+    /// Actual bound port (OS-assigned when config.bind_port is 0).
+    /// Used by `handle_forward_http` to detect requests targeting the proxy
+    /// itself (absolute-form `http://127.0.0.1:{bound_port}/…`) and re-route
+    /// them to the reverse-proxy credential-injection path.
+    bound_port: u16,
 }
 
 struct CompositeNonceResolver {
@@ -705,7 +741,7 @@ pub async fn start_with_nonce_resolver(
     let route_store = if config.routes.is_empty() {
         RouteStore::empty()
     } else {
-        RouteStore::load(&config.routes)?
+        RouteStore::load(&config.routes).await?
     };
     let oauth_capture_store = OAuthCaptureStore::load_with_persistence(
         &config.oauth_capture,
@@ -770,7 +806,17 @@ pub async fn start_with_nonce_resolver(
             CredentialStore::load_with_diagnostics(&config.routes, &tls_connector).await?;
         (outcome.store, outcome.diagnostics)
     };
-    let loaded_routes = credential_store.loaded_prefixes();
+    let mut loaded_routes = credential_store.loaded_prefixes();
+    loaded_routes.extend(route_store.spiffe_loaded_prefixes());
+    let config_loopback_upstream = crate::route::config_has_loopback_proxy_route(&config.routes);
+    let managed_loopback_upstream =
+        route_store.has_managed_loopback_upstream() || config_loopback_upstream;
+    if config_loopback_upstream && !route_store.has_managed_loopback_upstream() {
+        debug!(
+            "NO_PROXY: clearing loopback via config route match ({} route(s))",
+            config.routes.len()
+        );
+    }
 
     // Build filter. Strict mode treats an empty allowlist as deny-all.
     let filter = if config.strict_filter {
@@ -936,6 +982,7 @@ pub async fn start_with_nonce_resolver(
         cert_cache,
         enable_h2,
         h2_cache: UpstreamH2Cache::new(),
+        bound_port: port,
     });
 
     // Spawn accept loop as a task within the current runtime.
@@ -950,6 +997,7 @@ pub async fn start_with_nonce_resolver(
         shutdown_tx,
         loaded_routes,
         no_proxy_hosts,
+        managed_loopback_upstream,
         intercept_ca_path,
         intercept_ca_env_vars,
         diagnostics: proxy_diagnostics,
@@ -1552,6 +1600,40 @@ async fn handle_forward_http(
 
     // 2. Parse host+port and run the host filter (DNS resolution + SSRF guard).
     let (host, port) = parse_non_connect_target(first_line)?;
+
+    // Self-request: the absolute URL targets the proxy's own address.
+    //
+    // When `MOCKAPI_BASE_URL = http://127.0.0.1:{proxy_port}/mockapi` and
+    // loopback is absent from NO_PROXY (because a managed-credential route
+    // has a loopback upstream), HTTP_PROXY-aware clients such as curl send
+    // the request in absolute-form to the proxy.  Without this check the
+    // request would enter the transparent forward path and try to connect to
+    // the proxy itself (a self-loop), bypassing credential injection.
+    //
+    // Detect the pattern and delegate to `handle_reverse_proxy`, which
+    // already strips the scheme+authority from absolute-form URLs before
+    // routing by path prefix, so credential injection (including SPIFFE JWT)
+    // works correctly.
+    if port == state.bound_port
+        && (host == "127.0.0.1" || host == "localhost" || host == "[::1]" || host == "::1")
+    {
+        let ctx = reverse::ReverseProxyCtx {
+            route_store: &state.route_store,
+            credential_store: &state.credential_store,
+            session_token: &state.session_token,
+            require_auth: state.config.require_auth,
+            filter: &state.filter,
+            tls_connector: &state.tls_connector,
+            default_tls_config: &state.default_tls_config,
+            upstream_pool: &state.upstream_pool,
+            audit_log: Some(&state.audit_log),
+            approval_backends: state.approval_backends.clone(),
+            credential_capture_backend: state.credential_capture_backend.clone(),
+        };
+        return reverse::handle_reverse_proxy(first_line, stream, header_bytes, &ctx, buffered)
+            .await;
+    }
+
     let check = state.filter.check_host(&host, port).await?;
     if !check.result.is_allowed() {
         let reason = check.result.reason();
@@ -1794,6 +1876,7 @@ mod tests {
             tls_client_key: None,
             oauth2: None,
             aws_auth: None,
+            spiffe: None,
         }
     }
 
@@ -1956,6 +2039,7 @@ mod tests {
                 shutdown_tx,
                 loaded_routes: std::collections::HashSet::new(),
                 no_proxy_hosts: Vec::new(),
+                managed_loopback_upstream: false,
                 intercept_ca_path: None,
                 intercept_ca_env_vars: crate::config::default_intercept_ca_env_vars(),
                 diagnostics: vec![],
@@ -1998,6 +2082,7 @@ mod tests {
                     tls_client_key: None,
                     oauth2: None,
                     aws_auth: None,
+                    spiffe: None,
                 }],
                 intercept_ca_dir: Some(dir.path().to_path_buf()),
                 intercept_ca_env_vars: {
@@ -2074,6 +2159,7 @@ mod tests {
                 tls_client_key: None,
                 oauth2: None,
                 aws_auth: None,
+                spiffe: None,
             }],
             intercept_ca_dir: Some(dir.path().to_path_buf()),
             ..Default::default()
@@ -2157,6 +2243,7 @@ mod tests {
                 tls_client_key: None,
                 oauth2: None,
                 aws_auth: None,
+                spiffe: None,
             }],
             intercept_ca_dir: Some(missing_dir),
             ..Default::default()
@@ -2205,6 +2292,7 @@ mod tests {
                     tls_client_key: None,
                     oauth2: None,
                     aws_auth: None,
+                    spiffe: None,
                 },
                 crate::config::RouteConfig {
                     prefix: "alias".to_string(),
@@ -2225,6 +2313,7 @@ mod tests {
                     tls_client_key: None,
                     oauth2: None,
                     aws_auth: None,
+                    spiffe: None,
                 },
             ],
             intercept_ca_dir: Some(dir.path().to_path_buf()),
@@ -2285,6 +2374,7 @@ mod tests {
                     tls_client_key: None,
                     oauth2: None,
                     aws_auth: None,
+                    spiffe: None,
                 },
                 // Synthetic endpoint-authorization route for the same upstream.
                 crate::config::RouteConfig {
@@ -2306,6 +2396,7 @@ mod tests {
                     tls_client_key: None,
                     oauth2: None,
                     aws_auth: None,
+                    spiffe: None,
                 },
             ],
             intercept_ca_dir: Some(dir.path().to_path_buf()),
@@ -2366,6 +2457,7 @@ mod tests {
                     tls_client_key: None,
                     oauth2: None,
                     aws_auth: None,
+                    spiffe: None,
                 },
                 // `_ep_` route on a concrete subdomain covered by the wildcard.
                 crate::config::RouteConfig {
@@ -2387,6 +2479,7 @@ mod tests {
                     tls_client_key: None,
                     oauth2: None,
                     aws_auth: None,
+                    spiffe: None,
                 },
             ],
             intercept_ca_dir: Some(dir.path().to_path_buf()),
@@ -2437,6 +2530,7 @@ mod tests {
             tls_client_key: None,
             oauth2: None,
             aws_auth: None,
+            spiffe: None,
         };
         let config = ProxyConfig {
             routes: vec![
@@ -2485,6 +2579,7 @@ mod tests {
             tls_client_key: None,
             oauth2: None,
             aws_auth: None,
+            spiffe: None,
         };
         let config = ProxyConfig {
             routes: vec![
@@ -2560,6 +2655,7 @@ mod tests {
                 tls_client_key: None,
                 oauth2: None,
                 aws_auth: None,
+                spiffe: None,
             }],
             ..Default::default()
         };
@@ -2586,6 +2682,7 @@ mod tests {
             shutdown_tx,
             loaded_routes: ["openai".to_string()].into_iter().collect(),
             no_proxy_hosts: Vec::new(),
+            managed_loopback_upstream: false,
             intercept_ca_path: None,
             intercept_ca_env_vars: crate::config::default_intercept_ca_env_vars(),
             diagnostics: vec![],
@@ -2610,6 +2707,7 @@ mod tests {
                 tls_client_key: None,
                 oauth2: None,
                 aws_auth: None,
+                spiffe: None,
             }],
             ..Default::default()
         };
@@ -2645,6 +2743,7 @@ mod tests {
             shutdown_tx,
             loaded_routes: ["openai".to_string()].into_iter().collect(),
             no_proxy_hosts: Vec::new(),
+            managed_loopback_upstream: false,
             intercept_ca_path: None,
             intercept_ca_env_vars: crate::config::default_intercept_ca_env_vars(),
             diagnostics: vec![],
@@ -2669,6 +2768,7 @@ mod tests {
                 tls_client_key: None,
                 oauth2: None,
                 aws_auth: None,
+                spiffe: None,
             }],
             ..Default::default()
         };
@@ -2709,6 +2809,7 @@ mod tests {
             // Only "openai" was loaded; "github" credential was unavailable
             loaded_routes: ["openai".to_string()].into_iter().collect(),
             no_proxy_hosts: Vec::new(),
+            managed_loopback_upstream: false,
             intercept_ca_path: None,
             intercept_ca_env_vars: crate::config::default_intercept_ca_env_vars(),
             diagnostics: vec![],
@@ -2734,6 +2835,7 @@ mod tests {
                     tls_client_key: None,
                     oauth2: None,
                     aws_auth: None,
+                    spiffe: None,
                 },
                 crate::config::RouteConfig {
                     prefix: "github".to_string(),
@@ -2754,6 +2856,7 @@ mod tests {
                     tls_client_key: None,
                     oauth2: None,
                     aws_auth: None,
+                    spiffe: None,
                 },
             ],
             ..Default::default()
@@ -2782,6 +2885,61 @@ mod tests {
     }
 
     #[test]
+    fn test_proxy_credential_env_vars_injects_spiffe_phantom_token() {
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let handle = ProxyHandle {
+            port: 12345,
+            token: Zeroizing::new("session_token".to_string()),
+            audit_log: audit::new_audit_log(),
+            shutdown_tx,
+            loaded_routes: ["myapi".to_string()].into_iter().collect(),
+            no_proxy_hosts: Vec::new(),
+            managed_loopback_upstream: false,
+            intercept_ca_path: None,
+            intercept_ca_env_vars: crate::config::default_intercept_ca_env_vars(),
+            diagnostics: vec![],
+        };
+        let config = ProxyConfig {
+            routes: vec![crate::config::RouteConfig {
+                prefix: "myapi".to_string(),
+                upstream: "https://api.internal.corp".to_string(),
+                credential_key: None,
+                inject_mode: crate::config::InjectMode::Header,
+                inject_header: "Authorization".to_string(),
+                credential_format: None,
+                path_pattern: None,
+                path_replacement: None,
+                query_param_name: None,
+                proxy: None,
+                env_var: None,
+                endpoint_rules: vec![],
+                endpoint_policy: None,
+                tls_ca: None,
+                tls_client_cert: None,
+                tls_client_key: None,
+                oauth2: None,
+                aws_auth: None,
+                spiffe: Some(crate::config::SpiffeAuthConfig::Jwt {
+                    workload_api_socket: "/tmp/spire.sock".to_string(),
+                    audience: vec!["api.internal.corp".to_string()],
+                    inject_header: "Authorization".to_string(),
+                    credential_format: None,
+                    svid_hint: None,
+                }),
+            }],
+            ..Default::default()
+        };
+
+        let vars = handle.credential_env_vars(&config);
+        let api_key = vars.iter().find(|(k, _)| k == "MYAPI_API_KEY");
+        assert!(
+            api_key.is_some(),
+            "SPIFFE route should inject phantom API key"
+        );
+        assert_eq!(api_key.unwrap().1, "session_token");
+    }
+
+    #[test]
     fn test_proxy_credential_env_vars_strips_slashes() {
         // When prefix includes leading/trailing slashes, the env var name
         // must not contain slashes and the URL must not double-slash.
@@ -2795,6 +2953,7 @@ mod tests {
             shutdown_tx,
             loaded_routes: std::collections::HashSet::new(),
             no_proxy_hosts: Vec::new(),
+            managed_loopback_upstream: false,
             intercept_ca_path: None,
             intercept_ca_env_vars: crate::config::default_intercept_ca_env_vars(),
             diagnostics: vec![],
@@ -2821,6 +2980,7 @@ mod tests {
                 tls_client_key: None,
                 oauth2: None,
                 aws_auth: None,
+                spiffe: None,
             }],
             ..Default::default()
         };
@@ -2857,6 +3017,7 @@ mod tests {
                 tls_client_key: None,
                 oauth2: None,
                 aws_auth: None,
+                spiffe: None,
             }],
             ..Default::default()
         };
@@ -2889,6 +3050,7 @@ mod tests {
             shutdown_tx: shutdown_tx.clone(),
             loaded_routes: ["anthropic".to_string()].into_iter().collect(),
             no_proxy_hosts: Vec::new(),
+            managed_loopback_upstream: false,
             intercept_ca_path: None,
             intercept_ca_env_vars: crate::config::default_intercept_ca_env_vars(),
             diagnostics: vec![],
@@ -2913,6 +3075,7 @@ mod tests {
                 tls_client_key: None,
                 oauth2: None,
                 aws_auth: None,
+                spiffe: None,
             }],
             ..Default::default()
         };
@@ -2934,6 +3097,7 @@ mod tests {
             shutdown_tx: shutdown_tx2,
             loaded_routes: ["anthropic".to_string()].into_iter().collect(),
             no_proxy_hosts: Vec::new(),
+            managed_loopback_upstream: false,
             intercept_ca_path: None,
             intercept_ca_env_vars: crate::config::default_intercept_ca_env_vars(),
             diagnostics: vec![],
@@ -2958,6 +3122,7 @@ mod tests {
                 tls_client_key: None,
                 oauth2: None,
                 aws_auth: None,
+                spiffe: None,
             }],
             ..Default::default()
         };
@@ -2983,6 +3148,7 @@ mod tests {
                 "nats.internal:4222".to_string(),
                 "opencode.internal:4096".to_string(),
             ],
+            managed_loopback_upstream: false,
             intercept_ca_path: None,
             intercept_ca_env_vars: crate::config::default_intercept_ca_env_vars(),
             diagnostics: vec![],
@@ -3014,6 +3180,7 @@ mod tests {
             shutdown_tx,
             loaded_routes: std::collections::HashSet::new(),
             no_proxy_hosts: Vec::new(),
+            managed_loopback_upstream: false,
             intercept_ca_path: None,
             intercept_ca_env_vars: crate::config::default_intercept_ca_env_vars(),
             diagnostics: vec![],
@@ -3024,6 +3191,30 @@ mod tests {
         assert_eq!(
             no_proxy.1, "localhost,127.0.0.1",
             "NO_PROXY should only contain loopback when no bypass hosts"
+        );
+    }
+
+    #[test]
+    fn test_no_proxy_omits_loopback_for_managed_loopback_upstream() {
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let handle = ProxyHandle {
+            port: 12345,
+            token: Zeroizing::new("test_token".to_string()),
+            audit_log: audit::new_audit_log(),
+            shutdown_tx,
+            loaded_routes: std::collections::HashSet::new(),
+            no_proxy_hosts: Vec::new(),
+            managed_loopback_upstream: true,
+            intercept_ca_path: None,
+            intercept_ca_env_vars: crate::config::default_intercept_ca_env_vars(),
+            diagnostics: vec![],
+        };
+
+        let vars = handle.env_vars();
+        let no_proxy = vars.iter().find(|(k, _)| k == "NO_PROXY").unwrap();
+        assert_eq!(
+            no_proxy.1, "",
+            "loopback credential upstreams must traverse the proxy"
         );
     }
 
@@ -3151,6 +3342,7 @@ mod tests {
                 tls_client_key: None,
                 oauth2: None,
                 aws_auth: None,
+                spiffe: None,
             }],
             intercept_ca_dir: Some(dir.path().to_path_buf()),
             ..Default::default()
@@ -3491,6 +3683,7 @@ mod tests {
                 tls_client_key: None,
                 oauth2: None,
                 aws_auth: None,
+                spiffe: None,
             }],
             ..ProxyConfig::default()
         };
@@ -3703,6 +3896,7 @@ mod tests {
                 tls_client_key: None,
                 oauth2: None,
                 aws_auth: None,
+                spiffe: None,
             }],
             ..Default::default()
         };

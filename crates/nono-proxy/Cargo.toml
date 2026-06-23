@@ -69,6 +69,10 @@ rustls-native-certs = "0.8"
 # directly to set not_before/not_after.
 time = { version = "0.3", default-features = false, features = ["std"] }
 
+# SPIFFE Workload API client. Aliased to avoid colliding with any future `spiffe`
+# naming in the workspace.
+spiffe-workload = { package = "spiffe", version = "0.16", features = ["jwt-source"] }
+
 [dev-dependencies]
 tempfile.workspace = true
 tokio = { version = "1", features = ["test-util", "rt-multi-thread", "macros"] }

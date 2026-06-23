@@ -1,0 +1,188 @@
+---
+title: SPIFFE / SPIRE Workload Identity
+description: Authenticate outbound requests using SPIFFE SVIDs — no secrets in your profile, no credentials visible to the sandboxed process.
+---
+
+nono integrates with the [SPIFFE Workload API](https://spiffe.io) to authenticate outbound API
+calls using workload identity. Instead of storing a secret in a keystore or profile, nono contacts
+the local SPIRE agent socket at startup, obtains a credential, and handles injection automatically.
+The sandboxed process makes a plain HTTP request and is never aware a credential was used.
+
+JWT-SVIDs are currently supported. nono fetches a short-lived token per request and injects it
+as a bearer header; refresh is handled by the SPIRE agent cache.
+
+Most of the operational work lives on the SPIRE side: running the server and agent, writing
+attestation policies, and registering workload entries. nono's profile config is just a socket
+path and what to request.
+
+---
+
+## Profile configuration
+
+There are two separate configuration surfaces depending on what the upstream expects:
+
+- **`spiffe` block** — for upstreams that accept a JWT-SVID directly as a bearer token.
+- **`auth.client_assertion`** — for OAuth2 token endpoints that accept a JWT-SVID as a
+  [`urn:ietf:params:oauth:grant-type:jwt-bearer`](https://www.rfc-editor.org/rfc/rfc7523) assertion
+  and return a short-lived OAuth2 access token in exchange.
+
+### JWT-SVID (direct bearer injection)
+
+Add a `spiffe` block to any custom credential route. It is mutually exclusive with `credential_key`,
+`auth`, and `aws_auth`.
+
+```json
+{
+  "network": {
+    "credentials": ["my-api"],
+    "custom_credentials": {
+      "my-api": {
+        "upstream": "https://api.internal.example.com",
+        "spiffe": {
+          "type": "jwt",
+          "workload_api_socket": "/var/run/spire/sockets/agent.sock",
+          "audience": ["https://api.internal.example.com"],
+          "inject_header": "Authorization"
+        }
+      }
+    }
+  }
+}
+```
+
+nono injects the token as `Authorization: Bearer <jwt>`. Change `inject_header` to target a
+different header, or set `credential_format` to change the value format (`{}` is replaced by
+the token).
+
+### JWT-SVID as an OAuth2 client assertion
+
+Some upstreams (including Anthropic's API) accept a JWT-SVID as an OAuth2 client assertion via
+the `urn:ietf:params:oauth:grant-type:jwt-bearer` grant type. The upstream issues a short-lived
+OAuth2 access token in exchange. nono handles the full exchange and injects the resulting access
+token — not the raw JWT-SVID — into upstream requests.
+
+Use `auth.client_assertion` instead of the `spiffe` block for this flow:
+
+```json
+{
+  "network": {
+    "credentials": ["my-api"],
+    "custom_credentials": {
+      "my-api": {
+        "upstream": "https://api.example.com",
+        "auth": {
+          "token_url": "https://api.example.com/oauth/token",
+          "client_assertion": {
+            "type": "spiffe_jwt",
+            "workload_api_socket": "/var/run/spire/sockets/agent.sock",
+            "audience": ["https://api.example.com"]
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+When `client_assertion` is set, `client_id` and `client_secret` are not required — the JWT-SVID
+is the credential. Any extra parameters required by the token endpoint (such as federation rule IDs
+or workspace identifiers) can be passed via `auth.extra_params`:
+
+```json
+"auth": {
+  "token_url": "https://api.example.com/oauth/token",
+  "client_assertion": { ... },
+  "extra_params": {
+    "federation_rule_id": "fdrl_...",
+    "organization_id": "..."
+  }
+}
+```
+
+The difference between this and the `spiffe.type: jwt` block is the intermediary step: here nono
+exchanges the JWT-SVID for an OAuth2 token and caches it until near expiry; with `spiffe.type: jwt`
+the raw JWT-SVID is injected directly with no exchange.
+
+---
+
+## Options reference
+
+### `spiffe` block
+
+| Field | Description |
+|---|---|
+| `workload_api_socket` | Path to the SPIRE agent socket |
+| `audience` | Audience(s) for the minted JWT-SVID |
+| `inject_header` | Header to inject into (default: `Authorization`) |
+| `credential_format` | Format string; `{}` replaced by the token (default: `Bearer {}`) |
+| `svid_hint` | Select a specific SVID when the Workload API returns multiple |
+
+`svid_hint` is useful when the SPIRE agent issues more than one SVID for the same workload —
+for example, one for an internal service mesh and one for an external API. Set it to the SPIFFE ID
+of the SVID you want nono to use; if absent, nono uses the first SVID returned by the agent.
+
+### `auth.client_assertion` block
+
+| Field | Description |
+|---|---|
+| `type` | Must be `"spiffe_jwt"` |
+| `workload_api_socket` | Path to the SPIRE agent socket |
+| `audience` | Audience(s) for the JWT-SVID presented to the token endpoint |
+| `svid_hint` | Select a specific SVID when the Workload API returns multiple |
+
+---
+
+## Socket path by platform
+
+The SPIRE agent socket path varies by platform and installation:
+
+| Platform | Typical path |
+|---|---|
+| Linux | `/var/run/spire/sockets/agent.sock` |
+| macOS (local install) | `/tmp/spire-agent/public/api.sock` |
+| Kubernetes (SPIFFE CSI driver) | `/run/spiffe/sockets/agent.sock` |
+
+Set `workload_api_socket` to match wherever your agent is listening. nono fails at startup if the
+socket is unreachable, so misconfigured paths are caught immediately.
+
+---
+
+## What nono handles
+
+- Connecting to the Workload API on startup — fails immediately if the socket is unreachable
+- Fetching and injecting the right credential (JWT-SVID bearer or OAuth2 access token via client assertion)
+- Background SVID rotation without process restart or credential interruption
+- OAuth2 token caching and refresh for `client_assertion` flows
+- Zeroing JWT token memory on drop
+
+## What the SPIRE operator handles
+
+Everything else. nono's interface to SPIRE is the Workload API socket — it has no knowledge of
+how attestation works, what selectors are in use, or what environment it is running in. The same
+profile works anywhere SPIFFE runs:
+
+| Environment | Attestation method |
+|---|---|
+| Linux / macOS | `unix:uid` — kernel `SO_PEERCRED` |
+| Kubernetes | pod UID, namespace, service account labels |
+| AWS EC2 | instance identity document |
+| GCP / Azure | instance metadata |
+
+Only `workload_api_socket` changes between environments.
+
+The operator's responsibilities are:
+
+1. Run the SPIRE server and agent
+2. Register a workload entry mapping nono's platform identity to a SPIFFE ID:
+   ```bash
+   spire-server entry create \
+       -spiffeID "spiffe://example.com/nono-supervisor" \
+       -selector "unix:uid:$(id -u)"
+   ```
+3. For JWT routes: configure an OIDC discovery provider so upstreams can verify tokens without
+   any knowledge of SPIRE
+4. For `client_assertion` flows: configure a federation rule or JWT verification policy on the
+   token endpoint so it accepts the workload's SPIFFE ID
+
+nono (the supervisor process) is the registered workload — not the process inside the sandbox.
+The sandboxed process cannot reach the SPIRE socket and has no credential visibility.

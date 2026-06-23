@@ -369,6 +369,10 @@ pub struct CustomCredentialDef {
     /// credential chain). Mutually exclusive with `credential_key` and `auth`.
     #[serde(default)]
     pub aws_auth: Option<nono_proxy::config::AwsAuthConfig>,
+
+    /// SPIFFE/SPIRE Workload API auth. Mutually exclusive with `credential_key`, `auth`, and `aws_auth`.
+    #[serde(default)]
+    pub spiffe: Option<nono_proxy::config::SpiffeAuthConfig>,
 }
 
 /// Host-side source that materializes a proxy credential for `cmd://<name>`.
@@ -476,7 +480,7 @@ fn default_inject_header() -> String {
     "Authorization".to_string()
 }
 
-/// Check if a character is a valid HTTP token character per RFC 7230.
+/// Check if a character is a valid HTTP header token character.
 fn is_http_token_char(c: char) -> bool {
     c.is_ascii_alphanumeric()
         || matches!(
@@ -601,12 +605,36 @@ fn validate_custom_credential(name: &str, cred: &CustomCredentialDef) -> Result<
         )));
     }
 
-    // At least one of credential_key, auth, or aws_auth must be set
-    if cred.credential_key.is_none() && cred.auth.is_none() && cred.aws_auth.is_none() {
+    // Mutual exclusion: spiffe is incompatible with credential_key, auth (oauth2), and aws_auth.
+    if cred.spiffe.is_some()
+        && (cred.credential_key.is_some() || cred.auth.is_some() || cred.aws_auth.is_some())
+    {
         return Err(NonoError::ProfileParse(format!(
-            "custom credential '{}' must have either 'credential_key', 'auth', or 'aws_auth' set",
+            "custom credential '{}' has 'spiffe' set together with 'credential_key', 'auth' \
+             (oauth2), or 'aws_auth'; spiffe is mutually exclusive with all other auth fields",
             name
         )));
+    }
+
+    // At least one auth mechanism must be set
+    if cred.credential_key.is_none()
+        && cred.auth.is_none()
+        && cred.aws_auth.is_none()
+        && cred.spiffe.is_none()
+    {
+        return Err(NonoError::ProfileParse(format!(
+            "custom credential '{}' must have either 'credential_key', 'auth', 'aws_auth', \
+             or 'spiffe' set",
+            name
+        )));
+    }
+
+    // Validate inject_header for SPIFFE routes (credential_key has its own validate_header_mode()).
+    if let Some(nono_proxy::config::SpiffeAuthConfig::Jwt {
+        ref inject_header, ..
+    }) = cred.spiffe
+    {
+        validate_header_name(name, inject_header)?;
     }
 
     // Validate OAuth2 auth if present
@@ -820,20 +848,42 @@ fn validate_oauth2_auth(name: &str, auth: &OAuth2Config) -> Result<()> {
     // Validate token_url — same rules as upstream URL (HTTPS or loopback HTTP)
     validate_upstream_url(&auth.token_url, &format!("{}/auth.token_url", name))?;
 
-    // client_id must not be empty
-    if auth.client_id.is_empty() {
-        return Err(NonoError::ProfileParse(format!(
-            "auth.client_id for custom credential '{}' cannot be empty",
-            name
-        )));
-    }
-
-    // client_secret must not be empty
-    if auth.client_secret.is_empty() {
-        return Err(NonoError::ProfileParse(format!(
-            "auth.client_secret for custom credential '{}' cannot be empty",
-            name
-        )));
+    // When using client_assertion, client_id/client_secret are not required,
+    // but the assertion config itself must have valid fields.
+    if let Some(ref assertion) = auth.client_assertion {
+        match assertion {
+            nono_proxy::config::ClientAssertionConfig::SpiffeJwt {
+                workload_api_socket,
+                audience,
+                ..
+            } => {
+                if workload_api_socket.is_empty() {
+                    return Err(NonoError::ProfileParse(format!(
+                        "auth.client_assertion.workload_api_socket for custom credential '{}' cannot be empty",
+                        name
+                    )));
+                }
+                if audience.is_empty() {
+                    return Err(NonoError::ProfileParse(format!(
+                        "auth.client_assertion.audience for custom credential '{}' cannot be empty",
+                        name
+                    )));
+                }
+            }
+        }
+    } else {
+        if auth.client_id.is_empty() {
+            return Err(NonoError::ProfileParse(format!(
+                "auth.client_id for custom credential '{}' cannot be empty",
+                name
+            )));
+        }
+        if auth.client_secret.is_empty() {
+            return Err(NonoError::ProfileParse(format!(
+                "auth.client_secret for custom credential '{}' cannot be empty",
+                name
+            )));
+        }
     }
 
     Ok(())
@@ -885,8 +935,26 @@ fn validate_aws_auth(name: &str, aws: &nono_proxy::config::AwsAuthConfig) -> Res
 }
 
 /// Validate header injection mode fields.
+/// Validate a single header name: non-empty, valid HTTP token characters only.
+fn validate_header_name(cred_name: &str, header: &str) -> Result<()> {
+    if header.is_empty() {
+        return Err(NonoError::ProfileParse(format!(
+            "inject_header for custom credential '{}' cannot be empty",
+            cred_name
+        )));
+    }
+    if !header.chars().all(is_http_token_char) {
+        return Err(NonoError::ProfileParse(format!(
+            "inject_header '{}' for custom credential '{}' contains invalid characters; \
+             header names must be valid HTTP tokens (alphanumeric and !#$%&'*+-.^_`|~)",
+            header, cred_name
+        )));
+    }
+    Ok(())
+}
+
 fn validate_header_mode(name: &str, cred: &CustomCredentialDef) -> Result<()> {
-    // Validate inject_header (RFC 7230 token)
+    // Validate inject_header
     if cred.inject_header.is_empty() {
         return Err(NonoError::ProfileParse(format!(
             "inject_header for custom credential '{}' cannot be empty",
@@ -5001,7 +5069,7 @@ mod tests {
     }
 
     // ============================================================================
-    // is_http_token_char tests (RFC 7230)
+    // is_http_token_char tests
     // ============================================================================
 
     #[test]
@@ -5014,7 +5082,7 @@ mod tests {
 
     #[test]
     fn test_http_token_char_special_chars() {
-        // RFC 7230 tchar: !#$%&'*+-.^_`|~
+        // valid special chars in header token names: !#$%&'*+-.^_`|~
         for c in "!#$%&'*+-.^_`|~".chars() {
             assert!(is_http_token_char(c), "Expected '{}' to be valid tchar", c);
         }
@@ -5035,7 +5103,7 @@ mod tests {
     // Custom credential validation integration tests
     //
     // These test the full validation chain including:
-    // - inject_header (RFC 7230 token validation)
+    // - inject_header (token validation)
     // - credential_format (CRLF injection prevention)
     // - credential_key (alphanumeric + underscore)
     // - upstream URL (HTTPS required, HTTP only for loopback)
@@ -5060,6 +5128,7 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             aws_auth: None,
+            spiffe: None,
         }
     }
 
@@ -5202,6 +5271,57 @@ mod tests {
         assert!(validate_custom_credential("local", &cred).is_ok());
     }
 
+    #[test]
+    fn test_validate_custom_credential_spiffe_only_valid() {
+        let cred = CustomCredentialDef {
+            upstream: "http://127.0.0.1:8080".to_string(),
+            credential_key: None,
+            auth: None,
+            inject_mode: InjectMode::Header,
+            inject_header: "Authorization".to_string(),
+            credential_format: None,
+            path_pattern: None,
+            path_replacement: None,
+            query_param_name: None,
+            proxy: None,
+            env_var: None,
+            endpoint_rules: vec![],
+            endpoint_policy: None,
+            tls_ca: None,
+            tls_client_cert: None,
+            tls_client_key: None,
+            aws_auth: None,
+            spiffe: Some(nono_proxy::config::SpiffeAuthConfig::Jwt {
+                workload_api_socket: "/run/spire/agent/api.sock".to_string(),
+                audience: vec!["test-audience".to_string()],
+                inject_header: "Authorization".to_string(),
+                credential_format: None,
+                svid_hint: None,
+            }),
+        };
+        assert!(validate_custom_credential("testapi", &cred).is_ok());
+    }
+
+    #[test]
+    fn test_validate_custom_credential_spiffe_with_credential_key_rejected() {
+        let mut cred = header_cred_builder();
+        cred.spiffe = Some(nono_proxy::config::SpiffeAuthConfig::Jwt {
+            workload_api_socket: "/run/spire/agent/api.sock".to_string(),
+            audience: vec!["test-audience".to_string()],
+            inject_header: "Authorization".to_string(),
+            credential_format: None,
+            svid_hint: None,
+        });
+        let result = validate_custom_credential("test", &cred);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("spiffe is mutually exclusive")
+        );
+    }
+
     // ============================================================================
     // Injection Mode Validation Tests
     // ============================================================================
@@ -5226,6 +5346,7 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             aws_auth: None,
+            spiffe: None,
         };
         assert!(validate_custom_credential("telegram", &cred).is_ok());
     }
@@ -5250,6 +5371,7 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             aws_auth: None,
+            spiffe: None,
         };
         let result = validate_custom_credential("telegram", &cred);
         let err = result.expect_err("missing path_pattern should be rejected");
@@ -5276,6 +5398,7 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             aws_auth: None,
+            spiffe: None,
         };
         let result = validate_custom_credential("telegram", &cred);
         let err = result.expect_err("pattern without {} should be rejected");
@@ -5302,6 +5425,7 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             aws_auth: None,
+            spiffe: None,
         };
         assert!(validate_custom_credential("telegram", &cred).is_ok());
     }
@@ -5326,6 +5450,7 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             aws_auth: None,
+            spiffe: None,
         };
         let result = validate_custom_credential("telegram", &cred);
         let err = result.expect_err("replacement without {} should be rejected");
@@ -5352,6 +5477,7 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             aws_auth: None,
+            spiffe: None,
         };
         assert!(validate_custom_credential("google_maps", &cred).is_ok());
     }
@@ -5376,6 +5502,7 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             aws_auth: None,
+            spiffe: None,
         };
         let result = validate_custom_credential("google_maps", &cred);
         let err = result.expect_err("missing query_param_name should be rejected");
@@ -5402,6 +5529,7 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             aws_auth: None,
+            spiffe: None,
         };
         let result = validate_custom_credential("google_maps", &cred);
         let err = result.expect_err("empty query_param_name should be rejected");
@@ -5428,6 +5556,7 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             aws_auth: None,
+            spiffe: None,
         };
         // BasicAuth mode doesn't require additional fields
         // Credential value is expected to be "username:password" format
@@ -5616,6 +5745,8 @@ mod tests {
                 client_id: "my-client".to_string(),
                 client_secret: "env://CLIENT_SECRET".to_string(),
                 scope: "read write".to_string(),
+                client_assertion: None,
+                extra_params: Default::default(),
             }),
             inject_mode: InjectMode::Header,
             inject_header: "Authorization".to_string(),
@@ -5631,6 +5762,7 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             aws_auth: None,
+            spiffe: None,
         }
     }
 
@@ -5667,6 +5799,8 @@ mod tests {
             client_id: "my-client".to_string(),
             client_secret: "env://SECRET".to_string(),
             scope: String::new(),
+            client_assertion: None,
+            extra_params: Default::default(),
         });
         let result = validate_custom_credential("test", &cred);
         let err = result.expect_err("HTTP to remote token_url should be rejected");
@@ -5681,6 +5815,8 @@ mod tests {
             client_id: "my-client".to_string(),
             client_secret: "env://SECRET".to_string(),
             scope: String::new(),
+            client_assertion: None,
+            extra_params: Default::default(),
         });
         assert!(validate_custom_credential("test", &cred).is_ok());
     }
@@ -5693,6 +5829,8 @@ mod tests {
             client_id: "".to_string(),
             client_secret: "env://SECRET".to_string(),
             scope: String::new(),
+            client_assertion: None,
+            extra_params: Default::default(),
         });
         let result = validate_custom_credential("test", &cred);
         let err = result.expect_err("empty client_id should be rejected");
@@ -5708,6 +5846,8 @@ mod tests {
             client_id: "my-client".to_string(),
             client_secret: "".to_string(),
             scope: String::new(),
+            client_assertion: None,
+            extra_params: Default::default(),
         });
         let result = validate_custom_credential("test", &cred);
         let err = result.expect_err("empty client_secret should be rejected");
@@ -5723,6 +5863,8 @@ mod tests {
             client_id: "my-client".to_string(),
             client_secret: "env://SECRET".to_string(),
             scope: String::new(),
+            client_assertion: None,
+            extra_params: Default::default(),
         });
         assert!(validate_custom_credential("test", &cred).is_ok());
     }
@@ -6217,6 +6359,7 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 aws_auth: None,
+                spiffe: None,
             },
         );
 
@@ -6241,6 +6384,7 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 aws_auth: None,
+                spiffe: None,
             },
         );
 
@@ -6383,6 +6527,7 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 aws_auth: None,
+                spiffe: None,
             },
         );
 
@@ -6407,6 +6552,7 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 aws_auth: None,
+                spiffe: None,
             },
         );
 
@@ -8034,6 +8180,7 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             aws_auth: None,
+            spiffe: None,
         };
         assert!(
             validate_custom_credential("example", &cred).is_ok(),
@@ -8061,6 +8208,7 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             aws_auth: None,
+            spiffe: None,
         };
         let result = validate_custom_credential("example", &cred);
         let err = result.expect_err("file:// URI without env_var should be rejected");
@@ -8091,6 +8239,7 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             aws_auth: None,
+            spiffe: None,
         };
         let result = validate_custom_credential("example", &cred);
         let err = result.expect_err("file:// URI with relative path should be rejected");
@@ -8121,6 +8270,7 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             aws_auth: None,
+            spiffe: None,
         };
         let result = validate_custom_credential("example", &cred);
         assert!(
@@ -8183,6 +8333,7 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             aws_auth: None,
+            spiffe: None,
         };
         assert!(validate_custom_credential("example", &cred).is_ok());
     }
@@ -8591,6 +8742,7 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             aws_auth: None,
+            spiffe: None,
         };
         let result = validate_custom_credential("example", &cred);
         assert!(result.is_err(), "env://LD_PRELOAD should be rejected");
@@ -9393,6 +9545,7 @@ mod tests {
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
+            spiffe: None,
         }
     }
 
@@ -9456,6 +9609,8 @@ mod tests {
                 client_id: "cid".to_string(),
                 client_secret: "env://SECRET".to_string(),
                 scope: String::new(),
+                client_assertion: None,
+                extra_params: Default::default(),
             }),
             ..aws_auth_cred_builder()
         };
@@ -9475,6 +9630,7 @@ mod tests {
             credential_key: None,
             auth: None,
             aws_auth: None,
+            spiffe: None,
             ..aws_auth_cred_builder()
         };
         let result = validate_custom_credential("bedrock", &cred);

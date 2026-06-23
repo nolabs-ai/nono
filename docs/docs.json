@@ -72,7 +72,8 @@
         "group": "Secrets",
         "pages": [
           "cli/features/credential-injection",
-          "cli/features/sandboxed-oauth-logins"
+          "cli/features/sandboxed-oauth-logins",
+          "cli/features/spiffe"
         ]
       },
       {

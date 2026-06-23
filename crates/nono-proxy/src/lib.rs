@@ -19,6 +19,7 @@
 
 pub mod approval;
 pub mod audit;
+pub mod auth;
 pub mod aws;
 pub mod capture;
 pub mod config;
@@ -35,6 +36,7 @@ pub mod pool;
 pub mod reverse;
 pub mod route;
 pub mod server;
+pub mod spiffe;
 pub mod tls_intercept;
 pub mod token;
 

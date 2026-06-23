@@ -6,7 +6,7 @@
 #   make check        Run clippy and format check
 #   make release      Build release binaries
 
-.PHONY: all build build-lib build-cli build-ffi build-arm64 test test-lib test-cli test-ffi check clippy fmt clean install audit help
+.PHONY: all build build-lib build-cli build-ffi build-arm64 test test-lib test-cli test-ffi test-spiffe check clippy fmt clean install audit help
 
 # Default target
 all: build
@@ -53,6 +53,9 @@ test-ffi:
 
 test-doc:
 	cargo test --doc
+
+test-spiffe:
+	bash scripts/spire-test.sh
 
 # Check targets (lint + format)
 check: clippy fmt-check
@@ -139,6 +142,7 @@ help:
 	@echo "  make test-cli       Run CLI tests only"
 	@echo "  make test-ffi       Run C FFI tests only"
 	@echo "  make test-doc       Run doc tests only"
+	@echo "  make test-spiffe    Run SPIFFE/SPIRE integration tests (downloads SPIRE if needed)"
 	@echo ""
 	@echo "Check:"
 	@echo "  make check          Run clippy and format check"

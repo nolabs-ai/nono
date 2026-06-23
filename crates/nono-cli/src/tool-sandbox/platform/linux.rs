@@ -935,9 +935,15 @@ fn run_child_launcher() -> Result<()> {
     // (POSIX convention: outer pointer is const, inner is mutable) while
     // CString::as_ptr() yields *const c_char. The kernel does not mutate
     // the strings; cast at the call site to satisfy the type checker.
+    //
+    // Use syscall() directly rather than libc::execveat() to avoid a link
+    // dependency on the glibc execveat wrapper, which was only added in
+    // glibc 2.34. The syscall number (SYS_execveat) is a compile-time
+    // constant and syscall() itself is available in all glibc versions.
     unsafe {
-        libc::execveat(
-            binary_fd.as_raw_fd(),
+        libc::syscall(
+            libc::SYS_execveat,
+            binary_fd.as_raw_fd() as libc::c_long,
             empty_path.as_ptr(),
             argv_ptrs.as_ptr().cast::<*mut libc::c_char>(),
             envp_ptrs.as_ptr().cast::<*mut libc::c_char>(),

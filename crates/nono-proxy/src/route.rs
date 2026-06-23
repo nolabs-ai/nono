@@ -465,6 +465,9 @@ fn host_port_matches(pattern: &str, target: &str) -> bool {
     if pattern == target {
         return true;
     }
+    if !pattern.starts_with("*.") {
+        return false;
+    }
 
     let Some((pattern_host, pattern_port)) = pattern.rsplit_once(':') else {
         return false;

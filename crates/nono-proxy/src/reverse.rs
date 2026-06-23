@@ -93,6 +93,8 @@ pub struct ReverseProxyCtx<'a> {
     pub credential_store: &'a CredentialStore,
     /// Session token for authentication
     pub session_token: &'a Zeroizing<String>,
+    /// When `false`, skip session-token enforcement entirely (open proxy).
+    pub require_auth: bool,
     /// Host filter for upstream validation
     pub filter: &'a ProxyFilter,
     /// Shared TLS connector
@@ -254,21 +256,42 @@ pub async fn handle_reverse_proxy(
 
     // Authenticate the request. Every reverse proxy request must prove
     // possession of the session token, regardless of whether a credential
-    // is configured — this is the localhost auth boundary.
-    if let Some(cred) = cred {
-        if let Err(e) = validate_phantom_token_for_mode(
-            &cred.proxy_inject_mode,
-            remaining_header,
-            &upstream_path,
-            &cred.proxy_header_name,
-            cred.proxy_path_pattern.as_deref(),
-            cred.proxy_query_param_name.as_deref(),
-            ctx.session_token,
-        ) {
+    // is configured — this is the localhost auth boundary. Skipped only when
+    // `require_auth` is disabled (standalone `nono proxy --no-auth`).
+    if ctx.require_auth {
+        if let Some(cred) = cred {
+            if let Err(e) = validate_phantom_token_for_mode(
+                &cred.proxy_inject_mode,
+                remaining_header,
+                &upstream_path,
+                &cred.proxy_header_name,
+                cred.proxy_path_pattern.as_deref(),
+                cred.proxy_query_param_name.as_deref(),
+                ctx.session_token,
+            ) {
+                let deny_ctx = audit::EventContext {
+                    auth_outcome: Some(nono::undo::NetworkAuditAuthOutcome::Failed),
+                    denial_category: Some(
+                        nono::undo::NetworkAuditDenialCategory::AuthenticationFailed,
+                    ),
+                    ..managed_ctx.clone().unwrap_or_else(|| route_ctx.clone())
+                };
+                audit::log_denied(
+                    ctx.audit_log,
+                    audit::ProxyMode::Reverse,
+                    &deny_ctx,
+                    &service,
+                    0,
+                    &e.to_string(),
+                );
+                send_error(stream, 401, "Unauthorized").await?;
+                return Ok(());
+            }
+        } else if let Err(e) = token::validate_proxy_auth(remaining_header, ctx.session_token) {
             let deny_ctx = audit::EventContext {
                 auth_outcome: Some(nono::undo::NetworkAuditAuthOutcome::Failed),
                 denial_category: Some(nono::undo::NetworkAuditDenialCategory::AuthenticationFailed),
-                ..managed_ctx.clone().unwrap_or_else(|| route_ctx.clone())
+                ..proxy_auth_event_ctx(&service)
             };
             audit::log_denied(
                 ctx.audit_log,
@@ -278,7 +301,7 @@ pub async fn handle_reverse_proxy(
                 0,
                 &e.to_string(),
             );
-            send_error(stream, 401, "Unauthorized").await?;
+            send_error(stream, 407, "Proxy Authentication Required").await?;
             return Ok(());
         }
     } else if let Some(cmd) = cmd_route {
@@ -977,7 +1000,10 @@ async fn handle_oauth2_credential(
     // Validate session token from Authorization header (phantom token pattern).
     // OAuth2 routes still require the agent to authenticate with the session
     // token — this prevents unauthorized access to the token-exchanged credential.
-    if let Err(e) = validate_phantom_token(remaining_header, "Authorization", ctx.session_token) {
+    // Skipped only when `require_auth` is disabled (`nono proxy --no-auth`).
+    if ctx.require_auth
+        && let Err(e) = validate_phantom_token(remaining_header, "Authorization", ctx.session_token)
+    {
         let deny_ctx = audit::EventContext {
             route_id: Some(service),
             auth_mechanism: Some(nono::undo::NetworkAuditAuthMechanism::PhantomHeader),

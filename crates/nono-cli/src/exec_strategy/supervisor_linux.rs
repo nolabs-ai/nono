@@ -825,13 +825,6 @@ pub(super) fn handle_network_notification(
 
     let notif = recv_notif(notify_fd)?;
 
-    // Rate limit to prevent flooding
-    if !rate_limiter.try_acquire() {
-        debug!("Rate limited network seccomp notification, denying");
-        let _ = deny_notif(notify_fd, notif.id);
-        return Ok(());
-    }
-
     // Read sockaddr from child's memory. The location depends on the syscall:
     //   connect(fd, sockaddr*, addrlen):   args[1] = sockaddr*, args[2] = addrlen
     //   bind(fd, sockaddr*, addrlen):       args[1] = sockaddr*, args[2] = addrlen
@@ -965,6 +958,34 @@ pub(super) fn handle_network_notification(
             return Ok(());
         }
     };
+
+    // In AfUnixOnly mode the BPF filter traps by syscall number and cannot
+    // distinguish address families, so TCP/UDP calls arrive here too. They
+    // carry no policy decision — pass them through without consuming a
+    // rate-limiter token, which would otherwise starve legitimate network
+    // traffic once the burst is exhausted.
+    if matches!(
+        config.linux_network_notify_mode,
+        LinuxNetworkNotifyMode::AfUnixOnly
+    ) && sockaddrs.iter().all(|s| s.family != libc::AF_UNIX as u16)
+    {
+        if let Err(e) = continue_notif(notify_fd, notif.id) {
+            debug!(
+                "continue_notif failed for non-AF_UNIX pass-through (AfUnixOnly): {}",
+                e
+            );
+            return deny_notif(notify_fd, notif.id);
+        }
+        return Ok(());
+    }
+
+    // Rate limit: guard AF_UNIX mediation decisions and proxy-mode decisions
+    // against notification flooding from a compromised child.
+    if !rate_limiter.try_acquire() {
+        debug!("Rate limited network seccomp notification, denying");
+        let _ = deny_notif(notify_fd, notif.id);
+        return Ok(());
+    }
 
     // TOCTOU check
     if !notif_id_valid(notify_fd, notif.id)? {

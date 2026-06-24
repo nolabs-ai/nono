@@ -1853,6 +1853,8 @@ fn build_seccomp_proxy_filter(_has_bind_ports: bool) -> Vec<SockFilterInsn> {
     let bind_action = SECCOMP_RET_USER_NOTIF;
 
     // sendto(), sendmsg(), and sendmmsg() route unconditionally to USER_NOTIF.
+    // The IPC handshake completes before this filter is installed, so no
+    // fd-based exemption is needed.
     // The supervisor does the full-width NULL destination checks and inspects
     // each sendmmsg vector entry.
     //
@@ -2046,25 +2048,29 @@ fn build_seccomp_proxy_filter(_has_bind_ports: bool) -> Vec<SockFilterInsn> {
     ]
 }
 
-/// Build a BPF filter for opt-in pathname AF_UNIX mediation.
+/// Build a BPF filter for opt-in pathname AF_UNIX mediation (Linux-only).
 ///
-/// The filter routes `connect()`, `bind()`, `sendto()`, `sendmsg()`, and `sendmmsg()`
-/// to the supervisor so it can inspect `sockaddr_un` paths. Everything
-/// else is allowed by this filter: TCP policy remains Landlock's job on
-/// V4+ kernels.
+/// Routes `connect()`, `bind()`, `sendto()`, `sendmsg()`, and `sendmmsg()`
+/// to `USER_NOTIF` so the supervisor can inspect `sockaddr_un` paths.
+/// Everything else is allowed: TCP policy is Landlock's responsibility on
+/// V4+ kernels; this filter only handles AF_UNIX.
 ///
-/// The send syscalls route unconditionally. BPF cannot dereference
-/// `msghdr`/`mmsghdr`, and checking only half of a 64-bit `sendto` pointer
-/// is not a reliable NULL test.
+/// The IPC handshake (child→parent SCM_RIGHTS transfer of the notify fd)
+/// must complete *before* this filter is installed. That ordering removes
+/// the need for any fd-based exemption, so the filter is a pure allowlist
+/// with no internal plumbing holes.
+///
+/// BPF cannot dereference `msghdr`/`mmsghdr`; the supervisor performs those
+/// checks instead.
 ///
 /// Instruction layout:
 /// ```text
 ///  0: ld  [nr]
-///  1: jeq SYS_CONNECT  jt=+5 (-> 7: notify)
-///  2: jeq SYS_BIND     jt=+4 (-> 7: notify)
-///  3: jeq SYS_SENDTO   jt=+3 (-> 7: notify)
-///  4: jeq SYS_SENDMSG  jt=+2 (-> 7: notify)
-///  5: jeq SYS_SENDMMSG jt=+1 (-> 7: notify)
+///  1: jeq SYS_CONNECT  jt=+5 (->  7: notify)
+///  2: jeq SYS_BIND     jt=+4 (->  7: notify)
+///  3: jeq SYS_SENDTO   jt=+3 (->  7: notify)
+///  4: jeq SYS_SENDMSG  jt=+2 (->  7: notify)
+///  5: jeq SYS_SENDMMSG jt=+1 (->  7: notify)
 ///  6: ret ALLOW
 ///  7: ret USER_NOTIF
 /// ```
@@ -2129,13 +2135,19 @@ fn build_seccomp_af_unix_filter() -> Vec<SockFilterInsn> {
     ]
 }
 
-/// Install a seccomp-notify BPF filter for proxy-only network mode.
+/// Install a seccomp-notify BPF filter for proxy-only network mode (Linux-only).
 ///
-/// Returns the notify fd that the supervisor must poll for connect/bind
-/// notifications. Uses `SECCOMP_FILTER_FLAG_NEW_LISTENER`.
+/// Used on kernels without Landlock V4 TCP support as a fallback: traps
+/// `connect()`, `bind()`, `sendto()`, `sendmmsg()`, and `sendmsg()` for
+/// supervisor mediation. Returns the notify fd the supervisor must poll.
+/// Uses `SECCOMP_FILTER_FLAG_NEW_LISTENER`.
 ///
-/// Must be called AFTER `PR_SET_NO_NEW_PRIVS` is already set (either by
-/// a prior seccomp install or by Landlock's `restrict_self()`).
+/// The IPC handshake (SCM_RIGHTS transfer of the notify fd to the parent)
+/// must complete before this filter is installed so no fd-based exemption
+/// is needed.
+///
+/// Must be called after `PR_SET_NO_NEW_PRIVS` is set (either by a prior
+/// seccomp install or by Landlock's `restrict_self()`).
 ///
 /// # Errors
 ///
@@ -2144,7 +2156,19 @@ pub fn install_seccomp_proxy_filter(has_bind_ports: bool) -> Result<std::os::fd:
     install_seccomp_notify_filter(&build_seccomp_proxy_filter(has_bind_ports), "proxy filter")
 }
 
-/// Install a seccomp-notify BPF filter for pathname AF_UNIX mediation.
+/// Install a seccomp-notify BPF filter for pathname AF_UNIX mediation (Linux-only).
+///
+/// Enables `linux.af_unix_mediation: pathname` enforcement: traps AF_UNIX
+/// `connect()`, `bind()`, `sendto()`, `sendmmsg()`, and `sendmsg()` and
+/// routes them to the supervisor, which checks `sockaddr_un.sun_path`
+/// against the `unix_sockets` allowlist. Connections to unlisted paths
+/// are denied with `EACCES`. Returns the notify fd the supervisor must poll.
+///
+/// The IPC handshake (SCM_RIGHTS transfer of the notify fd to the parent)
+/// must complete before this filter is installed so no fd-based exemption
+/// is needed.
+///
+/// Must be called after `PR_SET_NO_NEW_PRIVS` is set.
 ///
 /// # Errors
 ///
@@ -3543,39 +3567,42 @@ mod tests {
     #[test]
     fn test_build_seccomp_proxy_filter_with_bind() {
         let filter = build_seccomp_proxy_filter(true);
-        // 23 instructions
+        // 23 instructions: no check_fd block
         assert_eq!(filter.len(), 23);
 
-        // Instruction 0 should be ld [nr]
         assert_eq!(filter[0].code, BPF_LD | BPF_W | BPF_ABS);
         assert_eq!(filter[0].k, SECCOMP_DATA_NR_OFFSET);
 
-        // Instruction 19 should be USER_NOTIF (connect)
+        // insn 6: jeq SENDMSG -> 21 (jt = 21-6-1 = 14)
+        assert_eq!(filter[6].k, SYS_SENDMSG as u32);
+        assert_eq!(filter[6].jt, 14);
+
+        // insn 19: USER_NOTIF (connect)
         assert_eq!(filter[19].code, BPF_RET | BPF_K);
         assert_eq!(filter[19].k, SECCOMP_RET_USER_NOTIF);
 
-        // Instruction 20 should be USER_NOTIF (bind; supervisor decides).
+        // insn 20: USER_NOTIF (bind)
         assert_eq!(filter[20].code, BPF_RET | BPF_K);
         assert_eq!(filter[20].k, SECCOMP_RET_USER_NOTIF);
 
-        // Instruction 21 should be USER_NOTIF (sendto/sendmsg/sendmmsg)
+        // insn 21: USER_NOTIF (sendto/sendmsg/sendmmsg)
         assert_eq!(filter[21].code, BPF_RET | BPF_K);
         assert_eq!(filter[21].k, SECCOMP_RET_USER_NOTIF);
+
+        // insn 22: ALLOW (good socket/socketpair family)
+        assert_eq!(filter[22].code, BPF_RET | BPF_K);
+        assert_eq!(filter[22].k, SECCOMP_RET_ALLOW);
     }
 
     /// Regression test for the Landlock V2 + `has_bind_ports=false`
     /// scenario (issue #685): even with no TCP bind ports configured,
     /// bind() must route to USER_NOTIF so the supervisor can allow
-    /// pathname AF_UNIX bind. Previously the filter short-circuited to
-    /// ERRNO in this branch, unconditionally failing AF_UNIX bind.
+    /// pathname AF_UNIX bind.
     #[test]
     fn test_build_seccomp_proxy_filter_without_bind() {
         let filter = build_seccomp_proxy_filter(false);
         assert_eq!(filter.len(), 23);
 
-        // Instruction 20 (bind) must ALSO route to USER_NOTIF -- the
-        // supervisor is the sole gate. This is the fix: previously this
-        // emitted ERRNO, which skipped the supervisor entirely.
         assert_eq!(filter[20].code, BPF_RET | BPF_K);
         assert_eq!(
             filter[20].k, SECCOMP_RET_USER_NOTIF,
@@ -3585,16 +3612,26 @@ mod tests {
     }
 
     #[test]
-    fn test_build_seccomp_af_unix_filter_notifies_connect_bind_sendto_sendmsg_sendmmsg() {
+    fn test_build_seccomp_af_unix_filter_notifies_all_syscalls() {
         let filter = build_seccomp_af_unix_filter();
+        // 8 instructions: 0 ld-nr, 1-5 jeq dispatch, 6 ALLOW, 7 USER_NOTIF
+        // No check_fd block — the IPC handshake completes before the filter
+        // is installed, so no fd-based exemption is needed.
         assert_eq!(filter.len(), 8);
         assert_eq!(filter[0].code, BPF_LD | BPF_W | BPF_ABS);
         assert_eq!(filter[0].k, SECCOMP_DATA_NR_OFFSET);
+
         assert_eq!(filter[1].k, SYS_CONNECT as u32);
+        assert_eq!(filter[1].jt, 5); // -> insn 7 (USER_NOTIF)
         assert_eq!(filter[2].k, SYS_BIND as u32);
+        assert_eq!(filter[2].jt, 4); // -> insn 7
         assert_eq!(filter[3].k, SYS_SENDTO as u32);
+        assert_eq!(filter[3].jt, 3); // -> insn 7
         assert_eq!(filter[4].k, SYS_SENDMSG as u32);
+        assert_eq!(filter[4].jt, 2); // -> insn 7 (no special exemption)
         assert_eq!(filter[5].k, SYS_SENDMMSG as u32);
+        assert_eq!(filter[5].jt, 1); // -> insn 7
+
         assert_eq!(filter[6].k, SECCOMP_RET_ALLOW);
         assert_eq!(filter[7].k, SECCOMP_RET_USER_NOTIF);
     }

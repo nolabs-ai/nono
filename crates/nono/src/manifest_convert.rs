@@ -10,8 +10,10 @@ use crate::capability::{
     SignalMode as InternalSignalMode,
 };
 use crate::manifest::{
-    AccessMode, CapabilityManifest, FsEntryType, IpcMode, NetworkMode, ProcessInfoMode, SignalMode,
+    AccessMode, CapabilityManifest, FsEntryType, IpcMode, NetworkMode, ProcessInfoMode, Resources,
+    SignalMode,
 };
+use crate::resource::ResourceLimits;
 use crate::{NonoError, Result};
 
 impl TryFrom<&CapabilityManifest> for CapabilitySet {
@@ -88,7 +90,20 @@ impl TryFrom<&CapabilityManifest> for CapabilitySet {
             }
         }
 
+        // Resources
+        if let Some(ref res) = manifest.resources {
+            caps = caps.with_resource_limits(convert_resources(res));
+        }
+
         Ok(caps)
+    }
+}
+
+fn convert_resources(res: &Resources) -> ResourceLimits {
+    ResourceLimits {
+        memory_bytes: res.memory_bytes.map(|n| n.get()),
+        cpu_max_percent: res.cpu_max_percent.map(|n| n.get()),
+        max_procs: res.max_procs.map(|n| n.get()),
     }
 }
 
@@ -120,5 +135,34 @@ fn convert_ipc_mode(mode: IpcMode) -> InternalIpcMode {
     match mode {
         IpcMode::SharedMemoryOnly => InternalIpcMode::SharedMemoryOnly,
         IpcMode::Full => InternalIpcMode::Full,
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn manifest_resources_map_into_capability_set() {
+        let json = r#"{
+            "version": "0.1.0",
+            "process": { "exec_strategy": "supervised" },
+            "resources": { "memory_bytes": 1048576, "cpu_max_percent": 150, "max_procs": 32 }
+        }"#;
+        let manifest = CapabilityManifest::from_json(json).unwrap();
+        let caps = CapabilitySet::try_from(&manifest).unwrap();
+        let limits = caps.resource_limits().expect("limits present");
+        assert_eq!(limits.memory_bytes, Some(1048576));
+        assert_eq!(limits.cpu_max_percent, Some(150));
+        assert_eq!(limits.max_procs, Some(32));
+    }
+
+    #[test]
+    fn manifest_without_resources_has_no_limits() {
+        let json = r#"{ "version": "0.1.0" }"#;
+        let manifest = CapabilityManifest::from_json(json).unwrap();
+        let caps = CapabilitySet::try_from(&manifest).unwrap();
+        assert!(caps.resource_limits().is_none());
     }
 }

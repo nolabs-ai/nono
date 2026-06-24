@@ -62,6 +62,17 @@ pub fn print_capabilities(caps: &CapabilitySet, verbose: u8, silent: bool) {
     eprintln!("  {}", theme::fg("Capabilities:", t.subtext).bold());
     rule();
 
+    // Resource limits (issue #1102: displayed only; enforcement lands later).
+    if let Some(limits) = caps.resource_limits()
+        && !limits.is_empty()
+    {
+        eprintln!(
+            "  {} {}",
+            theme::fg("resources", t.yellow).bold(),
+            theme::fg(&limits.summary(), t.subtext),
+        );
+    }
+
     // Filesystem capabilities
     let fs_caps = caps.fs_capabilities();
     if !fs_caps.is_empty() {

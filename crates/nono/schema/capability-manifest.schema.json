@@ -37,6 +37,10 @@
     "rollback": {
       "$ref": "#/$defs/Rollback",
       "description": "Rollback snapshot configuration controlling which files are excluded from undo snapshots."
+    },
+    "resources": {
+      "$ref": "#/$defs/Resources",
+      "description": "Per-process and per-tree resource ceilings enforced by the supervisor (memory, CPU bandwidth, process count). Requires exec_strategy: \"supervised\"."
     }
   },
   "$defs": {
@@ -350,6 +354,28 @@
           "type": "array",
           "items": { "type": "string" },
           "description": "Glob patterns to exclude from rollback snapshots."
+        }
+      }
+    },
+    "Resources": {
+      "type": "object",
+      "description": "Resource ceilings for the sandboxed process tree. Values are plain integers (bytes, counts) so the manifest is a fully-resolved machine contract; human-friendly sizes (e.g. '512M') are parsed only at the CLI. additionalProperties is false: this is a security object, so an unknown or misspelled key is a hard error rather than a silently-dropped limit.",
+      "additionalProperties": false,
+      "properties": {
+        "memory_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Maximum resident memory for the process tree, in bytes. Enforced via cgroup memory.max together with memory.swap.max=0."
+        },
+        "cpu_max_percent": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Maximum CPU bandwidth for the process tree, as a percentage of a single CPU core (100 = one full core, 150 = one and a half cores, 50 = half a core). A rate cap, not a cumulative CPU-seconds budget. Enforced via cgroup cpu.max with a fixed 100ms period."
+        },
+        "max_procs": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Maximum number of processes/threads allowed in the tree. Enforced via cgroup pids.max."
         }
       }
     }

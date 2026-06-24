@@ -4,6 +4,7 @@
 //! a sandboxed process can access.
 
 use crate::error::{NonoError, Result};
+use crate::resource::ResourceLimits;
 use serde::{Deserialize, Serialize};
 use std::path::{Component, Path, PathBuf};
 
@@ -914,6 +915,11 @@ pub struct CapabilitySet {
     /// When set, the generated Seatbelt profile emits `(debug deny)` so
     /// sandboxd records denial events in the unified log.
     seatbelt_debug_deny: bool,
+    /// Resource ceilings (memory, CPU bandwidth, process count) for the
+    /// sandboxed tree. Issue #1102: plumbed through here so they ride the
+    /// serialization layer like other policy; enforced by the supervisor via
+    /// cgroup v2 on Linux.
+    resource_limits: Option<ResourceLimits>,
 }
 
 impl CapabilitySet {
@@ -1015,6 +1021,23 @@ impl CapabilitySet {
     pub fn set_network_mode(mut self, mode: NetworkMode) -> Self {
         self.network_mode = mode;
         self
+    }
+
+    /// Attach resource ceilings (memory, CPU bandwidth, process count) to the
+    /// set (builder pattern).
+    ///
+    /// Issue #1102: the limits are carried through serialization, surfaced in
+    /// `--dry-run`, and enforced by the supervisor via cgroup v2 on Linux.
+    #[must_use]
+    pub fn with_resource_limits(mut self, limits: ResourceLimits) -> Self {
+        self.resource_limits = Some(limits);
+        self
+    }
+
+    /// Resource ceilings attached to this set, if any.
+    #[must_use]
+    pub fn resource_limits(&self) -> Option<&ResourceLimits> {
+        self.resource_limits.as_ref()
     }
 
     /// Restrict network to localhost proxy port only (builder pattern)

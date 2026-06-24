@@ -1357,6 +1357,7 @@ pub struct SandboxArgs {
             "allow_bind", "allow_port", "allow_connect_port", "external_proxy", "proxy_port",
             "proxy_credential", "allow_endpoint", "env_credential", "env_credential_map",
             "allow_command", "block_command", "allow_launch_services", "allow_gpu",
+            "memory", "cpu_max", "max_procs",
         ],
         help_heading = "OPTIONS"
     )]
@@ -1365,6 +1366,23 @@ pub struct SandboxArgs {
     /// Enable verbose output
     #[arg(long, short = 'v', action = clap::ArgAction::Count, help_heading = "OPTIONS")]
     pub verbose: u8,
+
+    /// Maximum resident memory for the process tree (e.g. 512M, 1Gi).
+    /// Enforced on Linux via cgroup v2; requires a supervised run.
+    #[arg(long, value_name = "SIZE", help_heading = "RESOURCES")]
+    pub memory: Option<String>,
+
+    /// Maximum CPU bandwidth for the process tree, as a share of one core
+    /// (e.g. 50% for half a core, 1.5 for one and a half cores). A rate cap, not
+    /// a total CPU-seconds budget. Enforced on Linux via cgroup v2; requires a
+    /// supervised run.
+    #[arg(long, value_name = "CPU", help_heading = "RESOURCES")]
+    pub cpu_max: Option<String>,
+
+    /// Maximum number of processes/threads in the process tree.
+    /// Enforced on Linux via cgroup v2; requires a supervised run.
+    #[arg(long, value_name = "N", help_heading = "RESOURCES")]
+    pub max_procs: Option<u64>,
 
     /// Show what would be sandboxed without executing
     #[arg(long, help_heading = "OPTIONS")]
@@ -1583,6 +1601,7 @@ pub struct WrapSandboxArgs {
             "block_net", "allow_bind", "allow_port", "allow_connect_port",
             "env_credential", "env_credential_map",
             "allow_command", "block_command", "allow_launch_services", "allow_gpu",
+            "memory", "cpu_max", "max_procs",
         ],
         help_heading = "OPTIONS"
     )]
@@ -1591,6 +1610,23 @@ pub struct WrapSandboxArgs {
     /// Enable verbose output
     #[arg(long, short = 'v', action = clap::ArgAction::Count, help_heading = "OPTIONS")]
     pub verbose: u8,
+
+    /// Maximum resident memory for the process tree (e.g. 512M, 1Gi).
+    /// Enforced on Linux via cgroup v2; requires a supervised run.
+    #[arg(long, value_name = "SIZE", help_heading = "RESOURCES")]
+    pub memory: Option<String>,
+
+    /// Maximum CPU bandwidth for the process tree, as a share of one core
+    /// (e.g. 50% for half a core, 1.5 for one and a half cores). A rate cap, not
+    /// a total CPU-seconds budget. Enforced on Linux via cgroup v2; requires a
+    /// supervised run.
+    #[arg(long, value_name = "CPU", help_heading = "RESOURCES")]
+    pub cpu_max: Option<String>,
+
+    /// Maximum number of processes/threads in the process tree.
+    /// Enforced on Linux via cgroup v2; requires a supervised run.
+    #[arg(long, value_name = "N", help_heading = "RESOURCES")]
+    pub max_procs: Option<u64>,
 
     /// Show what would be sandboxed without executing
     #[arg(long, help_heading = "OPTIONS")]
@@ -1640,6 +1676,9 @@ impl From<WrapSandboxArgs> for SandboxArgs {
             allow_gpu: args.allow_gpu,
             config: args.config,
             verbose: args.verbose,
+            memory: args.memory,
+            cpu_max: args.cpu_max,
+            max_procs: args.max_procs,
             dry_run: args.dry_run,
         }
     }
@@ -2576,6 +2615,68 @@ mod tests {
             }
             _ => panic!("Expected Run command"),
         }
+    }
+
+    #[test]
+    fn test_resource_flags_parse() {
+        let cli = Cli::parse_from([
+            "nono",
+            "run",
+            "--memory",
+            "512M",
+            "--cpu-max",
+            "50%",
+            "--max-procs",
+            "64",
+            "--",
+            "true",
+        ]);
+        match cli.command {
+            Commands::Run(args) => {
+                assert_eq!(args.sandbox.memory.as_deref(), Some("512M"));
+                assert_eq!(args.sandbox.cpu_max.as_deref(), Some("50%"));
+                assert_eq!(args.sandbox.max_procs, Some(64));
+            }
+            _ => panic!("Expected Run command"),
+        }
+    }
+
+    #[test]
+    fn test_resource_flags_conflict_with_config() {
+        // --config (manifest) is mutually exclusive with the resource flags.
+        let res = Cli::try_parse_from([
+            "nono", "run", "--config", "m.json", "--memory", "512M", "--", "true",
+        ]);
+        assert!(res.is_err(), "--config and --memory must conflict");
+
+        // --cpu-max conflicts with --config too.
+        let res = Cli::try_parse_from([
+            "nono",
+            "run",
+            "--config",
+            "m.json",
+            "--cpu-max",
+            "50%",
+            "--",
+            "true",
+        ]);
+        assert!(res.is_err(), "--config and --cpu-max must conflict");
+    }
+
+    #[test]
+    fn test_wrap_sandbox_args_from_maps_resource_fields() {
+        // Guards against the silent fail-open where a new field is added to the
+        // structs but dropped in the hand-written `From<WrapSandboxArgs>`.
+        let wrap = WrapSandboxArgs {
+            memory: Some("256M".to_string()),
+            cpu_max: Some("1.5".to_string()),
+            max_procs: Some(16),
+            ..Default::default()
+        };
+        let sandbox: SandboxArgs = wrap.into();
+        assert_eq!(sandbox.memory.as_deref(), Some("256M"));
+        assert_eq!(sandbox.cpu_max.as_deref(), Some("1.5"));
+        assert_eq!(sandbox.max_procs, Some(16));
     }
 
     #[test]

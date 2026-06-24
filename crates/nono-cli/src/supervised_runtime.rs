@@ -258,7 +258,48 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
         },
     };
 
+    // Resource enforcement (issue #1102): Linux cgroup v2. When a limit is
+    // requested, the leaf is created pre-fork from those limits, or the run
+    // fails closed (`CgroupLeaf::create` errors) if a delegated cgroup v2
+    // subtree is unavailable — we never run a requested limit unenforced. The
+    // child self-attaches to the leaf (see `resource_procs_fd` below); dropping
+    // `cgroup_leaf` tears it down.
+    #[cfg(target_os = "linux")]
+    let cgroup_leaf = match caps.resource_limits() {
+        Some(limits) if !limits.is_empty() => {
+            Some(crate::resource_cgroup::CgroupLeaf::create(limits)?)
+        }
+        _ => None,
+    };
+
+    // No cgroup enforcement off Linux yet — fail closed rather than run a
+    // requested limit unprotected (macOS gets its own backend later).
+    #[cfg(not(target_os = "linux"))]
+    if caps
+        .resource_limits()
+        .is_some_and(|limits| !limits.is_empty())
+    {
+        return Err(nono::NonoError::SandboxInit(
+            "resource: resource limits are only enforced on Linux (cgroup v2) in this build"
+                .to_string(),
+        ));
+    }
+
+    // The child self-attaches to the resource cgroup through this fd (issue
+    // #1102): it is opened in the parent so the forked child inherits it and can
+    // cage itself before it can fork/exec, closing the post-fork race that a
+    // parent-side attach would leave open. The leaf (and thus the fd) lives
+    // until the end of this function, where dropping it tears the cgroup down.
+    #[cfg(target_os = "linux")]
+    let resource_procs_fd = cgroup_leaf.as_ref().map(|leaf| leaf.procs_raw_fd());
+    #[cfg(not(target_os = "linux"))]
+    let resource_procs_fd: Option<std::os::fd::RawFd> = None;
+
     let exit_code = {
+        // `on_fork` runs in the parent the instant the child is forked, with the
+        // child's pid; we use it to record the pid on the session. The resource
+        // cgroup attach is done by the child itself (see `resource_procs_fd`
+        // above), not here, so there is no escape window to close from the parent.
         let mut on_fork = |child_pid: u32| {
             if let Some(ref mut guard) = session_guard {
                 guard.set_child_pid(child_pid);
@@ -271,8 +312,10 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
             Some(&mut on_fork),
             pty_pair,
             Some(&short_session_id),
+            resource_procs_fd,
         )?
     };
+
     if let Some(ref mut guard) = session_guard {
         guard.set_exited(exit_code);
     }

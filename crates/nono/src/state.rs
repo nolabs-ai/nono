@@ -5,6 +5,7 @@
 use crate::capability::{
     AccessMode, CapabilitySet, FsCapability, SocketScope, UnixSocketCapability, UnixSocketMode,
 };
+use crate::resource::ResourceLimits;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -19,6 +20,11 @@ pub struct SandboxState {
     pub unix_sockets: Vec<UnixSocketCapState>,
     /// Whether network is blocked
     pub net_blocked: bool,
+    /// Resource ceilings (memory, CPU bandwidth, process count). Absent in states persisted
+    /// by older nono builds; `#[serde(default)]` preserves backward compat.
+    /// These are plain numbers, so unlike paths they need no re-validation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_limits: Option<ResourceLimits>,
 }
 
 /// Serializable representation of a filesystem capability
@@ -78,6 +84,7 @@ impl SandboxState {
                 })
                 .collect(),
             net_blocked: caps.is_network_blocked(),
+            resource_limits: caps.resource_limits().copied(),
         }
     }
 
@@ -163,6 +170,11 @@ impl SandboxState {
         }
 
         caps.set_network_blocked(self.net_blocked);
+
+        if let Some(limits) = self.resource_limits {
+            caps = caps.with_resource_limits(limits);
+        }
+
         Ok(caps)
     }
 
@@ -195,6 +207,41 @@ mod tests {
         let json = state.to_json().expect("serialize state");
         let restored = SandboxState::from_json(&json).expect("deserialize state");
         assert!(restored.net_blocked);
+    }
+
+    #[test]
+    fn test_resource_limits_roundtrip() {
+        use crate::resource::ResourceLimits;
+
+        let caps = CapabilitySet::new().with_resource_limits(ResourceLimits {
+            memory_bytes: Some(512 * 1024 * 1024),
+            cpu_max_percent: Some(150),
+            max_procs: Some(64),
+        });
+        let state = SandboxState::from_caps(&caps);
+        assert_eq!(
+            state.resource_limits.and_then(|l| l.memory_bytes),
+            Some(512 * 1024 * 1024)
+        );
+
+        let json = state.to_json().expect("serialize state");
+        let restored = SandboxState::from_json(&json).expect("deserialize state");
+        let limits = restored.resource_limits.expect("limits survive roundtrip");
+        assert_eq!(limits.memory_bytes, Some(512 * 1024 * 1024));
+        assert_eq!(limits.cpu_max_percent, Some(150));
+        assert_eq!(limits.max_procs, Some(64));
+
+        // And back into a CapabilitySet.
+        let caps2 = restored.to_caps().expect("to_caps");
+        assert_eq!(caps2.resource_limits(), caps.resource_limits());
+    }
+
+    #[test]
+    fn test_resource_limits_absent_in_legacy_state() {
+        // A state JSON written before resource limits existed must still load.
+        let json = r#"{ "fs": [], "net_blocked": false }"#;
+        let state = SandboxState::from_json(json).expect("legacy state");
+        assert!(state.resource_limits.is_none());
     }
 
     #[test]

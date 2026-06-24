@@ -465,6 +465,10 @@ pub fn execute_supervised(
     on_fork: Option<&mut dyn FnMut(u32)>,
     pty_pair: Option<crate::pty_proxy::PtyPair>,
     pty_session_id: Option<&str>,
+    // Write fd of the resource cgroup's `cgroup.procs`, opened by the caller
+    // pre-fork (issue #1102). When set, the forked child self-attaches through
+    // it before applying the sandbox or exec'ing. Unused off Linux.
+    resource_procs_fd: Option<std::os::fd::RawFd>,
 ) -> Result<i32> {
     let program = &config.command[0];
     let cmd_args = &config.command[1..];
@@ -794,6 +798,29 @@ pub fn execute_supervised(
             // SAFETY: We are in the child after fork, slave_fd is valid.
             if let Some(slave_fd) = pty_slave_fd {
                 unsafe { crate::pty_proxy::setup_child_pty(slave_fd) };
+            }
+
+            // Resource cgroup self-attach (issue #1102). Before the child
+            // applies its sandbox or execs, it writes its OWN pid into the leaf
+            // cgroup through the fd inherited from the parent. Doing this here —
+            // before the child can fork or exec anything — caps the whole
+            // process tree by construction and closes the post-fork escape
+            // window a parent-side attach would leave open.
+            #[cfg(target_os = "linux")]
+            if let Some(procs_fd) = resource_procs_fd
+                && !crate::resource_cgroup::child_self_attach(procs_fd)
+            {
+                const MSG: &[u8] = b"nono: failed to self-attach to resource cgroup\n";
+                // SAFETY: `write` and `_exit` are async-signal-safe and we are in
+                // the post-fork child path. Fail-closed: never run unconfined.
+                unsafe {
+                    libc::write(
+                        libc::STDERR_FILENO,
+                        MSG.as_ptr().cast::<libc::c_void>(),
+                        MSG.len(),
+                    );
+                    libc::_exit(126);
+                }
             }
 
             // Apply Landlock FIRST. Landlock's restrict_self() opens path fds

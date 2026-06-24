@@ -256,7 +256,7 @@ jobs:
     name: Cross-compile check ${{ matrix.target }}
     needs: changes
     # Run on release PRs to catch cross-compilation failures before the tag is pushed.
-    if: ${{ startsWith(github.event.pull_request.title, 'chore: release v') && needs.changes.outputs.run_code_jobs == 'true' }}
+    if: "startsWith(github.event.pull_request.title, 'chore: release v') && needs.changes.outputs.run_code_jobs == 'true'"
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false

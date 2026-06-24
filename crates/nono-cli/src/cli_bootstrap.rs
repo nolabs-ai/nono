@@ -21,44 +21,60 @@ pub(crate) fn collect_legacy_network_warnings() -> Vec<String> {
     let mut warnings = Vec::new();
     let args: Vec<String> = std::env::args().skip(1).collect();
 
-    for (legacy, replacement) in [
-        ("--allow-net", Some("network is unrestricted by default")),
-        ("--net-allow", Some("network is unrestricted by default")),
-        ("--allow-proxy", Some("--allow-domain")),
-        ("--proxy-allow", Some("--allow-domain")),
-        ("--proxy-credential", Some("--credential")),
-        ("--allow-bind", Some("--listen-port")),
-        ("--allow-port", Some("--open-port")),
-        ("--external-proxy", Some("--upstream-proxy")),
-        ("--external-proxy-bypass", Some("--upstream-bypass")),
-        ("--net-block", Some("--block-net")),
+    // (legacy, replacement, remove_by)
+    for (legacy, replacement, remove_by) in [
+        (
+            "--allow-net",
+            Some("network is unrestricted by default"),
+            None,
+        ),
+        (
+            "--net-allow",
+            Some("network is unrestricted by default"),
+            None,
+        ),
+        ("--allow-proxy", Some("--allow-domain"), None),
+        ("--proxy-allow", Some("--allow-domain"), None),
+        ("--proxy-credential", Some("--credential"), Some("v1.0.0")),
+        ("--allow-bind", Some("--listen-port"), None),
+        ("--allow-port", Some("--open-port"), None),
+        ("--external-proxy", Some("--upstream-proxy"), None),
+        ("--external-proxy-bypass", Some("--upstream-bypass"), None),
+        ("--net-block", Some("--block-net"), None),
     ] {
         if args
             .iter()
             .any(|arg| arg == legacy || arg.starts_with(&format!("{legacy}=")))
         {
-            let message = if let Some(replacement) = replacement {
+            let mut message = if let Some(replacement) = replacement {
                 format!("Warning: `{legacy}` is deprecated; use `{replacement}` instead.")
             } else {
                 format!("Warning: `{legacy}` is deprecated.")
             };
+            if let Some(v) = remove_by {
+                message.push_str(&format!(" Will be removed in {v}."));
+            }
             warnings.push(message);
         }
     }
 
-    for (legacy, replacement) in [
-        ("NONO_NET_BLOCK", "NONO_BLOCK_NET"),
-        ("NONO_NET_ALLOW", "NONO_ALLOW_NET"),
-        ("NONO_ALLOW_PROXY", "NONO_ALLOW_DOMAIN"),
-        ("NONO_PROXY_ALLOW", "NONO_ALLOW_DOMAIN"),
-        ("NONO_PROXY_CREDENTIAL", "NONO_CREDENTIAL"),
-        ("NONO_EXTERNAL_PROXY", "NONO_UPSTREAM_PROXY"),
-        ("NONO_EXTERNAL_PROXY_BYPASS", "NONO_UPSTREAM_BYPASS"),
+    // (legacy, replacement, remove_by)
+    for (legacy, replacement, remove_by) in [
+        ("NONO_NET_BLOCK", "NONO_BLOCK_NET", None),
+        ("NONO_NET_ALLOW", "NONO_ALLOW_NET", None),
+        ("NONO_ALLOW_PROXY", "NONO_ALLOW_DOMAIN", None),
+        ("NONO_PROXY_ALLOW", "NONO_ALLOW_DOMAIN", None),
+        ("NONO_PROXY_CREDENTIAL", "NONO_CREDENTIAL", Some("v1.0.0")),
+        ("NONO_EXTERNAL_PROXY", "NONO_UPSTREAM_PROXY", None),
+        ("NONO_EXTERNAL_PROXY_BYPASS", "NONO_UPSTREAM_BYPASS", None),
     ] {
         if std::env::var_os(legacy).is_some() {
-            warnings.push(format!(
-                "Warning: `{legacy}` is deprecated; use `{replacement}` instead."
-            ));
+            let mut message =
+                format!("Warning: `{legacy}` is deprecated; use `{replacement}` instead.");
+            if let Some(v) = remove_by {
+                message.push_str(&format!(" Will be removed in {v}."));
+            }
+            warnings.push(message);
         }
     }
 

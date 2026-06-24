@@ -225,7 +225,13 @@ jobs:
         uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
 
       - name: Publish nono (core library)
-        run: cargo publish -p nono --allow-dirty --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          VERSION="${RELEASE_TAG#v}"
+          if cargo search nono --limit 1 2>/dev/null | grep -q "\"$VERSION\""; then
+            echo "nono $VERSION already published, skipping"
+          else
+            cargo publish -p nono --allow-dirty --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          fi
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
@@ -241,7 +247,11 @@ jobs:
             echo "Attempt $i: not yet indexed, retrying in 10s..."
             sleep 10
           done
-          cargo publish -p nono-proxy --allow-dirty --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          if cargo search nono-proxy --limit 1 2>/dev/null | grep -q "\"$VERSION\""; then
+            echo "nono-proxy $VERSION already published, skipping"
+          else
+            cargo publish -p nono-proxy --allow-dirty --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          fi
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
@@ -257,7 +267,11 @@ jobs:
             echo "Attempt $i: not yet indexed, retrying in 10s..."
             sleep 10
           done
-          cargo publish -p nono-cli --allow-dirty --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          if cargo search nono-cli --limit 1 2>/dev/null | grep -q "\"$VERSION\""; then
+            echo "nono-cli $VERSION already published, skipping"
+          else
+            cargo publish -p nono-cli --allow-dirty --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          fi
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 

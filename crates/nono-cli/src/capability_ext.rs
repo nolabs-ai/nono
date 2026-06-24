@@ -975,18 +975,10 @@ impl CapabilitySetExt for CapabilitySet {
             caps.add_blocked_command(cmd);
         }
 
-        // Network blocking or proxy mode from profile
+        // Only block is written here — proxy mode is set by start_proxy_runtime
+        // once the proxy has a real port.
         if profile.network.block {
             caps.set_network_blocked(true);
-        } else if profile.network.has_proxy_flags() {
-            let bind_ports =
-                crate::merge_dedup_ports(&profile.network.listen_port, &args.allow_bind);
-            // Profile requests proxy mode; port 0 is a placeholder.
-            // bind_ports come from profile listen_port plus CLI --listen-port.
-            caps = caps.set_network_mode(nono::NetworkMode::ProxyOnly {
-                port: 0,
-                bind_ports,
-            });
         }
 
         // Localhost IPC ports from profile
@@ -1136,13 +1128,6 @@ fn apply_cli_network_mode(caps: &mut CapabilitySet, args: &SandboxArgs) {
         caps.set_network_blocked(true);
     } else if args.allow_net {
         caps.set_network_mode_mut(nono::NetworkMode::AllowAll);
-    } else if args.has_proxy_flags() {
-        // Proxy mode: port 0 is a placeholder, updated when proxy starts.
-        // bind_ports are passed through allow_bind CLI flag.
-        caps.set_network_mode_mut(nono::NetworkMode::ProxyOnly {
-            port: 0,
-            bind_ports: args.allow_bind.clone(),
-        });
     }
 }
 

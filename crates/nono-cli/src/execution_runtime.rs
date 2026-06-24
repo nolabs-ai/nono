@@ -142,7 +142,8 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
     } = plan;
     let rollback = &flags.rollback;
     let trust = &flags.trust;
-    let proxy = &flags.proxy;
+    let network = &flags.network;
+    let proxy = network.proxy_options();
     let session = &flags.session;
     let tool_sandbox_active = flags
         .command_policies
@@ -193,16 +194,12 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
     if let Some(profile) = recommended_profile {
         output::print_profile_hint(recommended_program_name, profile, flags.silent);
     }
-    let plain_domain_entries = flags
-        .proxy
-        .domain_filter
-        .as_ref()
+    let plain_domain_entries = proxy
+        .and_then(|p| p.domain_filter.as_ref())
         .map(|d| d.allow_domain.as_slice())
         .unwrap_or(&[]);
-    let endpoint_domain_entries = flags
-        .proxy
-        .endpoint_filter
-        .as_ref()
+    let endpoint_domain_entries = proxy
+        .and_then(|p| p.endpoint_filter.as_ref())
         .map(|e| e.routes.as_slice())
         .unwrap_or(&[]);
     let all_domain_entries: Vec<_> = plain_domain_entries
@@ -259,13 +256,13 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
     }
 
     if matches!(strategy, exec_strategy::ExecStrategy::Supervised) {
-        output::print_supervised_info(flags.silent, rollback.requested, proxy.is_active());
+        output::print_supervised_info(flags.silent, rollback.requested, network.is_proxy_active());
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     let shared_broker = crate::tool_sandbox::token_broker::new_shared_broker();
     let active_proxy = start_proxy_runtime(
-        proxy,
+        network,
         &mut caps,
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         Some(shared_broker.clone()),
@@ -475,7 +472,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
 
     let threading = select_threading_context(
         !loaded_secrets.is_empty(),
-        proxy.is_active(),
+        network.is_proxy_active(),
         trust.scan_performed,
         trust.interception_active,
     );

@@ -72,7 +72,7 @@ pub(crate) struct TrustLaunchOptions {
 }
 
 /// Plain CONNECT-tunnel domain allowlist entries and an optional network profile.
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct DomainFilterIntent {
     pub(crate) network_profile: Option<String>,
     /// Only `AllowDomainEntry::Plain` entries — endpoint-bearing entries live in
@@ -84,18 +84,18 @@ pub(crate) struct DomainFilterIntent {
 /// proxy can inspect method and path before forwarding.
 /// All entries must be `AllowDomainEntry::WithEndpoints` (enforced by `debug_assert`
 /// at construction in `prepare_proxy_launch_options`).
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct EndpointFilterIntent {
     pub(crate) routes: Vec<profile::AllowDomainEntry>,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct CredentialProxyIntent {
     pub(crate) credentials: Vec<String>,
     pub(crate) custom_credentials: HashMap<String, profile::CustomCredentialDef>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct UpstreamProxyIntent {
     pub(crate) address: String,
     pub(crate) bypass: Vec<String>,
@@ -103,7 +103,7 @@ pub(crate) struct UpstreamProxyIntent {
 
 /// TLS interception configuration supplied by the user. Presence means the user
 /// configured TLS intercept settings; it does not by itself activate the proxy.
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct TlsInterceptIntent {
     /// macOS only: reuse a persistent CA bundle across sessions.
     #[cfg(target_os = "macos")]
@@ -111,14 +111,14 @@ pub(crate) struct TlsInterceptIntent {
     pub(crate) ca_validity: Option<std::time::Duration>,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct OpenUrlIntent {
     pub(crate) origins: Vec<String>,
     pub(crate) allow_localhost: bool,
     pub(crate) allow_launch_services: bool,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct ProxyLaunchOptions {
     pub(crate) domain_filter: Option<DomainFilterIntent>,
     pub(crate) endpoint_filter: Option<EndpointFilterIntent>,
@@ -128,10 +128,10 @@ pub(crate) struct ProxyLaunchOptions {
     pub(crate) open_url: Option<OpenUrlIntent>,
     pub(crate) allow_bind_ports: Vec<u16>,
     pub(crate) proxy_port: Option<u16>,
-    /// True when the user requested `network.block` or `--block-net`.
-    /// Propagated to `ProxyConfig.strict_filter` so the filter denies
-    /// unlisted hosts instead of falling back to allow-all.
-    pub(crate) network_block: bool,
+    /// When `true`, the proxy denies any host not explicitly allowed rather
+    /// than falling back to allow-all. Set when the user combined proxy
+    /// features with `--block-net` or profile `network.block`.
+    pub(crate) strict_filter: bool,
     pub(crate) proxy_leaf_validity: Option<std::time::Duration>,
     pub(crate) command_policies: Option<crate::command_policy::CommandPoliciesConfig>,
     /// Environment variables the proxy must source (e.g. credential-bearing
@@ -162,6 +162,40 @@ impl ProxyLaunchOptions {
     }
 }
 
+/// Resolved network intent, derived from CLI flags and profile before any
+/// proxy is started. This is the single source of truth for which network
+/// mode the sandbox will run in.
+///
+/// Variants are ordered by decreasing restriction:
+/// - `BlockAll` — OS sandbox denies all outbound connections.
+/// - `ProxyFiltered` — outbound connections are gated through the nono proxy.
+/// - `Unrestricted` — no network restriction.
+#[derive(Clone, Debug, Default)]
+pub(crate) enum NetworkIntent {
+    /// `--allow-net` or default when no network flags are given: no restriction.
+    #[default]
+    Unrestricted,
+    /// `--block-net` or profile `network.block` with no active proxy override:
+    /// outbound connections are denied by the OS sandbox.
+    BlockAll,
+    /// Proxy-activating features are configured. Proxy starts only if
+    /// `ProxyLaunchOptions::is_active()` — custom credentials alone do not.
+    ProxyFiltered(Box<ProxyLaunchOptions>),
+}
+
+impl NetworkIntent {
+    pub(crate) fn is_proxy_active(&self) -> bool {
+        matches!(self, Self::ProxyFiltered(opts) if opts.is_active())
+    }
+
+    pub(crate) fn proxy_options(&self) -> Option<&ProxyLaunchOptions> {
+        match self {
+            Self::ProxyFiltered(opts) => Some(opts),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct ExecutionFlags {
     pub(crate) strategy: exec_strategy::ExecStrategy,
@@ -182,7 +216,7 @@ pub(crate) struct ExecutionFlags {
     pub(crate) session: SessionLaunchOptions,
     pub(crate) rollback: RollbackLaunchOptions,
     pub(crate) trust: TrustLaunchOptions,
-    pub(crate) proxy: ProxyLaunchOptions,
+    pub(crate) network: NetworkIntent,
     pub(crate) redaction_policy: nono::ScrubPolicy,
     pub(crate) session_hooks: profile::SessionHooks,
     pub(crate) allowed_env_vars: Option<Vec<String>>,
@@ -219,7 +253,7 @@ impl ExecutionFlags {
                     .map_err(|e| NonoError::SandboxInit(format!("Failed to get cwd: {e}")))?,
                 ..TrustLaunchOptions::default()
             },
-            proxy: ProxyLaunchOptions::default(),
+            network: NetworkIntent::default(),
             redaction_policy: nono::ScrubPolicy::secure_default(),
             session_hooks: profile::SessionHooks::default(),
             allowed_env_vars: None,
@@ -319,7 +353,7 @@ pub(crate) fn prepare_run_launch_plan(
         .ok()
         .filter(|id| !id.is_empty())
         .unwrap_or_else(crate::session::generate_session_id);
-    let proxy = prepare_proxy_launch_options(&args, &prepared, silent, session_id.clone())?;
+    let network = prepare_proxy_launch_options(&args, &prepared, silent, session_id.clone())?;
     let rollback_options = prepare_rollback_launch_options(
         &run_args.rollback_exclude,
         run_args.rollback_all,
@@ -330,7 +364,7 @@ pub(crate) fn prepare_run_launch_plan(
 
     let strategy = select_exec_strategy(
         rollback,
-        proxy.is_active(),
+        network.is_proxy_active(),
         prepared.capability_elevation,
         trust.interception_active,
         run_args.detached,
@@ -376,7 +410,7 @@ pub(crate) fn prepare_run_launch_plan(
                 ..rollback_options
             },
             trust,
-            proxy,
+            network,
             redaction_policy,
             session_hooks: prepared.session_hooks,
             allowed_env_vars: prepared.allowed_env_vars,

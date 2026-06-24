@@ -280,7 +280,7 @@ All path fields support variable expansion (see Section 6).
 | `credentials`           | array of string                   | `[]`     | Credential services to enable via reverse proxy. Alias: `proxy_credentials`. |
 | `open_port`             | array of integer                  | `[]`     | Localhost TCP IPC. Aliases: `port_allow`, `allow_port`. Port **0**: macOS only (`localhost:*` outbound); Linux: explicit ports. |
 | `listen_port`           | array of integer                  | `[]`     | TCP ports the sandboxed child may listen on. |
-| `custom_credentials`    | map of string to credential def   | `{}`     | Custom credential route definitions (see below). |
+| `custom_credentials`    | map of string to credential def   | `{}`     | Custom credential route definitions (see below). Defines the route only — the proxy does not activate unless the service name also appears in `credentials`. |
 | `upstream_proxy`        | string                            | `null`   | Enterprise proxy address (`host:port`). Alias: `external_proxy`. |
 | `upstream_bypass`       | array of string                   | `[]`     | Hosts to bypass the upstream proxy. Supports `*.` wildcard suffixes. Alias: `external_proxy_bypass`. |
 
@@ -316,7 +316,27 @@ When profiles extend each other, endpoint rules for the same domain are **append
 
 #### custom_credentials entry
 
-Define a custom reverse proxy credential route for services not in `network-policy.json`:
+Define a custom reverse proxy credential route for services not in `network-policy.json`.
+
+> **Important:** `custom_credentials` defines the route configuration but does not activate the proxy on its own. The service name must also appear in `credentials` to start the proxy and inject the phantom token. For example:
+>
+> ```json
+> {
+>   "network": {
+>     "credentials": ["myservice"],
+>     "custom_credentials": {
+>       "myservice": {
+>         "upstream": "https://api.myservice.com",
+>         "credential_key": "myservice_api_key",
+>         "inject_header": "Authorization",
+>         "credential_format": "Bearer {}"
+>       }
+>     }
+>   }
+> }
+> ```
+
+An individual entry in the `custom_credentials` map is configured as follows:
 
 ```json
 {

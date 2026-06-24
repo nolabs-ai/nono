@@ -4887,6 +4887,46 @@ mod tests {
     }
 
     #[test]
+    fn filter_child_env_passes_tls_ca_vars_by_default() -> Result<()> {
+        let bundle = "/tmp/intercept-ca.pem";
+        let state = test_state();
+        let request = request_with_env(vec![
+            format!("SSL_CERT_FILE={bundle}").into_bytes(),
+            format!("CURL_CA_BUNDLE={bundle}").into_bytes(),
+            format!("NODE_EXTRA_CA_CERTS={bundle}").into_bytes(),
+            format!("REQUESTS_CA_BUNDLE={bundle}").into_bytes(),
+            format!("GIT_SSL_CAINFO={bundle}").into_bytes(),
+            b"UNRELATED=should-be-stripped".to_vec(),
+        ]);
+
+        let env = filter_child_env(&state, &request, &CommandSandboxConfig::default())?;
+
+        assert!(contains_entry(
+            &env,
+            format!("SSL_CERT_FILE={bundle}").as_bytes()
+        ));
+        assert!(contains_entry(
+            &env,
+            format!("CURL_CA_BUNDLE={bundle}").as_bytes()
+        ));
+        assert!(contains_entry(
+            &env,
+            format!("NODE_EXTRA_CA_CERTS={bundle}").as_bytes()
+        ));
+        assert!(contains_entry(
+            &env,
+            format!("REQUESTS_CA_BUNDLE={bundle}").as_bytes()
+        ));
+        assert!(contains_entry(
+            &env,
+            format!("GIT_SSL_CAINFO={bundle}").as_bytes()
+        ));
+        assert!(!contains_prefix(&env, b"UNRELATED="));
+
+        Ok(())
+    }
+
+    #[test]
     fn filter_child_env_resolves_broker_nonces() -> Result<()> {
         let state = test_state();
         let nonce = {

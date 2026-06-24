@@ -4,7 +4,7 @@ use crate::command_policy::{
     CommandSandboxConfig, EndpointPolicyConfig, PolicyDecision, PolicyDecisionConfig,
 };
 use crate::launch_runtime::{
-    CredentialProxyIntent, DomainFilterIntent, EndpointFilterIntent, OpenUrlIntent,
+    CredentialProxyIntent, DomainFilterIntent, EndpointFilterIntent, NetworkIntent, OpenUrlIntent,
     ProxyLaunchOptions, TlsInterceptIntent, UpstreamProxyIntent,
 };
 use crate::network_policy;
@@ -1166,7 +1166,7 @@ pub(crate) fn prepare_proxy_launch_options(
     prepared: &PreparedSandbox,
     silent: bool,
     session_id: String,
-) -> Result<ProxyLaunchOptions> {
+) -> Result<NetworkIntent> {
     validate_external_proxy_bypass(args, prepared)?;
 
     let effective_proxy = resolve_effective_proxy_settings(args, prepared);
@@ -1210,7 +1210,9 @@ pub(crate) fn prepare_proxy_launch_options(
     let has_credentials = !credentials.is_empty();
     let would_activate = has_domain_filter || has_credentials || upstream_proxy_addr.is_some();
 
-    if matches!(prepared.caps.network_mode(), nono::NetworkMode::Blocked) {
+    // --block-net always wins; profile network.block yields to any proxy config.
+    let block_wins = args.block_net || (prepared.profile_network_block && !would_activate);
+    if block_wins {
         if would_activate {
             warn!(
                 "--block-net is active; ignoring proxy configuration \
@@ -1223,12 +1225,11 @@ pub(crate) fn prepare_proxy_launch_options(
                 );
             }
         }
-        return Ok(ProxyLaunchOptions {
-            allow_bind_ports,
-            network_block: prepared.network_block_requested,
-            ..ProxyLaunchOptions::default()
-        });
+        return Ok(NetworkIntent::BlockAll);
     }
+
+    // Profile network.block + proxy flags → strict mode: deny unlisted hosts.
+    let strict_filter = prepared.profile_network_block;
 
     let (plain_entries, endpoint_entries): (Vec<_>, Vec<_>) = allow_domain
         .into_iter()
@@ -1311,7 +1312,7 @@ pub(crate) fn prepare_proxy_launch_options(
         open_url,
         allow_bind_ports,
         proxy_port: args.proxy_port,
-        network_block: prepared.network_block_requested,
+        strict_filter,
         proxy_leaf_validity: tls_options.leaf_validity,
         command_policies: prepared.command_policies.clone(),
         proxy_source_env_vars,
@@ -1340,7 +1341,7 @@ pub(crate) fn prepare_proxy_launch_options(
         }
     }
 
-    Ok(opts)
+    Ok(NetworkIntent::ProxyFiltered(Box::new(opts)))
 }
 
 struct ResolvedTlsInterceptOptions {
@@ -1996,7 +1997,7 @@ pub(crate) fn build_proxy_config_from_flags(
     resolved.routes = routes;
 
     let mut proxy_config = network_policy::build_proxy_config(&resolved, &plain_hosts);
-    proxy_config.strict_filter = proxy.network_block;
+    proxy_config.strict_filter = proxy.strict_filter;
 
     if let Some(ref upstream) = proxy.upstream_proxy {
         proxy_config.external_proxy = Some(nono_proxy::config::ExternalProxyConfig {
@@ -2028,13 +2029,21 @@ impl nono_proxy::NonceResolver for TokenBrokerNonceResolver {
 }
 
 pub(crate) fn start_proxy_runtime(
-    proxy: &ProxyLaunchOptions,
+    intent: &NetworkIntent,
     caps: &mut CapabilitySet,
     #[cfg(any(target_os = "linux", target_os = "macos"))] shared_broker: Option<
         crate::tool_sandbox::token_broker::SharedBroker,
     >,
     #[cfg(not(any(target_os = "linux", target_os = "macos")))] _shared_broker: Option<()>,
 ) -> Result<ActiveProxyRuntime> {
+    let NetworkIntent::ProxyFiltered(proxy) = intent else {
+        return Ok(ActiveProxyRuntime {
+            env_vars: Vec::new(),
+            tool_sandbox_credential_env_vars: BTreeMap::new(),
+            tool_sandbox_trust_bundle_paths: Vec::new(),
+            handle: None,
+        });
+    };
     if !proxy.is_active() {
         return Ok(ActiveProxyRuntime {
             env_vars: Vec::new(),
@@ -2465,30 +2474,27 @@ mod tests {
         }
     }
 
-    /// `network_block: true` must set `strict_filter` on the generated `ProxyConfig`.
+    /// `strict_filter: true` must propagate to `ProxyConfig.strict_filter`.
     #[test]
-    fn test_build_proxy_config_propagates_network_block_to_strict_filter() {
+    fn test_build_proxy_config_propagates_strict_filter() {
         let proxy = ProxyLaunchOptions {
-            network_block: true,
+            strict_filter: true,
             ..ProxyLaunchOptions::default()
         };
         let config = build_proxy_config_from_flags(&proxy).expect("build_proxy_config_from_flags");
         assert!(
             config.strict_filter,
-            "network_block: true must set strict_filter on ProxyConfig"
+            "strict_filter: true must propagate to ProxyConfig"
         );
     }
 
     #[test]
-    fn test_build_proxy_config_strict_filter_off_when_no_block() {
-        let proxy = ProxyLaunchOptions {
-            network_block: false,
-            ..ProxyLaunchOptions::default()
-        };
+    fn test_build_proxy_config_strict_filter_off_by_default() {
+        let proxy = ProxyLaunchOptions::default();
         let config = build_proxy_config_from_flags(&proxy).expect("build_proxy_config_from_flags");
         assert!(
             !config.strict_filter,
-            "strict_filter must default off when network_block is false"
+            "strict_filter must default off when not set"
         );
     }
 
@@ -2600,20 +2606,23 @@ mod tests {
             allowed_env_vars: None,
             denied_env_vars: None,
             set_vars: None,
-            network_block_requested: false,
+            profile_network_block: false,
             allow_http2_requested: false,
         };
 
         let args = crate::cli::SandboxArgs::default();
-        let opts = prepare_proxy_launch_options(&args, &prepared, true, String::new())
+        let intent = prepare_proxy_launch_options(&args, &prepared, true, String::new())
             .expect("prepare_proxy_launch_options");
 
         assert!(
-            !opts.is_active(),
+            !intent.is_proxy_active(),
             "proxy must stay inactive when only custom credential definitions are present"
         );
+        let proxy_opts = intent
+            .proxy_options()
+            .expect("NetworkIntent should be ProxyFiltered when custom credentials are present");
         assert!(
-            opts.credentials.is_some(),
+            proxy_opts.credentials.is_some(),
             "custom credential definitions should still be carried for network profile overrides"
         );
     }

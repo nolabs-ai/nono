@@ -1,9 +1,12 @@
 //! Session token generation, validation, and nonce resolution.
 //!
-//! Each proxy session gets a unique cryptographic token. The child process
-//! receives it via `NONO_PROXY_TOKEN` env var and must include it in all
-//! requests to the proxy. This prevents other local processes from using
-//! the proxy.
+//! Each proxy session gets a unique cryptographic token used to authenticate
+//! requests to the proxy. For reverse proxy credential routes the token is
+//! delivered transparently — nono sets the credential env var (e.g.
+//! `GITHUB_TOKEN`) to the phantom token inside the sandbox, so standard API
+//! clients include it automatically in the service-specific auth header. For
+//! CONNECT tunnel requests the token is validated via `Proxy-Authorization`.
+//! This prevents other local processes from hijacking the proxy session.
 //!
 //! The `NonceResolver` trait allows the proxy to resolve tool-sandbox broker
 //! nonces (`nono_<64hex>`) found in request headers, substituting the real

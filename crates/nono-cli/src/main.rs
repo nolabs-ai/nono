@@ -105,7 +105,6 @@ const DETACHED_CWD_PROMPT_RESPONSE_ENV: &str = "NONO_DETACHED_CWD_PROMPT_RESPONS
 const DETACHED_SESSION_ID_ENV: &str = "NONO_DETACHED_SESSION_ID";
 
 pub(crate) use launch_runtime::rollback_base_exclusions;
-pub(crate) use proxy_runtime::merge_dedup_ports;
 
 fn main() {
     if tool_sandbox::maybe_run_internal_tool_sandbox_entrypoint() {
@@ -307,7 +306,7 @@ mod tests {
             allowed_env_vars: None,
             denied_env_vars: None,
             set_vars: None,
-            network_block_requested: false,
+            profile_network_block: false,
             allow_http2_requested: false,
         };
 
@@ -365,7 +364,7 @@ mod tests {
             allowed_env_vars: None,
             denied_env_vars: None,
             set_vars: None,
-            network_block_requested: false,
+            profile_network_block: false,
             allow_http2_requested: false,
         };
 

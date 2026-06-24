@@ -2814,9 +2814,12 @@ fn run_supervisor_loop(
                         child,
                         config,
                         initial_caps,
-                        &mut rate_limiter,
-                        &mut denials,
-                        trust_interceptor.as_mut(),
+                        supervisor_linux::SeccompNotificationState {
+                            rate_limiter: &mut rate_limiter,
+                            denials: &mut denials,
+                            trust_interceptor: trust_interceptor.as_mut(),
+                            pty: pty.as_deref_mut(),
+                        },
                     )
                 {
                     debug!("Error handling seccomp notification: {}", e);

@@ -111,7 +111,7 @@ serde.workspace = true
 [dev-dependencies]
 jsonschema = "0.46"
 proptest = "1"
-criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 
 [lints]
 workspace = true

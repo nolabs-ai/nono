@@ -274,6 +274,7 @@ All path fields support variable expansion (see Section 6).
 | Field                   | Type                              | Default  | Description |
 |-------------------------|-----------------------------------|----------|-------------|
 | `block`                 | boolean                           | `false`  | Block all network access. |
+| `allow_http2`           | boolean                           | `false`  | Allow HTTP/2 to upstream servers via ALPN negotiation. Default is HTTP/1.1 with keep-alive. Equivalent to `--allow-http2`. |
 | `network_profile`       | string or null                    | inherit  | Name from `network-policy.json` for proxy filtering. Set to `null` to clear inherited value. |
 | `allow_domain`          | array of string or object         | `[]`     | Additional domains to allow through the proxy. Entries can be plain strings (CONNECT tunnel) or objects with endpoint rules (TLS-intercepted L7 filtering). Aliases: `proxy_allow`, `allow_proxy`. |
 | `credentials`           | array of string                   | `[]`     | Credential services to enable via reverse proxy. Alias: `proxy_credentials`. |

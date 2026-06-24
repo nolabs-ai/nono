@@ -514,6 +514,10 @@
           "type": "boolean",
           "description": "Block network access. Network is allowed by default; set to true to deny all outbound traffic."
         },
+        "allow_http2": {
+          "type": "boolean",
+          "description": "Allow HTTP/2 to upstream servers via ALPN negotiation. Defaults to false (HTTP/1.1 with keep-alive). Equivalent to the --allow-http2 CLI flag."
+        },
         "network_profile": {
           "oneOf": [
             { "type": "string" },

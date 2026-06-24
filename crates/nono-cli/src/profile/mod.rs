@@ -1403,6 +1403,11 @@ pub struct NetworkConfig {
     /// Canonical profile key: `block`.
     #[serde(default)]
     pub block: bool,
+    /// Allow HTTP/2 to upstream servers via ALPN negotiation.
+    /// When `false` (default), the proxy negotiates HTTP/1.1 with keep-alive
+    /// connection pooling. Equivalent to the `--allow-http2` CLI flag.
+    #[serde(default)]
+    pub allow_http2: bool,
     /// Network proxy profile name (from network-policy.json).
     /// When set, outbound traffic is filtered through the proxy.
     ///
@@ -3128,6 +3133,7 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
         },
         network: NetworkConfig {
             block: base.network.block || child.network.block,
+            allow_http2: base.network.allow_http2 || child.network.allow_http2,
             network_profile: child
                 .network
                 .network_profile
@@ -5321,6 +5327,7 @@ mod tests {
             },
             network: NetworkConfig {
                 block: false,
+                allow_http2: false,
                 network_profile: InheritableValue::Set("base-net".to_string()),
                 allow_domain: vec![AllowDomainEntry::Plain("base.example.com".to_string())],
                 open_port: vec![3000],
@@ -5405,6 +5412,7 @@ mod tests {
             },
             network: NetworkConfig {
                 block: false,
+                allow_http2: false,
                 network_profile: InheritableValue::Inherit,
                 allow_domain: vec![AllowDomainEntry::Plain("child.example.com".to_string())],
                 open_port: vec![3000, 5000],

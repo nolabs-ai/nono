@@ -451,6 +451,9 @@ pub(crate) struct PreparedSandbox {
     /// through because a CLI proxy flag (e.g. `--credential`) may later
     /// override `caps` to `ProxyOnly`, losing the original intent.
     pub(crate) network_block_requested: bool,
+    /// True when the profile or CLI requested HTTP/2 to upstream servers
+    /// (`network.allow_http2` or `--allow-http2`).
+    pub(crate) allow_http2_requested: bool,
 }
 
 fn resolved_workdir(args: &SandboxArgs) -> PathBuf {
@@ -1087,6 +1090,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
                 denied_env_vars: None,
                 set_vars: None,
                 network_block_requested: args.block_net,
+                allow_http2_requested: args.allow_http2,
             },
             &[],
             args,
@@ -1371,6 +1375,13 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         .unwrap_or(false);
     let network_block_requested = args.block_net || profile_network_block;
 
+    // Capture the profile's `network.allow_http2` intent alongside the CLI flag.
+    let profile_allow_http2 = loaded_profile
+        .as_ref()
+        .map(|p| p.network.allow_http2)
+        .unwrap_or(false);
+    let allow_http2_requested = args.allow_http2 || profile_allow_http2;
+
     let profile_secrets = loaded_profile
         .as_ref()
         .map(|profile| profile.env_credentials.mappings.clone())
@@ -1419,6 +1430,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
             denied_env_vars: profile_denied_env_vars,
             set_vars: profile_set_vars,
             network_block_requested,
+            allow_http2_requested,
         },
         &blocked_grants,
         args,

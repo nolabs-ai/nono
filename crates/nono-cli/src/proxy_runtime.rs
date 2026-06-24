@@ -1319,7 +1319,7 @@ pub(crate) fn prepare_proxy_launch_options(
         tool_sandbox_proxy_credentials,
         session_id,
         credential_capture: prepared.credential_capture.clone(),
-        enable_h2: args.allow_http2,
+        enable_h2: prepared.allow_http2_requested,
     };
 
     // Infra-only flags make no sense without an activating proxy feature.
@@ -2601,6 +2601,7 @@ mod tests {
             denied_env_vars: None,
             set_vars: None,
             network_block_requested: false,
+            allow_http2_requested: false,
         };
 
         let args = crate::cli::SandboxArgs::default();

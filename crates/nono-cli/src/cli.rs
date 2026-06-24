@@ -1286,7 +1286,7 @@ pub struct SandboxArgs {
 
     // ── Credentials ──────────────────────────────────────────────────────
     /// Inject credentials via reverse proxy for a service (repeatable)
-    /// ALIAS(canonical="--credential", introduced="v0.0.0", remove_by="indefinite", issue="#143")
+    /// ALIAS(canonical="--credential", introduced="v0.0.0", remove_by="v1.0.0", issue="#143")
     #[arg(
         long = "credential",
         alias = "proxy-credential",

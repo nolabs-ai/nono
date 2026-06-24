@@ -335,6 +335,8 @@ Define a custom reverse proxy credential route for services not in `network-poli
 > }
 > ```
 
+An individual entry in the `custom_credentials` map is configured as follows:
+
 ```json
 {
   "upstream": "https://api.example.com",

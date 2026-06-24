@@ -280,7 +280,7 @@ impl RouteStore {
             route
                 .upstream_host_port
                 .as_ref()
-                .is_some_and(|hp| *hp == normalised)
+                .is_some_and(|hp| host_port_matches(hp, &normalised))
         })
     }
 
@@ -295,7 +295,7 @@ impl RouteStore {
             route
                 .upstream_host_port
                 .as_ref()
-                .filter(|hp| **hp == normalised)
+                .filter(|hp| host_port_matches(hp, &normalised))
                 .map(|_| (prefix.as_str(), route))
         })
     }
@@ -312,7 +312,7 @@ impl RouteStore {
                 route
                     .upstream_host_port
                     .as_ref()
-                    .is_some_and(|hp| *hp == normalised)
+                    .is_some_and(|hp| host_port_matches(hp, &normalised))
             })
             .map(|(prefix, route)| (prefix.as_str(), route))
             .collect();
@@ -328,7 +328,7 @@ impl RouteStore {
             route
                 .upstream_host_port
                 .as_ref()
-                .is_some_and(|hp| *hp == normalised)
+                .is_some_and(|hp| host_port_matches(hp, &normalised))
                 && route.requires_intercept
         })
     }
@@ -486,6 +486,32 @@ fn route_tls_config_key(route: &RouteConfig) -> Option<String> {
         route.tls_client_cert.as_deref().unwrap_or(""),
         route.tls_client_key.as_deref().unwrap_or("")
     ))
+}
+
+fn host_port_matches(pattern: &str, target: &str) -> bool {
+    if pattern == target {
+        return true;
+    }
+    if !pattern.starts_with("*.") {
+        return false;
+    }
+
+    let Some((pattern_host, pattern_port)) = pattern.rsplit_once(':') else {
+        return false;
+    };
+    let Some((target_host, target_port)) = target.rsplit_once(':') else {
+        return false;
+    };
+    if pattern_port != target_port {
+        return false;
+    }
+
+    let Some(suffix) = pattern_host.strip_prefix("*.") else {
+        return false;
+    };
+    target_host
+        .strip_suffix(suffix)
+        .is_some_and(|prefix| prefix.ends_with('.') && prefix.len() > 1)
 }
 
 /// Read a PEM file, producing a clear `ProxyError::Config` for common failure modes.
@@ -878,6 +904,38 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_host_port_preserves_wildcard_host() {
+        assert_eq!(
+            extract_host_port("https://*.dev.example.net"),
+            Some("*.dev.example.net:443".to_string())
+        );
+    }
+
+    #[test]
+    fn test_host_port_matches_wildcard_subdomain_only() {
+        assert!(host_port_matches(
+            "*.dev.example.net:443",
+            "api.admin.dev.example.net:443"
+        ));
+        assert!(host_port_matches(
+            "*.dev.example.net:443",
+            "admin.dev.example.net:443"
+        ));
+        assert!(!host_port_matches(
+            "*.dev.example.net:443",
+            "dev.example.net:443"
+        ));
+        assert!(!host_port_matches(
+            "*.dev.example.net:443",
+            "api.admin.dev.example.net:8443"
+        ));
+        assert!(!host_port_matches(
+            "*.dev.example.net:443",
+            "api.admin.other.net:443"
+        ));
+    }
+
+    #[test]
     fn test_loaded_route_debug() {
         let route = LoadedRoute {
             upstream: "https://api.openai.com".to_string(),
@@ -936,6 +994,46 @@ mod tests {
             Some(NetworkAuditInjectionMode::Header)
         );
         assert!(!store.has_intercept_route("api.example.com:443"));
+    }
+
+    #[test]
+    fn test_requires_intercept_wildcard_credential_upstream() {
+        let routes = vec![RouteConfig {
+            prefix: "internal_api".to_string(),
+            upstream: "https://*.dev.example.net".to_string(),
+            credential_key: Some("cmd://internal_api".to_string()),
+            inject_mode: Default::default(),
+            inject_header: "Authorization".to_string(),
+            credential_format: Some("Bearer {}".to_string()),
+            path_pattern: None,
+            path_replacement: None,
+            query_param_name: None,
+            proxy: None,
+            env_var: Some("INTERNAL_API_TOKEN".to_string()),
+            endpoint_rules: vec![],
+            endpoint_policy: None,
+            tls_ca: None,
+            tls_client_cert: None,
+            tls_client_key: None,
+            oauth2: None,
+            aws_auth: None,
+        }];
+        let store = RouteStore::load(&routes).unwrap();
+
+        assert!(store.is_route_upstream("api.admin.dev.example.net:443"));
+        assert!(store.has_intercept_route("api.admin.dev.example.net:443"));
+        let hit = store
+            .lookup_by_upstream("api.admin.dev.example.net:443")
+            .unwrap();
+        assert_eq!(hit.0, "internal_api");
+        assert!(hit.1.requires_managed_credential);
+
+        let all = store.lookup_all_by_upstream("api.admin.dev.example.net:443");
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].0, "internal_api");
+
+        assert!(!store.is_route_upstream("dev.example.net:443"));
+        assert!(!store.has_intercept_route("api.admin.dev.example.net:8443"));
     }
 
     #[test]

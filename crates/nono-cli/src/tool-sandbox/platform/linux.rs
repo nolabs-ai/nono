@@ -3226,11 +3226,11 @@ fn add_policy_fs(
     use super::dynamic_providers::expand_dynamic_tokens;
     for entry in &expand_dynamic_tokens(&policy.fs_read)? {
         let path = resolve_policy_path(entry, policy_root)?;
-        caps.add_fs(FsCapability::new_dir(path, AccessMode::Read)?);
+        add_optional_dir(caps, path, AccessMode::Read)?;
     }
     for entry in &expand_dynamic_tokens(&policy.fs_write)? {
         let path = resolve_policy_path(entry, policy_root)?;
-        caps.add_fs(FsCapability::new_dir(path, AccessMode::ReadWrite)?);
+        add_optional_dir(caps, path, AccessMode::ReadWrite)?;
     }
     for entry in &expand_dynamic_tokens(&policy.fs_read_file)? {
         let path = resolve_policy_path(entry, policy_root)?;
@@ -3241,6 +3241,17 @@ fn add_policy_fs(
         caps.add_fs(FsCapability::new_file(path, AccessMode::ReadWrite)?);
     }
     Ok(())
+}
+
+fn add_optional_dir(caps: &mut CapabilitySet, path: PathBuf, access: AccessMode) -> Result<()> {
+    match FsCapability::new_dir(&path, access) {
+        Ok(capability) => {
+            caps.add_fs(capability);
+            Ok(())
+        }
+        Err(NonoError::PathNotFound(_)) => Ok(()),
+        Err(err) => Err(err),
+    }
 }
 
 fn add_optional_read_file(caps: &mut CapabilitySet, path: PathBuf) -> Result<()> {

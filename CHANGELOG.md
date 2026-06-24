@@ -6,6 +6,8 @@
 
 - *(tool-sandbox)* Pass TLS trust bundle env vars (`SSL_CERT_FILE`, `CURL_CA_BUNDLE`, `NODE_EXTRA_CA_CERTS`, `REQUESTS_CA_BUNDLE`, `GIT_SSL_CAINFO`) to tool-sandbox children so HTTPS certificate verification works when TLS interception is active (#1248)
 
+- *(tool-sandbox)* Skip missing `fs_read`/`fs_write` directories instead of erroring on startup; matches existing `fs_read_file` behaviour (#1252)
+
 ## [0.65.1] - 2026-06-23
 ## [0.65.0] - 2026-06-23
 

@@ -279,6 +279,10 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
             _ => Vec::new(),
         },
         #[cfg(target_os = "linux")]
+        localhost_ports: caps.localhost_ports().to_vec(),
+        #[cfg(target_os = "linux")]
+        localhost_port_ranges: caps.localhost_port_ranges().to_vec(),
+        #[cfg(target_os = "linux")]
         unix_socket_allowlist: caps.unix_socket_capabilities(),
         #[cfg(target_os = "linux")]
         linux_network_notify_mode: if config.seccomp_proxy_fallback {

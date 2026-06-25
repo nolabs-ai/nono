@@ -145,6 +145,101 @@ Profiles can form chains (up to 10 levels deep). Circular dependencies are detec
 my-dev.json → team-base.json → claude-code (pack)
 ```
 
+## Network Modes
+
+nono has three network modes. You pick one per run; they cannot be combined.
+
+| Mode | CLI flag | Profile field | What it does |
+|------|----------|---------------|--------------|
+| **Unrestricted** | *(default)* | — | Child has full network access |
+| **Blocked** | `--block-net` | `"network": { "block": true }` | All outbound connections denied |
+| **Proxy-only** | `--allow-domain <host>` | `"network": { "allow_domain": [...] }` | Child may only reach the nono proxy; proxy enforces an allowlist |
+
+### Localhost IPC ports
+
+`open_port` and `open_port_range` punch loopback exceptions into an otherwise restricted network. They have no effect in unrestricted (AllowAll) mode.
+
+**Single port — CLI or profile:**
+```bash
+nono run --allow-cwd --block-net --open-port 3000 -- my-agent
+```
+```json
+{ "network": { "block": true, "open_port": [3000, 3001] } }
+```
+
+**Port range — profile only:**
+```json
+{ "network": { "block": true, "open_port_range": [[3000, 3100]] } }
+```
+
+Multiple ranges are supported: `[[3000, 3100], [49152, 49200]]`.
+
+#### Platform behaviour
+
+|  | macOS | Linux |
+|--|-------|-------|
+| **`open_port`** | One `(remote tcp "localhost:N")` Seatbelt rule per port. Bind/inbound become a blanket allow (Seatbelt cannot filter by port). | Block-net: individual Landlock rules per port. Proxy mode: seccomp supervisor enforces loopback-only for connect. |
+| **`open_port = [0]`** (wildcard) | `(remote tcp "localhost:*")` — any loopback port. | Proxy mode only. Errors at startup in block-net mode. |
+| **`open_port_range`** | Ranges ≤ 256 ports expand to individual rules. Ranges > 256 ports collapse to `localhost:*` with a warning. Bind/inbound become a blanket allow. | Expanded to individual Landlock rules. Works in both block-net and proxy mode. In proxy mode, connect is additionally loopback-only; bind is per-port (no blanket allow). |
+
+### Proxy-only mode (`--allow-domain`)
+
+Proxy mode starts a local nono proxy and restricts the child to that proxy only. The proxy enforces domain allowlists, injects credentials, and optionally inspects endpoints.
+
+```bash
+# Allow one external domain
+nono run --allow-cwd --allow-domain api.openai.com -- my-agent
+```
+
+```json
+{
+  "network": {
+    "allow_domain": ["api.openai.com", "registry.npmjs.org"],
+    "open_port_range": [[3000, 3002]]
+  }
+}
+```
+
+When proxy mode is active, `open_port` and `open_port_range` add **localhost IPC exceptions** on top — the proxy itself is always reachable and the listed ports are additionally allowed for loopback communication.
+
+For tools that bind to an OS-assigned ephemeral port (Testcontainers, Maven Surefire, etc.), use the wildcard:
+
+```json
+{
+  "network": {
+    "allow_domain": ["api.example.com"],
+    "open_port": [0]
+  }
+}
+```
+
+`open_port: [0]` allows any loopback connect or bind without knowing the port in advance. External traffic is still restricted to the domain allowlist.
+
+On Linux, proxy-only mode always uses seccomp-notify to mediate `connect()` and `bind()` calls, even on kernels with Landlock V4+ network support. This is intentional: Landlock TCP rules match by destination port only and cannot enforce the loopback-only invariant that proxy mode requires.
+
+### Blocking external network while allowing localhost IPC
+
+```json
+{
+  "network": {
+    "block": true,
+    "open_port": [6379, 6380]
+  }
+}
+```
+
+Works on both macOS and Linux, including port ranges:
+
+```json
+{
+  "network": {
+    "block": true,
+    "open_port": [6379],
+    "open_port_range": [[49152, 49200]]
+  }
+}
+```
+
 ## Deprecated Command Blocking
 
 Command blocking is deprecated in `v0.33.0`. It is only checked against the

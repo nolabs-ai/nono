@@ -515,9 +515,9 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
             }
             false
         } else if needs_proxy {
-            !Sandbox::detect_abi()
-                .ok()
-                .is_some_and(|abi| abi.has_network())
+            // Always use seccomp-notify for ProxyOnly: Landlock TCP rules
+            // have no IP component and cannot enforce loopback-only.
+            true
         } else {
             false
         }

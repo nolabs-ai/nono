@@ -538,12 +538,14 @@ pub fn apply_with_abi(caps: &CapabilitySet, abi: &DetectedAbi) -> Result<Seccomp
     info!("Using Landlock ABI {:?}", target_abi);
     let scopes = requested_scopes(caps, abi)?;
 
-    if !matches!(caps.network_mode(), NetworkMode::AllowAll) && caps.localhost_ports().contains(&0)
-    {
-        return Err(NonoError::SandboxInit(
-            "open_port 0 (localhost TCP wildcard) is macOS-only; on Linux use explicit ports or a network profile."
-                .to_string(),
-        ));
+    if matches!(caps.network_mode(), NetworkMode::Blocked) {
+        if caps.localhost_ports().contains(&0) {
+            return Err(NonoError::SandboxInit(
+                "open_port 0 (localhost wildcard) is not supported in --block-net mode on Linux; \
+                 use proxy mode (--allow-domain) with open_port 0, or list explicit ports."
+                    .to_string(),
+            ));
+        }
     }
 
     // Determine which access rights to handle based on ABI
@@ -566,9 +568,23 @@ pub fn apply_with_abi(caps: &CapabilitySet, abi: &DetectedAbi) -> Result<Seccomp
         || !caps.tcp_connect_ports().is_empty()
         || !caps.tcp_bind_ports().is_empty();
 
-    let mut seccomp_net_fallback = SeccompNetFallback::None;
+    // ProxyOnly always uses seccomp-notify regardless of Landlock ABI: Landlock
+    // TCP rules match by destination port only, with no IP component, so they
+    // cannot enforce the loopback-only invariant that ProxyOnly requires.
+    let mut seccomp_net_fallback =
+        if let NetworkMode::ProxyOnly { port, bind_ports } = caps.network_mode() {
+            SeccompNetFallback::ProxyOnly {
+                proxy_port: *port,
+                bind_ports: bind_ports.clone(),
+            }
+        } else {
+            SeccompNetFallback::None
+        };
 
-    let ruleset_builder = if needs_network_handling {
+    let needs_landlock_network =
+        matches!(seccomp_net_fallback, SeccompNetFallback::None) && needs_network_handling;
+
+    let ruleset_builder = if needs_landlock_network {
         let handled_net = AccessNet::from_all(target_abi);
         if !handled_net.is_empty() {
             debug!("Handling network access: {:?}", handled_net);
@@ -595,16 +611,9 @@ pub fn apply_with_abi(caps: &CapabilitySet, abi: &DetectedAbi) -> Result<Seccomp
                     seccomp_net_fallback = fallback;
                     ruleset_builder
                 }
-                SeccompNetFallback::ProxyOnly {
-                    proxy_port,
-                    bind_ports,
-                } => {
-                    warn!(
-                        "Landlock ABI {:?} lacks TCP network filtering; \
-                         using seccomp proxy-only fallback (port={}, bind_ports={:?})",
-                        target_abi, proxy_port, bind_ports
-                    );
-                    seccomp_net_fallback = fallback;
+                SeccompNetFallback::ProxyOnly { .. } => {
+                    // Unreachable: ProxyOnly is set unconditionally above and
+                    // excluded from needs_landlock_network.
                     ruleset_builder
                 }
                 SeccompNetFallback::None => {
@@ -707,6 +716,7 @@ pub fn apply_with_abi(caps: &CapabilitySet, abi: &DetectedAbi) -> Result<Seccomp
         // Add localhost IPC port rules (connect + bind per port).
         // Only meaningful in Blocked/ProxyOnly modes. In AllowAll mode, all ports are
         // already reachable and adding Landlock network handling would restrict them.
+        // Ranges are expanded to individual rules — Landlock has no range syntax.
         if !matches!(caps.network_mode(), NetworkMode::AllowAll) {
             for port in caps.localhost_ports() {
                 debug!("Adding localhost TCP connect rule for port {}", port);
@@ -727,6 +737,26 @@ pub fn apply_with_abi(caps: &CapabilitySet, abi: &DetectedAbi) -> Result<Seccomp
                             port, e
                         ))
                     })?;
+            }
+            for &(start, end) in caps.localhost_port_ranges() {
+                for port in start..=end {
+                    ruleset = ruleset
+                        .add_rule(NetPort::new(port, AccessNet::ConnectTcp))
+                        .map_err(|e| {
+                            NonoError::SandboxInit(format!(
+                                "Cannot add TCP connect rule for port {}: {}",
+                                port, e
+                            ))
+                        })?;
+                    ruleset = ruleset
+                        .add_rule(NetPort::new(port, AccessNet::BindTcp))
+                        .map_err(|e| {
+                            NonoError::SandboxInit(format!(
+                                "Cannot add TCP bind rule for port {}: {}",
+                                port, e
+                            ))
+                        })?;
+                }
             }
         }
     }
@@ -4121,38 +4151,30 @@ mod tests {
         );
     }
 
-    /// Integration test: ProxyOnly + Landlock V4+ does NOT install seccomp
-    /// proxy filter (Landlock handles networking natively).
-    ///
-    /// Verifies that apply_with_abi() returns SeccompNetFallback::None when
-    /// the kernel supports AccessNet, even with ProxyOnly mode.
+    /// ProxyOnly always returns `SeccompNetFallback::ProxyOnly`, even on V4+
+    /// kernels — Landlock TCP rules have no IP component and cannot enforce
+    /// the loopback-only invariant.
     #[cfg(target_os = "linux")]
     #[test]
-    fn test_proxy_only_with_landlock_v4_returns_no_fallback() {
+    fn test_proxy_only_always_returns_seccomp_fallback() {
         let detected = match detect_abi() {
             Ok(d) => d,
             Err(_) => return,
         };
 
-        if !detected.has_network() {
-            // Pre-V4 kernel: the fallback SHOULD be ProxyOnly, not None.
-            // Test that separately.
-            return;
-        }
-
-        // On V4+, Landlock handles ProxyOnly natively. apply_with_abi should
-        // return None (no seccomp fallback needed). We can't actually call
-        // apply_with_abi in the parent (irreversible), so fork a child.
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "fork() failed");
 
         if pid == 0 {
             let caps = CapabilitySet::new().proxy_only(8080);
             let exit_code = match apply_with_abi(&caps, &detected) {
-                Ok(SeccompNetFallback::None) => 0,
-                Ok(SeccompNetFallback::BlockAll) => 1,
-                Ok(SeccompNetFallback::ProxyOnly { .. }) => 2,
-                Err(_) => 3,
+                Ok(SeccompNetFallback::ProxyOnly {
+                    proxy_port: 8080, ..
+                }) => 0,
+                Ok(SeccompNetFallback::ProxyOnly { .. }) => 1, // wrong port
+                Ok(SeccompNetFallback::None) => 2,
+                Ok(SeccompNetFallback::BlockAll) => 3,
+                Err(_) => 4,
             };
             unsafe { libc::_exit(exit_code) };
         }
@@ -4163,15 +4185,14 @@ mod tests {
         assert_eq!(
             libc::WEXITSTATUS(status),
             0,
-            "Expected SeccompNetFallback::None on V4+ kernel, got exit code {}",
+            "Expected SeccompNetFallback::ProxyOnly on any kernel, got exit code {}",
             libc::WEXITSTATUS(status)
         );
     }
 
-    /// Integration test: ProxyOnly on pre-V4 kernel returns ProxyOnly fallback.
-    ///
-    /// Verifies that apply_with_abi() returns SeccompNetFallback::ProxyOnly
-    /// when the kernel's Landlock ABI lacks AccessNet.
+    /// ProxyOnly on a pre-V4 kernel (no AccessNet) also returns ProxyOnly fallback.
+    /// Redundant with `test_proxy_only_always_returns_seccomp_fallback` but kept
+    /// to pin the pre-V4 path explicitly.
     #[cfg(target_os = "linux")]
     #[test]
     fn test_proxy_only_without_landlock_net_returns_proxy_fallback() {
@@ -4179,12 +4200,6 @@ mod tests {
             Ok(d) => d,
             Err(_) => return,
         };
-
-        if detected.has_network() {
-            // V4+ kernel: Landlock handles it, fallback not used.
-            // This test only runs on pre-V4 kernels.
-            return;
-        }
 
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "fork() failed");

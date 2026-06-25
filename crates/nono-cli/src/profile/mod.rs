@@ -1450,6 +1450,13 @@ pub struct NetworkConfig {
         alias = "allow_port"
     )]
     pub open_port: Vec<u16>,
+    /// Inclusive localhost port ranges, e.g. `[[3000, 3100], [49152, 49200]]`.
+    ///
+    /// macOS: ranges ≤ 256 ports expand to individual Seatbelt rules; wider ranges
+    /// collapse to `localhost:*` with a warning. Bind/inbound are blanket-allowed.
+    /// Linux: expanded to individual Landlock rules. Works in both block-net and proxy mode.
+    #[serde(default)]
+    pub open_port_range: Vec<[u16; 2]>,
     /// TCP ports the sandboxed child may listen on.
     /// Equivalent to `--listen-port` CLI flag.
     #[serde(default)]
@@ -3135,6 +3142,10 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
                 &child.network.allow_domain,
             ),
             open_port: dedup_append(&base.network.open_port, &child.network.open_port),
+            open_port_range: dedup_append(
+                &base.network.open_port_range,
+                &child.network.open_port_range,
+            ),
             listen_port: dedup_append(&base.network.listen_port, &child.network.listen_port),
             connect_port: dedup_append(&base.network.connect_port, &child.network.connect_port),
             // Child `Some([])` overrides parent credentials to empty (disables proxy).
@@ -5323,6 +5334,7 @@ mod tests {
                 network_profile: InheritableValue::Set("base-net".to_string()),
                 allow_domain: vec![AllowDomainEntry::Plain("base.example.com".to_string())],
                 open_port: vec![3000],
+                open_port_range: vec![],
                 listen_port: vec![4000],
                 connect_port: vec![],
                 credentials: Some(vec!["base_cred".to_string()]),
@@ -5408,6 +5420,7 @@ mod tests {
                 network_profile: InheritableValue::Inherit,
                 allow_domain: vec![AllowDomainEntry::Plain("child.example.com".to_string())],
                 open_port: vec![3000, 5000],
+                open_port_range: vec![],
                 listen_port: vec![4000, 6000],
                 connect_port: vec![],
                 credentials: None,

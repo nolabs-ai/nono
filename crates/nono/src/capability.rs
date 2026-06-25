@@ -892,6 +892,9 @@ pub struct CapabilitySet {
     /// by destination IP. Use with `--block-net` or proxy mode to ensure
     /// only localhost is reachable.
     localhost_ports: Vec<u16>,
+    /// Inclusive port ranges `[start, end]` for localhost IPC.
+    /// See [`CapabilitySet::allow_localhost_port_range`] for platform behaviour.
+    localhost_port_ranges: Vec<(u16, u16)>,
     /// Commands explicitly allowed (overrides blocklists - for CLI use)
     allowed_commands: Vec<String>,
     /// Additional commands to block (extends blocklists - for CLI use)
@@ -1083,6 +1086,23 @@ impl CapabilitySet {
         self
     }
 
+    /// Allow localhost TCP connect and bind on ports `start..=end`.
+    ///
+    /// **macOS**: ranges ≤ 256 ports expand to individual Seatbelt
+    /// `(remote tcp "localhost:N")` rules. Wider ranges collapse to
+    /// `localhost:*` (logged as a warning — Seatbelt has no range syntax).
+    /// Bind/inbound are blanket-allowed when any port or range is set;
+    /// Seatbelt cannot filter bind by port.
+    ///
+    /// **Linux**: expanded to individual Landlock `ConnectTcp`/`BindTcp` rules.
+    /// Works in both block-net and proxy mode. In proxy mode the seccomp supervisor
+    /// also enforces loopback-only for connect.
+    #[must_use]
+    pub fn allow_localhost_port_range(mut self, start: u16, end: u16) -> Self {
+        self.localhost_port_ranges.push((start, end));
+        self
+    }
+
     /// Allow TCP connect to standard HTTPS ports (443, 8443)
     ///
     /// Convenience method. Linux Landlock V4+ only.
@@ -1238,6 +1258,11 @@ impl CapabilitySet {
     /// Localhost IPC port; `0` is macOS-only (`localhost:*` TCP outbound).
     pub fn add_localhost_port(&mut self, port: u16) {
         self.localhost_ports.push(port);
+    }
+
+    /// Add a localhost IPC port range `[start, end]` (inclusive).
+    pub fn add_localhost_port_range(&mut self, start: u16, end: u16) {
+        self.localhost_port_ranges.push((start, end));
     }
 
     /// Set sandbox extensions state
@@ -1414,6 +1439,12 @@ impl CapabilitySet {
     #[must_use]
     pub fn localhost_ports(&self) -> &[u16] {
         &self.localhost_ports
+    }
+
+    /// Localhost IPC port ranges (inclusive `[start, end]`).
+    #[must_use]
+    pub fn localhost_port_ranges(&self) -> &[(u16, u16)] {
+        &self.localhost_port_ranges
     }
 
     /// Check if sandbox extensions are enabled for runtime capability expansion

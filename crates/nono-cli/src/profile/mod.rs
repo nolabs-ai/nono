@@ -2956,6 +2956,7 @@ fn load_registry_profile(name_or_path: &str, cli_extends: &[String]) -> Result<P
                 registry: None,
                 force: false,
                 init: false,
+                insecure: false,
                 help: None,
             },
             crate::registry_client::PullReason::ProfileAuto,

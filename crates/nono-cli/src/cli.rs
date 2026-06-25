@@ -57,6 +57,7 @@ const STYLES: Styles = Styles::plain().header(Style::new().bold());
   unpin      Unpin a pack to re-include it in updates
   search     Search the registry for nono packs
   list       List installed nono packs
+  pack       Pack authoring/publishing utilities
 
 \x1b[1mPOLICY & PROFILES\x1b[0m
   policy     [deprecated] Use 'nono profile' instead
@@ -668,6 +669,21 @@ IN-BAND DETACH:
 ")]
     Outdated(OutdatedArgs),
 
+    /// Pack authoring/publishing utilities
+    #[command(help_template = "\
+{about}
+
+\x1b[1mUSAGE\x1b[0m
+  nono pack <command>
+
+{all-args}
+{after-help}")]
+    #[command(after_help = "\x1b[1mEXAMPLES\x1b[0m
+  nono pack publish-static my-org/my-pack --pack-dir ./dist --out ./registry
+                                               # Emit a static registry tree for nginx
+")]
+    Pack(PackCmdArgs),
+
     /// Generate shell completion scripts
     #[command(name = "completion")]
     #[command(help_template = "\
@@ -718,6 +734,62 @@ pub struct PullArgs {
     #[arg(long, help_heading = "OPTIONS")]
     pub init: bool,
 
+    /// Skip Sigstore signature verification (internal/air-gapped registry).
+    /// Integrity (SHA-256) is still checked; TLS is unaffected. Can also be
+    /// set fleet-wide via `[registry] verify = false` or NONO_REGISTRY_INSECURE.
+    #[arg(long, help_heading = "OPTIONS")]
+    pub insecure: bool,
+
+    /// Print help
+    #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
+    pub help: Option<bool>,
+}
+
+#[derive(Parser, Debug)]
+#[command(disable_help_flag = true)]
+pub struct PackCmdArgs {
+    #[command(subcommand)]
+    pub command: PackCommands,
+
+    /// Print help
+    #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
+    pub help: Option<bool>,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum PackCommands {
+    /// Generate a static registry tree (servable by nginx) for a built pack
+    PublishStatic(PackPublishStaticArgs),
+}
+
+#[derive(Parser, Debug)]
+#[command(disable_help_flag = true)]
+pub struct PackPublishStaticArgs {
+    /// Package reference (<namespace>/<name>)
+    pub package_ref: String,
+
+    /// Directory holding the built pack (package.json + artifact files)
+    #[arg(
+        long,
+        value_name = "DIR",
+        default_value = ".",
+        help_heading = "OPTIONS"
+    )]
+    pub pack_dir: PathBuf,
+
+    /// Output directory: the static registry docroot to write into
+    #[arg(long, value_name = "DIR", help_heading = "OPTIONS")]
+    pub out: PathBuf,
+
+    /// URL prefix prepended to artifact download URLs (e.g. "/nono"). Use when
+    /// the registry is served under a sub-path rather than the host root.
+    #[arg(long, value_name = "PATH", help_heading = "OPTIONS")]
+    pub base_path: Option<String>,
+
+    /// Override the version (defaults to `version` from package.json)
+    #[arg(long, value_name = "VERSION", help_heading = "OPTIONS")]
+    pub version: Option<String>,
+
     /// Print help
     #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
     pub help: Option<bool>,
@@ -765,6 +837,12 @@ pub struct UpdateArgs {
     /// Update pinned packs and accept signer changes
     #[arg(long, help_heading = "OPTIONS")]
     pub force: bool,
+
+    /// Skip Sigstore signature verification (internal/air-gapped registry).
+    /// Integrity (SHA-256) is still checked; TLS is unaffected. Can also be
+    /// set fleet-wide via `[registry] verify = false` or NONO_REGISTRY_INSECURE.
+    #[arg(long, help_heading = "OPTIONS")]
+    pub insecure: bool,
 
     /// Print help
     #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
@@ -4403,6 +4481,7 @@ mod tests {
         "remove",
         "update",
         "outdated",
+        "pack",
         "pin",
         "unpin",
         "search",

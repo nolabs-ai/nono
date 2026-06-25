@@ -1264,15 +1264,16 @@ pub(crate) fn prepare_proxy_launch_options(
         .map(|s| parse_allow_endpoint_arg(s))
         .collect::<nono::Result<Vec<_>>>()?;
 
-    let credentials_intent = if has_credentials || !custom_credentials.is_empty() || !endpoint_restrictions.is_empty() {
-        Some(CredentialProxyIntent {
-            credentials,
-            custom_credentials,
-            endpoint_restrictions,
-        })
-    } else {
-        None
-    };
+    let credentials_intent =
+        if has_credentials || !custom_credentials.is_empty() || !endpoint_restrictions.is_empty() {
+            Some(CredentialProxyIntent {
+                credentials,
+                custom_credentials,
+                endpoint_restrictions,
+            })
+        } else {
+            None
+        };
 
     let upstream_proxy = upstream_proxy_addr.map(|address| UpstreamProxyIntent {
         address,

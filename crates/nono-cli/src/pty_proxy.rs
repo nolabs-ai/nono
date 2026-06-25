@@ -1809,19 +1809,25 @@ fn drain_terminal_output(fd: RawFd) {
     }
 }
 
-/// Wait briefly for, then discard, a late terminal query reply on `fd`.
+/// Wait briefly for, then consume, a late cursor-position reply on `fd`.
 ///
 /// On final teardown an exiting TUI child may have just sent the terminal a
 /// cursor-position query (`ESC[6n`); the terminal's reply (`ESC[<row>;<col>R`)
 /// lands only after the child is gone, so nothing consumes it and it gets
-/// pasted into the next shell prompt (e.g. `3;1R`). A bare flush races the
-/// reply and loses, so wait up to `max_wait` for it to arrive, then flush the
-/// input queue in one shot.
+/// pasted into the next shell prompt (e.g. `3;1R`).
 ///
-/// MUST run while the terminal is still in raw mode. Any genuine type-ahead
-/// queued at exit is discarded along with the reply; on a final teardown that
-/// is safer than leaking control bytes to the shell. No-op when `fd` is not a
-/// terminal, so non-interactive runs pay no cost.
+/// Reads the input queue one byte at a time, up to `max_wait`, stopping as soon
+/// as the reply's `R` terminator is consumed. This is preferable to a single
+/// `tcflush`: `poll` wakes as soon as the first byte (the `ESC`) is readable, so
+/// on a link where the reply arrives fragmented (e.g. across packets over SSH) a
+/// flush would clear the head while the tail is still in transit and the tail
+/// would then leak to the shell. Re-polling for each byte waits out the whole
+/// sequence instead. Stopping at `R` also leaves any genuine type-ahead queued
+/// behind the reply for the shell, rather than discarding it.
+///
+/// MUST run while the terminal is still in raw mode, so the reply — which has no
+/// trailing newline — is readable. No-op when `fd` is not a terminal, so
+/// non-interactive runs pay no cost.
 fn discard_late_terminal_input(fd: RawFd, max_wait: Duration) {
     // SAFETY: `isatty` only inspects the borrowed fd and does not take ownership.
     if unsafe { libc::isatty(fd) } != 1 {
@@ -1831,17 +1837,44 @@ fn discard_late_terminal_input(fd: RawFd, max_wait: Duration) {
     // terminal has a chance to reply before we wait for it.
     drain_terminal_output(fd);
 
-    let timeout_ms = max_wait.as_millis().min(i32::MAX as u128) as i32;
-    let mut pfd = libc::pollfd {
-        fd,
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    // SAFETY: single-fd poll over the borrowed terminal fd.
-    if unsafe { libc::poll(&mut pfd, 1, timeout_ms) } > 0 {
-        // SAFETY: `fd` is the live terminal fd for the duration of the call.
-        let tty = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
-        let _ = nix::sys::termios::tcflush(tty, nix::sys::termios::FlushArg::TCIFLUSH);
+    let deadline = Instant::now() + max_wait;
+    loop {
+        let remaining = match deadline.checked_duration_since(Instant::now()) {
+            Some(d) if !d.is_zero() => d,
+            _ => break,
+        };
+        let timeout_ms = remaining.as_millis().min(i32::MAX as u128) as i32;
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: single-fd poll over the borrowed terminal fd.
+        let ready = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+        if ready <= 0 || (pfd.revents & libc::POLLIN) == 0 {
+            // Timed out, errored, or woke for a non-readable event (e.g. HUP):
+            // there is nothing (more) to consume.
+            break;
+        }
+
+        let mut byte = [0u8; 1];
+        // SAFETY: reads a single byte into a stack buffer we own; `fd` is live.
+        let n = unsafe { libc::read(fd, byte.as_mut_ptr().cast::<libc::c_void>(), 1) };
+        match n {
+            // Cursor-position reply terminator: the full sequence is consumed.
+            1 if byte[0] == b'R' => break,
+            // An earlier byte of the reply (ESC, `[`, digits, `;`): keep reading.
+            1 => continue,
+            // EOF: nothing left to read.
+            0 => break,
+            // Negative: retry on EINTR, otherwise give up.
+            _ => {
+                if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                break;
+            }
+        }
     }
 }
 
@@ -2530,17 +2563,7 @@ mod tests {
 
     #[test]
     fn discard_late_terminal_input_drains_pending_query_reply() {
-        use nix::sys::termios::{SetArg, cfmakeraw, tcgetattr, tcsetattr};
-
-        let ws: Option<Winsize> = None;
-        let OpenptyResult { master, slave } = openpty(ws.as_ref(), None).expect("openpty");
-
-        // Put the slave (the "terminal" side a child/shell reads) into raw mode
-        // so a reply without a trailing newline is pollable — this mirrors the
-        // terminal state at teardown, which is where the fix must run.
-        let mut attrs = tcgetattr(&slave).expect("tcgetattr");
-        cfmakeraw(&mut attrs);
-        tcsetattr(&slave, SetArg::TCSANOW, &attrs).expect("tcsetattr");
+        let OpenptyResult { master, slave } = raw_mode_pty();
 
         // Simulate the terminal answering a child's `ESC[6n` cursor-position
         // query after the child has gone: the reply lands in the input queue.
@@ -2557,6 +2580,74 @@ mod tests {
         // SAFETY: single-fd poll over the borrowed slave fd.
         let pending = unsafe { libc::poll(&mut pfd, 1, 50) };
         assert_eq!(pending, 0, "terminal input queue should have been drained");
+    }
+
+    /// Open a pty whose slave is in raw mode, mirroring the terminal state at
+    /// teardown where `discard_late_terminal_input` must run.
+    fn raw_mode_pty() -> OpenptyResult {
+        use nix::sys::termios::{SetArg, cfmakeraw, tcgetattr, tcsetattr};
+
+        let ws: Option<Winsize> = None;
+        let pair = openpty(ws.as_ref(), None).expect("openpty");
+        let mut attrs = tcgetattr(&pair.slave).expect("tcgetattr");
+        cfmakeraw(&mut attrs);
+        tcsetattr(&pair.slave, SetArg::TCSANOW, &attrs).expect("tcsetattr");
+        pair
+    }
+
+    #[test]
+    fn discard_late_terminal_input_preserves_type_ahead_behind_reply() {
+        let OpenptyResult { master, slave } = raw_mode_pty();
+
+        // The reply, immediately followed by a byte the user typed ahead.
+        nix::unistd::write(&master, b"\x1b[3;1Rx").expect("write reply + type-ahead");
+
+        discard_late_terminal_input(slave.as_raw_fd(), Duration::from_millis(500));
+
+        // Stopping at `R` must leave the typed `x` for the shell to read.
+        let mut buf = [0u8; 8];
+        let n = nix::unistd::read(&slave, &mut buf).expect("read leftover");
+        assert_eq!(
+            &buf[..n],
+            b"x",
+            "type-ahead behind the reply must be preserved"
+        );
+    }
+
+    #[test]
+    fn discard_late_terminal_input_waits_out_fragmented_reply() {
+        let OpenptyResult { master, slave } = raw_mode_pty();
+
+        // Deliver the reply in two fragments, as a slow/network tty might: a bare
+        // `tcflush` on the first `poll` wake would clear the head and leak the
+        // tail. Re-polling per byte must wait out the whole sequence.
+        //
+        // The writer borrows the master fd rather than owning it: `master` must
+        // stay open in this thread, otherwise closing it would raise `POLLHUP`
+        // on the slave and the final drained-queue poll would spuriously wake.
+        let master_fd = master.as_raw_fd();
+        let writer = thread::spawn(move || {
+            // SAFETY: `master` outlives this thread (joined below before drop).
+            let m = unsafe { std::os::fd::BorrowedFd::borrow_raw(master_fd) };
+            nix::unistd::write(m, b"\x1b[3;").expect("write head");
+            thread::sleep(Duration::from_millis(20));
+            nix::unistd::write(m, b"1R").expect("write tail");
+        });
+
+        discard_late_terminal_input(slave.as_raw_fd(), Duration::from_secs(2));
+        writer.join().expect("writer thread");
+
+        let mut pfd = libc::pollfd {
+            fd: slave.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: single-fd poll over the borrowed slave fd.
+        let pending = unsafe { libc::poll(&mut pfd, 1, 50) };
+        assert_eq!(
+            pending, 0,
+            "fragmented reply should have been fully consumed"
+        );
     }
 
     fn build_test_proxy_with_master(master: OwnedFd, sequence: &[u8]) -> PtyProxy {

@@ -31,6 +31,8 @@ pub struct UserConfig {
     #[serde(default)]
     pub updates: UpdateSettings,
     #[serde(default)]
+    pub registry: RegistrySettings,
+    #[serde(default)]
     pub ui: UiSettings,
     #[serde(default)]
     pub redaction: RedactionSettings,
@@ -288,6 +290,34 @@ impl Default for UpdateSettings {
     fn default() -> Self {
         Self {
             check: default_true(),
+        }
+    }
+}
+
+/// Pack registry settings.
+///
+/// Lets a fleet point `nono pull`/`nono update` at an internal registry and
+/// (for air-gapped, internal-trust deployments) disable Sigstore signature
+/// verification via a single MDM-managed `config.toml`. `verify` defaults to
+/// `true` (fail-secure): signature checks stay on unless explicitly disabled.
+/// Disabling `verify` turns off signature verification only — it does NOT
+/// disable TLS host verification.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RegistrySettings {
+    /// Default registry base URL. Lower precedence than `--registry` and the
+    /// `NONO_REGISTRY` env var; higher than the compiled-in default.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Whether to verify pack signatures (default: true).
+    #[serde(default = "default_true")]
+    pub verify: bool,
+}
+
+impl Default for RegistrySettings {
+    fn default() -> Self {
+        Self {
+            url: None,
+            verify: default_true(),
         }
     }
 }

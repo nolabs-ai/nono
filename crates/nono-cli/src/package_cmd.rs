@@ -1,13 +1,14 @@
 //! Pack command handlers.
 
 use crate::cli::{
-    ListArgs, OutdatedArgs, PinArgs, PullArgs, RemoveArgs, SearchArgs, UnpinArgs, UpdateArgs,
+    ListArgs, OutdatedArgs, PackCmdArgs, PackCommands, PackPublishStaticArgs, PinArgs, PullArgs,
+    RemoveArgs, SearchArgs, UnpinArgs, UpdateArgs,
 };
 use crate::package::{
     self, ArtifactEntry, ArtifactType, LockedArtifact, LockedPackage, PackageManifest,
-    PackageProvenance, PackageRef, PullResponse,
+    PackageProvenance, PackageRef, PullArtifact, PullResponse,
 };
-use crate::registry_client::{PullReason, RegistryClient, resolve_registry_url};
+use crate::registry_client::{PullReason, RegistryClient, resolve_registry, resolve_registry_url};
 use chrono::{DateTime, Local, Utc};
 use nono::{NonoError, Result, SignerIdentity};
 use semver::Version;
@@ -19,7 +20,9 @@ use tempfile::TempDir;
 
 pub fn run_pull(args: PullArgs, reason: PullReason) -> Result<()> {
     let package_ref = package::parse_package_ref(&args.package_ref)?;
-    let registry_url = resolve_registry_url(args.registry.as_deref());
+    let config = crate::config::user::load_user_config()?;
+    let reg = resolve_registry(args.registry.as_deref(), args.insecure, config.as_ref());
+    let registry_url = reg.url.clone();
     let client = RegistryClient::new(registry_url.clone());
 
     let requested_version = package_ref.version.as_deref().unwrap_or("latest");
@@ -42,11 +45,15 @@ pub fn run_pull(args: PullArgs, reason: PullReason) -> Result<()> {
     let printer = crate::pull_ui::ProgressPrinter::new(&pull);
     printer.header(&package_ref);
 
-    let downloads = download_and_verify_artifacts(&client, &package_ref, &pull, Some(&printer))?;
+    let downloads =
+        download_and_verify_artifacts(&client, &package_ref, &pull, reg.verify, Some(&printer))?;
     let manifest = load_manifest(&downloads.artifacts)?;
     validate_manifest(&manifest)?;
 
-    let signer_identity = signer_identity_uri(&downloads.signer_identity)?;
+    let signer_identity = match &downloads.signer_identity {
+        Some(identity) => signer_identity_uri(identity)?,
+        None => package::UNSIGNED_SIGNER_IDENTITY.to_string(),
+    };
     enforce_signer_pinning(
         lockfile.packages.get(&package_ref.key()),
         &signer_identity,
@@ -124,6 +131,207 @@ pub fn run_pull(args: PullArgs, reason: PullReason) -> Result<()> {
     }
 
     Ok(())
+}
+
+pub fn run_pack(args: PackCmdArgs) -> Result<()> {
+    match args.command {
+        PackCommands::PublishStatic(args) => run_pack_publish_static(args),
+    }
+}
+
+/// Emit a static registry tree (servable by a plain HTTP server such as nginx)
+/// for a single built pack. The layout mirrors the endpoints the pull/update
+/// client hits, but as flat files:
+///
+/// ```text
+/// <out>/api/v1/packages/<ns>/<name>/versions/<version>/pull   # PullResponse JSON
+/// <out>/api/v1/packages/<ns>/<name>/versions/latest/pull      # newest version (by semver)
+/// <out>/api/v1/packages/<ns>/<name>/status                    # {schema_version, latest}
+/// <out>/files/<ns>/<name>/<version>/<filename>                # artifact bytes
+/// ```
+///
+/// The emitted `PullResponse` omits Sigstore provenance and the bundle URL: the
+/// resulting packs are installed with `--insecure` / `[registry].verify=false`,
+/// integrity guaranteed by per-artifact SHA-256. Re-running for a new version
+/// is additive; the `latest` alias and `status` always point at the highest
+/// semver published under the pack.
+fn run_pack_publish_static(args: PackPublishStaticArgs) -> Result<()> {
+    let package_ref = package::parse_package_ref(&args.package_ref)?;
+    if package_ref.version.is_some() {
+        return Err(NonoError::PackageInstall(
+            "publish-static takes <namespace>/<name> without a version — use --version".to_string(),
+        ));
+    }
+
+    // Load + validate the manifest from the built pack directory.
+    let manifest_path = args.pack_dir.join("package.json");
+    let manifest_bytes = fs::read(&manifest_path).map_err(|e| {
+        NonoError::PackageInstall(format!("failed to read {}: {e}", manifest_path.display()))
+    })?;
+    let manifest: PackageManifest = serde_json::from_slice(&manifest_bytes).map_err(|e| {
+        NonoError::PackageInstall(format!("failed to parse package.json manifest: {e}"))
+    })?;
+    validate_manifest(&manifest)?;
+    validate_manifest_install_paths(&manifest)?;
+
+    let version = args
+        .version
+        .clone()
+        .or_else(|| manifest.version.clone())
+        .ok_or_else(|| {
+            NonoError::PackageInstall(
+                "no version: set `version` in package.json or pass --version".to_string(),
+            )
+        })?;
+    Version::parse(&version).map_err(|e| {
+        NonoError::PackageInstall(format!("version '{version}' is not valid semver: {e}"))
+    })?;
+
+    // The pull response advertises package.json plus every manifest artifact,
+    // matching what the download/install path expects to fetch by filename.
+    let mut filenames: Vec<String> = vec!["package.json".to_string()];
+    for artifact in &manifest.artifacts {
+        if artifact.path != "package.json" {
+            filenames.push(artifact.path.clone());
+        }
+    }
+
+    let base_path = args
+        .base_path
+        .as_deref()
+        .map(|p| format!("/{}", p.trim_matches('/')))
+        .filter(|p| p != "/")
+        .unwrap_or_default();
+
+    let files_root = args
+        .out
+        .join("files")
+        .join(&package_ref.namespace)
+        .join(&package_ref.name)
+        .join(&version);
+
+    let mut pull_artifacts = Vec::with_capacity(filenames.len());
+    for filename in &filenames {
+        validate_relative_path(filename)?;
+        let source = args.pack_dir.join(filename);
+        let bytes = fs::read(&source).map_err(|e| {
+            NonoError::PackageInstall(format!("failed to read artifact {}: {e}", source.display()))
+        })?;
+
+        let dest = files_root.join(filename);
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent).map_err(NonoError::Io)?;
+        }
+        fs::write(&dest, &bytes).map_err(NonoError::Io)?;
+
+        let digest = sha256_hex(&bytes);
+        let size_bytes = i64::try_from(bytes.len()).unwrap_or(i64::MAX);
+        pull_artifacts.push(PullArtifact {
+            filename: filename.clone(),
+            sha256_digest: digest,
+            size_bytes,
+            download_url: format!(
+                "{base_path}/files/{}/{}/{version}/{filename}",
+                package_ref.namespace, package_ref.name
+            ),
+        });
+    }
+
+    let pull = PullResponse {
+        namespace: package_ref.namespace.clone(),
+        name: package_ref.name.clone(),
+        version: version.clone(),
+        provenance: None,
+        artifacts: pull_artifacts,
+        bundle_url: String::new(),
+        scan_passed: true,
+    };
+
+    let versions_dir = args
+        .out
+        .join("api/v1/packages")
+        .join(&package_ref.namespace)
+        .join(&package_ref.name)
+        .join("versions");
+    let pull_json = serde_json::to_string_pretty(&pull).map_err(|e| {
+        NonoError::PackageInstall(format!("failed to serialize pull response: {e}"))
+    })?;
+    write_file(
+        &versions_dir.join(&version).join("pull"),
+        pull_json.as_bytes(),
+    )?;
+
+    // Recompute the `latest` alias + status across all published versions so a
+    // re-publish of an older version does not clobber a newer one.
+    let latest = highest_published_version(&versions_dir, &version)?;
+    let latest_pull = fs::read(versions_dir.join(&latest).join("pull")).map_err(NonoError::Io)?;
+    write_file(&versions_dir.join("latest").join("pull"), &latest_pull)?;
+
+    let status = serde_json::json!({ "schema_version": 1, "latest": latest });
+    let status_json = serde_json::to_string_pretty(&status)
+        .map_err(|e| NonoError::PackageInstall(format!("failed to serialize status: {e}")))?;
+    let status_path = args
+        .out
+        .join("api/v1/packages")
+        .join(&package_ref.namespace)
+        .join(&package_ref.name)
+        .join("status");
+    write_file(&status_path, status_json.as_bytes())?;
+
+    eprintln!(
+        "  published {} {} ({} artifact(s)) — latest: {}",
+        package_ref.key(),
+        version,
+        filenames.len(),
+        latest
+    );
+    eprintln!("  docroot: {}", args.out.display());
+
+    Ok(())
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+fn write_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(NonoError::Io)?;
+    }
+    fs::write(path, bytes).map_err(NonoError::Io)
+}
+
+/// Highest semver among the version directories already published under
+/// `versions_dir`, plus `current`. Non-semver and the `latest` alias are
+/// ignored. `current` is always a candidate even before its dir is listed.
+fn highest_published_version(versions_dir: &Path, current: &str) -> Result<String> {
+    let mut best = Version::parse(current).map_err(|e| {
+        NonoError::PackageInstall(format!("version '{current}' is not valid semver: {e}"))
+    })?;
+    let mut best_str = current.to_string();
+
+    if let Ok(entries) = fs::read_dir(versions_dir) {
+        for entry in entries.flatten() {
+            let Ok(name) = entry.file_name().into_string() else {
+                continue;
+            };
+            if name == "latest" {
+                continue;
+            }
+            if let Ok(parsed) = Version::parse(&name)
+                && parsed > best
+            {
+                best = parsed;
+                best_str = name;
+            }
+        }
+    }
+
+    Ok(best_str)
 }
 
 pub fn run_remove(args: RemoveArgs) -> Result<()> {
@@ -239,7 +447,9 @@ pub fn run_update(args: UpdateArgs) -> Result<()> {
         return Ok(());
     }
 
-    let registry_url = resolve_registry_url(args.registry.as_deref());
+    let config = crate::config::user::load_user_config()?;
+    let reg = resolve_registry(args.registry.as_deref(), args.insecure, config.as_ref());
+    let registry_url = reg.url.clone();
     let client = RegistryClient::new(registry_url.clone());
 
     // Collect the keys to process: either one specific pack or all installed.
@@ -338,6 +548,7 @@ pub fn run_update(args: UpdateArgs) -> Result<()> {
                             registry: args.registry.clone(),
                             force: args.force,
                             init: false,
+                            insecure: args.insecure,
                             help: None,
                         },
                         PullReason::Update,
@@ -507,7 +718,8 @@ pub fn run_outdated(args: OutdatedArgs) -> Result<()> {
         return Ok(());
     }
 
-    let registry_url = resolve_registry_url(args.registry.as_deref());
+    let config = crate::config::user::load_user_config()?;
+    let registry_url = resolve_registry(args.registry.as_deref(), false, config.as_ref()).url;
     let client = RegistryClient::new(registry_url);
 
     let mut entries: Vec<OutdatedEntry> = Vec::new();
@@ -592,8 +804,12 @@ struct DownloadedArtifact {
 
 struct VerifiedDownloads {
     _tempdir: TempDir,
-    bundle_json: String,
-    signer_identity: SignerIdentity,
+    /// `None` when the pack was installed without signature verification
+    /// (no Sigstore bundle to persist as `.nono-trust.bundle`).
+    bundle_json: Option<String>,
+    /// `None` for unsigned installs; the lockfile records the
+    /// [`package::UNSIGNED_SIGNER_IDENTITY`] sentinel instead.
+    signer_identity: Option<SignerIdentity>,
     artifacts: Vec<DownloadedArtifact>,
 }
 
@@ -646,48 +862,61 @@ fn download_and_verify_artifacts(
     client: &RegistryClient,
     package_ref: &PackageRef,
     pull: &PullResponse,
+    verify: bool,
     printer: Option<&crate::pull_ui::ProgressPrinter>,
 ) -> Result<VerifiedDownloads> {
-    let trusted_root = nono::trust::load_production_trusted_root()?;
-    let policy = nono::trust::VerificationPolicy::default();
     let bundle_path = Path::new(".nono-trust.bundle");
     let tempdir = TempDir::new().map_err(NonoError::Io)?;
 
-    // Download the single multi-subject bundle for this version
-    let bundle_json = client.download_bundle(&pull.bundle_url)?;
-    let bundle = nono::trust::load_bundle_from_str(&bundle_json, bundle_path)?;
+    // When verification is enabled, download the single multi-subject bundle,
+    // verify its signature against the embedded Sigstore root, and build the
+    // set of trusted subject digests. When disabled (internal/air-gapped
+    // registry), skip all of this — there is no bundle and no signer.
+    let (bundle_json, signer_identity, subject_digests) = if verify {
+        let trusted_root = nono::trust::load_production_trusted_root()?;
+        let policy = nono::trust::VerificationPolicy::default();
 
-    // Extract all subjects from the bundle for digest matching
-    let subjects = nono::trust::extract_all_subjects(&bundle, bundle_path)?;
-    let subject_digests: std::collections::HashMap<&str, &str> = subjects
-        .iter()
-        .map(|(name, digest)| (digest.as_str(), name.as_str()))
-        .collect();
+        let bundle_json = client.download_bundle(&pull.bundle_url)?;
+        let bundle = nono::trust::load_bundle_from_str(&bundle_json, bundle_path)?;
 
-    // Verify the bundle signature using the first subject's digest
-    if let Some((_, first_digest)) = subjects.first() {
-        nono::trust::verify_bundle_with_digest(
-            first_digest,
-            &bundle,
-            &trusted_root,
-            &policy,
-            bundle_path,
-        )?;
+        let subjects = nono::trust::extract_all_subjects(&bundle, bundle_path)?;
+        let subject_digests: std::collections::HashSet<String> =
+            subjects.iter().map(|(_, digest)| digest.clone()).collect();
+
+        if let Some((_, first_digest)) = subjects.first() {
+            nono::trust::verify_bundle_with_digest(
+                first_digest,
+                &bundle,
+                &trusted_root,
+                &policy,
+                bundle_path,
+            )?;
+        } else {
+            return Err(NonoError::PackageVerification {
+                package: package_ref.key(),
+                reason: "bundle contains no subjects".to_string(),
+            });
+        }
+
+        let signer_identity = nono::trust::extract_signer_identity(&bundle, bundle_path)?;
+        enforce_namespace_assertion(package_ref, &signer_identity)?;
+
+        (
+            Some(bundle_json),
+            Some(signer_identity),
+            Some(subject_digests),
+        )
     } else {
-        return Err(NonoError::PackageVerification {
-            package: package_ref.key(),
-            reason: "bundle contains no subjects".to_string(),
-        });
-    }
-
-    let signer_identity = nono::trust::extract_signer_identity(&bundle, bundle_path)?;
-    enforce_namespace_assertion(package_ref, &signer_identity)?;
+        (None, None, None)
+    };
 
     let mut downloads = Vec::with_capacity(pull.artifacts.len());
 
     for artifact in &pull.artifacts {
         let path = tempdir.path().join(&artifact.filename);
         let digest = client.download_artifact_to_path(&artifact.download_url, &path)?;
+        // Integrity check always runs, signed or not: the digest must match
+        // what the (static) registry advertised in the pull response.
         if digest != artifact.sha256_digest {
             return Err(NonoError::PackageVerification {
                 package: package_ref.key(),
@@ -698,8 +927,11 @@ fn download_and_verify_artifacts(
             });
         }
 
-        // Verify this artifact's digest is a subject in the bundle
-        if !subject_digests.contains_key(digest.as_str()) {
+        // When verifying, also require the digest to be a signed subject of
+        // the bundle. Skipped for unsigned installs.
+        if let Some(subject_digests) = &subject_digests
+            && !subject_digests.contains(digest.as_str())
+        {
             return Err(NonoError::PackageVerification {
                 package: package_ref.key(),
                 reason: format!(
@@ -866,11 +1098,17 @@ fn write_supporting_artifacts(
         .map(|artifact| (artifact.filename.as_str(), artifact))
         .collect::<HashMap<_, _>>();
 
+    // Unsigned installs (internal/air-gapped registry) carry no Sigstore
+    // bundle, so there is nothing to persist as `.nono-trust.bundle`. The
+    // run-time pack verification keys off the lockfile sentinel instead.
+    let Some(bundle_json) = downloads.bundle_json.as_deref() else {
+        return Ok(());
+    };
+
     // Write per-artifact bundles into a single JSON array at the pack root
-    let bundle =
-        serde_json::from_str::<serde_json::Value>(&downloads.bundle_json).map_err(|e| {
-            NonoError::PackageInstall(format!("failed to parse trust bundle from registry: {e}"))
-        })?;
+    let bundle = serde_json::from_str::<serde_json::Value>(bundle_json).map_err(|e| {
+        NonoError::PackageInstall(format!("failed to parse trust bundle from registry: {e}"))
+    })?;
     let mut bundles: Vec<serde_json::Value> = Vec::new();
     if let Some(package_json) = downloaded_by_name.get("package.json") {
         bundles.push(serde_json::json!({
@@ -1044,17 +1282,28 @@ fn update_lockfile(
             version: pull.version.clone(),
             installed_at: Utc::now().to_rfc3339(),
             pinned: was_pinned,
-            provenance: Some(PackageProvenance {
-                signer_identity: signer_identity.to_string(),
-                repository: pull.provenance.repository.clone(),
-                workflow: pull.provenance.workflow.clone(),
-                git_ref: pull.provenance.git_ref.clone(),
-                rekor_log_index: pull.provenance.rekor_log_index.unwrap_or_default() as u64,
-                signed_at: pull
-                    .provenance
-                    .signed_at
-                    .map(|dt| dt.to_rfc3339())
-                    .unwrap_or_else(|| Utc::now().to_rfc3339()),
+            provenance: Some(match &pull.provenance {
+                Some(prov) => PackageProvenance {
+                    signer_identity: signer_identity.to_string(),
+                    repository: prov.repository.clone(),
+                    workflow: prov.workflow.clone(),
+                    git_ref: prov.git_ref.clone(),
+                    rekor_log_index: prov.rekor_log_index.unwrap_or_default() as u64,
+                    signed_at: prov
+                        .signed_at
+                        .map(|dt| dt.to_rfc3339())
+                        .unwrap_or_else(|| Utc::now().to_rfc3339()),
+                },
+                // Unsigned install: record the sentinel identity so run-time
+                // pack verification knows to skip Sigstore re-verification.
+                None => PackageProvenance {
+                    signer_identity: signer_identity.to_string(),
+                    repository: package_ref.key(),
+                    workflow: String::new(),
+                    git_ref: String::new(),
+                    rekor_log_index: 0,
+                    signed_at: Utc::now().to_rfc3339(),
+                },
             }),
             artifacts,
             wiring_record: wiring_record.to_vec(),
@@ -1296,5 +1545,89 @@ mod tests {
 
         assert_eq!(prerelease_vs_stable, Ordering::Less);
         assert_eq!(stable_vs_prerelease, Ordering::Greater);
+    }
+
+    fn write_pack(pack_dir: &Path, version: &str) {
+        fs::create_dir_all(pack_dir).expect("pack dir");
+        let manifest =
+            format!(r#"{{ "schema_version": 1, "name": "widget", "version": "{version}" }}"#);
+        fs::write(pack_dir.join("package.json"), manifest).expect("write manifest");
+    }
+
+    fn publish(pack_dir: &Path, out: &Path) {
+        run_pack_publish_static(PackPublishStaticArgs {
+            package_ref: "acme/widget".to_string(),
+            pack_dir: pack_dir.to_path_buf(),
+            out: out.to_path_buf(),
+            base_path: None,
+            version: None,
+            help: None,
+        })
+        .expect("publish-static");
+    }
+
+    #[test]
+    fn publish_static_round_trips_pull_response() {
+        let tmp = TempDir::new().expect("tmpdir");
+        let pack_dir = tmp.path().join("pack");
+        write_pack(&pack_dir, "1.0.0");
+        let out = tmp.path().join("registry");
+        publish(&pack_dir, &out);
+
+        // The emitted pull response deserializes and its advertised digest
+        // matches the served artifact bytes.
+        let pull_path = out.join("api/v1/packages/acme/widget/versions/1.0.0/pull");
+        let pull: PullResponse =
+            serde_json::from_slice(&fs::read(&pull_path).expect("read pull")).expect("parse pull");
+        assert_eq!(pull.namespace, "acme");
+        assert_eq!(pull.version, "1.0.0");
+        assert!(pull.provenance.is_none());
+        assert!(pull.bundle_url.is_empty());
+
+        let art = pull
+            .artifacts
+            .iter()
+            .find(|a| a.filename == "package.json")
+            .expect("package.json artifact");
+        let served = out.join(art.download_url.trim_start_matches('/'));
+        let bytes = fs::read(&served).expect("read served file");
+        assert_eq!(sha256_hex(&bytes), art.sha256_digest);
+
+        // latest alias + status are present and point at the published version.
+        assert!(
+            out.join("api/v1/packages/acme/widget/versions/latest/pull")
+                .exists()
+        );
+        let status: serde_json::Value = serde_json::from_slice(
+            &fs::read(out.join("api/v1/packages/acme/widget/status")).expect("read status"),
+        )
+        .expect("parse status");
+        assert_eq!(status["latest"], "1.0.0");
+    }
+
+    #[test]
+    fn publish_static_latest_tracks_highest_semver() {
+        let tmp = TempDir::new().expect("tmpdir");
+        let out = tmp.path().join("registry");
+
+        write_pack(&tmp.path().join("p100"), "1.0.0");
+        publish(&tmp.path().join("p100"), &out);
+        write_pack(&tmp.path().join("p102"), "1.0.2");
+        publish(&tmp.path().join("p102"), &out);
+        // Re-publishing an older version must not regress `latest`.
+        publish(&tmp.path().join("p100"), &out);
+
+        let status: serde_json::Value = serde_json::from_slice(
+            &fs::read(out.join("api/v1/packages/acme/widget/status")).expect("read status"),
+        )
+        .expect("parse status");
+        assert_eq!(status["latest"], "1.0.2");
+
+        let latest: PullResponse = serde_json::from_slice(
+            &fs::read(out.join("api/v1/packages/acme/widget/versions/latest/pull"))
+                .expect("read latest"),
+        )
+        .expect("parse latest");
+        assert_eq!(latest.version, "1.0.2");
     }
 }

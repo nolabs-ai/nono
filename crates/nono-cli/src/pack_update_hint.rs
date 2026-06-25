@@ -299,7 +299,17 @@ fn is_opted_out() -> bool {
     if std::env::var(NO_PACK_UPDATE_HINTS_ENV).is_ok() {
         return true;
     }
-    crate::update_check::update_check_opted_out()
+    if crate::update_check::update_check_opted_out() {
+        return true;
+    }
+    // Also opt out when signature verification is disabled: that is the
+    // air-gapped / internal-registry posture, where the static registry
+    // does not serve the status endpoint and a background hint check would
+    // just time out on an unreachable host.
+    matches!(
+        crate::config::user::load_user_config(),
+        Ok(Some(config)) if !config.registry.verify
+    )
 }
 
 fn is_newer(installed: &str, latest: &str) -> bool {

@@ -204,6 +204,9 @@ fn build_launch_options(args: &ProxyArgs) -> Result<ProxyLaunchOptions> {
         Some(CredentialProxyIntent {
             credentials,
             custom_credentials,
+            // The standalone proxy command has no `--allow-endpoint` flag, so
+            // there are no per-credential endpoint restrictions to apply.
+            endpoint_restrictions: Vec::new(),
         })
     };
 

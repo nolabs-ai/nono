@@ -1,10 +1,11 @@
 use crate::command_display::format_command_line;
 use crate::diagnostic::{ErrorObservation, PolicyExplanation};
+use crate::exec_strategy::ProfileSaveOffer;
 use crate::theme;
 use crate::{profile, query_ext};
 use colored::Colorize;
 use nono::SandboxViolation;
-use nono::{AccessMode, CapabilitySet, NonoError, Result};
+use nono::{AccessMode, CapabilitySet, NonoError, Result, UrlDenialReason, UrlDenialRecord};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -88,12 +89,47 @@ impl ProfileSection {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UrlItemKind {
+    Origin,
+    Localhost,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UrlItemAction {
+    Grant,
+    Skip,
+}
+
+impl UrlItemAction {
+    fn cycle(self) -> Self {
+        match self {
+            Self::Grant => Self::Skip,
+            Self::Skip => Self::Grant,
+        }
+    }
+
+    fn padded_label(self) -> &'static str {
+        match self {
+            Self::Grant => "grant   ",
+            Self::Skip => "skip    ",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
-struct DenialItem {
-    path: String,
-    section: ProfileSection,
-    is_bypass: bool,
-    action: ItemAction,
+enum DenialItem {
+    Fs {
+        path: String,
+        section: ProfileSection,
+        is_bypass: bool,
+        action: ItemAction,
+    },
+    Url {
+        origin: String,
+        kind: UrlItemKind,
+        action: UrlItemAction,
+    },
 }
 
 const DENIAL_SELECTOR_MAX_VISIBLE_ITEMS: usize = 15;
@@ -135,7 +171,7 @@ fn extract_denial_items(patch: &profile::Profile) -> Vec<DenialItem> {
     for (paths, section) in sections {
         for path in *paths {
             let is_bypass = fs.bypass_protection.contains(path);
-            items.push(DenialItem {
+            items.push(DenialItem::Fs {
                 path: path.clone(),
                 section: *section,
                 is_bypass,
@@ -145,12 +181,30 @@ fn extract_denial_items(patch: &profile::Profile) -> Vec<DenialItem> {
     }
 
     for rule in &patch.unsafe_macos_seatbelt_rules {
-        items.push(DenialItem {
+        items.push(DenialItem::Fs {
             path: rule.clone(),
             section: ProfileSection::UnsafeSeatbelt,
             is_bypass: false,
             action: ItemAction::Grant,
         });
+    }
+
+    // URL items from open_urls patch
+    if let Some(ref open_urls) = patch.open_urls {
+        if open_urls.allow_localhost {
+            items.push(DenialItem::Url {
+                origin: String::new(),
+                kind: UrlItemKind::Localhost,
+                action: UrlItemAction::Grant,
+            });
+        }
+        for origin in &open_urls.allow_origins {
+            items.push(DenialItem::Url {
+                origin: origin.clone(),
+                kind: UrlItemKind::Origin,
+                action: UrlItemAction::Grant,
+            });
+        }
     }
 
     items
@@ -176,31 +230,31 @@ pub(crate) fn terminal_prompts_available() -> bool {
         || std::fs::File::open("/dev/tty").is_ok()
 }
 
-pub(crate) fn offer_save_run_profile(
-    policy_explanations: &[PolicyExplanation],
-    error_observation: &ErrorObservation,
-    caps: &CapabilitySet,
-    command: &[String],
-    compared_profile: Option<&str>,
-    sandbox_violations: &[SandboxViolation],
-    ignored_denial_paths: &[PathBuf],
-) -> Result<()> {
+pub(crate) fn offer_save_run_profile(offer: &ProfileSaveOffer<'_>) -> Result<()> {
     if !terminal_prompts_available() {
         return Ok(());
     }
 
-    let Some(patch) = build_run_profile_patch(
-        policy_explanations,
-        error_observation,
-        caps,
-        sandbox_violations,
-        ignored_denial_paths,
+    let Some(mut patch) = build_run_profile_patch(
+        offer.policy_explanations,
+        offer.error_observation,
+        offer.caps,
+        offer.sandbox_violations,
+        offer.ignored_denial_paths,
     )?
     else {
-        return Ok(());
+        // No filesystem patch — but we may still have URL denials
+        return offer_url_only_save(offer.url_denials, offer.command, offer.compared_profile);
     };
 
-    let cmd_name = command_name(command)?;
+    // Merge URL grants into the filesystem patch profile so extract_denial_items
+    // picks them up alongside filesystem items. The URL patch only sets
+    // open_urls, so merging touches nothing else in the filesystem patch.
+    if let Some(url_patch) = build_url_patch(offer.url_denials) {
+        merge_profile_patch(&mut patch, &url_patch);
+    }
+
+    let cmd_name = command_name(offer.command)?;
 
     // Try the interactive selector first; fall back to the text prompt when
     // raw mode is unavailable (e.g. a dumb terminal or a redirected TTY).
@@ -209,9 +263,41 @@ pub(crate) fn offer_save_run_profile(
             let Some(combined_patch) = build_combined_patch_from_items(&items) else {
                 return Ok(());
             };
+            offer_save_with_patch(
+                &combined_patch,
+                &cmd_name,
+                offer.command,
+                offer.compared_profile,
+            )
+        }
+        None => offer_save_text_prompt(&patch, &cmd_name, offer.command, offer.compared_profile),
+    }
+}
+
+/// Offer profile save when only URL denials exist (no filesystem patch).
+fn offer_url_only_save(
+    url_denials: &[UrlDenialRecord],
+    command: &[String],
+    compared_profile: Option<&str>,
+) -> Result<()> {
+    if url_denials.is_empty() {
+        return Ok(());
+    }
+
+    let Some(url_patch) = build_url_patch(url_denials) else {
+        return Ok(());
+    };
+
+    let cmd_name = command_name(command)?;
+
+    match interactive_denial_selector(&url_patch)? {
+        Some(items) => {
+            let Some(combined_patch) = build_combined_patch_from_items(&items) else {
+                return Ok(());
+            };
             offer_save_with_patch(&combined_patch, &cmd_name, command, compared_profile)
         }
-        None => offer_save_text_prompt(&patch, &cmd_name, command, compared_profile),
+        None => offer_save_text_prompt(&url_patch, &cmd_name, command, compared_profile),
     }
 }
 
@@ -1120,40 +1206,89 @@ fn render_denial_selector(
             " ".to_string()
         };
 
-        let action_str = match item.action {
-            ItemAction::Grant => {
-                format!("{}", theme::fg(item.action.padded_label(), t.green).bold())
+        match item {
+            DenialItem::Fs {
+                path,
+                section,
+                is_bypass,
+                action,
+            } => {
+                let action_str = match action {
+                    ItemAction::Grant => {
+                        format!("{}", theme::fg(action.padded_label(), t.green).bold())
+                    }
+                    ItemAction::Suppress => {
+                        format!("{}", theme::fg(action.padded_label(), t.yellow))
+                    }
+                    ItemAction::Skip => {
+                        format!("{}", theme::fg(action.padded_label(), t.overlay))
+                    }
+                };
+
+                let bypass_prefix = if *is_bypass {
+                    format!("{} ", "⚠".red())
+                } else {
+                    String::new()
+                };
+
+                let path_str = if selected {
+                    format!("{}", theme::fg(path, t.text).bold())
+                } else {
+                    format!("{}", theme::fg(path, t.subtext))
+                };
+
+                let label_str = format!("  ({})", theme::fg(section.display_label(), t.overlay));
+
+                tty_ln!(
+                    "  {}  {}  {}{}{}",
+                    cursor_glyph,
+                    action_str,
+                    bypass_prefix,
+                    path_str,
+                    label_str
+                );
             }
-            ItemAction::Suppress => {
-                format!("{}", theme::fg(item.action.padded_label(), t.yellow))
+            DenialItem::Url {
+                origin,
+                kind,
+                action,
+            } => {
+                let action_str = match action {
+                    UrlItemAction::Grant => {
+                        format!("{}", theme::fg(action.padded_label(), t.green).bold())
+                    }
+                    UrlItemAction::Skip => {
+                        format!("{}", theme::fg(action.padded_label(), t.overlay))
+                    }
+                };
+
+                let (display_origin, label_str) = match kind {
+                    UrlItemKind::Origin => {
+                        let origin_display = if selected {
+                            format!("{}", theme::fg(origin, t.text).bold())
+                        } else {
+                            format!("{}", theme::fg(origin, t.subtext))
+                        };
+                        (
+                            origin_display,
+                            format!("  ({})", theme::fg("open-url origin", t.overlay)),
+                        )
+                    }
+                    UrlItemKind::Localhost => (
+                        String::new(),
+                        format!("  ({})", theme::fg("allow-localhost", t.overlay)),
+                    ),
+                };
+
+                tty_ln!(
+                    "  {}  {}  {}{}",
+                    cursor_glyph,
+                    action_str,
+                    display_origin,
+                    label_str
+                );
             }
-            ItemAction::Skip => {
-                format!("{}", theme::fg(item.action.padded_label(), t.overlay))
-            }
-        };
-
-        let bypass_prefix = if item.is_bypass {
-            format!("{} ", "⚠".red())
-        } else {
-            String::new()
-        };
-
-        let path_str = if selected {
-            format!("{}", theme::fg(&item.path, t.text).bold())
-        } else {
-            format!("{}", theme::fg(&item.path, t.subtext))
-        };
-
-        let label_str = format!("  ({})", theme::fg(item.section.display_label(), t.overlay));
-
-        tty_ln!(
-            "  {}  {}  {}{}{}",
-            cursor_glyph,
-            action_str,
-            bypass_prefix,
-            path_str,
-            label_str
-        );
+        }
     }
 
     tty_ln!("");
@@ -1216,35 +1351,53 @@ fn interactive_denial_selector(patch: &profile::Profile) -> Result<Option<Vec<De
                     cursor += 1;
                 }
             }
-            Key::Space => {
-                let next = items[cursor].action.cycle();
-                // UnsafeSeatbelt items have no suppress mechanism — skip that state
-                items[cursor].action = if items[cursor].section == ProfileSection::UnsafeSeatbelt
-                    && next == ItemAction::Suppress
-                {
-                    next.cycle()
-                } else {
-                    next
-                };
-            }
+            Key::Space => match &mut items[cursor] {
+                DenialItem::Fs {
+                    action, section, ..
+                } => {
+                    let mut next = action.cycle();
+                    if *section == ProfileSection::UnsafeSeatbelt && next == ItemAction::Suppress {
+                        next = next.cycle();
+                    }
+                    *action = next;
+                }
+                DenialItem::Url { action, .. } => {
+                    *action = action.cycle();
+                }
+            },
             Key::Char('a') => {
                 for item in &mut items {
-                    item.action = ItemAction::Grant;
+                    match item {
+                        DenialItem::Fs { action, .. } => *action = ItemAction::Grant,
+                        DenialItem::Url { action, .. } => *action = UrlItemAction::Grant,
+                    }
                 }
             }
             Key::Char('d') => {
                 for item in &mut items {
-                    item.action = if item.section == ProfileSection::UnsafeSeatbelt {
-                        ItemAction::Skip
-                    } else {
-                        ItemAction::Suppress
-                    };
+                    match item {
+                        DenialItem::Fs {
+                            action, section, ..
+                        } => {
+                            *action = if *section == ProfileSection::UnsafeSeatbelt {
+                                ItemAction::Skip
+                            } else {
+                                ItemAction::Suppress
+                            };
+                        }
+                        // URL items are not suppressible; deny-all skips them
+                        // so Enter cannot accidentally grant the default Grant.
+                        DenialItem::Url { action, .. } => *action = UrlItemAction::Skip,
+                    }
                 }
             }
             Key::Enter => break,
             Key::CtrlC | Key::Char('\x1b') => {
                 for item in &mut items {
-                    item.action = ItemAction::Skip;
+                    match item {
+                        DenialItem::Fs { action, .. } => *action = ItemAction::Skip,
+                        DenialItem::Url { action, .. } => *action = UrlItemAction::Skip,
+                    }
                 }
                 break;
             }
@@ -1259,49 +1412,79 @@ fn interactive_denial_selector(patch: &profile::Profile) -> Result<Option<Vec<De
 // ─── Build patch from per-item decisions ──────────────────────────────────
 
 fn build_combined_patch_from_items(items: &[DenialItem]) -> Option<profile::Profile> {
-    let has_grants = items.iter().any(|i| i.action == ItemAction::Grant);
-    let has_suppresses = items
-        .iter()
-        .any(|i| i.action == ItemAction::Suppress && i.section != ProfileSection::UnsafeSeatbelt);
+    let has_grants = items.iter().any(|i| match i {
+        DenialItem::Fs { action, .. } => *action == ItemAction::Grant,
+        DenialItem::Url { action, .. } => *action == UrlItemAction::Grant,
+    });
+    let has_suppresses = items.iter().any(|i| {
+        matches!(i, DenialItem::Fs { action: ItemAction::Suppress, section, .. } if *section != ProfileSection::UnsafeSeatbelt)
+    });
 
     if !has_grants && !has_suppresses {
         return None;
     }
 
     let mut patch = profile::Profile::default();
+    let mut origin_grants: Vec<String> = Vec::new();
+    let mut localhost_grant = false;
 
     for item in items {
-        match item.action {
-            ItemAction::Grant => {
-                match item.section {
-                    ProfileSection::Allow => patch.filesystem.allow.push(item.path.clone()),
-                    ProfileSection::Read => patch.filesystem.read.push(item.path.clone()),
-                    ProfileSection::Write => patch.filesystem.write.push(item.path.clone()),
-                    ProfileSection::AllowFile => {
-                        patch.filesystem.allow_file.push(item.path.clone())
+        match item {
+            DenialItem::Fs {
+                path,
+                section,
+                is_bypass,
+                action,
+            } => match action {
+                ItemAction::Grant => {
+                    match section {
+                        ProfileSection::Allow => patch.filesystem.allow.push(path.clone()),
+                        ProfileSection::Read => patch.filesystem.read.push(path.clone()),
+                        ProfileSection::Write => patch.filesystem.write.push(path.clone()),
+                        ProfileSection::AllowFile => patch.filesystem.allow_file.push(path.clone()),
+                        ProfileSection::ReadFile => patch.filesystem.read_file.push(path.clone()),
+                        ProfileSection::WriteFile => patch.filesystem.write_file.push(path.clone()),
+                        ProfileSection::UnsafeSeatbelt => {
+                            patch.unsafe_macos_seatbelt_rules.push(path.clone())
+                        }
                     }
-                    ProfileSection::ReadFile => patch.filesystem.read_file.push(item.path.clone()),
-                    ProfileSection::WriteFile => {
-                        patch.filesystem.write_file.push(item.path.clone())
-                    }
-                    ProfileSection::UnsafeSeatbelt => {
-                        patch.unsafe_macos_seatbelt_rules.push(item.path.clone())
+                    if *is_bypass && !patch.filesystem.bypass_protection.contains(path) {
+                        patch.filesystem.bypass_protection.push(path.clone());
                     }
                 }
-                if item.is_bypass && !patch.filesystem.bypass_protection.contains(&item.path) {
-                    patch.filesystem.bypass_protection.push(item.path.clone());
+                ItemAction::Suppress => {
+                    if *section != ProfileSection::UnsafeSeatbelt {
+                        patch.filesystem.suppress_save_prompt.push(path.clone());
+                    }
+                }
+                ItemAction::Skip => {}
+            },
+            DenialItem::Url {
+                origin,
+                kind,
+                action,
+            } => {
+                if *action == UrlItemAction::Grant {
+                    match kind {
+                        UrlItemKind::Origin => {
+                            if !origin.is_empty() && !origin_grants.contains(origin) {
+                                origin_grants.push(origin.clone());
+                            }
+                        }
+                        UrlItemKind::Localhost => {
+                            localhost_grant = true;
+                        }
+                    }
                 }
             }
-            ItemAction::Suppress => {
-                if item.section != ProfileSection::UnsafeSeatbelt {
-                    patch
-                        .filesystem
-                        .suppress_save_prompt
-                        .push(item.path.clone());
-                }
-            }
-            ItemAction::Skip => {}
         }
+    }
+
+    if !origin_grants.is_empty() || localhost_grant {
+        patch.open_urls = Some(profile::OpenUrlConfig {
+            allow_origins: origin_grants,
+            allow_localhost: localhost_grant,
+        });
     }
 
     Some(patch)
@@ -1509,6 +1692,7 @@ fn patch_is_suppression_only(patch: &profile::Profile) -> bool {
         && patch.filesystem.write_file.is_empty()
         && patch.filesystem.bypass_protection.is_empty()
         && patch.unsafe_macos_seatbelt_rules.is_empty()
+        && patch.open_urls.is_none()
 }
 
 fn build_suppress_save_prompt_patch(grant_patch: &profile::Profile) -> Option<profile::Profile> {
@@ -1642,6 +1826,60 @@ pub(crate) fn merge_profile_patch(profile: &mut profile::Profile, patch: &profil
         &profile.unsafe_macos_seatbelt_rules,
         &patch.unsafe_macos_seatbelt_rules,
     );
+
+    // Merge open_urls: origins are dedup-appended, allow_localhost is monotonic (false -> true only)
+    if let Some(ref patch_urls) = patch.open_urls
+        && (patch_urls.allow_localhost || !patch_urls.allow_origins.is_empty())
+    {
+        let urls = profile
+            .open_urls
+            .get_or_insert_with(|| profile::OpenUrlConfig {
+                allow_origins: Vec::new(),
+                allow_localhost: false,
+            });
+        urls.allow_origins = profile::dedup_append(&urls.allow_origins, &patch_urls.allow_origins);
+        // Monotonic: only flip false -> true, never true -> false
+        if patch_urls.allow_localhost {
+            urls.allow_localhost = true;
+        }
+    }
+}
+
+/// Build a profile patch containing only open_urls fields from URL denial records.
+///
+/// The resulting profile is merged into the filesystem profile patch before
+/// `extract_denial_items`, so URL items appear in the same selector alongside
+/// filesystem items without changing any existing function signatures.
+pub(crate) fn build_url_patch(url_denials: &[UrlDenialRecord]) -> Option<profile::Profile> {
+    let mut origin_grants: Vec<String> = Vec::new();
+    let mut localhost_grant = false;
+
+    for record in url_denials {
+        match record.reason {
+            UrlDenialReason::OriginNotAllowed
+                if !record.origin.is_empty() && !origin_grants.contains(&record.origin) =>
+            {
+                origin_grants.push(record.origin.clone());
+            }
+            UrlDenialReason::LocalhostNotAllowed => {
+                localhost_grant = true;
+            }
+            _ => {}
+        }
+    }
+
+    if origin_grants.is_empty() && !localhost_grant {
+        return None;
+    }
+
+    let patch = profile::Profile {
+        open_urls: Some(profile::OpenUrlConfig {
+            allow_origins: origin_grants,
+            allow_localhost: localhost_grant,
+        }),
+        ..Default::default()
+    };
+    Some(patch)
 }
 
 pub(crate) fn shorten_path_for_profile(path: &Path, home_path: &Path) -> String {
@@ -2349,5 +2587,243 @@ mod tests {
                     .starts_with(".profile.json.tmp.")
             });
         assert!(!leftover, "temp file should be renamed into place");
+    }
+
+    // ─── URL denial patch tests ───────────────────────────────────────────
+
+    fn url_record(origin: &str, reason: UrlDenialReason) -> UrlDenialRecord {
+        UrlDenialRecord {
+            origin: origin.to_string(),
+            reason,
+        }
+    }
+
+    #[test]
+    fn build_url_patch_returns_none_for_empty_input() {
+        // Non-fixable denials never become records, so an empty slice models a
+        // run where only non-fixable URL opens were rejected: no patch.
+        assert!(build_url_patch(&[]).is_none());
+    }
+
+    #[test]
+    fn build_url_patch_collects_origin_grants_deduplicated() {
+        let denials = vec![
+            url_record(
+                "https://accounts.google.com",
+                UrlDenialReason::OriginNotAllowed,
+            ),
+            url_record(
+                "https://accounts.google.com",
+                UrlDenialReason::OriginNotAllowed,
+            ),
+            url_record("https://github.com", UrlDenialReason::OriginNotAllowed),
+        ];
+        let patch = build_url_patch(&denials).expect("patch for origin denials");
+        let urls = patch.open_urls.expect("open_urls set");
+        assert_eq!(
+            urls.allow_origins,
+            vec!["https://accounts.google.com", "https://github.com"]
+        );
+        assert!(!urls.allow_localhost);
+    }
+
+    #[test]
+    fn build_url_patch_enables_localhost_for_localhost_denial() {
+        let denials = vec![
+            // Localhost record carries empty origin.
+            url_record("", UrlDenialReason::LocalhostNotAllowed),
+            url_record("", UrlDenialReason::LocalhostNotAllowed),
+        ];
+        let patch = build_url_patch(&denials).expect("patch for localhost denial");
+        let urls = patch.open_urls.expect("open_urls set");
+        assert!(urls.allow_origins.is_empty());
+        assert!(urls.allow_localhost);
+    }
+
+    #[test]
+    fn build_url_patch_combines_origins_and_localhost() {
+        let denials = vec![
+            url_record(
+                "https://oauth.example.com",
+                UrlDenialReason::OriginNotAllowed,
+            ),
+            url_record("", UrlDenialReason::LocalhostNotAllowed),
+        ];
+        let patch = build_url_patch(&denials).expect("combined patch");
+        let urls = patch.open_urls.expect("open_urls set");
+        assert_eq!(urls.allow_origins, vec!["https://oauth.example.com"]);
+        assert!(urls.allow_localhost);
+    }
+
+    #[test]
+    fn build_combined_patch_from_items_routes_url_origin_grants() {
+        let items = vec![
+            DenialItem::Url {
+                origin: "https://accounts.google.com".to_string(),
+                kind: UrlItemKind::Origin,
+                action: UrlItemAction::Grant,
+            },
+            DenialItem::Url {
+                origin: "https://github.com".to_string(),
+                kind: UrlItemKind::Origin,
+                action: UrlItemAction::Skip,
+            },
+        ];
+        let patch = build_combined_patch_from_items(&items).expect("patch from granted items");
+        let urls = patch.open_urls.expect("open_urls set");
+        // Skipped origin must NOT appear; granted origin must.
+        assert_eq!(urls.allow_origins, vec!["https://accounts.google.com"]);
+        assert!(!urls.allow_localhost);
+    }
+
+    #[test]
+    fn build_combined_patch_from_items_routes_localhost_grant() {
+        let items = vec![DenialItem::Url {
+            origin: String::new(),
+            kind: UrlItemKind::Localhost,
+            action: UrlItemAction::Grant,
+        }];
+        let patch = build_combined_patch_from_items(&items).expect("patch from localhost grant");
+        let urls = patch.open_urls.expect("open_urls set");
+        assert!(urls.allow_origins.is_empty());
+        assert!(urls.allow_localhost);
+    }
+
+    #[test]
+    fn build_combined_patch_from_items_returns_none_when_all_urls_skipped() {
+        let items = vec![DenialItem::Url {
+            origin: "https://accounts.google.com".to_string(),
+            kind: UrlItemKind::Origin,
+            action: UrlItemAction::Skip,
+        }];
+        assert!(build_combined_patch_from_items(&items).is_none());
+    }
+
+    #[test]
+    fn build_combined_patch_from_items_dedupes_origin_grants() {
+        let items = vec![
+            DenialItem::Url {
+                origin: "https://dup.example.com".to_string(),
+                kind: UrlItemKind::Origin,
+                action: UrlItemAction::Grant,
+            },
+            DenialItem::Url {
+                origin: "https://dup.example.com".to_string(),
+                kind: UrlItemKind::Origin,
+                action: UrlItemAction::Grant,
+            },
+        ];
+        let patch = build_combined_patch_from_items(&items).expect("patch");
+        let urls = patch.open_urls.expect("open_urls set");
+        assert_eq!(urls.allow_origins, vec!["https://dup.example.com"]);
+    }
+
+    #[test]
+    fn merge_profile_patch_appends_origins_deduplicated() {
+        let mut base = profile::Profile {
+            open_urls: Some(profile::OpenUrlConfig {
+                allow_origins: vec!["https://existing.example.com".to_string()],
+                allow_localhost: false,
+            }),
+            ..Default::default()
+        };
+        let patch = profile::Profile {
+            open_urls: Some(profile::OpenUrlConfig {
+                allow_origins: vec![
+                    "https://existing.example.com".to_string(),
+                    "https://new.example.com".to_string(),
+                ],
+                allow_localhost: false,
+            }),
+            ..Default::default()
+        };
+        merge_profile_patch(&mut base, &patch);
+        let urls = base.open_urls.expect("open_urls present");
+        assert_eq!(
+            urls.allow_origins,
+            vec!["https://existing.example.com", "https://new.example.com"]
+        );
+    }
+
+    #[test]
+    fn merge_profile_patch_localhost_is_monotonic_true_stays_true() {
+        // Base already allows localhost; patch without localhost must not disable it.
+        let mut base = profile::Profile {
+            open_urls: Some(profile::OpenUrlConfig {
+                allow_origins: vec![],
+                allow_localhost: true,
+            }),
+            ..Default::default()
+        };
+        let patch = profile::Profile {
+            open_urls: Some(profile::OpenUrlConfig {
+                allow_origins: vec!["https://only-in-patch.example.com".to_string()],
+                allow_localhost: false,
+            }),
+            ..Default::default()
+        };
+        merge_profile_patch(&mut base, &patch);
+        let urls = base.open_urls.expect("open_urls present");
+        assert!(
+            urls.allow_localhost,
+            "localhost must remain true (monotonic)"
+        );
+        assert_eq!(
+            urls.allow_origins,
+            vec!["https://only-in-patch.example.com"]
+        );
+    }
+
+    #[test]
+    fn merge_profile_patch_localhost_flips_false_to_true() {
+        let mut base = profile::Profile {
+            open_urls: Some(profile::OpenUrlConfig {
+                allow_origins: vec![],
+                allow_localhost: false,
+            }),
+            ..Default::default()
+        };
+        let patch = profile::Profile {
+            open_urls: Some(profile::OpenUrlConfig {
+                allow_origins: vec![],
+                allow_localhost: true,
+            }),
+            ..Default::default()
+        };
+        merge_profile_patch(&mut base, &patch);
+        let urls = base.open_urls.expect("open_urls present");
+        assert!(urls.allow_localhost, "localhost must flip to true");
+    }
+
+    #[test]
+    fn merge_profile_patch_creates_open_urls_when_base_has_none() {
+        let mut base = profile::Profile::default();
+        let patch = profile::Profile {
+            open_urls: Some(profile::OpenUrlConfig {
+                allow_origins: vec!["https://brand-new.example.com".to_string()],
+                allow_localhost: true,
+            }),
+            ..Default::default()
+        };
+        merge_profile_patch(&mut base, &patch);
+        let urls = base.open_urls.expect("open_urls created");
+        assert_eq!(urls.allow_origins, vec!["https://brand-new.example.com"]);
+        assert!(urls.allow_localhost);
+    }
+
+    #[test]
+    fn merge_profile_patch_skips_open_urls_when_patch_has_none() {
+        let mut base = profile::Profile {
+            open_urls: Some(profile::OpenUrlConfig {
+                allow_origins: vec!["https://keep.example.com".to_string()],
+                allow_localhost: true,
+            }),
+            ..Default::default()
+        };
+        let patch = profile::Profile::default();
+        merge_profile_patch(&mut base, &patch);
+        let urls = base.open_urls.expect("open_urls preserved");
+        assert_eq!(urls.allow_origins, vec!["https://keep.example.com"]);
+        assert!(urls.allow_localhost);
     }
 }

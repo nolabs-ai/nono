@@ -7,7 +7,7 @@
 //! filesystem deny and a `network-outbound` deny, blocking the connect.
 
 use std::fs;
-use std::os::unix::net::UnixListener;
+use std::os::unix::net::{UnixDatagram, UnixListener};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -37,6 +37,7 @@ fn run_nono(args: &[&str], home: &Path, cwd: &Path) -> Output {
         .args(args)
         .env("HOME", home)
         .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("NONO_NO_SAVE_PROMPT", "1")
         .env_remove("NONO_DETACHED_LAUNCH")
         .current_dir(cwd)
         .output()
@@ -130,7 +131,7 @@ fn af_unix_mediation_pathname_allows_connect_to_listed_socket() {
     let (_tmp, home, workspace) = setup_isolated_home("af-unix-mediation-allow");
     let sock_tmp = short_tempdir();
     let socket_path = sock_tmp.path().join("a.sock");
-    let _listener = UnixListener::bind(&socket_path).expect("bind test socket");
+    let _listener = UnixDatagram::bind(&socket_path).expect("bind test datagram socket");
 
     let socket_arg = socket_path.to_string_lossy().into_owned();
     let profile_path = home.join("af-unix-allow-test.json");

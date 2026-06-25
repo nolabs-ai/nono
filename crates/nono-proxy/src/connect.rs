@@ -48,9 +48,7 @@ pub async fn handle_connect(
     // Skipped entirely when auth is disabled (`nono proxy --no-auth`): there
     // is no token to check, so running the validation only produces noisy
     // "Missing Proxy-Authorization header" / "CONNECT auth skipped" debug logs.
-    if require_auth
-        && let Err(e) = validate_proxy_auth(remaining_header, session_token)
-    {
+    if require_auth && let Err(e) = validate_proxy_auth(remaining_header, session_token) {
         debug!("CONNECT auth skipped: {}", e);
     }
 

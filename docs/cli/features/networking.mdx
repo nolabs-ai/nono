@@ -5,6 +5,8 @@ description: Network access control — proxy modes, domain filtering, credentia
 
 By default the sandboxed process has unrestricted network access. When you restrict networking, nono routes traffic through an HTTP proxy running in the unsandboxed supervisor process. The sandboxed child can only reach `localhost:<proxy-port>` — all other outbound TCP is blocked at the kernel level.
 
+The same proxy can also be run on its own with [`nono proxy`](#standalone-proxy-nono-proxy) — a foreground server with no sandboxed child — so you can point external workloads (containers, microVMs) at nono's domain filtering and credential injection.
+
 ## Common cases
 
 ```bash
@@ -191,6 +193,64 @@ export NONO_UPSTREAM_PROXY=squid.corp:3128
 export NONO_UPSTREAM_BYPASS=git.internal.corp,*.dev.local
 nono run --allow-cwd --network-profile enterprise -- my-agent
 ```
+
+## Standalone Proxy (`nono proxy`)
+
+`nono run` / `shell` / `wrap` start the proxy as a side effect of launching a sandboxed child, wiring `HTTP_PROXY`/`HTTPS_PROXY` and the session token into that child. `nono proxy` instead runs the same network-filtering / credential-injection proxy as a **foreground server with no sandboxed child**, prints the connection details, and blocks until you press Ctrl-C.
+
+This lets you point your own tools at nono's domain filtering and credential injection, useful for workloads that provide their own OS-level isolation, such as Docker containers, Kata Containers, Kubernetes pods, Firecracker, and gVisor. The workload routes its egress through the proxy via `HTTP(S)_PROXY` while isolation comes from the container/microVM runtime.
+
+```bash
+# Ephemeral port, token auth, prints connection info
+nono proxy
+
+# Fixed port
+nono proxy --port 8080
+
+# Allowlist a host
+nono proxy --allow-domain github.com
+
+# Load network/credential settings from a profile
+nono proxy --profile my-profile
+```
+
+On startup it prints the proxy URL (with the embedded credential), the raw token, ready-to-paste `HTTP(S)_PROXY` exports, a summary of configured routes, and — when TLS interception is active — the trust-bundle path:
+
+```
+  nono proxy listening on 127.0.0.1:8080
+  proxy URL: http://nono:<token>@127.0.0.1:8080
+  token:     <token>
+
+  export HTTPS_PROXY=http://nono:<token>@127.0.0.1:8080
+  export HTTP_PROXY=http://nono:<token>@127.0.0.1:8080
+
+  Press Ctrl-C to stop.
+```
+
+Settings are loaded from `--profile` and extended/overridden by explicit flags, reusing the same configuration machinery as the sandboxed path. Allow-domains and credentials are merged on top of the profile; the network profile and upstream proxy are overridden by flags. Credential injection for known services and `cmd://` credential-capture routes carry through the profile exactly as they do under `nono run`.
+
+### Flags
+
+| Flag | Purpose |
+|------|---------|
+| `--listen <ADDR>` | Bind address (default `127.0.0.1`). |
+| `--port <PORT>` | Port to listen on (`0` = OS-assigned ephemeral, the default). |
+| `--no-auth` | Disable session-token auth — accept every request on the bind address. Loopback only. |
+| `--pass <PASSWORD>` | Pin the proxy credential to a fixed value instead of a random token. Reads `NONO_PROXY_PASS`. |
+| `--profile <NAME_OR_PATH>` | Load network/credential settings from a profile. |
+| `--network-profile <PROFILE>` | Enable a named network profile (e.g. `developer`). |
+| `--allow-domain <DOMAIN_OR_URL>` | Add a domain (or path-scoped URL) to the allowlist (repeatable). |
+| `--credential <SERVICE>` | Inject credentials for a service via the reverse proxy (repeatable). |
+| `--upstream-proxy <HOST:PORT>` | Chain outbound traffic through an upstream proxy. |
+| `--upstream-bypass <DOMAIN>` | Route these domains direct instead of through the upstream proxy (requires `--upstream-proxy`). |
+| `--proxy-ca-validity <DAYS>` | Proxy CA certificate validity in days (1–365). |
+| `--trust-proxy-ca` | Add the proxy CA to the macOS user trust store (macOS only). |
+
+### Authentication
+
+By default the proxy generates a random per-session token; clients authenticate with `Proxy-Authorization` (Basic via the `nono:<token>` userinfo in the printed URL, or Bearer). To use a fixed credential, pass `--pass` (or set `NONO_PROXY_PASS` to keep it out of shell history and process listings).
+
+`--no-auth` starts an open proxy that accepts every request on the bind address. To fail secure, it is **refused for non-loopback bind addresses** so you can't accidentally expose an open proxy to other hosts, and it is mutually exclusive with `--pass`.
 
 ## Endpoint Filtering
 

@@ -3,6 +3,7 @@ use crate::config;
 use crate::proxy_runtime::prepare_proxy_launch_options;
 use crate::sandbox_prepare::{
     PreparedSandbox, prepare_sandbox, print_allow_gpu_warning, print_allow_launch_services_warning,
+    validate_block_net_conflicts,
 };
 use crate::{exec_strategy, instruction_deny, profile, trust_scan};
 use colored::Colorize;
@@ -93,6 +94,9 @@ pub(crate) struct EndpointFilterIntent {
 pub(crate) struct CredentialProxyIntent {
     pub(crate) credentials: Vec<String>,
     pub(crate) custom_credentials: HashMap<String, profile::CustomCredentialDef>,
+    /// Per-credential endpoint restrictions from `--allow-endpoint SERVICE:METHOD:PATH`,
+    /// pre-parsed into `(service_name, rule)` pairs.
+    pub(crate) endpoint_restrictions: Vec<(String, nono_proxy::config::EndpointRule)>,
 }
 
 #[derive(Clone, Debug)]
@@ -304,6 +308,7 @@ pub(crate) fn prepare_run_launch_plan(
     }
 
     let mut prepared = prepare_sandbox(&args, silent)?;
+    validate_block_net_conflicts(&args, &prepared)?;
     validate_rollback_destination(run_args.rollback_dest.as_ref(), &prepared)?;
 
     if prepared.allow_launch_services_active {

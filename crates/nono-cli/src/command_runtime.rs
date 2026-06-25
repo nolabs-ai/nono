@@ -11,7 +11,8 @@ use crate::profile;
 use crate::proxy_runtime::prepare_proxy_launch_options;
 use crate::sandbox_prepare::{
     prepare_sandbox, print_allow_gpu_warning, print_allow_launch_services_warning,
-    should_auto_enable_claude_launch_services, validate_external_proxy_bypass,
+    should_auto_enable_claude_launch_services, validate_block_net_conflicts,
+    validate_external_proxy_bypass,
 };
 use crate::theme;
 use nono::{NonoError, Result};
@@ -128,6 +129,7 @@ pub(crate) fn run_sandbox(mut run_args: RunArgs, silent: bool) -> Result<()> {
 
     if args.dry_run {
         let prepared = prepare_sandbox(&args, silent)?;
+        validate_block_net_conflicts(&args, &prepared)?;
         validate_external_proxy_bypass(&args, &prepared)?;
         if !prepared.secrets.is_empty() && !silent {
             eprintln!(

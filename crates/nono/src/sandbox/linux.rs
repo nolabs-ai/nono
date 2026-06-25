@@ -391,6 +391,59 @@ fn can_use_seccomp_network_block_fallback(caps: &CapabilitySet) -> bool {
     )
 }
 
+/// Linux `statfs` magic number for the 9P filesystem (`v9fs`).
+///
+/// Covers all 9P-backed mounts: WSL2 Windows host paths (`/mnt/c`, `/mnt/d`),
+/// QEMU virtfs, and other Plan 9 mounts. The 9P driver does not implement the
+/// LSM inode hooks that Landlock relies on, so `PathBeneath` rules for these
+/// paths are accepted by the kernel but silently have no enforcement effect.
+const V9FS_MAGIC: libc::c_long = 0x0102_1997;
+
+/// Return `true` if `f_type` (from `statfs::f_type`) identifies a filesystem
+/// that does not support Landlock enforcement.
+#[inline]
+fn fs_type_unsupported(f_type: libc::c_long) -> bool {
+    f_type == V9FS_MAGIC
+}
+
+/// Return `true` if `path` sits on a filesystem that does not support Landlock.
+///
+/// Currently detects 9P mounts (`V9FS_MAGIC`), which includes WSL2 Windows
+/// host paths and QEMU virtfs. Uses `statfs(2)` on the path itself; falls back
+/// to `false` on any error so a detection failure never blocks sandbox startup.
+///
+/// Skips the syscall entirely for paths that cannot be on a 9P mount
+/// (anything not under `/mnt`), avoiding overhead on the common case.
+///
+/// Returns the device ID (`st_dev`) of the mount when unsupported, so the
+/// caller can deduplicate warnings per mount rather than per path. Returns
+/// `None` for supported filesystems or on any `statfs` error.
+fn unsupported_filesystem_dev(path: &Path) -> Option<u64> {
+    if !path.starts_with("/mnt") {
+        return None;
+    }
+    use std::ffi::CString;
+    use std::mem::MaybeUninit;
+    let Ok(cpath) = CString::new(path.as_os_str().as_encoded_bytes()) else {
+        return None;
+    };
+    // SAFETY: `buf` is a valid out-pointer for `statfs`; we initialise it
+    // through the syscall before reading any field.
+    unsafe {
+        let mut buf: MaybeUninit<libc::statfs> = MaybeUninit::uninit();
+        if libc::statfs(cpath.as_ptr(), buf.as_mut_ptr()) != 0 {
+            return None;
+        }
+        let stat = buf.assume_init();
+        if fs_type_unsupported(stat.f_type) {
+            // fsid_t.__val is private; transmute the 8-byte struct to u64 for dedup.
+            Some(std::mem::transmute::<libc::fsid_t, u64>(stat.f_fsid))
+        } else {
+            None
+        }
+    }
+}
+
 /// Check if a path is a character or block device file.
 ///
 /// Used to selectively grant `IoctlDev` only for actual device files
@@ -690,6 +743,10 @@ pub fn apply_with_abi(caps: &CapabilitySet, abi: &DetectedAbi) -> Result<Seccomp
     // are not distinguishable on this Linux path until the seccomp AF_UNIX
     // allowlist work enforces UnixSocketCapability::covers().
     let ioctl_dev_available = AccessFs::from_all(target_abi).contains(AccessFs::IoctlDev);
+    // Track device IDs of mounts already warned about to emit one warning
+    // per mount, not one per capability path.
+    let mut warned_unsupported_devs: std::collections::HashSet<u64> =
+        std::collections::HashSet::new();
 
     for cap in caps.fs_capabilities() {
         let result = access_to_landlock(cap.access, target_abi);
@@ -717,6 +774,18 @@ pub fn apply_with_abi(caps: &CapabilitySet, abi: &DetectedAbi) -> Result<Seccomp
             access |= AccessFs::IoctlDev;
             debug!(
                 "Adding IoctlDev for device path: {}",
+                cap.resolved.display()
+            );
+        }
+
+        if let Some(dev) = unsupported_filesystem_dev(&cap.resolved)
+            && warned_unsupported_devs.insert(dev)
+        {
+            warn!(
+                "Path '{}' is on a 9P filesystem (e.g. WSL2 Windows host mount, QEMU virtfs). \
+                 Landlock enforcement on 9P paths is unreliable — grants may be silently ignored \
+                 or incompletely enforced, causing unexpected access denials. \
+                 Move your working directory to a native Linux filesystem to use nono safely.",
                 cap.resolved.display()
             );
         }
@@ -4300,6 +4369,65 @@ mod tests {
             assert!(
                 is_supported(),
                 "Landlock must be available when WSL2 or native Linux"
+            );
+        }
+    }
+
+    // fs_type_unsupported: pure logic, runs on any CI platform
+
+    #[test]
+    fn test_fs_type_unsupported_v9fs_magic() {
+        assert!(
+            fs_type_unsupported(V9FS_MAGIC),
+            "V9FS_MAGIC must be unsupported"
+        );
+    }
+
+    #[test]
+    fn test_fs_type_unsupported_known_supported_types() {
+        const EXT4_MAGIC: libc::c_long = 0xEF53;
+        const TMPFS_MAGIC: libc::c_long = 0x0102_1994;
+        const PROC_MAGIC: libc::c_long = 0x9FA0;
+        assert!(!fs_type_unsupported(EXT4_MAGIC));
+        assert!(!fs_type_unsupported(TMPFS_MAGIC));
+        assert!(!fs_type_unsupported(PROC_MAGIC));
+        assert!(!fs_type_unsupported(0));
+    }
+
+    // unsupported_filesystem_dev: exercises the statfs syscall path
+
+    #[test]
+    fn test_unsupported_filesystem_dev_native_paths() {
+        // /tmp and /proc are native Linux filesystems, never 9P.
+        assert!(
+            unsupported_filesystem_dev(std::path::Path::new("/tmp")).is_none(),
+            "/tmp should be on a supported filesystem"
+        );
+        assert!(
+            unsupported_filesystem_dev(std::path::Path::new("/proc")).is_none(),
+            "/proc should be on a supported filesystem"
+        );
+    }
+
+    #[test]
+    fn test_unsupported_filesystem_dev_nonexistent_path() {
+        // statfs fails on a nonexistent path — must return None, not panic.
+        assert!(
+            unsupported_filesystem_dev(std::path::Path::new("/nonexistent-nono-test-path-xyz"))
+                .is_none(),
+            "nonexistent path should return None, not panic"
+        );
+    }
+
+    #[test]
+    fn test_unsupported_filesystem_dev_wsl2_mount() {
+        // On a real WSL2 system /mnt/c is a 9P mount and must be detected.
+        // Skipped on native Linux where /mnt/c doesn't exist.
+        let mnt_c = std::path::Path::new("/mnt/c");
+        if mnt_c.exists() {
+            assert!(
+                unsupported_filesystem_dev(mnt_c).is_some(),
+                "/mnt/c exists but was not detected as a 9P filesystem"
             );
         }
     }

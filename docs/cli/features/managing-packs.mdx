@@ -180,6 +180,61 @@ export NONO_REGISTRY=https://registry.example.com/api/v1
 nono pull acme-corp/internal-agent
 ```
 
+## Air-Gapped / Internal Registry (Unsigned Packs)
+
+For air-gapped fleets that distribute packs from an internal **static** registry (e.g. an nginx serving pre-generated files), nono can install and update packs without Sigstore signature verification. Integrity is still enforced by per-artifact SHA-256, and TLS host verification is unaffected — only signature verification is turned off.
+
+> **Security note:** disabling signature verification removes supply-chain provenance. Only do this when the registry and the network path to it are trusted (internal HTTPS with an MDM-trusted corporate CA, or a trusted internal network). `verify = false` does **not** disable TLS.
+
+### Fleet configuration
+
+Point the fleet at the internal registry and disable verification in a single managed `~/.config/nono/config.toml` (push it via MDM/Jamf):
+
+```toml
+[registry]
+url = "https://nono-registry.corp.internal"
+verify = false
+
+[updates]
+check = false
+```
+
+- `url` — the registry **host root** (no `/api/v1` suffix; the client appends `/api/v1/packages/...` itself).
+- `verify = false` — install/update unsigned packs (SHA-256 still checked).
+- `[updates] check = false` — suppress upstream update phone-home (also implied by `verify = false`).
+
+The same can be set ad hoc with the `--insecure` flag (`nono pull --insecure ...`, `nono update --insecure`) or the `NONO_REGISTRY_INSECURE` environment variable.
+
+Once configured, the usual commands work offline against the internal registry:
+
+```bash
+nono pull my-org/my-pack
+nono update
+```
+
+Packs installed this way carry no `.nono-trust.bundle`; their lockfile entry records the `unsigned:internal-registry` signer identity, and `nono run` skips Sigstore re-verification for them while still checking artifact digests.
+
+> Migrating a pack that was previously installed from the signed public registry to the internal unsigned one is a signer change, so it needs a one-time `nono pull --force` (or `nono remove` first).
+
+### Generating the static registry
+
+On the publishing side (e.g. a CI job), build the pack directory (`package.json` + artifact files), then emit the static tree:
+
+```bash
+nono pack publish-static my-org/my-pack --pack-dir ./dist --out ./registry
+```
+
+This writes, under `--out`:
+
+```text
+api/v1/packages/<ns>/<name>/versions/<version>/pull   # pull manifest (JSON)
+api/v1/packages/<ns>/<name>/versions/latest/pull      # newest version (by semver)
+api/v1/packages/<ns>/<name>/status                    # {schema_version, latest}
+files/<ns>/<name>/<version>/<filename>                # artifact bytes
+```
+
+Re-running for a new version is additive; `latest` and `status` always track the highest published semver. Serve the `--out` directory as the document root of any static HTTP server (nginx with `autoindex off`); the `?installed=` query string on the status endpoint is ignored, so a static file is sufficient.
+
 ## Pack Store Layout
 
 Installed packs live under `~/.config/nono/packages/<namespace>/<name>/`. Each pack directory contains the verified artifacts and a lockfile entry tracking the installed version and signer identity.

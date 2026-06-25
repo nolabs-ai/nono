@@ -538,14 +538,12 @@ pub fn apply_with_abi(caps: &CapabilitySet, abi: &DetectedAbi) -> Result<Seccomp
     info!("Using Landlock ABI {:?}", target_abi);
     let scopes = requested_scopes(caps, abi)?;
 
-    if matches!(caps.network_mode(), NetworkMode::Blocked) {
-        if caps.localhost_ports().contains(&0) {
-            return Err(NonoError::SandboxInit(
-                "open_port 0 (localhost wildcard) is not supported in --block-net mode on Linux; \
-                 use proxy mode (--allow-domain) with open_port 0, or list explicit ports."
-                    .to_string(),
-            ));
-        }
+    if matches!(caps.network_mode(), NetworkMode::Blocked) && caps.localhost_ports().contains(&0) {
+        return Err(NonoError::SandboxInit(
+            "open_port 0 (localhost wildcard) is not supported in --block-net mode on Linux; \
+             use proxy mode (--allow-domain) with open_port 0, or list explicit ports."
+                .to_string(),
+        ));
     }
 
     // Determine which access rights to handle based on ABI
@@ -3600,7 +3598,8 @@ mod tests {
         );
     }
 
-    /// Rejects `open_port: [0]` on Linux for any restricted network mode (not Landlock-only).
+    /// `open_port: [0]` (wildcard) is rejected in block-net mode on Linux —
+    /// Landlock has no wildcard port concept. Use proxy mode instead.
     #[test]
     fn test_reject_localhost_port_wildcard_zero_on_linux() {
         let Ok(detected) = detect_abi() else {
@@ -3610,7 +3609,8 @@ mod tests {
         caps.add_localhost_port(0);
         let err = apply_with_abi(&caps, &detected).expect_err("port 0 wildcard must be rejected");
         let msg = format!("{err}");
-        assert!(msg.contains("macOS-only"), "unexpected error: {msg}");
+        assert!(msg.contains("open_port 0"), "unexpected error: {msg}");
+        assert!(msg.contains("block-net"), "unexpected error: {msg}");
     }
 
     #[test]
@@ -4186,45 +4186,6 @@ mod tests {
             libc::WEXITSTATUS(status),
             0,
             "Expected SeccompNetFallback::ProxyOnly on any kernel, got exit code {}",
-            libc::WEXITSTATUS(status)
-        );
-    }
-
-    /// ProxyOnly on a pre-V4 kernel (no AccessNet) also returns ProxyOnly fallback.
-    /// Redundant with `test_proxy_only_always_returns_seccomp_fallback` but kept
-    /// to pin the pre-V4 path explicitly.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn test_proxy_only_without_landlock_net_returns_proxy_fallback() {
-        let detected = match detect_abi() {
-            Ok(d) => d,
-            Err(_) => return,
-        };
-
-        let pid = unsafe { libc::fork() };
-        assert!(pid >= 0, "fork() failed");
-
-        if pid == 0 {
-            let caps = CapabilitySet::new().proxy_only(8080);
-            let exit_code = match apply_with_abi(&caps, &detected) {
-                Ok(SeccompNetFallback::ProxyOnly {
-                    proxy_port: 8080, ..
-                }) => 0,
-                Ok(SeccompNetFallback::ProxyOnly { .. }) => 1, // wrong port
-                Ok(SeccompNetFallback::None) => 2,
-                Ok(SeccompNetFallback::BlockAll) => 3,
-                Err(_) => 4,
-            };
-            unsafe { libc::_exit(exit_code) };
-        }
-
-        let mut status = 0;
-        unsafe { libc::waitpid(pid, &mut status, 0) };
-        assert!(libc::WIFEXITED(status));
-        assert_eq!(
-            libc::WEXITSTATUS(status),
-            0,
-            "Expected SeccompNetFallback::ProxyOnly on pre-V4 kernel, got exit code {}",
             libc::WEXITSTATUS(status)
         );
     }

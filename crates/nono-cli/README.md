@@ -157,9 +157,9 @@ nono has three network modes. You pick one per run; they cannot be combined.
 
 ### Localhost IPC ports
 
-`open_port` and `open_port_range` punch loopback exceptions into an otherwise restricted network. They have no effect in unrestricted (AllowAll) mode.
+Use `open_port` and `open_port_range` to let the sandboxed process talk to other processes running on the same machine — dev servers, databases, test containers, sidecar agents, etc. These only take effect in blocked or proxy mode; in unrestricted mode all ports are already open.
 
-**Single port — CLI or profile:**
+**Single port:**
 ```bash
 nono run --allow-cwd --block-net --open-port 3000 -- my-agent
 ```
@@ -167,27 +167,36 @@ nono run --allow-cwd --block-net --open-port 3000 -- my-agent
 { "network": { "block": true, "open_port": [3000, 3001] } }
 ```
 
-**Port range — profile only:**
+**Port range** (profile only, works on both platforms):
 ```json
 { "network": { "block": true, "open_port_range": [[3000, 3100]] } }
 ```
 
-Multiple ranges are supported: `[[3000, 3100], [49152, 49200]]`.
+**Wildcard — allow any localhost port** (proxy mode only):
+```json
+{
+  "network": {
+    "allow_domain": ["api.example.com"],
+    "open_port": [0]
+  }
+}
+```
 
-#### Platform behaviour
+Use `open_port: [0]` when the port isn't known ahead of time — for example, Testcontainers and Maven Surefire bind to a random ephemeral port assigned by the OS. The `allow_domain` list still restricts what external hosts the agent can reach; only localhost traffic is unrestricted.
 
-|  | macOS | Linux |
-|--|-------|-------|
-| **`open_port`** | One `(remote tcp "localhost:N")` Seatbelt rule per port. Bind/inbound become a blanket allow (Seatbelt cannot filter by port). | Block-net: individual Landlock rules per port. Proxy mode: seccomp supervisor enforces loopback-only for connect. |
-| **`open_port = [0]`** (wildcard) | `(remote tcp "localhost:*")` — any loopback port. | Proxy mode only. Errors at startup in block-net mode. |
-| **`open_port_range`** | Ranges ≤ 256 ports expand to individual rules. Ranges > 256 ports collapse to `localhost:*` with a warning. Bind/inbound become a blanket allow. | Expanded to individual Landlock rules. Works in both block-net and proxy mode. In proxy mode, connect is additionally loopback-only; bind is per-port (no blanket allow). |
+> **Note:** `open_port: [0]` (wildcard) requires proxy mode on Linux. It will error at startup if used with `--block-net` on Linux, because block-net has no mechanism to express "any port". Use proxy mode with `allow_domain` instead.
+
+#### Platform differences
+
+On macOS, when any port or range is set, inbound connections to those ports are also allowed (macOS cannot filter inbound by port). On Linux, inbound is not automatically allowed — only the ports you list are open.
+
+On macOS, ranges over 256 ports collapse to a full localhost wildcard with a warning in the logs. On Linux, all ports in the range are allowed individually regardless of range width.
 
 ### Proxy-only mode (`--allow-domain`)
 
-Proxy mode starts a local nono proxy and restricts the child to that proxy only. The proxy enforces domain allowlists, injects credentials, and optionally inspects endpoints.
+Proxy mode restricts the agent to only the domains you list. All other outbound traffic is blocked.
 
 ```bash
-# Allow one external domain
 nono run --allow-cwd --allow-domain api.openai.com -- my-agent
 ```
 
@@ -200,35 +209,9 @@ nono run --allow-cwd --allow-domain api.openai.com -- my-agent
 }
 ```
 
-When proxy mode is active, `open_port` and `open_port_range` add **localhost IPC exceptions** on top — the proxy itself is always reachable and the listed ports are additionally allowed for loopback communication.
-
-For tools that bind to an OS-assigned ephemeral port (Testcontainers, Maven Surefire, etc.), use the wildcard:
-
-```json
-{
-  "network": {
-    "allow_domain": ["api.example.com"],
-    "open_port": [0]
-  }
-}
-```
-
-`open_port: [0]` allows any loopback connect or bind without knowing the port in advance. External traffic is still restricted to the domain allowlist.
-
-On Linux, proxy-only mode always uses seccomp-notify to mediate `connect()` and `bind()` calls, even on kernels with Landlock V4+ network support. This is intentional: Landlock TCP rules match by destination port only and cannot enforce the loopback-only invariant that proxy mode requires.
+`open_port` and `open_port_range` work alongside `allow_domain` — the domain list controls external traffic, and the port exceptions control localhost IPC. They are independent.
 
 ### Blocking external network while allowing localhost IPC
-
-```json
-{
-  "network": {
-    "block": true,
-    "open_port": [6379, 6380]
-  }
-}
-```
-
-Works on both macOS and Linux, including port ranges:
 
 ```json
 {
@@ -239,6 +222,8 @@ Works on both macOS and Linux, including port ranges:
   }
 }
 ```
+
+Works on both macOS and Linux.
 
 ## Deprecated Command Blocking
 

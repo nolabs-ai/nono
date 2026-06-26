@@ -306,21 +306,25 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
             }
         };
 
-        // Post-mortem hook. If a memory cap was requested and the kernel
-        // OOM-killed the sandbox for crossing it, the child comes back as a bare
-        // SIGKILL (exit 137) with no explanation. Read the leaf's OOM evidence
-        // while it still exists and print a precise diagnostic, so a cap breach
-        // is loud rather than silent. Returning `true` suppresses the generic
-        // "killed by SIGKILL" footer, which would otherwise send the user
-        // chasing path grants for a memory problem.
+        // Post-mortem hook (Linux, and ONLY when a resource cgroup leaf exists).
+        // If a memory cap was requested and the kernel OOM-killed the sandbox for
+        // crossing it, the child comes back as a bare SIGKILL (exit 137) with no
+        // explanation. Read the leaf's OOM evidence while it still exists and
+        // print a precise diagnostic, so a cap breach is loud rather than silent.
+        // Returning `true` suppresses the generic "killed by SIGKILL" footer.
+        //
+        // A run with no memory limit installs NO hook (`None`), so it takes the
+        // exact pre-feature path with no per-run hook call at all.
         #[cfg(target_os = "linux")]
-        let mut on_exit_diag = |code: i32| -> bool {
+        let install_exit_diag = cgroup_leaf.is_some();
+        #[cfg(target_os = "linux")]
+        let mut on_exit_diag_fn = |code: i32| -> bool {
             // The diagnostic explains the bare SIGKILL the kernel delivers when
             // the whole sandbox is OOM-killed for crossing the cap (exit code
-            // 128 + SIGKILL = 137). Only look at that exit: a success or an
-            // unrelated failure must not get a spurious "killed by the kernel"
-            // story, nor have its real footer suppressed, just because an
-            // individual descendant was OOM-reaped earlier in the run.
+            // 128 + SIGKILL = 137). Only look at that exit: an unrelated failure
+            // must not get a spurious "killed by the kernel" story, nor have its
+            // real footer suppressed, just because an individual descendant was
+            // OOM-reaped earlier in the run.
             const OOM_SIGKILL_EXIT: i32 = 128 + nix::libc::SIGKILL;
             if code != OOM_SIGKILL_EXIT {
                 return false;
@@ -333,8 +337,14 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
                 None => false,
             }
         };
+        #[cfg(target_os = "linux")]
+        let on_exit_diag: Option<&mut dyn FnMut(i32) -> bool> = if install_exit_diag {
+            Some(&mut on_exit_diag_fn)
+        } else {
+            None
+        };
         #[cfg(not(target_os = "linux"))]
-        let mut on_exit_diag = |_code: i32| -> bool { false };
+        let on_exit_diag: Option<&mut dyn FnMut(i32) -> bool> = None;
 
         exec_strategy::execute_supervised(
             config,
@@ -344,7 +354,7 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
             pty_pair,
             Some(&short_session_id),
             resource_procs_fd,
-            Some(&mut on_exit_diag),
+            on_exit_diag,
         )?
     };
 

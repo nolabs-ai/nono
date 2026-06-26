@@ -203,6 +203,13 @@ pub(crate) fn run_why(args: WhyArgs) -> Result<()> {
         )
     } else if let Some(ref scope) = args.scope {
         query_scope(scope_query(scope), &ctx.caps)
+    } else if args.self_query && !args.json {
+        // No specific query: show this sandbox's own capability summary
+        // (filesystem grants, network, commands, and resource limits such as the
+        // --memory ceiling). `print_capabilities` already renders the resources
+        // line, so the limit surfaces here without bespoke formatting.
+        crate::output::print_capabilities(&ctx.caps, 0, false);
+        return Ok(());
     } else {
         return Err(NonoError::ConfigParse(
             "--path, --host, or --scope is required".to_string(),

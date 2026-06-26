@@ -563,9 +563,13 @@ pub(super) enum NetworkDecision {
 ///    no path to check.
 ///
 /// 2. For `AF_INET`/`AF_INET6`:
-///    - `connect()` is allowed only to `127.0.0.1:proxy_port` (the nono proxy).
-///    - `bind()` is allowed only on ports in `proxy_bind_ports`.
+///    - `connect()` is allowed to `127.0.0.1:proxy_port` (the nono proxy),
+///      any port in `localhost_ports` (port `0` = wildcard), or any port
+///      that falls within a `localhost_port_ranges` range — **loopback only**.
+///    - `bind()` is allowed on `proxy_bind_ports`, `localhost_ports`, or
+///      `localhost_port_ranges`. No loopback check on bind (matches macOS).
 ///    - Everything else is denied.
+///
 pub(super) fn decide_network_notification(
     child_pid: u32,
     syscall: i32,
@@ -615,10 +619,17 @@ pub(super) fn decide_network_notification(
 
     match syscall {
         SYS_CONNECT | SYS_SENDTO | SYS_SENDMSG | SYS_SENDMMSG => {
-            // Allow connect/sendto/sendmsg/sendmmsg only to loopback + proxy port.
-            // sendto/sendmsg/sendmmsg with a destination address is semantically
-            // equivalent to connect for network reach-out (issue #1089).
-            if sockaddr.is_loopback && sockaddr.port == config.proxy_port {
+            // Allow proxy port, or any loopback port when localhost_ports
+            // contains 0 (wildcard), or an exact match in localhost_ports.
+            let allowed = sockaddr.is_loopback
+                && (sockaddr.port == config.proxy_port
+                    || config.localhost_ports.contains(&0)
+                    || config.localhost_ports.contains(&sockaddr.port)
+                    || config
+                        .localhost_port_ranges
+                        .iter()
+                        .any(|&(s, e)| sockaddr.port >= s && sockaddr.port <= e));
+            if allowed {
                 debug!(
                     "Proxy seccomp: allowing network syscall nr={} to loopback:{}",
                     syscall, sockaddr.port
@@ -633,8 +644,15 @@ pub(super) fn decide_network_notification(
             }
         }
         SYS_BIND => {
-            // Allow bind only on configured bind ports
-            if config.proxy_bind_ports.contains(&sockaddr.port) {
+            // Allow configured bind ports, localhost_ports wildcard (0), or exact match.
+            let allowed = config.proxy_bind_ports.contains(&sockaddr.port)
+                || config.localhost_ports.contains(&0)
+                || config.localhost_ports.contains(&sockaddr.port)
+                || config
+                    .localhost_port_ranges
+                    .iter()
+                    .any(|&(s, e)| sockaddr.port >= s && sockaddr.port <= e);
+            if allowed {
                 debug!("Proxy seccomp: allowing bind on port {}", sockaddr.port);
                 NetworkDecision::Allow
             } else {
@@ -1535,6 +1553,8 @@ mod tests {
                 allow_launch_services_active: false,
                 proxy_port,
                 proxy_bind_ports,
+                localhost_ports: Vec::new(),
+                localhost_port_ranges: Vec::new(),
                 unix_socket_allowlist,
                 linux_network_notify_mode: LinuxNetworkNotifyMode::ProxyOnly,
                 tool_sandbox_runtime: None,
@@ -2007,6 +2027,151 @@ mod tests {
                 ),
                 NetworkDecision::Deny,
                 "AF_INET sendmmsg to external host must be denied"
+            );
+        }
+
+        /// open_port=0 wildcard: connect to any loopback port is allowed.
+        #[test]
+        fn localhost_wildcard_allows_connect_any_loopback_port() {
+            let backend = DenyAllBackend;
+            let mut config = make_config(&backend, 8080, Vec::new(), &[]);
+            config.localhost_ports = vec![0];
+            assert_eq!(
+                decide_network_notification(
+                    test_pid(),
+                    SYS_CONNECT,
+                    &inet_loopback(32768),
+                    &config
+                ),
+                NetworkDecision::Allow,
+                "open_port=0 must allow connect to any loopback port"
+            );
+        }
+
+        /// open_port=0 wildcard: connect to external host is still denied.
+        #[test]
+        fn localhost_wildcard_denies_external_connect() {
+            let backend = DenyAllBackend;
+            let mut config = make_config(&backend, 8080, Vec::new(), &[]);
+            config.localhost_ports = vec![0];
+            assert_eq!(
+                decide_network_notification(test_pid(), SYS_CONNECT, &inet_external(443), &config),
+                NetworkDecision::Deny,
+                "open_port=0 must not allow connect to external hosts"
+            );
+        }
+
+        /// open_port=0 wildcard: bind on any port is allowed.
+        #[test]
+        fn localhost_wildcard_allows_bind_any_port() {
+            let backend = DenyAllBackend;
+            let mut config = make_config(&backend, 8080, Vec::new(), &[]);
+            config.localhost_ports = vec![0];
+            assert_eq!(
+                decide_network_notification(test_pid(), SYS_BIND, &inet_loopback(55123), &config),
+                NetworkDecision::Allow,
+                "open_port=0 must allow bind on any port"
+            );
+        }
+
+        /// Specific open_port: connect to that loopback port is allowed.
+        #[test]
+        fn specific_localhost_port_allows_connect() {
+            let backend = DenyAllBackend;
+            let mut config = make_config(&backend, 8080, Vec::new(), &[]);
+            config.localhost_ports = vec![3000];
+            assert_eq!(
+                decide_network_notification(test_pid(), SYS_CONNECT, &inet_loopback(3000), &config),
+                NetworkDecision::Allow,
+                "open_port=3000 must allow connect to loopback:3000"
+            );
+        }
+
+        /// Specific open_port: connect to a different port is denied.
+        #[test]
+        fn specific_localhost_port_denies_other_loopback_port() {
+            let backend = DenyAllBackend;
+            let mut config = make_config(&backend, 8080, Vec::new(), &[]);
+            config.localhost_ports = vec![3000];
+            assert_eq!(
+                decide_network_notification(test_pid(), SYS_CONNECT, &inet_loopback(4000), &config),
+                NetworkDecision::Deny,
+                "open_port=3000 must not allow connect to loopback:4000"
+            );
+        }
+
+        /// Port range: connect to a port within the range is allowed.
+        #[test]
+        fn port_range_allows_connect_within_range() {
+            let backend = DenyAllBackend;
+            let mut config = make_config(&backend, 8080, Vec::new(), &[]);
+            config.localhost_port_ranges = vec![(3000, 3100)];
+            assert_eq!(
+                decide_network_notification(test_pid(), SYS_CONNECT, &inet_loopback(3050), &config),
+                NetworkDecision::Allow,
+                "port range 3000-3100 must allow connect to loopback:3050"
+            );
+        }
+
+        /// Port range: connect to a port outside the range is denied.
+        #[test]
+        fn port_range_denies_connect_outside_range() {
+            let backend = DenyAllBackend;
+            let mut config = make_config(&backend, 8080, Vec::new(), &[]);
+            config.localhost_port_ranges = vec![(3000, 3100)];
+            assert_eq!(
+                decide_network_notification(test_pid(), SYS_CONNECT, &inet_loopback(3101), &config),
+                NetworkDecision::Deny,
+                "port range 3000-3100 must deny connect to loopback:3101"
+            );
+        }
+
+        /// Port range: range boundary ports (start and end) are inclusive.
+        #[test]
+        fn port_range_boundary_ports_are_inclusive() {
+            let backend = DenyAllBackend;
+            let mut config = make_config(&backend, 8080, Vec::new(), &[]);
+            config.localhost_port_ranges = vec![(5000, 5001)];
+            assert_eq!(
+                decide_network_notification(test_pid(), SYS_CONNECT, &inet_loopback(5000), &config),
+                NetworkDecision::Allow,
+                "range start port must be inclusive"
+            );
+            assert_eq!(
+                decide_network_notification(test_pid(), SYS_CONNECT, &inet_loopback(5001), &config),
+                NetworkDecision::Allow,
+                "range end port must be inclusive"
+            );
+            assert_eq!(
+                decide_network_notification(test_pid(), SYS_CONNECT, &inet_loopback(4999), &config),
+                NetworkDecision::Deny,
+                "port below range start must be denied"
+            );
+        }
+
+        /// Port range: external host is denied even if port is within range.
+        #[test]
+        fn port_range_denies_external_host_in_range() {
+            let backend = DenyAllBackend;
+            let mut config = make_config(&backend, 8080, Vec::new(), &[]);
+            config.localhost_port_ranges = vec![(3000, 3100)];
+            assert_eq!(
+                decide_network_notification(test_pid(), SYS_CONNECT, &inet_external(3050), &config),
+                NetworkDecision::Deny,
+                "port range must not allow connect to external host even if port matches"
+            );
+        }
+
+        /// Port range: bind within range is allowed.
+        #[test]
+        fn port_range_allows_bind_within_range() {
+            let backend = DenyAllBackend;
+            let mut config = make_config(&backend, 8080, Vec::new(), &[]);
+            config.localhost_port_ranges = vec![(3000, 3100)];
+            assert_eq!(
+                decide_network_notification(test_pid(), SYS_BIND, &inet_loopback(3000), &config),
+                NetworkDecision::Allow,
+                "port range 3000-3100 must allow bind on port 3000"
             );
         }
 

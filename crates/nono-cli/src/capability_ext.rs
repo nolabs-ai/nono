@@ -985,6 +985,9 @@ impl CapabilitySetExt for CapabilitySet {
         for port in &profile.network.open_port {
             caps.add_localhost_port(*port);
         }
+        for &[start, end] in &profile.network.open_port_range {
+            caps.add_localhost_port_range(start, end);
+        }
 
         // Outbound TCP connect port allowlist from profile (Linux Landlock V4+ only)
         #[cfg(target_os = "macos")]

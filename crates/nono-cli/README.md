@@ -145,6 +145,86 @@ Profiles can form chains (up to 10 levels deep). Circular dependencies are detec
 my-dev.json → team-base.json → claude-code (pack)
 ```
 
+## Network Modes
+
+nono has three network modes. You pick one per run; they cannot be combined.
+
+| Mode | CLI flag | Profile field | What it does |
+|------|----------|---------------|--------------|
+| **Unrestricted** | *(default)* | — | Child has full network access |
+| **Blocked** | `--block-net` | `"network": { "block": true }` | All outbound connections denied |
+| **Proxy-only** | `--allow-domain <host>` | `"network": { "allow_domain": [...] }` | Child may only reach the nono proxy; proxy enforces an allowlist |
+
+### Localhost IPC ports
+
+Use `open_port` and `open_port_range` to let the sandboxed process talk to other processes running on the same machine — dev servers, databases, test containers, sidecar agents, etc. These only take effect in blocked or proxy mode; in unrestricted mode all ports are already open.
+
+**Single port:**
+```bash
+nono run --allow-cwd --block-net --open-port 3000 -- my-agent
+```
+```json
+{ "network": { "block": true, "open_port": [3000, 3001] } }
+```
+
+**Port range** (profile only, works on both platforms):
+```json
+{ "network": { "block": true, "open_port_range": [[3000, 3100]] } }
+```
+
+**Wildcard — allow any localhost port** (proxy mode only):
+```json
+{
+  "network": {
+    "allow_domain": ["api.example.com"],
+    "open_port": [0]
+  }
+}
+```
+
+Use `open_port: [0]` when the port isn't known ahead of time — for example, Testcontainers and Maven Surefire bind to a random ephemeral port assigned by the OS. The `allow_domain` list still restricts what external hosts the agent can reach; only localhost traffic is unrestricted.
+
+> **Note:** `open_port: [0]` (wildcard) requires proxy mode on Linux. It will error at startup if used with `--block-net` on Linux, because block-net has no mechanism to express "any port". Use proxy mode with `allow_domain` instead.
+
+#### Platform differences
+
+On macOS, when any port or range is set, inbound connections to those ports are also allowed (macOS cannot filter inbound by port). On Linux, inbound is not automatically allowed — only the ports you list are open.
+
+On macOS, ranges over 256 ports collapse to a full localhost wildcard with a warning in the logs. On Linux, all ports in the range are allowed individually regardless of range width.
+
+### Proxy-only mode (`--allow-domain`)
+
+Proxy mode restricts the agent to only the domains you list. All other outbound traffic is blocked.
+
+```bash
+nono run --allow-cwd --allow-domain api.openai.com -- my-agent
+```
+
+```json
+{
+  "network": {
+    "allow_domain": ["api.openai.com", "registry.npmjs.org"],
+    "open_port_range": [[3000, 3002]]
+  }
+}
+```
+
+`open_port` and `open_port_range` work alongside `allow_domain` — the domain list controls external traffic, and the port exceptions control localhost IPC. They are independent.
+
+### Blocking external network while allowing localhost IPC
+
+```json
+{
+  "network": {
+    "block": true,
+    "open_port": [6379],
+    "open_port_range": [[49152, 49200]]
+  }
+}
+```
+
+Works on both macOS and Linux.
+
 ## Deprecated Command Blocking
 
 Command blocking is deprecated in `v0.33.0`. It is only checked against the

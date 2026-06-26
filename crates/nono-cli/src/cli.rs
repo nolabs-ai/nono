@@ -1216,7 +1216,9 @@ pub struct SandboxArgs {
     )]
     pub allow_bind: Vec<u16>,
 
-    /// Allow bidirectional localhost TCP on a port: connect + listen (repeatable)
+    /// Allow bidirectional localhost TCP on a port: connect + listen (repeatable).
+    /// Port 0 = localhost wildcard (any port); macOS and Linux proxy mode only.
+    /// For ranges use open_port_range in a profile (no CLI flag equivalent).
     /// ALIAS(canonical="--open-port", introduced="v0.0.0", remove_by="indefinite", issue="#415")
     #[arg(
         long = "open-port",
@@ -1530,7 +1532,9 @@ pub struct WrapSandboxArgs {
     )]
     pub allow_bind: Vec<u16>,
 
-    /// Allow bidirectional localhost TCP on a port: connect + listen (repeatable)
+    /// Allow bidirectional localhost TCP on a port: connect + listen (repeatable).
+    /// Port 0 = localhost wildcard (any port); macOS and Linux proxy mode only.
+    /// For ranges use open_port_range in a profile (no CLI flag equivalent).
     /// ALIAS(canonical="--open-port", introduced="v0.0.0", remove_by="indefinite", issue="#415")
     #[arg(
         long = "open-port",

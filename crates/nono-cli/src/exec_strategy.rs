@@ -312,6 +312,13 @@ pub struct SupervisorConfig<'a> {
     /// Bind ports allowed for seccomp proxy-only fallback.
     #[cfg(target_os = "linux")]
     pub proxy_bind_ports: Vec<u16>,
+    /// Localhost IPC ports for seccomp proxy-only fallback. Port 0 = wildcard
+    /// (any loopback port); otherwise exact ports for connect and bind.
+    #[cfg(target_os = "linux")]
+    pub localhost_ports: Vec<u16>,
+    /// Localhost IPC port ranges `[start, end]` (inclusive) for seccomp proxy-only.
+    #[cfg(target_os = "linux")]
+    pub localhost_port_ranges: Vec<(u16, u16)>,
     /// Pathname AF_UNIX socket grants allowed for seccomp proxy-only fallback.
     #[cfg(target_os = "linux")]
     pub unix_socket_allowlist: &'a [nono::UnixSocketCapability],
@@ -4585,6 +4592,10 @@ mod tests {
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
             #[cfg(target_os = "linux")]
+            localhost_ports: Vec::new(),
+            #[cfg(target_os = "linux")]
+            localhost_port_ranges: Vec::new(),
+            #[cfg(target_os = "linux")]
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
             linux_network_notify_mode: LinuxNetworkNotifyMode::ProxyOnly,
@@ -4705,6 +4716,10 @@ mod tests {
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
             #[cfg(target_os = "linux")]
+            localhost_ports: Vec::new(),
+            #[cfg(target_os = "linux")]
+            localhost_port_ranges: Vec::new(),
+            #[cfg(target_os = "linux")]
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
             linux_network_notify_mode: LinuxNetworkNotifyMode::ProxyOnly,
@@ -4791,6 +4806,10 @@ mod tests {
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
             #[cfg(target_os = "linux")]
+            localhost_ports: Vec::new(),
+            #[cfg(target_os = "linux")]
+            localhost_port_ranges: Vec::new(),
+            #[cfg(target_os = "linux")]
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
             linux_network_notify_mode: LinuxNetworkNotifyMode::ProxyOnly,
@@ -4834,6 +4853,10 @@ mod tests {
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
             #[cfg(target_os = "linux")]
+            localhost_ports: Vec::new(),
+            #[cfg(target_os = "linux")]
+            localhost_port_ranges: Vec::new(),
+            #[cfg(target_os = "linux")]
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
             linux_network_notify_mode: LinuxNetworkNotifyMode::ProxyOnly,
@@ -4875,6 +4898,10 @@ mod tests {
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
             #[cfg(target_os = "linux")]
+            localhost_ports: Vec::new(),
+            #[cfg(target_os = "linux")]
+            localhost_port_ranges: Vec::new(),
+            #[cfg(target_os = "linux")]
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
             linux_network_notify_mode: LinuxNetworkNotifyMode::ProxyOnly,
@@ -4897,6 +4924,10 @@ mod tests {
             proxy_port: 0,
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
+            #[cfg(target_os = "linux")]
+            localhost_ports: Vec::new(),
+            #[cfg(target_os = "linux")]
+            localhost_port_ranges: Vec::new(),
             #[cfg(target_os = "linux")]
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
@@ -4943,6 +4974,10 @@ mod tests {
             proxy_port: 0,
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
+            #[cfg(target_os = "linux")]
+            localhost_ports: Vec::new(),
+            #[cfg(target_os = "linux")]
+            localhost_port_ranges: Vec::new(),
             #[cfg(target_os = "linux")]
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
@@ -5095,6 +5130,10 @@ mod tests {
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
             #[cfg(target_os = "linux")]
+            localhost_ports: Vec::new(),
+            #[cfg(target_os = "linux")]
+            localhost_port_ranges: Vec::new(),
+            #[cfg(target_os = "linux")]
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
             linux_network_notify_mode: LinuxNetworkNotifyMode::ProxyOnly,
@@ -5146,6 +5185,10 @@ mod tests {
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
             #[cfg(target_os = "linux")]
+            localhost_ports: Vec::new(),
+            #[cfg(target_os = "linux")]
+            localhost_port_ranges: Vec::new(),
+            #[cfg(target_os = "linux")]
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
             linux_network_notify_mode: LinuxNetworkNotifyMode::ProxyOnly,
@@ -5185,6 +5228,10 @@ mod tests {
             proxy_port: 0,
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
+            #[cfg(target_os = "linux")]
+            localhost_ports: Vec::new(),
+            #[cfg(target_os = "linux")]
+            localhost_port_ranges: Vec::new(),
             #[cfg(target_os = "linux")]
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
@@ -5244,6 +5291,10 @@ mod tests {
             proxy_port: 0,
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
+            #[cfg(target_os = "linux")]
+            localhost_ports: Vec::new(),
+            #[cfg(target_os = "linux")]
+            localhost_port_ranges: Vec::new(),
             #[cfg(target_os = "linux")]
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]

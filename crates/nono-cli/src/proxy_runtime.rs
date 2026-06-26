@@ -2231,8 +2231,8 @@ pub(crate) fn start_proxy_runtime(
     let route_rows = handle.route_diagnostics(&proxy_config);
     if !route_rows.is_empty() {
         info!("Proxy routes:");
-        for (prefix, summary) in &route_rows {
-            info!("  /{}  {}", prefix, summary);
+        for summary in &route_rows {
+            info!("  {}", summary);
         }
         if handle.intercept_ca_path().is_some() {
             info!(

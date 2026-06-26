@@ -133,8 +133,8 @@ impl ProxyHandle {
             .map_err(|e| ProxyError::Config(format!("proxy diagnostics JSON error: {e}")))
     }
 
-    /// One-line-per-route diagnostic summary suitable for surfacing at
-    /// session start. Returns `(prefix, summary)` pairs.
+    /// One-line-per-upstream diagnostic summary suitable for surfacing at
+    /// session start. Returns one summary string per upstream.
     ///
     /// Each summary names: upstream URL, credential resolution status
     /// (✓ / ✗ + source label), TLS-intercept on/off, and `endpoint_rules`
@@ -142,36 +142,115 @@ impl ProxyHandle {
     /// noisy by default, addressing the common "I created the keychain
     /// entry but the warn at debug level got missed" footgun.
     ///
+    /// Routes are grouped by upstream so that the credential route and the
+    /// synthetic endpoint-authorization route (`_ep_<host>`) the CLI emits for
+    /// the same host collapse into one row. These are distinct internal routes
+    /// — credential injection is decoupled from L7 endpoint filtering (see
+    /// `route.rs`) — but at request time they are evaluated together against a
+    /// single upstream (the `_ep_` route gates, the credential catch-all
+    /// injects). A combined row therefore reflects the effective behaviour
+    /// instead of exposing the internal split as a confusing credential-less
+    /// duplicate. The internal route prefixes are intentionally not surfaced;
+    /// the upstream URL is the user-meaningful identity.
+    ///
     /// `config` is the same `ProxyConfig` that was passed to `start()`;
     /// the handle doesn't keep a copy, so the CLI passes it back in.
     #[must_use]
-    pub fn route_diagnostics(&self, config: &ProxyConfig) -> Vec<(String, String)> {
-        let mut rows = Vec::with_capacity(config.routes.len());
+    pub fn route_diagnostics(&self, config: &ProxyConfig) -> Vec<String> {
+        // Reconstruct the same host filter the server applies (see `start`).
+        // A credential/endpoint route only injects or filters; traffic still
+        // has to clear the allowlist to reach the upstream at all. A route
+        // whose upstream is not allow-listed is dead config (the proxy 403s
+        // it), so skip it here rather than advertise an unreachable route.
+        let filter = if config.strict_filter {
+            crate::filter::ProxyFilter::new_strict(&config.allowed_hosts)
+        } else if config.allowed_hosts.is_empty() {
+            crate::filter::ProxyFilter::allow_all()
+        } else {
+            crate::filter::ProxyFilter::new(&config.allowed_hosts)
+        };
+        // Hostname-only reachability: pass no resolved IPs so the link-local
+        // SSRF check is skipped (that is a runtime DNS concern, not a config
+        // one) and only the deny-list / allowlist hostname rules apply.
+        let upstream_reachable = |upstream: &str| -> bool {
+            match crate::route::extract_host_port(upstream) {
+                Some(host_port) => {
+                    let host = host_port
+                        .rsplit_once(':')
+                        .map(|(h, _)| h)
+                        .unwrap_or(&host_port);
+                    filter.check_host_with_ips(host, &[]).is_allowed()
+                }
+                // Unparseable upstream can't be matched against the allowlist;
+                // keep it visible rather than silently hiding a misconfig.
+                None => true,
+            }
+        };
+
+        // Group routes by upstream, preserving first-seen order. Route counts
+        // are small (a handful), so the linear scan per route is cheap.
+        let mut groups: Vec<(&str, Vec<&crate::config::RouteConfig>)> = Vec::new();
         for route in &config.routes {
-            let prefix = route.prefix.trim_matches('/').to_string();
-            let cred_summary = self.credential_status_summary(&prefix, route);
+            if !upstream_reachable(&route.upstream) {
+                continue;
+            }
+            if let Some(group) = groups
+                .iter_mut()
+                .find(|(u, _)| *u == route.upstream.as_str())
+            {
+                group.1.push(route);
+            } else {
+                groups.push((route.upstream.as_str(), vec![route]));
+            }
+        }
+
+        let mut rows = Vec::with_capacity(groups.len());
+        for (upstream, group) in &groups {
+            // Credential summary comes from the credential-bearing route in the
+            // group (if any); the `_ep_` route never carries one.
+            //
+            // A group may still be covered by a credential route on *another*
+            // upstream: a wildcard credential route (e.g. `*.githubusercontent.com`)
+            // matches concrete `_ep_` hosts (`raw.githubusercontent.com`) at
+            // request time via `host_port_matches`. Reporting that covering
+            // credential keeps the display honest — the token really is injected.
+            let own_cred = group
+                .iter()
+                .find(|r| r.credential_key.is_some() || r.oauth2.is_some() || r.aws_auth.is_some());
+            let covering_cred = own_cred.copied().or_else(|| {
+                let host_port = crate::route::extract_host_port(upstream)?;
+                config.routes.iter().find(|r| {
+                    (r.credential_key.is_some() || r.oauth2.is_some() || r.aws_auth.is_some())
+                        && crate::route::extract_host_port(&r.upstream)
+                            .is_some_and(|hp| crate::route::host_port_matches(&hp, &host_port))
+                })
+            });
+            let cred_route = covering_cred.unwrap_or(group[0]);
+            let cred_prefix = cred_route.prefix.trim_matches('/');
+            let cred_summary = self.credential_status_summary(cred_prefix, cred_route);
 
             let intercept_summary = if self.intercept_ca_path.is_some()
-                && (route.credential_key.is_some()
-                    || route.oauth2.is_some()
-                    || !route.endpoint_rules.is_empty()
-                    || route.endpoint_policy.is_some())
-            {
+                && group.iter().any(|r| {
+                    r.credential_key.is_some()
+                        || r.oauth2.is_some()
+                        || !r.endpoint_rules.is_empty()
+                        || r.endpoint_policy.is_some()
+                }) {
                 "intercept: on"
             } else {
                 "intercept: off"
             };
 
-            let rules_summary = if route.endpoint_policy.is_some() {
+            let rules_summary = if group.iter().any(|r| r.endpoint_policy.is_some()) {
                 "endpoint_policy: on".to_string()
             } else {
-                format!("endpoint_rules: {}", route.endpoint_rules.len())
+                let total: usize = group.iter().map(|r| r.endpoint_rules.len()).sum();
+                format!("endpoint_rules: {}", total)
             };
-            let summary = format!(
-                "→ {} | {} | {} | {}",
-                route.upstream, cred_summary, intercept_summary, rules_summary
-            );
-            rows.push((prefix, summary));
+            rows.push(format!(
+                "{} | {} | {} | {}",
+                upstream, cred_summary, intercept_summary, rules_summary
+            ));
         }
         rows
     }
@@ -1531,18 +1610,278 @@ mod tests {
         let rows = handle.route_diagnostics(&config);
         assert_eq!(rows.len(), 2);
 
-        let openai = rows.iter().find(|(p, _)| p == "openai").unwrap();
-        assert!(openai.1.contains("api.openai.com"));
-        assert!(openai.1.contains("intercept: on"));
+        let openai = rows.iter().find(|s| s.contains("api.openai.com")).unwrap();
+        assert!(openai.contains("intercept: on"));
         assert!(
-            openai.1.contains("✗") || openai.1.contains("credential_not_found"),
+            openai.contains("✗") || openai.contains("credential_not_found"),
             "missing credential should show structured code, got: {}",
-            openai.1
+            openai
         );
 
-        let alias = rows.iter().find(|(p, _)| p == "alias").unwrap();
-        assert!(alias.1.contains("creds: none"));
-        assert!(alias.1.contains("intercept: off"));
+        let alias = rows
+            .iter()
+            .find(|s| s.contains("aliased.example.com"))
+            .unwrap();
+        assert!(alias.contains("creds: none"));
+        assert!(alias.contains("intercept: off"));
+
+        handle.shutdown();
+    }
+
+    /// A credential route and the synthetic `_ep_<host>` endpoint-authorization
+    /// route for the same upstream collapse into a single diagnostic row that
+    /// carries the credential and the summed endpoint-rule count, rather than
+    /// surfacing the internal split as a credential-less duplicate.
+    #[tokio::test]
+    async fn test_route_diagnostics_groups_credential_and_endpoint_routes() {
+        let dir = tempfile::tempdir().unwrap();
+        let endpoint_rule = crate::config::EndpointRule {
+            method: "GET".to_string(),
+            path: "/repos/*".to_string(),
+        };
+        let config = ProxyConfig {
+            routes: vec![
+                // Credential catch-all route (no endpoint rules).
+                crate::config::RouteConfig {
+                    prefix: "github_api".to_string(),
+                    upstream: "https://api.github.com".to_string(),
+                    credential_key: Some("env://NONO_TEST_MISSING".to_string()),
+                    inject_mode: Default::default(),
+                    inject_header: "Authorization".to_string(),
+                    credential_format: Some("Bearer {}".to_string()),
+                    path_pattern: None,
+                    path_replacement: None,
+                    query_param_name: None,
+                    proxy: None,
+                    env_var: None,
+                    endpoint_rules: vec![],
+                    endpoint_policy: None,
+                    tls_ca: None,
+                    tls_client_cert: None,
+                    tls_client_key: None,
+                    oauth2: None,
+                    aws_auth: None,
+                },
+                // Synthetic endpoint-authorization route for the same upstream.
+                crate::config::RouteConfig {
+                    prefix: "_ep_api.github.com".to_string(),
+                    upstream: "https://api.github.com".to_string(),
+                    credential_key: None,
+                    inject_mode: Default::default(),
+                    inject_header: "Authorization".to_string(),
+                    credential_format: None,
+                    path_pattern: None,
+                    path_replacement: None,
+                    query_param_name: None,
+                    proxy: None,
+                    env_var: None,
+                    endpoint_rules: vec![endpoint_rule.clone(), endpoint_rule],
+                    endpoint_policy: None,
+                    tls_ca: None,
+                    tls_client_cert: None,
+                    tls_client_key: None,
+                    oauth2: None,
+                    aws_auth: None,
+                },
+            ],
+            intercept_ca_dir: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        };
+        let handle = start(config.clone()).await.unwrap();
+        let rows = handle.route_diagnostics(&config);
+
+        // Two routes, one upstream → a single grouped row.
+        assert_eq!(rows.len(), 1, "routes sharing an upstream should collapse");
+        let summary = &rows[0];
+        assert!(summary.contains("api.github.com"));
+        // Credential status comes from the credential-bearing route, not `none`.
+        assert!(
+            !summary.contains("creds: none"),
+            "grouped row must carry the credential, got: {summary}"
+        );
+        // Endpoint rules from the `_ep_` route are summed onto the row.
+        assert!(
+            summary.contains("endpoint_rules: 2"),
+            "grouped row must sum endpoint rules, got: {summary}"
+        );
+        assert!(summary.contains("intercept: on"));
+
+        handle.shutdown();
+    }
+
+    /// An `_ep_` route on a concrete subdomain (`raw.githubusercontent.com`)
+    /// stays its own row but reports the credential from the covering wildcard
+    /// route (`*.githubusercontent.com`) rather than `creds: none`, because the
+    /// wildcard route injects that credential for the subdomain at request time.
+    #[tokio::test]
+    async fn test_route_diagnostics_reports_covering_wildcard_credential() {
+        let dir = tempfile::tempdir().unwrap();
+        let endpoint_rule = crate::config::EndpointRule {
+            method: "GET".to_string(),
+            path: "/**".to_string(),
+        };
+        let config = ProxyConfig {
+            routes: vec![
+                // Wildcard credential route.
+                crate::config::RouteConfig {
+                    prefix: "github_raw".to_string(),
+                    upstream: "https://*.githubusercontent.com".to_string(),
+                    credential_key: Some("env://NONO_TEST_MISSING".to_string()),
+                    inject_mode: Default::default(),
+                    inject_header: "Authorization".to_string(),
+                    credential_format: Some("Bearer {}".to_string()),
+                    path_pattern: None,
+                    path_replacement: None,
+                    query_param_name: None,
+                    proxy: None,
+                    env_var: None,
+                    endpoint_rules: vec![],
+                    endpoint_policy: None,
+                    tls_ca: None,
+                    tls_client_cert: None,
+                    tls_client_key: None,
+                    oauth2: None,
+                    aws_auth: None,
+                },
+                // `_ep_` route on a concrete subdomain covered by the wildcard.
+                crate::config::RouteConfig {
+                    prefix: "_ep_raw.githubusercontent.com".to_string(),
+                    upstream: "https://raw.githubusercontent.com".to_string(),
+                    credential_key: None,
+                    inject_mode: Default::default(),
+                    inject_header: "Authorization".to_string(),
+                    credential_format: None,
+                    path_pattern: None,
+                    path_replacement: None,
+                    query_param_name: None,
+                    proxy: None,
+                    env_var: None,
+                    endpoint_rules: vec![endpoint_rule],
+                    endpoint_policy: None,
+                    tls_ca: None,
+                    tls_client_cert: None,
+                    tls_client_key: None,
+                    oauth2: None,
+                    aws_auth: None,
+                },
+            ],
+            intercept_ca_dir: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        };
+        let handle = start(config.clone()).await.unwrap();
+        let rows = handle.route_diagnostics(&config);
+
+        // Distinct upstreams → two rows (no merge across different hosts).
+        assert_eq!(rows.len(), 2, "distinct upstreams must not merge");
+        let ep_row = rows
+            .iter()
+            .find(|s| s.contains("raw.githubusercontent.com") && !s.contains('*'))
+            .expect("subdomain row present");
+        // The covering wildcard credential is reported, not `none`.
+        assert!(
+            !ep_row.contains("creds: none"),
+            "covered subdomain must report the wildcard credential, got: {}",
+            ep_row
+        );
+        assert!(ep_row.contains("endpoint_rules: 1"));
+
+        handle.shutdown();
+    }
+
+    /// A credential route whose upstream is not in the host allowlist is dead
+    /// config — traffic to it would be denied by the filter regardless of the
+    /// injected credential — so it is omitted from the diagnostics entirely.
+    #[tokio::test]
+    async fn test_route_diagnostics_omits_unreachable_upstream() {
+        let dir = tempfile::tempdir().unwrap();
+        let route = |prefix: &str, upstream: &str| crate::config::RouteConfig {
+            prefix: prefix.to_string(),
+            upstream: upstream.to_string(),
+            credential_key: Some("env://NONO_TEST_MISSING".to_string()),
+            inject_mode: Default::default(),
+            inject_header: "Authorization".to_string(),
+            credential_format: Some("Bearer {}".to_string()),
+            path_pattern: None,
+            path_replacement: None,
+            query_param_name: None,
+            proxy: None,
+            env_var: None,
+            endpoint_rules: vec![],
+            endpoint_policy: None,
+            tls_ca: None,
+            tls_client_cert: None,
+            tls_client_key: None,
+            oauth2: None,
+            aws_auth: None,
+        };
+        let config = ProxyConfig {
+            routes: vec![
+                route("github_api", "https://api.github.com"),
+                route("datadog", "https://api.datadoghq.com"),
+            ],
+            // Only github is allow-listed; datadog's upstream is unreachable.
+            allowed_hosts: vec!["api.github.com".to_string()],
+            intercept_ca_dir: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        };
+        let handle = start(config.clone()).await.unwrap();
+        let rows = handle.route_diagnostics(&config);
+
+        assert_eq!(rows.len(), 1, "unreachable upstream must be omitted");
+        assert!(rows[0].contains("api.github.com"));
+        assert!(
+            !rows.iter().any(|s| s.contains("datadoghq.com")),
+            "non-allow-listed upstream must not be listed, got: {rows:?}"
+        );
+
+        handle.shutdown();
+    }
+
+    /// Strict mode with a non-empty allowlist behaves the same: a route to a
+    /// non-allow-listed upstream is omitted, an allow-listed one is shown.
+    #[tokio::test]
+    async fn test_route_diagnostics_respects_wildcard_allowlist() {
+        let dir = tempfile::tempdir().unwrap();
+        let route = |prefix: &str, upstream: &str| crate::config::RouteConfig {
+            prefix: prefix.to_string(),
+            upstream: upstream.to_string(),
+            credential_key: Some("env://NONO_TEST_MISSING".to_string()),
+            inject_mode: Default::default(),
+            inject_header: "Authorization".to_string(),
+            credential_format: Some("Bearer {}".to_string()),
+            path_pattern: None,
+            path_replacement: None,
+            query_param_name: None,
+            proxy: None,
+            env_var: None,
+            endpoint_rules: vec![],
+            endpoint_policy: None,
+            tls_ca: None,
+            tls_client_cert: None,
+            tls_client_key: None,
+            oauth2: None,
+            aws_auth: None,
+        };
+        let config = ProxyConfig {
+            routes: vec![
+                route("github_raw", "https://raw.githubusercontent.com"),
+                route("evil", "https://evil.example.com"),
+            ],
+            // Wildcard covers the githubusercontent subdomain but not evil.
+            allowed_hosts: vec!["*.githubusercontent.com".to_string()],
+            strict_filter: true,
+            intercept_ca_dir: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        };
+        let handle = start(config.clone()).await.unwrap();
+        let rows = handle.route_diagnostics(&config);
+
+        assert_eq!(rows.len(), 1, "only the wildcard-covered upstream remains");
+        assert!(rows[0].contains("raw.githubusercontent.com"));
+        assert!(
+            !rows.iter().any(|s| s.contains("evil.example.com")),
+            "upstream outside the wildcard must be omitted, got: {rows:?}"
+        );
 
         handle.shutdown();
     }

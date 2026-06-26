@@ -55,8 +55,26 @@ pub(crate) fn run_proxy(args: ProxyArgs, silent: bool) -> Result<()> {
         proxy_config.session_token = Some(zeroize::Zeroizing::new(pass.clone()));
     }
 
-    // Share the same TLS-intercept wiring as the sandboxed path.
+    // Share the same TLS-intercept wiring as the sandboxed path (sets the
+    // intercept CA output directory and merges the parent SSL_CERT_FILE).
     apply_tls_intercept_config(&mut proxy_config, &proxy)?;
+
+    // An explicit `--proxy-ca-cert`/`--proxy-ca-key` pair reuses a caller-owned
+    // CA across runs instead of the per-session ephemeral one. Load and
+    // validate it eagerly so a bad key/cert fails the command with a clear
+    // error, rather than silently downgrading to no interception at server
+    // start.
+    if let (Some(cert_path), Some(key_path)) = (&args.proxy_ca_cert, &args.proxy_ca_key) {
+        #[cfg(target_os = "macos")]
+        if args.trust_proxy_ca {
+            return Err(NonoError::ConfigParse(
+                "--proxy-ca-cert cannot be combined with --trust-proxy-ca; the former supplies \
+                 its own CA while the latter manages one in the macOS Keychain"
+                    .to_string(),
+            ));
+        }
+        proxy_config.preloaded_ca = Some(load_preloaded_ca(cert_path, key_path)?);
+    }
 
     // Build the credential-capture backend (for `cmd://` credential routes) and
     // approval registry from the profile, mirroring `start_proxy_runtime`. Without
@@ -101,6 +119,44 @@ pub(crate) fn run_proxy(args: ProxyArgs, silent: bool) -> Result<()> {
     handle.shutdown();
     info!("Proxy server stopped");
     Ok(())
+}
+
+/// Load a caller-supplied CA from a cert PEM file and a PKCS#8 key PEM file
+/// into a [`PreloadedCa`] for cross-run TLS interception.
+///
+/// Both files are read, recombined into the single key+cert bundle that
+/// `split_key_cert_pem` expects, and then round-tripped through
+/// [`EphemeralCa::from_existing`] so a mismatched key/cert pair is rejected
+/// here with a clear error instead of failing later during TLS handshakes.
+/// The parsed CA is discarded; only the validated material is kept.
+fn load_preloaded_ca(
+    cert_path: &std::path::Path,
+    key_path: &std::path::Path,
+) -> Result<nono_proxy::config::PreloadedCa> {
+    let cert_pem = std::fs::read_to_string(cert_path).map_err(|e| {
+        NonoError::ConfigParse(format!(
+            "failed to read --proxy-ca-cert {}: {e}",
+            cert_path.display()
+        ))
+    })?;
+    let key_pem = zeroize::Zeroizing::new(std::fs::read_to_string(key_path).map_err(|e| {
+        NonoError::ConfigParse(format!(
+            "failed to read --proxy-ca-key {}: {e}",
+            key_path.display()
+        ))
+    })?);
+
+    // `split_key_cert_pem` extracts the PKCS#8 key as DER and returns the cert
+    // PEM; the key must come first in the combined bundle.
+    let combined = zeroize::Zeroizing::new(format!("{}{}", &*key_pem, cert_pem));
+    let (key_der, cert_pem) = nono_proxy::tls_intercept::ca::split_key_cert_pem(&combined)
+        .map_err(|e| NonoError::ConfigParse(format!("invalid proxy CA material: {e}")))?;
+
+    // Validate key/cert binding up front (also rejects a non-CA certificate).
+    nono_proxy::tls_intercept::ca::EphemeralCa::from_existing(&key_der, &cert_pem)
+        .map_err(|e| NonoError::ConfigParse(format!("invalid proxy CA material: {e}")))?;
+
+    Ok(nono_proxy::config::PreloadedCa { key_der, cert_pem })
 }
 
 /// Merge profile-derived settings (if `--profile` was given) with explicit
@@ -305,8 +361,8 @@ fn print_connection_info(
     if !route_rows.is_empty() {
         println!();
         println!("  {}", "routes:".bold());
-        for (prefix, summary) in &route_rows {
-            println!("    /{}  {}", prefix, summary);
+        for summary in &route_rows {
+            println!("    {}", summary);
         }
     }
 
@@ -335,6 +391,8 @@ mod tests {
         "NONO_UPSTREAM_PROXY",
         "NONO_UPSTREAM_BYPASS",
         "NONO_PROXY_CA_VALIDITY",
+        "NONO_PROXY_CA_CERT",
+        "NONO_PROXY_CA_KEY",
         "NONO_TRUST_PROXY_CA",
         "NONO_CREDENTIAL",
     ];
@@ -478,5 +536,71 @@ mod tests {
         let args = parse_args(&["--allow-endpoint", "github:GET"]);
         let err = build_launch_options(&args).expect_err("missing path must fail");
         assert!(matches!(err, NonoError::ConfigParse(_)), "got {err:?}");
+    }
+
+    /// Write a fresh, self-consistent CA key+cert pair to two temp files and
+    /// return their paths (plus the tempdir, which must outlive them).
+    fn write_ca_pair() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let ca = nono_proxy::tls_intercept::ca::EphemeralCa::generate().expect("generate CA");
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let cert_path = dir.path().join("ca.crt");
+        let key_path = dir.path().join("ca.key");
+        std::fs::write(&cert_path, ca.cert_pem()).expect("write cert");
+        std::fs::write(&key_path, &*ca.key_pem()).expect("write key");
+        (dir, cert_path, key_path)
+    }
+
+    #[test]
+    fn load_preloaded_ca_accepts_matching_pair() {
+        let (_dir, cert_path, key_path) = write_ca_pair();
+        let preloaded =
+            load_preloaded_ca(&cert_path, &key_path).expect("matching CA pair must load");
+        assert!(!preloaded.key_der.is_empty());
+        assert!(preloaded.cert_pem.contains("BEGIN CERTIFICATE"));
+    }
+
+    #[test]
+    fn load_preloaded_ca_rejects_mismatched_key() {
+        // Cert from one CA, key from another: from_existing must reject the
+        // binding rather than silently accept it.
+        let (_dir_a, cert_path, _key_a) = write_ca_pair();
+        let (_dir_b, _cert_b, key_path) = write_ca_pair();
+        let err = load_preloaded_ca(&cert_path, &key_path)
+            .expect_err("mismatched key/cert must be rejected");
+        assert!(matches!(err, NonoError::ConfigParse(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn load_preloaded_ca_rejects_missing_file() {
+        let (_dir, cert_path, key_path) = write_ca_pair();
+        std::fs::remove_file(&key_path).expect("remove key");
+        let err =
+            load_preloaded_ca(&cert_path, &key_path).expect_err("missing key file must error");
+        assert!(matches!(err, NonoError::ConfigParse(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn proxy_ca_cert_requires_key() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _env = cleared_env();
+        // clap enforces the mutual `requires`: cert without key is a parse error.
+        let res = ProxyArgs::try_parse_from(["proxy", "--proxy-ca-cert", "/tmp/ca.crt"]);
+        assert!(res.is_err(), "cert without key must fail to parse");
+    }
+
+    #[test]
+    fn proxy_ca_cert_conflicts_with_validity() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _env = cleared_env();
+        let res = ProxyArgs::try_parse_from([
+            "proxy",
+            "--proxy-ca-cert",
+            "/tmp/ca.crt",
+            "--proxy-ca-key",
+            "/tmp/ca.key",
+            "--proxy-ca-validity",
+            "30",
+        ]);
+        assert!(res.is_err(), "supplying a CA and a validity must conflict");
     }
 }

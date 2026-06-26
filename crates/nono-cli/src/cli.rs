@@ -1538,6 +1538,33 @@ pub struct ProxyArgs {
     )]
     pub proxy_ca_validity: Option<u32>,
 
+    /// Sign intercepted TLS connections with this existing CA certificate
+    /// (PEM) instead of a fresh per-session CA. Reuses the same CA across
+    /// proxy runs so clients only have to trust it once. Requires
+    /// --proxy-ca-key. Validity comes from the supplied certificate, so it
+    /// cannot be combined with --proxy-ca-validity.
+    #[arg(
+        long,
+        value_name = "PEM_FILE",
+        env = "NONO_PROXY_CA_CERT",
+        requires = "proxy_ca_key",
+        conflicts_with = "proxy_ca_validity",
+        help_heading = "NETWORK"
+    )]
+    pub proxy_ca_cert: Option<PathBuf>,
+
+    /// Private key (PKCS#8 PEM) for --proxy-ca-cert. Prefer
+    /// NONO_PROXY_CA_KEY to keep the path out of shell history; the key file
+    /// itself should be readable only by you.
+    #[arg(
+        long,
+        value_name = "PEM_FILE",
+        env = "NONO_PROXY_CA_KEY",
+        requires = "proxy_ca_cert",
+        help_heading = "NETWORK"
+    )]
+    pub proxy_ca_key: Option<PathBuf>,
+
     // ── Credentials ──────────────────────────────────────────────────────
     /// Inject credentials via reverse proxy for a service (repeatable)
     /// ALIAS(canonical="--credential", introduced="v0.0.0", remove_by="v1.0.0", issue="#143")

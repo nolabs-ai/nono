@@ -1,0 +1,140 @@
+---
+title: SPIFFE / SPIRE Workload Identity
+description: Authenticate outbound requests using SPIFFE SVIDs — no secrets in your profile, no credentials visible to the sandboxed process.
+---
+
+nono integrates with the [SPIFFE Workload API](https://spiffe.io) to authenticate outbound API
+calls using workload identity. Instead of storing a secret in a keystore or profile, nono contacts
+the local SPIRE agent socket at startup, obtains a credential, and handles injection automatically.
+The sandboxed process makes a plain HTTP request and is never aware a credential was used.
+
+Both SVID types are supported:
+
+- **X.509-SVID** — nono presents the cert chain as a TLS client certificate (mTLS). SVIDs rotate
+  in the background without restarting.
+- **JWT-SVID** — nono fetches a short-lived token per request and injects it as a bearer header.
+  Refresh is handled by the SPIRE agent cache.
+
+Most of the operational work lives on the SPIRE side: running the server and agent, writing
+attestation policies, and registering workload entries. nono's profile config is just a socket
+path and what to request.
+
+---
+
+## Profile configuration
+
+Add a `spiffe` block to any custom credential route. It is mutually exclusive with `credential_key`,
+`oauth2`, and `aws_auth`.
+
+### JWT-SVID
+
+```json
+{
+  "network": {
+    "credentials": ["my-api"],
+    "custom_credentials": {
+      "my-api": {
+        "upstream": "https://api.internal.example.com",
+        "spiffe": {
+          "type": "jwt",
+          "workload_api_socket": "/var/run/spire/sockets/agent.sock",
+          "audience": ["https://api.internal.example.com"],
+          "inject_header": "Authorization"
+        }
+      }
+    }
+  }
+}
+```
+
+nono injects the token as `Authorization: Bearer <jwt>`. Change `inject_header` to target a
+different header, or set `credential_format` to change the value format (`{}` is replaced by
+the token).
+
+### X.509-SVID (mTLS)
+
+```json
+{
+  "network": {
+    "credentials": ["my-api"],
+    "custom_credentials": {
+      "my-api": {
+        "upstream": "https://api.internal.example.com",
+        "spiffe": {
+          "type": "x509",
+          "workload_api_socket": "/var/run/spire/sockets/agent.sock",
+          "expected_upstream_spiffe_id": "spiffe://example.com/api"
+        }
+      }
+    }
+  }
+}
+```
+
+nono presents the X.509-SVID as a client certificate during the TLS handshake.
+`expected_upstream_spiffe_id` is optional but recommended — nono will reject the upstream if its
+URI SAN does not match.
+
+If the upstream uses a private CA or self-signed cert, set `tls_ca` at the route level alongside
+`spiffe`:
+
+```json
+{
+  "upstream": "https://api.internal.example.com",
+  "tls_ca": "/path/to/ca.pem",
+  "spiffe": { ... }
+}
+```
+
+---
+
+## Options reference
+
+| Field | Applies to | Description |
+|---|---|---|
+| `workload_api_socket` | both | Path to the SPIRE agent socket |
+| `audience` | JWT | Audience(s) for the minted token |
+| `inject_header` | JWT | Header to inject into (default: `Authorization`) |
+| `credential_format` | JWT | Format string; `{}` replaced by the token (default: `Bearer {}`) |
+| `svid_hint` | X.509 | Prefer the SVID with this hint when multiple are available |
+| `expected_upstream_spiffe_id` | X.509 | Reject upstreams whose URI SAN does not match |
+
+---
+
+## What nono handles
+
+- Connecting to the Workload API on startup — fails immediately if the socket is unreachable
+- Fetching and injecting the right credential (JWT bearer or X.509 client cert)
+- Background SVID rotation without process restart or credential interruption
+- Zeroing JWT token memory on drop
+
+## What the SPIRE operator handles
+
+Everything else. nono's interface to SPIRE is the Workload API socket — it has no knowledge of
+how attestation works, what selectors are in use, or what environment it is running in. The same
+profile works anywhere SPIFFE runs:
+
+| Environment | Attestation method |
+|---|---|
+| Linux / macOS | `unix:uid` — kernel `SO_PEERCRED` |
+| Kubernetes | pod UID, namespace, service account labels |
+| AWS EC2 | instance identity document |
+| GCP / Azure | instance metadata |
+
+Only `workload_api_socket` changes between environments.
+
+The operator's responsibilities are:
+
+1. Run the SPIRE server and agent
+2. Register a workload entry mapping nono's platform identity to a SPIFFE ID:
+   ```bash
+   spire-server entry create \
+       -spiffeID "spiffe://example.com/nono-supervisor" \
+       -selector "unix:uid:$(id -u)"
+   ```
+3. For JWT routes: configure an OIDC discovery provider so upstreams can verify tokens without
+   any knowledge of SPIRE
+4. For X.509 routes: ensure the upstream is configured to accept the SPIFFE trust domain's CA
+
+nono (the supervisor process) is the registered workload — not the process inside the sandbox.
+The sandboxed process cannot reach the SPIRE socket and has no credential visibility.

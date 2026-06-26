@@ -33,6 +33,8 @@ pub mod pool;
 pub mod reverse;
 pub mod route;
 pub mod server;
+#[cfg(feature = "spiffe")]
+pub mod spiffe;
 pub mod tls_intercept;
 pub mod token;
 

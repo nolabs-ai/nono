@@ -12,10 +12,13 @@ keywords = ["sandbox", "security", "proxy", "network"]
 categories = ["network-programming", "web-programming"]
 
 [features]
-default = ["system-keyring"]
+default = ["system-keyring", "spiffe"]
 # Enables OS system keyring access (macOS Keychain / Linux Secret Service).
 # Headless/container consumers opt out with default-features = false.
 system-keyring = ["nono/system-keyring"]
+# SPIFFE/SPIRE Workload API support for upstream mTLS and JWT-SVID auth.
+# Embedders who do not need SPIFFE can opt out with default-features = false.
+spiffe = ["dep:spiffe-workload", "dep:arc-swap", "dep:tokio-util"]
 
 [dependencies]
 nono = { version = "0.65.1", path = "../nono", default-features = false }
@@ -62,6 +65,15 @@ rustls-native-certs = "0.8"
 # transitive dep of rcgen; declared explicitly because we use OffsetDateTime
 # directly to set not_before/not_after.
 time = { version = "0.3", default-features = false, features = ["std"] }
+
+# SPIFFE Workload API client for X.509-SVID mTLS and JWT-SVID bearer auth.
+# Aliased to avoid colliding with any future `spiffe` naming in the workspace.
+# Features: x509-source (streaming SVID rotation) + jwt-source (JWT fetch/refresh).
+spiffe-workload = { package = "spiffe", version = "0.16", optional = true, features = ["x509-source", "jwt-source"] }
+# Direct deps used in spiffe.rs (also transitive from spiffe-workload but must
+# be declared directly when accessed in our own code).
+arc-swap = { version = "1", optional = true }
+tokio-util = { version = "0.7", optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true

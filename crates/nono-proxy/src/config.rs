@@ -302,6 +302,50 @@ pub struct RouteConfig {
     /// credentials. Mutually exclusive with `credential_key` and `oauth2`.
     #[serde(default)]
     pub aws_auth: Option<AwsAuthConfig>,
+
+    /// SPIFFE/SPIRE workload identity auth. Mutually exclusive with `credential_key`, `oauth2`, and `aws_auth`.
+    /// See `SpiffeAuthConfig` for JWT-SVID and X.509-SVID options.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spiffe: Option<SpiffeAuthConfig>,
+}
+
+/// SPIFFE/SPIRE auth for an upstream route.
+///
+/// `type: "x509"` — mTLS with an X.509-SVID (client cert presented during TLS handshake).
+/// `type: "jwt"` — JWT-SVID injected as a bearer token into the configured header.
+///
+/// In both cases the sandboxed process makes a plain request with no credentials;
+/// nono fetches the SVID from the SPIRE Workload API and handles everything.
+/// The SPIRE operator's job is to register the workload entry and configure the agent —
+/// nono's config is just the socket path and what to request.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SpiffeAuthConfig {
+    /// Upstream mTLS with an X.509-SVID. The proxy presents the cert chain during the
+    /// TLS handshake; SVIDs rotate in the background without restarting the process.
+    X509 {
+        /// Path to the SPIRE agent Unix domain socket.
+        workload_api_socket: String,
+        /// Prefer this SVID hint when the Workload API returns multiple; falls back to first.
+        #[serde(default)]
+        svid_hint: Option<String>,
+        /// Reject upstreams whose URI SAN does not match this SPIFFE ID.
+        #[serde(default)]
+        expected_upstream_spiffe_id: Option<String>,
+    },
+    /// JWT-SVID injected as a bearer token. Tokens refresh before expiry via the agent cache.
+    Jwt {
+        /// Path to the SPIRE agent Unix domain socket.
+        workload_api_socket: String,
+        /// Audience(s) for the minted JWT-SVID.
+        audience: Vec<String>,
+        /// Header to inject into (default: `Authorization`).
+        #[serde(default = "default_inject_header")]
+        inject_header: String,
+        /// Format string; `{}` is replaced by the token. Default: `Bearer {}`.
+        #[serde(default)]
+        credential_format: Option<String>,
+    },
 }
 
 /// Optional proxy-side overrides for credential injection shape.
@@ -1414,5 +1458,95 @@ mod tests {
         assert!(aws.profile.is_none());
         assert!(aws.region.is_none());
         assert!(aws.service.is_none());
+    }
+
+    #[test]
+    fn test_spiffe_x509_config_roundtrip() {
+        let json = r#"{
+            "prefix": "internal-api",
+            "upstream": "https://api.internal.example",
+            "spiffe": {
+                "type": "x509",
+                "workload_api_socket": "/run/spire/sockets/agent.sock",
+                "svid_hint": "internal",
+                "expected_upstream_spiffe_id": "spiffe://prod.example/internal/api"
+            }
+        }"#;
+        let route: RouteConfig = serde_json::from_str(json).unwrap();
+        assert!(route.spiffe.is_some());
+        let SpiffeAuthConfig::X509 {
+            workload_api_socket,
+            svid_hint,
+            expected_upstream_spiffe_id,
+        } = route.spiffe.unwrap()
+        else {
+            panic!("expected X509 variant");
+        };
+        assert_eq!(workload_api_socket, "/run/spire/sockets/agent.sock");
+        assert_eq!(svid_hint.as_deref(), Some("internal"));
+        assert_eq!(
+            expected_upstream_spiffe_id.as_deref(),
+            Some("spiffe://prod.example/internal/api")
+        );
+    }
+
+    #[test]
+    fn test_spiffe_jwt_config_roundtrip() {
+        let json = r#"{
+            "prefix": "inventory",
+            "upstream": "https://inventory.internal.example",
+            "spiffe": {
+                "type": "jwt",
+                "workload_api_socket": "/run/spire/sockets/agent.sock",
+                "audience": ["inventory.internal.example"],
+                "inject_header": "Authorization",
+                "credential_format": "Bearer {}"
+            }
+        }"#;
+        let route: RouteConfig = serde_json::from_str(json).unwrap();
+        let SpiffeAuthConfig::Jwt {
+            workload_api_socket,
+            audience,
+            inject_header,
+            credential_format,
+        } = route.spiffe.unwrap()
+        else {
+            panic!("expected JWT variant");
+        };
+        assert_eq!(workload_api_socket, "/run/spire/sockets/agent.sock");
+        assert_eq!(audience, vec!["inventory.internal.example"]);
+        assert_eq!(inject_header, "Authorization");
+        assert_eq!(credential_format.as_deref(), Some("Bearer {}"));
+    }
+
+    #[test]
+    fn test_spiffe_absent_by_default() {
+        let json = r#"{"prefix": "openai", "upstream": "https://api.openai.com"}"#;
+        let route: RouteConfig = serde_json::from_str(json).unwrap();
+        assert!(route.spiffe.is_none());
+    }
+
+    #[test]
+    fn test_spiffe_x509_minimal_config() {
+        // svid_hint and expected_upstream_spiffe_id are optional
+        let json = r#"{
+            "prefix": "svc",
+            "upstream": "https://svc.internal",
+            "spiffe": {
+                "type": "x509",
+                "workload_api_socket": "/tmp/agent.sock"
+            }
+        }"#;
+        let route: RouteConfig = serde_json::from_str(json).unwrap();
+        let SpiffeAuthConfig::X509 {
+            svid_hint,
+            expected_upstream_spiffe_id,
+            ..
+        } = route.spiffe.unwrap()
+        else {
+            panic!("expected X509 variant");
+        };
+        assert!(svid_hint.is_none());
+        assert!(expected_upstream_spiffe_id.is_none());
     }
 }

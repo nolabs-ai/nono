@@ -799,12 +799,17 @@ pub(crate) async fn resolve_managed_credential<'a>(
     let cmd_route = service.and_then(|s| credential_store.get_cmd(s));
     let oauth2_route = service.and_then(|s| credential_store.get_oauth2(s));
     let aws_route = service.and_then(|s| credential_store.get_aws(s));
+    #[cfg(feature = "spiffe")]
+    let has_spiffe = route.is_some_and(|rt| rt.has_spiffe_source());
+    #[cfg(not(feature = "spiffe"))]
+    let has_spiffe = false;
 
     if let Some(rt) = route
         && rt.missing_managed_credential(
             static_cred.is_some() || (cmd_route.is_some() && credential_capture_backend.is_some()),
             oauth2_route.is_some(),
             aws_route.is_some(),
+            has_spiffe,
         )
     {
         let svc = service.unwrap_or("unknown");
@@ -936,6 +941,16 @@ where
     };
     let service: Option<&str> = selected.map(|(s, _)| s);
     let route: Option<&crate::route::LoadedRoute> = selected.map(|(_, r)| r);
+
+    // SPIFFE routes bypass the normal credential resolution path entirely and
+    // use mTLS / JWT-SVID auth instead of injected headers.
+    #[cfg(feature = "spiffe")]
+    if route.is_some_and(|rt| rt.has_spiffe_source())
+        && let (Some(svc), Some(rt)) = (service, route)
+    {
+        return handle_spiffe_intercept_request(tls_stream, ctx, &req, svc, rt, &method, &path)
+            .await;
+    }
 
     // OAuth2 presence only affects the audit `managed_credential_active` flag
     // on this path; injection is not performed for intercepted requests.
@@ -1092,6 +1107,164 @@ where
     Ok(())
 }
 
+#[cfg(feature = "spiffe")]
+#[allow(clippy::too_many_arguments)]
+async fn handle_spiffe_intercept_request<S>(
+    tls_stream: &mut S,
+    ctx: &InterceptCtx<'_>,
+    req: &ParsedRequest,
+    service: &str,
+    route: &crate::route::LoadedRoute,
+    method: &str,
+    path: &str,
+) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let spiffe_auth = match reverse::acquire_spiffe_upstream_auth(route).await {
+        Ok(auth) => auth,
+        Err(e) => {
+            let reason = e.to_string();
+            warn!("tls_intercept: SPIFFE credential unavailable: {}", reason);
+            audit::log_denied(
+                ctx.audit_log,
+                audit::ProxyMode::ConnectIntercept,
+                &audit::EventContext {
+                    route_id: Some(service),
+                    auth_mechanism: route.managed_auth_mechanism.clone(),
+                    auth_outcome: Some(nono::undo::NetworkAuditAuthOutcome::Failed),
+                    managed_credential_active: Some(false),
+                    injection_mode: route.managed_injection_mode.clone(),
+                    denial_category: Some(
+                        nono::undo::NetworkAuditDenialCategory::ManagedCredentialUnavailable,
+                    ),
+                    ..audit::EventContext::default()
+                },
+                ctx.host,
+                ctx.port,
+                &reason,
+            );
+            reverse::send_error_generic(tls_stream, 503, "Service Unavailable").await?;
+            return Ok(());
+        }
+    };
+
+    let spiffe_ctx = nono::undo::SpiffeAuditContext {
+        workload_spiffe_id: spiffe_auth.spiffe_id.clone(),
+        trust_domain: String::new(),
+        upstream_spiffe_id: None,
+    };
+    let event_ctx = audit::EventContext {
+        route_id: Some(service),
+        auth_mechanism: route.managed_auth_mechanism.clone(),
+        auth_outcome: Some(nono::undo::NetworkAuditAuthOutcome::Succeeded),
+        managed_credential_active: Some(true),
+        injection_mode: route.managed_injection_mode.clone(),
+        spiffe_context: Some(spiffe_ctx),
+        ..audit::EventContext::default()
+    };
+
+    let resolved_addrs = match resolve_upstream_or_deny(
+        tls_stream,
+        ctx,
+        audit::EventContext {
+            route_id: Some(service),
+            managed_credential_active: Some(true),
+            injection_mode: route.managed_injection_mode.clone(),
+            ..audit::EventContext::default()
+        },
+    )
+    .await?
+    {
+        Some(addrs) => addrs,
+        None => return Ok(()),
+    };
+
+    let strip_header = spiffe_auth.inject_header.as_deref().unwrap_or("");
+    let filtered_headers = reverse::filter_headers(&req.header_bytes, strip_header);
+    let content_length = reverse::extract_content_length(&req.header_bytes);
+    let body = match reverse::read_request_body(tls_stream, content_length, &req.buffered).await? {
+        Some(b) => b,
+        None => return Ok(()),
+    };
+
+    let upstream_authority = reverse::format_host_header(UpstreamScheme::Https, ctx.host, ctx.port);
+    let mut request = Zeroizing::new(format!(
+        "{} {} {}\r\nHost: {}\r\n",
+        method, path, req.version, upstream_authority
+    ));
+    if let (Some(token), Some(header)) = (&spiffe_auth.jwt_token, &spiffe_auth.inject_header) {
+        request.push_str(&format!("{}: Bearer {}\r\n", header, token.as_str()));
+    }
+    for (name, value) in &filtered_headers {
+        if let Some(header) = &spiffe_auth.inject_header
+            && name.eq_ignore_ascii_case(header)
+        {
+            continue;
+        }
+        request.push_str(&format!("{}: {}\r\n", name, value));
+    }
+    request.push_str("Connection: close\r\n");
+    if !body.is_empty() {
+        request.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    }
+    request.push_str("\r\n");
+
+    let default_connector;
+    let connector = if let Some(ref owned) = spiffe_auth.tls_connector {
+        owned
+    } else {
+        default_connector = route
+            .tls_connector
+            .as_ref()
+            .unwrap_or(ctx.tls_connector)
+            .clone();
+        &default_connector
+    };
+    let strategy = select_upstream_strategy(&ctx.upstream_proxy, &resolved_addrs);
+    let upstream_spec = UpstreamSpec {
+        scheme: UpstreamScheme::Https,
+        host: ctx.host,
+        port: ctx.port,
+        strategy,
+        tls_connector: connector,
+    };
+    let audit_ctx = AuditCtx {
+        log: ctx.audit_log,
+        mode: audit::ProxyMode::ConnectIntercept,
+        event_ctx: event_ctx.clone(),
+        target: ctx.host,
+        method,
+        path,
+    };
+    if let Err(e) = forward::forward_request(
+        tls_stream,
+        request.as_bytes(),
+        &body,
+        upstream_spec,
+        audit_ctx,
+    )
+    .await
+    {
+        warn!("tls_intercept: SPIFFE upstream forwarding failed: {}", e);
+        audit::log_denied(
+            ctx.audit_log,
+            audit::ProxyMode::ConnectIntercept,
+            &audit::EventContext {
+                denial_category: Some(
+                    nono::undo::NetworkAuditDenialCategory::UpstreamConnectFailed,
+                ),
+                ..event_ctx
+            },
+            ctx.host,
+            ctx.port,
+            &e.to_string(),
+        );
+        let _ = reverse::send_error_generic(tls_stream, 502, "Bad Gateway").await;
+    }
+    Ok(())
+}
+
 /// Scan a header value for a tool-sandbox broker nonce (`nono_<64hex>`) and,
 /// if one is found and `resolver` admits `consumer`, return the header value
 /// with the nonce replaced by the real credential bytes (UTF-8).
@@ -1225,8 +1398,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn h2_tls_connector_for_target_uses_custom_route_config() {
+    #[tokio::test]
+    async fn h2_tls_connector_for_target_uses_custom_route_config() {
         let ca = crate::tls_intercept::ca::EphemeralCa::generate().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let ca_path = dir.path().join("upstream-ca.pem");
@@ -1238,7 +1411,7 @@ mod tests {
             9443,
             Some(ca_path.to_string_lossy().as_ref()),
         )];
-        let route_store = RouteStore::load(&routes).unwrap();
+        let route_store = RouteStore::load(&routes).await.unwrap();
         let default_connector = test_default_h2_connector();
 
         let (_connector, key) =
@@ -1251,8 +1424,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn h2_tls_connector_for_target_accepts_matching_custom_route_configs() {
+    #[tokio::test]
+    async fn h2_tls_connector_for_target_accepts_matching_custom_route_configs() {
         let ca = crate::tls_intercept::ca::EphemeralCa::generate().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let ca_path = dir.path().join("upstream-ca.pem");
@@ -1263,7 +1436,7 @@ mod tests {
             route_config("custom-a", "localhost", 9443, Some(ca_path.as_ref())),
             route_config("custom-b", "localhost", 9443, Some(ca_path.as_ref())),
         ];
-        let route_store = RouteStore::load(&routes).unwrap();
+        let route_store = RouteStore::load(&routes).await.unwrap();
         let default_connector = test_default_h2_connector();
 
         let (_connector, key) =
@@ -1276,8 +1449,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn h2_tls_connector_for_target_rejects_mixed_route_configs() {
+    #[tokio::test]
+    async fn h2_tls_connector_for_target_rejects_mixed_route_configs() {
         let ca = crate::tls_intercept::ca::EphemeralCa::generate().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let ca_path = dir.path().join("upstream-ca.pem");
@@ -1292,7 +1465,7 @@ mod tests {
                 Some(ca_path.to_string_lossy().as_ref()),
             ),
         ];
-        let route_store = RouteStore::load(&routes).unwrap();
+        let route_store = RouteStore::load(&routes).await.unwrap();
         let default_connector = test_default_h2_connector();
 
         assert!(
@@ -1335,6 +1508,7 @@ mod tests {
             oauth2: None,
             aws_auth: None,
             endpoint_policy: None,
+            spiffe: None,
         }
     }
 

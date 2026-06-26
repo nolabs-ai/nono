@@ -597,7 +597,7 @@ mod tests {
 
     /// Build a RouteStore + CredentialStore for a `cmd://` route so the
     /// command-backed capture path is exercised.
-    fn make_cmd_route_stores(
+    async fn make_cmd_route_stores(
         host: &str,
         port: u16,
         tls_connector: &tokio_rustls::TlsConnector,
@@ -624,8 +624,9 @@ mod tests {
             oauth2: None,
             aws_auth: None,
             endpoint_policy: None,
+            spiffe: None,
         }];
-        let route_store = RouteStore::load(&routes).unwrap();
+        let route_store = RouteStore::load(&routes).await.unwrap();
         let credential_store = CredentialStore::load_with_diagnostics(&routes, tls_connector)
             .unwrap()
             .store;
@@ -679,7 +680,7 @@ mod tests {
     }
 
     /// Build a RouteStore with a single route pointing at `host:port`.
-    fn make_route_store(host: &str, port: u16, rules: Vec<EndpointRule>) -> RouteStore {
+    async fn make_route_store(host: &str, port: u16, rules: Vec<EndpointRule>) -> RouteStore {
         let routes = vec![RouteConfig {
             prefix: "test-svc".to_string(),
             upstream: format!("https://{}:{}", host, port),
@@ -699,8 +700,9 @@ mod tests {
             oauth2: None,
             aws_auth: None,
             endpoint_policy: None,
+            spiffe: None,
         }];
-        RouteStore::load(&routes).unwrap()
+        RouteStore::load(&routes).await.unwrap()
     }
 
     /// Build a CredentialStore with a test credential.
@@ -941,7 +943,8 @@ mod tests {
                 method: "POST".to_string(),
                 path: "/v1/chat/completions".to_string(),
             }],
-        );
+        )
+        .await;
         let credential_store = make_credential_store("sk-test-secret-key");
         let cert_cache = Arc::new(CertCache::new(Arc::clone(&ca)));
         let tls_connector = h2_tls_connector_trusting(ca.cert_pem());
@@ -1031,7 +1034,7 @@ mod tests {
 
         let tls_connector = h2_tls_connector_trusting(ca.cert_pem());
         let (route_store, credential_store) =
-            make_cmd_route_stores("localhost", upstream_port, &tls_connector);
+            make_cmd_route_stores("localhost", upstream_port, &tls_connector).await;
         let cert_cache = Arc::new(CertCache::new(Arc::clone(&ca)));
         let filter = ProxyFilter::allow_all();
         let session_token = Zeroizing::new("session-tok".to_string());
@@ -1111,7 +1114,7 @@ mod tests {
 
         let tls_connector = h2_tls_connector_trusting(ca.cert_pem());
         let (route_store, credential_store) =
-            make_cmd_route_stores("localhost", upstream_port, &tls_connector);
+            make_cmd_route_stores("localhost", upstream_port, &tls_connector).await;
         let cert_cache = Arc::new(CertCache::new(Arc::clone(&ca)));
         let filter = ProxyFilter::allow_all();
         let session_token = Zeroizing::new("session-tok".to_string());
@@ -1199,7 +1202,7 @@ mod tests {
 
         let tls_connector = h2_tls_connector_trusting(ca.cert_pem());
         let (route_store, credential_store) =
-            make_cmd_route_stores("localhost", upstream_port, &tls_connector);
+            make_cmd_route_stores("localhost", upstream_port, &tls_connector).await;
         let cert_cache = Arc::new(CertCache::new(Arc::clone(&ca)));
         let filter = ProxyFilter::allow_all();
         let session_token = Zeroizing::new("session-tok".to_string());
@@ -1277,7 +1280,8 @@ mod tests {
                 method: "POST".to_string(),
                 path: "/v1/chat/completions".to_string(),
             }],
-        );
+        )
+        .await;
         // Credential carries a second managed header beyond Authorization.
         let credential_store =
             make_credential_store_with_extra("sk-test-secret-key", "x-api-key", "managed-key");
@@ -1405,8 +1409,9 @@ mod tests {
             oauth2: None,
             aws_auth: Some(AwsAuthConfig::default()),
             endpoint_policy: None,
+            spiffe: None,
         }];
-        let route_store = RouteStore::load(&routes).unwrap();
+        let route_store = RouteStore::load(&routes).await.unwrap();
         let credential_store = CredentialStore::load_with_diagnostics(&routes, &tls_connector)
             .unwrap()
             .store;
@@ -1484,7 +1489,7 @@ mod tests {
         let ca = Arc::new(EphemeralCa::generate().unwrap());
         let (upstream_port, rx) = spawn_mock_h2_upstream_echo(&ca).await;
 
-        let route_store = make_route_store("localhost", upstream_port, vec![]);
+        let route_store = make_route_store("localhost", upstream_port, vec![]).await;
         let credential_store = CredentialStore::empty();
         let cert_cache = Arc::new(CertCache::new(Arc::clone(&ca)));
         let tls_connector = h2_tls_connector_trusting(ca.cert_pem());
@@ -1673,6 +1678,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 endpoint_policy: None,
+                spiffe: None,
             },
             RouteConfig {
                 prefix: "svc-b".to_string(),
@@ -1696,9 +1702,10 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 endpoint_policy: None,
+                spiffe: None,
             },
         ];
-        let route_store = RouteStore::load(&routes).unwrap();
+        let route_store = RouteStore::load(&routes).await.unwrap();
         let credential_store = CredentialStore::empty();
         let cert_cache = Arc::new(CertCache::new(Arc::clone(&ca)));
         let tls_connector = h2_tls_connector_trusting(ca.cert_pem());
@@ -1775,7 +1782,8 @@ mod tests {
                 method: "POST".to_string(),
                 path: "/v1/chat/completions".to_string(),
             }],
-        );
+        )
+        .await;
         let credential_store = make_credential_store("sk-should-not-appear");
         let cert_cache = Arc::new(CertCache::new(Arc::clone(&ca)));
         let tls_connector = h2_tls_connector_trusting(ca.cert_pem());
@@ -1844,7 +1852,7 @@ mod tests {
 
     /// Build a RouteStore modeling an endpoint-only restriction route (no
     /// credential_key), as produced by `_ep_` routes from allow_domain.
-    fn make_endpoint_only_route_store(
+    async fn make_endpoint_only_route_store(
         host: &str,
         port: u16,
         rules: Vec<EndpointRule>,
@@ -1868,8 +1876,9 @@ mod tests {
             oauth2: None,
             aws_auth: None,
             endpoint_policy: None,
+            spiffe: None,
         }];
-        RouteStore::load(&routes).unwrap()
+        RouteStore::load(&routes).await.unwrap()
     }
 
     #[tokio::test]
@@ -1886,7 +1895,8 @@ mod tests {
                 method: "GET".to_string(),
                 path: "/repos/my-org/**".to_string(),
             }],
-        );
+        )
+        .await;
         let credential_store = CredentialStore::empty();
         let cert_cache = Arc::new(CertCache::new(Arc::clone(&ca)));
         let tls_connector = h2_tls_connector_trusting(ca.cert_pem());
@@ -2006,8 +2016,9 @@ mod tests {
                     timeout_secs: None,
                 }],
             }),
+            spiffe: None,
         }];
-        let route_store = RouteStore::load(&routes).unwrap();
+        let route_store = RouteStore::load(&routes).await.unwrap();
         let credential_store = CredentialStore::empty();
         let cert_cache = Arc::new(CertCache::new(Arc::clone(&ca)));
         let tls_connector = h2_tls_connector_trusting(ca.cert_pem());
@@ -2089,7 +2100,8 @@ mod tests {
                 method: "GET".to_string(),
                 path: "/repos/my-org/**".to_string(),
             }],
-        );
+        )
+        .await;
         let credential_store = CredentialStore::empty();
         let cert_cache = Arc::new(CertCache::new(Arc::clone(&ca)));
         let tls_connector = h2_tls_connector_trusting(ca.cert_pem());
@@ -2192,6 +2204,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 endpoint_policy: None,
+                spiffe: None,
             },
             // Endpoint-only restriction (_ep_ route)
             RouteConfig {
@@ -2222,9 +2235,10 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 endpoint_policy: None,
+                spiffe: None,
             },
         ];
-        let route_store = RouteStore::load(&routes).unwrap();
+        let route_store = RouteStore::load(&routes).await.unwrap();
         let credential_store = make_credential_store("gh-secret");
         let cert_cache = Arc::new(CertCache::new(Arc::clone(&ca)));
         let tls_connector = h2_tls_connector_trusting(ca.cert_pem());
@@ -2310,7 +2324,8 @@ mod tests {
                 method: "POST".to_string(),
                 path: "/v1/chat/completions".to_string(),
             }],
-        );
+        )
+        .await;
         // No managed credential — the secret arrives purely via nonce resolution.
         let credential_store = CredentialStore::empty();
         let cert_cache = Arc::new(CertCache::new(Arc::clone(&ca)));
@@ -2409,7 +2424,8 @@ mod tests {
                 method: "POST".to_string(),
                 path: "/v1/chat/completions".to_string(),
             }],
-        );
+        )
+        .await;
         let credential_store = CredentialStore::empty();
         let cert_cache = Arc::new(CertCache::new(Arc::clone(&ca)));
         let tls_connector = h2_tls_connector_trusting(ca.cert_pem());
@@ -2510,7 +2526,8 @@ mod tests {
                 method: "POST".to_string(),
                 path: "/pkg.Svc/BidiStream".to_string(),
             }],
-        );
+        )
+        .await;
         let credential_store = make_credential_store("sk-test-secret-key");
         let cert_cache = Arc::new(CertCache::new(Arc::clone(&ca)));
         let tls_connector = h2_tls_connector_trusting(ca.cert_pem());

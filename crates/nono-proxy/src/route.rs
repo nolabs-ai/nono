@@ -10,6 +10,8 @@
 //! (inject mode, header name/value, raw secret). Both stores are keyed by the
 //! normalised route prefix and are consulted independently by the proxy handlers.
 
+#[cfg(feature = "spiffe")]
+use crate::config::SpiffeAuthConfig;
 use crate::config::{CompiledEndpointPolicy, CompiledEndpointRules, RouteConfig};
 use crate::error::{ProxyError, Result};
 use nono::undo::{NetworkAuditAuthMechanism, NetworkAuditInjectionMode};
@@ -77,12 +79,21 @@ pub struct LoadedRoute {
 
     /// Audit injection mode implied by the managed credential configuration.
     pub managed_injection_mode: Option<NetworkAuditInjectionMode>,
+
+    /// Live SPIFFE X.509-SVID source for mTLS routes. The connector inside is
+    /// swapped atomically on rotation without requiring a new `LoadedRoute`.
+    #[cfg(feature = "spiffe")]
+    pub spiffe_x509: Option<Arc<crate::spiffe::SpiffeX509Source>>,
+
+    /// Live SPIFFE JWT-SVID source for JWT bearer routes.
+    #[cfg(feature = "spiffe")]
+    pub spiffe_jwt: Option<Arc<crate::spiffe::SpiffeJwtSource>>,
 }
 
 impl std::fmt::Debug for LoadedRoute {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LoadedRoute")
-            .field("upstream", &self.upstream)
+        let mut s = f.debug_struct("LoadedRoute");
+        s.field("upstream", &self.upstream)
             .field("upstream_host_port", &self.upstream_host_port)
             .field("endpoint_rules", &self.endpoint_rules)
             .field("endpoint_policy", &self.endpoint_policy)
@@ -93,12 +104,23 @@ impl std::fmt::Debug for LoadedRoute {
                 &self.requires_managed_credential,
             )
             .field("managed_auth_mechanism", &self.managed_auth_mechanism)
-            .field("managed_injection_mode", &self.managed_injection_mode)
-            .finish()
+            .field("managed_injection_mode", &self.managed_injection_mode);
+        #[cfg(feature = "spiffe")]
+        s.field("spiffe_x509", &self.spiffe_x509)
+            .field("spiffe_jwt", &self.spiffe_jwt);
+        s.finish()
     }
 }
 
 fn auth_mechanism_for_route(route: &RouteConfig) -> Option<NetworkAuditAuthMechanism> {
+    #[cfg(feature = "spiffe")]
+    if let Some(spiffe) = &route.spiffe {
+        return Some(match spiffe {
+            SpiffeAuthConfig::X509 { .. } => NetworkAuditAuthMechanism::SpiffeX509Mtls,
+            SpiffeAuthConfig::Jwt { .. } => NetworkAuditAuthMechanism::SpiffeJwtBearer,
+        });
+    }
+
     if route.oauth2.is_some() {
         return Some(NetworkAuditAuthMechanism::PhantomHeader);
     }
@@ -127,6 +149,15 @@ fn auth_mechanism_for_route(route: &RouteConfig) -> Option<NetworkAuditAuthMecha
 }
 
 fn injection_mode_for_route(route: &RouteConfig) -> Option<NetworkAuditInjectionMode> {
+    #[cfg(feature = "spiffe")]
+    if let Some(spiffe) = &route.spiffe {
+        return match spiffe {
+            // X.509-SVID auth is transport-layer (mTLS), no header injection.
+            SpiffeAuthConfig::X509 { .. } => None,
+            SpiffeAuthConfig::Jwt { .. } => Some(NetworkAuditInjectionMode::SpiffeJwt),
+        };
+    }
+
     if route.oauth2.is_some() {
         return Some(NetworkAuditInjectionMode::OAuth2);
     }
@@ -164,7 +195,7 @@ impl RouteStore {
     /// Each route's endpoint rules are compiled at startup so the hot path
     /// does a regex match, not a glob compile. Routes with a `tls_ca` field
     /// get a per-route TLS connector built from the custom CA certificate.
-    pub fn load(routes: &[RouteConfig]) -> Result<Self> {
+    pub async fn load(routes: &[RouteConfig]) -> Result<Self> {
         let mut loaded = HashMap::new();
 
         let base_root_store = build_base_root_store();
@@ -215,9 +246,73 @@ impl RouteStore {
             // they exist to provide a `*_BASE_URL` env var or appear in
             // `route_upstream_hosts()` — and CONNECT to those still gets
             // blocked with 403 (the "force SDK cooperation" path).
+            // SPIFFE is mutually exclusive with all other managed credential sources.
+            #[cfg(feature = "spiffe")]
+            if route.spiffe.is_some()
+                && (route.credential_key.is_some()
+                    || route.oauth2.is_some()
+                    || route.aws_auth.is_some())
+            {
+                return Err(ProxyError::Config(format!(
+                    "route '{}': `spiffe` is mutually exclusive with `credential_key`, `oauth2`, and `aws_auth`",
+                    normalized_prefix
+                )));
+            }
+
+            // Connect to the SPIRE Workload API for SPIFFE routes. This blocks
+            // startup (fail-closed) if the socket is unreachable within the
+            // initial_sync_timeout configured on the source builder.
+            #[cfg(feature = "spiffe")]
+            let (spiffe_x509, spiffe_jwt) = match &route.spiffe {
+                Some(SpiffeAuthConfig::X509 {
+                    workload_api_socket,
+                    svid_hint,
+                    expected_upstream_spiffe_id,
+                }) => {
+                    debug!(
+                        "Connecting SPIFFE X.509 source for route '{}'",
+                        normalized_prefix
+                    );
+                    let src = crate::spiffe::SpiffeX509Source::connect(
+                        workload_api_socket,
+                        svid_hint.as_deref(),
+                        expected_upstream_spiffe_id.clone(),
+                        route.tls_ca.clone(),
+                    )
+                    .await
+                    .map_err(|e| {
+                        ProxyError::Config(format!("route '{}': {e}", normalized_prefix))
+                    })?;
+                    (Some(Arc::new(src)), None)
+                }
+                Some(SpiffeAuthConfig::Jwt {
+                    workload_api_socket,
+                    audience,
+                    inject_header,
+                    ..
+                }) => {
+                    debug!(
+                        "Connecting SPIFFE JWT source for route '{}'",
+                        normalized_prefix
+                    );
+                    let src = crate::spiffe::SpiffeJwtSource::connect(
+                        workload_api_socket,
+                        audience.clone(),
+                        inject_header.clone(),
+                    )
+                    .await
+                    .map_err(|e| {
+                        ProxyError::Config(format!("route '{}': {e}", normalized_prefix))
+                    })?;
+                    (None, Some(Arc::new(src)))
+                }
+                None => (None, None),
+            };
+
             let requires_managed_credential = route.credential_key.is_some()
                 || route.oauth2.is_some()
-                || route.aws_auth.is_some();
+                || route.aws_auth.is_some()
+                || route.spiffe.is_some();
             let requires_intercept =
                 requires_managed_credential || !endpoint_policy.allows_all_without_l7();
             let managed_auth_mechanism = auth_mechanism_for_route(route);
@@ -237,6 +332,10 @@ impl RouteStore {
                     requires_managed_credential,
                     managed_auth_mechanism,
                     managed_injection_mode,
+                    #[cfg(feature = "spiffe")]
+                    spiffe_x509,
+                    #[cfg(feature = "spiffe")]
+                    spiffe_jwt,
                 },
             );
         }
@@ -341,6 +440,67 @@ impl RouteStore {
             .filter_map(|route| route.upstream_host_port.clone())
             .collect()
     }
+
+    /// Route prefixes with successfully loaded SPIFFE sources.
+    #[must_use]
+    pub fn spiffe_loaded_prefixes(&self) -> std::collections::HashSet<String> {
+        self.routes
+            .iter()
+            .filter(|(_, route)| route.has_spiffe_source())
+            .map(|(prefix, _)| prefix.clone())
+            .collect()
+    }
+
+    /// Whether any managed-credential route targets a loopback upstream host.
+    ///
+    /// When true, loopback must not appear in `NO_PROXY` so traffic to the
+    /// credential upstream goes through the proxy (for SPIFFE injection etc.).
+    #[must_use]
+    pub fn has_managed_loopback_upstream(&self) -> bool {
+        self.routes.iter().any(|(_, route)| {
+            if !(route.requires_managed_credential || route.requires_intercept) {
+                return false;
+            }
+            route
+                .upstream_host_port
+                .as_deref()
+                .is_some_and(is_loopback_host_port)
+        })
+    }
+}
+
+/// Whether any configured route targets a loopback upstream that must traverse
+/// the proxy (managed credentials, SPIFFE, or TLS-intercepted custom upstreams).
+#[must_use]
+pub fn config_has_loopback_proxy_route(routes: &[RouteConfig]) -> bool {
+    routes.iter().any(|route| {
+        let loopback =
+            extract_host_port(&route.upstream).is_some_and(|hp| is_loopback_host_port(&hp));
+        if !loopback {
+            return false;
+        }
+        route.spiffe.is_some()
+            || route.credential_key.is_some()
+            || route.oauth2.is_some()
+            || route.aws_auth.is_some()
+            || route.tls_ca.is_some()
+    })
+}
+
+pub(crate) fn is_loopback_host_port(host_port: &str) -> bool {
+    let host = host_port
+        .rsplit_once(':')
+        .map(|(h, _)| h)
+        .unwrap_or(host_port);
+    host == "localhost"
+        || host == "127.0.0.1"
+        || host == "[::1]"
+        || host
+            .parse::<std::net::Ipv4Addr>()
+            .is_ok_and(|ip| ip.is_loopback())
+        || host
+            .parse::<std::net::Ipv6Addr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 /// Outcome of route selection for an intercepted request.
@@ -446,6 +606,19 @@ pub(crate) fn select_route<'a>(
 }
 
 impl LoadedRoute {
+    /// Whether this route has a live SPIFFE Workload API source configured.
+    #[must_use]
+    pub fn has_spiffe_source(&self) -> bool {
+        #[cfg(feature = "spiffe")]
+        {
+            self.spiffe_x509.is_some() || self.spiffe_jwt.is_some()
+        }
+        #[cfg(not(feature = "spiffe"))]
+        {
+            false
+        }
+    }
+
     /// Whether this route is configured to require a proxy-managed credential
     /// but the credential material is currently unavailable.
     #[must_use]
@@ -454,8 +627,13 @@ impl LoadedRoute {
         has_static_credential: bool,
         has_oauth2: bool,
         has_aws: bool,
+        has_spiffe: bool,
     ) -> bool {
-        self.requires_managed_credential && !has_static_credential && !has_oauth2 && !has_aws
+        self.requires_managed_credential
+            && !has_static_credential
+            && !has_oauth2
+            && !has_aws
+            && !has_spiffe
     }
 }
 
@@ -556,6 +734,44 @@ fn build_base_root_store() -> rustls::RootCertStore {
     store
 }
 
+/// Add PEM CA certificate(s) from `ca_path` into `root_store`.
+pub(crate) fn add_ca_file_to_store(
+    root_store: &mut rustls::RootCertStore,
+    ca_path: &str,
+) -> Result<()> {
+    let ca_path = std::path::Path::new(ca_path);
+    let ca_pem = read_pem_file(ca_path, "CA certificate")?;
+
+    let certs: Vec<_> = rustls::pki_types::CertificateDer::pem_slice_iter(ca_pem.as_ref())
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| {
+            ProxyError::Config(format!(
+                "failed to parse CA certificate '{}': {}",
+                ca_path.display(),
+                e
+            ))
+        })?;
+
+    if certs.is_empty() {
+        return Err(ProxyError::Config(format!(
+            "CA certificate file '{}' contains no valid PEM certificates",
+            ca_path.display()
+        )));
+    }
+
+    for cert in certs {
+        root_store.add(cert).map_err(|e| {
+            ProxyError::Config(format!(
+                "invalid CA certificate in '{}': {}",
+                ca_path.display(),
+                e
+            ))
+        })?;
+    }
+
+    Ok(())
+}
+
 /// Build a per-route `TlsConnector`, optionally adding a custom CA
 /// and/or mTLS client certificate on top of `base_root_store`.
 /// Returns both the connector and the underlying `Arc<ClientConfig>` so the
@@ -568,37 +784,8 @@ fn build_tls_connector(
 ) -> Result<(tokio_rustls::TlsConnector, Arc<rustls::ClientConfig>)> {
     let mut root_store = base_root_store.clone();
 
-    // Add custom CA if provided
     if let Some(ca_path) = ca_path {
-        let ca_path = std::path::Path::new(ca_path);
-        let ca_pem = read_pem_file(ca_path, "CA certificate")?;
-
-        let certs: Vec<_> = rustls::pki_types::CertificateDer::pem_slice_iter(ca_pem.as_ref())
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|e| {
-                ProxyError::Config(format!(
-                    "failed to parse CA certificate '{}': {}",
-                    ca_path.display(),
-                    e
-                ))
-            })?;
-
-        if certs.is_empty() {
-            return Err(ProxyError::Config(format!(
-                "CA certificate file '{}' contains no valid PEM certificates",
-                ca_path.display()
-            )));
-        }
-
-        for cert in certs {
-            root_store.add(cert).map_err(|e| {
-                ProxyError::Config(format!(
-                    "invalid CA certificate in '{}': {}",
-                    ca_path.display(),
-                    e
-                ))
-            })?;
-        }
+        add_ca_file_to_store(&mut root_store, ca_path)?;
     }
 
     let builder = rustls::ClientConfig::builder_with_provider(Arc::new(
@@ -712,8 +899,8 @@ mod tests {
         assert!(store.get("openai").is_none());
     }
 
-    #[test]
-    fn test_load_routes_without_credentials() {
+    #[tokio::test]
+    async fn test_load_routes_without_credentials() {
         // Routes without credential_key should still be loaded into RouteStore
         let routes = vec![RouteConfig {
             prefix: "/openai".to_string(),
@@ -743,9 +930,10 @@ mod tests {
             tls_client_key: None,
             oauth2: None,
             aws_auth: None,
+            spiffe: None,
         }];
 
-        let store = RouteStore::load(&routes).unwrap();
+        let store = RouteStore::load(&routes).await.unwrap();
         assert_eq!(store.len(), 1);
 
         let route = store.get("openai").unwrap();
@@ -763,8 +951,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_load_routes_normalises_prefix() {
+    #[tokio::test]
+    async fn test_load_routes_normalises_prefix() {
         let routes = vec![RouteConfig {
             prefix: "/anthropic/".to_string(),
             upstream: "https://api.anthropic.com".to_string(),
@@ -784,15 +972,16 @@ mod tests {
             tls_client_key: None,
             oauth2: None,
             aws_auth: None,
+            spiffe: None,
         }];
 
-        let store = RouteStore::load(&routes).unwrap();
+        let store = RouteStore::load(&routes).await.unwrap();
         assert!(store.get("anthropic").is_some());
         assert!(store.get("/anthropic/").is_none());
     }
 
-    #[test]
-    fn test_is_route_upstream() {
+    #[tokio::test]
+    async fn test_is_route_upstream() {
         let routes = vec![RouteConfig {
             prefix: "openai".to_string(),
             upstream: "https://api.openai.com".to_string(),
@@ -812,15 +1001,16 @@ mod tests {
             tls_client_key: None,
             oauth2: None,
             aws_auth: None,
+            spiffe: None,
         }];
 
-        let store = RouteStore::load(&routes).unwrap();
+        let store = RouteStore::load(&routes).await.unwrap();
         assert!(store.is_route_upstream("api.openai.com:443"));
         assert!(!store.is_route_upstream("github.com:443"));
     }
 
-    #[test]
-    fn test_route_upstream_hosts() {
+    #[tokio::test]
+    async fn test_route_upstream_hosts() {
         let routes = vec![
             RouteConfig {
                 prefix: "openai".to_string(),
@@ -841,6 +1031,7 @@ mod tests {
                 tls_client_key: None,
                 oauth2: None,
                 aws_auth: None,
+                spiffe: None,
             },
             RouteConfig {
                 prefix: "anthropic".to_string(),
@@ -861,10 +1052,11 @@ mod tests {
                 tls_client_key: None,
                 oauth2: None,
                 aws_auth: None,
+                spiffe: None,
             },
         ];
 
-        let store = RouteStore::load(&routes).unwrap();
+        let store = RouteStore::load(&routes).await.unwrap();
         let hosts = store.route_upstream_hosts();
         assert!(hosts.contains("api.openai.com:443"));
         assert!(hosts.contains("api.anthropic.com:443"));
@@ -949,6 +1141,10 @@ mod tests {
             requires_managed_credential: false,
             managed_auth_mechanism: None,
             managed_injection_mode: None,
+            #[cfg(feature = "spiffe")]
+            spiffe_x509: None,
+            #[cfg(feature = "spiffe")]
+            spiffe_jwt: None,
         };
         let debug_output = format!("{:?}", route);
         assert!(debug_output.contains("api.openai.com"));
@@ -959,8 +1155,8 @@ mod tests {
         assert!(debug_output.contains("managed_injection_mode"));
     }
 
-    #[test]
-    fn test_requires_intercept_credential_only() {
+    #[tokio::test]
+    async fn test_requires_intercept_credential_only() {
         let routes = vec![RouteConfig {
             prefix: "openai".to_string(),
             upstream: "https://api.openai.com".to_string(),
@@ -980,8 +1176,9 @@ mod tests {
             tls_client_key: None,
             oauth2: None,
             aws_auth: None,
+            spiffe: None,
         }];
-        let store = RouteStore::load(&routes).unwrap();
+        let store = RouteStore::load(&routes).await.unwrap();
         let hit = store.lookup_by_upstream("api.openai.com:443").unwrap();
         assert!(store.has_intercept_route("api.openai.com:443"));
         assert!(hit.1.requires_managed_credential);
@@ -996,8 +1193,8 @@ mod tests {
         assert!(!store.has_intercept_route("api.example.com:443"));
     }
 
-    #[test]
-    fn test_requires_intercept_wildcard_credential_upstream() {
+    #[tokio::test]
+    async fn test_requires_intercept_wildcard_credential_upstream() {
         let routes = vec![RouteConfig {
             prefix: "internal_api".to_string(),
             upstream: "https://*.dev.example.net".to_string(),
@@ -1017,8 +1214,9 @@ mod tests {
             tls_client_key: None,
             oauth2: None,
             aws_auth: None,
+            spiffe: None,
         }];
-        let store = RouteStore::load(&routes).unwrap();
+        let store = RouteStore::load(&routes).await.unwrap();
 
         assert!(store.is_route_upstream("api.admin.dev.example.net:443"));
         assert!(store.has_intercept_route("api.admin.dev.example.net:443"));
@@ -1036,8 +1234,8 @@ mod tests {
         assert!(!store.has_intercept_route("api.admin.dev.example.net:8443"));
     }
 
-    #[test]
-    fn test_requires_intercept_endpoint_rules_only() {
+    #[tokio::test]
+    async fn test_requires_intercept_endpoint_rules_only() {
         // L7-only route (no credential): rules alone are enough to require
         // interception.
         let routes = vec![RouteConfig {
@@ -1062,8 +1260,9 @@ mod tests {
             tls_client_key: None,
             oauth2: None,
             aws_auth: None,
+            spiffe: None,
         }];
-        let store = RouteStore::load(&routes).unwrap();
+        let store = RouteStore::load(&routes).await.unwrap();
         let hit = store
             .lookup_by_upstream("internal.example.com:443")
             .unwrap();
@@ -1071,8 +1270,8 @@ mod tests {
         assert!(!hit.1.requires_managed_credential);
     }
 
-    #[test]
-    fn test_requires_intercept_declarative_only() {
+    #[tokio::test]
+    async fn test_requires_intercept_declarative_only() {
         // No credential, no rules — purely declarative route. CONNECT to
         // this upstream still gets the existing 403 (not intercepted).
         let routes = vec![RouteConfig {
@@ -1094,14 +1293,15 @@ mod tests {
             tls_client_key: None,
             oauth2: None,
             aws_auth: None,
+            spiffe: None,
         }];
-        let store = RouteStore::load(&routes).unwrap();
+        let store = RouteStore::load(&routes).await.unwrap();
         assert!(store.is_route_upstream("aliased.example.com:443"));
         assert!(!store.has_intercept_route("aliased.example.com:443"));
     }
 
-    #[test]
-    fn test_missing_managed_credential_policy() {
+    #[tokio::test]
+    async fn test_missing_managed_credential_policy() {
         let managed = LoadedRoute {
             upstream: "https://api.openai.com".to_string(),
             upstream_host_port: Some("api.openai.com:443".to_string()),
@@ -1114,11 +1314,16 @@ mod tests {
             requires_managed_credential: true,
             managed_auth_mechanism: Some(NetworkAuditAuthMechanism::PhantomHeader),
             managed_injection_mode: Some(NetworkAuditInjectionMode::Header),
+            #[cfg(feature = "spiffe")]
+            spiffe_x509: None,
+            #[cfg(feature = "spiffe")]
+            spiffe_jwt: None,
         };
-        assert!(managed.missing_managed_credential(false, false, false));
-        assert!(!managed.missing_managed_credential(true, false, false));
-        assert!(!managed.missing_managed_credential(false, true, false));
-        assert!(!managed.missing_managed_credential(false, false, true));
+        assert!(managed.missing_managed_credential(false, false, false, false));
+        assert!(!managed.missing_managed_credential(true, false, false, false));
+        assert!(!managed.missing_managed_credential(false, true, false, false));
+        assert!(!managed.missing_managed_credential(false, false, true, false));
+        assert!(!managed.missing_managed_credential(false, false, false, true));
 
         let l7_only = LoadedRoute {
             upstream: "https://internal.example.com".to_string(),
@@ -1132,12 +1337,16 @@ mod tests {
             requires_managed_credential: false,
             managed_auth_mechanism: None,
             managed_injection_mode: None,
+            #[cfg(feature = "spiffe")]
+            spiffe_x509: None,
+            #[cfg(feature = "spiffe")]
+            spiffe_jwt: None,
         };
-        assert!(!l7_only.missing_managed_credential(false, false, false));
+        assert!(!l7_only.missing_managed_credential(false, false, false, false));
     }
 
-    #[test]
-    fn test_lookup_by_upstream_returns_prefix() {
+    #[tokio::test]
+    async fn test_lookup_by_upstream_returns_prefix() {
         let routes = vec![RouteConfig {
             prefix: "openai".to_string(),
             upstream: "https://api.openai.com".to_string(),
@@ -1157,8 +1366,9 @@ mod tests {
             tls_client_key: None,
             oauth2: None,
             aws_auth: None,
+            spiffe: None,
         }];
-        let store = RouteStore::load(&routes).unwrap();
+        let store = RouteStore::load(&routes).await.unwrap();
         let hit = store.lookup_by_upstream("api.openai.com:443").unwrap();
         assert_eq!(hit.0, "openai");
         assert!(hit.1.requires_intercept);
@@ -1166,8 +1376,8 @@ mod tests {
         assert!(store.lookup_by_upstream("api.example.com:443").is_none());
     }
 
-    #[test]
-    fn test_lookup_all_by_upstream_returns_multiple_routes() {
+    #[tokio::test]
+    async fn test_lookup_all_by_upstream_returns_multiple_routes() {
         let routes = vec![
             RouteConfig {
                 prefix: "github_org_a".to_string(),
@@ -1191,6 +1401,7 @@ mod tests {
                 tls_client_key: None,
                 oauth2: None,
                 aws_auth: None,
+                spiffe: None,
             },
             RouteConfig {
                 prefix: "github_org_b".to_string(),
@@ -1214,9 +1425,10 @@ mod tests {
                 tls_client_key: None,
                 oauth2: None,
                 aws_auth: None,
+                spiffe: None,
             },
         ];
-        let store = RouteStore::load(&routes).unwrap();
+        let store = RouteStore::load(&routes).await.unwrap();
 
         let all = store.lookup_all_by_upstream("github.com:443");
         assert_eq!(all.len(), 2, "both routes share the same upstream");
@@ -1265,8 +1477,8 @@ mod tests {
     ///   1 match  → inject that route's credential
     ///   0 matches → passthrough (no credential injected)
     ///   2+ matches → ambiguous (hard-deny 403)
-    #[test]
-    fn test_route_selection_multi_org_profile() {
+    #[tokio::test]
+    async fn test_route_selection_multi_org_profile() {
         // Helper to build a route with the given prefix and endpoint path.
         fn gh_route(prefix: &str, env: &str, path: &str) -> RouteConfig {
             RouteConfig {
@@ -1291,6 +1503,7 @@ mod tests {
                 tls_client_key: None,
                 oauth2: None,
                 aws_auth: None,
+                spiffe: None,
             }
         }
 
@@ -1299,7 +1512,7 @@ mod tests {
             gh_route("github_https_org_a", "GH_TOKEN_A", "/org-a/**"),
             gh_route("github_https_org_b", "GH_TOKEN_B", "/org-b/**"),
         ];
-        let store = RouteStore::load(&routes).unwrap();
+        let store = RouteStore::load(&routes).await.unwrap();
         let candidates = store.lookup_all_by_upstream("github.com:443");
         assert_eq!(candidates.len(), 2);
 
@@ -1330,7 +1543,7 @@ mod tests {
             gh_route("github_https_org_b", "GH_TOKEN_B", "/org-b/**"),
             gh_route("github_https_all", "GH_TOKEN_A", "/**"),
         ];
-        let store2 = RouteStore::load(&routes_with_catchall).unwrap();
+        let store2 = RouteStore::load(&routes_with_catchall).await.unwrap();
         let candidates2 = store2.lookup_all_by_upstream("github.com:443");
         assert_eq!(candidates2.len(), 3);
 
@@ -1349,8 +1562,8 @@ mod tests {
     /// A credential-less `_ep_` authorization route (from `allow_domain` with
     /// endpoints) must not shadow a credential catch-all on a path the `_ep_`
     /// route authorizes — the token has to be injected, not silently dropped.
-    #[test]
-    fn test_route_selection_credential_catchall_not_shadowed() {
+    #[tokio::test]
+    async fn test_route_selection_credential_catchall_not_shadowed() {
         // `_ep_` endpoint-authorization route: no credential, scoped to /org/**.
         let ep_route = RouteConfig {
             prefix: "_ep_github.com".to_string(),
@@ -1371,7 +1584,7 @@ mod tests {
             ..Default::default()
         };
 
-        let store = RouteStore::load(&[ep_route, cred_route]).unwrap();
+        let store = RouteStore::load(&[ep_route, cred_route]).await.unwrap();
         let candidates = store.lookup_all_by_upstream("github.com:443");
         assert_eq!(candidates.len(), 2);
 
@@ -1393,8 +1606,8 @@ mod tests {
     /// Two credential catch-alls for the same upstream are ambiguous: the proxy
     /// must not silently pick one to inject, just as with overlapping endpoint
     /// credential routes.
-    #[test]
-    fn test_route_selection_dual_credential_catchall_is_ambiguous() {
+    #[tokio::test]
+    async fn test_route_selection_dual_credential_catchall_is_ambiguous() {
         let cred_a = RouteConfig {
             prefix: "github_a".to_string(),
             upstream: "https://github.com".to_string(),
@@ -1412,7 +1625,7 @@ mod tests {
             ..Default::default()
         };
 
-        let store = RouteStore::load(&[cred_a, cred_b]).unwrap();
+        let store = RouteStore::load(&[cred_a, cred_b]).await.unwrap();
         let candidates = store.lookup_all_by_upstream("github.com:443");
         assert_eq!(candidates.len(), 2);
 
@@ -1673,8 +1886,8 @@ h56ZLEEqHfVWFhJWIKRSabtxYPV/VJyMv+lo3L0QwSKsouHs3dtF1zVQ
         assert!(err.contains("client key"), "unexpected error: {}", err);
     }
 
-    #[test]
-    fn test_route_store_loads_mtls_route() {
+    #[tokio::test]
+    async fn test_route_store_loads_mtls_route() {
         // Verify RouteStore.load() builds a TLS connector when tls_client_cert/key are set.
         let dir = tempfile::tempdir().unwrap();
         let cert_path = dir.path().join("client.crt");
@@ -1701,9 +1914,12 @@ h56ZLEEqHfVWFhJWIKRSabtxYPV/VJyMv+lo3L0QwSKsouHs3dtF1zVQ
             tls_client_key: Some(key_path.to_str().unwrap().to_string()),
             oauth2: None,
             aws_auth: None,
+            spiffe: None,
         }];
 
-        let store = RouteStore::load(&routes).expect("should load mTLS route");
+        let store = RouteStore::load(&routes)
+            .await
+            .expect("should load mTLS route");
         let route = store.get("k8s").unwrap();
         assert!(
             route.tls_connector.is_some(),

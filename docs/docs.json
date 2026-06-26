@@ -71,7 +71,8 @@
       {
         "group": "Secrets",
         "pages": [
-          "cli/features/credential-injection"
+          "cli/features/credential-injection",
+          "cli/features/spiffe"
         ]
       },
       {

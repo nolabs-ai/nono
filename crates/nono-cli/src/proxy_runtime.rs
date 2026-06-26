@@ -1616,6 +1616,7 @@ fn collect_tool_sandbox_proxy_grants(
                 })
                 .transpose()?,
             aws_auth: None,
+            spiffe: None,
         };
 
         if let Some(existing) = custom_credentials.get(&grant.name) {
@@ -2059,6 +2060,28 @@ pub(crate) fn build_proxy_config_from_flags(
         }
     }
     routes.extend(endpoint_routes);
+    // Credential route upstreams must also be reachable by the proxy filter
+    // when the child curls the real upstream URL (CONNECT + TLS intercept).
+    for route in &routes {
+        let host_port = route
+            .upstream
+            .strip_prefix("https://")
+            .or_else(|| route.upstream.strip_prefix("http://"))
+            .and_then(|rest| rest.split('/').next());
+        if let Some(host_port) = host_port {
+            if !plain_hosts.iter().any(|h| h == host_port) {
+                plain_hosts.push(host_port.to_string());
+            }
+            // HostFilter matches on hostname only; also allow the bare host so
+            // CONNECT targets like localhost:19871 pass the filter as "localhost".
+            if let Some((host, port)) = host_port.rsplit_once(':')
+                && port.parse::<u16>().is_ok()
+                && !plain_hosts.iter().any(|h| h == host)
+            {
+                plain_hosts.push(host.to_string());
+            }
+        }
+    }
     resolved.routes = routes;
 
     let mut proxy_config = network_policy::build_proxy_config(&resolved, &plain_hosts);
@@ -2091,6 +2114,95 @@ impl nono_proxy::NonceResolver for TokenBrokerNonceResolver {
     fn resolve(&self, nonce: &str, consumer: &str) -> Option<Zeroizing<Vec<u8>>> {
         self.0.lock().ok()?.resolve_nonce(nonce, consumer)
     }
+}
+
+/// Deny the sandboxed child direct access to SPIRE Workload API sockets used
+/// by SPIFFE-authenticated proxy routes.
+///
+/// The proxy supervisor holds the SPIFFE identity and mediates all SVIDs. The
+/// sandboxed child must not be able to reach the socket independently — doing
+/// so would let it obtain its own SVIDs and bypass the proxy's auth boundary.
+///
+/// Emits a Seatbelt `(deny network-outbound (path ...))` rule on macOS.
+/// On Linux, Landlock has no deny-within-allow semantics, so we rely on the
+/// unix_socket allowlist being absent (the child never has the socket granted).
+///
+/// Hard errors if a `unix_socket` capability already grants the socket —
+/// that combination would silently undermine the isolation guarantee.
+fn enforce_spiffe_socket_isolation(
+    proxy_config: &nono_proxy::config::ProxyConfig,
+    caps: &mut CapabilitySet,
+) -> Result<()> {
+    use nono_proxy::config::SpiffeAuthConfig;
+    use std::collections::BTreeSet;
+
+    // Collect unique SPIRE socket paths from all SPIFFE routes.
+    let mut socket_paths: BTreeSet<String> = BTreeSet::new();
+    for route in &proxy_config.routes {
+        match &route.spiffe {
+            Some(SpiffeAuthConfig::X509 {
+                workload_api_socket,
+                ..
+            })
+            | Some(SpiffeAuthConfig::Jwt {
+                workload_api_socket,
+                ..
+            }) => {
+                socket_paths.insert(workload_api_socket.clone());
+            }
+            None => {}
+        }
+    }
+
+    if socket_paths.is_empty() {
+        return Ok(());
+    }
+
+    // Hard error if any SPIRE socket is also in the unix_socket grant list.
+    // Using Path::starts_with for component-safe comparison.
+    let unix_caps = caps.unix_socket_capabilities();
+    for socket_path in &socket_paths {
+        let spire = std::path::Path::new(socket_path);
+        for uc in unix_caps {
+            let granted = uc.resolved.as_path();
+            if spire == granted || spire.starts_with(granted) || granted.starts_with(spire) {
+                return Err(NonoError::ConfigParse(format!(
+                    "SPIFFE route uses Workload API socket '{}' which is also \
+                     granted via unix_socket capability '{}'; this would allow \
+                     the sandboxed process to obtain SVIDs directly and bypass \
+                     the proxy auth boundary — remove the unix_socket grant",
+                    socket_path,
+                    uc.resolved.display()
+                )));
+            }
+        }
+    }
+
+    // On macOS, emit an explicit Seatbelt deny rule so the child cannot reach
+    // the socket even if a future capability accidentally grants the parent dir.
+    #[cfg(target_os = "macos")]
+    for socket_path in &socket_paths {
+        let escaped = crate::policy::escape_seatbelt_path(socket_path)?;
+        caps.add_platform_rule(format!("(deny network-outbound (path \"{}\"))", escaped))?;
+        debug!(
+            "SPIFFE: emitted Seatbelt deny for SPIRE socket {}",
+            socket_path
+        );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        // On Linux, log a debug note. The child never has the socket granted,
+        // so no active deny is needed. The conflict check above is the guard.
+        for socket_path in &socket_paths {
+            debug!(
+                "SPIFFE: SPIRE socket {} is not in unix_socket grants (Linux, no deny needed)",
+                socket_path
+            );
+        }
+    }
+
+    Ok(())
 }
 
 pub(crate) fn start_proxy_runtime(
@@ -2223,6 +2335,15 @@ pub(crate) fn start_proxy_runtime(
         port,
         bind_ports: proxy.allow_bind_ports.clone(),
     });
+
+    // SPIFFE/SPIRE hardening: deny the sandboxed child direct access to the
+    // SPIRE Workload API socket. The proxy holds the SPIFFE identity; the
+    // child must not be able to obtain SVIDs independently. This prevents a
+    // compromised agent from escalating its own identity.
+    //
+    // Hard error if the user has explicitly granted the socket via unix_socket
+    // caps — that combination undermines the isolation guarantee.
+    enforce_spiffe_socket_isolation(&proxy_config, caps)?;
 
     // Grant the sandboxed child a read capability on the ephemeral
     // trust bundle so `SSL_CERT_FILE` etc. are actually openable after
@@ -2636,6 +2757,7 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 aws_auth: None,
+                spiffe: None,
             },
         );
 
@@ -2964,6 +3086,7 @@ mod tests {
             tls_client_key: None,
             oauth2: None,
             aws_auth: None,
+            spiffe: None,
         });
         let credential_env_vars = vec![
             (

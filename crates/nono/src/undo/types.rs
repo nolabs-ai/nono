@@ -218,6 +218,10 @@ pub enum NetworkAuditAuthMechanism {
     PhantomPath,
     /// Phantom token carried in a query parameter
     PhantomQuery,
+    /// SPIFFE X.509-SVID mTLS to the upstream (transport-layer, no header injection)
+    SpiffeX509Mtls,
+    /// SPIFFE JWT-SVID injected as a bearer token into an upstream request header
+    SpiffeJwtBearer,
 }
 
 /// Outcome of proxy-side authentication or phantom-token validation.
@@ -239,6 +243,22 @@ pub enum NetworkAuditInjectionMode {
     QueryParam,
     BasicAuth,
     OAuth2,
+    /// SPIFFE JWT-SVID injected as a bearer header value
+    SpiffeJwt,
+}
+
+/// SPIFFE workload identity context attached to a network audit event when a
+/// SPIFFE auth route was active.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpiffeAuditContext {
+    /// SPIFFE ID of the nono-proxy workload (`spiffe://trust-domain/path`)
+    pub workload_spiffe_id: String,
+    /// Trust domain extracted from the workload SPIFFE ID
+    pub trust_domain: String,
+    /// SPIFFE ID of the upstream peer, verified during the TLS handshake.
+    /// Present only for X.509-SVID routes with `expected_upstream_spiffe_id` configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_spiffe_id: Option<String>,
 }
 
 /// Structured category for denied proxy events.
@@ -334,6 +354,9 @@ pub struct NetworkAuditEvent {
     /// Whether the capture entry requested interactive affordances.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_capture_interactive: Option<bool>,
+    /// SPIFFE workload identity context when a SPIFFE auth route was active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spiffe_context: Option<SpiffeAuditContext>,
     /// Hostname or logical service target (for reverse proxy events)
     pub target: String,
     /// Upstream URL for route-scoped L7 events, without credentials.

@@ -171,6 +171,7 @@ impl ProfileDef {
             environment: None,
             command_policies: self.command_policies.clone(),
             credential_capture: HashMap::new(),
+            credential_routes: Vec::new(),
             workdir: self.workdir.clone(),
             hooks: self.hooks.clone(),
             session_hooks: profile::SessionHooks::default(),

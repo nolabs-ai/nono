@@ -1985,6 +1985,51 @@ where
         .map_err(D::Error::custom)
 }
 
+/// A managed credential route: declares an upstream the proxy mediates so
+/// the sandboxed agent never holds the real credential.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ManagedCredentialRoute {
+    /// Stable identifier for the route (used in route prefixes / logs).
+    pub name: String,
+    /// Upstream the credential authenticates to, e.g.
+    /// `https://api.anthropic.com`. A destination URL — not a `uri://`
+    /// credential-source reference.
+    pub upstream: String,
+    /// How the credential is captured/mediated.
+    pub capture: CredentialRouteCapture,
+}
+
+/// How a [`ManagedCredentialRoute`] obtains the real credential.
+///
+/// Currently only `oauth_intercept` is supported; `mediated_helper` and
+/// `proxy_provisioned_credential` are planned follow-ups.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CredentialRouteCapture {
+    /// Intercept the upstream's OAuth token endpoint response and swap the
+    /// real `access_token` / `refresh_token` for broker `nono_<hex>` nonces
+    /// before the body reaches the sandbox. The secret is captured at
+    /// runtime (no static `credential_key`).
+    OauthIntercept {
+        /// URL path the initial token-issuance response is captured on
+        /// (e.g. `/v1/oauth/token`).
+        token_url_match: String,
+        /// URL path the refresh-token response is captured on. Defaults to
+        /// `token_url_match` when absent (the same endpoint usually serves
+        /// both, distinguished by `grant_type`).
+        #[serde(default)]
+        refresh_url_match: Option<String>,
+        /// Host serving the OAuth token endpoint, if different from the
+        /// route's `upstream` (the API host where the captured nonce is
+        /// later used). e.g. tokens are minted at
+        /// `https://platform.claude.com` but the API is
+        /// `https://api.anthropic.com`. Defaults to `upstream` when absent
+        /// (token endpoint and API on the same host).
+        #[serde(default)]
+        token_host: Option<String>,
+    },
+}
+
 /// A complete profile definition
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Profile {
@@ -2019,6 +2064,12 @@ pub struct Profile {
     pub command_policies: Option<CommandPoliciesConfig>,
     #[serde(default)]
     pub credential_capture: HashMap<String, CredentialCaptureEntry>,
+    /// Managed credential routes: per-upstream declarations of how the proxy
+    /// mediates a credential so the sandboxed agent never holds the real
+    /// secret. Currently the `oauth_intercept` capture variant is supported
+    /// (swap `/v1/oauth/token` response tokens for broker nonces).
+    #[serde(default)]
+    pub credential_routes: Vec<ManagedCredentialRoute>,
     #[serde(default)]
     pub workdir: WorkdirConfig,
     #[serde(default)]
@@ -2124,6 +2175,8 @@ struct ProfileDeserialize {
     #[serde(default)]
     credential_capture: HashMap<String, CredentialCaptureEntry>,
     #[serde(default)]
+    credential_routes: Vec<ManagedCredentialRoute>,
+    #[serde(default)]
     workdir: WorkdirConfig,
     #[serde(default)]
     hooks: HooksConfig,
@@ -2176,6 +2229,7 @@ impl From<ProfileDeserialize> for Profile {
             environment: raw.environment,
             command_policies: raw.command_policies,
             credential_capture: raw.credential_capture,
+            credential_routes: raw.credential_routes,
             workdir: raw.workdir,
             hooks: raw.hooks,
             session_hooks: raw.session_hooks,
@@ -3204,6 +3258,18 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
         credential_capture: {
             let mut merged = base.credential_capture;
             merged.extend(child.credential_capture);
+            merged
+        },
+        credential_routes: {
+            // Child routes override base routes sharing a name; others append.
+            let child_names: std::collections::HashSet<&str> = child
+                .credential_routes
+                .iter()
+                .map(|r| r.name.as_str())
+                .collect();
+            let mut merged = base.credential_routes;
+            merged.retain(|r| !child_names.contains(r.name.as_str()));
+            merged.extend(child.credential_routes);
             merged
         },
         // NOTE: WorkdirAccess::None serves as both "not specified" and "explicitly no access".
@@ -5343,6 +5409,7 @@ mod tests {
             environment: None,
             command_policies: None,
             credential_capture: HashMap::new(),
+            credential_routes: Vec::new(),
             workdir: WorkdirConfig {
                 access: WorkdirAccess::ReadWrite,
             },
@@ -5428,6 +5495,7 @@ mod tests {
             environment: None,
             command_policies: None,
             credential_capture: HashMap::new(),
+            credential_routes: Vec::new(),
             workdir: WorkdirConfig {
                 access: WorkdirAccess::None,
             },

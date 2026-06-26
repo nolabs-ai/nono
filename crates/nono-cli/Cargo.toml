@@ -102,6 +102,13 @@ nix = { workspace = true, features = ["process", "signal", "fs", "user", "term"]
 dns-lookup = "2"
 keyring = { version = "3", features = ["apple-native"], optional = true, default-features = false }
 security-framework = "3"
+# Direct FFI usage in `tool_sandbox::broker_store` for the keychain ACL
+# (SecAccessCreate / kSecAttrAccess). Security.framework is already linked
+# via security-framework; these are sibling crates from the same family
+# exposing types and constants security-framework does not re-export.
+security-framework-sys = "2"
+core-foundation = "0.10"
+core-foundation-sys = "0.8"
 x509-parser = "0.18"
 
 [build-dependencies]

@@ -1328,6 +1328,7 @@ pub(crate) fn prepare_proxy_launch_options(
         tool_sandbox_proxy_credentials,
         session_id,
         credential_capture: prepared.credential_capture.clone(),
+        credential_routes: prepared.credential_routes.clone(),
         enable_h2: prepared.allow_http2_requested,
     };
 
@@ -1971,6 +1972,106 @@ fn parse_allow_endpoint_arg(
     ))
 }
 
+/// Desugar a managed credential route into one or more proxy `RouteConfig`s,
+/// all TLS-intercepted, carrying no static credential (the secret is captured
+/// at runtime from the token response).
+///
+/// An `oauth_intercept` route whose token endpoint and API are the *same* host
+/// becomes a single route that captures the token response and resolves the
+/// nonce bearer on egress. When the token endpoint is a *different* host (e.g.
+/// tokens minted at `platform.claude.com`, API at `api.anthropic.com`) it
+/// becomes two routes: a capture route on the token host and an egress route on
+/// the API host that intercepts (allow-all `endpoint_rules`) so the nonce is
+/// resolved to the real token on the way out.
+fn synthesize_credential_routes(
+    cr: &crate::profile::ManagedCredentialRoute,
+) -> Vec<nono_proxy::config::RouteConfig> {
+    use crate::profile::CredentialRouteCapture;
+    match &cr.capture {
+        CredentialRouteCapture::OauthIntercept {
+            token_url_match,
+            refresh_url_match,
+            token_host,
+        } => {
+            let capture = nono_proxy::config::OauthCaptureMatch {
+                token_url_match: token_url_match.clone(),
+                refresh_url_match: refresh_url_match
+                    .clone()
+                    .unwrap_or_else(|| token_url_match.clone()),
+            };
+            let token_host = token_host.clone().unwrap_or_else(|| cr.upstream.clone());
+
+            if token_host == cr.upstream {
+                return vec![nono_proxy::config::RouteConfig {
+                    prefix: format!("_oauth_{}", cr.name),
+                    upstream: cr.upstream.clone(),
+                    oauth_capture: Some(capture),
+                    ..Default::default()
+                }];
+            }
+
+            vec![
+                nono_proxy::config::RouteConfig {
+                    prefix: format!("_oauth_{}_token", cr.name),
+                    upstream: token_host,
+                    oauth_capture: Some(capture),
+                    ..Default::default()
+                },
+                nono_proxy::config::RouteConfig {
+                    prefix: format!("_oauth_{}_egress", cr.name),
+                    upstream: cr.upstream.clone(),
+                    endpoint_rules: vec![nono_proxy::config::EndpointRule {
+                        method: "*".to_string(),
+                        path: "/**".to_string(),
+                    }],
+                    oauth_capture: None,
+                    ..Default::default()
+                },
+            ]
+        }
+    }
+}
+
+/// Build the shared token broker. When OAuth-capture routes are configured,
+/// back it with the macOS keychain store so captured `(access, refresh)` pairs
+/// persist across sessions and any prior pair is hydrated on startup.
+/// Otherwise — and always on non-macOS, which has no per-entry keychain ACL —
+/// use an in-memory-only broker (capture + resolve still work within the
+/// session).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn build_shared_broker(
+    proxy: Option<&ProxyLaunchOptions>,
+) -> crate::tool_sandbox::token_broker::SharedBroker {
+    let has_oauth_capture = proxy.is_some_and(|p| {
+        p.credential_routes.iter().any(|cr| {
+            matches!(
+                cr.capture,
+                crate::profile::CredentialRouteCapture::OauthIntercept { .. }
+            )
+        })
+    });
+
+    #[cfg(target_os = "macos")]
+    if has_oauth_capture {
+        use crate::tool_sandbox::broker_store::{KeystoreBrokerStore, current_claude_access_token};
+        let store = std::sync::Arc::new(KeystoreBrokerStore::default_for_claude_oauth());
+        match crate::tool_sandbox::token_broker::TokenBroker::with_store_and_reader(
+            store,
+            Box::new(current_claude_access_token),
+        ) {
+            Ok(broker) => return std::sync::Arc::new(std::sync::Mutex::new(broker)),
+            Err(e) => {
+                tracing::warn!(
+                    "OAuth broker keychain hydrate failed ({e}); falling back to in-memory broker"
+                );
+            }
+        }
+    }
+    // `has_oauth_capture` is unused on non-macOS; reference it to avoid a warning.
+    let _ = has_oauth_capture;
+    crate::tool_sandbox::token_broker::new_shared_broker()
+}
+
 pub(crate) fn build_proxy_config_from_flags(
     proxy: &ProxyLaunchOptions,
 ) -> Result<nono_proxy::config::ProxyConfig> {
@@ -2059,6 +2160,23 @@ pub(crate) fn build_proxy_config_from_flags(
         }
     }
     routes.extend(endpoint_routes);
+
+    // Desugar managed credential_routes (currently OAuth-capture) into proxy
+    // routes. Each route is TLS-intercepted (forced by `oauth_capture`), and
+    // its upstream host must be allowed through the filter.
+    for cr in &proxy.credential_routes {
+        for route in synthesize_credential_routes(cr) {
+            if let Some(hp) = route
+                .upstream
+                .strip_prefix("https://")
+                .or_else(|| route.upstream.strip_prefix("http://"))
+            {
+                plain_hosts.push(hp.to_string());
+            }
+            routes.push(route);
+        }
+    }
+
     resolved.routes = routes;
 
     let mut proxy_config = network_policy::build_proxy_config(&resolved, &plain_hosts);
@@ -2090,6 +2208,38 @@ struct TokenBrokerNonceResolver(crate::tool_sandbox::token_broker::SharedBroker)
 impl nono_proxy::NonceResolver for TokenBrokerNonceResolver {
     fn resolve(&self, nonce: &str, consumer: &str) -> Option<Zeroizing<Vec<u8>>> {
         self.0.lock().ok()?.resolve_nonce(nonce, consumer)
+    }
+
+    fn oauth_capture(&self) -> Option<&dyn nono_proxy::OauthCaptureResolver> {
+        Some(self)
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl nono_proxy::OauthCaptureResolver for TokenBrokerNonceResolver {
+    fn issue(&self, secret: Zeroizing<String>) -> String {
+        // Poisoned lock → mint a throwaway, never-resolvable nonce rather than
+        // panicking in the proxy hot path. The agent then gets a nonce that
+        // resolves to nothing (fail-closed: upstream rejects it), never the
+        // real token.
+        match self.0.lock() {
+            Ok(mut broker) => broker.issue(Zeroizing::new(secret.as_bytes().to_vec())),
+            Err(_) => format!("nono_{}", "0".repeat(64)),
+        }
+    }
+
+    fn capture_oauth_pair(
+        &self,
+        access: Zeroizing<String>,
+        refresh: Zeroizing<String>,
+    ) -> (String, String) {
+        match self.0.lock() {
+            Ok(mut broker) => broker.capture_oauth_pair(access, refresh),
+            Err(_) => {
+                let dead = format!("nono_{}", "0".repeat(64));
+                (dead.clone(), dead)
+            }
+        }
     }
 }
 
@@ -2464,6 +2614,70 @@ fn read_parent_ssl_cert_file() -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn synthesize_oauth_same_host_is_single_capture_route() {
+        // token endpoint and API on the same host → one route that captures
+        // and resolves egress.
+        let cr = crate::profile::ManagedCredentialRoute {
+            name: "anthropic_oauth".to_string(),
+            upstream: "https://api.anthropic.com".to_string(),
+            capture: crate::profile::CredentialRouteCapture::OauthIntercept {
+                token_url_match: "/v1/oauth/token".to_string(),
+                refresh_url_match: None,
+                token_host: None,
+            },
+        };
+        let routes = synthesize_credential_routes(&cr);
+        assert_eq!(routes.len(), 1, "same-host → single route");
+        let route = &routes[0];
+        assert_eq!(route.upstream, "https://api.anthropic.com");
+        assert_eq!(route.prefix, "_oauth_anthropic_oauth");
+        assert!(route.credential_key.is_none(), "no static key");
+        let oc = route.oauth_capture.as_ref().expect("capture set");
+        assert_eq!(oc.token_url_match, "/v1/oauth/token");
+        // refresh defaults to token when absent.
+        assert_eq!(oc.refresh_url_match, "/v1/oauth/token");
+    }
+
+    #[test]
+    fn synthesize_oauth_cross_host_splits_capture_and_egress() {
+        // Distinct token host → a capture route (token host) + an egress route
+        // (API host) that intercepts via allow-all rules, no sentinel.
+        let cr = crate::profile::ManagedCredentialRoute {
+            name: "anthropic_oauth".to_string(),
+            upstream: "https://api.anthropic.com".to_string(),
+            capture: crate::profile::CredentialRouteCapture::OauthIntercept {
+                token_url_match: "/v1/oauth/token".to_string(),
+                refresh_url_match: Some("/v1/oauth/refresh".to_string()),
+                token_host: Some("https://platform.claude.com".to_string()),
+            },
+        };
+        let routes = synthesize_credential_routes(&cr);
+        assert_eq!(routes.len(), 2, "cross-host → capture + egress");
+
+        let capture = routes
+            .iter()
+            .find(|r| r.oauth_capture.is_some())
+            .expect("a capture route");
+        assert_eq!(capture.upstream, "https://platform.claude.com");
+        assert_eq!(capture.prefix, "_oauth_anthropic_oauth_token");
+        let oc = capture.oauth_capture.as_ref().expect("capture match");
+        assert_eq!(oc.token_url_match, "/v1/oauth/token");
+        assert_eq!(oc.refresh_url_match, "/v1/oauth/refresh");
+
+        let egress = routes
+            .iter()
+            .find(|r| r.oauth_capture.is_none())
+            .expect("an egress route");
+        assert_eq!(egress.upstream, "https://api.anthropic.com");
+        assert_eq!(egress.prefix, "_oauth_anthropic_oauth_egress");
+        // allow-all rules force L7 interception so nonces resolve on egress.
+        assert_eq!(egress.endpoint_rules.len(), 1);
+        assert_eq!(egress.endpoint_rules[0].method, "*");
+        assert_eq!(egress.endpoint_rules[0].path, "/**");
+    }
+
     use crate::command_policy::{
         ApprovalBackendConfig, ApprovalBackendType, CommandCredentialConfig,
         CommandCredentialGrantPolicyConfig, CommandPolicyConfig, EndpointRuleConfig,
@@ -2645,6 +2859,7 @@ mod tests {
             profile_display_name: None,
             command_policies: None,
             credential_capture: HashMap::new(),
+            credential_routes: Vec::new(),
             tls_intercept: None,
             session_hooks: crate::profile::SessionHooks::default(),
             rollback_exclude_patterns: Vec::new(),
@@ -2964,6 +3179,7 @@ mod tests {
             tls_client_key: None,
             oauth2: None,
             aws_auth: None,
+            oauth_capture: None,
         });
         let credential_env_vars = vec![
             (

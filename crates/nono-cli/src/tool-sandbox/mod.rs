@@ -30,6 +30,8 @@ pub(crate) fn log_main_total() {}
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod audit_context;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) mod broker_store;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod credentials;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod dynamic_providers;

@@ -366,6 +366,18 @@ pub enum LocalSocketMode {
     Connect,
 }
 
+/// Output format for an [`InterceptActionConfig::Capture`] action.
+///
+/// Absent on the action means opaque stdout (full-buffer nonce reissue).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureFormat {
+    /// Parse stdout as a JSON object and substitute a broker nonce for the
+    /// string value at each `secret_paths` entry, leaving all other fields
+    /// untouched.
+    Json,
+}
+
 /// Action to take when an [`InterceptRuleConfig`] matches.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -381,7 +393,32 @@ pub enum InterceptActionConfig {
     /// Fork the child, capture its stdout/stderr, and return the buffered output
     /// in the shim response. Primary use: credential-bearing output scanned by
     /// the token broker before reaching the agent.
-    Capture,
+    ///
+    /// By default (no `format`) the whole captured stdout is scanned and any
+    /// broker nonce or broker-held secret is reissued before the buffer reaches
+    /// the agent (`TokenBroker::scan_and_reissue`).
+    ///
+    /// With `format: "json"`, stdout is parsed as a JSON object and only the
+    /// string values at the dotted `secret_paths` are replaced with freshly
+    /// minted nonces; every other field passes through unchanged. Use this for
+    /// a single command returning a structured envelope with one or more
+    /// credentials at known field paths (e.g. `security find-generic-password`
+    /// emitting OAuth tokens under `claudeAiOauth.accessToken`). The rewrite is
+    /// fail-closed: malformed JSON, or a path resolving to a non-string value,
+    /// returns a sandbox-safe error instead of the raw stdout.
+    Capture {
+        /// Output format. Absent means opaque stdout (the original capture
+        /// semantics: full-buffer nonce reissue).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        format: Option<CaptureFormat>,
+        /// Dotted JSON field paths whose string values are each minted as a
+        /// separate nonce. Required (non-empty) when `format` is `"json"`;
+        /// ignored otherwise. Each path must resolve to a JSON string; a
+        /// missing path is silently skipped. Object keys containing literal
+        /// dots are not supported (`a.b.c` always traverses three keys).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        secret_paths: Vec<String>,
+    },
     /// Capture stdout, store it as a named tool-sandbox ambient credential, and return
     /// a broker nonce instead of the real value.
     CaptureCredential {
@@ -1275,6 +1312,32 @@ fn validate_intercept_rules(
                 *timeout_secs,
                 report,
             );
+        }
+        if let InterceptActionConfig::Capture {
+            format: Some(CaptureFormat::Json),
+            secret_paths,
+        } = &rule.action
+        {
+            // Fail-closed: a json capture with no secret_paths would parse and
+            // re-serialise the envelope unchanged, leaking the real credential.
+            if secret_paths.is_empty() {
+                report.error(
+                    "capture_json_missing_secret_paths",
+                    format!(
+                        "command '{command_name}' intercept rule {i} capture format=json requires a non-empty secret_paths"
+                    ),
+                );
+            }
+            // An empty path string traverses zero keys and can never resolve to
+            // a string value; reject it rather than silently no-op.
+            if secret_paths.iter().any(|p| p.is_empty()) {
+                report.error(
+                    "capture_json_empty_secret_path",
+                    format!(
+                        "command '{command_name}' intercept rule {i} capture secret_paths contains an empty path"
+                    ),
+                );
+            }
         }
     }
 }
@@ -3743,6 +3806,136 @@ mod tests {
                 .iter()
                 .any(|f| f.code == "intercept_rule_after_catch_all"),
             "expected intercept_rule_after_catch_all error"
+        );
+    }
+
+    #[test]
+    fn validate_capture_json_requires_secret_paths() {
+        let mut config = active_git_config();
+        if let Some(git) = config.commands.get_mut("git") {
+            git.intercept = vec![InterceptRuleConfig {
+                args: vec!["credential".to_string()],
+                action: InterceptActionConfig::Capture {
+                    format: Some(CaptureFormat::Json),
+                    secret_paths: vec![],
+                },
+            }];
+        }
+        let report =
+            validate_command_policies(Some(&config), CommandPolicyValidationScope::Resolved);
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|f| f.code == "capture_json_missing_secret_paths"),
+            "json capture without secret_paths must be a fatal config error: {:?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn validate_capture_json_rejects_empty_path() {
+        let mut config = active_git_config();
+        if let Some(git) = config.commands.get_mut("git") {
+            git.intercept = vec![InterceptRuleConfig {
+                args: vec!["credential".to_string()],
+                action: InterceptActionConfig::Capture {
+                    format: Some(CaptureFormat::Json),
+                    secret_paths: vec!["".to_string()],
+                },
+            }];
+        }
+        let report =
+            validate_command_policies(Some(&config), CommandPolicyValidationScope::Resolved);
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|f| f.code == "capture_json_empty_secret_path"),
+            "empty secret_path must be a fatal config error: {:?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn validate_capture_json_with_paths_is_valid() {
+        let mut config = active_git_config();
+        if let Some(git) = config.commands.get_mut("git") {
+            git.intercept = vec![InterceptRuleConfig {
+                args: vec!["credential".to_string()],
+                action: InterceptActionConfig::Capture {
+                    format: Some(CaptureFormat::Json),
+                    secret_paths: vec!["claudeAiOauth.accessToken".to_string()],
+                },
+            }];
+        }
+        let report =
+            validate_command_policies(Some(&config), CommandPolicyValidationScope::Resolved);
+        assert!(
+            !report
+                .errors
+                .iter()
+                .any(|f| f.code.starts_with("capture_json")),
+            "valid json capture must not error: {:?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn capture_action_serde_backward_compat() {
+        // Legacy bare form: no fields → opaque capture.
+        let opaque: InterceptActionConfig =
+            serde_json::from_str(r#"{"type":"capture"}"#).expect("bare capture must deserialize");
+        assert_eq!(
+            opaque,
+            InterceptActionConfig::Capture {
+                format: None,
+                secret_paths: vec![],
+            }
+        );
+        // It must also round-trip back to the bare form (fields skipped).
+        assert_eq!(
+            serde_json::to_value(&opaque).expect("serialize"),
+            serde_json::json!({"type": "capture"})
+        );
+
+        // New json form.
+        let json: InterceptActionConfig = serde_json::from_str(
+            r#"{"type":"capture","format":"json","secret_paths":["claudeAiOauth.accessToken"]}"#,
+        )
+        .expect("json capture must deserialize");
+        assert_eq!(
+            json,
+            InterceptActionConfig::Capture {
+                format: Some(CaptureFormat::Json),
+                secret_paths: vec!["claudeAiOauth.accessToken".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn validate_capture_opaque_needs_no_secret_paths() {
+        // Backward compatibility: a bare `{"type":"capture"}` (format None)
+        // must remain valid with no secret_paths.
+        let mut config = active_git_config();
+        if let Some(git) = config.commands.get_mut("git") {
+            git.intercept = vec![InterceptRuleConfig {
+                args: vec!["credential".to_string()],
+                action: InterceptActionConfig::Capture {
+                    format: None,
+                    secret_paths: vec![],
+                },
+            }];
+        }
+        let report =
+            validate_command_policies(Some(&config), CommandPolicyValidationScope::Resolved);
+        assert!(
+            !report
+                .errors
+                .iter()
+                .any(|f| f.code.starts_with("capture_json")),
+            "opaque capture must not require secret_paths: {:?}",
+            report.errors
         );
     }
 

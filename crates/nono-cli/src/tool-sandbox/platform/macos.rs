@@ -3,8 +3,8 @@ use crate::audit_integrity::{
     CommandPolicyStdioStreamAudit,
 };
 use crate::command_policy::{
-    CommandPoliciesConfig, CommandSandboxConfig, InterceptActionConfig, ResolvedCommandBinaries,
-    ResolvedCommandBinary, has_explicit_self_invocation_entry,
+    CaptureFormat, CommandPoliciesConfig, CommandSandboxConfig, InterceptActionConfig,
+    ResolvedCommandBinaries, ResolvedCommandBinary, has_explicit_self_invocation_entry,
 };
 use crate::tool_sandbox::credentials::{ResolvedCredential, resolve_credentials};
 use crate::tool_sandbox::env::{
@@ -1362,7 +1362,11 @@ fn handle_shim_stream_inner(
     }
 
     // ── Capture ──────────────────────────────────────────────────────────
-    if matches!(intercept_action, InterceptActionConfig::Capture) {
+    if let InterceptActionConfig::Capture {
+        format,
+        secret_paths,
+    } = intercept_action
+    {
         let active = state.active_count.fetch_add(1, Ordering::SeqCst);
         if active >= MAX_ACTIVE_TOOL_SANDBOX_CHILDREN {
             state.active_count.fetch_sub(1, Ordering::SeqCst);
@@ -1395,7 +1399,18 @@ fn handle_shim_stream_inner(
                             "tool-sandbox token broker lock poisoned".to_string(),
                         )
                     })?;
-                    broker.scan_and_reissue(&raw_output)
+                    match format {
+                        None => broker.scan_and_reissue(&raw_output),
+                        Some(CaptureFormat::Json) => {
+                            use crate::tool_sandbox::token_broker::JsonCaptureOutcome;
+                            match broker.rewrite_json_secrets(&raw_output, secret_paths) {
+                                JsonCaptureOutcome::Rewritten(bytes) => bytes,
+                                // Fail-closed: return the sandbox-safe message,
+                                // never the raw stdout that holds the secret.
+                                JsonCaptureOutcome::FailClosed(msg) => msg.into_bytes(),
+                            }
+                        }
+                    }
                 };
                 if captured.len() > MAX_CAPTURE_STDOUT {
                     return Err(NonoError::SandboxInit(

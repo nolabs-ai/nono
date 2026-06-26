@@ -20,9 +20,24 @@
 /// specific grant set limits redemption to named consumers of the form
 /// `"cmd.<command_name>"` (env-var promotion path) or `"proxy.<route_id>"`
 /// (L7 header-injection path). A consumer not in the grant set receives `None`.
+#[cfg(target_os = "macos")]
+use super::broker_store::{BrokerStore, PersistedRecord};
 use rand::RngExt;
 use std::sync::{Arc, Mutex};
 use zeroize::Zeroizing;
+
+/// Hook used by [`TokenBroker::with_store_and_reader`] to inspect claude's
+/// own `Claude Code-credentials` keychain entry at hydrate time. Returns
+/// the access-token field from the entry (typically a `nono_<hex>` nonce
+/// or a `sk-ant-…` real token), or `None` if the entry is missing /
+/// unreadable / lacks the field.
+///
+/// Production callers pass the real reader from
+/// [`super::broker_store::current_claude_access_token`]. Tests pass a
+/// closure returning a known value so the orphan-GC paths are exercised
+/// without touching the user's keychain.
+#[cfg(target_os = "macos")]
+pub(crate) type ClaudeAccessTokenReader = Box<dyn Fn() -> Option<String>>;
 
 /// A shared, thread-safe token broker that can be held by both the proxy
 /// runtime and the tool-sandbox runtime.
@@ -69,6 +84,15 @@ impl GrantSet {
 pub(crate) struct TokenBroker {
     map: std::collections::HashMap<String, (Zeroizing<Vec<u8>>, GrantSet)>,
     named: std::collections::HashMap<String, (Zeroizing<Vec<u8>>, GrantSet)>,
+    /// Optional durable backing for OAuth cross-session resume. `None`
+    /// for command-mediation-only brokers (the original behaviour).
+    #[cfg(target_os = "macos")]
+    store: Option<Arc<dyn BrokerStore>>,
+    /// Nonces of the currently-live OAuth pair, if any. Tracked separately
+    /// from `map` so [`capture_oauth_pair`](Self::capture_oauth_pair) can
+    /// prune the previous pair on a refresh rotation. `None` if no OAuth
+    /// pair has been captured or hydrated this run.
+    current_pair: Option<(String, String)>,
 }
 
 impl TokenBroker {
@@ -76,7 +100,146 @@ impl TokenBroker {
         Self {
             map: std::collections::HashMap::new(),
             named: std::collections::HashMap::new(),
+            #[cfg(target_os = "macos")]
+            store: None,
+            current_pair: None,
         }
+    }
+
+    /// Construct a broker backed by `store`, hydrating from any previously
+    /// persisted OAuth pair with orphan-GC disabled (no-op reader). Test-only
+    /// convenience; production always uses
+    /// [`with_store_and_reader`](Self::with_store_and_reader) with the real
+    /// `Claude Code-credentials` reader.
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn with_store(store: Arc<dyn BrokerStore>) -> nono::Result<Self> {
+        Self::with_store_and_reader(store, Box::new(|| None))
+    }
+
+    #[cfg(target_os = "macos")]
+    /// Construct a broker backed by `store`, cross-referencing the
+    /// persisted record against `claude_access_token_reader` to detect
+    /// orphaned records.
+    ///
+    /// On startup:
+    /// 1. Load the persisted record. If empty, return an empty broker.
+    /// 2. Read claude's own `Claude Code-credentials` access token.
+    /// 3. If it matches the stored `access_nonce`, the record is live —
+    ///    hydrate the in-memory map and set `current_pair`.
+    /// 4. Otherwise (entry missing, holds a real `sk-ant-…` token, or a
+    ///    different nonce), the record is stale — clear it and return an
+    ///    empty broker. The next `/login` capture creates a fresh record.
+    ///
+    /// Rationale: when the user runs `/logout` inside claude, the
+    /// `Claude Code-credentials` entry is wiped but our persisted record
+    /// still holds the real refresh token. Without this GC the broker
+    /// would keep hydrating dead tokens for as long as Anthropic considers
+    /// them valid (~1 year), violating the user's "logout means tokens are
+    /// gone" mental model.
+    ///
+    /// Returns an error only if the store's `load` itself fails — read
+    /// failures from `claude_access_token_reader` are treated as "entry
+    /// missing" (the GC-stale path), the conservative choice: better to
+    /// drop a live record and force a re-`/login` than to leak a real
+    /// token because we couldn't tell.
+    pub(crate) fn with_store_and_reader(
+        store: Arc<dyn BrokerStore>,
+        claude_access_token_reader: ClaudeAccessTokenReader,
+    ) -> nono::Result<Self> {
+        let mut broker = Self {
+            map: std::collections::HashMap::new(),
+            named: std::collections::HashMap::new(),
+            store: Some(store.clone()),
+            current_pair: None,
+        };
+
+        let Some(record) = store.load()? else {
+            return Ok(broker);
+        };
+
+        let claude_access = claude_access_token_reader();
+        let live = matches!(claude_access.as_deref(), Some(t) if t == record.access_nonce);
+
+        if !live {
+            tracing::info!(
+                "OAuth broker persisted record does not match Claude Code-credentials \
+                 entry (claude_access_present={}); clearing stale record",
+                claude_access.is_some()
+            );
+            if let Err(e) = store.clear() {
+                tracing::warn!(
+                    "OAuth broker stale-record clear failed (continuing without hydration): {e}"
+                );
+            }
+            return Ok(broker);
+        }
+
+        // Re-register the previous session's nonces so the keychain entry
+        // the sandboxed claude reads continues to resolve. OAuth nonces are
+        // unscoped (`GrantSet::All`): the proxy redeems them on egress.
+        broker.map.insert(
+            record.access_nonce.clone(),
+            (
+                Zeroizing::new(record.access_token.as_bytes().to_vec()),
+                GrantSet::All,
+            ),
+        );
+        broker.map.insert(
+            record.refresh_nonce.clone(),
+            (
+                Zeroizing::new(record.refresh_token.as_bytes().to_vec()),
+                GrantSet::All,
+            ),
+        );
+        broker.current_pair = Some((record.access_nonce, record.refresh_nonce));
+        Ok(broker)
+    }
+
+    /// Capture an OAuth `(access_token, refresh_token)` pair: mint a nonce
+    /// for each, register them in memory, and persist the pair to the
+    /// configured store (if any) so the mapping survives this session.
+    ///
+    /// If a previous OAuth pair is currently live (hydrated on startup or
+    /// minted by a prior call this session), its nonces are removed from
+    /// the in-memory map before the new pair is issued. This handles the
+    /// refresh-rotation case so the map does not grow with refresh count.
+    ///
+    /// Returns `(access_nonce, refresh_nonce)` so the caller can splice the
+    /// nonces into the response body bound for the sandboxed client.
+    ///
+    /// Persistence is best-effort: a store error is logged at `warn!` and
+    /// swallowed. The in-memory side always succeeds, so capture-and-rewrite
+    /// continues to work in the current session even when durable storage is
+    /// unavailable.
+    pub(crate) fn capture_oauth_pair(
+        &mut self,
+        access: Zeroizing<String>,
+        refresh: Zeroizing<String>,
+    ) -> (String, String) {
+        // Prune the previous pair, if any, before minting the new one, to
+        // keep the map bounded over a long session with many rotations.
+        if let Some((old_access_nonce, old_refresh_nonce)) = self.current_pair.take() {
+            self.map.remove(&old_access_nonce);
+            self.map.remove(&old_refresh_nonce);
+        }
+
+        let access_nonce = self.issue(Zeroizing::new(access.as_bytes().to_vec()));
+        let refresh_nonce = self.issue(Zeroizing::new(refresh.as_bytes().to_vec()));
+        self.current_pair = Some((access_nonce.clone(), refresh_nonce.clone()));
+
+        #[cfg(target_os = "macos")]
+        if let Some(store) = self.store.as_ref() {
+            let record = PersistedRecord {
+                access_nonce: access_nonce.clone(),
+                refresh_nonce: refresh_nonce.clone(),
+                access_token: access,
+                refresh_token: refresh,
+            };
+            if let Err(e) = store.save(&record) {
+                tracing::warn!("OAuth broker persistence failed (continuing in-memory only): {e}");
+            }
+        }
+        (access_nonce, refresh_nonce)
     }
 
     /// Issue a nonce for `value` with no consumer restriction.
@@ -225,6 +388,131 @@ impl TokenBroker {
             .max_by_key(|(value, _)| value.len())
             .cloned()
     }
+
+    #[cfg(target_os = "macos")]
+    /// Rewrite a JSON-envelope capture: parse `raw` as JSON and replace the
+    /// string value at each dotted `secret_paths` entry with a freshly minted,
+    /// unscoped nonce, leaving every other field untouched.
+    ///
+    /// **Fail-closed contract** — every error path returns
+    /// [`JsonCaptureOutcome::FailClosed`] with a sandbox-safe message rather
+    /// than the raw stdout (which is the real credential the agent must not
+    /// see):
+    ///
+    /// - Malformed JSON → fail-closed; we never return `raw` unchanged.
+    /// - A path resolving to a non-string value → fail-closed; a misconfigured
+    ///   profile must not leak string-credential siblings it *did* expect to
+    ///   nonce.
+    /// - A path whose parent is missing or is not an object → treated as
+    ///   "missing" and silently skipped.
+    ///
+    /// The caller must ensure `secret_paths` is non-empty (enforced at config
+    /// load by `validate_intercept_rules`); an empty list would re-serialise
+    /// the envelope unchanged and leak the credential.
+    pub(crate) fn rewrite_json_secrets(
+        &mut self,
+        raw: &[u8],
+        secret_paths: &[String],
+    ) -> JsonCaptureOutcome {
+        let mut value: serde_json::Value = match serde_json::from_slice(raw) {
+            Ok(v) => v,
+            Err(e) => {
+                // Report line/column only. The serde_json message can echo a
+                // snippet of the input on some errors, and we must never let
+                // any `raw` content into our error string.
+                return JsonCaptureOutcome::FailClosed(format!(
+                    "nono: capture format=json: stdout is not valid JSON \
+                     (at line {} column {}); refusing to return raw output",
+                    e.line(),
+                    e.column()
+                ));
+            }
+        };
+
+        for path in secret_paths {
+            match self.substitute_one_path(&mut value, path) {
+                Ok(()) => {}
+                Err(SubstituteErr::NonString) => {
+                    return JsonCaptureOutcome::FailClosed(format!(
+                        "nono: capture format=json: secret_path '{path}' resolved \
+                         to a non-string value; refusing to return raw output \
+                         to avoid leaking unrelated string credentials"
+                    ));
+                }
+                Err(SubstituteErr::MissingPath) => {
+                    // Silent skip — documented behaviour.
+                }
+            }
+        }
+
+        match serde_json::to_vec(&value) {
+            Ok(bytes) => JsonCaptureOutcome::Rewritten(bytes),
+            Err(e) => JsonCaptureOutcome::FailClosed(format!(
+                "nono: capture format=json: could not re-serialise JSON ({e}); \
+                 refusing to return raw output"
+            )),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    /// Walk `dotted` (dot-separated object keys) to a leaf string and replace
+    /// it with a freshly minted unscoped nonce. Object keys containing literal
+    /// dots are not supported.
+    fn substitute_one_path(
+        &mut self,
+        value: &mut serde_json::Value,
+        dotted: &str,
+    ) -> std::result::Result<(), SubstituteErr> {
+        let segments: Vec<&str> = dotted.split('.').collect();
+        let Some((last, parents)) = segments.split_last() else {
+            return Err(SubstituteErr::MissingPath);
+        };
+
+        let mut cursor = value;
+        for seg in parents {
+            cursor = match cursor.as_object_mut().and_then(|m| m.get_mut(*seg)) {
+                Some(child) => child,
+                None => return Err(SubstituteErr::MissingPath),
+            };
+        }
+
+        let Some(obj) = cursor.as_object_mut() else {
+            return Err(SubstituteErr::MissingPath);
+        };
+        let Some(leaf) = obj.get_mut(*last) else {
+            return Err(SubstituteErr::MissingPath);
+        };
+        let serde_json::Value::String(secret) = leaf else {
+            return Err(SubstituteErr::NonString);
+        };
+
+        // Move the secret out (leaving "" behind) so the real value is owned by
+        // the broker and zeroed on drop, then overwrite the leaf with the nonce.
+        let nonce = self.issue(Zeroizing::new(std::mem::take(secret).into_bytes()));
+        *leaf = serde_json::Value::String(nonce);
+        Ok(())
+    }
+}
+
+/// Outcome of [`TokenBroker::rewrite_json_secrets`].
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+pub(crate) enum JsonCaptureOutcome {
+    /// The JSON envelope with each targeted secret replaced by a nonce.
+    Rewritten(Vec<u8>),
+    /// A sandbox-safe error message. The caller must return this to the agent
+    /// in place of the captured stdout — never the raw output.
+    FailClosed(String),
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+enum SubstituteErr {
+    /// A path segment does not exist or its parent is not an object. The
+    /// caller treats this as a no-op for that path.
+    MissingPath,
+    /// The leaf value at the path is not a JSON string.
+    NonString,
 }
 
 /// Returns true if `s` is a well-formed broker nonce: `nono_` + exactly 64 hex chars.
@@ -237,6 +525,7 @@ pub(crate) fn is_nonce(s: &str) -> bool {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -470,5 +759,397 @@ mod tests {
             .expect("stored gitlab credential should be available");
         assert!(broker.resolve_nonce(&n2, "cmd.glab").is_some());
         assert!(broker.resolve_nonce(&n2, "cmd.curl").is_none());
+    }
+
+    // ── rewrite_json_secrets (capture format=json) — macOS only ─────────────
+
+    #[cfg(target_os = "macos")]
+    /// Keychain-shaped envelope: an Anthropic OAuth token we intend to nonce,
+    /// alongside an unrelated Slack token that must pass through untouched.
+    fn keychain_envelope() -> &'static str {
+        r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-REAL","refreshToken":"sk-ant-ort01-REAL"},"mcp":{"slack":{"token":"xoxb-UNRELATED"}}}"#
+    }
+
+    #[cfg(target_os = "macos")]
+    fn rewritten(outcome: JsonCaptureOutcome) -> Vec<u8> {
+        match outcome {
+            JsonCaptureOutcome::Rewritten(bytes) => bytes,
+            JsonCaptureOutcome::FailClosed(msg) => {
+                panic!("expected Rewritten, got FailClosed: {msg}")
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn json_capture_substitutes_targeted_paths_only() {
+        let mut broker = TokenBroker::new();
+        let paths = vec![
+            "claudeAiOauth.accessToken".to_string(),
+            "claudeAiOauth.refreshToken".to_string(),
+        ];
+        let out = rewritten(broker.rewrite_json_secrets(keychain_envelope().as_bytes(), &paths));
+        let out_str = as_utf8(&out);
+
+        // Real Anthropic tokens are gone; the unrelated Slack token is intact.
+        assert!(!out_str.contains("sk-ant-oat01-REAL"));
+        assert!(!out_str.contains("sk-ant-ort01-REAL"));
+        assert!(out_str.contains("xoxb-UNRELATED"));
+
+        // The substituted access-token nonce resolves back to the real value.
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&out).expect("rewritten output must be valid JSON");
+        let nonce = parsed["claudeAiOauth"]["accessToken"]
+            .as_str()
+            .expect("accessToken must be a string nonce");
+        assert!(is_nonce(nonce), "leaf must be replaced by a broker nonce");
+        let real = broker
+            .resolve_nonce(nonce, "proxy.anthropic")
+            .expect("nonce must resolve to the captured secret");
+        assert_eq!(real.as_slice(), b"sk-ant-oat01-REAL");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn json_capture_missing_path_silently_skipped() {
+        let mut broker = TokenBroker::new();
+        let paths = vec![
+            "claudeAiOauth.accessToken".to_string(),
+            "claudeAiOauth.doesNotExist".to_string(),
+            "absent.parent.leaf".to_string(),
+        ];
+        let out = rewritten(broker.rewrite_json_secrets(keychain_envelope().as_bytes(), &paths));
+        let out_str = as_utf8(&out);
+        // The present path is rewritten; the missing ones are no-ops.
+        assert!(!out_str.contains("sk-ant-oat01-REAL"));
+        assert!(out_str.contains("sk-ant-ort01-REAL"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn json_capture_non_string_value_fails_closed() {
+        let mut broker = TokenBroker::new();
+        // accessToken is targeted but resolves to an object, not a string.
+        let raw = r#"{"claudeAiOauth":{"accessToken":{"nested":"x"}}}"#;
+        let paths = vec!["claudeAiOauth.accessToken".to_string()];
+        match broker.rewrite_json_secrets(raw.as_bytes(), &paths) {
+            JsonCaptureOutcome::FailClosed(msg) => {
+                assert!(msg.contains("non-string"));
+                // The error must not echo any input content.
+                assert!(!msg.contains("nested"));
+            }
+            JsonCaptureOutcome::Rewritten(_) => panic!("non-string leaf must fail closed"),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn json_capture_malformed_input_fails_closed_without_leak() {
+        let mut broker = TokenBroker::new();
+        let raw = b"sk-ant-oat01-REAL not json at all";
+        let paths = vec!["accessToken".to_string()];
+        match broker.rewrite_json_secrets(raw, &paths) {
+            JsonCaptureOutcome::FailClosed(msg) => {
+                // Never return the raw stdout, and never echo it in the error.
+                assert!(!msg.contains("sk-ant-oat01-REAL"));
+                assert!(msg.contains("not valid JSON"));
+            }
+            JsonCaptureOutcome::Rewritten(_) => panic!("malformed input must fail closed"),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn json_capture_each_call_mints_fresh_nonces() {
+        let mut broker = TokenBroker::new();
+        let paths = vec!["claudeAiOauth.accessToken".to_string()];
+        let first = rewritten(broker.rewrite_json_secrets(keychain_envelope().as_bytes(), &paths));
+        let second = rewritten(broker.rewrite_json_secrets(keychain_envelope().as_bytes(), &paths));
+        let first_nonce = find_nonce(as_utf8(&first));
+        let second_nonce = find_nonce(as_utf8(&second));
+        assert_ne!(
+            first_nonce, second_nonce,
+            "each capture must mint a fresh nonce"
+        );
+        // Both still resolve to the same real secret.
+        assert_eq!(
+            broker
+                .resolve_nonce(first_nonce, "any")
+                .expect("first nonce resolves")
+                .as_slice(),
+            b"sk-ant-oat01-REAL"
+        );
+        assert_eq!(
+            broker
+                .resolve_nonce(second_nonce, "any")
+                .expect("second nonce resolves")
+                .as_slice(),
+            b"sk-ant-oat01-REAL"
+        );
+    }
+
+    // ── OAuth pair capture + cross-session persistence ───────────────────────
+
+    #[cfg(target_os = "macos")]
+    use crate::tool_sandbox::broker_store::test_support::MemoryBrokerStore;
+
+    #[test]
+    fn capture_oauth_pair_without_store_issues_two_resolvable_nonces() {
+        let mut broker = TokenBroker::new();
+        let (access_nonce, refresh_nonce) = broker.capture_oauth_pair(
+            Zeroizing::new("real_access".to_string()),
+            Zeroizing::new("real_refresh".to_string()),
+        );
+        assert!(is_nonce(&access_nonce));
+        assert!(is_nonce(&refresh_nonce));
+        assert_ne!(access_nonce, refresh_nonce);
+        assert_eq!(
+            broker
+                .resolve_nonce(&access_nonce, "any")
+                .unwrap()
+                .as_slice(),
+            b"real_access"
+        );
+        assert_eq!(
+            broker
+                .resolve_nonce(&refresh_nonce, "any")
+                .unwrap()
+                .as_slice(),
+            b"real_refresh"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn capture_oauth_pair_with_store_persists_record() {
+        let store = Arc::new(MemoryBrokerStore::new());
+        let mut broker = TokenBroker::with_store(store.clone()).expect("empty store loads OK");
+        let (access_nonce, refresh_nonce) = broker.capture_oauth_pair(
+            Zeroizing::new("real_access".to_string()),
+            Zeroizing::new("real_refresh".to_string()),
+        );
+
+        let persisted = store.current().expect("save wrote a record");
+        assert_eq!(persisted.access_nonce, access_nonce);
+        assert_eq!(persisted.refresh_nonce, refresh_nonce);
+        assert_eq!(persisted.access_token.as_str(), "real_access");
+        assert_eq!(persisted.refresh_token.as_str(), "real_refresh");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn with_store_hydrates_when_claude_keychain_matches() {
+        // resolve_nonce only resolves well-formed `nono_<64hex>` nonces, so
+        // the persisted nonces must be the real shape (unlike the fork's
+        // looser map-lookup resolve).
+        let access_nonce = format!("nono_{}", "a".repeat(64));
+        let refresh_nonce = format!("nono_{}", "b".repeat(64));
+        let preloaded = PersistedRecord {
+            access_nonce: access_nonce.clone(),
+            refresh_nonce: refresh_nonce.clone(),
+            access_token: Zeroizing::new("real_access".to_string()),
+            refresh_token: Zeroizing::new("real_refresh".to_string()),
+        };
+        let store = Arc::new(MemoryBrokerStore::preload(preloaded));
+        let access_for_reader = access_nonce.clone();
+        let matching: ClaudeAccessTokenReader = Box::new(move || Some(access_for_reader.clone()));
+        let broker = TokenBroker::with_store_and_reader(store.clone(), matching).expect("hydrate");
+
+        assert_eq!(
+            broker
+                .resolve_nonce(&access_nonce, "any")
+                .unwrap()
+                .as_slice(),
+            b"real_access"
+        );
+        assert_eq!(
+            broker
+                .resolve_nonce(&refresh_nonce, "any")
+                .unwrap()
+                .as_slice(),
+            b"real_refresh"
+        );
+        assert!(store.current().is_some(), "live record stays in store");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn with_store_clears_orphan_when_claude_keychain_missing() {
+        let preloaded = PersistedRecord {
+            access_nonce: "nono_orphan_access".to_string(),
+            refresh_nonce: "nono_orphan_refresh".to_string(),
+            access_token: Zeroizing::new("real_orphan_access".to_string()),
+            refresh_token: Zeroizing::new("real_orphan_refresh".to_string()),
+        };
+        let store = Arc::new(MemoryBrokerStore::preload(preloaded));
+        let empty: ClaudeAccessTokenReader = Box::new(|| None);
+        let broker = TokenBroker::with_store_and_reader(store.clone(), empty).expect("GC path");
+
+        assert!(store.current().is_none(), "orphan record must be cleared");
+        assert!(broker.resolve_nonce("nono_orphan_access", "any").is_none());
+        assert!(broker.resolve_nonce("nono_orphan_refresh", "any").is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn with_store_clears_orphan_when_claude_keychain_holds_real_token() {
+        let preloaded = PersistedRecord {
+            access_nonce: "nono_orphan_access".to_string(),
+            refresh_nonce: "nono_orphan_refresh".to_string(),
+            access_token: Zeroizing::new("real_orphan_access".to_string()),
+            refresh_token: Zeroizing::new("real_orphan_refresh".to_string()),
+        };
+        let store = Arc::new(MemoryBrokerStore::preload(preloaded));
+        let real_token: ClaudeAccessTokenReader =
+            Box::new(|| Some("sk-ant-oat01-fresh-real-token".to_string()));
+        let broker = TokenBroker::with_store_and_reader(store.clone(), real_token).expect("GC");
+
+        assert!(
+            store.current().is_none(),
+            "stale record cleared when claude holds a real token"
+        );
+        assert!(broker.resolve_nonce("nono_orphan_access", "any").is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn capture_oauth_pair_prunes_previous_pair() {
+        let store = Arc::new(MemoryBrokerStore::new());
+        let mut broker = TokenBroker::with_store(store).expect("empty store loads OK");
+
+        let (old_access, old_refresh) = broker.capture_oauth_pair(
+            Zeroizing::new("real_access_v1".to_string()),
+            Zeroizing::new("real_refresh_v1".to_string()),
+        );
+        assert!(broker.resolve_nonce(&old_access, "any").is_some());
+
+        let (new_access, new_refresh) = broker.capture_oauth_pair(
+            Zeroizing::new("real_access_v2".to_string()),
+            Zeroizing::new("real_refresh_v2".to_string()),
+        );
+
+        assert!(
+            broker.resolve_nonce(&old_access, "any").is_none(),
+            "old access nonce must be pruned"
+        );
+        assert!(
+            broker.resolve_nonce(&old_refresh, "any").is_none(),
+            "old refresh nonce must be pruned"
+        );
+        assert_eq!(
+            broker.resolve_nonce(&new_access, "any").unwrap().as_slice(),
+            b"real_access_v2"
+        );
+        assert_eq!(
+            broker
+                .resolve_nonce(&new_refresh, "any")
+                .unwrap()
+                .as_slice(),
+            b"real_refresh_v2"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn hydrate_then_capture_prunes_hydrated_pair() {
+        let access_nonce = format!("nono_{}", "c".repeat(64));
+        let refresh_nonce = format!("nono_{}", "d".repeat(64));
+        let preloaded = PersistedRecord {
+            access_nonce: access_nonce.clone(),
+            refresh_nonce: refresh_nonce.clone(),
+            access_token: Zeroizing::new("real_old".to_string()),
+            refresh_token: Zeroizing::new("real_old_refresh".to_string()),
+        };
+        let store = Arc::new(MemoryBrokerStore::preload(preloaded));
+        let access_for_reader = access_nonce.clone();
+        let matching: ClaudeAccessTokenReader = Box::new(move || Some(access_for_reader.clone()));
+        let mut broker = TokenBroker::with_store_and_reader(store, matching).expect("hydrate");
+        assert!(broker.resolve_nonce(&access_nonce, "any").is_some());
+
+        let _ = broker.capture_oauth_pair(
+            Zeroizing::new("real_new_access".to_string()),
+            Zeroizing::new("real_new_refresh".to_string()),
+        );
+
+        assert!(
+            broker.resolve_nonce(&access_nonce, "any").is_none(),
+            "hydrated nonce must be pruned after the post-hydrate capture"
+        );
+        assert!(broker.resolve_nonce(&refresh_nonce, "any").is_none());
+    }
+
+    /// Store whose `load` always fails — construction must propagate it.
+    #[cfg(target_os = "macos")]
+    struct FailingLoadStore;
+    #[cfg(target_os = "macos")]
+    impl BrokerStore for FailingLoadStore {
+        fn load(&self) -> nono::Result<Option<PersistedRecord>> {
+            Err(nono::NonoError::KeystoreAccess(
+                "simulated load failure".to_string(),
+            ))
+        }
+        fn save(&self, _record: &PersistedRecord) -> nono::Result<()> {
+            Ok(())
+        }
+        fn clear(&self) -> nono::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn with_store_propagates_load_errors() {
+        let store: Arc<dyn BrokerStore> = Arc::new(FailingLoadStore);
+        let err = match TokenBroker::with_store(store) {
+            Ok(_) => panic!("load failure must propagate"),
+            Err(e) => e,
+        };
+        assert!(
+            format!("{err}").contains("simulated load failure"),
+            "error must surface store's message: {err}"
+        );
+    }
+
+    /// Store whose `save` always fails — capture must still work in-memory.
+    #[cfg(target_os = "macos")]
+    struct FailingSaveStore;
+    #[cfg(target_os = "macos")]
+    impl BrokerStore for FailingSaveStore {
+        fn load(&self) -> nono::Result<Option<PersistedRecord>> {
+            Ok(None)
+        }
+        fn save(&self, _record: &PersistedRecord) -> nono::Result<()> {
+            Err(nono::NonoError::KeystoreAccess(
+                "simulated save failure".to_string(),
+            ))
+        }
+        fn clear(&self) -> nono::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn capture_oauth_pair_swallows_save_errors() {
+        let store: Arc<dyn BrokerStore> = Arc::new(FailingSaveStore);
+        let mut broker = TokenBroker::with_store(store).expect("empty store loads OK");
+        let (access_nonce, refresh_nonce) = broker.capture_oauth_pair(
+            Zeroizing::new("real_access".to_string()),
+            Zeroizing::new("real_refresh".to_string()),
+        );
+        assert_eq!(
+            broker
+                .resolve_nonce(&access_nonce, "any")
+                .unwrap()
+                .as_slice(),
+            b"real_access"
+        );
+        assert_eq!(
+            broker
+                .resolve_nonce(&refresh_nonce, "any")
+                .unwrap()
+                .as_slice(),
+            b"real_refresh"
+        );
     }
 }

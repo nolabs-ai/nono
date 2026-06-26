@@ -1012,11 +1012,33 @@ where
     }
     let injected_header_names = reverse::injected_credential_header_names(cred);
     let nonce_consumer = service.map(|s| format!("proxy.{s}"));
+
+    // OAuth-capture detection (HTTP/1.1 path): this route declares match
+    // patterns, the inbound path matches one, and a capture-capable resolver
+    // is wired. When active we force identity request encoding (below) and
+    // rewrite the token response (the `response_hook` passed to forward).
+    let oauth_capture_active = route
+        .and_then(|r| r.oauth_capture_match.as_ref())
+        .is_some_and(|oc| {
+            let p = req.path.split('?').next().unwrap_or(req.path.as_str());
+            p == oc.token_url_match || p == oc.refresh_url_match
+        })
+        && ctx
+            .nonce_resolver
+            .as_deref()
+            .and_then(|r| r.oauth_capture())
+            .is_some();
+
     for (name, value) in &filtered_headers {
         if injected_header_names
             .iter()
             .any(|header| name.eq_ignore_ascii_case(header))
         {
+            continue;
+        }
+        // For OAuth capture, drop accept-encoding so the upstream returns
+        // plaintext JSON the rewriter can parse.
+        if oauth_capture_active && name.eq_ignore_ascii_case("accept-encoding") {
             continue;
         }
         let resolved_value = nonce_consumer
@@ -1064,12 +1086,40 @@ where
         method: &req.method,
         path: &req.path,
     };
+
+    // OAuth-capture response rewrite: buffer the token response and swap real
+    // access/refresh tokens for broker nonces. Pass-through-on-error keeps
+    // `/login` working if the body isn't the expected JSON.
+    let response_hook: Option<forward::ResponseBodyRewriter<'_>> = if oauth_capture_active {
+        ctx.nonce_resolver.as_ref().map(|resolver| {
+            let resolver = Arc::clone(resolver);
+            let host = ctx.host.to_string();
+            let hook: forward::ResponseBodyRewriter<'_> = Box::new(move |body: &[u8]| {
+                let capture = resolver.oauth_capture()?;
+                match crate::oauth_rewrite::rewrite_oauth_json_body(body, capture) {
+                    crate::oauth_rewrite::OauthRewriteOutcome::Rewritten { bytes, substituted } => {
+                        debug!(
+                            "oauth-capture (h1): substituted {substituted} token field(s) for {host}"
+                        );
+                        Some(bytes.to_vec())
+                    }
+                    crate::oauth_rewrite::OauthRewriteOutcome::NotJson
+                    | crate::oauth_rewrite::OauthRewriteOutcome::NoTokenFields => None,
+                }
+            });
+            hook
+        })
+    } else {
+        None
+    };
+
     if let Err(e) = forward::forward_request(
         tls_stream,
         request.as_bytes(),
         &body,
         upstream_spec,
         audit_ctx,
+        response_hook,
     )
     .await
     {
@@ -1335,6 +1385,7 @@ mod tests {
             oauth2: None,
             aws_auth: None,
             endpoint_policy: None,
+            oauth_capture: None,
         }
     }
 

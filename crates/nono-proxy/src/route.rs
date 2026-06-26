@@ -77,6 +77,10 @@ pub struct LoadedRoute {
 
     /// Audit injection mode implied by the managed credential configuration.
     pub managed_injection_mode: Option<NetworkAuditInjectionMode>,
+
+    /// OAuth-capture match patterns, if this route captures tokens from an
+    /// intercepted OAuth response. `Some` forces `requires_intercept`.
+    pub oauth_capture_match: Option<crate::config::OauthCaptureMatch>,
 }
 
 impl std::fmt::Debug for LoadedRoute {
@@ -94,6 +98,7 @@ impl std::fmt::Debug for LoadedRoute {
             )
             .field("managed_auth_mechanism", &self.managed_auth_mechanism)
             .field("managed_injection_mode", &self.managed_injection_mode)
+            .field("oauth_capture", &self.oauth_capture_match.is_some())
             .finish()
     }
 }
@@ -218,8 +223,11 @@ impl RouteStore {
             let requires_managed_credential = route.credential_key.is_some()
                 || route.oauth2.is_some()
                 || route.aws_auth.is_some();
-            let requires_intercept =
-                requires_managed_credential || !endpoint_policy.allows_all_without_l7();
+            // OAuth-capture routes must be TLS-intercepted so the proxy can see
+            // and rewrite the token-endpoint response body.
+            let requires_intercept = requires_managed_credential
+                || route.oauth_capture.is_some()
+                || !endpoint_policy.allows_all_without_l7();
             let managed_auth_mechanism = auth_mechanism_for_route(route);
             let managed_injection_mode = injection_mode_for_route(route);
 
@@ -237,6 +245,7 @@ impl RouteStore {
                     requires_managed_credential,
                     managed_auth_mechanism,
                     managed_injection_mode,
+                    oauth_capture_match: route.oauth_capture.clone(),
                 },
             );
         }
@@ -738,6 +747,7 @@ mod tests {
                 },
             ],
             endpoint_policy: None,
+            oauth_capture: None,
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
@@ -779,6 +789,7 @@ mod tests {
             env_var: None,
             endpoint_rules: vec![],
             endpoint_policy: None,
+            oauth_capture: None,
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
@@ -807,6 +818,7 @@ mod tests {
             env_var: None,
             endpoint_rules: vec![],
             endpoint_policy: None,
+            oauth_capture: None,
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
@@ -836,6 +848,7 @@ mod tests {
                 env_var: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
+                oauth_capture: None,
                 tls_ca: None,
                 tls_client_cert: None,
                 tls_client_key: None,
@@ -856,6 +869,7 @@ mod tests {
                 env_var: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
+                oauth_capture: None,
                 tls_ca: None,
                 tls_client_cert: None,
                 tls_client_key: None,
@@ -949,6 +963,7 @@ mod tests {
             requires_managed_credential: false,
             managed_auth_mechanism: None,
             managed_injection_mode: None,
+            oauth_capture_match: None,
         };
         let debug_output = format!("{:?}", route);
         assert!(debug_output.contains("api.openai.com"));
@@ -975,6 +990,7 @@ mod tests {
             env_var: None,
             endpoint_rules: vec![],
             endpoint_policy: None,
+            oauth_capture: None,
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
@@ -1012,6 +1028,7 @@ mod tests {
             env_var: Some("INTERNAL_API_TOKEN".to_string()),
             endpoint_rules: vec![],
             endpoint_policy: None,
+            oauth_capture: None,
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
@@ -1057,6 +1074,7 @@ mod tests {
                 path: "/v1/items".to_string(),
             }],
             endpoint_policy: None,
+            oauth_capture: None,
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
@@ -1089,6 +1107,7 @@ mod tests {
             env_var: None,
             endpoint_rules: vec![],
             endpoint_policy: None,
+            oauth_capture: None,
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
@@ -1114,6 +1133,7 @@ mod tests {
             requires_managed_credential: true,
             managed_auth_mechanism: Some(NetworkAuditAuthMechanism::PhantomHeader),
             managed_injection_mode: Some(NetworkAuditInjectionMode::Header),
+            oauth_capture_match: None,
         };
         assert!(managed.missing_managed_credential(false, false, false));
         assert!(!managed.missing_managed_credential(true, false, false));
@@ -1132,6 +1152,7 @@ mod tests {
             requires_managed_credential: false,
             managed_auth_mechanism: None,
             managed_injection_mode: None,
+            oauth_capture_match: None,
         };
         assert!(!l7_only.missing_managed_credential(false, false, false));
     }
@@ -1152,6 +1173,7 @@ mod tests {
             env_var: None,
             endpoint_rules: vec![],
             endpoint_policy: None,
+            oauth_capture: None,
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
@@ -1186,6 +1208,7 @@ mod tests {
                     path: "/org-a/**".to_string(),
                 }],
                 endpoint_policy: None,
+                oauth_capture: None,
                 tls_ca: None,
                 tls_client_cert: None,
                 tls_client_key: None,
@@ -1209,6 +1232,7 @@ mod tests {
                     path: "/org-b/**".to_string(),
                 }],
                 endpoint_policy: None,
+                oauth_capture: None,
                 tls_ca: None,
                 tls_client_cert: None,
                 tls_client_key: None,
@@ -1286,6 +1310,7 @@ mod tests {
                     path: path.to_string(),
                 }],
                 endpoint_policy: None,
+                oauth_capture: None,
                 tls_ca: None,
                 tls_client_cert: None,
                 tls_client_key: None,
@@ -1696,6 +1721,7 @@ h56ZLEEqHfVWFhJWIKRSabtxYPV/VJyMv+lo3L0QwSKsouHs3dtF1zVQ
             env_var: None,
             endpoint_rules: vec![],
             endpoint_policy: None,
+            oauth_capture: None,
             tls_ca: None,
             tls_client_cert: Some(cert_path.to_str().unwrap().to_string()),
             tls_client_key: Some(key_path.to_str().unwrap().to_string()),

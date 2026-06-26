@@ -302,6 +302,32 @@ pub struct RouteConfig {
     /// credentials. Mutually exclusive with `credential_key` and `oauth2`.
     #[serde(default)]
     pub aws_auth: Option<AwsAuthConfig>,
+
+    /// Optional OAuth-capture configuration.
+    ///
+    /// When present, this route is TLS-intercepted and the proxy rewrites the
+    /// response body of the OAuth token endpoint: real `access_token` /
+    /// `refresh_token` JSON fields are swapped for broker-issued `nono_<hex>`
+    /// nonces before the body reaches the sandboxed client, and translated
+    /// back on egress. Unlike `credential_key`, the secret is captured at
+    /// runtime, not pre-loaded — routes using this leave `credential_key`
+    /// unset. Independent of `inject_mode` (capture is not injection).
+    #[serde(default)]
+    pub oauth_capture: Option<OauthCaptureMatch>,
+}
+
+/// URL paths an OAuth-capture route rewrites the response body on.
+///
+/// The two patterns are matched independently against the request path;
+/// identical strings are valid (the same upstream endpoint often serves both
+/// the initial authorization-code exchange and the refresh-token exchange,
+/// distinguished only by `grant_type` in the request body).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OauthCaptureMatch {
+    /// URL path the initial token-issuance response is captured on.
+    pub token_url_match: String,
+    /// URL path the refresh-token response is captured on.
+    pub refresh_url_match: String,
 }
 
 /// Optional proxy-side overrides for credential injection shape.

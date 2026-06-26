@@ -1693,7 +1693,7 @@ fn handle_shim_stream_inner(
 
     if matches!(
         intercept_action,
-        crate::command_policy::InterceptActionConfig::Capture
+        crate::command_policy::InterceptActionConfig::Capture { .. }
     ) {
         let active = state.active_count.fetch_add(1, Ordering::SeqCst);
         if active >= MAX_ACTIVE_TOOL_SANDBOX_CHILDREN {

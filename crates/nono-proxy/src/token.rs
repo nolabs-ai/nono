@@ -30,6 +30,47 @@ pub trait NonceResolver: Send + Sync {
     /// Returns the real credential bytes if the nonce is known and admitted
     /// for `consumer` (`"proxy.<route_id>"`), or `None` otherwise (fail-closed).
     fn resolve(&self, nonce: &str, consumer: &str) -> Option<Zeroizing<Vec<u8>>>;
+
+    /// If this resolver also supports OAuth capture (minting nonces for tokens
+    /// sniffed from a `/v1/oauth/token` response), return itself as an
+    /// [`OauthCaptureResolver`]. The default is `None` — a resolve-only
+    /// resolver, so OAuth-capture routes stay inert. The CLI's broker bridge
+    /// overrides this to enable capture. Keeping it an accessor (rather than
+    /// widening `NonceResolver`) means resolve-only impls and the proxy server
+    /// wiring need no changes.
+    fn oauth_capture(&self) -> Option<&dyn OauthCaptureResolver> {
+        None
+    }
+}
+
+/// Mints `nono_<hex>` nonces for credentials captured at runtime from an
+/// intercepted OAuth token response, holding the real secret in the broker so
+/// it never crosses the sandbox boundary.
+///
+/// Separate from [`NonceResolver`] (which only *reads* existing mappings) so
+/// that resolve-only resolvers and proxy-server wiring are unaffected; the
+/// broker bridge implements both and links them via
+/// [`NonceResolver::oauth_capture`].
+pub trait OauthCaptureResolver: Send + Sync {
+    /// Store `secret` and return a fresh opaque `nono_<hex>` nonce. Each call
+    /// yields a new nonce even for repeated secrets.
+    fn issue(&self, secret: Zeroizing<String>) -> String;
+
+    /// Mint nonces for a captured OAuth `(access_token, refresh_token)` pair.
+    ///
+    /// Distinct from two [`Self::issue`] calls because an implementation may
+    /// persist the pair to durable storage so the mapping survives across
+    /// sessions. Persistence failures must NOT propagate: a backend that
+    /// cannot write durably must still return valid in-memory nonces (and log
+    /// a warning) so capture-and-rewrite keeps working. The default is the
+    /// persistence-free two-`issue` behaviour.
+    fn capture_oauth_pair(
+        &self,
+        access: Zeroizing<String>,
+        refresh: Zeroizing<String>,
+    ) -> (String, String) {
+        (self.issue(access), self.issue(refresh))
+    }
 }
 
 /// Length of the random token in bytes (256 bits of entropy).

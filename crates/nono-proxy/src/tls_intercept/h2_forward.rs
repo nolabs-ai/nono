@@ -281,12 +281,34 @@ async fn handle_h2_stream(
     // carries a broker nonce in a header would forward the raw nonce upstream
     // instead of the resolved credential.
     let nonce_consumer = service.map(|s| format!("proxy.{s}"));
+
+    // OAuth-capture detection: this route declares match patterns, the inbound
+    // path matches one, and a capture-capable resolver is wired. When active,
+    // the response token body is rewritten (below) and we force identity
+    // request encoding so the rewriter sees plaintext JSON.
+    let oauth_capture_active = route
+        .and_then(|r| r.oauth_capture_match.as_ref())
+        .is_some_and(|oc| {
+            let p = path.split('?').next().unwrap_or(path.as_str());
+            p == oc.token_url_match || p == oc.refresh_url_match
+        })
+        && ctx
+            .nonce_resolver
+            .as_deref()
+            .and_then(|r| r.oauth_capture())
+            .is_some();
+
     let mut upstream_headers = HeaderMap::new();
     for (name, value) in request.headers() {
         let name_lower = name.as_str().to_lowercase();
         // Skip hop-by-hop and connection-specific headers.
         if name_lower == "host" || name_lower == "connection" || name_lower == "proxy-authorization"
         {
+            continue;
+        }
+        // For OAuth capture, force identity encoding so the response rewriter
+        // sees plaintext JSON rather than gzip/br.
+        if oauth_capture_active && name_lower == "accept-encoding" {
             continue;
         }
         // Skip any header the credential will inject (primary + extra), so a
@@ -392,6 +414,26 @@ async fn handle_h2_stream(
         let resp_headers = response.headers().clone();
         let recv_resp_body = response.into_body();
         let resp_end_stream = recv_resp_body.is_end_stream();
+
+        // OAuth-capture routes buffer + rewrite the token response body instead
+        // of streaming it frame-by-frame.
+        if oauth_capture_active
+            && let Some(capture) = ctx
+                .nonce_resolver
+                .as_deref()
+                .and_then(|r| r.oauth_capture())
+        {
+            capture_and_rewrite_oauth_response(
+                status,
+                resp_headers,
+                recv_resp_body,
+                resp_end_stream,
+                &mut respond,
+                capture,
+            )
+            .await?;
+            return Ok::<http::StatusCode, ProxyError>(status);
+        }
 
         // Send response headers back to client.
         let mut client_response = Response::builder().status(status);
@@ -514,6 +556,88 @@ async fn stream_body_to_client(mut recv: RecvStream, send: &mut SendStream<Bytes
     Ok(())
 }
 
+/// Buffer an entire h2 response body into memory, releasing flow-control
+/// capacity as frames arrive. Used only for OAuth-capture routes, whose token
+/// endpoint returns a small, non-streaming JSON body — never for general
+/// (potentially streaming/gRPC) traffic.
+async fn buffer_h2_body(mut recv: RecvStream) -> Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    while let Some(chunk) = recv.data().await {
+        let data =
+            chunk.map_err(|e| ProxyError::HttpParse(format!("h2 response body read: {e}")))?;
+        let len = data.len();
+        buf.extend_from_slice(&data);
+        recv.flow_control()
+            .release_capacity(len)
+            .map_err(|e| ProxyError::HttpParse(format!("h2 flow control: {e}")))?;
+    }
+    Ok(buf)
+}
+
+/// Send an h2 response with a fully-buffered body in a single DATA frame.
+async fn send_h2_response_with_body(
+    respond: &mut h2::server::SendResponse<Bytes>,
+    status: http::StatusCode,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<()> {
+    let mut builder = Response::builder().status(status);
+    if let Some(h) = builder.headers_mut() {
+        *h = headers;
+    }
+    let response = builder
+        .body(())
+        .map_err(|e| ProxyError::HttpParse(format!("h2 response build error: {e}")))?;
+    let end = body.is_empty();
+    let mut send = respond
+        .send_response(response, end)
+        .map_err(|e| ProxyError::HttpParse(format!("h2 send_response failed: {e}")))?;
+    if !end {
+        send.send_data(body, true)
+            .map_err(|e| ProxyError::HttpParse(format!("h2 send_data: {e}")))?;
+    }
+    Ok(())
+}
+
+/// Buffer the upstream OAuth token response, swap real `access_token` /
+/// `refresh_token` JSON fields for broker nonces, and relay the rewritten body
+/// to the client. Fail-closed = pass-through: any non-rewrite outcome forwards
+/// the original headers + body unchanged (see [`crate::oauth_rewrite`]).
+async fn capture_and_rewrite_oauth_response(
+    status: http::StatusCode,
+    resp_headers: HeaderMap,
+    recv_body: RecvStream,
+    resp_end_stream: bool,
+    respond: &mut h2::server::SendResponse<Bytes>,
+    capture: &dyn crate::token::OauthCaptureResolver,
+) -> Result<()> {
+    use crate::oauth_rewrite::{OauthRewriteOutcome, rewrite_oauth_json_body};
+
+    let buffered = if resp_end_stream {
+        Vec::new()
+    } else {
+        buffer_h2_body(recv_body).await?
+    };
+
+    match rewrite_oauth_json_body(&buffered, capture) {
+        OauthRewriteOutcome::Rewritten { bytes, substituted } => {
+            debug!("h2 oauth-capture: substituted {substituted} token field(s) with nonces");
+            // We now hold plaintext rewritten bytes of a new length: drop the
+            // framing/encoding headers we can no longer honour. (accept-encoding
+            // was stripped on the request, so the body should already be
+            // identity-encoded; this is defensive.)
+            let mut headers = resp_headers;
+            headers.remove(http::header::CONTENT_LENGTH);
+            headers.remove(http::header::CONTENT_ENCODING);
+            send_h2_response_with_body(respond, status, headers, bytes).await
+        }
+        OauthRewriteOutcome::NotJson | OauthRewriteOutcome::NoTokenFields => {
+            debug!("h2 oauth-capture: no token fields to rewrite; forwarding unchanged");
+            send_h2_response_with_body(respond, status, resp_headers, Bytes::from(buffered)).await
+        }
+    }
+}
+
 /// Send a simple h2 error response (no body).
 fn send_h2_error(respond: &mut h2::server::SendResponse<Bytes>, status_code: u16) -> Result<()> {
     let status =
@@ -624,6 +748,7 @@ mod tests {
             oauth2: None,
             aws_auth: None,
             endpoint_policy: None,
+            oauth_capture: None,
         }];
         let route_store = RouteStore::load(&routes).unwrap();
         let credential_store = CredentialStore::load_with_diagnostics(&routes, tls_connector)
@@ -699,6 +824,7 @@ mod tests {
             oauth2: None,
             aws_auth: None,
             endpoint_policy: None,
+            oauth_capture: None,
         }];
         RouteStore::load(&routes).unwrap()
     }
@@ -925,6 +1051,203 @@ mod tests {
         });
 
         (port, rx)
+    }
+
+    /// Capture-capable resolver: `oauth_capture()` returns self, `issue`
+    /// mints deterministic nonces and records the secret so `resolve` can map
+    /// it back. Exercises the OAuth-capture path on h2.
+    #[derive(Default)]
+    struct CaptureStubResolver {
+        counter: std::sync::Mutex<u32>,
+        map: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    }
+
+    impl crate::token::NonceResolver for CaptureStubResolver {
+        fn resolve(&self, nonce: &str, _consumer: &str) -> Option<Zeroizing<Vec<u8>>> {
+            self.map
+                .lock()
+                .unwrap()
+                .get(nonce)
+                .map(|s| Zeroizing::new(s.clone().into_bytes()))
+        }
+        fn oauth_capture(&self) -> Option<&dyn crate::token::OauthCaptureResolver> {
+            Some(self)
+        }
+    }
+
+    impl crate::token::OauthCaptureResolver for CaptureStubResolver {
+        fn issue(&self, secret: Zeroizing<String>) -> String {
+            let mut c = self.counter.lock().unwrap();
+            *c += 1;
+            let nonce = format!("nono_stub_{}", *c);
+            self.map
+                .lock()
+                .unwrap()
+                .insert(nonce.clone(), secret.to_string());
+            nonce
+        }
+    }
+
+    /// Mock h2 upstream that returns a fixed JSON body (the OAuth token
+    /// endpoint shape) after draining the request body.
+    async fn spawn_mock_h2_upstream_json_body(ca: &EphemeralCa, body: &'static str) -> u16 {
+        let server_config = upstream_server_config(ca);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            let (tcp_stream, _) = listener.accept().await.unwrap();
+            let tls_acceptor = tokio_rustls::TlsAcceptor::from(server_config);
+            let tls_stream = tls_acceptor.accept(tcp_stream).await.unwrap();
+            let mut h2_conn = h2::server::handshake(tls_stream).await.unwrap();
+            while let Some(Ok((request, mut respond))) = h2_conn.accept().await {
+                let mut rb = request.into_body();
+                while let Some(Ok(d)) = rb.data().await {
+                    let len = d.len();
+                    rb.flow_control().release_capacity(len).unwrap();
+                }
+                let response = http::Response::builder()
+                    .status(200)
+                    .header("content-type", "application/json")
+                    .body(())
+                    .unwrap();
+                let mut send_stream = respond.send_response(response, false).unwrap();
+                send_stream
+                    .send_data(Bytes::from_static(body.as_bytes()), true)
+                    .unwrap();
+            }
+        });
+
+        port
+    }
+
+    #[tokio::test]
+    async fn h2_forward_oauth_capture_rewrites_token_response() {
+        use std::time::Duration;
+
+        let ca = Arc::new(EphemeralCa::generate().unwrap());
+        let token_body = r#"{"access_token":"sk-ant-oat01-REAL","refresh_token":"sk-ant-ort01-REAL","expires_in":3600}"#;
+        let upstream_port = spawn_mock_h2_upstream_json_body(&ca, token_body).await;
+
+        // Route configured for OAuth capture on /v1/oauth/token. Empty
+        // endpoint_rules = allow-all; oauth_capture forces interception.
+        let routes = vec![RouteConfig {
+            prefix: "oauth-svc".to_string(),
+            upstream: format!("https://localhost:{}", upstream_port),
+            credential_key: None,
+            inject_mode: InjectMode::Header,
+            inject_header: "Authorization".to_string(),
+            credential_format: None,
+            path_pattern: None,
+            path_replacement: None,
+            query_param_name: None,
+            proxy: None,
+            env_var: None,
+            endpoint_rules: Vec::new(),
+            tls_ca: None,
+            tls_client_cert: None,
+            tls_client_key: None,
+            oauth2: None,
+            aws_auth: None,
+            oauth_capture: Some(crate::config::OauthCaptureMatch {
+                token_url_match: "/v1/oauth/token".to_string(),
+                refresh_url_match: "/v1/oauth/token".to_string(),
+            }),
+            endpoint_policy: None,
+        }];
+        let route_store = RouteStore::load(&routes).unwrap();
+        let credential_store = CredentialStore::empty();
+        let cert_cache = Arc::new(CertCache::new(Arc::clone(&ca)));
+        let tls_connector = h2_tls_connector_trusting(ca.cert_pem());
+        let filter = ProxyFilter::allow_all();
+        let session_token = Zeroizing::new("session-tok".to_string());
+        let resolver: Arc<dyn crate::token::NonceResolver> =
+            Arc::new(CaptureStubResolver::default());
+
+        let ctx = InterceptCtx {
+            route_id: Some("oauth-svc"),
+            host: "localhost",
+            port: upstream_port,
+            route_store: Arc::new(route_store),
+            credential_store: Arc::new(credential_store),
+            session_token: &session_token,
+            cert_cache,
+            tls_connector: &tls_connector,
+            tls_connector_h2: &tls_connector,
+            filter: &filter,
+            audit_log: None,
+            upstream_proxy: None,
+            approval_backends: None,
+            credential_capture_backend: None,
+            nonce_resolver: Some(resolver),
+            enable_h2: true,
+        };
+
+        let (client_io, server_io) = tokio::io::duplex(65536);
+
+        let result = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                async {
+                    let _ = forward_h2_connection(server_io, &ctx).await;
+                },
+                async {
+                    let (mut h2_client, h2_conn) = h2::client::handshake(client_io).await.unwrap();
+                    let conn_handle = tokio::spawn(async move {
+                        let _ = h2_conn.await;
+                    });
+
+                    let request = http::Request::builder()
+                        .method("POST")
+                        .uri(format!(
+                            "https://localhost:{}/v1/oauth/token",
+                            upstream_port
+                        ))
+                        .header("content-type", "application/json")
+                        .body(())
+                        .unwrap();
+                    let (response_fut, mut send_stream) =
+                        h2_client.send_request(request, false).unwrap();
+                    send_stream
+                        .send_data(
+                            Bytes::from_static(b"{\"grant_type\":\"authorization_code\"}"),
+                            true,
+                        )
+                        .unwrap();
+
+                    let response = response_fut.await.unwrap();
+                    assert_eq!(response.status(), 200);
+
+                    let mut rb = response.into_body();
+                    let mut got = Vec::new();
+                    while let Some(chunk) = rb.data().await {
+                        let d = chunk.unwrap();
+                        let len = d.len();
+                        got.extend_from_slice(&d);
+                        rb.flow_control().release_capacity(len).unwrap();
+                    }
+                    let s = String::from_utf8(got).unwrap();
+
+                    // Real tokens must NOT reach the client; nonces must.
+                    assert!(
+                        !s.contains("sk-ant-oat01-REAL"),
+                        "real access token leaked to client: {s}"
+                    );
+                    assert!(
+                        !s.contains("sk-ant-ort01-REAL"),
+                        "real refresh token leaked to client: {s}"
+                    );
+                    assert!(s.contains("nono_stub_"), "nonce not substituted: {s}");
+                    // Untouched fields survive.
+                    assert!(s.contains("3600"), "non-token field dropped: {s}");
+
+                    drop(h2_client);
+                    conn_handle.abort();
+                    let _ = conn_handle.await;
+                }
+            );
+        })
+        .await;
+        assert!(result.is_ok(), "test timed out — h2 oauth capture hung");
     }
 
     #[tokio::test]
@@ -1405,6 +1728,7 @@ mod tests {
             oauth2: None,
             aws_auth: Some(AwsAuthConfig::default()),
             endpoint_policy: None,
+            oauth_capture: None,
         }];
         let route_store = RouteStore::load(&routes).unwrap();
         let credential_store = CredentialStore::load_with_diagnostics(&routes, &tls_connector)
@@ -1673,6 +1997,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 endpoint_policy: None,
+                oauth_capture: None,
             },
             RouteConfig {
                 prefix: "svc-b".to_string(),
@@ -1696,6 +2021,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 endpoint_policy: None,
+                oauth_capture: None,
             },
         ];
         let route_store = RouteStore::load(&routes).unwrap();
@@ -1868,6 +2194,7 @@ mod tests {
             oauth2: None,
             aws_auth: None,
             endpoint_policy: None,
+            oauth_capture: None,
         }];
         RouteStore::load(&routes).unwrap()
     }
@@ -1990,6 +2317,7 @@ mod tests {
             tls_client_key: None,
             oauth2: None,
             aws_auth: None,
+            oauth_capture: None,
             endpoint_policy: Some(EndpointPolicyConfig {
                 default: EndpointPolicyDefault {
                     decision: EndpointPolicyDecision::Deny,
@@ -2192,6 +2520,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 endpoint_policy: None,
+                oauth_capture: None,
             },
             // Endpoint-only restriction (_ep_ route)
             RouteConfig {
@@ -2222,6 +2551,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 endpoint_policy: None,
+                oauth_capture: None,
             },
         ];
         let route_store = RouteStore::load(&routes).unwrap();

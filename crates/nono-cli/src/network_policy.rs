@@ -247,6 +247,7 @@ pub fn resolve_credentials(
                 env_var: cred.env_var.clone(),
                 endpoint_rules: cred.endpoint_rules.clone(),
                 endpoint_policy: cred.endpoint_policy.clone(),
+                oauth_capture: None,
                 tls_ca: cred
                     .tls_ca
                     .as_deref()
@@ -298,6 +299,7 @@ pub fn resolve_credentials(
                 env_var: cred.env_var.clone(),
                 endpoint_rules: cred.endpoint_rules.clone(),
                 endpoint_policy: None,
+                oauth_capture: None,
                 tls_ca: None, // Built-in credentials don't support custom CAs
                 tls_client_cert: None,
                 tls_client_key: None,
@@ -426,6 +428,7 @@ pub fn partition_allow_domain(
                         env_var: None,
                         endpoint_rules: endpoints.clone(),
                         endpoint_policy: None,
+                        oauth_capture: None,
                         tls_ca: None,
                         tls_client_cert: None,
                         tls_client_key: None,

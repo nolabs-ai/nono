@@ -150,6 +150,10 @@ pub(crate) struct ProxyLaunchOptions {
     pub(crate) session_id: String,
     /// Supervisor-side CLI command credential-capture entries.
     pub(crate) credential_capture: HashMap<String, profile::CredentialCaptureEntry>,
+    /// Managed credential routes (e.g. OAuth-capture). Desugared into proxy
+    /// `RouteConfig`s and used to decide whether the token broker is backed by
+    /// a persistent keychain store.
+    pub(crate) credential_routes: Vec<profile::ManagedCredentialRoute>,
     /// Enable HTTP/2 negotiation for upstream connections.
     pub(crate) enable_h2: bool,
 }
@@ -163,6 +167,7 @@ impl ProxyLaunchOptions {
                 .as_ref()
                 .is_some_and(|credentials| !credentials.credentials.is_empty())
             || self.upstream_proxy.is_some()
+            || !self.credential_routes.is_empty()
     }
 }
 

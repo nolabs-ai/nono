@@ -1,0 +1,31 @@
+{
+  "extends": "claude-code",
+  "meta": {
+    "name": "claude-code-oauth-capture",
+    "version": "1.0.0",
+    "description": "Example profile — not for production use without review. Extends claude-code with OAuth /login capture: the proxy intercepts the token endpoint response and swaps real access/refresh tokens for nono_<hex> broker nonces before they reach the agent. The agent and its keychain entry only ever hold nonces; the real tokens live in a nono-only keychain entry the agent cannot read."
+  },
+  "environment": {
+    "deny_vars": [
+      "ANTHROPIC_BASE_URL",
+      "ANTHROPIC_API_KEY",
+      "ANTHROPIC_AUTH_TOKEN",
+      "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR"
+    ]
+  },
+  "network": {
+    "listen_port": [0],
+    "tls_intercept": { "ca_lifecycle": "session" }
+  },
+  "credential_routes": [
+    {
+      "name": "anthropic_oauth",
+      "upstream": "https://api.anthropic.com",
+      "capture": {
+        "type": "oauth_intercept",
+        "token_host": "https://platform.claude.com",
+        "token_url_match": "/v1/oauth/token"
+      }
+    }
+  ]
+}

@@ -260,7 +260,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    let shared_broker = crate::tool_sandbox::token_broker::new_shared_broker();
+    let shared_broker = crate::proxy_runtime::build_shared_broker(proxy);
     let active_proxy = start_proxy_runtime(
         network,
         &mut caps,

@@ -680,14 +680,14 @@ fn prepare_profile_with_options(
             .map(|profile| profile.diagnostics.suppress_system_services.clone())
             .unwrap_or_default(),
         allowed_env_vars: loaded_profile.as_ref().and_then(|profile| {
-            profile.environment.as_ref().map(|env_config| {
-                if let Some(err) = crate::exec_strategy::validate_env_var_patterns(
-                    &env_config.allow_vars,
-                    "allow_vars",
-                ) {
+            profile.environment.as_ref().and_then(|env_config| {
+                let vars = env_config.allow_vars.as_ref()?;
+                if let Some(err) =
+                    crate::exec_strategy::validate_env_var_patterns(vars, "allow_vars")
+                {
                     eprintln!("Warning: {}", err);
                 }
-                env_config.allow_vars.clone()
+                Some(vars.clone())
             })
         }),
         denied_env_vars: loaded_profile.as_ref().and_then(|profile| {
@@ -892,7 +892,7 @@ mod tests {
         set_vars.insert("RUST_LOG".to_string(), "debug".to_string());
         set_vars.insert("CFG".to_string(), "$HOME/.config".to_string());
         profile.environment = Some(profile::EnvironmentConfig {
-            allow_vars: vec![],
+            allow_vars: None,
             deny_vars: vec![],
             set_vars,
         });
@@ -1486,6 +1486,64 @@ mod tests {
                     profile.filesystem.allow.clone(),
                 )
             })
+        );
+    }
+
+    #[test]
+    fn environment_deny_only_does_not_activate_allow_filter() {
+        // allow_vars absent (None) — no filter should be active
+        let mut profile = profile::Profile::default();
+        profile.environment = Some(profile::EnvironmentConfig {
+            allow_vars: None,
+            deny_vars: vec!["GH_TOKEN".to_string()],
+            set_vars: Default::default(),
+        });
+        assert_eq!(
+            profile
+                .environment
+                .as_ref()
+                .and_then(|e| e.allow_vars.as_ref()),
+            None,
+            "absent allow_vars should produce no filter"
+        );
+    }
+
+    #[test]
+    fn environment_explicit_empty_allow_vars_blocks_all() {
+        // allow_vars explicitly [] — filter active, nothing passes
+        let mut profile = profile::Profile::default();
+        profile.environment = Some(profile::EnvironmentConfig {
+            allow_vars: Some(vec![]),
+            deny_vars: vec![],
+            set_vars: Default::default(),
+        });
+        assert_eq!(
+            profile
+                .environment
+                .as_ref()
+                .and_then(|e| e.allow_vars.as_ref()),
+            Some(&vec![]),
+            "explicit empty allow_vars should produce Some([]) (block all)"
+        );
+    }
+
+    #[test]
+    fn environment_set_vars_only_does_not_activate_allow_filter() {
+        let mut profile = profile::Profile::default();
+        let mut set_vars = std::collections::HashMap::new();
+        set_vars.insert("MY_VAR".to_string(), "hello".to_string());
+        profile.environment = Some(profile::EnvironmentConfig {
+            allow_vars: None,
+            deny_vars: vec![],
+            set_vars,
+        });
+        assert_eq!(
+            profile
+                .environment
+                .as_ref()
+                .and_then(|e| e.allow_vars.as_ref()),
+            None,
+            "set_vars-only environment should not activate the allow filter"
         );
     }
 }

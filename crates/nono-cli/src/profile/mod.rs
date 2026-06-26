@@ -1887,10 +1887,15 @@ pub struct EnvironmentConfig {
     ///
     /// Supports exact names (`"PATH"`) and prefix patterns ending with `*`
     /// (`"AWS_*"` matches `AWS_REGION`, `AWS_SECRET_ACCESS_KEY`, etc.).
-    /// When empty, all variables are allowed (default).
+    ///
+    /// - Absent (field not written in JSON): no filter, all variables pass through.
+    /// - `[]` (explicitly empty): blocks all inherited variables; only nono-injected
+    ///   credentials reach the child.
+    /// - Non-empty: only matching variables pass through.
+    ///
     /// Nono-injected credentials always bypass this list.
-    #[serde(default)]
-    pub allow_vars: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_vars: Option<Vec<String>>,
 
     /// Deny-list of environment variable names stripped from the sandboxed process.
     ///
@@ -3191,7 +3196,11 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
             (Some(base_env), None) => Some(base_env.clone()),
             (None, Some(child_env)) => Some(child_env.clone()),
             (Some(base_env), Some(child_env)) => Some(EnvironmentConfig {
-                allow_vars: dedup_append(&base_env.allow_vars, &child_env.allow_vars),
+                allow_vars: match (&base_env.allow_vars, &child_env.allow_vars) {
+                    (_, None) => base_env.allow_vars.clone(),
+                    (None, Some(child)) => Some(child.clone()),
+                    (Some(base), Some(child)) => Some(dedup_append(base, child)),
+                },
                 deny_vars: dedup_append(&base_env.deny_vars, &child_env.deny_vars),
                 set_vars: {
                     let mut merged = base_env.set_vars.clone();
@@ -4082,7 +4091,11 @@ mod tests {
                 .as_ref()
                 .expect("environment")
                 .allow_vars,
-            vec!["PATH", "HOME", "AWS_*"]
+            Some(vec![
+                "PATH".to_string(),
+                "HOME".to_string(),
+                "AWS_*".to_string()
+            ])
         );
     }
 
@@ -4102,6 +4115,7 @@ mod tests {
 
     #[test]
     fn test_environment_config_empty_allow_vars() {
+        // Explicitly [] in JSON → Some([]) → filter active, blocks all inherited vars
         let json_str = r#"{
             "meta": { "name": "test-profile" },
             "environment": {
@@ -4114,7 +4128,25 @@ mod tests {
             .environment
             .as_ref()
             .expect("environment should be Some");
-        assert!(env_config.allow_vars.is_empty());
+        assert_eq!(env_config.allow_vars, Some(vec![]));
+    }
+
+    #[test]
+    fn test_environment_config_absent_allow_vars() {
+        // allow_vars not written in JSON → None → no filter
+        let json_str = r#"{
+            "meta": { "name": "test-profile" },
+            "environment": {
+                "deny_vars": ["GH_TOKEN"]
+            }
+        }"#;
+
+        let profile: Profile = serde_json::from_str(json_str).expect("Failed to parse profile");
+        let env_config = profile
+            .environment
+            .as_ref()
+            .expect("environment should be Some");
+        assert_eq!(env_config.allow_vars, None);
     }
 
     #[test]
@@ -4135,7 +4167,7 @@ mod tests {
             env_config.deny_vars,
             vec!["GH_TOKEN", "GITHUB_*", "ANTHROPIC_API_KEY"]
         );
-        assert!(env_config.allow_vars.is_empty());
+        assert_eq!(env_config.allow_vars, None);
     }
 
     #[test]
@@ -4153,7 +4185,14 @@ mod tests {
             .environment
             .as_ref()
             .expect("environment should be Some");
-        assert_eq!(env_config.allow_vars, vec!["PATH", "HOME", "AWS_*"]);
+        assert_eq!(
+            env_config.allow_vars,
+            Some(vec![
+                "PATH".to_string(),
+                "HOME".to_string(),
+                "AWS_*".to_string()
+            ])
+        );
         assert_eq!(env_config.deny_vars, vec!["AWS_SECRET_ACCESS_KEY"]);
     }
 
@@ -4162,7 +4201,7 @@ mod tests {
         // Merging two profiles with deny_vars concatenates them
         let base = Profile {
             environment: Some(EnvironmentConfig {
-                allow_vars: vec![],
+                allow_vars: None,
                 deny_vars: vec!["GH_TOKEN".into()],
                 set_vars: Default::default(),
             }),
@@ -4170,7 +4209,7 @@ mod tests {
         };
         let child = Profile {
             environment: Some(EnvironmentConfig {
-                allow_vars: vec![],
+                allow_vars: None,
                 deny_vars: vec!["ANTHROPIC_API_KEY".into()],
                 set_vars: Default::default(),
             }),
@@ -4187,7 +4226,7 @@ mod tests {
     fn test_environment_config_deny_vars_merge_deduplicates() {
         let base = Profile {
             environment: Some(EnvironmentConfig {
-                allow_vars: vec![],
+                allow_vars: None,
                 deny_vars: vec!["GH_TOKEN".into(), "ANTHROPIC_API_KEY".into()],
                 set_vars: Default::default(),
             }),
@@ -4195,7 +4234,7 @@ mod tests {
         };
         let child = Profile {
             environment: Some(EnvironmentConfig {
-                allow_vars: vec![],
+                allow_vars: None,
                 deny_vars: vec!["ANTHROPIC_API_KEY".into()],
                 set_vars: Default::default(),
             }),

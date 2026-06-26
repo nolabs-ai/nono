@@ -100,6 +100,16 @@ nono wrap [OPTIONS] -- <COMMAND> [ARGS...]
   `nono wrap` does not support proxy flags (`--network-profile`, `--allow-domain`, `--credential`, `--upstream-proxy`, `--upstream-bypass`). The network proxy requires a parent process. Use `nono run` instead.
 </Note>
 
+### `nono proxy`
+
+Run the network-filtering / credential-injection proxy as a standalone foreground server with no sandboxed child. Prints the proxy URL, token, and `HTTP(S)_PROXY` exports, then blocks until Ctrl-C. Useful for pointing external workloads (containers, microVMs) at nono's domain filtering and credential injection.
+
+```bash
+nono proxy [OPTIONS]
+```
+
+See [Standalone Proxy](/cli/features/networking#standalone-proxy-nono-proxy) for details.
+
 ### `nono why`
 
 Check why filesystem, network, scope, or command access would be allowed or denied. Designed for both human debugging and programmatic use by AI agents.

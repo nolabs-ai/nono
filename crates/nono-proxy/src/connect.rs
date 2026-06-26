@@ -34,6 +34,7 @@ pub async fn handle_connect(
     filter: &ProxyFilter,
     session_token: &Zeroizing<String>,
     remaining_header: &[u8],
+    require_auth: bool,
     audit_log: Option<&audit::SharedAuditLog>,
 ) -> Result<()> {
     // Parse host:port from CONNECT line
@@ -43,7 +44,11 @@ pub async fn handle_connect(
     // Validate session token from Proxy-Authorization header.
     // Non-fatal for CONNECT: Node.js undici doesn't send Proxy-Authorization
     // from URL userinfo for CONNECT requests.
-    if let Err(e) = validate_proxy_auth(remaining_header, session_token) {
+    //
+    // Skipped entirely when auth is disabled (`nono proxy --no-auth`): there
+    // is no token to check, so running the validation only produces noisy
+    // "Missing Proxy-Authorization header" / "CONNECT auth skipped" debug logs.
+    if require_auth && let Err(e) = validate_proxy_auth(remaining_header, session_token) {
         debug!("CONNECT auth skipped: {}", e);
     }
 

@@ -4,11 +4,11 @@
 //! [`crate::manifest`] types are the on-disk contract. (Same split as
 //! [`crate::capability::CapabilitySet`] vs the manifest.)
 //!
-//! Scope note: this module defines the limits and parses them from
-//! human-friendly CLI input; the configuration, serialization, and
-//! `--dry-run` layers carry them end-to-end. Enforcement lives in the CLI
-//! supervisor (`nono-cli`'s `resource_cgroup`), which renders these values to
-//! cgroup v2 knobs on Linux — keeping the library policy-free.
+//! This module defines the limits and parses them from human-friendly CLI
+//! input; config, serialization, and `--dry-run` carry them end-to-end.
+//! Enforcement lives in the CLI supervisor (`nono-cli`'s `resource_cgroup`),
+//! which renders these values to cgroup v2 knobs on Linux — keeping the
+//! library policy-free.
 
 use crate::error::{NonoError, Result};
 use serde::{Deserialize, Serialize};
@@ -26,8 +26,8 @@ pub struct ResourceLimits {
 }
 
 impl ResourceLimits {
-    /// True when no ceiling is set at all. Used to decide whether limits are
-    /// worth displaying or requiring a supervised run.
+    /// True when no ceiling is set. Used to decide whether to display limits or
+    /// require a supervised run.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.memory_bytes.is_none()
@@ -115,7 +115,7 @@ pub fn format_bytes(bytes: u64) -> String {
         idx += 1;
     }
     if idx == 0 {
-        // Under 1 KiB the loop never advanced: print whole bytes, no decimal.
+        // Under 1 KiB: whole bytes, no decimal.
         format!("{bytes} B")
     } else {
         format!("{val:.1} {}", UNITS[idx])

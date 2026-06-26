@@ -1,72 +1,57 @@
 //! Linux cgroup v2 resource enforcement.
 //!
-//! # What this does, in plain terms
+//! # What this does
 //!
-//! When a sandboxed run is given a `--memory` limit, this
-//! module puts the program in a kernel-enforced "box" so it cannot use more than
-//! that. If it tries, the Linux kernel kills it instantly — and *only* it — so a
-//! runaway agent cannot drag down the rest of the machine. Think of a room with
-//! a strict capacity sign: step over the line and the door slams, on that room
-//! alone.
+//! Given a `--memory` limit, this module puts the run in a kernel-enforced box
+//! it cannot grow past. Cross the line and the kernel kills the box instantly —
+//! and *only* it — so a runaway agent cannot drag down the machine.
 //!
-//! The mechanism is **cgroup v2** ("control groups"), the same kernel feature
-//! containers use. A cgroup is just a directory under `/sys/fs/cgroup`: you set
-//! limits by writing numbers into files inside it (its "knobs"), and you put a
-//! process in it by writing the process id into its `cgroup.procs` file. We
-//! create one such directory per run (a "leaf"), set the knobs, the child moves
-//! *itself* in, and we delete the directory when the run ends.
+//! The mechanism is **cgroup v2** ("control groups"), the kernel feature
+//! containers use. A cgroup is a directory under `/sys/fs/cgroup`: you set limits
+//! by writing numbers into files inside it (its "knobs"), and you put a process
+//! in it by writing the pid into its `cgroup.procs`. We create one such directory
+//! per run (a "leaf"), set the knobs, the child moves *itself* in, and we delete
+//! it when the run ends. The unsandboxed *supervisor* (nono's parent) builds and
+//! arms the leaf before forking; the sandboxed *child* then attaches itself (see
+//! the race below).
 //!
-//! # Who runs this
+//! # The race, and why the child self-attaches
 //!
-//! The unsandboxed *supervisor* (nono's parent process) builds the box and arms
-//! it before forking. The sandboxed *child* then puts itself in the box — see
-//! the race note below for why the child, not the parent, does the attach.
+//! A cgroup caps *every* process in it together, and a forked child inherits its
+//! parent's cgroup — so once a process is in the leaf, its whole subtree is
+//! capped and dies atomically. The hard part is getting the first process *in*
+//! without a gap.
 //!
-//! # Containing the whole process tree (the race, and why self-attach)
-//!
-//! A cgroup caps *every* process inside it together, and a forked child inherits
-//! its parent's cgroup automatically — so once a process is in the leaf, its
-//! whole subtree is capped and dies atomically. The only hard part is getting
-//! the first process *into* the leaf without leaving a gap.
-//!
-//! If the **parent** moved the child in *after* `fork()`, there would be a brief
-//! window in which the child is already running but not yet boxed; a child that
-//! forks its own children inside that window could slip a few of them out into
-//! the parent's (unconstrained) cgroup. To close that window, the **child
-//! attaches itself**: the parent opens the leaf's `cgroup.procs` write fd before
-//! forking (so the child inherits it), and the child writes its own pid through
-//! that fd before it does anything else — before it can fork or exec. It is
-//! therefore in the box by construction, with no escape window, regardless of
-//! timing (see [`child_self_attach`]).
+//! If the parent moved the child in *after* `fork()`, there would be a window
+//! where the child runs but is not yet boxed, and any grandchildren it forks in
+//! that window land in the parent's unconstrained cgroup. So the **child attaches
+//! itself**: the parent opens the leaf's `cgroup.procs` write fd before forking
+//! (the child inherits it), and the child writes its own pid through that fd
+//! before it can fork or exec. It is boxed by construction, no window, regardless
+//! of timing (see [`child_self_attach`]).
 //!
 //! # Fail-closed (AGENTS.md "Fail Secure")
 //!
-//! If the box cannot be built, armed, or entered, the run is refused rather than
-//! allowed to proceed unprotected:
-//! - Creating the box and setting its knobs happen *before* the child is forked,
-//!   so any failure is a [`NonoError`] returned while nothing is running yet.
-//! - If the child cannot self-attach after fork, it kills itself
-//!   (`_exit(126)`) before applying the sandbox or exec'ing — it never runs the
-//!   thing the limit was meant to constrain.
+//! If the box cannot be built, armed, or entered, the run is refused:
+//! - Building and arming the box happen *before* fork, so any failure is a
+//!   [`NonoError`] returned while nothing is running yet.
+//! - If the child cannot self-attach, it `_exit(126)`s before applying the
+//!   sandbox or exec'ing — it never runs the thing the limit was meant to cap.
 //!
 //! # The knobs we set
 //!
-//! These three knobs match the manual cgroup v2 experiment that validated the
-//! design:
-//! - `memory.max`         — the hard memory ceiling; cross it and the kernel OOM-kills.
-//! - `memory.swap.max=0`  — forbid spilling to swap, which would let it dodge the ceiling.
-//! - `memory.oom.group=1` — on OOM, kill the *whole* box at once, not one random member.
+//! - `memory.max`         — hard memory ceiling; cross it and the kernel OOM-kills.
+//! - `memory.swap.max=0`  — forbid swap, which would let it dodge the ceiling.
+//! - `memory.oom.group=1` — on OOM, kill the *whole* box at once, not one member.
 //!
-//! We deliberately do **not** set `memory.high` (a softer "ease off" threshold):
-//! with swap forbidden, a runaway allocator has nothing to reclaim, so it would
-//! stall for many seconds before finally being killed — defeating the point of a
-//! fast, clean kill. (Revisit as an opt-in only if real near-limit workloads
-//! show it helps.)
+//! We deliberately omit `memory.high` (a soft "ease off" threshold): with swap
+//! forbidden a runaway allocator has nothing to reclaim, so it would stall for
+//! seconds before the kill instead of dying fast. (Revisit as opt-in only if a
+//! real near-limit workload shows it helps.)
 //!
-//! Choosing *which* backend to enforce with (the WSL2 / non-systemd probe and
-//! the `auto`/`cgroup`/`portable` resolution) is a later step; this targets the
-//! common case — a normal desktop/server login, i.e. a systemd `Delegate=yes`
-//! user session.
+//! Picking *which* backend to enforce with (the WSL2 / non-systemd probe, the
+//! `auto`/`cgroup`/`portable` resolution) is a later step; this targets the
+//! common case — a systemd `Delegate=yes` user session.
 
 use nix::libc;
 use nono::{NonoError, ResourceLimits, Result};
@@ -92,10 +77,10 @@ pub struct CgroupLeaf {
     procs: File,
 }
 
-/// Post-mortem evidence that the kernel OOM-killed something inside this leaf,
-/// read from `memory.events` (plus the limit and peak gauges) while the leaf
-/// still exists. Lets the supervisor turn a bare SIGKILL into an explicit
-/// "you hit the memory cap" message instead of failing silently.
+/// Post-mortem evidence that the kernel OOM-killed something in this leaf, read
+/// from `memory.events` (plus the limit and peak gauges) while the leaf still
+/// exists. Lets the supervisor turn a bare SIGKILL into an explicit "you hit the
+/// memory cap" message.
 #[derive(Debug, Clone, Copy)]
 pub struct OomReport {
     /// `oom_kill` from `memory.events`: how many processes the kernel killed in
@@ -125,6 +110,11 @@ impl CgroupLeaf {
         let base = delegated_base()?;
         ensure_controllers_delegated(&base, limits)?;
 
+        // Clear out leaves from earlier runs whose supervisor died without
+        // running teardown (e.g. SIGKILL). Best-effort, and it frees the name
+        // before a pid-reuse collision could fail our own create below.
+        sweep_stale_leaves(&base);
+
         let path = base.join(format!("nono.{}", std::process::id()));
         // A leftover leaf with our exact pid is unexpected (pid reuse after a
         // crash). Reusing it could inherit stale members, so treat an existing
@@ -137,16 +127,9 @@ impl CgroupLeaf {
         })?;
 
         // The leaf directory now exists; from here any failure must remove it.
-        // `arm` does the remaining fallible work; on error we tear the directory
-        // down before returning (no `Self` is constructed yet, so there is no
-        // double teardown).
-        match Self::arm(path.clone(), limits) {
-            Ok(leaf) => Ok(leaf),
-            Err(e) => {
-                teardown(&path);
-                Err(e)
-            }
-        }
+        // `arm` does the remaining fallible work, so on error tear the directory
+        // down (no `Self` is constructed yet, so there is no double teardown).
+        Self::arm(path.clone(), limits).inspect_err(|_| teardown(&path))
     }
 
     /// Write the knobs and open `cgroup.procs`, building the owned [`CgroupLeaf`].
@@ -179,15 +162,14 @@ impl CgroupLeaf {
         self.procs.as_raw_fd()
     }
 
-    /// Read OOM evidence from the leaf's `memory.events`. Call this right after
-    /// the child exits and *before* the leaf is torn down. Returns `Some` only
-    /// when the kernel recorded at least one OOM kill in this leaf — i.e. the
-    /// memory cap was actually hit — so the caller can explain a SIGKILL that
-    /// would otherwise look unexplained.
+    /// Read OOM evidence from the leaf's `memory.events`. Call right after the
+    /// child exits and *before* teardown. Returns `Some` only when the kernel
+    /// recorded at least one OOM kill here — i.e. the cap was actually hit — so
+    /// the caller can explain an otherwise-mysterious SIGKILL.
     ///
-    /// Best-effort and infallible: an unreadable knob yields `None` (or an
-    /// absent optional field) rather than an error, so a missing or stripped-down
-    /// `memory.events` never derails the exit path or teardown.
+    /// Best-effort and infallible: an unreadable knob yields `None` (or an absent
+    /// optional field), so a missing or stripped-down `memory.events` never
+    /// derails the exit path or teardown.
     #[must_use]
     pub fn oom_report(&self) -> Option<OomReport> {
         let events = fs::read_to_string(self.path.join("memory.events")).ok()?;
@@ -237,15 +219,15 @@ impl Drop for CgroupLeaf {
 }
 
 /// The child puts **itself** into the resource cgroup by writing its own pid to
-/// the inherited `cgroup.procs` write fd, in the post-fork window *before* it
-/// applies the sandbox or execs. Because it runs before the child can fork or
-/// exec, every descendant it later spawns is inside the cgroup by construction —
-/// there is no window for a process to escape into the parent's cgroup.
+/// the inherited `cgroup.procs` write fd, post-fork but *before* it applies the
+/// sandbox or execs. Running before it can fork or exec means every descendant it
+/// later spawns is in the cgroup by construction — no window to escape into the
+/// parent's cgroup.
 ///
-/// Async-signal-safe: it only calls `getpid`, formats the pid into a stack
-/// buffer, and `write`s — no allocation and no locks — so it is safe to call in
-/// the post-fork child path. Returns `true` on a complete write; on `false` the
-/// caller must `_exit` the child (fail-closed: never run unconfined).
+/// Async-signal-safe: only `getpid`, a stack-buffer format, and `write` — no
+/// allocation, no locks — so it is safe in the post-fork child path. Returns
+/// `true` on a complete write; on `false` the caller must `_exit` the child
+/// (fail-closed: never run unconfined).
 ///
 /// # Safety
 /// `procs_fd` must be a valid, writable fd for the leaf's `cgroup.procs`,
@@ -279,8 +261,8 @@ const MAX_PID_DIGITS: usize = 10;
 /// rendered as `"0"` (which a real pid never is).
 fn format_pid_decimal(pid: i32, buf: &mut [u8; MAX_PID_DIGITS]) -> &[u8] {
     let mut n = u32::try_from(pid).unwrap_or(0);
-    // Write digits least-significant-first into the tail of buf, so we never
-    // need a second pass to reverse them (keeps this branch- and alloc-light).
+    // Write digits least-significant-first into the tail of buf, avoiding a
+    // reversal pass.
     let mut i = buf.len();
     if n == 0 {
         i -= 1;
@@ -297,14 +279,13 @@ fn format_pid_decimal(pid: i32, buf: &mut [u8; MAX_PID_DIGITS]) -> &[u8] {
 /// Write the requested limit knobs into the leaf at `path`.
 fn write_knobs(path: &Path, limits: &ResourceLimits) -> Result<()> {
     if let Some(max) = limits.memory_bytes {
-        // Forbid the swap escape hatch first, then set the ceiling itself.
+        // Shut the swap escape hatch before setting the ceiling.
         write_knob(path, "memory.swap.max", "0")?;
         write_knob(path, "memory.max", &max.to_string())?;
-        // On OOM, take down the whole box together rather than letting the
-        // kernel pick one member to sacrifice.
+        // On OOM, take down the whole box, not one member the kernel picks.
         write_knob(path, "memory.oom.group", "1")?;
-        // No memory.high on purpose — see the module docs: with swap forbidden
-        // it stalls a runaway allocator instead of killing it.
+        // No memory.high on purpose (see module docs): with swap forbidden it
+        // stalls a runaway allocator instead of killing it.
     }
     Ok(())
 }
@@ -346,13 +327,44 @@ fn teardown(path: &Path) {
     let _ = fs::remove_dir(path);
 }
 
+/// Remove leftover `nono.<pid>` leaves under `base` whose supervisor process is
+/// gone (e.g. it was SIGKILL'd, so `Drop`/teardown never ran). Best-effort.
+///
+/// Only leaves whose pid is no longer alive are touched, so a concurrently
+/// running nono — and an unrelated process that happens to reuse an old
+/// supervisor's pid — are left strictly alone.
+fn sweep_stale_leaves(base: &Path) {
+    let Ok(entries) = fs::read_dir(base) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Some(pid) = entry.file_name().to_str().and_then(parse_leaf_pid) else {
+            continue;
+        };
+        if !pid_is_alive(pid) {
+            teardown(&entry.path());
+        }
+    }
+}
+
+/// Extract the supervisor pid from a leaf directory name (`nono.<pid>`), or
+/// `None` if `name` is not one of our leaves.
+fn parse_leaf_pid(name: &str) -> Option<u32> {
+    name.strip_prefix("nono.")?.parse::<u32>().ok()
+}
+
+/// Whether `pid` currently names a live process (any state, including zombie),
+/// via the presence of `/proc/<pid>`.
+fn pid_is_alive(pid: u32) -> bool {
+    Path::new("/proc").join(pid.to_string()).exists()
+}
+
 /// Find the cgroup directory we're allowed to create our box inside.
 ///
-/// On a normal login, systemd hands each user's session a private cgroup subtree
-/// it may manage without root — rooted at `.../user@<uid>.service`. That handover
-/// is "delegation", and that directory is the only place we can reliably create
-/// child cgroups. We locate it by reading our own cgroup path from
-/// `/proc/self/cgroup` and walking up to the `user@<uid>.service` ancestor.
+/// On a normal login, systemd "delegates" each user session a private cgroup
+/// subtree it may manage without root, rooted at `.../user@<uid>.service` — the
+/// only place we can reliably create child cgroups. We find it by reading our own
+/// cgroup from `/proc/self/cgroup` and walking up to that ancestor.
 fn delegated_base() -> Result<PathBuf> {
     let raw = fs::read_to_string("/proc/self/cgroup").map_err(|e| {
         NonoError::SandboxInit(format!("resource: cannot read /proc/self/cgroup: {e}"))
@@ -408,8 +420,8 @@ fn parse_delegated_base(proc_self_cgroup: &str, uid: u32) -> Result<PathBuf> {
 
 /// Verify the controllers we need are enabled for child cgroups. A cgroup only
 /// exposes a controller's knobs (here `memory.max`) if that controller is listed
-/// in the parent's `cgroup.subtree_control` file; without that the leaf's
-/// `memory.max` would not exist and a cap would silently fail to apply.
+/// in the parent's `cgroup.subtree_control`; without it the leaf's `memory.max`
+/// would not exist and the cap would silently fail to apply.
 fn ensure_controllers_delegated(base: &Path, limits: &ResourceLimits) -> Result<()> {
     let subtree_path = base.join("cgroup.subtree_control");
     let subtree = fs::read_to_string(&subtree_path).map_err(|e| {
@@ -515,6 +527,29 @@ mod tests {
         assert_eq!(event_counter("oom_kill notanumber\n", "oom_kill"), 0);
         // A prefix of a real key must not match (whole-key, space-delimited).
         assert_eq!(event_counter("oom_killer 9\n", "oom_kill"), 0);
+    }
+
+    #[test]
+    fn parse_leaf_pid_only_matches_our_leaves() {
+        use super::parse_leaf_pid;
+        assert_eq!(parse_leaf_pid("nono.123"), Some(123));
+        assert_eq!(parse_leaf_pid("nono.0"), Some(0));
+        assert_eq!(parse_leaf_pid("nono.4194304"), Some(4_194_304));
+        // Malformed or not one of our leaves.
+        assert_eq!(parse_leaf_pid("nono."), None);
+        assert_eq!(parse_leaf_pid("nono.abc"), None);
+        assert_eq!(parse_leaf_pid("nono.12.3"), None);
+        assert_eq!(parse_leaf_pid("nono.-1"), None);
+        assert_eq!(parse_leaf_pid("nonoX.5"), None);
+        assert_eq!(parse_leaf_pid("user@1000.service"), None);
+    }
+
+    #[test]
+    fn pid_is_alive_tracks_real_processes() {
+        use super::pid_is_alive;
+        // Our own pid is alive; a value above the kernel pid_max never is.
+        assert!(pid_is_alive(std::process::id()));
+        assert!(!pid_is_alive(u32::MAX));
     }
 
     // ---- Adversarial component-wise matching & pid property ----
@@ -668,9 +703,11 @@ mod tests {
     // /sys/fs/cgroup, run a bounded memory bomb, and read kernel knobs. They are
     // NOT run by default CI. The host they target must be a systemd
     // `Delegate=yes` user session with the `memory` controller delegated to
-    // `user@<uid>.service` (cgroup v2 unified hierarchy). Run all of them with:
+    // `user@<uid>.service` (cgroup v2 unified hierarchy). They each create a
+    // `nono.<pid>` leaf for this test process, so run them SERIALLY — in parallel
+    // they collide on that name:
     //
-    //   cargo test -p nono-cli --bins -- --ignored
+    //   cargo test -p nono-cli --bins -- --ignored --test-threads=1
     //
     // or one at a time, e.g.:
     //
@@ -839,6 +876,32 @@ mod tests {
             "teardown must remove the leaf dir {}",
             leaf_path.display()
         );
+    }
+
+    /// LIVE: a leftover leaf from a dead supervisor is swept on the next create().
+    #[test]
+    #[ignore = "requires live cgroup v2 delegation (memory controller); run with --ignored"]
+    fn live_create_sweeps_stale_leaf_of_dead_supervisor() {
+        use super::CgroupLeaf;
+        use super::delegated_base;
+        use nono::ResourceLimits;
+
+        let base = delegated_base().expect("delegated base");
+        // Plant a leaf named for a pid that can never be alive (above pid_max),
+        // standing in for a supervisor that was SIGKILL'd before teardown.
+        let stale = base.join("nono.4294967295");
+        std::fs::create_dir(&stale).expect("plant stale leaf");
+
+        // Creating our real leaf sweeps stale siblings first.
+        let leaf = CgroupLeaf::create(&ResourceLimits {
+            memory_bytes: Some(64 * 1024 * 1024),
+        })
+        .expect("create leaf");
+        assert!(
+            !stale.exists(),
+            "a stale leaf whose supervisor is dead must be swept on create()"
+        );
+        drop(leaf);
     }
 
     /// LIVE: fail-closed against a colliding leaf. create() does fs::create_dir

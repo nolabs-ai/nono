@@ -258,12 +258,11 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
         },
     };
 
-    // Resource enforcement: Linux cgroup v2. When a limit is requested, the leaf
-    // is created pre-fork from those limits, or the run fails closed
-    // (`CgroupLeaf::create` errors) if a delegated cgroup v2 subtree is
-    // unavailable — we never run a requested limit unenforced. The child
-    // self-attaches to the leaf (see `resource_procs_fd` below); dropping
-    // `cgroup_leaf` tears it down.
+    // Resource enforcement: Linux cgroup v2. A requested limit creates the leaf
+    // pre-fork; if no delegated cgroup v2 subtree is available, `CgroupLeaf::create`
+    // errors and the run fails closed rather than execute the limit unenforced.
+    // The child self-attaches to the leaf (see `resource_procs_fd` below);
+    // dropping `cgroup_leaf` tears it down.
     #[cfg(target_os = "linux")]
     let cgroup_leaf = match caps.resource_limits() {
         Some(limits) if !limits.is_empty() => {
@@ -285,46 +284,44 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
         ));
     }
 
-    // The child self-attaches to the resource cgroup through this fd: it is
-    // opened in the parent so the forked child inherits it and can cage itself
-    // before it can fork/exec, closing the post-fork race that a parent-side
-    // attach would leave open. The leaf (and thus the fd) lives until the end
-    // of this function, where dropping it tears the cgroup down.
+    // The fd the child self-attaches through: opened in the parent so the forked
+    // child inherits it and can cage itself before it can fork/exec, closing the
+    // post-fork race a parent-side attach would leave open. The leaf (and thus the
+    // fd) lives to the end of this function.
     #[cfg(target_os = "linux")]
     let resource_procs_fd = cgroup_leaf.as_ref().map(|leaf| leaf.procs_raw_fd());
     #[cfg(not(target_os = "linux"))]
     let resource_procs_fd: Option<std::os::fd::RawFd> = None;
 
     let exit_code = {
-        // `on_fork` runs in the parent the instant the child is forked, with the
-        // child's pid; we use it to record the pid on the session. The resource
-        // cgroup attach is done by the child itself (see `resource_procs_fd`
-        // above), not here, so there is no escape window to close from the parent.
+        // Runs in the parent the instant the child is forked, with the child's
+        // pid; records it on the session. The cgroup attach is done by the child
+        // itself (see `resource_procs_fd` above), so there is no escape window for
+        // the parent to close here.
         let mut on_fork = |child_pid: u32| {
             if let Some(ref mut guard) = session_guard {
                 guard.set_child_pid(child_pid);
             }
         };
 
-        // Post-mortem hook (Linux, and ONLY when a resource cgroup leaf exists).
-        // If a memory cap was requested and the kernel OOM-killed the sandbox for
-        // crossing it, the child comes back as a bare SIGKILL (exit 137) with no
-        // explanation. Read the leaf's OOM evidence while it still exists and
-        // print a precise diagnostic, so a cap breach is loud rather than silent.
+        // Post-mortem hook, installed only when a resource cgroup leaf exists.
+        // When the kernel OOM-kills the sandbox for crossing a memory cap, the
+        // child comes back as a bare SIGKILL (exit 137) with no explanation. The
+        // hook reads the leaf's OOM evidence while it still exists and prints a
+        // precise diagnostic, so a cap breach is loud rather than silent.
         // Returning `true` suppresses the generic "killed by SIGKILL" footer.
         //
-        // A run with no memory limit installs NO hook (`None`), so it takes the
-        // exact pre-feature path with no per-run hook call at all.
+        // A run with no limit installs no hook (`None`), taking the exact
+        // pre-feature path.
         #[cfg(target_os = "linux")]
         let install_exit_diag = cgroup_leaf.is_some();
         #[cfg(target_os = "linux")]
         let mut on_exit_diag_fn = |code: i32| -> bool {
-            // The diagnostic explains the bare SIGKILL the kernel delivers when
-            // the whole sandbox is OOM-killed for crossing the cap (exit code
-            // 128 + SIGKILL = 137). Only look at that exit: an unrelated failure
-            // must not get a spurious "killed by the kernel" story, nor have its
-            // real footer suppressed, just because an individual descendant was
-            // OOM-reaped earlier in the run.
+            // Only explain the exit code the kernel delivers when the whole
+            // sandbox is OOM-killed for crossing the cap (128 + SIGKILL = 137).
+            // Bailing on any other code stops an unrelated failure from getting a
+            // spurious "killed by the kernel" story, or its real footer suppressed,
+            // just because a single descendant was OOM-reaped earlier in the run.
             const OOM_SIGKILL_EXIT: i32 = 128 + nix::libc::SIGKILL;
             if code != OOM_SIGKILL_EXIT {
                 return false;

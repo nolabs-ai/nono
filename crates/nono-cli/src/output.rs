@@ -506,13 +506,12 @@ pub fn print_diagnostic_footer(footer: &str) {
     print_terminal_block(&rendered, true);
 }
 
-/// Explain, verbosely, that the kernel OOM-killed the sandbox for exceeding its
-/// `--memory` ceiling.
+/// Explain that the kernel OOM-killed the sandbox for exceeding its `--memory`
+/// ceiling.
 ///
-/// Without this a memory-cap kill surfaces only as a bare SIGKILL (exit 137)
-/// with no hint at the cause — the run looks like it died for no reason. Here we
-/// name the limit, the peak the tree reached, and how to relax it. Suppressed
-/// under `--silent`.
+/// Without this a memory-cap kill surfaces only as a bare SIGKILL (exit 137),
+/// so the run looks like it died for no reason. We name the limit, the peak the
+/// tree reached, and how to relax it. Suppressed under `--silent`.
 #[cfg(target_os = "linux")]
 pub fn print_oom_diagnostic(report: &crate::resource_cgroup::OomReport, silent: bool) {
     if silent {
@@ -520,8 +519,8 @@ pub fn print_oom_diagnostic(report: &crate::resource_cgroup::OomReport, silent: 
     }
     let t = theme::current();
 
-    // Label column padded on the plain text (before coloring) so the values
-    // line up regardless of the invisible ANSI escapes.
+    // Pad the label on the plain text before coloring, so values line up
+    // regardless of the invisible ANSI escapes.
     let row = |label: &str, value: &str| {
         format!(
             "       {} {}",

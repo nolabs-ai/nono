@@ -92,6 +92,12 @@
         ]
       },
       {
+        "group": "Resource Limits",
+        "pages": [
+          "cli/features/resource-limits"
+        ]
+      },
+      {
         "group": "Architecture",
         "pages": [
           "cli/internals/overview",

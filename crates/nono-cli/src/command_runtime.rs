@@ -229,9 +229,8 @@ pub(crate) fn run_shell(args: ShellArgs, silent: bool) -> Result<()> {
 
 /// `nono wrap` execs the target directly (no supervising parent), so it never
 /// creates the cgroup that enforces a memory ceiling. Accepting a limit here
-/// would run unenforced — or, in `--dry-run`, advertise a cap we won't honor —
-/// which is a silent fail-open of a security control. Refuse instead, the same
-/// stance as the proxy / af_unix guards below. Covers both `--memory` and a
+/// would run unenforced — or, under `--dry-run`, advertise a cap we won't honor.
+/// Fail closed instead, like the proxy / AF_UNIX guards below. Covers both `--memory` and a
 /// manifest `resources.memory_bytes`, since both have landed in `caps` by now.
 fn reject_resource_limits_under_wrap(caps: &CapabilitySet) -> Result<()> {
     if caps

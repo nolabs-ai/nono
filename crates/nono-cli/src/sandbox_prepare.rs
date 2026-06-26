@@ -574,9 +574,9 @@ fn finalize_prepared_sandbox(
     args: &SandboxArgs,
     silent: bool,
 ) -> Result<PreparedSandbox> {
-    // Resource limits from CLI flags. The manifest path already populated caps
-    // via `CapabilitySet::try_from`; flags and `--config` are mutually exclusive
-    // (clap `conflicts_with`), so this only fires on the flag path. Enforcement
+    // Attach resource limits from CLI flags. The manifest path already populated
+    // caps via `CapabilitySet::try_from`, and flags conflict with `--config`
+    // (clap `conflicts_with`), so this branch only runs on the flag path. Enforcement
     // happens later in the supervised runtime; here we just attach the parsed
     // limits to the capability set (also shown in `--dry-run`).
     if let Some(ref s) = args.memory {
@@ -615,10 +615,10 @@ fn finalize_prepared_sandbox(
     Ok(prepared)
 }
 
-/// True when a filesystem grant hands the sandbox WRITE access over any part of
+/// True when a filesystem grant gives the sandbox WRITE access over any part of
 /// the cgroup v2 hierarchy (`/sys/fs/cgroup`) — the control plane that enforces
-/// `--memory`. Dangerous either way the paths nest: the grant lies inside the
-/// cgroup tree, or it is a broad ancestor (e.g. `/sys`, `/`) that subsumes it.
+/// `--memory`. Dangerous whichever way the paths nest: the grant is inside the
+/// cgroup tree, or it is a broad ancestor (e.g. `/sys`, `/`) that contains it.
 /// Read-only grants are safe — defeating the cap requires writing the limit
 /// knobs or `cgroup.procs`. Uses component-based `Path::starts_with`, never a
 /// string prefix, so `/sys/fs/cgroupX` does not match `/sys/fs/cgroup`.

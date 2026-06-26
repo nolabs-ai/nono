@@ -1589,7 +1589,6 @@ pub struct WrapSandboxArgs {
             "block_net", "allow_bind", "allow_port", "allow_connect_port",
             "env_credential", "env_credential_map",
             "allow_command", "block_command", "allow_launch_services", "allow_gpu",
-            "memory",
         ],
         help_heading = "OPTIONS"
     )]
@@ -1599,11 +1598,10 @@ pub struct WrapSandboxArgs {
     #[arg(long, short = 'v', action = clap::ArgAction::Count, help_heading = "OPTIONS")]
     pub verbose: u8,
 
-    /// Maximum resident memory for the process tree (e.g. 512M, 1Gi).
-    /// Enforced on Linux via cgroup v2; requires a supervised run.
-    #[arg(long, value_name = "SIZE", help_heading = "RESOURCES")]
-    pub memory: Option<String>,
-
+    // `wrap` deliberately has no `--memory`: it execs directly and cannot create
+    // the enforcement cgroup, so a cap could not be applied. Use `nono run`. A
+    // memory limit arriving via `--config <manifest>` is still refused at runtime
+    // in `run_wrap`.
     /// Show what would be sandboxed without executing
     #[arg(long, help_heading = "OPTIONS")]
     pub dry_run: bool,
@@ -1652,7 +1650,9 @@ impl From<WrapSandboxArgs> for SandboxArgs {
             allow_gpu: args.allow_gpu,
             config: args.config,
             verbose: args.verbose,
-            memory: args.memory,
+            // `wrap` has no `--memory` flag (it cannot enforce one); a limit in a
+            // `--config` manifest is refused at runtime in `run_wrap`.
+            memory: None,
             dry_run: args.dry_run,
         }
     }
@@ -2612,15 +2612,16 @@ mod tests {
     }
 
     #[test]
-    fn test_wrap_sandbox_args_from_maps_resource_fields() {
-        // Guards against the silent fail-open where a new field is added to the
-        // structs but dropped in the hand-written `From<WrapSandboxArgs>`.
-        let wrap = WrapSandboxArgs {
-            memory: Some("256M".to_string()),
-            ..Default::default()
-        };
-        let sandbox: SandboxArgs = wrap.into();
-        assert_eq!(sandbox.memory.as_deref(), Some("256M"));
+    fn test_wrap_rejects_memory_flag_and_from_maps_it_to_none() {
+        // `wrap` cannot enforce a memory cap (it execs directly), so it does not
+        // expose `--memory` at all — clap rejects the unknown flag.
+        let res = Cli::try_parse_from(["nono", "wrap", "--memory", "256M", "--", "true"]);
+        assert!(res.is_err(), "wrap must not accept --memory");
+
+        // And the hand-written `From<WrapSandboxArgs>` always maps memory to None
+        // (a manifest-borne limit is refused later in run_wrap, not here).
+        let sandbox: SandboxArgs = WrapSandboxArgs::default().into();
+        assert!(sandbox.memory.is_none());
     }
 
     #[test]

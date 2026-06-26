@@ -73,8 +73,8 @@ impl CapabilityManifest {
         }
 
         // Resource ceilings are enforced by the supervising parent, so they
-        // require exec_strategy: "supervised". A bare `backend` with no actual
-        // limit is a no-op and does not trigger the requirement.
+        // require exec_strategy: "supervised". An empty `resources` object carries
+        // no actual limit, so it is a no-op and does not trigger the requirement.
         if let Some(ref res) = self.resources
             && res.memory_bytes.is_some()
         {

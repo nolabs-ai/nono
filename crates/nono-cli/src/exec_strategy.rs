@@ -473,13 +473,12 @@ pub fn execute_supervised(
     // Optional post-mortem hook, called once with the child's exit code after it
     // is reaped. It may print a specialized diagnostic (e.g. the resource
     // cgroup's memory-cap explanation). Returning `true` means it fully explained
-    // the failure, so the generic exit/denial footer is suppressed to avoid
+    // the failure, so the generic exit/denial footer is suppressed instead of
     // telling the user two competing stories.
     mut on_exit_diagnostic: Option<&mut dyn FnMut(i32) -> bool>,
 ) -> Result<i32> {
-    // `resource_procs_fd` is consumed only by the Linux cgroup self-attach path
-    // below; mark it used on other platforms so the strict `-D warnings` build
-    // (macOS) stays clean.
+    // Only the Linux cgroup self-attach path below uses `resource_procs_fd`;
+    // mark it used elsewhere so the strict `-D warnings` build stays clean.
     #[cfg(not(target_os = "linux"))]
     let _ = resource_procs_fd;
 
@@ -813,12 +812,12 @@ pub fn execute_supervised(
                 unsafe { crate::pty_proxy::setup_child_pty(slave_fd) };
             }
 
-            // Resource cgroup self-attach. Before the child applies its
-            // sandbox or execs, it writes its OWN pid into the leaf
-            // cgroup through the fd inherited from the parent. Doing this here —
-            // before the child can fork or exec anything — caps the whole
-            // process tree by construction and closes the post-fork escape
-            // window a parent-side attach would leave open.
+            // Resource cgroup self-attach. Before applying its sandbox or
+            // exec'ing, the child writes its own pid into the leaf cgroup via the
+            // fd inherited from the parent. Doing it here — before the child can
+            // fork or exec anything — caps the whole process tree by construction
+            // and closes the post-fork escape window a parent-side attach would
+            // leave open.
             #[cfg(target_os = "linux")]
             if let Some(procs_fd) = resource_procs_fd
                 && !crate::resource_cgroup::child_self_attach(procs_fd)
@@ -1317,14 +1316,13 @@ pub fn execute_supervised(
                 }
             };
 
-            // Give the caller a chance to explain this specific exit (e.g. the
-            // resource cgroup turns a bare SIGKILL into an explicit memory-cap
-            // diagnostic). If it does, suppress the generic footer below so the
-            // user gets one clear story instead of two competing ones.
+            // Let the caller explain this specific exit (e.g. the resource cgroup
+            // turning a bare SIGKILL into an explicit memory-cap diagnostic). If it
+            // does, suppress the generic footer below so the user gets one clear
+            // story instead of two competing ones.
             let specialized_diagnostic = on_exit_diagnostic
                 .take()
-                .map(|hook| hook(exit_code))
-                .unwrap_or(false);
+                .is_some_and(|hook| hook(exit_code));
 
             // Analyze PTY screen content for sandbox-related errors.
             let error_observation = pty_proxy

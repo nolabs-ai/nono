@@ -1550,6 +1550,17 @@ pub struct ProxyArgs {
     )]
     pub proxy_credential: Vec<String>,
 
+    /// Restrict a credential service to specific HTTP method+path patterns (repeatable).
+    /// Format: "SERVICE:METHOD:/path/pattern" (e.g., "github:GET:/repos/*/issues")
+    /// Use "*" for any method: "github:*:/repos/*/issues"
+    /// Patterns: "*" matches one path segment, "**" matches zero or more.
+    #[arg(
+        long = "allow-endpoint",
+        value_name = "SERVICE:METHOD:PATH",
+        help_heading = "CREDENTIALS"
+    )]
+    pub allow_endpoint: Vec<String>,
+
     // ── Options ──────────────────────────────────────────────────────────
     /// Enable verbose output (-v info, -vv debug, -vvv trace)
     #[arg(long, short = 'v', action = clap::ArgAction::Count, help_heading = "OPTIONS")]

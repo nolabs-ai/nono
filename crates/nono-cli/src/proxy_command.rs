@@ -198,15 +198,26 @@ fn build_launch_options(args: &ProxyArgs) -> Result<ProxyLaunchOptions> {
         })
     };
 
-    let credentials_intent = if credentials.is_empty() && custom_credentials.is_empty() {
+    // Per-credential endpoint restrictions from `--allow-endpoint`. The
+    // referenced service must also be an active credential; that check happens
+    // downstream in `build_proxy_config_from_flags`, shared with the sandboxed
+    // path, so an unknown service surfaces the same error.
+    let endpoint_restrictions = args
+        .allow_endpoint
+        .iter()
+        .map(|s| crate::proxy_runtime::parse_allow_endpoint_arg(s))
+        .collect::<Result<Vec<_>>>()?;
+
+    let credentials_intent = if credentials.is_empty()
+        && custom_credentials.is_empty()
+        && endpoint_restrictions.is_empty()
+    {
         None
     } else {
         Some(CredentialProxyIntent {
             credentials,
             custom_credentials,
-            // The standalone proxy command has no `--allow-endpoint` flag, so
-            // there are no per-credential endpoint restrictions to apply.
-            endpoint_restrictions: Vec::new(),
+            endpoint_restrictions,
         })
     };
 
@@ -428,5 +439,44 @@ mod tests {
             .get("github")
             .expect("github capture entry carried through");
         assert_eq!(entry.command, vec!["true", "auth", "github"]);
+    }
+
+    #[test]
+    fn allow_endpoint_populates_credential_restrictions() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _env = cleared_env();
+        let args = parse_args(&[
+            "--credential",
+            "github",
+            "--allow-endpoint",
+            "github:GET:/repos/*/issues",
+        ]);
+        let opts = build_launch_options(&args).expect("allow-endpoint with credential is valid");
+        let creds = opts.credentials.expect("credential intent present");
+        assert_eq!(creds.endpoint_restrictions.len(), 1);
+        let (service, rule) = &creds.endpoint_restrictions[0];
+        assert_eq!(service, "github");
+        assert_eq!(rule.method, "GET");
+        assert_eq!(rule.path, "/repos/*/issues");
+    }
+
+    #[test]
+    fn allow_endpoint_alone_yields_credential_intent() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _env = cleared_env();
+        // Even without --credential, an endpoint restriction produces a
+        // credential intent so the downstream "service not found" check fires.
+        let args = parse_args(&["--allow-endpoint", "github:GET:/repos/*/issues"]);
+        let opts = build_launch_options(&args).expect("allow-endpoint alone parses");
+        assert!(opts.credentials.is_some());
+    }
+
+    #[test]
+    fn malformed_allow_endpoint_is_rejected() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _env = cleared_env();
+        let args = parse_args(&["--allow-endpoint", "github:GET"]);
+        let err = build_launch_options(&args).expect_err("missing path must fail");
+        assert!(matches!(err, NonoError::ConfigParse(_)), "got {err:?}");
     }
 }

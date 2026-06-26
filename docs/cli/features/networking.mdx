@@ -243,8 +243,42 @@ Settings are loaded from `--profile` and extended/overridden by explicit flags, 
 | `--credential <SERVICE>` | Inject credentials for a service via the reverse proxy (repeatable). |
 | `--upstream-proxy <HOST:PORT>` | Chain outbound traffic through an upstream proxy. |
 | `--upstream-bypass <DOMAIN>` | Route these domains direct instead of through the upstream proxy (requires `--upstream-proxy`). |
-| `--proxy-ca-validity <DAYS>` | Proxy CA certificate validity in days (1–365). |
+| `--proxy-ca-validity <DAYS>` | Proxy CA certificate validity in days (1–365). Conflicts with `--proxy-ca-cert`. |
 | `--trust-proxy-ca` | Add the proxy CA to the macOS user trust store (macOS only). |
+| `--proxy-ca-cert <PEM_FILE>` | Sign intercepted TLS with this existing CA certificate (PEM) instead of a fresh per-session CA. Requires `--proxy-ca-key`. Reads `NONO_PROXY_CA_CERT`. |
+| `--proxy-ca-key <PEM_FILE>` | PKCS#8 private key (PEM) for `--proxy-ca-cert`. Reads `NONO_PROXY_CA_KEY`. |
+
+### Reusing a CA across runs
+
+By default each `nono proxy` run mints a fresh ephemeral CA, so any client that trusts the intercepted TLS has to re-trust a new certificate every time. To keep one CA across runs — trust it once in your clients, containers, or microVM images — supply your own with `--proxy-ca-cert` and `--proxy-ca-key`:
+
+```bash
+nono proxy \
+  --allow-domain 'https://api.github.com/**' \
+  --proxy-ca-cert ./ca.crt \
+  --proxy-ca-key ./ca.key
+```
+
+The key must be an **ECDSA P-256** private key in **PKCS#8** PEM (`-----BEGIN PRIVATE KEY-----`); the certificate must be a CA certificate in PEM. Generate a pair with OpenSSL:
+
+```bash
+# PKCS#8 EC P-256 private key
+openssl ecparam -name prime256v1 -genkey -noout -out ca.ec.key
+openssl pkcs8 -topk8 -nocrypt -in ca.ec.key -out ca.key && rm ca.ec.key
+
+# Self-signed CA certificate (30-day validity here)
+openssl req -x509 -new -nodes -key ca.key -sha256 -days 30 \
+  -subj "/CN=my-proxy-ca" \
+  -addext "basicConstraints=critical,CA:TRUE" \
+  -addext "keyUsage=critical,keyCertSign,cRLSign,digitalSignature" \
+  -out ca.crt
+```
+
+The key and cert are validated at startup: a mismatched pair (or an unreadable file) fails the command immediately rather than silently disabling interception. Validity comes from the supplied certificate, so `--proxy-ca-cert` cannot be combined with `--proxy-ca-validity`; on macOS it also cannot be combined with `--trust-proxy-ca`, which manages its own CA in the Keychain. Protect the key file — anyone who can read it can mint certificates your clients will trust.
+
+<Note>
+  TLS interception (and therefore the CA) only activates when a route requires layer-7 visibility — for example an endpoint-scoped `--allow-domain` (a URL with a path glob) or `--allow-endpoint` rules. Plain host allowlisting tunnels CONNECT traffic without interception, so no CA is used.
+</Note>
 
 ### Authentication
 

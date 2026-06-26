@@ -14,6 +14,15 @@ env:
   RUSTFLAGS: -Dwarnings
 
 jobs:
+  actionlint:
+    name: Action Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Run actionlint
+        uses: rhysd/actionlint@914e7df21a07ef503a81201c76d2b11c789d3fca # v1.7.12
+
   changes:
     name: Classify Changes
     runs-on: ubuntu-latest

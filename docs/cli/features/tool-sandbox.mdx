@@ -16,7 +16,7 @@ A Tool Sandbox profile answers three questions:
 | Question | Field |
 |---|---|
 | What may the outer session run directly? | `command_policies.commands.<name>.sandbox` or `command_policies.commands.<name>.from.session` |
-| What may one Tool Sandbox command run next? | `command_policies.commands.<caller>.can_use` plus `command_policies.commands.<callee>.from.<caller>` |
+| What may one Tool Sandbox command run next? | `command_policies.commands.<caller>.can_use` plus `command_policies.commands.<callee>.from.<caller>` for other commands; self-invocation is implicit unless a self-invocation entry is configured |
 | What does the selected child command receive? | `sandbox` or caller-specific `from.<caller>` grants |
 
 `command_policies.entrypoint` is still parsed for older profiles, but current profiles should express direct session access with `commands.<name>.sandbox` or `commands.<name>.from.session`.
@@ -60,7 +60,7 @@ Each entry under `commands` uses the command name as the key:
 |---|---|---|
 | `sandbox` | object | Direct-session policy shorthand. This lets the outer session run the command. |
 | `from` | object | Caller-specific policies. Use `session` for direct session invocation or another command name for chaining. |
-| `can_use` | command-name array | Commands this command may invoke through Tool Sandbox. |
+| `can_use` | command-name array | Other commands this command may invoke through Tool Sandbox. If no self-invocation entry is configured, self-invocation keeps the current effective policy. |
 | `executable` | absolute path | Pin the command name to one executable file instead of the first `PATH` match. |
 | `allow_writable_executable` | boolean | Per-command trust downgrade for a pinned executable writable by the sandbox capability set. Requires absolute `executable`. |
 | `intercept` | array | Ordered argument-prefix mediation rules evaluated after invocation policy. |

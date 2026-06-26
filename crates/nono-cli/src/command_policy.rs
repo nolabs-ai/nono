@@ -480,6 +480,16 @@ impl CommandPolicyConfig {
     }
 }
 
+pub(crate) fn has_explicit_self_invocation_entry(
+    config: &CommandPoliciesConfig,
+    command_name: &str,
+) -> bool {
+    config.commands.get(command_name).is_some_and(|command| {
+        command.can_use.iter().any(|name| name == command_name)
+            || command.from.contains_key(command_name)
+    })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum CommandFromConfig {
@@ -2620,6 +2630,27 @@ mod tests {
                 .iter()
                 .any(|finding| finding.code == "contradictory_session_allow")
         );
+    }
+
+    #[test]
+    fn explicit_self_invocation_entry_detects_allow_and_deny_shapes() {
+        let mut config = active_git_config();
+
+        assert!(!has_explicit_self_invocation_entry(&config, "git"));
+
+        if let Some(git) = config.commands.get_mut("git") {
+            git.can_use = vec!["git".to_string()];
+        }
+        assert!(has_explicit_self_invocation_entry(&config, "git"));
+
+        if let Some(git) = config.commands.get_mut("git") {
+            git.can_use.clear();
+            git.from.insert(
+                "git".to_string(),
+                CommandFromConfig::Deny("deny".to_string()),
+            );
+        }
+        assert!(has_explicit_self_invocation_entry(&config, "git"));
     }
 
     #[test]

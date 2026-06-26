@@ -1194,7 +1194,7 @@
         "can_use": {
           "type": "array",
           "items": { "$ref": "#/$defs/CommandPolicyIdentifier" },
-          "description": "Commands this command may invoke through tool-sandbox chaining."
+          "description": "Other commands this command may invoke through tool-sandbox chaining. If no explicit self-invocation entry is configured, self-invocation keeps the command's current effective policy and does not require listing the command here."
         },
         "sandbox": {
           "$ref": "#/$defs/CommandSandboxConfig",

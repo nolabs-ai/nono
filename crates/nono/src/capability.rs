@@ -1075,8 +1075,16 @@ impl CapabilitySet {
     /// `127.0.0.1:port`. Works across all network modes.
     ///
     /// On macOS: outbound is per-port via Seatbelt; bind/inbound is blanket
-    /// (same tradeoff as `--allow-bind`).
-    /// On Linux: per-port ConnectTcp + BindTcp via Landlock.
+    /// (same tradeoff as `--allow-bind`). Port `0` generates a `localhost:*`
+    /// wildcard rule, allowing any localhost port.
+    ///
+    /// On Linux: per-port ConnectTcp + BindTcp via Landlock. Port `0` has no
+    /// wildcard semantics in Landlock — `ConnectTcp/0` only matches connects to
+    /// destination port 0, and `BindTcp/0` only permits `bind(port=0)` (OS ephemeral
+    /// assignment). Neither covers connecting to a random high port such as a
+    /// Testcontainers mapping. Instead, port `0` causes Landlock network handling to be
+    /// skipped entirely, leaving the proxy as the sole domain enforcer. This is only
+    /// permitted in `ProxyOnly` mode; `Blocked` mode rejects port `0` at sandbox init.
     #[must_use]
     pub fn allow_localhost_port(mut self, port: u16) -> Self {
         self.localhost_ports.push(port);

@@ -586,6 +586,14 @@ fn finalize_prepared_sandbox(
             .with_resource_limits(nono::ResourceLimits { memory_bytes });
     }
 
+    // SECURITY: a memory cap is enforced through cgroup control files under
+    // /sys/fs/cgroup. If the sandbox is ALSO granted write access over any part
+    // of that tree, the child could rewrite its own memory.max (or migrate to a
+    // cgroup it creates) and silently defeat the cap. Landlock is allow-list and
+    // cannot carve the cgroup tree out of a broad grant like `/sys`, so refuse
+    // the run rather than enforce a cap the sandbox can lift.
+    reject_cgroup_writable_grants_under_memory_limit(&prepared.caps)?;
+
     output::print_skipped_requested_paths(&collect_missing_cli_requested_paths(args), silent);
     output::print_capabilities(&prepared.caps, args.verbose, silent);
 
@@ -605,6 +613,47 @@ fn finalize_prepared_sandbox(
     info!("{}", Sandbox::support_info().details);
 
     Ok(prepared)
+}
+
+/// True when a filesystem grant hands the sandbox WRITE access over any part of
+/// the cgroup v2 hierarchy (`/sys/fs/cgroup`) — the control plane that enforces
+/// `--memory`. Dangerous either way the paths nest: the grant lies inside the
+/// cgroup tree, or it is a broad ancestor (e.g. `/sys`, `/`) that subsumes it.
+/// Read-only grants are safe — defeating the cap requires writing the limit
+/// knobs or `cgroup.procs`. Uses component-based `Path::starts_with`, never a
+/// string prefix, so `/sys/fs/cgroupX` does not match `/sys/fs/cgroup`.
+fn grant_opens_cgroup_control_plane(resolved: &Path, access: AccessMode) -> bool {
+    if !matches!(access, AccessMode::Write | AccessMode::ReadWrite) {
+        return false;
+    }
+    let cgroup_mount = Path::new("/sys/fs/cgroup");
+    resolved.starts_with(cgroup_mount) || cgroup_mount.starts_with(resolved)
+}
+
+/// Refuse a run whose `--memory` cap could be silently defeated because the
+/// sandbox is also granted write access over the cgroup hierarchy enforcing it
+/// (the child could raise its own `memory.max` or migrate out of the leaf).
+///
+/// Only fires when a memory limit is actually set; a no-limit run is unaffected.
+fn reject_cgroup_writable_grants_under_memory_limit(caps: &CapabilitySet) -> Result<()> {
+    if caps
+        .resource_limits()
+        .is_none_or(|limits| limits.is_empty())
+    {
+        return Ok(());
+    }
+    for cap in caps.fs_capabilities() {
+        if grant_opens_cgroup_control_plane(&cap.resolved, cap.access) {
+            return Err(NonoError::ConfigParse(format!(
+                "refusing write access to '{}' while a --memory limit is enforced: it overlaps \
+                 the cgroup hierarchy (/sys/fs/cgroup) that enforces the limit, so the sandbox \
+                 could rewrite its own memory cap and escape it. Make the grant read-only, scope \
+                 it more narrowly, or drop --memory.",
+                cap.resolved.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_external_proxy_bypass(
@@ -1843,5 +1892,56 @@ mod tests {
             ),
             Some(DetachedCwdPromptResponse::Deny)
         );
+    }
+
+    #[test]
+    fn cgroup_write_grant_detection_is_component_based() {
+        let (w, rw, r) = (AccessMode::Write, AccessMode::ReadWrite, AccessMode::Read);
+
+        // Inside or equal to the cgroup mount -> dangerous (writable).
+        assert!(grant_opens_cgroup_control_plane(
+            Path::new("/sys/fs/cgroup"),
+            w
+        ));
+        assert!(grant_opens_cgroup_control_plane(
+            Path::new("/sys/fs/cgroup/user.slice/user-1000.slice"),
+            rw
+        ));
+        // A broad ancestor that subsumes the cgroup mount -> dangerous.
+        assert!(grant_opens_cgroup_control_plane(Path::new("/sys"), w));
+        assert!(grant_opens_cgroup_control_plane(Path::new("/sys/fs"), w));
+        assert!(grant_opens_cgroup_control_plane(Path::new("/"), w));
+
+        // Read-only is safe even over the cgroup tree (cannot write the knobs).
+        assert!(!grant_opens_cgroup_control_plane(
+            Path::new("/sys/fs/cgroup"),
+            r
+        ));
+        assert!(!grant_opens_cgroup_control_plane(Path::new("/sys"), r));
+
+        // Unrelated or sibling write grants are safe.
+        assert!(!grant_opens_cgroup_control_plane(
+            Path::new("/sys/devices"),
+            w
+        ));
+        assert!(!grant_opens_cgroup_control_plane(Path::new("/tmp"), rw));
+
+        // Component-based: a look-alike sibling must NOT match. A string
+        // `starts_with` would wrongly flag this — the bug this guards against.
+        assert!(!grant_opens_cgroup_control_plane(
+            Path::new("/sys/fs/cgroupX"),
+            w
+        ));
+    }
+
+    #[test]
+    fn cgroup_grant_guard_only_fires_with_a_memory_limit() {
+        // No limit -> always Ok (guard short-circuits before inspecting grants).
+        assert!(reject_cgroup_writable_grants_under_memory_limit(&CapabilitySet::new()).is_ok());
+        // A limit set but no filesystem grants -> Ok.
+        let caps = CapabilitySet::new().with_resource_limits(nono::ResourceLimits {
+            memory_bytes: Some(64 * 1024 * 1024),
+        });
+        assert!(reject_cgroup_writable_grants_under_memory_limit(&caps).is_ok());
     }
 }

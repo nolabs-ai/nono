@@ -326,7 +326,7 @@ pub(super) fn handle_seccomp_notification(
                 }
             }
             Err(e) => {
-                let errno = e.raw_os_error().unwrap_or(libc::EACCES);
+                let errno = e.raw_os_error().unwrap_or(libc::EIO);
                 let _ = respond_notif_errno(notify_fd, notif.id, errno);
             }
         }

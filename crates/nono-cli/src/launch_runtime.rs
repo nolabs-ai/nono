@@ -229,6 +229,8 @@ pub(crate) struct ExecutionFlags {
     pub(crate) set_vars: Option<Vec<(String, String)>>,
     pub(crate) startup_timeout_secs: Option<u64>,
     pub(crate) command_policies: Option<crate::command_policy::CommandPoliciesConfig>,
+    #[cfg(target_os = "linux")]
+    pub(crate) allow_gpu_active: bool,
 }
 
 impl ExecutionFlags {
@@ -265,6 +267,8 @@ impl ExecutionFlags {
             set_vars: None,
             startup_timeout_secs: None,
             command_policies: None,
+            #[cfg(target_os = "linux")]
+            allow_gpu_active: false,
         })
     }
 }
@@ -423,6 +427,8 @@ pub(crate) fn prepare_run_launch_plan(
             set_vars: prepared.set_vars,
             startup_timeout_secs,
             command_policies: prepared.command_policies,
+            #[cfg(target_os = "linux")]
+            allow_gpu_active: prepared.allow_gpu_active,
         },
     })
 }

@@ -1940,7 +1940,7 @@ pub(crate) fn merge_dedup_ports(a: &[u16], b: &[u16]) -> Vec<u16> {
 ///
 /// Expected format: `SERVICE:METHOD:PATH`
 /// Example: `"github:GET:/repos/*/issues"` → `("github", EndpointRule { method: "GET", path: "/repos/*/issues" })`
-fn parse_allow_endpoint_arg(
+pub(crate) fn parse_allow_endpoint_arg(
     entry: &str,
 ) -> nono::Result<(String, nono_proxy::config::EndpointRule)> {
     let err = || {

@@ -848,12 +848,12 @@ fn missing_cwd_prompt_must_fail(
 ///   unrelated kernel drivers.
 /// - `/proc/self` (read): CUDA init reads `/proc/self/maps`, `/proc/self/status`
 ///   and other per-process files.
-/// - `/proc/self/task` (read): NVIDIA driver 570+ writes to
+/// - `/proc/self/task` (read+write): NVIDIA driver 570+ writes to
 ///   `/proc/self/task/<tid>/comm` during thread startup to set thread names.
-///   Landlock grants read-only; writes are auto-approved by the seccomp-notify
-///   supervisor fast-path when `gpu_comm` is set, avoiding CUDA Error 304.
-///   Narrowing write access to the `task` subtree keeps other per-process
-///   procfs entries read-only.
+///   Read+write is granted so those writes succeed through the seccomp-notify
+///   supervisor's `continue_notif` path, avoiding CUDA Error 304. The grant is
+///   scoped narrowly to the `task` subtree; other per-process procfs entries
+///   remain read-only.
 #[cfg(target_os = "linux")]
 fn grant_nvidia_gpu_procfs(caps: &mut CapabilitySet) -> Result<()> {
     for name in ["nvidia", "nvidia-uvm"] {
@@ -872,13 +872,14 @@ fn grant_nvidia_gpu_procfs(caps: &mut CapabilitySet) -> Result<()> {
         std::path::Path::new("/proc/self"),
         AccessMode::Read,
     )?);
-    // Read-only: writes to /proc/<tgid>/task/<tid>/comm are approved by the
-    // supervisor fast-path when gpu_comm is set (NVIDIA driver 570+). Keeping
-    // Landlock read-only here narrows the attack surface.
+    // Read+write: NVIDIA driver 570+ writes thread names to
+    // /proc/<tgid>/task/<tid>/comm. The supervisor's continue_notif path
+    // resumes the openat through Landlock, which allows it here.
     caps.add_fs(FsCapability::new_dir(
         std::path::Path::new("/proc/self/task"),
-        AccessMode::Read,
+        AccessMode::ReadWrite,
     )?);
+
 
     Ok(())
 }
@@ -1095,8 +1096,8 @@ pub(crate) fn print_allow_gpu_warning(silent: bool) {
         eprintln!(
             "  This grants read/write access to /dev/dri/renderD* and NVIDIA compute devices.\n  \
              On NVIDIA systems, additionally: read access to /proc/driver/nvidia,\n  \
-             /proc/driver/nvidia-uvm, and /proc/self; read access to\n  \
-             /proc/self/task (comm writes are approved by the sandbox supervisor)."
+             /proc/driver/nvidia-uvm, and /proc/self; read+write access to\n  \
+             /proc/self/task (required for NVIDIA driver 570+ thread naming)."
         );
     }
 }
@@ -1602,7 +1603,7 @@ mod tests {
     fn grant_nvidia_gpu_procfs_scopes_proc_self_reads_with_task_writes() {
         // Regression test for the NVIDIA-scoped procfs grants:
         //   /proc/self       Read        (CUDA init reads maps/status/etc.)
-        //   /proc/self/task  Read        (driver comm writes approved by supervisor fast-path)
+        //   /proc/self/task  ReadWrite   (NVIDIA driver 570+ writes thread names via comm)
         // Plus any of /proc/driver/{nvidia,nvidia-uvm} that exist.
         //
         // /proc/self and /proc/self/task always exist on Linux, so those
@@ -1632,13 +1633,13 @@ mod tests {
         assert!(!proc_self.is_file);
 
         let proc_self_task = find("/proc/self/task").expect(
-            "/proc/self/task must be granted read so the NVIDIA driver \
-             can list tasks; comm writes are approved by the supervisor fast-path",
+            "/proc/self/task must be granted read+write so the NVIDIA driver \
+             can write thread names to comm files (driver 570+)",
         );
         assert_eq!(
             proc_self_task.access,
-            AccessMode::Read,
-            "/proc/self/task must be read-only; comm writes handled by supervisor gpu_comm fast-path"
+            AccessMode::ReadWrite,
+            "/proc/self/task must be read+write so NVIDIA driver 570+ comm writes succeed"
         );
         assert!(!proc_self_task.is_file);
 

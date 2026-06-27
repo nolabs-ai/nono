@@ -211,8 +211,9 @@ pub struct SeccompPolicy {
     /// Intercept pathname AF_UNIX socket operations via seccomp-notify.
     /// Corresponds to the profile's `linux.af_unix_mediation = "pathname"`.
     pub af_unix_mediation: bool,
-    /// Auto-approve writes to `/proc/<tgid>/task/<tid>/comm` in the supervisor.
-    /// Required by NVIDIA driver 570+ which names threads by writing to this path.
+    /// Indicates NVIDIA GPU mode is active. The Landlock grant for
+    /// `/proc/self/task` is read+write in this mode so NVIDIA driver 570+
+    /// can write thread names to `comm` files without CUDA Error 304.
     /// Set when `--allow-gpu` is active on a system with NVIDIA devices.
     pub gpu_comm: bool,
 }

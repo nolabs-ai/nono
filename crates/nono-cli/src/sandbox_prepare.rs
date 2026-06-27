@@ -848,10 +848,10 @@ fn missing_cwd_prompt_must_fail(
 ///   unrelated kernel drivers.
 /// - `/proc/self` (read): CUDA init reads `/proc/self/maps`, `/proc/self/status`
 ///   and other per-process files.
-/// - `/proc/self/task` (read+write): NVIDIA driver 570+ writes to
+/// - `/proc/self/task` (read): NVIDIA driver 570+ writes to
 ///   `/proc/self/task/<tid>/comm` during thread startup to set thread names.
-///   Without write access this returns EACCES and the driver treats it as a
-///   fatal OS error, surfacing as CUDA Error 304 (`cudaErrorOperatingSystem`).
+///   Landlock grants read-only; writes are auto-approved by the seccomp-notify
+///   supervisor fast-path when `gpu_comm` is set, avoiding CUDA Error 304.
 ///   Narrowing write access to the `task` subtree keeps other per-process
 ///   procfs entries read-only.
 #[cfg(target_os = "linux")]
@@ -1095,8 +1095,8 @@ pub(crate) fn print_allow_gpu_warning(silent: bool) {
         eprintln!(
             "  This grants read/write access to /dev/dri/renderD* and NVIDIA compute devices.\n  \
              On NVIDIA systems, additionally: read access to /proc/driver/nvidia,\n  \
-             /proc/driver/nvidia-uvm, and /proc/self; read/write access to\n  \
-             /proc/self/task (for CUDA thread-name initialisation)."
+             /proc/driver/nvidia-uvm, and /proc/self; read access to\n  \
+             /proc/self/task (comm writes are approved by the sandbox supervisor)."
         );
     }
 }
@@ -1602,7 +1602,7 @@ mod tests {
     fn grant_nvidia_gpu_procfs_scopes_proc_self_reads_with_task_writes() {
         // Regression test for the NVIDIA-scoped procfs grants:
         //   /proc/self       Read        (CUDA init reads maps/status/etc.)
-        //   /proc/self/task  ReadWrite   (driver writes task/<tid>/comm)
+        //   /proc/self/task  Read        (driver comm writes approved by supervisor fast-path)
         // Plus any of /proc/driver/{nvidia,nvidia-uvm} that exist.
         //
         // /proc/self and /proc/self/task always exist on Linux, so those

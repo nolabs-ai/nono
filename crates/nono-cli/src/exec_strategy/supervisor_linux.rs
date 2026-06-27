@@ -291,21 +291,39 @@ pub(super) fn handle_seccomp_notification(
     // read-only, so these writes reach the supervisor. Auto-approve them when
     // gpu_comm is set (requires --allow-gpu on a system with NVIDIA devices).
     //
-    // Security: validate that the tgid in the path matches the child's own tgid
-    // to prevent a compromised agent from naming threads in other processes.
+    // Security: validate that the tgid in the path matches the notifying process's
+    // own tgid (already resolved above) to prevent a compromised agent from naming
+    // threads in other processes via the fast-path.
     if config.seccomp_policy.gpu_comm
         && access == AccessMode::Write
-        && is_proc_task_comm_for_tgid(&canonicalized, read_tgid(notif.pid))
+        && is_proc_task_comm_for_tgid(&canonicalized, notifying_tgid)
     {
-        if notif_id_valid(notify_fd, notif.id)?
-            && let Err(e) = continue_notif(notify_fd, notif.id)
-        {
-            debug!(
-                "continue_notif failed for gpu_comm path {}: {}",
-                canonicalized.display(),
-                e
-            );
-            let _ = deny_notif(notify_fd, notif.id);
+        // The supervisor opens the comm file on behalf of the sandboxed process
+        // (bypassing Landlock, which only grants read access to /proc/self/task)
+        // and injects the fd so the process gets a writable handle.
+        use std::os::unix::io::AsRawFd as _;
+        match std::fs::OpenOptions::new().write(true).open(&canonicalized) {
+            Ok(file) => {
+                if notif_id_valid(notify_fd, notif.id)?
+                    && let Err(e) = inject_fd(notify_fd, notif.id, file.as_raw_fd())
+                {
+                    debug!(
+                        "inject_fd failed for gpu_comm path {}: {}",
+                        canonicalized.display(),
+                        e
+                    );
+                    let _ = deny_notif(notify_fd, notif.id);
+                }
+            }
+            Err(e) => {
+                debug!(
+                    "Failed to open gpu_comm path {} for writing: {}",
+                    canonicalized.display(),
+                    e
+                );
+                let _ =
+                    respond_notif_errno(notify_fd, notif.id, e.raw_os_error().unwrap_or(libc::EIO));
+            }
         }
         return Ok(());
     }

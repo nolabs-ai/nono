@@ -300,6 +300,8 @@ mod tests {
             sandbox_policy: crate::profile::LinuxSandboxPolicy::Auto,
             allow_launch_services_active: false,
             allow_gpu_active: false,
+            #[cfg(target_os = "linux")]
+            allow_gpu_nvidia_active: false,
             open_url_origins: Vec::new(),
             open_url_allow_localhost: false,
             bypass_protection_paths: Vec::new(),
@@ -360,6 +362,8 @@ mod tests {
             sandbox_policy: crate::profile::LinuxSandboxPolicy::Auto,
             allow_launch_services_active: false,
             allow_gpu_active: false,
+            #[cfg(target_os = "linux")]
+            allow_gpu_nvidia_active: false,
             open_url_origins: Vec::new(),
             open_url_allow_localhost: false,
             bypass_protection_paths: Vec::new(),
@@ -668,8 +672,8 @@ mod tests {
         // Either outcome is correct. What must NOT happen is an error about
         // /dev/dri specifically, which would break NVIDIA/ROCm-only setups.
         match result {
-            Ok(enabled) => {
-                assert!(enabled, "should be active when devices are found");
+            Ok(activation) => {
+                assert!(activation.active, "should be active when devices are found");
                 assert!(
                     caps.has_fs(),
                     "should have granted fs capabilities for GPU devices"

@@ -216,6 +216,8 @@ pub(crate) struct ExecutionFlags {
     pub(crate) af_unix_mediation: crate::profile::LinuxAfUnixMediation,
     #[cfg(target_os = "linux")]
     pub(crate) sandbox_policy: crate::profile::LinuxSandboxPolicy,
+    #[cfg(target_os = "linux")]
+    pub(crate) allow_gpu_nvidia_active: bool,
     pub(crate) bypass_protection_paths: Vec<PathBuf>,
     pub(crate) ignored_denial_paths: Vec<PathBuf>,
     pub(crate) suppressed_system_service_operations: Vec<String>,
@@ -260,6 +262,8 @@ impl ExecutionFlags {
             af_unix_mediation: prepared.af_unix_mediation,
             #[cfg(target_os = "linux")]
             sandbox_policy: prepared.sandbox_policy,
+            #[cfg(target_os = "linux")]
+            allow_gpu_nvidia_active: prepared.allow_gpu_nvidia_active,
             bypass_protection_paths: prepared.bypass_protection_paths.clone(),
             ignored_denial_paths: prepared.ignored_denial_paths.clone(),
             suppressed_system_service_operations: prepared

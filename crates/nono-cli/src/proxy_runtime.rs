@@ -2665,6 +2665,8 @@ mod tests {
             sandbox_policy: crate::profile::LinuxSandboxPolicy::Auto,
             allow_launch_services_active: false,
             allow_gpu_active: false,
+            #[cfg(target_os = "linux")]
+            allow_gpu_nvidia_active: false,
             open_url_origins: Vec::new(),
             open_url_allow_localhost: false,
             bypass_protection_paths: Vec::new(),

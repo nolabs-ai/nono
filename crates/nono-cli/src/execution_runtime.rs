@@ -591,6 +591,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
             capability_elevation: flags.capability_elevation,
             proxy_fallback: seccomp_proxy_fallback,
             af_unix_mediation: flags.af_unix_mediation.is_pathname(),
+            gpu_comm: flags.allow_gpu_nvidia_active,
         },
         allowed_env_vars: flags.allowed_env_vars,
         denied_env_vars: flags.denied_env_vars,

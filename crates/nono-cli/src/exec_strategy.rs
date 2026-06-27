@@ -211,6 +211,10 @@ pub struct SeccompPolicy {
     /// Intercept pathname AF_UNIX socket operations via seccomp-notify.
     /// Corresponds to the profile's `linux.af_unix_mediation = "pathname"`.
     pub af_unix_mediation: bool,
+    /// Auto-approve writes to `/proc/<tgid>/task/<tid>/comm` in the supervisor.
+    /// Required by NVIDIA driver 570+ which names threads by writing to this path.
+    /// Set when `--allow-gpu` is active on a system with NVIDIA devices.
+    pub gpu_comm: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -4071,7 +4075,8 @@ mod tests {
             !SeccompPolicy {
                 capability_elevation: false,
                 proxy_fallback: false,
-                af_unix_mediation: false
+                af_unix_mediation: false,
+                gpu_comm: false
             }
             .child_requires_dumpable()
         );
@@ -4079,7 +4084,8 @@ mod tests {
             SeccompPolicy {
                 capability_elevation: true,
                 proxy_fallback: false,
-                af_unix_mediation: false
+                af_unix_mediation: false,
+                gpu_comm: false
             }
             .child_requires_dumpable()
         );
@@ -4087,7 +4093,8 @@ mod tests {
             SeccompPolicy {
                 capability_elevation: false,
                 proxy_fallback: true,
-                af_unix_mediation: false
+                af_unix_mediation: false,
+                gpu_comm: false
             }
             .child_requires_dumpable()
         );
@@ -4095,7 +4102,8 @@ mod tests {
             SeccompPolicy {
                 capability_elevation: true,
                 proxy_fallback: true,
-                af_unix_mediation: false
+                af_unix_mediation: false,
+                gpu_comm: false
             }
             .child_requires_dumpable()
         );
@@ -4625,6 +4633,7 @@ mod tests {
                 capability_elevation: false,
                 proxy_fallback: true,
                 af_unix_mediation: false,
+                gpu_comm: false,
             },
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             tool_sandbox_runtime: None,
@@ -4749,6 +4758,7 @@ mod tests {
                 capability_elevation: false,
                 proxy_fallback: true,
                 af_unix_mediation: false,
+                gpu_comm: false,
             },
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             tool_sandbox_runtime: None,
@@ -4839,6 +4849,7 @@ mod tests {
                 capability_elevation: false,
                 proxy_fallback: true,
                 af_unix_mediation: false,
+                gpu_comm: false,
             },
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             tool_sandbox_runtime: None,
@@ -4886,6 +4897,7 @@ mod tests {
                 capability_elevation: false,
                 proxy_fallback: true,
                 af_unix_mediation: false,
+                gpu_comm: false,
             },
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             tool_sandbox_runtime: None,
@@ -4931,6 +4943,7 @@ mod tests {
                 capability_elevation: false,
                 proxy_fallback: true,
                 af_unix_mediation: false,
+                gpu_comm: false,
             },
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             tool_sandbox_runtime: None,
@@ -4958,6 +4971,7 @@ mod tests {
                 capability_elevation: false,
                 proxy_fallback: true,
                 af_unix_mediation: false,
+                gpu_comm: false,
             },
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             tool_sandbox_runtime: None,
@@ -5008,6 +5022,7 @@ mod tests {
                 capability_elevation: false,
                 proxy_fallback: true,
                 af_unix_mediation: false,
+                gpu_comm: false,
             },
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             tool_sandbox_runtime: None,
@@ -5163,6 +5178,7 @@ mod tests {
                 capability_elevation: false,
                 proxy_fallback: true,
                 af_unix_mediation: false,
+                gpu_comm: false,
             },
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             tool_sandbox_runtime: None,
@@ -5218,6 +5234,7 @@ mod tests {
                 capability_elevation: false,
                 proxy_fallback: true,
                 af_unix_mediation: false,
+                gpu_comm: false,
             },
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             tool_sandbox_runtime: None,
@@ -5262,6 +5279,7 @@ mod tests {
                 capability_elevation: false,
                 proxy_fallback: true,
                 af_unix_mediation: false,
+                gpu_comm: false,
             },
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             tool_sandbox_runtime: None,
@@ -5325,6 +5343,7 @@ mod tests {
                 capability_elevation: false,
                 proxy_fallback: true,
                 af_unix_mediation: false,
+                gpu_comm: false,
             },
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             tool_sandbox_runtime: None,

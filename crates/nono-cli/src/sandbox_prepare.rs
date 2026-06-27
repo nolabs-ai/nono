@@ -440,6 +440,11 @@ pub(crate) struct PreparedSandbox {
     pub(crate) sandbox_policy: crate::profile::LinuxSandboxPolicy,
     pub(crate) allow_launch_services_active: bool,
     pub(crate) allow_gpu_active: bool,
+    /// True when GPU is active AND NVIDIA devices are present. The NVIDIA
+    /// driver 570+ writes thread names to /proc/<tgid>/task/<tid>/comm via
+    /// openat, which requires a supervisor fast-path approval.
+    #[cfg(target_os = "linux")]
+    pub(crate) allow_gpu_nvidia_active: bool,
     pub(crate) open_url_origins: Vec<String>,
     pub(crate) open_url_allow_localhost: bool,
     pub(crate) bypass_protection_paths: Vec<PathBuf>,
@@ -867,9 +872,12 @@ fn grant_nvidia_gpu_procfs(caps: &mut CapabilitySet) -> Result<()> {
         std::path::Path::new("/proc/self"),
         AccessMode::Read,
     )?);
+    // Read-only: writes to /proc/<tgid>/task/<tid>/comm are approved by the
+    // supervisor fast-path when gpu_comm is set (NVIDIA driver 570+). Keeping
+    // Landlock read-only here narrows the attack surface.
     caps.add_fs(FsCapability::new_dir(
         std::path::Path::new("/proc/self/task"),
-        AccessMode::ReadWrite,
+        AccessMode::Read,
     )?);
 
     Ok(())
@@ -898,14 +906,27 @@ fn is_nvidia_compute_device(name: &str) -> bool {
     false
 }
 
+/// Return value of `maybe_enable_gpu`.
+#[cfg(target_os = "linux")]
+pub(crate) struct GpuActivation {
+    /// GPU access was granted.
+    pub active: bool,
+    /// At least one NVIDIA device node was granted. When true the supervisor
+    /// must approve writes to `/proc/<tgid>/task/<tid>/comm` (driver 570+).
+    pub nvidia: bool,
+}
+
 #[cfg(target_os = "linux")]
 pub(crate) fn maybe_enable_gpu(
     caps: &mut CapabilitySet,
     cli_requested: bool,
     profile_allowed: bool,
-) -> Result<bool> {
+) -> Result<GpuActivation> {
     if !cli_requested {
-        return Ok(false);
+        return Ok(GpuActivation {
+            active: false,
+            nvidia: false,
+        });
     }
 
     if !profile_allowed {
@@ -1042,7 +1063,10 @@ pub(crate) fn maybe_enable_gpu(
         "--allow-gpu enabled: allowing {} GPU device(s) on Linux",
         gpu_device_count
     );
-    Ok(true)
+    Ok(GpuActivation {
+        active: true,
+        nvidia: have_nvidia,
+    })
 }
 
 pub(crate) fn print_allow_gpu_warning(silent: bool) {
@@ -1176,6 +1200,8 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
                 sandbox_policy: crate::profile::LinuxSandboxPolicy::default(),
                 allow_launch_services_active: false,
                 allow_gpu_active: false,
+                #[cfg(target_os = "linux")]
+                allow_gpu_nvidia_active: false,
                 open_url_origins: Vec::new(),
                 open_url_allow_localhost: false,
                 bypass_protection_paths: Vec::new(),
@@ -1365,11 +1391,15 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         loaded_profile.is_none() || profile_allow_gpu,
     )?;
     #[cfg(target_os = "linux")]
-    let allow_gpu_active = maybe_enable_gpu(
+    let gpu_activation = maybe_enable_gpu(
         &mut caps,
         args.allow_gpu,
         loaded_profile.is_none() || profile_allow_gpu,
     )?;
+    #[cfg(target_os = "linux")]
+    let allow_gpu_active = gpu_activation.active;
+    #[cfg(target_os = "linux")]
+    let allow_gpu_nvidia_active = gpu_activation.nvidia;
 
     if let Some(request) =
         pending_cwd_access_request(&caps, &workdir, profile_workdir_access.as_ref())?
@@ -1523,6 +1553,8 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
             sandbox_policy,
             allow_launch_services_active,
             allow_gpu_active,
+            #[cfg(target_os = "linux")]
+            allow_gpu_nvidia_active,
             open_url_origins,
             open_url_allow_localhost,
             bypass_protection_paths,
@@ -1600,13 +1632,13 @@ mod tests {
         assert!(!proc_self.is_file);
 
         let proc_self_task = find("/proc/self/task").expect(
-            "/proc/self/task must be granted read+write so the NVIDIA driver \
-             can write task/<tid>/comm (CUDA Error 304 root cause)",
+            "/proc/self/task must be granted read so the NVIDIA driver \
+             can list tasks; comm writes are approved by the supervisor fast-path",
         );
         assert_eq!(
             proc_self_task.access,
-            AccessMode::ReadWrite,
-            "/proc/self/task must be granted read+write"
+            AccessMode::Read,
+            "/proc/self/task must be read-only; comm writes handled by supervisor gpu_comm fast-path"
         );
         assert!(!proc_self_task.is_file);
 
@@ -2003,6 +2035,8 @@ mod tests {
             sandbox_policy: profile::LinuxSandboxPolicy::default(),
             allow_launch_services_active: false,
             allow_gpu_active: false,
+            #[cfg(target_os = "linux")]
+            allow_gpu_nvidia_active: false,
             open_url_origins: Vec::new(),
             open_url_allow_localhost: false,
             bypass_protection_paths: Vec::new(),

@@ -1791,8 +1791,9 @@ pub enum LinuxSandboxPolicy {
     /// Landlock only. Returns an error at startup if the kernel cannot
     /// satisfy network restrictions via Landlock alone.
     Landlock,
-    /// Enforcement is managed externally (iptables, cgroups, systemd, etc.).
-    /// nono installs no Landlock or seccomp rules.
+    /// TCP network egress enforcement is managed externally (iptables,
+    /// cgroups, systemd, etc.). nono still installs filesystem/process
+    /// sandboxing and skips only its own TCP network lockdown.
     External,
 }
 

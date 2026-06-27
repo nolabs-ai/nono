@@ -211,18 +211,16 @@ pub struct SeccompPolicy {
     /// Intercept pathname AF_UNIX socket operations via seccomp-notify.
     /// Corresponds to the profile's `linux.af_unix_mediation = "pathname"`.
     pub af_unix_mediation: bool,
-    /// Indicates NVIDIA GPU mode is active. The Landlock grant for
-    /// `/proc/self/task` is read+write in this mode so NVIDIA driver 570+
-    /// can write thread names to `comm` files without CUDA Error 304.
-    /// Set when `--allow-gpu` is active on a system with NVIDIA devices.
-    pub gpu_comm: bool,
+    /// Intercept openat/openat2 so the supervisor can inject a writable fd for
+    /// NVIDIA driver thread-name writes to `/proc/<tgid>/task/<tid>/comm`.
+    pub proc_comm_notify: bool,
 }
 
 #[cfg(target_os = "linux")]
 impl SeccompPolicy {
     /// Whether to install and receive an openat seccomp-notify fd.
     pub fn needs_openat_notify(self) -> bool {
-        self.capability_elevation
+        self.capability_elevation || self.proc_comm_notify
     }
 
     /// Whether to install and receive a connect/bind seccomp-notify fd.
@@ -278,6 +276,9 @@ pub struct ExecConfig<'a> {
     /// installed in the child and how the supervisor handles their events.
     #[cfg(target_os = "linux")]
     pub seccomp_policy: SeccompPolicy,
+    /// Linux network enforcement backend for this session.
+    #[cfg(target_os = "linux")]
+    pub sandbox_policy: crate::profile::LinuxSandboxPolicy,
     /// Allow-list of environment variable names. When set, only variables
     /// matching an exact name or prefix pattern (e.g. `"AWS_*"`) are
     /// passed to the child. Nono-injected credentials always bypass this.
@@ -944,7 +945,18 @@ pub fn execute_supervised(
                     }
                 }
 
-                match Sandbox::apply_auto(effective_caps) {
+                let sandbox_result = match config.sandbox_policy {
+                    crate::profile::LinuxSandboxPolicy::Auto => Sandbox::apply_auto(effective_caps),
+                    crate::profile::LinuxSandboxPolicy::Landlock => {
+                        Sandbox::apply_landlock(effective_caps)
+                            .map(|_| nono::sandbox::SeccompNetFallback::None)
+                    }
+                    crate::profile::LinuxSandboxPolicy::External => {
+                        Sandbox::apply_external_network(effective_caps)
+                    }
+                };
+
+                match sandbox_result {
                     Ok(_fallback) => {}
                     Err(e) => {
                         let detail =
@@ -4077,7 +4089,7 @@ mod tests {
                 capability_elevation: false,
                 proxy_fallback: false,
                 af_unix_mediation: false,
-                gpu_comm: false
+                proc_comm_notify: false,
             }
             .child_requires_dumpable()
         );
@@ -4086,7 +4098,7 @@ mod tests {
                 capability_elevation: true,
                 proxy_fallback: false,
                 af_unix_mediation: false,
-                gpu_comm: false
+                proc_comm_notify: false,
             }
             .child_requires_dumpable()
         );
@@ -4095,7 +4107,7 @@ mod tests {
                 capability_elevation: false,
                 proxy_fallback: true,
                 af_unix_mediation: false,
-                gpu_comm: false
+                proc_comm_notify: false,
             }
             .child_requires_dumpable()
         );
@@ -4104,7 +4116,16 @@ mod tests {
                 capability_elevation: true,
                 proxy_fallback: true,
                 af_unix_mediation: false,
-                gpu_comm: false
+                proc_comm_notify: false,
+            }
+            .child_requires_dumpable()
+        );
+        assert!(
+            SeccompPolicy {
+                capability_elevation: false,
+                proxy_fallback: false,
+                af_unix_mediation: false,
+                proc_comm_notify: true,
             }
             .child_requires_dumpable()
         );
@@ -4634,7 +4655,7 @@ mod tests {
                 capability_elevation: false,
                 proxy_fallback: true,
                 af_unix_mediation: false,
-                gpu_comm: false,
+                proc_comm_notify: false,
             },
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             tool_sandbox_runtime: None,
@@ -4759,7 +4780,7 @@ mod tests {
                 capability_elevation: false,
                 proxy_fallback: true,
                 af_unix_mediation: false,
-                gpu_comm: false,
+                proc_comm_notify: false,
             },
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             tool_sandbox_runtime: None,
@@ -4850,7 +4871,7 @@ mod tests {
                 capability_elevation: false,
                 proxy_fallback: true,
                 af_unix_mediation: false,
-                gpu_comm: false,
+                proc_comm_notify: false,
             },
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             tool_sandbox_runtime: None,
@@ -4898,7 +4919,7 @@ mod tests {
                 capability_elevation: false,
                 proxy_fallback: true,
                 af_unix_mediation: false,
-                gpu_comm: false,
+                proc_comm_notify: false,
             },
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             tool_sandbox_runtime: None,
@@ -4944,7 +4965,7 @@ mod tests {
                 capability_elevation: false,
                 proxy_fallback: true,
                 af_unix_mediation: false,
-                gpu_comm: false,
+                proc_comm_notify: false,
             },
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             tool_sandbox_runtime: None,
@@ -4972,7 +4993,7 @@ mod tests {
                 capability_elevation: false,
                 proxy_fallback: true,
                 af_unix_mediation: false,
-                gpu_comm: false,
+                proc_comm_notify: false,
             },
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             tool_sandbox_runtime: None,
@@ -5023,7 +5044,7 @@ mod tests {
                 capability_elevation: false,
                 proxy_fallback: true,
                 af_unix_mediation: false,
-                gpu_comm: false,
+                proc_comm_notify: false,
             },
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             tool_sandbox_runtime: None,
@@ -5179,7 +5200,7 @@ mod tests {
                 capability_elevation: false,
                 proxy_fallback: true,
                 af_unix_mediation: false,
-                gpu_comm: false,
+                proc_comm_notify: false,
             },
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             tool_sandbox_runtime: None,
@@ -5235,7 +5256,7 @@ mod tests {
                 capability_elevation: false,
                 proxy_fallback: true,
                 af_unix_mediation: false,
-                gpu_comm: false,
+                proc_comm_notify: false,
             },
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             tool_sandbox_runtime: None,
@@ -5280,7 +5301,7 @@ mod tests {
                 capability_elevation: false,
                 proxy_fallback: true,
                 af_unix_mediation: false,
-                gpu_comm: false,
+                proc_comm_notify: false,
             },
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             tool_sandbox_runtime: None,
@@ -5344,7 +5365,7 @@ mod tests {
                 capability_elevation: false,
                 proxy_fallback: true,
                 af_unix_mediation: false,
-                gpu_comm: false,
+                proc_comm_notify: false,
             },
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             tool_sandbox_runtime: None,

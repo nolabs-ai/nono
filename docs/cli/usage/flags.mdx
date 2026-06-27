@@ -1160,24 +1160,24 @@ Profiles can set this via `capability_elevation` in their security config. The C
 |-------|-----------|
 | `auto` | Landlock LSM with automatic seccomp fallback when the kernel ABI lacks network support (< v4). **Default.** Preserves existing behaviour. |
 | `landlock` | Landlock only. Returns an error at startup if the running kernel cannot satisfy network restrictions via Landlock alone — no silent seccomp fallback. |
-| `external` | No-op. nono installs no Landlock or seccomp rules. Use when enforcement is managed at the infrastructure level (iptables, cgroups, systemd units, container runtime policy). |
+| `external` | Delegate TCP network lockdown to the deployment. nono still installs filesystem/process sandboxing, but skips its own localhost/proxy-port network enforcement. Use only when infrastructure such as iptables, cgroups, systemd units, or container policy forces egress through the proxy. |
 
 ```bash
 # Require Landlock-only enforcement; fail if the kernel can't satisfy it
 nono run --sandbox-policy landlock --allow-cwd -- my-agent
 
-# Declare that enforcement is external; nono skips sandbox installation
+# Declare that network enforcement is external; nono still applies FS/process sandboxing
 nono run --sandbox-policy external --allow-cwd -- my-agent
 ```
 
-The policy can also be set in a profile under `linux.sandbox_policy`. The CLI flag overrides the profile value. On macOS and other non-Linux platforms this flag is not available.
+The policy can also be set in a profile under `linux.sandbox_policy`. The CLI flag overrides the profile value. This setting is supported only by `nono run`; `nono shell` and `nono wrap` reject profiles that contain `linux.sandbox_policy`. On macOS and other non-Linux platforms this flag is not available.
 
 <Note>
   `--sandbox-policy landlock` is useful for compliance contexts where you need a hard guarantee that seccomp BPF is not installed, or where you want to verify that the target kernel's Landlock ABI is sufficient before deploying to production.
 </Note>
 
 <Warning>
-  `--sandbox-policy external` provides no kernel-level enforcement on its own. Only use it when you have independently verified that the surrounding infrastructure enforces the required policy.
+  `--sandbox-policy external` provides no nono-managed TCP egress lockdown. Only use it when you have independently verified that the surrounding infrastructure forces outbound traffic through the intended proxy.
 </Warning>
 
 ### Operational Flags

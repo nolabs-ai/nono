@@ -438,13 +438,14 @@ pub(crate) struct PreparedSandbox {
     pub(crate) af_unix_mediation: crate::profile::LinuxAfUnixMediation,
     #[cfg(target_os = "linux")]
     pub(crate) sandbox_policy: crate::profile::LinuxSandboxPolicy,
+    #[cfg(target_os = "linux")]
+    pub(crate) explicit_sandbox_policy: Option<crate::profile::LinuxSandboxPolicy>,
     pub(crate) allow_launch_services_active: bool,
     pub(crate) allow_gpu_active: bool,
-    /// True when GPU is active AND NVIDIA devices are present. The NVIDIA
-    /// driver 570+ writes thread names to /proc/<tgid>/task/<tid>/comm via
-    /// openat, which requires a supervisor fast-path approval.
+    /// True when NVIDIA GPU support needs supervisor-mediated writes to
+    /// `/proc/<tgid>/task/<tid>/comm` for driver thread naming.
     #[cfg(target_os = "linux")]
-    pub(crate) allow_gpu_nvidia_active: bool,
+    pub(crate) proc_comm_notify: bool,
     pub(crate) open_url_origins: Vec<String>,
     pub(crate) open_url_allow_localhost: bool,
     pub(crate) bypass_protection_paths: Vec<PathBuf>,
@@ -848,12 +849,10 @@ fn missing_cwd_prompt_must_fail(
 ///   unrelated kernel drivers.
 /// - `/proc/self` (read): CUDA init reads `/proc/self/maps`, `/proc/self/status`
 ///   and other per-process files.
-/// - `/proc/self/task` (read+write): NVIDIA driver 570+ writes to
-///   `/proc/self/task/<tid>/comm` during thread startup to set thread names.
-///   Read+write is granted so those writes succeed through the seccomp-notify
-///   supervisor's `continue_notif` path, avoiding CUDA Error 304. The grant is
-///   scoped narrowly to the `task` subtree; other per-process procfs entries
-///   remain read-only.
+/// - `/proc/self/task` (read): NVIDIA driver 570+ enumerates task entries and
+///   writes to `/proc/self/task/<tid>/comm` during thread startup to set thread
+///   names. The write is handled by the seccomp-notify supervisor's
+///   `proc_comm_notify` fast-path so the broader task subtree stays read-only.
 #[cfg(target_os = "linux")]
 fn grant_nvidia_gpu_procfs(caps: &mut CapabilitySet) -> Result<()> {
     for name in ["nvidia", "nvidia-uvm"] {
@@ -872,15 +871,12 @@ fn grant_nvidia_gpu_procfs(caps: &mut CapabilitySet) -> Result<()> {
         std::path::Path::new("/proc/self"),
         AccessMode::Read,
     )?);
-    // Read+write: NVIDIA driver 570+ writes thread names to
-    // /proc/<tgid>/task/<tid>/comm. The supervisor's continue_notif path
-    // resumes the openat through Landlock, which allows it here.
+    // Read-only: NVIDIA driver 570+ comm writes are mediated by the
+    // supervisor's proc_comm_notify path.
     caps.add_fs(FsCapability::new_dir(
         std::path::Path::new("/proc/self/task"),
-        AccessMode::ReadWrite,
+        AccessMode::Read,
     )?);
-
-
     Ok(())
 }
 
@@ -907,14 +903,10 @@ fn is_nvidia_compute_device(name: &str) -> bool {
     false
 }
 
-/// Return value of `maybe_enable_gpu`.
 #[cfg(target_os = "linux")]
 pub(crate) struct GpuActivation {
-    /// GPU access was granted.
-    pub active: bool,
-    /// At least one NVIDIA device node was granted. When true the supervisor
-    /// must approve writes to `/proc/<tgid>/task/<tid>/comm` (driver 570+).
-    pub nvidia: bool,
+    pub(crate) active: bool,
+    pub(crate) proc_comm_notify: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -926,7 +918,7 @@ pub(crate) fn maybe_enable_gpu(
     if !cli_requested {
         return Ok(GpuActivation {
             active: false,
-            nvidia: false,
+            proc_comm_notify: false,
         });
     }
 
@@ -1066,7 +1058,7 @@ pub(crate) fn maybe_enable_gpu(
     );
     Ok(GpuActivation {
         active: true,
-        nvidia: have_nvidia,
+        proc_comm_notify: have_nvidia,
     })
 }
 
@@ -1096,8 +1088,8 @@ pub(crate) fn print_allow_gpu_warning(silent: bool) {
         eprintln!(
             "  This grants read/write access to /dev/dri/renderD* and NVIDIA compute devices.\n  \
              On NVIDIA systems, additionally: read access to /proc/driver/nvidia,\n  \
-             /proc/driver/nvidia-uvm, and /proc/self; read+write access to\n  \
-             /proc/self/task (required for NVIDIA driver 570+ thread naming)."
+             /proc/driver/nvidia-uvm, /proc/self, and /proc/self/task; writes to\n  \
+             /proc/<pid>/task/<tid>/comm are mediated by the sandbox supervisor."
         );
     }
 }
@@ -1199,10 +1191,12 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
                 af_unix_mediation: crate::profile::LinuxAfUnixMediation::default(),
                 #[cfg(target_os = "linux")]
                 sandbox_policy: crate::profile::LinuxSandboxPolicy::default(),
+                #[cfg(target_os = "linux")]
+                explicit_sandbox_policy: None,
                 allow_launch_services_active: false,
                 allow_gpu_active: false,
                 #[cfg(target_os = "linux")]
-                allow_gpu_nvidia_active: false,
+                proc_comm_notify: false,
                 open_url_origins: Vec::new(),
                 open_url_allow_localhost: false,
                 bypass_protection_paths: Vec::new(),
@@ -1231,6 +1225,8 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         af_unix_mediation,
         #[cfg(target_os = "linux")]
         sandbox_policy,
+        #[cfg(target_os = "linux")]
+        explicit_sandbox_policy,
         workdir_access: profile_workdir_access,
         rollback_exclude_patterns: profile_rollback_patterns,
         rollback_exclude_globs: profile_rollback_globs,
@@ -1382,6 +1378,8 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
     // CLI --sandbox-policy overrides the profile value; both default to Auto.
     #[cfg(target_os = "linux")]
     let sandbox_policy = args.sandbox_policy.unwrap_or(sandbox_policy);
+    #[cfg(target_os = "linux")]
+    let explicit_sandbox_policy = args.sandbox_policy.or(explicit_sandbox_policy);
 
     // GPU access: macOS uses IOKit platform rules (tightened to AGXDeviceUserClient only),
     // Linux uses filesystem capabilities for render nodes and compute devices.
@@ -1400,7 +1398,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
     #[cfg(target_os = "linux")]
     let allow_gpu_active = gpu_activation.active;
     #[cfg(target_os = "linux")]
-    let allow_gpu_nvidia_active = gpu_activation.nvidia;
+    let proc_comm_notify = gpu_activation.proc_comm_notify;
 
     if let Some(request) =
         pending_cwd_access_request(&caps, &workdir, profile_workdir_access.as_ref())?
@@ -1552,10 +1550,12 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
             af_unix_mediation,
             #[cfg(target_os = "linux")]
             sandbox_policy,
+            #[cfg(target_os = "linux")]
+            explicit_sandbox_policy,
             allow_launch_services_active,
             allow_gpu_active,
             #[cfg(target_os = "linux")]
-            allow_gpu_nvidia_active,
+            proc_comm_notify,
             open_url_origins,
             open_url_allow_localhost,
             bypass_protection_paths,
@@ -1600,10 +1600,10 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn grant_nvidia_gpu_procfs_scopes_proc_self_reads_with_task_writes() {
+    fn grant_nvidia_gpu_procfs_keeps_proc_self_task_read_only() {
         // Regression test for the NVIDIA-scoped procfs grants:
         //   /proc/self       Read        (CUDA init reads maps/status/etc.)
-        //   /proc/self/task  ReadWrite   (NVIDIA driver 570+ writes thread names via comm)
+        //   /proc/self/task  Read        (driver comm writes go via proc_comm_notify)
         // Plus any of /proc/driver/{nvidia,nvidia-uvm} that exist.
         //
         // /proc/self and /proc/self/task always exist on Linux, so those
@@ -1628,18 +1628,16 @@ mod tests {
         assert_eq!(
             proc_self.access,
             AccessMode::Read,
-            "/proc/self must be read-only (writes are scoped to /proc/self/task)"
+            "/proc/self must be read-only"
         );
         assert!(!proc_self.is_file);
 
-        let proc_self_task = find("/proc/self/task").expect(
-            "/proc/self/task must be granted read+write so the NVIDIA driver \
-             can write thread names to comm files (driver 570+)",
-        );
+        let proc_self_task = find("/proc/self/task")
+            .expect("/proc/self/task must be granted read so the NVIDIA driver can list tasks");
         assert_eq!(
             proc_self_task.access,
-            AccessMode::ReadWrite,
-            "/proc/self/task must be read+write so NVIDIA driver 570+ comm writes succeed"
+            AccessMode::Read,
+            "/proc/self/task must stay read-only; comm writes are supervisor mediated"
         );
         assert!(!proc_self_task.is_file);
 
@@ -2034,10 +2032,12 @@ mod tests {
             af_unix_mediation: profile::LinuxAfUnixMediation::default(),
             #[cfg(target_os = "linux")]
             sandbox_policy: profile::LinuxSandboxPolicy::default(),
+            #[cfg(target_os = "linux")]
+            explicit_sandbox_policy: None,
             allow_launch_services_active: false,
             allow_gpu_active: false,
             #[cfg(target_os = "linux")]
-            allow_gpu_nvidia_active: false,
+            proc_comm_notify: false,
             open_url_origins: Vec::new(),
             open_url_allow_localhost: false,
             bypass_protection_paths: Vec::new(),

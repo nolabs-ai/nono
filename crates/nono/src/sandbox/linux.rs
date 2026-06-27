@@ -507,15 +507,24 @@ fn requested_scopes(caps: &CapabilitySet, abi: &DetectedAbi) -> Result<BitFlags<
     Ok(scopes)
 }
 
-/// Declare that sandboxing is managed externally (e.g. iptables, cgroups, systemd).
+/// Apply sandboxing while delegating TCP network enforcement to external infrastructure.
 ///
-/// This is an explicit opt-out: the caller asserts that enforcement is handled
-/// at the infrastructure level and nono should not install Landlock or seccomp.
-/// Using this incorrectly provides no sandboxing — the call is intentionally
-/// visible in code review.
-pub fn apply_external() -> Result<()> {
-    info!("Sandbox policy: external — no Landlock or seccomp installed by nono");
-    Ok(())
+/// This still installs the normal Landlock filesystem rules and process/IPC
+/// scopes. Only nono's own TCP network lockdown is skipped; the caller asserts
+/// that egress is constrained externally (for example by cgroups, systemd,
+/// container policy, or iptables) to the intended proxy endpoint.
+pub fn apply_external_network(caps: &CapabilitySet) -> Result<SeccompNetFallback> {
+    let detected = detect_abi()?;
+    apply_external_network_with_abi(caps, &detected)
+}
+
+/// Apply sandboxing with externally delegated TCP network enforcement and a
+/// pre-detected ABI.
+pub fn apply_external_network_with_abi(
+    caps: &CapabilitySet,
+    abi: &DetectedAbi,
+) -> Result<SeccompNetFallback> {
+    apply_with_abi_inner(caps, abi, true, false)
 }
 
 /// Apply Landlock-only sandboxing with the given capabilities, auto-detecting ABI.
@@ -532,7 +541,7 @@ pub fn apply_landlock(caps: &CapabilitySet) -> Result<()> {
 ///
 /// Same contract as `apply_landlock` but avoids re-probing the kernel ABI.
 pub fn apply_landlock_with_abi(caps: &CapabilitySet, abi: &DetectedAbi) -> Result<()> {
-    apply_with_abi_inner(caps, abi, false).map(|_| ())
+    apply_with_abi_inner(caps, abi, false, true).map(|_| ())
 }
 
 /// Apply sandboxing with automatic Landlock → seccomp fallback, auto-detecting ABI.
@@ -548,23 +557,28 @@ pub fn apply_auto(caps: &CapabilitySet) -> Result<SeccompNetFallback> {
 
 /// Apply sandboxing with automatic fallback and a pre-detected ABI.
 pub fn apply_auto_with_abi(caps: &CapabilitySet, abi: &DetectedAbi) -> Result<SeccompNetFallback> {
-    apply_with_abi_inner(caps, abi, true)
+    apply_with_abi_inner(caps, abi, true, true)
 }
 
 /// Internal implementation shared by all public `apply_*` entry points.
 ///
 /// `allow_seccomp_fallback`: when `false`, returns an error if Landlock cannot
 /// satisfy network restrictions rather than silently installing seccomp.
+/// `handle_tcp_network`: when `false`, skips only nono-managed TCP network
+/// lockdown while preserving filesystem rules and Landlock scopes.
 fn apply_with_abi_inner(
     caps: &CapabilitySet,
     abi: &DetectedAbi,
     allow_seccomp_fallback: bool,
+    handle_tcp_network: bool,
 ) -> Result<SeccompNetFallback> {
     let target_abi = abi.abi;
     info!("Using Landlock ABI {:?}", target_abi);
     let scopes = requested_scopes(caps, abi)?;
 
-    if !matches!(caps.network_mode(), NetworkMode::AllowAll) && caps.localhost_ports().contains(&0)
+    if handle_tcp_network
+        && !matches!(caps.network_mode(), NetworkMode::AllowAll)
+        && caps.localhost_ports().contains(&0)
     {
         return Err(NonoError::SandboxInit(
             "open_port 0 (localhost TCP wildcard) is macOS-only; on Linux use explicit ports or a network profile."
@@ -588,16 +602,19 @@ fn apply_with_abi_inner(
         .set_compatibility(CompatLevel::BestEffort);
 
     // Determine if we need network handling (any mode besides AllowAll)
-    let needs_network_handling = !matches!(caps.network_mode(), NetworkMode::AllowAll)
-        || !caps.tcp_connect_ports().is_empty()
-        || !caps.tcp_bind_ports().is_empty();
+    let needs_network_handling = handle_tcp_network
+        && (!matches!(caps.network_mode(), NetworkMode::AllowAll)
+            || !caps.tcp_connect_ports().is_empty()
+            || !caps.tcp_bind_ports().is_empty());
 
     let mut seccomp_net_fallback = SeccompNetFallback::None;
+    let mut landlock_network_active = false;
 
     let ruleset_builder = if needs_network_handling {
         let handled_net = AccessNet::from_all(target_abi);
         if !handled_net.is_empty() {
             debug!("Handling network access: {:?}", handled_net);
+            landlock_network_active = true;
             ruleset_builder
                 .set_compatibility(CompatLevel::HardRequirement)
                 .handle_access(handled_net)
@@ -650,6 +667,11 @@ fn apply_with_abi_inner(
             )));
         }
     } else {
+        if !handle_tcp_network {
+            info!(
+                "TCP network enforcement delegated externally; applying filesystem and process sandbox only"
+            );
+        }
         ruleset_builder
     };
 
@@ -688,7 +710,7 @@ fn apply_with_abi_inner(
     // Add Landlock network port rules ONLY when Landlock is handling networking.
     // When a seccomp fallback is active (BlockAll or ProxyOnly), the ruleset was
     // created without handle_access(AccessNet), so adding NetPort rules would fail.
-    if matches!(seccomp_net_fallback, SeccompNetFallback::None) {
+    if landlock_network_active {
         // Add per-port TCP connect rules (ProxyOnly port + explicit tcp_connect_ports)
         if let NetworkMode::ProxyOnly { port, bind_ports } = caps.network_mode() {
             debug!("Adding ProxyOnly TCP connect rule for port {}", port);

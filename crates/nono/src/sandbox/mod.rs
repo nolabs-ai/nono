@@ -126,13 +126,23 @@ impl Sandbox {
         linux::apply_landlock_with_abi(caps, abi)
     }
 
-    /// Declare that sandboxing is managed externally (Linux).
+    /// Apply sandboxing while delegating TCP network enforcement externally (Linux).
     ///
-    /// No-op: nono installs no Landlock or seccomp rules. The caller asserts
-    /// that enforcement is handled at the infrastructure level.
+    /// Installs normal filesystem/process sandboxing. Only nono-managed TCP
+    /// network lockdown is skipped.
     #[cfg(target_os = "linux")]
-    pub fn apply_external() -> Result<()> {
-        linux::apply_external()
+    pub fn apply_external_network(caps: &CapabilitySet) -> Result<linux::SeccompNetFallback> {
+        linux::apply_external_network(caps)
+    }
+
+    /// Apply sandboxing with externally delegated TCP network enforcement and
+    /// a pre-detected ABI (Linux).
+    #[cfg(target_os = "linux")]
+    pub fn apply_external_network_with_abi(
+        caps: &CapabilitySet,
+        abi: &DetectedAbi,
+    ) -> Result<linux::SeccompNetFallback> {
+        linux::apply_external_network_with_abi(caps, abi)
     }
 
     /// Apply the sandbox with the given capabilities (macOS).

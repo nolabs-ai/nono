@@ -99,6 +99,29 @@ fn read_tgid(tid: u32) -> u32 {
         .unwrap_or(tid)
 }
 
+/// Returns true when `path` matches `/proc/<tgid>/task/<tid>/comm` and the
+/// tgid component equals `expected_tgid`.
+fn is_proc_task_comm_for_tgid(path: &std::path::Path, expected_tgid: u32) -> bool {
+    let mut it = path.components();
+    let parse_u32 = |c: Option<std::path::Component<'_>>| -> Option<u32> {
+        if let Some(std::path::Component::Normal(s)) = c {
+            s.to_str()
+                .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+                .and_then(|s| s.parse().ok())
+        } else {
+            None
+        }
+    };
+
+    matches!(it.next(), Some(std::path::Component::RootDir))
+        && matches!(it.next(), Some(std::path::Component::Normal(s)) if s == "proc")
+        && parse_u32(it.next()) == Some(expected_tgid)
+        && matches!(it.next(), Some(std::path::Component::Normal(s)) if s == "task")
+        && parse_u32(it.next()).is_some()
+        && matches!(it.next(), Some(std::path::Component::Normal(s)) if s == "comm")
+        && it.next().is_none()
+}
+
 /// Handle a seccomp notification on Linux.
 ///
 /// Flow:
@@ -286,6 +309,40 @@ pub(super) fn handle_seccomp_notification(
         return Ok(());
     }
 
+    // NVIDIA driver 570+ writes thread names through
+    // /proc/<tgid>/task/<tid>/comm. Landlock keeps /proc/self/task read-only;
+    // when proc_comm_notify is active, the supervisor opens this one validated
+    // procfs target and injects the writable fd.
+    if config.seccomp_policy.proc_comm_notify
+        && access == AccessMode::Write
+        && is_proc_task_comm_for_tgid(&canonicalized, notifying_tgid)
+    {
+        match std::fs::OpenOptions::new().write(true).open(&canonicalized) {
+            Ok(file) => {
+                if notif_id_valid(notify_fd, notif.id)?
+                    && let Err(e) = inject_fd(notify_fd, notif.id, file.as_raw_fd())
+                {
+                    debug!(
+                        "inject_fd failed for proc comm path {}: {}",
+                        canonicalized.display(),
+                        e
+                    );
+                    let _ = deny_notif(notify_fd, notif.id);
+                }
+            }
+            Err(e) => {
+                debug!(
+                    "Failed to open proc comm path {} for writing: {}",
+                    canonicalized.display(),
+                    e
+                );
+                let _ =
+                    respond_notif_errno(notify_fd, notif.id, e.raw_os_error().unwrap_or(libc::EIO));
+            }
+        }
+        return Ok(());
+    }
+
     // Fast-path: if the path is covered by the initial capability set and
     // the requested access mode is already granted, proceed immediately. If the
     // path matches but only with narrower access, record the denial here so the
@@ -390,6 +447,23 @@ pub(super) fn handle_seccomp_notification(
             return Ok(());
         }
         Err(_) => {}
+    }
+
+    if !config.seccomp_policy.capability_elevation {
+        debug!(
+            "Seccomp: path {} denied because runtime capability elevation is disabled",
+            canonicalized.display()
+        );
+        record_denial(
+            denials,
+            DenialRecord {
+                path: canonicalized.clone(),
+                access,
+                reason: DenialReason::PolicyBlocked,
+            },
+        );
+        let _ = deny_notif(notify_fd, notif.id);
+        return Ok(());
     }
 
     // 6. Rate limit check
@@ -1533,7 +1607,7 @@ mod tests {
                     capability_elevation: false,
                     proxy_fallback: true,
                     af_unix_mediation: false,
-                    gpu_comm: false,
+                    proc_comm_notify: false,
                 },
                 tool_sandbox_runtime: None,
             }
@@ -1608,7 +1682,7 @@ mod tests {
                 capability_elevation: false,
                 proxy_fallback: false,
                 af_unix_mediation: true,
-                gpu_comm: false,
+                proc_comm_notify: false,
             };
             config
         }
@@ -2025,5 +2099,63 @@ mod tests {
                 "AF_UNIX-only mode must allow non-AF_UNIX sendto"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod proc_task_comm_tests {
+    use super::is_proc_task_comm_for_tgid;
+    use std::path::Path;
+
+    #[test]
+    fn matches_canonical_proc_task_comm() {
+        assert!(is_proc_task_comm_for_tgid(
+            Path::new("/proc/12345/task/12345/comm"),
+            12345
+        ));
+        assert!(is_proc_task_comm_for_tgid(
+            Path::new("/proc/12345/task/67890/comm"),
+            12345
+        ));
+    }
+
+    #[test]
+    fn rejects_wrong_tgid() {
+        assert!(!is_proc_task_comm_for_tgid(
+            Path::new("/proc/99999/task/12345/comm"),
+            12345
+        ));
+        assert!(!is_proc_task_comm_for_tgid(
+            Path::new("/proc/12345/task/12345/comm"),
+            99999
+        ));
+    }
+
+    #[test]
+    fn rejects_non_comm_paths() {
+        assert!(!is_proc_task_comm_for_tgid(
+            Path::new("/proc/self/task/12345/comm"),
+            12345
+        ));
+        assert!(!is_proc_task_comm_for_tgid(
+            Path::new("/proc/12345/task/12345/mem"),
+            12345
+        ));
+        assert!(!is_proc_task_comm_for_tgid(
+            Path::new("/proc/12345/comm"),
+            12345
+        ));
+        assert!(!is_proc_task_comm_for_tgid(
+            Path::new("/proc/12345/task/abc/comm"),
+            12345
+        ));
+        assert!(!is_proc_task_comm_for_tgid(
+            Path::new("/proc/abc/task/12345/comm"),
+            12345
+        ));
+        assert!(!is_proc_task_comm_for_tgid(
+            Path::new("/proc/12345/task/12345/comm/extra"),
+            12345
+        ));
     }
 }

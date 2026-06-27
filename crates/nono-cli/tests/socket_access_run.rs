@@ -38,6 +38,9 @@ fn run_nono(args: &[&str], home: &Path, cwd: &Path) -> Output {
         .env("HOME", home)
         .env("XDG_CONFIG_HOME", home.join(".config"))
         .env_remove("NONO_DETACHED_LAUNCH")
+        // Denials are the expected outcome in these tests; never open the
+        // post-run denied-path review UI on the cargo test runner's TTY.
+        .env("NONO_NO_SAVE_PROMPT", "1")
         .current_dir(cwd)
         .output()
         .expect("failed to run nono")
@@ -166,16 +169,13 @@ fn af_unix_mediation_pathname_allows_connect_to_listed_socket() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    // The supervisor must not emit an IPC denial — that is the signal that
-    // the allowlist entry was honoured. Whether the connect() itself
-    // succeeds at the OS level (SOCK_DGRAM to an unbound peer) is not the
-    // point of this test; the unit tests in supervisor_linux.rs cover the
-    // full allow/deny decision matrix.
+    // The supervisor must not deny the allowlisted socket path. Other system
+    // sockets touched by Python or libc may still be denied; those are
+    // unrelated to the allowlist entry under test.
+    let denial_marker = format!("send {socket_arg}");
     assert!(
-        !stderr.contains("unix socket")
-            && !stderr.contains("Unix socket")
-            && !stderr.contains("unix_socket"),
-        "supervisor must not deny an allowlisted socket path\nstdout: {stdout}\nstderr: {stderr}",
+        !stderr.contains(&denial_marker),
+        "supervisor must not deny the allowlisted socket path\nstdout: {stdout}\nstderr: {stderr}",
     );
 }
 

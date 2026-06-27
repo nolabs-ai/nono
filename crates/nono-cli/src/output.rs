@@ -68,6 +68,23 @@ pub fn print_capabilities(
     eprintln!("  {}", theme::fg("Capabilities:", t.subtext).bold());
     rule();
 
+    // Resource limits: shown here; enforcement happens in the supervised runtime.
+    // Spell out that it's a hard cap so the user knows a breach kills the run,
+    // not just throttles it.
+    if let Some(limits) = caps.resource_limits()
+        && !limits.is_empty()
+    {
+        eprintln!(
+            "  {} {} {}",
+            theme::fg("resources", t.yellow).bold(),
+            theme::fg(&limits.summary(), t.subtext),
+            theme::fg(
+                "(hard cap — the process tree is killed if it exceeds this)",
+                t.subtext
+            ),
+        );
+    }
+
     // Filesystem capabilities
     let fs_caps = caps.fs_capabilities();
     if !fs_caps.is_empty() {
@@ -636,6 +653,74 @@ pub fn format_startup_blocked(
 pub fn print_diagnostic_footer(footer: &str) {
     let rendered = render_diagnostic_footer(footer);
     print_terminal_block(&rendered, true);
+}
+
+/// Explain that the kernel OOM-killed the sandbox for exceeding its `--memory`
+/// ceiling.
+///
+/// Without this a memory-cap kill surfaces only as a bare SIGKILL (exit 137),
+/// so the run looks like it died for no reason. We name the limit, the peak the
+/// tree reached, and how to relax it. Suppressed under `--silent`.
+#[cfg(target_os = "linux")]
+pub fn print_oom_diagnostic(report: &crate::resource_cgroup::OomReport, silent: bool) {
+    if silent {
+        return;
+    }
+    let t = theme::current();
+
+    // Pad the label on the plain text before coloring, so values line up
+    // regardless of the invisible ANSI escapes.
+    let row = |label: &str, value: &str| {
+        format!(
+            "       {} {}",
+            fg(&format!("{label:<17}"), t.subtext),
+            fg(value, t.text),
+        )
+    };
+
+    let mut lines = vec![format!(
+        "{} {}",
+        fg("[nono] memory limit exceeded:", t.red).bold(),
+        fg(
+            "the sandboxed process tree was killed by the kernel for using too much memory.",
+            t.text,
+        ),
+    )];
+
+    let limit = report
+        .limit_bytes
+        .map_or_else(|| "unset".to_string(), nono::resource::format_bytes);
+    lines.push(row("limit (--memory):", &limit));
+    if let Some(peak) = report.peak_bytes {
+        lines.push(row("peak memory:", &nono::resource::format_bytes(peak)));
+    }
+    lines.push(row(
+        "OOM kills:",
+        &format!(
+            "{} (whole-sandbox kills: {})",
+            report.oom_kills, report.oom_group_kills
+        ),
+    ));
+    lines.push(row(
+        "swap:",
+        "disabled (memory.swap.max=0) — nothing could spill to swap",
+    ));
+    lines.push(row(
+        "scope:",
+        "the whole sandbox was killed together (memory.oom.group=1)",
+    ));
+    lines.push(format!(
+        "       {} {}",
+        fg("hint:", t.yellow).bold(),
+        fg(
+            "raise the ceiling to allow more memory, e.g. --memory 1G.",
+            t.text,
+        ),
+    ));
+
+    for line in &lines {
+        crate::startup_prompt::print_terminal_safe_stderr(line);
+    }
 }
 
 /// Print skipped CLI path grants in a user-facing format.

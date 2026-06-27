@@ -1385,6 +1385,7 @@ pub struct SandboxArgs {
             "allow_bind", "allow_port", "allow_connect_port", "external_proxy", "proxy_port",
             "proxy_credential", "allow_endpoint", "env_credential", "env_credential_map",
             "allow_command", "block_command", "allow_launch_services", "allow_gpu", "allow_http2",
+            "memory",
         ],
         help_heading = "OPTIONS"
     )]
@@ -1393,6 +1394,11 @@ pub struct SandboxArgs {
     /// Enable verbose output
     #[arg(long, short = 'v', action = clap::ArgAction::Count, help_heading = "OPTIONS")]
     pub verbose: u8,
+
+    /// Maximum resident memory for the process tree (e.g. 512M, 1Gi).
+    /// Enforced on Linux via cgroup v2; requires a supervised run.
+    #[arg(long, value_name = "SIZE", help_heading = "RESOURCES")]
+    pub memory: Option<String>,
 
     /// Show what would be sandboxed without executing
     #[arg(long, help_heading = "OPTIONS")]
@@ -1620,6 +1626,10 @@ pub struct WrapSandboxArgs {
     #[arg(long, short = 'v', action = clap::ArgAction::Count, help_heading = "OPTIONS")]
     pub verbose: u8,
 
+    // `wrap` deliberately has no `--memory`: it execs directly and cannot create
+    // the enforcement cgroup, so a cap could not be applied. Use `nono run`. A
+    // memory limit arriving via `--config <manifest>` is still refused at runtime
+    // in `run_wrap`.
     /// Show what would be sandboxed without executing
     #[arg(long, help_heading = "OPTIONS")]
     pub dry_run: bool,
@@ -1669,6 +1679,9 @@ impl From<WrapSandboxArgs> for SandboxArgs {
             allow_http2: false,
             config: args.config,
             verbose: args.verbose,
+            // `wrap` has no `--memory` flag (it cannot enforce one); a limit in a
+            // `--config` manifest is refused at runtime in `run_wrap`.
+            memory: None,
             dry_run: args.dry_run,
         }
     }
@@ -2620,6 +2633,39 @@ mod tests {
             }
             _ => panic!("Expected Run command"),
         }
+    }
+
+    #[test]
+    fn test_resource_flags_parse() {
+        let cli = Cli::parse_from(["nono", "run", "--memory", "512M", "--", "true"]);
+        match cli.command {
+            Commands::Run(args) => {
+                assert_eq!(args.sandbox.memory.as_deref(), Some("512M"));
+            }
+            _ => panic!("Expected Run command"),
+        }
+    }
+
+    #[test]
+    fn test_resource_flags_conflict_with_config() {
+        // --config (manifest) is mutually exclusive with the resource flags.
+        let res = Cli::try_parse_from([
+            "nono", "run", "--config", "m.json", "--memory", "512M", "--", "true",
+        ]);
+        assert!(res.is_err(), "--config and --memory must conflict");
+    }
+
+    #[test]
+    fn test_wrap_rejects_memory_flag_and_from_maps_it_to_none() {
+        // `wrap` cannot enforce a memory cap (it execs directly), so it does not
+        // expose `--memory` at all — clap rejects the unknown flag.
+        let res = Cli::try_parse_from(["nono", "wrap", "--memory", "256M", "--", "true"]);
+        assert!(res.is_err(), "wrap must not accept --memory");
+
+        // And the hand-written `From<WrapSandboxArgs>` always maps memory to None
+        // (a manifest-borne limit is refused later in run_wrap, not here).
+        let sandbox: SandboxArgs = WrapSandboxArgs::default().into();
+        assert!(sandbox.memory.is_none());
     }
 
     #[test]

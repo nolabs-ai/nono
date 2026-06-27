@@ -290,12 +290,88 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
         tool_sandbox_runtime: config.tool_sandbox_runtime,
     };
 
+    // Resource enforcement (Linux cgroup v2): a requested limit creates the leaf
+    // pre-fork. With no delegated cgroup v2 subtree, `CgroupLeaf::create` errors and
+    // the run fails closed rather than run the limit unenforced. The child
+    // self-attaches (see `resource_procs_fd` below); dropping `cgroup_leaf` tears it
+    // down.
+    #[cfg(target_os = "linux")]
+    let cgroup_leaf = match caps.resource_limits() {
+        Some(limits) if !limits.is_empty() => Some(
+            // Log the fail-closed path: a requested cap we couldn't set up aborts
+            // the run rather than letting it proceed unenforced.
+            crate::resource_cgroup::CgroupLeaf::create(limits).inspect_err(|e| {
+                tracing::error!(
+                    "resource: could not set up the memory cgroup; refusing to run unconfined: {e}"
+                );
+            })?,
+        ),
+        _ => None,
+    };
+
+    // No cgroup enforcement off Linux yet — fail closed rather than run a
+    // requested limit unprotected (macOS gets its own backend later).
+    #[cfg(not(target_os = "linux"))]
+    if caps
+        .resource_limits()
+        .is_some_and(|limits| !limits.is_empty())
+    {
+        return Err(nono::NonoError::SandboxInit(
+            "resource: resource limits are only enforced on Linux (cgroup v2) in this build"
+                .to_string(),
+        ));
+    }
+
+    // The fd the child self-attaches through: opened in the parent so the forked
+    // child inherits it and cages itself before it can fork/exec — closing the
+    // post-fork race a parent-side attach would leave open. The leaf (and fd) live
+    // to the end of this function.
+    #[cfg(target_os = "linux")]
+    let resource_procs_fd = cgroup_leaf.as_ref().map(|leaf| leaf.procs_raw_fd());
+    #[cfg(not(target_os = "linux"))]
+    let resource_procs_fd: Option<std::os::fd::RawFd> = None;
+
     let exit_code = {
+        // Runs in the parent the instant the child is forked, with the child's pid;
+        // records it on the session. The cgroup attach is the child's own job (see
+        // `resource_procs_fd` above), so there's no parent-side escape window here.
         let mut on_fork = |child_pid: u32| {
             if let Some(ref mut guard) = session_guard {
                 guard.set_child_pid(child_pid);
             }
         };
+
+        // Post-mortem hook, installed only when a resource cgroup leaf exists. A
+        // memory-cap breach arrives as a bare SIGKILL (exit 137) with no
+        // explanation; the hook reads the leaf's OOM evidence while it still exists
+        // and prints a precise diagnostic, so the breach is loud not silent.
+        // Returning `true` suppresses the generic "killed by SIGKILL" footer.
+        #[cfg(target_os = "linux")]
+        let mut on_exit_diag_fn = |code: i32| -> bool {
+            // Only explain the kernel's exit code for a whole-sandbox OOM kill
+            // (128 + SIGKILL = 137). Bailing on any other code stops an unrelated
+            // failure from getting a spurious "killed by the kernel" story (or its
+            // real footer suppressed) just because one descendant was OOM-reaped
+            // earlier.
+            const OOM_SIGKILL_EXIT: i32 = 128 + nix::libc::SIGKILL;
+            if code != OOM_SIGKILL_EXIT {
+                return false;
+            }
+            cgroup_leaf
+                .as_ref()
+                .and_then(|leaf| leaf.oom_report())
+                .is_some_and(|report| {
+                    crate::output::print_oom_diagnostic(&report, silent);
+                    true
+                })
+        };
+        // No leaf, no hook (`None`) — the exact pre-feature path.
+        #[cfg(target_os = "linux")]
+        let on_exit_diag: Option<&mut dyn FnMut(i32) -> bool> =
+            cgroup_leaf.is_some().then_some(&mut on_exit_diag_fn);
+        #[cfg(not(target_os = "linux"))]
+        let on_exit_diag: Option<&mut dyn FnMut(i32) -> bool> = None;
+
         exec_strategy::execute_supervised(
             config,
             Some(&supervisor_cfg),
@@ -303,11 +379,15 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
             Some(&mut on_fork),
             pty_pair,
             Some(&short_session_id),
+            resource_procs_fd,
+            on_exit_diag,
         )?
     };
+
     if let Some(ref mut guard) = session_guard {
         guard.set_exited(exit_code);
     }
+
     let ended = chrono::Local::now().to_rfc3339();
     finalize_supervised_exit(RollbackExitContext {
         audit_state: audit_state.as_ref(),

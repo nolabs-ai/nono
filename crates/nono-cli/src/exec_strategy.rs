@@ -474,6 +474,7 @@ fn push_set_vars(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn execute_supervised(
     config: &ExecConfig<'_>,
     supervisor: Option<&SupervisorConfig<'_>>,
@@ -481,7 +482,21 @@ pub fn execute_supervised(
     on_fork: Option<&mut dyn FnMut(u32)>,
     pty_pair: Option<crate::pty_proxy::PtyPair>,
     pty_session_id: Option<&str>,
+    // Write fd of the resource cgroup's `cgroup.procs`, opened by the caller
+    // pre-fork. When set, the forked child self-attaches through it before
+    // applying the sandbox or exec'ing. Unused off Linux.
+    resource_procs_fd: Option<std::os::fd::RawFd>,
+    // Optional post-mortem hook, called once with the child's exit code after
+    // reaping. It may print a specialized diagnostic (e.g. the cgroup memory-cap
+    // explanation); returning `true` means it fully explained the failure, so the
+    // generic exit/denial footer is suppressed (no two competing stories).
+    mut on_exit_diagnostic: Option<&mut dyn FnMut(i32) -> bool>,
 ) -> Result<i32> {
+    // Used only by the Linux self-attach path below; silence the unused-var
+    // warning under the strict `-D warnings` build off Linux.
+    #[cfg(not(target_os = "linux"))]
+    let _ = resource_procs_fd;
+
     let program = &config.command[0];
     let cmd_args = &config.command[1..];
 
@@ -874,6 +889,28 @@ pub fn execute_supervised(
             // SAFETY: We are in the child after fork, slave_fd is valid.
             if let Some(slave_fd) = pty_slave_fd {
                 unsafe { crate::pty_proxy::setup_child_pty(slave_fd) };
+            }
+
+            // Resource cgroup self-attach: before sandboxing or exec'ing, the child
+            // writes its own pid into the leaf via the inherited fd. Doing it here —
+            // before it can fork or exec — caps the whole tree by construction and
+            // closes the post-fork escape window a parent-side attach would leave
+            // open.
+            #[cfg(target_os = "linux")]
+            if let Some(procs_fd) = resource_procs_fd
+                && !crate::resource_cgroup::child_self_attach(procs_fd)
+            {
+                const MSG: &[u8] = b"nono: failed to self-attach to resource cgroup\n";
+                // SAFETY: `write` and `_exit` are async-signal-safe and we are in
+                // the post-fork child path. Fail-closed: never run unconfined.
+                unsafe {
+                    libc::write(
+                        libc::STDERR_FILENO,
+                        MSG.as_ptr().cast::<libc::c_void>(),
+                        MSG.len(),
+                    );
+                    libc::_exit(126);
+                }
             }
 
             #[cfg(target_os = "linux")]
@@ -1496,6 +1533,20 @@ pub fn execute_supervised(
                 }
             };
 
+            // Let the caller explain this specific exit (e.g. the resource cgroup
+            // turning a bare SIGKILL into a memory-cap diagnostic). If it does,
+            // the generic footer below is suppressed so the user gets one story.
+            //
+            // Gated on `!killed_by_timeout`: a watchdog timeout also kills with
+            // SIGKILL (exit 137), the same code an OOM kill produces. Without this
+            // gate the hook could borrow the "memory cap exceeded" story for a
+            // timeout kill that merely coincided with an earlier OOM-reap in the
+            // leaf — attributing the death to the wrong cause.
+            let specialized_diagnostic = !killed_by_timeout
+                && on_exit_diagnostic
+                    .take()
+                    .is_some_and(|hook| hook(exit_code));
+
             // Analyze PTY screen content for sandbox-related errors.
             let pty_screen = pty_proxy
                 .as_ref()
@@ -1550,6 +1601,7 @@ pub fn execute_supervised(
             let prompt_error_observation = error_observation.clone();
 
             let should_print_diagnostics = !killed_by_timeout
+                && !specialized_diagnostic
                 && should_print_diagnostic_footer(
                     config.no_diagnostics,
                     exit_code,
@@ -1626,13 +1678,15 @@ pub fn execute_supervised(
                 }
             }
 
-            if should_offer_profile_save(
-                config.no_diagnostics,
-                exit_code,
-                &prompt_policy_explanations,
-                &prompt_error_observation,
-                &visible_sandbox_violations,
-            ) {
+            if !specialized_diagnostic
+                && should_offer_profile_save(
+                    config.no_diagnostics,
+                    exit_code,
+                    &prompt_policy_explanations,
+                    &prompt_error_observation,
+                    &visible_sandbox_violations,
+                )
+            {
                 // Clear the forwarding target before prompting. The child is
                 // already dead; keeping CHILD_PID set would cause forward_signal
                 // to send Ctrl-C to the dead PID, swallowing it silently.

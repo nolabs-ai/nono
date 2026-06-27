@@ -218,6 +218,13 @@ pub(crate) fn run_why(args: WhyArgs) -> Result<()> {
         )
     } else if let Some(ref scope) = args.scope {
         query_scope(scope_query(scope), &ctx.caps)
+    } else if args.self_query && !args.json {
+        // No specific query: show this sandbox's own capability summary (fs grants,
+        // network, commands, resource limits). `print_capabilities` already renders
+        // the resources line, so the --memory ceiling surfaces without bespoke
+        // formatting. A self query has no blocked grants and no pending proxy.
+        crate::output::print_capabilities(&ctx.caps, &[], 0, false, false);
+        return Ok(());
     } else {
         return Err(NonoError::ConfigParse(
             "--command, --path, --host, or --scope is required".to_string(),

@@ -10,8 +10,10 @@ use crate::capability::{
     SignalMode as InternalSignalMode,
 };
 use crate::manifest::{
-    AccessMode, CapabilityManifest, FsEntryType, IpcMode, NetworkMode, ProcessInfoMode, SignalMode,
+    AccessMode, CapabilityManifest, FsEntryType, IpcMode, NetworkMode, ProcessInfoMode, Resources,
+    SignalMode,
 };
+use crate::resource::ResourceLimits;
 use crate::{NonoError, Result};
 
 impl TryFrom<&CapabilityManifest> for CapabilitySet {
@@ -88,7 +90,18 @@ impl TryFrom<&CapabilityManifest> for CapabilitySet {
             }
         }
 
+        // Resources
+        if let Some(ref res) = manifest.resources {
+            caps = caps.with_resource_limits(convert_resources(res));
+        }
+
         Ok(caps)
+    }
+}
+
+fn convert_resources(res: &Resources) -> ResourceLimits {
+    ResourceLimits {
+        memory_bytes: res.memory_bytes.map(|n| n.get()),
     }
 }
 
@@ -120,5 +133,63 @@ fn convert_ipc_mode(mode: IpcMode) -> InternalIpcMode {
     match mode {
         IpcMode::SharedMemoryOnly => InternalIpcMode::SharedMemoryOnly,
         IpcMode::Full => InternalIpcMode::Full,
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn manifest_resources_map_into_capability_set() {
+        let json = r#"{
+            "version": "0.1.0",
+            "process": { "exec_strategy": "supervised" },
+            "resources": { "memory_bytes": 1048576 }
+        }"#;
+        let manifest = CapabilityManifest::from_json(json).unwrap();
+        let caps = CapabilitySet::try_from(&manifest).unwrap();
+        let limits = caps.resource_limits().expect("limits present");
+        assert_eq!(limits.memory_bytes, Some(1048576));
+    }
+
+    #[test]
+    fn manifest_without_resources_has_no_limits() {
+        let json = r#"{ "version": "0.1.0" }"#;
+        let manifest = CapabilityManifest::from_json(json).unwrap();
+        let caps = CapabilitySet::try_from(&manifest).unwrap();
+        assert!(caps.resource_limits().is_none());
+    }
+
+    // ---- TryFrom enforces validate(); empty resources maps clean ----
+
+    #[test]
+    fn try_from_runs_validate_and_rejects_unsupervised_memory() {
+        // CapabilitySet::try_from(&manifest) calls manifest.validate() first, so a
+        // memory ceiling under the default (monitor) strategy must surface the same
+        // ConfigParse rather than silently building an unenforceable set.
+        let json = r#"{ "version": "0.1.0", "resources": { "memory_bytes": 1024 } }"#;
+        let manifest = CapabilityManifest::from_json(json).unwrap();
+        let err = CapabilitySet::try_from(&manifest)
+            .expect_err("unsupervised memory limit must be rejected by TryFrom");
+        assert!(matches!(err, NonoError::ConfigParse(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn empty_resources_object_maps_to_no_ceiling() {
+        // `resources: {}` is present-but-empty: the conversion still attaches a
+        // ResourceLimits, but it must carry no ceiling (is_empty), never a phantom
+        // limit. Distinct from manifest_without_resources_has_no_limits, which omits
+        // the resources key entirely.
+        let json = r#"{ "version": "0.1.0", "resources": {} }"#;
+        let manifest = CapabilityManifest::from_json(json).unwrap();
+        let caps = CapabilitySet::try_from(&manifest).unwrap();
+        if let Some(limits) = caps.resource_limits() {
+            assert!(
+                limits.is_empty(),
+                "empty resources must not produce a ceiling, got {limits:?}"
+            );
+        }
     }
 }

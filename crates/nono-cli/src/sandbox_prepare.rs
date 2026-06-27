@@ -436,6 +436,8 @@ pub(crate) struct PreparedSandbox {
     pub(crate) wsl2_proxy_policy: crate::profile::Wsl2ProxyPolicy,
     #[cfg(target_os = "linux")]
     pub(crate) af_unix_mediation: crate::profile::LinuxAfUnixMediation,
+    #[cfg(target_os = "linux")]
+    pub(crate) sandbox_policy: crate::profile::LinuxSandboxPolicy,
     pub(crate) allow_launch_services_active: bool,
     pub(crate) allow_gpu_active: bool,
     pub(crate) open_url_origins: Vec<String>,
@@ -1170,6 +1172,8 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
                 wsl2_proxy_policy: crate::profile::Wsl2ProxyPolicy::default(),
                 #[cfg(target_os = "linux")]
                 af_unix_mediation: crate::profile::LinuxAfUnixMediation::default(),
+                #[cfg(target_os = "linux")]
+                sandbox_policy: crate::profile::LinuxSandboxPolicy::default(),
                 allow_launch_services_active: false,
                 allow_gpu_active: false,
                 open_url_origins: Vec::new(),
@@ -1198,6 +1202,8 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         wsl2_proxy_policy,
         #[cfg(target_os = "linux")]
         af_unix_mediation,
+        #[cfg(target_os = "linux")]
+        sandbox_policy,
         workdir_access: profile_workdir_access,
         rollback_exclude_patterns: profile_rollback_patterns,
         rollback_exclude_globs: profile_rollback_globs,
@@ -1345,6 +1351,10 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         &open_url_origins,
         open_url_allow_localhost,
     )?;
+
+    // CLI --sandbox-policy overrides the profile value; both default to Auto.
+    #[cfg(target_os = "linux")]
+    let sandbox_policy = args.sandbox_policy.unwrap_or(sandbox_policy);
 
     // GPU access: macOS uses IOKit platform rules (tightened to AGXDeviceUserClient only),
     // Linux uses filesystem capabilities for render nodes and compute devices.
@@ -1509,6 +1519,8 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
             wsl2_proxy_policy,
             #[cfg(target_os = "linux")]
             af_unix_mediation,
+            #[cfg(target_os = "linux")]
+            sandbox_policy,
             allow_launch_services_active,
             allow_gpu_active,
             open_url_origins,
@@ -1987,6 +1999,8 @@ mod tests {
             wsl2_proxy_policy: profile::Wsl2ProxyPolicy::default(),
             #[cfg(target_os = "linux")]
             af_unix_mediation: profile::LinuxAfUnixMediation::default(),
+            #[cfg(target_os = "linux")]
+            sandbox_policy: profile::LinuxSandboxPolicy::default(),
             allow_launch_services_active: false,
             allow_gpu_active: false,
             open_url_origins: Vec::new(),

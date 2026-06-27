@@ -672,7 +672,7 @@ fn run_child_launcher() -> Result<()> {
     // executable targets is therefore a deliberate trust downgrade.
     verify_launch_binary(&spec)?;
     let caps = caps_from_spec(&spec.caps)?;
-    Sandbox::apply(&caps)?;
+    Sandbox::apply_auto(&caps)?;
 
     let binary = CString::new(real_binary.as_bytes()).map_err(|_| {
         NonoError::SandboxInit("tool-sandbox real binary path contains NUL".to_string())

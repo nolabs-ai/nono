@@ -1152,6 +1152,34 @@ Profiles can set this via `capability_elevation` in their security config. The C
 |---------------------|---------------------------|
 | Example | `NONO_CAPABILITY_ELEVATION=true` |
 
+#### `--sandbox-policy`
+
+*Linux only.* Select the sandbox enforcement mechanism for this session. Accepted values:
+
+| Value | Behaviour |
+|-------|-----------|
+| `auto` | Landlock LSM with automatic seccomp fallback when the kernel ABI lacks network support (< v4). **Default.** Preserves existing behaviour. |
+| `landlock` | Landlock only. Returns an error at startup if the running kernel cannot satisfy network restrictions via Landlock alone — no silent seccomp fallback. |
+| `external` | No-op. nono installs no Landlock or seccomp rules. Use when enforcement is managed at the infrastructure level (iptables, cgroups, systemd units, container runtime policy). |
+
+```bash
+# Require Landlock-only enforcement; fail if the kernel can't satisfy it
+nono run --sandbox-policy landlock --allow-cwd -- my-agent
+
+# Declare that enforcement is external; nono skips sandbox installation
+nono run --sandbox-policy external --allow-cwd -- my-agent
+```
+
+The policy can also be set in a profile under `linux.sandbox_policy`. The CLI flag overrides the profile value. On macOS and other non-Linux platforms this flag is not available.
+
+<Note>
+  `--sandbox-policy landlock` is useful for compliance contexts where you need a hard guarantee that seccomp BPF is not installed, or where you want to verify that the target kernel's Landlock ABI is sufficient before deploying to production.
+</Note>
+
+<Warning>
+  `--sandbox-policy external` provides no kernel-level enforcement on its own. Only use it when you have independently verified that the surrounding infrastructure enforces the required policy.
+</Warning>
+
 ### Operational Flags
 
 #### `--dry-run`

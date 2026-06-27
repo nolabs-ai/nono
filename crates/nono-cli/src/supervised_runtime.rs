@@ -281,11 +281,7 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
         #[cfg(target_os = "linux")]
         unix_socket_allowlist: caps.unix_socket_capabilities(),
         #[cfg(target_os = "linux")]
-        linux_network_notify_mode: if config.seccomp_proxy_fallback {
-            exec_strategy::LinuxNetworkNotifyMode::ProxyOnly
-        } else {
-            exec_strategy::LinuxNetworkNotifyMode::AfUnixOnly
-        },
+        seccomp_policy: config.seccomp_policy,
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         tool_sandbox_runtime: config.tool_sandbox_runtime,
     };

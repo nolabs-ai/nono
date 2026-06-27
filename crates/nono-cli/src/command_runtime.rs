@@ -201,39 +201,27 @@ pub(crate) fn run_shell(args: ShellArgs, silent: bool) -> Result<()> {
         false,
     );
 
+    let flags = ExecutionFlags {
+        strategy,
+        workdir: resolve_requested_workdir(args.sandbox.workdir.as_ref()),
+        no_diagnostics: true,
+        startup_timeout_secs: args.startup_timeout_secs,
+        network,
+        redaction_policy: load_configured_redaction_policy()?,
+        session: SessionLaunchOptions {
+            session_id: Some(session_id),
+            session_name: args.name,
+            detach_sequence: load_configured_detach_sequence()?,
+            ..SessionLaunchOptions::default()
+        },
+        ..ExecutionFlags::from_prepared(&prepared, silent)?
+    };
     execute_sandboxed(LaunchPlan {
         program: shell_path.into_os_string(),
         cmd_args: vec![],
         caps: prepared.caps,
         loaded_secrets: prepared.secrets,
-        flags: ExecutionFlags {
-            strategy,
-            workdir: resolve_requested_workdir(args.sandbox.workdir.as_ref()),
-            no_diagnostics: true,
-            capability_elevation: prepared.capability_elevation,
-            #[cfg(target_os = "linux")]
-            wsl2_proxy_policy: prepared.wsl2_proxy_policy,
-            #[cfg(target_os = "linux")]
-            af_unix_mediation: prepared.af_unix_mediation,
-            bypass_protection_paths: prepared.bypass_protection_paths,
-            ignored_denial_paths: prepared.ignored_denial_paths,
-            suppressed_system_service_operations: prepared.suppressed_system_service_operations,
-            allowed_env_vars: prepared.allowed_env_vars,
-            denied_env_vars: prepared.denied_env_vars,
-            set_vars: prepared.set_vars,
-            startup_timeout_secs: args.startup_timeout_secs,
-            command_policies: prepared.command_policies,
-            session_hooks: prepared.session_hooks,
-            network,
-            redaction_policy: load_configured_redaction_policy()?,
-            session: SessionLaunchOptions {
-                session_id: Some(session_id),
-                session_name: args.name,
-                detach_sequence: load_configured_detach_sequence()?,
-                ..SessionLaunchOptions::default()
-            },
-            ..ExecutionFlags::defaults(silent)?
-        },
+        flags,
     })
 }
 
@@ -294,24 +282,17 @@ pub(crate) fn run_wrap(wrap_args: WrapArgs, silent: bool) -> Result<()> {
         print_allow_gpu_warning(silent);
     }
 
+    let flags = ExecutionFlags {
+        strategy: exec_strategy::ExecStrategy::Direct,
+        workdir: resolve_requested_workdir(args.workdir.as_ref()),
+        no_diagnostics,
+        ..ExecutionFlags::from_prepared(&prepared, silent)?
+    };
     execute_sandboxed(LaunchPlan {
         program,
         cmd_args,
         caps: prepared.caps,
         loaded_secrets: prepared.secrets,
-        flags: ExecutionFlags {
-            strategy: exec_strategy::ExecStrategy::Direct,
-            workdir: resolve_requested_workdir(args.workdir.as_ref()),
-            no_diagnostics,
-            bypass_protection_paths: prepared.bypass_protection_paths,
-            ignored_denial_paths: prepared.ignored_denial_paths,
-            suppressed_system_service_operations: prepared.suppressed_system_service_operations,
-            allowed_env_vars: prepared.allowed_env_vars,
-            denied_env_vars: prepared.denied_env_vars,
-            set_vars: prepared.set_vars,
-            command_policies: prepared.command_policies,
-            session_hooks: prepared.session_hooks,
-            ..ExecutionFlags::defaults(silent)?
-        },
+        flags,
     })
 }

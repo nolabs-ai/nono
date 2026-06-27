@@ -1354,6 +1354,18 @@ pub struct SandboxArgs {
     #[arg(long, help_heading = "OPTIONS")]
     pub allow_gpu: bool,
 
+    /// Linux sandbox enforcement mechanism [auto|landlock|external] (default: auto).
+    ///
+    /// auto     — Landlock with automatic seccomp fallback when the kernel
+    ///            lacks network support (ABI < V4). This is the default.
+    /// landlock — Landlock only; fails at startup if network restrictions
+    ///            cannot be satisfied without seccomp.
+    /// external — No sandbox installed by nono; enforcement is managed
+    ///            externally (iptables, cgroups, systemd, etc.).
+    #[cfg(target_os = "linux")]
+    #[arg(long, help_heading = "OPTIONS", value_name = "POLICY")]
+    pub sandbox_policy: Option<crate::profile::LinuxSandboxPolicy>,
+
     /// Allow HTTP/2 multiplexing for upstream proxy connections.
     ///
     /// When enabled, the proxy negotiates HTTP/2 via ALPN with upstream
@@ -1670,6 +1682,8 @@ impl From<WrapSandboxArgs> for SandboxArgs {
             config: args.config,
             verbose: args.verbose,
             dry_run: args.dry_run,
+            #[cfg(target_os = "linux")]
+            sandbox_policy: None,
         }
     }
 }

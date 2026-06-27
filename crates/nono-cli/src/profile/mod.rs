@@ -1778,6 +1778,25 @@ pub struct DiagnosticsConfig {
     pub suppress_system_services: Vec<String>,
 }
 
+/// Which sandboxing mechanism nono should install on Linux.
+///
+/// Defaults to `auto`, which reflects the historical behaviour.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum LinuxSandboxPolicy {
+    /// Landlock with automatic seccomp fallback when the kernel ABI lacks
+    /// network support (< V4). This is the default.
+    #[default]
+    Auto,
+    /// Landlock only. Returns an error at startup if the kernel cannot
+    /// satisfy network restrictions via Landlock alone.
+    Landlock,
+    /// TCP network egress enforcement is managed externally (iptables,
+    /// cgroups, systemd, etc.). nono still installs filesystem/process
+    /// sandboxing and skips only its own TCP network lockdown.
+    External,
+}
+
 /// Linux-specific profile controls.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1785,6 +1804,9 @@ pub struct LinuxConfig {
     /// Opt-in pathname AF_UNIX mediation mode.
     #[serde(default)]
     pub af_unix_mediation: Option<LinuxAfUnixMediation>,
+    /// Which sandboxing mechanism to use. Defaults to `auto`.
+    #[serde(default)]
+    pub sandbox_policy: Option<LinuxSandboxPolicy>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -3172,6 +3194,7 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
                 .linux
                 .af_unix_mediation
                 .or(base.linux.af_unix_mediation),
+            sandbox_policy: child.linux.sandbox_policy.or(base.linux.sandbox_policy),
         },
         diagnostics: DiagnosticsConfig {
             suppress_system_services: dedup_append(

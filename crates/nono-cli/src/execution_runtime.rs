@@ -21,20 +21,32 @@ fn apply_pre_fork_sandbox(
     strategy: exec_strategy::ExecStrategy,
     caps: &CapabilitySet,
     silent: bool,
+    #[cfg(target_os = "linux")] sandbox_policy: crate::profile::LinuxSandboxPolicy,
 ) -> Result<()> {
     if matches!(strategy, exec_strategy::ExecStrategy::Direct) {
         output::print_applying_sandbox(silent);
 
         #[cfg(target_os = "linux")]
         {
+            use crate::profile::LinuxSandboxPolicy;
             let detected = Sandbox::detect_abi()?;
             info!("Direct mode: detected {}", detected);
-            Sandbox::apply_with_abi(caps, &detected)?;
+            match sandbox_policy {
+                LinuxSandboxPolicy::Auto => {
+                    Sandbox::apply_auto_with_abi(caps, &detected)?;
+                }
+                LinuxSandboxPolicy::Landlock => {
+                    Sandbox::apply_landlock_with_abi(caps, &detected)?;
+                }
+                LinuxSandboxPolicy::External => {
+                    Sandbox::apply_external_network_with_abi(caps, &detected)?;
+                }
+            }
         }
 
         #[cfg(not(target_os = "linux"))]
         {
-            Sandbox::apply(caps)?;
+            Sandbox::apply_auto(caps)?;
         }
     }
     Ok(())
@@ -387,7 +399,13 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         ));
     }
 
-    apply_pre_fork_sandbox(strategy, &caps, flags.silent)?;
+    apply_pre_fork_sandbox(
+        strategy,
+        &caps,
+        flags.silent,
+        #[cfg(target_os = "linux")]
+        flags.sandbox_policy,
+    )?;
 
     // Session id shared across before- and after-hook so paired setup/teardown
     // scripts see the same NONO_SESSION_ID. Only allocated when at least one
@@ -485,7 +503,13 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
     #[cfg(target_os = "linux")]
     let seccomp_proxy_fallback = {
         let needs_proxy = matches!(caps.network_mode(), nono::NetworkMode::ProxyOnly { .. });
-        if needs_proxy && nono::is_wsl2() {
+        let external_network = matches!(
+            flags.sandbox_policy,
+            crate::profile::LinuxSandboxPolicy::External
+        );
+        if external_network {
+            false
+        } else if needs_proxy && nono::is_wsl2() {
             let needs_seccomp_fallback = !Sandbox::detect_abi()
                 .ok()
                 .is_some_and(|abi| abi.has_network());
@@ -533,6 +557,16 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         ));
     }
 
+    #[cfg(target_os = "linux")]
+    if flags.proc_comm_notify && nono::sandbox::is_wsl2() {
+        return Err(NonoError::SandboxInit(
+            "WSL2: NVIDIA GPU thread-name mediation requires seccomp user notification, \
+             but WSL2 reports EBUSY for seccomp notify listeners. Disable --allow-gpu \
+             or run on native Linux."
+                .to_string(),
+        ));
+    }
+
     let config = exec_strategy::ExecConfig {
         command: &command,
         resolved_program: &exec_resolved_program,
@@ -568,11 +602,15 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
                 program: recommended_program_name,
                 recommended_profile: known_builtin_profile,
             }),
-        capability_elevation: flags.capability_elevation,
         #[cfg(target_os = "linux")]
-        seccomp_proxy_fallback,
+        seccomp_policy: exec_strategy::SeccompPolicy {
+            capability_elevation: flags.capability_elevation,
+            proxy_fallback: seccomp_proxy_fallback,
+            af_unix_mediation: flags.af_unix_mediation.is_pathname(),
+            proc_comm_notify: flags.proc_comm_notify,
+        },
         #[cfg(target_os = "linux")]
-        af_unix_mediation: flags.af_unix_mediation,
+        sandbox_policy: flags.sandbox_policy,
         allowed_env_vars: flags.allowed_env_vars,
         denied_env_vars: flags.denied_env_vars,
         set_vars: flags.set_vars.unwrap_or_default(),

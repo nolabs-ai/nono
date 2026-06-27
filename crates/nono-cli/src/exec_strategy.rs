@@ -155,14 +155,14 @@ pub enum ThreadingContext {
     /// Keyring threads are idle XPC dispatch workers (macOS) or D-Bus workers
     /// (Linux) after the synchronous keyring call completes — parked, not
     /// holding allocator locks. Safe for Supervised mode's post-fork
-    /// Sandbox::apply() allocation.
+    /// Sandbox::apply_auto() allocation.
     KeyringExpected,
 
     /// Allow elevated thread count for crypto library thread pools.
     /// Spawned by trust scan's ECDSA verification (aws-lc-rs) and keystore
     /// public key lookup. These are idle pool workers parked on condvars,
     /// NOT holding allocator locks — safe for supervised mode's post-fork
-    /// Sandbox::apply() allocation.
+    /// Sandbox::apply_auto() allocation.
     CryptoExpected,
 }
 
@@ -192,6 +192,47 @@ pub enum ExecStrategy {
     /// - Used by `nono run` when a parent process is required
     #[default]
     Supervised,
+}
+
+/// Describes which seccomp-notify mechanisms are active for a sandboxed session.
+///
+/// Constructed once in `execution_runtime` from the raw profile and CLI inputs,
+/// then threaded through `ExecConfig` → `SupervisorConfig` as a single field.
+/// All consumers call the predicate methods rather than combining raw flags.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SeccompPolicy {
+    /// Route unrecognised openat paths to the user-facing approval backend.
+    /// Corresponds to the profile's `security.capability_elevation` flag.
+    pub capability_elevation: bool,
+    /// Intercept connect/bind via seccomp-notify when Landlock lacks AccessNet.
+    /// Set dynamically based on kernel ABI detection; not a profile field.
+    pub proxy_fallback: bool,
+    /// Intercept pathname AF_UNIX socket operations via seccomp-notify.
+    /// Corresponds to the profile's `linux.af_unix_mediation = "pathname"`.
+    pub af_unix_mediation: bool,
+    /// Intercept openat/openat2 so the supervisor can inject a writable fd for
+    /// NVIDIA driver thread-name writes to `/proc/<tgid>/task/<tid>/comm`.
+    pub proc_comm_notify: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl SeccompPolicy {
+    /// Whether to install and receive an openat seccomp-notify fd.
+    pub fn needs_openat_notify(self) -> bool {
+        self.capability_elevation || self.proc_comm_notify
+    }
+
+    /// Whether to install and receive a connect/bind seccomp-notify fd.
+    pub fn needs_network_notify(self) -> bool {
+        self.proxy_fallback || self.af_unix_mediation
+    }
+
+    /// Whether the child must be made dumpable so the supervisor can use
+    /// `pidfd_getfd` to steal the network notify fd.
+    pub fn child_requires_dumpable(self) -> bool {
+        self.needs_openat_notify() || self.needs_network_notify()
+    }
 }
 
 /// Configuration for command execution.
@@ -231,21 +272,13 @@ pub struct ExecConfig<'a> {
     /// Optional startup timeout for known interactive CLIs that were launched
     /// without their recommended built-in profile.
     pub startup_timeout: Option<StartupTimeoutConfig<'a>>,
-    /// Whether runtime capability elevation is enabled.
-    /// When true, the child installs seccomp-notify and the parent can grant
-    /// capabilities at runtime. On macOS this is currently unused.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    pub capability_elevation: bool,
-    /// Whether the seccomp proxy-only network fallback is needed.
-    /// Set by the parent before fork when Landlock ABI lacks AccessNet
-    /// and ProxyOnly network mode is requested. Both child and parent
-    /// use this flag to coordinate: child installs the proxy filter and
-    /// sends the notify fd; parent expects to receive it.
+    /// Seccomp-notify policy for this session. Controls which notify fds are
+    /// installed in the child and how the supervisor handles their events.
     #[cfg(target_os = "linux")]
-    pub seccomp_proxy_fallback: bool,
-    /// Linux pathname AF_UNIX mediation requested by profile.
+    pub seccomp_policy: SeccompPolicy,
+    /// Linux network enforcement backend for this session.
     #[cfg(target_os = "linux")]
-    pub af_unix_mediation: crate::profile::LinuxAfUnixMediation,
+    pub sandbox_policy: crate::profile::LinuxSandboxPolicy,
     /// Allow-list of environment variable names. When set, only variables
     /// matching an exact name or prefix pattern (e.g. `"AWS_*"`) are
     /// passed to the child. Nono-injected credentials always bypass this.
@@ -306,6 +339,9 @@ pub struct SupervisorConfig<'a> {
     /// Whether direct LaunchServices opening is enabled for this session.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub allow_launch_services_active: bool,
+    /// Seccomp-notify policy for this session.
+    #[cfg(target_os = "linux")]
+    pub seccomp_policy: SeccompPolicy,
     /// Proxy port allowed for seccomp proxy-only fallback (0 = not active).
     #[cfg(target_os = "linux")]
     pub proxy_port: u16,
@@ -315,31 +351,14 @@ pub struct SupervisorConfig<'a> {
     /// Pathname AF_UNIX socket grants allowed for seccomp proxy-only fallback.
     #[cfg(target_os = "linux")]
     pub unix_socket_allowlist: &'a [nono::UnixSocketCapability],
-    /// Linux connect/bind seccomp notify policy mode.
-    #[cfg(target_os = "linux")]
-    pub linux_network_notify_mode: LinuxNetworkNotifyMode,
     /// Prepared tool-sandbox runtime listener for command-policy shim requests.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub tool_sandbox_runtime: Option<&'a crate::tool_sandbox::PreparedToolSandboxRuntime>,
 }
 
-#[cfg(target_os = "linux")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LinuxNetworkNotifyMode {
-    /// V<4 proxy fallback: mediate TCP proxy ports and AF_UNIX sockets.
-    ProxyOnly,
-    /// V4+ opt-in: mediate pathname AF_UNIX only; let TCP continue.
-    AfUnixOnly,
-}
-
 #[cfg(target_os = "macos")]
 fn should_install_macos_open_shim(supervisor: Option<&SupervisorConfig<'_>>) -> bool {
     supervisor.is_some_and(|cfg| !cfg.allow_launch_services_active)
-}
-
-#[cfg(target_os = "linux")]
-const fn linux_child_requires_dumpable(capability_elevation: bool, network_notify: bool) -> bool {
-    capability_elevation || network_notify
 }
 
 /// Execute a command using the Direct strategy (exec, nono disappears).
@@ -420,7 +439,7 @@ pub fn execute_direct(config: &ExecConfig<'_>) -> Result<()> {
 ///
 /// # Sandbox Application in Child
 ///
-/// The child calls `Sandbox::apply()` after fork, which allocates memory (generating
+/// The child calls `Sandbox::apply_auto()` after fork, which allocates memory (generating
 /// Seatbelt profile strings on macOS, opening Landlock PathFds on Linux). This is safe
 /// because we validate threading context before fork — known-safe thread contexts
 /// (keyring workers, crypto pool) are idle and not holding allocator locks.
@@ -513,9 +532,7 @@ pub fn execute_supervised(
     // improves compatibility with CLIs that abort on unexpected inherited fds.
     #[cfg(target_os = "linux")]
     let needs_child_ipc = supervisor.is_some()
-        && (config.capability_elevation
-            || config.seccomp_proxy_fallback
-            || config.af_unix_mediation.is_pathname()
+        && (config.seccomp_policy.child_requires_dumpable()
             || trust_interceptor.is_some()
             || config.tool_sandbox_runtime.is_some()
             || supervisor.is_some_and(|cfg| {
@@ -800,7 +817,7 @@ pub fn execute_supervised(
     clear_signal_forwarding_target();
 
     // SAFETY: fork() is safe here because we validated threading context.
-    // Child will call Sandbox::apply() which allocates, but this is safe
+    // Child will call Sandbox::apply_auto() which allocates, but this is safe
     // because the child is single-threaded (validated above).
     let fork_result = unsafe { fork() };
 
@@ -842,7 +859,7 @@ pub fn execute_supervised(
             // CHILD: Set up PTY, apply sandbox, then exec.
             //
             // The child applies the sandbox itself before exec.
-            // Sandbox::apply() allocates (Seatbelt profile generation, Landlock
+            // Sandbox::apply_auto() allocates (Seatbelt profile generation, Landlock
             // PathFd opens) but this is safe because we validated single-threaded
             // execution before fork, giving us a clean heap.
 
@@ -928,7 +945,18 @@ pub fn execute_supervised(
                     }
                 }
 
-                match Sandbox::apply(effective_caps) {
+                let sandbox_result = match config.sandbox_policy {
+                    crate::profile::LinuxSandboxPolicy::Auto => Sandbox::apply_auto(effective_caps),
+                    crate::profile::LinuxSandboxPolicy::Landlock => {
+                        Sandbox::apply_landlock(effective_caps)
+                            .map(|_| nono::sandbox::SeccompNetFallback::None)
+                    }
+                    crate::profile::LinuxSandboxPolicy::External => {
+                        Sandbox::apply_external_network(effective_caps)
+                    }
+                };
+
+                match sandbox_result {
                     Ok(_fallback) => {}
                     Err(e) => {
                         let detail =
@@ -948,7 +976,7 @@ pub fn execute_supervised(
 
             #[cfg(not(target_os = "linux"))]
             {
-                if let Err(e) = Sandbox::apply(effective_caps) {
+                if let Err(e) = Sandbox::apply_auto(effective_caps) {
                     let detail =
                         format!("nono: failed to apply sandbox in supervised child: {}\n", e);
                     let msg = detail.as_bytes();
@@ -976,7 +1004,7 @@ pub fn execute_supervised(
             // have disabled these flags, but we check again as defense in depth.
             #[cfg(target_os = "linux")]
             {
-                if config.capability_elevation && nono::sandbox::is_wsl2() {
+                if config.seccomp_policy.needs_openat_notify() && nono::sandbox::is_wsl2() {
                     let msg = b"nono: WSL2 detected, skipping seccomp-notify (capability elevation unavailable)\n";
                     unsafe {
                         libc::write(
@@ -985,7 +1013,7 @@ pub fn execute_supervised(
                             msg.len(),
                         );
                     }
-                } else if config.capability_elevation
+                } else if config.seccomp_policy.needs_openat_notify()
                     && let Some(fd) = child_sock_fd
                 {
                     match nono::sandbox::install_seccomp_notify() {
@@ -1040,8 +1068,7 @@ pub fn execute_supervised(
                 // The notify fd is kept alive in `proxy_notify_fd_keep` past
                 // close_inherited_fds so the parent can call pidfd_getfd
                 // before the fd is closed. It is O_CLOEXEC and closes at exec.
-                let install_network_notify =
-                    config.seccomp_proxy_fallback || config.af_unix_mediation.is_pathname();
+                let install_network_notify = config.seccomp_policy.needs_network_notify();
                 let mut proxy_notify_fd_keep: Option<std::os::fd::OwnedFd> = None;
                 if install_network_notify && nono::sandbox::is_wsl2() {
                     let msg = b"nono: WSL2 detected, skipping seccomp proxy filter (proxy network filtering unavailable)\n";
@@ -1053,7 +1080,7 @@ pub fn execute_supervised(
                         );
                     }
                 } else if install_network_notify && let Some(fd) = child_sock_fd {
-                    let notify_result = if config.seccomp_proxy_fallback {
+                    let notify_result = if config.seccomp_policy.proxy_fallback {
                         let has_bind = match effective_caps.network_mode() {
                             nono::NetworkMode::ProxyOnly { bind_ports, .. } => {
                                 !bind_ports.is_empty()
@@ -1144,10 +1171,7 @@ pub fn execute_supervised(
                     child_keep_fds.push(pnf.as_raw_fd());
                 }
 
-                if !linux_child_requires_dumpable(
-                    config.capability_elevation,
-                    config.seccomp_proxy_fallback || config.af_unix_mediation.is_pathname(),
-                ) {
+                if !config.seccomp_policy.child_requires_dumpable() {
                     use nix::sys::prctl;
 
                     if let Err(e) = prctl::set_dumpable(false) {
@@ -1291,7 +1315,8 @@ pub fn execute_supervised(
             // sent the fd via SCM_RIGHTS on the supervisor socket.
             // Only attempt recv when elevation is active (child sends the fd).
             #[cfg(target_os = "linux")]
-            let seccomp_notify_fd: Option<OwnedFd> = if config.capability_elevation {
+            let seccomp_notify_fd: Option<OwnedFd> = if config.seccomp_policy.needs_openat_notify()
+            {
                 if let Some(ref sup_sock) = supervisor_sock {
                     match sup_sock.recv_fd() {
                         Ok(fd) => {
@@ -1316,9 +1341,7 @@ pub fn execute_supervised(
             // rather than SCM_RIGHTS so the AF_UNIX BPF filter (installed after
             // the write) cannot intercept it.
             #[cfg(target_os = "linux")]
-            let proxy_notify_fd: Option<OwnedFd> = if config.seccomp_proxy_fallback
-                || config.af_unix_mediation.is_pathname()
-            {
+            let proxy_notify_fd: Option<OwnedFd> = if config.seccomp_policy.needs_network_notify() {
                 if let Some(ref sup_sock) = supervisor_sock {
                     match sup_sock.recv_raw_fd_number() {
                         Ok(child_fd_num) => {
@@ -2026,7 +2049,7 @@ fn wait_for_child(child: Pid) -> Result<WaitStatus> {
 /// This is acceptable because:
 /// 1. `execute_supervised` is CLI code, not library code (per DESIGN-supervisor.md)
 /// 2. The fork+wait model inherently requires single-threaded execution
-/// 3. Library consumers would use `Sandbox::apply()` directly, not the fork machinery
+/// 3. Library consumers would use `Sandbox::apply_auto()` directly, not the fork machinery
 fn setup_signal_forwarding(child: Pid, pty_master_fd: Option<i32>) {
     // ==================== SAFETY INVARIANT ====================
     // This static variable is ONLY safe because execute_supervised()
@@ -4061,10 +4084,51 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn test_linux_child_requires_dumpable_only_for_seccomp_driven_features() {
-        assert!(!linux_child_requires_dumpable(false, false));
-        assert!(linux_child_requires_dumpable(true, false));
-        assert!(linux_child_requires_dumpable(false, true));
-        assert!(linux_child_requires_dumpable(true, true));
+        assert!(
+            !SeccompPolicy {
+                capability_elevation: false,
+                proxy_fallback: false,
+                af_unix_mediation: false,
+                proc_comm_notify: false,
+            }
+            .child_requires_dumpable()
+        );
+        assert!(
+            SeccompPolicy {
+                capability_elevation: true,
+                proxy_fallback: false,
+                af_unix_mediation: false,
+                proc_comm_notify: false,
+            }
+            .child_requires_dumpable()
+        );
+        assert!(
+            SeccompPolicy {
+                capability_elevation: false,
+                proxy_fallback: true,
+                af_unix_mediation: false,
+                proc_comm_notify: false,
+            }
+            .child_requires_dumpable()
+        );
+        assert!(
+            SeccompPolicy {
+                capability_elevation: true,
+                proxy_fallback: true,
+                af_unix_mediation: false,
+                proc_comm_notify: false,
+            }
+            .child_requires_dumpable()
+        );
+        assert!(
+            SeccompPolicy {
+                capability_elevation: false,
+                proxy_fallback: false,
+                af_unix_mediation: false,
+                proc_comm_notify: true,
+            }
+            .child_requires_dumpable()
+        );
     }
 
     #[test]
@@ -4587,7 +4651,12 @@ mod tests {
             #[cfg(target_os = "linux")]
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
-            linux_network_notify_mode: LinuxNetworkNotifyMode::ProxyOnly,
+            seccomp_policy: SeccompPolicy {
+                capability_elevation: false,
+                proxy_fallback: true,
+                af_unix_mediation: false,
+                proc_comm_notify: false,
+            },
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             tool_sandbox_runtime: None,
         };
@@ -4707,7 +4776,12 @@ mod tests {
             #[cfg(target_os = "linux")]
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
-            linux_network_notify_mode: LinuxNetworkNotifyMode::ProxyOnly,
+            seccomp_policy: SeccompPolicy {
+                capability_elevation: false,
+                proxy_fallback: true,
+                af_unix_mediation: false,
+                proc_comm_notify: false,
+            },
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             tool_sandbox_runtime: None,
         };
@@ -4793,7 +4867,12 @@ mod tests {
             #[cfg(target_os = "linux")]
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
-            linux_network_notify_mode: LinuxNetworkNotifyMode::ProxyOnly,
+            seccomp_policy: SeccompPolicy {
+                capability_elevation: false,
+                proxy_fallback: true,
+                af_unix_mediation: false,
+                proc_comm_notify: false,
+            },
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             tool_sandbox_runtime: None,
         };
@@ -4836,7 +4915,12 @@ mod tests {
             #[cfg(target_os = "linux")]
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
-            linux_network_notify_mode: LinuxNetworkNotifyMode::ProxyOnly,
+            seccomp_policy: SeccompPolicy {
+                capability_elevation: false,
+                proxy_fallback: true,
+                af_unix_mediation: false,
+                proc_comm_notify: false,
+            },
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             tool_sandbox_runtime: None,
         };
@@ -4877,7 +4961,12 @@ mod tests {
             #[cfg(target_os = "linux")]
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
-            linux_network_notify_mode: LinuxNetworkNotifyMode::ProxyOnly,
+            seccomp_policy: SeccompPolicy {
+                capability_elevation: false,
+                proxy_fallback: true,
+                af_unix_mediation: false,
+                proc_comm_notify: false,
+            },
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             tool_sandbox_runtime: None,
         };
@@ -4900,7 +4989,12 @@ mod tests {
             #[cfg(target_os = "linux")]
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
-            linux_network_notify_mode: LinuxNetworkNotifyMode::ProxyOnly,
+            seccomp_policy: SeccompPolicy {
+                capability_elevation: false,
+                proxy_fallback: true,
+                af_unix_mediation: false,
+                proc_comm_notify: false,
+            },
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             tool_sandbox_runtime: None,
         };
@@ -4946,7 +5040,12 @@ mod tests {
             #[cfg(target_os = "linux")]
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
-            linux_network_notify_mode: LinuxNetworkNotifyMode::ProxyOnly,
+            seccomp_policy: SeccompPolicy {
+                capability_elevation: false,
+                proxy_fallback: true,
+                af_unix_mediation: false,
+                proc_comm_notify: false,
+            },
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             tool_sandbox_runtime: None,
         };
@@ -5097,7 +5196,12 @@ mod tests {
             #[cfg(target_os = "linux")]
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
-            linux_network_notify_mode: LinuxNetworkNotifyMode::ProxyOnly,
+            seccomp_policy: SeccompPolicy {
+                capability_elevation: false,
+                proxy_fallback: true,
+                af_unix_mediation: false,
+                proc_comm_notify: false,
+            },
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             tool_sandbox_runtime: None,
         };
@@ -5148,7 +5252,12 @@ mod tests {
             #[cfg(target_os = "linux")]
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
-            linux_network_notify_mode: LinuxNetworkNotifyMode::ProxyOnly,
+            seccomp_policy: SeccompPolicy {
+                capability_elevation: false,
+                proxy_fallback: true,
+                af_unix_mediation: false,
+                proc_comm_notify: false,
+            },
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             tool_sandbox_runtime: None,
         };
@@ -5188,7 +5297,12 @@ mod tests {
             #[cfg(target_os = "linux")]
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
-            linux_network_notify_mode: LinuxNetworkNotifyMode::ProxyOnly,
+            seccomp_policy: SeccompPolicy {
+                capability_elevation: false,
+                proxy_fallback: true,
+                af_unix_mediation: false,
+                proc_comm_notify: false,
+            },
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             tool_sandbox_runtime: None,
         };
@@ -5247,7 +5361,12 @@ mod tests {
             #[cfg(target_os = "linux")]
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
-            linux_network_notify_mode: LinuxNetworkNotifyMode::ProxyOnly,
+            seccomp_policy: SeccompPolicy {
+                capability_elevation: false,
+                proxy_fallback: true,
+                af_unix_mediation: false,
+                proc_comm_notify: false,
+            },
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             tool_sandbox_runtime: None,
         };

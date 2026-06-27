@@ -32,7 +32,7 @@
 //!     }
 //!
 //!     // Apply sandbox - this is irreversible
-//!     Sandbox::apply(&caps)?;
+//!     Sandbox::apply_auto(&caps)?;
 //!
 //!     // Now running sandboxed...
 //!     Ok(())

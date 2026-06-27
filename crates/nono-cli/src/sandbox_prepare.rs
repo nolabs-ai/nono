@@ -436,8 +436,16 @@ pub(crate) struct PreparedSandbox {
     pub(crate) wsl2_proxy_policy: crate::profile::Wsl2ProxyPolicy,
     #[cfg(target_os = "linux")]
     pub(crate) af_unix_mediation: crate::profile::LinuxAfUnixMediation,
+    #[cfg(target_os = "linux")]
+    pub(crate) sandbox_policy: crate::profile::LinuxSandboxPolicy,
+    #[cfg(target_os = "linux")]
+    pub(crate) explicit_sandbox_policy: Option<crate::profile::LinuxSandboxPolicy>,
     pub(crate) allow_launch_services_active: bool,
     pub(crate) allow_gpu_active: bool,
+    /// True when NVIDIA GPU support needs supervisor-mediated writes to
+    /// `/proc/<tgid>/task/<tid>/comm` for driver thread naming.
+    #[cfg(target_os = "linux")]
+    pub(crate) proc_comm_notify: bool,
     pub(crate) open_url_origins: Vec<String>,
     pub(crate) open_url_allow_localhost: bool,
     pub(crate) bypass_protection_paths: Vec<PathBuf>,
@@ -841,12 +849,10 @@ fn missing_cwd_prompt_must_fail(
 ///   unrelated kernel drivers.
 /// - `/proc/self` (read): CUDA init reads `/proc/self/maps`, `/proc/self/status`
 ///   and other per-process files.
-/// - `/proc/self/task` (read+write): NVIDIA driver 570+ writes to
-///   `/proc/self/task/<tid>/comm` during thread startup to set thread names.
-///   Without write access this returns EACCES and the driver treats it as a
-///   fatal OS error, surfacing as CUDA Error 304 (`cudaErrorOperatingSystem`).
-///   Narrowing write access to the `task` subtree keeps other per-process
-///   procfs entries read-only.
+/// - `/proc/self/task` (read): NVIDIA driver 570+ enumerates task entries and
+///   writes to `/proc/self/task/<tid>/comm` during thread startup to set thread
+///   names. The write is handled by the seccomp-notify supervisor's
+///   `proc_comm_notify` fast-path so the broader task subtree stays read-only.
 #[cfg(target_os = "linux")]
 fn grant_nvidia_gpu_procfs(caps: &mut CapabilitySet) -> Result<()> {
     for name in ["nvidia", "nvidia-uvm"] {
@@ -865,11 +871,12 @@ fn grant_nvidia_gpu_procfs(caps: &mut CapabilitySet) -> Result<()> {
         std::path::Path::new("/proc/self"),
         AccessMode::Read,
     )?);
+    // Read-only: NVIDIA driver 570+ comm writes are mediated by the
+    // supervisor's proc_comm_notify path.
     caps.add_fs(FsCapability::new_dir(
         std::path::Path::new("/proc/self/task"),
-        AccessMode::ReadWrite,
+        AccessMode::Read,
     )?);
-
     Ok(())
 }
 
@@ -897,13 +904,22 @@ fn is_nvidia_compute_device(name: &str) -> bool {
 }
 
 #[cfg(target_os = "linux")]
+pub(crate) struct GpuActivation {
+    pub(crate) active: bool,
+    pub(crate) proc_comm_notify: bool,
+}
+
+#[cfg(target_os = "linux")]
 pub(crate) fn maybe_enable_gpu(
     caps: &mut CapabilitySet,
     cli_requested: bool,
     profile_allowed: bool,
-) -> Result<bool> {
+) -> Result<GpuActivation> {
     if !cli_requested {
-        return Ok(false);
+        return Ok(GpuActivation {
+            active: false,
+            proc_comm_notify: false,
+        });
     }
 
     if !profile_allowed {
@@ -1040,7 +1056,10 @@ pub(crate) fn maybe_enable_gpu(
         "--allow-gpu enabled: allowing {} GPU device(s) on Linux",
         gpu_device_count
     );
-    Ok(true)
+    Ok(GpuActivation {
+        active: true,
+        proc_comm_notify: have_nvidia,
+    })
 }
 
 pub(crate) fn print_allow_gpu_warning(silent: bool) {
@@ -1069,8 +1088,8 @@ pub(crate) fn print_allow_gpu_warning(silent: bool) {
         eprintln!(
             "  This grants read/write access to /dev/dri/renderD* and NVIDIA compute devices.\n  \
              On NVIDIA systems, additionally: read access to /proc/driver/nvidia,\n  \
-             /proc/driver/nvidia-uvm, and /proc/self; read/write access to\n  \
-             /proc/self/task (for CUDA thread-name initialisation)."
+             /proc/driver/nvidia-uvm, /proc/self, and /proc/self/task; writes to\n  \
+             /proc/<pid>/task/<tid>/comm are mediated by the sandbox supervisor."
         );
     }
 }
@@ -1170,8 +1189,14 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
                 wsl2_proxy_policy: crate::profile::Wsl2ProxyPolicy::default(),
                 #[cfg(target_os = "linux")]
                 af_unix_mediation: crate::profile::LinuxAfUnixMediation::default(),
+                #[cfg(target_os = "linux")]
+                sandbox_policy: crate::profile::LinuxSandboxPolicy::default(),
+                #[cfg(target_os = "linux")]
+                explicit_sandbox_policy: None,
                 allow_launch_services_active: false,
                 allow_gpu_active: false,
+                #[cfg(target_os = "linux")]
+                proc_comm_notify: false,
                 open_url_origins: Vec::new(),
                 open_url_allow_localhost: false,
                 bypass_protection_paths: Vec::new(),
@@ -1198,6 +1223,10 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         wsl2_proxy_policy,
         #[cfg(target_os = "linux")]
         af_unix_mediation,
+        #[cfg(target_os = "linux")]
+        sandbox_policy,
+        #[cfg(target_os = "linux")]
+        explicit_sandbox_policy,
         workdir_access: profile_workdir_access,
         rollback_exclude_patterns: profile_rollback_patterns,
         rollback_exclude_globs: profile_rollback_globs,
@@ -1346,6 +1375,12 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         open_url_allow_localhost,
     )?;
 
+    // CLI --sandbox-policy overrides the profile value; both default to Auto.
+    #[cfg(target_os = "linux")]
+    let sandbox_policy = args.sandbox_policy.unwrap_or(sandbox_policy);
+    #[cfg(target_os = "linux")]
+    let explicit_sandbox_policy = args.sandbox_policy.or(explicit_sandbox_policy);
+
     // GPU access: macOS uses IOKit platform rules (tightened to AGXDeviceUserClient only),
     // Linux uses filesystem capabilities for render nodes and compute devices.
     #[cfg(target_os = "macos")]
@@ -1355,11 +1390,15 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         loaded_profile.is_none() || profile_allow_gpu,
     )?;
     #[cfg(target_os = "linux")]
-    let allow_gpu_active = maybe_enable_gpu(
+    let gpu_activation = maybe_enable_gpu(
         &mut caps,
         args.allow_gpu,
         loaded_profile.is_none() || profile_allow_gpu,
     )?;
+    #[cfg(target_os = "linux")]
+    let allow_gpu_active = gpu_activation.active;
+    #[cfg(target_os = "linux")]
+    let proc_comm_notify = gpu_activation.proc_comm_notify;
 
     if let Some(request) =
         pending_cwd_access_request(&caps, &workdir, profile_workdir_access.as_ref())?
@@ -1509,8 +1548,14 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
             wsl2_proxy_policy,
             #[cfg(target_os = "linux")]
             af_unix_mediation,
+            #[cfg(target_os = "linux")]
+            sandbox_policy,
+            #[cfg(target_os = "linux")]
+            explicit_sandbox_policy,
             allow_launch_services_active,
             allow_gpu_active,
+            #[cfg(target_os = "linux")]
+            proc_comm_notify,
             open_url_origins,
             open_url_allow_localhost,
             bypass_protection_paths,
@@ -1555,10 +1600,10 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn grant_nvidia_gpu_procfs_scopes_proc_self_reads_with_task_writes() {
+    fn grant_nvidia_gpu_procfs_keeps_proc_self_task_read_only() {
         // Regression test for the NVIDIA-scoped procfs grants:
         //   /proc/self       Read        (CUDA init reads maps/status/etc.)
-        //   /proc/self/task  ReadWrite   (driver writes task/<tid>/comm)
+        //   /proc/self/task  Read        (driver comm writes go via proc_comm_notify)
         // Plus any of /proc/driver/{nvidia,nvidia-uvm} that exist.
         //
         // /proc/self and /proc/self/task always exist on Linux, so those
@@ -1583,18 +1628,16 @@ mod tests {
         assert_eq!(
             proc_self.access,
             AccessMode::Read,
-            "/proc/self must be read-only (writes are scoped to /proc/self/task)"
+            "/proc/self must be read-only"
         );
         assert!(!proc_self.is_file);
 
-        let proc_self_task = find("/proc/self/task").expect(
-            "/proc/self/task must be granted read+write so the NVIDIA driver \
-             can write task/<tid>/comm (CUDA Error 304 root cause)",
-        );
+        let proc_self_task = find("/proc/self/task")
+            .expect("/proc/self/task must be granted read so the NVIDIA driver can list tasks");
         assert_eq!(
             proc_self_task.access,
-            AccessMode::ReadWrite,
-            "/proc/self/task must be granted read+write"
+            AccessMode::Read,
+            "/proc/self/task must stay read-only; comm writes are supervisor mediated"
         );
         assert!(!proc_self_task.is_file);
 
@@ -1987,8 +2030,14 @@ mod tests {
             wsl2_proxy_policy: profile::Wsl2ProxyPolicy::default(),
             #[cfg(target_os = "linux")]
             af_unix_mediation: profile::LinuxAfUnixMediation::default(),
+            #[cfg(target_os = "linux")]
+            sandbox_policy: profile::LinuxSandboxPolicy::default(),
+            #[cfg(target_os = "linux")]
+            explicit_sandbox_policy: None,
             allow_launch_services_active: false,
             allow_gpu_active: false,
+            #[cfg(target_os = "linux")]
+            proc_comm_notify: false,
             open_url_origins: Vec::new(),
             open_url_allow_localhost: false,
             bypass_protection_paths: Vec::new(),

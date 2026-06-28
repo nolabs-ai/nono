@@ -79,6 +79,13 @@ UX-driven fallbacks and error messages, it belongs in `nono-cli`, not `crates/no
 
 - Security-relevant behavior must be visible in profile, policy, CLI flag,
   manifest, or audit output.
+- When adding a CLI flag, also add the matching profile-based policy surface
+  when relevant. Check `crates/nono-cli/src/policy.rs`,
+  `crates/nono-cli/data/profile-authoring-guide.md`, and
+  `docs/cli/usage/flags.mdx` so runtime behavior, profile authoring guidance,
+  and CLI documentation stay aligned.
+- Consider whether security or capability changes require an update to
+  `crates/nono/schema/capability-manifest.schema.json`.
 - Backward-compatible aliases are allowed only when they preserve the same
   effective policy. Keep the `/// ALIAS(...)` convention for serde and clap
   aliases.
@@ -220,6 +227,11 @@ Review `crates/nono/src/trust`, `crates/nono-cli/src/trust_*`,
   protected files, unsigned downgrade, and version rollback where tracked.
 - Package install/update/pin behavior must preserve the user's trust decisions
   and make verification failures actionable.
+- If a change adds unique OS-specific or distribution-specific paths to
+  `crates/nono-cli/data/policy.json` or
+  `crates/nono-cli/data/network-policy.json`, ask whether a nono package would
+  be a better fit. The project is trying to reduce customized in-tree policy
+  logic over time.
 
 ### Rollback and Audit
 
@@ -313,7 +325,7 @@ parallel in the same process.
 
 ## Review Questions
 
-Before approving a change, answer these:
+When reviewing a change, consider these:
 
 - What new authority does this grant to the sandboxed child, supervisor, proxy,
   profile, package, or registry?

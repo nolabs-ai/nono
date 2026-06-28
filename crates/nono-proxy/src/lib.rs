@@ -19,6 +19,7 @@
 
 pub mod approval;
 pub mod audit;
+pub mod aws;
 pub mod capture;
 pub mod config;
 pub mod connect;

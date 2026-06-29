@@ -55,13 +55,16 @@ pub(super) mod git {
         pub dirs: Vec<String>,
     }
 
-    /// Run `git rev-parse --show-toplevel` and return the repo root, or `None`
-    /// when the process is not inside a git repository (or git is absent).
-    fn git_toplevel() -> Option<PathBuf> {
-        let output = Command::new("git")
-            .args(["rev-parse", "--show-toplevel"])
-            .output()
-            .ok()?;
+    /// Run `git rev-parse --show-toplevel` from `cwd` (or the process cwd when
+    /// `None`) and return the repo root, or `None` when the directory is not
+    /// inside a git repository (or git is absent).
+    fn git_toplevel(cwd: Option<&Path>) -> Option<PathBuf> {
+        let mut cmd = Command::new("git");
+        cmd.args(["rev-parse", "--show-toplevel"]);
+        if let Some(d) = cwd {
+            cmd.current_dir(d);
+        }
+        let output = cmd.output().ok()?;
         if !output.status.success() {
             return None;
         }
@@ -75,11 +78,15 @@ pub(super) mod git {
     /// Invoke `git config --list --show-origin --show-scope` and return
     /// the file-typed paths the git binary needs to read at startup.
     ///
+    /// `workdir` is used as the git working directory when provided, so that
+    /// `hasconfig:` includeIf rules resolve against the correct repository
+    /// instead of the process cwd.
+    ///
     /// See [`read_hooks_path`] for directory-typed paths.
     ///
     /// Returns an empty list if `git` is absent or exits non-zero.
-    pub(crate) fn read_files() -> Result<Vec<String>> {
-        let cwd = git_toplevel();
+    pub(crate) fn read_files(workdir: Option<&Path>) -> Result<Vec<String>> {
+        let cwd = git_toplevel(workdir);
         Ok(run(cwd.as_deref(), None)?.files)
     }
 
@@ -87,14 +94,20 @@ pub(super) mod git {
     /// the directory-typed paths the git binary needs to read (today: just
     /// `core.hooksPath` if set in the `global` or `system` scope).
     ///
+    /// `workdir` is used as the git working directory when provided.
+    ///
     /// Returned paths are intended for `fs_read` lists.
-    pub(crate) fn read_hooks_path() -> Result<Vec<String>> {
-        let cwd = git_toplevel();
+    pub(crate) fn read_hooks_path(workdir: Option<&Path>) -> Result<Vec<String>> {
+        let cwd = git_toplevel(workdir);
         Ok(run(cwd.as_deref(), None)?.dirs)
     }
 
     /// Return the path to the git common directory (`.git` or the main repo's
     /// `.git` when running inside a worktree).
+    ///
+    /// `workdir` is used as the starting directory for `git rev-parse`, so
+    /// that `@git:common-dir` resolves correctly when the `--workdir` passed
+    /// into `from_profile` differs from the process cwd.
     ///
     /// In a regular repo this is `.git` (relative). In a worktree it is an
     /// absolute path pointing to the main repo's `.git`. Either form is
@@ -103,8 +116,8 @@ pub(super) mod git {
     ///
     /// Returns an empty list when git is absent, the command fails, or the
     /// process is not inside a git repository.
-    pub(crate) fn read_common_dir() -> Result<Vec<String>> {
-        run_common_dir(git_toplevel().as_deref())
+    pub(crate) fn read_common_dir(workdir: Option<&Path>) -> Result<Vec<String>> {
+        run_common_dir(git_toplevel(workdir).as_deref())
     }
 
     /// Return the main worktree root (parent of `@git:common-dir`).
@@ -117,8 +130,8 @@ pub(super) mod git {
     ///
     /// Returns an empty list when git is absent, the command fails, or the
     /// process is not inside a git repository.
-    pub(crate) fn read_main_worktree() -> Result<Vec<String>> {
-        run_main_worktree(None)
+    pub(crate) fn read_main_worktree(workdir: Option<&Path>) -> Result<Vec<String>> {
+        run_main_worktree(workdir)
     }
 
     fn run_main_worktree(cwd: Option<&Path>) -> Result<Vec<String>> {
@@ -149,8 +162,8 @@ pub(super) mod git {
     ///
     /// Returns an empty list when git is absent, the command fails, or the
     /// process is not inside a git repository.
-    pub(crate) fn read_toplevel() -> Result<Vec<String>> {
-        run_toplevel(None)
+    pub(crate) fn read_toplevel(workdir: Option<&Path>) -> Result<Vec<String>> {
+        run_toplevel(workdir)
     }
 
     /// Return the parent directory of the current git checkout root.
@@ -161,8 +174,8 @@ pub(super) mod git {
     ///
     /// Returns an empty list when git is absent, the command fails, or the
     /// process is not inside a git repository.
-    pub(crate) fn read_toplevel_parent() -> Result<Vec<String>> {
-        run_toplevel_parent(None)
+    pub(crate) fn read_toplevel_parent(workdir: Option<&Path>) -> Result<Vec<String>> {
+        run_toplevel_parent(workdir)
     }
 
     fn run_toplevel(cwd: Option<&Path>) -> Result<Vec<String>> {
@@ -353,15 +366,19 @@ pub(super) mod git {
 /// provider implementation. Returns an error for unknown providers so
 /// typos and stale profile entries surface at launch rather than silently
 /// producing no paths.
-fn dispatch_token(provider: &str, query: &str) -> Result<Vec<String>> {
+fn dispatch_token(
+    provider: &str,
+    query: &str,
+    workdir: Option<&std::path::Path>,
+) -> Result<Vec<String>> {
     match provider {
         "git" => match query {
-            "config-files" => git::read_files(),
-            "hooks-path" => git::read_hooks_path(),
-            "common-dir" => git::read_common_dir(),
-            "worktree" => git::read_main_worktree(),
-            "toplevel" => git::read_toplevel(),
-            "toplevel-parent" => git::read_toplevel_parent(),
+            "config-files" => git::read_files(workdir),
+            "hooks-path" => git::read_hooks_path(workdir),
+            "common-dir" => git::read_common_dir(workdir),
+            "worktree" => git::read_main_worktree(workdir),
+            "toplevel" => git::read_toplevel(workdir),
+            "toplevel-parent" => git::read_toplevel_parent(workdir),
             other => Err(NonoError::ProfileParse(format!(
                 "unknown git provider query '{other}'"
             ))),
@@ -374,11 +391,17 @@ fn dispatch_token(provider: &str, query: &str) -> Result<Vec<String>> {
 
 /// Expand every dynamic-provider token in a path list in place, returning
 /// the expanded list. Literal paths pass through unchanged.
-pub(super) fn expand_dynamic_tokens(entries: &[String]) -> Result<Vec<String>> {
+///
+/// `workdir` is forwarded to git providers so that `@git:*` tokens resolve
+/// relative to the intended working directory rather than the process cwd.
+pub(crate) fn expand_dynamic_tokens(
+    entries: &[String],
+    workdir: Option<&std::path::Path>,
+) -> Result<Vec<String>> {
     let mut out = Vec::with_capacity(entries.len());
     for entry in entries {
         match parse_token(entry) {
-            Some((provider, query)) => out.extend(dispatch_token(provider, query)?),
+            Some((provider, query)) => out.extend(dispatch_token(provider, query, workdir)?),
             None => out.push(entry.clone()),
         }
     }
@@ -425,21 +448,21 @@ mod tests {
     #[test]
     fn expand_dynamic_tokens_passes_literal_paths_through_unchanged() {
         let input = vec!["~/.gitconfig".to_string(), "/etc/static".to_string()];
-        let out = expand_dynamic_tokens(&input).expect("literal pass-through");
+        let out = expand_dynamic_tokens(&input, None).expect("literal pass-through");
         assert_eq!(out, vec!["~/.gitconfig", "/etc/static"]);
     }
 
     #[test]
     fn expand_dynamic_tokens_errors_on_unknown_provider() {
         let input = vec!["@unknown:query".to_string()];
-        let err = expand_dynamic_tokens(&input).expect_err("unknown provider");
+        let err = expand_dynamic_tokens(&input, None).expect_err("unknown provider");
         assert!(format!("{err}").contains("unknown"));
     }
 
     #[test]
     fn expand_dynamic_tokens_errors_on_unknown_git_query() {
         let input = vec!["@git:nonsense".to_string()];
-        let err = expand_dynamic_tokens(&input).expect_err("unknown git query");
+        let err = expand_dynamic_tokens(&input, None).expect_err("unknown git query");
         assert!(format!("{err}").contains("nonsense"));
     }
 

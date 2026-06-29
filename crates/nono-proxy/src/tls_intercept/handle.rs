@@ -996,10 +996,11 @@ where
     let strip_header = cred.map(|c| c.proxy_header_name.as_str()).unwrap_or("");
     let filtered_headers = reverse::filter_headers(&req.header_bytes, strip_header);
     let content_length = reverse::extract_content_length(&req.header_bytes);
-    let body = match reverse::read_request_body(tls_stream, content_length, &req.buffered).await? {
-        Some(b) => b,
-        None => return Ok(()),
-    };
+    let mut body =
+        match reverse::read_request_body(tls_stream, content_length, &req.buffered).await? {
+            Some(b) => b,
+            None => return Ok(()),
+        };
 
     // --- Build upstream request bytes ---
     let upstream_authority = reverse::format_host_header(UpstreamScheme::Https, ctx.host, ctx.port);
@@ -1028,6 +1029,28 @@ where
             .as_deref()
             .and_then(|r| r.oauth_capture())
             .is_some();
+
+    // Resolve broker nonces in the request body for token refresh requests.
+    // When the agent sends a refresh, `refresh_token` in the JSON body is a
+    // nono_<hex> nonce that must be swapped for the real token before the
+    // request reaches the upstream OAuth server. Unresolvable nonces are
+    // forwarded unchanged (the upstream rejects with an auth error, which is
+    // the correct fail-closed behavior: no real credential is leaked).
+    if oauth_capture_active {
+        if let (Some(consumer), Some(resolver)) =
+            (nonce_consumer.as_deref(), ctx.nonce_resolver.as_deref())
+        {
+            if let Some(rewritten) =
+                crate::oauth_rewrite::resolve_nonces_in_oauth_request_body(&body, consumer, resolver)
+            {
+                debug!(
+                    "oauth-capture (h1): resolved nonce(s) in refresh request body for {}",
+                    ctx.host
+                );
+                body = rewritten;
+            }
+        }
+    }
 
     for (name, value) in &filtered_headers {
         if injected_header_names

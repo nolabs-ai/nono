@@ -761,6 +761,25 @@
       "workdir": { "access": "readwrite" },
       "interactive": false
     },
+    "bun-dev": {
+      "extends": "default",
+      "meta": {
+        "name": "bun-dev",
+        "version": "1.0.0",
+        "description": "Bun runtime development profile",
+        "author": "always-further"
+      },
+      "groups": {
+        "include": ["bun_runtime"]
+      },
+      "security": {
+        "signal_mode": "isolated"
+      },
+      "filesystem": {},
+      "network": { "block": false, "network_profile": "developer" },
+      "workdir": { "access": "readwrite" },
+      "interactive": false
+    },
     "go-dev": {
       "extends": "default",
       "meta": {

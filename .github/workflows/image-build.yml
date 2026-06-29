@@ -55,18 +55,24 @@ jobs:
             # Skip prereleases
             if [[ "$TAG" == *alpha* ]] || [[ "$TAG" == *beta* ]] || [[ "$TAG" == *rc* ]]; then
               echo "Skipping prerelease tag: $TAG"
-              echo "push=false" >> "$GITHUB_OUTPUT"
-              echo "ref=$TAG" >> "$GITHUB_OUTPUT"
-              echo "version=$TAG" >> "$GITHUB_OUTPUT"
+              {
+                echo "push=false"
+                echo "ref=$TAG"
+                echo "version=$TAG"
+              } >> "$GITHUB_OUTPUT"
               exit 0
             fi
-            echo "ref=$TAG" >> "$GITHUB_OUTPUT"
-            echo "version=$TAG" >> "$GITHUB_OUTPUT"
-            echo "push=true" >> "$GITHUB_OUTPUT"
+            {
+              echo "ref=$TAG"
+              echo "version=$TAG"
+              echo "push=true"
+            } >> "$GITHUB_OUTPUT"
           else
-            echo "ref=$WD_REF" >> "$GITHUB_OUTPUT"
-            echo "version=${WD_VERSION:-$WD_REF}" >> "$GITHUB_OUTPUT"
-            echo "push=$WD_PUSH" >> "$GITHUB_OUTPUT"
+            {
+              echo "ref=$WD_REF"
+              echo "version=${WD_VERSION:-$WD_REF}"
+              echo "push=$WD_PUSH"
+            } >> "$GITHUB_OUTPUT"
           fi
 
   build-binaries:
@@ -182,9 +188,11 @@ jobs:
             TAGS="${TAGS},ghcr.io/nolabs-ai/nono:latest"
           fi
 
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "stable=$STABLE" >> "$GITHUB_OUTPUT"
-          echo "tags=$TAGS" >> "$GITHUB_OUTPUT"
+          {
+            echo "version=$VERSION"
+            echo "stable=$STABLE"
+            echo "tags=$TAGS"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@06116385d9baf250c9f4dcb4858b16962ea869c3 # v4.1.0

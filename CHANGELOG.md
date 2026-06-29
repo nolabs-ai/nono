@@ -1,5 +1,65 @@
 # Changelog
 
+## [0.66.0] - 2026-06-29
+
+### Bug Fixes
+
+- *(network)* Error early on contradictory network flag combinations (#1263) ([#1263](https://github.com/nolabs-ai/nono/pull/1263))
+
+- *(network)* Wire --allow-endpoint through to credential routes (#1127) ([#1127](https://github.com/nolabs-ai/nono/pull/1127))
+
+- *(sandbox)* Warn when capability path is on a 9P filesystem (#1207) ([#1207](https://github.com/nolabs-ai/nono/pull/1207))
+
+- *(ci)* Downgrade runner to ubuntu-latest (#1259) ([#1259](https://github.com/nolabs-ai/nono/pull/1259))
+
+- *(tool-sandbox)* Skip missing fs_read/fs_write dirs instead of erroring (#1253) ([#1253](https://github.com/nolabs-ai/nono/pull/1253))
+
+- *(tool-sandbox)* Pass TLS trust bundle env vars to tool-sandbox children (#1249) ([#1249](https://github.com/nolabs-ai/nono/pull/1249))
+
+- *(proxy)* Match wildcard credential upstream routes (#1243) ([#1243](https://github.com/nolabs-ai/nono/pull/1243))
+
+
+### CI/CD
+
+- Fix mapping err in compile step (#1251) ([#1251](https://github.com/nolabs-ai/nono/pull/1251))
+
+- Idempotent publish-crates + cross-compile check on release PRs (#1245) ([#1245](https://github.com/nolabs-ai/nono/pull/1245))
+
+
+### Dependencies
+
+- *(deps)* Bump sigstore-trust-root from 0.8.0 to 0.9.0 (#1229) ([#1229](https://github.com/nolabs-ai/nono/pull/1229))
+
+- *(deps)* Bump criterion from 0.5.1 to 0.8.2 (#1232) ([#1232](https://github.com/nolabs-ai/nono/pull/1232))
+
+
+### Documentation
+
+- *(proxy)* Explain proxy activation via custom credentials (#1247) ([#1247](https://github.com/nolabs-ai/nono/pull/1247))
+
+- *(proxy)* Fix stale X-Nono-Token authentication claim (#1246) ([#1246](https://github.com/nolabs-ai/nono/pull/1246))
+
+
+### Features
+
+- *(tool-sandbox)* Simplify self-invocation policy (#1268) ([#1268](https://github.com/nolabs-ai/nono/pull/1268))
+
+- *(tool-sandbox)* Add @git:common-dir dynamic token (#1271) ([#1271](https://github.com/nolabs-ai/nono/pull/1271))
+
+- *(proxy)* Add HTTP/2 support for reverse proxy and credential injection (#983) ([#983](https://github.com/nolabs-ai/nono/pull/983))
+
+- *(tests)* Add end-to-end integration tests for sandbox execution strategies (#1213) ([#1213](https://github.com/nolabs-ai/nono/pull/1213))
+
+
+### Miscellaneous
+
+- Migrate GitHub org references from always-further to nolabs-ai (#1235) ([#1235](https://github.com/nolabs-ai/nono/pull/1235))
+
+
+### Refactoring
+
+- *(network)* Introduce NetworkIntent and remove ProxyOnly placeholders (#1225) ([#1225](https://github.com/nolabs-ai/nono/pull/1225))
+
 ## [Unreleased]
 
 ### Features

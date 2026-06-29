@@ -21,20 +21,32 @@ fn apply_pre_fork_sandbox(
     strategy: exec_strategy::ExecStrategy,
     caps: &CapabilitySet,
     silent: bool,
+    #[cfg(target_os = "linux")] sandbox_policy: crate::profile::LinuxSandboxPolicy,
 ) -> Result<()> {
     if matches!(strategy, exec_strategy::ExecStrategy::Direct) {
         output::print_applying_sandbox(silent);
 
         #[cfg(target_os = "linux")]
         {
+            use crate::profile::LinuxSandboxPolicy;
             let detected = Sandbox::detect_abi()?;
             info!("Direct mode: detected {}", detected);
-            Sandbox::apply_with_abi(caps, &detected)?;
+            match sandbox_policy {
+                LinuxSandboxPolicy::Auto => {
+                    Sandbox::apply_auto_with_abi(caps, &detected)?;
+                }
+                LinuxSandboxPolicy::Landlock => {
+                    Sandbox::apply_landlock_with_abi(caps, &detected)?;
+                }
+                LinuxSandboxPolicy::External => {
+                    Sandbox::apply_external()?;
+                }
+            }
         }
 
         #[cfg(not(target_os = "linux"))]
         {
-            Sandbox::apply(caps)?;
+            Sandbox::apply_auto(caps)?;
         }
     }
     Ok(())
@@ -387,7 +399,13 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         ));
     }
 
-    apply_pre_fork_sandbox(strategy, &caps, flags.silent)?;
+    apply_pre_fork_sandbox(
+        strategy,
+        &caps,
+        flags.silent,
+        #[cfg(target_os = "linux")]
+        flags.sandbox_policy,
+    )?;
 
     // Session id shared across before- and after-hook so paired setup/teardown
     // scripts see the same NONO_SESSION_ID. Only allocated when at least one
@@ -568,11 +586,12 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
                 program: recommended_program_name,
                 recommended_profile: known_builtin_profile,
             }),
-        capability_elevation: flags.capability_elevation,
         #[cfg(target_os = "linux")]
-        seccomp_proxy_fallback,
-        #[cfg(target_os = "linux")]
-        af_unix_mediation: flags.af_unix_mediation,
+        seccomp_policy: exec_strategy::SeccompPolicy {
+            capability_elevation: flags.capability_elevation,
+            proxy_fallback: seccomp_proxy_fallback,
+            af_unix_mediation: flags.af_unix_mediation.is_pathname(),
+        },
         allowed_env_vars: flags.allowed_env_vars,
         denied_env_vars: flags.denied_env_vars,
         set_vars: flags.set_vars.unwrap_or_default(),

@@ -799,16 +799,15 @@ mod tests {
         assert_eq!(pid, std::process::id());
     }
 
-    /// Create a temp directory inside the cargo target dir for socket tests.
-    /// This avoids macOS Seatbelt denials when running tests inside a sandbox
-    /// (Seatbelt's `deny network*` blocks Unix socket connect on /var/folders).
+    /// Create a short-path temp directory for socket tests.
+    /// Socket paths must stay under the SUN_LEN limit (~104 bytes on macOS); use
+    /// /tmp directly rather than the cargo target dir, which under a git worktree
+    /// produces paths that exceed the limit and fail UnixListener::bind with EINVAL.
     fn socket_test_dir() -> tempfile::TempDir {
-        let target = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target");
-        std::fs::create_dir_all(&target).ok();
         tempfile::Builder::new()
             .prefix("sock-test-")
-            .tempdir_in(&target)
-            .expect("create test tmpdir in target/")
+            .tempdir_in(std::path::Path::new("/tmp"))
+            .expect("create test tmpdir in /tmp")
     }
 
     #[test]

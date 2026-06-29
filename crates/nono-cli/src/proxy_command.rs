@@ -112,9 +112,29 @@ pub(crate) fn run_proxy(args: ProxyArgs, silent: bool) -> Result<()> {
     print_connection_info(&handle, &proxy_config, args.no_auth, silent);
 
     // Block the foreground until the user interrupts, then shut down cleanly.
+    //
+    // Nothing consumes the in-memory network audit buffer on the standalone
+    // path (only the sandboxed rollback path drains it), so it would fill to
+    // its 4096-event cap and then log "audit buffer full" on every subsequent
+    // request. Periodically drain it to void to keep the buffer bounded and
+    // silent. The events carry no value here — they're collected only for
+    // rollback audit recording, which this command does not perform.
     rt.block_on(async {
-        if let Err(e) = tokio::signal::ctrl_c().await {
-            tracing::warn!("failed to listen for Ctrl-C: {}; shutting down", e);
+        let mut drain = tokio::time::interval(std::time::Duration::from_secs(30));
+        // The first tick fires immediately; we only care about subsequent ones.
+        drain.tick().await;
+        loop {
+            tokio::select! {
+                signal = tokio::signal::ctrl_c() => {
+                    if let Err(e) = signal {
+                        tracing::warn!("failed to listen for Ctrl-C: {}; shutting down", e);
+                    }
+                    break;
+                }
+                _ = drain.tick() => {
+                    let _ = handle.drain_audit_events();
+                }
+            }
         }
     });
 

@@ -59,12 +59,10 @@ mod tests {
     use std::path::PathBuf;
 
     fn socket_test_dir() -> tempfile::TempDir {
-        let target = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target");
-        std::fs::create_dir_all(&target).ok();
         tempfile::Builder::new()
             .prefix("url-open-test-")
-            .tempdir_in(&target)
-            .expect("create test tmpdir in target/")
+            .tempdir_in(std::path::Path::new("/tmp"))
+            .expect("create test tmpdir in /tmp")
     }
 
     fn can_use_unix_sockets(dir: &std::path::Path) -> bool {

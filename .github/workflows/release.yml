@@ -275,23 +275,6 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
-  update-homebrew-core:
-    name: Bump Homebrew Core Formula
-    needs: release
-    runs-on: ubuntu-latest
-    if: ${{ !contains(github.event.inputs.tag || github.ref_name, 'alpha') && !contains(github.event.inputs.tag || github.ref_name, 'beta') && !contains(github.event.inputs.tag || github.ref_name, 'rc') }}
-    steps:
-      - name: Bump homebrew-core formula
-        # Pinned to AvesAlight fork (v4.1.1) which accepts any 3xx redirect; revert to mislav once
-        # https://github.com/mislav/bump-homebrew-formula-action/issues/340 is fixed upstream.
-        uses: AvesAlight/bump-homebrew-formula-action@efacc598ed9b4b1bc526125f82d2dfba17509842 # v4.1.1
-        with:
-          formula-name: nono
-          tag-name: ${{ env.RELEASE_TAG }}
-          download-url: "https://github.com/nolabs-ai/nono/archive/refs/tags/${{ env.RELEASE_TAG }}.tar.gz"
-        env:
-          COMMITTER_TOKEN: ${{ secrets.HOMEBREW_CORE_TOKEN }}
-
   notify-downstream:
     name: Notify Downstream Repos
     needs: [release, publish-crates]

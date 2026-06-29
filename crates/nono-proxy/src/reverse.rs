@@ -287,6 +287,34 @@ pub async fn handle_reverse_proxy(
                 send_error(stream, 401, "Unauthorized").await?;
                 return Ok(());
             }
+        } else if let Some(cmd) = cmd_route {
+            if let Err(e) = validate_phantom_token_for_mode(
+                &cmd.proxy_inject_mode,
+                remaining_header,
+                &upstream_path,
+                &cmd.proxy_header_name,
+                cmd.proxy_path_pattern.as_deref(),
+                cmd.proxy_query_param_name.as_deref(),
+                ctx.session_token,
+            ) {
+                let deny_ctx = audit::EventContext {
+                    auth_outcome: Some(nono::undo::NetworkAuditAuthOutcome::Failed),
+                    denial_category: Some(
+                        nono::undo::NetworkAuditDenialCategory::AuthenticationFailed,
+                    ),
+                    ..managed_ctx.clone().unwrap_or_else(|| route_ctx.clone())
+                };
+                audit::log_denied(
+                    ctx.audit_log,
+                    audit::ProxyMode::Reverse,
+                    &deny_ctx,
+                    &service,
+                    0,
+                    &e.to_string(),
+                );
+                send_error(stream, 401, "Unauthorized").await?;
+                return Ok(());
+            }
         } else if let Err(e) = token::validate_proxy_auth(remaining_header, ctx.session_token) {
             let deny_ctx = audit::EventContext {
                 auth_outcome: Some(nono::undo::NetworkAuditAuthOutcome::Failed),
@@ -304,48 +332,6 @@ pub async fn handle_reverse_proxy(
             send_error(stream, 407, "Proxy Authentication Required").await?;
             return Ok(());
         }
-    } else if let Some(cmd) = cmd_route {
-        if let Err(e) = validate_phantom_token_for_mode(
-            &cmd.proxy_inject_mode,
-            remaining_header,
-            &upstream_path,
-            &cmd.proxy_header_name,
-            cmd.proxy_path_pattern.as_deref(),
-            cmd.proxy_query_param_name.as_deref(),
-            ctx.session_token,
-        ) {
-            let deny_ctx = audit::EventContext {
-                auth_outcome: Some(nono::undo::NetworkAuditAuthOutcome::Failed),
-                denial_category: Some(nono::undo::NetworkAuditDenialCategory::AuthenticationFailed),
-                ..managed_ctx.clone().unwrap_or_else(|| route_ctx.clone())
-            };
-            audit::log_denied(
-                ctx.audit_log,
-                audit::ProxyMode::Reverse,
-                &deny_ctx,
-                &service,
-                0,
-                &e.to_string(),
-            );
-            send_error(stream, 401, "Unauthorized").await?;
-            return Ok(());
-        }
-    } else if let Err(e) = token::validate_proxy_auth(remaining_header, ctx.session_token) {
-        let deny_ctx = audit::EventContext {
-            auth_outcome: Some(nono::undo::NetworkAuditAuthOutcome::Failed),
-            denial_category: Some(nono::undo::NetworkAuditDenialCategory::AuthenticationFailed),
-            ..proxy_auth_event_ctx(&service)
-        };
-        audit::log_denied(
-            ctx.audit_log,
-            audit::ProxyMode::Reverse,
-            &deny_ctx,
-            &service,
-            0,
-            &e.to_string(),
-        );
-        send_error(stream, 407, "Proxy Authentication Required").await?;
-        return Ok(());
     }
 
     let captured_credential = if let Some(cmd) = cmd_route

@@ -1302,6 +1302,7 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncReadExt;
 
     #[test]
     fn normalize_authority_normalises_case_and_default_port() {
@@ -1349,6 +1350,123 @@ mod tests {
             handle.token.len(),
             64,
             "empty --pass must fall back to a random token"
+        );
+        handle.shutdown();
+    }
+
+    /// Spawn a one-shot loopback HTTP server that accepts a single connection,
+    /// drains the request, and replies `200 OK`. Returns its `host:port`.
+    /// Used as a reverse-proxy upstream so the auth decision can be observed
+    /// end-to-end without reaching the network.
+    async fn spawn_mock_upstream() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                // Read until the end of the request head, then reply.
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                    .await;
+            }
+        });
+        format!("127.0.0.1:{}", addr.port())
+    }
+
+    /// A declarative (credential-less) reverse-proxy route whose upstream is a
+    /// loopback `http://` server. With no credential, the auth path falls to
+    /// the session-token fallback branch — the branch the `require_auth` fix
+    /// moved back inside the guard.
+    fn declarative_route(upstream: &str) -> crate::config::RouteConfig {
+        crate::config::RouteConfig {
+            prefix: "svc".to_string(),
+            upstream: upstream.to_string(),
+            credential_key: None,
+            inject_mode: Default::default(),
+            inject_header: "Authorization".to_string(),
+            credential_format: None,
+            path_pattern: None,
+            path_replacement: None,
+            query_param_name: None,
+            proxy: None,
+            env_var: None,
+            endpoint_rules: vec![],
+            endpoint_policy: None,
+            tls_ca: None,
+            tls_client_cert: None,
+            tls_client_key: None,
+            oauth2: None,
+            aws_auth: None,
+        }
+    }
+
+    /// Send `GET /svc/` through the proxy at `port` with no `Proxy-Authorization`
+    /// header and return the upstream status line the proxy wrote back.
+    async fn unauthenticated_reverse_request(port: u16) -> String {
+        let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        client
+            .write_all(b"GET /svc/ HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            .await
+            .unwrap();
+        let mut resp = Vec::new();
+        // Read the response head; the upstream is tiny so a single read suffices.
+        let mut buf = [0u8; 1024];
+        if let Ok(n) = client.read(&mut buf).await {
+            resp.extend_from_slice(&buf[..n]);
+        }
+        String::from_utf8_lossy(&resp)
+            .lines()
+            .next()
+            .unwrap_or("")
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn test_no_auth_skips_reverse_proxy_authentication() {
+        // Regression: `nono proxy --no-auth` (require_auth == false) must skip
+        // session-token enforcement on reverse-proxy routes. A previous
+        // restructure chained the auth branches as `else if` alternatives to
+        // `if ctx.require_auth`, so disabling auth still rejected requests.
+        let upstream = spawn_mock_upstream().await;
+        let config = ProxyConfig {
+            routes: vec![declarative_route(&format!("http://{upstream}"))],
+            allowed_hosts: vec!["127.0.0.1".to_string()],
+            require_auth: false,
+            ..Default::default()
+        };
+        let handle = start(config).await.unwrap();
+        let status = unauthenticated_reverse_request(handle.port).await;
+        assert!(
+            status.contains("200"),
+            "with --no-auth an unauthenticated reverse request must reach the upstream, got: {status:?}"
+        );
+        assert!(
+            !status.contains("407") && !status.contains("401"),
+            "auth must not be enforced when disabled, got: {status:?}"
+        );
+        handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_reverse_proxy_enforces_auth_when_required() {
+        // Companion to the --no-auth case: with auth required, an
+        // unauthenticated reverse request must still be challenged (407),
+        // locking the toggle in both directions.
+        let upstream = spawn_mock_upstream().await;
+        let config = ProxyConfig {
+            routes: vec![declarative_route(&format!("http://{upstream}"))],
+            allowed_hosts: vec!["127.0.0.1".to_string()],
+            require_auth: true,
+            ..Default::default()
+        };
+        let handle = start(config).await.unwrap();
+        let status = unauthenticated_reverse_request(handle.port).await;
+        assert!(
+            status.contains("407"),
+            "with auth required an unauthenticated reverse request must be challenged, got: {status:?}"
         );
         handle.shutdown();
     }

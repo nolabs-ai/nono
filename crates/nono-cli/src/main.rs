@@ -51,6 +51,7 @@ mod profile_cmd;
 mod profile_runtime;
 mod profile_save_runtime;
 mod protected_paths;
+mod proxy_command;
 mod proxy_runtime;
 mod pty_proxy;
 mod pull_ui;

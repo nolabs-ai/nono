@@ -214,6 +214,7 @@ fn cli_verbosity(cli: &Cli) -> u8 {
         Commands::Shell(args) => args.sandbox.verbose,
         Commands::Wrap(args) => args.sandbox.verbose,
         Commands::Setup(args) => args.verbose,
+        Commands::Proxy(args) => args.verbose,
         Commands::Why(_)
         | Commands::Rollback(_)
         | Commands::Trust(_)

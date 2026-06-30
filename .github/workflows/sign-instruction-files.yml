@@ -26,9 +26,9 @@ permissions:
 
 jobs:
   sign:
-    if: github.repository == 'always-further/nono'
+    if: github.repository == 'nolabs-ai/nono'
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - uses: always-further/agent-sign@c9426f1a00f823dd53e7b9068d910a68b43e49e9 # v0.0.11
+      - uses: nolabs-ai/agent-sign@c9426f1a00f823dd53e7b9068d910a68b43e49e9 # v0.0.11

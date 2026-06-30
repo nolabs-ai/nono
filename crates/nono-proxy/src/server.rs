@@ -15,9 +15,10 @@ use crate::credential::CredentialStore;
 use crate::error::{ProxyError, Result};
 use crate::external;
 use crate::filter::ProxyFilter;
+use crate::pool::UpstreamPool;
 use crate::reverse;
 use crate::route::RouteStore;
-use crate::tls_intercept::{self, CertCache, EphemeralCa};
+use crate::tls_intercept::{self, CertCache, EphemeralCa, UpstreamH2Cache};
 use crate::token;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -374,13 +375,20 @@ struct ProxyState {
     filter: ProxyFilter,
     session_token: Zeroizing<String>,
     /// Route-level configuration (upstream, L7 filtering, custom TLS CA) for all routes.
-    route_store: RouteStore,
+    route_store: Arc<RouteStore>,
     /// Credential-specific configuration (inject mode, headers, secrets) for routes with credentials.
-    credential_store: CredentialStore,
+    credential_store: Arc<CredentialStore>,
     config: ProxyConfig,
     /// Shared TLS connector for upstream connections (reverse proxy mode).
     /// Created once at startup to avoid rebuilding the root cert store per request.
     tls_connector: tokio_rustls::TlsConnector,
+    /// Default TLS client config (system roots). Used as the pool key for
+    /// routes without a custom CA.
+    default_tls_config: Arc<rustls::ClientConfig>,
+    /// Upstream connection pool (HTTP/1.1 keep-alive + HTTP/2 multiplexing).
+    upstream_pool: Arc<UpstreamPool>,
+    /// TLS connector with h2 ALPN for upstream HTTP/2 connections (gRPC).
+    tls_connector_h2: tokio_rustls::TlsConnector,
     /// Active connection count for connection limiting.
     active_connections: AtomicUsize,
     /// Shared network audit log for this proxy session.
@@ -401,6 +409,11 @@ struct ProxyState {
     /// CONNECT branch (CONNECTs fall through to the existing 403/tunnel
     /// dispatch even for routes that would otherwise require L7).
     cert_cache: Option<Arc<CertCache>>,
+    /// Whether HTTP/2 is enabled for upstream connections and intercept ALPN.
+    enable_h2: bool,
+    /// Per-host HTTP/2 capability cache. Populated by pre-flight probes so
+    /// the inbound acceptor only advertises h2 when the upstream supports it.
+    h2_cache: Arc<UpstreamH2Cache>,
 }
 
 /// Start the proxy server.
@@ -508,7 +521,16 @@ pub async fn start_with_nonce_resolver(
     .map_err(|e| ProxyError::Config(format!("TLS config error: {}", e)))?
     .with_root_certificates(root_store)
     .with_no_client_auth();
-    let tls_connector = tokio_rustls::TlsConnector::from(Arc::new(tls_config));
+    let tls_config_arc = Arc::new(tls_config.clone());
+    let tls_connector = tokio_rustls::TlsConnector::from(Arc::clone(&tls_config_arc));
+    let upstream_pool = Arc::new(UpstreamPool::new(
+        Arc::clone(&tls_config_arc),
+        config.enable_h2,
+    ));
+
+    let mut tls_config_h2 = tls_config;
+    tls_config_h2.alpn_protocols = vec![b"h2".to_vec()];
+    let tls_connector_h2 = tokio_rustls::TlsConnector::from(Arc::new(tls_config_h2));
 
     // Load credentials for reverse proxy routes (static keystore + OAuth2)
     let (credential_store, proxy_diagnostics) = if config.routes.is_empty() {
@@ -658,13 +680,17 @@ pub async fn start_with_nonce_resolver(
         (None, _) => (None, None),
     };
 
+    let enable_h2 = config.enable_h2;
     let state = Arc::new(ProxyState {
         filter,
         session_token: session_token.clone(),
-        route_store,
-        credential_store,
+        route_store: Arc::new(route_store),
+        credential_store: Arc::new(credential_store),
         config,
         tls_connector,
+        default_tls_config: tls_config_arc,
+        upstream_pool,
+        tls_connector_h2,
         active_connections: AtomicUsize::new(0),
         audit_log: Arc::clone(&audit_log),
         approval_backends,
@@ -672,6 +698,8 @@ pub async fn start_with_nonce_resolver(
         nonce_resolver,
         bypass_matcher,
         cert_cache,
+        enable_h2,
+        h2_cache: UpstreamH2Cache::new(),
     });
 
     // Spawn accept loop as a task within the current runtime.
@@ -969,21 +997,66 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
                                 None
                             };
 
+                        let mut h2_enabled_for_target = state.enable_h2;
+                        let (tls_connector_h2, h2_connector_cache_key) = if state.enable_h2 {
+                            match tls_intercept::handle::select_h2_tls_connector_for_target(
+                                &state.route_store,
+                                &host,
+                                port,
+                                &state.tls_connector_h2,
+                            ) {
+                                Ok(selected) => selected,
+                                Err(err) => {
+                                    warn!(
+                                        "tls_intercept: disabling h2 for {}:{}: {}",
+                                        host, port, err
+                                    );
+                                    h2_enabled_for_target = false;
+                                    (
+                                        state.tls_connector_h2.clone(),
+                                        "disabled-route-tls".to_string(),
+                                    )
+                                }
+                            }
+                        } else {
+                            (state.tls_connector_h2.clone(), "disabled".to_string())
+                        };
+
+                        // Pre-flight h2 probe: only advertise h2 to the agent
+                        // when the upstream actually negotiates it, avoiding
+                        // NoApplicationProtocol against h1-only upstreams.
+                        let upstream_h2 = if h2_enabled_for_target {
+                            state
+                                .h2_cache
+                                .get_or_probe(
+                                    &host,
+                                    port,
+                                    &state.filter,
+                                    &tls_connector_h2,
+                                    upstream_proxy.as_ref(),
+                                    &h2_connector_cache_key,
+                                )
+                                .await
+                        } else {
+                            false
+                        };
                         let ctx = tls_intercept::InterceptCtx {
                             route_id,
                             host: &host,
                             port,
-                            route_store: &state.route_store,
-                            credential_store: &state.credential_store,
+                            route_store: Arc::clone(&state.route_store),
+                            credential_store: Arc::clone(&state.credential_store),
                             session_token: &state.session_token,
                             cert_cache: Arc::clone(cache),
                             tls_connector: &state.tls_connector,
+                            tls_connector_h2: &tls_connector_h2,
                             filter: &state.filter,
                             audit_log: Some(&state.audit_log),
                             upstream_proxy,
                             approval_backends: state.approval_backends.clone(),
                             credential_capture_backend: state.credential_capture_backend.clone(),
                             nonce_resolver: state.nonce_resolver.clone(),
+                            enable_h2: upstream_h2,
                         };
                         return tls_intercept::handle_intercept_connect(&mut stream, ctx).await;
                     }
@@ -1089,6 +1162,8 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
             session_token: &state.session_token,
             filter: &state.filter,
             tls_connector: &state.tls_connector,
+            default_tls_config: &state.default_tls_config,
+            upstream_pool: &state.upstream_pool,
             audit_log: Some(&state.audit_log),
             approval_backends: state.approval_backends.clone(),
             credential_capture_backend: state.credential_capture_backend.clone(),

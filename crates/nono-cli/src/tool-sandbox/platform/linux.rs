@@ -4,7 +4,7 @@ use crate::audit_integrity::{
 };
 use crate::command_policy::{
     CommandFromConfig, CommandPoliciesConfig, CommandSandboxConfig, ResolvedCommandBinaries,
-    ResolvedCommandBinary, ResolvedExecutableKind,
+    ResolvedCommandBinary, ResolvedExecutableKind, has_explicit_self_invocation_entry,
 };
 use crate::profile;
 use crate::tool_sandbox::credentials::{ResolvedCredential, resolve_credentials};
@@ -859,7 +859,7 @@ fn run_child_launcher() -> Result<()> {
     let caps = caps_from_spec(&spec.caps)?;
     tool_sandbox_profile_log!("launcher:caps_from_spec: {:?}", start_caps_from.elapsed());
     let start_sandbox_apply = std::time::Instant::now();
-    Sandbox::apply(&caps)?;
+    Sandbox::apply_auto(&caps)?;
     tool_sandbox_profile_log!(
         "launcher:sandbox_apply: {:?}",
         start_sandbox_apply.elapsed()
@@ -1215,7 +1215,7 @@ fn handle_shim_stream_inner(
     let auth = authenticate_shim(peer_pid, shim_fd, &request.command, state)?;
     let stdio = recv_stdio_fds(stream)?;
 
-    let caller = match resolve_caller(auth.peer_pid, session_root_pid, state) {
+    let caller = match resolve_caller(auth.peer_pid, session_root_pid, state, &request.command) {
         Ok(caller) => caller,
         Err(err) => {
             record_command_policy_audit(
@@ -1892,16 +1892,22 @@ fn resolve_caller(
     peer_pid: u32,
     session_root_pid: u32,
     state: &ToolSandboxState,
+    command_name: &str,
 ) -> Result<Caller> {
     let mut pid = peer_pid;
     for _ in 0..ANCESTRY_DEPTH_LIMIT {
+        if let Some((command, launch_caller)) = live_active_child(pid, state)? {
+            if command == command_name
+                && !has_explicit_self_invocation_entry(&state.plan.config, command_name)
+            {
+                return Ok(launch_caller);
+            }
+            return Ok(Caller::Command { command, pid });
+        }
         if pid == session_root_pid {
             return Ok(Caller::Session {
                 pid: session_root_pid,
             });
-        }
-        if let Some(command) = live_active_child_command(pid, state)? {
-            return Ok(Caller::Command { command, pid });
         }
         if pid <= 1 {
             break;
@@ -1913,13 +1919,10 @@ fn resolve_caller(
     ))
 }
 
-fn live_active_child_command(pid: u32, state: &ToolSandboxState) -> Result<Option<String>> {
-    Ok(live_active_child(pid, state)?.map(|(command, _)| command))
-}
-
-/// Like [`live_active_child_command`] but also returns the caller the command
-/// was launched under. Used by the URL-open path to resolve the requesting
-/// command's own running policy.
+/// Returns the active command for `pid` and the caller it was launched under.
+/// Self-invocation with no explicit self-invocation entry uses the launch caller so
+/// recursive tool calls keep the current effective policy instead of requiring
+/// a `<cmd>.can_use[<cmd>]` edge.
 fn live_active_child(pid: u32, state: &ToolSandboxState) -> Result<Option<(String, Caller)>> {
     let map = state
         .active_children
@@ -3226,11 +3229,11 @@ fn add_policy_fs(
     use super::dynamic_providers::expand_dynamic_tokens;
     for entry in &expand_dynamic_tokens(&policy.fs_read)? {
         let path = resolve_policy_path(entry, policy_root)?;
-        caps.add_fs(FsCapability::new_dir(path, AccessMode::Read)?);
+        add_optional_dir(caps, path, AccessMode::Read)?;
     }
     for entry in &expand_dynamic_tokens(&policy.fs_write)? {
         let path = resolve_policy_path(entry, policy_root)?;
-        caps.add_fs(FsCapability::new_dir(path, AccessMode::ReadWrite)?);
+        add_optional_dir(caps, path, AccessMode::ReadWrite)?;
     }
     for entry in &expand_dynamic_tokens(&policy.fs_read_file)? {
         let path = resolve_policy_path(entry, policy_root)?;
@@ -3241,6 +3244,17 @@ fn add_policy_fs(
         caps.add_fs(FsCapability::new_file(path, AccessMode::ReadWrite)?);
     }
     Ok(())
+}
+
+fn add_optional_dir(caps: &mut CapabilitySet, path: PathBuf, access: AccessMode) -> Result<()> {
+    match FsCapability::new_dir(&path, access) {
+        Ok(capability) => {
+            caps.add_fs(capability);
+            Ok(())
+        }
+        Err(NonoError::PathNotFound(_)) => Ok(()),
+        Err(err) => Err(err),
+    }
 }
 
 fn add_optional_read_file(caps: &mut CapabilitySet, path: PathBuf) -> Result<()> {
@@ -5085,6 +5099,73 @@ mod tests {
         let result =
             ensure_outer_exec_gate_fully_enforced(landlock::RulesetStatus::PartiallyEnforced);
         assert!(matches!(result, Err(err) if err.to_string().contains("partially enforced")));
+    }
+
+    #[test]
+    fn resolve_caller_prefers_active_command_for_different_invocation() -> Result<()> {
+        let state = test_state_with_chaining_paths(
+            PathBuf::from("/tmp/nono-tool-sandbox-test"),
+            PathBuf::from("/tmp/nono-tool-sandbox-test/supervisor.sock"),
+            PathBuf::from("/tmp/nono-tool-sandbox-test/shims"),
+            ShimIdentity {
+                path: PathBuf::from("/tmp/nono-tool-sandbox-test/shims/git"),
+                id: FileId { dev: 1, ino: 1 },
+            },
+        );
+        let pid = std::process::id();
+        track_child(&state, pid, "git", &Caller::Session { pid })?;
+
+        let caller = resolve_caller(pid, pid, &state, "ssh")?;
+
+        assert!(matches!(caller, Caller::Command { command, .. } if command == "git"));
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_caller_uses_launch_caller_for_self_invocation() -> Result<()> {
+        let state = test_state_with_chaining_paths(
+            PathBuf::from("/tmp/nono-tool-sandbox-test"),
+            PathBuf::from("/tmp/nono-tool-sandbox-test/supervisor.sock"),
+            PathBuf::from("/tmp/nono-tool-sandbox-test/shims"),
+            ShimIdentity {
+                path: PathBuf::from("/tmp/nono-tool-sandbox-test/shims/git"),
+                id: FileId { dev: 1, ino: 1 },
+            },
+        );
+        let pid = std::process::id();
+        track_child(&state, pid, "git", &Caller::Session { pid })?;
+
+        let caller = resolve_caller(pid, pid, &state, "git")?;
+
+        assert!(matches!(caller, Caller::Session { .. }));
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_caller_honors_explicit_self_edge() -> Result<()> {
+        let mut state = test_state_with_chaining_paths(
+            PathBuf::from("/tmp/nono-tool-sandbox-test"),
+            PathBuf::from("/tmp/nono-tool-sandbox-test/supervisor.sock"),
+            PathBuf::from("/tmp/nono-tool-sandbox-test/shims"),
+            ShimIdentity {
+                path: PathBuf::from("/tmp/nono-tool-sandbox-test/shims/git"),
+                id: FileId { dev: 1, ino: 1 },
+            },
+        );
+        state.plan.config.commands.insert(
+            "git".to_string(),
+            CommandPolicyConfig {
+                can_use: vec!["git".to_string()],
+                ..Default::default()
+            },
+        );
+        let pid = std::process::id();
+        track_child(&state, pid, "git", &Caller::Session { pid })?;
+
+        let caller = resolve_caller(pid, pid, &state, "git")?;
+
+        assert!(matches!(caller, Caller::Command { command, .. } if command == "git"));
+        Ok(())
     }
 
     #[test]

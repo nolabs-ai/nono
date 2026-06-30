@@ -29,7 +29,7 @@ const ENV_NO_MIGRATE: &str = "NONO_NO_MIGRATE";
 /// Surfaced in both the install confirmation and the decline-path hint
 /// so users have a way to investigate before they say yes (or come
 /// back to after they say no).
-const LEARN_MORE_URL: &str = "https://github.com/always-further/nono/discussions/780";
+const LEARN_MORE_URL: &str = "https://github.com/nolabs-ai/nono/discussions/780";
 
 /// Profile names this CLI knows about as official, vetted packs.
 /// Fast-path for the common case so users don't pay a network round

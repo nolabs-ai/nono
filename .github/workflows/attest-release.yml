@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   attest:
-    if: github.repository == 'always-further/nono'
+    if: github.repository == 'nolabs-ai/nono'
     name: Attest Release Artifacts
     runs-on: ubuntu-latest
     permissions:
@@ -35,7 +35,7 @@ jobs:
             --dir artifacts
 
       - name: Attest build provenance
-        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26  # v4.1.0
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763  # v4.1.1
         with:
           subject-path: |
             artifacts/*.tar.gz

@@ -514,6 +514,10 @@
           "type": "boolean",
           "description": "Block network access. Network is allowed by default; set to true to deny all outbound traffic."
         },
+        "allow_http2": {
+          "type": "boolean",
+          "description": "Allow HTTP/2 to upstream servers via ALPN negotiation. Defaults to false (HTTP/1.1 with keep-alive). Equivalent to the --allow-http2 CLI flag."
+        },
         "network_profile": {
           "oneOf": [
             { "type": "string" },
@@ -1190,7 +1194,7 @@
         "can_use": {
           "type": "array",
           "items": { "$ref": "#/$defs/CommandPolicyIdentifier" },
-          "description": "Commands this command may invoke through tool-sandbox chaining."
+          "description": "Other commands this command may invoke through tool-sandbox chaining. If no explicit self-invocation entry is configured, self-invocation keeps the command's current effective policy and does not require listing the command here."
         },
         "sandbox": {
           "$ref": "#/$defs/CommandSandboxConfig",

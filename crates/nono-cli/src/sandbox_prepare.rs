@@ -436,6 +436,8 @@ pub(crate) struct PreparedSandbox {
     pub(crate) wsl2_proxy_policy: crate::profile::Wsl2ProxyPolicy,
     #[cfg(target_os = "linux")]
     pub(crate) af_unix_mediation: crate::profile::LinuxAfUnixMediation,
+    #[cfg(target_os = "linux")]
+    pub(crate) sandbox_policy: crate::profile::LinuxSandboxPolicy,
     pub(crate) allow_launch_services_active: bool,
     pub(crate) allow_gpu_active: bool,
     pub(crate) open_url_origins: Vec<String>,
@@ -451,6 +453,9 @@ pub(crate) struct PreparedSandbox {
     /// flag is read directly from `SandboxArgs` at proxy-launch time, so only
     /// the profile's contribution needs to be carried through.
     pub(crate) profile_network_block: bool,
+    /// True when the profile or CLI requested HTTP/2 to upstream servers
+    /// (`network.allow_http2` or `--allow-http2`).
+    pub(crate) allow_http2_requested: bool,
 }
 
 fn resolved_workdir(args: &SandboxArgs) -> PathBuf {
@@ -580,13 +585,9 @@ fn finalize_prepared_sandbox(
     silent: bool,
 ) -> Result<PreparedSandbox> {
     output::print_skipped_requested_paths(&collect_missing_cli_requested_paths(args), silent);
-    let has_proxy_intent = args.has_proxy_flags()
-        || prepared.network_profile.is_some()
-        || !prepared.allow_domain.is_empty()
-        || !prepared.credentials.is_empty()
-        || prepared.upstream_proxy.is_some();
-    let block_wins = args.block_net || (prepared.profile_network_block && !has_proxy_intent);
-    let proxy_pending = !block_wins && !args.allow_net && has_proxy_intent;
+    let proxy_intent = has_proxy_intent(args, &prepared);
+    let block_wins = args.block_net || (prepared.profile_network_block && !proxy_intent);
+    let proxy_pending = !block_wins && !args.allow_net && proxy_intent;
     output::print_capabilities(
         &prepared.caps,
         blocked_grants,
@@ -613,6 +614,16 @@ fn finalize_prepared_sandbox(
     Ok(prepared)
 }
 
+/// Returns true if any CLI flag or profile field requires the proxy to run.
+fn has_proxy_intent(args: &SandboxArgs, prepared: &PreparedSandbox) -> bool {
+    args.has_proxy_flags()
+        || !prepared.credentials.is_empty()
+        || !prepared.custom_credentials.is_empty()
+        || prepared.network_profile.is_some()
+        || !prepared.allow_domain.is_empty()
+        || prepared.upstream_proxy.is_some()
+}
+
 pub(crate) fn validate_external_proxy_bypass(
     args: &SandboxArgs,
     prepared: &PreparedSandbox,
@@ -627,6 +638,78 @@ pub(crate) fn validate_external_proxy_bypass(
                 .to_string(),
         ));
     }
+    Ok(())
+}
+
+/// Validate that `--block-net` is not combined with flags that imply proxy
+/// mode, and that `--allow-endpoint` always has a matching credential.
+///
+/// These combinations are logically contradictory: `--block-net` prevents all
+/// outbound traffic, so proxy-mode flags would be silently ignored.
+pub(crate) fn validate_block_net_conflicts(
+    args: &SandboxArgs,
+    prepared: &PreparedSandbox,
+) -> Result<()> {
+    let block_net = args.block_net || prepared.profile_network_block;
+
+    if block_net {
+        // Credential injection requires the proxy to be reachable.
+        let has_credentials = !args.proxy_credential.is_empty() || !prepared.credentials.is_empty();
+        if has_credentials {
+            return Err(NonoError::ConfigParse(
+                "--block-net and --credential are contradictory: \
+                 credential injection requires the proxy to be reachable"
+                    .to_string(),
+            ));
+        }
+
+        // A network profile configures proxy-mode filtering.
+        let has_network_profile =
+            args.network_profile.is_some() || prepared.network_profile.is_some();
+        if has_network_profile {
+            return Err(NonoError::ConfigParse(
+                "--block-net and --network-profile are contradictory: \
+                 a network profile requires proxy mode"
+                    .to_string(),
+            ));
+        }
+
+        // --allow-domain implies proxy-filtered mode.
+        let has_allow_domain = !args.allow_proxy.is_empty() || !prepared.allow_domain.is_empty();
+        if has_allow_domain {
+            return Err(NonoError::ConfigParse(
+                "--block-net and --allow-domain are contradictory: \
+                 domain filtering requires proxy mode"
+                    .to_string(),
+            ));
+        }
+    }
+
+    // --allow-endpoint without any credential is a no-op (and almost certainly
+    // a user error: the service name doesn't match any loaded credential).
+    if !args.allow_endpoint.is_empty() {
+        let has_credentials = !args.proxy_credential.is_empty()
+            || !prepared.credentials.is_empty()
+            || !prepared.custom_credentials.is_empty();
+        if !has_credentials {
+            return Err(NonoError::ConfigParse(
+                "--allow-endpoint requires at least one --credential \
+                 (no credential loaded for the named service)"
+                    .to_string(),
+            ));
+        }
+    }
+
+    // --proxy-port without any proxy-triggering flag is almost certainly a
+    // mistake: the port would be set but the proxy would never start.
+    if args.proxy_port.is_some() && !has_proxy_intent(args, prepared) {
+        return Err(NonoError::ConfigParse(
+            "--proxy-port has no effect without a proxy-mode flag \
+             (e.g. --credential, --network-profile, --allow-domain)"
+                .to_string(),
+        ));
+    }
+
     Ok(())
 }
 
@@ -1089,6 +1172,8 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
                 wsl2_proxy_policy: crate::profile::Wsl2ProxyPolicy::default(),
                 #[cfg(target_os = "linux")]
                 af_unix_mediation: crate::profile::LinuxAfUnixMediation::default(),
+                #[cfg(target_os = "linux")]
+                sandbox_policy: crate::profile::LinuxSandboxPolicy::default(),
                 allow_launch_services_active: false,
                 allow_gpu_active: false,
                 open_url_origins: Vec::new(),
@@ -1100,6 +1185,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
                 denied_env_vars: None,
                 set_vars: None,
                 profile_network_block: false,
+                allow_http2_requested: args.allow_http2,
             },
             &[],
             args,
@@ -1116,6 +1202,8 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         wsl2_proxy_policy,
         #[cfg(target_os = "linux")]
         af_unix_mediation,
+        #[cfg(target_os = "linux")]
+        sandbox_policy,
         workdir_access: profile_workdir_access,
         rollback_exclude_patterns: profile_rollback_patterns,
         rollback_exclude_globs: profile_rollback_globs,
@@ -1264,6 +1352,10 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         open_url_allow_localhost,
     )?;
 
+    // CLI --sandbox-policy overrides the profile value; both default to Auto.
+    #[cfg(target_os = "linux")]
+    let sandbox_policy = args.sandbox_policy.unwrap_or(sandbox_policy);
+
     // GPU access: macOS uses IOKit platform rules (tightened to AGXDeviceUserClient only),
     // Linux uses filesystem capabilities for render nodes and compute devices.
     #[cfg(target_os = "macos")]
@@ -1383,6 +1475,13 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         .map(|p| p.network.block)
         .unwrap_or(false);
 
+    // Capture the profile's `network.allow_http2` intent alongside the CLI flag.
+    let profile_allow_http2 = loaded_profile
+        .as_ref()
+        .map(|p| p.network.allow_http2)
+        .unwrap_or(false);
+    let allow_http2_requested = args.allow_http2 || profile_allow_http2;
+
     let profile_secrets = loaded_profile
         .as_ref()
         .map(|profile| profile.env_credentials.mappings.clone())
@@ -1420,6 +1519,8 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
             wsl2_proxy_policy,
             #[cfg(target_os = "linux")]
             af_unix_mediation,
+            #[cfg(target_os = "linux")]
+            sandbox_policy,
             allow_launch_services_active,
             allow_gpu_active,
             open_url_origins,
@@ -1431,6 +1532,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
             denied_env_vars: profile_denied_env_vars,
             set_vars: profile_set_vars,
             profile_network_block,
+            allow_http2_requested,
         },
         &blocked_grants,
         args,
@@ -1872,5 +1974,171 @@ mod tests {
             ),
             Some(DetachedCwdPromptResponse::Deny)
         );
+    }
+
+    fn empty_prepared() -> PreparedSandbox {
+        PreparedSandbox {
+            caps: CapabilitySet::default(),
+            secrets: Vec::new(),
+            profile_display_name: None,
+            command_policies: None,
+            session_hooks: profile::SessionHooks::default(),
+            rollback_exclude_patterns: Vec::new(),
+            rollback_exclude_globs: Vec::new(),
+            network_profile: None,
+            allow_domain: Vec::new(),
+            credentials: Vec::new(),
+            custom_credentials: std::collections::HashMap::new(),
+            credential_capture: std::collections::HashMap::new(),
+            tls_intercept: None,
+            upstream_proxy: None,
+            upstream_bypass: Vec::new(),
+            listen_ports: Vec::new(),
+            capability_elevation: false,
+            #[cfg(target_os = "linux")]
+            wsl2_proxy_policy: profile::Wsl2ProxyPolicy::default(),
+            #[cfg(target_os = "linux")]
+            af_unix_mediation: profile::LinuxAfUnixMediation::default(),
+            #[cfg(target_os = "linux")]
+            sandbox_policy: profile::LinuxSandboxPolicy::default(),
+            allow_launch_services_active: false,
+            allow_gpu_active: false,
+            open_url_origins: Vec::new(),
+            open_url_allow_localhost: false,
+            bypass_protection_paths: Vec::new(),
+            ignored_denial_paths: Vec::new(),
+            suppressed_system_service_operations: Vec::new(),
+            allowed_env_vars: None,
+            denied_env_vars: None,
+            set_vars: None,
+            profile_network_block: false,
+            allow_http2_requested: false,
+        }
+    }
+
+    #[test]
+    fn block_net_with_credential_errors() {
+        let args = SandboxArgs {
+            block_net: true,
+            proxy_credential: vec!["openai".to_string()],
+            ..Default::default()
+        };
+        let prepared = empty_prepared();
+        let err = validate_block_net_conflicts(&args, &prepared)
+            .expect_err("expected error for --block-net + --credential");
+        assert!(
+            err.to_string().contains("--block-net") && err.to_string().contains("--credential"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn block_net_with_network_profile_errors() {
+        let args = SandboxArgs {
+            block_net: true,
+            network_profile: Some("strict".to_string()),
+            ..Default::default()
+        };
+        let prepared = empty_prepared();
+        let err = validate_block_net_conflicts(&args, &prepared)
+            .expect_err("expected error for --block-net + --network-profile");
+        assert!(
+            err.to_string().contains("--block-net")
+                && err.to_string().contains("--network-profile"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn block_net_with_allow_domain_errors() {
+        let args = SandboxArgs {
+            block_net: true,
+            allow_proxy: vec!["example.com".to_string()],
+            ..Default::default()
+        };
+        let prepared = empty_prepared();
+        let err = validate_block_net_conflicts(&args, &prepared)
+            .expect_err("expected error for --block-net + --allow-domain");
+        assert!(
+            err.to_string().contains("--block-net") && err.to_string().contains("--allow-domain"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn block_net_alone_is_valid() {
+        let args = SandboxArgs {
+            block_net: true,
+            ..Default::default()
+        };
+        let prepared = empty_prepared();
+        assert!(validate_block_net_conflicts(&args, &prepared).is_ok());
+    }
+
+    #[test]
+    fn profile_network_block_with_credential_from_profile_errors() {
+        let args = SandboxArgs::default();
+        let mut prepared = empty_prepared();
+        prepared.profile_network_block = true;
+        prepared.credentials = vec!["github".to_string()];
+        let err = validate_block_net_conflicts(&args, &prepared)
+            .expect_err("expected error for profile network block + profile credential");
+        assert!(
+            err.to_string().contains("--block-net") && err.to_string().contains("--credential"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn allow_endpoint_without_credential_errors() {
+        let args = SandboxArgs {
+            allow_endpoint: vec!["openai:GET:/v1/chat/completions".to_string()],
+            ..Default::default()
+        };
+        let prepared = empty_prepared();
+        let err = validate_block_net_conflicts(&args, &prepared)
+            .expect_err("expected error for --allow-endpoint without --credential");
+        assert!(
+            err.to_string().contains("--allow-endpoint")
+                && err.to_string().contains("--credential"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn allow_endpoint_with_credential_is_valid() {
+        let args = SandboxArgs {
+            allow_endpoint: vec!["openai:GET:/v1/chat/completions".to_string()],
+            proxy_credential: vec!["openai".to_string()],
+            ..Default::default()
+        };
+        let prepared = empty_prepared();
+        assert!(validate_block_net_conflicts(&args, &prepared).is_ok());
+    }
+
+    #[test]
+    fn proxy_port_without_proxy_intent_errors() {
+        let args = SandboxArgs {
+            proxy_port: Some(8080),
+            ..Default::default()
+        };
+        let prepared = empty_prepared();
+        let err = validate_block_net_conflicts(&args, &prepared)
+            .expect_err("expected error for --proxy-port without proxy mode");
+        assert!(
+            err.to_string().contains("--proxy-port"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn proxy_port_with_credential_is_valid() {
+        let args = SandboxArgs {
+            proxy_port: Some(8080),
+            proxy_credential: vec!["openai".to_string()],
+            ..Default::default()
+        };
+        let prepared = empty_prepared();
+        assert!(validate_block_net_conflicts(&args, &prepared).is_ok());
     }
 }

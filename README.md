@@ -10,7 +10,7 @@
 </p>
 <p>
   <a href="https://opensource.org/licenses/Apache-2.0"><img src="https://img.shields.io/badge/License-Apache%202.0-blue.svg" alt="License"/></a>
-  <a href="https://github.com/always-further/nono/actions/workflows/ci.yml"><img src="https://github.com/always-further/nono/actions/workflows/ci.yml/badge.svg" alt="CI Status"/></a>
+  <a href="https://github.com/nolabs-ai/nono/actions/workflows/ci.yml"><img src="https://github.com/nolabs-ai/nono/actions/workflows/ci.yml/badge.svg" alt="CI Status"/></a>
   <a href="https://www.bestpractices.dev/projects/13332"><img src="https://www.bestpractices.dev/projects/13332/badge" alt="OpenSSF Best Practices"/></a>
   <a href="https://docs.nono.sh"><img src="https://img.shields.io/badge/Docs-docs.nono.sh-green.svg" alt="Documentation"/></a>
 </p>
@@ -18,7 +18,7 @@
   <a href="https://discord.gg/pPcjYzGvbS">
     <img src="https://img.shields.io/badge/Chat-Join%20Discord-7289da?style=for-the-badge&logo=discord&logoColor=white" alt="Join Discord"/>
   </a>
-   <a href="https://alwaysfurther.ai/careers">
+   <a href="https://nolabs.ai/careers">
       <img src="https://img.shields.io/badge/We're_Hiring-Join_the_team-ff4f00?style=for-the-badge&logo=githubsponsors&logoColor=white" alt="We're hiring"/>
   </a>
   <a href="https://github.com/marketplace/actions/agent-sign">
@@ -63,7 +63,7 @@ Search for an agent in the registry, then run it:
 
 ```bash
 $ nono search opencode
-always-further/opencode	-	Official Always Further Opencode Plugin
+always-further/opencode	-	Official Opencode Plugin
 
 $ nono run --profile always-further/opencode -- opencode
 ```
@@ -91,7 +91,7 @@ Head over to the [docs](https://nono.sh/docs) and discover nono's rich composabl
 
 nono provides FFI bindings for Rust, Python, TypeScript, and Go.
 
-Also available as [Python](https://github.com/always-further/nono-py), [TypeScript](https://github.com/always-further/nono-ts), and [Go](https://github.com/always-further/nono-go) bindings.
+Also available as [Python](https://github.com/nolabs-ai/nono-py), [TypeScript](https://github.com/nolabs-ai/nono-ts), and [Go](https://github.com/nolabs-ai/nono-go) bindings.
 
 ## Contributing
 
@@ -99,7 +99,7 @@ We encourage using AI tools to contribute. However, you must understand and care
 
 ## Security
 
-If you discover a security vulnerability, please **do not open a public issue**. Follow the process in our [Security Policy](https://github.com/always-further/nono/security).
+If you discover a security vulnerability, please **do not open a public issue**. Follow the process in our [Security Policy](https://github.com/nolabs-ai/nono/security).
 
 ## License
 

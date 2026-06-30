@@ -19,7 +19,7 @@ cargo install nono-cli
 ### From Source
 
 ```bash
-git clone https://github.com/always-further/nono
+git clone https://github.com/nolabs-ai/nono
 cd nono
 cargo build --release
 ```

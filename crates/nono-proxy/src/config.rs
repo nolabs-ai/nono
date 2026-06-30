@@ -113,6 +113,12 @@ pub struct ProxyConfig {
     /// Leaf expiry is capped by the issuer CA expiry.
     #[serde(default, skip)]
     pub leaf_validity: Option<std::time::Duration>,
+
+    /// Enable HTTP/2 negotiation for upstream connections.
+    /// When false (default), the reverse proxy pool uses HTTP/1.1 with
+    /// keep-alive and the CONNECT intercept only advertises HTTP/1.1 ALPN.
+    #[serde(default)]
+    pub enable_h2: bool,
 }
 
 /// Pre-generated CA key material for cross-session CA reuse.
@@ -165,6 +171,7 @@ impl Default for ProxyConfig {
             preloaded_ca: None,
             ca_validity: None,
             leaf_validity: None,
+            enable_h2: false,
         }
     }
 }

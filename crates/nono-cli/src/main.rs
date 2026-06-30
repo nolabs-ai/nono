@@ -296,6 +296,8 @@ mod tests {
             wsl2_proxy_policy: crate::profile::Wsl2ProxyPolicy::Error,
             #[cfg(target_os = "linux")]
             af_unix_mediation: crate::profile::LinuxAfUnixMediation::Off,
+            #[cfg(target_os = "linux")]
+            sandbox_policy: crate::profile::LinuxSandboxPolicy::Auto,
             allow_launch_services_active: false,
             allow_gpu_active: false,
             open_url_origins: Vec::new(),
@@ -307,6 +309,7 @@ mod tests {
             denied_env_vars: None,
             set_vars: None,
             profile_network_block: false,
+            allow_http2_requested: false,
         };
 
         let effective = resolve_effective_proxy_settings(&args, &prepared);
@@ -353,6 +356,8 @@ mod tests {
             wsl2_proxy_policy: crate::profile::Wsl2ProxyPolicy::Error,
             #[cfg(target_os = "linux")]
             af_unix_mediation: crate::profile::LinuxAfUnixMediation::Off,
+            #[cfg(target_os = "linux")]
+            sandbox_policy: crate::profile::LinuxSandboxPolicy::Auto,
             allow_launch_services_active: false,
             allow_gpu_active: false,
             open_url_origins: Vec::new(),
@@ -364,6 +369,7 @@ mod tests {
             denied_env_vars: None,
             set_vars: None,
             profile_network_block: false,
+            allow_http2_requested: false,
         };
 
         let effective = resolve_effective_proxy_settings(&args, &prepared);

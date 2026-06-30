@@ -339,9 +339,34 @@ Enable verbose logging to see proxy decisions:
 nono run -vv --network-profile claude-code --allow-cwd -- my-agent
 ```
 
+## HTTP/2 Support (`--allow-http2`)
+
+By default, the proxy uses HTTP/1.1 with keep-alive connection pooling for all upstream connections. The `--allow-http2` flag enables HTTP/2 multiplexing via ALPN negotiation:
+
+```bash
+nono run --profile claude-code --allow-http2 -- claude
+```
+
+When enabled:
+
+- **Reverse proxy**: Negotiates h2 with upstreams that support it, allowing multiple requests to be multiplexed over a single TCP connection. This eliminates per-request TLS handshake overhead (~50-100ms) for workloads with many concurrent requests to the same host (e.g., Maven/Gradle artifact downloads).
+- **CONNECT intercept**: Advertises both `h2` and `http/1.1` in ALPN, enabling gRPC and other HTTP/2 clients to negotiate h2 transparently through the proxy. Per-stream endpoint rules and credential injection are enforced at the HTTP/2 frame level.
+
+### Why Disabled by Default
+
+HTTP/2 is opt-in because:
+- Some upstream servers or corporate proxies may not handle h2 correctly
+- HTTP/1.1 keep-alive is sufficient for most workloads
+- h2 multiplexing changes request ordering semantics, which may affect rate-limited APIs
+
+### Connection Pooling
+
+Regardless of `--allow-http2`, the reverse proxy reuses TCP+TLS connections via keep-alive. With HTTP/1.1, connections are reused but requests are serialized per connection. With HTTP/2, multiple concurrent requests share a single connection via stream multiplexing.
+
+The pool provides DNS rebinding protection: resolved IPs are pinned after the initial filter check, preventing TOCTOU attacks on reused connections.
+
 ## Limitations
 
-- **HTTP/1.1 only** — The CONNECT tunnel passes raw bytes (HTTP/2 works end-to-end), but the reverse proxy mode speaks HTTP/1.1 to upstream
 - **No per-port filtering on macOS** — Seatbelt cannot filter outbound by destination port
 - **Domain filtering requires supervised execution** — The proxy runs in the unsandboxed parent process, so `nono wrap` (Direct mode) is incompatible. Use `nono run` instead.
 - **WSL2: no per-port filtering or domain filtering by default** — See [WSL2 section](#wsl2) above

@@ -16,7 +16,7 @@ A Tool Sandbox profile answers three questions:
 | Question | Field |
 |---|---|
 | What may the outer session run directly? | `command_policies.commands.<name>.sandbox` or `command_policies.commands.<name>.from.session` |
-| What may one Tool Sandbox command run next? | `command_policies.commands.<caller>.can_use` plus `command_policies.commands.<callee>.from.<caller>` |
+| What may one Tool Sandbox command run next? | `command_policies.commands.<caller>.can_use` plus `command_policies.commands.<callee>.from.<caller>` for other commands; self-invocation is implicit unless a self-invocation entry is configured |
 | What does the selected child command receive? | `sandbox` or caller-specific `from.<caller>` grants |
 
 `command_policies.entrypoint` is still parsed for older profiles, but current profiles should express direct session access with `commands.<name>.sandbox` or `commands.<name>.from.session`.
@@ -60,7 +60,7 @@ Each entry under `commands` uses the command name as the key:
 |---|---|---|
 | `sandbox` | object | Direct-session policy shorthand. This lets the outer session run the command. |
 | `from` | object | Caller-specific policies. Use `session` for direct session invocation or another command name for chaining. |
-| `can_use` | command-name array | Commands this command may invoke through Tool Sandbox. |
+| `can_use` | command-name array | Other commands this command may invoke through Tool Sandbox. If no self-invocation entry is configured, self-invocation keeps the current effective policy. |
 | `executable` | absolute path | Pin the command name to one executable file instead of the first `PATH` match. |
 | `allow_writable_executable` | boolean | Per-command trust downgrade for a pinned executable writable by the sandbox capability set. Requires absolute `executable`. |
 | `intercept` | array | Ordered argument-prefix mediation rules evaluated after invocation policy. |
@@ -102,6 +102,7 @@ Supported tokens:
 |---|---|---|
 | `@git:config-files` | `fs_read_file` | Trusted global/system Git config files and configured Git file paths, such as attributes, excludes, and commit template files. |
 | `@git:hooks-path` | `fs_read` | Trusted global/system `core.hooksPath` directories. |
+| `@git:common-dir` | `fs_write`, `fs_read` | The git common directory: `.git` in a regular repo, or the absolute path to the main repo's `.git` when running inside a git worktree. Useful in `fs_write` when the agent session starts from a worktree and `--workdir` points to the worktree itself — the token ensures the git object store (which lives in the main repo) is covered. |
 
 Example:
 
@@ -112,7 +113,8 @@ Example:
       "git": {
         "sandbox": {
           "fs_read_file": ["@git:config-files"],
-          "fs_read": ["@git:hooks-path"]
+          "fs_read": ["@git:hooks-path"],
+          "fs_write": ["$WORKDIR", "@git:common-dir"]
         }
       }
     }
@@ -121,6 +123,8 @@ Example:
 ```
 
 The Git provider reads `git config --list --show-origin --show-scope` and keeps only `global` and `system` scoped paths. It ignores `local` and `worktree` scopes so a repository cannot grant itself additional host filesystem access through `.git/config`. If `git` is unavailable or returns no matching paths, the token expands to no paths.
+
+The `@git:common-dir` token runs `git rev-parse --git-common-dir` from nono's working directory at sandbox-prepare time. In a regular repo it returns `.git` (relative, resolved against `$WORKDIR`). In a worktree it returns the absolute path to the main repo's `.git`. If git is unavailable or the process is not inside a repo, the token expands to no paths.
 
 `network` accepts these values:
 

@@ -21,7 +21,7 @@ pub unsafe extern "C" fn nono_sandbox_apply(caps: *const NonoCapabilitySet) -> N
         return NonoErrorCode::ErrInvalidArg;
     }
     let caps = unsafe { &*caps };
-    match nono::Sandbox::apply(&caps.inner) {
+    match nono::Sandbox::apply_auto(&caps.inner) {
         Ok(_) => NonoErrorCode::Ok,
         Err(e) => map_error(&e),
     }

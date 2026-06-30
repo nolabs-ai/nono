@@ -24,6 +24,11 @@ const DEFAULT_ENV_ALLOW: &[&str] = &[
     "https_proxy",
     "http_proxy",
     "no_proxy",
+    "SSL_CERT_FILE",
+    "CURL_CA_BUNDLE",
+    "NODE_EXTRA_CA_CERTS",
+    "REQUESTS_CA_BUNDLE",
+    "GIT_SSL_CAINFO",
 ];
 
 pub(crate) fn default_env_allow_patterns() -> Vec<String> {
@@ -146,4 +151,27 @@ pub(crate) fn inject_url_open_env(
 pub(crate) fn split_env_entry(entry: &[u8]) -> Option<(&[u8], &[u8])> {
     let pos = entry.iter().position(|byte| *byte == b'=')?;
     Some((&entry[..pos], &entry[pos + 1..]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::exec_strategy::env_sanitization::is_env_var_allowed;
+
+    #[test]
+    fn tls_trust_bundle_vars_are_in_default_allow() {
+        let patterns = default_env_allow_patterns();
+        for var in &[
+            "SSL_CERT_FILE",
+            "CURL_CA_BUNDLE",
+            "NODE_EXTRA_CA_CERTS",
+            "REQUESTS_CA_BUNDLE",
+            "GIT_SSL_CAINFO",
+        ] {
+            assert!(
+                is_env_var_allowed(var, &patterns),
+                "{var} must be allowed so tool-sandbox children can verify TLS through the intercept proxy"
+            );
+        }
+    }
 }

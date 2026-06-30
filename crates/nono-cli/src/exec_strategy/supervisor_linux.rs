@@ -602,10 +602,7 @@ pub(super) fn decide_network_notification(
         }
     }
 
-    if matches!(
-        config.linux_network_notify_mode,
-        LinuxNetworkNotifyMode::AfUnixOnly
-    ) {
+    if config.seccomp_policy.af_unix_mediation {
         debug!(
             "AF_UNIX-only seccomp mediation: allowing non-AF_UNIX syscall family={} nr={}",
             sockaddr.family, syscall
@@ -964,10 +961,8 @@ pub(super) fn handle_network_notification(
     // carry no policy decision — pass them through without consuming a
     // rate-limiter token, which would otherwise starve legitimate network
     // traffic once the burst is exhausted.
-    if matches!(
-        config.linux_network_notify_mode,
-        LinuxNetworkNotifyMode::AfUnixOnly
-    ) && sockaddrs.iter().all(|s| s.family != libc::AF_UNIX as u16)
+    if config.seccomp_policy.af_unix_mediation
+        && sockaddrs.iter().all(|s| s.family != libc::AF_UNIX as u16)
     {
         if let Err(e) = continue_notif(notify_fd, notif.id) {
             debug!(
@@ -1488,9 +1483,7 @@ mod tests {
     // decided by TCP proxy ports.
 
     mod network_decision {
-        use super::super::{
-            LinuxNetworkNotifyMode, NetworkDecision, SupervisorConfig, decide_network_notification,
-        };
+        use super::super::{NetworkDecision, SupervisorConfig, decide_network_notification};
         use nix::libc;
         use nono::sandbox::{
             SYS_BIND, SYS_CONNECT, SYS_SENDMMSG, SYS_SENDMSG, SYS_SENDTO, SockaddrInfo,
@@ -1536,7 +1529,11 @@ mod tests {
                 proxy_port,
                 proxy_bind_ports,
                 unix_socket_allowlist,
-                linux_network_notify_mode: LinuxNetworkNotifyMode::ProxyOnly,
+                seccomp_policy: super::super::SeccompPolicy {
+                    capability_elevation: false,
+                    proxy_fallback: true,
+                    af_unix_mediation: false,
+                },
                 tool_sandbox_runtime: None,
             }
         }
@@ -1606,7 +1603,11 @@ mod tests {
             unix_socket_allowlist: &'a [UnixSocketCapability],
         ) -> SupervisorConfig<'a> {
             let mut config = make_config(backend, 0, Vec::new(), unix_socket_allowlist);
-            config.linux_network_notify_mode = LinuxNetworkNotifyMode::AfUnixOnly;
+            config.seccomp_policy = super::super::SeccompPolicy {
+                capability_elevation: false,
+                proxy_fallback: false,
+                af_unix_mediation: true,
+            };
             config
         }
 

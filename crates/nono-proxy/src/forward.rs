@@ -150,7 +150,7 @@ async fn open_http_upstream(upstream: &UpstreamSpec<'_>) -> Result<TcpStream> {
 }
 
 /// Establish the TCP layer of the upstream connection (without TLS).
-async fn open_tcp_upstream(upstream: &UpstreamSpec<'_>) -> Result<TcpStream> {
+pub(crate) async fn open_tcp_upstream(upstream: &UpstreamSpec<'_>) -> Result<TcpStream> {
     match upstream.strategy {
         UpstreamStrategy::Direct { resolved_addrs } => {
             if resolved_addrs.is_empty() {

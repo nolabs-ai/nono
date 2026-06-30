@@ -1285,8 +1285,7 @@ fn validate_env_credential_keys(profile: &Profile) -> Result<()> {
         // Validate destination env var name against dangerous blocklist
         nono::validate_destination_env_var(value).map_err(|e| {
             NonoError::ProfileParse(format!(
-                "invalid destination env var '{}' in env_credentials: {}",
-                value, e
+                "invalid destination env var '{value}' in env_credentials: {e}"
             ))
         })?;
     }
@@ -1403,6 +1402,11 @@ pub struct NetworkConfig {
     /// Canonical profile key: `block`.
     #[serde(default)]
     pub block: bool,
+    /// Allow HTTP/2 to upstream servers via ALPN negotiation.
+    /// When `false` (default), the proxy negotiates HTTP/1.1 with keep-alive
+    /// connection pooling. Equivalent to the `--allow-http2` CLI flag.
+    #[serde(default)]
+    pub allow_http2: bool,
     /// Network proxy profile name (from network-policy.json).
     /// When set, outbound traffic is filtered through the proxy.
     ///
@@ -1773,6 +1777,24 @@ pub struct DiagnosticsConfig {
     pub suppress_system_services: Vec<String>,
 }
 
+/// Which sandboxing mechanism nono should install on Linux.
+///
+/// Defaults to `auto`, which reflects the historical behaviour.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum LinuxSandboxPolicy {
+    /// Landlock with automatic seccomp fallback when the kernel ABI lacks
+    /// network support (< V4). This is the default.
+    #[default]
+    Auto,
+    /// Landlock only. Returns an error at startup if the kernel cannot
+    /// satisfy network restrictions via Landlock alone.
+    Landlock,
+    /// Enforcement is managed externally (iptables, cgroups, systemd, etc.).
+    /// nono installs no Landlock or seccomp rules.
+    External,
+}
+
 /// Linux-specific profile controls.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1780,6 +1802,9 @@ pub struct LinuxConfig {
     /// Opt-in pathname AF_UNIX mediation mode.
     #[serde(default)]
     pub af_unix_mediation: Option<LinuxAfUnixMediation>,
+    /// Which sandboxing mechanism to use. Defaults to `auto`.
+    #[serde(default)]
+    pub sandbox_policy: Option<LinuxSandboxPolicy>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -3125,6 +3150,7 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
         },
         network: NetworkConfig {
             block: base.network.block || child.network.block,
+            allow_http2: base.network.allow_http2 || child.network.allow_http2,
             network_profile: child
                 .network
                 .network_profile
@@ -3171,6 +3197,7 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
                 .linux
                 .af_unix_mediation
                 .or(base.linux.af_unix_mediation),
+            sandbox_policy: child.linux.sandbox_policy.or(base.linux.sandbox_policy),
         },
         diagnostics: DiagnosticsConfig {
             suppress_system_services: dedup_append(
@@ -4050,12 +4077,20 @@ mod tests {
         let profile: Profile = serde_json::from_str(json_str).expect("Failed to parse profile");
         assert_eq!(profile.env_credentials.mappings.len(), 2);
         assert_eq!(
-            profile.env_credentials.mappings.get("openai_api_key"),
-            Some(&"OPENAI_API_KEY".to_string())
+            profile
+                .env_credentials
+                .mappings
+                .get("openai_api_key")
+                .map(|s| s.as_str()),
+            Some("OPENAI_API_KEY")
         );
         assert_eq!(
-            profile.env_credentials.mappings.get("anthropic_api_key"),
-            Some(&"ANTHROPIC_API_KEY".to_string())
+            profile
+                .env_credentials
+                .mappings
+                .get("anthropic_api_key")
+                .map(|s| s.as_str()),
+            Some("ANTHROPIC_API_KEY")
         );
     }
 
@@ -4349,8 +4384,12 @@ mod tests {
         let profile: Profile = serde_json::from_str(json_str).expect("Failed to parse profile");
         assert_eq!(profile.env_credentials.mappings.len(), 1);
         assert_eq!(
-            profile.env_credentials.mappings.get("openai_api_key"),
-            Some(&"OPENAI_API_KEY".to_string())
+            profile
+                .env_credentials
+                .mappings
+                .get("openai_api_key")
+                .map(|s| s.as_str()),
+            Some("OPENAI_API_KEY")
         );
     }
 
@@ -5352,6 +5391,7 @@ mod tests {
             },
             network: NetworkConfig {
                 block: false,
+                allow_http2: false,
                 network_profile: InheritableValue::Set("base-net".to_string()),
                 allow_domain: vec![AllowDomainEntry::Plain("base.example.com".to_string())],
                 open_port: vec![3000],
@@ -5436,6 +5476,7 @@ mod tests {
             },
             network: NetworkConfig {
                 block: false,
+                allow_http2: false,
                 network_profile: InheritableValue::Inherit,
                 allow_domain: vec![AllowDomainEntry::Plain("child.example.com".to_string())],
                 open_port: vec![3000, 5000],
@@ -6189,8 +6230,12 @@ mod tests {
 
         let merged = merge_profiles(base, child);
         assert_eq!(
-            merged.env_credentials.mappings.get("shared_key"),
-            Some(&"CHILD_VALUE".to_string()),
+            merged
+                .env_credentials
+                .mappings
+                .get("shared_key")
+                .map(|s| s.as_str()),
+            Some("CHILD_VALUE"),
             "child should win for same key"
         );
         assert!(merged.env_credentials.mappings.contains_key("base_key"));
@@ -7371,7 +7416,7 @@ mod tests {
                                                 "allow": [
                                                     {
                                                         "method": "GET",
-                                                        "path": "/repos/always-further/nono/issues"
+                                                        "path": "/repos/nolabs-ai/nono/issues"
                                                     }
                                                 ]
                                             }
@@ -7875,12 +7920,20 @@ mod tests {
         );
         assert_eq!(profile.filesystem.deny, vec!["/denied".to_string()]);
         assert_eq!(
-            profile.env_credentials.mappings.get("plain"),
-            Some(&"PLAIN_TOKEN".to_string())
+            profile
+                .env_credentials
+                .mappings
+                .get("plain")
+                .map(|s| s.as_str()),
+            Some("PLAIN_TOKEN")
         );
         assert_eq!(
-            profile.env_credentials.mappings.get("matching"),
-            Some(&"MATCH_TOKEN".to_string())
+            profile
+                .env_credentials
+                .mappings
+                .get("matching")
+                .map(|s| s.as_str()),
+            Some("MATCH_TOKEN")
         );
         assert!(!profile.env_credentials.mappings.contains_key("skipped"));
         let origins = profile.open_urls.expect("open urls").allow_origins;

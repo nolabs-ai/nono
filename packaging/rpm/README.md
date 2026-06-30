@@ -34,10 +34,10 @@ Cargo source override, so COPR can build with `cargo --offline`.
 After creating the COPR project, submit the generated SRPM:
 
 ```bash
-copr-cli build always-further/nono target/rpm/copr/SRPMS/*.src.rpm
+copr-cli build nolabs-ai/nono target/rpm/copr/SRPMS/*.src.rpm
 ```
 
-Replace `always-further/nono` with the actual COPR owner/project name if the
+Replace `nolabs-ai/nono` with the actual COPR owner/project name if the
 official project uses a COPR group namespace.
 
 ## Build requirements

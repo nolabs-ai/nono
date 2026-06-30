@@ -1,6 +1,6 @@
 [package]
 name = "nono-proxy"
-version = "0.65.1"
+version = "0.66.0"
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
@@ -18,7 +18,7 @@ default = ["system-keyring"]
 system-keyring = ["nono/system-keyring"]
 
 [dependencies]
-nono = { version = "0.65.1", path = "../nono", default-features = false }
+nono = { version = "0.66.0", path = "../nono", default-features = false }
 tokio.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
@@ -37,7 +37,12 @@ urlencoding = "2"
 globset.workspace = true
 
 # TLS for upstream connections (reverse proxy mode)
-hyper-rustls = { version = "0.27", features = ["http1", "ring", "webpki-tokio"] }
+hyper-rustls = { version = "0.27", features = ["http1", "http2", "ring", "webpki-tokio"] }
+# HTTP/2 framing for CONNECT-intercept h2 forwarding (gRPC support)
+h2 = "0.4"
+bytes = "1"
+http = "1"
+tower-service = "0.3"
 tokio-rustls = "0.26"
 rustls = { version = "0.23", features = ["ring"] }
 webpki-roots = "1"

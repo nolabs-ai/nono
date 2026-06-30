@@ -17,7 +17,7 @@
   },
   "navbar": {
     "links": [
-      { "label": "GitHub", "href": "https://github.com/always-further/nono" }
+      { "label": "GitHub", "href": "https://github.com/nolabs-ai/nono" }
     ],
     "primary": {
       "type": "button",
@@ -130,7 +130,7 @@
   },
   "footer": {
     "socials": {
-      "github": "https://github.com/always-further/nono",
+      "github": "https://github.com/nolabs-ai/nono",
       "discord": "https://discord.gg/pPcjYzGvbS"
     }
   }

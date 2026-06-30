@@ -33,7 +33,7 @@ jobs:
     name: Resolve build parameters
     runs-on: ubuntu-latest
     if: >-
-      github.repository == 'always-further/nono' &&
+      github.repository == 'nolabs-ai/nono' &&
       ((github.event_name == 'workflow_dispatch') ||
       (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success'))
     outputs:
@@ -55,18 +55,24 @@ jobs:
             # Skip prereleases
             if [[ "$TAG" == *alpha* ]] || [[ "$TAG" == *beta* ]] || [[ "$TAG" == *rc* ]]; then
               echo "Skipping prerelease tag: $TAG"
-              echo "push=false" >> "$GITHUB_OUTPUT"
-              echo "ref=$TAG" >> "$GITHUB_OUTPUT"
-              echo "version=$TAG" >> "$GITHUB_OUTPUT"
+              {
+                echo "push=false"
+                echo "ref=$TAG"
+                echo "version=$TAG"
+              } >> "$GITHUB_OUTPUT"
               exit 0
             fi
-            echo "ref=$TAG" >> "$GITHUB_OUTPUT"
-            echo "version=$TAG" >> "$GITHUB_OUTPUT"
-            echo "push=true" >> "$GITHUB_OUTPUT"
+            {
+              echo "ref=$TAG"
+              echo "version=$TAG"
+              echo "push=true"
+            } >> "$GITHUB_OUTPUT"
           else
-            echo "ref=$WD_REF" >> "$GITHUB_OUTPUT"
-            echo "version=${WD_VERSION:-$WD_REF}" >> "$GITHUB_OUTPUT"
-            echo "push=$WD_PUSH" >> "$GITHUB_OUTPUT"
+            {
+              echo "ref=$WD_REF"
+              echo "version=${WD_VERSION:-$WD_REF}"
+              echo "push=$WD_PUSH"
+            } >> "$GITHUB_OUTPUT"
           fi
 
   build-binaries:
@@ -175,16 +181,18 @@ jobs:
             STABLE=false
           fi
 
-          TAGS="ghcr.io/always-further/nono:${VERSION}"
+          TAGS="ghcr.io/nolabs-ai/nono:${VERSION}"
           if [ "$BUILD_PUSH" = "true" ] && [ "$STABLE" = "true" ] && [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             MAJOR_MINOR="${VERSION%.*}"
-            TAGS="${TAGS},ghcr.io/always-further/nono:${MAJOR_MINOR}"
-            TAGS="${TAGS},ghcr.io/always-further/nono:latest"
+            TAGS="${TAGS},ghcr.io/nolabs-ai/nono:${MAJOR_MINOR}"
+            TAGS="${TAGS},ghcr.io/nolabs-ai/nono:latest"
           fi
 
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "stable=$STABLE" >> "$GITHUB_OUTPUT"
-          echo "tags=$TAGS" >> "$GITHUB_OUTPUT"
+          {
+            echo "version=$VERSION"
+            echo "stable=$STABLE"
+            echo "tags=$TAGS"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@06116385d9baf250c9f4dcb4858b16962ea869c3 # v4.1.0
@@ -210,7 +218,7 @@ jobs:
           push: ${{ needs.resolve.outputs.push == 'true' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: |
-            org.opencontainers.image.source=https://github.com/always-further/nono
+            org.opencontainers.image.source=https://github.com/nolabs-ai/nono
             org.opencontainers.image.version=${{ steps.meta.outputs.version }}
             org.opencontainers.image.description=Capability-based sandboxing for untrusted AI agents
 
@@ -224,4 +232,4 @@ jobs:
           IMAGE_DIGEST: ${{ steps.push.outputs.digest }}
         run: |
           cosign sign --yes \
-            "ghcr.io/always-further/nono@${IMAGE_DIGEST}"
+            "ghcr.io/nolabs-ai/nono@${IMAGE_DIGEST}"

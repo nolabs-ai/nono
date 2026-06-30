@@ -1354,6 +1354,33 @@ pub struct SandboxArgs {
     #[arg(long, help_heading = "OPTIONS")]
     pub allow_gpu: bool,
 
+    /// Linux sandbox enforcement mechanism [auto|landlock|external] (default: auto).
+    ///
+    /// auto     — Landlock with automatic seccomp fallback when the kernel
+    ///            lacks network support (ABI < V4). This is the default.
+    /// landlock — Landlock only; fails at startup if network restrictions
+    ///            cannot be satisfied without seccomp.
+    /// external — No sandbox installed by nono; enforcement is managed
+    ///            externally (iptables, cgroups, systemd, etc.).
+    #[cfg(target_os = "linux")]
+    #[arg(long, help_heading = "OPTIONS", value_name = "POLICY")]
+    pub sandbox_policy: Option<crate::profile::LinuxSandboxPolicy>,
+
+    /// Allow HTTP/2 multiplexing for upstream proxy connections.
+    ///
+    /// When enabled, the proxy negotiates HTTP/2 via ALPN with upstream
+    /// servers that support it, allowing multiple requests to be multiplexed
+    /// over a single TCP connection. This can significantly improve throughput
+    /// for workloads that make many concurrent requests to the same host
+    /// (e.g., Maven/Gradle artifact downloads).
+    ///
+    /// Without this flag, the proxy uses HTTP/1.1 with keep-alive connection
+    /// pooling (connections are reused but requests are serialized per
+    /// connection). This is the conservative default since some upstream
+    /// servers may not handle HTTP/2 correctly.
+    #[arg(long, help_heading = "OPTIONS")]
+    pub allow_http2: bool,
+
     /// Capability manifest file (JSON). A fully-resolved sandbox specification —
     /// mutually exclusive with all other sandbox configuration flags.
     #[arg(
@@ -1369,7 +1396,7 @@ pub struct SandboxArgs {
             "block_net", "allow_net", "network_profile", "allow_proxy",
             "allow_bind", "allow_port", "allow_connect_port", "external_proxy", "proxy_port",
             "proxy_credential", "allow_endpoint", "env_credential", "env_credential_map",
-            "allow_command", "block_command", "allow_launch_services", "allow_gpu",
+            "allow_command", "block_command", "allow_launch_services", "allow_gpu", "allow_http2",
         ],
         help_heading = "OPTIONS"
     )]
@@ -1651,9 +1678,12 @@ impl From<WrapSandboxArgs> for SandboxArgs {
             profile: args.profile,
             allow_launch_services: args.allow_launch_services,
             allow_gpu: args.allow_gpu,
+            allow_http2: false,
             config: args.config,
             verbose: args.verbose,
             dry_run: args.dry_run,
+            #[cfg(target_os = "linux")]
+            sandbox_policy: None,
         }
     }
 }

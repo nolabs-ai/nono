@@ -603,7 +603,7 @@ mod tests {
             "latest_version": "0.7.0",
             "update_available": true,
             "message": null,
-            "release_url": "https://github.com/always-further/nono/releases/tag/v0.7.0"
+            "release_url": "https://github.com/nolabs-ai/nono/releases/tag/v0.7.0"
         }"#;
 
         let info: UpdateInfo = serde_json::from_str(json).expect("deserialize");

@@ -3,6 +3,7 @@ use crate::config;
 use crate::proxy_runtime::prepare_proxy_launch_options;
 use crate::sandbox_prepare::{
     PreparedSandbox, prepare_sandbox, print_allow_gpu_warning, print_allow_launch_services_warning,
+    validate_block_net_conflicts,
 };
 use crate::{exec_strategy, instruction_deny, profile, trust_scan};
 use colored::Colorize;
@@ -93,6 +94,9 @@ pub(crate) struct EndpointFilterIntent {
 pub(crate) struct CredentialProxyIntent {
     pub(crate) credentials: Vec<String>,
     pub(crate) custom_credentials: HashMap<String, profile::CustomCredentialDef>,
+    /// Per-credential endpoint restrictions from `--allow-endpoint SERVICE:METHOD:PATH`,
+    /// pre-parsed into `(service_name, rule)` pairs.
+    pub(crate) endpoint_restrictions: Vec<(String, nono_proxy::config::EndpointRule)>,
 }
 
 #[derive(Clone, Debug)]
@@ -146,6 +150,8 @@ pub(crate) struct ProxyLaunchOptions {
     pub(crate) session_id: String,
     /// Supervisor-side CLI command credential-capture entries.
     pub(crate) credential_capture: HashMap<String, profile::CredentialCaptureEntry>,
+    /// Enable HTTP/2 negotiation for upstream connections.
+    pub(crate) enable_h2: bool,
 }
 
 impl ProxyLaunchOptions {
@@ -202,11 +208,14 @@ pub(crate) struct ExecutionFlags {
     pub(crate) diagnostics_json: bool,
     pub(crate) diagnostic_verbosity: u8,
     pub(crate) silent: bool,
+    #[cfg(target_os = "linux")]
     pub(crate) capability_elevation: bool,
     #[cfg(target_os = "linux")]
     pub(crate) wsl2_proxy_policy: crate::profile::Wsl2ProxyPolicy,
     #[cfg(target_os = "linux")]
     pub(crate) af_unix_mediation: crate::profile::LinuxAfUnixMediation,
+    #[cfg(target_os = "linux")]
+    pub(crate) sandbox_policy: crate::profile::LinuxSandboxPolicy,
     pub(crate) bypass_protection_paths: Vec<PathBuf>,
     pub(crate) ignored_denial_paths: Vec<PathBuf>,
     pub(crate) suppressed_system_service_operations: Vec<String>,
@@ -226,39 +235,51 @@ pub(crate) struct ExecutionFlags {
 }
 
 impl ExecutionFlags {
-    pub(crate) fn defaults(silent: bool) -> Result<Self> {
+    /// Build flags from a fully-prepared sandbox, with sensible defaults for
+    /// fields that are not sourced from the profile (strategy, workdir, etc.).
+    /// Call sites override only what they need via struct update syntax:
+    ///   `ExecutionFlags { strategy: ..., ..ExecutionFlags::from_prepared(&p, silent)? }`
+    pub(crate) fn from_prepared(
+        prepared: &crate::sandbox_prepare::PreparedSandbox,
+        silent: bool,
+    ) -> Result<Self> {
+        let cwd = std::env::current_dir()
+            .map_err(|e| NonoError::SandboxInit(format!("Failed to get cwd: {e}")))?;
         Ok(Self {
             strategy: exec_strategy::ExecStrategy::Supervised,
-            workdir: std::env::current_dir()
-                .map_err(|e| NonoError::SandboxInit(format!("Failed to get cwd: {e}")))?,
+            workdir: cwd.clone(),
             no_diagnostics: false,
             diagnostics_json: false,
             diagnostic_verbosity: 0,
             silent,
-            capability_elevation: false,
             #[cfg(target_os = "linux")]
-            wsl2_proxy_policy: crate::profile::Wsl2ProxyPolicy::Error,
+            capability_elevation: prepared.capability_elevation,
             #[cfg(target_os = "linux")]
-            af_unix_mediation: crate::profile::LinuxAfUnixMediation::Off,
-            bypass_protection_paths: Vec::new(),
-            ignored_denial_paths: Vec::new(),
-            suppressed_system_service_operations: Vec::new(),
-            profile_display_name: None,
+            wsl2_proxy_policy: prepared.wsl2_proxy_policy,
+            #[cfg(target_os = "linux")]
+            af_unix_mediation: prepared.af_unix_mediation,
+            #[cfg(target_os = "linux")]
+            sandbox_policy: prepared.sandbox_policy,
+            bypass_protection_paths: prepared.bypass_protection_paths.clone(),
+            ignored_denial_paths: prepared.ignored_denial_paths.clone(),
+            suppressed_system_service_operations: prepared
+                .suppressed_system_service_operations
+                .clone(),
+            profile_display_name: prepared.profile_display_name.clone(),
             session: SessionLaunchOptions::default(),
             rollback: RollbackLaunchOptions::default(),
             trust: TrustLaunchOptions {
-                scan_root: std::env::current_dir()
-                    .map_err(|e| NonoError::SandboxInit(format!("Failed to get cwd: {e}")))?,
+                scan_root: cwd,
                 ..TrustLaunchOptions::default()
             },
             network: NetworkIntent::default(),
             redaction_policy: nono::ScrubPolicy::secure_default(),
-            session_hooks: profile::SessionHooks::default(),
-            allowed_env_vars: None,
-            denied_env_vars: None,
-            set_vars: None,
+            session_hooks: prepared.session_hooks.clone(),
+            allowed_env_vars: prepared.allowed_env_vars.clone(),
+            denied_env_vars: prepared.denied_env_vars.clone(),
+            set_vars: prepared.set_vars.clone(),
             startup_timeout_secs: None,
-            command_policies: None,
+            command_policies: prepared.command_policies.clone(),
         })
     }
 }
@@ -302,6 +323,7 @@ pub(crate) fn prepare_run_launch_plan(
     }
 
     let mut prepared = prepare_sandbox(&args, silent)?;
+    validate_block_net_conflicts(&args, &prepared)?;
     validate_rollback_destination(run_args.rollback_dest.as_ref(), &prepared)?;
 
     if prepared.allow_launch_services_active {
@@ -368,55 +390,42 @@ pub(crate) fn prepare_run_launch_plan(
         run_args.detached,
     );
 
+    let flags = ExecutionFlags {
+        strategy,
+        workdir: resolve_requested_workdir(args.workdir.as_ref()),
+        no_diagnostics,
+        diagnostics_json,
+        diagnostic_verbosity: args.verbose,
+        session: SessionLaunchOptions {
+            session_id: Some(session_id),
+            detached_start: run_args.detached,
+            session_name: run_args.name,
+            profile_name: args.profile.clone(),
+            detach_sequence,
+        },
+        rollback: RollbackLaunchOptions {
+            requested: rollback,
+            disabled: run_args.no_rollback,
+            prompt_disabled: no_rollback_prompt,
+            audit_disabled: no_audit,
+            no_audit_integrity,
+            audit_integrity: run_args.audit_integrity,
+            audit_sign_key,
+            destination: run_args.rollback_dest,
+            ..rollback_options
+        },
+        trust,
+        network,
+        redaction_policy,
+        startup_timeout_secs,
+        ..ExecutionFlags::from_prepared(&prepared, silent)?
+    };
     Ok(LaunchPlan {
         program,
         cmd_args,
         caps: prepared.caps,
         loaded_secrets: prepared.secrets,
-        flags: ExecutionFlags {
-            strategy,
-            workdir: resolve_requested_workdir(args.workdir.as_ref()),
-            no_diagnostics,
-            diagnostics_json,
-            diagnostic_verbosity: args.verbose,
-            silent,
-            capability_elevation: prepared.capability_elevation,
-            #[cfg(target_os = "linux")]
-            wsl2_proxy_policy: prepared.wsl2_proxy_policy,
-            #[cfg(target_os = "linux")]
-            af_unix_mediation: prepared.af_unix_mediation,
-            bypass_protection_paths: prepared.bypass_protection_paths,
-            ignored_denial_paths: prepared.ignored_denial_paths,
-            suppressed_system_service_operations: prepared.suppressed_system_service_operations,
-            profile_display_name: prepared.profile_display_name,
-            session: SessionLaunchOptions {
-                session_id: Some(session_id),
-                detached_start: run_args.detached,
-                session_name: run_args.name,
-                profile_name: args.profile.clone(),
-                detach_sequence,
-            },
-            rollback: RollbackLaunchOptions {
-                requested: rollback,
-                disabled: run_args.no_rollback,
-                prompt_disabled: no_rollback_prompt,
-                audit_disabled: no_audit,
-                no_audit_integrity,
-                audit_integrity: run_args.audit_integrity,
-                audit_sign_key,
-                destination: run_args.rollback_dest,
-                ..rollback_options
-            },
-            trust,
-            network,
-            redaction_policy,
-            session_hooks: prepared.session_hooks,
-            allowed_env_vars: prepared.allowed_env_vars,
-            denied_env_vars: prepared.denied_env_vars,
-            set_vars: prepared.set_vars,
-            startup_timeout_secs,
-            command_policies: prepared.command_policies,
-        },
+        flags,
     })
 }
 

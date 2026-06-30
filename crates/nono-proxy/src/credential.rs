@@ -512,6 +512,12 @@ impl CredentialStore {
             .cloned()
             .collect()
     }
+
+    /// Insert a pre-built credential for testing. Not available in production.
+    #[cfg(test)]
+    pub fn insert_for_test(&mut self, prefix: String, cred: LoadedCredential) {
+        self.credentials.insert(prefix, cred);
+    }
 }
 
 /// The keyring service name used by nono for all credentials.

@@ -43,7 +43,7 @@ jobs:
       - name: Clone nono at release tag
         run: |
           git clone --depth 1 --branch "$NONO_VERSION" \
-            https://github.com/always-further/nono.git /tmp/nono
+            https://github.com/nolabs-ai/nono.git /tmp/nono
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
@@ -109,7 +109,7 @@ jobs:
       - name: Update bundled libraries
         if: steps.check.outputs.skip != 'true'
         run: |
-          NONO_SHA=$(git ls-remote https://github.com/always-further/nono.git "refs/tags/${NONO_VERSION}" | cut -f1)
+          NONO_SHA=$(git ls-remote https://github.com/nolabs-ai/nono.git "refs/tags/${NONO_VERSION}" | cut -f1)
           if [ -z "$NONO_SHA" ]; then
             echo "Error: Could not resolve SHA for tag ${NONO_VERSION}"
             exit 1
@@ -134,7 +134,7 @@ jobs:
           body: |
             Automated PR to rebuild bundled `libnono_ffi.a` static libraries from nono `${{ env.NONO_VERSION }}`.
 
-            Triggered by [nono ${{ env.NONO_VERSION }}](https://github.com/always-further/nono/releases/tag/${{ env.NONO_VERSION }}).
+            Triggered by [nono ${{ env.NONO_VERSION }}](https://github.com/nolabs-ai/nono/releases/tag/${{ env.NONO_VERSION }}).
 
             ### Updated libraries
             - `internal/clib/darwin_amd64/libnono_ffi.a`

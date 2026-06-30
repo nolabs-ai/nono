@@ -211,8 +211,12 @@ pub fn child_self_attach(procs_fd: RawFd) -> bool {
     // SAFETY: `getpid` is async-signal-safe and always succeeds; in the child it
     // returns the child's own pid.
     let pid = unsafe { libc::getpid() };
-    let mut buf = [0u8; MAX_PID_DIGITS];
-    let encoded = format_pid_decimal(pid, &mut buf);
+    // Format the pid without allocating: `itoa::Buffer` writes the digits into its
+    // own stack buffer, no heap and no locks. That matters because we run post-fork
+    // and pre-exec in a child of a multithreaded process, where `malloc` (and so
+    // `to_string()` / `format!`) could deadlock on a heap lock held at `fork`.
+    let mut buf = itoa::Buffer::new();
+    let encoded = buf.format(pid).as_bytes();
     // SAFETY: writing a stack buffer to a raw fd is async-signal-safe. A short or
     // failed write is treated as failure, so the caller fails closed.
     let written = unsafe {
@@ -223,29 +227,6 @@ pub fn child_self_attach(procs_fd: RawFd) -> bool {
         )
     };
     written == encoded.len() as isize
-}
-
-/// Widest decimal a pid needs: `i32::MAX` is 10 digits.
-const MAX_PID_DIGITS: usize = 10;
-
-/// Write `pid` as decimal ASCII into `buf` without allocating (async-signal-safe);
-/// returns the filled slice. A non-positive `pid` renders as `"0"` (a real one
-/// never is).
-fn format_pid_decimal(pid: i32, buf: &mut [u8; MAX_PID_DIGITS]) -> &[u8] {
-    let mut n = u32::try_from(pid).unwrap_or(0);
-    // Write the digits from the right end of buf, lowest digit first, so there's
-    // no need for a second pass to reverse them.
-    let mut i = buf.len();
-    if n == 0 {
-        i -= 1;
-        buf[i] = b'0';
-    }
-    while n > 0 {
-        i -= 1;
-        buf[i] = b'0' + (n % 10) as u8;
-        n /= 10;
-    }
-    &buf[i..]
 }
 
 /// Write the requested memory limits into the leaf at `path`.
@@ -411,7 +392,7 @@ fn ensure_controllers_delegated(base: &Path, limits: &ResourceLimits) -> Result<
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_PID_DIGITS, format_pid_decimal, parse_delegated_base};
+    use super::parse_delegated_base;
     use std::path::PathBuf;
 
     #[test]
@@ -454,24 +435,6 @@ mod tests {
         // The path is for uid 1000 but we are uid 1001 — not our delegation.
         let raw = "0::/user.slice/user-1000.slice/user@1000.service/app.slice\n";
         assert!(parse_delegated_base(raw, 1001).is_err());
-    }
-
-    /// Self-attach depends on a correct, allocation-free pid encoding; spot-check
-    /// the encoder across widths.
-    #[test]
-    fn formats_pid_as_decimal() {
-        let mut buf = [0u8; MAX_PID_DIGITS];
-        assert_eq!(format_pid_decimal(1, &mut buf), b"1");
-        assert_eq!(format_pid_decimal(7, &mut buf), b"7");
-        assert_eq!(format_pid_decimal(12345, &mut buf), b"12345");
-        assert_eq!(format_pid_decimal(i32::MAX, &mut buf), b"2147483647");
-    }
-
-    #[test]
-    fn formats_nonpositive_pid_defensively_as_zero() {
-        let mut buf = [0u8; MAX_PID_DIGITS];
-        assert_eq!(format_pid_decimal(0, &mut buf), b"0");
-        assert_eq!(format_pid_decimal(-1, &mut buf), b"0");
     }
 
     /// `oom_report` reads these counters to drive the "you hit the memory cap"
@@ -597,67 +560,6 @@ mod tests {
             base_slash,
             PathBuf::from("/sys/fs/cgroup/user.slice/user@1000.service")
         );
-    }
-
-    /// `format_pid_decimal` matters (the post-fork child writes its pid through it
-    /// to add itself), so it must give the same result as `i32::to_string()` for
-    /// every positive pid — including where the digit count changes and the exact
-    /// buffer fill at `i32::MAX` (10 digits == MAX_PID_DIGITS), with `to_string` as
-    /// the reference.
-    #[test]
-    fn format_pid_decimal_matches_to_string_over_wide_range_and_boundaries() {
-        let mut buf = [0u8; MAX_PID_DIGITS];
-
-        // Explicit boundaries: digit-count transitions + exact buffer fill.
-        for &pid in &[
-            1i32,
-            9,
-            10,
-            99,
-            100,
-            999,
-            1000,
-            9999,
-            10000,
-            1_000_000,
-            i32::MAX,
-        ] {
-            assert_eq!(
-                format_pid_decimal(pid, &mut buf),
-                pid.to_string().as_bytes(),
-                "pid {pid} must encode identically to to_string()"
-            );
-        }
-        // i32::MAX fills the buffer exactly: 10 digits, no leading slack.
-        assert_eq!(format_pid_decimal(i32::MAX, &mut buf).len(), MAX_PID_DIGITS);
-
-        // Dense sweep over a contiguous low range (covers the 9->10, 99->100,
-        // 999->1000 width transitions).
-        for pid in 1..=10_000_i32 {
-            assert_eq!(
-                format_pid_decimal(pid, &mut buf),
-                pid.to_string().as_bytes(),
-                "mismatch at pid {pid}"
-            );
-        }
-        // Wide property sweep across the positive i32 range (a prime stride avoids
-        // aliasing to round numbers while staying fast).
-        let mut pid: i64 = 1;
-        while pid <= i32::MAX as i64 {
-            let p = pid as i32;
-            assert_eq!(format_pid_decimal(p, &mut buf), p.to_string().as_bytes());
-            pid += 7919;
-        }
-
-        // Non-positive defensively renders as "0" (a real pid never is); i32::MIN
-        // is included because a naive `pid.abs()` would overflow/panic.
-        for pid in [0_i32, -1, -42, -2_147_483_647, i32::MIN] {
-            assert_eq!(
-                format_pid_decimal(pid, &mut buf),
-                b"0",
-                "non-positive pid {pid} must render as 0"
-            );
-        }
     }
 
     // ---- Live cgroup v2 enforcement tests ----

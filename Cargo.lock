@@ -2244,6 +2244,7 @@ dependencies = [
  "dns-lookup",
  "globset",
  "ignore",
+ "itoa",
  "jsonc-parser",
  "jsonschema",
  "keyring",

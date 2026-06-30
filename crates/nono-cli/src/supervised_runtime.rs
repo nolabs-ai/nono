@@ -146,6 +146,17 @@ fn create_session_runtime_state(
     })
 }
 
+/// The error returned when a memory limit is requested on a platform that can't
+/// enforce one (no cgroup v2). Compiled off-Linux (where the branch above uses it)
+/// and under `test` so a Linux host can still pin the variant and message — the
+/// branch can't run there, but the contract shouldn't silently regress.
+#[cfg(any(not(target_os = "linux"), test))]
+fn resource_limits_unsupported_platform() -> nono::NonoError {
+    nono::NonoError::UnsupportedPlatform(
+        "resource limits are only enforced on Linux (cgroup v2) in this build".to_string(),
+    )
+}
+
 fn should_open_supervised_pty(
     detached_start: bool,
     stdin_is_terminal: bool,
@@ -312,9 +323,7 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
         .resource_limits()
         .is_some_and(|limits| !limits.is_empty())
     {
-        return Err(nono::NonoError::UnsupportedPlatform(
-            "resource limits are only enforced on Linux (cgroup v2) in this build".to_string(),
-        ));
+        return Err(resource_limits_unsupported_platform());
     }
 
     // The fd the child self-attaches through: opened in the parent so the forked
@@ -409,6 +418,17 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
 #[cfg(test)]
 mod tests {
     use super::should_open_supervised_pty;
+
+    /// Off-Linux, a requested memory limit is refused with UnsupportedPlatform (not
+    /// SandboxInit), so it maps to the right diagnostic/exit and reads naturally.
+    /// Pinned on every host so the variant can't silently regress, even though the
+    /// branch that returns it only compiles off-Linux.
+    #[test]
+    fn off_platform_resource_error_is_unsupported_platform() {
+        let err = super::resource_limits_unsupported_platform();
+        assert!(matches!(err, nono::NonoError::UnsupportedPlatform(_)));
+        assert!(err.to_string().contains("only enforced on Linux"));
+    }
 
     #[test]
     fn supervised_pty_is_used_for_attached_terminals() {

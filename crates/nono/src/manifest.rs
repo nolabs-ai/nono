@@ -151,10 +151,19 @@ mod resource_tests {
         assert_eq!(res.memory_bytes.map(|n| n.get()), Some(536870912));
         manifest.validate().expect("valid: supervised");
 
-        // Re-serialize and re-parse to confirm the field round-trips.
+        // Re-serialize and re-parse to confirm the byte count survives the trip.
+        // Assert the value, not just that a resources block is present — a wrong
+        // nonzero value would slip past an is_some() check.
         let out = manifest.to_json().expect("serialize");
         let reparsed = CapabilityManifest::from_json(&out).expect("reparse");
-        assert!(reparsed.resources.is_some());
+        assert_eq!(
+            reparsed
+                .resources
+                .as_ref()
+                .and_then(|r| r.memory_bytes)
+                .map(|n| n.get()),
+            Some(536870912)
+        );
     }
 
     #[test]

@@ -2114,6 +2114,34 @@ mod tests {
         assert!(reject_cgroup_writable_grants_under_memory_limit(&caps).is_ok());
     }
 
+    // The guard's whole point: with a memory limit active, a writable grant that
+    // overlaps the cgroup tree is refused — otherwise the sandbox could rewrite its
+    // own memory.max and lift the cap. Linux-only because we need the real cgroup
+    // mount to canonicalize a grant over it; skip gracefully if it isn't present.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn cgroup_write_grant_under_a_memory_limit_is_refused() {
+        let Ok(grant) = FsCapability::new_dir("/sys/fs/cgroup", AccessMode::Write) else {
+            return; // no cgroup mount on this host — nothing to exercise
+        };
+        let mut caps = CapabilitySet::new().with_resource_limits(nono::ResourceLimits {
+            memory_bytes: Some(64 * 1024 * 1024),
+        });
+        caps.add_fs(grant);
+
+        let err = reject_cgroup_writable_grants_under_memory_limit(&caps)
+            .expect_err("a writable /sys/fs/cgroup grant under a memory limit must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("/sys/fs/cgroup"),
+            "error must name the overlapping path: {msg}"
+        );
+        assert!(
+            msg.contains("--memory"),
+            "error should mention the limit: {msg}"
+        );
+    }
+
     #[test]
     fn memory_flag_rejects_below_one_mib_with_unit_hint() {
         // Bare bytes that are almost certainly a unit slip for 512M.

@@ -185,11 +185,15 @@ mod tests {
         let json = r#"{ "version": "0.1.0", "resources": {} }"#;
         let manifest = CapabilityManifest::from_json(json).unwrap();
         let caps = CapabilitySet::try_from(&manifest).unwrap();
-        if let Some(limits) = caps.resource_limits() {
-            assert!(
-                limits.is_empty(),
-                "empty resources must not produce a ceiling, got {limits:?}"
-            );
-        }
+        // The conversion must attach a ResourceLimits (assert Some first, so this
+        // can't pass vacuously if conversion ever returned None for `{}`)...
+        let limits = caps
+            .resource_limits()
+            .expect("empty resources must still attach a ResourceLimits");
+        // ...and that ResourceLimits must carry no ceiling, never a phantom limit.
+        assert!(
+            limits.is_empty(),
+            "empty resources must not produce a ceiling, got {limits:?}"
+        );
     }
 }

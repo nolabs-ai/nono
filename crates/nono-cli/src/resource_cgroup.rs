@@ -395,6 +395,47 @@ mod tests {
     use super::parse_delegated_base;
     use std::path::PathBuf;
 
+    /// child_self_attach writes the caller's pid (decimal, no newline) to the fd and
+    /// reports success; a bad fd makes the write fail, so it returns false and the
+    /// caller fails closed. Runs in-process (no fork, no cgroup), so it guards the
+    /// fail-closed contract in CI, where the live tests are skipped.
+    #[test]
+    fn child_self_attach_writes_pid_and_fails_closed_on_bad_fd() {
+        use super::child_self_attach;
+        use nix::libc;
+        use std::os::fd::RawFd;
+
+        // A pipe stands in for cgroup.procs.
+        let mut fds = [0 as RawFd; 2];
+        // SAFETY: fds is a valid 2-element array for pipe(2).
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe() failed");
+        let [read_fd, write_fd] = fds;
+
+        assert!(
+            child_self_attach(write_fd),
+            "writing to a valid fd must succeed"
+        );
+
+        // What landed in the pipe is our own pid in decimal, exactly as written.
+        let mut buf = [0u8; 32];
+        // SAFETY: buf is a valid 32-byte buffer; read fills at most buf.len() bytes.
+        let n = unsafe { libc::read(read_fd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len()) };
+        assert!(n > 0, "expected to read the pid back");
+        let n = usize::try_from(n).expect("non-negative read count");
+        let got = std::str::from_utf8(&buf[..n]).expect("ascii digits");
+        assert_eq!(got, std::process::id().to_string());
+
+        // SAFETY: closing our own pipe fds.
+        unsafe {
+            libc::close(read_fd);
+            libc::close(write_fd);
+        }
+
+        // Fail-closed: an invalid fd makes the write fail, so the function reports
+        // failure — the real caller then _exit(126)s rather than run uncapped.
+        assert!(!child_self_attach(-1), "a failed write must report failure");
+    }
+
     #[test]
     fn parses_user_service_ancestor_from_deep_path() {
         let raw = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/\
@@ -665,13 +706,16 @@ mod tests {
                     "expected oom_kill>=1 in memory.events, got {oom_kill} (full: {events:?})"
                 );
 
-                // The swap escape hatch stayed shut: nothing spilled to swap.
-                let swap = std::fs::read_to_string(leaf_path.join("memory.swap.current"))
-                    .expect("read memory.swap.current");
+                // The swap escape hatch is shut: we set memory.swap.max=0, so the
+                // child can't dodge the cap by spilling to swap. Read the limit knob
+                // back (not memory.swap.current, which is trivially 0 on a host with
+                // no swap configured and so would pass without proving anything).
+                let swap_max = std::fs::read_to_string(leaf_path.join("memory.swap.max"))
+                    .expect("read memory.swap.max");
                 assert_eq!(
-                    swap.trim(),
+                    swap_max.trim(),
                     "0",
-                    "memory.swap.current must be 0 (swap.max=0 forbids the escape)"
+                    "memory.swap.max must read back as 0 (swap forbidden)"
                 );
                 // Reaching here at all proves the parent survived the child OOM
                 // kill: oom.group scoped the kill to the leaf, not this process.

@@ -109,6 +109,21 @@ An `intercept` rule may carry an optional `sandbox` (the same object described a
 }
 ```
 
+### Intercept Actions
+
+Each `intercept` entry is `{ "args": [...], "action": { "type": ... } }`. Rules are evaluated in order; the first whose `args` are a prefix of the invocation's arguments wins (an empty `args` is a catch-all). The `action.type` selects how the matched subcommand is handled:
+
+| `action.type` | Behavior |
+|---|---|
+| `passthrough` | Run the real binary in its sandbox. This is the default when no rule matches. |
+| `respond` | Return a static `stdout` string to the caller without forking the binary. |
+| `capture` | Run the real binary, buffering its stdout for broker inspection before returning it. |
+| `capture_credential` | Run the real binary, store its stdout as a named ambient `credential`, and return a broker nonce. |
+| `approve` | Route the invocation through an approval backend before forking (optional `timeout_secs`). |
+| `exec` | Run the helper at `command[0]` — with `command[1..]` then the original arguments — in place of the real binary, inside the matched command's sandbox; stream its stdout/stderr and propagate its exit code. `command[0]` is `$VAR`-expanded, must be absolute, is resolved with identity expectations, and is subject to the same non-writable-executable trust gate as a pinned `executable`. |
+
+`exec` is for handling one subcommand with a custom helper while the command's other subcommands run normally — for example, intercepting an `auth switch` subcommand with a helper that rewrites a config file, while `api` calls pass through with their brokered credentials.
+
 ### Dynamic Filesystem Grants
 
 `fs_read`, `fs_write`, `fs_read_file`, and `fs_write_file` can contain dynamic provider tokens as well as literal paths. Tokens are expanded at launch before the child sandbox is built. They are opt-in: no dynamic paths are added unless a selected command policy includes one of these tokens.

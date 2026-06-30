@@ -325,6 +325,25 @@ pub(crate) fn expand_path(path_str: &str) -> Result<PathBuf> {
     Ok(PathBuf::from(expanded))
 }
 
+/// Expand `$VAR` references in a string against the process environment,
+/// erroring on an unset variable rather than leaving it literal like
+/// [`expand_env_vars`] — collapsing `$X/helper` to `/helper` on a typo'd var
+/// name would be a silent path-widening bug.
+pub(crate) fn expand_env_vars_strict(input: &str) -> Result<String> {
+    substitute_vars(
+        input,
+        |c| c.is_ascii_alphanumeric() || c == '_',
+        |name| {
+            std::env::var(name)
+                .map(Some)
+                .map_err(|_| NonoError::EnvVarValidation {
+                    var: name.to_string(),
+                    reason: format!("referenced in '{input}' but not set in the environment"),
+                })
+        },
+    )
+}
+
 /// Check whether a path resides inside the Nix store (`/nix/store`).
 ///
 /// The Nix store is immutable by design — its contents are content-addressed
@@ -1868,10 +1887,9 @@ mod tests {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
-        let _env =
-            crate::test_env::EnvVarGuard::set_all(&[("_TEST_SFROOT_POLICY", "/opt/shadowfax")]);
+        let _env = crate::test_env::EnvVarGuard::set_all(&[("_TEST_SFROOT_POLICY", "/opt/vendor")]);
         let path = expand_path("$_TEST_SFROOT_POLICY/profiles").expect("should expand");
-        assert_eq!(path, PathBuf::from("/opt/shadowfax/profiles"));
+        assert_eq!(path, PathBuf::from("/opt/vendor/profiles"));
     }
 
     #[test]
@@ -1898,6 +1916,41 @@ mod tests {
             expand_env_vars("$_TEST_POLICY_ROOT/bin/$_UNSET_VAR"),
             "/opt/tool/bin/$_UNSET_VAR"
         );
+    }
+
+    #[test]
+    fn expand_env_vars_strict_no_substitution() {
+        assert_eq!(
+            expand_env_vars_strict("/usr/bin/true").expect("literal"),
+            "/usr/bin/true"
+        );
+    }
+
+    #[test]
+    fn expand_env_vars_strict_substitutes_named_var() {
+        let _lock = match crate::test_env::ENV_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let var = "NONO_TEST_EXPAND_ENV_VARS_HELPER_DIR";
+        let _env = crate::test_env::EnvVarGuard::set_all(&[(var, "/opt/libexec")]);
+        let plain = expand_env_vars_strict(&format!("${var}/helper")).expect("plain expand");
+        assert_eq!(plain, "/opt/libexec/helper");
+    }
+
+    #[test]
+    fn expand_env_vars_strict_errors_on_unset() {
+        let _lock = match crate::test_env::ENV_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let var = "NONO_TEST_EXPAND_ENV_VARS_DEFINITELY_UNSET";
+        // Manage the key through the guard (so drop restores the original), then
+        // remove it to exercise the unset path.
+        let env = crate::test_env::EnvVarGuard::set_all(&[(var, "placeholder")]);
+        env.remove(var);
+        let err = expand_env_vars_strict(&format!("${var}/x")).expect_err("unset var must error");
+        assert!(matches!(err, NonoError::EnvVarValidation { .. }));
     }
 
     #[test]

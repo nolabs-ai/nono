@@ -1181,6 +1181,20 @@
             "type": { "type": "string", "const": "approve" },
             "timeout_secs": { "type": "integer", "minimum": 1 }
           }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "command"],
+          "properties": {
+            "type": { "type": "string", "const": "exec" },
+            "command": {
+              "type": "array",
+              "items": { "type": "string" },
+              "minItems": 1,
+              "description": "Run a helper in place of the matched subcommand, inside the command's sandbox. command[0] is the helper path (after $VAR expansion, must be absolute); command[1..] are fixed leading args inserted before the forwarded original arguments. The helper's stdout/stderr are streamed and its exit code propagated. The helper is resolved with identity expectations and is subject to the same non-writable-executable trust gate as a pinned executable."
+            }
+          }
         }
       ]
     },

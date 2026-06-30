@@ -38,18 +38,32 @@ pub(crate) fn default_env_allow_patterns() -> Vec<String> {
         .collect()
 }
 
-pub(crate) fn effective_argv(
+/// Build the child argv: argv[0] is the binary's canonical path, then
+/// `extra_args` (the `exec` helper's fixed leading args, empty for normal
+/// commands), then the policy's `argv_prepend`, then the forwarded user args
+/// (`request.argv[1..]`). NUL bytes in `extra_args`/`argv_prepend` are rejected.
+pub(crate) fn effective_argv_for_binary(
     binary: &ResolvedCommandBinary,
     request: &ToolSandboxShimRequest,
     policy: &CommandSandboxConfig,
+    extra_args: &[Vec<u8>],
 ) -> Result<Vec<Vec<u8>>> {
     if request.argv.is_empty() {
         return Err(NonoError::SandboxInit(
             "tool-sandbox request had empty argv".to_string(),
         ));
     }
-    let mut argv = Vec::with_capacity(request.argv.len() + policy.argv_prepend.len());
+    let mut argv =
+        Vec::with_capacity(request.argv.len() + policy.argv_prepend.len() + extra_args.len());
     argv.push(binary.canonical_path.as_os_str().as_bytes().to_vec());
+    for arg in extra_args {
+        if arg.contains(&0) {
+            return Err(NonoError::ConfigParse(
+                "tool-sandbox exec helper arg contains NUL".to_string(),
+            ));
+        }
+        argv.push(arg.clone());
+    }
     for arg in &policy.argv_prepend {
         if arg.as_bytes().contains(&0) {
             return Err(NonoError::ConfigParse(
@@ -156,7 +170,90 @@ pub(crate) fn split_env_entry(entry: &[u8]) -> Option<(&[u8], &[u8])> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::command_policy::{ResolvedExecutableKind, ResolvedExecutableShape};
     use crate::exec_strategy::env_sanitization::is_env_var_allowed;
+
+    fn test_binary(path: &str) -> ResolvedCommandBinary {
+        ResolvedCommandBinary {
+            name: "cmd".to_string(),
+            canonical_path: std::path::PathBuf::from(path),
+            dev: 0,
+            ino: 0,
+            size: 0,
+            mtime_nanos: 0,
+            sha256: String::new(),
+            duplicate_paths: vec![],
+            shape: ResolvedExecutableShape {
+                kind: ResolvedExecutableKind::Other,
+                interpreter: None,
+                interpreter_args: vec![],
+            },
+        }
+    }
+
+    fn test_request(argv: &[&str]) -> ToolSandboxShimRequest {
+        ToolSandboxShimRequest {
+            command: "gh".to_string(),
+            argv: argv.iter().map(|a| a.as_bytes().to_vec()).collect(),
+            env: vec![],
+            cwd: b"/".to_vec(),
+            stdio_tty: [false; 3],
+        }
+    }
+
+    #[test]
+    fn effective_argv_forwards_helper_then_prepend_then_user_args() {
+        // argv layout for an `exec` helper:
+        // [helper, extra_args.., argv_prepend.., user_args (request.argv[1..])].
+        let helper = test_binary("/opt/vendor/gh-wrapper");
+        let request = test_request(&["gh", "auth", "switch", "--user", "someuser"]);
+        let policy = CommandSandboxConfig {
+            argv_prepend: vec!["--prepended".to_string()],
+            ..Default::default()
+        };
+        let extra = vec![b"helperarg".to_vec()];
+
+        let argv = effective_argv_for_binary(&helper, &request, &policy, &extra).expect("argv");
+        let rendered: Vec<String> = argv
+            .iter()
+            .map(|a| String::from_utf8_lossy(a).into_owned())
+            .collect();
+        assert_eq!(
+            rendered,
+            vec![
+                "/opt/vendor/gh-wrapper",
+                "helperarg",
+                "--prepended",
+                "auth",
+                "switch",
+                "--user",
+                "someuser",
+            ]
+        );
+    }
+
+    #[test]
+    fn effective_argv_normal_command_has_no_extra_args() {
+        // The non-exec path passes `&[]`, so argv is [binary, argv_prepend.., user_args].
+        let binary = test_binary("/usr/bin/gh");
+        let request = test_request(&["gh", "pr", "list"]);
+        let policy = CommandSandboxConfig::default();
+        let argv = effective_argv_for_binary(&binary, &request, &policy, &[]).expect("argv");
+        let rendered: Vec<String> = argv
+            .iter()
+            .map(|a| String::from_utf8_lossy(a).into_owned())
+            .collect();
+        assert_eq!(rendered, vec!["/usr/bin/gh", "pr", "list"]);
+    }
+
+    #[test]
+    fn effective_argv_rejects_nul_in_extra_args() {
+        let helper = test_binary("/opt/vendor/helper");
+        let request = test_request(&["gh", "auth", "switch"]);
+        let policy = CommandSandboxConfig::default();
+        let extra = vec![b"a\0b".to_vec()];
+        assert!(effective_argv_for_binary(&helper, &request, &policy, &extra).is_err());
+    }
 
     #[test]
     fn tls_trust_bundle_vars_are_in_default_allow() {

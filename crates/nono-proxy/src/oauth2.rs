@@ -96,22 +96,13 @@ struct CachedToken {
 impl TokenCache {
     /// Create a new cache and perform the **initial** token exchange.
     ///
-    /// Called during [`CredentialStore::load()`](crate::credential::CredentialStore::load)
-    /// which is synchronous. We bridge into async via
-    /// [`tokio::runtime::Handle::current().block_on()`].
-    ///
     /// # Errors
     ///
     /// Returns [`ProxyError::OAuth2Exchange`] if the initial exchange fails
     /// (DNS, TCP, TLS, non-200, malformed JSON). The calling code skips the
     /// route so the proxy can still start for other routes.
-    pub fn new(config: OAuth2ExchangeConfig, tls_connector: TlsConnector) -> Result<Self> {
-        // Use block_in_place to avoid panicking when called from within an
-        // async context (e.g., server::start() which is async). This moves
-        // the blocking work off the async worker thread.
-        let (access_token, expires_in) = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(exchange_token(&config, &tls_connector))
-        })?;
+    pub async fn new(config: OAuth2ExchangeConfig, tls_connector: TlsConnector) -> Result<Self> {
+        let (access_token, expires_in) = exchange_token(&config, &tls_connector).await?;
 
         let expires_at = Instant::now() + expires_in;
         debug!(

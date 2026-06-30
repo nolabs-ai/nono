@@ -130,11 +130,20 @@ pub async fn handle_reverse_proxy(
     ctx: &ReverseProxyCtx<'_>,
     buffered_body: &[u8],
 ) -> Result<()> {
-    // Parse method, path, and HTTP version
     let (method, path, version) = parse_request_line(first_line)?;
     debug!("Reverse proxy: {} {}", method, path);
 
-    // Extract service prefix from path (e.g., "/openai/v1/chat" -> ("openai", "/v1/chat"))
+    // HTTP proxy clients send absolute URLs; strip scheme+authority so
+    // parse_service_prefix sees a relative path.
+    let path = if path.starts_with("http://") || path.starts_with("https://") {
+        path.strip_prefix("http://")
+            .or_else(|| path.strip_prefix("https://"))
+            .and_then(|s| s.find('/').map(|i| s[i..].to_string()))
+            .unwrap_or_else(|| "/".to_string())
+    } else {
+        path
+    };
+
     let (service, upstream_path) = parse_service_prefix(&path)?;
     let route = ctx
         .route_store

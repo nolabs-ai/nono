@@ -177,8 +177,9 @@ fn spiffe_jwt_credential_injected_end_to_end() {
         ),
     );
 
-    // nono injects MOCKAPI_BASE_URL=http://127.0.0.1:<proxy_port>/mockapi into the
-    // child env. We use a shell so the env var is expanded at runtime.
+    // curl routes $MOCKAPI_BASE_URL through HTTP_PROXY (127.0.0.1 is removed from
+    // NO_PROXY because the upstream is loopback). The proxy normalises the absolute
+    // URL, matches the mockapi route, fetches a JWT-SVID, and injects it.
     let output = run_nono(
         &[
             "run",

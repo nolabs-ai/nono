@@ -429,8 +429,14 @@ pub struct CredentialCaptureOutputConfig {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CredentialCaptureInteraction {
+    /// Allow the capture command to write prompts to the terminal via inherited stderr.
     #[serde(default)]
     pub stdio: bool,
+    /// Allow the capture command to read from the terminal via inherited stdin.
+    /// Only set this when the helper genuinely needs to prompt the user for input.
+    /// Defaults to false; stdin is `/dev/null` unless explicitly enabled.
+    #[serde(default)]
+    pub stdin: bool,
     #[serde(default)]
     pub open_urls: Option<OpenUrlConfig>,
     #[serde(default)]

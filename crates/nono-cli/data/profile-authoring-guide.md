@@ -406,9 +406,9 @@ Defines supervisor-side commands that produce credentials for `cmd://` custom cr
 | `cache_ttl_secs`   | integer         | no       | `900`   | In-memory cache TTL, 0–3600 seconds. `0` disables caching. |
 | `ttl_secs`         | integer         | no       | `900`   | Older alias for `cache_ttl_secs`. Do not set both fields. |
 | `cache_path_regex` | string          | no       | host    | Regex evaluated against the request path. Capture group 1 becomes the cache scope; otherwise the full match is used. |
-| `stdin`            | string          | no       | `null`  | `null` closes stdin; `request_json` writes request metadata JSON to stdin. |
+| `stdin`            | string          | no       | `null`  | `null` closes stdin (unless `interaction.stdin` is `true`); `request_json` writes request metadata JSON to stdin. |
 | `output`           | string/object   | no       | `text`  | `text` captures stdout as one credential. `{"format":"json","allow_headers":[...]}` captures multiple headers. |
-| `interaction`      | object          | no       | none    | Explicit opt-in for capture commands that need inherited stdio or browser opening. |
+| `interaction`      | object          | no       | none    | Explicit opt-in for capture commands that need inherited stderr, inherited stdin, or browser opening. |
 
 Capture commands run with `NONO_SESSION_ID`, `NONO_REQUEST_HOST`, `NONO_REQUEST_PATH`, `NONO_REQUEST_METHOD`, `NONO_CACHE_SCOPE`, `NONO_CAPTURE_CREDENTIAL`, and `NONO_CAPTURE_ROUTE` set. Proxy environment variables are removed to avoid recursively using the same proxy route while capturing the credential.
 

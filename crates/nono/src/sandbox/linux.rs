@@ -564,12 +564,47 @@ fn apply_with_abi_inner(
     info!("Using Landlock ABI {:?}", target_abi);
     let scopes = requested_scopes(caps, abi)?;
 
-    if !matches!(caps.network_mode(), NetworkMode::AllowAll) && caps.localhost_ports().contains(&0)
-    {
+    // Port 0 in localhost_ports means "allow all TCP ports" (localhost wildcard).
+    //
+    // Landlock's network rules match on exact port number via a red-black tree lookup
+    // in security/landlock/net.c; there is no wildcard rule type and no IP filter.
+    // Port 0 has access-specific semantics:
+    //   - BindTcp/port 0: matches bind(port=0), allowing OS ephemeral port assignment
+    //     from ip_local_port_range. Useful, but only covers the bind side.
+    //   - ConnectTcp/port 0: matches connect() to destination port 0 only — not a
+    //     wildcard. connect(localhost:32768) still has no rule and is denied EACCES.
+    // There is also no way to express "allow 127.0.0.1:* but deny external:*" — rules
+    // carry no IP-address component.
+    //
+    // In Blocked mode there is no proxy to enforce host-level restrictions; reject here.
+    //
+    // In ProxyOnly mode the correct approach is to skip Landlock network handling entirely.
+    // Without handle_access(AccessNet) on the ruleset, the kernel imposes no TCP port
+    // restrictions. The proxy (injected via HTTPS_PROXY / HTTP_PROXY env vars) then acts
+    // as the sole domain enforcer. This matches macOS behaviour where Seatbelt expresses
+    // localhost:* as a true wildcard; Linux achieves the same result by not adding any
+    // Landlock TCP rules.
+    if matches!(caps.network_mode(), NetworkMode::Blocked) && caps.localhost_ports().contains(&0) {
         return Err(NonoError::SandboxInit(
-            "open_port 0 (localhost TCP wildcard) is macOS-only; on Linux use explicit ports or a network profile."
+            "open_port 0 (localhost TCP wildcard) requires ProxyOnly mode on Linux. \
+             Landlock cannot restrict TCP connects by destination IP, so port 0 must \
+             disable Landlock network enforcement; this is only safe when a proxy \
+             enforces domain restrictions. Use --proxy or --allow-domain."
                 .to_string(),
         ));
+    }
+
+    // When port 0 is in localhost_ports with ProxyOnly, skip all Landlock network handling.
+    // The proxy is the sole TCP enforcer; all kernel-level port restrictions are lifted.
+    let localhost_wildcard_proxy = matches!(caps.network_mode(), NetworkMode::ProxyOnly { .. })
+        && caps.localhost_ports().contains(&0);
+
+    if localhost_wildcard_proxy {
+        warn!(
+            "open_port 0 in ProxyOnly mode: Landlock TCP enforcement disabled. \
+             All ports are accessible at the kernel level; domain restrictions \
+             are enforced by the proxy only."
+        );
     }
 
     // Determine which access rights to handle based on ABI
@@ -587,16 +622,22 @@ fn apply_with_abi_inner(
         .map_err(|e| NonoError::SandboxInit(format!("Failed to handle fs access: {}", e)))?
         .set_compatibility(CompatLevel::BestEffort);
 
-    // Determine if we need network handling (any mode besides AllowAll)
-    let needs_network_handling = !matches!(caps.network_mode(), NetworkMode::AllowAll)
-        || !caps.tcp_connect_ports().is_empty()
-        || !caps.tcp_bind_ports().is_empty();
+    // Skip all kernel-level TCP filtering when localhost_wildcard_proxy is set; the proxy
+    // is the enforcer. Also skip when AllowAll and no explicit port lists are requested.
+    let needs_network_handling = !localhost_wildcard_proxy
+        && (!matches!(caps.network_mode(), NetworkMode::AllowAll)
+            || !caps.tcp_connect_ports().is_empty()
+            || !caps.tcp_bind_ports().is_empty());
 
     let mut seccomp_net_fallback = SeccompNetFallback::None;
+    // True only when Landlock itself is configured to handle AccessNet (not seccomp fallback,
+    // and not skipped via localhost_wildcard_proxy). Only then can NetPort rules be added.
+    let mut network_handled_by_landlock = false;
 
     let ruleset_builder = if needs_network_handling {
         let handled_net = AccessNet::from_all(target_abi);
         if !handled_net.is_empty() {
+            network_handled_by_landlock = true;
             debug!("Handling network access: {:?}", handled_net);
             ruleset_builder
                 .set_compatibility(CompatLevel::HardRequirement)
@@ -685,10 +726,10 @@ fn apply_with_abi_inner(
         .create()
         .map_err(|e| NonoError::SandboxInit(format!("Failed to create ruleset: {}", e)))?;
 
-    // Add Landlock network port rules ONLY when Landlock is handling networking.
-    // When a seccomp fallback is active (BlockAll or ProxyOnly), the ruleset was
-    // created without handle_access(AccessNet), so adding NetPort rules would fail.
-    if matches!(seccomp_net_fallback, SeccompNetFallback::None) {
+    // Add Landlock network port rules only when Landlock itself is handling networking.
+    // Skipped when seccomp fallback is active (ruleset has no AccessNet), or when
+    // localhost_wildcard_proxy disabled Landlock network handling entirely.
+    if network_handled_by_landlock {
         // Add per-port TCP connect rules (ProxyOnly port + explicit tcp_connect_ports)
         if let NetworkMode::ProxyOnly { port, bind_ports } = caps.network_mode() {
             debug!("Adding ProxyOnly TCP connect rule for port {}", port);
@@ -739,6 +780,8 @@ fn apply_with_abi_inner(
         // Add localhost IPC port rules (connect + bind per port).
         // Only meaningful in Blocked/ProxyOnly modes. In AllowAll mode, all ports are
         // already reachable and adding Landlock network handling would restrict them.
+        // Port 0 (localhost wildcard in ProxyOnly mode) is handled above by skipping
+        // network handling entirely, so localhost_ports here never contains 0 in that path.
         if !matches!(caps.network_mode(), NetworkMode::AllowAll) {
             for port in caps.localhost_ports() {
                 debug!("Adding localhost TCP connect rule for port {}", port);
@@ -3602,9 +3645,9 @@ mod tests {
         );
     }
 
-    /// Rejects `open_port: [0]` on Linux for any restricted network mode (not Landlock-only).
+    /// Rejects `open_port: [0]` in Blocked mode — no proxy to enforce host-level restrictions.
     #[test]
-    fn test_reject_localhost_port_wildcard_zero_on_linux() {
+    fn test_reject_localhost_port_wildcard_zero_in_blocked_mode() {
         let Ok(detected) = detect_abi() else {
             return;
         };
@@ -3613,7 +3656,51 @@ mod tests {
         let err =
             apply_auto_with_abi(&caps, &detected).expect_err("port 0 wildcard must be rejected");
         let msg = format!("{err}");
-        assert!(msg.contains("macOS-only"), "unexpected error: {msg}");
+        assert!(msg.contains("ProxyOnly mode"), "unexpected error: {msg}");
+    }
+
+    /// Accepts `open_port: [0]` in ProxyOnly mode on Linux (Landlock v4+) — the proxy
+    /// enforces domain restrictions; port 0 acts as a wildcard to allow localhost
+    /// connections on dynamically assigned ports (e.g. Testcontainers, Maven Surefire).
+    #[test]
+    fn test_accept_localhost_port_wildcard_zero_in_proxy_only_mode() {
+        let Ok(detected) = detect_abi() else {
+            return;
+        };
+        if !detected.has_network() {
+            // Landlock < v4: no TCP filtering; test not applicable.
+            return;
+        }
+        let mut caps = CapabilitySet::new().proxy_only(8080);
+        caps.add_localhost_port(0);
+
+        // Fork a child to isolate the irreversible sandbox application.
+        // apply_with_abi() calls restrict_self(), which permanently sandboxes the
+        // calling process. Running it in a child prevents corrupting the test runner.
+        // SAFETY: fork() is used in a test helper; the child exits via _exit without
+        // running parent process destructors after fork.
+        let child_pid = unsafe { libc::fork() };
+        assert!(child_pid >= 0, "fork() failed");
+
+        if child_pid == 0 {
+            let exit_code = match apply_with_abi(&caps, &detected) {
+                Ok(_) => 0,
+                Err(_) => 1,
+            };
+            // SAFETY: _exit terminates the child without running parent destructors.
+            unsafe { libc::_exit(exit_code) };
+        }
+
+        let mut child_status = 0;
+        // SAFETY: child_pid is the PID returned by fork() in the parent branch.
+        let waited = unsafe { libc::waitpid(child_pid, &mut child_status, 0) };
+        assert_eq!(waited, child_pid, "waitpid() failed");
+        assert!(libc::WIFEXITED(child_status), "child did not exit normally");
+        assert_eq!(
+            libc::WEXITSTATUS(child_status),
+            0,
+            "port 0 in ProxyOnly mode must be accepted on Linux"
+        );
     }
 
     #[test]

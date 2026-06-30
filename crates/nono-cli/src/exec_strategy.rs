@@ -488,22 +488,20 @@ fn push_set_vars(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn execute_supervised(
+pub fn execute_supervised<F: FnMut(i32) -> bool>(
     config: &ExecConfig<'_>,
     supervisor: Option<&SupervisorConfig<'_>>,
     trust_interceptor: Option<crate::trust_intercept::TrustInterceptor>,
     on_fork: Option<&mut dyn FnMut(u32)>,
     pty_pair: Option<crate::pty_proxy::PtyPair>,
     pty_session_id: Option<&str>,
-    // Write fd of the resource cgroup's `cgroup.procs`, opened by the caller
-    // pre-fork. When set, the forked child self-attaches through it before
-    // applying the sandbox or exec'ing. Unused off Linux.
+    // Write fd of the resource cgroup's `cgroup.procs`. The forked child attaches
+    // itself through it before sandboxing or exec'ing. None off Linux.
     resource_procs_fd: Option<std::os::fd::RawFd>,
-    // Optional post-mortem hook, called once with the child's exit code after
-    // reaping. It may print a specialized diagnostic (e.g. the cgroup memory-cap
-    // explanation); returning `true` means it fully explained the failure, so the
-    // generic exit/denial footer is suppressed (no two competing stories).
-    mut on_exit_diagnostic: Option<&mut dyn FnMut(i32) -> bool>,
+    // Called once with the child's exit code after reaping. Returns true if it
+    // printed its own diagnostic (e.g. the cgroup memory-cap explanation), which
+    // suppresses the generic exit footer so there aren't two competing stories.
+    mut on_exit_diagnostic: Option<F>,
 ) -> Result<i32> {
     // Used only by the Linux self-attach path below; silence the unused-var
     // warning under the strict `-D warnings` build off Linux.
@@ -1551,7 +1549,7 @@ pub fn execute_supervised(
             let specialized_diagnostic = !killed_by_timeout
                 && on_exit_diagnostic
                     .take()
-                    .is_some_and(|hook| hook(exit_code));
+                    .is_some_and(|mut hook| hook(exit_code));
 
             // Analyze PTY screen content for sandbox-related errors.
             let pty_screen = pty_proxy

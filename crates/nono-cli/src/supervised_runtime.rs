@@ -342,7 +342,7 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
         // and prints a precise diagnostic, so the breach is loud not silent.
         // Returning `true` suppresses the generic "killed by SIGKILL" footer.
         #[cfg(target_os = "linux")]
-        let mut on_exit_diag_fn = |code: i32| -> bool {
+        let on_exit_diag_fn = |code: i32| -> bool {
             // Only explain the kernel's exit code for a whole-sandbox OOM kill
             // (128 + SIGKILL = 137). Bailing on any other code stops an unrelated
             // failure from getting a spurious "killed by the kernel" story (or its
@@ -362,10 +362,9 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
         };
         // No leaf, no hook (`None`) — the exact pre-feature path.
         #[cfg(target_os = "linux")]
-        let on_exit_diag: Option<&mut dyn FnMut(i32) -> bool> =
-            cgroup_leaf.is_some().then_some(&mut on_exit_diag_fn);
+        let on_exit_diag = cgroup_leaf.is_some().then_some(on_exit_diag_fn);
         #[cfg(not(target_os = "linux"))]
-        let on_exit_diag: Option<&mut dyn FnMut(i32) -> bool> = None;
+        let on_exit_diag: Option<fn(i32) -> bool> = None;
 
         exec_strategy::execute_supervised(
             config,

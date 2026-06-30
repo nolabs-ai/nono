@@ -70,8 +70,8 @@ pub use capability::{
 pub use diagnostic::{
     DenialReason, DenialRecord, IpcDenialRecord, NonoDiagnostic, NonoDiagnosticCode,
     NonoDiagnosticDetail, NonoDiagnosticSeverity, NonoRemediation, SandboxViolation,
-    SessionDiagnosticReport, SessionObservationInput, StderrObservationKind, dedupe_denials,
-    filesystem_denials_from_violations, follow_up_diagnostics,
+    SessionDiagnosticReport, SessionObservationInput, StderrObservationKind, UrlDenialReason,
+    UrlDenialRecord, dedupe_denials, filesystem_denials_from_violations, follow_up_diagnostics,
 };
 pub use error::{NonoError, Result};
 pub use keystore::{

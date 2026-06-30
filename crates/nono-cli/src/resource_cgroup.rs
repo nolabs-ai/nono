@@ -1,45 +1,36 @@
 //! Linux cgroup v2 memory enforcement.
 //!
-//! A `--memory` limit runs the program inside a *cgroup v2 leaf*: a directory
-//! under `/sys/fs/cgroup` whose limits we set by writing to files ("knobs") inside
-//! it. If the program and everything it spawns use more memory than the limit, the
-//! kernel kills them all at once — and only them, so a runaway agent can't take
-//! down the machine. The (unsandboxed) supervisor creates the leaf and sets its
-//! limits before forking; the sandboxed child puts itself into the leaf; we delete
-//! it when the run ends.
+//! A `--memory` limit runs the program in a *cgroup leaf*: a directory under
+//! `/sys/fs/cgroup` whose limits are set by writing to files ("knobs"). If the
+//! program and its children exceed the limit, the kernel kills them all — and only
+//! them. The supervisor builds the leaf before forking; the child moves itself in;
+//! the leaf is deleted when the run ends.
 //!
-//! # Why the child adds itself
+//! # Why the child moves itself in
 //!
-//! A cgroup limits every process in it as a group, and a forked child starts in
-//! the same cgroup as its parent — so once one process is in, everything it spawns
-//! is in too, and they all die together. The goal is to get that first process in
-//! with no gap. If we added the child *after* `fork()`, there would be a brief
-//! moment where it runs uncapped and could spawn children outside the limit. So
-//! the child adds *itself*: the parent opens the leaf's `cgroup.procs` file before
-//! forking (the child inherits it), and the child writes its own pid to it before
-//! it can spawn or start anything else. See [`child_self_attach`].
+//! A forked child starts in its parent's cgroup, and a cgroup caps all its
+//! processes together — so once one process is in, everything it spawns is capped
+//! too. Moving the child in *after* `fork()` would leave a gap where it runs
+//! uncapped. Instead the parent opens `cgroup.procs` before forking and the child
+//! writes its own pid to it first thing. See [`child_self_attach`].
 //!
 //! # Fail-closed (AGENTS.md "Fail Secure")
 //!
-//! If we can't create the leaf, set its limits, or get the child into it, we
-//! refuse to run. Creating and arming happen before the fork, so any problem shows
-//! up as a [`NonoError`] before anything runs. A child that can't add itself calls
-//! `_exit(126)` before it sandboxes or starts the real program — so it never runs
-//! the thing the limit was meant to cap.
+//! If the leaf can't be built or entered, the run is refused. Setup is pre-fork, so
+//! failures surface as a [`NonoError`] before anything runs; a child that can't get
+//! in `_exit(126)`s before running the program.
 //!
-//! # The knobs we write
+//! # The knobs
 //!
-//! - `memory.max`         — the hard limit; going over triggers an OOM kill.
-//! - `memory.swap.max=0`  — no swap (otherwise a program could swap to dodge it).
-//! - `memory.oom.group=1` — on an OOM kill, kill the whole leaf together at once.
+//! - `memory.max`         — the hard limit; over it, the kernel OOM-kills.
+//! - `memory.swap.max=0`  — no swap (else a program could swap around the limit).
+//! - `memory.oom.group=1` — kill the whole leaf together, not one process.
 //!
-//! We leave `memory.high` unset on purpose: with swap off, a program over the
-//! limit has nothing to give back, so it would stall for seconds instead of being
-//! killed quickly.
+//! `memory.high` is left unset on purpose: with swap off, a program over the limit
+//! would stall instead of being killed quickly.
 //!
-//! Choosing a different backend (WSL2 / non-systemd, `auto`/`cgroup`/`portable`)
-//! is a later step; this targets the common case — a systemd `Delegate=yes`
-//! session.
+//! Other backends (WSL2 / non-systemd) come later; this targets the common case, a
+//! systemd `Delegate=yes` session.
 
 use nix::libc;
 use nono::{NonoError, ResourceLimits, Result};
@@ -47,63 +38,53 @@ use std::fs::{self, File, OpenOptions};
 use std::os::fd::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 
-/// Prefix of the per-run leaf directory name (`nono.<pid>`). Shared by leaf
-/// creation and [`parse_leaf_pid`] so the two can never drift apart.
+/// Leaf directory name prefix (`nono.<pid>`), shared by creation and
+/// [`parse_leaf_pid`] so the two can't drift.
 const LEAF_PREFIX: &str = "nono.";
 
-/// Wrap a message as the [`NonoError::SandboxInit`] this module always returns,
-/// with the shared `resource: ` prefix. The per-site detail stays at the call
-/// site, so every error is still visible and auditable where it is raised.
+/// This module's standard error: a [`NonoError::SandboxInit`] with the shared
+/// `resource: ` prefix. The per-site detail stays at the call site.
 fn resource_err(msg: impl Into<String>) -> NonoError {
     NonoError::SandboxInit(format!("resource: {}", msg.into()))
 }
 
-/// One run's memory limit: a cgroup v2 directory we create, set limits on, move
-/// the child into, and delete when the run ends.
+/// One run's memory limit: a cgroup v2 directory we create, arm, and delete on drop.
 ///
-/// Created before the fork by [`CgroupLeaf::create`]; the child adds itself
-/// through the inherited `cgroup.procs` file ([`CgroupLeaf::procs_raw_fd`] +
-/// [`child_self_attach`]). Dropping it kills anything still inside and removes the
-/// directory, so an early return or panic can't leave a stray cgroup behind.
+/// Built before the fork by [`CgroupLeaf::create`]; the child moves itself in (see
+/// [`child_self_attach`]). Drop kills any survivors and removes the directory.
 pub struct CgroupLeaf {
     /// Absolute path of the leaf directory, e.g.
     /// `/sys/fs/cgroup/.../user@1000.service/nono.<pid>`.
     path: PathBuf,
-    /// Open write handle to the leaf's `cgroup.procs`. We open it before the fork
-    /// only so the child inherits it and can add itself; the parent never writes
-    /// to it. Closed when dropped, and automatically in the child when it starts
-    /// the real program (O_CLOEXEC).
+    /// Write handle to `cgroup.procs`, opened pre-fork so the child inherits it and
+    /// can move itself in. `O_CLOEXEC`, so it closes when the child execs.
     procs: File,
 }
 
-/// Evidence that the kernel OOM-killed something in this leaf, read from
-/// `memory.events` (plus the limit and peak figures) while the leaf still exists.
-/// Lets the supervisor explain an otherwise-bare SIGKILL as "you hit the memory
-/// limit".
+/// Proof the kernel OOM-killed something in this leaf (read from `memory.events`,
+/// plus the limit/peak), so a bare SIGKILL can be explained as "you hit the limit".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OomReport {
-    /// `oom_kill` from `memory.events`: how many processes the kernel killed here
-    /// for going over the limit.
+    /// Processes the kernel killed here for exceeding the limit (`oom_kill`).
     pub oom_kills: u64,
-    /// `oom_group_kill` from `memory.events`: how many times the kernel killed the
-    /// whole leaf at once (our `memory.oom.group=1`). Always 0 on kernels older
-    /// than 5.14, which don't report it.
+    /// Whole-leaf kills (`oom_group_kill`, our `memory.oom.group=1`). Always 0
+    /// before kernel 5.14, which doesn't report it.
     pub oom_group_kills: u64,
     /// The limit (`memory.max`) in bytes, if still readable.
     pub limit_bytes: Option<u64>,
-    /// The most memory the program reached (`memory.peak`) in bytes, if the kernel
-    /// reports it (Linux 5.19+). Usually right at the limit on an OOM kill.
+    /// Peak memory reached (`memory.peak`) in bytes, if the kernel reports it
+    /// (Linux 5.19+).
     pub peak_bytes: Option<u64>,
 }
 
 impl CgroupLeaf {
-    /// Create the leaf, set its limits, and open `cgroup.procs` for the child to
-    /// add itself through. Runs before the fork; fails closed.
+    /// Create the leaf, arm it, and open `cgroup.procs` for the child. Pre-fork;
+    /// fails closed.
     ///
     /// # Errors
-    /// [`NonoError::SandboxInit`] if this session has no cgroup v2 subtree it can
-    /// manage, the memory controller isn't available, or writing a limit or opening
-    /// `cgroup.procs` fails. Nothing half-built is left behind on failure.
+    /// [`NonoError::SandboxInit`] if there's no manageable cgroup v2 subtree, the
+    /// memory controller is missing, or a write/open fails. Nothing half-built is
+    /// left behind.
     pub fn create(limits: &ResourceLimits) -> Result<Self> {
         let base = delegated_base()?;
         ensure_controllers_delegated(&base, limits)?;
@@ -129,9 +110,8 @@ impl CgroupLeaf {
         Self::arm(path.clone(), limits).inspect_err(|_| teardown(&path))
     }
 
-    /// Set the limits and open `cgroup.procs`, producing the owned [`CgroupLeaf`].
-    /// Kept separate from [`create`](Self::create) so that if it fails, the caller
-    /// can clean up the directory it already created.
+    /// Write the limits and open `cgroup.procs`. Split from [`create`](Self::create)
+    /// so a failure here is cleaned up by the caller's teardown of the directory.
     fn arm(path: PathBuf, limits: &ResourceLimits) -> Result<Self> {
         write_knobs(&path, limits)?;
         let procs_path = path.join("cgroup.procs");
@@ -158,21 +138,17 @@ impl CgroupLeaf {
         Ok(Self { path, procs })
     }
 
-    /// Raw fd of the leaf's `cgroup.procs`, for the forked child to inherit and
-    /// write to via [`child_self_attach`]. Valid as long as this `CgroupLeaf` lives.
+    /// Raw fd of `cgroup.procs` for the child to inherit (see [`child_self_attach`]).
+    /// Valid while this `CgroupLeaf` lives.
     #[must_use]
     pub fn procs_raw_fd(&self) -> RawFd {
         self.procs.as_raw_fd()
     }
 
-    /// Read OOM evidence from the leaf's `memory.events`. Call right after the
-    /// child exits and *before* teardown. Returns `Some` only when the kernel
-    /// actually recorded an OOM kill here (the limit was really hit), so the caller
-    /// can explain an otherwise-confusing SIGKILL.
+    /// Read OOM evidence from `memory.events` — call after the child exits, before
+    /// teardown. `Some` only if the kernel actually recorded an OOM kill here.
     ///
-    /// Never fails: if a file can't be read it returns `None` (or leaves a field
-    /// empty), so a missing or cut-down `memory.events` never disrupts the exit
-    /// path or teardown.
+    /// Never fails: an unreadable file yields `None` or an empty field.
     #[must_use]
     pub fn oom_report(&self) -> Option<OomReport> {
         let events = fs::read_to_string(self.path.join("memory.events")).ok()?;
@@ -198,9 +174,8 @@ impl CgroupLeaf {
     }
 }
 
-/// Read one counter (e.g. `oom_kill`) from a cgroup `memory.events` file. Each
-/// line is `key value`; a missing or non-numeric key reads as 0, so a partial or
-/// newer-format file never panics.
+/// Read one `key value` counter (e.g. `oom_kill`) from `memory.events`. A missing
+/// or non-numeric key reads as 0.
 fn event_counter(events: &str, key: &str) -> u64 {
     events
         .lines()
@@ -221,19 +196,16 @@ impl Drop for CgroupLeaf {
     }
 }
 
-/// The child puts itself into the memory cgroup by writing its own pid to the
-/// inherited `cgroup.procs` fd — after the fork, but before it sandboxes or starts
-/// the real program. Because it does this first, everything it later spawns lands
-/// in the cgroup too, with no gap to slip out into the parent's cgroup.
+/// Move the child into the cgroup by writing its pid to the inherited
+/// `cgroup.procs` fd — after the fork, before it sandboxes or execs. Doing it first
+/// means every later child is capped too, with no gap to escape the parent's cgroup.
 ///
-/// Async-signal-safe: it only calls `getpid`, formats into a stack buffer, and
-/// `write`s — no memory allocation, no locks — so it is safe to run in the child
-/// right after `fork`. Returns `true` if the whole pid was written; on `false` the
-/// caller must `_exit` the child (fail closed: never run it uncapped).
+/// Async-signal-safe (only `getpid`, a stack buffer, and `write` — no alloc, no
+/// locks). Returns `true` on a complete write; on `false` the caller must `_exit`
+/// the child (fail closed).
 ///
 /// # Safety
-/// `procs_fd` must be a valid, writable fd for the leaf's `cgroup.procs`,
-/// inherited from the parent across `fork`.
+/// `procs_fd` must be a valid, writable `cgroup.procs` fd inherited across `fork`.
 #[must_use = "on `false` the child is unconfined and the caller MUST _exit it (fail-closed)"]
 pub fn child_self_attach(procs_fd: RawFd) -> bool {
     // SAFETY: `getpid` is async-signal-safe and always succeeds; in the child it
@@ -253,13 +225,12 @@ pub fn child_self_attach(procs_fd: RawFd) -> bool {
     written == encoded.len() as isize
 }
 
-/// `i32::MAX` is `2147483647` (10 digits); pids are positive, so 10 is the widest
-/// decimal a pid can need.
+/// Widest decimal a pid needs: `i32::MAX` is 10 digits.
 const MAX_PID_DIGITS: usize = 10;
 
-/// Write `pid` as decimal ASCII into `buf` without allocating (async-signal-safe)
-/// and return the part of the buffer that was filled. A zero or negative `pid`
-/// renders as `"0"` defensively (a real pid never is).
+/// Write `pid` as decimal ASCII into `buf` without allocating (async-signal-safe);
+/// returns the filled slice. A non-positive `pid` renders as `"0"` (a real one
+/// never is).
 fn format_pid_decimal(pid: i32, buf: &mut [u8; MAX_PID_DIGITS]) -> &[u8] {
     let mut n = u32::try_from(pid).unwrap_or(0);
     // Write the digits from the right end of buf, lowest digit first, so there's
@@ -304,15 +275,14 @@ fn write_knob(path: &Path, knob: &str, value: &str) -> Result<()> {
     })
 }
 
-/// How long to wait for the kernel to clean up killed processes before `rmdir`:
-/// [`REAP_POLL_ATTEMPTS`] checks, [`REAP_POLL_INTERVAL`] apart — about 500ms at
-/// most. Usually the child has already exited, so the first check passes and we
-/// never sleep.
+/// How long to wait for the kernel to reap killed processes before `rmdir`:
+/// [`REAP_POLL_ATTEMPTS`] checks [`REAP_POLL_INTERVAL`] apart (~500ms). Usually the
+/// child is already gone, so the first check passes.
 const REAP_POLL_ATTEMPTS: u32 = 50;
 const REAP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
 
-/// Kill anything still in the leaf, then remove it. Best-effort: leaving behind an
-/// empty cgroup directory isn't worth failing a finished run over.
+/// Kill anything left in the leaf, then remove it. Best-effort — a leftover empty
+/// directory isn't worth failing a finished run over.
 fn teardown(path: &Path) {
     // cgroup.kill (Linux 5.14+) kills everything in the leaf at once. If it isn't
     // available we ignore it; a single process that already exited leaves the leaf
@@ -340,12 +310,9 @@ fn teardown(path: &Path) {
     }
 }
 
-/// Remove leftover `nono.<pid>` leaves under `base` whose supervisor is no longer
-/// running (e.g. it was SIGKILL'd, so its `Drop`/teardown never ran). Best-effort.
-///
-/// Only touches leaves whose pid is no longer alive, so another nono running at the
-/// same time — or an unrelated process that happened to reuse an old supervisor's
-/// pid — is left alone.
+/// Remove leftover `nono.<pid>` leaves whose supervisor is gone (e.g. SIGKILL'd
+/// before teardown ran). Best-effort, and only touches leaves whose pid is dead, so
+/// a live nono (or a reused pid) is left alone.
 fn sweep_stale_leaves(base: &Path) {
     let Ok(entries) = fs::read_dir(base) else {
         return;
@@ -360,24 +327,21 @@ fn sweep_stale_leaves(base: &Path) {
     }
 }
 
-/// Supervisor pid from a leaf directory name (`nono.<pid>`), or `None` if `name`
-/// isn't one of our leaves.
+/// Supervisor pid from a leaf name (`nono.<pid>`), or `None` if it isn't one of ours.
 fn parse_leaf_pid(name: &str) -> Option<u32> {
     name.strip_prefix(LEAF_PREFIX)?.parse::<u32>().ok()
 }
 
-/// Whether `pid` still exists as a process (any state, including zombie), checked
-/// by whether `/proc/<pid>` is present.
+/// Whether `pid` still exists (`/proc/<pid>` present), in any state including zombie.
 fn pid_is_alive(pid: u32) -> bool {
     Path::new("/proc").join(pid.to_string()).exists()
 }
 
-/// Find the cgroup directory we're allowed to create our leaf inside.
+/// Find the cgroup directory we may create our leaf in.
 ///
-/// On a normal login, systemd gives each user session its own private cgroup
-/// subtree that it can manage without root, under `.../user@<uid>.service` — the
-/// one place we can reliably create child cgroups. We find it by reading
-/// `/proc/self/cgroup` and walking up to that directory.
+/// systemd delegates each user session a subtree under `.../user@<uid>.service` it
+/// can manage without root — the one place we can reliably create child cgroups. We
+/// read `/proc/self/cgroup` and walk up to it.
 fn delegated_base() -> Result<PathBuf> {
     let raw = fs::read_to_string("/proc/self/cgroup")
         .map_err(|e| resource_err(format!("cannot read /proc/self/cgroup: {e}")))?;
@@ -425,10 +389,9 @@ fn parse_delegated_base(proc_self_cgroup: &str, uid: u32) -> Result<PathBuf> {
     )))
 }
 
-/// Check that the controllers we need are turned on for child cgroups. A cgroup
-/// only has a controller's files (here `memory.max`) if that controller is listed
-/// in the parent's `cgroup.subtree_control`; without it, the leaf's `memory.max`
-/// wouldn't exist and the limit would silently not apply.
+/// Check the memory controller is enabled for child cgroups. A cgroup only has a
+/// controller's files (e.g. `memory.max`) if it's listed in the parent's
+/// `cgroup.subtree_control`; otherwise the limit would silently not apply.
 fn ensure_controllers_delegated(base: &Path, limits: &ResourceLimits) -> Result<()> {
     let subtree_path = base.join("cgroup.subtree_control");
     let subtree = fs::read_to_string(&subtree_path)

@@ -671,49 +671,49 @@ pub fn print_oom_diagnostic(report: &OomReport, silent: bool) {
         return;
     }
     let t = theme::current();
+    let emit = crate::startup_prompt::print_terminal_safe_stderr;
 
-    // Pad the label on the plain text before coloring, so values line up
-    // regardless of the invisible ANSI escapes.
+    // A labelled row: indented, the label padded on the plain text before
+    // coloring so values line up despite the invisible ANSI escapes.
     let row = |label: &str, value: &str| {
-        format!(
+        emit(&format!(
             "       {} {}",
             fg(&format!("{label:<17}"), t.subtext),
             fg(value, t.text),
-        )
+        ));
     };
 
-    let mut lines = vec![format!(
+    emit(&format!(
         "{} {}",
         fg("[nono] memory limit exceeded:", t.red).bold(),
         fg(
             "the sandboxed process tree was killed by the kernel for using too much memory.",
             t.text,
         ),
-    )];
-
+    ));
     let limit = report
         .limit_bytes
         .map_or_else(|| "unset".to_string(), format_bytes);
-    lines.push(row("limit (--memory):", &limit));
+    row("limit (--memory):", &limit);
     if let Some(peak) = report.peak_bytes {
-        lines.push(row("peak memory:", &format_bytes(peak)));
+        row("peak memory:", &format_bytes(peak));
     }
-    lines.push(row(
+    row(
         "OOM kills:",
         &format!(
             "{} (whole-sandbox kills: {})",
             report.oom_kills, report.oom_group_kills
         ),
-    ));
-    lines.push(row(
+    );
+    row(
         "swap:",
         "disabled (memory.swap.max=0) — nothing could spill to swap",
-    ));
-    lines.push(row(
+    );
+    row(
         "scope:",
         "the whole sandbox was killed together (memory.oom.group=1)",
-    ));
-    lines.push(format!(
+    );
+    emit(&format!(
         "       {} {}",
         fg("hint:", t.yellow).bold(),
         fg(
@@ -721,10 +721,6 @@ pub fn print_oom_diagnostic(report: &OomReport, silent: bool) {
             t.text,
         ),
     ));
-
-    for line in &lines {
-        crate::startup_prompt::print_terminal_safe_stderr(line);
-    }
 }
 
 /// Print skipped CLI path grants in a user-facing format.

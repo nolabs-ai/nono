@@ -2445,6 +2445,55 @@ fn duplicate_distinct_inode_paths(
     duplicates
 }
 
+/// Collects `unsafe_macos_seatbelt_rules` nested inside command sandboxes,
+/// `from.<caller>` edges, and intercept rule sandbox overrides, paired with
+/// a dotted location label. Used by profile save/share warnings, which
+/// otherwise only see the top-level `Profile.unsafe_macos_seatbelt_rules`
+/// and would silently miss rules nested here.
+pub(crate) fn nested_unsafe_seatbelt_rules(
+    policies: &CommandPoliciesConfig,
+) -> Vec<(String, String)> {
+    let mut found = Vec::new();
+    for (command_name, command) in &policies.commands {
+        if let Some(sandbox) = &command.sandbox {
+            push_unsafe_seatbelt_rules(
+                &format!("commands.{command_name}.sandbox"),
+                sandbox,
+                &mut found,
+            );
+        }
+        for (caller, from) in &command.from {
+            if let Some(sandbox) = from.sandbox() {
+                push_unsafe_seatbelt_rules(
+                    &format!("commands.{command_name}.from.{caller}"),
+                    sandbox,
+                    &mut found,
+                );
+            }
+        }
+        for (i, rule) in command.intercept.iter().enumerate() {
+            if let Some(sandbox) = &rule.sandbox {
+                push_unsafe_seatbelt_rules(
+                    &format!("commands.{command_name}.intercept[{i}]"),
+                    sandbox,
+                    &mut found,
+                );
+            }
+        }
+    }
+    found
+}
+
+fn push_unsafe_seatbelt_rules(
+    location: &str,
+    sandbox: &CommandSandboxConfig,
+    found: &mut Vec<(String, String)>,
+) {
+    for rule in &sandbox.unsafe_macos_seatbelt_rules {
+        found.push((location.to_string(), rule.clone()));
+    }
+}
+
 fn command_uses_credentials(command: &CommandPolicyConfig) -> bool {
     command
         .sandbox
@@ -3996,6 +4045,58 @@ mod tests {
             !serialized.contains("sandbox"),
             "absent sandbox override should be skipped in serialization: {serialized}"
         );
+    }
+
+    #[test]
+    fn nested_unsafe_seatbelt_rules_finds_command_from_and_intercept_sandboxes() {
+        let mut policies = CommandPoliciesConfig::default();
+        policies.commands.insert(
+            "git".to_string(),
+            CommandPolicyConfig {
+                sandbox: Some(CommandSandboxConfig {
+                    unsafe_macos_seatbelt_rules: vec!["(allow direct-sandbox)".to_string()],
+                    ..CommandSandboxConfig::default()
+                }),
+                from: BTreeMap::from([(
+                    "session".to_string(),
+                    CommandFromConfig::Policy(Box::new(CommandSandboxConfig {
+                        unsafe_macos_seatbelt_rules: vec!["(allow from-sandbox)".to_string()],
+                        ..CommandSandboxConfig::default()
+                    })),
+                )]),
+                intercept: vec![InterceptRuleConfig {
+                    args: vec!["push".to_string()],
+                    action: InterceptActionConfig::Passthrough,
+                    sandbox: Some(CommandSandboxConfig {
+                        unsafe_macos_seatbelt_rules: vec!["(allow intercept-sandbox)".to_string()],
+                        ..CommandSandboxConfig::default()
+                    }),
+                }],
+                ..CommandPolicyConfig::default()
+            },
+        );
+
+        let found = nested_unsafe_seatbelt_rules(&policies);
+        let rules: Vec<&str> = found.iter().map(|(_, rule)| rule.as_str()).collect();
+
+        assert!(rules.contains(&"(allow direct-sandbox)"));
+        assert!(rules.contains(&"(allow from-sandbox)"));
+        assert!(rules.contains(&"(allow intercept-sandbox)"));
+        assert_eq!(found.len(), 3);
+    }
+
+    #[test]
+    fn nested_unsafe_seatbelt_rules_empty_when_no_sandbox_sets_them() {
+        let mut policies = CommandPoliciesConfig::default();
+        policies.commands.insert(
+            "git".to_string(),
+            CommandPolicyConfig {
+                sandbox: Some(CommandSandboxConfig::default()),
+                ..CommandPolicyConfig::default()
+            },
+        );
+
+        assert!(nested_unsafe_seatbelt_rules(&policies).is_empty());
     }
 
     #[test]

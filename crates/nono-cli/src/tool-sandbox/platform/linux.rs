@@ -9,7 +9,7 @@ use crate::command_policy::{
 use crate::profile;
 use crate::tool_sandbox::credentials::{ResolvedCredential, resolve_credentials};
 use crate::tool_sandbox::env::{
-    apply_environment_set_vars, default_env_allow_patterns, effective_argv,
+    apply_environment_set_vars, default_env_allow_patterns, effective_argv_for_binary,
     inject_chaining_control_env, inject_url_open_env, split_env_entry,
 };
 use crate::tool_sandbox::launch::{
@@ -137,6 +137,10 @@ struct BaselineCache {
 struct ResolvedToolSandboxPlan {
     config: CommandPoliciesConfig,
     resolved: ResolvedCommandBinaries,
+    /// Pre-resolved `exec` intercept helpers, keyed by their env-expanded path
+    /// as written in the profile. Identity expectations are captured here so
+    /// the helper launch is TOCTOU-protected like a command binary.
+    exec_helpers: BTreeMap<PathBuf, ResolvedCommandBinary>,
     executable_dirs: Vec<PathBuf>,
     deny_only: BTreeMap<String, ResolvedDenyOnlyCommand>,
     allowed_direct_bypasses: Vec<PathBuf>,
@@ -210,6 +214,8 @@ impl ResolvedToolSandboxPlan {
         // entries part of the child sandbox trust boundary.
         let deny_only = resolve_deny_only_commands(config, &[], &[], &search_dirs)?;
         validate_controlled_binary_immutability(config, &resolved, &deny_only, outer_caps)?;
+        let exec_helpers = crate::command_policy::resolve_policy_exec_helpers(config)?;
+        validate_controlled_exec_helper_immutability(config, &exec_helpers, outer_caps)?;
         let governance_denies = resolve_governance_denies(config)?;
         let allowed_direct_bypasses =
             resolve_allowed_direct_bypasses(config, &resolved, &deny_only, &governance_denies)?;
@@ -217,6 +223,7 @@ impl ResolvedToolSandboxPlan {
         Ok(Self {
             config: config.clone(),
             resolved,
+            exec_helpers,
             executable_dirs: search_dirs,
             deny_only,
             allowed_direct_bypasses,
@@ -1768,6 +1775,88 @@ fn handle_shim_stream_inner(
         return result.map(|(c, _)| (c, Vec::new()));
     }
 
+    if let crate::command_policy::InterceptActionConfig::Exec { command } = intercept_action {
+        let active = state.active_count.fetch_add(1, Ordering::SeqCst);
+        if active >= MAX_ACTIVE_TOOL_SANDBOX_CHILDREN {
+            state.active_count.fetch_sub(1, Ordering::SeqCst);
+            record_command_policy_audit(
+                audit_recorder.as_ref(),
+                &request,
+                &state.redaction_policy,
+                session_id,
+                auth.peer_pid,
+                session_root_pid,
+                Some(&caller),
+                "denied",
+                Some("resource_limit".to_string()),
+                None,
+            )?;
+            return Err(NonoError::SandboxInit(
+                "tool-sandbox active child limit exceeded".to_string(),
+            ));
+        }
+        let result = (|| {
+            let (helper, extra_args) =
+                super::policy::resolve_exec_helper(&state.plan.exec_helpers, command)?;
+            let launch =
+                build_child_launch_spec_for_binary(state, &request, policy, helper, &extra_args)?;
+            launch_child(state, &request.command, &caller, launch, stdio)
+        })();
+        state.active_count.fetch_sub(1, Ordering::SeqCst);
+        return match result {
+            Ok(launch_result) => {
+                if let Some(reason) = launch_result.blocked_reason.clone() {
+                    record_command_policy_audit_with_stdio(
+                        audit_recorder.as_ref(),
+                        &request,
+                        &state.redaction_policy,
+                        session_id,
+                        auth.peer_pid,
+                        session_root_pid,
+                        Some(&caller),
+                        "denied",
+                        Some(reason.clone()),
+                        None,
+                        launch_result.stdio,
+                    )?;
+                    return Err(NonoError::BlockedCommand {
+                        command: request.command,
+                        reason,
+                    });
+                }
+                record_command_policy_audit_with_stdio(
+                    audit_recorder.as_ref(),
+                    &request,
+                    &state.redaction_policy,
+                    session_id,
+                    auth.peer_pid,
+                    session_root_pid,
+                    Some(&caller),
+                    "exec",
+                    None,
+                    Some(launch_result.exit_code),
+                    launch_result.stdio,
+                )?;
+                Ok((launch_result.exit_code, Vec::new()))
+            }
+            Err(err) => {
+                record_command_policy_audit(
+                    audit_recorder.as_ref(),
+                    &request,
+                    &state.redaction_policy,
+                    session_id,
+                    auth.peer_pid,
+                    session_root_pid,
+                    Some(&caller),
+                    "denied",
+                    Some(err.to_string()),
+                    None,
+                )?;
+                Err(err)
+            }
+        };
+    }
+
     let active = state.active_count.fetch_add(1, Ordering::SeqCst);
     if active >= MAX_ACTIVE_TOOL_SANDBOX_CHILDREN {
         state.active_count.fetch_sub(1, Ordering::SeqCst);
@@ -2448,6 +2537,29 @@ fn validate_controlled_binary_immutability(
     Ok(())
 }
 
+/// Apply the same non-writable-executable trust gate to resolved `exec`
+/// intercept helpers as to command binaries (see the macOS twin for rationale).
+fn validate_controlled_exec_helper_immutability(
+    config: &CommandPoliciesConfig,
+    exec_helpers: &BTreeMap<PathBuf, ResolvedCommandBinary>,
+    outer_caps: &CapabilitySet,
+) -> Result<()> {
+    for binary in exec_helpers.values() {
+        let allow_writable_path = config.allow_writable_executables
+            || super::policy::command_referencing_exec_helper_allows_writable(
+                config,
+                &binary.canonical_path,
+            );
+        validate_controlled_file(
+            &binary.canonical_path,
+            outer_caps,
+            "exec intercept helper",
+            allow_writable_path,
+        )?;
+    }
+    Ok(())
+}
+
 fn command_allows_writable_executable(
     command: &crate::command_policy::CommandPolicyConfig,
 ) -> bool {
@@ -3010,6 +3122,23 @@ fn build_child_launch_spec(
         .ok_or_else(|| {
             NonoError::SandboxInit(format!("missing resolved binary for {}", request.command))
         })?;
+    build_child_launch_spec_for_binary(state, request, policy, binary, &[])
+}
+
+/// Build a child launch spec that runs `binary` (the command's real binary OR
+/// an `exec` intercept helper) inside the matched command's sandbox (`policy`).
+/// `extra_args` are inserted between argv[0] and the forwarded original args —
+/// used by the `exec` action for the helper's fixed leading args. The fs-read
+/// cap, Landlock execute allowlist (binary + its ELF/interpreter closure),
+/// runtime baseline, and identity expectations are all bound to `binary`, while
+/// network/credentials/proxy/fs/env come from `policy`.
+fn build_child_launch_spec_for_binary(
+    state: &ToolSandboxState,
+    request: &ToolSandboxShimRequest,
+    policy: &CommandSandboxConfig,
+    binary: &ResolvedCommandBinary,
+    extra_args: &[Vec<u8>],
+) -> Result<ToolSandboxChildLaunchSpec> {
     let start_vbi = std::time::Instant::now();
     verify_binary_identity(binary)?;
     tool_sandbox_profile_log!(
@@ -3092,7 +3221,7 @@ fn build_child_launch_spec(
             .as_ref()
             .map(|path| path.as_os_str().as_bytes().to_vec()),
         interpreter_args: binary.shape.interpreter_args.clone(),
-        argv: effective_argv(binary, request, policy)?,
+        argv: effective_argv_for_binary(binary, request, policy, extra_args)?,
         env,
         cwd: cwd.as_os_str().as_bytes().to_vec(),
         stdio_mode: selected_stdio_mode(request).to_string(),
@@ -3428,7 +3557,14 @@ fn build_baseline_cache<'a>(
     let system_files = compute_system_baseline_files()?;
     let mut closures: BTreeMap<PathBuf, Vec<PathBuf>> = BTreeMap::new();
 
-    for binary in plan.resolved.commands.values() {
+    // Command binaries and exec intercept helpers are launched the same way, so
+    // cache the ELF dependency closure for both (plus their script interpreters).
+    let cacheable = plan
+        .resolved
+        .commands
+        .values()
+        .chain(plan.exec_helpers.values());
+    for binary in cacheable {
         if !closures.contains_key(&binary.canonical_path) {
             closures.insert(
                 binary.canonical_path.clone(),
@@ -5071,6 +5207,7 @@ mod tests {
                     commands: BTreeMap::new(),
                     warnings: Vec::new(),
                 },
+                exec_helpers: BTreeMap::new(),
                 executable_dirs: Vec::new(),
                 deny_only: BTreeMap::new(),
                 allowed_direct_bypasses: Vec::new(),

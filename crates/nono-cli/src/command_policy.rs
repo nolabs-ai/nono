@@ -400,6 +400,23 @@ pub enum InterceptActionConfig {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         timeout_secs: Option<u64>,
     },
+    /// Run a helper binary instead of the command's real binary, inside the
+    /// matched command's existing sandbox (same capabilities, env including
+    /// injected credentials/proxy routing, and cwd). The helper at `command[0]`
+    /// runs with `command[1..]` as fixed leading args, followed by the original
+    /// invocation's user args (`argv[1..]`). The helper's stdout/stderr are
+    /// streamed to the caller and its exit code is propagated.
+    ///
+    /// `command[0]` is `$VAR`-expanded then required to be an absolute path; it
+    /// is resolved exactly like a command binary (canonicalize/stat/sha256 with
+    /// identity expectations for TOCTOU protection) and is subject to the same
+    /// non-writable-executable trust gate as the `executable` field.
+    Exec {
+        /// Helper invocation: `command[0]` is the absolute helper path (after
+        /// `$VAR` expansion); `command[1..]` are fixed leading args prepended
+        /// before the forwarded original args.
+        command: Vec<String>,
+    },
 }
 
 /// A sub-command mediation rule on a [`CommandPolicyConfig`].
@@ -1088,6 +1105,65 @@ pub(crate) fn resolve_policy_command_binaries(
     Ok(ResolvedCommandBinaries { commands, warnings })
 }
 
+/// Pre-resolve every `exec` intercept helper referenced by any command policy.
+///
+/// We resolve helpers at plan-build time (rather than lazily at dispatch) so
+/// their identity expectations (dev/ino/size/mtime/sha256) are captured up
+/// front for TOCTOU protection, exactly like command binaries. Helpers are
+/// resolved the SAME way as command binaries — env-expand `command[0]`, then
+/// `candidate_command_match` (canonicalize, stat, sha256, classify shape).
+///
+/// The returned map is keyed by the env-expanded helper path as written in the
+/// profile, so dispatch can re-expand `command[0]` and look the helper up. A
+/// helper that fails to resolve (missing/non-executable) is surfaced as an
+/// error rather than skipped: unlike an absent command binary (which simply
+/// disables that command's policy), an exec helper that cannot run would leave
+/// the matched subcommand with no viable handler.
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
+pub(crate) fn resolve_policy_exec_helpers(
+    config: &CommandPoliciesConfig,
+) -> nono::Result<BTreeMap<PathBuf, ResolvedCommandBinary>> {
+    let mut helpers = BTreeMap::new();
+    for (command_name, command) in &config.commands {
+        for (rule_index, rule) in command.intercept.iter().enumerate() {
+            let InterceptActionConfig::Exec {
+                command: exec_command,
+            } = &rule.action
+            else {
+                continue;
+            };
+            let Some(helper_raw) = exec_command.first() else {
+                continue;
+            };
+            let expanded = crate::policy::expand_env_vars_strict(helper_raw)?;
+            let helper_path = PathBuf::from(&expanded);
+            if helpers.contains_key(&helper_path) {
+                continue;
+            }
+            let resolved = candidate_command_match(&helper_path)?.ok_or_else(|| {
+                nono::NonoError::ProfileParse(format!(
+                    "command '{command_name}' intercept rule {rule_index} exec helper '{expanded}' not found or not executable"
+                ))
+            })?;
+            helpers.insert(
+                helper_path,
+                ResolvedCommandBinary {
+                    name: format!("{command_name}.intercept[{rule_index}].exec"),
+                    canonical_path: resolved.canonical_path,
+                    dev: resolved.dev,
+                    ino: resolved.ino,
+                    size: resolved.size,
+                    mtime_nanos: resolved.mtime_nanos,
+                    sha256: resolved.sha256,
+                    duplicate_paths: Vec::new(),
+                    shape: resolved.shape,
+                },
+            );
+        }
+    }
+    Ok(helpers)
+}
+
 fn validate_command(
     command_name: &str,
     command: &CommandPolicyConfig,
@@ -1274,6 +1350,65 @@ fn validate_intercept_rules(
                 &format!("commands.{command_name}.intercept[{i}].action.timeout_secs"),
                 *timeout_secs,
                 report,
+            );
+        }
+        if let InterceptActionConfig::Exec { command } = &rule.action {
+            validate_exec_action(command_name, i, command, report);
+        }
+    }
+}
+
+/// Validate an `exec` intercept action's `command`.
+///
+/// Config-level checks only: non-empty, NUL-free, `command[0]` is
+/// `$VAR`-expandable and resolves to an ABSOLUTE path. The non-writable
+/// executable security gate runs at plan-build time against the outer
+/// capability set (see `validate_controlled_binary_immutability` in the
+/// platform runtimes), exactly as for command binaries — it cannot be enforced
+/// here because the outer caps are not in scope.
+fn validate_exec_action(
+    command_name: &str,
+    rule_index: usize,
+    command: &[String],
+    report: &mut CommandPolicyValidationReport,
+) {
+    let Some(helper) = command.first() else {
+        report.error(
+            "intercept_exec_empty_command",
+            format!(
+                "command '{command_name}' intercept rule {rule_index} exec action has an empty command"
+            ),
+        );
+        return;
+    };
+    for element in command {
+        if element.as_bytes().contains(&0) {
+            report.error(
+                "intercept_exec_nul_byte",
+                format!(
+                    "command '{command_name}' intercept rule {rule_index} exec command contains a NUL byte"
+                ),
+            );
+            return;
+        }
+    }
+    match crate::policy::expand_env_vars_strict(helper) {
+        Ok(expanded) => {
+            if !Path::new(&expanded).is_absolute() {
+                report.error(
+                    "intercept_exec_requires_absolute_helper",
+                    format!(
+                        "command '{command_name}' intercept rule {rule_index} exec helper must expand to an absolute path; got '{expanded}'"
+                    ),
+                );
+            }
+        }
+        Err(err) => {
+            report.error(
+                "intercept_exec_unexpandable_helper",
+                format!(
+                    "command '{command_name}' intercept rule {rule_index} exec helper '{helper}' could not be expanded: {err}"
+                ),
             );
         }
     }
@@ -3619,6 +3754,113 @@ mod tests {
         assert!(json.contains("capture_credential"));
         let back: InterceptActionConfig = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(action, back);
+    }
+
+    #[test]
+    fn exec_action_serde_roundtrip() {
+        let action = InterceptActionConfig::Exec {
+            command: vec!["/abs/helper".to_string(), "x".to_string()],
+        };
+        let json = serde_json::to_string(&action).expect("serialize");
+        assert!(json.contains("\"type\":\"exec\""), "{json}");
+        assert!(json.contains("/abs/helper"), "{json}");
+        let back: InterceptActionConfig = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(action, back);
+
+        // Verify the documented wire shape deserializes.
+        let from_wire: InterceptActionConfig =
+            serde_json::from_str(r#"{"type":"exec","command":["/abs/helper","x"]}"#)
+                .expect("deserialize wire form");
+        assert_eq!(action, from_wire);
+    }
+
+    fn git_config_with_exec(command: Vec<String>) -> CommandPoliciesConfig {
+        let mut config = active_git_config();
+        let git = config.commands.get_mut("git").expect("git command");
+        git.intercept.push(InterceptRuleConfig {
+            args: vec!["auth".to_string(), "switch".to_string()],
+            action: InterceptActionConfig::Exec { command },
+        });
+        config
+    }
+
+    #[test]
+    fn exec_action_accepts_absolute_helper() {
+        let config = git_config_with_exec(vec!["/usr/bin/true".to_string(), "auth".to_string()]);
+        let report =
+            validate_command_policies(Some(&config), CommandPolicyValidationScope::Resolved);
+        assert!(
+            !report
+                .errors
+                .iter()
+                .any(|finding| finding.code.starts_with("intercept_exec")),
+            "{:?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn exec_action_rejects_empty_command() {
+        let config = git_config_with_exec(vec![]);
+        let report =
+            validate_command_policies(Some(&config), CommandPolicyValidationScope::Resolved);
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|finding| finding.code == "intercept_exec_empty_command"),
+            "{:?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn exec_action_rejects_relative_helper() {
+        let config = git_config_with_exec(vec!["relative/helper".to_string()]);
+        let report =
+            validate_command_policies(Some(&config), CommandPolicyValidationScope::Resolved);
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|finding| finding.code == "intercept_exec_requires_absolute_helper"),
+            "{:?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn exec_action_rejects_nul_byte() {
+        let config = git_config_with_exec(vec!["/abs/helper".to_string(), "a\0b".to_string()]);
+        let report =
+            validate_command_policies(Some(&config), CommandPolicyValidationScope::Resolved);
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|finding| finding.code == "intercept_exec_nul_byte"),
+            "{:?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn exec_helper_resolution_captures_identity() {
+        // /usr/bin/true (or /bin/true) is a stable absolute executable on both
+        // macOS and Linux.
+        let helper = ["/usr/bin/true", "/bin/true"]
+            .into_iter()
+            .map(PathBuf::from)
+            .find(|p| p.exists());
+        let Some(helper) = helper else {
+            // No stable helper available; skip rather than fail spuriously.
+            return;
+        };
+        let config = git_config_with_exec(vec![helper.display().to_string()]);
+        let helpers = resolve_policy_exec_helpers(&config).expect("resolve helpers");
+        let resolved = helpers.get(&helper).expect("helper resolved");
+        assert!(!resolved.sha256.is_empty());
+        assert!(resolved.canonical_path.is_absolute());
     }
 
     #[test]

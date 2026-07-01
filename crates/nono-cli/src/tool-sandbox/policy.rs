@@ -57,6 +57,85 @@ pub(super) fn resolve_intercept_action<'a>(
     ResolvedInterceptAction::passthrough()
 }
 
+/// Resolve the env-expanded helper path and forwarded extra args for an `exec`
+/// intercept action's `command`.
+///
+/// Returns `(helper_path, extra_args)` where `helper_path` is `command[0]`
+/// after `$VAR` expansion (used as the lookup key into the plan's pre-resolved
+/// `exec_helpers` map) and `extra_args` are `command[1..]` after `$VAR`
+/// expansion, to be inserted ahead of the forwarded original args. Platform
+/// dispatch resolves the actual `ResolvedCommandBinary` from its own state map
+/// using `helper_path`, so this stays platform-agnostic.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(super) fn resolve_exec_command(
+    command: &[String],
+) -> nono::Result<(std::path::PathBuf, Vec<Vec<u8>>)> {
+    let helper_raw = command.first().ok_or_else(|| {
+        nono::NonoError::SandboxInit("tool-sandbox exec action has empty command".to_string())
+    })?;
+    let helper_path = std::path::PathBuf::from(crate::policy::expand_env_vars_strict(helper_raw)?);
+    let mut extra_args = Vec::with_capacity(command.len().saturating_sub(1));
+    for arg in command.iter().skip(1) {
+        extra_args.push(crate::policy::expand_env_vars_strict(arg)?.into_bytes());
+    }
+    Ok((helper_path, extra_args))
+}
+
+/// Looks up the pre-resolved binary rather than re-resolving it, to reuse the
+/// TOCTOU-protected identity captured at plan-build time.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(super) fn resolve_exec_helper<'a>(
+    exec_helpers: &'a std::collections::BTreeMap<
+        std::path::PathBuf,
+        crate::command_policy::ResolvedCommandBinary,
+    >,
+    command: &[String],
+) -> nono::Result<(
+    &'a crate::command_policy::ResolvedCommandBinary,
+    Vec<Vec<u8>>,
+)> {
+    let (helper_path, extra_args) = resolve_exec_command(command)?;
+    let helper = exec_helpers.get(&helper_path).ok_or_else(|| {
+        nono::NonoError::SandboxInit(format!(
+            "tool-sandbox exec helper not pre-resolved: {}",
+            helper_path.display()
+        ))
+    })?;
+    Ok((helper, extra_args))
+}
+
+/// True if any command whose `exec` intercept resolves to `canonical_helper`
+/// opts into `allow_writable_executable`.
+///
+/// Expansion/canonicalize failures resolve to "not exempted" rather than
+/// erroring, so an unrelated command's bad env var can't abort plan build.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(super) fn command_referencing_exec_helper_allows_writable(
+    config: &crate::command_policy::CommandPoliciesConfig,
+    canonical_helper: &std::path::Path,
+) -> bool {
+    config.commands.values().any(|command| {
+        if !command.allow_writable_executable {
+            return false;
+        }
+        command.intercept.iter().any(|rule| {
+            let crate::command_policy::InterceptActionConfig::Exec {
+                command: exec_command,
+            } = &rule.action
+            else {
+                return false;
+            };
+            let Some(helper_raw) = exec_command.first() else {
+                return false;
+            };
+            crate::policy::expand_env_vars_strict(helper_raw)
+                .ok()
+                .and_then(|expanded| std::path::PathBuf::from(expanded).canonicalize().ok())
+                .is_some_and(|canonical| canonical == canonical_helper)
+        })
+    })
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum InvocationPolicyOutcome {
@@ -638,5 +717,35 @@ mod intercept_tests {
             Some(message)
                 if message.contains("sandbox.resources is parsed by tool-sandbox Schema 2 but not yet enforced")
         ));
+    }
+
+    #[test]
+    fn resolve_exec_command_expands_helper_and_extra_args() {
+        let _lock = match crate::test_env::ENV_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let var = "NONO_TEST_EXEC_LIBEXEC";
+        let _env = crate::test_env::EnvVarGuard::set_all(&[(var, "/opt/vendor/libexec")]);
+        let command = vec![
+            format!("${var}/gh-wrapper"),
+            format!("${var}/data"),
+            "literal".to_string(),
+        ];
+        let (helper, extra) = resolve_exec_command(&command).expect("resolve");
+        assert_eq!(
+            helper,
+            std::path::PathBuf::from("/opt/vendor/libexec/gh-wrapper")
+        );
+        let rendered: Vec<String> = extra
+            .iter()
+            .map(|a| String::from_utf8_lossy(a).into_owned())
+            .collect();
+        assert_eq!(rendered, vec!["/opt/vendor/libexec/data", "literal"]);
+    }
+
+    #[test]
+    fn resolve_exec_command_rejects_empty_command() {
+        assert!(resolve_exec_command(&[]).is_err());
     }
 }

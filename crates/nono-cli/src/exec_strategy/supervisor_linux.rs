@@ -78,6 +78,13 @@ impl RateLimiter {
     }
 }
 
+pub(super) struct SeccompNotificationState<'a> {
+    pub(super) rate_limiter: &'a mut RateLimiter,
+    pub(super) denials: &'a mut Vec<DenialRecord>,
+    pub(super) trust_interceptor: Option<&'a mut TrustInterceptor>,
+    pub(super) pty: Option<&'a mut crate::pty_proxy::PtyProxy>,
+}
+
 /// Read the TGID (thread group ID / process ID) of a thread from /proc/<tid>/status.
 ///
 /// `seccomp_data.pid` is the TID of the requesting thread, not the TGID. `/proc/self`
@@ -179,15 +186,19 @@ pub(super) fn handle_seccomp_notification(
     child: Pid,
     config: &SupervisorConfig<'_>,
     initial_caps: &[InitialCapability],
-    rate_limiter: &mut RateLimiter,
-    denials: &mut Vec<DenialRecord>,
-    mut trust_interceptor: Option<&mut TrustInterceptor>,
+    state: SeccompNotificationState<'_>,
 ) -> Result<()> {
     use nono::sandbox::{
         SYS_OPENAT, SYS_OPENAT2, classify_access_from_flags, continue_notif, deny_notif, inject_fd,
         notif_id_valid, read_notif_path, read_open_how, recv_notif, resolve_notif_path,
         respond_notif_errno, validate_openat2_size,
     };
+    let SeccompNotificationState {
+        rate_limiter,
+        denials,
+        mut trust_interceptor,
+        mut pty,
+    } = state;
 
     // 1. Receive the notification
     let notif = recv_notif(notify_fd)?;
@@ -556,7 +567,15 @@ pub(super) fn handle_seccomp_notification(
         session_id: config.session_id.to_string(),
     };
 
-    let decision = match config.approval_backend.request_approval(&request) {
+    let paused_for_prompt = pty
+        .as_mut()
+        .is_some_and(|proxy| proxy.pause_terminal_for_prompt());
+    let approval_result = config.approval_backend.request_approval(&request);
+    if paused_for_prompt && let Some(proxy) = pty.as_mut() {
+        proxy.resume_terminal_after_prompt();
+    }
+
+    let decision = match approval_result {
         Ok(d) => {
             if d.is_denied() {
                 record_denial(

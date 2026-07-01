@@ -416,6 +416,12 @@ pub struct InterceptRuleConfig {
     /// Action to take when this rule matches.
     #[serde(default)]
     pub action: InterceptActionConfig,
+    /// Optional sandbox that replaces the command's selected sandbox for the
+    /// process this matched rule launches — any launching action (not
+    /// `respond`, which launches nothing). Credentials resolve lazily, so
+    /// omitting `credentials`/`use_credentials` injects none here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<CommandSandboxConfig>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -1213,13 +1219,14 @@ fn validate_command(
         }
     }
 
-    validate_intercept_rules(command_name, &command.intercept, config, report);
+    validate_intercept_rules(command_name, &command.intercept, config, scope, report);
 }
 
 fn validate_intercept_rules(
     command_name: &str,
     rules: &[InterceptRuleConfig],
     config: &CommandPoliciesConfig,
+    scope: CommandPolicyValidationScope,
     report: &mut CommandPolicyValidationReport,
 ) {
     let mut saw_catch_all = false;
@@ -1275,6 +1282,23 @@ fn validate_intercept_rules(
                 *timeout_secs,
                 report,
             );
+        }
+        if let Some(sandbox) = &rule.sandbox {
+            // A sandbox override applies to the process the action launches. `respond`
+            // returns static output without launching anything, so an override there
+            // would be silently ignored — reject it.
+            if matches!(rule.action, InterceptActionConfig::Respond { .. }) {
+                report.error(
+                    "intercept_sandbox_on_respond",
+                    format!(
+                        "command '{command_name}' intercept rule {i} sets a sandbox override but its action is `respond`, which launches no process"
+                    ),
+                );
+            }
+            // Validate the override like a from-edge sandbox. There is no
+            // caller, so label it by rule index for error context.
+            let caller = format!("intercept[{i}].sandbox");
+            validate_sandbox(command_name, &caller, sandbox, config, scope, report);
         }
     }
 }
@@ -3641,6 +3665,7 @@ mod tests {
                 credential: "github".to_string(),
                 grant_to: vec![],
             },
+            sandbox: None,
         });
 
         let report =
@@ -3669,6 +3694,7 @@ mod tests {
                 credential: "agent".to_string(),
                 grant_to: vec![],
             },
+            sandbox: None,
         });
 
         let report =
@@ -3685,10 +3711,12 @@ mod tests {
         let parent_rule = InterceptRuleConfig {
             args: vec!["push".to_string()],
             action: InterceptActionConfig::Approve { timeout_secs: None },
+            sandbox: None,
         };
         let child_rule = InterceptRuleConfig {
             args: vec!["fetch".to_string()],
             action: InterceptActionConfig::Passthrough,
+            sandbox: None,
         };
         let parent = CommandPolicyConfig {
             intercept: vec![parent_rule.clone()],
@@ -3707,6 +3735,7 @@ mod tests {
         let rule = InterceptRuleConfig {
             args: vec!["push".to_string()],
             action: InterceptActionConfig::Passthrough,
+            sandbox: None,
         };
         let parent = CommandPolicyConfig {
             intercept: vec![rule.clone()],
@@ -3728,10 +3757,12 @@ mod tests {
                 InterceptRuleConfig {
                     args: vec![],
                     action: InterceptActionConfig::Passthrough,
+                    sandbox: None,
                 },
                 InterceptRuleConfig {
                     args: vec!["push".to_string()],
                     action: InterceptActionConfig::Approve { timeout_secs: None },
+                    sandbox: None,
                 },
             ];
         }
@@ -3754,10 +3785,12 @@ mod tests {
                 InterceptRuleConfig {
                     args: vec!["push".to_string()],
                     action: InterceptActionConfig::Approve { timeout_secs: None },
+                    sandbox: None,
                 },
                 InterceptRuleConfig {
                     args: vec![],
                     action: InterceptActionConfig::Passthrough,
+                    sandbox: None,
                 },
             ];
         }
@@ -3781,6 +3814,7 @@ mod tests {
                 action: InterceptActionConfig::Respond {
                     stdout: "x".repeat(1024 * 1024 + 1),
                 },
+                sandbox: None,
             }];
         }
         let report =
@@ -3804,6 +3838,162 @@ mod tests {
             err.to_string().contains("unknown field"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn intercept_rule_roundtrips_with_sandbox_override() {
+        let json = r#"{
+            "args": ["auth", "switch"],
+            "action": {"type": "passthrough"},
+            "sandbox": {"fs_read": ["/etc/foo"], "use_credentials": ["github"]}
+        }"#;
+        let rule: InterceptRuleConfig =
+            serde_json::from_str(json).expect("deserialize rule with sandbox override");
+        let sandbox = rule.sandbox.as_ref().expect("sandbox override present");
+        assert_eq!(sandbox.fs_read, vec!["/etc/foo".to_string()]);
+        assert_eq!(sandbox.use_credentials, vec!["github".to_string()]);
+
+        // Round-trips: serialize then deserialize yields the same rule.
+        let serialized = serde_json::to_string(&rule).expect("serialize rule");
+        let reparsed: InterceptRuleConfig =
+            serde_json::from_str(&serialized).expect("re-deserialize rule");
+        assert_eq!(rule, reparsed);
+    }
+
+    #[test]
+    fn intercept_rule_omits_absent_sandbox_override() {
+        let rule = InterceptRuleConfig {
+            args: vec!["status".to_string()],
+            action: InterceptActionConfig::Passthrough,
+            sandbox: None,
+        };
+        let serialized = serde_json::to_string(&rule).expect("serialize rule");
+        assert!(
+            !serialized.contains("sandbox"),
+            "absent sandbox override should be skipped in serialization: {serialized}"
+        );
+    }
+
+    #[test]
+    fn intercept_sandbox_override_well_formed_passes() {
+        let mut config = active_git_config();
+        config.credentials.insert(
+            "github".to_string(),
+            CommandCredentialConfig {
+                credential_type: CommandCredentialType::Ambient,
+                ..Default::default()
+            },
+        );
+        let git = config.commands.get_mut("git").expect("git command");
+        git.intercept.push(InterceptRuleConfig {
+            args: vec!["status".to_string()],
+            action: InterceptActionConfig::Passthrough,
+            sandbox: Some(CommandSandboxConfig {
+                fs_read: vec![".".to_string()],
+                use_credentials: vec!["github".to_string()],
+                ..Default::default()
+            }),
+        });
+
+        let report =
+            validate_command_policies(Some(&config), CommandPolicyValidationScope::Resolved);
+
+        assert!(report.is_ok(), "{:?}", report.errors);
+    }
+
+    #[test]
+    fn intercept_sandbox_override_unknown_credential_rejected() {
+        let mut config = active_git_config();
+        let git = config.commands.get_mut("git").expect("git command");
+        git.intercept.push(InterceptRuleConfig {
+            args: vec!["status".to_string()],
+            action: InterceptActionConfig::Passthrough,
+            sandbox: Some(CommandSandboxConfig {
+                use_credentials: vec!["does-not-exist".to_string()],
+                ..Default::default()
+            }),
+        });
+
+        let report =
+            validate_command_policies(Some(&config), CommandPolicyValidationScope::Resolved);
+
+        assert!(
+            report.errors.iter().any(|finding| {
+                finding.code == "unknown_credential"
+                    && finding.message.contains("intercept[")
+                    && finding.message.contains("does-not-exist")
+            }),
+            "expected unknown_credential error for the override sandbox: {:?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn intercept_sandbox_override_on_respond_rejected() {
+        let mut config = active_git_config();
+        let git = config.commands.get_mut("git").expect("git command");
+        git.intercept.push(InterceptRuleConfig {
+            args: vec!["status".to_string()],
+            action: InterceptActionConfig::Respond {
+                stdout: String::new(),
+            },
+            sandbox: Some(CommandSandboxConfig {
+                fs_read: vec![".".to_string()],
+                ..Default::default()
+            }),
+        });
+
+        let report =
+            validate_command_policies(Some(&config), CommandPolicyValidationScope::Resolved);
+
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|finding| finding.code == "intercept_sandbox_on_respond"),
+            "expected sandbox override on a `respond` action to be rejected: {:?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn intercept_sandbox_override_on_launching_action_passes() {
+        let mut config = active_git_config();
+        config.credentials.insert(
+            "github".to_string(),
+            CommandCredentialConfig {
+                credential_type: CommandCredentialType::Ambient,
+                ..Default::default()
+            },
+        );
+        let git = config.commands.get_mut("git").expect("git command");
+        // capture_credential launches the real binary, so a sandbox override is
+        // meaningful and must be accepted.
+        git.intercept.push(InterceptRuleConfig {
+            args: vec!["status".to_string()],
+            action: InterceptActionConfig::CaptureCredential {
+                credential: "github".to_string(),
+                grant_to: Vec::new(),
+            },
+            sandbox: Some(CommandSandboxConfig {
+                fs_read: vec![".".to_string()],
+                use_credentials: vec!["github".to_string()],
+                ..Default::default()
+            }),
+        });
+
+        let report =
+            validate_command_policies(Some(&config), CommandPolicyValidationScope::Resolved);
+
+        assert!(
+            !report
+                .errors
+                .iter()
+                .any(|finding| finding.code == "intercept_sandbox_on_respond"),
+            "expected sandbox override on a launching action to be accepted: {:?}",
+            report.errors
+        );
+        assert!(report.is_ok(), "{:?}", report.errors);
     }
 
     #[test]
@@ -3831,6 +4021,7 @@ mod tests {
                 action: InterceptActionConfig::Approve {
                     timeout_secs: Some(0),
                 },
+                sandbox: None,
             }];
             git.from.insert(
                 "session".to_string(),

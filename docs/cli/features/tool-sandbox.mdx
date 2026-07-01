@@ -92,6 +92,22 @@ The selected `sandbox` object describes what the child receives:
 | `allow_launch_services` | boolean | macOS-only direct LaunchServices URL opening. |
 | `allow_raw_file_credentials_in_chained_policy` | boolean | Required before non-session callers can receive raw-file credentials. |
 
+### Per-Intercept Sandbox Override
+
+An `intercept` rule may carry an optional `sandbox` (the same object described above). When the rule matches, the process the rule launches runs under the rule's `sandbox` instead of the command's selected sandbox — for that matched invocation only. This applies to every action that launches a process (`passthrough`, `capture`, `capture_credential`, and an approved `approve`); it does not apply to `respond`, which returns static output and launches nothing (a `sandbox` there is rejected at validation). Credentials resolve lazily, so an override that omits `credentials`/`use_credentials` injects no credential env vars for that invocation. The override can only narrow or retarget capabilities; it cannot grant beyond what the rule declares.
+
+```jsonc
+{
+  "args": ["auth", "switch"],
+  "action": { "type": "passthrough" },
+  "sandbox": {
+    "fs_read": ["~/.config/gh"],
+    "fs_write": ["~/.config/gh"],
+    "network": { "allow_domain": ["github.com"] }
+  }
+}
+```
+
 ### Dynamic Filesystem Grants
 
 `fs_read`, `fs_write`, `fs_read_file`, and `fs_write_file` can contain dynamic provider tokens as well as literal paths. Tokens are expanded at launch before the child sandbox is built. They are opt-in: no dynamic paths are added unless a selected command policy includes one of these tokens.

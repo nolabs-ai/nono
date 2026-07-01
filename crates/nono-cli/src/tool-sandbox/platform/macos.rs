@@ -1176,6 +1176,11 @@ fn handle_shim_stream_inner(
     let intercept = super::resolve_intercept_action(command_config, &request.argv);
     let intercept_action = intercept.action;
 
+    // A matched intercept rule may carry a sandbox that replaces the command's
+    // selected sandbox for the process this rule launches (every action except
+    // `respond`, which launches nothing). Absent -> the command's selected sandbox.
+    let effective_sandbox = intercept.sandbox.unwrap_or(policy);
+
     // ── Respond ──────────────────────────────────────────────────────────
     if let InterceptActionConfig::Respond { stdout } = intercept_action {
         record_command_policy_audit(
@@ -1303,7 +1308,7 @@ fn handle_shim_stream_inner(
             ));
         }
         let result = (|| {
-            let launch = build_child_launch_spec(state, &request, policy)?;
+            let launch = build_child_launch_spec(state, &request, effective_sandbox)?;
             launch_child_with_capture(state, &request.command, &caller, launch, stdio)
         })();
         state.active_count.fetch_sub(1, Ordering::SeqCst);
@@ -1389,7 +1394,7 @@ fn handle_shim_stream_inner(
             ));
         }
         let result = (|| {
-            let launch = build_child_launch_spec(state, &request, policy)?;
+            let launch = build_child_launch_spec(state, &request, effective_sandbox)?;
             launch_child_with_capture(state, &request.command, &caller, launch, stdio)
         })();
         state.active_count.fetch_sub(1, Ordering::SeqCst);
@@ -1461,7 +1466,7 @@ fn handle_shim_stream_inner(
         ));
     }
     let result = (|| {
-        let launch = build_child_launch_spec(state, &request, policy)?;
+        let launch = build_child_launch_spec(state, &request, effective_sandbox)?;
         launch_child(state, &request.command, &caller, launch, stdio)
     })();
     state.active_count.fetch_sub(1, Ordering::SeqCst);
@@ -5086,5 +5091,34 @@ mod tests {
         );
         let dangerous_policy = policy_with_env(None, dangerous);
         assert!(apply_environment_set_vars(&mut vec![], &dangerous_policy).is_err());
+    }
+
+    #[test]
+    fn passthrough_uses_intercept_sandbox_override_when_present() {
+        // Mirrors the dispatch selection shared by every launching action:
+        //   let effective_sandbox = intercept.sandbox.unwrap_or(policy);
+        // A matched rule carrying its own sandbox replaces the command sandbox;
+        // a non-matching invocation (no override) falls back to the command
+        // sandbox.
+        let command_sandbox = CommandSandboxConfig {
+            fs_read: vec!["/command/path".to_string()],
+            ..CommandSandboxConfig::default()
+        };
+        let override_sandbox = CommandSandboxConfig {
+            fs_read: vec!["/override/path".to_string()],
+            ..CommandSandboxConfig::default()
+        };
+
+        let with_override = crate::tool_sandbox::ResolvedInterceptAction {
+            action: &crate::command_policy::InterceptActionConfig::Passthrough,
+            rule_args: Some(&[]),
+            sandbox: Some(&override_sandbox),
+        };
+        let effective = with_override.sandbox.unwrap_or(&command_sandbox);
+        assert_eq!(effective.fs_read, vec!["/override/path".to_string()]);
+
+        let without_override = crate::tool_sandbox::ResolvedInterceptAction::passthrough();
+        let effective = without_override.sandbox.unwrap_or(&command_sandbox);
+        assert_eq!(effective.fs_read, vec!["/command/path".to_string()]);
     }
 }

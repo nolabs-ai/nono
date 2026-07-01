@@ -212,7 +212,7 @@
           "type": "string",
           "enum": ["null", "request_json"],
           "default": "null",
-          "description": "Controls stdin for the capture command. null closes stdin unless interaction.stdio is true. request_json writes request metadata JSON to stdin."
+          "description": "Controls stdin for the capture command. null closes stdin unless interaction.stdin is true. request_json writes request metadata JSON to stdin."
         },
         "output": {
           "oneOf": [
@@ -262,7 +262,12 @@
         "stdio": {
           "type": "boolean",
           "default": false,
-          "description": "Allow the capture command to use inherited stderr and, when stdin is null, inherited stdin."
+          "description": "Allow the capture command to write prompts to the terminal via inherited stderr."
+        },
+        "stdin": {
+          "type": "boolean",
+          "default": false,
+          "description": "Allow the capture command to read from the terminal via inherited stdin. Only set this when the helper genuinely needs to prompt the user for input. Requires stdio:true."
         },
         "open_urls": {
           "oneOf": [

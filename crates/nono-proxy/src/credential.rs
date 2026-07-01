@@ -206,7 +206,7 @@ impl CredentialStore {
     /// Returns an error only for hard failures (config parse errors,
     /// non-UTF-8 values). Missing credentials are logged, recorded in
     /// `diagnostics`, and the route is skipped.
-    pub fn load_with_diagnostics(
+    pub async fn load_with_diagnostics(
         routes: &[RouteConfig],
         tls_connector: &TlsConnector,
     ) -> Result<CredentialLoadOutcome> {
@@ -389,7 +389,7 @@ impl CredentialStore {
                     scope: oauth2.scope.clone(),
                 };
 
-                match TokenCache::new(config, tls_connector.clone()) {
+                match TokenCache::new(config, tls_connector.clone()).await {
                     Ok(cache) => {
                         oauth2_routes.insert(
                             route.prefix.clone(),
@@ -440,8 +440,13 @@ impl CredentialStore {
         since = "0.64.0",
         note = "Use `load_with_diagnostics` instead. Will be removed in 1.0.0."
     )]
-    pub fn load(routes: &[RouteConfig], tls_connector: &TlsConnector) -> Result<CredentialStore> {
-        Self::load_with_diagnostics(routes, tls_connector).map(|outcome| outcome.store)
+    pub async fn load(
+        routes: &[RouteConfig],
+        tls_connector: &TlsConnector,
+    ) -> Result<CredentialStore> {
+        Self::load_with_diagnostics(routes, tls_connector)
+            .await
+            .map(|outcome| outcome.store)
     }
 
     /// Create an empty credential store (no credential injection).
@@ -869,8 +874,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_load_missing_env_credential_records_credential_not_found() {
+    #[tokio::test]
+    async fn test_load_missing_env_credential_records_credential_not_found() {
         let tls = test_tls_connector();
         let routes = vec![RouteConfig {
             prefix: "preview-missing".to_string(),
@@ -892,7 +897,9 @@ mod tests {
             oauth2: None,
             aws_auth: None,
         }];
-        let outcome = CredentialStore::load_with_diagnostics(&routes, &tls).expect("load");
+        let outcome = CredentialStore::load_with_diagnostics(&routes, &tls)
+            .await
+            .expect("load");
         assert!(outcome.store.is_empty());
         assert_eq!(outcome.diagnostics.len(), 1);
         assert_eq!(
@@ -942,8 +949,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_load_oauth2_missing_client_id_records_diagnostic() {
+    #[tokio::test]
+    async fn test_load_oauth2_missing_client_id_records_diagnostic() {
         let tls = test_tls_connector();
         let routes = vec![oauth2_route_with_refs(
             "my-api",
@@ -951,7 +958,9 @@ mod tests {
             "env://NONO_PROXY_TEST_CLIENT_SECRET",
             "https://127.0.0.1:1/oauth/token",
         )];
-        let outcome = CredentialStore::load_with_diagnostics(&routes, &tls).expect("load");
+        let outcome = CredentialStore::load_with_diagnostics(&routes, &tls)
+            .await
+            .expect("load");
         assert!(outcome.store.is_empty());
         assert_eq!(outcome.diagnostics.len(), 1);
         assert_eq!(
@@ -960,10 +969,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_load_oauth2_missing_client_secret_records_diagnostic() {
-        let _lock = ENV_LOCK.lock().expect("env mutex poisoned");
-        let _env = EnvVarGuard::set_all(&[("NONO_PROXY_TEST_CLIENT_ID", "test-client")]);
+    #[tokio::test]
+    async fn test_load_oauth2_missing_client_secret_records_diagnostic() {
+        let _env = {
+            let _lock = ENV_LOCK.lock().expect("env mutex poisoned");
+            EnvVarGuard::set_all(&[("NONO_PROXY_TEST_CLIENT_ID", "test-client")])
+        };
         let tls = test_tls_connector();
         let routes = vec![oauth2_route_with_refs(
             "my-api",
@@ -971,7 +982,9 @@ mod tests {
             "env://NONO_PROXY_TEST_MISSING_CLIENT_SECRET",
             "https://127.0.0.1:1/oauth/token",
         )];
-        let outcome = CredentialStore::load_with_diagnostics(&routes, &tls).expect("load");
+        let outcome = CredentialStore::load_with_diagnostics(&routes, &tls)
+            .await
+            .expect("load");
         assert!(outcome.store.is_empty());
         assert_eq!(outcome.diagnostics.len(), 1);
         assert_eq!(
@@ -980,8 +993,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_load_no_credential_routes() {
+    #[tokio::test]
+    async fn test_load_no_credential_routes() {
         let tls = test_tls_connector();
         let routes = vec![RouteConfig {
             prefix: "/test".to_string(),
@@ -1003,7 +1016,7 @@ mod tests {
             oauth2: None,
             aws_auth: None,
         }];
-        let outcome = CredentialStore::load_with_diagnostics(&routes, &tls);
+        let outcome = CredentialStore::load_with_diagnostics(&routes, &tls).await;
         assert!(outcome.is_ok());
         let store = outcome
             .unwrap_or_else(|_| CredentialLoadOutcome {
@@ -1021,8 +1034,8 @@ mod tests {
         assert!(store.get_oauth2("my-api").is_none());
     }
 
-    #[test]
-    fn test_load_cmd_uri_registers_lazy_route() {
+    #[tokio::test]
+    async fn test_load_cmd_uri_registers_lazy_route() {
         let tls = test_tls_connector();
         let routes = vec![RouteConfig {
             prefix: "/github".to_string(),
@@ -1045,6 +1058,7 @@ mod tests {
             aws_auth: None,
         }];
         let store = CredentialStore::load_with_diagnostics(&routes, &tls)
+            .await
             .expect("credential store loads")
             .store;
         assert!(store.get("github").is_none());
@@ -1115,10 +1129,12 @@ mod tests {
         assert!(prefixes.contains("my-api"));
     }
 
-    #[test]
-    fn test_load_non_authorization_header_explicit_bearer_format() {
-        let _lock = ENV_LOCK.lock().expect("env mutex poisoned");
-        let _guard = EnvVarGuard::set_all(&[("NONO_PROXY_TEST_LITELLM_TOKEN", "sk-litellm-test")]);
+    #[tokio::test]
+    async fn test_load_non_authorization_header_explicit_bearer_format() {
+        let _guard = {
+            let _lock = ENV_LOCK.lock().expect("env mutex poisoned");
+            EnvVarGuard::set_all(&[("NONO_PROXY_TEST_LITELLM_TOKEN", "sk-litellm-test")])
+        };
         let tls = test_tls_connector();
         let routes = vec![RouteConfig {
             prefix: "litellm".to_string(),
@@ -1141,6 +1157,7 @@ mod tests {
             aws_auth: None,
         }];
         let store = CredentialStore::load_with_diagnostics(&routes, &tls)
+            .await
             .expect("credential load")
             .store;
         let cred = store.get("litellm").expect("route should be loaded");
@@ -1148,10 +1165,12 @@ mod tests {
         assert_eq!(cred.header_value.as_str(), "Bearer sk-litellm-test");
     }
 
-    #[test]
-    fn test_load_non_authorization_header_omitted_format_injects_bare_secret() {
-        let _lock = ENV_LOCK.lock().expect("env mutex poisoned");
-        let _guard = EnvVarGuard::set_all(&[("NONO_PROXY_TEST_API_KEY", "secret-key")]);
+    #[tokio::test]
+    async fn test_load_non_authorization_header_omitted_format_injects_bare_secret() {
+        let _guard = {
+            let _lock = ENV_LOCK.lock().expect("env mutex poisoned");
+            EnvVarGuard::set_all(&[("NONO_PROXY_TEST_API_KEY", "secret-key")])
+        };
         let tls = test_tls_connector();
         let routes = vec![RouteConfig {
             prefix: "api".to_string(),
@@ -1174,21 +1193,24 @@ mod tests {
             aws_auth: None,
         }];
         let store = CredentialStore::load_with_diagnostics(&routes, &tls)
+            .await
             .expect("credential load")
             .store;
         let cred = store.get("api").expect("route should be loaded");
         assert_eq!(cred.header_value.as_str(), "secret-key");
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test]
     async fn test_load_oauth2_unreachable_endpoint_skips_route() {
         use crate::config::OAuth2Config;
 
-        let _lock = ENV_LOCK.lock().unwrap();
-        let _env = EnvVarGuard::set_all(&[
-            ("TEST_OAUTH2_CLIENT_ID", "test-client"),
-            ("TEST_OAUTH2_CLIENT_SECRET", "test-secret"),
-        ]);
+        let _env = {
+            let _lock = ENV_LOCK.lock().unwrap();
+            EnvVarGuard::set_all(&[
+                ("TEST_OAUTH2_CLIENT_ID", "test-client"),
+                ("TEST_OAUTH2_CLIENT_SECRET", "test-secret"),
+            ])
+        };
         let tls = test_tls_connector();
         let routes = vec![RouteConfig {
             prefix: "my-api".to_string(),
@@ -1218,7 +1240,7 @@ mod tests {
             aws_auth: None,
         }];
 
-        let outcome = CredentialStore::load_with_diagnostics(&routes, &tls);
+        let outcome = CredentialStore::load_with_diagnostics(&routes, &tls).await;
 
         // load() should succeed (route skipped, not hard error)
         assert!(

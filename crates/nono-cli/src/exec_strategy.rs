@@ -211,13 +211,16 @@ pub struct SeccompPolicy {
     /// Intercept pathname AF_UNIX socket operations via seccomp-notify.
     /// Corresponds to the profile's `linux.af_unix_mediation = "pathname"`.
     pub af_unix_mediation: bool,
+    /// Intercept openat/openat2 so the supervisor can inject a writable fd for
+    /// NVIDIA driver thread-name writes to `/proc/<tgid>/task/<tid>/comm`.
+    pub proc_comm_notify: bool,
 }
 
 #[cfg(target_os = "linux")]
 impl SeccompPolicy {
     /// Whether to install and receive an openat seccomp-notify fd.
     pub fn needs_openat_notify(self) -> bool {
-        self.capability_elevation
+        self.capability_elevation || self.proc_comm_notify
     }
 
     /// Whether to install and receive a connect/bind seccomp-notify fd.
@@ -273,6 +276,9 @@ pub struct ExecConfig<'a> {
     /// installed in the child and how the supervisor handles their events.
     #[cfg(target_os = "linux")]
     pub seccomp_policy: SeccompPolicy,
+    /// Linux network enforcement backend for this session.
+    #[cfg(target_os = "linux")]
+    pub sandbox_policy: crate::profile::LinuxSandboxPolicy,
     /// Allow-list of environment variable names. When set, only variables
     /// matching an exact name or prefix pattern (e.g. `"AWS_*"`) are
     /// passed to the child. Nono-injected credentials always bypass this.
@@ -939,7 +945,24 @@ pub fn execute_supervised(
                     }
                 }
 
-                match Sandbox::apply_auto(effective_caps) {
+                let sandbox_result = match config.sandbox_policy {
+                    crate::profile::LinuxSandboxPolicy::Auto => Sandbox::apply_auto(effective_caps),
+                    crate::profile::LinuxSandboxPolicy::Landlock => {
+                        Sandbox::apply_landlock(effective_caps)
+                            .map(|_| nono::sandbox::SeccompNetFallback::None)
+                    }
+                    crate::profile::LinuxSandboxPolicy::External => {
+                        match Sandbox::apply_seccomp(
+                            effective_caps,
+                            nono::SeccompOpts::external_tcp(),
+                        ) {
+                            Ok(fallback) => Sandbox::apply_external().map(|_| fallback),
+                            Err(e) => Err(e),
+                        }
+                    }
+                };
+
+                match sandbox_result {
                     Ok(_fallback) => {}
                     Err(e) => {
                         let detail =
@@ -988,13 +1011,14 @@ pub fn execute_supervised(
             #[cfg(target_os = "linux")]
             {
                 if config.seccomp_policy.needs_openat_notify() && nono::sandbox::is_wsl2() {
-                    let msg = b"nono: WSL2 detected, skipping seccomp-notify (capability elevation unavailable)\n";
+                    let msg = b"nono: WSL2 detected, seccomp-notify required but unavailable\n";
                     unsafe {
                         libc::write(
                             libc::STDERR_FILENO,
                             msg.as_ptr().cast::<libc::c_void>(),
                             msg.len(),
                         );
+                        libc::_exit(126);
                     }
                 } else if config.seccomp_policy.needs_openat_notify()
                     && let Some(fd) = child_sock_fd
@@ -1021,11 +1045,8 @@ pub fn execute_supervised(
                             }
                         }
                         Err(e) => {
-                            // seccomp not available -- proceed without transparent expansion
-                            let detail = format!(
-                                "nono: seccomp-notify not available, expansion disabled: {}\n",
-                                e
-                            );
+                            let detail =
+                                format!("nono: seccomp-notify required but unavailable: {}\n", e);
                             let msg = detail.as_bytes();
                             unsafe {
                                 libc::write(
@@ -1033,8 +1054,20 @@ pub fn execute_supervised(
                                     msg.as_ptr().cast::<libc::c_void>(),
                                     msg.len(),
                                 );
+                                libc::_exit(126);
                             }
                         }
+                    }
+                } else if config.seccomp_policy.needs_openat_notify() {
+                    let msg =
+                        b"nono: seccomp-notify required but supervisor socket is unavailable\n";
+                    unsafe {
+                        libc::write(
+                            libc::STDERR_FILENO,
+                            msg.as_ptr().cast::<libc::c_void>(),
+                            msg.len(),
+                        );
+                        libc::_exit(126);
                     }
                 }
 
@@ -1054,13 +1087,15 @@ pub fn execute_supervised(
                 let install_network_notify = config.seccomp_policy.needs_network_notify();
                 let mut proxy_notify_fd_keep: Option<std::os::fd::OwnedFd> = None;
                 if install_network_notify && nono::sandbox::is_wsl2() {
-                    let msg = b"nono: WSL2 detected, skipping seccomp proxy filter (proxy network filtering unavailable)\n";
+                    let msg =
+                        b"nono: WSL2 detected, seccomp network notify required but unavailable\n";
                     unsafe {
                         libc::write(
                             libc::STDERR_FILENO,
                             msg.as_ptr().cast::<libc::c_void>(),
                             msg.len(),
                         );
+                        libc::_exit(126);
                     }
                 } else if install_network_notify && let Some(fd) = child_sock_fd {
                     let notify_result = if config.seccomp_policy.proxy_fallback {
@@ -1148,6 +1183,17 @@ pub fn execute_supervised(
                                 libc::_exit(126);
                             }
                         }
+                    }
+                } else if install_network_notify {
+                    let msg =
+                        b"nono: seccomp network notify required but supervisor socket is unavailable\n";
+                    unsafe {
+                        libc::write(
+                            libc::STDERR_FILENO,
+                            msg.as_ptr().cast::<libc::c_void>(),
+                            msg.len(),
+                        );
+                        libc::_exit(126);
                     }
                 }
                 if let Some(ref pnf) = proxy_notify_fd_keep {
@@ -1293,10 +1339,9 @@ pub fn execute_supervised(
                 }
             }
 
-            // On Linux with capability elevation: receive the seccomp notify fd
-            // from the child. The child installed a seccomp-notify filter and
-            // sent the fd via SCM_RIGHTS on the supervisor socket.
-            // Only attempt recv when elevation is active (child sends the fd).
+            // On Linux with openat mediation: receive the required seccomp
+            // notify fd from the child. If the child cannot provide it, this is
+            // a sandbox initialisation failure rather than a degraded mode.
             #[cfg(target_os = "linux")]
             let seccomp_notify_fd: Option<OwnedFd> = if config.seccomp_policy.needs_openat_notify()
             {
@@ -1307,12 +1352,21 @@ pub fn execute_supervised(
                             Some(fd)
                         }
                         Err(e) => {
-                            warn!("Failed to receive seccomp notify fd: {}", e);
-                            None
+                            let _ = signal::kill(child, Signal::SIGKILL);
+                            let _ = waitpid(child, None);
+                            return Err(NonoError::SandboxInit(format!(
+                                "Failed to receive required seccomp notify fd from child: {}",
+                                e
+                            )));
                         }
                     }
                 } else {
-                    None
+                    let _ = signal::kill(child, Signal::SIGKILL);
+                    let _ = waitpid(child, None);
+                    return Err(NonoError::SandboxInit(
+                        "Seccomp notify is required but no supervisor socket was created"
+                            .to_string(),
+                    ));
                 }
             } else {
                 None
@@ -1358,24 +1412,31 @@ pub fn execute_supervised(
                                     Some(fd)
                                 }
                                 Err(e) => {
-                                    warn!(
-                                        "Failed to acquire proxy seccomp notify fd via pidfd_getfd: {}",
+                                    let _ = signal::kill(child, Signal::SIGKILL);
+                                    let _ = waitpid(child, None);
+                                    return Err(NonoError::SandboxInit(format!(
+                                        "Failed to acquire required network seccomp notify fd from child: {}",
                                         e
-                                    );
-                                    None
+                                    )));
                                 }
                             }
                         }
                         Err(e) => {
-                            warn!(
-                                "Failed to receive proxy seccomp notify fd number from child: {}",
+                            let _ = signal::kill(child, Signal::SIGKILL);
+                            let _ = waitpid(child, None);
+                            return Err(NonoError::SandboxInit(format!(
+                                "Failed to receive required network seccomp notify fd number from child: {}",
                                 e
-                            );
-                            None
+                            )));
                         }
                     }
                 } else {
-                    None
+                    let _ = signal::kill(child, Signal::SIGKILL);
+                    let _ = waitpid(child, None);
+                    return Err(NonoError::SandboxInit(
+                        "Network seccomp notify is required but no supervisor socket was created"
+                            .to_string(),
+                    ));
                 }
             } else {
                 None
@@ -4071,7 +4132,8 @@ mod tests {
             !SeccompPolicy {
                 capability_elevation: false,
                 proxy_fallback: false,
-                af_unix_mediation: false
+                af_unix_mediation: false,
+                proc_comm_notify: false,
             }
             .child_requires_dumpable()
         );
@@ -4079,7 +4141,8 @@ mod tests {
             SeccompPolicy {
                 capability_elevation: true,
                 proxy_fallback: false,
-                af_unix_mediation: false
+                af_unix_mediation: false,
+                proc_comm_notify: false,
             }
             .child_requires_dumpable()
         );
@@ -4087,7 +4150,8 @@ mod tests {
             SeccompPolicy {
                 capability_elevation: false,
                 proxy_fallback: true,
-                af_unix_mediation: false
+                af_unix_mediation: false,
+                proc_comm_notify: false,
             }
             .child_requires_dumpable()
         );
@@ -4095,10 +4159,35 @@ mod tests {
             SeccompPolicy {
                 capability_elevation: true,
                 proxy_fallback: true,
-                af_unix_mediation: false
+                af_unix_mediation: false,
+                proc_comm_notify: false,
             }
             .child_requires_dumpable()
         );
+        assert!(
+            SeccompPolicy {
+                capability_elevation: false,
+                proxy_fallback: false,
+                af_unix_mediation: false,
+                proc_comm_notify: true,
+            }
+            .child_requires_dumpable()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_linux_seccomp_policy_combines_file_expansion_and_network_fallback() {
+        let policy = SeccompPolicy {
+            capability_elevation: true,
+            proxy_fallback: true,
+            af_unix_mediation: false,
+            proc_comm_notify: false,
+        };
+
+        assert!(policy.needs_openat_notify());
+        assert!(policy.needs_network_notify());
+        assert!(policy.child_requires_dumpable());
     }
 
     #[test]
@@ -4625,6 +4714,7 @@ mod tests {
                 capability_elevation: false,
                 proxy_fallback: true,
                 af_unix_mediation: false,
+                proc_comm_notify: false,
             },
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             tool_sandbox_runtime: None,
@@ -4749,6 +4839,7 @@ mod tests {
                 capability_elevation: false,
                 proxy_fallback: true,
                 af_unix_mediation: false,
+                proc_comm_notify: false,
             },
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             tool_sandbox_runtime: None,
@@ -4839,6 +4930,7 @@ mod tests {
                 capability_elevation: false,
                 proxy_fallback: true,
                 af_unix_mediation: false,
+                proc_comm_notify: false,
             },
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             tool_sandbox_runtime: None,
@@ -4886,6 +4978,7 @@ mod tests {
                 capability_elevation: false,
                 proxy_fallback: true,
                 af_unix_mediation: false,
+                proc_comm_notify: false,
             },
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             tool_sandbox_runtime: None,
@@ -4931,6 +5024,7 @@ mod tests {
                 capability_elevation: false,
                 proxy_fallback: true,
                 af_unix_mediation: false,
+                proc_comm_notify: false,
             },
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             tool_sandbox_runtime: None,
@@ -4958,6 +5052,7 @@ mod tests {
                 capability_elevation: false,
                 proxy_fallback: true,
                 af_unix_mediation: false,
+                proc_comm_notify: false,
             },
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             tool_sandbox_runtime: None,
@@ -5008,6 +5103,7 @@ mod tests {
                 capability_elevation: false,
                 proxy_fallback: true,
                 af_unix_mediation: false,
+                proc_comm_notify: false,
             },
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             tool_sandbox_runtime: None,
@@ -5163,6 +5259,7 @@ mod tests {
                 capability_elevation: false,
                 proxy_fallback: true,
                 af_unix_mediation: false,
+                proc_comm_notify: false,
             },
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             tool_sandbox_runtime: None,
@@ -5218,6 +5315,7 @@ mod tests {
                 capability_elevation: false,
                 proxy_fallback: true,
                 af_unix_mediation: false,
+                proc_comm_notify: false,
             },
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             tool_sandbox_runtime: None,
@@ -5262,6 +5360,7 @@ mod tests {
                 capability_elevation: false,
                 proxy_fallback: true,
                 af_unix_mediation: false,
+                proc_comm_notify: false,
             },
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             tool_sandbox_runtime: None,
@@ -5325,6 +5424,7 @@ mod tests {
                 capability_elevation: false,
                 proxy_fallback: true,
                 af_unix_mediation: false,
+                proc_comm_notify: false,
             },
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             tool_sandbox_runtime: None,

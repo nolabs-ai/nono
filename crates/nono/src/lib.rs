@@ -84,7 +84,9 @@ pub use keystore::{
 pub use net_filter::{FilterResult, HostFilter};
 pub use path::try_canonicalize;
 #[cfg(target_os = "linux")]
-pub use sandbox::{DetectedAbi, LandlockScopePolicy, detect_abi, is_wsl2, landlock_scope_policy};
+pub use sandbox::{
+    DetectedAbi, LandlockScopePolicy, SeccompOpts, detect_abi, is_wsl2, landlock_scope_policy,
+};
 pub use sandbox::{Sandbox, SupportInfo};
 pub use scrub::{
     ScrubPolicy, ScrubPolicyDiff, scrub_argv, scrub_argv_with_policy, scrub_env_name,

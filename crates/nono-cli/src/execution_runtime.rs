@@ -39,6 +39,11 @@ fn apply_pre_fork_sandbox(
                     Sandbox::apply_landlock_with_abi(caps, &detected)?;
                 }
                 LinuxSandboxPolicy::External => {
+                    Sandbox::apply_seccomp_with_abi(
+                        caps,
+                        &detected,
+                        nono::sandbox::SeccompOpts::external_tcp(),
+                    )?;
                     Sandbox::apply_external()?;
                 }
             }
@@ -491,7 +496,13 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
     #[cfg(target_os = "linux")]
     let seccomp_proxy_fallback = {
         let needs_proxy = matches!(caps.network_mode(), nono::NetworkMode::ProxyOnly { .. });
-        if needs_proxy && nono::is_wsl2() {
+        let external_network = matches!(
+            flags.sandbox_policy,
+            crate::profile::LinuxSandboxPolicy::External
+        );
+        if external_network {
+            false
+        } else if needs_proxy && nono::is_wsl2() {
             let needs_seccomp_fallback = !Sandbox::detect_abi()
                 .ok()
                 .is_some_and(|abi| abi.has_network());
@@ -539,6 +550,16 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         ));
     }
 
+    #[cfg(target_os = "linux")]
+    if flags.proc_comm_notify && nono::sandbox::is_wsl2() {
+        return Err(NonoError::SandboxInit(
+            "WSL2: NVIDIA GPU thread-name mediation requires seccomp user notification, \
+             but WSL2 reports EBUSY for seccomp notify listeners. Disable --allow-gpu \
+             or run on native Linux."
+                .to_string(),
+        ));
+    }
+
     let config = exec_strategy::ExecConfig {
         command: &command,
         resolved_program: &exec_resolved_program,
@@ -579,7 +600,10 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
             capability_elevation: flags.capability_elevation,
             proxy_fallback: seccomp_proxy_fallback,
             af_unix_mediation: flags.af_unix_mediation.is_pathname(),
+            proc_comm_notify: flags.proc_comm_notify,
         },
+        #[cfg(target_os = "linux")]
+        sandbox_policy: flags.sandbox_policy,
         allowed_env_vars: flags.allowed_env_vars,
         denied_env_vars: flags.denied_env_vars,
         set_vars: flags.set_vars.unwrap_or_default(),

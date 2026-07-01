@@ -20,6 +20,36 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 use tracing::warn;
 
+#[cfg(target_os = "linux")]
+fn reject_run_only_sandbox_policy(
+    command: &str,
+    args: &SandboxArgs,
+    prepared: &crate::sandbox_prepare::PreparedSandbox,
+) -> Result<()> {
+    if args.sandbox_policy.is_some() {
+        return Err(NonoError::ConfigParse(format!(
+            "--sandbox-policy is only supported by `nono run`; `nono {command}` has no proxy supervisor. Use `nono run` instead."
+        )));
+    }
+
+    if prepared.explicit_sandbox_policy.is_some() {
+        return Err(NonoError::ConfigParse(format!(
+            "profiles containing linux.sandbox_policy are only supported by `nono run`; `nono {command}` has no proxy supervisor. Remove linux.sandbox_policy or use `nono run`."
+        )));
+    }
+
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn reject_run_only_sandbox_policy(
+    _command: &str,
+    _args: &SandboxArgs,
+    _prepared: &crate::sandbox_prepare::PreparedSandbox,
+) -> Result<()> {
+    Ok(())
+}
+
 /// Check whether the loaded profile specifies a `binary` field that should be
 /// honoured. Only user-authored profiles (user overrides or file-path based)
 /// are allowed to set the target binary. Pack/registry and built-in profiles
@@ -81,7 +111,10 @@ pub(crate) fn run_sandbox(mut run_args: RunArgs, silent: bool) -> Result<()> {
 
     // Load profile once and reuse for binary resolution and command_args.
     let loaded_profile = match run_args.sandbox.profile.as_ref() {
-        Some(name) => Some((name.clone(), profile::load_profile(name)?)),
+        Some(name) => Some((
+            name.clone(),
+            profile::load_profile_with_extends(name, &run_args.sandbox.extends)?,
+        )),
         None => None,
     };
 
@@ -159,6 +192,7 @@ pub(crate) fn run_shell(args: ShellArgs, silent: bool) -> Result<()> {
 
     if args.sandbox.dry_run {
         let prepared = prepare_sandbox(&args.sandbox, silent)?;
+        reject_run_only_sandbox_policy("shell", &args.sandbox, &prepared)?;
         if !prepared.secrets.is_empty() && !silent {
             eprintln!(
                 "  Would inject {} credential(s) as environment variables",
@@ -171,6 +205,7 @@ pub(crate) fn run_shell(args: ShellArgs, silent: bool) -> Result<()> {
     }
 
     let prepared = prepare_sandbox(&args.sandbox, silent)?;
+    reject_run_only_sandbox_policy("shell", &args.sandbox, &prepared)?;
 
     if prepared.allow_launch_services_active {
         print_allow_launch_services_warning(silent);
@@ -240,6 +275,7 @@ pub(crate) fn run_wrap(wrap_args: WrapArgs, silent: bool) -> Result<()> {
 
     if args.dry_run {
         let prepared = prepare_sandbox(&args, silent)?;
+        reject_run_only_sandbox_policy("wrap", &args, &prepared)?;
         if !prepared.secrets.is_empty() && !silent {
             eprintln!(
                 "  Would inject {} credential(s) as environment variables",
@@ -252,6 +288,7 @@ pub(crate) fn run_wrap(wrap_args: WrapArgs, silent: bool) -> Result<()> {
     }
 
     let prepared = prepare_sandbox(&args, silent)?;
+    reject_run_only_sandbox_policy("wrap", &args, &prepared)?;
 
     if prepared.upstream_proxy.is_some()
         || matches!(
@@ -271,6 +308,15 @@ pub(crate) fn run_wrap(wrap_args: WrapArgs, silent: bool) -> Result<()> {
         return Err(NonoError::ConfigParse(
             "nono wrap does not support linux.af_unix_mediation = \"pathname\" because direct \
              exec cannot run the seccomp supervisor. Use `nono run` instead."
+                .to_string(),
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    if prepared.proc_comm_notify {
+        return Err(NonoError::ConfigParse(
+            "nono wrap does not support NVIDIA GPU thread-name mediation because direct \
+             exec cannot run the seccomp supervisor. Use `nono run --allow-gpu` instead."
                 .to_string(),
         ));
     }

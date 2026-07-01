@@ -456,7 +456,10 @@ pub fn run_learn(args: &LearnArgs) -> Result<LearnResult> {
 
     // Load profile if specified
     let profile = if let Some(ref profile_name) = args.profile {
-        Some(profile::load_profile(profile_name)?)
+        Some(profile::load_profile_with_extends(
+            profile_name,
+            &args.extends,
+        )?)
     } else {
         None
     };
@@ -1089,7 +1092,10 @@ pub fn run_learn(args: &LearnArgs) -> Result<LearnResult> {
 
     // Load profile if specified
     let profile = if let Some(ref profile_name) = args.profile {
-        Some(profile::load_profile(profile_name)?)
+        Some(profile::load_profile_with_extends(
+            profile_name,
+            &args.extends,
+        )?)
     } else {
         None
     };

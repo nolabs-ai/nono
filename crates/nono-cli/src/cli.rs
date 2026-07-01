@@ -1381,6 +1381,15 @@ pub struct SandboxArgs {
     #[arg(long, help_heading = "OPTIONS")]
     pub allow_http2: bool,
 
+    /// Extend the selected profile with an additional base profile for this invocation
+    #[arg(
+        long,
+        value_name = "PROFILE",
+        requires = "profile",
+        help_heading = "OPTIONS"
+    )]
+    pub extends: Vec<String>,
+
     /// Capability manifest file (JSON). A fully-resolved sandbox specification —
     /// mutually exclusive with all other sandbox configuration flags.
     #[arg(
@@ -1392,7 +1401,7 @@ pub struct SandboxArgs {
             "allow_unix_socket", "allow_unix_socket_bind",
             "allow_unix_socket_dir", "allow_unix_socket_dir_bind",
             "allow_unix_socket_subtree", "allow_unix_socket_subtree_bind",
-            "profile", "bypass_protection", "suppress_save_prompt", "allow_cwd",
+            "profile", "extends", "bypass_protection", "suppress_save_prompt", "allow_cwd",
             "block_net", "allow_net", "network_profile", "allow_proxy",
             "allow_bind", "allow_port", "allow_connect_port", "external_proxy", "proxy_port",
             "proxy_credential", "allow_endpoint", "env_credential", "env_credential_map",
@@ -1600,6 +1609,15 @@ pub struct WrapSandboxArgs {
     )]
     pub profile: Option<String>,
 
+    /// Extend the selected profile with an additional base profile for this invocation
+    #[arg(
+        long,
+        value_name = "PROFILE",
+        requires = "profile",
+        help_heading = "OPTIONS"
+    )]
+    pub extends: Vec<String>,
+
     /// Allow direct LaunchServices opens on macOS (temporary login/setup flows)
     #[arg(long, help_heading = "OPTIONS")]
     pub allow_launch_services: bool,
@@ -1619,7 +1637,7 @@ pub struct WrapSandboxArgs {
             "allow_unix_socket", "allow_unix_socket_bind",
             "allow_unix_socket_dir", "allow_unix_socket_dir_bind",
             "allow_unix_socket_subtree", "allow_unix_socket_subtree_bind",
-            "profile", "bypass_protection", "suppress_save_prompt", "allow_cwd",
+            "profile", "extends", "bypass_protection", "suppress_save_prompt", "allow_cwd",
             "block_net", "allow_bind", "allow_port", "allow_connect_port",
             "env_credential", "env_credential_map",
             "allow_command", "block_command", "allow_launch_services", "allow_gpu",
@@ -1676,6 +1694,7 @@ impl From<WrapSandboxArgs> for SandboxArgs {
             allow_command: args.allow_command,
             block_command: args.block_command,
             profile: args.profile,
+            extends: args.extends,
             allow_launch_services: args.allow_launch_services,
             allow_gpu: args.allow_gpu,
             allow_http2: false,
@@ -1985,6 +2004,15 @@ pub struct WhyArgs {
     #[arg(long, short = 'p', value_name = "NAME", help_heading = "CONTEXT")]
     pub profile: Option<String>,
 
+    /// Extend the selected profile with an additional base profile for this query
+    #[arg(
+        long,
+        value_name = "PROFILE",
+        requires = "profile",
+        help_heading = "CONTEXT"
+    )]
+    pub extends: Vec<String>,
+
     /// Working directory for $WORKDIR expansion in profiles
     #[arg(long, value_name = "DIR", help_heading = "CONTEXT")]
     pub workdir: Option<PathBuf>,
@@ -2000,6 +2028,15 @@ pub struct LearnArgs {
     /// Use a named profile to compare against (shows only missing paths)
     #[arg(long, short = 'p', value_name = "NAME", help_heading = "OPTIONS")]
     pub profile: Option<String>,
+
+    /// Extend the selected profile with an additional base profile for this comparison
+    #[arg(
+        long,
+        value_name = "PROFILE",
+        requires = "profile",
+        help_heading = "OPTIONS"
+    )]
+    pub extends: Vec<String>,
 
     /// Output discovered paths as JSON fragment for profile
     #[arg(long, help_heading = "OPTIONS")]
@@ -2667,6 +2704,106 @@ mod tests {
                 assert_eq!(args.sandbox.read.len(), 1);
             }
             _ => panic!("Expected Run command"),
+        }
+    }
+
+    #[test]
+    fn test_extends_repeated_preserves_order() {
+        let cli = Cli::parse_from([
+            "nono",
+            "run",
+            "--profile",
+            "agent",
+            "--extends",
+            "linux-host-compat",
+            "--extends",
+            "extra-git",
+            "echo",
+        ]);
+        match cli.command {
+            Commands::Run(args) => {
+                assert_eq!(
+                    args.sandbox.extends,
+                    vec!["linux-host-compat".to_string(), "extra-git".to_string()]
+                );
+            }
+            _ => panic!("Expected Run command"),
+        }
+    }
+
+    #[test]
+    fn test_extends_requires_profile() {
+        let result = Cli::try_parse_from(["nono", "run", "--extends", "base", "echo"]);
+        assert!(result.is_err(), "--extends without --profile should fail");
+    }
+
+    #[test]
+    fn test_config_conflicts_with_extends() {
+        let result = Cli::try_parse_from([
+            "nono",
+            "run",
+            "--config",
+            "manifest.json",
+            "--profile",
+            "agent",
+            "--extends",
+            "base",
+            "echo",
+        ]);
+        assert!(result.is_err(), "--config and --extends should conflict");
+    }
+
+    #[test]
+    fn test_wrap_extends_is_copied_to_sandbox_args() {
+        let cli = Cli::parse_from([
+            "nono",
+            "wrap",
+            "--profile",
+            "agent",
+            "--extends",
+            "base",
+            "--",
+            "echo",
+        ]);
+        match cli.command {
+            Commands::Wrap(args) => {
+                let wrap = *args;
+                let sandbox: SandboxArgs = wrap.sandbox.into();
+                assert_eq!(sandbox.extends, vec!["base".to_string()]);
+            }
+            _ => panic!("Expected Wrap command"),
+        }
+    }
+
+    #[test]
+    fn test_why_and_learn_extends_parse() {
+        let cli = Cli::parse_from([
+            "nono",
+            "why",
+            "--profile",
+            "agent",
+            "--extends",
+            "base",
+            "--path",
+            "/tmp",
+        ]);
+        match cli.command {
+            Commands::Why(args) => assert_eq!(args.extends, vec!["base".to_string()]),
+            _ => panic!("Expected Why command"),
+        }
+
+        let cli = Cli::parse_from([
+            "nono",
+            "learn",
+            "--profile",
+            "agent",
+            "--extends",
+            "base",
+            "echo",
+        ]);
+        match cli.command {
+            Commands::Learn(args) => assert_eq!(args.extends, vec!["base".to_string()]),
+            _ => panic!("Expected Learn command"),
         }
     }
 

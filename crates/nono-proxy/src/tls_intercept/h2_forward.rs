@@ -597,7 +597,7 @@ mod tests {
 
     /// Build a RouteStore + CredentialStore for a `cmd://` route so the
     /// command-backed capture path is exercised.
-    fn make_cmd_route_stores(
+    async fn make_cmd_route_stores(
         host: &str,
         port: u16,
         tls_connector: &tokio_rustls::TlsConnector,
@@ -627,6 +627,7 @@ mod tests {
         }];
         let route_store = RouteStore::load(&routes).unwrap();
         let credential_store = CredentialStore::load_with_diagnostics(&routes, tls_connector)
+            .await
             .unwrap()
             .store;
         (route_store, credential_store)
@@ -1031,7 +1032,7 @@ mod tests {
 
         let tls_connector = h2_tls_connector_trusting(ca.cert_pem());
         let (route_store, credential_store) =
-            make_cmd_route_stores("localhost", upstream_port, &tls_connector);
+            make_cmd_route_stores("localhost", upstream_port, &tls_connector).await;
         let cert_cache = Arc::new(CertCache::new(Arc::clone(&ca)));
         let filter = ProxyFilter::allow_all();
         let session_token = Zeroizing::new("session-tok".to_string());
@@ -1111,7 +1112,7 @@ mod tests {
 
         let tls_connector = h2_tls_connector_trusting(ca.cert_pem());
         let (route_store, credential_store) =
-            make_cmd_route_stores("localhost", upstream_port, &tls_connector);
+            make_cmd_route_stores("localhost", upstream_port, &tls_connector).await;
         let cert_cache = Arc::new(CertCache::new(Arc::clone(&ca)));
         let filter = ProxyFilter::allow_all();
         let session_token = Zeroizing::new("session-tok".to_string());
@@ -1199,7 +1200,7 @@ mod tests {
 
         let tls_connector = h2_tls_connector_trusting(ca.cert_pem());
         let (route_store, credential_store) =
-            make_cmd_route_stores("localhost", upstream_port, &tls_connector);
+            make_cmd_route_stores("localhost", upstream_port, &tls_connector).await;
         let cert_cache = Arc::new(CertCache::new(Arc::clone(&ca)));
         let filter = ProxyFilter::allow_all();
         let session_token = Zeroizing::new("session-tok".to_string());
@@ -1408,6 +1409,7 @@ mod tests {
         }];
         let route_store = RouteStore::load(&routes).unwrap();
         let credential_store = CredentialStore::load_with_diagnostics(&routes, &tls_connector)
+            .await
             .unwrap()
             .store;
         let cert_cache = Arc::new(CertCache::new(Arc::clone(&ca)));

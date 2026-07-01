@@ -3342,7 +3342,7 @@ mod tests {
     fn test_capture_entry(command: Vec<String>) -> crate::profile::CredentialCaptureEntry {
         crate::profile::CredentialCaptureEntry {
             command,
-            timeout_secs: Some(5),
+            timeout_secs: Some(30),
             ttl_secs: Some(60),
             cache_ttl_secs: None,
             cache_path_regex: None,

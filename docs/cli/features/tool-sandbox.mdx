@@ -91,6 +91,23 @@ The selected `sandbox` object describes what the child receives:
 | `open_urls` | object | Runtime-delegated URL opening for this command. |
 | `allow_launch_services` | boolean | macOS-only direct LaunchServices URL opening. |
 | `allow_raw_file_credentials_in_chained_policy` | boolean | Required before non-session callers can receive raw-file credentials. |
+| `unsafe_macos_seatbelt_rules` | string array | macOS-only escape hatch: raw Seatbelt rules appended to this command's child profile after the deny gate (last-match-wins). Mirrors the top-level `unsafe_macos_seatbelt_rules` but scoped to one command/intercept. Use sparingly — e.g. to let a command exec + read a binary it forks by absolute path. |
+
+### Per-Intercept Sandbox Override
+
+An `intercept` rule may carry an optional `sandbox` (the same object described above). When the rule matches, the process the rule launches runs under the rule's `sandbox` instead of the command's selected sandbox — for that matched invocation only. This applies to every action that launches a process (`passthrough`, `capture`, `capture_credential`, and an approved `approve`); it does not apply to `respond`, which returns static output and launches nothing (a `sandbox` there is rejected at validation). Credentials resolve lazily, so an override that omits `credentials`/`use_credentials` injects no credential env vars for that invocation. The override **completely replaces** the command's selected sandbox for that invocation — it is validated for well-formedness (known credentials, valid paths, etc.) but is not checked against the command's base sandbox, so it is not restricted to narrowing. Author it as carefully as the command's base sandbox; it can grant capabilities the base sandbox does not.
+
+```jsonc
+{
+  "args": ["auth", "switch"],
+  "action": { "type": "passthrough" },
+  "sandbox": {
+    "fs_read": ["~/.config/gh"],
+    "fs_write": ["~/.config/gh"],
+    "network": { "allow_domain": ["github.com"] }
+  }
+}
+```
 
 ### Dynamic Filesystem Grants
 

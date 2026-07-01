@@ -416,6 +416,12 @@ pub struct InterceptRuleConfig {
     /// Action to take when this rule matches.
     #[serde(default)]
     pub action: InterceptActionConfig,
+    /// Optional sandbox that replaces the command's selected sandbox for the
+    /// process this matched rule launches — any launching action (not
+    /// `respond`, which launches nothing). Credentials resolve lazily, so
+    /// omitting `credentials`/`use_credentials` injects none here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<CommandSandboxConfig>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -586,6 +592,14 @@ pub struct CommandSandboxConfig {
     /// Ignored on Linux. Defaults to `false`.
     #[serde(default)]
     pub allow_launch_services: bool,
+    /// macOS-only expert escape hatch: raw Seatbelt S-expression rules appended
+    /// to this command's child sandbox profile. Rules are emitted after the
+    /// generated denies (including the exec gate's `(deny process-exec*)`), so a
+    /// later `(allow ...)` wins under Seatbelt's last-matching-rule semantics.
+    /// Mirrors the top-level `unsafe_macos_seatbelt_rules` but scoped to a single
+    /// command (or per-intercept override). Ignored on Linux.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unsafe_macos_seatbelt_rules: Vec<String>,
 }
 
 impl CommandSandboxConfig {
@@ -609,6 +623,10 @@ impl CommandSandboxConfig {
             // narrows (or widens) wholesale, matching root-profile semantics.
             open_urls: child.open_urls.clone().or_else(|| self.open_urls.clone()),
             allow_launch_services: self.allow_launch_services || child.allow_launch_services,
+            unsafe_macos_seatbelt_rules: dedup_append(
+                &self.unsafe_macos_seatbelt_rules,
+                &child.unsafe_macos_seatbelt_rules,
+            ),
         }
     }
 }
@@ -1213,13 +1231,14 @@ fn validate_command(
         }
     }
 
-    validate_intercept_rules(command_name, &command.intercept, config, report);
+    validate_intercept_rules(command_name, &command.intercept, config, scope, report);
 }
 
 fn validate_intercept_rules(
     command_name: &str,
     rules: &[InterceptRuleConfig],
     config: &CommandPoliciesConfig,
+    scope: CommandPolicyValidationScope,
     report: &mut CommandPolicyValidationReport,
 ) {
     let mut saw_catch_all = false;
@@ -1276,6 +1295,23 @@ fn validate_intercept_rules(
                 report,
             );
         }
+        if let Some(sandbox) = &rule.sandbox {
+            // A sandbox override applies to the process the action launches. `respond`
+            // returns static output without launching anything, so an override there
+            // would be silently ignored — reject it.
+            if matches!(rule.action, InterceptActionConfig::Respond { .. }) {
+                report.error(
+                    "intercept_sandbox_on_respond",
+                    format!(
+                        "command '{command_name}' intercept rule {i} sets a sandbox override but its action is `respond`, which launches no process"
+                    ),
+                );
+            }
+            // Validate the override like a from-edge sandbox. There is no
+            // caller, so label it by rule index for error context.
+            let caller = format!("intercept[{i}].sandbox");
+            validate_sandbox(command_name, &caller, sandbox, config, scope, report);
+        }
     }
 }
 
@@ -1317,6 +1353,13 @@ fn validate_sandbox(
     }
 
     validate_argv_prepend(command_name, caller, &sandbox.argv_prepend, report);
+
+    validate_unsafe_seatbelt_rules(
+        command_name,
+        caller,
+        &sandbox.unsafe_macos_seatbelt_rules,
+        report,
+    );
 
     if let Some(network) = &sandbox.network {
         validate_network(command_name, caller, network, report);
@@ -1402,6 +1445,42 @@ fn validate_argv_prepend(
             );
         }
     }
+}
+
+fn validate_unsafe_seatbelt_rules(
+    command_name: &str,
+    caller: &str,
+    rules: &[String],
+    report: &mut CommandPolicyValidationReport,
+) {
+    if rules.is_empty() {
+        return;
+    }
+    for rule in rules {
+        if rule.trim().is_empty() {
+            report.error(
+                "invalid_unsafe_seatbelt_rule",
+                format!(
+                    "command '{command_name}' from.{caller} unsafe_macos_seatbelt_rules contains an empty rule"
+                ),
+            );
+        }
+        if rule.contains('\0') {
+            report.error(
+                "invalid_unsafe_seatbelt_rule",
+                format!(
+                    "command '{command_name}' from.{caller} unsafe_macos_seatbelt_rules contains NUL"
+                ),
+            );
+        }
+    }
+    report.warning(
+        "unsafe_seatbelt_rules",
+        format!(
+            "command '{command_name}' from.{caller} sets {} raw macOS Seatbelt rule(s) via unsafe_macos_seatbelt_rules — review carefully",
+            rules.len()
+        ),
+    );
 }
 
 fn validate_invocation_policy(
@@ -2366,6 +2445,55 @@ fn duplicate_distinct_inode_paths(
     duplicates
 }
 
+/// Collects `unsafe_macos_seatbelt_rules` nested inside command sandboxes,
+/// `from.<caller>` edges, and intercept rule sandbox overrides, paired with
+/// a dotted location label. Used by profile save/share warnings, which
+/// otherwise only see the top-level `Profile.unsafe_macos_seatbelt_rules`
+/// and would silently miss rules nested here.
+pub(crate) fn nested_unsafe_seatbelt_rules(
+    policies: &CommandPoliciesConfig,
+) -> Vec<(String, String)> {
+    let mut found = Vec::new();
+    for (command_name, command) in &policies.commands {
+        if let Some(sandbox) = &command.sandbox {
+            push_unsafe_seatbelt_rules(
+                &format!("commands.{command_name}.sandbox"),
+                sandbox,
+                &mut found,
+            );
+        }
+        for (caller, from) in &command.from {
+            if let Some(sandbox) = from.sandbox() {
+                push_unsafe_seatbelt_rules(
+                    &format!("commands.{command_name}.from.{caller}"),
+                    sandbox,
+                    &mut found,
+                );
+            }
+        }
+        for (i, rule) in command.intercept.iter().enumerate() {
+            if let Some(sandbox) = &rule.sandbox {
+                push_unsafe_seatbelt_rules(
+                    &format!("commands.{command_name}.intercept[{i}]"),
+                    sandbox,
+                    &mut found,
+                );
+            }
+        }
+    }
+    found
+}
+
+fn push_unsafe_seatbelt_rules(
+    location: &str,
+    sandbox: &CommandSandboxConfig,
+    found: &mut Vec<(String, String)>,
+) {
+    for rule in &sandbox.unsafe_macos_seatbelt_rules {
+        found.push((location.to_string(), rule.clone()));
+    }
+}
+
 fn command_uses_credentials(command: &CommandPolicyConfig) -> bool {
     command
         .sandbox
@@ -2809,6 +2937,75 @@ mod tests {
         assert_eq!(open_urls.allow_origins, vec!["https://github.com"]);
         assert!(open_urls.allow_localhost);
         assert!(parsed.allow_launch_services);
+    }
+
+    #[test]
+    fn command_sandbox_unsafe_seatbelt_rules_round_trip() {
+        let json = r#"{
+            "unsafe_macos_seatbelt_rules": [
+                "(allow process-exec* (literal \"/usr/bin/security\"))"
+            ]
+        }"#;
+        let parsed: CommandSandboxConfig =
+            serde_json::from_str(json).expect("valid unsafe rules config should parse");
+        assert_eq!(
+            parsed.unsafe_macos_seatbelt_rules,
+            vec!["(allow process-exec* (literal \"/usr/bin/security\"))".to_string()]
+        );
+    }
+
+    #[test]
+    fn command_sandbox_unsafe_seatbelt_rules_omitted_when_empty() {
+        let sandbox = CommandSandboxConfig::default();
+        let value = serde_json::to_value(&sandbox).expect("serialize");
+        assert!(
+            value.get("unsafe_macos_seatbelt_rules").is_none(),
+            "empty unsafe_macos_seatbelt_rules should be omitted, got {value}"
+        );
+    }
+
+    #[test]
+    fn command_sandbox_unsafe_seatbelt_rules_merge_child_appends() {
+        let base = CommandSandboxConfig {
+            unsafe_macos_seatbelt_rules: vec!["(allow iokit-open)".to_string()],
+            ..Default::default()
+        };
+        let child = CommandSandboxConfig {
+            unsafe_macos_seatbelt_rules: vec![
+                "(allow iokit-open)".to_string(),
+                "(allow process-exec* (literal \"/usr/bin/security\"))".to_string(),
+            ],
+            ..Default::default()
+        };
+        let merged = base.merge_child(&child);
+        assert_eq!(
+            merged.unsafe_macos_seatbelt_rules,
+            vec![
+                "(allow iokit-open)".to_string(),
+                "(allow process-exec* (literal \"/usr/bin/security\"))".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn command_sandbox_unsafe_seatbelt_rules_empty_rule_errors() {
+        let mut config = active_git_config();
+        if let Some(git) = config.commands.get_mut("git") {
+            git.sandbox = Some(CommandSandboxConfig {
+                unsafe_macos_seatbelt_rules: vec!["   ".to_string()],
+                ..Default::default()
+            });
+        }
+        let report =
+            validate_command_policies(Some(&config), CommandPolicyValidationScope::Resolved);
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|finding| finding.code == "invalid_unsafe_seatbelt_rule"),
+            "expected invalid_unsafe_seatbelt_rule error, got {:?}",
+            report.errors
+        );
     }
 
     #[test]
@@ -3641,6 +3838,7 @@ mod tests {
                 credential: "github".to_string(),
                 grant_to: vec![],
             },
+            sandbox: None,
         });
 
         let report =
@@ -3669,6 +3867,7 @@ mod tests {
                 credential: "agent".to_string(),
                 grant_to: vec![],
             },
+            sandbox: None,
         });
 
         let report =
@@ -3685,10 +3884,12 @@ mod tests {
         let parent_rule = InterceptRuleConfig {
             args: vec!["push".to_string()],
             action: InterceptActionConfig::Approve { timeout_secs: None },
+            sandbox: None,
         };
         let child_rule = InterceptRuleConfig {
             args: vec!["fetch".to_string()],
             action: InterceptActionConfig::Passthrough,
+            sandbox: None,
         };
         let parent = CommandPolicyConfig {
             intercept: vec![parent_rule.clone()],
@@ -3707,6 +3908,7 @@ mod tests {
         let rule = InterceptRuleConfig {
             args: vec!["push".to_string()],
             action: InterceptActionConfig::Passthrough,
+            sandbox: None,
         };
         let parent = CommandPolicyConfig {
             intercept: vec![rule.clone()],
@@ -3728,10 +3930,12 @@ mod tests {
                 InterceptRuleConfig {
                     args: vec![],
                     action: InterceptActionConfig::Passthrough,
+                    sandbox: None,
                 },
                 InterceptRuleConfig {
                     args: vec!["push".to_string()],
                     action: InterceptActionConfig::Approve { timeout_secs: None },
+                    sandbox: None,
                 },
             ];
         }
@@ -3754,10 +3958,12 @@ mod tests {
                 InterceptRuleConfig {
                     args: vec!["push".to_string()],
                     action: InterceptActionConfig::Approve { timeout_secs: None },
+                    sandbox: None,
                 },
                 InterceptRuleConfig {
                     args: vec![],
                     action: InterceptActionConfig::Passthrough,
+                    sandbox: None,
                 },
             ];
         }
@@ -3781,6 +3987,7 @@ mod tests {
                 action: InterceptActionConfig::Respond {
                     stdout: "x".repeat(1024 * 1024 + 1),
                 },
+                sandbox: None,
             }];
         }
         let report =
@@ -3804,6 +4011,214 @@ mod tests {
             err.to_string().contains("unknown field"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn intercept_rule_roundtrips_with_sandbox_override() {
+        let json = r#"{
+            "args": ["auth", "switch"],
+            "action": {"type": "passthrough"},
+            "sandbox": {"fs_read": ["/etc/foo"], "use_credentials": ["github"]}
+        }"#;
+        let rule: InterceptRuleConfig =
+            serde_json::from_str(json).expect("deserialize rule with sandbox override");
+        let sandbox = rule.sandbox.as_ref().expect("sandbox override present");
+        assert_eq!(sandbox.fs_read, vec!["/etc/foo".to_string()]);
+        assert_eq!(sandbox.use_credentials, vec!["github".to_string()]);
+
+        // Round-trips: serialize then deserialize yields the same rule.
+        let serialized = serde_json::to_string(&rule).expect("serialize rule");
+        let reparsed: InterceptRuleConfig =
+            serde_json::from_str(&serialized).expect("re-deserialize rule");
+        assert_eq!(rule, reparsed);
+    }
+
+    #[test]
+    fn intercept_rule_omits_absent_sandbox_override() {
+        let rule = InterceptRuleConfig {
+            args: vec!["status".to_string()],
+            action: InterceptActionConfig::Passthrough,
+            sandbox: None,
+        };
+        let serialized = serde_json::to_string(&rule).expect("serialize rule");
+        assert!(
+            !serialized.contains("sandbox"),
+            "absent sandbox override should be skipped in serialization: {serialized}"
+        );
+    }
+
+    #[test]
+    fn nested_unsafe_seatbelt_rules_finds_command_from_and_intercept_sandboxes() {
+        let mut policies = CommandPoliciesConfig::default();
+        policies.commands.insert(
+            "git".to_string(),
+            CommandPolicyConfig {
+                sandbox: Some(CommandSandboxConfig {
+                    unsafe_macos_seatbelt_rules: vec!["(allow direct-sandbox)".to_string()],
+                    ..CommandSandboxConfig::default()
+                }),
+                from: BTreeMap::from([(
+                    "session".to_string(),
+                    CommandFromConfig::Policy(Box::new(CommandSandboxConfig {
+                        unsafe_macos_seatbelt_rules: vec!["(allow from-sandbox)".to_string()],
+                        ..CommandSandboxConfig::default()
+                    })),
+                )]),
+                intercept: vec![InterceptRuleConfig {
+                    args: vec!["push".to_string()],
+                    action: InterceptActionConfig::Passthrough,
+                    sandbox: Some(CommandSandboxConfig {
+                        unsafe_macos_seatbelt_rules: vec!["(allow intercept-sandbox)".to_string()],
+                        ..CommandSandboxConfig::default()
+                    }),
+                }],
+                ..CommandPolicyConfig::default()
+            },
+        );
+
+        let found = nested_unsafe_seatbelt_rules(&policies);
+        let rules: Vec<&str> = found.iter().map(|(_, rule)| rule.as_str()).collect();
+
+        assert!(rules.contains(&"(allow direct-sandbox)"));
+        assert!(rules.contains(&"(allow from-sandbox)"));
+        assert!(rules.contains(&"(allow intercept-sandbox)"));
+        assert_eq!(found.len(), 3);
+    }
+
+    #[test]
+    fn nested_unsafe_seatbelt_rules_empty_when_no_sandbox_sets_them() {
+        let mut policies = CommandPoliciesConfig::default();
+        policies.commands.insert(
+            "git".to_string(),
+            CommandPolicyConfig {
+                sandbox: Some(CommandSandboxConfig::default()),
+                ..CommandPolicyConfig::default()
+            },
+        );
+
+        assert!(nested_unsafe_seatbelt_rules(&policies).is_empty());
+    }
+
+    #[test]
+    fn intercept_sandbox_override_well_formed_passes() {
+        let mut config = active_git_config();
+        config.credentials.insert(
+            "github".to_string(),
+            CommandCredentialConfig {
+                credential_type: CommandCredentialType::Ambient,
+                ..Default::default()
+            },
+        );
+        let git = config.commands.get_mut("git").expect("git command");
+        git.intercept.push(InterceptRuleConfig {
+            args: vec!["status".to_string()],
+            action: InterceptActionConfig::Passthrough,
+            sandbox: Some(CommandSandboxConfig {
+                fs_read: vec![".".to_string()],
+                use_credentials: vec!["github".to_string()],
+                ..Default::default()
+            }),
+        });
+
+        let report =
+            validate_command_policies(Some(&config), CommandPolicyValidationScope::Resolved);
+
+        assert!(report.is_ok(), "{:?}", report.errors);
+    }
+
+    #[test]
+    fn intercept_sandbox_override_unknown_credential_rejected() {
+        let mut config = active_git_config();
+        let git = config.commands.get_mut("git").expect("git command");
+        git.intercept.push(InterceptRuleConfig {
+            args: vec!["status".to_string()],
+            action: InterceptActionConfig::Passthrough,
+            sandbox: Some(CommandSandboxConfig {
+                use_credentials: vec!["does-not-exist".to_string()],
+                ..Default::default()
+            }),
+        });
+
+        let report =
+            validate_command_policies(Some(&config), CommandPolicyValidationScope::Resolved);
+
+        assert!(
+            report.errors.iter().any(|finding| {
+                finding.code == "unknown_credential"
+                    && finding.message.contains("intercept[")
+                    && finding.message.contains("does-not-exist")
+            }),
+            "expected unknown_credential error for the override sandbox: {:?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn intercept_sandbox_override_on_respond_rejected() {
+        let mut config = active_git_config();
+        let git = config.commands.get_mut("git").expect("git command");
+        git.intercept.push(InterceptRuleConfig {
+            args: vec!["status".to_string()],
+            action: InterceptActionConfig::Respond {
+                stdout: String::new(),
+            },
+            sandbox: Some(CommandSandboxConfig {
+                fs_read: vec![".".to_string()],
+                ..Default::default()
+            }),
+        });
+
+        let report =
+            validate_command_policies(Some(&config), CommandPolicyValidationScope::Resolved);
+
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|finding| finding.code == "intercept_sandbox_on_respond"),
+            "expected sandbox override on a `respond` action to be rejected: {:?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn intercept_sandbox_override_on_launching_action_passes() {
+        let mut config = active_git_config();
+        config.credentials.insert(
+            "github".to_string(),
+            CommandCredentialConfig {
+                credential_type: CommandCredentialType::Ambient,
+                ..Default::default()
+            },
+        );
+        let git = config.commands.get_mut("git").expect("git command");
+        // capture_credential launches the real binary, so a sandbox override is
+        // meaningful and must be accepted.
+        git.intercept.push(InterceptRuleConfig {
+            args: vec!["status".to_string()],
+            action: InterceptActionConfig::CaptureCredential {
+                credential: "github".to_string(),
+                grant_to: Vec::new(),
+            },
+            sandbox: Some(CommandSandboxConfig {
+                fs_read: vec![".".to_string()],
+                use_credentials: vec!["github".to_string()],
+                ..Default::default()
+            }),
+        });
+
+        let report =
+            validate_command_policies(Some(&config), CommandPolicyValidationScope::Resolved);
+
+        assert!(
+            !report
+                .errors
+                .iter()
+                .any(|finding| finding.code == "intercept_sandbox_on_respond"),
+            "expected sandbox override on a launching action to be accepted: {:?}",
+            report.errors
+        );
+        assert!(report.is_ok(), "{:?}", report.errors);
     }
 
     #[test]
@@ -3831,6 +4246,7 @@ mod tests {
                 action: InterceptActionConfig::Approve {
                     timeout_secs: Some(0),
                 },
+                sandbox: None,
             }];
             git.from.insert(
                 "session".to_string(),

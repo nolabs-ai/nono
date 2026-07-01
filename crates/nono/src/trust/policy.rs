@@ -332,10 +332,25 @@ fn find_files_recursive(
         return Ok(());
     }
 
-    let entries = std::fs::read_dir(dir).map_err(NonoError::Io)?;
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            tracing::debug!(
+                "Skipping unreadable directory {}: {}",
+                dir.display(),
+                e
+            );
+            return Ok(());
+        }
+        Err(e) => return Err(NonoError::Io(e)),
+    };
 
     for entry in entries {
-        let entry = entry.map_err(NonoError::Io)?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => continue,
+            Err(e) => return Err(NonoError::Io(e)),
+        };
         let path = entry.path();
         let meta = match std::fs::metadata(&path) {
             Ok(metadata) => metadata,
@@ -1076,6 +1091,31 @@ mod tests {
         let files = find_included_files(&policy, dir.path()).unwrap();
         assert_eq!(files.len(), 1);
         assert!(files[0].to_string_lossy().contains("SKILLS.md"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn find_instruction_files_skips_unreadable_dirs() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        // Create a matching file at root level
+        std::fs::write(dir.path().join("SKILLS.md"), "content").unwrap();
+        // Create a subdirectory with mode 000 (unreadable)
+        let blocked = dir.path().join("shadow");
+        std::fs::create_dir(&blocked).unwrap();
+        std::fs::write(blocked.join("CLAUDE.md"), "secret").unwrap();
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let policy = make_policy(Enforcement::Deny, vec![], vec![]);
+        let files = find_instruction_files(&policy, dir.path()).unwrap();
+
+        // Should find the root-level file but not error on the blocked directory
+        assert_eq!(files.len(), 1);
+        assert!(files[0].to_string_lossy().contains("SKILLS.md"));
+
+        // Restore permissions so tempdir cleanup succeeds
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     #[test]

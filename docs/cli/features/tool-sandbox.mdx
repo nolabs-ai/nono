@@ -91,6 +91,7 @@ The selected `sandbox` object describes what the child receives:
 | `open_urls` | object | Runtime-delegated URL opening for this command. |
 | `allow_launch_services` | boolean | macOS-only direct LaunchServices URL opening. |
 | `allow_raw_file_credentials_in_chained_policy` | boolean | Required before non-session callers can receive raw-file credentials. |
+| `unsafe_macos_seatbelt_rules` | string array | macOS-only escape hatch: raw Seatbelt rules appended to this command's child profile after the deny gate (last-match-wins). Mirrors the top-level `unsafe_macos_seatbelt_rules` but scoped to one command/intercept. Use sparingly — e.g. to let a command exec + read a binary it forks by absolute path. |
 
 ### Per-Intercept Sandbox Override
 

@@ -592,6 +592,14 @@ pub struct CommandSandboxConfig {
     /// Ignored on Linux. Defaults to `false`.
     #[serde(default)]
     pub allow_launch_services: bool,
+    /// macOS-only expert escape hatch: raw Seatbelt S-expression rules appended
+    /// to this command's child sandbox profile. Rules are emitted after the
+    /// generated denies (including the exec gate's `(deny process-exec*)`), so a
+    /// later `(allow ...)` wins under Seatbelt's last-matching-rule semantics.
+    /// Mirrors the top-level `unsafe_macos_seatbelt_rules` but scoped to a single
+    /// command (or per-intercept override). Ignored on Linux.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unsafe_macos_seatbelt_rules: Vec<String>,
 }
 
 impl CommandSandboxConfig {
@@ -615,6 +623,10 @@ impl CommandSandboxConfig {
             // narrows (or widens) wholesale, matching root-profile semantics.
             open_urls: child.open_urls.clone().or_else(|| self.open_urls.clone()),
             allow_launch_services: self.allow_launch_services || child.allow_launch_services,
+            unsafe_macos_seatbelt_rules: dedup_append(
+                &self.unsafe_macos_seatbelt_rules,
+                &child.unsafe_macos_seatbelt_rules,
+            ),
         }
     }
 }
@@ -1342,6 +1354,13 @@ fn validate_sandbox(
 
     validate_argv_prepend(command_name, caller, &sandbox.argv_prepend, report);
 
+    validate_unsafe_seatbelt_rules(
+        command_name,
+        caller,
+        &sandbox.unsafe_macos_seatbelt_rules,
+        report,
+    );
+
     if let Some(network) = &sandbox.network {
         validate_network(command_name, caller, network, report);
     }
@@ -1426,6 +1445,42 @@ fn validate_argv_prepend(
             );
         }
     }
+}
+
+fn validate_unsafe_seatbelt_rules(
+    command_name: &str,
+    caller: &str,
+    rules: &[String],
+    report: &mut CommandPolicyValidationReport,
+) {
+    if rules.is_empty() {
+        return;
+    }
+    for rule in rules {
+        if rule.trim().is_empty() {
+            report.error(
+                "invalid_unsafe_seatbelt_rule",
+                format!(
+                    "command '{command_name}' from.{caller} unsafe_macos_seatbelt_rules contains an empty rule"
+                ),
+            );
+        }
+        if rule.contains('\0') {
+            report.error(
+                "invalid_unsafe_seatbelt_rule",
+                format!(
+                    "command '{command_name}' from.{caller} unsafe_macos_seatbelt_rules contains NUL"
+                ),
+            );
+        }
+    }
+    report.warning(
+        "unsafe_seatbelt_rules",
+        format!(
+            "command '{command_name}' from.{caller} sets {} raw macOS Seatbelt rule(s) via unsafe_macos_seatbelt_rules — review carefully",
+            rules.len()
+        ),
+    );
 }
 
 fn validate_invocation_policy(
@@ -2833,6 +2888,75 @@ mod tests {
         assert_eq!(open_urls.allow_origins, vec!["https://github.com"]);
         assert!(open_urls.allow_localhost);
         assert!(parsed.allow_launch_services);
+    }
+
+    #[test]
+    fn command_sandbox_unsafe_seatbelt_rules_round_trip() {
+        let json = r#"{
+            "unsafe_macos_seatbelt_rules": [
+                "(allow process-exec* (literal \"/usr/bin/security\"))"
+            ]
+        }"#;
+        let parsed: CommandSandboxConfig =
+            serde_json::from_str(json).expect("valid unsafe rules config should parse");
+        assert_eq!(
+            parsed.unsafe_macos_seatbelt_rules,
+            vec!["(allow process-exec* (literal \"/usr/bin/security\"))".to_string()]
+        );
+    }
+
+    #[test]
+    fn command_sandbox_unsafe_seatbelt_rules_omitted_when_empty() {
+        let sandbox = CommandSandboxConfig::default();
+        let value = serde_json::to_value(&sandbox).expect("serialize");
+        assert!(
+            value.get("unsafe_macos_seatbelt_rules").is_none(),
+            "empty unsafe_macos_seatbelt_rules should be omitted, got {value}"
+        );
+    }
+
+    #[test]
+    fn command_sandbox_unsafe_seatbelt_rules_merge_child_appends() {
+        let base = CommandSandboxConfig {
+            unsafe_macos_seatbelt_rules: vec!["(allow iokit-open)".to_string()],
+            ..Default::default()
+        };
+        let child = CommandSandboxConfig {
+            unsafe_macos_seatbelt_rules: vec![
+                "(allow iokit-open)".to_string(),
+                "(allow process-exec* (literal \"/usr/bin/security\"))".to_string(),
+            ],
+            ..Default::default()
+        };
+        let merged = base.merge_child(&child);
+        assert_eq!(
+            merged.unsafe_macos_seatbelt_rules,
+            vec![
+                "(allow iokit-open)".to_string(),
+                "(allow process-exec* (literal \"/usr/bin/security\"))".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn command_sandbox_unsafe_seatbelt_rules_empty_rule_errors() {
+        let mut config = active_git_config();
+        if let Some(git) = config.commands.get_mut("git") {
+            git.sandbox = Some(CommandSandboxConfig {
+                unsafe_macos_seatbelt_rules: vec!["   ".to_string()],
+                ..Default::default()
+            });
+        }
+        let report =
+            validate_command_policies(Some(&config), CommandPolicyValidationScope::Resolved);
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|finding| finding.code == "invalid_unsafe_seatbelt_rule"),
+            "expected invalid_unsafe_seatbelt_rule error, got {:?}",
+            report.errors
+        );
     }
 
     #[test]

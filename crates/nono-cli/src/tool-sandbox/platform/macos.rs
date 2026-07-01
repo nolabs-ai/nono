@@ -1893,7 +1893,25 @@ fn build_child_caps(
     add_url_open_caps(&mut caps, state, policy)?;
     add_launch_services_caps(&mut caps, policy)?;
     add_child_process_exec_gate_with_policy(&mut caps, state, binary, Some(policy))?;
+    // Append the command's opt-in raw Seatbelt rules last so they land at the
+    // tail of the generated child profile. Seatbelt evaluates last-matching-rule
+    // wins, so a rule like `(allow process-exec* (literal "/usr/bin/security"))`
+    // overrides the exec gate's earlier `(deny process-exec*)`.
+    add_unsafe_seatbelt_rules(&mut caps, policy)?;
     Ok(caps)
+}
+
+/// Append a command sandbox's opt-in raw macOS Seatbelt rules to the child's
+/// platform rules. Emitted after all generated rules so they win under
+/// last-matching-rule semantics. No-op when the list is empty.
+fn add_unsafe_seatbelt_rules(
+    caps: &mut CapabilitySet,
+    policy: &CommandSandboxConfig,
+) -> Result<()> {
+    for rule in &policy.unsafe_macos_seatbelt_rules {
+        caps.add_platform_rule(rule.clone())?;
+    }
+    Ok(())
 }
 
 /// When a command opts into direct LaunchServices (`allow_launch_services`),
@@ -4449,6 +4467,47 @@ mod tests {
         assert!(has_exec_rule(&caps, &command)?);
         assert!(has_exec_rule(&caps, &interpreter)?);
         assert!(has_exec_rule(&caps, &bundle)?);
+        Ok(())
+    }
+
+    #[test]
+    fn unsafe_seatbelt_rules_appended_after_exec_gate_deny() -> Result<()> {
+        let temp = test_tempdir()?;
+        let command = temp.path().join("tool");
+        create_executable(&command)?;
+        let binary = test_binary("tool", &command)?;
+        let state = test_state();
+
+        let policy = CommandSandboxConfig {
+            unsafe_macos_seatbelt_rules: vec![
+                "(allow process-exec* (literal \"/usr/bin/security\"))".to_string(),
+                "(allow file-read* (literal \"/usr/bin/security\"))".to_string(),
+            ],
+            ..Default::default()
+        };
+
+        let mut caps = CapabilitySet::new();
+        // Reproduce the child-caps ordering: exec gate first, then unsafe rules.
+        add_child_process_exec_gate_with_policy(&mut caps, &state, &binary, Some(&policy))?;
+        add_unsafe_seatbelt_rules(&mut caps, &policy)?;
+
+        let rules: Vec<&str> = caps.platform_rules().iter().map(|r| r.as_str()).collect();
+        let deny_idx = rules
+            .iter()
+            .position(|r| *r == "(deny process-exec*)")
+            .expect("exec gate deny present");
+        let allow_idx = rules
+            .iter()
+            .position(|r| *r == "(allow process-exec* (literal \"/usr/bin/security\"))")
+            .expect("unsafe exec allow present");
+        assert!(
+            allow_idx > deny_idx,
+            "unsafe allow (idx {allow_idx}) must come after deny (idx {deny_idx}) so it wins"
+        );
+        assert!(
+            rules.contains(&"(allow file-read* (literal \"/usr/bin/security\"))"),
+            "unsafe file-read rule should be present"
+        );
         Ok(())
     }
 

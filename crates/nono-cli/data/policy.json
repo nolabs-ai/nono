@@ -375,6 +375,14 @@
         ]
       }
     },
+    "bun_runtime": {
+      "description": "Bun javascript runtime and package manager paths",
+      "allow": {
+        "read": [
+          "~/.bun"
+        ]
+      }
+    },
     "opencode_linux": {
       "description": "OpenCode binary directory (Landlock requires directory read to execute binaries)",
       "platform": "linux",

@@ -55,6 +55,7 @@ pub mod manifest_convert;
 pub mod net_filter;
 pub mod path;
 pub mod query;
+pub mod resource;
 pub mod sandbox;
 pub mod scrub;
 pub mod state;
@@ -83,6 +84,7 @@ pub use keystore::{
 };
 pub use net_filter::{FilterResult, HostFilter};
 pub use path::try_canonicalize;
+pub use resource::ResourceLimits;
 #[cfg(target_os = "linux")]
 pub use sandbox::{
     DetectedAbi, LandlockScopePolicy, SeccompOpts, detect_abi, is_wsl2, landlock_scope_policy,

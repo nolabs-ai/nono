@@ -5,6 +5,9 @@ static PASSTHROUGH_INTERCEPT_ACTION: crate::command_policy::InterceptActionConfi
 pub(super) struct ResolvedInterceptAction<'a> {
     pub(super) action: &'a crate::command_policy::InterceptActionConfig,
     pub(super) rule_args: Option<&'a [String]>,
+    /// Per-rule sandbox override for this matched invocation (passthrough).
+    /// `None` for the fallthrough and rules without an override.
+    pub(super) sandbox: Option<&'a crate::command_policy::CommandSandboxConfig>,
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -13,6 +16,7 @@ impl<'a> ResolvedInterceptAction<'a> {
         Self {
             action: &PASSTHROUGH_INTERCEPT_ACTION,
             rule_args: None,
+            sandbox: None,
         }
     }
 
@@ -38,6 +42,7 @@ pub(super) fn resolve_intercept_action<'a>(
             return ResolvedInterceptAction {
                 action: &rule.action,
                 rule_args: Some(&rule.args),
+                sandbox: rule.sandbox.as_ref(),
             };
         }
         if shim_args.len() >= rule.args.len()
@@ -50,6 +55,7 @@ pub(super) fn resolve_intercept_action<'a>(
             return ResolvedInterceptAction {
                 action: &rule.action,
                 rule_args: Some(&rule.args),
+                sandbox: rule.sandbox.as_ref(),
             };
         }
     }
@@ -483,6 +489,7 @@ mod intercept_tests {
             intercept: vec![InterceptRuleConfig {
                 args: vec!["push".to_string(), "--force".to_string()],
                 action: InterceptActionConfig::Approve { timeout_secs: None },
+                sandbox: None,
             }],
             ..CommandPolicyConfig::default()
         };
@@ -503,6 +510,7 @@ mod intercept_tests {
             intercept: vec![InterceptRuleConfig {
                 args: Vec::new(),
                 action: InterceptActionConfig::Approve { timeout_secs: None },
+                sandbox: None,
             }],
             ..CommandPolicyConfig::default()
         };
@@ -515,6 +523,40 @@ mod intercept_tests {
             resolved.action,
             InterceptActionConfig::Approve { .. }
         ));
+    }
+
+    #[test]
+    fn resolve_intercept_action_exposes_rule_sandbox_override() {
+        let override_sandbox = CommandSandboxConfig {
+            use_credentials: vec!["github".to_string()],
+            ..CommandSandboxConfig::default()
+        };
+        let config = CommandPolicyConfig {
+            intercept: vec![
+                InterceptRuleConfig {
+                    args: vec!["with-override".to_string()],
+                    action: InterceptActionConfig::Passthrough,
+                    sandbox: Some(override_sandbox.clone()),
+                },
+                InterceptRuleConfig {
+                    args: vec!["no-override".to_string()],
+                    action: InterceptActionConfig::Passthrough,
+                    sandbox: None,
+                },
+            ],
+            ..CommandPolicyConfig::default()
+        };
+
+        let with = resolve_intercept_action(&config, &[b"git".to_vec(), b"with-override".to_vec()]);
+        assert_eq!(with.sandbox, Some(&override_sandbox));
+
+        let without =
+            resolve_intercept_action(&config, &[b"git".to_vec(), b"no-override".to_vec()]);
+        assert_eq!(without.sandbox, None);
+
+        // Fallthrough (no matching rule) also has no override.
+        let fallthrough = resolve_intercept_action(&config, &[b"git".to_vec(), b"other".to_vec()]);
+        assert_eq!(fallthrough.sandbox, None);
     }
 
     #[test]

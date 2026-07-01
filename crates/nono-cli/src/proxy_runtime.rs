@@ -2481,6 +2481,11 @@ mod tests {
         CommandCredentialGrantPolicyConfig, CommandPolicyConfig, EndpointRuleConfig,
     };
 
+    // Shared across all tests that dup/dup2 the process's stdin fd, so two such tests
+    // never race on fd 0 when cargo runs them concurrently.
+    #[cfg(unix)]
+    static STDIN_MANIPULATION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[cfg(unix)]
     #[test]
     fn set_intercept_ca_dir_permissions_fails_closed() -> Result<()> {
@@ -3526,9 +3531,7 @@ mod tests {
     fn capture_helper_with_stdio_true_receives_null_not_terminal_stdin() -> Result<()> {
         use nix::libc;
 
-        // Serialize stdin manipulation across concurrent test threads.
-        static STDIN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = STDIN_LOCK
+        let _guard = STDIN_MANIPULATION_LOCK
             .lock()
             .map_err(|e| NonoError::SandboxInit(format!("stdin lock poisoned: {e}")))?;
 
@@ -3609,8 +3612,7 @@ mod tests {
     fn capture_helper_with_interaction_stdin_true_inherits_terminal_stdin() -> Result<()> {
         use nix::libc;
 
-        static STDIN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = STDIN_LOCK
+        let _guard = STDIN_MANIPULATION_LOCK
             .lock()
             .map_err(|e| NonoError::SandboxInit(format!("stdin lock poisoned: {e}")))?;
 

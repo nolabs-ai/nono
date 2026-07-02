@@ -4,6 +4,7 @@
 //! a sandboxed process can access.
 
 use crate::error::{NonoError, Result};
+use crate::resource::ResourceLimits;
 use serde::{Deserialize, Serialize};
 use std::path::{Component, Path, PathBuf};
 
@@ -914,6 +915,10 @@ pub struct CapabilitySet {
     /// When set, the generated Seatbelt profile emits `(debug deny)` so
     /// sandboxd records denial events in the unified log.
     seatbelt_debug_deny: bool,
+    /// Resource ceilings (currently memory) for the sandboxed tree. Plumbed
+    /// through here so they ride the serialization layer like other policy;
+    /// enforced by the supervisor via cgroup v2 on Linux.
+    resource_limits: Option<ResourceLimits>,
 }
 
 impl CapabilitySet {
@@ -1015,6 +1020,22 @@ impl CapabilitySet {
     pub fn set_network_mode(mut self, mode: NetworkMode) -> Self {
         self.network_mode = mode;
         self
+    }
+
+    /// Attach resource ceilings (currently memory) to the set (builder pattern).
+    ///
+    /// The limits are carried through serialization, surfaced in `--dry-run`,
+    /// and enforced by the supervisor via cgroup v2 on Linux.
+    #[must_use]
+    pub fn with_resource_limits(mut self, limits: ResourceLimits) -> Self {
+        self.resource_limits = Some(limits);
+        self
+    }
+
+    /// Resource ceilings attached to this set, if any.
+    #[must_use]
+    pub fn resource_limits(&self) -> Option<&ResourceLimits> {
+        self.resource_limits.as_ref()
     }
 
     /// Restrict network to localhost proxy port only (builder pattern)
@@ -3474,5 +3495,45 @@ mod tests {
         assert!(summary.contains("connect+bind"));
         assert!(summary.contains("file"));
         assert!(summary.contains("dir"));
+    }
+
+    // ---- Resource-limit builder ----
+
+    #[test]
+    fn capabilityset_with_and_get_resource_limits_roundtrip() {
+        use crate::resource::ResourceLimits;
+
+        let caps = CapabilitySet::new();
+        assert!(
+            caps.resource_limits().is_none(),
+            "a fresh set has no limits"
+        );
+
+        let limits = ResourceLimits {
+            memory_bytes: Some(512 * 1024 * 1024),
+        };
+        let caps = caps.with_resource_limits(limits);
+        let got = caps.resource_limits().expect("limits attached");
+        assert_eq!(*got, limits);
+        assert_eq!(got.memory_bytes, Some(512 * 1024 * 1024));
+    }
+
+    #[test]
+    fn with_resource_limits_last_call_wins() {
+        use crate::resource::ResourceLimits;
+
+        // The builder overwrites rather than merges: the final call's ceiling is
+        // the one that sticks (Option assignment, not accumulation).
+        let caps = CapabilitySet::new()
+            .with_resource_limits(ResourceLimits {
+                memory_bytes: Some(1024),
+            })
+            .with_resource_limits(ResourceLimits {
+                memory_bytes: Some(2048),
+            });
+        assert_eq!(
+            caps.resource_limits().and_then(|l| l.memory_bytes),
+            Some(2048)
+        );
     }
 }

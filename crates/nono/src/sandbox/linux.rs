@@ -397,12 +397,12 @@ fn can_use_seccomp_network_block_fallback(caps: &CapabilitySet) -> bool {
 /// QEMU virtfs, and other Plan 9 mounts. The 9P driver does not implement the
 /// LSM inode hooks that Landlock relies on, so `PathBeneath` rules for these
 /// paths are accepted by the kernel but silently have no enforcement effect.
-const V9FS_MAGIC: libc::c_long = 0x0102_1997;
+const V9FS_MAGIC: u64 = 0x0102_1997;
 
 /// Return `true` if `f_type` (from `statfs::f_type`) identifies a filesystem
 /// that does not support Landlock enforcement.
 #[inline]
-fn fs_type_unsupported(f_type: libc::c_long) -> bool {
+fn fs_type_unsupported(f_type: u64) -> bool {
     f_type == V9FS_MAGIC
 }
 
@@ -435,7 +435,7 @@ fn unsupported_filesystem_dev(path: &Path) -> Option<u64> {
             return None;
         }
         let stat = buf.assume_init();
-        if fs_type_unsupported(stat.f_type) {
+        if fs_type_unsupported(stat.f_type as u64) {
             // fsid_t.__val is private; transmute the 8-byte struct to u64 for dedup.
             Some(std::mem::transmute::<libc::fsid_t, u64>(stat.f_fsid))
         } else {
@@ -507,17 +507,6 @@ fn requested_scopes(caps: &CapabilitySet, abi: &DetectedAbi) -> Result<BitFlags<
     Ok(scopes)
 }
 
-/// Declare that sandboxing is managed externally (e.g. iptables, cgroups, systemd).
-///
-/// This is an explicit opt-out: the caller asserts that enforcement is handled
-/// at the infrastructure level and nono should not install Landlock or seccomp.
-/// Using this incorrectly provides no sandboxing — the call is intentionally
-/// visible in code review.
-pub fn apply_external() -> Result<()> {
-    info!("Sandbox policy: external — no Landlock or seccomp installed by nono");
-    Ok(())
-}
-
 /// Apply Landlock-only sandboxing with the given capabilities, auto-detecting ABI.
 ///
 /// If the kernel Landlock ABI does not support network filtering and network
@@ -532,7 +521,38 @@ pub fn apply_landlock(caps: &CapabilitySet) -> Result<()> {
 ///
 /// Same contract as `apply_landlock` but avoids re-probing the kernel ABI.
 pub fn apply_landlock_with_abi(caps: &CapabilitySet, abi: &DetectedAbi) -> Result<()> {
-    apply_with_abi_inner(caps, abi, false).map(|_| ())
+    apply_with_abi_inner(caps, abi, TcpNetworkEnforcement::LandlockOnly).map(|_| ())
+}
+
+/// Apply Landlock filesystem/process sandboxing and use seccomp for TCP
+/// network fallback according to `opts`.
+///
+/// This is not a seccomp-only sandbox. Filesystem and process isolation always
+/// remain Landlock-enforced; `opts` controls only nono-managed TCP network
+/// handling when Landlock networking is unavailable or intentionally delegated.
+pub fn apply_seccomp(caps: &CapabilitySet, opts: SeccompOpts) -> Result<SeccompNetFallback> {
+    let detected = detect_abi()?;
+    apply_seccomp_with_abi(caps, &detected, opts)
+}
+
+/// Apply Landlock filesystem/process sandboxing and seccomp-controlled TCP
+/// handling with a pre-detected ABI.
+pub fn apply_seccomp_with_abi(
+    caps: &CapabilitySet,
+    abi: &DetectedAbi,
+    opts: SeccompOpts,
+) -> Result<SeccompNetFallback> {
+    apply_with_abi_inner(caps, abi, opts.tcp_network.into())
+}
+
+/// Declare that TCP network enforcement is managed externally.
+///
+/// This function intentionally installs no kernel policy. It exists only as an
+/// explicit marker for callers that have already applied the normal filesystem
+/// and process sandbox and are delegating TCP egress lockdown to infrastructure.
+pub fn apply_external() -> Result<()> {
+    info!("TCP network enforcement delegated externally");
+    Ok(())
 }
 
 /// Apply sandboxing with automatic Landlock → seccomp fallback, auto-detecting ABI.
@@ -548,23 +568,22 @@ pub fn apply_auto(caps: &CapabilitySet) -> Result<SeccompNetFallback> {
 
 /// Apply sandboxing with automatic fallback and a pre-detected ABI.
 pub fn apply_auto_with_abi(caps: &CapabilitySet, abi: &DetectedAbi) -> Result<SeccompNetFallback> {
-    apply_with_abi_inner(caps, abi, true)
+    apply_with_abi_inner(caps, abi, TcpNetworkEnforcement::AutoSeccompFallback)
 }
 
 /// Internal implementation shared by all public `apply_*` entry points.
-///
-/// `allow_seccomp_fallback`: when `false`, returns an error if Landlock cannot
-/// satisfy network restrictions rather than silently installing seccomp.
 fn apply_with_abi_inner(
     caps: &CapabilitySet,
     abi: &DetectedAbi,
-    allow_seccomp_fallback: bool,
+    tcp_network: TcpNetworkEnforcement,
 ) -> Result<SeccompNetFallback> {
     let target_abi = abi.abi;
     info!("Using Landlock ABI {:?}", target_abi);
     let scopes = requested_scopes(caps, abi)?;
 
-    if !matches!(caps.network_mode(), NetworkMode::AllowAll) && caps.localhost_ports().contains(&0)
+    if tcp_network.handles_tcp()
+        && !matches!(caps.network_mode(), NetworkMode::AllowAll)
+        && caps.localhost_ports().contains(&0)
     {
         return Err(NonoError::SandboxInit(
             "open_port 0 (localhost TCP wildcard) is macOS-only; on Linux use explicit ports or a network profile."
@@ -588,16 +607,19 @@ fn apply_with_abi_inner(
         .set_compatibility(CompatLevel::BestEffort);
 
     // Determine if we need network handling (any mode besides AllowAll)
-    let needs_network_handling = !matches!(caps.network_mode(), NetworkMode::AllowAll)
-        || !caps.tcp_connect_ports().is_empty()
-        || !caps.tcp_bind_ports().is_empty();
+    let needs_network_handling = tcp_network.handles_tcp()
+        && (!matches!(caps.network_mode(), NetworkMode::AllowAll)
+            || !caps.tcp_connect_ports().is_empty()
+            || !caps.tcp_bind_ports().is_empty());
 
     let mut seccomp_net_fallback = SeccompNetFallback::None;
+    let mut landlock_network_active = false;
 
     let ruleset_builder = if needs_network_handling {
         let handled_net = AccessNet::from_all(target_abi);
         if !handled_net.is_empty() {
             debug!("Handling network access: {:?}", handled_net);
+            landlock_network_active = true;
             ruleset_builder
                 .set_compatibility(CompatLevel::HardRequirement)
                 .handle_access(handled_net)
@@ -608,7 +630,7 @@ fn apply_with_abi_inner(
                     ))
                 })?
                 .set_compatibility(CompatLevel::BestEffort)
-        } else if allow_seccomp_fallback {
+        } else if tcp_network.allows_seccomp_fallback() {
             // Landlock ABI lacks AccessNet. Check seccomp fallback options.
             let fallback = seccomp_network_fallback_mode(caps);
             match &fallback {
@@ -650,6 +672,11 @@ fn apply_with_abi_inner(
             )));
         }
     } else {
+        if !tcp_network.handles_tcp() {
+            info!(
+                "TCP network enforcement delegated externally; applying filesystem and process sandbox only"
+            );
+        }
         ruleset_builder
     };
 
@@ -688,7 +715,7 @@ fn apply_with_abi_inner(
     // Add Landlock network port rules ONLY when Landlock is handling networking.
     // When a seccomp fallback is active (BlockAll or ProxyOnly), the ruleset was
     // created without handle_access(AccessNet), so adding NetPort rules would fail.
-    if matches!(seccomp_net_fallback, SeccompNetFallback::None) {
+    if landlock_network_active {
         // Add per-port TCP connect rules (ProxyOnly port + explicit tcp_connect_ports)
         if let NetworkMode::ProxyOnly { port, bind_ports } = caps.network_mode() {
             debug!("Adding ProxyOnly TCP connect rule for port {}", port);
@@ -1888,6 +1915,70 @@ pub enum SeccompNetFallback {
         /// Ports to allow bind() on (e.g. MCP servers).
         bind_ports: Vec<u16>,
     },
+}
+
+/// Options for `apply_seccomp`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SeccompOpts {
+    tcp_network: SeccompTcpNetwork,
+}
+
+impl SeccompOpts {
+    /// Apply Landlock filesystem/process sandboxing and use seccomp as the
+    /// network fallback when Landlock lacks TCP filtering support.
+    #[must_use]
+    pub fn network_fallback() -> Self {
+        Self {
+            tcp_network: SeccompTcpNetwork::Fallback,
+        }
+    }
+
+    /// Apply Landlock filesystem/process sandboxing, but skip nono-managed TCP
+    /// network enforcement because the deployment enforces egress externally.
+    #[must_use]
+    pub fn external_tcp() -> Self {
+        Self {
+            tcp_network: SeccompTcpNetwork::External,
+        }
+    }
+}
+
+impl Default for SeccompOpts {
+    fn default() -> Self {
+        Self::network_fallback()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SeccompTcpNetwork {
+    Fallback,
+    External,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TcpNetworkEnforcement {
+    LandlockOnly,
+    AutoSeccompFallback,
+    External,
+}
+
+impl TcpNetworkEnforcement {
+    fn handles_tcp(self) -> bool {
+        !matches!(self, Self::External)
+    }
+
+    fn allows_seccomp_fallback(self) -> bool {
+        matches!(self, Self::AutoSeccompFallback)
+    }
+}
+
+impl From<SeccompTcpNetwork> for TcpNetworkEnforcement {
+    fn from(value: SeccompTcpNetwork) -> Self {
+        match value {
+            SeccompTcpNetwork::Fallback => Self::AutoSeccompFallback,
+            SeccompTcpNetwork::External => Self::External,
+        }
+    }
 }
 
 /// Determine the seccomp network fallback mode for the given capabilities.
@@ -3650,6 +3741,17 @@ mod tests {
     }
 
     #[test]
+    fn test_seccomp_opts_external_tcp_disables_only_tcp_handling() {
+        let fallback: TcpNetworkEnforcement = SeccompOpts::network_fallback().tcp_network.into();
+        assert!(fallback.handles_tcp());
+        assert!(fallback.allows_seccomp_fallback());
+
+        let external: TcpNetworkEnforcement = SeccompOpts::external_tcp().tcp_network.into();
+        assert!(!external.handles_tcp());
+        assert!(!external.allows_seccomp_fallback());
+    }
+
+    #[test]
     fn test_legacy_can_use_seccomp_block_fallback() {
         // BlockAll => true
         assert!(can_use_seccomp_network_block_fallback(
@@ -4418,9 +4520,9 @@ mod tests {
 
     #[test]
     fn test_fs_type_unsupported_known_supported_types() {
-        const EXT4_MAGIC: libc::c_long = 0xEF53;
-        const TMPFS_MAGIC: libc::c_long = 0x0102_1994;
-        const PROC_MAGIC: libc::c_long = 0x9FA0;
+        const EXT4_MAGIC: u64 = 0xEF53;
+        const TMPFS_MAGIC: u64 = 0x0102_1994;
+        const PROC_MAGIC: u64 = 0x9FA0;
         assert!(!fs_type_unsupported(EXT4_MAGIC));
         assert!(!fs_type_unsupported(TMPFS_MAGIC));
         assert!(!fs_type_unsupported(PROC_MAGIC));

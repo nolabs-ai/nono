@@ -19,8 +19,8 @@ use crate::tool_sandbox::protocol::{
     StdioStreamLimitSpec, TOOL_SANDBOX_LAUNCH_SPEC_ENV, TOOL_SANDBOX_SHIM_DIR_ENV,
     TOOL_SANDBOX_SOCKET_ENV, TOOL_SANDBOX_URL_IO_TIMEOUT, ToolSandboxChildLaunchSpec,
     ToolSandboxOpenUrlRequest, ToolSandboxOpenUrlResponse, ToolSandboxShimRequest,
-    ToolSandboxShimResponse, UnixSocketGrantSpec, read_frame, recv_stdio_fds, send_stdio_fds,
-    validate_ipc_request, write_frame, write_response,
+    ToolSandboxShimResponse, UnixSocketGrantSpec, read_frame, recv_frame_ack, recv_stdio_fds,
+    send_frame_ack, send_stdio_fds, validate_ipc_request, write_frame, write_response,
 };
 use nix::libc;
 use nono::supervisor::ApprovalRequest;
@@ -618,6 +618,7 @@ fn run_shim() -> Result<()> {
         ))
     })?;
     write_frame(&mut stream, &request)?;
+    recv_frame_ack(&mut stream)?;
     send_stdio_fds(&stream)?;
     let response: ToolSandboxShimResponse = read_frame(&mut stream)?;
 
@@ -881,6 +882,11 @@ fn handle_shim_stream_inner(
 ) -> Result<(i32, Vec<u8>)> {
     let auth = authenticate_shim(stream, state)?;
     let request: ToolSandboxShimRequest = read_frame(stream)?;
+    // Ack before receiving stdio FDs: on macOS, sendmsg with SCM_RIGHTS ancillary
+    // data returns EMSGSIZE if the peer's receive buffer still holds unread frame
+    // bytes. Sending the ack proves the buffer is drained so the shim's sendmsg
+    // can always queue its ancillary data atomically.
+    send_frame_ack(stream)?;
     validate_ipc_request(&request)?;
     if request.command != auth.command {
         return Err(NonoError::SandboxInit(format!(
@@ -2254,19 +2260,19 @@ fn add_policy_fs(
     policy_root: &Path,
 ) -> Result<()> {
     use super::dynamic_providers::expand_dynamic_tokens;
-    for entry in &expand_dynamic_tokens(&policy.fs_read)? {
+    for entry in &expand_dynamic_tokens(&policy.fs_read, Some(policy_root))? {
         let path = resolve_policy_path(entry, policy_root)?;
         add_optional_dir(caps, path, AccessMode::Read)?;
     }
-    for entry in &expand_dynamic_tokens(&policy.fs_write)? {
+    for entry in &expand_dynamic_tokens(&policy.fs_write, Some(policy_root))? {
         let path = resolve_policy_path(entry, policy_root)?;
         add_optional_dir(caps, path, AccessMode::ReadWrite)?;
     }
-    for entry in &expand_dynamic_tokens(&policy.fs_read_file)? {
+    for entry in &expand_dynamic_tokens(&policy.fs_read_file, Some(policy_root))? {
         let path = resolve_policy_path(entry, policy_root)?;
         add_optional_read_file(caps, path)?;
     }
-    for entry in &expand_dynamic_tokens(&policy.fs_write_file)? {
+    for entry in &expand_dynamic_tokens(&policy.fs_write_file, Some(policy_root))? {
         let path = resolve_policy_path(entry, policy_root)?;
         caps.add_fs(FsCapability::new_file(path, AccessMode::ReadWrite)?);
     }

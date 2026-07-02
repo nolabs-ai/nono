@@ -20,8 +20,8 @@ use crate::tool_sandbox::protocol::{
     StdioStreamLimitSpec, TOOL_SANDBOX_LAUNCH_SPEC_ENV, TOOL_SANDBOX_SHIM_DIR_ENV,
     TOOL_SANDBOX_SOCKET_ENV, TOOL_SANDBOX_URL_IO_TIMEOUT, ToolSandboxChildLaunchSpec,
     ToolSandboxOpenUrlRequest, ToolSandboxOpenUrlResponse, ToolSandboxShimRequest,
-    ToolSandboxShimResponse, UnixSocketGrantSpec, read_frame, recv_stdio_fds, send_stdio_fds,
-    validate_ipc_request, write_frame, write_response,
+    ToolSandboxShimResponse, UnixSocketGrantSpec, read_frame, recv_frame_ack, recv_stdio_fds,
+    send_frame_ack, send_stdio_fds, validate_ipc_request, write_frame, write_response,
 };
 use landlock::{
     AccessFs, CompatLevel, Compatible, PathBeneath, PathFd, Ruleset, RulesetAttr,
@@ -777,6 +777,7 @@ fn run_shim() -> Result<()> {
     let start_send = std::time::Instant::now();
     send_shim_identity_fd(&stream, &shim_exe)?;
     write_frame(&mut stream, &request)?;
+    recv_frame_ack(&mut stream)?;
     send_stdio_fds(&stream)?;
     tool_sandbox_profile_log!(
         "shim:send_request: {:?} (entry-to-request: {:?})",
@@ -1211,6 +1212,7 @@ fn handle_shim_stream_inner(
     let peer_pid = peer_credentials(stream.as_raw_fd())?.pid;
     let shim_fd = recv_fd_via_socket(stream.as_raw_fd())?;
     let request: ToolSandboxShimRequest = read_frame(stream)?;
+    send_frame_ack(stream)?;
     validate_ipc_request(&request)?;
     let auth = authenticate_shim(peer_pid, shim_fd, &request.command, state)?;
     let stdio = recv_stdio_fds(stream)?;
@@ -2907,7 +2909,7 @@ fn send_fd_via_socket(socket_fd: RawFd, fd_to_send: RawFd) -> Result<()> {
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
     msg.msg_control = control.as_mut_ptr().cast();
-    msg.msg_controllen = control.len();
+    msg.msg_controllen = control.len() as MsgControlLen;
 
     unsafe {
         let cmsg = msg.msg_control.cast::<libc::cmsghdr>();
@@ -2940,7 +2942,7 @@ fn recv_fd_via_socket(socket_fd: RawFd) -> Result<OwnedFd> {
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
     msg.msg_control = control.as_mut_ptr().cast();
-    msg.msg_controllen = control.len();
+    msg.msg_controllen = control.len() as MsgControlLen;
 
     let received = unsafe { libc::recvmsg(socket_fd, &mut msg, 0) };
     if received < 0 {
@@ -2956,7 +2958,7 @@ fn recv_fd_via_socket(socket_fd: RawFd) -> Result<OwnedFd> {
     }
 
     let cmsg = msg.msg_control.cast::<libc::cmsghdr>();
-    if msg.msg_controllen < std::mem::size_of::<libc::cmsghdr>()
+    if msg.msg_controllen < std::mem::size_of::<libc::cmsghdr>() as MsgControlLen
         || unsafe { (*cmsg).cmsg_level } != libc::SOL_SOCKET
         || unsafe { (*cmsg).cmsg_type } != libc::SCM_RIGHTS
         || unsafe { (*cmsg).cmsg_len } < cmsg_len(std::mem::size_of::<RawFd>())
@@ -2975,6 +2977,14 @@ fn recv_fd_via_socket(socket_fd: RawFd) -> Result<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
+// msghdr::msg_controllen and cmsghdr::cmsg_len are usize on glibc and u32 on
+// musl. This alias lets the cmsg helpers compile correctly on both without
+// per-site casts.
+#[cfg(target_env = "musl")]
+type MsgControlLen = u32;
+#[cfg(not(target_env = "musl"))]
+type MsgControlLen = usize;
+
 fn cmsg_align(len: usize) -> usize {
     let align = std::mem::size_of::<usize>();
     (len + align - 1) & !(align - 1)
@@ -2984,8 +2994,8 @@ fn cmsg_space(data_len: usize) -> usize {
     cmsg_align(std::mem::size_of::<libc::cmsghdr>()) + cmsg_align(data_len)
 }
 
-fn cmsg_len(data_len: usize) -> usize {
-    cmsg_align(std::mem::size_of::<libc::cmsghdr>()) + data_len
+fn cmsg_len(data_len: usize) -> MsgControlLen {
+    (cmsg_align(std::mem::size_of::<libc::cmsghdr>()) + data_len) as MsgControlLen
 }
 
 unsafe fn cmsg_data(cmsg: *mut libc::cmsghdr) -> *mut u8 {
@@ -3227,19 +3237,19 @@ fn add_policy_fs(
     policy_root: &Path,
 ) -> Result<()> {
     use super::dynamic_providers::expand_dynamic_tokens;
-    for entry in &expand_dynamic_tokens(&policy.fs_read)? {
+    for entry in &expand_dynamic_tokens(&policy.fs_read, Some(policy_root))? {
         let path = resolve_policy_path(entry, policy_root)?;
         add_optional_dir(caps, path, AccessMode::Read)?;
     }
-    for entry in &expand_dynamic_tokens(&policy.fs_write)? {
+    for entry in &expand_dynamic_tokens(&policy.fs_write, Some(policy_root))? {
         let path = resolve_policy_path(entry, policy_root)?;
         add_optional_dir(caps, path, AccessMode::ReadWrite)?;
     }
-    for entry in &expand_dynamic_tokens(&policy.fs_read_file)? {
+    for entry in &expand_dynamic_tokens(&policy.fs_read_file, Some(policy_root))? {
         let path = resolve_policy_path(entry, policy_root)?;
         add_optional_read_file(caps, path)?;
     }
-    for entry in &expand_dynamic_tokens(&policy.fs_write_file)? {
+    for entry in &expand_dynamic_tokens(&policy.fs_write_file, Some(policy_root))? {
         let path = resolve_policy_path(entry, policy_root)?;
         caps.add_fs(FsCapability::new_file(path, AccessMode::ReadWrite)?);
     }
@@ -4288,7 +4298,7 @@ fn apply_terminal_winsize(stdin_fd: i32, pty_master_fd: i32, last: &mut Option<(
         return;
     }
     unsafe {
-        libc::ioctl(pty_master_fd, libc::TIOCSWINSZ as libc::c_ulong, &ws);
+        libc::ioctl(pty_master_fd, libc::TIOCSWINSZ, &ws);
     }
     *last = Some(current);
 }

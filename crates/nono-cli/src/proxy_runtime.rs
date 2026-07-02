@@ -197,7 +197,12 @@ impl ProxyCredentialCaptureBackend {
                 name.clone(),
                 ResolvedCredentialCaptureEntry {
                     command_path,
-                    args: entry.command.iter().skip(1).cloned().collect(),
+                    args: entry
+                        .command
+                        .iter()
+                        .skip(1)
+                        .map(|a| crate::policy::expand_env_vars(a))
+                        .collect(),
                     timeout: Duration::from_secs(entry.timeout_secs.unwrap_or(5)),
                     ttl: Duration::from_secs(
                         entry.cache_ttl_secs.or(entry.ttl_secs).unwrap_or(900),
@@ -1113,6 +1118,8 @@ fn redacted_stderr(stderr: &[u8], policy: &nono::ScrubPolicy) -> Option<String> 
 }
 
 fn resolve_capture_command(command: &str) -> Result<PathBuf> {
+    let expanded = crate::policy::expand_env_vars(command);
+    let command = expanded.as_str();
     let path = PathBuf::from(command);
     if path.is_absolute() {
         return validate_capture_command_path(path);
@@ -2504,11 +2511,10 @@ mod tests {
         CommandCredentialGrantPolicyConfig, CommandPolicyConfig, EndpointRuleConfig,
     };
 
-    // Shared across all tests that replace the process-wide STDIN_FILENO. A per-test
-    // `static` mutex would not serialize tests against each other, letting them stomp
-    // on the same fd concurrently (causing dup() failures and capture timeouts).
+    // Shared across all tests that dup/dup2 the process's stdin fd, so two such tests
+    // never race on fd 0 when cargo runs them concurrently.
     #[cfg(unix)]
-    static STDIN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static STDIN_MANIPULATION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[cfg(unix)]
     #[test]
@@ -2704,8 +2710,12 @@ mod tests {
             af_unix_mediation: crate::profile::LinuxAfUnixMediation::Off,
             #[cfg(target_os = "linux")]
             sandbox_policy: crate::profile::LinuxSandboxPolicy::Auto,
+            #[cfg(target_os = "linux")]
+            explicit_sandbox_policy: None,
             allow_launch_services_active: false,
             allow_gpu_active: false,
+            #[cfg(target_os = "linux")]
+            proc_comm_notify: false,
             open_url_origins: Vec::new(),
             open_url_allow_localhost: false,
             bypass_protection_paths: Vec::new(),
@@ -3551,8 +3561,7 @@ mod tests {
     fn capture_helper_with_stdio_true_receives_null_not_terminal_stdin() -> Result<()> {
         use nix::libc;
 
-        // Serialize stdin manipulation across concurrent test threads.
-        let _guard = STDIN_LOCK
+        let _guard = STDIN_MANIPULATION_LOCK
             .lock()
             .map_err(|e| NonoError::SandboxInit(format!("stdin lock poisoned: {e}")))?;
 
@@ -3633,7 +3642,7 @@ mod tests {
     fn capture_helper_with_interaction_stdin_true_inherits_terminal_stdin() -> Result<()> {
         use nix::libc;
 
-        let _guard = STDIN_LOCK
+        let _guard = STDIN_MANIPULATION_LOCK
             .lock()
             .map_err(|e| NonoError::SandboxInit(format!("stdin lock poisoned: {e}")))?;
 

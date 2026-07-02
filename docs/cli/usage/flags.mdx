@@ -189,6 +189,14 @@ Compare against an existing profile to show only missing paths.
 nono learn --profile always-further/opencode -- opencode
 ```
 
+### `--extends`
+
+Compose the selected `--profile` with an additional base profile for this comparison. Repeatable; bases are applied left-to-right before any `extends` already declared by the selected profile. Requires `--profile`.
+
+```bash
+nono learn --profile my-agent --extends linux-host-compat -- my-agent
+```
+
 ### `--json`
 
 Output discovered paths as a JSON fragment suitable for a profile.
@@ -654,6 +662,24 @@ Can be specified multiple times for multiple ports.
 **Linux limitation:** Landlock ABI v4+ enforces both connect and bind per-port, but **cannot filter by destination IP**. The ConnectTcp rule allows connecting to the specified port on any IP, not just localhost. In practice this is mitigated by using `--block-net` (which blocks all outbound except the allowed ports) or proxy mode (which routes outbound through the localhost proxy). Only the `--open-port` + default AllowAll combination (a no-op) would theoretically permit non-localhost connections on the port.
 </Warning>
 
+### Resource Limits
+
+#### `--memory`
+
+Cap the resident memory of the sandboxed process tree. If the tree goes over, the Linux kernel kills the whole sandbox at once (the run exits `137`) and nono prints a diagnostic naming the limit and the peak the tree reached.
+
+```bash
+nono run --memory 512M -- my-agent
+```
+
+Sizes take an optional unit suffix: `512M`/`512MiB` (binary, 1024-based), `512MB` (decimal, 1000-based), and `K`/`G`/`T` likewise; a bare number is bytes.
+
+- **Linux only**, enforced via cgroup v2, and requires a systemd `Delegate=yes` user session. On other platforms the request is refused rather than silently ignored.
+- Enforced on `nono run` and `nono shell` (supervised). `nono wrap` execs directly and does not accept `--memory`.
+- Granting the sandbox **write** access overlapping `/sys/fs/cgroup` (e.g. `--allow /sys`) is refused while `--memory` is active, since it would let the process rewrite its own cap. Use `--read /sys` instead if a workload needs it.
+
+See [Resource Limits](/cli/features/resource-limits) for the full details.
+
 ## `nono shell` Options
 
 `nono shell` supports the same permission, profile, credential, and dry-run flags as `nono run`, plus:
@@ -816,6 +842,19 @@ Use a named profile (from installed packs or `~/.config/nono/profiles/`).
 nono run --profile always-further/claude -- claude
 nono run -p openclaw -- openclaw gateway
 ```
+
+#### `--extends`
+
+Extend the selected profile with an additional base profile for one invocation. Repeatable; bases are merged left-to-right, then any `extends` already in the selected profile is resolved, and the selected profile remains the final override layer.
+
+```bash
+nono run --profile my-agent \
+  --extends linux-host-compat \
+  --extends extra-git \
+  -- my-agent
+```
+
+This is equivalent to temporarily prepending those bases to the profile JSON's `extends` field. It requires `--profile` and conflicts with `--config`. Inherited filesystem and network grants can widen sandbox permissions, so treat each base profile as explicit policy input.
 
 #### `--workdir`
 
@@ -1170,24 +1209,24 @@ Profiles can set this via `capability_elevation` in their security config. The C
 |-------|-----------|
 | `auto` | Landlock LSM with automatic seccomp fallback when the kernel ABI lacks network support (< v4). **Default.** Preserves existing behaviour. |
 | `landlock` | Landlock only. Returns an error at startup if the running kernel cannot satisfy network restrictions via Landlock alone — no silent seccomp fallback. |
-| `external` | No-op. nono installs no Landlock or seccomp rules. Use when enforcement is managed at the infrastructure level (iptables, cgroups, systemd units, container runtime policy). |
+| `external` | Delegate TCP network lockdown to the deployment. nono still installs filesystem/process sandboxing, but skips its own localhost/proxy-port network enforcement. Use only when infrastructure such as iptables, cgroups, systemd units, or container policy forces egress through the proxy. |
 
 ```bash
 # Require Landlock-only enforcement; fail if the kernel can't satisfy it
 nono run --sandbox-policy landlock --allow-cwd -- my-agent
 
-# Declare that enforcement is external; nono skips sandbox installation
+# Declare that network enforcement is external; nono still applies FS/process sandboxing
 nono run --sandbox-policy external --allow-cwd -- my-agent
 ```
 
-The policy can also be set in a profile under `linux.sandbox_policy`. The CLI flag overrides the profile value. On macOS and other non-Linux platforms this flag is not available.
+The policy can also be set in a profile under `linux.sandbox_policy`. The CLI flag overrides the profile value. This setting is supported only by `nono run`; `nono shell` and `nono wrap` reject profiles that contain `linux.sandbox_policy`. On macOS and other non-Linux platforms this flag is not available.
 
 <Note>
   `--sandbox-policy landlock` is useful for compliance contexts where you need a hard guarantee that seccomp BPF is not installed, or where you want to verify that the target kernel's Landlock ABI is sufficient before deploying to production.
 </Note>
 
 <Warning>
-  `--sandbox-policy external` provides no kernel-level enforcement on its own. Only use it when you have independently verified that the surrounding infrastructure enforces the required policy.
+  `--sandbox-policy external` provides no nono-managed TCP egress lockdown. Only use it when you have independently verified that the surrounding infrastructure forces outbound traffic through the intended proxy.
 </Warning>
 
 ### Operational Flags
@@ -1366,6 +1405,7 @@ Available context flags:
 - `--block-net` - Block network access
 - `--allow-net` - Force unrestricted network access for this run
 - `--profile`, `-p` - Use a named profile
+- `--extends` - Add repeatable base profiles to the selected profile for this query (requires `--profile`)
 - `--workdir` - Working directory for `$WORKDIR` expansion
 
 ## `nono trust` Options

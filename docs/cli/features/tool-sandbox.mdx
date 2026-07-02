@@ -100,9 +100,12 @@ Supported tokens:
 
 | Token | Use in | Expands to |
 |---|---|---|
-| `@git:config-files` | `fs_read_file` | Trusted global/system Git config files and configured Git file paths, such as attributes, excludes, and commit template files. |
+| `@git:config-files` | `fs_read_file` | Trusted global/system Git config files and configured Git file paths (attributes, excludes, commit templates), plus the declared target of every `include.path` and `includeIf.*.path` directive in those scopes — including conditional includes that do not currently fire. |
 | `@git:hooks-path` | `fs_read` | Trusted global/system `core.hooksPath` directories. |
 | `@git:common-dir` | `fs_write`, `fs_read` | The git common directory: `.git` in a regular repo, or the absolute path to the main repo's `.git` when running inside a git worktree. Useful in `fs_write` when the agent session starts from a worktree and `--workdir` points to the worktree itself — the token ensures the git object store (which lives in the main repo) is covered. |
+| `@git:worktree` | `fs_read`, `fs_write` | The main worktree root (parent of `@git:common-dir`). Empty in a regular repo; in a linked worktree it is the absolute path to the main repo root. `git worktree add` changes CWD to the main repo root, so without this `getcwd()` fails with EPERM. |
+| `@git:toplevel` | `fs_read`, `fs_write` | Absolute path of the current checkout root (`git rev-parse --show-toplevel`). In a linked worktree this is the worktree's own root, not the main repo. |
+| `@git:toplevel-parent` | `fs_write` | Parent directory of `@git:toplevel`. Required for `git worktree add ../sibling`, where the new worktree is created adjacent to the current checkout. |
 
 Example:
 
@@ -124,7 +127,9 @@ Example:
 
 The Git provider reads `git config --list --show-origin --show-scope` and keeps only `global` and `system` scoped paths. It ignores `local` and `worktree` scopes so a repository cannot grant itself additional host filesystem access through `.git/config`. If `git` is unavailable or returns no matching paths, the token expands to no paths.
 
-The `@git:common-dir` token runs `git rev-parse --git-common-dir` from nono's working directory at sandbox-prepare time. In a regular repo it returns `.git` (relative, resolved against `$WORKDIR`). In a worktree it returns the absolute path to the main repo's `.git`. If git is unavailable or the process is not inside a repo, the token expands to no paths.
+The `@git:common-dir` token runs `git rev-parse --git-common-dir` from nono's working directory at sandbox-prepare time. In a regular repo it returns `.git` (relative, resolved against `$WORKDIR`). In a worktree it returns the absolute path to the main repo's `.git`. If git is unavailable or the process is not inside a repo, the token expands to no paths. The `@git:worktree`, `@git:toplevel`, and `@git:toplevel-parent` tokens are derived from the same git invocations and behave the same way when git is unavailable.
+
+`@git:config-files` expands to the config files git reads in the current context, plus the declared target of every `include.path` and `includeIf.*.path` directive in trusted `global` and `system` scopes — including conditional includes whose condition does not currently fire (e.g. a `hasconfig:remote.*.url` rule that only matches certain repositories). A conditional include that is false now is still grantable because a later git operation — such as `git worktree add` for a repo with a matching remote — may make the condition fire. Like the other git tokens it keeps only `global` and `system` scopes; per-repo `.git/config` entries are not trusted.
 
 `network` accepts these values:
 

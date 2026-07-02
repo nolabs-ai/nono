@@ -55,6 +55,11 @@ Inherit from another profile by name:
 ```
 
 - Inheritance chain max depth: 10.
+- The CLI `--extends <PROFILE>` flag composes a selected `--profile` for one
+  invocation. It is repeatable and prepends its bases to the profile JSON's
+  `extends` list, preserving left-to-right merge order while keeping the
+  selected profile as the final override layer. Inherited grants can widen
+  sandbox permissions.
 - Scalar fields: child overrides base.
 - Array fields (`groups.include`, `groups.exclude`, `commands.allow`, `commands.deny`, `filesystem.*`, `allow_domain`, `open_port`, `listen_port`, `rollback.*`, `upstream_bypass`): child values are appended to base values and deduplicated. To remove inherited entries, use `groups.exclude` for groups; there is no mechanism to remove inherited filesystem paths. For `allow_domain` entries with endpoint rules, rules for the same domain are merged (appended) rather than replaced.
 - Map fields (`env_credentials`, `hooks`, `custom_credentials`): child entries are merged into base; child keys override matching base keys.
@@ -84,7 +89,7 @@ Controls startup-time command gating. These checks run only at launch time and a
 
 tool-sandbox policies live under `command_policies`. Use `commands.<name>.executable` to bind a command name to one exact executable file instead of the first PATH match. By default, tool-sandbox rejects pinned executables and direct parent directories that are writable through the outer sandbox capability set. If a low-assurance profile intentionally grants write access overlapping a pinned executable, `commands.<name>.allow_writable_executable` is available as a per-command trust downgrade. It is valid only with an absolute `executable` path; relative paths and bare command names fail validation. For local demos, `command_policies.allow_writable_executables` disables the writable executable and parent-directory trust check across policy, deny-only, and outer executable allow-list paths. The agent still invokes the command name through the tool-sandbox shim. On macOS, tool-sandbox verifies the file before sandboxing but must still exec by path, so sandbox-writable pinned executables are not suitable for high-assurance policies.
 
-Command sandbox path lists (`fs_read`, `fs_write`, `fs_read_file`, `fs_write_file`) may use dynamic provider tokens. `@git:config-files` expands to trusted global/system Git config files and Git file settings such as attributes, excludes, and commit templates. `@git:hooks-path` expands to trusted global/system `core.hooksPath` directories. These tokens are opt-in per profile and ignore repo-local/worktree Git config so a checkout cannot grant itself extra host filesystem access.
+Command sandbox path lists (`fs_read`, `fs_write`, `fs_read_file`, `fs_write_file`) may use dynamic provider tokens. `@git:config-files` expands to trusted global/system Git config files, Git file settings (attributes, excludes, commit templates), and the declared target of every `include.path` and `includeIf.*.path` directive — including conditional includes that do not currently fire. `@git:hooks-path` expands to trusted global/system `core.hooksPath` directories. `@git:common-dir` expands to the git common directory (`.git` in a regular repo, or the absolute path to the main repo's `.git` in a worktree). `@git:worktree` expands to the main worktree root (empty in a regular repo). `@git:toplevel` expands to the current checkout root. `@git:toplevel-parent` expands to the parent of the current checkout root. These tokens are opt-in per profile and ignore repo-local/worktree Git config so a checkout cannot grant itself extra host filesystem access.
 
 ```json
 {

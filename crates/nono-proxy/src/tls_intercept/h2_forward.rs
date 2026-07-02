@@ -1369,13 +1369,16 @@ mod tests {
     }
 
     /// Regression test for the h1/h2 AWS divergence: an `aws_auth` route is
-    /// gated identically on both protocols. SigV4 signing is not implemented,
-    /// so the request must be rejected (501) rather than forwarded upstream
+    /// gated identically on both protocols. SigV4 signing is not implemented on
+    /// h2, so the request must be rejected (501) rather than forwarded upstream
     /// unsigned. Before the shared `resolve_managed_credential`, the h2 path had
     /// no AWS branch and would forward the request without a signature.
+    ///
+    /// Fake AWS env vars are set for the duration of credential loading so the
+    /// default credential chain succeeds and `get_aws()` returns `Some(...)`,
+    /// letting the 501 stub in `resolve_managed_credential` be reached.
     #[tokio::test]
     async fn h2_forward_rejects_aws_route_without_forwarding() {
-        use crate::config::AwsAuthConfig;
         use std::time::Duration;
 
         let ca = Arc::new(EphemeralCa::generate().unwrap());
@@ -1383,7 +1386,7 @@ mod tests {
 
         let tls_connector = h2_tls_connector_trusting(ca.cert_pem());
 
-        // Route configured for AWS SigV4 (signing not yet implemented).
+        // Route configured for AWS SigV4 (h2 signing not yet implemented).
         let routes = vec![RouteConfig {
             prefix: "aws-svc".to_string(),
             upstream: format!("https://localhost:{}", upstream_port),
@@ -1404,10 +1407,31 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             oauth2: None,
-            aws_auth: Some(AwsAuthConfig::default()),
+            aws_auth: Some(crate::config::AwsAuthConfig {
+                profile: None,
+                region: Some("us-east-1".to_string()),
+                service: Some("bedrock".to_string()),
+            }),
             endpoint_policy: None,
         }];
         let route_store = RouteStore::load(&routes).unwrap();
+        // Set fake AWS credential env vars so the default chain succeeds and
+        // load_with_diagnostics inserts the AwsRoute. The mutex lock is dropped
+        // before the await point (holding a MutexGuard across an await is a
+        // compile error); the EnvVarGuard outlives the await so it restores the
+        // vars after load completes.
+        let _env = {
+            let _lock = crate::test_env::ENV_LOCK
+                .lock()
+                .expect("env mutex poisoned");
+            crate::test_env::EnvVarGuard::set_all(&[
+                ("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE"),
+                (
+                    "AWS_SECRET_ACCESS_KEY",
+                    "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+                ),
+            ])
+        };
         let credential_store = CredentialStore::load_with_diagnostics(&routes, &tls_connector)
             .await
             .unwrap()

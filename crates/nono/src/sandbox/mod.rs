@@ -32,7 +32,7 @@ pub use linux::is_wsl2;
 #[cfg(target_os = "linux")]
 pub use linux::{
     OpenHow, SYS_BIND, SYS_CONNECT, SYS_OPENAT, SYS_OPENAT2, SYS_SENDMMSG, SYS_SENDMSG, SYS_SENDTO,
-    SeccompData, SeccompNetFallback, SeccompNotif, SockaddrInfo, UnixSocketKind,
+    SeccompData, SeccompNetFallback, SeccompNotif, SeccompOpts, SockaddrInfo, UnixSocketKind,
     classify_access_from_flags, classify_af_unix, continue_notif, deny_notif, inject_fd,
     install_seccomp_af_unix_filter, install_seccomp_notify, install_seccomp_proxy_filter,
     notif_id_valid, probe_seccomp_block_network_support, read_mmsghdr_dests, read_msghdr_dest,
@@ -126,10 +126,33 @@ impl Sandbox {
         linux::apply_landlock_with_abi(caps, abi)
     }
 
-    /// Declare that sandboxing is managed externally (Linux).
+    /// Apply Landlock filesystem/process sandboxing and seccomp TCP fallback (Linux).
     ///
-    /// No-op: nono installs no Landlock or seccomp rules. The caller asserts
-    /// that enforcement is handled at the infrastructure level.
+    /// Filesystem/process sandboxing is always Landlock-enforced. `opts`
+    /// controls only nono-managed TCP network fallback/delegation.
+    #[cfg(target_os = "linux")]
+    pub fn apply_seccomp(
+        caps: &CapabilitySet,
+        opts: linux::SeccompOpts,
+    ) -> Result<linux::SeccompNetFallback> {
+        linux::apply_seccomp(caps, opts)
+    }
+
+    /// Apply Landlock filesystem/process sandboxing and seccomp TCP fallback
+    /// with a pre-detected ABI (Linux).
+    #[cfg(target_os = "linux")]
+    pub fn apply_seccomp_with_abi(
+        caps: &CapabilitySet,
+        abi: &DetectedAbi,
+        opts: linux::SeccompOpts,
+    ) -> Result<linux::SeccompNetFallback> {
+        linux::apply_seccomp_with_abi(caps, abi, opts)
+    }
+
+    /// Declare that TCP network enforcement is handled externally (Linux).
+    ///
+    /// This is intentionally a no-op marker. It must not be used as the whole
+    /// `nono run` sandbox; filesystem/process sandboxing is applied separately.
     #[cfg(target_os = "linux")]
     pub fn apply_external() -> Result<()> {
         linux::apply_external()

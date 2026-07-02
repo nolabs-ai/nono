@@ -37,6 +37,10 @@
     "rollback": {
       "$ref": "#/$defs/Rollback",
       "description": "Rollback snapshot configuration controlling which files are excluded from undo snapshots."
+    },
+    "resources": {
+      "$ref": "#/$defs/Resources",
+      "description": "Resource ceilings for the sandboxed process tree (currently memory), enforced by the supervisor. Requires exec_strategy: \"supervised\"."
     }
   },
   "$defs": {
@@ -350,6 +354,18 @@
           "type": "array",
           "items": { "type": "string" },
           "description": "Glob patterns to exclude from rollback snapshots."
+        }
+      }
+    },
+    "Resources": {
+      "type": "object",
+      "description": "Resource ceilings for the sandboxed process tree. Values are plain integers (bytes, counts) so the manifest is a fully-resolved machine contract; human-friendly sizes (e.g. '512M') are parsed only at the CLI. additionalProperties is false: this is a security object, so an unknown or misspelled key is a hard error rather than a silently-dropped limit.",
+      "additionalProperties": false,
+      "properties": {
+        "memory_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Maximum resident memory for the process tree, in bytes. Enforced via cgroup memory.max together with memory.swap.max=0 and memory.oom.group=1."
         }
       }
     }

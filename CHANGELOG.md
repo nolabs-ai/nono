@@ -64,6 +64,8 @@
 
 ### Features
 
+- *(profile)* Add repeatable `--extends <PROFILE>` support for profile-consuming commands, allowing one invocation to compose a selected `--profile` with additional base profiles ([#956](https://github.com/nolabs-ai/nono/issues/956))
+
 - *(tool-sandbox)* Add `@git:common-dir` dynamic token: expands to the git common directory (`.git` in a regular repo; the main repo's `.git` when running inside a worktree). Use in `fs_write` to cover the object store when the agent session starts from a worktree and `--workdir` points to the worktree itself ([#1270](https://github.com/nolabs-ai/nono/issues/1270))
 
 ### Bug Fixes

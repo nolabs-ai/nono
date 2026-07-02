@@ -3,8 +3,12 @@
 //! All colors are drawn from the active theme via `theme::current()`.
 
 use crate::command_display::format_command_line;
+#[cfg(target_os = "linux")]
+use crate::resource_cgroup::OomReport;
 use crate::theme::{self, Rgb, badge, fg};
 use colored::Colorize;
+#[cfg(target_os = "linux")]
+use nono::resource::format_bytes;
 use nono::{AccessMode, CapabilitySet, NetworkMode, NonoError, Result};
 use std::ffi::{OsStr, OsString};
 use std::io::{BufRead, IsTerminal, Write};
@@ -67,6 +71,23 @@ pub fn print_capabilities(
 
     eprintln!("  {}", theme::fg("Capabilities:", t.subtext).bold());
     rule();
+
+    // Resource limits: shown here; enforcement happens in the supervised runtime.
+    // Spell out that it's a hard cap so the user knows a breach kills the run,
+    // not just throttles it.
+    if let Some(limits) = caps.resource_limits()
+        && !limits.is_empty()
+    {
+        eprintln!(
+            "  {} {} {}",
+            theme::fg("resources", t.yellow).bold(),
+            theme::fg(&limits.summary(), t.subtext),
+            theme::fg(
+                "(hard cap — the process tree is killed if it exceeds this)",
+                t.subtext
+            ),
+        );
+    }
 
     // Filesystem capabilities
     let fs_caps = caps.fs_capabilities();
@@ -636,6 +657,70 @@ pub fn format_startup_blocked(
 pub fn print_diagnostic_footer(footer: &str) {
     let rendered = render_diagnostic_footer(footer);
     print_terminal_block(&rendered, true);
+}
+
+/// Explain that the kernel OOM-killed the sandbox for exceeding its `--memory`
+/// ceiling.
+///
+/// Without this a memory-cap kill surfaces only as a bare SIGKILL (exit 137),
+/// so the run looks like it died for no reason. We name the limit, the peak the
+/// tree reached, and how to relax it. Suppressed under `--silent`.
+#[cfg(target_os = "linux")]
+pub fn print_oom_diagnostic(report: &OomReport, silent: bool) {
+    if silent {
+        return;
+    }
+    let t = theme::current();
+    let emit = crate::startup_prompt::print_terminal_safe_stderr;
+
+    // A labelled row: indented, the label padded on the plain text before
+    // coloring so values line up despite the invisible ANSI escapes.
+    let row = |label: &str, value: &str| {
+        emit(&format!(
+            "       {} {}",
+            fg(&format!("{label:<17}"), t.subtext),
+            fg(value, t.text),
+        ));
+    };
+
+    emit(&format!(
+        "{} {}",
+        fg("[nono] memory limit exceeded:", t.red).bold(),
+        fg(
+            "the sandboxed process tree was killed by the kernel for using too much memory.",
+            t.text,
+        ),
+    ));
+    let limit = report
+        .limit_bytes
+        .map_or_else(|| "unset".to_string(), format_bytes);
+    row("limit (--memory):", &limit);
+    if let Some(peak) = report.peak_bytes {
+        row("peak memory:", &format_bytes(peak));
+    }
+    row(
+        "OOM kills:",
+        &format!(
+            "{} (whole-sandbox kills: {})",
+            report.oom_kills, report.oom_group_kills
+        ),
+    );
+    row(
+        "swap:",
+        "disabled (memory.swap.max=0) — nothing could spill to swap",
+    );
+    row(
+        "scope:",
+        "the whole sandbox was killed together (memory.oom.group=1)",
+    );
+    emit(&format!(
+        "       {} {}",
+        fg("hint:", t.yellow).bold(),
+        fg(
+            "raise the ceiling to allow more memory, e.g. --memory 1G.",
+            t.text,
+        ),
+    ));
 }
 
 /// Print skipped CLI path grants in a user-facing format.

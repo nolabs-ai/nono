@@ -14,6 +14,8 @@ pub(crate) struct PreparedProfile {
     pub(crate) af_unix_mediation: profile::LinuxAfUnixMediation,
     #[cfg(target_os = "linux")]
     pub(crate) sandbox_policy: profile::LinuxSandboxPolicy,
+    #[cfg(target_os = "linux")]
+    pub(crate) explicit_sandbox_policy: Option<profile::LinuxSandboxPolicy>,
     pub(crate) workdir_access: Option<profile::WorkdirAccess>,
     pub(crate) rollback_exclude_patterns: Vec<String>,
     pub(crate) rollback_exclude_globs: Vec<String>,
@@ -530,7 +532,7 @@ fn prepare_profile_with_options(
         // The claude-code → registry-pack migration is wired into
         // `load_profile` itself so it fires from every call site (run,
         // wrap, shell, profile show, why, learn) without duplication.
-        let profile = profile::load_profile(profile_name)?;
+        let profile = profile::load_profile_with_extends(profile_name, &args.extends)?;
         crate::package_status::enforce_for_active_profile(
             Some(profile_name),
             options.hook_output_silent,
@@ -607,6 +609,10 @@ fn prepare_profile_with_options(
             .as_ref()
             .and_then(|profile| profile.linux.sandbox_policy)
             .unwrap_or_default(),
+        #[cfg(target_os = "linux")]
+        explicit_sandbox_policy: loaded_profile
+            .as_ref()
+            .and_then(|profile| profile.linux.sandbox_policy),
         workdir_access: loaded_profile
             .as_ref()
             .map(|profile| profile.workdir.access.clone()),

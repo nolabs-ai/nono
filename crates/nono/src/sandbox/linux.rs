@@ -435,7 +435,7 @@ fn unsupported_filesystem_dev(path: &Path) -> Option<u64> {
             return None;
         }
         let stat = buf.assume_init();
-        if fs_type_unsupported(stat.f_type) {
+        if fs_type_unsupported(stat.f_type as u64) {
             // fsid_t.__val is private; transmute the 8-byte struct to u64 for dedup.
             Some(std::mem::transmute::<libc::fsid_t, u64>(stat.f_fsid))
         } else {

@@ -2909,7 +2909,7 @@ fn send_fd_via_socket(socket_fd: RawFd, fd_to_send: RawFd) -> Result<()> {
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
     msg.msg_control = control.as_mut_ptr().cast();
-    msg.msg_controllen = control.len();
+    msg.msg_controllen = control.len() as u32;
 
     unsafe {
         let cmsg = msg.msg_control.cast::<libc::cmsghdr>();
@@ -2942,7 +2942,7 @@ fn recv_fd_via_socket(socket_fd: RawFd) -> Result<OwnedFd> {
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
     msg.msg_control = control.as_mut_ptr().cast();
-    msg.msg_controllen = control.len();
+    msg.msg_controllen = control.len() as u32;
 
     let received = unsafe { libc::recvmsg(socket_fd, &mut msg, 0) };
     if received < 0 {
@@ -2958,7 +2958,7 @@ fn recv_fd_via_socket(socket_fd: RawFd) -> Result<OwnedFd> {
     }
 
     let cmsg = msg.msg_control.cast::<libc::cmsghdr>();
-    if msg.msg_controllen < std::mem::size_of::<libc::cmsghdr>()
+    if msg.msg_controllen < std::mem::size_of::<libc::cmsghdr>() as u32
         || unsafe { (*cmsg).cmsg_level } != libc::SOL_SOCKET
         || unsafe { (*cmsg).cmsg_type } != libc::SCM_RIGHTS
         || unsafe { (*cmsg).cmsg_len } < cmsg_len(std::mem::size_of::<RawFd>())
@@ -2986,8 +2986,8 @@ fn cmsg_space(data_len: usize) -> usize {
     cmsg_align(std::mem::size_of::<libc::cmsghdr>()) + cmsg_align(data_len)
 }
 
-fn cmsg_len(data_len: usize) -> usize {
-    cmsg_align(std::mem::size_of::<libc::cmsghdr>()) + data_len
+fn cmsg_len(data_len: usize) -> u32 {
+    (cmsg_align(std::mem::size_of::<libc::cmsghdr>()) + data_len) as u32
 }
 
 unsafe fn cmsg_data(cmsg: *mut libc::cmsghdr) -> *mut u8 {
@@ -4290,7 +4290,7 @@ fn apply_terminal_winsize(stdin_fd: i32, pty_master_fd: i32, last: &mut Option<(
         return;
     }
     unsafe {
-        libc::ioctl(pty_master_fd, libc::TIOCSWINSZ as libc::c_ulong, &ws);
+        libc::ioctl(pty_master_fd, libc::TIOCSWINSZ, &ws);
     }
     *last = Some(current);
 }

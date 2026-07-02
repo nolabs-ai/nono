@@ -2909,7 +2909,7 @@ fn send_fd_via_socket(socket_fd: RawFd, fd_to_send: RawFd) -> Result<()> {
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
     msg.msg_control = control.as_mut_ptr().cast();
-    msg.msg_controllen = control.len() as u32;
+    msg.msg_controllen = control.len() as MsgControlLen;
 
     unsafe {
         let cmsg = msg.msg_control.cast::<libc::cmsghdr>();
@@ -2942,7 +2942,7 @@ fn recv_fd_via_socket(socket_fd: RawFd) -> Result<OwnedFd> {
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
     msg.msg_control = control.as_mut_ptr().cast();
-    msg.msg_controllen = control.len() as u32;
+    msg.msg_controllen = control.len() as MsgControlLen;
 
     let received = unsafe { libc::recvmsg(socket_fd, &mut msg, 0) };
     if received < 0 {
@@ -2958,7 +2958,7 @@ fn recv_fd_via_socket(socket_fd: RawFd) -> Result<OwnedFd> {
     }
 
     let cmsg = msg.msg_control.cast::<libc::cmsghdr>();
-    if msg.msg_controllen < std::mem::size_of::<libc::cmsghdr>() as u32
+    if msg.msg_controllen < std::mem::size_of::<libc::cmsghdr>() as MsgControlLen
         || unsafe { (*cmsg).cmsg_level } != libc::SOL_SOCKET
         || unsafe { (*cmsg).cmsg_type } != libc::SCM_RIGHTS
         || unsafe { (*cmsg).cmsg_len } < cmsg_len(std::mem::size_of::<RawFd>())
@@ -2977,6 +2977,14 @@ fn recv_fd_via_socket(socket_fd: RawFd) -> Result<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
+// msghdr::msg_controllen and cmsghdr::cmsg_len are usize on glibc and u32 on
+// musl. This alias lets the cmsg helpers compile correctly on both without
+// per-site casts.
+#[cfg(target_env = "musl")]
+type MsgControlLen = u32;
+#[cfg(not(target_env = "musl"))]
+type MsgControlLen = usize;
+
 fn cmsg_align(len: usize) -> usize {
     let align = std::mem::size_of::<usize>();
     (len + align - 1) & !(align - 1)
@@ -2986,8 +2994,8 @@ fn cmsg_space(data_len: usize) -> usize {
     cmsg_align(std::mem::size_of::<libc::cmsghdr>()) + cmsg_align(data_len)
 }
 
-fn cmsg_len(data_len: usize) -> u32 {
-    (cmsg_align(std::mem::size_of::<libc::cmsghdr>()) + data_len) as u32
+fn cmsg_len(data_len: usize) -> MsgControlLen {
+    (cmsg_align(std::mem::size_of::<libc::cmsghdr>()) + data_len) as MsgControlLen
 }
 
 unsafe fn cmsg_data(cmsg: *mut libc::cmsghdr) -> *mut u8 {

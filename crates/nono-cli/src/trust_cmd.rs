@@ -123,7 +123,7 @@ fn run_init(args: TrustInitArgs) -> Result<()> {
     };
 
     let policy = serde_json::json!({
-        "version": 1,
+        "predicate": nono::trust::TRUST_POLICY_PREDICATE,
         "includes": patterns,
         "publishers": publishers,
         "blocklist": {

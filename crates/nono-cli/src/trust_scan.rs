@@ -29,6 +29,51 @@ use std::path::{Path, PathBuf};
 ///
 /// Returns `NonoError::TrustPolicy` if a found policy file is malformed, or
 /// `NonoError::TrustVerification` if signature verification fails.
+/// Load a trust policy from `path`, returning `None` if the file exists but
+/// lacks the nono predicate field (i.e. is a foreign JSON file).
+fn load_nono_policy(path: &Path) -> Result<Option<TrustPolicy>> {
+    let content = std::fs::read_to_string(path).map_err(nono::NonoError::Io)?;
+
+    // Check for the predicate field before attempting full deserialization.
+    // Foreign JSON files (e.g. AWS IAM policies) share the filename but lack
+    // the predicate, and may also be missing required nono fields — attempting
+    // a full parse would produce a confusing error rather than a clean skip.
+    let raw: serde_json::Value = serde_json::from_str(&content).map_err(|e| {
+        nono::NonoError::TrustPolicy(format!("failed to parse {}: {e}", path.display()))
+    })?;
+
+    match raw.get("predicate").and_then(|v| v.as_str()) {
+        None => {
+            eprintln!(
+                "  {}",
+                format!(
+                    "Warning: {} has no predicate field — skipping. This is probably not a nono trust policy. If it is, recreate it with 'nono trust init --force'.",
+                    path.display()
+                )
+                .yellow()
+            );
+            return Ok(None);
+        }
+        Some(p) if p != nono::trust::TRUST_POLICY_PREDICATE => {
+            eprintln!(
+                "  {}",
+                format!(
+                    "Warning: {} has an unrecognised predicate '{}' — skipping. Expected '{}'.",
+                    path.display(),
+                    p,
+                    nono::trust::TRUST_POLICY_PREDICATE
+                )
+                .yellow()
+            );
+            return Ok(None);
+        }
+        Some(_) => {}
+    }
+
+    let policy = trust::load_policy_from_str(&content)?;
+    Ok(Some(policy))
+}
+
 pub fn load_scan_policy(
     root: &Path,
     trust_override: bool,
@@ -37,20 +82,19 @@ pub fn load_scan_policy(
     let cwd_policy = root.join("trust-policy.json");
     let project_policy_path = cwd_policy.exists().then_some(cwd_policy);
 
-    let project = if let Some(ref policy_path) = project_policy_path {
-        Some(trust::load_policy_from_file(policy_path)?)
-    } else {
-        None
-    };
+    let project = project_policy_path
+        .as_deref()
+        .map(load_nono_policy)
+        .transpose()?
+        .flatten();
 
     let user_path = crate::trust_cmd::user_trust_policy_path();
     let user_policy_path = user_path.as_ref().filter(|path| path.exists());
 
-    let user = if let Some(path) = user_policy_path {
-        Some(trust::load_policy_from_file(path)?)
-    } else {
-        None
-    };
+    let user = user_policy_path
+        .map(|p| load_nono_policy(p.as_path()))
+        .transpose()?
+        .flatten();
 
     let effective = match (user, project) {
         (Some(u), Some(p)) => trust::merge_policies(&[u, p]),
@@ -1124,6 +1168,16 @@ fn format_identity(identity: &trust::SignerIdentity) -> String {
 mod tests {
     use super::*;
 
+    fn write_test_policy(path: &std::path::Path, includes: &[&str], enforcement: Enforcement) {
+        let policy = TrustPolicy {
+            includes: includes.iter().map(|s| s.to_string()).collect(),
+            enforcement,
+            ..TrustPolicy::default()
+        };
+        let json = serde_json::to_string(&policy).unwrap();
+        std::fs::write(path, json).unwrap();
+    }
+
     #[test]
     fn scan_empty_dir_returns_empty_result() {
         let dir = tempfile::tempdir().unwrap();
@@ -1349,11 +1403,11 @@ mod tests {
         )]);
 
         // Create a policy file with no .bundle — should still load with trust_override=true
-        std::fs::write(
-            dir.path().join("trust-policy.json"),
-            r#"{"version":1,"includes":["SKILLS*","CLAUDE*"],"publishers":[],"blocklist":{"digests":[],"publishers":[]},"enforcement":"warn"}"#,
-        )
-        .unwrap();
+        write_test_policy(
+            &dir.path().join("trust-policy.json"),
+            &["SKILLS*", "CLAUDE*"],
+            Enforcement::Warn,
+        );
 
         let policy = load_scan_policy(dir.path(), true, &[]).unwrap();
         assert_eq!(policy.enforcement, Enforcement::Warn);
@@ -1377,13 +1431,7 @@ mod tests {
         std::fs::write(scan_dir.path().join("notes.arbitrary"), "unsigned").unwrap();
 
         let project_policy_path = scan_dir.path().join("trust-policy.json");
-        std::fs::write(
-            &project_policy_path,
-            format!(
-                r#"{{"version":1,"includes":["{include_pattern}"],"publishers":[],"blocklist":{{"digests":[],"publishers":[]}},"enforcement":"warn"}}"#
-            ),
-        )
-        .unwrap();
+        write_test_policy(&project_policy_path, &[include_pattern], Enforcement::Warn);
 
         let policy = load_scan_policy(scan_dir.path(), false, &[]).unwrap();
         assert!(policy.includes.contains(&include_pattern.to_string()));

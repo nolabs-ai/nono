@@ -47,8 +47,12 @@ pub(crate) fn load_nono_policy(path: &Path) -> Result<Option<TrustPolicy>> {
             eprintln!(
                 "  {}",
                 format!(
-                    "Warning: {} has no predicate field — skipping. This is probably not a nono trust policy. If it is, recreate it with 'nono trust init --force'.",
-                    path.display()
+                    "Warning: {} has no predicate field — skipping. \
+                     This is probably not a nono trust policy. \
+                     If it is, add `\"predicate\": \"{}\"` as the first field \
+                     or recreate it with 'nono trust init --force'.",
+                    path.display(),
+                    nono::trust::TRUST_POLICY_PREDICATE,
                 )
                 .yellow()
             );

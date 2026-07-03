@@ -1163,6 +1163,11 @@ pub(crate) fn resolve_policy_exec_helpers(
             };
             let expanded = crate::policy::expand_env_vars_strict(helper_raw)?;
             let helper_path = PathBuf::from(&expanded);
+            if !helper_path.is_absolute() {
+                return Err(nono::NonoError::ProfileParse(format!(
+                    "command '{command_name}' intercept rule {rule_index} exec helper must be an absolute path; got '{expanded}'"
+                )));
+            }
             if helpers.contains_key(&helper_path) {
                 continue;
             }
@@ -4088,6 +4093,16 @@ mod tests {
         let resolved = helpers.get(&helper).expect("helper resolved");
         assert!(!resolved.sha256.is_empty());
         assert!(resolved.canonical_path.is_absolute());
+    }
+
+    #[test]
+    fn resolve_policy_exec_helpers_rejects_relative_helper() {
+        let config = git_config_with_exec(vec!["relative/helper".to_string()]);
+        let err = resolve_policy_exec_helpers(&config).expect_err("must reject relative helper");
+        assert!(
+            err.to_string().contains("absolute path"),
+            "expected absolute-path rejection, got: {err}"
+        );
     }
 
     #[test]

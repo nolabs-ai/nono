@@ -80,6 +80,12 @@ pub(super) fn resolve_exec_command(
         nono::NonoError::SandboxInit("tool-sandbox exec action has empty command".to_string())
     })?;
     let helper_path = std::path::PathBuf::from(crate::policy::expand_env_vars_strict(helper_raw)?);
+    if !helper_path.is_absolute() {
+        return Err(nono::NonoError::SandboxInit(format!(
+            "tool-sandbox exec helper must be an absolute path; got '{}'",
+            helper_path.display()
+        )));
+    }
     let mut extra_args = Vec::with_capacity(command.len().saturating_sub(1));
     for arg in command.iter().skip(1) {
         extra_args.push(crate::policy::expand_env_vars_strict(arg)?.into_bytes());
@@ -789,5 +795,10 @@ mod intercept_tests {
     #[test]
     fn resolve_exec_command_rejects_empty_command() {
         assert!(resolve_exec_command(&[]).is_err());
+    }
+
+    #[test]
+    fn resolve_exec_command_rejects_relative_helper() {
+        assert!(resolve_exec_command(&["relative/helper".to_string()]).is_err());
     }
 }

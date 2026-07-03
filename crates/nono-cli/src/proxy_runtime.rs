@@ -98,9 +98,6 @@ pub(crate) fn prepare_proxy_launch_options(
         None
     };
 
-    let approval_mode =
-        resolve_network_approval_mode(args, prepared.profile_network_approval_mode.as_deref());
-
     let endpoint_filter = if !endpoint_entries.is_empty() {
         debug_assert!(
             endpoint_entries
@@ -182,11 +179,6 @@ pub(crate) fn prepare_proxy_launch_options(
         ),
         profile_name: args.profile.clone(),
         network_block: prepared.network_block_requested,
-        network_approval_mode: approval_mode,
-        network_approval_timeout_secs: resolve_approval_timeout_secs(
-            prepared.profile_network_approval_timeout_secs,
-        ),
-        profile_name: args.profile.clone(),
     };
 
     // Infra-only flags make no sense without an activating proxy feature.

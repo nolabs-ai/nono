@@ -21,11 +21,12 @@ use nix::libc;
 use nix::sys::signal::{self, Signal};
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::{ForkResult, Pid, fork};
-use nono::supervisor::{ApprovalDecision, AuditEntry, SupervisorMessage, SupervisorResponse};
+use nono::supervisor::{
+    ApprovalDecision, AuditEntry, SupervisorListener, SupervisorMessage, SupervisorResponse,
+};
 use nono::{
     ApprovalBackend, CapabilitySet, DenialReason, DenialRecord, NonoError, Result, Sandbox,
-    SessionDiagnosticReport, SupervisorListener, SupervisorSocket, UnixSocketCapability,
-    UnixSocketMode,
+    SessionDiagnosticReport, SupervisorSocket, UnixSocketCapability, UnixSocketMode,
 };
 use std::collections::HashSet;
 use std::ffi::{CString, OsStr};

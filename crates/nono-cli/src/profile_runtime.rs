@@ -38,8 +38,6 @@ pub(crate) struct PreparedProfile {
     /// when the profile has no `set_vars`. Values are expanded with
     /// [`profile::expand_vars`] at prepare time.
     pub(crate) set_vars: Option<Vec<(String, String)>>,
-    pub(crate) network_approval_mode: Option<String>,
-    pub(crate) network_approval_timeout_secs: Option<u64>,
 }
 
 #[derive(Clone, Copy)]
@@ -716,12 +714,6 @@ fn prepare_profile_with_options(
             .as_ref()
             .and_then(|profile| profile.network.approval_timeout_secs),
         set_vars: expand_profile_set_vars(loaded_profile.as_ref(), workdir)?,
-        network_approval_mode: loaded_profile
-            .as_ref()
-            .and_then(|profile| profile.network.approval_mode.clone()),
-        network_approval_timeout_secs: loaded_profile
-            .as_ref()
-            .and_then(|profile| profile.network.approval_timeout_secs),
         loaded_profile,
     })
 }

@@ -86,6 +86,7 @@ pub async fn handle_connect_with_approval(
             audit::log_denied(
                 ctx.audit_log,
                 audit::ProxyMode::Connect,
+                &audit::EventContext::default(),
                 &host,
                 port,
                 &reason,
@@ -99,6 +100,7 @@ pub async fn handle_connect_with_approval(
         audit::log_allowed(
             ctx.audit_log,
             audit::ProxyMode::Connect,
+            &audit::EventContext::default(),
             &host,
             port,
             "CONNECT",
@@ -111,6 +113,7 @@ pub async fn handle_connect_with_approval(
     if matches!(
         primary_check.result,
         nono::net_filter::FilterResult::DenyHost { .. }
+            | nono::net_filter::FilterResult::DenyLinkLocal { .. }
     ) {
         let reason = primary_check.result.reason();
         debug!(
@@ -120,6 +123,7 @@ pub async fn handle_connect_with_approval(
         audit::log_denied(
             ctx.audit_log,
             audit::ProxyMode::Connect,
+            &audit::EventContext::default(),
             &host,
             port,
             &reason,
@@ -140,6 +144,7 @@ pub async fn handle_connect_with_approval(
             audit::log_denied(
                 ctx.audit_log,
                 audit::ProxyMode::Connect,
+                &audit::EventContext::default(),
                 &host,
                 port,
                 &reason,
@@ -153,6 +158,7 @@ pub async fn handle_connect_with_approval(
         audit::log_allowed(
             ctx.audit_log,
             audit::ProxyMode::Connect,
+            &audit::EventContext::default(),
             &host,
             port,
             "CONNECT (runtime)",
@@ -165,6 +171,7 @@ pub async fn handle_connect_with_approval(
     if matches!(
         runtime_check.result,
         nono::net_filter::FilterResult::DenyHost { .. }
+            | nono::net_filter::FilterResult::DenyLinkLocal { .. }
     ) {
         let reason = runtime_check.result.reason();
         debug!(
@@ -174,6 +181,7 @@ pub async fn handle_connect_with_approval(
         audit::log_denied(
             ctx.audit_log,
             audit::ProxyMode::Connect,
+            &audit::EventContext::default(),
             &host,
             port,
             &reason,
@@ -203,6 +211,7 @@ pub async fn handle_connect_with_approval(
         audit::log_denied(
             ctx.audit_log,
             audit::ProxyMode::Connect,
+            &audit::EventContext::default(),
             &host,
             port,
             reason,
@@ -221,6 +230,7 @@ pub async fn handle_connect_with_approval(
             audit::log_denied(
                 ctx.audit_log,
                 audit::ProxyMode::Connect,
+                &audit::EventContext::default(),
                 &host,
                 port,
                 reason,
@@ -253,6 +263,7 @@ pub async fn handle_connect_with_approval(
                     audit::log_denied(
                         ctx.audit_log,
                         audit::ProxyMode::Connect,
+                        &audit::EventContext::default(),
                         &host,
                         port,
                         reason,
@@ -272,6 +283,7 @@ pub async fn handle_connect_with_approval(
                     audit::log_denied(
                         ctx.audit_log,
                         audit::ProxyMode::Connect,
+                        &audit::EventContext::default(),
                         &host,
                         port,
                         reason,
@@ -290,6 +302,7 @@ pub async fn handle_connect_with_approval(
             audit::log_allowed(
                 ctx.audit_log,
                 audit::ProxyMode::Connect,
+                &audit::EventContext::default(),
                 &host,
                 port,
                 "CONNECT (approved)",
@@ -307,6 +320,7 @@ pub async fn handle_connect_with_approval(
             audit::log_denied(
                 ctx.audit_log,
                 audit::ProxyMode::Connect,
+                &audit::EventContext::default(),
                 &host,
                 port,
                 display_reason,

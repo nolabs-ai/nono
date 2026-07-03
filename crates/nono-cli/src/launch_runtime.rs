@@ -135,11 +135,6 @@ pub(crate) struct ProxyLaunchOptions {
     /// Propagated to `ProxyConfig.strict_filter` so the filter denies
     /// unlisted hosts instead of falling back to allow-all.
     pub(crate) network_block: bool,
-    pub(crate) network_approval_mode: crate::network_approval::NetworkApprovalMode,
-    pub(crate) network_approval_timeout_secs: u64,
-    /// The nono profile name (from `--profile`), used by ConfigWriter
-    /// to persist approved hosts to the correct user profile file.
-    pub(crate) profile_name: Option<String>,
 }
 
 impl ProxyLaunchOptions {
@@ -152,6 +147,7 @@ impl ProxyLaunchOptions {
                 .is_some_and(|credentials| !credentials.credentials.is_empty())
             || self.upstream_proxy.is_some()
     }
+}
 
 #[derive(Clone)]
 pub(crate) struct ExecutionFlags {

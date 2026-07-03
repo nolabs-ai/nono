@@ -124,6 +124,8 @@ Each `intercept` entry is `{ "args": [...], "action": { "type": ... } }`. Rules 
 
 `exec` is for handling one subcommand with a custom helper while the command's other subcommands run normally — for example, intercepting an `auth switch` subcommand with a helper that rewrites a config file, while `api` calls pass through with their brokered credentials.
 
+The helper runs with the matched command's real credentials, capabilities, and sandbox — it is not itself sandboxed further. Do not point `exec` at a general-purpose shell (`/bin/sh`, `/bin/bash`, etc.): it would let the caller run arbitrary commands with those credentials, defeating the sandbox. Use a purpose-specific helper that only does what the intercepted subcommand needs.
+
 ### Dynamic Filesystem Grants
 
 `fs_read`, `fs_write`, `fs_read_file`, and `fs_write_file` can contain dynamic provider tokens as well as literal paths. Tokens are expanded at launch before the child sandbox is built. They are opt-in: no dynamic paths are added unless a selected command policy includes one of these tokens.

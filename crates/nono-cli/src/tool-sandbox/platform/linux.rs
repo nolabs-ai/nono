@@ -5103,9 +5103,9 @@ fn le_u64(data: &[u8], offset: usize) -> Result<u64> {
 mod tests {
     use super::*;
     use crate::command_policy::{
-        CommandEnvironmentConfig, CommandPolicyConfig, CommandSandboxConfig,
-        ResolvedCommandBinaries, ResolvedCommandBinary, ResolvedExecutableKind,
-        ResolvedExecutableShape,
+        CommandEnvironmentConfig, CommandPolicyConfig, CommandSandboxConfig, InterceptActionConfig,
+        InterceptRuleConfig, ResolvedCommandBinaries, ResolvedCommandBinary,
+        ResolvedExecutableKind, ResolvedExecutableShape,
     };
     use std::collections::BTreeMap;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -5402,6 +5402,78 @@ mod tests {
             &BTreeMap::new(),
             &file_write_caps,
         )?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn writable_exec_helper_override_is_explicit_for_sandbox_writable_paths() -> Result<()> {
+        let temp = test_tempdir()?;
+        let bin_dir = temp.path().join("bin");
+        create_dir(&bin_dir)?;
+        let helper = bin_dir.join("helper");
+        create_executable(&helper)?;
+
+        let mut config = CommandPoliciesConfig::default();
+        config.commands.insert(
+            "tool".to_string(),
+            CommandPolicyConfig {
+                intercept: vec![InterceptRuleConfig {
+                    args: vec![],
+                    action: InterceptActionConfig::Exec {
+                        command: vec![helper.to_string_lossy().into_owned()],
+                    },
+                }],
+                ..Default::default()
+            },
+        );
+
+        let mut exec_helpers = BTreeMap::new();
+        exec_helpers.insert(helper.clone(), test_binary("helper", &helper)?);
+
+        let caps = CapabilitySet::new();
+        validate_controlled_exec_helper_immutability(&config, &exec_helpers, &caps)?;
+
+        let mut file_write_caps = CapabilitySet::new();
+        file_write_caps.add_fs(FsCapability::new_file(&helper, AccessMode::ReadWrite)?);
+        let err =
+            validate_controlled_exec_helper_immutability(&config, &exec_helpers, &file_write_caps)
+                .err()
+                .ok_or_else(|| {
+                    NonoError::SandboxInit("expected sandbox-writable helper rejection".to_string())
+                })?;
+        assert!(
+            err.to_string()
+                .contains("writable by the outer session capability set")
+        );
+
+        let mut parent_write_caps = CapabilitySet::new();
+        parent_write_caps.add_fs(FsCapability::new_dir(&bin_dir, AccessMode::ReadWrite)?);
+        let err = validate_controlled_exec_helper_immutability(
+            &config,
+            &exec_helpers,
+            &parent_write_caps,
+        )
+        .err()
+        .ok_or_else(|| {
+            NonoError::SandboxInit("expected sandbox-writable parent rejection".to_string())
+        })?;
+        assert!(
+            err.to_string()
+                .contains("replaceable through writable parent directory")
+        );
+
+        config.allow_writable_executables = true;
+        validate_controlled_exec_helper_immutability(&config, &exec_helpers, &parent_write_caps)?;
+        config.allow_writable_executables = false;
+
+        let command = config
+            .commands
+            .get_mut("tool")
+            .ok_or_else(|| NonoError::SandboxInit("missing test command policy".to_string()))?;
+        command.allow_writable_executable = true;
+
+        validate_controlled_exec_helper_immutability(&config, &exec_helpers, &file_write_caps)?;
 
         Ok(())
     }

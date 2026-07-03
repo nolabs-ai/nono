@@ -139,7 +139,7 @@ fn scan_settings(path: &Path, home: &Path) -> Option<(Vec<(String, String)>, boo
     let has_plugin_key = settings
         .get("enabledPlugins")
         .and_then(Value::as_object)
-        .map_or(false, |p| p.contains_key(LEGACY_PLUGIN_KEY));
+        .is_some_and(|p| p.contains_key(LEGACY_PLUGIN_KEY));
 
     let mut found = Vec::new();
     if let Some(hooks) = settings.get("hooks").and_then(Value::as_object) {
@@ -313,8 +313,7 @@ fn strip_settings_entries(
                     continue;
                 };
                 matchers.retain_mut(|matcher| {
-                    let Some(inner) = matcher.get_mut("hooks").and_then(Value::as_array_mut)
-                    else {
+                    let Some(inner) = matcher.get_mut("hooks").and_then(Value::as_array_mut) else {
                         return true;
                     };
                     inner.retain(|h| {
@@ -338,10 +337,10 @@ fn strip_settings_entries(
     }
 
     let mut plugin_key_removed = false;
-    if remove_plugin_key {
-        if let Some(plugins) = obj.get_mut("enabledPlugins").and_then(Value::as_object_mut) {
-            plugin_key_removed = plugins.remove(LEGACY_PLUGIN_KEY).is_some();
-        }
+    if remove_plugin_key
+        && let Some(plugins) = obj.get_mut("enabledPlugins").and_then(Value::as_object_mut)
+    {
+        plugin_key_removed = plugins.remove(LEGACY_PLUGIN_KEY).is_some();
     }
 
     if removed.is_empty() && !plugin_key_removed {
@@ -564,7 +563,10 @@ mod tests {
         .expect("write");
 
         let artifacts = scan(home.path());
-        assert!(artifacts.legacy_plugin_key, "should detect legacy plugin key");
+        assert!(
+            artifacts.legacy_plugin_key,
+            "should detect legacy plugin key"
+        );
         assert!(artifacts.settings_entries.is_empty());
         assert!(!artifacts.is_empty());
     }
@@ -594,9 +596,8 @@ mod tests {
         let report = apply(&artifacts, home.path()).expect("apply");
         assert!(report.removed_plugin_key);
 
-        let after: Value =
-            serde_json::from_str(&fs::read_to_string(&settings_path).expect("read"))
-                .expect("parse");
+        let after: Value = serde_json::from_str(&fs::read_to_string(&settings_path).expect("read"))
+            .expect("parse");
 
         assert_eq!(after["theme"], "dark", "unrelated keys preserved");
         assert!(

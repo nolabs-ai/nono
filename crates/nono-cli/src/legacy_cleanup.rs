@@ -349,9 +349,13 @@ fn strip_settings_entries(
 
     let serialized = serde_json::to_string_pretty(&settings)
         .map_err(|e| NonoError::HookInstall(format!("serialize {}: {e}", path.display())))?;
-    let tmp = path.with_extension("json.nono-tmp");
+    // Canonicalize before writing so that if settings.json is a symlink
+    // (common in dotfile repos), we write through to the real file rather
+    // than replacing the symlink itself with a plain file.
+    let real_path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let tmp = real_path.with_extension("json.nono-tmp");
     fs::write(&tmp, format!("{serialized}\n")).map_err(NonoError::Io)?;
-    fs::rename(&tmp, path).map_err(NonoError::Io)?;
+    fs::rename(&tmp, &real_path).map_err(NonoError::Io)?;
 
     Ok((removed, plugin_key_removed))
 }

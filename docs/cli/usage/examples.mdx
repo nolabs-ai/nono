@@ -67,7 +67,7 @@ nono why --path ./src --op write --allow .
 # Output: ALLOWED - Granted by: --allow .
 
 # Check against a profile
-nono why --path ./src --op read --profile always-further/claude
+nono why --path ./src --op read --profile nolabs-ai/claude
 ```
 
 ### Query from inside a sandbox
@@ -237,7 +237,7 @@ nono run --allow . \
 
 ```bash
 # Claude Code profile
-nono run --profile always-further/claude -- claude
+nono run --profile nolabs-ai/claude -- claude
 
 # OpenClaw profile
 nono run --profile openclaw -- openclaw gateway
@@ -246,19 +246,19 @@ nono run --profile openclaw -- openclaw gateway
 ### Profile with Extra Permissions
 
 ```bash
-nono run --profile always-further/claude --read /tmp/extra -- claude
+nono run --profile nolabs-ai/claude --read /tmp/extra -- claude
 ```
 
 ### Profile with Custom Workdir
 
 ```bash
-nono run --profile always-further/claude --workdir ./my-project -- claude
+nono run --profile nolabs-ai/claude --workdir ./my-project -- claude
 ```
 
 ### Restrict Profile to Specific Domains
 
 ```bash
-nono run --profile always-further/claude --allow-domain api.openai.com -- claude
+nono run --profile nolabs-ai/claude --allow-domain api.openai.com -- claude
 ```
 
 ## Real-World Scenarios

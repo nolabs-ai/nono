@@ -133,7 +133,7 @@ Because nono and containers operate at different layers, they combine naturally.
 ```dockerfile
 # Dockerfile
 FROM ubuntu:22.04
-COPY --from=ghcr.io/always-further/nono:latest /usr/bin/nono /usr/bin/nono
+COPY --from=ghcr.io/nolabs-ai/nono:latest /usr/bin/nono /usr/bin/nono
 RUN apt-get update && \
     apt-get install -y --no-install-recommends ca-certificates && \
     rm -rf /var/lib/apt/lists/*

@@ -409,7 +409,7 @@ jobs:
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
-      - uses: always-further/agent-sign@<pinned-sha>
+      - uses: nolabs-ai/agent-sign@<pinned-sha>
         with:
           publish: "true"
           package-name: claude
@@ -503,13 +503,13 @@ The table lives at `crates/nono-cli/src/migration.rs` as `PACK_PROVIDED_PROFILES
 pub const PACK_PROVIDED_PROFILES: &[PackProvidedProfile] = &[
     PackProvidedProfile {
         profile_name: "claude-code",
-        pack_ref: "always-further/claude",
+        pack_ref: "nolabs-ai/claude",
         installs_summary: "sandbox profile + Claude Code plugin",
     },
     // Future:
     // PackProvidedProfile {
     //     profile_name: "codex",
-    //     pack_ref: "always-further/codex",
+    //     pack_ref: "nolabs-ai/codex",
     //     installs_summary: "sandbox profile + Codex integration assets",
     // },
 ];

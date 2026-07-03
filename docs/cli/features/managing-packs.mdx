@@ -12,7 +12,7 @@ For the producer side (creating and publishing packs), see [Publishing Packs](/c
 Use `nono pull` to install a pack from the registry:
 
 ```bash
-nono pull always-further/claude
+nono pull nolabs-ai/claude
 ```
 
 On install, the CLI:
@@ -29,7 +29,7 @@ On install, the CLI:
 By default `nono pull` installs the latest version. Pin to a specific version with `@`:
 
 ```bash
-nono pull always-further/claude@1.2.0
+nono pull nolabs-ai/claude@1.2.0
 ```
 
 ### Initializing Project Files
@@ -37,7 +37,7 @@ nono pull always-further/claude@1.2.0
 Some packs include project-level instructions (e.g. a `CLAUDE.md` context file). Use `--init` to copy them into the current directory:
 
 ```bash
-nono pull always-further/claude --init
+nono pull nolabs-ai/claude --init
 ```
 
 Without `--init`, project-level instructions are installed into the pack store but not copied into your working directory.
@@ -47,7 +47,7 @@ Without `--init`, project-level instructions are installed into the pack store b
 Use `--force` to overwrite conflicts and accept signer changes:
 
 ```bash
-nono pull always-further/claude --force
+nono pull nolabs-ai/claude --force
 ```
 
 <Warning>
@@ -59,7 +59,7 @@ nono pull always-further/claude --force
 When you run `nono run --profile <name>`, nono checks whether any pack in the active profile's extends chain has a newer version available and prints a one-line hint if so:
 
 ```
-  update available  always-further/claude  0.0.12 → 0.0.13   run: nono update
+  update available  nolabs-ai/claude  0.0.12 → 0.0.13   run: nono update
 ```
 
 Results are cached for 24 hours so the check never blocks startup. Stale entries refresh in a detached helper process for the next run. To suppress only pack update hints, set `NONO_NO_PACK_UPDATE_HINTS=1`. The hint also respects the global CLI update-check opt-out: set `NONO_NO_UPDATE_CHECK=1` or `[updates] check = false` in `~/.config/nono/config.toml`.
@@ -91,7 +91,7 @@ nono update
 Or update a specific pack:
 
 ```bash
-nono update always-further/claude
+nono update nolabs-ai/claude
 ```
 
 The update checks the registry for newer versions, verifies signatures, and replaces local artifacts. Signer identity changes trigger a confirmation prompt (use `--force` to skip).
@@ -113,13 +113,13 @@ nono update --force
 Pin a pack to prevent it from being updated by `nono update`:
 
 ```bash
-nono pin always-further/claude
+nono pin nolabs-ai/claude
 ```
 
 Unpin to allow updates again:
 
 ```bash
-nono unpin always-further/claude
+nono unpin nolabs-ai/claude
 ```
 
 Pinned packs are still shown by `nono outdated`. The pin state is local — it does not affect other users or the registry.
@@ -127,7 +127,7 @@ Pinned packs are still shown by `nono outdated`. The pin state is local — it d
 ## Removing a Pack
 
 ```bash
-nono remove always-further/claude
+nono remove nolabs-ai/claude
 ```
 
 This removes all artifacts installed by the pack (profiles, plugins, hooks, wiring) and cleans up the lockfile entry.
@@ -135,7 +135,7 @@ This removes all artifacts installed by the pack (profiles, plugins, hooks, wiri
 If the pack applied wiring directives (e.g. injected hook entries into `hooks.json`), removal reverses them. If reversal partially fails, the lockfile entry is kept so you can retry. Use `--force` to proceed anyway:
 
 ```bash
-nono remove always-further/claude --force
+nono remove nolabs-ai/claude --force
 ```
 
 ## Searching the Registry

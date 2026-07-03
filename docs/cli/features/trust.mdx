@@ -178,7 +178,7 @@ nono trust sign-policy --keyref file:///path/to/key.pem  # file-backed key
 For development and testing, disable attestation enforcement:
 
 ```bash
-nono run --profile always-further/claude --trust-override -- claude
+nono run --profile nolabs-ai/claude --trust-override -- claude
 ```
 
 Verification still runs and results are logged, but failures produce warnings instead of hard denies. This flag is CLI-only — it cannot be set in a profile or trust policy.
@@ -515,7 +515,7 @@ When `nono run` launches a command, it scans the working directory for files mat
 To keep startup latency bounded in large repositories, the scan prunes a small built-in set of regenerable heavy directories such as `.git`, `node_modules`, `target`, `dist`, and common cache directories. Hidden directories are otherwise still scanned. You can extend the skip set for a session with `--skip-dir <name>` or persist it in a profile with `skipdirs`.
 
 ```
-nono run --profile always-further/claude -- claude
+nono run --profile nolabs-ai/claude -- claude
   -> Scan CWD for files matching includes patterns
   -> For each match:
      -> Compute SHA-256 digest

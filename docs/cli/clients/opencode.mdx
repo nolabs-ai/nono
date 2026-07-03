@@ -18,7 +18,7 @@ nono prevents all of this at the kernel level.
 ## Quick Start
 
 ```bash
-nono run --profile always-further/opencode -- opencode
+nono run --profile nolabs-ai/opencode -- opencode
 ```
 
 The profile provides:
@@ -67,7 +67,7 @@ Create `~/.config/nono/profiles/opencode.json` for different permissions:
 
 **Usage:**
 ```bash
-nono run --profile always-further/opencode -- opencode
+nono run --profile nolabs-ai/opencode -- opencode
 ```
 
 ## Security Tips
@@ -88,7 +88,7 @@ secret-tool store --label="nono: openai_api_key" service nono username openai_ap
 
 Then run:
 ```bash
-nono run --profile always-further/opencode --env-credential openai_api_key -- opencode
+nono run --profile nolabs-ai/opencode --env-credential openai_api_key -- opencode
 ```
 
 See [Credential Injection](/cli/features/credential-injection) for full documentation.
@@ -113,10 +113,10 @@ CLI flags always take precedence:
 
 ```bash
 # Add extra directory access
-nono run --profile always-further/opencode --allow ~/shared-libs -- opencode
+nono run --profile nolabs-ai/opencode --allow ~/shared-libs -- opencode
 
 # Block network
-nono run --profile always-further/opencode --block-net -- opencode
+nono run --profile nolabs-ai/opencode --block-net -- opencode
 ```
 
 See [Security Profiles](/cli/features/profiles-groups) for details on profile format and precedence rules.
@@ -130,5 +130,5 @@ OpenCode routes Google Gemini requests directly to the Google API rather than th
 Use `--env-credential` instead of proxy injection when working with Gemini:
 
 ```bash
-nono run --profile always-further/opencode --env-credential gemini_api_key -- opencode
+nono run --profile nolabs-ai/opencode --env-credential gemini_api_key -- opencode
 ```

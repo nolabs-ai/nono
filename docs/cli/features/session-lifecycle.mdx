@@ -46,7 +46,7 @@ In normal day-to-day usage, the common states are:
 ### Attached Start
 
 ```bash
-nono run --profile always-further/claude --allow-cwd -- claude
+nono run --profile nolabs-ai/claude --allow-cwd -- claude
 ```
 
 This starts the session attached to your current terminal. You interact with the agent directly from the start.
@@ -54,7 +54,7 @@ This starts the session attached to your current terminal. You interact with the
 ### Detached Start
 
 ```bash
-nono run --detached --profile always-further/claude --allow-cwd -- claude
+nono run --detached --profile nolabs-ai/claude --allow-cwd -- claude
 ```
 
 This starts the session with no client attached, but the session keeps running under supervisor and PTY management.
@@ -210,7 +210,7 @@ nono prune --keep 20
 Use this when you want an agent to keep running while you do something else:
 
 ```bash
-nono run --detached --rollback --profile always-further/claude --allow-cwd -- claude
+nono run --detached --rollback --profile nolabs-ai/claude --allow-cwd -- claude
 nono ps
 nono attach <session-id>
 ```
@@ -222,7 +222,7 @@ This is the recommended workflow for long-running coding or migration sessions.
 Use this when you want to watch the first phase of the run, then leave it working:
 
 ```bash
-nono run --rollback --profile always-further/claude --allow-cwd -- claude
+nono run --rollback --profile nolabs-ai/claude --allow-cwd -- claude
 ```
 
 Then detach with:
@@ -267,7 +267,7 @@ Prefer `nono stop` over killing the child directly, because the supervisor is re
 Detached sessions are especially useful when combined with rollback:
 
 ```bash
-nono run --detached --rollback --profile always-further/claude --allow-cwd -- claude
+nono run --detached --rollback --profile nolabs-ai/claude --allow-cwd -- claude
 ```
 
 This gives you two safety properties at once:

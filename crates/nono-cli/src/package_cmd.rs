@@ -9,11 +9,13 @@ use crate::package::{
 };
 use crate::registry_client::{RegistryClient, resolve_registry_url};
 use chrono::{DateTime, Local, Utc};
+use colored::Colorize;
 use nono::{NonoError, Result, SignerIdentity};
 use semver::Version;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
@@ -122,6 +124,86 @@ pub fn run_pull(args: PullArgs) -> Result<()> {
     if package_ref.namespace == "nolabs-ai" && package_ref.name == "claude" {
         crate::legacy_cleanup::check_and_offer_cleanup()?;
     }
+
+    // After installing any nolabs-ai pack, check whether the same pack
+    // under the legacy always-further namespace is still in the lockfile.
+    // If so, its wiring (marketplace dirs, TOML blocks, hook entries, etc.)
+    // is still live and conflicts with the new install. Offer to remove it.
+    offer_remove_legacy_namespace_pack(&package_ref)?;
+
+    Ok(())
+}
+
+/// If `always-further/<name>` is present in the lockfile after a successful
+/// `nolabs-ai/<name>` pull, prompt to remove it so the old wiring is reversed
+/// cleanly. This covers all packs (codex, claude, opencode, …) without
+/// requiring pack-specific cleanup logic.
+fn offer_remove_legacy_namespace_pack(new_ref: &PackageRef) -> Result<()> {
+    if new_ref.namespace != "nolabs-ai" {
+        return Ok(());
+    }
+    let legacy_key = format!("always-further/{}", new_ref.name);
+    let lockfile = package::read_lockfile()?;
+    if !lockfile.packages.contains_key(&legacy_key) {
+        return Ok(());
+    }
+
+    let mut err = io::stderr().lock();
+    let _ = writeln!(err);
+    let _ = writeln!(
+        err,
+        "  {}  Legacy pack {} is still installed.",
+        "⚠".yellow(),
+        legacy_key.bold(),
+    );
+    let _ = writeln!(err);
+    let _ = writeln!(
+        err,
+        "     Its wiring (marketplace dirs, config entries, hook entries) conflicts"
+    );
+    let _ = writeln!(
+        err,
+        "     with the newly installed {}. Remove it now?",
+        new_ref.key().bold()
+    );
+    let _ = writeln!(err);
+
+    let interactive = io::stdin().is_terminal() && io::stderr().is_terminal();
+    if !interactive {
+        let _ = writeln!(
+            err,
+            "  no TTY — skipping. Remove manually with: {}",
+            format!("nono remove {legacy_key}").bold()
+        );
+        let _ = writeln!(err);
+        return Ok(());
+    }
+
+    let _ = write!(err, "  Remove {}? [Y/n] ", legacy_key.bold());
+    let _ = err.flush();
+    drop(err);
+
+    let mut line = String::new();
+    if io::stdin().lock().read_line(&mut line).is_err() {
+        return Ok(());
+    }
+    let answer = line.trim().to_ascii_lowercase();
+    if !(answer.is_empty() || answer == "y" || answer == "yes") {
+        let mut err = io::stderr().lock();
+        let _ = writeln!(
+            err,
+            "  skipped — remove later with: {}",
+            format!("nono remove {legacy_key}").bold()
+        );
+        let _ = writeln!(err);
+        return Ok(());
+    }
+
+    run_remove(RemoveArgs {
+        package_ref: legacy_key,
+        force: false,
+        help: None,
+    })?;
 
     Ok(())
 }

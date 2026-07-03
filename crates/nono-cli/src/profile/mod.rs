@@ -2472,7 +2472,7 @@ fn load_profile_inner(name_or_path: &str, cli_extends: &[String]) -> Result<Opti
         // bypassing the post-pull cleanup hook in `migration::check_and_run`.
         // Idempotent: silent no-op when no legacy artifacts exist, so safe
         // to fire on every claude resolution.
-        if is_always_further_claude_pack(&profile_path) {
+        if is_nolabs_ai_claude_pack(&profile_path) {
             crate::legacy_cleanup::check_and_offer_cleanup()?;
         }
         return Ok(Some(profile));
@@ -2498,7 +2498,7 @@ fn load_profile_inner(name_or_path: &str, cli_extends: &[String]) -> Result<Opti
 /// Used to gate legacy-cleanup invocation on the canonical claude pack
 /// rather than any pack that happens to publish a profile named `claude`
 /// or `claude-code`.
-fn is_always_further_claude_pack(profile_path: &Path) -> bool {
+fn is_nolabs_ai_claude_pack(profile_path: &Path) -> bool {
     let Ok(store) = crate::package::package_store_dir() else {
         return false;
     };
@@ -2506,7 +2506,7 @@ fn is_always_further_claude_pack(profile_path: &Path) -> bool {
 }
 
 /// Pure path-component matcher: does `profile_path` live under
-/// `<store>/<ns>/<name>/...`? Split out of `is_always_further_claude_pack`
+/// `<store>/<ns>/<name>/...`? Split out of `is_nolabs_ai_claude_pack`
 /// so it can be tested without touching `XDG_CONFIG_HOME` / `HOME`.
 fn profile_path_is_in_pack(profile_path: &Path, store: &Path, ns: &str, name: &str) -> bool {
     let Ok(rel) = profile_path.strip_prefix(store) else {

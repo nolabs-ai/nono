@@ -25,15 +25,15 @@ Just search for your favorite coding agent from the registry
 
 ```bash
 nono search opencode
-always-further/opencode	-	Official Always Further Opencode Plugin
+nolabs-ai/opencode	-	Official Always Further Opencode Plugin
 ```
 
 And then run..
 
 ```bash
-nono run --profile always-further/claude -- claude
-nono run --profile always-further/codex -- codex
-nono run --profile always-further/pi -- pi
+nono run --profile nolabs-ai/claude -- claude
+nono run --profile nolabs-ai/codex -- codex
+nono run --profile nolabs-ai/pi -- pi
 ```
 
 ## Network Access
@@ -145,7 +145,7 @@ For setting up nono with a specific AI agent:
 - [OpenClaw](/cli/clients/openclaw)
 
 <Note>
-  If the agent you want to use cannot be found, create an [issue](https://github.com/always-further/nono/issues) to request consideration for adding it to the registry, or fork an existing profile and submit a PR with the new agent profile. See [Package Publishing](/cli/features/package-publishing) for details on publishing profiles.
+  If the agent you want to use cannot be found, create an [issue](https://github.com/nolabs-ai/nono/issues) to request consideration for adding it to the registry, or fork an existing profile and submit a PR with the new agent profile. See [Package Publishing](/cli/features/package-publishing) for details on publishing profiles.
 </Note>
 
 ### Build your own profile
@@ -153,7 +153,7 @@ For setting up nono with a specific AI agent:
 It's likely that you are going to want to customize the pre-built profiles or create your own for different tools and needs. You can do this easily with `nono profile init` which will create a new profile based on an existing one, with the option to customize it interactively.
 
 ```bash
-nono profile init claude --extends always-further/claude --full
+nono profile init claude --extends nolabs-ai/claude --full
 
 nono profile Created profile at /Users/jdoe/.config/nono/profiles/claude.json
 nono profile Validate with: nono profile validate claude

@@ -120,14 +120,14 @@ nono derives these scopes from the effective capability set:
 Use verbose dry-run output to see what would be requested and enforced:
 
 ```bash
-nono run --dry-run -v --profile always-further/claude -- claude
+nono run --dry-run -v --profile nolabs-ai/claude -- claude
 ```
 
 Use `nono why` for a focused scope query:
 
 ```bash
-nono why --scope signal --profile always-further/claude
-nono why --scope abstract-unix-socket --profile always-further/claude
+nono why --scope signal --profile nolabs-ai/claude
+nono why --scope abstract-unix-socket --profile nolabs-ai/claude
 ```
 
 ## Pathname Unix Socket Mediation

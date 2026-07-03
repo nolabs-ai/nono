@@ -583,7 +583,7 @@ pub(crate) fn would_shadow_existing_profile(profile_name: &str) -> bool {
         return false;
     }
     // Only block names that match embedded built-ins. Pack profiles are
-    // referenced by their full `org/name` key (e.g. `always-further/hermes`),
+    // referenced by their full `org/name` key (e.g. `nolabs-ai/hermes`),
     // which is an invalid profile name, so a short user profile name like
     // `hermes` cannot shadow a pack profile.
     crate::policy::load_embedded_policy()
@@ -2177,14 +2177,14 @@ mod tests {
             &patch,
             "claude",
             "claude-test",
-            Some("always-further/claude"),
+            Some("nolabs-ai/claude"),
         )
         .expect("prepare");
 
         assert!(matches!(prepared.action, SaveAction::Created));
         assert_eq!(
             prepared.profile.extends,
-            Some(vec!["always-further/claude".to_string()])
+            Some(vec!["nolabs-ai/claude".to_string()])
         );
     }
 
@@ -2208,13 +2208,13 @@ mod tests {
             &patch,
             "claude",
             "claude-test",
-            Some("always-further/claude@1.2.0"),
+            Some("nolabs-ai/claude@1.2.0"),
         )
         .expect("prepare");
 
         assert_eq!(
             prepared.profile.extends,
-            Some(vec!["always-further/claude@1.2.0".to_string()])
+            Some(vec!["nolabs-ai/claude@1.2.0".to_string()])
         );
     }
 

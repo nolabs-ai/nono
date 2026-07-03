@@ -117,9 +117,9 @@ pub fn run_pull(args: PullArgs) -> Result<()> {
     // pack (here, not via `migration::check_and_run`), also offer to
     // strip pre-0.43 inbuilt-hook leftovers. Idempotent — silent no-op
     // on a clean install. Mirrors the cleanup hook in `check_and_run`
-    // so power users who skip `--profile always-further/claude` don't end up with
+    // so power users who skip `--profile nolabs-ai/claude` don't end up with
     // both legacy and pack hooks firing.
-    if package_ref.namespace == "always-further" && package_ref.name == "claude" {
+    if package_ref.namespace == "nolabs-ai" && package_ref.name == "claude" {
         crate::legacy_cleanup::check_and_offer_cleanup()?;
     }
 

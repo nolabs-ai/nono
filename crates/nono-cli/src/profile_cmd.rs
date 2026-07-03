@@ -103,7 +103,7 @@ fn cmd_init(args: ProfileInitArgs) -> Result<()> {
     }
 
     // Block names that match an embedded built-in profile. Pack profiles use
-    // `org/name` keys (e.g. `always-further/hermes`), which are invalid as
+    // `org/name` keys (e.g. `nolabs-ai/hermes`), which are invalid as
     // profile names, so a short name like `hermes` cannot shadow a pack.
     {
         let pol = policy::load_embedded_policy()?;
@@ -802,7 +802,7 @@ pub(crate) fn cmd_list(args: ProfileListArgs) -> Result<()> {
 }
 
 /// Like `print_profile_line` but appends the providing pack ref so the
-/// user sees `claude-code  Anthropic Claude Code …  always-further/claude`.
+/// user sees `claude-code  Anthropic Claude Code …  nolabs-ai/claude`.
 fn print_pack_profile_line(name: &str, pack_ref: &str, result: &Result<Profile>, t: &theme::Theme) {
     match result {
         Ok(p) => {

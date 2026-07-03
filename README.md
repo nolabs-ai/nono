@@ -63,9 +63,9 @@ Search for an agent in the registry, then run it:
 
 ```bash
 $ nono search opencode
-always-further/opencode	-	Official Opencode Plugin
+nolabs-ai/opencode	-	Official Opencode Plugin
 
-$ nono run --profile always-further/opencode -- opencode
+$ nono run --profile nolabs-ai/opencode -- opencode
 ```
 
 That's it. `opencode` now runs with read/write access to the current directory and **nothing else** — your SSH keys, your cloud credentials, the rest of your disk are invisible to it.
@@ -77,7 +77,7 @@ Profiles for all the popular agents live at [registry.nono.sh](https://registry.
 Outgrow the defaults? Scaffold a profile and tweak it — same command you already know:
 
 ```bash
-nono profile init opencode --extends always-further/opencode
+nono profile init opencode --extends nolabs-ai/opencode
 nono run --profile opencode -- opencode
 ```
 

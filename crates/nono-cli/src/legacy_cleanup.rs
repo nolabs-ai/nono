@@ -3,7 +3,7 @@
 //! Pre-0.43 installs wrote `~/.claude/hooks/nono-hook.sh` and patched
 //! `~/.claude/settings.json::hooks` with one matching command entry.
 //! Post-0.43 the integration ships as a registry pack
-//! (`always-further/claude`) with its own marketplace-based plugin
+//! (`nolabs-ai/claude`) with its own marketplace-based plugin
 //! install. If the legacy state isn't removed, Claude Code runs both —
 //! duplicate hook execution at best, broken behaviour if the legacy
 //! `nono-hook.sh` references binaries the current nono no longer ships.
@@ -32,6 +32,7 @@ use std::path::{Path, PathBuf};
 const LEGACY_HOOK_SCRIPT_REL: &str = ".claude/hooks/nono-hook.sh";
 const LEGACY_HOOK_COMMAND_TEMPLATE: &str = "$HOME/.claude/hooks/nono-hook.sh";
 const LEGACY_BAK_SUFFIX: &str = ".legacy-bak";
+const LEGACY_PLUGIN_KEY: &str = "nono@always-further";
 
 /// What `scan` found on disk. Empty = nothing to do.
 #[derive(Debug, Default, Clone)]
@@ -41,6 +42,11 @@ pub struct LegacyArtifacts {
     /// Hook entries inside `~/.claude/settings.json` that reference the
     /// legacy script. Stored as `(event, command)` for display.
     pub settings_entries: Vec<(String, String)>,
+    /// Whether `enabledPlugins["nono@always-further"]` is present in
+    /// `~/.claude/settings.json`. The new pack writes `nono@nolabs-ai`;
+    /// leaving both in place causes Claude Code to see two `nono` plugins
+    /// from different marketplaces and silently fail one or both.
+    pub legacy_plugin_key: bool,
     /// Resolved path to `~/.claude/settings.json` (only set when at
     /// least one matching entry was found).
     settings_path: Option<PathBuf>,
@@ -48,7 +54,7 @@ pub struct LegacyArtifacts {
 
 impl LegacyArtifacts {
     pub fn is_empty(&self) -> bool {
-        self.files.is_empty() && self.settings_entries.is_empty()
+        self.files.is_empty() && self.settings_entries.is_empty() && !self.legacy_plugin_key
     }
 }
 
@@ -57,12 +63,15 @@ impl LegacyArtifacts {
 pub struct LegacyCleanupReport {
     pub renamed_files: Vec<(PathBuf, PathBuf)>,
     pub removed_settings_entries: Vec<(String, String)>,
+    pub removed_plugin_key: bool,
     pub settings_path: Option<PathBuf>,
 }
 
 impl LegacyCleanupReport {
     fn is_empty(&self) -> bool {
-        self.renamed_files.is_empty() && self.removed_settings_entries.is_empty()
+        self.renamed_files.is_empty()
+            && self.removed_settings_entries.is_empty()
+            && !self.removed_plugin_key
     }
 }
 
@@ -101,48 +110,59 @@ fn scan(home: &Path) -> LegacyArtifacts {
     }
 
     let settings_path = home.join(".claude").join("settings.json");
-    if let Some(entries) = scan_settings(&settings_path, home)
-        && !entries.is_empty()
-    {
-        artifacts.settings_entries = entries;
-        artifacts.settings_path = Some(settings_path);
+    if let Some((entries, has_plugin_key)) = scan_settings(&settings_path, home) {
+        if !entries.is_empty() {
+            artifacts.settings_entries = entries;
+        }
+        if has_plugin_key {
+            artifacts.legacy_plugin_key = true;
+        }
+        if !artifacts.settings_entries.is_empty() || artifacts.legacy_plugin_key {
+            artifacts.settings_path = Some(settings_path);
+        }
     }
 
     artifacts
 }
 
-/// Walk `settings.json::hooks` looking for entries whose `command` is
-/// the legacy `nono-hook.sh` reference (template or expanded form).
-/// Returns `None` if the file is missing or unparseable (treated as
-/// "nothing to clean", not an error). Pure inspection — no mutation.
-fn scan_settings(path: &Path, home: &Path) -> Option<Vec<(String, String)>> {
+/// Walk `settings.json` looking for legacy artifacts. Returns `None` if
+/// the file is missing or unparseable (treated as "nothing to clean").
+/// Returns `Some((hook_entries, has_legacy_plugin_key))`. Pure inspection
+/// — no mutation.
+fn scan_settings(path: &Path, home: &Path) -> Option<(Vec<(String, String)>, bool)> {
     if !path.exists() {
         return None;
     }
     let content = fs::read_to_string(path).ok()?;
     let settings: Value = serde_json::from_str(&content).ok()?;
-    let hooks = settings.get("hooks")?.as_object()?;
+
+    let has_plugin_key = settings
+        .get("enabledPlugins")
+        .and_then(Value::as_object)
+        .map_or(false, |p| p.contains_key(LEGACY_PLUGIN_KEY));
 
     let mut found = Vec::new();
-    for (event, matchers) in hooks {
-        let Some(matchers) = matchers.as_array() else {
-            continue;
-        };
-        for matcher in matchers {
-            let Some(inner) = matcher.get("hooks").and_then(Value::as_array) else {
+    if let Some(hooks) = settings.get("hooks").and_then(Value::as_object) {
+        for (event, matchers) in hooks {
+            let Some(matchers) = matchers.as_array() else {
                 continue;
             };
-            for entry in inner {
-                let Some(cmd) = entry.get("command").and_then(Value::as_str) else {
+            for matcher in matchers {
+                let Some(inner) = matcher.get("hooks").and_then(Value::as_array) else {
                     continue;
                 };
-                if matches_legacy_command(cmd, home) {
-                    found.push((event.clone(), cmd.to_string()));
+                for entry in inner {
+                    let Some(cmd) = entry.get("command").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    if matches_legacy_command(cmd, home) {
+                        found.push((event.clone(), cmd.to_string()));
+                    }
                 }
             }
         }
     }
-    Some(found)
+    Some((found, has_plugin_key))
 }
 
 fn matches_legacy_command(cmd: &str, home: &Path) -> bool {
@@ -200,6 +220,18 @@ fn confirm(artifacts: &LegacyArtifacts) -> bool {
         }
         let _ = writeln!(err);
     }
+    if artifacts.legacy_plugin_key {
+        let _ = writeln!(
+            err,
+            "     {} (~/.claude/settings.json):",
+            "Plugin key to remove".dimmed()
+        );
+        let _ = writeln!(
+            err,
+            "       enabledPlugins[\"{LEGACY_PLUGIN_KEY}\"] — replaced by nono@nolabs-ai"
+        );
+        let _ = writeln!(err);
+    }
 
     let interactive = io::stdin().is_terminal() && io::stderr().is_terminal();
     if !interactive {
@@ -227,10 +259,15 @@ fn apply(artifacts: &LegacyArtifacts, home: &Path) -> Result<LegacyCleanupReport
     let mut report = LegacyCleanupReport::default();
 
     if let Some(path) = &artifacts.settings_path {
-        let removed = strip_settings_entries(path, home)?;
-        if !removed.is_empty() {
-            report.removed_settings_entries = removed;
+        let (removed_entries, removed_plugin_key) =
+            strip_settings_entries(path, home, artifacts.legacy_plugin_key)?;
+        if !removed_entries.is_empty() {
+            report.removed_settings_entries = removed_entries;
             report.settings_path = Some(path.clone());
+        }
+        if removed_plugin_key {
+            report.removed_plugin_key = true;
+            report.settings_path.get_or_insert_with(|| path.clone());
         }
     }
 
@@ -250,54 +287,65 @@ fn apply(artifacts: &LegacyArtifacts, home: &Path) -> Result<LegacyCleanupReport
     Ok(report)
 }
 
-/// Mutate the on-disk settings.json: drop hook entries whose `command`
-/// is a legacy reference, prune empty matchers and empty event arrays,
-/// preserve every other key. Atomic write (tempfile + rename). Returns
-/// the `(event, command)` list that was removed.
-fn strip_settings_entries(path: &Path, home: &Path) -> Result<Vec<(String, String)>> {
+/// Mutate the on-disk settings.json in one atomic write: drop hook
+/// entries whose `command` is a legacy reference (pruning empty matchers
+/// and event arrays), and optionally remove `enabledPlugins["nono@always-further"]`.
+/// All other keys are preserved. Returns `(removed_hook_entries, plugin_key_removed)`.
+fn strip_settings_entries(
+    path: &Path,
+    home: &Path,
+    remove_plugin_key: bool,
+) -> Result<(Vec<(String, String)>, bool)> {
     let content = fs::read_to_string(path).map_err(NonoError::Io)?;
     let mut settings: Value = serde_json::from_str(&content)
         .map_err(|e| NonoError::HookInstall(format!("parse {}: {e}", path.display())))?;
 
     let Some(obj) = settings.as_object_mut() else {
-        return Ok(Vec::new());
-    };
-    let Some(hooks) = obj.get_mut("hooks").and_then(Value::as_object_mut) else {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), false));
     };
 
     let mut removed: Vec<(String, String)> = Vec::new();
-    let event_keys: Vec<String> = hooks.keys().cloned().collect();
-    for event in event_keys {
-        let drop_event = {
-            let Some(matchers) = hooks.get_mut(&event).and_then(Value::as_array_mut) else {
-                continue;
-            };
-            matchers.retain_mut(|matcher| {
-                let Some(inner) = matcher.get_mut("hooks").and_then(Value::as_array_mut) else {
-                    return true;
+    if let Some(hooks) = obj.get_mut("hooks").and_then(Value::as_object_mut) {
+        let event_keys: Vec<String> = hooks.keys().cloned().collect();
+        for event in event_keys {
+            let drop_event = {
+                let Some(matchers) = hooks.get_mut(&event).and_then(Value::as_array_mut) else {
+                    continue;
                 };
-                inner.retain(|h| {
-                    let Some(cmd) = h.get("command").and_then(Value::as_str) else {
+                matchers.retain_mut(|matcher| {
+                    let Some(inner) = matcher.get_mut("hooks").and_then(Value::as_array_mut)
+                    else {
                         return true;
                     };
-                    if matches_legacy_command(cmd, home) {
-                        removed.push((event.clone(), cmd.to_string()));
-                        return false;
-                    }
-                    true
+                    inner.retain(|h| {
+                        let Some(cmd) = h.get("command").and_then(Value::as_str) else {
+                            return true;
+                        };
+                        if matches_legacy_command(cmd, home) {
+                            removed.push((event.clone(), cmd.to_string()));
+                            return false;
+                        }
+                        true
+                    });
+                    !inner.is_empty()
                 });
-                !inner.is_empty()
-            });
-            matchers.is_empty()
-        };
-        if drop_event {
-            hooks.remove(&event);
+                matchers.is_empty()
+            };
+            if drop_event {
+                hooks.remove(&event);
+            }
         }
     }
 
-    if removed.is_empty() {
-        return Ok(removed);
+    let mut plugin_key_removed = false;
+    if remove_plugin_key {
+        if let Some(plugins) = obj.get_mut("enabledPlugins").and_then(Value::as_object_mut) {
+            plugin_key_removed = plugins.remove(LEGACY_PLUGIN_KEY).is_some();
+        }
+    }
+
+    if removed.is_empty() && !plugin_key_removed {
+        return Ok((removed, false));
     }
 
     let serialized = serde_json::to_string_pretty(&settings)
@@ -306,7 +354,7 @@ fn strip_settings_entries(path: &Path, home: &Path) -> Result<Vec<(String, Strin
     fs::write(&tmp, format!("{serialized}\n")).map_err(NonoError::Io)?;
     fs::rename(&tmp, path).map_err(NonoError::Io)?;
 
-    Ok(removed)
+    Ok((removed, plugin_key_removed))
 }
 
 fn backup_path_for(path: &Path) -> PathBuf {
@@ -341,6 +389,10 @@ fn emit_summary(report: &LegacyCleanupReport) {
         for (event, cmd) in &report.removed_settings_entries {
             let _ = writeln!(err, "       [{event}]  {cmd}");
         }
+    }
+    if report.removed_plugin_key {
+        let _ = writeln!(err, "     {}:", "Removed plugin key".dimmed());
+        let _ = writeln!(err, "       enabledPlugins[\"{LEGACY_PLUGIN_KEY}\"]");
     }
     let _ = writeln!(err);
 }
@@ -450,7 +502,7 @@ mod tests {
         let expanded_cmd = format!("{}/.claude/hooks/nono-hook.sh", home.path().display());
         let settings = json!({
             "theme": "light",
-            "enabledPlugins": { "nono@always-further": true },
+            "enabledPlugins": { "nono@nolabs-ai": true },
             "hooks": {
                 "PreToolUse": [
                     { "matcher": "*", "hooks": [
@@ -481,7 +533,7 @@ mod tests {
 
         assert_eq!(after["theme"], "light", "unrelated keys preserved");
         assert_eq!(
-            after["enabledPlugins"]["nono@always-further"], true,
+            after["enabledPlugins"]["nono@nolabs-ai"], true,
             "plugin entries preserved"
         );
         assert!(
@@ -495,6 +547,70 @@ mod tests {
         let inner = post[0]["hooks"].as_array().expect("inner array");
         assert_eq!(inner.len(), 1, "user hook preserved");
         assert_eq!(inner[0]["command"], "/usr/local/bin/user-hook");
+    }
+
+    #[test]
+    fn scan_detects_legacy_plugin_key() {
+        let home = TempDir::new().expect("tempdir");
+        let claude = home.path().join(".claude");
+        fs::create_dir_all(&claude).expect("mkdir");
+        let settings = json!({
+            "enabledPlugins": { "nono@always-further": true, "other-plugin@somewhere": true }
+        });
+        fs::write(
+            claude.join("settings.json"),
+            serde_json::to_string_pretty(&settings).expect("ser"),
+        )
+        .expect("write");
+
+        let artifacts = scan(home.path());
+        assert!(artifacts.legacy_plugin_key, "should detect legacy plugin key");
+        assert!(artifacts.settings_entries.is_empty());
+        assert!(!artifacts.is_empty());
+    }
+
+    #[test]
+    fn apply_removes_legacy_plugin_key_preserving_other_plugins() {
+        let home = TempDir::new().expect("tempdir");
+        let claude = home.path().join(".claude");
+        fs::create_dir_all(&claude).expect("mkdir");
+        let settings = json!({
+            "theme": "dark",
+            "enabledPlugins": {
+                "nono@always-further": true,
+                "nono@nolabs-ai": true,
+                "other-plugin@somewhere": true
+            }
+        });
+        let settings_path = claude.join("settings.json");
+        fs::write(
+            &settings_path,
+            serde_json::to_string_pretty(&settings).expect("ser"),
+        )
+        .expect("write");
+
+        let artifacts = scan(home.path());
+        assert!(artifacts.legacy_plugin_key);
+        let report = apply(&artifacts, home.path()).expect("apply");
+        assert!(report.removed_plugin_key);
+
+        let after: Value =
+            serde_json::from_str(&fs::read_to_string(&settings_path).expect("read"))
+                .expect("parse");
+
+        assert_eq!(after["theme"], "dark", "unrelated keys preserved");
+        assert!(
+            after["enabledPlugins"].get("nono@always-further").is_none(),
+            "legacy plugin key removed"
+        );
+        assert_eq!(
+            after["enabledPlugins"]["nono@nolabs-ai"], true,
+            "new plugin key preserved"
+        );
+        assert_eq!(
+            after["enabledPlugins"]["other-plugin@somewhere"], true,
+            "unrelated plugin preserved"
+        );
     }
 
     #[test]

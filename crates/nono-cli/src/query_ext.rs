@@ -996,7 +996,7 @@ mod tests {
                 },
                 crate::sandbox_state::EndpointRuleState {
                     method: "*".to_string(),
-                    path: "/always-further/**".to_string(),
+                    path: "/nolabs-ai/**".to_string(),
                 },
             ],
         }];

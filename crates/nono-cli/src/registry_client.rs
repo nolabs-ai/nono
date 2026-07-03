@@ -111,9 +111,14 @@ impl RegistryClient {
                     msg.push_str(&format!("\nadvisory severity: {severity}"));
                 }
             }
+            let suggest_ns = if package_ref.namespace == "always-further" {
+                "nolabs-ai"
+            } else {
+                package_ref.namespace.as_str()
+            };
             msg.push_str(&format!(
                 "\ninstall the latest safe release: nono pull {}/{}",
-                package_ref.namespace, package_ref.name
+                suggest_ns, package_ref.name
             ));
             return Err(NonoError::RegistryError(msg));
         }

@@ -490,7 +490,7 @@ mod tests {
         let helper = Cli::parse_from([
             "nono",
             "pack-update-hint-helper",
-            "always-further/claude",
+            "nolabs-ai/claude",
             "1.0.0",
         ]);
         assert!(!allows_pre_exec_update_check(&helper.command));

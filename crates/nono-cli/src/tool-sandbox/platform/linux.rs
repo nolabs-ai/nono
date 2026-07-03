@@ -108,6 +108,14 @@ struct ToolSandboxState {
     profile_display_name: Option<String>,
     redaction_policy: nono::ScrubPolicy,
     policy_root: PathBuf,
+    /// The agent's own capability set. Used to bound a mediated command's live
+    /// working directory: a command may only run where the agent itself is
+    /// granted access, so `.`/`@git:*` resolving against the live cwd can never
+    /// hand a command filesystem reach the agent lacks.
+    outer_caps: CapabilitySet,
+    /// Agent's resolved filesystem deny paths; a command's live cwd under any of
+    /// these is rejected (the agent's broad allow may otherwise cover them).
+    deny_paths: Vec<PathBuf>,
     plan: ResolvedToolSandboxPlan,
     shims_by_command: BTreeMap<String, ShimIdentity>,
     credential_handles: BTreeMap<String, ResolvedCredential>,
@@ -240,6 +248,7 @@ impl PreparedToolSandboxRuntime {
             allowed_commands,
             blocked_commands,
             outer_caps,
+            deny_paths,
             policy_root,
             proxy_credential_env_vars,
             proxy_trust_bundle_paths,
@@ -357,6 +366,8 @@ impl PreparedToolSandboxRuntime {
                 profile_display_name: audit_context.profile_display_name,
                 redaction_policy: audit_context.redaction_policy,
                 policy_root: policy_root.to_path_buf(),
+                outer_caps: outer_caps.clone(),
+                deny_paths: deny_paths.to_vec(),
                 plan,
                 shims_by_command,
                 credential_handles,
@@ -750,7 +761,14 @@ fn run_shim() -> Result<()> {
         })
         .collect::<Vec<_>>();
     let cwd = std::env::current_dir()
-        .map_err(|err| NonoError::SandboxInit(format!("tool-sandbox shim cwd failed: {err}")))?
+        .map_err(|err| {
+            NonoError::SandboxInit(format!(
+                "tool-sandbox shim cwd failed: {err}. '{command}' is running in a directory its \
+                 sandbox does not grant read on (getcwd needs to resolve the cwd). If '{command}' \
+                 was invoked in a directory outside its policy — e.g. a sibling git worktree — add \
+                 \".\" to the command's fs_read so its live working directory is readable."
+            ))
+        })?
         .into_os_string()
         .into_vec();
     tool_sandbox_profile_log!(
@@ -3167,8 +3185,20 @@ fn build_child_launch_spec_for_binary(
             source,
         })?;
 
+    // Bound the command's live cwd to the agent's own granted filesystem
+    // (rejecting a cwd outside it), and learn whether the agent can write it so
+    // the command's cwd write access can be capped (write non-escalation, see
+    // add_policy_fs).
+    let cwd_agent_writable = super::admit_command_cwd(
+        &request.command,
+        &cwd,
+        &state.policy_root,
+        &state.outer_caps,
+        &state.deny_paths,
+    )?;
+
     let start_caps = std::time::Instant::now();
-    let mut caps = build_child_caps(state, binary, policy, request)?;
+    let mut caps = build_child_caps(state, binary, policy, request, &cwd, cwd_agent_writable)?;
     tool_sandbox_profile_log!("build_child_caps total: {:?}", start_caps.elapsed());
     caps.deduplicate();
 
@@ -3279,6 +3309,8 @@ fn build_child_caps(
     binary: &ResolvedCommandBinary,
     policy: &CommandSandboxConfig,
     request: &ToolSandboxShimRequest,
+    cwd: &Path,
+    cwd_agent_writable: bool,
 ) -> Result<CapabilitySet> {
     let mut caps = CapabilitySet::new().block_network();
     caps.add_fs(FsCapability::new_file(
@@ -3288,7 +3320,13 @@ fn build_child_caps(
     add_runtime_baseline(&mut caps, &state.baseline_cache, &binary.canonical_path)?;
     add_executable_shape_baseline(&mut caps, state, binary)?;
     add_chaining_control_caps(&mut caps, state)?;
-    add_policy_fs(&mut caps, policy, &state.policy_root)?;
+    add_policy_fs(
+        &mut caps,
+        policy,
+        &state.policy_root,
+        cwd,
+        cwd_agent_writable,
+    )?;
     add_policy_network(&mut caps, policy)?;
     add_policy_proxy_network(&mut caps, state, request, policy)?;
     add_proxy_trust_bundle_caps(&mut caps, state, policy)?;
@@ -3369,23 +3407,44 @@ fn add_policy_fs(
     caps: &mut CapabilitySet,
     policy: &CommandSandboxConfig,
     policy_root: &Path,
+    cwd: &Path,
+    cwd_agent_writable: bool,
 ) -> Result<()> {
     use super::dynamic_providers::expand_dynamic_tokens;
-    for entry in &expand_dynamic_tokens(&policy.fs_read, Some(policy_root))? {
-        let path = resolve_policy_path(entry, policy_root)?;
+    // A write grant that resolves under the live cwd is downgraded to read when
+    // the agent itself cannot write the cwd, so a command's cwd access never
+    // exceeds the agent's (write non-escalation). Grants outside the cwd (e.g.
+    // `$WORKDIR`, absolute paths) are unaffected.
+    let write_access = |path: &Path| {
+        if !cwd_agent_writable && path.starts_with(cwd) {
+            AccessMode::Read
+        } else {
+            AccessMode::ReadWrite
+        }
+    };
+    // `@git:*` tokens run git in the command's live cwd so they resolve to the
+    // repo the command is actually operating in (e.g. its worktree / .git
+    // common-dir), not the repo the agent was launched in.
+    for entry in &expand_dynamic_tokens(&policy.fs_read, Some(cwd))? {
+        let path = resolve_policy_path(entry, policy_root, cwd)?;
         add_optional_dir(caps, path, AccessMode::Read)?;
     }
-    for entry in &expand_dynamic_tokens(&policy.fs_write, Some(policy_root))? {
-        let path = resolve_policy_path(entry, policy_root)?;
-        add_optional_dir(caps, path, AccessMode::ReadWrite)?;
+    for entry in &expand_dynamic_tokens(&policy.fs_write, Some(cwd))? {
+        let path = resolve_policy_path(entry, policy_root, cwd)?;
+        let access = write_access(&path);
+        add_optional_dir(caps, path, access)?;
     }
-    for entry in &expand_dynamic_tokens(&policy.fs_read_file, Some(policy_root))? {
-        let path = resolve_policy_path(entry, policy_root)?;
+    for entry in &expand_dynamic_tokens(&policy.fs_read_file, Some(cwd))? {
+        let path = resolve_policy_path(entry, policy_root, cwd)?;
         add_optional_read_file(caps, path)?;
     }
-    for entry in &expand_dynamic_tokens(&policy.fs_write_file, Some(policy_root))? {
-        let path = resolve_policy_path(entry, policy_root)?;
-        caps.add_fs(FsCapability::new_file(path, AccessMode::ReadWrite)?);
+    for entry in &expand_dynamic_tokens(&policy.fs_write_file, Some(cwd))? {
+        let path = resolve_policy_path(entry, policy_root, cwd)?;
+        if matches!(write_access(&path), AccessMode::Read) {
+            add_optional_read_file(caps, path)?;
+        } else {
+            caps.add_fs(FsCapability::new_file(path, AccessMode::ReadWrite)?);
+        }
     }
     Ok(())
 }
@@ -3412,8 +3471,8 @@ fn add_optional_read_file(caps: &mut CapabilitySet, path: PathBuf) -> Result<()>
     }
 }
 
-fn resolve_policy_path(entry: &str, cwd: &Path) -> Result<PathBuf> {
-    let expanded = profile::expand_vars(entry, cwd)?;
+fn resolve_policy_path(entry: &str, workdir: &Path, cwd: &Path) -> Result<PathBuf> {
+    let expanded = profile::expand_vars(entry, workdir)?;
     if expanded.is_absolute() {
         Ok(expanded)
     } else {
@@ -5214,6 +5273,8 @@ mod tests {
             profile_display_name: None,
             redaction_policy: nono::ScrubPolicy::secure_default(),
             policy_root: PathBuf::from("/tmp"),
+            outer_caps: CapabilitySet::new(),
+            deny_paths: Vec::new(),
             plan: ResolvedToolSandboxPlan {
                 config: CommandPoliciesConfig::default(),
                 resolved: ResolvedCommandBinaries {

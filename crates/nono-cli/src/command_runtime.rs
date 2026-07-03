@@ -305,6 +305,7 @@ pub(crate) fn run_shell(args: ShellArgs, silent: bool) -> Result<()> {
         program: shell_path.into_os_string(),
         cmd_args: vec![],
         caps: prepared.caps,
+        deny_paths: prepared.deny_paths,
         loaded_secrets: prepared.secrets,
         flags,
     })
@@ -409,6 +410,7 @@ pub(crate) fn run_wrap(wrap_args: WrapArgs, silent: bool) -> Result<()> {
         program,
         cmd_args,
         caps: prepared.caps,
+        deny_paths: prepared.deny_paths,
         loaded_secrets: prepared.secrets,
         flags,
     })

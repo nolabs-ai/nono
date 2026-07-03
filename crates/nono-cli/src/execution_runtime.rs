@@ -154,6 +154,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         program,
         cmd_args,
         mut caps,
+        deny_paths,
         loaded_secrets,
         flags,
     } = plan;
@@ -320,6 +321,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
                 allowed_commands: caps.allowed_commands(),
                 blocked_commands: caps.blocked_commands(),
                 outer_caps: &caps,
+                deny_paths: &deny_paths,
                 policy_root: &requested_workdir,
                 proxy_credential_env_vars: &tool_sandbox_proxy_credential_env_vars,
                 proxy_trust_bundle_paths: &tool_sandbox_trust_bundle_paths,
@@ -347,6 +349,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
                 allowed_commands: caps.allowed_commands(),
                 blocked_commands: caps.blocked_commands(),
                 outer_caps: &caps,
+                deny_paths: &deny_paths,
                 policy_root: &requested_workdir,
                 proxy_credential_env_vars: &tool_sandbox_proxy_credential_env_vars,
                 proxy_trust_bundle_paths: &tool_sandbox_trust_bundle_paths,

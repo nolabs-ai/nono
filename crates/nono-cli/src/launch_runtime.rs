@@ -33,6 +33,10 @@ pub(crate) struct LaunchPlan {
     pub(crate) program: OsString,
     pub(crate) cmd_args: Vec<OsString>,
     pub(crate) caps: CapabilitySet,
+    /// Resolved filesystem deny paths (groups + profile `filesystem.deny`).
+    /// Threaded to the tool-sandbox so a mediated command's live working
+    /// directory can be rejected when it falls under a path the agent is denied.
+    pub(crate) deny_paths: Vec<PathBuf>,
     pub(crate) loaded_secrets: Vec<nono::LoadedSecret>,
     pub(crate) flags: ExecutionFlags,
 }
@@ -428,6 +432,7 @@ pub(crate) fn prepare_run_launch_plan(
         program,
         cmd_args,
         caps: prepared.caps,
+        deny_paths: prepared.deny_paths,
         loaded_secrets: prepared.secrets,
         flags,
     })

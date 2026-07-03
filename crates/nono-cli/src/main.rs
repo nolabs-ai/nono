@@ -277,6 +277,7 @@ mod tests {
         };
         let prepared = PreparedSandbox {
             caps: CapabilitySet::new(),
+            deny_paths: Vec::new(),
             secrets: Vec::new(),
             profile_display_name: None,
             command_policies: None,
@@ -341,6 +342,7 @@ mod tests {
         };
         let prepared = PreparedSandbox {
             caps: CapabilitySet::new(),
+            deny_paths: Vec::new(),
             secrets: Vec::new(),
             profile_display_name: None,
             command_policies: None,

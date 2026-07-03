@@ -416,6 +416,10 @@ struct PendingCwdAccessRequest {
 /// Result of sandbox preparation.
 pub(crate) struct PreparedSandbox {
     pub(crate) caps: CapabilitySet,
+    /// Resolved filesystem deny paths (groups + profile `filesystem.deny`).
+    /// Threaded to the tool-sandbox so a mediated command's live cwd can be
+    /// rejected when it falls under a directory the agent is denied.
+    pub(crate) deny_paths: Vec<PathBuf>,
     pub(crate) secrets: Vec<nono::LoadedSecret>,
     pub(crate) profile_display_name: Option<String>,
     pub(crate) command_policies: Option<crate::command_policy::CommandPoliciesConfig>,
@@ -1256,6 +1260,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         return finalize_prepared_sandbox(
             PreparedSandbox {
                 caps,
+                deny_paths: Vec::new(),
                 secrets: Vec::new(),
                 profile_display_name: None,
                 command_policies: None,
@@ -1630,6 +1635,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
     finalize_prepared_sandbox(
         PreparedSandbox {
             caps,
+            deny_paths: prepared_deny_paths,
             secrets: loaded_secrets,
             profile_display_name,
             command_policies,
@@ -2215,6 +2221,7 @@ mod tests {
     fn empty_prepared() -> PreparedSandbox {
         PreparedSandbox {
             caps: CapabilitySet::default(),
+            deny_paths: Vec::new(),
             secrets: Vec::new(),
             profile_display_name: None,
             command_policies: None,

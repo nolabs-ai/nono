@@ -305,9 +305,9 @@ fn detect_ci_provider() -> Option<&'static str> {
 /// Returns a coarse label from a fixed allowlist. `unknown` is used when the
 /// executable path cannot be resolved.
 fn detect_install_source() -> String {
-    if std::option_env!("NONO_INSTALL_SOURCE").is_some() {
+    if let Some(source) = std::option_env!("NONO_INSTALL_SOURCE") {
         // Baked in at compile time by the release pipeline; not runtime-controllable.
-        return "github_release".to_string();
+        return source.to_string();
     }
 
     let Ok(exe) = std::env::current_exe() else {

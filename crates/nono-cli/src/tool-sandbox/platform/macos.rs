@@ -1176,6 +1176,11 @@ fn handle_shim_stream_inner(
     let intercept = super::resolve_intercept_action(command_config, &request.argv);
     let intercept_action = intercept.action;
 
+    // A matched intercept rule may carry a sandbox that replaces the command's
+    // selected sandbox for the process this rule launches (every action except
+    // `respond`, which launches nothing). Absent -> the command's selected sandbox.
+    let effective_sandbox = intercept.sandbox.unwrap_or(policy);
+
     // ── Respond ──────────────────────────────────────────────────────────
     if let InterceptActionConfig::Respond { stdout } = intercept_action {
         record_command_policy_audit(
@@ -1303,7 +1308,7 @@ fn handle_shim_stream_inner(
             ));
         }
         let result = (|| {
-            let launch = build_child_launch_spec(state, &request, policy)?;
+            let launch = build_child_launch_spec(state, &request, effective_sandbox)?;
             launch_child_with_capture(state, &request.command, &caller, launch, stdio)
         })();
         state.active_count.fetch_sub(1, Ordering::SeqCst);
@@ -1389,7 +1394,7 @@ fn handle_shim_stream_inner(
             ));
         }
         let result = (|| {
-            let launch = build_child_launch_spec(state, &request, policy)?;
+            let launch = build_child_launch_spec(state, &request, effective_sandbox)?;
             launch_child_with_capture(state, &request.command, &caller, launch, stdio)
         })();
         state.active_count.fetch_sub(1, Ordering::SeqCst);
@@ -1461,7 +1466,7 @@ fn handle_shim_stream_inner(
         ));
     }
     let result = (|| {
-        let launch = build_child_launch_spec(state, &request, policy)?;
+        let launch = build_child_launch_spec(state, &request, effective_sandbox)?;
         launch_child(state, &request.command, &caller, launch, stdio)
     })();
     state.active_count.fetch_sub(1, Ordering::SeqCst);
@@ -1888,7 +1893,25 @@ fn build_child_caps(
     add_url_open_caps(&mut caps, state, policy)?;
     add_launch_services_caps(&mut caps, policy)?;
     add_child_process_exec_gate_with_policy(&mut caps, state, binary, Some(policy))?;
+    // Append the command's opt-in raw Seatbelt rules last so they land at the
+    // tail of the generated child profile. Seatbelt evaluates last-matching-rule
+    // wins, so a rule like `(allow process-exec* (literal "/usr/bin/security"))`
+    // overrides the exec gate's earlier `(deny process-exec*)`.
+    add_unsafe_seatbelt_rules(&mut caps, policy)?;
     Ok(caps)
+}
+
+/// Append a command sandbox's opt-in raw macOS Seatbelt rules to the child's
+/// platform rules. Emitted after all generated rules so they win under
+/// last-matching-rule semantics. No-op when the list is empty.
+fn add_unsafe_seatbelt_rules(
+    caps: &mut CapabilitySet,
+    policy: &CommandSandboxConfig,
+) -> Result<()> {
+    for rule in &policy.unsafe_macos_seatbelt_rules {
+        caps.add_platform_rule(rule.clone())?;
+    }
+    Ok(())
 }
 
 /// When a command opts into direct LaunchServices (`allow_launch_services`),
@@ -4448,6 +4471,47 @@ mod tests {
     }
 
     #[test]
+    fn unsafe_seatbelt_rules_appended_after_exec_gate_deny() -> Result<()> {
+        let temp = test_tempdir()?;
+        let command = temp.path().join("tool");
+        create_executable(&command)?;
+        let binary = test_binary("tool", &command)?;
+        let state = test_state();
+
+        let policy = CommandSandboxConfig {
+            unsafe_macos_seatbelt_rules: vec![
+                "(allow process-exec* (literal \"/usr/bin/security\"))".to_string(),
+                "(allow file-read* (literal \"/usr/bin/security\"))".to_string(),
+            ],
+            ..Default::default()
+        };
+
+        let mut caps = CapabilitySet::new();
+        // Reproduce the child-caps ordering: exec gate first, then unsafe rules.
+        add_child_process_exec_gate_with_policy(&mut caps, &state, &binary, Some(&policy))?;
+        add_unsafe_seatbelt_rules(&mut caps, &policy)?;
+
+        let rules: Vec<&str> = caps.platform_rules().iter().map(|r| r.as_str()).collect();
+        let deny_idx = rules
+            .iter()
+            .position(|r| *r == "(deny process-exec*)")
+            .expect("exec gate deny present");
+        let allow_idx = rules
+            .iter()
+            .position(|r| *r == "(allow process-exec* (literal \"/usr/bin/security\"))")
+            .expect("unsafe exec allow present");
+        assert!(
+            allow_idx > deny_idx,
+            "unsafe allow (idx {allow_idx}) must come after deny (idx {deny_idx}) so it wins"
+        );
+        assert!(
+            rules.contains(&"(allow file-read* (literal \"/usr/bin/security\"))"),
+            "unsafe file-read rule should be present"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn outer_process_exec_gate_allows_exec_but_denies_controlled_paths() -> Result<()> {
         let temp = test_tempdir()?;
         let bin_dir = temp.path().join("bin");
@@ -5086,5 +5150,34 @@ mod tests {
         );
         let dangerous_policy = policy_with_env(None, dangerous);
         assert!(apply_environment_set_vars(&mut vec![], &dangerous_policy).is_err());
+    }
+
+    #[test]
+    fn passthrough_uses_intercept_sandbox_override_when_present() {
+        // Mirrors the dispatch selection shared by every launching action:
+        //   let effective_sandbox = intercept.sandbox.unwrap_or(policy);
+        // A matched rule carrying its own sandbox replaces the command sandbox;
+        // a non-matching invocation (no override) falls back to the command
+        // sandbox.
+        let command_sandbox = CommandSandboxConfig {
+            fs_read: vec!["/command/path".to_string()],
+            ..CommandSandboxConfig::default()
+        };
+        let override_sandbox = CommandSandboxConfig {
+            fs_read: vec!["/override/path".to_string()],
+            ..CommandSandboxConfig::default()
+        };
+
+        let with_override = crate::tool_sandbox::ResolvedInterceptAction {
+            action: &crate::command_policy::InterceptActionConfig::Passthrough,
+            rule_args: Some(&[]),
+            sandbox: Some(&override_sandbox),
+        };
+        let effective = with_override.sandbox.unwrap_or(&command_sandbox);
+        assert_eq!(effective.fs_read, vec!["/override/path".to_string()]);
+
+        let without_override = crate::tool_sandbox::ResolvedInterceptAction::passthrough();
+        let effective = without_override.sandbox.unwrap_or(&command_sandbox);
+        assert_eq!(effective.fs_read, vec!["/command/path".to_string()]);
     }
 }

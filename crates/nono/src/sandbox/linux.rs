@@ -397,12 +397,12 @@ fn can_use_seccomp_network_block_fallback(caps: &CapabilitySet) -> bool {
 /// QEMU virtfs, and other Plan 9 mounts. The 9P driver does not implement the
 /// LSM inode hooks that Landlock relies on, so `PathBeneath` rules for these
 /// paths are accepted by the kernel but silently have no enforcement effect.
-const V9FS_MAGIC: libc::c_long = 0x0102_1997;
+const V9FS_MAGIC: u64 = 0x0102_1997;
 
 /// Return `true` if `f_type` (from `statfs::f_type`) identifies a filesystem
 /// that does not support Landlock enforcement.
 #[inline]
-fn fs_type_unsupported(f_type: libc::c_long) -> bool {
+fn fs_type_unsupported(f_type: u64) -> bool {
     f_type == V9FS_MAGIC
 }
 
@@ -435,7 +435,7 @@ fn unsupported_filesystem_dev(path: &Path) -> Option<u64> {
             return None;
         }
         let stat = buf.assume_init();
-        if fs_type_unsupported(stat.f_type) {
+        if fs_type_unsupported(stat.f_type as u64) {
             // fsid_t.__val is private; transmute the 8-byte struct to u64 for dedup.
             Some(std::mem::transmute::<libc::fsid_t, u64>(stat.f_fsid))
         } else {
@@ -4520,9 +4520,9 @@ mod tests {
 
     #[test]
     fn test_fs_type_unsupported_known_supported_types() {
-        const EXT4_MAGIC: libc::c_long = 0xEF53;
-        const TMPFS_MAGIC: libc::c_long = 0x0102_1994;
-        const PROC_MAGIC: libc::c_long = 0x9FA0;
+        const EXT4_MAGIC: u64 = 0xEF53;
+        const TMPFS_MAGIC: u64 = 0x0102_1994;
+        const PROC_MAGIC: u64 = 0x9FA0;
         assert!(!fs_type_unsupported(EXT4_MAGIC));
         assert!(!fs_type_unsupported(TMPFS_MAGIC));
         assert!(!fs_type_unsupported(PROC_MAGIC));

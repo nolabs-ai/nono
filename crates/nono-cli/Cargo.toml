@@ -56,6 +56,10 @@ walkdir.workspace = true
 ignore.workspace = true
 chrono = { version = "0.4", features = ["serde"] }
 
+# Allocation-free integer formatting for the post-fork cgroup self-attach path
+# (resource_cgroup::child_self_attach), where malloc could deadlock.
+itoa = "1"
+
 # Signing key PKCS#8 serialization (already transitive via sigstore-verify)
 aws-lc-rs = "1"
 

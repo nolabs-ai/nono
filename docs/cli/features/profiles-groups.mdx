@@ -27,6 +27,47 @@ Profiles simplify this:
 nono run --profile always-further/claude -- claude
 ```
 
+### Predefined Profiles vs User Profiles
+
+Predefined profiles (shipped with nono or installed via packs) cover two things:
+
+- **Agent packs** — profiles for specific AI coding agents (Claude Code, Codex, opencode, openclaw). These grant the exact paths each agent needs to run, including its config directory, credential stores, and runtime group.
+- **Language runtimes** — profiles for common developer workflows (node-dev, python-dev, go-dev, rust-dev). These include the appropriate runtime group and a developer network profile.
+
+Predefined profiles are intentionally narrow. They do not encode environment-specific paths because those vary by OS distribution, package manager, and installation method. A `java-dev` profile cannot know whether your JDK config lives in `/etc/java-openjdk`, `/etc/java21-openjdk`, or somewhere else entirely — that depends on your system.
+
+**Environment-specific additions belong in a user profile.** Write a profile that extends the closest predefined profile and adds only what your environment requires:
+
+```json
+{
+  "meta": {
+    "name": "java-dev-local",
+    "version": "1.0.0",
+    "description": "Java / Maven profile for this machine's JDK install"
+  },
+  "extends": "java-dev",
+  "filesystem": {
+    "read": [
+      "/etc/java21-openjdk"
+    ]
+  },
+  "network": {
+    "allow_domain": [
+      "repo.maven.apache.org",
+      "oss.sonatype.org"
+    ]
+  }
+}
+```
+
+Save this to `~/.config/nono/profiles/java-dev-local.json` and use it with:
+
+```bash
+nono run --profile java-dev-local -- mvn package
+```
+
+This keeps the predefined profile stable and auditable while giving you full control over your local environment's requirements. See [Creating User Profiles](#creating-user-profiles) below for the full workflow.
+
 ### Profile Sources
 
 Profiles can come from three sources, in order of precedence:
@@ -643,6 +684,7 @@ nono ships with 32 built-in groups:
 - `rust_runtime` - rustup, cargo
 - `python_runtime` - pyenv, conda, pip, uv
 - `go_runtime` - ~/go, /usr/local/go
+- `java_runtime` - SDKMAN (~/.sdkman), Maven (~/.m2/repository, ~/.m2/wrapper), Gradle (~/.gradle/caches, ~/.gradle/wrapper)
 - `nix_runtime` - Nix profile paths, /nix/store, /nix/var (Linux only)
 - `user_tools` - Local bins, .desktop files, man pages, shell completions
 - `homebrew` - /opt/homebrew, /usr/local/Cellar, /usr/local/opt (macOS only)
@@ -807,6 +849,25 @@ nono run --profile rust-dev -- cargo run
 **Network:** Allowed, with `developer` network profile for host filtering
 
 **CWD:** Read+write
+
+### java-dev
+
+```bash
+nono run --profile java-dev -- mvn package
+```
+
+**Groups:** `java_runtime` (plus `default` groups)
+
+**Network:** Allowed, with `developer` network profile for host filtering
+
+**CWD:** Read+write
+
+<Note>
+  `java-dev` covers SDKMAN-managed JDKs, Maven, and Gradle. It does not include
+  system JDK config paths (e.g. `/etc/java21-openjdk`) because these vary by
+  distribution and installation method. Add them in a user profile that extends
+  `java-dev` — see [Predefined Profiles vs User Profiles](#predefined-profiles-vs-user-profiles).
+</Note>
 
 ---
 

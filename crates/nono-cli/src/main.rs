@@ -56,6 +56,8 @@ mod pty_proxy;
 mod pull_ui;
 mod query_ext;
 mod registry_client;
+#[cfg(target_os = "linux")]
+mod resource_cgroup;
 mod rollback_commands;
 mod rollback_preflight;
 mod rollback_runtime;

@@ -652,6 +652,24 @@ Can be specified multiple times for multiple ports.
 **Linux limitation:** Landlock ABI v4+ enforces both connect and bind per-port, but **cannot filter by destination IP**. The ConnectTcp rule allows connecting to the specified port on any IP, not just localhost. In practice this is mitigated by using `--block-net` (which blocks all outbound except the allowed ports) or proxy mode (which routes outbound through the localhost proxy). Only the `--open-port` + default AllowAll combination (a no-op) would theoretically permit non-localhost connections on the port.
 </Warning>
 
+### Resource Limits
+
+#### `--memory`
+
+Cap the resident memory of the sandboxed process tree. If the tree goes over, the Linux kernel kills the whole sandbox at once (the run exits `137`) and nono prints a diagnostic naming the limit and the peak the tree reached.
+
+```bash
+nono run --memory 512M -- my-agent
+```
+
+Sizes take an optional unit suffix: `512M`/`512MiB` (binary, 1024-based), `512MB` (decimal, 1000-based), and `K`/`G`/`T` likewise; a bare number is bytes.
+
+- **Linux only**, enforced via cgroup v2, and requires a systemd `Delegate=yes` user session. On other platforms the request is refused rather than silently ignored.
+- Enforced on `nono run` and `nono shell` (supervised). `nono wrap` execs directly and does not accept `--memory`.
+- Granting the sandbox **write** access overlapping `/sys/fs/cgroup` (e.g. `--allow /sys`) is refused while `--memory` is active, since it would let the process rewrite its own cap. Use `--read /sys` instead if a workload needs it.
+
+See [Resource Limits](/cli/features/resource-limits) for the full details.
+
 ## `nono shell` Options
 
 `nono shell` supports the same permission, profile, credential, and dry-run flags as `nono run`, plus:

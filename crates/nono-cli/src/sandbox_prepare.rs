@@ -585,11 +585,29 @@ pub(crate) fn resolve_detached_cwd_prompt_response(
 }
 
 fn finalize_prepared_sandbox(
-    prepared: PreparedSandbox,
+    mut prepared: PreparedSandbox,
     blocked_grants: &[(PathBuf, Option<String>)],
     args: &SandboxArgs,
     silent: bool,
 ) -> Result<PreparedSandbox> {
+    // Attach resource limits from CLI flags. The manifest path already set caps via
+    // `CapabilitySet::try_from`, and flags conflict with `--config`, so this only
+    // runs on the flag path. Enforcement is later, in the supervised runtime; here
+    // we just attach the parsed limits to the capability set (also in --dry-run).
+    if let Some(ref s) = args.memory {
+        let memory_bytes = parse_memory_limit_flag(s)?;
+        prepared.caps = prepared.caps.with_resource_limits(nono::ResourceLimits {
+            memory_bytes: Some(memory_bytes),
+        });
+    }
+
+    // SECURITY: the memory cap lives in cgroup control files under /sys/fs/cgroup.
+    // Write access to any part of that tree lets the child rewrite its own
+    // memory.max (or migrate to a cgroup it makes) and defeat the cap. Landlock is
+    // allow-list and can't carve the cgroup tree out of a broad grant like `/sys`,
+    // so refuse the run rather than enforce a cap the sandbox can lift.
+    reject_cgroup_writable_grants_under_memory_limit(&prepared.caps)?;
+
     output::print_skipped_requested_paths(&collect_missing_cli_requested_paths(args), silent);
     let proxy_intent = has_proxy_intent(args, &prepared);
     let block_wins = args.block_net || (prepared.profile_network_block && !proxy_intent);
@@ -618,6 +636,75 @@ fn finalize_prepared_sandbox(
     info!("{}", Sandbox::support_info().details);
 
     Ok(prepared)
+}
+
+/// Smallest `--memory` ceiling the CLI accepts. A bare number is bytes, so
+/// `--memory 512` means 512 B — which OOM-kills any real process the instant it
+/// starts, almost always a unit slip for `512M`. Refuse anything below this floor
+/// with a hint instead of silently enforcing an unusable cap. (Manifests carry an
+/// already-resolved byte count guarded by the schema's `minimum: 1`.)
+const MIN_MEMORY_LIMIT_BYTES: u64 = 1024 * 1024; // 1 MiB
+
+/// Parse the `--memory` flag and reject implausibly small ceilings (see
+/// [`MIN_MEMORY_LIMIT_BYTES`]). Surfaces the parse error for malformed sizes.
+fn parse_memory_limit_flag(s: &str) -> Result<u64> {
+    let bytes = nono::resource::parse_size(s)?;
+    if bytes < MIN_MEMORY_LIMIT_BYTES {
+        let digits: String = s
+            .trim()
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        let hint = if digits.is_empty() {
+            "use a size unit like M or G (e.g. 512M, 2G)".to_string()
+        } else {
+            format!("a bare number is bytes — did you mean {digits}M? use a unit like M or G")
+        };
+        return Err(NonoError::ConfigParse(format!(
+            "--memory {s} is {}, below the 1 MiB minimum; {hint}",
+            nono::resource::format_bytes(bytes)
+        )));
+    }
+    Ok(bytes)
+}
+
+/// True when a filesystem grant gives the sandbox WRITE access over any part of
+/// the cgroup v2 hierarchy (`/sys/fs/cgroup`) that enforces `--memory`. Dangerous
+/// either way the paths nest: the grant is inside the tree, or a broad ancestor
+/// (`/sys`, `/`) containing it. Read-only is safe — defeating the cap needs
+/// writing the knobs or `cgroup.procs`. Component-based `Path::starts_with`, not a
+/// string prefix, so `/sys/fs/cgroupX` doesn't match `/sys/fs/cgroup`.
+fn grant_opens_cgroup_control_plane(resolved: &Path, access: AccessMode) -> bool {
+    if !matches!(access, AccessMode::Write | AccessMode::ReadWrite) {
+        return false;
+    }
+    let cgroup_mount = Path::new("/sys/fs/cgroup");
+    resolved.starts_with(cgroup_mount) || cgroup_mount.starts_with(resolved)
+}
+
+/// Refuse a run whose `--memory` cap could be defeated because the sandbox is also
+/// granted write access over the cgroup hierarchy enforcing it (the child could
+/// raise its own `memory.max` or migrate out of the leaf). Only fires when a
+/// memory limit is set.
+fn reject_cgroup_writable_grants_under_memory_limit(caps: &CapabilitySet) -> Result<()> {
+    if caps
+        .resource_limits()
+        .is_none_or(|limits| limits.is_empty())
+    {
+        return Ok(());
+    }
+    for cap in caps.fs_capabilities() {
+        if grant_opens_cgroup_control_plane(&cap.resolved, cap.access) {
+            return Err(NonoError::ConfigParse(format!(
+                "refusing write access to '{}' while a --memory limit is enforced: it overlaps \
+                 the cgroup hierarchy (/sys/fs/cgroup) that enforces the limit, so the sandbox \
+                 could rewrite its own memory cap and escape it. Make the grant read-only, scope \
+                 it more narrowly, or drop --memory.",
+                cap.resolved.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Returns true if any CLI flag or profile field requires the proxy to run.
@@ -1216,8 +1303,8 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
 
     let prepared_profile = prepare_profile(args, silent, &workdir)?;
     let crate::profile_runtime::PreparedProfile {
-        loaded_profile,
-        command_policies,
+        mut loaded_profile,
+        mut command_policies,
         capability_elevation,
         #[cfg(target_os = "linux")]
         wsl2_proxy_policy,
@@ -1250,6 +1337,21 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         denied_env_vars: profile_denied_env_vars,
         set_vars: profile_set_vars,
     } = prepared_profile;
+
+    // Raw Seatbelt rules (`unsafe_macos_seatbelt_rules`) are as powerful as
+    // an arbitrary `binary` override, so honour them only for user-authored
+    // profiles — same trust boundary as `resolve_profile_binary`. Strip them
+    // (top-level and nested in command/from/intercept sandboxes) for
+    // pack/registry/built-in profiles before they can reach emission.
+    if let (Some(profile_name), Some(profile)) = (args.profile.as_deref(), loaded_profile.as_mut())
+    {
+        crate::command_runtime::strip_untrusted_unsafe_seatbelt_rules(
+            profile_name,
+            profile,
+            command_policies.as_mut(),
+            silent,
+        );
+    }
 
     let session_hooks = loaded_profile
         .as_ref()
@@ -2005,6 +2107,109 @@ mod tests {
             ),
             Some(DetachedCwdPromptResponse::Deny)
         );
+    }
+
+    #[test]
+    fn cgroup_write_grant_detection_is_component_based() {
+        let (w, rw, r) = (AccessMode::Write, AccessMode::ReadWrite, AccessMode::Read);
+
+        // Inside or equal to the cgroup mount -> dangerous (writable).
+        assert!(grant_opens_cgroup_control_plane(
+            Path::new("/sys/fs/cgroup"),
+            w
+        ));
+        assert!(grant_opens_cgroup_control_plane(
+            Path::new("/sys/fs/cgroup/user.slice/user-1000.slice"),
+            rw
+        ));
+        // A broad ancestor that subsumes the cgroup mount -> dangerous.
+        assert!(grant_opens_cgroup_control_plane(Path::new("/sys"), w));
+        assert!(grant_opens_cgroup_control_plane(Path::new("/sys/fs"), w));
+        assert!(grant_opens_cgroup_control_plane(Path::new("/"), w));
+
+        // Read-only is safe even over the cgroup tree (cannot write the knobs).
+        assert!(!grant_opens_cgroup_control_plane(
+            Path::new("/sys/fs/cgroup"),
+            r
+        ));
+        assert!(!grant_opens_cgroup_control_plane(Path::new("/sys"), r));
+
+        // Unrelated or sibling write grants are safe.
+        assert!(!grant_opens_cgroup_control_plane(
+            Path::new("/sys/devices"),
+            w
+        ));
+        assert!(!grant_opens_cgroup_control_plane(Path::new("/tmp"), rw));
+
+        // Component-based: a look-alike sibling must NOT match. A string
+        // `starts_with` would wrongly flag this — the bug this guards against.
+        assert!(!grant_opens_cgroup_control_plane(
+            Path::new("/sys/fs/cgroupX"),
+            w
+        ));
+    }
+
+    #[test]
+    fn cgroup_grant_guard_only_fires_with_a_memory_limit() {
+        // No limit -> always Ok (guard short-circuits before inspecting grants).
+        assert!(reject_cgroup_writable_grants_under_memory_limit(&CapabilitySet::new()).is_ok());
+        // A limit set but no filesystem grants -> Ok.
+        let caps = CapabilitySet::new().with_resource_limits(nono::ResourceLimits {
+            memory_bytes: Some(64 * 1024 * 1024),
+        });
+        assert!(reject_cgroup_writable_grants_under_memory_limit(&caps).is_ok());
+    }
+
+    // The guard's whole point: with a memory limit active, a writable grant that
+    // overlaps the cgroup tree is refused — otherwise the sandbox could rewrite its
+    // own memory.max and lift the cap. Linux-only because we need the real cgroup
+    // mount to canonicalize a grant over it; skip gracefully if it isn't present.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn cgroup_write_grant_under_a_memory_limit_is_refused() {
+        let Ok(grant) = FsCapability::new_dir("/sys/fs/cgroup", AccessMode::Write) else {
+            return; // no cgroup mount on this host — nothing to exercise
+        };
+        let mut caps = CapabilitySet::new().with_resource_limits(nono::ResourceLimits {
+            memory_bytes: Some(64 * 1024 * 1024),
+        });
+        caps.add_fs(grant);
+
+        let err = reject_cgroup_writable_grants_under_memory_limit(&caps)
+            .expect_err("a writable /sys/fs/cgroup grant under a memory limit must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("/sys/fs/cgroup"),
+            "error must name the overlapping path: {msg}"
+        );
+        assert!(
+            msg.contains("--memory"),
+            "error should mention the limit: {msg}"
+        );
+    }
+
+    #[test]
+    fn memory_flag_rejects_below_one_mib_with_unit_hint() {
+        // Bare bytes that are almost certainly a unit slip for 512M.
+        let err = parse_memory_limit_flag("512").expect_err("512 B must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("1 MiB minimum"), "msg: {msg}");
+        assert!(msg.contains("512M"), "should echo the unit form: {msg}");
+
+        // Sub-MiB even with a unit is refused (512K = 512 KiB).
+        assert!(parse_memory_limit_flag("512K").is_err());
+        // The floor itself and anything above it are accepted.
+        assert_eq!(
+            parse_memory_limit_flag("1M").expect("1 MiB is at the floor"),
+            1024 * 1024
+        );
+        assert_eq!(
+            parse_memory_limit_flag("512M").expect("512M is well above the floor"),
+            512 * 1024 * 1024
+        );
+        // Malformed sizes still surface the parser's error.
+        assert!(parse_memory_limit_flag("abc").is_err());
+        assert!(parse_memory_limit_flag("0").is_err());
     }
 
     fn empty_prepared() -> PreparedSandbox {

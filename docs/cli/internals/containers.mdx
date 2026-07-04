@@ -17,7 +17,7 @@ This guide helps you understand what each brings to the table and when to use on
 | Works on host files | Yes (directly) | Requires volume mounts |
 | Credential protection | Automatic blocklist | Manual (don't mount) |
 | Network isolation | On/off | Full namespace |
-| Resource limits | No | Yes (cgroups) |
+| Resource limits | Memory cap (cgroup v2, Linux) | Yes (cgroups) |
 | Process isolation | No | Yes (PID namespace) |
 
 ## What nono Adds
@@ -104,7 +104,7 @@ Containers can limit CPU, memory, and I/O:
 docker run --memory=2g --cpus=1 my-agent
 ```
 
-nono does not limit resources. A runaway agent can consume all available CPU/memory.
+nono can cap memory with `--memory` (a cgroup v2 hard ceiling on Linux; see [Resource limits](/cli/features/resource-limits)), so a runaway agent cannot exhaust host RAM. It does not yet limit CPU or I/O — for those, reach for a container.
 
 ### Process Isolation
 

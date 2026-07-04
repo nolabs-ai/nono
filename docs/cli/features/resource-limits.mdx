@@ -1,0 +1,94 @@
+---
+title: Resource Limits
+description: Cap a sandboxed process tree's memory with OS-enforced cgroup limits
+---
+
+`nono` can place a hard ceiling on how much memory a sandboxed command — and every process it spawns — may use. If the tree goes over, the Linux kernel kills it instantly, and only it, so a runaway agent cannot exhaust the host.
+
+## Limiting memory
+
+Pass `--memory` to `nono run` (or `nono shell`):
+
+```bash
+nono run --memory 512M -- my-agent
+```
+
+Sizes take an optional, case-insensitive unit suffix:
+
+| Form | Meaning |
+| --- | --- |
+| `1048576`, `512B` | bytes |
+| `512K` / `512Ki` / `512KiB` | binary, 1024-based |
+| `512KB` | decimal, 1000-based |
+| `M` / `MiB`, `G` / `GiB`, `T` / `TiB` | binary mega / giga / tera |
+| `MB`, `GB`, `TB` | decimal |
+
+So `512M` is 536,870,912 bytes and `1Gi` is 1,073,741,824 bytes. The ceiling covers the whole process tree, not just the first process.
+
+## What happens at the limit
+
+When the tree crosses the cap, the kernel terminates the entire sandbox at once and `nono` explains why instead of dying silently:
+
+```
+[nono] memory limit exceeded: the sandboxed process tree was killed by the kernel for using too much memory.
+       limit (--memory): 512.0 MiB
+       peak memory:      512.0 MiB
+       OOM kills:        2 (whole-sandbox kills: 1)
+       swap:             disabled (memory.swap.max=0) — nothing could spill to swap
+       hint: raise the ceiling to allow more memory, e.g. --memory 1G.
+```
+
+The run exits `137` (128 + `SIGKILL`). A failure unrelated to memory shows the normal diagnostics, not this one.
+
+## How it works
+
+On Linux the limit is enforced with **cgroup v2**, the same kernel mechanism containers use. For each run `nono`:
+
+- creates a leaf control group under your delegated user session (`.../user@<uid>.service/nono.<pid>`),
+- sets `memory.max` to the cap, `memory.swap.max=0` (so the limit cannot be dodged via swap), and `memory.oom.group=1` (so the whole tree is killed together), and
+- has the sandboxed child place *itself* into the group before it can fork or exec, so every descendant is contained by construction.
+
+The group is removed when the run ends. A leftover group from a supervisor that was hard-killed (`SIGKILL`) is swept on the next run.
+
+## Requirements and scope
+
+- **Linux only.** Enforcement needs cgroup v2 and a systemd `Delegate=yes` user session (a normal desktop or server login). On other platforms a `--memory` request is refused rather than silently ignored.
+- **Supervised runs only.** `nono run` and `nono shell` enforce it. `nono wrap` execs directly and cannot create the cgroup, so it does not accept `--memory`.
+- **Memory only.** There is currently no CPU-time or process-count limit.
+- **Fail closed.** If the cgroup cannot be created or armed, the run is refused — `nono` never runs a requested limit unenforced.
+
+## Manifests
+
+A capability manifest can carry the limit. It requires the supervised execution strategy:
+
+```json
+{
+  "version": "0.1.0",
+  "process": { "exec_strategy": "supervised" },
+  "resources": { "memory_bytes": 536870912 }
+}
+```
+
+`resources.memory_bytes` is a plain byte count — human-friendly sizes like `512M` are a CLI convenience, resolved before they reach the manifest.
+
+## Do not grant write over the cgroup tree
+
+The limit lives in control files under `/sys/fs/cgroup`. If the sandbox is *also* granted **write** access overlapping that path (for example `--allow /sys`), the process could rewrite its own limit and escape the cap. `nono` refuses such a run while `--memory` is active:
+
+```
+refusing write access to '/sys' while a --memory limit is enforced: it overlaps
+the cgroup hierarchy (/sys/fs/cgroup) that enforces the limit ...
+```
+
+Grant `/sys` read-only (`--read /sys`) if a workload needs it — read access cannot defeat the cap.
+
+## Inspecting the limit
+
+The active limit appears in the capability summary at launch, and in `nono why --self` from inside the sandbox:
+
+```bash
+nono why --self
+#   Capabilities:
+#   resources memory=512.0 MiB
+#   ...
+```

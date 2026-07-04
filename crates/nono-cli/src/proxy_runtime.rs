@@ -58,6 +58,7 @@ struct ResolvedCredentialCaptureEntry {
     allow_headers: HashSet<String>,
     interactive: bool,
     stdio: bool,
+    inherit_stdin: bool,
     open_urls: Option<CaptureOpenUrlPolicy>,
     allow_launch_services: bool,
 }
@@ -189,13 +190,19 @@ impl ProxyCredentialCaptureBackend {
                     })
             });
             let stdio = interaction.is_some_and(|interaction| interaction.stdio);
+            let inherit_stdin = interaction.is_some_and(|interaction| interaction.stdin);
             let allow_launch_services =
                 interaction.is_some_and(|interaction| interaction.allow_launch_services);
             resolved.insert(
                 name.clone(),
                 ResolvedCredentialCaptureEntry {
                     command_path,
-                    args: entry.command.iter().skip(1).cloned().collect(),
+                    args: entry
+                        .command
+                        .iter()
+                        .skip(1)
+                        .map(|a| crate::policy::expand_env_vars(a))
+                        .collect(),
                     timeout: Duration::from_secs(entry.timeout_secs.unwrap_or(5)),
                     ttl: Duration::from_secs(
                         entry.cache_ttl_secs.or(entry.ttl_secs).unwrap_or(900),
@@ -215,6 +222,7 @@ impl ProxyCredentialCaptureBackend {
                     allow_headers: credential_capture_allow_headers(&entry.output),
                     interactive: stdio || open_urls.is_some() || allow_launch_services,
                     stdio,
+                    inherit_stdin,
                     open_urls,
                     allow_launch_services,
                 },
@@ -296,7 +304,9 @@ impl ProxyCredentialCaptureBackend {
         let start = Instant::now();
         let mut command = Command::new(&entry.command_path);
         let stdin = match entry.stdin_mode {
-            crate::profile::CredentialCaptureStdinMode::Null if entry.stdio => Stdio::inherit(),
+            crate::profile::CredentialCaptureStdinMode::Null if entry.inherit_stdin => {
+                Stdio::inherit()
+            }
             crate::profile::CredentialCaptureStdinMode::Null => Stdio::null(),
             crate::profile::CredentialCaptureStdinMode::RequestJson => Stdio::piped(),
         };
@@ -1108,6 +1118,8 @@ fn redacted_stderr(stderr: &[u8], policy: &nono::ScrubPolicy) -> Option<String> 
 }
 
 fn resolve_capture_command(command: &str) -> Result<PathBuf> {
+    let expanded = crate::policy::expand_env_vars(command);
+    let command = expanded.as_str();
     let path = PathBuf::from(command);
     if path.is_absolute() {
         return validate_capture_command_path(path);
@@ -2469,6 +2481,11 @@ mod tests {
         CommandCredentialGrantPolicyConfig, CommandPolicyConfig, EndpointRuleConfig,
     };
 
+    // Shared across all tests that dup/dup2 the process's stdin fd, so two such tests
+    // never race on fd 0 when cargo runs them concurrently.
+    #[cfg(unix)]
+    static STDIN_MANIPULATION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[cfg(unix)]
     #[test]
     fn set_intercept_ca_dir_permissions_fails_closed() -> Result<()> {
@@ -2661,8 +2678,14 @@ mod tests {
             wsl2_proxy_policy: crate::profile::Wsl2ProxyPolicy::Error,
             #[cfg(target_os = "linux")]
             af_unix_mediation: crate::profile::LinuxAfUnixMediation::Off,
+            #[cfg(target_os = "linux")]
+            sandbox_policy: crate::profile::LinuxSandboxPolicy::Auto,
+            #[cfg(target_os = "linux")]
+            explicit_sandbox_policy: None,
             allow_launch_services_active: false,
             allow_gpu_active: false,
+            #[cfg(target_os = "linux")]
+            proc_comm_notify: false,
             open_url_origins: Vec::new(),
             open_url_allow_localhost: false,
             bypass_protection_paths: Vec::new(),
@@ -3287,6 +3310,7 @@ mod tests {
         ]);
         entry.interaction = Some(crate::profile::CredentialCaptureInteraction {
             stdio: false,
+            stdin: false,
             open_urls: Some(crate::profile::OpenUrlConfig {
                 allow_origins: vec!["https://github.com".to_string()],
                 allow_localhost: true,
@@ -3318,7 +3342,7 @@ mod tests {
     fn test_capture_entry(command: Vec<String>) -> crate::profile::CredentialCaptureEntry {
         crate::profile::CredentialCaptureEntry {
             command,
-            timeout_secs: Some(5),
+            timeout_secs: Some(30),
             ttl_secs: Some(60),
             cache_ttl_secs: None,
             cache_path_regex: None,
@@ -3492,5 +3516,169 @@ mod tests {
             result.is_err(),
             "--allow-endpoint for a service without --credential must error"
         );
+    }
+
+    // Verify that a credential helper with `stdio: true` (interaction.stdio) does not
+    // inherit the terminal's stdin. The `stdio` flag is only meant to allow the helper
+    // to write prompts via stderr; stdin must always be /dev/null when stdin_mode is Null.
+    //
+    // The test replaces the process's stdin fd with a blocking pipe (write end kept open,
+    // so it never reaches EOF). If the fix is absent, the child inherits that blocking fd
+    // and `select` reports it as not ready; with the fix, the child gets /dev/null instead
+    // and `select` reports it as readable (EOF is a readable condition).
+    #[test]
+    #[cfg(unix)]
+    fn capture_helper_with_stdio_true_receives_null_not_terminal_stdin() -> Result<()> {
+        use nix::libc;
+
+        let _guard = STDIN_MANIPULATION_LOCK
+            .lock()
+            .map_err(|e| NonoError::SandboxInit(format!("stdin lock poisoned: {e}")))?;
+
+        let mut pipe_fds = [-1i32; 2];
+        let saved_stdin;
+        unsafe {
+            assert_eq!(libc::pipe(pipe_fds.as_mut_ptr()), 0, "pipe() failed");
+            saved_stdin = libc::dup(libc::STDIN_FILENO);
+            assert!(saved_stdin >= 0, "dup(stdin) failed");
+            assert_eq!(
+                libc::dup2(pipe_fds[0], libc::STDIN_FILENO),
+                libc::STDIN_FILENO,
+                "dup2 failed"
+            );
+            libc::close(pipe_fds[0]);
+        }
+
+        let result = (|| -> Result<()> {
+            let mut entry = test_capture_entry_no_cache(vec![
+                "/usr/bin/python3".to_string(),
+                "-c".to_string(),
+                // select() with timeout=0: /dev/null stdin is immediately readable (EOF);
+                // a blocking pipe (write end open, no data) is not ready.
+                concat!(
+                    "import select, sys; ",
+                    "r, _, _ = select.select([sys.stdin], [], [], 0); ",
+                    "sys.stdout.write('null' if r else 'blocked'); ",
+                    "sys.stdout.flush()"
+                )
+                .to_string(),
+            ]);
+            entry.interaction = Some(crate::profile::CredentialCaptureInteraction {
+                stdio: true,
+                stdin: false,
+                open_urls: None,
+                allow_launch_services: false,
+            });
+            let mut entries = HashMap::new();
+            entries.insert("test-cred".to_string(), entry);
+            let backend =
+                ProxyCredentialCaptureBackend::new(&entries, "sess-stdio-stdin".to_string())?;
+            let response = nono_proxy::capture::CredentialCaptureBackend::capture(
+                &backend,
+                nono_proxy::capture::CredentialCaptureRequest {
+                    credential_name: "test-cred".to_string(),
+                    route_id: "test-cred".to_string(),
+                    request_host: "example.com".to_string(),
+                    request_path: "/".to_string(),
+                    request_method: "GET".to_string(),
+                    session_id: String::new(),
+                    cache_scope: String::new(),
+                },
+            )
+            .map_err(|err| NonoError::SandboxInit(err.to_string()))?;
+            assert_eq!(
+                capture_secret(&response),
+                "null",
+                "credential helper stdin must be /dev/null when stdio:true, not the inherited fd"
+            );
+            Ok(())
+        })();
+
+        // Restore stdin whether the test passed or failed.
+        unsafe {
+            libc::dup2(saved_stdin, libc::STDIN_FILENO);
+            libc::close(saved_stdin);
+            libc::close(pipe_fds[1]);
+        }
+
+        result
+    }
+
+    // Verify that setting interaction.stdin:true lets the credential helper inherit the
+    // terminal stdin. This is the explicit opt-in for helpers that genuinely need to
+    // prompt the user for input.
+    #[test]
+    #[cfg(unix)]
+    fn capture_helper_with_interaction_stdin_true_inherits_terminal_stdin() -> Result<()> {
+        use nix::libc;
+
+        let _guard = STDIN_MANIPULATION_LOCK
+            .lock()
+            .map_err(|e| NonoError::SandboxInit(format!("stdin lock poisoned: {e}")))?;
+
+        let mut pipe_fds = [-1i32; 2];
+        let saved_stdin;
+        unsafe {
+            assert_eq!(libc::pipe(pipe_fds.as_mut_ptr()), 0, "pipe() failed");
+            saved_stdin = libc::dup(libc::STDIN_FILENO);
+            assert!(saved_stdin >= 0, "dup(stdin) failed");
+            assert_eq!(
+                libc::dup2(pipe_fds[0], libc::STDIN_FILENO),
+                libc::STDIN_FILENO,
+                "dup2 failed"
+            );
+            libc::close(pipe_fds[0]);
+        }
+
+        let result = (|| -> Result<()> {
+            let mut entry = test_capture_entry_no_cache(vec![
+                "/usr/bin/python3".to_string(),
+                "-c".to_string(),
+                concat!(
+                    "import select, sys; ",
+                    "r, _, _ = select.select([sys.stdin], [], [], 0); ",
+                    "sys.stdout.write('null' if r else 'blocked'); ",
+                    "sys.stdout.flush()"
+                )
+                .to_string(),
+            ]);
+            entry.interaction = Some(crate::profile::CredentialCaptureInteraction {
+                stdio: true,
+                stdin: true,
+                open_urls: None,
+                allow_launch_services: false,
+            });
+            let mut entries = HashMap::new();
+            entries.insert("test-cred".to_string(), entry);
+            let backend =
+                ProxyCredentialCaptureBackend::new(&entries, "sess-inherit-stdin".to_string())?;
+            let response = nono_proxy::capture::CredentialCaptureBackend::capture(
+                &backend,
+                nono_proxy::capture::CredentialCaptureRequest {
+                    credential_name: "test-cred".to_string(),
+                    route_id: "test-cred".to_string(),
+                    request_host: "example.com".to_string(),
+                    request_path: "/".to_string(),
+                    request_method: "GET".to_string(),
+                    session_id: String::new(),
+                    cache_scope: String::new(),
+                },
+            )
+            .map_err(|err| NonoError::SandboxInit(err.to_string()))?;
+            assert_eq!(
+                capture_secret(&response),
+                "blocked",
+                "credential helper stdin must be inherited when interaction.stdin:true"
+            );
+            Ok(())
+        })();
+
+        unsafe {
+            libc::dup2(saved_stdin, libc::STDIN_FILENO);
+            libc::close(saved_stdin);
+            libc::close(pipe_fds[1]);
+        }
+
+        result
     }
 }

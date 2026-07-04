@@ -429,8 +429,14 @@ pub struct CredentialCaptureOutputConfig {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CredentialCaptureInteraction {
+    /// Allow the capture command to write prompts to the terminal via inherited stderr.
     #[serde(default)]
     pub stdio: bool,
+    /// Allow the capture command to read from the terminal via inherited stdin.
+    /// Only set this when the helper genuinely needs to prompt the user for input.
+    /// Defaults to false; stdin is `/dev/null` unless explicitly enabled.
+    #[serde(default)]
+    pub stdin: bool,
     #[serde(default)]
     pub open_urls: Option<OpenUrlConfig>,
     #[serde(default)]
@@ -1285,8 +1291,7 @@ fn validate_env_credential_keys(profile: &Profile) -> Result<()> {
         // Validate destination env var name against dangerous blocklist
         nono::validate_destination_env_var(value).map_err(|e| {
             NonoError::ProfileParse(format!(
-                "invalid destination env var '{}' in env_credentials: {}",
-                value, e
+                "invalid destination env var '{value}' in env_credentials: {e}"
             ))
         })?;
     }
@@ -1778,6 +1783,25 @@ pub struct DiagnosticsConfig {
     pub suppress_system_services: Vec<String>,
 }
 
+/// Which sandboxing mechanism nono should install on Linux.
+///
+/// Defaults to `auto`, which reflects the historical behaviour.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum LinuxSandboxPolicy {
+    /// Landlock with automatic seccomp fallback when the kernel ABI lacks
+    /// network support (< V4). This is the default.
+    #[default]
+    Auto,
+    /// Landlock only. Returns an error at startup if the kernel cannot
+    /// satisfy network restrictions via Landlock alone.
+    Landlock,
+    /// TCP network egress enforcement is managed externally (iptables,
+    /// cgroups, systemd, etc.). nono still installs filesystem/process
+    /// sandboxing and skips only its own TCP network lockdown.
+    External,
+}
+
 /// Linux-specific profile controls.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1785,6 +1809,9 @@ pub struct LinuxConfig {
     /// Opt-in pathname AF_UNIX mediation mode.
     #[serde(default)]
     pub af_unix_mediation: Option<LinuxAfUnixMediation>,
+    /// Which sandboxing mechanism to use. Defaults to `auto`.
+    #[serde(default)]
+    pub sandbox_policy: Option<LinuxSandboxPolicy>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1887,10 +1914,15 @@ pub struct EnvironmentConfig {
     ///
     /// Supports exact names (`"PATH"`) and prefix patterns ending with `*`
     /// (`"AWS_*"` matches `AWS_REGION`, `AWS_SECRET_ACCESS_KEY`, etc.).
-    /// When empty, all variables are allowed (default).
+    ///
+    /// - Absent (field not written in JSON): no filter, all variables pass through.
+    /// - `[]` (explicitly empty): blocks all inherited variables; only nono-injected
+    ///   credentials reach the child.
+    /// - Non-empty: only matching variables pass through.
+    ///
     /// Nono-injected credentials always bypass this list.
-    #[serde(default)]
-    pub allow_vars: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_vars: Option<Vec<String>>,
 
     /// Deny-list of environment variable names stripped from the sandboxed process.
     ///
@@ -2294,6 +2326,21 @@ pub fn load_profile_extends(name_or_path: &str) -> Option<Vec<String>> {
 /// 4. Auto-pull prompt for the registry pack `always-further/claude` when
 ///    the requested profile is `claude-code` (or inherits from it).
 pub fn load_profile(name_or_path: &str) -> Result<Profile> {
+    load_profile_impl(name_or_path, &[])
+}
+
+/// Load a profile by name or file path, injecting additional CLI-selected bases.
+///
+/// Non-empty `cli_extends` behaves as if those base names were prepended to the
+/// selected profile's raw `extends` list before inheritance resolution. Bases
+/// still resolve through the normal profile resolver, so cycle checks, sibling
+/// lookup, pack provenance, migration prompts, and validation remain shared
+/// with JSON-authored inheritance.
+pub fn load_profile_with_extends(name_or_path: &str, cli_extends: &[String]) -> Result<Profile> {
+    load_profile_impl(name_or_path, cli_extends)
+}
+
+fn load_profile_impl(name_or_path: &str, cli_extends: &[String]) -> Result<Profile> {
     // Enable the chain-aware migration prompt for the duration of this
     // call: if `extends` resolution hits a pack-provided base that isn't
     // installed (e.g. user profile that `extends: ["claude-code"]`),
@@ -2301,7 +2348,7 @@ pub fn load_profile(name_or_path: &str) -> Result<Profile> {
     // than failing with "base profile not found". The flag is restored
     // on exit so nested `load_profile_no_migrate` calls stay quiet.
     with_missing_base_prompt(true, || {
-        if let Some(profile) = load_profile_inner(name_or_path)? {
+        if let Some(profile) = load_profile_inner(name_or_path, cli_extends)? {
             return Ok(profile);
         }
 
@@ -2318,7 +2365,8 @@ pub fn load_profile(name_or_path: &str) -> Result<Profile> {
                         "Loading pack-store profile from: {}",
                         profile_path.display()
                     );
-                    let mut profile = finalize_profile(load_from_file(&profile_path)?)?;
+                    let mut profile =
+                        load_from_file(&profile_path, cli_extends).and_then(finalize_profile)?;
                     if !profile.packs.contains(&pack_key) {
                         profile.packs.push(pack_key);
                     }
@@ -2353,7 +2401,7 @@ pub fn load_profile(name_or_path: &str) -> Result<Profile> {
 /// the user with a network operation.
 pub fn load_profile_no_migrate(name_or_path: &str) -> Result<Profile> {
     with_missing_base_prompt(false, || {
-        if let Some(profile) = load_profile_inner(name_or_path)? {
+        if let Some(profile) = load_profile_inner(name_or_path, &[])? {
             return Ok(profile);
         }
         Err(NonoError::ProfileNotFound(name_or_path.to_string()))
@@ -2387,12 +2435,12 @@ fn missing_base_prompt_enabled() -> bool {
 /// and `Err(_)` on validation/IO failures. Shared between `load_profile`
 /// (which then runs the migration prompt) and `load_profile_no_migrate`
 /// (which surfaces a not-found error directly).
-fn load_profile_inner(name_or_path: &str) -> Result<Option<Profile>> {
+fn load_profile_inner(name_or_path: &str, cli_extends: &[String]) -> Result<Option<Profile>> {
     if is_registry_ref(name_or_path) {
-        return load_registry_profile(name_or_path).map(Some);
+        return load_registry_profile(name_or_path, cli_extends).map(Some);
     }
     if is_file_path_ref(name_or_path) {
-        return load_profile_from_path(Path::new(name_or_path)).map(Some);
+        return load_profile_from_path_impl(Path::new(name_or_path), cli_extends).map(Some);
     }
     if !is_valid_profile_name(name_or_path) {
         return Err(NonoError::ProfileParse(format!(
@@ -2403,14 +2451,14 @@ fn load_profile_inner(name_or_path: &str) -> Result<Option<Profile>> {
     let profile_path = resolve_user_profile_path(name_or_path)?;
     if profile_path.exists() {
         tracing::info!("Loading user profile from: {}", profile_path.display());
-        return finalize_profile(load_from_file(&profile_path)?).map(Some);
+        return load_profile_from_path_impl(&profile_path, cli_extends).map(Some);
     }
     if let Some((profile_path, pack_key)) = find_pack_store_profile(name_or_path) {
         tracing::info!(
             "Loading pack-store profile from: {}",
             profile_path.display()
         );
-        let mut profile = load_from_file(&profile_path)?;
+        let mut profile = load_from_file(&profile_path, cli_extends)?;
         resolve_store_pack_session_hooks(&mut profile, &pack_key)?;
         let mut profile = finalize_profile(profile)?;
         // Inject the source pack ref so it's always present in the
@@ -2429,9 +2477,19 @@ fn load_profile_inner(name_or_path: &str) -> Result<Option<Profile>> {
         }
         return Ok(Some(profile));
     }
-    if let Some(profile) = builtin::get_builtin(name_or_path) {
-        tracing::info!("Using built-in profile: {}", name_or_path);
-        return Ok(Some(profile));
+    if cli_extends.is_empty() {
+        if let Some(profile) = builtin::get_builtin(name_or_path) {
+            tracing::info!("Using built-in profile: {}", name_or_path);
+            return Ok(Some(profile));
+        }
+    } else {
+        let policy = crate::policy::load_embedded_policy()?;
+        if let Some(def) = policy.profiles.get(name_or_path) {
+            tracing::info!("Using built-in profile: {}", name_or_path);
+            let mut profile = def.to_raw_profile();
+            prepend_cli_extends(&mut profile, cli_extends);
+            return resolve_and_finalize_profile(profile).map(Some);
+        }
     }
     Ok(None)
 }
@@ -2615,7 +2673,7 @@ fn resolve_store_pack_session_hooks(profile: &mut Profile, pack_key: &str) -> Re
 
 /// Load a profile from a registry pack. If the pack isn't installed locally,
 /// pull it first (Docker-style auto-pull with Sigstore verification).
-fn load_registry_profile(name_or_path: &str) -> Result<Profile> {
+fn load_registry_profile(name_or_path: &str, cli_extends: &[String]) -> Result<Profile> {
     let package_ref = crate::package::parse_package_ref(name_or_path)?;
     let install_dir =
         crate::package::package_install_dir(&package_ref.namespace, &package_ref.name)?;
@@ -2670,7 +2728,7 @@ fn load_registry_profile(name_or_path: &str) -> Result<Profile> {
                 .join(format!("{install_name}.json"));
             if profile_path.exists() {
                 tracing::info!("Loading registry profile from: {}", profile_path.display());
-                let mut profile = load_from_file(&profile_path)?;
+                let mut profile = load_from_file(&profile_path, cli_extends)?;
                 resolve_store_pack_session_hooks(&mut profile, &package_ref.key())?;
                 return finalize_profile(profile);
             }
@@ -2688,6 +2746,10 @@ fn load_registry_profile(name_or_path: &str) -> Result<Profile> {
 /// The path must exist and point to a valid JSON profile file.
 /// Base groups are merged automatically.
 pub fn load_profile_from_path(path: &Path) -> Result<Profile> {
+    load_profile_from_path_impl(path, &[])
+}
+
+fn load_profile_from_path_impl(path: &Path, cli_extends: &[String]) -> Result<Profile> {
     if !path.exists() {
         return Err(NonoError::ProfileRead {
             path: path.to_path_buf(),
@@ -2696,7 +2758,7 @@ pub fn load_profile_from_path(path: &Path) -> Result<Profile> {
     }
 
     tracing::info!("Loading profile from path: {}", path.display());
-    finalize_profile(load_from_file(path)?)
+    finalize_profile(load_from_file(path, cli_extends)?)
 }
 
 /// Load a raw profile from a direct file path without resolving inheritance.
@@ -2835,10 +2897,27 @@ pub(crate) fn parse_profile_bytes(content: &[u8]) -> Result<Profile> {
 
 /// Load a profile from a JSON file, resolving inheritance. The parent
 /// directory is passed as context so `extends` can resolve sibling profiles.
-fn load_from_file(path: &Path) -> Result<Profile> {
-    let profile = parse_profile_file(path)?;
+fn load_from_file(path: &Path, cli_extends: &[String]) -> Result<Profile> {
+    let mut profile = parse_profile_file(path)?;
+    prepend_cli_extends(&mut profile, cli_extends);
     let context_dir = path.parent();
     resolve_extends(profile, &mut Vec::new(), 0, context_dir, Some(path))
+}
+
+fn prepend_cli_extends(profile: &mut Profile, cli_extends: &[String]) {
+    if cli_extends.is_empty() {
+        return;
+    }
+    let mut extends = Vec::with_capacity(
+        cli_extends
+            .len()
+            .saturating_add(profile.extends.as_ref().map_or(0, Vec::len)),
+    );
+    extends.extend(cli_extends.iter().cloned());
+    if let Some(existing) = profile.extends.take() {
+        extends.extend(existing);
+    }
+    profile.extends = Some(extends);
 }
 
 // ============================================================================
@@ -3172,6 +3251,7 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
                 .linux
                 .af_unix_mediation
                 .or(base.linux.af_unix_mediation),
+            sandbox_policy: child.linux.sandbox_policy.or(base.linux.sandbox_policy),
         },
         diagnostics: DiagnosticsConfig {
             suppress_system_services: dedup_append(
@@ -3191,7 +3271,11 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
             (Some(base_env), None) => Some(base_env.clone()),
             (None, Some(child_env)) => Some(child_env.clone()),
             (Some(base_env), Some(child_env)) => Some(EnvironmentConfig {
-                allow_vars: dedup_append(&base_env.allow_vars, &child_env.allow_vars),
+                allow_vars: match (&base_env.allow_vars, &child_env.allow_vars) {
+                    (_, None) => base_env.allow_vars.clone(),
+                    (None, Some(child)) => Some(child.clone()),
+                    (Some(base), Some(child)) => Some(dedup_append(base, child)),
+                },
                 deny_vars: dedup_append(&base_env.deny_vars, &child_env.deny_vars),
                 set_vars: {
                     let mut merged = base_env.set_vars.clone();
@@ -4012,6 +4096,154 @@ mod tests {
     }
 
     #[test]
+    fn test_load_profile_with_extends_prepends_cli_bases()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let dir = tempdir()?;
+        let config_dir = dir.path().canonicalize()?;
+        let config_dir_string = config_dir.to_string_lossy().into_owned();
+        let profiles_dir = config_dir.join("nono").join("profiles");
+        std::fs::create_dir_all(&profiles_dir)?;
+        let _env = crate::test_env::EnvVarGuard::set_all(&[(
+            "XDG_CONFIG_HOME",
+            config_dir_string.as_str(),
+        )]);
+
+        std::fs::write(
+            profiles_dir.join("cli-a.json"),
+            r#"{ "meta": { "name": "cli-a" }, "filesystem": { "read": ["/tmp/cli-a"] } }"#,
+        )?;
+        std::fs::write(
+            profiles_dir.join("cli-b.json"),
+            r#"{ "meta": { "name": "cli-b" }, "filesystem": { "read": ["/tmp/cli-b"] } }"#,
+        )?;
+        std::fs::write(
+            profiles_dir.join("json-base.json"),
+            r#"{ "meta": { "name": "json-base" }, "filesystem": { "read": ["/tmp/json-base"] } }"#,
+        )?;
+        std::fs::write(
+            profiles_dir.join("child.json"),
+            r#"{
+                "extends": "json-base",
+                "meta": { "name": "child" },
+                "filesystem": { "read": ["/tmp/child"] }
+            }"#,
+        )?;
+
+        let profile =
+            load_profile_with_extends("child", &["cli-a".to_string(), "cli-b".to_string()])?;
+
+        assert_eq!(
+            profile.filesystem.read,
+            vec![
+                "/tmp/cli-a".to_string(),
+                "/tmp/cli-b".to_string(),
+                "/tmp/json-base".to_string(),
+                "/tmp/child".to_string(),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_load_profile_with_extends_deduplicates_duplicate_base()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let dir = tempdir()?;
+        let config_dir = dir.path().canonicalize()?;
+        let config_dir_string = config_dir.to_string_lossy().into_owned();
+        let profiles_dir = config_dir.join("nono").join("profiles");
+        std::fs::create_dir_all(&profiles_dir)?;
+        let _env = crate::test_env::EnvVarGuard::set_all(&[(
+            "XDG_CONFIG_HOME",
+            config_dir_string.as_str(),
+        )]);
+
+        std::fs::write(
+            profiles_dir.join("base.json"),
+            r#"{ "meta": { "name": "base" }, "filesystem": { "read": ["/tmp/base"] } }"#,
+        )?;
+        std::fs::write(
+            profiles_dir.join("child.json"),
+            r#"{ "extends": "base", "meta": { "name": "child" } }"#,
+        )?;
+
+        let profile = load_profile_with_extends("child", &["base".to_string()])?;
+
+        assert_eq!(profile.filesystem.read, vec!["/tmp/base".to_string()]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_load_profile_with_extends_missing_base_fails_closed()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let dir = tempdir()?;
+        let config_dir = dir.path().canonicalize()?;
+        let config_dir_string = config_dir.to_string_lossy().into_owned();
+        let profiles_dir = config_dir.join("nono").join("profiles");
+        std::fs::create_dir_all(&profiles_dir)?;
+        let _env = crate::test_env::EnvVarGuard::set_all(&[
+            ("XDG_CONFIG_HOME", config_dir_string.as_str()),
+            ("NONO_NO_MIGRATE", "0"),
+            ("NONO_AUTO_MIGRATE", "0"),
+        ]);
+
+        std::fs::write(
+            profiles_dir.join("child.json"),
+            r#"{ "meta": { "name": "child" } }"#,
+        )?;
+
+        let result = load_profile_with_extends("child", &["missing-base".to_string()]);
+        assert!(matches!(result, Err(NonoError::ProfileInheritance(_))));
+        Ok(())
+    }
+
+    #[test]
+    fn test_load_profile_with_extends_circular_base_fails_closed()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let dir = tempdir()?;
+        let config_dir = dir.path().canonicalize()?;
+        let config_dir_string = config_dir.to_string_lossy().into_owned();
+        let profiles_dir = config_dir.join("nono").join("profiles");
+        std::fs::create_dir_all(&profiles_dir)?;
+        let _env = crate::test_env::EnvVarGuard::set_all(&[(
+            "XDG_CONFIG_HOME",
+            config_dir_string.as_str(),
+        )]);
+
+        std::fs::write(
+            profiles_dir.join("base-a.json"),
+            r#"{ "extends": "base-b", "meta": { "name": "base-a" } }"#,
+        )?;
+        std::fs::write(
+            profiles_dir.join("base-b.json"),
+            r#"{ "extends": "base-a", "meta": { "name": "base-b" } }"#,
+        )?;
+        std::fs::write(
+            profiles_dir.join("child.json"),
+            r#"{ "meta": { "name": "child" } }"#,
+        )?;
+
+        let result = load_profile_with_extends("child", &["base-a".to_string()]);
+        assert!(matches!(result, Err(NonoError::ProfileInheritance(_))));
+        Ok(())
+    }
+
+    #[test]
     fn test_list_profiles() {
         let _guard = match crate::test_env::ENV_LOCK.lock() {
             Ok(g) => g,
@@ -4047,12 +4279,20 @@ mod tests {
         let profile: Profile = serde_json::from_str(json_str).expect("Failed to parse profile");
         assert_eq!(profile.env_credentials.mappings.len(), 2);
         assert_eq!(
-            profile.env_credentials.mappings.get("openai_api_key"),
-            Some(&"OPENAI_API_KEY".to_string())
+            profile
+                .env_credentials
+                .mappings
+                .get("openai_api_key")
+                .map(|s| s.as_str()),
+            Some("OPENAI_API_KEY")
         );
         assert_eq!(
-            profile.env_credentials.mappings.get("anthropic_api_key"),
-            Some(&"ANTHROPIC_API_KEY".to_string())
+            profile
+                .env_credentials
+                .mappings
+                .get("anthropic_api_key")
+                .map(|s| s.as_str()),
+            Some("ANTHROPIC_API_KEY")
         );
     }
 
@@ -4082,7 +4322,11 @@ mod tests {
                 .as_ref()
                 .expect("environment")
                 .allow_vars,
-            vec!["PATH", "HOME", "AWS_*"]
+            Some(vec![
+                "PATH".to_string(),
+                "HOME".to_string(),
+                "AWS_*".to_string()
+            ])
         );
     }
 
@@ -4102,6 +4346,7 @@ mod tests {
 
     #[test]
     fn test_environment_config_empty_allow_vars() {
+        // Explicitly [] in JSON → Some([]) → filter active, blocks all inherited vars
         let json_str = r#"{
             "meta": { "name": "test-profile" },
             "environment": {
@@ -4114,7 +4359,25 @@ mod tests {
             .environment
             .as_ref()
             .expect("environment should be Some");
-        assert!(env_config.allow_vars.is_empty());
+        assert_eq!(env_config.allow_vars, Some(vec![]));
+    }
+
+    #[test]
+    fn test_environment_config_absent_allow_vars() {
+        // allow_vars not written in JSON → None → no filter
+        let json_str = r#"{
+            "meta": { "name": "test-profile" },
+            "environment": {
+                "deny_vars": ["GH_TOKEN"]
+            }
+        }"#;
+
+        let profile: Profile = serde_json::from_str(json_str).expect("Failed to parse profile");
+        let env_config = profile
+            .environment
+            .as_ref()
+            .expect("environment should be Some");
+        assert_eq!(env_config.allow_vars, None);
     }
 
     #[test]
@@ -4135,7 +4398,7 @@ mod tests {
             env_config.deny_vars,
             vec!["GH_TOKEN", "GITHUB_*", "ANTHROPIC_API_KEY"]
         );
-        assert!(env_config.allow_vars.is_empty());
+        assert_eq!(env_config.allow_vars, None);
     }
 
     #[test]
@@ -4153,7 +4416,14 @@ mod tests {
             .environment
             .as_ref()
             .expect("environment should be Some");
-        assert_eq!(env_config.allow_vars, vec!["PATH", "HOME", "AWS_*"]);
+        assert_eq!(
+            env_config.allow_vars,
+            Some(vec![
+                "PATH".to_string(),
+                "HOME".to_string(),
+                "AWS_*".to_string()
+            ])
+        );
         assert_eq!(env_config.deny_vars, vec!["AWS_SECRET_ACCESS_KEY"]);
     }
 
@@ -4162,7 +4432,7 @@ mod tests {
         // Merging two profiles with deny_vars concatenates them
         let base = Profile {
             environment: Some(EnvironmentConfig {
-                allow_vars: vec![],
+                allow_vars: None,
                 deny_vars: vec!["GH_TOKEN".into()],
                 set_vars: Default::default(),
             }),
@@ -4170,7 +4440,7 @@ mod tests {
         };
         let child = Profile {
             environment: Some(EnvironmentConfig {
-                allow_vars: vec![],
+                allow_vars: None,
                 deny_vars: vec!["ANTHROPIC_API_KEY".into()],
                 set_vars: Default::default(),
             }),
@@ -4187,7 +4457,7 @@ mod tests {
     fn test_environment_config_deny_vars_merge_deduplicates() {
         let base = Profile {
             environment: Some(EnvironmentConfig {
-                allow_vars: vec![],
+                allow_vars: None,
                 deny_vars: vec!["GH_TOKEN".into(), "ANTHROPIC_API_KEY".into()],
                 set_vars: Default::default(),
             }),
@@ -4195,7 +4465,7 @@ mod tests {
         };
         let child = Profile {
             environment: Some(EnvironmentConfig {
-                allow_vars: vec![],
+                allow_vars: None,
                 deny_vars: vec!["ANTHROPIC_API_KEY".into()],
                 set_vars: Default::default(),
             }),
@@ -4316,8 +4586,12 @@ mod tests {
         let profile: Profile = serde_json::from_str(json_str).expect("Failed to parse profile");
         assert_eq!(profile.env_credentials.mappings.len(), 1);
         assert_eq!(
-            profile.env_credentials.mappings.get("openai_api_key"),
-            Some(&"OPENAI_API_KEY".to_string())
+            profile
+                .env_credentials
+                .mappings
+                .get("openai_api_key")
+                .map(|s| s.as_str()),
+            Some("OPENAI_API_KEY")
         );
     }
 
@@ -5900,7 +6174,10 @@ mod tests {
         )
         .expect("write profile");
 
-        let profile = load_from_file(&profile_path).expect("load extended profile");
+        let profile = match load_from_file(&profile_path, &[]) {
+            Ok(profile) => profile,
+            Err(err) => panic!("load extended profile: {err}"),
+        };
         assert_eq!(profile.meta.name, "ext-test");
         // Should inherit openclaw's filesystem paths
         assert!(
@@ -6158,8 +6435,12 @@ mod tests {
 
         let merged = merge_profiles(base, child);
         assert_eq!(
-            merged.env_credentials.mappings.get("shared_key"),
-            Some(&"CHILD_VALUE".to_string()),
+            merged
+                .env_credentials
+                .mappings
+                .get("shared_key")
+                .map(|s| s.as_str()),
+            Some("CHILD_VALUE"),
             "child should win for same key"
         );
         assert!(merged.env_credentials.mappings.contains_key("base_key"));
@@ -6629,7 +6910,10 @@ mod tests {
         )
         .expect("write profile");
 
-        let profile = load_from_file(&profile_path).expect("load extended profile");
+        let profile = match load_from_file(&profile_path, &[]) {
+            Ok(profile) => profile,
+            Err(err) => panic!("load extended profile: {err}"),
+        };
         assert_eq!(profile.meta.name, "multi-ext-test");
         assert!(
             profile
@@ -6654,7 +6938,7 @@ mod tests {
         )
         .expect("write profile");
 
-        let result = load_from_file(&profile_path);
+        let result = load_from_file(&profile_path, &[]);
         assert!(
             result.is_ok(),
             "shared transitive base should be deduplicated, not error: {:?}",
@@ -6679,7 +6963,10 @@ mod tests {
         )
         .expect("write");
 
-        let profile = load_from_file(&child_path).expect("resolve");
+        let profile = match load_from_file(&child_path, &[]) {
+            Ok(profile) => profile,
+            Err(err) => panic!("resolve: {err}"),
+        };
         assert_eq!(profile.meta.name, "child");
         assert!(
             profile
@@ -6701,7 +6988,10 @@ mod tests {
         )
         .expect("write");
 
-        let profile = load_from_file(&self_path).expect("should not be circular");
+        let profile = match load_from_file(&self_path, &[]) {
+            Ok(profile) => profile,
+            Err(err) => panic!("should not be circular: {err}"),
+        };
         assert_eq!(profile.meta.name, "my-default");
         assert!(
             !profile.groups.include.is_empty(),
@@ -6727,7 +7017,10 @@ mod tests {
         )
         .expect("write");
 
-        let profile = load_from_file(&self_path).expect("should resolve both bases");
+        let profile = match load_from_file(&self_path, &[]) {
+            Ok(profile) => profile,
+            Err(err) => panic!("should resolve both bases: {err}"),
+        };
         assert_eq!(profile.meta.name, "my-combo");
         assert!(
             !profile.groups.include.is_empty(),
@@ -7729,7 +8022,10 @@ mod tests {
         )
         .expect("write child");
 
-        let profile = load_from_file(&child_path).expect("inherited cmd capture resolves");
+        let profile = match load_from_file(&child_path, &[]) {
+            Ok(profile) => profile,
+            Err(err) => panic!("inherited cmd capture resolves: {err}"),
+        };
         assert!(profile.credential_capture.contains_key("github"));
     }
 
@@ -7844,12 +8140,20 @@ mod tests {
         );
         assert_eq!(profile.filesystem.deny, vec!["/denied".to_string()]);
         assert_eq!(
-            profile.env_credentials.mappings.get("plain"),
-            Some(&"PLAIN_TOKEN".to_string())
+            profile
+                .env_credentials
+                .mappings
+                .get("plain")
+                .map(|s| s.as_str()),
+            Some("PLAIN_TOKEN")
         );
         assert_eq!(
-            profile.env_credentials.mappings.get("matching"),
-            Some(&"MATCH_TOKEN".to_string())
+            profile
+                .env_credentials
+                .mappings
+                .get("matching")
+                .map(|s| s.as_str()),
+            Some("MATCH_TOKEN")
         );
         assert!(!profile.env_credentials.mappings.contains_key("skipped"));
         let origins = profile.open_urls.expect("open urls").allow_origins;

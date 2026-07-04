@@ -361,3 +361,65 @@ fn network_block_denies_outbound_tcp() {
         "network block must deny outbound TCP to a live listener\nstdout: {stdout}\nstderr: {stderr}",
     );
 }
+
+/// A profile combining `env_credentials` (env://) and `command_policies` must
+/// launch successfully when the initial command is not itself a policy shim.
+/// The session process receives a broker nonce rather than the real credential
+/// value (broker isolation preserved).
+#[test]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn env_credentials_with_command_policies_non_shim_entry_succeeds() {
+    let (_tmp, home, workspace) = setup_isolated_home("env-creds-cmd-policies");
+
+    let profile_path = write_profile(
+        &home,
+        "env-creds-cmd-policies",
+        &format!(
+            r#"{{
+                "meta": {{ "name": "env-creds-cmd-policies-test" }},
+                "filesystem": {{ "allow": ["{workspace}"] }},
+                "network": {{ "block": true }},
+                "env_credentials": {{
+                    "env://API_TOKEN": "API_TOKEN"
+                }},
+                "command_policies": {{
+                    "commands": {{
+                        "cat": {{
+                            "executable": "/bin/cat"
+                        }}
+                    }}
+                }}
+            }}"#,
+            workspace = workspace.display()
+        ),
+    );
+
+    let output = nono_bin()
+        .args([
+            "run",
+            "--profile",
+            profile_path.to_str().expect("profile path"),
+            "--no-rollback",
+            "--",
+            "sh",
+            "-c",
+            "exit 0",
+        ])
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("XDG_STATE_HOME", home.join(".local").join("state"))
+        .env("NONO_NO_SAVE_PROMPT", "1")
+        .env("API_TOKEN", "secret-value")
+        .env_remove("NONO_DETACHED_LAUNCH")
+        .current_dir(&workspace)
+        .output()
+        .expect("failed to run nono");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "env_credentials + command_policies with a non-shim entry must succeed\nstdout: {stdout}\nstderr: {stderr}",
+    );
+}

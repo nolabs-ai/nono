@@ -212,7 +212,7 @@
           "type": "string",
           "enum": ["null", "request_json"],
           "default": "null",
-          "description": "Controls stdin for the capture command. null closes stdin unless interaction.stdio is true. request_json writes request metadata JSON to stdin."
+          "description": "Controls stdin for the capture command. null closes stdin unless interaction.stdin is true. request_json writes request metadata JSON to stdin."
         },
         "output": {
           "oneOf": [
@@ -262,7 +262,12 @@
         "stdio": {
           "type": "boolean",
           "default": false,
-          "description": "Allow the capture command to use inherited stderr and, when stdin is null, inherited stdin."
+          "description": "Allow the capture command to write prompts to the terminal via inherited stderr."
+        },
+        "stdin": {
+          "type": "boolean",
+          "default": false,
+          "description": "Allow the capture command to read from the terminal via inherited stdin. Only set this when the helper genuinely needs to prompt the user for input. Requires stdio:true."
         },
         "open_urls": {
           "oneOf": [
@@ -1194,7 +1199,7 @@
         "can_use": {
           "type": "array",
           "items": { "$ref": "#/$defs/CommandPolicyIdentifier" },
-          "description": "Commands this command may invoke through tool-sandbox chaining."
+          "description": "Other commands this command may invoke through tool-sandbox chaining. If no explicit self-invocation entry is configured, self-invocation keeps the command's current effective policy and does not require listing the command here."
         },
         "sandbox": {
           "$ref": "#/$defs/CommandSandboxConfig",
@@ -1308,6 +1313,11 @@
         "allow_launch_services": {
           "type": "boolean",
           "description": "macOS-only: allow this command to open URLs directly via LaunchServices instead of the origin-validated browser shim. Ignored on Linux. Defaults to false."
+        },
+        "unsafe_macos_seatbelt_rules": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "macOS-only. Expert escape hatch: raw Seatbelt S-expression rules appended to this command's child sandbox profile, emitted after the generated denies (including the exec gate's (deny process-exec*)), so a later (allow ...) wins under Seatbelt's last-matching-rule semantics. Scoped to a single command or per-intercept override. Ignored on Linux."
         }
       }
     },

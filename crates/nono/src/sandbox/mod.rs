@@ -32,7 +32,7 @@ pub use linux::is_wsl2;
 #[cfg(target_os = "linux")]
 pub use linux::{
     OpenHow, SYS_BIND, SYS_CONNECT, SYS_OPENAT, SYS_OPENAT2, SYS_SENDMMSG, SYS_SENDMSG, SYS_SENDTO,
-    SeccompData, SeccompNetFallback, SeccompNotif, SockaddrInfo, UnixSocketKind,
+    SeccompData, SeccompNetFallback, SeccompNotif, SeccompOpts, SockaddrInfo, UnixSocketKind,
     classify_access_from_flags, classify_af_unix, continue_notif, deny_notif, inject_fd,
     install_seccomp_af_unix_filter, install_seccomp_notify, install_seccomp_proxy_filter,
     notif_id_valid, probe_seccomp_block_network_support, read_mmsghdr_dests, read_msghdr_dest,
@@ -68,7 +68,7 @@ pub struct SupportInfo {
 ///
 /// // Check if sandbox is supported
 /// if Sandbox::is_supported() {
-///     Sandbox::apply(&caps)?;
+///     Sandbox::apply_auto(&caps)?;
 /// }
 /// # Ok::<(), nono::NonoError>(())
 /// ```
@@ -89,70 +89,80 @@ impl Sandbox {
         linux::detect_abi()
     }
 
-    /// Apply the sandbox with the given capabilities.
+    /// Apply sandboxing with automatic Landlock → seccomp fallback (Linux).
     ///
-    /// This function applies OS-level restrictions that **cannot be undone**.
-    /// After calling this, the current process (and all children) will
-    /// only be able to access resources granted by the capabilities.
-    ///
-    /// On Linux, returns the seccomp network fallback mode. `BlockAll` is
-    /// already enforced. `ProxyOnly` signals the caller to install the
-    /// proxy filter post-fork via `install_seccomp_proxy_filter()`.
-    /// On macOS, always returns `()` (no seccomp fallback concept).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if sandbox initialization fails.
+    /// Uses Landlock where possible; falls back to seccomp when the kernel
+    /// ABI lacks network support (< V4). This is the default behaviour.
+    /// `BlockAll` is installed inline; `ProxyOnly` must be installed
+    /// post-fork via `install_seccomp_proxy_filter()`.
     #[cfg(target_os = "linux")]
     #[must_use = "sandbox application result should be checked"]
-    pub fn apply(caps: &CapabilitySet) -> Result<linux::SeccompNetFallback> {
-        linux::apply(caps)
+    pub fn apply_auto(caps: &CapabilitySet) -> Result<linux::SeccompNetFallback> {
+        linux::apply_auto(caps)
+    }
+
+    /// Apply sandboxing with automatic fallback and a pre-detected ABI (Linux).
+    #[cfg(target_os = "linux")]
+    #[must_use = "sandbox application result should be checked"]
+    pub fn apply_auto_with_abi(
+        caps: &CapabilitySet,
+        abi: &DetectedAbi,
+    ) -> Result<linux::SeccompNetFallback> {
+        linux::apply_auto_with_abi(caps, abi)
+    }
+
+    /// Apply Landlock-only sandboxing (Linux).
+    ///
+    /// Returns an error if network restrictions cannot be satisfied via
+    /// Landlock alone (kernel ABI < V4). Use `apply_auto` for fallback.
+    #[cfg(target_os = "linux")]
+    pub fn apply_landlock(caps: &CapabilitySet) -> Result<()> {
+        linux::apply_landlock(caps)
+    }
+
+    /// Apply Landlock-only sandboxing with a pre-detected ABI (Linux).
+    #[cfg(target_os = "linux")]
+    pub fn apply_landlock_with_abi(caps: &CapabilitySet, abi: &DetectedAbi) -> Result<()> {
+        linux::apply_landlock_with_abi(caps, abi)
+    }
+
+    /// Apply Landlock filesystem/process sandboxing and seccomp TCP fallback (Linux).
+    ///
+    /// Filesystem/process sandboxing is always Landlock-enforced. `opts`
+    /// controls only nono-managed TCP network fallback/delegation.
+    #[cfg(target_os = "linux")]
+    pub fn apply_seccomp(
+        caps: &CapabilitySet,
+        opts: linux::SeccompOpts,
+    ) -> Result<linux::SeccompNetFallback> {
+        linux::apply_seccomp(caps, opts)
+    }
+
+    /// Apply Landlock filesystem/process sandboxing and seccomp TCP fallback
+    /// with a pre-detected ABI (Linux).
+    #[cfg(target_os = "linux")]
+    pub fn apply_seccomp_with_abi(
+        caps: &CapabilitySet,
+        abi: &DetectedAbi,
+        opts: linux::SeccompOpts,
+    ) -> Result<linux::SeccompNetFallback> {
+        linux::apply_seccomp_with_abi(caps, abi, opts)
+    }
+
+    /// Declare that TCP network enforcement is handled externally (Linux).
+    ///
+    /// This is intentionally a no-op marker. It must not be used as the whole
+    /// `nono run` sandbox; filesystem/process sandboxing is applied separately.
+    #[cfg(target_os = "linux")]
+    pub fn apply_external() -> Result<()> {
+        linux::apply_external()
     }
 
     /// Apply the sandbox with the given capabilities (macOS).
     #[cfg(target_os = "macos")]
     #[must_use = "sandbox application result should be checked"]
-    pub fn apply(caps: &CapabilitySet) -> Result<()> {
+    pub fn apply_auto(caps: &CapabilitySet) -> Result<()> {
         macos::apply(caps)
-    }
-
-    /// Apply the sandbox with the given capabilities (unsupported platforms).
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    #[must_use = "sandbox application result should be checked"]
-    pub fn apply(caps: &CapabilitySet) -> Result<()> {
-        let _ = caps;
-        #[cfg(target_arch = "wasm32")]
-        {
-            Err(crate::error::NonoError::UnsupportedPlatform(
-                "WASM: Browser sandboxing requires different approach (CSP, iframe sandbox)".into(),
-            ))
-        }
-
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            Err(crate::error::NonoError::UnsupportedPlatform(
-                std::env::consts::OS.to_string(),
-            ))
-        }
-    }
-
-    /// Apply the sandbox with a pre-detected Landlock ABI (Linux only).
-    ///
-    /// Avoids re-probing the kernel when the caller has already detected
-    /// the ABI (e.g., probed once at startup).
-    ///
-    /// Returns the seccomp network fallback mode (see `apply()` docs).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if sandbox initialization fails.
-    #[cfg(target_os = "linux")]
-    #[must_use = "sandbox application result should be checked"]
-    pub fn apply_with_abi(
-        caps: &CapabilitySet,
-        abi: &DetectedAbi,
-    ) -> Result<linux::SeccompNetFallback> {
-        linux::apply_with_abi(caps, abi)
     }
 
     /// Stack a second Landlock layer that restricts execute to the given paths (Linux only).

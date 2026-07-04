@@ -4,7 +4,7 @@ use crate::audit_integrity::{
 };
 use crate::command_policy::{
     CommandFromConfig, CommandPoliciesConfig, CommandSandboxConfig, ResolvedCommandBinaries,
-    ResolvedCommandBinary, ResolvedExecutableKind,
+    ResolvedCommandBinary, ResolvedExecutableKind, has_explicit_self_invocation_entry,
 };
 use crate::profile;
 use crate::tool_sandbox::credentials::{ResolvedCredential, resolve_credentials};
@@ -20,8 +20,8 @@ use crate::tool_sandbox::protocol::{
     StdioStreamLimitSpec, TOOL_SANDBOX_LAUNCH_SPEC_ENV, TOOL_SANDBOX_SHIM_DIR_ENV,
     TOOL_SANDBOX_SOCKET_ENV, TOOL_SANDBOX_URL_IO_TIMEOUT, ToolSandboxChildLaunchSpec,
     ToolSandboxOpenUrlRequest, ToolSandboxOpenUrlResponse, ToolSandboxShimRequest,
-    ToolSandboxShimResponse, UnixSocketGrantSpec, read_frame, recv_stdio_fds, send_stdio_fds,
-    validate_ipc_request, write_frame, write_response,
+    ToolSandboxShimResponse, UnixSocketGrantSpec, read_frame, recv_frame_ack, recv_stdio_fds,
+    send_frame_ack, send_stdio_fds, validate_ipc_request, write_frame, write_response,
 };
 use landlock::{
     AccessFs, CompatLevel, Compatible, PathBeneath, PathFd, Ruleset, RulesetAttr,
@@ -777,6 +777,7 @@ fn run_shim() -> Result<()> {
     let start_send = std::time::Instant::now();
     send_shim_identity_fd(&stream, &shim_exe)?;
     write_frame(&mut stream, &request)?;
+    recv_frame_ack(&mut stream)?;
     send_stdio_fds(&stream)?;
     tool_sandbox_profile_log!(
         "shim:send_request: {:?} (entry-to-request: {:?})",
@@ -859,7 +860,7 @@ fn run_child_launcher() -> Result<()> {
     let caps = caps_from_spec(&spec.caps)?;
     tool_sandbox_profile_log!("launcher:caps_from_spec: {:?}", start_caps_from.elapsed());
     let start_sandbox_apply = std::time::Instant::now();
-    Sandbox::apply(&caps)?;
+    Sandbox::apply_auto(&caps)?;
     tool_sandbox_profile_log!(
         "launcher:sandbox_apply: {:?}",
         start_sandbox_apply.elapsed()
@@ -1211,11 +1212,12 @@ fn handle_shim_stream_inner(
     let peer_pid = peer_credentials(stream.as_raw_fd())?.pid;
     let shim_fd = recv_fd_via_socket(stream.as_raw_fd())?;
     let request: ToolSandboxShimRequest = read_frame(stream)?;
+    send_frame_ack(stream)?;
     validate_ipc_request(&request)?;
     let auth = authenticate_shim(peer_pid, shim_fd, &request.command, state)?;
     let stdio = recv_stdio_fds(stream)?;
 
-    let caller = match resolve_caller(auth.peer_pid, session_root_pid, state) {
+    let caller = match resolve_caller(auth.peer_pid, session_root_pid, state, &request.command) {
         Ok(caller) => caller,
         Err(err) => {
             record_command_policy_audit(
@@ -1492,6 +1494,11 @@ fn handle_shim_stream_inner(
         .unwrap_or_else(super::ResolvedInterceptAction::passthrough);
     let intercept_action = intercept.action;
 
+    // A matched intercept rule may carry a sandbox that replaces the command's
+    // selected sandbox for the process this rule launches (every action except
+    // `respond`, which launches nothing). Absent -> the command's selected sandbox.
+    let effective_sandbox = intercept.sandbox.unwrap_or(policy);
+
     if let crate::command_policy::InterceptActionConfig::Respond { stdout } = intercept_action {
         // Write the static payload to the shim's stdout fd, then respond.
         let stdout_bytes = stdout.as_bytes();
@@ -1627,7 +1634,7 @@ fn handle_shim_stream_inner(
             ));
         }
         let result = (|| {
-            let launch = build_child_launch_spec(state, &request, policy)?;
+            let launch = build_child_launch_spec(state, &request, effective_sandbox)?;
             launch_child_with_capture(state, &request.command, &caller, launch, stdio)
         })();
         state.active_count.fetch_sub(1, Ordering::SeqCst);
@@ -1715,7 +1722,7 @@ fn handle_shim_stream_inner(
             ));
         }
         let result = (|| {
-            let launch = build_child_launch_spec(state, &request, policy)?;
+            let launch = build_child_launch_spec(state, &request, effective_sandbox)?;
             launch_child_with_capture(state, &request.command, &caller, launch, stdio)
         })();
         state.active_count.fetch_sub(1, Ordering::SeqCst);
@@ -1787,7 +1794,7 @@ fn handle_shim_stream_inner(
     }
 
     let result = (|| {
-        let launch = build_child_launch_spec(state, &request, policy)?;
+        let launch = build_child_launch_spec(state, &request, effective_sandbox)?;
         launch_child(state, &request.command, &caller, launch, stdio)
     })();
     state.active_count.fetch_sub(1, Ordering::SeqCst);
@@ -1892,16 +1899,22 @@ fn resolve_caller(
     peer_pid: u32,
     session_root_pid: u32,
     state: &ToolSandboxState,
+    command_name: &str,
 ) -> Result<Caller> {
     let mut pid = peer_pid;
     for _ in 0..ANCESTRY_DEPTH_LIMIT {
+        if let Some((command, launch_caller)) = live_active_child(pid, state)? {
+            if command == command_name
+                && !has_explicit_self_invocation_entry(&state.plan.config, command_name)
+            {
+                return Ok(launch_caller);
+            }
+            return Ok(Caller::Command { command, pid });
+        }
         if pid == session_root_pid {
             return Ok(Caller::Session {
                 pid: session_root_pid,
             });
-        }
-        if let Some(command) = live_active_child_command(pid, state)? {
-            return Ok(Caller::Command { command, pid });
         }
         if pid <= 1 {
             break;
@@ -1913,13 +1926,10 @@ fn resolve_caller(
     ))
 }
 
-fn live_active_child_command(pid: u32, state: &ToolSandboxState) -> Result<Option<String>> {
-    Ok(live_active_child(pid, state)?.map(|(command, _)| command))
-}
-
-/// Like [`live_active_child_command`] but also returns the caller the command
-/// was launched under. Used by the URL-open path to resolve the requesting
-/// command's own running policy.
+/// Returns the active command for `pid` and the caller it was launched under.
+/// Self-invocation with no explicit self-invocation entry uses the launch caller so
+/// recursive tool calls keep the current effective policy instead of requiring
+/// a `<cmd>.can_use[<cmd>]` edge.
 fn live_active_child(pid: u32, state: &ToolSandboxState) -> Result<Option<(String, Caller)>> {
     let map = state
         .active_children
@@ -2904,7 +2914,7 @@ fn send_fd_via_socket(socket_fd: RawFd, fd_to_send: RawFd) -> Result<()> {
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
     msg.msg_control = control.as_mut_ptr().cast();
-    msg.msg_controllen = control.len();
+    msg.msg_controllen = control.len() as MsgControlLen;
 
     unsafe {
         let cmsg = msg.msg_control.cast::<libc::cmsghdr>();
@@ -2937,7 +2947,7 @@ fn recv_fd_via_socket(socket_fd: RawFd) -> Result<OwnedFd> {
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
     msg.msg_control = control.as_mut_ptr().cast();
-    msg.msg_controllen = control.len();
+    msg.msg_controllen = control.len() as MsgControlLen;
 
     let received = unsafe { libc::recvmsg(socket_fd, &mut msg, 0) };
     if received < 0 {
@@ -2953,7 +2963,7 @@ fn recv_fd_via_socket(socket_fd: RawFd) -> Result<OwnedFd> {
     }
 
     let cmsg = msg.msg_control.cast::<libc::cmsghdr>();
-    if msg.msg_controllen < std::mem::size_of::<libc::cmsghdr>()
+    if msg.msg_controllen < std::mem::size_of::<libc::cmsghdr>() as MsgControlLen
         || unsafe { (*cmsg).cmsg_level } != libc::SOL_SOCKET
         || unsafe { (*cmsg).cmsg_type } != libc::SCM_RIGHTS
         || unsafe { (*cmsg).cmsg_len } < cmsg_len(std::mem::size_of::<RawFd>())
@@ -2972,6 +2982,14 @@ fn recv_fd_via_socket(socket_fd: RawFd) -> Result<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
+// msghdr::msg_controllen and cmsghdr::cmsg_len are usize on glibc and u32 on
+// musl. This alias lets the cmsg helpers compile correctly on both without
+// per-site casts.
+#[cfg(target_env = "musl")]
+type MsgControlLen = u32;
+#[cfg(not(target_env = "musl"))]
+type MsgControlLen = usize;
+
 fn cmsg_align(len: usize) -> usize {
     let align = std::mem::size_of::<usize>();
     (len + align - 1) & !(align - 1)
@@ -2981,8 +2999,8 @@ fn cmsg_space(data_len: usize) -> usize {
     cmsg_align(std::mem::size_of::<libc::cmsghdr>()) + cmsg_align(data_len)
 }
 
-fn cmsg_len(data_len: usize) -> usize {
-    cmsg_align(std::mem::size_of::<libc::cmsghdr>()) + data_len
+fn cmsg_len(data_len: usize) -> MsgControlLen {
+    (cmsg_align(std::mem::size_of::<libc::cmsghdr>()) + data_len) as MsgControlLen
 }
 
 unsafe fn cmsg_data(cmsg: *mut libc::cmsghdr) -> *mut u8 {
@@ -3224,19 +3242,19 @@ fn add_policy_fs(
     policy_root: &Path,
 ) -> Result<()> {
     use super::dynamic_providers::expand_dynamic_tokens;
-    for entry in &expand_dynamic_tokens(&policy.fs_read)? {
+    for entry in &expand_dynamic_tokens(&policy.fs_read, Some(policy_root))? {
         let path = resolve_policy_path(entry, policy_root)?;
         add_optional_dir(caps, path, AccessMode::Read)?;
     }
-    for entry in &expand_dynamic_tokens(&policy.fs_write)? {
+    for entry in &expand_dynamic_tokens(&policy.fs_write, Some(policy_root))? {
         let path = resolve_policy_path(entry, policy_root)?;
         add_optional_dir(caps, path, AccessMode::ReadWrite)?;
     }
-    for entry in &expand_dynamic_tokens(&policy.fs_read_file)? {
+    for entry in &expand_dynamic_tokens(&policy.fs_read_file, Some(policy_root))? {
         let path = resolve_policy_path(entry, policy_root)?;
         add_optional_read_file(caps, path)?;
     }
-    for entry in &expand_dynamic_tokens(&policy.fs_write_file)? {
+    for entry in &expand_dynamic_tokens(&policy.fs_write_file, Some(policy_root))? {
         let path = resolve_policy_path(entry, policy_root)?;
         caps.add_fs(FsCapability::new_file(path, AccessMode::ReadWrite)?);
     }
@@ -4285,7 +4303,7 @@ fn apply_terminal_winsize(stdin_fd: i32, pty_master_fd: i32, last: &mut Option<(
         return;
     }
     unsafe {
-        libc::ioctl(pty_master_fd, libc::TIOCSWINSZ as libc::c_ulong, &ws);
+        libc::ioctl(pty_master_fd, libc::TIOCSWINSZ, &ws);
     }
     *last = Some(current);
 }
@@ -5096,6 +5114,73 @@ mod tests {
         let result =
             ensure_outer_exec_gate_fully_enforced(landlock::RulesetStatus::PartiallyEnforced);
         assert!(matches!(result, Err(err) if err.to_string().contains("partially enforced")));
+    }
+
+    #[test]
+    fn resolve_caller_prefers_active_command_for_different_invocation() -> Result<()> {
+        let state = test_state_with_chaining_paths(
+            PathBuf::from("/tmp/nono-tool-sandbox-test"),
+            PathBuf::from("/tmp/nono-tool-sandbox-test/supervisor.sock"),
+            PathBuf::from("/tmp/nono-tool-sandbox-test/shims"),
+            ShimIdentity {
+                path: PathBuf::from("/tmp/nono-tool-sandbox-test/shims/git"),
+                id: FileId { dev: 1, ino: 1 },
+            },
+        );
+        let pid = std::process::id();
+        track_child(&state, pid, "git", &Caller::Session { pid })?;
+
+        let caller = resolve_caller(pid, pid, &state, "ssh")?;
+
+        assert!(matches!(caller, Caller::Command { command, .. } if command == "git"));
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_caller_uses_launch_caller_for_self_invocation() -> Result<()> {
+        let state = test_state_with_chaining_paths(
+            PathBuf::from("/tmp/nono-tool-sandbox-test"),
+            PathBuf::from("/tmp/nono-tool-sandbox-test/supervisor.sock"),
+            PathBuf::from("/tmp/nono-tool-sandbox-test/shims"),
+            ShimIdentity {
+                path: PathBuf::from("/tmp/nono-tool-sandbox-test/shims/git"),
+                id: FileId { dev: 1, ino: 1 },
+            },
+        );
+        let pid = std::process::id();
+        track_child(&state, pid, "git", &Caller::Session { pid })?;
+
+        let caller = resolve_caller(pid, pid, &state, "git")?;
+
+        assert!(matches!(caller, Caller::Session { .. }));
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_caller_honors_explicit_self_edge() -> Result<()> {
+        let mut state = test_state_with_chaining_paths(
+            PathBuf::from("/tmp/nono-tool-sandbox-test"),
+            PathBuf::from("/tmp/nono-tool-sandbox-test/supervisor.sock"),
+            PathBuf::from("/tmp/nono-tool-sandbox-test/shims"),
+            ShimIdentity {
+                path: PathBuf::from("/tmp/nono-tool-sandbox-test/shims/git"),
+                id: FileId { dev: 1, ino: 1 },
+            },
+        );
+        state.plan.config.commands.insert(
+            "git".to_string(),
+            CommandPolicyConfig {
+                can_use: vec!["git".to_string()],
+                ..Default::default()
+            },
+        );
+        let pid = std::process::id();
+        track_child(&state, pid, "git", &Caller::Session { pid })?;
+
+        let caller = resolve_caller(pid, pid, &state, "git")?;
+
+        assert!(matches!(caller, Caller::Command { command, .. } if command == "git"));
+        Ok(())
     }
 
     #[test]

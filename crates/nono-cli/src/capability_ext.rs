@@ -7,12 +7,28 @@ use crate::cli::SandboxArgs;
 use crate::policy;
 use crate::profile::{Profile, expand_vars};
 use crate::protected_paths::{self, ProtectedRoots};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use crate::tool_sandbox::dynamic_providers::expand_dynamic_tokens;
+
+/// Expand a profile path template: arbitrary `$VAR` tokens from the process
+/// environment are resolved first, then built-in nono vars (`$HOME`,
+/// `$WORKDIR`, `$TMPDIR`, `$XDG_*`, etc.) are applied.
+fn expand_path(template: &str, workdir: &Path) -> nono::Result<PathBuf> {
+    let after_env = policy::expand_env_vars(template);
+    expand_vars(&after_env, workdir)
+}
 use nono::{
     AccessMode, CapabilitySet, CapabilitySource, FsCapability, NonoError, Result, SocketScope,
     UnixSocketCapability, UnixSocketMode,
 };
 use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
+
+// Platform-specific cfg fallbacks (placed here after all use statements)
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn expand_dynamic_tokens(entries: &[String], _workdir: Option<&Path>) -> nono::Result<Vec<String>> {
+    Ok(entries.to_vec())
+}
 
 /// Try to create a directory capability, warning and skipping on PathNotFound.
 /// Propagates all other errors.
@@ -657,8 +673,9 @@ impl CapabilitySetExt for CapabilitySet {
         let fs = &profile.filesystem;
 
         // Directories with read+write access
-        for path_template in &fs.allow {
-            let path = expand_vars(path_template, workdir)?;
+        let allow_expanded = expand_dynamic_tokens(&fs.allow, Some(workdir))?;
+        for path_template in &allow_expanded {
+            let path = expand_path(path_template, workdir)?;
             validate_requested_dir(
                 &path,
                 "Profile",
@@ -673,8 +690,9 @@ impl CapabilitySetExt for CapabilitySet {
         }
 
         // Read-only filesystem entries (directory or file)
-        for path_template in &fs.read {
-            let path = expand_vars(path_template, workdir)?;
+        let read_expanded = expand_dynamic_tokens(&fs.read, Some(workdir))?;
+        for path_template in &read_expanded {
+            let path = expand_path(path_template, workdir)?;
             let label = format!("Profile path '{}' does not exist, skipping", path_template);
 
             let reads_file = std::fs::metadata(&path)
@@ -706,8 +724,9 @@ impl CapabilitySetExt for CapabilitySet {
         }
 
         // Directories with write-only access
-        for path_template in &fs.write {
-            let path = expand_vars(path_template, workdir)?;
+        let write_expanded = expand_dynamic_tokens(&fs.write, Some(workdir))?;
+        for path_template in &write_expanded {
+            let path = expand_path(path_template, workdir)?;
             validate_requested_dir(
                 &path,
                 "Profile",
@@ -722,8 +741,9 @@ impl CapabilitySetExt for CapabilitySet {
         }
 
         // Single files with read+write access
-        for path_template in &fs.allow_file {
-            let path = expand_vars(path_template, workdir)?;
+        let allow_file_expanded = expand_dynamic_tokens(&fs.allow_file, Some(workdir))?;
+        for path_template in &allow_file_expanded {
+            let path = expand_path(path_template, workdir)?;
             let label = format!("Profile file '{}' does not exist, skipping", path_template);
             if let Some(mut cap) = try_new_profile_exact_path(
                 &path,
@@ -741,8 +761,9 @@ impl CapabilitySetExt for CapabilitySet {
         }
 
         // Single files with read-only access
-        for path_template in &fs.read_file {
-            let path = expand_vars(path_template, workdir)?;
+        let read_file_expanded = expand_dynamic_tokens(&fs.read_file, Some(workdir))?;
+        for path_template in &read_file_expanded {
+            let path = expand_path(path_template, workdir)?;
             let label = format!("Profile file '{}' does not exist, skipping", path_template);
             if let Some(mut cap) = try_new_profile_exact_path(
                 &path,
@@ -757,8 +778,9 @@ impl CapabilitySetExt for CapabilitySet {
         }
 
         // Single files with write-only access
-        for path_template in &fs.write_file {
-            let path = expand_vars(path_template, workdir)?;
+        let write_file_expanded = expand_dynamic_tokens(&fs.write_file, Some(workdir))?;
+        for path_template in &write_file_expanded {
+            let path = expand_path(path_template, workdir)?;
             let label = format!("Profile file '{}' does not exist, skipping", path_template);
             if let Some(mut cap) = try_new_profile_exact_path(
                 &path,
@@ -780,7 +802,7 @@ impl CapabilitySetExt for CapabilitySet {
         // implied FsCapability with matching access mode. Source is
         // marked as Profile so `--dry-run -v` can show provenance.
         for path_template in &fs.unix_socket {
-            let path = expand_vars(path_template, workdir)?;
+            let path = expand_path(path_template, workdir)?;
             validate_requested_file(
                 &path,
                 "Profile",
@@ -807,7 +829,7 @@ impl CapabilitySetExt for CapabilitySet {
         }
 
         for path_template in &fs.unix_socket_bind {
-            let path = expand_vars(path_template, workdir)?;
+            let path = expand_path(path_template, workdir)?;
             validate_requested_file(
                 &path,
                 "Profile",
@@ -848,7 +870,7 @@ impl CapabilitySetExt for CapabilitySet {
         }
 
         for path_template in &fs.unix_socket_dir {
-            let path = expand_vars(path_template, workdir)?;
+            let path = expand_path(path_template, workdir)?;
             validate_requested_dir(
                 &path,
                 "Profile",
@@ -875,7 +897,7 @@ impl CapabilitySetExt for CapabilitySet {
         }
 
         for path_template in &fs.unix_socket_dir_bind {
-            let path = expand_vars(path_template, workdir)?;
+            let path = expand_path(path_template, workdir)?;
             validate_requested_dir(
                 &path,
                 "Profile",
@@ -902,7 +924,7 @@ impl CapabilitySetExt for CapabilitySet {
         }
 
         for path_template in &fs.unix_socket_subtree {
-            let path = expand_vars(path_template, workdir)?;
+            let path = expand_path(path_template, workdir)?;
             validate_requested_dir(
                 &path,
                 "Profile",
@@ -929,7 +951,7 @@ impl CapabilitySetExt for CapabilitySet {
         }
 
         for path_template in &fs.unix_socket_subtree_bind {
-            let path = expand_vars(path_template, workdir)?;
+            let path = expand_path(path_template, workdir)?;
             validate_requested_dir(
                 &path,
                 "Profile",
@@ -960,8 +982,9 @@ impl CapabilitySetExt for CapabilitySet {
         // drain sources `filesystem.allow` / `.read` / `.write`). The core
         // allow/read/write entries are already applied above — these branches
         // apply the remaining deny and deny-command surfaces.
-        for path_template in &profile.filesystem.deny {
-            let path = expand_vars(path_template, workdir)?;
+        let deny_expanded = expand_dynamic_tokens(&profile.filesystem.deny, Some(workdir))?;
+        for path_template in &deny_expanded {
+            let path = expand_path(path_template, workdir)?;
             let path_str = path.to_str().ok_or_else(|| {
                 NonoError::ConfigParse(format!(
                     "Profile filesystem deny path contains non-UTF-8 bytes: {}",
@@ -1043,9 +1066,11 @@ impl CapabilitySetExt for CapabilitySet {
         // would silently no-op with no feedback. Emit a `tracing::warn!`
         // so `nono -v ...` and the diagnostic footer surface the typo,
         // while keeping the security posture unchanged.
-        let mut profile_overrides = Vec::with_capacity(profile.filesystem.bypass_protection.len());
-        for path_template in &profile.filesystem.bypass_protection {
-            let path = expand_vars(path_template, workdir)?;
+        let bypass_expanded =
+            expand_dynamic_tokens(&profile.filesystem.bypass_protection, Some(workdir))?;
+        let mut profile_overrides = Vec::with_capacity(bypass_expanded.len());
+        for path_template in &bypass_expanded {
+            let path = expand_path(path_template, workdir)?;
             if path.exists() {
                 profile_overrides.push(path);
             } else {
@@ -3123,5 +3148,125 @@ mod tests {
         assert_eq!(socks.len(), 1);
         assert_eq!(socks[0].mode, UnixSocketMode::ConnectBind);
         assert_eq!(socks[0].scope, SocketScope::DirSubtree);
+    }
+
+    #[test]
+    fn test_from_profile_filesystem_allow_expands_git_dynamic_token() {
+        let tmp = tempfile::TempDir::new_in(
+            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+        )
+        .expect("tmpdir");
+        let main_repo = tmp.path().join("main");
+        std::fs::create_dir_all(&main_repo).expect("create main");
+
+        // git init + initial commit so worktree add works
+        let main_repo_str = main_repo.to_str().expect("main_repo utf8");
+        std::process::Command::new("git")
+            .args(["init", main_repo_str])
+            .output()
+            .expect("git init");
+        std::process::Command::new("git")
+            .args([
+                "-C",
+                main_repo_str,
+                "-c",
+                "user.email=test@test.com",
+                "-c",
+                "user.name=Test",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "init",
+            ])
+            .output()
+            .expect("git commit");
+
+        // git worktree add
+        let wt = tmp.path().join("linked");
+        let wt_str = wt.to_str().expect("wt utf8");
+        std::process::Command::new("git")
+            .args(["-C", main_repo_str, "worktree", "add", wt_str, "HEAD"])
+            .output()
+            .expect("git worktree add");
+
+        // Build a profile with @git:common-dir in filesystem.allow.
+        // In a linked worktree, @git:common-dir resolves to the absolute path of the
+        // main repo's .git directory — verifying that dynamic tokens are expanded in
+        // the top-level filesystem grant, not just in per-command sandboxes.
+        let profile_dir = tmp.path().join("profile");
+        std::fs::create_dir_all(&profile_dir).expect("create profile dir");
+        let profile_path = profile_dir.join("test.json");
+        std::fs::write(
+            &profile_path,
+            r#"{"meta":{"name":"test"},"filesystem":{"allow":["@git:common-dir"]}}"#,
+        )
+        .expect("write profile");
+
+        let profile = crate::profile::load_profile_from_path(&profile_path).expect("load profile");
+        let args = sandbox_args();
+
+        // from_profile receives &wt as workdir; @git:common-dir resolves via that
+        // path, not the process cwd — this is the scenario Luke flagged.
+        let (caps, _) = CapabilitySet::from_profile(&profile, &wt, &args)
+            .map(
+                |PreparedCaps {
+                     caps,
+                     needs_unlink_overrides,
+                     ..
+                 }| (caps, needs_unlink_overrides),
+            )
+            .expect("from_profile should succeed");
+
+        let expected_git_dir = main_repo
+            .join(".git")
+            .canonicalize()
+            .expect("canonicalize .git");
+        assert!(
+            caps.fs_capabilities().iter().any(|c| {
+                !c.is_file
+                    && c.access == nono::AccessMode::ReadWrite
+                    && c.resolved == expected_git_dir
+            }),
+            "@git:common-dir in filesystem.allow should grant ReadWrite on the main .git dir {:?}; \
+             caps = {:?}",
+            expected_git_dir,
+            caps.fs_capabilities()
+                .iter()
+                .map(|c| (&c.resolved, c.access))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_profile_fs_allow_expands_env_var() {
+        let dir = tempdir().expect("tempdir");
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let _env = crate::test_env::EnvVarGuard::set_all(&[(
+            "_TEST_CAPS_ALLOW_DIR",
+            dir.path().to_str().expect("utf-8 path"),
+        )]);
+        let profile = profile_with_fs_field("allow", "$_TEST_CAPS_ALLOW_DIR");
+        // Call from_profile directly — we already hold ENV_LOCK; from_profile_locked
+        // would try to acquire it again, deadlocking on the non-reentrant mutex.
+        let PreparedCaps { caps, .. } =
+            CapabilitySet::from_profile(&profile, dir.path(), &sandbox_args())
+                .expect("from_profile");
+        let fs_matches: Vec<_> = caps
+            .fs_capabilities()
+            .iter()
+            .filter(|c| {
+                c.source == CapabilitySource::Profile
+                    && c.resolved == dir.path().canonicalize().expect("canonicalize")
+            })
+            .collect();
+        assert_eq!(
+            fs_matches.len(),
+            1,
+            "$VAR in fs.allow should expand to the real path"
+        );
+        assert_eq!(fs_matches[0].access, AccessMode::ReadWrite);
     }
 }

@@ -941,9 +941,17 @@ where
     // on this path; injection is not performed for intercepted requests.
     let oauth2_route = service.and_then(|s| ctx.credential_store.get_oauth2(s));
 
-    // Managed credential gating, AWS handling, and command-backed capture are
-    // shared with the HTTP/2 path via [`resolve_managed_credential`] so the two
-    // protocols cannot diverge (e.g. forwarding an unsigned AWS request).
+    // Early branch: AWS SigV4 path is completely self-contained. Must be
+    // checked before calling resolve_managed_credential, which still carries
+    // a 501 stub for the aws_route case.
+    let aws_route = service.and_then(|s| ctx.credential_store.get_aws(s));
+    if let Some(aws) = aws_route {
+        return handle_inner_request_aws(tls_stream, ctx, aws, route, service, &req).await;
+    }
+
+    // Managed credential gating and command-backed capture are shared with the
+    // HTTP/2 path via [`resolve_managed_credential`] so the two protocols
+    // cannot diverge (e.g. forwarding an unsigned request).
     let resolved = match resolve_managed_credential(
         &ctx.credential_store,
         ctx.credential_capture_backend.as_ref(),
@@ -1124,6 +1132,179 @@ pub(crate) fn resolve_nonce_in_header_value(
     let real = resolver.resolve(nonce, consumer)?;
     let real_str = std::str::from_utf8(&real).ok()?;
     Some(format!("{}{}{}", &value[..start], real_str, &value[end..]))
+}
+
+/// Handle the AWS SigV4 arm of an intercepted inner request.
+///
+/// Owns the full pipeline for that credential type: header stripping, body reading,
+/// SigV4 signing, request assembly, filter check, and upstream forwarding.
+async fn handle_inner_request_aws<S>(
+    tls_stream: &mut S,
+    ctx: &InterceptCtx<'_>,
+    aws: &crate::aws::route::AwsRoute,
+    route: Option<&crate::route::LoadedRoute>,
+    service: Option<&str>,
+    req: &ParsedRequest,
+) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    // Strip the five auth-bearing headers so the agent's dummy credentials are
+    // never forwarded or included in the canonical request. All other
+    // x-amz-* headers (X-Amz-Target, meta, etc.) are preserved and signed.
+    let mut filtered_headers = reverse::filter_headers(&req.header_bytes, "");
+    filtered_headers.retain(|(name, _)| !crate::aws::sign::is_aws_auth_header(name));
+
+    let content_length = reverse::extract_content_length(&req.header_bytes);
+    let body = match reverse::read_request_body(tls_stream, content_length, &req.buffered).await? {
+        Some(b) => b,
+        None => return Ok(()),
+    };
+
+    // --- Resolve upstream IPs (DNS-rebind-safe via filter) ---
+    let resolved_addrs = match resolve_upstream_or_deny(
+        tls_stream,
+        ctx,
+        audit::EventContext {
+            route_id: service,
+            managed_credential_active: Some(true),
+            injection_mode: Some(nono::undo::NetworkAuditInjectionMode::Header),
+            ..audit::EventContext::default()
+        },
+    )
+    .await?
+    {
+        Some(addrs) => addrs,
+        None => return Ok(()),
+    };
+
+    // --- Build upstream request bytes ---
+    let upstream_authority = reverse::format_host_header(UpstreamScheme::Https, ctx.host, ctx.port);
+    let mut request = Zeroizing::new(format!(
+        "{} {} {}\r\nHost: {}\r\n",
+        req.method, req.path, req.version, upstream_authority
+    ));
+
+    // SigV4 signing: resolve credentials via the route's provider and inject
+    // Authorization, X-Amz-Date, X-Amz-Content-Sha256, and (if present)
+    // X-Amz-Security-Token.
+    let full_url = format!("https://{}{}", upstream_authority, req.path);
+    debug!(
+        "tls_intercept: signing AWS request: method={} url='{}' \
+         service='{}' region='{}' body_len={} header_count={}",
+        req.method,
+        full_url,
+        aws.service,
+        aws.region,
+        body.len(),
+        filtered_headers.len(),
+    );
+    match crate::aws::sign::sign_request(aws, &req.method, &full_url, &filtered_headers, &body)
+        .await
+    {
+        Ok(sign_headers) => {
+            debug!(
+                "tls_intercept: SigV4 signing succeeded; injecting {} headers",
+                sign_headers.len(),
+            );
+            for (name, value) in &sign_headers {
+                request.push_str(&format!("{}: {}\r\n", name, value));
+            }
+        }
+        Err(e) => {
+            let svc = service.unwrap_or("unknown");
+            let reason = format!(
+                "AWS credential resolution failed for route '{}': {}",
+                svc, e
+            );
+            warn!("tls_intercept: {}", reason);
+            audit::log_denied(
+                ctx.audit_log,
+                audit::ProxyMode::ConnectIntercept,
+                &audit::EventContext {
+                    route_id: service,
+                    auth_mechanism: route.and_then(|r| r.managed_auth_mechanism.clone()),
+                    auth_outcome: Some(nono::undo::NetworkAuditAuthOutcome::Failed),
+                    managed_credential_active: Some(false),
+                    injection_mode: route.and_then(|r| r.managed_injection_mode.clone()),
+                    denial_category: Some(
+                        nono::undo::NetworkAuditDenialCategory::ManagedCredentialUnavailable,
+                    ),
+                    ..audit::EventContext::default()
+                },
+                ctx.host,
+                ctx.port,
+                &reason,
+            );
+            reverse::send_error_generic(tls_stream, 502, "Bad Gateway").await?;
+            return Ok(());
+        }
+    }
+
+    for (name, value) in &filtered_headers {
+        request.push_str(&format!("{}: {}\r\n", name, value));
+    }
+    request.push_str("Connection: close\r\n");
+    if !body.is_empty() {
+        request.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    }
+    request.push_str("\r\n");
+
+    // --- Forward via shared pipeline ---
+    let connector = route
+        .and_then(|r| r.tls_connector.as_ref())
+        .unwrap_or(ctx.tls_connector);
+    let strategy = select_upstream_strategy(&ctx.upstream_proxy, &resolved_addrs);
+    let upstream_spec = UpstreamSpec {
+        scheme: UpstreamScheme::Https,
+        host: ctx.host,
+        port: ctx.port,
+        strategy,
+        tls_connector: connector,
+    };
+    let event_ctx = audit::EventContext {
+        route_id: service,
+        auth_mechanism: Some(nono::undo::NetworkAuditAuthMechanism::PhantomHeader),
+        auth_outcome: Some(nono::undo::NetworkAuditAuthOutcome::Succeeded),
+        managed_credential_active: Some(true),
+        injection_mode: Some(nono::undo::NetworkAuditInjectionMode::Header),
+        denial_category: None,
+        ..audit::EventContext::default()
+    };
+    let audit_ctx = AuditCtx {
+        log: ctx.audit_log,
+        mode: audit::ProxyMode::ConnectIntercept,
+        event_ctx: event_ctx.clone(),
+        target: ctx.host,
+        method: &req.method,
+        path: &req.path,
+    };
+    if let Err(e) = forward::forward_request(
+        tls_stream,
+        request.as_bytes(),
+        &body,
+        upstream_spec,
+        audit_ctx,
+    )
+    .await
+    {
+        warn!("tls_intercept: upstream forwarding failed: {}", e);
+        audit::log_denied(
+            ctx.audit_log,
+            audit::ProxyMode::ConnectIntercept,
+            &audit::EventContext {
+                denial_category: Some(
+                    nono::undo::NetworkAuditDenialCategory::UpstreamConnectFailed,
+                ),
+                ..event_ctx
+            },
+            ctx.host,
+            ctx.port,
+            &e.to_string(),
+        );
+        let _ = reverse::send_error_generic(tls_stream, 502, "Bad Gateway").await;
+    }
+    Ok(())
 }
 
 /// Parse a request line into (method, path, version).

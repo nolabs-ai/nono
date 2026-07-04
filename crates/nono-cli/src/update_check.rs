@@ -14,6 +14,12 @@
 //! identifiers or user accounts. No personally identifiable information is
 //! collected or transmitted. No IP addresses are logged by the update service.
 //!
+//! The same UUID, platform, arch, CI, and install-source fields are also
+//! attached as HTTP headers to every `RegistryClient` request (see
+//! `registry_client.rs`). Version is conveyed via the `User-Agent` header
+//! rather than a dedicated field. The privacy posture is otherwise identical:
+//! the same anonymous installation identity, no PII.
+//!
 //! To disable the update check, set `NONO_NO_UPDATE_CHECK=1` or add
 //! `[updates] check = false` to `$XDG_CONFIG_HOME/nono/config.toml` (default `~/.config/nono/config.toml`).
 
@@ -286,7 +292,24 @@ fn is_newer_version(current: &str, latest: &str) -> bool {
     }
 }
 
-fn detect_ci_provider() -> Option<&'static str> {
+/// Return the persisted installation UUID, or `None` if no state file exists yet. Never writes.
+///
+/// Intentionally does not delegate to `load_or_create_state()` — that function
+/// creates the state file when none exists, which would violate this function's
+/// no-write contract. The deserialization logic is therefore duplicated here.
+/// If `UpdateCheckState` changes (e.g. the `uuid` field is renamed), update
+/// both sites.
+pub(crate) fn read_installation_uuid() -> Option<String> {
+    let path = state_file_path()?;
+    if !path.exists() {
+        return None;
+    }
+    let content = std::fs::read_to_string(&path).ok()?;
+    let state: UpdateCheckState = serde_json::from_str(&content).ok()?;
+    Some(state.uuid)
+}
+
+pub(crate) fn detect_ci_provider() -> Option<&'static str> {
     for (env_var, provider) in CI_PROVIDER_ENV_VARS {
         if env_marker_present(env_var) {
             return Some(provider);
@@ -304,7 +327,7 @@ fn detect_ci_provider() -> Option<&'static str> {
 ///
 /// Returns a coarse label from a fixed allowlist. `unknown` is used when the
 /// executable path cannot be resolved.
-fn detect_install_source() -> String {
+pub(crate) fn detect_install_source() -> String {
     if let Some(source) = std::option_env!("NONO_INSTALL_SOURCE") {
         // Baked in at compile time by the release pipeline; not runtime-controllable.
         return source.to_string();

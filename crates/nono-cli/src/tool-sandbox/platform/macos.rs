@@ -4811,6 +4811,7 @@ mod tests {
                     action: InterceptActionConfig::Exec {
                         command: vec![helper.to_string_lossy().into_owned()],
                     },
+                    sandbox: None,
                 }],
                 ..Default::default()
             },

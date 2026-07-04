@@ -4012,6 +4012,7 @@ mod tests {
         git.intercept.push(InterceptRuleConfig {
             args: vec!["auth".to_string(), "switch".to_string()],
             action: InterceptActionConfig::Exec { command },
+            sandbox: None,
         });
         config
     }

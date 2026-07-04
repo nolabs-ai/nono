@@ -4,12 +4,15 @@
 //! background thread with a 3-second timeout and is throttled to once per 24 hours.
 //!
 //! Each request sends a randomly generated UUID (created on first run and stored
-//! locally), the current nono version, the OS name, the CPU architecture, and a
-//! coarse CI environment classification. The CI classification is derived only
-//! from well-known environment variable names and never includes raw environment
-//! values. None of these values are derived from hardware identifiers or user
-//! accounts. No personally identifiable information is collected or transmitted.
-//! No IP addresses are logged by the update service.
+//! locally), the current nono version, the OS name, the CPU architecture, a
+//! coarse CI environment classification, and a coarse install-source
+//! classification. The CI classification is derived only from well-known
+//! environment variable names and never includes raw environment values. The
+//! install-source classification is derived from the binary path and a
+//! compile-time environment variable set by the release pipeline — the binary
+//! path itself is never sent. None of these values are derived from hardware
+//! identifiers or user accounts. No personally identifiable information is
+//! collected or transmitted. No IP addresses are logged by the update service.
 //!
 //! To disable the update check, set `NONO_NO_UPDATE_CHECK=1` or add
 //! `[updates] check = false` to `$XDG_CONFIG_HOME/nono/config.toml` (default `~/.config/nono/config.toml`).
@@ -67,6 +70,7 @@ struct UpdateCheckRequest {
     ci: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     ci_provider: Option<&'static str>,
+    install_source: String,
 }
 
 const CI_PROVIDER_ENV_VARS: &[(&str, &str)] = &[
@@ -296,6 +300,38 @@ fn detect_ci_provider() -> Option<&'static str> {
     None
 }
 
+/// Classify the install method from the binary path and compile-time env.
+///
+/// Returns a coarse label from a fixed allowlist. `unknown` is used when the
+/// executable path cannot be resolved.
+fn detect_install_source() -> String {
+    if std::option_env!("NONO_INSTALL_SOURCE").is_some() {
+        // Baked in at compile time by the release pipeline; not runtime-controllable.
+        return "github_release".to_string();
+    }
+
+    let Ok(exe) = std::env::current_exe() else {
+        return "unknown".to_string();
+    };
+
+    classify_install_source(&exe).to_string()
+}
+
+fn classify_install_source(exe: &std::path::Path) -> &'static str {
+    let path = exe.to_string_lossy();
+
+    if path.contains("/opt/homebrew/")
+        || path.contains("/usr/local/Cellar/")
+        || path.contains("/.linuxbrew/")
+    {
+        "homebrew"
+    } else if path.contains("/.cargo/bin/") {
+        "cargo"
+    } else {
+        "manual"
+    }
+}
+
 fn env_marker_present(key: &str) -> bool {
     std::env::var_os(key).is_some_and(|value| {
         let value = value.to_string_lossy();
@@ -314,6 +350,7 @@ fn perform_check(uuid: &str) -> Option<UpdateInfo> {
         arch: std::env::consts::ARCH.to_string(),
         ci: ci_provider.is_some(),
         ci_provider,
+        install_source: detect_install_source(),
     };
 
     let body = serde_json::to_string(&request).ok()?;
@@ -565,6 +602,7 @@ mod tests {
             arch: "x86_64".to_string(),
             ci: true,
             ci_provider: Some("github_actions"),
+            install_source: "manual".to_string(),
         };
 
         let json = serde_json::to_value(&request).expect("serialize");
@@ -595,6 +633,44 @@ mod tests {
         assert!(!is_newer_version("bad", "0.6.1"));
         assert!(!is_newer_version("0.6.1", "bad"));
         assert!(!is_newer_version("", ""));
+    }
+
+    #[test]
+    fn test_update_request_serializes_install_source() {
+        let request = UpdateCheckRequest {
+            uuid: "test-uuid".to_string(),
+            version: "1.2.3".to_string(),
+            platform: "linux".to_string(),
+            arch: "x86_64".to_string(),
+            ci: false,
+            ci_provider: None,
+            install_source: "homebrew".to_string(),
+        };
+
+        let json = serde_json::to_value(&request).expect("serialize");
+        assert_eq!(json["install_source"], "homebrew");
+    }
+
+    #[test]
+    fn test_classify_install_source_homebrew() {
+        let exe = std::path::Path::new("/opt/homebrew/bin/nono");
+        assert_eq!(classify_install_source(exe), "homebrew");
+
+        // Linuxbrew (Homebrew on Linux / WSL2)
+        let exe = std::path::Path::new("/home/linuxbrew/.linuxbrew/bin/nono");
+        assert_eq!(classify_install_source(exe), "homebrew");
+    }
+
+    #[test]
+    fn test_classify_install_source_cargo() {
+        let exe = std::path::Path::new("/home/user/.cargo/bin/nono");
+        assert_eq!(classify_install_source(exe), "cargo");
+    }
+
+    #[test]
+    fn test_classify_install_source_manual() {
+        let exe = std::path::Path::new("/usr/local/bin/nono");
+        assert_eq!(classify_install_source(exe), "manual");
     }
 
     #[test]

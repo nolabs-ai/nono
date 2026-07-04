@@ -70,10 +70,14 @@ jobs:
       - name: Build
         if: matrix.target != 'aarch64-unknown-linux-gnu'
         run: cargo build --release --target ${{ matrix.target }} -p nono-cli
+        env:
+          NONO_INSTALL_SOURCE: github_release
 
       - name: Build (cross aarch64-unknown-linux-gnu)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: cross build --release --target aarch64-unknown-linux-gnu -p nono-cli
+        env:
+          NONO_INSTALL_SOURCE: github_release
 
       # The portable .tar.gz artifacts carry no dependency metadata, so a binary
       # that links libdbus would fail to start on hosts without it. The Linux

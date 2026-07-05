@@ -8,6 +8,7 @@ use crate::open_url_runtime::run_open_url_helper;
 use crate::output;
 use crate::package_cmd;
 use crate::profile_cmd;
+use crate::proxy_command;
 use crate::rollback_commands;
 use crate::session_commands;
 use crate::setup;
@@ -49,6 +50,9 @@ fn dispatch_command(
             run_command_with_banner_and_update(update_handle, silent, || run_wrap(*args, silent))
         }
         Commands::Why(args) => run_command_with_update(update_handle, silent, || run_why(*args)),
+        Commands::Proxy(args) => run_command_with_update(update_handle, silent, || {
+            proxy_command::run_proxy(*args, silent)
+        }),
         Commands::Setup(args) => {
             run_command_with_banner_and_update(update_handle, silent, || run_setup(args))
         }

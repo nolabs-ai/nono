@@ -1920,7 +1920,7 @@ fn policy_decision_to_proxy(decision: &PolicyDecision) -> ProxyEndpointPolicyDec
 /// - A plain hostname: `github.com` → `Plain("github.com")`
 /// - A URL with a path pattern: `https://github.com/atko-cic/**` →
 ///   `WithEndpoints { domain: "github.com", endpoints: [{method: "*", path: "/atko-cic/**"}] }`
-fn parse_allow_domain_arg(input: &str) -> crate::profile::AllowDomainEntry {
+pub(crate) fn parse_allow_domain_arg(input: &str) -> crate::profile::AllowDomainEntry {
     if let Ok(parsed) = url::Url::parse(input) {
         let domain = parsed.host_str().unwrap_or(input).to_string();
         let path = parsed.path();
@@ -1952,7 +1952,7 @@ pub(crate) fn merge_dedup_ports(a: &[u16], b: &[u16]) -> Vec<u16> {
 ///
 /// Expected format: `SERVICE:METHOD:PATH`
 /// Example: `"github:GET:/repos/*/issues"` → `("github", EndpointRule { method: "GET", path: "/repos/*/issues" })`
-fn parse_allow_endpoint_arg(
+pub(crate) fn parse_allow_endpoint_arg(
     entry: &str,
 ) -> nono::Result<(String, nono_proxy::config::EndpointRule)> {
     let err = || {
@@ -2095,6 +2095,25 @@ pub(crate) fn build_proxy_config_from_flags(
     Ok(proxy_config)
 }
 
+/// Build the credential-capture backend for a set of `credential_capture`
+/// entries, or `None` when no entries are configured.
+///
+/// Shared by the sandboxed `run` path (`start_proxy_runtime`) and the
+/// standalone `nono proxy` command so `cmd://` credential routes resolve
+/// identically in both.
+pub(crate) fn build_credential_capture_backend(
+    credential_capture: &HashMap<String, crate::profile::CredentialCaptureEntry>,
+    session_id: String,
+) -> Result<Option<Arc<dyn nono_proxy::capture::CredentialCaptureBackend>>> {
+    if credential_capture.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(Arc::new(ProxyCredentialCaptureBackend::new(
+        credential_capture,
+        session_id,
+    )?)))
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 struct TokenBrokerNonceResolver(crate::tool_sandbox::token_broker::SharedBroker);
 
@@ -2103,6 +2122,50 @@ impl nono_proxy::NonceResolver for TokenBrokerNonceResolver {
     fn resolve(&self, nonce: &str, consumer: &str) -> Option<Zeroizing<Vec<u8>>> {
         self.0.lock().ok()?.resolve_nonce(nonce, consumer)
     }
+}
+
+/// Wire up TLS interception on a `ProxyConfig`: pick a session-scoped
+/// directory for the ephemeral CA bundle, merge any parent `SSL_CERT_FILE`
+/// so corporate trust survives our env-var override, and (on macOS) load a
+/// preloaded CA when `--trust-proxy-ca` is set.
+///
+/// Shared by the sandboxed `run` path (`start_proxy_runtime`) and the
+/// standalone `nono proxy` command.
+pub(crate) fn apply_tls_intercept_config(
+    proxy_config: &mut nono_proxy::config::ProxyConfig,
+    proxy: &ProxyLaunchOptions,
+) -> Result<()> {
+    if let Some(dir) = prepare_intercept_ca_dir()? {
+        proxy_config.intercept_ca_dir = Some(dir);
+        proxy_config.intercept_parent_ca_pems = read_parent_ssl_cert_file();
+    }
+
+    #[cfg(target_os = "macos")]
+    if proxy
+        .tls_intercept
+        .as_ref()
+        .is_some_and(|t| t.trust_proxy_ca)
+    {
+        if proxy_config.intercept_ca_dir.is_some() {
+            let validity = proxy
+                .tls_intercept
+                .as_ref()
+                .and_then(|t| t.ca_validity)
+                .unwrap_or(nono_proxy::tls_intercept::ca::CA_VALIDITY_DEFAULT);
+            proxy_config.preloaded_ca = crate::macos_trust::load_or_generate_proxy_ca(validity);
+        } else {
+            tracing::warn!(
+                "--trust-proxy-ca has no effect without TLS-intercepting credential routes"
+            );
+        }
+    }
+
+    // `proxy` is only read on macOS (trust_proxy_ca); silence unused warning
+    // on other platforms without dropping the shared signature.
+    #[cfg(not(target_os = "macos"))]
+    let _ = proxy;
+
+    Ok(())
 }
 
 pub(crate) fn start_proxy_runtime(
@@ -2134,33 +2197,7 @@ pub(crate) fn start_proxy_runtime(
     let mut proxy_config = build_proxy_config_from_flags(proxy)?;
     proxy_config.direct_connect_ports = caps.tcp_connect_ports().to_vec();
 
-    // Wire up TLS interception: pick a session-scoped directory for the
-    // ephemeral CA bundle and merge any parent `SSL_CERT_FILE` so corporate
-    // trust survives our env-var override.
-    if let Some(dir) = prepare_intercept_ca_dir()? {
-        proxy_config.intercept_ca_dir = Some(dir);
-        proxy_config.intercept_parent_ca_pems = read_parent_ssl_cert_file();
-    }
-
-    #[cfg(target_os = "macos")]
-    if proxy
-        .tls_intercept
-        .as_ref()
-        .is_some_and(|t| t.trust_proxy_ca)
-    {
-        if proxy_config.intercept_ca_dir.is_some() {
-            let validity = proxy
-                .tls_intercept
-                .as_ref()
-                .and_then(|t| t.ca_validity)
-                .unwrap_or(nono_proxy::tls_intercept::ca::CA_VALIDITY_DEFAULT);
-            proxy_config.preloaded_ca = crate::macos_trust::load_or_generate_proxy_ca(validity);
-        } else {
-            tracing::warn!(
-                "--trust-proxy-ca has no effect without TLS-intercepting credential routes"
-            );
-        }
-    }
+    apply_tls_intercept_config(&mut proxy_config, proxy)?;
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -2169,15 +2206,8 @@ pub(crate) fn start_proxy_runtime(
         .map_err(|e| NonoError::SandboxInit(format!("Failed to start proxy runtime: {}", e)))?;
     let approval_registry =
         crate::approval_runtime::build_proxy_approval_registry(proxy.command_policies.as_ref())?;
-    let credential_capture_backend: Option<Arc<dyn nono_proxy::capture::CredentialCaptureBackend>> =
-        if proxy.credential_capture.is_empty() {
-            None
-        } else {
-            Some(Arc::new(ProxyCredentialCaptureBackend::new(
-                &proxy.credential_capture,
-                proxy.session_id.clone(),
-            )?))
-        };
+    let credential_capture_backend =
+        build_credential_capture_backend(&proxy.credential_capture, proxy.session_id.clone())?;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     let nonce_resolver: Option<Arc<dyn nono_proxy::NonceResolver>> = shared_broker
         .map(|b| -> Arc<dyn nono_proxy::NonceResolver> { Arc::new(TokenBrokerNonceResolver(b)) });
@@ -2213,8 +2243,8 @@ pub(crate) fn start_proxy_runtime(
     let route_rows = handle.route_diagnostics(&proxy_config);
     if !route_rows.is_empty() {
         info!("Proxy routes:");
-        for (prefix, summary) in &route_rows {
-            info!("  /{}  {}", prefix, summary);
+        for summary in &route_rows {
+            info!("  {}", summary);
         }
         if handle.intercept_ca_path().is_some() {
             info!(

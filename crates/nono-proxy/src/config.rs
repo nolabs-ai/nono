@@ -46,6 +46,51 @@ pub struct ProxyConfig {
     #[serde(default)]
     pub strict_filter: bool,
 
+    /// When `true` (the default), the proxy enforces the per-session token
+    /// on incoming requests via the `Proxy-Authorization` header. When
+    /// `false`, token enforcement is skipped entirely — an open proxy on the
+    /// bind address.
+    ///
+    /// This MUST remain `true` for the sandboxed `nono run`/`shell`/`wrap`
+    /// path: the token is the localhost auth boundary that stops other local
+    /// processes from using the proxy. It is set `false` only by the
+    /// standalone `nono proxy --no-auth` command, which keeps the bind
+    /// address on loopback.
+    #[serde(default = "default_require_auth")]
+    pub require_auth: bool,
+
+    /// Make `Proxy-Authorization` validation fatal on the transparent CONNECT
+    /// path (returns `407 Proxy Authentication Required` instead of tunnelling).
+    ///
+    /// Defaults to `false`, which preserves the lenient CONNECT behaviour the
+    /// sandboxed `nono run`/`shell`/`wrap` path relies on: Node.js undici does
+    /// not echo URL-userinfo credentials as `Proxy-Authorization` on CONNECT,
+    /// and the sandbox itself is the trust boundary there.
+    ///
+    /// Set `true` only by the standalone `nono proxy` command (unless
+    /// `--no-auth`), where the session token — not an OS sandbox — is the auth
+    /// boundary for the external tools pointed at the proxy. Has no effect when
+    /// `require_auth` is `false`.
+    #[serde(default)]
+    pub strict_connect_auth: bool,
+
+    /// Optional caller-supplied auth password used in place of a freshly
+    /// generated random session token.
+    ///
+    /// When `Some` (and non-empty), [`crate::server::start`] uses this exact
+    /// value as the credential clients must present via the
+    /// `Proxy-Authorization` header (Basic password or Bearer token), instead
+    /// of minting 256 bits of randomness. Set only by the standalone
+    /// `nono proxy --pass` flag so the operator controls the exact secret;
+    /// the sandboxed `run`/`shell`/`wrap` path always leaves this `None` and
+    /// uses a random per-session token.
+    ///
+    /// Skipped during (de)serialisation — a secret must never be persisted to
+    /// or read from a config file on disk. Has no effect when
+    /// `require_auth` is `false`.
+    #[serde(default, skip)]
+    pub session_token: Option<Zeroizing<String>>,
+
     /// Reverse proxy credential routes.
     #[serde(default)]
     pub routes: Vec<RouteConfig>,
@@ -162,6 +207,9 @@ impl Default for ProxyConfig {
             bind_port: 0,
             allowed_hosts: Vec::new(),
             strict_filter: false,
+            require_auth: default_require_auth(),
+            strict_connect_auth: false,
+            session_token: None,
             routes: Vec::new(),
             external_proxy: None,
             direct_connect_ports: Vec::new(),
@@ -178,6 +226,10 @@ impl Default for ProxyConfig {
 
 fn default_bind_addr() -> IpAddr {
     IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+}
+
+fn default_require_auth() -> bool {
+    true
 }
 
 /// Configuration for a reverse proxy credential route.

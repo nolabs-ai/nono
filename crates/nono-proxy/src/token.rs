@@ -76,6 +76,24 @@ const HEX_CHARS: [char; 16] = [
     '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f',
 ];
 
+/// Enforce proxy authentication, honouring the `require_auth` toggle.
+///
+/// When `require_auth` is `false` (the standalone `nono proxy --no-auth`
+/// case) this is a no-op: the proxy accepts every request without checking
+/// the `Proxy-Authorization` header. When `true` it delegates to
+/// [`validate_proxy_auth`]. Centralising the toggle here keeps the
+/// "skip when disabled" decision in one place rather than at every call site.
+pub fn enforce_proxy_auth(
+    require_auth: bool,
+    header_bytes: &[u8],
+    session_token: &Zeroizing<String>,
+) -> Result<()> {
+    if !require_auth {
+        return Ok(());
+    }
+    validate_proxy_auth(header_bytes, session_token)
+}
+
 /// Validate a `Proxy-Authorization` header against the session token.
 ///
 /// Accepts two formats:
@@ -245,5 +263,34 @@ mod tests {
         let token = Zeroizing::new("abc123".to_string());
         let header = b"Host: example.com\r\n\r\n";
         assert!(validate_proxy_auth(header, &token).is_err());
+    }
+
+    #[test]
+    fn test_enforce_proxy_auth_disabled_accepts_missing_header() {
+        let token = Zeroizing::new("abc123".to_string());
+        // With auth disabled, even a header with no Proxy-Authorization passes.
+        let header = b"Host: example.com\r\n\r\n";
+        assert!(enforce_proxy_auth(false, header, &token).is_ok());
+    }
+
+    #[test]
+    fn test_enforce_proxy_auth_disabled_accepts_wrong_token() {
+        let token = Zeroizing::new("abc123".to_string());
+        let header = b"Proxy-Authorization: Bearer wrong\r\n\r\n";
+        assert!(enforce_proxy_auth(false, header, &token).is_ok());
+    }
+
+    #[test]
+    fn test_enforce_proxy_auth_enabled_delegates_valid() {
+        let token = Zeroizing::new("abc123".to_string());
+        let header = b"Proxy-Authorization: Bearer abc123\r\n\r\n";
+        assert!(enforce_proxy_auth(true, header, &token).is_ok());
+    }
+
+    #[test]
+    fn test_enforce_proxy_auth_enabled_delegates_invalid() {
+        let token = Zeroizing::new("abc123".to_string());
+        let header = b"Proxy-Authorization: Bearer wrong\r\n\r\n";
+        assert!(enforce_proxy_auth(true, header, &token).is_err());
     }
 }

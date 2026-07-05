@@ -5,6 +5,8 @@ description: Network access control — proxy modes, domain filtering, credentia
 
 By default the sandboxed process has unrestricted network access. When you restrict networking, nono routes traffic through an HTTP proxy running in the unsandboxed supervisor process. The sandboxed child can only reach `localhost:<proxy-port>` — all other outbound TCP is blocked at the kernel level.
 
+The same proxy can also be run on its own with [`nono proxy`](#standalone-proxy-nono-proxy) — a foreground server with no sandboxed child — so you can point external workloads (containers, microVMs) at nono's domain filtering and credential injection.
+
 ## Common cases
 
 ```bash
@@ -192,6 +194,101 @@ export NONO_UPSTREAM_BYPASS=git.internal.corp,*.dev.local
 nono run --allow-cwd --network-profile enterprise -- my-agent
 ```
 
+## Standalone Proxy (`nono proxy`)
+
+`nono run` / `shell` / `wrap` start the proxy as a side effect of launching a sandboxed child, wiring `HTTP_PROXY`/`HTTPS_PROXY` and the session token into that child. `nono proxy` instead runs the same network-filtering / credential-injection proxy as a **foreground server with no sandboxed child**, prints the connection details, and blocks until you press Ctrl-C.
+
+This lets you point your own tools at nono's domain filtering and credential injection, useful for workloads that provide their own OS-level isolation, such as Docker containers, Kata Containers, Kubernetes pods, Firecracker, and gVisor. The workload routes its egress through the proxy via `HTTP(S)_PROXY` while isolation comes from the container/microVM runtime.
+
+```bash
+# Ephemeral port, token auth, prints connection info
+nono proxy
+
+# Fixed port
+nono proxy --port 8080
+
+# Allowlist a host
+nono proxy --allow-domain github.com
+
+# Load network/credential settings from a profile
+nono proxy --profile my-profile
+```
+
+On startup it prints the proxy URL (with the embedded credential), the raw token, ready-to-paste `HTTP(S)_PROXY` exports, a summary of configured routes, and — when TLS interception is active — the trust-bundle path:
+
+```
+  nono proxy listening on 127.0.0.1:8080
+  proxy URL: http://nono:<token>@127.0.0.1:8080
+  token:     <token>
+
+  export HTTPS_PROXY=http://nono:<token>@127.0.0.1:8080
+  export HTTP_PROXY=http://nono:<token>@127.0.0.1:8080
+
+  Press Ctrl-C to stop.
+```
+
+Settings are loaded from `--profile` and extended/overridden by explicit flags, reusing the same configuration machinery as the sandboxed path. Allow-domains and credentials are merged on top of the profile; the network profile and upstream proxy are overridden by flags. Credential injection for known services and `cmd://` credential-capture routes carry through the profile exactly as they do under `nono run`.
+
+### Flags
+
+| Flag | Purpose |
+|------|---------|
+| `--listen <ADDR>` | Bind address (default `127.0.0.1`). |
+| `--port <PORT>` | Port to listen on (`0` = OS-assigned ephemeral, the default). |
+| `--no-auth` | Disable session-token auth — accept every request on the bind address. Loopback only. |
+| `--pass <PASSWORD>` | Pin the proxy credential to a fixed value instead of a random token. Reads `NONO_PROXY_PASS`. |
+| `--profile <NAME_OR_PATH>` | Load network/credential settings from a profile. |
+| `--max-connections <N>` | Maximum concurrent client connections (`0` = unlimited, default `256`). Raise for highly parallel clients such as `docker pull`. Reads `NONO_PROXY_MAX_CONNECTIONS`. |
+| `--network-profile <PROFILE>` | Enable a named network profile (e.g. `developer`). |
+| `--allow-domain <DOMAIN_OR_URL>` | Add a domain (or path-scoped URL) to the allowlist (repeatable). |
+| `--credential <SERVICE>` | Inject credentials for a service via the reverse proxy (repeatable). |
+| `--allow-endpoint <SERVICE:METHOD:PATH>` | Restrict a credential service to specific HTTP method+path patterns (repeatable). See [Endpoint Filtering](#endpoint-filtering). |
+| `--upstream-proxy <HOST:PORT>` | Chain outbound traffic through an upstream proxy. |
+| `--upstream-bypass <DOMAIN>` | Route these domains direct instead of through the upstream proxy (requires `--upstream-proxy`). |
+| `--allow-http2` | Negotiate HTTP/2 with upstreams that support it (ALPN). Off by default. See [HTTP/2 Support](#http2-support---allow-http2). |
+| `--proxy-ca-validity <DAYS>` | Proxy CA certificate validity in days (1–365). Conflicts with `--proxy-ca-cert`. |
+| `--trust-proxy-ca` | Add the proxy CA to the macOS user trust store (macOS only). |
+| `--proxy-ca-cert <PEM_FILE>` | Sign intercepted TLS with this existing CA certificate (PEM) instead of a fresh per-session CA. Requires `--proxy-ca-key`. Reads `NONO_PROXY_CA_CERT`. |
+| `--proxy-ca-key <PEM_FILE>` | PKCS#8 private key (PEM) for `--proxy-ca-cert`. Reads `NONO_PROXY_CA_KEY`. |
+
+### Reusing a CA across runs
+
+By default each `nono proxy` run mints a fresh ephemeral CA, so any client that trusts the intercepted TLS has to re-trust a new certificate every time. To keep one CA across runs — trust it once in your clients, containers, or microVM images — supply your own with `--proxy-ca-cert` and `--proxy-ca-key`:
+
+```bash
+nono proxy \
+  --allow-domain 'https://api.github.com/**' \
+  --proxy-ca-cert ./ca.crt \
+  --proxy-ca-key ./ca.key
+```
+
+The key must be an **ECDSA P-256** private key in **PKCS#8** PEM (`-----BEGIN PRIVATE KEY-----`); the certificate must be a CA certificate in PEM. Generate a pair with OpenSSL:
+
+```bash
+# PKCS#8 EC P-256 private key
+openssl ecparam -name prime256v1 -genkey -noout -out ca.ec.key
+openssl pkcs8 -topk8 -nocrypt -in ca.ec.key -out ca.key && rm ca.ec.key
+
+# Self-signed CA certificate (30-day validity here)
+openssl req -x509 -new -nodes -key ca.key -sha256 -days 30 \
+  -subj "/CN=my-proxy-ca" \
+  -addext "basicConstraints=critical,CA:TRUE" \
+  -addext "keyUsage=critical,keyCertSign,cRLSign,digitalSignature" \
+  -out ca.crt
+```
+
+The key and cert are validated at startup: a mismatched pair (or an unreadable file) fails the command immediately rather than silently disabling interception. Validity comes from the supplied certificate, so `--proxy-ca-cert` cannot be combined with `--proxy-ca-validity`; on macOS it also cannot be combined with `--trust-proxy-ca`, which manages its own CA in the Keychain. Protect the key file — anyone who can read it can mint certificates your clients will trust.
+
+<Note>
+  TLS interception (and therefore the CA) only activates when a route requires layer-7 visibility — for example an endpoint-scoped `--allow-domain` (a URL with a path glob) or `--allow-endpoint` rules. Plain host allowlisting tunnels CONNECT traffic without interception, so no CA is used.
+</Note>
+
+### Authentication
+
+By default the proxy generates a random per-session token; clients authenticate with `Proxy-Authorization` (Basic via the `nono:<token>` userinfo in the printed URL, or Bearer). To use a fixed credential, pass `--pass` (or set `NONO_PROXY_PASS` to keep it out of shell history and process listings).
+
+`--no-auth` starts an open proxy that accepts every request on the bind address. To fail secure, it is **refused for non-loopback bind addresses** so you can't accidentally expose an open proxy to other hosts, and it is mutually exclusive with `--pass`.
+
 ## Endpoint Filtering
 
 When credential injection routes traffic through the reverse proxy, you can further restrict which HTTP method+path combinations are allowed on a per-service basis. This enforces least-privilege at the API level — the agent can reach an allowed domain but only use specific endpoints.
@@ -346,6 +443,8 @@ By default, the proxy uses HTTP/1.1 with keep-alive connection pooling for all u
 ```bash
 nono run --profile claude-code --allow-http2 -- claude
 ```
+
+It can also be set in a profile with `network.allow_http2`, which both `nono run` and `nono proxy` honor.
 
 When enabled:
 

@@ -133,8 +133,8 @@ impl ProxyHandle {
             .map_err(|e| ProxyError::Config(format!("proxy diagnostics JSON error: {e}")))
     }
 
-    /// One-line-per-route diagnostic summary suitable for surfacing at
-    /// session start. Returns `(prefix, summary)` pairs.
+    /// One-line-per-upstream diagnostic summary suitable for surfacing at
+    /// session start. Returns one summary string per upstream.
     ///
     /// Each summary names: upstream URL, credential resolution status
     /// (✓ / ✗ + source label), TLS-intercept on/off, and `endpoint_rules`
@@ -142,36 +142,115 @@ impl ProxyHandle {
     /// noisy by default, addressing the common "I created the keychain
     /// entry but the warn at debug level got missed" footgun.
     ///
+    /// Routes are grouped by upstream so that the credential route and the
+    /// synthetic endpoint-authorization route (`_ep_<host>`) the CLI emits for
+    /// the same host collapse into one row. These are distinct internal routes
+    /// — credential injection is decoupled from L7 endpoint filtering (see
+    /// `route.rs`) — but at request time they are evaluated together against a
+    /// single upstream (the `_ep_` route gates, the credential catch-all
+    /// injects). A combined row therefore reflects the effective behaviour
+    /// instead of exposing the internal split as a confusing credential-less
+    /// duplicate. The internal route prefixes are intentionally not surfaced;
+    /// the upstream URL is the user-meaningful identity.
+    ///
     /// `config` is the same `ProxyConfig` that was passed to `start()`;
     /// the handle doesn't keep a copy, so the CLI passes it back in.
     #[must_use]
-    pub fn route_diagnostics(&self, config: &ProxyConfig) -> Vec<(String, String)> {
-        let mut rows = Vec::with_capacity(config.routes.len());
+    pub fn route_diagnostics(&self, config: &ProxyConfig) -> Vec<String> {
+        // Reconstruct the same host filter the server applies (see `start`).
+        // A credential/endpoint route only injects or filters; traffic still
+        // has to clear the allowlist to reach the upstream at all. A route
+        // whose upstream is not allow-listed is dead config (the proxy 403s
+        // it), so skip it here rather than advertise an unreachable route.
+        let filter = if config.strict_filter {
+            crate::filter::ProxyFilter::new_strict(&config.allowed_hosts)
+        } else if config.allowed_hosts.is_empty() {
+            crate::filter::ProxyFilter::allow_all()
+        } else {
+            crate::filter::ProxyFilter::new(&config.allowed_hosts)
+        };
+        // Hostname-only reachability: pass no resolved IPs so the link-local
+        // SSRF check is skipped (that is a runtime DNS concern, not a config
+        // one) and only the deny-list / allowlist hostname rules apply.
+        let upstream_reachable = |upstream: &str| -> bool {
+            match crate::route::extract_host_port(upstream) {
+                Some(host_port) => {
+                    let host = host_port
+                        .rsplit_once(':')
+                        .map(|(h, _)| h)
+                        .unwrap_or(&host_port);
+                    filter.check_host_with_ips(host, &[]).is_allowed()
+                }
+                // Unparseable upstream can't be matched against the allowlist;
+                // keep it visible rather than silently hiding a misconfig.
+                None => true,
+            }
+        };
+
+        // Group routes by upstream, preserving first-seen order. Route counts
+        // are small (a handful), so the linear scan per route is cheap.
+        let mut groups: Vec<(&str, Vec<&crate::config::RouteConfig>)> = Vec::new();
         for route in &config.routes {
-            let prefix = route.prefix.trim_matches('/').to_string();
-            let cred_summary = self.credential_status_summary(&prefix, route);
+            if !upstream_reachable(&route.upstream) {
+                continue;
+            }
+            if let Some(group) = groups
+                .iter_mut()
+                .find(|(u, _)| *u == route.upstream.as_str())
+            {
+                group.1.push(route);
+            } else {
+                groups.push((route.upstream.as_str(), vec![route]));
+            }
+        }
+
+        let mut rows = Vec::with_capacity(groups.len());
+        for (upstream, group) in &groups {
+            // Credential summary comes from the credential-bearing route in the
+            // group (if any); the `_ep_` route never carries one.
+            //
+            // A group may still be covered by a credential route on *another*
+            // upstream: a wildcard credential route (e.g. `*.githubusercontent.com`)
+            // matches concrete `_ep_` hosts (`raw.githubusercontent.com`) at
+            // request time via `host_port_matches`. Reporting that covering
+            // credential keeps the display honest — the token really is injected.
+            let own_cred = group
+                .iter()
+                .find(|r| r.credential_key.is_some() || r.oauth2.is_some() || r.aws_auth.is_some());
+            let covering_cred = own_cred.copied().or_else(|| {
+                let host_port = crate::route::extract_host_port(upstream)?;
+                config.routes.iter().find(|r| {
+                    (r.credential_key.is_some() || r.oauth2.is_some() || r.aws_auth.is_some())
+                        && crate::route::extract_host_port(&r.upstream)
+                            .is_some_and(|hp| crate::route::host_port_matches(&hp, &host_port))
+                })
+            });
+            let cred_route = covering_cred.unwrap_or(group[0]);
+            let cred_prefix = cred_route.prefix.trim_matches('/');
+            let cred_summary = self.credential_status_summary(cred_prefix, cred_route);
 
             let intercept_summary = if self.intercept_ca_path.is_some()
-                && (route.credential_key.is_some()
-                    || route.oauth2.is_some()
-                    || !route.endpoint_rules.is_empty()
-                    || route.endpoint_policy.is_some())
-            {
+                && group.iter().any(|r| {
+                    r.credential_key.is_some()
+                        || r.oauth2.is_some()
+                        || !r.endpoint_rules.is_empty()
+                        || r.endpoint_policy.is_some()
+                }) {
                 "intercept: on"
             } else {
                 "intercept: off"
             };
 
-            let rules_summary = if route.endpoint_policy.is_some() {
+            let rules_summary = if group.iter().any(|r| r.endpoint_policy.is_some()) {
                 "endpoint_policy: on".to_string()
             } else {
-                format!("endpoint_rules: {}", route.endpoint_rules.len())
+                let total: usize = group.iter().map(|r| r.endpoint_rules.len()).sum();
+                format!("endpoint_rules: {}", total)
             };
-            let summary = format!(
-                "→ {} | {} | {} | {}",
-                route.upstream, cred_summary, intercept_summary, rules_summary
-            );
-            rows.push((prefix, summary));
+            rows.push(format!(
+                "{} | {} | {} | {}",
+                upstream, cred_summary, intercept_summary, rules_summary
+            ));
         }
         rows
     }
@@ -464,8 +543,14 @@ pub async fn start_with_nonce_resolver(
     credential_capture_backend: Option<Arc<dyn CredentialCaptureBackend>>,
     nonce_resolver: Option<Arc<dyn crate::token::NonceResolver>>,
 ) -> Result<ProxyHandle> {
-    // Generate session token
-    let session_token = token::generate_session_token()?;
+    // Use the caller-supplied password if one was provided (the standalone
+    // `nono proxy --pass` case), otherwise mint a fresh random session token.
+    // An empty override is treated as "not supplied" so a blank `--pass`
+    // can't silently produce an unguessable-but-empty credential.
+    let session_token = match config.session_token {
+        Some(ref token) if !token.is_empty() => token.clone(),
+        _ => token::generate_session_token()?,
+    };
 
     // Bind listener
     let bind_addr = SocketAddr::new(config.bind_addr, config.bind_port);
@@ -830,6 +915,18 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
 
     // Dispatch by method
     if first_line.starts_with("CONNECT ") {
+        // Resolve how the transparent CONNECT path treats Proxy-Authorization.
+        // Strict (407 on failure) only for standalone `nono proxy` with auth
+        // on; lenient (validate-but-tunnel) for the sandboxed paths; disabled
+        // under `--no-auth`. See [`connect::ConnectAuthMode`].
+        let connect_auth_mode = if !state.config.require_auth {
+            connect::ConnectAuthMode::Disabled
+        } else if state.config.strict_connect_auth {
+            connect::ConnectAuthMode::Strict
+        } else {
+            connect::ConnectAuthMode::Lenient
+        };
+
         // CONNECT requests targeting a configured route's upstream get
         // special handling. There are three sub-cases:
         //
@@ -877,10 +974,17 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
                         // request head rather than dropping the socket — closing
                         // it breaks reactive clients (Apache HttpClient, Java's
                         // HttpClient, Maven's native resolver).
+                        //
+                        // When auth is disabled (standalone `nono proxy
+                        // --no-auth`), `enforce_proxy_auth` returns `Ok(())` on
+                        // the first pass and the loop exits without challenging.
                         let mut current_headers = header_bytes;
                         loop {
-                            match token::validate_proxy_auth(&current_headers, &state.session_token)
-                            {
+                            match token::enforce_proxy_auth(
+                                state.config.require_auth,
+                                &current_headers,
+                                &state.session_token,
+                            ) {
                                 Ok(()) => break,
                                 Err(e) => {
                                     debug!(
@@ -1125,6 +1229,7 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
                 &header_bytes,
                 &state.filter,
                 &state.session_token,
+                state.config.require_auth,
                 ext_config,
                 Some(&state.audit_log),
             )
@@ -1134,13 +1239,18 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
             // routing direct. Without this, bypassed hosts would inherit
             // connect::handle_connect()'s lenient auth (which tolerates
             // missing Proxy-Authorization for Node.js undici compat).
-            token::validate_proxy_auth(&header_bytes, &state.session_token)?;
+            token::enforce_proxy_auth(
+                state.config.require_auth,
+                &header_bytes,
+                &state.session_token,
+            )?;
             connect::handle_connect(
                 first_line,
                 &mut stream,
                 &state.filter,
                 &state.session_token,
                 &header_bytes,
+                connect_auth_mode,
                 Some(&state.audit_log),
             )
             .await
@@ -1151,6 +1261,7 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
                 &state.filter,
                 &state.session_token,
                 &header_bytes,
+                connect_auth_mode,
                 Some(&state.audit_log),
             )
             .await
@@ -1161,6 +1272,7 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
             route_store: &state.route_store,
             credential_store: &state.credential_store,
             session_token: &state.session_token,
+            require_auth: state.config.require_auth,
             filter: &state.filter,
             tls_connector: &state.tls_connector,
             default_tls_config: &state.default_tls_config,
@@ -1203,6 +1315,7 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncReadExt;
 
     #[test]
     fn normalize_authority_normalises_case_and_default_port() {
@@ -1222,6 +1335,217 @@ mod tests {
             normalize_authority("API.OPENAI.COM:443"),
             normalize_authority("api.openai.com")
         );
+    }
+
+    #[tokio::test]
+    async fn test_proxy_uses_supplied_session_token() {
+        // A caller-supplied password (the `nono proxy --pass` case) must be
+        // used verbatim as the proxy credential instead of a random token.
+        let config = ProxyConfig {
+            session_token: Some(Zeroizing::new("my-fixed-password".to_string())),
+            ..Default::default()
+        };
+        let handle = start(config).await.unwrap();
+        assert_eq!(*handle.token, "my-fixed-password");
+        handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_proxy_ignores_empty_session_token() {
+        // An empty override must fall back to a random token, never an
+        // effectively-absent credential.
+        let config = ProxyConfig {
+            session_token: Some(Zeroizing::new(String::new())),
+            ..Default::default()
+        };
+        let handle = start(config).await.unwrap();
+        assert_eq!(
+            handle.token.len(),
+            64,
+            "empty --pass must fall back to a random token"
+        );
+        handle.shutdown();
+    }
+
+    /// Spawn a one-shot loopback HTTP server that accepts a single connection,
+    /// drains the request, and replies `200 OK`. Returns its `host:port`.
+    /// Used as a reverse-proxy upstream so the auth decision can be observed
+    /// end-to-end without reaching the network.
+    async fn spawn_mock_upstream() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                // Read until the end of the request head, then reply.
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                    .await;
+            }
+        });
+        format!("127.0.0.1:{}", addr.port())
+    }
+
+    /// A declarative (credential-less) reverse-proxy route whose upstream is a
+    /// loopback `http://` server. With no credential, the auth path falls to
+    /// the session-token fallback branch — the branch the `require_auth` fix
+    /// moved back inside the guard.
+    fn declarative_route(upstream: &str) -> crate::config::RouteConfig {
+        crate::config::RouteConfig {
+            prefix: "svc".to_string(),
+            upstream: upstream.to_string(),
+            credential_key: None,
+            inject_mode: Default::default(),
+            inject_header: "Authorization".to_string(),
+            credential_format: None,
+            path_pattern: None,
+            path_replacement: None,
+            query_param_name: None,
+            proxy: None,
+            env_var: None,
+            endpoint_rules: vec![],
+            endpoint_policy: None,
+            tls_ca: None,
+            tls_client_cert: None,
+            tls_client_key: None,
+            oauth2: None,
+            aws_auth: None,
+        }
+    }
+
+    /// Send `GET /svc/` through the proxy at `port` with no `Proxy-Authorization`
+    /// header and return the upstream status line the proxy wrote back.
+    async fn unauthenticated_reverse_request(port: u16) -> String {
+        let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        client
+            .write_all(b"GET /svc/ HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            .await
+            .unwrap();
+        let mut resp = Vec::new();
+        // Read the response head; the upstream is tiny so a single read suffices.
+        let mut buf = [0u8; 1024];
+        if let Ok(n) = client.read(&mut buf).await {
+            resp.extend_from_slice(&buf[..n]);
+        }
+        String::from_utf8_lossy(&resp)
+            .lines()
+            .next()
+            .unwrap_or("")
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn test_no_auth_skips_reverse_proxy_authentication() {
+        // Regression: `nono proxy --no-auth` (require_auth == false) must skip
+        // session-token enforcement on reverse-proxy routes. A previous
+        // restructure chained the auth branches as `else if` alternatives to
+        // `if ctx.require_auth`, so disabling auth still rejected requests.
+        let upstream = spawn_mock_upstream().await;
+        let config = ProxyConfig {
+            routes: vec![declarative_route(&format!("http://{upstream}"))],
+            allowed_hosts: vec!["127.0.0.1".to_string()],
+            require_auth: false,
+            ..Default::default()
+        };
+        let handle = start(config).await.unwrap();
+        let status = unauthenticated_reverse_request(handle.port).await;
+        assert!(
+            status.contains("200"),
+            "with --no-auth an unauthenticated reverse request must reach the upstream, got: {status:?}"
+        );
+        assert!(
+            !status.contains("407") && !status.contains("401"),
+            "auth must not be enforced when disabled, got: {status:?}"
+        );
+        handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_reverse_proxy_enforces_auth_when_required() {
+        // Companion to the --no-auth case: with auth required, an
+        // unauthenticated reverse request must still be challenged (407),
+        // locking the toggle in both directions.
+        let upstream = spawn_mock_upstream().await;
+        let config = ProxyConfig {
+            routes: vec![declarative_route(&format!("http://{upstream}"))],
+            allowed_hosts: vec!["127.0.0.1".to_string()],
+            require_auth: true,
+            ..Default::default()
+        };
+        let handle = start(config).await.unwrap();
+        let status = unauthenticated_reverse_request(handle.port).await;
+        assert!(
+            status.contains("407"),
+            "with auth required an unauthenticated reverse request must be challenged, got: {status:?}"
+        );
+        handle.shutdown();
+    }
+
+    /// Send an unauthenticated `CONNECT host:443` through the proxy at `port`
+    /// and return the status line the proxy wrote back.
+    async fn unauthenticated_connect_request(port: u16, host: &str) -> String {
+        let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        client
+            .write_all(
+                format!("CONNECT {host}:443 HTTP/1.1\r\nHost: {host}:443\r\n\r\n").as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut buf = [0u8; 1024];
+        let n = client.read(&mut buf).await.unwrap_or(0);
+        String::from_utf8_lossy(&buf[..n])
+            .lines()
+            .next()
+            .unwrap_or("")
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn test_strict_connect_auth_rejects_unauthenticated_connect() {
+        // Standalone `nono proxy` sets strict_connect_auth: an unauthenticated
+        // CONNECT must be answered with 407 *before* any DNS/filter/upstream
+        // handling, rather than tunnelled (which would otherwise surface as a
+        // 502 once the upstream connect fails).
+        let config = ProxyConfig {
+            allowed_hosts: vec!["nonexistent.invalid".to_string()],
+            require_auth: true,
+            strict_connect_auth: true,
+            ..Default::default()
+        };
+        let handle = start(config).await.unwrap();
+        let status = unauthenticated_connect_request(handle.port, "nonexistent.invalid").await;
+        assert!(
+            status.contains("407"),
+            "strict CONNECT auth must challenge an unauthenticated CONNECT, got: {status:?}"
+        );
+        handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_lenient_connect_auth_tunnels_unauthenticated_connect() {
+        // Sandboxed run/shell/wrap path (strict_connect_auth == false): an
+        // unauthenticated CONNECT is *not* rejected with 407 — it proceeds to
+        // host filtering / upstream connect (undici compat). The unresolvable
+        // host then yields a 502, proving the request was never short-circuited
+        // at the auth gate.
+        let config = ProxyConfig {
+            allowed_hosts: vec!["nonexistent.invalid".to_string()],
+            require_auth: true,
+            strict_connect_auth: false,
+            ..Default::default()
+        };
+        let handle = start(config).await.unwrap();
+        let status = unauthenticated_connect_request(handle.port, "nonexistent.invalid").await;
+        assert!(
+            !status.contains("407"),
+            "lenient CONNECT auth must not challenge with 407, got: {status:?}"
+        );
+        handle.shutdown();
     }
 
     #[tokio::test]
@@ -1481,18 +1805,278 @@ mod tests {
         let rows = handle.route_diagnostics(&config);
         assert_eq!(rows.len(), 2);
 
-        let openai = rows.iter().find(|(p, _)| p == "openai").unwrap();
-        assert!(openai.1.contains("api.openai.com"));
-        assert!(openai.1.contains("intercept: on"));
+        let openai = rows.iter().find(|s| s.contains("api.openai.com")).unwrap();
+        assert!(openai.contains("intercept: on"));
         assert!(
-            openai.1.contains("✗") || openai.1.contains("credential_not_found"),
+            openai.contains("✗") || openai.contains("credential_not_found"),
             "missing credential should show structured code, got: {}",
-            openai.1
+            openai
         );
 
-        let alias = rows.iter().find(|(p, _)| p == "alias").unwrap();
-        assert!(alias.1.contains("creds: none"));
-        assert!(alias.1.contains("intercept: off"));
+        let alias = rows
+            .iter()
+            .find(|s| s.contains("aliased.example.com"))
+            .unwrap();
+        assert!(alias.contains("creds: none"));
+        assert!(alias.contains("intercept: off"));
+
+        handle.shutdown();
+    }
+
+    /// A credential route and the synthetic `_ep_<host>` endpoint-authorization
+    /// route for the same upstream collapse into a single diagnostic row that
+    /// carries the credential and the summed endpoint-rule count, rather than
+    /// surfacing the internal split as a credential-less duplicate.
+    #[tokio::test]
+    async fn test_route_diagnostics_groups_credential_and_endpoint_routes() {
+        let dir = tempfile::tempdir().unwrap();
+        let endpoint_rule = crate::config::EndpointRule {
+            method: "GET".to_string(),
+            path: "/repos/*".to_string(),
+        };
+        let config = ProxyConfig {
+            routes: vec![
+                // Credential catch-all route (no endpoint rules).
+                crate::config::RouteConfig {
+                    prefix: "github_api".to_string(),
+                    upstream: "https://api.github.com".to_string(),
+                    credential_key: Some("env://NONO_TEST_MISSING".to_string()),
+                    inject_mode: Default::default(),
+                    inject_header: "Authorization".to_string(),
+                    credential_format: Some("Bearer {}".to_string()),
+                    path_pattern: None,
+                    path_replacement: None,
+                    query_param_name: None,
+                    proxy: None,
+                    env_var: None,
+                    endpoint_rules: vec![],
+                    endpoint_policy: None,
+                    tls_ca: None,
+                    tls_client_cert: None,
+                    tls_client_key: None,
+                    oauth2: None,
+                    aws_auth: None,
+                },
+                // Synthetic endpoint-authorization route for the same upstream.
+                crate::config::RouteConfig {
+                    prefix: "_ep_api.github.com".to_string(),
+                    upstream: "https://api.github.com".to_string(),
+                    credential_key: None,
+                    inject_mode: Default::default(),
+                    inject_header: "Authorization".to_string(),
+                    credential_format: None,
+                    path_pattern: None,
+                    path_replacement: None,
+                    query_param_name: None,
+                    proxy: None,
+                    env_var: None,
+                    endpoint_rules: vec![endpoint_rule.clone(), endpoint_rule],
+                    endpoint_policy: None,
+                    tls_ca: None,
+                    tls_client_cert: None,
+                    tls_client_key: None,
+                    oauth2: None,
+                    aws_auth: None,
+                },
+            ],
+            intercept_ca_dir: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        };
+        let handle = start(config.clone()).await.unwrap();
+        let rows = handle.route_diagnostics(&config);
+
+        // Two routes, one upstream → a single grouped row.
+        assert_eq!(rows.len(), 1, "routes sharing an upstream should collapse");
+        let summary = &rows[0];
+        assert!(summary.contains("api.github.com"));
+        // Credential status comes from the credential-bearing route, not `none`.
+        assert!(
+            !summary.contains("creds: none"),
+            "grouped row must carry the credential, got: {summary}"
+        );
+        // Endpoint rules from the `_ep_` route are summed onto the row.
+        assert!(
+            summary.contains("endpoint_rules: 2"),
+            "grouped row must sum endpoint rules, got: {summary}"
+        );
+        assert!(summary.contains("intercept: on"));
+
+        handle.shutdown();
+    }
+
+    /// An `_ep_` route on a concrete subdomain (`raw.githubusercontent.com`)
+    /// stays its own row but reports the credential from the covering wildcard
+    /// route (`*.githubusercontent.com`) rather than `creds: none`, because the
+    /// wildcard route injects that credential for the subdomain at request time.
+    #[tokio::test]
+    async fn test_route_diagnostics_reports_covering_wildcard_credential() {
+        let dir = tempfile::tempdir().unwrap();
+        let endpoint_rule = crate::config::EndpointRule {
+            method: "GET".to_string(),
+            path: "/**".to_string(),
+        };
+        let config = ProxyConfig {
+            routes: vec![
+                // Wildcard credential route.
+                crate::config::RouteConfig {
+                    prefix: "github_raw".to_string(),
+                    upstream: "https://*.githubusercontent.com".to_string(),
+                    credential_key: Some("env://NONO_TEST_MISSING".to_string()),
+                    inject_mode: Default::default(),
+                    inject_header: "Authorization".to_string(),
+                    credential_format: Some("Bearer {}".to_string()),
+                    path_pattern: None,
+                    path_replacement: None,
+                    query_param_name: None,
+                    proxy: None,
+                    env_var: None,
+                    endpoint_rules: vec![],
+                    endpoint_policy: None,
+                    tls_ca: None,
+                    tls_client_cert: None,
+                    tls_client_key: None,
+                    oauth2: None,
+                    aws_auth: None,
+                },
+                // `_ep_` route on a concrete subdomain covered by the wildcard.
+                crate::config::RouteConfig {
+                    prefix: "_ep_raw.githubusercontent.com".to_string(),
+                    upstream: "https://raw.githubusercontent.com".to_string(),
+                    credential_key: None,
+                    inject_mode: Default::default(),
+                    inject_header: "Authorization".to_string(),
+                    credential_format: None,
+                    path_pattern: None,
+                    path_replacement: None,
+                    query_param_name: None,
+                    proxy: None,
+                    env_var: None,
+                    endpoint_rules: vec![endpoint_rule],
+                    endpoint_policy: None,
+                    tls_ca: None,
+                    tls_client_cert: None,
+                    tls_client_key: None,
+                    oauth2: None,
+                    aws_auth: None,
+                },
+            ],
+            intercept_ca_dir: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        };
+        let handle = start(config.clone()).await.unwrap();
+        let rows = handle.route_diagnostics(&config);
+
+        // Distinct upstreams → two rows (no merge across different hosts).
+        assert_eq!(rows.len(), 2, "distinct upstreams must not merge");
+        let ep_row = rows
+            .iter()
+            .find(|s| s.contains("raw.githubusercontent.com") && !s.contains('*'))
+            .expect("subdomain row present");
+        // The covering wildcard credential is reported, not `none`.
+        assert!(
+            !ep_row.contains("creds: none"),
+            "covered subdomain must report the wildcard credential, got: {}",
+            ep_row
+        );
+        assert!(ep_row.contains("endpoint_rules: 1"));
+
+        handle.shutdown();
+    }
+
+    /// A credential route whose upstream is not in the host allowlist is dead
+    /// config — traffic to it would be denied by the filter regardless of the
+    /// injected credential — so it is omitted from the diagnostics entirely.
+    #[tokio::test]
+    async fn test_route_diagnostics_omits_unreachable_upstream() {
+        let dir = tempfile::tempdir().unwrap();
+        let route = |prefix: &str, upstream: &str| crate::config::RouteConfig {
+            prefix: prefix.to_string(),
+            upstream: upstream.to_string(),
+            credential_key: Some("env://NONO_TEST_MISSING".to_string()),
+            inject_mode: Default::default(),
+            inject_header: "Authorization".to_string(),
+            credential_format: Some("Bearer {}".to_string()),
+            path_pattern: None,
+            path_replacement: None,
+            query_param_name: None,
+            proxy: None,
+            env_var: None,
+            endpoint_rules: vec![],
+            endpoint_policy: None,
+            tls_ca: None,
+            tls_client_cert: None,
+            tls_client_key: None,
+            oauth2: None,
+            aws_auth: None,
+        };
+        let config = ProxyConfig {
+            routes: vec![
+                route("github_api", "https://api.github.com"),
+                route("datadog", "https://api.datadoghq.com"),
+            ],
+            // Only github is allow-listed; datadog's upstream is unreachable.
+            allowed_hosts: vec!["api.github.com".to_string()],
+            intercept_ca_dir: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        };
+        let handle = start(config.clone()).await.unwrap();
+        let rows = handle.route_diagnostics(&config);
+
+        assert_eq!(rows.len(), 1, "unreachable upstream must be omitted");
+        assert!(rows[0].contains("api.github.com"));
+        assert!(
+            !rows.iter().any(|s| s.contains("datadoghq.com")),
+            "non-allow-listed upstream must not be listed, got: {rows:?}"
+        );
+
+        handle.shutdown();
+    }
+
+    /// Strict mode with a non-empty allowlist behaves the same: a route to a
+    /// non-allow-listed upstream is omitted, an allow-listed one is shown.
+    #[tokio::test]
+    async fn test_route_diagnostics_respects_wildcard_allowlist() {
+        let dir = tempfile::tempdir().unwrap();
+        let route = |prefix: &str, upstream: &str| crate::config::RouteConfig {
+            prefix: prefix.to_string(),
+            upstream: upstream.to_string(),
+            credential_key: Some("env://NONO_TEST_MISSING".to_string()),
+            inject_mode: Default::default(),
+            inject_header: "Authorization".to_string(),
+            credential_format: Some("Bearer {}".to_string()),
+            path_pattern: None,
+            path_replacement: None,
+            query_param_name: None,
+            proxy: None,
+            env_var: None,
+            endpoint_rules: vec![],
+            endpoint_policy: None,
+            tls_ca: None,
+            tls_client_cert: None,
+            tls_client_key: None,
+            oauth2: None,
+            aws_auth: None,
+        };
+        let config = ProxyConfig {
+            routes: vec![
+                route("github_raw", "https://raw.githubusercontent.com"),
+                route("evil", "https://evil.example.com"),
+            ],
+            // Wildcard covers the githubusercontent subdomain but not evil.
+            allowed_hosts: vec!["*.githubusercontent.com".to_string()],
+            strict_filter: true,
+            intercept_ca_dir: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        };
+        let handle = start(config.clone()).await.unwrap();
+        let rows = handle.route_diagnostics(&config);
+
+        assert_eq!(rows.len(), 1, "only the wildcard-covered upstream remains");
+        assert!(rows[0].contains("raw.githubusercontent.com"));
+        assert!(
+            !rows.iter().any(|s| s.contains("evil.example.com")),
+            "upstream outside the wildcard must be omitted, got: {rows:?}"
+        );
 
         handle.shutdown();
     }

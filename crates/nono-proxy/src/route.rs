@@ -463,7 +463,7 @@ impl LoadedRoute {
 ///
 /// Defaults to port 443 for `https://` and 80 for `http://` when no
 /// explicit port is present. Returns `None` if the URL cannot be parsed.
-fn extract_host_port(url: &str) -> Option<String> {
+pub(crate) fn extract_host_port(url: &str) -> Option<String> {
     let parsed = url::Url::parse(url).ok()?;
     let host = parsed.host_str()?;
     let default_port = match parsed.scheme() {
@@ -488,7 +488,7 @@ fn route_tls_config_key(route: &RouteConfig) -> Option<String> {
     ))
 }
 
-fn host_port_matches(pattern: &str, target: &str) -> bool {
+pub(crate) fn host_port_matches(pattern: &str, target: &str) -> bool {
     if pattern == target {
         return true;
     }

@@ -55,24 +55,83 @@ pub(super) mod git {
         pub dirs: Vec<String>,
     }
 
+    /// Walk up from `cwd` looking for a `.git` entry (a directory in a regular
+    /// repo, or a file containing `gitdir: <path>` in a linked worktree). The
+    /// first ancestor (inclusive) with a `.git` entry is the toplevel — this
+    /// matches `git rev-parse --show-toplevel` semantics for both cases
+    /// without ever spawning `git` or reading `.git/config`, which matters
+    /// because `cwd` may be an attacker-controlled agent working directory
+    /// whose `.git/config` could otherwise execute code via `core.pager` etc.
+    fn find_git_toplevel(cwd: &Path) -> Option<PathBuf> {
+        let mut dir = cwd;
+        loop {
+            if std::fs::symlink_metadata(dir.join(".git")).is_ok() {
+                return Some(dir.to_path_buf());
+            }
+            dir = dir.parent()?;
+        }
+    }
+
+    /// Resolve the git-dir for the repo/worktree rooted at `worktree_root`.
+    /// A `.git` directory resolves to itself; a `.git` file (linked worktree)
+    /// is followed via its `gitdir: <path>` line. Never spawns a process.
+    fn resolve_git_dir(worktree_root: &Path) -> Option<PathBuf> {
+        let dot_git = worktree_root.join(".git");
+        let meta = std::fs::symlink_metadata(&dot_git).ok()?;
+        if meta.is_dir() {
+            return Some(dot_git);
+        }
+        let contents = std::fs::read_to_string(&dot_git).ok()?;
+        let raw = contents
+            .lines()
+            .next()?
+            .trim()
+            .strip_prefix("gitdir:")?
+            .trim();
+        if raw.is_empty() {
+            return None;
+        }
+        let pointed = PathBuf::from(raw);
+        Some(if pointed.is_absolute() {
+            pointed
+        } else {
+            worktree_root.join(pointed)
+        })
+    }
+
+    /// Resolve the git *common* directory for the repo/worktree rooted at
+    /// `worktree_root` — the main repo's `.git` even when called from a
+    /// linked worktree. Follows the `commondir` file git itself writes
+    /// inside a linked worktree's private gitdir (pointing back at the main
+    /// repo's `.git`, relative to that private gitdir) if present. Never
+    /// spawns a process.
+    fn resolve_common_dir(worktree_root: &Path) -> Option<PathBuf> {
+        let git_dir = resolve_git_dir(worktree_root)?;
+        let commondir_file = git_dir.join("commondir");
+        let Ok(contents) = std::fs::read_to_string(&commondir_file) else {
+            return Some(git_dir);
+        };
+        let raw = contents.lines().next()?.trim();
+        if raw.is_empty() {
+            return Some(git_dir);
+        }
+        let pointed = PathBuf::from(raw);
+        Some(if pointed.is_absolute() {
+            pointed
+        } else {
+            git_dir.join(pointed)
+        })
+    }
+
     /// Run `git rev-parse --show-toplevel` from `cwd` (or the process cwd when
     /// `None`) and return the repo root, or `None` when the directory is not
     /// inside a git repository (or git is absent).
     fn git_toplevel(cwd: Option<&Path>) -> Option<PathBuf> {
-        let mut cmd = Command::new("git");
-        cmd.args(["rev-parse", "--show-toplevel"]);
-        if let Some(d) = cwd {
-            cmd.current_dir(d);
-        }
-        let output = cmd.output().ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        let s = std::str::from_utf8(&output.stdout).ok()?.trim();
-        if s.is_empty() {
-            return None;
-        }
-        Some(PathBuf::from(s))
+        let start = match cwd {
+            Some(d) => d.to_path_buf(),
+            None => std::env::current_dir().ok()?,
+        };
+        find_git_toplevel(&start)
     }
 
     /// Invoke `git config --list --show-origin --show-scope` and return
@@ -179,23 +238,23 @@ pub(super) mod git {
     }
 
     fn run_toplevel(cwd: Option<&Path>) -> Result<Vec<String>> {
-        let mut cmd = Command::new("git");
-        cmd.args(["rev-parse", "--show-toplevel"]);
-        if let Some(d) = cwd {
-            cmd.current_dir(d);
-        }
-        let output = match cmd.output() {
-            Ok(o) if o.status.success() => o,
-            _ => return Ok(vec![]),
+        let start = match cwd {
+            Some(d) => d.to_path_buf(),
+            None => match std::env::current_dir() {
+                Ok(d) => d,
+                Err(_) => return Ok(vec![]),
+            },
         };
-        let path = std::str::from_utf8(&output.stdout)
-            .unwrap_or("")
-            .trim()
-            .to_string();
-        if path.is_empty() {
+        let Some(toplevel) = find_git_toplevel(&start) else {
             return Ok(vec![]);
-        }
-        Ok(vec![path])
+        };
+        let Ok(canonical) = toplevel.canonicalize() else {
+            return Ok(vec![]);
+        };
+        let Some(path) = canonical.to_str() else {
+            return Ok(vec![]);
+        };
+        Ok(vec![path.to_string()])
     }
 
     fn run_toplevel_parent(cwd: Option<&Path>) -> Result<Vec<String>> {
@@ -224,23 +283,36 @@ pub(super) mod git {
     }
 
     fn run_common_dir(cwd: Option<&Path>) -> Result<Vec<String>> {
-        let mut cmd = Command::new("git");
-        cmd.args(["rev-parse", "--git-common-dir"]);
-        if let Some(d) = cwd {
-            cmd.current_dir(d);
-        }
-        let output = match cmd.output() {
-            Ok(o) if o.status.success() => o,
-            _ => return Ok(vec![]),
+        let start = match cwd {
+            Some(d) => d.to_path_buf(),
+            None => match std::env::current_dir() {
+                Ok(d) => d,
+                Err(_) => return Ok(vec![]),
+            },
         };
-        let path = std::str::from_utf8(&output.stdout)
-            .unwrap_or("")
-            .trim()
-            .to_string();
-        if path.is_empty() {
+        let Some(toplevel) = find_git_toplevel(&start) else {
             return Ok(vec![]);
+        };
+        let Some(common_dir) = resolve_common_dir(&toplevel) else {
+            return Ok(vec![]);
+        };
+
+        let is_regular_dot_git = common_dir == toplevel.join(".git");
+        let started_at_toplevel = match (start.canonicalize(), toplevel.canonicalize()) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => false,
+        };
+        if is_regular_dot_git && started_at_toplevel {
+            return Ok(vec![".git".to_string()]);
         }
-        Ok(vec![path])
+
+        let Ok(canonical) = common_dir.canonicalize() else {
+            return Ok(vec![]);
+        };
+        let Some(path) = canonical.to_str() else {
+            return Ok(vec![]);
+        };
+        Ok(vec![path.to_string()])
     }
 
     /// Test seam: run the common-dir provider from a specific directory.
@@ -1070,6 +1142,122 @@ global\tfile:/home/u/.gitconfig\tuser.name=Alice
             result.is_empty(),
             "expected empty outside repo, got {:?}",
             result
+        );
+    }
+
+    /// Writes an executable stub `git` at `dir/git` that touches `sentinel` and
+    /// exits non-zero, then returns a PATH value with `dir` prepended to the
+    /// real PATH so the stub shadows the real `git` binary.
+    #[cfg(unix)]
+    fn install_git_spawn_sentinel(dir: &std::path::Path, sentinel: &std::path::Path) -> String {
+        use std::os::unix::fs::PermissionsExt;
+
+        let script = format!(
+            "#!/bin/sh\ntouch '{}'\nexit 1\n",
+            sentinel.to_str().expect("utf8 sentinel path")
+        );
+        let stub = dir.join("git");
+        std::fs::write(&stub, script).expect("write git stub");
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod git stub");
+
+        let real_path = std::env::var("PATH").unwrap_or_default();
+        format!("{}:{real_path}", dir.to_str().expect("utf8 stub dir"))
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn git_toplevel_common_dir_and_worktree_never_spawn_git_in_regular_repo() {
+        use std::process::Command;
+
+        let _env_lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).expect("mkdir repo");
+        Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&repo)
+            .status()
+            .expect("git init");
+        // Hostile per-repo config: if git ever ran here, these would fire.
+        std::fs::write(
+            repo.join(".git/config"),
+            "[core]\n\tpager = touch /tmp/nono-git-pager-fired\n\tfsmonitor = touch /tmp/nono-git-fsmonitor-fired\n",
+        )
+        .expect("write hostile config");
+
+        let stub_dir = tmp.path().join("stub-bin");
+        std::fs::create_dir(&stub_dir).expect("mkdir stub-bin");
+        let sentinel = tmp.path().join("git-was-spawned");
+        let new_path = install_git_spawn_sentinel(&stub_dir, &sentinel);
+
+        let _env = crate::test_env::EnvVarGuard::set_all(&[("PATH", &new_path)]);
+
+        let _ = git::read_toplevel_in(&repo);
+        let _ = git::read_common_dir_in(&repo);
+        let _ = git::read_main_worktree_in(&repo);
+
+        assert!(
+            !sentinel.exists(),
+            "git subprocess was spawned for toplevel/common-dir/worktree resolution"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn git_toplevel_common_dir_and_worktree_never_spawn_git_in_linked_worktree() {
+        use std::process::Command;
+
+        let _env_lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).expect("mkdir repo");
+        Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&repo)
+            .status()
+            .expect("git init");
+        Command::new("git")
+            .args([
+                "-c",
+                "user.email=t@t.com",
+                "-c",
+                "user.name=T",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "init",
+            ])
+            .current_dir(&repo)
+            .status()
+            .expect("git commit");
+        let wt = tmp.path().join("worktree");
+        Command::new("git")
+            .args(["worktree", "add", wt.to_str().expect("utf8")])
+            .current_dir(&repo)
+            .status()
+            .expect("git worktree add");
+
+        let stub_dir = tmp.path().join("stub-bin");
+        std::fs::create_dir(&stub_dir).expect("mkdir stub-bin");
+        let sentinel = tmp.path().join("git-was-spawned");
+        let new_path = install_git_spawn_sentinel(&stub_dir, &sentinel);
+
+        let _env = crate::test_env::EnvVarGuard::set_all(&[("PATH", &new_path)]);
+
+        let _ = git::read_toplevel_in(&wt);
+        let _ = git::read_common_dir_in(&wt);
+        let _ = git::read_main_worktree_in(&wt);
+
+        assert!(
+            !sentinel.exists(),
+            "git subprocess was spawned for toplevel/common-dir/worktree resolution in a linked worktree"
         );
     }
 }

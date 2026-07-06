@@ -321,13 +321,17 @@ fn build_launch_options(args: &ProxyArgs) -> Result<ProxyLaunchOptions> {
         Some(TlsInterceptIntent {
             trust_proxy_ca: args.trust_proxy_ca,
             ca_validity,
+            ca_env_vars: Vec::new(),
         })
     } else {
         None
     };
     #[cfg(not(target_os = "macos"))]
     let tls_intercept = if ca_validity.is_some() {
-        Some(TlsInterceptIntent { ca_validity })
+        Some(TlsInterceptIntent {
+            ca_validity,
+            ca_env_vars: Vec::new(),
+        })
     } else {
         None
     };

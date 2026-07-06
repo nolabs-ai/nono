@@ -18,6 +18,7 @@ use crate::credential::CredentialStore;
 use crate::error::{ProxyError, Result};
 use crate::filter::ProxyFilter;
 use crate::forward::{self, AuditCtx, UpstreamScheme, UpstreamSpec, UpstreamStrategy};
+use crate::oauth_capture::OAuthCaptureStore;
 use crate::reverse;
 use crate::route::RouteStore;
 use crate::tls_intercept::cert_cache::CertCache;
@@ -32,6 +33,9 @@ use zeroize::Zeroizing;
 /// Header byte cap matching the outer proxy's `MAX_HEADER_SIZE` to keep the
 /// memory ceiling consistent.
 const MAX_HEADER_SIZE: usize = 64 * 1024;
+
+type InterceptResponseRewrite<'a> =
+    Box<dyn Fn(u16, &[(String, String)], &[u8]) -> Result<Vec<u8>> + Send + Sync + 'a>;
 
 /// Resolved upstream proxy for the intercept path.
 ///
@@ -129,6 +133,7 @@ pub struct InterceptCtx<'a> {
     pub port: u16,
     pub route_store: Arc<RouteStore>,
     pub credential_store: Arc<CredentialStore>,
+    pub oauth_capture_store: Arc<OAuthCaptureStore>,
     pub session_token: &'a Zeroizing<String>,
     pub cert_cache: Arc<CertCache>,
     pub tls_connector: &'a tokio_rustls::TlsConnector,
@@ -913,26 +918,33 @@ where
     // diverge in L7 policy enforcement.
     let method = req.method.clone();
     let path = req.path.clone();
-    let selected = match select_intercept_route(
-        &ctx.route_store,
-        ctx.host,
-        ctx.port,
-        &method,
-        &path,
-        ctx.audit_log,
-        ctx.approval_backends.as_ref(),
-    )
-    .await
-    {
-        RouteSelection::Rejected(status) => {
-            let msg = match status {
-                502 => "Bad Gateway",
-                _ => "Forbidden",
-            };
-            reverse::send_error_generic(tls_stream, status, msg).await?;
-            return Ok(());
+    let host_port = format!("{}:{}", ctx.host.to_lowercase(), ctx.port);
+    let is_oauth_capture_host = ctx.oauth_capture_store.host_policy(&host_port).is_some();
+    let oauth_endpoint = ctx.oauth_capture_store.lookup(&host_port, &req.path);
+    let selected = if oauth_endpoint.is_some() {
+        None
+    } else {
+        match select_intercept_route(
+            &ctx.route_store,
+            ctx.host,
+            ctx.port,
+            &method,
+            &path,
+            ctx.audit_log,
+            ctx.approval_backends.as_ref(),
+        )
+        .await
+        {
+            RouteSelection::Rejected(status) => {
+                let msg = match status {
+                    502 => "Bad Gateway",
+                    _ => "Forbidden",
+                };
+                reverse::send_error_generic(tls_stream, status, msg).await?;
+                return Ok(());
+            }
+            RouteSelection::Selected(selected) => selected,
         }
-        RouteSelection::Selected(selected) => selected,
     };
     let service: Option<&str> = selected.map(|(s, _)| s);
     let route: Option<&crate::route::LoadedRoute> = selected.map(|(_, r)| r);
@@ -1002,11 +1014,21 @@ where
     // --- Read body (Content-Length only; chunked is rare in API requests
     // and matches the existing reverse-proxy contract). ---
     let strip_header = cred.map(|c| c.proxy_header_name.as_str()).unwrap_or("");
-    let filtered_headers = reverse::filter_headers(&req.header_bytes, strip_header);
+    let mut filtered_headers = reverse::filter_headers(&req.header_bytes, strip_header);
+    if is_oauth_capture_host {
+        filtered_headers.retain(|(name, _)| !name.eq_ignore_ascii_case("accept-encoding"));
+        filtered_headers.push(("Accept-Encoding".to_string(), "identity".to_string()));
+    }
     let content_length = reverse::extract_content_length(&req.header_bytes);
     let body = match reverse::read_request_body(tls_stream, content_length, &req.buffered).await? {
         Some(b) => b,
         None => return Ok(()),
+    };
+    let body = if let Some(endpoint) = oauth_endpoint {
+        ctx.oauth_capture_store
+            .rewrite_request_body(endpoint, &body)?
+    } else {
+        body
     };
 
     // --- Build upstream request bytes ---
@@ -1072,12 +1094,40 @@ where
         method: &req.method,
         path: &req.path,
     };
-    if let Err(e) = forward::forward_request(
+    let response_rewrite: Option<InterceptResponseRewrite<'_>> =
+        if let Some(endpoint) = oauth_endpoint {
+            Some(Box::new(
+                move |status: u16, _headers: &[(String, String)], body: &[u8]| {
+                    if (200..300).contains(&status) {
+                        ctx.oauth_capture_store
+                            .rewrite_response_body(endpoint, body)
+                    } else {
+                        ctx.oauth_capture_store
+                            .inspect_capture_host_response(&host_port, &path, status, body)
+                    }
+                },
+            ))
+        } else if is_oauth_capture_host {
+            Some(Box::new(
+                move |status: u16, _headers: &[(String, String)], body: &[u8]| {
+                    ctx.oauth_capture_store
+                        .inspect_capture_host_response(&host_port, &path, status, body)
+                },
+            ))
+        } else {
+            None
+        };
+    let response_rewrite_ref = response_rewrite
+        .as_ref()
+        .map(|rewrite| rewrite.as_ref() as forward::ResponseRewrite<'_>);
+
+    if let Err(e) = forward::forward_request_with_response_rewrite(
         tls_stream,
         request.as_bytes(),
         &body,
         upstream_spec,
         audit_ctx,
+        response_rewrite_ref,
     )
     .await
     {

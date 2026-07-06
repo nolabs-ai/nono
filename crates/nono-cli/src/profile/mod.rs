@@ -5,6 +5,19 @@
 //! into the binary) or user-defined (in `$XDG_CONFIG_HOME/nono/profiles/`).
 
 pub(crate) mod builtin;
+mod credential_provider;
+
+pub use credential_provider::{
+    CredentialProviderDef, CredentialProviderRequestBodyFormat,
+    CredentialProviderResponseFieldKind, CredentialProviderStore, CredentialRouteDef,
+};
+#[cfg(test)]
+pub use credential_provider::{
+    CredentialProviderResponseField, CredentialProviderTokenEndpoint, CredentialProviderType,
+};
+use credential_provider::{
+    validate_credential_provider_entries, validate_credential_provider_resolved,
+};
 
 use crate::command_policy::{
     CommandPoliciesConfig, CommandPolicyValidationScope, validate_command_policies,
@@ -358,13 +371,18 @@ pub struct CustomCredentialDef {
     pub aws_auth: Option<nono_proxy::config::AwsAuthConfig>,
 }
 
-/// Host-side command that materializes a proxy credential for `cmd://<name>`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Host-side source that materializes a proxy credential for `cmd://<name>`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CredentialCaptureEntry {
     /// Command and arguments. The first element is resolved by the supervisor
     /// before execution; no shell is used.
+    #[serde(default)]
     pub command: Vec<String>,
+    /// External provider subprocess using the typed nono credential-provider
+    /// protocol. Mutually exclusive with `command`.
+    #[serde(default)]
+    pub provider: Option<CredentialCaptureProvider>,
     /// Maximum command runtime in seconds.
     #[serde(default)]
     pub timeout_secs: Option<u64>,
@@ -388,6 +406,17 @@ pub struct CredentialCaptureEntry {
     /// Explicit interactive affordances for browser-backed auth flows.
     #[serde(default)]
     pub interaction: Option<CredentialCaptureInteraction>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CredentialCaptureProvider {
+    /// Provider executable and arguments. The first element is resolved by the
+    /// supervisor before execution; no shell is used.
+    pub command: Vec<String>,
+    /// Provider-specific configuration sent to the provider in request JSON.
+    #[serde(default)]
+    pub config: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1051,15 +1080,36 @@ fn validate_credential_capture_entries(profile: &Profile) -> Result<()> {
                 "credential_capture entry '{name}' must contain only alphanumeric characters and underscores"
             )));
         }
-        if entry.command.is_empty() {
+        let has_command = !entry.command.is_empty();
+        let has_provider = entry.provider.is_some();
+        if has_command == has_provider {
             return Err(NonoError::ProfileParse(format!(
-                "credential_capture entry '{name}' must include a non-empty command array"
+                "credential_capture entry '{name}' must include exactly one of 'command' or 'provider'"
             )));
         }
         for part in &entry.command {
             if part.is_empty() || part.contains('\0') {
                 return Err(NonoError::ProfileParse(format!(
                     "credential_capture entry '{name}' contains an empty or NUL-bearing command argument"
+                )));
+            }
+        }
+        if let Some(provider) = &entry.provider {
+            if provider.command.is_empty() {
+                return Err(NonoError::ProfileParse(format!(
+                    "credential_capture entry '{name}' provider.command must not be empty"
+                )));
+            }
+            for part in &provider.command {
+                if part.is_empty() || part.contains('\0') {
+                    return Err(NonoError::ProfileParse(format!(
+                        "credential_capture entry '{name}' provider.command contains an empty or NUL-bearing argument"
+                    )));
+                }
+            }
+            if !provider.config.is_null() && !provider.config.is_object() {
+                return Err(NonoError::ProfileParse(format!(
+                    "credential_capture entry '{name}' provider.config must be a JSON object"
                 )));
             }
         }
@@ -1213,6 +1263,13 @@ fn validate_profile_tls_intercept(profile: &Profile) -> Result<()> {
     }
     if let Some(value) = &tls.leaf_validity {
         parse_tls_duration("network.tls_intercept.leaf_validity", value)?;
+    }
+    for env_var in &tls.ca_env_vars {
+        nono::validate_destination_env_var(env_var).map_err(|err| {
+            NonoError::ProfileParse(format!(
+                "invalid network.tls_intercept.ca_env_vars entry '{env_var}': {err}"
+            ))
+        })?;
     }
     Ok(())
 }
@@ -1494,6 +1551,8 @@ pub struct TlsInterceptConfig {
     pub ca_validity: Option<String>,
     #[serde(default)]
     pub leaf_validity: Option<String>,
+    #[serde(default)]
+    pub ca_env_vars: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -2052,6 +2111,10 @@ pub struct Profile {
     #[serde(default)]
     pub credential_capture: HashMap<String, CredentialCaptureEntry>,
     #[serde(default)]
+    pub credential_providers: HashMap<String, CredentialProviderDef>,
+    #[serde(default)]
+    pub credential_routes: Vec<CredentialRouteDef>,
+    #[serde(default)]
     pub workdir: WorkdirConfig,
     #[serde(default)]
     pub hooks: HooksConfig,
@@ -2156,6 +2219,10 @@ struct ProfileDeserialize {
     #[serde(default)]
     credential_capture: HashMap<String, CredentialCaptureEntry>,
     #[serde(default)]
+    credential_providers: HashMap<String, CredentialProviderDef>,
+    #[serde(default)]
+    credential_routes: Vec<CredentialRouteDef>,
+    #[serde(default)]
     workdir: WorkdirConfig,
     #[serde(default)]
     hooks: HooksConfig,
@@ -2208,6 +2275,8 @@ impl From<ProfileDeserialize> for Profile {
             environment: raw.environment,
             command_policies: raw.command_policies,
             credential_capture: raw.credential_capture,
+            credential_providers: raw.credential_providers,
+            credential_routes: raw.credential_routes,
             workdir: raw.workdir,
             hooks: raw.hooks,
             session_hooks: raw.session_hooks,
@@ -2779,6 +2848,7 @@ pub(crate) fn load_raw_profile_from_path(path: &Path) -> Result<Profile> {
 pub(crate) fn finalize_profile(mut profile: Profile) -> Result<Profile> {
     merge_implicit_default_groups(&mut profile)?;
     validate_credential_capture_resolved(&profile)?;
+    validate_credential_provider_resolved(&profile)?;
     validate_profile_tls_intercept(&profile)?;
     validate_command_policies(
         profile.command_policies.as_ref(),
@@ -2867,6 +2937,7 @@ pub(crate) fn parse_profile_bytes(content: &[u8]) -> Result<Profile> {
     // Validate custom credentials for security issues
     validate_profile_custom_credentials(&profile)?;
     validate_credential_capture_entries(&profile)?;
+    validate_credential_provider_entries(&profile)?;
     validate_profile_tls_intercept(&profile)?;
 
     // Validate env_credentials keys (URI entries need structural validation)
@@ -3288,6 +3359,16 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
         credential_capture: {
             let mut merged = base.credential_capture;
             merged.extend(child.credential_capture);
+            merged
+        },
+        credential_providers: {
+            let mut merged = base.credential_providers;
+            merged.extend(child.credential_providers);
+            merged
+        },
+        credential_routes: {
+            let mut merged = base.credential_routes;
+            merged.extend(child.credential_routes);
             merged
         },
         // NOTE: WorkdirAccess::None serves as both "not specified" and "explicitly no access".
@@ -5617,6 +5698,8 @@ mod tests {
             environment: None,
             command_policies: None,
             credential_capture: HashMap::new(),
+            credential_providers: HashMap::new(),
+            credential_routes: Vec::new(),
             workdir: WorkdirConfig {
                 access: WorkdirAccess::ReadWrite,
             },
@@ -5702,6 +5785,8 @@ mod tests {
             environment: None,
             command_policies: None,
             credential_capture: HashMap::new(),
+            credential_providers: HashMap::new(),
+            credential_routes: Vec::new(),
             workdir: WorkdirConfig {
                 access: WorkdirAccess::None,
             },
@@ -8027,6 +8112,247 @@ mod tests {
             Err(err) => panic!("inherited cmd capture resolves: {err}"),
         };
         assert!(profile.credential_capture.contains_key("github"));
+    }
+
+    #[test]
+    fn test_profile_cmd_uri_provider_custom_credential_requires_capture_entry() {
+        let json = r#"{
+            "meta": { "name": "provider-creds" },
+            "network": {
+                "credentials": ["acme_mcp"],
+                "custom_credentials": {
+                    "acme_mcp": {
+                        "upstream": "https://mcp.example.com",
+                        "credential_key": "cmd://acme_mcp",
+                        "env_var": "ACME_MCP_TOKEN"
+                    }
+                }
+            }
+        }"#;
+        let profile = parse_profile_bytes(json.as_bytes()).expect("raw profile parses");
+        let err = finalize_profile(profile).expect_err("missing provider should reject");
+        assert!(
+            err.to_string().contains("credential_capture.acme_mcp"),
+            "error should mention missing provider entry: {err}"
+        );
+    }
+
+    #[test]
+    fn test_profile_cmd_uri_custom_credential_accepts_provider_entry() {
+        let json = r#"{
+            "meta": { "name": "provider-creds" },
+            "network": {
+                "credentials": ["acme_mcp"],
+                "custom_credentials": {
+                    "acme_mcp": {
+                        "upstream": "https://mcp.example.com",
+                        "credential_key": "cmd://acme_mcp",
+                        "env_var": "ACME_MCP_TOKEN"
+                    }
+                }
+            },
+            "credential_capture": {
+                "acme_mcp": {
+                    "provider": {
+                        "command": ["/bin/echo", "{\"material\":{\"type\":\"secret\",\"value\":\"token\"}}"],
+                        "config": {
+                            "issuer": "https://auth.example.com"
+                        }
+                    },
+                    "timeout_secs": 5,
+                    "cache_ttl_secs": 0
+                }
+            }
+        }"#;
+        let profile = parse_profile_bytes(json.as_bytes()).expect("provider profile parses");
+        let entry = profile
+            .credential_capture
+            .get("acme_mcp")
+            .expect("provider entry should parse");
+        assert!(entry.command.is_empty());
+        assert!(entry.provider.is_some());
+    }
+
+    #[test]
+    fn test_profile_provider_capture_rejects_command_and_provider() {
+        let json = br#"{
+            "meta": { "name": "provider-creds" },
+            "credential_capture": {
+                "acme_mcp": {
+                    "command": ["/bin/echo", "token"],
+                    "provider": {
+                        "command": ["/bin/echo", "{\"material\":{\"type\":\"secret\",\"value\":\"token\"}}"]
+                    }
+                }
+            }
+        }"#;
+        let err = parse_profile_bytes(json).expect_err("dual source should reject");
+        assert!(
+            err.to_string()
+                .contains("exactly one of 'command' or 'provider'"),
+            "error should mention source conflict: {err}"
+        );
+    }
+
+    #[test]
+    fn test_profile_parses_oauth_capture_credential_provider() {
+        let json = r#"{
+            "meta": { "name": "provider-oauth-capture" },
+            "credential_providers": {
+                "claude_code": {
+                    "type": "oauth_capture",
+                    "token_endpoints": [
+                        {
+                            "host": "https://platform.claude.com",
+                            "path": "/v1/oauth/token",
+                            "response_fields": [
+                                { "path": "access_token", "kind": "opaque" },
+                                { "path": "refresh_token", "kind": "opaque" }
+                            ],
+                            "request_nonce_fields": ["access_token", "refresh_token"]
+                        }
+                    ],
+                    "api_hosts": ["https://api.anthropic.com"],
+                    "credential_store": {
+                        "type": "keychain_json",
+                        "service": "Claude Code-credentials",
+                        "account_candidates": ["unknown", "$USER", "claude-code-user"],
+                        "phantom_fields": [
+                            "claudeAiOauth.accessToken",
+                            "claudeAiOauth.refreshToken"
+                        ]
+                    },
+                    "helpers": {
+                        "status": ["claude", "auth", "status", "--json"],
+                        "login": ["claude", "auth", "login"],
+                        "logout": ["claude", "auth", "logout"]
+                    }
+                }
+            },
+            "credential_routes": [
+                {
+                    "name": "anthropic_oauth",
+                    "provider": "claude_code",
+                    "env_var": "ANTHROPIC_AUTH_TOKEN",
+                    "base_url_env_var": "ANTHROPIC_BASE_URL",
+                    "endpoint_policy": {
+                        "default": { "decision": "deny" },
+                        "allow": [{ "method": "POST", "path": "/v1/messages" }]
+                    }
+                }
+            ]
+        }"#;
+        let profile = parse_profile_bytes(json.as_bytes()).expect("provider profile parses");
+        let provider = profile
+            .credential_providers
+            .get("claude_code")
+            .expect("provider should parse");
+        assert_eq!(provider.provider_type, CredentialProviderType::OauthCapture);
+        assert_eq!(
+            provider.token_endpoints[0].host,
+            "https://platform.claude.com"
+        );
+        assert_eq!(provider.api_hosts, vec!["https://api.anthropic.com"]);
+        assert_eq!(profile.credential_routes[0].provider, "claude_code");
+    }
+
+    #[test]
+    fn test_profile_credential_route_rejects_unknown_provider() {
+        let json = br#"{
+            "meta": { "name": "provider-oauth-capture" },
+            "credential_routes": [
+                {
+                    "name": "anthropic_oauth",
+                    "provider": "missing_provider",
+                    "env_var": "ANTHROPIC_AUTH_TOKEN"
+                }
+            ]
+        }"#;
+        let profile = parse_profile_bytes(json).expect("raw profile parses");
+        let err = finalize_profile(profile).expect_err("unknown provider should reject");
+        assert!(
+            err.to_string().contains("unknown credential provider"),
+            "error should mention unknown provider: {err}"
+        );
+    }
+
+    #[test]
+    fn test_profile_credential_route_accepts_inherited_provider() {
+        let dir = tempdir().expect("tmpdir");
+        std::fs::write(
+            dir.path().join("base.json"),
+            r#"{
+                "meta": { "name": "base" },
+                "credential_providers": {
+                    "codex": {
+                        "type": "oauth_capture",
+                        "token_endpoints": [
+                            {
+                                "host": "https://auth.openai.com",
+                                "path": "/oauth/token",
+                                "response_fields": [
+                                    { "path": "access_token", "kind": "opaque" },
+                                    { "path": "refresh_token", "kind": "opaque" }
+                                ],
+                                "request_nonce_fields": ["refresh_token"]
+                            }
+                        ],
+                        "api_hosts": ["https://api.openai.com"]
+                    }
+                }
+            }"#,
+        )
+        .expect("write base");
+        let child_path = dir.path().join("child.json");
+        std::fs::write(
+            &child_path,
+            r#"{
+                "extends": "base",
+                "meta": { "name": "child" },
+                "credential_routes": [
+                    {
+                        "name": "openai_oauth",
+                        "provider": "codex",
+                        "env_var": "OPENAI_API_KEY",
+                        "base_url_env_var": "OPENAI_BASE_URL"
+                    }
+                ]
+            }"#,
+        )
+        .expect("write child");
+
+        let profile = load_from_file(&child_path, &[]).expect("inherited provider resolves");
+        assert!(profile.credential_providers.contains_key("codex"));
+        assert_eq!(profile.credential_routes[0].provider, "codex");
+    }
+
+    #[test]
+    fn test_profile_credential_provider_rejects_non_origin_token_host() {
+        let json = br#"{
+            "meta": { "name": "provider-oauth-capture" },
+            "credential_providers": {
+                "codex": {
+                    "type": "oauth_capture",
+                    "token_endpoints": [
+                        {
+                            "host": "https://auth.openai.com/oauth/token",
+                            "path": "/oauth/token",
+                            "response_fields": [
+                                { "path": "access_token", "kind": "opaque" },
+                                { "path": "refresh_token", "kind": "opaque" }
+                            ],
+                            "request_nonce_fields": ["refresh_token"]
+                        }
+                    ],
+                    "api_hosts": ["https://api.openai.com"]
+                }
+            }
+        }"#;
+        let err = parse_profile_bytes(json).expect_err("token host path should reject");
+        assert!(
+            err.to_string().contains("must be an origin"),
+            "error should mention origin-only hosts: {err}"
+        );
     }
 
     #[test]

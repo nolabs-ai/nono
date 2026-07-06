@@ -378,7 +378,7 @@ An individual entry in the `custom_credentials` map is configured as follows:
 
 ### credential_capture
 
-Defines supervisor-side commands that produce credentials for `cmd://` custom credential routes. The command runs lazily when the proxy first needs the credential; only the proxy receives stdout, and the sandboxed child never sees the command output.
+Defines supervisor-side commands and provider subprocesses that produce credentials for `cmd://` custom credential routes. Capture runs lazily when the proxy first needs the credential; only the proxy receives captured material, and the sandboxed child never sees the command output, provider output, or real credential.
 
 ```json
 {
@@ -399,6 +399,62 @@ Defines supervisor-side commands that produce credentials for `cmd://` custom cr
       "timeout_secs": 5,
       "cache_ttl_secs": 900,
       "cache_path_regex": "^/(?:repos/|orgs/)?([^/]+)"
+    }
+  }
+}
+```
+
+Provider-backed captures use a typed JSON protocol. The provider receives request metadata and provider-specific config on stdin and returns credential material on stdout. The provider does not route requests or inject credentials; `nono` still validates the phantom token, applies endpoint policy, validates provider output, and injects only on matching upstream requests.
+
+```json
+{
+  "network": {
+    "credentials": ["acme_mcp"],
+    "custom_credentials": {
+      "acme_mcp": {
+        "upstream": "https://mcp.acme.com",
+        "credential_key": "cmd://acme_mcp",
+        "env_var": "ACME_MCP_TOKEN",
+        "credential_format": "Bearer {}",
+        "endpoint_rules": [{ "method": "*", "path": "/mcp/**" }]
+      }
+    }
+  },
+  "credential_capture": {
+    "acme_mcp": {
+      "provider": {
+        "command": ["acme-nono-provider"],
+        "config": {
+          "issuer": "https://auth.acme.com",
+          "client_id": "abc123"
+        }
+      },
+      "timeout_secs": 30,
+      "cache_ttl_secs": 240
+    }
+  }
+}
+```
+
+Provider stdout must be JSON:
+
+```json
+{
+  "material": {
+    "type": "secret",
+    "value": "real-access-token"
+  }
+}
+```
+
+For multi-header output, configure `output.allow_headers` and return:
+
+```json
+{
+  "material": {
+    "type": "headers",
+    "headers": {
+      "Authorization": "Bearer real-access-token"
     }
   }
 }
@@ -470,6 +526,101 @@ Browser auth is command-scoped. Add `interaction.open_urls` to a specific captur
 ```
 
 When `open_urls` is configured, nono gives the capture command a temporary `BROWSER` helper and URL-opening socket. On macOS it also prepends an `open` shim to `PATH`. URL requests through those helpers are validated against that capture entry's `interaction.open_urls`, not the child sandbox's top-level `open_urls`. Non-URL `open` fallback through the shim is available only when `allow_launch_services` is true.
+
+### credential_providers and credential_routes
+
+`credential_providers` declare profile-driven OAuth providers for sandboxed `/login` flows where the agent may drive the CLI, but token endpoint responses are captured and rewritten before real token material reaches the sandbox. The sandbox receives phantom `nono_<64hex>` tokens; the proxy resolves those phantoms to real tokens only for declared `api_hosts` and route endpoint policy.
+
+`credential_routes` bind a provider to the sandbox-visible environment variables and optional API endpoint policy. Provider declarations are data, so local profiles and packs can define providers without adding Rust enum variants or merging provider-specific code.
+
+OAuth capture currently forces HTTP/1.1 for declared token hosts so the proxy can buffer and rewrite token responses before releasing them to the sandbox. HTTP/2 token response rewriting must be implemented before capture hosts can safely negotiate h2.
+
+When a client has its own CA-bundle environment variable, add it with
+`network.tls_intercept.ca_env_vars`. nono still sets the standard CA variables;
+profile entries add client-specific names that should point at the same
+generated trust bundle.
+
+```json
+{
+  "network": {
+    "tls_intercept": {
+      "ca_env_vars": ["CODEX_CA_CERTIFICATE"]
+    }
+  },
+  "credential_providers": {
+    "claude_code": {
+      "type": "oauth_capture",
+      "token_endpoints": [
+        {
+          "host": "https://platform.claude.com",
+          "path": "/v1/oauth/token",
+          "response_fields": [
+            { "path": "access_token", "kind": "opaque" },
+            { "path": "refresh_token", "kind": "opaque" },
+            { "path": "id_token", "kind": "jwt" }
+          ],
+          "request_body": "auto",
+          "request_nonce_fields": ["access_token", "refresh_token"]
+        }
+      ],
+      "api_hosts": ["https://api.anthropic.com"],
+      "credential_store": {
+        "type": "keychain_json",
+        "service": "Claude Code-credentials",
+        "account_candidates": ["unknown", "$USER", "claude-code-user"],
+        "phantom_fields": [
+          "claudeAiOauth.accessToken",
+          "claudeAiOauth.refreshToken"
+        ]
+      },
+      "helpers": {
+        "status": ["claude", "auth", "status", "--json"],
+        "login": ["claude", "auth", "login"],
+        "logout": ["claude", "auth", "logout"]
+      }
+    }
+  },
+  "credential_routes": [
+    {
+      "name": "anthropic_oauth",
+      "provider": "claude_code",
+      "env_var": "ANTHROPIC_AUTH_TOKEN",
+      "base_url_env_var": "ANTHROPIC_BASE_URL",
+      "endpoint_policy": {
+        "default": { "decision": "deny" },
+        "allow": [{ "method": "POST", "path": "/v1/messages" }]
+      }
+    }
+  ]
+}
+```
+
+| Provider field       | Type            | Required | Description |
+|----------------------|-----------------|----------|-------------|
+| `type`               | string          | yes      | Currently `oauth_capture`. |
+| `token_endpoints`    | array           | yes      | HTTPS OAuth token origins and exact paths whose JSON responses are captured and rewritten to phantom tokens. Configure every token-bearing path the client may use. |
+| `api_hosts`          | array           | yes      | HTTPS API URL origins where this provider's phantom tokens may be resolved on egress. |
+| `response_fields`    | array           | yes      | Token response fields to rewrite. Each entry declares a `path` and a visible phantom `kind` of `opaque` or `jwt`; use `jwt` only for locally parsed fields, not bearer tokens resent upstream. |
+| `request_body`       | string          | no       | Token request body format for refresh/exchange rewriting: `auto`, `json`, or `form`. |
+| `credential_store`   | object          | no       | Optional session/logout detection, such as a keychain JSON record or file JSON record with fields expected to contain phantoms. |
+| `helpers`            | object          | no       | Optional status, login, and logout commands for humans or CLI workflows. Commands are arrays and are not run through a shell. |
+
+The OAuth capture store lives under nono's state directory with owner-only
+permissions. It retains real token material for phantom resolution for up to 90
+days, capped at 4096 phantoms.
+
+Unmatched capture-host responses are inspected for common OAuth token field
+names as a fail-closed backstop. Providers that use unusual token field names
+still need exact `token_endpoints` and exhaustive `response_fields`; the backstop
+is not the primary capture policy.
+
+| Route field          | Type            | Required | Description |
+|----------------------|-----------------|----------|-------------|
+| `name`               | string          | yes      | Route name used in generated proxy routes and audit. |
+| `provider`           | string          | yes      | Provider key from `credential_providers`. |
+| `env_var`            | string          | no       | Optional environment variable for clients that can start from a sandbox-visible phantom. Many OAuth CLI clients instead receive phantoms by writing their captured credential store during login. |
+| `base_url_env_var`   | string          | no       | Environment variable that points SDKs or CLIs at the mediated proxy base URL. |
+| `endpoint_policy`    | object          | no       | Method/path policy for provider API egress. |
 
 ### env_credentials (alias: secrets)
 

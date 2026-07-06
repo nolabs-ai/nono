@@ -59,8 +59,7 @@ representative at an online or offline event.
 ## Enforcement
 
 Instances of abusive, harassing, or otherwise unacceptable behavior may be
-reported to the maintainer council via GitHub Security Advisories:
-https://github.com/nolabs-ai/nono/security/advisories/new
+reported to the project lead at luke@nolabs.ai.
 
 All complaints will be reviewed and investigated promptly and fairly. All
 community leaders are obligated to respect the privacy and security of the

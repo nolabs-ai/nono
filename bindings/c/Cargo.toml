@@ -15,7 +15,7 @@ name = "nono_ffi"
 crate-type = ["cdylib", "staticlib"]
 
 [dependencies]
-nono = { version = "0.67.0", path = "../../crates/nono", default-features = false }
+nono = { version = "0.67.1", path = "../../crates/nono", default-features = false }
 serde.workspace = true
 serde_json.workspace = true
 

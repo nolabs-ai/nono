@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.67.1] - 2026-07-06
+
+### Bug Fixes
+
+- *(release)* Strip ./ prefix from SHA256SUMS.txt entries (#1352) ([#1352](https://github.com/nolabs-ai/nono/pull/1352))
+
 ## [0.67.0] - 2026-07-06
 
 ### Bug Fixes

@@ -3416,7 +3416,7 @@ fn add_policy_fs(
     // exceeds the agent's (write non-escalation). Grants outside the cwd (e.g.
     // `$WORKDIR`, absolute paths) are unaffected.
     let write_access = |path: &Path| {
-        if !cwd_agent_writable && path.starts_with(cwd) {
+        if !cwd_agent_writable && super::lexically_normalize(path).starts_with(cwd) {
             AccessMode::Read
         } else {
             AccessMode::ReadWrite

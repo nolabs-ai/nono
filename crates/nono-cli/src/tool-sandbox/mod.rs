@@ -114,6 +114,74 @@ pub(crate) fn admit_command_cwd(
     Ok(cwd_under_workdir || caps_grant(outer_caps, cwd, nono::AccessMode::Write))
 }
 
+/// Lexically resolve `.`/`..` components in `path` without touching the
+/// filesystem.
+///
+/// Callers compare a policy-resolved path against an already-canonical
+/// prefix via `starts_with` to decide whether a grant falls inside a
+/// directory (e.g. the command's live cwd). `starts_with` compares path
+/// *components*, not resolved locations, so an unnormalized `..` segment
+/// (e.g. `cwd.join("../out")`) lexically starts with `cwd` even though it
+/// actually resolves outside it. Normalizing first fixes that without
+/// requiring the path to exist (unlike `Path::canonicalize`).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn lexically_normalize(path: &std::path::Path) -> std::path::PathBuf {
+    let mut normalized = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if matches!(
+                    normalized.components().next_back(),
+                    Some(std::path::Component::Normal(_))
+                ) {
+                    normalized.pop();
+                } else {
+                    normalized.push(component);
+                }
+            }
+            other => normalized.push(other),
+        }
+    }
+    normalized
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(test)]
+mod lexically_normalize_tests {
+    use super::lexically_normalize;
+    use std::path::PathBuf;
+
+    #[test]
+    fn parent_dir_walks_back_out_of_prefix() {
+        let normalized = lexically_normalize(&PathBuf::from("/work/sub/../out"));
+
+        assert_eq!(normalized, PathBuf::from("/work/out"));
+        assert!(!normalized.starts_with("/work/sub"));
+    }
+
+    #[test]
+    fn cur_dir_is_dropped() {
+        let normalized = lexically_normalize(&PathBuf::from("/work/./sub"));
+
+        assert_eq!(normalized, PathBuf::from("/work/sub"));
+    }
+
+    #[test]
+    fn path_with_no_dot_components_is_unchanged() {
+        let normalized = lexically_normalize(&PathBuf::from("/work/sub/dir"));
+
+        assert_eq!(normalized, PathBuf::from("/work/sub/dir"));
+    }
+
+    #[test]
+    fn parent_dir_past_root_is_kept_literal() {
+        let normalized = lexically_normalize(&PathBuf::from("/../escaped"));
+
+        assert_eq!(normalized, PathBuf::from("/../escaped"));
+    }
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[cfg(test)]
 mod admit_command_cwd_tests {

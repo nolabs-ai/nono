@@ -38,6 +38,7 @@ struct SharedH2Ctx {
     port: u16,
     route_store: Arc<RouteStore>,
     credential_store: Arc<CredentialStore>,
+    oauth_capture_store: Arc<crate::oauth_capture::OAuthCaptureStore>,
     audit_log: Option<audit::SharedAuditLog>,
     approval_backends: Option<crate::approval::ApprovalBackendRegistry>,
     credential_capture_backend: Option<Arc<dyn CredentialCaptureBackend>>,
@@ -103,6 +104,7 @@ where
         port: ctx.port,
         route_store: Arc::clone(&ctx.route_store),
         credential_store: Arc::clone(&ctx.credential_store),
+        oauth_capture_store: Arc::clone(&ctx.oauth_capture_store),
         audit_log: ctx.audit_log.cloned(),
         approval_backends: ctx.approval_backends.clone(),
         credential_capture_backend: ctx.credential_capture_backend.clone(),
@@ -215,6 +217,16 @@ async fn handle_h2_stream(
         "h2_forward: {} {} on {}:{}",
         method, path, ctx.host, ctx.port
     );
+
+    let host_port = format!("{}:{}", ctx.host.to_lowercase(), ctx.port);
+    if ctx.oauth_capture_store.host_policy(&host_port).is_some() {
+        warn!(
+            "h2_forward: OAuth capture host matched for {} {}, but h2 OAuth body rewrite is not implemented; failing closed",
+            method, path
+        );
+        send_h2_error(&mut respond, 502)?;
+        return Ok(());
+    }
 
     // Endpoint authorization + credential route selection. Shared with the
     // HTTP/1.1 path via [`handle::select_intercept_route`] so the two protocols
@@ -955,6 +967,7 @@ mod tests {
             port: upstream_port,
             route_store: Arc::new(route_store),
             credential_store: Arc::new(credential_store),
+            oauth_capture_store: Arc::new(crate::oauth_capture::OAuthCaptureStore::empty()),
             session_token: &session_token,
             cert_cache,
             tls_connector: &tls_connector,
@@ -1047,6 +1060,7 @@ mod tests {
             port: upstream_port,
             route_store: Arc::new(route_store),
             credential_store: Arc::new(credential_store),
+            oauth_capture_store: Arc::new(crate::oauth_capture::OAuthCaptureStore::empty()),
             session_token: &session_token,
             cert_cache,
             tls_connector: &tls_connector,
@@ -1132,6 +1146,7 @@ mod tests {
             port: upstream_port,
             route_store: Arc::new(route_store),
             credential_store: Arc::new(credential_store),
+            oauth_capture_store: Arc::new(crate::oauth_capture::OAuthCaptureStore::empty()),
             session_token: &session_token,
             cert_cache,
             tls_connector: &tls_connector,
@@ -1213,6 +1228,7 @@ mod tests {
             port: upstream_port,
             route_store: Arc::new(route_store),
             credential_store: Arc::new(credential_store),
+            oauth_capture_store: Arc::new(crate::oauth_capture::OAuthCaptureStore::empty()),
             session_token: &session_token,
             cert_cache,
             tls_connector: &tls_connector,
@@ -1293,6 +1309,7 @@ mod tests {
             port: upstream_port,
             route_store: Arc::new(route_store),
             credential_store: Arc::new(credential_store),
+            oauth_capture_store: Arc::new(crate::oauth_capture::OAuthCaptureStore::empty()),
             session_token: &session_token,
             cert_cache,
             tls_connector: &tls_connector,
@@ -1446,6 +1463,7 @@ mod tests {
             port: upstream_port,
             route_store: Arc::new(route_store),
             credential_store: Arc::new(credential_store),
+            oauth_capture_store: Arc::new(crate::oauth_capture::OAuthCaptureStore::empty()),
             session_token: &session_token,
             cert_cache,
             tls_connector: &tls_connector,
@@ -1523,6 +1541,7 @@ mod tests {
             port: upstream_port,
             route_store: Arc::new(route_store),
             credential_store: Arc::new(credential_store),
+            oauth_capture_store: Arc::new(crate::oauth_capture::OAuthCaptureStore::empty()),
             session_token: &session_token,
             cert_cache,
             tls_connector: &tls_connector,
@@ -1628,6 +1647,7 @@ mod tests {
             port: upstream_port,
             route_store: Arc::new(route_store),
             credential_store: Arc::new(credential_store),
+            oauth_capture_store: Arc::new(crate::oauth_capture::OAuthCaptureStore::empty()),
             session_token: &session_token,
             cert_cache,
             tls_connector: &tls_connector,
@@ -1669,6 +1689,101 @@ mod tests {
             }
         );
         client_result
+    }
+
+    #[tokio::test]
+    async fn h2_forward_fails_closed_for_oauth_capture_host() {
+        let ca = Arc::new(EphemeralCa::generate().unwrap());
+        let (upstream_port, rx) = spawn_mock_h2_upstream(&ca).await;
+
+        let route_store = RouteStore::empty();
+        let credential_store = CredentialStore::empty();
+        let oauth_capture_store =
+            crate::oauth_capture::OAuthCaptureStore::load(&[crate::config::OAuthCaptureConfig {
+                provider: "test".to_string(),
+                token_endpoints: vec![crate::config::OAuthTokenEndpointConfig {
+                    host: format!("https://localhost:{upstream_port}"),
+                    path: "/oauth/token".to_string(),
+                    response_fields: vec![
+                        crate::config::OAuthTokenResponseFieldConfig {
+                            path: "access_token".to_string(),
+                            kind: crate::config::OAuthTokenResponseFieldKind::Opaque,
+                        },
+                        crate::config::OAuthTokenResponseFieldConfig {
+                            path: "refresh_token".to_string(),
+                            kind: crate::config::OAuthTokenResponseFieldKind::Opaque,
+                        },
+                    ],
+                    request_body: crate::config::OAuthTokenRequestBodyFormat::Auto,
+                    request_nonce_fields: vec!["refresh_token".to_string()],
+                }],
+                admitted_consumers: vec!["proxy.test".to_string()],
+            }])
+            .unwrap();
+        let cert_cache = Arc::new(CertCache::new(Arc::clone(&ca)));
+        let tls_connector = h2_tls_connector_trusting(ca.cert_pem());
+        let filter = ProxyFilter::allow_all();
+        let session_token = Zeroizing::new("session-tok".to_string());
+
+        let ctx = InterceptCtx {
+            route_id: None,
+            host: "localhost",
+            port: upstream_port,
+            route_store: Arc::new(route_store),
+            credential_store: Arc::new(credential_store),
+            oauth_capture_store: Arc::new(oauth_capture_store),
+            session_token: &session_token,
+            cert_cache,
+            tls_connector: &tls_connector,
+            tls_connector_h2: &tls_connector,
+            filter: &filter,
+            audit_log: None,
+            upstream_proxy: None,
+            approval_backends: None,
+            credential_capture_backend: None,
+            nonce_resolver: None,
+            enable_h2: true,
+        };
+
+        let (client_io, server_io) = tokio::io::duplex(65536);
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let (_, client_result) = tokio::join!(
+                async {
+                    let _ = forward_h2_connection(server_io, &ctx).await;
+                },
+                async {
+                    let (h2_client, h2_conn) = h2::client::handshake(client_io).await.unwrap();
+                    let conn_handle = tokio::spawn(async move {
+                        let _ = h2_conn.await;
+                    });
+
+                    let mut client_send = h2_client.ready().await.unwrap();
+                    let request = http::Request::builder()
+                        .method("POST")
+                        .uri(format!("https://localhost:{upstream_port}/oauth/token/"))
+                        .body(())
+                        .unwrap();
+                    let (response_fut, _send_stream) =
+                        client_send.send_request(request, true).unwrap();
+
+                    let response = response_fut.await.unwrap();
+                    assert_eq!(response.status(), 502);
+                    assert!(
+                        tokio::time::timeout(std::time::Duration::from_millis(100), rx)
+                            .await
+                            .is_err(),
+                        "OAuth capture h2 host request must not be forwarded before rewrite support exists"
+                    );
+
+                    drop(client_send);
+                    conn_handle.abort();
+                }
+            );
+            client_result
+        })
+        .await;
+        assert!(result.is_ok(), "test timed out — h2 forwarding hung");
     }
 
     #[tokio::test]
@@ -1737,6 +1852,7 @@ mod tests {
             port: upstream_port,
             route_store: Arc::new(route_store),
             credential_store: Arc::new(credential_store),
+            oauth_capture_store: Arc::new(crate::oauth_capture::OAuthCaptureStore::empty()),
             session_token: &session_token,
             cert_cache,
             tls_connector: &tls_connector,
@@ -1814,6 +1930,7 @@ mod tests {
             port: upstream_port,
             route_store: Arc::new(route_store),
             credential_store: Arc::new(credential_store),
+            oauth_capture_store: Arc::new(crate::oauth_capture::OAuthCaptureStore::empty()),
             session_token: &session_token,
             cert_cache,
             tls_connector: &tls_connector,
@@ -1925,6 +2042,7 @@ mod tests {
             port: upstream_port,
             route_store: Arc::new(route_store),
             credential_store: Arc::new(credential_store),
+            oauth_capture_store: Arc::new(crate::oauth_capture::OAuthCaptureStore::empty()),
             session_token: &session_token,
             cert_cache,
             tls_connector: &tls_connector,
@@ -2046,6 +2164,7 @@ mod tests {
             port: upstream_port,
             route_store: Arc::new(route_store),
             credential_store: Arc::new(credential_store),
+            oauth_capture_store: Arc::new(crate::oauth_capture::OAuthCaptureStore::empty()),
             session_token: &session_token,
             cert_cache,
             tls_connector: &tls_connector,
@@ -2128,6 +2247,7 @@ mod tests {
             port: upstream_port,
             route_store: Arc::new(route_store),
             credential_store: Arc::new(credential_store),
+            oauth_capture_store: Arc::new(crate::oauth_capture::OAuthCaptureStore::empty()),
             session_token: &session_token,
             cert_cache,
             tls_connector: &tls_connector,
@@ -2263,6 +2383,7 @@ mod tests {
             port: upstream_port,
             route_store: Arc::new(route_store),
             credential_store: Arc::new(credential_store),
+            oauth_capture_store: Arc::new(crate::oauth_capture::OAuthCaptureStore::empty()),
             session_token: &session_token,
             cert_cache,
             tls_connector: &tls_connector,
@@ -2357,6 +2478,7 @@ mod tests {
             port: upstream_port,
             route_store: Arc::new(route_store),
             credential_store: Arc::new(credential_store),
+            oauth_capture_store: Arc::new(crate::oauth_capture::OAuthCaptureStore::empty()),
             session_token: &session_token,
             cert_cache,
             tls_connector: &tls_connector,
@@ -2456,6 +2578,7 @@ mod tests {
             port: upstream_port,
             route_store: Arc::new(route_store),
             credential_store: Arc::new(credential_store),
+            oauth_capture_store: Arc::new(crate::oauth_capture::OAuthCaptureStore::empty()),
             session_token: &session_token,
             cert_cache,
             tls_connector: &tls_connector,
@@ -2549,6 +2672,7 @@ mod tests {
             port: upstream_port,
             route_store: Arc::new(route_store),
             credential_store: Arc::new(credential_store),
+            oauth_capture_store: Arc::new(crate::oauth_capture::OAuthCaptureStore::empty()),
             session_token: &session_token,
             cert_cache,
             tls_connector: &tls_connector,

@@ -71,7 +71,8 @@
       {
         "group": "Secrets",
         "pages": [
-          "cli/features/credential-injection"
+          "cli/features/credential-injection",
+          "cli/features/sandboxed-oauth-logins"
         ]
       },
       {
@@ -129,7 +130,8 @@
         "group": "Development",
         "pages": [
           "cli/development/index",
-          "cli/development/testing"
+          "cli/development/testing",
+          "cli/development/oauth-capture-manual-qa"
         ]
       }
     ]

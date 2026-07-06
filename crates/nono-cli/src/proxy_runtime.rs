@@ -47,9 +47,21 @@ pub(crate) struct EffectiveProxySettings {
 }
 
 #[derive(Debug, Clone)]
+enum ResolvedCredentialCaptureSource {
+    Command {
+        command_path: PathBuf,
+        args: Vec<String>,
+    },
+    Provider {
+        command_path: PathBuf,
+        args: Vec<String>,
+        config: serde_json::Value,
+    },
+}
+
+#[derive(Debug, Clone)]
 struct ResolvedCredentialCaptureEntry {
-    command_path: PathBuf,
-    args: Vec<String>,
+    source: ResolvedCredentialCaptureSource,
     timeout: Duration,
     ttl: Duration,
     cache_path_regex: Option<Regex>,
@@ -166,6 +178,26 @@ struct CaptureBrowserShim {
     launcher: PathBuf,
 }
 
+impl ResolvedCredentialCaptureSource {
+    fn command_path(&self) -> &Path {
+        match self {
+            Self::Command { command_path, .. } | Self::Provider { command_path, .. } => {
+                command_path
+            }
+        }
+    }
+
+    fn args(&self) -> &[String] {
+        match self {
+            Self::Command { args, .. } | Self::Provider { args, .. } => args,
+        }
+    }
+
+    fn is_provider(&self) -> bool {
+        matches!(self, Self::Provider { .. })
+    }
+}
+
 impl ProxyCredentialCaptureBackend {
     fn new(
         entries: &HashMap<String, crate::profile::CredentialCaptureEntry>,
@@ -173,12 +205,38 @@ impl ProxyCredentialCaptureBackend {
     ) -> Result<Self> {
         let mut resolved = HashMap::new();
         for (name, entry) in entries {
-            let Some(command) = entry.command.first() else {
-                return Err(NonoError::ConfigParse(format!(
-                    "credential_capture.{name}.command must not be empty"
-                )));
+            let source = if let Some(provider) = &entry.provider {
+                let Some(command) = provider.command.first() else {
+                    return Err(NonoError::ConfigParse(format!(
+                        "credential_capture.{name}.provider.command must not be empty"
+                    )));
+                };
+                ResolvedCredentialCaptureSource::Provider {
+                    command_path: resolve_capture_command(command)?,
+                    args: provider
+                        .command
+                        .iter()
+                        .skip(1)
+                        .map(|arg| crate::policy::expand_env_vars(arg))
+                        .collect(),
+                    config: provider.config.clone(),
+                }
+            } else {
+                let Some(command) = entry.command.first() else {
+                    return Err(NonoError::ConfigParse(format!(
+                        "credential_capture.{name}.command must not be empty"
+                    )));
+                };
+                ResolvedCredentialCaptureSource::Command {
+                    command_path: resolve_capture_command(command)?,
+                    args: entry
+                        .command
+                        .iter()
+                        .skip(1)
+                        .map(|arg| crate::policy::expand_env_vars(arg))
+                        .collect(),
+                }
             };
-            let command_path = resolve_capture_command(command)?;
             let interaction = entry.interaction.as_ref();
             let open_urls = interaction.and_then(|interaction| {
                 interaction
@@ -196,13 +254,7 @@ impl ProxyCredentialCaptureBackend {
             resolved.insert(
                 name.clone(),
                 ResolvedCredentialCaptureEntry {
-                    command_path,
-                    args: entry
-                        .command
-                        .iter()
-                        .skip(1)
-                        .map(|a| crate::policy::expand_env_vars(a))
-                        .collect(),
+                    source,
                     timeout: Duration::from_secs(entry.timeout_secs.unwrap_or(5)),
                     ttl: Duration::from_secs(
                         entry.cache_ttl_secs.or(entry.ttl_secs).unwrap_or(900),
@@ -302,13 +354,17 @@ impl ProxyCredentialCaptureBackend {
         nono_proxy::capture::CredentialCaptureError,
     > {
         let start = Instant::now();
-        let mut command = Command::new(&entry.command_path);
-        let stdin = match entry.stdin_mode {
-            crate::profile::CredentialCaptureStdinMode::Null if entry.inherit_stdin => {
-                Stdio::inherit()
+        let mut command = Command::new(entry.source.command_path());
+        let stdin = if entry.source.is_provider() {
+            Stdio::piped()
+        } else {
+            match entry.stdin_mode {
+                crate::profile::CredentialCaptureStdinMode::Null if entry.inherit_stdin => {
+                    Stdio::inherit()
+                }
+                crate::profile::CredentialCaptureStdinMode::Null => Stdio::null(),
+                crate::profile::CredentialCaptureStdinMode::RequestJson => Stdio::piped(),
             }
-            crate::profile::CredentialCaptureStdinMode::Null => Stdio::null(),
-            crate::profile::CredentialCaptureStdinMode::RequestJson => Stdio::piped(),
         };
         let stderr = if entry.stdio {
             Stdio::inherit()
@@ -324,7 +380,7 @@ impl ProxyCredentialCaptureBackend {
             )
         })?;
         command
-            .args(&entry.args)
+            .args(entry.source.args())
             .stdin(stdin)
             .stdout(Stdio::piped())
             .stderr(stderr)
@@ -375,33 +431,24 @@ impl ProxyCredentialCaptureBackend {
                     .reason(format!("failed to start credential capture command: {err}")),
             )
         })?;
-        if entry.stdin_mode == crate::profile::CredentialCaptureStdinMode::RequestJson {
-            let stdin_payload = serde_json::json!({
-                "session_id": request.session_id,
-                "credential_name": request.credential_name,
-                "route_id": request.route_id,
-                "request_host": request.request_host,
-                "request_path": request.request_path,
-                "request_method": request.request_method,
-                "cache_scope": request.cache_scope,
-            });
-            if let Some(mut stdin) = child.stdin.take() {
-                let bytes = serde_json::to_vec(&stdin_payload).map_err(|err| {
-                    self.capture_error(
-                        entry,
-                        CaptureErrorDetails::new("stdin_failed", start.elapsed()).reason(format!(
-                            "failed to serialize credential capture stdin: {err}"
-                        )),
-                    )
-                })?;
-                stdin.write_all(&bytes).map_err(|err| {
-                    self.capture_error(
-                        entry,
-                        CaptureErrorDetails::new("stdin_failed", start.elapsed())
-                            .reason(format!("failed to write credential capture stdin: {err}")),
-                    )
-                })?;
-            }
+        if let Some(stdin_payload) = capture_stdin_payload(entry, request, browser_bridge.as_ref())
+            && let Some(mut stdin) = child.stdin.take()
+        {
+            let bytes = serde_json::to_vec(&stdin_payload).map_err(|err| {
+                self.capture_error(
+                    entry,
+                    CaptureErrorDetails::new("stdin_failed", start.elapsed()).reason(format!(
+                        "failed to serialize credential capture stdin: {err}"
+                    )),
+                )
+            })?;
+            stdin.write_all(&bytes).map_err(|err| {
+                self.capture_error(
+                    entry,
+                    CaptureErrorDetails::new("stdin_failed", start.elapsed())
+                        .reason(format!("failed to write credential capture stdin: {err}")),
+                )
+            })?;
         }
 
         loop {
@@ -482,44 +529,30 @@ impl ProxyCredentialCaptureBackend {
             )
         })?;
 
-        let (material, header_names) = match entry.output_format {
-            crate::profile::CredentialCaptureOutputFormat::Text => (
-                nono_proxy::capture::CredentialCaptureMaterial::Secret(Zeroizing::new(value)),
-                Vec::new(),
-            ),
-            crate::profile::CredentialCaptureOutputFormat::Json => {
-                let headers =
-                    parse_capture_headers_json(&value, &entry.allow_headers).map_err(|reason| {
-                        self.capture_error(
-                            entry,
-                            CaptureErrorDetails::new("invalid_json_output", start.elapsed())
-                                .exit_status(status_code)
-                                .stdout_bytes(stdout_bytes)
-                                .reason(reason),
-                        )
-                    })?;
-                let names = headers.iter().map(|(name, _)| name.clone()).collect();
-                (
-                    nono_proxy::capture::CredentialCaptureMaterial::Headers(headers),
-                    names,
-                )
-            }
-        };
+        let (material, header_names) = parse_capture_material(entry, &value).map_err(|reason| {
+            self.capture_error(
+                entry,
+                CaptureErrorDetails::new("invalid_json_output", start.elapsed())
+                    .exit_status(status_code)
+                    .stdout_bytes(stdout_bytes)
+                    .reason(reason),
+            )
+        })?;
 
         Ok(nono_proxy::capture::CredentialCaptureResponse {
             material,
             metadata: nono_proxy::capture::CredentialCaptureMetadata {
                 cache_action: "captured".to_string(),
-                command: Some(entry.command_path.to_string_lossy().into_owned()),
-                argv: scrub_capture_argv(&entry.args, &self.redaction_policy),
+                command: Some(entry.source.command_path().to_string_lossy().into_owned()),
+                argv: scrub_capture_argv(entry.source.args(), &self.redaction_policy),
                 exit_status: status_code,
                 duration_ms: millis_u64(start.elapsed()),
                 stdout_bytes: Some(stdout_bytes),
                 stderr_redacted: None,
                 cache_scope: Some(request.cache_scope.clone()),
-                output_format: Some(capture_output_format_name(entry.output_format).to_string()),
+                output_format: Some(capture_output_format_name(entry).to_string()),
                 header_names,
-                stdin_mode: Some(capture_stdin_mode_name(entry.stdin_mode).to_string()),
+                stdin_mode: Some(capture_stdin_mode_name(entry).to_string()),
                 interactive: Some(entry.interactive),
             },
         })
@@ -536,16 +569,16 @@ impl ProxyCredentialCaptureBackend {
                 .unwrap_or_else(|| "credential capture failed".to_string()),
             nono_proxy::capture::CredentialCaptureMetadata {
                 cache_action: details.action.to_string(),
-                command: Some(entry.command_path.to_string_lossy().into_owned()),
-                argv: scrub_capture_argv(&entry.args, &self.redaction_policy),
+                command: Some(entry.source.command_path().to_string_lossy().into_owned()),
+                argv: scrub_capture_argv(entry.source.args(), &self.redaction_policy),
                 exit_status: details.exit_status,
                 duration_ms: millis_u64(details.duration),
                 stdout_bytes: details.stdout_bytes,
                 stderr_redacted: details.stderr_redacted,
                 cache_scope: None,
-                output_format: Some(capture_output_format_name(entry.output_format).to_string()),
+                output_format: Some(capture_output_format_name(entry).to_string()),
                 header_names: Vec::new(),
-                stdin_mode: Some(capture_stdin_mode_name(entry.stdin_mode).to_string()),
+                stdin_mode: Some(capture_stdin_mode_name(entry).to_string()),
                 interactive: Some(entry.interactive),
             },
         )
@@ -595,18 +628,18 @@ impl nono_proxy::capture::CredentialCaptureBackend for ProxyCredentialCaptureBac
                         material: cached.material.clone(),
                         metadata: nono_proxy::capture::CredentialCaptureMetadata {
                             cache_action: "cache_hit".to_string(),
-                            command: Some(entry.command_path.to_string_lossy().into_owned()),
-                            argv: scrub_capture_argv(&entry.args, &self.redaction_policy),
+                            command: Some(
+                                entry.source.command_path().to_string_lossy().into_owned(),
+                            ),
+                            argv: scrub_capture_argv(entry.source.args(), &self.redaction_policy),
                             exit_status: Some(0),
                             duration_ms: 0,
                             stdout_bytes: Some(cached.stdout_bytes),
                             stderr_redacted: None,
                             cache_scope: Some(cache_scope),
-                            output_format: Some(
-                                capture_output_format_name(entry.output_format).to_string(),
-                            ),
+                            output_format: Some(capture_output_format_name(entry).to_string()),
                             header_names: capture_material_header_names(&cached.material),
-                            stdin_mode: Some(capture_stdin_mode_name(entry.stdin_mode).to_string()),
+                            stdin_mode: Some(capture_stdin_mode_name(entry).to_string()),
                             interactive: Some(entry.interactive),
                         },
                     });
@@ -619,13 +652,11 @@ impl nono_proxy::capture::CredentialCaptureBackend for ProxyCredentialCaptureBac
                     reason,
                     nono_proxy::capture::CredentialCaptureMetadata {
                         cache_action: "active_set_error".to_string(),
-                        command: Some(entry.command_path.to_string_lossy().into_owned()),
-                        argv: scrub_capture_argv(&entry.args, &self.redaction_policy),
+                        command: Some(entry.source.command_path().to_string_lossy().into_owned()),
+                        argv: scrub_capture_argv(entry.source.args(), &self.redaction_policy),
                         cache_scope: Some(cache_scope.clone()),
-                        output_format: Some(
-                            capture_output_format_name(entry.output_format).to_string(),
-                        ),
-                        stdin_mode: Some(capture_stdin_mode_name(entry.stdin_mode).to_string()),
+                        output_format: Some(capture_output_format_name(entry).to_string()),
+                        stdin_mode: Some(capture_stdin_mode_name(entry).to_string()),
                         interactive: Some(entry.interactive),
                         ..Default::default()
                     },
@@ -639,13 +670,11 @@ impl nono_proxy::capture::CredentialCaptureBackend for ProxyCredentialCaptureBac
                     reason,
                     nono_proxy::capture::CredentialCaptureMetadata {
                         cache_action: "wait_failed".to_string(),
-                        command: Some(entry.command_path.to_string_lossy().into_owned()),
-                        argv: scrub_capture_argv(&entry.args, &self.redaction_policy),
+                        command: Some(entry.source.command_path().to_string_lossy().into_owned()),
+                        argv: scrub_capture_argv(entry.source.args(), &self.redaction_policy),
                         cache_scope: Some(cache_scope.clone()),
-                        output_format: Some(
-                            capture_output_format_name(entry.output_format).to_string(),
-                        ),
-                        stdin_mode: Some(capture_stdin_mode_name(entry.stdin_mode).to_string()),
+                        output_format: Some(capture_output_format_name(entry).to_string()),
+                        stdin_mode: Some(capture_stdin_mode_name(entry).to_string()),
                         interactive: Some(entry.interactive),
                         ..Default::default()
                     },
@@ -989,17 +1018,161 @@ fn credential_capture_allow_headers(
     }
 }
 
-fn capture_output_format_name(
-    format: crate::profile::CredentialCaptureOutputFormat,
-) -> &'static str {
-    match format {
+fn capture_stdin_payload(
+    entry: &ResolvedCredentialCaptureEntry,
+    request: &nono_proxy::capture::CredentialCaptureRequest,
+    browser_bridge: Option<&CaptureBrowserBridge>,
+) -> Option<serde_json::Value> {
+    match &entry.source {
+        ResolvedCredentialCaptureSource::Provider { config, .. } => {
+            let mut interaction = serde_json::Map::new();
+            if let Some(bridge) = browser_bridge {
+                interaction.insert(
+                    "open_url_helper".to_string(),
+                    serde_json::Value::String(bridge.shim.launcher.to_string_lossy().into_owned()),
+                );
+                interaction.insert(
+                    "supervisor_socket".to_string(),
+                    serde_json::Value::String(bridge.socket_path.to_string_lossy().into_owned()),
+                );
+            }
+            Some(serde_json::json!({
+                "protocol": "nono.credential-provider.v1",
+                "session_id": request.session_id,
+                "credential_name": request.credential_name,
+                "route_id": request.route_id,
+                "request_host": request.request_host,
+                "request_path": request.request_path,
+                "request_method": request.request_method,
+                "cache_scope": request.cache_scope,
+                "config": config,
+                "interaction": interaction,
+            }))
+        }
+        ResolvedCredentialCaptureSource::Command { .. }
+            if entry.stdin_mode == crate::profile::CredentialCaptureStdinMode::RequestJson =>
+        {
+            Some(serde_json::json!({
+                "session_id": request.session_id,
+                "credential_name": request.credential_name,
+                "route_id": request.route_id,
+                "request_host": request.request_host,
+                "request_path": request.request_path,
+                "request_method": request.request_method,
+                "cache_scope": request.cache_scope,
+            }))
+        }
+        ResolvedCredentialCaptureSource::Command { .. } => None,
+    }
+}
+
+fn parse_capture_material(
+    entry: &ResolvedCredentialCaptureEntry,
+    value: &str,
+) -> std::result::Result<(nono_proxy::capture::CredentialCaptureMaterial, Vec<String>), String> {
+    match &entry.source {
+        ResolvedCredentialCaptureSource::Provider { .. } => {
+            parse_provider_capture_response(value, &entry.allow_headers)
+        }
+        ResolvedCredentialCaptureSource::Command { .. } => match entry.output_format {
+            crate::profile::CredentialCaptureOutputFormat::Text => Ok((
+                nono_proxy::capture::CredentialCaptureMaterial::Secret(Zeroizing::new(
+                    value.to_string(),
+                )),
+                Vec::new(),
+            )),
+            crate::profile::CredentialCaptureOutputFormat::Json => {
+                let headers = parse_capture_headers_json(value, &entry.allow_headers)?;
+                let names = headers.iter().map(|(name, _)| name.clone()).collect();
+                Ok((
+                    nono_proxy::capture::CredentialCaptureMaterial::Headers(headers),
+                    names,
+                ))
+            }
+        },
+    }
+}
+
+fn parse_provider_capture_response(
+    value: &str,
+    allow_headers: &HashSet<String>,
+) -> std::result::Result<(nono_proxy::capture::CredentialCaptureMaterial, Vec<String>), String> {
+    let parsed: serde_json::Value = serde_json::from_str(value)
+        .map_err(|err| format!("credential provider JSON output could not be parsed: {err}"))?;
+    let material = parsed
+        .get("material")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| {
+            "credential provider JSON output must include an object field 'material'".to_string()
+        })?;
+    let material_type = material
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "credential provider material.type must be a string".to_string())?;
+    match material_type {
+        "secret" => {
+            let value = material
+                .get("value")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    "credential provider secret material must include string field 'value'"
+                        .to_string()
+                })?;
+            Ok((
+                nono_proxy::capture::CredentialCaptureMaterial::Secret(validate_provider_secret(
+                    value,
+                    "credential provider secret",
+                )?),
+                Vec::new(),
+            ))
+        }
+        "headers" => {
+            let headers_value = material.get("headers").ok_or_else(|| {
+                "credential provider headers material must include object field 'headers'"
+                    .to_string()
+            })?;
+            let wrapped = serde_json::json!({ "headers": headers_value });
+            let headers = parse_capture_headers_json(&wrapped.to_string(), allow_headers)?;
+            let names = headers.iter().map(|(name, _)| name.clone()).collect();
+            Ok((
+                nono_proxy::capture::CredentialCaptureMaterial::Headers(headers),
+                names,
+            ))
+        }
+        other => Err(format!(
+            "credential provider material.type '{other}' is not supported"
+        )),
+    }
+}
+
+fn validate_provider_secret(
+    value: &str,
+    label: &str,
+) -> std::result::Result<Zeroizing<String>, String> {
+    if value.is_empty() {
+        return Err(format!("{label} must not be empty"));
+    }
+    if value.contains('\r') || value.contains('\n') {
+        return Err(format!("{label} must not contain CR or LF"));
+    }
+    Ok(Zeroizing::new(value.to_string()))
+}
+
+fn capture_output_format_name(entry: &ResolvedCredentialCaptureEntry) -> &'static str {
+    if entry.source.is_provider() {
+        return "provider_json";
+    }
+    match entry.output_format {
         crate::profile::CredentialCaptureOutputFormat::Text => "text",
         crate::profile::CredentialCaptureOutputFormat::Json => "json",
     }
 }
 
-fn capture_stdin_mode_name(mode: crate::profile::CredentialCaptureStdinMode) -> &'static str {
-    match mode {
+fn capture_stdin_mode_name(entry: &ResolvedCredentialCaptureEntry) -> &'static str {
+    if entry.source.is_provider() {
+        return "provider_json";
+    }
+    match entry.stdin_mode {
         crate::profile::CredentialCaptureStdinMode::Null => "null",
         crate::profile::CredentialCaptureStdinMode::RequestJson => "request_json",
     }
@@ -1293,18 +1466,24 @@ pub(crate) fn prepare_proxy_launch_options(
     });
 
     #[cfg(target_os = "macos")]
-    let tls_intercept = if tls_options.trust_proxy_ca || tls_options.ca_validity.is_some() {
+    let tls_intercept = if tls_options.trust_proxy_ca
+        || tls_options.ca_validity.is_some()
+        || !tls_options.ca_env_vars.is_empty()
+    {
         Some(TlsInterceptIntent {
             trust_proxy_ca: tls_options.trust_proxy_ca,
             ca_validity: tls_options.ca_validity,
+            ca_env_vars: tls_options.ca_env_vars,
         })
     } else {
         None
     };
     #[cfg(not(target_os = "macos"))]
-    let tls_intercept = if tls_options.ca_validity.is_some() {
+    let tls_intercept = if tls_options.ca_validity.is_some() || !tls_options.ca_env_vars.is_empty()
+    {
         Some(TlsInterceptIntent {
             ca_validity: tls_options.ca_validity,
+            ca_env_vars: tls_options.ca_env_vars,
         })
     } else {
         None
@@ -1340,6 +1519,8 @@ pub(crate) fn prepare_proxy_launch_options(
         tool_sandbox_proxy_credentials,
         session_id,
         credential_capture: prepared.credential_capture.clone(),
+        credential_providers: prepared.credential_providers.clone(),
+        credential_routes: prepared.credential_routes.clone(),
         enable_h2: prepared.allow_http2_requested,
     };
 
@@ -1369,6 +1550,7 @@ struct ResolvedTlsInterceptOptions {
     trust_proxy_ca: bool,
     ca_validity: Option<std::time::Duration>,
     leaf_validity: Option<std::time::Duration>,
+    ca_env_vars: Vec<String>,
 }
 
 fn resolve_tls_intercept_options(
@@ -1421,6 +1603,9 @@ fn resolve_tls_intercept_options(
         trust_proxy_ca: args.trust_proxy_ca || profile_trusted,
         ca_validity,
         leaf_validity,
+        ca_env_vars: profile_tls
+            .map(|tls| tls.ca_env_vars.clone())
+            .unwrap_or_default(),
     })
 }
 
@@ -2089,8 +2274,23 @@ pub(crate) fn build_proxy_config_from_flags(
     }
 
     proxy_config.ca_validity = proxy.tls_intercept.as_ref().and_then(|t| t.ca_validity);
+    if let Some(tls_intercept) = proxy.tls_intercept.as_ref() {
+        for env_var in &tls_intercept.ca_env_vars {
+            if !proxy_config.intercept_ca_env_vars.contains(env_var) {
+                proxy_config.intercept_ca_env_vars.push(env_var.clone());
+            }
+        }
+    }
     proxy_config.leaf_validity = proxy.proxy_leaf_validity;
     proxy_config.enable_h2 = proxy.enable_h2;
+    synthesize_credential_provider_proxy_config(proxy, &mut proxy_config)?;
+    if !proxy_config.oauth_capture.is_empty() {
+        proxy_config.oauth_capture_store_path = Some(
+            crate::state_paths::user_state_dir()?
+                .join("oauth-capture")
+                .join("providers.json"),
+        );
+    }
 
     Ok(proxy_config)
 }
@@ -2112,6 +2312,142 @@ pub(crate) fn build_credential_capture_backend(
         credential_capture,
         session_id,
     )?)))
+}
+
+fn synthesize_credential_provider_proxy_config(
+    proxy: &ProxyLaunchOptions,
+    proxy_config: &mut nono_proxy::config::ProxyConfig,
+) -> Result<()> {
+    if proxy.credential_providers.is_empty() && proxy.credential_routes.is_empty() {
+        return Ok(());
+    }
+
+    let mut consumers_by_provider: HashMap<String, Vec<String>> = HashMap::new();
+    for route in &proxy.credential_routes {
+        let provider = proxy
+            .credential_providers
+            .get(&route.provider)
+            .ok_or_else(|| {
+                NonoError::ConfigParse(format!(
+                    "credential route '{}' references unknown provider '{}'",
+                    route.name, route.provider
+                ))
+            })?;
+        let endpoint_policy = route.endpoint_policy.clone();
+        for (index, api_host) in provider.api_hosts.iter().enumerate() {
+            let prefix = provider_route_prefix(&route.name, index, provider.api_hosts.len());
+            proxy_config.routes.push(nono_proxy::config::RouteConfig {
+                prefix: prefix.clone(),
+                upstream: api_host.clone(),
+                credential_key: None,
+                inject_mode: InjectMode::Header,
+                inject_header: "Authorization".to_string(),
+                credential_format: Some("Bearer {}".to_string()),
+                path_pattern: None,
+                path_replacement: None,
+                query_param_name: None,
+                proxy: None,
+                env_var: route.env_var.clone(),
+                endpoint_rules: if endpoint_policy.is_none() {
+                    vec![nono_proxy::config::EndpointRule {
+                        method: "*".to_string(),
+                        path: "/**".to_string(),
+                    }]
+                } else {
+                    Vec::new()
+                },
+                endpoint_policy: endpoint_policy.clone(),
+                tls_ca: None,
+                tls_client_cert: None,
+                tls_client_key: None,
+                oauth2: None,
+                aws_auth: None,
+            });
+            consumers_by_provider
+                .entry(route.provider.clone())
+                .or_default()
+                .push(format!("proxy.{prefix}"));
+            if let Some(host_port) = origin_host_port(api_host)? {
+                push_unique(&mut proxy_config.allowed_hosts, host_port);
+            }
+        }
+    }
+
+    for (name, provider) in &proxy.credential_providers {
+        let mut endpoints = Vec::new();
+        for endpoint in &provider.token_endpoints {
+            endpoints.push(nono_proxy::config::OAuthTokenEndpointConfig {
+                host: endpoint.host.clone(),
+                path: endpoint.path.clone(),
+                response_fields: endpoint
+                    .response_fields
+                    .iter()
+                    .map(|field| nono_proxy::config::OAuthTokenResponseFieldConfig {
+                        path: field.path.clone(),
+                        kind: match field.kind {
+                            crate::profile::CredentialProviderResponseFieldKind::Opaque => {
+                                nono_proxy::config::OAuthTokenResponseFieldKind::Opaque
+                            }
+                            crate::profile::CredentialProviderResponseFieldKind::Jwt => {
+                                nono_proxy::config::OAuthTokenResponseFieldKind::Jwt
+                            }
+                        },
+                    })
+                    .collect(),
+                request_body: match endpoint.request_body {
+                    crate::profile::CredentialProviderRequestBodyFormat::Auto => {
+                        nono_proxy::config::OAuthTokenRequestBodyFormat::Auto
+                    }
+                    crate::profile::CredentialProviderRequestBodyFormat::Json => {
+                        nono_proxy::config::OAuthTokenRequestBodyFormat::Json
+                    }
+                    crate::profile::CredentialProviderRequestBodyFormat::Form => {
+                        nono_proxy::config::OAuthTokenRequestBodyFormat::Form
+                    }
+                },
+                request_nonce_fields: endpoint.request_nonce_fields.clone(),
+            });
+            if let Some(host_port) = origin_host_port(&endpoint.host)? {
+                push_unique(&mut proxy_config.allowed_hosts, host_port);
+            }
+        }
+        proxy_config
+            .oauth_capture
+            .push(nono_proxy::config::OAuthCaptureConfig {
+                provider: name.clone(),
+                token_endpoints: endpoints,
+                admitted_consumers: consumers_by_provider.remove(name).unwrap_or_default(),
+            });
+    }
+
+    Ok(())
+}
+
+fn provider_route_prefix(route_name: &str, index: usize, total: usize) -> String {
+    if total <= 1 {
+        route_name.to_string()
+    } else {
+        format!("{route_name}_{index}")
+    }
+}
+
+fn push_unique(values: &mut Vec<String>, value: String) {
+    if !values.iter().any(|existing| existing == &value) {
+        values.push(value);
+    }
+}
+
+fn origin_host_port(origin: &str) -> Result<Option<String>> {
+    let url = url::Url::parse(origin).map_err(|err| {
+        NonoError::ConfigParse(format!("invalid provider origin '{origin}': {err}"))
+    })?;
+    let Some(host) = url.host_str() else {
+        return Ok(None);
+    };
+    let Some(port) = url.port_or_known_default() else {
+        return Ok(None);
+    };
+    Ok(Some(format!("{}:{}", host.to_lowercase(), port)))
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -2333,6 +2669,7 @@ pub(crate) fn start_proxy_runtime(
         }
         env_vars.push((key, value));
     }
+    extend_provider_base_url_env_vars(proxy, port, &mut env_vars);
 
     std::mem::forget(rt);
 
@@ -2342,6 +2679,28 @@ pub(crate) fn start_proxy_runtime(
         tool_sandbox_trust_bundle_paths,
         handle: Some(handle),
     })
+}
+
+fn extend_provider_base_url_env_vars(
+    proxy: &ProxyLaunchOptions,
+    port: u16,
+    env_vars: &mut Vec<(String, String)>,
+) {
+    for route in &proxy.credential_routes {
+        let Some(base_url_env_var) = &route.base_url_env_var else {
+            continue;
+        };
+        let total = proxy
+            .credential_providers
+            .get(&route.provider)
+            .map(|provider| provider.api_hosts.len())
+            .unwrap_or(1);
+        let prefix = provider_route_prefix(&route.name, 0, total);
+        env_vars.push((
+            base_url_env_var.clone(),
+            format!("http://127.0.0.1:{port}/{prefix}"),
+        ));
+    }
 }
 
 fn tool_sandbox_proxy_env_var_names(
@@ -2693,6 +3052,8 @@ mod tests {
             profile_display_name: None,
             command_policies: None,
             credential_capture: HashMap::new(),
+            credential_providers: HashMap::new(),
+            credential_routes: Vec::new(),
             tls_intercept: None,
             session_hooks: crate::profile::SessionHooks::default(),
             rollback_exclude_patterns: Vec::new(),
@@ -3298,6 +3659,116 @@ mod tests {
     }
 
     #[test]
+    fn proxy_credential_capture_backend_runs_provider_protocol() -> Result<()> {
+        let temp = tempfile::tempdir().map_err(NonoError::Io)?;
+        let stdin_path = temp.path().join("provider-stdin.json");
+        let mut entry = test_capture_entry_no_cache(Vec::new());
+        entry.provider = Some(crate::profile::CredentialCaptureProvider {
+            command: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                r#"cat > "$1"; printf '%s' '{"material":{"type":"secret","value":"provider-token"}}'"#
+                    .to_string(),
+                "provider".to_string(),
+                stdin_path.to_string_lossy().into_owned(),
+            ],
+            config: serde_json::json!({
+                "issuer": "https://auth.example.com",
+                "client_id": "client-123"
+            }),
+        });
+        let mut entries = HashMap::new();
+        entries.insert("acme_mcp".to_string(), entry);
+        let backend = ProxyCredentialCaptureBackend::new(&entries, "sess-provider".to_string())?;
+        let response = nono_proxy::capture::CredentialCaptureBackend::capture(
+            &backend,
+            nono_proxy::capture::CredentialCaptureRequest {
+                credential_name: "acme_mcp".to_string(),
+                route_id: "acme_mcp".to_string(),
+                request_host: "mcp.example.com".to_string(),
+                request_path: "/mcp/tools/list".to_string(),
+                request_method: "POST".to_string(),
+                session_id: String::new(),
+                cache_scope: String::new(),
+            },
+        )
+        .map_err(|err| NonoError::SandboxInit(err.to_string()))?;
+
+        assert_capture_secret(&response, "provider-token");
+        assert_eq!(
+            response.metadata.output_format.as_deref(),
+            Some("provider_json")
+        );
+        assert_eq!(
+            response.metadata.stdin_mode.as_deref(),
+            Some("provider_json")
+        );
+
+        let stdin_json = std::fs::read_to_string(&stdin_path).map_err(NonoError::Io)?;
+        let payload: serde_json::Value = serde_json::from_str(&stdin_json)
+            .map_err(|err| NonoError::ConfigParse(err.to_string()))?;
+        assert_eq!(payload["protocol"], "nono.credential-provider.v1");
+        assert_eq!(payload["session_id"], "sess-provider");
+        assert_eq!(payload["credential_name"], "acme_mcp");
+        assert_eq!(payload["request_path"], "/mcp/tools/list");
+        assert_eq!(payload["config"]["client_id"], "client-123");
+        Ok(())
+    }
+
+    #[test]
+    fn proxy_credential_capture_backend_validates_provider_headers() -> Result<()> {
+        let mut entry = test_capture_entry_no_cache(Vec::new());
+        entry.provider = Some(crate::profile::CredentialCaptureProvider {
+            command: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "cat >/dev/null; printf '%s' \"$1\"".to_string(),
+                "provider".to_string(),
+                r#"{"material":{"type":"headers","headers":{"Authorization":"Bearer provider"}}}"#
+                    .to_string(),
+            ],
+            config: serde_json::json!({}),
+        });
+        entry.output = crate::profile::CredentialCaptureOutput::Config(
+            crate::profile::CredentialCaptureOutputConfig {
+                format: crate::profile::CredentialCaptureOutputFormat::Json,
+                allow_headers: vec!["Authorization".to_string()],
+            },
+        );
+        let mut entries = HashMap::new();
+        entries.insert("gateway".to_string(), entry);
+        let backend = ProxyCredentialCaptureBackend::new(&entries, "sess-provider".to_string())?;
+        let response = nono_proxy::capture::CredentialCaptureBackend::capture(
+            &backend,
+            nono_proxy::capture::CredentialCaptureRequest {
+                credential_name: "gateway".to_string(),
+                route_id: "gateway".to_string(),
+                request_host: "api.example.com".to_string(),
+                request_path: "/".to_string(),
+                request_method: "GET".to_string(),
+                session_id: String::new(),
+                cache_scope: String::new(),
+            },
+        )
+        .map_err(|err| NonoError::SandboxInit(err.to_string()))?;
+
+        assert_eq!(
+            response.metadata.header_names,
+            vec!["Authorization".to_string()]
+        );
+        match response.material {
+            nono_proxy::capture::CredentialCaptureMaterial::Headers(headers) => {
+                assert_eq!(headers[0].0, "Authorization");
+                assert_eq!(headers[0].1.as_str(), "Bearer provider");
+            }
+            nono_proxy::capture::CredentialCaptureMaterial::Secret(_) => {
+                panic!("expected provider header material")
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn proxy_credential_capture_backend_sends_request_json_stdin() -> Result<()> {
         let mut entry = test_capture_entry_no_cache(vec!["/bin/cat".to_string()]);
         entry.stdin = crate::profile::CredentialCaptureStdinMode::RequestJson;
@@ -3373,6 +3844,7 @@ mod tests {
     fn test_capture_entry(command: Vec<String>) -> crate::profile::CredentialCaptureEntry {
         crate::profile::CredentialCaptureEntry {
             command,
+            provider: None,
             timeout_secs: Some(30),
             ttl_secs: Some(60),
             cache_ttl_secs: None,
@@ -3546,6 +4018,79 @@ mod tests {
         assert!(
             result.is_err(),
             "--allow-endpoint for a service without --credential must error"
+        );
+    }
+
+    #[test]
+    fn test_credential_provider_routes_synthesize_proxy_config() {
+        let mut providers = HashMap::new();
+        providers.insert(
+            "codex".to_string(),
+            crate::profile::CredentialProviderDef {
+                provider_type: crate::profile::CredentialProviderType::OauthCapture,
+                token_endpoints: vec![crate::profile::CredentialProviderTokenEndpoint {
+                    host: "https://auth.openai.com".to_string(),
+                    path: "/oauth/token".to_string(),
+                    response_fields: vec![
+                        crate::profile::CredentialProviderResponseField {
+                            path: "access_token".to_string(),
+                            kind: crate::profile::CredentialProviderResponseFieldKind::Opaque,
+                        },
+                        crate::profile::CredentialProviderResponseField {
+                            path: "refresh_token".to_string(),
+                            kind: crate::profile::CredentialProviderResponseFieldKind::Opaque,
+                        },
+                    ],
+                    request_body: crate::profile::CredentialProviderRequestBodyFormat::Auto,
+                    request_nonce_fields: vec!["refresh_token".to_string()],
+                }],
+                api_hosts: vec!["https://api.openai.com".to_string()],
+                credential_store: None,
+                helpers: None,
+            },
+        );
+        let proxy = ProxyLaunchOptions {
+            credential_providers: providers,
+            credential_routes: vec![crate::profile::CredentialRouteDef {
+                name: "openai_oauth".to_string(),
+                provider: "codex".to_string(),
+                env_var: Some("OPENAI_API_KEY".to_string()),
+                base_url_env_var: Some("OPENAI_BASE_URL".to_string()),
+                endpoint_policy: None,
+            }],
+            ..ProxyLaunchOptions::default()
+        };
+
+        let config = build_proxy_config_from_flags(&proxy).expect("provider proxy config builds");
+        assert!(
+            config
+                .allowed_hosts
+                .iter()
+                .any(|host| host == "auth.openai.com:443"),
+            "token host must be allowed through the proxy"
+        );
+        assert!(
+            config
+                .allowed_hosts
+                .iter()
+                .any(|host| host == "api.openai.com:443"),
+            "API host must be allowed through the proxy"
+        );
+        assert_eq!(config.oauth_capture.len(), 1);
+        assert_eq!(config.oauth_capture[0].provider, "codex");
+        assert_eq!(
+            config.oauth_capture[0].admitted_consumers,
+            vec!["proxy.openai_oauth".to_string()]
+        );
+        let route = config
+            .routes
+            .iter()
+            .find(|route| route.prefix == "openai_oauth")
+            .expect("API route must be synthesized");
+        assert_eq!(route.upstream, "https://api.openai.com");
+        assert!(
+            !route.endpoint_rules.is_empty(),
+            "provider API routes must force L7 visibility even with allow-all policy"
         );
     }
 

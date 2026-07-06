@@ -2,7 +2,8 @@ use crate::cli::SandboxArgs;
 use crate::{package, profile};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::fs::{self, DirBuilder};
+use std::path::{Component, Path, PathBuf};
 
 pub(crate) struct PreparedProfile {
     pub(crate) loaded_profile: Option<profile::Profile>,
@@ -23,6 +24,8 @@ pub(crate) struct PreparedProfile {
     pub(crate) allow_domain: Vec<profile::AllowDomainEntry>,
     pub(crate) credentials: Vec<String>,
     pub(crate) custom_credentials: HashMap<String, profile::CustomCredentialDef>,
+    pub(crate) credential_providers: HashMap<String, profile::CredentialProviderDef>,
+    pub(crate) credential_routes: Vec<profile::CredentialRouteDef>,
     pub(crate) tls_intercept: Option<profile::TlsInterceptConfig>,
     pub(crate) upstream_proxy: Option<String>,
     pub(crate) upstream_bypass: Vec<String>,
@@ -508,6 +511,169 @@ fn collect_ignored_denial_paths(
     paths
 }
 
+fn precreate_file_json_credential_store_dirs(
+    loaded_profile: Option<&profile::Profile>,
+    workdir: &Path,
+) {
+    let Some(loaded_profile) = loaded_profile else {
+        return;
+    };
+
+    for (provider_name, provider) in &loaded_profile.credential_providers {
+        let Some(profile::CredentialProviderStore::FileJson { path, .. }) =
+            &provider.credential_store
+        else {
+            continue;
+        };
+        let expanded = match expanded_credential_store_path(path, workdir) {
+            Ok(path) => path,
+            Err(error) => {
+                tracing::warn!(
+                    "Failed to expand file_json credential store path for provider {}: {}",
+                    provider_name,
+                    error
+                );
+                continue;
+            }
+        };
+        if !file_json_store_path_is_precreatable(loaded_profile, &expanded, workdir) {
+            tracing::warn!(
+                "Skipping file_json credential store directory pre-create for provider {} at {}: path is not under workdir or an explicit writable filesystem grant",
+                provider_name,
+                expanded.display()
+            );
+            continue;
+        }
+        let Some(parent) = expanded.parent() else {
+            continue;
+        };
+        if let Err(error) = create_dir_all_owner_only(parent) {
+            tracing::warn!(
+                "Failed to pre-create file_json credential store directory {} for provider {}: {}",
+                parent.display(),
+                provider_name,
+                error
+            );
+        }
+    }
+}
+
+fn expanded_credential_store_path(path: &str, workdir: &Path) -> crate::Result<PathBuf> {
+    let expanded = profile::expand_vars(path, workdir)?;
+    let absolute = if expanded.is_absolute() {
+        expanded
+    } else {
+        workdir.join(expanded)
+    };
+    Ok(lexically_normalize(&absolute))
+}
+
+fn file_json_store_path_is_precreatable(
+    loaded_profile: &profile::Profile,
+    store_path: &Path,
+    workdir: &Path,
+) -> bool {
+    let normalized_workdir = lexically_normalize(workdir);
+    if store_path.starts_with(&normalized_workdir) {
+        return true;
+    }
+
+    writable_profile_dirs(loaded_profile, workdir)
+        .into_iter()
+        .any(|grant| store_path.starts_with(grant))
+        || writable_profile_files(loaded_profile, workdir)
+            .into_iter()
+            .any(|grant| store_path == grant)
+}
+
+fn writable_profile_dirs(loaded_profile: &profile::Profile, workdir: &Path) -> Vec<PathBuf> {
+    loaded_profile
+        .filesystem
+        .allow
+        .iter()
+        .chain(loaded_profile.filesystem.write.iter())
+        .filter_map(|path| expanded_credential_store_path(path, workdir).ok())
+        .collect()
+}
+
+fn writable_profile_files(loaded_profile: &profile::Profile, workdir: &Path) -> Vec<PathBuf> {
+    loaded_profile
+        .filesystem
+        .allow_file
+        .iter()
+        .chain(loaded_profile.filesystem.write_file.iter())
+        .filter_map(|path| expanded_credential_store_path(path, workdir).ok())
+        .collect()
+}
+
+fn lexically_normalize(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+    normalized
+}
+
+fn create_dir_all_owner_only(path: &Path) -> std::io::Result<()> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        if current.as_os_str().is_empty() {
+            continue;
+        }
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!(
+                        "refusing to create credential store directory through symlink '{}'",
+                        current.display()
+                    ),
+                ));
+            }
+            Ok(metadata) if metadata.is_dir() => continue,
+            Ok(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!(
+                        "credential store path component '{}' is not a directory",
+                        current.display()
+                    ),
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                create_owner_only_dir(&current)?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn create_owner_only_dir(path: &Path) -> std::io::Result<()> {
+    let mut builder = DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
 fn prepare_profile_with_options(
     args: &SandboxArgs,
     workdir: &Path,
@@ -589,6 +755,8 @@ fn prepare_profile_with_options(
         None
     };
 
+    precreate_file_json_credential_store_dirs(loaded_profile.as_ref(), workdir);
+
     Ok(PreparedProfile {
         capability_elevation: loaded_profile
             .as_ref()
@@ -641,6 +809,14 @@ fn prepare_profile_with_options(
         custom_credentials: loaded_profile
             .as_ref()
             .map(|profile| profile.network.custom_credentials.clone())
+            .unwrap_or_default(),
+        credential_providers: loaded_profile
+            .as_ref()
+            .map(|profile| profile.credential_providers.clone())
+            .unwrap_or_default(),
+        credential_routes: loaded_profile
+            .as_ref()
+            .map(|profile| profile.credential_routes.clone())
             .unwrap_or_default(),
         tls_intercept: loaded_profile
             .as_ref()
@@ -931,6 +1107,95 @@ mod tests {
         let result = expand_profile_set_vars(Some(&profile), Path::new("/tmp/work"))
             .expect("expansion should succeed");
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn precreate_file_json_credential_store_creates_parent_dir_only() {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let tmp = tempdir().expect("tmpdir");
+        let tmp_root = tmp.path().canonicalize().expect("canonical tmpdir");
+        let home = tmp_root.join("home");
+        let workdir = tmp_root.join("work");
+        fs::create_dir(&home).expect("create home");
+        fs::create_dir(&workdir).expect("create workdir");
+        let _env =
+            crate::test_env::EnvVarGuard::set_all(&[("HOME", home.to_str().expect("utf8 home"))]);
+
+        let mut profile = profile::Profile::default();
+        profile.credential_providers.insert(
+            "codex_openai".to_string(),
+            profile::CredentialProviderDef {
+                provider_type: profile::CredentialProviderType::OauthCapture,
+                token_endpoints: Vec::new(),
+                api_hosts: Vec::new(),
+                credential_store: Some(profile::CredentialProviderStore::FileJson {
+                    path: "$HOME/.codex-nono-oauth/auth.json".to_string(),
+                    phantom_fields: vec!["tokens.access_token".to_string()],
+                }),
+                helpers: None,
+            },
+        );
+        profile
+            .filesystem
+            .allow
+            .push("$HOME/.codex-nono-oauth".to_string());
+
+        let store_path = home.join(".codex-nono-oauth").join("auth.json");
+        assert!(!store_path.parent().expect("parent").exists());
+
+        precreate_file_json_credential_store_dirs(Some(&profile), &workdir);
+
+        assert!(store_path.parent().expect("parent").is_dir());
+        assert!(!store_path.exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(store_path.parent().expect("parent"))
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o700);
+        }
+    }
+
+    #[test]
+    fn file_json_credential_store_precreate_requires_safe_location() {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let tmp = tempdir().expect("tmpdir");
+        let tmp_root = tmp.path().canonicalize().expect("canonical tmpdir");
+        let home = tmp_root.join("home");
+        let workdir = tmp_root.join("work");
+        fs::create_dir(&home).expect("create home");
+        fs::create_dir(&workdir).expect("create workdir");
+        let _env =
+            crate::test_env::EnvVarGuard::set_all(&[("HOME", home.to_str().expect("utf8 home"))]);
+
+        let mut profile = profile::Profile::default();
+        profile.credential_providers.insert(
+            "codex_openai".to_string(),
+            profile::CredentialProviderDef {
+                provider_type: profile::CredentialProviderType::OauthCapture,
+                token_endpoints: Vec::new(),
+                api_hosts: Vec::new(),
+                credential_store: Some(profile::CredentialProviderStore::FileJson {
+                    path: "$HOME/.codex-nono-oauth/auth.json".to_string(),
+                    phantom_fields: vec!["tokens.access_token".to_string()],
+                }),
+                helpers: None,
+            },
+        );
+
+        let store_path = home.join(".codex-nono-oauth").join("auth.json");
+        precreate_file_json_credential_store_dirs(Some(&profile), &workdir);
+
+        assert!(!store_path.parent().expect("parent").exists());
     }
 
     /// Build a minimal pack on disk under `<config_dir>/nono/packages/<ns>/<name>/`

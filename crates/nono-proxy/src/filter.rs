@@ -76,7 +76,7 @@ impl ProxyFilter {
         };
 
         let resolved_ips: Vec<IpAddr> = resolved.iter().map(|a| a.ip()).collect();
-        let result = self.inner.check_host(host, &resolved_ips);
+        let result = self.check_host_result(host, port, &resolved_ips);
 
         // Only return resolved addrs on allow to prevent misuse
         let addrs = if result.is_allowed() {
@@ -95,6 +95,16 @@ impl ProxyFilter {
     #[must_use]
     pub fn check_host_with_ips(&self, host: &str, resolved_ips: &[IpAddr]) -> FilterResult {
         self.inner.check_host(host, resolved_ips)
+    }
+
+    fn check_host_result(&self, host: &str, port: u16, resolved_ips: &[IpAddr]) -> FilterResult {
+        let result = self.inner.check_host(host, resolved_ips);
+        if !matches!(result, FilterResult::DenyNotAllowed { .. }) {
+            return result;
+        }
+
+        let host_port = format!("{host}:{port}");
+        self.inner.check_host(&host_port, resolved_ips)
     }
 
     /// Number of allowed hosts configured.
@@ -120,6 +130,28 @@ mod tests {
 
         let result = filter.check_host_with_ips("evil.com", &public_ip);
         assert!(!result.is_allowed());
+    }
+
+    #[test]
+    fn test_proxy_filter_allows_host_port_entries() {
+        let filter = ProxyFilter::new(&["platform.claude.com:443".to_string()]);
+        let public_ip = vec![IpAddr::V4(Ipv4Addr::new(160, 79, 104, 10))];
+
+        let result = filter.check_host_result("platform.claude.com", 443, &public_ip);
+        assert!(result.is_allowed());
+
+        let result = filter.check_host_result("platform.claude.com", 8443, &public_ip);
+        assert!(!result.is_allowed());
+    }
+
+    #[test]
+    fn test_proxy_filter_host_port_entries_do_not_override_metadata_deny() {
+        let filter = ProxyFilter::new(&["metadata.google.internal:443".to_string()]);
+        let public_ip = vec![IpAddr::V4(Ipv4Addr::new(104, 18, 7, 96))];
+
+        let result = filter.check_host_result("metadata.google.internal", 443, &public_ip);
+        assert!(!result.is_allowed());
+        assert!(matches!(result, FilterResult::DenyHost { .. }));
     }
 
     #[test]

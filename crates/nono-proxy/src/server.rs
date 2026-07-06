@@ -15,6 +15,7 @@ use crate::credential::CredentialStore;
 use crate::error::{ProxyError, Result};
 use crate::external;
 use crate::filter::ProxyFilter;
+use crate::oauth_capture::OAuthCaptureStore;
 use crate::pool::UpstreamPool;
 use crate::reverse;
 use crate::route::RouteStore;
@@ -86,6 +87,8 @@ pub struct ProxyHandle {
     /// Seatbelt read capability on it. `None` when interception is not
     /// configured (no `intercept_ca_dir`) or no route requires L7 visibility.
     intercept_ca_path: Option<PathBuf>,
+    /// Environment variables that should point at `intercept_ca_path`.
+    intercept_ca_env_vars: Vec<String>,
     /// Credential load warnings collected at startup.
     diagnostics: Vec<crate::diagnostic::ProxyDiagnostic>,
 }
@@ -353,21 +356,11 @@ impl ProxyHandle {
         // system trust store + the ephemeral session CA, so standard
         // runtimes see a superset of the trust they had before nono.
         //
-        // Replacement semantics (swap out the default store entirely):
-        //   SSL_CERT_FILE, REQUESTS_CA_BUNDLE, CURL_CA_BUNDLE, GIT_SSL_CAINFO
-        // Additive semantics (default + this file):
-        //   NODE_EXTRA_CA_CERTS
-        //
-        // Pointing all five at the same bundle is safe: Node sees system
-        // roots twice (harmless), and all other runtimes get the union of
-        // trust they need.
         if let Some(path) = self.intercept_ca_path.as_deref() {
             let path_str = path.to_string_lossy().to_string();
-            vars.push(("SSL_CERT_FILE".to_string(), path_str.clone()));
-            vars.push(("REQUESTS_CA_BUNDLE".to_string(), path_str.clone()));
-            vars.push(("NODE_EXTRA_CA_CERTS".to_string(), path_str.clone()));
-            vars.push(("CURL_CA_BUNDLE".to_string(), path_str.clone()));
-            vars.push(("GIT_SSL_CAINFO".to_string(), path_str));
+            for name in &self.intercept_ca_env_vars {
+                vars.push((name.clone(), path_str.clone()));
+            }
         }
 
         vars
@@ -457,6 +450,8 @@ struct ProxyState {
     route_store: Arc<RouteStore>,
     /// Credential-specific configuration (inject mode, headers, secrets) for routes with credentials.
     credential_store: Arc<CredentialStore>,
+    /// OAuth token endpoint capture and phantom-token store.
+    oauth_capture_store: Arc<OAuthCaptureStore>,
     config: ProxyConfig,
     /// Shared TLS connector for upstream connections (reverse proxy mode).
     /// Created once at startup to avoid rebuilding the root cert store per request.
@@ -493,6 +488,20 @@ struct ProxyState {
     /// Per-host HTTP/2 capability cache. Populated by pre-flight probes so
     /// the inbound acceptor only advertises h2 when the upstream supports it.
     h2_cache: Arc<UpstreamH2Cache>,
+}
+
+struct CompositeNonceResolver {
+    external: Option<Arc<dyn crate::token::NonceResolver>>,
+    oauth: Arc<OAuthCaptureStore>,
+}
+
+impl crate::token::NonceResolver for CompositeNonceResolver {
+    fn resolve(&self, nonce: &str, consumer: &str) -> Option<Zeroizing<Vec<u8>>> {
+        self.external
+            .as_ref()
+            .and_then(|resolver| resolver.resolve(nonce, consumer))
+            .or_else(|| self.oauth.resolve(nonce, consumer))
+    }
 }
 
 /// Start the proxy server.
@@ -576,6 +585,20 @@ pub async fn start_with_nonce_resolver(
     } else {
         RouteStore::load(&config.routes)?
     };
+    let oauth_capture_store = OAuthCaptureStore::load_with_persistence(
+        &config.oauth_capture,
+        config.oauth_capture_store_path.clone(),
+    )?;
+    let oauth_capture_store = Arc::new(oauth_capture_store);
+    let effective_nonce_resolver: Option<Arc<dyn crate::token::NonceResolver>> =
+        if oauth_capture_store.is_empty() {
+            nonce_resolver
+        } else {
+            Some(Arc::new(CompositeNonceResolver {
+                external: nonce_resolver,
+                oauth: Arc::clone(&oauth_capture_store),
+            }))
+        };
     // Build shared TLS connector (root cert store is expensive to construct).
     // Use the ring provider explicitly to avoid ambiguity when multiple
     // crypto providers are in the dependency tree.
@@ -705,17 +728,19 @@ pub async fn start_with_nonce_resolver(
     // checked here (rather than relying solely on the CLI's decision) so a
     // misconfigured `intercept_ca_dir` without intercept-bearing routes
     // doesn't generate a useless CA on disk.
-    let any_intercept_route = route_store
+    let any_route_intercept = route_store
         .route_upstream_hosts()
         .iter()
         .any(|hp| route_store.has_intercept_route(hp));
+    let any_intercept_route = any_route_intercept || !oauth_capture_store.is_empty();
     let (cert_cache, intercept_ca_path) = match (&config.intercept_ca_dir, any_intercept_route) {
         (Some(dir), true) => {
             let intercept_route_count = route_store
                 .route_upstream_hosts()
                 .iter()
                 .filter(|hp| route_store.has_intercept_route(hp))
-                .count();
+                .count()
+                + oauth_capture_store.host_ports().len();
             let ca_result = if let Some(ref preloaded) = config.preloaded_ca {
                 EphemeralCa::from_existing(&preloaded.key_der, &preloaded.cert_pem)
             } else {
@@ -767,11 +792,13 @@ pub async fn start_with_nonce_resolver(
     };
 
     let enable_h2 = config.enable_h2;
+    let intercept_ca_env_vars = config.intercept_ca_env_vars.clone();
     let state = Arc::new(ProxyState {
         filter,
         session_token: session_token.clone(),
         route_store: Arc::new(route_store),
         credential_store: Arc::new(credential_store),
+        oauth_capture_store,
         config,
         tls_connector,
         default_tls_config: tls_config_arc,
@@ -781,7 +808,7 @@ pub async fn start_with_nonce_resolver(
         audit_log: Arc::clone(&audit_log),
         approval_backends,
         credential_capture_backend,
-        nonce_resolver,
+        nonce_resolver: effective_nonce_resolver,
         bypass_matcher,
         cert_cache,
         enable_h2,
@@ -801,6 +828,7 @@ pub async fn start_with_nonce_resolver(
         loaded_routes,
         no_proxy_hosts,
         intercept_ca_path,
+        intercept_ca_env_vars,
         diagnostics: proxy_diagnostics,
     })
 }
@@ -942,22 +970,29 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
         //
         // Anything else (host not matching any route) falls through to the
         // existing transparent-tunnel / external-proxy paths.
-        if !state.route_store.is_empty()
+        if (!state.route_store.is_empty() || !state.oauth_capture_store.is_empty())
             && let Some(authority) = first_line.split_whitespace().nth(1)
         {
             let host_port = normalize_authority(authority);
+            let oauth_host_policy = state.oauth_capture_store.host_policy(&host_port);
 
-            if state.route_store.is_route_upstream(&host_port) {
+            if state.route_store.is_route_upstream(&host_port) || oauth_host_policy.is_some() {
                 let route_id = state
                     .route_store
                     .lookup_by_upstream(&host_port)
-                    .map(|(prefix, _)| prefix);
+                    .map(|(prefix, _)| prefix)
+                    .or_else(|| {
+                        oauth_host_policy
+                            .as_ref()
+                            .map(|policy| policy.route_id.as_str())
+                    });
                 let (host, port) = host_port
                     .rsplit_once(':')
                     .map(|(h, p)| (h.to_string(), p.parse::<u16>().unwrap_or(443)))
                     .unwrap_or_else(|| (host_port.clone(), 443));
 
-                let intercept_eligible = state.route_store.has_intercept_route(&host_port);
+                let intercept_eligible = state.route_store.has_intercept_route(&host_port)
+                    || oauth_host_policy.is_some();
 
                 match (intercept_eligible, state.cert_cache.as_ref()) {
                     // Case 1: intercept-eligible route + cert cache available.
@@ -1102,7 +1137,10 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
                                 None
                             };
 
-                        let mut h2_enabled_for_target = state.enable_h2;
+                        let mut h2_enabled_for_target = state.enable_h2
+                            && !oauth_host_policy
+                                .as_ref()
+                                .is_some_and(|policy| policy.force_http1);
                         let (tls_connector_h2, h2_connector_cache_key) = if state.enable_h2 {
                             match tls_intercept::handle::select_h2_tls_connector_for_target(
                                 &state.route_store,
@@ -1151,6 +1189,7 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
                             port,
                             route_store: Arc::clone(&state.route_store),
                             credential_store: Arc::clone(&state.credential_store),
+                            oauth_capture_store: Arc::clone(&state.oauth_capture_store),
                             session_token: &state.session_token,
                             cert_cache: Arc::clone(cache),
                             tls_connector: &state.tls_connector,
@@ -1574,6 +1613,7 @@ mod tests {
                 loaded_routes: std::collections::HashSet::new(),
                 no_proxy_hosts: Vec::new(),
                 intercept_ca_path: None,
+                intercept_ca_env_vars: crate::config::default_intercept_ca_env_vars(),
                 diagnostics: vec![],
             };
         }
@@ -1586,7 +1626,7 @@ mod tests {
     /// 1. generates an ephemeral CA;
     /// 2. writes a trust bundle file with at least the ephemeral cert + system roots;
     /// 3. exposes the path via `intercept_ca_path()`;
-    /// 4. emits trust env vars (`SSL_CERT_FILE` etc.) pointing at it;
+    /// 4. emits configured trust env vars (`SSL_CERT_FILE` etc.) pointing at it;
     /// 5. cleans the file on `Drop`.
     #[tokio::test]
     async fn test_intercept_lifecycle_end_to_end() {
@@ -1616,6 +1656,11 @@ mod tests {
                     aws_auth: None,
                 }],
                 intercept_ca_dir: Some(dir.path().to_path_buf()),
+                intercept_ca_env_vars: {
+                    let mut vars = crate::config::default_intercept_ca_env_vars();
+                    vars.push("CODEX_CA_CERTIFICATE".to_string());
+                    vars
+                },
                 ..Default::default()
             };
             let handle = start(config).await.unwrap();
@@ -1642,6 +1687,11 @@ mod tests {
                 .find(|(k, _)| k == "SSL_CERT_FILE")
                 .expect("SSL_CERT_FILE should be set when intercept active");
             assert_eq!(std::path::Path::new(&ssl.1), ca_path_clone);
+            let codex_ca = vars
+                .iter()
+                .find(|(k, _)| k == "CODEX_CA_CERTIFICATE")
+                .expect("CODEX_CA_CERTIFICATE should be set when intercept active");
+            assert_eq!(std::path::Path::new(&codex_ca.1), ca_path_clone);
             assert!(vars.iter().any(|(k, _)| k == "REQUESTS_CA_BUNDLE"));
             assert!(vars.iter().any(|(k, _)| k == "NODE_EXTRA_CA_CERTS"));
             assert!(vars.iter().any(|(k, _)| k == "CURL_CA_BUNDLE"));
@@ -1693,6 +1743,41 @@ mod tests {
         assert!(
             vars.iter().all(|(k, _)| k != "SSL_CERT_FILE"),
             "trust env vars must not be set when intercept inactive"
+        );
+        handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_oauth_capture_routes_activate_intercept() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = ProxyConfig {
+            oauth_capture: vec![crate::config::OAuthCaptureConfig {
+                provider: "codex".to_string(),
+                token_endpoints: vec![crate::config::OAuthTokenEndpointConfig {
+                    host: "https://auth.openai.com".to_string(),
+                    path: "/oauth/token".to_string(),
+                    response_fields: vec![
+                        crate::config::OAuthTokenResponseFieldConfig {
+                            path: "access_token".to_string(),
+                            kind: crate::config::OAuthTokenResponseFieldKind::Opaque,
+                        },
+                        crate::config::OAuthTokenResponseFieldConfig {
+                            path: "refresh_token".to_string(),
+                            kind: crate::config::OAuthTokenResponseFieldKind::Opaque,
+                        },
+                    ],
+                    request_body: crate::config::OAuthTokenRequestBodyFormat::Auto,
+                    request_nonce_fields: vec!["refresh_token".to_string()],
+                }],
+                admitted_consumers: vec!["proxy.openai_oauth".to_string()],
+            }],
+            intercept_ca_dir: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        };
+        let handle = start(config).await.unwrap();
+        assert!(
+            handle.intercept_ca_path().is_some(),
+            "oauth_capture token endpoints must activate TLS interception"
         );
         handle.shutdown();
     }
@@ -2158,6 +2243,7 @@ mod tests {
             loaded_routes: ["openai".to_string()].into_iter().collect(),
             no_proxy_hosts: Vec::new(),
             intercept_ca_path: None,
+            intercept_ca_env_vars: crate::config::default_intercept_ca_env_vars(),
             diagnostics: vec![],
         };
         let config = ProxyConfig {
@@ -2216,6 +2302,7 @@ mod tests {
             loaded_routes: ["openai".to_string()].into_iter().collect(),
             no_proxy_hosts: Vec::new(),
             intercept_ca_path: None,
+            intercept_ca_env_vars: crate::config::default_intercept_ca_env_vars(),
             diagnostics: vec![],
         };
         let config = ProxyConfig {
@@ -2279,6 +2366,7 @@ mod tests {
             loaded_routes: ["openai".to_string()].into_iter().collect(),
             no_proxy_hosts: Vec::new(),
             intercept_ca_path: None,
+            intercept_ca_env_vars: crate::config::default_intercept_ca_env_vars(),
             diagnostics: vec![],
         };
         let config = ProxyConfig {
@@ -2364,6 +2452,7 @@ mod tests {
             loaded_routes: std::collections::HashSet::new(),
             no_proxy_hosts: Vec::new(),
             intercept_ca_path: None,
+            intercept_ca_env_vars: crate::config::default_intercept_ca_env_vars(),
             diagnostics: vec![],
         };
 
@@ -2457,6 +2546,7 @@ mod tests {
             loaded_routes: ["anthropic".to_string()].into_iter().collect(),
             no_proxy_hosts: Vec::new(),
             intercept_ca_path: None,
+            intercept_ca_env_vars: crate::config::default_intercept_ca_env_vars(),
             diagnostics: vec![],
         };
         let config_no_env_var = ProxyConfig {
@@ -2501,6 +2591,7 @@ mod tests {
             loaded_routes: ["anthropic".to_string()].into_iter().collect(),
             no_proxy_hosts: Vec::new(),
             intercept_ca_path: None,
+            intercept_ca_env_vars: crate::config::default_intercept_ca_env_vars(),
             diagnostics: vec![],
         };
         let config_fixed = ProxyConfig {
@@ -2549,6 +2640,7 @@ mod tests {
                 "opencode.internal:4096".to_string(),
             ],
             intercept_ca_path: None,
+            intercept_ca_env_vars: crate::config::default_intercept_ca_env_vars(),
             diagnostics: vec![],
         };
 
@@ -2579,6 +2671,7 @@ mod tests {
             loaded_routes: std::collections::HashSet::new(),
             no_proxy_hosts: Vec::new(),
             intercept_ca_path: None,
+            intercept_ca_env_vars: crate::config::default_intercept_ca_env_vars(),
             diagnostics: vec![],
         };
 

@@ -30,6 +30,7 @@ pub mod external;
 pub mod filter;
 pub mod forward;
 pub mod oauth2;
+pub mod oauth_capture;
 pub mod pool;
 pub mod reverse;
 pub mod route;

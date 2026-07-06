@@ -117,6 +117,7 @@ pub(crate) struct TlsInterceptIntent {
     #[cfg(target_os = "macos")]
     pub(crate) trust_proxy_ca: bool,
     pub(crate) ca_validity: Option<std::time::Duration>,
+    pub(crate) ca_env_vars: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -154,6 +155,10 @@ pub(crate) struct ProxyLaunchOptions {
     pub(crate) session_id: String,
     /// Supervisor-side CLI command credential-capture entries.
     pub(crate) credential_capture: HashMap<String, profile::CredentialCaptureEntry>,
+    /// Declarative OAuth provider definitions.
+    pub(crate) credential_providers: HashMap<String, profile::CredentialProviderDef>,
+    /// Declarative OAuth provider route bindings.
+    pub(crate) credential_routes: Vec<profile::CredentialRouteDef>,
     /// Enable HTTP/2 negotiation for upstream connections.
     pub(crate) enable_h2: bool,
 }
@@ -166,6 +171,7 @@ impl ProxyLaunchOptions {
                 .credentials
                 .as_ref()
                 .is_some_and(|credentials| !credentials.credentials.is_empty())
+            || !self.credential_routes.is_empty()
             || self.upstream_proxy.is_some()
     }
 }

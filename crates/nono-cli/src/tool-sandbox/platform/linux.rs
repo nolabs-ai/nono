@@ -1514,9 +1514,31 @@ fn handle_shim_stream_inner(
     // Resolve intercept action before consuming the active-count slot so
     // that Respond can return without forking a child process.
     let command_config = state.plan.config.commands.get(&request.command);
-    let intercept = command_config
-        .map(|cc| super::resolve_intercept_action(cc, &request.argv))
-        .unwrap_or_else(super::ResolvedInterceptAction::passthrough);
+    let intercept = match command_config {
+        Some(cc) => {
+            match super::resolve_intercept_action(cc, &request.argv, || {
+                filter_child_env(state, &request, policy)
+            }) {
+                Ok(intercept) => intercept,
+                Err(err) => {
+                    record_command_policy_audit(
+                        audit_recorder.as_ref(),
+                        &request,
+                        &state.redaction_policy,
+                        session_id,
+                        auth.peer_pid,
+                        session_root_pid,
+                        Some(&caller),
+                        "denied",
+                        Some(err.to_string()),
+                        None,
+                    )?;
+                    return Err(err);
+                }
+            }
+        }
+        None => super::ResolvedInterceptAction::passthrough(),
+    };
     let intercept_action = intercept.action;
 
     // A matched intercept rule may carry a sandbox that replaces the command's
@@ -5486,7 +5508,8 @@ mod tests {
             "tool".to_string(),
             CommandPolicyConfig {
                 intercept: vec![InterceptRuleConfig {
-                    args: vec![],
+                    args: Some(vec![]),
+                    match_config: None,
                     action: InterceptActionConfig::Exec {
                         command: vec![helper.to_string_lossy().into_owned()],
                     },

@@ -5,7 +5,7 @@
 //! phase 2 restructuring. Any future accidental reintroduction of the
 //! legacy patch namespace or legacy security subkeys will fail here.
 
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::collections::BTreeSet;
 
 fn load_schema() -> Value {
@@ -138,7 +138,8 @@ fn test_schema_command_policies_match_tool_sandbox_guide_shape() {
             "upstream",
         ],
     );
-    assert_schema_properties(&schema, "InterceptRuleConfig", &["action", "args"]);
+    assert_schema_properties(&schema, "InterceptRuleConfig", &["action", "args", "match"]);
+    assert_schema_properties(&schema, "InterceptRuleMatchConfig", &["argv", "env"]);
     assert_schema_properties(
         &schema,
         "CommandPolicyConfig",
@@ -204,6 +205,11 @@ fn test_schema_command_policies_match_tool_sandbox_guide_shape() {
         "ArgvMatcherConfig",
         &["contains", "exact", "prefix"],
     );
+    assert_schema_properties(
+        &schema,
+        "InterceptArgvMatcherConfig",
+        &["contains", "exact", "prefix"],
+    );
     assert_schema_properties(&schema, "EnvMatcherConfig", &["equals", "one_of"]);
     assert_schema_properties(
         &schema,
@@ -252,6 +258,155 @@ fn test_schema_command_policies_match_tool_sandbox_guide_shape() {
                 == Some("#/$defs/CommandEdgeConfig")),
         "CommandPolicyConfig.from must allow edge objects with sandbox and invocation_policy"
     );
+}
+
+#[test]
+fn test_schema_validates_intercept_match_rule() {
+    let schema = load_schema();
+    let validator = jsonschema::validator_for(&schema).expect("schema compiles");
+    let profile = json!({
+        "command_policies": {
+            "commands": {
+                "git": {
+                    "sandbox": {},
+                    "intercept": [{
+                        "match": {
+                            "argv": { "contains": ["push", "--force"] },
+                            "env": {
+                                "GIT_SSH_COMMAND": { "equals": "ssh -i /tmp/fake_key" }
+                            }
+                        },
+                        "action": { "type": "approve" }
+                    }]
+                }
+            }
+        }
+    });
+
+    validator
+        .validate(&profile)
+        .expect("intercept match rule should validate");
+}
+
+#[test]
+fn test_schema_rejects_intercept_args_and_match_together() {
+    let schema = load_schema();
+    let validator = jsonschema::validator_for(&schema).expect("schema compiles");
+    let profile = json!({
+        "command_policies": {
+            "commands": {
+                "git": {
+                    "sandbox": {},
+                    "intercept": [{
+                        "args": ["push"],
+                        "match": { "argv": { "prefix": ["push"] } },
+                        "action": { "type": "passthrough" }
+                    }]
+                }
+            }
+        }
+    });
+
+    assert!(
+        validator.validate(&profile).is_err(),
+        "intercept rule cannot define both args and match"
+    );
+}
+
+#[test]
+fn test_schema_rejects_empty_intercept_argv_matcher() {
+    let schema = load_schema();
+    let validator = jsonschema::validator_for(&schema).expect("schema compiles");
+    for argv in [
+        json!({ "exact": [] }),
+        json!({ "prefix": [] }),
+        json!({ "contains": [] }),
+    ] {
+        let profile = json!({
+            "command_policies": {
+                "commands": {
+                    "git": {
+                        "sandbox": {},
+                        "intercept": [{
+                            "match": { "argv": argv },
+                            "action": { "type": "passthrough" }
+                        }]
+                    }
+                }
+            }
+        });
+
+        assert!(
+            validator.validate(&profile).is_err(),
+            "intercept argv matcher arrays cannot be empty"
+        );
+    }
+}
+
+#[test]
+fn test_schema_rejects_invalid_intercept_argv_matcher_shape() {
+    let schema = load_schema();
+    let validator = jsonschema::validator_for(&schema).expect("schema compiles");
+    for argv in [
+        json!({}),
+        json!({ "exact": ["push"], "prefix": ["push"] }),
+        json!({ "exact": ["push"], "contains": ["push"] }),
+        json!({ "prefix": ["push"], "contains": ["push"] }),
+    ] {
+        let profile = json!({
+            "command_policies": {
+                "commands": {
+                    "git": {
+                        "sandbox": {},
+                        "intercept": [{
+                            "match": { "argv": argv },
+                            "action": { "type": "passthrough" }
+                        }]
+                    }
+                }
+            }
+        });
+
+        assert!(
+            validator.validate(&profile).is_err(),
+            "intercept argv matcher must define exactly one matcher"
+        );
+    }
+}
+
+#[test]
+fn test_schema_allows_empty_invocation_argv_matcher_for_compatibility() {
+    let schema = load_schema();
+    let validator = jsonschema::validator_for(&schema).expect("schema compiles");
+    for argv in [
+        json!({ "exact": [] }),
+        json!({ "prefix": [] }),
+        json!({ "contains": [] }),
+    ] {
+        let profile = json!({
+            "command_policies": {
+                "commands": {
+                    "git": {
+                        "sandbox": {},
+                        "from": {
+                            "session": {
+                                "sandbox": {},
+                                "invocation_policy": {
+                                    "approve": [{
+                                        "argv": argv
+                                    }]
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        validator
+            .validate(&profile)
+            .expect("empty invocation argv matcher remains schema-compatible");
+    }
 }
 
 #[test]

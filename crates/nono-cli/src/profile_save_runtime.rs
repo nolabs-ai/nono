@@ -1958,7 +1958,8 @@ mod tests {
             "git".to_string(),
             CommandPolicyConfig {
                 intercept: vec![InterceptRuleConfig {
-                    args: vec!["push".to_string()],
+                    args: Some(vec!["push".to_string()]),
+                    match_config: None,
                     action: InterceptActionConfig::Passthrough,
                     sandbox: Some(CommandSandboxConfig {
                         unsafe_macos_seatbelt_rules: vec!["(allow iokit-open)".to_string()],

@@ -421,15 +421,21 @@ pub enum InterceptActionConfig {
 
 /// A sub-command mediation rule on a [`CommandPolicyConfig`].
 ///
-/// Rules are evaluated in order; the first match wins. An empty `args` list
-/// is a catch-all and must appear last in the list. If no rule matches the
-/// default action is `Passthrough`.
+/// Rules are evaluated in order; the first match wins. Legacy `args` matches a
+/// contiguous argument sequence. Predicate `match` rules can match argv and/or
+/// env. An explicit empty `args` list is a catch-all and must appear last in the
+/// list. If no rule matches the default action is `Passthrough`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct InterceptRuleConfig {
     /// Contiguous argument sequence to match within argv[1..] of the shim invocation.
     /// An empty list is a catch-all.
-    pub args: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub args: Option<Vec<String>>,
+    /// Explicit predicate match for argv and/or env. Serialized as `match` in
+    /// profile JSON because that is the user-facing policy term.
+    #[serde(rename = "match", default, skip_serializing_if = "Option::is_none")]
+    pub match_config: Option<InterceptRuleMatchConfig>,
     /// Action to take when this rule matches.
     #[serde(default)]
     pub action: InterceptActionConfig,
@@ -439,6 +445,15 @@ pub struct InterceptRuleConfig {
     /// omitting `credentials`/`use_credentials` injects none here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox: Option<CommandSandboxConfig>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct InterceptRuleMatchConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub argv: Option<ArgvMatcherConfig>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, EnvMatcherConfig>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -1340,8 +1355,28 @@ fn validate_intercept_rules(
                 ),
             );
         }
-        if rule.args.is_empty() {
-            saw_catch_all = true;
+        let label = format!("commands.{command_name}.intercept[{i}]");
+        match (&rule.args, &rule.match_config) {
+            (Some(_), Some(_)) => {
+                report.error(
+                    "invalid_intercept_matcher",
+                    format!("{label} must define either args or match, not both"),
+                );
+            }
+            (None, None) => {
+                report.error(
+                    "invalid_intercept_matcher",
+                    format!("{label} must define args or match"),
+                );
+            }
+            (Some(args), None) => {
+                if args.is_empty() {
+                    saw_catch_all = true;
+                }
+            }
+            (None, Some(match_config)) => {
+                validate_intercept_matcher(&label, match_config, report);
+            }
         }
         if let InterceptActionConfig::Respond { stdout } = &rule.action
             && stdout.len() > 1024 * 1024
@@ -1405,6 +1440,23 @@ fn validate_intercept_rules(
             validate_exec_action(command_name, i, command, report);
         }
     }
+}
+
+fn validate_intercept_matcher(
+    label: &str,
+    matcher: &InterceptRuleMatchConfig,
+    report: &mut CommandPolicyValidationReport,
+) {
+    if matcher.argv.is_none() && matcher.env.is_empty() {
+        report.error(
+            "invalid_intercept_matcher",
+            format!("{label}.match must define argv or env"),
+        );
+    }
+    if let Some(argv) = &matcher.argv {
+        validate_argv_matcher(label, "invalid_intercept_matcher", argv, true, report);
+    }
+    validate_env_matchers(label, "invalid_intercept_env_matcher", &matcher.env, report);
 }
 
 /// Validate an `exec` intercept action's `command`.
@@ -1861,47 +1913,75 @@ fn validate_invocation_rule(
     validate_positive_timeout(label, rule.timeout_secs, report);
 
     if let Some(argv) = &rule.argv {
-        let matcher_count = usize::from(argv.exact.is_some())
-            + usize::from(argv.prefix.is_some())
-            + usize::from(argv.contains.is_some());
-        if matcher_count != 1 {
-            report.error(
-                "invalid_invocation_matcher",
-                format!("{label} must define exactly one argv matcher"),
-            );
+        validate_argv_matcher(label, "invalid_invocation_matcher", argv, false, report);
+    }
+
+    validate_env_matchers(label, "invalid_invocation_env_matcher", &rule.env, report);
+}
+
+fn validate_argv_matcher(
+    label: &str,
+    code: &'static str,
+    argv: &ArgvMatcherConfig,
+    reject_empty_matcher: bool,
+    report: &mut CommandPolicyValidationReport,
+) {
+    let matcher_count = usize::from(argv.exact.is_some())
+        + usize::from(argv.prefix.is_some())
+        + usize::from(argv.contains.is_some());
+    if matcher_count != 1 {
+        report.error(
+            code,
+            format!("{label} must define exactly one argv matcher"),
+        );
+    }
+    for value in argv
+        .exact
+        .iter()
+        .chain(argv.prefix.iter())
+        .chain(argv.contains.iter())
+        .flat_map(|values| values.iter())
+    {
+        if value.contains('\0') {
+            report.error(code, format!("{label} argv matcher contains NUL"));
         }
-        for value in argv
+    }
+    if reject_empty_matcher {
+        for values in argv
             .exact
             .iter()
             .chain(argv.prefix.iter())
             .chain(argv.contains.iter())
-            .flat_map(|values| values.iter())
         {
-            if value.contains('\0') {
-                report.error(
-                    "invalid_invocation_matcher",
-                    format!("{label} argv matcher contains NUL"),
-                );
+            if values.is_empty() {
+                report.error(code, format!("{label} argv matcher cannot be empty"));
             }
         }
     }
+}
 
-    for (name, matcher) in &rule.env {
+fn validate_env_matchers(
+    label: &str,
+    code: &'static str,
+    env: &BTreeMap<String, EnvMatcherConfig>,
+    report: &mut CommandPolicyValidationReport,
+) {
+    for (name, matcher) in env {
         if !valid_env_matcher_name(name) {
             report.error(
-                "invalid_invocation_env_matcher",
+                code,
                 format!("{label} env matcher has invalid name '{name}'"),
             );
         }
         if matcher.equals.is_none() && matcher.one_of.is_empty() {
             report.error(
-                "invalid_invocation_env_matcher",
+                code,
                 format!("{label} env matcher for '{name}' must define equals or one_of"),
             );
         }
         if matcher.equals.is_some() && !matcher.one_of.is_empty() {
             report.error(
-                "invalid_invocation_env_matcher",
+                code,
                 format!("{label} env matcher for '{name}' cannot define both equals and one_of"),
             );
         }
@@ -4010,7 +4090,8 @@ mod tests {
         let mut config = active_git_config();
         let git = config.commands.get_mut("git").expect("git command");
         git.intercept.push(InterceptRuleConfig {
-            args: vec!["auth".to_string(), "switch".to_string()],
+            args: Some(vec!["auth".to_string(), "switch".to_string()]),
+            match_config: None,
             action: InterceptActionConfig::Exec { command },
             sandbox: None,
         });
@@ -4121,7 +4202,8 @@ mod tests {
         );
         let git = config.commands.get_mut("git").expect("git command");
         git.intercept.push(InterceptRuleConfig {
-            args: vec!["auth".to_string(), "token".to_string()],
+            args: Some(vec!["auth".to_string(), "token".to_string()]),
+            match_config: None,
             action: InterceptActionConfig::CaptureCredential {
                 credential: "github".to_string(),
                 grant_to: vec![],
@@ -4150,7 +4232,8 @@ mod tests {
         );
         let git = config.commands.get_mut("git").expect("git command");
         git.intercept.push(InterceptRuleConfig {
-            args: vec!["auth".to_string(), "token".to_string()],
+            args: Some(vec!["auth".to_string(), "token".to_string()]),
+            match_config: None,
             action: InterceptActionConfig::CaptureCredential {
                 credential: "agent".to_string(),
                 grant_to: vec![],
@@ -4170,12 +4253,14 @@ mod tests {
     #[test]
     fn intercept_rule_merge_child_appends_child_rules() {
         let parent_rule = InterceptRuleConfig {
-            args: vec!["push".to_string()],
+            args: Some(vec!["push".to_string()]),
+            match_config: None,
             action: InterceptActionConfig::Approve { timeout_secs: None },
             sandbox: None,
         };
         let child_rule = InterceptRuleConfig {
-            args: vec!["fetch".to_string()],
+            args: Some(vec!["fetch".to_string()]),
+            match_config: None,
             action: InterceptActionConfig::Passthrough,
             sandbox: None,
         };
@@ -4194,7 +4279,8 @@ mod tests {
     #[test]
     fn intercept_rule_merge_child_does_not_duplicate() {
         let rule = InterceptRuleConfig {
-            args: vec!["push".to_string()],
+            args: Some(vec!["push".to_string()]),
+            match_config: None,
             action: InterceptActionConfig::Passthrough,
             sandbox: None,
         };
@@ -4216,12 +4302,14 @@ mod tests {
         if let Some(git) = config.commands.get_mut("git") {
             git.intercept = vec![
                 InterceptRuleConfig {
-                    args: vec![],
+                    args: Some(vec![]),
+                    match_config: None,
                     action: InterceptActionConfig::Passthrough,
                     sandbox: None,
                 },
                 InterceptRuleConfig {
-                    args: vec!["push".to_string()],
+                    args: Some(vec!["push".to_string()]),
+                    match_config: None,
                     action: InterceptActionConfig::Approve { timeout_secs: None },
                     sandbox: None,
                 },
@@ -4244,12 +4332,14 @@ mod tests {
         if let Some(git) = config.commands.get_mut("git") {
             git.intercept = vec![
                 InterceptRuleConfig {
-                    args: vec!["push".to_string()],
+                    args: Some(vec!["push".to_string()]),
+                    match_config: None,
                     action: InterceptActionConfig::Approve { timeout_secs: None },
                     sandbox: None,
                 },
                 InterceptRuleConfig {
-                    args: vec![],
+                    args: Some(vec![]),
+                    match_config: None,
                     action: InterceptActionConfig::Passthrough,
                     sandbox: None,
                 },
@@ -4267,11 +4357,285 @@ mod tests {
     }
 
     #[test]
+    fn validate_intercept_match_only_rule_is_valid() {
+        let mut config = active_git_config();
+        if let Some(git) = config.commands.get_mut("git") {
+            git.intercept = vec![InterceptRuleConfig {
+                args: None,
+                match_config: Some(InterceptRuleMatchConfig {
+                    argv: Some(ArgvMatcherConfig {
+                        exact: None,
+                        prefix: None,
+                        contains: Some(vec!["push".to_string(), "--force".to_string()]),
+                    }),
+                    env: BTreeMap::from([(
+                        "GIT_SSH_COMMAND".to_string(),
+                        EnvMatcherConfig {
+                            one_of: Vec::new(),
+                            equals: Some("ssh -i /tmp/fake_key".to_string()),
+                        },
+                    )]),
+                }),
+                action: InterceptActionConfig::Approve { timeout_secs: None },
+                sandbox: None,
+            }];
+        }
+
+        let report =
+            validate_command_policies(Some(&config), CommandPolicyValidationScope::Resolved);
+
+        assert!(
+            !report
+                .errors
+                .iter()
+                .any(|f| f.code.starts_with("invalid_intercept")),
+            "unexpected intercept matcher validation error: {:?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn validate_intercept_rejects_args_and_match_together() {
+        let mut config = active_git_config();
+        if let Some(git) = config.commands.get_mut("git") {
+            git.intercept = vec![InterceptRuleConfig {
+                args: Some(vec!["push".to_string()]),
+                match_config: Some(InterceptRuleMatchConfig {
+                    argv: Some(ArgvMatcherConfig {
+                        exact: None,
+                        prefix: Some(vec!["push".to_string()]),
+                        contains: None,
+                    }),
+                    env: BTreeMap::new(),
+                }),
+                action: InterceptActionConfig::Passthrough,
+                sandbox: None,
+            }];
+        }
+
+        let report =
+            validate_command_policies(Some(&config), CommandPolicyValidationScope::Resolved);
+
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|f| f.code == "invalid_intercept_matcher"
+                    && f.message.contains("either args or match")),
+            "expected args+match rejection: {:?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn validate_intercept_rejects_missing_matcher() {
+        let mut config = active_git_config();
+        if let Some(git) = config.commands.get_mut("git") {
+            git.intercept = vec![InterceptRuleConfig {
+                args: None,
+                match_config: None,
+                action: InterceptActionConfig::Passthrough,
+                sandbox: None,
+            }];
+        }
+
+        let report =
+            validate_command_policies(Some(&config), CommandPolicyValidationScope::Resolved);
+
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|f| f.code == "invalid_intercept_matcher"
+                    && f.message.contains("must define args or match")),
+            "expected missing matcher rejection: {:?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn validate_intercept_rejects_empty_match_object() {
+        let mut config = active_git_config();
+        if let Some(git) = config.commands.get_mut("git") {
+            git.intercept = vec![InterceptRuleConfig {
+                args: None,
+                match_config: Some(InterceptRuleMatchConfig::default()),
+                action: InterceptActionConfig::Passthrough,
+                sandbox: None,
+            }];
+        }
+
+        let report =
+            validate_command_policies(Some(&config), CommandPolicyValidationScope::Resolved);
+
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|f| f.code == "invalid_intercept_matcher"
+                    && f.message.contains("must define argv or env")),
+            "expected empty match rejection: {:?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn validate_intercept_reuses_argv_and_env_matcher_validation() {
+        let mut config = active_git_config();
+        if let Some(git) = config.commands.get_mut("git") {
+            git.intercept = vec![InterceptRuleConfig {
+                args: None,
+                match_config: Some(InterceptRuleMatchConfig {
+                    argv: Some(ArgvMatcherConfig {
+                        exact: Some(vec!["push".to_string()]),
+                        prefix: Some(vec!["push".to_string()]),
+                        contains: None,
+                    }),
+                    env: BTreeMap::from([(
+                        "BAD=NAME".to_string(),
+                        EnvMatcherConfig {
+                            one_of: Vec::new(),
+                            equals: None,
+                        },
+                    )]),
+                }),
+                action: InterceptActionConfig::Passthrough,
+                sandbox: None,
+            }];
+        }
+
+        let report =
+            validate_command_policies(Some(&config), CommandPolicyValidationScope::Resolved);
+
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|f| f.code == "invalid_intercept_matcher"
+                    && f.message.contains("exactly one argv matcher")),
+            "expected argv matcher validation: {:?}",
+            report.errors
+        );
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|f| f.code == "invalid_intercept_env_matcher"
+                    && f.message.contains("invalid name")),
+            "expected env name validation: {:?}",
+            report.errors
+        );
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|f| f.code == "invalid_intercept_env_matcher"
+                    && f.message.contains("must define equals or one_of")),
+            "expected env matcher validation: {:?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn validate_intercept_rejects_empty_argv_matcher() {
+        for argv in [
+            ArgvMatcherConfig {
+                exact: Some(Vec::new()),
+                prefix: None,
+                contains: None,
+            },
+            ArgvMatcherConfig {
+                exact: None,
+                prefix: Some(Vec::new()),
+                contains: None,
+            },
+            ArgvMatcherConfig {
+                exact: None,
+                prefix: None,
+                contains: Some(Vec::new()),
+            },
+        ] {
+            let mut config = active_git_config();
+            if let Some(git) = config.commands.get_mut("git") {
+                git.intercept = vec![InterceptRuleConfig {
+                    args: None,
+                    match_config: Some(InterceptRuleMatchConfig {
+                        argv: Some(argv),
+                        env: BTreeMap::new(),
+                    }),
+                    action: InterceptActionConfig::Passthrough,
+                    sandbox: None,
+                }];
+            }
+
+            let report =
+                validate_command_policies(Some(&config), CommandPolicyValidationScope::Resolved);
+
+            assert!(
+                report
+                    .errors
+                    .iter()
+                    .any(|f| f.code == "invalid_intercept_matcher"
+                        && f.message.contains("cannot be empty")),
+                "expected empty argv matcher validation: {:?}",
+                report.errors
+            );
+        }
+    }
+
+    #[test]
+    fn validate_invocation_allows_empty_argv_matcher_for_compatibility() {
+        for argv in [
+            ArgvMatcherConfig {
+                exact: Some(Vec::new()),
+                prefix: None,
+                contains: None,
+            },
+            ArgvMatcherConfig {
+                exact: None,
+                prefix: Some(Vec::new()),
+                contains: None,
+            },
+            ArgvMatcherConfig {
+                exact: None,
+                prefix: None,
+                contains: Some(Vec::new()),
+            },
+        ] {
+            let mut report = CommandPolicyValidationReport::default();
+            let rule = InvocationRuleConfig {
+                argv: Some(argv),
+                env: BTreeMap::new(),
+                backend: None,
+                reason: None,
+                timeout_secs: None,
+            };
+            validate_invocation_rule(
+                "commands.git.from.session.invocation_policy.approve[0]",
+                "approve",
+                &rule,
+                &CommandPoliciesConfig::default(),
+                &mut report,
+            );
+
+            assert!(
+                !report
+                    .errors
+                    .iter()
+                    .any(|f| f.code == "invalid_invocation_matcher"),
+                "empty invocation argv matcher must remain compatible: {:?}",
+                report.errors
+            );
+        }
+    }
+
+    #[test]
     fn validate_intercept_respond_stdout_too_large() {
         let mut config = active_git_config();
         if let Some(git) = config.commands.get_mut("git") {
             git.intercept = vec![InterceptRuleConfig {
-                args: vec![],
+                args: Some(vec![]),
+                match_config: None,
                 action: InterceptActionConfig::Respond {
                     stdout: "x".repeat(1024 * 1024 + 1),
                 },
@@ -4324,7 +4688,8 @@ mod tests {
     #[test]
     fn intercept_rule_omits_absent_sandbox_override() {
         let rule = InterceptRuleConfig {
-            args: vec!["status".to_string()],
+            args: Some(vec!["status".to_string()]),
+            match_config: None,
             action: InterceptActionConfig::Passthrough,
             sandbox: None,
         };
@@ -4333,6 +4698,45 @@ mod tests {
             !serialized.contains("sandbox"),
             "absent sandbox override should be skipped in serialization: {serialized}"
         );
+    }
+
+    #[test]
+    fn intercept_match_rule_omits_absent_predicate_fields() {
+        let argv_rule = InterceptRuleConfig {
+            args: None,
+            match_config: Some(InterceptRuleMatchConfig {
+                argv: Some(ArgvMatcherConfig {
+                    exact: None,
+                    prefix: Some(vec!["push".to_string()]),
+                    contains: None,
+                }),
+                env: BTreeMap::new(),
+            }),
+            action: InterceptActionConfig::Approve { timeout_secs: None },
+            sandbox: None,
+        };
+        let argv_json = serde_json::to_value(&argv_rule).expect("serialize argv-only match rule");
+        assert!(argv_json["match"].get("argv").is_some());
+        assert!(argv_json["match"].get("env").is_none());
+
+        let env_rule = InterceptRuleConfig {
+            args: None,
+            match_config: Some(InterceptRuleMatchConfig {
+                argv: None,
+                env: BTreeMap::from([(
+                    "GIT_SSH_COMMAND".to_string(),
+                    EnvMatcherConfig {
+                        one_of: Vec::new(),
+                        equals: Some("ssh -i /tmp/fake_key".to_string()),
+                    },
+                )]),
+            }),
+            action: InterceptActionConfig::Approve { timeout_secs: None },
+            sandbox: None,
+        };
+        let env_json = serde_json::to_value(&env_rule).expect("serialize env-only match rule");
+        assert!(env_json["match"].get("argv").is_none());
+        assert!(env_json["match"].get("env").is_some());
     }
 
     #[test]
@@ -4353,7 +4757,8 @@ mod tests {
                     })),
                 )]),
                 intercept: vec![InterceptRuleConfig {
-                    args: vec!["push".to_string()],
+                    args: Some(vec!["push".to_string()]),
+                    match_config: None,
                     action: InterceptActionConfig::Passthrough,
                     sandbox: Some(CommandSandboxConfig {
                         unsafe_macos_seatbelt_rules: vec!["(allow intercept-sandbox)".to_string()],
@@ -4406,7 +4811,8 @@ mod tests {
                     })),
                 )]),
                 intercept: vec![InterceptRuleConfig {
-                    args: vec!["push".to_string()],
+                    args: Some(vec!["push".to_string()]),
+                    match_config: None,
                     action: InterceptActionConfig::Passthrough,
                     sandbox: Some(CommandSandboxConfig {
                         unsafe_macos_seatbelt_rules: vec!["(allow intercept-sandbox)".to_string()],
@@ -4443,7 +4849,8 @@ mod tests {
         );
         let git = config.commands.get_mut("git").expect("git command");
         git.intercept.push(InterceptRuleConfig {
-            args: vec!["status".to_string()],
+            args: Some(vec!["status".to_string()]),
+            match_config: None,
             action: InterceptActionConfig::Passthrough,
             sandbox: Some(CommandSandboxConfig {
                 fs_read: vec![".".to_string()],
@@ -4463,7 +4870,8 @@ mod tests {
         let mut config = active_git_config();
         let git = config.commands.get_mut("git").expect("git command");
         git.intercept.push(InterceptRuleConfig {
-            args: vec!["status".to_string()],
+            args: Some(vec!["status".to_string()]),
+            match_config: None,
             action: InterceptActionConfig::Passthrough,
             sandbox: Some(CommandSandboxConfig {
                 use_credentials: vec!["does-not-exist".to_string()],
@@ -4490,7 +4898,8 @@ mod tests {
         let mut config = active_git_config();
         let git = config.commands.get_mut("git").expect("git command");
         git.intercept.push(InterceptRuleConfig {
-            args: vec!["status".to_string()],
+            args: Some(vec!["status".to_string()]),
+            match_config: None,
             action: InterceptActionConfig::Respond {
                 stdout: String::new(),
             },
@@ -4527,7 +4936,8 @@ mod tests {
         // capture_credential launches the real binary, so a sandbox override is
         // meaningful and must be accepted.
         git.intercept.push(InterceptRuleConfig {
-            args: vec!["status".to_string()],
+            args: Some(vec!["status".to_string()]),
+            match_config: None,
             action: InterceptActionConfig::CaptureCredential {
                 credential: "github".to_string(),
                 grant_to: Vec::new(),
@@ -4574,7 +4984,8 @@ mod tests {
         if let Some(git) = config.commands.get_mut("git") {
             git.sandbox = None;
             git.intercept = vec![InterceptRuleConfig {
-                args: vec!["push".to_string()],
+                args: Some(vec!["push".to_string()]),
+                match_config: None,
                 action: InterceptActionConfig::Approve {
                     timeout_secs: Some(0),
                 },

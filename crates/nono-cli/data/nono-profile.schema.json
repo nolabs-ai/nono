@@ -1384,14 +1384,28 @@
     "InterceptRuleConfig": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["args"],
+      "oneOf": [{ "required": ["args"] }, { "required": ["match"] }],
       "properties": {
         "args": {
           "type": "array",
           "items": { "type": "string" },
           "description": "Contiguous argument sequence matched within argv[1..]. An empty list is a catch-all and must be last. Broad single-argument rules such as [\"--force\"] match anywhere in the invocation, not only at the subcommand position."
         },
+        "match": { "$ref": "#/$defs/InterceptRuleMatchConfig" },
         "action": { "$ref": "#/$defs/InterceptActionConfig" }
+      }
+    },
+    "InterceptRuleMatchConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "anyOf": [{ "required": ["argv"] }, { "required": ["env"] }],
+      "properties": {
+        "argv": { "$ref": "#/$defs/InterceptArgvMatcherConfig" },
+        "env": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": { "$ref": "#/$defs/EnvMatcherConfig" }
+        }
       }
     },
     "InterceptActionConfig": {
@@ -1690,6 +1704,47 @@
         },
         "contains": {
           "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "InterceptArgvMatcherConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "required": ["exact"],
+          "not": {
+            "anyOf": [{ "required": ["prefix"] }, { "required": ["contains"] }]
+          }
+        },
+        {
+          "required": ["prefix"],
+          "not": {
+            "anyOf": [{ "required": ["exact"] }, { "required": ["contains"] }]
+          }
+        },
+        {
+          "required": ["contains"],
+          "not": {
+            "anyOf": [{ "required": ["exact"] }, { "required": ["prefix"] }]
+          }
+        }
+      ],
+      "properties": {
+        "exact": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string" }
+        },
+        "prefix": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string" }
+        },
+        "contains": {
+          "type": "array",
+          "minItems": 1,
           "items": { "type": "string" }
         }
       }

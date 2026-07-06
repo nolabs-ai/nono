@@ -111,7 +111,7 @@ An `intercept` rule may carry an optional `sandbox` (the same object described a
 
 ### Intercept Actions
 
-Each `intercept` entry is `{ "args": [...], "action": { "type": ... } }`. Rules are evaluated in order; the first whose `args` appear as a contiguous sequence in the invocation's arguments wins (an empty `args` is a catch-all). This lets subcommand rules match after command-global options, such as `git -c foo=bar push --force`. The `action.type` selects how the matched subcommand is handled:
+Each `intercept` entry is `{ "args": [...], "action": { "type": ... } }`. Rules are evaluated in order; the first whose `args` appear as a contiguous sequence in the invocation's arguments wins (an empty `args` is a catch-all). This lets subcommand rules match after command-global options, such as `git -c foo=bar push --force`. Broad single-argument rules like `["--force"]` match anywhere in the invocation, not only at the subcommand position. The `action.type` selects how the matched subcommand is handled:
 
 | `action.type` | Behavior |
 |---|---|

@@ -57,7 +57,6 @@ pub(super) fn resolve_intercept_action<'a>(
     ResolvedInterceptAction::passthrough()
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn intercept_args_match(expected_args: &[String], shim_args: &[&[u8]]) -> bool {
     expected_args.is_empty()
         || (shim_args.len() >= expected_args.len()

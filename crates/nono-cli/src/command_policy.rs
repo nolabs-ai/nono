@@ -427,7 +427,7 @@ pub enum InterceptActionConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct InterceptRuleConfig {
-    /// Argument prefix to match against argv[1..] of the shim invocation.
+    /// Contiguous argument sequence to match within argv[1..] of the shim invocation.
     /// An empty list is a catch-all.
     pub args: Vec<String>,
     /// Action to take when this rule matches.

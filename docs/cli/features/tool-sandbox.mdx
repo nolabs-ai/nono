@@ -63,7 +63,7 @@ Each entry under `commands` uses the command name as the key:
 | `can_use` | command-name array | Other commands this command may invoke through Tool Sandbox. If no self-invocation entry is configured, self-invocation keeps the current effective policy. |
 | `executable` | absolute path | Pin the command name to one executable file instead of the first `PATH` match. |
 | `allow_writable_executable` | boolean | Per-command trust downgrade for a pinned executable writable by the sandbox capability set. Requires absolute `executable`. |
-| `intercept` | array | Ordered argument-prefix mediation rules evaluated after invocation policy. |
+| `intercept` | array | Ordered argument-sequence mediation rules evaluated after invocation policy. |
 | `allow_direct_exec_bypass` | absolute path array | Compatibility escape hatch for direct canonical-path invocation. |
 | `allow_direct_exec_bypass_with_credentials` | boolean | Required when a credential-using command also allows direct exec bypass. |
 
@@ -111,7 +111,7 @@ An `intercept` rule may carry an optional `sandbox` (the same object described a
 
 ### Intercept Actions
 
-Each `intercept` entry is `{ "args": [...], "action": { "type": ... } }`. Rules are evaluated in order; the first whose `args` are a prefix of the invocation's arguments wins (an empty `args` is a catch-all). The `action.type` selects how the matched subcommand is handled:
+Each `intercept` entry is `{ "args": [...], "action": { "type": ... } }`. Rules are evaluated in order; the first whose `args` appear as a contiguous sequence in the invocation's arguments wins (an empty `args` is a catch-all). This lets subcommand rules match after command-global options, such as `git -c foo=bar push --force`. The `action.type` selects how the matched subcommand is handled:
 
 | `action.type` | Behavior |
 |---|---|

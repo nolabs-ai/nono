@@ -45,13 +45,7 @@ pub(super) fn resolve_intercept_action<'a>(
                 sandbox: rule.sandbox.as_ref(),
             };
         }
-        if shim_args.len() >= rule.args.len()
-            && rule
-                .args
-                .iter()
-                .zip(shim_args.iter())
-                .all(|(expected, actual)| expected.as_bytes() == *actual)
-        {
+        if intercept_args_match(&rule.args, &shim_args) {
             return ResolvedInterceptAction {
                 action: &rule.action,
                 rule_args: Some(&rule.args),
@@ -61,6 +55,18 @@ pub(super) fn resolve_intercept_action<'a>(
     }
 
     ResolvedInterceptAction::passthrough()
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn intercept_args_match(expected_args: &[String], shim_args: &[&[u8]]) -> bool {
+    expected_args.is_empty()
+        || (shim_args.len() >= expected_args.len()
+            && shim_args.windows(expected_args.len()).any(|window| {
+                expected_args
+                    .iter()
+                    .zip(window.iter())
+                    .all(|(expected, actual)| expected.as_bytes() == *actual)
+            }))
 }
 
 /// Resolve the env-expanded helper path and forwarded extra args for an `exec`
@@ -586,6 +592,60 @@ mod intercept_tests {
         assert!(matches!(
             resolved.action,
             InterceptActionConfig::Approve { .. }
+        ));
+    }
+
+    #[test]
+    fn resolve_intercept_action_matches_after_leading_global_args() {
+        let config = CommandPolicyConfig {
+            intercept: vec![InterceptRuleConfig {
+                args: vec!["push".to_string(), "--force".to_string()],
+                action: InterceptActionConfig::Approve { timeout_secs: None },
+                sandbox: None,
+            }],
+            ..CommandPolicyConfig::default()
+        };
+        let argv = vec![
+            b"git".to_vec(),
+            b"-c".to_vec(),
+            b"foo=bar".to_vec(),
+            b"push".to_vec(),
+            b"--force".to_vec(),
+        ];
+
+        let resolved = resolve_intercept_action(&config, &argv);
+
+        assert_eq!(resolved.rule_label(), "push --force");
+        assert!(matches!(
+            resolved.action,
+            InterceptActionConfig::Approve { .. }
+        ));
+    }
+
+    #[test]
+    fn resolve_intercept_action_falls_through_when_rule_sequence_is_absent() {
+        let config = CommandPolicyConfig {
+            intercept: vec![InterceptRuleConfig {
+                args: vec!["push".to_string(), "--force".to_string()],
+                action: InterceptActionConfig::Approve { timeout_secs: None },
+                sandbox: None,
+            }],
+            ..CommandPolicyConfig::default()
+        };
+        let argv = vec![
+            b"git".to_vec(),
+            b"-c".to_vec(),
+            b"foo=bar".to_vec(),
+            b"pull".to_vec(),
+            b"--force".to_vec(),
+        ];
+
+        let resolved = resolve_intercept_action(&config, &argv);
+
+        assert_eq!(resolved.rule_label(), "passthrough");
+        assert!(matches!(
+            resolved.action,
+            InterceptActionConfig::Passthrough
         ));
     }
 

@@ -1935,18 +1935,17 @@ fn build_child_launch_spec_for_binary(
             path: cwd.clone(),
             source,
         })?;
-    // Bound the command's live cwd to the agent's own granted filesystem
-    // (rejecting a cwd outside it), and learn whether the agent can write it so
-    // the command's cwd write access can be capped (write non-escalation, see
-    // add_policy_fs).
-    let cwd_agent_writable = super::admit_command_cwd(
+    // Bound the command's live cwd to the agent's own granted filesystem;
+    // rejects a cwd outside it (write non-escalation for cwd-scoped policy
+    // grants is enforced per-path in add_policy_fs).
+    super::admit_command_cwd(
         &request.command,
         &cwd,
         &state.policy_root,
         &state.outer_caps,
         &state.deny_paths,
     )?;
-    let mut caps = build_child_caps(state, binary, policy, request, &cwd, cwd_agent_writable)?;
+    let mut caps = build_child_caps(state, binary, policy, request, &cwd)?;
     caps.deduplicate();
 
     Ok(ToolSandboxChildLaunchSpec {
@@ -2004,7 +2003,6 @@ fn build_child_caps(
     policy: &CommandSandboxConfig,
     request: &ToolSandboxShimRequest,
     cwd: &Path,
-    cwd_agent_writable: bool,
 ) -> Result<CapabilitySet> {
     let mut caps = CapabilitySet::new().block_network();
     caps.add_fs(FsCapability::new_file(
@@ -2020,7 +2018,8 @@ fn build_child_caps(
         policy,
         &state.policy_root,
         cwd,
-        cwd_agent_writable,
+        &state.outer_caps,
+        &state.deny_paths,
     )?;
     // When the command was granted a keychain DB file (e.g. login.keychain-db),
     // reuse the main-path keychain mechanism: add the WAL/SHM/`.fl`/`user.kb`
@@ -2425,15 +2424,22 @@ fn add_policy_fs(
     policy: &CommandSandboxConfig,
     policy_root: &Path,
     cwd: &Path,
-    cwd_agent_writable: bool,
+    outer_caps: &CapabilitySet,
+    deny_paths: &[PathBuf],
 ) -> Result<()> {
     use super::dynamic_providers::expand_dynamic_tokens;
-    // A write grant that resolves under the live cwd is downgraded to read when
-    // the agent itself cannot write the cwd, so a command's cwd access never
-    // exceeds the agent's (write non-escalation). Grants outside the cwd (e.g.
-    // `$WORKDIR`, absolute paths) are unaffected.
+    // A write grant that resolves under the live cwd is downgraded to read
+    // unless the agent itself can write that exact resolved path, so a
+    // command's cwd access never exceeds the agent's own (write
+    // non-escalation). Checked per resolved path, not just the cwd as a
+    // whole, so a subdirectory the agent can explicitly write stays
+    // writable even when the surrounding cwd itself is not. Grants outside
+    // the cwd (e.g. `$WORKDIR`, absolute paths) are unaffected.
     let write_access = |path: &Path| {
-        if !cwd_agent_writable && super::lexically_normalize(path).starts_with(cwd) {
+        let normalized = super::lexically_normalize(path);
+        if normalized.starts_with(cwd)
+            && !super::agent_can_write(&normalized, policy_root, outer_caps, deny_paths)
+        {
             AccessMode::Read
         } else {
             AccessMode::ReadWrite

@@ -146,6 +146,100 @@ pub(crate) fn lexically_normalize(path: &std::path::Path) -> std::path::PathBuf 
     normalized
 }
 
+/// Whether the agent's own filesystem grants admit *writing* `path` directly.
+///
+/// True when `path` is (or is under) the agent's own `--workdir`
+/// (`policy_root`, always writable by the agent), or when the agent holds an
+/// explicit write grant covering `path` and no deny path covers it. Used to
+/// check each policy write-grant against the agent's actual capabilities
+/// individually, rather than a single verdict for the whole live cwd — a
+/// grant on a subdirectory the agent can write should stay writable even
+/// when the surrounding cwd itself is not agent-writable.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn agent_can_write(
+    path: &std::path::Path,
+    policy_root: &std::path::Path,
+    outer_caps: &nono::CapabilitySet,
+    deny_paths: &[std::path::PathBuf],
+) -> bool {
+    let denied = deny_paths.iter().any(|deny| path.starts_with(deny));
+    !denied
+        && (path.starts_with(policy_root) || caps_grant(outer_caps, path, nono::AccessMode::Write))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(test)]
+mod agent_can_write_tests {
+    use super::agent_can_write;
+    use nono::{AccessMode, CapabilitySet, CapabilitySource, FsCapability};
+    use std::path::PathBuf;
+
+    fn write_cap(resolved: &str) -> FsCapability {
+        FsCapability {
+            original: PathBuf::from(resolved),
+            resolved: PathBuf::from(resolved),
+            access: AccessMode::ReadWrite,
+            is_file: false,
+            source: CapabilitySource::User,
+        }
+    }
+
+    #[test]
+    fn path_under_workdir_is_writable() {
+        let caps = CapabilitySet::new();
+        let policy_root = PathBuf::from("/work");
+
+        assert!(agent_can_write(
+            &PathBuf::from("/work/sub"),
+            &policy_root,
+            &caps,
+            &[]
+        ));
+    }
+
+    #[test]
+    fn subdirectory_with_explicit_write_grant_is_writable_even_outside_workdir() {
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(write_cap("/data/repo/cache"));
+        let policy_root = PathBuf::from("/work");
+
+        assert!(agent_can_write(
+            &PathBuf::from("/data/repo/cache"),
+            &policy_root,
+            &caps,
+            &[]
+        ));
+    }
+
+    #[test]
+    fn path_without_any_grant_is_not_writable() {
+        let caps = CapabilitySet::new();
+        let policy_root = PathBuf::from("/work");
+
+        assert!(!agent_can_write(
+            &PathBuf::from("/data/repo"),
+            &policy_root,
+            &caps,
+            &[]
+        ));
+    }
+
+    #[test]
+    fn denied_path_is_not_writable_even_with_a_grant() {
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(write_cap("/data/repo"));
+        let policy_root = PathBuf::from("/work");
+        let deny_paths = vec![PathBuf::from("/data/repo/secret")];
+
+        assert!(!agent_can_write(
+            &PathBuf::from("/data/repo/secret"),
+            &policy_root,
+            &caps,
+            &deny_paths
+        ));
+    }
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[cfg(test)]
 mod lexically_normalize_tests {

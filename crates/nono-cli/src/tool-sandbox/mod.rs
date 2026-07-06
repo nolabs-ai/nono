@@ -115,6 +115,111 @@ pub(crate) fn admit_command_cwd(
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(test)]
+mod admit_command_cwd_tests {
+    use super::admit_command_cwd;
+    use nono::{AccessMode, CapabilitySet, CapabilitySource, FsCapability};
+    use std::path::PathBuf;
+
+    fn read_cap(resolved: &str) -> FsCapability {
+        FsCapability {
+            original: PathBuf::from(resolved),
+            resolved: PathBuf::from(resolved),
+            access: AccessMode::Read,
+            is_file: false,
+            source: CapabilitySource::User,
+        }
+    }
+
+    fn read_write_cap(resolved: &str) -> FsCapability {
+        FsCapability {
+            original: PathBuf::from(resolved),
+            resolved: PathBuf::from(resolved),
+            access: AccessMode::ReadWrite,
+            is_file: false,
+            source: CapabilitySource::User,
+        }
+    }
+
+    #[test]
+    fn cwd_under_workdir_is_admitted_and_writable() {
+        let caps = CapabilitySet::new();
+        let policy_root = PathBuf::from("/work");
+        let cwd = PathBuf::from("/work/sub");
+
+        let writable = admit_command_cwd("cmd", &cwd, &policy_root, &caps, &[])
+            .expect("cwd should be admitted");
+
+        assert!(writable);
+    }
+
+    #[test]
+    fn cwd_in_read_grant_outside_workdir_is_admitted_but_not_writable() {
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(read_cap("/data"));
+        let policy_root = PathBuf::from("/work");
+        let cwd = PathBuf::from("/data/repo");
+
+        let writable = admit_command_cwd("cmd", &cwd, &policy_root, &caps, &[])
+            .expect("cwd should be admitted");
+
+        assert!(!writable);
+    }
+
+    #[test]
+    fn cwd_in_read_write_grant_outside_workdir_is_writable() {
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(read_write_cap("/data"));
+        let policy_root = PathBuf::from("/work");
+        let cwd = PathBuf::from("/data/repo");
+
+        let writable = admit_command_cwd("cmd", &cwd, &policy_root, &caps, &[])
+            .expect("cwd should be admitted");
+
+        assert!(writable);
+    }
+
+    #[test]
+    fn cwd_outside_all_grants_is_rejected() {
+        let caps = CapabilitySet::new();
+        let policy_root = PathBuf::from("/work");
+        let cwd = PathBuf::from("/etc/secrets");
+
+        let err = admit_command_cwd("cmd", &cwd, &policy_root, &caps, &[])
+            .expect_err("cwd should be rejected");
+
+        assert!(matches!(err, nono::NonoError::SandboxInit(_)));
+    }
+
+    #[test]
+    fn cwd_under_deny_path_inside_broad_allow_grant_is_rejected() {
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(read_write_cap("/data"));
+        let policy_root = PathBuf::from("/work");
+        let cwd = PathBuf::from("/data/secret");
+        let deny_paths = vec![PathBuf::from("/data/secret")];
+
+        let err = admit_command_cwd("cmd", &cwd, &policy_root, &caps, &deny_paths)
+            .expect_err("cwd should be rejected");
+
+        assert!(matches!(err, nono::NonoError::SandboxInit(_)));
+    }
+
+    #[test]
+    fn cwd_under_workdir_but_also_under_deny_path_is_rejected() {
+        let caps = CapabilitySet::new();
+        let policy_root = PathBuf::from("/work");
+        let cwd = PathBuf::from("/work/secret");
+        let deny_paths = vec![PathBuf::from("/work/secret")];
+
+        let err = admit_command_cwd("cmd", &cwd, &policy_root, &caps, &deny_paths)
+            .expect_err("cwd should be rejected");
+
+        assert!(matches!(err, nono::NonoError::SandboxInit(_)));
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) use self::audit_context::ToolSandboxAuditContext;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use self::policy::*;

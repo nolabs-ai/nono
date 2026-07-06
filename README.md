@@ -15,7 +15,7 @@
   <a href="https://docs.nono.sh"><img src="https://img.shields.io/badge/Docs-docs.nono.sh-green.svg" alt="Documentation"/></a>
 </p>
 <p>
-  <a href="https://discord.gg/pPcjYzGvbS">
+  <a href="https://discord.gg/G6qDa7cC7x">
     <img src="https://img.shields.io/badge/Chat-Join%20Discord-7289da?style=for-the-badge&logo=discord&logoColor=white" alt="Join Discord"/>
   </a>
    <a href="https://nolabs.ai/careers">
@@ -160,7 +160,7 @@ Also available as [Python](https://github.com/nolabs-ai/nono-py), [TypeScript](h
 
 ## Contributing
 
-We encourage using AI tools to contribute. However, you must understand and carefully review any AI-generated code before submitting. Security is paramount. If you don't understand how a change works, ask in [Discord](https://discord.gg/pPcjYzGvbS) first.
+We encourage using AI tools to contribute. However, you must understand and carefully review any AI-generated code before submitting. Security is paramount. If you don't understand how a change works, ask in [Discord](https://discord.gg/G6qDa7cC7x) first.
 
 ## Security
 

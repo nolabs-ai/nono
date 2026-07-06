@@ -4,7 +4,7 @@ nono is a capability-based sandboxing system for running untrusted AI agents
 with OS-enforced isolation. Contributions are welcome from anyone who
 understands what they are submitting.
 
-If anything here is unclear, ask in [Discord](https://discord.gg/3v2DduCsd)
+If anything here is unclear, ask in [Discord](https://discord.gg/G6qDa7cC7x)
 before writing code. A five-minute conversation saves a rejected PR.
 
 ---
@@ -226,7 +226,7 @@ including hard stop conditions that prohibit certain automated contributions.
 
 The maintainer council reviews PRs. See [MAINTAINERS.md](./MAINTAINERS.md)
 for the current list. First response within 5 business days. If that window
-passes with no response, ping in [Discord](https://discord.gg/3v2DduCsd)
+passes with no response, ping in [Discord](https://discord.gg/G6qDa7cC7x)
 with a link to the PR.
 
 ---

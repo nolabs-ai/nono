@@ -13,7 +13,7 @@ It is referenced by both CONTRIBUTING.md and GOVERNANCE.md.
 
 ## Solutions Architect
 
-Sal Kimmich. Reachable in [Discord](https://discord.gg/3v2DduCsd) for
+Sal Kimmich. Reachable in [Discord](https://discord.gg/G6qDa7cC7x) for
 contributor questions and onboarding.
 
 ## Changes to This File

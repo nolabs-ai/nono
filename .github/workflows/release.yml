@@ -199,7 +199,7 @@ jobs:
           find . -name "*.tar.gz" -exec mv {} . \;
           find . -name "*.deb" -exec mv {} . \;
           find . -name "*.rpm" -exec mv {} . \;
-          sha256sum ./*.tar.gz ./*.deb ./*.rpm > SHA256SUMS.txt
+          sha256sum -- *.tar.gz *.deb *.rpm > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
       - name: Create GitHub Release

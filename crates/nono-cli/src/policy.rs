@@ -187,6 +187,7 @@ impl ProfileDef {
             binary: None,
             command_args: self.command_args.clone(),
             unsafe_macos_seatbelt_rules: self.unsafe_macos_seatbelt_rules.clone(),
+            platform_overrides: None,
         }
     }
 }

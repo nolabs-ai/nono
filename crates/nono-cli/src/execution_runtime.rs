@@ -224,31 +224,48 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         .iter()
         .chain(endpoint_domain_entries.iter())
         .collect();
-    // Expand network_profile hosts into the sandbox state so that `nono why --self`
-    // sees the same allowlist that the proxy enforces at runtime.
-    let mut allowed_domain_strs: Vec<String> = all_domain_entries
+    // Expand network_profile hosts and domain group aliases into the sandbox state
+    // so that `nono why --self` sees the same allowlist the proxy enforces at runtime.
+    let plain_domain_strs: Vec<String> = all_domain_entries
         .iter()
         .map(|e| e.domain().to_string())
         .collect();
-    if let Some(profile_name) = proxy
-        .and_then(|p| p.domain_filter.as_ref())
-        .and_then(|d| d.network_profile.as_deref())
-    {
+    let domain_filter = proxy.and_then(|p| p.domain_filter.as_ref());
+    let allowed_domain_strs: Vec<String> = if domain_filter.is_some() {
         let policy_json = config::embedded::embedded_network_policy_json();
-        if let Ok(net_policy) = network_policy::load_network_policy(policy_json)
-            && let Ok(resolved) = network_policy::resolve_network_profile(&net_policy, profile_name)
-        {
-            allowed_domain_strs.extend(resolved.hosts);
-            for suffix in &resolved.suffixes {
-                let wildcard = if suffix.starts_with('.') {
-                    format!("*{suffix}")
-                } else {
-                    format!("*.{suffix}")
-                };
-                allowed_domain_strs.push(wildcard);
+        match network_policy::load_network_policy(policy_json) {
+            Ok(net_policy) => {
+                let mut domains =
+                    network_policy::expand_proxy_allow(&net_policy, &plain_domain_strs);
+                if let Some(profile_name) = domain_filter.and_then(|d| d.network_profile.as_deref())
+                {
+                    match network_policy::resolve_network_profile(&net_policy, profile_name) {
+                        Ok(resolved) => {
+                            domains.extend(resolved.hosts);
+                            for suffix in &resolved.suffixes {
+                                let wildcard = if suffix.starts_with('.') {
+                                    format!("*{suffix}")
+                                } else {
+                                    format!("*.{suffix}")
+                                };
+                                domains.push(wildcard);
+                            }
+                        }
+                        Err(e) => {
+                            warn!("failed to resolve network_profile for sandbox state: {e}");
+                        }
+                    }
+                }
+                domains
+            }
+            Err(e) => {
+                warn!("failed to load network policy for sandbox state: {e}");
+                plain_domain_strs
             }
         }
-    }
+    } else {
+        plain_domain_strs
+    };
     let domain_endpoints: Vec<sandbox_state::DomainEndpointState> = all_domain_entries
         .iter()
         .filter_map(|e| match e {

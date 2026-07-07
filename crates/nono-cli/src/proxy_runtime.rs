@@ -1326,7 +1326,7 @@ fn resolve_capture_command(command: &str) -> Result<CaptureCommandResolution> {
     if path.is_absolute() {
         return validate_capture_command_path(path);
     }
-    if command.contains(std::path::MAIN_SEPARATOR) {
+    if command.contains('/') || command.contains('\\') {
         return Err(NonoError::ConfigParse(format!(
             "credential_capture command '{command}' must be an absolute path or bare command name"
         )));
@@ -3982,6 +3982,17 @@ mod tests {
         assert!(
             matches!(result, Err(NonoError::ConfigParse(_))),
             "relative path with separator should still be a hard error, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_capture_command_rejects_non_native_separator() {
+        // A relative command embedding a backslash must be rejected on every
+        // platform, not just on Windows where `\` is the native separator.
+        let result = resolve_capture_command("foo\\bar");
+        assert!(
+            matches!(result, Err(NonoError::ConfigParse(_))),
+            "relative path with non-native separator should still be a hard error, got {result:?}"
         );
     }
 

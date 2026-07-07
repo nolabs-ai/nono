@@ -67,6 +67,37 @@ Inherit from another profile by name:
 - `open_urls`: if the child provides the field (even as `{}`), it replaces the base entirely. If absent, the base value is inherited. Setting to `null` in JSON is equivalent to omitting it (both inherit the base).
 - `workdir`: child overrides base unless child is `"none"` (which inherits the base value instead).
 
+### platform_overrides
+
+Apply per-OS patches to the profile after `extends` resolution. Only the block matching the current platform is merged in; the others are ignored.
+
+```json
+{
+  "meta": { "name": "myprofile" },
+  "filesystem": {
+    "read": ["/tmp"]
+  },
+  "platform_overrides": {
+    "macos": {
+      "security": { "process_info_mode": "allow_all" },
+      "filesystem": { "read": ["/opt/homebrew", "~/Library/Caches"] }
+    },
+    "linux": {
+      "security": { "signal_mode": "isolated", "process_info_mode": "allow_same_sandbox" },
+      "filesystem": { "read": ["/usr/lib", "~/.cache"] }
+    }
+  }
+}
+```
+
+Merge semantics are identical to `extends`: array fields are dedup-appended, scalar fields are child-wins, deny-lists union. The override can only add or tighten — it cannot remove inherited paths or relax inherited deny rules.
+
+Valid platform keys are `macos`, `linux`, and `windows`. Unrecognised keys are a parse error.
+
+`extends` and `platform_overrides` are not allowed inside an override block. Nesting either is a parse error.
+
+Use `platform_overrides` when a single profile needs different paths or security modes per OS. Use group-level `when` predicates for package-level platform differences that are already handled by built-in groups.
+
 ### groups
 
 Controls which policy groups apply to the profile. Group definitions live in `policy.json`; list available groups with `nono profile groups`.
@@ -1046,6 +1077,7 @@ Supported predicate forms include `linux`, `macos`, `linux:fedora`, `linux:rhel-
 - `filesystem.suppress_save_prompt` only suppresses save-profile suggestions. It does not grant access, remove deny rules, or hide diagnostics.
 - `groups.exclude` removes groups from the resolved set. This weakens the sandbox. Use it only when you understand which protections you are removing.
 - `extends` chains resolve recursively up to depth 10. Circular inheritance is an error.
+- `platform_overrides` is applied after all `extends` inheritance is resolved. The override for the current platform is merged as a child, so its values win over inherited ones. Override blocks cannot themselves use `extends` or `platform_overrides`.
 - Prefer `when` predicates for package-specific platform differences. Put shared OS baseline paths in built-in policy groups instead.
 - `network.block: true` blocks all network access. It cannot be combined with proxy settings.
 - `custom_credentials` upstream URLs must use HTTPS. HTTP is only accepted for loopback addresses (localhost, 127.0.0.1, ::1).

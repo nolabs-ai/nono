@@ -2181,6 +2181,69 @@ pub struct Profile {
     /// first-class capability.
     #[serde(default)]
     pub unsafe_macos_seatbelt_rules: Vec<String>,
+    /// Per-OS profile patches merged after `extends` resolution.
+    ///
+    /// Only the entry matching the current platform is applied; others are ignored.
+    /// The override block supports all profile fields except `extends` and
+    /// `platform_overrides` — nesting either is a parse error.
+    /// Merge semantics are identical to `extends`: deny-lists union, scalar fields
+    /// are child-wins, lists are dedup-appended.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform_overrides: Option<PlatformOverrides>,
+}
+
+/// Per-OS patches for [`Profile::platform_overrides`].
+///
+/// Unrecognised keys are rejected. Nesting `extends` or `platform_overrides`
+/// inside an override block is a parse error.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlatformOverrides {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub macos: Option<Box<PlatformOverride>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linux: Option<Box<PlatformOverride>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub windows: Option<Box<PlatformOverride>>,
+}
+
+impl PlatformOverrides {
+    fn for_current_platform(self) -> Option<Box<PlatformOverride>> {
+        match crate::platform::current().os {
+            crate::platform::Os::Macos => self.macos,
+            crate::platform::Os::Linux => self.linux,
+            crate::platform::Os::Windows => self.windows,
+            crate::platform::Os::Unknown(_) => None,
+        }
+    }
+}
+
+/// A partial profile fragment used inside [`PlatformOverrides`].
+///
+/// Identical to [`Profile`] but rejects `extends` and `platform_overrides`
+/// during deserialization to prevent a second inheritance system from forming
+/// inside an override block.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct PlatformOverride(pub Profile);
+
+impl<'de> Deserialize<'de> for PlatformOverride {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let profile = Profile::deserialize(deserializer)?;
+        if profile.extends.is_some() {
+            return Err(serde::de::Error::custom(
+                "`extends` is not allowed inside `platform_overrides`",
+            ));
+        }
+        if profile.platform_overrides.is_some() {
+            return Err(serde::de::Error::custom(
+                "`platform_overrides` cannot be nested",
+            ));
+        }
+        Ok(Self(profile))
+    }
 }
 
 #[derive(Deserialize)]
@@ -2252,6 +2315,8 @@ struct ProfileDeserialize {
     command_args: Vec<String>,
     #[serde(default)]
     unsafe_macos_seatbelt_rules: Vec<String>,
+    #[serde(default)]
+    platform_overrides: Option<PlatformOverrides>,
 }
 
 impl From<ProfileDeserialize> for Profile {
@@ -2291,6 +2356,7 @@ impl From<ProfileDeserialize> for Profile {
             binary: raw.binary,
             command_args: raw.command_args,
             unsafe_macos_seatbelt_rules: raw.unsafe_macos_seatbelt_rules,
+            platform_overrides: raw.platform_overrides,
         };
 
         // Drain legacy keys into canonical sections (no-op unless the legacy
@@ -2846,6 +2912,7 @@ pub(crate) fn load_raw_profile_from_path(path: &Path) -> Result<Profile> {
 /// Resolve inheritance and apply implicit default-group merging for a raw profile.
 #[allow(deprecated)]
 pub(crate) fn finalize_profile(mut profile: Profile) -> Result<Profile> {
+    profile = apply_platform_overrides(profile)?;
     merge_implicit_default_groups(&mut profile)?;
     validate_credential_capture_resolved(&profile)?;
     validate_credential_provider_resolved(&profile)?;
@@ -3207,9 +3274,31 @@ fn load_base_profile_raw(
 /// The child's values take precedence for scalar fields. Collection fields
 /// are appended and deduplicated. The `extends` field is consumed (set to `None`).
 #[allow(deprecated)] // reads/writes commands.{allow,deny} (deprecated v0.33.0)
+/// Extract the current platform's override block and merge it into `profile`.
+///
+/// Called once during `finalize_profile`, after `extends` is fully resolved.
+/// The override is treated as a child in `merge_profiles` so deny-lists union
+/// and security modes are child-wins — an override can only tighten, not loosen.
+fn apply_platform_overrides(mut profile: Profile) -> Result<Profile> {
+    let Some(mut override_profile) = profile
+        .platform_overrides
+        .take()
+        .and_then(|po| po.for_current_platform())
+        .map(|o| o.0)
+    else {
+        return Ok(profile);
+    };
+    // Overrides don't carry meaningful meta; propagate the profile's own so
+    // merge_profiles' child-wins rule doesn't blank it out.
+    override_profile.meta = profile.meta.clone();
+    Ok(merge_profiles(profile, override_profile))
+}
+
+#[allow(deprecated)] // reads/writes commands.{allow,deny} (deprecated v0.33.0)
 fn merge_profiles(base: Profile, child: Profile) -> Profile {
     Profile {
         extends: None,
+        platform_overrides: None,
         meta: child.meta,
         security: SecurityConfig {
             signal_mode: child.security.signal_mode.or(base.security.signal_mode),
@@ -5724,6 +5813,7 @@ mod tests {
             binary: None,
             command_args: vec![],
             unsafe_macos_seatbelt_rules: vec![],
+            platform_overrides: None,
         }
     }
 
@@ -5811,6 +5901,7 @@ mod tests {
             binary: None,
             command_args: vec![],
             unsafe_macos_seatbelt_rules: vec![],
+            platform_overrides: None,
         }
     }
 
@@ -9557,5 +9648,121 @@ mod tests {
             ..aws_auth_cred_builder()
         };
         assert!(validate_custom_credential("apigw", &cred).is_ok());
+    }
+
+    // --- platform_overrides tests ---
+
+    #[test]
+    fn platform_overrides_parses_and_serializes() {
+        let json = r#"{
+            "meta": {"name": "test"},
+            "platform_overrides": {
+                "macos": { "filesystem": { "read": ["/opt/homebrew"] } },
+                "linux": { "filesystem": { "read": ["/usr/lib"] } }
+            }
+        }"#;
+        let profile: Profile = serde_json::from_str(json).expect("parse");
+        let po = profile.platform_overrides.as_ref().expect("has overrides");
+        assert!(po.macos.is_some());
+        assert!(po.linux.is_some());
+        assert!(po.windows.is_none());
+    }
+
+    #[test]
+    fn platform_overrides_rejects_nested_extends() {
+        let json = r#"{
+            "meta": {"name": "test"},
+            "platform_overrides": {
+                "linux": { "extends": "base", "filesystem": { "read": ["/usr/lib"] } }
+            }
+        }"#;
+        let err = serde_json::from_str::<Profile>(json).unwrap_err();
+        assert!(
+            err.to_string().contains("extends"),
+            "expected error about `extends`, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn platform_overrides_rejects_nested_platform_overrides() {
+        let json = r#"{
+            "meta": {"name": "test"},
+            "platform_overrides": {
+                "linux": {
+                    "platform_overrides": { "linux": {} }
+                }
+            }
+        }"#;
+        let err = serde_json::from_str::<Profile>(json).unwrap_err();
+        assert!(
+            err.to_string().contains("platform_overrides"),
+            "expected error about nesting, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn platform_overrides_merge_adds_filesystem_paths() {
+        // Build a profile whose override for the current platform adds a read path.
+        let current_os = crate::platform::current_os_name();
+        let json = format!(
+            r#"{{
+                "meta": {{"name": "test"}},
+                "filesystem": {{"read": ["/base/path"]}},
+                "platform_overrides": {{
+                    "{current_os}": {{ "filesystem": {{"read": ["/platform/path"]}} }}
+                }}
+            }}"#
+        );
+        let profile: Profile = serde_json::from_str(&json).expect("parse");
+        // finalize_profile applies platform_overrides
+        let finalized = finalize_profile(profile).expect("finalize");
+        assert!(
+            finalized.platform_overrides.is_none(),
+            "platform_overrides should be consumed after finalization"
+        );
+        assert!(
+            finalized
+                .filesystem
+                .read
+                .contains(&"/base/path".to_string()),
+            "base path must be present"
+        );
+        assert!(
+            finalized
+                .filesystem
+                .read
+                .contains(&"/platform/path".to_string()),
+            "platform override path must be present after merge"
+        );
+    }
+
+    #[test]
+    fn platform_overrides_other_platform_not_applied() {
+        // The override for the non-current platform must not bleed in.
+        let other_os = if crate::platform::current_os_name() == "macos" {
+            "linux"
+        } else {
+            "macos"
+        };
+        let json = format!(
+            r#"{{
+                "meta": {{"name": "test"}},
+                "filesystem": {{"read": ["/base/path"]}},
+                "platform_overrides": {{
+                    "{other_os}": {{ "filesystem": {{"read": ["/other/platform/path"]}} }}
+                }}
+            }}"#
+        );
+        let profile: Profile = serde_json::from_str(&json).expect("parse");
+        let finalized = finalize_profile(profile).expect("finalize");
+        assert!(
+            !finalized
+                .filesystem
+                .read
+                .contains(&"/other/platform/path".to_string()),
+            "other platform's paths must not be present"
+        );
     }
 }

@@ -2917,6 +2917,18 @@ pub(crate) fn load_raw_profile_from_path(path: &Path) -> Result<Profile> {
 #[allow(deprecated)]
 pub(crate) fn finalize_profile(mut profile: Profile) -> Result<Profile> {
     profile = apply_platform_overrides(profile)?;
+    // apply_platform_overrides merges platform-specific custom_credentials,
+    // env_credentials, and environment.set_vars into the profile, so those
+    // merged values must be re-validated here — parse_profile_bytes only
+    // validated the pre-merge, top-level values.
+    validate_profile_custom_credentials(&profile)?;
+    validate_env_credential_keys(&profile)?;
+    if let Some(env_config) = profile.environment.as_ref()
+        && !env_config.set_vars.is_empty()
+        && let Some(err) = crate::exec_strategy::validate_set_vars(&env_config.set_vars)
+    {
+        return Err(NonoError::ProfileParse(err));
+    }
     merge_implicit_default_groups(&mut profile)?;
     validate_credential_capture_resolved(&profile)?;
     validate_credential_provider_resolved(&profile)?;
@@ -3298,11 +3310,50 @@ fn apply_platform_overrides(mut profile: Profile) -> Result<Profile> {
     Ok(merge_profiles(profile, override_profile))
 }
 
+/// Must preserve a base's overrides, not just a leaf's — `merge_profiles`
+/// previously nulled this field unconditionally, so any override on a base
+/// profile was silently lost. Same-OS conflicts deep-merge via
+/// `merge_platform_override_slot` rather than one side replacing the other,
+/// so a child override touching one field can't wipe out unrelated fields
+/// the base's override for that OS set.
+fn merge_platform_overrides(
+    base: Option<PlatformOverrides>,
+    child: Option<PlatformOverrides>,
+) -> Option<PlatformOverrides> {
+    match (base, child) {
+        (None, None) => None,
+        (Some(b), None) => Some(b),
+        (None, Some(c)) => Some(c),
+        (Some(b), Some(c)) => Some(PlatformOverrides {
+            macos: merge_platform_override_slot(b.macos, c.macos),
+            linux: merge_platform_override_slot(b.linux, c.linux),
+            windows: merge_platform_override_slot(b.windows, c.windows),
+        }),
+    }
+}
+
+/// Uses `merge_profiles` itself so a same-OS override composes with the same
+/// child-wins/dedup-append/deny-union rules as everything else in a profile.
+fn merge_platform_override_slot(
+    base: Option<Box<PlatformOverride>>,
+    child: Option<Box<PlatformOverride>>,
+) -> Option<Box<PlatformOverride>> {
+    match (base, child) {
+        (None, None) => None,
+        (Some(b), None) => Some(b),
+        (None, Some(c)) => Some(c),
+        (Some(b), Some(c)) => Some(Box::new(PlatformOverride(merge_profiles(b.0, c.0)))),
+    }
+}
+
 #[allow(deprecated)] // reads/writes commands.{allow,deny} (deprecated v0.33.0)
 fn merge_profiles(base: Profile, child: Profile) -> Profile {
     Profile {
         extends: None,
-        platform_overrides: None,
+        platform_overrides: merge_platform_overrides(
+            base.platform_overrides,
+            child.platform_overrides,
+        ),
         meta: child.meta,
         security: SecurityConfig {
             signal_mode: child.security.signal_mode.or(base.security.signal_mode),
@@ -9770,6 +9821,248 @@ mod tests {
                 .read
                 .contains(&"/other/platform/path".to_string()),
             "other platform's paths must not be present"
+        );
+    }
+
+    #[test]
+    fn platform_overrides_valid_set_vars_merged_and_accepted() {
+        // Positive counterpart to `platform_overrides_set_vars_validated_after_merge`:
+        // a well-formed set_vars entry declared only inside platform_overrides must
+        // survive the merge and finalize successfully, not just get rejected.
+        let current_os = crate::platform::current_os_name();
+        let json = format!(
+            r#"{{
+                "meta": {{"name": "test"}},
+                "platform_overrides": {{
+                    "{current_os}": {{ "environment": {{ "set_vars": {{"MY_VAR": "value"}} }} }}
+                }}
+            }}"#
+        );
+        let profile: Profile = serde_json::from_str(&json).expect("parse");
+        let finalized = finalize_profile(profile).expect("valid set_vars must be accepted");
+        assert_eq!(
+            finalized
+                .environment
+                .as_ref()
+                .expect("environment must be merged in")
+                .set_vars
+                .get("MY_VAR")
+                .map(String::as_str),
+            Some("value"),
+            "merged set_vars entry must be present after finalize"
+        );
+    }
+
+    #[test]
+    fn platform_overrides_set_vars_validated_after_merge() {
+        // Regression: finalize_profile used to skip re-validating
+        // custom_credentials/env_credentials/set_vars after apply_platform_overrides
+        // merged them in, letting an override sneak in a reserved set_vars key.
+        let current_os = crate::platform::current_os_name();
+        let json = format!(
+            r#"{{
+                "meta": {{"name": "test"}},
+                "platform_overrides": {{
+                    "{current_os}": {{ "environment": {{ "set_vars": {{"PATH": "/evil"}} }} }}
+                }}
+            }}"#
+        );
+        let profile: Profile = serde_json::from_str(&json).expect("parse");
+        let err = finalize_profile(profile).expect_err("reserved set_vars key must be rejected");
+        assert!(
+            err.to_string().contains("PATH"),
+            "expected error about reserved PATH key, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn platform_overrides_on_base_survive_extends_resolution() {
+        // Regression: merge_profiles used to null platform_overrides
+        // unconditionally, dropping an override defined on a base before
+        // finalize_profile ever got to apply it.
+        let current_os = crate::platform::current_os_name();
+        let dir = tempdir().expect("tmpdir");
+        std::fs::write(
+            dir.path().join("shared.json"),
+            format!(
+                r#"{{
+                    "meta": {{ "name": "shared" }},
+                    "filesystem": {{ "read": ["/base/path"] }},
+                    "platform_overrides": {{
+                        "{current_os}": {{ "filesystem": {{ "read": ["/platform/path"] }} }}
+                    }}
+                }}"#
+            ),
+        )
+        .expect("write");
+        let child_path = dir.path().join("child.json");
+        std::fs::write(
+            &child_path,
+            r#"{ "extends": "shared", "meta": { "name": "child" } }"#,
+        )
+        .expect("write");
+
+        let merged = match load_from_file(&child_path, &[]) {
+            Ok(profile) => profile,
+            Err(err) => panic!("resolve: {err}"),
+        };
+        assert!(
+            merged.platform_overrides.is_some(),
+            "base profile's platform_overrides must survive extends resolution"
+        );
+
+        let finalized = load_profile_from_path(&child_path).expect("load+finalize");
+        assert!(
+            finalized.platform_overrides.is_none(),
+            "platform_overrides should be consumed after finalization"
+        );
+        assert!(
+            finalized
+                .filesystem
+                .read
+                .contains(&"/base/path".to_string()),
+            "base path must be present"
+        );
+        assert!(
+            finalized
+                .filesystem
+                .read
+                .contains(&"/platform/path".to_string()),
+            "platform override declared on the base profile must apply through extends"
+        );
+    }
+
+    #[test]
+    fn platform_overrides_merge_per_os_key_child_wins() {
+        let current_os = crate::platform::current_os_name();
+        let base = Profile {
+            filesystem: FilesystemConfig {
+                read: vec!["/base/path".to_string()],
+                ..Default::default()
+            },
+            platform_overrides: Some(PlatformOverrides {
+                macos: if current_os == "macos" {
+                    Some(Box::new(PlatformOverride(Profile {
+                        filesystem: FilesystemConfig {
+                            read: vec!["/base/override/current".to_string()],
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    })))
+                } else {
+                    None
+                },
+                linux: if current_os == "linux" {
+                    Some(Box::new(PlatformOverride(Profile {
+                        filesystem: FilesystemConfig {
+                            read: vec!["/base/override/current".to_string()],
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    })))
+                } else {
+                    None
+                },
+                windows: None,
+            }),
+            ..Default::default()
+        };
+        let child = Profile {
+            platform_overrides: Some(PlatformOverrides {
+                macos: None,
+                linux: None,
+                windows: Some(Box::new(PlatformOverride(Profile {
+                    filesystem: FilesystemConfig {
+                        read: vec!["/child/override/windows".to_string()],
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }))),
+            }),
+            ..Default::default()
+        };
+
+        let merged = merge_profiles(base, child);
+        let po = merged
+            .platform_overrides
+            .expect("merged overrides must survive");
+        assert!(
+            po.windows.is_some(),
+            "child-only override key must be preserved"
+        );
+        assert!(
+            (current_os == "macos" && po.macos.is_some())
+                || (current_os == "linux" && po.linux.is_some()),
+            "base-only override key for the current platform must be preserved"
+        );
+    }
+
+    #[test]
+    fn platform_overrides_same_os_key_deep_merges_not_clobbers() {
+        let current_os = crate::platform::current_os_name();
+        let base_override = Profile {
+            network: NetworkConfig {
+                open_port: vec![1234],
+                ..Default::default()
+            },
+            filesystem: FilesystemConfig {
+                read: vec!["/base/override/path".to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let child_override = Profile {
+            open_urls: Some(OpenUrlConfig {
+                allow_origins: vec!["https://example.com".to_string()],
+                allow_localhost: false,
+            }),
+            ..Default::default()
+        };
+        let mk_overrides = |o: Profile| -> PlatformOverrides {
+            let wrapped = Some(Box::new(PlatformOverride(o)));
+            if current_os == "macos" {
+                PlatformOverrides {
+                    macos: wrapped,
+                    linux: None,
+                    windows: None,
+                }
+            } else {
+                PlatformOverrides {
+                    macos: None,
+                    linux: wrapped,
+                    windows: None,
+                }
+            }
+        };
+        let base = Profile {
+            platform_overrides: Some(mk_overrides(base_override)),
+            ..Default::default()
+        };
+        let child = Profile {
+            platform_overrides: Some(mk_overrides(child_override)),
+            ..Default::default()
+        };
+
+        let merged = merge_profiles(base, child);
+        let finalized = finalize_profile(merged).expect("finalize");
+        assert!(
+            finalized.network.open_port.contains(&1234),
+            "base override's open_port must survive a same-OS deep merge with child's override"
+        );
+        assert!(
+            finalized
+                .filesystem
+                .read
+                .contains(&"/base/override/path".to_string()),
+            "base override's filesystem grant must survive a same-OS deep merge with child's override"
+        );
+        assert!(
+            finalized
+                .open_urls
+                .as_ref()
+                .is_some_and(|u| u.allow_origins.contains(&"https://example.com".to_string())),
+            "child override's own field must still apply"
         );
     }
 }

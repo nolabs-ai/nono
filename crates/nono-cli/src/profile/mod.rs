@@ -1489,6 +1489,10 @@ pub struct NetworkConfig {
         alias = "allow_proxy"
     )]
     pub allow_domain: Vec<AllowDomainEntry>,
+    /// Domains to deny through the proxy regardless of the allowlist.
+    /// Supports the same wildcard syntax as `allow_domain` (e.g. `*.ads.example.com`).
+    #[serde(default)]
+    pub deny_domain: Vec<String>,
     /// Credential services to enable via reverse proxy.
     /// Canonical profile key: `credentials` (legacy `proxy_credentials` accepted).
     ///
@@ -3284,6 +3288,7 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
                 &base.network.allow_domain,
                 &child.network.allow_domain,
             ),
+            deny_domain: dedup_append(&base.network.deny_domain, &child.network.deny_domain),
             open_port: dedup_append(&base.network.open_port, &child.network.open_port),
             listen_port: dedup_append(&base.network.listen_port, &child.network.listen_port),
             connect_port: dedup_append(&base.network.connect_port, &child.network.connect_port),
@@ -5677,6 +5682,7 @@ mod tests {
                 allow_http2: false,
                 network_profile: InheritableValue::Set("base-net".to_string()),
                 allow_domain: vec![AllowDomainEntry::Plain("base.example.com".to_string())],
+                deny_domain: vec![],
                 open_port: vec![3000],
                 listen_port: vec![4000],
                 connect_port: vec![],
@@ -5764,6 +5770,7 @@ mod tests {
                 allow_http2: false,
                 network_profile: InheritableValue::Inherit,
                 allow_domain: vec![AllowDomainEntry::Plain("child.example.com".to_string())],
+                deny_domain: vec![],
                 open_port: vec![3000, 5000],
                 listen_port: vec![4000, 6000],
                 connect_port: vec![],

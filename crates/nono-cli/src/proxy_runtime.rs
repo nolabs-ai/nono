@@ -43,6 +43,7 @@ pub(crate) struct ActiveProxyRuntime {
 pub(crate) struct EffectiveProxySettings {
     pub(crate) network_profile: Option<String>,
     pub(crate) allow_domain: Vec<crate::profile::AllowDomainEntry>,
+    pub(crate) deny_domain: Vec<String>,
     pub(crate) credentials: Vec<String>,
 }
 
@@ -1357,6 +1358,7 @@ pub(crate) fn prepare_proxy_launch_options(
     let effective_proxy = resolve_effective_proxy_settings(args, prepared);
     let network_profile = effective_proxy.network_profile;
     let allow_domain = effective_proxy.allow_domain;
+    let deny_domain = effective_proxy.deny_domain;
     let mut credentials = effective_proxy.credentials;
     let mut custom_credentials = prepared.custom_credentials.clone();
     let mut proxy_source_env_vars = HashMap::new();
@@ -1391,7 +1393,8 @@ pub(crate) fn prepare_proxy_launch_options(
         bypass
     };
 
-    let has_domain_filter = network_profile.is_some() || !allow_domain.is_empty();
+    let has_domain_filter =
+        network_profile.is_some() || !allow_domain.is_empty() || !deny_domain.is_empty();
     let has_credentials = !credentials.is_empty();
     let would_activate = has_domain_filter || has_credentials || upstream_proxy_addr.is_some();
 
@@ -1420,14 +1423,16 @@ pub(crate) fn prepare_proxy_launch_options(
         .into_iter()
         .partition(|e| !matches!(e, crate::profile::AllowDomainEntry::WithEndpoints { endpoints, .. } if !endpoints.is_empty()));
 
-    let domain_filter = if network_profile.is_some() || !plain_entries.is_empty() {
-        Some(DomainFilterIntent {
-            network_profile,
-            allow_domain: plain_entries,
-        })
-    } else {
-        None
-    };
+    let domain_filter =
+        if network_profile.is_some() || !plain_entries.is_empty() || !deny_domain.is_empty() {
+            Some(DomainFilterIntent {
+                network_profile,
+                allow_domain: plain_entries,
+                deny_domain,
+            })
+        } else {
+            None
+        };
 
     let endpoint_filter = if !endpoint_entries.is_empty() {
         debug_assert!(
@@ -1617,6 +1622,7 @@ pub(crate) fn resolve_effective_proxy_settings(
         return EffectiveProxySettings {
             network_profile: None,
             allow_domain: Vec::new(),
+            deny_domain: Vec::new(),
             credentials: Vec::new(),
         };
     }
@@ -1627,12 +1633,15 @@ pub(crate) fn resolve_effective_proxy_settings(
         .or_else(|| prepared.network_profile.clone());
     let mut allow_domain = prepared.allow_domain.clone();
     allow_domain.extend(args.allow_proxy.iter().map(|s| parse_allow_domain_arg(s)));
+    let mut deny_domain = prepared.deny_domain.clone();
+    deny_domain.extend(args.deny_proxy.iter().cloned());
     let mut credentials = prepared.credentials.clone();
     credentials.extend(args.proxy_credential.clone());
 
     EffectiveProxySettings {
         network_profile,
         allow_domain,
+        deny_domain,
         credentials,
     }
 }
@@ -2258,7 +2267,15 @@ pub(crate) fn build_proxy_config_from_flags(
     routes.extend(endpoint_routes);
     resolved.routes = routes;
 
-    let mut proxy_config = network_policy::build_proxy_config(&resolved, &plain_hosts);
+    let deny_domain = proxy
+        .domain_filter
+        .as_ref()
+        .map(|d| d.deny_domain.as_slice())
+        .unwrap_or(&[]);
+    let denied_hosts = network_policy::expand_proxy_deny(&net_policy, deny_domain);
+
+    let mut proxy_config =
+        network_policy::build_proxy_config(&resolved, &plain_hosts, &denied_hosts);
     proxy_config.strict_filter = proxy.strict_filter;
 
     if let Some(ref upstream) = proxy.upstream_proxy {
@@ -3060,6 +3077,7 @@ mod tests {
             rollback_exclude_globs: Vec::new(),
             network_profile: None,
             allow_domain: Vec::new(),
+            deny_domain: Vec::new(),
             credentials: Vec::new(),
             custom_credentials,
             upstream_proxy: None,

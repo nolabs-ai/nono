@@ -83,6 +83,8 @@ pub(crate) struct DomainFilterIntent {
     /// Only `AllowDomainEntry::Plain` entries — endpoint-bearing entries live in
     /// `EndpointFilterIntent`.
     pub(crate) allow_domain: Vec<profile::AllowDomainEntry>,
+    /// Domains to deny regardless of the allowlist.
+    pub(crate) deny_domain: Vec<String>,
 }
 
 /// `WithEndpoints` allow-domain entries that require TLS interception so the

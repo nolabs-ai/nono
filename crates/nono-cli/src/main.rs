@@ -288,6 +288,7 @@ mod tests {
             allow_domain: vec![profile::AllowDomainEntry::Plain(
                 "docs.python.org".to_string(),
             )],
+            deny_domain: Vec::new(),
             credentials: vec!["github".to_string()],
             custom_credentials: std::collections::HashMap::new(),
             credential_capture: std::collections::HashMap::new(),
@@ -329,6 +330,7 @@ mod tests {
             EffectiveProxySettings {
                 network_profile: None,
                 allow_domain: Vec::new(),
+                deny_domain: Vec::new(),
                 credentials: Vec::new(),
             }
         );
@@ -355,6 +357,7 @@ mod tests {
             allow_domain: vec![profile::AllowDomainEntry::Plain(
                 "docs.python.org".to_string(),
             )],
+            deny_domain: Vec::new(),
             credentials: vec!["github".to_string()],
             custom_credentials: std::collections::HashMap::new(),
             credential_capture: std::collections::HashMap::new(),
@@ -399,6 +402,7 @@ mod tests {
                     profile::AllowDomainEntry::Plain("docs.python.org".to_string()),
                     profile::AllowDomainEntry::Plain("example.com".to_string()),
                 ],
+                deny_domain: Vec::new(),
                 credentials: vec!["github".to_string(), "openai".to_string()],
             }
         );

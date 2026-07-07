@@ -2917,6 +2917,18 @@ pub(crate) fn load_raw_profile_from_path(path: &Path) -> Result<Profile> {
 #[allow(deprecated)]
 pub(crate) fn finalize_profile(mut profile: Profile) -> Result<Profile> {
     profile = apply_platform_overrides(profile)?;
+    // apply_platform_overrides merges platform-specific custom_credentials,
+    // env_credentials, and environment.set_vars into the profile, so those
+    // merged values must be re-validated here — parse_profile_bytes only
+    // validated the pre-merge, top-level values.
+    validate_profile_custom_credentials(&profile)?;
+    validate_env_credential_keys(&profile)?;
+    if let Some(env_config) = profile.environment.as_ref()
+        && !env_config.set_vars.is_empty()
+        && let Some(err) = crate::exec_strategy::validate_set_vars(&env_config.set_vars)
+    {
+        return Err(NonoError::ProfileParse(err));
+    }
     merge_implicit_default_groups(&mut profile)?;
     validate_credential_capture_resolved(&profile)?;
     validate_credential_provider_resolved(&profile)?;
@@ -9809,6 +9821,58 @@ mod tests {
                 .read
                 .contains(&"/other/platform/path".to_string()),
             "other platform's paths must not be present"
+        );
+    }
+
+    #[test]
+    fn platform_overrides_valid_set_vars_merged_and_accepted() {
+        // Positive counterpart to `platform_overrides_set_vars_validated_after_merge`:
+        // a well-formed set_vars entry declared only inside platform_overrides must
+        // survive the merge and finalize successfully, not just get rejected.
+        let current_os = crate::platform::current_os_name();
+        let json = format!(
+            r#"{{
+                "meta": {{"name": "test"}},
+                "platform_overrides": {{
+                    "{current_os}": {{ "environment": {{ "set_vars": {{"MY_VAR": "value"}} }} }}
+                }}
+            }}"#
+        );
+        let profile: Profile = serde_json::from_str(&json).expect("parse");
+        let finalized = finalize_profile(profile).expect("valid set_vars must be accepted");
+        assert_eq!(
+            finalized
+                .environment
+                .as_ref()
+                .expect("environment must be merged in")
+                .set_vars
+                .get("MY_VAR")
+                .map(String::as_str),
+            Some("value"),
+            "merged set_vars entry must be present after finalize"
+        );
+    }
+
+    #[test]
+    fn platform_overrides_set_vars_validated_after_merge() {
+        // Regression: finalize_profile used to skip re-validating
+        // custom_credentials/env_credentials/set_vars after apply_platform_overrides
+        // merged them in, letting an override sneak in a reserved set_vars key.
+        let current_os = crate::platform::current_os_name();
+        let json = format!(
+            r#"{{
+                "meta": {{"name": "test"}},
+                "platform_overrides": {{
+                    "{current_os}": {{ "environment": {{ "set_vars": {{"PATH": "/evil"}} }} }}
+                }}
+            }}"#
+        );
+        let profile: Profile = serde_json::from_str(&json).expect("parse");
+        let err = finalize_profile(profile).expect_err("reserved set_vars key must be rejected");
+        assert!(
+            err.to_string().contains("PATH"),
+            "expected error about reserved PATH key, got: {}",
+            err
         );
     }
 

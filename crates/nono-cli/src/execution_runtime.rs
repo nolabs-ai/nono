@@ -5,8 +5,8 @@ use crate::launch_runtime::{LaunchPlan, select_threading_context};
 use crate::proxy_runtime::start_proxy_runtime;
 use crate::supervised_runtime::{SupervisedRuntimeContext, execute_supervised_runtime};
 use crate::{
-    DETACHED_SESSION_ID_ENV, command_blocking_deprecation, config, exec_strategy, output,
-    sandbox_state, session,
+    DETACHED_SESSION_ID_ENV, command_blocking_deprecation, config, exec_strategy, network_policy,
+    output, sandbox_state, session,
 };
 use nono::undo::{ContentHash, ExecutableIdentity};
 use nono::{CapabilitySet, NonoError, Result, Sandbox};
@@ -224,10 +224,31 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         .iter()
         .chain(endpoint_domain_entries.iter())
         .collect();
-    let allowed_domain_strs: Vec<String> = all_domain_entries
+    // Expand network_profile hosts into the sandbox state so that `nono why --self`
+    // sees the same allowlist that the proxy enforces at runtime.
+    let mut allowed_domain_strs: Vec<String> = all_domain_entries
         .iter()
         .map(|e| e.domain().to_string())
         .collect();
+    if let Some(profile_name) = proxy
+        .and_then(|p| p.domain_filter.as_ref())
+        .and_then(|d| d.network_profile.as_deref())
+    {
+        let policy_json = config::embedded::embedded_network_policy_json();
+        if let Ok(net_policy) = network_policy::load_network_policy(policy_json)
+            && let Ok(resolved) = network_policy::resolve_network_profile(&net_policy, profile_name)
+        {
+            allowed_domain_strs.extend(resolved.hosts);
+            for suffix in &resolved.suffixes {
+                let wildcard = if suffix.starts_with('.') {
+                    format!("*{suffix}")
+                } else {
+                    format!("*.{suffix}")
+                };
+                allowed_domain_strs.push(wildcard);
+            }
+        }
+    }
     let domain_endpoints: Vec<sandbox_state::DomainEndpointState> = all_domain_entries
         .iter()
         .filter_map(|e| match e {

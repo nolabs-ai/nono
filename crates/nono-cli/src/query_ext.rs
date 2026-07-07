@@ -334,16 +334,47 @@ pub fn query_network(
                 },
             }
         }
-        nono::NetworkMode::AllowAll => QueryResult::Allowed {
-            reason: "network_allowed".to_string(),
-            granted_path: None,
-            access: Some(format!(
-                "Connection to {}:{} would be allowed",
-                domain, port
-            )),
-            source: None,
-            endpoint_rules: None,
-        },
+        nono::NetworkMode::AllowAll => {
+            // OS-level network is unrestricted, but a proxy domain filter may still
+            // apply. When allowed_domains is non-empty the proxy is active; check it.
+            if !allowed_domains.is_empty() {
+                let filter = nono::net_filter::HostFilter::new(allowed_domains);
+                match filter.check_host(&domain, &[]) {
+                    nono::net_filter::FilterResult::Allow => QueryResult::Allowed {
+                        reason: "proxy_allowed".to_string(),
+                        granted_path: None,
+                        access: Some(format!(
+                            "Connection to {}:{} would be allowed via proxy",
+                            domain, port
+                        )),
+                        source: Some("domain allowlist".to_string()),
+                        endpoint_rules: None,
+                    },
+                    _ => QueryResult::Denied {
+                        reason: "proxy_filtered".to_string(),
+                        details: Some(format!(
+                            "Domain filtering is active. host {} is not in the allowlist",
+                            domain
+                        )),
+                        policy_source: Some("proxy domain filter".to_string()),
+                        matching_capability: None,
+                        suggested_flag: Some(format!("--allow-domain {}", domain)),
+                        endpoint_rules: None,
+                    },
+                }
+            } else {
+                QueryResult::Allowed {
+                    reason: "network_allowed".to_string(),
+                    granted_path: None,
+                    access: Some(format!(
+                        "Connection to {}:{} would be allowed",
+                        domain, port
+                    )),
+                    source: None,
+                    endpoint_rules: None,
+                }
+            }
+        }
     }
 }
 

@@ -432,6 +432,7 @@ pub(crate) struct PreparedSandbox {
     pub(crate) rollback_exclude_globs: Vec<String>,
     pub(crate) network_profile: Option<String>,
     pub(crate) allow_domain: Vec<profile::AllowDomainEntry>,
+    pub(crate) deny_domain: Vec<String>,
     pub(crate) credentials: Vec<String>,
     pub(crate) custom_credentials: HashMap<String, profile::CustomCredentialDef>,
     pub(crate) credential_capture: HashMap<String, profile::CredentialCaptureEntry>,
@@ -1276,6 +1277,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
                 rollback_exclude_globs,
                 network_profile: None,
                 allow_domain,
+                deny_domain: Vec::new(),
                 credentials,
                 custom_credentials: HashMap::new(),
                 credential_capture: HashMap::new(),
@@ -1333,6 +1335,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         rollback_exclude_globs: profile_rollback_globs,
         network_profile: profile_network_profile,
         allow_domain: profile_allow_domain,
+        deny_domain: profile_deny_domain,
         credentials: profile_credentials,
         custom_credentials: profile_custom_credentials,
         credential_providers: profile_credential_providers,
@@ -1385,6 +1388,8 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         .collect();
     print_allow_domain_port_warnings(&profile_allow_domain_strs, "profile allow_domain", silent);
     print_allow_domain_port_warnings(&args.allow_proxy, "--allow-domain", silent);
+    print_allow_domain_port_warnings(&profile_deny_domain, "profile deny_domain", silent);
+    print_allow_domain_port_warnings(&args.deny_proxy, "--deny-domain", silent);
 
     #[cfg(unix)]
     if args.profile.as_deref().is_some_and(is_claude_code_profile) {
@@ -1657,6 +1662,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
             rollback_exclude_globs: profile_rollback_globs,
             network_profile: profile_network_profile,
             allow_domain: profile_allow_domain,
+            deny_domain: profile_deny_domain,
             credentials: profile_credentials,
             custom_credentials: profile_custom_credentials,
             credential_capture: profile_credential_capture,
@@ -2246,6 +2252,7 @@ mod tests {
             rollback_exclude_globs: Vec::new(),
             network_profile: None,
             allow_domain: Vec::new(),
+            deny_domain: Vec::new(),
             credentials: Vec::new(),
             custom_credentials: std::collections::HashMap::new(),
             credential_capture: std::collections::HashMap::new(),

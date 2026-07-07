@@ -22,6 +22,7 @@ pub(crate) struct PreparedProfile {
     pub(crate) rollback_exclude_globs: Vec<String>,
     pub(crate) network_profile: Option<String>,
     pub(crate) allow_domain: Vec<profile::AllowDomainEntry>,
+    pub(crate) deny_domain: Vec<String>,
     pub(crate) credentials: Vec<String>,
     pub(crate) custom_credentials: HashMap<String, profile::CustomCredentialDef>,
     pub(crate) credential_providers: HashMap<String, profile::CredentialProviderDef>,
@@ -806,6 +807,10 @@ fn prepare_profile_with_options(
         allow_domain: loaded_profile
             .as_ref()
             .map(|profile| profile.network.allow_domain.clone())
+            .unwrap_or_default(),
+        deny_domain: loaded_profile
+            .as_ref()
+            .map(|profile| profile.network.deny_domain.clone())
             .unwrap_or_default(),
         credentials: loaded_profile
             .as_ref()

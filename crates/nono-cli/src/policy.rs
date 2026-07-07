@@ -149,6 +149,8 @@ pub struct ProfileDef {
     pub command_args: Vec<String>,
     #[serde(default)]
     pub unsafe_macos_seatbelt_rules: Vec<String>,
+    #[serde(default)]
+    pub platform_overrides: Option<profile::PlatformOverrides>,
 }
 
 impl ProfileDef {
@@ -187,7 +189,7 @@ impl ProfileDef {
             binary: None,
             command_args: self.command_args.clone(),
             unsafe_macos_seatbelt_rules: self.unsafe_macos_seatbelt_rules.clone(),
-            platform_overrides: None,
+            platform_overrides: self.platform_overrides.clone(),
         }
     }
 }

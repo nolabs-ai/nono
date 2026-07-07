@@ -194,10 +194,15 @@ impl ResolvedToolSandboxPlan {
         _allowed_commands: &[String],
         _blocked_commands: &[String],
         outer_caps: &CapabilitySet,
+        precomputed: Option<&crate::command_policy::ResolvedCommandBinaries>,
     ) -> Result<Self> {
         let path_env = std::env::var_os("PATH");
-        let resolved =
-            crate::command_policy::resolve_policy_command_binaries(config, path_env.clone())?;
+        let resolved = match precomputed {
+            Some(resolved) => resolved.clone(),
+            None => {
+                crate::command_policy::resolve_policy_command_binaries(config, path_env.clone())?
+            }
+        };
         for w in &resolved.warnings {
             if w.code == "command_not_found" {
                 eprintln!("  [nono] Warning: {}", w.message);
@@ -231,6 +236,7 @@ impl PreparedToolSandboxRuntime {
     pub(crate) fn prepare(input: super::ToolSandboxPrepare<'_>) -> Result<Self> {
         let super::ToolSandboxPrepare {
             config,
+            resolved_command_binaries,
             audit_context,
             allowed_commands,
             blocked_commands,
@@ -244,8 +250,13 @@ impl PreparedToolSandboxRuntime {
 
         validate_platform_requirements(config)?;
 
-        let plan =
-            ResolvedToolSandboxPlan::build(config, allowed_commands, blocked_commands, outer_caps)?;
+        let plan = ResolvedToolSandboxPlan::build(
+            config,
+            allowed_commands,
+            blocked_commands,
+            outer_caps,
+            resolved_command_binaries,
+        )?;
 
         let runtime_dir = create_runtime_dir()?;
         let mut cleanup = RuntimeDirCleanup::new(runtime_dir.clone());

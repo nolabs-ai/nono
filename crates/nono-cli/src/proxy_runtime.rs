@@ -3051,6 +3051,7 @@ mod tests {
             secrets: Vec::new(),
             profile_display_name: None,
             command_policies: None,
+            resolved_command_binaries: None,
             credential_capture: HashMap::new(),
             credential_providers: HashMap::new(),
             credential_routes: Vec::new(),

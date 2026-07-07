@@ -44,6 +44,11 @@ pub(crate) struct PreparedProfile {
     /// when the profile has no `set_vars`. Values are expanded with
     /// [`profile::expand_vars`] at prepare time.
     pub(crate) set_vars: Option<Vec<(String, String)>>,
+    /// Command binaries already resolved (canonicalized, stat'd, hashed) while
+    /// validating the profile's `command_policies`. Building the tool-sandbox
+    /// plan reuses this instead of resolving — and re-hashing — every
+    /// controlled binary a second time.
+    pub(crate) resolved_command_binaries: Option<crate::command_policy::ResolvedCommandBinaries>,
 }
 
 #[derive(Clone, Copy)]
@@ -694,7 +699,7 @@ fn prepare_profile_with_options(
         }
     }
 
-    let loaded_profile = if let Some(ref profile_name) = args.profile {
+    let (loaded_profile, resolved_command_binaries) = if let Some(ref profile_name) = args.profile {
         // The claude-code → registry-pack migration is wired into
         // `load_profile` itself so it fires from every call site (run,
         // wrap, shell, profile show, why, learn) without duplication.
@@ -709,7 +714,7 @@ fn prepare_profile_with_options(
         // pack-store resolution — both direct registry refs and name/alias
         // paths — so no post-hoc lookup is needed here.
         let mut packs_to_verify = profile.packs.clone();
-        validate_command_policy_runtime_support(&profile)?;
+        let resolved_command_binaries = validate_command_policy_runtime_support(&profile)?;
 
         // For direct registry refs the pack key may not yet be in packs if
         // load_registry_profile found the pack installed but the profile JSON
@@ -750,9 +755,9 @@ fn prepare_profile_with_options(
         if options.install_hooks {
             install_profile_hooks(Some(profile_name), &profile, options.hook_output_silent);
         }
-        Some(profile)
+        (Some(profile), resolved_command_binaries)
     } else {
-        None
+        (None, None)
     };
 
     precreate_file_json_credential_store_dirs(loaded_profile.as_ref(), workdir);
@@ -897,16 +902,23 @@ fn prepare_profile_with_options(
             .as_ref()
             .and_then(|profile| profile.command_policies.clone()),
         set_vars: expand_profile_set_vars(loaded_profile.as_ref(), workdir)?,
+        resolved_command_binaries,
         loaded_profile,
     })
 }
 
-fn validate_command_policy_runtime_support(profile: &profile::Profile) -> crate::Result<()> {
+/// Validates that the active platform can support the profile's
+/// `command_policies`, returning the binaries resolved along the way (if
+/// any) so callers that go on to build a tool-sandbox plan can reuse this
+/// resolution instead of re-reading and re-hashing every controlled binary.
+fn validate_command_policy_runtime_support(
+    profile: &profile::Profile,
+) -> crate::Result<Option<crate::command_policy::ResolvedCommandBinaries>> {
     let Some(command_policies) = profile.command_policies.as_ref() else {
-        return Ok(());
+        return Ok(None);
     };
     if !command_policies.is_active() {
-        return Ok(());
+        return Ok(None);
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -928,16 +940,20 @@ fn validate_command_policy_runtime_support(profile: &profile::Profile) -> crate:
 }
 
 #[cfg(target_os = "linux")]
-fn validate_linux_command_policy_runtime_support(profile: &profile::Profile) -> crate::Result<()> {
-    if let Some(command_policies) = profile.command_policies.as_ref() {
-        let _resolved = crate::command_policy::resolve_policy_command_binaries(
+fn validate_linux_command_policy_runtime_support(
+    profile: &profile::Profile,
+) -> crate::Result<Option<crate::command_policy::ResolvedCommandBinaries>> {
+    let resolved = if let Some(command_policies) = profile.command_policies.as_ref() {
+        Some(crate::command_policy::resolve_policy_command_binaries(
             command_policies,
             std::env::var_os("PATH"),
-        )?;
-    }
+        )?)
+    } else {
+        None
+    };
 
     if !command_policies_use_tcp_port_rules(profile) {
-        return Ok(());
+        return Ok(resolved);
     }
 
     let abi = nono::detect_abi().map_err(|err| {
@@ -951,18 +967,22 @@ fn validate_linux_command_policy_runtime_support(profile: &profile::Profile) -> 
             abi
         )));
     }
-    Ok(())
+    Ok(resolved)
 }
 
 #[cfg(target_os = "macos")]
-fn validate_macos_command_policy_runtime_support(profile: &profile::Profile) -> crate::Result<()> {
-    if let Some(command_policies) = profile.command_policies.as_ref() {
-        let _resolved = crate::command_policy::resolve_policy_command_binaries(
+fn validate_macos_command_policy_runtime_support(
+    profile: &profile::Profile,
+) -> crate::Result<Option<crate::command_policy::ResolvedCommandBinaries>> {
+    let resolved = if let Some(command_policies) = profile.command_policies.as_ref() {
+        Some(crate::command_policy::resolve_policy_command_binaries(
             command_policies,
             std::env::var_os("PATH"),
-        )?;
-    }
-    Ok(())
+        )?)
+    } else {
+        None
+    };
+    Ok(resolved)
 }
 
 #[cfg(target_os = "linux")]

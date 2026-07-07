@@ -55,14 +55,12 @@ pub(crate) struct CommandPolicyValidationReport {
     pub info: Vec<CommandPolicyFinding>,
 }
 
-#[cfg(any(test, target_os = "linux", target_os = "macos"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ResolvedCommandBinaries {
     pub commands: BTreeMap<String, ResolvedCommandBinary>,
     pub warnings: Vec<CommandPolicyFinding>,
 }
 
-#[cfg(any(test, target_os = "linux", target_os = "macos"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ResolvedCommandBinary {
     pub name: String,
@@ -76,7 +74,6 @@ pub(crate) struct ResolvedCommandBinary {
     pub shape: ResolvedExecutableShape,
 }
 
-#[cfg(any(test, target_os = "linux", target_os = "macos"))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ResolvedExecutableKind {
@@ -85,7 +82,6 @@ pub(crate) enum ResolvedExecutableKind {
     Other,
 }
 
-#[cfg(any(test, target_os = "linux", target_os = "macos"))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct ResolvedExecutableShape {
     pub kind: ResolvedExecutableKind,
@@ -1034,16 +1030,111 @@ pub(crate) fn validate_legacy_blocked_command_interactions(
     report
 }
 
+/// Resolution outcome for a single `command_policies.commands` entry: the
+/// matched binary (if any) plus any warnings raised along the way
+/// (`command_not_found`, `duplicate_path_command`, `script_entrypoint`).
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
+type CommandResolution = (
+    String,
+    Option<(CommandMatch, Vec<PathBuf>)>,
+    Vec<CommandPolicyFinding>,
+);
+
 #[cfg(any(test, target_os = "linux", target_os = "macos"))]
 pub(crate) fn resolve_policy_command_binaries(
     config: &CommandPoliciesConfig,
     path_env: Option<OsString>,
 ) -> nono::Result<ResolvedCommandBinaries> {
-    let mut commands = BTreeMap::new();
-    let mut warnings = Vec::new();
     let search_dirs = command_search_dirs(config, path_env)?;
 
-    for (command_name, command) in &config.commands {
+    // Command binaries are independent of one another (each is its own
+    // canonicalize+stat+read+hash), so resolve them across a pool of scoped
+    // threads instead of one at a time — the dominant cost here is I/O and
+    // SHA-256 throughput, both of which parallelize cleanly across files.
+    // `config.commands` is a `BTreeMap`, so iteration order (and therefore
+    // warning order) is already deterministic; chunking in that order and
+    // reassembling chunk-by-chunk below preserves it exactly.
+    let entries: Vec<(&String, &CommandPolicyConfig)> = config.commands.iter().collect();
+    let worker_count = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(entries.len().max(1));
+    let chunk_size = entries.len().div_ceil(worker_count.max(1)).max(1);
+
+    let chunk_results: Vec<nono::Result<Vec<CommandResolution>>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = entries
+            .chunks(chunk_size)
+            .map(|chunk| scope.spawn(|| resolve_command_chunk(chunk, &search_dirs)))
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| {
+                handle.join().unwrap_or_else(|_| {
+                    Err(nono::NonoError::ProfileParse(
+                        "command policy resolution worker thread panicked".to_string(),
+                    ))
+                })
+            })
+            .collect()
+    });
+
+    let mut commands = BTreeMap::new();
+    let mut warnings = Vec::new();
+    for chunk_result in chunk_results {
+        for (command_name, resolution, command_warnings) in chunk_result? {
+            warnings.extend(command_warnings);
+            let Some((selected, duplicate_paths)) = resolution else {
+                continue;
+            };
+
+            if selected.shape.kind == ResolvedExecutableKind::ShebangScript {
+                let interpreter = selected
+                    .shape
+                    .interpreter
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "<unknown>".to_string());
+                warnings.push(CommandPolicyFinding::new(
+                    "script_entrypoint",
+                    format!(
+                        "command policy '{command_name}' resolved to script {}; child policy must grant interpreter/runtime {} explicitly",
+                        selected.canonical_path.display(),
+                        interpreter
+                    ),
+                ));
+            }
+
+            let resolved_binary = ResolvedCommandBinary {
+                name: command_name.clone(),
+                canonical_path: selected.canonical_path.clone(),
+                dev: selected.dev,
+                ino: selected.ino,
+                size: selected.size,
+                mtime_nanos: selected.mtime_nanos,
+                sha256: selected.sha256.clone(),
+                duplicate_paths,
+                shape: selected.shape.clone(),
+            };
+            commands.insert(command_name, resolved_binary);
+        }
+    }
+
+    Ok(ResolvedCommandBinaries { commands, warnings })
+}
+
+/// Resolve a contiguous slice of `command_policies.commands` entries.
+/// Runs on a worker thread in [`resolve_policy_command_binaries`]; performs
+/// no shared-state mutation, so each entry's canonicalize→stat→hash→classify
+/// sequence stays atomic within a single thread (no per-command TOCTOU is
+/// introduced by parallelizing across commands).
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
+fn resolve_command_chunk(
+    chunk: &[(&String, &CommandPolicyConfig)],
+    search_dirs: &[CommandSearchDir],
+) -> nono::Result<Vec<CommandResolution>> {
+    let mut results = Vec::with_capacity(chunk.len());
+    for (command_name, command) in chunk {
+        let mut warnings = Vec::new();
         let resolution = if let Some(executable) = &command.executable {
             match candidate_command_match(&PathBuf::from(executable))? {
                 Some(m) => Some((m, Vec::new())),
@@ -1059,7 +1150,7 @@ pub(crate) fn resolve_policy_command_binaries(
                 }
             }
         } else {
-            let matches = find_command_matches(command_name, &search_dirs)?;
+            let matches = find_command_matches(command_name, search_dirs)?;
             match matches.first() {
                 None => {
                     warnings.push(CommandPolicyFinding::new(
@@ -1091,44 +1182,9 @@ pub(crate) fn resolve_policy_command_binaries(
             }
         };
 
-        let Some((selected, duplicate_paths)) = resolution else {
-            continue;
-        };
-
-        if selected.shape.kind == ResolvedExecutableKind::ShebangScript {
-            let interpreter = selected
-                .shape
-                .interpreter
-                .as_ref()
-                .map(|path| path.display().to_string())
-                .unwrap_or_else(|| "<unknown>".to_string());
-            warnings.push(CommandPolicyFinding::new(
-                "script_entrypoint",
-                format!(
-                    "command policy '{command_name}' resolved to script {}; child policy must grant interpreter/runtime {} explicitly",
-                    selected.canonical_path.display(),
-                    interpreter
-                ),
-            ));
-        }
-
-        commands.insert(
-            command_name.clone(),
-            ResolvedCommandBinary {
-                name: command_name.clone(),
-                canonical_path: selected.canonical_path.clone(),
-                dev: selected.dev,
-                ino: selected.ino,
-                size: selected.size,
-                mtime_nanos: selected.mtime_nanos,
-                sha256: selected.sha256.clone(),
-                duplicate_paths,
-                shape: selected.shape.clone(),
-            },
-        );
+        results.push(((*command_name).clone(), resolution, warnings));
     }
-
-    Ok(ResolvedCommandBinaries { commands, warnings })
+    Ok(results)
 }
 
 /// Pre-resolve every `exec` intercept helper referenced by any command policy.
@@ -4655,5 +4711,55 @@ mod tests {
                 .any(|f| f.code == "invalid_stdio_limit"),
             "expected invalid_stdio_limit error"
         );
+    }
+
+    /// A resolved candidate's binary contents feed both its digest and its
+    /// shape classification (shebang vs. ELF); this should stay consistent
+    /// after the resolution is reused across the validation and sandbox-plan
+    /// build passes instead of being recomputed.
+    #[test]
+    fn candidate_command_match_hashes_and_classifies_shebang_script() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("script.sh");
+        let contents = b"#!/usr/bin/env bash\necho hi\n";
+        write_executable(&path, contents);
+
+        let expected_sha256 = Sha256::digest(contents)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+
+        let matched = candidate_command_match(&path)
+            .expect("resolve candidate")
+            .expect("candidate should match");
+
+        assert_eq!(matched.sha256, expected_sha256);
+        assert_eq!(matched.shape.kind, ResolvedExecutableKind::ShebangScript);
+        assert_eq!(
+            matched.shape.interpreter,
+            Some(PathBuf::from("/usr/bin/env"))
+        );
+        assert_eq!(matched.shape.interpreter_args, vec!["bash".to_string()]);
+    }
+
+    #[test]
+    fn candidate_command_match_hashes_and_classifies_elf_like_binary() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("binary");
+        let mut contents = b"\x7fELF".to_vec();
+        contents.extend(std::iter::repeat_n(0u8, 4096));
+        write_executable(&path, &contents);
+
+        let expected_sha256 = Sha256::digest(&contents)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+
+        let matched = candidate_command_match(&path)
+            .expect("resolve candidate")
+            .expect("candidate should match");
+
+        assert_eq!(matched.sha256, expected_sha256);
+        assert_eq!(matched.shape.kind, ResolvedExecutableKind::Elf);
     }
 }

@@ -244,6 +244,9 @@ pub(crate) struct ExecutionFlags {
     pub(crate) set_vars: Option<Vec<(String, String)>>,
     pub(crate) startup_timeout_secs: Option<u64>,
     pub(crate) command_policies: Option<crate::command_policy::CommandPoliciesConfig>,
+    /// Command binaries already resolved while validating `command_policies`,
+    /// reused when building the tool-sandbox plan instead of re-resolving.
+    pub(crate) resolved_command_binaries: Option<crate::command_policy::ResolvedCommandBinaries>,
 }
 
 impl ExecutionFlags {
@@ -294,6 +297,7 @@ impl ExecutionFlags {
             set_vars: prepared.set_vars.clone(),
             startup_timeout_secs: None,
             command_policies: prepared.command_policies.clone(),
+            resolved_command_binaries: prepared.resolved_command_binaries.clone(),
         })
     }
 }

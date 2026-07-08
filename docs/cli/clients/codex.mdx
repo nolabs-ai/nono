@@ -227,6 +227,23 @@ If you want Codex limited to the built-in host allowlist for coding workflows:
 nono run --profile always-further/codex --network-profile codex -- codex --sandbox danger-full-access --ask-for-approval on-request
 ```
 
+#### Codex Shell-based Tools
+
+The `allow_login_shell` configuration key in Codex controls whether shell-based tools use login-shell semantics. When disabled, login-shell requests are rejected and the subprocess falls back to a non-login shell. This matters because, even with the Codex sandbox disabled, Codex subprocesses will have a narrow set of environment variables.
+
+As a result:
+
+- when domain filtering is enabled, all network requests from commands executed by Codex are denied, regardless of the allowlist;
+- tool commands no longer appear to run inside nono.
+
+Because nono is already sandboxing the execution and filtering environment variables, you can start Codex with its own sandbox and optional hardening disabled.
+
+Recommended invocation:
+
+```bash
+nono run --profile always-further/codex --network-profile codex -- codex --sandbox danger-full-access --ask-for-approval on-request --config allow_login_shell=true
+```
+
 ### Additional Home-Directory Tools
 
 The profile covers common Rust, Node.js, Python, and Nix runtime locations under `~/`, but some developer tools still install into other home-directory paths such as `~/go/bin` or `~/.bun/bin`.

@@ -384,6 +384,17 @@
         ]
       }
     },
+    "mise_manager": {
+      "description": "Mise - dev tools, env vars, task runner",
+      "allow": {
+        "read": [
+          "/etc/mise",
+          "~/.local/bin/mise",
+          "~/.config/mise",
+          "~/.local/share/mise"
+        ]
+      }
+    },
     "python_runtime": {
       "description": "Python runtime paths (pyenv, conda, uv)",
       "allow": {
@@ -712,6 +723,25 @@
       "undo": {
         "exclude_patterns": ["node_modules", ".next"]
       },
+      "interactive": false
+    },
+    "mise-dev": {
+      "extends": "default",
+      "meta": {
+        "name": "mise-dev",
+        "version": "1.0.0",
+        "description": "Mise: dev tools, env vars, task runner",
+        "author": "always-further"
+      },
+      "groups": {
+        "include": ["mise_manager"]
+      },
+      "security": {
+        "signal_mode": "isolated"
+      },
+      "filesystem": {},
+      "network": { "block": false, "network_profile": "developer" },
+      "workdir": { "access": "readwrite" },
       "interactive": false
     },
     "python-dev": {

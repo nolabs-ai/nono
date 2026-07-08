@@ -618,6 +618,7 @@ const AVAILABLE_GROUPS: &[&str] = &[
     "python_runtime",
     "rust_runtime",
     "user_tools",
+    "mise_manager",
     "unlink_protection",
 ];
 

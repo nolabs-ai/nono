@@ -20,6 +20,8 @@
           "~/.git-credentials",
           "~/.netrc",
           "~/.npmrc",
+          "~/.bunfig.toml",
+          "~/.config/bun/bunfig.toml",
           "~/.vault-token",
           "~/.credentials",
           "~/.secrets",

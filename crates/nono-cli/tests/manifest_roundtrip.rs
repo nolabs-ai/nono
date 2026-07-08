@@ -616,6 +616,7 @@ const AVAILABLE_GROUPS: &[&str] = &[
     "git_config",
     "bun_runtime"
     "node_runtime",
+    "bun_runtime",
     "python_runtime",
     "rust_runtime",
     "user_tools",

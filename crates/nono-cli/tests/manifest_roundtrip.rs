@@ -614,7 +614,6 @@ const AVAILABLE_GROUPS: &[&str] = &[
     "deny_shell_history",
     "dangerous_commands",
     "git_config",
-    "bun_runtime"
     "node_runtime",
     "bun_runtime",
     "python_runtime",

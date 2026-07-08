@@ -5,7 +5,7 @@
 //! this typed config after profile inheritance has been resolved.
 
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 #[cfg(any(test, target_os = "linux", target_os = "macos"))]
 use std::ffi::OsString;
 #[cfg(any(test, target_os = "linux", target_os = "macos"))]
@@ -16,7 +16,7 @@ use std::path::Path;
 #[cfg(any(test, target_os = "linux", target_os = "macos"))]
 use std::path::PathBuf;
 
-#[cfg(any(test, target_os = "linux", target_os = "macos"))]
+#[cfg(test)]
 use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,14 +55,12 @@ pub(crate) struct CommandPolicyValidationReport {
     pub info: Vec<CommandPolicyFinding>,
 }
 
-#[cfg(any(test, target_os = "linux", target_os = "macos"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ResolvedCommandBinaries {
     pub commands: BTreeMap<String, ResolvedCommandBinary>,
     pub warnings: Vec<CommandPolicyFinding>,
 }
 
-#[cfg(any(test, target_os = "linux", target_os = "macos"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ResolvedCommandBinary {
     pub name: String,
@@ -76,8 +74,7 @@ pub(crate) struct ResolvedCommandBinary {
     pub shape: ResolvedExecutableShape,
 }
 
-#[cfg(any(test, target_os = "linux", target_os = "macos"))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ResolvedExecutableKind {
     Elf,
@@ -85,14 +82,86 @@ pub(crate) enum ResolvedExecutableKind {
     Other,
 }
 
-#[cfg(any(test, target_os = "linux", target_os = "macos"))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ResolvedExecutableShape {
     pub kind: ResolvedExecutableKind,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interpreter: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub interpreter_args: Vec<String>,
+}
+
+/// On-disk cache entry for [`resolve_policy_command_binaries`], keyed by
+/// `{dev}:{ino}:{size}:{mtime_nanos}`. Never authoritative: nono re-opens and
+/// re-hashes the real binary at exec time on every platform, so a stale entry
+/// can only cause a spurious hash-mismatch rejection, never execution of
+/// unintended content.
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CachedCommandHash {
+    pub sha256: String,
+    pub shape: ResolvedExecutableShape,
+}
+
+/// Persisted form of the command-hash cache file. No schema/version field —
+/// matches this codebase's convention (see `update_check.rs`, `pack_update_hint.rs`)
+/// of using `#[serde(default)]` per field for back-compat instead.
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct CommandHashCacheFile {
+    #[serde(default)]
+    entries: HashMap<String, CachedCommandHash>,
+}
+
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
+const COMMAND_HASH_CACHE_FILE: &str = "command-hash-cache.json";
+
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
+fn command_hash_cache_key(dev: u64, ino: u64, size: u64, mtime_nanos: i128) -> String {
+    format!("{dev}:{ino}:{size}:{mtime_nanos}")
+}
+
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
+fn command_hash_cache_file_path() -> Option<PathBuf> {
+    crate::state_paths::user_state_dir()
+        .ok()
+        .map(|dir| dir.join(COMMAND_HASH_CACHE_FILE))
+}
+
+/// Load the command-hash cache, best-effort. Any missing file, I/O error, or
+/// parse failure returns an empty cache — the resolution simply falls back to
+/// hashing everything fresh, exactly as if caching were disabled.
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
+fn load_command_hash_cache() -> HashMap<String, CachedCommandHash> {
+    let Some(path) = command_hash_cache_file_path() else {
+        return HashMap::new();
+    };
+    let Ok(content) = fs::read_to_string(&path) else {
+        return HashMap::new();
+    };
+    serde_json::from_str::<CommandHashCacheFile>(&content)
+        .map(|file| file.entries)
+        .unwrap_or_default()
+}
+
+/// Persist the command-hash cache, best-effort (write failures are silently
+/// ignored — the cache is purely an optimization).
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
+fn save_command_hash_cache(entries: &HashMap<String, CachedCommandHash>) {
+    let Some(path) = command_hash_cache_file_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent()
+        && fs::create_dir_all(parent).is_err()
+    {
+        return;
+    }
+    let file = CommandHashCacheFile {
+        entries: entries.clone(),
+    };
+    if let Ok(content) = serde_json::to_string_pretty(&file) {
+        let _ = fs::write(&path, content);
+    }
 }
 
 impl Default for CommandPolicyValidationReport {
@@ -640,6 +709,10 @@ pub struct CommandSandboxConfig {
     /// command (or per-intercept override). Ignored on Linux.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unsafe_macos_seatbelt_rules: Vec<String>,
+    /// Extra paths this command may `exec` (Linux only), for multi-call
+    /// tools like `git` that re-exec their own helpers by absolute path.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exec_paths: Vec<String>,
 }
 
 impl CommandSandboxConfig {
@@ -667,6 +740,7 @@ impl CommandSandboxConfig {
                 &self.unsafe_macos_seatbelt_rules,
                 &child.unsafe_macos_seatbelt_rules,
             ),
+            exec_paths: dedup_append(&self.exec_paths, &child.exec_paths),
         }
     }
 }
@@ -1049,19 +1123,141 @@ pub(crate) fn validate_legacy_blocked_command_interactions(
     report
 }
 
+/// Resolution outcome for a single `command_policies.commands` entry: the
+/// matched binary (if any) plus any warnings raised along the way
+/// (`command_not_found`, `duplicate_path_command`, `script_entrypoint`).
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
+type CommandResolution = (
+    String,
+    Option<(CommandMatch, Vec<PathBuf>)>,
+    Vec<CommandPolicyFinding>,
+);
+
+/// A single `(cache_key, entry)` pair produced by a cache-missed resolution,
+/// to be merged into the persisted command-hash cache.
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
+type CommandHashCacheUpdate = (String, CachedCommandHash);
+
 #[cfg(any(test, target_os = "linux", target_os = "macos"))]
 pub(crate) fn resolve_policy_command_binaries(
     config: &CommandPoliciesConfig,
     path_env: Option<OsString>,
 ) -> nono::Result<ResolvedCommandBinaries> {
-    let mut commands = BTreeMap::new();
-    let mut warnings = Vec::new();
     let search_dirs = command_search_dirs(config, path_env)?;
 
-    for (command_name, command) in &config.commands {
+    // Loaded once, before the thread pool starts, and only ever read from
+    // inside worker threads — no locking needed on the hot path. Misses are
+    // collected per-chunk and merged into a fresh copy after the join below.
+    let cache = load_command_hash_cache();
+
+    // Command binaries are independent of one another (each is its own
+    // canonicalize+stat+read+hash), so resolve them across a pool of scoped
+    // threads instead of one at a time — the dominant cost here is I/O and
+    // SHA-256 throughput, both of which parallelize cleanly across files.
+    // `config.commands` is a `BTreeMap`, so iteration order (and therefore
+    // warning order) is already deterministic; chunking in that order and
+    // reassembling chunk-by-chunk below preserves it exactly.
+    let entries: Vec<(&String, &CommandPolicyConfig)> = config.commands.iter().collect();
+    let worker_count = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(entries.len().max(1));
+    let chunk_size = entries.len().div_ceil(worker_count.max(1)).max(1);
+
+    type ChunkOutcome = (Vec<CommandResolution>, Vec<CommandHashCacheUpdate>);
+    let chunk_results: Vec<nono::Result<ChunkOutcome>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = entries
+            .chunks(chunk_size)
+            .map(|chunk| scope.spawn(|| resolve_command_chunk(chunk, &search_dirs, &cache)))
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| {
+                handle.join().unwrap_or_else(|_| {
+                    Err(nono::NonoError::ProfileParse(
+                        "command policy resolution worker thread panicked".to_string(),
+                    ))
+                })
+            })
+            .collect()
+    });
+
+    let mut commands = BTreeMap::new();
+    let mut warnings = Vec::new();
+    let mut new_cache_entries = Vec::new();
+    for chunk_result in chunk_results {
+        let (resolutions, chunk_new_entries) = chunk_result?;
+        new_cache_entries.extend(chunk_new_entries);
+        for (command_name, resolution, command_warnings) in resolutions {
+            warnings.extend(command_warnings);
+            let Some((selected, duplicate_paths)) = resolution else {
+                continue;
+            };
+
+            if selected.shape.kind == ResolvedExecutableKind::ShebangScript {
+                let interpreter = selected
+                    .shape
+                    .interpreter
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "<unknown>".to_string());
+                warnings.push(CommandPolicyFinding::new(
+                    "script_entrypoint",
+                    format!(
+                        "command policy '{command_name}' resolved to script {}; child policy must grant interpreter/runtime {} explicitly",
+                        selected.canonical_path.display(),
+                        interpreter
+                    ),
+                ));
+            }
+
+            let resolved_binary = ResolvedCommandBinary {
+                name: command_name.clone(),
+                canonical_path: selected.canonical_path.clone(),
+                dev: selected.dev,
+                ino: selected.ino,
+                size: selected.size,
+                mtime_nanos: selected.mtime_nanos,
+                sha256: selected.sha256.clone(),
+                duplicate_paths,
+                shape: selected.shape.clone(),
+            };
+            commands.insert(command_name, resolved_binary);
+        }
+    }
+
+    if !new_cache_entries.is_empty() {
+        let mut merged = cache;
+        merged.extend(new_cache_entries);
+        save_command_hash_cache(&merged);
+    }
+
+    Ok(ResolvedCommandBinaries { commands, warnings })
+}
+
+/// Resolve a contiguous slice of `command_policies.commands` entries.
+/// Runs on a worker thread in [`resolve_policy_command_binaries`]; performs
+/// no shared-state mutation, so each entry's canonicalize→stat→hash→classify
+/// sequence stays atomic within a single thread (no per-command TOCTOU is
+/// introduced by parallelizing across commands).
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
+fn resolve_command_chunk(
+    chunk: &[(&String, &CommandPolicyConfig)],
+    search_dirs: &[CommandSearchDir],
+    cache: &HashMap<String, CachedCommandHash>,
+) -> nono::Result<(Vec<CommandResolution>, Vec<CommandHashCacheUpdate>)> {
+    let mut results = Vec::with_capacity(chunk.len());
+    let mut new_cache_entries = Vec::new();
+    for (command_name, command) in chunk {
+        let mut warnings = Vec::new();
         let resolution = if let Some(executable) = &command.executable {
-            match candidate_command_match(&PathBuf::from(executable))? {
-                Some(m) => Some((m, Vec::new())),
+            match candidate_command_match(&PathBuf::from(executable), cache)? {
+                Some((m, update)) => {
+                    if let Some(update) = update {
+                        new_cache_entries.push(update);
+                    }
+                    Some((m, Vec::new()))
+                }
                 None => {
                     warnings.push(CommandPolicyFinding::new(
                         "command_not_found",
@@ -1074,7 +1270,8 @@ pub(crate) fn resolve_policy_command_binaries(
                 }
             }
         } else {
-            let matches = find_command_matches(command_name, &search_dirs)?;
+            let matches =
+                find_command_matches(command_name, search_dirs, cache, &mut new_cache_entries)?;
             match matches.first() {
                 None => {
                     warnings.push(CommandPolicyFinding::new(
@@ -1106,44 +1303,9 @@ pub(crate) fn resolve_policy_command_binaries(
             }
         };
 
-        let Some((selected, duplicate_paths)) = resolution else {
-            continue;
-        };
-
-        if selected.shape.kind == ResolvedExecutableKind::ShebangScript {
-            let interpreter = selected
-                .shape
-                .interpreter
-                .as_ref()
-                .map(|path| path.display().to_string())
-                .unwrap_or_else(|| "<unknown>".to_string());
-            warnings.push(CommandPolicyFinding::new(
-                "script_entrypoint",
-                format!(
-                    "command policy '{command_name}' resolved to script {}; child policy must grant interpreter/runtime {} explicitly",
-                    selected.canonical_path.display(),
-                    interpreter
-                ),
-            ));
-        }
-
-        commands.insert(
-            command_name.clone(),
-            ResolvedCommandBinary {
-                name: command_name.clone(),
-                canonical_path: selected.canonical_path.clone(),
-                dev: selected.dev,
-                ino: selected.ino,
-                size: selected.size,
-                mtime_nanos: selected.mtime_nanos,
-                sha256: selected.sha256.clone(),
-                duplicate_paths,
-                shape: selected.shape.clone(),
-            },
-        );
+        results.push(((*command_name).clone(), resolution, warnings));
     }
-
-    Ok(ResolvedCommandBinaries { commands, warnings })
+    Ok((results, new_cache_entries))
 }
 
 /// Pre-resolve every `exec` intercept helper referenced by any command policy.
@@ -1186,11 +1348,15 @@ pub(crate) fn resolve_policy_exec_helpers(
             if helpers.contains_key(&helper_path) {
                 continue;
             }
-            let resolved = candidate_command_match(&helper_path)?.ok_or_else(|| {
-                nono::NonoError::ProfileParse(format!(
-                    "command '{command_name}' intercept rule {rule_index} exec helper '{expanded}' not found or not executable"
-                ))
-            })?;
+            // Not scoped by the command-hash cache (that cache only covers
+            // `resolve_policy_command_binaries`'s measured hot path); an
+            // empty map here always misses, so this always hashes fresh.
+            let (resolved, _) = candidate_command_match(&helper_path, &HashMap::new())?
+                .ok_or_else(|| {
+                    nono::NonoError::ProfileParse(format!(
+                        "command '{command_name}' intercept rule {rule_index} exec helper '{expanded}' not found or not executable"
+                    ))
+                })?;
             helpers.insert(
                 helper_path,
                 ResolvedCommandBinary {
@@ -2533,14 +2699,21 @@ fn command_search_dirs(
 fn find_command_matches(
     command_name: &str,
     search_dirs: &[CommandSearchDir],
+    cache: &HashMap<String, CachedCommandHash>,
+    new_cache_entries: &mut Vec<CommandHashCacheUpdate>,
 ) -> nono::Result<Vec<CommandMatch>> {
     let mut matches = Vec::new();
     let mut explicit_errors = Vec::new();
 
     for dir in search_dirs {
         let candidate = dir.path.join(command_name);
-        match candidate_command_match(&candidate) {
-            Ok(Some(command_match)) => matches.push(command_match),
+        match candidate_command_match(&candidate, cache) {
+            Ok(Some((command_match, update))) => {
+                if let Some(update) = update {
+                    new_cache_entries.push(update);
+                }
+                matches.push(command_match);
+            }
             Ok(None) => {}
             Err(err) if dir.explicit => {
                 explicit_errors.push(format!("{}: {err}", candidate.display()))
@@ -2559,8 +2732,23 @@ fn find_command_matches(
     Ok(matches)
 }
 
+/// Bounded prefix read for executable-shape classification (ELF magic is 4
+/// bytes; a real-world shebang line is always well under this). Kept small
+/// and separate from the hash so the hash itself can stream the whole file
+/// without holding it in memory.
 #[cfg(any(test, target_os = "linux", target_os = "macos"))]
-fn candidate_command_match(candidate: &Path) -> nono::Result<Option<CommandMatch>> {
+const SHAPE_CLASSIFICATION_PREFIX_BYTES: usize = 4096;
+
+/// Resolve `candidate` to a [`CommandMatch`], consulting `cache` (keyed by
+/// `{dev}:{ino}:{size}:{mtime_nanos}`) before hashing. On a cache miss, the
+/// second element of the returned tuple carries the freshly computed
+/// `(key, CachedCommandHash)` pair for the caller to persist; `None` means
+/// either a cache hit or no cache in use (pass an empty map to always miss).
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
+fn candidate_command_match(
+    candidate: &Path,
+    cache: &HashMap<String, CachedCommandHash>,
+) -> nono::Result<Option<(CommandMatch, Option<CommandHashCacheUpdate>)>> {
     let metadata = match fs::metadata(candidate) {
         Ok(metadata) => metadata,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -2583,30 +2771,66 @@ fn candidate_command_match(candidate: &Path) -> nono::Result<Option<CommandMatch
             canonical_path.display()
         ))
     })?;
-    let bytes = fs::read(&canonical_path).map_err(|err| {
-        nono::NonoError::ProfileParse(format!(
-            "failed to hash command candidate '{}': {err}",
-            canonical_path.display()
-        ))
-    })?;
-    let sha256 = Sha256::digest(&bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    let shape = classify_executable_shape(&canonical_path, &bytes)?;
 
+    let dev = canonical_metadata.dev();
+    let ino = canonical_metadata.ino();
+    let size = canonical_metadata.size();
     let mtime_nanos = (canonical_metadata.mtime() as i128)
         .saturating_mul(1_000_000_000)
         .saturating_add(canonical_metadata.mtime_nsec() as i128);
-    Ok(Some(CommandMatch {
-        canonical_path,
-        dev: canonical_metadata.dev(),
-        ino: canonical_metadata.ino(),
-        size: canonical_metadata.size(),
-        mtime_nanos,
-        sha256,
-        shape,
-    }))
+    let cache_key = command_hash_cache_key(dev, ino, size, mtime_nanos);
+
+    let (sha256, shape, cache_update) = if let Some(cached) = cache.get(&cache_key) {
+        (cached.sha256.clone(), cached.shape.clone(), None)
+    } else {
+        let sha256 = nono::trust::file_digest(&canonical_path).map_err(|err| {
+            nono::NonoError::ProfileParse(format!(
+                "failed to hash command candidate '{}': {err}",
+                canonical_path.display()
+            ))
+        })?;
+        let prefix = read_command_prefix(&canonical_path, SHAPE_CLASSIFICATION_PREFIX_BYTES)?;
+        let shape = classify_executable_shape(&canonical_path, &prefix)?;
+        let entry = CachedCommandHash {
+            sha256: sha256.clone(),
+            shape: shape.clone(),
+        };
+        (sha256, shape, Some((cache_key, entry)))
+    };
+
+    Ok(Some((
+        CommandMatch {
+            canonical_path,
+            dev,
+            ino,
+            size,
+            mtime_nanos,
+            sha256,
+            shape,
+        },
+        cache_update,
+    )))
+}
+
+/// Read up to `max_bytes` from the start of `path`, for shape classification.
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
+fn read_command_prefix(path: &Path, max_bytes: usize) -> nono::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut file = fs::File::open(path).map_err(|err| {
+        nono::NonoError::ProfileParse(format!(
+            "failed to read command candidate '{}': {err}",
+            path.display()
+        ))
+    })?;
+    let mut buf = vec![0u8; max_bytes];
+    let n = file.read(&mut buf).map_err(|err| {
+        nono::NonoError::ProfileParse(format!(
+            "failed to read command candidate '{}': {err}",
+            path.display()
+        ))
+    })?;
+    buf.truncate(n);
+    Ok(buf)
 }
 
 #[cfg(any(test, target_os = "linux", target_os = "macos"))]
@@ -3234,6 +3458,38 @@ mod tests {
                 "(allow iokit-open)".to_string(),
                 "(allow process-exec* (literal \"/usr/bin/security\"))".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn command_sandbox_exec_paths_merge_child_dedup_appends() {
+        let base = CommandSandboxConfig {
+            exec_paths: vec!["/usr/lib/git-core".to_string()],
+            ..Default::default()
+        };
+        let child = CommandSandboxConfig {
+            exec_paths: vec![
+                "/usr/lib/git-core".to_string(),
+                "/opt/tool/libexec".to_string(),
+            ],
+            ..Default::default()
+        };
+        let merged = base.merge_child(&child);
+        assert_eq!(
+            merged.exec_paths,
+            vec![
+                "/usr/lib/git-core".to_string(),
+                "/opt/tool/libexec".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn command_sandbox_empty_exec_paths_omitted_from_serialization() {
+        let value = serde_json::to_value(CommandSandboxConfig::default()).expect("serialize");
+        assert!(
+            value.get("exec_paths").is_none(),
+            "empty exec_paths should be omitted, got {value}"
         );
     }
 
@@ -5066,5 +5322,152 @@ mod tests {
                 .any(|f| f.code == "invalid_stdio_limit"),
             "expected invalid_stdio_limit error"
         );
+    }
+
+    /// A resolved candidate's binary contents feed both its digest and its
+    /// shape classification (shebang vs. ELF); this should stay consistent
+    /// after the resolution is reused across the validation and sandbox-plan
+    /// build passes instead of being recomputed.
+    #[test]
+    fn candidate_command_match_hashes_and_classifies_shebang_script() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("script.sh");
+        let contents = b"#!/usr/bin/env bash\necho hi\n";
+        write_executable(&path, contents);
+
+        let expected_sha256 = Sha256::digest(contents)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+
+        let (matched, cache_update) = candidate_command_match(&path, &HashMap::new())
+            .expect("resolve candidate")
+            .expect("candidate should match");
+
+        assert_eq!(matched.sha256, expected_sha256);
+        assert_eq!(matched.shape.kind, ResolvedExecutableKind::ShebangScript);
+        assert_eq!(
+            matched.shape.interpreter,
+            Some(PathBuf::from("/usr/bin/env"))
+        );
+        assert_eq!(matched.shape.interpreter_args, vec!["bash".to_string()]);
+        assert!(cache_update.is_some(), "empty cache should always miss");
+    }
+
+    #[test]
+    fn candidate_command_match_hashes_and_classifies_elf_like_binary() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("binary");
+        let mut contents = b"\x7fELF".to_vec();
+        contents.extend(std::iter::repeat_n(0u8, 4096));
+        write_executable(&path, &contents);
+
+        let expected_sha256 = Sha256::digest(&contents)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+
+        let (matched, _) = candidate_command_match(&path, &HashMap::new())
+            .expect("resolve candidate")
+            .expect("candidate should match");
+
+        assert_eq!(matched.sha256, expected_sha256);
+        assert_eq!(matched.shape.kind, ResolvedExecutableKind::Elf);
+    }
+
+    /// A cache hit must skip the read+hash entirely and return identical
+    /// output to a fresh resolution — proven by seeding the cache with a
+    /// deliberately wrong sha256 and asserting the wrong value comes back.
+    #[test]
+    fn candidate_command_match_uses_cached_hash_on_hit() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("script.sh");
+        let contents = b"#!/bin/sh\necho hi\n";
+        write_executable(&path, contents);
+
+        let (fresh, update) = candidate_command_match(&path, &HashMap::new())
+            .expect("resolve candidate")
+            .expect("candidate should match");
+        let (key, _) = update.expect("fresh resolution should produce a cache entry");
+
+        let mut cache = HashMap::new();
+        let poisoned = CachedCommandHash {
+            sha256: "poisoned".to_string(),
+            shape: fresh.shape.clone(),
+        };
+        cache.insert(key, poisoned.clone());
+
+        let (cached_match, cache_update) = candidate_command_match(&path, &cache)
+            .expect("resolve candidate")
+            .expect("candidate should match");
+
+        assert_eq!(cached_match.sha256, "poisoned");
+        assert!(
+            cache_update.is_none(),
+            "a cache hit must not produce a new entry to persist"
+        );
+    }
+
+    /// A changed mtime must invalidate the stale cache entry (different key
+    /// => miss => recomputed fresh, not served from cache).
+    #[test]
+    fn candidate_command_match_mtime_change_invalidates_cache_entry() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("script.sh");
+        write_executable(&path, b"#!/bin/sh\necho one\n");
+
+        let (first, update) = candidate_command_match(&path, &HashMap::new())
+            .expect("resolve candidate")
+            .expect("candidate should match");
+        let (key, entry) = update.expect("fresh resolution should produce a cache entry");
+        let mut cache = HashMap::new();
+        cache.insert(key.clone(), entry);
+
+        // Rewrite with different content and force a distinct mtime so the
+        // (dev, ino, size, mtime) cache key changes.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        write_executable(&path, b"#!/bin/sh\necho two, longer content\n");
+
+        let (second, second_update) = candidate_command_match(&path, &cache)
+            .expect("resolve candidate")
+            .expect("candidate should match");
+
+        assert_ne!(first.sha256, second.sha256);
+        assert!(
+            second_update.is_some(),
+            "changed mtime should produce a fresh cache entry, not reuse the stale one"
+        );
+        assert_ne!(second.sha256, cache.get(&key).expect("stale entry").sha256);
+    }
+
+    #[test]
+    fn command_hash_cache_file_json_roundtrip() {
+        let mut entries = HashMap::new();
+        entries.insert(
+            "100:200:300:400".to_string(),
+            CachedCommandHash {
+                sha256: "deadbeef".to_string(),
+                shape: ResolvedExecutableShape {
+                    kind: ResolvedExecutableKind::ShebangScript,
+                    interpreter: Some(PathBuf::from("/usr/bin/env")),
+                    interpreter_args: vec!["bash".to_string()],
+                },
+            },
+        );
+        let file = CommandHashCacheFile {
+            entries: entries.clone(),
+        };
+
+        let json = serde_json::to_string(&file).expect("serialize");
+        let restored: CommandHashCacheFile = serde_json::from_str(&json).expect("deserialize");
+
+        assert_eq!(restored.entries, entries);
+    }
+
+    #[test]
+    fn command_hash_cache_file_missing_fields_default() {
+        let restored: CommandHashCacheFile =
+            serde_json::from_str("{}").expect("missing entries should default to empty");
+        assert!(restored.entries.is_empty());
     }
 }

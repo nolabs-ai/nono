@@ -9,6 +9,7 @@ use crate::output;
 use crate::package_cmd;
 use crate::profile_cmd;
 use crate::proxy_command;
+use crate::registry_client::PullReason;
 use crate::rollback_commands;
 use crate::session_commands;
 use crate::setup;
@@ -97,9 +98,9 @@ fn dispatch_command(
         Commands::Profile(args) => {
             run_command_with_update(update_handle, silent, || profile_cmd::run_profile(args))
         }
-        Commands::Pull(args) => {
-            run_command_with_update(update_handle, silent, || package_cmd::run_pull(args))
-        }
+        Commands::Pull(args) => run_command_with_update(update_handle, silent, || {
+            package_cmd::run_pull(args, PullReason::Explicit)
+        }),
         Commands::Remove(args) => {
             run_command_with_update(update_handle, silent, || package_cmd::run_remove(args))
         }

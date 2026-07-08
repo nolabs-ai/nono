@@ -81,6 +81,7 @@ The selected `sandbox` object describes what the child receives:
 |---|---|---|
 | `fs_read` / `fs_write` | directory path arrays | Directory grants. |
 | `fs_read_file` / `fs_write_file` | file path arrays | Exact file grants. |
+| `exec_paths` | path arrays | Linux-only. Extra paths the child may execute, for multi-call tools (e.g. `git`) that re-exec their own helpers by absolute path from a compiled-in exec-path. A directory entry covers everything beneath it; a matching `fs_read` grant is still required, and missing paths are skipped so profiles can list per-distro candidates. Ignored on macOS. |
 | `network` | object | Child network grants. |
 | `environment` | object | Environment allow-list and injected static variables. |
 | `argv_prepend` | string array | Mandatory arguments inserted before caller-provided arguments. |

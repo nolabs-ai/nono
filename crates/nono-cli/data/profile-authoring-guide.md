@@ -61,11 +61,42 @@ Inherit from another profile by name:
   selected profile as the final override layer. Inherited grants can widen
   sandbox permissions.
 - Scalar fields: child overrides base.
-- Array fields (`groups.include`, `groups.exclude`, `commands.allow`, `commands.deny`, `filesystem.*`, `allow_domain`, `open_port`, `listen_port`, `rollback.*`, `upstream_bypass`): child values are appended to base values and deduplicated. To remove inherited entries, use `groups.exclude` for groups; there is no mechanism to remove inherited filesystem paths. For `allow_domain` entries with endpoint rules, rules for the same domain are merged (appended) rather than replaced.
+- Array fields (`groups.include`, `groups.exclude`, `commands.allow`, `commands.deny`, `filesystem.*`, `allow_domain`, `deny_domain`, `open_port`, `listen_port`, `rollback.*`, `upstream_bypass`): child values are appended to base values and deduplicated. To remove inherited entries, use `groups.exclude` for groups; there is no mechanism to remove inherited filesystem paths. For `allow_domain` entries with endpoint rules, rules for the same domain are merged (appended) rather than replaced. `deny_domain` entries are additive — child profiles can only add more denies, never remove inherited ones.
 - Map fields (`env_credentials`, `hooks`, `custom_credentials`): child entries are merged into base; child keys override matching base keys.
 - `network_profile` supports three-state inheritance via `InheritableValue`: absent = inherit base value, `null` = explicitly clear, string = override. This is the only field that supports null-clearing.
 - `open_urls`: if the child provides the field (even as `{}`), it replaces the base entirely. If absent, the base value is inherited. Setting to `null` in JSON is equivalent to omitting it (both inherit the base).
 - `workdir`: child overrides base unless child is `"none"` (which inherits the base value instead).
+
+### platform_overrides
+
+Apply per-OS patches to the profile after `extends` resolution. Only the block matching the current platform is merged in; the others are ignored.
+
+```json
+{
+  "meta": { "name": "myprofile" },
+  "filesystem": {
+    "read": ["/tmp"]
+  },
+  "platform_overrides": {
+    "macos": {
+      "security": { "process_info_mode": "allow_all" },
+      "filesystem": { "read": ["/opt/homebrew", "~/Library/Caches"] }
+    },
+    "linux": {
+      "security": { "signal_mode": "isolated", "process_info_mode": "allow_same_sandbox" },
+      "filesystem": { "read": ["/usr/lib", "~/.cache"] }
+    }
+  }
+}
+```
+
+Merge semantics are identical to `extends`: array fields are dedup-appended, scalar fields are child-wins, deny-lists union. The override can only add or tighten — it cannot remove inherited paths or relax inherited deny rules.
+
+Valid platform keys are `macos`, `linux`, and `windows`. Unrecognised keys are a parse error.
+
+`extends` and `platform_overrides` are not allowed inside an override block. Nesting either is a parse error.
+
+Use `platform_overrides` when a single profile needs different paths or security modes per OS. Use group-level `when` predicates for package-level platform differences that are already handled by built-in groups.
 
 ### groups
 
@@ -282,6 +313,7 @@ All path fields support variable expansion (see Section 6).
 | `allow_http2`           | boolean                           | `false`  | Allow HTTP/2 to upstream servers via ALPN negotiation. Default is HTTP/1.1 with keep-alive. Equivalent to `--allow-http2`. |
 | `network_profile`       | string or null                    | inherit  | Name from `network-policy.json` for proxy filtering. Set to `null` to clear inherited value. |
 | `allow_domain`          | array of string or object         | `[]`     | Additional domains to allow through the proxy. Entries can be plain strings (CONNECT tunnel) or objects with endpoint rules (TLS-intercepted L7 filtering). Aliases: `proxy_allow`, `allow_proxy`. |
+| `deny_domain`           | array of string                   | `[]`     | Domains to block through the proxy regardless of the allowlist. Evaluated before `allow_domain`. Supports wildcard subdomains (`*.ads.example.com`). Equivalent to `--deny-domain`. |
 | `credentials`           | array of string                   | `[]`     | Credential services to enable via reverse proxy. Alias: `proxy_credentials`. |
 | `open_port`             | array of integer                  | `[]`     | Localhost TCP IPC. Aliases: `port_allow`, `allow_port`. Port **0**: macOS only (`localhost:*` outbound); Linux: explicit ports. |
 | `listen_port`           | array of integer                  | `[]`     | TCP ports the sandboxed child may listen on. |
@@ -1045,6 +1077,7 @@ Supported predicate forms include `linux`, `macos`, `linux:fedora`, `linux:rhel-
 - `filesystem.suppress_save_prompt` only suppresses save-profile suggestions. It does not grant access, remove deny rules, or hide diagnostics.
 - `groups.exclude` removes groups from the resolved set. This weakens the sandbox. Use it only when you understand which protections you are removing.
 - `extends` chains resolve recursively up to depth 10. Circular inheritance is an error.
+- `platform_overrides` is applied after all `extends` inheritance is resolved. The override for the current platform is merged as a child, so its values win over inherited ones. Override blocks cannot themselves use `extends` or `platform_overrides`.
 - Prefer `when` predicates for package-specific platform differences. Put shared OS baseline paths in built-in policy groups instead.
 - `network.block: true` blocks all network access. It cannot be combined with proxy settings.
 - `custom_credentials` upstream URLs must use HTTPS. HTTP is only accepted for loopback addresses (localhost, 127.0.0.1, ::1).

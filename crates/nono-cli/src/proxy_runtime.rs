@@ -43,6 +43,7 @@ pub(crate) struct ActiveProxyRuntime {
 pub(crate) struct EffectiveProxySettings {
     pub(crate) network_profile: Option<String>,
     pub(crate) allow_domain: Vec<crate::profile::AllowDomainEntry>,
+    pub(crate) deny_domain: Vec<String>,
     pub(crate) credentials: Vec<String>,
 }
 
@@ -211,8 +212,17 @@ impl ProxyCredentialCaptureBackend {
                         "credential_capture.{name}.provider.command must not be empty"
                     )));
                 };
+                let command_path = match resolve_capture_command(command)? {
+                    CaptureCommandResolution::Resolved(path) => path,
+                    CaptureCommandResolution::Unavailable(reason) => {
+                        warn!(
+                            "credential_capture.{name}: {reason}; skipping (cmd://{name} routes are unavailable until the helper is installed)"
+                        );
+                        continue;
+                    }
+                };
                 ResolvedCredentialCaptureSource::Provider {
-                    command_path: resolve_capture_command(command)?,
+                    command_path,
                     args: provider
                         .command
                         .iter()
@@ -227,8 +237,17 @@ impl ProxyCredentialCaptureBackend {
                         "credential_capture.{name}.command must not be empty"
                     )));
                 };
+                let command_path = match resolve_capture_command(command)? {
+                    CaptureCommandResolution::Resolved(path) => path,
+                    CaptureCommandResolution::Unavailable(reason) => {
+                        warn!(
+                            "credential_capture.{name}: {reason}; skipping (cmd://{name} routes are unavailable until the helper is installed)"
+                        );
+                        continue;
+                    }
+                };
                 ResolvedCredentialCaptureSource::Command {
-                    command_path: resolve_capture_command(command)?,
+                    command_path,
                     args: entry
                         .command
                         .iter()
@@ -1290,20 +1309,31 @@ fn redacted_stderr(stderr: &[u8], policy: &nono::ScrubPolicy) -> Option<String> 
     Some(nono::scrub_value_with_policy(&text, policy).into_owned())
 }
 
-fn resolve_capture_command(command: &str) -> Result<PathBuf> {
+/// Outcome of resolving a `credential_capture` command's executable.
+///
+/// `Unavailable` covers helper binaries that are legitimately optional on a given
+/// machine (not on PATH, not executable, etc.) so the caller can skip the entry
+/// with a warning instead of aborting proxy startup entirely.
+#[derive(Debug)]
+enum CaptureCommandResolution {
+    Resolved(PathBuf),
+    Unavailable(String),
+}
+
+fn resolve_capture_command(command: &str) -> Result<CaptureCommandResolution> {
     let expanded = crate::policy::expand_env_vars(command);
     let command = expanded.as_str();
     let path = PathBuf::from(command);
     if path.is_absolute() {
         return validate_capture_command_path(path);
     }
-    if command.contains(std::path::MAIN_SEPARATOR) {
+    if command.contains('/') || command.contains('\\') {
         return Err(NonoError::ConfigParse(format!(
             "credential_capture command '{command}' must be an absolute path or bare command name"
         )));
     }
     let Some(path_var) = std::env::var_os("PATH") else {
-        return Err(NonoError::ConfigParse(format!(
+        return Ok(CaptureCommandResolution::Unavailable(format!(
             "credential_capture command '{command}' could not be resolved because PATH is unset"
         )));
     };
@@ -1313,20 +1343,28 @@ fn resolve_capture_command(command: &str) -> Result<PathBuf> {
             return validate_capture_command_path(candidate);
         }
     }
-    Err(NonoError::ConfigParse(format!(
+    Ok(CaptureCommandResolution::Unavailable(format!(
         "credential_capture command '{command}' was not found in PATH"
     )))
 }
 
-fn validate_capture_command_path(path: PathBuf) -> Result<PathBuf> {
-    let canonical = path
-        .canonicalize()
-        .map_err(|source| NonoError::PathCanonicalization {
-            path: path.clone(),
-            source,
-        })?;
+fn validate_capture_command_path(path: PathBuf) -> Result<CaptureCommandResolution> {
+    let canonical = match path.canonicalize() {
+        Ok(canonical) => canonical,
+        Err(source) => {
+            return Ok(CaptureCommandResolution::Unavailable(
+                NonoError::PathCanonicalization {
+                    path: path.clone(),
+                    source,
+                }
+                .to_string(),
+            ));
+        }
+    };
     if !canonical.is_file() {
-        return Err(NonoError::ExpectedFile(canonical));
+        return Ok(CaptureCommandResolution::Unavailable(
+            NonoError::ExpectedFile(canonical).to_string(),
+        ));
     }
     #[cfg(unix)]
     {
@@ -1337,13 +1375,13 @@ fn validate_capture_command_path(path: PathBuf) -> Result<PathBuf> {
             .permissions()
             .mode();
         if mode & 0o111 == 0 {
-            return Err(NonoError::ConfigParse(format!(
+            return Ok(CaptureCommandResolution::Unavailable(format!(
                 "credential_capture command '{}' is not executable",
                 canonical.display()
             )));
         }
     }
-    Ok(canonical)
+    Ok(CaptureCommandResolution::Resolved(canonical))
 }
 
 pub(crate) fn prepare_proxy_launch_options(
@@ -1357,6 +1395,7 @@ pub(crate) fn prepare_proxy_launch_options(
     let effective_proxy = resolve_effective_proxy_settings(args, prepared);
     let network_profile = effective_proxy.network_profile;
     let allow_domain = effective_proxy.allow_domain;
+    let deny_domain = effective_proxy.deny_domain;
     let mut credentials = effective_proxy.credentials;
     let mut custom_credentials = prepared.custom_credentials.clone();
     let mut proxy_source_env_vars = HashMap::new();
@@ -1391,7 +1430,8 @@ pub(crate) fn prepare_proxy_launch_options(
         bypass
     };
 
-    let has_domain_filter = network_profile.is_some() || !allow_domain.is_empty();
+    let has_domain_filter =
+        network_profile.is_some() || !allow_domain.is_empty() || !deny_domain.is_empty();
     let has_credentials = !credentials.is_empty();
     let would_activate = has_domain_filter || has_credentials || upstream_proxy_addr.is_some();
 
@@ -1420,14 +1460,16 @@ pub(crate) fn prepare_proxy_launch_options(
         .into_iter()
         .partition(|e| !matches!(e, crate::profile::AllowDomainEntry::WithEndpoints { endpoints, .. } if !endpoints.is_empty()));
 
-    let domain_filter = if network_profile.is_some() || !plain_entries.is_empty() {
-        Some(DomainFilterIntent {
-            network_profile,
-            allow_domain: plain_entries,
-        })
-    } else {
-        None
-    };
+    let domain_filter =
+        if network_profile.is_some() || !plain_entries.is_empty() || !deny_domain.is_empty() {
+            Some(DomainFilterIntent {
+                network_profile,
+                allow_domain: plain_entries,
+                deny_domain,
+            })
+        } else {
+            None
+        };
 
     let endpoint_filter = if !endpoint_entries.is_empty() {
         debug_assert!(
@@ -1617,6 +1659,7 @@ pub(crate) fn resolve_effective_proxy_settings(
         return EffectiveProxySettings {
             network_profile: None,
             allow_domain: Vec::new(),
+            deny_domain: Vec::new(),
             credentials: Vec::new(),
         };
     }
@@ -1627,12 +1670,15 @@ pub(crate) fn resolve_effective_proxy_settings(
         .or_else(|| prepared.network_profile.clone());
     let mut allow_domain = prepared.allow_domain.clone();
     allow_domain.extend(args.allow_proxy.iter().map(|s| parse_allow_domain_arg(s)));
+    let mut deny_domain = prepared.deny_domain.clone();
+    deny_domain.extend(args.deny_proxy.iter().cloned());
     let mut credentials = prepared.credentials.clone();
     credentials.extend(args.proxy_credential.clone());
 
     EffectiveProxySettings {
         network_profile,
         allow_domain,
+        deny_domain,
         credentials,
     }
 }
@@ -2258,7 +2304,15 @@ pub(crate) fn build_proxy_config_from_flags(
     routes.extend(endpoint_routes);
     resolved.routes = routes;
 
-    let mut proxy_config = network_policy::build_proxy_config(&resolved, &plain_hosts);
+    let deny_domain = proxy
+        .domain_filter
+        .as_ref()
+        .map(|d| d.deny_domain.as_slice())
+        .unwrap_or(&[]);
+    let denied_hosts = network_policy::expand_proxy_deny(&net_policy, deny_domain);
+
+    let mut proxy_config =
+        network_policy::build_proxy_config(&resolved, &plain_hosts, &denied_hosts);
     proxy_config.strict_filter = proxy.strict_filter;
 
     if let Some(ref upstream) = proxy.upstream_proxy {
@@ -3051,6 +3105,7 @@ mod tests {
             secrets: Vec::new(),
             profile_display_name: None,
             command_policies: None,
+            resolved_command_binaries: None,
             credential_capture: HashMap::new(),
             credential_providers: HashMap::new(),
             credential_routes: Vec::new(),
@@ -3060,6 +3115,7 @@ mod tests {
             rollback_exclude_globs: Vec::new(),
             network_profile: None,
             allow_domain: Vec::new(),
+            deny_domain: Vec::new(),
             credentials: Vec::new(),
             custom_credentials,
             upstream_proxy: None,
@@ -3838,6 +3894,216 @@ mod tests {
 
         assert_capture_secret(&response, "browser-ok");
         assert_eq!(response.metadata.interactive, Some(true));
+        Ok(())
+    }
+
+    #[test]
+    fn credential_capture_backend_skips_missing_binary() -> Result<()> {
+        let entry = test_capture_entry_no_cache(vec!["nono-nonexistent-helper-xyz".to_string()]);
+        let mut entries = HashMap::new();
+        entries.insert("ghost".to_string(), entry);
+        let backend = ProxyCredentialCaptureBackend::new(&entries, "sess-ghost".to_string())?;
+
+        let err = nono_proxy::capture::CredentialCaptureBackend::capture(
+            &backend,
+            nono_proxy::capture::CredentialCaptureRequest {
+                credential_name: "ghost".to_string(),
+                route_id: "ghost".to_string(),
+                request_host: "example.com".to_string(),
+                request_path: "/".to_string(),
+                request_method: "GET".to_string(),
+                session_id: String::new(),
+                cache_scope: String::new(),
+            },
+        )
+        .expect_err("capture for a skipped entry should error");
+        assert_eq!(err.metadata.cache_action, "unknown_credential");
+        Ok(())
+    }
+
+    #[test]
+    fn credential_capture_backend_keeps_resolvable_entry_when_sibling_missing() -> Result<()> {
+        let resolvable = test_capture_entry_no_cache(vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "printf ok".to_string(),
+        ]);
+        let missing = test_capture_entry_no_cache(vec!["nono-nonexistent-helper-xyz".to_string()]);
+        let mut entries = HashMap::new();
+        entries.insert("present".to_string(), resolvable);
+        entries.insert("ghost".to_string(), missing);
+        let backend = ProxyCredentialCaptureBackend::new(&entries, "sess-mixed".to_string())?;
+
+        let response = nono_proxy::capture::CredentialCaptureBackend::capture(
+            &backend,
+            nono_proxy::capture::CredentialCaptureRequest {
+                credential_name: "present".to_string(),
+                route_id: "present".to_string(),
+                request_host: "example.com".to_string(),
+                request_path: "/".to_string(),
+                request_method: "GET".to_string(),
+                session_id: String::new(),
+                cache_scope: String::new(),
+            },
+        )
+        .map_err(|err| NonoError::SandboxInit(err.to_string()))?;
+        assert_capture_secret(&response, "ok");
+
+        let err = nono_proxy::capture::CredentialCaptureBackend::capture(
+            &backend,
+            nono_proxy::capture::CredentialCaptureRequest {
+                credential_name: "ghost".to_string(),
+                route_id: "ghost".to_string(),
+                request_host: "example.com".to_string(),
+                request_path: "/".to_string(),
+                request_method: "GET".to_string(),
+                session_id: String::new(),
+                cache_scope: String::new(),
+            },
+        )
+        .expect_err("capture for a skipped entry should error");
+        assert_eq!(err.metadata.cache_action, "unknown_credential");
+        Ok(())
+    }
+
+    #[test]
+    fn credential_capture_backend_skips_missing_provider_binary() -> Result<()> {
+        let mut entry = test_capture_entry_no_cache(Vec::new());
+        entry.provider = Some(crate::profile::CredentialCaptureProvider {
+            command: vec!["nono-nonexistent-provider-xyz".to_string()],
+            config: serde_json::json!({}),
+        });
+        let mut entries = HashMap::new();
+        entries.insert("ghost_provider".to_string(), entry);
+        let backend =
+            ProxyCredentialCaptureBackend::new(&entries, "sess-ghost-provider".to_string())?;
+
+        let err = nono_proxy::capture::CredentialCaptureBackend::capture(
+            &backend,
+            nono_proxy::capture::CredentialCaptureRequest {
+                credential_name: "ghost_provider".to_string(),
+                route_id: "ghost_provider".to_string(),
+                request_host: "example.com".to_string(),
+                request_path: "/".to_string(),
+                request_method: "GET".to_string(),
+                session_id: String::new(),
+                cache_scope: String::new(),
+            },
+        )
+        .expect_err("capture for a skipped provider entry should error");
+        assert_eq!(err.metadata.cache_action, "unknown_credential");
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_capture_command_malformed_reference_still_errors() {
+        let result = resolve_capture_command("foo/bar");
+        assert!(
+            matches!(result, Err(NonoError::ConfigParse(_))),
+            "relative path with separator should still be a hard error, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_capture_command_rejects_non_native_separator() {
+        // A relative command embedding a backslash must be rejected on every
+        // platform, not just on Windows where `\` is the native separator.
+        let result = resolve_capture_command("foo\\bar");
+        assert!(
+            matches!(result, Err(NonoError::ConfigParse(_))),
+            "relative path with non-native separator should still be a hard error, got {result:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn credential_capture_backend_skips_non_executable_binary() -> Result<()> {
+        let temp = tempfile::tempdir().map_err(NonoError::Io)?;
+        let path = temp.path().join("not-executable");
+        std::fs::write(&path, b"#!/bin/sh\necho hi\n").map_err(NonoError::Io)?;
+        let mut perms = std::fs::metadata(&path)
+            .map_err(NonoError::Io)?
+            .permissions();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            perms.set_mode(0o644);
+        }
+        std::fs::set_permissions(&path, perms).map_err(NonoError::Io)?;
+
+        let entry = test_capture_entry_no_cache(vec![path.to_string_lossy().into_owned()]);
+        let mut entries = HashMap::new();
+        entries.insert("not_exec".to_string(), entry);
+        let backend = ProxyCredentialCaptureBackend::new(&entries, "sess-not-exec".to_string())?;
+
+        let err = nono_proxy::capture::CredentialCaptureBackend::capture(
+            &backend,
+            nono_proxy::capture::CredentialCaptureRequest {
+                credential_name: "not_exec".to_string(),
+                route_id: "not_exec".to_string(),
+                request_host: "example.com".to_string(),
+                request_path: "/".to_string(),
+                request_method: "GET".to_string(),
+                session_id: String::new(),
+                cache_scope: String::new(),
+            },
+        )
+        .expect_err("capture for a non-executable entry should error");
+        assert_eq!(err.metadata.cache_action, "unknown_credential");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn credential_capture_backend_skips_dangling_symlink() -> Result<()> {
+        let temp = tempfile::tempdir().map_err(NonoError::Io)?;
+        let link_path = temp.path().join("dangling-link");
+        std::os::unix::fs::symlink(temp.path().join("does-not-exist"), &link_path)
+            .map_err(NonoError::Io)?;
+
+        let entry = test_capture_entry_no_cache(vec![link_path.to_string_lossy().into_owned()]);
+        let mut entries = HashMap::new();
+        entries.insert("dangling".to_string(), entry);
+        let backend = ProxyCredentialCaptureBackend::new(&entries, "sess-dangling".to_string())?;
+
+        let err = nono_proxy::capture::CredentialCaptureBackend::capture(
+            &backend,
+            nono_proxy::capture::CredentialCaptureRequest {
+                credential_name: "dangling".to_string(),
+                route_id: "dangling".to_string(),
+                request_host: "example.com".to_string(),
+                request_path: "/".to_string(),
+                request_method: "GET".to_string(),
+                session_id: String::new(),
+                cache_scope: String::new(),
+            },
+        )
+        .expect_err("capture for a dangling-symlink entry should error");
+        assert_eq!(err.metadata.cache_action, "unknown_credential");
+        Ok(())
+    }
+
+    #[test]
+    fn credential_capture_backend_skips_directory_reference() -> Result<()> {
+        let temp = tempfile::tempdir().map_err(NonoError::Io)?;
+        let entry = test_capture_entry_no_cache(vec![temp.path().to_string_lossy().into_owned()]);
+        let mut entries = HashMap::new();
+        entries.insert("a_directory".to_string(), entry);
+        let backend = ProxyCredentialCaptureBackend::new(&entries, "sess-directory".to_string())?;
+
+        let err = nono_proxy::capture::CredentialCaptureBackend::capture(
+            &backend,
+            nono_proxy::capture::CredentialCaptureRequest {
+                credential_name: "a_directory".to_string(),
+                route_id: "a_directory".to_string(),
+                request_host: "example.com".to_string(),
+                request_path: "/".to_string(),
+                request_method: "GET".to_string(),
+                session_id: String::new(),
+                cache_scope: String::new(),
+            },
+        )
+        .expect_err("capture for a directory reference should error");
+        assert_eq!(err.metadata.cache_action, "unknown_credential");
         Ok(())
     }
 

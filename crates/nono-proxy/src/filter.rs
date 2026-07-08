@@ -52,6 +52,19 @@ impl ProxyFilter {
         }
     }
 
+    /// Append user-configured deny entries. Evaluated before the allowlist.
+    ///
+    /// Supports the same wildcard syntax as the allowlist (`*.example.com`).
+    #[must_use]
+    pub fn with_denied_hosts(self, denied: &[String]) -> Self {
+        if denied.is_empty() {
+            return self;
+        }
+        Self {
+            inner: self.inner.with_denied_hosts(denied),
+        }
+    }
+
     /// Check a host against the filter with async DNS resolution.
     ///
     /// Resolves the hostname to IP addresses, then checks all resolved IPs
@@ -152,6 +165,31 @@ mod tests {
         let result = filter.check_host_result("metadata.google.internal", 443, &public_ip);
         assert!(!result.is_allowed());
         assert!(matches!(result, FilterResult::DenyHost { .. }));
+    }
+
+    #[test]
+    fn test_proxy_filter_with_denied_hosts() {
+        let filter = ProxyFilter::allow_all().with_denied_hosts(&["evil.com".to_string()]);
+        let public_ip = vec![IpAddr::V4(Ipv4Addr::new(104, 18, 7, 96))];
+
+        let result = filter.check_host_with_ips("evil.com", &public_ip);
+        assert!(!result.is_allowed());
+
+        let result = filter.check_host_with_ips("good.com", &public_ip);
+        assert!(result.is_allowed());
+    }
+
+    #[test]
+    fn test_proxy_filter_with_denied_hosts_wildcard() {
+        let filter = ProxyFilter::allow_all().with_denied_hosts(&["*.ads.example.com".to_string()]);
+        let public_ip = vec![IpAddr::V4(Ipv4Addr::new(104, 18, 7, 96))];
+
+        let result = filter.check_host_with_ips("tracker.ads.example.com", &public_ip);
+        assert!(!result.is_allowed());
+
+        // bare domain must NOT match wildcard
+        let result = filter.check_host_with_ips("ads.example.com", &public_ip);
+        assert!(result.is_allowed());
     }
 
     #[test]

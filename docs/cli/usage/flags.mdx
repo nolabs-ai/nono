@@ -464,6 +464,29 @@ nono run --allow-cwd --network-profile minimal --allow-domain custom-api.example
 
 When a URL with a path is provided, only requests matching that path pattern are permitted. Requests to other paths on the same domain are denied with `403 Forbidden`. Pattern syntax: `*` matches one path segment, `**` matches zero or more.
 
+#### `--deny-domain`
+
+Block a domain through the proxy even if it would otherwise be allowed. Can be specified multiple times. Activates proxy mode if not already active.
+
+Deny rules are evaluated before the allowlist, so a domain in both `--deny-domain` and `--allow-domain` (or a network profile) is always blocked.
+
+Accepts a plain hostname or a wildcard subdomain pattern:
+
+```bash
+# Block a specific host while allowing everything else
+nono run --allow-cwd --deny-domain ads.example.com -- my-agent
+
+# Block all subdomains of a domain
+nono run --allow-cwd --deny-domain '*.tracker.io' -- my-agent
+
+# Block telemetry while using a permissive profile
+nono run --allow-cwd --network-profile developer --deny-domain telemetry.vendor.com -- my-agent
+```
+
+Wildcard syntax (`*.example.com`) matches subdomains but not the bare domain itself. Cloud metadata endpoints (169.254.169.254, metadata.google.internal, etc.) are always denied regardless of this flag.
+
+Incompatible with `--allow-net` (which bypasses the proxy entirely, making deny rules ineffective).
+
 #### `--credential`
 
 Enable credential injection for a named service via the reverse proxy. The service must be either a preset service (`openai`, `anthropic`, `gemini`, `google-ai`) or defined as a custom credential in your profile. Credentials are loaded from the system keyring under the `nono` service name, from 1Password when `credential_key` is an `op://` URI, from Apple Passwords on macOS when `credential_key` is an `apple-password://` URI, from a file when `credential_key` is a `file://` URI, or from the host environment when `credential_key` is an `env://` URI.

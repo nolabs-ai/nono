@@ -58,6 +58,35 @@ pub(crate) fn build_context_headers() -> Vec<(&'static str, String)> {
     headers
 }
 
+/// Why a `/pull` request was made. Sent only on that request via the
+/// `X-Nono-Pull-Reason` header, so the registry can distinguish a
+/// deliberate user-initiated install from a CI-driven or implicit one.
+/// Unlike the installation-context headers above, this doesn't apply to
+/// every registry call — only `/pull` has more than one possible trigger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PullReason {
+    /// `nono pull <ns>/<name>` invoked directly.
+    Explicit,
+    /// `nono update` re-pulling an outdated pack.
+    Update,
+    /// First-run legacy-config migration auto-installing a suggested pack.
+    Migration,
+    /// Silent implicit pull because a `--profile <ns>/<name>` reference
+    /// (including an `extends` chain) wasn't installed locally.
+    ProfileAuto,
+}
+
+impl PullReason {
+    fn header_value(self) -> &'static str {
+        match self {
+            PullReason::Explicit => "explicit",
+            PullReason::Update => "update",
+            PullReason::Migration => "migration",
+            PullReason::ProfileAuto => "profile-auto",
+        }
+    }
+}
+
 impl RegistryClient {
     /// Build a registry client whose TLS verifier delegates to the OS-native
     /// trust store at handshake time (SecTrust on macOS, system CA stores on
@@ -127,6 +156,7 @@ impl RegistryClient {
         &self,
         package_ref: &PackageRef,
         version: &str,
+        reason: PullReason,
     ) -> Result<PullResponse> {
         let url = format!(
             "{}/api/v1/packages/{}/{}/versions/{version}/pull",
@@ -135,6 +165,7 @@ impl RegistryClient {
         let mut response = self
             .http
             .get(&url)
+            .header("X-Nono-Pull-Reason", reason.header_value())
             .config()
             .http_status_as_error(false)
             .build()
@@ -477,5 +508,13 @@ mod tests {
             Some("github_actions"),
             "X-Nono-CI-Provider should be 'github_actions'"
         );
+    }
+
+    #[test]
+    fn pull_reason_header_values_are_distinct_and_stable() {
+        assert_eq!(PullReason::Explicit.header_value(), "explicit");
+        assert_eq!(PullReason::Update.header_value(), "update");
+        assert_eq!(PullReason::Migration.header_value(), "migration");
+        assert_eq!(PullReason::ProfileAuto.header_value(), "profile-auto");
     }
 }

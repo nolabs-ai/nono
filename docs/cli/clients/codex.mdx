@@ -236,12 +236,32 @@ As a result:
 - when domain filtering is enabled, all network requests from commands executed by Codex are denied, regardless of the allowlist;
 - tool commands no longer appear to run inside nono.
 
+##### Option 1: Allow login shell in nono sandbox
+
 Because nono is already sandboxing the execution and filtering environment variables, you can start Codex with its own sandbox and optional hardening disabled.
 
 Recommended invocation:
 
 ```bash
 nono run --profile always-further/codex --network-profile codex -- codex --sandbox danger-full-access --ask-for-approval on-request --config allow_login_shell=true
+```
+
+##### Option 2: Explicit configration
+
+An alternative, more secure, and explicit approach is to keep optional hardening enabled and configure Codex’s `shell_environment_policy` so that required environment variables are passed to the subprocess.
+
+Set `allow_login_shell=false` in the Codex configuration, then add the `shell_environment_policy` block and list required exports:
+
+```toml
+[shell_environment_policy]
+inherit = "all"
+ignore_default_excludes = false
+include_only = [
+    "PATH", "HOME", "USER", "SHELL", "TERM", "COLORTERM", "LANG", "LC_*",
+    "NONO_CAP_FILE", "NONO_PROXY_TOKEN", "BROWSER",
+    "NO_PROXY", "HTTP_PROXY", "HTTPS_PROXY", "NODE_USE_ENV_PROXY",
+    "GIT_SSL_CAINFO", "CURL_CA_BUNDLE", "NODE_EXTRA_CA_CERTS", "REQUESTS_CA_BUNDLE", "SSL_CERT_FILE"
+]
 ```
 
 ### Additional Home-Directory Tools

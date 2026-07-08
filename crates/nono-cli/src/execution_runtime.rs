@@ -352,6 +352,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         let runtime = crate::tool_sandbox::PreparedToolSandboxRuntime::prepare(
             crate::tool_sandbox::ToolSandboxPrepare {
                 config: command_policies,
+                resolved_command_binaries: flags.resolved_command_binaries.as_ref(),
                 audit_context: crate::tool_sandbox::ToolSandboxAuditContext::new(
                     flags.profile_display_name.clone(),
                     flags.redaction_policy.clone(),
@@ -380,6 +381,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         let runtime = crate::tool_sandbox::PreparedToolSandboxRuntime::prepare(
             crate::tool_sandbox::ToolSandboxPrepare {
                 config: command_policies,
+                resolved_command_binaries: flags.resolved_command_binaries.as_ref(),
                 audit_context: crate::tool_sandbox::ToolSandboxAuditContext::new(
                     flags.profile_display_name.clone(),
                     flags.redaction_policy.clone(),

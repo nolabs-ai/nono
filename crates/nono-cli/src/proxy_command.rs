@@ -213,6 +213,9 @@ fn build_launch_options(args: &ProxyArgs) -> Result<ProxyLaunchOptions> {
             .map(|s| crate::proxy_runtime::parse_allow_domain_arg(s)),
     );
 
+    let mut deny_domain: Vec<String> = network.map(|n| n.deny_domain.clone()).unwrap_or_default();
+    deny_domain.extend(args.deny_proxy.iter().cloned());
+
     let mut credentials: Vec<String> = network
         .map(|n| n.resolved_credentials().to_vec())
         .unwrap_or_default();
@@ -267,14 +270,16 @@ fn build_launch_options(args: &ProxyArgs) -> Result<ProxyLaunchOptions> {
         .into_iter()
         .partition(|e| !matches!(e, profile::AllowDomainEntry::WithEndpoints { endpoints, .. } if !endpoints.is_empty()));
 
-    let domain_filter = if network_profile.is_some() || !plain_entries.is_empty() {
-        Some(DomainFilterIntent {
-            network_profile,
-            allow_domain: plain_entries,
-        })
-    } else {
-        None
-    };
+    let domain_filter =
+        if network_profile.is_some() || !plain_entries.is_empty() || !deny_domain.is_empty() {
+            Some(DomainFilterIntent {
+                network_profile,
+                allow_domain: plain_entries,
+                deny_domain,
+            })
+        } else {
+            None
+        };
 
     let endpoint_filter = if endpoint_entries.is_empty() {
         None

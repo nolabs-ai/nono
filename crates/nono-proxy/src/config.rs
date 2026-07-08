@@ -41,6 +41,11 @@ pub struct ProxyConfig {
     #[serde(default)]
     pub allowed_hosts: Vec<String>,
 
+    /// Hosts to deny regardless of the allowlist (exact match + wildcards).
+    /// Evaluated before the allowlist.
+    #[serde(default)]
+    pub denied_hosts: Vec<String>,
+
     /// When `true`, an empty `allowed_hosts` denies every host instead of
     /// falling back to allow-all.
     #[serde(default)]
@@ -227,6 +232,7 @@ impl Default for ProxyConfig {
             bind_addr: default_bind_addr(),
             bind_port: 0,
             allowed_hosts: Vec::new(),
+            denied_hosts: Vec::new(),
             strict_filter: false,
             require_auth: default_require_auth(),
             strict_connect_auth: false,

@@ -1225,6 +1225,17 @@ pub struct SandboxArgs {
     )]
     pub allow_proxy: Vec<String>,
 
+    /// Block a domain through the proxy. Evaluated before the allowlist.
+    /// Supports wildcards (e.g. *.ads.example.com). Incompatible with --allow-net.
+    #[arg(
+        long = "deny-domain",
+        env = "NONO_DENY_DOMAIN",
+        value_name = "DOMAIN",
+        conflicts_with = "allow_net",
+        help_heading = "NETWORK"
+    )]
+    pub deny_proxy: Vec<String>,
+
     /// Allow the sandboxed child to listen on a TCP port (repeatable)
     /// ALIAS(canonical="--listen-port", introduced="v0.0.0", remove_by="indefinite", issue="#415")
     #[arg(
@@ -1538,6 +1549,16 @@ pub struct ProxyArgs {
         help_heading = "NETWORK"
     )]
     pub allow_proxy: Vec<String>,
+
+    /// Block a domain through the proxy. Evaluated before the allowlist.
+    /// Supports wildcards (e.g. *.ads.example.com).
+    #[arg(
+        long = "deny-domain",
+        env = "NONO_DENY_DOMAIN",
+        value_name = "DOMAIN",
+        help_heading = "NETWORK"
+    )]
+    pub deny_proxy: Vec<String>,
 
     /// Chain outbound traffic through an upstream proxy (host:port)
     /// ALIAS(canonical="--upstream-proxy", introduced="v0.0.0", remove_by="indefinite", issue="#415")
@@ -1900,6 +1921,7 @@ impl From<WrapSandboxArgs> for SandboxArgs {
             allow_net: false,
             network_profile: None,
             allow_proxy: Vec::new(),
+            deny_proxy: Vec::new(),
             allow_bind: args.allow_bind,
             allow_port: args.allow_port,
             allow_connect_port: args.allow_connect_port,

@@ -423,11 +423,16 @@ pub(crate) struct PreparedSandbox {
     pub(crate) secrets: Vec<nono::LoadedSecret>,
     pub(crate) profile_display_name: Option<String>,
     pub(crate) command_policies: Option<crate::command_policy::CommandPoliciesConfig>,
+    /// Command binaries already resolved while validating `command_policies`.
+    /// Reused by the tool-sandbox plan build so every controlled binary is
+    /// only read and hashed once per invocation, not twice.
+    pub(crate) resolved_command_binaries: Option<crate::command_policy::ResolvedCommandBinaries>,
     pub(crate) session_hooks: profile::SessionHooks,
     pub(crate) rollback_exclude_patterns: Vec<String>,
     pub(crate) rollback_exclude_globs: Vec<String>,
     pub(crate) network_profile: Option<String>,
     pub(crate) allow_domain: Vec<profile::AllowDomainEntry>,
+    pub(crate) deny_domain: Vec<String>,
     pub(crate) credentials: Vec<String>,
     pub(crate) custom_credentials: HashMap<String, profile::CustomCredentialDef>,
     pub(crate) credential_capture: HashMap<String, profile::CredentialCaptureEntry>,
@@ -1266,11 +1271,13 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
                 secrets: Vec::new(),
                 profile_display_name: None,
                 command_policies: None,
+                resolved_command_binaries: None,
                 session_hooks: profile::SessionHooks::default(),
                 rollback_exclude_patterns,
                 rollback_exclude_globs,
                 network_profile: None,
                 allow_domain,
+                deny_domain: Vec::new(),
                 credentials,
                 custom_credentials: HashMap::new(),
                 credential_capture: HashMap::new(),
@@ -1328,6 +1335,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         rollback_exclude_globs: profile_rollback_globs,
         network_profile: profile_network_profile,
         allow_domain: profile_allow_domain,
+        deny_domain: profile_deny_domain,
         credentials: profile_credentials,
         custom_credentials: profile_custom_credentials,
         credential_providers: profile_credential_providers,
@@ -1347,6 +1355,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         allowed_env_vars: profile_allowed_env_vars,
         denied_env_vars: profile_denied_env_vars,
         set_vars: profile_set_vars,
+        resolved_command_binaries: profile_resolved_command_binaries,
     } = prepared_profile;
 
     // Raw Seatbelt rules (`unsafe_macos_seatbelt_rules`) are as powerful as
@@ -1379,6 +1388,8 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         .collect();
     print_allow_domain_port_warnings(&profile_allow_domain_strs, "profile allow_domain", silent);
     print_allow_domain_port_warnings(&args.allow_proxy, "--allow-domain", silent);
+    print_allow_domain_port_warnings(&profile_deny_domain, "profile deny_domain", silent);
+    print_allow_domain_port_warnings(&args.deny_proxy, "--deny-domain", silent);
 
     #[cfg(unix)]
     if args.profile.as_deref().is_some_and(is_claude_code_profile) {
@@ -1645,11 +1656,13 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
             secrets: loaded_secrets,
             profile_display_name,
             command_policies,
+            resolved_command_binaries: profile_resolved_command_binaries,
             session_hooks,
             rollback_exclude_patterns: profile_rollback_patterns,
             rollback_exclude_globs: profile_rollback_globs,
             network_profile: profile_network_profile,
             allow_domain: profile_allow_domain,
+            deny_domain: profile_deny_domain,
             credentials: profile_credentials,
             custom_credentials: profile_custom_credentials,
             credential_capture: profile_credential_capture,
@@ -2233,11 +2246,13 @@ mod tests {
             secrets: Vec::new(),
             profile_display_name: None,
             command_policies: None,
+            resolved_command_binaries: None,
             session_hooks: profile::SessionHooks::default(),
             rollback_exclude_patterns: Vec::new(),
             rollback_exclude_globs: Vec::new(),
             network_profile: None,
             allow_domain: Vec::new(),
+            deny_domain: Vec::new(),
             credentials: Vec::new(),
             custom_credentials: std::collections::HashMap::new(),
             credential_capture: std::collections::HashMap::new(),

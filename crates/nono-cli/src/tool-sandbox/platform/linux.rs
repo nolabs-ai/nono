@@ -153,6 +153,9 @@ struct ResolvedToolSandboxPlan {
     deny_only: BTreeMap<String, ResolvedDenyOnlyCommand>,
     allowed_direct_bypasses: Vec<PathBuf>,
     allowed_direct_bypass_ids: HashSet<FileId>,
+    /// Writable dirs (cwd, etc.) get a subtree exec grant instead of the
+    /// per-file allow-list, since files can appear there after setup.
+    outer_exec_writable_dirs: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -233,6 +236,7 @@ impl ResolvedToolSandboxPlan {
         let allowed_direct_bypasses =
             resolve_allowed_direct_bypasses(config, &resolved, &deny_only, &governance_denies)?;
         let allowed_direct_bypass_ids = resolve_file_ids(&allowed_direct_bypasses)?;
+        let outer_exec_writable_dirs = collect_outer_exec_writable_dirs(outer_caps, &search_dirs);
         Ok(Self {
             config: config.clone(),
             resolved,
@@ -241,6 +245,7 @@ impl ResolvedToolSandboxPlan {
             deny_only,
             allowed_direct_bypasses,
             allowed_direct_bypass_ids,
+            outer_exec_writable_dirs,
         })
     }
 }
@@ -471,6 +476,7 @@ impl PreparedToolSandboxRuntime {
     pub(crate) fn apply_outer_exec_gate(&self) -> Result<()> {
         apply_outer_exec_gate(
             &self.inner.allowed_outer_exec_files,
+            &self.inner.plan.outer_exec_writable_dirs,
             self.inner.landlock_abi,
         )
     }
@@ -2645,6 +2651,25 @@ fn reject_group_or_world_writable_path(
     Ok(())
 }
 
+/// Dirs the outer capability set grants write/readwrite to (e.g. cwd). Kept
+/// separate from `build_outer_exec_files`'s per-file enumeration since a
+/// writable dir's contents can change after setup.
+fn collect_outer_exec_writable_dirs(
+    caps: &CapabilitySet,
+    executable_dirs: &[PathBuf],
+) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = caps
+        .fs_capabilities()
+        .iter()
+        .filter(|cap| !cap.is_file && cap.access.contains(AccessMode::Write))
+        .map(|cap| cap.resolved.clone())
+        .filter(|dir| !executable_dirs.contains(dir))
+        .collect();
+    dirs.sort();
+    dirs.dedup();
+    dirs
+}
+
 fn outer_caps_grant_write(caps: &CapabilitySet, path: &Path) -> bool {
     caps.fs_capabilities().iter().any(|cap| {
         cap.access.contains(AccessMode::Write)
@@ -2983,7 +3008,11 @@ fn add_outer_exec_file_with_deps(
     Ok(())
 }
 
-fn apply_outer_exec_gate(paths: &[PathBuf], abi: nono::DetectedAbi) -> Result<()> {
+fn apply_outer_exec_gate(
+    paths: &[PathBuf],
+    writable_dirs: &[PathBuf],
+    abi: nono::DetectedAbi,
+) -> Result<()> {
     if !abi.has_execute() {
         return Err(NonoError::SandboxInit(format!(
             "tool-sandbox outer exec gate requires Landlock ABI V3+; detected {}",
@@ -3020,6 +3049,24 @@ fn apply_outer_exec_gate(paths: &[PathBuf], abi: nono::DetectedAbi) -> Result<()
                 NonoError::SandboxInit(format!(
                     "tool-sandbox outer exec gate add_rule for {}: {err}",
                     path.display()
+                ))
+            })?;
+    }
+
+    // Subtree grant: files written into these dirs after setup must still run.
+    for dir in writable_dirs {
+        let fd = PathFd::new(dir).map_err(|err| {
+            NonoError::SandboxInit(format!(
+                "tool-sandbox outer exec gate cannot open {}: {err}",
+                dir.display()
+            ))
+        })?;
+        ruleset = ruleset
+            .add_rule(PathBeneath::new(fd, AccessFs::Execute))
+            .map_err(|err| {
+                NonoError::SandboxInit(format!(
+                    "tool-sandbox outer exec gate add_rule for {}: {err}",
+                    dir.display()
                 ))
             })?;
     }
@@ -5365,6 +5412,7 @@ mod tests {
                 deny_only: BTreeMap::new(),
                 allowed_direct_bypasses: Vec::new(),
                 allowed_direct_bypass_ids: HashSet::new(),
+                outer_exec_writable_dirs: Vec::new(),
             },
             shims_by_command: BTreeMap::from([("git".to_string(), shim.clone())]),
             credential_handles: BTreeMap::new(),

@@ -2822,13 +2822,16 @@ fn load_registry_profile(name_or_path: &str, cli_extends: &[String]) -> Result<P
         eprintln!("Profile '{}' not found locally.", package_ref.key());
 
         // Auto-pull from registry
-        crate::package_cmd::run_pull(crate::cli::PullArgs {
-            package_ref: name_or_path.to_string(),
-            registry: None,
-            force: false,
-            init: false,
-            help: None,
-        })?;
+        crate::package_cmd::run_pull(
+            crate::cli::PullArgs {
+                package_ref: name_or_path.to_string(),
+                registry: None,
+                force: false,
+                init: false,
+                help: None,
+            },
+            crate::registry_client::PullReason::ProfileAuto,
+        )?;
     }
 
     // Read manifest to check pack type and find profile artifacts

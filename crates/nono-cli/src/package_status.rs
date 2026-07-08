@@ -27,7 +27,14 @@ const CODEX_PACK: OfficialPackStatusTarget = OfficialPackStatusTarget {
     profiles: &["codex"],
 };
 
-const OFFICIAL_PACK_STATUS_TARGETS: &[OfficialPackStatusTarget] = &[CLAUDE_PACK, CODEX_PACK];
+const OPENCODE_PACK: OfficialPackStatusTarget = OfficialPackStatusTarget {
+    namespace: "nolabs-ai",
+    name: "opencode",
+    profiles: &["opencode"],
+};
+
+const OFFICIAL_PACK_STATUS_TARGETS: &[OfficialPackStatusTarget] =
+    &[CLAUDE_PACK, CODEX_PACK, OPENCODE_PACK];
 
 impl OfficialPackStatusTarget {
     fn key(self) -> String {
@@ -229,12 +236,14 @@ mod tests {
     }
 
     #[test]
-    fn official_profile_names_include_claude_and_codex() {
+    fn official_profile_names_include_claude_codex_and_opencode() {
         assert!(is_official_profile_name(CLAUDE_PACK, "claude"));
         assert!(is_official_profile_name(CLAUDE_PACK, "claude-code"));
         assert!(is_official_profile_name(CODEX_PACK, "codex"));
+        assert!(is_official_profile_name(OPENCODE_PACK, "opencode"));
         assert!(!is_official_profile_name(CLAUDE_PACK, "codex"));
         assert!(!is_official_profile_name(CODEX_PACK, "claude"));
+        assert!(!is_official_profile_name(OPENCODE_PACK, "claude"));
     }
 
     #[test]
@@ -246,6 +255,11 @@ mod tests {
         ));
         assert!(is_official_package_ref(CODEX_PACK, "nolabs-ai/codex"));
         assert!(is_official_package_ref(CODEX_PACK, "nolabs-ai/codex@1.2.3"));
+        assert!(is_official_package_ref(OPENCODE_PACK, "nolabs-ai/opencode"));
+        assert!(is_official_package_ref(
+            OPENCODE_PACK,
+            "nolabs-ai/opencode@1.0.0"
+        ));
         assert!(!is_official_package_ref(CLAUDE_PACK, "someone/claude"));
         assert!(!is_official_package_ref(
             CODEX_PACK,

@@ -23,7 +23,7 @@ mod tests {
     #[test]
     fn test_claude_code_no_longer_inbuilt() {
         // Removed in v0.43.0: claude-code is now shipped via the registry pack
-        // `always-further/claude` and resolved through the user-profile
+        // `nolabs-ai/claude` and resolved through the user-profile
         // symlink, not the embedded policy.json.
         assert!(get_builtin("claude-code").is_none());
         assert!(get_builtin("claude-no-kc").is_none());
@@ -32,7 +32,7 @@ mod tests {
     #[test]
     fn test_opencode_no_longer_inbuilt() {
         // Removed: opencode is now shipped via the registry pack
-        // `always-further/opencode`, not embedded in policy.json.
+        // `nolabs-ai/opencode`, not embedded in policy.json.
         assert!(get_builtin("opencode").is_none());
     }
 

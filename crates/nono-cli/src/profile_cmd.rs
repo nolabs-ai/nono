@@ -802,7 +802,7 @@ pub(crate) fn cmd_list(args: ProfileListArgs) -> Result<()> {
 }
 
 /// Like `print_profile_line` but appends the providing pack ref so the
-/// user sees `claude-code  Anthropic Claude Code …  always-further/claude`.
+/// user sees `claude-code  Anthropic Claude Code …  nolabs-ai/claude`.
 fn print_pack_profile_line(name: &str, pack_ref: &str, result: &Result<Profile>, t: &theme::Theme) {
     match result {
         Ok(p) => {

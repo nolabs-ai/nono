@@ -2256,14 +2256,14 @@ mod tests {
             &patch,
             "claude",
             "claude-test",
-            Some("always-further/claude"),
+            Some("nolabs-ai/claude"),
         )
         .expect("prepare");
 
         assert!(matches!(prepared.action, SaveAction::Created));
         assert_eq!(
             prepared.profile.extends,
-            Some(vec!["always-further/claude".to_string()])
+            Some(vec!["nolabs-ai/claude".to_string()])
         );
     }
 
@@ -2287,13 +2287,13 @@ mod tests {
             &patch,
             "claude",
             "claude-test",
-            Some("always-further/claude@1.2.0"),
+            Some("nolabs-ai/claude@1.2.0"),
         )
         .expect("prepare");
 
         assert_eq!(
             prepared.profile.extends,
-            Some(vec!["always-further/claude@1.2.0".to_string()])
+            Some(vec!["nolabs-ai/claude@1.2.0".to_string()])
         );
     }
 

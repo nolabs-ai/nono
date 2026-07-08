@@ -250,7 +250,7 @@ pub enum WiringRecord {
 
 /// Per-leaf record for `JsonMerge`. `path` is the chain of object
 /// keys from the document root to the leaf (e.g.
-/// `["enabledPlugins", "nono@always-further"]`). `installed_value` is
+/// `["enabledPlugins", "nono@nolabs-ai"]`). `installed_value` is
 /// what we wrote at that leaf; `prior_value` is what was there before
 /// (None when the leaf didn't exist pre-merge).
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -1510,7 +1510,7 @@ mod tests {
         let _ = home; // signature parity with test setup
         WiringContext {
             pack_dir,
-            namespace: "always-further".to_string(),
+            namespace: "nolabs-ai".to_string(),
             pack_name: "claude".to_string(),
         }
     }
@@ -1567,8 +1567,8 @@ mod tests {
             "/h/.config/nono/profile-drafts"
         );
         assert_eq!(
-            expand_vars("$NONO_PACKAGES/always-further/claude", &ctx).expect("expand"),
-            "/h/.config/nono/packages/always-further/claude"
+            expand_vars("$NONO_PACKAGES/nolabs-ai/claude", &ctx).expect("expand"),
+            "/h/.config/nono/packages/nolabs-ai/claude"
         );
     }
 
@@ -1584,12 +1584,12 @@ mod tests {
         let config_str = config.path().to_str().expect("config path");
         let ctx = WiringContext {
             pack_dir: PathBuf::from("/p"),
-            namespace: "always-further".to_string(),
+            namespace: "nolabs-ai".to_string(),
             pack_name: "claude".to_string(),
         };
         let _env = EnvVarGuard::set_all(&[("HOME", home_str), ("XDG_CONFIG_HOME", config_str)]);
         let expected_config = format!("{config_str}/nono/profile-drafts");
-        let expected_packages = format!("{config_str}/nono/packages/always-further/claude");
+        let expected_packages = format!("{config_str}/nono/packages/nolabs-ai/claude");
         assert_eq!(
             nono::try_canonicalize(Path::new(
                 &expand_vars("$NONO_CONFIG/profile-drafts", &ctx).expect("expand")
@@ -1598,7 +1598,7 @@ mod tests {
         );
         assert_eq!(
             nono::try_canonicalize(Path::new(
-                &expand_vars("$NONO_PACKAGES/always-further/claude", &ctx).expect("expand")
+                &expand_vars("$NONO_PACKAGES/nolabs-ai/claude", &ctx).expect("expand")
             )),
             nono::try_canonicalize(Path::new(&expected_packages))
         );

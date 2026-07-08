@@ -5,6 +5,9 @@ use crate::profile;
 use crate::registry_client::{RegistryClient, resolve_registry_url};
 use nono::{NonoError, Result};
 
+const DEPRECATED_NAMESPACE: &str = "always-further";
+const REPLACEMENT_NAMESPACE: &str = "nolabs-ai";
+
 #[derive(Clone, Copy, Debug)]
 struct OfficialPackStatusTarget {
     namespace: &'static str,
@@ -13,13 +16,13 @@ struct OfficialPackStatusTarget {
 }
 
 const CLAUDE_PACK: OfficialPackStatusTarget = OfficialPackStatusTarget {
-    namespace: "always-further",
+    namespace: "nolabs-ai",
     name: "claude",
     profiles: &["claude", "claude-code"],
 };
 
 const CODEX_PACK: OfficialPackStatusTarget = OfficialPackStatusTarget {
-    namespace: "always-further",
+    namespace: "nolabs-ai",
     name: "codex",
     profiles: &["codex"],
 };
@@ -45,12 +48,39 @@ pub(crate) fn enforce_for_active_profile(profile_name: Option<&str>, silent: boo
         return Ok(());
     };
 
+    warn_deprecated_namespace(silent);
+
     for target in OFFICIAL_PACK_STATUS_TARGETS {
         if depends_on_official_pack_profile(*target, profile_name) {
             enforce_official_pack_status(*target, silent)?;
         }
     }
     Ok(())
+}
+
+/// Warn once per invocation for every pack installed under the deprecated
+/// `always-further` namespace. Runs unconditionally (not gated on the active
+/// profile) so users are notified regardless of which profile they're using,
+/// including custom profiles that extend old packs.
+fn warn_deprecated_namespace(silent: bool) {
+    if silent {
+        return;
+    }
+    let lockfile = match package::read_lockfile() {
+        Ok(lf) => lf,
+        Err(_) => return,
+    };
+    let prefix = format!("{DEPRECATED_NAMESPACE}/");
+    for old_ref in lockfile.packages.keys().filter(|k| k.starts_with(&prefix)) {
+        let name = &old_ref[prefix.len()..];
+        let new_ref = format!("{REPLACEMENT_NAMESPACE}/{name}");
+        eprintln!(
+            "\n  [nono] ⚠  {old_ref} has moved to {new_ref}\n  \
+             Migrate with:\n  \
+               nono remove {old_ref}\n  \
+               nono pull {new_ref}\n"
+        );
+    }
 }
 
 fn enforce_official_pack_status(target: OfficialPackStatusTarget, silent: bool) -> Result<()> {
@@ -167,6 +197,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn deprecated_namespace_constants_are_correct() {
+        assert_eq!(DEPRECATED_NAMESPACE, "always-further");
+        assert_eq!(REPLACEMENT_NAMESPACE, "nolabs-ai");
+        // Verify the replacement logic produces the right ref for a sample pack.
+        let old_ref = format!("{DEPRECATED_NAMESPACE}/claude");
+        let name = old_ref.trim_start_matches(&format!("{DEPRECATED_NAMESPACE}/"));
+        assert_eq!(
+            format!("{REPLACEMENT_NAMESPACE}/{name}"),
+            "nolabs-ai/claude"
+        );
+    }
+
+    #[test]
     fn yanked_message_pins_latest_when_available() {
         let status = PackageStatusResponse {
             schema_version: 1,
@@ -179,8 +222,8 @@ mod tests {
             }),
         };
 
-        let message = yanked_message("always-further/claude", "1.2.2", &status);
-        assert!(message.contains("nono pull always-further/claude@1.2.3 --force"));
+        let message = yanked_message("nolabs-ai/claude", "1.2.2", &status);
+        assert!(message.contains("nono pull nolabs-ai/claude@1.2.3 --force"));
         assert!(message.contains("security"));
         assert!(message.contains("high - profile policy fix"));
     }
@@ -196,23 +239,17 @@ mod tests {
 
     #[test]
     fn canonical_package_refs_target_official_packs() {
+        assert!(is_official_package_ref(CLAUDE_PACK, "nolabs-ai/claude"));
         assert!(is_official_package_ref(
             CLAUDE_PACK,
-            "always-further/claude"
+            "nolabs-ai/claude@1.2.3"
         ));
-        assert!(is_official_package_ref(
-            CLAUDE_PACK,
-            "always-further/claude@1.2.3"
-        ));
-        assert!(is_official_package_ref(CODEX_PACK, "always-further/codex"));
-        assert!(is_official_package_ref(
-            CODEX_PACK,
-            "always-further/codex@1.2.3"
-        ));
+        assert!(is_official_package_ref(CODEX_PACK, "nolabs-ai/codex"));
+        assert!(is_official_package_ref(CODEX_PACK, "nolabs-ai/codex@1.2.3"));
         assert!(!is_official_package_ref(CLAUDE_PACK, "someone/claude"));
         assert!(!is_official_package_ref(
             CODEX_PACK,
-            "always-further/codex-extra"
+            "nolabs-ai/codex-extra"
         ));
     }
 }

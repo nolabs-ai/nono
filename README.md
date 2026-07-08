@@ -63,9 +63,9 @@ Search for an agent in the registry, then run it:
 
 ```bash
 $ nono search opencode
-always-further/opencode	-	Official Opencode Plugin
+nolabs-ai/opencode	-	Official Opencode Plugin
 
-$ nono run --profile always-further/opencode -- opencode
+$ nono run --profile nolabs-ai/opencode -- opencode
 ```
 
 That's it. `opencode` now runs with read/write access to the current directory and **nothing else** — your SSH keys, your cloud credentials, the rest of your disk are invisible to it.
@@ -77,7 +77,7 @@ Profiles for all the popular agents live at [registry.nono.sh](https://registry.
 Outgrow the defaults? Scaffold a profile and tweak it — same command you already know:
 
 ```bash
-nono profile init opencode --extends always-further/opencode
+nono profile init opencode --extends nolabs-ai/opencode
 nono run --profile opencode -- opencode
 ```
 
@@ -147,6 +147,19 @@ The policy lives in the profile, not in the prompt. The agent can ask for a tool
 ```
 
 Read more in [Sandboxed Tool Execution](https://nono.sh/docs/cli/features/tool-sandbox).
+
+## Migrating from `always-further/` packs
+
+All official packs have moved from the `always-further` namespace to `nolabs-ai`. To migrate
+cleanly, remove the old pack first so its wiring is torn down, then pull the new one:
+
+```bash
+nono remove always-further/<pack>
+nono pull nolabs-ai/<pack>
+```
+
+Pulling the new pack without removing the old one can leave stale wiring from the previous
+namespace in place (symlinks, plugin registrations, etc.).
 
 ## Ready to go deep?
 

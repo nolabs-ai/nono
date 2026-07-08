@@ -39,14 +39,14 @@ nono run --allow ./project-a --allow ./project-b -- command
 # Block network access
 nono run --allow-cwd --block-net -- command
 
-# Use a pack profile (requires: nono pull always-further/claude)
-nono run --profile always-further/claude -- claude
+# Use a pack profile (requires: nono pull nolabs-ai/claude)
+nono run --profile nolabs-ai/claude -- claude
 
 # Use a built-in profile
-nono run --profile always-further/opencode -- opencode
+nono run --profile nolabs-ai/opencode -- opencode
 
 # Keep a profile but temporarily allow unrestricted network
-nono run --profile always-further/claude --allow-net -- claude
+nono run --profile nolabs-ai/claude --allow-net -- claude
 
 # Start an interactive shell inside the sandbox
 nono shell --allow .
@@ -85,14 +85,24 @@ Precedence is: CLI flag, then `NONO_THEME`, then config file, then the default `
 
 | Profile | Install | Command |
 |---------|---------|---------|
-| Claude Code | `nono pull always-further/claude` | `nono run --profile always-further/claude -- claude` |
-| Codex | `nono pull always-further/codex` | `nono run --profile always-further/codex -- codex` |
+| Claude Code | `nono pull nolabs-ai/claude` | `nono run --profile nolabs-ai/claude -- claude` |
+| Codex | `nono pull nolabs-ai/codex` | `nono run --profile nolabs-ai/codex -- codex` |
+
+> **Migrating from `always-further/` packs?**
+> Packs were moved from the `always-further` namespace to `nolabs-ai`. To cleanly migrate,
+> remove the old pack first so its wiring is torn down, then pull the new one:
+> ```bash
+> nono remove always-further/<pack>
+> nono pull nolabs-ai/<pack>
+> ```
+> Just pulling the new pack without removing the old one can leave stale wiring from the
+> previous namespace in place.
 
 ### Built-in profiles
 
 | Profile | Command |
 |---------|---------|
-| OpenCode | `nono run --profile always-further/opencode -- opencode` |
+| OpenCode | `nono run --profile nolabs-ai/opencode -- opencode` |
 | OpenClaw | `nono run --profile openclaw -- openclaw gateway` |
 | Swival | `nono run --profile swival -- swival` |
 

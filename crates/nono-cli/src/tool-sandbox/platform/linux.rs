@@ -3264,6 +3264,11 @@ fn build_child_launch_spec_for_binary(
             allowed_exec_paths.push(dep.as_os_str().as_bytes().to_vec());
         }
     }
+    // Let multi-call tools (e.g. git) exec the helpers they invoke by
+    // absolute path.
+    for path in resolve_exec_paths(&policy.exec_paths, &state.policy_root, &cwd)? {
+        allowed_exec_paths.push(path.as_os_str().as_bytes().to_vec());
+    }
 
     Ok(ToolSandboxChildLaunchSpec {
         real_binary: binary.canonical_path.as_os_str().as_bytes().to_vec(),
@@ -3495,6 +3500,29 @@ fn resolve_policy_path(entry: &str, workdir: &Path, cwd: &Path) -> Result<PathBu
     } else {
         Ok(cwd.join(expanded))
     }
+}
+
+/// Resolve a command's `exec_paths` for the execute allowlist. Non-existent
+/// paths are skipped so a profile can list per-distro candidates.
+fn resolve_exec_paths(
+    exec_paths: &[String],
+    policy_root: &Path,
+    cwd: &Path,
+) -> Result<Vec<PathBuf>> {
+    let mut resolved = Vec::new();
+    for entry in &super::dynamic_providers::expand_dynamic_tokens(exec_paths, Some(cwd))? {
+        let path = resolve_policy_path(entry, policy_root, cwd)?;
+        if path.exists() {
+            resolved.push(path);
+        } else {
+            warn!(
+                "tool-sandbox: skipping exec_path '{}' (resolved from '{}'): path does not exist",
+                path.display(),
+                entry
+            );
+        }
+    }
+    Ok(resolved)
 }
 
 fn add_policy_network(caps: &mut CapabilitySet, policy: &CommandSandboxConfig) -> Result<()> {
@@ -5224,6 +5252,40 @@ mod tests {
             path: path.to_path_buf(),
             source,
         })
+    }
+
+    #[test]
+    fn resolve_exec_paths_includes_existing_and_skips_missing() -> Result<()> {
+        let tmp = test_tempdir()?;
+        let present = tmp.path().join("git-core");
+        create_dir(&present)?;
+        let missing = tmp.path().join("does-not-exist");
+
+        let resolved = resolve_exec_paths(
+            &[
+                present.to_string_lossy().into_owned(),
+                missing.to_string_lossy().into_owned(),
+            ],
+            tmp.path(),
+            tmp.path(),
+        )?;
+
+        assert!(
+            resolved.contains(&present),
+            "existing exec_path must be included: {resolved:?}"
+        );
+        assert!(
+            !resolved.iter().any(|p| p == &missing),
+            "missing exec_path must be skipped, not fatal: {resolved:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_exec_paths_empty_yields_empty() -> Result<()> {
+        let tmp = test_tempdir()?;
+        assert!(resolve_exec_paths(&[], tmp.path(), tmp.path())?.is_empty());
+        Ok(())
     }
 
     fn create_executable(path: &Path) -> Result<()> {

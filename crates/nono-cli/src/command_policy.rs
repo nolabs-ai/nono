@@ -694,6 +694,10 @@ pub struct CommandSandboxConfig {
     /// command (or per-intercept override). Ignored on Linux.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unsafe_macos_seatbelt_rules: Vec<String>,
+    /// Extra paths this command may `exec` (Linux only), for multi-call
+    /// tools like `git` that re-exec their own helpers by absolute path.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exec_paths: Vec<String>,
 }
 
 impl CommandSandboxConfig {
@@ -721,6 +725,7 @@ impl CommandSandboxConfig {
                 &self.unsafe_macos_seatbelt_rules,
                 &child.unsafe_macos_seatbelt_rules,
             ),
+            exec_paths: dedup_append(&self.exec_paths, &child.exec_paths),
         }
     }
 }
@@ -3373,6 +3378,38 @@ mod tests {
                 "(allow iokit-open)".to_string(),
                 "(allow process-exec* (literal \"/usr/bin/security\"))".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn command_sandbox_exec_paths_merge_child_dedup_appends() {
+        let base = CommandSandboxConfig {
+            exec_paths: vec!["/usr/lib/git-core".to_string()],
+            ..Default::default()
+        };
+        let child = CommandSandboxConfig {
+            exec_paths: vec![
+                "/usr/lib/git-core".to_string(),
+                "/opt/tool/libexec".to_string(),
+            ],
+            ..Default::default()
+        };
+        let merged = base.merge_child(&child);
+        assert_eq!(
+            merged.exec_paths,
+            vec![
+                "/usr/lib/git-core".to_string(),
+                "/opt/tool/libexec".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn command_sandbox_empty_exec_paths_omitted_from_serialization() {
+        let value = serde_json::to_value(CommandSandboxConfig::default()).expect("serialize");
+        assert!(
+            value.get("exec_paths").is_none(),
+            "empty exec_paths should be omitted, got {value}"
         );
     }
 

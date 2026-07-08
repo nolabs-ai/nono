@@ -9797,6 +9797,69 @@ mod tests {
     }
 
     #[test]
+    fn platform_overrides_merge_adds_command_exec_paths() {
+        // A per-command `exec_paths` declared only in the current platform's
+        // override must merge into the command's sandbox alongside the base's.
+        let current_os = crate::platform::current_os_name();
+        let json = format!(
+            r#"{{
+                "meta": {{"name": "test"}},
+                "command_policies": {{"commands": {{"git": {{"sandbox": {{"exec_paths": ["/base/exec"]}}}}}}}},
+                "platform_overrides": {{
+                    "{current_os}": {{"command_policies": {{"commands": {{"git": {{"sandbox": {{"exec_paths": ["/platform/exec"]}}}}}}}}}}
+                }}
+            }}"#
+        );
+        let profile: Profile = serde_json::from_str(&json).expect("parse");
+        let finalized = finalize_profile(profile).expect("finalize");
+        let command_policies = finalized.command_policies.expect("command_policies");
+        let exec_paths = &command_policies.commands["git"]
+            .sandbox
+            .as_ref()
+            .expect("sandbox")
+            .exec_paths;
+        assert!(
+            exec_paths.contains(&"/base/exec".to_string()),
+            "base exec_path must be present: {exec_paths:?}"
+        );
+        assert!(
+            exec_paths.contains(&"/platform/exec".to_string()),
+            "platform-override exec_path must be present after merge: {exec_paths:?}"
+        );
+    }
+
+    #[test]
+    fn platform_overrides_other_platform_exec_paths_not_applied() {
+        // An `exec_paths` override for the non-current platform must not leak in.
+        let other_os = if crate::platform::current_os_name() == "macos" {
+            "linux"
+        } else {
+            "macos"
+        };
+        let json = format!(
+            r#"{{
+                "meta": {{"name": "test"}},
+                "command_policies": {{"commands": {{"git": {{"sandbox": {{"exec_paths": ["/base/exec"]}}}}}}}},
+                "platform_overrides": {{
+                    "{other_os}": {{"command_policies": {{"commands": {{"git": {{"sandbox": {{"exec_paths": ["/other/exec"]}}}}}}}}}}
+                }}
+            }}"#
+        );
+        let profile: Profile = serde_json::from_str(&json).expect("parse");
+        let finalized = finalize_profile(profile).expect("finalize");
+        let command_policies = finalized.command_policies.expect("command_policies");
+        let exec_paths = &command_policies.commands["git"]
+            .sandbox
+            .as_ref()
+            .expect("sandbox")
+            .exec_paths;
+        assert!(
+            !exec_paths.contains(&"/other/exec".to_string()),
+            "other platform's exec_path must not be present: {exec_paths:?}"
+        );
+    }
+
+    #[test]
     fn platform_overrides_other_platform_not_applied() {
         // The override for the non-current platform must not bleed in.
         let other_os = if crate::platform::current_os_name() == "macos" {

@@ -687,9 +687,11 @@ mod tests {
         let home = test_root.join("home");
         let state = test_root.join("state");
         let config = test_root.join("config");
+        let workdir = test_root.join("workdir");
         std::fs::create_dir_all(&home).expect("create test home");
         std::fs::create_dir_all(&state).expect("create test state");
         std::fs::create_dir_all(&config).expect("create test config");
+        std::fs::create_dir_all(&workdir).expect("create test workdir");
         let _env = crate::test_env::EnvVarGuard::set_all(&[
             ("HOME", home.to_str().expect("home path is utf-8")),
             (
@@ -704,6 +706,7 @@ mod tests {
 
         let run_args = run_args_with_sandbox(SandboxArgs {
             allow_cwd: true,
+            workdir: Some(workdir),
             block_net: true,
             external_proxy: Some("squid.corp:3128".to_string()),
             ..SandboxArgs::default()

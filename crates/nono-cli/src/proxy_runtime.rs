@@ -1435,7 +1435,8 @@ pub(crate) fn prepare_proxy_launch_options(
     let has_credentials = !credentials.is_empty();
     let would_activate = has_domain_filter || has_credentials || upstream_proxy_addr.is_some();
 
-    // --block-net always wins; profile network.block yields to any proxy config.
+    // Normal launch validation rejects hard-block plus proxy-mode inputs before
+    // this fallback can choose BlockAll or strict filtering.
     let block_wins = args.block_net || (prepared.profile_network_block && !would_activate);
     if block_wins {
         if would_activate {
@@ -1453,7 +1454,6 @@ pub(crate) fn prepare_proxy_launch_options(
         return Ok(NetworkIntent::BlockAll);
     }
 
-    // Profile network.block + proxy flags → strict mode: deny unlisted hosts.
     let strict_filter = prepared.profile_network_block;
 
     let (plain_entries, endpoint_entries): (Vec<_>, Vec<_>) = allow_domain

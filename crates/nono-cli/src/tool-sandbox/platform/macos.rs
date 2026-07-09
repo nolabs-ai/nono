@@ -9,7 +9,8 @@ use crate::command_policy::{
 use crate::tool_sandbox::credentials::{ResolvedCredential, resolve_credentials};
 use crate::tool_sandbox::env::{
     apply_environment_set_vars, default_env_allow_patterns, effective_argv_for_binary,
-    inject_chaining_control_env, inject_url_open_env, split_env_entry,
+    env_shebang_target_interpreter, inject_chaining_control_env, inject_url_open_env,
+    split_env_entry,
 };
 use crate::tool_sandbox::launch::{
     exit_status_code, prepare_launcher_command, remove_launch_spec, write_launch_spec,
@@ -2140,7 +2141,19 @@ fn add_executable_shape_baseline(
     {
         caps.add_fs(FsCapability::new_file(bundle, AccessMode::Read)?);
     }
-    caps.add_fs(FsCapability::new_file(interpreter, AccessMode::Read)?);
+    caps.add_fs(FsCapability::new_file(&interpreter, AccessMode::Read)?);
+    // `env` re-exec's the real interpreter, so grant it read too (as on Linux).
+    if let Some(real_interp) =
+        env_shebang_target_interpreter(&interpreter, &binary.shape.interpreter_args)
+        && let Ok(canonical_real) = real_interp.canonicalize()
+    {
+        if let Some(bundle) = python_framework_app_bundle_path(&canonical_real)
+            && bundle.is_file()
+        {
+            caps.add_fs(FsCapability::new_file(bundle, AccessMode::Read)?);
+        }
+        caps.add_fs(FsCapability::new_file(&canonical_real, AccessMode::Read)?);
+    }
     Ok(())
 }
 
@@ -4684,6 +4697,30 @@ mod tests {
 
         assert!(has_read_file_cap(&caps, &interpreter)?);
         assert!(!has_read_file_cap(&caps, &bundle).unwrap_or(false));
+        Ok(())
+    }
+
+    #[test]
+    fn executable_shape_baseline_grants_env_shebang_target_interpreter() -> Result<()> {
+        // Seatbelt must grant read to the re-exec'd `<interp>`, not just `env`.
+        let temp = test_tempdir()?;
+        let command = temp.path().join("tool");
+        create_executable(&command)?;
+        let target = temp.path().join("real-interp");
+        create_executable(&target)?;
+
+        let mut binary = test_binary("tool", &command)?;
+        binary.shape = ResolvedExecutableShape {
+            kind: ResolvedExecutableKind::ShebangScript,
+            interpreter: Some(PathBuf::from("/usr/bin/env")),
+            interpreter_args: vec![target.to_string_lossy().into_owned()],
+        };
+
+        let mut caps = CapabilitySet::new();
+        add_executable_shape_baseline(&mut caps, &binary)?;
+
+        assert!(has_read_file_cap(&caps, Path::new("/usr/bin/env"))?);
+        assert!(has_read_file_cap(&caps, &target)?);
         Ok(())
     }
 

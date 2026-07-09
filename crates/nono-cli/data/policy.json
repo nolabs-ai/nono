@@ -20,6 +20,8 @@
           "~/.git-credentials",
           "~/.netrc",
           "~/.npmrc",
+          "~/.bunfig.toml",
+          "~/.config/bun/bunfig.toml",
           "~/.vault-token",
           "~/.credentials",
           "~/.secrets",
@@ -375,12 +377,31 @@
         ]
       }
     },
+    "bun_runtime": {
+      "description": "Bun javascript runtime and package manager paths",
+      "allow": {
+        "read": [
+          "~/.bun"
+        ]
+      }
+    },
     "opencode_linux": {
       "description": "OpenCode binary directory (Landlock requires directory read to execute binaries)",
       "platform": "linux",
       "allow": {
         "read": [
           "~/.opencode/bin"
+        ]
+      }
+    },
+    "mise_manager": {
+      "description": "Mise - dev tools, env vars, task runner",
+      "allow": {
+        "read": [
+          "/etc/mise",
+          "~/.local/bin/mise",
+          "~/.config/mise",
+          "~/.local/share/mise"
         ]
       }
     },
@@ -714,6 +735,25 @@
       },
       "interactive": false
     },
+    "mise-dev": {
+      "extends": "default",
+      "meta": {
+        "name": "mise-dev",
+        "version": "1.0.0",
+        "description": "Mise: dev tools, env vars, task runner",
+        "author": "always-further"
+      },
+      "groups": {
+        "include": ["mise_manager"]
+      },
+      "security": {
+        "signal_mode": "isolated"
+      },
+      "filesystem": {},
+      "network": { "block": false, "network_profile": "developer" },
+      "workdir": { "access": "readwrite" },
+      "interactive": false
+    },
     "python-dev": {
       "extends": "default",
       "meta": {
@@ -744,6 +784,25 @@
       },
       "groups": {
         "include": ["node_runtime"]
+      },
+      "security": {
+        "signal_mode": "isolated"
+      },
+      "filesystem": {},
+      "network": { "block": false, "network_profile": "developer" },
+      "workdir": { "access": "readwrite" },
+      "interactive": false
+    },
+    "bun-dev": {
+      "extends": "default",
+      "meta": {
+        "name": "bun-dev",
+        "version": "1.0.0",
+        "description": "Bun runtime development profile",
+        "author": "always-further"
+      },
+      "groups": {
+        "include": ["bun_runtime"]
       },
       "security": {
         "signal_mode": "isolated"

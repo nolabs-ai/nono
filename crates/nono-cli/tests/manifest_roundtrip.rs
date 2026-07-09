@@ -615,9 +615,11 @@ const AVAILABLE_GROUPS: &[&str] = &[
     "dangerous_commands",
     "git_config",
     "node_runtime",
+    "bun_runtime",
     "python_runtime",
     "rust_runtime",
     "user_tools",
+    "mise_manager",
     "unlink_protection",
 ];
 

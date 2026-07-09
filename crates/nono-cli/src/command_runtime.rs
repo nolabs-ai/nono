@@ -11,8 +11,7 @@ use crate::profile;
 use crate::proxy_runtime::prepare_proxy_launch_options;
 use crate::sandbox_prepare::{
     prepare_sandbox, print_allow_gpu_warning, print_allow_launch_services_warning,
-    should_auto_enable_claude_launch_services, validate_block_net_conflicts,
-    validate_external_proxy_bypass,
+    should_auto_enable_claude_launch_services, validate_proxy_conflicts,
 };
 use crate::theme;
 use nono::{CapabilitySet, NonoError, Result};
@@ -48,14 +47,6 @@ fn reject_run_only_sandbox_policy(
     _prepared: &crate::sandbox_prepare::PreparedSandbox,
 ) -> Result<()> {
     Ok(())
-}
-
-fn validate_proxy_conflicts(
-    args: &SandboxArgs,
-    prepared: &crate::sandbox_prepare::PreparedSandbox,
-) -> Result<()> {
-    validate_block_net_conflicts(args, prepared)?;
-    validate_external_proxy_bypass(args, prepared)
 }
 
 /// Check whether the loaded profile specifies a `binary` field that should be

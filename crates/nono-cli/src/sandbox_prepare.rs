@@ -748,6 +748,14 @@ pub(crate) fn validate_external_proxy_bypass(
     Ok(())
 }
 
+pub(crate) fn validate_proxy_conflicts(
+    args: &SandboxArgs,
+    prepared: &PreparedSandbox,
+) -> Result<()> {
+    validate_block_net_conflicts(args, prepared)?;
+    validate_external_proxy_bypass(args, prepared)
+}
+
 /// Validate that `--block-net` is not combined with flags that imply proxy
 /// mode, and that `--allow-endpoint` always has a matching credential.
 ///

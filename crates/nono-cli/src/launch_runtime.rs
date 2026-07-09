@@ -3,7 +3,7 @@ use crate::config;
 use crate::proxy_runtime::prepare_proxy_launch_options;
 use crate::sandbox_prepare::{
     PreparedSandbox, prepare_sandbox, print_allow_gpu_warning, print_allow_launch_services_warning,
-    validate_block_net_conflicts,
+    validate_proxy_conflicts,
 };
 use crate::{exec_strategy, instruction_deny, profile, trust_scan};
 use colored::Colorize;
@@ -343,7 +343,7 @@ pub(crate) fn prepare_run_launch_plan(
     }
 
     let mut prepared = prepare_sandbox(&args, silent)?;
-    validate_block_net_conflicts(&args, &prepared)?;
+    validate_proxy_conflicts(&args, &prepared)?;
     validate_rollback_destination(run_args.rollback_dest.as_ref(), &prepared)?;
 
     if prepared.allow_launch_services_active {
@@ -636,5 +636,86 @@ pub(crate) fn select_threading_context(
         exec_strategy::ThreadingContext::KeyringExpected
     } else {
         exec_strategy::ThreadingContext::Strict
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::SandboxArgs;
+
+    fn run_args_with_sandbox(sandbox: SandboxArgs) -> RunArgs {
+        RunArgs {
+            sandbox,
+            detached: false,
+            detach_timeout_secs: None,
+            rollback: false,
+            no_rollback_prompt: false,
+            no_rollback: false,
+            rollback_exclude: Vec::new(),
+            rollback_include: Vec::new(),
+            rollback_all: false,
+            skip_dir: Vec::new(),
+            rollback_dest: None,
+            no_diagnostics: false,
+            diagnostics_json: false,
+            startup_timeout_secs: None,
+            no_audit: false,
+            no_audit_integrity: false,
+            audit_integrity: false,
+            audit_sign_key: None,
+            trust_override: false,
+            name: None,
+            capability_elevation: false,
+            command: Vec::new(),
+            help: None,
+        }
+    }
+
+    #[test]
+    fn run_launch_plan_rejects_block_net_with_upstream_proxy() {
+        let _env_lock = crate::test_env::ENV_LOCK.lock().expect("env lock");
+        let test_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("target")
+            .join("test-env")
+            .join(format!(
+                "run-launch-block-net-upstream-proxy-{}",
+                std::process::id()
+            ));
+        let home = test_root.join("home");
+        let state = test_root.join("state");
+        let config = test_root.join("config");
+        std::fs::create_dir_all(&home).expect("create test home");
+        std::fs::create_dir_all(&state).expect("create test state");
+        std::fs::create_dir_all(&config).expect("create test config");
+        let _env = crate::test_env::EnvVarGuard::set_all(&[
+            ("HOME", home.to_str().expect("home path is utf-8")),
+            (
+                "XDG_STATE_HOME",
+                state.to_str().expect("state path is utf-8"),
+            ),
+            (
+                "XDG_CONFIG_HOME",
+                config.to_str().expect("config path is utf-8"),
+            ),
+        ]);
+
+        let run_args = run_args_with_sandbox(SandboxArgs {
+            allow_cwd: true,
+            block_net: true,
+            external_proxy: Some("squid.corp:3128".to_string()),
+            ..SandboxArgs::default()
+        });
+
+        let result = prepare_run_launch_plan(run_args, OsString::from("/bin/echo"), vec![], true);
+        let Err(err) = result else {
+            panic!("expected run launch plan to reject --block-net + --upstream-proxy");
+        };
+        assert!(
+            err.to_string().contains("--block-net") && err.to_string().contains("--upstream-proxy"),
+            "unexpected error: {err}"
+        );
     }
 }

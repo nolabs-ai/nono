@@ -15,10 +15,40 @@ use crate::sandbox_prepare::{
     validate_external_proxy_bypass,
 };
 use crate::theme;
-use nono::{NonoError, Result};
+use nono::{CapabilitySet, NonoError, Result};
 use std::ffi::OsString;
 use std::path::PathBuf;
 use tracing::warn;
+
+#[cfg(target_os = "linux")]
+fn reject_run_only_sandbox_policy(
+    command: &str,
+    args: &SandboxArgs,
+    prepared: &crate::sandbox_prepare::PreparedSandbox,
+) -> Result<()> {
+    if args.sandbox_policy.is_some() {
+        return Err(NonoError::ConfigParse(format!(
+            "--sandbox-policy is only supported by `nono run`; `nono {command}` has no proxy supervisor. Use `nono run` instead."
+        )));
+    }
+
+    if prepared.explicit_sandbox_policy.is_some() {
+        return Err(NonoError::ConfigParse(format!(
+            "profiles containing linux.sandbox_policy are only supported by `nono run`; `nono {command}` has no proxy supervisor. Remove linux.sandbox_policy or use `nono run`."
+        )));
+    }
+
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn reject_run_only_sandbox_policy(
+    _command: &str,
+    _args: &SandboxArgs,
+    _prepared: &crate::sandbox_prepare::PreparedSandbox,
+) -> Result<()> {
+    Ok(())
+}
 
 /// Check whether the loaded profile specifies a `binary` field that should be
 /// honoured. Only user-authored profiles (user overrides or file-path based)
@@ -43,6 +73,56 @@ fn resolve_profile_binary(
         return None;
     }
     Some(binary.clone())
+}
+
+/// Strip `unsafe_macos_seatbelt_rules` — top-level and nested inside
+/// command/`from`/intercept sandboxes — unless the profile is user-authored
+/// (user override or file-path profile). Raw Seatbelt rules are as powerful
+/// as an arbitrary `binary` override (they can grant anything, including
+/// `(allow default)`), so pack/registry/built-in profiles are not trusted to
+/// set them. Mirrors `resolve_profile_binary`.
+///
+/// Structured sandbox overrides (fs/network/credentials) are left untouched
+/// for all profiles; only raw Seatbelt S-expressions are gated.
+pub(crate) fn strip_untrusted_unsafe_seatbelt_rules(
+    profile_name: &str,
+    profile: &mut profile::Profile,
+    command_policies: Option<&mut crate::command_policy::CommandPoliciesConfig>,
+    silent: bool,
+) {
+    let is_user_profile =
+        profile::is_user_override(profile_name) || profile::is_file_path_ref(profile_name);
+    if is_user_profile {
+        return;
+    }
+
+    if !profile.unsafe_macos_seatbelt_rules.is_empty() {
+        if !silent {
+            warn!(
+                "Profile '{profile_name}' sets {} raw Seatbelt rule(s) via unsafe_macos_seatbelt_rules but is not a user profile; ignoring",
+                profile.unsafe_macos_seatbelt_rules.len()
+            );
+        }
+        profile.unsafe_macos_seatbelt_rules.clear();
+    }
+
+    if let Some(command_policies) = command_policies {
+        let locations = crate::command_policy::nested_unsafe_seatbelt_rules(command_policies);
+        if !locations.is_empty() {
+            if !silent {
+                for location in locations
+                    .iter()
+                    .map(|(location, _rule)| location)
+                    .collect::<std::collections::BTreeSet<_>>()
+                {
+                    warn!(
+                        "Profile '{profile_name}' sets raw Seatbelt rule(s) at {location} but is not a user profile; ignoring",
+                    );
+                }
+            }
+            crate::command_policy::clear_unsafe_seatbelt_rules(command_policies);
+        }
+    }
 }
 
 /// Resolve the program to execute: if the profile specifies a `binary` field
@@ -81,7 +161,10 @@ pub(crate) fn run_sandbox(mut run_args: RunArgs, silent: bool) -> Result<()> {
 
     // Load profile once and reuse for binary resolution and command_args.
     let loaded_profile = match run_args.sandbox.profile.as_ref() {
-        Some(name) => Some((name.clone(), profile::load_profile(name)?)),
+        Some(name) => Some((
+            name.clone(),
+            profile::load_profile_with_extends(name, &run_args.sandbox.extends)?,
+        )),
         None => None,
     };
 
@@ -159,6 +242,7 @@ pub(crate) fn run_shell(args: ShellArgs, silent: bool) -> Result<()> {
 
     if args.sandbox.dry_run {
         let prepared = prepare_sandbox(&args.sandbox, silent)?;
+        reject_run_only_sandbox_policy("shell", &args.sandbox, &prepared)?;
         if !prepared.secrets.is_empty() && !silent {
             eprintln!(
                 "  Would inject {} credential(s) as environment variables",
@@ -171,6 +255,7 @@ pub(crate) fn run_shell(args: ShellArgs, silent: bool) -> Result<()> {
     }
 
     let prepared = prepare_sandbox(&args.sandbox, silent)?;
+    reject_run_only_sandbox_policy("shell", &args.sandbox, &prepared)?;
 
     if prepared.allow_launch_services_active {
         print_allow_launch_services_warning(silent);
@@ -201,40 +286,48 @@ pub(crate) fn run_shell(args: ShellArgs, silent: bool) -> Result<()> {
         false,
     );
 
+    let flags = ExecutionFlags {
+        strategy,
+        workdir: resolve_requested_workdir(args.sandbox.workdir.as_ref()),
+        no_diagnostics: true,
+        startup_timeout_secs: args.startup_timeout_secs,
+        network,
+        redaction_policy: load_configured_redaction_policy()?,
+        session: SessionLaunchOptions {
+            session_id: Some(session_id),
+            session_name: args.name,
+            detach_sequence: load_configured_detach_sequence()?,
+            ..SessionLaunchOptions::default()
+        },
+        ..ExecutionFlags::from_prepared(&prepared, silent)?
+    };
     execute_sandboxed(LaunchPlan {
         program: shell_path.into_os_string(),
         cmd_args: vec![],
         caps: prepared.caps,
+        deny_paths: prepared.deny_paths,
         loaded_secrets: prepared.secrets,
-        flags: ExecutionFlags {
-            strategy,
-            workdir: resolve_requested_workdir(args.sandbox.workdir.as_ref()),
-            no_diagnostics: true,
-            capability_elevation: prepared.capability_elevation,
-            #[cfg(target_os = "linux")]
-            wsl2_proxy_policy: prepared.wsl2_proxy_policy,
-            #[cfg(target_os = "linux")]
-            af_unix_mediation: prepared.af_unix_mediation,
-            bypass_protection_paths: prepared.bypass_protection_paths,
-            ignored_denial_paths: prepared.ignored_denial_paths,
-            suppressed_system_service_operations: prepared.suppressed_system_service_operations,
-            allowed_env_vars: prepared.allowed_env_vars,
-            denied_env_vars: prepared.denied_env_vars,
-            set_vars: prepared.set_vars,
-            startup_timeout_secs: args.startup_timeout_secs,
-            command_policies: prepared.command_policies,
-            session_hooks: prepared.session_hooks,
-            network,
-            redaction_policy: load_configured_redaction_policy()?,
-            session: SessionLaunchOptions {
-                session_id: Some(session_id),
-                session_name: args.name,
-                detach_sequence: load_configured_detach_sequence()?,
-                ..SessionLaunchOptions::default()
-            },
-            ..ExecutionFlags::defaults(silent)?
-        },
+        flags,
     })
+}
+
+/// `nono wrap` execs the target directly (no supervising parent), so it never
+/// creates the cgroup that enforces a memory ceiling. Accepting a limit here would
+/// run unenforced — or under `--dry-run` advertise a cap we won't honor. Fail
+/// closed instead, like the proxy / AF_UNIX guards below. Covers both `--memory`
+/// and a manifest `resources.memory_bytes` (both are in `caps` by now).
+fn reject_resource_limits_under_wrap(caps: &CapabilitySet) -> Result<()> {
+    if caps
+        .resource_limits()
+        .is_some_and(|limits| !limits.is_empty())
+    {
+        return Err(NonoError::ConfigParse(
+            "nono wrap does not support --memory / resources.memory_bytes because direct \
+             exec cannot create the enforcement cgroup. Use `nono run` instead."
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn run_wrap(wrap_args: WrapArgs, silent: bool) -> Result<()> {
@@ -252,6 +345,8 @@ pub(crate) fn run_wrap(wrap_args: WrapArgs, silent: bool) -> Result<()> {
 
     if args.dry_run {
         let prepared = prepare_sandbox(&args, silent)?;
+        reject_resource_limits_under_wrap(&prepared.caps)?;
+        reject_run_only_sandbox_policy("wrap", &args, &prepared)?;
         if !prepared.secrets.is_empty() && !silent {
             eprintln!(
                 "  Would inject {} credential(s) as environment variables",
@@ -264,6 +359,8 @@ pub(crate) fn run_wrap(wrap_args: WrapArgs, silent: bool) -> Result<()> {
     }
 
     let prepared = prepare_sandbox(&args, silent)?;
+    reject_resource_limits_under_wrap(&prepared.caps)?;
+    reject_run_only_sandbox_policy("wrap", &args, &prepared)?;
 
     if prepared.upstream_proxy.is_some()
         || matches!(
@@ -287,6 +384,15 @@ pub(crate) fn run_wrap(wrap_args: WrapArgs, silent: bool) -> Result<()> {
         ));
     }
 
+    #[cfg(target_os = "linux")]
+    if prepared.proc_comm_notify {
+        return Err(NonoError::ConfigParse(
+            "nono wrap does not support NVIDIA GPU thread-name mediation because direct \
+             exec cannot run the seccomp supervisor. Use `nono run --allow-gpu` instead."
+                .to_string(),
+        ));
+    }
+
     if prepared.allow_launch_services_active {
         print_allow_launch_services_warning(silent);
     }
@@ -294,24 +400,145 @@ pub(crate) fn run_wrap(wrap_args: WrapArgs, silent: bool) -> Result<()> {
         print_allow_gpu_warning(silent);
     }
 
+    let flags = ExecutionFlags {
+        strategy: exec_strategy::ExecStrategy::Direct,
+        workdir: resolve_requested_workdir(args.workdir.as_ref()),
+        no_diagnostics,
+        ..ExecutionFlags::from_prepared(&prepared, silent)?
+    };
     execute_sandboxed(LaunchPlan {
         program,
         cmd_args,
         caps: prepared.caps,
+        deny_paths: prepared.deny_paths,
         loaded_secrets: prepared.secrets,
-        flags: ExecutionFlags {
-            strategy: exec_strategy::ExecStrategy::Direct,
-            workdir: resolve_requested_workdir(args.workdir.as_ref()),
-            no_diagnostics,
-            bypass_protection_paths: prepared.bypass_protection_paths,
-            ignored_denial_paths: prepared.ignored_denial_paths,
-            suppressed_system_service_operations: prepared.suppressed_system_service_operations,
-            allowed_env_vars: prepared.allowed_env_vars,
-            denied_env_vars: prepared.denied_env_vars,
-            set_vars: prepared.set_vars,
-            command_policies: prepared.command_policies,
-            session_hooks: prepared.session_hooks,
-            ..ExecutionFlags::defaults(silent)?
-        },
+        flags,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::reject_resource_limits_under_wrap;
+    use nono::{CapabilitySet, ResourceLimits};
+
+    #[test]
+    fn wrap_rejects_caps_carrying_a_memory_limit() {
+        // `nono wrap` execs directly and cannot create the enforcement cgroup,
+        // so a requested memory ceiling must be refused (fail-closed) rather than
+        // silently dropped and run unenforced.
+        let caps = CapabilitySet::new().with_resource_limits(ResourceLimits {
+            memory_bytes: Some(64 * 1024 * 1024),
+        });
+        assert!(reject_resource_limits_under_wrap(&caps).is_err());
+    }
+
+    #[test]
+    fn wrap_allows_caps_without_a_ceiling() {
+        // No limit set at all -> wrap proceeds normally.
+        assert!(reject_resource_limits_under_wrap(&CapabilitySet::new()).is_ok());
+
+        // A present-but-empty limit set carries no ceiling, so it is not a
+        // silently-dropped enforcement request and must be allowed.
+        let caps = CapabilitySet::new().with_resource_limits(ResourceLimits::default());
+        assert!(reject_resource_limits_under_wrap(&caps).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod strip_untrusted_unsafe_seatbelt_rules_tests {
+    use super::strip_untrusted_unsafe_seatbelt_rules;
+    use crate::command_policy::{CommandPoliciesConfig, CommandPolicyConfig, CommandSandboxConfig};
+    use crate::profile;
+
+    // `is_file_path_ref` is pure string logic (no filesystem access), so a
+    // name ending in `.json` is treated as a trusted, user-authored profile
+    // reference without needing to touch `XDG_CONFIG_HOME`.
+    const TRUSTED_NAME: &str = "./scratch-profile.json";
+    const UNTRUSTED_NAME: &str = "hardened";
+
+    #[test]
+    fn strips_top_level_rules_for_untrusted_profile() {
+        let mut profile = profile::Profile {
+            unsafe_macos_seatbelt_rules: vec!["(allow default)".to_string()],
+            ..profile::Profile::default()
+        };
+
+        strip_untrusted_unsafe_seatbelt_rules(UNTRUSTED_NAME, &mut profile, None, true);
+
+        assert!(profile.unsafe_macos_seatbelt_rules.is_empty());
+    }
+
+    #[test]
+    fn retains_top_level_rules_for_trusted_profile() {
+        let mut profile = profile::Profile {
+            unsafe_macos_seatbelt_rules: vec!["(allow default)".to_string()],
+            ..profile::Profile::default()
+        };
+
+        strip_untrusted_unsafe_seatbelt_rules(TRUSTED_NAME, &mut profile, None, true);
+
+        assert_eq!(
+            profile.unsafe_macos_seatbelt_rules,
+            vec!["(allow default)".to_string()]
+        );
+    }
+
+    #[test]
+    fn strips_nested_command_sandbox_rules_for_untrusted_profile() {
+        let mut profile = profile::Profile::default();
+        let mut policies = CommandPoliciesConfig::default();
+        policies.commands.insert(
+            "git".to_string(),
+            CommandPolicyConfig {
+                sandbox: Some(CommandSandboxConfig {
+                    unsafe_macos_seatbelt_rules: vec!["(allow iokit-open)".to_string()],
+                    fs_read: vec!["/tmp".to_string()],
+                    ..CommandSandboxConfig::default()
+                }),
+                ..CommandPolicyConfig::default()
+            },
+        );
+
+        strip_untrusted_unsafe_seatbelt_rules(
+            UNTRUSTED_NAME,
+            &mut profile,
+            Some(&mut policies),
+            true,
+        );
+
+        let sandbox = policies.commands["git"].sandbox.as_ref().expect("sandbox");
+        assert!(sandbox.unsafe_macos_seatbelt_rules.is_empty());
+        // Structured overrides are not gated by provenance — only raw
+        // Seatbelt rules are.
+        assert_eq!(sandbox.fs_read, vec!["/tmp".to_string()]);
+    }
+
+    #[test]
+    fn retains_nested_command_sandbox_rules_for_trusted_profile() {
+        let mut profile = profile::Profile::default();
+        let mut policies = CommandPoliciesConfig::default();
+        policies.commands.insert(
+            "git".to_string(),
+            CommandPolicyConfig {
+                sandbox: Some(CommandSandboxConfig {
+                    unsafe_macos_seatbelt_rules: vec!["(allow iokit-open)".to_string()],
+                    ..CommandSandboxConfig::default()
+                }),
+                ..CommandPolicyConfig::default()
+            },
+        );
+
+        strip_untrusted_unsafe_seatbelt_rules(
+            TRUSTED_NAME,
+            &mut profile,
+            Some(&mut policies),
+            true,
+        );
+
+        let sandbox = policies.commands["git"].sandbox.as_ref().expect("sandbox");
+        assert_eq!(
+            sandbox.unsafe_macos_seatbelt_rules,
+            vec!["(allow iokit-open)".to_string()]
+        );
+    }
 }

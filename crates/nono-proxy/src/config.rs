@@ -41,14 +41,80 @@ pub struct ProxyConfig {
     #[serde(default)]
     pub allowed_hosts: Vec<String>,
 
+    /// Hosts to deny regardless of the allowlist (exact match + wildcards).
+    /// Evaluated before the allowlist.
+    #[serde(default)]
+    pub denied_hosts: Vec<String>,
+
     /// When `true`, an empty `allowed_hosts` denies every host instead of
     /// falling back to allow-all.
     #[serde(default)]
     pub strict_filter: bool,
 
+    /// When `true` (the default), the proxy enforces the per-session token
+    /// on incoming requests via the `Proxy-Authorization` header. When
+    /// `false`, token enforcement is skipped entirely — an open proxy on the
+    /// bind address.
+    ///
+    /// This MUST remain `true` for the sandboxed `nono run`/`shell`/`wrap`
+    /// path: the token is the localhost auth boundary that stops other local
+    /// processes from using the proxy. It is set `false` only by the
+    /// standalone `nono proxy --no-auth` command, which keeps the bind
+    /// address on loopback.
+    #[serde(default = "default_require_auth")]
+    pub require_auth: bool,
+
+    /// Make `Proxy-Authorization` validation fatal on the transparent CONNECT
+    /// path (returns `407 Proxy Authentication Required` instead of tunnelling).
+    ///
+    /// Defaults to `false`, which preserves the lenient CONNECT behaviour the
+    /// sandboxed `nono run`/`shell`/`wrap` path relies on: Node.js undici does
+    /// not echo URL-userinfo credentials as `Proxy-Authorization` on CONNECT,
+    /// and the sandbox itself is the trust boundary there.
+    ///
+    /// Set `true` only by the standalone `nono proxy` command (unless
+    /// `--no-auth`), where the session token — not an OS sandbox — is the auth
+    /// boundary for the external tools pointed at the proxy. Has no effect when
+    /// `require_auth` is `false`.
+    #[serde(default)]
+    pub strict_connect_auth: bool,
+
+    /// Optional caller-supplied auth password used in place of a freshly
+    /// generated random session token.
+    ///
+    /// When `Some` (and non-empty), [`crate::server::start`] uses this exact
+    /// value as the credential clients must present via the
+    /// `Proxy-Authorization` header (Basic password or Bearer token), instead
+    /// of minting 256 bits of randomness. Set only by the standalone
+    /// `nono proxy --pass` flag so the operator controls the exact secret;
+    /// the sandboxed `run`/`shell`/`wrap` path always leaves this `None` and
+    /// uses a random per-session token.
+    ///
+    /// Skipped during (de)serialisation — a secret must never be persisted to
+    /// or read from a config file on disk. Has no effect when
+    /// `require_auth` is `false`.
+    #[serde(default, skip)]
+    pub session_token: Option<Zeroizing<String>>,
+
     /// Reverse proxy credential routes.
     #[serde(default)]
     pub routes: Vec<RouteConfig>,
+
+    /// Declarative OAuth token capture routes.
+    ///
+    /// These are not reverse-proxy routes. They mark OAuth token endpoints
+    /// whose JSON responses must be rewritten from real tokens to phantom
+    /// nonces before reaching the sandboxed process.
+    #[serde(default)]
+    pub oauth_capture: Vec<OAuthCaptureConfig>,
+
+    /// Optional host-only persistence file for OAuth capture phantom mappings.
+    ///
+    /// The sandboxed process never receives this path. It only sees phantom
+    /// tokens in provider-owned credential files; the proxy uses this file to
+    /// resolve those phantoms in later nono sessions.
+    #[serde(default, skip)]
+    pub oauth_capture_store_path: Option<PathBuf>,
 
     /// External (enterprise) proxy URL for passthrough mode.
     /// When set, CONNECT requests are chained to this proxy.
@@ -94,6 +160,11 @@ pub struct ProxyConfig {
     /// (de)serialisation: it's not part of any user-authored config file.
     #[serde(default, skip)]
     pub intercept_parent_ca_pems: Option<Vec<u8>>,
+
+    /// Environment variables that should point at the TLS-intercept trust
+    /// bundle when interception is active.
+    #[serde(default = "default_intercept_ca_env_vars")]
+    pub intercept_ca_env_vars: Vec<String>,
 
     /// Pre-generated CA material for cross-session reuse (`--trust-proxy-ca`).
     ///
@@ -161,13 +232,20 @@ impl Default for ProxyConfig {
             bind_addr: default_bind_addr(),
             bind_port: 0,
             allowed_hosts: Vec::new(),
+            denied_hosts: Vec::new(),
             strict_filter: false,
+            require_auth: default_require_auth(),
+            strict_connect_auth: false,
+            session_token: None,
             routes: Vec::new(),
+            oauth_capture: Vec::new(),
+            oauth_capture_store_path: None,
             external_proxy: None,
             direct_connect_ports: Vec::new(),
             max_connections: 256,
             intercept_ca_dir: None,
             intercept_parent_ca_pems: None,
+            intercept_ca_env_vars: default_intercept_ca_env_vars(),
             preloaded_ca: None,
             ca_validity: None,
             leaf_validity: None,
@@ -176,8 +254,84 @@ impl Default for ProxyConfig {
     }
 }
 
+pub fn default_intercept_ca_env_vars() -> Vec<String> {
+    [
+        "SSL_CERT_FILE",
+        "REQUESTS_CA_BUNDLE",
+        "NODE_EXTRA_CA_CERTS",
+        "CURL_CA_BUNDLE",
+        "GIT_SSL_CAINFO",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+/// Declarative OAuth capture provider configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OAuthCaptureConfig {
+    /// Provider name from the profile.
+    pub provider: String,
+    /// OAuth token endpoints whose responses are rewritten.
+    #[serde(default)]
+    pub token_endpoints: Vec<OAuthTokenEndpointConfig>,
+    /// Nonce consumers admitted for tokens minted by this provider.
+    ///
+    /// Values use the same namespace as [`crate::token::NonceResolver`], for
+    /// example `proxy.anthropic_oauth`.
+    #[serde(default)]
+    pub admitted_consumers: Vec<String>,
+}
+
+/// OAuth token endpoint capture configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OAuthTokenEndpointConfig {
+    /// URL origin serving the token endpoint, for example
+    /// `https://platform.claude.com`.
+    pub host: String,
+    /// Absolute token endpoint path.
+    pub path: String,
+    /// JSON response fields containing real token material.
+    pub response_fields: Vec<OAuthTokenResponseFieldConfig>,
+    /// Request body encoding for token refresh/exchange requests.
+    #[serde(default)]
+    pub request_body: OAuthTokenRequestBodyFormat,
+    /// JSON request fields where phantom tokens must be resolved before
+    /// forwarding token refresh/exchange requests upstream.
+    #[serde(default)]
+    pub request_nonce_fields: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OAuthTokenResponseFieldConfig {
+    pub path: String,
+    #[serde(default)]
+    pub kind: OAuthTokenResponseFieldKind,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OAuthTokenResponseFieldKind {
+    #[default]
+    Opaque,
+    Jwt,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OAuthTokenRequestBodyFormat {
+    #[default]
+    Auto,
+    Json,
+    Form,
+}
+
 fn default_bind_addr() -> IpAddr {
     IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+}
+
+fn default_require_auth() -> bool {
+    true
 }
 
 /// Configuration for a reverse proxy credential route.

@@ -119,7 +119,7 @@ pub(crate) fn run_why(args: WhyArgs) -> Result<()> {
             }
         }
     } else if let Some(ref profile_name) = args.profile {
-        let profile = profile::load_profile(profile_name)?;
+        let profile = profile::load_profile_with_extends(profile_name, &args.extends)?;
         let workdir = args
             .workdir
             .clone()

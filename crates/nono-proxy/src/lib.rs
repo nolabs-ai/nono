@@ -19,6 +19,7 @@
 
 pub mod approval;
 pub mod audit;
+pub mod aws;
 pub mod capture;
 pub mod config;
 pub mod connect;
@@ -29,12 +30,16 @@ pub mod external;
 pub mod filter;
 pub mod forward;
 pub mod oauth2;
+pub mod oauth_capture;
 pub mod pool;
 pub mod reverse;
 pub mod route;
 pub mod server;
 pub mod tls_intercept;
 pub mod token;
+
+#[cfg(test)]
+pub mod test_env;
 
 pub use config::ProxyConfig;
 pub use credential::{CredentialLoadOutcome, CredentialStore};

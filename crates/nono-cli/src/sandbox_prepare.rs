@@ -416,17 +416,28 @@ struct PendingCwdAccessRequest {
 /// Result of sandbox preparation.
 pub(crate) struct PreparedSandbox {
     pub(crate) caps: CapabilitySet,
+    /// Resolved filesystem deny paths (groups + profile `filesystem.deny`).
+    /// Threaded to the tool-sandbox so a mediated command's live cwd can be
+    /// rejected when it falls under a directory the agent is denied.
+    pub(crate) deny_paths: Vec<PathBuf>,
     pub(crate) secrets: Vec<nono::LoadedSecret>,
     pub(crate) profile_display_name: Option<String>,
     pub(crate) command_policies: Option<crate::command_policy::CommandPoliciesConfig>,
+    /// Command binaries already resolved while validating `command_policies`.
+    /// Reused by the tool-sandbox plan build so every controlled binary is
+    /// only read and hashed once per invocation, not twice.
+    pub(crate) resolved_command_binaries: Option<crate::command_policy::ResolvedCommandBinaries>,
     pub(crate) session_hooks: profile::SessionHooks,
     pub(crate) rollback_exclude_patterns: Vec<String>,
     pub(crate) rollback_exclude_globs: Vec<String>,
     pub(crate) network_profile: Option<String>,
     pub(crate) allow_domain: Vec<profile::AllowDomainEntry>,
+    pub(crate) deny_domain: Vec<String>,
     pub(crate) credentials: Vec<String>,
     pub(crate) custom_credentials: HashMap<String, profile::CustomCredentialDef>,
     pub(crate) credential_capture: HashMap<String, profile::CredentialCaptureEntry>,
+    pub(crate) credential_providers: HashMap<String, profile::CredentialProviderDef>,
+    pub(crate) credential_routes: Vec<profile::CredentialRouteDef>,
     pub(crate) tls_intercept: Option<profile::TlsInterceptConfig>,
     pub(crate) upstream_proxy: Option<String>,
     pub(crate) upstream_bypass: Vec<String>,
@@ -436,8 +447,16 @@ pub(crate) struct PreparedSandbox {
     pub(crate) wsl2_proxy_policy: crate::profile::Wsl2ProxyPolicy,
     #[cfg(target_os = "linux")]
     pub(crate) af_unix_mediation: crate::profile::LinuxAfUnixMediation,
+    #[cfg(target_os = "linux")]
+    pub(crate) sandbox_policy: crate::profile::LinuxSandboxPolicy,
+    #[cfg(target_os = "linux")]
+    pub(crate) explicit_sandbox_policy: Option<crate::profile::LinuxSandboxPolicy>,
     pub(crate) allow_launch_services_active: bool,
     pub(crate) allow_gpu_active: bool,
+    /// True when NVIDIA GPU support needs supervisor-mediated writes to
+    /// `/proc/<tgid>/task/<tid>/comm` for driver thread naming.
+    #[cfg(target_os = "linux")]
+    pub(crate) proc_comm_notify: bool,
     pub(crate) open_url_origins: Vec<String>,
     pub(crate) open_url_allow_localhost: bool,
     pub(crate) bypass_protection_paths: Vec<PathBuf>,
@@ -577,11 +596,29 @@ pub(crate) fn resolve_detached_cwd_prompt_response(
 }
 
 fn finalize_prepared_sandbox(
-    prepared: PreparedSandbox,
+    mut prepared: PreparedSandbox,
     blocked_grants: &[(PathBuf, Option<String>)],
     args: &SandboxArgs,
     silent: bool,
 ) -> Result<PreparedSandbox> {
+    // Attach resource limits from CLI flags. The manifest path already set caps via
+    // `CapabilitySet::try_from`, and flags conflict with `--config`, so this only
+    // runs on the flag path. Enforcement is later, in the supervised runtime; here
+    // we just attach the parsed limits to the capability set (also in --dry-run).
+    if let Some(ref s) = args.memory {
+        let memory_bytes = parse_memory_limit_flag(s)?;
+        prepared.caps = prepared.caps.with_resource_limits(nono::ResourceLimits {
+            memory_bytes: Some(memory_bytes),
+        });
+    }
+
+    // SECURITY: the memory cap lives in cgroup control files under /sys/fs/cgroup.
+    // Write access to any part of that tree lets the child rewrite its own
+    // memory.max (or migrate to a cgroup it makes) and defeat the cap. Landlock is
+    // allow-list and can't carve the cgroup tree out of a broad grant like `/sys`,
+    // so refuse the run rather than enforce a cap the sandbox can lift.
+    reject_cgroup_writable_grants_under_memory_limit(&prepared.caps)?;
+
     output::print_skipped_requested_paths(&collect_missing_cli_requested_paths(args), silent);
     let proxy_intent = has_proxy_intent(args, &prepared);
     let block_wins = args.block_net || (prepared.profile_network_block && !proxy_intent);
@@ -610,6 +647,75 @@ fn finalize_prepared_sandbox(
     info!("{}", Sandbox::support_info().details);
 
     Ok(prepared)
+}
+
+/// Smallest `--memory` ceiling the CLI accepts. A bare number is bytes, so
+/// `--memory 512` means 512 B — which OOM-kills any real process the instant it
+/// starts, almost always a unit slip for `512M`. Refuse anything below this floor
+/// with a hint instead of silently enforcing an unusable cap. (Manifests carry an
+/// already-resolved byte count guarded by the schema's `minimum: 1`.)
+const MIN_MEMORY_LIMIT_BYTES: u64 = 1024 * 1024; // 1 MiB
+
+/// Parse the `--memory` flag and reject implausibly small ceilings (see
+/// [`MIN_MEMORY_LIMIT_BYTES`]). Surfaces the parse error for malformed sizes.
+fn parse_memory_limit_flag(s: &str) -> Result<u64> {
+    let bytes = nono::resource::parse_size(s)?;
+    if bytes < MIN_MEMORY_LIMIT_BYTES {
+        let digits: String = s
+            .trim()
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        let hint = if digits.is_empty() {
+            "use a size unit like M or G (e.g. 512M, 2G)".to_string()
+        } else {
+            format!("a bare number is bytes — did you mean {digits}M? use a unit like M or G")
+        };
+        return Err(NonoError::ConfigParse(format!(
+            "--memory {s} is {}, below the 1 MiB minimum; {hint}",
+            nono::resource::format_bytes(bytes)
+        )));
+    }
+    Ok(bytes)
+}
+
+/// True when a filesystem grant gives the sandbox WRITE access over any part of
+/// the cgroup v2 hierarchy (`/sys/fs/cgroup`) that enforces `--memory`. Dangerous
+/// either way the paths nest: the grant is inside the tree, or a broad ancestor
+/// (`/sys`, `/`) containing it. Read-only is safe — defeating the cap needs
+/// writing the knobs or `cgroup.procs`. Component-based `Path::starts_with`, not a
+/// string prefix, so `/sys/fs/cgroupX` doesn't match `/sys/fs/cgroup`.
+fn grant_opens_cgroup_control_plane(resolved: &Path, access: AccessMode) -> bool {
+    if !matches!(access, AccessMode::Write | AccessMode::ReadWrite) {
+        return false;
+    }
+    let cgroup_mount = Path::new("/sys/fs/cgroup");
+    resolved.starts_with(cgroup_mount) || cgroup_mount.starts_with(resolved)
+}
+
+/// Refuse a run whose `--memory` cap could be defeated because the sandbox is also
+/// granted write access over the cgroup hierarchy enforcing it (the child could
+/// raise its own `memory.max` or migrate out of the leaf). Only fires when a
+/// memory limit is set.
+fn reject_cgroup_writable_grants_under_memory_limit(caps: &CapabilitySet) -> Result<()> {
+    if caps
+        .resource_limits()
+        .is_none_or(|limits| limits.is_empty())
+    {
+        return Ok(());
+    }
+    for cap in caps.fs_capabilities() {
+        if grant_opens_cgroup_control_plane(&cap.resolved, cap.access) {
+            return Err(NonoError::ConfigParse(format!(
+                "refusing write access to '{}' while a --memory limit is enforced: it overlaps \
+                 the cgroup hierarchy (/sys/fs/cgroup) that enforces the limit, so the sandbox \
+                 could rewrite its own memory cap and escape it. Make the grant read-only, scope \
+                 it more narrowly, or drop --memory.",
+                cap.resolved.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Returns true if any CLI flag or profile field requires the proxy to run.
@@ -841,12 +947,10 @@ fn missing_cwd_prompt_must_fail(
 ///   unrelated kernel drivers.
 /// - `/proc/self` (read): CUDA init reads `/proc/self/maps`, `/proc/self/status`
 ///   and other per-process files.
-/// - `/proc/self/task` (read+write): NVIDIA driver 570+ writes to
-///   `/proc/self/task/<tid>/comm` during thread startup to set thread names.
-///   Without write access this returns EACCES and the driver treats it as a
-///   fatal OS error, surfacing as CUDA Error 304 (`cudaErrorOperatingSystem`).
-///   Narrowing write access to the `task` subtree keeps other per-process
-///   procfs entries read-only.
+/// - `/proc/self/task` (read): NVIDIA driver 570+ enumerates task entries and
+///   writes to `/proc/self/task/<tid>/comm` during thread startup to set thread
+///   names. The write is handled by the seccomp-notify supervisor's
+///   `proc_comm_notify` fast-path so the broader task subtree stays read-only.
 #[cfg(target_os = "linux")]
 fn grant_nvidia_gpu_procfs(caps: &mut CapabilitySet) -> Result<()> {
     for name in ["nvidia", "nvidia-uvm"] {
@@ -865,11 +969,12 @@ fn grant_nvidia_gpu_procfs(caps: &mut CapabilitySet) -> Result<()> {
         std::path::Path::new("/proc/self"),
         AccessMode::Read,
     )?);
+    // Read-only: NVIDIA driver 570+ comm writes are mediated by the
+    // supervisor's proc_comm_notify path.
     caps.add_fs(FsCapability::new_dir(
         std::path::Path::new("/proc/self/task"),
-        AccessMode::ReadWrite,
+        AccessMode::Read,
     )?);
-
     Ok(())
 }
 
@@ -897,13 +1002,22 @@ fn is_nvidia_compute_device(name: &str) -> bool {
 }
 
 #[cfg(target_os = "linux")]
+pub(crate) struct GpuActivation {
+    pub(crate) active: bool,
+    pub(crate) proc_comm_notify: bool,
+}
+
+#[cfg(target_os = "linux")]
 pub(crate) fn maybe_enable_gpu(
     caps: &mut CapabilitySet,
     cli_requested: bool,
     profile_allowed: bool,
-) -> Result<bool> {
+) -> Result<GpuActivation> {
     if !cli_requested {
-        return Ok(false);
+        return Ok(GpuActivation {
+            active: false,
+            proc_comm_notify: false,
+        });
     }
 
     if !profile_allowed {
@@ -1040,7 +1154,10 @@ pub(crate) fn maybe_enable_gpu(
         "--allow-gpu enabled: allowing {} GPU device(s) on Linux",
         gpu_device_count
     );
-    Ok(true)
+    Ok(GpuActivation {
+        active: true,
+        proc_comm_notify: have_nvidia,
+    })
 }
 
 pub(crate) fn print_allow_gpu_warning(silent: bool) {
@@ -1069,8 +1186,8 @@ pub(crate) fn print_allow_gpu_warning(silent: bool) {
         eprintln!(
             "  This grants read/write access to /dev/dri/renderD* and NVIDIA compute devices.\n  \
              On NVIDIA systems, additionally: read access to /proc/driver/nvidia,\n  \
-             /proc/driver/nvidia-uvm, and /proc/self; read/write access to\n  \
-             /proc/self/task (for CUDA thread-name initialisation)."
+             /proc/driver/nvidia-uvm, /proc/self, and /proc/self/task; writes to\n  \
+             /proc/<pid>/task/<tid>/comm are mediated by the sandbox supervisor."
         );
     }
 }
@@ -1150,17 +1267,22 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         return finalize_prepared_sandbox(
             PreparedSandbox {
                 caps,
+                deny_paths: Vec::new(),
                 secrets: Vec::new(),
                 profile_display_name: None,
                 command_policies: None,
+                resolved_command_binaries: None,
                 session_hooks: profile::SessionHooks::default(),
                 rollback_exclude_patterns,
                 rollback_exclude_globs,
                 network_profile: None,
                 allow_domain,
+                deny_domain: Vec::new(),
                 credentials,
                 custom_credentials: HashMap::new(),
                 credential_capture: HashMap::new(),
+                credential_providers: HashMap::new(),
+                credential_routes: Vec::new(),
                 tls_intercept: None,
                 upstream_proxy: None,
                 upstream_bypass: Vec::new(),
@@ -1170,8 +1292,14 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
                 wsl2_proxy_policy: crate::profile::Wsl2ProxyPolicy::default(),
                 #[cfg(target_os = "linux")]
                 af_unix_mediation: crate::profile::LinuxAfUnixMediation::default(),
+                #[cfg(target_os = "linux")]
+                sandbox_policy: crate::profile::LinuxSandboxPolicy::default(),
+                #[cfg(target_os = "linux")]
+                explicit_sandbox_policy: None,
                 allow_launch_services_active: false,
                 allow_gpu_active: false,
+                #[cfg(target_os = "linux")]
+                proc_comm_notify: false,
                 open_url_origins: Vec::new(),
                 open_url_allow_localhost: false,
                 bypass_protection_paths: Vec::new(),
@@ -1191,20 +1319,27 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
 
     let prepared_profile = prepare_profile(args, silent, &workdir)?;
     let crate::profile_runtime::PreparedProfile {
-        loaded_profile,
-        command_policies,
+        mut loaded_profile,
+        mut command_policies,
         capability_elevation,
         #[cfg(target_os = "linux")]
         wsl2_proxy_policy,
         #[cfg(target_os = "linux")]
         af_unix_mediation,
+        #[cfg(target_os = "linux")]
+        sandbox_policy,
+        #[cfg(target_os = "linux")]
+        explicit_sandbox_policy,
         workdir_access: profile_workdir_access,
         rollback_exclude_patterns: profile_rollback_patterns,
         rollback_exclude_globs: profile_rollback_globs,
         network_profile: profile_network_profile,
         allow_domain: profile_allow_domain,
+        deny_domain: profile_deny_domain,
         credentials: profile_credentials,
         custom_credentials: profile_custom_credentials,
+        credential_providers: profile_credential_providers,
+        credential_routes: profile_credential_routes,
         tls_intercept: profile_tls_intercept,
         upstream_proxy: profile_upstream_proxy,
         upstream_bypass: profile_upstream_bypass,
@@ -1220,7 +1355,23 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         allowed_env_vars: profile_allowed_env_vars,
         denied_env_vars: profile_denied_env_vars,
         set_vars: profile_set_vars,
+        resolved_command_binaries: profile_resolved_command_binaries,
     } = prepared_profile;
+
+    // Raw Seatbelt rules (`unsafe_macos_seatbelt_rules`) are as powerful as
+    // an arbitrary `binary` override, so honour them only for user-authored
+    // profiles — same trust boundary as `resolve_profile_binary`. Strip them
+    // (top-level and nested in command/from/intercept sandboxes) for
+    // pack/registry/built-in profiles before they can reach emission.
+    if let (Some(profile_name), Some(profile)) = (args.profile.as_deref(), loaded_profile.as_mut())
+    {
+        crate::command_runtime::strip_untrusted_unsafe_seatbelt_rules(
+            profile_name,
+            profile,
+            command_policies.as_mut(),
+            silent,
+        );
+    }
 
     let session_hooks = loaded_profile
         .as_ref()
@@ -1237,6 +1388,8 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         .collect();
     print_allow_domain_port_warnings(&profile_allow_domain_strs, "profile allow_domain", silent);
     print_allow_domain_port_warnings(&args.allow_proxy, "--allow-domain", silent);
+    print_allow_domain_port_warnings(&profile_deny_domain, "profile deny_domain", silent);
+    print_allow_domain_port_warnings(&args.deny_proxy, "--deny-domain", silent);
 
     #[cfg(unix)]
     if args.profile.as_deref().is_some_and(is_claude_code_profile) {
@@ -1346,6 +1499,12 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         open_url_allow_localhost,
     )?;
 
+    // CLI --sandbox-policy overrides the profile value; both default to Auto.
+    #[cfg(target_os = "linux")]
+    let sandbox_policy = args.sandbox_policy.unwrap_or(sandbox_policy);
+    #[cfg(target_os = "linux")]
+    let explicit_sandbox_policy = args.sandbox_policy.or(explicit_sandbox_policy);
+
     // GPU access: macOS uses IOKit platform rules (tightened to AGXDeviceUserClient only),
     // Linux uses filesystem capabilities for render nodes and compute devices.
     #[cfg(target_os = "macos")]
@@ -1355,11 +1514,15 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         loaded_profile.is_none() || profile_allow_gpu,
     )?;
     #[cfg(target_os = "linux")]
-    let allow_gpu_active = maybe_enable_gpu(
+    let gpu_activation = maybe_enable_gpu(
         &mut caps,
         args.allow_gpu,
         loaded_profile.is_none() || profile_allow_gpu,
     )?;
+    #[cfg(target_os = "linux")]
+    let allow_gpu_active = gpu_activation.active;
+    #[cfg(target_os = "linux")]
+    let proc_comm_notify = gpu_activation.proc_comm_notify;
 
     if let Some(request) =
         pending_cwd_access_request(&caps, &workdir, profile_workdir_access.as_ref())?
@@ -1489,17 +1652,22 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
     finalize_prepared_sandbox(
         PreparedSandbox {
             caps,
+            deny_paths: prepared_deny_paths,
             secrets: loaded_secrets,
             profile_display_name,
             command_policies,
+            resolved_command_binaries: profile_resolved_command_binaries,
             session_hooks,
             rollback_exclude_patterns: profile_rollback_patterns,
             rollback_exclude_globs: profile_rollback_globs,
             network_profile: profile_network_profile,
             allow_domain: profile_allow_domain,
+            deny_domain: profile_deny_domain,
             credentials: profile_credentials,
             custom_credentials: profile_custom_credentials,
             credential_capture: profile_credential_capture,
+            credential_providers: profile_credential_providers,
+            credential_routes: profile_credential_routes,
             tls_intercept: profile_tls_intercept,
             upstream_proxy: profile_upstream_proxy,
             upstream_bypass: profile_upstream_bypass,
@@ -1509,8 +1677,14 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
             wsl2_proxy_policy,
             #[cfg(target_os = "linux")]
             af_unix_mediation,
+            #[cfg(target_os = "linux")]
+            sandbox_policy,
+            #[cfg(target_os = "linux")]
+            explicit_sandbox_policy,
             allow_launch_services_active,
             allow_gpu_active,
+            #[cfg(target_os = "linux")]
+            proc_comm_notify,
             open_url_origins,
             open_url_allow_localhost,
             bypass_protection_paths,
@@ -1555,10 +1729,10 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn grant_nvidia_gpu_procfs_scopes_proc_self_reads_with_task_writes() {
+    fn grant_nvidia_gpu_procfs_keeps_proc_self_task_read_only() {
         // Regression test for the NVIDIA-scoped procfs grants:
         //   /proc/self       Read        (CUDA init reads maps/status/etc.)
-        //   /proc/self/task  ReadWrite   (driver writes task/<tid>/comm)
+        //   /proc/self/task  Read        (driver comm writes go via proc_comm_notify)
         // Plus any of /proc/driver/{nvidia,nvidia-uvm} that exist.
         //
         // /proc/self and /proc/self/task always exist on Linux, so those
@@ -1583,18 +1757,16 @@ mod tests {
         assert_eq!(
             proc_self.access,
             AccessMode::Read,
-            "/proc/self must be read-only (writes are scoped to /proc/self/task)"
+            "/proc/self must be read-only"
         );
         assert!(!proc_self.is_file);
 
-        let proc_self_task = find("/proc/self/task").expect(
-            "/proc/self/task must be granted read+write so the NVIDIA driver \
-             can write task/<tid>/comm (CUDA Error 304 root cause)",
-        );
+        let proc_self_task = find("/proc/self/task")
+            .expect("/proc/self/task must be granted read so the NVIDIA driver can list tasks");
         assert_eq!(
             proc_self_task.access,
-            AccessMode::ReadWrite,
-            "/proc/self/task must be granted read+write"
+            AccessMode::Read,
+            "/proc/self/task must stay read-only; comm writes are supervisor mediated"
         );
         assert!(!proc_self_task.is_file);
 
@@ -1964,20 +2136,128 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cgroup_write_grant_detection_is_component_based() {
+        let (w, rw, r) = (AccessMode::Write, AccessMode::ReadWrite, AccessMode::Read);
+
+        // Inside or equal to the cgroup mount -> dangerous (writable).
+        assert!(grant_opens_cgroup_control_plane(
+            Path::new("/sys/fs/cgroup"),
+            w
+        ));
+        assert!(grant_opens_cgroup_control_plane(
+            Path::new("/sys/fs/cgroup/user.slice/user-1000.slice"),
+            rw
+        ));
+        // A broad ancestor that subsumes the cgroup mount -> dangerous.
+        assert!(grant_opens_cgroup_control_plane(Path::new("/sys"), w));
+        assert!(grant_opens_cgroup_control_plane(Path::new("/sys/fs"), w));
+        assert!(grant_opens_cgroup_control_plane(Path::new("/"), w));
+
+        // Read-only is safe even over the cgroup tree (cannot write the knobs).
+        assert!(!grant_opens_cgroup_control_plane(
+            Path::new("/sys/fs/cgroup"),
+            r
+        ));
+        assert!(!grant_opens_cgroup_control_plane(Path::new("/sys"), r));
+
+        // Unrelated or sibling write grants are safe.
+        assert!(!grant_opens_cgroup_control_plane(
+            Path::new("/sys/devices"),
+            w
+        ));
+        assert!(!grant_opens_cgroup_control_plane(Path::new("/tmp"), rw));
+
+        // Component-based: a look-alike sibling must NOT match. A string
+        // `starts_with` would wrongly flag this — the bug this guards against.
+        assert!(!grant_opens_cgroup_control_plane(
+            Path::new("/sys/fs/cgroupX"),
+            w
+        ));
+    }
+
+    #[test]
+    fn cgroup_grant_guard_only_fires_with_a_memory_limit() {
+        // No limit -> always Ok (guard short-circuits before inspecting grants).
+        assert!(reject_cgroup_writable_grants_under_memory_limit(&CapabilitySet::new()).is_ok());
+        // A limit set but no filesystem grants -> Ok.
+        let caps = CapabilitySet::new().with_resource_limits(nono::ResourceLimits {
+            memory_bytes: Some(64 * 1024 * 1024),
+        });
+        assert!(reject_cgroup_writable_grants_under_memory_limit(&caps).is_ok());
+    }
+
+    // The guard's whole point: with a memory limit active, a writable grant that
+    // overlaps the cgroup tree is refused — otherwise the sandbox could rewrite its
+    // own memory.max and lift the cap. Linux-only because we need the real cgroup
+    // mount to canonicalize a grant over it; skip gracefully if it isn't present.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn cgroup_write_grant_under_a_memory_limit_is_refused() {
+        let Ok(grant) = FsCapability::new_dir("/sys/fs/cgroup", AccessMode::Write) else {
+            return; // no cgroup mount on this host — nothing to exercise
+        };
+        let mut caps = CapabilitySet::new().with_resource_limits(nono::ResourceLimits {
+            memory_bytes: Some(64 * 1024 * 1024),
+        });
+        caps.add_fs(grant);
+
+        let err = reject_cgroup_writable_grants_under_memory_limit(&caps)
+            .expect_err("a writable /sys/fs/cgroup grant under a memory limit must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("/sys/fs/cgroup"),
+            "error must name the overlapping path: {msg}"
+        );
+        assert!(
+            msg.contains("--memory"),
+            "error should mention the limit: {msg}"
+        );
+    }
+
+    #[test]
+    fn memory_flag_rejects_below_one_mib_with_unit_hint() {
+        // Bare bytes that are almost certainly a unit slip for 512M.
+        let err = parse_memory_limit_flag("512").expect_err("512 B must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("1 MiB minimum"), "msg: {msg}");
+        assert!(msg.contains("512M"), "should echo the unit form: {msg}");
+
+        // Sub-MiB even with a unit is refused (512K = 512 KiB).
+        assert!(parse_memory_limit_flag("512K").is_err());
+        // The floor itself and anything above it are accepted.
+        assert_eq!(
+            parse_memory_limit_flag("1M").expect("1 MiB is at the floor"),
+            1024 * 1024
+        );
+        assert_eq!(
+            parse_memory_limit_flag("512M").expect("512M is well above the floor"),
+            512 * 1024 * 1024
+        );
+        // Malformed sizes still surface the parser's error.
+        assert!(parse_memory_limit_flag("abc").is_err());
+        assert!(parse_memory_limit_flag("0").is_err());
+    }
+
     fn empty_prepared() -> PreparedSandbox {
         PreparedSandbox {
             caps: CapabilitySet::default(),
+            deny_paths: Vec::new(),
             secrets: Vec::new(),
             profile_display_name: None,
             command_policies: None,
+            resolved_command_binaries: None,
             session_hooks: profile::SessionHooks::default(),
             rollback_exclude_patterns: Vec::new(),
             rollback_exclude_globs: Vec::new(),
             network_profile: None,
             allow_domain: Vec::new(),
+            deny_domain: Vec::new(),
             credentials: Vec::new(),
             custom_credentials: std::collections::HashMap::new(),
             credential_capture: std::collections::HashMap::new(),
+            credential_providers: std::collections::HashMap::new(),
+            credential_routes: Vec::new(),
             tls_intercept: None,
             upstream_proxy: None,
             upstream_bypass: Vec::new(),
@@ -1987,8 +2267,14 @@ mod tests {
             wsl2_proxy_policy: profile::Wsl2ProxyPolicy::default(),
             #[cfg(target_os = "linux")]
             af_unix_mediation: profile::LinuxAfUnixMediation::default(),
+            #[cfg(target_os = "linux")]
+            sandbox_policy: profile::LinuxSandboxPolicy::default(),
+            #[cfg(target_os = "linux")]
+            explicit_sandbox_policy: None,
             allow_launch_services_active: false,
             allow_gpu_active: false,
+            #[cfg(target_os = "linux")]
+            proc_comm_notify: false,
             open_url_origins: Vec::new(),
             open_url_allow_localhost: false,
             bypass_protection_paths: Vec::new(),

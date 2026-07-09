@@ -665,59 +665,29 @@ fn expand_vars(template: &str, ctx: &WiringContext) -> Result<String> {
     let nono_config_str = nono_config.to_string_lossy().into_owned();
     let nono_packages_str = nono_packages.to_string_lossy().into_owned();
 
-    // `$` is a variable sigil only when followed by an ASCII uppercase
-    // letter or underscore — i.e. the start of an identifier from the
-    // closed set below. Any other `$` (regex end-anchor `$`, a literal
-    // dollar sign in a comment, jq's `$var` lowercase) is passed
-    // through untouched. This keeps pack content like
-    // `"matcher": "^(Bash|apply_patch)$"` from needing a `$$` escape.
-    let mut out = String::with_capacity(template.len());
-    let mut chars = template.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c != '$' {
-            out.push(c);
-            continue;
-        }
-        match chars.peek() {
-            Some(&p) if p.is_ascii_uppercase() || p == '_' => {}
-            _ => {
-                out.push('$');
-                continue;
-            }
-        }
-        let mut name = String::new();
-        while let Some(&peek) = chars.peek() {
-            if peek.is_ascii_alphanumeric() || peek == '_' {
-                name.push(peek);
-                chars.next();
-            } else {
-                break;
-            }
-        }
-        let value = match name.as_str() {
-            "PACK_DIR" => pack_dir.clone(),
-            "NS" => ctx.namespace.clone(),
-            "PLUGIN" => ctx.pack_name.clone(),
-            "HOME" => home_str.clone(),
-            "XDG_CONFIG_HOME" => xdg_str.clone(),
-            "NONO_CONFIG" => nono_config_str.clone(),
-            "NONO_PACKAGES" => nono_packages_str.clone(),
-            // Install-time UTC timestamp (RFC3339, milliseconds), for
-            // agents that require a `lastUpdated`-style field on their
-            // config entries (Claude Code's marketplace registry being
-            // the case that drove this in). Resolved per call so each
-            // expansion within a single install carries the same
-            // monotonic value.
-            "NOW" => Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string(),
-            other => {
-                return Err(NonoError::PackageInstall(format!(
+    // Uppercase-only start: leaves `$` regex anchors and jq `$var` untouched.
+    crate::policy::substitute_vars(
+        template,
+        |nc| nc.is_ascii_uppercase() || nc == '_',
+        |name| -> Result<Option<String>> {
+            match name {
+                "PACK_DIR" => Ok(Some(pack_dir.clone())),
+                "NS" => Ok(Some(ctx.namespace.clone())),
+                "PLUGIN" => Ok(Some(ctx.pack_name.clone())),
+                "HOME" => Ok(Some(home_str.clone())),
+                "XDG_CONFIG_HOME" => Ok(Some(xdg_str.clone())),
+                "NONO_CONFIG" => Ok(Some(nono_config_str.clone())),
+                "NONO_PACKAGES" => Ok(Some(nono_packages_str.clone())),
+                // Install-time UTC timestamp (RFC3339, milliseconds).
+                "NOW" => Ok(Some(
+                    Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string(),
+                )),
+                other => Err(NonoError::PackageInstall(format!(
                     "wiring template references unknown variable '${other}' in '{template}'"
-                )));
+                ))),
             }
-        };
-        out.push_str(&value);
-    }
-    Ok(out)
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------

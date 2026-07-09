@@ -146,6 +146,25 @@ fn create_session_runtime_state(
     })
 }
 
+/// The error returned when a memory limit is requested on a platform that can't
+/// enforce one (no cgroup v2). Compiled off-Linux (where the branch above uses it)
+/// and under `test` so a Linux host can still pin the variant and message — the
+/// branch can't run there, but the contract shouldn't silently regress.
+#[cfg(any(not(target_os = "linux"), test))]
+fn resource_limits_unsupported_platform() -> nono::NonoError {
+    nono::NonoError::UnsupportedPlatform(
+        "resource limits are only enforced on Linux (cgroup v2) in this build".to_string(),
+    )
+}
+
+/// True only for the exit code a whole-sandbox OOM kill produces (128 + SIGKILL =
+/// 137). Gating the memory-cap diagnostic on this keeps a clean exit, an ordinary
+/// crash, or a different signal from borrowing the "out of memory" story.
+#[cfg(target_os = "linux")]
+const fn is_oom_sigkill_exit(exit_code: i32) -> bool {
+    exit_code == 128 + nix::libc::SIGKILL
+}
+
 fn should_open_supervised_pty(
     detached_start: bool,
     stdin_is_terminal: bool,
@@ -281,21 +300,86 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
         #[cfg(target_os = "linux")]
         unix_socket_allowlist: caps.unix_socket_capabilities(),
         #[cfg(target_os = "linux")]
-        linux_network_notify_mode: if config.seccomp_proxy_fallback {
-            exec_strategy::LinuxNetworkNotifyMode::ProxyOnly
-        } else {
-            exec_strategy::LinuxNetworkNotifyMode::AfUnixOnly
-        },
+        seccomp_policy: config.seccomp_policy,
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         tool_sandbox_runtime: config.tool_sandbox_runtime,
     };
 
+    // Resource enforcement (Linux cgroup v2): a requested limit creates the leaf
+    // pre-fork. With no delegated cgroup v2 subtree, `CgroupLeaf::create` errors and
+    // the run fails closed rather than run the limit unenforced. The child
+    // self-attaches (see `resource_procs_fd` below); dropping `cgroup_leaf` tears it
+    // down.
+    #[cfg(target_os = "linux")]
+    let cgroup_leaf = match caps.resource_limits() {
+        Some(limits) if !limits.is_empty() => Some(
+            // Log the fail-closed path: a requested cap we couldn't set up aborts
+            // the run rather than letting it proceed unenforced.
+            crate::resource_cgroup::CgroupLeaf::create(limits).inspect_err(|e| {
+                tracing::error!(
+                    "resource: could not set up the memory cgroup; refusing to run unconfined: {e}"
+                );
+            })?,
+        ),
+        _ => None,
+    };
+
+    // No cgroup enforcement off Linux yet — fail closed rather than run a
+    // requested limit unprotected (macOS gets its own backend later).
+    #[cfg(not(target_os = "linux"))]
+    if caps
+        .resource_limits()
+        .is_some_and(|limits| !limits.is_empty())
+    {
+        return Err(resource_limits_unsupported_platform());
+    }
+
+    // The fd the child self-attaches through: opened in the parent so the forked
+    // child inherits it and cages itself before it can fork/exec — closing the
+    // post-fork race a parent-side attach would leave open. The leaf (and fd) live
+    // to the end of this function.
+    #[cfg(target_os = "linux")]
+    let resource_procs_fd = cgroup_leaf.as_ref().map(|leaf| leaf.procs_raw_fd());
+    #[cfg(not(target_os = "linux"))]
+    let resource_procs_fd: Option<std::os::fd::RawFd> = None;
+
     let exit_code = {
+        // Runs in the parent the instant the child is forked, with the child's pid;
+        // records it on the session. The cgroup attach is the child's own job (see
+        // `resource_procs_fd` above), so there's no parent-side escape window here.
         let mut on_fork = |child_pid: u32| {
             if let Some(ref mut guard) = session_guard {
                 guard.set_child_pid(child_pid);
             }
         };
+
+        // Post-mortem hook, installed only when a resource cgroup leaf exists. A
+        // memory-cap breach arrives as a bare SIGKILL (exit 137) with no
+        // explanation; the hook reads the leaf's OOM evidence while it still exists
+        // and prints a precise diagnostic, so the breach is loud not silent.
+        // Returning `true` suppresses the generic "killed by SIGKILL" footer.
+        #[cfg(target_os = "linux")]
+        let on_exit_diag_fn = |code: i32| -> bool {
+            // Only explain a whole-sandbox OOM kill (exit 137). Any other code —
+            // a clean exit, an ordinary crash (e.g. SIGSEGV -> 139), a SIGTERM ->
+            // 143 — gets the normal footer, not a spurious "out of memory" story.
+            if !is_oom_sigkill_exit(code) {
+                return false;
+            }
+            cgroup_leaf
+                .as_ref()
+                .and_then(|leaf| leaf.oom_report())
+                .is_some_and(|report| {
+                    crate::output::print_oom_diagnostic(&report, silent);
+                    true
+                })
+        };
+        // No leaf, no hook (`None`) — the exact pre-feature path.
+        #[cfg(target_os = "linux")]
+        let on_exit_diag = cgroup_leaf.is_some().then_some(on_exit_diag_fn);
+        #[cfg(not(target_os = "linux"))]
+        let on_exit_diag: Option<fn(i32) -> bool> = None;
+
         exec_strategy::execute_supervised(
             config,
             Some(&supervisor_cfg),
@@ -303,11 +387,15 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
             Some(&mut on_fork),
             pty_pair,
             Some(&short_session_id),
+            resource_procs_fd,
+            on_exit_diag,
         )?
     };
+
     if let Some(ref mut guard) = session_guard {
         guard.set_exited(exit_code);
     }
+
     let ended = chrono::Local::now().to_rfc3339();
     finalize_supervised_exit(RollbackExitContext {
         audit_state: audit_state.as_ref(),
@@ -335,6 +423,42 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
 #[cfg(test)]
 mod tests {
     use super::should_open_supervised_pty;
+
+    /// Off-Linux, a requested memory limit is refused with UnsupportedPlatform (not
+    /// SandboxInit), so it maps to the right diagnostic/exit and reads naturally.
+    /// Pinned on every host so the variant can't silently regress, even though the
+    /// branch that returns it only compiles off-Linux.
+    #[test]
+    fn off_platform_resource_error_is_unsupported_platform() {
+        let err = super::resource_limits_unsupported_platform();
+        assert!(matches!(err, nono::NonoError::UnsupportedPlatform(_)));
+        assert!(err.to_string().contains("only enforced on Linux"));
+    }
+
+    /// The memory-cap diagnostic fires only on exit 137 (the whole-sandbox OOM
+    /// kill). Pins that a clean exit, an ordinary crash (SIGSEGV -> 139), or a
+    /// SIGTERM (-> 143) is NOT mistaken for an out-of-memory kill. (The other half
+    /// of the gate — a watchdog-timeout SIGKILL, also 137, suppressed via
+    /// !killed_by_timeout — lives in exec_strategy and is covered by review.)
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn only_exit_137_is_treated_as_an_oom_kill() {
+        use super::is_oom_sigkill_exit;
+        assert!(is_oom_sigkill_exit(137), "128 + SIGKILL(9) = 137");
+        assert!(!is_oom_sigkill_exit(0), "clean exit is not an OOM kill");
+        assert!(
+            !is_oom_sigkill_exit(1),
+            "ordinary failure is not an OOM kill"
+        );
+        assert!(
+            !is_oom_sigkill_exit(139),
+            "SIGSEGV crash (128+11) is not an OOM kill"
+        );
+        assert!(
+            !is_oom_sigkill_exit(143),
+            "SIGTERM (128+15) is not an OOM kill"
+        );
+    }
 
     #[test]
     fn supervised_pty_is_used_for_attached_terminals() {

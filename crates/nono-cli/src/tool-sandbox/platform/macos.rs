@@ -8,7 +8,7 @@ use crate::command_policy::{
 };
 use crate::tool_sandbox::credentials::{ResolvedCredential, resolve_credentials};
 use crate::tool_sandbox::env::{
-    apply_environment_set_vars, default_env_allow_patterns, effective_argv,
+    apply_environment_set_vars, default_env_allow_patterns, effective_argv_for_binary,
     inject_chaining_control_env, inject_url_open_env, split_env_entry,
 };
 use crate::tool_sandbox::launch::{
@@ -19,8 +19,8 @@ use crate::tool_sandbox::protocol::{
     StdioStreamLimitSpec, TOOL_SANDBOX_LAUNCH_SPEC_ENV, TOOL_SANDBOX_SHIM_DIR_ENV,
     TOOL_SANDBOX_SOCKET_ENV, TOOL_SANDBOX_URL_IO_TIMEOUT, ToolSandboxChildLaunchSpec,
     ToolSandboxOpenUrlRequest, ToolSandboxOpenUrlResponse, ToolSandboxShimRequest,
-    ToolSandboxShimResponse, UnixSocketGrantSpec, read_frame, recv_stdio_fds, send_stdio_fds,
-    validate_ipc_request, write_frame, write_response,
+    ToolSandboxShimResponse, UnixSocketGrantSpec, read_frame, recv_frame_ack, recv_stdio_fds,
+    send_frame_ack, send_stdio_fds, validate_ipc_request, write_frame, write_response,
 };
 use nix::libc;
 use nono::supervisor::ApprovalRequest;
@@ -141,6 +141,14 @@ struct ToolSandboxState {
     profile_display_name: Option<String>,
     redaction_policy: nono::ScrubPolicy,
     policy_root: PathBuf,
+    /// The agent's own capability set. Used to bound a mediated command's live
+    /// working directory: a command may only run where the agent itself is
+    /// granted access, so `.`/`@git:*` resolving against the live cwd can never
+    /// hand a command filesystem reach the agent lacks.
+    outer_caps: CapabilitySet,
+    /// Agent's resolved filesystem deny paths; a command's live cwd under any of
+    /// these is rejected (the agent's broad allow may otherwise cover them).
+    deny_paths: Vec<PathBuf>,
     plan: ResolvedToolSandboxPlan,
     shims_by_command: BTreeMap<String, ShimIdentity>,
     shims_by_path: BTreeMap<PathBuf, String>,
@@ -157,6 +165,10 @@ struct ToolSandboxState {
 struct ResolvedToolSandboxPlan {
     config: CommandPoliciesConfig,
     resolved: ResolvedCommandBinaries,
+    /// Pre-resolved `exec` intercept helpers, keyed by their env-expanded path
+    /// as written in the profile. Identity expectations are captured here so
+    /// the helper launch is TOCTOU-protected like a command binary.
+    exec_helpers: BTreeMap<PathBuf, ResolvedCommandBinary>,
     deny_only: BTreeMap<String, ResolvedDenyOnlyCommand>,
     allowed_direct_bypass_ids: HashSet<FileId>,
 }
@@ -182,15 +194,22 @@ impl ResolvedToolSandboxPlan {
         _allowed_commands: &[String],
         _blocked_commands: &[String],
         outer_caps: &CapabilitySet,
+        precomputed: Option<&crate::command_policy::ResolvedCommandBinaries>,
     ) -> Result<Self> {
         let path_env = std::env::var_os("PATH");
-        let resolved =
-            crate::command_policy::resolve_policy_command_binaries(config, path_env.clone())?;
+        let resolved = match precomputed {
+            Some(resolved) => resolved.clone(),
+            None => {
+                crate::command_policy::resolve_policy_command_binaries(config, path_env.clone())?
+            }
+        };
         for w in &resolved.warnings {
             if w.code == "command_not_found" {
                 eprintln!("  [nono] Warning: {}", w.message);
             }
         }
+        let exec_helpers = crate::command_policy::resolve_policy_exec_helpers(config)?;
+        validate_controlled_exec_helper_immutability(config, &exec_helpers, outer_caps)?;
         let search_dirs = command_search_dirs(config, path_env, outer_caps)?;
         validate_trusted_executable_dirs(&search_dirs, outer_caps)?;
         // BMETE command policies are scoped to command_policies.commands.
@@ -206,6 +225,7 @@ impl ResolvedToolSandboxPlan {
         Ok(Self {
             config: config.clone(),
             resolved,
+            exec_helpers,
             deny_only,
             allowed_direct_bypass_ids,
         })
@@ -216,10 +236,12 @@ impl PreparedToolSandboxRuntime {
     pub(crate) fn prepare(input: super::ToolSandboxPrepare<'_>) -> Result<Self> {
         let super::ToolSandboxPrepare {
             config,
+            resolved_command_binaries,
             audit_context,
             allowed_commands,
             blocked_commands,
             outer_caps,
+            deny_paths,
             policy_root,
             proxy_credential_env_vars,
             proxy_trust_bundle_paths,
@@ -228,8 +250,13 @@ impl PreparedToolSandboxRuntime {
 
         validate_platform_requirements(config)?;
 
-        let plan =
-            ResolvedToolSandboxPlan::build(config, allowed_commands, blocked_commands, outer_caps)?;
+        let plan = ResolvedToolSandboxPlan::build(
+            config,
+            allowed_commands,
+            blocked_commands,
+            outer_caps,
+            resolved_command_binaries,
+        )?;
 
         let runtime_dir = create_runtime_dir()?;
         let mut cleanup = RuntimeDirCleanup::new(runtime_dir.clone());
@@ -286,6 +313,8 @@ impl PreparedToolSandboxRuntime {
                 profile_display_name: audit_context.profile_display_name,
                 redaction_policy: audit_context.redaction_policy,
                 policy_root: policy_root.to_path_buf(),
+                outer_caps: outer_caps.clone(),
+                deny_paths: deny_paths.to_vec(),
                 plan,
                 shims_by_command,
                 shims_by_path,
@@ -594,7 +623,14 @@ fn run_shim() -> Result<()> {
         })
         .collect::<Vec<_>>();
     let cwd = std::env::current_dir()
-        .map_err(|e| NonoError::SandboxInit(format!("tool-sandbox shim cwd failed: {e}")))?
+        .map_err(|e| {
+            NonoError::SandboxInit(format!(
+                "tool-sandbox shim cwd failed: {e}. '{command}' is running in a directory its \
+                 sandbox does not grant read on (getcwd needs to resolve the cwd). If '{command}' \
+                 was invoked in a directory outside its policy — e.g. a sibling git worktree — add \
+                 \".\" to the command's fs_read so its live working directory is readable."
+            ))
+        })?
         .into_os_string()
         .into_vec();
 
@@ -618,6 +654,7 @@ fn run_shim() -> Result<()> {
         ))
     })?;
     write_frame(&mut stream, &request)?;
+    recv_frame_ack(&mut stream)?;
     send_stdio_fds(&stream)?;
     let response: ToolSandboxShimResponse = read_frame(&mut stream)?;
 
@@ -672,7 +709,7 @@ fn run_child_launcher() -> Result<()> {
     // executable targets is therefore a deliberate trust downgrade.
     verify_launch_binary(&spec)?;
     let caps = caps_from_spec(&spec.caps)?;
-    Sandbox::apply(&caps)?;
+    Sandbox::apply_auto(&caps)?;
 
     let binary = CString::new(real_binary.as_bytes()).map_err(|_| {
         NonoError::SandboxInit("tool-sandbox real binary path contains NUL".to_string())
@@ -881,6 +918,11 @@ fn handle_shim_stream_inner(
 ) -> Result<(i32, Vec<u8>)> {
     let auth = authenticate_shim(stream, state)?;
     let request: ToolSandboxShimRequest = read_frame(stream)?;
+    // Ack before receiving stdio FDs: on macOS, sendmsg with SCM_RIGHTS ancillary
+    // data returns EMSGSIZE if the peer's receive buffer still holds unread frame
+    // bytes. Sending the ack proves the buffer is drained so the shim's sendmsg
+    // can always queue its ancillary data atomically.
+    send_frame_ack(stream)?;
     validate_ipc_request(&request)?;
     if request.command != auth.command {
         return Err(NonoError::SandboxInit(format!(
@@ -1170,6 +1212,11 @@ fn handle_shim_stream_inner(
     let intercept = super::resolve_intercept_action(command_config, &request.argv);
     let intercept_action = intercept.action;
 
+    // A matched intercept rule may carry a sandbox that replaces the command's
+    // selected sandbox for the process this rule launches (every action except
+    // `respond`, which launches nothing). Absent -> the command's selected sandbox.
+    let effective_sandbox = intercept.sandbox.unwrap_or(policy);
+
     // ── Respond ──────────────────────────────────────────────────────────
     if let InterceptActionConfig::Respond { stdout } = intercept_action {
         record_command_policy_audit(
@@ -1297,7 +1344,7 @@ fn handle_shim_stream_inner(
             ));
         }
         let result = (|| {
-            let launch = build_child_launch_spec(state, &request, policy)?;
+            let launch = build_child_launch_spec(state, &request, effective_sandbox)?;
             launch_child_with_capture(state, &request.command, &caller, launch, stdio)
         })();
         state.active_count.fetch_sub(1, Ordering::SeqCst);
@@ -1383,7 +1430,7 @@ fn handle_shim_stream_inner(
             ));
         }
         let result = (|| {
-            let launch = build_child_launch_spec(state, &request, policy)?;
+            let launch = build_child_launch_spec(state, &request, effective_sandbox)?;
             launch_child_with_capture(state, &request.command, &caller, launch, stdio)
         })();
         state.active_count.fetch_sub(1, Ordering::SeqCst);
@@ -1434,6 +1481,89 @@ fn handle_shim_stream_inner(
         };
     }
 
+    // ── Exec ─────────────────────────────────────────────────────────────
+    if let InterceptActionConfig::Exec { command } = intercept_action {
+        let active = state.active_count.fetch_add(1, Ordering::SeqCst);
+        if active >= MAX_ACTIVE_TOOL_SANDBOX_CHILDREN {
+            state.active_count.fetch_sub(1, Ordering::SeqCst);
+            record_command_policy_audit(
+                audit_recorder.as_ref(),
+                &request,
+                &state.redaction_policy,
+                session_id,
+                auth.peer_pid,
+                session_root_pid,
+                Some(&caller),
+                "denied",
+                Some("resource_limit".to_string()),
+                None,
+            )?;
+            return Err(NonoError::SandboxInit(
+                "tool-sandbox active child limit exceeded".to_string(),
+            ));
+        }
+        let result = (|| {
+            let (helper, extra_args) =
+                super::policy::resolve_exec_helper(&state.plan.exec_helpers, command)?;
+            let launch =
+                build_child_launch_spec_for_binary(state, &request, policy, helper, &extra_args)?;
+            launch_child(state, &request.command, &caller, launch, stdio)
+        })();
+        state.active_count.fetch_sub(1, Ordering::SeqCst);
+        return match result {
+            Ok(launch_result) => {
+                if let Some(reason) = launch_result.blocked_reason.clone() {
+                    record_command_policy_audit_with_stdio(
+                        audit_recorder.as_ref(),
+                        &request,
+                        &state.redaction_policy,
+                        session_id,
+                        auth.peer_pid,
+                        session_root_pid,
+                        Some(&caller),
+                        "denied",
+                        Some(reason.clone()),
+                        None,
+                        launch_result.stdio,
+                    )?;
+                    return Err(NonoError::BlockedCommand {
+                        command: request.command,
+                        reason,
+                    });
+                }
+                record_command_policy_audit_with_stdio(
+                    audit_recorder.as_ref(),
+                    &request,
+                    &state.redaction_policy,
+                    session_id,
+                    auth.peer_pid,
+                    session_root_pid,
+                    Some(&caller),
+                    "exec",
+                    None,
+                    Some(launch_result.exit_code),
+                    launch_result.stdio,
+                )?;
+                Ok((launch_result.exit_code, Vec::new()))
+            }
+            Err(err) => {
+                record_command_policy_audit(
+                    audit_recorder.as_ref(),
+                    &request,
+                    &state.redaction_policy,
+                    session_id,
+                    auth.peer_pid,
+                    session_root_pid,
+                    Some(&caller),
+                    "denied",
+                    Some(err.to_string()),
+                    None,
+                )?;
+                Err(err)
+            }
+        };
+    }
+
     // ── Passthrough (and Approve→granted) ────────────────────────────────
     let active = state.active_count.fetch_add(1, Ordering::SeqCst);
     if active >= MAX_ACTIVE_TOOL_SANDBOX_CHILDREN {
@@ -1455,7 +1585,7 @@ fn handle_shim_stream_inner(
         ));
     }
     let result = (|| {
-        let launch = build_child_launch_spec(state, &request, policy)?;
+        let launch = build_child_launch_spec(state, &request, effective_sandbox)?;
         launch_child(state, &request.command, &caller, launch, stdio)
     })();
     state.active_count.fetch_sub(1, Ordering::SeqCst);
@@ -1791,6 +1921,23 @@ fn build_child_launch_spec(
         .ok_or_else(|| {
             NonoError::SandboxInit(format!("missing resolved binary for {}", request.command))
         })?;
+    build_child_launch_spec_for_binary(state, request, policy, binary, &[])
+}
+
+/// Build a child launch spec that runs `binary` (which may be the command's
+/// real binary OR an `exec` intercept helper) inside the matched command's
+/// sandbox (`policy`). `extra_args` are inserted between argv[0] and the
+/// forwarded original args (`request.argv[1..]`) — used by the `exec` action to
+/// pass the helper's fixed leading args. The fs-read cap, exec-gate, executable
+/// shape baseline, and identity expectations are all bound to `binary`, while
+/// network/credentials/proxy/fs/env come from `policy`.
+fn build_child_launch_spec_for_binary(
+    state: &ToolSandboxState,
+    request: &ToolSandboxShimRequest,
+    policy: &CommandSandboxConfig,
+    binary: &ResolvedCommandBinary,
+    extra_args: &[Vec<u8>],
+) -> Result<ToolSandboxChildLaunchSpec> {
     verify_binary_identity(binary)?;
     let cwd = PathBuf::from(OsString::from_vec(request.cwd.clone()));
     let cwd = cwd
@@ -1799,6 +1946,16 @@ fn build_child_launch_spec(
             path: cwd.clone(),
             source,
         })?;
+    // Bound the command's live cwd to the agent's own granted filesystem;
+    // rejects a cwd outside it (write non-escalation for cwd-scoped policy
+    // grants is enforced per-path in add_policy_fs).
+    super::admit_command_cwd(
+        &request.command,
+        &cwd,
+        &state.policy_root,
+        &state.outer_caps,
+        &state.deny_paths,
+    )?;
     let mut caps = build_child_caps(state, binary, policy, request, &cwd)?;
     caps.deduplicate();
 
@@ -1811,7 +1968,7 @@ fn build_child_launch_spec(
             .as_ref()
             .map(|path| path.as_os_str().as_bytes().to_vec()),
         interpreter_args: binary.shape.interpreter_args.clone(),
-        argv: effective_argv(binary, request, policy)?,
+        argv: effective_argv_for_binary(binary, request, policy, extra_args)?,
         env: filter_child_env(state, request, policy)?,
         cwd: cwd.as_os_str().as_bytes().to_vec(),
         stdio_mode: selected_stdio_mode(request).to_string(),
@@ -1867,7 +2024,14 @@ fn build_child_caps(
     add_executable_shape_baseline(&mut caps, binary)?;
     add_chaining_control_caps(&mut caps, state)?;
     add_macos_cwd_metadata_rules(&mut caps, cwd)?;
-    add_policy_fs(&mut caps, policy, &state.policy_root)?;
+    add_policy_fs(
+        &mut caps,
+        policy,
+        &state.policy_root,
+        cwd,
+        &state.outer_caps,
+        &state.deny_paths,
+    )?;
     // When the command was granted a keychain DB file (e.g. login.keychain-db),
     // reuse the main-path keychain mechanism: add the WAL/SHM/`.fl`/`user.kb`
     // sibling-file exceptions the Security framework touches. The library
@@ -1882,7 +2046,25 @@ fn build_child_caps(
     add_url_open_caps(&mut caps, state, policy)?;
     add_launch_services_caps(&mut caps, policy)?;
     add_child_process_exec_gate_with_policy(&mut caps, state, binary, Some(policy))?;
+    // Append the command's opt-in raw Seatbelt rules last so they land at the
+    // tail of the generated child profile. Seatbelt evaluates last-matching-rule
+    // wins, so a rule like `(allow process-exec* (literal "/usr/bin/security"))`
+    // overrides the exec gate's earlier `(deny process-exec*)`.
+    add_unsafe_seatbelt_rules(&mut caps, policy)?;
     Ok(caps)
+}
+
+/// Append a command sandbox's opt-in raw macOS Seatbelt rules to the child's
+/// platform rules. Emitted after all generated rules so they win under
+/// last-matching-rule semantics. No-op when the list is empty.
+fn add_unsafe_seatbelt_rules(
+    caps: &mut CapabilitySet,
+    policy: &CommandSandboxConfig,
+) -> Result<()> {
+    for rule in &policy.unsafe_macos_seatbelt_rules {
+        caps.add_platform_rule(rule.clone())?;
+    }
+    Ok(())
 }
 
 /// When a command opts into direct LaunchServices (`allow_launch_services`),
@@ -2252,23 +2434,51 @@ fn add_policy_fs(
     caps: &mut CapabilitySet,
     policy: &CommandSandboxConfig,
     policy_root: &Path,
+    cwd: &Path,
+    outer_caps: &CapabilitySet,
+    deny_paths: &[PathBuf],
 ) -> Result<()> {
     use super::dynamic_providers::expand_dynamic_tokens;
-    for entry in &expand_dynamic_tokens(&policy.fs_read)? {
-        let path = resolve_policy_path(entry, policy_root)?;
+    // A write grant that resolves under the live cwd is downgraded to read
+    // unless the agent itself can write that exact resolved path, so a
+    // command's cwd access never exceeds the agent's own (write
+    // non-escalation). Checked per resolved path, not just the cwd as a
+    // whole, so a subdirectory the agent can explicitly write stays
+    // writable even when the surrounding cwd itself is not. Grants outside
+    // the cwd (e.g. `$WORKDIR`, absolute paths) are unaffected.
+    let write_access = |path: &Path| {
+        let normalized = super::lexically_normalize(path);
+        if normalized.starts_with(cwd)
+            && !super::agent_can_write(&normalized, policy_root, outer_caps, deny_paths)
+        {
+            AccessMode::Read
+        } else {
+            AccessMode::ReadWrite
+        }
+    };
+    // `@git:*` tokens run git in the command's live cwd so they resolve to the
+    // repo the command is actually operating in (e.g. its worktree / .git
+    // common-dir), not the repo the agent was launched in.
+    for entry in &expand_dynamic_tokens(&policy.fs_read, Some(cwd))? {
+        let path = resolve_policy_path(entry, policy_root, cwd)?;
         add_optional_dir(caps, path, AccessMode::Read)?;
     }
-    for entry in &expand_dynamic_tokens(&policy.fs_write)? {
-        let path = resolve_policy_path(entry, policy_root)?;
-        add_optional_dir(caps, path, AccessMode::ReadWrite)?;
+    for entry in &expand_dynamic_tokens(&policy.fs_write, Some(cwd))? {
+        let path = resolve_policy_path(entry, policy_root, cwd)?;
+        let access = write_access(&path);
+        add_optional_dir(caps, path, access)?;
     }
-    for entry in &expand_dynamic_tokens(&policy.fs_read_file)? {
-        let path = resolve_policy_path(entry, policy_root)?;
+    for entry in &expand_dynamic_tokens(&policy.fs_read_file, Some(cwd))? {
+        let path = resolve_policy_path(entry, policy_root, cwd)?;
         add_optional_read_file(caps, path)?;
     }
-    for entry in &expand_dynamic_tokens(&policy.fs_write_file)? {
-        let path = resolve_policy_path(entry, policy_root)?;
-        caps.add_fs(FsCapability::new_file(path, AccessMode::ReadWrite)?);
+    for entry in &expand_dynamic_tokens(&policy.fs_write_file, Some(cwd))? {
+        let path = resolve_policy_path(entry, policy_root, cwd)?;
+        if matches!(write_access(&path), AccessMode::Read) {
+            add_optional_read_file(caps, path)?;
+        } else {
+            caps.add_fs(FsCapability::new_file(path, AccessMode::ReadWrite)?);
+        }
     }
     Ok(())
 }
@@ -2410,8 +2620,8 @@ fn add_policy_credentials(
     Ok(())
 }
 
-fn resolve_policy_path(entry: &str, cwd: &Path) -> Result<PathBuf> {
-    let expanded = crate::profile::expand_vars(entry, cwd)?;
+fn resolve_policy_path(entry: &str, workdir: &Path, cwd: &Path) -> Result<PathBuf> {
+    let expanded = crate::profile::expand_vars(entry, workdir)?;
     if expanded.is_absolute() {
         Ok(expanded)
     } else {
@@ -3563,6 +3773,33 @@ fn validate_controlled_binary_immutability(
     Ok(())
 }
 
+/// Apply the same non-writable-executable trust gate to resolved `exec`
+/// intercept helpers as to command binaries: a helper must not be writable (nor
+/// replaceable via a writable parent) through the outer session capability set
+/// unless the referencing command opted into `allow_writable_executable` (or
+/// the global `allow_writable_executables`). This prevents writable-executable
+/// substitution of the helper.
+fn validate_controlled_exec_helper_immutability(
+    config: &CommandPoliciesConfig,
+    exec_helpers: &BTreeMap<PathBuf, ResolvedCommandBinary>,
+    outer_caps: &CapabilitySet,
+) -> Result<()> {
+    for binary in exec_helpers.values() {
+        let allow_writable_path = config.allow_writable_executables
+            || super::policy::command_referencing_exec_helper_allows_writable(
+                config,
+                &binary.canonical_path,
+            );
+        validate_controlled_file(
+            &binary.canonical_path,
+            outer_caps,
+            "exec intercept helper",
+            allow_writable_path,
+        )?;
+    }
+    Ok(())
+}
+
 fn command_allows_writable_executable(
     command: &crate::command_policy::CommandPolicyConfig,
 ) -> bool {
@@ -3995,8 +4232,8 @@ fn is_tty(fd: i32) -> bool {
 mod tests {
     use super::*;
     use crate::command_policy::{
-        CommandEnvironmentConfig, CommandFromConfig, CommandPolicyConfig, ResolvedExecutableKind,
-        ResolvedExecutableShape,
+        CommandEnvironmentConfig, CommandFromConfig, CommandPolicyConfig, InterceptActionConfig,
+        InterceptRuleConfig, ResolvedExecutableKind, ResolvedExecutableShape,
     };
 
     fn test_binary(name: &str, path: &Path) -> Result<ResolvedCommandBinary> {
@@ -4040,12 +4277,15 @@ mod tests {
             profile_display_name: None,
             redaction_policy: nono::ScrubPolicy::secure_default(),
             policy_root: PathBuf::from("/tmp"),
+            outer_caps: CapabilitySet::new(),
+            deny_paths: Vec::new(),
             plan: ResolvedToolSandboxPlan {
                 config: CommandPoliciesConfig::default(),
                 resolved: ResolvedCommandBinaries {
                     commands: BTreeMap::new(),
                     warnings: Vec::new(),
                 },
+                exec_helpers: BTreeMap::new(),
                 deny_only: BTreeMap::new(),
                 allowed_direct_bypass_ids: HashSet::new(),
             },
@@ -4322,6 +4562,35 @@ mod tests {
     }
 
     #[test]
+    fn resolve_policy_path_relative_uses_live_cwd_and_workdir_var_uses_workdir() -> Result<()> {
+        let workdir = Path::new("/launch/root");
+        let cwd = Path::new("/live/elsewhere");
+
+        // A relative entry (the `.` token, or a bare relative path) resolves
+        // against the command's live cwd, not the launch dir.
+        assert_eq!(resolve_policy_path(".", workdir, cwd)?, cwd.join("."));
+        assert_eq!(resolve_policy_path("sub", workdir, cwd)?, cwd.join("sub"));
+
+        // `$WORKDIR` still expands to the launch-time workdir, independent of
+        // the live cwd.
+        assert_eq!(
+            resolve_policy_path("$WORKDIR", workdir, cwd)?,
+            PathBuf::from("/launch/root")
+        );
+        assert_eq!(
+            resolve_policy_path("$WORKDIR/x", workdir, cwd)?,
+            PathBuf::from("/launch/root/x")
+        );
+
+        // Absolute entries are returned unchanged.
+        assert_eq!(
+            resolve_policy_path("/etc/hosts", workdir, cwd)?,
+            PathBuf::from("/etc/hosts")
+        );
+        Ok(())
+    }
+
+    #[test]
     fn process_exec_gate_denies_by_default_and_allows_exact_paths() -> Result<()> {
         let mut caps = CapabilitySet::new();
         add_process_exec_gate(&mut caps, vec![PathBuf::from("/bin/sh")])?;
@@ -4438,6 +4707,47 @@ mod tests {
         assert!(has_exec_rule(&caps, &command)?);
         assert!(has_exec_rule(&caps, &interpreter)?);
         assert!(has_exec_rule(&caps, &bundle)?);
+        Ok(())
+    }
+
+    #[test]
+    fn unsafe_seatbelt_rules_appended_after_exec_gate_deny() -> Result<()> {
+        let temp = test_tempdir()?;
+        let command = temp.path().join("tool");
+        create_executable(&command)?;
+        let binary = test_binary("tool", &command)?;
+        let state = test_state();
+
+        let policy = CommandSandboxConfig {
+            unsafe_macos_seatbelt_rules: vec![
+                "(allow process-exec* (literal \"/usr/bin/security\"))".to_string(),
+                "(allow file-read* (literal \"/usr/bin/security\"))".to_string(),
+            ],
+            ..Default::default()
+        };
+
+        let mut caps = CapabilitySet::new();
+        // Reproduce the child-caps ordering: exec gate first, then unsafe rules.
+        add_child_process_exec_gate_with_policy(&mut caps, &state, &binary, Some(&policy))?;
+        add_unsafe_seatbelt_rules(&mut caps, &policy)?;
+
+        let rules: Vec<&str> = caps.platform_rules().iter().map(|r| r.as_str()).collect();
+        let deny_idx = rules
+            .iter()
+            .position(|r| *r == "(deny process-exec*)")
+            .expect("exec gate deny present");
+        let allow_idx = rules
+            .iter()
+            .position(|r| *r == "(allow process-exec* (literal \"/usr/bin/security\"))")
+            .expect("unsafe exec allow present");
+        assert!(
+            allow_idx > deny_idx,
+            "unsafe allow (idx {allow_idx}) must come after deny (idx {deny_idx}) so it wins"
+        );
+        assert!(
+            rules.contains(&"(allow file-read* (literal \"/usr/bin/security\"))"),
+            "unsafe file-read rule should be present"
+        );
         Ok(())
     }
 
@@ -4585,6 +4895,79 @@ mod tests {
             &BTreeMap::new(),
             &file_write_caps,
         )?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn writable_exec_helper_override_is_explicit_for_sandbox_writable_paths() -> Result<()> {
+        let temp = test_tempdir()?;
+        let bin_dir = temp.path().join("bin");
+        create_dir(&bin_dir)?;
+        let helper = bin_dir.join("helper");
+        create_executable(&helper)?;
+
+        let mut config = CommandPoliciesConfig::default();
+        config.commands.insert(
+            "tool".to_string(),
+            CommandPolicyConfig {
+                intercept: vec![InterceptRuleConfig {
+                    args: vec![],
+                    action: InterceptActionConfig::Exec {
+                        command: vec![helper.to_string_lossy().into_owned()],
+                    },
+                    sandbox: None,
+                }],
+                ..Default::default()
+            },
+        );
+
+        let mut exec_helpers = BTreeMap::new();
+        exec_helpers.insert(helper.clone(), test_binary("helper", &helper)?);
+
+        let caps = CapabilitySet::new();
+        validate_controlled_exec_helper_immutability(&config, &exec_helpers, &caps)?;
+
+        let mut file_write_caps = CapabilitySet::new();
+        file_write_caps.add_fs(FsCapability::new_file(&helper, AccessMode::ReadWrite)?);
+        let err =
+            validate_controlled_exec_helper_immutability(&config, &exec_helpers, &file_write_caps)
+                .err()
+                .ok_or_else(|| {
+                    NonoError::SandboxInit("expected sandbox-writable helper rejection".to_string())
+                })?;
+        assert!(
+            err.to_string()
+                .contains("writable by the outer session capability set")
+        );
+
+        let mut parent_write_caps = CapabilitySet::new();
+        parent_write_caps.add_fs(FsCapability::new_dir(&bin_dir, AccessMode::ReadWrite)?);
+        let err = validate_controlled_exec_helper_immutability(
+            &config,
+            &exec_helpers,
+            &parent_write_caps,
+        )
+        .err()
+        .ok_or_else(|| {
+            NonoError::SandboxInit("expected sandbox-writable parent rejection".to_string())
+        })?;
+        assert!(
+            err.to_string()
+                .contains("replaceable through writable parent directory")
+        );
+
+        config.allow_writable_executables = true;
+        validate_controlled_exec_helper_immutability(&config, &exec_helpers, &parent_write_caps)?;
+        config.allow_writable_executables = false;
+
+        let command = config
+            .commands
+            .get_mut("tool")
+            .ok_or_else(|| NonoError::SandboxInit("missing test command policy".to_string()))?;
+        command.allow_writable_executable = true;
+
+        validate_controlled_exec_helper_immutability(&config, &exec_helpers, &file_write_caps)?;
 
         Ok(())
     }
@@ -5080,5 +5463,34 @@ mod tests {
         );
         let dangerous_policy = policy_with_env(None, dangerous);
         assert!(apply_environment_set_vars(&mut vec![], &dangerous_policy).is_err());
+    }
+
+    #[test]
+    fn passthrough_uses_intercept_sandbox_override_when_present() {
+        // Mirrors the dispatch selection shared by every launching action:
+        //   let effective_sandbox = intercept.sandbox.unwrap_or(policy);
+        // A matched rule carrying its own sandbox replaces the command sandbox;
+        // a non-matching invocation (no override) falls back to the command
+        // sandbox.
+        let command_sandbox = CommandSandboxConfig {
+            fs_read: vec!["/command/path".to_string()],
+            ..CommandSandboxConfig::default()
+        };
+        let override_sandbox = CommandSandboxConfig {
+            fs_read: vec!["/override/path".to_string()],
+            ..CommandSandboxConfig::default()
+        };
+
+        let with_override = crate::tool_sandbox::ResolvedInterceptAction {
+            action: &crate::command_policy::InterceptActionConfig::Passthrough,
+            rule_args: Some(&[]),
+            sandbox: Some(&override_sandbox),
+        };
+        let effective = with_override.sandbox.unwrap_or(&command_sandbox);
+        assert_eq!(effective.fs_read, vec!["/override/path".to_string()]);
+
+        let without_override = crate::tool_sandbox::ResolvedInterceptAction::passthrough();
+        let effective = without_override.sandbox.unwrap_or(&command_sandbox);
+        assert_eq!(effective.fs_read, vec!["/command/path".to_string()]);
     }
 }

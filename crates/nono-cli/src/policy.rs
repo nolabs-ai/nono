@@ -149,6 +149,8 @@ pub struct ProfileDef {
     pub command_args: Vec<String>,
     #[serde(default)]
     pub unsafe_macos_seatbelt_rules: Vec<String>,
+    #[serde(default)]
+    pub platform_overrides: Option<profile::PlatformOverrides>,
 }
 
 impl ProfileDef {
@@ -171,6 +173,8 @@ impl ProfileDef {
             environment: None,
             command_policies: self.command_policies.clone(),
             credential_capture: HashMap::new(),
+            credential_providers: HashMap::new(),
+            credential_routes: Vec::new(),
             workdir: self.workdir.clone(),
             hooks: self.hooks.clone(),
             session_hooks: profile::SessionHooks::default(),
@@ -185,6 +189,7 @@ impl ProfileDef {
             binary: None,
             command_args: self.command_args.clone(),
             unsafe_macos_seatbelt_rules: self.unsafe_macos_seatbelt_rules.clone(),
+            platform_overrides: self.platform_overrides.clone(),
         }
     }
 }
@@ -210,9 +215,71 @@ pub(crate) fn group_matches_platform(group: &Group) -> bool {
 // Path expansion
 // ============================================================================
 
-/// Expand `~` to $HOME and `$TMPDIR` to the environment variable value.
+/// Scan `s` for bare `$IDENTIFIER` tokens and replace each via `lookup`.
 ///
-/// Returns an error if HOME or TMPDIR are set to non-absolute paths.
+/// `var_start` controls which first character after `$` opens a reference;
+/// subsequent chars are always `[A-Za-z0-9_]`. `${VAR}` and a lone `$` pass through.
+pub(crate) fn substitute_vars<E>(
+    s: &str,
+    var_start: impl Fn(char) -> bool,
+    lookup: impl Fn(&str) -> std::result::Result<Option<String>, E>,
+) -> std::result::Result<String, E> {
+    if !s.contains('$') {
+        return Ok(s.to_owned());
+    }
+    let mut result = String::with_capacity(s.len() * 2);
+    let mut iter = s.char_indices().peekable();
+    while let Some((i, c)) = iter.next() {
+        if c != '$' {
+            result.push(c);
+            continue;
+        }
+        match iter.peek() {
+            Some(&(_, nc)) if var_start(nc) => {}
+            _ => {
+                result.push('$');
+                continue;
+            }
+        }
+        let name_start = i + 1;
+        let mut name_end = name_start;
+        while let Some(&(j, nc)) = iter.peek() {
+            if nc.is_ascii_alphanumeric() || nc == '_' {
+                name_end = j + nc.len_utf8();
+                iter.next();
+            } else {
+                break;
+            }
+        }
+        let var_name = &s[name_start..name_end];
+        match lookup(var_name)? {
+            Some(val) => result.push_str(&val),
+            None => {
+                result.push('$');
+                result.push_str(var_name);
+            }
+        }
+    }
+    Ok(result)
+}
+
+/// Expand bare `$VAR` tokens in `s` from the process environment; unset vars are preserved.
+pub(crate) fn expand_env_vars(s: &str) -> String {
+    substitute_vars(
+        s,
+        |nc| nc.is_ascii_alphanumeric() || nc == '_',
+        |name| -> std::result::Result<Option<String>, std::convert::Infallible> {
+            Ok(std::env::var(name).ok())
+        },
+    )
+    .unwrap_or_else(|e| match e {})
+}
+
+/// Expand `~` to $HOME and `$VAR` to the environment variable value.
+///
+/// Handles `~`, `$HOME`, `$TMPDIR`, and any other `$VAR_NAME` prefix.
+/// Returns an error if the referenced variable is not set or does not expand
+/// to an absolute path.
 pub(crate) fn expand_path(path_str: &str) -> Result<PathBuf> {
     use crate::config;
 
@@ -229,11 +296,57 @@ pub(crate) fn expand_path(path_str: &str) -> Result<PathBuf> {
     } else if let Some(rest) = path_str.strip_prefix("$TMPDIR/") {
         let tmpdir = config::validated_tmpdir()?;
         format!("{}/{}", tmpdir, rest)
+    } else if path_str.starts_with('$') {
+        // General $VAR_NAME/rest expansion. The leading var must resolve to an
+        // absolute path; additional $VAR references further in the string are
+        // expanded by expand_env_vars but are not individually validated.
+        let expanded = expand_env_vars(path_str);
+        if expanded.starts_with('$') {
+            // Leading var was unset — extract name for a useful error message.
+            let rest = expanded.strip_prefix('$').unwrap_or(&expanded);
+            let var_name = rest
+                .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .map_or(rest, |end| &rest[..end]);
+            return Err(NonoError::EnvVarValidation {
+                var: var_name.to_string(),
+                reason: "not set".to_string(),
+            });
+        }
+        if !Path::new(&expanded).is_absolute() {
+            let rest = path_str.strip_prefix('$').unwrap_or(path_str);
+            let var_name = rest
+                .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .map_or(rest, |end| &rest[..end]);
+            return Err(NonoError::EnvVarValidation {
+                var: var_name.to_string(),
+                reason: format!("must be an absolute path, got: {expanded}"),
+            });
+        }
+        expanded
     } else {
         path_str.to_string()
     };
 
     Ok(PathBuf::from(expanded))
+}
+
+/// Expand `$VAR` references in a string against the process environment,
+/// erroring on an unset variable rather than leaving it literal like
+/// [`expand_env_vars`] — collapsing `$X/helper` to `/helper` on a typo'd var
+/// name would be a silent path-widening bug.
+pub(crate) fn expand_env_vars_strict(input: &str) -> Result<String> {
+    substitute_vars(
+        input,
+        |c| c.is_ascii_alphanumeric() || c == '_',
+        |name| {
+            std::env::var(name)
+                .map(Some)
+                .map_err(|_| NonoError::EnvVarValidation {
+                    var: name.to_string(),
+                    reason: format!("referenced in '{input}' but not set in the environment"),
+                })
+        },
+    )
 }
 
 /// Check whether a path resides inside the Nix store (`/nix/store`).
@@ -1771,6 +1884,78 @@ mod tests {
     fn test_expand_path_absolute() {
         let path = expand_path("/usr/bin").expect("absolute path needs no env");
         assert_eq!(path, PathBuf::from("/usr/bin"));
+    }
+
+    #[test]
+    fn test_expand_path_custom_env_var() {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let _env = crate::test_env::EnvVarGuard::set_all(&[("_TEST_SFROOT_POLICY", "/opt/vendor")]);
+        let path = expand_path("$_TEST_SFROOT_POLICY/profiles").expect("should expand");
+        assert_eq!(path, PathBuf::from("/opt/vendor/profiles"));
+    }
+
+    #[test]
+    fn test_expand_path_custom_env_var_unset_errors() {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let _env =
+            crate::test_env::EnvVarGuard::set_all(&[("_TEST_SFROOT_POLICY_UNSET", "placeholder")]);
+        _env.remove("_TEST_SFROOT_POLICY_UNSET");
+        let result = expand_path("$_TEST_SFROOT_POLICY_UNSET/profiles");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_expand_env_vars_expands_set_vars_and_preserves_unset() {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let _env = crate::test_env::EnvVarGuard::set_all(&[("_TEST_POLICY_ROOT", "/opt/tool")]);
+        assert_eq!(
+            expand_env_vars("$_TEST_POLICY_ROOT/bin/$_UNSET_VAR"),
+            "/opt/tool/bin/$_UNSET_VAR"
+        );
+    }
+
+    #[test]
+    fn expand_env_vars_strict_no_substitution() {
+        assert_eq!(
+            expand_env_vars_strict("/usr/bin/true").expect("literal"),
+            "/usr/bin/true"
+        );
+    }
+
+    #[test]
+    fn expand_env_vars_strict_substitutes_named_var() {
+        let _lock = match crate::test_env::ENV_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let var = "NONO_TEST_EXPAND_ENV_VARS_HELPER_DIR";
+        let _env = crate::test_env::EnvVarGuard::set_all(&[(var, "/opt/libexec")]);
+        let plain = expand_env_vars_strict(&format!("${var}/helper")).expect("plain expand");
+        assert_eq!(plain, "/opt/libexec/helper");
+    }
+
+    #[test]
+    fn expand_env_vars_strict_errors_on_unset() {
+        let _lock = match crate::test_env::ENV_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let var = "NONO_TEST_EXPAND_ENV_VARS_DEFINITELY_UNSET";
+        // Manage the key through the guard (so drop restores the original), then
+        // remove it to exercise the unset path.
+        let env = crate::test_env::EnvVarGuard::set_all(&[(var, "placeholder")]);
+        env.remove(var);
+        let err = expand_env_vars_strict(&format!("${var}/x")).expect_err("unset var must error");
+        assert!(matches!(err, NonoError::EnvVarValidation { .. }));
     }
 
     #[test]

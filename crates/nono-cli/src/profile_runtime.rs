@@ -2,7 +2,8 @@ use crate::cli::SandboxArgs;
 use crate::{package, profile};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::fs::{self, DirBuilder};
+use std::path::{Component, Path, PathBuf};
 
 pub(crate) struct PreparedProfile {
     pub(crate) loaded_profile: Option<profile::Profile>,
@@ -12,13 +13,20 @@ pub(crate) struct PreparedProfile {
     pub(crate) wsl2_proxy_policy: profile::Wsl2ProxyPolicy,
     #[cfg(target_os = "linux")]
     pub(crate) af_unix_mediation: profile::LinuxAfUnixMediation,
+    #[cfg(target_os = "linux")]
+    pub(crate) sandbox_policy: profile::LinuxSandboxPolicy,
+    #[cfg(target_os = "linux")]
+    pub(crate) explicit_sandbox_policy: Option<profile::LinuxSandboxPolicy>,
     pub(crate) workdir_access: Option<profile::WorkdirAccess>,
     pub(crate) rollback_exclude_patterns: Vec<String>,
     pub(crate) rollback_exclude_globs: Vec<String>,
     pub(crate) network_profile: Option<String>,
     pub(crate) allow_domain: Vec<profile::AllowDomainEntry>,
+    pub(crate) deny_domain: Vec<String>,
     pub(crate) credentials: Vec<String>,
     pub(crate) custom_credentials: HashMap<String, profile::CustomCredentialDef>,
+    pub(crate) credential_providers: HashMap<String, profile::CredentialProviderDef>,
+    pub(crate) credential_routes: Vec<profile::CredentialRouteDef>,
     pub(crate) tls_intercept: Option<profile::TlsInterceptConfig>,
     pub(crate) upstream_proxy: Option<String>,
     pub(crate) upstream_bypass: Vec<String>,
@@ -37,6 +45,11 @@ pub(crate) struct PreparedProfile {
     /// when the profile has no `set_vars`. Values are expanded with
     /// [`profile::expand_vars`] at prepare time.
     pub(crate) set_vars: Option<Vec<(String, String)>>,
+    /// Command binaries already resolved (canonicalized, stat'd, hashed) while
+    /// validating the profile's `command_policies`. Building the tool-sandbox
+    /// plan reuses this instead of resolving — and re-hashing — every
+    /// controlled binary a second time.
+    pub(crate) resolved_command_binaries: Option<crate::command_policy::ResolvedCommandBinaries>,
 }
 
 #[derive(Clone, Copy)]
@@ -504,6 +517,169 @@ fn collect_ignored_denial_paths(
     paths
 }
 
+fn precreate_file_json_credential_store_dirs(
+    loaded_profile: Option<&profile::Profile>,
+    workdir: &Path,
+) {
+    let Some(loaded_profile) = loaded_profile else {
+        return;
+    };
+
+    for (provider_name, provider) in &loaded_profile.credential_providers {
+        let Some(profile::CredentialProviderStore::FileJson { path, .. }) =
+            &provider.credential_store
+        else {
+            continue;
+        };
+        let expanded = match expanded_credential_store_path(path, workdir) {
+            Ok(path) => path,
+            Err(error) => {
+                tracing::warn!(
+                    "Failed to expand file_json credential store path for provider {}: {}",
+                    provider_name,
+                    error
+                );
+                continue;
+            }
+        };
+        if !file_json_store_path_is_precreatable(loaded_profile, &expanded, workdir) {
+            tracing::warn!(
+                "Skipping file_json credential store directory pre-create for provider {} at {}: path is not under workdir or an explicit writable filesystem grant",
+                provider_name,
+                expanded.display()
+            );
+            continue;
+        }
+        let Some(parent) = expanded.parent() else {
+            continue;
+        };
+        if let Err(error) = create_dir_all_owner_only(parent) {
+            tracing::warn!(
+                "Failed to pre-create file_json credential store directory {} for provider {}: {}",
+                parent.display(),
+                provider_name,
+                error
+            );
+        }
+    }
+}
+
+fn expanded_credential_store_path(path: &str, workdir: &Path) -> crate::Result<PathBuf> {
+    let expanded = profile::expand_vars(path, workdir)?;
+    let absolute = if expanded.is_absolute() {
+        expanded
+    } else {
+        workdir.join(expanded)
+    };
+    Ok(lexically_normalize(&absolute))
+}
+
+fn file_json_store_path_is_precreatable(
+    loaded_profile: &profile::Profile,
+    store_path: &Path,
+    workdir: &Path,
+) -> bool {
+    let normalized_workdir = lexically_normalize(workdir);
+    if store_path.starts_with(&normalized_workdir) {
+        return true;
+    }
+
+    writable_profile_dirs(loaded_profile, workdir)
+        .into_iter()
+        .any(|grant| store_path.starts_with(grant))
+        || writable_profile_files(loaded_profile, workdir)
+            .into_iter()
+            .any(|grant| store_path == grant)
+}
+
+fn writable_profile_dirs(loaded_profile: &profile::Profile, workdir: &Path) -> Vec<PathBuf> {
+    loaded_profile
+        .filesystem
+        .allow
+        .iter()
+        .chain(loaded_profile.filesystem.write.iter())
+        .filter_map(|path| expanded_credential_store_path(path, workdir).ok())
+        .collect()
+}
+
+fn writable_profile_files(loaded_profile: &profile::Profile, workdir: &Path) -> Vec<PathBuf> {
+    loaded_profile
+        .filesystem
+        .allow_file
+        .iter()
+        .chain(loaded_profile.filesystem.write_file.iter())
+        .filter_map(|path| expanded_credential_store_path(path, workdir).ok())
+        .collect()
+}
+
+fn lexically_normalize(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+    normalized
+}
+
+fn create_dir_all_owner_only(path: &Path) -> std::io::Result<()> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        if current.as_os_str().is_empty() {
+            continue;
+        }
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!(
+                        "refusing to create credential store directory through symlink '{}'",
+                        current.display()
+                    ),
+                ));
+            }
+            Ok(metadata) if metadata.is_dir() => continue,
+            Ok(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!(
+                        "credential store path component '{}' is not a directory",
+                        current.display()
+                    ),
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                create_owner_only_dir(&current)?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn create_owner_only_dir(path: &Path) -> std::io::Result<()> {
+    let mut builder = DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
 fn prepare_profile_with_options(
     args: &SandboxArgs,
     workdir: &Path,
@@ -524,11 +700,11 @@ fn prepare_profile_with_options(
         }
     }
 
-    let loaded_profile = if let Some(ref profile_name) = args.profile {
+    let (loaded_profile, resolved_command_binaries) = if let Some(ref profile_name) = args.profile {
         // The claude-code → registry-pack migration is wired into
         // `load_profile` itself so it fires from every call site (run,
         // wrap, shell, profile show, why, learn) without duplication.
-        let profile = profile::load_profile(profile_name)?;
+        let profile = profile::load_profile_with_extends(profile_name, &args.extends)?;
         crate::package_status::enforce_for_active_profile(
             Some(profile_name),
             options.hook_output_silent,
@@ -539,7 +715,7 @@ fn prepare_profile_with_options(
         // pack-store resolution — both direct registry refs and name/alias
         // paths — so no post-hoc lookup is needed here.
         let mut packs_to_verify = profile.packs.clone();
-        validate_command_policy_runtime_support(&profile)?;
+        let resolved_command_binaries = validate_command_policy_runtime_support(&profile)?;
 
         // For direct registry refs the pack key may not yet be in packs if
         // load_registry_profile found the pack installed but the profile JSON
@@ -580,10 +756,12 @@ fn prepare_profile_with_options(
         if options.install_hooks {
             install_profile_hooks(Some(profile_name), &profile, options.hook_output_silent);
         }
-        Some(profile)
+        (Some(profile), resolved_command_binaries)
     } else {
-        None
+        (None, None)
     };
+
+    precreate_file_json_credential_store_dirs(loaded_profile.as_ref(), workdir);
 
     Ok(PreparedProfile {
         capability_elevation: loaded_profile
@@ -600,6 +778,15 @@ fn prepare_profile_with_options(
             .as_ref()
             .and_then(|profile| profile.linux.af_unix_mediation)
             .unwrap_or_default(),
+        #[cfg(target_os = "linux")]
+        sandbox_policy: loaded_profile
+            .as_ref()
+            .and_then(|profile| profile.linux.sandbox_policy)
+            .unwrap_or_default(),
+        #[cfg(target_os = "linux")]
+        explicit_sandbox_policy: loaded_profile
+            .as_ref()
+            .and_then(|profile| profile.linux.sandbox_policy),
         workdir_access: loaded_profile
             .as_ref()
             .map(|profile| profile.workdir.access.clone()),
@@ -621,6 +808,10 @@ fn prepare_profile_with_options(
             .as_ref()
             .map(|profile| profile.network.allow_domain.clone())
             .unwrap_or_default(),
+        deny_domain: loaded_profile
+            .as_ref()
+            .map(|profile| profile.network.deny_domain.clone())
+            .unwrap_or_default(),
         credentials: loaded_profile
             .as_ref()
             .and_then(|profile| profile.network.credentials.clone())
@@ -628,6 +819,14 @@ fn prepare_profile_with_options(
         custom_credentials: loaded_profile
             .as_ref()
             .map(|profile| profile.network.custom_credentials.clone())
+            .unwrap_or_default(),
+        credential_providers: loaded_profile
+            .as_ref()
+            .map(|profile| profile.credential_providers.clone())
+            .unwrap_or_default(),
+        credential_routes: loaded_profile
+            .as_ref()
+            .map(|profile| profile.credential_routes.clone())
             .unwrap_or_default(),
         tls_intercept: loaded_profile
             .as_ref()
@@ -680,14 +879,14 @@ fn prepare_profile_with_options(
             .map(|profile| profile.diagnostics.suppress_system_services.clone())
             .unwrap_or_default(),
         allowed_env_vars: loaded_profile.as_ref().and_then(|profile| {
-            profile.environment.as_ref().map(|env_config| {
-                if let Some(err) = crate::exec_strategy::validate_env_var_patterns(
-                    &env_config.allow_vars,
-                    "allow_vars",
-                ) {
+            profile.environment.as_ref().and_then(|env_config| {
+                let vars = env_config.allow_vars.as_ref()?;
+                if let Some(err) =
+                    crate::exec_strategy::validate_env_var_patterns(vars, "allow_vars")
+                {
                     eprintln!("Warning: {}", err);
                 }
-                env_config.allow_vars.clone()
+                Some(vars.clone())
             })
         }),
         denied_env_vars: loaded_profile.as_ref().and_then(|profile| {
@@ -708,16 +907,23 @@ fn prepare_profile_with_options(
             .as_ref()
             .and_then(|profile| profile.command_policies.clone()),
         set_vars: expand_profile_set_vars(loaded_profile.as_ref(), workdir)?,
+        resolved_command_binaries,
         loaded_profile,
     })
 }
 
-fn validate_command_policy_runtime_support(profile: &profile::Profile) -> crate::Result<()> {
+/// Validates that the active platform can support the profile's
+/// `command_policies`, returning the binaries resolved along the way (if
+/// any) so callers that go on to build a tool-sandbox plan can reuse this
+/// resolution instead of re-reading and re-hashing every controlled binary.
+fn validate_command_policy_runtime_support(
+    profile: &profile::Profile,
+) -> crate::Result<Option<crate::command_policy::ResolvedCommandBinaries>> {
     let Some(command_policies) = profile.command_policies.as_ref() else {
-        return Ok(());
+        return Ok(None);
     };
     if !command_policies.is_active() {
-        return Ok(());
+        return Ok(None);
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -739,16 +945,20 @@ fn validate_command_policy_runtime_support(profile: &profile::Profile) -> crate:
 }
 
 #[cfg(target_os = "linux")]
-fn validate_linux_command_policy_runtime_support(profile: &profile::Profile) -> crate::Result<()> {
-    if let Some(command_policies) = profile.command_policies.as_ref() {
-        let _resolved = crate::command_policy::resolve_policy_command_binaries(
+fn validate_linux_command_policy_runtime_support(
+    profile: &profile::Profile,
+) -> crate::Result<Option<crate::command_policy::ResolvedCommandBinaries>> {
+    let resolved = if let Some(command_policies) = profile.command_policies.as_ref() {
+        Some(crate::command_policy::resolve_policy_command_binaries(
             command_policies,
             std::env::var_os("PATH"),
-        )?;
-    }
+        )?)
+    } else {
+        None
+    };
 
     if !command_policies_use_tcp_port_rules(profile) {
-        return Ok(());
+        return Ok(resolved);
     }
 
     let abi = nono::detect_abi().map_err(|err| {
@@ -762,18 +972,22 @@ fn validate_linux_command_policy_runtime_support(profile: &profile::Profile) -> 
             abi
         )));
     }
-    Ok(())
+    Ok(resolved)
 }
 
 #[cfg(target_os = "macos")]
-fn validate_macos_command_policy_runtime_support(profile: &profile::Profile) -> crate::Result<()> {
-    if let Some(command_policies) = profile.command_policies.as_ref() {
-        let _resolved = crate::command_policy::resolve_policy_command_binaries(
+fn validate_macos_command_policy_runtime_support(
+    profile: &profile::Profile,
+) -> crate::Result<Option<crate::command_policy::ResolvedCommandBinaries>> {
+    let resolved = if let Some(command_policies) = profile.command_policies.as_ref() {
+        Some(crate::command_policy::resolve_policy_command_binaries(
             command_policies,
             std::env::var_os("PATH"),
-        )?;
-    }
-    Ok(())
+        )?)
+    } else {
+        None
+    };
+    Ok(resolved)
 }
 
 #[cfg(target_os = "linux")]
@@ -892,7 +1106,7 @@ mod tests {
         set_vars.insert("RUST_LOG".to_string(), "debug".to_string());
         set_vars.insert("CFG".to_string(), "$HOME/.config".to_string());
         profile.environment = Some(profile::EnvironmentConfig {
-            allow_vars: vec![],
+            allow_vars: None,
             deny_vars: vec![],
             set_vars,
         });
@@ -918,6 +1132,95 @@ mod tests {
         let result = expand_profile_set_vars(Some(&profile), Path::new("/tmp/work"))
             .expect("expansion should succeed");
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn precreate_file_json_credential_store_creates_parent_dir_only() {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let tmp = tempdir().expect("tmpdir");
+        let tmp_root = tmp.path().canonicalize().expect("canonical tmpdir");
+        let home = tmp_root.join("home");
+        let workdir = tmp_root.join("work");
+        fs::create_dir(&home).expect("create home");
+        fs::create_dir(&workdir).expect("create workdir");
+        let _env =
+            crate::test_env::EnvVarGuard::set_all(&[("HOME", home.to_str().expect("utf8 home"))]);
+
+        let mut profile = profile::Profile::default();
+        profile.credential_providers.insert(
+            "codex_openai".to_string(),
+            profile::CredentialProviderDef {
+                provider_type: profile::CredentialProviderType::OauthCapture,
+                token_endpoints: Vec::new(),
+                api_hosts: Vec::new(),
+                credential_store: Some(profile::CredentialProviderStore::FileJson {
+                    path: "$HOME/.codex-nono-oauth/auth.json".to_string(),
+                    phantom_fields: vec!["tokens.access_token".to_string()],
+                }),
+                helpers: None,
+            },
+        );
+        profile
+            .filesystem
+            .allow
+            .push("$HOME/.codex-nono-oauth".to_string());
+
+        let store_path = home.join(".codex-nono-oauth").join("auth.json");
+        assert!(!store_path.parent().expect("parent").exists());
+
+        precreate_file_json_credential_store_dirs(Some(&profile), &workdir);
+
+        assert!(store_path.parent().expect("parent").is_dir());
+        assert!(!store_path.exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(store_path.parent().expect("parent"))
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o700);
+        }
+    }
+
+    #[test]
+    fn file_json_credential_store_precreate_requires_safe_location() {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let tmp = tempdir().expect("tmpdir");
+        let tmp_root = tmp.path().canonicalize().expect("canonical tmpdir");
+        let home = tmp_root.join("home");
+        let workdir = tmp_root.join("work");
+        fs::create_dir(&home).expect("create home");
+        fs::create_dir(&workdir).expect("create workdir");
+        let _env =
+            crate::test_env::EnvVarGuard::set_all(&[("HOME", home.to_str().expect("utf8 home"))]);
+
+        let mut profile = profile::Profile::default();
+        profile.credential_providers.insert(
+            "codex_openai".to_string(),
+            profile::CredentialProviderDef {
+                provider_type: profile::CredentialProviderType::OauthCapture,
+                token_endpoints: Vec::new(),
+                api_hosts: Vec::new(),
+                credential_store: Some(profile::CredentialProviderStore::FileJson {
+                    path: "$HOME/.codex-nono-oauth/auth.json".to_string(),
+                    phantom_fields: vec!["tokens.access_token".to_string()],
+                }),
+                helpers: None,
+            },
+        );
+
+        let store_path = home.join(".codex-nono-oauth").join("auth.json");
+        precreate_file_json_credential_store_dirs(Some(&profile), &workdir);
+
+        assert!(!store_path.parent().expect("parent").exists());
     }
 
     /// Build a minimal pack on disk under `<config_dir>/nono/packages/<ns>/<name>/`
@@ -1486,6 +1789,64 @@ mod tests {
                     profile.filesystem.allow.clone(),
                 )
             })
+        );
+    }
+
+    #[test]
+    fn environment_deny_only_does_not_activate_allow_filter() {
+        // allow_vars absent (None) — no filter should be active
+        let mut profile = profile::Profile::default();
+        profile.environment = Some(profile::EnvironmentConfig {
+            allow_vars: None,
+            deny_vars: vec!["GH_TOKEN".to_string()],
+            set_vars: Default::default(),
+        });
+        assert_eq!(
+            profile
+                .environment
+                .as_ref()
+                .and_then(|e| e.allow_vars.as_ref()),
+            None,
+            "absent allow_vars should produce no filter"
+        );
+    }
+
+    #[test]
+    fn environment_explicit_empty_allow_vars_blocks_all() {
+        // allow_vars explicitly [] — filter active, nothing passes
+        let mut profile = profile::Profile::default();
+        profile.environment = Some(profile::EnvironmentConfig {
+            allow_vars: Some(vec![]),
+            deny_vars: vec![],
+            set_vars: Default::default(),
+        });
+        assert_eq!(
+            profile
+                .environment
+                .as_ref()
+                .and_then(|e| e.allow_vars.as_ref()),
+            Some(&vec![]),
+            "explicit empty allow_vars should produce Some([]) (block all)"
+        );
+    }
+
+    #[test]
+    fn environment_set_vars_only_does_not_activate_allow_filter() {
+        let mut profile = profile::Profile::default();
+        let mut set_vars = std::collections::HashMap::new();
+        set_vars.insert("MY_VAR".to_string(), "hello".to_string());
+        profile.environment = Some(profile::EnvironmentConfig {
+            allow_vars: None,
+            deny_vars: vec![],
+            set_vars,
+        });
+        assert_eq!(
+            profile
+                .environment
+                .as_ref()
+                .and_then(|e| e.allow_vars.as_ref()),
+            None,
+            "set_vars-only environment should not activate the allow filter"
         );
     }
 }

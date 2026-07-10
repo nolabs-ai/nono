@@ -4,6 +4,8 @@
 //! enforcement types. `CapabilitySet` is constructed by mapping each manifest
 //! domain (filesystem, network, process) to the corresponding builder calls.
 
+#[cfg(target_os = "macos")]
+use crate::capability::merge_port_ranges;
 use crate::capability::{
     AccessMode as InternalAccessMode, CapabilitySet, IpcMode as InternalIpcMode,
     NetworkMode as InternalNetworkMode, ProcessInfoMode as InternalProcessInfoMode,
@@ -72,6 +74,44 @@ impl TryFrom<&CapabilityManifest> for CapabilitySet {
                         NonoError::ConfigParse(format!("port {} exceeds u16 range", port))
                     })?;
                     caps = caps.allow_localhost_port(p);
+                }
+                let mut raw_ranges: Vec<(u16, u16)> = Vec::new();
+                for &[start, end] in &ports.localhost_range {
+                    let start_u = start.get();
+                    let end_u = end.get();
+                    let (start, end) = match (u16::try_from(start_u), u16::try_from(end_u)) {
+                        (Ok(s), Ok(e)) => (s, e),
+                        _ => {
+                            return Err(NonoError::ConfigParse(format!(
+                                "localhost_range entry [{start_u}, {end_u}] is invalid: ports must be in 1–65535"
+                            )));
+                        }
+                    };
+                    if start > end {
+                        return Err(NonoError::ConfigParse(format!(
+                            "localhost_range entry [{start}, {end}] is invalid: start must be <= end"
+                        )));
+                    }
+                    raw_ranges.push((start, end));
+                }
+                #[cfg(target_os = "macos")]
+                {
+                    let merged = merge_port_ranges(&raw_ranges);
+                    let total: u32 = merged
+                        .iter()
+                        .map(|&(s, e)| (e as u32).saturating_sub(s as u32).saturating_add(1))
+                        .fold(0u32, |acc, n| acc.saturating_add(n));
+                    if total > crate::capability::MACOS_PORT_RANGE_LIMIT {
+                        return Err(NonoError::ConfigParse(format!(
+                            "localhost_range entries expand to {} unique ports, which exceeds the macOS limit of {} \
+                             (sandbox_init crashes above ~17,770 rules); use smaller or fewer ranges",
+                            total,
+                            crate::capability::MACOS_PORT_RANGE_LIMIT
+                        )));
+                    }
+                }
+                for (start, end) in raw_ranges {
+                    caps = caps.allow_localhost_port_range(start, end)?;
                 }
             }
         }

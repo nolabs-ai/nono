@@ -1,6 +1,8 @@
 //! Linux sandbox implementation using Landlock LSM
 
-use crate::capability::{AccessMode, CapabilitySet, IpcMode, NetworkMode, SignalMode};
+use crate::capability::{
+    AccessMode, CapabilitySet, IpcMode, NetworkMode, SignalMode, merge_port_ranges,
+};
 use crate::error::{NonoError, Result};
 use crate::sandbox::SupportInfo;
 use landlock::{
@@ -786,6 +788,30 @@ fn apply_with_abi_inner(
                             port, e
                         ))
                     })?;
+            }
+            for (start, end) in merge_port_ranges(caps.localhost_port_ranges()) {
+                debug!(
+                    "Adding localhost TCP rules for port range {}..={}",
+                    start, end
+                );
+                for port in start..=end {
+                    ruleset = ruleset
+                        .add_rule(NetPort::new(port, AccessNet::ConnectTcp))
+                        .map_err(|e| {
+                            NonoError::SandboxInit(format!(
+                                "Cannot add TCP connect rule for localhost port range {}..={}: {}",
+                                start, end, e
+                            ))
+                        })?;
+                    ruleset = ruleset
+                        .add_rule(NetPort::new(port, AccessNet::BindTcp))
+                        .map_err(|e| {
+                            NonoError::SandboxInit(format!(
+                                "Cannot add TCP bind rule for localhost port range {}..={}: {}",
+                                start, end, e
+                            ))
+                        })?;
+                }
             }
         }
     }

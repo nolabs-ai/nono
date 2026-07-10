@@ -10,7 +10,8 @@ use crate::profile;
 use crate::tool_sandbox::credentials::{ResolvedCredential, resolve_credentials};
 use crate::tool_sandbox::env::{
     apply_environment_set_vars, default_env_allow_patterns, effective_argv_for_binary,
-    inject_chaining_control_env, inject_url_open_env, split_env_entry,
+    env_shebang_target_interpreter, inject_chaining_control_env, inject_url_open_env,
+    split_env_entry,
 };
 use crate::tool_sandbox::launch::{
     exit_status_code, prepare_launcher_command, remove_launch_spec, write_launch_spec,
@@ -3242,6 +3243,25 @@ fn build_child_launch_spec_for_binary(
                 allowed_exec_paths.push(dep.as_os_str().as_bytes().to_vec());
             }
         }
+        // `env` re-exec's `<interp>`, so grant it and its ELF closure too.
+        if let Some(real_interp) =
+            env_shebang_target_interpreter(interp, &binary.shape.interpreter_args)
+        {
+            debug!(
+                "env-shebang: granting re-exec target {} (interp {}, args {:?})",
+                real_interp.display(),
+                interp.display(),
+                binary.shape.interpreter_args
+            );
+            allowed_exec_paths.push(real_interp.as_os_str().as_bytes().to_vec());
+            if let Ok(canonical_real) = real_interp.canonicalize()
+                && let Some(closure) = state.baseline_cache.closures.get(&canonical_real)
+            {
+                for dep in closure {
+                    allowed_exec_paths.push(dep.as_os_str().as_bytes().to_vec());
+                }
+            }
+        }
     }
     for shim in state.shims_by_command.values() {
         allowed_exec_paths.push(shim.path.as_os_str().as_bytes().to_vec());
@@ -3396,7 +3416,17 @@ fn add_executable_shape_baseline(
                 source,
             })?;
     caps.add_fs(FsCapability::new_file(&interpreter, AccessMode::Read)?);
-    add_runtime_baseline(caps, &state.baseline_cache, &interpreter)
+    add_runtime_baseline(caps, &state.baseline_cache, &interpreter)?;
+    // Landlock intersects the filesystem and execute layers, so the re-exec'd
+    // `<interp>` (and its ELF closure) must be present in the fs layer too.
+    if let Some(real_interp) =
+        env_shebang_target_interpreter(&interpreter, &binary.shape.interpreter_args)
+        && let Ok(canonical_real) = real_interp.canonicalize()
+    {
+        caps.add_fs(FsCapability::new_file(&canonical_real, AccessMode::Read)?);
+        add_runtime_baseline(caps, &state.baseline_cache, &canonical_real)?;
+    }
+    Ok(())
 }
 
 fn add_chaining_control_caps(caps: &mut CapabilitySet, state: &ToolSandboxState) -> Result<()> {
@@ -3698,6 +3728,18 @@ fn build_baseline_cache<'a>(
                     })?;
             if !closures.contains_key(&canonical) {
                 closures.insert(canonical.clone(), elf_dependency_closure(&canonical)?);
+            }
+            // Cache the re-exec'd `<interp>`'s closure so the exec allowlist can
+            // grant it.
+            if let Some(real_interp) =
+                env_shebang_target_interpreter(interpreter, &binary.shape.interpreter_args)
+                && let Ok(canonical_real) = real_interp.canonicalize()
+                && !closures.contains_key(&canonical_real)
+            {
+                closures.insert(
+                    canonical_real.clone(),
+                    elf_dependency_closure(&canonical_real)?,
+                );
             }
         }
     }
@@ -5206,6 +5248,7 @@ fn le_u64(data: &[u8], offset: usize) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::command_policy::{
         CommandEnvironmentConfig, CommandPolicyConfig, CommandSandboxConfig, InterceptActionConfig,
         InterceptRuleConfig, ResolvedCommandBinaries, ResolvedCommandBinary,

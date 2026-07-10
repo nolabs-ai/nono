@@ -4,8 +4,9 @@ use crate::tool_sandbox::protocol::{
     TOOL_SANDBOX_URL_SOCKET_ENV, ToolSandboxShimRequest,
 };
 use nono::{NonoError, Result};
+use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const DEFAULT_ENV_ALLOW: &[&str] = &[
     "PATH",
@@ -167,11 +168,239 @@ pub(crate) fn split_env_entry(entry: &[u8]) -> Option<(&[u8], &[u8])> {
     Some((&entry[..pos], &entry[pos + 1..]))
 }
 
+/// `env` re-exec's the `<interp>` behind a `#!/usr/bin/env <interp>` shebang, so
+/// it must be granted alongside `env` or the re-exec is denied. Parses `env`'s
+/// own args enough to find `<interp>` and where it would be searched. Only ever
+/// widens the allowlist.
+pub(crate) fn env_shebang_target_interpreter(
+    interp: &Path,
+    interpreter_args: &[String],
+) -> Option<PathBuf> {
+    if interp.file_name() != Some(OsStr::new("env")) {
+        return None;
+    }
+    let mut args = interpreter_args.iter();
+    let mut search_path: Option<&str> = None;
+    let target = loop {
+        let arg = args.next()?;
+        if arg == "--" {
+            break args.next()?;
+        }
+        if matches!(arg.as_str(), "-u" | "-C" | "--unset" | "--chdir") {
+            args.next()?;
+        } else if arg == "-P" {
+            // BSD alternate search path.
+            search_path = args.next().map(String::as_str);
+        } else if let Some((name, value)) = arg.split_once('=') {
+            if name == "PATH" {
+                search_path = Some(value);
+            }
+        } else if !arg.starts_with('-') {
+            break arg;
+        }
+    };
+    let candidate = Path::new(target);
+    if candidate.is_absolute() {
+        return Some(candidate.to_path_buf());
+    }
+    // A pinned search path is authoritative; falling back elsewhere would grant
+    // a path `env` never searches. Cwd components aren't known at build time.
+    if let Some(path_list) = search_path {
+        for dir in path_list.split(':').map(Path::new) {
+            if !dir.is_absolute() {
+                continue;
+            }
+            let path = dir.join(target);
+            if path.exists() {
+                return Some(path);
+            }
+        }
+        return None;
+    }
+    if let Ok(resolved) = which::which(target) {
+        return Some(resolved);
+    }
+    // Supervisor PATH may be minimal at build time; try standard locations.
+    for dir in ["/usr/bin", "/bin", "/usr/local/bin"] {
+        let path = Path::new(dir).join(target);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::command_policy::{ResolvedExecutableKind, ResolvedExecutableShape};
     use crate::exec_strategy::env_sanitization::is_env_var_allowed;
+
+    #[test]
+    fn env_shebang_target_resolves_relative_against_inline_path() {
+        // Homebrew-style shebangs pin PATH; resolve the relative interp there.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let interp = dir.path().join("myinterp");
+        std::fs::File::create(&interp).expect("create interp");
+        let dir_str = dir.path().to_string_lossy().into_owned();
+
+        assert_eq!(
+            env_shebang_target_interpreter(
+                Path::new("/usr/bin/env"),
+                &[
+                    "-S".to_string(),
+                    format!("PATH={dir_str}"),
+                    "myinterp".to_string(),
+                ],
+            ),
+            Some(interp.clone()),
+        );
+        assert_eq!(
+            env_shebang_target_interpreter(
+                Path::new("/usr/bin/env"),
+                &["-P".to_string(), dir_str, "myinterp".to_string()],
+            ),
+            Some(interp),
+        );
+    }
+
+    #[test]
+    fn env_shebang_target_pinned_path_does_not_widen_to_supervisor_path() {
+        // Pinned path missing the interp must grant nothing, not widen to the
+        // supervisor PATH. `sh` is on the supervisor PATH but not in `dir`.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dir_str = dir.path().to_string_lossy().into_owned();
+        assert_eq!(
+            env_shebang_target_interpreter(
+                Path::new("/usr/bin/env"),
+                &[format!("PATH={dir_str}"), "sh".to_string()],
+            ),
+            None,
+        );
+        // Empty component means cwd, not resolved at build time; still no widen.
+        assert_eq!(
+            env_shebang_target_interpreter(
+                Path::new("/usr/bin/env"),
+                &["PATH=".to_string(), "sh".to_string()],
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    fn env_shebang_target_resolves_absolute_interpreter() {
+        // `#!/usr/bin/env /bin/bash` — absolute target is used verbatim.
+        assert_eq!(
+            env_shebang_target_interpreter(Path::new("/usr/bin/env"), &["/bin/bash".to_string()]),
+            Some(PathBuf::from("/bin/bash")),
+        );
+    }
+
+    #[test]
+    fn env_shebang_target_none_for_non_env_interpreter() {
+        // A direct `#!/bin/bash` shebang needs no extra grant.
+        assert_eq!(
+            env_shebang_target_interpreter(Path::new("/bin/bash"), &["x".to_string()]),
+            None,
+        );
+    }
+
+    #[test]
+    fn env_shebang_target_none_when_no_interpreter_follows() {
+        // Only option flags / assignments and no interpreter: nothing to grant.
+        assert_eq!(
+            env_shebang_target_interpreter(Path::new("/usr/bin/env"), &["-S".to_string()]),
+            None,
+        );
+        assert_eq!(
+            env_shebang_target_interpreter(Path::new("/usr/bin/env"), &["FOO=bar".to_string()]),
+            None,
+        );
+        assert_eq!(
+            env_shebang_target_interpreter(Path::new("/usr/bin/env"), &[]),
+            None,
+        );
+    }
+
+    #[test]
+    fn env_shebang_target_honors_end_of_options() {
+        // After `--` the next token is the interpreter verbatim.
+        assert_eq!(
+            env_shebang_target_interpreter(
+                Path::new("/usr/bin/env"),
+                &["--".to_string(), "/bin/bash".to_string()],
+            ),
+            Some(PathBuf::from("/bin/bash")),
+        );
+        assert_eq!(
+            env_shebang_target_interpreter(
+                Path::new("/usr/bin/env"),
+                &["--".to_string(), "/opt/x=y".to_string()],
+            ),
+            Some(PathBuf::from("/opt/x=y")),
+        );
+    }
+
+    #[test]
+    fn env_shebang_target_skips_split_string_flag() {
+        // `#!/usr/bin/env -S <interp> -u` — skip `-S`, resolve the interpreter.
+        assert_eq!(
+            env_shebang_target_interpreter(
+                Path::new("/usr/bin/env"),
+                &["-S".to_string(), "/bin/bash".to_string(), "-u".to_string()],
+            ),
+            Some(PathBuf::from("/bin/bash")),
+        );
+    }
+
+    #[test]
+    fn env_shebang_target_skips_env_assignments() {
+        // `#!/usr/bin/env FOO=bar <interp>` — skip the assignment, resolve interp.
+        assert_eq!(
+            env_shebang_target_interpreter(
+                Path::new("/usr/bin/env"),
+                &["FOO=bar".to_string(), "/bin/bash".to_string()],
+            ),
+            Some(PathBuf::from("/bin/bash")),
+        );
+    }
+
+    #[test]
+    fn env_shebang_target_skips_value_consuming_options() {
+        // `-u NAME` (GNU), `-C DIR` (GNU), `-P DIR` (BSD/macOS) consume the next
+        // token; it is not the interpreter.
+        for flag in ["-u", "-C", "-P"] {
+            assert_eq!(
+                env_shebang_target_interpreter(
+                    Path::new("/usr/bin/env"),
+                    &[
+                        flag.to_string(),
+                        "/tmp".to_string(),
+                        "/bin/bash".to_string()
+                    ],
+                ),
+                Some(PathBuf::from("/bin/bash")),
+                "flag {flag} should consume its value token",
+            );
+        }
+    }
+
+    #[test]
+    fn env_shebang_target_skips_flag_and_assignment_together() {
+        // `#!/usr/bin/env -S FOO=bar <interp> -u` — skip both, resolve interp.
+        assert_eq!(
+            env_shebang_target_interpreter(
+                Path::new("/usr/bin/env"),
+                &[
+                    "-S".to_string(),
+                    "FOO=bar".to_string(),
+                    "/bin/bash".to_string(),
+                    "-u".to_string(),
+                ],
+            ),
+            Some(PathBuf::from("/bin/bash")),
+        );
+    }
 
     fn test_binary(path: &str) -> ResolvedCommandBinary {
         ResolvedCommandBinary {

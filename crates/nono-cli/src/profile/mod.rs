@@ -2108,9 +2108,9 @@ pub struct Profile {
     /// ALIAS(canonical="env_credentials", introduced="v0.0.0", remove_by="indefinite", issue="#143")
     #[serde(default, alias = "secrets")]
     pub env_credentials: SecretsConfig,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub environment: Option<EnvironmentConfig>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command_policies: Option<CommandPoliciesConfig>,
     #[serde(default)]
     pub credential_capture: HashMap<String, CredentialCaptureEntry>,
@@ -2134,22 +2134,22 @@ pub struct Profile {
     /// When `None` (absent from JSON), inherits from the base profile.
     /// When `Some`, replaces the base profile's config entirely, allowing
     /// derived profiles to narrow permissions.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub open_urls: Option<OpenUrlConfig>,
     /// Opt-in gate for temporary direct LaunchServices opens on macOS.
     /// Must be paired with the CLI flag `--allow-launch-services`.
     /// When `None`, inherits from the base profile.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allow_launch_services: Option<bool>,
     /// Opt-in gate for GPU access (Metal/IOKit on macOS, render nodes on Linux).
     /// Must be paired with the CLI flag `--allow-gpu`.
     /// When `None`, inherits from the base profile.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allow_gpu: Option<bool>,
     /// Opt-in to allow parent-of-protected-root grants on macOS.
     /// When `true` (and on macOS), `--allow ~` is permitted because Seatbelt deny
     /// rules protect `~/.nono`. Ignored on Linux. Default is `false`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allow_parent_of_protected: Option<bool>,
     /// Deprecated: Parsed for backward compatibility but ignored.
     /// Supervised mode preserves TTY by default, making this unnecessary.
@@ -2166,7 +2166,7 @@ pub struct Profile {
     /// Binary path or command name to run when no trailing `-- <command>` is given.
     /// Resolved via `PATH` lookup or canonicalized if absolute. Only honoured
     /// for user-authored profiles (ignored for pack and built-in profiles).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binary: Option<String>,
     /// Extra arguments appended to the child command at launch.
     /// Supports variable expansion (e.g. `$NONO_PACKAGES`).
@@ -7322,6 +7322,46 @@ mod tests {
             err.to_string().contains("command_policies cannot be null"),
             "error should describe null rejection: {err}"
         );
+    }
+
+    /// Regression for https://github.com/nolabs-ai/nono/issues/1400.
+    ///
+    /// The post-run save flow serializes a resolved `Profile` and writes it
+    /// to disk. Inheritable `Option` fields whose `None` means "inherit from
+    /// base" must be OMITTED from the output, not serialized as `null`.
+    /// `command_policies` additionally rejects an explicit `null` on read
+    /// (see `test_command_policies_null_rejected`), so serializing `None` as
+    /// `null` produced a file that could never be reloaded — the user-visible
+    /// "saving throws an error, yet the profile is updated on disk" symptom.
+    #[test]
+    fn test_inheritable_options_omitted_when_none_and_round_trip() {
+        // A default Profile has every inheritable Option set to None.
+        let profile = Profile::default();
+
+        let json = serde_json::to_string(&profile).expect("serialize");
+
+        // None of these keys may appear in the serialized form; emitting any
+        // of them as `null` either breaks reload (command_policies) or
+        // wrongly clears an inherited value (the rest).
+        for key in [
+            "\"environment\"",
+            "\"command_policies\"",
+            "\"open_urls\"",
+            "\"allow_launch_services\"",
+            "\"allow_gpu\"",
+            "\"allow_parent_of_protected\"",
+            "\"binary\"",
+        ] {
+            assert!(
+                !json.contains(key),
+                "serialized Profile should omit {key} when None, got: {json}"
+            );
+        }
+
+        // The whole point: the saved file must reload successfully.
+        let reparsed: Profile = serde_json::from_str(&json).expect("saved profile must round-trip");
+        assert_eq!(reparsed.command_policies, None);
+        assert_eq!(reparsed.open_urls, None);
     }
 
     #[test]

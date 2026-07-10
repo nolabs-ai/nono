@@ -428,7 +428,7 @@ impl ProxyHandle {
     /// presented during interception.
     #[must_use]
     pub fn env_vars(&self) -> Vec<(String, String)> {
-        let proxy_url = format!("http://nono:{}@127.0.0.1:{}", &*self.token, self.port);
+        let proxy_url = format!("http://nono:{}@127.0.0.1:{}", *self.token, self.port);
 
         // Build NO_PROXY: always include loopback, plus non-credential
         // allowed hosts. Credential upstreams are excluded so their traffic

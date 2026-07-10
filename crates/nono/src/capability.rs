@@ -3511,11 +3511,13 @@ mod tests {
 
         let limits = ResourceLimits {
             memory_bytes: Some(512 * 1024 * 1024),
+            max_processes: Some(64),
         };
         let caps = caps.with_resource_limits(limits);
         let got = caps.resource_limits().expect("limits attached");
         assert_eq!(*got, limits);
         assert_eq!(got.memory_bytes, Some(512 * 1024 * 1024));
+        assert_eq!(got.max_processes, Some(64));
     }
 
     #[test]
@@ -3527,13 +3529,19 @@ mod tests {
         let caps = CapabilitySet::new()
             .with_resource_limits(ResourceLimits {
                 memory_bytes: Some(1024),
+                max_processes: None,
             })
             .with_resource_limits(ResourceLimits {
                 memory_bytes: Some(2048),
+                max_processes: Some(16),
             });
         assert_eq!(
             caps.resource_limits().and_then(|l| l.memory_bytes),
             Some(2048)
+        );
+        assert_eq!(
+            caps.resource_limits().and_then(|l| l.max_processes),
+            Some(16)
         );
     }
 }

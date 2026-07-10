@@ -1,9 +1,9 @@
 ---
 title: Resource Limits
-description: Cap a sandboxed process tree's memory with OS-enforced cgroup limits
+description: Cap a sandboxed process tree's memory and process count with OS-enforced cgroup limits
 ---
 
-`nono` can place a hard ceiling on how much memory a sandboxed command — and every process it spawns — may use. If the tree goes over, the Linux kernel kills it instantly, and only it, so a runaway agent cannot exhaust the host.
+`nono` can place hard ceilings on how much a sandboxed command — and every process it spawns — may consume: a **memory** cap and a **process-count** cap. Both are enforced by the Linux kernel, and both cover the whole process tree, so a runaway agent cannot exhaust the host.
 
 ## Limiting memory
 
@@ -25,9 +25,25 @@ Sizes take an optional, case-insensitive unit suffix:
 
 So `512M` is 536,870,912 bytes and `1Gi` is 1,073,741,824 bytes. The ceiling covers the whole process tree, not just the first process.
 
+## Limiting the process count
+
+Pass `--max-processes` to cap how many processes and threads the sandbox may have alive at once:
+
+```bash
+nono run --max-processes 64 -- my-agent
+```
+
+The value is a plain count (minimum `1`). It counts **tasks** — every process *and* every thread in the tree — so pick a value with headroom for the threads your workload legitimately uses. This is what bounds fork bombs and runaway spawning.
+
+The two flags are independent and can be combined:
+
+```bash
+nono run --memory 512M --max-processes 64 -- my-agent
+```
+
 ## What happens at the limit
 
-When the tree crosses the cap, the kernel terminates the entire sandbox at once and `nono` explains why instead of dying silently:
+**Memory.** When the tree crosses the memory cap, the kernel terminates the entire sandbox at once and `nono` explains why instead of dying silently:
 
 ```
 [nono] memory limit exceeded: the sandboxed process tree was killed by the kernel for using too much memory.
@@ -40,55 +56,67 @@ When the tree crosses the cap, the kernel terminates the entire sandbox at once 
 
 The run exits `137` (128 + `SIGKILL`). A failure unrelated to memory shows the normal diagnostics, not this one.
 
+**Process count.** Hitting the process cap is different: the kernel **kills nothing**. It simply refuses the next `fork`/`clone` with `EAGAIN`, which the program usually surfaces as "resource temporarily unavailable" or "cannot fork". The exit code is whatever the program itself returns. `nono` detects that the cap was hit and adds an explanation regardless of exit code:
+
+```
+[nono] process limit reached: the sandbox hit its process cap; the kernel refused new processes (fork failed) — it was not killed.
+       limit (--max-processes): 64
+       peak processes:          64
+       denied forks:            3
+       hint: raise the ceiling to allow more processes, e.g. --max-processes 256.
+```
+
 ## How it works
 
-On Linux the limit is enforced with **cgroup v2**, the same kernel mechanism containers use. For each run `nono`:
+On Linux the limits are enforced with **cgroup v2**, the same kernel mechanism containers use. For each run `nono`:
 
 - creates a leaf control group under your delegated user session (`.../user@<uid>.service/nono.<pid>`),
-- sets `memory.max` to the cap, `memory.swap.max=0` (so the limit cannot be dodged via swap), and `memory.oom.group=1` (so the whole tree is killed together), and
+- sets the requested knobs:
+  - `memory.max` to the memory cap, plus `memory.swap.max=0` (so the limit cannot be dodged via swap) and `memory.oom.group=1` (so the whole tree is killed together),
+  - `pids.max` to the process cap,
 - has the sandboxed child place *itself* into the group before it can fork or exec, so every descendant is contained by construction.
 
 The group is removed when the run ends. A leftover group from a supervisor that was hard-killed (`SIGKILL`) is swept on the next run.
 
 ## Requirements and scope
 
-- **Linux only.** Enforcement needs cgroup v2 and a systemd `Delegate=yes` user session (a normal desktop or server login). On other platforms a `--memory` request is refused rather than silently ignored.
-- **Supervised runs only.** `nono run` and `nono shell` enforce it. `nono wrap` execs directly and cannot create the cgroup, so it does not accept `--memory`.
-- **Memory only.** There is currently no CPU-time or process-count limit.
+- **Linux only.** Enforcement needs cgroup v2 and a systemd `Delegate=yes` user session (a normal desktop or server login). On other platforms a limit request is refused rather than silently ignored.
+- **Delegated controllers.** The relevant controller must be delegated to your user session's cgroup subtree: `memory` for `--memory`, `pids` for `--max-processes`. If it is not, `nono` refuses the run rather than enforce a limit that would silently not apply. Check with `cat /sys/fs/cgroup/<...>/cgroup.subtree_control`.
+- **Supervised runs only.** `nono run` and `nono shell` enforce limits. `nono wrap` execs directly and cannot create the cgroup, so it does not accept the resource flags.
 - **Fail closed.** If the cgroup cannot be created or armed, the run is refused — `nono` never runs a requested limit unenforced.
 
 ## Manifests
 
-A capability manifest can carry the limit. It requires the supervised execution strategy:
+A capability manifest can carry either or both limits. They require the supervised execution strategy:
 
 ```json
 {
   "version": "0.1.0",
   "process": { "exec_strategy": "supervised" },
-  "resources": { "memory_bytes": 536870912 }
+  "resources": { "memory_bytes": 536870912, "max_processes": 64 }
 }
 ```
 
-`resources.memory_bytes` is a plain byte count — human-friendly sizes like `512M` are a CLI convenience, resolved before they reach the manifest.
+`resources.memory_bytes` is a plain byte count and `resources.max_processes` a plain task count — human-friendly sizes like `512M` are a CLI convenience, resolved before they reach the manifest. Both have a schema minimum of `1`.
 
 ## Do not grant write over the cgroup tree
 
-The limit lives in control files under `/sys/fs/cgroup`. If the sandbox is *also* granted **write** access overlapping that path (for example `--allow /sys`), the process could rewrite its own limit and escape the cap. `nono` refuses such a run while `--memory` is active:
+The limits live in control files under `/sys/fs/cgroup`. If the sandbox is *also* granted **write** access overlapping that path (for example `--allow /sys`), the process could rewrite its own limit (`memory.max` / `pids.max`) and escape the cap. `nono` refuses such a run while any resource limit is active:
 
 ```
-refusing write access to '/sys' while a --memory limit is enforced: it overlaps
-the cgroup hierarchy (/sys/fs/cgroup) that enforces the limit ...
+refusing write access to '/sys' while a resource limit (--memory / --max-processes) is
+enforced: it overlaps the cgroup hierarchy (/sys/fs/cgroup) that enforces the limit ...
 ```
 
-Grant `/sys` read-only (`--read /sys`) if a workload needs it — read access cannot defeat the cap.
+Grant `/sys` read-only (`--read /sys`) if a workload needs it — read access cannot defeat a cap.
 
 ## Inspecting the limit
 
-The active limit appears in the capability summary at launch, and in `nono why --self` from inside the sandbox:
+The active limits appear in the capability summary at launch, and in `nono why --self` from inside the sandbox:
 
 ```bash
 nono why --self
 #   Capabilities:
-#   resources memory=512.0 MiB
+#   resources memory=512.0 MiB, processes=64
 #   ...
 ```

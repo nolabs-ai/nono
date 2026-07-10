@@ -215,6 +215,7 @@ mod tests {
 
         let caps = CapabilitySet::new().with_resource_limits(ResourceLimits {
             memory_bytes: Some(512 * 1024 * 1024),
+            max_processes: None,
         });
         let state = SandboxState::from_caps(&caps);
         assert_eq!(
@@ -267,6 +268,7 @@ mod tests {
             .block_network()
             .with_resource_limits(ResourceLimits {
                 memory_bytes: Some(256 * 1024 * 1024),
+                max_processes: None,
             });
         let state = SandboxState::from_caps(&caps);
 

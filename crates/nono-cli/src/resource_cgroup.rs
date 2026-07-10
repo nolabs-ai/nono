@@ -1,10 +1,11 @@
-//! Linux cgroup v2 memory enforcement.
+//! Linux cgroup v2 resource enforcement (memory + process count).
 //!
-//! A `--memory` limit runs the program in a *cgroup leaf*: a directory under
-//! `/sys/fs/cgroup` whose limits are set by writing to files ("knobs"). If the
-//! program and its children exceed the limit, the kernel kills them all — and only
-//! them. The supervisor builds the leaf before forking; the child moves itself in;
-//! the leaf is deleted when the run ends.
+//! A `--memory` or `--max-processes` limit runs the program in a *cgroup leaf*: a
+//! directory under `/sys/fs/cgroup` whose limits are set by writing to files
+//! ("knobs"). If the program and its children exceed the memory limit, the kernel
+//! kills them all — and only them; if they hit the process-count limit, the kernel
+//! refuses the next fork instead. The supervisor builds the leaf before forking;
+//! the child moves itself in; the leaf is deleted when the run ends.
 //!
 //! # Why the child moves itself in
 //!
@@ -25,6 +26,8 @@
 //! - `memory.max`         — the hard limit; over it, the kernel OOM-kills.
 //! - `memory.swap.max=0`  — no swap (else a program could swap around the limit).
 //! - `memory.oom.group=1` — kill the whole leaf together, not one process.
+//! - `pids.max`           — max tasks (processes + threads); over it, `fork`/`clone`
+//!   fails with `EAGAIN`. Nothing is killed.
 //!
 //! `memory.high` is left unset on purpose: with swap off, a program over the limit
 //! would stall instead of being killed quickly.
@@ -75,6 +78,25 @@ pub struct OomReport {
     /// Peak memory reached (`memory.peak`) in bytes, if the kernel reports it
     /// (Linux 5.19+).
     pub peak_bytes: Option<u64>,
+}
+
+/// Proof the kernel refused a `fork`/`clone` in this leaf because it hit the
+/// process-count cap (`pids.events`'s `max` counter), plus the limit and peak, so a
+/// fork failure the program surfaced can be explained as "you hit the process cap".
+///
+/// Distinct from [`OomReport`]: a pids breach kills nothing and produces no fixed
+/// exit code — the offending `fork` just returns `EAGAIN` — so this is read on
+/// every exit, not only on a SIGKILL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PidsReport {
+    /// How many times a `fork`/`clone` was denied here for hitting the limit
+    /// (`pids.events`'s `max`). Non-zero is the whole reason to report.
+    pub max_events: u64,
+    /// The limit (`pids.max`) read back, if still a finite number (the literal
+    /// `max`, i.e. unlimited, reads as `None`).
+    pub limit: Option<u64>,
+    /// Peak task count reached (`pids.peak`) if the kernel reports it (Linux 6.1+).
+    pub peak: Option<u64>,
 }
 
 impl CgroupLeaf {
@@ -172,10 +194,51 @@ impl CgroupLeaf {
             peak_bytes: gauge("memory.peak"),
         })
     }
+
+    /// Read process-cap evidence from `pids.events` — call after the child exits,
+    /// before teardown. `Some` only if the kernel actually denied a `fork`/`clone`
+    /// here for hitting `pids.max` (`max` counter > 0), so a clean run says nothing.
+    ///
+    /// Never fails: an unreadable file yields `None`.
+    #[must_use]
+    pub fn pids_report(&self) -> Option<PidsReport> {
+        // The IO half: read the three knobs. pids.events is required (its `max`
+        // counter is the whole signal); pids.max / pids.peak are optional. The pure
+        // parsing/gating half lives in `parse_pids_report`, so it can be unit-tested
+        // without a live cgroup — mirroring delegated_base / parse_delegated_base.
+        let events = fs::read_to_string(self.path.join("pids.events")).ok()?;
+        let max = fs::read_to_string(self.path.join("pids.max")).ok();
+        let peak = fs::read_to_string(self.path.join("pids.peak")).ok();
+        parse_pids_report(&events, max.as_deref(), peak.as_deref())
+    }
 }
 
-/// Read one `key value` counter (e.g. `oom_kill`) from `memory.events`. A missing
-/// or non-numeric key reads as 0.
+/// Pure parser/gate behind [`CgroupLeaf::pids_report`], split out so it can be
+/// tested without a live cgroup (mirrors [`parse_delegated_base`]). `events` is the
+/// raw `pids.events` table; `max` / `peak` are the raw `pids.max` / `pids.peak`
+/// contents, or `None` if that file couldn't be read. Returns `None` unless the
+/// kernel actually denied a `fork`/`clone` here (`max` counter > 0), so a clean run
+/// says nothing. `pids.max`'s literal `max` (unlimited) and an absent or unreadable
+/// `pids.peak` each read as `None` without suppressing the report.
+fn parse_pids_report(events: &str, max: Option<&str>, peak: Option<&str>) -> Option<PidsReport> {
+    let max_events = event_counter(events, "max");
+    // No denied fork here: the cap wasn't hit, so say nothing.
+    if max_events == 0 {
+        return None;
+    }
+    // pids.max is a plain integer, or the literal "max" for unlimited — parse only
+    // the finite case, leaving unlimited (or an unreadable knob) as None.
+    let limit = max.and_then(|s| s.trim().parse::<u64>().ok());
+    let peak = peak.and_then(|s| s.trim().parse::<u64>().ok());
+    Some(PidsReport {
+        max_events,
+        limit,
+        peak,
+    })
+}
+
+/// Read one `key value` counter from a cgroup events table (`memory.events`'s
+/// `oom_kill`, `pids.events`'s `max`). A missing or non-numeric key reads as 0.
 fn event_counter(events: &str, key: &str) -> u64 {
     events
         .lines()
@@ -229,7 +292,7 @@ pub fn child_self_attach(procs_fd: RawFd) -> bool {
     written == encoded.len() as isize
 }
 
-/// Write the requested memory limits into the leaf at `path`.
+/// Write the requested limits into the leaf at `path`.
 fn write_knobs(path: &Path, limits: &ResourceLimits) -> Result<()> {
     if let Some(max) = limits.memory_bytes {
         // Turn off swap before setting the limit, so the program can't use swap to
@@ -241,6 +304,12 @@ fn write_knobs(path: &Path, limits: &ResourceLimits) -> Result<()> {
         write_knob(path, "memory.oom.group", "1")?;
         // We leave memory.high unset on purpose (see the module docs): with swap
         // off it would make a runaway program stall instead of dying quickly.
+    }
+    if let Some(max) = limits.max_processes {
+        // pids.max caps the number of tasks (processes AND threads) in the leaf.
+        // Unlike memory, hitting it kills nothing: the kernel fails the next
+        // fork/clone with EAGAIN, which bounds fork bombs and runaway spawning.
+        write_knob(path, "pids.max", &max.to_string())?;
     }
     Ok(())
 }
@@ -370,9 +439,9 @@ fn parse_delegated_base(proc_self_cgroup: &str, uid: u32) -> Result<PathBuf> {
     )))
 }
 
-/// Check the memory controller is enabled for child cgroups. A cgroup only has a
-/// controller's files (e.g. `memory.max`) if it's listed in the parent's
-/// `cgroup.subtree_control`; otherwise the limit would silently not apply.
+/// Check each requested controller is enabled for child cgroups. A cgroup only has
+/// a controller's files (e.g. `memory.max`, `pids.max`) if it's listed in the
+/// parent's `cgroup.subtree_control`; otherwise the limit would silently not apply.
 fn ensure_controllers_delegated(base: &Path, limits: &ResourceLimits) -> Result<()> {
     let subtree_path = base.join("cgroup.subtree_control");
     let subtree = fs::read_to_string(&subtree_path)
@@ -383,6 +452,14 @@ fn ensure_controllers_delegated(base: &Path, limits: &ResourceLimits) -> Result<
         return Err(resource_err(format!(
             "the 'memory' controller is not delegated to {} \
              (cgroup.subtree_control = '{}'); cannot enforce --memory",
+            base.display(),
+            subtree.trim()
+        )));
+    }
+    if limits.max_processes.is_some() && !controller_enabled("pids") {
+        return Err(resource_err(format!(
+            "the 'pids' controller is not delegated to {} \
+             (cgroup.subtree_control = '{}'); cannot enforce --max-processes",
             base.display(),
             subtree.trim()
         )));
@@ -603,20 +680,230 @@ mod tests {
         );
     }
 
+    /// `pids_report`'s pure half: it reports only when the kernel actually denied a
+    /// fork (`max` counter > 0), and it tolerates the optional knobs — `pids.max`'s
+    /// literal `max` (unlimited) or an unreadable knob, and an absent `pids.peak`,
+    /// each read as `None` without suppressing an otherwise-valid report.
+    #[test]
+    fn parse_pids_report_gates_on_max_counter_and_parses_optional_knobs() {
+        use super::parse_pids_report;
+
+        // No denial recorded (max 0): nothing to report, whatever the other knobs say.
+        assert_eq!(
+            parse_pids_report("max 0\n", Some("5\n"), Some("5\n")),
+            None,
+            "a clean run (max counter 0) must produce no report"
+        );
+        // A pids.events table with no `max` line reads as 0 -> None.
+        assert_eq!(parse_pids_report("", Some("5\n"), None), None);
+
+        // A denial with both optional knobs present and finite: full report.
+        let report = parse_pids_report("max 3\n", Some("5\n"), Some("5\n"))
+            .expect("max>0 must produce a report");
+        assert_eq!(report.max_events, 3);
+        assert_eq!(report.limit, Some(5));
+        assert_eq!(report.peak, Some(5));
+
+        // pids.max == "max" (unlimited) parses to None, but the report still stands on
+        // the non-zero counter; an absent pids.peak (older kernel) is also None.
+        let report = parse_pids_report("max 1\n", Some("max\n"), None)
+            .expect("a denial with unlimited pids.max still reports");
+        assert_eq!(report.max_events, 1);
+        assert_eq!(report.limit, None, "literal \"max\" is unlimited -> None");
+        assert_eq!(report.peak, None, "absent pids.peak -> None");
+
+        // An unreadable pids.max (None) also yields limit None without dropping the
+        // report; an unrelated readable peak is still parsed.
+        let report = parse_pids_report("max 2\n", None, Some("9\n"))
+            .expect("an unreadable pids.max must not suppress the report");
+        assert_eq!(report.limit, None);
+        assert_eq!(report.peak, Some(9));
+    }
+
+    /// SECURITY / fail-closed: a limit whose controller is NOT delegated to the
+    /// session must be refused, never silently unenforced. The controller name is
+    /// matched whole-word (`split_whitespace` + `==`), so a superstring like
+    /// `pidsfoo` / `memoryfoo` must NOT satisfy the requirement.
+    #[test]
+    fn ensure_controllers_delegated_fails_closed_on_missing_or_lookalike_controller() {
+        use super::ensure_controllers_delegated;
+        use nono::ResourceLimits;
+        use tempfile::tempdir;
+
+        let base = tempdir().expect("tempdir");
+        let write_subtree = |contents: &str| {
+            std::fs::write(base.path().join("cgroup.subtree_control"), contents)
+                .expect("write cgroup.subtree_control");
+        };
+        let mem_only = ResourceLimits {
+            memory_bytes: Some(1 << 20),
+            max_processes: None,
+        };
+        let pids_only = ResourceLimits {
+            memory_bytes: None,
+            max_processes: Some(64),
+        };
+        let both = ResourceLimits {
+            memory_bytes: Some(1 << 20),
+            max_processes: Some(64),
+        };
+
+        // Both controllers delegated: every combination is allowed.
+        write_subtree("cpu io memory pids");
+        assert!(ensure_controllers_delegated(base.path(), &mem_only).is_ok());
+        assert!(ensure_controllers_delegated(base.path(), &pids_only).is_ok());
+        assert!(ensure_controllers_delegated(base.path(), &both).is_ok());
+
+        // pids missing: a process limit is refused, and the error names the knob/flag.
+        write_subtree("cpu io memory");
+        let err = ensure_controllers_delegated(base.path(), &pids_only)
+            .expect_err("a pids limit without a delegated pids controller must fail closed");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("pids"),
+            "error must name the controller: {msg}"
+        );
+        assert!(
+            msg.contains("--max-processes"),
+            "error must name the flag: {msg}"
+        );
+        // ...but a memory-only limit is fine when only memory is delegated.
+        assert!(ensure_controllers_delegated(base.path(), &mem_only).is_ok());
+
+        // memory missing: a memory limit is refused and the error names --memory.
+        write_subtree("cpu io pids");
+        let err = ensure_controllers_delegated(base.path(), &mem_only)
+            .expect_err("a memory limit without a delegated memory controller must fail closed");
+        assert!(err.to_string().contains("--memory"));
+
+        // Superstrings must NOT count as the controller (whole-word match, not substring).
+        write_subtree("memoryfoo pidsbar");
+        assert!(
+            ensure_controllers_delegated(base.path(), &pids_only).is_err(),
+            "'pidsbar' must not satisfy the 'pids' controller requirement"
+        );
+        assert!(
+            ensure_controllers_delegated(base.path(), &mem_only).is_err(),
+            "'memoryfoo' must not satisfy the 'memory' controller requirement"
+        );
+
+        // An empty limit set requests no controller, so it passes even with none listed.
+        write_subtree("");
+        assert!(ensure_controllers_delegated(base.path(), &ResourceLimits::default()).is_ok());
+    }
+
+    /// Fail-closed when `cgroup.subtree_control` can't be read at all (the base isn't
+    /// really a delegated cgroup): a set limit must surface an error, not slip through
+    /// unenforced.
+    #[test]
+    fn ensure_controllers_delegated_errors_when_subtree_control_is_unreadable() {
+        use super::ensure_controllers_delegated;
+        use nono::ResourceLimits;
+        use tempfile::tempdir;
+
+        // Empty temp dir: no cgroup.subtree_control file inside.
+        let base = tempdir().expect("tempdir");
+        let pids_only = ResourceLimits {
+            memory_bytes: None,
+            max_processes: Some(8),
+        };
+        assert!(
+            ensure_controllers_delegated(base.path(), &pids_only).is_err(),
+            "an unreadable cgroup.subtree_control must fail closed when a limit is set"
+        );
+    }
+
+    /// write_knobs writes only the knobs for the limits that are actually set: a
+    /// memory cap writes the memory trio (swap off, max, oom.group) and no pids.max;
+    /// a process cap writes only pids.max; both write all four. Exercised on a temp
+    /// dir (plain files) so it needs no real cgroup, pinning the knob SELECTION that
+    /// the live tests only cover for the both-set case.
+    #[test]
+    fn write_knobs_writes_only_the_set_controllers_knobs() {
+        use super::write_knobs;
+        use nono::ResourceLimits;
+        use tempfile::tempdir;
+
+        let knob = |dir: &std::path::Path, name: &str| std::fs::read_to_string(dir.join(name));
+
+        // Memory only: the three memory knobs, and NO pids.max.
+        let d = tempdir().expect("tempdir");
+        write_knobs(
+            d.path(),
+            &ResourceLimits {
+                memory_bytes: Some(64 * 1024 * 1024),
+                max_processes: None,
+            },
+        )
+        .expect("write memory knobs");
+        assert_eq!(
+            knob(d.path(), "memory.max").expect("memory.max").trim(),
+            (64u64 * 1024 * 1024).to_string()
+        );
+        assert_eq!(knob(d.path(), "memory.swap.max").expect("swap").trim(), "0");
+        assert_eq!(knob(d.path(), "memory.oom.group").expect("oom").trim(), "1");
+        assert!(
+            knob(d.path(), "pids.max").is_err(),
+            "a memory-only limit must not write pids.max"
+        );
+
+        // Process only: just pids.max, and NONE of the memory knobs.
+        let d = tempdir().expect("tempdir");
+        write_knobs(
+            d.path(),
+            &ResourceLimits {
+                memory_bytes: None,
+                max_processes: Some(32),
+            },
+        )
+        .expect("write pids knob");
+        assert_eq!(knob(d.path(), "pids.max").expect("pids.max").trim(), "32");
+        assert!(
+            knob(d.path(), "memory.max").is_err()
+                && knob(d.path(), "memory.swap.max").is_err()
+                && knob(d.path(), "memory.oom.group").is_err(),
+            "a process-only limit must not write any memory knob"
+        );
+
+        // Both: all four knobs present with their values.
+        let d = tempdir().expect("tempdir");
+        write_knobs(
+            d.path(),
+            &ResourceLimits {
+                memory_bytes: Some(128 * 1024 * 1024),
+                max_processes: Some(16),
+            },
+        )
+        .expect("write both");
+        assert_eq!(
+            knob(d.path(), "memory.max").expect("memory.max").trim(),
+            (128u64 * 1024 * 1024).to_string()
+        );
+        assert_eq!(knob(d.path(), "memory.swap.max").expect("swap").trim(), "0");
+        assert_eq!(knob(d.path(), "memory.oom.group").expect("oom").trim(), "1");
+        assert_eq!(knob(d.path(), "pids.max").expect("pids.max").trim(), "16");
+    }
+
     // ---- Live cgroup v2 enforcement tests ----
     //
     // #[ignore]-gated (not run in CI): they create real leaves under
     // /sys/fs/cgroup, run a small program that deliberately overruns the limit, and
-    // read kernel files. The host must be a systemd `Delegate=yes` user session
-    // with the `memory` controller delegated to `user@<uid>.service`. Each creates
-    // a `nono.<pid>` leaf for this test process, so run them SERIALLY — in parallel
-    // they collide on the name:
+    // read kernel files. The host must be a systemd `Delegate=yes` user session with
+    // the `memory` controller (and, for the pids tests, `pids`) delegated to
+    // `user@<uid>.service`:
     //
-    //   cargo test -p nono-cli --bins -- --ignored --test-threads=1
+    //   cargo test -p nono-cli --bins -- --ignored
     //
-    // or one at a time, e.g.:
-    //
-    //   cargo test -p nono-cli --bins -- --ignored live_child_over_memory_cap
+    // Each creates a `nono.<pid>` leaf named for THIS one test process, so run in
+    // parallel they would collide on the name; LIVE_LOCK below serializes them so the
+    // command above works as-is (no `--test-threads=1` needed).
+
+    /// Serializes the live tests: each creates a `nono.<pid>` leaf for the single
+    /// shared test process, so on multiple threads they collide on the leaf name —
+    /// the exact failure a bare `cargo test -- --ignored` hits. Every live test holds
+    /// this for its whole body so they run one at a time. Poison-tolerant on purpose:
+    /// a live test that panics must not wedge the rest behind a poisoned lock.
+    static LIVE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// LIVE: end-to-end enforcement. A forked child that self-attaches then
     /// allocates past the cap is OOM-killed (SIGKILL); the leaf records
@@ -625,6 +912,9 @@ mod tests {
     #[test]
     #[ignore = "requires live cgroup v2 delegation (memory controller); run with --ignored"]
     fn live_child_over_memory_cap_is_oom_killed_and_only_it() {
+        let _live = LIVE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         use super::CgroupLeaf;
         use super::child_self_attach;
         use nix::libc;
@@ -639,6 +929,7 @@ mod tests {
 
         let limits = ResourceLimits {
             memory_bytes: Some(CAP),
+            max_processes: None,
         };
         // Real pre-fork construction: creates the leaf dir, writes
         // memory.swap.max=0 / memory.max=CAP / memory.oom.group=1, opens
@@ -750,12 +1041,16 @@ mod tests {
     #[test]
     #[ignore = "requires live cgroup v2 delegation (memory controller); run with --ignored"]
     fn live_teardown_removes_leaf_and_create_leaves_no_leak() {
+        let _live = LIVE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         use super::CgroupLeaf;
         use super::delegated_base;
         use nono::ResourceLimits;
 
         let limits = ResourceLimits {
             memory_bytes: Some(64 * 1024 * 1024),
+            max_processes: None,
         };
         let base = delegated_base().expect("delegated base on delegated host");
 
@@ -799,6 +1094,9 @@ mod tests {
     #[test]
     #[ignore = "requires live cgroup v2 delegation (memory controller); run with --ignored"]
     fn live_create_sweeps_stale_leaf_of_dead_supervisor() {
+        let _live = LIVE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         use super::CgroupLeaf;
         use super::delegated_base;
         use nono::ResourceLimits;
@@ -812,6 +1110,7 @@ mod tests {
         // Creating our real leaf sweeps stale siblings first.
         let leaf = CgroupLeaf::create(&ResourceLimits {
             memory_bytes: Some(64 * 1024 * 1024),
+            max_processes: None,
         })
         .expect("create leaf");
         assert!(
@@ -828,12 +1127,16 @@ mod tests {
     #[test]
     #[ignore = "requires live cgroup v2 delegation (memory controller); run with --ignored"]
     fn live_create_failure_leaves_no_partial_leaf() {
+        let _live = LIVE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         use super::CgroupLeaf;
         use super::{delegated_base, teardown};
         use nono::ResourceLimits;
 
         let limits = ResourceLimits {
             memory_bytes: Some(64 * 1024 * 1024),
+            max_processes: None,
         };
         let base = delegated_base().expect("delegated base");
         // Plant a directory with our exact future leaf name so create()'s
@@ -863,6 +1166,9 @@ mod tests {
     #[test]
     #[ignore = "requires live cgroup v2 delegation (memory controller); run with --ignored"]
     fn live_child_self_attach_lands_pid_in_leaf_procs() {
+        let _live = LIVE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         use super::CgroupLeaf;
         use super::child_self_attach;
         use nix::libc;
@@ -872,6 +1178,7 @@ mod tests {
 
         let limits = ResourceLimits {
             memory_bytes: Some(64 * 1024 * 1024),
+            max_processes: None,
         };
         let leaf = CgroupLeaf::create(&limits).expect("create leaf");
         let procs_fd = leaf.procs_raw_fd();
@@ -907,5 +1214,160 @@ mod tests {
         }
         drop(leaf);
         assert!(!leaf_path.exists(), "leaf removed after teardown");
+    }
+
+    /// LIVE: end-to-end process-cap enforcement. A forked child that self-attaches
+    /// then tries to out-spawn its `pids.max` has the offending `fork` denied
+    /// (EAGAIN) — nothing is killed; the leaf records `pids.events`'s `max`>=1;
+    /// `pids_report()` surfaces it echoing the cap; the parent survives; teardown
+    /// removes the leaf. The pids limiter's core property, on a real cgroupfs.
+    #[test]
+    #[ignore = "requires live cgroup v2 delegation (pids controller); run with --ignored"]
+    fn live_child_over_pids_cap_is_denied_forks_and_report_surfaces_it() {
+        let _live = LIVE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        use super::CgroupLeaf;
+        use super::child_self_attach;
+        use nix::libc;
+        use nix::sys::wait::{WaitStatus, waitpid};
+        use nix::unistd::{ForkResult, fork};
+        use nono::ResourceLimits;
+
+        const CAP: u64 = 3; // the leaf may hold at most 3 tasks (self + 2 more)
+
+        let limits = ResourceLimits {
+            memory_bytes: None,
+            max_processes: Some(CAP),
+        };
+        // Real pre-fork construction: creates the leaf dir, checks the pids
+        // controller is delegated, writes pids.max=CAP, opens cgroup.procs.
+        let leaf = CgroupLeaf::create(&limits)
+            .expect("create leaf on delegated host (pids controller delegated)");
+        let procs_fd = leaf.procs_raw_fd();
+        let leaf_path = leaf.path.clone();
+
+        // SAFETY: single-purpose forked child; after fork it uses only
+        // async-signal-safe libc calls (fork, usleep, write, _exit) — no Rust heap
+        // alloc, no locks.
+        match unsafe { fork() }.expect("fork") {
+            ForkResult::Child => {
+                // Self-attach FIRST so the whole tree below is capped by pids.max.
+                if !child_self_attach(procs_fd) {
+                    unsafe { libc::_exit(126) };
+                }
+                // The leaf now holds this one task. Spawn grandchildren that PARK
+                // (so they keep occupying pids slots) until a fork is refused. With
+                // CAP=3 two grandchildren succeed (self + 2 == CAP) and the third
+                // fork must fail with EAGAIN.
+                let mut saw_eagain = false;
+                for _ in 0..CAP + 2 {
+                    let pid = unsafe { libc::fork() };
+                    if pid == 0 {
+                        // Grandchild: park, then exit. Async-signal-safe only.
+                        unsafe { libc::usleep(500_000) };
+                        unsafe { libc::_exit(0) };
+                    } else if pid < 0 {
+                        // fork denied — the cap held. errno should be EAGAIN.
+                        saw_eagain = true;
+                        break;
+                    }
+                    // Our child does NOT wait, so grandchildren stay alive and keep
+                    // holding slots while we probe the next fork.
+                }
+                // Exit 0 iff we actually observed the cap deny a fork.
+                unsafe { libc::_exit(i32::from(!saw_eagain)) };
+            }
+            ForkResult::Parent { child } => {
+                let status = waitpid(child, None).expect("waitpid");
+                // The child must exit 0: it saw a fork denied by the cap. A non-zero
+                // exit means every fork succeeded — the cap did NOT enforce.
+                match status {
+                    WaitStatus::Exited(_, 0) => {}
+                    other => panic!(
+                        "expected child to observe EAGAIN and exit 0, got {other:?}; \
+                         pids cap did not enforce"
+                    ),
+                }
+
+                // Kernel-side evidence: the leaf recorded at least one denied fork.
+                let events = std::fs::read_to_string(leaf_path.join("pids.events"))
+                    .expect("read pids.events");
+                let max_events = events
+                    .lines()
+                    .find_map(|l| l.strip_prefix("max "))
+                    .and_then(|n| n.trim().parse::<u64>().ok())
+                    .expect("pids.events has a max line");
+                assert!(
+                    max_events >= 1,
+                    "expected pids.events max>=1, got {max_events} (full: {events:?})"
+                );
+                // Reaching here proves the parent survived: a pids breach kills
+                // nothing, unlike the memory OOM path.
+            }
+        }
+
+        // The supervisor reads the same evidence via pids_report() to drive the
+        // user-facing diagnostic: it must report the denial and echo the cap.
+        let report = leaf
+            .pids_report()
+            .expect("pids_report must surface the recorded fork denial");
+        assert!(
+            report.max_events >= 1,
+            "pids_report.max_events must be >= 1"
+        );
+        assert_eq!(
+            report.limit,
+            Some(CAP),
+            "pids_report must echo the enforced pids.max"
+        );
+
+        // Drop runs teardown: kill any parked grandchildren, rmdir the leaf.
+        drop(leaf);
+        assert!(
+            !leaf_path.exists(),
+            "leaf {} must be removed after teardown",
+            leaf_path.display()
+        );
+    }
+
+    /// LIVE: both ceilings coexist in one leaf — memory.max and pids.max are both
+    /// written and read back, proving the two limits compose in a single cgroup.
+    #[test]
+    #[ignore = "requires live cgroup v2 delegation (memory + pids controllers); run with --ignored"]
+    fn live_memory_and_pids_limits_coexist_in_one_leaf() {
+        let _live = LIVE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        use super::CgroupLeaf;
+        use super::delegated_base;
+        use nono::ResourceLimits;
+
+        let limits = ResourceLimits {
+            memory_bytes: Some(64 * 1024 * 1024),
+            max_processes: Some(16),
+        };
+        let base = delegated_base().expect("delegated base");
+        let leaf = CgroupLeaf::create(&limits).expect("create leaf with both ceilings");
+        let leaf_path = leaf.path.clone();
+        assert_eq!(
+            leaf_path.parent(),
+            Some(base.as_path()),
+            "leaf must be a child of the delegated base"
+        );
+
+        let knob = |name: &str| {
+            std::fs::read_to_string(leaf_path.join(name))
+                .unwrap_or_else(|e| panic!("read {name}: {e}"))
+                .trim()
+                .to_string()
+        };
+        assert_eq!(knob("memory.max"), (64u64 * 1024 * 1024).to_string());
+        assert_eq!(knob("memory.swap.max"), "0");
+        assert_eq!(knob("memory.oom.group"), "1");
+        assert_eq!(knob("pids.max"), "16");
+
+        drop(leaf);
+        assert!(!leaf_path.exists(), "teardown must remove the leaf dir");
     }
 }

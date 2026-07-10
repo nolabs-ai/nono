@@ -838,15 +838,20 @@ mod cap_file_validation_tests {
 
     #[test]
     fn resource_limits_round_trip_through_self_state() {
-        // A memory ceiling must be captured in the self-state, survive the JSON
-        // round-trip, and reconstruct into caps so `nono why --self` can report it.
+        // Both ceilings must be captured in the self-state, survive the JSON
+        // round-trip, and reconstruct into caps so `nono why --self` can report them.
         let caps = CapabilitySet::new().with_resource_limits(nono::ResourceLimits {
             memory_bytes: Some(512 * 1024 * 1024),
+            max_processes: Some(64),
         });
         let state = SandboxState::from_caps(&caps, &[], &[], &[]);
         assert_eq!(
             state.resource_limits.and_then(|l| l.memory_bytes),
             Some(512 * 1024 * 1024)
+        );
+        assert_eq!(
+            state.resource_limits.and_then(|l| l.max_processes),
+            Some(64)
         );
 
         let json = serde_json::to_string(&state).expect("serialize");
@@ -855,6 +860,10 @@ mod cap_file_validation_tests {
         assert_eq!(
             caps2.resource_limits().and_then(|l| l.memory_bytes),
             Some(512 * 1024 * 1024)
+        );
+        assert_eq!(
+            caps2.resource_limits().and_then(|l| l.max_processes),
+            Some(64)
         );
     }
 

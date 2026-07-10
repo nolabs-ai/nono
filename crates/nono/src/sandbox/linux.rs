@@ -913,6 +913,10 @@ fn apply_with_abi_inner(
 /// not listed here lose execute permission even if the main sandbox granted it
 /// via `AccessMode::Read`. Read/write grants from the main ruleset are unaffected.
 ///
+/// Also grants bare `Refer` on `/` — Landlock requires it in every layer
+/// for rename/link, so omitting it here silently breaks renames the main
+/// ruleset already permits. Bare `Refer` alone can't widen access.
+///
 /// Call this after `apply_auto()` / `apply_landlock()` to lock down which binaries
 /// an already-sandboxed process can exec.
 pub fn restrict_execute(paths: &[impl AsRef<Path>]) -> Result<()> {
@@ -933,6 +937,12 @@ pub fn restrict_execute(paths: &[impl AsRef<Path>]) -> Result<()> {
             ))
         })?
         .set_compatibility(CompatLevel::BestEffort)
+        .handle_access(AccessFs::Refer)
+        .map_err(|e| {
+            NonoError::SandboxInit(format!(
+                "Tool Sandbox  execute restriction: cannot handle Refer: {e}"
+            ))
+        })?
         .create()
         .map_err(|e| {
             NonoError::SandboxInit(format!(
@@ -954,6 +964,21 @@ pub fn restrict_execute(paths: &[impl AsRef<Path>]) -> Result<()> {
                 NonoError::SandboxInit(format!(
                     "Tool Sandbox  execute restriction: add_rule for {}: {e}",
                     p.display()
+                ))
+            })?;
+    }
+
+    if abi.has_refer() {
+        let root_fd = PathFd::new("/").map_err(|e| {
+            NonoError::SandboxInit(format!(
+                "Tool Sandbox  execute restriction: cannot open / for Refer grant: {e}"
+            ))
+        })?;
+        ruleset = ruleset
+            .add_rule(PathBeneath::new(root_fd, AccessFs::Refer))
+            .map_err(|e| {
+                NonoError::SandboxInit(format!(
+                    "Tool Sandbox  execute restriction: add_rule for / (Refer): {e}"
                 ))
             })?;
     }
@@ -4565,5 +4590,69 @@ mod tests {
                 "/mnt/c exists but was not detected as a 9P filesystem"
             );
         }
+    }
+
+    #[test]
+    fn test_restrict_execute_does_not_break_rename_into_new_subdir() {
+        // Regression test for the missing-Refer bug: rename into a subdir
+        // created after restrict_execute() must still succeed.
+        let detected = match detect_abi() {
+            Ok(detected) => detected,
+            Err(_) => return,
+        };
+        if !detected.has_execute() {
+            return;
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "nono-restrict-execute-rename-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(root.join("_tmp")).expect("create _tmp dir");
+        let src = root.join("_tmp/srcfile");
+        std::fs::write(&src, b"x").expect("create srcfile");
+
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork() failed");
+
+        if pid == 0 {
+            let cap = crate::capability::FsCapability::new_dir(&root, AccessMode::ReadWrite)
+                .expect("build fs capability");
+            let mut caps = CapabilitySet::new();
+            caps.add_fs(cap);
+
+            if apply_landlock(&caps).is_err() {
+                unsafe { libc::_exit(2) };
+            }
+            if restrict_execute(&["/usr/bin"]).is_err() {
+                unsafe { libc::_exit(3) };
+            }
+
+            let new_subdir = root.join("sha256/abc/bin");
+            if std::fs::create_dir_all(&new_subdir).is_err() {
+                unsafe { libc::_exit(4) };
+            }
+            let dst = new_subdir.join("dstfile");
+            match std::fs::rename(&src, &dst) {
+                Ok(()) => unsafe { libc::_exit(0) },
+                Err(_) => unsafe { libc::_exit(1) },
+            }
+        }
+
+        let mut status: i32 = 0;
+        let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(waited, pid, "waitpid() failed");
+        assert!(
+            libc::WIFEXITED(status),
+            "child did not exit normally: status={status}"
+        );
+        let code = libc::WEXITSTATUS(status);
+        assert_eq!(
+            code, 0,
+            "rename into freshly-created subdir failed under stacked execute-restriction layer \
+             (exit code {code}; 1=rename EXDEV/denied, 2=apply_landlock failed, \
+             3=restrict_execute failed, 4=mkdir failed)"
+        );
     }
 }

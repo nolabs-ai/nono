@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use crate::cli::SandboxArgs;
 use crate::command_policy::{
     CommandCredentialGrantConfig, CommandCredentialType, CommandFromConfig, CommandPoliciesConfig,
@@ -7,11 +9,12 @@ use crate::launch_runtime::{
     CredentialProxyIntent, DomainFilterIntent, EndpointFilterIntent, NetworkIntent, OpenUrlIntent,
     ProxyLaunchOptions, TlsInterceptIntent, UpstreamProxyIntent,
 };
+use crate::network_approval::{NetworkApprovalBackend, NetworkApprovalMode};
 use crate::network_policy;
 use crate::sandbox_prepare::{PreparedSandbox, validate_external_proxy_bypass};
 #[cfg(not(target_os = "macos"))]
 use nono::AccessMode;
-use nono::{CapabilitySet, NonoError, Result};
+use nono::{CapabilitySet, HostFilter, NonoError, Result, RuntimeHostFilter};
 use nono_proxy::config::{
     EndpointPolicyConfig as ProxyEndpointPolicyConfig,
     EndpointPolicyDecision as ProxyEndpointPolicyDecision,
@@ -28,7 +31,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tracing::{debug, info, warn};
 use zeroize::Zeroizing;
 
@@ -37,6 +40,7 @@ pub(crate) struct ActiveProxyRuntime {
     pub(crate) tool_sandbox_credential_env_vars: BTreeMap<String, Vec<(String, String)>>,
     pub(crate) tool_sandbox_trust_bundle_paths: Vec<std::path::PathBuf>,
     pub(crate) handle: Option<nono_proxy::server::ProxyHandle>,
+    pub(crate) approval_backend: Option<std::sync::Arc<NetworkApprovalBackend>>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1584,6 +1588,9 @@ pub(crate) fn prepare_proxy_launch_options(
         None
     };
 
+    let approval_mode =
+        resolve_network_approval_mode(args, prepared.profile_network_approval_mode.as_deref());
+
     let opts = ProxyLaunchOptions {
         domain_filter,
         endpoint_filter,
@@ -1606,6 +1613,11 @@ pub(crate) fn prepare_proxy_launch_options(
         enable_h2: prepared.allow_http2_requested,
         no_proxy,
         audit_disabled: false,
+        network_approval_mode: approval_mode,
+        network_approval_timeout_secs: resolve_approval_timeout_secs(
+            prepared.profile_network_approval_timeout_secs,
+        ),
+        profile_name: args.profile.clone(),
     };
 
     // Infra-only flags make no sense without an activating proxy feature.
@@ -2321,6 +2333,60 @@ pub(crate) fn parse_allow_endpoint_arg(
     ))
 }
 
+fn resolve_network_approval_mode(
+    args: &SandboxArgs,
+    profile_approval_mode: Option<&str>,
+) -> NetworkApprovalMode {
+    use crate::cli::NetworkApprovalArg;
+
+    if let Some(ref mode) = args.network_approval {
+        match mode {
+            NetworkApprovalArg::Ask => NetworkApprovalMode::Ask,
+        }
+    } else if let Ok(val) = std::env::var("NONO_NETWORK_APPROVAL") {
+        match val.to_lowercase().as_str() {
+            "ask" => NetworkApprovalMode::Ask,
+            _ => NetworkApprovalMode::Off,
+        }
+    } else if let Some(mode) = profile_approval_mode {
+        match mode.to_lowercase().as_str() {
+            "ask" => NetworkApprovalMode::Ask,
+            _ => NetworkApprovalMode::Off,
+        }
+    } else if let Ok(Some(config)) = crate::config::user::load_user_config() {
+        match config
+            .network
+            .approval_mode
+            .as_deref()
+            .unwrap_or("off")
+            .to_lowercase()
+            .as_str()
+        {
+            "ask" => NetworkApprovalMode::Ask,
+            _ => NetworkApprovalMode::Off,
+        }
+    } else {
+        NetworkApprovalMode::Off
+    }
+}
+
+fn resolve_approval_timeout_secs(profile_timeout: Option<u64>) -> u64 {
+    if let Ok(val) = std::env::var("NONO_NETWORK_APPROVAL_TIMEOUT")
+        && let Ok(secs) = val.parse::<u64>()
+    {
+        return secs.clamp(5, 300);
+    }
+    if let Some(secs) = profile_timeout {
+        return secs.clamp(5, 300);
+    }
+    if let Ok(Some(config)) = crate::config::user::load_user_config()
+        && let Some(secs) = config.network.approval_timeout_secs
+    {
+        return secs.clamp(5, 300);
+    }
+    60
+}
+
 pub(crate) fn build_proxy_config_from_flags(
     proxy: &ProxyLaunchOptions,
 ) -> Result<nono_proxy::config::ProxyConfig> {
@@ -2951,6 +3017,7 @@ pub(crate) fn start_proxy_runtime(
             tool_sandbox_credential_env_vars: BTreeMap::new(),
             tool_sandbox_trust_bundle_paths: Vec::new(),
             handle: None,
+            approval_backend: None,
         });
     };
     if !proxy.is_active() {
@@ -2959,6 +3026,7 @@ pub(crate) fn start_proxy_runtime(
             tool_sandbox_credential_env_vars: BTreeMap::new(),
             tool_sandbox_trust_bundle_paths: Vec::new(),
             handle: None,
+            approval_backend: None,
         });
     }
 
@@ -2987,6 +3055,42 @@ pub(crate) fn start_proxy_runtime(
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let nonce_resolver: Option<Arc<dyn nono_proxy::NonceResolver>> = None;
 
+    let (approval_backend, approval_tx, runtime_filter) = match proxy.network_approval_mode {
+        NetworkApprovalMode::Off => (None, None, None),
+        NetworkApprovalMode::Ask => {
+            let host_filter = HostFilter::deny_all();
+            let runtime_filter = RuntimeHostFilter::new(host_filter);
+            let proxy_runtime_filter =
+                nono_proxy::filter::RuntimeProxyFilter::new(runtime_filter.clone());
+
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<nono_proxy::ApprovalChannelRequest>(16);
+
+            let config_writer = Some(crate::network_approval::ConfigWriter::new(
+                proxy.profile_name.as_deref().unwrap_or("default"),
+            ));
+
+            let backend = NetworkApprovalBackend::new(
+                proxy.network_approval_mode,
+                runtime_filter,
+                proxy.network_approval_timeout_secs,
+                config_writer,
+            );
+            let backend_arc = std::sync::Arc::new(backend);
+
+            let backend_clone = std::sync::Arc::clone(&backend_arc);
+            rt.spawn(async move {
+                while let Some(req) = rx.recv().await {
+                    let decision = backend_clone
+                        .request_network_approval_async(&req.request)
+                        .await;
+                    let _ = req.response_tx.send(decision);
+                }
+            });
+
+            (Some(backend_arc), Some(tx), Some(proxy_runtime_filter))
+        }
+    };
+
     let handle = rt
         .block_on(async {
             nono_proxy::server::start_with_nonce_resolver(
@@ -2994,6 +3098,11 @@ pub(crate) fn start_proxy_runtime(
                 approval_registry,
                 credential_capture_backend,
                 nonce_resolver,
+                runtime_filter,
+                approval_tx,
+                std::process::id(),
+                &format!("nono-{}", std::process::id()),
+                Duration::from_secs(proxy.network_approval_timeout_secs),
             )
             .await
         })
@@ -3124,6 +3233,7 @@ pub(crate) fn start_proxy_runtime(
         tool_sandbox_credential_env_vars,
         tool_sandbox_trust_bundle_paths,
         handle: Some(handle),
+        approval_backend,
     })
 }
 
@@ -3700,6 +3810,8 @@ mod tests {
             set_vars: None,
             profile_network_block: false,
             allow_http2_requested: false,
+            profile_network_approval_mode: None,
+            profile_network_approval_timeout_secs: None,
         };
 
         let args = crate::cli::SandboxArgs::default();
@@ -3774,7 +3886,10 @@ mod tests {
             set_vars: None,
             profile_network_block: false,
             allow_http2_requested: false,
+            profile_network_approval_mode: None,
+            profile_network_approval_timeout_secs: None,
         };
+
         let args = crate::cli::SandboxArgs {
             allow_proxy: vec!["api.internal.corp".to_string()],
             ..crate::cli::SandboxArgs::default()
@@ -3843,7 +3958,10 @@ mod tests {
             set_vars: None,
             profile_network_block: false,
             allow_http2_requested: false,
+            profile_network_approval_mode: None,
+            profile_network_approval_timeout_secs: None,
         };
+
         let args = crate::cli::SandboxArgs::default();
         let intent = prepare_proxy_launch_options(&args, &prepared, true, String::new())?;
         let proxy = intent

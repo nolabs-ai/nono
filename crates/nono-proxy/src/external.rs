@@ -357,7 +357,8 @@ fn parse_status_code(line: &str) -> Result<u16> {
 
 /// Send an HTTP response line.
 async fn send_response(stream: &mut TcpStream, status: u16, reason: &str) -> Result<()> {
-    let response = format!("HTTP/1.1 {} {}\r\n\r\n", status, reason);
+    let sanitised_reason = reason.replace(['\r', '\n'], " ");
+    let response = format!("HTTP/1.1 {} {}\r\n\r\n", status, sanitised_reason);
     stream.write_all(response.as_bytes()).await?;
     stream.flush().await?;
     Ok(())

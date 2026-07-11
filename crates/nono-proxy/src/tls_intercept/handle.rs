@@ -2816,7 +2816,7 @@ mod tests {
     impl nono::ApprovalBackend for DecisionBackend {
         fn request_approval(
             &self,
-            _request: &nono::ApprovalRequest,
+            _request: &nono::supervisor::ApprovalRequest,
         ) -> nono::Result<nono::ApprovalDecision> {
             (self.decision)()
         }

@@ -742,13 +742,18 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
             // be built or picked, error out — never quietly drop back to the
             // terminal prompt. Nothing configured returns `None`, keeping the
             // prompt.
-            let approval_backend = crate::approval_runtime::resolve_supervised_approval_backend(
-                &flags.approval_backends,
-                flags
-                    .approval_defaults
-                    .as_ref()
-                    .and_then(|d| d.backend.clone()),
-            )?;
+            let configured_approval_backend =
+                crate::approval_runtime::resolve_supervised_approval_backend(
+                    &flags.approval_backends,
+                    flags
+                        .approval_defaults
+                        .as_ref()
+                        .and_then(|d| d.backend.clone()),
+                )?;
+            let approval_backend = crate::approval_runtime::build_supervised_approval_backend(
+                configured_approval_backend,
+                active_proxy.approval_backend.clone(),
+            );
             let exit_result = execute_supervised_runtime(SupervisedRuntimeContext {
                 config: &config,
                 caps: &caps,

@@ -1752,6 +1752,15 @@ pub struct NetworkConfig {
     /// ALIAS(canonical="upstream_bypass", introduced="v0.0.0", remove_by="indefinite", issue="#415")
     #[serde(default, rename = "upstream_bypass", alias = "external_proxy_bypass")]
     pub upstream_bypass: Vec<String>,
+    /// How to handle requests to blocked hosts at runtime.
+    /// `"off"` (default) denies immediately; `"ask"` shows an OS notification
+    /// with action buttons (Deny / Allow once / Always allow).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_mode: Option<String>,
+    /// Seconds to wait for user approval before denying (default: 60).
+    /// Only applies when `approval_mode` is not `"off"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2695,7 +2704,32 @@ pub fn load_profile_extends(name_or_path: &str) -> Option<Vec<String>> {
     None
 }
 
-/// Load a profile by name or file path
+/// Resolve the file path for a profile name or direct path.
+///
+/// Returns the resolved filesystem path if the profile is a user file,
+/// or `None` for built-in profiles or invalid names.
+///
+/// This is the same resolution logic used by [`load_profile`].
+pub fn resolve_profile_path(name_or_path: &str) -> Option<PathBuf> {
+    if name_or_path.contains('/') || name_or_path.ends_with(".json") {
+        let path = Path::new(name_or_path);
+        if path.exists() {
+            return Some(path.to_path_buf());
+        }
+        return None;
+    }
+
+    if !is_valid_profile_name(name_or_path) {
+        return None;
+    }
+
+    match get_user_profile_path(name_or_path) {
+        Ok(path) if path.exists() => Some(path),
+        _ => None,
+    }
+}
+
+/// Load a profile by name or file path.
 ///
 /// If `name_or_path` contains a path separator or ends with `.json`, it is
 /// treated as a direct file path. Otherwise it is resolved as a profile name.
@@ -3785,6 +3819,15 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
                 &base.network.upstream_bypass,
                 &child.network.upstream_bypass,
             ),
+            approval_mode: child
+                .network
+                .approval_mode
+                .clone()
+                .or(base.network.approval_mode.clone()),
+            approval_timeout_secs: child
+                .network
+                .approval_timeout_secs
+                .or(base.network.approval_timeout_secs),
         },
         linux: LinuxConfig {
             af_unix_mediation: child
@@ -6807,6 +6850,8 @@ mod tests {
                 tls_intercept: None,
                 upstream_proxy: None,
                 upstream_bypass: Vec::new(),
+                approval_mode: None,
+                approval_timeout_secs: None,
             },
             diagnostics: DiagnosticsConfig::default(),
             linux: LinuxConfig::default(),
@@ -6899,6 +6944,8 @@ mod tests {
                 tls_intercept: None,
                 upstream_proxy: None,
                 upstream_bypass: Vec::new(),
+                approval_mode: None,
+                approval_timeout_secs: None,
             },
             diagnostics: DiagnosticsConfig::default(),
             linux: LinuxConfig::default(),
@@ -8041,6 +8088,17 @@ mod tests {
                 "signal".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn test_credentials_none_does_not_activate_proxy() {
+        let mut config = NetworkConfig::default();
+        // None or empty credentials should not activate proxy
+        assert!(config.resolved_credentials().is_empty());
+        config.credentials = Some(Vec::new());
+        assert!(config.resolved_credentials().is_empty());
+        config.credentials = Some(vec!["openai".to_string()]);
+        assert!(!config.resolved_credentials().is_empty());
     }
 
     #[test]

@@ -40,7 +40,9 @@ mod lineage_cgroup;
 #[cfg(target_os = "macos")]
 mod macos_trust;
 mod migration;
+mod network_approval;
 mod network_policy;
+mod notification;
 mod open_url_runtime;
 mod output;
 mod pack_update_hint;
@@ -337,6 +339,8 @@ mod tests {
             set_vars: None,
             profile_network_block: false,
             allow_http2_requested: false,
+            profile_network_approval_mode: None,
+            profile_network_approval_timeout_secs: None,
         };
 
         let effective = resolve_effective_proxy_settings(&args, &prepared)?;
@@ -413,6 +417,8 @@ mod tests {
             set_vars: None,
             profile_network_block: false,
             allow_http2_requested: false,
+            profile_network_approval_mode: None,
+            profile_network_approval_timeout_secs: None,
         };
 
         let effective = resolve_effective_proxy_settings(&args, &prepared)?;

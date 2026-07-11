@@ -542,6 +542,8 @@ pub(crate) struct PreparedSandbox {
     /// True when the profile or CLI requested HTTP/2 to upstream servers
     /// (`network.allow_http2` or `--allow-http2`).
     pub(crate) allow_http2_requested: bool,
+    pub(crate) profile_network_approval_mode: Option<String>,
+    pub(crate) profile_network_approval_timeout_secs: Option<u64>,
 }
 
 fn resolved_workdir(args: &SandboxArgs) -> PathBuf {
@@ -1508,6 +1510,8 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
                 set_vars: None,
                 profile_network_block: false,
                 allow_http2_requested: args.allow_http2,
+                profile_network_approval_mode: None,
+                profile_network_approval_timeout_secs: None,
             },
             &[],
             args,
@@ -1558,6 +1562,8 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         case_insensitive_env_vars: profile_case_insensitive_env_vars,
         set_vars: profile_set_vars,
         resolved_command_binaries: profile_resolved_command_binaries,
+        network_approval_mode: profile_network_approval_mode,
+        network_approval_timeout_secs: profile_network_approval_timeout_secs,
     } = prepared_profile;
 
     // Raw Seatbelt rules (`unsafe_macos_seatbelt_rules`) are as powerful as
@@ -1880,6 +1886,8 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
             set_vars: profile_set_vars,
             profile_network_block,
             allow_http2_requested,
+            profile_network_approval_mode,
+            profile_network_approval_timeout_secs,
         },
         &blocked_grants,
         args,
@@ -2799,6 +2807,8 @@ mod tests {
             set_vars: None,
             profile_network_block: false,
             allow_http2_requested: false,
+            profile_network_approval_mode: None,
+            profile_network_approval_timeout_secs: None,
         }
     }
 

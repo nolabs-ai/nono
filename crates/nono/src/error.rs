@@ -185,6 +185,9 @@ pub enum NonoError {
     #[error("Instruction file denied: {path}: {reason}")]
     InstructionFileDenied { path: String, reason: String },
 
+    #[error("Invalid configuration: {reason}")]
+    InvalidConfig { reason: String },
+
     #[error("Package install error: {0}")]
     PackageInstall(String),
 
@@ -249,6 +252,7 @@ impl NonoError {
             Self::ConfigParse(_)
             | Self::ConfigWrite { .. }
             | Self::ConfigRead { .. }
+            | Self::InvalidConfig { .. }
             | Self::ProfileNotFound(_)
             | Self::ProfileRead { .. }
             | Self::ProfileParse(_)

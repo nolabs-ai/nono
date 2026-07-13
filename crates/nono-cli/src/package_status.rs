@@ -196,19 +196,13 @@ mod tests {
 
     #[test]
     fn canonical_package_refs_target_official_packs() {
-        assert!(is_official_package_ref(
-            CLAUDE_PACK,
-            "nolabs-ai/claude"
-        ));
+        assert!(is_official_package_ref(CLAUDE_PACK, "nolabs-ai/claude"));
         assert!(is_official_package_ref(
             CLAUDE_PACK,
             "nolabs-ai/claude@1.2.3"
         ));
         assert!(is_official_package_ref(CODEX_PACK, "nolabs-ai/codex"));
-        assert!(is_official_package_ref(
-            CODEX_PACK,
-            "nolabs-ai/codex@1.2.3"
-        ));
+        assert!(is_official_package_ref(CODEX_PACK, "nolabs-ai/codex@1.2.3"));
         assert!(!is_official_package_ref(CLAUDE_PACK, "someone/claude"));
         assert!(!is_official_package_ref(
             CODEX_PACK,

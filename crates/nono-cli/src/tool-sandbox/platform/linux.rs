@@ -5387,6 +5387,45 @@ mod tests {
         })
     }
 
+    #[test]
+    fn verify_binary_identity_accepts_unchanged_binary() -> Result<()> {
+        let dir = test_tempdir()?;
+        let path = dir.path().join("multitool");
+        fs::write(&path, b"#!/bin/sh\nbasename \"$0\"\n").map_err(|source| {
+            NonoError::ConfigWrite {
+                path: path.clone(),
+                source,
+            }
+        })?;
+        let binary = test_binary("multitool", &path)?;
+        verify_binary_identity(&binary)?;
+        Ok(())
+    }
+
+    #[test]
+    fn verify_binary_identity_rejects_swapped_binary() -> Result<()> {
+        // Preserving argv[0] must not weaken the anti-swap guard.
+        let dir = test_tempdir()?;
+        let path = dir.path().join("multitool");
+        fs::write(&path, b"original").map_err(|source| NonoError::ConfigWrite {
+            path: path.clone(),
+            source,
+        })?;
+        let binary = test_binary("multitool", &path)?;
+
+        // swap the on-disk file (changes size + mtime)
+        fs::write(&path, b"swapped-larger-content").map_err(|source| NonoError::ConfigWrite {
+            path: path.clone(),
+            source,
+        })?;
+
+        assert!(
+            verify_binary_identity(&binary).is_err(),
+            "verify_binary_identity must reject a binary changed after resolution"
+        );
+        Ok(())
+    }
+
     fn symlink_path(target: &Path, link: &Path) -> Result<()> {
         std::os::unix::fs::symlink(target, link).map_err(|source| NonoError::ConfigWrite {
             path: link.to_path_buf(),

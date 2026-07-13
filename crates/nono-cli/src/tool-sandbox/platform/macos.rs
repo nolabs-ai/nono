@@ -708,6 +708,9 @@ fn run_child_launcher() -> Result<()> {
     // object but the final exec is still path-based. Default immutability
     // checks reject paths writable by the sandboxed agent; allowing writable
     // executable targets is therefore a deliberate trust downgrade.
+    //
+    // Preserving argv[0] doesn't widen it: argv[0] is only a string;
+    // `real_binary` (re-verified here) selects what runs.
     verify_launch_binary(&spec)?;
     let caps = caps_from_spec(&spec.caps)?;
     Sandbox::apply_auto(&caps)?;
@@ -1506,8 +1509,14 @@ fn handle_shim_stream_inner(
         let result = (|| {
             let (helper, extra_args) =
                 super::policy::resolve_exec_helper(&state.plan.exec_helpers, command)?;
-            let launch =
-                build_child_launch_spec_for_binary(state, &request, policy, helper, &extra_args)?;
+            let launch = build_child_launch_spec_for_binary(
+                state,
+                &request,
+                policy,
+                helper,
+                &extra_args,
+                false,
+            )?;
             launch_child(state, &request.command, &caller, launch, stdio)
         })();
         state.active_count.fetch_sub(1, Ordering::SeqCst);
@@ -1922,22 +1931,24 @@ fn build_child_launch_spec(
         .ok_or_else(|| {
             NonoError::SandboxInit(format!("missing resolved binary for {}", request.command))
         })?;
-    build_child_launch_spec_for_binary(state, request, policy, binary, &[])
+    build_child_launch_spec_for_binary(state, request, policy, binary, &[], true)
 }
 
 /// Build a child launch spec that runs `binary` (which may be the command's
 /// real binary OR an `exec` intercept helper) inside the matched command's
 /// sandbox (`policy`). `extra_args` are inserted between argv[0] and the
 /// forwarded original args (`request.argv[1..]`) — used by the `exec` action to
-/// pass the helper's fixed leading args. The fs-read cap, exec-gate, executable
-/// shape baseline, and identity expectations are all bound to `binary`, while
-/// network/credentials/proxy/fs/env come from `policy`.
+/// pass the helper's fixed leading args. `preserve_caller_argv0` is true for
+/// the command's own binary, false for `exec` helpers. The fs-read cap, exec-gate, executable shape baseline, and identity
+/// expectations are all bound to `binary`, while network/credentials/proxy/fs/env
+/// come from `policy`.
 fn build_child_launch_spec_for_binary(
     state: &ToolSandboxState,
     request: &ToolSandboxShimRequest,
     policy: &CommandSandboxConfig,
     binary: &ResolvedCommandBinary,
     extra_args: &[Vec<u8>],
+    preserve_caller_argv0: bool,
 ) -> Result<ToolSandboxChildLaunchSpec> {
     verify_binary_identity(binary)?;
     let cwd = PathBuf::from(OsString::from_vec(request.cwd.clone()));
@@ -1969,7 +1980,13 @@ fn build_child_launch_spec_for_binary(
             .as_ref()
             .map(|path| path.as_os_str().as_bytes().to_vec()),
         interpreter_args: binary.shape.interpreter_args.clone(),
-        argv: effective_argv_for_binary(binary, request, policy, extra_args)?,
+        argv: effective_argv_for_binary(
+            binary,
+            request,
+            policy,
+            extra_args,
+            preserve_caller_argv0,
+        )?,
         env: filter_child_env(state, request, policy)?,
         cwd: cwd.as_os_str().as_bytes().to_vec(),
         stdio_mode: selected_stdio_mode(request).to_string(),
@@ -5260,6 +5277,45 @@ mod tests {
     fn selected_stdio_mode_uses_supervisor_direct_fds() {
         let request = request_with_env(Vec::new());
         assert_eq!(selected_stdio_mode(&request), "direct_fds");
+    }
+
+    #[test]
+    fn verify_binary_identity_accepts_unchanged_binary() -> Result<()> {
+        let dir = test_tempdir()?;
+        let path = dir.path().join("multitool");
+        fs::write(&path, b"#!/bin/sh\nbasename \"$0\"\n").map_err(|source| {
+            NonoError::ConfigWrite {
+                path: path.clone(),
+                source,
+            }
+        })?;
+        let binary = test_binary("multitool", &path)?;
+        verify_binary_identity(&binary)?;
+        Ok(())
+    }
+
+    #[test]
+    fn verify_binary_identity_rejects_swapped_binary() -> Result<()> {
+        // Preserving argv[0] must not weaken the anti-swap guard.
+        let dir = test_tempdir()?;
+        let path = dir.path().join("multitool");
+        fs::write(&path, b"original").map_err(|source| NonoError::ConfigWrite {
+            path: path.clone(),
+            source,
+        })?;
+        let binary = test_binary("multitool", &path)?;
+
+        // swap the on-disk file (changes size + mtime)
+        fs::write(&path, b"swapped-larger-content").map_err(|source| NonoError::ConfigWrite {
+            path: path.clone(),
+            source,
+        })?;
+
+        assert!(
+            verify_binary_identity(&binary).is_err(),
+            "verify_binary_identity must reject a binary changed after resolution"
+        );
+        Ok(())
     }
 
     #[test]

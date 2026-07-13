@@ -1833,8 +1833,14 @@ fn handle_shim_stream_inner(
         let result = (|| {
             let (helper, extra_args) =
                 super::policy::resolve_exec_helper(&state.plan.exec_helpers, command)?;
-            let launch =
-                build_child_launch_spec_for_binary(state, &request, policy, helper, &extra_args)?;
+            let launch = build_child_launch_spec_for_binary(
+                state,
+                &request,
+                policy,
+                helper,
+                &extra_args,
+                false,
+            )?;
             launch_child(state, &request.command, &caller, launch, stdio)
         })();
         state.active_count.fetch_sub(1, Ordering::SeqCst);
@@ -3165,15 +3171,17 @@ fn build_child_launch_spec(
         .ok_or_else(|| {
             NonoError::SandboxInit(format!("missing resolved binary for {}", request.command))
         })?;
-    build_child_launch_spec_for_binary(state, request, policy, binary, &[])
+    build_child_launch_spec_for_binary(state, request, policy, binary, &[], true)
 }
 
 /// Build a child launch spec that runs `binary` (the command's real binary OR
 /// an `exec` intercept helper) inside the matched command's sandbox (`policy`).
 /// `extra_args` are inserted between argv[0] and the forwarded original args —
-/// used by the `exec` action for the helper's fixed leading args. The fs-read
-/// cap, Landlock execute allowlist (binary + its ELF/interpreter closure),
-/// runtime baseline, and identity expectations are all bound to `binary`, while
+/// used by the `exec` action for the helper's fixed leading args.
+/// `preserve_caller_argv0` is true for the command's own binary, false for
+/// `exec` helpers. The fs-read cap, Landlock execute
+/// allowlist (binary + its ELF/interpreter closure), runtime baseline, and
+/// identity expectations are all bound to `binary`, while
 /// network/credentials/proxy/fs/env come from `policy`.
 fn build_child_launch_spec_for_binary(
     state: &ToolSandboxState,
@@ -3181,6 +3189,7 @@ fn build_child_launch_spec_for_binary(
     policy: &CommandSandboxConfig,
     binary: &ResolvedCommandBinary,
     extra_args: &[Vec<u8>],
+    preserve_caller_argv0: bool,
 ) -> Result<ToolSandboxChildLaunchSpec> {
     let start_vbi = std::time::Instant::now();
     verify_binary_identity(binary)?;
@@ -3299,7 +3308,13 @@ fn build_child_launch_spec_for_binary(
             .as_ref()
             .map(|path| path.as_os_str().as_bytes().to_vec()),
         interpreter_args: binary.shape.interpreter_args.clone(),
-        argv: effective_argv_for_binary(binary, request, policy, extra_args)?,
+        argv: effective_argv_for_binary(
+            binary,
+            request,
+            policy,
+            extra_args,
+            preserve_caller_argv0,
+        )?,
         env,
         cwd: cwd.as_os_str().as_bytes().to_vec(),
         stdio_mode: selected_stdio_mode(request).to_string(),

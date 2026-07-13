@@ -887,6 +887,14 @@ Working directory for `$WORKDIR` expansion in profiles (defaults to current dire
 nono run --profile always-further/claude --workdir ./my-project -- claude
 ```
 
+#### `--repo-root`
+
+Explicit repository root for `$REPO_ROOT` expansion in profile paths. When omitted, nono auto-detects the root via `git rev-parse --show-toplevel` from the current directory. Set `NONO_REPO_ROOT` as an environment variable alternative. Paths containing `$REPO_ROOT` are silently skipped when the root cannot be determined.
+
+```bash
+nono run --profile always-further/claude --repo-root /path/to/repo -- claude
+```
+
 #### `--allow-cwd`
 
 Allow access to the current working directory without prompting. By default, nono prompts interactively for CWD sharing. The access level is determined by the profile's `[workdir]` config or defaults to read-only.

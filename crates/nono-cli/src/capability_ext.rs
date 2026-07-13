@@ -13,9 +13,9 @@ use crate::tool_sandbox::dynamic_providers::expand_dynamic_tokens;
 /// Expand a profile path template: arbitrary `$VAR` tokens from the process
 /// environment are resolved first, then built-in nono vars (`$HOME`,
 /// `$WORKDIR`, `$TMPDIR`, `$XDG_*`, etc.) are applied.
-fn expand_path(template: &str, workdir: &Path) -> nono::Result<PathBuf> {
+fn expand_path(template: &str, workdir: &Path, repo_root: Option<&Path>) -> nono::Result<PathBuf> {
     let after_env = policy::expand_env_vars(template);
-    expand_vars(&after_env, workdir)
+    expand_vars(&after_env, workdir, repo_root)
 }
 use nono::{
     AccessMode, CapabilitySet, CapabilitySource, FsCapability, NonoError, Result, SocketScope,
@@ -671,11 +671,12 @@ impl CapabilitySetExt for CapabilitySet {
         // the banner but NOT tracked for rollback snapshots (only User-sourced paths
         // representing the project workspace are tracked).
         let fs = &profile.filesystem;
+        let repo_root = args.repo_root.as_deref();
 
         // Directories with read+write access
         let allow_expanded = expand_dynamic_tokens(&fs.allow, Some(workdir))?;
         for path_template in &allow_expanded {
-            let path = expand_path(path_template, workdir)?;
+            let path = expand_path(path_template, workdir, repo_root)?;
             validate_requested_dir(
                 &path,
                 "Profile",
@@ -692,7 +693,7 @@ impl CapabilitySetExt for CapabilitySet {
         // Read-only filesystem entries (directory or file)
         let read_expanded = expand_dynamic_tokens(&fs.read, Some(workdir))?;
         for path_template in &read_expanded {
-            let path = expand_path(path_template, workdir)?;
+            let path = expand_path(path_template, workdir, repo_root)?;
             let label = format!("Profile path '{}' does not exist, skipping", path_template);
 
             let reads_file = std::fs::metadata(&path)
@@ -726,7 +727,7 @@ impl CapabilitySetExt for CapabilitySet {
         // Directories with write-only access
         let write_expanded = expand_dynamic_tokens(&fs.write, Some(workdir))?;
         for path_template in &write_expanded {
-            let path = expand_path(path_template, workdir)?;
+            let path = expand_path(path_template, workdir, repo_root)?;
             validate_requested_dir(
                 &path,
                 "Profile",
@@ -743,7 +744,7 @@ impl CapabilitySetExt for CapabilitySet {
         // Single files with read+write access
         let allow_file_expanded = expand_dynamic_tokens(&fs.allow_file, Some(workdir))?;
         for path_template in &allow_file_expanded {
-            let path = expand_path(path_template, workdir)?;
+            let path = expand_path(path_template, workdir, repo_root)?;
             let label = format!("Profile file '{}' does not exist, skipping", path_template);
             if let Some(mut cap) = try_new_profile_exact_path(
                 &path,
@@ -763,7 +764,7 @@ impl CapabilitySetExt for CapabilitySet {
         // Single files with read-only access
         let read_file_expanded = expand_dynamic_tokens(&fs.read_file, Some(workdir))?;
         for path_template in &read_file_expanded {
-            let path = expand_path(path_template, workdir)?;
+            let path = expand_path(path_template, workdir, repo_root)?;
             let label = format!("Profile file '{}' does not exist, skipping", path_template);
             if let Some(mut cap) = try_new_profile_exact_path(
                 &path,
@@ -780,7 +781,7 @@ impl CapabilitySetExt for CapabilitySet {
         // Single files with write-only access
         let write_file_expanded = expand_dynamic_tokens(&fs.write_file, Some(workdir))?;
         for path_template in &write_file_expanded {
-            let path = expand_path(path_template, workdir)?;
+            let path = expand_path(path_template, workdir, repo_root)?;
             let label = format!("Profile file '{}' does not exist, skipping", path_template);
             if let Some(mut cap) = try_new_profile_exact_path(
                 &path,
@@ -802,7 +803,7 @@ impl CapabilitySetExt for CapabilitySet {
         // implied FsCapability with matching access mode. Source is
         // marked as Profile so `--dry-run -v` can show provenance.
         for path_template in &fs.unix_socket {
-            let path = expand_path(path_template, workdir)?;
+            let path = expand_path(path_template, workdir, repo_root)?;
             validate_requested_file(
                 &path,
                 "Profile",
@@ -829,7 +830,7 @@ impl CapabilitySetExt for CapabilitySet {
         }
 
         for path_template in &fs.unix_socket_bind {
-            let path = expand_path(path_template, workdir)?;
+            let path = expand_path(path_template, workdir, repo_root)?;
             validate_requested_file(
                 &path,
                 "Profile",
@@ -870,7 +871,7 @@ impl CapabilitySetExt for CapabilitySet {
         }
 
         for path_template in &fs.unix_socket_dir {
-            let path = expand_path(path_template, workdir)?;
+            let path = expand_path(path_template, workdir, repo_root)?;
             validate_requested_dir(
                 &path,
                 "Profile",
@@ -897,7 +898,7 @@ impl CapabilitySetExt for CapabilitySet {
         }
 
         for path_template in &fs.unix_socket_dir_bind {
-            let path = expand_path(path_template, workdir)?;
+            let path = expand_path(path_template, workdir, repo_root)?;
             validate_requested_dir(
                 &path,
                 "Profile",
@@ -924,7 +925,7 @@ impl CapabilitySetExt for CapabilitySet {
         }
 
         for path_template in &fs.unix_socket_subtree {
-            let path = expand_path(path_template, workdir)?;
+            let path = expand_path(path_template, workdir, repo_root)?;
             validate_requested_dir(
                 &path,
                 "Profile",
@@ -951,7 +952,7 @@ impl CapabilitySetExt for CapabilitySet {
         }
 
         for path_template in &fs.unix_socket_subtree_bind {
-            let path = expand_path(path_template, workdir)?;
+            let path = expand_path(path_template, workdir, repo_root)?;
             validate_requested_dir(
                 &path,
                 "Profile",
@@ -984,7 +985,7 @@ impl CapabilitySetExt for CapabilitySet {
         // apply the remaining deny and deny-command surfaces.
         let deny_expanded = expand_dynamic_tokens(&profile.filesystem.deny, Some(workdir))?;
         for path_template in &deny_expanded {
-            let path = expand_path(path_template, workdir)?;
+            let path = expand_path(path_template, workdir, repo_root)?;
             let path_str = path.to_str().ok_or_else(|| {
                 NonoError::ConfigParse(format!(
                     "Profile filesystem deny path contains non-UTF-8 bytes: {}",
@@ -1070,7 +1071,7 @@ impl CapabilitySetExt for CapabilitySet {
             expand_dynamic_tokens(&profile.filesystem.bypass_protection, Some(workdir))?;
         let mut profile_overrides = Vec::with_capacity(bypass_expanded.len());
         for path_template in &bypass_expanded {
-            let path = expand_path(path_template, workdir)?;
+            let path = expand_path(path_template, workdir, repo_root)?;
             if path.exists() {
                 profile_overrides.push(path);
             } else {
@@ -3268,5 +3269,68 @@ mod tests {
             "$VAR in fs.allow should expand to the real path"
         );
         assert_eq!(fs_matches[0].access, AccessMode::ReadWrite);
+    }
+
+    #[test]
+    fn test_from_profile_repo_root_read_file() {
+        let dir = tempdir().expect("tmpdir");
+        // Create the file that $REPO_ROOT will expand to
+        let agents_file = dir.path().join("AGENTS.md");
+        std::fs::write(&agents_file, "# agents").expect("write AGENTS.md");
+
+        let profile_path = dir.path().join("repo-root-test.json");
+        std::fs::write(
+            &profile_path,
+            r#"{
+                "meta": { "name": "repo-root-test" },
+                "filesystem": { "read_file": ["$REPO_ROOT/AGENTS.md"] }
+            }"#,
+        )
+        .expect("write profile");
+        let profile = crate::profile::load_profile_from_path(&profile_path).expect("load profile");
+
+        let workdir = tempdir().expect("workdir");
+        let args = SandboxArgs {
+            repo_root: Some(dir.path().to_path_buf()),
+            ..SandboxArgs::default()
+        };
+
+        let (caps, _) = from_profile_locked(&profile, workdir.path(), &args).expect("build caps");
+        let fs_caps: Vec<_> = caps
+            .fs_capabilities()
+            .iter()
+            .filter(|c| c.source == CapabilitySource::Profile)
+            .collect();
+        assert!(
+            !fs_caps.is_empty(),
+            "expected at least one profile fs capability for $REPO_ROOT/AGENTS.md"
+        );
+    }
+
+    #[test]
+    fn test_from_profile_repo_root_unexpanded_skipped() {
+        // When args.repo_root is None, $REPO_ROOT is left unexpanded and the path
+        // doesn't exist, so it should be silently skipped (no error, no cap).
+        let dir = tempdir().expect("tmpdir");
+        let profile_path = dir.path().join("repo-root-none.json");
+        std::fs::write(
+            &profile_path,
+            r#"{
+                "meta": { "name": "repo-root-none" },
+                "filesystem": { "read_file": ["$REPO_ROOT/AGENTS.md"] }
+            }"#,
+        )
+        .expect("write profile");
+        let profile = crate::profile::load_profile_from_path(&profile_path).expect("load profile");
+
+        let workdir = tempdir().expect("workdir");
+        let args = SandboxArgs::default(); // repo_root = None
+
+        // Should not error: unexpanded path doesn't exist → silently skipped
+        let result = from_profile_locked(&profile, workdir.path(), &args);
+        assert!(
+            result.is_ok(),
+            "from_profile should not error when $REPO_ROOT is unexpanded"
+        );
     }
 }

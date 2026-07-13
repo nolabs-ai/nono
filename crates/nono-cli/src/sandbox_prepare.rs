@@ -513,6 +513,50 @@ fn resolved_workdir(args: &SandboxArgs) -> PathBuf {
     canonical_cwd.unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// Resolve the repository root for `$REPO_ROOT` expansion.
+///
+/// Resolution order:
+/// 1. `--repo-root` flag / `NONO_REPO_ROOT` env var (already in `args.repo_root`)
+/// 2. Auto-detect via `git rev-parse --show-toplevel` from `workdir`.
+///    This handles all repo layouts correctly:
+///    - Normal repos: returns the repo root
+///    - Linked worktrees (non-bare): returns the worktree checkout root
+///    - Bare repos with worktrees: returns the worktree checkout root
+/// 3. Returns `None` if git is unavailable or `workdir` is not inside a repo.
+///
+/// The returned path is always absolute and canonicalized.
+fn resolved_repo_root(args: &SandboxArgs, workdir: &Path) -> Option<PathBuf> {
+    // 1. Explicit override via --repo-root / NONO_REPO_ROOT
+    if let Some(ref p) = args.repo_root {
+        return p.canonicalize().ok().filter(|c| c.is_absolute());
+    }
+
+    // 2. Auto-detect via git rev-parse --show-toplevel.
+    // Clear GIT_DIR / GIT_WORK_TREE so that caller-set overrides don't mislead git.
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(workdir)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let toplevel_str = std::str::from_utf8(&output.stdout).ok()?.trim();
+    if toplevel_str.is_empty() {
+        return None;
+    }
+    let toplevel = PathBuf::from(toplevel_str);
+
+    // `git rev-parse --show-toplevel` returns the correct working root
+    // for all repo layouts (normal repos, linked worktrees, bare repos with
+    // worktrees). Canonicalize to resolve any symlinks in the path.
+    toplevel.canonicalize().ok().filter(|c| c.is_absolute())
+}
+
 fn cwd_access_requirement(profile_workdir_access: Option<&WorkdirAccess>) -> Option<AccessMode> {
     if let Some(access) = profile_workdir_access {
         match access {
@@ -568,6 +612,17 @@ pub(crate) fn resolve_detached_cwd_prompt_response(
     }
 
     let workdir = resolved_workdir(args);
+    // Auto-detect repo root for $REPO_ROOT expansion when not explicitly set.
+    let effective_args: Option<SandboxArgs> = if args.repo_root.is_none() {
+        resolved_repo_root(args, &workdir).map(|root| {
+            let mut a = args.clone();
+            a.repo_root = Some(root);
+            a
+        })
+    } else {
+        None
+    };
+    let args: &SandboxArgs = effective_args.as_ref().unwrap_or(args);
     let crate::profile_runtime::PreparedProfile {
         loaded_profile,
         workdir_access: profile_workdir_access,
@@ -1197,6 +1252,17 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
     let detached_launch = std::env::var_os(DETACHED_LAUNCH_ENV).is_some();
     let detached_prompt_response = detached_cwd_prompt_response();
     let workdir = resolved_workdir(args);
+    // Auto-detect repo root for $REPO_ROOT expansion when not explicitly set.
+    let effective_args: Option<SandboxArgs> = if args.repo_root.is_none() {
+        resolved_repo_root(args, &workdir).map(|root| {
+            let mut a = args.clone();
+            a.repo_root = Some(root);
+            a
+        })
+    } else {
+        None
+    };
+    let args: &SandboxArgs = effective_args.as_ref().unwrap_or(args);
 
     if let Some(ref config_path) = args.config {
         let json = std::fs::read_to_string(config_path).map_err(|e| {
@@ -1213,14 +1279,14 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
 
         if let Some(ref mut fs) = manifest.filesystem {
             for grant in &mut fs.grants {
-                let expanded = profile::expand_vars(grant.path.as_str(), &workdir)?;
+                let expanded = profile::expand_vars(grant.path.as_str(), &workdir, None)?;
                 grant.path = expanded
                     .to_string_lossy()
                     .parse()
                     .map_err(|e| NonoError::ConfigParse(format!("invalid path: {e}")))?;
             }
             for deny in &mut fs.deny {
-                let expanded = profile::expand_vars(deny.path.as_str(), &workdir)?;
+                let expanded = profile::expand_vars(deny.path.as_str(), &workdir, None)?;
                 deny.path = expanded
                     .to_string_lossy()
                     .parse()
@@ -2031,6 +2097,302 @@ mod tests {
     #[test]
     fn missing_cwd_prompt_can_interactively_prompt_when_attached() {
         assert!(!missing_cwd_prompt_must_fail(false, false, None));
+    }
+
+    // ── resolved_repo_root tests ─────────────────────────────────────────
+    //
+    // Shared helper: initialise a git repo with one commit so that
+    // `git worktree add` and similar commands work.  Returns false when
+    // git is not available in the test environment (tests skip gracefully).
+    fn git_init_with_commit(dir: &std::path::Path) -> bool {
+        let init = std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(dir)
+            .output();
+        let Ok(out) = init else {
+            return false;
+        };
+        if !out.status.success() {
+            return false;
+        }
+        for (k, v) in &[("user.email", "t@t.com"), ("user.name", "T")] {
+            let _ = std::process::Command::new("git")
+                .args(["config", k, v])
+                .current_dir(dir)
+                .output();
+        }
+        std::fs::write(dir.join("README"), "hi").expect("write README");
+        let add = std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(dir)
+            .output();
+        if add.map(|o| !o.status.success()).unwrap_or(true) {
+            return false;
+        }
+        let commit = std::process::Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(dir)
+            .output();
+        commit.map(|o| o.status.success()).unwrap_or(false)
+    }
+
+    // ── 1. Explicit --repo-root: existing path is returned canonicalized ──
+    #[test]
+    fn resolved_repo_root_returns_explicit_flag() {
+        let dir = tempdir().expect("tmpdir");
+        let args = SandboxArgs {
+            repo_root: Some(dir.path().to_path_buf()),
+            ..SandboxArgs::default()
+        };
+        let workdir = PathBuf::from("/some/workdir");
+        let result = resolved_repo_root(&args, &workdir);
+        assert_eq!(result, dir.path().canonicalize().ok());
+    }
+
+    // ── 2. Explicit --repo-root: nonexistent path → None ─────────────────
+    #[test]
+    fn resolved_repo_root_explicit_nonexistent_returns_none() {
+        let args = SandboxArgs {
+            repo_root: Some(PathBuf::from("/nonexistent/path/that/does/not/exist")),
+            ..SandboxArgs::default()
+        };
+        let result = resolved_repo_root(&args, &PathBuf::from("/tmp"));
+        assert!(
+            result.is_none(),
+            "nonexistent explicit path should return None"
+        );
+    }
+
+    // ── 3. Explicit --repo-root overrides git auto-detection ─────────────
+    #[test]
+    fn resolved_repo_root_explicit_overrides_auto_detection() {
+        let repo_dir = tempdir().expect("repo tmpdir");
+        let override_dir = tempdir().expect("override tmpdir");
+        if !git_init_with_commit(repo_dir.path()) {
+            return; // git not available
+        }
+        // Pointing repo_root at override_dir even though we're inside repo_dir
+        let args = SandboxArgs {
+            repo_root: Some(override_dir.path().to_path_buf()),
+            ..SandboxArgs::default()
+        };
+        let result = resolved_repo_root(&args, repo_dir.path());
+        assert_eq!(
+            result,
+            override_dir.path().canonicalize().ok(),
+            "explicit --repo-root must override git auto-detection"
+        );
+    }
+
+    // ── 4. Non-git directory → None ───────────────────────────────────────
+    #[test]
+    fn resolved_repo_root_returns_none_outside_git() {
+        let dir = tempdir().expect("tmpdir");
+        let args = SandboxArgs::default();
+        let result = resolved_repo_root(&args, dir.path());
+        assert!(result.is_none(), "expected None for non-git directory");
+    }
+
+    // ── 5. Normal repo: called from the repo root itself ──────────────────
+    #[test]
+    fn resolved_repo_root_from_repo_root_itself() {
+        let dir = tempdir().expect("tmpdir");
+        if !git_init_with_commit(dir.path()) {
+            return;
+        }
+        let args = SandboxArgs::default();
+        let result = resolved_repo_root(&args, dir.path());
+        assert_eq!(
+            result,
+            dir.path().canonicalize().ok(),
+            "calling from the repo root should return the repo root itself"
+        );
+    }
+
+    // ── 6. Normal repo: called from a subdirectory ────────────────────────
+    #[test]
+    fn resolved_repo_root_detects_git_repo() {
+        let dir = tempdir().expect("tmpdir");
+        if !git_init_with_commit(dir.path()) {
+            return;
+        }
+        let subdir = dir.path().join("packages/app");
+        std::fs::create_dir_all(&subdir).expect("create subdir");
+        let args = SandboxArgs::default();
+        let result = resolved_repo_root(&args, &subdir);
+        assert_eq!(
+            result,
+            dir.path().canonicalize().ok(),
+            "should return the repo root when called from a subdirectory"
+        );
+    }
+
+    // ── 7. Normal repo: called from a deeply-nested subdirectory ──────────
+    #[test]
+    fn resolved_repo_root_deeply_nested_subdir() {
+        let dir = tempdir().expect("tmpdir");
+        if !git_init_with_commit(dir.path()) {
+            return;
+        }
+        let deep = dir.path().join("a/b/c/d/e");
+        std::fs::create_dir_all(&deep).expect("create deep subdir");
+        let args = SandboxArgs::default();
+        let result = resolved_repo_root(&args, &deep);
+        assert_eq!(
+            result,
+            dir.path().canonicalize().ok(),
+            "deep nesting should still resolve to the repo root"
+        );
+    }
+
+    // ── 8. Nested repos: inner repo takes precedence over outer ───────────
+    //
+    // Layout:   outer/          (git repo)
+    //             inner/        (separate git repo)
+    //               sub/        (subdirectory inside inner)
+    //
+    // Running from outer/inner/sub should yield outer/inner, not outer.
+    #[test]
+    fn resolved_repo_root_nested_repo_uses_innermost() {
+        let outer = tempdir().expect("outer tmpdir");
+        if !git_init_with_commit(outer.path()) {
+            return;
+        }
+        let inner = outer.path().join("inner");
+        std::fs::create_dir_all(&inner).expect("create inner");
+        if !git_init_with_commit(&inner) {
+            return;
+        }
+        let sub = inner.join("sub");
+        std::fs::create_dir_all(&sub).expect("create sub");
+        let args = SandboxArgs::default();
+        let result = resolved_repo_root(&args, &sub);
+        assert_eq!(
+            result,
+            inner.canonicalize().ok(),
+            "innermost git repo should take precedence over outer repo"
+        );
+    }
+
+    // ── 9. Non-bare repo: linked worktree returns the worktree root ────────
+    //
+    // Layout:   main/     (normal git repo, first commit)
+    //           feat/     (linked worktree checked out via `git worktree add`)
+    //
+    // Running from feat/ should yield feat/ (the worktree checkout root),
+    // not main/ (the original repo).
+    #[test]
+    fn resolved_repo_root_worktree_finds_main_root() {
+        let main_dir = tempdir().expect("main tmpdir");
+        if !git_init_with_commit(main_dir.path()) {
+            return;
+        }
+        let wt_dir = tempdir().expect("wt tmpdir");
+        let wt_path = wt_dir.path().join("feat");
+        let wt_add = std::process::Command::new("git")
+            .args([
+                "worktree",
+                "add",
+                "-b",
+                "feat",
+                wt_path.to_str().expect("path str"),
+            ])
+            .current_dir(main_dir.path())
+            .output();
+        if wt_add.map(|o| !o.status.success()).unwrap_or(true) {
+            return; // worktree add failed (old git), skip
+        }
+        let args = SandboxArgs::default();
+        let result = resolved_repo_root(&args, &wt_path);
+        assert_eq!(
+            result,
+            wt_path.canonicalize().ok(),
+            "linked worktree: should return the worktree checkout root"
+        );
+    }
+
+    // ── 10. Non-bare repo: linked worktree subdir ─────────────────────────
+    //
+    // Same as above but called from a subdirectory *inside* the worktree.
+    #[test]
+    fn resolved_repo_root_worktree_subdir() {
+        let main_dir = tempdir().expect("main tmpdir");
+        if !git_init_with_commit(main_dir.path()) {
+            return;
+        }
+        let wt_dir = tempdir().expect("wt tmpdir");
+        let wt_path = wt_dir.path().join("feat");
+        let wt_add = std::process::Command::new("git")
+            .args([
+                "worktree",
+                "add",
+                "-b",
+                "feat",
+                wt_path.to_str().expect("path str"),
+            ])
+            .current_dir(main_dir.path())
+            .output();
+        if wt_add.map(|o| !o.status.success()).unwrap_or(true) {
+            return;
+        }
+        let sub = wt_path.join("apps/service");
+        std::fs::create_dir_all(&sub).expect("create wt subdir");
+        let args = SandboxArgs::default();
+        let result = resolved_repo_root(&args, &sub);
+        assert_eq!(
+            result,
+            wt_path.canonicalize().ok(),
+            "subdirectory inside a linked worktree should resolve to the worktree root"
+        );
+    }
+
+    // ── 11. Bare repo with worktrees (the squash-bug layout) ──────────────
+    //
+    // Layout:   bare.git/         (bare repo)
+    //           bare.git/main/    (worktree: main branch)
+    //           bare.git/feat/    (worktree: feature branch)
+    //
+    // `git rev-parse --show-toplevel` from bare.git/feat/apps/service
+    // should return bare.git/feat, not bare.git.
+    #[test]
+    fn resolved_repo_root_bare_repo_with_worktree() {
+        // 1. Create a normal repo, make a commit.
+        let src = tempdir().expect("src tmpdir");
+        if !git_init_with_commit(src.path()) {
+            return;
+        }
+        // 2. Clone it as a bare repo.
+        let bare = tempdir().expect("bare tmpdir");
+        let clone = std::process::Command::new("git")
+            .args([
+                "clone",
+                "--bare",
+                src.path().to_str().expect("src path"),
+                bare.path().to_str().expect("bare path"),
+            ])
+            .output();
+        if clone.map(|o| !o.status.success()).unwrap_or(true) {
+            return;
+        }
+        // 3. Add a worktree from the bare repo.
+        let wt_path = bare.path().join("feat");
+        let wt_add = std::process::Command::new("git")
+            .args(["worktree", "add", wt_path.to_str().expect("wt path")])
+            .current_dir(bare.path())
+            .output();
+        if wt_add.map(|o| !o.status.success()).unwrap_or(true) {
+            return;
+        }
+        // 4. Call from a subdirectory inside the worktree checkout.
+        let sub = wt_path.join("apps/service");
+        std::fs::create_dir_all(&sub).expect("create sub");
+        let args = SandboxArgs::default();
+        let result = resolved_repo_root(&args, &sub);
+        assert_eq!(
+            result,
+            wt_path.canonicalize().ok(),
+            "bare repo worktree subdir should resolve to the worktree checkout root"
+        );
     }
 
     #[cfg(unix)]

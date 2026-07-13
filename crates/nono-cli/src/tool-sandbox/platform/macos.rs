@@ -2634,7 +2634,7 @@ fn add_policy_credentials(
 }
 
 fn resolve_policy_path(entry: &str, workdir: &Path, cwd: &Path) -> Result<PathBuf> {
-    let expanded = crate::profile::expand_vars(entry, workdir)?;
+    let expanded = crate::profile::expand_vars(entry, workdir, None)?;
     if expanded.is_absolute() {
         Ok(expanded)
     } else {

@@ -202,10 +202,9 @@ impl CgroupLeaf {
     /// Never fails: an unreadable file yields `None`.
     #[must_use]
     pub fn pids_report(&self) -> Option<PidsReport> {
-        // The IO half: read the three knobs. pids.events is required (its `max`
-        // counter is the whole signal); pids.max / pids.peak are optional. The pure
-        // parsing/gating half lives in `parse_pids_report`, so it can be unit-tested
-        // without a live cgroup — mirroring delegated_base / parse_delegated_base.
+        // Read the three knobs; parse_pids_report does the parsing/gating (split out
+        // so it's unit-testable without a live cgroup). pids.events is required — its
+        // `max` counter is the whole signal — while pids.max / pids.peak are optional.
         let events = fs::read_to_string(self.path.join("pids.events")).ok()?;
         let max = fs::read_to_string(self.path.join("pids.max")).ok();
         let peak = fs::read_to_string(self.path.join("pids.peak")).ok();
@@ -213,13 +212,12 @@ impl CgroupLeaf {
     }
 }
 
-/// Pure parser/gate behind [`CgroupLeaf::pids_report`], split out so it can be
-/// tested without a live cgroup (mirrors [`parse_delegated_base`]). `events` is the
-/// raw `pids.events` table; `max` / `peak` are the raw `pids.max` / `pids.peak`
-/// contents, or `None` if that file couldn't be read. Returns `None` unless the
-/// kernel actually denied a `fork`/`clone` here (`max` counter > 0), so a clean run
-/// says nothing. `pids.max`'s literal `max` (unlimited) and an absent or unreadable
-/// `pids.peak` each read as `None` without suppressing the report.
+/// Pure parser/gate behind [`CgroupLeaf::pids_report`] (split out for unit tests).
+/// `events` is the raw `pids.events` table; `max` / `peak` are the raw `pids.max` /
+/// `pids.peak` contents, or `None` if unreadable. Returns `None` unless the kernel
+/// actually denied a fork here (`max` counter > 0), so a clean run says nothing.
+/// `pids.max`'s literal `max` (unlimited) and an absent `pids.peak` parse to `None`
+/// without dropping the report.
 fn parse_pids_report(events: &str, max: Option<&str>, peak: Option<&str>) -> Option<PidsReport> {
     let max_events = event_counter(events, "max");
     // No denied fork here: the cap wasn't hit, so say nothing.

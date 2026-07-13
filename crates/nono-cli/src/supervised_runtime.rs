@@ -353,29 +353,24 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
             }
         };
 
-        // Post-mortem hook, installed only when a resource cgroup leaf exists. It
-        // reads the leaf's kernel evidence while it still exists and prints a precise
-        // diagnostic, so a resource breach is loud, not silent. Returning `true` means
-        // "I explained this exit", which suppresses the generic failure footer (the
-        // "no path denials … here's how to grant access" help) so the user gets one
-        // story. It does NOT change the exit code — that is propagated regardless.
+        // Post-mortem hook, installed only when a resource cgroup leaf exists. It reads
+        // the leaf's kernel evidence and prints a precise diagnostic, so a resource
+        // breach is loud, not silent. Returning `true` means "I explained this exit" and
+        // suppresses the generic path-permissions footer; it never changes the exit code.
         #[cfg(target_os = "linux")]
         let on_exit_diag_fn = |code: i32| -> bool {
-            // Memory path: a whole-sandbox OOM kill arrives as a bare SIGKILL (exit
-            // 137) with no explanation. Only 137 counts — a crash (SIGSEGV -> 139) or
-            // SIGTERM (-> 143) must not borrow the "out of memory" story. If we can
-            // prove the kill, explain it and suppress the generic footer.
+            // Memory path: an OOM kill arrives as a bare SIGKILL (exit 137) with no
+            // explanation. Only 137 counts — a crash (139) or SIGTERM (143) must not
+            // borrow the "out of memory" story. Explain it only if we can prove the kill.
             if is_oom_sigkill_exit(code)
                 && let Some(report) = cgroup_leaf.as_ref().and_then(|leaf| leaf.oom_report())
             {
                 crate::output::print_oom_diagnostic(&report, silent);
                 return true;
             }
-            // Process-cap path: hitting pids.max kills nothing and produces no fixed
-            // exit code — the offending fork just fails with EAGAIN — so check on every
-            // exit. If we can prove the cap was hit, that IS the failure's explanation;
-            // suppress the generic path-permissions footer, since a "grant more paths"
-            // hint would be actively misleading here.
+            // Process-cap path: hitting pids.max kills nothing and has no fixed exit code
+            // (the fork just fails with EAGAIN), so check on every exit. If the cap was
+            // hit that IS the explanation — a "grant more paths" footer would mislead.
             if let Some(report) = cgroup_leaf.as_ref().and_then(|leaf| leaf.pids_report()) {
                 crate::output::print_pids_diagnostic(&report, silent);
                 return true;

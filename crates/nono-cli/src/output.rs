@@ -51,11 +51,10 @@ pub fn print_banner(silent: bool) {
 // Capabilities
 // ---------------------------------------------------------------------------
 
-/// The parenthetical after the `resources` summary, spelling out breach behavior
-/// so the two caps aren't confused: over memory the process tree is killed; over
-/// the process count new forks are refused (nothing dies). Callers only render this
-/// for a non-empty limit set, so at least one bool is true; the `_` arm is the
-/// memory-only case, and the unreachable `(false, false)` folds into it.
+/// The parenthetical after the `resources` summary, spelling out breach behavior so
+/// the two caps aren't confused: over memory the tree is killed; over the process
+/// count new forks are refused (nothing dies). Only rendered for a non-empty limit
+/// set, so the `_` arm is memory-only — `(false, false)` never reaches here.
 fn resource_limit_note(has_memory: bool, has_processes: bool) -> &'static str {
     match (has_memory, has_processes) {
         (true, true) => {
@@ -741,11 +740,10 @@ pub fn print_oom_diagnostic(report: &OomReport, silent: bool) {
 
 /// Explain that the sandbox hit its `--max-processes` ceiling.
 ///
-/// Unlike the memory cap this kills nothing — the kernel just refused a
-/// `fork`/`clone` (EAGAIN), which the program may have surfaced as an opaque
-/// "resource temporarily unavailable" or "cannot fork" error and any exit code. We
-/// name the limit and how many forks were denied so that failure is explained, not
-/// mysterious. Printed whenever the cap was hit, regardless of exit code.
+/// Unlike the memory cap this kills nothing — the kernel just refused a `fork`/`clone`
+/// (EAGAIN), which the program may surface as an opaque "resource temporarily
+/// unavailable" under any exit code. Naming the limit and the denied-fork count turns
+/// that into an explained failure. Printed whenever the cap was hit, any exit code.
 #[cfg(target_os = "linux")]
 pub fn print_pids_diagnostic(report: &PidsReport, silent: bool) {
     if silent {

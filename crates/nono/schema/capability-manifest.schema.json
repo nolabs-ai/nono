@@ -40,7 +40,7 @@
     },
     "resources": {
       "$ref": "#/$defs/Resources",
-      "description": "Resource ceilings for the sandboxed process tree (currently memory), enforced by the supervisor. Requires exec_strategy: \"supervised\"."
+      "description": "Resource ceilings for the sandboxed process tree (memory and max processes), enforced by the supervisor. Requires exec_strategy: \"supervised\"."
     }
   },
   "$defs": {

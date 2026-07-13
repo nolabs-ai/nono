@@ -56,12 +56,12 @@ nono run --memory 512M --max-processes 64 -- my-agent
 
 The run exits `137` (128 + `SIGKILL`). A failure unrelated to memory shows the normal diagnostics, not this one.
 
-**Process count.** Hitting the process cap is different: the kernel **kills nothing**. It simply refuses the next `fork`/`clone` with `EAGAIN`, which the program usually surfaces as "resource temporarily unavailable" or "cannot fork". The exit code is whatever the program itself returns. `nono` detects that the cap was hit and adds an explanation regardless of exit code:
+**Process count.** Hitting the process cap is different: the kernel **kills nothing**. It simply refuses the next `fork`/`clone` with `EAGAIN`, which the program usually surfaces as "resource temporarily unavailable" or "cannot fork". The exit code is whatever the program itself returns. The kernel's denied-fork counter is cumulative, so it proves only that the cap was *touched*, not that it *caused* the outcome. `nono` therefore notes it only when the run exits **non-zero** — a clean exit means the program recovered from the `EAGAIN`, and a run killed by an unrelated signal is never attributed to the cap (a process breach never kills):
 
 ```
-[nono] process limit reached: the sandbox hit its process cap; the kernel refused new processes (fork failed) — it was not killed.
+[nono] process limit hit: the sandbox hit its process cap at least once during this run; the kernel refused a fork/clone (EAGAIN) — nothing was killed. This may be why the program exited non-zero.
        limit (--max-processes): 64
-       peak processes:          64
+       peak processes:          64      # only on Linux 6.1+; omitted on older kernels
        denied forks:            3
        hint: raise the ceiling to allow more processes, e.g. --max-processes 256.
 ```

@@ -915,9 +915,9 @@ pub struct CapabilitySet {
     /// When set, the generated Seatbelt profile emits `(debug deny)` so
     /// sandboxd records denial events in the unified log.
     seatbelt_debug_deny: bool,
-    /// Resource ceilings (currently memory) for the sandboxed tree. Plumbed
-    /// through here so they ride the serialization layer like other policy;
-    /// enforced by the supervisor via cgroup v2 on Linux.
+    /// Resource ceilings (memory and max processes) for the sandboxed tree.
+    /// Plumbed through here so they ride the serialization layer like other
+    /// policy; enforced by the supervisor via cgroup v2 on Linux.
     resource_limits: Option<ResourceLimits>,
 }
 
@@ -1022,7 +1022,7 @@ impl CapabilitySet {
         self
     }
 
-    /// Attach resource ceilings (currently memory) to the set (builder pattern).
+    /// Attach resource ceilings (memory and max processes) to the set (builder pattern).
     ///
     /// The limits are carried through serialization, surfaced in `--dry-run`,
     /// and enforced by the supervisor via cgroup v2 on Linux.

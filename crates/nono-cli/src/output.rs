@@ -742,8 +742,10 @@ pub fn print_oom_diagnostic(report: &OomReport, silent: bool) {
 ///
 /// Unlike the memory cap this kills nothing — the kernel just refused a `fork`/`clone`
 /// (EAGAIN), which the program may surface as an opaque "resource temporarily
-/// unavailable" under any exit code. Naming the limit and the denied-fork count turns
-/// that into an explained failure. Printed whenever the cap was hit, any exit code.
+/// unavailable". `pids.events`'s `max` counter is cumulative, so it proves only that
+/// the cap was touched, not that it caused the exit; the caller therefore gates this
+/// on a non-zero, non-signal exit, and the text says "may be why", not "was why". A
+/// clean exit (recovered) or a signal-killed run is never attributed to the cap.
 #[cfg(target_os = "linux")]
 pub fn print_pids_diagnostic(report: &PidsReport, silent: bool) {
     if silent {
@@ -764,10 +766,11 @@ pub fn print_pids_diagnostic(report: &PidsReport, silent: bool) {
 
     emit(&format!(
         "{} {}",
-        fg("[nono] process limit reached:", t.red).bold(),
+        fg("[nono] process limit hit:", t.red).bold(),
         fg(
-            "the sandbox hit its process cap; the kernel refused new processes (fork failed) — \
-             it was not killed.",
+            "the sandbox hit its process cap at least once during this run; the kernel refused \
+             a fork/clone (EAGAIN) — nothing was killed. This may be why the program exited \
+             non-zero.",
             t.text,
         ),
     ));

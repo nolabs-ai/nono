@@ -20,9 +20,9 @@ pub struct SandboxState {
     pub unix_sockets: Vec<UnixSocketCapState>,
     /// Whether network is blocked
     pub net_blocked: bool,
-    /// Resource ceilings (currently memory). Absent in states from older nono
-    /// builds; `#[serde(default)]` keeps those loadable. Plain numbers, so unlike
-    /// paths they need no re-validation.
+    /// Resource ceilings (memory and max processes). Absent in states from older
+    /// nono builds; `#[serde(default)]` keeps those loadable. Plain numbers, so
+    /// unlike paths they need no re-validation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource_limits: Option<ResourceLimits>,
 }

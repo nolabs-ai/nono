@@ -39,8 +39,8 @@ pub struct SandboxState {
     /// Endpoint-restricted domains with method+path rules
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub domain_endpoints: Vec<DomainEndpointState>,
-    /// Resource ceilings (currently memory) in effect for this sandbox, so
-    /// `nono why --self` can report them. Absent in states written by older
+    /// Resource ceilings (memory and max processes) in effect for this sandbox,
+    /// so `nono why --self` can report them. Absent in states written by older
     /// nono builds; `#[serde(default)]` keeps those loadable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource_limits: Option<ResourceLimits>,

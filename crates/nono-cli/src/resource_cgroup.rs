@@ -85,8 +85,9 @@ pub struct OomReport {
 /// fork failure the program surfaced can be explained as "you hit the process cap".
 ///
 /// Distinct from [`OomReport`]: a pids breach kills nothing and produces no fixed
-/// exit code — the offending `fork` just returns `EAGAIN` — so this is read on
-/// every exit, not only on a SIGKILL.
+/// exit code — the offending `fork` just returns `EAGAIN`. The `max` counter is
+/// cumulative, so it proves the cap was touched, not that it caused the exit; the
+/// caller only surfaces this on a non-zero, non-signal exit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PidsReport {
     /// How many times a `fork`/`clone` was denied here for hitting the limit

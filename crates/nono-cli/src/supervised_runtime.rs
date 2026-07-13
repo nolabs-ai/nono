@@ -165,6 +165,16 @@ const fn is_oom_sigkill_exit(exit_code: i32) -> bool {
     exit_code == 128 + nix::libc::SIGKILL
 }
 
+/// An "ordinary" failure exit: the program itself returned a non-zero code and was
+/// NOT killed by a signal (signal deaths are `128 + signo`, i.e. `> 128`). This is the
+/// only exit shape consistent with a refused `fork`/`clone` (EAGAIN) surfacing — a
+/// clean exit (0) means the program recovered, and a signal death means something
+/// *killed* the tree, which the pids cap never does. `128` itself is not a signal
+/// death (e.g. git uses it for fatal errors), so it counts as an ordinary failure.
+const fn is_ordinary_failure_exit(exit_code: i32) -> bool {
+    exit_code > 0 && exit_code <= 128
+}
+
 fn should_open_supervised_pty(
     detached_start: bool,
     stdin_is_terminal: bool,
@@ -368,10 +378,14 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
                 crate::output::print_oom_diagnostic(&report, silent);
                 return true;
             }
-            // Process-cap path: hitting pids.max kills nothing and has no fixed exit code
-            // (the fork just fails with EAGAIN), so check on every exit. If the cap was
-            // hit that IS the explanation — a "grant more paths" footer would mislead.
-            if let Some(report) = cgroup_leaf.as_ref().and_then(|leaf| leaf.pids_report()) {
+            // Process-cap path: a pids breach kills nothing — the offending fork just
+            // returns EAGAIN, which the program surfaces as an ordinary non-zero exit.
+            // Its cumulative `max` counter only proves the cap was touched, not that it
+            // caused THIS exit, so we surface it (phrased as "may explain") solely on an
+            // ordinary failure exit — never on a clean or signal-killed run.
+            if is_ordinary_failure_exit(code)
+                && let Some(report) = cgroup_leaf.as_ref().and_then(|leaf| leaf.pids_report())
+            {
                 crate::output::print_pids_diagnostic(&report, silent);
                 return true;
             }
@@ -460,6 +474,36 @@ mod tests {
         assert!(
             !is_oom_sigkill_exit(143),
             "SIGTERM (128+15) is not an OOM kill"
+        );
+    }
+
+    /// The pids-cap diagnostic is surfaced only on an ordinary failure exit: a clean
+    /// exit means the program recovered from the EAGAIN, and a signal death means the
+    /// tree was killed (which the pids cap never does). `128` counts as ordinary (git
+    /// uses it for fatal errors); `> 128` is a signal death.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn only_an_ordinary_failure_exit_is_blamed_on_the_pids_cap() {
+        use super::is_ordinary_failure_exit;
+        assert!(
+            is_ordinary_failure_exit(1),
+            "a plain non-zero exit could be a refused fork surfacing"
+        );
+        assert!(
+            is_ordinary_failure_exit(128),
+            "128 (e.g. git fatal) is an ordinary failure, not a signal death"
+        );
+        assert!(
+            !is_ordinary_failure_exit(0),
+            "a clean exit means the program recovered from EAGAIN"
+        );
+        assert!(
+            !is_ordinary_failure_exit(137),
+            "SIGKILL (128+9) killed the tree; the pids cap never kills"
+        );
+        assert!(
+            !is_ordinary_failure_exit(143),
+            "SIGTERM (128+15) is a kill, not a fork failure"
         );
     }
 

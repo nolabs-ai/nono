@@ -171,6 +171,7 @@ const fn is_oom_sigkill_exit(exit_code: i32) -> bool {
 /// clean exit (0) means the program recovered, and a signal death means something
 /// *killed* the tree, which the pids cap never does. `128` itself is not a signal
 /// death (e.g. git uses it for fatal errors), so it counts as an ordinary failure.
+#[cfg(target_os = "linux")]
 const fn is_ordinary_failure_exit(exit_code: i32) -> bool {
     exit_code > 0 && exit_code <= 128
 }

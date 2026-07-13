@@ -2462,7 +2462,7 @@ pub fn load_profile_extends(name_or_path: &str) -> Option<Vec<String>> {
 ///    `install_as` matches the requested name. Self-heals Claude Code plugin
 ///    wiring (symlink + `enabledPlugins`) on every successful resolution.
 /// 3. Built-in profiles (compiled into binary).
-/// 4. Auto-pull prompt for the registry pack `always-further/claude` when
+/// 4. Auto-pull prompt for the registry pack `nolabs-ai/claude` when
 ///    the requested profile is `claude-code` (or inherits from it).
 pub fn load_profile(name_or_path: &str) -> Result<Profile> {
     load_profile_impl(name_or_path, &[])
@@ -2605,9 +2605,9 @@ fn load_profile_inner(name_or_path: &str, cli_extends: &[String]) -> Result<Opti
         if !profile.packs.contains(&pack_key) {
             profile.packs.push(pack_key);
         }
-        // If we just resolved through `always-further/claude`, also offer
+        // If we just resolved through `nolabs-ai/claude`, also offer
         // to strip pre-0.43 inbuilt-hook leftovers. Catches the path
-        // where users `nono pull always-further/claude` directly,
+        // where users `nono pull nolabs-ai/claude` directly,
         // bypassing the post-pull cleanup hook in `migration::check_and_run`.
         // Idempotent: silent no-op when no legacy artifacts exist, so safe
         // to fire on every claude resolution.
@@ -2633,7 +2633,7 @@ fn load_profile_inner(name_or_path: &str, cli_extends: &[String]) -> Result<Opti
     Ok(None)
 }
 
-/// True when `profile_path` lives inside `<package_store>/always-further/claude/`.
+/// True when `profile_path` lives inside `<package_store>/nolabs-ai/claude/`.
 /// Used to gate legacy-cleanup invocation on the canonical claude pack
 /// rather than any pack that happens to publish a profile named `claude`
 /// or `claude-code`.
@@ -3189,7 +3189,7 @@ enum ResolvedBase {
 /// This handles the v0.42 → v0.43 upgrade case where a user profile
 /// `extends: ["claude-code"]` and the inbuilt `claude-code` is gone:
 /// instead of an inscrutable "base profile not found" error, the user
-/// sees the same install prompt that `--profile always-further/claude` would
+/// sees the same install prompt that `--profile nolabs-ai/claude` would
 /// produce, with the chain still resolving cleanly on accept.
 fn load_base_profile_raw(
     name: &str,
@@ -3875,7 +3875,7 @@ pub fn list_profiles() -> Vec<String> {
     }
 
     // Add pack-store profiles — names exposed by installed packs via
-    // `install_as`. Without this, `--profile always-further/claude` works (the
+    // `install_as`. Without this, `--profile nolabs-ai/claude` works (the
     // resolver finds it) but `nono profile list` doesn't surface it,
     // confusing users who expect a one-stop catalogue.
     for (name, _pack_ref) in list_pack_store_profiles() {
@@ -4487,9 +4487,9 @@ mod tests {
         assert!(profiles.contains(&"openclaw".to_string()));
         assert!(profiles.contains(&"swival".to_string()));
         // These profiles were removed from built-ins; they ship via registry packs:
-        //   claude-code / claude → always-further/claude   (removed v0.43.0)
-        //   codex               → always-further/codex    (removed v0.43.0)
-        //   opencode            → always-further/opencode (removed)
+        //   claude-code / claude → nolabs-ai/claude   (formerly always-further/claude, removed v0.43.0)
+        //   codex               → nolabs-ai/codex    (formerly always-further/codex, removed v0.43.0)
+        //   opencode            → nolabs-ai/opencode (formerly always-further/opencode, removed)
         assert!(!profiles.contains(&"claude-code".to_string()));
         assert!(!profiles.contains(&"codex".to_string()));
         assert!(!profiles.contains(&"opencode".to_string()));

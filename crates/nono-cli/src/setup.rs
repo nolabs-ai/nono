@@ -374,7 +374,7 @@ impl SetupRunner {
 
         println!("  You can add these aliases to {}:", shell_rc);
         println!();
-        println!("    alias nono-claude='nono run --profile always-further/claude -- claude'");
+        println!("    alias nono-claude='nono run --profile nolabs-ai/claude -- claude'");
         println!("    alias nono-safe='nono run --allow-cwd --block-net --'");
         println!();
     }
@@ -393,7 +393,7 @@ impl SetupRunner {
             println!("Quick start examples:");
             println!();
             println!("  # Run Claude Code with built-in profile (recommended)");
-            println!("  nono run --profile always-further/claude -- claude");
+            println!("  nono run --profile nolabs-ai/claude -- claude");
             println!();
             println!("  # Run any command with current directory access");
             println!("  nono run --allow-cwd -- <command>");

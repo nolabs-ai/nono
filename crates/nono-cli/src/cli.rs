@@ -134,8 +134,8 @@ pub enum Commands {
 {after-help}")]
     #[command(after_help = "\x1b[1mEXAMPLES\x1b[0m
   nono run --allow . claude                    # Read/write current dir, run claude
-  nono run --profile always-further/claude claude        # Use a profile
-  nono run --profile always-further/claude --allow-domain api.openai.com claude
+  nono run --profile nolabs-ai/claude claude        # Use a profile
+  nono run --profile nolabs-ai/claude --allow-domain api.openai.com claude
                                                # Restrict outbound access to listed domains
   nono run --read ./src --write ./output cargo build
                                                # Separate read/write permissions
@@ -156,7 +156,7 @@ pub enum Commands {
 {after-help}")]
     #[command(after_help = "\x1b[1mEXAMPLES\x1b[0m
   nono shell --allow .                         # Shell with read/write to current dir
-  nono shell --profile always-further/claude             # Use a named profile
+  nono shell --profile nolabs-ai/claude             # Use a named profile
   nono shell --allow . --shell /bin/zsh        # Override shell binary
 ")]
     Shell(Box<ShellArgs>),
@@ -558,9 +558,9 @@ IN-BAND DETACH:
 {all-args}
 {after-help}")]
     #[command(after_help = "\x1b[1mEXAMPLES\x1b[0m
-  nono pull always-further/claude
-  nono pull always-further/claude@1.2.0 --registry http://localhost:3000
-  nono pull always-further/claude --init
+  nono pull nolabs-ai/claude
+  nono pull nolabs-ai/claude@1.2.0 --registry http://localhost:3000
+  nono pull nolabs-ai/claude --init
 ")]
     Pull(PullArgs),
 
@@ -574,7 +574,7 @@ IN-BAND DETACH:
 {all-args}
 {after-help}")]
     #[command(after_help = "\x1b[1mEXAMPLES\x1b[0m
-  nono remove always-further/claude
+  nono remove nolabs-ai/claude
 ")]
     Remove(RemoveArgs),
 
@@ -589,7 +589,7 @@ IN-BAND DETACH:
 {after-help}")]
     #[command(after_help = "\x1b[1mEXAMPLES\x1b[0m
   nono update
-  nono update always-further/claude
+  nono update nolabs-ai/claude
   nono update --dry-run
   nono update --force                          # also update pinned packs
 ")]
@@ -635,7 +635,7 @@ IN-BAND DETACH:
 {all-args}
 {after-help}")]
     #[command(after_help = "\x1b[1mEXAMPLES\x1b[0m
-  nono pin always-further/claude
+  nono pin nolabs-ai/claude
 ")]
     Pin(PinArgs),
 
@@ -649,7 +649,7 @@ IN-BAND DETACH:
 {all-args}
 {after-help}")]
     #[command(after_help = "\x1b[1mEXAMPLES\x1b[0m
-  nono unpin always-further/claude
+  nono unpin nolabs-ai/claude
 ")]
     Unpin(UnpinArgs),
 

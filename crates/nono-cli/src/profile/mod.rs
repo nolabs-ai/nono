@@ -9927,6 +9927,112 @@ mod tests {
     }
 
     #[test]
+    fn platform_overrides_merge_adds_command_daemon_pid_source() {
+        // `daemon_pid_source` declared only in the current platform's override must
+        // land on the command's effective policy, alongside the base's fields.
+        let current_os = crate::platform::current_os_name();
+        let json = format!(
+            r#"{{
+                "meta": {{"name": "test"}},
+                "command_policies": {{"commands": {{"tmux": {{"sandbox": {{"exec_paths": ["/base/exec"]}}}}}}}},
+                "platform_overrides": {{
+                    "{current_os}": {{"command_policies": {{"commands": {{"tmux": {{"daemon_pid_source": {{"argv": ["tmux-pid"]}}}}}}}}}}
+                }}
+            }}"#
+        );
+        let profile: Profile = serde_json::from_str(&json).expect("parse");
+        let finalized = finalize_profile(profile).expect("finalize");
+        let tmux = &finalized
+            .command_policies
+            .expect("command_policies")
+            .commands["tmux"];
+        assert_eq!(
+            tmux.daemon_pid_source
+                .as_ref()
+                .map(|source| source.argv.clone()),
+            Some(vec!["tmux-pid".to_string()]),
+            "current-OS override must add daemon_pid_source"
+        );
+        assert_eq!(
+            tmux.sandbox.as_ref().expect("sandbox").exec_paths,
+            vec!["/base/exec".to_string()],
+            "base sandbox must survive the override merge"
+        );
+    }
+
+    #[test]
+    fn platform_overrides_other_platform_daemon_pid_source_not_applied() {
+        // A `daemon_pid_source` override for the non-current platform must not leak in.
+        let other_os = if crate::platform::current_os_name() == "macos" {
+            "linux"
+        } else {
+            "macos"
+        };
+        let json = format!(
+            r#"{{
+                "meta": {{"name": "test"}},
+                "command_policies": {{"commands": {{"tmux": {{"sandbox": {{"exec_paths": ["/base/exec"]}}}}}}}},
+                "platform_overrides": {{
+                    "{other_os}": {{"command_policies": {{"commands": {{"tmux": {{"daemon_pid_source": {{"argv": ["tmux-pid"]}}}}}}}}}}
+                }}
+            }}"#
+        );
+        let profile: Profile = serde_json::from_str(&json).expect("parse");
+        let finalized = finalize_profile(profile).expect("finalize");
+        assert_eq!(
+            finalized
+                .command_policies
+                .expect("command_policies")
+                .commands["tmux"]
+                .daemon_pid_source,
+            None,
+            "other platform's daemon_pid_source must not be present"
+        );
+    }
+
+    #[test]
+    fn extends_child_daemon_pid_source_replaces_base() {
+        // resolve_extends folds `merge_profiles(base, child)`; the child (more
+        // derived) helper wins.
+        let base: Profile = serde_json::from_str(
+            r#"{"meta":{"name":"base"},"command_policies":{"commands":{"tmux":{"daemon_pid_source":{"argv":["base-pid"]}}}}}"#,
+        )
+        .expect("parse base");
+        let child: Profile = serde_json::from_str(
+            r#"{"meta":{"name":"child"},"command_policies":{"commands":{"tmux":{"daemon_pid_source":{"argv":["child-pid"]}}}}}"#,
+        )
+        .expect("parse child");
+        let merged = merge_profiles(base, child);
+        assert_eq!(
+            merged.command_policies.expect("command_policies").commands["tmux"]
+                .daemon_pid_source
+                .as_ref()
+                .map(|source| source.argv.clone()),
+            Some(vec!["child-pid".to_string()])
+        );
+    }
+
+    #[test]
+    fn extends_inherits_base_daemon_pid_source_when_child_omits() {
+        let base: Profile = serde_json::from_str(
+            r#"{"meta":{"name":"base"},"command_policies":{"commands":{"tmux":{"daemon_pid_source":{"argv":["base-pid"]}}}}}"#,
+        )
+        .expect("parse base");
+        let child: Profile = serde_json::from_str(
+            r#"{"meta":{"name":"child"},"command_policies":{"commands":{"tmux":{}}}}"#,
+        )
+        .expect("parse child");
+        let merged = merge_profiles(base, child);
+        assert_eq!(
+            merged.command_policies.expect("command_policies").commands["tmux"]
+                .daemon_pid_source
+                .as_ref()
+                .map(|source| source.argv.clone()),
+            Some(vec!["base-pid".to_string()])
+        );
+    }
+
+    #[test]
     fn platform_overrides_other_platform_not_applied() {
         // The override for the non-current platform must not bleed in.
         let other_os = if crate::platform::current_os_name() == "macos" {

@@ -529,6 +529,24 @@ pub struct CommandPolicyConfig {
     pub allow_direct_exec_bypass_with_credentials: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub intercept: Vec<InterceptRuleConfig>,
+    /// Helper that reports the pid of a daemon this command spawns (e.g. a tmux
+    /// server that reparents to pid 1), letting the lineage marker attribute a
+    /// severed caller back to this command. Consumed on macOS only for now.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_pid_source: Option<DaemonPidSource>,
+}
+
+/// The helper the lineage marker runs to attribute a severed daemon back to a
+/// command, plus the daemon-env keys it may see.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DaemonPidSource {
+    /// Helper program + args. The program is expanded (`~`, `$WORKDIR`, `$TMPDIR`,
+    /// `$UID`, XDG) and must then be an absolute path.
+    pub argv: Vec<String>,
+    /// Daemon-env keys nono may forward into the helper's JSON `daemon_env`.
+    #[serde(default)]
+    pub env: Vec<String>,
 }
 
 impl CommandPolicyConfig {
@@ -568,6 +586,11 @@ impl CommandPolicyConfig {
                 }
                 rules
             },
+            // Child (more-derived) replaces the base helper: replace, not merge.
+            daemon_pid_source: child
+                .daemon_pid_source
+                .clone()
+                .or_else(|| self.daemon_pid_source.clone()),
         }
     }
 }
@@ -4464,6 +4487,83 @@ mod tests {
         };
         let merged = parent.merge_child(&child);
         assert_eq!(merged.intercept.len(), 1);
+    }
+
+    #[test]
+    fn daemon_pid_source_child_replaces_parent() {
+        let parent = CommandPolicyConfig {
+            daemon_pid_source: Some(DaemonPidSource {
+                argv: vec!["parent-helper".to_string()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let child = CommandPolicyConfig {
+            daemon_pid_source: Some(DaemonPidSource {
+                argv: vec!["child-helper".to_string()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            parent.merge_child(&child).daemon_pid_source,
+            Some(DaemonPidSource {
+                argv: vec!["child-helper".to_string()],
+                ..Default::default()
+            })
+        );
+    }
+
+    #[test]
+    fn daemon_pid_source_inherited_when_child_omits_it() {
+        let parent = CommandPolicyConfig {
+            daemon_pid_source: Some(DaemonPidSource {
+                argv: vec!["parent-helper".to_string()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let child = CommandPolicyConfig::default();
+        assert_eq!(
+            parent.merge_child(&child).daemon_pid_source,
+            Some(DaemonPidSource {
+                argv: vec!["parent-helper".to_string()],
+                ..Default::default()
+            })
+        );
+        // Child adds it where the parent has none.
+        assert_eq!(
+            child.merge_child(&parent).daemon_pid_source,
+            Some(DaemonPidSource {
+                argv: vec!["parent-helper".to_string()],
+                ..Default::default()
+            })
+        );
+    }
+
+    #[test]
+    fn daemon_pid_source_round_trips_through_serde() {
+        let config = CommandPolicyConfig {
+            daemon_pid_source: Some(DaemonPidSource {
+                argv: vec!["tmux-server-pid".to_string(), "--workspace".to_string()],
+                env: vec!["BAZEL_OUTPUT_USER_ROOT".to_string()],
+            }),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&config).expect("serialize");
+        assert!(
+            json.contains("daemon_pid_source"),
+            "field must serialize: {json}"
+        );
+        let parsed: CommandPolicyConfig = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed.daemon_pid_source, config.daemon_pid_source);
+
+        // Omitted by default (skip_serializing_if) and parses back as None.
+        let empty = serde_json::to_string(&CommandPolicyConfig::default()).expect("serialize");
+        assert!(
+            !empty.contains("daemon_pid_source"),
+            "absent by default: {empty}"
+        );
     }
 
     #[test]

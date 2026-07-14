@@ -42,8 +42,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::{debug, warn};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tracing::{debug, trace, warn};
 use zeroize::Zeroizing;
 
 // ── Constants ────────────────────────────────────────────────────────────
@@ -156,6 +156,9 @@ struct ToolSandboxState {
     credential_handles: BTreeMap<String, ResolvedCredential>,
     proxy_trust_bundle_paths: Vec<PathBuf>,
     active_children: Mutex<HashMap<u32, ActiveChild>>,
+    /// Attributes severed-ancestry callers to their spawning command. See the
+    /// daemon-lineage section below.
+    lineage: LineageMarker,
     active_count: AtomicUsize,
     queued_requests: AtomicUsize,
     emitted_error_response: AtomicBool,
@@ -303,6 +306,8 @@ impl PreparedToolSandboxRuntime {
         seal_shim_dir(&shim_dir)?;
 
         let approval_backends = crate::approval_runtime::build_approval_registry(&plan.config)?;
+        // Verify severed daemons if any command declares a helper, else disabled (fail closed).
+        let lineage = LineageMarker::build(&plan.config);
         let runtime = Self {
             inner: Arc::new(ToolSandboxState {
                 runtime_dir,
@@ -322,6 +327,7 @@ impl PreparedToolSandboxRuntime {
                 credential_handles,
                 proxy_trust_bundle_paths: proxy_trust_bundle_paths.to_vec(),
                 active_children: Mutex::new(HashMap::new()),
+                lineage,
                 active_count: AtomicUsize::new(0),
                 queued_requests: AtomicUsize::new(0),
                 emitted_error_response: AtomicBool::new(false),
@@ -1743,7 +1749,37 @@ fn resolve_caller(
     state: &ToolSandboxState,
     command_name: &str,
 ) -> Result<Caller> {
+    resolve_caller_with(
+        peer_pid,
+        session_root_pid,
+        state,
+        command_name,
+        |daemon_pid| {
+            // Only a genuinely reparented daemon (ppid 1) is a valid severed anchor.
+            if parent_pid(daemon_pid).ok() != Some(1) {
+                return None;
+            }
+            state
+                .lineage
+                .resolve_severed_command(daemon_pid, &state.plan.config, &state.policy_root)
+                .map(|name| Caller::Command { name })
+        },
+    )
+}
+
+/// `resolve_severed` receives the daemon pid `D` (last non-init pid in the walk);
+/// a parameter so tests can drive the severed branch without a real reparented
+/// process. Mirrors the Linux `lineage_cgroup` seam.
+fn resolve_caller_with(
+    peer_pid: u32,
+    session_root_pid: u32,
+    state: &ToolSandboxState,
+    command_name: &str,
+    resolve_severed: impl Fn(u32) -> Option<Caller>,
+) -> Result<Caller> {
     let mut pid = peer_pid;
+    // On a severed walk this ends as the reparented daemon `D` (ppid 1).
+    let mut last_non_init = peer_pid;
     for _ in 0..ANCESTRY_DEPTH_LIMIT {
         if let Some((cmd, launch_caller)) = live_active_child(pid, state)? {
             if cmd == command_name
@@ -1759,6 +1795,7 @@ fn resolve_caller(
         if pid == 0 || pid == 1 {
             break;
         }
+        last_non_init = pid;
         pid = match parent_pid(pid) {
             Ok(p) => p,
             // If proc_pidinfo fails partway up the chain the process likely
@@ -1766,10 +1803,452 @@ fn resolve_caller(
             Err(_) => break,
         };
     }
+    // Walk stopped short of the root: an ancestor daemonized (reparented to pid 1).
+    // Fail closed unless the marker verifies `last_non_init` by pid identity.
+    if let Some(caller) = resolve_severed(last_non_init) {
+        return Ok(caller);
+    }
     Err(NonoError::BlockedCommand {
         command: "unknown".to_string(),
         reason: "caller ancestry did not reach session root".to_string(),
     })
+}
+
+// ── Daemon lineage ─────────────────────────────────────────────────────────
+//
+// A daemonized caller (setsid + double-fork, reparented to pid 1) severs the
+// parent-pid walk above. The marker re-establishes attribution by running each
+// command's declared `daemon_pid_source` helper and matching the pid it reports
+// against the severed daemon `D`, pinned by kernel identity so a recycled pid
+// cannot inherit a stale attribution. Fail closed: no helper naming `D` -> deny,
+// never the session.
+//
+// Mirrors the Linux `lineage_cgroup::LineageMarker` seam (verified pid vs.
+// unforgeable cgroup membership). Lives here, not a standalone module, to reuse
+// the `proc_pidinfo` FFI and `ProcBsdInfo` layout defined above.
+
+/// The session's lineage-attribution mechanism, chosen once at supervisor start.
+enum LineageMarker {
+    /// A command declares a `daemon_pid_source`; severed daemons are verified against it.
+    DaemonPid(DaemonPidLineage),
+    /// No helper declared; severed callers are denied (fail closed).
+    Disabled,
+}
+
+impl LineageMarker {
+    fn build(config: &CommandPoliciesConfig) -> Self {
+        if config
+            .commands
+            .values()
+            .any(|command| command.daemon_pid_source.is_some())
+        {
+            Self::DaemonPid(DaemonPidLineage::default())
+        } else {
+            Self::Disabled
+        }
+    }
+
+    /// Attribute a severed daemon `D` to the command that declared it, or `None`
+    /// to deny. Never the session.
+    fn resolve_severed_command(
+        &self,
+        daemon_pid: u32,
+        config: &CommandPoliciesConfig,
+        policy_root: &Path,
+    ) -> Option<String> {
+        match self {
+            Self::DaemonPid(lineage) => lineage.attribute(daemon_pid, config, policy_root),
+            Self::Disabled => None,
+        }
+    }
+}
+
+/// Kernel identity of a pid: `p_uniqueid` (monotonic per boot, never recycled)
+/// plus BSD process start time. Pins a cached `D -> command` attribution so a
+/// recycled pid cannot inherit it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct DaemonIdentity {
+    uniqueid: u64,
+    start_usec: u64,
+}
+
+/// Verifies severed daemons against declared `daemon_pid_source` helpers and
+/// caches each result, keyed by pid and pinned by kernel identity.
+#[derive(Default)]
+struct DaemonPidLineage {
+    cache: Mutex<HashMap<u32, (DaemonIdentity, String)>>,
+}
+
+impl DaemonPidLineage {
+    fn attribute(
+        &self,
+        daemon_pid: u32,
+        config: &CommandPoliciesConfig,
+        policy_root: &Path,
+    ) -> Option<String> {
+        if daemon_pid == 0 || daemon_pid == 1 {
+            return None;
+        }
+        let identity = daemon_identity(daemon_pid)?;
+        if let Ok(cache) = self.cache.lock()
+            && let Some((cached_id, name)) = cache.get(&daemon_pid)
+            && *cached_id == identity
+        {
+            trace!("tool-sandbox: severed daemon {daemon_pid} -> command {name} (cache hit)");
+            return Some(name.clone());
+        }
+        // `D`'s kernel-read context is the same for every helper, so read it once.
+        let daemon_cwd = daemon_cwd(daemon_pid);
+        let daemon_argv_env = daemon_argv_env(daemon_pid);
+        let daemon_argv = daemon_argv_env.as_ref().map(|(argv, _)| argv.clone());
+        for (name, command) in &config.commands {
+            let Some(source) = &command.daemon_pid_source else {
+                continue;
+            };
+            let daemon_env = daemon_argv_env
+                .as_ref()
+                .map(|(_, env)| filter_daemon_env(env, &source.env, name));
+            let context = DaemonHelperContext {
+                schema_version: DAEMON_HELPER_SCHEMA_VERSION,
+                command: name.clone(),
+                candidate_pid: daemon_pid,
+                workdir: policy_root.to_string_lossy().into_owned(),
+                daemon_cwd: daemon_cwd.clone(),
+                daemon_argv: daemon_argv.clone(),
+                daemon_env,
+            };
+            let Some(server_pid) =
+                run_daemon_pid_source(name, &source.argv, &context, DAEMON_PID_SOURCE_TIMEOUT)
+            else {
+                continue;
+            };
+            // A match counts only if `D`'s kernel identity is unchanged across the
+            // helper run, so a pid reused mid-check can't be mis-attributed.
+            if server_pid == daemon_pid && daemon_identity(daemon_pid) == Some(identity) {
+                if let Ok(mut cache) = self.cache.lock() {
+                    cache.insert(daemon_pid, (identity, name.clone()));
+                    // Bound the cache: drop entries whose pid died or was reused.
+                    cache.retain(|pid, (id, _)| daemon_identity(*pid) == Some(*id));
+                }
+                debug!("tool-sandbox: severed daemon {daemon_pid} attributed to command {name}");
+                return Some(name.clone());
+            }
+        }
+        debug!("tool-sandbox: severed daemon {daemon_pid} matched no daemon_pid_source; denying");
+        None
+    }
+}
+
+const PROC_PIDUNIQIDENTIFIERINFO: i32 = 17;
+
+#[repr(C)]
+struct ProcUniqIdentifierInfo {
+    p_uuid: [u8; 16],
+    p_uniqueid: u64,
+    p_puniqueid: u64,
+    p_reserve2: u64,
+    p_reserve3: u64,
+    p_reserve4: u64,
+}
+
+fn daemon_identity(pid: u32) -> Option<DaemonIdentity> {
+    let mut uinfo: ProcUniqIdentifierInfo = unsafe { std::mem::zeroed() };
+    let usize_bytes = std::mem::size_of::<ProcUniqIdentifierInfo>() as i32;
+    // SAFETY: proc_pidinfo writes exactly `usize_bytes` into uinfo on success and
+    // the flavor-sized return is checked before any field is read.
+    let ret = unsafe {
+        proc_pidinfo(
+            pid as i32,
+            PROC_PIDUNIQIDENTIFIERINFO,
+            0,
+            (&mut uinfo as *mut ProcUniqIdentifierInfo).cast::<libc::c_void>(),
+            usize_bytes,
+        )
+    };
+    if ret != usize_bytes {
+        return None;
+    }
+    let mut binfo: ProcBsdInfo = unsafe { std::mem::zeroed() };
+    let bsize = std::mem::size_of::<ProcBsdInfo>() as i32;
+    // SAFETY: as above, for the BSD-info flavor.
+    let ret = unsafe {
+        proc_pidinfo(
+            pid as i32,
+            PROC_PIDTBSDINFO,
+            0,
+            (&mut binfo as *mut ProcBsdInfo).cast::<libc::c_void>(),
+            bsize,
+        )
+    };
+    if ret != bsize {
+        return None;
+    }
+    Some(DaemonIdentity {
+        uniqueid: uinfo.p_uniqueid,
+        start_usec: binfo.pbi_start_tvsec * 1_000_000 + binfo.pbi_start_tvusec,
+    })
+}
+
+/// Bumped only on an incompatible change to the helper's JSON input.
+const DAEMON_HELPER_SCHEMA_VERSION: u32 = 1;
+
+/// Credential-named keys never forwarded into `daemon_env`, even if allowlisted:
+/// a backstop against a profile leaking a secret to an unsandboxed helper.
+const DAEMON_ENV_CREDENTIAL_DENYLIST: &[&str] = &[
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "GITLAB_TOKEN",
+    "OAUTH_TOKEN",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "ANTHROPIC_API_KEY",
+];
+
+/// The daemon context nono hands a `daemon_pid_source` helper as a JSON object on
+/// stdin. `candidate_pid` is the kernel-pinned severed daemon `D`; the helper
+/// prints the pid it believes is its server and nono accepts only if it equals `D`.
+#[derive(serde::Serialize)]
+struct DaemonHelperContext {
+    schema_version: u32,
+    command: String,
+    candidate_pid: u32,
+    workdir: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    daemon_cwd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    daemon_argv: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    daemon_env: Option<BTreeMap<String, String>>,
+}
+
+/// Keep only the allowlisted keys present in `D`'s env, minus the credential-name
+/// backstop. Logs each backstop drop so a misconfigured allowlist is visible.
+fn filter_daemon_env(
+    daemon_env: &[(String, String)],
+    allowlist: &[String],
+    command_name: &str,
+) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    for key in allowlist {
+        if DAEMON_ENV_CREDENTIAL_DENYLIST
+            .iter()
+            .any(|denied| denied.eq_ignore_ascii_case(key))
+        {
+            debug!(
+                "tool-sandbox: {command_name}.daemon_pid_source dropped credential-named env key {key}"
+            );
+            continue;
+        }
+        if let Some((_, value)) = daemon_env.iter().find(|(k, _)| k == key) {
+            out.insert(key.clone(), value.clone());
+        }
+    }
+    out
+}
+
+/// A daemon's argv plus its env as `(key, value)` pairs.
+type DaemonArgvEnv = (Vec<String>, Vec<(String, String)>);
+
+/// `D`'s argv and env (`KEY=VALUE` split on the first `=`), read from the kernel.
+/// `None` on any failure; callers omit the fields rather than fail attribution.
+fn daemon_argv_env(pid: u32) -> Option<DaemonArgvEnv> {
+    let argmax = kern_argmax()?;
+    let mut buf = vec![0u8; argmax];
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as libc::c_int];
+    let mut len = buf.len();
+    // SAFETY: sysctl writes at most `len` bytes into `buf` and updates `len` to the
+    // count actually written, which we honor before parsing.
+    let ret = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            buf.as_mut_ptr().cast::<libc::c_void>(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if ret != 0 {
+        return None;
+    }
+    buf.truncate(len);
+    parse_procargs2(&buf)
+}
+
+fn kern_argmax() -> Option<usize> {
+    let mut mib = [libc::CTL_KERN, libc::KERN_ARGMAX];
+    let mut argmax: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>();
+    // SAFETY: sysctl writes one `c_int` into `argmax`; `len` bounds the write.
+    let ret = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            (&mut argmax as *mut libc::c_int).cast::<libc::c_void>(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if ret != 0 || argmax <= 0 {
+        return None;
+    }
+    Some(argmax as usize)
+}
+
+/// Parse a `KERN_PROCARGS2` buffer: `argc` (i32), the exec path, NUL padding, then
+/// `argc` NUL-terminated argv strings, then NUL-terminated `KEY=VALUE` env strings.
+/// All reads are bounds-checked against the returned length.
+fn parse_procargs2(buf: &[u8]) -> Option<DaemonArgvEnv> {
+    let argc = i32::from_ne_bytes(buf.get(0..4)?.try_into().ok()?);
+    if argc < 0 {
+        return None;
+    }
+    let read_cstr = |pos: &mut usize| -> &[u8] {
+        let start = *pos;
+        while *pos < buf.len() && buf[*pos] != 0 {
+            *pos += 1;
+        }
+        let s = &buf[start..*pos];
+        *pos += 1; // step over the NUL (or past the end)
+        s
+    };
+    let mut pos = 4;
+    read_cstr(&mut pos); // exec path
+    while pos < buf.len() && buf[pos] == 0 {
+        pos += 1; // exec-path alignment padding
+    }
+    let mut argv = Vec::with_capacity(argc as usize);
+    for _ in 0..argc {
+        if pos >= buf.len() {
+            break;
+        }
+        argv.push(String::from_utf8_lossy(read_cstr(&mut pos)).into_owned());
+    }
+    let mut env = Vec::new();
+    while pos < buf.len() && buf[pos] != 0 {
+        let entry = read_cstr(&mut pos);
+        if let Some(eq) = entry.iter().position(|&b| b == b'=') {
+            env.push((
+                String::from_utf8_lossy(&entry[..eq]).into_owned(),
+                String::from_utf8_lossy(&entry[eq + 1..]).into_owned(),
+            ));
+        }
+    }
+    Some((argv, env))
+}
+
+/// `D`'s current working directory, read from the kernel. `None` on failure.
+fn daemon_cwd(pid: u32) -> Option<String> {
+    let mut info: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_vnodepathinfo>() as i32;
+    // SAFETY: proc_pidinfo writes exactly `size` bytes into `info` on success.
+    let ret = unsafe {
+        proc_pidinfo(
+            pid as i32,
+            libc::PROC_PIDVNODEPATHINFO,
+            0,
+            (&mut info as *mut libc::proc_vnodepathinfo).cast::<libc::c_void>(),
+            size,
+        )
+    };
+    if ret != size {
+        return None;
+    }
+    let raw = &info.pvi_cdir.vip_path;
+    // SAFETY: `vip_path` is a fixed NUL-terminated C-string buffer; read it as bytes.
+    let bytes = unsafe {
+        std::slice::from_raw_parts(raw.as_ptr().cast::<u8>(), std::mem::size_of_val(raw))
+    };
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    if end == 0 {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&bytes[..end]).into_owned())
+}
+
+const DAEMON_PID_SOURCE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Run a command's `daemon_pid_source` helper, feeding `context` as a JSON object
+/// on stdin; parse the first whitespace-delimited integer of stdout as the daemon pid.
+///
+/// SECURITY: the helper runs UNSANDBOXED in the supervisor, so it MUST only read and
+/// emit a pid, never execute workspace-controlled code. nono hardens the launch
+/// (absolute-path program, cleared env, neutral cwd, hard timeout) but cannot vet
+/// the helper itself.
+fn run_daemon_pid_source(
+    command_name: &str,
+    argv: &[String],
+    context: &DaemonHelperContext,
+    timeout: Duration,
+) -> Option<u32> {
+    let (prog, args) = argv.split_first()?;
+    // Resolve `~`/`$VAR` (e.g. an install-prefix env var) from the supervisor env,
+    // then require the result absolute — the helper is exec'd directly, not via PATH.
+    let prog = crate::policy::expand_path(prog)
+        .map_err(|err| warn!("tool-sandbox: {command_name}.daemon_pid_source path expand: {err}"))
+        .ok()?;
+    if !prog.is_absolute() {
+        warn!("tool-sandbox: {command_name}.daemon_pid_source program must be absolute; ignoring");
+        return None;
+    }
+    let payload = serde_json::to_vec(context)
+        .map_err(|err| debug!("tool-sandbox: {command_name}.daemon_pid_source serialize: {err}"))
+        .ok()?;
+    let mut command = std::process::Command::new(&prog);
+    command
+        .args(args)
+        .current_dir("/")
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    // HOME lets a helper expand `~` to a pid file; not credential-bearing.
+    if let Some(home) = std::env::var_os("HOME") {
+        command.env("HOME", home);
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|err| debug!("tool-sandbox: {command_name}.daemon_pid_source spawn failed: {err}"))
+        .ok()?;
+
+    // The JSON is far under the pipe buffer, so this one blocking write can't
+    // deadlock against a helper that reads stdin to EOF. Drop closes it (signals EOF).
+    if let Some(mut stdin) = child.stdin.take()
+        && let Err(err) = stdin.write_all(&payload)
+    {
+        debug!("tool-sandbox: {command_name}.daemon_pid_source stdin write failed: {err}");
+    }
+
+    // Poll to a deadline; kill a wedged helper so it can't hang the shim thread.
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                warn!("tool-sandbox: {command_name}.daemon_pid_source timed out; denying");
+                return None;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            Err(err) => {
+                debug!("tool-sandbox: {command_name}.daemon_pid_source wait failed: {err}");
+                return None;
+            }
+        }
+    };
+    if !status.success() {
+        debug!(
+            "tool-sandbox: {command_name}.daemon_pid_source exited {:?}",
+            status.code()
+        );
+        return None;
+    }
+    let mut stdout = String::new();
+    child.stdout.take()?.read_to_string(&mut stdout).ok()?;
+    stdout.split_whitespace().next()?.parse::<u32>().ok()
 }
 
 fn parent_pid(pid: u32) -> Result<u32> {
@@ -4266,8 +4745,9 @@ fn is_tty(fd: i32) -> bool {
 mod tests {
     use super::*;
     use crate::command_policy::{
-        CommandEnvironmentConfig, CommandFromConfig, CommandPolicyConfig, InterceptActionConfig,
-        InterceptRuleConfig, ResolvedExecutableKind, ResolvedExecutableShape,
+        CommandEnvironmentConfig, CommandFromConfig, CommandPolicyConfig, DaemonPidSource,
+        InterceptActionConfig, InterceptRuleConfig, ResolvedExecutableKind,
+        ResolvedExecutableShape,
     };
 
     fn test_binary(name: &str, path: &Path) -> Result<ResolvedCommandBinary> {
@@ -4328,6 +4808,7 @@ mod tests {
             credential_handles: BTreeMap::new(),
             proxy_trust_bundle_paths: Vec::new(),
             active_children: Mutex::new(HashMap::new()),
+            lineage: LineageMarker::Disabled,
             active_count: AtomicUsize::new(0),
             queued_requests: AtomicUsize::new(0),
             emitted_error_response: AtomicBool::new(false),
@@ -5364,6 +5845,356 @@ mod tests {
 
         assert!(matches!(caller, Caller::Command { name } if name == "git"));
         Ok(())
+    }
+
+    // Peer pid 1 with an unrelated root: the walk ends before the root (as after a
+    // daemonized reparent), forcing the severed-daemon branch.
+    const DAEMONIZED_PEER: u32 = 1;
+    const UNRELATED_ROOT: u32 = 2;
+
+    fn config_with_helper(command: &str, argv: Vec<String>) -> CommandPoliciesConfig {
+        let mut config = CommandPoliciesConfig::default();
+        config.commands.insert(
+            command.to_string(),
+            CommandPolicyConfig {
+                daemon_pid_source: Some(DaemonPidSource {
+                    argv,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        config
+    }
+
+    fn test_context(candidate_pid: u32) -> DaemonHelperContext {
+        DaemonHelperContext {
+            schema_version: DAEMON_HELPER_SCHEMA_VERSION,
+            command: "tmux".to_string(),
+            candidate_pid,
+            workdir: "/tmp".to_string(),
+            daemon_cwd: None,
+            daemon_argv: None,
+            daemon_env: None,
+        }
+    }
+
+    #[test]
+    fn resolve_caller_attributes_severed_daemon_to_verified_command() -> Result<()> {
+        let state = test_state();
+        // Stand in for a positive daemon_pid_source match; drives the severed branch.
+        let caller = resolve_caller_with(DAEMONIZED_PEER, UNRELATED_ROOT, &state, "git", |_| {
+            Some(Caller::Command {
+                name: "tmux".to_string(),
+            })
+        })?;
+
+        assert!(matches!(caller, Caller::Command { name } if name == "tmux"));
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_caller_blocks_severed_daemon_without_match() -> Result<()> {
+        let state = test_state();
+        // Fail-closed: no declared helper identifies the severed daemon.
+        let blocked = resolve_caller_with(DAEMONIZED_PEER, UNRELATED_ROOT, &state, "git", |_| None);
+        assert!(matches!(blocked, Err(NonoError::BlockedCommand { .. })));
+        Ok(())
+    }
+
+    #[test]
+    fn lineage_build_enabled_only_when_a_command_declares_a_helper() {
+        assert!(matches!(
+            LineageMarker::build(&CommandPoliciesConfig::default()),
+            LineageMarker::Disabled
+        ));
+        let config = config_with_helper("tmux", vec!["/bin/echo".to_string()]);
+        assert!(matches!(
+            LineageMarker::build(&config),
+            LineageMarker::DaemonPid(_)
+        ));
+    }
+
+    #[test]
+    fn disabled_lineage_denies_severed_daemon() {
+        // Disabled -> deny, never a command, never the session.
+        assert_eq!(
+            LineageMarker::Disabled.resolve_severed_command(
+                std::process::id(),
+                &CommandPoliciesConfig::default(),
+                Path::new("/tmp"),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn daemon_pid_lineage_denies_reserved_and_dead_pids() {
+        let lineage = DaemonPidLineage::default();
+        let config = config_with_helper("tmux", vec!["/bin/echo".to_string()]);
+        // init / kernel pids are never attributed.
+        assert_eq!(lineage.attribute(0, &config, Path::new("/tmp")), None);
+        assert_eq!(lineage.attribute(1, &config, Path::new("/tmp")), None);
+        // A pid with no live process yields no kernel identity -> deny.
+        assert_eq!(
+            lineage.attribute(u32::MAX, &config, Path::new("/tmp")),
+            None
+        );
+    }
+
+    #[test]
+    fn daemon_pid_lineage_attributes_when_helper_names_the_daemon() {
+        // Helper echoes our own pid, so attribution matches and pins by kernel identity.
+        let pid = std::process::id();
+        let config = config_with_helper("tmux", vec!["/bin/echo".to_string(), pid.to_string()]);
+        let lineage = DaemonPidLineage::default();
+        assert_eq!(
+            lineage.attribute(pid, &config, Path::new("/tmp")),
+            Some("tmux".to_string())
+        );
+    }
+
+    #[test]
+    fn daemon_pid_lineage_denies_when_helper_names_a_different_pid() {
+        // Helper reports a pid that is not the one being resolved -> no match -> deny.
+        let other = std::process::id().wrapping_add(1).max(2);
+        let config = config_with_helper("tmux", vec!["/bin/echo".to_string(), other.to_string()]);
+        let lineage = DaemonPidLineage::default();
+        assert_eq!(
+            lineage.attribute(std::process::id(), &config, Path::new("/tmp")),
+            None
+        );
+    }
+
+    #[test]
+    fn run_daemon_pid_source_rejects_relative_program() {
+        // A non-absolute helper program is misconfiguration: never PATH-resolve it.
+        let pid = std::process::id();
+        let argv = vec!["echo".to_string(), pid.to_string()];
+        assert_eq!(
+            run_daemon_pid_source("tmux", &argv, &test_context(pid), Duration::from_secs(5)),
+            None
+        );
+    }
+
+    #[test]
+    fn run_daemon_pid_source_times_out_wedged_helper() {
+        // A helper that never exits is killed at the deadline -> no pid (fail-closed).
+        let argv = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "sleep 30".to_string(),
+        ];
+        let start = Instant::now();
+        assert_eq!(
+            run_daemon_pid_source(
+                "tmux",
+                &argv,
+                &test_context(std::process::id()),
+                Duration::from_millis(200)
+            ),
+            None
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "must not block on the helper"
+        );
+    }
+
+    #[test]
+    fn run_daemon_pid_source_verify_mode_round_trips_candidate_pid() {
+        // Verify-mode helper: echo back the candidate_pid it read from stdin JSON.
+        // plutil ships in /usr/bin, so it works under the helper's minimal PATH.
+        let pid = std::process::id();
+        let argv = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "plutil -extract candidate_pid raw -o - -".to_string(),
+        ];
+        assert_eq!(
+            run_daemon_pid_source("tmux", &argv, &test_context(pid), Duration::from_secs(5)),
+            Some(pid)
+        );
+    }
+
+    #[test]
+    fn run_daemon_pid_source_expands_vars_in_program_path() {
+        // A `$VAR/helper` path must expand from the env and run, so profiles need
+        // not hard-code an install prefix.
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let pid = std::process::id();
+        let dir = std::env::temp_dir().join(format!("nono-pid-expand-{pid}"));
+        fs::create_dir_all(&dir).expect("mkdir");
+        let helper = dir.join("helper.sh");
+        fs::write(&helper, format!("#!/bin/sh\necho {pid}\n")).expect("write");
+        fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let dir_str = dir.to_string_lossy().into_owned();
+        let _env = crate::test_env::EnvVarGuard::set_all(&[("NONO_TEST_HELPER_DIR", &dir_str)]);
+
+        let context = test_context(pid);
+        let argv = vec!["$NONO_TEST_HELPER_DIR/helper.sh".to_string()];
+        assert_eq!(
+            run_daemon_pid_source("tmux", &argv, &context, Duration::from_secs(5)),
+            Some(pid)
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn filter_daemon_env_honors_allowlist_and_credential_backstop() {
+        let daemon_env = vec![
+            ("BAZEL_OUTPUT_USER_ROOT".to_string(), "/custom".to_string()),
+            ("GH_TOKEN".to_string(), "secret".to_string()),
+            ("PATH".to_string(), "/usr/bin".to_string()),
+        ];
+        // Allowlist BAZEL_OUTPUT_USER_ROOT (kept), a credential-named key (dropped by
+        // the backstop), and a key absent from `D` (omitted). PATH is not allowlisted.
+        let allowlist = vec![
+            "BAZEL_OUTPUT_USER_ROOT".to_string(),
+            "gh_token".to_string(), // case-insensitive denylist match
+            "ABSENT".to_string(),
+        ];
+        let filtered = filter_daemon_env(&daemon_env, &allowlist, "tmux");
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(
+            filtered.get("BAZEL_OUTPUT_USER_ROOT"),
+            Some(&"/custom".to_string())
+        );
+        assert!(!filtered.contains_key("GH_TOKEN"));
+        assert!(!filtered.contains_key("PATH"));
+    }
+
+    #[test]
+    fn parse_procargs2_extracts_argv_and_env() {
+        // argc(=2) | exec path + NUL | pad NUL | argv0 | argv1 | env0 | env1
+        let mut buf = 2i32.to_ne_bytes().to_vec();
+        buf.extend_from_slice(b"/path/to/prog\0\0");
+        buf.extend_from_slice(b"/path/to/prog\0--flag\0");
+        buf.extend_from_slice(b"KEY=VALUE\0BAZEL_OUTPUT_USER_ROOT=/custom\0");
+        let (argv, env) = parse_procargs2(&buf).expect("parse");
+        assert_eq!(argv, vec!["/path/to/prog", "--flag"]);
+        assert_eq!(
+            env,
+            vec![
+                ("KEY".to_string(), "VALUE".to_string()),
+                ("BAZEL_OUTPUT_USER_ROOT".to_string(), "/custom".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn daemon_pid_lineage_cache_prunes_dead_entries() {
+        // A successful attribution prunes cache entries whose pid no longer carries
+        // its recorded identity, so the cache can't grow unbounded.
+        let pid = std::process::id();
+        let config = config_with_helper("tmux", vec!["/bin/echo".to_string(), pid.to_string()]);
+        let lineage = DaemonPidLineage::default();
+        {
+            let mut cache = lineage.cache.lock().expect("lock");
+            cache.insert(
+                u32::MAX, // dead pid: no live identity
+                (
+                    DaemonIdentity {
+                        uniqueid: 1,
+                        start_usec: 1,
+                    },
+                    "stale".to_string(),
+                ),
+            );
+        }
+        assert_eq!(
+            lineage.attribute(pid, &config, Path::new("/tmp")),
+            Some("tmux".to_string())
+        );
+        let cache = lineage.cache.lock().expect("lock");
+        assert!(!cache.contains_key(&u32::MAX), "dead entry must be pruned");
+        assert!(cache.contains_key(&pid), "live attribution must remain");
+        assert_eq!(cache.len(), 1);
+    }
+
+    /// LIVE: the property the marker exists for. A real setsid+double-fork daemon
+    /// reparented to pid 1, named by a `daemon_pid_source` helper, resolves to
+    /// `Command{tmux}`; an unnamed reparented daemon is denied. `#[ignore]`: forks
+    /// real processes; run with --ignored.
+    #[test]
+    #[ignore = "forks real reparented daemons; run with --ignored"]
+    fn live_severed_daemon_attributed_to_its_command() {
+        use nix::sys::wait::waitpid;
+        use nix::unistd::{ForkResult, fork};
+
+        // Spawn a setsid + double-fork daemon; returns the reparented grandchild pid.
+        fn spawn_reparented_daemon() -> u32 {
+            let mut fds = [0i32; 2];
+            assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
+            let [read_fd, write_fd] = fds;
+            // SAFETY: post-fork children use only async-signal-safe libc calls.
+            match unsafe { fork() }.expect("fork") {
+                ForkResult::Child => {
+                    unsafe { libc::setsid() };
+                    match unsafe { fork() }.expect("fork") {
+                        ForkResult::Child => {
+                            let pid = unsafe { libc::getpid() };
+                            let bytes = pid.to_ne_bytes();
+                            unsafe {
+                                libc::write(write_fd, bytes.as_ptr().cast(), bytes.len());
+                                libc::usleep(800_000);
+                                libc::_exit(0);
+                            }
+                        }
+                        ForkResult::Parent { .. } => unsafe { libc::_exit(0) },
+                    }
+                }
+                ForkResult::Parent { child } => {
+                    unsafe { libc::close(write_fd) };
+                    let _ = waitpid(child, None); // reap the middle process
+                    let mut buf = [0u8; 4];
+                    let n = unsafe { libc::read(read_fd, buf.as_mut_ptr().cast(), buf.len()) };
+                    assert_eq!(n, 4, "expected the daemon's pid");
+                    unsafe { libc::close(read_fd) };
+                    i32::from_ne_bytes(buf) as u32
+                }
+            }
+        }
+
+        let daemon = spawn_reparented_daemon();
+        let other = spawn_reparented_daemon();
+        assert_eq!(
+            parent_pid(daemon).ok(),
+            Some(1),
+            "daemon must reparent to 1"
+        );
+        assert_eq!(
+            parent_pid(other).ok(),
+            Some(1),
+            "control must reparent to 1"
+        );
+
+        // Throwaway helper that echoes the daemon's pid.
+        let dir = std::env::temp_dir().join(format!("nono-daemon-pid-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("mkdir");
+        let helper = dir.join("pid_source.sh");
+        fs::write(&helper, format!("#!/bin/sh\necho {daemon}\n")).expect("write helper");
+        fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        let config = config_with_helper("tmux", vec![helper.to_string_lossy().into_owned()]);
+        let marker = LineageMarker::build(&config);
+
+        assert_eq!(
+            marker.resolve_severed_command(daemon, &config, &dir),
+            Some("tmux".to_string()),
+            "reparented daemon must attribute to its command"
+        );
+        // A reparented daemon the helper does not name is denied (fail-closed).
+        assert_eq!(
+            marker.resolve_severed_command(other, &config, &dir),
+            None,
+            "non-matching reparented daemon must be denied"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

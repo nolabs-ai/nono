@@ -264,7 +264,7 @@ const REAP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis
 
 /// Kill anything left in the leaf, then remove it. Best-effort — a leftover empty
 /// directory isn't worth failing a finished run over.
-fn teardown(path: &Path) {
+pub(crate) fn teardown(path: &Path) {
     // cgroup.kill (Linux 5.14+) kills everything in the leaf at once. If it isn't
     // available we ignore it; a single process that already exited leaves the leaf
     // empty anyway.
@@ -314,7 +314,7 @@ fn parse_leaf_pid(name: &str) -> Option<u32> {
 }
 
 /// Whether `pid` still exists (`/proc/<pid>` present), in any state including zombie.
-fn pid_is_alive(pid: u32) -> bool {
+pub(crate) fn pid_is_alive(pid: u32) -> bool {
     Path::new("/proc").join(pid.to_string()).exists()
 }
 
@@ -323,7 +323,7 @@ fn pid_is_alive(pid: u32) -> bool {
 /// systemd delegates each user session a subtree under `.../user@<uid>.service` it
 /// can manage without root — the one place we can reliably create child cgroups. We
 /// read `/proc/self/cgroup` and walk up to it.
-fn delegated_base() -> Result<PathBuf> {
+pub(crate) fn delegated_base() -> Result<PathBuf> {
     let raw = fs::read_to_string("/proc/self/cgroup")
         .map_err(|e| resource_err(format!("cannot read /proc/self/cgroup: {e}")))?;
     let uid = nix::unistd::Uid::current().as_raw();

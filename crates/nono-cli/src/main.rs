@@ -34,6 +34,8 @@ mod launch_runtime;
 mod learn;
 mod learn_runtime;
 mod legacy_cleanup;
+#[cfg(target_os = "linux")]
+mod lineage_cgroup;
 #[cfg(target_os = "macos")]
 mod macos_trust;
 mod migration;

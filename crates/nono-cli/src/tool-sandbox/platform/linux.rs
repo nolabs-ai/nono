@@ -6,6 +6,7 @@ use crate::command_policy::{
     CommandFromConfig, CommandPoliciesConfig, CommandSandboxConfig, ResolvedCommandBinaries,
     ResolvedCommandBinary, ResolvedExecutableKind, has_explicit_self_invocation_entry,
 };
+use crate::lineage_cgroup::LineageMarker;
 use crate::profile;
 use crate::tool_sandbox::credentials::{ResolvedCredential, resolve_credentials};
 use crate::tool_sandbox::env::{
@@ -44,8 +45,9 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -125,6 +127,8 @@ struct ToolSandboxState {
     baseline_cache: BaselineCache,
     proxy_trust_bundle_paths: Vec<PathBuf>,
     active_children: Mutex<HashMap<u32, ActiveChild>>,
+    /// Attributes severed-ancestry callers to their spawning command. See `lineage_cgroup`.
+    lineage: LineageMarker,
     active_count: AtomicUsize,
     queued_requests: AtomicUsize,
     emitted_error_response: AtomicBool,
@@ -367,6 +371,10 @@ impl PreparedToolSandboxRuntime {
         );
 
         let approval_backends = crate::approval_runtime::build_approval_registry(&plan.config)?;
+        // Deferred: the cgroup marker builds itself on first use (post-fork), never
+        // now — eager cgroup I/O here would perturb the supervised fork. See
+        // `LineageMarker`'s security note.
+        let lineage = LineageMarker::deferred(std::process::id());
         let runtime = Self {
             inner: Arc::new(ToolSandboxState {
                 runtime_dir,
@@ -388,6 +396,7 @@ impl PreparedToolSandboxRuntime {
                 baseline_cache,
                 proxy_trust_bundle_paths: proxy_trust_bundle_paths.to_vec(),
                 active_children: Mutex::new(HashMap::new()),
+                lineage,
                 active_count: AtomicUsize::new(0),
                 queued_requests: AtomicUsize::new(0),
                 emitted_error_response: AtomicBool::new(false),
@@ -408,6 +417,8 @@ impl PreparedToolSandboxRuntime {
     /// `process::exit` (which bypasses Drop chains); on Rust unwind paths
     /// `ToolSandboxState::Drop` provides a fallback that finds a stale dir already gone.
     pub(crate) fn cleanup_runtime_dir(&self) {
+        // Also here, not just Drop: `process::exit` bypasses Drop chains. Idempotent.
+        self.inner.lineage.teardown();
         if let Err(err) = guarded_remove_runtime_dir(&self.inner.runtime_dir) {
             debug!(
                 "tool-sandbox runtime dir cleanup skipped for {}: {}",
@@ -637,6 +648,8 @@ impl PreparedToolSandboxRuntime {
 
 impl Drop for ToolSandboxState {
     fn drop(&mut self) {
+        // Fallback for unwind paths; `cleanup_runtime_dir` handles normal exit. Idempotent.
+        self.lineage.teardown();
         if let Err(err) = guarded_remove_runtime_dir(&self.runtime_dir) {
             debug!(
                 "tool-sandbox runtime dir cleanup skipped for {}: {err}",
@@ -2026,6 +2039,23 @@ fn resolve_caller(
     state: &ToolSandboxState,
     command_name: &str,
 ) -> Result<Caller> {
+    resolve_caller_with(peer_pid, session_root_pid, state, command_name, |pid| {
+        state
+            .lineage
+            .resolve_severed_command(pid)
+            .map(|command| Caller::Command { command, pid })
+    })
+}
+
+/// `resolve_severed` is a parameter so tests can drive the fallback without a
+/// real reparented process.
+fn resolve_caller_with(
+    peer_pid: u32,
+    session_root_pid: u32,
+    state: &ToolSandboxState,
+    command_name: &str,
+    resolve_severed: impl Fn(u32) -> Option<Caller>,
+) -> Result<Caller> {
     let mut pid = peer_pid;
     for _ in 0..ANCESTRY_DEPTH_LIMIT {
         if let Some((command, launch_caller)) = live_active_child(pid, state)? {
@@ -2045,6 +2075,11 @@ fn resolve_caller(
             break;
         }
         pid = parent_pid(pid)?;
+    }
+    // Walk stopped short of the root: an ancestor daemonized (reparented to pid 1).
+    // Attribute to the spawning command via the lineage marker, never the session.
+    if let Some(caller) = resolve_severed(peer_pid) {
+        return Ok(caller);
     }
     Err(NonoError::SandboxInit(
         "tool-sandbox caller ancestry could not be trusted".to_string(),
@@ -3917,6 +3952,30 @@ fn filter_child_env(
     Ok(env)
 }
 
+/// Make the child self-attach to its command's cgroup pre-exec, so every descendant
+/// (including a daemon reparented to pid 1) carries the marker. No-op when disabled.
+fn install_lineage_attach(
+    state: &ToolSandboxState,
+    command_name: &str,
+    command: &mut Command,
+) -> Result<()> {
+    let Some(procs_fd) = state.lineage.command_procs_fd(command_name)? else {
+        return Ok(());
+    };
+    // SAFETY: runs post-fork/pre-exec, so must be async-signal-safe; child_self_attach
+    // is (getpid + itoa + write) and _exit(126)s on failure (fail closed). procs_fd is
+    // O_CLOEXEC so it never reaches the sandboxed program.
+    unsafe {
+        command.pre_exec(move || {
+            if !crate::resource_cgroup::child_self_attach(procs_fd.as_raw_fd()) {
+                libc::_exit(126);
+            }
+            Ok(())
+        });
+    }
+    Ok(())
+}
+
 fn launch_child(
     state: &ToolSandboxState,
     command_name: &str,
@@ -3975,6 +4034,7 @@ fn launch_child_with_direct_fds(
         .stdin(Stdio::from(File::from(stdio.stdin)))
         .stdout(Stdio::from(File::from(stdio.stdout)))
         .stderr(Stdio::from(File::from(stdio.stderr)));
+    install_lineage_attach(state, command_name, &mut command)?;
     let mut child = command.spawn().map_err(NonoError::CommandExecution)?;
     drop(command);
     let exit_code = wait_for_tracked_child(state, command_name, launch_caller, &mut child)?;
@@ -4009,6 +4069,7 @@ fn launch_child_with_brokered_stdio(
         .stdin(Stdio::from(File::from(stdin)))
         .stdout(Stdio::from(File::from(stdout_write)))
         .stderr(Stdio::from(File::from(stderr_write)));
+    install_lineage_attach(state, command_name, &mut command)?;
 
     let mut child = command.spawn().map_err(NonoError::CommandExecution)?;
     drop(command);
@@ -4268,6 +4329,7 @@ fn launch_child_with_capture(
         .stderr(Stdio::from(File::from(stdio.stderr)));
     // stdio.stdout is not used for capture; drop it so the fd is closed.
     drop(stdio.stdout);
+    install_lineage_attach(state, command_name, &mut command)?;
 
     let mut child = command.spawn().map_err(NonoError::CommandExecution)?;
     drop(command);
@@ -4325,6 +4387,7 @@ fn launch_child_with_pty(
         .stdin(Stdio::from(File::from(stdin_slave)))
         .stdout(Stdio::from(File::from(stdout_slave)))
         .stderr(Stdio::from(File::from(stderr_slave)));
+    install_lineage_attach(state, command_name, &mut command)?;
     let mut child = command.spawn().map_err(NonoError::CommandExecution)?;
     drop(command);
     drop(pty.slave);
@@ -5477,6 +5540,7 @@ mod tests {
             },
             proxy_trust_bundle_paths: Vec::new(),
             active_children: Mutex::new(HashMap::new()),
+            lineage: LineageMarker::disabled_for_test(),
             active_count: AtomicUsize::new(0),
             queued_requests: AtomicUsize::new(0),
             emitted_error_response: AtomicBool::new(false),
@@ -5558,6 +5622,50 @@ mod tests {
         let caller = resolve_caller(pid, pid, &state, "git")?;
 
         assert!(matches!(caller, Caller::Command { command, .. } if command == "git"));
+        Ok(())
+    }
+
+    fn test_state_for_membership(socket_path: PathBuf) -> ToolSandboxState {
+        let runtime_dir = PathBuf::from("/tmp/nono-tool-sandbox-test");
+        test_state_with_chaining_paths(
+            runtime_dir.clone(),
+            socket_path,
+            runtime_dir.join("shims"),
+            ShimIdentity {
+                path: runtime_dir.join("shims/git"),
+                id: FileId { dev: 1, ino: 1 },
+            },
+        )
+    }
+
+    // Peer pid 1 with an unrelated root: the walk ends before the root (as after a
+    // daemonized reparent), forcing the severed-ancestry fallback.
+    const DAEMONIZED_PEER: u32 = 1;
+    const UNRELATED_ROOT: u32 = 2;
+
+    #[test]
+    fn resolve_caller_attributes_daemonized_caller_to_its_command() -> Result<()> {
+        let state =
+            test_state_for_membership(PathBuf::from("/tmp/nono-tool-sandbox-test/supervisor.sock"));
+        // Marker resolves the severed caller to its command, never the session.
+        let caller = resolve_caller_with(DAEMONIZED_PEER, UNRELATED_ROOT, &state, "git", |_| {
+            Some(Caller::Command {
+                command: "tmux".to_string(),
+                pid: DAEMONIZED_PEER,
+            })
+        })?;
+
+        assert!(matches!(caller, Caller::Command { command, .. } if command == "tmux"));
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_caller_blocks_daemonized_caller_the_marker_cannot_attribute() -> Result<()> {
+        let state =
+            test_state_for_membership(PathBuf::from("/tmp/nono-tool-sandbox-test/supervisor.sock"));
+        // Marker cannot attribute: fail closed rather than fall back to the session.
+        let denied = resolve_caller_with(DAEMONIZED_PEER, UNRELATED_ROOT, &state, "git", |_| None);
+        assert!(matches!(denied, Err(NonoError::SandboxInit(_))));
         Ok(())
     }
 

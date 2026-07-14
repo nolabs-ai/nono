@@ -39,15 +39,15 @@ pub(crate) fn default_env_allow_patterns() -> Vec<String> {
         .collect()
 }
 
-/// Build the child argv: argv[0] is the binary's canonical path, then
-/// `extra_args` (the `exec` helper's fixed leading args, empty for normal
-/// commands), then the policy's `argv_prepend`, then the forwarded user args
-/// (`request.argv[1..]`). NUL bytes in `extra_args`/`argv_prepend` are rejected.
+/// `preserve_caller_argv0` keeps the caller's argv[0] so argv[0]-dispatch
+/// multi-call binaries (busybox, `docker-credential-*`) work; `exec` helpers
+/// pass false. argv[0] never selects the executed file (that stays `binary`).
 pub(crate) fn effective_argv_for_binary(
     binary: &ResolvedCommandBinary,
     request: &ToolSandboxShimRequest,
     policy: &CommandSandboxConfig,
     extra_args: &[Vec<u8>],
+    preserve_caller_argv0: bool,
 ) -> Result<Vec<Vec<u8>>> {
     if request.argv.is_empty() {
         return Err(NonoError::SandboxInit(
@@ -56,7 +56,11 @@ pub(crate) fn effective_argv_for_binary(
     }
     let mut argv =
         Vec::with_capacity(request.argv.len() + policy.argv_prepend.len() + extra_args.len());
-    argv.push(binary.canonical_path.as_os_str().as_bytes().to_vec());
+    if preserve_caller_argv0 {
+        argv.push(request.argv[0].clone());
+    } else {
+        argv.push(binary.canonical_path.as_os_str().as_bytes().to_vec());
+    }
     for arg in extra_args {
         if arg.contains(&0) {
             return Err(NonoError::ConfigParse(
@@ -442,7 +446,8 @@ mod tests {
         };
         let extra = vec![b"helperarg".to_vec()];
 
-        let argv = effective_argv_for_binary(&helper, &request, &policy, &extra).expect("argv");
+        let argv =
+            effective_argv_for_binary(&helper, &request, &policy, &extra, false).expect("argv");
         let rendered: Vec<String> = argv
             .iter()
             .map(|a| String::from_utf8_lossy(a).into_owned())
@@ -463,16 +468,48 @@ mod tests {
 
     #[test]
     fn effective_argv_normal_command_has_no_extra_args() {
-        // The non-exec path passes `&[]`, so argv is [binary, argv_prepend.., user_args].
         let binary = test_binary("/usr/bin/gh");
         let request = test_request(&["gh", "pr", "list"]);
         let policy = CommandSandboxConfig::default();
-        let argv = effective_argv_for_binary(&binary, &request, &policy, &[]).expect("argv");
+        let argv = effective_argv_for_binary(&binary, &request, &policy, &[], true).expect("argv");
         let rendered: Vec<String> = argv
             .iter()
             .map(|a| String::from_utf8_lossy(a).into_owned())
             .collect();
-        assert_eq!(rendered, vec!["/usr/bin/gh", "pr", "list"]);
+        assert_eq!(rendered, vec!["gh", "pr", "list"]);
+    }
+
+    #[test]
+    fn effective_argv_preserves_caller_argv0_for_symlink_dispatch() {
+        // Multi-call binary: the child must see the invoked name, not the path.
+        let binary = test_binary("/opt/homebrew/bin/docker-credential-helper");
+        let request = test_request(&["docker-credential-osxkeychain", "get"]);
+        let policy = CommandSandboxConfig::default();
+        let argv = effective_argv_for_binary(&binary, &request, &policy, &[], true).expect("argv");
+        let rendered: Vec<String> = argv
+            .iter()
+            .map(|a| String::from_utf8_lossy(a).into_owned())
+            .collect();
+        assert_eq!(rendered, vec!["docker-credential-osxkeychain", "get"]);
+        // argv[0] didn't change the executed file.
+        assert_eq!(
+            binary.canonical_path,
+            std::path::PathBuf::from("/opt/homebrew/bin/docker-credential-helper")
+        );
+    }
+
+    #[test]
+    fn effective_argv_helper_ignores_caller_argv0() {
+        // exec helper keeps its own argv[0], even with no extra_args.
+        let helper = test_binary("/opt/vendor/helper");
+        let request = test_request(&["git", "push"]);
+        let policy = CommandSandboxConfig::default();
+        let argv = effective_argv_for_binary(&helper, &request, &policy, &[], false).expect("argv");
+        let rendered: Vec<String> = argv
+            .iter()
+            .map(|a| String::from_utf8_lossy(a).into_owned())
+            .collect();
+        assert_eq!(rendered, vec!["/opt/vendor/helper", "push"]);
     }
 
     #[test]
@@ -481,7 +518,7 @@ mod tests {
         let request = test_request(&["gh", "auth", "switch"]);
         let policy = CommandSandboxConfig::default();
         let extra = vec![b"a\0b".to_vec()];
-        assert!(effective_argv_for_binary(&helper, &request, &policy, &extra).is_err());
+        assert!(effective_argv_for_binary(&helper, &request, &policy, &extra, false).is_err());
     }
 
     #[test]

@@ -605,19 +605,22 @@ fn finalize_prepared_sandbox(
     // `CapabilitySet::try_from`, and flags conflict with `--config`, so this only
     // runs on the flag path. Enforcement is later, in the supervised runtime; here
     // we just attach the parsed limits to the capability set (also in --dry-run).
-    if let Some(ref s) = args.memory {
-        let memory_bytes = parse_memory_limit_flag(s)?;
-        prepared.caps = prepared.caps.with_resource_limits(nono::ResourceLimits {
-            memory_bytes: Some(memory_bytes),
-        });
+    // `--memory` and `--max-processes` layer over any limits a profile already set
+    // (see merge_flag_resource_limits); None means no flag was given — leave them be.
+    if let Some(limits) = merge_flag_resource_limits(
+        prepared.caps.resource_limits(),
+        args.memory.as_deref(),
+        args.max_processes,
+    )? {
+        prepared.caps = prepared.caps.with_resource_limits(limits);
     }
 
-    // SECURITY: the memory cap lives in cgroup control files under /sys/fs/cgroup.
-    // Write access to any part of that tree lets the child rewrite its own
-    // memory.max (or migrate to a cgroup it makes) and defeat the cap. Landlock is
+    // SECURITY: the caps live in cgroup control files under /sys/fs/cgroup. Write
+    // access to any part of that tree lets the child rewrite its own memory.max /
+    // pids.max (or migrate to a cgroup it makes) and defeat the limit. Landlock is
     // allow-list and can't carve the cgroup tree out of a broad grant like `/sys`,
-    // so refuse the run rather than enforce a cap the sandbox can lift.
-    reject_cgroup_writable_grants_under_memory_limit(&prepared.caps)?;
+    // so refuse the run rather than enforce a limit the sandbox can lift.
+    reject_cgroup_writable_grants_under_resource_limit(&prepared.caps)?;
 
     output::print_skipped_requested_paths(&collect_missing_cli_requested_paths(args), silent);
     let proxy_intent = has_proxy_intent(args, &prepared);
@@ -679,12 +682,50 @@ fn parse_memory_limit_flag(s: &str) -> Result<u64> {
     Ok(bytes)
 }
 
+/// Validate the `--max-processes` count. clap already rejects negatives and
+/// non-integers (the flag is a `u64`); this rejects 0, which would forbid the
+/// sandbox from creating *any* task at all — always a mistake, never "unlimited"
+/// (omit the flag for no limit). Mirrors the schema's `minimum: 1`.
+fn validate_max_processes_flag(n: u64) -> Result<u64> {
+    if n == 0 {
+        return Err(NonoError::ConfigParse(
+            "--max-processes must be at least 1; 0 would forbid the sandbox from \
+             creating any process or thread. Omit the flag for no limit."
+                .to_string(),
+        ));
+    }
+    Ok(n)
+}
+
+/// Merge the CLI resource flags over any limits already attached (e.g. from a
+/// profile) into the `ResourceLimits` to enforce. `--memory` and `--max-processes`
+/// combine, and each overrides only its own field — so passing one flag never drops
+/// a limit the profile set for the other. Returns `None` when neither flag is given,
+/// leaving any profile limits untouched (the caller then attaches nothing).
+fn merge_flag_resource_limits(
+    existing: Option<&nono::ResourceLimits>,
+    memory: Option<&str>,
+    max_processes: Option<u64>,
+) -> Result<Option<nono::ResourceLimits>> {
+    if memory.is_none() && max_processes.is_none() {
+        return Ok(None);
+    }
+    let mut limits = existing.copied().unwrap_or_default();
+    if let Some(s) = memory {
+        limits.memory_bytes = Some(parse_memory_limit_flag(s)?);
+    }
+    if let Some(n) = max_processes {
+        limits.max_processes = Some(validate_max_processes_flag(n)?);
+    }
+    Ok(Some(limits))
+}
+
 /// True when a filesystem grant gives the sandbox WRITE access over any part of
-/// the cgroup v2 hierarchy (`/sys/fs/cgroup`) that enforces `--memory`. Dangerous
-/// either way the paths nest: the grant is inside the tree, or a broad ancestor
-/// (`/sys`, `/`) containing it. Read-only is safe — defeating the cap needs
-/// writing the knobs or `cgroup.procs`. Component-based `Path::starts_with`, not a
-/// string prefix, so `/sys/fs/cgroupX` doesn't match `/sys/fs/cgroup`.
+/// the cgroup v2 hierarchy (`/sys/fs/cgroup`) that enforces resource limits.
+/// Dangerous either way the paths nest: the grant is inside the tree, or a broad
+/// ancestor (`/sys`, `/`) containing it. Read-only is safe — defeating a limit
+/// needs writing the knobs or `cgroup.procs`. Component-based `Path::starts_with`,
+/// not a string prefix, so `/sys/fs/cgroupX` doesn't match `/sys/fs/cgroup`.
 fn grant_opens_cgroup_control_plane(resolved: &Path, access: AccessMode) -> bool {
     if !matches!(access, AccessMode::Write | AccessMode::ReadWrite) {
         return false;
@@ -693,11 +734,11 @@ fn grant_opens_cgroup_control_plane(resolved: &Path, access: AccessMode) -> bool
     resolved.starts_with(cgroup_mount) || cgroup_mount.starts_with(resolved)
 }
 
-/// Refuse a run whose `--memory` cap could be defeated because the sandbox is also
-/// granted write access over the cgroup hierarchy enforcing it (the child could
-/// raise its own `memory.max` or migrate out of the leaf). Only fires when a
-/// memory limit is set.
-fn reject_cgroup_writable_grants_under_memory_limit(caps: &CapabilitySet) -> Result<()> {
+/// Refuse a run whose resource limit (`--memory` / `--max-processes`) could be
+/// defeated because the sandbox is also granted write access over the cgroup
+/// hierarchy enforcing it (the child could raise its own `memory.max` / `pids.max`
+/// or migrate out of the leaf). Only fires when a limit is set.
+fn reject_cgroup_writable_grants_under_resource_limit(caps: &CapabilitySet) -> Result<()> {
     if caps
         .resource_limits()
         .is_none_or(|limits| limits.is_empty())
@@ -707,10 +748,11 @@ fn reject_cgroup_writable_grants_under_memory_limit(caps: &CapabilitySet) -> Res
     for cap in caps.fs_capabilities() {
         if grant_opens_cgroup_control_plane(&cap.resolved, cap.access) {
             return Err(NonoError::ConfigParse(format!(
-                "refusing write access to '{}' while a --memory limit is enforced: it overlaps \
-                 the cgroup hierarchy (/sys/fs/cgroup) that enforces the limit, so the sandbox \
-                 could rewrite its own memory cap and escape it. Make the grant read-only, scope \
-                 it more narrowly, or drop --memory.",
+                "refusing write access to '{}' while a resource limit (--memory / \
+                 --max-processes) is enforced: it overlaps the cgroup hierarchy \
+                 (/sys/fs/cgroup) that enforces the limit, so the sandbox could rewrite \
+                 its own cap and escape it. Make the grant read-only, scope it more \
+                 narrowly, or drop the limit.",
                 cap.resolved.display()
             )));
         }
@@ -2177,40 +2219,50 @@ mod tests {
     }
 
     #[test]
-    fn cgroup_grant_guard_only_fires_with_a_memory_limit() {
+    fn cgroup_grant_guard_only_fires_with_a_resource_limit() {
         // No limit -> always Ok (guard short-circuits before inspecting grants).
-        assert!(reject_cgroup_writable_grants_under_memory_limit(&CapabilitySet::new()).is_ok());
-        // A limit set but no filesystem grants -> Ok.
+        assert!(reject_cgroup_writable_grants_under_resource_limit(&CapabilitySet::new()).is_ok());
+        // A memory limit set but no filesystem grants -> Ok.
         let caps = CapabilitySet::new().with_resource_limits(nono::ResourceLimits {
             memory_bytes: Some(64 * 1024 * 1024),
+            max_processes: None,
         });
-        assert!(reject_cgroup_writable_grants_under_memory_limit(&caps).is_ok());
+        assert!(reject_cgroup_writable_grants_under_resource_limit(&caps).is_ok());
+        // A process-only limit also arms the guard (is_empty covers both fields),
+        // but with no grants it still passes.
+        let caps = CapabilitySet::new().with_resource_limits(nono::ResourceLimits {
+            memory_bytes: None,
+            max_processes: Some(64),
+        });
+        assert!(reject_cgroup_writable_grants_under_resource_limit(&caps).is_ok());
     }
 
-    // The guard's whole point: with a memory limit active, a writable grant that
-    // overlaps the cgroup tree is refused — otherwise the sandbox could rewrite its
-    // own memory.max and lift the cap. Linux-only because we need the real cgroup
-    // mount to canonicalize a grant over it; skip gracefully if it isn't present.
+    // The guard's whole point: with a limit active, a writable grant that overlaps
+    // the cgroup tree is refused — otherwise the sandbox could rewrite its own
+    // memory.max / pids.max and lift the cap. Linux-only because we need the real
+    // cgroup mount to canonicalize a grant over it; skip gracefully if absent.
+    // Uses a process-only limit to prove the guard is not memory-specific.
     #[test]
     #[cfg(target_os = "linux")]
-    fn cgroup_write_grant_under_a_memory_limit_is_refused() {
+    fn cgroup_write_grant_under_a_resource_limit_is_refused() {
         let Ok(grant) = FsCapability::new_dir("/sys/fs/cgroup", AccessMode::Write) else {
             return; // no cgroup mount on this host — nothing to exercise
         };
         let mut caps = CapabilitySet::new().with_resource_limits(nono::ResourceLimits {
-            memory_bytes: Some(64 * 1024 * 1024),
+            memory_bytes: None,
+            max_processes: Some(64),
         });
         caps.add_fs(grant);
 
-        let err = reject_cgroup_writable_grants_under_memory_limit(&caps)
-            .expect_err("a writable /sys/fs/cgroup grant under a memory limit must be refused");
+        let err = reject_cgroup_writable_grants_under_resource_limit(&caps)
+            .expect_err("a writable /sys/fs/cgroup grant under a resource limit must be refused");
         let msg = err.to_string();
         assert!(
             msg.contains("/sys/fs/cgroup"),
             "error must name the overlapping path: {msg}"
         );
         assert!(
-            msg.contains("--memory"),
+            msg.contains("--memory") || msg.contains("--max-processes"),
             "error should mention the limit: {msg}"
         );
     }
@@ -2237,6 +2289,98 @@ mod tests {
         // Malformed sizes still surface the parser's error.
         assert!(parse_memory_limit_flag("abc").is_err());
         assert!(parse_memory_limit_flag("0").is_err());
+    }
+
+    #[test]
+    fn max_processes_flag_rejects_zero_but_accepts_positive() {
+        // 0 is refused with a message that says why and points at the fix.
+        let err = validate_max_processes_flag(0).expect_err("0 must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("at least 1"), "msg: {msg}");
+        assert!(msg.contains("Omit the flag"), "should hint the fix: {msg}");
+
+        // Any positive count passes through unchanged (1, and a larger value).
+        assert_eq!(validate_max_processes_flag(1).expect("1 is the floor"), 1);
+        assert_eq!(
+            validate_max_processes_flag(1024).expect("large counts are fine"),
+            1024
+        );
+    }
+
+    #[test]
+    fn merge_flag_resource_limits_layers_flags_over_profile_without_clobbering() {
+        use nono::ResourceLimits;
+
+        // No flag: nothing to attach — even when a profile already set limits, they
+        // are left untouched (the caller attaches nothing on None).
+        assert_eq!(
+            merge_flag_resource_limits(None, None, None).expect("ok"),
+            None
+        );
+        let profile = ResourceLimits {
+            memory_bytes: Some(1 << 20),
+            max_processes: Some(8),
+        };
+        assert_eq!(
+            merge_flag_resource_limits(Some(&profile), None, None).expect("ok"),
+            None,
+            "no flag must not disturb profile-provided limits"
+        );
+
+        // A lone flag with no existing limits sets only its own field.
+        let mem = merge_flag_resource_limits(None, Some("512M"), None)
+            .expect("ok")
+            .expect("some");
+        assert!(mem.memory_bytes.is_some());
+        assert_eq!(mem.max_processes, None);
+        assert_eq!(
+            merge_flag_resource_limits(None, None, Some(64)).expect("ok"),
+            Some(ResourceLimits {
+                memory_bytes: None,
+                max_processes: Some(64),
+            })
+        );
+
+        // Don't-clobber: a profile MEMORY cap + a CLI --max-processes yields BOTH,
+        // not just the flag's field.
+        let profile_mem = ResourceLimits {
+            memory_bytes: Some(256 * 1024 * 1024),
+            max_processes: None,
+        };
+        let merged = merge_flag_resource_limits(Some(&profile_mem), None, Some(32))
+            .expect("ok")
+            .expect("some");
+        assert_eq!(
+            merged.memory_bytes,
+            Some(256 * 1024 * 1024),
+            "adding --max-processes must not drop the profile's memory cap"
+        );
+        assert_eq!(merged.max_processes, Some(32));
+
+        // Symmetric: a profile PIDS cap + a CLI --memory keeps the pids cap.
+        let profile_pids = ResourceLimits {
+            memory_bytes: None,
+            max_processes: Some(16),
+        };
+        let merged = merge_flag_resource_limits(Some(&profile_pids), Some("128M"), None)
+            .expect("ok")
+            .expect("some");
+        assert_eq!(merged.max_processes, Some(16));
+        assert!(merged.memory_bytes.is_some());
+
+        // A flag overrides the same field the profile set.
+        let overridden = merge_flag_resource_limits(Some(&profile), None, Some(2))
+            .expect("ok")
+            .expect("some");
+        assert_eq!(
+            overridden.max_processes,
+            Some(2),
+            "the flag overrides the profile's pids cap"
+        );
+
+        // Invalid flag values propagate as errors (0 processes; sub-MiB memory).
+        assert!(merge_flag_resource_limits(None, None, Some(0)).is_err());
+        assert!(merge_flag_resource_limits(None, Some("0"), None).is_err());
     }
 
     fn empty_prepared() -> PreparedSandbox {

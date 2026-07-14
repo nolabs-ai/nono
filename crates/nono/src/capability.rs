@@ -956,9 +956,9 @@ pub struct CapabilitySet {
     /// When set, the generated Seatbelt profile emits `(debug deny)` so
     /// sandboxd records denial events in the unified log.
     seatbelt_debug_deny: bool,
-    /// Resource ceilings (currently memory) for the sandboxed tree. Plumbed
-    /// through here so they ride the serialization layer like other policy;
-    /// enforced by the supervisor via cgroup v2 on Linux.
+    /// Resource ceilings (memory and max processes) for the sandboxed tree.
+    /// Plumbed through here so they ride the serialization layer like other
+    /// policy; enforced by the supervisor via cgroup v2 on Linux.
     resource_limits: Option<ResourceLimits>,
 }
 
@@ -1063,7 +1063,7 @@ impl CapabilitySet {
         self
     }
 
-    /// Attach resource ceilings (currently memory) to the set (builder pattern).
+    /// Attach resource ceilings (memory and max processes) to the set (builder pattern).
     ///
     /// The limits are carried through serialization, surfaced in `--dry-run`,
     /// and enforced by the supervisor via cgroup v2 on Linux.
@@ -3666,11 +3666,13 @@ mod tests {
 
         let limits = ResourceLimits {
             memory_bytes: Some(512 * 1024 * 1024),
+            max_processes: Some(64),
         };
         let caps = caps.with_resource_limits(limits);
         let got = caps.resource_limits().expect("limits attached");
         assert_eq!(*got, limits);
         assert_eq!(got.memory_bytes, Some(512 * 1024 * 1024));
+        assert_eq!(got.max_processes, Some(64));
     }
 
     #[test]
@@ -3682,13 +3684,19 @@ mod tests {
         let caps = CapabilitySet::new()
             .with_resource_limits(ResourceLimits {
                 memory_bytes: Some(1024),
+                max_processes: None,
             })
             .with_resource_limits(ResourceLimits {
                 memory_bytes: Some(2048),
+                max_processes: Some(16),
             });
         assert_eq!(
             caps.resource_limits().and_then(|l| l.memory_bytes),
             Some(2048)
+        );
+        assert_eq!(
+            caps.resource_limits().and_then(|l| l.max_processes),
+            Some(16)
         );
     }
 }

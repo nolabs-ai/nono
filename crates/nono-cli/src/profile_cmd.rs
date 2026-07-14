@@ -1074,12 +1074,36 @@ pub(crate) fn cmd_show(args: ProfileShowArgs) -> Result<()> {
                 ports.join(", ")
             );
         }
+        if !net.open_port_range.is_empty() {
+            let ranges: Vec<String> = net
+                .open_port_range
+                .iter()
+                .map(|&[s, e]| format!("{}..={}", s, e))
+                .collect();
+            println!(
+                "    {}: {}",
+                theme::fg("open_port_range", t.subtext),
+                ranges.join(", ")
+            );
+        }
         if !net.listen_port.is_empty() {
             let ports: Vec<String> = net.listen_port.iter().map(|p| p.to_string()).collect();
             println!(
                 "    {}: {}",
                 theme::fg("listen_port", t.subtext),
                 ports.join(", ")
+            );
+        }
+        if !net.listen_port_range.is_empty() {
+            let ranges: Vec<String> = net
+                .listen_port_range
+                .iter()
+                .map(|&[s, e]| format!("{}..={}", s, e))
+                .collect();
+            println!(
+                "    {}: {}",
+                theme::fg("listen_port_range", t.subtext),
+                ranges.join(", ")
             );
         }
         if let Some(ref ep) = net.upstream_proxy {
@@ -3020,7 +3044,10 @@ fn resolve_to_manifest(
             .collect(),
         endpoints: manifest_endpoints,
         dns: true,
-        ports: if prof.network.listen_port.is_empty() && prof.network.open_port.is_empty() {
+        ports: if prof.network.listen_port.is_empty()
+            && prof.network.open_port.is_empty()
+            && prof.network.open_port_range.is_empty()
+        {
             None
         } else {
             Some(manifest::PortConfig {
@@ -3036,6 +3063,17 @@ fn resolve_to_manifest(
                     .open_port
                     .iter()
                     .filter_map(|p| std::num::NonZeroU64::new(u64::from(*p)))
+                    .collect(),
+                localhost_range: prof
+                    .network
+                    .open_port_range
+                    .iter()
+                    .filter_map(|&[s, e]| {
+                        Some([
+                            std::num::NonZeroU64::new(u64::from(s))?,
+                            std::num::NonZeroU64::new(u64::from(e))?,
+                        ])
+                    })
                     .collect(),
             })
         },

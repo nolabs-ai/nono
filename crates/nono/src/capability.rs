@@ -8,6 +8,41 @@ use crate::resource::ResourceLimits;
 use serde::{Deserialize, Serialize};
 use std::path::{Component, Path, PathBuf};
 
+/// Maximum total ports across all `localhost_port_ranges` entries on macOS (2¹⁴ = 16,384).
+///
+/// Each port in a range becomes an individual Seatbelt rule. `sandbox_init()` crashes
+/// with SIGILL above ~17,770 rules; this limit keeps the total safely below that.
+/// Linux has no such restriction — Landlock accepts the full 16-bit port space (1–65535).
+pub const MACOS_PORT_RANGE_LIMIT: u32 = 1 << 14;
+
+/// Merge overlapping or adjacent port ranges into a minimal sorted list.
+///
+/// Sorting is by start port; adjacent ranges (e.g. `1..=5` and `6..=10`) are
+/// merged into one. The result is used before expanding ranges into individual
+/// sandbox rules so duplicate ports are never added twice.
+pub fn merge_port_ranges(ranges: &[(u16, u16)]) -> Vec<(u16, u16)> {
+    if ranges.is_empty() {
+        return Vec::new();
+    }
+    let mut sorted = ranges.to_vec();
+    sorted.sort_unstable_by_key(|&(s, _)| s);
+    let mut merged: Vec<(u16, u16)> = Vec::with_capacity(sorted.len());
+    let (mut cur_start, mut cur_end) = sorted[0];
+    for &(start, end) in &sorted[1..] {
+        if start <= cur_end.saturating_add(1) {
+            if end > cur_end {
+                cur_end = end;
+            }
+        } else {
+            merged.push((cur_start, cur_end));
+            cur_start = start;
+            cur_end = end;
+        }
+    }
+    merged.push((cur_start, cur_end));
+    merged
+}
+
 /// Source of a filesystem capability for diagnostics
 ///
 /// Tracks whether a capability was added by the user directly,
@@ -893,6 +928,12 @@ pub struct CapabilitySet {
     /// by destination IP. Use with `--block-net` or proxy mode to ensure
     /// only localhost is reachable.
     localhost_ports: Vec<u16>,
+    /// Inclusive port ranges for bidirectional localhost IPC (connect + bind).
+    ///
+    /// Each port in a range becomes an individual sandbox rule. macOS enforces
+    /// [`MACOS_PORT_RANGE_LIMIT`] (2¹⁴ = 16,384 ports) across all ranges combined;
+    /// Linux accepts any range within the 16-bit port space (1–65535).
+    localhost_port_ranges: Vec<(u16, u16)>,
     /// Commands explicitly allowed (overrides blocklists - for CLI use)
     allowed_commands: Vec<String>,
     /// Additional commands to block (extends blocklists - for CLI use)
@@ -1104,6 +1145,24 @@ impl CapabilitySet {
         self
     }
 
+    /// Allow an inclusive range of localhost ports for bidirectional IPC.
+    ///
+    /// Returns an error if `start` is 0 (port 0 has no defined meaning in a
+    /// range; use `allow_localhost_port(0)` for the macOS `localhost:*` wildcard).
+    ///
+    /// See [`localhost_port_ranges`](Self::localhost_port_ranges) for
+    /// platform-specific behaviour and expansion limits.
+    pub fn allow_localhost_port_range(mut self, start: u16, end: u16) -> Result<Self> {
+        if start == 0 {
+            return Err(NonoError::ConfigParse(
+                "port range starting at 0 is invalid; port 0 has no defined meaning in a range"
+                    .to_string(),
+            ));
+        }
+        self.localhost_port_ranges.push((start, end));
+        Ok(self)
+    }
+
     /// Allow TCP connect to standard HTTPS ports (443, 8443)
     ///
     /// Convenience method. Linux Landlock V4+ only.
@@ -1259,6 +1318,20 @@ impl CapabilitySet {
     /// Localhost IPC port; `0` is macOS-only (`localhost:*` TCP outbound).
     pub fn add_localhost_port(&mut self, port: u16) {
         self.localhost_ports.push(port);
+    }
+
+    /// Add an inclusive localhost port range for bidirectional IPC (mutable).
+    ///
+    /// Returns an error if `start` is 0 (port 0 has no defined meaning in a range).
+    pub fn add_localhost_port_range(&mut self, start: u16, end: u16) -> Result<()> {
+        if start == 0 {
+            return Err(NonoError::ConfigParse(
+                "port range starting at 0 is invalid; port 0 has no defined meaning in a range"
+                    .to_string(),
+            ));
+        }
+        self.localhost_port_ranges.push((start, end));
+        Ok(())
     }
 
     /// Set sandbox extensions state
@@ -1435,6 +1508,12 @@ impl CapabilitySet {
     #[must_use]
     pub fn localhost_ports(&self) -> &[u16] {
         &self.localhost_ports
+    }
+
+    /// Get localhost IPC port ranges
+    #[must_use]
+    pub fn localhost_port_ranges(&self) -> &[(u16, u16)] {
+        &self.localhost_port_ranges
     }
 
     /// Check if sandbox extensions are enabled for runtime capability expansion
@@ -2814,6 +2893,82 @@ mod tests {
         caps.add_localhost_port(8080);
         caps.add_localhost_port(9090);
         assert_eq!(caps.localhost_ports(), &[8080, 9090]);
+    }
+
+    #[test]
+    fn test_localhost_port_range_builder() {
+        let caps = CapabilitySet::new()
+            .allow_localhost_port_range(3000, 3100)
+            .expect("valid range")
+            .allow_localhost_port_range(49152, 49200)
+            .expect("valid range");
+        assert_eq!(
+            caps.localhost_port_ranges(),
+            &[(3000, 3100), (49152, 49200)]
+        );
+    }
+
+    #[test]
+    fn test_localhost_port_range_mutable() {
+        let mut caps = CapabilitySet::new();
+        caps.add_localhost_port_range(8000, 8080)
+            .expect("valid range");
+        assert_eq!(caps.localhost_port_ranges(), &[(8000, 8080)]);
+    }
+
+    #[test]
+    fn test_localhost_port_range_rejects_zero_start() {
+        assert!(
+            CapabilitySet::new()
+                .allow_localhost_port_range(0, 100)
+                .is_err()
+        );
+        let mut caps = CapabilitySet::new();
+        assert!(caps.add_localhost_port_range(0, 100).is_err());
+    }
+
+    #[test]
+    fn test_merge_port_ranges_empty() {
+        assert_eq!(merge_port_ranges(&[]), vec![]);
+    }
+
+    #[test]
+    fn test_merge_port_ranges_no_overlap() {
+        assert_eq!(
+            merge_port_ranges(&[(1, 10), (20, 30)]),
+            vec![(1, 10), (20, 30)]
+        );
+    }
+
+    #[test]
+    fn test_merge_port_ranges_overlapping() {
+        assert_eq!(merge_port_ranges(&[(1, 20), (10, 30)]), vec![(1, 30)]);
+    }
+
+    #[test]
+    fn test_merge_port_ranges_adjacent() {
+        assert_eq!(merge_port_ranges(&[(1, 10), (11, 20)]), vec![(1, 20)]);
+    }
+
+    #[test]
+    fn test_merge_port_ranges_contained() {
+        assert_eq!(merge_port_ranges(&[(1, 100), (20, 50)]), vec![(1, 100)]);
+    }
+
+    #[test]
+    fn test_merge_port_ranges_unsorted_input() {
+        assert_eq!(
+            merge_port_ranges(&[(50, 60), (1, 10), (8, 55)]),
+            vec![(1, 60)]
+        );
+    }
+
+    #[test]
+    fn test_merge_port_ranges_three_overlap() {
+        assert_eq!(
+            merge_port_ranges(&[(3000, 4000), (3500, 5000), (4500, 6000)]),
+            vec![(3000, 6000)]
+        );
     }
 
     #[test]

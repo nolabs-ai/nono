@@ -1516,10 +1516,22 @@ pub struct NetworkConfig {
         alias = "allow_port"
     )]
     pub open_port: Vec<u16>,
+    /// Inclusive port ranges for bidirectional localhost TCP IPC (connect + bind).
+    /// Multiple ranges are supported. Example: `[[3000, 3010], [8000, 8100]]`.
+    /// Each port becomes an individual rule — larger ranges take longer to apply at startup.
+    /// macOS enforces a combined limit of 16,384 unique ports across all ranges (2¹⁴);
+    /// Linux has no such restriction. Overlapping ranges are merged before applying rules.
+    #[serde(default)]
+    pub open_port_range: Vec<[u16; 2]>,
     /// TCP ports the sandboxed child may listen on.
     /// Equivalent to `--listen-port` CLI flag.
     #[serde(default)]
     pub listen_port: Vec<u16>,
+    /// Inclusive port ranges for TCP listen (bind only). Same platform behaviour as
+    /// `open_port_range` for the bind side; no outbound connect rules are added.
+    /// Overlapping ranges are merged before applying rules.
+    #[serde(default)]
+    pub listen_port_range: Vec<[u16; 2]>,
     /// Outbound TCP connect ports (allowlist). Linux Landlock V4+ only.
     /// Equivalent to `--allow-connect-port` CLI flag.
     #[serde(default)]
@@ -3433,7 +3445,15 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
             ),
             deny_domain: dedup_append(&base.network.deny_domain, &child.network.deny_domain),
             open_port: dedup_append(&base.network.open_port, &child.network.open_port),
+            open_port_range: dedup_append(
+                &base.network.open_port_range,
+                &child.network.open_port_range,
+            ),
             listen_port: dedup_append(&base.network.listen_port, &child.network.listen_port),
+            listen_port_range: dedup_append(
+                &base.network.listen_port_range,
+                &child.network.listen_port_range,
+            ),
             connect_port: dedup_append(&base.network.connect_port, &child.network.connect_port),
             // Child `Some([])` overrides parent credentials to empty (disables proxy).
             // Child `None` inherits parent credentials. Child `Some([...])` merges with parent.
@@ -5827,7 +5847,9 @@ mod tests {
                 allow_domain: vec![AllowDomainEntry::Plain("base.example.com".to_string())],
                 deny_domain: vec![],
                 open_port: vec![3000],
+                open_port_range: vec![],
                 listen_port: vec![4000],
+                listen_port_range: vec![],
                 connect_port: vec![],
                 credentials: Some(vec!["base_cred".to_string()]),
                 custom_credentials: HashMap::new(),
@@ -5916,7 +5938,9 @@ mod tests {
                 allow_domain: vec![AllowDomainEntry::Plain("child.example.com".to_string())],
                 deny_domain: vec![],
                 open_port: vec![3000, 5000],
+                open_port_range: vec![],
                 listen_port: vec![4000, 6000],
+                listen_port_range: vec![],
                 connect_port: vec![],
                 credentials: None,
                 custom_credentials: HashMap::new(),

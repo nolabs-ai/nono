@@ -251,16 +251,19 @@ pub fn print_capabilities(
             }
         }
     }
-    if !caps.localhost_ports().is_empty() {
-        let ports_str: Vec<String> = caps
+    if !caps.localhost_ports().is_empty() || !caps.localhost_port_ranges().is_empty() {
+        let mut parts: Vec<String> = caps
             .localhost_ports()
             .iter()
             .map(|p| p.to_string())
             .collect();
+        for &(start, end) in caps.localhost_port_ranges() {
+            parts.push(format!("{}..={}", start, end));
+        }
         eprintln!(
             "  {} {}",
             theme::badge(" ipc ", t.teal, BADGE_FG_DARK),
-            theme::fg(&format!("localhost:{}", ports_str.join(", ")), t.subtext,),
+            theme::fg(&format!("localhost:{}", parts.join(", ")), t.subtext,),
         );
     }
 

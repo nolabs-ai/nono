@@ -4723,6 +4723,7 @@ fn caps_to_spec(caps: &CapabilitySet) -> ChildCapsSpec {
             NetworkMode::ProxyOnly { bind_ports, .. } => bind_ports.clone(),
             _ => Vec::new(),
         },
+        proxy_bind_port_ranges: caps.localhost_port_ranges().to_vec(),
         tcp_connect_ports: caps.tcp_connect_ports().to_vec(),
         tcp_bind_ports: caps.tcp_bind_ports().to_vec(),
     }
@@ -4737,6 +4738,9 @@ fn caps_from_spec(spec: &ChildCapsSpec) -> Result<CapabilitySet> {
         });
     } else if spec.network_blocked {
         caps.set_network_mode_mut(NetworkMode::Blocked);
+    }
+    for &(start, end) in &spec.proxy_bind_port_ranges {
+        caps.add_localhost_port_range(start, end)?;
     }
     for fs_grant in &spec.fs {
         caps.add_fs(fs_cap_from_spec(fs_grant)?);
@@ -5916,6 +5920,7 @@ mod tests {
             network_blocked: false,
             proxy_port: None,
             proxy_bind_ports: Vec::new(),
+            proxy_bind_port_ranges: Vec::new(),
             tcp_connect_ports: Vec::new(),
             tcp_bind_ports: Vec::new(),
         };

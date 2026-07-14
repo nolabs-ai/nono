@@ -197,6 +197,16 @@
           "type": "array",
           "items": { "type": "integer", "minimum": 1, "maximum": 65535 },
           "description": "Localhost TCP ports allowed for bidirectional IPC (connect + bind)."
+        },
+        "localhost_range": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "items": { "type": "integer", "minimum": 1, "maximum": 65535 },
+            "minItems": 2,
+            "maxItems": 2
+          },
+          "description": "Inclusive localhost port ranges for bidirectional IPC. Each entry is [start, end]. All ranges combined must not exceed 16,384 total ports."
         }
       }
     },

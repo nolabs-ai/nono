@@ -2118,7 +2118,10 @@ fn parse_procargs2(buf: &[u8]) -> Option<DaemonArgvEnv> {
     while pos < buf.len() && buf[pos] == 0 {
         pos += 1; // exec-path alignment padding
     }
-    let mut argv = Vec::with_capacity(argc as usize);
+    // `argc` comes from the target process's raw KERN_PROCARGS2 buffer, so an
+    // untrusted/manipulated process can report an enormous value; cap the
+    // allocation by the buffer we actually read to avoid an OOM panic.
+    let mut argv = Vec::with_capacity(std::cmp::min(argc as usize, buf.len()));
     for _ in 0..argc {
         if pos >= buf.len() {
             break;
@@ -6421,5 +6424,22 @@ mod tests {
         let without_override = crate::tool_sandbox::ResolvedInterceptAction::passthrough();
         let effective = without_override.sandbox.unwrap_or(&command_sandbox);
         assert_eq!(effective.fs_read, vec!["/command/path".to_string()]);
+    }
+
+    #[test]
+    fn parse_procargs2_bounds_argv_capacity_to_buffer_len() {
+        // `argc` is read from the target process's own KERN_PROCARGS2 buffer, so an
+        // untrusted/manipulated process can report an argc far larger than the
+        // buffer actually holds. Before the fix this drove an unbounded
+        // `Vec::with_capacity(argc as usize)`, which panics with an OOM abort
+        // rather than returning an error.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&i32::MAX.to_ne_bytes()); // argc
+        buf.push(0); // empty exec path, NUL-terminated
+        buf.extend_from_slice(b"one\0two\0");
+
+        let (argv, env) = parse_procargs2(&buf).expect("buffer is well-formed enough to parse");
+        assert_eq!(argv, vec!["one".to_string(), "two".to_string()]);
+        assert!(env.is_empty());
     }
 }

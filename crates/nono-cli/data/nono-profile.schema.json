@@ -1006,6 +1006,13 @@
             { "type": "null" }
           ],
           "description": "Path to the PEM-encoded private key corresponding to tls_client_cert. Must be set together with tls_client_cert."
+        },
+        "rate_limit": {
+          "oneOf": [
+            { "$ref": "#/$defs/RouteRateLimitConfig" },
+            { "type": "null" }
+          ],
+          "description": "Optional per-route request-rate limit (RouteRateLimiter). Caps the rate of L7 requests forwarded to this credential's upstream to contain a runaway or compromised agent. Applies only to L7-visible traffic (reverse-proxy and TLS-intercepted CONNECT); it has no effect on opaque CONNECT tunnels."
         }
       }
     },
@@ -1147,6 +1154,31 @@
              { "type": "null" }
            ],
            "description": "Explicit SigV4 service name (e.g., \"bedrock\", \"s3\"). If omitted, auto-detected from the upstream URL. Must be non-empty and contain no whitespace if set."
+         }
+       }
+     },
+     "RouteRateLimitConfig": {
+       "type": "object",
+       "description": "Per-route request-rate limit (RouteRateLimiter). A token bucket refilling at requests_per_minute and holding up to burst tokens. When the bucket is empty, a request is delayed up to max_delay_secs; a request that would wait longer is rejected with HTTP 429 (bounded delay then reject).",
+       "additionalProperties": false,
+       "required": ["requests_per_minute"],
+       "properties": {
+         "requests_per_minute": {
+           "type": "integer",
+           "minimum": 0,
+           "description": "Sustained request rate, in requests per minute. The token bucket refills at this rate. 0 disables the limiter for the route."
+         },
+         "burst": {
+           "type": "integer",
+           "minimum": 0,
+           "default": 5,
+           "description": "Burst capacity: instantaneous requests allowed before throttling begins. Clamped to at least 1 at runtime."
+         },
+         "max_delay_secs": {
+           "type": "integer",
+           "minimum": 0,
+           "default": 5,
+           "description": "Maximum seconds a request may be delayed before it is rejected with HTTP 429. Bounds the delay queue so a flood cannot exhaust proxy resources."
          }
        }
      },

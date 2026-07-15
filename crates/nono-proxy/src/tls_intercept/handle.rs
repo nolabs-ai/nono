@@ -759,6 +759,41 @@ pub(crate) async fn select_intercept_route<'a>(
             method, path
         ),
     }
+
+    // Route request rate limit (RouteRateLimiter) for the selected route. Gate
+    // the authorized request before credential injection and upstream
+    // forwarding. Both the HTTP/1.1 and h2 intercept paths route through this
+    // function, so a 429 is emitted identically regardless of protocol. A
+    // passthrough selection (no route) has no limiter and is unaffected.
+    if let Some((prefix, route)) = selected
+        && let Some(limiter) = route.rate_limiter.as_ref()
+    {
+        match limiter.acquire() {
+            crate::rate_limit::RateLimitDecision::Proceed { delay } => {
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
+            }
+            crate::rate_limit::RateLimitDecision::Reject => {
+                let reason = "route request rate limit exceeded";
+                warn!("tls_intercept: {} for route '{}'", reason, prefix);
+                audit::log_denied(
+                    audit_log,
+                    audit::ProxyMode::ConnectIntercept,
+                    &audit::EventContext {
+                        route_id: Some(prefix),
+                        upstream: Some(&route.upstream),
+                        ..audit::EventContext::default()
+                    },
+                    host,
+                    port,
+                    reason,
+                );
+                return RouteSelection::Rejected(429);
+            }
+        }
+    }
+
     RouteSelection::Selected(selected)
 }
 
@@ -958,6 +993,7 @@ where
             RouteSelection::Rejected(status) => {
                 let msg = match status {
                     502 => "Bad Gateway",
+                    429 => "Too Many Requests",
                     _ => "Forbidden",
                 };
                 reverse::send_error_generic(tls_stream, status, msg).await?;
@@ -1841,6 +1877,7 @@ mod tests {
             aws_auth: None,
             endpoint_policy: None,
             spiffe: None,
+            rate_limit: None,
         }
     }
 
@@ -1875,6 +1912,7 @@ mod tests {
                 aws_auth: None,
                 endpoint_policy: None,
                 spiffe: None,
+                rate_limit: None,
             }
         }
 

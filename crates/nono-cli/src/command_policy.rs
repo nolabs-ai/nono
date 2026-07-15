@@ -1391,7 +1391,10 @@ pub(crate) fn resolve_policy_exec_helpers(
 /// at dispatch time. A declared helper that fails to resolve is a hard error —
 /// a daemon_pid_source that can never run would silently fail closed on every
 /// severed-daemon check, which should surface at profile-build time instead.
-#[cfg(any(test, target_os = "linux", target_os = "macos"))]
+// daemon_pid_source is consumed on macOS only for now (see CommandPolicyConfig
+// doc comment); unlike exec_helpers this isn't wired up on Linux, so keep the
+// cfg gate macOS-only or `-D warnings` flags it as dead code there.
+#[cfg(any(test, target_os = "macos"))]
 pub(crate) fn resolve_policy_daemon_pid_source_helpers(
     config: &CommandPoliciesConfig,
 ) -> nono::Result<BTreeMap<String, ResolvedCommandBinary>> {
@@ -1442,7 +1445,7 @@ pub(crate) fn resolve_policy_daemon_pid_source_helpers(
 
 /// True if the named command's `daemon_pid_source` helper opts into
 /// `allow_writable_executable`. Mirrors `command_referencing_exec_helper_allows_writable`.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub(crate) fn command_daemon_pid_source_helper_allows_writable(
     config: &CommandPoliciesConfig,
     command_name: &str,

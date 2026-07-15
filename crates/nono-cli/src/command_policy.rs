@@ -1384,6 +1384,75 @@ pub(crate) fn resolve_policy_exec_helpers(
     Ok(helpers)
 }
 
+/// Pre-resolve every command's `daemon_pid_source` helper, keyed by command
+/// name (each command declares at most one), exactly like `exec` intercept
+/// helpers: identity (dev/ino/size/mtime/sha256) is captured up front for
+/// TOCTOU protection, rather than only checking the helper path is absolute
+/// at dispatch time. A declared helper that fails to resolve is a hard error —
+/// a daemon_pid_source that can never run would silently fail closed on every
+/// severed-daemon check, which should surface at profile-build time instead.
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
+pub(crate) fn resolve_policy_daemon_pid_source_helpers(
+    config: &CommandPoliciesConfig,
+) -> nono::Result<BTreeMap<String, ResolvedCommandBinary>> {
+    let mut helpers = BTreeMap::new();
+    for (command_name, command) in &config.commands {
+        let Some(source) = &command.daemon_pid_source else {
+            continue;
+        };
+        let Some(helper_raw) = source.argv.first() else {
+            continue;
+        };
+        let helper_path = crate::policy::expand_path(helper_raw).map_err(|err| {
+            nono::NonoError::ProfileParse(format!(
+                "command '{command_name}' daemon_pid_source helper '{helper_raw}' could not be expanded: {err}"
+            ))
+        })?;
+        if !helper_path.is_absolute() {
+            return Err(nono::NonoError::ProfileParse(format!(
+                "command '{command_name}' daemon_pid_source helper must be an absolute path; got '{}'",
+                helper_path.display()
+            )));
+        }
+        // Not scoped by the command-hash cache, same rationale as exec helpers above.
+        let (resolved, _) = candidate_command_match(&helper_path, &HashMap::new())?
+            .ok_or_else(|| {
+                nono::NonoError::ProfileParse(format!(
+                    "command '{command_name}' daemon_pid_source helper '{}' not found or not executable",
+                    helper_path.display()
+                ))
+            })?;
+        helpers.insert(
+            command_name.clone(),
+            ResolvedCommandBinary {
+                name: format!("{command_name}.daemon_pid_source"),
+                canonical_path: resolved.canonical_path,
+                dev: resolved.dev,
+                ino: resolved.ino,
+                size: resolved.size,
+                mtime_nanos: resolved.mtime_nanos,
+                sha256: resolved.sha256,
+                duplicate_paths: Vec::new(),
+                shape: resolved.shape,
+            },
+        );
+    }
+    Ok(helpers)
+}
+
+/// True if the named command's `daemon_pid_source` helper opts into
+/// `allow_writable_executable`. Mirrors `command_referencing_exec_helper_allows_writable`.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn command_daemon_pid_source_helper_allows_writable(
+    config: &CommandPoliciesConfig,
+    command_name: &str,
+) -> bool {
+    config
+        .commands
+        .get(command_name)
+        .is_some_and(|command| command.allow_writable_executable)
+}
+
 fn validate_command(
     command_name: &str,
     command: &CommandPolicyConfig,
@@ -1509,7 +1578,27 @@ fn validate_command(
         }
     }
 
+    if let Some(source) = &command.daemon_pid_source {
+        validate_daemon_pid_source(command_name, source, report);
+    }
+
     validate_intercept_rules(command_name, &command.intercept, config, scope, report);
+}
+
+/// An empty `argv` fails closed at runtime (`argv.first()` is `None`, so the
+/// command's severed-daemon attribution is silently disabled) rather than
+/// surfacing a clear error, so reject it at profile-load time instead.
+fn validate_daemon_pid_source(
+    command_name: &str,
+    source: &DaemonPidSource,
+    report: &mut CommandPolicyValidationReport,
+) {
+    if source.argv.is_empty() {
+        report.error(
+            "daemon_pid_source_empty_argv",
+            format!("command '{command_name}' daemon_pid_source.argv must not be empty"),
+        );
+    }
 }
 
 fn validate_intercept_rules(
@@ -4383,6 +4472,114 @@ mod tests {
             err.to_string().contains("absolute path"),
             "expected absolute-path rejection, got: {err}"
         );
+    }
+
+    fn git_config_with_daemon_pid_source(argv: Vec<String>) -> CommandPoliciesConfig {
+        let mut config = active_git_config();
+        let git = config.commands.get_mut("git").expect("git command");
+        git.daemon_pid_source = Some(DaemonPidSource {
+            argv,
+            env: Vec::new(),
+        });
+        config
+    }
+
+    #[test]
+    fn daemon_pid_source_rejects_empty_argv() {
+        let config = git_config_with_daemon_pid_source(vec![]);
+        let report =
+            validate_command_policies(Some(&config), CommandPolicyValidationScope::Resolved);
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|finding| finding.code == "daemon_pid_source_empty_argv"),
+            "{:?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn daemon_pid_source_accepts_nonempty_argv() {
+        let config = git_config_with_daemon_pid_source(vec!["/usr/bin/true".to_string()]);
+        let report =
+            validate_command_policies(Some(&config), CommandPolicyValidationScope::Resolved);
+        assert!(
+            !report
+                .errors
+                .iter()
+                .any(|finding| finding.code == "daemon_pid_source_empty_argv"),
+            "{:?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn daemon_pid_source_helper_resolution_captures_identity() {
+        let helper = ["/usr/bin/true", "/bin/true"]
+            .into_iter()
+            .map(PathBuf::from)
+            .find(|p| p.exists());
+        let Some(helper) = helper else {
+            return; // no stable helper available; skip rather than fail spuriously.
+        };
+        let config = git_config_with_daemon_pid_source(vec![helper.display().to_string()]);
+        let helpers = resolve_policy_daemon_pid_source_helpers(&config).expect("resolve helpers");
+        let resolved = helpers.get("git").expect("helper resolved for git");
+        assert!(!resolved.sha256.is_empty());
+        assert!(resolved.canonical_path.is_absolute());
+    }
+
+    #[test]
+    fn resolve_policy_daemon_pid_source_helpers_rejects_relative_helper() {
+        let config = git_config_with_daemon_pid_source(vec!["relative/helper".to_string()]);
+        let err = resolve_policy_daemon_pid_source_helpers(&config)
+            .expect_err("must reject relative helper");
+        assert!(
+            err.to_string().contains("absolute path"),
+            "expected absolute-path rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_policy_daemon_pid_source_helpers_rejects_missing_helper() {
+        let config =
+            git_config_with_daemon_pid_source(vec!["/nonexistent/nono-test-helper".to_string()]);
+        let err = resolve_policy_daemon_pid_source_helpers(&config)
+            .expect_err("must reject a helper that does not exist");
+        assert!(
+            err.to_string().contains("not found or not executable"),
+            "expected not-found rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_policy_daemon_pid_source_helpers_expands_vars_in_program_path() {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let dir = std::env::temp_dir().join(format!(
+            "nono-daemon-pid-source-expand-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).expect("mkdir");
+        let helper = dir.join("helper.sh");
+        fs::write(&helper, "#!/bin/sh\necho 1\n").expect("write");
+        fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let dir_str = dir.to_string_lossy().into_owned();
+        let _env = crate::test_env::EnvVarGuard::set_all(&[("NONO_TEST_HELPER_DIR", &dir_str)]);
+
+        let config =
+            git_config_with_daemon_pid_source(vec!["$NONO_TEST_HELPER_DIR/helper.sh".to_string()]);
+        let helpers = resolve_policy_daemon_pid_source_helpers(&config).expect("resolve helpers");
+        let resolved = helpers.get("git").expect("helper resolved for git");
+        assert_eq!(
+            resolved.canonical_path,
+            helper.canonicalize().expect("canonicalize")
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

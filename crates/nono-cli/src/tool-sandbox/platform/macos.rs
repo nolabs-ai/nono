@@ -173,6 +173,9 @@ struct ResolvedToolSandboxPlan {
     /// as written in the profile. Identity expectations are captured here so
     /// the helper launch is TOCTOU-protected like a command binary.
     exec_helpers: BTreeMap<PathBuf, ResolvedCommandBinary>,
+    /// Pre-resolved `daemon_pid_source` helpers, keyed by command name.
+    /// Identity is captured here for the same TOCTOU protection as `exec_helpers`.
+    daemon_pid_source_helpers: BTreeMap<String, ResolvedCommandBinary>,
     deny_only: BTreeMap<String, ResolvedDenyOnlyCommand>,
     allowed_direct_bypass_ids: HashSet<FileId>,
 }
@@ -214,6 +217,13 @@ impl ResolvedToolSandboxPlan {
         }
         let exec_helpers = crate::command_policy::resolve_policy_exec_helpers(config)?;
         validate_controlled_exec_helper_immutability(config, &exec_helpers, outer_caps)?;
+        let daemon_pid_source_helpers =
+            crate::command_policy::resolve_policy_daemon_pid_source_helpers(config)?;
+        validate_controlled_daemon_pid_source_helper_immutability(
+            config,
+            &daemon_pid_source_helpers,
+            outer_caps,
+        )?;
         let search_dirs = command_search_dirs(config, path_env, outer_caps)?;
         validate_trusted_executable_dirs(&search_dirs, outer_caps)?;
         // BMETE command policies are scoped to command_policies.commands.
@@ -230,6 +240,7 @@ impl ResolvedToolSandboxPlan {
             config: config.clone(),
             resolved,
             exec_helpers,
+            daemon_pid_source_helpers,
             deny_only,
             allowed_direct_bypass_ids,
         })
@@ -307,7 +318,7 @@ impl PreparedToolSandboxRuntime {
 
         let approval_backends = crate::approval_runtime::build_approval_registry(&plan.config)?;
         // Verify severed daemons if any command declares a helper, else disabled (fail closed).
-        let lineage = LineageMarker::build(&plan.config);
+        let lineage = LineageMarker::build(&plan.config, plan.daemon_pid_source_helpers.clone());
         let runtime = Self {
             inner: Arc::new(ToolSandboxState {
                 runtime_dir,
@@ -1836,13 +1847,19 @@ enum LineageMarker {
 }
 
 impl LineageMarker {
-    fn build(config: &CommandPoliciesConfig) -> Self {
+    fn build(
+        config: &CommandPoliciesConfig,
+        helpers: BTreeMap<String, ResolvedCommandBinary>,
+    ) -> Self {
         if config
             .commands
             .values()
             .any(|command| command.daemon_pid_source.is_some())
         {
-            Self::DaemonPid(DaemonPidLineage::default())
+            Self::DaemonPid(DaemonPidLineage {
+                helpers,
+                ..Default::default()
+            })
         } else {
             Self::Disabled
         }
@@ -1872,11 +1889,25 @@ struct DaemonIdentity {
     start_usec: u64,
 }
 
+/// A severed daemon that matched no declared `daemon_pid_source` is re-checked
+/// against every helper (each up to `DAEMON_PID_SOURCE_TIMEOUT`) on every call
+/// without this bound: a same-user process that rapidly forks/reparents could
+/// force a full helper sweep per attempt and exhaust the supervisor's thread
+/// pool. Short enough that a helper's own startup race (e.g. server not fully
+/// up yet) self-heals quickly; long enough to blunt a tight fork loop.
+const DAEMON_PID_NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(2);
+
 /// Verifies severed daemons against declared `daemon_pid_source` helpers and
 /// caches each result, keyed by pid and pinned by kernel identity.
 #[derive(Default)]
 struct DaemonPidLineage {
     cache: Mutex<HashMap<u32, (DaemonIdentity, String)>>,
+    /// Unmatched severed daemons, pinned by kernel identity so a recycled pid
+    /// can't inherit a stale denial, expired after `DAEMON_PID_NEGATIVE_CACHE_TTL`.
+    negative_cache: Mutex<HashMap<u32, (DaemonIdentity, Instant)>>,
+    /// Pre-resolved helper identity (dev/ino/size/mtime/sha256), keyed by
+    /// command name, captured at plan-build time for TOCTOU protection.
+    helpers: BTreeMap<String, ResolvedCommandBinary>,
 }
 
 impl DaemonPidLineage {
@@ -1885,6 +1916,21 @@ impl DaemonPidLineage {
         daemon_pid: u32,
         config: &CommandPoliciesConfig,
         policy_root: &Path,
+    ) -> Option<String> {
+        self.attribute_with_negative_ttl(
+            daemon_pid,
+            config,
+            policy_root,
+            DAEMON_PID_NEGATIVE_CACHE_TTL,
+        )
+    }
+
+    fn attribute_with_negative_ttl(
+        &self,
+        daemon_pid: u32,
+        config: &CommandPoliciesConfig,
+        policy_root: &Path,
+        negative_ttl: Duration,
     ) -> Option<String> {
         if daemon_pid == 0 || daemon_pid == 1 {
             return None;
@@ -1897,12 +1943,28 @@ impl DaemonPidLineage {
             trace!("tool-sandbox: severed daemon {daemon_pid} -> command {name} (cache hit)");
             return Some(name.clone());
         }
+        if let Ok(negative_cache) = self.negative_cache.lock()
+            && let Some((cached_id, at)) = negative_cache.get(&daemon_pid)
+            && *cached_id == identity
+            && at.elapsed() < negative_ttl
+        {
+            trace!(
+                "tool-sandbox: severed daemon {daemon_pid} denied (negative cache hit, no helper re-run)"
+            );
+            return None;
+        }
         // `D`'s kernel-read context is the same for every helper, so read it once.
         let daemon_cwd = daemon_cwd(daemon_pid);
         let daemon_argv_env = daemon_argv_env(daemon_pid);
         let daemon_argv = daemon_argv_env.as_ref().map(|(argv, _)| argv.clone());
         for (name, command) in &config.commands {
             let Some(source) = &command.daemon_pid_source else {
+                continue;
+            };
+            // Resolved at plan-build time; absent means the helper failed to
+            // resolve there and plan build would have already errored, so this
+            // is defensive (e.g. a config mutated after build in a test).
+            let Some(resolved) = self.helpers.get(name) else {
                 continue;
             };
             let daemon_env = daemon_argv_env
@@ -1917,9 +1979,13 @@ impl DaemonPidLineage {
                 daemon_argv: daemon_argv.clone(),
                 daemon_env,
             };
-            let Some(server_pid) =
-                run_daemon_pid_source(name, &source.argv, &context, DAEMON_PID_SOURCE_TIMEOUT)
-            else {
+            let Some(server_pid) = run_daemon_pid_source(
+                name,
+                &source.argv,
+                resolved,
+                &context,
+                DAEMON_PID_SOURCE_TIMEOUT,
+            ) else {
                 continue;
             };
             // A match counts only if `D`'s kernel identity is unchanged across the
@@ -1933,6 +1999,13 @@ impl DaemonPidLineage {
                 debug!("tool-sandbox: severed daemon {daemon_pid} attributed to command {name}");
                 return Some(name.clone());
             }
+        }
+        if let Ok(mut negative_cache) = self.negative_cache.lock() {
+            negative_cache.insert(daemon_pid, (identity, Instant::now()));
+            // Bound the cache: drop entries whose pid died, was reused, or expired.
+            negative_cache.retain(|pid, (id, at)| {
+                at.elapsed() < negative_ttl && daemon_identity(*pid) == Some(*id)
+            });
         }
         debug!("tool-sandbox: severed daemon {daemon_pid} matched no daemon_pid_source; denying");
         None
@@ -2177,28 +2250,28 @@ const DAEMON_PID_SOURCE_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// SECURITY: the helper runs UNSANDBOXED in the supervisor, so it MUST only read and
 /// emit a pid, never execute workspace-controlled code. nono hardens the launch
-/// (absolute-path program, cleared env, neutral cwd, hard timeout) but cannot vet
-/// the helper itself.
+/// (pinned, TOCTOU-verified identity resolved at plan-build time; cleared env,
+/// neutral cwd, hard timeout) but cannot vet the helper's own behavior.
 fn run_daemon_pid_source(
     command_name: &str,
     argv: &[String],
+    resolved: &ResolvedCommandBinary,
     context: &DaemonHelperContext,
     timeout: Duration,
 ) -> Option<u32> {
-    let (prog, args) = argv.split_first()?;
-    // Resolve `~`/`$VAR` (e.g. an install-prefix env var) from the supervisor env,
-    // then require the result absolute — the helper is exec'd directly, not via PATH.
-    let prog = crate::policy::expand_path(prog)
-        .map_err(|err| warn!("tool-sandbox: {command_name}.daemon_pid_source path expand: {err}"))
-        .ok()?;
-    if !prog.is_absolute() {
-        warn!("tool-sandbox: {command_name}.daemon_pid_source program must be absolute; ignoring");
+    let (_, args) = argv.split_first()?;
+    // `resolved` was resolved and immutability-checked at plan-build time; re-verify
+    // its identity now, right before spawn, to close the TOCTOU window between then
+    // and dispatch (mirrors verify_binary_identity's use for command binaries).
+    if let Err(err) = verify_binary_identity(resolved) {
+        warn!("tool-sandbox: {command_name}.daemon_pid_source helper identity check failed: {err}");
         return None;
     }
+    let prog = &resolved.canonical_path;
     let payload = serde_json::to_vec(context)
         .map_err(|err| debug!("tool-sandbox: {command_name}.daemon_pid_source serialize: {err}"))
         .ok()?;
-    let mut command = std::process::Command::new(&prog);
+    let mut command = std::process::Command::new(prog);
     command
         .args(args)
         .current_dir("/")
@@ -2216,12 +2289,18 @@ fn run_daemon_pid_source(
         .map_err(|err| debug!("tool-sandbox: {command_name}.daemon_pid_source spawn failed: {err}"))
         .ok()?;
 
-    // The JSON is far under the pipe buffer, so this one blocking write can't
-    // deadlock against a helper that reads stdin to EOF. Drop closes it (signals EOF).
-    if let Some(mut stdin) = child.stdin.take()
-        && let Err(err) = stdin.write_all(&payload)
-    {
-        debug!("tool-sandbox: {command_name}.daemon_pid_source stdin write failed: {err}");
+    // `D`'s argv/env is untrusted and unbounded (read straight from the kernel), so
+    // the JSON payload can exceed the pipe buffer. Write it on its own thread so a
+    // helper that doesn't drain stdin before doing other work can't wedge this
+    // thread's write and skip the deadline loop below; killing the child on timeout
+    // closes its stdin fd, unblocking the writer.
+    if let Some(mut stdin) = child.stdin.take() {
+        let command_name = command_name.to_string();
+        std::thread::spawn(move || {
+            if let Err(err) = stdin.write_all(&payload) {
+                debug!("tool-sandbox: {command_name}.daemon_pid_source stdin write failed: {err}");
+            }
+        });
     }
 
     // Poll to a deadline; kill a wedged helper so it can't hang the shim thread.
@@ -4316,6 +4395,36 @@ fn validate_controlled_exec_helper_immutability(
     Ok(())
 }
 
+/// Apply the same non-writable-executable trust gate to resolved
+/// `daemon_pid_source` helpers as to `exec` intercept helpers: the helper
+/// binary must not be writable (nor replaceable via a writable parent)
+/// through the outer session capability set unless the declaring command
+/// opted into `allow_writable_executable` (or the global
+/// `allow_writable_executables`). Without this, a command whose own
+/// capability grant covers the helper's path could let the sandboxed
+/// workspace process substitute a malicious binary that then runs
+/// unsandboxed in the supervisor.
+fn validate_controlled_daemon_pid_source_helper_immutability(
+    config: &CommandPoliciesConfig,
+    daemon_pid_source_helpers: &BTreeMap<String, ResolvedCommandBinary>,
+    outer_caps: &CapabilitySet,
+) -> Result<()> {
+    for (command_name, binary) in daemon_pid_source_helpers {
+        let allow_writable_path = config.allow_writable_executables
+            || crate::command_policy::command_daemon_pid_source_helper_allows_writable(
+                config,
+                command_name,
+            );
+        validate_controlled_file(
+            &binary.canonical_path,
+            outer_caps,
+            "daemon_pid_source helper",
+            allow_writable_path,
+        )?;
+    }
+    Ok(())
+}
+
 fn command_allows_writable_executable(
     command: &crate::command_policy::CommandPolicyConfig,
 ) -> bool {
@@ -4803,6 +4912,7 @@ mod tests {
                     warnings: Vec::new(),
                 },
                 exec_helpers: BTreeMap::new(),
+                daemon_pid_source_helpers: BTreeMap::new(),
                 deny_only: BTreeMap::new(),
                 allowed_direct_bypass_ids: HashSet::new(),
             },
@@ -5515,6 +5625,66 @@ mod tests {
     }
 
     #[test]
+    fn writable_daemon_pid_source_helper_override_is_explicit_for_sandbox_writable_paths()
+    -> Result<()> {
+        let temp = test_tempdir()?;
+        let bin_dir = temp.path().join("bin");
+        create_dir(&bin_dir)?;
+        let helper = bin_dir.join("helper");
+        create_executable(&helper)?;
+
+        let mut config = CommandPoliciesConfig::default();
+        config.commands.insert(
+            "tmux".to_string(),
+            CommandPolicyConfig {
+                daemon_pid_source: Some(DaemonPidSource {
+                    argv: vec![helper.to_string_lossy().into_owned()],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+
+        let mut helpers = BTreeMap::new();
+        helpers.insert(
+            "tmux".to_string(),
+            test_binary("tmux.daemon_pid_source", &helper)?,
+        );
+
+        let caps = CapabilitySet::new();
+        validate_controlled_daemon_pid_source_helper_immutability(&config, &helpers, &caps)?;
+
+        let mut file_write_caps = CapabilitySet::new();
+        file_write_caps.add_fs(FsCapability::new_file(&helper, AccessMode::ReadWrite)?);
+        let err = validate_controlled_daemon_pid_source_helper_immutability(
+            &config,
+            &helpers,
+            &file_write_caps,
+        )
+        .err()
+        .ok_or_else(|| {
+            NonoError::SandboxInit("expected sandbox-writable helper rejection".to_string())
+        })?;
+        assert!(
+            err.to_string()
+                .contains("writable by the outer session capability set")
+        );
+
+        config
+            .commands
+            .get_mut("tmux")
+            .ok_or_else(|| NonoError::SandboxInit("missing test command policy".to_string()))?
+            .allow_writable_executable = true;
+        validate_controlled_daemon_pid_source_helper_immutability(
+            &config,
+            &helpers,
+            &file_write_caps,
+        )?;
+
+        Ok(())
+    }
+
+    #[test]
     fn exec_gate_allows_non_controlled_initial_exec() {
         let id = FileId { dev: 42, ino: 7 };
         let result = check_exec_gate(
@@ -5908,12 +6078,12 @@ mod tests {
     #[test]
     fn lineage_build_enabled_only_when_a_command_declares_a_helper() {
         assert!(matches!(
-            LineageMarker::build(&CommandPoliciesConfig::default()),
+            LineageMarker::build(&CommandPoliciesConfig::default(), BTreeMap::new()),
             LineageMarker::Disabled
         ));
         let config = config_with_helper("tmux", vec!["/bin/echo".to_string()]);
         assert!(matches!(
-            LineageMarker::build(&config),
+            LineageMarker::build(&config, BTreeMap::new()),
             LineageMarker::DaemonPid(_)
         ));
     }
@@ -5950,7 +6120,12 @@ mod tests {
         // Helper echoes our own pid, so attribution matches and pins by kernel identity.
         let pid = std::process::id();
         let config = config_with_helper("tmux", vec!["/bin/echo".to_string(), pid.to_string()]);
-        let lineage = DaemonPidLineage::default();
+        let helper = test_binary("tmux.daemon_pid_source", Path::new("/bin/echo"))
+            .expect("resolve /bin/echo");
+        let lineage = DaemonPidLineage {
+            helpers: BTreeMap::from([("tmux".to_string(), helper)]),
+            ..Default::default()
+        };
         assert_eq!(
             lineage.attribute(pid, &config, Path::new("/tmp")),
             Some("tmux".to_string())
@@ -5962,22 +6137,119 @@ mod tests {
         // Helper reports a pid that is not the one being resolved -> no match -> deny.
         let other = std::process::id().wrapping_add(1).max(2);
         let config = config_with_helper("tmux", vec!["/bin/echo".to_string(), other.to_string()]);
-        let lineage = DaemonPidLineage::default();
+        let helper = test_binary("tmux.daemon_pid_source", Path::new("/bin/echo"))
+            .expect("resolve /bin/echo");
+        let lineage = DaemonPidLineage {
+            helpers: BTreeMap::from([("tmux".to_string(), helper)]),
+            ..Default::default()
+        };
         assert_eq!(
             lineage.attribute(std::process::id(), &config, Path::new("/tmp")),
             None
         );
     }
 
+    /// A helper script that appends one byte to `counter_path` per invocation, so
+    /// tests can assert how many times it actually ran, then echoes `reported_pid`.
+    fn counting_helper_argv(counter_path: &Path, reported_pid: u32) -> Vec<String> {
+        vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            format!(
+                "printf x >> {} && echo {reported_pid}",
+                counter_path.display()
+            ),
+        ]
+    }
+
     #[test]
-    fn run_daemon_pid_source_rejects_relative_program() {
-        // A non-absolute helper program is misconfiguration: never PATH-resolve it.
+    fn daemon_pid_lineage_negative_cache_suppresses_helper_rerun_within_ttl() {
         let pid = std::process::id();
-        let argv = vec!["echo".to_string(), pid.to_string()];
+        let other = pid.wrapping_add(1).max(2);
+        let dir = std::env::temp_dir().join(format!("nono-neg-cache-{pid}"));
+        fs::create_dir_all(&dir).expect("mkdir");
+        let counter = dir.join("count");
+
+        let config = config_with_helper("tmux", counting_helper_argv(&counter, other));
+        let helper =
+            test_binary("tmux.daemon_pid_source", Path::new("/bin/sh")).expect("resolve /bin/sh");
+        let lineage = DaemonPidLineage {
+            helpers: BTreeMap::from([("tmux".to_string(), helper)]),
+            ..Default::default()
+        };
+
+        // First call: no match, helper runs once, negative-cached.
         assert_eq!(
-            run_daemon_pid_source("tmux", &argv, &test_context(pid), Duration::from_secs(5)),
+            lineage.attribute_with_negative_ttl(
+                pid,
+                &config,
+                Path::new("/tmp"),
+                Duration::from_secs(30)
+            ),
             None
         );
+        // Second call within the TTL: must hit the negative cache, not re-run the helper.
+        assert_eq!(
+            lineage.attribute_with_negative_ttl(
+                pid,
+                &config,
+                Path::new("/tmp"),
+                Duration::from_secs(30)
+            ),
+            None
+        );
+        let invocations = fs::read(&counter).expect("read counter").len();
+        assert_eq!(
+            invocations, 1,
+            "helper must run once, not once per attribute() call, within the negative-cache TTL"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn daemon_pid_lineage_negative_cache_expires_and_rechecks_helper() {
+        let pid = std::process::id();
+        let other = pid.wrapping_add(1).max(2);
+        let dir = std::env::temp_dir().join(format!("nono-neg-cache-expire-{pid}"));
+        fs::create_dir_all(&dir).expect("mkdir");
+        let counter = dir.join("count");
+
+        let config = config_with_helper("tmux", counting_helper_argv(&counter, other));
+        let helper =
+            test_binary("tmux.daemon_pid_source", Path::new("/bin/sh")).expect("resolve /bin/sh");
+        let lineage = DaemonPidLineage {
+            helpers: BTreeMap::from([("tmux".to_string(), helper)]),
+            ..Default::default()
+        };
+
+        let tiny_ttl = Duration::from_millis(1);
+        assert_eq!(
+            lineage.attribute_with_negative_ttl(pid, &config, Path::new("/tmp"), tiny_ttl),
+            None
+        );
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            lineage.attribute_with_negative_ttl(pid, &config, Path::new("/tmp"), tiny_ttl),
+            None
+        );
+        let invocations = fs::read(&counter).expect("read counter").len();
+        assert_eq!(
+            invocations, 2,
+            "an expired negative-cache entry must let the helper re-run, so a since-started \
+             server can still be attributed"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn daemon_pid_lineage_denies_when_helper_not_pre_resolved() {
+        // Defensive: a command declares daemon_pid_source but no matching entry made
+        // it into the pre-resolved helpers map (shouldn't happen outside tests, since
+        // plan build would have errored) -> skip that command, fail closed overall.
+        let pid = std::process::id();
+        let config = config_with_helper("tmux", vec!["/bin/echo".to_string(), pid.to_string()]);
+        let lineage = DaemonPidLineage::default(); // helpers empty
+        assert_eq!(lineage.attribute(pid, &config, Path::new("/tmp")), None);
     }
 
     #[test]
@@ -5988,11 +6260,14 @@ mod tests {
             "-c".to_string(),
             "sleep 30".to_string(),
         ];
+        let resolved =
+            test_binary("tmux.daemon_pid_source", Path::new("/bin/sh")).expect("resolve /bin/sh");
         let start = Instant::now();
         assert_eq!(
             run_daemon_pid_source(
                 "tmux",
                 &argv,
+                &resolved,
                 &test_context(std::process::id()),
                 Duration::from_millis(200)
             ),
@@ -6001,6 +6276,40 @@ mod tests {
         assert!(
             start.elapsed() < Duration::from_secs(5),
             "must not block on the helper"
+        );
+    }
+
+    #[test]
+    fn run_daemon_pid_source_does_not_deadlock_on_large_daemon_argv() {
+        // A severed daemon's argv is untrusted and unbounded (read straight from the
+        // kernel, see daemon_argv_env), so it can exceed the OS pipe buffer (~16KB on
+        // macOS). A helper that doesn't drain stdin before blocking (e.g. it only reads
+        // once it's done its own work) must not be able to wedge the write and skip the
+        // timeout loop entirely.
+        let mut context = test_context(std::process::id());
+        context.daemon_argv = Some(vec!["x".repeat(4096); 64]); // ~256KB, well over 16KB
+        let argv = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "sleep 3".to_string(),
+        ];
+        let resolved =
+            test_binary("tmux.daemon_pid_source", Path::new("/bin/sh")).expect("resolve /bin/sh");
+        let start = Instant::now();
+        assert_eq!(
+            run_daemon_pid_source(
+                "tmux",
+                &argv,
+                &resolved,
+                &context,
+                Duration::from_millis(200)
+            ),
+            None
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "blocking stdin write let a non-draining helper skip the timeout deadline: took {:?}",
+            start.elapsed()
         );
     }
 
@@ -6014,36 +6323,43 @@ mod tests {
             "-c".to_string(),
             "plutil -extract candidate_pid raw -o - -".to_string(),
         ];
+        let resolved =
+            test_binary("tmux.daemon_pid_source", Path::new("/bin/sh")).expect("resolve /bin/sh");
         assert_eq!(
-            run_daemon_pid_source("tmux", &argv, &test_context(pid), Duration::from_secs(5)),
+            run_daemon_pid_source(
+                "tmux",
+                &argv,
+                &resolved,
+                &test_context(pid),
+                Duration::from_secs(5)
+            ),
             Some(pid)
         );
     }
 
     #[test]
-    fn run_daemon_pid_source_expands_vars_in_program_path() {
-        // A `$VAR/helper` path must expand from the env and run, so profiles need
-        // not hard-code an install prefix.
-        let _guard = match crate::test_env::ENV_LOCK.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
+    fn run_daemon_pid_source_rejects_helper_whose_identity_changed_since_resolution() {
+        // TOCTOU: the resolved identity (dev/ino/size/mtime) no longer matches the live
+        // file -> deny rather than exec a possibly-substituted binary.
         let pid = std::process::id();
-        let dir = std::env::temp_dir().join(format!("nono-pid-expand-{pid}"));
-        fs::create_dir_all(&dir).expect("mkdir");
-        let helper = dir.join("helper.sh");
-        fs::write(&helper, format!("#!/bin/sh\necho {pid}\n")).expect("write");
-        fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-        let dir_str = dir.to_string_lossy().into_owned();
-        let _env = crate::test_env::EnvVarGuard::set_all(&[("NONO_TEST_HELPER_DIR", &dir_str)]);
-
-        let context = test_context(pid);
-        let argv = vec!["$NONO_TEST_HELPER_DIR/helper.sh".to_string()];
+        let mut resolved =
+            test_binary("tmux.daemon_pid_source", Path::new("/bin/sh")).expect("resolve /bin/sh");
+        resolved.ino = resolved.ino.wrapping_add(1);
+        let argv = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            format!("echo {pid}"),
+        ];
         assert_eq!(
-            run_daemon_pid_source("tmux", &argv, &context, Duration::from_secs(5)),
-            Some(pid)
+            run_daemon_pid_source(
+                "tmux",
+                &argv,
+                &resolved,
+                &test_context(pid),
+                Duration::from_secs(5)
+            ),
+            None
         );
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -6094,7 +6410,12 @@ mod tests {
         // its recorded identity, so the cache can't grow unbounded.
         let pid = std::process::id();
         let config = config_with_helper("tmux", vec!["/bin/echo".to_string(), pid.to_string()]);
-        let lineage = DaemonPidLineage::default();
+        let helper = test_binary("tmux.daemon_pid_source", Path::new("/bin/echo"))
+            .expect("resolve /bin/echo");
+        let lineage = DaemonPidLineage {
+            helpers: BTreeMap::from([("tmux".to_string(), helper)]),
+            ..Default::default()
+        };
         {
             let mut cache = lineage.cache.lock().expect("lock");
             cache.insert(
@@ -6183,7 +6504,9 @@ mod tests {
         fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).expect("chmod");
 
         let config = config_with_helper("tmux", vec![helper.to_string_lossy().into_owned()]);
-        let marker = LineageMarker::build(&config);
+        let helpers = crate::command_policy::resolve_policy_daemon_pid_source_helpers(&config)
+            .expect("resolve daemon_pid_source helpers");
+        let marker = LineageMarker::build(&config, helpers);
 
         assert_eq!(
             marker.resolve_severed_command(daemon, &config, &dir),

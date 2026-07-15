@@ -3538,6 +3538,87 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_no_proxy_reaches_proxy_env_vars() -> Result<()> {
+        use crate::sandbox_prepare::PreparedSandbox;
+        use nono::CapabilitySet;
+        use std::collections::HashMap;
+
+        let prepared = PreparedSandbox {
+            caps: CapabilitySet::new(),
+            deny_paths: Vec::new(),
+            secrets: Vec::new(),
+            profile_display_name: None,
+            command_policies: None,
+            resolved_command_binaries: None,
+            credential_capture: HashMap::new(),
+            credential_providers: HashMap::new(),
+            credential_routes: Vec::new(),
+            tls_intercept: None,
+            session_hooks: crate::profile::SessionHooks::default(),
+            rollback_exclude_patterns: Vec::new(),
+            rollback_exclude_globs: Vec::new(),
+            network_profile: None,
+            allow_domain: Vec::new(),
+            deny_domain: Vec::new(),
+            credentials: Vec::new(),
+            custom_credentials: HashMap::new(),
+            upstream_proxy: Some("127.0.0.1:9".to_string()),
+            no_proxy: vec!["redis".to_string(), "*.internal.example".to_string()],
+            upstream_bypass: Vec::new(),
+            listen_ports: Vec::new(),
+            capability_elevation: false,
+            #[cfg(target_os = "linux")]
+            wsl2_proxy_policy: crate::profile::Wsl2ProxyPolicy::Error,
+            #[cfg(target_os = "linux")]
+            af_unix_mediation: crate::profile::LinuxAfUnixMediation::Off,
+            #[cfg(target_os = "linux")]
+            sandbox_policy: crate::profile::LinuxSandboxPolicy::Auto,
+            #[cfg(target_os = "linux")]
+            explicit_sandbox_policy: None,
+            allow_launch_services_active: false,
+            allow_gpu_active: false,
+            #[cfg(target_os = "linux")]
+            proc_comm_notify: false,
+            open_url_origins: Vec::new(),
+            open_url_allow_localhost: false,
+            bypass_protection_paths: Vec::new(),
+            ignored_denial_paths: Vec::new(),
+            suppressed_system_service_operations: Vec::new(),
+            allowed_env_vars: None,
+            denied_env_vars: None,
+            set_vars: None,
+            profile_network_block: false,
+            allow_http2_requested: false,
+        };
+        let args = crate::cli::SandboxArgs::default();
+        let intent = prepare_proxy_launch_options(&args, &prepared, true, String::new())?;
+        let proxy = intent
+            .proxy_options()
+            .ok_or_else(|| NonoError::ConfigParse("proxy options missing".to_string()))?;
+        let config = build_proxy_config_from_flags(proxy)?;
+        let handle = nono_proxy::server::start(config)
+            .await
+            .map_err(|err| NonoError::ConfigParse(err.to_string()))?;
+        let env = handle.env_vars();
+        let value = |name: &str| {
+            env.iter()
+                .find_map(|(key, value)| (key == name).then_some(value.as_str()))
+                .ok_or_else(|| NonoError::ConfigParse(format!("{name} missing")))
+        };
+
+        assert_eq!(
+            value("NO_PROXY")?,
+            "localhost,127.0.0.1,redis,.internal.example"
+        );
+        assert_eq!(
+            value("NONO_NO_PROXY")?,
+            "localhost,127.0.0.1,redis,*.internal.example"
+        );
+        handle.shutdown();
+        Ok(())
+    }
+
     #[test]
     fn tool_sandbox_proxy_credentials_create_endpoint_filtered_route() -> Result<()> {
         let mut policies = CommandPoliciesConfig::default();

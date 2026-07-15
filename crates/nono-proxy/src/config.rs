@@ -633,11 +633,6 @@ fn validate_no_proxy_host_pattern(pattern: &str) -> crate::error::Result<()> {
         }
         return Ok(());
     }
-    if is_broad_single_label_suffix(&host) {
-        return Err(no_proxy_config_error(
-            "broad DNS suffix labels are not allowed as no_proxy entries",
-        ));
-    }
     if normalise_no_proxy_host(pattern) == host && host.contains('.') {
         return Err(no_proxy_config_error(
             "bare multi-label domains are not allowed; use an explicit leading-dot or '*.' suffix pattern",
@@ -653,26 +648,6 @@ fn validate_no_proxy_host_pattern(pattern: &str) -> crate::error::Result<()> {
     Err(no_proxy_config_error(
         "entry host contains invalid characters",
     ))
-}
-
-fn is_broad_single_label_suffix(host: &str) -> bool {
-    matches!(
-        host,
-        "com"
-            | "org"
-            | "net"
-            | "edu"
-            | "gov"
-            | "mil"
-            | "int"
-            | "arpa"
-            | "io"
-            | "co"
-            | "dev"
-            | "app"
-            | "ai"
-            | "local"
-    )
 }
 
 const ALWAYS_DENIED_HOSTS: &[&str] = &[
@@ -1451,9 +1426,6 @@ mod tests {
             "dev.local",
             "api.openai.com",
             "API.OPENAI.COM",
-            "com",
-            ".com",
-            "*.com",
             "*",
             "*corp",
             "api.example.com:443",

@@ -1648,8 +1648,8 @@ pub struct NetworkConfig {
     ///
     /// Entries are host patterns only: single-label local aliases, IP
     /// literals, `*.example.com` wildcard suffixes, or `.example.com` suffix
-    /// patterns. Bare multi-label domains, broad DNS suffix labels, full URLs,
-    /// credentials, schemes, ports, paths, and catch-all `*` are rejected at load time.
+    /// patterns. Bare multi-label domains, full URLs, credentials, schemes,
+    /// ports, paths, and catch-all `*` are rejected at load time.
     #[serde(default)]
     pub no_proxy: Vec<String>,
     /// Custom credential definitions for services not in network-policy.json.
@@ -3061,6 +3061,9 @@ pub(crate) fn finalize_profile(mut profile: Profile) -> Result<Profile> {
         return Err(NonoError::ProfileParse(err));
     }
     merge_implicit_default_groups(&mut profile)?;
+    // Re-run after extends/platform overrides: base and child profiles can
+    // independently add no_proxy and allow_domain entries that only conflict
+    // once the final effective profile has been assembled.
     validate_profile_no_proxy(&profile)?;
     validate_credential_capture_resolved(&profile)?;
     validate_credential_provider_resolved(&profile)?;
@@ -3149,9 +3152,12 @@ pub(crate) fn parse_profile_bytes(content: &[u8]) -> Result<Profile> {
 
     let profile: Profile = crate::jsonc::parse(text).map_err(NonoError::ProfileParse)?;
 
+    // Validate raw no_proxy entries for direct parse/profile-edit UX. Finalize
+    // re-validates after inheritance and platform overrides have been applied.
+    validate_profile_no_proxy(&profile)?;
+
     // Validate custom credentials for security issues
     validate_profile_custom_credentials(&profile)?;
-    validate_profile_no_proxy(&profile)?;
     validate_credential_capture_entries(&profile)?;
     validate_credential_provider_entries(&profile)?;
     validate_profile_tls_intercept(&profile)?;
@@ -7727,7 +7733,6 @@ mod tests {
             "dev.local",
             "api.openai.com",
             "API.OPENAI.COM",
-            "com",
             "169.254.169.254",
             "169.254.1.2",
             "internal",

@@ -85,7 +85,7 @@ pub(crate) fn select_h2_tls_connector_for_target(
     port: u16,
     default_connector: &tokio_rustls::TlsConnector,
 ) -> Result<(tokio_rustls::TlsConnector, String)> {
-    let host_port = format!("{}:{}", host.to_lowercase(), port);
+    let host_port = crate::route::format_host_port(host, port);
     let candidates = route_store.lookup_all_by_upstream(&host_port);
     let mut selected: Option<(Option<String>, Option<std::sync::Arc<rustls::ClientConfig>>)> = None;
 

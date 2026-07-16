@@ -4,6 +4,7 @@
 //! IPs against the link-local range (cloud metadata SSRF protection), and
 //! validates the hostname against the cloud metadata deny list and allowlist.
 
+use crate::config::{is_proxy_denied_metadata_ip, parse_host_ip_literal};
 use crate::error::Result;
 use nono::net_filter::{FilterResult, HostFilter};
 use std::net::{IpAddr, SocketAddr};
@@ -76,6 +77,13 @@ impl ProxyFilter {
     /// instead of re-resolving the hostname, eliminating the DNS rebinding
     /// TOCTOU window.
     pub async fn check_host(&self, host: &str, port: u16) -> Result<CheckResult> {
+        if let Some(result) = proxy_metadata_filter_result(host, &[]) {
+            return Ok(CheckResult {
+                result,
+                resolved_addrs: Vec::new(),
+            });
+        }
+
         // Resolve DNS
         let addr_str = format!("{}:{}", host, port);
         let resolved: Vec<SocketAddr> = match tokio::net::lookup_host(&addr_str).await {
@@ -89,7 +97,8 @@ impl ProxyFilter {
         };
 
         let resolved_ips: Vec<IpAddr> = resolved.iter().map(|a| a.ip()).collect();
-        let result = self.check_host_result(host, port, &resolved_ips);
+        let result = proxy_metadata_filter_result(host, &resolved_ips)
+            .unwrap_or_else(|| self.check_host_result(host, port, &resolved_ips));
 
         // Only return resolved addrs on allow to prevent misuse
         let addrs = if result.is_allowed() {
@@ -107,7 +116,8 @@ impl ProxyFilter {
     /// Check a host with pre-resolved IPs (no DNS lookup).
     #[must_use]
     pub fn check_host_with_ips(&self, host: &str, resolved_ips: &[IpAddr]) -> FilterResult {
-        self.inner.check_host(host, resolved_ips)
+        proxy_metadata_filter_result(host, resolved_ips)
+            .unwrap_or_else(|| self.inner.check_host(host, resolved_ips))
     }
 
     fn check_host_result(&self, host: &str, port: u16, resolved_ips: &[IpAddr]) -> FilterResult {
@@ -127,11 +137,22 @@ impl ProxyFilter {
     }
 }
 
+fn proxy_metadata_filter_result(host: &str, resolved_ips: &[IpAddr]) -> Option<FilterResult> {
+    if parse_host_ip_literal(host).is_some_and(|ip| is_proxy_denied_metadata_ip(&ip))
+        || resolved_ips.iter().any(is_proxy_denied_metadata_ip)
+    {
+        return Some(FilterResult::DenyHost {
+            host: host.to_string(),
+        });
+    }
+    None
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use std::net::Ipv4Addr;
+    use std::net::{Ipv4Addr, Ipv6Addr};
 
     #[test]
     fn test_proxy_filter_delegates_to_host_filter() {
@@ -213,6 +234,33 @@ mod tests {
         let filter = ProxyFilter::allow_all();
         let link_local = vec![IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254))];
         let result = filter.check_host_with_ips("evil.com", &link_local);
+        assert!(!result.is_allowed());
+    }
+
+    #[test]
+    fn test_proxy_filter_denies_aws_ipv6_metadata_literals() {
+        let filter = ProxyFilter::allow_all();
+        for host in [
+            "fd00:ec2::254",
+            "fd00:0ec2::254",
+            "fd00:ec2:0:0:0:0:0:254",
+            "[fd00:ec2::254]",
+        ] {
+            let result = filter.check_host_with_ips(host, &[]);
+            assert!(
+                !result.is_allowed(),
+                "AWS IPv6 metadata literal {host:?} must be denied"
+            );
+        }
+    }
+
+    #[test]
+    fn test_proxy_filter_denies_resolved_aws_ipv6_metadata_ip() {
+        let filter = ProxyFilter::allow_all();
+        let resolved = vec![IpAddr::V6(Ipv6Addr::new(
+            0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254,
+        ))];
+        let result = filter.check_host_with_ips("allowed.example", &resolved);
         assert!(!result.is_allowed());
     }
 }

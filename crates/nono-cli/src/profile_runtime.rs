@@ -28,6 +28,7 @@ pub(crate) struct PreparedProfile {
     pub(crate) credential_providers: HashMap<String, profile::CredentialProviderDef>,
     pub(crate) credential_routes: Vec<profile::CredentialRouteDef>,
     pub(crate) tls_intercept: Option<profile::TlsInterceptConfig>,
+    pub(crate) no_proxy: Vec<String>,
     pub(crate) upstream_proxy: Option<String>,
     pub(crate) upstream_bypass: Vec<String>,
     pub(crate) listen_ports: Vec<u16>,
@@ -884,6 +885,10 @@ fn prepare_profile_with_options(
         tls_intercept: loaded_profile
             .as_ref()
             .and_then(|profile| profile.network.tls_intercept.clone()),
+        no_proxy: loaded_profile
+            .as_ref()
+            .map(|profile| profile.network.no_proxy.clone())
+            .unwrap_or_default(),
         upstream_proxy: loaded_profile
             .as_ref()
             .and_then(|profile| profile.network.upstream_proxy.clone()),
@@ -1767,6 +1772,7 @@ mod tests {
                 "rollback": { "exclude_patterns": ["target"] },
                 "network": {
                     "allow_domain": ["example.com"],
+                    "no_proxy": ["redis"],
                     "upstream_bypass": ["localhost"],
                     "listen_port": [8080]
                 },
@@ -1811,6 +1817,7 @@ mod tests {
         assert_eq!(runtime.allow_domain, preflight.allow_domain);
         assert_eq!(runtime.credentials, preflight.credentials);
         assert_eq!(runtime.custom_credentials, preflight.custom_credentials);
+        assert_eq!(runtime.no_proxy, preflight.no_proxy);
         assert_eq!(runtime.upstream_proxy, preflight.upstream_proxy);
         assert_eq!(runtime.upstream_bypass, preflight.upstream_bypass);
         assert_eq!(runtime.listen_ports, preflight.listen_ports);

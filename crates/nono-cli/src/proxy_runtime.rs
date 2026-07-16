@@ -45,6 +45,7 @@ pub(crate) struct EffectiveProxySettings {
     pub(crate) allow_domain: Vec<crate::profile::AllowDomainEntry>,
     pub(crate) deny_domain: Vec<String>,
     pub(crate) credentials: Vec<String>,
+    pub(crate) no_proxy: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1417,11 +1418,12 @@ pub(crate) fn prepare_proxy_launch_options(
 ) -> Result<NetworkIntent> {
     validate_external_proxy_bypass(args, prepared)?;
 
-    let effective_proxy = resolve_effective_proxy_settings(args, prepared);
+    let effective_proxy = resolve_effective_proxy_settings(args, prepared)?;
     let network_profile = effective_proxy.network_profile;
     let allow_domain = effective_proxy.allow_domain;
     let deny_domain = effective_proxy.deny_domain;
     let mut credentials = effective_proxy.credentials;
+    let no_proxy = effective_proxy.no_proxy;
     let mut custom_credentials = prepared.custom_credentials.clone();
     let mut proxy_source_env_vars = HashMap::new();
     let mut tool_sandbox_base_url_env_vars = HashMap::new();
@@ -1589,6 +1591,7 @@ pub(crate) fn prepare_proxy_launch_options(
         credential_providers: prepared.credential_providers.clone(),
         credential_routes: prepared.credential_routes.clone(),
         enable_h2: prepared.allow_http2_requested,
+        no_proxy,
     };
 
     // Infra-only flags make no sense without an activating proxy feature.
@@ -1676,17 +1679,19 @@ fn resolve_tls_intercept_options(
     })
 }
 
+#[must_use = "effective proxy settings resolution result must be handled"]
 pub(crate) fn resolve_effective_proxy_settings(
     args: &SandboxArgs,
     prepared: &PreparedSandbox,
-) -> EffectiveProxySettings {
+) -> Result<EffectiveProxySettings> {
     if args.allow_net {
-        return EffectiveProxySettings {
+        return Ok(EffectiveProxySettings {
             network_profile: None,
             allow_domain: Vec::new(),
             deny_domain: Vec::new(),
             credentials: Vec::new(),
-        };
+            no_proxy: Vec::new(),
+        });
     }
 
     let network_profile = args
@@ -1700,12 +1705,18 @@ pub(crate) fn resolve_effective_proxy_settings(
     let mut credentials = prepared.credentials.clone();
     credentials.extend(args.proxy_credential.clone());
 
-    EffectiveProxySettings {
+    let effective = EffectiveProxySettings {
         network_profile,
         allow_domain,
         deny_domain,
         credentials,
-    }
+        no_proxy: prepared.no_proxy.clone(),
+    };
+    crate::profile::validate_no_proxy_allow_domain_conflicts(
+        &effective.no_proxy,
+        &effective.allow_domain,
+    )?;
+    Ok(effective)
 }
 
 fn extend_proxy_settings_with_tool_sandbox_credentials(
@@ -2267,6 +2278,8 @@ pub(crate) fn parse_allow_endpoint_arg(
 pub(crate) fn build_proxy_config_from_flags(
     proxy: &ProxyLaunchOptions,
 ) -> Result<nono_proxy::config::ProxyConfig> {
+    validate_proxy_launch_no_proxy_conflicts(proxy)?;
+
     let net_policy_json = crate::config::embedded::embedded_network_policy_json();
     let net_policy = network_policy::load_network_policy(net_policy_json)?;
 
@@ -2378,6 +2391,12 @@ pub(crate) fn build_proxy_config_from_flags(
         }
     }
     resolved.routes = routes;
+    let expanded_proxy_hosts = expanded_proxy_host_patterns(&resolved, &plain_hosts);
+    validate_expanded_proxy_no_proxy_conflicts(
+        &proxy.no_proxy,
+        &expanded_proxy_hosts,
+        &resolved.routes,
+    )?;
 
     let deny_domain = proxy
         .domain_filter
@@ -2412,6 +2431,7 @@ pub(crate) fn build_proxy_config_from_flags(
     }
     proxy_config.leaf_validity = proxy.proxy_leaf_validity;
     proxy_config.enable_h2 = proxy.enable_h2;
+    proxy_config.no_proxy = proxy.no_proxy.clone();
     synthesize_credential_provider_proxy_config(proxy, &mut proxy_config)?;
     if !proxy_config.oauth_capture.is_empty() {
         proxy_config.oauth_capture_store_path = Some(
@@ -2578,6 +2598,80 @@ fn origin_host_port(origin: &str) -> Result<Option<String>> {
         return Ok(None);
     };
     Ok(Some(format!("{}:{}", host.to_lowercase(), port)))
+}
+
+#[must_use = "proxy launch no_proxy conflict validation result must be handled"]
+fn validate_proxy_launch_no_proxy_conflicts(proxy: &ProxyLaunchOptions) -> Result<()> {
+    let mut allow_domain = Vec::new();
+    if let Some(domain_filter) = proxy.domain_filter.as_ref() {
+        allow_domain.extend(domain_filter.allow_domain.iter().cloned());
+    }
+    if let Some(endpoint_filter) = proxy.endpoint_filter.as_ref() {
+        allow_domain.extend(endpoint_filter.routes.iter().cloned());
+    }
+    crate::profile::validate_no_proxy_allow_domain_conflicts(&proxy.no_proxy, &allow_domain)
+}
+
+fn expanded_proxy_host_patterns(
+    resolved: &network_policy::ResolvedNetworkPolicy,
+    extra_hosts: &[String],
+) -> Vec<String> {
+    let mut hosts = resolved.hosts.clone();
+    for suffix in &resolved.suffixes {
+        let wildcard = if suffix.starts_with('.') {
+            format!("*{suffix}")
+        } else {
+            format!("*.{suffix}")
+        };
+        hosts.push(wildcard);
+    }
+    hosts.extend(extra_hosts.iter().cloned());
+    hosts
+}
+
+#[must_use = "expanded proxy no_proxy conflict validation result must be handled"]
+fn validate_expanded_proxy_no_proxy_conflicts(
+    no_proxy: &[String],
+    proxy_hosts: &[String],
+    routes: &[nono_proxy::config::RouteConfig],
+) -> Result<()> {
+    for no_proxy_entry in no_proxy {
+        for host in proxy_hosts {
+            if nono_proxy::config::no_proxy_entry_overlaps_host_pattern(no_proxy_entry, host) {
+                return Err(NonoError::ConfigParse(format!(
+                    "network.no_proxy entry '{no_proxy_entry}' conflicts with expanded proxy allow host '{host}': proxy-allowed traffic must go through the proxy allowlist/L7 route, not bypass it"
+                )));
+            }
+        }
+        for route in routes {
+            let host = route_upstream_host_pattern(route)?;
+            if nono_proxy::config::no_proxy_entry_overlaps_host_pattern(no_proxy_entry, &host) {
+                return Err(NonoError::ConfigParse(format!(
+                    "network.no_proxy entry '{no_proxy_entry}' conflicts with proxy route upstream '{host}': route traffic must go through the proxy allowlist/L7 route, not bypass it"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[must_use = "route upstream host extraction result must be handled"]
+fn route_upstream_host_pattern(route: &nono_proxy::config::RouteConfig) -> Result<String> {
+    let parsed = url::Url::parse(&route.upstream).map_err(|err| {
+        NonoError::ConfigParse(format!(
+            "route '{}' has invalid upstream '{}': {err}",
+            route.prefix, route.upstream
+        ))
+    })?;
+    parsed
+        .host_str()
+        .map(|host| host.to_string())
+        .ok_or_else(|| {
+            NonoError::ConfigParse(format!(
+                "route '{}' has invalid upstream '{}': missing host",
+                route.prefix, route.upstream
+            ))
+        })
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -3200,6 +3294,42 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_build_proxy_config_propagates_no_proxy() -> Result<()> {
+        let proxy = ProxyLaunchOptions {
+            no_proxy: vec!["redis".to_string(), "*.internal.example".to_string()],
+            ..ProxyLaunchOptions::default()
+        };
+        let config = build_proxy_config_from_flags(&proxy)?;
+        assert_eq!(
+            config.no_proxy,
+            vec!["redis".to_string(), "*.internal.example".to_string()]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_build_proxy_config_rejects_group_expanded_no_proxy_overlap() {
+        let proxy = ProxyLaunchOptions {
+            domain_filter: Some(DomainFilterIntent {
+                network_profile: None,
+                allow_domain: vec![crate::profile::AllowDomainEntry::Plain(
+                    "github".to_string(),
+                )],
+                deny_domain: Vec::new(),
+            }),
+            no_proxy: vec![".github.com".to_string()],
+            ..ProxyLaunchOptions::default()
+        };
+
+        let result = build_proxy_config_from_flags(&proxy);
+
+        assert!(
+            result.is_err(),
+            "network policy group expansion must be checked against network.no_proxy"
+        );
+    }
+
     /// `{ "domain": "cdn.example.com" }` (no `endpoints` key) deserializes via serde default
     /// to `WithEndpoints { endpoints: [] }`, which is semantically identical to `Plain`.
     /// The partition must route it to `plain_entries` — not `endpoint_entries` — or the
@@ -3297,6 +3427,7 @@ mod tests {
             credentials: Vec::new(),
             custom_credentials,
             upstream_proxy: None,
+            no_proxy: Vec::new(),
             upstream_bypass: Vec::new(),
             listen_ports: Vec::new(),
             capability_elevation: false,
@@ -3339,6 +3470,153 @@ mod tests {
             proxy_opts.credentials.is_some(),
             "custom credential definitions should still be carried for network profile overrides"
         );
+    }
+
+    #[test]
+    fn test_prepare_proxy_launch_options_rejects_cli_allow_domain_no_proxy_overlap() {
+        use crate::sandbox_prepare::PreparedSandbox;
+        use nono::CapabilitySet;
+        use std::collections::HashMap;
+
+        let prepared = PreparedSandbox {
+            caps: CapabilitySet::new(),
+            deny_paths: Vec::new(),
+            secrets: Vec::new(),
+            profile_display_name: None,
+            command_policies: None,
+            resolved_command_binaries: None,
+            credential_capture: HashMap::new(),
+            credential_providers: HashMap::new(),
+            credential_routes: Vec::new(),
+            tls_intercept: None,
+            session_hooks: crate::profile::SessionHooks::default(),
+            rollback_exclude_patterns: Vec::new(),
+            rollback_exclude_globs: Vec::new(),
+            network_profile: None,
+            allow_domain: Vec::new(),
+            deny_domain: Vec::new(),
+            credentials: Vec::new(),
+            custom_credentials: HashMap::new(),
+            upstream_proxy: None,
+            no_proxy: vec![".internal.corp".to_string()],
+            upstream_bypass: Vec::new(),
+            listen_ports: Vec::new(),
+            capability_elevation: false,
+            #[cfg(target_os = "linux")]
+            wsl2_proxy_policy: crate::profile::Wsl2ProxyPolicy::Error,
+            #[cfg(target_os = "linux")]
+            af_unix_mediation: crate::profile::LinuxAfUnixMediation::Off,
+            #[cfg(target_os = "linux")]
+            sandbox_policy: crate::profile::LinuxSandboxPolicy::Auto,
+            #[cfg(target_os = "linux")]
+            explicit_sandbox_policy: None,
+            allow_launch_services_active: false,
+            allow_gpu_active: false,
+            #[cfg(target_os = "linux")]
+            proc_comm_notify: false,
+            open_url_origins: Vec::new(),
+            open_url_allow_localhost: false,
+            bypass_protection_paths: Vec::new(),
+            ignored_denial_paths: Vec::new(),
+            suppressed_system_service_operations: Vec::new(),
+            allowed_env_vars: None,
+            denied_env_vars: None,
+            set_vars: None,
+            profile_network_block: false,
+            allow_http2_requested: false,
+        };
+        let args = crate::cli::SandboxArgs {
+            allow_proxy: vec!["api.internal.corp".to_string()],
+            ..crate::cli::SandboxArgs::default()
+        };
+
+        let result = prepare_proxy_launch_options(&args, &prepared, true, String::new());
+
+        assert!(
+            result.is_err(),
+            "CLI --allow-domain must be checked against profile network.no_proxy"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_no_proxy_reaches_proxy_env_vars() -> Result<()> {
+        use crate::sandbox_prepare::PreparedSandbox;
+        use nono::CapabilitySet;
+        use std::collections::HashMap;
+
+        let prepared = PreparedSandbox {
+            caps: CapabilitySet::new(),
+            deny_paths: Vec::new(),
+            secrets: Vec::new(),
+            profile_display_name: None,
+            command_policies: None,
+            resolved_command_binaries: None,
+            credential_capture: HashMap::new(),
+            credential_providers: HashMap::new(),
+            credential_routes: Vec::new(),
+            tls_intercept: None,
+            session_hooks: crate::profile::SessionHooks::default(),
+            rollback_exclude_patterns: Vec::new(),
+            rollback_exclude_globs: Vec::new(),
+            network_profile: None,
+            allow_domain: Vec::new(),
+            deny_domain: Vec::new(),
+            credentials: Vec::new(),
+            custom_credentials: HashMap::new(),
+            upstream_proxy: Some("127.0.0.1:9".to_string()),
+            no_proxy: vec!["redis".to_string(), "*.internal.example".to_string()],
+            upstream_bypass: Vec::new(),
+            listen_ports: Vec::new(),
+            capability_elevation: false,
+            #[cfg(target_os = "linux")]
+            wsl2_proxy_policy: crate::profile::Wsl2ProxyPolicy::Error,
+            #[cfg(target_os = "linux")]
+            af_unix_mediation: crate::profile::LinuxAfUnixMediation::Off,
+            #[cfg(target_os = "linux")]
+            sandbox_policy: crate::profile::LinuxSandboxPolicy::Auto,
+            #[cfg(target_os = "linux")]
+            explicit_sandbox_policy: None,
+            allow_launch_services_active: false,
+            allow_gpu_active: false,
+            #[cfg(target_os = "linux")]
+            proc_comm_notify: false,
+            open_url_origins: Vec::new(),
+            open_url_allow_localhost: false,
+            bypass_protection_paths: Vec::new(),
+            ignored_denial_paths: Vec::new(),
+            suppressed_system_service_operations: Vec::new(),
+            allowed_env_vars: None,
+            denied_env_vars: None,
+            set_vars: None,
+            profile_network_block: false,
+            allow_http2_requested: false,
+        };
+        let args = crate::cli::SandboxArgs::default();
+        let intent = prepare_proxy_launch_options(&args, &prepared, true, String::new())?;
+        let proxy = intent
+            .proxy_options()
+            .ok_or_else(|| NonoError::ConfigParse("proxy options missing".to_string()))?;
+        let config = build_proxy_config_from_flags(proxy)?;
+        let handle = nono_proxy::server::start(config)
+            .await
+            .map_err(|err| NonoError::ConfigParse(err.to_string()))?;
+        let env = handle.env_vars();
+        let value = |name: &str| {
+            env.iter()
+                .find_map(|(key, value)| (key == name).then_some(value.as_str()))
+                .ok_or_else(|| NonoError::ConfigParse(format!("{name} missing")))
+        };
+
+        assert_eq!(
+            value("NO_PROXY")?,
+            "localhost,127.0.0.1,redis,.internal.example"
+        );
+        assert_eq!(
+            value("NONO_NO_PROXY")?,
+            "localhost,127.0.0.1,redis,*.internal.example"
+        );
+        handle.shutdown();
+        Ok(())
     }
 
     #[test]

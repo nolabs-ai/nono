@@ -831,6 +831,11 @@
           "items": { "type": "integer" },
           "description": "TCP ports the sandboxed child may listen on."
         },
+        "no_proxy": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Additional client-side proxy bypass entries appended to generated NO_PROXY/no_proxy in proxy mode. This does not grant network access; direct connections still require matching sandbox permissions. Entries must be host patterns only: safe single-label local aliases, canonical IP literals, *.<domain> wildcard suffixes, or .<domain> suffix patterns. Bare multi-label domains, protected metadata suffix tokens, full URLs, credentials, ports, paths, comma-separated lists, and catch-all * are rejected."
+        },
         "custom_credentials": {
           "type": "object",
           "additionalProperties": {

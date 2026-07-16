@@ -30,7 +30,8 @@ pub struct LoadedRoute {
 
     /// Pre-normalised `host:port` extracted from `upstream` at load time.
     /// Used for O(1) lookups in `is_route_upstream()` without per-request
-    /// URL parsing. `None` if the upstream URL cannot be parsed.
+    /// URL parsing. `RouteStore::load` rejects routes where this cannot be
+    /// parsed so route-protection checks never silently drop an upstream.
     pub upstream_host_port: Option<String>,
 
     /// Pre-compiled L7 endpoint rules for method+path filtering.
@@ -226,7 +227,12 @@ impl RouteStore {
                 (None, None)
             };
 
-            let upstream_host_port = extract_host_port(&route.upstream);
+            let upstream_host_port = extract_host_port(&route.upstream).map_err(|err| {
+                ProxyError::Config(format!(
+                    "route '{}': invalid upstream '{}': {}",
+                    normalized_prefix, route.upstream, err
+                ))
+            })?;
 
             // A route needs L7 visibility if it carries credentials to inject
             // (`credential_key` or `oauth2`) or if it enforces method/path
@@ -298,7 +304,7 @@ impl RouteStore {
                 normalized_prefix,
                 LoadedRoute {
                     upstream: route.upstream.clone(),
-                    upstream_host_port,
+                    upstream_host_port: Some(upstream_host_port),
                     endpoint_rules,
                     endpoint_policy,
                     tls_connector,
@@ -347,7 +353,7 @@ impl RouteStore {
     /// computed at load time to avoid per-request URL parsing.
     #[must_use]
     pub fn is_route_upstream(&self, host_port: &str) -> bool {
-        let normalised = host_port.to_lowercase();
+        let normalised = normalise_host_port(host_port);
         self.routes.values().any(|route| {
             route
                 .upstream_host_port
@@ -362,7 +368,7 @@ impl RouteStore {
     /// when multiple routes may share the same upstream.
     #[must_use]
     pub fn lookup_by_upstream(&self, host_port: &str) -> Option<(&str, &LoadedRoute)> {
-        let normalised = host_port.to_lowercase();
+        let normalised = normalise_host_port(host_port);
         self.routes.iter().find_map(|(prefix, route)| {
             route
                 .upstream_host_port
@@ -376,7 +382,7 @@ impl RouteStore {
     /// prefix for deterministic iteration.
     #[must_use]
     pub fn lookup_all_by_upstream(&self, host_port: &str) -> Vec<(&str, &LoadedRoute)> {
-        let normalised = host_port.to_lowercase();
+        let normalised = normalise_host_port(host_port);
         let mut matches: Vec<_> = self
             .routes
             .iter()
@@ -395,7 +401,7 @@ impl RouteStore {
     /// Whether any route for `host:port` requires TLS interception.
     #[must_use]
     pub fn has_intercept_route(&self, host_port: &str) -> bool {
-        let normalised = host_port.to_lowercase();
+        let normalised = normalise_host_port(host_port);
         self.routes.values().any(|route| {
             route
                 .upstream_host_port
@@ -448,7 +454,7 @@ impl RouteStore {
 pub fn config_has_loopback_proxy_route(routes: &[RouteConfig]) -> bool {
     routes.iter().any(|route| {
         let loopback =
-            extract_host_port(&route.upstream).is_some_and(|hp| is_loopback_host_port(&hp));
+            extract_host_port(&route.upstream).is_ok_and(|hp| is_loopback_host_port(&hp));
         if !loopback {
             return false;
         }
@@ -605,17 +611,57 @@ impl LoadedRoute {
 /// Extract and normalise `host:port` from a URL string.
 ///
 /// Defaults to port 443 for `https://` and 80 for `http://` when no
-/// explicit port is present. Returns `None` if the URL cannot be parsed.
-pub(crate) fn extract_host_port(url: &str) -> Option<String> {
-    let parsed = url::Url::parse(url).ok()?;
-    let host = parsed.host_str()?;
+/// explicit port is present.
+#[must_use = "route upstream host:port extraction result must be handled"]
+pub(crate) fn extract_host_port(url: &str) -> std::result::Result<String, String> {
+    let parsed = url::Url::parse(url).map_err(|err| format!("URL parse error: {err}"))?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| "upstream URL must include a host".to_string())?;
     let default_port = match parsed.scheme() {
         "https" => 443,
         "http" => 80,
-        _ => return None,
+        scheme => {
+            return Err(format!(
+                "unsupported upstream scheme '{scheme}' (expected http or https)"
+            ));
+        }
     };
     let port = parsed.port().unwrap_or(default_port);
-    Some(format!("{}:{}", host.to_lowercase(), port))
+    Ok(format_host_port(host, port))
+}
+
+pub(crate) fn format_host_port(host: &str, port: u16) -> String {
+    let host = host.to_lowercase();
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        match ip {
+            std::net::IpAddr::V4(v4) => format!("{v4}:{port}"),
+            std::net::IpAddr::V6(v6) => format!("[{v6}]:{port}"),
+        }
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+fn normalise_host_port(host_port: &str) -> String {
+    split_host_port(host_port)
+        .map(|(host, port)| format_host_port(host, port))
+        .unwrap_or_else(|| host_port.to_lowercase())
+}
+
+fn split_host_port(host_port: &str) -> Option<(&str, u16)> {
+    if let Some(rest) = host_port.strip_prefix('[') {
+        let (host, remainder) = rest.split_once(']')?;
+        let port = remainder.strip_prefix(':')?.parse::<u16>().ok()?;
+        return Some((host, port));
+    }
+
+    let (host, port) = host_port.rsplit_once(':')?;
+    let port = port.parse::<u16>().ok()?;
+    if host.contains(':') && host.parse::<std::net::Ipv6Addr>().is_err() {
+        return None;
+    }
+    Some((host, port))
 }
 
 fn route_tls_config_key(route: &RouteConfig) -> Option<String> {
@@ -1032,7 +1078,7 @@ mod tests {
     fn test_extract_host_port_https() {
         assert_eq!(
             extract_host_port("https://api.openai.com"),
-            Some("api.openai.com:443".to_string())
+            Ok("api.openai.com:443".to_string())
         );
     }
 
@@ -1040,7 +1086,7 @@ mod tests {
     fn test_extract_host_port_with_port() {
         assert_eq!(
             extract_host_port("https://api.example.com:8443"),
-            Some("api.example.com:8443".to_string())
+            Ok("api.example.com:8443".to_string())
         );
     }
 
@@ -1048,7 +1094,7 @@ mod tests {
     fn test_extract_host_port_http() {
         assert_eq!(
             extract_host_port("http://internal-service"),
-            Some("internal-service:80".to_string())
+            Ok("internal-service:80".to_string())
         );
     }
 
@@ -1056,7 +1102,7 @@ mod tests {
     fn test_extract_host_port_normalises_case() {
         assert_eq!(
             extract_host_port("https://API.Example.COM"),
-            Some("api.example.com:443".to_string())
+            Ok("api.example.com:443".to_string())
         );
     }
 
@@ -1064,8 +1110,94 @@ mod tests {
     fn test_extract_host_port_preserves_wildcard_host() {
         assert_eq!(
             extract_host_port("https://*.dev.example.net"),
-            Some("*.dev.example.net:443".to_string())
+            Ok("*.dev.example.net:443".to_string())
         );
+    }
+
+    #[test]
+    fn test_extract_host_port_brackets_ipv6_host() {
+        assert_eq!(
+            extract_host_port("http://[::1]:8080/v1"),
+            Ok("[::1]:8080".to_string())
+        );
+        assert_eq!(
+            extract_host_port("http://[0:0:0:0:0:0:0:1]:8080/v1"),
+            Ok("[::1]:8080".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_route_store_matches_bracketed_ipv6_authority() -> Result<()> {
+        let routes = vec![RouteConfig {
+            prefix: "local".to_string(),
+            upstream: "http://[::1]:8080/v1".to_string(),
+            credential_key: Some("local".to_string()),
+            inject_mode: Default::default(),
+            inject_header: "Authorization".to_string(),
+            credential_format: Some("Bearer {}".to_string()),
+            path_pattern: None,
+            path_replacement: None,
+            query_param_name: None,
+            proxy: None,
+            env_var: None,
+            endpoint_rules: vec![],
+            endpoint_policy: None,
+            tls_ca: None,
+            tls_client_cert: None,
+            tls_client_key: None,
+            oauth2: None,
+            aws_auth: None,
+            spiffe: None,
+        }];
+
+        let store = RouteStore::load(&routes).await?;
+
+        assert!(store.route_upstream_hosts().contains("[::1]:8080"));
+        assert!(store.is_route_upstream("[::1]:8080"));
+        assert!(store.is_route_upstream("[0:0:0:0:0:0:0:1]:8080"));
+        assert!(store.is_route_upstream("0:0:0:0:0:0:0:1:8080"));
+        assert!(store.lookup_by_upstream("[::1]:8080").is_some());
+        assert!(store.lookup_by_upstream("[0:0:0:0:0:0:0:1]:8080").is_some());
+        assert!(store.has_intercept_route("[::1]:8080"));
+        assert!(store.has_intercept_route("[0:0:0:0:0:0:0:1]:8080"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_load_routes_rejects_malformed_or_unsupported_upstreams() {
+        for upstream in [
+            "not a url",
+            "ftp://api.openai.com",
+            "https://",
+            "https://api.openai.com:notaport",
+        ] {
+            let routes = vec![RouteConfig {
+                prefix: "bad".to_string(),
+                upstream: upstream.to_string(),
+                credential_key: None,
+                inject_mode: Default::default(),
+                inject_header: "Authorization".to_string(),
+                credential_format: Some("Bearer {}".to_string()),
+                path_pattern: None,
+                path_replacement: None,
+                query_param_name: None,
+                proxy: None,
+                env_var: None,
+                endpoint_rules: vec![],
+                endpoint_policy: None,
+                tls_ca: None,
+                tls_client_cert: None,
+                tls_client_key: None,
+                oauth2: None,
+                aws_auth: None,
+                spiffe: None,
+            }];
+
+            assert!(
+                RouteStore::load(&routes).await.is_err(),
+                "route upstream {upstream:?} must fail closed at load time"
+            );
+        }
     }
 
     #[test]

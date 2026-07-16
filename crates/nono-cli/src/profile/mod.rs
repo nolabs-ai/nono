@@ -1114,6 +1114,45 @@ fn validate_profile_custom_credentials(profile: &Profile) -> Result<()> {
     Ok(())
 }
 
+#[must_use = "network.no_proxy validation result must be handled"]
+fn validate_profile_no_proxy(profile: &Profile) -> Result<()> {
+    for entry in &profile.network.no_proxy {
+        nono_proxy::config::validate_no_proxy_entry(entry).map_err(|err| match err {
+            nono_proxy::ProxyError::Config(message) => NonoError::ProfileParse(format!(
+                "network.no_proxy entry '{entry}' is invalid: {message}"
+            )),
+            other => NonoError::ProfileParse(format!(
+                "network.no_proxy entry '{entry}' is invalid: {other}"
+            )),
+        })?;
+    }
+
+    validate_no_proxy_allow_domain_conflicts(
+        &profile.network.no_proxy,
+        &profile.network.allow_domain,
+    )
+}
+
+#[must_use = "network.no_proxy allow_domain conflict validation result must be handled"]
+pub(crate) fn validate_no_proxy_allow_domain_conflicts(
+    no_proxy: &[String],
+    allow_domain: &[AllowDomainEntry],
+) -> Result<()> {
+    for allow_entry in allow_domain {
+        let domain = allow_entry.domain();
+        for no_proxy_entry in no_proxy {
+            if nono_proxy::config::no_proxy_entry_overlaps_host_pattern(no_proxy_entry, domain) {
+                return Err(NonoError::ProfileParse(format!(
+                    "network.no_proxy entry '{no_proxy_entry}' conflicts with \
+                     network.allow_domain entry '{domain}': allow_domain traffic must \
+                     go through the proxy allowlist/L7 route, not bypass it"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_open_url_config(config: &OpenUrlConfig) -> Result<()> {
     for origin in &config.allow_origins {
         if origin.trim().is_empty() || origin.contains('\0') {
@@ -1604,6 +1643,15 @@ pub struct NetworkConfig {
     /// Equivalent to `--allow-connect-port` CLI flag.
     #[serde(default)]
     pub connect_port: Vec<u16>,
+    /// Additional client-side proxy bypass entries for generated
+    /// NO_PROXY/no_proxy in proxy mode.
+    ///
+    /// Entries are host patterns only: single-label local aliases, IP
+    /// literals, `*.example.com` wildcard suffixes, or `.example.com` suffix
+    /// patterns. Bare multi-label domains, full URLs, credentials, schemes,
+    /// ports, paths, and catch-all `*` are rejected at load time.
+    #[serde(default)]
+    pub no_proxy: Vec<String>,
     /// Custom credential definitions for services not in network-policy.json.
     /// Keys are service names (used with `--credential`), values define
     /// how to route and inject credentials for that service.
@@ -3013,6 +3061,10 @@ pub(crate) fn finalize_profile(mut profile: Profile) -> Result<Profile> {
         return Err(NonoError::ProfileParse(err));
     }
     merge_implicit_default_groups(&mut profile)?;
+    // Re-run after extends/platform overrides: base and child profiles can
+    // independently add no_proxy and allow_domain entries that only conflict
+    // once the final effective profile has been assembled.
+    validate_profile_no_proxy(&profile)?;
     validate_credential_capture_resolved(&profile)?;
     validate_credential_provider_resolved(&profile)?;
     validate_profile_tls_intercept(&profile)?;
@@ -3099,6 +3151,10 @@ pub(crate) fn parse_profile_bytes(content: &[u8]) -> Result<Profile> {
         .map_err(|e| NonoError::ProfileParse(format!("invalid UTF-8: {e}")))?;
 
     let profile: Profile = crate::jsonc::parse(text).map_err(NonoError::ProfileParse)?;
+
+    // Validate raw no_proxy entries for direct parse/profile-edit UX. Finalize
+    // re-validates after inheritance and platform overrides have been applied.
+    validate_profile_no_proxy(&profile)?;
 
     // Validate custom credentials for security issues
     validate_profile_custom_credentials(&profile)?;
@@ -3523,6 +3579,7 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
                 &child.network.listen_port_range,
             ),
             connect_port: dedup_append(&base.network.connect_port, &child.network.connect_port),
+            no_proxy: dedup_append(&base.network.no_proxy, &child.network.no_proxy),
             // Child `Some([])` overrides parent credentials to empty (disables proxy).
             // Child `None` inherits parent credentials. Child `Some([...])` merges with parent.
             credentials: match child.network.credentials {
@@ -5993,6 +6050,7 @@ mod tests {
                 listen_port: vec![4000],
                 listen_port_range: vec![],
                 connect_port: vec![],
+                no_proxy: vec!["base.local".to_string()],
                 credentials: Some(vec!["base_cred".to_string()]),
                 custom_credentials: HashMap::new(),
                 tls_intercept: None,
@@ -6084,6 +6142,7 @@ mod tests {
                 listen_port: vec![4000, 6000],
                 listen_port_range: vec![],
                 connect_port: vec![],
+                no_proxy: vec!["base.local".to_string(), "child.local".to_string()],
                 credentials: None,
                 custom_credentials: HashMap::new(),
                 tls_intercept: None,
@@ -6153,6 +6212,15 @@ mod tests {
         let merged = merge_profiles(base_profile(), child_profile());
         // base has [3000], child has [3000, 5000] — merged should dedup to [3000, 5000]
         assert_eq!(merged.network.open_port, vec![3000, 5000]);
+    }
+
+    #[test]
+    fn test_merge_profiles_deduplicates_no_proxy() {
+        let merged = merge_profiles(base_profile(), child_profile());
+        assert_eq!(
+            merged.network.no_proxy,
+            vec!["base.local".to_string(), "child.local".to_string()]
+        );
     }
 
     #[test]
@@ -7612,6 +7680,7 @@ mod tests {
                     "credentials": ["openai"],
                     "open_port": [3000],
                     "listen_port": [4000],
+                    "no_proxy": ["redis"],
                     "upstream_proxy": "squid.corp:3128",
                     "upstream_bypass": ["internal.corp"]
                 }
@@ -7626,8 +7695,122 @@ mod tests {
         assert!(network.contains_key("credentials"));
         assert!(network.contains_key("open_port"));
         assert!(network.contains_key("listen_port"));
+        assert!(network.contains_key("no_proxy"));
         assert!(network.contains_key("upstream_proxy"));
         assert!(network.contains_key("upstream_bypass"));
+    }
+
+    #[test]
+    fn test_network_no_proxy_deserializes_plain_host_patterns() -> Result<()> {
+        let profile = parse_profile_bytes(
+            br#"{
+                "meta": { "name": "no-proxy" },
+                "network": {
+                    "no_proxy": ["redis", "*.internal.example", ".svc.cluster.local"]
+                }
+            }"#,
+        )?;
+
+        assert_eq!(
+            profile.network.no_proxy,
+            vec![
+                "redis".to_string(),
+                "*.internal.example".to_string(),
+                ".svc.cluster.local".to_string()
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_network_no_proxy_rejects_url_credentials_and_path_entries() {
+        for entry in [
+            "https://dev.local",
+            "user@dev.local",
+            "dev.local/path",
+            "dev.local?debug=true",
+            "dev.local:8080",
+            "dev.local",
+            "api.openai.com",
+            "API.OPENAI.COM",
+            "169.254.169.254",
+            "169.254.1.2",
+            "internal",
+            "fd00:ec2::254",
+            "fd00:0ec2::254",
+            "fd00:ec2:0:0:0:0:0:254",
+            "[fd00:ec2::254]",
+            "[fd00:0ec2::254]",
+            "[fe80::1]",
+            "metadata.google.internal",
+            ".google.internal",
+            "[::1]:8443",
+            "*",
+        ] {
+            let json = format!(
+                r#"{{
+                    "meta": {{ "name": "bad-no-proxy" }},
+                    "network": {{ "no_proxy": ["{entry}"] }}
+                }}"#
+            );
+            let result = parse_profile_bytes(json.as_bytes());
+            assert!(
+                result.is_err(),
+                "network.no_proxy entry {entry:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_network_no_proxy_rejects_allow_domain_overlap() {
+        for (allow_domain, no_proxy) in [
+            (r#""api.internal.corp""#, ".internal.corp"),
+            (r#""redis""#, "redis"),
+            (
+                r#"{ "domain": "api.github.com", "endpoints": [{ "method": "GET", "path": "/repos/**" }] }"#,
+                ".github.com",
+            ),
+        ] {
+            let json = format!(
+                r#"{{
+                    "meta": {{ "name": "bad-no-proxy-overlap" }},
+                    "network": {{
+                        "allow_domain": [{allow_domain}],
+                        "no_proxy": ["{no_proxy}"]
+                    }}
+                }}"#
+            );
+            let result = parse_profile_bytes(json.as_bytes());
+            assert!(
+                result.is_err(),
+                "allow_domain {allow_domain} and no_proxy {no_proxy:?} should conflict"
+            );
+        }
+    }
+
+    #[test]
+    fn test_finalize_profile_rejects_inherited_no_proxy_allow_domain_overlap() -> Result<()> {
+        let base = parse_profile_bytes(
+            br#"{
+                "meta": { "name": "base" },
+                "network": { "no_proxy": [".internal.corp"] }
+            }"#,
+        )?;
+        let child = parse_profile_bytes(
+            br#"{
+                "meta": { "name": "child" },
+                "network": { "allow_domain": ["api.internal.corp"] }
+            }"#,
+        )?;
+
+        let merged = merge_profiles(base, child);
+        let result = finalize_profile(merged);
+
+        assert!(
+            result.is_err(),
+            "inherited allow_domain/no_proxy conflicts must fail after profile merge"
+        );
+        Ok(())
     }
 
     #[test]

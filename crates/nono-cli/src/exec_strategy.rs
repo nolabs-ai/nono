@@ -66,10 +66,13 @@ pub fn resolve_program(program: &str) -> Result<PathBuf> {
 /// Main thread (1) + up to 3 keyring threads for D-Bus/Security.framework.
 const MAX_KEYRING_THREADS: usize = 4;
 /// Maximum threads allowed when crypto library thread pool is active.
-/// Main thread (1) + tokio proxy workers (2) + aws-lc-rs ECDSA pool (4).
-/// When --network-profile is used with trust scanning, both the proxy runtime
-/// and crypto verification threads may be active simultaneously.
-const MAX_CRYPTO_THREADS: usize = 7;
+/// Main thread (1) + tokio proxy workers (2) + aws-lc-rs ECDSA pool (4), plus
+/// headroom for the OS-managed libdispatch workqueue threads that
+/// Security.framework spawns for `SecTrustSettings*` XPC during proxy CA setup
+/// on macOS (2-5 observed, scales with load). Those workqueue threads are
+/// unnamed, parked, and fork-safe, but a tighter budget intermittently tripped
+/// on them (issue: fork thread-count flake).
+const MAX_CRYPTO_THREADS: usize = 12;
 /// Hard cap on retained denial records to prevent memory exhaustion.
 const MAX_DENIAL_RECORDS: usize = 1000;
 /// Hard cap on request IDs tracked for replay detection.

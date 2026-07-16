@@ -64,6 +64,16 @@ def make_handler(jwks: dict, audience: str, issuer: str):
         def _handle(self):
             ts = time.strftime("%H:%M:%S")
             print(f"{BOLD}──── {ts} {self.command} {self.path} ────{RESET}")
+            print(f"  {CYAN}Headers:{RESET}")
+            for name, value in self.headers.items():
+                print(f"    {name}: {value}")
+
+            # Reject requests that contain unexpected credential headers — a
+            # real upstream would do the same and this catches proxy leaks.
+            for forbidden in ("x-api-key", "proxy-authorization", "proxy-connection"):
+                if self.headers.get(forbidden):
+                    self._reject(400, f"unexpected header forwarded: {forbidden}")
+                    return
 
             auth = self.headers.get("Authorization", "")
             if not auth.lower().startswith("bearer "):

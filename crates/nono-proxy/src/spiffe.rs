@@ -27,6 +27,7 @@ pub struct SpiffeJwtSource {
     inner: Arc<JwtSource>,
     pub audience: Vec<String>,
     pub inject_header: String,
+    pub credential_format: Option<String>,
     pub svid_hint: Option<SpiffeId>,
 }
 
@@ -42,6 +43,7 @@ impl SpiffeJwtSource {
         socket_path: &str,
         audience: Vec<String>,
         inject_header: String,
+        credential_format: Option<String>,
         svid_hint: Option<&str>,
     ) -> Result<Self> {
         let endpoint = format!("unix:{socket_path}");
@@ -69,6 +71,7 @@ impl SpiffeJwtSource {
             inner: Arc::new(source),
             audience,
             inject_header,
+            credential_format,
             svid_hint,
         })
     }

@@ -788,7 +788,11 @@ async fn handle_spiffe_route(
         return Ok(());
     }
 
-    let filtered_headers = filter_headers(remaining_header, "");
+    let inject_header_str = inject_header.as_deref().unwrap_or("");
+    let filtered_headers = filter_headers_multi(
+        remaining_header,
+        &[inject_header_str, "Authorization", "x-api-key"],
+    );
     let content_length = extract_content_length(remaining_header);
     let body = match read_request_body(stream, content_length, buffered_body).await? {
         Some(body) => body,
@@ -803,17 +807,23 @@ async fn handle_spiffe_route(
 
     // Inject the managed credential (SPIFFE JWT, etc.).
     if let (Some(value), Some(header)) = (&inject_value, &inject_header) {
-        request.push_str(&format!("{}: {}\r\n", header, value.as_str()));
+        request.push_str(header);
+        request.push_str(": ");
+        request.push_str(value.as_str());
+        request.push_str("\r\n");
     }
 
     for (name, value) in &filtered_headers {
-        // Strip the injection header so the sandboxed client cannot override it.
-        if let Some(ref h) = inject_header
-            && name.eq_ignore_ascii_case(h)
-        {
+        // Reject headers with CRLF in name or value — prevents a sandboxed
+        // process from injecting extra headers into the upstream request.
+        if name.contains(['\r', '\n']) || value.contains(['\r', '\n']) {
+            warn!("dropping header with CRLF in name or value: {:?}", name);
             continue;
         }
-        request.push_str(&format!("{}: {}\r\n", name, value));
+        request.push_str(name);
+        request.push_str(": ");
+        request.push_str(value);
+        request.push_str("\r\n");
     }
 
     request.push_str("Connection: close\r\n");
@@ -1385,10 +1395,12 @@ async fn handle_oauth2_like(
         return Ok(());
     }
 
-    // Strip the phantom header (whatever the client used) and any Authorization
+    // Strip the phantom header (whatever the client used) and any auth headers
     // the client may have sent — we inject the real OAuth Bearer token below.
-    let filtered_headers =
-        filter_headers_multi(remaining_header, &[inject_header, "Authorization"]);
+    let filtered_headers = filter_headers_multi(
+        remaining_header,
+        &[inject_header, "Authorization", "x-api-key"],
+    );
     let content_length = extract_content_length(remaining_header);
     let body = match read_request_body(stream, content_length, buffered_body).await? {
         Some(b) => b,
@@ -1724,6 +1736,7 @@ pub(crate) fn filter_headers_multi(header_bytes: &[u8], strip: &[&str]) -> Vec<(
         if lower.starts_with("host:")
             || lower.starts_with("content-length:")
             || lower.starts_with("connection:")
+            || lower.starts_with("proxy-connection:")
             || lower.starts_with("proxy-authorization:")
             || prefixes.iter().any(|p| lower.starts_with(p.as_str()))
             || line.trim().is_empty()
@@ -1751,6 +1764,7 @@ pub(crate) fn filter_headers(header_bytes: &[u8], cred_header: &str) -> Vec<(Str
         if lower.starts_with("host:")
             || lower.starts_with("content-length:")
             || lower.starts_with("connection:")
+            || lower.starts_with("proxy-connection:")
             || lower.starts_with("proxy-authorization:")
             || (!cred_header_lower.is_empty() && lower.starts_with(&cred_header_lower))
             || line.trim().is_empty()

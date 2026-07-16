@@ -383,6 +383,7 @@ impl CredentialStore {
                                 workload_api_socket,
                                 audience.clone(),
                                 "Authorization".to_string(),
+                                None,
                                 svid_hint.as_deref(),
                             ),
                         )
@@ -483,7 +484,7 @@ impl CredentialStore {
                     match TokenCache::new(config, tls_connector.clone()).await {
                         Ok(cache) => {
                             oauth2_routes.insert(
-                                route.prefix.clone(),
+                                normalized_prefix.clone(),
                                 OAuth2Route {
                                     cache,
                                     upstream: route.upstream.clone(),

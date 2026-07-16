@@ -56,7 +56,10 @@ impl ManagedUpstreamAuth {
                     .fetch_token(&src.audience)
                     .await
                     .map_err(|e| ProxyError::Credential(e.to_string()))?;
-                let fmt = crate::config::resolved_credential_format(&src.inject_header, None);
+                let fmt = crate::config::resolved_credential_format(
+                    &src.inject_header,
+                    src.credential_format.as_deref(),
+                );
                 Ok(UpstreamAuthMaterial::BearerToken {
                     header: src.inject_header.clone(),
                     token,

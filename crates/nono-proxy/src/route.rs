@@ -259,8 +259,8 @@ impl RouteStore {
                     workload_api_socket,
                     audience,
                     inject_header,
+                    credential_format,
                     svid_hint,
-                    ..
                 }) = &route.spiffe
                 {
                     debug!(
@@ -271,6 +271,7 @@ impl RouteStore {
                         workload_api_socket,
                         audience.clone(),
                         inject_header.clone(),
+                        credential_format.clone(),
                         svid_hint.as_deref(),
                     )
                     .await

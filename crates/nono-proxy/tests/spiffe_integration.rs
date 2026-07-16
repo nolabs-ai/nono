@@ -84,10 +84,15 @@ async fn test_spiffe_jwt_live_fetch() {
     let audience = live_audience();
     let expected_id = live_expected_spiffe_id();
 
-    let src =
-        SpiffeJwtSource::connect(&socket, audience.clone(), "Authorization".to_string(), None)
-            .await
-            .expect("should connect to live SPIRE agent");
+    let src = SpiffeJwtSource::connect(
+        &socket,
+        audience.clone(),
+        "Authorization".to_string(),
+        None,
+        None,
+    )
+    .await
+    .expect("should connect to live SPIRE agent");
 
     let (token, spiffe_id) = src
         .fetch_token(&audience)
@@ -112,10 +117,15 @@ async fn test_spiffe_jwt_live_delegation_none_on_plain_svid() {
     };
     let audience = live_audience();
 
-    let src =
-        SpiffeJwtSource::connect(&socket, audience.clone(), "Authorization".to_string(), None)
-            .await
-            .expect("should connect to live SPIRE agent");
+    let src = SpiffeJwtSource::connect(
+        &socket,
+        audience.clone(),
+        "Authorization".to_string(),
+        None,
+        None,
+    )
+    .await
+    .expect("should connect to live SPIRE agent");
 
     let (token, _) = src
         .fetch_token(&audience)

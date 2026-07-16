@@ -903,7 +903,7 @@ global\tfile:/home/u/.gitconfig\tuser.name=Alice
             .current_dir(&repo)
             .status()
             .expect("git init");
-        Command::new("git")
+        let commit = Command::new("git")
             .args([
                 "-c",
                 "user.email=t@t.com",
@@ -917,13 +917,18 @@ global\tfile:/home/u/.gitconfig\tuser.name=Alice
             .current_dir(&repo)
             .status()
             .expect("git commit");
+        assert!(commit.success(), "git commit failed: {commit}");
 
         let wt = tmp.path().join("worktree");
-        Command::new("git")
+        let worktree_add = Command::new("git")
             .args(["worktree", "add", wt.to_str().expect("utf8")])
             .current_dir(&repo)
             .status()
             .expect("git worktree add");
+        assert!(
+            worktree_add.success(),
+            "git worktree add failed: {worktree_add}"
+        );
 
         let result = git::read_common_dir_in(&wt).expect("read_common_dir in worktree");
         assert_eq!(result.len(), 1, "expected one entry, got {:?}", result);
@@ -984,7 +989,7 @@ global\tfile:/home/u/.gitconfig\tuser.name=Alice
             .current_dir(&repo)
             .status()
             .expect("git init");
-        Command::new("git")
+        let commit = Command::new("git")
             .args([
                 "-c",
                 "user.email=t@t.com",
@@ -998,13 +1003,18 @@ global\tfile:/home/u/.gitconfig\tuser.name=Alice
             .current_dir(&repo)
             .status()
             .expect("git commit");
+        assert!(commit.success(), "git commit failed: {commit}");
 
         let wt = tmp.path().join("worktree");
-        Command::new("git")
+        let worktree_add = Command::new("git")
             .args(["worktree", "add", wt.to_str().expect("utf8")])
             .current_dir(&repo)
             .status()
             .expect("git worktree add");
+        assert!(
+            worktree_add.success(),
+            "git worktree add failed: {worktree_add}"
+        );
 
         let result = git::read_main_worktree_in(&wt).expect("read_main_worktree in worktree");
         assert_eq!(result.len(), 1, "expected one entry, got {:?}", result);
@@ -1069,7 +1079,7 @@ global\tfile:/home/u/.gitconfig\tuser.name=Alice
             .current_dir(&repo)
             .status()
             .expect("git init");
-        Command::new("git")
+        let commit = Command::new("git")
             .args([
                 "-c",
                 "user.email=t@t.com",
@@ -1083,12 +1093,17 @@ global\tfile:/home/u/.gitconfig\tuser.name=Alice
             .current_dir(&repo)
             .status()
             .expect("git commit");
+        assert!(commit.success(), "git commit failed: {commit}");
         let wt = tmp.path().join("worktree");
-        Command::new("git")
+        let worktree_add = Command::new("git")
             .args(["worktree", "add", wt.to_str().expect("utf8")])
             .current_dir(&repo)
             .status()
             .expect("git worktree add");
+        assert!(
+            worktree_add.success(),
+            "git worktree add failed: {worktree_add}"
+        );
 
         // In a linked worktree, --show-toplevel returns the worktree dir, not the main repo.
         let result = git::read_toplevel_in(&wt).expect("read_toplevel in worktree");
@@ -1223,7 +1238,7 @@ global\tfile:/home/u/.gitconfig\tuser.name=Alice
             .current_dir(&repo)
             .status()
             .expect("git init");
-        Command::new("git")
+        let commit = Command::new("git")
             .args([
                 "-c",
                 "user.email=t@t.com",
@@ -1237,12 +1252,17 @@ global\tfile:/home/u/.gitconfig\tuser.name=Alice
             .current_dir(&repo)
             .status()
             .expect("git commit");
+        assert!(commit.success(), "git commit failed: {commit}");
         let wt = tmp.path().join("worktree");
-        Command::new("git")
+        let worktree_add = Command::new("git")
             .args(["worktree", "add", wt.to_str().expect("utf8")])
             .current_dir(&repo)
             .status()
             .expect("git worktree add");
+        assert!(
+            worktree_add.success(),
+            "git worktree add failed: {worktree_add}"
+        );
 
         let stub_dir = tmp.path().join("stub-bin");
         std::fs::create_dir(&stub_dir).expect("mkdir stub-bin");

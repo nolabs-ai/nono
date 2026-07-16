@@ -3164,11 +3164,12 @@ mod tests {
 
         // git init + initial commit so worktree add works
         let main_repo_str = main_repo.to_str().expect("main_repo utf8");
-        std::process::Command::new("git")
+        let init = std::process::Command::new("git")
             .args(["init", main_repo_str])
-            .output()
+            .status()
             .expect("git init");
-        std::process::Command::new("git")
+        assert!(init.success(), "git init failed: {init}");
+        let commit = std::process::Command::new("git")
             .args([
                 "-C",
                 main_repo_str,
@@ -3181,16 +3182,21 @@ mod tests {
                 "-m",
                 "init",
             ])
-            .output()
+            .status()
             .expect("git commit");
+        assert!(commit.success(), "git commit failed: {commit}");
 
         // git worktree add
         let wt = tmp.path().join("linked");
         let wt_str = wt.to_str().expect("wt utf8");
-        std::process::Command::new("git")
+        let worktree_add = std::process::Command::new("git")
             .args(["-C", main_repo_str, "worktree", "add", wt_str, "HEAD"])
-            .output()
+            .status()
             .expect("git worktree add");
+        assert!(
+            worktree_add.success(),
+            "git worktree add failed: {worktree_add}"
+        );
 
         // Build a profile with @git:common-dir in filesystem.allow.
         // In a linked worktree, @git:common-dir resolves to the absolute path of the

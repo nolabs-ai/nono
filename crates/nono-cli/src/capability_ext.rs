@@ -3174,6 +3174,8 @@ mod tests {
                 "-C",
                 main_repo_str,
                 "-c",
+                "commit.gpgsign=false",
+                "-c",
                 "user.email=test@test.com",
                 "-c",
                 "user.name=Test",

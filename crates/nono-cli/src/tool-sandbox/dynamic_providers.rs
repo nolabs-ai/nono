@@ -906,6 +906,8 @@ global\tfile:/home/u/.gitconfig\tuser.name=Alice
         let commit = Command::new("git")
             .args([
                 "-c",
+                "commit.gpgsign=false",
+                "-c",
                 "user.email=t@t.com",
                 "-c",
                 "user.name=T",
@@ -991,6 +993,8 @@ global\tfile:/home/u/.gitconfig\tuser.name=Alice
             .expect("git init");
         let commit = Command::new("git")
             .args([
+                "-c",
+                "commit.gpgsign=false",
                 "-c",
                 "user.email=t@t.com",
                 "-c",
@@ -1081,6 +1085,8 @@ global\tfile:/home/u/.gitconfig\tuser.name=Alice
             .expect("git init");
         let commit = Command::new("git")
             .args([
+                "-c",
+                "commit.gpgsign=false",
                 "-c",
                 "user.email=t@t.com",
                 "-c",
@@ -1240,6 +1246,8 @@ global\tfile:/home/u/.gitconfig\tuser.name=Alice
             .expect("git init");
         let commit = Command::new("git")
             .args([
+                "-c",
+                "commit.gpgsign=false",
                 "-c",
                 "user.email=t@t.com",
                 "-c",

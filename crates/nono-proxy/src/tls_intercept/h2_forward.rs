@@ -270,8 +270,11 @@ async fn handle_h2_stream(
         &ctx.route_store,
         &ctx.host,
         ctx.port,
-        &method_str,
-        &path,
+        handle::InterceptRouteRequest {
+            method: &method_str,
+            path: &path,
+            websocket_path: None,
+        },
         ctx.audit_log.as_ref(),
         ctx.approval_backends.as_ref(),
     )
@@ -283,8 +286,8 @@ async fn handle_h2_stream(
         }
         RouteSelection::Selected(selected) => selected,
     };
-    let service: Option<&str> = selected.map(|(s, _)| s);
-    let route: Option<&crate::route::LoadedRoute> = selected.map(|(_, r)| r);
+    let service = selected.map(|selected| selected.id);
+    let route = selected.map(|selected| selected.route);
 
     // Managed credential gating, AWS handling, and command-backed capture are
     // shared with the HTTP/1.1 path via [`handle::resolve_managed_credential`]

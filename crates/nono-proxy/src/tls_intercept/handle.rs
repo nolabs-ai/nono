@@ -645,6 +645,23 @@ pub(crate) async fn select_intercept_route<'a>(
                 }
             }
             EndpointPolicyOutcome::Deny { reason, rule_label } => {
+                // A legacy `endpoint_rules` allow-list compiles to a
+                // non-explicit default-deny policy. When the request path is
+                // not in that list the route simply does not apply — it must
+                // not hard-deny the whole request, because another route
+                // sharing this upstream may still authorize and inject a
+                // credential. Mirror `route::select_route`: drop a managed-
+                // credential route, or let a credential-less endpoint-only
+                // (`_ep_`) route gate the request via `has_endpoint_only_route`
+                // so the post-loop check produces the 403 only when nothing
+                // authorized it. Explicit endpoint policies keep their
+                // authoritative hard-deny below.
+                if !route.endpoint_policy.is_explicit() {
+                    if !route.requires_managed_credential {
+                        has_endpoint_only_route = true;
+                    }
+                    continue;
+                }
                 let deny_reason = reason.unwrap_or("endpoint denied by policy");
                 audit::log_l7_policy_decision(
                     audit_log,
@@ -1824,6 +1841,76 @@ mod tests {
             aws_auth: None,
             endpoint_policy: None,
             spiffe: None,
+        }
+    }
+
+    /// Two managed-credential routes sharing one upstream with disjoint
+    /// `endpoint_rules` must each authorize their own path and inject their own
+    /// credential; a path covered by neither is an un-credentialed passthrough.
+    /// Regression test: a sibling route's legacy default-deny must not
+    /// hard-deny (403) a request another route on the same upstream allows.
+    #[tokio::test]
+    async fn select_intercept_route_disjoint_credential_routes_do_not_cross_deny() {
+        fn cred_route(prefix: &str, path: &str) -> crate::config::RouteConfig {
+            crate::config::RouteConfig {
+                prefix: prefix.to_string(),
+                upstream: "https://example.com".to_string(),
+                credential_key: Some(format!("env://{}_TOKEN", prefix.to_uppercase())),
+                inject_mode: crate::config::InjectMode::Header,
+                inject_header: "Authorization".to_string(),
+                credential_format: Some("Bearer {}".to_string()),
+                path_pattern: None,
+                path_replacement: None,
+                query_param_name: None,
+                proxy: None,
+                env_var: None,
+                endpoint_rules: vec![crate::config::EndpointRule {
+                    method: "GET".to_string(),
+                    path: path.to_string(),
+                }],
+                tls_ca: None,
+                tls_client_cert: None,
+                tls_client_key: None,
+                oauth2: None,
+                aws_auth: None,
+                endpoint_policy: None,
+                spiffe: None,
+            }
+        }
+
+        let routes = vec![cred_route("foo", "/foo"), cred_route("bar", "/bar")];
+        let store = RouteStore::load(&routes).await.unwrap();
+
+        // Each path selects its own route; the sibling route's default-deny must
+        // not turn this into a 403.
+        match select_intercept_route(&store, "example.com", 443, "GET", "/foo", None, None).await {
+            RouteSelection::Selected(Some((svc, _))) => assert_eq!(svc, "foo"),
+            RouteSelection::Selected(None) => {
+                panic!("/foo must select the foo route, not passthrough")
+            }
+            RouteSelection::Rejected(status) => {
+                panic!("/foo must be allowed, got rejection with status {status}")
+            }
+        }
+        match select_intercept_route(&store, "example.com", 443, "GET", "/bar", None, None).await {
+            RouteSelection::Selected(Some((svc, _))) => assert_eq!(svc, "bar"),
+            RouteSelection::Selected(None) => {
+                panic!("/bar must select the bar route, not passthrough")
+            }
+            RouteSelection::Rejected(status) => {
+                panic!("/bar must be allowed, got rejection with status {status}")
+            }
+        }
+        // A path covered by neither route: passthrough without credentials, not a 403.
+        match select_intercept_route(&store, "example.com", 443, "GET", "/other", None, None).await
+        {
+            RouteSelection::Selected(None) => {}
+            RouteSelection::Selected(Some((svc, _))) => {
+                panic!("/other must not inject a credential, selected route '{svc}'")
+            }
+            RouteSelection::Rejected(status) => {
+                panic!("/other must pass through, got rejection with status {status}")
+            }
         }
     }
 

@@ -58,7 +58,7 @@ pub(crate) fn is_dangerous_env_var(key: &str) -> bool {
 /// (`"AWS_*"` matches `AWS_REGION`, `AWS_SECRET_ACCESS_KEY`, etc.).
 /// A bare `"*"` matches everything. The `*` wildcard is only valid as a
 /// trailing suffix — patterns like `"A*B"` or `"*X"` are skipped.
-fn matches_env_var_patterns(key: &str, patterns: &[String]) -> bool {
+pub(crate) fn matches_env_var_patterns(key: &str, patterns: &[String]) -> bool {
     for pattern in patterns {
         if let Some(prefix) = pattern.strip_suffix('*') {
             if prefix.contains('*') {

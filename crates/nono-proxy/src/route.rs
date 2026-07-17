@@ -10,7 +10,10 @@
 //! (inject mode, header name/value, raw secret). Both stores are keyed by the
 //! normalised route prefix and are consulted independently by the proxy handlers.
 
-use crate::config::{CompiledEndpointPolicy, CompiledEndpointRules, RouteConfig, SpiffeAuthConfig};
+use crate::config::{
+    CompiledEndpointPolicy, CompiledEndpointRules, CompiledUpgradeRules, RouteConfig,
+    SpiffeAuthConfig,
+};
 use crate::error::{ProxyError, Result};
 use nono::undo::{NetworkAuditAuthMechanism, NetworkAuditInjectionMode};
 use rustls::pki_types::pem::PemObject;
@@ -42,6 +45,10 @@ pub struct LoadedRoute {
     /// Pre-compiled explicit endpoint policy. When no explicit policy is
     /// configured this preserves legacy `endpoint_rules` semantics.
     pub endpoint_policy: CompiledEndpointPolicy,
+
+    /// Pre-compiled WebSocket upgrade allow-list. When empty (the default),
+    /// no upgrade requests are tunneled for this route.
+    pub upgrade_rules: CompiledUpgradeRules,
 
     /// Per-route TLS connector with custom CA trust, if configured.
     /// Built once at startup from the route's `tls_ca` certificate file.
@@ -92,6 +99,7 @@ impl std::fmt::Debug for LoadedRoute {
             .field("upstream_host_port", &self.upstream_host_port)
             .field("endpoint_rules", &self.endpoint_rules)
             .field("endpoint_policy", &self.endpoint_policy)
+            .field("upgrade_rules", &self.upgrade_rules)
             .field("has_custom_tls_ca", &self.tls_connector.is_some())
             .field("requires_intercept", &self.requires_intercept)
             .field(
@@ -204,6 +212,8 @@ impl RouteStore {
                 &route.endpoint_rules,
             )
             .map_err(|e| ProxyError::Config(format!("route '{}': {}", normalized_prefix, e)))?;
+            let upgrade_rules = CompiledUpgradeRules::compile(&route.upgrades)
+                .map_err(|e| ProxyError::Config(format!("route '{}': {}", normalized_prefix, e)))?;
 
             let tls_config_key = route_tls_config_key(route);
             let (tls_connector, tls_client_config) = if route.tls_ca.is_some()
@@ -307,6 +317,7 @@ impl RouteStore {
                     upstream_host_port: Some(upstream_host_port),
                     endpoint_rules,
                     endpoint_policy,
+                    upgrade_rules,
                     tls_connector,
                     tls_client_config,
                     tls_config_key,
@@ -942,6 +953,7 @@ mod tests {
             oauth2: None,
             aws_auth: None,
             spiffe: None,
+            upgrades: vec![],
         }];
 
         let store = RouteStore::load(&routes).await.unwrap();
@@ -984,6 +996,7 @@ mod tests {
             oauth2: None,
             aws_auth: None,
             spiffe: None,
+            upgrades: vec![],
         }];
 
         let store = RouteStore::load(&routes).await.unwrap();
@@ -1013,6 +1026,7 @@ mod tests {
             oauth2: None,
             aws_auth: None,
             spiffe: None,
+            upgrades: vec![],
         }];
 
         let store = RouteStore::load(&routes).await.unwrap();
@@ -1043,6 +1057,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                upgrades: vec![],
             },
             RouteConfig {
                 prefix: "anthropic".to_string(),
@@ -1064,6 +1079,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                upgrades: vec![],
             },
         ];
 
@@ -1148,6 +1164,7 @@ mod tests {
             oauth2: None,
             aws_auth: None,
             spiffe: None,
+            upgrades: vec![],
         }];
 
         let store = RouteStore::load(&routes).await?;
@@ -1191,6 +1208,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                upgrades: vec![],
             }];
 
             assert!(
@@ -1231,6 +1249,7 @@ mod tests {
             upstream_host_port: Some("api.openai.com:443".to_string()),
             endpoint_rules: CompiledEndpointRules::compile(&[]).unwrap(),
             endpoint_policy: CompiledEndpointPolicy::compile(None, &[]).unwrap(),
+            upgrade_rules: CompiledUpgradeRules::compile(&[]).unwrap(),
             tls_connector: None,
             tls_client_config: None,
             tls_config_key: None,
@@ -1271,6 +1290,7 @@ mod tests {
             oauth2: None,
             aws_auth: None,
             spiffe: None,
+            upgrades: vec![],
         }];
         let store = RouteStore::load(&routes).await.unwrap();
         let hit = store.lookup_by_upstream("api.openai.com:443").unwrap();
@@ -1309,6 +1329,7 @@ mod tests {
             oauth2: None,
             aws_auth: None,
             spiffe: None,
+            upgrades: vec![],
         }];
         let store = RouteStore::load(&routes).await.unwrap();
 
@@ -1355,6 +1376,7 @@ mod tests {
             oauth2: None,
             aws_auth: None,
             spiffe: None,
+            upgrades: vec![],
         }];
         let store = RouteStore::load(&routes).await.unwrap();
         let hit = store
@@ -1388,6 +1410,7 @@ mod tests {
             oauth2: None,
             aws_auth: None,
             spiffe: None,
+            upgrades: vec![],
         }];
         let store = RouteStore::load(&routes).await.unwrap();
         assert!(store.is_route_upstream("aliased.example.com:443"));
@@ -1401,6 +1424,7 @@ mod tests {
             upstream_host_port: Some("api.openai.com:443".to_string()),
             endpoint_rules: CompiledEndpointRules::compile(&[]).unwrap(),
             endpoint_policy: CompiledEndpointPolicy::compile(None, &[]).unwrap(),
+            upgrade_rules: CompiledUpgradeRules::compile(&[]).unwrap(),
             tls_connector: None,
             tls_client_config: None,
             tls_config_key: None,
@@ -1421,6 +1445,7 @@ mod tests {
             upstream_host_port: Some("internal.example.com:443".to_string()),
             endpoint_rules: CompiledEndpointRules::compile(&[]).unwrap(),
             endpoint_policy: CompiledEndpointPolicy::compile(None, &[]).unwrap(),
+            upgrade_rules: CompiledUpgradeRules::compile(&[]).unwrap(),
             tls_connector: None,
             tls_client_config: None,
             tls_config_key: None,
@@ -1455,6 +1480,7 @@ mod tests {
             oauth2: None,
             aws_auth: None,
             spiffe: None,
+            upgrades: vec![],
         }];
         let store = RouteStore::load(&routes).await.unwrap();
         let hit = store.lookup_by_upstream("api.openai.com:443").unwrap();
@@ -1490,6 +1516,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                upgrades: vec![],
             },
             RouteConfig {
                 prefix: "github_org_b".to_string(),
@@ -1514,6 +1541,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                upgrades: vec![],
             },
         ];
         let store = RouteStore::load(&routes).await.unwrap();
@@ -1592,6 +1620,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                upgrades: vec![],
             }
         }
 
@@ -2003,6 +2032,7 @@ h56ZLEEqHfVWFhJWIKRSabtxYPV/VJyMv+lo3L0QwSKsouHs3dtF1zVQ
             oauth2: None,
             aws_auth: None,
             spiffe: None,
+            upgrades: vec![],
         }];
 
         let store = RouteStore::load(&routes)

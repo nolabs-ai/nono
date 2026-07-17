@@ -118,6 +118,11 @@ pub struct CredentialRouteDef {
     pub base_url_env_var: Option<String>,
     #[serde(default)]
     pub endpoint_policy: Option<nono_proxy::config::EndpointPolicyConfig>,
+    /// Allow-listed WebSocket upgrade targets for this route. Each rule's
+    /// `origin` must be one of the provider's `api_hosts`; `method` must be
+    /// `"GET"`. Empty (the default) grants no upgrades.
+    #[serde(default)]
+    pub upgrades: Vec<nono_proxy::config::UpgradeRuleConfig>,
 }
 
 pub(super) fn validate_credential_provider_entries(profile: &Profile) -> Result<()> {
@@ -221,11 +226,32 @@ pub(super) fn validate_credential_provider_entries(profile: &Profile) -> Result<
 
 fn validate_credential_provider_references(profile: &Profile) -> Result<()> {
     for route in &profile.credential_routes {
-        if !profile.credential_providers.contains_key(&route.provider) {
+        let Some(provider) = profile.credential_providers.get(&route.provider) else {
             return Err(NonoError::ProfileParse(format!(
                 "credential_routes.{} references unknown credential provider '{}'",
                 route.name, route.provider
             )));
+        };
+        for (index, rule) in route.upgrades.iter().enumerate() {
+            let context = format!("credential_routes.{}.upgrades[{index}]", route.name);
+            validate_provider_origin(&format!("{context}.origin"), &rule.origin)?;
+            validate_provider_path(&format!("{context}.path"), &rule.path)?;
+            if !provider.api_hosts.iter().any(|host| host == &rule.origin) {
+                return Err(NonoError::ProfileParse(format!(
+                    "{context}.origin '{}' is not in provider '{}'.api_hosts",
+                    rule.origin, route.provider
+                )));
+            }
+            match rule.protocol {
+                nono_proxy::config::UpgradeProtocol::Websocket => {
+                    if rule.method != "GET" {
+                        return Err(NonoError::ProfileParse(format!(
+                            "{context}.method must be 'GET' for a websocket upgrade, got '{}'",
+                            rule.method
+                        )));
+                    }
+                }
+            }
         }
     }
     Ok(())

@@ -24,6 +24,7 @@ use crate::forward;
 use crate::forward::{AuditCtx, UpstreamScheme, UpstreamSpec, UpstreamStrategy};
 use crate::route::RouteStore;
 use crate::token;
+use base64::Engine as _;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -134,6 +135,32 @@ pub async fn handle_reverse_proxy(
 ) -> Result<()> {
     let (method, path, version) = parse_request_line(first_line)?;
     debug!("Reverse proxy: {} {}", method, path);
+
+    // Detect and close out WebSocket (and other) upgrade attempts before
+    // any route lookup, credential resolution, or upstream connection.
+    // Without this, an upgrade request is forwarded as if it were a plain
+    // HTTP request and the client hangs waiting for a response that never
+    // arrives, since we don't (yet) support tunneling the upgraded protocol.
+    match classify_upgrade_attempt(&method, &version, remaining_header) {
+        UpgradeAttempt::None => {}
+        UpgradeAttempt::Malformed(reason) => {
+            log_upgrade_rejection(ctx, &method, &path, remaining_header, "malformed", reason);
+            send_error_with_close(stream, 400, "Bad Request").await?;
+            return Ok(());
+        }
+        UpgradeAttempt::Valid => {
+            log_upgrade_rejection(
+                ctx,
+                &method,
+                &path,
+                remaining_header,
+                "unsupported",
+                "websocket",
+            );
+            send_error_with_close(stream, 501, "Not Implemented").await?;
+            return Ok(());
+        }
+    }
 
     // HTTP proxy clients send absolute URLs; strip scheme+authority so
     // parse_service_prefix sees a relative path.
@@ -1779,6 +1806,45 @@ pub(crate) fn filter_headers(header_bytes: &[u8], cred_header: &str) -> Vec<(Str
     headers
 }
 
+/// Filter headers for an outbound WebSocket upgrade request.
+///
+/// Like [`filter_headers`], but does **not** strip `Connection` or
+/// `Upgrade` — the handshake requires `Connection: Upgrade` and
+/// `Upgrade: websocket` to reach the real upstream verbatim, along with
+/// `Origin` and every `Sec-WebSocket-*` header. Only `Host`,
+/// `Content-Length`, `Proxy-Connection`, `Proxy-Authorization`, and the
+/// given credential header (if any) are stripped.
+pub(crate) fn filter_headers_for_upgrade(
+    header_bytes: &[u8],
+    cred_header: &str,
+) -> Vec<(String, String)> {
+    let header_str = std::str::from_utf8(header_bytes).unwrap_or("");
+    let cred_header_lower = if cred_header.is_empty() {
+        String::new()
+    } else {
+        format!("{}:", cred_header.to_lowercase())
+    };
+    let mut headers = Vec::new();
+
+    for line in header_str.lines() {
+        let lower = line.to_lowercase();
+        if lower.starts_with("host:")
+            || lower.starts_with("content-length:")
+            || lower.starts_with("proxy-connection:")
+            || lower.starts_with("proxy-authorization:")
+            || (!cred_header_lower.is_empty() && lower.starts_with(&cred_header_lower))
+            || line.trim().is_empty()
+        {
+            continue;
+        }
+        if let Some((name, value)) = line.split_once(':') {
+            headers.push((name.trim().to_string(), value.trim().to_string()));
+        }
+    }
+
+    headers
+}
+
 /// Extract Content-Length value from raw headers.
 pub(crate) fn extract_content_length(header_bytes: &[u8]) -> Option<usize> {
     let header_str = std::str::from_utf8(header_bytes).ok()?;
@@ -1789,6 +1855,150 @@ pub(crate) fn extract_content_length(header_bytes: &[u8]) -> Option<usize> {
         }
     }
     None
+}
+
+/// Outcome of scanning a request for an HTTP `Upgrade` attempt.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum UpgradeAttempt {
+    /// No `Upgrade` header and no `upgrade` token in `Connection` — ordinary request.
+    None,
+    /// Recognized upgrade attempt that fails handshake validation.
+    Malformed(&'static str),
+    /// Structurally valid WebSocket handshake (RFC 6455); protocol still unsupported.
+    Valid,
+}
+
+/// Split raw header bytes into lowercased-name/raw-value pairs.
+///
+/// Rejects obsolete line folding (leading space/tab) the same way
+/// [`validate_phantom_token`] does, by simply not treating folded
+/// continuation lines as part of the preceding header — callers see
+/// them as malformed via a missing colon, which `split_once` handles
+/// by skipping the line.
+pub(crate) fn header_pairs(header_bytes: &[u8]) -> Option<Vec<(String, &str)>> {
+    let header_str = std::str::from_utf8(header_bytes).ok()?;
+    let mut pairs = Vec::new();
+    for line in header_str.lines() {
+        if line.starts_with(' ') || line.starts_with('\t') {
+            // Obsolete line-folding: treat as unparseable rather than
+            // silently joining it to the previous header.
+            return None;
+        }
+        if line.trim().is_empty() {
+            continue;
+        }
+        let (name, value) = line.split_once(':')?;
+        pairs.push((name.trim().to_lowercase(), value.trim()));
+    }
+    Some(pairs)
+}
+
+/// Count occurrences and collect values of a lowercased header name.
+pub(crate) fn header_values<'a>(pairs: &'a [(String, &'a str)], name: &str) -> Vec<&'a str> {
+    pairs
+        .iter()
+        .filter(|(n, _)| n == name)
+        .map(|(_, v)| *v)
+        .collect()
+}
+
+/// Check whether a `Connection` header value's comma-separated tokens
+/// include `upgrade` (case-insensitive).
+pub(crate) fn connection_has_upgrade_token(value: &str) -> bool {
+    value
+        .split(',')
+        .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
+}
+
+/// Detect and validate an HTTP `Upgrade` attempt before any route lookup,
+/// credential resolution, or upstream connection.
+///
+/// Per RFC 6455, a valid classic WebSocket handshake requires `GET`,
+/// `HTTP/1.1`, single well-formed `Connection`/`Upgrade`/`Host`/
+/// `Sec-WebSocket-Key`/`Sec-WebSocket-Version` headers, no request body,
+/// and no `Transfer-Encoding`. Anything recognized as an upgrade attempt
+/// that doesn't meet this bar is rejected as malformed rather than
+/// forwarded upstream.
+pub(crate) fn classify_upgrade_attempt(
+    method: &str,
+    version: &str,
+    header_bytes: &[u8],
+) -> UpgradeAttempt {
+    let Some(pairs) = header_pairs(header_bytes) else {
+        return UpgradeAttempt::None;
+    };
+
+    let connection_values = header_values(&pairs, "connection");
+    let upgrade_values = header_values(&pairs, "upgrade");
+
+    let is_attempt = !upgrade_values.is_empty()
+        || connection_values
+            .iter()
+            .any(|v| connection_has_upgrade_token(v));
+    if !is_attempt {
+        return UpgradeAttempt::None;
+    }
+
+    if method != "GET" || version != "HTTP/1.1" {
+        return UpgradeAttempt::Malformed("upgrade requires GET over HTTP/1.1");
+    }
+
+    if connection_values.len() != 1 || !connection_has_upgrade_token(connection_values[0]) {
+        return UpgradeAttempt::Malformed("missing or duplicate Connection: upgrade");
+    }
+
+    if upgrade_values.len() != 1 {
+        return UpgradeAttempt::Malformed("missing or duplicate Upgrade header");
+    }
+    if !upgrade_values[0].eq_ignore_ascii_case("websocket") {
+        return UpgradeAttempt::Malformed("unsupported upgrade protocol");
+    }
+
+    let host_values = header_values(&pairs, "host");
+    if host_values.len() != 1 || host_values[0].is_empty() {
+        return UpgradeAttempt::Malformed("missing or duplicate Host header");
+    }
+
+    let key_values = header_values(&pairs, "sec-websocket-key");
+    if key_values.len() != 1 {
+        return UpgradeAttempt::Malformed("missing or duplicate Sec-WebSocket-Key");
+    }
+    let Ok(decoded_key) =
+        base64::engine::general_purpose::STANDARD.decode(key_values[0].as_bytes())
+    else {
+        return UpgradeAttempt::Malformed("invalid Sec-WebSocket-Key encoding");
+    };
+    if decoded_key.len() != 16 {
+        return UpgradeAttempt::Malformed("invalid Sec-WebSocket-Key length");
+    }
+
+    let version_values = header_values(&pairs, "sec-websocket-version");
+    if version_values.len() != 1 {
+        return UpgradeAttempt::Malformed("missing or duplicate Sec-WebSocket-Version");
+    }
+    if version_values[0].trim() != "13" {
+        return UpgradeAttempt::Malformed("unsupported Sec-WebSocket-Version");
+    }
+
+    if !header_values(&pairs, "transfer-encoding").is_empty() {
+        return UpgradeAttempt::Malformed("transfer encoding not permitted for upgrade");
+    }
+
+    let content_length_values = header_values(&pairs, "content-length");
+    match content_length_values.len() {
+        0 => {}
+        1 => {
+            let Ok(len) = content_length_values[0].parse::<usize>() else {
+                return UpgradeAttempt::Malformed("invalid Content-Length");
+            };
+            if len != 0 {
+                return UpgradeAttempt::Malformed("request body not permitted for upgrade");
+            }
+        }
+        _ => return UpgradeAttempt::Malformed("duplicate Content-Length header"),
+    }
+
+    UpgradeAttempt::Valid
 }
 
 fn validate_http_upstream_target(
@@ -1897,6 +2107,63 @@ async fn send_error(stream: &mut TcpStream, status: u16, reason: &str) -> Result
     stream.write_all(response.as_bytes()).await?;
     stream.flush().await?;
     Ok(())
+}
+
+/// Send an HTTP error response with an explicit `Connection: close`.
+///
+/// Used for upgrade rejection: the client must not assume it can retry the
+/// handshake or send further data on this connection.
+async fn send_error_with_close(stream: &mut TcpStream, status: u16, reason: &str) -> Result<()> {
+    let body = format!("{{\"error\":\"{}\"}}", reason);
+    let response = format!(
+        "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
+        status,
+        reason,
+        body.len(),
+        body
+    );
+    stream.write_all(response.as_bytes()).await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+/// Emit a secret-free audit event for a rejected upgrade attempt.
+///
+/// No route has been resolved yet, so `target` falls back to the `Host`
+/// header (or `-` if absent/malformed) rather than a route id.
+fn log_upgrade_rejection(
+    ctx: &ReverseProxyCtx<'_>,
+    method: &str,
+    path: &str,
+    header_bytes: &[u8],
+    action: &str,
+    reason: &str,
+) {
+    let target = header_pairs(header_bytes)
+        .and_then(|pairs| {
+            pairs
+                .iter()
+                .find(|(name, _)| name == "host")
+                .map(|(_, v)| (*v).to_string())
+        })
+        .unwrap_or_else(|| "-".to_string());
+
+    audit::log_l7_policy_decision(
+        ctx.audit_log,
+        audit::ProxyMode::Reverse,
+        &audit::EventContext {
+            denial_category: Some(nono::undo::NetworkAuditDenialCategory::UnsupportedUpgrade),
+            ..audit::EventContext::default()
+        },
+        &target,
+        None,
+        method,
+        path,
+        nono::undo::NetworkAuditDecision::Deny,
+        action,
+        "upgrade",
+        Some(reason),
+    );
 }
 
 // ============================================================================
@@ -2410,6 +2677,138 @@ mod tests {
         let (service, path) = parse_service_prefix("/anthropic").unwrap();
         assert_eq!(service, "anthropic");
         assert_eq!(path, "/");
+    }
+
+    /// RFC 6455 section 1.2 example handshake headers (16-byte nonce key).
+    const VALID_WS_HEADERS: &[u8] = b"Host: chatgpt.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+
+    #[test]
+    fn test_classify_upgrade_not_an_attempt() {
+        let headers = b"Host: chatgpt.com\r\nContent-Type: application/json\r\n\r\n";
+        assert_eq!(
+            classify_upgrade_attempt("POST", "HTTP/1.1", headers),
+            UpgradeAttempt::None
+        );
+    }
+
+    #[test]
+    fn test_classify_upgrade_valid_handshake() {
+        assert_eq!(
+            classify_upgrade_attempt("GET", "HTTP/1.1", VALID_WS_HEADERS),
+            UpgradeAttempt::Valid
+        );
+    }
+
+    #[test]
+    fn test_classify_upgrade_case_insensitive_headers_and_tokens() {
+        let headers = b"host: chatgpt.com\r\nUPGRADE: WebSocket\r\nconnection: keep-alive, Upgrade\r\nsec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\nSEC-WEBSOCKET-VERSION: 13\r\n\r\n";
+        assert_eq!(
+            classify_upgrade_attempt("GET", "HTTP/1.1", headers),
+            UpgradeAttempt::Valid
+        );
+    }
+
+    #[test]
+    fn test_classify_upgrade_content_length_zero_still_valid() {
+        let mut headers = VALID_WS_HEADERS[..VALID_WS_HEADERS.len() - 2].to_vec();
+        headers.extend_from_slice(b"Content-Length: 0\r\n\r\n");
+        assert_eq!(
+            classify_upgrade_attempt("GET", "HTTP/1.1", &headers),
+            UpgradeAttempt::Valid
+        );
+    }
+
+    #[test]
+    fn test_classify_upgrade_rejects_request_body() {
+        let mut headers = VALID_WS_HEADERS[..VALID_WS_HEADERS.len() - 2].to_vec();
+        headers.extend_from_slice(b"Content-Length: 5\r\n\r\n");
+        assert!(matches!(
+            classify_upgrade_attempt("GET", "HTTP/1.1", &headers),
+            UpgradeAttempt::Malformed(_)
+        ));
+    }
+
+    #[test]
+    fn test_classify_upgrade_rejects_transfer_encoding() {
+        let mut headers = VALID_WS_HEADERS[..VALID_WS_HEADERS.len() - 2].to_vec();
+        headers.extend_from_slice(b"Transfer-Encoding: chunked\r\n\r\n");
+        assert!(matches!(
+            classify_upgrade_attempt("GET", "HTTP/1.1", &headers),
+            UpgradeAttempt::Malformed(_)
+        ));
+    }
+
+    #[test]
+    fn test_classify_upgrade_rejects_duplicate_sec_websocket_key() {
+        let mut headers = VALID_WS_HEADERS[..VALID_WS_HEADERS.len() - 2].to_vec();
+        headers.extend_from_slice(b"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n");
+        assert!(matches!(
+            classify_upgrade_attempt("GET", "HTTP/1.1", &headers),
+            UpgradeAttempt::Malformed(_)
+        ));
+    }
+
+    #[test]
+    fn test_classify_upgrade_rejects_duplicate_connection() {
+        let mut headers = VALID_WS_HEADERS[..VALID_WS_HEADERS.len() - 2].to_vec();
+        headers.extend_from_slice(b"Connection: Upgrade\r\n\r\n");
+        assert!(matches!(
+            classify_upgrade_attempt("GET", "HTTP/1.1", &headers),
+            UpgradeAttempt::Malformed(_)
+        ));
+    }
+
+    #[test]
+    fn test_classify_upgrade_rejects_missing_host() {
+        let headers = b"Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+        assert!(matches!(
+            classify_upgrade_attempt("GET", "HTTP/1.1", headers),
+            UpgradeAttempt::Malformed(_)
+        ));
+    }
+
+    #[test]
+    fn test_classify_upgrade_rejects_unsupported_version() {
+        let headers = b"Host: chatgpt.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 8\r\n\r\n";
+        assert!(matches!(
+            classify_upgrade_attempt("GET", "HTTP/1.1", headers),
+            UpgradeAttempt::Malformed(_)
+        ));
+    }
+
+    #[test]
+    fn test_classify_upgrade_rejects_non_websocket_protocol() {
+        let headers = b"Host: chatgpt.com\r\nUpgrade: h2c\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+        assert!(matches!(
+            classify_upgrade_attempt("GET", "HTTP/1.1", headers),
+            UpgradeAttempt::Malformed(_)
+        ));
+    }
+
+    #[test]
+    fn test_classify_upgrade_rejects_bad_key_length() {
+        // "short" base64-encodes to fewer than 16 bytes.
+        let headers = b"Host: chatgpt.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: c2hvcnQ=\r\nSec-WebSocket-Version: 13\r\n\r\n";
+        assert!(matches!(
+            classify_upgrade_attempt("GET", "HTTP/1.1", headers),
+            UpgradeAttempt::Malformed(_)
+        ));
+    }
+
+    #[test]
+    fn test_classify_upgrade_rejects_non_get_method() {
+        assert!(matches!(
+            classify_upgrade_attempt("POST", "HTTP/1.1", VALID_WS_HEADERS),
+            UpgradeAttempt::Malformed(_)
+        ));
+    }
+
+    #[test]
+    fn test_classify_upgrade_rejects_http_1_0() {
+        assert!(matches!(
+            classify_upgrade_attempt("GET", "HTTP/1.0", VALID_WS_HEADERS),
+            UpgradeAttempt::Malformed(_)
+        ));
     }
 
     #[test]

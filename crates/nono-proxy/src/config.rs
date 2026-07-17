@@ -821,6 +821,35 @@ pub struct RouteConfig {
     /// See `SpiffeAuthConfig` for JWT-SVID options.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spiffe: Option<SpiffeAuthConfig>,
+
+    /// Optional allow-list of WebSocket upgrade targets for this route.
+    ///
+    /// When a client requests an HTTP `Upgrade` on this route, it is only
+    /// tunneled if it matches one of these rules by protocol, method, and
+    /// exact path. Empty (the default) permits no upgrades — the request is
+    /// rejected before any upstream contact is made.
+    #[serde(default)]
+    pub upgrades: Vec<UpgradeRuleConfig>,
+}
+
+/// Protocol an [`UpgradeRuleConfig`] allows tunneling for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpgradeProtocol {
+    Websocket,
+}
+
+/// A single allow-listed WebSocket upgrade target for a reverse proxy route.
+///
+/// `origin` must be an https origin already present in the owning
+/// credential provider's `api_hosts`; `path` is matched exactly (no globs).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpgradeRuleConfig {
+    pub protocol: UpgradeProtocol,
+    pub origin: String,
+    pub method: String,
+    pub path: String,
 }
 
 /// SPIFFE/SPIRE auth for an upstream route.
@@ -1012,6 +1041,53 @@ pub enum EndpointPolicyOutcome<'a> {
         timeout_secs: Option<u64>,
         rule_label: String,
     },
+}
+
+/// Pre-compiled WebSocket upgrade allow-list for the request hot path.
+///
+/// Built once at proxy startup from `UpgradeRuleConfig` entries already
+/// filtered to this route's own upstream (origin is implicit once a rule
+/// reaches here, so only protocol/method/path need to be checked).
+#[derive(Debug, Default)]
+pub struct CompiledUpgradeRules {
+    rules: Vec<CompiledUpgradeRule>,
+}
+
+#[derive(Debug)]
+struct CompiledUpgradeRule {
+    protocol: UpgradeProtocol,
+    method: String,
+    path: String,
+}
+
+impl CompiledUpgradeRules {
+    /// Compile upgrade rules for one route. There is no glob support here —
+    /// `path` is matched exactly (after normalization) on purpose, since
+    /// upgrade targets are a small fixed set of endpoints, not a broad API
+    /// surface.
+    pub fn compile(rules: &[UpgradeRuleConfig]) -> Result<Self, String> {
+        let compiled = rules
+            .iter()
+            .map(|r| CompiledUpgradeRule {
+                protocol: r.protocol.clone(),
+                method: r.method.clone(),
+                path: normalize_path(&r.path),
+            })
+            .collect();
+        Ok(Self { rules: compiled })
+    }
+
+    /// `true` if `protocol`+`method`+`path` matches one of the compiled
+    /// rules. `path` is normalized (query string stripped, percent-decoded,
+    /// trailing slash removed) before comparison so callers can pass the raw
+    /// request path.
+    #[must_use]
+    pub fn matches(&self, protocol: &UpgradeProtocol, method: &str, path: &str) -> bool {
+        let normalized = normalize_path(path);
+        self.rules.iter().any(|r| {
+            r.protocol == *protocol && r.method.eq_ignore_ascii_case(method) && r.path == normalized
+        })
+    }
 }
 
 impl CompiledEndpointRules {

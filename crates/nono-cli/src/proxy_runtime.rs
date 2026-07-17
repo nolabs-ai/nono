@@ -2485,6 +2485,12 @@ fn synthesize_credential_provider_proxy_config(
         let endpoint_policy = route.endpoint_policy.clone();
         for (index, api_host) in provider.api_hosts.iter().enumerate() {
             let prefix = provider_route_prefix(&route.name, index, provider.api_hosts.len());
+            let upgrades: Vec<nono_proxy::config::UpgradeRuleConfig> = route
+                .upgrades
+                .iter()
+                .filter(|rule| &rule.origin == api_host)
+                .cloned()
+                .collect();
             proxy_config.routes.push(nono_proxy::config::RouteConfig {
                 prefix: prefix.clone(),
                 upstream: api_host.clone(),
@@ -2512,6 +2518,7 @@ fn synthesize_credential_provider_proxy_config(
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                upgrades,
             });
             consumers_by_provider
                 .entry(route.provider.clone())
@@ -3892,6 +3899,7 @@ mod tests {
             oauth2: None,
             aws_auth: None,
             spiffe: None,
+            upgrades: vec![],
         });
         let credential_env_vars = vec![
             (
@@ -4780,6 +4788,7 @@ mod tests {
                 env_var: Some("OPENAI_API_KEY".to_string()),
                 base_url_env_var: Some("OPENAI_BASE_URL".to_string()),
                 endpoint_policy: None,
+                upgrades: vec![],
             }],
             ..ProxyLaunchOptions::default()
         };

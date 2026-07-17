@@ -1816,33 +1816,13 @@ pub(crate) fn filter_headers(header_bytes: &[u8], cred_header: &str) -> Vec<(Str
 /// given credential header (if any) are stripped.
 pub(crate) fn filter_headers_for_upgrade(
     header_bytes: &[u8],
-    cred_header: &str,
-) -> Vec<(String, String)> {
-    let header_str = std::str::from_utf8(header_bytes).unwrap_or("");
-    let cred_header_lower = if cred_header.is_empty() {
-        String::new()
-    } else {
-        format!("{}:", cred_header.to_lowercase())
-    };
-    let mut headers = Vec::new();
-
-    for line in header_str.lines() {
-        let lower = line.to_lowercase();
-        if lower.starts_with("host:")
-            || lower.starts_with("content-length:")
-            || lower.starts_with("proxy-connection:")
-            || lower.starts_with("proxy-authorization:")
-            || (!cred_header_lower.is_empty() && lower.starts_with(&cred_header_lower))
-            || line.trim().is_empty()
-        {
-            continue;
-        }
-        if let Some((name, value)) = line.split_once(':') {
-            headers.push((name.trim().to_string(), value.trim().to_string()));
-        }
-    }
-
-    headers
+    credential_headers: &[String],
+) -> Result<Vec<crate::tls_intercept::http1::HeaderField>> {
+    let fields = crate::tls_intercept::http1::parse_header_fields(header_bytes)?;
+    Ok(crate::tls_intercept::http1::filter_websocket_request(
+        &fields,
+        credential_headers,
+    ))
 }
 
 /// Extract Content-Length value from raw headers.
@@ -1893,15 +1873,6 @@ pub(crate) fn header_pairs(header_bytes: &[u8]) -> Option<Vec<(String, &str)>> {
     Some(pairs)
 }
 
-/// Count occurrences and collect values of a lowercased header name.
-pub(crate) fn header_values<'a>(pairs: &'a [(String, &'a str)], name: &str) -> Vec<&'a str> {
-    pairs
-        .iter()
-        .filter(|(n, _)| n == name)
-        .map(|(_, v)| *v)
-        .collect()
-}
-
 /// Check whether a `Connection` header value's comma-separated tokens
 /// include `upgrade` (case-insensitive).
 pub(crate) fn connection_has_upgrade_token(value: &str) -> bool {
@@ -1924,12 +1895,20 @@ pub(crate) fn classify_upgrade_attempt(
     version: &str,
     header_bytes: &[u8],
 ) -> UpgradeAttempt {
-    let Some(pairs) = header_pairs(header_bytes) else {
-        return UpgradeAttempt::None;
+    let pairs = match crate::tls_intercept::http1::parse_header_fields(header_bytes) {
+        Ok(fields) => fields,
+        Err(_) => {
+            let text = String::from_utf8_lossy(header_bytes).to_ascii_lowercase();
+            return if text.contains("upgrade") {
+                UpgradeAttempt::Malformed("malformed HTTP headers in upgrade request")
+            } else {
+                UpgradeAttempt::None
+            };
+        }
     };
 
-    let connection_values = header_values(&pairs, "connection");
-    let upgrade_values = header_values(&pairs, "upgrade");
+    let connection_values = crate::tls_intercept::http1::values(&pairs, "connection");
+    let upgrade_values = crate::tls_intercept::http1::values(&pairs, "upgrade");
 
     let is_attempt = !upgrade_values.is_empty()
         || connection_values
@@ -1954,12 +1933,12 @@ pub(crate) fn classify_upgrade_attempt(
         return UpgradeAttempt::Malformed("unsupported upgrade protocol");
     }
 
-    let host_values = header_values(&pairs, "host");
+    let host_values = crate::tls_intercept::http1::values(&pairs, "host");
     if host_values.len() != 1 || host_values[0].is_empty() {
         return UpgradeAttempt::Malformed("missing or duplicate Host header");
     }
 
-    let key_values = header_values(&pairs, "sec-websocket-key");
+    let key_values = crate::tls_intercept::http1::values(&pairs, "sec-websocket-key");
     if key_values.len() != 1 {
         return UpgradeAttempt::Malformed("missing or duplicate Sec-WebSocket-Key");
     }
@@ -1972,7 +1951,7 @@ pub(crate) fn classify_upgrade_attempt(
         return UpgradeAttempt::Malformed("invalid Sec-WebSocket-Key length");
     }
 
-    let version_values = header_values(&pairs, "sec-websocket-version");
+    let version_values = crate::tls_intercept::http1::values(&pairs, "sec-websocket-version");
     if version_values.len() != 1 {
         return UpgradeAttempt::Malformed("missing or duplicate Sec-WebSocket-Version");
     }
@@ -1980,11 +1959,11 @@ pub(crate) fn classify_upgrade_attempt(
         return UpgradeAttempt::Malformed("unsupported Sec-WebSocket-Version");
     }
 
-    if !header_values(&pairs, "transfer-encoding").is_empty() {
+    if !crate::tls_intercept::http1::values(&pairs, "transfer-encoding").is_empty() {
         return UpgradeAttempt::Malformed("transfer encoding not permitted for upgrade");
     }
 
-    let content_length_values = header_values(&pairs, "content-length");
+    let content_length_values = crate::tls_intercept::http1::values(&pairs, "content-length");
     match content_length_values.len() {
         0 => {}
         1 => {
@@ -2807,6 +2786,15 @@ mod tests {
     fn test_classify_upgrade_rejects_http_1_0() {
         assert!(matches!(
             classify_upgrade_attempt("GET", "HTTP/1.0", VALID_WS_HEADERS),
+            UpgradeAttempt::Malformed(_)
+        ));
+    }
+
+    #[test]
+    fn test_classify_upgrade_rejects_whitespace_before_header_colon() {
+        let headers = b"Host : chatgpt.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+        assert!(matches!(
+            classify_upgrade_attempt("GET", "HTTP/1.1", headers),
             UpgradeAttempt::Malformed(_)
         ));
     }

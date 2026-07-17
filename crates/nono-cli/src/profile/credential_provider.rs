@@ -118,11 +118,18 @@ pub struct CredentialRouteDef {
     pub base_url_env_var: Option<String>,
     #[serde(default)]
     pub endpoint_policy: Option<nono_proxy::config::EndpointPolicyConfig>,
-    /// Allow-listed WebSocket upgrade targets for this route. Each rule's
-    /// `origin` must be one of the provider's `api_hosts`; `method` must be
-    /// `"GET"`. Empty (the default) grants no upgrades.
+    /// Allow-listed classic WebSocket targets for this route. Each origin
+    /// must be one of the provider's HTTPS `api_hosts`. Classic WebSockets
+    /// imply HTTP/1.1 GET, so neither is configurable here.
     #[serde(default)]
-    pub upgrades: Vec<nono_proxy::config::UpgradeRuleConfig>,
+    pub upgrades: Vec<CredentialWebSocketRuleDef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CredentialWebSocketRuleDef {
+    pub origin: String,
+    pub path: String,
 }
 
 pub(super) fn validate_credential_provider_entries(profile: &Profile) -> Result<()> {
@@ -241,16 +248,6 @@ fn validate_credential_provider_references(profile: &Profile) -> Result<()> {
                     "{context}.origin '{}' is not in provider '{}'.api_hosts",
                     rule.origin, route.provider
                 )));
-            }
-            match rule.protocol {
-                nono_proxy::config::UpgradeProtocol::Websocket => {
-                    if rule.method != "GET" {
-                        return Err(NonoError::ProfileParse(format!(
-                            "{context}.method must be 'GET' for a websocket upgrade, got '{}'",
-                            rule.method
-                        )));
-                    }
-                }
             }
         }
     }

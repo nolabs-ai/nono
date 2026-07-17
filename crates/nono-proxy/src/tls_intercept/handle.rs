@@ -22,9 +22,8 @@ use crate::oauth_capture::OAuthCaptureStore;
 use crate::reverse;
 use crate::route::RouteStore;
 use crate::tls_intercept::cert_cache::CertCache;
-use crate::tls_intercept::{acceptor, h2_forward};
+use crate::tls_intercept::{acceptor, h2_forward, websocket};
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsAcceptor;
@@ -354,7 +353,19 @@ pub(crate) enum RouteSelection<'a> {
     /// Endpoint policy authorized the request. The selected route (if any) is
     /// the one whose credential should be injected; `None` means forward
     /// without credentials (passthrough).
-    Selected(Option<(&'a str, &'a crate::route::LoadedRoute)>),
+    Selected(Option<SelectedRoute<'a>>),
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct SelectedRoute<'a> {
+    pub id: &'a str,
+    pub route: &'a crate::route::LoadedRoute,
+}
+
+pub(crate) struct InterceptRouteRequest<'a> {
+    pub method: &'a str,
+    pub path: &'a str,
+    pub websocket_path: Option<&'a str>,
 }
 
 /// Evaluate endpoint policy for every candidate route on an intercepted
@@ -376,11 +387,12 @@ pub(crate) async fn select_intercept_route<'a>(
     route_store: &'a RouteStore,
     host: &str,
     port: u16,
-    method: &str,
-    path: &str,
+    request: InterceptRouteRequest<'_>,
     audit_log: Option<&audit::SharedAuditLog>,
     approval_backends: Option<&crate::approval::ApprovalBackendRegistry>,
 ) -> RouteSelection<'a> {
+    let method = request.method;
+    let path = request.path;
     let host_port = format!("{}:{}", host.to_lowercase(), port);
     let candidates = route_store.lookup_all_by_upstream(&host_port);
     if candidates.is_empty() {
@@ -398,6 +410,12 @@ pub(crate) async fn select_intercept_route<'a>(
     let mut has_endpoint_only_route = false;
     let mut endpoint_authorized = false;
     for (prefix, route) in &candidates {
+        if request
+            .websocket_path
+            .is_some_and(|upgrade_path| !route.upgrade_rules.matches(upgrade_path))
+        {
+            continue;
+        }
         if route.endpoint_policy.allows_all_without_l7() {
             if route.requires_managed_credential {
                 catchall_cred.push((prefix, route));
@@ -750,6 +768,20 @@ pub(crate) async fn select_intercept_route<'a>(
         .copied()
         .or_else(|| matched_passthrough.first().copied())
         .or_else(|| catchall_passthrough.first().copied());
+    if request.websocket_path.is_some() && selected.is_none() {
+        audit::log_denied(
+            audit_log,
+            audit::ProxyMode::ConnectIntercept,
+            &audit::EventContext {
+                denial_category: Some(nono::undo::NetworkAuditDenialCategory::UnsupportedUpgrade),
+                ..audit::EventContext::default()
+            },
+            host,
+            port,
+            "no matching WebSocket upgrade rule",
+        );
+        return RouteSelection::Rejected(403);
+    }
     match selected.map(|(s, _)| s) {
         Some(svc) => debug!(
             "tls_intercept: selected route '{}' for {} {}",
@@ -760,7 +792,7 @@ pub(crate) async fn select_intercept_route<'a>(
             method, path
         ),
     }
-    RouteSelection::Selected(selected)
+    RouteSelection::Selected(selected.map(|(id, route)| SelectedRoute { id, route }))
 }
 
 /// A managed credential resolved for an intercept request. Borrowed for static
@@ -979,8 +1011,11 @@ where
             &ctx.route_store,
             ctx.host,
             ctx.port,
-            &method,
-            &path,
+            InterceptRouteRequest {
+                method: &method,
+                path: &path,
+                websocket_path: is_websocket_upgrade.then_some(path.as_str()),
+            },
             ctx.audit_log,
             ctx.approval_backends.as_ref(),
         )
@@ -997,8 +1032,30 @@ where
             RouteSelection::Selected(selected) => selected,
         }
     };
-    let service: Option<&str> = selected.map(|(s, _)| s);
-    let route: Option<&crate::route::LoadedRoute> = selected.map(|(_, r)| r);
+    let service = selected.map(|selected| selected.id);
+    let route = selected.map(|selected| selected.route);
+
+    if is_websocket_upgrade
+        && (route.is_some_and(|rt| rt.has_spiffe_source())
+            || service
+                .and_then(|s| ctx.credential_store.get_aws(s))
+                .is_some())
+    {
+        audit::log_denied(
+            ctx.audit_log,
+            audit::ProxyMode::ConnectIntercept,
+            &audit::EventContext {
+                route_id: service,
+                denial_category: Some(nono::undo::NetworkAuditDenialCategory::UnsupportedUpgrade),
+                ..audit::EventContext::default()
+            },
+            ctx.host,
+            ctx.port,
+            "WebSocket upgrade is unsupported for this authentication mechanism",
+        );
+        reverse::send_error_generic(tls_stream, 501, "Not Implemented").await?;
+        return Ok(());
+    }
 
     // SPIFFE routes bypass the normal credential resolution path entirely and
     // use mTLS / JWT-SVID auth instead of injected headers.
@@ -1057,28 +1114,6 @@ where
     // ordinary managed-credential/passthrough routes on identical L7 policy,
     // while still refusing to tunnel anything not explicitly allow-listed.
     if is_websocket_upgrade {
-        let allowed = route.is_some_and(|r| {
-            r.upgrade_rules
-                .matches(&crate::config::UpgradeProtocol::Websocket, &method, &path)
-        });
-        if !allowed {
-            audit::log_denied(
-                ctx.audit_log,
-                audit::ProxyMode::ConnectIntercept,
-                &audit::EventContext {
-                    route_id: service,
-                    denial_category: Some(
-                        nono::undo::NetworkAuditDenialCategory::UnsupportedUpgrade,
-                    ),
-                    ..audit::EventContext::default()
-                },
-                ctx.host,
-                ctx.port,
-                "no matching upgrade rule",
-            );
-            reverse::send_error_generic(tls_stream, 403, "Forbidden").await?;
-            return Ok(());
-        }
         return handle_websocket_upgrade(tls_stream, ctx, route, service, &req, cred).await;
     }
 
@@ -1521,6 +1556,10 @@ pub(crate) fn resolve_nonce_in_header_value(
     Some(format!("{}{}{}", &value[..start], real_str, &value[end..]))
 }
 
+fn contains_phantom_nonce(value: &str) -> bool {
+    value.contains("nono_")
+}
+
 /// Handle the AWS SigV4 arm of an intercepted inner request.
 ///
 /// Owns the full pipeline for that credential type: header stripping, body reading,
@@ -1694,115 +1733,6 @@ where
     Ok(())
 }
 
-/// Timeout waiting for the upstream's response to a proxied WebSocket
-/// handshake. Generous because slow upstream auth on the handshake itself is
-/// common, but bounded so a stalled upstream can't hang the client
-/// indefinitely — the original bug this feature fixes.
-const UPSTREAM_UPGRADE_HEADER_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// The raw upstream response to a WebSocket handshake attempt, captured
-/// before deciding whether to tunnel or relay it verbatim.
-struct UpstreamHandshakeResponse {
-    status: u16,
-    /// Status line including its trailing `\r\n`.
-    status_line_raw: String,
-    /// Header lines including their trailing `\r\n`s, excluding the blank
-    /// terminator line.
-    header_bytes: Vec<u8>,
-    /// Bytes already pulled into the read buffer beyond the headers.
-    leftover: Vec<u8>,
-}
-
-/// Read one HTTP/1.1 response (status line + headers) from `upstream`,
-/// capped at [`MAX_HEADER_SIZE`] and [`UPSTREAM_UPGRADE_HEADER_TIMEOUT`].
-async fn read_upstream_ws_response<U>(
-    upstream: &mut U,
-    host: &str,
-) -> Result<UpstreamHandshakeResponse>
-where
-    U: tokio::io::AsyncRead + Unpin,
-{
-    let read = async {
-        let mut buf_reader = BufReader::new(&mut *upstream);
-        let mut status_line = String::new();
-        let n = buf_reader.read_line(&mut status_line).await?;
-        if n == 0 {
-            return Err(ProxyError::UpstreamConnect {
-                host: host.to_string(),
-                reason: "upstream closed before sending an upgrade response".to_string(),
-            });
-        }
-        let status = parse_response_status_line(&status_line)?;
-
-        let mut header_bytes = Vec::new();
-        loop {
-            let mut line = String::new();
-            let n = buf_reader.read_line(&mut line).await?;
-            if n == 0 || line.trim().is_empty() {
-                break;
-            }
-            header_bytes.extend_from_slice(line.as_bytes());
-            if header_bytes.len() > MAX_HEADER_SIZE {
-                return Err(ProxyError::UpstreamConnect {
-                    host: host.to_string(),
-                    reason: "upstream upgrade response headers exceeded size limit".to_string(),
-                });
-            }
-        }
-        let leftover = buf_reader.buffer().to_vec();
-        Ok(UpstreamHandshakeResponse {
-            status,
-            status_line_raw: status_line,
-            header_bytes,
-            leftover,
-        })
-    };
-
-    match tokio::time::timeout(UPSTREAM_UPGRADE_HEADER_TIMEOUT, read).await {
-        Ok(result) => result,
-        Err(_) => Err(ProxyError::UpstreamConnect {
-            host: host.to_string(),
-            reason: "timed out waiting for upstream upgrade response".to_string(),
-        }),
-    }
-}
-
-fn parse_response_status_line(line: &str) -> Result<u16> {
-    let mut parts = line.split_whitespace();
-    let version = parts.next().ok_or_else(|| {
-        ProxyError::HttpParse(format!("malformed upstream status line: {}", line))
-    })?;
-    if !version.starts_with("HTTP/") {
-        return Err(ProxyError::HttpParse(format!(
-            "malformed upstream status line: {}",
-            line
-        )));
-    }
-    let code = parts.next().ok_or_else(|| {
-        ProxyError::HttpParse(format!("malformed upstream status line: {}", line))
-    })?;
-    code.parse::<u16>()
-        .map_err(|_| ProxyError::HttpParse(format!("malformed upstream status code: {}", code)))
-}
-
-/// Validate that an upstream response completes an RFC 6455 handshake:
-/// `101` status plus a `Connection: upgrade` token and `Upgrade: websocket`.
-fn is_valid_websocket_handshake_response(status: u16, header_bytes: &[u8]) -> bool {
-    status == 101
-        && match reverse::header_pairs(header_bytes) {
-            Some(pairs) => {
-                let connection_ok = reverse::header_values(&pairs, "connection")
-                    .iter()
-                    .any(|v| reverse::connection_has_upgrade_token(v));
-                let upgrade_ok = reverse::header_values(&pairs, "upgrade")
-                    .iter()
-                    .any(|v| v.eq_ignore_ascii_case("websocket"));
-                connection_ok && upgrade_ok
-            }
-            None => false,
-        }
-}
-
 /// Tunnel an authenticated WebSocket upgrade to its upstream.
 ///
 /// Reuses the same header filtering, credential injection, and nonce
@@ -1850,37 +1780,34 @@ where
         None => return Ok(()),
     };
 
-    let strip_header = cred.map(|c| c.proxy_header_name.as_str()).unwrap_or("");
-    let filtered_headers = reverse::filter_headers_for_upgrade(&req.header_bytes, strip_header);
-
     let upstream_authority = reverse::format_host_header(UpstreamScheme::Https, ctx.host, ctx.port);
-    let mut request = Zeroizing::new(format!(
-        "{} {} {}\r\nHost: {}\r\n",
-        req.method, req.path, req.version, upstream_authority
-    ));
-    if let Some(cred) = cred {
-        reverse::inject_credential_for_mode(cred, &mut request);
-    }
-    let injected_header_names = reverse::injected_credential_header_names(cred);
-    let nonce_consumer = service.map(|s| format!("proxy.{s}"));
-    for (name, value) in &filtered_headers {
-        if injected_header_names
-            .iter()
-            .any(|header| name.eq_ignore_ascii_case(header))
-        {
-            continue;
+    let request = match build_websocket_upstream_request(
+        req,
+        &upstream_authority,
+        cred,
+        service,
+        ctx.nonce_resolver.as_deref(),
+    ) {
+        Ok(request) => request,
+        Err(error) => {
+            audit::log_denied(
+                ctx.audit_log,
+                audit::ProxyMode::ConnectIntercept,
+                &audit::EventContext {
+                    route_id: service,
+                    denial_category: Some(
+                        nono::undo::NetworkAuditDenialCategory::ManagedCredentialUnavailable,
+                    ),
+                    ..audit::EventContext::default()
+                },
+                ctx.host,
+                ctx.port,
+                &error.to_string(),
+            );
+            reverse::send_error_generic(tls_stream, 403, "Forbidden").await?;
+            return Ok(());
         }
-        let resolved_value = nonce_consumer
-            .as_deref()
-            .and_then(|consumer| {
-                ctx.nonce_resolver
-                    .as_deref()
-                    .and_then(|resolver| resolve_nonce_in_header_value(value, consumer, resolver))
-            })
-            .unwrap_or_else(|| value.clone());
-        request.push_str(&format!("{}: {}\r\n", name, resolved_value));
-    }
-    request.push_str("\r\n");
+    };
 
     let connector = route
         .and_then(|r| r.tls_connector.as_ref())
@@ -1938,7 +1865,7 @@ where
         return Ok(());
     }
 
-    let handshake = match read_upstream_ws_response(&mut upstream, ctx.host).await {
+    let handshake = match websocket::read_response(&mut upstream, ctx.host).await {
         Ok(h) => h,
         Err(e) => {
             warn!("tls_intercept: WS upstream handshake read failed: {}", e);
@@ -1955,7 +1882,7 @@ where
         }
     };
 
-    if !is_valid_websocket_handshake_response(handshake.status, &handshake.header_bytes) {
+    if !websocket::is_valid_response(handshake.status, &handshake.header_bytes) {
         warn!(
             "tls_intercept: upstream WS handshake response invalid (status {})",
             handshake.status
@@ -1979,9 +1906,15 @@ where
             .await?;
         tls_stream.write_all(&handshake.header_bytes).await?;
         tls_stream.write_all(b"\r\n").await?;
-        tls_stream.write_all(&handshake.leftover).await?;
         tls_stream.flush().await?;
-        let _ = tokio::io::copy(&mut upstream, tls_stream).await;
+        super::http1::relay_response_body(
+            &mut upstream,
+            tls_stream,
+            handshake.status,
+            &handshake.header_fields,
+            handshake.leftover,
+        )
+        .await?;
         return Ok(());
     }
 
@@ -2024,6 +1957,46 @@ where
     Ok(())
 }
 
+fn build_websocket_upstream_request(
+    req: &ParsedRequest,
+    upstream_authority: &str,
+    cred: Option<&crate::credential::LoadedCredential>,
+    service: Option<&str>,
+    nonce_resolver: Option<&dyn crate::token::NonceResolver>,
+) -> Result<Zeroizing<String>> {
+    let injected_header_names = reverse::injected_credential_header_names(cred);
+    let filtered_headers =
+        reverse::filter_headers_for_upgrade(&req.header_bytes, &injected_header_names)?;
+    let mut request = Zeroizing::new(format!(
+        "{} {} {}\r\nHost: {}\r\n",
+        req.method, req.path, req.version, upstream_authority
+    ));
+    if let Some(cred) = cred {
+        reverse::inject_credential_for_mode(cred, &mut request);
+    }
+    let nonce_consumer = service.map(|name| format!("proxy.{name}"));
+    for field in filtered_headers {
+        let resolved_value = if contains_phantom_nonce(&field.value) {
+            let consumer = nonce_consumer.as_deref().ok_or_else(|| {
+                ProxyError::Credential("phantom nonce has no selected route consumer".to_string())
+            })?;
+            let resolver = nonce_resolver.ok_or_else(|| {
+                ProxyError::Credential("phantom nonce resolver is unavailable".to_string())
+            })?;
+            resolve_nonce_in_header_value(&field.value, consumer, resolver).ok_or_else(|| {
+                ProxyError::Credential(
+                    "phantom nonce is invalid, expired, or not admitted for this route".to_string(),
+                )
+            })?
+        } else {
+            field.value
+        };
+        request.push_str(&format!("{}: {}\r\n", field.name, resolved_value));
+    }
+    request.push_str("\r\n");
+    Ok(request)
+}
+
 /// Parse a request line into (method, path, version).
 fn parse_request_line(line: &str) -> Result<(String, String, String)> {
     let parts: Vec<&str> = line.split_whitespace().collect();
@@ -2063,31 +2036,31 @@ mod tests {
     #[test]
     fn parse_response_status_line_extracts_code() {
         assert_eq!(
-            parse_response_status_line("HTTP/1.1 101 Switching Protocols\r\n").unwrap(),
+            websocket::parse_status_line("HTTP/1.1 101 Switching Protocols\r\n").unwrap(),
             101
         );
         assert_eq!(
-            parse_response_status_line("HTTP/1.1 403 Forbidden").unwrap(),
+            websocket::parse_status_line("HTTP/1.1 403 Forbidden").unwrap(),
             403
         );
     }
 
     #[test]
     fn parse_response_status_line_rejects_malformed() {
-        assert!(parse_response_status_line("garbage").is_err());
-        assert!(parse_response_status_line("").is_err());
-        assert!(parse_response_status_line("HTTP/1.1 notanumber\r\n").is_err());
-        assert!(parse_response_status_line("101 Switching Protocols\r\n").is_err());
+        assert!(websocket::parse_status_line("garbage").is_err());
+        assert!(websocket::parse_status_line("").is_err());
+        assert!(websocket::parse_status_line("HTTP/1.1 notanumber\r\n").is_err());
+        assert!(websocket::parse_status_line("101 Switching Protocols\r\n").is_err());
     }
 
     #[test]
     fn websocket_handshake_response_accepts_valid_101() {
-        assert!(is_valid_websocket_handshake_response(
+        assert!(websocket::is_valid_response(
             101,
             b"Connection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: abc\r\n"
         ));
         // Case-insensitivity and multi-token Connection values are legal.
-        assert!(is_valid_websocket_handshake_response(
+        assert!(websocket::is_valid_response(
             101,
             b"connection: keep-alive, Upgrade\r\nupgrade: WebSocket\r\n"
         ));
@@ -2095,11 +2068,11 @@ mod tests {
 
     #[test]
     fn websocket_handshake_response_rejects_wrong_status() {
-        assert!(!is_valid_websocket_handshake_response(
+        assert!(!websocket::is_valid_response(
             200,
             b"Connection: Upgrade\r\nUpgrade: websocket\r\n"
         ));
-        assert!(!is_valid_websocket_handshake_response(
+        assert!(!websocket::is_valid_response(
             403,
             b"Connection: Upgrade\r\nUpgrade: websocket\r\n"
         ));
@@ -2107,19 +2080,19 @@ mod tests {
 
     #[test]
     fn websocket_handshake_response_rejects_missing_upgrade_headers() {
-        assert!(!is_valid_websocket_handshake_response(
+        assert!(!websocket::is_valid_response(
             101,
             b"Connection: Upgrade\r\n"
         ));
-        assert!(!is_valid_websocket_handshake_response(
+        assert!(!websocket::is_valid_response(
             101,
             b"Upgrade: websocket\r\n"
         ));
-        assert!(!is_valid_websocket_handshake_response(
+        assert!(!websocket::is_valid_response(
             101,
             b"Connection: keep-alive\r\nUpgrade: websocket\r\n"
         ));
-        assert!(!is_valid_websocket_handshake_response(101, b""));
+        assert!(!websocket::is_valid_response(101, b""));
     }
 
     #[tokio::test]
@@ -2140,7 +2113,7 @@ mod tests {
         drop(client);
 
         let mut server = server;
-        let resp = read_upstream_ws_response(&mut server, "example.com")
+        let resp = websocket::read_response(&mut server, "example.com")
             .await
             .unwrap();
         assert_eq!(resp.status, 101);
@@ -2162,7 +2135,7 @@ mod tests {
         drop(client);
 
         let mut server = server;
-        let result = read_upstream_ws_response(&mut server, "example.com").await;
+        let result = websocket::read_response(&mut server, "example.com").await;
         assert!(result.is_err());
     }
 
@@ -2180,7 +2153,7 @@ mod tests {
         drop(client);
 
         let mut server = server;
-        let result = read_upstream_ws_response(&mut server, "example.com").await;
+        let result = websocket::read_response(&mut server, "example.com").await;
         assert!(result.is_err());
     }
 
@@ -2190,7 +2163,21 @@ mod tests {
         drop(client);
 
         let mut server = server;
-        let result = read_upstream_ws_response(&mut server, "example.com").await;
+        let result = websocket::read_response(&mut server, "example.com").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn read_upstream_ws_response_rejects_eof_before_header_terminator() {
+        let (mut client, server) = tokio::io::duplex(4096);
+        client
+            .write_all(b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\n")
+            .await
+            .unwrap();
+        drop(client);
+
+        let mut server = server;
+        let result = websocket::read_response(&mut server, "example.com").await;
         assert!(result.is_err());
     }
 
@@ -2515,6 +2502,12 @@ mod tests {
     }
 
     #[test]
+    fn detects_malformed_reserved_nonce_marker() {
+        assert!(contains_phantom_nonce("Bearer nono_too-short"));
+        assert!(!contains_phantom_nonce("Bearer ordinary-token"));
+    }
+
+    #[test]
     fn preserves_prefix_and_suffix_around_nonce() {
         let nonce = make_nonce();
         let resolver = TestResolver {
@@ -2525,5 +2518,92 @@ mod tests {
         let value = format!("prefix-{nonce}-suffix");
         let result = resolve_nonce_in_header_value(&value, "proxy.svc", &resolver);
         assert_eq!(result, Some("prefix-REAL-suffix".to_string()));
+    }
+
+    #[test]
+    fn websocket_request_rejects_nonce_for_wrong_consumer() {
+        let nonce = make_nonce();
+        let resolver = TestResolver {
+            nonce: nonce.clone(),
+            real: b"REAL".to_vec(),
+            admitted_consumer: "proxy.chat".to_string(),
+        };
+        let request = ParsedRequest {
+            method: "GET".to_string(),
+            path: "/socket".to_string(),
+            version: "HTTP/1.1".to_string(),
+            header_bytes: format!(
+                "Host: chat.example\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nX-Session: {nonce}\r\n"
+            )
+            .into_bytes(),
+            buffered: Vec::new(),
+        };
+        assert!(
+            build_websocket_upstream_request(
+                &request,
+                "chat.example",
+                None,
+                Some("other"),
+                Some(&resolver),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn websocket_request_resolves_admitted_nonce_before_forwarding() {
+        let nonce = make_nonce();
+        let resolver = TestResolver {
+            nonce: nonce.clone(),
+            real: b"REAL".to_vec(),
+            admitted_consumer: "proxy.chat".to_string(),
+        };
+        let request = ParsedRequest {
+            method: "GET".to_string(),
+            path: "/socket".to_string(),
+            version: "HTTP/1.1".to_string(),
+            header_bytes: format!(
+                "Host: chat.example\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nX-Session: {nonce}\r\n"
+            )
+            .into_bytes(),
+            buffered: Vec::new(),
+        };
+        let outbound = build_websocket_upstream_request(
+            &request,
+            "chat.example",
+            None,
+            Some("chat"),
+            Some(&resolver),
+        )
+        .unwrap();
+        assert!(outbound.contains("x-session: REAL\r\n"));
+        assert!(!outbound.contains(&nonce));
+    }
+
+    #[tokio::test]
+    async fn websocket_route_selection_is_default_deny() {
+        let route: crate::config::RouteConfig = serde_json::from_str(
+            r#"{
+                "prefix": "chat",
+                "upstream": "https://chat.example",
+                "upgrades": [{"path": "/allowed"}]
+            }"#,
+        )
+        .unwrap();
+        let store = RouteStore::load(&[route]).await.unwrap();
+        let selection = select_intercept_route(
+            &store,
+            "chat.example",
+            443,
+            InterceptRouteRequest {
+                method: "GET",
+                path: "/other",
+                websocket_path: Some("/other"),
+            },
+            None,
+            None,
+        )
+        .await;
+        assert!(matches!(selection, RouteSelection::Rejected(403)));
     }
 }

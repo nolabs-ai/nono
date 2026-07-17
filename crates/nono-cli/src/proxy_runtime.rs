@@ -2485,11 +2485,13 @@ fn synthesize_credential_provider_proxy_config(
         let endpoint_policy = route.endpoint_policy.clone();
         for (index, api_host) in provider.api_hosts.iter().enumerate() {
             let prefix = provider_route_prefix(&route.name, index, provider.api_hosts.len());
-            let upgrades: Vec<nono_proxy::config::UpgradeRuleConfig> = route
+            let upgrades: Vec<nono_proxy::config::WebSocketRuleConfig> = route
                 .upgrades
                 .iter()
                 .filter(|rule| &rule.origin == api_host)
-                .cloned()
+                .map(|rule| nono_proxy::config::WebSocketRuleConfig {
+                    path: rule.path.clone(),
+                })
                 .collect();
             proxy_config.routes.push(nono_proxy::config::RouteConfig {
                 prefix: prefix.clone(),

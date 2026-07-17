@@ -305,8 +305,9 @@ impl RouteStore {
                 || route.oauth2.is_some()
                 || route.aws_auth.is_some()
                 || route.spiffe.is_some();
-            let requires_intercept =
-                requires_managed_credential || !endpoint_policy.allows_all_without_l7();
+            let requires_intercept = requires_managed_credential
+                || !endpoint_policy.allows_all_without_l7()
+                || !upgrade_rules.is_empty();
             let managed_auth_mechanism = auth_mechanism_for_route(route);
             let managed_injection_mode = injection_mode_for_route(route);
 
@@ -2043,5 +2044,19 @@ h56ZLEEqHfVWFhJWIKRSabtxYPV/VJyMv+lo3L0QwSKsouHs3dtF1zVQ
             route.tls_connector.is_some(),
             "connector must be built when tls_client_cert/key are set"
         );
+    }
+
+    #[tokio::test]
+    async fn websocket_rule_alone_requires_interception() {
+        let route: RouteConfig = serde_json::from_str(
+            r#"{
+                "prefix": "chat",
+                "upstream": "https://chat.example",
+                "upgrades": [{"path": "/socket"}]
+            }"#,
+        )
+        .unwrap();
+        let store = RouteStore::load(&[route]).await.unwrap();
+        assert!(store.get("chat").unwrap().requires_intercept);
     }
 }

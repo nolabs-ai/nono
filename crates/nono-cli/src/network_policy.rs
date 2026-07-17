@@ -272,6 +272,7 @@ pub fn resolve_credentials(
                 aws_auth: cred.aws_auth.clone(),
                 spiffe: cred.spiffe.clone(),
                 rate_limit: cred.rate_limit.clone(),
+                upgrades: vec![],
             });
         } else if let Some(cred) = policy.credentials.get(name) {
             // Validate env_var against dangerous variable blocklist
@@ -307,6 +308,7 @@ pub fn resolve_credentials(
                 aws_auth: None,
                 spiffe: None,
                 rate_limit: None,
+                upgrades: vec![],
             });
         }
         // We already validated existence above, so this else branch won't be hit
@@ -469,6 +471,7 @@ pub fn partition_allow_domain(
                         aws_auth: None,
                         spiffe: None,
                         rate_limit: None,
+                        upgrades: vec![],
                     });
                 }
             }

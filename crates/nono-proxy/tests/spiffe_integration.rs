@@ -38,6 +38,7 @@ fn make_jwt_route(socket: &str) -> RouteConfig {
             svid_hint: None,
         }),
         rate_limit: None,
+        upgrades: vec![],
     }
 }
 
@@ -176,6 +177,7 @@ async fn test_spiffe_jwt_live_proxy_startup() {
             svid_hint: None,
         }),
         rate_limit: None,
+        upgrades: vec![],
     };
     let result = server::start(ProxyConfig {
         routes: vec![route],

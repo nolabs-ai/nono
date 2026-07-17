@@ -765,6 +765,7 @@ mod tests {
             endpoint_policy: None,
             spiffe: None,
             rate_limit: None,
+            upgrades: vec![],
         }];
         let route_store = RouteStore::load(&routes).await.unwrap();
         let credential_store = CredentialStore::load_with_diagnostics(&routes, tls_connector)
@@ -843,6 +844,7 @@ mod tests {
             endpoint_policy: None,
             spiffe: None,
             rate_limit: None,
+            upgrades: vec![],
         }];
         RouteStore::load(&routes).await.unwrap()
     }
@@ -1565,6 +1567,7 @@ mod tests {
             endpoint_policy: None,
             spiffe: None,
             rate_limit: None,
+            upgrades: vec![],
         }];
         let route_store = RouteStore::load(&routes).await.unwrap();
         // Set fake AWS credential env vars so the default chain succeeds and
@@ -1951,6 +1954,7 @@ mod tests {
                 endpoint_policy: None,
                 spiffe: None,
                 rate_limit: None,
+                upgrades: vec![],
             },
             RouteConfig {
                 prefix: "svc-b".to_string(),
@@ -1976,6 +1980,7 @@ mod tests {
                 endpoint_policy: None,
                 spiffe: None,
                 rate_limit: None,
+                upgrades: vec![],
             },
         ];
         let route_store = RouteStore::load(&routes).await.unwrap();
@@ -2153,6 +2158,7 @@ mod tests {
             endpoint_policy: None,
             spiffe: None,
             rate_limit: None,
+            upgrades: vec![],
         }];
         RouteStore::load(&routes).await.unwrap()
     }
@@ -2295,6 +2301,7 @@ mod tests {
             }),
             spiffe: None,
             rate_limit: None,
+            upgrades: vec![],
         }];
         let route_store = RouteStore::load(&routes).await.unwrap();
         let credential_store = CredentialStore::empty();
@@ -2486,6 +2493,7 @@ mod tests {
                 endpoint_policy: None,
                 spiffe: None,
                 rate_limit: None,
+                upgrades: vec![],
             },
             // Endpoint-only restriction (_ep_ route)
             RouteConfig {
@@ -2518,6 +2526,7 @@ mod tests {
                 endpoint_policy: None,
                 spiffe: None,
                 rate_limit: None,
+                upgrades: vec![],
             },
         ];
         let route_store = RouteStore::load(&routes).await.unwrap();

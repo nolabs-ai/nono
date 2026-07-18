@@ -3889,6 +3889,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                upgrades: vec![],
             }],
             ..Default::default()
         };
@@ -3933,6 +3934,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                upgrades: vec![],
             }],
             ..Default::default()
         };

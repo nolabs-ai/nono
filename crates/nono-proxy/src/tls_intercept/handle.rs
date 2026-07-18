@@ -2390,6 +2390,15 @@ mod tests {
                 aws_auth: None,
                 endpoint_policy: None,
                 spiffe: None,
+                upgrades: vec![],
+            }
+        }
+
+        fn req<'a>(method: &'a str, path: &'a str) -> InterceptRouteRequest<'a> {
+            InterceptRouteRequest {
+                method,
+                path,
+                websocket_path: None,
             }
         }
 
@@ -2398,8 +2407,10 @@ mod tests {
 
         // Each path selects its own route; the sibling route's default-deny must
         // not turn this into a 403.
-        match select_intercept_route(&store, "example.com", 443, "GET", "/foo", None, None).await {
-            RouteSelection::Selected(Some((svc, _))) => assert_eq!(svc, "foo"),
+        match select_intercept_route(&store, "example.com", 443, req("GET", "/foo"), None, None)
+            .await
+        {
+            RouteSelection::Selected(Some(selected)) => assert_eq!(selected.id, "foo"),
             RouteSelection::Selected(None) => {
                 panic!("/foo must select the foo route, not passthrough")
             }
@@ -2407,8 +2418,10 @@ mod tests {
                 panic!("/foo must be allowed, got rejection with status {status}")
             }
         }
-        match select_intercept_route(&store, "example.com", 443, "GET", "/bar", None, None).await {
-            RouteSelection::Selected(Some((svc, _))) => assert_eq!(svc, "bar"),
+        match select_intercept_route(&store, "example.com", 443, req("GET", "/bar"), None, None)
+            .await
+        {
+            RouteSelection::Selected(Some(selected)) => assert_eq!(selected.id, "bar"),
             RouteSelection::Selected(None) => {
                 panic!("/bar must select the bar route, not passthrough")
             }
@@ -2417,11 +2430,15 @@ mod tests {
             }
         }
         // A path covered by neither route: passthrough without credentials, not a 403.
-        match select_intercept_route(&store, "example.com", 443, "GET", "/other", None, None).await
+        match select_intercept_route(&store, "example.com", 443, req("GET", "/other"), None, None)
+            .await
         {
             RouteSelection::Selected(None) => {}
-            RouteSelection::Selected(Some((svc, _))) => {
-                panic!("/other must not inject a credential, selected route '{svc}'")
+            RouteSelection::Selected(Some(selected)) => {
+                panic!(
+                    "/other must not inject a credential, selected route '{}'",
+                    selected.id
+                )
             }
             RouteSelection::Rejected(status) => {
                 panic!("/other must pass through, got rejection with status {status}")

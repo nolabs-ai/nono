@@ -3980,6 +3980,7 @@ mod tests {
                 aws_auth: None,
                 spiffe: None,
                 rate_limit: None,
+                upgrades: vec![],
             }],
             ..Default::default()
         };
@@ -4025,6 +4026,7 @@ mod tests {
                 aws_auth: None,
                 spiffe: None,
                 rate_limit: None,
+                upgrades: vec![],
             }],
             ..Default::default()
         };

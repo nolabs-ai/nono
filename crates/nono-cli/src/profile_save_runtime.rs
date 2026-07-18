@@ -583,7 +583,7 @@ pub(crate) fn would_shadow_existing_profile(profile_name: &str) -> bool {
         return false;
     }
     // Only block names that match embedded built-ins. Pack profiles are
-    // referenced by their full `org/name` key (e.g. `always-further/hermes`),
+    // referenced by their full `org/name` key (e.g. `nolabs-ai/hermes`),
     // which is an invalid profile name, so a short user profile name like
     // `hermes` cannot shadow a pack profile.
     crate::policy::load_embedded_policy()

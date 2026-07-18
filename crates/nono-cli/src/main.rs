@@ -34,6 +34,8 @@ mod launch_runtime;
 mod learn;
 mod learn_runtime;
 mod legacy_cleanup;
+#[cfg(target_os = "linux")]
+mod lineage_cgroup;
 #[cfg(target_os = "macos")]
 mod macos_trust;
 mod migration;
@@ -270,7 +272,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_effective_proxy_settings_allow_net_clears_profile_proxy_state() {
+    fn test_resolve_effective_proxy_settings_allow_net_clears_profile_proxy_state() -> Result<()> {
         let args = SandboxArgs {
             allow_net: true,
             ..sandbox_args()
@@ -296,6 +298,7 @@ mod tests {
             credential_providers: std::collections::HashMap::new(),
             credential_routes: Vec::new(),
             tls_intercept: None,
+            no_proxy: vec!["redis".to_string()],
             upstream_proxy: None,
             upstream_bypass: Vec::new(),
             listen_ports: Vec::new(),
@@ -324,7 +327,7 @@ mod tests {
             allow_http2_requested: false,
         };
 
-        let effective = resolve_effective_proxy_settings(&args, &prepared);
+        let effective = resolve_effective_proxy_settings(&args, &prepared)?;
 
         assert_eq!(
             effective,
@@ -333,12 +336,14 @@ mod tests {
                 allow_domain: Vec::new(),
                 deny_domain: Vec::new(),
                 credentials: Vec::new(),
+                no_proxy: Vec::new(),
             }
         );
+        Ok(())
     }
 
     #[test]
-    fn test_resolve_effective_proxy_settings_merges_cli_and_profile() {
+    fn test_resolve_effective_proxy_settings_merges_cli_and_profile() -> Result<()> {
         let args = SandboxArgs {
             network_profile: Some("minimal".to_string()),
             allow_proxy: vec!["example.com".to_string()],
@@ -366,6 +371,7 @@ mod tests {
             credential_providers: std::collections::HashMap::new(),
             credential_routes: Vec::new(),
             tls_intercept: None,
+            no_proxy: vec!["redis".to_string()],
             upstream_proxy: None,
             upstream_bypass: Vec::new(),
             listen_ports: Vec::new(),
@@ -394,7 +400,7 @@ mod tests {
             allow_http2_requested: false,
         };
 
-        let effective = resolve_effective_proxy_settings(&args, &prepared);
+        let effective = resolve_effective_proxy_settings(&args, &prepared)?;
 
         assert_eq!(
             effective,
@@ -406,8 +412,10 @@ mod tests {
                 ],
                 deny_domain: Vec::new(),
                 credentials: vec!["github".to_string(), "openai".to_string()],
+                no_proxy: vec!["redis".to_string()],
             }
         );
+        Ok(())
     }
 
     #[test]

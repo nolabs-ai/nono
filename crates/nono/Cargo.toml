@@ -1,6 +1,6 @@
 [package]
 name = "nono"
-version = "0.67.1"
+version = "0.68.0"
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
@@ -51,7 +51,7 @@ keyring = { version = "3", optional = true, default-features = false }
 # exists purely to keep the resolver on a coherent 0.6.3-era set
 # until the upstream API churn settles.
 sigstore-verify = { version = "0.9.0", default-features = false }
-sigstore-trust-root = "=0.9.0"
+sigstore-trust-root = "=0.11.0"
 x509-cert = { version = "0.2", default-features = false }
 der = { version = "0.7", default-features = false }
 

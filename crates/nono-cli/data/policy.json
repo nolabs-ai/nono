@@ -20,6 +20,8 @@
           "~/.git-credentials",
           "~/.netrc",
           "~/.npmrc",
+          "~/.bunfig.toml",
+          "~/.config/bun/bunfig.toml",
           "~/.vault-token",
           "~/.credentials",
           "~/.secrets",
@@ -323,7 +325,8 @@
       "allow": {
         "readwrite": [
           "~/Library/Caches",
-          "~/Library/Logs"
+          "~/Library/Logs",
+          "~/.cache"
         ],
         "read": [
           "~/Library/Preferences"
@@ -375,12 +378,31 @@
         ]
       }
     },
+    "bun_runtime": {
+      "description": "Bun javascript runtime and package manager paths",
+      "allow": {
+        "read": [
+          "~/.bun"
+        ]
+      }
+    },
     "opencode_linux": {
       "description": "OpenCode binary directory (Landlock requires directory read to execute binaries)",
       "platform": "linux",
       "allow": {
         "read": [
           "~/.opencode/bin"
+        ]
+      }
+    },
+    "mise_manager": {
+      "description": "Mise - dev tools, env vars, task runner",
+      "allow": {
+        "read": [
+          "/etc/mise",
+          "~/.local/bin/mise",
+          "~/.config/mise",
+          "~/.local/share/mise"
         ]
       }
     },
@@ -631,7 +653,7 @@
         "name": "default",
         "version": "1.0.0",
         "description": "Default conservative base profile",
-        "author": "always-further"
+        "author": "nolabs-ai"
       },
       "groups": {
         "include": [
@@ -669,7 +691,7 @@
         "name": "linux-host-compat",
         "version": "1.0.0",
         "description": "Linux compatibility profile for host runtime, sysfs, and temp access",
-        "author": "always-further"
+        "author": "nolabs-ai"
       },
       "groups": {
         "include": [
@@ -692,7 +714,7 @@
         "name": "openclaw",
         "version": "1.0.0",
         "description": "OpenClaw messaging gateway",
-        "author": "always-further"
+        "author": "nolabs-ai"
       },
       "groups": {
         "include": ["node_runtime"]
@@ -714,13 +736,32 @@
       },
       "interactive": false
     },
+    "mise-dev": {
+      "extends": "default",
+      "meta": {
+        "name": "mise-dev",
+        "version": "1.0.0",
+        "description": "Mise: dev tools, env vars, task runner",
+        "author": "nolabs-ai"
+      },
+      "groups": {
+        "include": ["mise_manager"]
+      },
+      "security": {
+        "signal_mode": "isolated"
+      },
+      "filesystem": {},
+      "network": { "block": false, "network_profile": "developer" },
+      "workdir": { "access": "readwrite" },
+      "interactive": false
+    },
     "python-dev": {
       "extends": "default",
       "meta": {
         "name": "python-dev",
         "version": "1.0.0",
         "description": "Python SDK development profile with pyenv, conda, and pip support",
-        "author": "always-further"
+        "author": "nolabs-ai"
       },
       "groups": {
         "include": ["python_runtime"]
@@ -740,10 +781,29 @@
         "name": "node-dev",
         "version": "1.0.0",
         "description": "Node.js SDK development profile with nvm, fnm, pnpm, and npm support",
-        "author": "always-further"
+        "author": "nolabs-ai"
       },
       "groups": {
         "include": ["node_runtime"]
+      },
+      "security": {
+        "signal_mode": "isolated"
+      },
+      "filesystem": {},
+      "network": { "block": false, "network_profile": "developer" },
+      "workdir": { "access": "readwrite" },
+      "interactive": false
+    },
+    "bun-dev": {
+      "extends": "default",
+      "meta": {
+        "name": "bun-dev",
+        "version": "1.0.0",
+        "description": "Bun runtime development profile",
+        "author": "nolabs-ai"
+      },
+      "groups": {
+        "include": ["bun_runtime"]
       },
       "security": {
         "signal_mode": "isolated"
@@ -759,7 +819,7 @@
         "name": "go-dev",
         "version": "1.0.0",
         "description": "Go SDK development profile with GOPATH and module support",
-        "author": "always-further"
+        "author": "nolabs-ai"
       },
       "groups": {
         "include": ["go_runtime", "go_runtime_linux", "go_runtime_macos"]
@@ -778,7 +838,7 @@
         "name": "java-dev",
         "version": "1.0.0",
         "description": "Java SDK development profile with SDKMAN, Maven, and Gradle support",
-        "author": "always-further"
+        "author": "nolabs-ai"
       },
       "groups": {
         "include": ["java_runtime"]
@@ -800,7 +860,7 @@
         "name": "rust-dev",
         "version": "1.0.0",
         "description": "Rust SDK development profile with cargo and rustup support",
-        "author": "always-further"
+        "author": "nolabs-ai"
       },
       "groups": {
         "include": ["rust_runtime"]
@@ -819,7 +879,7 @@
         "name": "swival",
         "version": "1.0.0",
         "description": "Swival CLI coding agent",
-        "author": "always-further"
+        "author": "nolabs-ai"
       },
       "groups": {
         "include": [

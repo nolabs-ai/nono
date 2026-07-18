@@ -16,7 +16,7 @@
 use crate::cli::PullArgs;
 use crate::package::ProfileProvider;
 use crate::package_cmd;
-use crate::registry_client::{RegistryClient, resolve_registry_url};
+use crate::registry_client::{PullReason, RegistryClient, resolve_registry_url};
 use colored::Colorize;
 use nono::Result;
 use std::io::{self, BufRead, IsTerminal, Write};
@@ -291,17 +291,20 @@ fn write_field<W: Write>(out: &mut W, label: &str, value: &str, label_w: usize) 
 }
 
 fn run_pull(pack_ref: &str) -> Result<()> {
-    package_cmd::run_pull(PullArgs {
-        package_ref: pack_ref.to_string(),
-        registry: None,
-        // Migration only triggers when the resolver couldn't find the
-        // pack-provided profile. The lockfile may still claim "up to
-        // date" if the user wiped the pack dir manually — force
-        // re-install so the files actually exist before we retry.
-        force: true,
-        init: false,
-        help: None,
-    })?;
+    package_cmd::run_pull(
+        PullArgs {
+            package_ref: pack_ref.to_string(),
+            registry: None,
+            // Migration only triggers when the resolver couldn't find the
+            // pack-provided profile. The lockfile may still claim "up to
+            // date" if the user wiped the pack dir manually — force
+            // re-install so the files actually exist before we retry.
+            force: true,
+            init: false,
+            help: None,
+        },
+        PullReason::Migration,
+    )?;
     Ok(())
 }
 

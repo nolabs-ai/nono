@@ -312,18 +312,20 @@ pub(crate) fn run_shell(args: ShellArgs, silent: bool) -> Result<()> {
 }
 
 /// `nono wrap` execs the target directly (no supervising parent), so it never
-/// creates the cgroup that enforces a memory ceiling. Accepting a limit here would
+/// creates the cgroup that enforces resource ceilings. Accepting a limit here would
 /// run unenforced — or under `--dry-run` advertise a cap we won't honor. Fail
-/// closed instead, like the proxy / AF_UNIX guards below. Covers both `--memory`
-/// and a manifest `resources.memory_bytes` (both are in `caps` by now).
+/// closed instead, like the proxy / AF_UNIX guards below. Covers `--memory`,
+/// `--max-processes`, and their manifest `resources.*` equivalents (all in `caps`
+/// by now).
 fn reject_resource_limits_under_wrap(caps: &CapabilitySet) -> Result<()> {
     if caps
         .resource_limits()
         .is_some_and(|limits| !limits.is_empty())
     {
         return Err(NonoError::ConfigParse(
-            "nono wrap does not support --memory / resources.memory_bytes because direct \
-             exec cannot create the enforcement cgroup. Use `nono run` instead."
+            "nono wrap does not support resource limits (--memory / --max-processes / \
+             resources.*) because direct exec cannot create the enforcement cgroup. \
+             Use `nono run` instead."
                 .to_string(),
         ));
     }
@@ -428,6 +430,18 @@ mod tests {
         // silently dropped and run unenforced.
         let caps = CapabilitySet::new().with_resource_limits(ResourceLimits {
             memory_bytes: Some(64 * 1024 * 1024),
+            max_processes: None,
+        });
+        assert!(reject_resource_limits_under_wrap(&caps).is_err());
+    }
+
+    #[test]
+    fn wrap_rejects_caps_carrying_a_process_limit() {
+        // Same fail-closed rule for a process-count ceiling: wrap can't enforce it
+        // either, so it must be refused rather than run unenforced.
+        let caps = CapabilitySet::new().with_resource_limits(ResourceLimits {
+            memory_bytes: None,
+            max_processes: Some(64),
         });
         assert!(reject_resource_limits_under_wrap(&caps).is_err());
     }

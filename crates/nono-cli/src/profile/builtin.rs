@@ -23,8 +23,8 @@ mod tests {
     #[test]
     fn test_claude_code_no_longer_inbuilt() {
         // Removed in v0.43.0: claude-code is now shipped via the registry pack
-        // `nolabs-ai/claude` and resolved through the user-profile
-        // symlink, not the embedded policy.json.
+        // `nolabs-ai/claude` (formerly `always-further/claude`) and resolved
+        // through the user-profile symlink, not the embedded policy.json.
         assert!(get_builtin("claude-code").is_none());
         assert!(get_builtin("claude-no-kc").is_none());
     }
@@ -32,7 +32,7 @@ mod tests {
     #[test]
     fn test_opencode_no_longer_inbuilt() {
         // Removed: opencode is now shipped via the registry pack
-        // `nolabs-ai/opencode`, not embedded in policy.json.
+        // `nolabs-ai/opencode` (formerly `always-further/opencode`), not embedded in policy.json.
         assert!(get_builtin("opencode").is_none());
     }
 
@@ -115,9 +115,9 @@ mod tests {
         assert!(profiles.contains(&"openclaw".to_string()));
         assert!(profiles.contains(&"swival".to_string()));
         // Profiles that ship via registry packs instead of as built-ins:
-        //   claude-code → always-further/claude   (removed v0.43.0)
-        //   codex       → always-further/codex    (removed v0.43.0)
-        //   opencode    → always-further/opencode (removed)
+        //   claude-code → nolabs-ai/claude   (formerly always-further/claude, removed v0.43.0)
+        //   codex       → nolabs-ai/codex    (formerly always-further/codex, removed v0.43.0)
+        //   opencode    → nolabs-ai/opencode (formerly always-further/opencode, removed)
         // Tool Sandbox examples should also live outside embedded built-ins.
         assert!(!profiles.contains(&"claude-code".to_string()));
         assert!(!profiles.contains(&"claude-no-kc".to_string()));

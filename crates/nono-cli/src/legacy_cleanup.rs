@@ -3,7 +3,7 @@
 //! Pre-0.43 installs wrote `~/.claude/hooks/nono-hook.sh` and patched
 //! `~/.claude/settings.json::hooks` with one matching command entry.
 //! Post-0.43 the integration ships as a registry pack
-//! (`nolabs-ai/claude`) with its own marketplace-based plugin
+//! (`nolabs-ai/claude`, formerly `always-further/claude`) with its own marketplace-based plugin
 //! install. If the legacy state isn't removed, Claude Code runs both —
 //! duplicate hook execution at best, broken behaviour if the legacy
 //! `nono-hook.sh` references binaries the current nono no longer ships.

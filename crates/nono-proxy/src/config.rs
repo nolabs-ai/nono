@@ -127,6 +127,16 @@ pub struct ProxyConfig {
     #[serde(default)]
     pub direct_connect_ports: Vec<u16>,
 
+    /// Additional client-side proxy bypass entries to append to generated
+    /// NO_PROXY/no_proxy values.
+    ///
+    /// These entries are host patterns only. They do not grant network access;
+    /// they only tell standard HTTP clients not to use the local nono proxy for
+    /// matching destinations. Route upstreams that require L7 filtering or
+    /// credential injection are filtered out at proxy startup.
+    #[serde(default)]
+    pub no_proxy: Vec<String>,
+
     /// Maximum concurrent connections (0 = unlimited).
     #[serde(default)]
     pub max_connections: usize,
@@ -242,6 +252,7 @@ impl Default for ProxyConfig {
             oauth_capture_store_path: None,
             external_proxy: None,
             direct_connect_ports: Vec::new(),
+            no_proxy: Vec::new(),
             max_connections: 256,
             intercept_ca_dir: None,
             intercept_parent_ca_pems: None,
@@ -332,6 +343,355 @@ fn default_bind_addr() -> IpAddr {
 
 fn default_require_auth() -> bool {
     true
+}
+
+/// Validate a client-side NO_PROXY entry.
+///
+/// Accepts single-label local aliases, IP literals, `*.example.com` wildcard
+/// suffixes, and `.example.com` suffix patterns. Bare multi-label domains are
+/// rejected because common clients treat them as suffix matches. Full URLs,
+/// credentials, ports, path/query/fragment-bearing values, comma-separated
+/// lists, and catch-all `*` are rejected so profile values cannot silently
+/// broaden proxy bypass behavior.
+///
+/// # Errors
+///
+/// Returns a human-readable validation error if `entry` is not a host pattern.
+#[must_use = "the no_proxy validation result must be handled"]
+pub fn validate_no_proxy_entry(entry: &str) -> crate::error::Result<()> {
+    if entry.is_empty() {
+        return Err(no_proxy_config_error("entry must not be empty"));
+    }
+    if entry.trim() != entry {
+        return Err(no_proxy_config_error(
+            "entry must not contain leading or trailing whitespace",
+        ));
+    }
+    if entry
+        .chars()
+        .any(|c| c.is_control() || c.is_ascii_whitespace())
+    {
+        return Err(no_proxy_config_error(
+            "entry must not contain whitespace or control characters",
+        ));
+    }
+    if entry.contains(',') {
+        return Err(no_proxy_config_error(
+            "entry must be a single host pattern, not a comma-separated list",
+        ));
+    }
+    if entry.contains("://") {
+        return Err(no_proxy_config_error("entry must not include a URL scheme"));
+    }
+    if entry.contains('@') {
+        return Err(no_proxy_config_error("entry must not include credentials"));
+    }
+    if entry.contains('/') || entry.contains('?') || entry.contains('#') {
+        return Err(no_proxy_config_error(
+            "entry must not include a path, query, or fragment",
+        ));
+    }
+
+    if entry.contains('[') || entry.contains(']') {
+        if !entry.starts_with('[') || !entry.ends_with(']') {
+            return Err(no_proxy_config_error(
+                "brackets are only allowed around IPv6 literals",
+            ));
+        }
+        let Some(host) = entry
+            .strip_prefix('[')
+            .and_then(|host| host.strip_suffix(']'))
+        else {
+            return Err(no_proxy_config_error(
+                "brackets are only allowed around IPv6 literals",
+            ));
+        };
+        if host.parse::<std::net::Ipv6Addr>().is_err() {
+            return Err(no_proxy_config_error(
+                "bracketed entry must be an IPv6 literal",
+            ));
+        }
+    } else if has_host_port_separator(entry) {
+        return Err(no_proxy_config_error("entry must not include a port"));
+    }
+
+    validate_no_proxy_host_pattern(entry)
+}
+
+fn no_proxy_config_error(message: impl Into<String>) -> crate::error::ProxyError {
+    crate::error::ProxyError::Config(message.into())
+}
+
+fn has_host_port_separator(entry: &str) -> bool {
+    entry
+        .rsplit_once(':')
+        .is_some_and(|(host, port)| !host.contains(':') && !port.is_empty())
+}
+
+pub(crate) fn no_proxy_host_pattern_matches(pattern: &str, host: &str) -> bool {
+    let pattern = normalise_no_proxy_host(pattern);
+    let host = normalise_no_proxy_host(host);
+    if pattern == host {
+        return true;
+    }
+
+    if let Some(suffix) = pattern.strip_prefix("*.") {
+        return host
+            .strip_suffix(suffix)
+            .is_some_and(|prefix| prefix.ends_with('.') && prefix.len() > 1);
+    }
+
+    if let Some(suffix) = pattern.strip_prefix('.') {
+        return host == suffix || host.ends_with(&format!(".{suffix}"));
+    }
+
+    false
+}
+
+/// Return true when a client-side NO_PROXY-style entry could overlap a proxy
+/// allow/route host pattern.
+///
+/// The grammar and overlap semantics live in `nono-proxy` because this crate
+/// owns proxy env generation, route protection, and startup fail-safe checks.
+/// CLI profile validation calls this helper for parse-time UX but the proxy
+/// still enforces the same semantics at startup.
+#[must_use]
+pub fn no_proxy_entry_overlaps_host_pattern(no_proxy_entry: &str, host_pattern: &str) -> bool {
+    let entry_host = strip_no_proxy_port(no_proxy_entry);
+    let host_pattern = strip_no_proxy_port(host_pattern);
+    if entry_host.is_empty() || host_pattern.is_empty() {
+        return true;
+    }
+
+    if no_proxy_host_pattern_matches(&entry_host, &host_pattern) {
+        return true;
+    }
+    if bare_single_label_suffix_overlaps_host(&entry_host, &host_pattern) {
+        return true;
+    }
+
+    let Some(entry_suffix) = no_proxy_suffix_for_overlap(&entry_host) else {
+        return false;
+    };
+
+    if let Some(host_suffix) = host_pattern
+        .strip_prefix("*.")
+        .map(normalise_no_proxy_host_pattern)
+    {
+        if host_suffix.is_empty() {
+            return true;
+        }
+        return domain_suffixes_overlap(&entry_suffix, &host_suffix);
+    }
+
+    let host = normalise_no_proxy_host_pattern(&host_pattern);
+    host == entry_suffix || host.ends_with(&format!(".{entry_suffix}"))
+}
+
+fn bare_single_label_suffix_overlaps_host(entry: &str, host_pattern: &str) -> bool {
+    let entry = normalise_no_proxy_host(entry);
+    if entry.is_empty() || entry.contains('.') || entry.contains(':') || entry.contains('*') {
+        return false;
+    }
+
+    let host = normalise_host_pattern_for_suffix_overlap(host_pattern);
+    host == entry || host.ends_with(&format!(".{entry}"))
+}
+
+fn normalise_host_pattern_for_suffix_overlap(host_pattern: &str) -> String {
+    let normalised = normalise_no_proxy_host(host_pattern);
+    normalised
+        .strip_prefix("*.")
+        .or_else(|| normalised.strip_prefix('.'))
+        .unwrap_or(&normalised)
+        .to_string()
+}
+
+pub(crate) fn strip_no_proxy_port(entry: &str) -> String {
+    if let Some(rest) = entry.strip_prefix('[') {
+        if let Some((host, remainder)) = rest.split_once(']')
+            && let Some(port) = remainder.strip_prefix(':')
+            && port.parse::<u16>().is_ok()
+        {
+            return format!("[{host}]");
+        }
+        return entry.to_string();
+    }
+
+    if entry.parse::<std::net::Ipv6Addr>().is_ok() {
+        return entry.to_string();
+    }
+
+    entry
+        .rsplit_once(':')
+        .and_then(|(host, port)| {
+            if host.contains(':') {
+                return None;
+            }
+            port.parse::<u16>().ok().map(|_| host.to_string())
+        })
+        .unwrap_or_else(|| entry.to_string())
+}
+
+fn no_proxy_suffix_for_overlap(entry: &str) -> Option<String> {
+    let normalised = normalise_no_proxy_host_pattern(entry);
+    let explicit_suffix = entry.starts_with('.') || normalised.starts_with("*.");
+    let suffix = normalised.strip_prefix("*.").unwrap_or(&normalised);
+    if suffix.is_empty() || suffix.parse::<std::net::IpAddr>().is_ok() {
+        return None;
+    }
+    if explicit_suffix || suffix.contains('.') {
+        Some(suffix.to_string())
+    } else {
+        None
+    }
+}
+
+fn domain_suffixes_overlap(left: &str, right: &str) -> bool {
+    left == right || left.ends_with(&format!(".{right}")) || right.ends_with(&format!(".{left}"))
+}
+
+pub(crate) fn normalise_no_proxy_host_pattern(pattern: &str) -> String {
+    let normalised = normalise_no_proxy_host(pattern);
+    normalised
+        .strip_prefix('.')
+        .unwrap_or(&normalised)
+        .to_string()
+}
+
+pub(crate) fn normalise_no_proxy_env_entry(entry: &str) -> String {
+    let host = strip_no_proxy_port(entry);
+    let normalised = normalise_no_proxy_host(&host);
+    if let Some(suffix) = normalised.strip_prefix("*.") {
+        format!(".{suffix}")
+    } else {
+        normalised
+    }
+}
+
+#[must_use = "no_proxy host pattern validation result must be handled"]
+fn validate_no_proxy_host_pattern(pattern: &str) -> crate::error::Result<()> {
+    if pattern.is_empty() {
+        return Err(no_proxy_config_error("entry host must not be empty"));
+    }
+    if pattern == "*" {
+        return Err(no_proxy_config_error("catch-all '*' is not allowed"));
+    }
+
+    let host = if let Some(suffix) = pattern.strip_prefix("*.") {
+        if suffix.is_empty() {
+            return Err(no_proxy_config_error(
+                "wildcard entry must include a suffix",
+            ));
+        }
+        if suffix.contains('*') {
+            return Err(no_proxy_config_error(
+                "wildcards are only allowed as a leading '*.'",
+            ));
+        }
+        suffix
+    } else if let Some(suffix) = pattern.strip_prefix('.') {
+        if suffix.is_empty() {
+            return Err(no_proxy_config_error("suffix entry must include a domain"));
+        }
+        if suffix.contains('*') {
+            return Err(no_proxy_config_error(
+                "wildcards are only allowed as a leading '*.'",
+            ));
+        }
+        suffix
+    } else {
+        if pattern.contains('*') {
+            return Err(no_proxy_config_error(
+                "wildcards are only allowed as a leading '*.'",
+            ));
+        }
+        pattern
+    };
+
+    let host = normalise_no_proxy_host(host);
+    if host.is_empty() || host.starts_with('.') || host.ends_with('.') || host.contains("..") {
+        return Err(no_proxy_config_error(
+            "entry host must be a non-empty hostname or IP literal",
+        ));
+    }
+    if no_proxy_pattern_overlaps_always_denied_host(pattern) {
+        return Err(no_proxy_config_error(
+            "entry overlaps a proxy-denied metadata host",
+        ));
+    }
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if is_proxy_denied_metadata_ip(&ip) {
+            return Err(no_proxy_config_error(
+                "entry overlaps a proxy-denied metadata IP",
+            ));
+        }
+        if is_link_local_ip(&ip) {
+            return Err(no_proxy_config_error(
+                "entry must not bypass link-local or cloud metadata IP ranges",
+            ));
+        }
+        return Ok(());
+    }
+    if normalise_no_proxy_host(pattern) == host && host.contains('.') {
+        return Err(no_proxy_config_error(
+            "bare multi-label domains are not allowed; use an explicit leading-dot or '*.' suffix pattern",
+        ));
+    }
+    if host
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+    {
+        return Ok(());
+    }
+
+    Err(no_proxy_config_error(
+        "entry host contains invalid characters",
+    ))
+}
+
+const ALWAYS_DENIED_HOSTS: &[&str] = &[
+    "169.254.169.254",
+    "fd00:ec2::254",
+    "metadata.google.internal",
+    "metadata.azure.internal",
+];
+
+pub(crate) fn parse_host_ip_literal(host: &str) -> Option<IpAddr> {
+    normalise_no_proxy_host(host).parse::<IpAddr>().ok()
+}
+
+pub(crate) fn is_proxy_denied_metadata_ip(ip: &IpAddr) -> bool {
+    ALWAYS_DENIED_HOSTS
+        .iter()
+        .filter_map(|host| host.parse::<IpAddr>().ok())
+        .any(|denied| denied == *ip)
+}
+
+// Mirrors the proxy HostFilter's non-overridable metadata deny list at the
+// client-bypass boundary: NO_PROXY must not let clients skip that filter.
+fn no_proxy_pattern_overlaps_always_denied_host(pattern: &str) -> bool {
+    ALWAYS_DENIED_HOSTS
+        .iter()
+        .any(|denied| no_proxy_entry_overlaps_host_pattern(pattern, denied))
+}
+
+fn is_link_local_ip(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.octets()[0] == 169 && v4.octets()[1] == 254,
+        IpAddr::V6(v6) => {
+            if (v6.segments()[0] & 0xffc0) == 0xfe80 {
+                return true;
+            }
+            v6.to_ipv4_mapped()
+                .is_some_and(|v4| v4.octets()[0] == 169 && v4.octets()[1] == 254)
+        }
+    }
+}
+
+fn normalise_no_proxy_host(host: &str) -> String {
+    let lower = host.trim_matches(['[', ']']).to_ascii_lowercase();
+    lower.parse::<IpAddr>().map_or(lower, |ip| ip.to_string())
 }
 
 /// Configuration for a reverse proxy credential route.
@@ -456,6 +816,46 @@ pub struct RouteConfig {
     /// credentials. Mutually exclusive with `credential_key` and `oauth2`.
     #[serde(default)]
     pub aws_auth: Option<AwsAuthConfig>,
+
+    /// SPIFFE/SPIRE workload identity auth. Mutually exclusive with `credential_key`, `oauth2`, and `aws_auth`.
+    /// See `SpiffeAuthConfig` for JWT-SVID options.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spiffe: Option<SpiffeAuthConfig>,
+}
+
+/// SPIFFE/SPIRE auth for an upstream route.
+///
+/// Currently only `type: "jwt"` is supported — JWT-SVID injected as a bearer
+/// token into the configured header.
+///
+/// The sandboxed process makes a plain request with no credentials; nono fetches
+/// the SVID from the SPIRE Workload API and handles everything. The SPIRE
+/// operator registers the workload entry and configures the agent — nono's
+/// config is just the socket path and what to request.
+///
+/// Future variant: `type: "x509"` — mTLS with an X.509-SVID (client cert
+/// presented during TLS handshake, with atomic rotation). Planned once the
+/// TLS-intercept CONNECT path is wired to support it for HTTPS upstreams.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SpiffeAuthConfig {
+    /// JWT-SVID injected as a bearer token. Tokens refresh before expiry via the agent cache.
+    Jwt {
+        /// Path to the SPIRE agent Unix domain socket.
+        workload_api_socket: String,
+        /// Audience(s) for the minted JWT-SVID.
+        audience: Vec<String>,
+        /// Header to inject the JWT into (default: `Authorization`).
+        #[serde(default = "default_inject_header")]
+        inject_header: String,
+        /// Format string; `{}` is replaced by the token. Default: `Bearer {}`.
+        #[serde(default)]
+        credential_format: Option<String>,
+        /// Select a specific SVID by SPIFFE ID when the Workload API returns multiple SVIDs for
+        /// the same workload. When absent, nono uses the first SVID returned by the agent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        svid_hint: Option<String>,
+    },
 }
 
 /// Optional proxy-side overrides for credential injection shape.
@@ -833,7 +1233,8 @@ fn endpoint_allowed(rules: &[EndpointRule], method: &str, path: &str) -> bool {
 /// Percent-decoding prevents bypass via encoded characters (e.g.,
 /// `/api/%70rojects` evading a rule for `/api/projects/*`).
 fn normalize_path(path: &str) -> String {
-    // Strip query string
+    // Strip query string before percent-decoding: a literal %3F must not be
+    // treated as a query delimiter, so the split must precede the decode.
     let path = path.split('?').next().unwrap_or(path);
 
     // Percent-decode to prevent bypass via encoded segments.
@@ -915,15 +1316,34 @@ fn default_auth_scheme() -> String {
 /// The agent never sees client_id or client_secret — only a phantom token.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OAuth2Config {
-    /// Token endpoint URL (e.g., "https://auth.example.com/oauth/token")
     pub token_url: String,
-    /// Client ID — plain value or credential reference (env://, file://, op://)
+    /// Mutually exclusive with `client_assertion`.
+    #[serde(default)]
     pub client_id: String,
-    /// Client secret — credential reference (env://, file://, op://)
+    /// Mutually exclusive with `client_assertion`.
+    #[serde(default)]
     pub client_secret: String,
-    /// OAuth2 scopes (space-separated). Empty = no scope parameter sent.
     #[serde(default)]
     pub scope: String,
+    /// Use a SPIFFE JWT-SVID as the OAuth2 client assertion instead of client_id/secret.
+    /// Mutually exclusive with `client_id`/`client_secret`.
+    #[serde(default)]
+    pub client_assertion: Option<ClientAssertionConfig>,
+    /// Extra parameters merged into the token exchange POST body verbatim.
+    #[serde(default)]
+    pub extra_params: std::collections::HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ClientAssertionConfig {
+    SpiffeJwt {
+        workload_api_socket: String,
+        audience: Vec<String>,
+        /// Select a specific SVID by SPIFFE ID when the Workload API returns multiple.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        svid_hint: Option<String>,
+    },
 }
 
 /// AWS SigV4 signing configuration for a credential route.
@@ -972,17 +1392,120 @@ mod tests {
         assert!(config.allowed_hosts.is_empty());
         assert!(config.routes.is_empty());
         assert!(config.external_proxy.is_none());
+        assert!(config.no_proxy.is_empty());
+    }
+
+    #[test]
+    fn test_validate_no_proxy_entry_accepts_host_patterns() {
+        for entry in [
+            "redis",
+            "*.internal.example",
+            ".dev.local",
+            ".svc.cluster.local",
+            "127.0.0.1",
+            "::1",
+            "[::1]",
+        ] {
+            assert!(
+                validate_no_proxy_entry(entry).is_ok(),
+                "no_proxy entry {entry:?} should be valid"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_no_proxy_entry_rejects_non_host_values() {
+        for entry in [
+            "",
+            " https://dev.local",
+            "https://dev.local",
+            "user@dev.local",
+            "dev.local/path",
+            "dev.local?debug=true",
+            "dev.local,other.local",
+            "dev.local",
+            "api.openai.com",
+            "API.OPENAI.COM",
+            "*",
+            "*corp",
+            "api.example.com:443",
+            "169.254.169.254",
+            "169.254.1.2",
+            "internal",
+            "fd00:ec2::254",
+            "fd00:0ec2::254",
+            "fd00:ec2:0:0:0:0:0:254",
+            "[fd00:ec2::254]",
+            "[fd00:0ec2::254]",
+            "[fe80::1]",
+            "metadata.google.internal",
+            ".google.internal",
+            "[::1]:8443",
+            "[dev.local]",
+            "dev.local]",
+        ] {
+            assert!(
+                validate_no_proxy_entry(entry).is_err(),
+                "no_proxy entry {entry:?} should be invalid"
+            );
+        }
+    }
+
+    #[test]
+    fn test_no_proxy_host_pattern_matches_only_explicit_suffix_semantics() {
+        assert!(!no_proxy_host_pattern_matches(
+            "openai.com",
+            "api.openai.com"
+        ));
+        assert!(!no_proxy_host_pattern_matches("com", "api.openai.com"));
+        assert!(no_proxy_host_pattern_matches(
+            ".openai.com",
+            "api.openai.com"
+        ));
+        assert!(no_proxy_host_pattern_matches(
+            "*.openai.com",
+            "api.openai.com"
+        ));
+        assert!(!no_proxy_host_pattern_matches("*.openai.com", "openai.com"));
+        assert!(no_proxy_host_pattern_matches("[0:0:0:0:0:0:0:1]", "::1"));
+        assert!(no_proxy_host_pattern_matches("0:0:0:0:0:0:0:1", "[::1]"));
+        assert!(!no_proxy_host_pattern_matches(
+            "evilopenai.com",
+            "api.openai.com"
+        ));
+    }
+
+    #[test]
+    fn test_no_proxy_overlap_models_common_client_bare_suffixes_for_protected_hosts() {
+        assert!(no_proxy_entry_overlaps_host_pattern(
+            "internal",
+            "metadata.google.internal"
+        ));
+        assert!(no_proxy_entry_overlaps_host_pattern(
+            "254",
+            "169.254.169.254"
+        ));
+        assert!(no_proxy_entry_overlaps_host_pattern(
+            "internal",
+            "api.internal"
+        ));
+        assert!(!no_proxy_entry_overlaps_host_pattern(
+            "redis",
+            "metadata.google.internal"
+        ));
     }
 
     #[test]
     fn test_config_serialization() {
         let config = ProxyConfig {
             allowed_hosts: vec!["api.openai.com".to_string()],
+            no_proxy: vec!["redis".to_string()],
             ..Default::default()
         };
         let json = serde_json::to_string(&config).unwrap();
         let deserialized: ProxyConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.allowed_hosts, vec!["api.openai.com"]);
+        assert_eq!(deserialized.no_proxy, vec!["redis"]);
     }
 
     #[test]
@@ -1568,5 +2091,39 @@ mod tests {
         assert!(aws.profile.is_none());
         assert!(aws.region.is_none());
         assert!(aws.service.is_none());
+    }
+
+    #[test]
+    fn test_spiffe_jwt_config_roundtrip() {
+        let json = r#"{
+            "prefix": "inventory",
+            "upstream": "https://inventory.internal.example",
+            "spiffe": {
+                "type": "jwt",
+                "workload_api_socket": "/run/spire/sockets/agent.sock",
+                "audience": ["inventory.internal.example"],
+                "inject_header": "Authorization",
+                "credential_format": "Bearer {}"
+            }
+        }"#;
+        let route: RouteConfig = serde_json::from_str(json).unwrap();
+        let SpiffeAuthConfig::Jwt {
+            workload_api_socket,
+            audience,
+            inject_header,
+            credential_format,
+            ..
+        } = route.spiffe.unwrap();
+        assert_eq!(workload_api_socket, "/run/spire/sockets/agent.sock");
+        assert_eq!(audience, vec!["inventory.internal.example"]);
+        assert_eq!(inject_header, "Authorization");
+        assert_eq!(credential_format.as_deref(), Some("Bearer {}"));
+    }
+
+    #[test]
+    fn test_spiffe_absent_by_default() {
+        let json = r#"{"prefix": "openai", "upstream": "https://api.openai.com"}"#;
+        let route: RouteConfig = serde_json::from_str(json).unwrap();
+        assert!(route.spiffe.is_none());
     }
 }

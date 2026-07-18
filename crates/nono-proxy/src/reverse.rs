@@ -20,7 +20,8 @@ use crate::config::{EndpointPolicyOutcome, InjectMode};
 use crate::credential::{CmdCredentialRoute, CredentialStore, LoadedCredential};
 use crate::error::{ProxyError, Result};
 use crate::filter::ProxyFilter;
-use crate::forward::UpstreamScheme;
+use crate::forward;
+use crate::forward::{AuditCtx, UpstreamScheme, UpstreamSpec, UpstreamStrategy};
 use crate::route::RouteStore;
 use crate::token;
 use std::net::SocketAddr;
@@ -131,11 +132,20 @@ pub async fn handle_reverse_proxy(
     ctx: &ReverseProxyCtx<'_>,
     buffered_body: &[u8],
 ) -> Result<()> {
-    // Parse method, path, and HTTP version
     let (method, path, version) = parse_request_line(first_line)?;
     debug!("Reverse proxy: {} {}", method, path);
 
-    // Extract service prefix from path (e.g., "/openai/v1/chat" -> ("openai", "/v1/chat"))
+    // HTTP proxy clients send absolute URLs; strip scheme+authority so
+    // parse_service_prefix sees a relative path.
+    let path = if path.starts_with("http://") || path.starts_with("https://") {
+        path.strip_prefix("http://")
+            .or_else(|| path.strip_prefix("https://"))
+            .and_then(|s| s.find('/').map(|i| s[i..].to_string()))
+            .unwrap_or_else(|| "/".to_string())
+    } else {
+        path
+    };
+
     let (service, upstream_path) = parse_service_prefix(&path)?;
     let route = ctx
         .route_store
@@ -146,6 +156,7 @@ pub async fn handle_reverse_proxy(
     let static_cred = ctx.credential_store.get(&service);
     let cmd_route = ctx.credential_store.get_cmd(&service);
     let oauth2_route = ctx.credential_store.get_oauth2(&service);
+    let spiffe_assertion_route = ctx.credential_store.get_spiffe_assertion(&service);
     let aws_route = ctx.credential_store.get_aws(&service);
     let managed_ctx = static_cred
         .map(|cred| {
@@ -171,6 +182,7 @@ pub async fn handle_reverse_proxy(
         injection_mode: Some(nono::undo::NetworkAuditInjectionMode::OAuth2),
         ..audit::EventContext::default()
     });
+    let has_spiffe = route.has_spiffe_source();
     let route_ctx = managed_ctx
         .clone()
         .or_else(|| oauth2_ctx.clone())
@@ -183,8 +195,9 @@ pub async fn handle_reverse_proxy(
     let cmd_available = cmd_route.is_some() && ctx.credential_capture_backend.is_some();
     if route.missing_managed_credential(
         static_cred.is_some() || cmd_available,
-        oauth2_route.is_some(),
+        oauth2_route.is_some() || spiffe_assertion_route.is_some(),
         aws_route.is_some(),
+        has_spiffe,
     ) {
         let reason = format!(
             "managed credential unavailable for service '{}': route is configured for proxy-supplied auth",
@@ -244,12 +257,44 @@ pub async fn handle_reverse_proxy(
         .await;
     }
 
+    if let Some(assertion_route) = spiffe_assertion_route {
+        return handle_spiffe_assertion_credential(
+            assertion_route,
+            route,
+            &service,
+            &upstream_path,
+            &method,
+            &version,
+            stream,
+            remaining_header,
+            buffered_body,
+            ctx,
+        )
+        .await;
+    }
+
     // AWS SigV4 signing is not yet implemented. Return 501 so the caller
     // knows the route exists but is not functional. This branch will be
     // replaced with real SigV4 signing in a follow-up.
     if aws_route.is_some() {
         send_error(stream, 501, "Not Implemented").await?;
         return Ok(());
+    }
+
+    if has_spiffe {
+        return handle_spiffe_route(
+            route,
+            &service,
+            &method,
+            &upstream_path,
+            &version,
+            remaining_header,
+            buffered_body,
+            stream,
+            ctx,
+            &route_ctx,
+        )
+        .await;
     }
 
     let cred = static_cred;
@@ -549,6 +594,284 @@ pub async fn handle_reverse_proxy(
                 &e.to_string(),
             );
         }
+    }
+    Ok(())
+}
+
+/// Handle a reverse-proxy request for a SPIFFE-authenticated route.
+///
+/// Validate the localhost auth boundary for SPIFFE reverse-proxy requests.
+///
+/// Accepts `Proxy-Authorization` (forward-proxy style via `HTTP_PROXY`) or
+/// `Authorization: Bearer <session-token>` (SDK / `*_BASE_URL` style).
+fn validate_reverse_local_auth(
+    remaining_header: &[u8],
+    upstream_path: &str,
+    session_token: &Zeroizing<String>,
+) -> Result<()> {
+    if token::validate_proxy_auth(remaining_header, session_token).is_ok() {
+        return Ok(());
+    }
+    // Try Authorization: Bearer <token> first (standard pattern).
+    if validate_phantom_token_for_mode(
+        &crate::config::InjectMode::Header,
+        remaining_header,
+        upstream_path,
+        "Authorization",
+        None,
+        None,
+        session_token,
+    )
+    .is_ok()
+    {
+        return Ok(());
+    }
+    // Also accept x-api-key: <token> for clients (e.g. claude CLI) that send
+    // the API key directly without a Bearer prefix.
+    validate_phantom_token_for_mode(
+        &crate::config::InjectMode::Header,
+        remaining_header,
+        upstream_path,
+        "x-api-key",
+        None,
+        None,
+        session_token,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_spiffe_route(
+    route: &crate::route::LoadedRoute,
+    service: &str,
+    method: &str,
+    upstream_path: &str,
+    version: &str,
+    remaining_header: &[u8],
+    buffered_body: &[u8],
+    stream: &mut TcpStream,
+    ctx: &ReverseProxyCtx<'_>,
+    route_ctx: &audit::EventContext<'_>,
+) -> Result<()> {
+    // Validate the local session token before doing anything with the SPIFFE source.
+    if let Err(e) = validate_reverse_local_auth(remaining_header, upstream_path, ctx.session_token)
+    {
+        let deny_ctx = audit::EventContext {
+            auth_outcome: Some(nono::undo::NetworkAuditAuthOutcome::Failed),
+            denial_category: Some(nono::undo::NetworkAuditDenialCategory::AuthenticationFailed),
+            ..route_ctx.clone()
+        };
+        audit::log_denied(
+            ctx.audit_log,
+            audit::ProxyMode::Reverse,
+            &deny_ctx,
+            service,
+            0,
+            &e.to_string(),
+        );
+        send_error(stream, 407, "Proxy Authentication Required").await?;
+        return Ok(());
+    }
+
+    let auth = route
+        .managed_auth
+        .as_ref()
+        .ok_or_else(|| ProxyError::Credential("no managed auth on SPIFFE route".into()));
+    let material = match auth {
+        Ok(auth) => match auth.acquire().await {
+            Ok(m) => m,
+            Err(e) => {
+                warn!("SPIFFE credential unavailable: {}", e);
+                let deny_ctx = audit::EventContext {
+                    auth_mechanism: route.managed_auth_mechanism.clone(),
+                    auth_outcome: Some(nono::undo::NetworkAuditAuthOutcome::Failed),
+                    denial_category: Some(
+                        nono::undo::NetworkAuditDenialCategory::ManagedCredentialUnavailable,
+                    ),
+                    ..route_ctx.clone()
+                };
+                audit::log_denied(
+                    ctx.audit_log,
+                    audit::ProxyMode::Reverse,
+                    &deny_ctx,
+                    service,
+                    0,
+                    &e.to_string(),
+                );
+                send_error(stream, 503, "Service Unavailable").await?;
+                return Ok(());
+            }
+        },
+        Err(e) => {
+            warn!("SPIFFE credential unavailable: {}", e);
+            let deny_ctx = audit::EventContext {
+                auth_mechanism: route.managed_auth_mechanism.clone(),
+                auth_outcome: Some(nono::undo::NetworkAuditAuthOutcome::Failed),
+                denial_category: Some(
+                    nono::undo::NetworkAuditDenialCategory::ManagedCredentialUnavailable,
+                ),
+                ..route_ctx.clone()
+            };
+            audit::log_denied(
+                ctx.audit_log,
+                audit::ProxyMode::Reverse,
+                &deny_ctx,
+                service,
+                0,
+                &e.to_string(),
+            );
+            send_error(stream, 503, "Service Unavailable").await?;
+            return Ok(());
+        }
+    };
+
+    let crate::auth::UpstreamAuthMaterial::BearerToken {
+        ref header,
+        ref token,
+        ref credential_format,
+        ..
+    } = material;
+    let inject_header = Some(header.clone());
+    let inject_value = Some(Zeroizing::new(
+        credential_format.replace("{}", token.as_str()),
+    ));
+    let spiffe_ctx = material.spiffe_audit_context();
+    let success_ctx = audit::EventContext {
+        route_id: Some(service),
+        auth_mechanism: route.managed_auth_mechanism.clone(),
+        auth_outcome: Some(nono::undo::NetworkAuditAuthOutcome::Succeeded),
+        managed_credential_active: Some(true),
+        injection_mode: route.managed_injection_mode.clone(),
+        spiffe_context: Some(spiffe_ctx),
+        ..audit::EventContext::default()
+    };
+
+    let upstream_url = format!("{}{}", route.upstream.trim_end_matches('/'), upstream_path);
+    debug!("SPIFFE forward to upstream: {} {}", method, upstream_url);
+    let (upstream_scheme, upstream_host, upstream_port, upstream_path_full) =
+        parse_upstream_url(&upstream_url)?;
+    let check = ctx.filter.check_host(&upstream_host, upstream_port).await?;
+    if !check.result.is_allowed() {
+        let reason = check.result.reason();
+        warn!("Upstream host denied by filter: {}", reason);
+        send_error(stream, 403, "Forbidden").await?;
+        let deny_ctx = audit::EventContext {
+            denial_category: Some(nono::undo::NetworkAuditDenialCategory::HostDenied),
+            ..route_ctx.clone()
+        };
+        audit::log_denied(
+            ctx.audit_log,
+            audit::ProxyMode::Reverse,
+            &deny_ctx,
+            service,
+            0,
+            &reason,
+        );
+        return Ok(());
+    }
+    if let Err(reason) =
+        validate_http_upstream_target(upstream_scheme, &upstream_host, &check.resolved_addrs)
+    {
+        warn!("{}", reason);
+        send_error(stream, 502, "Bad Gateway").await?;
+        let deny_ctx = audit::EventContext {
+            denial_category: Some(nono::undo::NetworkAuditDenialCategory::UpstreamConnectFailed),
+            ..route_ctx.clone()
+        };
+        audit::log_denied(
+            ctx.audit_log,
+            audit::ProxyMode::Reverse,
+            &deny_ctx,
+            service,
+            0,
+            &reason,
+        );
+        return Ok(());
+    }
+
+    let inject_header_str = inject_header.as_deref().unwrap_or("");
+    let filtered_headers = filter_headers_multi(
+        remaining_header,
+        &[inject_header_str, "Authorization", "x-api-key"],
+    );
+    let content_length = extract_content_length(remaining_header);
+    let body = match read_request_body(stream, content_length, buffered_body).await? {
+        Some(body) => body,
+        None => return Ok(()),
+    };
+
+    let upstream_authority = format_host_header(upstream_scheme, &upstream_host, upstream_port);
+    let mut request = Zeroizing::new(format!(
+        "{} {} {}\r\nHost: {}\r\n",
+        method, upstream_path_full, version, upstream_authority
+    ));
+
+    // Inject the managed credential (SPIFFE JWT, etc.).
+    if let (Some(value), Some(header)) = (&inject_value, &inject_header) {
+        request.push_str(header);
+        request.push_str(": ");
+        request.push_str(value.as_str());
+        request.push_str("\r\n");
+    }
+
+    for (name, value) in &filtered_headers {
+        // Reject headers with CRLF in name or value — prevents a sandboxed
+        // process from injecting extra headers into the upstream request.
+        if name.contains(['\r', '\n']) || value.contains(['\r', '\n']) {
+            warn!("dropping header with CRLF in name or value: {:?}", name);
+            continue;
+        }
+        request.push_str(name);
+        request.push_str(": ");
+        request.push_str(value);
+        request.push_str("\r\n");
+    }
+
+    request.push_str("Connection: close\r\n");
+    if !body.is_empty() {
+        request.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    }
+    request.push_str("\r\n");
+
+    let default_connector = route
+        .tls_connector
+        .as_ref()
+        .unwrap_or(ctx.tls_connector)
+        .clone();
+    let connector = &default_connector;
+    let upstream_spec = UpstreamSpec {
+        scheme: upstream_scheme,
+        host: &upstream_host,
+        port: upstream_port,
+        strategy: UpstreamStrategy::Direct {
+            resolved_addrs: &check.resolved_addrs,
+        },
+        tls_connector: connector,
+    };
+    let audit_ctx = AuditCtx {
+        log: ctx.audit_log,
+        mode: audit::ProxyMode::Reverse,
+        event_ctx: success_ctx.clone(),
+        target: service,
+        method,
+        path: upstream_path,
+    };
+    if let Err(e) =
+        forward::forward_request(stream, request.as_bytes(), &body, upstream_spec, audit_ctx).await
+    {
+        warn!("SPIFFE upstream connection failed: {}", e);
+        send_error(stream, 502, "Bad Gateway").await?;
+        let deny_ctx = audit::EventContext {
+            denial_category: Some(nono::undo::NetworkAuditDenialCategory::UpstreamConnectFailed),
+            ..success_ctx
+        };
+        audit::log_denied(
+            ctx.audit_log,
+            audit::ProxyMode::Reverse,
+            &deny_ctx,
+            service,
+            0,
+            &e.to_string(),
+        );
     }
     Ok(())
 }
@@ -968,8 +1291,8 @@ fn endpoint_approval_request_id(service: &str) -> String {
 /// session token via the `Authorization: Bearer <phantom>` header, which is
 /// validated and then replaced with the real OAuth2 access token.
 #[allow(clippy::too_many_arguments)]
-async fn handle_oauth2_credential(
-    oauth2_route: &crate::credential::OAuth2Route,
+async fn handle_spiffe_assertion_credential(
+    assertion_route: &crate::credential::SpiffeAssertionRoute,
     route: &crate::route::LoadedRoute,
     service: &str,
     upstream_path: &str,
@@ -980,22 +1303,67 @@ async fn handle_oauth2_credential(
     buffered_body: &[u8],
     ctx: &ReverseProxyCtx<'_>,
 ) -> Result<()> {
-    // Get (possibly refreshed) OAuth2 access token
-    let access_token = oauth2_route.cache.get_or_refresh().await;
+    let access_token = assertion_route.cache.get_or_refresh().await?;
+    let id = &assertion_route.cache.workload_spiffe_id;
+    let spiffe_ctx = nono::undo::SpiffeAuditContext {
+        trust_domain: crate::auth::extract_trust_domain(id),
+        workload_spiffe_id: id.clone(),
+        svid_type: "jwt".to_string(),
+        source: "spire-workload-api".to_string(),
+        upstream_spiffe_id: None,
+        delegation: None,
+    };
+    handle_oauth2_like(
+        access_token,
+        Some(spiffe_ctx),
+        &assertion_route.upstream,
+        &assertion_route.inject_header,
+        route,
+        service,
+        upstream_path,
+        method,
+        stream,
+        remaining_header,
+        buffered_body,
+        ctx,
+    )
+    .await
+}
 
-    // Validate session token from Authorization header (phantom token pattern).
-    // OAuth2 routes still require the agent to authenticate with the session
-    // token — this prevents unauthorized access to the token-exchanged credential.
-    // Skipped only when `require_auth` is disabled (`nono proxy --no-auth`).
-    if ctx.require_auth
-        && let Err(e) = validate_phantom_token(remaining_header, "Authorization", ctx.session_token)
-    {
+#[allow(clippy::too_many_arguments)]
+async fn handle_oauth2_like(
+    access_token: zeroize::Zeroizing<String>,
+    spiffe_context: Option<nono::undo::SpiffeAuditContext>,
+    upstream: &str,
+    inject_header: &str,
+    route: &crate::route::LoadedRoute,
+    service: &str,
+    upstream_path: &str,
+    method: &str,
+    stream: &mut TcpStream,
+    remaining_header: &[u8],
+    buffered_body: &[u8],
+    ctx: &ReverseProxyCtx<'_>,
+) -> Result<()> {
+    if let Err(e) = validate_phantom_token(remaining_header, inject_header, ctx.session_token) {
+        let (auth_mechanism, injection_mode) = if spiffe_context.is_some() {
+            (
+                nono::undo::NetworkAuditAuthMechanism::SpiffeOAuthAssertion,
+                nono::undo::NetworkAuditInjectionMode::OAuth2,
+            )
+        } else {
+            (
+                nono::undo::NetworkAuditAuthMechanism::PhantomHeader,
+                nono::undo::NetworkAuditInjectionMode::OAuth2,
+            )
+        };
         let deny_ctx = audit::EventContext {
             route_id: Some(service),
-            auth_mechanism: Some(nono::undo::NetworkAuditAuthMechanism::PhantomHeader),
+            auth_mechanism: Some(auth_mechanism),
             auth_outcome: Some(nono::undo::NetworkAuditAuthOutcome::Failed),
             managed_credential_active: Some(true),
-            injection_mode: Some(nono::undo::NetworkAuditInjectionMode::OAuth2),
+            injection_mode: Some(injection_mode),
+            spiffe_context: spiffe_context.clone(),
             denial_category: Some(nono::undo::NetworkAuditDenialCategory::AuthenticationFailed),
             ..audit::EventContext::default()
         };
@@ -1011,36 +1379,12 @@ async fn handle_oauth2_credential(
         return Ok(());
     }
 
-    let upstream_url = format!(
-        "{}{}",
-        oauth2_route.upstream.trim_end_matches('/'),
-        upstream_path
-    );
-    debug!("OAuth2 forwarding to upstream: {} {}", method, upstream_url);
-
+    let upstream_url = format!("{}{}", upstream.trim_end_matches('/'), upstream_path);
     let (upstream_scheme, upstream_host, upstream_port, upstream_path_full) =
         parse_upstream_url(&upstream_url)?;
-    // DNS resolve + host check via the filter
     let check = ctx.filter.check_host(&upstream_host, upstream_port).await?;
     if !check.result.is_allowed() {
-        let reason = check.result.reason();
-        warn!("Upstream host denied by filter: {}", reason);
         send_error(stream, 403, "Forbidden").await?;
-        let route_ctx = audit::EventContext {
-            route_id: Some(service),
-            managed_credential_active: Some(true),
-            injection_mode: Some(nono::undo::NetworkAuditInjectionMode::OAuth2),
-            denial_category: Some(nono::undo::NetworkAuditDenialCategory::HostDenied),
-            ..audit::EventContext::default()
-        };
-        audit::log_denied(
-            ctx.audit_log,
-            audit::ProxyMode::Reverse,
-            &route_ctx,
-            service,
-            0,
-            &reason,
-        );
         return Ok(());
     }
     if let Err(reason) =
@@ -1048,36 +1392,21 @@ async fn handle_oauth2_credential(
     {
         warn!("{}", reason);
         send_error(stream, 502, "Bad Gateway").await?;
-        let route_ctx = audit::EventContext {
-            route_id: Some(service),
-            managed_credential_active: Some(true),
-            injection_mode: Some(nono::undo::NetworkAuditInjectionMode::OAuth2),
-            denial_category: Some(nono::undo::NetworkAuditDenialCategory::UpstreamConnectFailed),
-            ..audit::EventContext::default()
-        };
-        audit::log_denied(
-            ctx.audit_log,
-            audit::ProxyMode::Reverse,
-            &route_ctx,
-            service,
-            0,
-            &reason,
-        );
         return Ok(());
     }
 
-    // Collect remaining request headers, stripping the client-supplied
-    // Authorization header that carries the phantom token.
-    let filtered_headers = filter_headers(remaining_header, "Authorization");
+    // Strip the phantom header (whatever the client used) and any auth headers
+    // the client may have sent — we inject the real OAuth Bearer token below.
+    let filtered_headers = filter_headers_multi(
+        remaining_header,
+        &[inject_header, "Authorization", "x-api-key"],
+    );
     let content_length = extract_content_length(remaining_header);
-
-    // Read request body
     let body = match read_request_body(stream, content_length, buffered_body).await? {
-        Some(body) => body,
+        Some(b) => b,
         None => return Ok(()),
     };
 
-    // Build upstream request with Bearer token injection
     let upstream_authority = format_host_header(upstream_scheme, &upstream_host, upstream_port);
     let scheme_str = match upstream_scheme {
         UpstreamScheme::Https => "https",
@@ -1087,37 +1416,45 @@ async fn handle_oauth2_credential(
         "{}://{}{}",
         scheme_str, upstream_authority, upstream_path_full
     );
+    let bearer_value = zeroize::Zeroizing::new(format!("Bearer {}", access_token.as_str()));
 
-    let bearer_value = Zeroizing::new(format!("Bearer {}", access_token.as_str()));
     let mut req_builder = http::Request::builder()
         .method(method)
         .uri(&uri)
         .header("Host", &upstream_authority)
         .header("Authorization", bearer_value.as_str());
-
     for (name, value) in &filtered_headers {
         req_builder = req_builder.header(name.as_str(), value.as_str());
     }
-
     let req = req_builder
         .body(http_body_util::Full::new(bytes::Bytes::from(body)))
-        .map_err(|e| ProxyError::HttpParse(format!("request build error: {}", e)))?;
+        .map_err(|e| ProxyError::HttpParse(format!("request build error: {e}")))?;
 
     let tls_config = route
         .tls_client_config
         .as_ref()
         .unwrap_or(ctx.default_tls_config);
-
     ctx.upstream_pool
         .pin_host(&upstream_host, &check.resolved_addrs);
 
+    let (auth_mechanism, injection_mode) = if spiffe_context.is_some() {
+        (
+            nono::undo::NetworkAuditAuthMechanism::SpiffeOAuthAssertion,
+            nono::undo::NetworkAuditInjectionMode::OAuth2,
+        )
+    } else {
+        (
+            nono::undo::NetworkAuditAuthMechanism::PhantomHeader,
+            nono::undo::NetworkAuditInjectionMode::OAuth2,
+        )
+    };
     let success_event = audit::EventContext {
         route_id: Some(service),
-        auth_mechanism: Some(nono::undo::NetworkAuditAuthMechanism::PhantomHeader),
+        auth_mechanism: Some(auth_mechanism),
         auth_outcome: Some(nono::undo::NetworkAuditAuthOutcome::Succeeded),
         managed_credential_active: Some(true),
-        injection_mode: Some(nono::undo::NetworkAuditInjectionMode::OAuth2),
-        denial_category: None,
+        injection_mode: Some(injection_mode),
+        spiffe_context,
         ..audit::EventContext::default()
     };
 
@@ -1154,6 +1491,38 @@ async fn handle_oauth2_credential(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn handle_oauth2_credential(
+    oauth2_route: &crate::credential::OAuth2Route,
+    route: &crate::route::LoadedRoute,
+    service: &str,
+    upstream_path: &str,
+    method: &str,
+    _version: &str,
+    stream: &mut TcpStream,
+    remaining_header: &[u8],
+    buffered_body: &[u8],
+    ctx: &ReverseProxyCtx<'_>,
+) -> Result<()> {
+    let access_token = oauth2_route.cache.get_or_refresh().await;
+    handle_oauth2_like(
+        access_token,
+        None,
+        &oauth2_route.upstream,
+        &oauth2_route.inject_header,
+        route,
+        service,
+        upstream_path,
+        method,
+        stream,
+        remaining_header,
+        buffered_body,
+        ctx,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
 /// Read request body from the client stream with size limit.
 ///
 /// `buffered_body` contains bytes the BufReader read ahead beyond headers.
@@ -1310,6 +1679,10 @@ fn validate_phantom_token(
     let header_name_lower = header_name.to_lowercase();
 
     for line in header_str.lines() {
+        // RFC 7230: folded headers are obsolete; reject to prevent parser divergence.
+        if line.starts_with(' ') || line.starts_with('\t') {
+            return Err(ProxyError::InvalidToken);
+        }
         let lower = line.to_lowercase();
         if lower.starts_with(&format!("{}:", header_name_lower)) {
             let value = line.split_once(':').map(|(_, v)| v.trim()).unwrap_or("");
@@ -1350,6 +1723,33 @@ fn validate_phantom_token(
 /// the phantom token that must not be forwarded alongside the real credential).
 /// When `cred_header` is empty (no-credential route), all other headers
 /// including `Authorization` are passed through to the upstream.
+pub(crate) fn filter_headers_multi(header_bytes: &[u8], strip: &[&str]) -> Vec<(String, String)> {
+    let prefixes: Vec<String> = strip
+        .iter()
+        .filter(|h| !h.is_empty())
+        .map(|h| format!("{}:", h.to_lowercase()))
+        .collect();
+    let header_str = std::str::from_utf8(header_bytes).unwrap_or("");
+    let mut headers = Vec::new();
+    for line in header_str.lines() {
+        let lower = line.to_lowercase();
+        if lower.starts_with("host:")
+            || lower.starts_with("content-length:")
+            || lower.starts_with("connection:")
+            || lower.starts_with("proxy-connection:")
+            || lower.starts_with("proxy-authorization:")
+            || prefixes.iter().any(|p| lower.starts_with(p.as_str()))
+            || line.trim().is_empty()
+        {
+            continue;
+        }
+        if let Some((name, value)) = line.split_once(':') {
+            headers.push((name.trim().to_string(), value.trim().to_string()));
+        }
+    }
+    headers
+}
+
 pub(crate) fn filter_headers(header_bytes: &[u8], cred_header: &str) -> Vec<(String, String)> {
     let header_str = std::str::from_utf8(header_bytes).unwrap_or("");
     let cred_header_lower = if cred_header.is_empty() {
@@ -1364,6 +1764,7 @@ pub(crate) fn filter_headers(header_bytes: &[u8], cred_header: &str) -> Vec<(Str
         if lower.starts_with("host:")
             || lower.starts_with("content-length:")
             || lower.starts_with("connection:")
+            || lower.starts_with("proxy-connection:")
             || lower.starts_with("proxy-authorization:")
             || (!cred_header_lower.is_empty() && lower.starts_with(&cred_header_lower))
             || line.trim().is_empty()

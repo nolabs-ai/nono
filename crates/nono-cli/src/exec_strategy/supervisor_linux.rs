@@ -664,7 +664,7 @@ pub(super) enum NetworkDecision {
 ///
 /// 2. For `AF_INET`/`AF_INET6`:
 ///    - `connect()` is allowed only to `127.0.0.1:proxy_port` (the nono proxy).
-///    - `bind()` is allowed only on ports in `proxy_bind_ports`.
+///    - `bind()` is allowed on ports in `proxy_bind_ports` or within any range in `proxy_bind_port_ranges`.
 ///    - Everything else is denied.
 pub(super) fn decide_network_notification(
     child_pid: u32,
@@ -730,14 +730,19 @@ pub(super) fn decide_network_notification(
             }
         }
         SYS_BIND => {
-            // Allow bind only on configured bind ports
-            if config.proxy_bind_ports.contains(&sockaddr.port) {
-                debug!("Proxy seccomp: allowing bind on port {}", sockaddr.port);
+            let port = sockaddr.port;
+            let allowed = config.proxy_bind_ports.contains(&port)
+                || config
+                    .proxy_bind_port_ranges
+                    .iter()
+                    .any(|&(s, e)| port >= s && port <= e);
+            if allowed {
+                debug!("Proxy seccomp: allowing bind on port {}", port);
                 NetworkDecision::Allow
             } else {
                 debug!(
-                    "Proxy seccomp: denying bind on port {} (allowed: {:?})",
-                    sockaddr.port, config.proxy_bind_ports
+                    "Proxy seccomp: denying bind on port {} (allowed ports: {:?}, ranges: {:?})",
+                    port, config.proxy_bind_ports, config.proxy_bind_port_ranges
                 );
                 NetworkDecision::Deny
             }
@@ -1253,6 +1258,7 @@ fn record_network_audit_denial(
         credential_capture_header_names: None,
         credential_capture_stdin_mode: None,
         credential_capture_interactive: None,
+        spiffe_context: None,
         target,
         upstream: None,
         port: if sockaddr.port == 0 {
@@ -1612,6 +1618,22 @@ mod tests {
             proxy_bind_ports: Vec<u16>,
             unix_socket_allowlist: &'a [UnixSocketCapability],
         ) -> SupervisorConfig<'a> {
+            make_config_with_ranges(
+                backend,
+                proxy_port,
+                proxy_bind_ports,
+                vec![],
+                unix_socket_allowlist,
+            )
+        }
+
+        fn make_config_with_ranges<'a>(
+            backend: &'a DenyAllBackend,
+            proxy_port: u16,
+            proxy_bind_ports: Vec<u16>,
+            proxy_bind_port_ranges: Vec<(u16, u16)>,
+            unix_socket_allowlist: &'a [UnixSocketCapability],
+        ) -> SupervisorConfig<'a> {
             static REDACTION_POLICY: std::sync::LazyLock<nono::ScrubPolicy> =
                 std::sync::LazyLock::new(nono::ScrubPolicy::secure_default);
             SupervisorConfig {
@@ -1628,6 +1650,7 @@ mod tests {
                 allow_launch_services_active: false,
                 proxy_port,
                 proxy_bind_ports,
+                proxy_bind_port_ranges,
                 unix_socket_allowlist,
                 seccomp_policy: super::super::SeccompPolicy {
                     capability_elevation: false,
@@ -2123,6 +2146,53 @@ mod tests {
                 decide_network_notification(test_pid(), SYS_SENDTO, &inet_external(8080), &config),
                 NetworkDecision::Allow,
                 "AF_UNIX-only mode must allow non-AF_UNIX sendto"
+            );
+        }
+
+        #[test]
+        fn bind_within_port_range_is_allowed() {
+            let backend = DenyAllBackend;
+            let config = make_config_with_ranges(&backend, 0, vec![], vec![(49152, 49200)], &[]);
+            assert_eq!(
+                decide_network_notification(test_pid(), SYS_BIND, &inet_loopback(49152), &config),
+                NetworkDecision::Allow
+            );
+            assert_eq!(
+                decide_network_notification(test_pid(), SYS_BIND, &inet_loopback(49180), &config),
+                NetworkDecision::Allow
+            );
+            assert_eq!(
+                decide_network_notification(test_pid(), SYS_BIND, &inet_loopback(49200), &config),
+                NetworkDecision::Allow
+            );
+        }
+
+        #[test]
+        fn bind_outside_port_range_is_denied() {
+            let backend = DenyAllBackend;
+            let config = make_config_with_ranges(&backend, 0, vec![], vec![(49152, 49200)], &[]);
+            assert_eq!(
+                decide_network_notification(test_pid(), SYS_BIND, &inet_loopback(49151), &config),
+                NetworkDecision::Deny
+            );
+            assert_eq!(
+                decide_network_notification(test_pid(), SYS_BIND, &inet_loopback(49201), &config),
+                NetworkDecision::Deny
+            );
+        }
+
+        #[test]
+        fn bind_allowed_by_individual_port_or_range() {
+            let backend = DenyAllBackend;
+            let config =
+                make_config_with_ranges(&backend, 0, vec![3000], vec![(49152, 49200)], &[]);
+            assert_eq!(
+                decide_network_notification(test_pid(), SYS_BIND, &inet_loopback(3000), &config),
+                NetworkDecision::Allow
+            );
+            assert_eq!(
+                decide_network_notification(test_pid(), SYS_BIND, &inet_loopback(49160), &config),
+                NetworkDecision::Allow
             );
         }
     }

@@ -1436,7 +1436,7 @@ pub struct SandboxArgs {
             "allow_bind", "allow_port", "allow_connect_port", "external_proxy", "proxy_port",
             "proxy_credential", "allow_endpoint", "env_credential", "env_credential_map",
             "allow_command", "block_command", "allow_launch_services", "allow_gpu", "allow_http2",
-            "memory",
+            "memory", "max_processes",
         ],
         help_heading = "OPTIONS"
     )]
@@ -1450,6 +1450,12 @@ pub struct SandboxArgs {
     /// Enforced on Linux via cgroup v2; requires a supervised run.
     #[arg(long, value_name = "SIZE", help_heading = "RESOURCES")]
     pub memory: Option<String>,
+
+    /// Maximum number of processes and threads in the process tree.
+    /// Enforced on Linux via cgroup v2 (pids.max); requires a supervised run.
+    /// At the cap the kernel refuses new forks rather than killing anything.
+    #[arg(long, value_name = "COUNT", help_heading = "RESOURCES")]
+    pub max_processes: Option<u64>,
 
     /// Show what would be sandboxed without executing
     #[arg(long, help_heading = "OPTIONS")]
@@ -1944,9 +1950,10 @@ impl From<WrapSandboxArgs> for SandboxArgs {
             allow_http2: false,
             config: args.config,
             verbose: args.verbose,
-            // `wrap` has no `--memory` flag (it cannot enforce one); a limit in a
-            // `--config` manifest is refused at runtime in `run_wrap`.
+            // `wrap` has no `--memory` / `--max-processes` flags (it cannot enforce
+            // them); a limit in a `--config` manifest is refused at runtime in `run_wrap`.
             memory: None,
+            max_processes: None,
             dry_run: args.dry_run,
             #[cfg(target_os = "linux")]
             sandbox_policy: None,
@@ -2922,13 +2929,30 @@ mod tests {
 
     #[test]
     fn test_resource_flags_parse() {
-        let cli = Cli::parse_from(["nono", "run", "--memory", "512M", "--", "true"]);
+        // Both resource flags parse, independently and together.
+        let cli = Cli::parse_from([
+            "nono",
+            "run",
+            "--memory",
+            "512M",
+            "--max-processes",
+            "64",
+            "--",
+            "true",
+        ]);
         match cli.command {
             Commands::Run(args) => {
                 assert_eq!(args.sandbox.memory.as_deref(), Some("512M"));
+                assert_eq!(args.sandbox.max_processes, Some(64));
             }
             _ => panic!("Expected Run command"),
         }
+
+        // --max-processes takes a plain integer; a non-integer is a clap parse error.
+        assert!(
+            Cli::try_parse_from(["nono", "run", "--max-processes", "lots", "--", "true"]).is_err(),
+            "--max-processes must reject a non-integer"
+        );
     }
 
     #[test]
@@ -2938,19 +2962,34 @@ mod tests {
             "nono", "run", "--config", "m.json", "--memory", "512M", "--", "true",
         ]);
         assert!(res.is_err(), "--config and --memory must conflict");
+
+        let res = Cli::try_parse_from([
+            "nono",
+            "run",
+            "--config",
+            "m.json",
+            "--max-processes",
+            "64",
+            "--",
+            "true",
+        ]);
+        assert!(res.is_err(), "--config and --max-processes must conflict");
     }
 
     #[test]
-    fn test_wrap_rejects_memory_flag_and_from_maps_it_to_none() {
-        // `wrap` cannot enforce a memory cap (it execs directly), so it does not
-        // expose `--memory` at all — clap rejects the unknown flag.
+    fn test_wrap_rejects_resource_flags_and_from_maps_them_to_none() {
+        // `wrap` cannot enforce a cap (it execs directly), so it exposes neither
+        // resource flag — clap rejects the unknown flags.
         let res = Cli::try_parse_from(["nono", "wrap", "--memory", "256M", "--", "true"]);
         assert!(res.is_err(), "wrap must not accept --memory");
+        let res = Cli::try_parse_from(["nono", "wrap", "--max-processes", "64", "--", "true"]);
+        assert!(res.is_err(), "wrap must not accept --max-processes");
 
-        // And the hand-written `From<WrapSandboxArgs>` always maps memory to None
+        // And the hand-written `From<WrapSandboxArgs>` always maps both to None
         // (a manifest-borne limit is refused later in run_wrap, not here).
         let sandbox: SandboxArgs = WrapSandboxArgs::default().into();
         assert!(sandbox.memory.is_none());
+        assert!(sandbox.max_processes.is_none());
     }
 
     #[test]

@@ -66,6 +66,7 @@ Each entry under `commands` uses the command name as the key:
 | `intercept` | array | Ordered argument-sequence mediation rules evaluated after invocation policy. |
 | `allow_direct_exec_bypass` | absolute path array | Compatibility escape hatch for direct canonical-path invocation. |
 | `allow_direct_exec_bypass_with_credentials` | boolean | Required when a credential-using command also allows direct exec bypass. |
+| `daemon_pid_source` | `{ argv: string[], env?: string[] }` | macOS only. Helper nono runs to learn the pid of a daemon this command spawns that double-forks and reparents to pid 1 (e.g. a tmux server), so a request from that daemon can still be attributed to this command. `argv` is the helper program (expanded, then must be absolute); `env` allowlists daemon-env keys forwarded to it. See [Daemon Attribution](#daemon-attribution). |
 
 `from` entries accept three value shapes:
 
@@ -81,6 +82,7 @@ The selected `sandbox` object describes what the child receives:
 |---|---|---|
 | `fs_read` / `fs_write` | directory path arrays | Directory grants. |
 | `fs_read_file` / `fs_write_file` | file path arrays | Exact file grants. |
+| `exec_paths` | path arrays | Linux-only. Extra paths the child may execute, for multi-call tools (e.g. `git`) that re-exec their own helpers by absolute path from a compiled-in exec-path. A directory entry covers everything beneath it; a matching `fs_read` grant is still required, and missing paths are skipped so profiles can list per-distro candidates. Ignored on macOS. |
 | `network` | object | Child network grants. |
 | `environment` | object | Environment allow-list and injected static variables. |
 | `argv_prepend` | string array | Mandatory arguments inserted before caller-provided arguments. |
@@ -240,6 +242,33 @@ This is broader than `commands.<name>.allow_writable_executable`: it also covers
 Linux launches the verified executable object by file descriptor. macOS verifies the pinned file before sandboxing but must still call `execve()` by path, so a sandbox-writable executable or parent directory remains replaceable before launch. Avoid `allow_writable_executable` for high-assurance macOS policies.
 
 Interpreter-packaged tools, such as a Python `aws` entrypoint, are classified as shebang scripts. Tool Sandbox grants the selected script, its interpreter, and the interpreter's ELF loader closure. Language package directories, virtualenvs, SDK homes, and tool-specific data are not guessed by Tool Sandbox; grant those explicitly with `fs_read`, `fs_read_file`, `fs_write`, or `fs_write_file`.
+
+## Daemon Attribution
+
+Tool Sandbox authorizes a request by walking the caller's process ancestry to the session. A daemon that double-forks and reparents to pid 1 (a tmux server, for example) severs that chain, so a request from it can no longer be tied to the command that spawned it. Rather than fall back to something replayable, Tool Sandbox attributes such a caller by a platform lineage marker, or denies it:
+
+- **Linux** places each Tool Sandbox command in a per-command cgroup that survives reparenting; a severed caller is attributed by reading its cgroup. No writable cgroup base means severed callers are denied.
+- **macOS** uses `commands.<name>.daemon_pid_source`: a helper nono runs to learn the pid of the daemon the command spawns. When a caller reparented to pid 1 is seen, nono runs each declared helper and attributes the caller to a command only if the reported pid matches, pinned by the daemon's kernel identity. No declared helper means severed callers are denied.
+
+Either way a severed caller resolves only to the command that spawned it, never the session, and is denied on any mismatch.
+
+The macOS helper is declared as `{ "argv": [...], "env": [...] }`. nono passes the daemon's context as a single JSON object on **stdin**:
+
+```json
+{
+  "schema_version": 1,
+  "command": "<command name>",
+  "candidate_pid": 48213,
+  "workdir": "/abs/session/workdir",
+  "daemon_cwd": "/abs/daemon/cwd",
+  "daemon_argv": ["/path/to/daemon", "..."],
+  "daemon_env": { "SOME_KEY": "value" }
+}
+```
+
+`candidate_pid` is the severed daemon nono walked to; `daemon_cwd`, `daemon_argv`, and `daemon_env` describe it, read from the kernel, and are omitted when unreadable. `daemon_env` carries only the keys named in `env` that are present in the daemon's environment; credential-named keys are always dropped. The helper prints the pid it believes is its server on stdout; nono accepts only if that equals `candidate_pid`.
+
+The helper runs **unsandboxed** in the supervisor. It MUST only read and emit a single pid (for example, the pid file the daemon writes) and MUST NOT execute workspace-controlled code. nono hardens the launch — the `argv` program is expanded (`~`, `$WORKDIR`, `$TMPDIR`, `$UID`, XDG) and must then be an absolute path, its environment is cleared to a minimal set, its working directory is neutral, and it is killed if it exceeds a short timeout — but cannot vet what the declared helper itself does.
 
 ## Examples
 

@@ -715,6 +715,52 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
         profile.push('\n');
     }
 
+    // Lets libc command resolution get ENOENT (not a deny's EPERM, which aborts
+    // the PATH walk) on ungranted/missing $PATH entries. Metadata only, emitted
+    // last so it overrides read denies without exposing file contents.
+    // Separate sets: a dir may appear both as a $PATH target (needs subpath, to
+    // cover <dir>/<command>) and as another entry's ancestor (needs only
+    // literal). Tracking them together would let an ancestor-first literal
+    // suppress the later subpath and re-break nested lookups.
+    let mut seen_subpath = std::collections::HashSet::new();
+    let mut seen_ancestor = std::collections::HashSet::new();
+    for dir in caps.path_metadata_dirs() {
+        let dir_str = dir.to_str().ok_or_else(|| {
+            NonoError::SandboxInit(format!(
+                "PATH directory contains non-UTF-8 bytes: {}",
+                dir.display()
+            ))
+        })?;
+        if seen_subpath.insert(dir_str.to_string()) {
+            let escaped = escape_path(dir_str)?;
+            profile.push_str(&format!(
+                "(allow file-read-metadata (subpath \"{}\"))\n",
+                escaped
+            ));
+        }
+        // Ancestors (literal): Seatbelt checks metadata on every component
+        // during traversal. A subpath grant already covers a dir and its
+        // ancestors-were-walked, so stop at the first already-covered one.
+        let mut current = dir.parent();
+        while let Some(parent) = current {
+            let Some(parent_str) = parent.to_str() else {
+                break;
+            };
+            if parent_str == "/" || parent_str.is_empty() {
+                break;
+            }
+            if seen_subpath.contains(parent_str) || !seen_ancestor.insert(parent_str.to_string()) {
+                break;
+            }
+            let escaped = escape_path(parent_str)?;
+            profile.push_str(&format!(
+                "(allow file-read-metadata (literal \"{}\"))\n",
+                escaped
+            ));
+            current = parent.parent();
+        }
+    }
+
     // Network rules
     //
     // DNS resolution rules for restricted modes (Blocked/ProxyOnly):
@@ -1021,6 +1067,49 @@ mod tests {
         assert!(profile.contains("(deny network*)"));
         // Should NOT have general outbound allow (only mDNSResponder path allows)
         assert!(!profile.contains("(allow network-outbound)\n"));
+    }
+
+    #[test]
+    fn test_generate_profile_path_metadata_dirs() {
+        let mut caps = CapabilitySet::new();
+        // A non-existent PATH dir: no fs grant, so only the metadata rule
+        // makes its probe resolve to ENOENT instead of EPERM.
+        caps.add_path_metadata_dir(PathBuf::from("/nonexistent/tools/bin"));
+        caps.add_path_metadata_dir(PathBuf::from("/opt/homebrew/bin"));
+        // Duplicate must be de-duplicated.
+        caps.add_path_metadata_dir(PathBuf::from("/opt/homebrew/bin"));
+
+        let profile = generate_profile(&caps).unwrap();
+
+        assert!(
+            profile.contains("(allow file-read-metadata (subpath \"/nonexistent/tools/bin\"))")
+        );
+        assert_eq!(
+            profile
+                .matches("(allow file-read-metadata (subpath \"/opt/homebrew/bin\"))")
+                .count(),
+            1,
+            "duplicate PATH dirs should emit a single rule"
+        );
+        // Ancestors are literals so path resolution can traverse to the dir.
+        assert!(profile.contains("(allow file-read-metadata (literal \"/nonexistent/tools\"))"));
+        assert!(profile.contains("(allow file-read-metadata (literal \"/nonexistent\"))"));
+        // Metadata only — never grants data reads on PATH dirs.
+        assert!(!profile.contains("(allow file-read* (subpath \"/nonexistent/tools/bin\"))"));
+    }
+
+    #[test]
+    fn test_path_metadata_dir_that_is_also_an_ancestor_still_gets_subpath() {
+        // Regression: a dir emitted as a literal ancestor of an earlier entry
+        // must still get its own subpath when it appears as a $PATH entry,
+        // otherwise nested lookups in it fail (EPERM aborts the walk).
+        let mut caps = CapabilitySet::new();
+        caps.add_path_metadata_dir(PathBuf::from("/opt/homebrew/bin")); // emits literal /opt/homebrew
+        caps.add_path_metadata_dir(PathBuf::from("/opt/homebrew")); // must still get a subpath
+
+        let profile = generate_profile(&caps).unwrap();
+
+        assert!(profile.contains("(allow file-read-metadata (subpath \"/opt/homebrew\"))"));
     }
 
     #[test]

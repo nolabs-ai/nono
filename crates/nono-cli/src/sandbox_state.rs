@@ -78,6 +78,37 @@ pub struct FsCapState {
     /// Capability source for diagnostics (`user`, `profile`, `group:<name>`, `system`)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    /// Device number of the resolved path at sandbox start (Linux file grants
+    /// only). Landlock rules bind to the inode that was open at ruleset build
+    /// time, not to the path, so a file replaced via write-temp-then-rename
+    /// carries no rule even though the grant still names it. `nono why`
+    /// compares this against a fresh stat to surface such stale grants.
+    /// Absent in states written by older builds and on non-Linux platforms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dev: Option<u64>,
+    /// Inode number of the resolved path at sandbox start (see `dev`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ino: Option<u64>,
+}
+
+/// Stat the resolved path of a file-level grant so its identity at sandbox
+/// start can be recorded. Landlock is the only backend that binds rules to
+/// inodes (macOS Seatbelt rules are path-based), so this is Linux-only.
+#[cfg(target_os = "linux")]
+fn grant_time_inode(cap: &nono::FsCapability) -> (Option<u64>, Option<u64>) {
+    use std::os::unix::fs::MetadataExt;
+    if !cap.is_file {
+        return (None, None);
+    }
+    match std::fs::metadata(&cap.resolved) {
+        Ok(md) => (Some(md.dev()), Some(md.ino())),
+        Err(_) => (None, None),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn grant_time_inode(_cap: &nono::FsCapability) -> (Option<u64>, Option<u64>) {
+    (None, None)
 }
 
 impl SandboxState {
@@ -92,16 +123,21 @@ impl SandboxState {
             fs: caps
                 .fs_capabilities()
                 .iter()
-                .map(|c| FsCapState {
-                    original: c.original.display().to_string(),
-                    path: c.resolved.display().to_string(),
-                    access: match c.access {
-                        AccessMode::Read => "read".to_string(),
-                        AccessMode::Write => "write".to_string(),
-                        AccessMode::ReadWrite => "readwrite".to_string(),
-                    },
-                    is_file: c.is_file,
-                    source: Some(c.source.to_string()),
+                .map(|c| {
+                    let (dev, ino) = grant_time_inode(c);
+                    FsCapState {
+                        original: c.original.display().to_string(),
+                        path: c.resolved.display().to_string(),
+                        access: match c.access {
+                            AccessMode::Read => "read".to_string(),
+                            AccessMode::Write => "write".to_string(),
+                            AccessMode::ReadWrite => "readwrite".to_string(),
+                        },
+                        is_file: c.is_file,
+                        source: Some(c.source.to_string()),
+                        dev,
+                        ino,
+                    }
                 })
                 .collect(),
             net_blocked: caps.is_network_blocked(),
@@ -560,6 +596,68 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
+    fn test_from_caps_records_inode_for_file_grants_only() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempdir().expect("tempdir");
+        let file_path = dir.path().join("granted.txt");
+        std::fs::write(&file_path, b"ok").expect("write test file");
+
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(FsCapability::new_file(&file_path, AccessMode::Read).expect("file cap"));
+        caps.add_fs(FsCapability::new_dir(dir.path(), AccessMode::Read).expect("dir cap"));
+
+        let state = SandboxState::from_caps(&caps, &[], &[], &[]);
+        let file_state = state.fs.iter().find(|c| c.is_file).expect("file grant");
+        let dir_state = state.fs.iter().find(|c| !c.is_file).expect("dir grant");
+
+        let md = std::fs::metadata(&file_path).expect("stat");
+        assert_eq!(file_state.dev, Some(md.dev()));
+        assert_eq!(file_state.ino, Some(md.ino()));
+        assert_eq!(dir_state.dev, None);
+        assert_eq!(dir_state.ino, None);
+
+        // Directory grants must omit the keys entirely so states stay readable
+        // by older builds that don't know the fields.
+        let json = serde_json::to_string(&state).expect("serialize");
+        let v: serde_json::Value = serde_json::from_str(&json).expect("parse");
+        let dir_obj = v["fs"]
+            .as_array()
+            .expect("fs array")
+            .iter()
+            .find(|c| c["is_file"] == serde_json::Value::Bool(false))
+            .expect("dir entry");
+        assert!(dir_obj.get("ino").is_none());
+        assert!(dir_obj.get("dev").is_none());
+    }
+
+    #[test]
+    fn test_state_without_inode_fields_still_loads() {
+        // States written by older builds have no dev/ino keys on fs entries;
+        // strip them from a freshly serialized state to reproduce that shape.
+        let dir = tempdir().expect("tempdir");
+        let file_path = dir.path().join("granted.txt");
+        std::fs::write(&file_path, b"ok").expect("write test file");
+
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(FsCapability::new_file(&file_path, AccessMode::Read).expect("file cap"));
+        let state = SandboxState::from_caps(&caps, &[], &[], &[]);
+
+        let mut v = serde_json::to_value(&state).expect("serialize state");
+        for entry in v["fs"].as_array_mut().expect("fs array") {
+            let obj = entry.as_object_mut().expect("fs entry object");
+            obj.remove("dev");
+            obj.remove("ino");
+        }
+
+        let legacy: SandboxState = serde_json::from_value(v).expect("legacy state loads");
+        assert_eq!(legacy.fs[0].dev, None);
+        assert_eq!(legacy.fs[0].ino, None);
+        legacy.to_caps().expect("legacy state converts to caps");
+    }
+
+    #[test]
     fn test_sandbox_state_roundtrip_preserves_source() {
         let dir = tempdir().expect("tempdir");
         let file_path = dir.path().join("granted.txt");
@@ -664,6 +762,8 @@ mod tests {
                 access: "readwrite".to_string(),
                 is_file: true,
                 source: Some("profile".to_string()),
+                dev: None,
+                ino: None,
             }],
             net_blocked: false,
             allowed_commands: vec![],

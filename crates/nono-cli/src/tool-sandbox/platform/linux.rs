@@ -3552,11 +3552,13 @@ fn add_interpreted_script_read(
     binary: &ResolvedCommandBinary,
     request: &ToolSandboxShimRequest,
 ) -> Result<()> {
+    let cwd = PathBuf::from(OsString::from_vec(request.cwd.clone()));
     add_interpreted_script_read_inner(
         caps,
         &state.outer_caps,
         &binary.canonical_path,
         &request.argv,
+        &cwd,
         &state.proxy_trust_bundle_paths,
     )
 }
@@ -3596,32 +3598,43 @@ fn add_interpreted_script_read_inner(
     outer_caps: &CapabilitySet,
     binary_path: &Path,
     argv: &[Vec<u8>],
+    cwd: &Path,
     proxy_trust_bundle_paths: &[PathBuf],
 ) -> Result<()> {
     let mut granted_script = false;
     for arg in argv {
         let raw = PathBuf::from(OsString::from_vec(arg.clone()));
-        if !raw.is_absolute() {
-            continue;
-        }
+        let raw = if raw.is_absolute() {
+            raw
+        } else {
+            cwd.join(raw)
+        };
         let Ok(canon) = raw.canonicalize() else {
             continue;
         };
-        if !canon.is_file() || !is_shebang_script_for(binary_path, &canon) {
+        if !canon.is_file() {
             continue;
         }
-        for outer in outer_caps.fs_capabilities() {
-            if !matches!(outer.access, AccessMode::Read | AccessMode::ReadWrite) {
-                continue;
-            }
-            let covers = if outer.is_file {
-                outer.resolved == canon
-            } else {
-                canon.starts_with(&outer.resolved)
-            };
-            if !covers {
-                continue;
-            }
+        // Determine the covering outer read grant(s) before reading the file's
+        // header, so a path outside `outer_caps` is never opened by the
+        // unsandboxed supervisor on the strength of argv alone.
+        let covering: Vec<FsCapability> = outer_caps
+            .fs_capabilities()
+            .iter()
+            .filter(|outer| {
+                matches!(outer.access, AccessMode::Read | AccessMode::ReadWrite)
+                    && if outer.is_file {
+                        outer.resolved == canon
+                    } else {
+                        canon.starts_with(&outer.resolved)
+                    }
+            })
+            .cloned()
+            .collect();
+        if covering.is_empty() || !is_shebang_script_for(binary_path, &canon) {
+            continue;
+        }
+        for outer in covering {
             if outer.is_file {
                 caps.add_fs(FsCapability::new_file(&outer.resolved, AccessMode::Read)?);
             } else {
@@ -5601,6 +5614,7 @@ mod tests {
             &outer,
             &binary,
             &argv,
+            tmp.path(),
             std::slice::from_ref(&ca),
         )?;
         let granted: Vec<_> = caps
@@ -5634,6 +5648,7 @@ mod tests {
             &outer,
             &binary,
             &argv_data,
+            tmp.path(),
             std::slice::from_ref(&ca),
         )?;
         assert!(
@@ -5661,12 +5676,80 @@ mod tests {
             &outer,
             &binary,
             &argv_other,
+            tmp.path(),
             std::slice::from_ref(&ca),
         )?;
         assert!(
             caps_other.fs_capabilities().is_empty(),
             "shebang script for a different interpreter must grant nothing: {:?}",
             caps_other.fs_capabilities()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn interpreted_script_read_resolves_relative_argv_against_cwd() -> Result<()> {
+        let tmp = test_tempdir()?;
+        let pkg = tmp.path().join("pkg");
+        create_dir(&pkg)?;
+        let script = pkg.join("cli.js");
+        fs::write(&script, b"#!/opt/tools/bin/myinterp\n// script").map_err(|source| {
+            NonoError::ConfigWrite {
+                path: script.clone(),
+                source,
+            }
+        })?;
+        let outer = CapabilitySet::new().allow_path(tmp.path(), AccessMode::Read)?;
+        let pkg_canon = pkg.canonicalize().expect("canonicalize pkg");
+        let binary = PathBuf::from("/opt/tools/bin/myinterp");
+
+        // Interpreter invoked with a script path relative to the request cwd
+        // (e.g. `node cli.js`), not an absolute argv path.
+        let mut caps = CapabilitySet::new();
+        let argv = vec![b"myinterp".to_vec(), b"cli.js".to_vec()];
+        add_interpreted_script_read_inner(&mut caps, &outer, &binary, &argv, &pkg, &[])?;
+        let granted: Vec<_> = caps
+            .fs_capabilities()
+            .iter()
+            .map(|c| c.resolved.clone())
+            .collect();
+        assert!(
+            granted.contains(&pkg_canon) || granted.iter().any(|p| pkg_canon.starts_with(p)),
+            "relative script path must resolve against cwd and be granted: {granted:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn interpreted_script_read_grants_nothing_for_an_uncovered_script() -> Result<()> {
+        // A path outside `outer_caps` must never be classified, let alone
+        // granted, regardless of whether it looks like a matching shebang
+        // script — the coverage check must gate the file read, not follow it.
+        let tmp = test_tempdir()?;
+        let allowed = tmp.path().join("allowed");
+        create_dir(&allowed)?;
+        let outside = tmp.path().join("outside");
+        create_dir(&outside)?;
+        let script = outside.join("cli.js");
+        fs::write(&script, b"#!/opt/tools/bin/myinterp\n// script").map_err(|source| {
+            NonoError::ConfigWrite {
+                path: script.clone(),
+                source,
+            }
+        })?;
+
+        let outer = CapabilitySet::new().allow_path(&allowed, AccessMode::Read)?;
+        let binary = PathBuf::from("/opt/tools/bin/myinterp");
+        let mut caps = CapabilitySet::new();
+        let argv = vec![
+            b"myinterp".to_vec(),
+            script.to_string_lossy().into_owned().into_bytes(),
+        ];
+        add_interpreted_script_read_inner(&mut caps, &outer, &binary, &argv, tmp.path(), &[])?;
+        assert!(
+            caps.fs_capabilities().is_empty(),
+            "uncovered path must grant nothing: {:?}",
+            caps.fs_capabilities()
         );
         Ok(())
     }

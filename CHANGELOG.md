@@ -1,5 +1,34 @@
 # Changelog
 
+## [0.69.0] - 2026-07-20
+
+### Bug Fixes
+
+- *(proxy)* Don't cross-deny sibling routes sharing an upstream (#1437) ([#1437](https://github.com/nolabs-ai/nono/pull/1437))
+
+- *(tool-sandbox)* Attribute daemonized callers to their command (cgroup on linux, verified daemon-pid on macos) (#1417) ([#1417](https://github.com/nolabs-ai/nono/pull/1417))
+
+- *(exec)* Raise MAX_CRYPTO_THREADS to 12 for macOS libdispatch workqueue threads (#1424) ([#1424](https://github.com/nolabs-ai/nono/pull/1424))
+
+- *(sandbox)* Allow exec in writable grant-dirs under command policies (#1391) ([#1391](https://github.com/nolabs-ai/nono/pull/1391))
+
+
+### Documentation
+
+- *(profiles)* Fix codeblock (#1426) ([#1426](https://github.com/nolabs-ai/nono/pull/1426))
+
+
+### Features
+
+- Add profile-declared no_proxy bypass support (#1415) ([#1415](https://github.com/nolabs-ai/nono/pull/1415))
+
+- *(proxy)* Add SPIFFE/SPIRE workload identity auth for upstream routes (#1272) ([#1272](https://github.com/nolabs-ai/nono/pull/1272))
+
+
+### Bug
+
+- Fix SigV4 URI generation errors for uri's that have encoded characters in them (#1430) ([#1430](https://github.com/nolabs-ai/nono/pull/1430))
+
 ## [0.68.0] - 2026-07-14
 
 ### Bug Fixes

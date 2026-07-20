@@ -2869,7 +2869,10 @@ fn read_command_prefix(path: &Path, max_bytes: usize) -> nono::Result<Vec<u8>> {
 }
 
 #[cfg(any(test, target_os = "linux", target_os = "macos"))]
-fn classify_executable_shape(path: &Path, bytes: &[u8]) -> nono::Result<ResolvedExecutableShape> {
+pub(crate) fn classify_executable_shape(
+    path: &Path,
+    bytes: &[u8],
+) -> nono::Result<ResolvedExecutableShape> {
     if bytes.starts_with(b"\x7fELF") {
         return Ok(ResolvedExecutableShape {
             kind: ResolvedExecutableKind::Elf,

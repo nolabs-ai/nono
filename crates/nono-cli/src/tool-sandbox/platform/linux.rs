@@ -4,7 +4,8 @@ use crate::audit_integrity::{
 };
 use crate::command_policy::{
     CommandFromConfig, CommandPoliciesConfig, CommandSandboxConfig, ResolvedCommandBinaries,
-    ResolvedCommandBinary, ResolvedExecutableKind, has_explicit_self_invocation_entry,
+    ResolvedCommandBinary, ResolvedExecutableKind, classify_executable_shape,
+    has_explicit_self_invocation_entry,
 };
 use crate::lineage_cgroup::LineageMarker;
 use crate::profile;
@@ -3450,6 +3451,7 @@ fn build_child_caps(
     )?);
     add_runtime_baseline(&mut caps, &state.baseline_cache, &binary.canonical_path)?;
     add_executable_shape_baseline(&mut caps, state, binary)?;
+    add_interpreted_script_read(&mut caps, state, binary, request)?;
     add_chaining_control_caps(&mut caps, state)?;
     add_policy_fs(
         &mut caps,
@@ -3522,6 +3524,116 @@ fn add_executable_shape_baseline(
     {
         caps.add_fs(FsCapability::new_file(&canonical_real, AccessMode::Read)?);
         add_runtime_baseline(caps, &state.baseline_cache, &canonical_real)?;
+    }
+    Ok(())
+}
+
+/// Grant a re-exec'd interpreter read of the shebang script it is running.
+///
+/// A `#!/usr/bin/env <interp>` script re-exec's `<interp>` (e.g. `node`),
+/// which the exec gate launches as its own binary with the script as an argv
+/// path — not `binary.canonical_path`. Its child domain therefore never grants
+/// the script, and module runtimes fail to read the script and its co-located
+/// dependency tree (`EACCES`).
+///
+/// Scope is deliberately narrow: an argv path is treated as the interpreter's
+/// script only when it is a shebang script whose resolved interpreter is the
+/// launched binary. This excludes ordinary file arguments to non-interpreter
+/// commands (e.g. `curl /path/file`), which must not gain a read grant or the
+/// proxy trust bundle. For a matched script, re-grant the covering outer read
+/// grant(s) so the dependency tree resolves — bounded by `outer_caps`, so the
+/// interpreter never gains read access the caller did not already have — plus
+/// the session TLS-intercept trust bundle (otherwise granted only to commands
+/// with their own proxy route) so the interpreter can make the caller's HTTPS
+/// calls.
+fn add_interpreted_script_read(
+    caps: &mut CapabilitySet,
+    state: &ToolSandboxState,
+    binary: &ResolvedCommandBinary,
+    request: &ToolSandboxShimRequest,
+) -> Result<()> {
+    add_interpreted_script_read_inner(
+        caps,
+        &state.outer_caps,
+        &binary.canonical_path,
+        &request.argv,
+        &state.proxy_trust_bundle_paths,
+    )
+}
+
+/// Read up to the first 256 bytes of `path` for shebang classification.
+fn read_executable_header(path: &Path) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut file = fs::File::open(path).ok()?;
+    let mut buf = [0u8; 256];
+    let n = file.read(&mut buf).ok()?;
+    Some(buf[..n].to_vec())
+}
+
+/// True when `arg_path` is a shebang script whose resolved interpreter shares a
+/// file name with `binary_path` (the binary being launched to run it).
+fn is_shebang_script_for(binary_path: &Path, arg_path: &Path) -> bool {
+    let Some(header) = read_executable_header(arg_path) else {
+        return false;
+    };
+    let Ok(shape) = classify_executable_shape(arg_path, &header) else {
+        return false;
+    };
+    if shape.kind != ResolvedExecutableKind::ShebangScript {
+        return false;
+    }
+    let Some(shebang_interp) = shape.interpreter.as_ref() else {
+        return false;
+    };
+    // `#!/usr/bin/env <interp>` records `env`; resolve the real target.
+    let resolved = env_shebang_target_interpreter(shebang_interp, &shape.interpreter_args)
+        .unwrap_or_else(|| shebang_interp.clone());
+    resolved.file_name().is_some() && resolved.file_name() == binary_path.file_name()
+}
+
+fn add_interpreted_script_read_inner(
+    caps: &mut CapabilitySet,
+    outer_caps: &CapabilitySet,
+    binary_path: &Path,
+    argv: &[Vec<u8>],
+    proxy_trust_bundle_paths: &[PathBuf],
+) -> Result<()> {
+    let mut granted_script = false;
+    for arg in argv {
+        let raw = PathBuf::from(OsString::from_vec(arg.clone()));
+        if !raw.is_absolute() {
+            continue;
+        }
+        let Ok(canon) = raw.canonicalize() else {
+            continue;
+        };
+        if !canon.is_file() || !is_shebang_script_for(binary_path, &canon) {
+            continue;
+        }
+        for outer in outer_caps.fs_capabilities() {
+            if !matches!(outer.access, AccessMode::Read | AccessMode::ReadWrite) {
+                continue;
+            }
+            let covers = if outer.is_file {
+                outer.resolved == canon
+            } else {
+                canon.starts_with(&outer.resolved)
+            };
+            if !covers {
+                continue;
+            }
+            if outer.is_file {
+                caps.add_fs(FsCapability::new_file(&outer.resolved, AccessMode::Read)?);
+            } else {
+                caps.add_fs(FsCapability::new_dir(&outer.resolved, AccessMode::Read)?);
+            }
+            granted_script = true;
+        }
+    }
+    if granted_script {
+        for path in proxy_trust_bundle_paths {
+            caps.add_fs(FsCapability::new_file(path, AccessMode::Read)?);
+        }
     }
     Ok(())
 }
@@ -5449,6 +5561,112 @@ mod tests {
         assert!(
             !resolved.iter().any(|p| p == &missing),
             "missing exec_path must be skipped, not fatal: {resolved:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn interpreted_script_read_grants_covered_script_and_trust_bundle() -> Result<()> {
+        let tmp = test_tempdir()?;
+        let pkg = tmp.path().join("pkg");
+        create_dir(&pkg)?;
+        // A shebang script whose interpreter basename is `myinterp` (direct
+        // path, no PATH resolution needed).
+        let script = pkg.join("cli.js");
+        fs::write(&script, b"#!/opt/tools/bin/myinterp\n// script").map_err(|source| {
+            NonoError::ConfigWrite {
+                path: script.clone(),
+                source,
+            }
+        })?;
+        let ca = tmp.path().join("intercept-ca.pem");
+        fs::write(&ca, b"cert").map_err(|source| NonoError::ConfigWrite {
+            path: ca.clone(),
+            source,
+        })?;
+        // Outer sandbox grants the package tree (read) — but nothing outside it.
+        let outer = CapabilitySet::new().allow_path(tmp.path(), AccessMode::Read)?;
+        let tmp_canon = tmp.path().canonicalize().expect("canonicalize tmp");
+        let ca_canon = ca.canonicalize().expect("canonicalize ca");
+        let binary = PathBuf::from("/opt/tools/bin/myinterp");
+
+        // Interpreter (myinterp) invoked with its shebang script under the tree.
+        let mut caps = CapabilitySet::new();
+        let argv = vec![
+            b"myinterp".to_vec(),
+            script.to_string_lossy().into_owned().into_bytes(),
+        ];
+        add_interpreted_script_read_inner(
+            &mut caps,
+            &outer,
+            &binary,
+            &argv,
+            std::slice::from_ref(&ca),
+        )?;
+        let granted: Vec<_> = caps
+            .fs_capabilities()
+            .iter()
+            .map(|c| c.resolved.clone())
+            .collect();
+        assert!(
+            granted.contains(&tmp_canon),
+            "covering outer read subtree must be re-granted: {granted:?}"
+        );
+        assert!(
+            granted.contains(&ca_canon),
+            "trust bundle must be granted when a shebang script is matched: {granted:?}"
+        );
+
+        // Not a shebang script for this interpreter: a plain data file arg (the
+        // `curl /path/file` case) must grant nothing — no read, no trust bundle.
+        let data = pkg.join("data.txt");
+        fs::write(&data, b"plain data").map_err(|source| NonoError::ConfigWrite {
+            path: data.clone(),
+            source,
+        })?;
+        let mut caps_data = CapabilitySet::new();
+        let argv_data = vec![
+            b"myinterp".to_vec(),
+            data.to_string_lossy().into_owned().into_bytes(),
+        ];
+        add_interpreted_script_read_inner(
+            &mut caps_data,
+            &outer,
+            &binary,
+            &argv_data,
+            std::slice::from_ref(&ca),
+        )?;
+        assert!(
+            caps_data.fs_capabilities().is_empty(),
+            "non-shebang file arg must grant nothing: {:?}",
+            caps_data.fs_capabilities()
+        );
+
+        // A shebang script for a DIFFERENT interpreter must not match this
+        // binary (prevents unrelated commands gaining the grant / trust bundle).
+        let other = pkg.join("other.sh");
+        fs::write(&other, b"#!/bin/otherinterp\necho hi").map_err(|source| {
+            NonoError::ConfigWrite {
+                path: other.clone(),
+                source,
+            }
+        })?;
+        let mut caps_other = CapabilitySet::new();
+        let argv_other = vec![
+            b"myinterp".to_vec(),
+            other.to_string_lossy().into_owned().into_bytes(),
+        ];
+        add_interpreted_script_read_inner(
+            &mut caps_other,
+            &outer,
+            &binary,
+            &argv_other,
+            std::slice::from_ref(&ca),
+        )?;
+        assert!(
+            caps_other.fs_capabilities().is_empty(),
+            "shebang script for a different interpreter must grant nothing: {:?}",
+            caps_other.fs_capabilities()
         );
         Ok(())
     }

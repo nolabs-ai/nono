@@ -52,7 +52,7 @@ keyring = { version = "3", optional = true, default-features = false }
 # until the upstream API churn settles.
 sigstore-verify = { version = "0.9.0", default-features = false }
 sigstore-trust-root = "=0.11.0"
-x509-cert = { version = "0.2", default-features = false }
+x509-cert = { version = "0.3", default-features = false }
 der = { version = "0.7", default-features = false }
 
 [target.'cfg(target_os = "linux")'.dependencies]

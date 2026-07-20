@@ -2557,6 +2557,12 @@ fn validate_export_env(
             );
             continue;
         }
+        if pattern.matches('*').count() > 1 {
+            report.error(
+                "invalid_export_env",
+                format!("{field_label} pattern '{pattern}' contains multiple wildcards"),
+            );
+        }
         // Reject patterns that explicitly target reserved variables (exact
         // `PATH` or the `NONO_*` namespace) — nono owns those. A bare `*` or a
         // broad prefix is still fine: PATH and NONO_* are excluded at build
@@ -3853,6 +3859,29 @@ mod tests {
                 "PATH".to_string(),
                 "NONO_FOO".to_string(),
             ];
+        }
+
+        let report =
+            validate_command_policies(Some(&config), CommandPolicyValidationScope::Resolved);
+
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|finding| finding.code == "invalid_export_env")
+        );
+    }
+
+    #[test]
+    fn export_env_rejects_repeated_trailing_wildcards() {
+        // "A**" ends with '*' and doesn't start with '*', so it passes the
+        // shared validate_env_var_patterns check, but matches_env_var_patterns
+        // treats a `*`-containing prefix as unmatchable, silently excluding
+        // the variable at runtime. Enforce the same single-wildcard rule used
+        // for allow_vars.
+        let mut config = active_git_config();
+        if let Some(git) = config.commands.get_mut("git") {
+            git.export_env = vec!["A**".to_string()];
         }
 
         let report =

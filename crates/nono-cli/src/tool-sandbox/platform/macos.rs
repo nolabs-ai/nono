@@ -872,8 +872,8 @@ fn handle_url_open_stream(
 }
 
 /// Resolve the requesting command from the connecting PID and validate the URL
-/// against that command's `open_urls` policy. Returns `Ok(())` if the open is
-/// permitted, or a denial reason otherwise. Does not open the browser.
+/// against that command's policy. Returns `Ok(())` if the open is permitted,
+/// or a denial reason otherwise. Does not open the browser.
 fn validate_url_open(
     state: &ToolSandboxState,
     peer_pid: u32,
@@ -890,6 +890,22 @@ fn validate_url_open(
 
     let policy = select_effective_policy(&state.plan.config, &command_name, &launch_caller)
         .map_err(|err| format!("policy resolution failed: {err}"))?;
+
+    check_url_open_policy(policy, &command_name, url)
+}
+
+/// Pure policy check, split out from [`validate_url_open`] for unit testing
+/// without a real process tree. `allow_launch_services` trusts the command to
+/// open any URL, matching a real exec of `/usr/bin/open`; otherwise the URL
+/// must pass `open_urls.allow_origins`.
+fn check_url_open_policy(
+    policy: &CommandSandboxConfig,
+    command_name: &str,
+    url: &str,
+) -> std::result::Result<(), String> {
+    if policy.allow_launch_services {
+        return Ok(());
+    }
 
     let open_urls = policy
         .open_urls
@@ -2675,15 +2691,15 @@ fn add_launch_services_caps(caps: &mut CapabilitySet, policy: &CommandSandboxCon
 }
 
 /// Grant the brokered child connect access to the URL listener socket and read
-/// access to the open shim, when the command declares `open_urls` and did not
-/// opt into direct LaunchServices. The shim is added to the exec gate by
+/// access to the open shim, when the command declares `open_urls` or
+/// `allow_launch_services`. The shim is added to the exec gate by
 /// [`add_child_process_exec_gate_with_policy`].
 fn add_url_open_caps(
     caps: &mut CapabilitySet,
     state: &ToolSandboxState,
     policy: &CommandSandboxConfig,
 ) -> Result<()> {
-    if policy.open_urls.is_none() || policy.allow_launch_services {
+    if policy.open_urls.is_none() && !policy.allow_launch_services {
         return Ok(());
     }
     let (Some(url_socket_path), Some(shim)) =
@@ -2854,15 +2870,16 @@ fn add_child_process_exec_gate_with_policy(
             .map(|identity| identity.path.clone()),
     );
     if let Some(policy) = policy {
-        // Allow execing the browser-open shim only when this command may open
-        // URLs without direct LaunchServices.
-        if policy.open_urls.is_some()
-            && !policy.allow_launch_services
+        // A bare `open` always resolves to this shim (mediated $PATH puts the
+        // shim dir first) once any command needs one, so both `open_urls` and
+        // `allow_launch_services` commands must be allowed to exec it.
+        if (policy.open_urls.is_some() || policy.allow_launch_services)
             && let Some(shim) = state.url_open_shim.as_ref()
         {
             allowed.push(shim.path.clone());
         }
-        // Direct LaunchServices opt-in: permit execing /usr/bin/open.
+        // Direct LaunchServices opt-in: also permit execing /usr/bin/open
+        // directly, for callers that resolve it by absolute path.
         if policy.allow_launch_services {
             let open_path = Path::new("/usr/bin/open");
             if open_path.exists() {
@@ -5399,6 +5416,166 @@ mod tests {
         assert!(
             rules.contains(&"(allow file-read* (literal \"/usr/bin/security\"))"),
             "unsafe file-read rule should be present"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn exec_gate_allows_open_shim_for_allow_launch_services_without_open_urls() -> Result<()> {
+        let temp = test_tempdir()?;
+        let command = temp.path().join("tool");
+        create_executable(&command)?;
+        let binary = test_binary("tool", &command)?;
+
+        let shim_path = temp.path().join("open");
+        create_executable(&shim_path)?;
+        let shim_path =
+            shim_path
+                .canonicalize()
+                .map_err(|source| NonoError::PathCanonicalization {
+                    path: shim_path,
+                    source,
+                })?;
+        let mut state = test_state();
+        state.url_open_shim = Some(ShimIdentity {
+            path: shim_path.clone(),
+            id: FileId { dev: 0, ino: 0 },
+        });
+
+        let policy = CommandSandboxConfig {
+            allow_launch_services: true,
+            ..Default::default()
+        };
+
+        let mut caps = CapabilitySet::new();
+        add_child_process_exec_gate_with_policy(&mut caps, &state, &binary, Some(&policy))?;
+
+        assert!(
+            has_exec_rule(&caps, &shim_path)?,
+            "allow_launch_services must let the command exec the open shim, since the \
+             mediated $PATH resolves `open` there rather than /usr/bin/open"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn url_open_policy_allows_launch_services_without_open_urls() {
+        let policy = CommandSandboxConfig {
+            allow_launch_services: true,
+            ..Default::default()
+        };
+        assert!(check_url_open_policy(&policy, "tool", "https://example.com/anything").is_ok());
+    }
+
+    #[test]
+    fn url_open_policy_denies_without_open_urls_or_launch_services() {
+        let policy = CommandSandboxConfig::default();
+        assert!(check_url_open_policy(&policy, "tool", "https://example.com").is_err());
+    }
+
+    #[test]
+    fn url_open_policy_still_enforces_allow_origins_without_launch_services() {
+        let policy = CommandSandboxConfig {
+            open_urls: Some(crate::profile::OpenUrlConfig {
+                allow_origins: vec!["https://example.com".to_string()],
+                allow_localhost: false,
+            }),
+            ..Default::default()
+        };
+        assert!(check_url_open_policy(&policy, "tool", "https://example.com/login").is_ok());
+        assert!(check_url_open_policy(&policy, "tool", "https://evil.example").is_err());
+    }
+
+    #[test]
+    fn url_open_caps_granted_for_allow_launch_services_without_open_urls() -> Result<()> {
+        let temp = test_tempdir()?;
+        let shim_path = temp.path().join("open");
+        create_executable(&shim_path)?;
+        let shim_path =
+            shim_path
+                .canonicalize()
+                .map_err(|source| NonoError::PathCanonicalization {
+                    path: shim_path,
+                    source,
+                })?;
+        let socket_path = temp.path().join("url.sock");
+        std::fs::File::create(&socket_path).map_err(|source| NonoError::ConfigRead {
+            path: socket_path.clone(),
+            source,
+        })?;
+        let socket_path =
+            socket_path
+                .canonicalize()
+                .map_err(|source| NonoError::PathCanonicalization {
+                    path: socket_path,
+                    source,
+                })?;
+
+        let mut state = test_state();
+        state.url_socket_path = Some(socket_path.clone());
+        state.url_open_shim = Some(ShimIdentity {
+            path: shim_path,
+            id: FileId { dev: 0, ino: 0 },
+        });
+
+        let policy = CommandSandboxConfig {
+            allow_launch_services: true,
+            ..Default::default()
+        };
+
+        let mut caps = CapabilitySet::new();
+        add_url_open_caps(&mut caps, &state, &policy)?;
+
+        assert!(
+            caps.unix_socket_capabilities()
+                .iter()
+                .any(|cap| cap.resolved == socket_path),
+            "allow_launch_services must get connect access to the URL listener socket, since \
+             the shim always relays through it rather than execing /usr/bin/open directly"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn url_open_caps_not_granted_without_open_urls_or_launch_services() -> Result<()> {
+        let temp = test_tempdir()?;
+        let shim_path = temp.path().join("open");
+        create_executable(&shim_path)?;
+        let shim_path =
+            shim_path
+                .canonicalize()
+                .map_err(|source| NonoError::PathCanonicalization {
+                    path: shim_path,
+                    source,
+                })?;
+        let socket_path = temp.path().join("url.sock");
+        std::fs::File::create(&socket_path).map_err(|source| NonoError::ConfigRead {
+            path: socket_path.clone(),
+            source,
+        })?;
+        let socket_path =
+            socket_path
+                .canonicalize()
+                .map_err(|source| NonoError::PathCanonicalization {
+                    path: socket_path,
+                    source,
+                })?;
+
+        let mut state = test_state();
+        state.url_socket_path = Some(socket_path.clone());
+        state.url_open_shim = Some(ShimIdentity {
+            path: shim_path,
+            id: FileId { dev: 0, ino: 0 },
+        });
+
+        let policy = CommandSandboxConfig::default();
+
+        let mut caps = CapabilitySet::new();
+        add_url_open_caps(&mut caps, &state, &policy)?;
+
+        assert!(
+            caps.unix_socket_capabilities().is_empty(),
+            "a command with neither policy must get no URL socket access"
         );
         Ok(())
     }

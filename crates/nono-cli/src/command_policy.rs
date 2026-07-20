@@ -435,6 +435,37 @@ pub enum LocalSocketMode {
     Connect,
 }
 
+/// Shape of the broker nonce a capture intercept returns to the caller.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CapturedNonceShape {
+    /// Opaque `nono_<64hex>` (default).
+    #[default]
+    Opaque,
+    /// JWT-shaped `<header>.<payload>.nono_<64hex>`, for consumers that
+    /// validate token structure before use. The embedded nonce still resolves.
+    Jwt,
+}
+
+impl CapturedNonceShape {
+    /// Whether this is the default ([`CapturedNonceShape::Opaque`]).
+    pub fn is_opaque(&self) -> bool {
+        matches!(self, Self::Opaque)
+    }
+
+    /// Apply this shape to a freshly issued broker `nonce` before it is returned
+    /// to the caller. The JWT shape embeds the bare nonce in the signature
+    /// segment, so it still resolves on egress.
+    pub fn apply(&self, nonce: String) -> nono::Result<String> {
+        match self {
+            Self::Opaque => Ok(nonce),
+            Self::Jwt => nono_proxy::jwt_phantom::jwt_shaped_phantom(&nonce).map_err(|err| {
+                nono::NonoError::SandboxInit(format!("jwt-shape capture nonce: {err}"))
+            }),
+        }
+    }
+}
+
 /// Action to take when an [`InterceptRuleConfig`] matches.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -461,6 +492,11 @@ pub enum InterceptActionConfig {
         /// An empty list means any consumer may redeem (equivalent to `GrantSet::All`).
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         grant_to: Vec<String>,
+        /// Shape of the nonce returned to the caller. `jwt` wraps it so
+        /// structure-validating consumers accept the phantom; the embedded
+        /// nonce still promotes on egress.
+        #[serde(default, skip_serializing_if = "CapturedNonceShape::is_opaque")]
+        shape: CapturedNonceShape,
     },
     /// Block and route through `ApprovalBackend` before forking the child.
     /// On denial the shim receives an error response; no child is forked.
@@ -4351,12 +4387,60 @@ mod tests {
         let action = InterceptActionConfig::CaptureCredential {
             credential: "github".to_string(),
             grant_to: vec![],
+            shape: CapturedNonceShape::Opaque,
         };
         let json = serde_json::to_string(&action).expect("serialize");
 
         assert!(json.contains("capture_credential"));
+        // The default opaque shape is omitted from the serialized form.
+        assert!(!json.contains("shape"), "{json}");
         let back: InterceptActionConfig = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(action, back);
+    }
+
+    #[test]
+    fn capture_credential_shape_defaults_to_opaque() {
+        let action: InterceptActionConfig =
+            serde_json::from_str(r#"{"type":"capture_credential","credential":"github"}"#)
+                .expect("deserialize without shape");
+        assert_eq!(
+            action,
+            InterceptActionConfig::CaptureCredential {
+                credential: "github".to_string(),
+                grant_to: vec![],
+                shape: CapturedNonceShape::Opaque,
+            }
+        );
+    }
+
+    #[test]
+    fn capture_credential_shape_jwt_roundtrip() {
+        let action = InterceptActionConfig::CaptureCredential {
+            credential: "api_jwt".to_string(),
+            grant_to: vec![],
+            shape: CapturedNonceShape::Jwt,
+        };
+        let json = serde_json::to_string(&action).expect("serialize");
+        assert!(json.contains("\"shape\":\"jwt\""), "{json}");
+        let back: InterceptActionConfig = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(action, back);
+    }
+
+    #[test]
+    fn captured_nonce_shape_apply() {
+        let nonce = format!("nono_{}", "a".repeat(64));
+        // Opaque returns the nonce unchanged.
+        assert_eq!(
+            CapturedNonceShape::Opaque
+                .apply(nonce.clone())
+                .expect("opaque"),
+            nonce
+        );
+        // Jwt wraps it as three segments with the bare nonce as the signature.
+        let jwt = CapturedNonceShape::Jwt.apply(nonce.clone()).expect("jwt");
+        let segments: Vec<&str> = jwt.split('.').collect();
+        assert_eq!(segments.len(), 3);
+        assert_eq!(segments[2], nonce);
     }
 
     #[test]
@@ -4604,6 +4688,7 @@ mod tests {
             action: InterceptActionConfig::CaptureCredential {
                 credential: "github".to_string(),
                 grant_to: vec![],
+                shape: CapturedNonceShape::Opaque,
             },
             sandbox: None,
         });
@@ -4633,6 +4718,7 @@ mod tests {
             action: InterceptActionConfig::CaptureCredential {
                 credential: "agent".to_string(),
                 grant_to: vec![],
+                shape: CapturedNonceShape::Opaque,
             },
             sandbox: None,
         });
@@ -5087,6 +5173,7 @@ mod tests {
             action: InterceptActionConfig::CaptureCredential {
                 credential: "github".to_string(),
                 grant_to: Vec::new(),
+                shape: CapturedNonceShape::Opaque,
             },
             sandbox: Some(CommandSandboxConfig {
                 fs_read: vec![".".to_string()],

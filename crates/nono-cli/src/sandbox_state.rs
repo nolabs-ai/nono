@@ -92,23 +92,23 @@ pub struct FsCapState {
 }
 
 /// Stat the resolved path of a file-level grant so its identity at sandbox
-/// start can be recorded. Landlock is the only backend that binds rules to
+/// start can be recorded, as a `(dev, ino)` pair — one is meaningless
+/// without the other. Landlock is the only backend that binds rules to
 /// inodes (macOS Seatbelt rules are path-based), so this is Linux-only.
 #[cfg(target_os = "linux")]
-fn grant_time_inode(cap: &nono::FsCapability) -> (Option<u64>, Option<u64>) {
+fn grant_time_inode(cap: &nono::FsCapability) -> Option<(u64, u64)> {
     use std::os::unix::fs::MetadataExt;
     if !cap.is_file {
-        return (None, None);
+        return None;
     }
-    match std::fs::metadata(&cap.resolved) {
-        Ok(md) => (Some(md.dev()), Some(md.ino())),
-        Err(_) => (None, None),
-    }
+    std::fs::metadata(&cap.resolved)
+        .ok()
+        .map(|md| (md.dev(), md.ino()))
 }
 
 #[cfg(not(target_os = "linux"))]
-fn grant_time_inode(_cap: &nono::FsCapability) -> (Option<u64>, Option<u64>) {
-    (None, None)
+fn grant_time_inode(_cap: &nono::FsCapability) -> Option<(u64, u64)> {
+    None
 }
 
 impl SandboxState {
@@ -124,7 +124,7 @@ impl SandboxState {
                 .fs_capabilities()
                 .iter()
                 .map(|c| {
-                    let (dev, ino) = grant_time_inode(c);
+                    let inode = grant_time_inode(c);
                     FsCapState {
                         original: c.original.display().to_string(),
                         path: c.resolved.display().to_string(),
@@ -135,8 +135,8 @@ impl SandboxState {
                         },
                         is_file: c.is_file,
                         source: Some(c.source.to_string()),
-                        dev,
-                        ino,
+                        dev: inode.map(|(dev, _)| dev),
+                        ino: inode.map(|(_, ino)| ino),
                     }
                 })
                 .collect(),

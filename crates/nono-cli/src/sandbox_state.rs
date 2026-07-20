@@ -443,6 +443,48 @@ fn validate_cap_file_path(path_str: &str) -> Result<PathBuf> {
     Ok(canonical)
 }
 
+/// Lenient variant of [`load_sandbox_state`] for opportunistic consumers,
+/// such as the stale-file-grant hints in non-`--self` `nono why` queries.
+///
+/// Returns `None` on any failure (unset env var, validation failure,
+/// unreadable file, parse error) instead of exiting. Callers of this variant
+/// worked without the state file before it was consulted and must not grow a
+/// hard dependency on its readability — inside a sandbox the state file is
+/// frequently not covered by any read grant. The fallback only means fewer
+/// diagnostics; enforcement is unaffected. `--self` queries, whose whole
+/// answer comes from the state file, keep the strict fail-loud loader.
+pub fn try_load_sandbox_state() -> Option<SandboxState> {
+    let cap_file_str = std::env::var("NONO_CAP_FILE").ok()?;
+
+    let validated_path = match validate_cap_file_path(&cap_file_str) {
+        Ok(path) => path,
+        Err(e) => {
+            debug!("Skipping sandbox state for diagnostics: {}", e);
+            return None;
+        }
+    };
+
+    let content = match std::fs::read_to_string(&validated_path) {
+        Ok(content) => content,
+        Err(e) => {
+            debug!(
+                "Skipping sandbox state for diagnostics: cannot read {}: {}",
+                validated_path.display(),
+                e
+            );
+            return None;
+        }
+    };
+
+    match serde_json::from_str(&content) {
+        Ok(state) => Some(state),
+        Err(e) => {
+            debug!("Skipping sandbox state for diagnostics: parse error: {}", e);
+            None
+        }
+    }
+}
+
 /// Load sandbox state from NONO_CAP_FILE environment variable
 ///
 /// Returns None if not running inside a nono sandbox (env var not set).
@@ -934,6 +976,52 @@ mod cap_file_validation_tests {
             msg.contains("regular file") || msg.contains(".nono-"),
             "directory should be rejected: {msg}"
         );
+    }
+
+    #[test]
+    fn test_try_load_returns_none_instead_of_exiting_on_bad_cap_file() {
+        // Non-`--self` `nono why` consults the state only for staleness hints;
+        // a NONO_CAP_FILE that fails validation or cannot be read must degrade
+        // to None (pre-hint behavior), not abort the query like the strict
+        // loader does.
+        let _lock = match ENV_LOCK.lock() {
+            Ok(lock) => lock,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        // Unset: not in a sandbox.
+        {
+            let env = EnvVarGuard::set_all(&[("NONO_CAP_FILE", "placeholder")]);
+            env.remove("NONO_CAP_FILE");
+            assert!(try_load_sandbox_state().is_none());
+        }
+
+        // Validation failure (wrong location / pattern).
+        {
+            let _env = EnvVarGuard::set_all(&[("NONO_CAP_FILE", "/etc/hosts")]);
+            assert!(try_load_sandbox_state().is_none());
+        }
+
+        // Nonexistent file under a valid root.
+        {
+            let dir = tempfile::tempdir_in("/tmp").expect("tempdir");
+            let missing = dir.path().join(".nono-0000000000000000.json");
+            let missing_str = missing.to_str().expect("utf8");
+            let _env = EnvVarGuard::set_all(&[("NONO_CAP_FILE", missing_str)]);
+            assert!(try_load_sandbox_state().is_none());
+        }
+
+        // And a valid file still loads. Use env::temp_dir() rather than the
+        // /tmp anchor the other tests use: this case reads the file's
+        // contents (not just metadata), and sandboxed dev environments may
+        // grant /tmp write-only. Holding ENV_LOCK keeps TMPDIR stable here.
+        {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = write_cap_file(dir.path());
+            let path_str = path.to_str().expect("utf8");
+            let _env = EnvVarGuard::set_all(&[("NONO_CAP_FILE", path_str)]);
+            assert!(try_load_sandbox_state().is_some());
+        }
     }
 
     #[test]

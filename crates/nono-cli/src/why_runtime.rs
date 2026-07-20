@@ -95,7 +95,17 @@ pub(crate) fn run_why(args: WhyArgs) -> Result<()> {
     // that inode, so a grant whose file was since replaced is enforced against
     // the wrong (old) inode — detect those up front so path queries can report
     // them instead of a misleading plain ALLOWED.
-    let sandbox_state = load_sandbox_state();
+    //
+    // `--self` answers entirely from the state file, so it keeps the strict
+    // loader (fail loud on a bad NONO_CAP_FILE). All other modes only use the
+    // state for staleness hints and worked without it before — they use the
+    // lenient loader so an unreadable state file (common inside the sandbox)
+    // degrades to "no hints" instead of breaking the query.
+    let sandbox_state = if args.self_query {
+        load_sandbox_state()
+    } else {
+        sandbox_state::try_load_sandbox_state()
+    };
     let stale_file_grants = sandbox_state
         .as_ref()
         .map(detect_stale_file_grants)

@@ -268,6 +268,12 @@ pub struct CustomCredentialDef {
     /// Mutually exclusive with `auth` — use one or the other.
     #[serde(default)]
     pub credential_key: Option<String>,
+    /// Broker credential names redeemable at this route from a caller-presented
+    /// phantom (by-value / proof-of-possession). Composes with a managed
+    /// `credential_key`/`auth`, or stands alone; not honored with
+    /// `aws_auth`/`spiffe` (dedicated handlers that skip nonce resolution).
+    #[serde(default)]
+    pub redeem_phantoms: Vec<String>,
     /// Optional OAuth2 client_credentials configuration.
     /// When present, the proxy handles token exchange automatically.
     /// Mutually exclusive with `credential_key` — use one or the other.
@@ -625,17 +631,43 @@ fn validate_custom_credential(name: &str, cred: &CustomCredentialDef) -> Result<
         )));
     }
 
+    // aws_auth/spiffe branch to dedicated handlers that never run the
+    // nonce-resolution loop, so redeem_phantoms would be silently ignored.
+    if !cred.redeem_phantoms.is_empty() && (cred.aws_auth.is_some() || cred.spiffe.is_some()) {
+        return Err(NonoError::ProfileParse(format!(
+            "custom credential '{}' sets 'redeem_phantoms' together with 'aws_auth' or \
+             'spiffe'; those use dedicated intercept handlers that do not resolve caller nonces, \
+             so redeem_phantoms could not be honored — remove one",
+            name
+        )));
+    }
+
     // At least one auth mechanism must be set
     if cred.credential_key.is_none()
         && cred.auth.is_none()
         && cred.aws_auth.is_none()
         && cred.spiffe.is_none()
+        && cred.redeem_phantoms.is_empty()
     {
         return Err(NonoError::ProfileParse(format!(
             "custom credential '{}' must have either 'credential_key', 'auth', 'aws_auth', \
-             or 'spiffe' set",
+             'spiffe', or 'redeem_phantoms' set",
             name
         )));
+    }
+
+    for cred_name in &cred.redeem_phantoms {
+        if cred_name.is_empty()
+            || !cred_name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'+' | b'-'))
+        {
+            return Err(NonoError::ProfileParse(format!(
+                "custom credential '{}' has an invalid 'redeem_phantoms' entry '{}'; \
+                 names must be non-empty and contain only [A-Za-z0-9._+-]",
+                name, cred_name
+            )));
+        }
     }
 
     // Validate inject_header for SPIFFE routes (credential_key has its own validate_header_mode()).
@@ -5400,6 +5432,7 @@ mod tests {
 
     fn header_cred_builder() -> CustomCredentialDef {
         CustomCredentialDef {
+            redeem_phantoms: Vec::new(),
             upstream: "https://api.example.com".to_string(),
             credential_key: Some("api_key".to_string()),
             auth: None,
@@ -5564,6 +5597,7 @@ mod tests {
     #[test]
     fn test_validate_custom_credential_spiffe_only_valid() {
         let cred = CustomCredentialDef {
+            redeem_phantoms: Vec::new(),
             upstream: "http://127.0.0.1:8080".to_string(),
             credential_key: None,
             auth: None,
@@ -5594,6 +5628,45 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_redeem_phantoms_composes_with_credential_key() {
+        // A route may both inject a managed credential (credential_key) and
+        // resolve caller-presented phantoms (redeem_phantoms): the managed
+        // value goes into inject_header, caller nonces resolve on other headers.
+        let mut cred = header_cred_builder();
+        cred.redeem_phantoms = vec!["ddtool-token".to_string()];
+        assert!(validate_custom_credential("test", &cred).is_ok());
+    }
+
+    #[test]
+    fn test_validate_redeem_phantoms_rejects_empty_name() {
+        let mut cred = header_cred_builder();
+        cred.credential_key = None;
+        cred.redeem_phantoms = vec!["".to_string()];
+        let err = validate_custom_credential("test", &cred)
+            .expect_err("empty redeem_phantoms name must be rejected");
+        assert!(err.to_string().contains("redeem_phantoms"));
+    }
+
+    #[test]
+    fn test_validate_redeem_phantoms_with_spiffe_rejected() {
+        // spiffe branches to its own intercept handler that never resolves
+        // caller nonces, so redeem_phantoms could not be honored — reject.
+        let mut cred = header_cred_builder();
+        cred.credential_key = None;
+        cred.redeem_phantoms = vec!["ddtool-token".to_string()];
+        cred.spiffe = Some(nono_proxy::config::SpiffeAuthConfig::Jwt {
+            workload_api_socket: "/run/spire/agent/api.sock".to_string(),
+            audience: vec!["test-audience".to_string()],
+            inject_header: "Authorization".to_string(),
+            credential_format: None,
+            svid_hint: None,
+        });
+        let err = validate_custom_credential("test", &cred)
+            .expect_err("redeem_phantoms + spiffe must be rejected");
+        assert!(err.to_string().contains("redeem_phantoms"));
+    }
+
+    #[test]
     fn test_validate_custom_credential_spiffe_with_credential_key_rejected() {
         let mut cred = header_cred_builder();
         cred.spiffe = Some(nono_proxy::config::SpiffeAuthConfig::Jwt {
@@ -5620,6 +5693,7 @@ mod tests {
     #[test]
     fn test_validate_url_path_mode_valid() {
         let cred = CustomCredentialDef {
+            redeem_phantoms: Vec::new(),
             upstream: "https://api.telegram.org".to_string(),
             credential_key: Some("telegram_token".to_string()),
             auth: None,
@@ -5646,6 +5720,7 @@ mod tests {
     #[test]
     fn test_validate_url_path_mode_missing_pattern() {
         let cred = CustomCredentialDef {
+            redeem_phantoms: Vec::new(),
             upstream: "https://api.telegram.org".to_string(),
             credential_key: Some("telegram_token".to_string()),
             auth: None,
@@ -5674,6 +5749,7 @@ mod tests {
     #[test]
     fn test_validate_url_path_mode_pattern_without_placeholder() {
         let cred = CustomCredentialDef {
+            redeem_phantoms: Vec::new(),
             upstream: "https://api.telegram.org".to_string(),
             credential_key: Some("telegram_token".to_string()),
             auth: None,
@@ -5702,6 +5778,7 @@ mod tests {
     #[test]
     fn test_validate_url_path_mode_with_replacement() {
         let cred = CustomCredentialDef {
+            redeem_phantoms: Vec::new(),
             upstream: "https://api.telegram.org".to_string(),
             credential_key: Some("telegram_token".to_string()),
             auth: None,
@@ -5728,6 +5805,7 @@ mod tests {
     #[test]
     fn test_validate_url_path_mode_replacement_without_placeholder() {
         let cred = CustomCredentialDef {
+            redeem_phantoms: Vec::new(),
             upstream: "https://api.telegram.org".to_string(),
             credential_key: Some("telegram_token".to_string()),
             auth: None,
@@ -5756,6 +5834,7 @@ mod tests {
     #[test]
     fn test_validate_query_param_mode_valid() {
         let cred = CustomCredentialDef {
+            redeem_phantoms: Vec::new(),
             upstream: "https://maps.googleapis.com".to_string(),
             credential_key: Some("google_maps_key".to_string()),
             auth: None,
@@ -5782,6 +5861,7 @@ mod tests {
     #[test]
     fn test_validate_query_param_mode_missing_param_name() {
         let cred = CustomCredentialDef {
+            redeem_phantoms: Vec::new(),
             upstream: "https://maps.googleapis.com".to_string(),
             credential_key: Some("google_maps_key".to_string()),
             auth: None,
@@ -5810,6 +5890,7 @@ mod tests {
     #[test]
     fn test_validate_query_param_mode_empty_param_name() {
         let cred = CustomCredentialDef {
+            redeem_phantoms: Vec::new(),
             upstream: "https://maps.googleapis.com".to_string(),
             credential_key: Some("google_maps_key".to_string()),
             auth: None,
@@ -5838,6 +5919,7 @@ mod tests {
     #[test]
     fn test_validate_basic_auth_mode_valid() {
         let cred = CustomCredentialDef {
+            redeem_phantoms: Vec::new(),
             upstream: "https://api.example.com".to_string(),
             credential_key: Some("example_basic_auth".to_string()),
             auth: None,
@@ -6038,6 +6120,7 @@ mod tests {
 
     fn oauth2_cred_builder() -> CustomCredentialDef {
         CustomCredentialDef {
+            redeem_phantoms: Vec::new(),
             upstream: "https://api.example.com".to_string(),
             credential_key: None,
             auth: Some(OAuth2Config {
@@ -6708,6 +6791,7 @@ mod tests {
         base.network.custom_credentials.insert(
             "svc_a".to_string(),
             CustomCredentialDef {
+                redeem_phantoms: Vec::new(),
                 upstream: "https://a.example.com".to_string(),
                 credential_key: Some("key_a".to_string()),
                 auth: None,
@@ -6734,6 +6818,7 @@ mod tests {
         child.network.custom_credentials.insert(
             "svc_b".to_string(),
             CustomCredentialDef {
+                redeem_phantoms: Vec::new(),
                 upstream: "https://b.example.com".to_string(),
                 credential_key: Some("key_b".to_string()),
                 auth: None,
@@ -6878,6 +6963,7 @@ mod tests {
         base.network.custom_credentials.insert(
             "svc_shared".to_string(),
             CustomCredentialDef {
+                redeem_phantoms: Vec::new(),
                 upstream: "https://base.example.com".to_string(),
                 credential_key: Some("key_base".to_string()),
                 auth: None,
@@ -6904,6 +6990,7 @@ mod tests {
         child.network.custom_credentials.insert(
             "svc_shared".to_string(),
             CustomCredentialDef {
+                redeem_phantoms: Vec::new(),
                 upstream: "https://child.example.com".to_string(),
                 credential_key: Some("key_child".to_string()),
                 auth: None,
@@ -8685,6 +8772,7 @@ mod tests {
     #[test]
     fn test_validate_custom_credential_file_uri_accepted() {
         let cred = CustomCredentialDef {
+            redeem_phantoms: Vec::new(),
             upstream: "https://api.example.com".to_string(),
             credential_key: Some("file:///run/secrets/api-token".to_string()),
             auth: None,
@@ -8714,6 +8802,7 @@ mod tests {
     #[test]
     fn test_validate_custom_credential_file_uri_requires_env_var() {
         let cred = CustomCredentialDef {
+            redeem_phantoms: Vec::new(),
             upstream: "https://api.example.com".to_string(),
             credential_key: Some("file:///run/secrets/api-token".to_string()),
             auth: None,
@@ -8746,6 +8835,7 @@ mod tests {
     #[test]
     fn test_validate_custom_credential_file_uri_invalid_rejected() {
         let cred = CustomCredentialDef {
+            redeem_phantoms: Vec::new(),
             upstream: "https://api.example.com".to_string(),
             credential_key: Some("file://relative/path".to_string()),
             auth: None,
@@ -8778,6 +8868,7 @@ mod tests {
     #[test]
     fn test_validate_custom_credential_file_uri_traversal_rejected() {
         let cred = CustomCredentialDef {
+            redeem_phantoms: Vec::new(),
             upstream: "https://api.example.com".to_string(),
             credential_key: Some("file:///run/secrets/../../../etc/shadow".to_string()),
             auth: None,
@@ -8842,6 +8933,7 @@ mod tests {
     #[test]
     fn test_validate_custom_credential_env_uri_accepted() {
         let cred = CustomCredentialDef {
+            redeem_phantoms: Vec::new(),
             upstream: "https://api.example.com".to_string(),
             credential_key: Some("env://MY_API_TOKEN".to_string()),
             auth: None,
@@ -9252,6 +9344,7 @@ mod tests {
     #[test]
     fn test_validate_custom_credential_env_uri_dangerous_var_rejected() {
         let cred = CustomCredentialDef {
+            redeem_phantoms: Vec::new(),
             upstream: "https://api.example.com".to_string(),
             credential_key: Some("env://LD_PRELOAD".to_string()),
             auth: None,
@@ -10105,6 +10198,7 @@ mod tests {
 
     fn aws_auth_cred_builder() -> CustomCredentialDef {
         CustomCredentialDef {
+            redeem_phantoms: Vec::new(),
             upstream: "https://bedrock-runtime.us-east-1.amazonaws.com".to_string(),
             credential_key: None,
             auth: None,

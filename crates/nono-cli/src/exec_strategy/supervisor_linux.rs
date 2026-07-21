@@ -148,7 +148,7 @@ pub(super) fn handle_seccomp_notification(
         rate_limiter,
         denials,
         mut trust_interceptor,
-        mut pty,
+        pty,
     } = state;
 
     // 1. Receive the notification
@@ -467,15 +467,7 @@ pub(super) fn handle_seccomp_notification(
         session_id: config.session_id.to_string(),
     };
 
-    let paused_for_prompt = pty
-        .as_mut()
-        .is_some_and(|proxy| proxy.pause_terminal_for_prompt());
-    let approval_result = config.approval_backend.request_approval(&request);
-    if paused_for_prompt && let Some(proxy) = pty.as_mut() {
-        proxy.resume_terminal_after_prompt();
-    }
-
-    let decision = match approval_result {
+    let decision = match super::request_approval_with_relay_paused(config, &request, pty) {
         Ok(d) => {
             if d.is_denied() {
                 record_denial(

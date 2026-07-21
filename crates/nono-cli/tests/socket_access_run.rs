@@ -7,7 +7,9 @@
 //! filesystem deny and a `network-outbound` deny, blocking the connect.
 
 use std::fs;
-use std::os::unix::net::{UnixDatagram, UnixListener};
+#[cfg(target_os = "linux")]
+use std::os::unix::net::UnixDatagram;
+use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 

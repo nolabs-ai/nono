@@ -270,6 +270,7 @@ pub fn resolve_credentials(
                     .transpose()?,
                 oauth2,
                 aws_auth: cred.aws_auth.clone(),
+                spiffe: cred.spiffe.clone(),
             });
         } else if let Some(cred) = policy.credentials.get(name) {
             // Validate env_var against dangerous variable blocklist
@@ -303,6 +304,7 @@ pub fn resolve_credentials(
                 tls_client_key: None,
                 oauth2: None,
                 aws_auth: None,
+                spiffe: None,
             });
         }
         // We already validated existence above, so this else branch won't be hit
@@ -314,8 +316,12 @@ pub fn resolve_credentials(
 /// Build a complete `ProxyConfig` from a resolved network policy.
 ///
 /// Combines resolved hosts/suffixes with credential routes and optional
-/// CLI overrides (extra hosts).
-pub fn build_proxy_config(resolved: &ResolvedNetworkPolicy, extra_hosts: &[String]) -> ProxyConfig {
+/// CLI overrides (extra hosts and denied hosts).
+pub fn build_proxy_config(
+    resolved: &ResolvedNetworkPolicy,
+    extra_hosts: &[String],
+    denied_hosts: &[String],
+) -> ProxyConfig {
     let mut allowed_hosts = resolved.hosts.clone();
     // Convert suffixes to wildcard format for the proxy filter
     for suffix in &resolved.suffixes {
@@ -331,9 +337,37 @@ pub fn build_proxy_config(resolved: &ResolvedNetworkPolicy, extra_hosts: &[Strin
 
     ProxyConfig {
         allowed_hosts,
+        denied_hosts: denied_hosts.to_vec(),
         routes: resolved.routes.clone(),
         ..Default::default()
     }
+}
+
+/// Expand `--deny-domain` entries: if an entry matches a group name in the
+/// network policy, expand it to the group's hosts and suffixes. Otherwise
+/// treat it as a literal hostname.
+pub fn expand_proxy_deny(policy: &NetworkPolicy, entries: &[String]) -> Vec<String> {
+    let mut result = Vec::new();
+    for entry in entries {
+        if let Some(group) = policy.groups.get(entry.as_str()) {
+            result.extend(group.hosts.clone());
+            for suffix in &group.suffixes {
+                let wildcard = if suffix.starts_with('.') {
+                    format!("*{}", suffix)
+                } else {
+                    format!("*.{}", suffix)
+                };
+                result.push(wildcard);
+            }
+        } else {
+            let host = entry
+                .rsplit_once(':')
+                .and_then(|(h, p)| p.parse::<u16>().ok().map(|_| h))
+                .unwrap_or(entry.as_str());
+            result.push(host.to_string());
+        }
+    }
+    result
 }
 
 /// Expand `--allow-domain` entries: if an entry matches a group name in the
@@ -431,6 +465,7 @@ pub fn partition_allow_domain(
                         tls_client_key: None,
                         oauth2: None,
                         aws_auth: None,
+                        spiffe: None,
                     });
                 }
             }
@@ -586,6 +621,7 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 aws_auth: None,
+                spiffe: None,
             },
         );
 
@@ -628,6 +664,7 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 aws_auth: None,
+                spiffe: None,
             },
         );
 
@@ -666,6 +703,7 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 aws_auth: None,
+                spiffe: None,
             },
         );
 
@@ -714,6 +752,7 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 aws_auth: None,
+                spiffe: None,
             },
         );
 
@@ -734,7 +773,7 @@ mod tests {
             routes: vec![],
             profile_credentials: vec![],
         };
-        let config = build_proxy_config(&resolved, &["extra.example.com".to_string()]);
+        let config = build_proxy_config(&resolved, &["extra.example.com".to_string()], &[]);
         assert!(config.allowed_hosts.contains(&"api.openai.com".to_string()));
         assert!(
             config
@@ -802,6 +841,7 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 aws_auth: None,
+                spiffe: None,
             },
         );
 
@@ -837,6 +877,7 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 aws_auth: None,
+                spiffe: None,
             },
         );
 
@@ -872,6 +913,7 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 aws_auth: None,
+                spiffe: None,
             },
         );
 
@@ -912,6 +954,7 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 aws_auth: None,
+                spiffe: None,
             },
         );
 
@@ -1046,6 +1089,7 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 aws_auth: None,
+                spiffe: None,
             },
         );
 
@@ -1121,6 +1165,8 @@ mod tests {
                     client_id: "my-client".to_string(),
                     client_secret: "env://CLIENT_SECRET".to_string(),
                     scope: "api.read".to_string(),
+                    client_assertion: None,
+                    extra_params: Default::default(),
                 }),
                 inject_mode: InjectMode::Header,
                 inject_header: "Authorization".to_string(),
@@ -1136,6 +1182,7 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 aws_auth: None,
+                spiffe: None,
             },
         );
 
@@ -1186,6 +1233,7 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 aws_auth: None,
+                spiffe: None,
             },
         );
 
@@ -1342,6 +1390,7 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 aws_auth: None,
+                spiffe: None,
             },
         );
 
@@ -1383,6 +1432,7 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 aws_auth: None,
+                spiffe: None,
             },
         );
         custom.insert(
@@ -1405,6 +1455,7 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 aws_auth: None,
+                spiffe: None,
             },
         );
 
@@ -1415,5 +1466,36 @@ mod tests {
             "custom credential definitions should remain disabled until explicitly requested, got {} route(s)",
             routes.len()
         );
+    }
+
+    #[test]
+    fn test_expand_proxy_deny_plain_hostnames() {
+        let json = embedded_network_policy_json();
+        let policy = load_network_policy(json).unwrap();
+
+        let entries = vec!["evil.com".to_string(), "tracker.io".to_string()];
+        let denied = expand_proxy_deny(&policy, &entries);
+        assert_eq!(denied, vec!["evil.com", "tracker.io"]);
+    }
+
+    #[test]
+    fn test_expand_proxy_deny_strips_port() {
+        let json = embedded_network_policy_json();
+        let policy = load_network_policy(json).unwrap();
+
+        let entries = vec!["evil.com:443".to_string()];
+        let denied = expand_proxy_deny(&policy, &entries);
+        assert_eq!(denied, vec!["evil.com"]);
+    }
+
+    #[test]
+    fn test_build_proxy_config_denied_hosts_propagated() {
+        let json = embedded_network_policy_json();
+        let policy = load_network_policy(json).unwrap();
+        let profile_name = policy.profiles.keys().next().unwrap().clone();
+        let resolved = resolve_network_profile(&policy, &profile_name).unwrap();
+
+        let config = build_proxy_config(&resolved, &[], &["evil.com".to_string()]);
+        assert_eq!(config.denied_hosts, vec!["evil.com"]);
     }
 }

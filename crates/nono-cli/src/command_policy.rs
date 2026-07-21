@@ -5,7 +5,7 @@
 //! this typed config after profile inheritance has been resolved.
 
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 #[cfg(any(test, target_os = "linux", target_os = "macos"))]
 use std::ffi::OsString;
 #[cfg(any(test, target_os = "linux", target_os = "macos"))]
@@ -16,7 +16,7 @@ use std::path::Path;
 #[cfg(any(test, target_os = "linux", target_os = "macos"))]
 use std::path::PathBuf;
 
-#[cfg(any(test, target_os = "linux", target_os = "macos"))]
+#[cfg(test)]
 use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,14 +55,12 @@ pub(crate) struct CommandPolicyValidationReport {
     pub info: Vec<CommandPolicyFinding>,
 }
 
-#[cfg(any(test, target_os = "linux", target_os = "macos"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ResolvedCommandBinaries {
     pub commands: BTreeMap<String, ResolvedCommandBinary>,
     pub warnings: Vec<CommandPolicyFinding>,
 }
 
-#[cfg(any(test, target_os = "linux", target_os = "macos"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ResolvedCommandBinary {
     pub name: String,
@@ -76,8 +74,7 @@ pub(crate) struct ResolvedCommandBinary {
     pub shape: ResolvedExecutableShape,
 }
 
-#[cfg(any(test, target_os = "linux", target_os = "macos"))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ResolvedExecutableKind {
     Elf,
@@ -85,14 +82,86 @@ pub(crate) enum ResolvedExecutableKind {
     Other,
 }
 
-#[cfg(any(test, target_os = "linux", target_os = "macos"))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ResolvedExecutableShape {
     pub kind: ResolvedExecutableKind,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interpreter: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub interpreter_args: Vec<String>,
+}
+
+/// On-disk cache entry for [`resolve_policy_command_binaries`], keyed by
+/// `{dev}:{ino}:{size}:{mtime_nanos}`. Never authoritative: nono re-opens and
+/// re-hashes the real binary at exec time on every platform, so a stale entry
+/// can only cause a spurious hash-mismatch rejection, never execution of
+/// unintended content.
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CachedCommandHash {
+    pub sha256: String,
+    pub shape: ResolvedExecutableShape,
+}
+
+/// Persisted form of the command-hash cache file. No schema/version field —
+/// matches this codebase's convention (see `update_check.rs`, `pack_update_hint.rs`)
+/// of using `#[serde(default)]` per field for back-compat instead.
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct CommandHashCacheFile {
+    #[serde(default)]
+    entries: HashMap<String, CachedCommandHash>,
+}
+
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
+const COMMAND_HASH_CACHE_FILE: &str = "command-hash-cache.json";
+
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
+fn command_hash_cache_key(dev: u64, ino: u64, size: u64, mtime_nanos: i128) -> String {
+    format!("{dev}:{ino}:{size}:{mtime_nanos}")
+}
+
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
+fn command_hash_cache_file_path() -> Option<PathBuf> {
+    crate::state_paths::user_state_dir()
+        .ok()
+        .map(|dir| dir.join(COMMAND_HASH_CACHE_FILE))
+}
+
+/// Load the command-hash cache, best-effort. Any missing file, I/O error, or
+/// parse failure returns an empty cache — the resolution simply falls back to
+/// hashing everything fresh, exactly as if caching were disabled.
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
+fn load_command_hash_cache() -> HashMap<String, CachedCommandHash> {
+    let Some(path) = command_hash_cache_file_path() else {
+        return HashMap::new();
+    };
+    let Ok(content) = fs::read_to_string(&path) else {
+        return HashMap::new();
+    };
+    serde_json::from_str::<CommandHashCacheFile>(&content)
+        .map(|file| file.entries)
+        .unwrap_or_default()
+}
+
+/// Persist the command-hash cache, best-effort (write failures are silently
+/// ignored — the cache is purely an optimization).
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
+fn save_command_hash_cache(entries: &HashMap<String, CachedCommandHash>) {
+    let Some(path) = command_hash_cache_file_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent()
+        && fs::create_dir_all(parent).is_err()
+    {
+        return;
+    }
+    let file = CommandHashCacheFile {
+        entries: entries.clone(),
+    };
+    if let Ok(content) = serde_json::to_string_pretty(&file) {
+        let _ = fs::write(&path, content);
+    }
 }
 
 impl Default for CommandPolicyValidationReport {
@@ -400,6 +469,23 @@ pub enum InterceptActionConfig {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         timeout_secs: Option<u64>,
     },
+    /// Run a helper binary instead of the command's real binary, inside the
+    /// matched command's existing sandbox (same capabilities, env including
+    /// injected credentials/proxy routing, and cwd). The helper at `command[0]`
+    /// runs with `command[1..]` as fixed leading args, followed by the original
+    /// invocation's user args (`argv[1..]`). The helper's stdout/stderr are
+    /// streamed to the caller and its exit code is propagated.
+    ///
+    /// `command[0]` is `$VAR`-expanded then required to be an absolute path; it
+    /// is resolved exactly like a command binary (canonicalize/stat/sha256 with
+    /// identity expectations for TOCTOU protection) and is subject to the same
+    /// non-writable-executable trust gate as the `executable` field.
+    Exec {
+        /// Helper invocation: `command[0]` is the absolute helper path (after
+        /// `$VAR` expansion); `command[1..]` are fixed leading args prepended
+        /// before the forwarded original args.
+        command: Vec<String>,
+    },
 }
 
 /// A sub-command mediation rule on a [`CommandPolicyConfig`].
@@ -410,12 +496,18 @@ pub enum InterceptActionConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct InterceptRuleConfig {
-    /// Argument prefix to match against argv[1..] of the shim invocation.
+    /// Contiguous argument sequence to match within argv[1..] of the shim invocation.
     /// An empty list is a catch-all.
     pub args: Vec<String>,
     /// Action to take when this rule matches.
     #[serde(default)]
     pub action: InterceptActionConfig,
+    /// Optional sandbox that replaces the command's selected sandbox for the
+    /// process this matched rule launches — any launching action (not
+    /// `respond`, which launches nothing). Credentials resolve lazily, so
+    /// omitting `credentials`/`use_credentials` injects none here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<CommandSandboxConfig>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -437,6 +529,24 @@ pub struct CommandPolicyConfig {
     pub allow_direct_exec_bypass_with_credentials: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub intercept: Vec<InterceptRuleConfig>,
+    /// Helper that reports the pid of a daemon this command spawns (e.g. a tmux
+    /// server that reparents to pid 1), letting the lineage marker attribute a
+    /// severed caller back to this command. Consumed on macOS only for now.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_pid_source: Option<DaemonPidSource>,
+}
+
+/// The helper the lineage marker runs to attribute a severed daemon back to a
+/// command, plus the daemon-env keys it may see.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DaemonPidSource {
+    /// Helper program + args. The program is expanded (`~`, `$WORKDIR`, `$TMPDIR`,
+    /// `$UID`, XDG) and must then be an absolute path.
+    pub argv: Vec<String>,
+    /// Daemon-env keys nono may forward into the helper's JSON `daemon_env`.
+    #[serde(default)]
+    pub env: Vec<String>,
 }
 
 impl CommandPolicyConfig {
@@ -476,8 +586,23 @@ impl CommandPolicyConfig {
                 }
                 rules
             },
+            // Child (more-derived) replaces the base helper: replace, not merge.
+            daemon_pid_source: child
+                .daemon_pid_source
+                .clone()
+                .or_else(|| self.daemon_pid_source.clone()),
         }
     }
+}
+
+pub(crate) fn has_explicit_self_invocation_entry(
+    config: &CommandPoliciesConfig,
+    command_name: &str,
+) -> bool {
+    config.commands.get(command_name).is_some_and(|command| {
+        command.can_use.iter().any(|name| name == command_name)
+            || command.from.contains_key(command_name)
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -510,6 +635,14 @@ impl CommandFromConfig {
     pub(crate) fn sandbox(&self) -> Option<&CommandSandboxConfig> {
         match self {
             Self::Edge(edge) => Some(&edge.sandbox),
+            Self::Policy(policy) => Some(policy),
+            Self::Deny(_) => None,
+        }
+    }
+
+    fn sandbox_mut(&mut self) -> Option<&mut CommandSandboxConfig> {
+        match self {
+            Self::Edge(edge) => Some(&mut edge.sandbox),
             Self::Policy(policy) => Some(policy),
             Self::Deny(_) => None,
         }
@@ -576,6 +709,18 @@ pub struct CommandSandboxConfig {
     /// Ignored on Linux. Defaults to `false`.
     #[serde(default)]
     pub allow_launch_services: bool,
+    /// macOS-only expert escape hatch: raw Seatbelt S-expression rules appended
+    /// to this command's child sandbox profile. Rules are emitted after the
+    /// generated denies (including the exec gate's `(deny process-exec*)`), so a
+    /// later `(allow ...)` wins under Seatbelt's last-matching-rule semantics.
+    /// Mirrors the top-level `unsafe_macos_seatbelt_rules` but scoped to a single
+    /// command (or per-intercept override). Ignored on Linux.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unsafe_macos_seatbelt_rules: Vec<String>,
+    /// Extra paths this command may `exec` (Linux only), for multi-call
+    /// tools like `git` that re-exec their own helpers by absolute path.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exec_paths: Vec<String>,
 }
 
 impl CommandSandboxConfig {
@@ -599,6 +744,11 @@ impl CommandSandboxConfig {
             // narrows (or widens) wholesale, matching root-profile semantics.
             open_urls: child.open_urls.clone().or_else(|| self.open_urls.clone()),
             allow_launch_services: self.allow_launch_services || child.allow_launch_services,
+            unsafe_macos_seatbelt_rules: dedup_append(
+                &self.unsafe_macos_seatbelt_rules,
+                &child.unsafe_macos_seatbelt_rules,
+            ),
+            exec_paths: dedup_append(&self.exec_paths, &child.exec_paths),
         }
     }
 }
@@ -981,19 +1131,141 @@ pub(crate) fn validate_legacy_blocked_command_interactions(
     report
 }
 
+/// Resolution outcome for a single `command_policies.commands` entry: the
+/// matched binary (if any) plus any warnings raised along the way
+/// (`command_not_found`, `duplicate_path_command`, `script_entrypoint`).
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
+type CommandResolution = (
+    String,
+    Option<(CommandMatch, Vec<PathBuf>)>,
+    Vec<CommandPolicyFinding>,
+);
+
+/// A single `(cache_key, entry)` pair produced by a cache-missed resolution,
+/// to be merged into the persisted command-hash cache.
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
+type CommandHashCacheUpdate = (String, CachedCommandHash);
+
 #[cfg(any(test, target_os = "linux", target_os = "macos"))]
 pub(crate) fn resolve_policy_command_binaries(
     config: &CommandPoliciesConfig,
     path_env: Option<OsString>,
 ) -> nono::Result<ResolvedCommandBinaries> {
-    let mut commands = BTreeMap::new();
-    let mut warnings = Vec::new();
     let search_dirs = command_search_dirs(config, path_env)?;
 
-    for (command_name, command) in &config.commands {
+    // Loaded once, before the thread pool starts, and only ever read from
+    // inside worker threads — no locking needed on the hot path. Misses are
+    // collected per-chunk and merged into a fresh copy after the join below.
+    let cache = load_command_hash_cache();
+
+    // Command binaries are independent of one another (each is its own
+    // canonicalize+stat+read+hash), so resolve them across a pool of scoped
+    // threads instead of one at a time — the dominant cost here is I/O and
+    // SHA-256 throughput, both of which parallelize cleanly across files.
+    // `config.commands` is a `BTreeMap`, so iteration order (and therefore
+    // warning order) is already deterministic; chunking in that order and
+    // reassembling chunk-by-chunk below preserves it exactly.
+    let entries: Vec<(&String, &CommandPolicyConfig)> = config.commands.iter().collect();
+    let worker_count = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(entries.len().max(1));
+    let chunk_size = entries.len().div_ceil(worker_count.max(1)).max(1);
+
+    type ChunkOutcome = (Vec<CommandResolution>, Vec<CommandHashCacheUpdate>);
+    let chunk_results: Vec<nono::Result<ChunkOutcome>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = entries
+            .chunks(chunk_size)
+            .map(|chunk| scope.spawn(|| resolve_command_chunk(chunk, &search_dirs, &cache)))
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| {
+                handle.join().unwrap_or_else(|_| {
+                    Err(nono::NonoError::ProfileParse(
+                        "command policy resolution worker thread panicked".to_string(),
+                    ))
+                })
+            })
+            .collect()
+    });
+
+    let mut commands = BTreeMap::new();
+    let mut warnings = Vec::new();
+    let mut new_cache_entries = Vec::new();
+    for chunk_result in chunk_results {
+        let (resolutions, chunk_new_entries) = chunk_result?;
+        new_cache_entries.extend(chunk_new_entries);
+        for (command_name, resolution, command_warnings) in resolutions {
+            warnings.extend(command_warnings);
+            let Some((selected, duplicate_paths)) = resolution else {
+                continue;
+            };
+
+            if selected.shape.kind == ResolvedExecutableKind::ShebangScript {
+                let interpreter = selected
+                    .shape
+                    .interpreter
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "<unknown>".to_string());
+                warnings.push(CommandPolicyFinding::new(
+                    "script_entrypoint",
+                    format!(
+                        "command policy '{command_name}' resolved to script {}; child policy must grant interpreter/runtime {} explicitly",
+                        selected.canonical_path.display(),
+                        interpreter
+                    ),
+                ));
+            }
+
+            let resolved_binary = ResolvedCommandBinary {
+                name: command_name.clone(),
+                canonical_path: selected.canonical_path.clone(),
+                dev: selected.dev,
+                ino: selected.ino,
+                size: selected.size,
+                mtime_nanos: selected.mtime_nanos,
+                sha256: selected.sha256.clone(),
+                duplicate_paths,
+                shape: selected.shape.clone(),
+            };
+            commands.insert(command_name, resolved_binary);
+        }
+    }
+
+    if !new_cache_entries.is_empty() {
+        let mut merged = cache;
+        merged.extend(new_cache_entries);
+        save_command_hash_cache(&merged);
+    }
+
+    Ok(ResolvedCommandBinaries { commands, warnings })
+}
+
+/// Resolve a contiguous slice of `command_policies.commands` entries.
+/// Runs on a worker thread in [`resolve_policy_command_binaries`]; performs
+/// no shared-state mutation, so each entry's canonicalize→stat→hash→classify
+/// sequence stays atomic within a single thread (no per-command TOCTOU is
+/// introduced by parallelizing across commands).
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
+fn resolve_command_chunk(
+    chunk: &[(&String, &CommandPolicyConfig)],
+    search_dirs: &[CommandSearchDir],
+    cache: &HashMap<String, CachedCommandHash>,
+) -> nono::Result<(Vec<CommandResolution>, Vec<CommandHashCacheUpdate>)> {
+    let mut results = Vec::with_capacity(chunk.len());
+    let mut new_cache_entries = Vec::new();
+    for (command_name, command) in chunk {
+        let mut warnings = Vec::new();
         let resolution = if let Some(executable) = &command.executable {
-            match candidate_command_match(&PathBuf::from(executable))? {
-                Some(m) => Some((m, Vec::new())),
+            match candidate_command_match(&PathBuf::from(executable), cache)? {
+                Some((m, update)) => {
+                    if let Some(update) = update {
+                        new_cache_entries.push(update);
+                    }
+                    Some((m, Vec::new()))
+                }
                 None => {
                     warnings.push(CommandPolicyFinding::new(
                         "command_not_found",
@@ -1006,7 +1278,8 @@ pub(crate) fn resolve_policy_command_binaries(
                 }
             }
         } else {
-            let matches = find_command_matches(command_name, &search_dirs)?;
+            let matches =
+                find_command_matches(command_name, search_dirs, cache, &mut new_cache_entries)?;
             match matches.first() {
                 None => {
                     warnings.push(CommandPolicyFinding::new(
@@ -1038,44 +1311,149 @@ pub(crate) fn resolve_policy_command_binaries(
             }
         };
 
-        let Some((selected, duplicate_paths)) = resolution else {
+        results.push(((*command_name).clone(), resolution, warnings));
+    }
+    Ok((results, new_cache_entries))
+}
+
+/// Pre-resolve every `exec` intercept helper referenced by any command policy.
+///
+/// We resolve helpers at plan-build time (rather than lazily at dispatch) so
+/// their identity expectations (dev/ino/size/mtime/sha256) are captured up
+/// front for TOCTOU protection, exactly like command binaries. Helpers are
+/// resolved the SAME way as command binaries — env-expand `command[0]`, then
+/// `candidate_command_match` (canonicalize, stat, sha256, classify shape).
+///
+/// The returned map is keyed by the env-expanded helper path as written in the
+/// profile, so dispatch can re-expand `command[0]` and look the helper up. A
+/// helper that fails to resolve (missing/non-executable) is surfaced as an
+/// error rather than skipped: unlike an absent command binary (which simply
+/// disables that command's policy), an exec helper that cannot run would leave
+/// the matched subcommand with no viable handler.
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
+pub(crate) fn resolve_policy_exec_helpers(
+    config: &CommandPoliciesConfig,
+) -> nono::Result<BTreeMap<PathBuf, ResolvedCommandBinary>> {
+    let mut helpers = BTreeMap::new();
+    for (command_name, command) in &config.commands {
+        for (rule_index, rule) in command.intercept.iter().enumerate() {
+            let InterceptActionConfig::Exec {
+                command: exec_command,
+            } = &rule.action
+            else {
+                continue;
+            };
+            let Some(helper_raw) = exec_command.first() else {
+                continue;
+            };
+            let expanded = crate::policy::expand_env_vars_strict(helper_raw)?;
+            let helper_path = PathBuf::from(&expanded);
+            if !helper_path.is_absolute() {
+                return Err(nono::NonoError::ProfileParse(format!(
+                    "command '{command_name}' intercept rule {rule_index} exec helper must be an absolute path; got '{expanded}'"
+                )));
+            }
+            if helpers.contains_key(&helper_path) {
+                continue;
+            }
+            // Not scoped by the command-hash cache (that cache only covers
+            // `resolve_policy_command_binaries`'s measured hot path); an
+            // empty map here always misses, so this always hashes fresh.
+            let (resolved, _) = candidate_command_match(&helper_path, &HashMap::new())?
+                .ok_or_else(|| {
+                    nono::NonoError::ProfileParse(format!(
+                        "command '{command_name}' intercept rule {rule_index} exec helper '{expanded}' not found or not executable"
+                    ))
+                })?;
+            helpers.insert(
+                helper_path,
+                ResolvedCommandBinary {
+                    name: format!("{command_name}.intercept[{rule_index}].exec"),
+                    canonical_path: resolved.canonical_path,
+                    dev: resolved.dev,
+                    ino: resolved.ino,
+                    size: resolved.size,
+                    mtime_nanos: resolved.mtime_nanos,
+                    sha256: resolved.sha256,
+                    duplicate_paths: Vec::new(),
+                    shape: resolved.shape,
+                },
+            );
+        }
+    }
+    Ok(helpers)
+}
+
+/// Pre-resolve every command's `daemon_pid_source` helper, keyed by command
+/// name (each command declares at most one), exactly like `exec` intercept
+/// helpers: identity (dev/ino/size/mtime/sha256) is captured up front for
+/// TOCTOU protection, rather than only checking the helper path is absolute
+/// at dispatch time. A declared helper that fails to resolve is a hard error —
+/// a daemon_pid_source that can never run would silently fail closed on every
+/// severed-daemon check, which should surface at profile-build time instead.
+// daemon_pid_source is consumed on macOS only for now (see CommandPolicyConfig
+// doc comment); unlike exec_helpers this isn't wired up on Linux, so keep the
+// cfg gate macOS-only or `-D warnings` flags it as dead code there.
+#[cfg(any(test, target_os = "macos"))]
+pub(crate) fn resolve_policy_daemon_pid_source_helpers(
+    config: &CommandPoliciesConfig,
+) -> nono::Result<BTreeMap<String, ResolvedCommandBinary>> {
+    let mut helpers = BTreeMap::new();
+    for (command_name, command) in &config.commands {
+        let Some(source) = &command.daemon_pid_source else {
             continue;
         };
-
-        if selected.shape.kind == ResolvedExecutableKind::ShebangScript {
-            let interpreter = selected
-                .shape
-                .interpreter
-                .as_ref()
-                .map(|path| path.display().to_string())
-                .unwrap_or_else(|| "<unknown>".to_string());
-            warnings.push(CommandPolicyFinding::new(
-                "script_entrypoint",
-                format!(
-                    "command policy '{command_name}' resolved to script {}; child policy must grant interpreter/runtime {} explicitly",
-                    selected.canonical_path.display(),
-                    interpreter
-                ),
-            ));
+        let Some(helper_raw) = source.argv.first() else {
+            continue;
+        };
+        let helper_path = crate::policy::expand_path(helper_raw).map_err(|err| {
+            nono::NonoError::ProfileParse(format!(
+                "command '{command_name}' daemon_pid_source helper '{helper_raw}' could not be expanded: {err}"
+            ))
+        })?;
+        if !helper_path.is_absolute() {
+            return Err(nono::NonoError::ProfileParse(format!(
+                "command '{command_name}' daemon_pid_source helper must be an absolute path; got '{}'",
+                helper_path.display()
+            )));
         }
-
-        commands.insert(
+        // Not scoped by the command-hash cache, same rationale as exec helpers above.
+        let (resolved, _) = candidate_command_match(&helper_path, &HashMap::new())?
+            .ok_or_else(|| {
+                nono::NonoError::ProfileParse(format!(
+                    "command '{command_name}' daemon_pid_source helper '{}' not found or not executable",
+                    helper_path.display()
+                ))
+            })?;
+        helpers.insert(
             command_name.clone(),
             ResolvedCommandBinary {
-                name: command_name.clone(),
-                canonical_path: selected.canonical_path.clone(),
-                dev: selected.dev,
-                ino: selected.ino,
-                size: selected.size,
-                mtime_nanos: selected.mtime_nanos,
-                sha256: selected.sha256.clone(),
-                duplicate_paths,
-                shape: selected.shape.clone(),
+                name: format!("{command_name}.daemon_pid_source"),
+                canonical_path: resolved.canonical_path,
+                dev: resolved.dev,
+                ino: resolved.ino,
+                size: resolved.size,
+                mtime_nanos: resolved.mtime_nanos,
+                sha256: resolved.sha256,
+                duplicate_paths: Vec::new(),
+                shape: resolved.shape,
             },
         );
     }
+    Ok(helpers)
+}
 
-    Ok(ResolvedCommandBinaries { commands, warnings })
+/// True if the named command's `daemon_pid_source` helper opts into
+/// `allow_writable_executable`. Mirrors `command_referencing_exec_helper_allows_writable`.
+#[cfg(target_os = "macos")]
+pub(crate) fn command_daemon_pid_source_helper_allows_writable(
+    config: &CommandPoliciesConfig,
+    command_name: &str,
+) -> bool {
+    config
+        .commands
+        .get(command_name)
+        .is_some_and(|command| command.allow_writable_executable)
 }
 
 fn validate_command(
@@ -1203,13 +1581,34 @@ fn validate_command(
         }
     }
 
-    validate_intercept_rules(command_name, &command.intercept, config, report);
+    if let Some(source) = &command.daemon_pid_source {
+        validate_daemon_pid_source(command_name, source, report);
+    }
+
+    validate_intercept_rules(command_name, &command.intercept, config, scope, report);
+}
+
+/// An empty `argv` fails closed at runtime (`argv.first()` is `None`, so the
+/// command's severed-daemon attribution is silently disabled) rather than
+/// surfacing a clear error, so reject it at profile-load time instead.
+fn validate_daemon_pid_source(
+    command_name: &str,
+    source: &DaemonPidSource,
+    report: &mut CommandPolicyValidationReport,
+) {
+    if source.argv.is_empty() {
+        report.error(
+            "daemon_pid_source_empty_argv",
+            format!("command '{command_name}' daemon_pid_source.argv must not be empty"),
+        );
+    }
 }
 
 fn validate_intercept_rules(
     command_name: &str,
     rules: &[InterceptRuleConfig],
     config: &CommandPoliciesConfig,
+    scope: CommandPolicyValidationScope,
     report: &mut CommandPolicyValidationReport,
 ) {
     let mut saw_catch_all = false;
@@ -1266,6 +1665,82 @@ fn validate_intercept_rules(
                 report,
             );
         }
+        if let Some(sandbox) = &rule.sandbox {
+            // A sandbox override applies to the process the action launches. `respond`
+            // returns static output without launching anything, so an override there
+            // would be silently ignored — reject it.
+            if matches!(rule.action, InterceptActionConfig::Respond { .. }) {
+                report.error(
+                    "intercept_sandbox_on_respond",
+                    format!(
+                        "command '{command_name}' intercept rule {i} sets a sandbox override but its action is `respond`, which launches no process"
+                    ),
+                );
+            }
+            // Validate the override like a from-edge sandbox. There is no
+            // caller, so label it by rule index for error context.
+            let caller = format!("intercept[{i}].sandbox");
+            validate_sandbox(command_name, &caller, sandbox, config, scope, report);
+        }
+        if let InterceptActionConfig::Exec { command } = &rule.action {
+            validate_exec_action(command_name, i, command, report);
+        }
+    }
+}
+
+/// Validate an `exec` intercept action's `command`.
+///
+/// Config-level checks only: non-empty, NUL-free, `command[0]` is
+/// `$VAR`-expandable and resolves to an ABSOLUTE path. The non-writable
+/// executable security gate runs at plan-build time against the outer
+/// capability set (see `validate_controlled_binary_immutability` in the
+/// platform runtimes), exactly as for command binaries — it cannot be enforced
+/// here because the outer caps are not in scope.
+fn validate_exec_action(
+    command_name: &str,
+    rule_index: usize,
+    command: &[String],
+    report: &mut CommandPolicyValidationReport,
+) {
+    let Some(helper) = command.first() else {
+        report.error(
+            "intercept_exec_empty_command",
+            format!(
+                "command '{command_name}' intercept rule {rule_index} exec action has an empty command"
+            ),
+        );
+        return;
+    };
+    for element in command {
+        if element.as_bytes().contains(&0) {
+            report.error(
+                "intercept_exec_nul_byte",
+                format!(
+                    "command '{command_name}' intercept rule {rule_index} exec command contains a NUL byte"
+                ),
+            );
+            return;
+        }
+    }
+    match crate::policy::expand_env_vars_strict(helper) {
+        Ok(expanded) => {
+            if !Path::new(&expanded).is_absolute() {
+                report.error(
+                    "intercept_exec_requires_absolute_helper",
+                    format!(
+                        "command '{command_name}' intercept rule {rule_index} exec helper must expand to an absolute path; got '{expanded}'"
+                    ),
+                );
+            }
+        }
+        Err(err) => {
+            report.error(
+                "intercept_exec_unexpandable_helper",
+                format!(
+                    "command '{command_name}' intercept rule {rule_index} exec helper '{helper}' could not be expanded: {err}"
+                ),
+            );
+        }
     }
 }
 
@@ -1307,6 +1782,13 @@ fn validate_sandbox(
     }
 
     validate_argv_prepend(command_name, caller, &sandbox.argv_prepend, report);
+
+    validate_unsafe_seatbelt_rules(
+        command_name,
+        caller,
+        &sandbox.unsafe_macos_seatbelt_rules,
+        report,
+    );
 
     if let Some(network) = &sandbox.network {
         validate_network(command_name, caller, network, report);
@@ -1392,6 +1874,42 @@ fn validate_argv_prepend(
             );
         }
     }
+}
+
+fn validate_unsafe_seatbelt_rules(
+    command_name: &str,
+    caller: &str,
+    rules: &[String],
+    report: &mut CommandPolicyValidationReport,
+) {
+    if rules.is_empty() {
+        return;
+    }
+    for rule in rules {
+        if rule.trim().is_empty() {
+            report.error(
+                "invalid_unsafe_seatbelt_rule",
+                format!(
+                    "command '{command_name}' from.{caller} unsafe_macos_seatbelt_rules contains an empty rule"
+                ),
+            );
+        }
+        if rule.contains('\0') {
+            report.error(
+                "invalid_unsafe_seatbelt_rule",
+                format!(
+                    "command '{command_name}' from.{caller} unsafe_macos_seatbelt_rules contains NUL"
+                ),
+            );
+        }
+    }
+    report.warning(
+        "unsafe_seatbelt_rules",
+        format!(
+            "command '{command_name}' from.{caller} sets {} raw macOS Seatbelt rule(s) via unsafe_macos_seatbelt_rules — review carefully",
+            rules.len()
+        ),
+    );
 }
 
 fn validate_invocation_policy(
@@ -2216,14 +2734,21 @@ fn command_search_dirs(
 fn find_command_matches(
     command_name: &str,
     search_dirs: &[CommandSearchDir],
+    cache: &HashMap<String, CachedCommandHash>,
+    new_cache_entries: &mut Vec<CommandHashCacheUpdate>,
 ) -> nono::Result<Vec<CommandMatch>> {
     let mut matches = Vec::new();
     let mut explicit_errors = Vec::new();
 
     for dir in search_dirs {
         let candidate = dir.path.join(command_name);
-        match candidate_command_match(&candidate) {
-            Ok(Some(command_match)) => matches.push(command_match),
+        match candidate_command_match(&candidate, cache) {
+            Ok(Some((command_match, update))) => {
+                if let Some(update) = update {
+                    new_cache_entries.push(update);
+                }
+                matches.push(command_match);
+            }
             Ok(None) => {}
             Err(err) if dir.explicit => {
                 explicit_errors.push(format!("{}: {err}", candidate.display()))
@@ -2242,8 +2767,23 @@ fn find_command_matches(
     Ok(matches)
 }
 
+/// Bounded prefix read for executable-shape classification (ELF magic is 4
+/// bytes; a real-world shebang line is always well under this). Kept small
+/// and separate from the hash so the hash itself can stream the whole file
+/// without holding it in memory.
 #[cfg(any(test, target_os = "linux", target_os = "macos"))]
-fn candidate_command_match(candidate: &Path) -> nono::Result<Option<CommandMatch>> {
+const SHAPE_CLASSIFICATION_PREFIX_BYTES: usize = 4096;
+
+/// Resolve `candidate` to a [`CommandMatch`], consulting `cache` (keyed by
+/// `{dev}:{ino}:{size}:{mtime_nanos}`) before hashing. On a cache miss, the
+/// second element of the returned tuple carries the freshly computed
+/// `(key, CachedCommandHash)` pair for the caller to persist; `None` means
+/// either a cache hit or no cache in use (pass an empty map to always miss).
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
+fn candidate_command_match(
+    candidate: &Path,
+    cache: &HashMap<String, CachedCommandHash>,
+) -> nono::Result<Option<(CommandMatch, Option<CommandHashCacheUpdate>)>> {
     let metadata = match fs::metadata(candidate) {
         Ok(metadata) => metadata,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -2266,30 +2806,66 @@ fn candidate_command_match(candidate: &Path) -> nono::Result<Option<CommandMatch
             canonical_path.display()
         ))
     })?;
-    let bytes = fs::read(&canonical_path).map_err(|err| {
-        nono::NonoError::ProfileParse(format!(
-            "failed to hash command candidate '{}': {err}",
-            canonical_path.display()
-        ))
-    })?;
-    let sha256 = Sha256::digest(&bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    let shape = classify_executable_shape(&canonical_path, &bytes)?;
 
+    let dev = canonical_metadata.dev();
+    let ino = canonical_metadata.ino();
+    let size = canonical_metadata.size();
     let mtime_nanos = (canonical_metadata.mtime() as i128)
         .saturating_mul(1_000_000_000)
         .saturating_add(canonical_metadata.mtime_nsec() as i128);
-    Ok(Some(CommandMatch {
-        canonical_path,
-        dev: canonical_metadata.dev(),
-        ino: canonical_metadata.ino(),
-        size: canonical_metadata.size(),
-        mtime_nanos,
-        sha256,
-        shape,
-    }))
+    let cache_key = command_hash_cache_key(dev, ino, size, mtime_nanos);
+
+    let (sha256, shape, cache_update) = if let Some(cached) = cache.get(&cache_key) {
+        (cached.sha256.clone(), cached.shape.clone(), None)
+    } else {
+        let sha256 = nono::trust::file_digest(&canonical_path).map_err(|err| {
+            nono::NonoError::ProfileParse(format!(
+                "failed to hash command candidate '{}': {err}",
+                canonical_path.display()
+            ))
+        })?;
+        let prefix = read_command_prefix(&canonical_path, SHAPE_CLASSIFICATION_PREFIX_BYTES)?;
+        let shape = classify_executable_shape(&canonical_path, &prefix)?;
+        let entry = CachedCommandHash {
+            sha256: sha256.clone(),
+            shape: shape.clone(),
+        };
+        (sha256, shape, Some((cache_key, entry)))
+    };
+
+    Ok(Some((
+        CommandMatch {
+            canonical_path,
+            dev,
+            ino,
+            size,
+            mtime_nanos,
+            sha256,
+            shape,
+        },
+        cache_update,
+    )))
+}
+
+/// Read up to `max_bytes` from the start of `path`, for shape classification.
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
+fn read_command_prefix(path: &Path, max_bytes: usize) -> nono::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut file = fs::File::open(path).map_err(|err| {
+        nono::NonoError::ProfileParse(format!(
+            "failed to read command candidate '{}': {err}",
+            path.display()
+        ))
+    })?;
+    let mut buf = vec![0u8; max_bytes];
+    let n = file.read(&mut buf).map_err(|err| {
+        nono::NonoError::ProfileParse(format!(
+            "failed to read command candidate '{}': {err}",
+            path.display()
+        ))
+    })?;
+    buf.truncate(n);
+    Ok(buf)
 }
 
 #[cfg(any(test, target_os = "linux", target_os = "macos"))]
@@ -2354,6 +2930,77 @@ fn duplicate_distinct_inode_paths(
         }
     }
     duplicates
+}
+
+/// Collects `unsafe_macos_seatbelt_rules` nested inside command sandboxes,
+/// `from.<caller>` edges, and intercept rule sandbox overrides, paired with
+/// a dotted location label. Used by profile save/share warnings, which
+/// otherwise only see the top-level `Profile.unsafe_macos_seatbelt_rules`
+/// and would silently miss rules nested here.
+pub(crate) fn nested_unsafe_seatbelt_rules(
+    policies: &CommandPoliciesConfig,
+) -> Vec<(String, String)> {
+    let mut found = Vec::new();
+    for (command_name, command) in &policies.commands {
+        if let Some(sandbox) = &command.sandbox {
+            push_unsafe_seatbelt_rules(
+                &format!("commands.{command_name}.sandbox"),
+                sandbox,
+                &mut found,
+            );
+        }
+        for (caller, from) in &command.from {
+            if let Some(sandbox) = from.sandbox() {
+                push_unsafe_seatbelt_rules(
+                    &format!("commands.{command_name}.from.{caller}"),
+                    sandbox,
+                    &mut found,
+                );
+            }
+        }
+        for (i, rule) in command.intercept.iter().enumerate() {
+            if let Some(sandbox) = &rule.sandbox {
+                push_unsafe_seatbelt_rules(
+                    &format!("commands.{command_name}.intercept[{i}]"),
+                    sandbox,
+                    &mut found,
+                );
+            }
+        }
+    }
+    found
+}
+
+fn push_unsafe_seatbelt_rules(
+    location: &str,
+    sandbox: &CommandSandboxConfig,
+    found: &mut Vec<(String, String)>,
+) {
+    for rule in &sandbox.unsafe_macos_seatbelt_rules {
+        found.push((location.to_string(), rule.clone()));
+    }
+}
+
+/// Clears `unsafe_macos_seatbelt_rules` nested inside command sandboxes,
+/// `from.<caller>` edges, and intercept rule sandbox overrides. Used to
+/// enforce that raw Seatbelt rules are honoured only for user-authored
+/// profiles — see `command_runtime::strip_untrusted_unsafe_seatbelt_rules`.
+pub(crate) fn clear_unsafe_seatbelt_rules(policies: &mut CommandPoliciesConfig) {
+    for command in policies.commands.values_mut() {
+        if let Some(sandbox) = &mut command.sandbox {
+            sandbox.unsafe_macos_seatbelt_rules.clear();
+        }
+        for from in command.from.values_mut() {
+            if let Some(sandbox) = from.sandbox_mut() {
+                sandbox.unsafe_macos_seatbelt_rules.clear();
+            }
+        }
+        for rule in &mut command.intercept {
+            if let Some(sandbox) = &mut rule.sandbox {
+                sandbox.unsafe_macos_seatbelt_rules.clear();
+            }
+        }
+    }
 }
 
 fn command_uses_credentials(command: &CommandPolicyConfig) -> bool {
@@ -2623,6 +3270,27 @@ mod tests {
     }
 
     #[test]
+    fn explicit_self_invocation_entry_detects_allow_and_deny_shapes() {
+        let mut config = active_git_config();
+
+        assert!(!has_explicit_self_invocation_entry(&config, "git"));
+
+        if let Some(git) = config.commands.get_mut("git") {
+            git.can_use = vec!["git".to_string()];
+        }
+        assert!(has_explicit_self_invocation_entry(&config, "git"));
+
+        if let Some(git) = config.commands.get_mut("git") {
+            git.can_use.clear();
+            git.from.insert(
+                "git".to_string(),
+                CommandFromConfig::Deny("deny".to_string()),
+            );
+        }
+        assert!(has_explicit_self_invocation_entry(&config, "git"));
+    }
+
+    #[test]
     fn top_level_sandbox_and_from_session_is_ambiguous() {
         let mut config = active_git_config();
         if let Some(git) = config.commands.get_mut("git") {
@@ -2778,6 +3446,107 @@ mod tests {
         assert_eq!(open_urls.allow_origins, vec!["https://github.com"]);
         assert!(open_urls.allow_localhost);
         assert!(parsed.allow_launch_services);
+    }
+
+    #[test]
+    fn command_sandbox_unsafe_seatbelt_rules_round_trip() {
+        let json = r#"{
+            "unsafe_macos_seatbelt_rules": [
+                "(allow process-exec* (literal \"/usr/bin/security\"))"
+            ]
+        }"#;
+        let parsed: CommandSandboxConfig =
+            serde_json::from_str(json).expect("valid unsafe rules config should parse");
+        assert_eq!(
+            parsed.unsafe_macos_seatbelt_rules,
+            vec!["(allow process-exec* (literal \"/usr/bin/security\"))".to_string()]
+        );
+    }
+
+    #[test]
+    fn command_sandbox_unsafe_seatbelt_rules_omitted_when_empty() {
+        let sandbox = CommandSandboxConfig::default();
+        let value = serde_json::to_value(&sandbox).expect("serialize");
+        assert!(
+            value.get("unsafe_macos_seatbelt_rules").is_none(),
+            "empty unsafe_macos_seatbelt_rules should be omitted, got {value}"
+        );
+    }
+
+    #[test]
+    fn command_sandbox_unsafe_seatbelt_rules_merge_child_appends() {
+        let base = CommandSandboxConfig {
+            unsafe_macos_seatbelt_rules: vec!["(allow iokit-open)".to_string()],
+            ..Default::default()
+        };
+        let child = CommandSandboxConfig {
+            unsafe_macos_seatbelt_rules: vec![
+                "(allow iokit-open)".to_string(),
+                "(allow process-exec* (literal \"/usr/bin/security\"))".to_string(),
+            ],
+            ..Default::default()
+        };
+        let merged = base.merge_child(&child);
+        assert_eq!(
+            merged.unsafe_macos_seatbelt_rules,
+            vec![
+                "(allow iokit-open)".to_string(),
+                "(allow process-exec* (literal \"/usr/bin/security\"))".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn command_sandbox_exec_paths_merge_child_dedup_appends() {
+        let base = CommandSandboxConfig {
+            exec_paths: vec!["/usr/lib/git-core".to_string()],
+            ..Default::default()
+        };
+        let child = CommandSandboxConfig {
+            exec_paths: vec![
+                "/usr/lib/git-core".to_string(),
+                "/opt/tool/libexec".to_string(),
+            ],
+            ..Default::default()
+        };
+        let merged = base.merge_child(&child);
+        assert_eq!(
+            merged.exec_paths,
+            vec![
+                "/usr/lib/git-core".to_string(),
+                "/opt/tool/libexec".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn command_sandbox_empty_exec_paths_omitted_from_serialization() {
+        let value = serde_json::to_value(CommandSandboxConfig::default()).expect("serialize");
+        assert!(
+            value.get("exec_paths").is_none(),
+            "empty exec_paths should be omitted, got {value}"
+        );
+    }
+
+    #[test]
+    fn command_sandbox_unsafe_seatbelt_rules_empty_rule_errors() {
+        let mut config = active_git_config();
+        if let Some(git) = config.commands.get_mut("git") {
+            git.sandbox = Some(CommandSandboxConfig {
+                unsafe_macos_seatbelt_rules: vec!["   ".to_string()],
+                ..Default::default()
+            });
+        }
+        let report =
+            validate_command_policies(Some(&config), CommandPolicyValidationScope::Resolved);
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|finding| finding.code == "invalid_unsafe_seatbelt_rule"),
+            "expected invalid_unsafe_seatbelt_rule error, got {:?}",
+            report.errors
+        );
     }
 
     #[test]
@@ -3591,6 +4360,232 @@ mod tests {
     }
 
     #[test]
+    fn exec_action_serde_roundtrip() {
+        let action = InterceptActionConfig::Exec {
+            command: vec!["/abs/helper".to_string(), "x".to_string()],
+        };
+        let json = serde_json::to_string(&action).expect("serialize");
+        assert!(json.contains("\"type\":\"exec\""), "{json}");
+        assert!(json.contains("/abs/helper"), "{json}");
+        let back: InterceptActionConfig = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(action, back);
+
+        // Verify the documented wire shape deserializes.
+        let from_wire: InterceptActionConfig =
+            serde_json::from_str(r#"{"type":"exec","command":["/abs/helper","x"]}"#)
+                .expect("deserialize wire form");
+        assert_eq!(action, from_wire);
+    }
+
+    fn git_config_with_exec(command: Vec<String>) -> CommandPoliciesConfig {
+        let mut config = active_git_config();
+        let git = config.commands.get_mut("git").expect("git command");
+        git.intercept.push(InterceptRuleConfig {
+            args: vec!["auth".to_string(), "switch".to_string()],
+            action: InterceptActionConfig::Exec { command },
+            sandbox: None,
+        });
+        config
+    }
+
+    #[test]
+    fn exec_action_accepts_absolute_helper() {
+        let config = git_config_with_exec(vec!["/usr/bin/true".to_string(), "auth".to_string()]);
+        let report =
+            validate_command_policies(Some(&config), CommandPolicyValidationScope::Resolved);
+        assert!(
+            !report
+                .errors
+                .iter()
+                .any(|finding| finding.code.starts_with("intercept_exec")),
+            "{:?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn exec_action_rejects_empty_command() {
+        let config = git_config_with_exec(vec![]);
+        let report =
+            validate_command_policies(Some(&config), CommandPolicyValidationScope::Resolved);
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|finding| finding.code == "intercept_exec_empty_command"),
+            "{:?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn exec_action_rejects_relative_helper() {
+        let config = git_config_with_exec(vec!["relative/helper".to_string()]);
+        let report =
+            validate_command_policies(Some(&config), CommandPolicyValidationScope::Resolved);
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|finding| finding.code == "intercept_exec_requires_absolute_helper"),
+            "{:?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn exec_action_rejects_nul_byte() {
+        let config = git_config_with_exec(vec!["/abs/helper".to_string(), "a\0b".to_string()]);
+        let report =
+            validate_command_policies(Some(&config), CommandPolicyValidationScope::Resolved);
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|finding| finding.code == "intercept_exec_nul_byte"),
+            "{:?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn exec_helper_resolution_captures_identity() {
+        // /usr/bin/true (or /bin/true) is a stable absolute executable on both
+        // macOS and Linux.
+        let helper = ["/usr/bin/true", "/bin/true"]
+            .into_iter()
+            .map(PathBuf::from)
+            .find(|p| p.exists());
+        let Some(helper) = helper else {
+            // No stable helper available; skip rather than fail spuriously.
+            return;
+        };
+        let config = git_config_with_exec(vec![helper.display().to_string()]);
+        let helpers = resolve_policy_exec_helpers(&config).expect("resolve helpers");
+        let resolved = helpers.get(&helper).expect("helper resolved");
+        assert!(!resolved.sha256.is_empty());
+        assert!(resolved.canonical_path.is_absolute());
+    }
+
+    #[test]
+    fn resolve_policy_exec_helpers_rejects_relative_helper() {
+        let config = git_config_with_exec(vec!["relative/helper".to_string()]);
+        let err = resolve_policy_exec_helpers(&config).expect_err("must reject relative helper");
+        assert!(
+            err.to_string().contains("absolute path"),
+            "expected absolute-path rejection, got: {err}"
+        );
+    }
+
+    fn git_config_with_daemon_pid_source(argv: Vec<String>) -> CommandPoliciesConfig {
+        let mut config = active_git_config();
+        let git = config.commands.get_mut("git").expect("git command");
+        git.daemon_pid_source = Some(DaemonPidSource {
+            argv,
+            env: Vec::new(),
+        });
+        config
+    }
+
+    #[test]
+    fn daemon_pid_source_rejects_empty_argv() {
+        let config = git_config_with_daemon_pid_source(vec![]);
+        let report =
+            validate_command_policies(Some(&config), CommandPolicyValidationScope::Resolved);
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|finding| finding.code == "daemon_pid_source_empty_argv"),
+            "{:?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn daemon_pid_source_accepts_nonempty_argv() {
+        let config = git_config_with_daemon_pid_source(vec!["/usr/bin/true".to_string()]);
+        let report =
+            validate_command_policies(Some(&config), CommandPolicyValidationScope::Resolved);
+        assert!(
+            !report
+                .errors
+                .iter()
+                .any(|finding| finding.code == "daemon_pid_source_empty_argv"),
+            "{:?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn daemon_pid_source_helper_resolution_captures_identity() {
+        let helper = ["/usr/bin/true", "/bin/true"]
+            .into_iter()
+            .map(PathBuf::from)
+            .find(|p| p.exists());
+        let Some(helper) = helper else {
+            return; // no stable helper available; skip rather than fail spuriously.
+        };
+        let config = git_config_with_daemon_pid_source(vec![helper.display().to_string()]);
+        let helpers = resolve_policy_daemon_pid_source_helpers(&config).expect("resolve helpers");
+        let resolved = helpers.get("git").expect("helper resolved for git");
+        assert!(!resolved.sha256.is_empty());
+        assert!(resolved.canonical_path.is_absolute());
+    }
+
+    #[test]
+    fn resolve_policy_daemon_pid_source_helpers_rejects_relative_helper() {
+        let config = git_config_with_daemon_pid_source(vec!["relative/helper".to_string()]);
+        let err = resolve_policy_daemon_pid_source_helpers(&config)
+            .expect_err("must reject relative helper");
+        assert!(
+            err.to_string().contains("absolute path"),
+            "expected absolute-path rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_policy_daemon_pid_source_helpers_rejects_missing_helper() {
+        let config =
+            git_config_with_daemon_pid_source(vec!["/nonexistent/nono-test-helper".to_string()]);
+        let err = resolve_policy_daemon_pid_source_helpers(&config)
+            .expect_err("must reject a helper that does not exist");
+        assert!(
+            err.to_string().contains("not found or not executable"),
+            "expected not-found rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_policy_daemon_pid_source_helpers_expands_vars_in_program_path() {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let dir = std::env::temp_dir().join(format!(
+            "nono-daemon-pid-source-expand-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).expect("mkdir");
+        let helper = dir.join("helper.sh");
+        fs::write(&helper, "#!/bin/sh\necho 1\n").expect("write");
+        fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let dir_str = dir.to_string_lossy().into_owned();
+        let _env = crate::test_env::EnvVarGuard::set_all(&[("NONO_TEST_HELPER_DIR", &dir_str)]);
+
+        let config =
+            git_config_with_daemon_pid_source(vec!["$NONO_TEST_HELPER_DIR/helper.sh".to_string()]);
+        let helpers = resolve_policy_daemon_pid_source_helpers(&config).expect("resolve helpers");
+        let resolved = helpers.get("git").expect("helper resolved for git");
+        assert_eq!(
+            resolved.canonical_path,
+            helper.canonicalize().expect("canonicalize")
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn ambient_credential_capture_validates() {
         let mut config = active_git_config();
         config.credentials.insert(
@@ -3610,6 +4605,7 @@ mod tests {
                 credential: "github".to_string(),
                 grant_to: vec![],
             },
+            sandbox: None,
         });
 
         let report =
@@ -3638,6 +4634,7 @@ mod tests {
                 credential: "agent".to_string(),
                 grant_to: vec![],
             },
+            sandbox: None,
         });
 
         let report =
@@ -3654,10 +4651,12 @@ mod tests {
         let parent_rule = InterceptRuleConfig {
             args: vec!["push".to_string()],
             action: InterceptActionConfig::Approve { timeout_secs: None },
+            sandbox: None,
         };
         let child_rule = InterceptRuleConfig {
             args: vec!["fetch".to_string()],
             action: InterceptActionConfig::Passthrough,
+            sandbox: None,
         };
         let parent = CommandPolicyConfig {
             intercept: vec![parent_rule.clone()],
@@ -3676,6 +4675,7 @@ mod tests {
         let rule = InterceptRuleConfig {
             args: vec!["push".to_string()],
             action: InterceptActionConfig::Passthrough,
+            sandbox: None,
         };
         let parent = CommandPolicyConfig {
             intercept: vec![rule.clone()],
@@ -3690,6 +4690,83 @@ mod tests {
     }
 
     #[test]
+    fn daemon_pid_source_child_replaces_parent() {
+        let parent = CommandPolicyConfig {
+            daemon_pid_source: Some(DaemonPidSource {
+                argv: vec!["parent-helper".to_string()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let child = CommandPolicyConfig {
+            daemon_pid_source: Some(DaemonPidSource {
+                argv: vec!["child-helper".to_string()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            parent.merge_child(&child).daemon_pid_source,
+            Some(DaemonPidSource {
+                argv: vec!["child-helper".to_string()],
+                ..Default::default()
+            })
+        );
+    }
+
+    #[test]
+    fn daemon_pid_source_inherited_when_child_omits_it() {
+        let parent = CommandPolicyConfig {
+            daemon_pid_source: Some(DaemonPidSource {
+                argv: vec!["parent-helper".to_string()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let child = CommandPolicyConfig::default();
+        assert_eq!(
+            parent.merge_child(&child).daemon_pid_source,
+            Some(DaemonPidSource {
+                argv: vec!["parent-helper".to_string()],
+                ..Default::default()
+            })
+        );
+        // Child adds it where the parent has none.
+        assert_eq!(
+            child.merge_child(&parent).daemon_pid_source,
+            Some(DaemonPidSource {
+                argv: vec!["parent-helper".to_string()],
+                ..Default::default()
+            })
+        );
+    }
+
+    #[test]
+    fn daemon_pid_source_round_trips_through_serde() {
+        let config = CommandPolicyConfig {
+            daemon_pid_source: Some(DaemonPidSource {
+                argv: vec!["tmux-server-pid".to_string(), "--workspace".to_string()],
+                env: vec!["BAZEL_OUTPUT_USER_ROOT".to_string()],
+            }),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&config).expect("serialize");
+        assert!(
+            json.contains("daemon_pid_source"),
+            "field must serialize: {json}"
+        );
+        let parsed: CommandPolicyConfig = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed.daemon_pid_source, config.daemon_pid_source);
+
+        // Omitted by default (skip_serializing_if) and parses back as None.
+        let empty = serde_json::to_string(&CommandPolicyConfig::default()).expect("serialize");
+        assert!(
+            !empty.contains("daemon_pid_source"),
+            "absent by default: {empty}"
+        );
+    }
+
+    #[test]
     fn validate_intercept_catch_all_must_be_last() {
         let mut config = active_git_config();
         if let Some(git) = config.commands.get_mut("git") {
@@ -3697,10 +4774,12 @@ mod tests {
                 InterceptRuleConfig {
                     args: vec![],
                     action: InterceptActionConfig::Passthrough,
+                    sandbox: None,
                 },
                 InterceptRuleConfig {
                     args: vec!["push".to_string()],
                     action: InterceptActionConfig::Approve { timeout_secs: None },
+                    sandbox: None,
                 },
             ];
         }
@@ -3723,10 +4802,12 @@ mod tests {
                 InterceptRuleConfig {
                     args: vec!["push".to_string()],
                     action: InterceptActionConfig::Approve { timeout_secs: None },
+                    sandbox: None,
                 },
                 InterceptRuleConfig {
                     args: vec![],
                     action: InterceptActionConfig::Passthrough,
+                    sandbox: None,
                 },
             ];
         }
@@ -3750,6 +4831,7 @@ mod tests {
                 action: InterceptActionConfig::Respond {
                     stdout: "x".repeat(1024 * 1024 + 1),
                 },
+                sandbox: None,
             }];
         }
         let report =
@@ -3773,6 +4855,258 @@ mod tests {
             err.to_string().contains("unknown field"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn intercept_rule_roundtrips_with_sandbox_override() {
+        let json = r#"{
+            "args": ["auth", "switch"],
+            "action": {"type": "passthrough"},
+            "sandbox": {"fs_read": ["/etc/foo"], "use_credentials": ["github"]}
+        }"#;
+        let rule: InterceptRuleConfig =
+            serde_json::from_str(json).expect("deserialize rule with sandbox override");
+        let sandbox = rule.sandbox.as_ref().expect("sandbox override present");
+        assert_eq!(sandbox.fs_read, vec!["/etc/foo".to_string()]);
+        assert_eq!(sandbox.use_credentials, vec!["github".to_string()]);
+
+        // Round-trips: serialize then deserialize yields the same rule.
+        let serialized = serde_json::to_string(&rule).expect("serialize rule");
+        let reparsed: InterceptRuleConfig =
+            serde_json::from_str(&serialized).expect("re-deserialize rule");
+        assert_eq!(rule, reparsed);
+    }
+
+    #[test]
+    fn intercept_rule_omits_absent_sandbox_override() {
+        let rule = InterceptRuleConfig {
+            args: vec!["status".to_string()],
+            action: InterceptActionConfig::Passthrough,
+            sandbox: None,
+        };
+        let serialized = serde_json::to_string(&rule).expect("serialize rule");
+        assert!(
+            !serialized.contains("sandbox"),
+            "absent sandbox override should be skipped in serialization: {serialized}"
+        );
+    }
+
+    #[test]
+    fn nested_unsafe_seatbelt_rules_finds_command_from_and_intercept_sandboxes() {
+        let mut policies = CommandPoliciesConfig::default();
+        policies.commands.insert(
+            "git".to_string(),
+            CommandPolicyConfig {
+                sandbox: Some(CommandSandboxConfig {
+                    unsafe_macos_seatbelt_rules: vec!["(allow direct-sandbox)".to_string()],
+                    ..CommandSandboxConfig::default()
+                }),
+                from: BTreeMap::from([(
+                    "session".to_string(),
+                    CommandFromConfig::Policy(Box::new(CommandSandboxConfig {
+                        unsafe_macos_seatbelt_rules: vec!["(allow from-sandbox)".to_string()],
+                        ..CommandSandboxConfig::default()
+                    })),
+                )]),
+                intercept: vec![InterceptRuleConfig {
+                    args: vec!["push".to_string()],
+                    action: InterceptActionConfig::Passthrough,
+                    sandbox: Some(CommandSandboxConfig {
+                        unsafe_macos_seatbelt_rules: vec!["(allow intercept-sandbox)".to_string()],
+                        ..CommandSandboxConfig::default()
+                    }),
+                }],
+                ..CommandPolicyConfig::default()
+            },
+        );
+
+        let found = nested_unsafe_seatbelt_rules(&policies);
+        let rules: Vec<&str> = found.iter().map(|(_, rule)| rule.as_str()).collect();
+
+        assert!(rules.contains(&"(allow direct-sandbox)"));
+        assert!(rules.contains(&"(allow from-sandbox)"));
+        assert!(rules.contains(&"(allow intercept-sandbox)"));
+        assert_eq!(found.len(), 3);
+    }
+
+    #[test]
+    fn nested_unsafe_seatbelt_rules_empty_when_no_sandbox_sets_them() {
+        let mut policies = CommandPoliciesConfig::default();
+        policies.commands.insert(
+            "git".to_string(),
+            CommandPolicyConfig {
+                sandbox: Some(CommandSandboxConfig::default()),
+                ..CommandPolicyConfig::default()
+            },
+        );
+
+        assert!(nested_unsafe_seatbelt_rules(&policies).is_empty());
+    }
+
+    #[test]
+    fn clear_unsafe_seatbelt_rules_clears_command_from_and_intercept_sandboxes() {
+        let mut policies = CommandPoliciesConfig::default();
+        policies.commands.insert(
+            "git".to_string(),
+            CommandPolicyConfig {
+                sandbox: Some(CommandSandboxConfig {
+                    unsafe_macos_seatbelt_rules: vec!["(allow direct-sandbox)".to_string()],
+                    fs_read: vec!["/tmp".to_string()],
+                    ..CommandSandboxConfig::default()
+                }),
+                from: BTreeMap::from([(
+                    "session".to_string(),
+                    CommandFromConfig::Policy(Box::new(CommandSandboxConfig {
+                        unsafe_macos_seatbelt_rules: vec!["(allow from-sandbox)".to_string()],
+                        ..CommandSandboxConfig::default()
+                    })),
+                )]),
+                intercept: vec![InterceptRuleConfig {
+                    args: vec!["push".to_string()],
+                    action: InterceptActionConfig::Passthrough,
+                    sandbox: Some(CommandSandboxConfig {
+                        unsafe_macos_seatbelt_rules: vec!["(allow intercept-sandbox)".to_string()],
+                        ..CommandSandboxConfig::default()
+                    }),
+                }],
+                ..CommandPolicyConfig::default()
+            },
+        );
+
+        clear_unsafe_seatbelt_rules(&mut policies);
+
+        assert!(nested_unsafe_seatbelt_rules(&policies).is_empty());
+        // Structured overrides survive — only raw Seatbelt rules are cleared.
+        assert_eq!(
+            policies.commands["git"]
+                .sandbox
+                .as_ref()
+                .expect("sandbox")
+                .fs_read,
+            vec!["/tmp".to_string()]
+        );
+    }
+
+    #[test]
+    fn intercept_sandbox_override_well_formed_passes() {
+        let mut config = active_git_config();
+        config.credentials.insert(
+            "github".to_string(),
+            CommandCredentialConfig {
+                credential_type: CommandCredentialType::Ambient,
+                ..Default::default()
+            },
+        );
+        let git = config.commands.get_mut("git").expect("git command");
+        git.intercept.push(InterceptRuleConfig {
+            args: vec!["status".to_string()],
+            action: InterceptActionConfig::Passthrough,
+            sandbox: Some(CommandSandboxConfig {
+                fs_read: vec![".".to_string()],
+                use_credentials: vec!["github".to_string()],
+                ..Default::default()
+            }),
+        });
+
+        let report =
+            validate_command_policies(Some(&config), CommandPolicyValidationScope::Resolved);
+
+        assert!(report.is_ok(), "{:?}", report.errors);
+    }
+
+    #[test]
+    fn intercept_sandbox_override_unknown_credential_rejected() {
+        let mut config = active_git_config();
+        let git = config.commands.get_mut("git").expect("git command");
+        git.intercept.push(InterceptRuleConfig {
+            args: vec!["status".to_string()],
+            action: InterceptActionConfig::Passthrough,
+            sandbox: Some(CommandSandboxConfig {
+                use_credentials: vec!["does-not-exist".to_string()],
+                ..Default::default()
+            }),
+        });
+
+        let report =
+            validate_command_policies(Some(&config), CommandPolicyValidationScope::Resolved);
+
+        assert!(
+            report.errors.iter().any(|finding| {
+                finding.code == "unknown_credential"
+                    && finding.message.contains("intercept[")
+                    && finding.message.contains("does-not-exist")
+            }),
+            "expected unknown_credential error for the override sandbox: {:?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn intercept_sandbox_override_on_respond_rejected() {
+        let mut config = active_git_config();
+        let git = config.commands.get_mut("git").expect("git command");
+        git.intercept.push(InterceptRuleConfig {
+            args: vec!["status".to_string()],
+            action: InterceptActionConfig::Respond {
+                stdout: String::new(),
+            },
+            sandbox: Some(CommandSandboxConfig {
+                fs_read: vec![".".to_string()],
+                ..Default::default()
+            }),
+        });
+
+        let report =
+            validate_command_policies(Some(&config), CommandPolicyValidationScope::Resolved);
+
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|finding| finding.code == "intercept_sandbox_on_respond"),
+            "expected sandbox override on a `respond` action to be rejected: {:?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn intercept_sandbox_override_on_launching_action_passes() {
+        let mut config = active_git_config();
+        config.credentials.insert(
+            "github".to_string(),
+            CommandCredentialConfig {
+                credential_type: CommandCredentialType::Ambient,
+                ..Default::default()
+            },
+        );
+        let git = config.commands.get_mut("git").expect("git command");
+        // capture_credential launches the real binary, so a sandbox override is
+        // meaningful and must be accepted.
+        git.intercept.push(InterceptRuleConfig {
+            args: vec!["status".to_string()],
+            action: InterceptActionConfig::CaptureCredential {
+                credential: "github".to_string(),
+                grant_to: Vec::new(),
+            },
+            sandbox: Some(CommandSandboxConfig {
+                fs_read: vec![".".to_string()],
+                use_credentials: vec!["github".to_string()],
+                ..Default::default()
+            }),
+        });
+
+        let report =
+            validate_command_policies(Some(&config), CommandPolicyValidationScope::Resolved);
+
+        assert!(
+            !report
+                .errors
+                .iter()
+                .any(|finding| finding.code == "intercept_sandbox_on_respond"),
+            "expected sandbox override on a launching action to be accepted: {:?}",
+            report.errors
+        );
+        assert!(report.is_ok(), "{:?}", report.errors);
     }
 
     #[test]
@@ -3800,6 +5134,7 @@ mod tests {
                 action: InterceptActionConfig::Approve {
                     timeout_secs: Some(0),
                 },
+                sandbox: None,
             }];
             git.from.insert(
                 "session".to_string(),
@@ -3811,7 +5146,7 @@ mod tests {
                                 endpoint_policy: Some(EndpointPolicyConfig {
                                     allow: vec![EndpointRuleConfig {
                                         method: "GET".to_string(),
-                                        path: "/repos/always-further/nono/issues".to_string(),
+                                        path: "/repos/nolabs-ai/nono/issues".to_string(),
                                         backend: None,
                                         reason: None,
                                         timeout_secs: Some(0),
@@ -3876,5 +5211,152 @@ mod tests {
                 .any(|f| f.code == "invalid_stdio_limit"),
             "expected invalid_stdio_limit error"
         );
+    }
+
+    /// A resolved candidate's binary contents feed both its digest and its
+    /// shape classification (shebang vs. ELF); this should stay consistent
+    /// after the resolution is reused across the validation and sandbox-plan
+    /// build passes instead of being recomputed.
+    #[test]
+    fn candidate_command_match_hashes_and_classifies_shebang_script() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("script.sh");
+        let contents = b"#!/usr/bin/env bash\necho hi\n";
+        write_executable(&path, contents);
+
+        let expected_sha256 = Sha256::digest(contents)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+
+        let (matched, cache_update) = candidate_command_match(&path, &HashMap::new())
+            .expect("resolve candidate")
+            .expect("candidate should match");
+
+        assert_eq!(matched.sha256, expected_sha256);
+        assert_eq!(matched.shape.kind, ResolvedExecutableKind::ShebangScript);
+        assert_eq!(
+            matched.shape.interpreter,
+            Some(PathBuf::from("/usr/bin/env"))
+        );
+        assert_eq!(matched.shape.interpreter_args, vec!["bash".to_string()]);
+        assert!(cache_update.is_some(), "empty cache should always miss");
+    }
+
+    #[test]
+    fn candidate_command_match_hashes_and_classifies_elf_like_binary() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("binary");
+        let mut contents = b"\x7fELF".to_vec();
+        contents.extend(std::iter::repeat_n(0u8, 4096));
+        write_executable(&path, &contents);
+
+        let expected_sha256 = Sha256::digest(&contents)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+
+        let (matched, _) = candidate_command_match(&path, &HashMap::new())
+            .expect("resolve candidate")
+            .expect("candidate should match");
+
+        assert_eq!(matched.sha256, expected_sha256);
+        assert_eq!(matched.shape.kind, ResolvedExecutableKind::Elf);
+    }
+
+    /// A cache hit must skip the read+hash entirely and return identical
+    /// output to a fresh resolution — proven by seeding the cache with a
+    /// deliberately wrong sha256 and asserting the wrong value comes back.
+    #[test]
+    fn candidate_command_match_uses_cached_hash_on_hit() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("script.sh");
+        let contents = b"#!/bin/sh\necho hi\n";
+        write_executable(&path, contents);
+
+        let (fresh, update) = candidate_command_match(&path, &HashMap::new())
+            .expect("resolve candidate")
+            .expect("candidate should match");
+        let (key, _) = update.expect("fresh resolution should produce a cache entry");
+
+        let mut cache = HashMap::new();
+        let poisoned = CachedCommandHash {
+            sha256: "poisoned".to_string(),
+            shape: fresh.shape.clone(),
+        };
+        cache.insert(key, poisoned.clone());
+
+        let (cached_match, cache_update) = candidate_command_match(&path, &cache)
+            .expect("resolve candidate")
+            .expect("candidate should match");
+
+        assert_eq!(cached_match.sha256, "poisoned");
+        assert!(
+            cache_update.is_none(),
+            "a cache hit must not produce a new entry to persist"
+        );
+    }
+
+    /// A changed mtime must invalidate the stale cache entry (different key
+    /// => miss => recomputed fresh, not served from cache).
+    #[test]
+    fn candidate_command_match_mtime_change_invalidates_cache_entry() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("script.sh");
+        write_executable(&path, b"#!/bin/sh\necho one\n");
+
+        let (first, update) = candidate_command_match(&path, &HashMap::new())
+            .expect("resolve candidate")
+            .expect("candidate should match");
+        let (key, entry) = update.expect("fresh resolution should produce a cache entry");
+        let mut cache = HashMap::new();
+        cache.insert(key.clone(), entry);
+
+        // Rewrite with different content and force a distinct mtime so the
+        // (dev, ino, size, mtime) cache key changes.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        write_executable(&path, b"#!/bin/sh\necho two, longer content\n");
+
+        let (second, second_update) = candidate_command_match(&path, &cache)
+            .expect("resolve candidate")
+            .expect("candidate should match");
+
+        assert_ne!(first.sha256, second.sha256);
+        assert!(
+            second_update.is_some(),
+            "changed mtime should produce a fresh cache entry, not reuse the stale one"
+        );
+        assert_ne!(second.sha256, cache.get(&key).expect("stale entry").sha256);
+    }
+
+    #[test]
+    fn command_hash_cache_file_json_roundtrip() {
+        let mut entries = HashMap::new();
+        entries.insert(
+            "100:200:300:400".to_string(),
+            CachedCommandHash {
+                sha256: "deadbeef".to_string(),
+                shape: ResolvedExecutableShape {
+                    kind: ResolvedExecutableKind::ShebangScript,
+                    interpreter: Some(PathBuf::from("/usr/bin/env")),
+                    interpreter_args: vec!["bash".to_string()],
+                },
+            },
+        );
+        let file = CommandHashCacheFile {
+            entries: entries.clone(),
+        };
+
+        let json = serde_json::to_string(&file).expect("serialize");
+        let restored: CommandHashCacheFile = serde_json::from_str(&json).expect("deserialize");
+
+        assert_eq!(restored.entries, entries);
+    }
+
+    #[test]
+    fn command_hash_cache_file_missing_fields_default() {
+        let restored: CommandHashCacheFile =
+            serde_json::from_str("{}").expect("missing entries should default to empty");
+        assert!(restored.entries.is_empty());
     }
 }

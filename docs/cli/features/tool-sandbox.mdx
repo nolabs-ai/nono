@@ -16,7 +16,7 @@ A Tool Sandbox profile answers three questions:
 | Question | Field |
 |---|---|
 | What may the outer session run directly? | `command_policies.commands.<name>.sandbox` or `command_policies.commands.<name>.from.session` |
-| What may one Tool Sandbox command run next? | `command_policies.commands.<caller>.can_use` plus `command_policies.commands.<callee>.from.<caller>` |
+| What may one Tool Sandbox command run next? | `command_policies.commands.<caller>.can_use` plus `command_policies.commands.<callee>.from.<caller>` for other commands; self-invocation is implicit unless a self-invocation entry is configured |
 | What does the selected child command receive? | `sandbox` or caller-specific `from.<caller>` grants |
 
 `command_policies.entrypoint` is still parsed for older profiles, but current profiles should express direct session access with `commands.<name>.sandbox` or `commands.<name>.from.session`.
@@ -60,12 +60,13 @@ Each entry under `commands` uses the command name as the key:
 |---|---|---|
 | `sandbox` | object | Direct-session policy shorthand. This lets the outer session run the command. |
 | `from` | object | Caller-specific policies. Use `session` for direct session invocation or another command name for chaining. |
-| `can_use` | command-name array | Commands this command may invoke through Tool Sandbox. |
+| `can_use` | command-name array | Other commands this command may invoke through Tool Sandbox. If no self-invocation entry is configured, self-invocation keeps the current effective policy. |
 | `executable` | absolute path | Pin the command name to one executable file instead of the first `PATH` match. |
 | `allow_writable_executable` | boolean | Per-command trust downgrade for a pinned executable writable by the sandbox capability set. Requires absolute `executable`. |
-| `intercept` | array | Ordered argument-prefix mediation rules evaluated after invocation policy. |
+| `intercept` | array | Ordered argument-sequence mediation rules evaluated after invocation policy. |
 | `allow_direct_exec_bypass` | absolute path array | Compatibility escape hatch for direct canonical-path invocation. |
 | `allow_direct_exec_bypass_with_credentials` | boolean | Required when a credential-using command also allows direct exec bypass. |
+| `daemon_pid_source` | `{ argv: string[], env?: string[] }` | macOS only. Helper nono runs to learn the pid of a daemon this command spawns that double-forks and reparents to pid 1 (e.g. a tmux server), so a request from that daemon can still be attributed to this command. `argv` is the helper program (expanded, then must be absolute); `env` allowlists daemon-env keys forwarded to it. See [Daemon Attribution](#daemon-attribution). |
 
 `from` entries accept three value shapes:
 
@@ -81,6 +82,7 @@ The selected `sandbox` object describes what the child receives:
 |---|---|---|
 | `fs_read` / `fs_write` | directory path arrays | Directory grants. |
 | `fs_read_file` / `fs_write_file` | file path arrays | Exact file grants. |
+| `exec_paths` | path arrays | Linux-only. Extra paths the child may execute, for multi-call tools (e.g. `git`) that re-exec their own helpers by absolute path from a compiled-in exec-path. A directory entry covers everything beneath it; a matching `fs_read` grant is still required, and missing paths are skipped so profiles can list per-distro candidates. Ignored on macOS. |
 | `network` | object | Child network grants. |
 | `environment` | object | Environment allow-list and injected static variables. |
 | `argv_prepend` | string array | Mandatory arguments inserted before caller-provided arguments. |
@@ -91,6 +93,40 @@ The selected `sandbox` object describes what the child receives:
 | `open_urls` | object | Runtime-delegated URL opening for this command. |
 | `allow_launch_services` | boolean | macOS-only direct LaunchServices URL opening. |
 | `allow_raw_file_credentials_in_chained_policy` | boolean | Required before non-session callers can receive raw-file credentials. |
+| `unsafe_macos_seatbelt_rules` | string array | macOS-only escape hatch: raw Seatbelt rules appended to this command's child profile after the deny gate (last-match-wins). Mirrors the top-level `unsafe_macos_seatbelt_rules` but scoped to one command/intercept. Use sparingly — e.g. to let a command exec + read a binary it forks by absolute path. Honoured only for **user-authored profiles** (same trust boundary as `binary` — see below); pack and built-in profiles have these rules stripped with a warning. |
+
+### Per-Intercept Sandbox Override
+
+An `intercept` rule may carry an optional `sandbox` (the same object described above). When the rule matches, the process the rule launches runs under the rule's `sandbox` instead of the command's selected sandbox — for that matched invocation only. This applies to every action that launches a process (`passthrough`, `capture`, `capture_credential`, and an approved `approve`); it does not apply to `respond`, which returns static output and launches nothing (a `sandbox` there is rejected at validation). Credentials resolve lazily, so an override that omits `credentials`/`use_credentials` injects no credential env vars for that invocation. The override **completely replaces** the command's selected sandbox for that invocation — it is validated for well-formedness (known credentials, valid paths, etc.) but is not checked against the command's base sandbox, so it is not restricted to narrowing. Author it as carefully as the command's base sandbox; it can grant capabilities the base sandbox does not.
+
+```jsonc
+{
+  "args": ["auth", "switch"],
+  "action": { "type": "passthrough" },
+  "sandbox": {
+    "fs_read": ["~/.config/gh"],
+    "fs_write": ["~/.config/gh"],
+    "network": { "allow_domain": ["github.com"] }
+  }
+}
+```
+
+### Intercept Actions
+
+Each `intercept` entry is `{ "args": [...], "action": { "type": ... } }`. Rules are evaluated in order; the first whose `args` appear as a contiguous sequence in the invocation's arguments wins (an empty `args` is a catch-all). This lets subcommand rules match after command-global options, such as `git -c foo=bar push --force`. Broad single-argument rules like `["--force"]` match anywhere in the invocation, not only at the subcommand position. The `action.type` selects how the matched subcommand is handled:
+
+| `action.type` | Behavior |
+|---|---|
+| `passthrough` | Run the real binary in its sandbox. This is the default when no rule matches. |
+| `respond` | Return a static `stdout` string to the caller without forking the binary. |
+| `capture` | Run the real binary, buffering its stdout for broker inspection before returning it. |
+| `capture_credential` | Run the real binary, store its stdout as a named ambient `credential`, and return a broker nonce. |
+| `approve` | Route the invocation through an approval backend before forking (optional `timeout_secs`). |
+| `exec` | Run the helper at `command[0]` — with `command[1..]` then the original arguments — in place of the real binary, inside the matched command's sandbox; stream its stdout/stderr and propagate its exit code. `command[0]` is `$VAR`-expanded, must be absolute, is resolved with identity expectations, and is subject to the same non-writable-executable trust gate as a pinned `executable`. |
+
+`exec` is for handling one subcommand with a custom helper while the command's other subcommands run normally — for example, intercepting an `auth switch` subcommand with a helper that rewrites a config file, while `api` calls pass through with their brokered credentials.
+
+The helper runs with the matched command's real credentials, capabilities, and sandbox — it is not itself sandboxed further. Do not point `exec` at a general-purpose shell (`/bin/sh`, `/bin/bash`, etc.): it would let the caller run arbitrary commands with those credentials, defeating the sandbox. Use a purpose-specific helper that only does what the intercepted subcommand needs.
 
 ### Dynamic Filesystem Grants
 
@@ -100,8 +136,12 @@ Supported tokens:
 
 | Token | Use in | Expands to |
 |---|---|---|
-| `@git:config-files` | `fs_read_file` | Trusted global/system Git config files and configured Git file paths, such as attributes, excludes, and commit template files. |
+| `@git:config-files` | `fs_read_file` | Trusted global/system Git config files and configured Git file paths (attributes, excludes, commit templates), plus the declared target of every `include.path` and `includeIf.*.path` directive in those scopes — including conditional includes that do not currently fire. |
 | `@git:hooks-path` | `fs_read` | Trusted global/system `core.hooksPath` directories. |
+| `@git:common-dir` | `fs_write`, `fs_read` | The git common directory: `.git` in a regular repo, or the absolute path to the main repo's `.git` when running inside a git worktree. Useful in `fs_write` when the agent session starts from a worktree and `--workdir` points to the worktree itself — the token ensures the git object store (which lives in the main repo) is covered. |
+| `@git:worktree` | `fs_read`, `fs_write` | The main worktree root (parent of `@git:common-dir`). Empty in a regular repo; in a linked worktree it is the absolute path to the main repo root. `git worktree add` changes CWD to the main repo root, so without this `getcwd()` fails with EPERM. |
+| `@git:toplevel` | `fs_read`, `fs_write` | Absolute path of the current checkout root (`git rev-parse --show-toplevel`). In a linked worktree this is the worktree's own root, not the main repo. |
+| `@git:toplevel-parent` | `fs_write` | Parent directory of `@git:toplevel`. Required for `git worktree add ../sibling`, where the new worktree is created adjacent to the current checkout. |
 
 Example:
 
@@ -112,7 +152,8 @@ Example:
       "git": {
         "sandbox": {
           "fs_read_file": ["@git:config-files"],
-          "fs_read": ["@git:hooks-path"]
+          "fs_read": ["@git:hooks-path"],
+          "fs_write": ["$WORKDIR", "@git:common-dir"]
         }
       }
     }
@@ -121,6 +162,10 @@ Example:
 ```
 
 The Git provider reads `git config --list --show-origin --show-scope` and keeps only `global` and `system` scoped paths. It ignores `local` and `worktree` scopes so a repository cannot grant itself additional host filesystem access through `.git/config`. If `git` is unavailable or returns no matching paths, the token expands to no paths.
+
+The `@git:common-dir` token runs `git rev-parse --git-common-dir` from nono's working directory at sandbox-prepare time. In a regular repo it returns `.git` (relative, resolved against `$WORKDIR`). In a worktree it returns the absolute path to the main repo's `.git`. If git is unavailable or the process is not inside a repo, the token expands to no paths. The `@git:worktree`, `@git:toplevel`, and `@git:toplevel-parent` tokens are derived from the same git invocations and behave the same way when git is unavailable.
+
+`@git:config-files` expands to the config files git reads in the current context, plus the declared target of every `include.path` and `includeIf.*.path` directive in trusted `global` and `system` scopes — including conditional includes whose condition does not currently fire (e.g. a `hasconfig:remote.*.url` rule that only matches certain repositories). A conditional include that is false now is still grantable because a later git operation — such as `git worktree add` for a repo with a matching remote — may make the condition fire. Like the other git tokens it keeps only `global` and `system` scopes; per-repo `.git/config` entries are not trusted.
 
 `network` accepts these values:
 
@@ -197,6 +242,33 @@ This is broader than `commands.<name>.allow_writable_executable`: it also covers
 Linux launches the verified executable object by file descriptor. macOS verifies the pinned file before sandboxing but must still call `execve()` by path, so a sandbox-writable executable or parent directory remains replaceable before launch. Avoid `allow_writable_executable` for high-assurance macOS policies.
 
 Interpreter-packaged tools, such as a Python `aws` entrypoint, are classified as shebang scripts. Tool Sandbox grants the selected script, its interpreter, and the interpreter's ELF loader closure. Language package directories, virtualenvs, SDK homes, and tool-specific data are not guessed by Tool Sandbox; grant those explicitly with `fs_read`, `fs_read_file`, `fs_write`, or `fs_write_file`.
+
+## Daemon Attribution
+
+Tool Sandbox authorizes a request by walking the caller's process ancestry to the session. A daemon that double-forks and reparents to pid 1 (a tmux server, for example) severs that chain, so a request from it can no longer be tied to the command that spawned it. Rather than fall back to something replayable, Tool Sandbox attributes such a caller by a platform lineage marker, or denies it:
+
+- **Linux** places each Tool Sandbox command in a per-command cgroup that survives reparenting; a severed caller is attributed by reading its cgroup. No writable cgroup base means severed callers are denied.
+- **macOS** uses `commands.<name>.daemon_pid_source`: a helper nono runs to learn the pid of the daemon the command spawns. When a caller reparented to pid 1 is seen, nono runs each declared helper and attributes the caller to a command only if the reported pid matches, pinned by the daemon's kernel identity. No declared helper means severed callers are denied.
+
+Either way a severed caller resolves only to the command that spawned it, never the session, and is denied on any mismatch.
+
+The macOS helper is declared as `{ "argv": [...], "env": [...] }`. nono passes the daemon's context as a single JSON object on **stdin**:
+
+```json
+{
+  "schema_version": 1,
+  "command": "<command name>",
+  "candidate_pid": 48213,
+  "workdir": "/abs/session/workdir",
+  "daemon_cwd": "/abs/daemon/cwd",
+  "daemon_argv": ["/path/to/daemon", "..."],
+  "daemon_env": { "SOME_KEY": "value" }
+}
+```
+
+`candidate_pid` is the severed daemon nono walked to; `daemon_cwd`, `daemon_argv`, and `daemon_env` describe it, read from the kernel, and are omitted when unreadable. `daemon_env` carries only the keys named in `env` that are present in the daemon's environment; credential-named keys are always dropped. The helper prints the pid it believes is its server on stdout; nono accepts only if that equals `candidate_pid`.
+
+The helper runs **unsandboxed** in the supervisor. It MUST only read and emit a single pid (for example, the pid file the daemon writes) and MUST NOT execute workspace-controlled code. nono hardens the launch — the `argv` program is expanded (`~`, `$WORKDIR`, `$TMPDIR`, `$UID`, XDG) and must then be an absolute path, its environment is cleared to a minimal set, its working directory is neutral, and it is killed if it exceeds a short timeout — but cannot vet what the declared helper itself does.
 
 ## Examples
 

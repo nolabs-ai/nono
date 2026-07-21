@@ -331,8 +331,8 @@ mod tests {
     #[test]
     fn refresh_helper_args_round_trip() {
         let stale = vec![
-            ("always-further/claude".to_string(), "1.0.0".to_string()),
-            ("always-further/codex".to_string(), "2.3.4".to_string()),
+            ("nolabs-ai/claude".to_string(), "1.0.0".to_string()),
+            ("nolabs-ai/codex".to_string(), "2.3.4".to_string()),
         ];
 
         let args = refresh_helper_args(&stale);
@@ -342,7 +342,7 @@ mod tests {
 
     #[test]
     fn refresh_helper_args_reject_odd_values() {
-        assert!(parse_refresh_helper_args(vec!["always-further/claude".to_string()]).is_none());
+        assert!(parse_refresh_helper_args(vec!["nolabs-ai/claude".to_string()]).is_none());
     }
 
     #[test]

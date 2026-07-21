@@ -5,8 +5,8 @@ use crate::launch_runtime::{LaunchPlan, select_threading_context};
 use crate::proxy_runtime::start_proxy_runtime;
 use crate::supervised_runtime::{SupervisedRuntimeContext, execute_supervised_runtime};
 use crate::{
-    DETACHED_SESSION_ID_ENV, command_blocking_deprecation, config, exec_strategy, output,
-    sandbox_state, session,
+    DETACHED_SESSION_ID_ENV, command_blocking_deprecation, config, exec_strategy, network_policy,
+    output, sandbox_state, session,
 };
 use nono::undo::{ContentHash, ExecutableIdentity};
 use nono::{CapabilitySet, NonoError, Result, Sandbox};
@@ -21,20 +21,37 @@ fn apply_pre_fork_sandbox(
     strategy: exec_strategy::ExecStrategy,
     caps: &CapabilitySet,
     silent: bool,
+    #[cfg(target_os = "linux")] sandbox_policy: crate::profile::LinuxSandboxPolicy,
 ) -> Result<()> {
     if matches!(strategy, exec_strategy::ExecStrategy::Direct) {
         output::print_applying_sandbox(silent);
 
         #[cfg(target_os = "linux")]
         {
+            use crate::profile::LinuxSandboxPolicy;
             let detected = Sandbox::detect_abi()?;
             info!("Direct mode: detected {}", detected);
-            Sandbox::apply_with_abi(caps, &detected)?;
+            match sandbox_policy {
+                LinuxSandboxPolicy::Auto => {
+                    Sandbox::apply_auto_with_abi(caps, &detected)?;
+                }
+                LinuxSandboxPolicy::Landlock => {
+                    Sandbox::apply_landlock_with_abi(caps, &detected)?;
+                }
+                LinuxSandboxPolicy::External => {
+                    Sandbox::apply_seccomp_with_abi(
+                        caps,
+                        &detected,
+                        nono::sandbox::SeccompOpts::external_tcp(),
+                    )?;
+                    Sandbox::apply_external()?;
+                }
+            }
         }
 
         #[cfg(not(target_os = "linux"))]
         {
-            Sandbox::apply(caps)?;
+            Sandbox::apply_auto(caps)?;
         }
     }
     Ok(())
@@ -137,6 +154,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         program,
         cmd_args,
         mut caps,
+        deny_paths,
         loaded_secrets,
         flags,
     } = plan;
@@ -206,10 +224,48 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         .iter()
         .chain(endpoint_domain_entries.iter())
         .collect();
-    let allowed_domain_strs: Vec<String> = all_domain_entries
+    // Expand network_profile hosts and domain group aliases into the sandbox state
+    // so that `nono why --self` sees the same allowlist the proxy enforces at runtime.
+    let plain_domain_strs: Vec<String> = all_domain_entries
         .iter()
         .map(|e| e.domain().to_string())
         .collect();
+    let domain_filter = proxy.and_then(|p| p.domain_filter.as_ref());
+    let allowed_domain_strs: Vec<String> = if domain_filter.is_some() {
+        let policy_json = config::embedded::embedded_network_policy_json();
+        match network_policy::load_network_policy(policy_json) {
+            Ok(net_policy) => {
+                let mut domains =
+                    network_policy::expand_proxy_allow(&net_policy, &plain_domain_strs);
+                if let Some(profile_name) = domain_filter.and_then(|d| d.network_profile.as_deref())
+                {
+                    match network_policy::resolve_network_profile(&net_policy, profile_name) {
+                        Ok(resolved) => {
+                            domains.extend(resolved.hosts);
+                            for suffix in &resolved.suffixes {
+                                let wildcard = if suffix.starts_with('.') {
+                                    format!("*{suffix}")
+                                } else {
+                                    format!("*.{suffix}")
+                                };
+                                domains.push(wildcard);
+                            }
+                        }
+                        Err(e) => {
+                            warn!("failed to resolve network_profile for sandbox state: {e}");
+                        }
+                    }
+                }
+                domains
+            }
+            Err(e) => {
+                warn!("failed to load network policy for sandbox state: {e}");
+                plain_domain_strs
+            }
+        }
+    } else {
+        plain_domain_strs
+    };
     let domain_endpoints: Vec<sandbox_state::DomainEndpointState> = all_domain_entries
         .iter()
         .filter_map(|e| match e {
@@ -296,6 +352,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         let runtime = crate::tool_sandbox::PreparedToolSandboxRuntime::prepare(
             crate::tool_sandbox::ToolSandboxPrepare {
                 config: command_policies,
+                resolved_command_binaries: flags.resolved_command_binaries.as_ref(),
                 audit_context: crate::tool_sandbox::ToolSandboxAuditContext::new(
                     flags.profile_display_name.clone(),
                     flags.redaction_policy.clone(),
@@ -303,6 +360,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
                 allowed_commands: caps.allowed_commands(),
                 blocked_commands: caps.blocked_commands(),
                 outer_caps: &caps,
+                deny_paths: &deny_paths,
                 policy_root: &requested_workdir,
                 proxy_credential_env_vars: &tool_sandbox_proxy_credential_env_vars,
                 proxy_trust_bundle_paths: &tool_sandbox_trust_bundle_paths,
@@ -323,6 +381,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         let runtime = crate::tool_sandbox::PreparedToolSandboxRuntime::prepare(
             crate::tool_sandbox::ToolSandboxPrepare {
                 config: command_policies,
+                resolved_command_binaries: flags.resolved_command_binaries.as_ref(),
                 audit_context: crate::tool_sandbox::ToolSandboxAuditContext::new(
                     flags.profile_display_name.clone(),
                     flags.redaction_policy.clone(),
@@ -330,6 +389,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
                 allowed_commands: caps.allowed_commands(),
                 blocked_commands: caps.blocked_commands(),
                 outer_caps: &caps,
+                deny_paths: &deny_paths,
                 policy_root: &requested_workdir,
                 proxy_credential_env_vars: &tool_sandbox_proxy_credential_env_vars,
                 proxy_trust_bundle_paths: &tool_sandbox_trust_bundle_paths,
@@ -375,19 +435,13 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         ));
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    if tool_sandbox_runtime.is_some()
-        && !loaded_secrets.is_empty()
-        && tool_sandbox_initial_shim.is_none()
-    {
-        return Err(NonoError::ConfigParse(
-            "tool-sandbox brokered credentials require the initial command to run through an tool-sandbox shim; \
-             direct exec bypass cannot resolve broker tokens"
-                .to_string(),
-        ));
-    }
-
-    apply_pre_fork_sandbox(strategy, &caps, flags.silent)?;
+    apply_pre_fork_sandbox(
+        strategy,
+        &caps,
+        flags.silent,
+        #[cfg(target_os = "linux")]
+        flags.sandbox_policy,
+    )?;
 
     // Session id shared across before- and after-hook so paired setup/teardown
     // scripts see the same NONO_SESSION_ID. Only allocated when at least one
@@ -485,7 +539,13 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
     #[cfg(target_os = "linux")]
     let seccomp_proxy_fallback = {
         let needs_proxy = matches!(caps.network_mode(), nono::NetworkMode::ProxyOnly { .. });
-        if needs_proxy && nono::is_wsl2() {
+        let external_network = matches!(
+            flags.sandbox_policy,
+            crate::profile::LinuxSandboxPolicy::External
+        );
+        if external_network {
+            false
+        } else if needs_proxy && nono::is_wsl2() {
             let needs_seccomp_fallback = !Sandbox::detect_abi()
                 .ok()
                 .is_some_and(|abi| abi.has_network());
@@ -533,6 +593,16 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         ));
     }
 
+    #[cfg(target_os = "linux")]
+    if flags.proc_comm_notify && nono::sandbox::is_wsl2() {
+        return Err(NonoError::SandboxInit(
+            "WSL2: NVIDIA GPU thread-name mediation requires seccomp user notification, \
+             but WSL2 reports EBUSY for seccomp notify listeners. Disable --allow-gpu \
+             or run on native Linux."
+                .to_string(),
+        ));
+    }
+
     let config = exec_strategy::ExecConfig {
         command: &command,
         resolved_program: &exec_resolved_program,
@@ -568,11 +638,15 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
                 program: recommended_program_name,
                 recommended_profile: known_builtin_profile,
             }),
-        capability_elevation: flags.capability_elevation,
         #[cfg(target_os = "linux")]
-        seccomp_proxy_fallback,
+        seccomp_policy: exec_strategy::SeccompPolicy {
+            capability_elevation: flags.capability_elevation,
+            proxy_fallback: seccomp_proxy_fallback,
+            af_unix_mediation: flags.af_unix_mediation.is_pathname(),
+            proc_comm_notify: flags.proc_comm_notify,
+        },
         #[cfg(target_os = "linux")]
-        af_unix_mediation: flags.af_unix_mediation,
+        sandbox_policy: flags.sandbox_policy,
         allowed_env_vars: flags.allowed_env_vars,
         denied_env_vars: flags.denied_env_vars,
         set_vars: flags.set_vars.unwrap_or_default(),

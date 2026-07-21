@@ -18,7 +18,7 @@ We strongly encourage responsible disclosure and collaboration while the project
 
 Instead, report vulnerabilities **privately** via GitHub Security Advisories:
 
-👉 https://github.com/always-further/nono/security/advisories/new
+👉 https://github.com/nolabs-ai/nono/security/advisories/new
 
 This ensures:
 

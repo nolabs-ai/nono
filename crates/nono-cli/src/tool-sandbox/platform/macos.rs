@@ -4,12 +4,13 @@ use crate::audit_integrity::{
 };
 use crate::command_policy::{
     CommandPoliciesConfig, CommandSandboxConfig, InterceptActionConfig, ResolvedCommandBinaries,
-    ResolvedCommandBinary,
+    ResolvedCommandBinary, has_explicit_self_invocation_entry,
 };
 use crate::tool_sandbox::credentials::{ResolvedCredential, resolve_credentials};
 use crate::tool_sandbox::env::{
-    apply_environment_set_vars, default_env_allow_patterns, effective_argv,
-    inject_chaining_control_env, inject_url_open_env, split_env_entry,
+    apply_environment_set_vars, default_env_allow_patterns, effective_argv_for_binary,
+    env_shebang_target_interpreter, inject_chaining_control_env, inject_url_open_env,
+    split_env_entry,
 };
 use crate::tool_sandbox::launch::{
     exit_status_code, prepare_launcher_command, remove_launch_spec, write_launch_spec,
@@ -19,8 +20,8 @@ use crate::tool_sandbox::protocol::{
     StdioStreamLimitSpec, TOOL_SANDBOX_LAUNCH_SPEC_ENV, TOOL_SANDBOX_SHIM_DIR_ENV,
     TOOL_SANDBOX_SOCKET_ENV, TOOL_SANDBOX_URL_IO_TIMEOUT, ToolSandboxChildLaunchSpec,
     ToolSandboxOpenUrlRequest, ToolSandboxOpenUrlResponse, ToolSandboxShimRequest,
-    ToolSandboxShimResponse, UnixSocketGrantSpec, read_frame, recv_stdio_fds, send_stdio_fds,
-    validate_ipc_request, write_frame, write_response,
+    ToolSandboxShimResponse, UnixSocketGrantSpec, read_frame, recv_frame_ack, recv_stdio_fds,
+    send_frame_ack, send_stdio_fds, validate_ipc_request, write_frame, write_response,
 };
 use nix::libc;
 use nono::supervisor::ApprovalRequest;
@@ -41,8 +42,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::{debug, warn};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tracing::{debug, trace, warn};
 use zeroize::Zeroizing;
 
 // ── Constants ────────────────────────────────────────────────────────────
@@ -141,12 +142,23 @@ struct ToolSandboxState {
     profile_display_name: Option<String>,
     redaction_policy: nono::ScrubPolicy,
     policy_root: PathBuf,
+    /// The agent's own capability set. Used to bound a mediated command's live
+    /// working directory: a command may only run where the agent itself is
+    /// granted access, so `.`/`@git:*` resolving against the live cwd can never
+    /// hand a command filesystem reach the agent lacks.
+    outer_caps: CapabilitySet,
+    /// Agent's resolved filesystem deny paths; a command's live cwd under any of
+    /// these is rejected (the agent's broad allow may otherwise cover them).
+    deny_paths: Vec<PathBuf>,
     plan: ResolvedToolSandboxPlan,
     shims_by_command: BTreeMap<String, ShimIdentity>,
     shims_by_path: BTreeMap<PathBuf, String>,
     credential_handles: BTreeMap<String, ResolvedCredential>,
     proxy_trust_bundle_paths: Vec<PathBuf>,
     active_children: Mutex<HashMap<u32, ActiveChild>>,
+    /// Attributes severed-ancestry callers to their spawning command. See the
+    /// daemon-lineage section below.
+    lineage: LineageMarker,
     active_count: AtomicUsize,
     queued_requests: AtomicUsize,
     emitted_error_response: AtomicBool,
@@ -157,6 +169,13 @@ struct ToolSandboxState {
 struct ResolvedToolSandboxPlan {
     config: CommandPoliciesConfig,
     resolved: ResolvedCommandBinaries,
+    /// Pre-resolved `exec` intercept helpers, keyed by their env-expanded path
+    /// as written in the profile. Identity expectations are captured here so
+    /// the helper launch is TOCTOU-protected like a command binary.
+    exec_helpers: BTreeMap<PathBuf, ResolvedCommandBinary>,
+    /// Pre-resolved `daemon_pid_source` helpers, keyed by command name.
+    /// Identity is captured here for the same TOCTOU protection as `exec_helpers`.
+    daemon_pid_source_helpers: BTreeMap<String, ResolvedCommandBinary>,
     deny_only: BTreeMap<String, ResolvedDenyOnlyCommand>,
     allowed_direct_bypass_ids: HashSet<FileId>,
 }
@@ -182,15 +201,29 @@ impl ResolvedToolSandboxPlan {
         _allowed_commands: &[String],
         _blocked_commands: &[String],
         outer_caps: &CapabilitySet,
+        precomputed: Option<&crate::command_policy::ResolvedCommandBinaries>,
     ) -> Result<Self> {
         let path_env = std::env::var_os("PATH");
-        let resolved =
-            crate::command_policy::resolve_policy_command_binaries(config, path_env.clone())?;
+        let resolved = match precomputed {
+            Some(resolved) => resolved.clone(),
+            None => {
+                crate::command_policy::resolve_policy_command_binaries(config, path_env.clone())?
+            }
+        };
         for w in &resolved.warnings {
             if w.code == "command_not_found" {
                 eprintln!("  [nono] Warning: {}", w.message);
             }
         }
+        let exec_helpers = crate::command_policy::resolve_policy_exec_helpers(config)?;
+        validate_controlled_exec_helper_immutability(config, &exec_helpers, outer_caps)?;
+        let daemon_pid_source_helpers =
+            crate::command_policy::resolve_policy_daemon_pid_source_helpers(config)?;
+        validate_controlled_daemon_pid_source_helper_immutability(
+            config,
+            &daemon_pid_source_helpers,
+            outer_caps,
+        )?;
         let search_dirs = command_search_dirs(config, path_env, outer_caps)?;
         validate_trusted_executable_dirs(&search_dirs, outer_caps)?;
         // BMETE command policies are scoped to command_policies.commands.
@@ -206,6 +239,8 @@ impl ResolvedToolSandboxPlan {
         Ok(Self {
             config: config.clone(),
             resolved,
+            exec_helpers,
+            daemon_pid_source_helpers,
             deny_only,
             allowed_direct_bypass_ids,
         })
@@ -216,10 +251,12 @@ impl PreparedToolSandboxRuntime {
     pub(crate) fn prepare(input: super::ToolSandboxPrepare<'_>) -> Result<Self> {
         let super::ToolSandboxPrepare {
             config,
+            resolved_command_binaries,
             audit_context,
             allowed_commands,
             blocked_commands,
             outer_caps,
+            deny_paths,
             policy_root,
             proxy_credential_env_vars,
             proxy_trust_bundle_paths,
@@ -228,8 +265,13 @@ impl PreparedToolSandboxRuntime {
 
         validate_platform_requirements(config)?;
 
-        let plan =
-            ResolvedToolSandboxPlan::build(config, allowed_commands, blocked_commands, outer_caps)?;
+        let plan = ResolvedToolSandboxPlan::build(
+            config,
+            allowed_commands,
+            blocked_commands,
+            outer_caps,
+            resolved_command_binaries,
+        )?;
 
         let runtime_dir = create_runtime_dir()?;
         let mut cleanup = RuntimeDirCleanup::new(runtime_dir.clone());
@@ -275,6 +317,8 @@ impl PreparedToolSandboxRuntime {
         seal_shim_dir(&shim_dir)?;
 
         let approval_backends = crate::approval_runtime::build_approval_registry(&plan.config)?;
+        // Verify severed daemons if any command declares a helper, else disabled (fail closed).
+        let lineage = LineageMarker::build(&plan.config, plan.daemon_pid_source_helpers.clone());
         let runtime = Self {
             inner: Arc::new(ToolSandboxState {
                 runtime_dir,
@@ -286,12 +330,15 @@ impl PreparedToolSandboxRuntime {
                 profile_display_name: audit_context.profile_display_name,
                 redaction_policy: audit_context.redaction_policy,
                 policy_root: policy_root.to_path_buf(),
+                outer_caps: outer_caps.clone(),
+                deny_paths: deny_paths.to_vec(),
                 plan,
                 shims_by_command,
                 shims_by_path,
                 credential_handles,
                 proxy_trust_bundle_paths: proxy_trust_bundle_paths.to_vec(),
                 active_children: Mutex::new(HashMap::new()),
+                lineage,
                 active_count: AtomicUsize::new(0),
                 queued_requests: AtomicUsize::new(0),
                 emitted_error_response: AtomicBool::new(false),
@@ -594,7 +641,14 @@ fn run_shim() -> Result<()> {
         })
         .collect::<Vec<_>>();
     let cwd = std::env::current_dir()
-        .map_err(|e| NonoError::SandboxInit(format!("tool-sandbox shim cwd failed: {e}")))?
+        .map_err(|e| {
+            NonoError::SandboxInit(format!(
+                "tool-sandbox shim cwd failed: {e}. '{command}' is running in a directory its \
+                 sandbox does not grant read on (getcwd needs to resolve the cwd). If '{command}' \
+                 was invoked in a directory outside its policy — e.g. a sibling git worktree — add \
+                 \".\" to the command's fs_read so its live working directory is readable."
+            ))
+        })?
         .into_os_string()
         .into_vec();
 
@@ -618,6 +672,7 @@ fn run_shim() -> Result<()> {
         ))
     })?;
     write_frame(&mut stream, &request)?;
+    recv_frame_ack(&mut stream)?;
     send_stdio_fds(&stream)?;
     let response: ToolSandboxShimResponse = read_frame(&mut stream)?;
 
@@ -670,9 +725,12 @@ fn run_child_launcher() -> Result<()> {
     // object but the final exec is still path-based. Default immutability
     // checks reject paths writable by the sandboxed agent; allowing writable
     // executable targets is therefore a deliberate trust downgrade.
+    //
+    // Preserving argv[0] doesn't widen it: argv[0] is only a string;
+    // `real_binary` (re-verified here) selects what runs.
     verify_launch_binary(&spec)?;
     let caps = caps_from_spec(&spec.caps)?;
-    Sandbox::apply(&caps)?;
+    Sandbox::apply_auto(&caps)?;
 
     let binary = CString::new(real_binary.as_bytes()).map_err(|_| {
         NonoError::SandboxInit("tool-sandbox real binary path contains NUL".to_string())
@@ -881,6 +939,11 @@ fn handle_shim_stream_inner(
 ) -> Result<(i32, Vec<u8>)> {
     let auth = authenticate_shim(stream, state)?;
     let request: ToolSandboxShimRequest = read_frame(stream)?;
+    // Ack before receiving stdio FDs: on macOS, sendmsg with SCM_RIGHTS ancillary
+    // data returns EMSGSIZE if the peer's receive buffer still holds unread frame
+    // bytes. Sending the ack proves the buffer is drained so the shim's sendmsg
+    // can always queue its ancillary data atomically.
+    send_frame_ack(stream)?;
     validate_ipc_request(&request)?;
     if request.command != auth.command {
         return Err(NonoError::SandboxInit(format!(
@@ -909,7 +972,7 @@ fn handle_shim_stream_inner(
         });
     }
 
-    let caller = match resolve_caller(auth.peer_pid, session_root_pid, state) {
+    let caller = match resolve_caller(auth.peer_pid, session_root_pid, state, &request.command) {
         Ok(caller) => caller,
         Err(err) => {
             record_command_policy_audit(
@@ -1170,6 +1233,11 @@ fn handle_shim_stream_inner(
     let intercept = super::resolve_intercept_action(command_config, &request.argv);
     let intercept_action = intercept.action;
 
+    // A matched intercept rule may carry a sandbox that replaces the command's
+    // selected sandbox for the process this rule launches (every action except
+    // `respond`, which launches nothing). Absent -> the command's selected sandbox.
+    let effective_sandbox = intercept.sandbox.unwrap_or(policy);
+
     // ── Respond ──────────────────────────────────────────────────────────
     if let InterceptActionConfig::Respond { stdout } = intercept_action {
         record_command_policy_audit(
@@ -1297,7 +1365,7 @@ fn handle_shim_stream_inner(
             ));
         }
         let result = (|| {
-            let launch = build_child_launch_spec(state, &request, policy)?;
+            let launch = build_child_launch_spec(state, &request, effective_sandbox)?;
             launch_child_with_capture(state, &request.command, &caller, launch, stdio)
         })();
         state.active_count.fetch_sub(1, Ordering::SeqCst);
@@ -1383,7 +1451,7 @@ fn handle_shim_stream_inner(
             ));
         }
         let result = (|| {
-            let launch = build_child_launch_spec(state, &request, policy)?;
+            let launch = build_child_launch_spec(state, &request, effective_sandbox)?;
             launch_child_with_capture(state, &request.command, &caller, launch, stdio)
         })();
         state.active_count.fetch_sub(1, Ordering::SeqCst);
@@ -1434,6 +1502,95 @@ fn handle_shim_stream_inner(
         };
     }
 
+    // ── Exec ─────────────────────────────────────────────────────────────
+    if let InterceptActionConfig::Exec { command } = intercept_action {
+        let active = state.active_count.fetch_add(1, Ordering::SeqCst);
+        if active >= MAX_ACTIVE_TOOL_SANDBOX_CHILDREN {
+            state.active_count.fetch_sub(1, Ordering::SeqCst);
+            record_command_policy_audit(
+                audit_recorder.as_ref(),
+                &request,
+                &state.redaction_policy,
+                session_id,
+                auth.peer_pid,
+                session_root_pid,
+                Some(&caller),
+                "denied",
+                Some("resource_limit".to_string()),
+                None,
+            )?;
+            return Err(NonoError::SandboxInit(
+                "tool-sandbox active child limit exceeded".to_string(),
+            ));
+        }
+        let result = (|| {
+            let (helper, extra_args) =
+                super::policy::resolve_exec_helper(&state.plan.exec_helpers, command)?;
+            let launch = build_child_launch_spec_for_binary(
+                state,
+                &request,
+                policy,
+                helper,
+                &extra_args,
+                false,
+            )?;
+            launch_child(state, &request.command, &caller, launch, stdio)
+        })();
+        state.active_count.fetch_sub(1, Ordering::SeqCst);
+        return match result {
+            Ok(launch_result) => {
+                if let Some(reason) = launch_result.blocked_reason.clone() {
+                    record_command_policy_audit_with_stdio(
+                        audit_recorder.as_ref(),
+                        &request,
+                        &state.redaction_policy,
+                        session_id,
+                        auth.peer_pid,
+                        session_root_pid,
+                        Some(&caller),
+                        "denied",
+                        Some(reason.clone()),
+                        None,
+                        launch_result.stdio,
+                    )?;
+                    return Err(NonoError::BlockedCommand {
+                        command: request.command,
+                        reason,
+                    });
+                }
+                record_command_policy_audit_with_stdio(
+                    audit_recorder.as_ref(),
+                    &request,
+                    &state.redaction_policy,
+                    session_id,
+                    auth.peer_pid,
+                    session_root_pid,
+                    Some(&caller),
+                    "exec",
+                    None,
+                    Some(launch_result.exit_code),
+                    launch_result.stdio,
+                )?;
+                Ok((launch_result.exit_code, Vec::new()))
+            }
+            Err(err) => {
+                record_command_policy_audit(
+                    audit_recorder.as_ref(),
+                    &request,
+                    &state.redaction_policy,
+                    session_id,
+                    auth.peer_pid,
+                    session_root_pid,
+                    Some(&caller),
+                    "denied",
+                    Some(err.to_string()),
+                    None,
+                )?;
+                Err(err)
+            }
+        };
+    }
+
     // ── Passthrough (and Approve→granted) ────────────────────────────────
     let active = state.active_count.fetch_add(1, Ordering::SeqCst);
     if active >= MAX_ACTIVE_TOOL_SANDBOX_CHILDREN {
@@ -1455,7 +1612,7 @@ fn handle_shim_stream_inner(
         ));
     }
     let result = (|| {
-        let launch = build_child_launch_spec(state, &request, policy)?;
+        let launch = build_child_launch_spec(state, &request, effective_sandbox)?;
         launch_child(state, &request.command, &caller, launch, stdio)
     })();
     state.active_count.fetch_sub(1, Ordering::SeqCst);
@@ -1601,37 +1758,579 @@ fn resolve_caller(
     peer_pid: u32,
     session_root_pid: u32,
     state: &ToolSandboxState,
+    command_name: &str,
 ) -> Result<Caller> {
-    if let Some(cmd) = live_active_child_command(peer_pid, state)? {
-        return Ok(Caller::Command { name: cmd });
-    }
+    resolve_caller_with(
+        peer_pid,
+        session_root_pid,
+        state,
+        command_name,
+        |daemon_pid| {
+            // Only a genuinely reparented daemon (ppid 1) is a valid severed anchor.
+            if parent_pid(daemon_pid).ok() != Some(1) {
+                return None;
+            }
+            state
+                .lineage
+                .resolve_severed_command(daemon_pid, &state.plan.config, &state.policy_root)
+                .map(|name| Caller::Command { name })
+        },
+    )
+}
 
-    // Fast path: the shim IS the session root (simple exec, no intermediate shell).
-    if peer_pid == session_root_pid {
-        return Ok(Caller::Session);
-    }
+/// `resolve_severed` receives the daemon pid `D` (last non-init pid in the walk);
+/// a parameter so tests can drive the severed branch without a real reparented
+/// process. Mirrors the Linux `lineage_cgroup` seam.
+fn resolve_caller_with(
+    peer_pid: u32,
+    session_root_pid: u32,
+    state: &ToolSandboxState,
+    command_name: &str,
+    resolve_severed: impl Fn(u32) -> Option<Caller>,
+) -> Result<Caller> {
     let mut pid = peer_pid;
+    // On a severed walk this ends as the reparented daemon `D` (ppid 1).
+    let mut last_non_init = peer_pid;
     for _ in 0..ANCESTRY_DEPTH_LIMIT {
+        if let Some((cmd, launch_caller)) = live_active_child(pid, state)? {
+            if cmd == command_name
+                && !has_explicit_self_invocation_entry(&state.plan.config, command_name)
+            {
+                return Ok(launch_caller);
+            }
+            return Ok(Caller::Command { name: cmd });
+        }
+        if pid == session_root_pid {
+            return Ok(Caller::Session);
+        }
+        if pid == 0 || pid == 1 {
+            break;
+        }
+        last_non_init = pid;
         pid = match parent_pid(pid) {
             Ok(p) => p,
             // If proc_pidinfo fails partway up the chain the process likely
             // exited; stop walking rather than returning an opaque error.
             Err(_) => break,
         };
-        if pid == 0 || pid == 1 {
-            break;
-        }
-        if let Some(cmd) = live_active_child_command(pid, state)? {
-            return Ok(Caller::Command { name: cmd });
-        }
-        if pid == session_root_pid {
-            return Ok(Caller::Session);
-        }
+    }
+    // Walk stopped short of the root: an ancestor daemonized (reparented to pid 1).
+    // Fail closed unless the marker verifies `last_non_init` by pid identity.
+    if let Some(caller) = resolve_severed(last_non_init) {
+        return Ok(caller);
     }
     Err(NonoError::BlockedCommand {
         command: "unknown".to_string(),
         reason: "caller ancestry did not reach session root".to_string(),
     })
+}
+
+// ── Daemon lineage ─────────────────────────────────────────────────────────
+//
+// A daemonized caller (setsid + double-fork, reparented to pid 1) severs the
+// parent-pid walk above. The marker re-establishes attribution by running each
+// command's declared `daemon_pid_source` helper and matching the pid it reports
+// against the severed daemon `D`, pinned by kernel identity so a recycled pid
+// cannot inherit a stale attribution. Fail closed: no helper naming `D` -> deny,
+// never the session.
+//
+// Mirrors the Linux `lineage_cgroup::LineageMarker` seam (verified pid vs.
+// unforgeable cgroup membership). Lives here, not a standalone module, to reuse
+// the `proc_pidinfo` FFI and `ProcBsdInfo` layout defined above.
+
+/// The session's lineage-attribution mechanism, chosen once at supervisor start.
+enum LineageMarker {
+    /// A command declares a `daemon_pid_source`; severed daemons are verified against it.
+    DaemonPid(DaemonPidLineage),
+    /// No helper declared; severed callers are denied (fail closed).
+    Disabled,
+}
+
+impl LineageMarker {
+    fn build(
+        config: &CommandPoliciesConfig,
+        helpers: BTreeMap<String, ResolvedCommandBinary>,
+    ) -> Self {
+        if config
+            .commands
+            .values()
+            .any(|command| command.daemon_pid_source.is_some())
+        {
+            Self::DaemonPid(DaemonPidLineage {
+                helpers,
+                ..Default::default()
+            })
+        } else {
+            Self::Disabled
+        }
+    }
+
+    /// Attribute a severed daemon `D` to the command that declared it, or `None`
+    /// to deny. Never the session.
+    fn resolve_severed_command(
+        &self,
+        daemon_pid: u32,
+        config: &CommandPoliciesConfig,
+        policy_root: &Path,
+    ) -> Option<String> {
+        match self {
+            Self::DaemonPid(lineage) => lineage.attribute(daemon_pid, config, policy_root),
+            Self::Disabled => None,
+        }
+    }
+}
+
+/// Kernel identity of a pid: `p_uniqueid` (monotonic per boot, never recycled)
+/// plus BSD process start time. Pins a cached `D -> command` attribution so a
+/// recycled pid cannot inherit it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct DaemonIdentity {
+    uniqueid: u64,
+    start_usec: u64,
+}
+
+/// A severed daemon that matched no declared `daemon_pid_source` is re-checked
+/// against every helper (each up to `DAEMON_PID_SOURCE_TIMEOUT`) on every call
+/// without this bound: a same-user process that rapidly forks/reparents could
+/// force a full helper sweep per attempt and exhaust the supervisor's thread
+/// pool. Short enough that a helper's own startup race (e.g. server not fully
+/// up yet) self-heals quickly; long enough to blunt a tight fork loop.
+const DAEMON_PID_NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(2);
+
+/// Verifies severed daemons against declared `daemon_pid_source` helpers and
+/// caches each result, keyed by pid and pinned by kernel identity.
+#[derive(Default)]
+struct DaemonPidLineage {
+    cache: Mutex<HashMap<u32, (DaemonIdentity, String)>>,
+    /// Unmatched severed daemons, pinned by kernel identity so a recycled pid
+    /// can't inherit a stale denial, expired after `DAEMON_PID_NEGATIVE_CACHE_TTL`.
+    negative_cache: Mutex<HashMap<u32, (DaemonIdentity, Instant)>>,
+    /// Pre-resolved helper identity (dev/ino/size/mtime/sha256), keyed by
+    /// command name, captured at plan-build time for TOCTOU protection.
+    helpers: BTreeMap<String, ResolvedCommandBinary>,
+}
+
+impl DaemonPidLineage {
+    fn attribute(
+        &self,
+        daemon_pid: u32,
+        config: &CommandPoliciesConfig,
+        policy_root: &Path,
+    ) -> Option<String> {
+        self.attribute_with_negative_ttl(
+            daemon_pid,
+            config,
+            policy_root,
+            DAEMON_PID_NEGATIVE_CACHE_TTL,
+        )
+    }
+
+    fn attribute_with_negative_ttl(
+        &self,
+        daemon_pid: u32,
+        config: &CommandPoliciesConfig,
+        policy_root: &Path,
+        negative_ttl: Duration,
+    ) -> Option<String> {
+        if daemon_pid == 0 || daemon_pid == 1 {
+            return None;
+        }
+        let identity = daemon_identity(daemon_pid)?;
+        if let Ok(cache) = self.cache.lock()
+            && let Some((cached_id, name)) = cache.get(&daemon_pid)
+            && *cached_id == identity
+        {
+            trace!("tool-sandbox: severed daemon {daemon_pid} -> command {name} (cache hit)");
+            return Some(name.clone());
+        }
+        if let Ok(negative_cache) = self.negative_cache.lock()
+            && let Some((cached_id, at)) = negative_cache.get(&daemon_pid)
+            && *cached_id == identity
+            && at.elapsed() < negative_ttl
+        {
+            trace!(
+                "tool-sandbox: severed daemon {daemon_pid} denied (negative cache hit, no helper re-run)"
+            );
+            return None;
+        }
+        // `D`'s kernel-read context is the same for every helper, so read it once.
+        let daemon_cwd = daemon_cwd(daemon_pid);
+        let daemon_argv_env = daemon_argv_env(daemon_pid);
+        let daemon_argv = daemon_argv_env.as_ref().map(|(argv, _)| argv.clone());
+        for (name, command) in &config.commands {
+            let Some(source) = &command.daemon_pid_source else {
+                continue;
+            };
+            // Resolved at plan-build time; absent means the helper failed to
+            // resolve there and plan build would have already errored, so this
+            // is defensive (e.g. a config mutated after build in a test).
+            let Some(resolved) = self.helpers.get(name) else {
+                continue;
+            };
+            let daemon_env = daemon_argv_env
+                .as_ref()
+                .map(|(_, env)| filter_daemon_env(env, &source.env, name));
+            let context = DaemonHelperContext {
+                schema_version: DAEMON_HELPER_SCHEMA_VERSION,
+                command: name.clone(),
+                candidate_pid: daemon_pid,
+                workdir: policy_root.to_string_lossy().into_owned(),
+                daemon_cwd: daemon_cwd.clone(),
+                daemon_argv: daemon_argv.clone(),
+                daemon_env,
+            };
+            let Some(server_pid) = run_daemon_pid_source(
+                name,
+                &source.argv,
+                resolved,
+                &context,
+                DAEMON_PID_SOURCE_TIMEOUT,
+            ) else {
+                continue;
+            };
+            // A match counts only if `D`'s kernel identity is unchanged across the
+            // helper run, so a pid reused mid-check can't be mis-attributed.
+            if server_pid == daemon_pid && daemon_identity(daemon_pid) == Some(identity) {
+                if let Ok(mut cache) = self.cache.lock() {
+                    cache.insert(daemon_pid, (identity, name.clone()));
+                    // Bound the cache: drop entries whose pid died or was reused.
+                    cache.retain(|pid, (id, _)| daemon_identity(*pid) == Some(*id));
+                }
+                debug!("tool-sandbox: severed daemon {daemon_pid} attributed to command {name}");
+                return Some(name.clone());
+            }
+        }
+        if let Ok(mut negative_cache) = self.negative_cache.lock() {
+            negative_cache.insert(daemon_pid, (identity, Instant::now()));
+            // Bound the cache: drop entries whose pid died, was reused, or expired.
+            negative_cache.retain(|pid, (id, at)| {
+                at.elapsed() < negative_ttl && daemon_identity(*pid) == Some(*id)
+            });
+        }
+        debug!("tool-sandbox: severed daemon {daemon_pid} matched no daemon_pid_source; denying");
+        None
+    }
+}
+
+const PROC_PIDUNIQIDENTIFIERINFO: i32 = 17;
+
+#[repr(C)]
+struct ProcUniqIdentifierInfo {
+    p_uuid: [u8; 16],
+    p_uniqueid: u64,
+    p_puniqueid: u64,
+    p_reserve2: u64,
+    p_reserve3: u64,
+    p_reserve4: u64,
+}
+
+fn daemon_identity(pid: u32) -> Option<DaemonIdentity> {
+    let mut uinfo: ProcUniqIdentifierInfo = unsafe { std::mem::zeroed() };
+    let usize_bytes = std::mem::size_of::<ProcUniqIdentifierInfo>() as i32;
+    // SAFETY: proc_pidinfo writes exactly `usize_bytes` into uinfo on success and
+    // the flavor-sized return is checked before any field is read.
+    let ret = unsafe {
+        proc_pidinfo(
+            pid as i32,
+            PROC_PIDUNIQIDENTIFIERINFO,
+            0,
+            (&mut uinfo as *mut ProcUniqIdentifierInfo).cast::<libc::c_void>(),
+            usize_bytes,
+        )
+    };
+    if ret != usize_bytes {
+        return None;
+    }
+    let mut binfo: ProcBsdInfo = unsafe { std::mem::zeroed() };
+    let bsize = std::mem::size_of::<ProcBsdInfo>() as i32;
+    // SAFETY: as above, for the BSD-info flavor.
+    let ret = unsafe {
+        proc_pidinfo(
+            pid as i32,
+            PROC_PIDTBSDINFO,
+            0,
+            (&mut binfo as *mut ProcBsdInfo).cast::<libc::c_void>(),
+            bsize,
+        )
+    };
+    if ret != bsize {
+        return None;
+    }
+    Some(DaemonIdentity {
+        uniqueid: uinfo.p_uniqueid,
+        start_usec: binfo.pbi_start_tvsec * 1_000_000 + binfo.pbi_start_tvusec,
+    })
+}
+
+/// Bumped only on an incompatible change to the helper's JSON input.
+const DAEMON_HELPER_SCHEMA_VERSION: u32 = 1;
+
+/// Credential-named keys never forwarded into `daemon_env`, even if allowlisted:
+/// a backstop against a profile leaking a secret to an unsandboxed helper.
+const DAEMON_ENV_CREDENTIAL_DENYLIST: &[&str] = &[
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "GITLAB_TOKEN",
+    "OAUTH_TOKEN",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "ANTHROPIC_API_KEY",
+];
+
+/// The daemon context nono hands a `daemon_pid_source` helper as a JSON object on
+/// stdin. `candidate_pid` is the kernel-pinned severed daemon `D`; the helper
+/// prints the pid it believes is its server and nono accepts only if it equals `D`.
+#[derive(serde::Serialize)]
+struct DaemonHelperContext {
+    schema_version: u32,
+    command: String,
+    candidate_pid: u32,
+    workdir: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    daemon_cwd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    daemon_argv: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    daemon_env: Option<BTreeMap<String, String>>,
+}
+
+/// Keep only the allowlisted keys present in `D`'s env, minus the credential-name
+/// backstop. Logs each backstop drop so a misconfigured allowlist is visible.
+fn filter_daemon_env(
+    daemon_env: &[(String, String)],
+    allowlist: &[String],
+    command_name: &str,
+) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    for key in allowlist {
+        if DAEMON_ENV_CREDENTIAL_DENYLIST
+            .iter()
+            .any(|denied| denied.eq_ignore_ascii_case(key))
+        {
+            debug!(
+                "tool-sandbox: {command_name}.daemon_pid_source dropped credential-named env key {key}"
+            );
+            continue;
+        }
+        if let Some((_, value)) = daemon_env.iter().find(|(k, _)| k == key) {
+            out.insert(key.clone(), value.clone());
+        }
+    }
+    out
+}
+
+/// A daemon's argv plus its env as `(key, value)` pairs.
+type DaemonArgvEnv = (Vec<String>, Vec<(String, String)>);
+
+/// `D`'s argv and env (`KEY=VALUE` split on the first `=`), read from the kernel.
+/// `None` on any failure; callers omit the fields rather than fail attribution.
+fn daemon_argv_env(pid: u32) -> Option<DaemonArgvEnv> {
+    let argmax = kern_argmax()?;
+    let mut buf = vec![0u8; argmax];
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as libc::c_int];
+    let mut len = buf.len();
+    // SAFETY: sysctl writes at most `len` bytes into `buf` and updates `len` to the
+    // count actually written, which we honor before parsing.
+    let ret = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            buf.as_mut_ptr().cast::<libc::c_void>(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if ret != 0 {
+        return None;
+    }
+    buf.truncate(len);
+    parse_procargs2(&buf)
+}
+
+fn kern_argmax() -> Option<usize> {
+    let mut mib = [libc::CTL_KERN, libc::KERN_ARGMAX];
+    let mut argmax: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>();
+    // SAFETY: sysctl writes one `c_int` into `argmax`; `len` bounds the write.
+    let ret = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            (&mut argmax as *mut libc::c_int).cast::<libc::c_void>(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if ret != 0 || argmax <= 0 {
+        return None;
+    }
+    Some(argmax as usize)
+}
+
+/// Parse a `KERN_PROCARGS2` buffer: `argc` (i32), the exec path, NUL padding, then
+/// `argc` NUL-terminated argv strings, then NUL-terminated `KEY=VALUE` env strings.
+/// All reads are bounds-checked against the returned length.
+fn parse_procargs2(buf: &[u8]) -> Option<DaemonArgvEnv> {
+    let argc = i32::from_ne_bytes(buf.get(0..4)?.try_into().ok()?);
+    if argc < 0 {
+        return None;
+    }
+    let read_cstr = |pos: &mut usize| -> &[u8] {
+        let start = *pos;
+        while *pos < buf.len() && buf[*pos] != 0 {
+            *pos += 1;
+        }
+        let s = &buf[start..*pos];
+        *pos += 1; // step over the NUL (or past the end)
+        s
+    };
+    let mut pos = 4;
+    read_cstr(&mut pos); // exec path
+    while pos < buf.len() && buf[pos] == 0 {
+        pos += 1; // exec-path alignment padding
+    }
+    // `argc` comes from the target process's raw KERN_PROCARGS2 buffer, so an
+    // untrusted/manipulated process can report an enormous value; cap the
+    // allocation by the buffer we actually read to avoid an OOM panic.
+    let mut argv = Vec::with_capacity(std::cmp::min(argc as usize, buf.len()));
+    for _ in 0..argc {
+        if pos >= buf.len() {
+            break;
+        }
+        argv.push(String::from_utf8_lossy(read_cstr(&mut pos)).into_owned());
+    }
+    let mut env = Vec::new();
+    while pos < buf.len() && buf[pos] != 0 {
+        let entry = read_cstr(&mut pos);
+        if let Some(eq) = entry.iter().position(|&b| b == b'=') {
+            env.push((
+                String::from_utf8_lossy(&entry[..eq]).into_owned(),
+                String::from_utf8_lossy(&entry[eq + 1..]).into_owned(),
+            ));
+        }
+    }
+    Some((argv, env))
+}
+
+/// `D`'s current working directory, read from the kernel. `None` on failure.
+fn daemon_cwd(pid: u32) -> Option<String> {
+    let mut info: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_vnodepathinfo>() as i32;
+    // SAFETY: proc_pidinfo writes exactly `size` bytes into `info` on success.
+    let ret = unsafe {
+        proc_pidinfo(
+            pid as i32,
+            libc::PROC_PIDVNODEPATHINFO,
+            0,
+            (&mut info as *mut libc::proc_vnodepathinfo).cast::<libc::c_void>(),
+            size,
+        )
+    };
+    if ret != size {
+        return None;
+    }
+    let raw = &info.pvi_cdir.vip_path;
+    // SAFETY: `vip_path` is a fixed NUL-terminated C-string buffer; read it as bytes.
+    let bytes = unsafe {
+        std::slice::from_raw_parts(raw.as_ptr().cast::<u8>(), std::mem::size_of_val(raw))
+    };
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    if end == 0 {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&bytes[..end]).into_owned())
+}
+
+const DAEMON_PID_SOURCE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Run a command's `daemon_pid_source` helper, feeding `context` as a JSON object
+/// on stdin; parse the first whitespace-delimited integer of stdout as the daemon pid.
+///
+/// SECURITY: the helper runs UNSANDBOXED in the supervisor, so it MUST only read and
+/// emit a pid, never execute workspace-controlled code. nono hardens the launch
+/// (pinned, TOCTOU-verified identity resolved at plan-build time; cleared env,
+/// neutral cwd, hard timeout) but cannot vet the helper's own behavior.
+fn run_daemon_pid_source(
+    command_name: &str,
+    argv: &[String],
+    resolved: &ResolvedCommandBinary,
+    context: &DaemonHelperContext,
+    timeout: Duration,
+) -> Option<u32> {
+    let (_, args) = argv.split_first()?;
+    // `resolved` was resolved and immutability-checked at plan-build time; re-verify
+    // its identity now, right before spawn, to close the TOCTOU window between then
+    // and dispatch (mirrors verify_binary_identity's use for command binaries).
+    if let Err(err) = verify_binary_identity(resolved) {
+        warn!("tool-sandbox: {command_name}.daemon_pid_source helper identity check failed: {err}");
+        return None;
+    }
+    let prog = &resolved.canonical_path;
+    let payload = serde_json::to_vec(context)
+        .map_err(|err| debug!("tool-sandbox: {command_name}.daemon_pid_source serialize: {err}"))
+        .ok()?;
+    let mut command = std::process::Command::new(prog);
+    command
+        .args(args)
+        .current_dir("/")
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    // HOME lets a helper expand `~` to a pid file; not credential-bearing.
+    if let Some(home) = std::env::var_os("HOME") {
+        command.env("HOME", home);
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|err| debug!("tool-sandbox: {command_name}.daemon_pid_source spawn failed: {err}"))
+        .ok()?;
+
+    // `D`'s argv/env is untrusted and unbounded (read straight from the kernel), so
+    // the JSON payload can exceed the pipe buffer. Write it on its own thread so a
+    // helper that doesn't drain stdin before doing other work can't wedge this
+    // thread's write and skip the deadline loop below; killing the child on timeout
+    // closes its stdin fd, unblocking the writer.
+    if let Some(mut stdin) = child.stdin.take() {
+        let command_name = command_name.to_string();
+        std::thread::spawn(move || {
+            if let Err(err) = stdin.write_all(&payload) {
+                debug!("tool-sandbox: {command_name}.daemon_pid_source stdin write failed: {err}");
+            }
+        });
+    }
+
+    // Poll to a deadline; kill a wedged helper so it can't hang the shim thread.
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                warn!("tool-sandbox: {command_name}.daemon_pid_source timed out; denying");
+                return None;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            Err(err) => {
+                debug!("tool-sandbox: {command_name}.daemon_pid_source wait failed: {err}");
+                return None;
+            }
+        }
+    };
+    if !status.success() {
+        debug!(
+            "tool-sandbox: {command_name}.daemon_pid_source exited {:?}",
+            status.code()
+        );
+        return None;
+    }
+    let mut stdout = String::new();
+    child.stdout.take()?.read_to_string(&mut stdout).ok()?;
+    stdout.split_whitespace().next()?.parse::<u32>().ok()
 }
 
 fn parent_pid(pid: u32) -> Result<u32> {
@@ -1657,13 +2356,10 @@ fn parent_pid(pid: u32) -> Result<u32> {
     }
 }
 
-fn live_active_child_command(pid: u32, state: &ToolSandboxState) -> Result<Option<String>> {
-    Ok(live_active_child(pid, state)?.map(|(command, _)| command))
-}
-
-/// Like [`live_active_child_command`] but also returns the caller the command
-/// was launched under. Used by the URL-open path to resolve the requesting
-/// command's own running policy.
+/// Returns the active command for `pid` and the caller it was launched under.
+/// Self-invocation with no explicit self-invocation entry uses the launch caller so
+/// recursive tool calls keep the current effective policy instead of requiring
+/// a `<cmd>.can_use[<cmd>]` edge.
 fn live_active_child(pid: u32, state: &ToolSandboxState) -> Result<Option<(String, Caller)>> {
     let map = state
         .active_children
@@ -1796,6 +2492,25 @@ fn build_child_launch_spec(
         .ok_or_else(|| {
             NonoError::SandboxInit(format!("missing resolved binary for {}", request.command))
         })?;
+    build_child_launch_spec_for_binary(state, request, policy, binary, &[], true)
+}
+
+/// Build a child launch spec that runs `binary` (which may be the command's
+/// real binary OR an `exec` intercept helper) inside the matched command's
+/// sandbox (`policy`). `extra_args` are inserted between argv[0] and the
+/// forwarded original args (`request.argv[1..]`) — used by the `exec` action to
+/// pass the helper's fixed leading args. `preserve_caller_argv0` is true for
+/// the command's own binary, false for `exec` helpers. The fs-read cap, exec-gate, executable shape baseline, and identity
+/// expectations are all bound to `binary`, while network/credentials/proxy/fs/env
+/// come from `policy`.
+fn build_child_launch_spec_for_binary(
+    state: &ToolSandboxState,
+    request: &ToolSandboxShimRequest,
+    policy: &CommandSandboxConfig,
+    binary: &ResolvedCommandBinary,
+    extra_args: &[Vec<u8>],
+    preserve_caller_argv0: bool,
+) -> Result<ToolSandboxChildLaunchSpec> {
     verify_binary_identity(binary)?;
     let cwd = PathBuf::from(OsString::from_vec(request.cwd.clone()));
     let cwd = cwd
@@ -1804,6 +2519,16 @@ fn build_child_launch_spec(
             path: cwd.clone(),
             source,
         })?;
+    // Bound the command's live cwd to the agent's own granted filesystem;
+    // rejects a cwd outside it (write non-escalation for cwd-scoped policy
+    // grants is enforced per-path in add_policy_fs).
+    super::admit_command_cwd(
+        &request.command,
+        &cwd,
+        &state.policy_root,
+        &state.outer_caps,
+        &state.deny_paths,
+    )?;
     let mut caps = build_child_caps(state, binary, policy, request, &cwd)?;
     caps.deduplicate();
 
@@ -1816,7 +2541,13 @@ fn build_child_launch_spec(
             .as_ref()
             .map(|path| path.as_os_str().as_bytes().to_vec()),
         interpreter_args: binary.shape.interpreter_args.clone(),
-        argv: effective_argv(binary, request, policy)?,
+        argv: effective_argv_for_binary(
+            binary,
+            request,
+            policy,
+            extra_args,
+            preserve_caller_argv0,
+        )?,
         env: filter_child_env(state, request, policy)?,
         cwd: cwd.as_os_str().as_bytes().to_vec(),
         stdio_mode: selected_stdio_mode(request).to_string(),
@@ -1872,7 +2603,14 @@ fn build_child_caps(
     add_executable_shape_baseline(&mut caps, binary)?;
     add_chaining_control_caps(&mut caps, state)?;
     add_macos_cwd_metadata_rules(&mut caps, cwd)?;
-    add_policy_fs(&mut caps, policy, &state.policy_root)?;
+    add_policy_fs(
+        &mut caps,
+        policy,
+        &state.policy_root,
+        cwd,
+        &state.outer_caps,
+        &state.deny_paths,
+    )?;
     // When the command was granted a keychain DB file (e.g. login.keychain-db),
     // reuse the main-path keychain mechanism: add the WAL/SHM/`.fl`/`user.kb`
     // sibling-file exceptions the Security framework touches. The library
@@ -1887,7 +2625,25 @@ fn build_child_caps(
     add_url_open_caps(&mut caps, state, policy)?;
     add_launch_services_caps(&mut caps, policy)?;
     add_child_process_exec_gate_with_policy(&mut caps, state, binary, Some(policy))?;
+    // Append the command's opt-in raw Seatbelt rules last so they land at the
+    // tail of the generated child profile. Seatbelt evaluates last-matching-rule
+    // wins, so a rule like `(allow process-exec* (literal "/usr/bin/security"))`
+    // overrides the exec gate's earlier `(deny process-exec*)`.
+    add_unsafe_seatbelt_rules(&mut caps, policy)?;
     Ok(caps)
+}
+
+/// Append a command sandbox's opt-in raw macOS Seatbelt rules to the child's
+/// platform rules. Emitted after all generated rules so they win under
+/// last-matching-rule semantics. No-op when the list is empty.
+fn add_unsafe_seatbelt_rules(
+    caps: &mut CapabilitySet,
+    policy: &CommandSandboxConfig,
+) -> Result<()> {
+    for rule in &policy.unsafe_macos_seatbelt_rules {
+        caps.add_platform_rule(rule.clone())?;
+    }
+    Ok(())
 }
 
 /// When a command opts into direct LaunchServices (`allow_launch_services`),
@@ -1963,7 +2719,19 @@ fn add_executable_shape_baseline(
     {
         caps.add_fs(FsCapability::new_file(bundle, AccessMode::Read)?);
     }
-    caps.add_fs(FsCapability::new_file(interpreter, AccessMode::Read)?);
+    caps.add_fs(FsCapability::new_file(&interpreter, AccessMode::Read)?);
+    // `env` re-exec's the real interpreter, so grant it read too (as on Linux).
+    if let Some(real_interp) =
+        env_shebang_target_interpreter(&interpreter, &binary.shape.interpreter_args)
+        && let Ok(canonical_real) = real_interp.canonicalize()
+    {
+        if let Some(bundle) = python_framework_app_bundle_path(&canonical_real)
+            && bundle.is_file()
+        {
+            caps.add_fs(FsCapability::new_file(bundle, AccessMode::Read)?);
+        }
+        caps.add_fs(FsCapability::new_file(&canonical_real, AccessMode::Read)?);
+    }
     Ok(())
 }
 
@@ -2257,25 +3025,64 @@ fn add_policy_fs(
     caps: &mut CapabilitySet,
     policy: &CommandSandboxConfig,
     policy_root: &Path,
+    cwd: &Path,
+    outer_caps: &CapabilitySet,
+    deny_paths: &[PathBuf],
 ) -> Result<()> {
     use super::dynamic_providers::expand_dynamic_tokens;
-    for entry in &expand_dynamic_tokens(&policy.fs_read)? {
-        let path = resolve_policy_path(entry, policy_root)?;
-        caps.add_fs(FsCapability::new_dir(path, AccessMode::Read)?);
+    // A write grant that resolves under the live cwd is downgraded to read
+    // unless the agent itself can write that exact resolved path, so a
+    // command's cwd access never exceeds the agent's own (write
+    // non-escalation). Checked per resolved path, not just the cwd as a
+    // whole, so a subdirectory the agent can explicitly write stays
+    // writable even when the surrounding cwd itself is not. Grants outside
+    // the cwd (e.g. `$WORKDIR`, absolute paths) are unaffected.
+    let write_access = |path: &Path| {
+        let normalized = super::lexically_normalize(path);
+        if normalized.starts_with(cwd)
+            && !super::agent_can_write(&normalized, policy_root, outer_caps, deny_paths)
+        {
+            AccessMode::Read
+        } else {
+            AccessMode::ReadWrite
+        }
+    };
+    // `@git:*` tokens run git in the command's live cwd so they resolve to the
+    // repo the command is actually operating in (e.g. its worktree / .git
+    // common-dir), not the repo the agent was launched in.
+    for entry in &expand_dynamic_tokens(&policy.fs_read, Some(cwd))? {
+        let path = resolve_policy_path(entry, policy_root, cwd)?;
+        add_optional_dir(caps, path, AccessMode::Read)?;
     }
-    for entry in &expand_dynamic_tokens(&policy.fs_write)? {
-        let path = resolve_policy_path(entry, policy_root)?;
-        caps.add_fs(FsCapability::new_dir(path, AccessMode::ReadWrite)?);
+    for entry in &expand_dynamic_tokens(&policy.fs_write, Some(cwd))? {
+        let path = resolve_policy_path(entry, policy_root, cwd)?;
+        let access = write_access(&path);
+        add_optional_dir(caps, path, access)?;
     }
-    for entry in &expand_dynamic_tokens(&policy.fs_read_file)? {
-        let path = resolve_policy_path(entry, policy_root)?;
+    for entry in &expand_dynamic_tokens(&policy.fs_read_file, Some(cwd))? {
+        let path = resolve_policy_path(entry, policy_root, cwd)?;
         add_optional_read_file(caps, path)?;
     }
-    for entry in &expand_dynamic_tokens(&policy.fs_write_file)? {
-        let path = resolve_policy_path(entry, policy_root)?;
-        caps.add_fs(FsCapability::new_file(path, AccessMode::ReadWrite)?);
+    for entry in &expand_dynamic_tokens(&policy.fs_write_file, Some(cwd))? {
+        let path = resolve_policy_path(entry, policy_root, cwd)?;
+        if matches!(write_access(&path), AccessMode::Read) {
+            add_optional_read_file(caps, path)?;
+        } else {
+            caps.add_fs(FsCapability::new_file(path, AccessMode::ReadWrite)?);
+        }
     }
     Ok(())
+}
+
+fn add_optional_dir(caps: &mut CapabilitySet, path: PathBuf, access: AccessMode) -> Result<()> {
+    match FsCapability::new_dir(&path, access) {
+        Ok(capability) => {
+            caps.add_fs(capability);
+            Ok(())
+        }
+        Err(NonoError::PathNotFound(_)) => Ok(()),
+        Err(err) => Err(err),
+    }
 }
 
 fn add_optional_read_file(caps: &mut CapabilitySet, path: PathBuf) -> Result<()> {
@@ -2404,8 +3211,8 @@ fn add_policy_credentials(
     Ok(())
 }
 
-fn resolve_policy_path(entry: &str, cwd: &Path) -> Result<PathBuf> {
-    let expanded = crate::profile::expand_vars(entry, cwd)?;
+fn resolve_policy_path(entry: &str, workdir: &Path, cwd: &Path) -> Result<PathBuf> {
+    let expanded = crate::profile::expand_vars(entry, workdir)?;
     if expanded.is_absolute() {
         Ok(expanded)
     } else {
@@ -2994,6 +3801,7 @@ fn caps_to_spec(caps: &CapabilitySet) -> ChildCapsSpec {
             NetworkMode::ProxyOnly { bind_ports, .. } => bind_ports.clone(),
             _ => Vec::new(),
         },
+        proxy_bind_port_ranges: caps.localhost_port_ranges().to_vec(),
         tcp_connect_ports: caps.tcp_connect_ports().to_vec(),
         tcp_bind_ports: caps.tcp_bind_ports().to_vec(),
     }
@@ -3008,6 +3816,9 @@ fn caps_from_spec(spec: &ChildCapsSpec) -> Result<CapabilitySet> {
         });
     } else if spec.network_blocked {
         caps.set_network_mode_mut(NetworkMode::Blocked);
+    }
+    for &(start, end) in &spec.proxy_bind_port_ranges {
+        caps.add_localhost_port_range(start, end)?;
     }
     for fs_grant in &spec.fs {
         caps.add_fs(fs_cap_from_spec(fs_grant)?);
@@ -3557,6 +4368,63 @@ fn validate_controlled_binary_immutability(
     Ok(())
 }
 
+/// Apply the same non-writable-executable trust gate to resolved `exec`
+/// intercept helpers as to command binaries: a helper must not be writable (nor
+/// replaceable via a writable parent) through the outer session capability set
+/// unless the referencing command opted into `allow_writable_executable` (or
+/// the global `allow_writable_executables`). This prevents writable-executable
+/// substitution of the helper.
+fn validate_controlled_exec_helper_immutability(
+    config: &CommandPoliciesConfig,
+    exec_helpers: &BTreeMap<PathBuf, ResolvedCommandBinary>,
+    outer_caps: &CapabilitySet,
+) -> Result<()> {
+    for binary in exec_helpers.values() {
+        let allow_writable_path = config.allow_writable_executables
+            || super::policy::command_referencing_exec_helper_allows_writable(
+                config,
+                &binary.canonical_path,
+            );
+        validate_controlled_file(
+            &binary.canonical_path,
+            outer_caps,
+            "exec intercept helper",
+            allow_writable_path,
+        )?;
+    }
+    Ok(())
+}
+
+/// Apply the same non-writable-executable trust gate to resolved
+/// `daemon_pid_source` helpers as to `exec` intercept helpers: the helper
+/// binary must not be writable (nor replaceable via a writable parent)
+/// through the outer session capability set unless the declaring command
+/// opted into `allow_writable_executable` (or the global
+/// `allow_writable_executables`). Without this, a command whose own
+/// capability grant covers the helper's path could let the sandboxed
+/// workspace process substitute a malicious binary that then runs
+/// unsandboxed in the supervisor.
+fn validate_controlled_daemon_pid_source_helper_immutability(
+    config: &CommandPoliciesConfig,
+    daemon_pid_source_helpers: &BTreeMap<String, ResolvedCommandBinary>,
+    outer_caps: &CapabilitySet,
+) -> Result<()> {
+    for (command_name, binary) in daemon_pid_source_helpers {
+        let allow_writable_path = config.allow_writable_executables
+            || crate::command_policy::command_daemon_pid_source_helper_allows_writable(
+                config,
+                command_name,
+            );
+        validate_controlled_file(
+            &binary.canonical_path,
+            outer_caps,
+            "daemon_pid_source helper",
+            allow_writable_path,
+        )?;
+    }
+    Ok(())
+}
+
 fn command_allows_writable_executable(
     command: &crate::command_policy::CommandPolicyConfig,
 ) -> bool {
@@ -3989,7 +4857,8 @@ fn is_tty(fd: i32) -> bool {
 mod tests {
     use super::*;
     use crate::command_policy::{
-        CommandEnvironmentConfig, CommandFromConfig, CommandPolicyConfig, ResolvedExecutableKind,
+        CommandEnvironmentConfig, CommandFromConfig, CommandPolicyConfig, DaemonPidSource,
+        InterceptActionConfig, InterceptRuleConfig, ResolvedExecutableKind,
         ResolvedExecutableShape,
     };
 
@@ -4034,12 +4903,16 @@ mod tests {
             profile_display_name: None,
             redaction_policy: nono::ScrubPolicy::secure_default(),
             policy_root: PathBuf::from("/tmp"),
+            outer_caps: CapabilitySet::new(),
+            deny_paths: Vec::new(),
             plan: ResolvedToolSandboxPlan {
                 config: CommandPoliciesConfig::default(),
                 resolved: ResolvedCommandBinaries {
                     commands: BTreeMap::new(),
                     warnings: Vec::new(),
                 },
+                exec_helpers: BTreeMap::new(),
+                daemon_pid_source_helpers: BTreeMap::new(),
                 deny_only: BTreeMap::new(),
                 allowed_direct_bypass_ids: HashSet::new(),
             },
@@ -4048,6 +4921,7 @@ mod tests {
             credential_handles: BTreeMap::new(),
             proxy_trust_bundle_paths: Vec::new(),
             active_children: Mutex::new(HashMap::new()),
+            lineage: LineageMarker::Disabled,
             active_count: AtomicUsize::new(0),
             queued_requests: AtomicUsize::new(0),
             emitted_error_response: AtomicBool::new(false),
@@ -4316,6 +5190,35 @@ mod tests {
     }
 
     #[test]
+    fn resolve_policy_path_relative_uses_live_cwd_and_workdir_var_uses_workdir() -> Result<()> {
+        let workdir = Path::new("/launch/root");
+        let cwd = Path::new("/live/elsewhere");
+
+        // A relative entry (the `.` token, or a bare relative path) resolves
+        // against the command's live cwd, not the launch dir.
+        assert_eq!(resolve_policy_path(".", workdir, cwd)?, cwd.join("."));
+        assert_eq!(resolve_policy_path("sub", workdir, cwd)?, cwd.join("sub"));
+
+        // `$WORKDIR` still expands to the launch-time workdir, independent of
+        // the live cwd.
+        assert_eq!(
+            resolve_policy_path("$WORKDIR", workdir, cwd)?,
+            PathBuf::from("/launch/root")
+        );
+        assert_eq!(
+            resolve_policy_path("$WORKDIR/x", workdir, cwd)?,
+            PathBuf::from("/launch/root/x")
+        );
+
+        // Absolute entries are returned unchanged.
+        assert_eq!(
+            resolve_policy_path("/etc/hosts", workdir, cwd)?,
+            PathBuf::from("/etc/hosts")
+        );
+        Ok(())
+    }
+
+    #[test]
     fn process_exec_gate_denies_by_default_and_allows_exact_paths() -> Result<()> {
         let mut caps = CapabilitySet::new();
         add_process_exec_gate(&mut caps, vec![PathBuf::from("/bin/sh")])?;
@@ -4413,6 +5316,30 @@ mod tests {
     }
 
     #[test]
+    fn executable_shape_baseline_grants_env_shebang_target_interpreter() -> Result<()> {
+        // Seatbelt must grant read to the re-exec'd `<interp>`, not just `env`.
+        let temp = test_tempdir()?;
+        let command = temp.path().join("tool");
+        create_executable(&command)?;
+        let target = temp.path().join("real-interp");
+        create_executable(&target)?;
+
+        let mut binary = test_binary("tool", &command)?;
+        binary.shape = ResolvedExecutableShape {
+            kind: ResolvedExecutableKind::ShebangScript,
+            interpreter: Some(PathBuf::from("/usr/bin/env")),
+            interpreter_args: vec![target.to_string_lossy().into_owned()],
+        };
+
+        let mut caps = CapabilitySet::new();
+        add_executable_shape_baseline(&mut caps, &binary)?;
+
+        assert!(has_read_file_cap(&caps, Path::new("/usr/bin/env"))?);
+        assert!(has_read_file_cap(&caps, &target)?);
+        Ok(())
+    }
+
+    #[test]
     fn child_exec_gate_allows_python_framework_app_bundle_exec() -> Result<()> {
         let temp = test_tempdir()?;
         let command = temp.path().join("tool");
@@ -4432,6 +5359,47 @@ mod tests {
         assert!(has_exec_rule(&caps, &command)?);
         assert!(has_exec_rule(&caps, &interpreter)?);
         assert!(has_exec_rule(&caps, &bundle)?);
+        Ok(())
+    }
+
+    #[test]
+    fn unsafe_seatbelt_rules_appended_after_exec_gate_deny() -> Result<()> {
+        let temp = test_tempdir()?;
+        let command = temp.path().join("tool");
+        create_executable(&command)?;
+        let binary = test_binary("tool", &command)?;
+        let state = test_state();
+
+        let policy = CommandSandboxConfig {
+            unsafe_macos_seatbelt_rules: vec![
+                "(allow process-exec* (literal \"/usr/bin/security\"))".to_string(),
+                "(allow file-read* (literal \"/usr/bin/security\"))".to_string(),
+            ],
+            ..Default::default()
+        };
+
+        let mut caps = CapabilitySet::new();
+        // Reproduce the child-caps ordering: exec gate first, then unsafe rules.
+        add_child_process_exec_gate_with_policy(&mut caps, &state, &binary, Some(&policy))?;
+        add_unsafe_seatbelt_rules(&mut caps, &policy)?;
+
+        let rules: Vec<&str> = caps.platform_rules().iter().map(|r| r.as_str()).collect();
+        let deny_idx = rules
+            .iter()
+            .position(|r| *r == "(deny process-exec*)")
+            .expect("exec gate deny present");
+        let allow_idx = rules
+            .iter()
+            .position(|r| *r == "(allow process-exec* (literal \"/usr/bin/security\"))")
+            .expect("unsafe exec allow present");
+        assert!(
+            allow_idx > deny_idx,
+            "unsafe allow (idx {allow_idx}) must come after deny (idx {deny_idx}) so it wins"
+        );
+        assert!(
+            rules.contains(&"(allow file-read* (literal \"/usr/bin/security\"))"),
+            "unsafe file-read rule should be present"
+        );
         Ok(())
     }
 
@@ -4584,6 +5552,139 @@ mod tests {
     }
 
     #[test]
+    fn writable_exec_helper_override_is_explicit_for_sandbox_writable_paths() -> Result<()> {
+        let temp = test_tempdir()?;
+        let bin_dir = temp.path().join("bin");
+        create_dir(&bin_dir)?;
+        let helper = bin_dir.join("helper");
+        create_executable(&helper)?;
+
+        let mut config = CommandPoliciesConfig::default();
+        config.commands.insert(
+            "tool".to_string(),
+            CommandPolicyConfig {
+                intercept: vec![InterceptRuleConfig {
+                    args: vec![],
+                    action: InterceptActionConfig::Exec {
+                        command: vec![helper.to_string_lossy().into_owned()],
+                    },
+                    sandbox: None,
+                }],
+                ..Default::default()
+            },
+        );
+
+        let mut exec_helpers = BTreeMap::new();
+        exec_helpers.insert(helper.clone(), test_binary("helper", &helper)?);
+
+        let caps = CapabilitySet::new();
+        validate_controlled_exec_helper_immutability(&config, &exec_helpers, &caps)?;
+
+        let mut file_write_caps = CapabilitySet::new();
+        file_write_caps.add_fs(FsCapability::new_file(&helper, AccessMode::ReadWrite)?);
+        let err =
+            validate_controlled_exec_helper_immutability(&config, &exec_helpers, &file_write_caps)
+                .err()
+                .ok_or_else(|| {
+                    NonoError::SandboxInit("expected sandbox-writable helper rejection".to_string())
+                })?;
+        assert!(
+            err.to_string()
+                .contains("writable by the outer session capability set")
+        );
+
+        let mut parent_write_caps = CapabilitySet::new();
+        parent_write_caps.add_fs(FsCapability::new_dir(&bin_dir, AccessMode::ReadWrite)?);
+        let err = validate_controlled_exec_helper_immutability(
+            &config,
+            &exec_helpers,
+            &parent_write_caps,
+        )
+        .err()
+        .ok_or_else(|| {
+            NonoError::SandboxInit("expected sandbox-writable parent rejection".to_string())
+        })?;
+        assert!(
+            err.to_string()
+                .contains("replaceable through writable parent directory")
+        );
+
+        config.allow_writable_executables = true;
+        validate_controlled_exec_helper_immutability(&config, &exec_helpers, &parent_write_caps)?;
+        config.allow_writable_executables = false;
+
+        let command = config
+            .commands
+            .get_mut("tool")
+            .ok_or_else(|| NonoError::SandboxInit("missing test command policy".to_string()))?;
+        command.allow_writable_executable = true;
+
+        validate_controlled_exec_helper_immutability(&config, &exec_helpers, &file_write_caps)?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn writable_daemon_pid_source_helper_override_is_explicit_for_sandbox_writable_paths()
+    -> Result<()> {
+        let temp = test_tempdir()?;
+        let bin_dir = temp.path().join("bin");
+        create_dir(&bin_dir)?;
+        let helper = bin_dir.join("helper");
+        create_executable(&helper)?;
+
+        let mut config = CommandPoliciesConfig::default();
+        config.commands.insert(
+            "tmux".to_string(),
+            CommandPolicyConfig {
+                daemon_pid_source: Some(DaemonPidSource {
+                    argv: vec![helper.to_string_lossy().into_owned()],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+
+        let mut helpers = BTreeMap::new();
+        helpers.insert(
+            "tmux".to_string(),
+            test_binary("tmux.daemon_pid_source", &helper)?,
+        );
+
+        let caps = CapabilitySet::new();
+        validate_controlled_daemon_pid_source_helper_immutability(&config, &helpers, &caps)?;
+
+        let mut file_write_caps = CapabilitySet::new();
+        file_write_caps.add_fs(FsCapability::new_file(&helper, AccessMode::ReadWrite)?);
+        let err = validate_controlled_daemon_pid_source_helper_immutability(
+            &config,
+            &helpers,
+            &file_write_caps,
+        )
+        .err()
+        .ok_or_else(|| {
+            NonoError::SandboxInit("expected sandbox-writable helper rejection".to_string())
+        })?;
+        assert!(
+            err.to_string()
+                .contains("writable by the outer session capability set")
+        );
+
+        config
+            .commands
+            .get_mut("tmux")
+            .ok_or_else(|| NonoError::SandboxInit("missing test command policy".to_string()))?
+            .allow_writable_executable = true;
+        validate_controlled_daemon_pid_source_helper_immutability(
+            &config,
+            &helpers,
+            &file_write_caps,
+        )?;
+
+        Ok(())
+    }
+
+    #[test]
     fn exec_gate_allows_non_controlled_initial_exec() {
         let id = FileId { dev: 42, ino: 7 };
         let result = check_exec_gate(
@@ -4714,6 +5815,7 @@ mod tests {
             network_blocked: false,
             proxy_port: None,
             proxy_bind_ports: Vec::new(),
+            proxy_bind_port_ranges: Vec::new(),
             tcp_connect_ports: Vec::new(),
             tcp_bind_ports: Vec::new(),
         };
@@ -4837,15 +5939,588 @@ mod tests {
     }
 
     #[test]
+    fn verify_binary_identity_accepts_unchanged_binary() -> Result<()> {
+        let dir = test_tempdir()?;
+        let path = dir.path().join("multitool");
+        fs::write(&path, b"#!/bin/sh\nbasename \"$0\"\n").map_err(|source| {
+            NonoError::ConfigWrite {
+                path: path.clone(),
+                source,
+            }
+        })?;
+        let binary = test_binary("multitool", &path)?;
+        verify_binary_identity(&binary)?;
+        Ok(())
+    }
+
+    #[test]
+    fn verify_binary_identity_rejects_swapped_binary() -> Result<()> {
+        // Preserving argv[0] must not weaken the anti-swap guard.
+        let dir = test_tempdir()?;
+        let path = dir.path().join("multitool");
+        fs::write(&path, b"original").map_err(|source| NonoError::ConfigWrite {
+            path: path.clone(),
+            source,
+        })?;
+        let binary = test_binary("multitool", &path)?;
+
+        // swap the on-disk file (changes size + mtime)
+        fs::write(&path, b"swapped-larger-content").map_err(|source| NonoError::ConfigWrite {
+            path: path.clone(),
+            source,
+        })?;
+
+        assert!(
+            verify_binary_identity(&binary).is_err(),
+            "verify_binary_identity must reject a binary changed after resolution"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn resolve_caller_prefers_active_command_for_peer_pid() -> Result<()> {
         let state = test_state();
         let pid = std::process::id();
         track_child(&state, pid, "git", &Caller::Session)?;
 
-        let caller = resolve_caller(pid, pid, &state)?;
+        let caller = resolve_caller(pid, pid, &state, "ssh")?;
 
         assert!(matches!(caller, Caller::Command { name } if name == "git"));
         Ok(())
+    }
+
+    #[test]
+    fn resolve_caller_uses_launch_caller_for_self_invocation() -> Result<()> {
+        let state = test_state();
+        let pid = std::process::id();
+        track_child(&state, pid, "git", &Caller::Session)?;
+
+        let caller = resolve_caller(pid, pid, &state, "git")?;
+
+        assert!(matches!(caller, Caller::Session));
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_caller_honors_explicit_self_edge() -> Result<()> {
+        let mut state = test_state();
+        state.plan.config.commands.insert(
+            "git".to_string(),
+            CommandPolicyConfig {
+                can_use: vec!["git".to_string()],
+                ..Default::default()
+            },
+        );
+        let pid = std::process::id();
+        track_child(&state, pid, "git", &Caller::Session)?;
+
+        let caller = resolve_caller(pid, pid, &state, "git")?;
+
+        assert!(matches!(caller, Caller::Command { name } if name == "git"));
+        Ok(())
+    }
+
+    // Peer pid 1 with an unrelated root: the walk ends before the root (as after a
+    // daemonized reparent), forcing the severed-daemon branch.
+    const DAEMONIZED_PEER: u32 = 1;
+    const UNRELATED_ROOT: u32 = 2;
+
+    fn config_with_helper(command: &str, argv: Vec<String>) -> CommandPoliciesConfig {
+        let mut config = CommandPoliciesConfig::default();
+        config.commands.insert(
+            command.to_string(),
+            CommandPolicyConfig {
+                daemon_pid_source: Some(DaemonPidSource {
+                    argv,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        config
+    }
+
+    fn test_context(candidate_pid: u32) -> DaemonHelperContext {
+        DaemonHelperContext {
+            schema_version: DAEMON_HELPER_SCHEMA_VERSION,
+            command: "tmux".to_string(),
+            candidate_pid,
+            workdir: "/tmp".to_string(),
+            daemon_cwd: None,
+            daemon_argv: None,
+            daemon_env: None,
+        }
+    }
+
+    #[test]
+    fn resolve_caller_attributes_severed_daemon_to_verified_command() -> Result<()> {
+        let state = test_state();
+        // Stand in for a positive daemon_pid_source match; drives the severed branch.
+        let caller = resolve_caller_with(DAEMONIZED_PEER, UNRELATED_ROOT, &state, "git", |_| {
+            Some(Caller::Command {
+                name: "tmux".to_string(),
+            })
+        })?;
+
+        assert!(matches!(caller, Caller::Command { name } if name == "tmux"));
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_caller_blocks_severed_daemon_without_match() -> Result<()> {
+        let state = test_state();
+        // Fail-closed: no declared helper identifies the severed daemon.
+        let blocked = resolve_caller_with(DAEMONIZED_PEER, UNRELATED_ROOT, &state, "git", |_| None);
+        assert!(matches!(blocked, Err(NonoError::BlockedCommand { .. })));
+        Ok(())
+    }
+
+    #[test]
+    fn lineage_build_enabled_only_when_a_command_declares_a_helper() {
+        assert!(matches!(
+            LineageMarker::build(&CommandPoliciesConfig::default(), BTreeMap::new()),
+            LineageMarker::Disabled
+        ));
+        let config = config_with_helper("tmux", vec!["/bin/echo".to_string()]);
+        assert!(matches!(
+            LineageMarker::build(&config, BTreeMap::new()),
+            LineageMarker::DaemonPid(_)
+        ));
+    }
+
+    #[test]
+    fn disabled_lineage_denies_severed_daemon() {
+        // Disabled -> deny, never a command, never the session.
+        assert_eq!(
+            LineageMarker::Disabled.resolve_severed_command(
+                std::process::id(),
+                &CommandPoliciesConfig::default(),
+                Path::new("/tmp"),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn daemon_pid_lineage_denies_reserved_and_dead_pids() {
+        let lineage = DaemonPidLineage::default();
+        let config = config_with_helper("tmux", vec!["/bin/echo".to_string()]);
+        // init / kernel pids are never attributed.
+        assert_eq!(lineage.attribute(0, &config, Path::new("/tmp")), None);
+        assert_eq!(lineage.attribute(1, &config, Path::new("/tmp")), None);
+        // A pid with no live process yields no kernel identity -> deny.
+        assert_eq!(
+            lineage.attribute(u32::MAX, &config, Path::new("/tmp")),
+            None
+        );
+    }
+
+    #[test]
+    fn daemon_pid_lineage_attributes_when_helper_names_the_daemon() {
+        // Helper echoes our own pid, so attribution matches and pins by kernel identity.
+        let pid = std::process::id();
+        let config = config_with_helper("tmux", vec!["/bin/echo".to_string(), pid.to_string()]);
+        let helper = test_binary("tmux.daemon_pid_source", Path::new("/bin/echo"))
+            .expect("resolve /bin/echo");
+        let lineage = DaemonPidLineage {
+            helpers: BTreeMap::from([("tmux".to_string(), helper)]),
+            ..Default::default()
+        };
+        assert_eq!(
+            lineage.attribute(pid, &config, Path::new("/tmp")),
+            Some("tmux".to_string())
+        );
+    }
+
+    #[test]
+    fn daemon_pid_lineage_denies_when_helper_names_a_different_pid() {
+        // Helper reports a pid that is not the one being resolved -> no match -> deny.
+        let other = std::process::id().wrapping_add(1).max(2);
+        let config = config_with_helper("tmux", vec!["/bin/echo".to_string(), other.to_string()]);
+        let helper = test_binary("tmux.daemon_pid_source", Path::new("/bin/echo"))
+            .expect("resolve /bin/echo");
+        let lineage = DaemonPidLineage {
+            helpers: BTreeMap::from([("tmux".to_string(), helper)]),
+            ..Default::default()
+        };
+        assert_eq!(
+            lineage.attribute(std::process::id(), &config, Path::new("/tmp")),
+            None
+        );
+    }
+
+    /// A helper script that appends one byte to `counter_path` per invocation, so
+    /// tests can assert how many times it actually ran, then echoes `reported_pid`.
+    fn counting_helper_argv(counter_path: &Path, reported_pid: u32) -> Vec<String> {
+        vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            format!(
+                "printf x >> {} && echo {reported_pid}",
+                counter_path.display()
+            ),
+        ]
+    }
+
+    #[test]
+    fn daemon_pid_lineage_negative_cache_suppresses_helper_rerun_within_ttl() {
+        let pid = std::process::id();
+        let other = pid.wrapping_add(1).max(2);
+        let dir = std::env::temp_dir().join(format!("nono-neg-cache-{pid}"));
+        fs::create_dir_all(&dir).expect("mkdir");
+        let counter = dir.join("count");
+
+        let config = config_with_helper("tmux", counting_helper_argv(&counter, other));
+        let helper =
+            test_binary("tmux.daemon_pid_source", Path::new("/bin/sh")).expect("resolve /bin/sh");
+        let lineage = DaemonPidLineage {
+            helpers: BTreeMap::from([("tmux".to_string(), helper)]),
+            ..Default::default()
+        };
+
+        // First call: no match, helper runs once, negative-cached.
+        assert_eq!(
+            lineage.attribute_with_negative_ttl(
+                pid,
+                &config,
+                Path::new("/tmp"),
+                Duration::from_secs(30)
+            ),
+            None
+        );
+        // Second call within the TTL: must hit the negative cache, not re-run the helper.
+        assert_eq!(
+            lineage.attribute_with_negative_ttl(
+                pid,
+                &config,
+                Path::new("/tmp"),
+                Duration::from_secs(30)
+            ),
+            None
+        );
+        let invocations = fs::read(&counter).expect("read counter").len();
+        assert_eq!(
+            invocations, 1,
+            "helper must run once, not once per attribute() call, within the negative-cache TTL"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn daemon_pid_lineage_negative_cache_expires_and_rechecks_helper() {
+        let pid = std::process::id();
+        let other = pid.wrapping_add(1).max(2);
+        let dir = std::env::temp_dir().join(format!("nono-neg-cache-expire-{pid}"));
+        fs::create_dir_all(&dir).expect("mkdir");
+        let counter = dir.join("count");
+
+        let config = config_with_helper("tmux", counting_helper_argv(&counter, other));
+        let helper =
+            test_binary("tmux.daemon_pid_source", Path::new("/bin/sh")).expect("resolve /bin/sh");
+        let lineage = DaemonPidLineage {
+            helpers: BTreeMap::from([("tmux".to_string(), helper)]),
+            ..Default::default()
+        };
+
+        let tiny_ttl = Duration::from_millis(1);
+        assert_eq!(
+            lineage.attribute_with_negative_ttl(pid, &config, Path::new("/tmp"), tiny_ttl),
+            None
+        );
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            lineage.attribute_with_negative_ttl(pid, &config, Path::new("/tmp"), tiny_ttl),
+            None
+        );
+        let invocations = fs::read(&counter).expect("read counter").len();
+        assert_eq!(
+            invocations, 2,
+            "an expired negative-cache entry must let the helper re-run, so a since-started \
+             server can still be attributed"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn daemon_pid_lineage_denies_when_helper_not_pre_resolved() {
+        // Defensive: a command declares daemon_pid_source but no matching entry made
+        // it into the pre-resolved helpers map (shouldn't happen outside tests, since
+        // plan build would have errored) -> skip that command, fail closed overall.
+        let pid = std::process::id();
+        let config = config_with_helper("tmux", vec!["/bin/echo".to_string(), pid.to_string()]);
+        let lineage = DaemonPidLineage::default(); // helpers empty
+        assert_eq!(lineage.attribute(pid, &config, Path::new("/tmp")), None);
+    }
+
+    #[test]
+    fn run_daemon_pid_source_times_out_wedged_helper() {
+        // A helper that never exits is killed at the deadline -> no pid (fail-closed).
+        let argv = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "sleep 30".to_string(),
+        ];
+        let resolved =
+            test_binary("tmux.daemon_pid_source", Path::new("/bin/sh")).expect("resolve /bin/sh");
+        let start = Instant::now();
+        assert_eq!(
+            run_daemon_pid_source(
+                "tmux",
+                &argv,
+                &resolved,
+                &test_context(std::process::id()),
+                Duration::from_millis(200)
+            ),
+            None
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "must not block on the helper"
+        );
+    }
+
+    #[test]
+    fn run_daemon_pid_source_does_not_deadlock_on_large_daemon_argv() {
+        // A severed daemon's argv is untrusted and unbounded (read straight from the
+        // kernel, see daemon_argv_env), so it can exceed the OS pipe buffer (~16KB on
+        // macOS). A helper that doesn't drain stdin before blocking (e.g. it only reads
+        // once it's done its own work) must not be able to wedge the write and skip the
+        // timeout loop entirely.
+        let mut context = test_context(std::process::id());
+        context.daemon_argv = Some(vec!["x".repeat(4096); 64]); // ~256KB, well over 16KB
+        let argv = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "sleep 3".to_string(),
+        ];
+        let resolved =
+            test_binary("tmux.daemon_pid_source", Path::new("/bin/sh")).expect("resolve /bin/sh");
+        let start = Instant::now();
+        assert_eq!(
+            run_daemon_pid_source(
+                "tmux",
+                &argv,
+                &resolved,
+                &context,
+                Duration::from_millis(200)
+            ),
+            None
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "blocking stdin write let a non-draining helper skip the timeout deadline: took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn run_daemon_pid_source_verify_mode_round_trips_candidate_pid() {
+        // Verify-mode helper: echo back the candidate_pid it read from stdin JSON.
+        // plutil ships in /usr/bin, so it works under the helper's minimal PATH.
+        let pid = std::process::id();
+        let argv = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "plutil -extract candidate_pid raw -o - -".to_string(),
+        ];
+        let resolved =
+            test_binary("tmux.daemon_pid_source", Path::new("/bin/sh")).expect("resolve /bin/sh");
+        assert_eq!(
+            run_daemon_pid_source(
+                "tmux",
+                &argv,
+                &resolved,
+                &test_context(pid),
+                Duration::from_secs(5)
+            ),
+            Some(pid)
+        );
+    }
+
+    #[test]
+    fn run_daemon_pid_source_rejects_helper_whose_identity_changed_since_resolution() {
+        // TOCTOU: the resolved identity (dev/ino/size/mtime) no longer matches the live
+        // file -> deny rather than exec a possibly-substituted binary.
+        let pid = std::process::id();
+        let mut resolved =
+            test_binary("tmux.daemon_pid_source", Path::new("/bin/sh")).expect("resolve /bin/sh");
+        resolved.ino = resolved.ino.wrapping_add(1);
+        let argv = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            format!("echo {pid}"),
+        ];
+        assert_eq!(
+            run_daemon_pid_source(
+                "tmux",
+                &argv,
+                &resolved,
+                &test_context(pid),
+                Duration::from_secs(5)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn filter_daemon_env_honors_allowlist_and_credential_backstop() {
+        let daemon_env = vec![
+            ("BAZEL_OUTPUT_USER_ROOT".to_string(), "/custom".to_string()),
+            ("GH_TOKEN".to_string(), "secret".to_string()),
+            ("PATH".to_string(), "/usr/bin".to_string()),
+        ];
+        // Allowlist BAZEL_OUTPUT_USER_ROOT (kept), a credential-named key (dropped by
+        // the backstop), and a key absent from `D` (omitted). PATH is not allowlisted.
+        let allowlist = vec![
+            "BAZEL_OUTPUT_USER_ROOT".to_string(),
+            "gh_token".to_string(), // case-insensitive denylist match
+            "ABSENT".to_string(),
+        ];
+        let filtered = filter_daemon_env(&daemon_env, &allowlist, "tmux");
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(
+            filtered.get("BAZEL_OUTPUT_USER_ROOT"),
+            Some(&"/custom".to_string())
+        );
+        assert!(!filtered.contains_key("GH_TOKEN"));
+        assert!(!filtered.contains_key("PATH"));
+    }
+
+    #[test]
+    fn parse_procargs2_extracts_argv_and_env() {
+        // argc(=2) | exec path + NUL | pad NUL | argv0 | argv1 | env0 | env1
+        let mut buf = 2i32.to_ne_bytes().to_vec();
+        buf.extend_from_slice(b"/path/to/prog\0\0");
+        buf.extend_from_slice(b"/path/to/prog\0--flag\0");
+        buf.extend_from_slice(b"KEY=VALUE\0BAZEL_OUTPUT_USER_ROOT=/custom\0");
+        let (argv, env) = parse_procargs2(&buf).expect("parse");
+        assert_eq!(argv, vec!["/path/to/prog", "--flag"]);
+        assert_eq!(
+            env,
+            vec![
+                ("KEY".to_string(), "VALUE".to_string()),
+                ("BAZEL_OUTPUT_USER_ROOT".to_string(), "/custom".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn daemon_pid_lineage_cache_prunes_dead_entries() {
+        // A successful attribution prunes cache entries whose pid no longer carries
+        // its recorded identity, so the cache can't grow unbounded.
+        let pid = std::process::id();
+        let config = config_with_helper("tmux", vec!["/bin/echo".to_string(), pid.to_string()]);
+        let helper = test_binary("tmux.daemon_pid_source", Path::new("/bin/echo"))
+            .expect("resolve /bin/echo");
+        let lineage = DaemonPidLineage {
+            helpers: BTreeMap::from([("tmux".to_string(), helper)]),
+            ..Default::default()
+        };
+        {
+            let mut cache = lineage.cache.lock().expect("lock");
+            cache.insert(
+                u32::MAX, // dead pid: no live identity
+                (
+                    DaemonIdentity {
+                        uniqueid: 1,
+                        start_usec: 1,
+                    },
+                    "stale".to_string(),
+                ),
+            );
+        }
+        assert_eq!(
+            lineage.attribute(pid, &config, Path::new("/tmp")),
+            Some("tmux".to_string())
+        );
+        let cache = lineage.cache.lock().expect("lock");
+        assert!(!cache.contains_key(&u32::MAX), "dead entry must be pruned");
+        assert!(cache.contains_key(&pid), "live attribution must remain");
+        assert_eq!(cache.len(), 1);
+    }
+
+    /// LIVE: the property the marker exists for. A real setsid+double-fork daemon
+    /// reparented to pid 1, named by a `daemon_pid_source` helper, resolves to
+    /// `Command{tmux}`; an unnamed reparented daemon is denied. `#[ignore]`: forks
+    /// real processes; run with --ignored.
+    #[test]
+    #[ignore = "forks real reparented daemons; run with --ignored"]
+    fn live_severed_daemon_attributed_to_its_command() {
+        use nix::sys::wait::waitpid;
+        use nix::unistd::{ForkResult, fork};
+
+        // Spawn a setsid + double-fork daemon; returns the reparented grandchild pid.
+        fn spawn_reparented_daemon() -> u32 {
+            let mut fds = [0i32; 2];
+            assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
+            let [read_fd, write_fd] = fds;
+            // SAFETY: post-fork children use only async-signal-safe libc calls.
+            match unsafe { fork() }.expect("fork") {
+                ForkResult::Child => {
+                    unsafe { libc::setsid() };
+                    match unsafe { fork() }.expect("fork") {
+                        ForkResult::Child => {
+                            let pid = unsafe { libc::getpid() };
+                            let bytes = pid.to_ne_bytes();
+                            unsafe {
+                                libc::write(write_fd, bytes.as_ptr().cast(), bytes.len());
+                                libc::usleep(800_000);
+                                libc::_exit(0);
+                            }
+                        }
+                        ForkResult::Parent { .. } => unsafe { libc::_exit(0) },
+                    }
+                }
+                ForkResult::Parent { child } => {
+                    unsafe { libc::close(write_fd) };
+                    let _ = waitpid(child, None); // reap the middle process
+                    let mut buf = [0u8; 4];
+                    let n = unsafe { libc::read(read_fd, buf.as_mut_ptr().cast(), buf.len()) };
+                    assert_eq!(n, 4, "expected the daemon's pid");
+                    unsafe { libc::close(read_fd) };
+                    i32::from_ne_bytes(buf) as u32
+                }
+            }
+        }
+
+        let daemon = spawn_reparented_daemon();
+        let other = spawn_reparented_daemon();
+        assert_eq!(
+            parent_pid(daemon).ok(),
+            Some(1),
+            "daemon must reparent to 1"
+        );
+        assert_eq!(
+            parent_pid(other).ok(),
+            Some(1),
+            "control must reparent to 1"
+        );
+
+        // Throwaway helper that echoes the daemon's pid.
+        let dir = std::env::temp_dir().join(format!("nono-daemon-pid-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("mkdir");
+        let helper = dir.join("pid_source.sh");
+        fs::write(&helper, format!("#!/bin/sh\necho {daemon}\n")).expect("write helper");
+        fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        let config = config_with_helper("tmux", vec![helper.to_string_lossy().into_owned()]);
+        let helpers = crate::command_policy::resolve_policy_daemon_pid_source_helpers(&config)
+            .expect("resolve daemon_pid_source helpers");
+        let marker = LineageMarker::build(&config, helpers);
+
+        assert_eq!(
+            marker.resolve_severed_command(daemon, &config, &dir),
+            Some("tmux".to_string()),
+            "reparented daemon must attribute to its command"
+        );
+        // A reparented daemon the helper does not name is denied (fail-closed).
+        assert_eq!(
+            marker.resolve_severed_command(other, &config, &dir),
+            None,
+            "non-matching reparented daemon must be denied"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -5043,5 +6718,51 @@ mod tests {
         );
         let dangerous_policy = policy_with_env(None, dangerous);
         assert!(apply_environment_set_vars(&mut vec![], &dangerous_policy).is_err());
+    }
+
+    #[test]
+    fn passthrough_uses_intercept_sandbox_override_when_present() {
+        // Mirrors the dispatch selection shared by every launching action:
+        //   let effective_sandbox = intercept.sandbox.unwrap_or(policy);
+        // A matched rule carrying its own sandbox replaces the command sandbox;
+        // a non-matching invocation (no override) falls back to the command
+        // sandbox.
+        let command_sandbox = CommandSandboxConfig {
+            fs_read: vec!["/command/path".to_string()],
+            ..CommandSandboxConfig::default()
+        };
+        let override_sandbox = CommandSandboxConfig {
+            fs_read: vec!["/override/path".to_string()],
+            ..CommandSandboxConfig::default()
+        };
+
+        let with_override = crate::tool_sandbox::ResolvedInterceptAction {
+            action: &crate::command_policy::InterceptActionConfig::Passthrough,
+            rule_args: Some(&[]),
+            sandbox: Some(&override_sandbox),
+        };
+        let effective = with_override.sandbox.unwrap_or(&command_sandbox);
+        assert_eq!(effective.fs_read, vec!["/override/path".to_string()]);
+
+        let without_override = crate::tool_sandbox::ResolvedInterceptAction::passthrough();
+        let effective = without_override.sandbox.unwrap_or(&command_sandbox);
+        assert_eq!(effective.fs_read, vec!["/command/path".to_string()]);
+    }
+
+    #[test]
+    fn parse_procargs2_bounds_argv_capacity_to_buffer_len() {
+        // `argc` is read from the target process's own KERN_PROCARGS2 buffer, so an
+        // untrusted/manipulated process can report an argc far larger than the
+        // buffer actually holds. Before the fix this drove an unbounded
+        // `Vec::with_capacity(argc as usize)`, which panics with an OOM abort
+        // rather than returning an error.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&i32::MAX.to_ne_bytes()); // argc
+        buf.push(0); // empty exec path, NUL-terminated
+        buf.extend_from_slice(b"one\0two\0");
+
+        let (argv, env) = parse_procargs2(&buf).expect("buffer is well-formed enough to parse");
+        assert_eq!(argv, vec!["one".to_string(), "two".to_string()]);
+        assert!(env.is_empty());
     }
 }

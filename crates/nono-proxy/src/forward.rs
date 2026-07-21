@@ -31,6 +31,7 @@ use tracing::debug;
 
 /// Timeout for upstream TCP connect (matches the historical reverse-proxy value).
 const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+const UPSTREAM_REWRITE_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Scheme of the upstream connection. `Http` is only legal for loopback
 /// targets; the caller is responsible for enforcing that invariant
@@ -81,6 +82,14 @@ pub struct AuditCtx<'a> {
     pub path: &'a str,
 }
 
+/// Optional HTTP/1.1 response body rewrite hook.
+///
+/// Used for OAuth token capture, where the proxy must buffer a token endpoint
+/// response, replace real token fields with phantoms, and only then release the
+/// response to the sandboxed client.
+pub type ResponseRewrite<'a> =
+    &'a (dyn Fn(u16, &[(String, String)], &[u8]) -> Result<Vec<u8>> + Send + Sync);
+
 /// Connect to the upstream, write `request_bytes + body`, stream the
 /// response back into `inbound`, and emit the L7 audit event.
 ///
@@ -96,16 +105,30 @@ pub async fn forward_request<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    forward_request_with_response_rewrite(inbound, request_bytes, body, upstream, audit, None).await
+}
+
+pub async fn forward_request_with_response_rewrite<S>(
+    inbound: &mut S,
+    request_bytes: &[u8],
+    body: &[u8],
+    upstream: UpstreamSpec<'_>,
+    audit: AuditCtx<'_>,
+    response_rewrite: Option<ResponseRewrite<'_>>,
+) -> Result<u16>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let status = match upstream.scheme {
         UpstreamScheme::Https => {
             let mut tls_stream = open_https_upstream(&upstream).await?;
             write_request(&mut tls_stream, request_bytes, body).await?;
-            stream_response(&mut tls_stream, inbound).await?
+            stream_or_rewrite_response(&mut tls_stream, inbound, response_rewrite).await?
         }
         UpstreamScheme::Http => {
             let mut tcp_stream = open_http_upstream(&upstream).await?;
             write_request(&mut tcp_stream, request_bytes, body).await?;
-            stream_response(&mut tcp_stream, inbound).await?
+            stream_or_rewrite_response(&mut tcp_stream, inbound, response_rewrite).await?
         }
     };
 
@@ -119,6 +142,21 @@ where
         status,
     );
     Ok(status)
+}
+
+async fn stream_or_rewrite_response<U, I>(
+    upstream: &mut U,
+    inbound: &mut I,
+    response_rewrite: Option<ResponseRewrite<'_>>,
+) -> Result<u16>
+where
+    U: AsyncRead + AsyncWrite + Unpin,
+    I: AsyncWrite + Unpin,
+{
+    match response_rewrite {
+        Some(rewrite) => buffer_rewrite_response(upstream, inbound, rewrite).await,
+        None => stream_response(upstream, inbound).await,
+    }
 }
 
 /// Open an upstream HTTPS connection (Direct TLS or ExternalProxy + TLS).
@@ -150,7 +188,7 @@ async fn open_http_upstream(upstream: &UpstreamSpec<'_>) -> Result<TcpStream> {
 }
 
 /// Establish the TCP layer of the upstream connection (without TLS).
-async fn open_tcp_upstream(upstream: &UpstreamSpec<'_>) -> Result<TcpStream> {
+pub(crate) async fn open_tcp_upstream(upstream: &UpstreamSpec<'_>) -> Result<TcpStream> {
     match upstream.strategy {
         UpstreamStrategy::Direct { resolved_addrs } => {
             if resolved_addrs.is_empty() {
@@ -288,6 +326,158 @@ fn parse_response_status(data: &[u8]) -> u16 {
     502
 }
 
+const MAX_REWRITE_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+
+async fn buffer_rewrite_response<U, I>(
+    upstream: &mut U,
+    inbound: &mut I,
+    rewrite: ResponseRewrite<'_>,
+) -> Result<u16>
+where
+    U: AsyncRead + AsyncWrite + Unpin,
+    I: AsyncWrite + Unpin,
+{
+    let mut raw = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = match tokio::time::timeout(UPSTREAM_REWRITE_READ_TIMEOUT, upstream.read(&mut buf))
+            .await
+        {
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => {
+                debug!("Upstream read error: {}", e);
+                break;
+            }
+            Err(_) => {
+                return Err(ProxyError::HttpParse(
+                    "timed out reading response for OAuth capture rewrite".to_string(),
+                ));
+            }
+        };
+        raw.extend_from_slice(&buf[..n]);
+        if raw.len() > MAX_REWRITE_RESPONSE_BYTES {
+            return Err(ProxyError::HttpParse(
+                "response too large for OAuth capture rewrite".to_string(),
+            ));
+        }
+    }
+
+    let rewritten = rewrite_http1_response(&raw, rewrite)?;
+    let status = parse_response_status(&rewritten);
+    inbound.write_all(&rewritten).await?;
+    inbound.flush().await?;
+    Ok(status)
+}
+
+fn rewrite_http1_response(raw: &[u8], rewrite: ResponseRewrite<'_>) -> Result<Vec<u8>> {
+    let Some(header_end) = find_header_end(raw) else {
+        return Err(ProxyError::HttpParse(
+            "upstream response missing header terminator".to_string(),
+        ));
+    };
+    let head = &raw[..header_end];
+    let mut body = raw[header_end + 4..].to_vec();
+    let head_str = std::str::from_utf8(head).map_err(|_| {
+        ProxyError::HttpParse("upstream response headers are not UTF-8".to_string())
+    })?;
+    let mut lines = head_str.split("\r\n");
+    let status_line = lines
+        .next()
+        .ok_or_else(|| ProxyError::HttpParse("upstream response missing status".to_string()))?;
+    let status = parse_response_status(raw);
+    let mut headers = Vec::new();
+    let mut chunked = false;
+    let mut content_encoded = false;
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let name_trimmed = name.trim().to_string();
+        let value_trimmed = value.trim().to_string();
+        if name_trimmed.eq_ignore_ascii_case("transfer-encoding")
+            && value_trimmed
+                .split(',')
+                .any(|part| part.trim().eq_ignore_ascii_case("chunked"))
+        {
+            chunked = true;
+        }
+        if name_trimmed.eq_ignore_ascii_case("content-encoding") && !value_trimmed.is_empty() {
+            content_encoded = true;
+        }
+        headers.push((name_trimmed, value_trimmed));
+    }
+
+    if chunked {
+        body = decode_chunked_body(&body)?;
+    }
+    if content_encoded {
+        return Err(ProxyError::HttpParse(
+            "cannot safely rewrite or inspect content-encoded OAuth capture response".to_string(),
+        ));
+    }
+
+    let rewritten_body = rewrite(status, &headers, &body)?;
+    let mut out = Vec::new();
+    out.extend_from_slice(status_line.as_bytes());
+    out.extend_from_slice(b"\r\n");
+    for (name, value) in headers {
+        if name.eq_ignore_ascii_case("content-length")
+            || name.eq_ignore_ascii_case("transfer-encoding")
+        {
+            continue;
+        }
+        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(b": ");
+        out.extend_from_slice(value.as_bytes());
+        out.extend_from_slice(b"\r\n");
+    }
+    out.extend_from_slice(format!("Content-Length: {}\r\n", rewritten_body.len()).as_bytes());
+    out.extend_from_slice(b"\r\n");
+    out.extend_from_slice(&rewritten_body);
+    Ok(out)
+}
+
+fn find_header_end(raw: &[u8]) -> Option<usize> {
+    raw.windows(4).position(|window| window == b"\r\n\r\n")
+}
+
+fn decode_chunked_body(body: &[u8]) -> Result<Vec<u8>> {
+    let mut pos = 0;
+    let mut out = Vec::new();
+    loop {
+        let Some(line_end_rel) = body[pos..].windows(2).position(|w| w == b"\r\n") else {
+            return Err(ProxyError::HttpParse(
+                "malformed chunked response".to_string(),
+            ));
+        };
+        let line_end = pos + line_end_rel;
+        let size_line = std::str::from_utf8(&body[pos..line_end])
+            .map_err(|_| ProxyError::HttpParse("invalid chunk size".to_string()))?;
+        let size_hex = size_line.split(';').next().unwrap_or("").trim();
+        let size = usize::from_str_radix(size_hex, 16)
+            .map_err(|_| ProxyError::HttpParse("invalid chunk size".to_string()))?;
+        pos = line_end + 2;
+        if size == 0 {
+            break;
+        }
+        let end = pos
+            .checked_add(size)
+            .ok_or_else(|| ProxyError::HttpParse("chunk size overflow".to_string()))?;
+        if end + 2 > body.len() || &body[end..end + 2] != b"\r\n" {
+            return Err(ProxyError::HttpParse(
+                "malformed chunked response".to_string(),
+            ));
+        }
+        out.extend_from_slice(&body[pos..end]);
+        pos = end + 2;
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -305,5 +495,33 @@ mod tests {
         assert_eq!(parse_response_status(b""), 502);
         assert_eq!(parse_response_status(b"garbage"), 502);
         assert_eq!(parse_response_status(b"NOT-HTTP 200 OK"), 502);
+    }
+
+    #[test]
+    fn rewrite_http1_response_decodes_chunked_body_before_rewrite() {
+        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\n{\"a\"\r\n3\r\n:1}\r\n0\r\n\r\n";
+        let rewritten = rewrite_http1_response(raw, &|_, _, body| {
+            assert_eq!(body, br#"{"a":1}"#);
+            Ok(br#"{"b":2}"#.to_vec())
+        })
+        .unwrap();
+
+        let text = std::str::from_utf8(&rewritten).unwrap();
+        assert!(text.contains("Content-Length: 7"));
+        assert!(!text.to_ascii_lowercase().contains("transfer-encoding"));
+        assert!(text.ends_with(r#"{"b":2}"#));
+    }
+
+    #[test]
+    fn rewrite_http1_response_rejects_content_encoded_body_for_all_statuses() {
+        let raw =
+            b"HTTP/1.1 400 Bad Request\r\nContent-Encoding: gzip\r\nContent-Length: 4\r\n\r\nxxxx";
+        let err = rewrite_http1_response(raw, &|_, _, body| Ok(body.to_vec())).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("content-encoded OAuth capture response"),
+            "unexpected error: {err}"
+        );
     }
 }

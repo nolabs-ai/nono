@@ -3,8 +3,12 @@
 //! All colors are drawn from the active theme via `theme::current()`.
 
 use crate::command_display::format_command_line;
+#[cfg(target_os = "linux")]
+use crate::resource_cgroup::{OomReport, PidsReport};
 use crate::theme::{self, Rgb, badge, fg};
 use colored::Colorize;
+#[cfg(target_os = "linux")]
+use nono::resource::format_bytes;
 use nono::{AccessMode, CapabilitySet, NetworkMode, NonoError, Result};
 use std::ffi::{OsStr, OsString};
 use std::io::{BufRead, IsTerminal, Write};
@@ -47,6 +51,20 @@ pub fn print_banner(silent: bool) {
 // Capabilities
 // ---------------------------------------------------------------------------
 
+/// The parenthetical after the `resources` summary, spelling out breach behavior so
+/// the two caps aren't confused: over memory the tree is killed; over the process
+/// count new forks are refused (nothing dies). Only rendered for a non-empty limit
+/// set, so the `_` arm is memory-only — `(false, false)` never reaches here.
+fn resource_limit_note(has_memory: bool, has_processes: bool) -> &'static str {
+    match (has_memory, has_processes) {
+        (true, true) => {
+            "(hard caps — over memory the process tree is killed; over the process count new forks are refused)"
+        }
+        (false, true) => "(hard cap — new processes are refused past this count)",
+        _ => "(hard cap — the process tree is killed if it exceeds this)",
+    }
+}
+
 /// Print the capability summary
 ///
 /// When `verbose` is 0, only user-specified capabilities are shown (CLI flags
@@ -67,6 +85,24 @@ pub fn print_capabilities(
 
     eprintln!("  {}", theme::fg("Capabilities:", t.subtext).bold());
     rule();
+
+    // Resource limits are shown here; enforcement happens in the supervised runtime.
+    if let Some(limits) = caps.resource_limits()
+        && !limits.is_empty()
+    {
+        eprintln!(
+            "  {} {} {}",
+            theme::fg("resources", t.yellow).bold(),
+            theme::fg(&limits.summary(), t.subtext),
+            theme::fg(
+                resource_limit_note(
+                    limits.memory_bytes.is_some(),
+                    limits.max_processes.is_some(),
+                ),
+                t.subtext,
+            ),
+        );
+    }
 
     // Filesystem capabilities
     let fs_caps = caps.fs_capabilities();
@@ -230,16 +266,19 @@ pub fn print_capabilities(
             }
         }
     }
-    if !caps.localhost_ports().is_empty() {
-        let ports_str: Vec<String> = caps
+    if !caps.localhost_ports().is_empty() || !caps.localhost_port_ranges().is_empty() {
+        let mut parts: Vec<String> = caps
             .localhost_ports()
             .iter()
             .map(|p| p.to_string())
             .collect();
+        for &(start, end) in caps.localhost_port_ranges() {
+            parts.push(format!("{}..={}", start, end));
+        }
         eprintln!(
             "  {} {}",
             theme::badge(" ipc ", t.teal, BADGE_FG_DARK),
-            theme::fg(&format!("localhost:{}", ports_str.join(", ")), t.subtext,),
+            theme::fg(&format!("localhost:{}", parts.join(", ")), t.subtext,),
         );
     }
 
@@ -636,6 +675,124 @@ pub fn format_startup_blocked(
 pub fn print_diagnostic_footer(footer: &str) {
     let rendered = render_diagnostic_footer(footer);
     print_terminal_block(&rendered, true);
+}
+
+/// Explain that the kernel OOM-killed the sandbox for exceeding its `--memory`
+/// ceiling.
+///
+/// Without this a memory-cap kill surfaces only as a bare SIGKILL (exit 137),
+/// so the run looks like it died for no reason. We name the limit, the peak the
+/// tree reached, and how to relax it. Suppressed under `--silent`.
+#[cfg(target_os = "linux")]
+pub fn print_oom_diagnostic(report: &OomReport, silent: bool) {
+    if silent {
+        return;
+    }
+    let t = theme::current();
+    let emit = crate::startup_prompt::print_terminal_safe_stderr;
+
+    // A labelled row: indented, the label padded on the plain text before
+    // coloring so values line up despite the invisible ANSI escapes.
+    let row = |label: &str, value: &str| {
+        emit(&format!(
+            "       {} {}",
+            fg(&format!("{label:<17}"), t.subtext),
+            fg(value, t.text),
+        ));
+    };
+
+    emit(&format!(
+        "{} {}",
+        fg("[nono] memory limit exceeded:", t.red).bold(),
+        fg(
+            "the sandboxed process tree was killed by the kernel for using too much memory.",
+            t.text,
+        ),
+    ));
+    let limit = report
+        .limit_bytes
+        .map_or_else(|| "unset".to_string(), format_bytes);
+    row("limit (--memory):", &limit);
+    if let Some(peak) = report.peak_bytes {
+        row("peak memory:", &format_bytes(peak));
+    }
+    row(
+        "OOM kills:",
+        &format!(
+            "{} (whole-sandbox kills: {})",
+            report.oom_kills, report.oom_group_kills
+        ),
+    );
+    row(
+        "swap:",
+        "disabled (memory.swap.max=0) — nothing could spill to swap",
+    );
+    row(
+        "scope:",
+        "the whole sandbox was killed together (memory.oom.group=1)",
+    );
+    emit(&format!(
+        "       {} {}",
+        fg("hint:", t.yellow).bold(),
+        fg(
+            "raise the ceiling to allow more memory, e.g. --memory 1G.",
+            t.text,
+        ),
+    ));
+}
+
+/// Explain that the sandbox hit its `--max-processes` ceiling.
+///
+/// Unlike the memory cap this kills nothing — the kernel just refused a `fork`/`clone`
+/// (EAGAIN), which the program may surface as an opaque "resource temporarily
+/// unavailable". `pids.events`'s `max` counter is cumulative, so it proves only that
+/// the cap was touched, not that it caused the exit; the caller therefore gates this
+/// on a non-zero, non-signal exit, and the text says "may be why", not "was why". A
+/// clean exit (recovered) or a signal-killed run is never attributed to the cap.
+#[cfg(target_os = "linux")]
+pub fn print_pids_diagnostic(report: &PidsReport, silent: bool) {
+    if silent {
+        return;
+    }
+    let t = theme::current();
+    let emit = crate::startup_prompt::print_terminal_safe_stderr;
+
+    // Pad to the longest label ("limit (--max-processes):" == 24) so the values
+    // line up, matching the memory diagnostic's aligned look.
+    let row = |label: &str, value: &str| {
+        emit(&format!(
+            "       {} {}",
+            fg(&format!("{label:<24}"), t.subtext),
+            fg(value, t.text),
+        ));
+    };
+
+    emit(&format!(
+        "{} {}",
+        fg("[nono] process limit hit:", t.red).bold(),
+        fg(
+            "the sandbox hit its process cap at least once during this run; the kernel refused \
+             a fork/clone (EAGAIN) — nothing was killed. This may be why the program exited \
+             non-zero.",
+            t.text,
+        ),
+    ));
+    let limit = report
+        .limit
+        .map_or_else(|| "unset".to_string(), |n| n.to_string());
+    row("limit (--max-processes):", &limit);
+    if let Some(peak) = report.peak {
+        row("peak processes:", &peak.to_string());
+    }
+    row("denied forks:", &report.max_events.to_string());
+    emit(&format!(
+        "       {} {}",
+        fg("hint:", t.yellow).bold(),
+        fg(
+            "raise the ceiling to allow more processes, e.g. --max-processes 256.",
+            t.text,
+        ),
+    ));
 }
 
 /// Print skipped CLI path grants in a user-facing format.
@@ -1190,5 +1347,71 @@ mod tests {
         print_blocked_grants(&blocked, 0, t);
         print_blocked_grants(&blocked, 1, t);
         print_blocked_grants(&[], 0, t);
+    }
+
+    #[test]
+    fn resource_limit_note_matches_the_active_ceilings() {
+        use super::resource_limit_note;
+
+        // Both ceilings: the note must spell out both breach behaviors.
+        let both = resource_limit_note(true, true);
+        assert!(
+            both.contains("memory") && both.contains("forks are refused"),
+            "both-ceilings note must describe both mechanisms: {both}"
+        );
+
+        // Process-only: forks are refused, and it must NOT claim anything is killed.
+        let procs = resource_limit_note(false, true);
+        assert_eq!(
+            procs,
+            "(hard cap — new processes are refused past this count)"
+        );
+        assert!(
+            !procs.contains("killed"),
+            "a pids cap kills nothing: {procs}"
+        );
+
+        // Memory-only falls to the kill-the-tree note; the unreachable empty input
+        // folds into the same arm (documented fallback, never rendered in practice).
+        let mem = resource_limit_note(true, false);
+        assert!(
+            mem.contains("killed"),
+            "memory-only note must say killed: {mem}"
+        );
+        assert_eq!(
+            resource_limit_note(false, false),
+            mem,
+            "the (false,false) fallback must match the memory-only note"
+        );
+    }
+
+    /// The `--max-processes` breach footer renders across every report shape without
+    /// panicking: silent is a no-op, a full report prints, and the Option branches
+    /// (an unset limit -> "unset", an absent peak -> the row is skipped) are safe.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn print_pids_diagnostic_renders_all_report_shapes() {
+        use super::print_pids_diagnostic;
+        use crate::resource_cgroup::PidsReport;
+
+        let full = PidsReport {
+            max_events: 4,
+            limit: Some(5),
+            peak: Some(5),
+        };
+        // Silent short-circuits before any rendering.
+        print_pids_diagnostic(&full, true);
+        // Full report: limit + peak rows present.
+        print_pids_diagnostic(&full, false);
+        // Degenerate report: unlimited/unreadable limit and no kernel peak, so the
+        // "unset" limit branch and the skipped-peak branch are both exercised.
+        print_pids_diagnostic(
+            &PidsReport {
+                max_events: 1,
+                limit: None,
+                peak: None,
+            },
+            false,
+        );
     }
 }

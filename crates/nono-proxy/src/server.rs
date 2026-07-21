@@ -15,9 +15,12 @@ use crate::credential::CredentialStore;
 use crate::error::{ProxyError, Result};
 use crate::external;
 use crate::filter::ProxyFilter;
+use crate::forward::{self, AuditCtx, UpstreamScheme, UpstreamSpec, UpstreamStrategy};
+use crate::oauth_capture::OAuthCaptureStore;
+use crate::pool::UpstreamPool;
 use crate::reverse;
 use crate::route::RouteStore;
-use crate::tls_intercept::{self, CertCache, EphemeralCa};
+use crate::tls_intercept::{self, CertCache, EphemeralCa, UpstreamH2Cache};
 use crate::token;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -54,6 +57,126 @@ fn parse_non_connect_target(line: &str) -> Result<(String, u16)> {
     Ok((host, port))
 }
 
+/// Request-target form of a non-CONNECT proxy request line, used to
+/// discriminate forward-proxy (absolute-form) requests from reverse-proxy
+/// (origin-form) ones.
+///
+/// A forward-proxy client (one honoring `HTTP_PROXY`) sends the *absolute*
+/// URL in the request line: `GET http://example.com/path HTTP/1.1`. A
+/// reverse-proxy client sends *origin-form*: `GET /service/path HTTP/1.1`.
+/// Discriminating on the target's form (not the method) is what lets nono
+/// act as a drop-in `HTTP_PROXY` target without disturbing the existing
+/// origin-form reverse-proxy routing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestTargetForm {
+    /// Absolute-form `http://…` — plain HTTP forward proxy.
+    AbsoluteHttp,
+    /// Absolute-form `https://…` — must be tunneled via CONNECT, not forwarded.
+    AbsoluteHttps,
+    /// Origin-form (`/path`) or anything else — reverse-proxy / inline path.
+    Origin,
+}
+
+/// Classify the request-target of a non-CONNECT request line.
+///
+/// Only the scheme prefix of the request target is inspected. The check is
+/// ASCII-case-insensitive per RFC 3986 (schemes are case-insensitive) and
+/// deliberately conservative: anything that is not an `http://` or `https://`
+/// absolute URL is treated as origin-form so existing reverse-proxy and
+/// inline flows are completely unaffected.
+fn classify_request_target(line: &str) -> RequestTargetForm {
+    // Request line: METHOD SP request-target SP HTTP-version
+    let Some(target) = line.split_whitespace().nth(1) else {
+        return RequestTargetForm::Origin;
+    };
+    // Case-insensitive scheme match without allocating a lowercase copy of
+    // the whole (possibly long) URL.
+    let lower_starts_with = |s: &str, prefix: &str| {
+        s.len() >= prefix.len()
+            && s.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+    };
+    if lower_starts_with(target, "http://") {
+        RequestTargetForm::AbsoluteHttp
+    } else if lower_starts_with(target, "https://") {
+        RequestTargetForm::AbsoluteHttps
+    } else {
+        RequestTargetForm::Origin
+    }
+}
+
+/// Rewrite an absolute-form request line into origin-form for forwarding.
+///
+/// `GET http://host/p?q HTTP/1.1` -> `GET /p?q HTTP/1.1`
+/// `GET http://host HTTP/1.1`     -> `GET /`      (empty path becomes `/`)
+///
+/// The method and HTTP-version tokens are preserved verbatim. Returns the
+/// rewritten first line (with trailing CRLF) so it can be prepended to the
+/// forwarded header block.
+fn rewrite_absolute_to_origin_form(line: &str) -> Result<String> {
+    let mut parts = line.split_whitespace();
+    let method = parts
+        .next()
+        .ok_or_else(|| ProxyError::HttpParse(format!("malformed request line: {}", line)))?;
+    let target = parts
+        .next()
+        .ok_or_else(|| ProxyError::HttpParse(format!("malformed request line: {}", line)))?;
+    // Preserve the version if present; default to HTTP/1.1 otherwise.
+    let version = parts.next().unwrap_or("HTTP/1.1");
+
+    let parsed = Url::parse(target)
+        .map_err(|e| ProxyError::HttpParse(format!("invalid URL in request: {}: {}", target, e)))?;
+
+    let mut origin = parsed.path().to_string();
+    if origin.is_empty() {
+        origin.push('/');
+    }
+    if let Some(query) = parsed.query() {
+        origin.push('?');
+        origin.push_str(query);
+    }
+
+    // Defence in depth: the method/version tokens come from the client's
+    // request line and are echoed into the forwarded request line, which is
+    // itself a protocol-formatting boundary. `Url` already rejects control
+    // characters in the target, but strip CR/LF from the surrounding tokens
+    // so a crafted method/version can never split the forwarded request.
+    let sanitise = |s: &str| s.replace(['\r', '\n'], "");
+    Ok(format!(
+        "{} {} {}\r\n",
+        sanitise(method),
+        origin,
+        sanitise(version)
+    ))
+}
+
+/// Strip hop-by-hop proxy headers (`Proxy-Connection`, `Proxy-Authorization`)
+/// from a raw header block before forwarding upstream.
+///
+/// These headers are meaningful only on the client<->proxy hop and must never
+/// be forwarded: `Proxy-Authorization` carries the session token, and
+/// `Proxy-Connection` is a non-standard hop-by-hop hint. Other headers
+/// (including `Host`) are preserved verbatim so the forwarded request matches
+/// what the client sent.
+fn strip_proxy_headers(header_bytes: &[u8]) -> Vec<u8> {
+    let header_str = match std::str::from_utf8(header_bytes) {
+        Ok(s) => s,
+        // Non-UTF-8 headers: forward unchanged rather than corrupt the block.
+        // The upstream will reject malformed headers itself.
+        Err(_) => return header_bytes.to_vec(),
+    };
+    let mut out = Vec::with_capacity(header_bytes.len());
+    for line in header_str.split_inclusive("\r\n") {
+        let name = line.split(':').next().unwrap_or("").trim();
+        if name.eq_ignore_ascii_case("proxy-connection")
+            || name.eq_ignore_ascii_case("proxy-authorization")
+        {
+            continue;
+        }
+        out.extend_from_slice(line.as_bytes());
+    }
+    out
+}
+
 #[must_use]
 fn proxy_diagnostic_code_label(code: crate::diagnostic::ProxyDiagnosticCode) -> &'static str {
     code.as_str()
@@ -76,15 +199,25 @@ pub struct ProxyHandle {
     /// Routes whose credentials were unavailable are excluded so we
     /// don't inject phantom tokens that shadow valid external credentials.
     loaded_routes: std::collections::HashSet<String>,
-    /// Non-credential allowed hosts that should bypass the proxy (NO_PROXY).
-    /// Computed at startup: `allowed_hosts` minus credential upstream hosts.
+    /// Client-side proxy bypass entries appended after loopback defaults.
+    /// Computed at startup from direct-connect bypasses and profile-declared
+    /// `network.no_proxy` entries, excluding route upstreams.
     no_proxy_hosts: Vec<String>,
+    /// When true, loopback must not appear in `NO_PROXY` because a managed
+    /// credential route targets a loopback upstream host.
+    managed_loopback_upstream: bool,
+    /// Canonical nono-owned bypass patterns for wrappers/SDKs that need to
+    /// translate profile intent to non-env proxy surfaces such as Java
+    /// `http.nonProxyHosts`.
+    canonical_no_proxy_hosts: Vec<String>,
     /// Path to the TLS-intercept trust bundle written at startup, when
     /// interception is active. The CLI passes this path to the sandboxed
     /// child via env vars (`SSL_CERT_FILE` etc.) and grants a Landlock /
     /// Seatbelt read capability on it. `None` when interception is not
     /// configured (no `intercept_ca_dir`) or no route requires L7 visibility.
     intercept_ca_path: Option<PathBuf>,
+    /// Environment variables that should point at `intercept_ca_path`.
+    intercept_ca_env_vars: Vec<String>,
     /// Credential load warnings collected at startup.
     diagnostics: Vec<crate::diagnostic::ProxyDiagnostic>,
 }
@@ -132,8 +265,8 @@ impl ProxyHandle {
             .map_err(|e| ProxyError::Config(format!("proxy diagnostics JSON error: {e}")))
     }
 
-    /// One-line-per-route diagnostic summary suitable for surfacing at
-    /// session start. Returns `(prefix, summary)` pairs.
+    /// One-line-per-upstream diagnostic summary suitable for surfacing at
+    /// session start. Returns one summary string per upstream.
     ///
     /// Each summary names: upstream URL, credential resolution status
     /// (✓ / ✗ + source label), TLS-intercept on/off, and `endpoint_rules`
@@ -141,36 +274,117 @@ impl ProxyHandle {
     /// noisy by default, addressing the common "I created the keychain
     /// entry but the warn at debug level got missed" footgun.
     ///
+    /// Routes are grouped by upstream so that the credential route and the
+    /// synthetic endpoint-authorization route (`_ep_<host>`) the CLI emits for
+    /// the same host collapse into one row. These are distinct internal routes
+    /// — credential injection is decoupled from L7 endpoint filtering (see
+    /// `route.rs`) — but at request time they are evaluated together against a
+    /// single upstream (the `_ep_` route gates, the credential catch-all
+    /// injects). A combined row therefore reflects the effective behaviour
+    /// instead of exposing the internal split as a confusing credential-less
+    /// duplicate. The internal route prefixes are intentionally not surfaced;
+    /// the upstream URL is the user-meaningful identity.
+    ///
     /// `config` is the same `ProxyConfig` that was passed to `start()`;
     /// the handle doesn't keep a copy, so the CLI passes it back in.
     #[must_use]
-    pub fn route_diagnostics(&self, config: &ProxyConfig) -> Vec<(String, String)> {
-        let mut rows = Vec::with_capacity(config.routes.len());
+    pub fn route_diagnostics(&self, config: &ProxyConfig) -> Vec<String> {
+        // Reconstruct the same host filter the server applies (see `start`).
+        // A credential/endpoint route only injects or filters; traffic still
+        // has to clear the allowlist to reach the upstream at all. A route
+        // whose upstream is not allow-listed is dead config (the proxy 403s
+        // it), so skip it here rather than advertise an unreachable route.
+        let filter = if config.strict_filter {
+            crate::filter::ProxyFilter::new_strict(&config.allowed_hosts)
+        } else if config.allowed_hosts.is_empty() {
+            crate::filter::ProxyFilter::allow_all()
+        } else {
+            crate::filter::ProxyFilter::new(&config.allowed_hosts)
+        }
+        .with_denied_hosts(&config.denied_hosts);
+        // Hostname-only reachability: pass no resolved IPs so the link-local
+        // SSRF check is skipped (that is a runtime DNS concern, not a config
+        // one) and only the deny-list / allowlist hostname rules apply.
+        let upstream_reachable = |upstream: &str| -> bool {
+            match crate::route::extract_host_port(upstream) {
+                Ok(host_port) => {
+                    let host = host_port
+                        .rsplit_once(':')
+                        .map(|(h, _)| h)
+                        .unwrap_or(&host_port);
+                    filter.check_host_with_ips(host, &[]).is_allowed()
+                }
+                // Unparseable upstream can't be matched against the allowlist;
+                // keep it visible rather than silently hiding a misconfig.
+                Err(_) => true,
+            }
+        };
+
+        // Group routes by upstream, preserving first-seen order. Route counts
+        // are small (a handful), so the linear scan per route is cheap.
+        let mut groups: Vec<(&str, Vec<&crate::config::RouteConfig>)> = Vec::new();
         for route in &config.routes {
-            let prefix = route.prefix.trim_matches('/').to_string();
-            let cred_summary = self.credential_status_summary(&prefix, route);
+            if !upstream_reachable(&route.upstream) {
+                continue;
+            }
+            if let Some(group) = groups
+                .iter_mut()
+                .find(|(u, _)| *u == route.upstream.as_str())
+            {
+                group.1.push(route);
+            } else {
+                groups.push((route.upstream.as_str(), vec![route]));
+            }
+        }
+
+        let mut rows = Vec::with_capacity(groups.len());
+        for (upstream, group) in &groups {
+            // Credential summary comes from the credential-bearing route in the
+            // group (if any); the `_ep_` route never carries one.
+            //
+            // A group may still be covered by a credential route on *another*
+            // upstream: a wildcard credential route (e.g. `*.githubusercontent.com`)
+            // matches concrete `_ep_` hosts (`raw.githubusercontent.com`) at
+            // request time via `host_port_matches`. Reporting that covering
+            // credential keeps the display honest — the token really is injected.
+            let own_cred = group
+                .iter()
+                .find(|r| r.credential_key.is_some() || r.oauth2.is_some() || r.aws_auth.is_some());
+            let covering_cred = own_cred.copied().or_else(|| {
+                let host_port = crate::route::extract_host_port(upstream).ok()?;
+                config.routes.iter().find(|r| {
+                    (r.credential_key.is_some() || r.oauth2.is_some() || r.aws_auth.is_some())
+                        && crate::route::extract_host_port(&r.upstream)
+                            .is_ok_and(|hp| crate::route::host_port_matches(&hp, &host_port))
+                })
+            });
+            let cred_route = covering_cred.unwrap_or(group[0]);
+            let cred_prefix = cred_route.prefix.trim_matches('/');
+            let cred_summary = self.credential_status_summary(cred_prefix, cred_route);
 
             let intercept_summary = if self.intercept_ca_path.is_some()
-                && (route.credential_key.is_some()
-                    || route.oauth2.is_some()
-                    || !route.endpoint_rules.is_empty()
-                    || route.endpoint_policy.is_some())
-            {
+                && group.iter().any(|r| {
+                    r.credential_key.is_some()
+                        || r.oauth2.is_some()
+                        || r.spiffe.is_some()
+                        || !r.endpoint_rules.is_empty()
+                        || r.endpoint_policy.is_some()
+                }) {
                 "intercept: on"
             } else {
                 "intercept: off"
             };
 
-            let rules_summary = if route.endpoint_policy.is_some() {
+            let rules_summary = if group.iter().any(|r| r.endpoint_policy.is_some()) {
                 "endpoint_policy: on".to_string()
             } else {
-                format!("endpoint_rules: {}", route.endpoint_rules.len())
+                let total: usize = group.iter().map(|r| r.endpoint_rules.len()).sum();
+                format!("endpoint_rules: {}", total)
             };
-            let summary = format!(
-                "→ {} | {} | {} | {}",
-                route.upstream, cred_summary, intercept_summary, rules_summary
-            );
-            rows.push((prefix, summary));
+            rows.push(format!(
+                "{} | {} | {} | {}",
+                upstream, cred_summary, intercept_summary, rules_summary
+            ));
         }
         rows
     }
@@ -204,6 +418,13 @@ impl ProxyHandle {
             } else {
                 "creds: oauth2 ✗ (token exchange failed)".to_string()
             }
+        } else if route.spiffe.is_some() {
+            let resolved = self.loaded_routes.contains(prefix);
+            if resolved {
+                "creds: spiffe ✓".to_string()
+            } else {
+                "creds: spiffe ✗ (Workload API unavailable)".to_string()
+            }
         } else {
             "creds: none".to_string()
         }
@@ -223,35 +444,36 @@ impl ProxyHandle {
     /// presented during interception.
     #[must_use]
     pub fn env_vars(&self) -> Vec<(String, String)> {
-        let proxy_url = format!("http://nono:{}@127.0.0.1:{}", &*self.token, self.port);
+        let proxy_url = format!("http://nono:{}@127.0.0.1:{}", *self.token, self.port);
 
-        // Build NO_PROXY: always include loopback, plus non-credential
-        // allowed hosts. Credential upstreams are excluded so their traffic
-        // goes through the reverse proxy for L7 filtering + injection.
-        let mut no_proxy_parts = vec!["localhost".to_string(), "127.0.0.1".to_string()];
+        // Build NO_PROXY: include loopback unless a managed credential route
+        // targets a loopback upstream (those must traverse the proxy). Add
+        // startup-filtered bypass entries. Parent-shell NO_PROXY/no_proxy is
+        // intentionally not read here; proxy mode owns the child proxy env.
+        let mut no_proxy_parts = Vec::new();
+        let mut canonical_no_proxy_parts = Vec::new();
+        push_no_proxy_entry(&mut no_proxy_parts, "localhost");
+        push_no_proxy_entry(&mut no_proxy_parts, "127.0.0.1");
+        push_canonical_no_proxy_entry(&mut canonical_no_proxy_parts, "localhost");
+        push_canonical_no_proxy_entry(&mut canonical_no_proxy_parts, "127.0.0.1");
+        if self.managed_loopback_upstream {
+            no_proxy_parts.clear();
+            canonical_no_proxy_parts.clear();
+        }
         for host in &self.no_proxy_hosts {
-            // Strip port for NO_PROXY (most HTTP clients match on hostname).
-            // Handle IPv6 brackets: "[::1]:443" → "[::1]", "host:443" → "host"
-            let hostname = if host.contains("]:") {
-                // IPv6 with port: split at "]:port"
-                host.rsplit_once("]:")
-                    .map(|(h, _)| format!("{}]", h))
-                    .unwrap_or_else(|| host.clone())
-            } else {
-                host.rsplit_once(':')
-                    .and_then(|(h, p)| p.parse::<u16>().ok().map(|_| h.to_string()))
-                    .unwrap_or_else(|| host.clone())
-            };
-            if !no_proxy_parts.contains(&hostname.to_string()) {
-                no_proxy_parts.push(hostname.to_string());
-            }
+            push_no_proxy_entry(&mut no_proxy_parts, host);
+        }
+        for host in &self.canonical_no_proxy_hosts {
+            push_canonical_no_proxy_entry(&mut canonical_no_proxy_parts, host);
         }
         let no_proxy = no_proxy_parts.join(",");
+        let nono_no_proxy = canonical_no_proxy_parts.join(",");
 
         let mut vars = vec![
             ("HTTP_PROXY".to_string(), proxy_url.clone()),
             ("HTTPS_PROXY".to_string(), proxy_url.clone()),
             ("NO_PROXY".to_string(), no_proxy.clone()),
+            ("NONO_NO_PROXY".to_string(), nono_no_proxy),
             ("NONO_PROXY_TOKEN".to_string(), self.token.to_string()),
         ];
 
@@ -273,21 +495,11 @@ impl ProxyHandle {
         // system trust store + the ephemeral session CA, so standard
         // runtimes see a superset of the trust they had before nono.
         //
-        // Replacement semantics (swap out the default store entirely):
-        //   SSL_CERT_FILE, REQUESTS_CA_BUNDLE, CURL_CA_BUNDLE, GIT_SSL_CAINFO
-        // Additive semantics (default + this file):
-        //   NODE_EXTRA_CA_CERTS
-        //
-        // Pointing all five at the same bundle is safe: Node sees system
-        // roots twice (harmless), and all other runtimes get the union of
-        // trust they need.
         if let Some(path) = self.intercept_ca_path.as_deref() {
             let path_str = path.to_string_lossy().to_string();
-            vars.push(("SSL_CERT_FILE".to_string(), path_str.clone()));
-            vars.push(("REQUESTS_CA_BUNDLE".to_string(), path_str.clone()));
-            vars.push(("NODE_EXTRA_CA_CERTS".to_string(), path_str.clone()));
-            vars.push(("CURL_CA_BUNDLE".to_string(), path_str.clone()));
-            vars.push(("GIT_SSL_CAINFO".to_string(), path_str));
+            for name in &self.intercept_ca_env_vars {
+                vars.push((name.clone(), path_str.clone()));
+            }
         }
 
         vars
@@ -337,6 +549,22 @@ impl ProxyHandle {
                     let api_key_name = cred_key.to_uppercase();
                     vars.push((api_key_name, self.token.to_string()));
                 }
+            } else if route.spiffe.is_some() {
+                // SPIFFE routes use the same phantom token pattern for SDK-style
+                // `*_BASE_URL` clients even though upstream auth is SPIFFE.
+                let api_key_name = format!("{}_API_KEY", prefix.to_uppercase());
+                vars.push((api_key_name, self.token.to_string()));
+            } else if route
+                .oauth2
+                .as_ref()
+                .and_then(|o| o.client_assertion.as_ref())
+                .is_some()
+            {
+                // OAuth2 jwt-bearer assertion routes need the same phantom token
+                // pattern — the proxy validates session integrity before injecting
+                // the exchanged access token, so the child process must present it.
+                let api_key_name = format!("{}_API_KEY", prefix.to_uppercase());
+                vars.push((api_key_name, self.token.to_string()));
             }
         }
         vars
@@ -369,18 +597,229 @@ impl Drop for ProxyHandle {
     }
 }
 
+fn merge_no_proxy_hosts(
+    smart_no_proxy_hosts: &[String],
+    profile_no_proxy: &[String],
+    route_hosts: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    let mut merged = Vec::new();
+    for entry in smart_no_proxy_hosts {
+        if no_proxy_entry_matches_any_route(entry, route_hosts) {
+            debug!(
+                "Skipping smart no_proxy entry {:?}: it matches a proxy route upstream",
+                entry
+            );
+            continue;
+        }
+        push_no_proxy_entry(&mut merged, entry);
+    }
+
+    for entry in profile_no_proxy {
+        if no_proxy_entry_matches_any_route(entry, route_hosts) {
+            debug!(
+                "Skipping no_proxy entry {:?}: it matches a proxy route upstream",
+                entry
+            );
+            continue;
+        }
+        push_no_proxy_entry(&mut merged, entry);
+    }
+
+    merged
+}
+
+fn merge_canonical_no_proxy_hosts(
+    smart_no_proxy_hosts: &[String],
+    profile_no_proxy: &[String],
+    route_hosts: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    let mut merged = Vec::new();
+    for entry in smart_no_proxy_hosts {
+        if no_proxy_entry_matches_any_route(entry, route_hosts) {
+            continue;
+        }
+        push_canonical_no_proxy_entry(&mut merged, entry);
+    }
+
+    for entry in profile_no_proxy {
+        if no_proxy_entry_matches_any_route(entry, route_hosts) {
+            continue;
+        }
+        push_canonical_no_proxy_entry(&mut merged, entry);
+    }
+
+    merged
+}
+
+#[must_use = "no_proxy proxy config validation result must be handled"]
+fn validate_no_proxy_config(config: &ProxyConfig) -> Result<()> {
+    for entry in &config.no_proxy {
+        crate::config::validate_no_proxy_entry(entry).map_err(|err| match err {
+            ProxyError::Config(message) => {
+                ProxyError::Config(format!("invalid no_proxy entry '{entry}': {message}"))
+            }
+            other => other,
+        })?;
+    }
+    validate_no_proxy_allowed_host_conflicts(&config.no_proxy, &config.allowed_hosts)
+}
+
+#[must_use = "no_proxy route conflict validation result must be handled"]
+fn validate_no_proxy_route_conflicts(
+    no_proxy: &[String],
+    route_hosts: &std::collections::HashSet<String>,
+) -> Result<()> {
+    for no_proxy_entry in no_proxy {
+        for route_host in route_hosts {
+            if no_proxy_entry_matches_route(no_proxy_entry, route_host) {
+                return Err(ProxyError::Config(format!(
+                    "no_proxy entry '{no_proxy_entry}' conflicts with route upstream '{route_host}': configured route traffic must go through the proxy, not bypass it"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[must_use = "no_proxy allowed_host conflict validation result must be handled"]
+fn validate_no_proxy_allowed_host_conflicts(
+    no_proxy: &[String],
+    allowed_hosts: &[String],
+) -> Result<()> {
+    for no_proxy_entry in no_proxy {
+        for allowed_host in allowed_hosts {
+            if crate::config::no_proxy_entry_overlaps_host_pattern(no_proxy_entry, allowed_host) {
+                return Err(ProxyError::Config(format!(
+                    "no_proxy entry '{no_proxy_entry}' conflicts with allowed_host '{allowed_host}': proxy-allowed traffic must go through the proxy filter, not bypass it"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn push_no_proxy_entry(entries: &mut Vec<String>, entry: &str) {
+    let env_entry = crate::config::normalise_no_proxy_env_entry(entry);
+    let normalised = crate::config::normalise_no_proxy_host_pattern(&env_entry);
+    if !entries
+        .iter()
+        .any(|existing| crate::config::normalise_no_proxy_host_pattern(existing) == normalised)
+    {
+        entries.push(env_entry);
+    }
+}
+
+fn push_canonical_no_proxy_entry(entries: &mut Vec<String>, entry: &str) {
+    let canonical = canonical_no_proxy_entry(entry);
+    let normalised = crate::config::normalise_no_proxy_host_pattern(&canonical);
+    if !entries
+        .iter()
+        .any(|existing| crate::config::normalise_no_proxy_host_pattern(existing) == normalised)
+    {
+        entries.push(canonical);
+    }
+}
+
+fn canonical_no_proxy_entry(entry: &str) -> String {
+    let host = crate::config::strip_no_proxy_port(entry);
+    let normalised = host.trim().to_ascii_lowercase();
+    if let Some(suffix) = normalised.strip_prefix("*.") {
+        format!("*.{suffix}")
+    } else {
+        crate::config::normalise_no_proxy_env_entry(&normalised)
+    }
+}
+
+fn smart_no_proxy_entry(host: &str) -> Option<String> {
+    let entry = crate::config::strip_no_proxy_port(host);
+    if entry.trim().to_ascii_lowercase().starts_with("*.") {
+        debug!(
+            "Skipping smart no_proxy entry {:?}: wildcard allowlist entries cannot be emitted without broadening to a bare-domain NO_PROXY bypass",
+            host
+        );
+        return None;
+    }
+    if crate::config::validate_no_proxy_entry(&entry).is_ok() {
+        Some(crate::config::normalise_no_proxy_env_entry(&entry))
+    } else {
+        debug!(
+            "Skipping smart no_proxy entry {:?}: unsafe or ambiguous NO_PROXY bypass semantics",
+            host
+        );
+        None
+    }
+}
+
+fn no_proxy_entry_matches_any_route(
+    entry: &str,
+    route_hosts: &std::collections::HashSet<String>,
+) -> bool {
+    route_hosts
+        .iter()
+        .any(|route_host| no_proxy_entry_matches_route(entry, route_host))
+}
+
+fn no_proxy_entry_matches_route(entry: &str, route_host_port: &str) -> bool {
+    let Some(route_host) = route_host_from_host_port(route_host_port) else {
+        return true;
+    };
+    crate::config::no_proxy_entry_overlaps_host_pattern(entry, route_host)
+}
+
+fn route_host_from_host_port(route_host_port: &str) -> Option<&str> {
+    if let Some(rest) = route_host_port.strip_prefix('[') {
+        let end = rest.find(']')?;
+        let host_end = end.checked_add(2)?;
+        let port = route_host_port[host_end..].strip_prefix(':')?;
+        if port.parse::<u16>().is_err() {
+            return None;
+        }
+        return Some(&route_host_port[..host_end]);
+    }
+
+    let (host, port) = route_host_port.rsplit_once(':')?;
+    if host.is_empty() || host.contains(':') || port.parse::<u16>().is_err() {
+        return None;
+    }
+    Some(host)
+}
+
+#[must_use]
+fn connect_target_from_normalized_authority(host_port: &str) -> Option<(String, u16)> {
+    if let Some(rest) = host_port.strip_prefix('[') {
+        let (host, remainder) = rest.split_once(']')?;
+        let port = remainder.strip_prefix(':')?.parse::<u16>().ok()?;
+        return Some((host.to_string(), port));
+    }
+
+    let (host, port) = host_port.rsplit_once(':')?;
+    if host.is_empty() || host.contains(':') {
+        return None;
+    }
+    Some((host.to_string(), port.parse::<u16>().ok()?))
+}
+
 /// Shared state for the proxy server.
 struct ProxyState {
     filter: ProxyFilter,
     session_token: Zeroizing<String>,
     /// Route-level configuration (upstream, L7 filtering, custom TLS CA) for all routes.
-    route_store: RouteStore,
+    route_store: Arc<RouteStore>,
     /// Credential-specific configuration (inject mode, headers, secrets) for routes with credentials.
-    credential_store: CredentialStore,
+    credential_store: Arc<CredentialStore>,
+    /// OAuth token endpoint capture and phantom-token store.
+    oauth_capture_store: Arc<OAuthCaptureStore>,
     config: ProxyConfig,
     /// Shared TLS connector for upstream connections (reverse proxy mode).
     /// Created once at startup to avoid rebuilding the root cert store per request.
     tls_connector: tokio_rustls::TlsConnector,
+    /// Default TLS client config (system roots). Used as the pool key for
+    /// routes without a custom CA.
+    default_tls_config: Arc<rustls::ClientConfig>,
+    /// Upstream connection pool (HTTP/1.1 keep-alive + HTTP/2 multiplexing).
+    upstream_pool: Arc<UpstreamPool>,
+    /// TLS connector with h2 ALPN for upstream HTTP/2 connections (gRPC).
+    tls_connector_h2: tokio_rustls::TlsConnector,
     /// Active connection count for connection limiting.
     active_connections: AtomicUsize,
     /// Shared network audit log for this proxy session.
@@ -401,6 +840,30 @@ struct ProxyState {
     /// CONNECT branch (CONNECTs fall through to the existing 403/tunnel
     /// dispatch even for routes that would otherwise require L7).
     cert_cache: Option<Arc<CertCache>>,
+    /// Whether HTTP/2 is enabled for upstream connections and intercept ALPN.
+    enable_h2: bool,
+    /// Per-host HTTP/2 capability cache. Populated by pre-flight probes so
+    /// the inbound acceptor only advertises h2 when the upstream supports it.
+    h2_cache: Arc<UpstreamH2Cache>,
+    /// Actual bound port (OS-assigned when config.bind_port is 0).
+    /// Used by `handle_forward_http` to detect requests targeting the proxy
+    /// itself (absolute-form `http://127.0.0.1:{bound_port}/…`) and re-route
+    /// them to the reverse-proxy credential-injection path.
+    bound_port: u16,
+}
+
+struct CompositeNonceResolver {
+    external: Option<Arc<dyn crate::token::NonceResolver>>,
+    oauth: Arc<OAuthCaptureStore>,
+}
+
+impl crate::token::NonceResolver for CompositeNonceResolver {
+    fn resolve(&self, nonce: &str, consumer: &str) -> Option<Zeroizing<Vec<u8>>> {
+        self.external
+            .as_ref()
+            .and_then(|resolver| resolver.resolve(nonce, consumer))
+            .or_else(|| self.oauth.resolve(nonce, consumer))
+    }
 }
 
 /// Start the proxy server.
@@ -451,8 +914,28 @@ pub async fn start_with_nonce_resolver(
     credential_capture_backend: Option<Arc<dyn CredentialCaptureBackend>>,
     nonce_resolver: Option<Arc<dyn crate::token::NonceResolver>>,
 ) -> Result<ProxyHandle> {
-    // Generate session token
-    let session_token = token::generate_session_token()?;
+    validate_no_proxy_config(&config)?;
+
+    // Load route-level configuration (upstream, L7 filtering, custom TLS CA)
+    // for ALL routes, regardless of credential presence. This happens before
+    // binding so route/no_proxy conflicts fail configuration instead of being
+    // silently omitted from the generated environment.
+    let route_store = if config.routes.is_empty() {
+        RouteStore::empty()
+    } else {
+        RouteStore::load(&config.routes).await?
+    };
+    let route_hosts = route_store.route_upstream_hosts();
+    validate_no_proxy_route_conflicts(&config.no_proxy, &route_hosts)?;
+
+    // Use the caller-supplied password if one was provided (the standalone
+    // `nono proxy --pass` case), otherwise mint a fresh random session token.
+    // An empty override is treated as "not supplied" so a blank `--pass`
+    // can't silently produce an unguessable-but-empty credential.
+    let session_token = match config.session_token {
+        Some(ref token) if !token.is_empty() => token.clone(),
+        _ => token::generate_session_token()?,
+    };
 
     // Bind listener
     let bind_addr = SocketAddr::new(config.bind_addr, config.bind_port);
@@ -471,13 +954,20 @@ pub async fn start_with_nonce_resolver(
 
     info!("Proxy server listening on {}", local_addr);
 
-    // Load route-level configuration (upstream, L7 filtering, custom TLS CA)
-    // for ALL routes, regardless of credential presence.
-    let route_store = if config.routes.is_empty() {
-        RouteStore::empty()
-    } else {
-        RouteStore::load(&config.routes)?
-    };
+    let oauth_capture_store = OAuthCaptureStore::load_with_persistence(
+        &config.oauth_capture,
+        config.oauth_capture_store_path.clone(),
+    )?;
+    let oauth_capture_store = Arc::new(oauth_capture_store);
+    let effective_nonce_resolver: Option<Arc<dyn crate::token::NonceResolver>> =
+        if oauth_capture_store.is_empty() {
+            nonce_resolver
+        } else {
+            Some(Arc::new(CompositeNonceResolver {
+                external: nonce_resolver,
+                oauth: Arc::clone(&oauth_capture_store),
+            }))
+        };
     // Build shared TLS connector (root cert store is expensive to construct).
     // Use the ring provider explicitly to avoid ambiguity when multiple
     // crypto providers are in the dependency tree.
@@ -508,16 +998,36 @@ pub async fn start_with_nonce_resolver(
     .map_err(|e| ProxyError::Config(format!("TLS config error: {}", e)))?
     .with_root_certificates(root_store)
     .with_no_client_auth();
-    let tls_connector = tokio_rustls::TlsConnector::from(Arc::new(tls_config));
+    let tls_config_arc = Arc::new(tls_config.clone());
+    let tls_connector = tokio_rustls::TlsConnector::from(Arc::clone(&tls_config_arc));
+    let upstream_pool = Arc::new(UpstreamPool::new(
+        Arc::clone(&tls_config_arc),
+        config.enable_h2,
+    ));
+
+    let mut tls_config_h2 = tls_config;
+    tls_config_h2.alpn_protocols = vec![b"h2".to_vec()];
+    let tls_connector_h2 = tokio_rustls::TlsConnector::from(Arc::new(tls_config_h2));
 
     // Load credentials for reverse proxy routes (static keystore + OAuth2)
     let (credential_store, proxy_diagnostics) = if config.routes.is_empty() {
         (CredentialStore::empty(), Vec::new())
     } else {
-        let outcome = CredentialStore::load_with_diagnostics(&config.routes, &tls_connector)?;
+        let outcome =
+            CredentialStore::load_with_diagnostics(&config.routes, &tls_connector).await?;
         (outcome.store, outcome.diagnostics)
     };
-    let loaded_routes = credential_store.loaded_prefixes();
+    let mut loaded_routes = credential_store.loaded_prefixes();
+    loaded_routes.extend(route_store.spiffe_loaded_prefixes());
+    let config_loopback_upstream = crate::route::config_has_loopback_proxy_route(&config.routes);
+    let managed_loopback_upstream =
+        route_store.has_managed_loopback_upstream() || config_loopback_upstream;
+    if config_loopback_upstream && !route_store.has_managed_loopback_upstream() {
+        debug!(
+            "NO_PROXY: clearing loopback via config route match ({} route(s))",
+            config.routes.len()
+        );
+    }
 
     // Build filter. Strict mode treats an empty allowlist as deny-all.
     let filter = if config.strict_filter {
@@ -526,7 +1036,8 @@ pub async fn start_with_nonce_resolver(
         ProxyFilter::allow_all()
     } else {
         ProxyFilter::new(&config.allowed_hosts)
-    };
+    }
+    .with_denied_hosts(&config.denied_hosts);
 
     // Build bypass matcher from external proxy config (once, not per-request)
     let bypass_matcher = config
@@ -545,19 +1056,22 @@ pub async fn start_with_nonce_resolver(
     // adding them to NO_PROXY would cause clients to attempt direct
     // connections that the sandbox (Landlock / Seatbelt) denies.
     //
-    // Route upstreams are always excluded so their traffic goes through
-    // the proxy for L7 path filtering and/or credential injection.
+    // Route upstreams are always kept on the proxy path: explicit profile
+    // conflicts fail startup above, while smart-derived entries are filtered
+    // here because they are implementation details, not user-declared bypasses.
     //
-    // On macOS this MUST be empty regardless: Seatbelt's ProxyOnly mode
-    // blocks ALL direct outbound. See #580.
-    let no_proxy_hosts: Vec<String> = if cfg!(target_os = "macos") {
+    // On macOS the derived smart list MUST be empty: Seatbelt's ProxyOnly mode
+    // cannot infer arbitrary direct outbound bypasses. Explicit profile
+    // `network.no_proxy` entries are still merged below. They do not expand
+    // kernel permissions; direct attempts still fail closed unless the sandbox
+    // grants that destination (for example a loopback alias with an open port).
+    let smart_no_proxy_hosts: Vec<String> = if cfg!(target_os = "macos") {
         Vec::new()
     } else {
-        let route_hosts = route_store.route_upstream_hosts();
         config
             .allowed_hosts
             .iter()
-            .filter(|host| {
+            .filter_map(|host| {
                 let normalised = {
                     let h = host.to_lowercase();
                     if h.starts_with('[') {
@@ -573,8 +1087,8 @@ pub async fn start_with_nonce_resolver(
                         format!("{}:443", h)
                     }
                 };
-                if route_hosts.contains(&normalised) {
-                    return false;
+                if no_proxy_entry_matches_any_route(&normalised, &route_hosts) {
+                    return None;
                 }
                 // Only bypass the proxy if the sandbox grants direct
                 // TCP on this host's port (via --allow-connect-port).
@@ -582,14 +1096,23 @@ pub async fn start_with_nonce_resolver(
                     .rsplit_once(':')
                     .and_then(|(_, p)| p.parse::<u16>().ok())
                     .unwrap_or(443);
-                config.direct_connect_ports.contains(&port)
+                if config.direct_connect_ports.contains(&port) {
+                    smart_no_proxy_entry(host)
+                } else {
+                    None
+                }
             })
-            .cloned()
             .collect()
     };
 
+    let profile_no_proxy_hosts = config.no_proxy.as_slice();
+    let no_proxy_hosts =
+        merge_no_proxy_hosts(&smart_no_proxy_hosts, profile_no_proxy_hosts, &route_hosts);
+    let canonical_no_proxy_hosts =
+        merge_canonical_no_proxy_hosts(&smart_no_proxy_hosts, profile_no_proxy_hosts, &route_hosts);
+
     if !no_proxy_hosts.is_empty() {
-        debug!("Smart NO_PROXY bypass hosts: {:?}", no_proxy_hosts);
+        debug!("NO_PROXY bypass hosts: {:?}", no_proxy_hosts);
     }
 
     // Initialise TLS interception if a directory was supplied AND at least
@@ -597,17 +1120,19 @@ pub async fn start_with_nonce_resolver(
     // checked here (rather than relying solely on the CLI's decision) so a
     // misconfigured `intercept_ca_dir` without intercept-bearing routes
     // doesn't generate a useless CA on disk.
-    let any_intercept_route = route_store
+    let any_route_intercept = route_store
         .route_upstream_hosts()
         .iter()
         .any(|hp| route_store.has_intercept_route(hp));
+    let any_intercept_route = any_route_intercept || !oauth_capture_store.is_empty();
     let (cert_cache, intercept_ca_path) = match (&config.intercept_ca_dir, any_intercept_route) {
         (Some(dir), true) => {
             let intercept_route_count = route_store
                 .route_upstream_hosts()
                 .iter()
                 .filter(|hp| route_store.has_intercept_route(hp))
-                .count();
+                .count()
+                + oauth_capture_store.host_ports().len();
             let ca_result = if let Some(ref preloaded) = config.preloaded_ca {
                 EphemeralCa::from_existing(&preloaded.key_der, &preloaded.cert_pem)
             } else {
@@ -658,20 +1183,29 @@ pub async fn start_with_nonce_resolver(
         (None, _) => (None, None),
     };
 
+    let enable_h2 = config.enable_h2;
+    let intercept_ca_env_vars = config.intercept_ca_env_vars.clone();
     let state = Arc::new(ProxyState {
         filter,
         session_token: session_token.clone(),
-        route_store,
-        credential_store,
+        route_store: Arc::new(route_store),
+        credential_store: Arc::new(credential_store),
+        oauth_capture_store,
         config,
         tls_connector,
+        default_tls_config: tls_config_arc,
+        upstream_pool,
+        tls_connector_h2,
         active_connections: AtomicUsize::new(0),
         audit_log: Arc::clone(&audit_log),
         approval_backends,
         credential_capture_backend,
-        nonce_resolver,
+        nonce_resolver: effective_nonce_resolver,
         bypass_matcher,
         cert_cache,
+        enable_h2,
+        h2_cache: UpstreamH2Cache::new(),
+        bound_port: port,
     });
 
     // Spawn accept loop as a task within the current runtime.
@@ -686,7 +1220,10 @@ pub async fn start_with_nonce_resolver(
         shutdown_tx,
         loaded_routes,
         no_proxy_hosts,
+        managed_loopback_upstream,
+        canonical_no_proxy_hosts,
         intercept_ca_path,
+        intercept_ca_env_vars,
         diagnostics: proxy_diagnostics,
     })
 }
@@ -743,16 +1280,36 @@ async fn accept_loop(
 /// to 443 when absent. Handles IPv6 brackets: `[::1]:443` already has a port,
 /// `[::1]` needs the default, `host:443` has a port.
 fn normalize_authority(authority: &str) -> String {
-    if authority.starts_with('[') {
-        if authority.contains("]:") {
-            authority.to_lowercase()
-        } else {
-            format!("{}:443", authority.to_lowercase())
+    if let Some(rest) = authority.strip_prefix('[') {
+        if let Some((host, remainder)) = rest.split_once(']') {
+            if remainder.is_empty() {
+                return crate::route::format_host_port(host, 443);
+            }
+            if let Some(port) = remainder.strip_prefix(':')
+                && let Ok(port) = port.parse::<u16>()
+            {
+                return crate::route::format_host_port(host, port);
+            }
         }
-    } else if authority.contains(':') {
         authority.to_lowercase()
     } else {
-        format!("{}:443", authority.to_lowercase())
+        if let Some((host, port)) = authority.rsplit_once(':')
+            && let Ok(port) = port.parse::<u16>()
+        {
+            if host.parse::<std::net::Ipv6Addr>().is_ok() {
+                return crate::route::format_host_port(host, port);
+            }
+            if !host.contains(':') {
+                return crate::route::format_host_port(host, port);
+            }
+        }
+        if authority.parse::<std::net::Ipv6Addr>().is_ok() {
+            crate::route::format_host_port(authority, 443)
+        } else if authority.contains(':') {
+            authority.to_lowercase()
+        } else {
+            crate::route::format_host_port(authority, 443)
+        }
     }
 }
 
@@ -801,6 +1358,18 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
 
     // Dispatch by method
     if first_line.starts_with("CONNECT ") {
+        // Resolve how the transparent CONNECT path treats Proxy-Authorization.
+        // Strict (407 on failure) only for standalone `nono proxy` with auth
+        // on; lenient (validate-but-tunnel) for the sandboxed paths; disabled
+        // under `--no-auth`. See [`connect::ConnectAuthMode`].
+        let connect_auth_mode = if !state.config.require_auth {
+            connect::ConnectAuthMode::Disabled
+        } else if state.config.strict_connect_auth {
+            connect::ConnectAuthMode::Strict
+        } else {
+            connect::ConnectAuthMode::Lenient
+        };
+
         // CONNECT requests targeting a configured route's upstream get
         // special handling. There are three sub-cases:
         //
@@ -816,22 +1385,27 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
         //
         // Anything else (host not matching any route) falls through to the
         // existing transparent-tunnel / external-proxy paths.
-        if !state.route_store.is_empty()
+        if (!state.route_store.is_empty() || !state.oauth_capture_store.is_empty())
             && let Some(authority) = first_line.split_whitespace().nth(1)
         {
             let host_port = normalize_authority(authority);
+            let oauth_host_policy = state.oauth_capture_store.host_policy(&host_port);
 
-            if state.route_store.is_route_upstream(&host_port) {
+            if state.route_store.is_route_upstream(&host_port) || oauth_host_policy.is_some() {
                 let route_id = state
                     .route_store
                     .lookup_by_upstream(&host_port)
-                    .map(|(prefix, _)| prefix);
-                let (host, port) = host_port
-                    .rsplit_once(':')
-                    .map(|(h, p)| (h.to_string(), p.parse::<u16>().unwrap_or(443)))
+                    .map(|(prefix, _)| prefix)
+                    .or_else(|| {
+                        oauth_host_policy
+                            .as_ref()
+                            .map(|policy| policy.route_id.as_str())
+                    });
+                let (host, port) = connect_target_from_normalized_authority(&host_port)
                     .unwrap_or_else(|| (host_port.clone(), 443));
 
-                let intercept_eligible = state.route_store.has_intercept_route(&host_port);
+                let intercept_eligible = state.route_store.has_intercept_route(&host_port)
+                    || oauth_host_policy.is_some();
 
                 match (intercept_eligible, state.cert_cache.as_ref()) {
                     // Case 1: intercept-eligible route + cert cache available.
@@ -848,10 +1422,17 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
                         // request head rather than dropping the socket — closing
                         // it breaks reactive clients (Apache HttpClient, Java's
                         // HttpClient, Maven's native resolver).
+                        //
+                        // When auth is disabled (standalone `nono proxy
+                        // --no-auth`), `enforce_proxy_auth` returns `Ok(())` on
+                        // the first pass and the loop exits without challenging.
                         let mut current_headers = header_bytes;
                         loop {
-                            match token::validate_proxy_auth(&current_headers, &state.session_token)
-                            {
+                            match token::enforce_proxy_auth(
+                                state.config.require_auth,
+                                &current_headers,
+                                &state.session_token,
+                            ) {
                                 Ok(()) => break,
                                 Err(e) => {
                                     debug!(
@@ -969,21 +1550,70 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
                                 None
                             };
 
+                        let mut h2_enabled_for_target = state.enable_h2
+                            && !oauth_host_policy
+                                .as_ref()
+                                .is_some_and(|policy| policy.force_http1);
+                        let (tls_connector_h2, h2_connector_cache_key) = if state.enable_h2 {
+                            match tls_intercept::handle::select_h2_tls_connector_for_target(
+                                &state.route_store,
+                                &host,
+                                port,
+                                &state.tls_connector_h2,
+                            ) {
+                                Ok(selected) => selected,
+                                Err(err) => {
+                                    warn!(
+                                        "tls_intercept: disabling h2 for {}:{}: {}",
+                                        host, port, err
+                                    );
+                                    h2_enabled_for_target = false;
+                                    (
+                                        state.tls_connector_h2.clone(),
+                                        "disabled-route-tls".to_string(),
+                                    )
+                                }
+                            }
+                        } else {
+                            (state.tls_connector_h2.clone(), "disabled".to_string())
+                        };
+
+                        // Pre-flight h2 probe: only advertise h2 to the agent
+                        // when the upstream actually negotiates it, avoiding
+                        // NoApplicationProtocol against h1-only upstreams.
+                        let upstream_h2 = if h2_enabled_for_target {
+                            state
+                                .h2_cache
+                                .get_or_probe(
+                                    &host,
+                                    port,
+                                    &state.filter,
+                                    &tls_connector_h2,
+                                    upstream_proxy.as_ref(),
+                                    &h2_connector_cache_key,
+                                )
+                                .await
+                        } else {
+                            false
+                        };
                         let ctx = tls_intercept::InterceptCtx {
                             route_id,
                             host: &host,
                             port,
-                            route_store: &state.route_store,
-                            credential_store: &state.credential_store,
+                            route_store: Arc::clone(&state.route_store),
+                            credential_store: Arc::clone(&state.credential_store),
+                            oauth_capture_store: Arc::clone(&state.oauth_capture_store),
                             session_token: &state.session_token,
                             cert_cache: Arc::clone(cache),
                             tls_connector: &state.tls_connector,
+                            tls_connector_h2: &tls_connector_h2,
                             filter: &state.filter,
                             audit_log: Some(&state.audit_log),
                             upstream_proxy,
                             approval_backends: state.approval_backends.clone(),
                             credential_capture_backend: state.credential_capture_backend.clone(),
                             nonce_resolver: state.nonce_resolver.clone(),
+                            enable_h2: upstream_h2,
                         };
                         return tls_intercept::handle_intercept_connect(&mut stream, ctx).await;
                     }
@@ -1051,6 +1681,7 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
                 &header_bytes,
                 &state.filter,
                 &state.session_token,
+                state.config.require_auth,
                 ext_config,
                 Some(&state.audit_log),
             )
@@ -1060,13 +1691,18 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
             // routing direct. Without this, bypassed hosts would inherit
             // connect::handle_connect()'s lenient auth (which tolerates
             // missing Proxy-Authorization for Node.js undici compat).
-            token::validate_proxy_auth(&header_bytes, &state.session_token)?;
+            token::enforce_proxy_auth(
+                state.config.require_auth,
+                &header_bytes,
+                &state.session_token,
+            )?;
             connect::handle_connect(
                 first_line,
                 &mut stream,
                 &state.filter,
                 &state.session_token,
                 &header_bytes,
+                connect_auth_mode,
                 Some(&state.audit_log),
             )
             .await
@@ -1077,18 +1713,38 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
                 &state.filter,
                 &state.session_token,
                 &header_bytes,
+                connect_auth_mode,
                 Some(&state.audit_log),
             )
             .await
         }
+    } else if classify_request_target(first_line) == RequestTargetForm::AbsoluteHttp {
+        // Absolute-form `http://…` request from an HTTP_PROXY-honoring client.
+        // Forward it as a plain-HTTP forward proxy (see handle_forward_http).
+        // This branch is checked BEFORE the origin-form reverse-proxy path so
+        // that absolute-form URLs never reach parse_service_prefix (which
+        // would misread the scheme as a service name — see issue #1334).
+        handle_forward_http(first_line, &mut stream, &header_bytes, &buffered, state).await
+    } else if classify_request_target(first_line) == RequestTargetForm::AbsoluteHttps {
+        // Absolute-form `https://…` cannot be forwarded as cleartext: the
+        // proxy would have to originate TLS to the upstream on the client's
+        // behalf, which no standard HTTP_PROXY client expects. Such clients
+        // use CONNECT for HTTPS. Reject with explicit guidance rather than a
+        // confusing 502.
+        let response = "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: 62\r\n\r\nhttps forward-proxying is not supported; use CONNECT for https";
+        stream.write_all(response.as_bytes()).await?;
+        Ok(())
     } else if !state.route_store.is_empty() {
         // Non-CONNECT request with routes configured -> reverse proxy
         let ctx = reverse::ReverseProxyCtx {
             route_store: &state.route_store,
             credential_store: &state.credential_store,
             session_token: &state.session_token,
+            require_auth: state.config.require_auth,
             filter: &state.filter,
             tls_connector: &state.tls_connector,
+            default_tls_config: &state.default_tls_config,
+            upstream_pool: &state.upstream_pool,
             audit_log: Some(&state.audit_log),
             approval_backends: state.approval_backends.clone(),
             credential_capture_backend: state.credential_capture_backend.clone(),
@@ -1123,10 +1779,270 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
     }
 }
 
+/// Handle an absolute-form `http://` forward-proxy request.
+///
+/// This is the plain-HTTP counterpart to the CONNECT tunnel: a client that
+/// honors `HTTP_PROXY` sends `GET http://host/path HTTP/1.1` for cleartext
+/// HTTP, and nono forwards it after applying the same trust boundary the
+/// tunnel path uses (session-token auth + host filter).
+///
+/// Steps:
+/// 1. Enforce `Proxy-Authorization` (same session-token gate as CONNECT /
+///    reverse). On failure: 407 + audit denial, matching the reverse path's
+///    no-credential branch.
+/// 2. Parse host+port from the absolute URL and run the host filter. On deny:
+///    403 + `HostDenied` audit event, mirroring the no-routes inline `else`.
+/// 3. Rewrite the request line to origin-form and strip hop-by-hop proxy
+///    headers, then forward via the shared L7 pipeline using the
+///    DNS-rebinding-safe resolved addresses (or the external proxy chain).
+///
+/// SAFETY / SECURITY: this path intentionally does NOT call
+/// `reverse::validate_http_upstream_target`. That check enforces
+/// loopback-only for `http` upstreams, which is correct for the *reverse*
+/// proxy (whose upstreams are operator-configured and where plain HTTP to a
+/// non-local host would be an accidental credential-leak footgun). A general
+/// forward proxy, by contrast, exists precisely to reach arbitrary allowed
+/// `http://` hosts on behalf of the agent. Here the host filter
+/// (`check_host`) is the sufficient and authoritative trust boundary: it
+/// applies the allowlist and the cloud-metadata / link-local SSRF guards, and
+/// returns the exact resolved addresses we then connect to. Do NOT assume
+/// "http upstream => loopback" holds on this path.
+async fn handle_forward_http(
+    first_line: &str,
+    stream: &mut tokio::net::TcpStream,
+    header_bytes: &[u8],
+    buffered: &[u8],
+    state: &ProxyState,
+) -> Result<()> {
+    // 1. Proxy-Authorization gate — identical to the reverse-proxy
+    //    no-credential branch: 407 on missing/invalid auth, with an audit
+    //    denial recording the authentication failure. No auth bypass.
+    if let Err(e) = token::validate_proxy_auth(header_bytes, &state.session_token) {
+        // Parse the target host for the audit record where possible; fall
+        // back to a placeholder so a malformed line still audits.
+        let (host, port) =
+            parse_non_connect_target(first_line).unwrap_or_else(|_| ("unknown".to_string(), 0));
+        audit::log_denied(
+            Some(&state.audit_log),
+            audit::ProxyMode::Reverse,
+            &audit::EventContext {
+                auth_mechanism: Some(nono::undo::NetworkAuditAuthMechanism::ProxyAuthorization),
+                auth_outcome: Some(nono::undo::NetworkAuditAuthOutcome::Failed),
+                denial_category: Some(nono::undo::NetworkAuditDenialCategory::AuthenticationFailed),
+                ..audit::EventContext::default()
+            },
+            &host,
+            port,
+            &e.to_string(),
+        );
+        let response = "HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"nono\"\r\nContent-Length: 0\r\n\r\n";
+        stream.write_all(response.as_bytes()).await?;
+        return Ok(());
+    }
+
+    // 2. Parse host+port and run the host filter (DNS resolution + SSRF guard).
+    let (host, port) = parse_non_connect_target(first_line)?;
+
+    // Self-request: the absolute URL targets the proxy's own address.
+    //
+    // When `MOCKAPI_BASE_URL = http://127.0.0.1:{proxy_port}/mockapi` and
+    // loopback is absent from NO_PROXY (because a managed-credential route
+    // has a loopback upstream), HTTP_PROXY-aware clients such as curl send
+    // the request in absolute-form to the proxy.  Without this check the
+    // request would enter the transparent forward path and try to connect to
+    // the proxy itself (a self-loop), bypassing credential injection.
+    //
+    // Detect the pattern and delegate to `handle_reverse_proxy`, which
+    // already strips the scheme+authority from absolute-form URLs before
+    // routing by path prefix, so credential injection (including SPIFFE JWT)
+    // works correctly.
+    if port == state.bound_port
+        && (host == "127.0.0.1" || host == "localhost" || host == "[::1]" || host == "::1")
+    {
+        let ctx = reverse::ReverseProxyCtx {
+            route_store: &state.route_store,
+            credential_store: &state.credential_store,
+            session_token: &state.session_token,
+            require_auth: state.config.require_auth,
+            filter: &state.filter,
+            tls_connector: &state.tls_connector,
+            default_tls_config: &state.default_tls_config,
+            upstream_pool: &state.upstream_pool,
+            audit_log: Some(&state.audit_log),
+            approval_backends: state.approval_backends.clone(),
+            credential_capture_backend: state.credential_capture_backend.clone(),
+        };
+        return reverse::handle_reverse_proxy(first_line, stream, header_bytes, &ctx, buffered)
+            .await;
+    }
+
+    let check = state.filter.check_host(&host, port).await?;
+    if !check.result.is_allowed() {
+        let reason = check.result.reason();
+        audit::log_denied(
+            Some(&state.audit_log),
+            audit::ProxyMode::Reverse,
+            &audit::EventContext {
+                denial_category: Some(nono::undo::NetworkAuditDenialCategory::HostDenied),
+                ..audit::EventContext::default()
+            },
+            &host,
+            port,
+            &reason,
+        );
+        let sanitised = reason.replace(['\r', '\n'], " ");
+        let response = format!("HTTP/1.1 403 Forbidden: {}\r\n\r\n", sanitised);
+        stream.write_all(response.as_bytes()).await?;
+        return Ok(());
+    }
+
+    // 3. Build the origin-form request bytes: rewritten request line +
+    //    proxy-header-stripped header block + terminating CRLF.
+    let origin_line = rewrite_absolute_to_origin_form(first_line)?;
+    let inbound_path = origin_line
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or("/")
+        .to_string();
+    let method = first_line
+        .split_whitespace()
+        .next()
+        .unwrap_or("GET")
+        .to_string();
+
+    let filtered_headers = strip_proxy_headers(header_bytes);
+    let mut request_bytes = Vec::with_capacity(origin_line.len() + filtered_headers.len() + 2);
+    request_bytes.extend_from_slice(origin_line.as_bytes());
+    request_bytes.extend_from_slice(&filtered_headers);
+    request_bytes.extend_from_slice(b"\r\n");
+
+    // Read the request body honoring Content-Length. `buffered` holds any
+    // bytes the BufReader already read past the header terminator.
+    let content_length = reverse::extract_content_length(header_bytes);
+    let body = match reverse::read_request_body(stream, content_length, buffered).await? {
+        Some(body) => body,
+        None => return Ok(()), // send_error already written (e.g. 413)
+    };
+
+    // 4. Choose the upstream strategy: chain through the external/enterprise
+    //    proxy when configured (unless the host is a bypass host), else
+    //    connect directly to the resolved addresses (DNS-rebinding-safe).
+    let ext_proxy_addr = match state.config.external_proxy.as_ref() {
+        Some(ext) if !(state.bypass_matcher.matches(&host)) => {
+            // Mirror the CONNECT/intercept paths: external proxy auth is
+            // configured-but-unimplemented, so fail loudly rather than
+            // silently connecting unauthenticated.
+            if ext.auth.is_some() {
+                let msg = "external proxy authentication is configured but not yet \
+                     implemented; remove the auth section from the external proxy \
+                     config or wait for a future release";
+                audit::log_denied(
+                    Some(&state.audit_log),
+                    audit::ProxyMode::Reverse,
+                    &audit::EventContext {
+                        denial_category: Some(
+                            nono::undo::NetworkAuditDenialCategory::UpstreamConnectFailed,
+                        ),
+                        ..audit::EventContext::default()
+                    },
+                    &host,
+                    port,
+                    msg,
+                );
+                let response = "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n";
+                stream.write_all(response.as_bytes()).await?;
+                return Err(ProxyError::ExternalProxy(msg.to_string()));
+            }
+            Some(ext.address.clone())
+        }
+        _ => None,
+    };
+
+    let strategy = match ext_proxy_addr.as_deref() {
+        Some(addr) => UpstreamStrategy::ExternalProxy {
+            proxy_addr: addr,
+            proxy_auth_header: None,
+        },
+        None => UpstreamStrategy::Direct {
+            resolved_addrs: &check.resolved_addrs,
+        },
+    };
+
+    let upstream = UpstreamSpec {
+        scheme: UpstreamScheme::Http,
+        host: &host,
+        port,
+        strategy,
+        // Unused for the Http scheme (no TLS to the upstream), but the shared
+        // pipeline requires a connector value. Reuse the shared default.
+        tls_connector: &state.tls_connector,
+    };
+
+    let audit_ctx = AuditCtx {
+        log: Some(&state.audit_log),
+        mode: audit::ProxyMode::Reverse,
+        event_ctx: audit::EventContext {
+            auth_mechanism: Some(nono::undo::NetworkAuditAuthMechanism::ProxyAuthorization),
+            auth_outcome: Some(nono::undo::NetworkAuditAuthOutcome::Succeeded),
+            managed_credential_active: Some(false),
+            ..audit::EventContext::default()
+        },
+        target: &host,
+        method: &method,
+        path: &inbound_path,
+    };
+
+    match forward::forward_request(stream, &request_bytes, &body, upstream, audit_ctx).await {
+        Ok(_status) => Ok(()),
+        Err(e) => {
+            warn!("forward-http upstream connection failed: {}", e);
+            audit::log_denied(
+                Some(&state.audit_log),
+                audit::ProxyMode::Reverse,
+                &audit::EventContext {
+                    denial_category: Some(
+                        nono::undo::NetworkAuditDenialCategory::UpstreamConnectFailed,
+                    ),
+                    ..audit::EventContext::default()
+                },
+                &host,
+                port,
+                &e.to_string(),
+            );
+            // The upstream connect failed before any response bytes were
+            // streamed, so it is safe to emit a 502 to the client here.
+            let response = "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n";
+            stream.write_all(response.as_bytes()).await?;
+            Ok(())
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncReadExt;
+
+    fn env_value<'a>(vars: &'a [(String, String)], key: &str) -> Result<&'a str> {
+        vars.iter()
+            .find(|(candidate, _)| candidate == key)
+            .map(|(_, value)| value.as_str())
+            .ok_or_else(|| ProxyError::Config(format!("{key} should be emitted")))
+    }
+
+    async fn start_config_error(config: ProxyConfig) -> Result<String> {
+        match start(config).await {
+            Err(ProxyError::Config(message)) => Ok(message),
+            Err(err) => Err(err),
+            Ok(handle) => {
+                handle.shutdown();
+                Err(ProxyError::Config(
+                    "proxy startup should have rejected config".to_string(),
+                ))
+            }
+        }
+    }
 
     #[test]
     fn normalize_authority_normalises_case_and_default_port() {
@@ -1141,11 +2057,274 @@ mod tests {
         );
         assert_eq!(normalize_authority("[::1]"), "[::1]:443");
         assert_eq!(normalize_authority("[::1]:8443"), "[::1]:8443");
+        assert_eq!(normalize_authority("::1"), "[::1]:443");
+        assert_eq!(normalize_authority("::1:8080"), "[::1]:8080");
+        assert_eq!(normalize_authority("[0:0:0:0:0:0:0:1]:8080"), "[::1]:8080");
+        assert_eq!(normalize_authority("0:0:0:0:0:0:0:1:8080"), "[::1]:8080");
         // case- and port-insensitive equality is the point of the retry guard
         assert_eq!(
             normalize_authority("API.OPENAI.COM:443"),
             normalize_authority("api.openai.com")
         );
+    }
+
+    #[tokio::test]
+    async fn normalize_authority_matches_ipv6_route_upstreams() -> Result<()> {
+        let routes = vec![crate::config::RouteConfig {
+            prefix: "local".to_string(),
+            upstream: "http://[::1]:8080/v1".to_string(),
+            credential_key: Some("local".to_string()),
+            inject_mode: crate::config::InjectMode::Header,
+            inject_header: "Authorization".to_string(),
+            credential_format: None,
+            path_pattern: None,
+            path_replacement: None,
+            query_param_name: None,
+            proxy: None,
+            env_var: None,
+            endpoint_rules: Vec::new(),
+            endpoint_policy: None,
+            tls_ca: None,
+            tls_client_cert: None,
+            tls_client_key: None,
+            oauth2: None,
+            aws_auth: None,
+            spiffe: None,
+        }];
+        let store = RouteStore::load(&routes).await?;
+        let host_port = normalize_authority("::1:8080");
+
+        assert_eq!(host_port, "[::1]:8080");
+        assert!(store.is_route_upstream(&host_port));
+        assert!(store.has_intercept_route(&host_port));
+        Ok(())
+    }
+
+    #[test]
+    fn connect_target_from_normalized_authority_unbrackets_ipv6() {
+        let host_port = normalize_authority("::1:8080");
+
+        assert_eq!(host_port, "[::1]:8080");
+        assert_eq!(
+            connect_target_from_normalized_authority(&host_port),
+            Some(("::1".to_string(), 8080))
+        );
+        assert_eq!(
+            connect_target_from_normalized_authority("api.openai.com:443"),
+            Some(("api.openai.com".to_string(), 443))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_proxy_uses_supplied_session_token() {
+        // A caller-supplied password (the `nono proxy --pass` case) must be
+        // used verbatim as the proxy credential instead of a random token.
+        let config = ProxyConfig {
+            session_token: Some(Zeroizing::new("my-fixed-password".to_string())),
+            ..Default::default()
+        };
+        let handle = start(config).await.unwrap();
+        assert_eq!(*handle.token, "my-fixed-password");
+        handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_proxy_ignores_empty_session_token() {
+        // An empty override must fall back to a random token, never an
+        // effectively-absent credential.
+        let config = ProxyConfig {
+            session_token: Some(Zeroizing::new(String::new())),
+            ..Default::default()
+        };
+        let handle = start(config).await.unwrap();
+        assert_eq!(
+            handle.token.len(),
+            64,
+            "empty --pass must fall back to a random token"
+        );
+        handle.shutdown();
+    }
+
+    /// Spawn a one-shot loopback HTTP server that accepts a single connection,
+    /// drains the request, and replies `200 OK`. Returns its `host:port`.
+    /// Used as a reverse-proxy upstream so the auth decision can be observed
+    /// end-to-end without reaching the network.
+    async fn spawn_mock_upstream() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                // Read until the end of the request head, then reply.
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                    .await;
+            }
+        });
+        format!("127.0.0.1:{}", addr.port())
+    }
+
+    /// A declarative (credential-less) reverse-proxy route whose upstream is a
+    /// loopback `http://` server. With no credential, the auth path falls to
+    /// the session-token fallback branch — the branch the `require_auth` fix
+    /// moved back inside the guard.
+    fn declarative_route(upstream: &str) -> crate::config::RouteConfig {
+        crate::config::RouteConfig {
+            prefix: "svc".to_string(),
+            upstream: upstream.to_string(),
+            credential_key: None,
+            inject_mode: Default::default(),
+            inject_header: "Authorization".to_string(),
+            credential_format: None,
+            path_pattern: None,
+            path_replacement: None,
+            query_param_name: None,
+            proxy: None,
+            env_var: None,
+            endpoint_rules: vec![],
+            endpoint_policy: None,
+            tls_ca: None,
+            tls_client_cert: None,
+            tls_client_key: None,
+            oauth2: None,
+            aws_auth: None,
+            spiffe: None,
+        }
+    }
+
+    /// Send `GET /svc/` through the proxy at `port` with no `Proxy-Authorization`
+    /// header and return the upstream status line the proxy wrote back.
+    async fn unauthenticated_reverse_request(port: u16) -> String {
+        let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        client
+            .write_all(b"GET /svc/ HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            .await
+            .unwrap();
+        let mut resp = Vec::new();
+        // Read the response head; the upstream is tiny so a single read suffices.
+        let mut buf = [0u8; 1024];
+        if let Ok(n) = client.read(&mut buf).await {
+            resp.extend_from_slice(&buf[..n]);
+        }
+        String::from_utf8_lossy(&resp)
+            .lines()
+            .next()
+            .unwrap_or("")
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn test_no_auth_skips_reverse_proxy_authentication() {
+        // Regression: `nono proxy --no-auth` (require_auth == false) must skip
+        // session-token enforcement on reverse-proxy routes. A previous
+        // restructure chained the auth branches as `else if` alternatives to
+        // `if ctx.require_auth`, so disabling auth still rejected requests.
+        let upstream = spawn_mock_upstream().await;
+        let config = ProxyConfig {
+            routes: vec![declarative_route(&format!("http://{upstream}"))],
+            allowed_hosts: vec!["127.0.0.1".to_string()],
+            require_auth: false,
+            ..Default::default()
+        };
+        let handle = start(config).await.unwrap();
+        let status = unauthenticated_reverse_request(handle.port).await;
+        assert!(
+            status.contains("200"),
+            "with --no-auth an unauthenticated reverse request must reach the upstream, got: {status:?}"
+        );
+        assert!(
+            !status.contains("407") && !status.contains("401"),
+            "auth must not be enforced when disabled, got: {status:?}"
+        );
+        handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_reverse_proxy_enforces_auth_when_required() {
+        // Companion to the --no-auth case: with auth required, an
+        // unauthenticated reverse request must still be challenged (407),
+        // locking the toggle in both directions.
+        let upstream = spawn_mock_upstream().await;
+        let config = ProxyConfig {
+            routes: vec![declarative_route(&format!("http://{upstream}"))],
+            allowed_hosts: vec!["127.0.0.1".to_string()],
+            require_auth: true,
+            ..Default::default()
+        };
+        let handle = start(config).await.unwrap();
+        let status = unauthenticated_reverse_request(handle.port).await;
+        assert!(
+            status.contains("407"),
+            "with auth required an unauthenticated reverse request must be challenged, got: {status:?}"
+        );
+        handle.shutdown();
+    }
+
+    /// Send an unauthenticated `CONNECT host:443` through the proxy at `port`
+    /// and return the status line the proxy wrote back.
+    async fn unauthenticated_connect_request(port: u16, host: &str) -> String {
+        let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        client
+            .write_all(
+                format!("CONNECT {host}:443 HTTP/1.1\r\nHost: {host}:443\r\n\r\n").as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut buf = [0u8; 1024];
+        let n = client.read(&mut buf).await.unwrap_or(0);
+        String::from_utf8_lossy(&buf[..n])
+            .lines()
+            .next()
+            .unwrap_or("")
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn test_strict_connect_auth_rejects_unauthenticated_connect() {
+        // Standalone `nono proxy` sets strict_connect_auth: an unauthenticated
+        // CONNECT must be answered with 407 *before* any DNS/filter/upstream
+        // handling, rather than tunnelled (which would otherwise surface as a
+        // 502 once the upstream connect fails).
+        let config = ProxyConfig {
+            allowed_hosts: vec!["nonexistent.invalid".to_string()],
+            require_auth: true,
+            strict_connect_auth: true,
+            ..Default::default()
+        };
+        let handle = start(config).await.unwrap();
+        let status = unauthenticated_connect_request(handle.port, "nonexistent.invalid").await;
+        assert!(
+            status.contains("407"),
+            "strict CONNECT auth must challenge an unauthenticated CONNECT, got: {status:?}"
+        );
+        handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_lenient_connect_auth_tunnels_unauthenticated_connect() {
+        // Sandboxed run/shell/wrap path (strict_connect_auth == false): an
+        // unauthenticated CONNECT is *not* rejected with 407 — it proceeds to
+        // host filtering / upstream connect (undici compat). The unresolvable
+        // host then yields a 502, proving the request was never short-circuited
+        // at the auth gate.
+        let config = ProxyConfig {
+            allowed_hosts: vec!["nonexistent.invalid".to_string()],
+            require_auth: true,
+            strict_connect_auth: false,
+            ..Default::default()
+        };
+        let handle = start(config).await.unwrap();
+        let status = unauthenticated_connect_request(handle.port, "nonexistent.invalid").await;
+        assert!(
+            !status.contains("407"),
+            "lenient CONNECT auth must not challenge with 407, got: {status:?}"
+        );
+        handle.shutdown();
     }
 
     #[tokio::test]
@@ -1173,7 +2352,10 @@ mod tests {
                 shutdown_tx,
                 loaded_routes: std::collections::HashSet::new(),
                 no_proxy_hosts: Vec::new(),
+                managed_loopback_upstream: false,
+                canonical_no_proxy_hosts: Vec::new(),
                 intercept_ca_path: None,
+                intercept_ca_env_vars: crate::config::default_intercept_ca_env_vars(),
                 diagnostics: vec![],
             };
         }
@@ -1186,7 +2368,7 @@ mod tests {
     /// 1. generates an ephemeral CA;
     /// 2. writes a trust bundle file with at least the ephemeral cert + system roots;
     /// 3. exposes the path via `intercept_ca_path()`;
-    /// 4. emits trust env vars (`SSL_CERT_FILE` etc.) pointing at it;
+    /// 4. emits configured trust env vars (`SSL_CERT_FILE` etc.) pointing at it;
     /// 5. cleans the file on `Drop`.
     #[tokio::test]
     async fn test_intercept_lifecycle_end_to_end() {
@@ -1214,8 +2396,14 @@ mod tests {
                     tls_client_key: None,
                     oauth2: None,
                     aws_auth: None,
+                    spiffe: None,
                 }],
                 intercept_ca_dir: Some(dir.path().to_path_buf()),
+                intercept_ca_env_vars: {
+                    let mut vars = crate::config::default_intercept_ca_env_vars();
+                    vars.push("CODEX_CA_CERTIFICATE".to_string());
+                    vars
+                },
                 ..Default::default()
             };
             let handle = start(config).await.unwrap();
@@ -1242,6 +2430,11 @@ mod tests {
                 .find(|(k, _)| k == "SSL_CERT_FILE")
                 .expect("SSL_CERT_FILE should be set when intercept active");
             assert_eq!(std::path::Path::new(&ssl.1), ca_path_clone);
+            let codex_ca = vars
+                .iter()
+                .find(|(k, _)| k == "CODEX_CA_CERTIFICATE")
+                .expect("CODEX_CA_CERTIFICATE should be set when intercept active");
+            assert_eq!(std::path::Path::new(&codex_ca.1), ca_path_clone);
             assert!(vars.iter().any(|(k, _)| k == "REQUESTS_CA_BUNDLE"));
             assert!(vars.iter().any(|(k, _)| k == "NODE_EXTRA_CA_CERTS"));
             assert!(vars.iter().any(|(k, _)| k == "CURL_CA_BUNDLE"));
@@ -1280,6 +2473,7 @@ mod tests {
                 tls_client_key: None,
                 oauth2: None,
                 aws_auth: None,
+                spiffe: None,
             }],
             intercept_ca_dir: Some(dir.path().to_path_buf()),
             ..Default::default()
@@ -1293,6 +2487,41 @@ mod tests {
         assert!(
             vars.iter().all(|(k, _)| k != "SSL_CERT_FILE"),
             "trust env vars must not be set when intercept inactive"
+        );
+        handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_oauth_capture_routes_activate_intercept() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = ProxyConfig {
+            oauth_capture: vec![crate::config::OAuthCaptureConfig {
+                provider: "codex".to_string(),
+                token_endpoints: vec![crate::config::OAuthTokenEndpointConfig {
+                    host: "https://auth.openai.com".to_string(),
+                    path: "/oauth/token".to_string(),
+                    response_fields: vec![
+                        crate::config::OAuthTokenResponseFieldConfig {
+                            path: "access_token".to_string(),
+                            kind: crate::config::OAuthTokenResponseFieldKind::Opaque,
+                        },
+                        crate::config::OAuthTokenResponseFieldConfig {
+                            path: "refresh_token".to_string(),
+                            kind: crate::config::OAuthTokenResponseFieldKind::Opaque,
+                        },
+                    ],
+                    request_body: crate::config::OAuthTokenRequestBodyFormat::Auto,
+                    request_nonce_fields: vec!["refresh_token".to_string()],
+                }],
+                admitted_consumers: vec!["proxy.openai_oauth".to_string()],
+            }],
+            intercept_ca_dir: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        };
+        let handle = start(config).await.unwrap();
+        assert!(
+            handle.intercept_ca_path().is_some(),
+            "oauth_capture token endpoints must activate TLS interception"
         );
         handle.shutdown();
     }
@@ -1328,6 +2557,7 @@ mod tests {
                 tls_client_key: None,
                 oauth2: None,
                 aws_auth: None,
+                spiffe: None,
             }],
             intercept_ca_dir: Some(missing_dir),
             ..Default::default()
@@ -1376,6 +2606,7 @@ mod tests {
                     tls_client_key: None,
                     oauth2: None,
                     aws_auth: None,
+                    spiffe: None,
                 },
                 crate::config::RouteConfig {
                     prefix: "alias".to_string(),
@@ -1396,6 +2627,7 @@ mod tests {
                     tls_client_key: None,
                     oauth2: None,
                     aws_auth: None,
+                    spiffe: None,
                 },
             ],
             intercept_ca_dir: Some(dir.path().to_path_buf()),
@@ -1405,18 +2637,284 @@ mod tests {
         let rows = handle.route_diagnostics(&config);
         assert_eq!(rows.len(), 2);
 
-        let openai = rows.iter().find(|(p, _)| p == "openai").unwrap();
-        assert!(openai.1.contains("api.openai.com"));
-        assert!(openai.1.contains("intercept: on"));
+        let openai = rows.iter().find(|s| s.contains("api.openai.com")).unwrap();
+        assert!(openai.contains("intercept: on"));
         assert!(
-            openai.1.contains("✗") || openai.1.contains("credential_not_found"),
+            openai.contains("✗") || openai.contains("credential_not_found"),
             "missing credential should show structured code, got: {}",
-            openai.1
+            openai
         );
 
-        let alias = rows.iter().find(|(p, _)| p == "alias").unwrap();
-        assert!(alias.1.contains("creds: none"));
-        assert!(alias.1.contains("intercept: off"));
+        let alias = rows
+            .iter()
+            .find(|s| s.contains("aliased.example.com"))
+            .unwrap();
+        assert!(alias.contains("creds: none"));
+        assert!(alias.contains("intercept: off"));
+
+        handle.shutdown();
+    }
+
+    /// A credential route and the synthetic `_ep_<host>` endpoint-authorization
+    /// route for the same upstream collapse into a single diagnostic row that
+    /// carries the credential and the summed endpoint-rule count, rather than
+    /// surfacing the internal split as a credential-less duplicate.
+    #[tokio::test]
+    async fn test_route_diagnostics_groups_credential_and_endpoint_routes() {
+        let dir = tempfile::tempdir().unwrap();
+        let endpoint_rule = crate::config::EndpointRule {
+            method: "GET".to_string(),
+            path: "/repos/*".to_string(),
+        };
+        let config = ProxyConfig {
+            routes: vec![
+                // Credential catch-all route (no endpoint rules).
+                crate::config::RouteConfig {
+                    prefix: "github_api".to_string(),
+                    upstream: "https://api.github.com".to_string(),
+                    credential_key: Some("env://NONO_TEST_MISSING".to_string()),
+                    inject_mode: Default::default(),
+                    inject_header: "Authorization".to_string(),
+                    credential_format: Some("Bearer {}".to_string()),
+                    path_pattern: None,
+                    path_replacement: None,
+                    query_param_name: None,
+                    proxy: None,
+                    env_var: None,
+                    endpoint_rules: vec![],
+                    endpoint_policy: None,
+                    tls_ca: None,
+                    tls_client_cert: None,
+                    tls_client_key: None,
+                    oauth2: None,
+                    aws_auth: None,
+                    spiffe: None,
+                },
+                // Synthetic endpoint-authorization route for the same upstream.
+                crate::config::RouteConfig {
+                    prefix: "_ep_api.github.com".to_string(),
+                    upstream: "https://api.github.com".to_string(),
+                    credential_key: None,
+                    inject_mode: Default::default(),
+                    inject_header: "Authorization".to_string(),
+                    credential_format: None,
+                    path_pattern: None,
+                    path_replacement: None,
+                    query_param_name: None,
+                    proxy: None,
+                    env_var: None,
+                    endpoint_rules: vec![endpoint_rule.clone(), endpoint_rule],
+                    endpoint_policy: None,
+                    tls_ca: None,
+                    tls_client_cert: None,
+                    tls_client_key: None,
+                    oauth2: None,
+                    aws_auth: None,
+                    spiffe: None,
+                },
+            ],
+            intercept_ca_dir: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        };
+        let handle = start(config.clone()).await.unwrap();
+        let rows = handle.route_diagnostics(&config);
+
+        // Two routes, one upstream → a single grouped row.
+        assert_eq!(rows.len(), 1, "routes sharing an upstream should collapse");
+        let summary = &rows[0];
+        assert!(summary.contains("api.github.com"));
+        // Credential status comes from the credential-bearing route, not `none`.
+        assert!(
+            !summary.contains("creds: none"),
+            "grouped row must carry the credential, got: {summary}"
+        );
+        // Endpoint rules from the `_ep_` route are summed onto the row.
+        assert!(
+            summary.contains("endpoint_rules: 2"),
+            "grouped row must sum endpoint rules, got: {summary}"
+        );
+        assert!(summary.contains("intercept: on"));
+
+        handle.shutdown();
+    }
+
+    /// An `_ep_` route on a concrete subdomain (`raw.githubusercontent.com`)
+    /// stays its own row but reports the credential from the covering wildcard
+    /// route (`*.githubusercontent.com`) rather than `creds: none`, because the
+    /// wildcard route injects that credential for the subdomain at request time.
+    #[tokio::test]
+    async fn test_route_diagnostics_reports_covering_wildcard_credential() {
+        let dir = tempfile::tempdir().unwrap();
+        let endpoint_rule = crate::config::EndpointRule {
+            method: "GET".to_string(),
+            path: "/**".to_string(),
+        };
+        let config = ProxyConfig {
+            routes: vec![
+                // Wildcard credential route.
+                crate::config::RouteConfig {
+                    prefix: "github_raw".to_string(),
+                    upstream: "https://*.githubusercontent.com".to_string(),
+                    credential_key: Some("env://NONO_TEST_MISSING".to_string()),
+                    inject_mode: Default::default(),
+                    inject_header: "Authorization".to_string(),
+                    credential_format: Some("Bearer {}".to_string()),
+                    path_pattern: None,
+                    path_replacement: None,
+                    query_param_name: None,
+                    proxy: None,
+                    env_var: None,
+                    endpoint_rules: vec![],
+                    endpoint_policy: None,
+                    tls_ca: None,
+                    tls_client_cert: None,
+                    tls_client_key: None,
+                    oauth2: None,
+                    aws_auth: None,
+                    spiffe: None,
+                },
+                // `_ep_` route on a concrete subdomain covered by the wildcard.
+                crate::config::RouteConfig {
+                    prefix: "_ep_raw.githubusercontent.com".to_string(),
+                    upstream: "https://raw.githubusercontent.com".to_string(),
+                    credential_key: None,
+                    inject_mode: Default::default(),
+                    inject_header: "Authorization".to_string(),
+                    credential_format: None,
+                    path_pattern: None,
+                    path_replacement: None,
+                    query_param_name: None,
+                    proxy: None,
+                    env_var: None,
+                    endpoint_rules: vec![endpoint_rule],
+                    endpoint_policy: None,
+                    tls_ca: None,
+                    tls_client_cert: None,
+                    tls_client_key: None,
+                    oauth2: None,
+                    aws_auth: None,
+                    spiffe: None,
+                },
+            ],
+            intercept_ca_dir: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        };
+        let handle = start(config.clone()).await.unwrap();
+        let rows = handle.route_diagnostics(&config);
+
+        // Distinct upstreams → two rows (no merge across different hosts).
+        assert_eq!(rows.len(), 2, "distinct upstreams must not merge");
+        let ep_row = rows
+            .iter()
+            .find(|s| s.contains("raw.githubusercontent.com") && !s.contains('*'))
+            .expect("subdomain row present");
+        // The covering wildcard credential is reported, not `none`.
+        assert!(
+            !ep_row.contains("creds: none"),
+            "covered subdomain must report the wildcard credential, got: {}",
+            ep_row
+        );
+        assert!(ep_row.contains("endpoint_rules: 1"));
+
+        handle.shutdown();
+    }
+
+    /// A credential route whose upstream is not in the host allowlist is dead
+    /// config — traffic to it would be denied by the filter regardless of the
+    /// injected credential — so it is omitted from the diagnostics entirely.
+    #[tokio::test]
+    async fn test_route_diagnostics_omits_unreachable_upstream() {
+        let dir = tempfile::tempdir().unwrap();
+        let route = |prefix: &str, upstream: &str| crate::config::RouteConfig {
+            prefix: prefix.to_string(),
+            upstream: upstream.to_string(),
+            credential_key: Some("env://NONO_TEST_MISSING".to_string()),
+            inject_mode: Default::default(),
+            inject_header: "Authorization".to_string(),
+            credential_format: Some("Bearer {}".to_string()),
+            path_pattern: None,
+            path_replacement: None,
+            query_param_name: None,
+            proxy: None,
+            env_var: None,
+            endpoint_rules: vec![],
+            endpoint_policy: None,
+            tls_ca: None,
+            tls_client_cert: None,
+            tls_client_key: None,
+            oauth2: None,
+            aws_auth: None,
+            spiffe: None,
+        };
+        let config = ProxyConfig {
+            routes: vec![
+                route("github_api", "https://api.github.com"),
+                route("datadog", "https://api.datadoghq.com"),
+            ],
+            // Only github is allow-listed; datadog's upstream is unreachable.
+            allowed_hosts: vec!["api.github.com".to_string()],
+            intercept_ca_dir: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        };
+        let handle = start(config.clone()).await.unwrap();
+        let rows = handle.route_diagnostics(&config);
+
+        assert_eq!(rows.len(), 1, "unreachable upstream must be omitted");
+        assert!(rows[0].contains("api.github.com"));
+        assert!(
+            !rows.iter().any(|s| s.contains("datadoghq.com")),
+            "non-allow-listed upstream must not be listed, got: {rows:?}"
+        );
+
+        handle.shutdown();
+    }
+
+    /// Strict mode with a non-empty allowlist behaves the same: a route to a
+    /// non-allow-listed upstream is omitted, an allow-listed one is shown.
+    #[tokio::test]
+    async fn test_route_diagnostics_respects_wildcard_allowlist() {
+        let dir = tempfile::tempdir().unwrap();
+        let route = |prefix: &str, upstream: &str| crate::config::RouteConfig {
+            prefix: prefix.to_string(),
+            upstream: upstream.to_string(),
+            credential_key: Some("env://NONO_TEST_MISSING".to_string()),
+            inject_mode: Default::default(),
+            inject_header: "Authorization".to_string(),
+            credential_format: Some("Bearer {}".to_string()),
+            path_pattern: None,
+            path_replacement: None,
+            query_param_name: None,
+            proxy: None,
+            env_var: None,
+            endpoint_rules: vec![],
+            endpoint_policy: None,
+            tls_ca: None,
+            tls_client_cert: None,
+            tls_client_key: None,
+            oauth2: None,
+            aws_auth: None,
+            spiffe: None,
+        };
+        let config = ProxyConfig {
+            routes: vec![
+                route("github_raw", "https://raw.githubusercontent.com"),
+                route("evil", "https://evil.example.com"),
+            ],
+            // Wildcard covers the githubusercontent subdomain but not evil.
+            allowed_hosts: vec!["*.githubusercontent.com".to_string()],
+            strict_filter: true,
+            intercept_ca_dir: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        };
+        let handle = start(config.clone()).await.unwrap();
+        let rows = handle.route_diagnostics(&config);
+
+        assert_eq!(rows.len(), 1, "only the wildcard-covered upstream remains");
+        assert!(rows[0].contains("raw.githubusercontent.com"));
+        assert!(
+            !rows.iter().any(|s| s.contains("evil.example.com")),
+            "upstream outside the wildcard must be omitted, got: {rows:?}"
+        );
 
         handle.shutdown();
     }
@@ -1449,6 +2947,44 @@ mod tests {
         handle.shutdown();
     }
 
+    #[test]
+    fn test_proxy_env_vars_include_canonical_nono_no_proxy() -> Result<()> {
+        let (shutdown_tx, _shutdown_rx) = watch::channel(false);
+        let handle = ProxyHandle {
+            port: 12345,
+            token: Zeroizing::new("a".repeat(64)),
+            audit_log: audit::new_audit_log(),
+            shutdown_tx,
+            loaded_routes: std::collections::HashSet::new(),
+            no_proxy_hosts: vec![
+                "redis".to_string(),
+                ".internal.example".to_string(),
+                "::1".to_string(),
+            ],
+            managed_loopback_upstream: false,
+            canonical_no_proxy_hosts: vec![
+                "redis".to_string(),
+                "*.internal.example".to_string(),
+                "::1".to_string(),
+            ],
+            intercept_ca_env_vars: crate::config::default_intercept_ca_env_vars(),
+            intercept_ca_path: None,
+            diagnostics: Vec::new(),
+        };
+
+        let vars = handle.env_vars();
+
+        assert_eq!(
+            env_value(&vars, "NO_PROXY")?,
+            "localhost,127.0.0.1,redis,.internal.example,::1"
+        );
+        assert_eq!(
+            env_value(&vars, "NONO_NO_PROXY")?,
+            "localhost,127.0.0.1,redis,*.internal.example,::1"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_proxy_credential_env_vars() {
         let config = ProxyConfig {
@@ -1471,6 +3007,7 @@ mod tests {
                 tls_client_key: None,
                 oauth2: None,
                 aws_auth: None,
+                spiffe: None,
             }],
             ..Default::default()
         };
@@ -1497,7 +3034,10 @@ mod tests {
             shutdown_tx,
             loaded_routes: ["openai".to_string()].into_iter().collect(),
             no_proxy_hosts: Vec::new(),
+            managed_loopback_upstream: false,
+            canonical_no_proxy_hosts: Vec::new(),
             intercept_ca_path: None,
+            intercept_ca_env_vars: crate::config::default_intercept_ca_env_vars(),
             diagnostics: vec![],
         };
         let config = ProxyConfig {
@@ -1520,6 +3060,7 @@ mod tests {
                 tls_client_key: None,
                 oauth2: None,
                 aws_auth: None,
+                spiffe: None,
             }],
             ..Default::default()
         };
@@ -1555,7 +3096,10 @@ mod tests {
             shutdown_tx,
             loaded_routes: ["openai".to_string()].into_iter().collect(),
             no_proxy_hosts: Vec::new(),
+            managed_loopback_upstream: false,
+            canonical_no_proxy_hosts: Vec::new(),
             intercept_ca_path: None,
+            intercept_ca_env_vars: crate::config::default_intercept_ca_env_vars(),
             diagnostics: vec![],
         };
         let config = ProxyConfig {
@@ -1578,6 +3122,7 @@ mod tests {
                 tls_client_key: None,
                 oauth2: None,
                 aws_auth: None,
+                spiffe: None,
             }],
             ..Default::default()
         };
@@ -1618,7 +3163,10 @@ mod tests {
             // Only "openai" was loaded; "github" credential was unavailable
             loaded_routes: ["openai".to_string()].into_iter().collect(),
             no_proxy_hosts: Vec::new(),
+            managed_loopback_upstream: false,
+            canonical_no_proxy_hosts: Vec::new(),
             intercept_ca_path: None,
+            intercept_ca_env_vars: crate::config::default_intercept_ca_env_vars(),
             diagnostics: vec![],
         };
         let config = ProxyConfig {
@@ -1642,6 +3190,7 @@ mod tests {
                     tls_client_key: None,
                     oauth2: None,
                     aws_auth: None,
+                    spiffe: None,
                 },
                 crate::config::RouteConfig {
                     prefix: "github".to_string(),
@@ -1662,6 +3211,7 @@ mod tests {
                     tls_client_key: None,
                     oauth2: None,
                     aws_auth: None,
+                    spiffe: None,
                 },
             ],
             ..Default::default()
@@ -1690,6 +3240,62 @@ mod tests {
     }
 
     #[test]
+    fn test_proxy_credential_env_vars_injects_spiffe_phantom_token() {
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let handle = ProxyHandle {
+            port: 12345,
+            token: Zeroizing::new("session_token".to_string()),
+            audit_log: audit::new_audit_log(),
+            shutdown_tx,
+            loaded_routes: ["myapi".to_string()].into_iter().collect(),
+            no_proxy_hosts: Vec::new(),
+            managed_loopback_upstream: false,
+            canonical_no_proxy_hosts: Vec::new(),
+            intercept_ca_path: None,
+            intercept_ca_env_vars: crate::config::default_intercept_ca_env_vars(),
+            diagnostics: vec![],
+        };
+        let config = ProxyConfig {
+            routes: vec![crate::config::RouteConfig {
+                prefix: "myapi".to_string(),
+                upstream: "https://api.internal.corp".to_string(),
+                credential_key: None,
+                inject_mode: crate::config::InjectMode::Header,
+                inject_header: "Authorization".to_string(),
+                credential_format: None,
+                path_pattern: None,
+                path_replacement: None,
+                query_param_name: None,
+                proxy: None,
+                env_var: None,
+                endpoint_rules: vec![],
+                endpoint_policy: None,
+                tls_ca: None,
+                tls_client_cert: None,
+                tls_client_key: None,
+                oauth2: None,
+                aws_auth: None,
+                spiffe: Some(crate::config::SpiffeAuthConfig::Jwt {
+                    workload_api_socket: "/tmp/spire.sock".to_string(),
+                    audience: vec!["api.internal.corp".to_string()],
+                    inject_header: "Authorization".to_string(),
+                    credential_format: None,
+                    svid_hint: None,
+                }),
+            }],
+            ..Default::default()
+        };
+
+        let vars = handle.credential_env_vars(&config);
+        let api_key = vars.iter().find(|(k, _)| k == "MYAPI_API_KEY");
+        assert!(
+            api_key.is_some(),
+            "SPIFFE route should inject phantom API key"
+        );
+        assert_eq!(api_key.unwrap().1, "session_token");
+    }
+
+    #[test]
     fn test_proxy_credential_env_vars_strips_slashes() {
         // When prefix includes leading/trailing slashes, the env var name
         // must not contain slashes and the URL must not double-slash.
@@ -1703,7 +3309,10 @@ mod tests {
             shutdown_tx,
             loaded_routes: std::collections::HashSet::new(),
             no_proxy_hosts: Vec::new(),
+            managed_loopback_upstream: false,
+            canonical_no_proxy_hosts: Vec::new(),
             intercept_ca_path: None,
+            intercept_ca_env_vars: crate::config::default_intercept_ca_env_vars(),
             diagnostics: vec![],
         };
 
@@ -1728,6 +3337,7 @@ mod tests {
                 tls_client_key: None,
                 oauth2: None,
                 aws_auth: None,
+                spiffe: None,
             }],
             ..Default::default()
         };
@@ -1764,6 +3374,7 @@ mod tests {
                 tls_client_key: None,
                 oauth2: None,
                 aws_auth: None,
+                spiffe: None,
             }],
             ..Default::default()
         };
@@ -1796,7 +3407,10 @@ mod tests {
             shutdown_tx: shutdown_tx.clone(),
             loaded_routes: ["anthropic".to_string()].into_iter().collect(),
             no_proxy_hosts: Vec::new(),
+            managed_loopback_upstream: false,
+            canonical_no_proxy_hosts: Vec::new(),
             intercept_ca_path: None,
+            intercept_ca_env_vars: crate::config::default_intercept_ca_env_vars(),
             diagnostics: vec![],
         };
         let config_no_env_var = ProxyConfig {
@@ -1819,6 +3433,7 @@ mod tests {
                 tls_client_key: None,
                 oauth2: None,
                 aws_auth: None,
+                spiffe: None,
             }],
             ..Default::default()
         };
@@ -1840,7 +3455,10 @@ mod tests {
             shutdown_tx: shutdown_tx2,
             loaded_routes: ["anthropic".to_string()].into_iter().collect(),
             no_proxy_hosts: Vec::new(),
+            managed_loopback_upstream: false,
+            canonical_no_proxy_hosts: Vec::new(),
             intercept_ca_path: None,
+            intercept_ca_env_vars: crate::config::default_intercept_ca_env_vars(),
             diagnostics: vec![],
         };
         let config_fixed = ProxyConfig {
@@ -1863,6 +3481,7 @@ mod tests {
                 tls_client_key: None,
                 oauth2: None,
                 aws_auth: None,
+                spiffe: None,
             }],
             ..Default::default()
         };
@@ -1888,7 +3507,13 @@ mod tests {
                 "nats.internal:4222".to_string(),
                 "opencode.internal:4096".to_string(),
             ],
+            managed_loopback_upstream: false,
+            canonical_no_proxy_hosts: vec![
+                "nats.internal:4222".to_string(),
+                "opencode.internal:4096".to_string(),
+            ],
             intercept_ca_path: None,
+            intercept_ca_env_vars: crate::config::default_intercept_ca_env_vars(),
             diagnostics: vec![],
         };
 
@@ -1918,7 +3543,10 @@ mod tests {
             shutdown_tx,
             loaded_routes: std::collections::HashSet::new(),
             no_proxy_hosts: Vec::new(),
+            managed_loopback_upstream: false,
+            canonical_no_proxy_hosts: Vec::new(),
             intercept_ca_path: None,
+            intercept_ca_env_vars: crate::config::default_intercept_ca_env_vars(),
             diagnostics: vec![],
         };
 
@@ -1928,6 +3556,403 @@ mod tests {
             no_proxy.1, "localhost,127.0.0.1",
             "NO_PROXY should only contain loopback when no bypass hosts"
         );
+    }
+
+    #[test]
+    fn test_no_proxy_omits_loopback_for_managed_loopback_upstream() {
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let handle = ProxyHandle {
+            port: 12345,
+            token: Zeroizing::new("test_token".to_string()),
+            audit_log: audit::new_audit_log(),
+            shutdown_tx,
+            loaded_routes: std::collections::HashSet::new(),
+            no_proxy_hosts: Vec::new(),
+            managed_loopback_upstream: true,
+            canonical_no_proxy_hosts: Vec::new(),
+            intercept_ca_path: None,
+            intercept_ca_env_vars: crate::config::default_intercept_ca_env_vars(),
+            diagnostics: vec![],
+        };
+
+        let vars = handle.env_vars();
+        let no_proxy = vars.iter().find(|(k, _)| k == "NO_PROXY").unwrap();
+        assert_eq!(
+            no_proxy.1, "",
+            "loopback credential upstreams must traverse the proxy"
+        );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[tokio::test]
+    async fn test_profile_no_proxy_emits_uppercase_and_lowercase() -> Result<()> {
+        let config = ProxyConfig {
+            no_proxy: vec![
+                "redis".to_string(),
+                "*.internal.example".to_string(),
+                "REDIS".to_string(),
+                "[::1]".to_string(),
+            ],
+            ..Default::default()
+        };
+        let handle = start(config).await?;
+
+        let vars = handle.env_vars();
+        let upper = env_value(&vars, "NO_PROXY")?;
+        let lower = env_value(&vars, "no_proxy")?;
+        let canonical = env_value(&vars, "NONO_NO_PROXY")?;
+
+        assert_eq!(upper, "localhost,127.0.0.1,redis,.internal.example,::1");
+        assert_eq!(lower, upper);
+        assert_eq!(
+            canonical,
+            "localhost,127.0.0.1,redis,*.internal.example,::1"
+        );
+
+        handle.shutdown();
+        Ok(())
+    }
+
+    #[test]
+    fn test_no_proxy_route_matching_strips_direct_connect_ports() {
+        assert!(no_proxy_entry_matches_route(
+            "api.openai.com:443",
+            "api.openai.com:443"
+        ));
+        assert!(no_proxy_entry_matches_route(
+            ".openai.com",
+            "api.openai.com:443"
+        ));
+        assert!(
+            no_proxy_entry_matches_route("openai.com", "api.openai.com:443"),
+            "bare multi-label NO_PROXY entries are interpreted as suffix bypasses by common clients"
+        );
+        assert!(!no_proxy_entry_matches_route(
+            "api.anthropic.com:443",
+            "api.openai.com:443"
+        ));
+        assert!(no_proxy_entry_matches_route("::1", "[::1]:8080"));
+        assert!(no_proxy_entry_matches_route("[::1]", "[::1]:8080"));
+        assert!(no_proxy_entry_matches_route("[::1]:8080", "[::1]:8080"));
+    }
+
+    #[tokio::test]
+    async fn test_profile_no_proxy_rejects_allowed_host_conflicts() -> Result<()> {
+        for (allowed_host, no_proxy_entry) in [
+            ("api.internal.corp", ".internal.corp"),
+            ("*.internal.corp", ".api.internal.corp"),
+            ("redis", "redis"),
+        ] {
+            let config = ProxyConfig {
+                allowed_hosts: vec![allowed_host.to_string()],
+                no_proxy: vec![no_proxy_entry.to_string()],
+                ..Default::default()
+            };
+
+            let err = start(config).await.err().ok_or_else(|| {
+                ProxyError::Config(format!(
+                    "no_proxy entry {no_proxy_entry:?} should conflict with allowed_host {allowed_host:?}"
+                ))
+            })?;
+
+            assert!(
+                err.to_string().contains("conflicts with allowed_host"),
+                "expected allowed_host/no_proxy conflict error, got {err}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_no_proxy_route_matching_detects_wildcard_route_overlap() {
+        assert!(no_proxy_entry_matches_route(
+            "api.admin.dev.example.net",
+            "*.dev.example.net:443"
+        ));
+        assert!(no_proxy_entry_matches_route(
+            "admin.dev.example.net",
+            "*.dev.example.net:443"
+        ));
+        assert!(no_proxy_entry_matches_route(
+            "dev.example.net",
+            "*.dev.example.net:443"
+        ));
+        assert!(no_proxy_entry_matches_route(
+            "example.net",
+            "*.dev.example.net:443"
+        ));
+        assert!(no_proxy_entry_matches_route(
+            "*.example.net",
+            "*.dev.example.net:443"
+        ));
+        assert!(no_proxy_entry_matches_route(
+            ".admin.dev.example.net",
+            "*.dev.example.net:443"
+        ));
+        assert!(!no_proxy_entry_matches_route(
+            "api.other.example.net",
+            "*.dev.example.net:443"
+        ));
+        assert!(!no_proxy_entry_matches_route(
+            "evildev.example.net",
+            "*.dev.example.net:443"
+        ));
+    }
+
+    #[test]
+    fn test_no_proxy_route_matching_fails_closed_for_unparseable_routes() {
+        for route_host in [
+            "api.openai.com",
+            ":443",
+            "api.openai.com:notaport",
+            "[::1",
+            "[::1]:notaport",
+            "*.dev.example.net:notaport",
+        ] {
+            assert!(
+                no_proxy_entry_matches_route("redis", route_host),
+                "unparseable route host {route_host:?} must block profile no_proxy bypass"
+            );
+        }
+    }
+
+    #[test]
+    fn test_smart_no_proxy_entry_filters_ambiguous_bare_domains() -> Result<()> {
+        assert_eq!(smart_no_proxy_entry("github.com"), None);
+        assert_eq!(smart_no_proxy_entry("api.github.com:443"), None);
+        assert_eq!(smart_no_proxy_entry("redis"), Some("redis".to_string()));
+        assert_eq!(
+            smart_no_proxy_entry("127.0.0.1"),
+            Some("127.0.0.1".to_string())
+        );
+        assert_eq!(smart_no_proxy_entry("[::1]:443"), Some("::1".to_string()));
+        assert_eq!(smart_no_proxy_entry("*.internal.example:443"), None);
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[tokio::test]
+    async fn test_smart_no_proxy_excludes_route_upstreams() -> Result<()> {
+        let config = ProxyConfig {
+            allowed_hosts: vec!["api.openai.com".to_string()],
+            direct_connect_ports: vec![443],
+            routes: vec![crate::config::RouteConfig {
+                prefix: "openai".to_string(),
+                upstream: "https://api.openai.com/v1".to_string(),
+                credential_key: Some("openai".to_string()),
+                inject_mode: crate::config::InjectMode::Header,
+                inject_header: "Authorization".to_string(),
+                credential_format: None,
+                path_pattern: None,
+                path_replacement: None,
+                query_param_name: None,
+                proxy: None,
+                env_var: None,
+                endpoint_rules: Vec::new(),
+                endpoint_policy: None,
+                tls_ca: None,
+                tls_client_cert: None,
+                tls_client_key: None,
+                oauth2: None,
+                aws_auth: None,
+                spiffe: None,
+            }],
+            ..Default::default()
+        };
+        let handle = start(config).await?;
+
+        let vars = handle.env_vars();
+        let no_proxy = env_value(&vars, "NO_PROXY")?;
+        let no_proxy_entries: std::collections::HashSet<&str> = no_proxy.split(',').collect();
+
+        assert!(
+            !no_proxy_entries.contains("api.openai.com"),
+            "derived direct-connect bypass must not bypass credential route upstreams"
+        );
+
+        handle.shutdown();
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[tokio::test]
+    async fn test_smart_no_proxy_excludes_bare_parent_of_route_upstream() -> Result<()> {
+        let config = ProxyConfig {
+            allowed_hosts: vec!["openai.com".to_string()],
+            direct_connect_ports: vec![443],
+            routes: vec![crate::config::RouteConfig {
+                prefix: "openai".to_string(),
+                upstream: "https://api.openai.com/v1".to_string(),
+                credential_key: Some("openai".to_string()),
+                inject_mode: crate::config::InjectMode::Header,
+                inject_header: "Authorization".to_string(),
+                credential_format: None,
+                path_pattern: None,
+                path_replacement: None,
+                query_param_name: None,
+                proxy: None,
+                env_var: None,
+                endpoint_rules: Vec::new(),
+                endpoint_policy: None,
+                tls_ca: None,
+                tls_client_cert: None,
+                tls_client_key: None,
+                oauth2: None,
+                aws_auth: None,
+                spiffe: None,
+            }],
+            ..Default::default()
+        };
+        let handle = start(config).await?;
+
+        let vars = handle.env_vars();
+        let no_proxy = env_value(&vars, "NO_PROXY")?;
+        let no_proxy_entries: std::collections::HashSet<&str> = no_proxy.split(',').collect();
+
+        assert!(
+            !no_proxy_entries.contains("openai.com"),
+            "derived direct-connect bypass must not emit a bare parent domain that can bypass api.openai.com routes"
+        );
+
+        handle.shutdown();
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn test_profile_no_proxy_is_emitted_on_macos_proxy_only() -> Result<()> {
+        let config = ProxyConfig {
+            no_proxy: vec!["redis".to_string()],
+            ..Default::default()
+        };
+        let handle = start(config).await?;
+
+        let vars = handle.env_vars();
+        let no_proxy = env_value(&vars, "NO_PROXY")?;
+
+        assert_eq!(
+            no_proxy, "localhost,127.0.0.1,redis",
+            "explicit profile no_proxy entries should be emitted on macOS; Seatbelt still gates direct access"
+        );
+
+        handle.shutdown();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_profile_no_proxy_rejects_route_upstream_patterns() -> Result<()> {
+        let config = ProxyConfig {
+            no_proxy: vec![
+                "*.openai.com".to_string(),
+                ".openai.com".to_string(),
+                ".anthropic.com".to_string(),
+                "redis".to_string(),
+            ],
+            routes: vec![crate::config::RouteConfig {
+                prefix: "openai".to_string(),
+                upstream: "https://api.openai.com/v1".to_string(),
+                credential_key: Some("openai".to_string()),
+                inject_mode: crate::config::InjectMode::Header,
+                inject_header: "Authorization".to_string(),
+                credential_format: None,
+                path_pattern: None,
+                path_replacement: None,
+                query_param_name: None,
+                proxy: None,
+                env_var: None,
+                endpoint_rules: Vec::new(),
+                endpoint_policy: None,
+                tls_ca: None,
+                tls_client_cert: None,
+                tls_client_key: None,
+                oauth2: None,
+                aws_auth: None,
+                spiffe: None,
+            }],
+            ..Default::default()
+        };
+        let message = start_config_error(config).await?;
+
+        assert!(message.contains("no_proxy entry '*.openai.com' conflicts with route upstream"));
+        assert!(message.contains("api.openai.com:443"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_profile_no_proxy_rejects_ipv6_route_upstream_patterns() -> Result<()> {
+        let config = ProxyConfig {
+            no_proxy: vec![
+                "0:0:0:0:0:0:0:1".to_string(),
+                "[0:0:0:0:0:0:0:1]".to_string(),
+                "redis".to_string(),
+            ],
+            routes: vec![crate::config::RouteConfig {
+                prefix: "local".to_string(),
+                upstream: "http://[::1]:8080/v1".to_string(),
+                credential_key: Some("local".to_string()),
+                inject_mode: crate::config::InjectMode::Header,
+                inject_header: "Authorization".to_string(),
+                credential_format: None,
+                path_pattern: None,
+                path_replacement: None,
+                query_param_name: None,
+                proxy: None,
+                env_var: None,
+                endpoint_rules: Vec::new(),
+                endpoint_policy: None,
+                tls_ca: None,
+                tls_client_cert: None,
+                tls_client_key: None,
+                oauth2: None,
+                aws_auth: None,
+                spiffe: None,
+            }],
+            ..Default::default()
+        };
+        let message = start_config_error(config).await?;
+
+        assert!(message.contains("no_proxy entry '0:0:0:0:0:0:0:1' conflicts with route upstream"));
+        assert!(message.contains("[::1]:8080"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_profile_no_proxy_rejects_wildcard_route_upstream_overlap() -> Result<()> {
+        let config = ProxyConfig {
+            no_proxy: vec![
+                "*.example.net".to_string(),
+                ".admin.dev.example.net".to_string(),
+                ".dev.example.net".to_string(),
+                ".example.net".to_string(),
+                "redis".to_string(),
+            ],
+            routes: vec![crate::config::RouteConfig {
+                prefix: "internal".to_string(),
+                upstream: "https://*.dev.example.net".to_string(),
+                credential_key: Some("internal".to_string()),
+                inject_mode: crate::config::InjectMode::Header,
+                inject_header: "Authorization".to_string(),
+                credential_format: None,
+                path_pattern: None,
+                path_replacement: None,
+                query_param_name: None,
+                proxy: None,
+                env_var: None,
+                endpoint_rules: Vec::new(),
+                endpoint_policy: None,
+                tls_ca: None,
+                tls_client_cert: None,
+                tls_client_key: None,
+                oauth2: None,
+                aws_auth: None,
+                spiffe: None,
+            }],
+            ..Default::default()
+        };
+        let message = start_config_error(config).await?;
+        assert!(message.contains("no_proxy entry '*.example.net' conflicts with route upstream"));
+        assert!(message.contains("*.dev.example.net:443"));
+        Ok(())
     }
 
     #[tokio::test]
@@ -1953,29 +3978,92 @@ mod tests {
 
     #[cfg(not(target_os = "macos"))]
     #[tokio::test]
-    async fn test_no_proxy_includes_hosts_with_matching_connect_port() {
-        // When direct_connect_ports includes port 443, allowed_hosts on
-        // that port SHOULD appear in NO_PROXY (direct TCP is permitted).
-        // macOS always returns empty NO_PROXY (Seatbelt blocks all direct outbound).
+    async fn test_smart_no_proxy_filters_ambiguous_bare_domains() -> Result<()> {
+        // Smart-derived NO_PROXY keeps unambiguous single-label/IP direct
+        // grants, but must not emit bare multi-label DNS names because common
+        // clients interpret them as suffix bypasses.
         let config = ProxyConfig {
-            allowed_hosts: vec!["github.com".to_string(), "server.internal:4222".to_string()],
+            allowed_hosts: vec![
+                "github.com".to_string(),
+                "API.OPENAI.COM".to_string(),
+                "*.googleapis.com".to_string(),
+                "redis".to_string(),
+                "127.0.0.1".to_string(),
+                "[::1]".to_string(),
+                "169.254.169.254".to_string(),
+                "server.internal:4222".to_string(),
+            ],
             direct_connect_ports: vec![443],
             ..Default::default()
         };
-        let handle = start(config).await.unwrap();
+        let handle = start(config).await?;
 
         let vars = handle.env_vars();
-        let no_proxy = vars.iter().find(|(k, _)| k == "NO_PROXY").unwrap();
+        let no_proxy = env_value(&vars, "NO_PROXY")?;
         assert!(
-            no_proxy.1.contains("github.com"),
-            "host on port 443 should be in NO_PROXY when 443 is in direct_connect_ports"
+            !no_proxy.contains("github.com"),
+            "bare multi-label host must not be emitted as smart NO_PROXY"
         );
         assert!(
-            !no_proxy.1.contains("server.internal"),
+            !no_proxy.contains("API.OPENAI.COM") && !no_proxy.contains("api.openai.com"),
+            "uppercase bare multi-label host must not bypass smart NO_PROXY filtering"
+        );
+        assert!(
+            !no_proxy.contains(".googleapis.com") && !no_proxy.contains("googleapis.com"),
+            "wildcard allowlist entries must not be broadened into suffix NO_PROXY bypasses"
+        );
+        assert!(
+            no_proxy.contains("redis"),
+            "single-label alias should remain eligible for smart NO_PROXY"
+        );
+        assert!(
+            no_proxy.contains("127.0.0.1"),
+            "IP literals should remain eligible for smart NO_PROXY"
+        );
+        assert!(
+            no_proxy.contains("::1") && !no_proxy.contains("[::1]"),
+            "bracketed IPv6 smart NO_PROXY entries should emit portable unbracketed literals"
+        );
+        assert!(
+            !no_proxy.contains("169.254.169.254"),
+            "link-local metadata IPs must not be emitted as smart NO_PROXY"
+        );
+        assert!(
+            !no_proxy.contains("server.internal"),
             "host on port 4222 should NOT be in NO_PROXY when only 443 is allowed"
         );
 
         handle.shutdown();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_profile_no_proxy_rejects_link_local_and_metadata_bypass_entries() {
+        for entry in [
+            "169.254.169.254",
+            "169.254.1.2",
+            "internal",
+            "fd00:ec2::254",
+            "fd00:0ec2::254",
+            "fd00:ec2:0:0:0:0:0:254",
+            "[fd00:ec2::254]",
+            "[fd00:0ec2::254]",
+            "[fe80::1]",
+            "metadata.google.internal",
+            ".google.internal",
+        ] {
+            let config = ProxyConfig {
+                no_proxy: vec![entry.to_string()],
+                ..Default::default()
+            };
+
+            let result = start(config).await;
+
+            assert!(
+                result.is_err(),
+                "profile no_proxy entry {entry:?} must not bypass proxy deny invariants"
+            );
+        }
     }
 
     /// Regression test: when `strict_filter` is true and `allowed_hosts` is
@@ -2054,6 +4142,7 @@ mod tests {
                 tls_client_key: None,
                 oauth2: None,
                 aws_auth: None,
+                spiffe: None,
             }],
             intercept_ca_dir: Some(dir.path().to_path_buf()),
             ..Default::default()
@@ -2132,8 +4221,13 @@ mod tests {
         assert!(err.to_string().contains("malformed request line"));
     }
 
-    /// Regression for #1062: a denied non-CONNECT request must return 403
-    /// (not 400) and produce a `http` audit deny event.
+    /// Regression for #1062: a denied absolute-form `http://` request must
+    /// return 403 (not 400) and produce a deny audit event.
+    ///
+    /// Since #1334, absolute-form `http://` requests are handled by the
+    /// forward-proxy path (`handle_forward_http`), which audits denials under
+    /// `Reverse` mode rather than the old inline `Connect` mode. The 403
+    /// status, target, and port are unchanged.
     #[tokio::test]
     async fn test_denied_non_connect_returns_403_and_audits() {
         use tokio::io::AsyncReadExt;
@@ -2146,10 +4240,20 @@ mod tests {
         };
         let handle = start(config).await.unwrap();
         let addr = format!("127.0.0.1:{}", handle.port);
+        let token = handle.token.to_string();
 
         let mut stream = TcpStream::connect(&addr).await.unwrap();
-        let request = b"GET http://google.com/ HTTP/1.1\r\nHost: google.com\r\n\r\n";
-        tokio::io::AsyncWriteExt::write_all(&mut stream, request)
+        // Include valid proxy auth so the request reaches the host filter
+        // (rather than being rejected at the auth gate).
+        let creds = {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode(format!("nono:{}", token))
+        };
+        let request = format!(
+            "GET http://google.com/ HTTP/1.1\r\nHost: google.com\r\nProxy-Authorization: Basic {}\r\n\r\n",
+            creds
+        );
+        tokio::io::AsyncWriteExt::write_all(&mut stream, request.as_bytes())
             .await
             .unwrap();
 
@@ -2165,10 +4269,465 @@ mod tests {
         let events = handle.drain_audit_events();
         assert_eq!(events.len(), 1, "expected one audit event");
         let event = &events[0];
-        assert_eq!(event.mode, nono::undo::NetworkAuditMode::Connect);
+        assert_eq!(event.mode, nono::undo::NetworkAuditMode::Reverse);
         assert_eq!(event.decision, nono::undo::NetworkAuditDecision::Deny);
         assert_eq!(event.target, "google.com");
         assert_eq!(event.port, Some(80));
+
+        handle.shutdown();
+    }
+
+    // ========================================================================
+    // Forward-proxy (absolute-form http://) tests — issue #1334
+    // ========================================================================
+
+    #[test]
+    fn classify_request_target_detects_absolute_and_origin_forms() {
+        assert_eq!(
+            classify_request_target("GET http://example.com/path HTTP/1.1"),
+            RequestTargetForm::AbsoluteHttp
+        );
+        // Scheme match is case-insensitive.
+        assert_eq!(
+            classify_request_target("GET HTTP://example.com/ HTTP/1.1"),
+            RequestTargetForm::AbsoluteHttp
+        );
+        assert_eq!(
+            classify_request_target("CONNECT https://example.com/ HTTP/1.1"),
+            RequestTargetForm::AbsoluteHttps
+        );
+        assert_eq!(
+            classify_request_target("GET /openai/v1/chat HTTP/1.1"),
+            RequestTargetForm::Origin
+        );
+        // Malformed / empty lines are treated as origin-form (unaffected).
+        assert_eq!(classify_request_target("GET"), RequestTargetForm::Origin);
+        assert_eq!(classify_request_target(""), RequestTargetForm::Origin);
+    }
+
+    #[test]
+    fn rewrite_absolute_to_origin_form_produces_origin_line() {
+        assert_eq!(
+            rewrite_absolute_to_origin_form("GET http://host.example/p/q?a=1 HTTP/1.1").unwrap(),
+            "GET /p/q?a=1 HTTP/1.1\r\n"
+        );
+        // Bare authority with no path becomes "/".
+        assert_eq!(
+            rewrite_absolute_to_origin_form("GET http://host.example HTTP/1.1").unwrap(),
+            "GET / HTTP/1.1\r\n"
+        );
+        // Method and version are preserved verbatim.
+        assert_eq!(
+            rewrite_absolute_to_origin_form("POST http://host.example:8080/x HTTP/1.0").unwrap(),
+            "POST /x HTTP/1.0\r\n"
+        );
+    }
+
+    #[test]
+    fn strip_proxy_headers_removes_proxy_hop_by_hop_only() {
+        let headers = b"Host: example.com\r\nProxy-Connection: keep-alive\r\nProxy-Authorization: Basic abc\r\nAccept: */*\r\n";
+        let stripped = strip_proxy_headers(headers);
+        let s = String::from_utf8(stripped).unwrap();
+        assert!(s.contains("Host: example.com"));
+        assert!(s.contains("Accept: */*"));
+        assert!(
+            !s.to_lowercase().contains("proxy-connection"),
+            "Proxy-Connection must be stripped, got: {s:?}"
+        );
+        assert!(
+            !s.to_lowercase().contains("proxy-authorization"),
+            "Proxy-Authorization must be stripped, got: {s:?}"
+        );
+    }
+
+    /// Spawn a one-shot local HTTP/1.1 origin server that echoes the received
+    /// request line back in the body and returns 200. Returns its address and
+    /// a receiver that yields the raw request bytes it saw.
+    async fn spawn_echo_origin() -> (std::net::SocketAddr, tokio::sync::oneshot::Receiver<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let received = String::from_utf8_lossy(&buf[..n]).to_string();
+                let body = "ok";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(response.as_bytes()).await;
+                let _ = sock.flush().await;
+                let _ = tx.send(received);
+            }
+        });
+        (addr, rx)
+    }
+
+    /// Absolute-form http:// to an ALLOWED host is forwarded and returns the
+    /// upstream status. Also asserts the upstream saw an origin-form request
+    /// line with the proxy headers stripped.
+    #[tokio::test]
+    async fn forward_http_allowed_host_is_forwarded() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+
+        let (origin_addr, origin_rx) = spawn_echo_origin().await;
+
+        let config = ProxyConfig {
+            allowed_hosts: vec!["127.0.0.1".to_string()],
+            ..ProxyConfig::default()
+        };
+        let handle = start(config).await.unwrap();
+        let token = handle.token.to_string();
+
+        let mut stream = TcpStream::connect(("127.0.0.1", handle.port))
+            .await
+            .unwrap();
+        let creds = {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode(format!("nono:{}", token))
+        };
+        let request = format!(
+            "GET http://127.0.0.1:{}/hello?x=1 HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nProxy-Connection: keep-alive\r\nProxy-Authorization: Basic {}\r\nAccept: */*\r\n\r\n",
+            origin_addr.port(),
+            origin_addr.port(),
+            creds
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        let response_str = String::from_utf8_lossy(&response);
+        assert!(
+            response_str.starts_with("HTTP/1.1 200"),
+            "expected upstream 200 status, got: {}",
+            response_str
+        );
+
+        // The upstream must have seen an origin-form request line with the
+        // proxy headers stripped.
+        let received = origin_rx.await.unwrap();
+        assert!(
+            received.starts_with("GET /hello?x=1 HTTP/1.1"),
+            "upstream should see origin-form request line, got: {received:?}"
+        );
+        assert!(
+            !received.to_lowercase().contains("proxy-connection"),
+            "Proxy-Connection must not reach upstream: {received:?}"
+        );
+        assert!(
+            !received.to_lowercase().contains("proxy-authorization"),
+            "Proxy-Authorization must not reach upstream: {received:?}"
+        );
+        assert!(
+            received.contains("Accept: */*"),
+            "non-proxy headers must be preserved: {received:?}"
+        );
+
+        // An L7 audit event should have been recorded for the allowed request.
+        let events = handle.drain_audit_events();
+        assert!(
+            events
+                .iter()
+                .any(|e| e.decision == nono::undo::NetworkAuditDecision::Allow
+                    && e.target == "127.0.0.1"
+                    && e.status == Some(200)),
+            "expected an allow L7 audit event, got: {events:?}"
+        );
+
+        handle.shutdown();
+    }
+
+    /// The forward path is a TRANSPARENT proxy: it must never inject a managed
+    /// credential, even when credential-injecting routes are configured.
+    /// Credential injection is reserved for the reverse path (HTTPS or
+    /// http-loopback upstreams).
+    ///
+    /// The configured route carries an UNRESOLVABLE credential key. If the
+    /// forward path ever attempted injection it would fail credential
+    /// resolution and return 503 (the reverse path's missing-credential
+    /// behavior) — so a 200 with the client's own Authorization header intact
+    /// proves the forward path bypasses routing/injection entirely. We also
+    /// assert the audit event reports `managed_credential_active = false`.
+    #[tokio::test]
+    async fn forward_http_does_not_inject_managed_credential() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+
+        let (origin_addr, origin_rx) = spawn_echo_origin().await;
+
+        // A credential-injecting route whose key cannot resolve. The forward
+        // path must ignore it entirely rather than fail resolving it.
+        let config = ProxyConfig {
+            allowed_hosts: vec!["127.0.0.1".to_string()],
+            routes: vec![crate::config::RouteConfig {
+                prefix: "svc".to_string(),
+                upstream: "https://api.example.com".to_string(),
+                credential_key: Some("env://NONO_TEST_TOTALLY_MISSING".to_string()),
+                inject_mode: Default::default(),
+                inject_header: "Authorization".to_string(),
+                credential_format: Some("Bearer {}".to_string()),
+                path_pattern: None,
+                path_replacement: None,
+                query_param_name: None,
+                proxy: None,
+                env_var: None,
+                endpoint_rules: vec![],
+                endpoint_policy: None,
+                tls_ca: None,
+                tls_client_cert: None,
+                tls_client_key: None,
+                oauth2: None,
+                aws_auth: None,
+                spiffe: None,
+            }],
+            ..ProxyConfig::default()
+        };
+        let handle = start(config).await.unwrap();
+        let token = handle.token.to_string();
+
+        let mut stream = TcpStream::connect(("127.0.0.1", handle.port))
+            .await
+            .unwrap();
+        let creds = {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode(format!("nono:{}", token))
+        };
+        // The client sends its own Authorization header. A transparent proxy
+        // forwards it unchanged.
+        let request = format!(
+            "GET http://127.0.0.1:{}/data HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nProxy-Authorization: Basic {}\r\nAuthorization: Bearer client-token\r\n\r\n",
+            origin_addr.port(),
+            origin_addr.port(),
+            creds
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        let response_str = String::from_utf8_lossy(&response);
+        // 200 (not 503) proves no credential resolution/injection was attempted.
+        assert!(
+            response_str.starts_with("HTTP/1.1 200"),
+            "expected upstream 200 (no injection attempt), got: {}",
+            response_str
+        );
+
+        let received = origin_rx.await.unwrap();
+        // The client's own credential must survive verbatim, unmodified.
+        assert!(
+            received.contains("Authorization: Bearer client-token"),
+            "client Authorization must be forwarded verbatim: {received:?}"
+        );
+
+        // The audit event must record that no managed credential was active.
+        let events = handle.drain_audit_events();
+        let l7 = events
+            .iter()
+            .find(|e| e.status == Some(200))
+            .expect("expected an L7 audit event for the forwarded request");
+        assert_eq!(
+            l7.managed_credential_active,
+            Some(false),
+            "forward path must audit managed_credential_active=false: {l7:?}"
+        );
+
+        handle.shutdown();
+    }
+
+    /// Absolute-form http:// to a DENIED host returns 403 with an audit denial.
+    #[tokio::test]
+    async fn forward_http_denied_host_returns_403_and_audits() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+
+        // Allowlist a different host so 127.0.0.1 is denied.
+        let config = ProxyConfig {
+            allowed_hosts: vec!["example.com".to_string()],
+            ..ProxyConfig::default()
+        };
+        let handle = start(config).await.unwrap();
+        let token = handle.token.to_string();
+
+        let mut stream = TcpStream::connect(("127.0.0.1", handle.port))
+            .await
+            .unwrap();
+        let creds = {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode(format!("nono:{}", token))
+        };
+        let request = format!(
+            "GET http://denied.example.org/secret HTTP/1.1\r\nHost: denied.example.org\r\nProxy-Authorization: Basic {}\r\n\r\n",
+            creds
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        let response_str = String::from_utf8_lossy(&response);
+        assert!(
+            response_str.starts_with("HTTP/1.1 403"),
+            "expected 403 for denied host, got: {}",
+            response_str
+        );
+
+        let events = handle.drain_audit_events();
+        assert!(
+            events
+                .iter()
+                .any(|e| e.decision == nono::undo::NetworkAuditDecision::Deny
+                    && e.target == "denied.example.org"
+                    && e.denial_category
+                        == Some(nono::undo::NetworkAuditDenialCategory::HostDenied)),
+            "expected a HostDenied audit event, got: {events:?}"
+        );
+
+        handle.shutdown();
+    }
+
+    /// Absolute-form https:// is rejected with guidance to use CONNECT.
+    #[tokio::test]
+    async fn forward_https_absolute_form_is_rejected_with_connect_guidance() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+
+        let config = ProxyConfig {
+            allowed_hosts: vec!["example.com".to_string()],
+            ..ProxyConfig::default()
+        };
+        let handle = start(config).await.unwrap();
+
+        let mut stream = TcpStream::connect(("127.0.0.1", handle.port))
+            .await
+            .unwrap();
+        let request = b"GET https://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        stream.write_all(request).await.unwrap();
+
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        let response_str = String::from_utf8_lossy(&response);
+        assert!(
+            response_str.starts_with("HTTP/1.1 400"),
+            "expected 400 for absolute-form https, got: {}",
+            response_str
+        );
+        assert!(
+            response_str.to_lowercase().contains("connect"),
+            "response should direct the client to use CONNECT, got: {}",
+            response_str
+        );
+
+        handle.shutdown();
+    }
+
+    /// Missing/invalid Proxy-Authorization with the strict filter active is
+    /// rejected with 407 (matching the reverse-proxy no-credential branch).
+    #[tokio::test]
+    async fn forward_http_missing_proxy_auth_is_rejected_407() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+
+        let config = ProxyConfig {
+            allowed_hosts: vec!["127.0.0.1".to_string()],
+            ..ProxyConfig::default()
+        };
+        let handle = start(config).await.unwrap();
+
+        let mut stream = TcpStream::connect(("127.0.0.1", handle.port))
+            .await
+            .unwrap();
+        // No Proxy-Authorization header at all.
+        let request = b"GET http://127.0.0.1:9/hello HTTP/1.1\r\nHost: 127.0.0.1:9\r\n\r\n";
+        stream.write_all(request).await.unwrap();
+
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        let response_str = String::from_utf8_lossy(&response);
+        assert!(
+            response_str.starts_with("HTTP/1.1 407"),
+            "expected 407 for missing proxy auth, got: {}",
+            response_str
+        );
+
+        let events = handle.drain_audit_events();
+        assert!(
+            events
+                .iter()
+                .any(|e| e.decision == nono::undo::NetworkAuditDecision::Deny
+                    && e.denial_category
+                        == Some(nono::undo::NetworkAuditDenialCategory::AuthenticationFailed)),
+            "expected an AuthenticationFailed audit event, got: {events:?}"
+        );
+
+        handle.shutdown();
+    }
+
+    /// Regression guard: origin-form requests with routes configured still
+    /// route to the reverse proxy (unaffected by the forward-proxy dispatch).
+    #[tokio::test]
+    async fn origin_form_request_still_routes_to_reverse_proxy() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+
+        // A route whose credential is missing -> reverse proxy returns 503
+        // (managed credential unavailable). The point is that it reaches the
+        // reverse handler at all, not the forward path.
+        let config = ProxyConfig {
+            routes: vec![crate::config::RouteConfig {
+                prefix: "openai".to_string(),
+                upstream: "https://api.openai.com".to_string(),
+                credential_key: Some("env://NONO_TEST_TOTALLY_MISSING".to_string()),
+                inject_mode: Default::default(),
+                inject_header: "Authorization".to_string(),
+                credential_format: Some("Bearer {}".to_string()),
+                path_pattern: None,
+                path_replacement: None,
+                query_param_name: None,
+                proxy: None,
+                env_var: None,
+                endpoint_rules: vec![],
+                endpoint_policy: None,
+                tls_ca: None,
+                tls_client_cert: None,
+                tls_client_key: None,
+                oauth2: None,
+                aws_auth: None,
+                spiffe: None,
+            }],
+            ..Default::default()
+        };
+        let handle = start(config).await.unwrap();
+
+        let mut stream = TcpStream::connect(("127.0.0.1", handle.port))
+            .await
+            .unwrap();
+        let request = b"GET /openai/v1/models HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer whatever\r\n\r\n";
+        stream.write_all(request).await.unwrap();
+
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        let response_str = String::from_utf8_lossy(&response);
+        // The reverse handler answers 503 for a route with a missing managed
+        // credential. Any structured HTTP answer (not a dropped socket / 502
+        // forward failure) proves the reverse path handled it.
+        assert!(
+            response_str.starts_with("HTTP/1.1 503"),
+            "origin-form request must reach the reverse proxy (503 for missing \
+             credential), got: {}",
+            response_str
+        );
+
+        let events = handle.drain_audit_events();
+        assert!(
+            events
+                .iter()
+                .any(|e| e.mode == nono::undo::NetworkAuditMode::Reverse),
+            "expected a Reverse-mode audit event, got: {events:?}"
+        );
 
         handle.shutdown();
     }

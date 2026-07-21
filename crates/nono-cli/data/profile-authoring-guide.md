@@ -55,12 +55,48 @@ Inherit from another profile by name:
 ```
 
 - Inheritance chain max depth: 10.
+- The CLI `--extends <PROFILE>` flag composes a selected `--profile` for one
+  invocation. It is repeatable and prepends its bases to the profile JSON's
+  `extends` list, preserving left-to-right merge order while keeping the
+  selected profile as the final override layer. Inherited grants can widen
+  sandbox permissions.
 - Scalar fields: child overrides base.
-- Array fields (`groups.include`, `groups.exclude`, `commands.allow`, `commands.deny`, `filesystem.*`, `allow_domain`, `open_port`, `listen_port`, `rollback.*`, `upstream_bypass`): child values are appended to base values and deduplicated. To remove inherited entries, use `groups.exclude` for groups; there is no mechanism to remove inherited filesystem paths. For `allow_domain` entries with endpoint rules, rules for the same domain are merged (appended) rather than replaced.
+- Array fields (`groups.include`, `groups.exclude`, `commands.allow`, `commands.deny`, `filesystem.*`, `allow_domain`, `deny_domain`, `open_port`, `open_port_range`, `listen_port`, `listen_port_range`, `no_proxy`, `rollback.*`, `upstream_bypass`): child values are appended to base values and deduplicated. To remove inherited entries, use `groups.exclude` for groups; there is no mechanism to remove inherited filesystem paths. For `allow_domain` entries with endpoint rules, rules for the same domain are merged (appended) rather than replaced. `deny_domain` entries are additive — child profiles can only add more denies, never remove inherited ones.
 - Map fields (`env_credentials`, `hooks`, `custom_credentials`): child entries are merged into base; child keys override matching base keys.
 - `network_profile` supports three-state inheritance via `InheritableValue`: absent = inherit base value, `null` = explicitly clear, string = override. This is the only field that supports null-clearing.
 - `open_urls`: if the child provides the field (even as `{}`), it replaces the base entirely. If absent, the base value is inherited. Setting to `null` in JSON is equivalent to omitting it (both inherit the base).
 - `workdir`: child overrides base unless child is `"none"` (which inherits the base value instead).
+
+### platform_overrides
+
+Apply per-OS patches to the profile after `extends` resolution. Only the block matching the current platform is merged in; the others are ignored.
+
+```json
+{
+  "meta": { "name": "myprofile" },
+  "filesystem": {
+    "read": ["/tmp"]
+  },
+  "platform_overrides": {
+    "macos": {
+      "security": { "process_info_mode": "allow_all" },
+      "filesystem": { "read": ["/opt/homebrew", "~/Library/Caches"] }
+    },
+    "linux": {
+      "security": { "signal_mode": "isolated", "process_info_mode": "allow_same_sandbox" },
+      "filesystem": { "read": ["/usr/lib", "~/.cache"] }
+    }
+  }
+}
+```
+
+Merge semantics are identical to `extends`: array fields are dedup-appended, scalar fields are child-wins, deny-lists union. The override can only add or tighten — it cannot remove inherited paths or relax inherited deny rules.
+
+Valid platform keys are `macos`, `linux`, and `windows`. Unrecognised keys are a parse error.
+
+`extends` and `platform_overrides` are not allowed inside an override block. Nesting either is a parse error.
+
+Use `platform_overrides` when a single profile needs different paths or security modes per OS. Use group-level `when` predicates for package-level platform differences that are already handled by built-in groups.
 
 ### groups
 
@@ -84,7 +120,7 @@ Controls startup-time command gating. These checks run only at launch time and a
 
 tool-sandbox policies live under `command_policies`. Use `commands.<name>.executable` to bind a command name to one exact executable file instead of the first PATH match. By default, tool-sandbox rejects pinned executables and direct parent directories that are writable through the outer sandbox capability set. If a low-assurance profile intentionally grants write access overlapping a pinned executable, `commands.<name>.allow_writable_executable` is available as a per-command trust downgrade. It is valid only with an absolute `executable` path; relative paths and bare command names fail validation. For local demos, `command_policies.allow_writable_executables` disables the writable executable and parent-directory trust check across policy, deny-only, and outer executable allow-list paths. The agent still invokes the command name through the tool-sandbox shim. On macOS, tool-sandbox verifies the file before sandboxing but must still exec by path, so sandbox-writable pinned executables are not suitable for high-assurance policies.
 
-Command sandbox path lists (`fs_read`, `fs_write`, `fs_read_file`, `fs_write_file`) may use dynamic provider tokens. `@git:config-files` expands to trusted global/system Git config files and Git file settings such as attributes, excludes, and commit templates. `@git:hooks-path` expands to trusted global/system `core.hooksPath` directories. These tokens are opt-in per profile and ignore repo-local/worktree Git config so a checkout cannot grant itself extra host filesystem access.
+Command sandbox path lists (`fs_read`, `fs_write`, `fs_read_file`, `fs_write_file`) may use dynamic provider tokens. `@git:config-files` expands to trusted global/system Git config files, Git file settings (attributes, excludes, commit templates), and the declared target of every `include.path` and `includeIf.*.path` directive — including conditional includes that do not currently fire. `@git:hooks-path` expands to trusted global/system `core.hooksPath` directories. `@git:common-dir` expands to the git common directory (`.git` in a regular repo, or the absolute path to the main repo's `.git` in a worktree). `@git:worktree` expands to the main worktree root (empty in a regular repo). `@git:toplevel` expands to the current checkout root. `@git:toplevel-parent` expands to the parent of the current checkout root. These tokens are opt-in per profile and ignore repo-local/worktree Git config so a checkout cannot grant itself extra host filesystem access.
 
 ```json
 {
@@ -198,9 +234,9 @@ If a command uses a proxy credential, both layers must allow the operation. For 
                   "endpoint_policy": {
                     "default": "deny",
                     "allow": [
-                      { "method": "GET", "path": "/repos/always-further/nono/issues" },
-                      { "method": "GET", "path": "/repos/always-further/nono/issues/*" },
-                      { "method": "POST", "path": "/repos/always-further/nono/issues/*/comments" }
+                      { "method": "GET", "path": "/repos/nolabs-ai/nono/issues" },
+                      { "method": "GET", "path": "/repos/nolabs-ai/nono/issues/*" },
+                      { "method": "POST", "path": "/repos/nolabs-ai/nono/issues/*/comments" }
                     ],
                     "deny": [
                       {
@@ -233,7 +269,7 @@ If a command uses a proxy credential, both layers must allow the operation. For 
 }
 ```
 
-Endpoint policy uses the same decision order as invocation policy: `deny`, then `approve`, then `allow`, then `default`. A broad `deny` such as `{"method": "POST", "path": "/repos/always-further/nono/issues/**"}` will still win over a later `allow` for issue comments. Remove or narrow the deny when the mutation is intentionally allowed.
+Endpoint policy uses the same decision order as invocation policy: `deny`, then `approve`, then `allow`, then `default`. A broad `deny` such as `{"method": "POST", "path": "/repos/nolabs-ai/nono/issues/**"}` will still win over a later `allow` for issue comments. Remove or narrow the deny when the mutation is intentionally allowed.
 
 ### security
 
@@ -274,11 +310,16 @@ All path fields support variable expansion (see Section 6).
 | Field                   | Type                              | Default  | Description |
 |-------------------------|-----------------------------------|----------|-------------|
 | `block`                 | boolean                           | `false`  | Block all network access. |
+| `allow_http2`           | boolean                           | `false`  | Allow HTTP/2 to upstream servers via ALPN negotiation. Default is HTTP/1.1 with keep-alive. Equivalent to `--allow-http2`. |
 | `network_profile`       | string or null                    | inherit  | Name from `network-policy.json` for proxy filtering. Set to `null` to clear inherited value. |
 | `allow_domain`          | array of string or object         | `[]`     | Additional domains to allow through the proxy. Entries can be plain strings (CONNECT tunnel) or objects with endpoint rules (TLS-intercepted L7 filtering). Aliases: `proxy_allow`, `allow_proxy`. |
+| `deny_domain`           | array of string                   | `[]`     | Domains to block through the proxy regardless of the allowlist. Evaluated before `allow_domain`. Supports wildcard subdomains (`*.ads.example.com`). Equivalent to `--deny-domain`. |
 | `credentials`           | array of string                   | `[]`     | Credential services to enable via reverse proxy. Alias: `proxy_credentials`. |
-| `open_port`             | array of integer                  | `[]`     | Localhost TCP IPC. Aliases: `port_allow`, `allow_port`. Port **0**: macOS only (`localhost:*` outbound); Linux: explicit ports. |
-| `listen_port`           | array of integer                  | `[]`     | TCP ports the sandboxed child may listen on. |
+| `open_port`             | array of integer                  | `[]`     | Localhost TCP IPC (connect + bind). Aliases: `port_allow`, `allow_port`. Port **0**: macOS only (`localhost:*` outbound); Linux: explicit ports. |
+| `open_port_range`       | array of `[start, end]`           | `[]`     | Inclusive port ranges for bidirectional localhost TCP (connect + bind). Multiple ranges are supported. Example: `[[3000, 3010], [8000, 8100]]`. Each port becomes an individual rule; overlapping ranges are merged automatically. **macOS**: hard limit of 16,384 unique ports across all ranges (2¹⁴) due to `sandbox_init` rule limits. **Linux**: no limit beyond the 16-bit port space (1–65535). |
+| `listen_port`           | array of integer                  | `[]`     | TCP ports the sandboxed child may listen on (bind only). |
+| `listen_port_range`     | array of `[start, end]`           | `[]`     | Inclusive port ranges for TCP listen (bind only). Multiple ranges are supported. Example: `[[8000, 8100], [9000, 9010]]`. Overlapping ranges are merged automatically. Same platform limits as `open_port_range`. |
+| `no_proxy`              | array of string                   | `[]`     | Additional client-side `NO_PROXY` / `no_proxy` entries in proxy mode. This does not grant network access; direct connections still require matching sandbox permissions. Entries must be host patterns only (safe single-label local alias, canonical IP literal, `*.` wildcard suffix, or leading-dot suffix); bare multi-label domains, protected metadata suffix tokens, URLs, credentials, ports, paths, comma-separated lists, and `*` are rejected. |
 | `custom_credentials`    | map of string to credential def   | `{}`     | Custom credential route definitions (see below). Defines the route only — the proxy does not activate unless the service name also appears in `credentials`. |
 | `upstream_proxy`        | string                            | `null`   | Enterprise proxy address (`host:port`). Alias: `external_proxy`. |
 | `upstream_bypass`       | array of string                   | `[]`     | Hosts to bypass the upstream proxy. Supports `*.` wildcard suffixes. Alias: `external_proxy_bypass`. |
@@ -372,7 +413,7 @@ An individual entry in the `custom_credentials` map is configured as follows:
 
 ### credential_capture
 
-Defines supervisor-side commands that produce credentials for `cmd://` custom credential routes. The command runs lazily when the proxy first needs the credential; only the proxy receives stdout, and the sandboxed child never sees the command output.
+Defines supervisor-side commands and provider subprocesses that produce credentials for `cmd://` custom credential routes. Capture runs lazily when the proxy first needs the credential; only the proxy receives captured material, and the sandboxed child never sees the command output, provider output, or real credential.
 
 ```json
 {
@@ -398,6 +439,62 @@ Defines supervisor-side commands that produce credentials for `cmd://` custom cr
 }
 ```
 
+Provider-backed captures use a typed JSON protocol. The provider receives request metadata and provider-specific config on stdin and returns credential material on stdout. The provider does not route requests or inject credentials; `nono` still validates the phantom token, applies endpoint policy, validates provider output, and injects only on matching upstream requests.
+
+```json
+{
+  "network": {
+    "credentials": ["acme_mcp"],
+    "custom_credentials": {
+      "acme_mcp": {
+        "upstream": "https://mcp.acme.com",
+        "credential_key": "cmd://acme_mcp",
+        "env_var": "ACME_MCP_TOKEN",
+        "credential_format": "Bearer {}",
+        "endpoint_rules": [{ "method": "*", "path": "/mcp/**" }]
+      }
+    }
+  },
+  "credential_capture": {
+    "acme_mcp": {
+      "provider": {
+        "command": ["acme-nono-provider"],
+        "config": {
+          "issuer": "https://auth.acme.com",
+          "client_id": "abc123"
+        }
+      },
+      "timeout_secs": 30,
+      "cache_ttl_secs": 240
+    }
+  }
+}
+```
+
+Provider stdout must be JSON:
+
+```json
+{
+  "material": {
+    "type": "secret",
+    "value": "real-access-token"
+  }
+}
+```
+
+For multi-header output, configure `output.allow_headers` and return:
+
+```json
+{
+  "material": {
+    "type": "headers",
+    "headers": {
+      "Authorization": "Bearer real-access-token"
+    }
+  }
+}
+```
+
 | Field              | Type            | Required | Default | Description |
 |--------------------|-----------------|----------|---------|-------------|
 | `command`          | array of string | yes      | —       | Command and arguments. No shell interpolation is used. |
@@ -405,9 +502,9 @@ Defines supervisor-side commands that produce credentials for `cmd://` custom cr
 | `cache_ttl_secs`   | integer         | no       | `900`   | In-memory cache TTL, 0–3600 seconds. `0` disables caching. |
 | `ttl_secs`         | integer         | no       | `900`   | Older alias for `cache_ttl_secs`. Do not set both fields. |
 | `cache_path_regex` | string          | no       | host    | Regex evaluated against the request path. Capture group 1 becomes the cache scope; otherwise the full match is used. |
-| `stdin`            | string          | no       | `null`  | `null` closes stdin; `request_json` writes request metadata JSON to stdin. |
+| `stdin`            | string          | no       | `null`  | `null` closes stdin (unless `interaction.stdin` is `true`); `request_json` writes request metadata JSON to stdin. |
 | `output`           | string/object   | no       | `text`  | `text` captures stdout as one credential. `{"format":"json","allow_headers":[...]}` captures multiple headers. |
-| `interaction`      | object          | no       | none    | Explicit opt-in for capture commands that need inherited stdio or browser opening. |
+| `interaction`      | object          | no       | none    | Explicit opt-in for capture commands that need inherited stderr, inherited stdin, or browser opening. |
 
 Capture commands run with `NONO_SESSION_ID`, `NONO_REQUEST_HOST`, `NONO_REQUEST_PATH`, `NONO_REQUEST_METHOD`, `NONO_CACHE_SCOPE`, `NONO_CAPTURE_CREDENTIAL`, and `NONO_CAPTURE_ROUTE` set. Proxy environment variables are removed to avoid recursively using the same proxy route while capturing the credential.
 
@@ -419,9 +516,9 @@ Capture commands run with `NONO_SESSION_ID`, `NONO_REQUEST_HOST`, `NONO_REQUEST_
   "credential_name": "github",
   "route_id": "github",
   "request_host": "api.github.com",
-  "request_path": "/repos/always-further/nono/issues/787",
+  "request_path": "/repos/nolabs-ai/nono/issues/787",
   "request_method": "GET",
-  "cache_scope": "always-further"
+  "cache_scope": "nolabs-ai"
 }
 ```
 
@@ -465,6 +562,101 @@ Browser auth is command-scoped. Add `interaction.open_urls` to a specific captur
 
 When `open_urls` is configured, nono gives the capture command a temporary `BROWSER` helper and URL-opening socket. On macOS it also prepends an `open` shim to `PATH`. URL requests through those helpers are validated against that capture entry's `interaction.open_urls`, not the child sandbox's top-level `open_urls`. Non-URL `open` fallback through the shim is available only when `allow_launch_services` is true.
 
+### credential_providers and credential_routes
+
+`credential_providers` declare profile-driven OAuth providers for sandboxed `/login` flows where the agent may drive the CLI, but token endpoint responses are captured and rewritten before real token material reaches the sandbox. The sandbox receives phantom `nono_<64hex>` tokens; the proxy resolves those phantoms to real tokens only for declared `api_hosts` and route endpoint policy.
+
+`credential_routes` bind a provider to the sandbox-visible environment variables and optional API endpoint policy. Provider declarations are data, so local profiles and packs can define providers without adding Rust enum variants or merging provider-specific code.
+
+OAuth capture currently forces HTTP/1.1 for declared token hosts so the proxy can buffer and rewrite token responses before releasing them to the sandbox. HTTP/2 token response rewriting must be implemented before capture hosts can safely negotiate h2.
+
+When a client has its own CA-bundle environment variable, add it with
+`network.tls_intercept.ca_env_vars`. nono still sets the standard CA variables;
+profile entries add client-specific names that should point at the same
+generated trust bundle.
+
+```json
+{
+  "network": {
+    "tls_intercept": {
+      "ca_env_vars": ["CODEX_CA_CERTIFICATE"]
+    }
+  },
+  "credential_providers": {
+    "claude_code": {
+      "type": "oauth_capture",
+      "token_endpoints": [
+        {
+          "host": "https://platform.claude.com",
+          "path": "/v1/oauth/token",
+          "response_fields": [
+            { "path": "access_token", "kind": "opaque" },
+            { "path": "refresh_token", "kind": "opaque" },
+            { "path": "id_token", "kind": "jwt" }
+          ],
+          "request_body": "auto",
+          "request_nonce_fields": ["access_token", "refresh_token"]
+        }
+      ],
+      "api_hosts": ["https://api.anthropic.com"],
+      "credential_store": {
+        "type": "keychain_json",
+        "service": "Claude Code-credentials",
+        "account_candidates": ["unknown", "$USER", "claude-code-user"],
+        "phantom_fields": [
+          "claudeAiOauth.accessToken",
+          "claudeAiOauth.refreshToken"
+        ]
+      },
+      "helpers": {
+        "status": ["claude", "auth", "status", "--json"],
+        "login": ["claude", "auth", "login"],
+        "logout": ["claude", "auth", "logout"]
+      }
+    }
+  },
+  "credential_routes": [
+    {
+      "name": "anthropic_oauth",
+      "provider": "claude_code",
+      "env_var": "ANTHROPIC_AUTH_TOKEN",
+      "base_url_env_var": "ANTHROPIC_BASE_URL",
+      "endpoint_policy": {
+        "default": { "decision": "deny" },
+        "allow": [{ "method": "POST", "path": "/v1/messages" }]
+      }
+    }
+  ]
+}
+```
+
+| Provider field       | Type            | Required | Description |
+|----------------------|-----------------|----------|-------------|
+| `type`               | string          | yes      | Currently `oauth_capture`. |
+| `token_endpoints`    | array           | yes      | HTTPS OAuth token origins and exact paths whose JSON responses are captured and rewritten to phantom tokens. Configure every token-bearing path the client may use. |
+| `api_hosts`          | array           | yes      | HTTPS API URL origins where this provider's phantom tokens may be resolved on egress. |
+| `response_fields`    | array           | yes      | Token response fields to rewrite. Each entry declares a `path` and a visible phantom `kind` of `opaque` or `jwt`; use `jwt` only for locally parsed fields, not bearer tokens resent upstream. |
+| `request_body`       | string          | no       | Token request body format for refresh/exchange rewriting: `auto`, `json`, or `form`. |
+| `credential_store`   | object          | no       | Optional session/logout detection, such as a keychain JSON record or file JSON record with fields expected to contain phantoms. |
+| `helpers`            | object          | no       | Optional status, login, and logout commands for humans or CLI workflows. Commands are arrays and are not run through a shell. |
+
+The OAuth capture store lives under nono's state directory with owner-only
+permissions. It retains real token material for phantom resolution for up to 90
+days, capped at 4096 phantoms.
+
+Unmatched capture-host responses are inspected for common OAuth token field
+names as a fail-closed backstop. Providers that use unusual token field names
+still need exact `token_endpoints` and exhaustive `response_fields`; the backstop
+is not the primary capture policy.
+
+| Route field          | Type            | Required | Description |
+|----------------------|-----------------|----------|-------------|
+| `name`               | string          | yes      | Route name used in generated proxy routes and audit. |
+| `provider`           | string          | yes      | Provider key from `credential_providers`. |
+| `env_var`            | string          | no       | Optional environment variable for clients that can start from a sandbox-visible phantom. Many OAuth CLI clients instead receive phantoms by writing their captured credential store during login. |
+| `base_url_env_var`   | string          | no       | Environment variable that points SDKs or CLIs at the mediated proxy base URL. |
+| `endpoint_policy`    | object          | no       | Method/path policy for provider API egress. |
+
 ### env_credentials (alias: secrets)
 
 Maps keystore account names to environment variable names. Secrets are loaded from the system keystore (macOS Keychain / Linux Secret Service) under the service name "nono".
@@ -500,7 +692,7 @@ Controls which environment variables are passed to the sandboxed process. When `
 
 | Field         | Type            | Default | Description |
 |---------------|-----------------|---------|-------------|
-| `allow_vars`  | array of string | `[]`    | Allow-list of environment variable names. Supports exact names (`"PATH"`) and prefix patterns ending with `*` (`"AWS_*"` matches `AWS_REGION`, `AWS_SECRET_ACCESS_KEY`, etc.). The `*` wildcard is only valid as a trailing suffix. When the `environment` section is omitted entirely, all variables are allowed. When present with an empty array, no inherited variables are passed (only nono-injected credentials). Nono-injected credentials always bypass this list. |
+| `allow_vars`  | array of string | absent  | Allow-list of environment variable names. Supports exact names (`"PATH"`) and prefix patterns ending with `*` (`"AWS_*"` matches `AWS_REGION`, `AWS_SECRET_ACCESS_KEY`, etc.). The `*` wildcard is only valid as a trailing suffix. When omitted (or when the `environment` section is absent entirely), all variables pass through. When explicitly set to `[]`, no inherited variables are passed (only nono-injected credentials). When non-empty, only matching variables pass. Nono-injected credentials always bypass this list. |
 | `deny_vars`   | array of string | `[]`    | Deny-list of environment variable names stripped from the child. Same pattern syntax as `allow_vars` (exact names and trailing `*`). Denied vars are stripped even if they also match `allow_vars`. |
 | `set_vars`    | object (string→string) | `{}` | Static environment variables injected after allow/deny filtering and before credential injection (injected credentials win on conflict). Values support the same expansion as profile paths (`$HOME`, `~`, `$WORKDIR`, `$TMPDIR`, `$XDG_*`, `$NONO_CONFIG`, `$NONO_PACKAGES`); keys are not expanded. `PATH` and any `NONO_*` key are reserved and rejected at load time. Unlike inherited host vars, keys here are NOT subject to the dangerous-variable blocklist (`LD_PRELOAD`, `NODE_OPTIONS`, …) — setting one is an explicit operator decision. |
 
@@ -888,13 +1080,14 @@ Supported predicate forms include `linux`, `macos`, `linux:fedora`, `linux:rhel-
 - `filesystem.suppress_save_prompt` only suppresses save-profile suggestions. It does not grant access, remove deny rules, or hide diagnostics.
 - `groups.exclude` removes groups from the resolved set. This weakens the sandbox. Use it only when you understand which protections you are removing.
 - `extends` chains resolve recursively up to depth 10. Circular inheritance is an error.
+- `platform_overrides` is applied after all `extends` inheritance is resolved. The override for the current platform is merged as a child, so its values win over inherited ones. Override blocks cannot themselves use `extends` or `platform_overrides`.
 - Prefer `when` predicates for package-specific platform differences. Put shared OS baseline paths in built-in policy groups instead.
 - `network.block: true` blocks all network access. It cannot be combined with proxy settings.
 - `custom_credentials` upstream URLs must use HTTPS. HTTP is only accepted for loopback addresses (localhost, 127.0.0.1, ::1).
 
 ## 9. Migration from previous schema
 
-Issue [#594](https://github.com/always-further/nono/issues/594) restructured the profile JSON schema. The old `policy.*` namespace has been dissolved into `filesystem`, `groups`, and `commands`; `security.groups` and `security.allowed_commands` have moved to top-level `groups.include` and `commands.allow`.
+Issue [#594](https://github.com/nolabs-ai/nono/issues/594) restructured the profile JSON schema. The old `policy.*` namespace has been dissolved into `filesystem`, `groups`, and `commands`; `security.groups` and `security.allowed_commands` have moved to top-level `groups.include` and `commands.allow`.
 
 Legacy keys still deserialize — profiles using the old names continue to load and emit a single deprecation warning — but they are scheduled for removal in **v1.0.0**. New profiles and edits should use the canonical keys below.
 

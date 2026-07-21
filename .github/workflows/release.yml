@@ -20,7 +20,7 @@ env:
 
 jobs:
   build:
-    if: github.repository == 'always-further/nono'
+    if: github.repository == 'nolabs-ai/nono'
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     strategy:
@@ -70,10 +70,14 @@ jobs:
       - name: Build
         if: matrix.target != 'aarch64-unknown-linux-gnu'
         run: cargo build --release --target ${{ matrix.target }} -p nono-cli
+        env:
+          NONO_INSTALL_SOURCE: github_release
 
       - name: Build (cross aarch64-unknown-linux-gnu)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: cross build --release --target aarch64-unknown-linux-gnu -p nono-cli
+        env:
+          NONO_INSTALL_SOURCE: github_release
 
       # The portable .tar.gz artifacts carry no dependency metadata, so a binary
       # that links libdbus would fail to start on hosts without it. The Linux
@@ -166,7 +170,7 @@ jobs:
           merge-multiple: true
 
       - name: Attest build provenance
-        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
         with:
           subject-path: |
             artifacts/**/*.tar.gz
@@ -195,7 +199,7 @@ jobs:
           find . -name "*.tar.gz" -exec mv {} . \;
           find . -name "*.deb" -exec mv {} . \;
           find . -name "*.rpm" -exec mv {} . \;
-          sha256sum *.tar.gz *.deb *.rpm > SHA256SUMS.txt
+          sha256sum -- *.tar.gz *.deb *.rpm > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
       - name: Create GitHub Release
@@ -275,23 +279,6 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
-  update-homebrew-core:
-    name: Bump Homebrew Core Formula
-    needs: release
-    runs-on: ubuntu-latest
-    if: ${{ !contains(github.event.inputs.tag || github.ref_name, 'alpha') && !contains(github.event.inputs.tag || github.ref_name, 'beta') && !contains(github.event.inputs.tag || github.ref_name, 'rc') }}
-    steps:
-      - name: Bump homebrew-core formula
-        # Pinned to AvesAlight fork (v4.1.1) which accepts any 3xx redirect; revert to mislav once
-        # https://github.com/mislav/bump-homebrew-formula-action/issues/340 is fixed upstream.
-        uses: AvesAlight/bump-homebrew-formula-action@efacc598ed9b4b1bc526125f82d2dfba17509842 # v4.1.1
-        with:
-          formula-name: nono
-          tag-name: ${{ env.RELEASE_TAG }}
-          download-url: "https://github.com/always-further/nono/archive/refs/tags/${{ env.RELEASE_TAG }}.tar.gz"
-        env:
-          COMMITTER_TOKEN: ${{ secrets.HOMEBREW_CORE_TOKEN }}
-
   notify-downstream:
     name: Notify Downstream Repos
     needs: [release, publish-crates]
@@ -301,10 +288,10 @@ jobs:
       fail-fast: false
       matrix:
         repo:
-          - always-further/nono-py
-          - always-further/nono-ts
-          - always-further/nono-go
-          - always-further/nono-docs
+          - nolabs-ai/nono-py
+          - nolabs-ai/nono-ts
+          - nolabs-ai/nono-go
+          - nolabs-ai/nono-docs
     steps:
       - name: Dispatch to ${{ matrix.repo }}
         uses: peter-evans/repository-dispatch@28959ce8df70de7be546dd1250a005dd32156697 # v4.0.1

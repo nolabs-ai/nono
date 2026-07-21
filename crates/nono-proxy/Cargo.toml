@@ -1,6 +1,6 @@
 [package]
 name = "nono-proxy"
-version = "0.65.1"
+version = "0.69.0"
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
@@ -18,7 +18,7 @@ default = ["system-keyring"]
 system-keyring = ["nono/system-keyring"]
 
 [dependencies]
-nono = { version = "0.65.1", path = "../nono", default-features = false }
+nono = { version = "0.69.0", path = "../nono", default-features = false }
 tokio.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
@@ -31,13 +31,24 @@ zeroize.workspace = true
 sha2.workspace = true
 getrandom.workspace = true
 base64 = "0.22"
+regex = "1"
 subtle = "2"
 url.workspace = true
 urlencoding = "2"
 globset.workspace = true
 
+# AWS SigV4 signing support (smithy-rs, no service SDK required)
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+aws-sigv4 = { version = "1", features = ["sign-http", "http1"] }
+aws-credential-types = { version = "1", features = ["hardcoded-credentials"] }
+
 # TLS for upstream connections (reverse proxy mode)
-hyper-rustls = { version = "0.27", features = ["http1", "ring", "webpki-tokio"] }
+hyper-rustls = { version = "0.27", features = ["http1", "http2", "ring", "webpki-tokio"] }
+# HTTP/2 framing for CONNECT-intercept h2 forwarding (gRPC support)
+h2 = "0.4"
+bytes = "1"
+http = "1"
+tower-service = "0.3"
 tokio-rustls = "0.26"
 rustls = { version = "0.23", features = ["ring"] }
 webpki-roots = "1"
@@ -57,6 +68,10 @@ rustls-native-certs = "0.8"
 # transitive dep of rcgen; declared explicitly because we use OffsetDateTime
 # directly to set not_before/not_after.
 time = { version = "0.3", default-features = false, features = ["std"] }
+
+# SPIFFE Workload API client. Aliased to avoid colliding with any future `spiffe`
+# naming in the workspace.
+spiffe-workload = { package = "spiffe", version = "0.16", features = ["jwt-source"] }
 
 [dev-dependencies]
 tempfile.workspace = true

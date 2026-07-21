@@ -16,7 +16,7 @@
 use crate::cli::PullArgs;
 use crate::package::ProfileProvider;
 use crate::package_cmd;
-use crate::registry_client::{RegistryClient, resolve_registry_url};
+use crate::registry_client::{PullReason, RegistryClient, resolve_registry_url};
 use colored::Colorize;
 use nono::Result;
 use std::io::{self, BufRead, IsTerminal, Write};
@@ -29,7 +29,7 @@ const ENV_NO_MIGRATE: &str = "NONO_NO_MIGRATE";
 /// Surfaced in both the install confirmation and the decline-path hint
 /// so users have a way to investigate before they say yes (or come
 /// back to after they say no).
-const LEARN_MORE_URL: &str = "https://github.com/always-further/nono/discussions/780";
+const LEARN_MORE_URL: &str = "https://github.com/nolabs-ai/nono/discussions/780";
 
 /// Profile names this CLI knows about as official, vetted packs.
 /// Fast-path for the common case so users don't pay a network round
@@ -43,7 +43,7 @@ const LEARN_MORE_URL: &str = "https://github.com/always-further/nono/discussions
 const OFFICIAL_PACKS: &[OfficialPack] = &[
     OfficialPack {
         profile_name: "claude",
-        namespace: "always-further",
+        namespace: "nolabs-ai",
         pack_name: "claude",
         description: Some("Anthropic Claude Code sandbox profile + plugin"),
         installs_summary: Some("sandbox profile + Claude Code plugin (hooks, skill)"),
@@ -52,24 +52,24 @@ const OFFICIAL_PACKS: &[OfficialPack] = &[
     // renamed to `claude` so it matches the pack name. Once the pack
     // is installed, the resolver also accepts `claude-code` via the
     // artifact's `aliases` field. This entry only matters for users
-    // who type `--profile always-further/claude` *before* the pack is installed.
+    // who type `--profile nolabs-ai/claude` *before* the pack is installed.
     OfficialPack {
         profile_name: "claude-code",
-        namespace: "always-further",
+        namespace: "nolabs-ai",
         pack_name: "claude",
         description: Some("Anthropic Claude Code (legacy profile name; canonical is `claude`)"),
         installs_summary: Some("sandbox profile + Claude Code plugin (hooks, skill)"),
     },
     OfficialPack {
         profile_name: "codex",
-        namespace: "always-further",
+        namespace: "nolabs-ai",
         pack_name: "codex",
         description: Some("OpenAI Codex CLI sandbox profile + plugin"),
         installs_summary: Some("sandbox profile + Codex plugin (hooks, skill)"),
     },
     OfficialPack {
         profile_name: "opencode",
-        namespace: "always-further",
+        namespace: "nolabs-ai",
         pack_name: "opencode",
         description: Some("OpenCode AI coding assistant sandbox profile + plugin"),
         installs_summary: Some("sandbox profile + OpenCode plugin (hooks, skill)"),
@@ -166,7 +166,7 @@ pub fn check_and_run(profile_name: &str) -> Result<MigrationOutcome> {
 }
 
 fn is_claude_pack(provider: &ProfileProvider) -> bool {
-    provider.namespace == "always-further" && provider.name == "claude"
+    provider.namespace == "nolabs-ai" && provider.name == "claude"
 }
 
 fn official_pack_for(profile_name: &str) -> Option<&'static OfficialPack> {
@@ -291,17 +291,20 @@ fn write_field<W: Write>(out: &mut W, label: &str, value: &str, label_w: usize) 
 }
 
 fn run_pull(pack_ref: &str) -> Result<()> {
-    package_cmd::run_pull(PullArgs {
-        package_ref: pack_ref.to_string(),
-        registry: None,
-        // Migration only triggers when the resolver couldn't find the
-        // pack-provided profile. The lockfile may still claim "up to
-        // date" if the user wiped the pack dir manually — force
-        // re-install so the files actually exist before we retry.
-        force: true,
-        init: false,
-        help: None,
-    })?;
+    package_cmd::run_pull(
+        PullArgs {
+            package_ref: pack_ref.to_string(),
+            registry: None,
+            // Migration only triggers when the resolver couldn't find the
+            // pack-provided profile. The lockfile may still claim "up to
+            // date" if the user wiped the pack dir manually — force
+            // re-install so the files actually exist before we retry.
+            force: true,
+            init: false,
+            help: None,
+        },
+        PullReason::Migration,
+    )?;
     Ok(())
 }
 
@@ -312,7 +315,7 @@ mod tests {
 
     #[test]
     fn registry_ref_skips_migration() {
-        assert!(is_path_or_registry_ref("always-further/claude"));
+        assert!(is_path_or_registry_ref("nolabs-ai/claude"));
         assert!(is_path_or_registry_ref("./local.json"));
         assert!(is_path_or_registry_ref("path/to/profile.json"));
         assert!(!is_path_or_registry_ref("claude-code"));
@@ -345,7 +348,7 @@ mod tests {
             .expect("claude-code")
             .as_provider();
         assert_eq!(canonical.pack_ref(), legacy.pack_ref());
-        assert_eq!(canonical.pack_ref(), "always-further/claude");
+        assert_eq!(canonical.pack_ref(), "nolabs-ai/claude");
     }
 
     #[test]

@@ -1,10 +1,324 @@
 # Changelog
 
+## [0.69.0] - 2026-07-20
+
+### Bug Fixes
+
+- *(proxy)* Don't cross-deny sibling routes sharing an upstream (#1437) ([#1437](https://github.com/nolabs-ai/nono/pull/1437))
+
+- *(tool-sandbox)* Attribute daemonized callers to their command (cgroup on linux, verified daemon-pid on macos) (#1417) ([#1417](https://github.com/nolabs-ai/nono/pull/1417))
+
+- *(exec)* Raise MAX_CRYPTO_THREADS to 12 for macOS libdispatch workqueue threads (#1424) ([#1424](https://github.com/nolabs-ai/nono/pull/1424))
+
+- *(sandbox)* Allow exec in writable grant-dirs under command policies (#1391) ([#1391](https://github.com/nolabs-ai/nono/pull/1391))
+
+
+### Documentation
+
+- *(profiles)* Fix codeblock (#1426) ([#1426](https://github.com/nolabs-ai/nono/pull/1426))
+
+
+### Features
+
+- Add profile-declared no_proxy bypass support (#1415) ([#1415](https://github.com/nolabs-ai/nono/pull/1415))
+
+- *(proxy)* Add SPIFFE/SPIRE workload identity auth for upstream routes (#1272) ([#1272](https://github.com/nolabs-ai/nono/pull/1272))
+
+
+### Bug
+
+- Fix SigV4 URI generation errors for uri's that have encoded characters in them (#1430) ([#1430](https://github.com/nolabs-ai/nono/pull/1430))
+
+## [0.68.0] - 2026-07-14
+
+### Bug Fixes
+
+- *(tool-sandbox)* Preserve argv[0] for symlink-dispatched commands (#1413) ([#1413](https://github.com/nolabs-ai/nono/pull/1413))
+
+- *(sandbox)* Keep orphaned descendants in supervisor ancestry for seccomp-notify mediation (#1401) ([#1401](https://github.com/nolabs-ai/nono/pull/1401))
+
+- *(profile)* Omit inheritable Option fields when None on save (#1400) (#1402) ([#1402](https://github.com/nolabs-ai/nono/pull/1402))
+
+- *(sandbox)* Grant Refer in execute-restriction layer on Linux (#1397) ([#1397](https://github.com/nolabs-ai/nono/pull/1397))
+
+- Missing ~/.cache on macOS (#1378) ([#1378](https://github.com/nolabs-ai/nono/pull/1378))
+
+- *(tool-sandbox)* Grant env-shebang scripts their re-exec interpreter (#1394) ([#1394](https://github.com/nolabs-ai/nono/pull/1394))
+
+- *(registry)* Add X-Nono-Pull-Reason header to distinguish pull triggers (#1383) (#1386) ([#1386](https://github.com/nolabs-ai/nono/pull/1386))
+
+- *(profile)* Preserve platform_overrides through extends resolution (#1380) ([#1380](https://github.com/nolabs-ai/nono/pull/1380))
+
+- *(command-policy)* Resolve command_policies binaries once, in parallel, with caching (#1373) ([#1373](https://github.com/nolabs-ai/nono/pull/1373))
+
+- *(why)* Respect proxy domain filter in --profile and --self host queries (#1372) ([#1372](https://github.com/nolabs-ai/nono/pull/1372))
+
+- *(proxy)* Skip credential_capture entries with missing helper binaries (#1368) ([#1368](https://github.com/nolabs-ai/nono/pull/1368))
+
+
+### Dependencies
+
+- *(deps)* Bump sigstore-trust-root from 0.9.0 to 0.11.0 (#1410) ([#1410](https://github.com/nolabs-ai/nono/pull/1410))
+
+- *(deps)* Bump bytes from 1.12.0 to 1.12.1 (#1408) ([#1408](https://github.com/nolabs-ai/nono/pull/1408))
+
+- *(deps)* Bump regex from 1.12.4 to 1.13.0 (#1406) ([#1406](https://github.com/nolabs-ai/nono/pull/1406))
+
+- *(deps)* Bump sigstore-sign from 0.10.0 to 0.11.0 (#1407) ([#1407](https://github.com/nolabs-ai/nono/pull/1407))
+
+- *(deps)* Bump crossbeam-epoch from 0.9.18 to 0.9.20 (#1369) ([#1369](https://github.com/nolabs-ai/nono/pull/1369))
+
+- *(deps)* Bump clap_complete from 4.6.5 to 4.6.7 (#1360) ([#1360](https://github.com/nolabs-ai/nono/pull/1360))
+
+- *(deps)* Bump ignore from 0.4.26 to 0.4.27 (#1363) ([#1363](https://github.com/nolabs-ai/nono/pull/1363))
+
+- *(deps)* Bump time from 0.3.52 to 0.3.53 (#1358) ([#1358](https://github.com/nolabs-ai/nono/pull/1358))
+
+- *(deps)* Bump rand from 0.10.1 to 0.10.2 (#1362) ([#1362](https://github.com/nolabs-ai/nono/pull/1362))
+
+- *(deps)* Bump sigstore-sign from 0.8.0 to 0.10.0 (#1361) ([#1361](https://github.com/nolabs-ai/nono/pull/1361))
+
+- *(deps)* Bump docker/setup-buildx-action from 4.1.0 to 4.2.0 (#1359) ([#1359](https://github.com/nolabs-ai/nono/pull/1359))
+
+- *(deps)* Bump docker/login-action from 4.2.0 to 4.4.0 (#1357) ([#1357](https://github.com/nolabs-ai/nono/pull/1357))
+
+- *(deps)* Bump nolabs-ai/agent-sign from 0.0.11 to 0.1.0 (#1355) ([#1355](https://github.com/nolabs-ai/nono/pull/1355))
+
+- *(deps)* Bump docker/setup-qemu-action from 4.1.0 to 4.2.0 (#1354) ([#1354](https://github.com/nolabs-ai/nono/pull/1354))
+
+- *(deps)* Bump docker/build-push-action from 7.2.0 to 7.3.0 (#1356) ([#1356](https://github.com/nolabs-ai/nono/pull/1356))
+
+
+### Documentation
+
+- *(codex)* Clarify codex docs around the optional login-shell hardening (#1381) ([#1381](https://github.com/nolabs-ai/nono/pull/1381))
+
+
+### Features
+
+- *(resources)* Cap sandbox process count with --max-processes (cgroup v2 pids.max) (#1403) ([#1403](https://github.com/nolabs-ai/nono/pull/1403))
+
+- Add port range support to sandbox profiles (#1398) ([#1398](https://github.com/nolabs-ai/nono/pull/1398))
+
+- *(policy)* Add bun runtime preset (#1305) ([#1305](https://github.com/nolabs-ai/nono/pull/1305))
+
+- *(proxy)* Support plain HTTP forward-proxying via HTTP_PROXY (#1335) ([#1335](https://github.com/nolabs-ai/nono/pull/1335))
+
+- *(tool-sandbox)* Add per-command exec_paths for multi-call binaries (#1384) ([#1384](https://github.com/nolabs-ai/nono/pull/1384))
+
+- *(proxy)* Add deny_domain to block domains through the proxy (#1374) ([#1374](https://github.com/nolabs-ai/nono/pull/1374))
+
+- *(profile)* Add platform_overrides field for per-OS profile patches (#1371) ([#1371](https://github.com/nolabs-ai/nono/pull/1371))
+
+
+### Miscellaneous
+
+- Migrate registry namespace references from always-further to nolabs-ai (#1405) ([#1405](https://github.com/nolabs-ai/nono/pull/1405))
+
+## [0.67.1] - 2026-07-06
+
+### Bug Fixes
+
+- *(release)* Strip ./ prefix from SHA256SUMS.txt entries (#1352) ([#1352](https://github.com/nolabs-ai/nono/pull/1352))
+
+## [0.67.0] - 2026-07-06
+
+### Bug Fixes
+
+- *(tool-sandbox)* Resolve command policy paths against the live cwd (#1339) ([#1339](https://github.com/nolabs-ai/nono/pull/1339))
+
+- Use permanent community link across project (#1349) ([#1349](https://github.com/nolabs-ai/nono/pull/1349))
+
+- *(cli)* Match intercept args after global options (#1344) ([#1344](https://github.com/nolabs-ai/nono/pull/1344))
+
+- *(oauth)* Harden capture security boundaries
+
+- *(tool-sandbox)* Strip untrusted unsafe_macos_seatbelt_rules before emission
+
+- *(tool-sandbox)* Warn on unsafe_macos_seatbelt_rules nested in command/intercept sandboxes
+
+- *(tests)* Raise credential-capture test timeout to reduce macOS CI flakiness
+
+- *(trust)* Add predicate field to distinguish nono trust policies from foreign JSON (#1333) ([#1333](https://github.com/nolabs-ai/nono/pull/1333))
+
+- *(linux)* Use u64 for fs_type_unsupported to fix musl build (#1332) ([#1332](https://github.com/nolabs-ai/nono/pull/1332))
+
+- *(tests)* Share stdin-manipulation lock between capture_helper stdin tests (#1327) ([#1327](https://github.com/nolabs-ai/nono/pull/1327))
+
+- *(pty)* Drain late terminal query reply on teardown (#1258) ([#1258](https://github.com/nolabs-ai/nono/pull/1258))
+
+- *(tool-sandbox)* Ack frame before SCM_RIGHTS send to prevent EMSGSIZE on macOS (#1325) ([#1325](https://github.com/nolabs-ai/nono/pull/1325))
+
+- *(profile)* Empty allow_vars no longer strips all env vars (#1204) ([#1204](https://github.com/nolabs-ai/nono/pull/1204))
+
+- *(proxy)* Separate stdin and stderr inheritance for credential helpers (#1300) ([#1300](https://github.com/nolabs-ai/nono/pull/1300))
+
+- *(execution-runtime)* Allow env_credentials + command_policies on non-shim entry (#1301) ([#1301](https://github.com/nolabs-ai/nono/pull/1301))
+
+- *(dynamic-providers)* Run git config from repo root to honour hasconfig: includeIf (#1313) ([#1313](https://github.com/nolabs-ai/nono/pull/1313))
+
+- *(tests)* Use /tmp for socket test dirs to stay under SUN_LEN limit (#1303) ([#1303](https://github.com/nolabs-ai/nono/pull/1303))
+
+
+### CI/CD
+
+- Run actionlint (#1273) ([#1273](https://github.com/nolabs-ai/nono/pull/1273))
+
+
+### Dependencies
+
+- *(deps)* Bump h2 from 0.4.14 to 0.4.15 (#1312) ([#1312](https://github.com/nolabs-ai/nono/pull/1312))
+
+- *(deps)* Bump webpki-roots from 1.0.7 to 1.0.8 (#1311) ([#1311](https://github.com/nolabs-ai/nono/pull/1311))
+
+- *(deps)* Bump rustls from 0.23.40 to 0.23.41 (#1310) ([#1310](https://github.com/nolabs-ai/nono/pull/1310))
+
+- *(deps)* Bump actions/attest from 4.1.0 to 4.1.1 (#1309) ([#1309](https://github.com/nolabs-ai/nono/pull/1309))
+
+- *(deps)* Bump actions/cache from 5.0.5 to 6.1.0 (#1308) ([#1308](https://github.com/nolabs-ai/nono/pull/1308))
+
+- *(deps)* Bump time from 0.3.49 to 0.3.51 (#1307) ([#1307](https://github.com/nolabs-ai/nono/pull/1307))
+
+- *(deps)* Bump jsonschema from 0.46.5 to 0.46.6 (#1306) ([#1306](https://github.com/nolabs-ai/nono/pull/1306))
+
+
+### Documentation
+
+- Add community health files (#1348) ([#1348](https://github.com/nolabs-ai/nono/pull/1348))
+
+- *(readme)* Explain tool sandboxing for agents (#1342) ([#1342](https://github.com/nolabs-ai/nono/pull/1342))
+
+- *(cli/profile)* Simplify credential provider def doc comment
+
+- *(profiles)* Clarify predefined vs user profiles scope (#1331) ([#1331](https://github.com/nolabs-ai/nono/pull/1331))
+
+- *(credential-injection)* Document AWS SigV4 proxy signing (#1329) ([#1329](https://github.com/nolabs-ai/nono/pull/1329))
+
+- *(nogent)* Add nogent markdown file (#1288) ([#1288](https://github.com/nolabs-ai/nono/pull/1288))
+
+
+### Features
+
+- *(registry-client)* Attach installation context headers to registry requests (#1341) ([#1341](https://github.com/nolabs-ai/nono/pull/1341))
+
+- *(update-check)* Emit install_source on update check requests (#1340) ([#1340](https://github.com/nolabs-ai/nono/pull/1340))
+
+- *(tool-sandbox)* Add exec intercept action (#1322) ([#1322](https://github.com/nolabs-ai/nono/pull/1322))
+
+- *(oauth)* Add declarative sandboxed OAuth capture
+
+- *(cli)* Add standalone `nono proxy` command (#1261) ([#1261](https://github.com/nolabs-ai/nono/pull/1261))
+
+- *(tool-sandbox)* Per-command unsafe_macos_seatbelt_rules escape hatch
+
+- *(tool-sandbox)* Per-intercept sandbox override
+
+- Resource limiting (#1269) ([#1269](https://github.com/nolabs-ai/nono/pull/1269))
+
+- Implement aws authentication for the MiTM proxy  (#1195) ([#1195](https://github.com/nolabs-ai/nono/pull/1195))
+
+- *(profile)* Expand @git:* dynamic tokens in top-level filesystem paths (#1298) ([#1298](https://github.com/nolabs-ai/nono/pull/1298))
+
+- *(profile)* Expand $VAR tokens from process env in profile paths and capture commands (#1296) ([#1296](https://github.com/nolabs-ai/nono/pull/1296))
+
+- *(tool-sandbox)* Add git worktree tokens; fold include-files into @git:config-files (#1280) ([#1280](https://github.com/nolabs-ai/nono/pull/1280))
+
+- *(profile)* Support CLI profile extends (#1320) ([#1320](https://github.com/nolabs-ai/nono/pull/1320))
+
+- *(gpu)* Harden NVIDIA procfs mediation (#1284) ([#1284](https://github.com/nolabs-ai/nono/pull/1284))
+
+
+### Miscellaneous
+
+- *(ci)* Remove homebrew bump workflow (#1294) ([#1294](https://github.com/nolabs-ai/nono/pull/1294))
+
+- *(ci)* Refine automation workflow (#1292) ([#1292](https://github.com/nolabs-ai/nono/pull/1292))
+
+
+### Refactoring
+
+- *(seccomp)* Introduce SeccompPolicy struct and client-driven selection (#1283) ([#1283](https://github.com/nolabs-ai/nono/pull/1283))
+
+
+### Testing
+
+- *(oauth)* Consume provider stdin in header fixture
+
+- Suppress save prompt in socket access tests (#1279) ([#1279](https://github.com/nolabs-ai/nono/pull/1279))
+
+## [0.66.0] - 2026-06-29
+
+### Bug Fixes
+
+- *(network)* Error early on contradictory network flag combinations (#1263) ([#1263](https://github.com/nolabs-ai/nono/pull/1263))
+
+- *(network)* Wire --allow-endpoint through to credential routes (#1127) ([#1127](https://github.com/nolabs-ai/nono/pull/1127))
+
+- *(sandbox)* Warn when capability path is on a 9P filesystem (#1207) ([#1207](https://github.com/nolabs-ai/nono/pull/1207))
+
+- *(ci)* Downgrade runner to ubuntu-latest (#1259) ([#1259](https://github.com/nolabs-ai/nono/pull/1259))
+
+- *(tool-sandbox)* Skip missing fs_read/fs_write dirs instead of erroring (#1253) ([#1253](https://github.com/nolabs-ai/nono/pull/1253))
+
+- *(tool-sandbox)* Pass TLS trust bundle env vars to tool-sandbox children (#1249) ([#1249](https://github.com/nolabs-ai/nono/pull/1249))
+
+- *(proxy)* Match wildcard credential upstream routes (#1243) ([#1243](https://github.com/nolabs-ai/nono/pull/1243))
+
+
+### CI/CD
+
+- Fix mapping err in compile step (#1251) ([#1251](https://github.com/nolabs-ai/nono/pull/1251))
+
+- Idempotent publish-crates + cross-compile check on release PRs (#1245) ([#1245](https://github.com/nolabs-ai/nono/pull/1245))
+
+
+### Dependencies
+
+- *(deps)* Bump sigstore-trust-root from 0.8.0 to 0.9.0 (#1229) ([#1229](https://github.com/nolabs-ai/nono/pull/1229))
+
+- *(deps)* Bump criterion from 0.5.1 to 0.8.2 (#1232) ([#1232](https://github.com/nolabs-ai/nono/pull/1232))
+
+
+### Documentation
+
+- *(proxy)* Explain proxy activation via custom credentials (#1247) ([#1247](https://github.com/nolabs-ai/nono/pull/1247))
+
+- *(proxy)* Fix stale X-Nono-Token authentication claim (#1246) ([#1246](https://github.com/nolabs-ai/nono/pull/1246))
+
+
+### Features
+
+- *(tool-sandbox)* Simplify self-invocation policy (#1268) ([#1268](https://github.com/nolabs-ai/nono/pull/1268))
+
+- *(tool-sandbox)* Add @git:common-dir dynamic token (#1271) ([#1271](https://github.com/nolabs-ai/nono/pull/1271))
+
+- *(proxy)* Add HTTP/2 support for reverse proxy and credential injection (#983) ([#983](https://github.com/nolabs-ai/nono/pull/983))
+
+- *(tests)* Add end-to-end integration tests for sandbox execution strategies (#1213) ([#1213](https://github.com/nolabs-ai/nono/pull/1213))
+
+
+### Miscellaneous
+
+- Migrate GitHub org references from always-further to nolabs-ai (#1235) ([#1235](https://github.com/nolabs-ai/nono/pull/1235))
+
+
+### Refactoring
+
+- *(network)* Introduce NetworkIntent and remove ProxyOnly placeholders (#1225) ([#1225](https://github.com/nolabs-ai/nono/pull/1225))
+
 ## [Unreleased]
+
+### Features
+
+- *(profile)* Add repeatable `--extends <PROFILE>` support for profile-consuming commands, allowing one invocation to compose a selected `--profile` with additional base profiles ([#956](https://github.com/nolabs-ai/nono/issues/956))
+
+- *(tool-sandbox)* Add `@git:common-dir` dynamic token: expands to the git common directory (`.git` in a regular repo; the main repo's `.git` when running inside a worktree). Use in `fs_write` to cover the object store when the agent session starts from a worktree and `--workdir` points to the worktree itself ([#1270](https://github.com/nolabs-ai/nono/issues/1270))
 
 ### Bug Fixes
 
 - *(tool-sandbox)* Pass TLS trust bundle env vars (`SSL_CERT_FILE`, `CURL_CA_BUNDLE`, `NODE_EXTRA_CA_CERTS`, `REQUESTS_CA_BUNDLE`, `GIT_SSL_CAINFO`) to tool-sandbox children so HTTPS certificate verification works when TLS interception is active (#1248)
+
+- *(tool-sandbox)* Skip missing `fs_read`/`fs_write` directories instead of erroring on startup; matches existing `fs_read_file` behaviour (#1252)
 
 ## [0.65.1] - 2026-06-23
 ## [0.65.0] - 2026-06-23

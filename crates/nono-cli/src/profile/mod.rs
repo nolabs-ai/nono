@@ -5,6 +5,19 @@
 //! into the binary) or user-defined (in `$XDG_CONFIG_HOME/nono/profiles/`).
 
 pub(crate) mod builtin;
+mod credential_provider;
+
+pub use credential_provider::{
+    CredentialProviderDef, CredentialProviderRequestBodyFormat,
+    CredentialProviderResponseFieldKind, CredentialProviderStore, CredentialRouteDef,
+};
+#[cfg(test)]
+pub use credential_provider::{
+    CredentialProviderResponseField, CredentialProviderTokenEndpoint, CredentialProviderType,
+};
+use credential_provider::{
+    validate_credential_provider_entries, validate_credential_provider_resolved,
+};
 
 use crate::command_policy::{
     CommandPoliciesConfig, CommandPolicyValidationScope, validate_command_policies,
@@ -356,15 +369,24 @@ pub struct CustomCredentialDef {
     /// credential chain). Mutually exclusive with `credential_key` and `auth`.
     #[serde(default)]
     pub aws_auth: Option<nono_proxy::config::AwsAuthConfig>,
+
+    /// SPIFFE/SPIRE Workload API auth. Mutually exclusive with `credential_key`, `auth`, and `aws_auth`.
+    #[serde(default)]
+    pub spiffe: Option<nono_proxy::config::SpiffeAuthConfig>,
 }
 
-/// Host-side command that materializes a proxy credential for `cmd://<name>`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Host-side source that materializes a proxy credential for `cmd://<name>`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CredentialCaptureEntry {
     /// Command and arguments. The first element is resolved by the supervisor
     /// before execution; no shell is used.
+    #[serde(default)]
     pub command: Vec<String>,
+    /// External provider subprocess using the typed nono credential-provider
+    /// protocol. Mutually exclusive with `command`.
+    #[serde(default)]
+    pub provider: Option<CredentialCaptureProvider>,
     /// Maximum command runtime in seconds.
     #[serde(default)]
     pub timeout_secs: Option<u64>,
@@ -388,6 +410,17 @@ pub struct CredentialCaptureEntry {
     /// Explicit interactive affordances for browser-backed auth flows.
     #[serde(default)]
     pub interaction: Option<CredentialCaptureInteraction>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CredentialCaptureProvider {
+    /// Provider executable and arguments. The first element is resolved by the
+    /// supervisor before execution; no shell is used.
+    pub command: Vec<String>,
+    /// Provider-specific configuration sent to the provider in request JSON.
+    #[serde(default)]
+    pub config: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -429,8 +462,14 @@ pub struct CredentialCaptureOutputConfig {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CredentialCaptureInteraction {
+    /// Allow the capture command to write prompts to the terminal via inherited stderr.
     #[serde(default)]
     pub stdio: bool,
+    /// Allow the capture command to read from the terminal via inherited stdin.
+    /// Only set this when the helper genuinely needs to prompt the user for input.
+    /// Defaults to false; stdin is `/dev/null` unless explicitly enabled.
+    #[serde(default)]
+    pub stdin: bool,
     #[serde(default)]
     pub open_urls: Option<OpenUrlConfig>,
     #[serde(default)]
@@ -441,7 +480,7 @@ fn default_inject_header() -> String {
     "Authorization".to_string()
 }
 
-/// Check if a character is a valid HTTP token character per RFC 7230.
+/// Check if a character is a valid HTTP header token character.
 fn is_http_token_char(c: char) -> bool {
     c.is_ascii_alphanumeric()
         || matches!(
@@ -566,12 +605,36 @@ fn validate_custom_credential(name: &str, cred: &CustomCredentialDef) -> Result<
         )));
     }
 
-    // At least one of credential_key, auth, or aws_auth must be set
-    if cred.credential_key.is_none() && cred.auth.is_none() && cred.aws_auth.is_none() {
+    // Mutual exclusion: spiffe is incompatible with credential_key, auth (oauth2), and aws_auth.
+    if cred.spiffe.is_some()
+        && (cred.credential_key.is_some() || cred.auth.is_some() || cred.aws_auth.is_some())
+    {
         return Err(NonoError::ProfileParse(format!(
-            "custom credential '{}' must have either 'credential_key', 'auth', or 'aws_auth' set",
+            "custom credential '{}' has 'spiffe' set together with 'credential_key', 'auth' \
+             (oauth2), or 'aws_auth'; spiffe is mutually exclusive with all other auth fields",
             name
         )));
+    }
+
+    // At least one auth mechanism must be set
+    if cred.credential_key.is_none()
+        && cred.auth.is_none()
+        && cred.aws_auth.is_none()
+        && cred.spiffe.is_none()
+    {
+        return Err(NonoError::ProfileParse(format!(
+            "custom credential '{}' must have either 'credential_key', 'auth', 'aws_auth', \
+             or 'spiffe' set",
+            name
+        )));
+    }
+
+    // Validate inject_header for SPIFFE routes (credential_key has its own validate_header_mode()).
+    if let Some(nono_proxy::config::SpiffeAuthConfig::Jwt {
+        ref inject_header, ..
+    }) = cred.spiffe
+    {
+        validate_header_name(name, inject_header)?;
     }
 
     // Validate OAuth2 auth if present
@@ -785,20 +848,42 @@ fn validate_oauth2_auth(name: &str, auth: &OAuth2Config) -> Result<()> {
     // Validate token_url — same rules as upstream URL (HTTPS or loopback HTTP)
     validate_upstream_url(&auth.token_url, &format!("{}/auth.token_url", name))?;
 
-    // client_id must not be empty
-    if auth.client_id.is_empty() {
-        return Err(NonoError::ProfileParse(format!(
-            "auth.client_id for custom credential '{}' cannot be empty",
-            name
-        )));
-    }
-
-    // client_secret must not be empty
-    if auth.client_secret.is_empty() {
-        return Err(NonoError::ProfileParse(format!(
-            "auth.client_secret for custom credential '{}' cannot be empty",
-            name
-        )));
+    // When using client_assertion, client_id/client_secret are not required,
+    // but the assertion config itself must have valid fields.
+    if let Some(ref assertion) = auth.client_assertion {
+        match assertion {
+            nono_proxy::config::ClientAssertionConfig::SpiffeJwt {
+                workload_api_socket,
+                audience,
+                ..
+            } => {
+                if workload_api_socket.is_empty() {
+                    return Err(NonoError::ProfileParse(format!(
+                        "auth.client_assertion.workload_api_socket for custom credential '{}' cannot be empty",
+                        name
+                    )));
+                }
+                if audience.is_empty() {
+                    return Err(NonoError::ProfileParse(format!(
+                        "auth.client_assertion.audience for custom credential '{}' cannot be empty",
+                        name
+                    )));
+                }
+            }
+        }
+    } else {
+        if auth.client_id.is_empty() {
+            return Err(NonoError::ProfileParse(format!(
+                "auth.client_id for custom credential '{}' cannot be empty",
+                name
+            )));
+        }
+        if auth.client_secret.is_empty() {
+            return Err(NonoError::ProfileParse(format!(
+                "auth.client_secret for custom credential '{}' cannot be empty",
+                name
+            )));
+        }
     }
 
     Ok(())
@@ -850,8 +935,26 @@ fn validate_aws_auth(name: &str, aws: &nono_proxy::config::AwsAuthConfig) -> Res
 }
 
 /// Validate header injection mode fields.
+/// Validate a single header name: non-empty, valid HTTP token characters only.
+fn validate_header_name(cred_name: &str, header: &str) -> Result<()> {
+    if header.is_empty() {
+        return Err(NonoError::ProfileParse(format!(
+            "inject_header for custom credential '{}' cannot be empty",
+            cred_name
+        )));
+    }
+    if !header.chars().all(is_http_token_char) {
+        return Err(NonoError::ProfileParse(format!(
+            "inject_header '{}' for custom credential '{}' contains invalid characters; \
+             header names must be valid HTTP tokens (alphanumeric and !#$%&'*+-.^_`|~)",
+            header, cred_name
+        )));
+    }
+    Ok(())
+}
+
 fn validate_header_mode(name: &str, cred: &CustomCredentialDef) -> Result<()> {
-    // Validate inject_header (RFC 7230 token)
+    // Validate inject_header
     if cred.inject_header.is_empty() {
         return Err(NonoError::ProfileParse(format!(
             "inject_header for custom credential '{}' cannot be empty",
@@ -1011,6 +1114,45 @@ fn validate_profile_custom_credentials(profile: &Profile) -> Result<()> {
     Ok(())
 }
 
+#[must_use = "network.no_proxy validation result must be handled"]
+fn validate_profile_no_proxy(profile: &Profile) -> Result<()> {
+    for entry in &profile.network.no_proxy {
+        nono_proxy::config::validate_no_proxy_entry(entry).map_err(|err| match err {
+            nono_proxy::ProxyError::Config(message) => NonoError::ProfileParse(format!(
+                "network.no_proxy entry '{entry}' is invalid: {message}"
+            )),
+            other => NonoError::ProfileParse(format!(
+                "network.no_proxy entry '{entry}' is invalid: {other}"
+            )),
+        })?;
+    }
+
+    validate_no_proxy_allow_domain_conflicts(
+        &profile.network.no_proxy,
+        &profile.network.allow_domain,
+    )
+}
+
+#[must_use = "network.no_proxy allow_domain conflict validation result must be handled"]
+pub(crate) fn validate_no_proxy_allow_domain_conflicts(
+    no_proxy: &[String],
+    allow_domain: &[AllowDomainEntry],
+) -> Result<()> {
+    for allow_entry in allow_domain {
+        let domain = allow_entry.domain();
+        for no_proxy_entry in no_proxy {
+            if nono_proxy::config::no_proxy_entry_overlaps_host_pattern(no_proxy_entry, domain) {
+                return Err(NonoError::ProfileParse(format!(
+                    "network.no_proxy entry '{no_proxy_entry}' conflicts with \
+                     network.allow_domain entry '{domain}': allow_domain traffic must \
+                     go through the proxy allowlist/L7 route, not bypass it"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_open_url_config(config: &OpenUrlConfig) -> Result<()> {
     for origin in &config.allow_origins {
         if origin.trim().is_empty() || origin.contains('\0') {
@@ -1045,15 +1187,36 @@ fn validate_credential_capture_entries(profile: &Profile) -> Result<()> {
                 "credential_capture entry '{name}' must contain only alphanumeric characters and underscores"
             )));
         }
-        if entry.command.is_empty() {
+        let has_command = !entry.command.is_empty();
+        let has_provider = entry.provider.is_some();
+        if has_command == has_provider {
             return Err(NonoError::ProfileParse(format!(
-                "credential_capture entry '{name}' must include a non-empty command array"
+                "credential_capture entry '{name}' must include exactly one of 'command' or 'provider'"
             )));
         }
         for part in &entry.command {
             if part.is_empty() || part.contains('\0') {
                 return Err(NonoError::ProfileParse(format!(
                     "credential_capture entry '{name}' contains an empty or NUL-bearing command argument"
+                )));
+            }
+        }
+        if let Some(provider) = &entry.provider {
+            if provider.command.is_empty() {
+                return Err(NonoError::ProfileParse(format!(
+                    "credential_capture entry '{name}' provider.command must not be empty"
+                )));
+            }
+            for part in &provider.command {
+                if part.is_empty() || part.contains('\0') {
+                    return Err(NonoError::ProfileParse(format!(
+                        "credential_capture entry '{name}' provider.command contains an empty or NUL-bearing argument"
+                    )));
+                }
+            }
+            if !provider.config.is_null() && !provider.config.is_object() {
+                return Err(NonoError::ProfileParse(format!(
+                    "credential_capture entry '{name}' provider.config must be a JSON object"
                 )));
             }
         }
@@ -1208,6 +1371,13 @@ fn validate_profile_tls_intercept(profile: &Profile) -> Result<()> {
     if let Some(value) = &tls.leaf_validity {
         parse_tls_duration("network.tls_intercept.leaf_validity", value)?;
     }
+    for env_var in &tls.ca_env_vars {
+        nono::validate_destination_env_var(env_var).map_err(|err| {
+            NonoError::ProfileParse(format!(
+                "invalid network.tls_intercept.ca_env_vars entry '{env_var}': {err}"
+            ))
+        })?;
+    }
     Ok(())
 }
 
@@ -1285,8 +1455,7 @@ fn validate_env_credential_keys(profile: &Profile) -> Result<()> {
         // Validate destination env var name against dangerous blocklist
         nono::validate_destination_env_var(value).map_err(|e| {
             NonoError::ProfileParse(format!(
-                "invalid destination env var '{}' in env_credentials: {}",
-                value, e
+                "invalid destination env var '{value}' in env_credentials: {e}"
             ))
         })?;
     }
@@ -1403,6 +1572,11 @@ pub struct NetworkConfig {
     /// Canonical profile key: `block`.
     #[serde(default)]
     pub block: bool,
+    /// Allow HTTP/2 to upstream servers via ALPN negotiation.
+    /// When `false` (default), the proxy negotiates HTTP/1.1 with keep-alive
+    /// connection pooling. Equivalent to the `--allow-http2` CLI flag.
+    #[serde(default)]
+    pub allow_http2: bool,
     /// Network proxy profile name (from network-policy.json).
     /// When set, outbound traffic is filtered through the proxy.
     ///
@@ -1422,6 +1596,10 @@ pub struct NetworkConfig {
         alias = "allow_proxy"
     )]
     pub allow_domain: Vec<AllowDomainEntry>,
+    /// Domains to deny through the proxy regardless of the allowlist.
+    /// Supports the same wildcard syntax as `allow_domain` (e.g. `*.ads.example.com`).
+    #[serde(default)]
+    pub deny_domain: Vec<String>,
     /// Credential services to enable via reverse proxy.
     /// Canonical profile key: `credentials` (legacy `proxy_credentials` accepted).
     ///
@@ -1445,14 +1623,35 @@ pub struct NetworkConfig {
         alias = "allow_port"
     )]
     pub open_port: Vec<u16>,
+    /// Inclusive port ranges for bidirectional localhost TCP IPC (connect + bind).
+    /// Multiple ranges are supported. Example: `[[3000, 3010], [8000, 8100]]`.
+    /// Each port becomes an individual rule — larger ranges take longer to apply at startup.
+    /// macOS enforces a combined limit of 16,384 unique ports across all ranges (2¹⁴);
+    /// Linux has no such restriction. Overlapping ranges are merged before applying rules.
+    #[serde(default)]
+    pub open_port_range: Vec<[u16; 2]>,
     /// TCP ports the sandboxed child may listen on.
     /// Equivalent to `--listen-port` CLI flag.
     #[serde(default)]
     pub listen_port: Vec<u16>,
+    /// Inclusive port ranges for TCP listen (bind only). Same platform behaviour as
+    /// `open_port_range` for the bind side; no outbound connect rules are added.
+    /// Overlapping ranges are merged before applying rules.
+    #[serde(default)]
+    pub listen_port_range: Vec<[u16; 2]>,
     /// Outbound TCP connect ports (allowlist). Linux Landlock V4+ only.
     /// Equivalent to `--allow-connect-port` CLI flag.
     #[serde(default)]
     pub connect_port: Vec<u16>,
+    /// Additional client-side proxy bypass entries for generated
+    /// NO_PROXY/no_proxy in proxy mode.
+    ///
+    /// Entries are host patterns only: single-label local aliases, IP
+    /// literals, `*.example.com` wildcard suffixes, or `.example.com` suffix
+    /// patterns. Bare multi-label domains, full URLs, credentials, schemes,
+    /// ports, paths, and catch-all `*` are rejected at load time.
+    #[serde(default)]
+    pub no_proxy: Vec<String>,
     /// Custom credential definitions for services not in network-policy.json.
     /// Keys are service names (used with `--credential`), values define
     /// how to route and inject credentials for that service.
@@ -1484,6 +1683,8 @@ pub struct TlsInterceptConfig {
     pub ca_validity: Option<String>,
     #[serde(default)]
     pub leaf_validity: Option<String>,
+    #[serde(default)]
+    pub ca_env_vars: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1773,6 +1974,25 @@ pub struct DiagnosticsConfig {
     pub suppress_system_services: Vec<String>,
 }
 
+/// Which sandboxing mechanism nono should install on Linux.
+///
+/// Defaults to `auto`, which reflects the historical behaviour.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum LinuxSandboxPolicy {
+    /// Landlock with automatic seccomp fallback when the kernel ABI lacks
+    /// network support (< V4). This is the default.
+    #[default]
+    Auto,
+    /// Landlock only. Returns an error at startup if the kernel cannot
+    /// satisfy network restrictions via Landlock alone.
+    Landlock,
+    /// TCP network egress enforcement is managed externally (iptables,
+    /// cgroups, systemd, etc.). nono still installs filesystem/process
+    /// sandboxing and skips only its own TCP network lockdown.
+    External,
+}
+
 /// Linux-specific profile controls.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1780,6 +2000,9 @@ pub struct LinuxConfig {
     /// Opt-in pathname AF_UNIX mediation mode.
     #[serde(default)]
     pub af_unix_mediation: Option<LinuxAfUnixMediation>,
+    /// Which sandboxing mechanism to use. Defaults to `auto`.
+    #[serde(default)]
+    pub sandbox_policy: Option<LinuxSandboxPolicy>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1882,10 +2105,15 @@ pub struct EnvironmentConfig {
     ///
     /// Supports exact names (`"PATH"`) and prefix patterns ending with `*`
     /// (`"AWS_*"` matches `AWS_REGION`, `AWS_SECRET_ACCESS_KEY`, etc.).
-    /// When empty, all variables are allowed (default).
+    ///
+    /// - Absent (field not written in JSON): no filter, all variables pass through.
+    /// - `[]` (explicitly empty): blocks all inherited variables; only nono-injected
+    ///   credentials reach the child.
+    /// - Non-empty: only matching variables pass through.
+    ///
     /// Nono-injected credentials always bypass this list.
-    #[serde(default)]
-    pub allow_vars: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_vars: Option<Vec<String>>,
 
     /// Deny-list of environment variable names stripped from the sandboxed process.
     ///
@@ -2008,12 +2236,16 @@ pub struct Profile {
     /// ALIAS(canonical="env_credentials", introduced="v0.0.0", remove_by="indefinite", issue="#143")
     #[serde(default, alias = "secrets")]
     pub env_credentials: SecretsConfig,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub environment: Option<EnvironmentConfig>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command_policies: Option<CommandPoliciesConfig>,
     #[serde(default)]
     pub credential_capture: HashMap<String, CredentialCaptureEntry>,
+    #[serde(default)]
+    pub credential_providers: HashMap<String, CredentialProviderDef>,
+    #[serde(default)]
+    pub credential_routes: Vec<CredentialRouteDef>,
     #[serde(default)]
     pub workdir: WorkdirConfig,
     #[serde(default)]
@@ -2030,22 +2262,22 @@ pub struct Profile {
     /// When `None` (absent from JSON), inherits from the base profile.
     /// When `Some`, replaces the base profile's config entirely, allowing
     /// derived profiles to narrow permissions.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub open_urls: Option<OpenUrlConfig>,
     /// Opt-in gate for temporary direct LaunchServices opens on macOS.
     /// Must be paired with the CLI flag `--allow-launch-services`.
     /// When `None`, inherits from the base profile.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allow_launch_services: Option<bool>,
     /// Opt-in gate for GPU access (Metal/IOKit on macOS, render nodes on Linux).
     /// Must be paired with the CLI flag `--allow-gpu`.
     /// When `None`, inherits from the base profile.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allow_gpu: Option<bool>,
     /// Opt-in to allow parent-of-protected-root grants on macOS.
     /// When `true` (and on macOS), `--allow ~` is permitted because Seatbelt deny
     /// rules protect `~/.nono`. Ignored on Linux. Default is `false`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allow_parent_of_protected: Option<bool>,
     /// Deprecated: Parsed for backward compatibility but ignored.
     /// Supervised mode preserves TTY by default, making this unnecessary.
@@ -2062,7 +2294,7 @@ pub struct Profile {
     /// Binary path or command name to run when no trailing `-- <command>` is given.
     /// Resolved via `PATH` lookup or canonicalized if absolute. Only honoured
     /// for user-authored profiles (ignored for pack and built-in profiles).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binary: Option<String>,
     /// Extra arguments appended to the child command at launch.
     /// Supports variable expansion (e.g. `$NONO_PACKAGES`).
@@ -2081,6 +2313,69 @@ pub struct Profile {
     /// first-class capability.
     #[serde(default)]
     pub unsafe_macos_seatbelt_rules: Vec<String>,
+    /// Per-OS profile patches merged after `extends` resolution.
+    ///
+    /// Only the entry matching the current platform is applied; others are ignored.
+    /// The override block supports all profile fields except `extends` and
+    /// `platform_overrides` — nesting either is a parse error.
+    /// Merge semantics are identical to `extends`: deny-lists union, scalar fields
+    /// are child-wins, lists are dedup-appended.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform_overrides: Option<PlatformOverrides>,
+}
+
+/// Per-OS patches for [`Profile::platform_overrides`].
+///
+/// Unrecognised keys are rejected. Nesting `extends` or `platform_overrides`
+/// inside an override block is a parse error.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlatformOverrides {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub macos: Option<Box<PlatformOverride>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linux: Option<Box<PlatformOverride>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub windows: Option<Box<PlatformOverride>>,
+}
+
+impl PlatformOverrides {
+    fn for_current_platform(self) -> Option<Box<PlatformOverride>> {
+        match crate::platform::current().os {
+            crate::platform::Os::Macos => self.macos,
+            crate::platform::Os::Linux => self.linux,
+            crate::platform::Os::Windows => self.windows,
+            crate::platform::Os::Unknown(_) => None,
+        }
+    }
+}
+
+/// A partial profile fragment used inside [`PlatformOverrides`].
+///
+/// Identical to [`Profile`] but rejects `extends` and `platform_overrides`
+/// during deserialization to prevent a second inheritance system from forming
+/// inside an override block.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct PlatformOverride(pub Profile);
+
+impl<'de> Deserialize<'de> for PlatformOverride {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let profile = Profile::deserialize(deserializer)?;
+        if profile.extends.is_some() {
+            return Err(serde::de::Error::custom(
+                "`extends` is not allowed inside `platform_overrides`",
+            ));
+        }
+        if profile.platform_overrides.is_some() {
+            return Err(serde::de::Error::custom(
+                "`platform_overrides` cannot be nested",
+            ));
+        }
+        Ok(Self(profile))
+    }
 }
 
 #[derive(Deserialize)]
@@ -2119,6 +2414,10 @@ struct ProfileDeserialize {
     #[serde(default)]
     credential_capture: HashMap<String, CredentialCaptureEntry>,
     #[serde(default)]
+    credential_providers: HashMap<String, CredentialProviderDef>,
+    #[serde(default)]
+    credential_routes: Vec<CredentialRouteDef>,
+    #[serde(default)]
     workdir: WorkdirConfig,
     #[serde(default)]
     hooks: HooksConfig,
@@ -2148,6 +2447,8 @@ struct ProfileDeserialize {
     command_args: Vec<String>,
     #[serde(default)]
     unsafe_macos_seatbelt_rules: Vec<String>,
+    #[serde(default)]
+    platform_overrides: Option<PlatformOverrides>,
 }
 
 impl From<ProfileDeserialize> for Profile {
@@ -2171,6 +2472,8 @@ impl From<ProfileDeserialize> for Profile {
             environment: raw.environment,
             command_policies: raw.command_policies,
             credential_capture: raw.credential_capture,
+            credential_providers: raw.credential_providers,
+            credential_routes: raw.credential_routes,
             workdir: raw.workdir,
             hooks: raw.hooks,
             session_hooks: raw.session_hooks,
@@ -2185,6 +2488,7 @@ impl From<ProfileDeserialize> for Profile {
             binary: raw.binary,
             command_args: raw.command_args,
             unsafe_macos_seatbelt_rules: raw.unsafe_macos_seatbelt_rules,
+            platform_overrides: raw.platform_overrides,
         };
 
         // Drain legacy keys into canonical sections (no-op unless the legacy
@@ -2286,9 +2590,24 @@ pub fn load_profile_extends(name_or_path: &str) -> Option<Vec<String>> {
 ///    `install_as` matches the requested name. Self-heals Claude Code plugin
 ///    wiring (symlink + `enabledPlugins`) on every successful resolution.
 /// 3. Built-in profiles (compiled into binary).
-/// 4. Auto-pull prompt for the registry pack `always-further/claude` when
+/// 4. Auto-pull prompt for the registry pack `nolabs-ai/claude` when
 ///    the requested profile is `claude-code` (or inherits from it).
 pub fn load_profile(name_or_path: &str) -> Result<Profile> {
+    load_profile_impl(name_or_path, &[])
+}
+
+/// Load a profile by name or file path, injecting additional CLI-selected bases.
+///
+/// Non-empty `cli_extends` behaves as if those base names were prepended to the
+/// selected profile's raw `extends` list before inheritance resolution. Bases
+/// still resolve through the normal profile resolver, so cycle checks, sibling
+/// lookup, pack provenance, migration prompts, and validation remain shared
+/// with JSON-authored inheritance.
+pub fn load_profile_with_extends(name_or_path: &str, cli_extends: &[String]) -> Result<Profile> {
+    load_profile_impl(name_or_path, cli_extends)
+}
+
+fn load_profile_impl(name_or_path: &str, cli_extends: &[String]) -> Result<Profile> {
     // Enable the chain-aware migration prompt for the duration of this
     // call: if `extends` resolution hits a pack-provided base that isn't
     // installed (e.g. user profile that `extends: ["claude-code"]`),
@@ -2296,7 +2615,7 @@ pub fn load_profile(name_or_path: &str) -> Result<Profile> {
     // than failing with "base profile not found". The flag is restored
     // on exit so nested `load_profile_no_migrate` calls stay quiet.
     with_missing_base_prompt(true, || {
-        if let Some(profile) = load_profile_inner(name_or_path)? {
+        if let Some(profile) = load_profile_inner(name_or_path, cli_extends)? {
             return Ok(profile);
         }
 
@@ -2313,7 +2632,8 @@ pub fn load_profile(name_or_path: &str) -> Result<Profile> {
                         "Loading pack-store profile from: {}",
                         profile_path.display()
                     );
-                    let mut profile = finalize_profile(load_from_file(&profile_path)?)?;
+                    let mut profile =
+                        load_from_file(&profile_path, cli_extends).and_then(finalize_profile)?;
                     if !profile.packs.contains(&pack_key) {
                         profile.packs.push(pack_key);
                     }
@@ -2348,7 +2668,7 @@ pub fn load_profile(name_or_path: &str) -> Result<Profile> {
 /// the user with a network operation.
 pub fn load_profile_no_migrate(name_or_path: &str) -> Result<Profile> {
     with_missing_base_prompt(false, || {
-        if let Some(profile) = load_profile_inner(name_or_path)? {
+        if let Some(profile) = load_profile_inner(name_or_path, &[])? {
             return Ok(profile);
         }
         Err(NonoError::ProfileNotFound(name_or_path.to_string()))
@@ -2382,12 +2702,12 @@ fn missing_base_prompt_enabled() -> bool {
 /// and `Err(_)` on validation/IO failures. Shared between `load_profile`
 /// (which then runs the migration prompt) and `load_profile_no_migrate`
 /// (which surfaces a not-found error directly).
-fn load_profile_inner(name_or_path: &str) -> Result<Option<Profile>> {
+fn load_profile_inner(name_or_path: &str, cli_extends: &[String]) -> Result<Option<Profile>> {
     if is_registry_ref(name_or_path) {
-        return load_registry_profile(name_or_path).map(Some);
+        return load_registry_profile(name_or_path, cli_extends).map(Some);
     }
     if is_file_path_ref(name_or_path) {
-        return load_profile_from_path(Path::new(name_or_path)).map(Some);
+        return load_profile_from_path_impl(Path::new(name_or_path), cli_extends).map(Some);
     }
     if !is_valid_profile_name(name_or_path) {
         return Err(NonoError::ProfileParse(format!(
@@ -2398,14 +2718,14 @@ fn load_profile_inner(name_or_path: &str) -> Result<Option<Profile>> {
     let profile_path = resolve_user_profile_path(name_or_path)?;
     if profile_path.exists() {
         tracing::info!("Loading user profile from: {}", profile_path.display());
-        return finalize_profile(load_from_file(&profile_path)?).map(Some);
+        return load_profile_from_path_impl(&profile_path, cli_extends).map(Some);
     }
     if let Some((profile_path, pack_key)) = find_pack_store_profile(name_or_path) {
         tracing::info!(
             "Loading pack-store profile from: {}",
             profile_path.display()
         );
-        let mut profile = load_from_file(&profile_path)?;
+        let mut profile = load_from_file(&profile_path, cli_extends)?;
         resolve_store_pack_session_hooks(&mut profile, &pack_key)?;
         let mut profile = finalize_profile(profile)?;
         // Inject the source pack ref so it's always present in the
@@ -2413,9 +2733,9 @@ fn load_profile_inner(name_or_path: &str) -> Result<Option<Profile>> {
         if !profile.packs.contains(&pack_key) {
             profile.packs.push(pack_key);
         }
-        // If we just resolved through `always-further/claude`, also offer
+        // If we just resolved through `nolabs-ai/claude`, also offer
         // to strip pre-0.43 inbuilt-hook leftovers. Catches the path
-        // where users `nono pull always-further/claude` directly,
+        // where users `nono pull nolabs-ai/claude` directly,
         // bypassing the post-pull cleanup hook in `migration::check_and_run`.
         // Idempotent: silent no-op when no legacy artifacts exist, so safe
         // to fire on every claude resolution.
@@ -2424,14 +2744,24 @@ fn load_profile_inner(name_or_path: &str) -> Result<Option<Profile>> {
         }
         return Ok(Some(profile));
     }
-    if let Some(profile) = builtin::get_builtin(name_or_path) {
-        tracing::info!("Using built-in profile: {}", name_or_path);
-        return Ok(Some(profile));
+    if cli_extends.is_empty() {
+        if let Some(profile) = builtin::get_builtin(name_or_path) {
+            tracing::info!("Using built-in profile: {}", name_or_path);
+            return Ok(Some(profile));
+        }
+    } else {
+        let policy = crate::policy::load_embedded_policy()?;
+        if let Some(def) = policy.profiles.get(name_or_path) {
+            tracing::info!("Using built-in profile: {}", name_or_path);
+            let mut profile = def.to_raw_profile();
+            prepend_cli_extends(&mut profile, cli_extends);
+            return resolve_and_finalize_profile(profile).map(Some);
+        }
     }
     Ok(None)
 }
 
-/// True when `profile_path` lives inside `<package_store>/always-further/claude/`.
+/// True when `profile_path` lives inside `<package_store>/nolabs-ai/claude/`.
 /// Used to gate legacy-cleanup invocation on the canonical claude pack
 /// rather than any pack that happens to publish a profile named `claude`
 /// or `claude-code`.
@@ -2610,7 +2940,7 @@ fn resolve_store_pack_session_hooks(profile: &mut Profile, pack_key: &str) -> Re
 
 /// Load a profile from a registry pack. If the pack isn't installed locally,
 /// pull it first (Docker-style auto-pull with Sigstore verification).
-fn load_registry_profile(name_or_path: &str) -> Result<Profile> {
+fn load_registry_profile(name_or_path: &str, cli_extends: &[String]) -> Result<Profile> {
     let package_ref = crate::package::parse_package_ref(name_or_path)?;
     let install_dir =
         crate::package::package_install_dir(&package_ref.namespace, &package_ref.name)?;
@@ -2620,13 +2950,16 @@ fn load_registry_profile(name_or_path: &str) -> Result<Profile> {
         eprintln!("Profile '{}' not found locally.", package_ref.key());
 
         // Auto-pull from registry
-        crate::package_cmd::run_pull(crate::cli::PullArgs {
-            package_ref: name_or_path.to_string(),
-            registry: None,
-            force: false,
-            init: false,
-            help: None,
-        })?;
+        crate::package_cmd::run_pull(
+            crate::cli::PullArgs {
+                package_ref: name_or_path.to_string(),
+                registry: None,
+                force: false,
+                init: false,
+                help: None,
+            },
+            crate::registry_client::PullReason::ProfileAuto,
+        )?;
     }
 
     // Read manifest to check pack type and find profile artifacts
@@ -2665,7 +2998,7 @@ fn load_registry_profile(name_or_path: &str) -> Result<Profile> {
                 .join(format!("{install_name}.json"));
             if profile_path.exists() {
                 tracing::info!("Loading registry profile from: {}", profile_path.display());
-                let mut profile = load_from_file(&profile_path)?;
+                let mut profile = load_from_file(&profile_path, cli_extends)?;
                 resolve_store_pack_session_hooks(&mut profile, &package_ref.key())?;
                 return finalize_profile(profile);
             }
@@ -2683,6 +3016,10 @@ fn load_registry_profile(name_or_path: &str) -> Result<Profile> {
 /// The path must exist and point to a valid JSON profile file.
 /// Base groups are merged automatically.
 pub fn load_profile_from_path(path: &Path) -> Result<Profile> {
+    load_profile_from_path_impl(path, &[])
+}
+
+fn load_profile_from_path_impl(path: &Path, cli_extends: &[String]) -> Result<Profile> {
     if !path.exists() {
         return Err(NonoError::ProfileRead {
             path: path.to_path_buf(),
@@ -2691,7 +3028,7 @@ pub fn load_profile_from_path(path: &Path) -> Result<Profile> {
     }
 
     tracing::info!("Loading profile from path: {}", path.display());
-    finalize_profile(load_from_file(path)?)
+    finalize_profile(load_from_file(path, cli_extends)?)
 }
 
 /// Load a raw profile from a direct file path without resolving inheritance.
@@ -2710,8 +3047,26 @@ pub(crate) fn load_raw_profile_from_path(path: &Path) -> Result<Profile> {
 /// Resolve inheritance and apply implicit default-group merging for a raw profile.
 #[allow(deprecated)]
 pub(crate) fn finalize_profile(mut profile: Profile) -> Result<Profile> {
+    profile = apply_platform_overrides(profile)?;
+    // apply_platform_overrides merges platform-specific custom_credentials,
+    // env_credentials, and environment.set_vars into the profile, so those
+    // merged values must be re-validated here — parse_profile_bytes only
+    // validated the pre-merge, top-level values.
+    validate_profile_custom_credentials(&profile)?;
+    validate_env_credential_keys(&profile)?;
+    if let Some(env_config) = profile.environment.as_ref()
+        && !env_config.set_vars.is_empty()
+        && let Some(err) = crate::exec_strategy::validate_set_vars(&env_config.set_vars)
+    {
+        return Err(NonoError::ProfileParse(err));
+    }
     merge_implicit_default_groups(&mut profile)?;
+    // Re-run after extends/platform overrides: base and child profiles can
+    // independently add no_proxy and allow_domain entries that only conflict
+    // once the final effective profile has been assembled.
+    validate_profile_no_proxy(&profile)?;
     validate_credential_capture_resolved(&profile)?;
+    validate_credential_provider_resolved(&profile)?;
     validate_profile_tls_intercept(&profile)?;
     validate_command_policies(
         profile.command_policies.as_ref(),
@@ -2797,9 +3152,14 @@ pub(crate) fn parse_profile_bytes(content: &[u8]) -> Result<Profile> {
 
     let profile: Profile = crate::jsonc::parse(text).map_err(NonoError::ProfileParse)?;
 
+    // Validate raw no_proxy entries for direct parse/profile-edit UX. Finalize
+    // re-validates after inheritance and platform overrides have been applied.
+    validate_profile_no_proxy(&profile)?;
+
     // Validate custom credentials for security issues
     validate_profile_custom_credentials(&profile)?;
     validate_credential_capture_entries(&profile)?;
+    validate_credential_provider_entries(&profile)?;
     validate_profile_tls_intercept(&profile)?;
 
     // Validate env_credentials keys (URI entries need structural validation)
@@ -2830,10 +3190,27 @@ pub(crate) fn parse_profile_bytes(content: &[u8]) -> Result<Profile> {
 
 /// Load a profile from a JSON file, resolving inheritance. The parent
 /// directory is passed as context so `extends` can resolve sibling profiles.
-fn load_from_file(path: &Path) -> Result<Profile> {
-    let profile = parse_profile_file(path)?;
+fn load_from_file(path: &Path, cli_extends: &[String]) -> Result<Profile> {
+    let mut profile = parse_profile_file(path)?;
+    prepend_cli_extends(&mut profile, cli_extends);
     let context_dir = path.parent();
     resolve_extends(profile, &mut Vec::new(), 0, context_dir, Some(path))
+}
+
+fn prepend_cli_extends(profile: &mut Profile, cli_extends: &[String]) {
+    if cli_extends.is_empty() {
+        return;
+    }
+    let mut extends = Vec::with_capacity(
+        cli_extends
+            .len()
+            .saturating_add(profile.extends.as_ref().map_or(0, Vec::len)),
+    );
+    extends.extend(cli_extends.iter().cloned());
+    if let Some(existing) = profile.extends.take() {
+        extends.extend(existing);
+    }
+    profile.extends = Some(extends);
 }
 
 // ============================================================================
@@ -2948,7 +3325,7 @@ enum ResolvedBase {
 /// This handles the v0.42 → v0.43 upgrade case where a user profile
 /// `extends: ["claude-code"]` and the inbuilt `claude-code` is gone:
 /// instead of an inscrutable "base profile not found" error, the user
-/// sees the same install prompt that `--profile always-further/claude` would
+/// sees the same install prompt that `--profile nolabs-ai/claude` would
 /// produce, with the chain still resolving cleanly on accept.
 fn load_base_profile_raw(
     name: &str,
@@ -3052,9 +3429,70 @@ fn load_base_profile_raw(
 /// The child's values take precedence for scalar fields. Collection fields
 /// are appended and deduplicated. The `extends` field is consumed (set to `None`).
 #[allow(deprecated)] // reads/writes commands.{allow,deny} (deprecated v0.33.0)
+/// Extract the current platform's override block and merge it into `profile`.
+///
+/// Called once during `finalize_profile`, after `extends` is fully resolved.
+/// The override is treated as a child in `merge_profiles` so deny-lists union
+/// and security modes are child-wins — an override can only tighten, not loosen.
+fn apply_platform_overrides(mut profile: Profile) -> Result<Profile> {
+    let Some(mut override_profile) = profile
+        .platform_overrides
+        .take()
+        .and_then(|po| po.for_current_platform())
+        .map(|o| o.0)
+    else {
+        return Ok(profile);
+    };
+    // Overrides don't carry meaningful meta; propagate the profile's own so
+    // merge_profiles' child-wins rule doesn't blank it out.
+    override_profile.meta = profile.meta.clone();
+    Ok(merge_profiles(profile, override_profile))
+}
+
+/// Must preserve a base's overrides, not just a leaf's — `merge_profiles`
+/// previously nulled this field unconditionally, so any override on a base
+/// profile was silently lost. Same-OS conflicts deep-merge via
+/// `merge_platform_override_slot` rather than one side replacing the other,
+/// so a child override touching one field can't wipe out unrelated fields
+/// the base's override for that OS set.
+fn merge_platform_overrides(
+    base: Option<PlatformOverrides>,
+    child: Option<PlatformOverrides>,
+) -> Option<PlatformOverrides> {
+    match (base, child) {
+        (None, None) => None,
+        (Some(b), None) => Some(b),
+        (None, Some(c)) => Some(c),
+        (Some(b), Some(c)) => Some(PlatformOverrides {
+            macos: merge_platform_override_slot(b.macos, c.macos),
+            linux: merge_platform_override_slot(b.linux, c.linux),
+            windows: merge_platform_override_slot(b.windows, c.windows),
+        }),
+    }
+}
+
+/// Uses `merge_profiles` itself so a same-OS override composes with the same
+/// child-wins/dedup-append/deny-union rules as everything else in a profile.
+fn merge_platform_override_slot(
+    base: Option<Box<PlatformOverride>>,
+    child: Option<Box<PlatformOverride>>,
+) -> Option<Box<PlatformOverride>> {
+    match (base, child) {
+        (None, None) => None,
+        (Some(b), None) => Some(b),
+        (None, Some(c)) => Some(c),
+        (Some(b), Some(c)) => Some(Box::new(PlatformOverride(merge_profiles(b.0, c.0)))),
+    }
+}
+
+#[allow(deprecated)] // reads/writes commands.{allow,deny} (deprecated v0.33.0)
 fn merge_profiles(base: Profile, child: Profile) -> Profile {
     Profile {
         extends: None,
+        platform_overrides: merge_platform_overrides(
+            base.platform_overrides,
+            child.platform_overrides,
+        ),
         meta: child.meta,
         security: SecurityConfig {
             signal_mode: child.security.signal_mode.or(base.security.signal_mode),
@@ -3120,6 +3558,7 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
         },
         network: NetworkConfig {
             block: base.network.block || child.network.block,
+            allow_http2: base.network.allow_http2 || child.network.allow_http2,
             network_profile: child
                 .network
                 .network_profile
@@ -3128,9 +3567,19 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
                 &base.network.allow_domain,
                 &child.network.allow_domain,
             ),
+            deny_domain: dedup_append(&base.network.deny_domain, &child.network.deny_domain),
             open_port: dedup_append(&base.network.open_port, &child.network.open_port),
+            open_port_range: dedup_append(
+                &base.network.open_port_range,
+                &child.network.open_port_range,
+            ),
             listen_port: dedup_append(&base.network.listen_port, &child.network.listen_port),
+            listen_port_range: dedup_append(
+                &base.network.listen_port_range,
+                &child.network.listen_port_range,
+            ),
             connect_port: dedup_append(&base.network.connect_port, &child.network.connect_port),
+            no_proxy: dedup_append(&base.network.no_proxy, &child.network.no_proxy),
             // Child `Some([])` overrides parent credentials to empty (disables proxy).
             // Child `None` inherits parent credentials. Child `Some([...])` merges with parent.
             credentials: match child.network.credentials {
@@ -3166,6 +3615,7 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
                 .linux
                 .af_unix_mediation
                 .or(base.linux.af_unix_mediation),
+            sandbox_policy: child.linux.sandbox_policy.or(base.linux.sandbox_policy),
         },
         diagnostics: DiagnosticsConfig {
             suppress_system_services: dedup_append(
@@ -3185,7 +3635,11 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
             (Some(base_env), None) => Some(base_env.clone()),
             (None, Some(child_env)) => Some(child_env.clone()),
             (Some(base_env), Some(child_env)) => Some(EnvironmentConfig {
-                allow_vars: dedup_append(&base_env.allow_vars, &child_env.allow_vars),
+                allow_vars: match (&base_env.allow_vars, &child_env.allow_vars) {
+                    (_, None) => base_env.allow_vars.clone(),
+                    (None, Some(child)) => Some(child.clone()),
+                    (Some(base), Some(child)) => Some(dedup_append(base, child)),
+                },
                 deny_vars: dedup_append(&base_env.deny_vars, &child_env.deny_vars),
                 set_vars: {
                     let mut merged = base_env.set_vars.clone();
@@ -3198,6 +3652,16 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
         credential_capture: {
             let mut merged = base.credential_capture;
             merged.extend(child.credential_capture);
+            merged
+        },
+        credential_providers: {
+            let mut merged = base.credential_providers;
+            merged.extend(child.credential_providers);
+            merged
+        },
+        credential_routes: {
+            let mut merged = base.credential_routes;
+            merged.extend(child.credential_routes);
             merged
         },
         // NOTE: WorkdirAccess::None serves as both "not specified" and "explicitly no access".
@@ -3556,7 +4020,7 @@ pub fn list_profiles() -> Vec<String> {
     }
 
     // Add pack-store profiles — names exposed by installed packs via
-    // `install_as`. Without this, `--profile always-further/claude` works (the
+    // `install_as`. Without this, `--profile nolabs-ai/claude` works (the
     // resolver finds it) but `nono profile list` doesn't surface it,
     // confusing users who expect a one-stop catalogue.
     for (name, _pack_ref) in list_pack_store_profiles() {
@@ -4006,6 +4470,154 @@ mod tests {
     }
 
     #[test]
+    fn test_load_profile_with_extends_prepends_cli_bases()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let dir = tempdir()?;
+        let config_dir = dir.path().canonicalize()?;
+        let config_dir_string = config_dir.to_string_lossy().into_owned();
+        let profiles_dir = config_dir.join("nono").join("profiles");
+        std::fs::create_dir_all(&profiles_dir)?;
+        let _env = crate::test_env::EnvVarGuard::set_all(&[(
+            "XDG_CONFIG_HOME",
+            config_dir_string.as_str(),
+        )]);
+
+        std::fs::write(
+            profiles_dir.join("cli-a.json"),
+            r#"{ "meta": { "name": "cli-a" }, "filesystem": { "read": ["/tmp/cli-a"] } }"#,
+        )?;
+        std::fs::write(
+            profiles_dir.join("cli-b.json"),
+            r#"{ "meta": { "name": "cli-b" }, "filesystem": { "read": ["/tmp/cli-b"] } }"#,
+        )?;
+        std::fs::write(
+            profiles_dir.join("json-base.json"),
+            r#"{ "meta": { "name": "json-base" }, "filesystem": { "read": ["/tmp/json-base"] } }"#,
+        )?;
+        std::fs::write(
+            profiles_dir.join("child.json"),
+            r#"{
+                "extends": "json-base",
+                "meta": { "name": "child" },
+                "filesystem": { "read": ["/tmp/child"] }
+            }"#,
+        )?;
+
+        let profile =
+            load_profile_with_extends("child", &["cli-a".to_string(), "cli-b".to_string()])?;
+
+        assert_eq!(
+            profile.filesystem.read,
+            vec![
+                "/tmp/cli-a".to_string(),
+                "/tmp/cli-b".to_string(),
+                "/tmp/json-base".to_string(),
+                "/tmp/child".to_string(),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_load_profile_with_extends_deduplicates_duplicate_base()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let dir = tempdir()?;
+        let config_dir = dir.path().canonicalize()?;
+        let config_dir_string = config_dir.to_string_lossy().into_owned();
+        let profiles_dir = config_dir.join("nono").join("profiles");
+        std::fs::create_dir_all(&profiles_dir)?;
+        let _env = crate::test_env::EnvVarGuard::set_all(&[(
+            "XDG_CONFIG_HOME",
+            config_dir_string.as_str(),
+        )]);
+
+        std::fs::write(
+            profiles_dir.join("base.json"),
+            r#"{ "meta": { "name": "base" }, "filesystem": { "read": ["/tmp/base"] } }"#,
+        )?;
+        std::fs::write(
+            profiles_dir.join("child.json"),
+            r#"{ "extends": "base", "meta": { "name": "child" } }"#,
+        )?;
+
+        let profile = load_profile_with_extends("child", &["base".to_string()])?;
+
+        assert_eq!(profile.filesystem.read, vec!["/tmp/base".to_string()]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_load_profile_with_extends_missing_base_fails_closed()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let dir = tempdir()?;
+        let config_dir = dir.path().canonicalize()?;
+        let config_dir_string = config_dir.to_string_lossy().into_owned();
+        let profiles_dir = config_dir.join("nono").join("profiles");
+        std::fs::create_dir_all(&profiles_dir)?;
+        let _env = crate::test_env::EnvVarGuard::set_all(&[
+            ("XDG_CONFIG_HOME", config_dir_string.as_str()),
+            ("NONO_NO_MIGRATE", "0"),
+            ("NONO_AUTO_MIGRATE", "0"),
+        ]);
+
+        std::fs::write(
+            profiles_dir.join("child.json"),
+            r#"{ "meta": { "name": "child" } }"#,
+        )?;
+
+        let result = load_profile_with_extends("child", &["missing-base".to_string()]);
+        assert!(matches!(result, Err(NonoError::ProfileInheritance(_))));
+        Ok(())
+    }
+
+    #[test]
+    fn test_load_profile_with_extends_circular_base_fails_closed()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let dir = tempdir()?;
+        let config_dir = dir.path().canonicalize()?;
+        let config_dir_string = config_dir.to_string_lossy().into_owned();
+        let profiles_dir = config_dir.join("nono").join("profiles");
+        std::fs::create_dir_all(&profiles_dir)?;
+        let _env = crate::test_env::EnvVarGuard::set_all(&[(
+            "XDG_CONFIG_HOME",
+            config_dir_string.as_str(),
+        )]);
+
+        std::fs::write(
+            profiles_dir.join("base-a.json"),
+            r#"{ "extends": "base-b", "meta": { "name": "base-a" } }"#,
+        )?;
+        std::fs::write(
+            profiles_dir.join("base-b.json"),
+            r#"{ "extends": "base-a", "meta": { "name": "base-b" } }"#,
+        )?;
+        std::fs::write(
+            profiles_dir.join("child.json"),
+            r#"{ "meta": { "name": "child" } }"#,
+        )?;
+
+        let result = load_profile_with_extends("child", &["base-a".to_string()]);
+        assert!(matches!(result, Err(NonoError::ProfileInheritance(_))));
+        Ok(())
+    }
+
+    #[test]
     fn test_list_profiles() {
         let _guard = match crate::test_env::ENV_LOCK.lock() {
             Ok(g) => g,
@@ -4020,9 +4632,9 @@ mod tests {
         assert!(profiles.contains(&"openclaw".to_string()));
         assert!(profiles.contains(&"swival".to_string()));
         // These profiles were removed from built-ins; they ship via registry packs:
-        //   claude-code / claude → always-further/claude   (removed v0.43.0)
-        //   codex               → always-further/codex    (removed v0.43.0)
-        //   opencode            → always-further/opencode (removed)
+        //   claude-code / claude → nolabs-ai/claude   (formerly always-further/claude, removed v0.43.0)
+        //   codex               → nolabs-ai/codex    (formerly always-further/codex, removed v0.43.0)
+        //   opencode            → nolabs-ai/opencode (formerly always-further/opencode, removed)
         assert!(!profiles.contains(&"claude-code".to_string()));
         assert!(!profiles.contains(&"codex".to_string()));
         assert!(!profiles.contains(&"opencode".to_string()));
@@ -4041,12 +4653,20 @@ mod tests {
         let profile: Profile = serde_json::from_str(json_str).expect("Failed to parse profile");
         assert_eq!(profile.env_credentials.mappings.len(), 2);
         assert_eq!(
-            profile.env_credentials.mappings.get("openai_api_key"),
-            Some(&"OPENAI_API_KEY".to_string())
+            profile
+                .env_credentials
+                .mappings
+                .get("openai_api_key")
+                .map(|s| s.as_str()),
+            Some("OPENAI_API_KEY")
         );
         assert_eq!(
-            profile.env_credentials.mappings.get("anthropic_api_key"),
-            Some(&"ANTHROPIC_API_KEY".to_string())
+            profile
+                .env_credentials
+                .mappings
+                .get("anthropic_api_key")
+                .map(|s| s.as_str()),
+            Some("ANTHROPIC_API_KEY")
         );
     }
 
@@ -4076,7 +4696,11 @@ mod tests {
                 .as_ref()
                 .expect("environment")
                 .allow_vars,
-            vec!["PATH", "HOME", "AWS_*"]
+            Some(vec![
+                "PATH".to_string(),
+                "HOME".to_string(),
+                "AWS_*".to_string()
+            ])
         );
     }
 
@@ -4096,6 +4720,7 @@ mod tests {
 
     #[test]
     fn test_environment_config_empty_allow_vars() {
+        // Explicitly [] in JSON → Some([]) → filter active, blocks all inherited vars
         let json_str = r#"{
             "meta": { "name": "test-profile" },
             "environment": {
@@ -4108,7 +4733,25 @@ mod tests {
             .environment
             .as_ref()
             .expect("environment should be Some");
-        assert!(env_config.allow_vars.is_empty());
+        assert_eq!(env_config.allow_vars, Some(vec![]));
+    }
+
+    #[test]
+    fn test_environment_config_absent_allow_vars() {
+        // allow_vars not written in JSON → None → no filter
+        let json_str = r#"{
+            "meta": { "name": "test-profile" },
+            "environment": {
+                "deny_vars": ["GH_TOKEN"]
+            }
+        }"#;
+
+        let profile: Profile = serde_json::from_str(json_str).expect("Failed to parse profile");
+        let env_config = profile
+            .environment
+            .as_ref()
+            .expect("environment should be Some");
+        assert_eq!(env_config.allow_vars, None);
     }
 
     #[test]
@@ -4129,7 +4772,7 @@ mod tests {
             env_config.deny_vars,
             vec!["GH_TOKEN", "GITHUB_*", "ANTHROPIC_API_KEY"]
         );
-        assert!(env_config.allow_vars.is_empty());
+        assert_eq!(env_config.allow_vars, None);
     }
 
     #[test]
@@ -4147,7 +4790,14 @@ mod tests {
             .environment
             .as_ref()
             .expect("environment should be Some");
-        assert_eq!(env_config.allow_vars, vec!["PATH", "HOME", "AWS_*"]);
+        assert_eq!(
+            env_config.allow_vars,
+            Some(vec![
+                "PATH".to_string(),
+                "HOME".to_string(),
+                "AWS_*".to_string()
+            ])
+        );
         assert_eq!(env_config.deny_vars, vec!["AWS_SECRET_ACCESS_KEY"]);
     }
 
@@ -4156,7 +4806,7 @@ mod tests {
         // Merging two profiles with deny_vars concatenates them
         let base = Profile {
             environment: Some(EnvironmentConfig {
-                allow_vars: vec![],
+                allow_vars: None,
                 deny_vars: vec!["GH_TOKEN".into()],
                 set_vars: Default::default(),
             }),
@@ -4164,7 +4814,7 @@ mod tests {
         };
         let child = Profile {
             environment: Some(EnvironmentConfig {
-                allow_vars: vec![],
+                allow_vars: None,
                 deny_vars: vec!["ANTHROPIC_API_KEY".into()],
                 set_vars: Default::default(),
             }),
@@ -4181,7 +4831,7 @@ mod tests {
     fn test_environment_config_deny_vars_merge_deduplicates() {
         let base = Profile {
             environment: Some(EnvironmentConfig {
-                allow_vars: vec![],
+                allow_vars: None,
                 deny_vars: vec!["GH_TOKEN".into(), "ANTHROPIC_API_KEY".into()],
                 set_vars: Default::default(),
             }),
@@ -4189,7 +4839,7 @@ mod tests {
         };
         let child = Profile {
             environment: Some(EnvironmentConfig {
-                allow_vars: vec![],
+                allow_vars: None,
                 deny_vars: vec!["ANTHROPIC_API_KEY".into()],
                 set_vars: Default::default(),
             }),
@@ -4310,8 +4960,12 @@ mod tests {
         let profile: Profile = serde_json::from_str(json_str).expect("Failed to parse profile");
         assert_eq!(profile.env_credentials.mappings.len(), 1);
         assert_eq!(
-            profile.env_credentials.mappings.get("openai_api_key"),
-            Some(&"OPENAI_API_KEY".to_string())
+            profile
+                .env_credentials
+                .mappings
+                .get("openai_api_key")
+                .map(|s| s.as_str()),
+            Some("OPENAI_API_KEY")
         );
     }
 
@@ -4472,7 +5126,7 @@ mod tests {
     }
 
     // ============================================================================
-    // is_http_token_char tests (RFC 7230)
+    // is_http_token_char tests
     // ============================================================================
 
     #[test]
@@ -4485,7 +5139,7 @@ mod tests {
 
     #[test]
     fn test_http_token_char_special_chars() {
-        // RFC 7230 tchar: !#$%&'*+-.^_`|~
+        // valid special chars in header token names: !#$%&'*+-.^_`|~
         for c in "!#$%&'*+-.^_`|~".chars() {
             assert!(is_http_token_char(c), "Expected '{}' to be valid tchar", c);
         }
@@ -4506,7 +5160,7 @@ mod tests {
     // Custom credential validation integration tests
     //
     // These test the full validation chain including:
-    // - inject_header (RFC 7230 token validation)
+    // - inject_header (token validation)
     // - credential_format (CRLF injection prevention)
     // - credential_key (alphanumeric + underscore)
     // - upstream URL (HTTPS required, HTTP only for loopback)
@@ -4531,6 +5185,7 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             aws_auth: None,
+            spiffe: None,
         }
     }
 
@@ -4673,6 +5328,57 @@ mod tests {
         assert!(validate_custom_credential("local", &cred).is_ok());
     }
 
+    #[test]
+    fn test_validate_custom_credential_spiffe_only_valid() {
+        let cred = CustomCredentialDef {
+            upstream: "http://127.0.0.1:8080".to_string(),
+            credential_key: None,
+            auth: None,
+            inject_mode: InjectMode::Header,
+            inject_header: "Authorization".to_string(),
+            credential_format: None,
+            path_pattern: None,
+            path_replacement: None,
+            query_param_name: None,
+            proxy: None,
+            env_var: None,
+            endpoint_rules: vec![],
+            endpoint_policy: None,
+            tls_ca: None,
+            tls_client_cert: None,
+            tls_client_key: None,
+            aws_auth: None,
+            spiffe: Some(nono_proxy::config::SpiffeAuthConfig::Jwt {
+                workload_api_socket: "/run/spire/agent/api.sock".to_string(),
+                audience: vec!["test-audience".to_string()],
+                inject_header: "Authorization".to_string(),
+                credential_format: None,
+                svid_hint: None,
+            }),
+        };
+        assert!(validate_custom_credential("testapi", &cred).is_ok());
+    }
+
+    #[test]
+    fn test_validate_custom_credential_spiffe_with_credential_key_rejected() {
+        let mut cred = header_cred_builder();
+        cred.spiffe = Some(nono_proxy::config::SpiffeAuthConfig::Jwt {
+            workload_api_socket: "/run/spire/agent/api.sock".to_string(),
+            audience: vec!["test-audience".to_string()],
+            inject_header: "Authorization".to_string(),
+            credential_format: None,
+            svid_hint: None,
+        });
+        let result = validate_custom_credential("test", &cred);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("spiffe is mutually exclusive")
+        );
+    }
+
     // ============================================================================
     // Injection Mode Validation Tests
     // ============================================================================
@@ -4697,6 +5403,7 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             aws_auth: None,
+            spiffe: None,
         };
         assert!(validate_custom_credential("telegram", &cred).is_ok());
     }
@@ -4721,6 +5428,7 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             aws_auth: None,
+            spiffe: None,
         };
         let result = validate_custom_credential("telegram", &cred);
         let err = result.expect_err("missing path_pattern should be rejected");
@@ -4747,6 +5455,7 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             aws_auth: None,
+            spiffe: None,
         };
         let result = validate_custom_credential("telegram", &cred);
         let err = result.expect_err("pattern without {} should be rejected");
@@ -4773,6 +5482,7 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             aws_auth: None,
+            spiffe: None,
         };
         assert!(validate_custom_credential("telegram", &cred).is_ok());
     }
@@ -4797,6 +5507,7 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             aws_auth: None,
+            spiffe: None,
         };
         let result = validate_custom_credential("telegram", &cred);
         let err = result.expect_err("replacement without {} should be rejected");
@@ -4823,6 +5534,7 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             aws_auth: None,
+            spiffe: None,
         };
         assert!(validate_custom_credential("google_maps", &cred).is_ok());
     }
@@ -4847,6 +5559,7 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             aws_auth: None,
+            spiffe: None,
         };
         let result = validate_custom_credential("google_maps", &cred);
         let err = result.expect_err("missing query_param_name should be rejected");
@@ -4873,6 +5586,7 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             aws_auth: None,
+            spiffe: None,
         };
         let result = validate_custom_credential("google_maps", &cred);
         let err = result.expect_err("empty query_param_name should be rejected");
@@ -4899,6 +5613,7 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             aws_auth: None,
+            spiffe: None,
         };
         // BasicAuth mode doesn't require additional fields
         // Credential value is expected to be "username:password" format
@@ -5087,6 +5802,8 @@ mod tests {
                 client_id: "my-client".to_string(),
                 client_secret: "env://CLIENT_SECRET".to_string(),
                 scope: "read write".to_string(),
+                client_assertion: None,
+                extra_params: Default::default(),
             }),
             inject_mode: InjectMode::Header,
             inject_header: "Authorization".to_string(),
@@ -5102,6 +5819,7 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             aws_auth: None,
+            spiffe: None,
         }
     }
 
@@ -5138,6 +5856,8 @@ mod tests {
             client_id: "my-client".to_string(),
             client_secret: "env://SECRET".to_string(),
             scope: String::new(),
+            client_assertion: None,
+            extra_params: Default::default(),
         });
         let result = validate_custom_credential("test", &cred);
         let err = result.expect_err("HTTP to remote token_url should be rejected");
@@ -5152,6 +5872,8 @@ mod tests {
             client_id: "my-client".to_string(),
             client_secret: "env://SECRET".to_string(),
             scope: String::new(),
+            client_assertion: None,
+            extra_params: Default::default(),
         });
         assert!(validate_custom_credential("test", &cred).is_ok());
     }
@@ -5164,6 +5886,8 @@ mod tests {
             client_id: "".to_string(),
             client_secret: "env://SECRET".to_string(),
             scope: String::new(),
+            client_assertion: None,
+            extra_params: Default::default(),
         });
         let result = validate_custom_credential("test", &cred);
         let err = result.expect_err("empty client_id should be rejected");
@@ -5179,6 +5903,8 @@ mod tests {
             client_id: "my-client".to_string(),
             client_secret: "".to_string(),
             scope: String::new(),
+            client_assertion: None,
+            extra_params: Default::default(),
         });
         let result = validate_custom_credential("test", &cred);
         let err = result.expect_err("empty client_secret should be rejected");
@@ -5194,6 +5920,8 @@ mod tests {
             client_id: "my-client".to_string(),
             client_secret: "env://SECRET".to_string(),
             scope: String::new(),
+            client_assertion: None,
+            extra_params: Default::default(),
         });
         assert!(validate_custom_credential("test", &cred).is_ok());
     }
@@ -5313,11 +6041,16 @@ mod tests {
             },
             network: NetworkConfig {
                 block: false,
+                allow_http2: false,
                 network_profile: InheritableValue::Set("base-net".to_string()),
                 allow_domain: vec![AllowDomainEntry::Plain("base.example.com".to_string())],
+                deny_domain: vec![],
                 open_port: vec![3000],
+                open_port_range: vec![],
                 listen_port: vec![4000],
+                listen_port_range: vec![],
                 connect_port: vec![],
+                no_proxy: vec!["base.local".to_string()],
                 credentials: Some(vec!["base_cred".to_string()]),
                 custom_credentials: HashMap::new(),
                 tls_intercept: None,
@@ -5336,6 +6069,8 @@ mod tests {
             environment: None,
             command_policies: None,
             credential_capture: HashMap::new(),
+            credential_providers: HashMap::new(),
+            credential_routes: Vec::new(),
             workdir: WorkdirConfig {
                 access: WorkdirAccess::ReadWrite,
             },
@@ -5360,6 +6095,7 @@ mod tests {
             binary: None,
             command_args: vec![],
             unsafe_macos_seatbelt_rules: vec![],
+            platform_overrides: None,
         }
     }
 
@@ -5397,11 +6133,16 @@ mod tests {
             },
             network: NetworkConfig {
                 block: false,
+                allow_http2: false,
                 network_profile: InheritableValue::Inherit,
                 allow_domain: vec![AllowDomainEntry::Plain("child.example.com".to_string())],
+                deny_domain: vec![],
                 open_port: vec![3000, 5000],
+                open_port_range: vec![],
                 listen_port: vec![4000, 6000],
+                listen_port_range: vec![],
                 connect_port: vec![],
+                no_proxy: vec!["base.local".to_string(), "child.local".to_string()],
                 credentials: None,
                 custom_credentials: HashMap::new(),
                 tls_intercept: None,
@@ -5420,6 +6161,8 @@ mod tests {
             environment: None,
             command_policies: None,
             credential_capture: HashMap::new(),
+            credential_providers: HashMap::new(),
+            credential_routes: Vec::new(),
             workdir: WorkdirConfig {
                 access: WorkdirAccess::None,
             },
@@ -5444,6 +6187,7 @@ mod tests {
             binary: None,
             command_args: vec![],
             unsafe_macos_seatbelt_rules: vec![],
+            platform_overrides: None,
         }
     }
 
@@ -5468,6 +6212,15 @@ mod tests {
         let merged = merge_profiles(base_profile(), child_profile());
         // base has [3000], child has [3000, 5000] — merged should dedup to [3000, 5000]
         assert_eq!(merged.network.open_port, vec![3000, 5000]);
+    }
+
+    #[test]
+    fn test_merge_profiles_deduplicates_no_proxy() {
+        let merged = merge_profiles(base_profile(), child_profile());
+        assert_eq!(
+            merged.network.no_proxy,
+            vec!["base.local".to_string(), "child.local".to_string()]
+        );
     }
 
     #[test]
@@ -5674,6 +6427,7 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 aws_auth: None,
+                spiffe: None,
             },
         );
 
@@ -5698,6 +6452,7 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 aws_auth: None,
+                spiffe: None,
             },
         );
 
@@ -5840,6 +6595,7 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 aws_auth: None,
+                spiffe: None,
             },
         );
 
@@ -5864,6 +6620,7 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 aws_auth: None,
+                spiffe: None,
             },
         );
 
@@ -5892,7 +6649,10 @@ mod tests {
         )
         .expect("write profile");
 
-        let profile = load_from_file(&profile_path).expect("load extended profile");
+        let profile = match load_from_file(&profile_path, &[]) {
+            Ok(profile) => profile,
+            Err(err) => panic!("load extended profile: {err}"),
+        };
         assert_eq!(profile.meta.name, "ext-test");
         // Should inherit openclaw's filesystem paths
         assert!(
@@ -6150,8 +6910,12 @@ mod tests {
 
         let merged = merge_profiles(base, child);
         assert_eq!(
-            merged.env_credentials.mappings.get("shared_key"),
-            Some(&"CHILD_VALUE".to_string()),
+            merged
+                .env_credentials
+                .mappings
+                .get("shared_key")
+                .map(|s| s.as_str()),
+            Some("CHILD_VALUE"),
             "child should win for same key"
         );
         assert!(merged.env_credentials.mappings.contains_key("base_key"));
@@ -6621,7 +7385,10 @@ mod tests {
         )
         .expect("write profile");
 
-        let profile = load_from_file(&profile_path).expect("load extended profile");
+        let profile = match load_from_file(&profile_path, &[]) {
+            Ok(profile) => profile,
+            Err(err) => panic!("load extended profile: {err}"),
+        };
         assert_eq!(profile.meta.name, "multi-ext-test");
         assert!(
             profile
@@ -6646,7 +7413,7 @@ mod tests {
         )
         .expect("write profile");
 
-        let result = load_from_file(&profile_path);
+        let result = load_from_file(&profile_path, &[]);
         assert!(
             result.is_ok(),
             "shared transitive base should be deduplicated, not error: {:?}",
@@ -6671,7 +7438,10 @@ mod tests {
         )
         .expect("write");
 
-        let profile = load_from_file(&child_path).expect("resolve");
+        let profile = match load_from_file(&child_path, &[]) {
+            Ok(profile) => profile,
+            Err(err) => panic!("resolve: {err}"),
+        };
         assert_eq!(profile.meta.name, "child");
         assert!(
             profile
@@ -6693,7 +7463,10 @@ mod tests {
         )
         .expect("write");
 
-        let profile = load_from_file(&self_path).expect("should not be circular");
+        let profile = match load_from_file(&self_path, &[]) {
+            Ok(profile) => profile,
+            Err(err) => panic!("should not be circular: {err}"),
+        };
         assert_eq!(profile.meta.name, "my-default");
         assert!(
             !profile.groups.include.is_empty(),
@@ -6719,7 +7492,10 @@ mod tests {
         )
         .expect("write");
 
-        let profile = load_from_file(&self_path).expect("should resolve both bases");
+        let profile = match load_from_file(&self_path, &[]) {
+            Ok(profile) => profile,
+            Err(err) => panic!("should resolve both bases: {err}"),
+        };
         assert_eq!(profile.meta.name, "my-combo");
         assert!(
             !profile.groups.include.is_empty(),
@@ -6784,6 +7560,46 @@ mod tests {
             err.to_string().contains("command_policies cannot be null"),
             "error should describe null rejection: {err}"
         );
+    }
+
+    /// Regression for https://github.com/nolabs-ai/nono/issues/1400.
+    ///
+    /// The post-run save flow serializes a resolved `Profile` and writes it
+    /// to disk. Inheritable `Option` fields whose `None` means "inherit from
+    /// base" must be OMITTED from the output, not serialized as `null`.
+    /// `command_policies` additionally rejects an explicit `null` on read
+    /// (see `test_command_policies_null_rejected`), so serializing `None` as
+    /// `null` produced a file that could never be reloaded — the user-visible
+    /// "saving throws an error, yet the profile is updated on disk" symptom.
+    #[test]
+    fn test_inheritable_options_omitted_when_none_and_round_trip() {
+        // A default Profile has every inheritable Option set to None.
+        let profile = Profile::default();
+
+        let json = serde_json::to_string(&profile).expect("serialize");
+
+        // None of these keys may appear in the serialized form; emitting any
+        // of them as `null` either breaks reload (command_policies) or
+        // wrongly clears an inherited value (the rest).
+        for key in [
+            "\"environment\"",
+            "\"command_policies\"",
+            "\"open_urls\"",
+            "\"allow_launch_services\"",
+            "\"allow_gpu\"",
+            "\"allow_parent_of_protected\"",
+            "\"binary\"",
+        ] {
+            assert!(
+                !json.contains(key),
+                "serialized Profile should omit {key} when None, got: {json}"
+            );
+        }
+
+        // The whole point: the saved file must reload successfully.
+        let reparsed: Profile = serde_json::from_str(&json).expect("saved profile must round-trip");
+        assert_eq!(reparsed.command_policies, None);
+        assert_eq!(reparsed.open_urls, None);
     }
 
     #[test]
@@ -6864,6 +7680,7 @@ mod tests {
                     "credentials": ["openai"],
                     "open_port": [3000],
                     "listen_port": [4000],
+                    "no_proxy": ["redis"],
                     "upstream_proxy": "squid.corp:3128",
                     "upstream_bypass": ["internal.corp"]
                 }
@@ -6878,8 +7695,122 @@ mod tests {
         assert!(network.contains_key("credentials"));
         assert!(network.contains_key("open_port"));
         assert!(network.contains_key("listen_port"));
+        assert!(network.contains_key("no_proxy"));
         assert!(network.contains_key("upstream_proxy"));
         assert!(network.contains_key("upstream_bypass"));
+    }
+
+    #[test]
+    fn test_network_no_proxy_deserializes_plain_host_patterns() -> Result<()> {
+        let profile = parse_profile_bytes(
+            br#"{
+                "meta": { "name": "no-proxy" },
+                "network": {
+                    "no_proxy": ["redis", "*.internal.example", ".svc.cluster.local"]
+                }
+            }"#,
+        )?;
+
+        assert_eq!(
+            profile.network.no_proxy,
+            vec![
+                "redis".to_string(),
+                "*.internal.example".to_string(),
+                ".svc.cluster.local".to_string()
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_network_no_proxy_rejects_url_credentials_and_path_entries() {
+        for entry in [
+            "https://dev.local",
+            "user@dev.local",
+            "dev.local/path",
+            "dev.local?debug=true",
+            "dev.local:8080",
+            "dev.local",
+            "api.openai.com",
+            "API.OPENAI.COM",
+            "169.254.169.254",
+            "169.254.1.2",
+            "internal",
+            "fd00:ec2::254",
+            "fd00:0ec2::254",
+            "fd00:ec2:0:0:0:0:0:254",
+            "[fd00:ec2::254]",
+            "[fd00:0ec2::254]",
+            "[fe80::1]",
+            "metadata.google.internal",
+            ".google.internal",
+            "[::1]:8443",
+            "*",
+        ] {
+            let json = format!(
+                r#"{{
+                    "meta": {{ "name": "bad-no-proxy" }},
+                    "network": {{ "no_proxy": ["{entry}"] }}
+                }}"#
+            );
+            let result = parse_profile_bytes(json.as_bytes());
+            assert!(
+                result.is_err(),
+                "network.no_proxy entry {entry:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_network_no_proxy_rejects_allow_domain_overlap() {
+        for (allow_domain, no_proxy) in [
+            (r#""api.internal.corp""#, ".internal.corp"),
+            (r#""redis""#, "redis"),
+            (
+                r#"{ "domain": "api.github.com", "endpoints": [{ "method": "GET", "path": "/repos/**" }] }"#,
+                ".github.com",
+            ),
+        ] {
+            let json = format!(
+                r#"{{
+                    "meta": {{ "name": "bad-no-proxy-overlap" }},
+                    "network": {{
+                        "allow_domain": [{allow_domain}],
+                        "no_proxy": ["{no_proxy}"]
+                    }}
+                }}"#
+            );
+            let result = parse_profile_bytes(json.as_bytes());
+            assert!(
+                result.is_err(),
+                "allow_domain {allow_domain} and no_proxy {no_proxy:?} should conflict"
+            );
+        }
+    }
+
+    #[test]
+    fn test_finalize_profile_rejects_inherited_no_proxy_allow_domain_overlap() -> Result<()> {
+        let base = parse_profile_bytes(
+            br#"{
+                "meta": { "name": "base" },
+                "network": { "no_proxy": [".internal.corp"] }
+            }"#,
+        )?;
+        let child = parse_profile_bytes(
+            br#"{
+                "meta": { "name": "child" },
+                "network": { "allow_domain": ["api.internal.corp"] }
+            }"#,
+        )?;
+
+        let merged = merge_profiles(base, child);
+        let result = finalize_profile(merged);
+
+        assert!(
+            result.is_err(),
+            "inherited allow_domain/no_proxy conflicts must fail after profile merge"
+        );
+        Ok(())
     }
 
     #[test]
@@ -7332,7 +8263,7 @@ mod tests {
                                                 "allow": [
                                                     {
                                                         "method": "GET",
-                                                        "path": "/repos/always-further/nono/issues"
+                                                        "path": "/repos/nolabs-ai/nono/issues"
                                                     }
                                                 ]
                                             }
@@ -7432,6 +8363,7 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             aws_auth: None,
+            spiffe: None,
         };
         assert!(
             validate_custom_credential("example", &cred).is_ok(),
@@ -7459,6 +8391,7 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             aws_auth: None,
+            spiffe: None,
         };
         let result = validate_custom_credential("example", &cred);
         let err = result.expect_err("file:// URI without env_var should be rejected");
@@ -7489,6 +8422,7 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             aws_auth: None,
+            spiffe: None,
         };
         let result = validate_custom_credential("example", &cred);
         let err = result.expect_err("file:// URI with relative path should be rejected");
@@ -7519,6 +8453,7 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             aws_auth: None,
+            spiffe: None,
         };
         let result = validate_custom_credential("example", &cred);
         assert!(
@@ -7581,6 +8516,7 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             aws_auth: None,
+            spiffe: None,
         };
         assert!(validate_custom_credential("example", &cred).is_ok());
     }
@@ -7721,8 +8657,252 @@ mod tests {
         )
         .expect("write child");
 
-        let profile = load_from_file(&child_path).expect("inherited cmd capture resolves");
+        let profile = match load_from_file(&child_path, &[]) {
+            Ok(profile) => profile,
+            Err(err) => panic!("inherited cmd capture resolves: {err}"),
+        };
         assert!(profile.credential_capture.contains_key("github"));
+    }
+
+    #[test]
+    fn test_profile_cmd_uri_provider_custom_credential_requires_capture_entry() {
+        let json = r#"{
+            "meta": { "name": "provider-creds" },
+            "network": {
+                "credentials": ["acme_mcp"],
+                "custom_credentials": {
+                    "acme_mcp": {
+                        "upstream": "https://mcp.example.com",
+                        "credential_key": "cmd://acme_mcp",
+                        "env_var": "ACME_MCP_TOKEN"
+                    }
+                }
+            }
+        }"#;
+        let profile = parse_profile_bytes(json.as_bytes()).expect("raw profile parses");
+        let err = finalize_profile(profile).expect_err("missing provider should reject");
+        assert!(
+            err.to_string().contains("credential_capture.acme_mcp"),
+            "error should mention missing provider entry: {err}"
+        );
+    }
+
+    #[test]
+    fn test_profile_cmd_uri_custom_credential_accepts_provider_entry() {
+        let json = r#"{
+            "meta": { "name": "provider-creds" },
+            "network": {
+                "credentials": ["acme_mcp"],
+                "custom_credentials": {
+                    "acme_mcp": {
+                        "upstream": "https://mcp.example.com",
+                        "credential_key": "cmd://acme_mcp",
+                        "env_var": "ACME_MCP_TOKEN"
+                    }
+                }
+            },
+            "credential_capture": {
+                "acme_mcp": {
+                    "provider": {
+                        "command": ["/bin/echo", "{\"material\":{\"type\":\"secret\",\"value\":\"token\"}}"],
+                        "config": {
+                            "issuer": "https://auth.example.com"
+                        }
+                    },
+                    "timeout_secs": 5,
+                    "cache_ttl_secs": 0
+                }
+            }
+        }"#;
+        let profile = parse_profile_bytes(json.as_bytes()).expect("provider profile parses");
+        let entry = profile
+            .credential_capture
+            .get("acme_mcp")
+            .expect("provider entry should parse");
+        assert!(entry.command.is_empty());
+        assert!(entry.provider.is_some());
+    }
+
+    #[test]
+    fn test_profile_provider_capture_rejects_command_and_provider() {
+        let json = br#"{
+            "meta": { "name": "provider-creds" },
+            "credential_capture": {
+                "acme_mcp": {
+                    "command": ["/bin/echo", "token"],
+                    "provider": {
+                        "command": ["/bin/echo", "{\"material\":{\"type\":\"secret\",\"value\":\"token\"}}"]
+                    }
+                }
+            }
+        }"#;
+        let err = parse_profile_bytes(json).expect_err("dual source should reject");
+        assert!(
+            err.to_string()
+                .contains("exactly one of 'command' or 'provider'"),
+            "error should mention source conflict: {err}"
+        );
+    }
+
+    #[test]
+    fn test_profile_parses_oauth_capture_credential_provider() {
+        let json = r#"{
+            "meta": { "name": "provider-oauth-capture" },
+            "credential_providers": {
+                "claude_code": {
+                    "type": "oauth_capture",
+                    "token_endpoints": [
+                        {
+                            "host": "https://platform.claude.com",
+                            "path": "/v1/oauth/token",
+                            "response_fields": [
+                                { "path": "access_token", "kind": "opaque" },
+                                { "path": "refresh_token", "kind": "opaque" }
+                            ],
+                            "request_nonce_fields": ["access_token", "refresh_token"]
+                        }
+                    ],
+                    "api_hosts": ["https://api.anthropic.com"],
+                    "credential_store": {
+                        "type": "keychain_json",
+                        "service": "Claude Code-credentials",
+                        "account_candidates": ["unknown", "$USER", "claude-code-user"],
+                        "phantom_fields": [
+                            "claudeAiOauth.accessToken",
+                            "claudeAiOauth.refreshToken"
+                        ]
+                    },
+                    "helpers": {
+                        "status": ["claude", "auth", "status", "--json"],
+                        "login": ["claude", "auth", "login"],
+                        "logout": ["claude", "auth", "logout"]
+                    }
+                }
+            },
+            "credential_routes": [
+                {
+                    "name": "anthropic_oauth",
+                    "provider": "claude_code",
+                    "env_var": "ANTHROPIC_AUTH_TOKEN",
+                    "base_url_env_var": "ANTHROPIC_BASE_URL",
+                    "endpoint_policy": {
+                        "default": { "decision": "deny" },
+                        "allow": [{ "method": "POST", "path": "/v1/messages" }]
+                    }
+                }
+            ]
+        }"#;
+        let profile = parse_profile_bytes(json.as_bytes()).expect("provider profile parses");
+        let provider = profile
+            .credential_providers
+            .get("claude_code")
+            .expect("provider should parse");
+        assert_eq!(provider.provider_type, CredentialProviderType::OauthCapture);
+        assert_eq!(
+            provider.token_endpoints[0].host,
+            "https://platform.claude.com"
+        );
+        assert_eq!(provider.api_hosts, vec!["https://api.anthropic.com"]);
+        assert_eq!(profile.credential_routes[0].provider, "claude_code");
+    }
+
+    #[test]
+    fn test_profile_credential_route_rejects_unknown_provider() {
+        let json = br#"{
+            "meta": { "name": "provider-oauth-capture" },
+            "credential_routes": [
+                {
+                    "name": "anthropic_oauth",
+                    "provider": "missing_provider",
+                    "env_var": "ANTHROPIC_AUTH_TOKEN"
+                }
+            ]
+        }"#;
+        let profile = parse_profile_bytes(json).expect("raw profile parses");
+        let err = finalize_profile(profile).expect_err("unknown provider should reject");
+        assert!(
+            err.to_string().contains("unknown credential provider"),
+            "error should mention unknown provider: {err}"
+        );
+    }
+
+    #[test]
+    fn test_profile_credential_route_accepts_inherited_provider() {
+        let dir = tempdir().expect("tmpdir");
+        std::fs::write(
+            dir.path().join("base.json"),
+            r#"{
+                "meta": { "name": "base" },
+                "credential_providers": {
+                    "codex": {
+                        "type": "oauth_capture",
+                        "token_endpoints": [
+                            {
+                                "host": "https://auth.openai.com",
+                                "path": "/oauth/token",
+                                "response_fields": [
+                                    { "path": "access_token", "kind": "opaque" },
+                                    { "path": "refresh_token", "kind": "opaque" }
+                                ],
+                                "request_nonce_fields": ["refresh_token"]
+                            }
+                        ],
+                        "api_hosts": ["https://api.openai.com"]
+                    }
+                }
+            }"#,
+        )
+        .expect("write base");
+        let child_path = dir.path().join("child.json");
+        std::fs::write(
+            &child_path,
+            r#"{
+                "extends": "base",
+                "meta": { "name": "child" },
+                "credential_routes": [
+                    {
+                        "name": "openai_oauth",
+                        "provider": "codex",
+                        "env_var": "OPENAI_API_KEY",
+                        "base_url_env_var": "OPENAI_BASE_URL"
+                    }
+                ]
+            }"#,
+        )
+        .expect("write child");
+
+        let profile = load_from_file(&child_path, &[]).expect("inherited provider resolves");
+        assert!(profile.credential_providers.contains_key("codex"));
+        assert_eq!(profile.credential_routes[0].provider, "codex");
+    }
+
+    #[test]
+    fn test_profile_credential_provider_rejects_non_origin_token_host() {
+        let json = br#"{
+            "meta": { "name": "provider-oauth-capture" },
+            "credential_providers": {
+                "codex": {
+                    "type": "oauth_capture",
+                    "token_endpoints": [
+                        {
+                            "host": "https://auth.openai.com/oauth/token",
+                            "path": "/oauth/token",
+                            "response_fields": [
+                                { "path": "access_token", "kind": "opaque" },
+                                { "path": "refresh_token", "kind": "opaque" }
+                            ],
+                            "request_nonce_fields": ["refresh_token"]
+                        }
+                    ],
+                    "api_hosts": ["https://api.openai.com"]
+                }
+            }
+        }"#;
+        let err = parse_profile_bytes(json).expect_err("token host path should reject");
+        assert!(
+            err.to_string().contains("must be an origin"),
+            "error should mention origin-only hosts: {err}"
+        );
     }
 
     #[test]
@@ -7745,6 +8925,7 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             aws_auth: None,
+            spiffe: None,
         };
         let result = validate_custom_credential("example", &cred);
         assert!(result.is_err(), "env://LD_PRELOAD should be rejected");
@@ -7836,12 +9017,20 @@ mod tests {
         );
         assert_eq!(profile.filesystem.deny, vec!["/denied".to_string()]);
         assert_eq!(
-            profile.env_credentials.mappings.get("plain"),
-            Some(&"PLAIN_TOKEN".to_string())
+            profile
+                .env_credentials
+                .mappings
+                .get("plain")
+                .map(|s| s.as_str()),
+            Some("PLAIN_TOKEN")
         );
         assert_eq!(
-            profile.env_credentials.mappings.get("matching"),
-            Some(&"MATCH_TOKEN".to_string())
+            profile
+                .env_credentials
+                .mappings
+                .get("matching")
+                .map(|s| s.as_str()),
+            Some("MATCH_TOKEN")
         );
         assert!(!profile.env_credentials.mappings.contains_key("skipped"));
         let origins = profile.open_urls.expect("open urls").allow_origins;
@@ -8539,6 +9728,7 @@ mod tests {
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
+            spiffe: None,
         }
     }
 
@@ -8602,6 +9792,8 @@ mod tests {
                 client_id: "cid".to_string(),
                 client_secret: "env://SECRET".to_string(),
                 scope: String::new(),
+                client_assertion: None,
+                extra_params: Default::default(),
             }),
             ..aws_auth_cred_builder()
         };
@@ -8621,6 +9813,7 @@ mod tests {
             credential_key: None,
             auth: None,
             aws_auth: None,
+            spiffe: None,
             ..aws_auth_cred_builder()
         };
         let result = validate_custom_credential("bedrock", &cred);
@@ -8919,5 +10112,532 @@ mod tests {
             ..aws_auth_cred_builder()
         };
         assert!(validate_custom_credential("apigw", &cred).is_ok());
+    }
+
+    // --- platform_overrides tests ---
+
+    #[test]
+    fn platform_overrides_parses_and_serializes() {
+        let json = r#"{
+            "meta": {"name": "test"},
+            "platform_overrides": {
+                "macos": { "filesystem": { "read": ["/opt/homebrew"] } },
+                "linux": { "filesystem": { "read": ["/usr/lib"] } }
+            }
+        }"#;
+        let profile: Profile = serde_json::from_str(json).expect("parse");
+        let po = profile.platform_overrides.as_ref().expect("has overrides");
+        assert!(po.macos.is_some());
+        assert!(po.linux.is_some());
+        assert!(po.windows.is_none());
+    }
+
+    #[test]
+    fn platform_overrides_rejects_nested_extends() {
+        let json = r#"{
+            "meta": {"name": "test"},
+            "platform_overrides": {
+                "linux": { "extends": "base", "filesystem": { "read": ["/usr/lib"] } }
+            }
+        }"#;
+        let err = serde_json::from_str::<Profile>(json).unwrap_err();
+        assert!(
+            err.to_string().contains("extends"),
+            "expected error about `extends`, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn platform_overrides_rejects_nested_platform_overrides() {
+        let json = r#"{
+            "meta": {"name": "test"},
+            "platform_overrides": {
+                "linux": {
+                    "platform_overrides": { "linux": {} }
+                }
+            }
+        }"#;
+        let err = serde_json::from_str::<Profile>(json).unwrap_err();
+        assert!(
+            err.to_string().contains("platform_overrides"),
+            "expected error about nesting, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn platform_overrides_merge_adds_filesystem_paths() {
+        // Build a profile whose override for the current platform adds a read path.
+        let current_os = crate::platform::current_os_name();
+        let json = format!(
+            r#"{{
+                "meta": {{"name": "test"}},
+                "filesystem": {{"read": ["/base/path"]}},
+                "platform_overrides": {{
+                    "{current_os}": {{ "filesystem": {{"read": ["/platform/path"]}} }}
+                }}
+            }}"#
+        );
+        let profile: Profile = serde_json::from_str(&json).expect("parse");
+        // finalize_profile applies platform_overrides
+        let finalized = finalize_profile(profile).expect("finalize");
+        assert!(
+            finalized.platform_overrides.is_none(),
+            "platform_overrides should be consumed after finalization"
+        );
+        assert!(
+            finalized
+                .filesystem
+                .read
+                .contains(&"/base/path".to_string()),
+            "base path must be present"
+        );
+        assert!(
+            finalized
+                .filesystem
+                .read
+                .contains(&"/platform/path".to_string()),
+            "platform override path must be present after merge"
+        );
+    }
+
+    #[test]
+    fn platform_overrides_merge_adds_command_exec_paths() {
+        // A per-command `exec_paths` declared only in the current platform's
+        // override must merge into the command's sandbox alongside the base's.
+        let current_os = crate::platform::current_os_name();
+        let json = format!(
+            r#"{{
+                "meta": {{"name": "test"}},
+                "command_policies": {{"commands": {{"git": {{"sandbox": {{"exec_paths": ["/base/exec"]}}}}}}}},
+                "platform_overrides": {{
+                    "{current_os}": {{"command_policies": {{"commands": {{"git": {{"sandbox": {{"exec_paths": ["/platform/exec"]}}}}}}}}}}
+                }}
+            }}"#
+        );
+        let profile: Profile = serde_json::from_str(&json).expect("parse");
+        let finalized = finalize_profile(profile).expect("finalize");
+        let command_policies = finalized.command_policies.expect("command_policies");
+        let exec_paths = &command_policies.commands["git"]
+            .sandbox
+            .as_ref()
+            .expect("sandbox")
+            .exec_paths;
+        assert!(
+            exec_paths.contains(&"/base/exec".to_string()),
+            "base exec_path must be present: {exec_paths:?}"
+        );
+        assert!(
+            exec_paths.contains(&"/platform/exec".to_string()),
+            "platform-override exec_path must be present after merge: {exec_paths:?}"
+        );
+    }
+
+    #[test]
+    fn platform_overrides_other_platform_exec_paths_not_applied() {
+        // An `exec_paths` override for the non-current platform must not leak in.
+        let other_os = if crate::platform::current_os_name() == "macos" {
+            "linux"
+        } else {
+            "macos"
+        };
+        let json = format!(
+            r#"{{
+                "meta": {{"name": "test"}},
+                "command_policies": {{"commands": {{"git": {{"sandbox": {{"exec_paths": ["/base/exec"]}}}}}}}},
+                "platform_overrides": {{
+                    "{other_os}": {{"command_policies": {{"commands": {{"git": {{"sandbox": {{"exec_paths": ["/other/exec"]}}}}}}}}}}
+                }}
+            }}"#
+        );
+        let profile: Profile = serde_json::from_str(&json).expect("parse");
+        let finalized = finalize_profile(profile).expect("finalize");
+        let command_policies = finalized.command_policies.expect("command_policies");
+        let exec_paths = &command_policies.commands["git"]
+            .sandbox
+            .as_ref()
+            .expect("sandbox")
+            .exec_paths;
+        assert!(
+            !exec_paths.contains(&"/other/exec".to_string()),
+            "other platform's exec_path must not be present: {exec_paths:?}"
+        );
+    }
+
+    #[test]
+    fn platform_overrides_merge_adds_command_daemon_pid_source() {
+        // `daemon_pid_source` declared only in the current platform's override must
+        // land on the command's effective policy, alongside the base's fields.
+        let current_os = crate::platform::current_os_name();
+        let json = format!(
+            r#"{{
+                "meta": {{"name": "test"}},
+                "command_policies": {{"commands": {{"tmux": {{"sandbox": {{"exec_paths": ["/base/exec"]}}}}}}}},
+                "platform_overrides": {{
+                    "{current_os}": {{"command_policies": {{"commands": {{"tmux": {{"daemon_pid_source": {{"argv": ["tmux-pid"]}}}}}}}}}}
+                }}
+            }}"#
+        );
+        let profile: Profile = serde_json::from_str(&json).expect("parse");
+        let finalized = finalize_profile(profile).expect("finalize");
+        let tmux = &finalized
+            .command_policies
+            .expect("command_policies")
+            .commands["tmux"];
+        assert_eq!(
+            tmux.daemon_pid_source
+                .as_ref()
+                .map(|source| source.argv.clone()),
+            Some(vec!["tmux-pid".to_string()]),
+            "current-OS override must add daemon_pid_source"
+        );
+        assert_eq!(
+            tmux.sandbox.as_ref().expect("sandbox").exec_paths,
+            vec!["/base/exec".to_string()],
+            "base sandbox must survive the override merge"
+        );
+    }
+
+    #[test]
+    fn platform_overrides_other_platform_daemon_pid_source_not_applied() {
+        // A `daemon_pid_source` override for the non-current platform must not leak in.
+        let other_os = if crate::platform::current_os_name() == "macos" {
+            "linux"
+        } else {
+            "macos"
+        };
+        let json = format!(
+            r#"{{
+                "meta": {{"name": "test"}},
+                "command_policies": {{"commands": {{"tmux": {{"sandbox": {{"exec_paths": ["/base/exec"]}}}}}}}},
+                "platform_overrides": {{
+                    "{other_os}": {{"command_policies": {{"commands": {{"tmux": {{"daemon_pid_source": {{"argv": ["tmux-pid"]}}}}}}}}}}
+                }}
+            }}"#
+        );
+        let profile: Profile = serde_json::from_str(&json).expect("parse");
+        let finalized = finalize_profile(profile).expect("finalize");
+        assert_eq!(
+            finalized
+                .command_policies
+                .expect("command_policies")
+                .commands["tmux"]
+                .daemon_pid_source,
+            None,
+            "other platform's daemon_pid_source must not be present"
+        );
+    }
+
+    #[test]
+    fn extends_child_daemon_pid_source_replaces_base() {
+        // resolve_extends folds `merge_profiles(base, child)`; the child (more
+        // derived) helper wins.
+        let base: Profile = serde_json::from_str(
+            r#"{"meta":{"name":"base"},"command_policies":{"commands":{"tmux":{"daemon_pid_source":{"argv":["base-pid"]}}}}}"#,
+        )
+        .expect("parse base");
+        let child: Profile = serde_json::from_str(
+            r#"{"meta":{"name":"child"},"command_policies":{"commands":{"tmux":{"daemon_pid_source":{"argv":["child-pid"]}}}}}"#,
+        )
+        .expect("parse child");
+        let merged = merge_profiles(base, child);
+        assert_eq!(
+            merged.command_policies.expect("command_policies").commands["tmux"]
+                .daemon_pid_source
+                .as_ref()
+                .map(|source| source.argv.clone()),
+            Some(vec!["child-pid".to_string()])
+        );
+    }
+
+    #[test]
+    fn extends_inherits_base_daemon_pid_source_when_child_omits() {
+        let base: Profile = serde_json::from_str(
+            r#"{"meta":{"name":"base"},"command_policies":{"commands":{"tmux":{"daemon_pid_source":{"argv":["base-pid"]}}}}}"#,
+        )
+        .expect("parse base");
+        let child: Profile = serde_json::from_str(
+            r#"{"meta":{"name":"child"},"command_policies":{"commands":{"tmux":{}}}}"#,
+        )
+        .expect("parse child");
+        let merged = merge_profiles(base, child);
+        assert_eq!(
+            merged.command_policies.expect("command_policies").commands["tmux"]
+                .daemon_pid_source
+                .as_ref()
+                .map(|source| source.argv.clone()),
+            Some(vec!["base-pid".to_string()])
+        );
+    }
+
+    #[test]
+    fn platform_overrides_other_platform_not_applied() {
+        // The override for the non-current platform must not bleed in.
+        let other_os = if crate::platform::current_os_name() == "macos" {
+            "linux"
+        } else {
+            "macos"
+        };
+        let json = format!(
+            r#"{{
+                "meta": {{"name": "test"}},
+                "filesystem": {{"read": ["/base/path"]}},
+                "platform_overrides": {{
+                    "{other_os}": {{ "filesystem": {{"read": ["/other/platform/path"]}} }}
+                }}
+            }}"#
+        );
+        let profile: Profile = serde_json::from_str(&json).expect("parse");
+        let finalized = finalize_profile(profile).expect("finalize");
+        assert!(
+            !finalized
+                .filesystem
+                .read
+                .contains(&"/other/platform/path".to_string()),
+            "other platform's paths must not be present"
+        );
+    }
+
+    #[test]
+    fn platform_overrides_valid_set_vars_merged_and_accepted() {
+        // Positive counterpart to `platform_overrides_set_vars_validated_after_merge`:
+        // a well-formed set_vars entry declared only inside platform_overrides must
+        // survive the merge and finalize successfully, not just get rejected.
+        let current_os = crate::platform::current_os_name();
+        let json = format!(
+            r#"{{
+                "meta": {{"name": "test"}},
+                "platform_overrides": {{
+                    "{current_os}": {{ "environment": {{ "set_vars": {{"MY_VAR": "value"}} }} }}
+                }}
+            }}"#
+        );
+        let profile: Profile = serde_json::from_str(&json).expect("parse");
+        let finalized = finalize_profile(profile).expect("valid set_vars must be accepted");
+        assert_eq!(
+            finalized
+                .environment
+                .as_ref()
+                .expect("environment must be merged in")
+                .set_vars
+                .get("MY_VAR")
+                .map(String::as_str),
+            Some("value"),
+            "merged set_vars entry must be present after finalize"
+        );
+    }
+
+    #[test]
+    fn platform_overrides_set_vars_validated_after_merge() {
+        // Regression: finalize_profile used to skip re-validating
+        // custom_credentials/env_credentials/set_vars after apply_platform_overrides
+        // merged them in, letting an override sneak in a reserved set_vars key.
+        let current_os = crate::platform::current_os_name();
+        let json = format!(
+            r#"{{
+                "meta": {{"name": "test"}},
+                "platform_overrides": {{
+                    "{current_os}": {{ "environment": {{ "set_vars": {{"PATH": "/evil"}} }} }}
+                }}
+            }}"#
+        );
+        let profile: Profile = serde_json::from_str(&json).expect("parse");
+        let err = finalize_profile(profile).expect_err("reserved set_vars key must be rejected");
+        assert!(
+            err.to_string().contains("PATH"),
+            "expected error about reserved PATH key, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn platform_overrides_on_base_survive_extends_resolution() {
+        // Regression: merge_profiles used to null platform_overrides
+        // unconditionally, dropping an override defined on a base before
+        // finalize_profile ever got to apply it.
+        let current_os = crate::platform::current_os_name();
+        let dir = tempdir().expect("tmpdir");
+        std::fs::write(
+            dir.path().join("shared.json"),
+            format!(
+                r#"{{
+                    "meta": {{ "name": "shared" }},
+                    "filesystem": {{ "read": ["/base/path"] }},
+                    "platform_overrides": {{
+                        "{current_os}": {{ "filesystem": {{ "read": ["/platform/path"] }} }}
+                    }}
+                }}"#
+            ),
+        )
+        .expect("write");
+        let child_path = dir.path().join("child.json");
+        std::fs::write(
+            &child_path,
+            r#"{ "extends": "shared", "meta": { "name": "child" } }"#,
+        )
+        .expect("write");
+
+        let merged = match load_from_file(&child_path, &[]) {
+            Ok(profile) => profile,
+            Err(err) => panic!("resolve: {err}"),
+        };
+        assert!(
+            merged.platform_overrides.is_some(),
+            "base profile's platform_overrides must survive extends resolution"
+        );
+
+        let finalized = load_profile_from_path(&child_path).expect("load+finalize");
+        assert!(
+            finalized.platform_overrides.is_none(),
+            "platform_overrides should be consumed after finalization"
+        );
+        assert!(
+            finalized
+                .filesystem
+                .read
+                .contains(&"/base/path".to_string()),
+            "base path must be present"
+        );
+        assert!(
+            finalized
+                .filesystem
+                .read
+                .contains(&"/platform/path".to_string()),
+            "platform override declared on the base profile must apply through extends"
+        );
+    }
+
+    #[test]
+    fn platform_overrides_merge_per_os_key_child_wins() {
+        let current_os = crate::platform::current_os_name();
+        let base = Profile {
+            filesystem: FilesystemConfig {
+                read: vec!["/base/path".to_string()],
+                ..Default::default()
+            },
+            platform_overrides: Some(PlatformOverrides {
+                macos: if current_os == "macos" {
+                    Some(Box::new(PlatformOverride(Profile {
+                        filesystem: FilesystemConfig {
+                            read: vec!["/base/override/current".to_string()],
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    })))
+                } else {
+                    None
+                },
+                linux: if current_os == "linux" {
+                    Some(Box::new(PlatformOverride(Profile {
+                        filesystem: FilesystemConfig {
+                            read: vec!["/base/override/current".to_string()],
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    })))
+                } else {
+                    None
+                },
+                windows: None,
+            }),
+            ..Default::default()
+        };
+        let child = Profile {
+            platform_overrides: Some(PlatformOverrides {
+                macos: None,
+                linux: None,
+                windows: Some(Box::new(PlatformOverride(Profile {
+                    filesystem: FilesystemConfig {
+                        read: vec!["/child/override/windows".to_string()],
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }))),
+            }),
+            ..Default::default()
+        };
+
+        let merged = merge_profiles(base, child);
+        let po = merged
+            .platform_overrides
+            .expect("merged overrides must survive");
+        assert!(
+            po.windows.is_some(),
+            "child-only override key must be preserved"
+        );
+        assert!(
+            (current_os == "macos" && po.macos.is_some())
+                || (current_os == "linux" && po.linux.is_some()),
+            "base-only override key for the current platform must be preserved"
+        );
+    }
+
+    #[test]
+    fn platform_overrides_same_os_key_deep_merges_not_clobbers() {
+        let current_os = crate::platform::current_os_name();
+        let base_override = Profile {
+            network: NetworkConfig {
+                open_port: vec![1234],
+                ..Default::default()
+            },
+            filesystem: FilesystemConfig {
+                read: vec!["/base/override/path".to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let child_override = Profile {
+            open_urls: Some(OpenUrlConfig {
+                allow_origins: vec!["https://example.com".to_string()],
+                allow_localhost: false,
+            }),
+            ..Default::default()
+        };
+        let mk_overrides = |o: Profile| -> PlatformOverrides {
+            let wrapped = Some(Box::new(PlatformOverride(o)));
+            if current_os == "macos" {
+                PlatformOverrides {
+                    macos: wrapped,
+                    linux: None,
+                    windows: None,
+                }
+            } else {
+                PlatformOverrides {
+                    macos: None,
+                    linux: wrapped,
+                    windows: None,
+                }
+            }
+        };
+        let base = Profile {
+            platform_overrides: Some(mk_overrides(base_override)),
+            ..Default::default()
+        };
+        let child = Profile {
+            platform_overrides: Some(mk_overrides(child_override)),
+            ..Default::default()
+        };
+
+        let merged = merge_profiles(base, child);
+        let finalized = finalize_profile(merged).expect("finalize");
+        assert!(
+            finalized.network.open_port.contains(&1234),
+            "base override's open_port must survive a same-OS deep merge with child's override"
+        );
+        assert!(
+            finalized
+                .filesystem
+                .read
+                .contains(&"/base/override/path".to_string()),
+            "base override's filesystem grant must survive a same-OS deep merge with child's override"
+        );
+        assert!(
+            finalized
+                .open_urls
+                .as_ref()
+                .is_some_and(|u| u.allow_origins.contains(&"https://example.com".to_string())),
+            "child override's own field must still apply"
+        );
     }
 }

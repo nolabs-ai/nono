@@ -226,7 +226,7 @@ fn test_show_format_manifest_default_profile() {
 fn test_show_format_manifest_node_dev_profile() {
     // node-dev is an embedded profile with non-empty filesystem grants,
     // standing in for the claude-code coverage that moved to the
-    // always-further/claude registry pack.
+    // nolabs-ai/claude registry pack.
     let output = nono_bin()
         .args(["profile", "show", "node-dev", "--format", "manifest"])
         .output()

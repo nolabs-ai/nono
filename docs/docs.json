@@ -17,12 +17,12 @@
   },
   "navbar": {
     "links": [
-      { "label": "GitHub", "href": "https://github.com/always-further/nono" }
+      { "label": "GitHub", "href": "https://github.com/nolabs-ai/nono" }
     ],
     "primary": {
       "type": "button",
       "label": "Discord",
-      "href": "https://discord.gg/pPcjYzGvbS"
+      "href": "https://discord.gg/G6qDa7cC7x"
     }
   },
   "navigation": {
@@ -71,7 +71,9 @@
       {
         "group": "Secrets",
         "pages": [
-          "cli/features/credential-injection"
+          "cli/features/credential-injection",
+          "cli/features/sandboxed-oauth-logins",
+          "cli/features/spiffe"
         ]
       },
       {
@@ -91,6 +93,12 @@
         "group": "Rollback",
         "pages": [
           "cli/features/atomic-rollbacks"
+        ]
+      },
+      {
+        "group": "Resource Limits",
+        "pages": [
+          "cli/features/resource-limits"
         ]
       },
       {
@@ -123,15 +131,16 @@
         "group": "Development",
         "pages": [
           "cli/development/index",
-          "cli/development/testing"
+          "cli/development/testing",
+          "cli/development/oauth-capture-manual-qa"
         ]
       }
     ]
   },
   "footer": {
     "socials": {
-      "github": "https://github.com/always-further/nono",
-      "discord": "https://discord.gg/pPcjYzGvbS"
+      "github": "https://github.com/nolabs-ai/nono",
+      "discord": "https://discord.gg/G6qDa7cC7x"
     }
   }
 }

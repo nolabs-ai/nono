@@ -7,7 +7,7 @@ use crate::package::{
     self, ArtifactEntry, ArtifactType, LockedArtifact, LockedPackage, PackageManifest,
     PackageProvenance, PackageRef, PullResponse,
 };
-use crate::registry_client::{RegistryClient, resolve_registry_url};
+use crate::registry_client::{PullReason, RegistryClient, resolve_registry_url};
 use chrono::{DateTime, Local, Utc};
 use nono::{NonoError, Result, SignerIdentity};
 use semver::Version;
@@ -17,13 +17,13 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
-pub fn run_pull(args: PullArgs) -> Result<()> {
+pub fn run_pull(args: PullArgs, reason: PullReason) -> Result<()> {
     let package_ref = package::parse_package_ref(&args.package_ref)?;
     let registry_url = resolve_registry_url(args.registry.as_deref());
     let client = RegistryClient::new(registry_url.clone());
 
     let requested_version = package_ref.version.as_deref().unwrap_or("latest");
-    let pull = client.fetch_pull_response(&package_ref, requested_version)?;
+    let pull = client.fetch_pull_response(&package_ref, requested_version, reason)?;
     validate_pull_response(&package_ref, &pull)?;
 
     let lockfile = package::read_lockfile()?;
@@ -117,9 +117,9 @@ pub fn run_pull(args: PullArgs) -> Result<()> {
     // pack (here, not via `migration::check_and_run`), also offer to
     // strip pre-0.43 inbuilt-hook leftovers. Idempotent — silent no-op
     // on a clean install. Mirrors the cleanup hook in `check_and_run`
-    // so power users who skip `--profile always-further/claude` don't end up with
+    // so power users who skip `--profile nolabs-ai/claude` don't end up with
     // both legacy and pack hooks firing.
-    if package_ref.namespace == "always-further" && package_ref.name == "claude" {
+    if package_ref.namespace == "nolabs-ai" && package_ref.name == "claude" {
         crate::legacy_cleanup::check_and_offer_cleanup()?;
     }
 
@@ -332,13 +332,16 @@ pub fn run_update(args: UpdateArgs) -> Result<()> {
                         );
                     }
                     eprintln!("  updating {key} {} → {latest}", pkg.version);
-                    match run_pull(PullArgs {
-                        package_ref: key.clone(),
-                        registry: args.registry.clone(),
-                        force: args.force,
-                        init: false,
-                        help: None,
-                    }) {
+                    match run_pull(
+                        PullArgs {
+                            package_ref: key.clone(),
+                            registry: args.registry.clone(),
+                            force: args.force,
+                            init: false,
+                            help: None,
+                        },
+                        PullReason::Update,
+                    ) {
                         Ok(()) => {
                             updated = updated.saturating_add(1);
                         }

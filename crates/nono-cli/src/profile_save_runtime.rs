@@ -583,7 +583,7 @@ pub(crate) fn would_shadow_existing_profile(profile_name: &str) -> bool {
         return false;
     }
     // Only block names that match embedded built-ins. Pack profiles are
-    // referenced by their full `org/name` key (e.g. `always-further/hermes`),
+    // referenced by their full `org/name` key (e.g. `nolabs-ai/hermes`),
     // which is an invalid profile name, so a short user profile name like
     // `hermes` cannot shadow a pack profile.
     crate::policy::load_embedded_policy()
@@ -688,7 +688,14 @@ pub(crate) fn print_profile_save(prepared: &PreparedProfileSave, command: &[Stri
             .yellow()
         ));
     }
-    let unsafe_rule_count = prepared.profile.unsafe_macos_seatbelt_rules.len();
+    let unsafe_rule_count = prepared.profile.unsafe_macos_seatbelt_rules.len()
+        + prepared
+            .profile
+            .command_policies
+            .as_ref()
+            .map_or(0, |policies| {
+                crate::command_policy::nested_unsafe_seatbelt_rules(policies).len()
+            });
     if unsafe_rule_count > 0 {
         prompt_println(&format!(
             "{}",
@@ -736,8 +743,15 @@ pub(crate) fn print_patch_preview(patch: &profile::Profile) {
         ("write files", &patch.filesystem.write_file),
     ];
 
+    let nested_unsafe_rules = patch
+        .command_policies
+        .as_ref()
+        .map(crate::command_policy::nested_unsafe_seatbelt_rules)
+        .unwrap_or_default();
+
     let has_entries = sections.iter().any(|(_, paths)| !paths.is_empty());
-    let has_unsafe_rules = !patch.unsafe_macos_seatbelt_rules.is_empty();
+    let has_unsafe_rules =
+        !patch.unsafe_macos_seatbelt_rules.is_empty() || !nested_unsafe_rules.is_empty();
     if !has_entries && patch.filesystem.bypass_protection.is_empty() && !has_unsafe_rules {
         return;
     }
@@ -786,6 +800,9 @@ pub(crate) fn print_patch_preview(patch: &profile::Profile) {
                 rule
             ));
         }
+        for (location, rule) in &nested_unsafe_rules {
+            prompt_println(&format!("  {}  {}  ({location})", "⚠".red(), rule));
+        }
     }
 
     if !patch.filesystem.bypass_protection.is_empty() {
@@ -815,7 +832,11 @@ pub(crate) fn print_patch_preview(patch: &profile::Profile) {
 
 /// Return true if the patch includes entries that bypass normal capability policy.
 pub(crate) fn patch_has_policy_overrides(patch: &profile::Profile) -> bool {
-    !patch.filesystem.bypass_protection.is_empty() || !patch.unsafe_macos_seatbelt_rules.is_empty()
+    !patch.filesystem.bypass_protection.is_empty()
+        || !patch.unsafe_macos_seatbelt_rules.is_empty()
+        || patch.command_policies.as_ref().is_some_and(|policies| {
+            !crate::command_policy::nested_unsafe_seatbelt_rules(policies).is_empty()
+        })
 }
 
 fn prompt_print(template: &str, args: &[&str]) {
@@ -1898,6 +1919,64 @@ mod tests {
     }
 
     #[test]
+    fn nested_unsafe_macos_seatbelt_rules_in_command_sandbox_count_as_policy_overrides() {
+        use crate::command_policy::{
+            CommandPoliciesConfig, CommandPolicyConfig, CommandSandboxConfig,
+        };
+
+        let patch = profile::Profile::default();
+        assert!(!patch_has_policy_overrides(&patch));
+
+        let mut policies = CommandPoliciesConfig::default();
+        policies.commands.insert(
+            "git".to_string(),
+            CommandPolicyConfig {
+                sandbox: Some(CommandSandboxConfig {
+                    unsafe_macos_seatbelt_rules: vec!["(allow iokit-open)".to_string()],
+                    ..CommandSandboxConfig::default()
+                }),
+                ..CommandPolicyConfig::default()
+            },
+        );
+        let patch = profile::Profile {
+            command_policies: Some(policies),
+            ..patch
+        };
+
+        assert!(patch_has_policy_overrides(&patch));
+    }
+
+    #[test]
+    fn nested_unsafe_macos_seatbelt_rules_in_intercept_sandbox_count_as_policy_overrides() {
+        use crate::command_policy::{
+            CommandPoliciesConfig, CommandPolicyConfig, CommandSandboxConfig,
+            InterceptActionConfig, InterceptRuleConfig,
+        };
+
+        let mut policies = CommandPoliciesConfig::default();
+        policies.commands.insert(
+            "git".to_string(),
+            CommandPolicyConfig {
+                intercept: vec![InterceptRuleConfig {
+                    args: vec!["push".to_string()],
+                    action: InterceptActionConfig::Passthrough,
+                    sandbox: Some(CommandSandboxConfig {
+                        unsafe_macos_seatbelt_rules: vec!["(allow iokit-open)".to_string()],
+                        ..CommandSandboxConfig::default()
+                    }),
+                }],
+                ..CommandPolicyConfig::default()
+            },
+        );
+        let patch = profile::Profile {
+            command_policies: Some(policies),
+            ..profile::Profile::default()
+        };
+
+        assert!(patch_has_policy_overrides(&patch));
+    }
+
+    #[test]
     fn suggested_run_profile_name_uses_compared_profile_when_available() {
         let _env_lock = ENV_LOCK.lock().expect("env lock");
         let temp_home = TempDir::new().expect("temp home");
@@ -2177,14 +2256,14 @@ mod tests {
             &patch,
             "claude",
             "claude-test",
-            Some("always-further/claude"),
+            Some("nolabs-ai/claude"),
         )
         .expect("prepare");
 
         assert!(matches!(prepared.action, SaveAction::Created));
         assert_eq!(
             prepared.profile.extends,
-            Some(vec!["always-further/claude".to_string()])
+            Some(vec!["nolabs-ai/claude".to_string()])
         );
     }
 
@@ -2208,13 +2287,13 @@ mod tests {
             &patch,
             "claude",
             "claude-test",
-            Some("always-further/claude@1.2.0"),
+            Some("nolabs-ai/claude@1.2.0"),
         )
         .expect("prepare");
 
         assert_eq!(
             prepared.profile.extends,
-            Some(vec!["always-further/claude@1.2.0".to_string()])
+            Some(vec!["nolabs-ai/claude@1.2.0".to_string()])
         );
     }
 

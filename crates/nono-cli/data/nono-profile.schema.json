@@ -130,10 +130,25 @@
     },
     "credential_capture": {
       "type": "object",
-      "description": "Maps logical credential names to supervisor-side commands used by custom_credentials entries with credential_key: \"cmd://<name>\". Commands are run lazily when the proxy first needs the credential; stdout is injected by the proxy and never exposed to the sandboxed child.",
+      "description": "Maps logical credential names to supervisor-side commands or provider subprocesses used by custom_credentials entries with credential_key: \"cmd://<name>\". Captures run lazily when the proxy first needs the credential; captured material is injected by the proxy and never exposed to the sandboxed child.",
       "additionalProperties": {
         "$ref": "#/$defs/CredentialCaptureEntry"
       }
+    },
+    "credential_providers": {
+      "type": "object",
+      "description": "Maps provider names to declarative OAuth capture providers. Providers describe token endpoints to capture, API origins where phantom tokens may be resolved, optional credential-store detection, and optional lifecycle helper commands.",
+      "additionalProperties": {
+        "$ref": "#/$defs/CredentialProviderDef"
+      }
+    },
+    "credential_routes": {
+      "type": "array",
+      "description": "Binds declarative credential providers to sandbox-visible phantom credentials and optional endpoint policy.",
+      "items": {
+        "$ref": "#/$defs/CredentialRouteDef"
+      },
+      "default": []
     },
     "unsafe_macos_seatbelt_rules": {
       "type": "array",
@@ -173,15 +188,22 @@
     },
     "CredentialCaptureEntry": {
       "type": "object",
-      "description": "Configuration for a supervisor-side credential capture command.",
+      "description": "Configuration for a supervisor-side credential capture command or provider subprocess.",
       "additionalProperties": false,
-      "required": ["command"],
+      "oneOf": [
+        { "required": ["command"], "not": { "required": ["provider"] } },
+        { "required": ["provider"], "not": { "required": ["command"] } }
+      ],
       "properties": {
         "command": {
           "type": "array",
           "items": { "type": "string" },
           "minItems": 1,
           "description": "Command and arguments to execute without a shell, for example [\"gh\", \"auth\", \"token\"]. The executable is resolved before proxy startup."
+        },
+        "provider": {
+          "$ref": "#/$defs/CredentialCaptureProvider",
+          "description": "Typed external credential provider subprocess. The provider receives nono.credential-provider.v1 request JSON on stdin and returns JSON credential material on stdout."
         },
         "timeout_secs": {
           "type": "integer",
@@ -212,7 +234,7 @@
           "type": "string",
           "enum": ["null", "request_json"],
           "default": "null",
-          "description": "Controls stdin for the capture command. null closes stdin unless interaction.stdio is true. request_json writes request metadata JSON to stdin."
+          "description": "Controls stdin for the capture command. null closes stdin unless interaction.stdin is true. request_json writes request metadata JSON to stdin."
         },
         "output": {
           "oneOf": [
@@ -231,6 +253,25 @@
         "interaction": {
           "$ref": "#/$defs/CredentialCaptureInteraction",
           "description": "Explicit opt-in policy for interactive capture commands."
+        }
+      }
+    },
+    "CredentialCaptureProvider": {
+      "type": "object",
+      "description": "External provider subprocess using the typed nono credential-provider protocol.",
+      "additionalProperties": false,
+      "required": ["command"],
+      "properties": {
+        "command": {
+          "type": "array",
+          "items": { "type": "string" },
+          "minItems": 1,
+          "description": "Provider executable and arguments to execute without a shell."
+        },
+        "config": {
+          "type": "object",
+          "description": "Provider-specific configuration passed through in request JSON.",
+          "additionalProperties": true
         }
       }
     },
@@ -262,7 +303,12 @@
         "stdio": {
           "type": "boolean",
           "default": false,
-          "description": "Allow the capture command to use inherited stderr and, when stdin is null, inherited stdin."
+          "description": "Allow the capture command to write prompts to the terminal via inherited stderr."
+        },
+        "stdin": {
+          "type": "boolean",
+          "default": false,
+          "description": "Allow the capture command to read from the terminal via inherited stdin. Only set this when the helper genuinely needs to prompt the user for input. Requires stdio:true."
         },
         "open_urls": {
           "oneOf": [
@@ -277,6 +323,216 @@
           "description": "Mark this capture command as allowed to use host browser/app launch mechanisms during auth setup."
         }
       }
+    },
+    "CredentialProviderDef": {
+      "type": "object",
+      "description": "Declarative provider for mediated OAuth credentials. Capture and token rewriting are driven by profile data instead of built-in provider-specific Rust code.",
+      "additionalProperties": false,
+      "required": ["type", "token_endpoints", "api_hosts"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["oauth_capture"],
+          "description": "Provider mechanism. oauth_capture captures token endpoint responses and maps real tokens to sandbox-visible phantom tokens."
+        },
+        "token_endpoints": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/CredentialProviderTokenEndpoint" },
+          "minItems": 1,
+          "description": "OAuth token endpoints whose JSON responses contain real credentials that must be replaced before reaching the sandbox. Configure every token-bearing endpoint the client may use."
+        },
+        "api_hosts": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/UrlOrigin" },
+          "minItems": 1,
+          "description": "API URL origins where phantom tokens issued by this provider may be resolved back to real credentials on egress."
+        },
+        "credential_store": {
+          "oneOf": [
+            { "$ref": "#/$defs/CredentialProviderStore" },
+            { "type": "null" }
+          ],
+          "description": "Optional provider-specific session or logout detection."
+        },
+        "helpers": {
+          "oneOf": [
+            { "$ref": "#/$defs/CredentialProviderHelpers" },
+            { "type": "null" }
+          ],
+          "description": "Optional human-invoked lifecycle helper commands. Commands are executed without a shell."
+        }
+      }
+    },
+    "CredentialProviderTokenEndpoint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["host", "path", "response_fields"],
+      "properties": {
+        "host": {
+          "$ref": "#/$defs/UrlOrigin",
+          "description": "Origin serving the token endpoint, for example https://platform.claude.com."
+        },
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^/",
+          "description": "Exact absolute URL path of the token endpoint."
+        },
+        "response_fields": {
+          "$ref": "#/$defs/CredentialProviderResponseFields",
+          "description": "JSON fields in the token endpoint response that contain real credentials. These fields must be exhaustive for token material returned by the endpoint."
+        },
+        "request_body": {
+          "type": "string",
+          "enum": ["auto", "json", "form"],
+          "default": "auto",
+          "description": "Token request body encoding used when resolving phantom refresh/exchange values before forwarding upstream."
+        },
+        "request_nonce_fields": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "minItems": 1,
+          "description": "Request body fields where phantom tokens must be resolved before refresh-token or token-exchange requests are sent upstream."
+        }
+      }
+    },
+    "CredentialProviderResponseFields": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path"],
+        "properties": {
+          "path": {
+            "type": "string",
+            "minLength": 1,
+            "description": "JSON response field path containing real token material."
+          },
+          "kind": {
+            "type": "string",
+            "enum": ["opaque", "jwt"],
+            "default": "opaque",
+            "description": "Visible phantom format. Use jwt only when a client locally parses the token as a JWT and does not resend it as a bearer token."
+          }
+        }
+      }
+    },
+    "CredentialProviderStore": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "service", "account_candidates", "phantom_fields"],
+          "properties": {
+            "type": { "const": "keychain_json" },
+            "service": { "type": "string", "minLength": 1 },
+            "account_candidates": {
+              "type": "array",
+              "items": { "type": "string", "minLength": 1 },
+              "minItems": 1
+            },
+            "phantom_fields": {
+              "type": "array",
+              "items": { "type": "string", "minLength": 1 },
+              "minItems": 1
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "path", "phantom_fields"],
+          "properties": {
+            "type": { "const": "file_json" },
+            "path": { "type": "string", "minLength": 1 },
+            "phantom_fields": {
+              "type": "array",
+              "items": { "type": "string", "minLength": 1 },
+              "minItems": 1
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "command"],
+          "properties": {
+            "type": { "const": "command_status" },
+            "command": {
+              "type": "array",
+              "items": { "type": "string", "minLength": 1 },
+              "minItems": 1
+            }
+          }
+        }
+      ]
+    },
+    "CredentialProviderHelpers": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "description": "Optional status helper command."
+        },
+        "login": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "description": "Optional login helper command."
+        },
+        "logout": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "description": "Optional logout helper command."
+        }
+      }
+    },
+    "CredentialRouteDef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "provider"],
+      "properties": {
+        "name": {
+          "$ref": "#/$defs/ProviderIdentifier",
+          "description": "Route name used in audit and generated proxy routes."
+        },
+        "provider": {
+          "$ref": "#/$defs/ProviderIdentifier",
+          "description": "Name of the provider declared under credential_providers."
+        },
+        "env_var": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "null" }
+          ],
+          "description": "Optional environment variable for clients that can start from a sandbox-visible phantom token. Many OAuth CLI clients instead receive phantoms through their captured credential store during login."
+        },
+        "base_url_env_var": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "null" }
+          ],
+          "description": "Environment variable that should point SDKs at the mediated proxy base URL."
+        },
+        "endpoint_policy": {
+          "oneOf": [
+            { "$ref": "#/$defs/EndpointPolicyConfig" },
+            { "type": "null" }
+          ],
+          "description": "Optional method/path policy for provider API egress."
+        }
+      }
+    },
+    "ProviderIdentifier": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]+$"
+    },
+    "UrlOrigin": {
+      "type": "string",
+      "pattern": "^https://[^/?#]+$",
+      "description": "HTTPS URL origin without path, query, or fragment."
     },
     "SecurityConfig": {
       "type": "object",
@@ -514,6 +770,10 @@
           "type": "boolean",
           "description": "Block network access. Network is allowed by default; set to true to deny all outbound traffic."
         },
+        "allow_http2": {
+          "type": "boolean",
+          "description": "Allow HTTP/2 to upstream servers via ALPN negotiation. Defaults to false (HTTP/1.1 with keep-alive). Equivalent to the --allow-http2 CLI flag."
+        },
         "network_profile": {
           "oneOf": [
             { "type": "string" },
@@ -571,6 +831,11 @@
           "items": { "type": "integer" },
           "description": "TCP ports the sandboxed child may listen on."
         },
+        "no_proxy": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Additional client-side proxy bypass entries appended to generated NO_PROXY/no_proxy in proxy mode. This does not grant network access; direct connections still require matching sandbox permissions. Entries must be host patterns only: safe single-label local aliases, canonical IP literals, *.<domain> wildcard suffixes, or .<domain> suffix patterns. Bare multi-label domains, protected metadata suffix tokens, full URLs, credentials, ports, paths, comma-separated lists, and catch-all * are rejected."
+        },
         "custom_credentials": {
           "type": "object",
           "additionalProperties": {
@@ -627,6 +892,12 @@
           "type": "string",
           "pattern": "^[1-9][0-9]*(s|m|h|d)?$",
           "description": "Per-host leaf certificate validity duration, such as 15m. Leaf expiry is capped by CA expiry."
+        },
+        "ca_env_vars": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
+          "default": [],
+          "description": "Additional environment variables that should point at the generated TLS-intercept CA bundle, for clients with runtime-specific CA settings."
         }
       }
     },
@@ -705,7 +976,7 @@
             { "type": "string" },
             { "type": "null" }
           ],
-          "description": "Explicit environment variable name for the phantom token (e.g., \"OPENAI_API_KEY\"). Required when credential_key is a URI manager reference (op://, bw://, apple-password://, or file://). Optional for env:// (derived from the URI)."
+          "description": "Explicit environment variable name for the phantom token (e.g., \"OPENAI_API_KEY\"). Required when credential_key is a URI manager reference (op://, bw://, apple-password://, file://, or cmd://). Optional for env:// (derived from the URI)."
         },
         "endpoint_rules": {
           "type": "array",
@@ -1123,7 +1394,7 @@
         "args": {
           "type": "array",
           "items": { "type": "string" },
-          "description": "Argument prefix matched against argv[1..]. An empty list is a catch-all and must be last."
+          "description": "Contiguous argument sequence matched within argv[1..]. An empty list is a catch-all and must be last. Broad single-argument rules such as [\"--force\"] match anywhere in the invocation, not only at the subcommand position."
         },
         "action": { "$ref": "#/$defs/InterceptActionConfig" }
       }
@@ -1172,6 +1443,20 @@
             "type": { "type": "string", "const": "approve" },
             "timeout_secs": { "type": "integer", "minimum": 1 }
           }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "command"],
+          "properties": {
+            "type": { "type": "string", "const": "exec" },
+            "command": {
+              "type": "array",
+              "items": { "type": "string" },
+              "minItems": 1,
+              "description": "Run a helper in place of the matched subcommand, inside the command's sandbox. command[0] is the helper path (after $VAR expansion, must be absolute); command[1..] are fixed leading args inserted before the forwarded original arguments. The helper's stdout/stderr are streamed and its exit code propagated. The helper is resolved with identity expectations and is subject to the same non-writable-executable trust gate as a pinned executable."
+            }
+          }
         }
       ]
     },
@@ -1190,7 +1475,7 @@
         "can_use": {
           "type": "array",
           "items": { "$ref": "#/$defs/CommandPolicyIdentifier" },
-          "description": "Commands this command may invoke through tool-sandbox chaining."
+          "description": "Other commands this command may invoke through tool-sandbox chaining. If no explicit self-invocation entry is configured, self-invocation keeps the command's current effective policy and does not require listing the command here."
         },
         "sandbox": {
           "$ref": "#/$defs/CommandSandboxConfig",
@@ -1210,7 +1495,7 @@
         "intercept": {
           "type": "array",
           "items": { "$ref": "#/$defs/InterceptRuleConfig" },
-          "description": "Ordered command argument-prefix intercept rules evaluated after invocation policy."
+          "description": "Ordered command argument-sequence intercept rules evaluated after invocation policy."
         },
         "allow_direct_exec_bypass": {
           "type": "array",
@@ -1220,6 +1505,27 @@
         "allow_direct_exec_bypass_with_credentials": {
           "type": "boolean",
           "description": "Second opt-in required before a credential-using command may have direct exec bypass."
+        },
+        "daemon_pid_source": {
+          "$ref": "#/$defs/DaemonPidSource",
+          "description": "Helper nono runs to learn the pid of a daemon this command spawns (e.g. a tmux server that double-forks and reparents to pid 1). When a caller's process ancestry is severed by that reparenting, the lineage marker runs this helper and attributes the severed daemon to this command only if the reported pid matches. Prints one pid. Consumed on macOS only for now."
+        }
+      }
+    },
+    "DaemonPidSource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["argv"],
+      "properties": {
+        "argv": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Helper program and args. The program is expanded (~, $WORKDIR, $TMPDIR, $UID, XDG) and must then be an absolute path. nono passes the daemon's context as a JSON object on stdin and reads the pid the helper prints on stdout."
+        },
+        "env": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Allowlist of the daemon's environment keys nono may forward into the helper's JSON input. Credential-named keys are dropped regardless."
         }
       }
     },
@@ -1304,6 +1610,11 @@
         "allow_launch_services": {
           "type": "boolean",
           "description": "macOS-only: allow this command to open URLs directly via LaunchServices instead of the origin-validated browser shim. Ignored on Linux. Defaults to false."
+        },
+        "unsafe_macos_seatbelt_rules": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "macOS-only. Expert escape hatch: raw Seatbelt S-expression rules appended to this command's child sandbox profile, emitted after the generated denies (including the exec gate's (deny process-exec*)), so a later (allow ...) wins under Seatbelt's last-matching-rule semantics. Scoped to a single command or per-intercept override. Ignored on Linux."
         }
       }
     },

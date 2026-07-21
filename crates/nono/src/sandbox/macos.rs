@@ -5,7 +5,9 @@
 //! - Adding system paths (e.g., /usr, /lib, /System/Library) if executables need to run
 //! - Implementing any security policy (sensitive path blocking, etc.)
 
-use crate::capability::{AccessMode, CapabilitySet, NetworkMode};
+use crate::capability::{
+    AccessMode, CapabilitySet, MACOS_PORT_RANGE_LIMIT, NetworkMode, merge_port_ranges,
+};
 use crate::error::{NonoError, Result};
 use crate::sandbox::SupportInfo;
 use std::ffi::{CStr, CString};
@@ -458,10 +460,13 @@ fn emit_unix_socket_rules(profile: &mut String, caps: &CapabilitySet) -> Result<
     Ok(())
 }
 
-/// Seatbelt rules: one `(remote tcp "localhost:N")` per non-zero port; `0` adds
-/// a single `localhost:*` outbound rule (`localhost:0` is invalid in Seatbelt).
-fn push_localhost_tcp_outbound_seatbelt_rules(profile: &mut String, localhost_ports: &[u16]) {
+fn push_localhost_tcp_outbound_seatbelt_rules(
+    profile: &mut String,
+    localhost_ports: &[u16],
+    localhost_port_ranges: &[(u16, u16)],
+) {
     let wildcard = localhost_ports.contains(&0);
+
     for &lp in localhost_ports {
         if lp == 0 {
             continue;
@@ -470,6 +475,18 @@ fn push_localhost_tcp_outbound_seatbelt_rules(profile: &mut String, localhost_po
             "(allow network-outbound (remote tcp \"localhost:{}\"))\n",
             lp
         ));
+    }
+    for &(start, end) in localhost_port_ranges {
+        debug!(
+            "Adding localhost TCP rules for port range {}..={}",
+            start, end
+        );
+        for port in start..=end {
+            profile.push_str(&format!(
+                "(allow network-outbound (remote tcp \"localhost:{}\"))\n",
+                port
+            ));
+        }
     }
     if wildcard {
         profile.push_str("(allow network-outbound (remote tcp \"localhost:*\"))\n");
@@ -484,6 +501,19 @@ fn push_localhost_tcp_outbound_seatbelt_rules(profile: &mut String, localhost_po
 /// Returns an error if any path contains non-UTF-8 bytes (which would produce
 /// incorrect Seatbelt rules via lossy conversion).
 fn generate_profile(caps: &CapabilitySet) -> Result<String> {
+    let merged_ranges = merge_port_ranges(caps.localhost_port_ranges());
+    let total_range_ports: u32 = merged_ranges
+        .iter()
+        .map(|&(s, e)| (e as u32).saturating_sub(s as u32).saturating_add(1))
+        .fold(0u32, |acc, n| acc.saturating_add(n));
+    if total_range_ports > MACOS_PORT_RANGE_LIMIT {
+        return Err(NonoError::SandboxInit(format!(
+            "port ranges expand to {} unique ports, which exceeds the macOS limit of {} \
+             (sandbox_init crashes above ~17,770 rules); use smaller or fewer ranges",
+            total_range_ports, MACOS_PORT_RANGE_LIMIT
+        )));
+    }
+
     let mut profile = String::new();
 
     // Profile version
@@ -699,6 +729,7 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
 (allow network-outbound (path \"/var/run/mDNSResponder\"))\n";
 
     let localhost_ports = caps.localhost_ports();
+    let has_localhost_tcp = !localhost_ports.is_empty() || !merged_ranges.is_empty();
     match caps.network_mode() {
         NetworkMode::Blocked => {
             profile.push_str("(deny network*)\n");
@@ -709,7 +740,7 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
             // `connect()`/`bind()` to sockets inside them. Directory
             // grants use a non-recursive regex.
             emit_unix_socket_rules(&mut profile, caps)?;
-            if !localhost_ports.is_empty() {
+            if has_localhost_tcp {
                 // Allow system-socket for TCP (required for connect/bind)
                 profile.push_str(
                     "(allow system-socket (socket-domain AF_INET) (socket-type SOCK_STREAM))\n",
@@ -717,7 +748,11 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
                 profile.push_str(
                     "(allow system-socket (socket-domain AF_INET6) (socket-type SOCK_STREAM))\n",
                 );
-                push_localhost_tcp_outbound_seatbelt_rules(&mut profile, localhost_ports);
+                push_localhost_tcp_outbound_seatbelt_rules(
+                    &mut profile,
+                    localhost_ports,
+                    &merged_ranges,
+                );
                 // Seatbelt cannot filter bind/inbound by port
                 profile.push_str("(allow network-bind)\n");
                 profile.push_str("(allow network-inbound)\n");
@@ -733,7 +768,11 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
                 "(allow network-outbound (remote tcp \"localhost:{}\"))\n",
                 port
             ));
-            push_localhost_tcp_outbound_seatbelt_rules(&mut profile, localhost_ports);
+            push_localhost_tcp_outbound_seatbelt_rules(
+                &mut profile,
+                localhost_ports,
+                &merged_ranges,
+            );
             // Scope system-socket for TCP (required for connect/bind to proxy).
             profile.push_str(
                 "(allow system-socket (socket-domain AF_INET) (socket-type SOCK_STREAM))\n",
@@ -744,7 +783,7 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
             // If bind ports or localhost IPC ports are specified, allow network-bind
             // and network-inbound. Seatbelt cannot filter bind/inbound by port,
             // so this is a blanket allow.
-            if !bind_ports.is_empty() || !localhost_ports.is_empty() {
+            if !bind_ports.is_empty() || has_localhost_tcp {
                 profile.push_str("(allow network-bind)\n");
                 profile.push_str("(allow network-inbound)\n");
             }
@@ -778,7 +817,7 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
 pub fn apply(caps: &CapabilitySet) -> Result<()> {
     let profile = generate_profile(caps)?;
 
-    debug!("Generated Seatbelt profile:\n{}", profile);
+    debug!("Generated Seatbelt profile ({} bytes)", profile.len());
 
     let profile_cstr = CString::new(profile)
         .map_err(|e| NonoError::SandboxInit(format!("Invalid profile string: {}", e)))?;
@@ -1902,5 +1941,98 @@ mod tests {
 
         assert!(!profile.contains("(deny network*)"));
         assert!(!profile.contains("mDNSResponder"));
+    }
+
+    #[test]
+    fn test_port_range_small_expands_to_individual_rules() {
+        let mut caps = CapabilitySet::new();
+        caps.set_network_blocked(true);
+        caps.add_localhost_port_range(3000, 3002)
+            .expect("valid range");
+        let profile = generate_profile(&caps).unwrap();
+
+        assert!(profile.contains("(allow network-outbound (remote tcp \"localhost:3000\"))"));
+        assert!(profile.contains("(allow network-outbound (remote tcp \"localhost:3001\"))"));
+        assert!(profile.contains("(allow network-outbound (remote tcp \"localhost:3002\"))"));
+        assert!(!profile.contains("localhost:*"));
+        assert!(profile.contains("(allow network-bind)"));
+    }
+
+    #[test]
+    fn test_port_range_under_limit_expands() {
+        let mut caps = CapabilitySet::new();
+        caps.set_network_blocked(true);
+        caps.add_localhost_port_range(1000, 1999)
+            .expect("valid range"); // 1000 ports — under limit, expands
+        let profile = generate_profile(&caps).unwrap();
+
+        assert!(profile.contains("(allow network-outbound (remote tcp \"localhost:1000\"))"));
+        assert!(profile.contains("(allow network-outbound (remote tcp \"localhost:1999\"))"));
+        assert!(!profile.contains("localhost:*"));
+    }
+
+    #[test]
+    fn test_port_range_over_limit_returns_error() {
+        let mut caps = CapabilitySet::new();
+        caps.set_network_blocked(true);
+        caps.add_localhost_port_range(1000, 18000)
+            .expect("valid range"); // 17001 ports — over limit, must fail
+        let result = generate_profile(&caps);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("exceeds the macOS limit")
+        );
+    }
+
+    #[test]
+    fn test_cumulative_port_ranges_over_limit_returns_error() {
+        let mut caps = CapabilitySet::new();
+        caps.set_network_blocked(true);
+        caps.add_localhost_port_range(1000, 10000)
+            .expect("valid range"); // 9001 ports
+        caps.add_localhost_port_range(20000, 30000)
+            .expect("valid range"); // 10001 ports — 19002 total, over limit
+        let result = generate_profile(&caps);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("exceeds the macOS limit")
+        );
+    }
+
+    #[test]
+    fn test_multiple_port_ranges_all_expand() {
+        let mut caps = CapabilitySet::new();
+        caps.set_network_blocked(true);
+        caps.add_localhost_port_range(3000, 3001)
+            .expect("valid range");
+        caps.add_localhost_port_range(8000, 8001)
+            .expect("valid range");
+        let profile = generate_profile(&caps).unwrap();
+
+        assert!(profile.contains("(allow network-outbound (remote tcp \"localhost:3000\"))"));
+        assert!(profile.contains("(allow network-outbound (remote tcp \"localhost:3001\"))"));
+        assert!(profile.contains("(allow network-outbound (remote tcp \"localhost:8000\"))"));
+        assert!(profile.contains("(allow network-outbound (remote tcp \"localhost:8001\"))"));
+        assert!(!profile.contains("localhost:*"));
+    }
+
+    #[test]
+    fn test_port_range_in_proxy_only_mode() {
+        let caps = CapabilitySet::new()
+            .proxy_only(8080)
+            .allow_localhost_port_range(4000, 4002)
+            .expect("valid range");
+        let profile = generate_profile(&caps).unwrap();
+
+        assert!(profile.contains("(allow network-outbound (remote tcp \"localhost:4000\"))"));
+        assert!(profile.contains("(allow network-outbound (remote tcp \"localhost:4001\"))"));
+        assert!(profile.contains("(allow network-outbound (remote tcp \"localhost:4002\"))"));
+        assert!(profile.contains("(allow network-bind)"));
     }
 }

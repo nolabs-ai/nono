@@ -456,7 +456,10 @@ pub fn run_learn(args: &LearnArgs) -> Result<LearnResult> {
 
     // Load profile if specified
     let profile = if let Some(ref profile_name) = args.profile {
-        Some(profile::load_profile(profile_name)?)
+        Some(profile::load_profile_with_extends(
+            profile_name,
+            &args.extends,
+        )?)
     } else {
         None
     };
@@ -1089,7 +1092,10 @@ pub fn run_learn(args: &LearnArgs) -> Result<LearnResult> {
 
     // Load profile if specified
     let profile = if let Some(ref profile_name) = args.profile {
-        Some(profile::load_profile(profile_name)?)
+        Some(profile::load_profile_with_extends(
+            profile_name,
+            &args.extends,
+        )?)
     } else {
         None
     };
@@ -1365,10 +1371,9 @@ fn extract_path_from_syscall(line: &str, syscall: &str) -> Option<String> {
     // For openat, skip AT_FDCWD
     let path_start = if syscall == "openat" {
         // Skip "AT_FDCWD, " or similar
-        if let Some(comma_idx) = after_paren.find(',') {
+        {
+            let comma_idx = after_paren.find(',')?;
             comma_idx + 2 // Skip ", "
-        } else {
-            return None;
         }
     } else {
         0

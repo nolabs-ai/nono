@@ -4,7 +4,7 @@
 /// `env::set_var` / `env::remove_var` calls race against each other.
 /// All env-mutating tests must acquire this lock before touching env vars.
 ///
-/// See <https://github.com/always-further/nono/issues/567> for the plan to
+/// See <https://github.com/nolabs-ai/nono/issues/567> for the plan to
 /// eliminate env var mutation from tests entirely.
 #[allow(dead_code)]
 pub static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

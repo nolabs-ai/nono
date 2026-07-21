@@ -6,7 +6,9 @@
 
 #[cfg(target_os = "macos")]
 use crate::capability_ext::new_exact_path_capability;
-use nono::{AccessMode, CapabilitySet, CapabilitySource, FsCapability, NonoError, Result};
+use nono::{
+    AccessMode, CapabilitySet, CapabilitySource, FsCapability, NonoError, ResourceLimits, Result,
+};
 use serde::{Deserialize, Serialize};
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -37,6 +39,11 @@ pub struct SandboxState {
     /// Endpoint-restricted domains with method+path rules
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub domain_endpoints: Vec<DomainEndpointState>,
+    /// Resource ceilings (memory and max processes) in effect for this sandbox,
+    /// so `nono why --self` can report them. Absent in states written by older
+    /// nono builds; `#[serde(default)]` keeps those loadable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_limits: Option<ResourceLimits>,
 }
 
 /// Serializable domain endpoint restriction state
@@ -106,6 +113,7 @@ impl SandboxState {
                 .collect(),
             allowed_domains: allowed_domains.to_vec(),
             domain_endpoints: domain_endpoints.to_vec(),
+            resource_limits: caps.resource_limits().copied(),
         }
     }
 
@@ -155,6 +163,10 @@ impl SandboxState {
         }
         for cmd in &self.blocked_commands {
             caps.add_blocked_command(cmd.clone());
+        }
+
+        if let Some(limits) = self.resource_limits {
+            caps = caps.with_resource_limits(limits);
         }
 
         Ok(caps)
@@ -659,6 +671,7 @@ mod tests {
             bypass_protection_paths: vec![],
             allowed_domains: vec![],
             domain_endpoints: vec![],
+            resource_limits: None,
         };
 
         let err = state
@@ -821,5 +834,54 @@ mod cap_file_validation_tests {
             msg.contains("regular file") || msg.contains(".nono-"),
             "directory should be rejected: {msg}"
         );
+    }
+
+    #[test]
+    fn resource_limits_round_trip_through_self_state() {
+        // Both ceilings must be captured in the self-state, survive the JSON
+        // round-trip, and reconstruct into caps so `nono why --self` can report them.
+        let caps = CapabilitySet::new().with_resource_limits(nono::ResourceLimits {
+            memory_bytes: Some(512 * 1024 * 1024),
+            max_processes: Some(64),
+        });
+        let state = SandboxState::from_caps(&caps, &[], &[], &[]);
+        assert_eq!(
+            state.resource_limits.and_then(|l| l.memory_bytes),
+            Some(512 * 1024 * 1024)
+        );
+        assert_eq!(
+            state.resource_limits.and_then(|l| l.max_processes),
+            Some(64)
+        );
+
+        let json = serde_json::to_string(&state).expect("serialize");
+        let restored: SandboxState = serde_json::from_str(&json).expect("deserialize");
+        let caps2 = restored.to_caps().expect("to_caps");
+        assert_eq!(
+            caps2.resource_limits().and_then(|l| l.memory_bytes),
+            Some(512 * 1024 * 1024)
+        );
+        assert_eq!(
+            caps2.resource_limits().and_then(|l| l.max_processes),
+            Some(64)
+        );
+    }
+
+    #[test]
+    fn self_state_without_limits_omits_key_and_is_back_compatible() {
+        // With no limit the key is omitted, so this serialized state is identical
+        // to one an older nono build (without the field) would have written.
+        let state = SandboxState::from_caps(&CapabilitySet::new(), &[], &[], &[]);
+        assert!(state.resource_limits.is_none());
+        let json = serde_json::to_string(&state).expect("serialize");
+        assert!(
+            !json.contains("resource_limits"),
+            "no-limit state must omit the key, got {json}"
+        );
+
+        // That legacy-shaped JSON (no resource_limits key) still loads, defaulting
+        // the field to None via #[serde(default)] — the back-compat guarantee.
+        let reloaded: SandboxState = serde_json::from_str(&json).expect("loads");
+        assert!(reloaded.resource_limits.is_none());
     }
 }

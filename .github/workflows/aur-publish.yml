@@ -25,7 +25,7 @@ jobs:
     name: Resolve publish parameters
     runs-on: ubuntu-latest
     if: >-
-      github.repository == 'always-further/nono' &&
+      github.repository == 'nolabs-ai/nono' &&
       ((github.event_name == 'workflow_dispatch') ||
       (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success'))
     outputs:

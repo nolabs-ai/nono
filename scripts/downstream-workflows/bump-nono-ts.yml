@@ -61,7 +61,7 @@ jobs:
           body: |
             Automated PR to bump the nono dependency to `${{ steps.version.outputs.version }}`.
 
-            Triggered by [nono ${{ env.NONO_VERSION }}](https://github.com/always-further/nono/releases/tag/${{ env.NONO_VERSION }}).
+            Triggered by [nono ${{ env.NONO_VERSION }}](https://github.com/nolabs-ai/nono/releases/tag/${{ env.NONO_VERSION }}).
 
             ## Checklist
             - [ ] CI passes

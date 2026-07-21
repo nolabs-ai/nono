@@ -2,7 +2,7 @@
 # push-downstream-workflows.sh
 #
 # Creates PRs in downstream repos to add the bump-nono.yml workflow.
-# Requires: gh CLI authenticated with repo scope for always-further org.
+# Requires: gh CLI authenticated with repo scope for nolabs-ai org.
 #
 # Usage: ./scripts/push-downstream-workflows.sh
 
@@ -29,7 +29,7 @@ Signed-off-by: nono-release-automation <noreply@nono.sh>"
 
 for repo in "${!REPOS[@]}"; do
   workflow_file="${REPOS[$repo]}"
-  full_repo="always-further/${repo}"
+  full_repo="nolabs-ai/${repo}"
 
   echo "==> Processing ${full_repo}..."
 
@@ -66,7 +66,7 @@ Adds `.github/workflows/bump-nono.yml` — an automated workflow that:
 2. **Creates a PR** to bump the nono dependency to the new version
 3. Can also be triggered manually via `workflow_dispatch`
 
-This is part of the [nono release automation](https://github.com/always-further/nono) that keeps all downstream SDKs and services in sync when a new nono version is released.
+This is part of the [nono release automation](https://github.com/nolabs-ai/nono) that keeps all downstream SDKs and services in sync when a new nono version is released.
 
 ### Flow
 ```
@@ -79,7 +79,7 @@ nono tag v0.X.0
 ```
 
 ### Required setup
-- A `DOWNSTREAM_PAT` secret must be configured in the nono repo with `repo` scope for the `always-further` org
+- A `DOWNSTREAM_PAT` secret must be configured in the nono repo with `repo` scope for the `nolabs-ai` org
 
 🤖 Generated with [Claude Code](https://claude.com/claude-code)
 EOF
@@ -91,4 +91,4 @@ EOF
 done
 
 echo ""
-echo "Done! Remember to add the DOWNSTREAM_PAT secret to always-further/nono."
+echo "Done! Remember to add the DOWNSTREAM_PAT secret to nolabs-ai/nono."

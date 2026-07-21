@@ -220,6 +220,13 @@ a token refresh or exchange request.
 For JSON bodies, dotted paths are supported. For form bodies, use top-level
 field names.
 
+Optional. A *capture-only* endpoint — where the token arrives in the response
+and is never re-sent in a request body — leaves this empty. For example, the
+HashiCorp Vault CLI's `vault login -method=oidc` flow GETs
+`/v1/auth/<mount>/oidc/callback`, receives `auth.client_token` in the response,
+and thereafter sends it in a header; nothing is re-injected into a request
+body, so its token endpoint has no `request_nonce_fields`.
+
 ### `api_hosts` and `credential_routes`
 
 `api_hosts` declares where phantoms may be resolved:
@@ -241,6 +248,45 @@ field names.
 
 Only those routes can resolve the provider's phantoms. A random process cannot
 take `nono_<64hex>` and use it directly against the provider.
+
+### `inject_header` and `credential_format` (non-Bearer APIs)
+
+By default a resolved phantom is injected into the `Authorization` header as
+`Bearer <token>`. APIs that authenticate differently override this on the
+provider:
+
+```json
+"inject_header": "X-Vault-Token",
+"credential_format": "{}"
+```
+
+- `inject_header` — request header the resolved credential is injected into.
+  Defaults to `Authorization`. Must be a valid HTTP header name.
+- `credential_format` — value written to that header; `{}` is replaced with the
+  token. Defaults to `Bearer {}`. Must contain `{}`.
+
+For example, the HashiCorp Vault CLI sends the token as
+`X-Vault-Token: <raw token>`, so a `vault_oidc` provider sets
+`inject_header: "X-Vault-Token"` and `credential_format: "{}"`.
+
+### Binding the callback when the login CLI is a mediated command
+
+The examples above assume the sandboxed agent itself performs the login, using
+the top-level `network.open_port` grant for its loopback callback listener. If
+instead the login CLI runs as a mediated command (declared in
+`command_policies`), it must be granted its callback port on that command's
+network policy — the top-level grant does not extend to a tool-sandbox child:
+
+```json
+"network": {
+  "allow_domain": ["vault.example.com"],
+  "open_port_range": [[8250, 8255]]
+}
+```
+
+`vault login -method=oidc` binds `http://localhost:8250/oidc/callback` (and
+increments if busy). Use `open_port` / `open_port_range` rather than
+`tcp_bind_ports`, which cannot be enforced for tool-sandbox children on macOS.
 
 ## Add endpoint policy
 

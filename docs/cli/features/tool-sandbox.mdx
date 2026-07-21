@@ -174,7 +174,9 @@ The `@git:common-dir` token runs `git rev-parse --git-common-dir` from nono's wo
 | `allow_all` | boolean | Allows unrestricted child network access. |
 | `allow_domain` | string array | Hostname allow-list. Valid only with an enforceable nono proxy/helper mode. |
 | `tcp_connect_ports` | port array | Raw TCP connect ports on Linux Landlock. Not hostname-filtered. |
-| `tcp_bind_ports` | port array | Raw TCP bind ports on Linux Landlock. |
+| `tcp_bind_ports` | port array | Raw TCP bind ports on Linux Landlock. Cannot be enforced for tool-sandbox children on macOS. |
+| `open_port` | port array | Localhost bind ports (e.g. an OAuth/OIDC loopback callback listener). Mirrors the top-level `network.open_port`; enforceable for children on macOS and Linux. |
+| `open_port_range` | `[start, end]` array | Inclusive localhost bind port ranges, e.g. `[[8250, 8255]]`. |
 
 `environment.allow_vars` accepts exact names such as `PATH`, trailing-prefix wildcards such as `AWS_*`, and the bare wildcard `*`. `environment.set_vars` injects static values after filtering; `PATH` and `NONO_*` are reserved.
 

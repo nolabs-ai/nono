@@ -2490,8 +2490,16 @@ fn synthesize_credential_provider_proxy_config(
                 upstream: api_host.clone(),
                 credential_key: None,
                 inject_mode: InjectMode::Header,
-                inject_header: "Authorization".to_string(),
-                credential_format: Some("Bearer {}".to_string()),
+                inject_header: provider
+                    .inject_header
+                    .clone()
+                    .unwrap_or_else(|| "Authorization".to_string()),
+                credential_format: Some(
+                    provider
+                        .credential_format
+                        .clone()
+                        .unwrap_or_else(|| "Bearer {}".to_string()),
+                ),
                 path_pattern: None,
                 path_replacement: None,
                 query_param_name: None,
@@ -4768,6 +4776,8 @@ mod tests {
                     request_nonce_fields: vec!["refresh_token".to_string()],
                 }],
                 api_hosts: vec!["https://api.openai.com".to_string()],
+                inject_header: None,
+                credential_format: None,
                 credential_store: None,
                 helpers: None,
             },
@@ -4815,6 +4825,57 @@ mod tests {
             !route.endpoint_rules.is_empty(),
             "provider API routes must force L7 visibility even with allow-all policy"
         );
+        // Default injection is an OAuth Bearer Authorization header.
+        assert_eq!(route.inject_header, "Authorization");
+        assert_eq!(route.credential_format.as_deref(), Some("Bearer {}"));
+    }
+
+    #[test]
+    fn test_credential_provider_route_honors_custom_inject_header() {
+        // Vault authenticates with the raw token in `X-Vault-Token`, not an
+        // OAuth `Authorization: Bearer` header.
+        let mut providers = HashMap::new();
+        providers.insert(
+            "vault_oidc".to_string(),
+            crate::profile::CredentialProviderDef {
+                provider_type: crate::profile::CredentialProviderType::OauthCapture,
+                token_endpoints: vec![crate::profile::CredentialProviderTokenEndpoint {
+                    host: "https://vault.us1.ddbuild.io".to_string(),
+                    path: "/v1/auth/oidc/oidc/callback".to_string(),
+                    response_fields: vec![crate::profile::CredentialProviderResponseField {
+                        path: "auth.client_token".to_string(),
+                        kind: crate::profile::CredentialProviderResponseFieldKind::Opaque,
+                    }],
+                    request_body: crate::profile::CredentialProviderRequestBodyFormat::Auto,
+                    request_nonce_fields: vec![],
+                }],
+                api_hosts: vec!["https://vault.us1.ddbuild.io".to_string()],
+                inject_header: Some("X-Vault-Token".to_string()),
+                credential_format: Some("{}".to_string()),
+                credential_store: None,
+                helpers: None,
+            },
+        );
+        let proxy = ProxyLaunchOptions {
+            credential_providers: providers,
+            credential_routes: vec![crate::profile::CredentialRouteDef {
+                name: "vault".to_string(),
+                provider: "vault_oidc".to_string(),
+                env_var: None,
+                base_url_env_var: None,
+                endpoint_policy: None,
+            }],
+            ..ProxyLaunchOptions::default()
+        };
+
+        let config = build_proxy_config_from_flags(&proxy).expect("provider proxy config builds");
+        let route = config
+            .routes
+            .iter()
+            .find(|route| route.prefix == "vault")
+            .expect("API route must be synthesized");
+        assert_eq!(route.inject_header, "X-Vault-Token");
+        assert_eq!(route.credential_format.as_deref(), Some("{}"));
     }
 
     // Verify that a credential helper with `stdio: true` (interaction.stdio) does not

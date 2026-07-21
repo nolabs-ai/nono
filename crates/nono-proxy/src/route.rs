@@ -1490,6 +1490,7 @@ mod tests {
             oauth2: None,
             aws_auth: None,
             spiffe: None,
+            rate_limit: None,
             upgrades: vec![],
         }];
         let store = RouteStore::load(&routes).await.unwrap();

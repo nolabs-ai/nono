@@ -356,7 +356,7 @@ pub(crate) enum RouteSelection<'a> {
     Selected(Option<SelectedRoute<'a>>),
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct SelectedRoute<'a> {
     pub id: &'a str,
     pub route: &'a crate::route::LoadedRoute,
@@ -2549,13 +2549,23 @@ mod tests {
                 burst: 1,
                 max_delay_secs: 0,
             }),
+            redeem_phantoms: vec![],
+            upgrades: vec![],
         };
 
         let store = RouteStore::load(&[route]).await.unwrap();
 
+        fn req() -> InterceptRouteRequest<'static> {
+            InterceptRouteRequest {
+                method: "GET",
+                path: "/foo",
+                websocket_path: None,
+            }
+        }
+
         // First request consumes the single burst token and selects the route.
-        match select_intercept_route(&store, "example.com", 443, "GET", "/foo", None, None).await {
-            RouteSelection::Selected(Some((svc, _))) => assert_eq!(svc, "limited"),
+        match select_intercept_route(&store, "example.com", 443, req(), None, None).await {
+            RouteSelection::Selected(Some(selected)) => assert_eq!(selected.id, "limited"),
             RouteSelection::Selected(None) => {
                 panic!("first request must select the limited route, not passthrough")
             }
@@ -2566,7 +2576,7 @@ mod tests {
 
         // Second request within the same instant: bucket empty, zero delay
         // budget, so it is rejected with HTTP 429.
-        match select_intercept_route(&store, "example.com", 443, "GET", "/foo", None, None).await {
+        match select_intercept_route(&store, "example.com", 443, req(), None, None).await {
             RouteSelection::Rejected(status) => assert_eq!(status, 429),
             RouteSelection::Selected(selected) => {
                 panic!("second request must be rate limited with 429, got Selected({selected:?})")

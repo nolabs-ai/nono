@@ -227,6 +227,16 @@ async fn open_upstream_h2(
         })
 }
 
+/// `true` if `request` is an RFC 8441 extended CONNECT for the `websocket`
+/// protocol (`:method: CONNECT` + `:protocol: websocket`).
+fn is_extended_connect_websocket<T>(request: &Request<T>) -> bool {
+    request.method() == http::Method::CONNECT
+        && request
+            .extensions()
+            .get::<h2::ext::Protocol>()
+            .is_some_and(|protocol| protocol.as_str().eq_ignore_ascii_case("websocket"))
+}
+
 /// Handle a single h2 request stream: route selection, credential injection,
 /// and bidirectional body streaming.
 async fn handle_h2_stream(
@@ -264,6 +274,16 @@ async fn handle_h2_stream(
     // gRPC traffic.
     let method_str = method.as_str().to_string();
 
+    // RFC 8441 extended CONNECT (`:method: CONNECT` + `:protocol: websocket`) is
+    // the HTTP/2 equivalent of an HTTP/1.1 `Upgrade: websocket` request. This
+    // server doesn't call `enable_connect_protocol()`, so the h2 crate itself
+    // currently rejects such streams before they reach here — but the gate
+    // below must still route any that do arrive through the same
+    // `upgrade_rules` check as the HTTP/1.1 path, so enabling extended CONNECT
+    // in the future (e.g. for h2 WebSocket tunneling) can't silently bypass
+    // the route's WebSocket allowlist.
+    let is_websocket_upgrade = is_extended_connect_websocket(&request);
+
     // Audit context is populated per-stream when credentials are acquired.
     let mut spiffe_audit_ctx: Option<nono::undo::SpiffeAuditContext> = None;
     let selected = match handle::select_intercept_route(
@@ -273,7 +293,7 @@ async fn handle_h2_stream(
         handle::InterceptRouteRequest {
             method: &method_str,
             path: &path,
-            websocket_path: None,
+            websocket_path: is_websocket_upgrade.then_some(path.as_str()),
         },
         ctx.audit_log.as_ref(),
         ctx.approval_backends.as_ref(),
@@ -2170,6 +2190,48 @@ mod tests {
             upgrades: vec![],
         }];
         RouteStore::load(&routes).await.unwrap()
+    }
+
+    // Regression tests for `is_extended_connect_websocket`: an RFC 8441
+    // extended CONNECT must be classified so it can be routed through the
+    // same `upgrade_rules` gate as the HTTP/1.1 `Upgrade: websocket` path
+    // (see `handle_h2_stream`, which previously hardcoded
+    // `websocket_path: None` and never applied this gate at all).
+
+    #[test]
+    fn is_extended_connect_websocket_true_for_connect_with_websocket_protocol() {
+        let request = http::Request::builder()
+            .method("CONNECT")
+            .extension(h2::ext::Protocol::from_static("websocket"))
+            .body(())
+            .unwrap();
+        assert!(is_extended_connect_websocket(&request));
+    }
+
+    #[test]
+    fn is_extended_connect_websocket_false_for_plain_connect() {
+        let request = http::Request::builder().method("CONNECT").body(()).unwrap();
+        assert!(!is_extended_connect_websocket(&request));
+    }
+
+    #[test]
+    fn is_extended_connect_websocket_false_for_non_connect_method_with_protocol_extension() {
+        let request = http::Request::builder()
+            .method("GET")
+            .extension(h2::ext::Protocol::from_static("websocket"))
+            .body(())
+            .unwrap();
+        assert!(!is_extended_connect_websocket(&request));
+    }
+
+    #[test]
+    fn is_extended_connect_websocket_false_for_other_protocol() {
+        let request = http::Request::builder()
+            .method("CONNECT")
+            .extension(h2::ext::Protocol::from_static("webtransport"))
+            .body(())
+            .unwrap();
+        assert!(!is_extended_connect_websocket(&request));
     }
 
     #[tokio::test]

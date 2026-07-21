@@ -2693,7 +2693,7 @@ dependencies = [
 
 [[package]]
 name = "nono"
-version = "0.68.0"
+version = "0.69.0"
 dependencies = [
  "der",
  "getrandom 0.4.3",
@@ -2723,7 +2723,7 @@ dependencies = [
 
 [[package]]
 name = "nono-cli"
-version = "0.68.0"
+version = "0.69.0"
 dependencies = [
  "aws-lc-rs",
  "chrono",
@@ -2784,7 +2784,7 @@ dependencies = [
 
 [[package]]
 name = "nono-proxy"
-version = "0.68.0"
+version = "0.69.0"
 dependencies = [
  "aws-config",
  "aws-credential-types",

@@ -237,6 +237,7 @@ pub fn resolve_credentials(
                 prefix: name.clone(),
                 upstream: cred.upstream.clone(),
                 credential_key: cred.credential_key.clone(),
+                redeem_phantoms: cred.redeem_phantoms.clone(),
                 inject_mode: cred.inject_mode.clone(),
                 inject_header: cred.inject_header.clone(),
                 credential_format: cred.credential_format.clone(),
@@ -290,6 +291,7 @@ pub fn resolve_credentials(
                 prefix: name.clone(),
                 upstream: cred.upstream.clone(),
                 credential_key: Some(key),
+                redeem_phantoms: Vec::new(),
                 inject_mode: InjectMode::Header,
                 inject_header: cred.inject_header.clone(),
                 credential_format: cred.credential_format.clone(),
@@ -452,6 +454,7 @@ pub fn partition_allow_domain(
                         prefix,
                         upstream: format!("{}://{}", scheme, domain),
                         credential_key: None,
+                        redeem_phantoms: Vec::new(),
                         inject_mode: InjectMode::default(),
                         inject_header: "Authorization".to_string(),
                         credential_format: None,
@@ -607,6 +610,7 @@ mod tests {
         custom.insert(
             "telegram".to_string(),
             CustomCredentialDef {
+                redeem_phantoms: Vec::new(),
                 upstream: "https://api.telegram.org".to_string(),
                 credential_key: Some("telegram_bot_token".to_string()),
                 auth: None,
@@ -650,6 +654,7 @@ mod tests {
         custom.insert(
             "openai".to_string(),
             CustomCredentialDef {
+                redeem_phantoms: Vec::new(),
                 upstream: "https://my-proxy.example.com/openai".to_string(),
                 credential_key: Some("my_openai_key".to_string()),
                 auth: None,
@@ -689,6 +694,7 @@ mod tests {
         custom.insert(
             "telegram".to_string(),
             CustomCredentialDef {
+                redeem_phantoms: Vec::new(),
                 upstream: "https://api.telegram.org".to_string(),
                 credential_key: Some("telegram_bot_token".to_string()),
                 auth: None,
@@ -738,6 +744,7 @@ mod tests {
         custom.insert(
             "local".to_string(),
             CustomCredentialDef {
+                redeem_phantoms: Vec::new(),
                 upstream: "http://localhost:8080/api".to_string(),
                 credential_key: Some("local_api_key".to_string()),
                 auth: None,
@@ -827,6 +834,7 @@ mod tests {
         custom.insert(
             "local".to_string(),
             CustomCredentialDef {
+                redeem_phantoms: Vec::new(),
                 upstream: "http://127.1.2.3:8080/api".to_string(),
                 credential_key: Some("local_api_key".to_string()),
                 auth: None,
@@ -863,6 +871,7 @@ mod tests {
         custom.insert(
             "local".to_string(),
             CustomCredentialDef {
+                redeem_phantoms: Vec::new(),
                 upstream: "http://0.0.0.0:3000/api".to_string(),
                 credential_key: Some("local_api_key".to_string()),
                 auth: None,
@@ -899,6 +908,7 @@ mod tests {
         custom.insert(
             "test".to_string(),
             CustomCredentialDef {
+                redeem_phantoms: Vec::new(),
                 upstream: "https://api.example.com".to_string(),
                 credential_key: Some("api_key".to_string()),
                 auth: None,
@@ -940,6 +950,7 @@ mod tests {
         custom.insert(
             "openai".to_string(),
             CustomCredentialDef {
+                redeem_phantoms: Vec::new(),
                 upstream: "https://api.openai.com/v1".to_string(),
                 credential_key: Some("op://Development/OpenAI/credential".to_string()),
                 auth: None,
@@ -1075,6 +1086,7 @@ mod tests {
         custom.insert(
             "evil".to_string(),
             CustomCredentialDef {
+                redeem_phantoms: Vec::new(),
                 upstream: "https://api.example.com".to_string(),
                 credential_key: Some("safe_key".to_string()),
                 auth: None,
@@ -1161,6 +1173,7 @@ mod tests {
         custom.insert(
             "my_api".to_string(),
             CustomCredentialDef {
+                redeem_phantoms: Vec::new(),
                 upstream: "https://api.example.com".to_string(),
                 credential_key: None,
                 auth: Some(OAuth2Config {
@@ -1219,6 +1232,7 @@ mod tests {
         custom.insert(
             "standard".to_string(),
             CustomCredentialDef {
+                redeem_phantoms: Vec::new(),
                 upstream: "https://api.example.com".to_string(),
                 credential_key: Some("my_key".to_string()),
                 auth: None,
@@ -1376,6 +1390,7 @@ mod tests {
         custom.insert(
             "mockhttp".to_string(),
             CustomCredentialDef {
+                redeem_phantoms: Vec::new(),
                 upstream: "https://mockhttp.org".to_string(),
                 credential_key: Some("env://MOCK_API_KEY".to_string()),
                 auth: None,
@@ -1418,6 +1433,7 @@ mod tests {
         custom.insert(
             "svc_a".to_string(),
             CustomCredentialDef {
+                redeem_phantoms: Vec::new(),
                 upstream: "https://svc-a.example.com".to_string(),
                 credential_key: Some("env://SVC_A_KEY".to_string()),
                 auth: None,
@@ -1441,6 +1457,7 @@ mod tests {
         custom.insert(
             "svc_b".to_string(),
             CustomCredentialDef {
+                redeem_phantoms: Vec::new(),
                 upstream: "https://svc-b.example.com".to_string(),
                 credential_key: Some("env://SVC_B_KEY".to_string()),
                 auth: None,

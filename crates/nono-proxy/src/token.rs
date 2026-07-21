@@ -30,6 +30,17 @@ pub trait NonceResolver: Send + Sync {
     /// Returns the real credential bytes if the nonce is known and admitted
     /// for `consumer` (`"proxy.<route_id>"`), or `None` otherwise (fail-closed).
     fn resolve(&self, nonce: &str, consumer: &str) -> Option<Zeroizing<Vec<u8>>>;
+
+    /// Resolve `nonce` iff its credential name is in `allowed_credentials`
+    /// (route-authoritative; ignores the grant set). Default `None` for
+    /// resolvers that don't track credential names (e.g. OAuth-capture store).
+    fn resolve_for_credentials(
+        &self,
+        _nonce: &str,
+        _allowed_credentials: &[String],
+    ) -> Option<Zeroizing<Vec<u8>>> {
+        None
+    }
 }
 
 /// Length of the random token in bytes (256 bits of entropy).

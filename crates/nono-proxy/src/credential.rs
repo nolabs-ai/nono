@@ -961,6 +961,7 @@ mod tests {
         use crate::config::OAuth2Config;
 
         RouteConfig {
+            redeem_phantoms: Vec::new(),
             prefix: prefix.to_string(),
             upstream: "https://api.example.com".to_string(),
             credential_key: None,
@@ -995,6 +996,7 @@ mod tests {
     async fn test_load_missing_env_credential_records_credential_not_found() {
         let tls = test_tls_connector();
         let routes = vec![RouteConfig {
+            redeem_phantoms: Vec::new(),
             prefix: "preview-missing".to_string(),
             upstream: "https://api.example.com".to_string(),
             credential_key: Some("env://NONO_PROXY_TEST_MISSING_CRED".to_string()),
@@ -1116,6 +1118,7 @@ mod tests {
     async fn test_load_no_credential_routes() {
         let tls = test_tls_connector();
         let routes = vec![RouteConfig {
+            redeem_phantoms: Vec::new(),
             prefix: "/test".to_string(),
             upstream: "https://example.com".to_string(),
             credential_key: None,
@@ -1159,6 +1162,7 @@ mod tests {
     async fn test_load_cmd_uri_registers_lazy_route() {
         let tls = test_tls_connector();
         let routes = vec![RouteConfig {
+            redeem_phantoms: Vec::new(),
             prefix: "/github".to_string(),
             upstream: "https://api.github.com".to_string(),
             credential_key: Some("cmd://github".to_string()),
@@ -1264,6 +1268,7 @@ mod tests {
         };
         let tls = test_tls_connector();
         let routes = vec![RouteConfig {
+            redeem_phantoms: Vec::new(),
             prefix: "litellm".to_string(),
             upstream: "https://litellm".to_string(),
             credential_key: Some("env://NONO_PROXY_TEST_LITELLM_TOKEN".to_string()),
@@ -1302,6 +1307,7 @@ mod tests {
         };
         let tls = test_tls_connector();
         let routes = vec![RouteConfig {
+            redeem_phantoms: Vec::new(),
             prefix: "api".to_string(),
             upstream: "https://api.example.com".to_string(),
             credential_key: Some("env://NONO_PROXY_TEST_API_KEY".to_string()),
@@ -1344,6 +1350,7 @@ mod tests {
         };
         let tls = test_tls_connector();
         let routes = vec![RouteConfig {
+            redeem_phantoms: Vec::new(),
             prefix: "my-api".to_string(),
             upstream: "https://api.example.com".to_string(),
             credential_key: None,

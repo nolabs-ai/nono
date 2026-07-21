@@ -708,6 +708,13 @@ pub struct RouteConfig {
     /// If `None`, no credential is injected.
     pub credential_key: Option<String>,
 
+    /// Broker credential names redeemable at this route from a caller-presented
+    /// phantom (by-value / proof-of-possession). Non-empty forces
+    /// `requires_intercept`. Composes with a managed `credential_key`/`oauth2`;
+    /// not honored with `aws_auth`/`spiffe` (dedicated handlers).
+    #[serde(default)]
+    pub redeem_phantoms: Vec<String>,
+
     /// Injection mode (default: "header")
     #[serde(default)]
     pub inject_mode: InjectMode,

@@ -1857,6 +1857,7 @@ fn collect_tool_sandbox_proxy_grants(
         };
 
         let route = crate::profile::CustomCredentialDef {
+            redeem_phantoms: Vec::new(),
             upstream,
             credential_key,
             auth: None,
@@ -2494,6 +2495,7 @@ fn synthesize_credential_provider_proxy_config(
                 })
                 .collect();
             proxy_config.routes.push(nono_proxy::config::RouteConfig {
+                redeem_phantoms: Vec::new(),
                 prefix: prefix.clone(),
                 upstream: api_host.clone(),
                 credential_key: None,
@@ -2690,6 +2692,17 @@ struct TokenBrokerNonceResolver(crate::tool_sandbox::token_broker::SharedBroker)
 impl nono_proxy::NonceResolver for TokenBrokerNonceResolver {
     fn resolve(&self, nonce: &str, consumer: &str) -> Option<Zeroizing<Vec<u8>>> {
         self.0.lock().ok()?.resolve_nonce(nonce, consumer)
+    }
+
+    fn resolve_for_credentials(
+        &self,
+        nonce: &str,
+        allowed_credentials: &[String],
+    ) -> Option<Zeroizing<Vec<u8>>> {
+        self.0
+            .lock()
+            .ok()?
+            .resolve_nonce_for_credentials(nonce, allowed_credentials)
     }
 }
 
@@ -3395,6 +3408,7 @@ mod tests {
         custom_credentials.insert(
             "mockhttp".to_string(),
             CustomCredentialDef {
+                redeem_phantoms: Vec::new(),
                 upstream: "https://mockhttp.org".to_string(),
                 credential_key: Some("env://MOCK_API_KEY".to_string()),
                 auth: None,
@@ -3882,6 +3896,7 @@ mod tests {
 
         let mut proxy_config = nono_proxy::config::ProxyConfig::default();
         proxy_config.routes.push(nono_proxy::config::RouteConfig {
+            redeem_phantoms: Vec::new(),
             prefix: "github-api".to_string(),
             upstream: "https://api.github.com".to_string(),
             credential_key: Some("github-token".to_string()),

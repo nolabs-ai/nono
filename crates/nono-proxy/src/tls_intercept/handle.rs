@@ -1187,6 +1187,7 @@ where
     }
     let injected_header_names = reverse::injected_credential_header_names(cred);
     let nonce_consumer = service.map(|s| format!("proxy.{s}"));
+    let redeem_phantoms: &[String] = route.map_or(&[], |r| r.redeem_phantoms.as_slice());
     for (name, value) in &filtered_headers {
         if injected_header_names
             .iter()
@@ -1197,9 +1198,9 @@ where
         let resolved_value = nonce_consumer
             .as_deref()
             .and_then(|consumer| {
-                ctx.nonce_resolver
-                    .as_deref()
-                    .and_then(|resolver| resolve_nonce_in_header_value(value, consumer, resolver))
+                ctx.nonce_resolver.as_deref().and_then(|resolver| {
+                    resolve_nonce_in_header_value(value, consumer, redeem_phantoms, resolver)
+                })
             })
             .unwrap_or_else(|| value.clone());
         request.push_str(&format!("{}: {}\r\n", name, resolved_value));
@@ -1522,18 +1523,15 @@ where
     Ok(())
 }
 
-/// Scan a header value for a tool-sandbox broker nonce (`nono_<64hex>`) and,
-/// if one is found and `resolver` admits `consumer`, return the header value
-/// with the nonce replaced by the real credential bytes (UTF-8).
+/// Replace a broker nonce in a header value with the real credential.
 ///
-/// Only the first nonce found is substituted. Non-UTF-8 real values are
-/// forwarded verbatim (fail-open for the substitution, not the request).
-/// If no nonce is found, or the resolver returns `None`, the original value
-/// is returned unchanged (fail-closed: the upstream sees the raw nonce and
-/// will reject the request, not a silently wrong credential).
+/// Empty `allowed_credentials` uses grant-set auth (`consumer`); non-empty uses
+/// route-authoritative by-value auth (the nonce's credential name must be listed).
+/// Fail-closed: unresolved/unauthorized nonces are left raw so the upstream 401s.
 pub(crate) fn resolve_nonce_in_header_value(
     value: &str,
     consumer: &str,
+    allowed_credentials: &[String],
     resolver: &dyn crate::token::NonceResolver,
 ) -> Option<String> {
     const NONCE_PREFIX: &str = "nono_";
@@ -1551,8 +1549,32 @@ pub(crate) fn resolve_nonce_in_header_value(
     {
         return None;
     }
-    let real = resolver.resolve(nonce, consumer)?;
+    let real = if allowed_credentials.is_empty() {
+        resolver.resolve(nonce, consumer)?
+    } else {
+        resolver.resolve_for_credentials(nonce, allowed_credentials)?
+    };
     let real_str = std::str::from_utf8(&real).ok()?;
+
+    // Whole-token replace a JWT-shaped phantom: splicing only the signature
+    // segment would leave a mangled 5-segment token when the real value is a JWT.
+    // Anchor to the nonce already parsed at `start` (the shaped token ends with
+    // it) rather than re-searching the header, so a different occurrence can't be
+    // matched and leave this one unresolved.
+    if let Ok(shaped) = crate::jwt_phantom::jwt_shaped_phantom(nonce)
+        && let Some(shaped_prefix) = shaped.strip_suffix(nonce)
+        && let Some(shaped_start) = start.checked_sub(shaped_prefix.len())
+        // `.get` (not indexing): shaped_start may fall mid-UTF-8 on a crafted header.
+        && value.get(shaped_start..start) == Some(shaped_prefix)
+    {
+        return Some(format!(
+            "{}{}{}",
+            &value[..shaped_start],
+            real_str,
+            &value[end..]
+        ));
+    }
+
     Some(format!("{}{}{}", &value[..start], real_str, &value[end..]))
 }
 
@@ -1786,6 +1808,7 @@ where
         &upstream_authority,
         cred,
         service,
+        route.map_or(&[], |r| r.redeem_phantoms.as_slice()),
         ctx.nonce_resolver.as_deref(),
     ) {
         Ok(request) => request,
@@ -1962,6 +1985,7 @@ fn build_websocket_upstream_request(
     upstream_authority: &str,
     cred: Option<&crate::credential::LoadedCredential>,
     service: Option<&str>,
+    redeem_phantoms: &[String],
     nonce_resolver: Option<&dyn crate::token::NonceResolver>,
 ) -> Result<Zeroizing<String>> {
     let injected_header_names = reverse::injected_credential_header_names(cred);
@@ -1983,11 +2007,13 @@ fn build_websocket_upstream_request(
             let resolver = nonce_resolver.ok_or_else(|| {
                 ProxyError::Credential("phantom nonce resolver is unavailable".to_string())
             })?;
-            resolve_nonce_in_header_value(&field.value, consumer, resolver).ok_or_else(|| {
-                ProxyError::Credential(
-                    "phantom nonce is invalid, expired, or not admitted for this route".to_string(),
-                )
-            })?
+            resolve_nonce_in_header_value(&field.value, consumer, redeem_phantoms, resolver)
+                .ok_or_else(|| {
+                    ProxyError::Credential(
+                        "phantom nonce is invalid, expired, or not admitted for this route"
+                            .to_string(),
+                    )
+                })?
         } else {
             field.value
         };
@@ -2333,6 +2359,7 @@ mod tests {
         tls_ca: Option<&str>,
     ) -> crate::config::RouteConfig {
         crate::config::RouteConfig {
+            redeem_phantoms: Vec::new(),
             prefix: prefix.to_string(),
             upstream: format!("https://{}:{}", host, port),
             credential_key: Some(format!("env://{}_TOKEN", prefix.to_uppercase())),
@@ -2368,6 +2395,7 @@ mod tests {
     async fn select_intercept_route_disjoint_credential_routes_do_not_cross_deny() {
         fn cred_route(prefix: &str, path: &str) -> crate::config::RouteConfig {
             crate::config::RouteConfig {
+                redeem_phantoms: Vec::new(),
                 prefix: prefix.to_string(),
                 upstream: "https://example.com".to_string(),
                 credential_key: Some(format!("env://{}_TOKEN", prefix.to_uppercase())),
@@ -2463,12 +2491,28 @@ mod tests {
     struct TestResolver {
         nonce: String,
         real: Vec<u8>,
+        /// Admitted for the consumer/grant-set path (`resolve`).
         admitted_consumer: String,
+        /// Broker credential name for the route-authoritative path
+        /// (`resolve_for_credentials`).
+        credential_name: String,
     }
 
     impl crate::token::NonceResolver for TestResolver {
         fn resolve(&self, nonce: &str, consumer: &str) -> Option<Zeroizing<Vec<u8>>> {
             if nonce == self.nonce && consumer == self.admitted_consumer {
+                Some(Zeroizing::new(self.real.clone()))
+            } else {
+                None
+            }
+        }
+
+        fn resolve_for_credentials(
+            &self,
+            nonce: &str,
+            allowed: &[String],
+        ) -> Option<Zeroizing<Vec<u8>>> {
+            if nonce == self.nonce && allowed.iter().any(|a| a == &self.credential_name) {
                 Some(Zeroizing::new(self.real.clone()))
             } else {
                 None
@@ -2480,41 +2524,46 @@ mod tests {
         format!("nono_{}", "a".repeat(64))
     }
 
+    fn test_resolver(nonce: &str, real: &[u8]) -> TestResolver {
+        TestResolver {
+            nonce: nonce.to_string(),
+            real: real.to_vec(),
+            admitted_consumer: "proxy.anthropic".to_string(),
+            credential_name: "ddtool-token".to_string(),
+        }
+    }
+
+    // Empty allow-list selects the consumer/grant-set resolution path.
+    const CONSUMER_PATH: &[String] = &[];
+
     #[test]
     fn resolves_bearer_nonce() {
         let nonce = make_nonce();
-        let resolver = TestResolver {
-            nonce: nonce.clone(),
-            real: b"sk-ant-real".to_vec(),
-            admitted_consumer: "proxy.anthropic".to_string(),
-        };
+        let resolver = test_resolver(&nonce, b"sk-ant-real");
         let value = format!("Bearer {nonce}");
-        let result = resolve_nonce_in_header_value(&value, "proxy.anthropic", &resolver);
+        let result =
+            resolve_nonce_in_header_value(&value, "proxy.anthropic", CONSUMER_PATH, &resolver);
         assert_eq!(result, Some("Bearer sk-ant-real".to_string()));
     }
 
     #[test]
     fn returns_none_for_unadmitted_consumer() {
         let nonce = make_nonce();
-        let resolver = TestResolver {
-            nonce: nonce.clone(),
-            real: b"sk-ant-real".to_vec(),
-            admitted_consumer: "proxy.anthropic".to_string(),
-        };
+        let resolver = test_resolver(&nonce, b"sk-ant-real");
         let value = format!("Bearer {nonce}");
-        let result = resolve_nonce_in_header_value(&value, "proxy.other", &resolver);
+        let result = resolve_nonce_in_header_value(&value, "proxy.other", CONSUMER_PATH, &resolver);
         assert!(result.is_none(), "unadmitted consumer must not resolve");
     }
 
     #[test]
     fn returns_none_when_no_nonce_present() {
-        let resolver = TestResolver {
-            nonce: make_nonce(),
-            real: b"secret".to_vec(),
-            admitted_consumer: "proxy.anthropic".to_string(),
-        };
-        let result =
-            resolve_nonce_in_header_value("Bearer plain-token", "proxy.anthropic", &resolver);
+        let resolver = test_resolver(&make_nonce(), b"secret");
+        let result = resolve_nonce_in_header_value(
+            "Bearer plain-token",
+            "proxy.anthropic",
+            CONSUMER_PATH,
+            &resolver,
+        );
         assert!(result.is_none());
     }
 
@@ -2527,20 +2576,112 @@ mod tests {
     #[test]
     fn preserves_prefix_and_suffix_around_nonce() {
         let nonce = make_nonce();
-        let resolver = TestResolver {
-            nonce: nonce.clone(),
-            real: b"REAL".to_vec(),
-            admitted_consumer: "proxy.svc".to_string(),
-        };
+        let mut resolver = test_resolver(&nonce, b"REAL");
+        resolver.admitted_consumer = "proxy.svc".to_string();
         let value = format!("prefix-{nonce}-suffix");
-        let result = resolve_nonce_in_header_value(&value, "proxy.svc", &resolver);
+        let result = resolve_nonce_in_header_value(&value, "proxy.svc", CONSUMER_PATH, &resolver);
         assert_eq!(result, Some("prefix-REAL-suffix".to_string()));
+    }
+
+    const REAL_JWT: &str = "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJyYXBpZCJ9.c2lnbmF0dXJlLWJ5dGVz";
+
+    #[test]
+    fn jwt_shaped_phantom_resolves_to_clean_real_jwt() {
+        // The real value is a JWT: a substring splice would mangle it to 5 segments.
+        let nonce = make_nonce();
+        let shaped = crate::jwt_phantom::jwt_shaped_phantom(&nonce).expect("shape");
+        let resolver = test_resolver(&nonce, REAL_JWT.as_bytes());
+        let allowed = vec!["ddtool-token".to_string()];
+        let value = format!("Bearer {shaped}");
+        let result = resolve_nonce_in_header_value(&value, "proxy.dealership", &allowed, &resolver)
+            .expect("resolves");
+        assert_eq!(result, format!("Bearer {REAL_JWT}"));
+        let token = result.strip_prefix("Bearer ").expect("bearer prefix");
+        assert_eq!(
+            token.matches('.').count(),
+            2,
+            "expected exactly 3 JWT segments"
+        );
+    }
+
+    #[test]
+    fn opaque_nonce_uses_substring_replacement() {
+        let nonce = make_nonce();
+        let mut resolver = test_resolver(&nonce, b"opaque-secret");
+        resolver.admitted_consumer = "proxy.svc".to_string();
+        let value = format!("token={nonce}&scope=all");
+        let result = resolve_nonce_in_header_value(&value, "proxy.svc", CONSUMER_PATH, &resolver);
+        assert_eq!(result, Some("token=opaque-secret&scope=all".to_string()));
+    }
+
+    #[test]
+    fn multibyte_before_nonce_does_not_panic() {
+        // A multibyte char positioned so the shaped-prefix anchor offset lands
+        // mid-codepoint must not panic (crafted-header DoS); falls to opaque.
+        let nonce = make_nonce();
+        let shaped = crate::jwt_phantom::jwt_shaped_phantom(&nonce).expect("shape");
+        let prefix_len = shaped.len() - nonce.len();
+        // 'é' is 2 bytes; start = prefix_len + 1, so shaped_start = 1 (inside 'é').
+        let filler = "a".repeat(prefix_len - 1);
+        let value = format!("é{filler}{nonce}");
+        let resolver = test_resolver(&nonce, b"REAL");
+        let result =
+            resolve_nonce_in_header_value(&value, "proxy.anthropic", CONSUMER_PATH, &resolver);
+        assert_eq!(result, Some(format!("é{filler}REAL")));
+    }
+
+    #[test]
+    fn route_resolves_only_listed_credential() {
+        // Route-authoritative gate: the phantom resolves because the route lists
+        // its credential name, regardless of consumer/grant-set.
+        let nonce = make_nonce();
+        let resolver = test_resolver(&nonce, b"real-dealership-jwt");
+        let allowed = vec!["ddtool-token".to_string()];
+        let value = format!("Bearer {nonce}");
+        let result = resolve_nonce_in_header_value(&value, "proxy.dealership", &allowed, &resolver);
+        assert_eq!(result, Some("Bearer real-dealership-jwt".to_string()));
+    }
+
+    #[test]
+    fn route_fails_closed_for_unlisted_credential() {
+        // The presented phantom is for `ddtool-token`, but the route only
+        // resolves `some-other-token`, so it must not resolve (fail-closed).
+        let nonce = make_nonce();
+        let resolver = test_resolver(&nonce, REAL_JWT.as_bytes());
+        let allowed = vec!["some-other-token".to_string()];
+        let value = format!("Bearer {nonce}");
+        let result = resolve_nonce_in_header_value(&value, "proxy.dealership", &allowed, &resolver);
+        assert!(
+            result.is_none(),
+            "route must not resolve a credential it does not list"
+        );
+    }
+
+    #[test]
+    fn short_nonce_marker_never_resolves() {
+        // A `nono_` marker shorter than the fixed nonce length fails closed.
+        let resolver = test_resolver(&make_nonce(), REAL_JWT.as_bytes());
+        let allowed = vec!["ddtool-token".to_string()];
+        assert!(
+            resolve_nonce_in_header_value("Bearer nono_deadbeef", "proxy.svc", &allowed, &resolver)
+                .is_none()
+        );
+        assert!(
+            resolve_nonce_in_header_value(
+                "Bearer nono_deadbeef",
+                "proxy.svc",
+                CONSUMER_PATH,
+                &resolver
+            )
+            .is_none()
+        );
     }
 
     #[test]
     fn websocket_request_rejects_nonce_for_wrong_consumer() {
         let nonce = make_nonce();
         let resolver = TestResolver {
+            credential_name: "ddtool-token".to_string(),
             nonce: nonce.clone(),
             real: b"REAL".to_vec(),
             admitted_consumer: "proxy.chat".to_string(),
@@ -2561,6 +2702,7 @@ mod tests {
                 "chat.example",
                 None,
                 Some("other"),
+                &[],
                 Some(&resolver),
             )
             .is_err()
@@ -2571,6 +2713,7 @@ mod tests {
     fn websocket_request_resolves_admitted_nonce_before_forwarding() {
         let nonce = make_nonce();
         let resolver = TestResolver {
+            credential_name: "ddtool-token".to_string(),
             nonce: nonce.clone(),
             real: b"REAL".to_vec(),
             admitted_consumer: "proxy.chat".to_string(),
@@ -2590,6 +2733,7 @@ mod tests {
             "chat.example",
             None,
             Some("chat"),
+            &[],
             Some(&resolver),
         )
         .unwrap();

@@ -118,6 +118,18 @@ pub struct CredentialRouteDef {
     pub base_url_env_var: Option<String>,
     #[serde(default)]
     pub endpoint_policy: Option<nono_proxy::config::EndpointPolicyConfig>,
+    /// Allow-listed classic WebSocket targets for this route. Each origin
+    /// must be one of the provider's HTTPS `api_hosts`. Classic WebSockets
+    /// imply HTTP/1.1 GET, so neither is configurable here.
+    #[serde(default)]
+    pub upgrades: Vec<CredentialWebSocketRuleDef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CredentialWebSocketRuleDef {
+    pub origin: String,
+    pub path: String,
 }
 
 pub(super) fn validate_credential_provider_entries(profile: &Profile) -> Result<()> {
@@ -221,11 +233,22 @@ pub(super) fn validate_credential_provider_entries(profile: &Profile) -> Result<
 
 fn validate_credential_provider_references(profile: &Profile) -> Result<()> {
     for route in &profile.credential_routes {
-        if !profile.credential_providers.contains_key(&route.provider) {
+        let Some(provider) = profile.credential_providers.get(&route.provider) else {
             return Err(NonoError::ProfileParse(format!(
                 "credential_routes.{} references unknown credential provider '{}'",
                 route.name, route.provider
             )));
+        };
+        for (index, rule) in route.upgrades.iter().enumerate() {
+            let context = format!("credential_routes.{}.upgrades[{index}]", route.name);
+            validate_provider_origin(&format!("{context}.origin"), &rule.origin)?;
+            validate_provider_path(&format!("{context}.path"), &rule.path)?;
+            if !provider.api_hosts.iter().any(|host| host == &rule.origin) {
+                return Err(NonoError::ProfileParse(format!(
+                    "{context}.origin '{}' is not in provider '{}'.api_hosts",
+                    rule.origin, route.provider
+                )));
+            }
         }
     }
     Ok(())

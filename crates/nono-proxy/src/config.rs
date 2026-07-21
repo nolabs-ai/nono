@@ -821,6 +821,26 @@ pub struct RouteConfig {
     /// See `SpiffeAuthConfig` for JWT-SVID options.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spiffe: Option<SpiffeAuthConfig>,
+
+    /// Optional allow-list of WebSocket upgrade targets for this route.
+    ///
+    /// When a client requests an HTTP `Upgrade` on this route, it is only
+    /// tunneled if its normalized path matches one of these rules. Classic
+    /// WebSockets imply HTTP/1.1 GET. Empty (the default) permits no upgrades — the request is
+    /// rejected before any upstream contact is made.
+    #[serde(default)]
+    pub upgrades: Vec<WebSocketRuleConfig>,
+}
+
+/// A WebSocket path allow-listed on one concrete upstream route.
+///
+/// Origin selection belongs to the profile layer that expands a credential
+/// provider into concrete routes. Keeping only the path here makes it
+/// impossible for the runtime to silently ignore a security-relevant origin.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebSocketRuleConfig {
+    pub path: String,
 }
 
 /// SPIFFE/SPIRE auth for an upstream route.
@@ -1012,6 +1032,68 @@ pub enum EndpointPolicyOutcome<'a> {
         timeout_secs: Option<u64>,
         rule_label: String,
     },
+}
+
+/// Pre-compiled WebSocket upgrade allow-list for the request hot path.
+///
+/// Built once at proxy startup from route-local [`WebSocketRuleConfig`]
+/// entries. Classic WebSocket handshakes are always HTTP/1.1 GET requests,
+/// so the runtime policy only needs to retain normalized paths.
+#[derive(Debug, Default)]
+pub struct CompiledUpgradeRules {
+    rules: Vec<CompiledUpgradeRule>,
+}
+
+#[derive(Debug)]
+struct CompiledUpgradeRule {
+    path: String,
+}
+
+impl CompiledUpgradeRules {
+    /// Compile upgrade rules for one route. There is no glob support here —
+    /// `path` is matched exactly (after normalization) on purpose, since
+    /// upgrade targets are a small fixed set of endpoints, not a broad API
+    /// surface.
+    pub fn compile(rules: &[WebSocketRuleConfig]) -> Result<Self, String> {
+        let mut compiled = Vec::with_capacity(rules.len());
+        for rule in rules {
+            if !rule.path.starts_with('/') {
+                return Err(format!(
+                    "WebSocket path must start with '/': '{}'",
+                    rule.path
+                ));
+            }
+            if rule.path.contains(['?', '#']) || rule.path.chars().any(char::is_control) {
+                return Err(format!(
+                    "WebSocket path must be an absolute path without query, fragment, or control characters: '{}'",
+                    rule.path
+                ));
+            }
+            let path = normalize_path(&rule.path);
+            if !compiled
+                .iter()
+                .any(|entry: &CompiledUpgradeRule| entry.path == path)
+            {
+                compiled.push(CompiledUpgradeRule { path });
+            }
+        }
+        Ok(Self { rules: compiled })
+    }
+
+    /// `true` if `protocol`+`method`+`path` matches one of the compiled
+    /// rules. `path` is normalized (query string stripped, percent-decoded,
+    /// trailing slash removed) before comparison so callers can pass the raw
+    /// request path.
+    #[must_use]
+    pub fn matches(&self, path: &str) -> bool {
+        let normalized = normalize_path(path);
+        self.rules.iter().any(|r| r.path == normalized)
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.rules.is_empty()
+    }
 }
 
 impl CompiledEndpointRules {
@@ -2125,5 +2207,32 @@ mod tests {
         let json = r#"{"prefix": "openai", "upstream": "https://api.openai.com"}"#;
         let route: RouteConfig = serde_json::from_str(json).unwrap();
         assert!(route.spiffe.is_none());
+    }
+
+    #[test]
+    fn websocket_rules_validate_and_deduplicate_paths() {
+        let rules = vec![
+            WebSocketRuleConfig {
+                path: "/backend-api/codex/responses".to_string(),
+            },
+            WebSocketRuleConfig {
+                path: "/backend-api//codex/responses/".to_string(),
+            },
+        ];
+        let compiled = CompiledUpgradeRules::compile(&rules).unwrap();
+        assert!(compiled.matches("/backend-api/codex/responses?session=1"));
+        assert!(!compiled.matches("/backend-api/codex/other"));
+    }
+
+    #[test]
+    fn websocket_rules_reject_ambiguous_or_non_absolute_paths() {
+        for path in ["relative", "/socket?scope=all", "/socket#fragment"] {
+            assert!(
+                CompiledUpgradeRules::compile(&[WebSocketRuleConfig {
+                    path: path.to_string(),
+                }])
+                .is_err()
+            );
+        }
     }
 }

@@ -4341,10 +4341,10 @@ fn normalize_captured_credential(mut output: Vec<u8>) -> Vec<u8> {
     output
 }
 
+/// No appended newline: a caller that captures raw stdout and reuses it
+/// verbatim (e.g. in an HTTP header) would otherwise get a corrupted value.
 fn nonce_stdout(nonce: String) -> Vec<u8> {
-    let mut output = nonce.into_bytes();
-    output.push(b'\n');
-    output
+    nonce.into_bytes()
 }
 
 fn launch_child_with_capture(
@@ -6177,5 +6177,12 @@ mod tests {
         let result = apply_environment_set_vars(&mut env, &policy);
         assert!(result.is_ok());
         assert!(env.iter().any(|e| e == b"MY_APP_CONFIG=value"));
+    }
+
+    #[test]
+    fn nonce_stdout_appends_no_trailing_newline() {
+        let phantom = format!("nono_{}", "a".repeat(64));
+        let stdout = nonce_stdout(phantom.clone());
+        assert_eq!(stdout, phantom.into_bytes());
     }
 }

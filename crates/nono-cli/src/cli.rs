@@ -966,6 +966,24 @@ pub struct ProfileInitArgs {
     /// Overwrite existing file
     #[arg(long)]
     pub force: bool,
+    ///Output the file to the profile-drafts folder
+    #[arg(long)]
+    pub draft: bool,
+    /// Controls the behavior of how the draft content is generated
+    /// Passing in `template` forces creation of a new profile, erroring if the live profile exists
+    /// Passing in existing forces modification of an existing profile
+    /// Defaults to auto-detection of whether an existing profile is to be used
+    #[arg(long, value_enum, requires = "draft")]
+    pub source: Option<ProfileInitSource>,
+}
+
+/// How to seed a profile draft's content for `nono profile init --draft`.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProfileInitSource {
+    /// Always generate a fresh skeleton; errors if the profile already exists.
+    Template,
+    /// Copy the live profile; errors if it doesn't exist.
+    Existing,
 }
 
 #[derive(Parser, Debug)]
@@ -4184,6 +4202,8 @@ mod tests {
                     assert!(!init.full);
                     assert!(init.output.is_none());
                     assert!(!init.force);
+                    assert!(!init.draft);
+                    assert!(init.source.is_none());
                 }
                 _ => panic!("Expected Init subcommand"),
             },
@@ -4219,11 +4239,73 @@ mod tests {
                     assert!(init.full);
                     assert_eq!(init.output, Some(std::path::PathBuf::from("/tmp/out.json")));
                     assert!(init.force);
+                    assert!(!init.draft);
+                    assert!(init.source.is_none());
                 }
                 _ => panic!("Expected Init subcommand"),
             },
             _ => panic!("Expected Profile command"),
         }
+    }
+
+    #[test]
+    fn test_profile_init_draft_alone() {
+        let cli = Cli::parse_from(["nono", "profile", "init", "my-agent", "--draft"]);
+        match cli.command {
+            Commands::Profile(args) => match args.command {
+                ProfileCommands::Init(init) => {
+                    assert!(init.draft);
+                    assert!(init.source.is_none());
+                }
+                _ => panic!("Expected Init subcommand"),
+            },
+            _ => panic!("Expected Profile command"),
+        }
+    }
+
+    #[test]
+    fn test_profile_init_draft_source_template() {
+        let cli = Cli::parse_from([
+            "nono", "profile", "init", "my-agent", "--draft", "--source", "template",
+        ]);
+        match cli.command {
+            Commands::Profile(args) => match args.command {
+                ProfileCommands::Init(init) => {
+                    assert!(init.draft);
+                    assert_eq!(init.source, Some(ProfileInitSource::Template));
+                }
+                _ => panic!("Expected Init subcommand"),
+            },
+            _ => panic!("Expected Profile command"),
+        }
+    }
+
+    #[test]
+    fn test_profile_init_draft_source_existing() {
+        let cli = Cli::parse_from([
+            "nono", "profile", "init", "my-agent", "--draft", "--source", "existing",
+        ]);
+        match cli.command {
+            Commands::Profile(args) => match args.command {
+                ProfileCommands::Init(init) => {
+                    assert!(init.draft);
+                    assert_eq!(init.source, Some(ProfileInitSource::Existing));
+                }
+                _ => panic!("Expected Init subcommand"),
+            },
+            _ => panic!("Expected Profile command"),
+        }
+    }
+
+    #[test]
+    fn test_profile_init_source_requires_draft() {
+        let result = Cli::try_parse_from([
+            "nono", "profile", "init", "my-agent", "--source", "template",
+        ]);
+        assert!(
+            result.is_err(),
+            "--source without --draft should be rejected by clap"
+        );
     }
 
     #[test]

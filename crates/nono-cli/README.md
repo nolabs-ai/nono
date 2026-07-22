@@ -88,6 +88,16 @@ Precedence is: CLI flag, then `NONO_THEME`, then config file, then the default `
 | Claude Code | `nono pull nolabs-ai/claude` | `nono run --profile nolabs-ai/claude -- claude` |
 | Codex | `nono pull nolabs-ai/codex` | `nono run --profile nolabs-ai/codex -- codex` |
 
+> **Migrating from `always-further/` packs?**
+> Packs were moved from the `always-further` namespace to `nolabs-ai`. To cleanly migrate,
+> remove the old pack first so its wiring is torn down, then pull the new one:
+> ```bash
+> nono remove always-further/<pack>
+> nono pull nolabs-ai/<pack>
+> ```
+> Just pulling the new pack without removing the old one can leave stale wiring from the
+> previous namespace in place.
+
 ### Built-in profiles
 
 | Profile | Command |

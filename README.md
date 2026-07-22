@@ -157,6 +157,19 @@ The policy lives in the profile, not in the prompt. The agent can ask for a tool
 
 Read more in [Sandboxed Tool Execution](https://nono.sh/docs/cli/features/tool-sandbox).
 
+## Migrating from `always-further/` packs
+
+All official packs have moved from the `always-further` namespace to `nolabs-ai`. To migrate
+cleanly, remove the old pack first so its wiring is torn down, then pull the new one:
+
+```bash
+nono remove always-further/<pack>
+nono pull nolabs-ai/<pack>
+```
+
+Pulling the new pack without removing the old one can leave stale wiring from the previous
+namespace in place (symlinks, plugin registrations, etc.).
+
 ## Ready to go deep?
 
 Head over to the [docs](https://nono.sh/docs) and discover nono's rich composable policy system, credentials injection, L7 filtering, supply chain security, rollback, multiplexing, audit and more.

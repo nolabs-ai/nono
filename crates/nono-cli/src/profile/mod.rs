@@ -2739,7 +2739,7 @@ fn load_profile_inner(name_or_path: &str, cli_extends: &[String]) -> Result<Opti
         // bypassing the post-pull cleanup hook in `migration::check_and_run`.
         // Idempotent: silent no-op when no legacy artifacts exist, so safe
         // to fire on every claude resolution.
-        if is_always_further_claude_pack(&profile_path) {
+        if is_nolabs_ai_claude_pack(&profile_path) {
             crate::legacy_cleanup::check_and_offer_cleanup()?;
         }
         return Ok(Some(profile));
@@ -2765,15 +2765,15 @@ fn load_profile_inner(name_or_path: &str, cli_extends: &[String]) -> Result<Opti
 /// Used to gate legacy-cleanup invocation on the canonical claude pack
 /// rather than any pack that happens to publish a profile named `claude`
 /// or `claude-code`.
-fn is_always_further_claude_pack(profile_path: &Path) -> bool {
+fn is_nolabs_ai_claude_pack(profile_path: &Path) -> bool {
     let Ok(store) = crate::package::package_store_dir() else {
         return false;
     };
-    profile_path_is_in_pack(profile_path, &store, "always-further", "claude")
+    profile_path_is_in_pack(profile_path, &store, "nolabs-ai", "claude")
 }
 
 /// Pure path-component matcher: does `profile_path` live under
-/// `<store>/<ns>/<name>/...`? Split out of `is_always_further_claude_pack`
+/// `<store>/<ns>/<name>/...`? Split out of `is_nolabs_ai_claude_pack`
 /// so it can be tested without touching `XDG_CONFIG_HOME` / `HOME`.
 fn profile_path_is_in_pack(profile_path: &Path, store: &Path, ns: &str, name: &str) -> bool {
     let Ok(rel) = profile_path.strip_prefix(store) else {
@@ -4106,11 +4106,11 @@ mod tests {
     #[test]
     fn profile_path_is_in_pack_matches_canonical_layout() {
         let store = Path::new("/store");
-        let claude_profile = Path::new("/store/always-further/claude/profile/claude.json");
+        let claude_profile = Path::new("/store/nolabs-ai/claude/profile/claude.json");
         assert!(profile_path_is_in_pack(
             claude_profile,
             store,
-            "always-further",
+            "nolabs-ai",
             "claude"
         ));
 
@@ -4121,25 +4121,25 @@ mod tests {
         assert!(!profile_path_is_in_pack(
             third_party,
             store,
-            "always-further",
+            "nolabs-ai",
             "claude"
         ));
 
         // Different pack name in the same namespace must not match.
-        let codex = Path::new("/store/always-further/codex/profile/codex.json");
+        let codex = Path::new("/store/nolabs-ai/codex/profile/codex.json");
         assert!(!profile_path_is_in_pack(
             codex,
             store,
-            "always-further",
+            "nolabs-ai",
             "claude"
         ));
 
         // Path outside the store entirely must not match.
-        let outside = Path::new("/elsewhere/always-further/claude/profile.json");
+        let outside = Path::new("/elsewhere/nolabs-ai/claude/profile.json");
         assert!(!profile_path_is_in_pack(
             outside,
             store,
-            "always-further",
+            "nolabs-ai",
             "claude"
         ));
     }

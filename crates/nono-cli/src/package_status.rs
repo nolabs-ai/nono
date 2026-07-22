@@ -5,6 +5,9 @@ use crate::profile;
 use crate::registry_client::{RegistryClient, resolve_registry_url};
 use nono::{NonoError, Result};
 
+const DEPRECATED_NAMESPACE: &str = "always-further";
+const REPLACEMENT_NAMESPACE: &str = "nolabs-ai";
+
 #[derive(Clone, Copy, Debug)]
 struct OfficialPackStatusTarget {
     namespace: &'static str,
@@ -24,7 +27,14 @@ const CODEX_PACK: OfficialPackStatusTarget = OfficialPackStatusTarget {
     profiles: &["codex"],
 };
 
-const OFFICIAL_PACK_STATUS_TARGETS: &[OfficialPackStatusTarget] = &[CLAUDE_PACK, CODEX_PACK];
+const OPENCODE_PACK: OfficialPackStatusTarget = OfficialPackStatusTarget {
+    namespace: "nolabs-ai",
+    name: "opencode",
+    profiles: &["opencode"],
+};
+
+const OFFICIAL_PACK_STATUS_TARGETS: &[OfficialPackStatusTarget] =
+    &[CLAUDE_PACK, CODEX_PACK, OPENCODE_PACK];
 
 impl OfficialPackStatusTarget {
     fn key(self) -> String {
@@ -45,12 +55,39 @@ pub(crate) fn enforce_for_active_profile(profile_name: Option<&str>, silent: boo
         return Ok(());
     };
 
+    warn_deprecated_namespace(silent);
+
     for target in OFFICIAL_PACK_STATUS_TARGETS {
         if depends_on_official_pack_profile(*target, profile_name) {
             enforce_official_pack_status(*target, silent)?;
         }
     }
     Ok(())
+}
+
+/// Warn once per invocation for every pack installed under the deprecated
+/// `always-further` namespace. Runs unconditionally (not gated on the active
+/// profile) so users are notified regardless of which profile they're using,
+/// including custom profiles that extend old packs.
+fn warn_deprecated_namespace(silent: bool) {
+    if silent {
+        return;
+    }
+    let lockfile = match package::read_lockfile() {
+        Ok(lf) => lf,
+        Err(_) => return,
+    };
+    let prefix = format!("{DEPRECATED_NAMESPACE}/");
+    for old_ref in lockfile.packages.keys().filter(|k| k.starts_with(&prefix)) {
+        let name = &old_ref[prefix.len()..];
+        let new_ref = format!("{REPLACEMENT_NAMESPACE}/{name}");
+        eprintln!(
+            "\n  [nono] ⚠  {old_ref} has moved to {new_ref}\n  \
+             Migrate with:\n  \
+               nono remove {old_ref}\n  \
+               nono pull {new_ref}\n"
+        );
+    }
 }
 
 fn enforce_official_pack_status(target: OfficialPackStatusTarget, silent: bool) -> Result<()> {
@@ -167,6 +204,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn deprecated_namespace_constants_are_correct() {
+        assert_eq!(DEPRECATED_NAMESPACE, "always-further");
+        assert_eq!(REPLACEMENT_NAMESPACE, "nolabs-ai");
+        // Verify the replacement logic produces the right ref for a sample pack.
+        let old_ref = format!("{DEPRECATED_NAMESPACE}/claude");
+        let name = old_ref.trim_start_matches(&format!("{DEPRECATED_NAMESPACE}/"));
+        assert_eq!(
+            format!("{REPLACEMENT_NAMESPACE}/{name}"),
+            "nolabs-ai/claude"
+        );
+    }
+
+    #[test]
     fn yanked_message_pins_latest_when_available() {
         let status = PackageStatusResponse {
             schema_version: 1,
@@ -186,12 +236,14 @@ mod tests {
     }
 
     #[test]
-    fn official_profile_names_include_claude_and_codex() {
+    fn official_profile_names_include_claude_codex_and_opencode() {
         assert!(is_official_profile_name(CLAUDE_PACK, "claude"));
         assert!(is_official_profile_name(CLAUDE_PACK, "claude-code"));
         assert!(is_official_profile_name(CODEX_PACK, "codex"));
+        assert!(is_official_profile_name(OPENCODE_PACK, "opencode"));
         assert!(!is_official_profile_name(CLAUDE_PACK, "codex"));
         assert!(!is_official_profile_name(CODEX_PACK, "claude"));
+        assert!(!is_official_profile_name(OPENCODE_PACK, "claude"));
     }
 
     #[test]
@@ -203,6 +255,11 @@ mod tests {
         ));
         assert!(is_official_package_ref(CODEX_PACK, "nolabs-ai/codex"));
         assert!(is_official_package_ref(CODEX_PACK, "nolabs-ai/codex@1.2.3"));
+        assert!(is_official_package_ref(OPENCODE_PACK, "nolabs-ai/opencode"));
+        assert!(is_official_package_ref(
+            OPENCODE_PACK,
+            "nolabs-ai/opencode@1.0.0"
+        ));
         assert!(!is_official_package_ref(CLAUDE_PACK, "someone/claude"));
         assert!(!is_official_package_ref(
             CODEX_PACK,

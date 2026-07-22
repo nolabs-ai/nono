@@ -198,6 +198,17 @@ pub(super) fn validate_credential_provider_entries(profile: &Profile) -> Result<
                 "credential_providers.{name}.credential_format must contain the '{{}}' token placeholder"
             )));
         }
+        // Same raw header-value path as the header name; reject control chars
+        // to prevent header injection.
+        if provider
+            .credential_format
+            .as_deref()
+            .is_some_and(|format| format.bytes().any(|b| b.is_ascii_control() && b != b'\t'))
+        {
+            return Err(NonoError::ProfileParse(format!(
+                "credential_providers.{name}.credential_format must not contain control characters"
+            )));
+        }
         if provider
             .inject_header
             .as_deref()
@@ -483,6 +494,30 @@ mod tests {
             err.to_string().contains("credential_format"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn credential_format_with_control_chars_is_rejected() {
+        for bad in [
+            "{}\r\nEvil: 1",
+            "Bearer {}\n",
+            "{}\0",
+            "{}\x01",
+            "{}\x0b",
+            "{}\x0c",
+            "{}\x7f",
+        ] {
+            let profile = provider_with(Some("X-Vault-Token"), Some(bad));
+            let err = validate_credential_provider_entries(&profile)
+                .expect_err(&format!("must reject format {bad:?}"));
+            assert!(
+                err.to_string().contains("credential_format"),
+                "unexpected error for {bad:?}: {err}"
+            );
+        }
+        // Horizontal tab is a legal field-value character.
+        let ok = provider_with(Some("X-Vault-Token"), Some("Bearer\t{}"));
+        validate_credential_provider_entries(&ok).expect("tab is allowed");
     }
 
     #[test]

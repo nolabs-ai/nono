@@ -82,7 +82,7 @@ impl OAuthCaptureStore {
     ) -> Result<Vec<u8>> {
         let parsed = url::form_urlencoded::parse(body).collect::<Vec<_>>();
         if parsed.is_empty() {
-            if contains_phantom(body) {
+            if self.contains_phantom(body) {
                 return Err(ProxyError::HttpParse(format!(
                     "OAuth token request body for provider '{}' contains a phantom but is neither JSON nor form-urlencoded",
                     endpoint.provider
@@ -156,11 +156,31 @@ impl OAuthCaptureStore {
             if real.is_empty() {
                 continue;
             }
-            let phantom = self.store_phantom(real.as_bytes(), &endpoint.admitted_consumers)?;
-            let visible = match field.format {
-                ResponseFieldFormat::Opaque => phantom,
-                ResponseFieldFormat::Jwt => jwt_shaped_phantom(&phantom)?,
+            let (key, visible) = match &field.template {
+                Some(template) => {
+                    if !template.matches(real) {
+                        tracing::warn!(
+                            provider = %endpoint.provider,
+                            path = %field.path,
+                            "OAuth capture format does not match the captured token shape; \
+                             a prefix-sniffing client may classify the phantom wrongly"
+                        );
+                    }
+                    let phantom = template.render(&super::generate_phantom_body()?);
+                    (phantom.clone(), phantom)
+                }
+                None => {
+                    let phantom = super::generate_phantom()?;
+                    match field.format {
+                        ResponseFieldFormat::Opaque => (phantom.clone(), phantom),
+                        ResponseFieldFormat::Jwt => {
+                            let visible = jwt_shaped_phantom(&phantom)?;
+                            (phantom, visible)
+                        }
+                    }
+                }
             };
+            self.store_phantom(&key, real.as_bytes(), &endpoint.admitted_consumers)?;
             *value = Value::String(visible);
             changed = true;
             rewritten_fields += 1;
@@ -218,8 +238,12 @@ impl OAuthCaptureStore {
     }
 }
 
-fn contains_phantom(body: &[u8]) -> bool {
-    body.windows(5).any(|window| window == b"nono_")
+impl OAuthCaptureStore {
+    /// Whether `body` carries a phantom this store could have minted. Templated
+    /// phantoms carry no `nono_` marker, so the templates must be checked too.
+    fn contains_phantom(&self, body: &[u8]) -> bool {
+        crate::token::contains_phantom(body, &self.templates)
+    }
 }
 
 fn value_at_path_mut<'a>(root: &'a mut Value, path: &str) -> Option<&'a mut Value> {
@@ -284,4 +308,57 @@ fn body_contains_token_field_marker(body: &[u8]) -> bool {
 
 fn is_sensitive_token_field(field: &str) -> bool {
     matches!(field, "access_token" | "refresh_token" | "id_token")
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use crate::config::{
+        OAuthCaptureConfig, OAuthTokenEndpointConfig, OAuthTokenResponseFieldConfig,
+        OAuthTokenResponseFieldKind,
+    };
+
+    const HEX64: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    fn templated_store() -> OAuthCaptureStore {
+        OAuthCaptureStore::load(&[OAuthCaptureConfig {
+            provider: "anthropic".to_string(),
+            token_endpoints: vec![OAuthTokenEndpointConfig {
+                host: "https://platform.claude.com".to_string(),
+                path: "/v1/oauth/token".to_string(),
+                response_fields: vec![OAuthTokenResponseFieldConfig {
+                    path: "access_token".to_string(),
+                    kind: OAuthTokenResponseFieldKind::Opaque,
+                    format: Some("sk-ant-oat01-{}".to_string()),
+                }],
+                request_body: OAuthTokenRequestBodyFormat::Auto,
+                request_nonce_fields: vec!["refresh_token".to_string()],
+            }],
+            admitted_consumers: vec!["proxy.anthropic".to_string()],
+        }])
+        .unwrap()
+    }
+
+    #[test]
+    fn contains_phantom_sees_templated_phantom_without_marker() {
+        let store = templated_store();
+        assert!(store.contains_phantom(format!("nono_{HEX64}").as_bytes()));
+        assert!(store.contains_phantom(format!("token=sk-ant-oat01-{HEX64}").as_bytes()));
+    }
+
+    #[test]
+    fn contains_phantom_ignores_non_phantom_material() {
+        let store = templated_store();
+        assert!(!store.contains_phantom(b"grant_type=refresh_token&device_code=abc"));
+        // Template prefix without a 64-hex body is not a phantom.
+        assert!(!store.contains_phantom(b"sk-ant-oat01-nothexatall"));
+    }
+
+    #[test]
+    fn contains_phantom_without_templates_still_sees_bare_nonce() {
+        let store = OAuthCaptureStore::empty();
+        assert!(store.contains_phantom(format!("nono_{HEX64}").as_bytes()));
+        assert!(!store.contains_phantom(format!("sk-ant-oat01-{HEX64}").as_bytes()));
+    }
 }

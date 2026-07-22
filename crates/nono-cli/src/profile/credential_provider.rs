@@ -64,6 +64,11 @@ pub struct CredentialProviderResponseField {
     pub path: String,
     #[serde(default)]
     pub kind: CredentialProviderResponseFieldKind,
+    /// Literal template for the visible phantom, `{}` standing in for the random
+    /// body (e.g. `"sk-ant-oat01-{}"`), so a client that classifies a credential by
+    /// sniffing a token prefix still recognises it. `kind: opaque` only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -178,6 +183,15 @@ pub(super) fn validate_credential_provider_entries(profile: &Profile) -> Result<
                     ),
                     &field.path,
                 )?;
+                if let Some(template) = &field.format {
+                    validate_provider_format(
+                        &format!(
+                            "credential_providers.{name}.token_endpoints[{index}].response_fields.format"
+                        ),
+                        template,
+                        field.kind,
+                    )?;
+                }
             }
             // request_nonce_fields is only meaningful for refresh/exchange
             // flows that re-send a phantom in the request body. Capture-only
@@ -360,6 +374,23 @@ fn validate_phantom_fields(provider_name: &str, fields: &[String]) -> Result<()>
     Ok(())
 }
 
+/// A JWT phantom's shape is already fixed by its three segments, so a `format`
+/// there would have nothing to shape.
+fn validate_provider_format(
+    context: &str,
+    template: &str,
+    kind: CredentialProviderResponseFieldKind,
+) -> Result<()> {
+    if kind != CredentialProviderResponseFieldKind::Opaque {
+        return Err(NonoError::ProfileParse(format!(
+            "{context} is only valid with kind 'opaque'"
+        )));
+    }
+    nono_proxy::token::PhantomTemplate::parse(template)
+        .map_err(|err| NonoError::ProfileParse(format!("{context} {err}")))?;
+    Ok(())
+}
+
 fn validate_optional_helper_command(
     provider_name: &str,
     helper_name: &str,
@@ -494,6 +525,7 @@ mod tests {
                     response_fields: vec![CredentialProviderResponseField {
                         path: "auth.client_token".to_string(),
                         kind: CredentialProviderResponseFieldKind::Opaque,
+                        format: None,
                     }],
                     request_body: CredentialProviderRequestBodyFormat::Auto,
                     // Capture-only endpoint: intentionally no request_nonce_fields.

@@ -22,7 +22,20 @@ pub(crate) enum ResolvedCredential {
     },
     Ambient {
         source: Option<AmbientCredentialSourceConfig>,
+        /// Visible-phantom template applied to every phantom issued for this
+        /// credential. Parsed from the credential's `format`.
+        template: Option<nono_proxy::token::PhantomTemplate>,
     },
+}
+
+impl ResolvedCredential {
+    /// The visible-phantom template configured for an ambient credential, if any.
+    pub(crate) fn phantom_template(&self) -> Option<nono_proxy::token::PhantomTemplate> {
+        match self {
+            Self::Ambient { template, .. } => template.clone(),
+            _ => None,
+        }
+    }
 }
 
 pub(crate) fn resolve_credentials(
@@ -85,10 +98,19 @@ pub(crate) fn resolve_credentials(
                 );
             }
             CommandCredentialType::Ambient => {
+                let template = match &credential.format {
+                    Some(template) => Some(
+                        nono_proxy::token::PhantomTemplate::parse(template).map_err(|err| {
+                            NonoError::ConfigParse(format!("ambient credential '{name}' {err}"))
+                        })?,
+                    ),
+                    None => None,
+                };
                 resolved.insert(
                     name.clone(),
                     ResolvedCredential::Ambient {
                         source: credential.source.clone(),
+                        template,
                     },
                 );
             }

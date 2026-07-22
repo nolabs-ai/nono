@@ -2589,6 +2589,7 @@ fn synthesize_credential_provider_proxy_config(
                                 nono_proxy::config::OAuthTokenResponseFieldKind::Jwt
                             }
                         },
+                        format: field.format.clone(),
                     })
                     .collect(),
                 request_body: match endpoint.request_body {
@@ -2728,6 +2729,20 @@ struct TokenBrokerNonceResolver(crate::tool_sandbox::token_broker::SharedBroker)
 impl nono_proxy::NonceResolver for TokenBrokerNonceResolver {
     fn resolve(&self, nonce: &str, consumer: &str) -> Option<Zeroizing<Vec<u8>>> {
         self.0.lock().ok()?.resolve_nonce(nonce, consumer)
+    }
+
+    fn rewrite_header_value(&self, value: &str, consumer: &str) -> Option<String> {
+        self.0.lock().ok()?.rewrite_header_value(value, consumer)
+    }
+
+    fn contains_phantom(&self, value: &str) -> bool {
+        match self.0.lock() {
+            Ok(broker) => broker.contains_phantom(value),
+            // The templates live behind the poisoned lock, so a phantom cannot
+            // be ruled out. Claim one: `rewrite_header_value` fails on the same
+            // lock and the caller rejects rather than forwarding it raw.
+            Err(_) => true,
+        }
     }
 }
 
@@ -4891,10 +4906,12 @@ mod tests {
                         crate::profile::CredentialProviderResponseField {
                             path: "access_token".to_string(),
                             kind: crate::profile::CredentialProviderResponseFieldKind::Opaque,
+                            format: None,
                         },
                         crate::profile::CredentialProviderResponseField {
                             path: "refresh_token".to_string(),
                             kind: crate::profile::CredentialProviderResponseFieldKind::Opaque,
+                            format: None,
                         },
                     ],
                     request_body: crate::profile::CredentialProviderRequestBodyFormat::Auto,
@@ -4971,6 +4988,7 @@ mod tests {
                     response_fields: vec![crate::profile::CredentialProviderResponseField {
                         path: "auth.client_token".to_string(),
                         kind: crate::profile::CredentialProviderResponseFieldKind::Opaque,
+                        format: None,
                     }],
                     request_body: crate::profile::CredentialProviderRequestBodyFormat::Auto,
                     request_nonce_fields: vec![],

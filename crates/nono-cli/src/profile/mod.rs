@@ -8807,6 +8807,93 @@ mod tests {
     }
 
     #[test]
+    fn credential_provider_format_opaque_single_placeholder_parses() {
+        let json = br#"{
+            "meta": { "name": "fmt-ok" },
+            "credential_providers": {
+                "claude_code": {
+                    "type": "oauth_capture",
+                    "token_endpoints": [{
+                        "host": "https://platform.claude.com",
+                        "path": "/v1/oauth/token",
+                        "response_fields": [
+                            { "path": "access_token", "kind": "opaque", "format": "sk-ant-oat01-{}" }
+                        ],
+                        "request_nonce_fields": ["refresh_token"]
+                    }],
+                    "api_hosts": ["https://api.anthropic.com"]
+                }
+            }
+        }"#;
+        let profile = parse_profile_bytes(json).expect("format profile parses");
+        finalize_profile(profile.clone()).expect("opaque single-placeholder format validates");
+        let field = &profile
+            .credential_providers
+            .get("claude_code")
+            .expect("provider")
+            .token_endpoints[0]
+            .response_fields[0];
+        assert_eq!(field.format.as_deref(), Some("sk-ant-oat01-{}"));
+    }
+
+    #[test]
+    fn credential_provider_format_rejected_with_jwt_kind() {
+        let json = br#"{
+            "meta": { "name": "fmt-jwt" },
+            "credential_providers": {
+                "claude_code": {
+                    "type": "oauth_capture",
+                    "token_endpoints": [{
+                        "host": "https://platform.claude.com",
+                        "path": "/v1/oauth/token",
+                        "response_fields": [
+                            { "path": "access_token", "kind": "jwt", "format": "sk-{}" }
+                        ],
+                        "request_nonce_fields": ["refresh_token"]
+                    }],
+                    "api_hosts": ["https://api.anthropic.com"]
+                }
+            }
+        }"#;
+        let err = parse_profile_bytes(json).expect_err("format+jwt should reject");
+        assert!(
+            err.to_string().contains("only valid with kind 'opaque'"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn credential_provider_format_requires_single_placeholder() {
+        for bad in ["sk-ant-", "{}{}"] {
+            let json = format!(
+                r#"{{
+                    "meta": {{ "name": "fmt-bad" }},
+                    "credential_providers": {{
+                        "claude_code": {{
+                            "type": "oauth_capture",
+                            "token_endpoints": [{{
+                                "host": "https://platform.claude.com",
+                                "path": "/v1/oauth/token",
+                                "response_fields": [
+                                    {{ "path": "access_token", "kind": "opaque", "format": "{bad}" }}
+                                ],
+                                "request_nonce_fields": ["refresh_token"]
+                            }}],
+                            "api_hosts": ["https://api.anthropic.com"]
+                        }}
+                    }}
+                }}"#
+            );
+            let err = parse_profile_bytes(json.as_bytes())
+                .expect_err(&format!("format '{bad}' should reject"));
+            assert!(
+                err.to_string().contains("exactly one '{}' placeholder"),
+                "format '{bad}' unexpected error: {err}"
+            );
+        }
+    }
+
+    #[test]
     fn test_profile_credential_route_rejects_unknown_provider() {
         let json = br#"{
             "meta": { "name": "provider-oauth-capture" },

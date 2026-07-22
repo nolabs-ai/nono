@@ -383,6 +383,13 @@ pub struct CommandCredentialConfig {
     pub tls_client_key: Option<String>,
     #[serde(default)]
     pub source: Option<AmbientCredentialSourceConfig>,
+    /// Optional literal template for the visible phantom the sandbox sees, with
+    /// `{}` standing in for a freshly minted random body (e.g.
+    /// `"sk-ant-oat01-{}"`). Lets a client that classifies a credential by
+    /// sniffing a literal token prefix recognise the phantom. Only valid for
+    /// `ambient` credentials.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
 }
 
 impl Default for CommandCredentialConfig {
@@ -401,6 +408,7 @@ impl Default for CommandCredentialConfig {
             tls_client_cert: None,
             tls_client_key: None,
             source: None,
+            format: None,
         }
     }
 }
@@ -2265,6 +2273,21 @@ fn validate_credential(
     credential: &CommandCredentialConfig,
     report: &mut CommandPolicyValidationReport,
 ) {
+    if let Some(template) = &credential.format {
+        if credential.credential_type != CommandCredentialType::Ambient {
+            report.error(
+                "invalid_credential",
+                format!("credential '{name}' format is only valid for ambient credentials"),
+            );
+        } else if template.match_indices("{}").count() != 1 {
+            report.error(
+                "invalid_credential",
+                format!(
+                    "ambient credential '{name}' format '{template}' must contain exactly one '{{}}' placeholder"
+                ),
+            );
+        }
+    }
     match credential.credential_type {
         CommandCredentialType::LocalSocket => {
             if credential.path.as_deref().unwrap_or_default().is_empty() {
@@ -5358,5 +5381,72 @@ mod tests {
         let restored: CommandHashCacheFile =
             serde_json::from_str("{}").expect("missing entries should default to empty");
         assert!(restored.entries.is_empty());
+    }
+
+    fn validate_one(credential: &CommandCredentialConfig) -> CommandPolicyValidationReport {
+        let mut report = CommandPolicyValidationReport::default();
+        validate_credential("cred", credential, &mut report);
+        report
+    }
+
+    #[test]
+    fn ambient_format_single_placeholder_accepted() {
+        let cred = CommandCredentialConfig {
+            credential_type: CommandCredentialType::Ambient,
+            format: Some("sk-ant-oat01-{}".to_string()),
+            ..Default::default()
+        };
+        assert!(
+            validate_one(&cred).errors.is_empty(),
+            "single-placeholder ambient format should validate"
+        );
+    }
+
+    #[test]
+    fn ambient_format_zero_placeholder_rejected() {
+        let cred = CommandCredentialConfig {
+            credential_type: CommandCredentialType::Ambient,
+            format: Some("sk-ant-".to_string()),
+            ..Default::default()
+        };
+        let errors = validate_one(&cred).errors;
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("exactly one '{}' placeholder")),
+            "expected placeholder-count error, got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn ambient_format_multiple_placeholder_rejected() {
+        let cred = CommandCredentialConfig {
+            credential_type: CommandCredentialType::Ambient,
+            format: Some("{}-{}".to_string()),
+            ..Default::default()
+        };
+        assert!(
+            validate_one(&cred)
+                .errors
+                .iter()
+                .any(|e| e.message.contains("exactly one '{}' placeholder"))
+        );
+    }
+
+    #[test]
+    fn format_rejected_on_non_ambient_credential() {
+        let cred = CommandCredentialConfig {
+            credential_type: CommandCredentialType::Proxy,
+            format: Some("sk-{}".to_string()),
+            upstream: Some("https://example.com".to_string()),
+            inject_header: Some("Authorization".to_string()),
+            ..Default::default()
+        };
+        assert!(
+            validate_one(&cred)
+                .errors
+                .iter()
+                .any(|e| e.message.contains("only valid for ambient credentials"))
+        );
     }
 }

@@ -156,11 +156,31 @@ impl OAuthCaptureStore {
             if real.is_empty() {
                 continue;
             }
-            let phantom = self.store_phantom(real.as_bytes(), &endpoint.admitted_consumers)?;
-            let visible = match field.format {
-                ResponseFieldFormat::Opaque => phantom,
-                ResponseFieldFormat::Jwt => jwt_shaped_phantom(&phantom)?,
+            let (key, visible) = match &field.template {
+                Some(template) => {
+                    if !template.matches(real) {
+                        tracing::warn!(
+                            provider = %endpoint.provider,
+                            path = %field.path,
+                            "OAuth capture format does not match the captured token shape; \
+                             a prefix-sniffing client may classify the phantom wrongly"
+                        );
+                    }
+                    let phantom = template.render(&super::generate_phantom_body()?);
+                    (phantom.clone(), phantom)
+                }
+                None => {
+                    let phantom = super::generate_phantom()?;
+                    match field.format {
+                        ResponseFieldFormat::Opaque => (phantom.clone(), phantom),
+                        ResponseFieldFormat::Jwt => {
+                            let visible = jwt_shaped_phantom(&phantom)?;
+                            (phantom, visible)
+                        }
+                    }
+                }
             };
+            self.store_phantom(&key, real.as_bytes(), &endpoint.admitted_consumers)?;
             *value = Value::String(visible);
             changed = true;
             rewritten_fields += 1;

@@ -1389,13 +1389,14 @@ fn handle_shim_stream_inner(
                     )));
                 }
                 let captured = normalize_captured_credential(raw_output);
+                let template = ambient_credential_template(state, credential);
                 let nonce = {
                     let mut broker = state.token_broker.lock().map_err(|_| {
                         NonoError::SandboxInit(
                             "tool-sandbox token broker lock poisoned".to_string(),
                         )
                     })?;
-                    broker.store_named(credential.clone(), captured, grants.clone())
+                    broker.store_named(credential.clone(), captured, grants.clone(), template)
                 };
                 record_command_policy_audit(
                     audit_recorder.as_ref(),
@@ -3576,6 +3577,7 @@ fn issue_existing_ambient_credential_nonce(
     let Some(value) = load_ambient_credential_source(state, credential)? else {
         return Ok(None);
     };
+    let template = ambient_credential_template(state, credential);
     let mut broker = state.token_broker.lock().map_err(|_| {
         NonoError::SandboxInit("tool-sandbox token broker lock poisoned".to_string())
     })?;
@@ -3583,6 +3585,7 @@ fn issue_existing_ambient_credential_nonce(
         credential.to_string(),
         value,
         grants,
+        template,
     )))
 }
 
@@ -3593,14 +3596,26 @@ fn load_ambient_credential_source(
     match state.credential_handles.get(credential) {
         Some(ResolvedCredential::Ambient {
             source: Some(source),
+            ..
         }) => Ok(Some(super::load_supervisor_credential_source(source)?)),
-        Some(ResolvedCredential::Ambient { source: None }) => Ok(None),
+        Some(ResolvedCredential::Ambient { source: None, .. }) => Ok(None),
         Some(_) => Err(NonoError::SandboxInit(format!(
             "tool-sandbox credential '{credential}' is not ambient"
         ))),
         None => Err(NonoError::SandboxInit(format!(
             "tool-sandbox credential handle '{credential}' was not resolved"
         ))),
+    }
+}
+
+/// The visible-phantom template configured for an ambient credential, if any.
+fn ambient_credential_template(
+    state: &ToolSandboxState,
+    credential: &str,
+) -> Option<nono_proxy::token::PhantomTemplate> {
+    match state.credential_handles.get(credential) {
+        Some(ResolvedCredential::Ambient { template, .. }) => template.clone(),
+        _ => None,
     }
 }
 

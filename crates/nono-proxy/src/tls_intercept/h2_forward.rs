@@ -1840,10 +1840,12 @@ mod tests {
                         crate::config::OAuthTokenResponseFieldConfig {
                             path: "access_token".to_string(),
                             kind: crate::config::OAuthTokenResponseFieldKind::Opaque,
+                            format: None,
                         },
                         crate::config::OAuthTokenResponseFieldConfig {
                             path: "refresh_token".to_string(),
                             kind: crate::config::OAuthTokenResponseFieldKind::Opaque,
+                            format: None,
                         },
                     ],
                     request_body: crate::config::OAuthTokenRequestBodyFormat::Auto,

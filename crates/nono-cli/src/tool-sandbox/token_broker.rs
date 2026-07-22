@@ -20,6 +20,7 @@
 /// specific grant set limits redemption to named consumers of the form
 /// `"cmd.<command_name>"` (env-var promotion path) or `"proxy.<route_id>"`
 /// (L7 header-injection path). A consumer not in the grant set receives `None`.
+use nono_proxy::token::{PhantomTemplate, rewrite_first_phantom};
 use rand::RngExt;
 use std::sync::{Arc, Mutex};
 use zeroize::Zeroizing;
@@ -64,11 +65,20 @@ impl GrantSet {
     }
 }
 
+/// A stored phantom's real value and its redemption grants.
+type BrokerEntry = (Zeroizing<Vec<u8>>, GrantSet);
+
+/// A named credential's value, grants, and optional visible-phantom template.
+type NamedEntry = (Zeroizing<Vec<u8>>, GrantSet, Option<PhantomTemplate>);
+
 /// Holds real credential values in the supervisor's memory.
 /// All stored values are zeroed when the broker is dropped.
 pub(crate) struct TokenBroker {
-    map: std::collections::HashMap<String, (Zeroizing<Vec<u8>>, GrantSet)>,
-    named: std::collections::HashMap<String, (Zeroizing<Vec<u8>>, GrantSet)>,
+    map: std::collections::HashMap<String, BrokerEntry>,
+    named: std::collections::HashMap<String, NamedEntry>,
+    /// Distinct phantom templates seen across issued nonces. Used to recognise
+    /// templated phantoms on the L7 egress and capture-redaction paths.
+    templates: Vec<PhantomTemplate>,
 }
 
 impl TokenBroker {
@@ -76,6 +86,7 @@ impl TokenBroker {
         Self {
             map: std::collections::HashMap::new(),
             named: std::collections::HashMap::new(),
+            templates: Vec::new(),
         }
     }
 
@@ -93,35 +104,74 @@ impl TokenBroker {
     /// `resolve_env_entry` or `resolve_nonce`. `GrantSet::All` is equivalent
     /// to the unscoped `issue`.
     pub(crate) fn issue_granted(&mut self, value: Zeroizing<Vec<u8>>, grants: GrantSet) -> String {
+        self.issue_templated(value, grants, None)
+    }
+
+    /// Issue a nonce, optionally wrapping the visible phantom in `template`.
+    ///
+    /// Without a template the phantom is a bare `nono_<64hex>`. With one it is
+    /// `template.render(<64hex body>)` — following the template exactly so a
+    /// prefix-sniffing client classifies it correctly. Either way the full
+    /// visible string is the store key resolution looks up.
+    fn issue_templated(
+        &mut self,
+        value: Zeroizing<Vec<u8>>,
+        grants: GrantSet,
+        template: Option<&PhantomTemplate>,
+    ) -> String {
         let mut raw = [0u8; 32];
         rand::rng().fill(&mut raw);
-        let nonce = format!(
-            "{}{}",
-            NONCE_PREFIX,
-            raw.iter().map(|b| format!("{b:02x}")).collect::<String>()
-        );
-        self.map.insert(nonce.clone(), (value, grants));
-        nonce
+        let body = raw.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let phantom = match template {
+            Some(template) => {
+                if !self.templates.contains(template) {
+                    self.templates.push(template.clone());
+                }
+                template.render(&body)
+            }
+            None => format!("{NONCE_PREFIX}{body}"),
+        };
+        self.map.insert(phantom.clone(), (value, grants));
+        phantom
     }
 
     /// Store or replace a named supervisor credential and issue a nonce for it.
     ///
-    /// `grants` scopes which consumers may redeem nonces issued for this credential.
-    pub(crate) fn store_named(&mut self, name: String, value: Vec<u8>, grants: GrantSet) -> String {
+    /// `grants` scopes which consumers may redeem nonces issued for this
+    /// credential; `template`, when set, shapes every phantom issued for it.
+    pub(crate) fn store_named(
+        &mut self,
+        name: String,
+        value: Vec<u8>,
+        grants: GrantSet,
+        template: Option<PhantomTemplate>,
+    ) -> String {
+        if let Some(template) = &template
+            && let Ok(real) = std::str::from_utf8(&value)
+            && !template.matches(real)
+        {
+            tracing::warn!(
+                credential = %name,
+                "ambient credential format does not match the captured token shape; \
+                 a prefix-sniffing client may classify the phantom wrongly"
+            );
+        }
         let zeroized = Zeroizing::new(value);
-        self.named.insert(name, (zeroized.clone(), grants.clone()));
-        self.issue_granted(zeroized, grants)
+        self.named
+            .insert(name, (zeroized.clone(), grants.clone(), template.clone()));
+        self.issue_templated(zeroized, grants, template.as_ref())
     }
 
     /// Issue a fresh nonce for a previously stored named supervisor credential.
     ///
-    /// The new nonce inherits the grant set from the stored credential.
-    /// Returns `None` if the credential is not registered.
+    /// The new nonce inherits the grant set and template from the stored
+    /// credential. Returns `None` if the credential is not registered.
     pub(crate) fn issue_named(&mut self, name: &str) -> Option<String> {
-        let (value, grants) = self.named.get(name)?;
+        let (value, grants, template) = self.named.get(name)?;
         let value = value.clone();
         let grants = grants.clone();
-        Some(self.issue_granted(value, grants))
+        let template = template.clone();
+        Some(self.issue_templated(value, grants, template.as_ref()))
     }
 
     /// If `env_entry` has the form `NAME=nono_<64hex>` and the nonce is known to
@@ -134,9 +184,8 @@ impl TokenBroker {
         let eq = env_entry.iter().position(|&b| b == b'=')?;
         let value = &env_entry[eq.saturating_add(1)..];
         let value_str = std::str::from_utf8(value).ok()?;
-        if !is_nonce(value_str) {
-            return None;
-        }
+        // The whole env value is the phantom (a bare nonce or a full templated
+        // phantom), so it is itself the store key.
         let (real, grants) = self.map.get(value_str)?;
         if !grants.admits(consumer) {
             return None;
@@ -147,19 +196,25 @@ impl TokenBroker {
         Some(out)
     }
 
-    /// Resolve a raw nonce value for `consumer`, returning the real value if
-    /// the nonce is known and the consumer is admitted by the grant set.
+    /// Resolve a phantom (bare nonce or full templated phantom) for `consumer`,
+    /// returning the real value if known and the consumer is admitted.
     ///
     /// `consumer` should be `"proxy.<route_id>"` for L7 header-injection.
     pub(crate) fn resolve_nonce(&self, nonce: &str, consumer: &str) -> Option<Zeroizing<Vec<u8>>> {
-        if !is_nonce(nonce) {
-            return None;
-        }
         let (real, grants) = self.map.get(nonce)?;
         if !grants.admits(consumer) {
             return None;
         }
         Some(real.clone())
+    }
+
+    /// Rewrite the first broker phantom appearing in a header `value` to the
+    /// real credential for `consumer` — templated phantoms (by registered
+    /// template shape) or bare `nono_<64hex>` nonces.
+    pub(crate) fn rewrite_header_value(&self, value: &str, consumer: &str) -> Option<String> {
+        rewrite_first_phantom(value, &self.templates, |nonce| {
+            self.resolve_nonce(nonce, consumer)
+        })
     }
 
     /// Scan `input` for broker nonces or broker-held values and issue fresh
@@ -189,6 +244,14 @@ impl TokenBroker {
         let prefix = NONCE_PREFIX.as_bytes();
 
         while i < input.len() {
+            // Templated phantom (no `nono_` marker) starting at i.
+            if let Some((len, real, grants, template)) = self.templated_phantom_at(&input[i..]) {
+                let new_phantom = self.issue_templated(real, grants, Some(&template));
+                out.extend_from_slice(new_phantom.as_bytes());
+                i += len;
+                continue;
+            }
+
             // Look for the nonce prefix starting at i
             if input[i..].starts_with(prefix) && i + NONCE_LEN <= input.len() {
                 let candidate = &input[i..i + NONCE_LEN];
@@ -216,6 +279,28 @@ impl TokenBroker {
             i = i.saturating_add(1);
         }
         out
+    }
+
+    /// If a known templated phantom starts at the beginning of `input`, return
+    /// its byte length plus the stored value, grants, and template.
+    fn templated_phantom_at(
+        &self,
+        input: &[u8],
+    ) -> Option<(usize, Zeroizing<Vec<u8>>, GrantSet, PhantomTemplate)> {
+        let s = std::str::from_utf8(input).ok()?;
+        for template in &self.templates {
+            let (start, end) = match template.find_in(s) {
+                Some(span) => span,
+                None => continue,
+            };
+            if start != 0 {
+                continue;
+            }
+            if let Some((real, grants)) = self.map.get(&s[start..end]) {
+                return Some((end, real.clone(), grants.clone(), template.clone()));
+            }
+        }
+        None
     }
 
     fn longest_secret_value_at(&self, input: &[u8]) -> Option<(Zeroizing<Vec<u8>>, GrantSet)> {
@@ -280,7 +365,12 @@ mod tests {
     #[test]
     fn named_credential_issues_fresh_resolvable_nonces() {
         let mut broker = TokenBroker::new();
-        let first = broker.store_named("github".to_string(), b"ghp_real".to_vec(), GrantSet::All);
+        let first = broker.store_named(
+            "github".to_string(),
+            b"ghp_real".to_vec(),
+            GrantSet::All,
+            None,
+        );
         let second = match broker.issue_named("github") {
             Some(value) => value,
             None => panic!("named credential must issue nonce"),
@@ -459,6 +549,7 @@ mod tests {
             "gitlab".to_string(),
             b"glpat-real".to_vec(),
             GrantSet::Specific(vec!["cmd.glab".to_string()]),
+            None,
         );
         // Admitted
         assert!(broker.resolve_nonce(&n, "cmd.glab").is_some());
@@ -470,5 +561,124 @@ mod tests {
             .expect("stored gitlab credential should be available");
         assert!(broker.resolve_nonce(&n2, "cmd.glab").is_some());
         assert!(broker.resolve_nonce(&n2, "cmd.curl").is_none());
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn templated_named_credential_follows_template_and_resolves() {
+        let mut broker = TokenBroker::new();
+        let template = PhantomTemplate::parse("sk-ant-oat01-{}").unwrap();
+        let phantom = broker.store_named(
+            "anthropic".to_string(),
+            b"real-oauth-token".to_vec(),
+            GrantSet::Specific(vec!["proxy.anthropic".to_string()]),
+            Some(template),
+        );
+
+        // Visible phantom follows the template exactly: prefix + 64 hex, no marker.
+        assert!(phantom.starts_with("sk-ant-oat01-"));
+        assert!(!phantom.contains("nono_"));
+        assert_eq!(phantom.strip_prefix("sk-ant-oat01-").unwrap().len(), 64);
+
+        // Whole templated span resolves via the L7 header path, no leftover text.
+        let header = format!("Bearer {phantom}");
+        assert_eq!(
+            broker
+                .rewrite_header_value(&header, "proxy.anthropic")
+                .expect("admitted consumer resolves"),
+            "Bearer real-oauth-token"
+        );
+        // Not admitted for a different consumer.
+        assert!(
+            broker
+                .rewrite_header_value(&header, "proxy.other")
+                .is_none()
+        );
+
+        // Env promotion substitutes the real value for the whole templated value.
+        let entry = format!("ANTHROPIC_API_KEY={phantom}").into_bytes();
+        assert_eq!(
+            broker.resolve_env_entry(&entry, "proxy.anthropic").unwrap(),
+            b"ANTHROPIC_API_KEY=real-oauth-token"
+        );
+        // Env promotion is also consumer-gated for templated phantoms.
+        assert!(
+            broker.resolve_env_entry(&entry, "proxy.other").is_none(),
+            "unadmitted consumer must not resolve templated env entry"
+        );
+
+        // A fresh nonce for the same named credential reuses the template and
+        // resolves to the same real value.
+        let phantom2 = broker.issue_named("anthropic").unwrap();
+        assert!(phantom2.starts_with("sk-ant-oat01-"));
+        assert_ne!(phantom, phantom2);
+        assert_eq!(
+            broker
+                .rewrite_header_value(&format!("Bearer {phantom2}"), "proxy.anthropic")
+                .expect("reissued templated phantom resolves"),
+            "Bearer real-oauth-token"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn scan_and_reissue_reissues_templated_phantom() {
+        let mut broker = TokenBroker::new();
+        let template = PhantomTemplate::parse("sk-ant-oat01-{}").unwrap();
+        let phantom = broker.store_named(
+            "anthropic".to_string(),
+            b"real-oauth-token".to_vec(),
+            GrantSet::Specific(vec!["proxy.anthropic".to_string()]),
+            Some(template),
+        );
+
+        // A captured stdout line containing the templated phantom, mid-string.
+        let captured = format!("prefix {phantom} suffix").into_bytes();
+        let out = broker.scan_and_reissue(&captured);
+        let out_str = as_utf8(&out);
+
+        // Original phantom is replaced by a fresh templated phantom; no nono_.
+        assert!(
+            !out_str.contains(&phantom),
+            "original phantom must be redacted"
+        );
+        assert!(out_str.starts_with("prefix sk-ant-oat01-"));
+        assert!(out_str.ends_with(" suffix"));
+        assert!(!out_str.contains("nono_"));
+
+        // The reissued phantom still resolves to the real value (name preserved).
+        let reissued = out_str
+            .split_whitespace()
+            .find(|w| w.starts_with("sk-ant-oat01-"))
+            .expect("a templated phantom replaced the original");
+        assert_eq!(
+            broker
+                .rewrite_header_value(&format!("Bearer {reissued}"), "proxy.anthropic")
+                .expect("reissued phantom resolves"),
+            "Bearer real-oauth-token"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn store_named_warns_on_drift_but_still_resolves() {
+        // Template prefix does not match the captured value shape: the broker
+        // warns (not asserted here) but still mints a template-shaped phantom
+        // that resolves.
+        let mut broker = TokenBroker::new();
+        let template = PhantomTemplate::parse("sk-ant-oat01-{}").unwrap();
+        let phantom = broker.store_named(
+            "anthropic".to_string(),
+            b"unexpected-shape".to_vec(),
+            GrantSet::All,
+            Some(template),
+        );
+        assert!(phantom.starts_with("sk-ant-oat01-"));
+        assert_eq!(
+            broker
+                .rewrite_header_value(&format!("Bearer {phantom}"), "proxy.anything")
+                .expect("resolves despite drift"),
+            "Bearer unexpected-shape"
+        );
     }
 }

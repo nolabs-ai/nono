@@ -15,16 +15,19 @@ pub struct LoadedOAuthEndpoint {
     pub(super) admitted_consumers: HashSet<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum ResponseFieldFormat {
     Opaque,
     Jwt,
 }
 
+pub(super) use crate::token::PhantomTemplate;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ResponseField {
     pub(super) path: String,
     pub(super) format: ResponseFieldFormat,
+    pub(super) template: Option<PhantomTemplate>,
 }
 
 pub(super) fn load_endpoint(
@@ -50,33 +53,62 @@ pub(super) fn load_endpoint(
         provider: provider.to_string(),
         host_port: format!("{}:{}", host.to_lowercase(), port),
         path: endpoint.path.clone(),
-        response_fields: endpoint_response_fields(endpoint),
+        response_fields: endpoint_response_fields(endpoint)?,
         request_body: endpoint.request_body,
         request_nonce_fields: endpoint.request_nonce_fields.clone(),
         admitted_consumers,
     })
 }
 
-fn endpoint_response_fields(endpoint: &OAuthTokenEndpointConfig) -> Vec<ResponseField> {
+fn endpoint_response_fields(endpoint: &OAuthTokenEndpointConfig) -> Result<Vec<ResponseField>> {
     let mut fields = Vec::with_capacity(endpoint.response_fields.len());
     for field in &endpoint.response_fields {
-        push_response_field(
-            &mut fields,
-            field.path.clone(),
-            match field.kind {
-                OAuthTokenResponseFieldKind::Opaque => ResponseFieldFormat::Opaque,
-                OAuthTokenResponseFieldKind::Jwt => ResponseFieldFormat::Jwt,
-            },
-        );
+        let format = match field.kind {
+            OAuthTokenResponseFieldKind::Opaque => ResponseFieldFormat::Opaque,
+            OAuthTokenResponseFieldKind::Jwt => ResponseFieldFormat::Jwt,
+        };
+        let template = match &field.format {
+            None => None,
+            Some(template) => {
+                if format != ResponseFieldFormat::Opaque {
+                    return Err(ProxyError::Config(
+                        "OAuth capture 'format' is only valid with kind 'opaque'".to_string(),
+                    ));
+                }
+                Some(
+                    PhantomTemplate::parse(template)
+                        .map_err(|err| ProxyError::Config(format!("OAuth capture {err}")))?,
+                )
+            }
+        };
+        push_response_field(&mut fields, field.path.clone(), format, template);
     }
-    fields
+    Ok(fields)
 }
 
-fn push_response_field(fields: &mut Vec<ResponseField>, path: String, format: ResponseFieldFormat) {
+fn push_response_field(
+    fields: &mut Vec<ResponseField>,
+    path: String,
+    format: ResponseFieldFormat,
+    template: Option<PhantomTemplate>,
+) {
     if fields.iter().any(|existing| existing.path == path) {
         return;
     }
-    fields.push(ResponseField { path, format });
+    fields.push(ResponseField {
+        path,
+        format,
+        template,
+    });
+}
+
+impl LoadedOAuthEndpoint {
+    /// Distinct phantom templates declared by this endpoint's response fields.
+    pub(super) fn templates(&self) -> impl Iterator<Item = &PhantomTemplate> {
+        self.response_fields
+            .iter()
+            .filter_map(|field| field.template.as_ref())
+    }
 }
 
 pub(super) fn provider_consumer(provider: &str) -> String {

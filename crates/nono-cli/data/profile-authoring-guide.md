@@ -590,7 +590,7 @@ generated trust bundle.
           "host": "https://platform.claude.com",
           "path": "/v1/oauth/token",
           "response_fields": [
-            { "path": "access_token", "kind": "opaque" },
+            { "path": "access_token", "kind": "opaque", "format": "sk-ant-oat01-{}" },
             { "path": "refresh_token", "kind": "opaque" },
             { "path": "id_token", "kind": "jwt" }
           ],
@@ -635,7 +635,7 @@ generated trust bundle.
 | `type`               | string          | yes      | Currently `oauth_capture`. |
 | `token_endpoints`    | array           | yes      | HTTPS OAuth token origins and exact paths whose JSON responses are captured and rewritten to phantom tokens. Configure every token-bearing path the client may use. |
 | `api_hosts`          | array           | yes      | HTTPS API URL origins where this provider's phantom tokens may be resolved on egress. |
-| `response_fields`    | array           | yes      | Token response fields to rewrite. Each entry declares a `path` and a visible phantom `kind` of `opaque` or `jwt`; use `jwt` only for locally parsed fields, not bearer tokens resent upstream. |
+| `response_fields`    | array           | yes      | Token response fields to rewrite. Each entry declares a `path` and a visible phantom `kind` of `opaque` or `jwt`; use `jwt` only for locally parsed fields, not bearer tokens resent upstream. An optional `format` (e.g. `"sk-ant-oat01-{}"`, `kind: opaque` only) shapes the visible phantom — `{}` is a random body — so a client that classifies a credential by its literal prefix recognises it; the template is stripped on egress. |
 | `request_body`       | string          | no       | Token request body format for refresh/exchange rewriting: `auto`, `json`, or `form`. |
 | `credential_store`   | object          | no       | Optional session/logout detection, such as a keychain JSON record or file JSON record with fields expected to contain phantoms. |
 | `helpers`            | object          | no       | Optional status, login, and logout commands for humans or CLI workflows. Commands are arrays and are not run through a shell. |

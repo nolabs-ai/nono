@@ -63,6 +63,14 @@ phantom only works when it is sent back through a matching nono proxy route.
   locally and does not later send as a bearer token.
 </Note>
 
+<Note>
+  If a client classifies a credential by sniffing a literal prefix (e.g.
+  treating `sk-ant-oat01-…` as an OAuth token), give the field a `format` such
+  as `"sk-ant-oat01-{}"` (`kind: opaque` only). The phantom then follows that
+  shape — `{}` is the random body — and the template is stripped on egress
+  before the real token is substituted, so it never reaches the provider.
+</Note>
+
 ## The simplest profile
 
 Start with a profile that allows the tool to run normally and enables network

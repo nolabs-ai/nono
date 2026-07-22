@@ -200,6 +200,20 @@ fn verify_profile_packs(packs: &[String], profile: &profile::Profile) -> crate::
             }
         }
 
+        let signer = locked_pkg
+            .provenance
+            .as_ref()
+            .map(|p| p.signer_identity.as_str());
+
+        // Packs installed without signature verification (internal/air-gapped
+        // registry) carry no Sigstore bundle. Their integrity is guaranteed by
+        // the SHA-256 checks above against the lockfile; there is nothing to
+        // re-verify against Sigstore. Keyed on the lockfile sentinel so signed
+        // packs always get full re-verification regardless of current config.
+        if signer == Some(package::UNSIGNED_SIGNER_IDENTITY) {
+            continue;
+        }
+
         let bundle_path = install_dir.join(".nono-trust.bundle");
         if !bundle_path.exists() {
             return Err(nono::NonoError::PackageVerification {
@@ -211,17 +225,13 @@ fn verify_profile_packs(packs: &[String], profile: &profile::Profile) -> crate::
             });
         }
 
-        let pinned_signer = locked_pkg
-            .provenance
-            .as_ref()
-            .map(|p| p.signer_identity.as_str())
-            .ok_or_else(|| nono::NonoError::PackageVerification {
-                package: pack_ref.clone(),
-                reason: format!(
-                    "pack '{}' has no signer identity in the lockfile - reinstall with: nono pull {} --force",
-                    pack_ref, pack_ref
-                ),
-            })?;
+        let pinned_signer = signer.ok_or_else(|| nono::NonoError::PackageVerification {
+            package: pack_ref.clone(),
+            reason: format!(
+                "pack '{}' has no signer identity in the lockfile - reinstall with: nono pull {} --force",
+                pack_ref, pack_ref
+            ),
+        })?;
         verify_stored_bundles(&install_dir, &bundle_path, pack_ref, Some(pinned_signer))?;
     }
 
@@ -1385,6 +1395,43 @@ mod tests {
         fs::write(&lockfile_path, format!("{json}\n")).expect("write lockfile");
     }
 
+    /// Write a lockfile entry whose provenance is marked unsigned (the
+    /// [`package::UNSIGNED_SIGNER_IDENTITY`] sentinel) — i.e. a pack installed
+    /// against an internal/air-gapped registry with verification disabled.
+    fn write_unsigned_lockfile(
+        config_dir: &std::path::Path,
+        pack_ref: &str,
+        artifacts: BTreeMap<String, package::LockedArtifact>,
+    ) {
+        let lockfile_path = config_dir
+            .join("nono")
+            .join("packages")
+            .join("lockfile.json");
+        fs::create_dir_all(lockfile_path.parent().expect("parent")).expect("create packages dir");
+
+        let mut lockfile = package::Lockfile {
+            lockfile_version: package::LOCKFILE_VERSION,
+            registry: String::new(),
+            packages: BTreeMap::new(),
+        };
+        let pkg = package::LockedPackage {
+            artifacts,
+            provenance: Some(package::PackageProvenance {
+                signer_identity: package::UNSIGNED_SIGNER_IDENTITY.to_string(),
+                repository: pack_ref.to_string(),
+                workflow: String::new(),
+                git_ref: String::new(),
+                rekor_log_index: 0,
+                signed_at: String::new(),
+            }),
+            ..package::LockedPackage::default()
+        };
+        lockfile.packages.insert(pack_ref.to_string(), pkg);
+
+        let json = serde_json::to_string_pretty(&lockfile).expect("serialize lockfile");
+        fs::write(&lockfile_path, format!("{json}\n")).expect("write lockfile");
+    }
+
     /// Construct a `SessionHook` with the given script path and optional
     /// `source_pack`.  Used to build `SessionHooks` directly in tests without
     /// going through profile loading.
@@ -1708,6 +1755,55 @@ mod tests {
         };
         assert!(
             err.to_string().contains("missing .nono-trust.bundle"),
+            "unexpected error: {err}"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Unsigned (internal/air-gapped) pack: marked with the sentinel signer
+    // identity and carrying no `.nono-trust.bundle`. Integrity is still
+    // enforced by the SHA-256 checks, but Sigstore re-verification is skipped.
+    // -------------------------------------------------------------------------
+    #[test]
+    fn verify_profile_packs_skips_bundle_for_unsigned_pack() {
+        let result = with_config_env(|config_dir| {
+            let (_, artifacts) = build_pack_with_scripts(
+                config_dir,
+                "acme",
+                "widget",
+                &[("package.json", r#"{"meta":{"name":"widget"}}"#)],
+            );
+            write_unsigned_lockfile(config_dir, "acme/widget", artifacts);
+            verify_profile_packs(&["acme/widget".to_string()], &profile::Profile::default())
+        });
+
+        assert!(
+            result.is_ok(),
+            "unsigned pack with matching digests must verify without a bundle: {result:?}"
+        );
+    }
+
+    #[test]
+    fn verify_profile_packs_detects_tamper_for_unsigned_pack() {
+        let result = with_config_env(|config_dir| {
+            let (install_dir, artifacts) = build_pack_with_scripts(
+                config_dir,
+                "acme",
+                "widget",
+                &[("package.json", r#"{"meta":{"name":"widget"}}"#)],
+            );
+            write_unsigned_lockfile(config_dir, "acme/widget", artifacts);
+            // Tamper with the artifact after its digest was recorded.
+            fs::write(install_dir.join("package.json"), b"tampered").expect("tamper");
+            verify_profile_packs(&["acme/widget".to_string()], &profile::Profile::default())
+        });
+
+        let err = match result {
+            Ok(()) => panic!("tampered unsigned pack must fail verification"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("tampered"),
             "unexpected error: {err}"
         );
     }

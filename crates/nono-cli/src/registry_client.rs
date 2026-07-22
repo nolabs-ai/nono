@@ -394,11 +394,52 @@ impl RegistryClient {
     }
 }
 
+/// Resolved registry endpoint plus whether to verify pack signatures.
+#[derive(Debug, Clone)]
+pub struct ResolvedRegistry {
+    pub url: String,
+    pub verify: bool,
+}
+
+/// Resolve the registry URL alone. Kept for callers that do not need the
+/// verify flag (migration prompt, update-hint helper). Precedence:
+/// `--registry` flag → `NONO_REGISTRY` env → compiled-in default.
 pub fn resolve_registry_url(override_url: Option<&str>) -> String {
     override_url
         .map(ToOwned::to_owned)
         .or_else(|| std::env::var("NONO_REGISTRY").ok())
         .unwrap_or_else(|| DEFAULT_REGISTRY_URL.to_string())
+}
+
+/// Resolve both the registry URL and the signature-verification flag.
+///
+/// URL precedence: `--registry` flag → `NONO_REGISTRY` env →
+/// `[registry].url` in `config.toml` → compiled-in default.
+///
+/// `verify` is fail-secure (defaults to `true`). It is turned off only when
+/// explicitly requested: the `--insecure` flag, the `NONO_REGISTRY_INSECURE`
+/// env var (any non-empty value), or `[registry].verify = false` in
+/// `config.toml`. Disabling verification skips Sigstore signature checks only;
+/// TLS host verification is unaffected.
+#[must_use]
+pub fn resolve_registry(
+    override_url: Option<&str>,
+    insecure_flag: bool,
+    config: Option<&crate::config::user::UserConfig>,
+) -> ResolvedRegistry {
+    let url = override_url
+        .map(ToOwned::to_owned)
+        .or_else(|| std::env::var("NONO_REGISTRY").ok())
+        .or_else(|| config.and_then(|c| c.registry.url.clone()))
+        .unwrap_or_else(|| DEFAULT_REGISTRY_URL.to_string());
+
+    let env_insecure = std::env::var("NONO_REGISTRY_INSECURE")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false);
+    let config_disables = config.map(|c| !c.registry.verify).unwrap_or(false);
+    let verify = !(insecure_flag || env_insecure || config_disables);
+
+    ResolvedRegistry { url, verify }
 }
 
 fn map_ureq_error(error: ureq::Error) -> NonoError {
@@ -516,5 +557,75 @@ mod tests {
         assert_eq!(PullReason::Update.header_value(), "update");
         assert_eq!(PullReason::Migration.header_value(), "migration");
         assert_eq!(PullReason::ProfileAuto.header_value(), "profile-auto");
+    }
+
+    fn config_with(url: Option<&str>, verify: bool) -> crate::config::user::UserConfig {
+        let mut config = crate::config::user::UserConfig::default();
+        config.registry.url = url.map(ToOwned::to_owned);
+        config.registry.verify = verify;
+        config
+    }
+
+    #[test]
+    fn resolve_registry_url_precedence() {
+        let _lock = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let guard = crate::test_env::EnvVarGuard::set_all(&[
+            ("NONO_REGISTRY", ""),
+            ("NONO_REGISTRY_INSECURE", ""),
+        ]);
+        guard.remove("NONO_REGISTRY");
+        guard.remove("NONO_REGISTRY_INSECURE");
+
+        let config = config_with(Some("https://config.example"), true);
+
+        // Flag beats env and config.
+        let _env =
+            crate::test_env::EnvVarGuard::set_all(&[("NONO_REGISTRY", "https://env.example")]);
+        assert_eq!(
+            resolve_registry(Some("https://flag.example"), false, Some(&config)).url,
+            "https://flag.example"
+        );
+        // Env beats config.
+        assert_eq!(
+            resolve_registry(None, false, Some(&config)).url,
+            "https://env.example"
+        );
+        drop(_env);
+        guard.remove("NONO_REGISTRY");
+        // Config beats the compiled-in default.
+        assert_eq!(
+            resolve_registry(None, false, Some(&config)).url,
+            "https://config.example"
+        );
+        // Default when nothing is set.
+        assert_eq!(
+            resolve_registry(None, false, None).url,
+            DEFAULT_REGISTRY_URL
+        );
+    }
+
+    #[test]
+    fn resolve_registry_verify_is_fail_secure() {
+        let _lock = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let guard = crate::test_env::EnvVarGuard::set_all(&[("NONO_REGISTRY_INSECURE", "")]);
+        guard.remove("NONO_REGISTRY_INSECURE");
+
+        // Defaults to verifying.
+        assert!(resolve_registry(None, false, None).verify);
+        assert!(resolve_registry(None, false, Some(&config_with(None, true))).verify);
+
+        // Disabled by the flag.
+        assert!(!resolve_registry(None, true, None).verify);
+        // Disabled by config.
+        assert!(!resolve_registry(None, false, Some(&config_with(None, false))).verify);
+        // Disabled by env (any non-empty value).
+        let _env = crate::test_env::EnvVarGuard::set_all(&[("NONO_REGISTRY_INSECURE", "1")]);
+        assert!(!resolve_registry(None, false, None).verify);
     }
 }

@@ -128,6 +128,18 @@ pub fn check_and_run(profile_name: &str) -> Result<MigrationOutcome> {
     let chosen = if let Some(pack) = official_pack_for(profile_name) {
         pack.as_provider()
     } else {
+        // The provider lookup is a network call to the registry's
+        // `/api/v1/profiles/<name>/providers` endpoint. A static
+        // (air-gapped/internal) registry does not serve it, so skip the lookup
+        // when signature verification is disabled — the in-tree
+        // `official_pack_for` path above still works for known packs.
+        let verify = match crate::config::user::load_user_config() {
+            Ok(Some(config)) => config.registry.verify,
+            _ => true,
+        };
+        if !verify {
+            return Ok(MigrationOutcome::NotApplicable);
+        }
         match fetch_providers(profile_name) {
             Ok(p) if p.is_empty() => return Ok(MigrationOutcome::NotApplicable),
             Ok(mut p) => p.remove(0),
@@ -301,6 +313,7 @@ fn run_pull(pack_ref: &str) -> Result<()> {
             // re-install so the files actually exist before we retry.
             force: true,
             init: false,
+            insecure: false,
             help: None,
         },
         PullReason::Migration,

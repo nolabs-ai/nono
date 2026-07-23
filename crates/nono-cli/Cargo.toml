@@ -73,7 +73,7 @@ keyring = { version = "3", optional = true, default-features = false }
 sigstore-sign = "0.11.0"
 tokio = { version = "1", features = ["rt"] }
 
-ureq = { version = "3", features = ["platform-verifier"] }
+ureq = { version = "3", features = ["platform-verifier", "socks-proxy"] }
 semver = "1"
 
 zeroize.workspace = true

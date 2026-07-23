@@ -1718,6 +1718,35 @@ mod tests {
     }
 
     #[test]
+    fn symlink_to_large_file_not_counted_against_budget() {
+        let (dir, tracked) = setup_test_dir();
+        let session_dir = dir.path().join("session");
+        fs::create_dir_all(&session_dir).expect("create session dir");
+
+        let big = dir.path().join("big.bin");
+        fs::write(&big, vec![0u8; 64 * 1024]).expect("write big target");
+        let link = tracked.join("link-to-big");
+        std::os::unix::fs::symlink(&big, &link).expect("create symlink");
+
+        let mut manager = make_manager_with_budget(
+            &session_dir,
+            &tracked,
+            WalkBudget {
+                max_entries: 0,
+                max_bytes: 4096,
+            },
+        );
+
+        let manifest = manager.create_baseline().expect("baseline should succeed");
+        assert!(
+            !manifest.files.contains_key(&link),
+            "symlink should not be tracked as a file"
+        );
+        assert!(manifest.files.contains_key(&tracked.join("file1.txt")));
+        assert!(manifest.files.contains_key(&tracked.join("file2.txt")));
+    }
+
+    #[test]
     fn collect_atomic_temp_prunes_excluded_dirs() {
         let dir = TempDir::new().expect("tempdir");
         let tracked = dir.path().join("project");

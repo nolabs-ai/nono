@@ -678,6 +678,14 @@ impl SnapshotManager {
                 continue;
             }
 
+            // Never follow a symlinked tracked root.
+            if fs::symlink_metadata(tracked)
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false)
+            {
+                continue;
+            }
+
             let exclusion = self.filter_for_root(tracked);
 
             if tracked.is_file() {
@@ -721,6 +729,11 @@ impl SnapshotManager {
                 entries_visited = entries_visited.saturating_add(1);
                 self.check_budget(entries_visited, total_bytes)?;
                 let path = entry.path();
+                // Never follow symlinks at snapshot time. `WalkDir` already
+                // lstat'd this entry, so `is_symlink()` costs no extra syscall.
+                if entry.file_type().is_symlink() {
+                    continue;
+                }
                 if !path.is_file() {
                     continue;
                 }
@@ -770,6 +783,13 @@ impl SnapshotManager {
                 continue;
             }
 
+            if fs::symlink_metadata(tracked)
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false)
+            {
+                continue;
+            }
+
             let exclusion = self.filter_for_root(tracked);
 
             if tracked.is_file() {
@@ -793,6 +813,10 @@ impl SnapshotManager {
                 entries_visited = entries_visited.saturating_add(1);
                 self.check_budget(entries_visited, total_bytes)?;
                 let path = entry.path();
+
+                if entry.file_type().is_symlink() {
+                    continue;
+                }
                 if !path.is_file() {
                     continue;
                 }

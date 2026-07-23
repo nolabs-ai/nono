@@ -678,6 +678,14 @@ impl SnapshotManager {
                 continue;
             }
 
+            // Never follow a symlinked tracked root.
+            if fs::symlink_metadata(tracked)
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false)
+            {
+                continue;
+            }
+
             let exclusion = self.filter_for_root(tracked);
 
             if tracked.is_file() {
@@ -721,6 +729,11 @@ impl SnapshotManager {
                 entries_visited = entries_visited.saturating_add(1);
                 self.check_budget(entries_visited, total_bytes)?;
                 let path = entry.path();
+                // Never follow symlinks at snapshot time. `WalkDir` already
+                // lstat'd this entry, so `is_symlink()` costs no extra syscall.
+                if entry.file_type().is_symlink() {
+                    continue;
+                }
                 if !path.is_file() {
                     continue;
                 }
@@ -770,6 +783,13 @@ impl SnapshotManager {
                 continue;
             }
 
+            if fs::symlink_metadata(tracked)
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false)
+            {
+                continue;
+            }
+
             let exclusion = self.filter_for_root(tracked);
 
             if tracked.is_file() {
@@ -793,6 +813,10 @@ impl SnapshotManager {
                 entries_visited = entries_visited.saturating_add(1);
                 self.check_budget(entries_visited, total_bytes)?;
                 let path = entry.path();
+
+                if entry.file_type().is_symlink() {
+                    continue;
+                }
                 if !path.is_file() {
                     continue;
                 }
@@ -1715,6 +1739,35 @@ mod tests {
             err_msg.contains("budget exceeded") || err_msg.contains("bytes tracked"),
             "Expected budget error for tracked file, got: {err_msg}"
         );
+    }
+
+    #[test]
+    fn symlink_to_large_file_not_counted_against_budget() {
+        let (dir, tracked) = setup_test_dir();
+        let session_dir = dir.path().join("session");
+        fs::create_dir_all(&session_dir).expect("create session dir");
+
+        let big = dir.path().join("big.bin");
+        fs::write(&big, vec![0u8; 64 * 1024]).expect("write big target");
+        let link = tracked.join("link-to-big");
+        std::os::unix::fs::symlink(&big, &link).expect("create symlink");
+
+        let mut manager = make_manager_with_budget(
+            &session_dir,
+            &tracked,
+            WalkBudget {
+                max_entries: 0,
+                max_bytes: 4096,
+            },
+        );
+
+        let manifest = manager.create_baseline().expect("baseline should succeed");
+        assert!(
+            !manifest.files.contains_key(&link),
+            "symlink should not be tracked as a file"
+        );
+        assert!(manifest.files.contains_key(&tracked.join("file1.txt")));
+        assert!(manifest.files.contains_key(&tracked.join("file2.txt")));
     }
 
     #[test]

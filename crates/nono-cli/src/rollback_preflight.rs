@@ -115,6 +115,9 @@ pub(crate) fn run_preflight(
             .filter_entry(|e| !exclusion.is_excluded(e.path()))
             .filter_map(|e| e.ok())
         {
+            if entry.file_type().is_symlink() {
+                continue;
+            }
             if entry.path().is_file() {
                 file_count = file_count.saturating_add(1);
             }

@@ -2635,6 +2635,7 @@ fn run_supervisor_loop(
                             &mut denials,
                             &mut seen_request_ids,
                             trust_interceptor.as_mut(),
+                            pty.as_deref_mut(),
                         ) {
                             warn!("Error handling supervisor message: {}", e);
                         }
@@ -2947,6 +2948,7 @@ fn run_supervisor_loop(
                                 &mut denials,
                                 &mut seen_request_ids,
                                 trust_interceptor.as_mut(),
+                                pty.as_deref_mut(),
                             ) {
                                 warn!("Error handling supervisor message: {}", e);
                             }
@@ -2975,9 +2977,12 @@ fn run_supervisor_loop(
                         child,
                         config,
                         initial_caps,
-                        &mut rate_limiter,
-                        &mut denials,
-                        trust_interceptor.as_mut(),
+                        supervisor_linux::SeccompNotificationState {
+                            rate_limiter: &mut rate_limiter,
+                            denials: &mut denials,
+                            trust_interceptor: trust_interceptor.as_mut(),
+                            pty: pty.as_deref_mut(),
+                        },
                     )
                 {
                     debug!("Error handling seccomp notification: {}", e);
@@ -3118,6 +3123,28 @@ fn run_supervisor_loop(
     Ok((status, denials, ipc_denials))
 }
 
+/// Run an approval request with the PTY relay paused.
+///
+/// While a terminal client is attached to the PTY relay, the real terminal is
+/// in raw mode and relaying keystrokes to the child, so an interactive prompt
+/// would render garbled and never see the user's answer. Pause the relay
+/// (restoring cooked mode) for the duration of the request and re-enter relay
+/// mode afterwards. A no-op when no terminal-backed client is attached.
+fn request_approval_with_relay_paused(
+    config: &SupervisorConfig<'_>,
+    request: &nono::supervisor::ApprovalRequest,
+    mut pty: Option<&mut crate::pty_proxy::PtyProxy>,
+) -> Result<ApprovalDecision> {
+    let paused_for_prompt = pty
+        .as_mut()
+        .is_some_and(|proxy| proxy.pause_terminal_for_prompt());
+    let result = config.approval_backend.request_approval(request);
+    if paused_for_prompt && let Some(proxy) = pty.as_mut() {
+        proxy.resume_terminal_after_prompt();
+    }
+    result
+}
+
 /// Handle a single supervisor IPC message.
 ///
 /// Flow:
@@ -3126,6 +3153,7 @@ fn run_supervisor_loop(
 /// 3. If granted, open the path and send the fd via `SCM_RIGHTS`
 /// 4. Send the decision response
 /// 5. Record denials for diagnostic footer
+#[allow(clippy::too_many_arguments)]
 fn handle_supervisor_message(
     sock: &mut SupervisorSocket,
     msg: SupervisorMessage,
@@ -3134,6 +3162,7 @@ fn handle_supervisor_message(
     denials: &mut Vec<DenialRecord>,
     seen_request_ids: &mut HashSet<String>,
     mut trust_interceptor: Option<&mut crate::trust_intercept::TrustInterceptor>,
+    mut pty: Option<&mut crate::pty_proxy::PtyProxy>,
 ) -> Result<()> {
     match msg {
         SupervisorMessage::Request(request) => {
@@ -3218,8 +3247,10 @@ fn handle_supervisor_message(
                         // Stash the verified digest for TOCTOU re-check at open time
                         verified_digest = Some(verified.digest);
                         // Instruction file verified — proceed to approval backend
-                        match config.approval_backend.request_approval(
+                        match request_approval_with_relay_paused(
+                            config,
                             &nono::supervisor::ApprovalRequest::from(request.clone()),
+                            pty.as_deref_mut(),
                         ) {
                             Ok(d) => {
                                 if d.is_denied() {
@@ -3272,10 +3303,11 @@ fn handle_supervisor_message(
                 }
             } else {
                 // 3. Delegate to approval backend (non-instruction files)
-                match config
-                    .approval_backend
-                    .request_approval(&nono::supervisor::ApprovalRequest::from(request.clone()))
-                {
+                match request_approval_with_relay_paused(
+                    config,
+                    &nono::supervisor::ApprovalRequest::from(request.clone()),
+                    pty,
+                ) {
                     Ok(d) => {
                         if d.is_denied() {
                             record_denial(

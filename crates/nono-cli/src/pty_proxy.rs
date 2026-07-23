@@ -875,6 +875,25 @@ impl PtyProxy {
         }
     }
 
+    /// Re-enter relay terminal mode after a supervisor-owned prompt.
+    ///
+    /// Returns true when a terminal-backed client was resumed.
+    pub fn resume_terminal_after_prompt(&mut self) -> bool {
+        if !self
+            .client
+            .as_ref()
+            .is_some_and(AttachedClient::is_terminal)
+        {
+            return false;
+        }
+
+        if self.saved_termios.is_none() {
+            self.saved_termios = set_terminal_raw();
+        }
+        self.reenter_screen_for_resume();
+        true
+    }
+
     /// Restore terminal settings.
     pub(crate) fn restore_terminal(&mut self) {
         if let Some(ref termios) = self.saved_termios {
@@ -3244,6 +3263,14 @@ mod tests {
 
         assert!(proxy.proxy_master_to_client());
         assert!(proxy.client.is_none());
+    }
+
+    #[test]
+    fn resume_terminal_after_prompt_is_noop_without_terminal_client() {
+        let mut proxy = build_test_proxy(&DEFAULT_DETACH_SEQUENCE);
+
+        assert!(!proxy.resume_terminal_after_prompt());
+        assert!(proxy.saved_termios.is_none());
     }
 
     // --- Ctrl-Z suspension detection ---

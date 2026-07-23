@@ -4719,12 +4719,9 @@ fn guarded_remove_runtime_dir(dir: &Path) -> Result<()> {
             dir.display()
         )));
     }
-    fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).map_err(|e| {
-        NonoError::ConfigWrite {
-            path: dir.to_path_buf(),
-            source: e,
-        }
-    })?;
+    // The `shims` subdir is sealed to 0o500; re-grant owner-write across the
+    // tree so `remove_dir_all` can unlink the sealed shim copies inside it.
+    crate::tool_sandbox::restore_dir_tree_writable(dir);
     fs::remove_dir_all(dir).map_err(|e| NonoError::ConfigWrite {
         path: dir.to_path_buf(),
         source: e,
@@ -5929,6 +5926,43 @@ mod tests {
         let second = materialize_shim(&source_path, dir.path(), "xargs")?;
 
         assert_ne!(first.id, second.id);
+        Ok(())
+    }
+
+    #[test]
+    fn guarded_remove_deletes_runtime_dir_with_sealed_shims() -> Result<()> {
+        let tmp = test_tempdir()?;
+        let runtime = tmp.path().join("nono-tool-sandbox-test");
+        fs::create_dir(&runtime).map_err(|source| NonoError::ConfigWrite {
+            path: runtime.clone(),
+            source,
+        })?;
+        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).map_err(|source| {
+            NonoError::ConfigWrite {
+                path: runtime.clone(),
+                source,
+            }
+        })?;
+        let shim_dir = create_shim_dir(&runtime)?;
+        let shim = shim_dir.join("git");
+        fs::write(&shim, b"shim").map_err(|source| NonoError::ConfigWrite {
+            path: shim.clone(),
+            source,
+        })?;
+        fs::set_permissions(&shim, fs::Permissions::from_mode(0o500)).map_err(|source| {
+            NonoError::ConfigWrite {
+                path: shim.clone(),
+                source,
+            }
+        })?;
+        // Seal the shim dir to 0o500 exactly as the live runtime does.
+        seal_shim_dir(&shim_dir)?;
+
+        // Regression: with the shim dir sealed, a naive remove_dir_all cannot
+        // unlink its contents, so cleanup must first re-grant owner-write.
+        guarded_remove_runtime_dir(&runtime)?;
+
+        assert!(!runtime.exists(), "sealed runtime dir was not removed");
         Ok(())
     }
 

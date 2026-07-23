@@ -4986,6 +4986,9 @@ fn guarded_remove_runtime_dir(path: &Path) -> Result<()> {
             path.display()
         )));
     }
+    // The `shims` subdir is sealed to 0o500; re-grant owner-write across the
+    // tree so `remove_dir_all` can unlink the sealed shim copies inside it.
+    crate::tool_sandbox::restore_dir_tree_writable(path);
     fs::remove_dir_all(path).map_err(|source| NonoError::ConfigWrite {
         path: path.to_path_buf(),
         source,
@@ -5417,6 +5420,43 @@ mod tests {
             path: PathBuf::from("/tmp"),
             source,
         })
+    }
+
+    #[test]
+    fn guarded_remove_deletes_runtime_dir_with_sealed_shims() -> Result<()> {
+        let tmp = test_tempdir()?;
+        let runtime = tmp.path().join("nono-tool-sandbox-test");
+        std::fs::create_dir(&runtime).map_err(|source| NonoError::ConfigWrite {
+            path: runtime.clone(),
+            source,
+        })?;
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).map_err(
+            |source| NonoError::ConfigWrite {
+                path: runtime.clone(),
+                source,
+            },
+        )?;
+        let shim_dir = create_shim_dir(&runtime)?;
+        let shim = shim_dir.join("git");
+        std::fs::write(&shim, b"shim").map_err(|source| NonoError::ConfigWrite {
+            path: shim.clone(),
+            source,
+        })?;
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o500)).map_err(
+            |source| NonoError::ConfigWrite {
+                path: shim.clone(),
+                source,
+            },
+        )?;
+        // Seal the shim dir to 0o500 exactly as the live runtime does.
+        seal_shim_dir(&shim_dir)?;
+
+        // Regression: with the shim dir sealed, a naive remove_dir_all cannot
+        // unlink its contents, so cleanup must first re-grant owner-write.
+        guarded_remove_runtime_dir(&runtime)?;
+
+        assert!(!runtime.exists(), "sealed runtime dir was not removed");
+        Ok(())
     }
 
     fn create_dir(path: &Path) -> Result<()> {

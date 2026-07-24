@@ -875,8 +875,7 @@ pub enum SpiffeAuthConfig {
 /// A token bucket refilling at `requests_per_minute` and holding up to `burst`
 /// tokens. When the bucket is empty, overshoot is delayed up to
 /// `max_delay_secs`; a request that would wait longer is rejected with HTTP
-/// 429. See
-/// `docs/adr/0001-route-rate-limiter-bounded-throttle-then-reject.md`.
+/// 429.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RouteRateLimitConfig {

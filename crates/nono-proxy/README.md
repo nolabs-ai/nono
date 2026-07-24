@@ -43,8 +43,7 @@ A token bucket refills at `requests_per_minute` and holds up to `burst` tokens.
 When the bucket is empty, a request is delayed until a token accrues, up to
 `max_delay_secs`; a request that would wait longer is rejected with **HTTP 429**.
 Overload is a bounded delay then reject -- never a human approval prompt and
-never an unbounded wait (which would let a flood exhaust the proxy). See
-[`docs/adr/0001-route-rate-limiter-bounded-throttle-then-reject.md`](../../docs/adr/0001-route-rate-limiter-bounded-throttle-then-reject.md).
+never an unbounded wait (which would let a flood exhaust the proxy).
 
 **Scope:** the limiter acts only on **L7-visible** traffic -- reverse-proxy
 routes and TLS-intercepted CONNECT. It has **no effect** on an opaque CONNECT

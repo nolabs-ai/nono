@@ -17,10 +17,7 @@
 //!   — so the implicit delay queue is always bounded and the proxy cannot be
 //!   pushed into a self-inflicted denial of service.
 //!
-//! This is the nginx `limit_req ... burst / delay` model. See
-//! `docs/adr/0001-route-rate-limiter-bounded-throttle-then-reject.md` for why
-//! overload is a bounded delay then reject, never a human approval and never an
-//! unbounded wait.
+//! This is the nginx `limit_req ... burst / delay` model.
 //!
 //! ## Scope
 //!

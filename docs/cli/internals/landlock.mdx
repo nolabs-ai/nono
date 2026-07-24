@@ -79,6 +79,8 @@ AccessFs::Truncate    // ABI v3+
 
 Note: `RemoveFile` and `RemoveDir` are both included because `rename()` requires removal rights on the source. This enables atomic write patterns (write to `.tmp` then rename to target) for both files and directories.
 
+Note: Landlock rules bind to the inode that was open when the ruleset was applied, not to the path. A *file-level* grant therefore goes stale if the file is replaced via such an atomic write from outside the sandbox — the new inode carries no rule and access fails with `EACCES`. `nono why` reports this as `stale_file_grant` (see [Troubleshooting](/cli/usage/troubleshooting)). Directory grants are not affected: a directory rule covers all children, including files created after the sandbox started.
+
 ### Full Access (`--allow`)
 
 Both read and write access rights combined.

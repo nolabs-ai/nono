@@ -55,6 +55,10 @@ pub enum QueryResult {
         source: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         endpoint_rules: Option<Vec<crate::sandbox_state::EndpointRuleState>>,
+        /// Advisory caveat: policy allows the operation, but enforcement may
+        /// still deny it (e.g. a sibling file grant went stale).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        warning: Option<String>,
     },
     /// The operation is denied
     #[serde(rename = "denied")]
@@ -181,6 +185,7 @@ pub fn query_path(
             access: Some(cap.access.to_string()),
             source: Some(cap.source.to_string()),
             endpoint_rules: None,
+            warning: None,
         });
     }
 
@@ -271,6 +276,7 @@ pub fn query_network(
                                     )),
                                     source: Some("domain allowlist".to_string()),
                                     endpoint_rules: Some(de.endpoints.clone()),
+                                    warning: None,
                                 }
                             } else {
                                 QueryResult::Denied {
@@ -301,6 +307,7 @@ pub fn query_network(
                             )),
                             source: Some("domain allowlist".to_string()),
                             endpoint_rules: Some(de.endpoints.clone()),
+                            warning: None,
                         },
                         (None, _) => QueryResult::Allowed {
                             reason: "proxy_allowed".to_string(),
@@ -321,6 +328,7 @@ pub fn query_network(
                                 "domain allowlist".to_string()
                             }),
                             endpoint_rules: None,
+                            warning: None,
                         },
                     }
                 }
@@ -359,6 +367,7 @@ pub fn query_network(
                                         )),
                                         source: Some("domain allowlist".to_string()),
                                         endpoint_rules: Some(de.endpoints.clone()),
+                                        warning: None,
                                     }
                                 } else {
                                     QueryResult::Denied {
@@ -389,6 +398,7 @@ pub fn query_network(
                                 )),
                                 source: Some("domain allowlist".to_string()),
                                 endpoint_rules: Some(de.endpoints.clone()),
+                                warning: None,
                             },
                             (None, _) => QueryResult::Allowed {
                                 reason: "proxy_allowed".to_string(),
@@ -399,6 +409,7 @@ pub fn query_network(
                                 )),
                                 source: Some("domain allowlist".to_string()),
                                 endpoint_rules: None,
+                                warning: None,
                             },
                         }
                     }
@@ -421,6 +432,7 @@ pub fn query_network(
                     )),
                     source: None,
                     endpoint_rules: None,
+                    warning: None,
                 }
             }
         }
@@ -569,6 +581,7 @@ pub fn print_result(result: &QueryResult) {
             access,
             source,
             endpoint_rules,
+            warning,
         } => {
             println!("{}", "ALLOWED".green().bold());
             println!("  Reason: {}", reason);
@@ -586,6 +599,9 @@ pub fn print_result(result: &QueryResult) {
                 for rule in rules {
                     println!("    {} {}", rule.method, rule.path);
                 }
+            }
+            if let Some(warn) = warning {
+                println!("  {} {}", "Warning:".yellow().bold(), warn);
             }
         }
         QueryResult::Denied {

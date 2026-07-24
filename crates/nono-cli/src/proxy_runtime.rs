@@ -2354,6 +2354,16 @@ pub(crate) fn build_proxy_config_from_flags(
         .unwrap_or(&[]);
     let (_, endpoint_routes) =
         network_policy::partition_allow_domain(&net_policy, endpoint_allow_domain)?;
+    // Keep the user's host-filtering intent separate from entries derived for
+    // proxy internals. An open policy is represented downstream by an empty
+    // allowlist; adding a credential upstream to that empty list would
+    // accidentally turn allow-all into allow-only-that-upstream (#1485).
+    let host_allowlist_active = proxy.strict_filter
+        || !resolved.hosts.is_empty()
+        || !resolved.suffixes.is_empty()
+        || !plain_hosts.is_empty()
+        || !endpoint_routes.is_empty();
+
     // Endpoint-restricted domains need filter allowlist access so the proxy
     // can reach upstream after TLS interception (h2 checks the filter at
     // connection setup, before per-stream route matching).
@@ -2369,24 +2379,26 @@ pub(crate) fn build_proxy_config_from_flags(
     // when the child curls the real upstream URL (CONNECT + TLS intercept).
     // Use url::Url::parse so credentials embedded in the URL (user:pass@host)
     // don't end up in the allowlist as a garbled "user:pass@host:port" string.
-    for route in &routes {
-        if let Ok(parsed) = url::Url::parse(&route.upstream)
-            && let Some(host) = parsed.host_str()
-        {
-            let default_port = if parsed.scheme() == "https" {
-                443u16
-            } else {
-                80u16
-            };
-            let port = parsed.port().unwrap_or(default_port);
-            let host_port = format!("{}:{}", host, port);
-            if !plain_hosts.iter().any(|h| h == &host_port) {
-                plain_hosts.push(host_port);
-            }
-            // HostFilter matches on hostname only; also allow the bare host so
-            // CONNECT targets like localhost:19871 pass the filter as "localhost".
-            if !plain_hosts.iter().any(|h| h == host) {
-                plain_hosts.push(host.to_string());
+    if host_allowlist_active {
+        for route in &routes {
+            if let Ok(parsed) = url::Url::parse(&route.upstream)
+                && let Some(host) = parsed.host_str()
+            {
+                let default_port = if parsed.scheme() == "https" {
+                    443u16
+                } else {
+                    80u16
+                };
+                let port = parsed.port().unwrap_or(default_port);
+                let host_port = format!("{}:{}", host, port);
+                if !plain_hosts.iter().any(|h| h == &host_port) {
+                    plain_hosts.push(host_port);
+                }
+                // HostFilter matches on hostname only; also allow the bare host so
+                // CONNECT targets like localhost:19871 pass the filter as "localhost".
+                if !plain_hosts.iter().any(|h| h == host) {
+                    plain_hosts.push(host.to_string());
+                }
             }
         }
     }
@@ -3291,6 +3303,89 @@ mod tests {
         assert!(
             !config.strict_filter,
             "strict_filter must default off when not set"
+        );
+    }
+
+    fn proxy_with_custom_credential(
+        strict_filter: bool,
+        allow_domain: Vec<crate::profile::AllowDomainEntry>,
+    ) -> ProxyLaunchOptions {
+        let credential = serde_json::from_value(serde_json::json!({
+            "upstream": "https://bedrock-runtime.us-east-1.amazonaws.com",
+            "aws_auth": { "region": "us-east-1" }
+        }))
+        .expect("custom credential should deserialize");
+
+        ProxyLaunchOptions {
+            domain_filter: (!allow_domain.is_empty()).then_some(DomainFilterIntent {
+                network_profile: None,
+                allow_domain,
+                deny_domain: Vec::new(),
+            }),
+            credentials: Some(CredentialProxyIntent {
+                credentials: vec!["bedrock".to_string()],
+                custom_credentials: HashMap::from([("bedrock".to_string(), credential)]),
+                endpoint_restrictions: Vec::new(),
+            }),
+            strict_filter,
+            ..ProxyLaunchOptions::default()
+        }
+    }
+
+    /// Regression test for #1485: adding a credential route to an open network
+    /// policy must not populate the host allowlist and restrict all other egress.
+    #[test]
+    fn test_custom_credential_preserves_open_network_policy() {
+        let proxy = proxy_with_custom_credential(false, Vec::new());
+        let config = build_proxy_config_from_flags(&proxy).expect("build proxy config");
+
+        assert!(
+            config.allowed_hosts.is_empty(),
+            "an open network policy must retain the empty allowlist sentinel"
+        );
+        assert!(
+            config.routes.iter().any(|route| route.prefix == "bedrock"),
+            "the credential route must still be active"
+        );
+    }
+
+    #[test]
+    fn test_custom_credential_upstream_is_added_to_active_host_allowlist() {
+        let proxy = proxy_with_custom_credential(
+            false,
+            vec![crate::profile::AllowDomainEntry::Plain(
+                "www.example.com".to_string(),
+            )],
+        );
+        let config = build_proxy_config_from_flags(&proxy).expect("build proxy config");
+
+        assert!(
+            config
+                .allowed_hosts
+                .iter()
+                .any(|host| host == "www.example.com"),
+            "the explicit allowlist entry must be preserved"
+        );
+        assert!(
+            config
+                .allowed_hosts
+                .iter()
+                .any(|host| host == "bedrock-runtime.us-east-1.amazonaws.com:443"),
+            "the credential upstream must remain reachable in allowlist mode"
+        );
+    }
+
+    #[test]
+    fn test_custom_credential_upstream_is_added_to_strict_empty_allowlist() {
+        let proxy = proxy_with_custom_credential(true, Vec::new());
+        let config = build_proxy_config_from_flags(&proxy).expect("build proxy config");
+
+        assert!(
+            config
+                .allowed_hosts
+                .iter()
+                .any(|host| host == "bedrock-runtime.us-east-1.amazonaws.com:443"),
+            "the credential upstream must remain reachable in strict mode"
         );
     }
 

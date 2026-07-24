@@ -111,13 +111,25 @@ pub async fn sign_request(
     //   for all other services).
     // - `SessionTokenMode::Include`: include X-Amz-Security-Token in the
     //   canonical request when a session token is present (STS / IMDS / SSO).
-    // - `PercentEncodingMode::Single`: standard single-encode mode.
-    // - `UriPathNormalizationMode::Disabled`: required for S3 key correctness.
+    // - `PercentEncodingMode`: Almost all AWS services use double encoding, except S3
+    //   This means that a : character in the URL should encode once to %3A, and then again to %253A
+    //   Failing to do so will cause signing errors. The only exception to this rule is S3, which uses single encoding
+    // - `UriPathNormalizationMode` - Similarly, most uri's are normalized first (e.g. a path with ../.) before any encoding.
+    //   S3 is again the exception where these paths should be passed as-is
+    let is_s3 = route.service == "s3";
     let mut settings = SigningSettings::default();
     settings.payload_checksum_kind = PayloadChecksumKind::XAmzSha256;
     settings.session_token_mode = SessionTokenMode::Include;
-    settings.percent_encoding_mode = PercentEncodingMode::Single;
-    settings.uri_path_normalization_mode = UriPathNormalizationMode::Disabled;
+    settings.percent_encoding_mode = if is_s3 {
+        PercentEncodingMode::Single
+    } else {
+        PercentEncodingMode::Double
+    };
+    settings.uri_path_normalization_mode = if is_s3 {
+        UriPathNormalizationMode::Disabled
+    } else {
+        UriPathNormalizationMode::Enabled
+    };
 
     // Build signing parameters with pinned behavior version.
     let params = v4::SigningParams::builder()

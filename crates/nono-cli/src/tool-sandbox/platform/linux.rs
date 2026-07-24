@@ -6,11 +6,13 @@ use crate::command_policy::{
     CommandFromConfig, CommandPoliciesConfig, CommandSandboxConfig, ResolvedCommandBinaries,
     ResolvedCommandBinary, ResolvedExecutableKind, has_explicit_self_invocation_entry,
 };
+use crate::lineage_cgroup::LineageMarker;
 use crate::profile;
 use crate::tool_sandbox::credentials::{ResolvedCredential, resolve_credentials};
 use crate::tool_sandbox::env::{
     apply_environment_set_vars, default_env_allow_patterns, effective_argv_for_binary,
-    inject_chaining_control_env, inject_url_open_env, split_env_entry,
+    env_shebang_target_interpreter, inject_chaining_control_env, inject_url_open_env,
+    split_env_entry,
 };
 use crate::tool_sandbox::launch::{
     exit_status_code, prepare_launcher_command, remove_launch_spec, write_launch_spec,
@@ -43,8 +45,9 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -124,6 +127,8 @@ struct ToolSandboxState {
     baseline_cache: BaselineCache,
     proxy_trust_bundle_paths: Vec<PathBuf>,
     active_children: Mutex<HashMap<u32, ActiveChild>>,
+    /// Attributes severed-ancestry callers to their spawning command. See `lineage_cgroup`.
+    lineage: LineageMarker,
     active_count: AtomicUsize,
     queued_requests: AtomicUsize,
     emitted_error_response: AtomicBool,
@@ -153,6 +158,9 @@ struct ResolvedToolSandboxPlan {
     deny_only: BTreeMap<String, ResolvedDenyOnlyCommand>,
     allowed_direct_bypasses: Vec<PathBuf>,
     allowed_direct_bypass_ids: HashSet<FileId>,
+    /// Writable dirs (cwd, etc.) get a subtree exec grant instead of the
+    /// per-file allow-list, since files can appear there after setup.
+    outer_exec_writable_dirs: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -233,6 +241,7 @@ impl ResolvedToolSandboxPlan {
         let allowed_direct_bypasses =
             resolve_allowed_direct_bypasses(config, &resolved, &deny_only, &governance_denies)?;
         let allowed_direct_bypass_ids = resolve_file_ids(&allowed_direct_bypasses)?;
+        let outer_exec_writable_dirs = collect_outer_exec_writable_dirs(outer_caps, &search_dirs);
         Ok(Self {
             config: config.clone(),
             resolved,
@@ -241,6 +250,7 @@ impl ResolvedToolSandboxPlan {
             deny_only,
             allowed_direct_bypasses,
             allowed_direct_bypass_ids,
+            outer_exec_writable_dirs,
         })
     }
 }
@@ -366,6 +376,10 @@ impl PreparedToolSandboxRuntime {
         );
 
         let approval_backends = crate::approval_runtime::build_approval_registry(&plan.config)?;
+        // Deferred: the cgroup marker builds itself on first use (post-fork), never
+        // now — eager cgroup I/O here would perturb the supervised fork. See
+        // `LineageMarker`'s security note.
+        let lineage = LineageMarker::deferred(std::process::id());
         let runtime = Self {
             inner: Arc::new(ToolSandboxState {
                 runtime_dir,
@@ -387,6 +401,7 @@ impl PreparedToolSandboxRuntime {
                 baseline_cache,
                 proxy_trust_bundle_paths: proxy_trust_bundle_paths.to_vec(),
                 active_children: Mutex::new(HashMap::new()),
+                lineage,
                 active_count: AtomicUsize::new(0),
                 queued_requests: AtomicUsize::new(0),
                 emitted_error_response: AtomicBool::new(false),
@@ -407,6 +422,8 @@ impl PreparedToolSandboxRuntime {
     /// `process::exit` (which bypasses Drop chains); on Rust unwind paths
     /// `ToolSandboxState::Drop` provides a fallback that finds a stale dir already gone.
     pub(crate) fn cleanup_runtime_dir(&self) {
+        // Also here, not just Drop: `process::exit` bypasses Drop chains. Idempotent.
+        self.inner.lineage.teardown();
         if let Err(err) = guarded_remove_runtime_dir(&self.inner.runtime_dir) {
             debug!(
                 "tool-sandbox runtime dir cleanup skipped for {}: {}",
@@ -471,6 +488,7 @@ impl PreparedToolSandboxRuntime {
     pub(crate) fn apply_outer_exec_gate(&self) -> Result<()> {
         apply_outer_exec_gate(
             &self.inner.allowed_outer_exec_files,
+            &self.inner.plan.outer_exec_writable_dirs,
             self.inner.landlock_abi,
         )
     }
@@ -636,6 +654,8 @@ impl PreparedToolSandboxRuntime {
 
 impl Drop for ToolSandboxState {
     fn drop(&mut self) {
+        // Fallback for unwind paths; `cleanup_runtime_dir` handles normal exit. Idempotent.
+        self.lineage.teardown();
         if let Err(err) = guarded_remove_runtime_dir(&self.runtime_dir) {
             debug!(
                 "tool-sandbox runtime dir cleanup skipped for {}: {err}",
@@ -1832,8 +1852,14 @@ fn handle_shim_stream_inner(
         let result = (|| {
             let (helper, extra_args) =
                 super::policy::resolve_exec_helper(&state.plan.exec_helpers, command)?;
-            let launch =
-                build_child_launch_spec_for_binary(state, &request, policy, helper, &extra_args)?;
+            let launch = build_child_launch_spec_for_binary(
+                state,
+                &request,
+                policy,
+                helper,
+                &extra_args,
+                false,
+            )?;
             launch_child(state, &request.command, &caller, launch, stdio)
         })();
         state.active_count.fetch_sub(1, Ordering::SeqCst);
@@ -2019,6 +2045,23 @@ fn resolve_caller(
     state: &ToolSandboxState,
     command_name: &str,
 ) -> Result<Caller> {
+    resolve_caller_with(peer_pid, session_root_pid, state, command_name, |pid| {
+        state
+            .lineage
+            .resolve_severed_command(pid)
+            .map(|command| Caller::Command { command, pid })
+    })
+}
+
+/// `resolve_severed` is a parameter so tests can drive the fallback without a
+/// real reparented process.
+fn resolve_caller_with(
+    peer_pid: u32,
+    session_root_pid: u32,
+    state: &ToolSandboxState,
+    command_name: &str,
+    resolve_severed: impl Fn(u32) -> Option<Caller>,
+) -> Result<Caller> {
     let mut pid = peer_pid;
     for _ in 0..ANCESTRY_DEPTH_LIMIT {
         if let Some((command, launch_caller)) = live_active_child(pid, state)? {
@@ -2038,6 +2081,11 @@ fn resolve_caller(
             break;
         }
         pid = parent_pid(pid)?;
+    }
+    // Walk stopped short of the root: an ancestor daemonized (reparented to pid 1).
+    // Attribute to the spawning command via the lineage marker, never the session.
+    if let Some(caller) = resolve_severed(peer_pid) {
+        return Ok(caller);
     }
     Err(NonoError::SandboxInit(
         "tool-sandbox caller ancestry could not be trusted".to_string(),
@@ -2645,6 +2693,25 @@ fn reject_group_or_world_writable_path(
     Ok(())
 }
 
+/// Dirs the outer capability set grants write/readwrite to (e.g. cwd). Kept
+/// separate from `build_outer_exec_files`'s per-file enumeration since a
+/// writable dir's contents can change after setup.
+fn collect_outer_exec_writable_dirs(
+    caps: &CapabilitySet,
+    executable_dirs: &[PathBuf],
+) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = caps
+        .fs_capabilities()
+        .iter()
+        .filter(|cap| !cap.is_file && cap.access.contains(AccessMode::Write))
+        .map(|cap| cap.resolved.clone())
+        .filter(|dir| !executable_dirs.contains(dir))
+        .collect();
+    dirs.sort();
+    dirs.dedup();
+    dirs
+}
+
 fn outer_caps_grant_write(caps: &CapabilitySet, path: &Path) -> bool {
     caps.fs_capabilities().iter().any(|cap| {
         cap.access.contains(AccessMode::Write)
@@ -2983,7 +3050,11 @@ fn add_outer_exec_file_with_deps(
     Ok(())
 }
 
-fn apply_outer_exec_gate(paths: &[PathBuf], abi: nono::DetectedAbi) -> Result<()> {
+fn apply_outer_exec_gate(
+    paths: &[PathBuf],
+    writable_dirs: &[PathBuf],
+    abi: nono::DetectedAbi,
+) -> Result<()> {
     if !abi.has_execute() {
         return Err(NonoError::SandboxInit(format!(
             "tool-sandbox outer exec gate requires Landlock ABI V3+; detected {}",
@@ -3020,6 +3091,24 @@ fn apply_outer_exec_gate(paths: &[PathBuf], abi: nono::DetectedAbi) -> Result<()
                 NonoError::SandboxInit(format!(
                     "tool-sandbox outer exec gate add_rule for {}: {err}",
                     path.display()
+                ))
+            })?;
+    }
+
+    // Subtree grant: files written into these dirs after setup must still run.
+    for dir in writable_dirs {
+        let fd = PathFd::new(dir).map_err(|err| {
+            NonoError::SandboxInit(format!(
+                "tool-sandbox outer exec gate cannot open {}: {err}",
+                dir.display()
+            ))
+        })?;
+        ruleset = ruleset
+            .add_rule(PathBeneath::new(fd, AccessFs::Execute))
+            .map_err(|err| {
+                NonoError::SandboxInit(format!(
+                    "tool-sandbox outer exec gate add_rule for {}: {err}",
+                    dir.display()
                 ))
             })?;
     }
@@ -3164,15 +3253,17 @@ fn build_child_launch_spec(
         .ok_or_else(|| {
             NonoError::SandboxInit(format!("missing resolved binary for {}", request.command))
         })?;
-    build_child_launch_spec_for_binary(state, request, policy, binary, &[])
+    build_child_launch_spec_for_binary(state, request, policy, binary, &[], true)
 }
 
 /// Build a child launch spec that runs `binary` (the command's real binary OR
 /// an `exec` intercept helper) inside the matched command's sandbox (`policy`).
 /// `extra_args` are inserted between argv[0] and the forwarded original args —
-/// used by the `exec` action for the helper's fixed leading args. The fs-read
-/// cap, Landlock execute allowlist (binary + its ELF/interpreter closure),
-/// runtime baseline, and identity expectations are all bound to `binary`, while
+/// used by the `exec` action for the helper's fixed leading args.
+/// `preserve_caller_argv0` is true for the command's own binary, false for
+/// `exec` helpers. The fs-read cap, Landlock execute
+/// allowlist (binary + its ELF/interpreter closure), runtime baseline, and
+/// identity expectations are all bound to `binary`, while
 /// network/credentials/proxy/fs/env come from `policy`.
 fn build_child_launch_spec_for_binary(
     state: &ToolSandboxState,
@@ -3180,6 +3271,7 @@ fn build_child_launch_spec_for_binary(
     policy: &CommandSandboxConfig,
     binary: &ResolvedCommandBinary,
     extra_args: &[Vec<u8>],
+    preserve_caller_argv0: bool,
 ) -> Result<ToolSandboxChildLaunchSpec> {
     let start_vbi = std::time::Instant::now();
     verify_binary_identity(binary)?;
@@ -3242,6 +3334,25 @@ fn build_child_launch_spec_for_binary(
                 allowed_exec_paths.push(dep.as_os_str().as_bytes().to_vec());
             }
         }
+        // `env` re-exec's `<interp>`, so grant it and its ELF closure too.
+        if let Some(real_interp) =
+            env_shebang_target_interpreter(interp, &binary.shape.interpreter_args)
+        {
+            debug!(
+                "env-shebang: granting re-exec target {} (interp {}, args {:?})",
+                real_interp.display(),
+                interp.display(),
+                binary.shape.interpreter_args
+            );
+            allowed_exec_paths.push(real_interp.as_os_str().as_bytes().to_vec());
+            if let Ok(canonical_real) = real_interp.canonicalize()
+                && let Some(closure) = state.baseline_cache.closures.get(&canonical_real)
+            {
+                for dep in closure {
+                    allowed_exec_paths.push(dep.as_os_str().as_bytes().to_vec());
+                }
+            }
+        }
     }
     for shim in state.shims_by_command.values() {
         allowed_exec_paths.push(shim.path.as_os_str().as_bytes().to_vec());
@@ -3279,7 +3390,13 @@ fn build_child_launch_spec_for_binary(
             .as_ref()
             .map(|path| path.as_os_str().as_bytes().to_vec()),
         interpreter_args: binary.shape.interpreter_args.clone(),
-        argv: effective_argv_for_binary(binary, request, policy, extra_args)?,
+        argv: effective_argv_for_binary(
+            binary,
+            request,
+            policy,
+            extra_args,
+            preserve_caller_argv0,
+        )?,
         env,
         cwd: cwd.as_os_str().as_bytes().to_vec(),
         stdio_mode: selected_stdio_mode(request).to_string(),
@@ -3396,7 +3513,17 @@ fn add_executable_shape_baseline(
                 source,
             })?;
     caps.add_fs(FsCapability::new_file(&interpreter, AccessMode::Read)?);
-    add_runtime_baseline(caps, &state.baseline_cache, &interpreter)
+    add_runtime_baseline(caps, &state.baseline_cache, &interpreter)?;
+    // Landlock intersects the filesystem and execute layers, so the re-exec'd
+    // `<interp>` (and its ELF closure) must be present in the fs layer too.
+    if let Some(real_interp) =
+        env_shebang_target_interpreter(&interpreter, &binary.shape.interpreter_args)
+        && let Ok(canonical_real) = real_interp.canonicalize()
+    {
+        caps.add_fs(FsCapability::new_file(&canonical_real, AccessMode::Read)?);
+        add_runtime_baseline(caps, &state.baseline_cache, &canonical_real)?;
+    }
+    Ok(())
 }
 
 fn add_chaining_control_caps(caps: &mut CapabilitySet, state: &ToolSandboxState) -> Result<()> {
@@ -3699,6 +3826,18 @@ fn build_baseline_cache<'a>(
             if !closures.contains_key(&canonical) {
                 closures.insert(canonical.clone(), elf_dependency_closure(&canonical)?);
             }
+            // Cache the re-exec'd `<interp>`'s closure so the exec allowlist can
+            // grant it.
+            if let Some(real_interp) =
+                env_shebang_target_interpreter(interpreter, &binary.shape.interpreter_args)
+                && let Ok(canonical_real) = real_interp.canonicalize()
+                && !closures.contains_key(&canonical_real)
+            {
+                closures.insert(
+                    canonical_real.clone(),
+                    elf_dependency_closure(&canonical_real)?,
+                );
+            }
         }
     }
 
@@ -3860,6 +3999,30 @@ fn filter_child_env(
     Ok(env)
 }
 
+/// Make the child self-attach to its command's cgroup pre-exec, so every descendant
+/// (including a daemon reparented to pid 1) carries the marker. No-op when disabled.
+fn install_lineage_attach(
+    state: &ToolSandboxState,
+    command_name: &str,
+    command: &mut Command,
+) -> Result<()> {
+    let Some(procs_fd) = state.lineage.command_procs_fd(command_name)? else {
+        return Ok(());
+    };
+    // SAFETY: runs post-fork/pre-exec, so must be async-signal-safe; child_self_attach
+    // is (getpid + itoa + write) and _exit(126)s on failure (fail closed). procs_fd is
+    // O_CLOEXEC so it never reaches the sandboxed program.
+    unsafe {
+        command.pre_exec(move || {
+            if !crate::resource_cgroup::child_self_attach(procs_fd.as_raw_fd()) {
+                libc::_exit(126);
+            }
+            Ok(())
+        });
+    }
+    Ok(())
+}
+
 fn launch_child(
     state: &ToolSandboxState,
     command_name: &str,
@@ -3918,6 +4081,7 @@ fn launch_child_with_direct_fds(
         .stdin(Stdio::from(File::from(stdio.stdin)))
         .stdout(Stdio::from(File::from(stdio.stdout)))
         .stderr(Stdio::from(File::from(stdio.stderr)));
+    install_lineage_attach(state, command_name, &mut command)?;
     let mut child = command.spawn().map_err(NonoError::CommandExecution)?;
     drop(command);
     let exit_code = wait_for_tracked_child(state, command_name, launch_caller, &mut child)?;
@@ -3952,6 +4116,7 @@ fn launch_child_with_brokered_stdio(
         .stdin(Stdio::from(File::from(stdin)))
         .stdout(Stdio::from(File::from(stdout_write)))
         .stderr(Stdio::from(File::from(stderr_write)));
+    install_lineage_attach(state, command_name, &mut command)?;
 
     let mut child = command.spawn().map_err(NonoError::CommandExecution)?;
     drop(command);
@@ -4176,10 +4341,10 @@ fn normalize_captured_credential(mut output: Vec<u8>) -> Vec<u8> {
     output
 }
 
+/// No appended newline: a caller that captures raw stdout and reuses it
+/// verbatim (e.g. in an HTTP header) would otherwise get a corrupted value.
 fn nonce_stdout(nonce: String) -> Vec<u8> {
-    let mut output = nonce.into_bytes();
-    output.push(b'\n');
-    output
+    nonce.into_bytes()
 }
 
 fn launch_child_with_capture(
@@ -4211,6 +4376,7 @@ fn launch_child_with_capture(
         .stderr(Stdio::from(File::from(stdio.stderr)));
     // stdio.stdout is not used for capture; drop it so the fd is closed.
     drop(stdio.stdout);
+    install_lineage_attach(state, command_name, &mut command)?;
 
     let mut child = command.spawn().map_err(NonoError::CommandExecution)?;
     drop(command);
@@ -4268,6 +4434,7 @@ fn launch_child_with_pty(
         .stdin(Stdio::from(File::from(stdin_slave)))
         .stdout(Stdio::from(File::from(stdout_slave)))
         .stderr(Stdio::from(File::from(stderr_slave)));
+    install_lineage_attach(state, command_name, &mut command)?;
     let mut child = command.spawn().map_err(NonoError::CommandExecution)?;
     drop(command);
     drop(pty.slave);
@@ -4666,6 +4833,7 @@ fn caps_to_spec(caps: &CapabilitySet) -> ChildCapsSpec {
             NetworkMode::ProxyOnly { bind_ports, .. } => bind_ports.clone(),
             _ => Vec::new(),
         },
+        proxy_bind_port_ranges: caps.localhost_port_ranges().to_vec(),
         tcp_connect_ports: caps.tcp_connect_ports().to_vec(),
         tcp_bind_ports: caps.tcp_bind_ports().to_vec(),
     }
@@ -4680,6 +4848,9 @@ fn caps_from_spec(spec: &ChildCapsSpec) -> Result<CapabilitySet> {
         });
     } else if spec.network_blocked {
         caps.set_network_mode_mut(NetworkMode::Blocked);
+    }
+    for &(start, end) in &spec.proxy_bind_port_ranges {
+        caps.add_localhost_port_range(start, end)?;
     }
     for fs_grant in &spec.fs {
         caps.add_fs(fs_cap_from_spec(fs_grant)?);
@@ -5206,6 +5377,7 @@ fn le_u64(data: &[u8], offset: usize) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::command_policy::{
         CommandEnvironmentConfig, CommandPolicyConfig, CommandSandboxConfig, InterceptActionConfig,
         InterceptRuleConfig, ResolvedCommandBinaries, ResolvedCommandBinary,
@@ -5329,6 +5501,45 @@ mod tests {
         })
     }
 
+    #[test]
+    fn verify_binary_identity_accepts_unchanged_binary() -> Result<()> {
+        let dir = test_tempdir()?;
+        let path = dir.path().join("multitool");
+        fs::write(&path, b"#!/bin/sh\nbasename \"$0\"\n").map_err(|source| {
+            NonoError::ConfigWrite {
+                path: path.clone(),
+                source,
+            }
+        })?;
+        let binary = test_binary("multitool", &path)?;
+        verify_binary_identity(&binary)?;
+        Ok(())
+    }
+
+    #[test]
+    fn verify_binary_identity_rejects_swapped_binary() -> Result<()> {
+        // Preserving argv[0] must not weaken the anti-swap guard.
+        let dir = test_tempdir()?;
+        let path = dir.path().join("multitool");
+        fs::write(&path, b"original").map_err(|source| NonoError::ConfigWrite {
+            path: path.clone(),
+            source,
+        })?;
+        let binary = test_binary("multitool", &path)?;
+
+        // swap the on-disk file (changes size + mtime)
+        fs::write(&path, b"swapped-larger-content").map_err(|source| NonoError::ConfigWrite {
+            path: path.clone(),
+            source,
+        })?;
+
+        assert!(
+            verify_binary_identity(&binary).is_err(),
+            "verify_binary_identity must reject a binary changed after resolution"
+        );
+        Ok(())
+    }
+
     fn symlink_path(target: &Path, link: &Path) -> Result<()> {
         std::os::unix::fs::symlink(target, link).map_err(|source| NonoError::ConfigWrite {
             path: link.to_path_buf(),
@@ -5365,6 +5576,7 @@ mod tests {
                 deny_only: BTreeMap::new(),
                 allowed_direct_bypasses: Vec::new(),
                 allowed_direct_bypass_ids: HashSet::new(),
+                outer_exec_writable_dirs: Vec::new(),
             },
             shims_by_command: BTreeMap::from([("git".to_string(), shim.clone())]),
             credential_handles: BTreeMap::new(),
@@ -5376,6 +5588,7 @@ mod tests {
             },
             proxy_trust_bundle_paths: Vec::new(),
             active_children: Mutex::new(HashMap::new()),
+            lineage: LineageMarker::disabled_for_test(),
             active_count: AtomicUsize::new(0),
             queued_requests: AtomicUsize::new(0),
             emitted_error_response: AtomicBool::new(false),
@@ -5457,6 +5670,50 @@ mod tests {
         let caller = resolve_caller(pid, pid, &state, "git")?;
 
         assert!(matches!(caller, Caller::Command { command, .. } if command == "git"));
+        Ok(())
+    }
+
+    fn test_state_for_membership(socket_path: PathBuf) -> ToolSandboxState {
+        let runtime_dir = PathBuf::from("/tmp/nono-tool-sandbox-test");
+        test_state_with_chaining_paths(
+            runtime_dir.clone(),
+            socket_path,
+            runtime_dir.join("shims"),
+            ShimIdentity {
+                path: runtime_dir.join("shims/git"),
+                id: FileId { dev: 1, ino: 1 },
+            },
+        )
+    }
+
+    // Peer pid 1 with an unrelated root: the walk ends before the root (as after a
+    // daemonized reparent), forcing the severed-ancestry fallback.
+    const DAEMONIZED_PEER: u32 = 1;
+    const UNRELATED_ROOT: u32 = 2;
+
+    #[test]
+    fn resolve_caller_attributes_daemonized_caller_to_its_command() -> Result<()> {
+        let state =
+            test_state_for_membership(PathBuf::from("/tmp/nono-tool-sandbox-test/supervisor.sock"));
+        // Marker resolves the severed caller to its command, never the session.
+        let caller = resolve_caller_with(DAEMONIZED_PEER, UNRELATED_ROOT, &state, "git", |_| {
+            Some(Caller::Command {
+                command: "tmux".to_string(),
+                pid: DAEMONIZED_PEER,
+            })
+        })?;
+
+        assert!(matches!(caller, Caller::Command { command, .. } if command == "tmux"));
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_caller_blocks_daemonized_caller_the_marker_cannot_attribute() -> Result<()> {
+        let state =
+            test_state_for_membership(PathBuf::from("/tmp/nono-tool-sandbox-test/supervisor.sock"));
+        // Marker cannot attribute: fail closed rather than fall back to the session.
+        let denied = resolve_caller_with(DAEMONIZED_PEER, UNRELATED_ROOT, &state, "git", |_| None);
+        assert!(matches!(denied, Err(NonoError::SandboxInit(_))));
         Ok(())
     }
 
@@ -5819,6 +6076,7 @@ mod tests {
             network_blocked: false,
             proxy_port: None,
             proxy_bind_ports: Vec::new(),
+            proxy_bind_port_ranges: Vec::new(),
             tcp_connect_ports: Vec::new(),
             tcp_bind_ports: Vec::new(),
         };
@@ -5919,5 +6177,12 @@ mod tests {
         let result = apply_environment_set_vars(&mut env, &policy);
         assert!(result.is_ok());
         assert!(env.iter().any(|e| e == b"MY_APP_CONFIG=value"));
+    }
+
+    #[test]
+    fn nonce_stdout_appends_no_trailing_newline() {
+        let phantom = format!("nono_{}", "a".repeat(64));
+        let stdout = nonce_stdout(phantom.clone());
+        assert_eq!(stdout, phantom.into_bytes());
     }
 }

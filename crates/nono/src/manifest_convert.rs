@@ -4,6 +4,8 @@
 //! enforcement types. `CapabilitySet` is constructed by mapping each manifest
 //! domain (filesystem, network, process) to the corresponding builder calls.
 
+#[cfg(target_os = "macos")]
+use crate::capability::merge_port_ranges;
 use crate::capability::{
     AccessMode as InternalAccessMode, CapabilitySet, IpcMode as InternalIpcMode,
     NetworkMode as InternalNetworkMode, ProcessInfoMode as InternalProcessInfoMode,
@@ -73,6 +75,44 @@ impl TryFrom<&CapabilityManifest> for CapabilitySet {
                     })?;
                     caps = caps.allow_localhost_port(p);
                 }
+                let mut raw_ranges: Vec<(u16, u16)> = Vec::new();
+                for &[start, end] in &ports.localhost_range {
+                    let start_u = start.get();
+                    let end_u = end.get();
+                    let (start, end) = match (u16::try_from(start_u), u16::try_from(end_u)) {
+                        (Ok(s), Ok(e)) => (s, e),
+                        _ => {
+                            return Err(NonoError::ConfigParse(format!(
+                                "localhost_range entry [{start_u}, {end_u}] is invalid: ports must be in 1–65535"
+                            )));
+                        }
+                    };
+                    if start > end {
+                        return Err(NonoError::ConfigParse(format!(
+                            "localhost_range entry [{start}, {end}] is invalid: start must be <= end"
+                        )));
+                    }
+                    raw_ranges.push((start, end));
+                }
+                #[cfg(target_os = "macos")]
+                {
+                    let merged = merge_port_ranges(&raw_ranges);
+                    let total: u32 = merged
+                        .iter()
+                        .map(|&(s, e)| (e as u32).saturating_sub(s as u32).saturating_add(1))
+                        .fold(0u32, |acc, n| acc.saturating_add(n));
+                    if total > crate::capability::MACOS_PORT_RANGE_LIMIT {
+                        return Err(NonoError::ConfigParse(format!(
+                            "localhost_range entries expand to {} unique ports, which exceeds the macOS limit of {} \
+                             (sandbox_init crashes above ~17,770 rules); use smaller or fewer ranges",
+                            total,
+                            crate::capability::MACOS_PORT_RANGE_LIMIT
+                        )));
+                    }
+                }
+                for (start, end) in raw_ranges {
+                    caps = caps.allow_localhost_port_range(start, end)?;
+                }
             }
         }
 
@@ -102,6 +142,7 @@ impl TryFrom<&CapabilityManifest> for CapabilitySet {
 fn convert_resources(res: &Resources) -> ResourceLimits {
     ResourceLimits {
         memory_bytes: res.memory_bytes.map(|n| n.get()),
+        max_processes: res.max_processes.map(|n| n.get()),
     }
 }
 
@@ -160,6 +201,49 @@ mod tests {
         let manifest = CapabilityManifest::from_json(json).unwrap();
         let caps = CapabilitySet::try_from(&manifest).unwrap();
         assert!(caps.resource_limits().is_none());
+    }
+
+    #[test]
+    fn manifest_max_processes_maps_into_capability_set() {
+        // The process-count ceiling flows the same path as memory: schema
+        // (NonZeroU64) -> convert_resources -> ResourceLimits.max_processes.
+        let json = r#"{
+            "version": "0.1.0",
+            "process": { "exec_strategy": "supervised" },
+            "resources": { "max_processes": 64 }
+        }"#;
+        let manifest = CapabilityManifest::from_json(json).unwrap();
+        let caps = CapabilitySet::try_from(&manifest).unwrap();
+        let limits = caps.resource_limits().expect("limits present");
+        assert_eq!(limits.max_processes, Some(64));
+        // A process-only manifest leaves memory unset.
+        assert_eq!(limits.memory_bytes, None);
+    }
+
+    #[test]
+    fn manifest_both_ceilings_map_together() {
+        let json = r#"{
+            "version": "0.1.0",
+            "process": { "exec_strategy": "supervised" },
+            "resources": { "memory_bytes": 1048576, "max_processes": 32 }
+        }"#;
+        let manifest = CapabilityManifest::from_json(json).unwrap();
+        let caps = CapabilitySet::try_from(&manifest).unwrap();
+        let limits = caps.resource_limits().expect("limits present");
+        assert_eq!(limits.memory_bytes, Some(1048576));
+        assert_eq!(limits.max_processes, Some(32));
+    }
+
+    #[test]
+    fn try_from_rejects_unsupervised_max_processes() {
+        // Mirror of try_from_runs_validate_and_rejects_unsupervised_memory for the
+        // process-count ceiling: it too is enforced by the supervising parent, so an
+        // unsupervised manifest must be rejected rather than build an unenforceable set.
+        let json = r#"{ "version": "0.1.0", "resources": { "max_processes": 8 } }"#;
+        let manifest = CapabilityManifest::from_json(json).unwrap();
+        let err = CapabilitySet::try_from(&manifest)
+            .expect_err("unsupervised max_processes limit must be rejected by TryFrom");
+        assert!(matches!(err, NonoError::ConfigParse(_)), "got {err:?}");
     }
 
     // ---- TryFrom enforces validate(); empty resources maps clean ----

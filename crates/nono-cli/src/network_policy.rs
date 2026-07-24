@@ -270,6 +270,7 @@ pub fn resolve_credentials(
                     .transpose()?,
                 oauth2,
                 aws_auth: cred.aws_auth.clone(),
+                spiffe: cred.spiffe.clone(),
             });
         } else if let Some(cred) = policy.credentials.get(name) {
             // Validate env_var against dangerous variable blocklist
@@ -303,6 +304,7 @@ pub fn resolve_credentials(
                 tls_client_key: None,
                 oauth2: None,
                 aws_auth: None,
+                spiffe: None,
             });
         }
         // We already validated existence above, so this else branch won't be hit
@@ -463,6 +465,7 @@ pub fn partition_allow_domain(
                         tls_client_key: None,
                         oauth2: None,
                         aws_auth: None,
+                        spiffe: None,
                     });
                 }
             }
@@ -618,6 +621,7 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 aws_auth: None,
+                spiffe: None,
             },
         );
 
@@ -660,6 +664,7 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 aws_auth: None,
+                spiffe: None,
             },
         );
 
@@ -698,6 +703,7 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 aws_auth: None,
+                spiffe: None,
             },
         );
 
@@ -746,6 +752,7 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 aws_auth: None,
+                spiffe: None,
             },
         );
 
@@ -834,6 +841,7 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 aws_auth: None,
+                spiffe: None,
             },
         );
 
@@ -869,6 +877,7 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 aws_auth: None,
+                spiffe: None,
             },
         );
 
@@ -904,6 +913,7 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 aws_auth: None,
+                spiffe: None,
             },
         );
 
@@ -944,6 +954,7 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 aws_auth: None,
+                spiffe: None,
             },
         );
 
@@ -1078,6 +1089,7 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 aws_auth: None,
+                spiffe: None,
             },
         );
 
@@ -1153,6 +1165,8 @@ mod tests {
                     client_id: "my-client".to_string(),
                     client_secret: "env://CLIENT_SECRET".to_string(),
                     scope: "api.read".to_string(),
+                    client_assertion: None,
+                    extra_params: Default::default(),
                 }),
                 inject_mode: InjectMode::Header,
                 inject_header: "Authorization".to_string(),
@@ -1168,6 +1182,7 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 aws_auth: None,
+                spiffe: None,
             },
         );
 
@@ -1218,6 +1233,7 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 aws_auth: None,
+                spiffe: None,
             },
         );
 
@@ -1374,6 +1390,7 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 aws_auth: None,
+                spiffe: None,
             },
         );
 
@@ -1415,6 +1432,7 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 aws_auth: None,
+                spiffe: None,
             },
         );
         custom.insert(
@@ -1437,6 +1455,7 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 aws_auth: None,
+                spiffe: None,
             },
         );
 

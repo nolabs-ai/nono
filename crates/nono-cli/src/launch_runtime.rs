@@ -163,6 +163,9 @@ pub(crate) struct ProxyLaunchOptions {
     pub(crate) credential_routes: Vec<profile::CredentialRouteDef>,
     /// Enable HTTP/2 negotiation for upstream connections.
     pub(crate) enable_h2: bool,
+    /// Profile-declared client-side proxy bypass entries for generated
+    /// NO_PROXY/no_proxy.
+    pub(crate) no_proxy: Vec<String>,
 }
 
 impl ProxyLaunchOptions {

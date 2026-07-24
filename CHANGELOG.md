@@ -1,5 +1,120 @@
 # Changelog
 
+## [0.69.0] - 2026-07-20
+
+### Bug Fixes
+
+- *(proxy)* Don't cross-deny sibling routes sharing an upstream (#1437) ([#1437](https://github.com/nolabs-ai/nono/pull/1437))
+
+- *(tool-sandbox)* Attribute daemonized callers to their command (cgroup on linux, verified daemon-pid on macos) (#1417) ([#1417](https://github.com/nolabs-ai/nono/pull/1417))
+
+- *(exec)* Raise MAX_CRYPTO_THREADS to 12 for macOS libdispatch workqueue threads (#1424) ([#1424](https://github.com/nolabs-ai/nono/pull/1424))
+
+- *(sandbox)* Allow exec in writable grant-dirs under command policies (#1391) ([#1391](https://github.com/nolabs-ai/nono/pull/1391))
+
+
+### Documentation
+
+- *(profiles)* Fix codeblock (#1426) ([#1426](https://github.com/nolabs-ai/nono/pull/1426))
+
+
+### Features
+
+- Add profile-declared no_proxy bypass support (#1415) ([#1415](https://github.com/nolabs-ai/nono/pull/1415))
+
+- *(proxy)* Add SPIFFE/SPIRE workload identity auth for upstream routes (#1272) ([#1272](https://github.com/nolabs-ai/nono/pull/1272))
+
+
+### Bug
+
+- Fix SigV4 URI generation errors for uri's that have encoded characters in them (#1430) ([#1430](https://github.com/nolabs-ai/nono/pull/1430))
+
+## [0.68.0] - 2026-07-14
+
+### Bug Fixes
+
+- *(tool-sandbox)* Preserve argv[0] for symlink-dispatched commands (#1413) ([#1413](https://github.com/nolabs-ai/nono/pull/1413))
+
+- *(sandbox)* Keep orphaned descendants in supervisor ancestry for seccomp-notify mediation (#1401) ([#1401](https://github.com/nolabs-ai/nono/pull/1401))
+
+- *(profile)* Omit inheritable Option fields when None on save (#1400) (#1402) ([#1402](https://github.com/nolabs-ai/nono/pull/1402))
+
+- *(sandbox)* Grant Refer in execute-restriction layer on Linux (#1397) ([#1397](https://github.com/nolabs-ai/nono/pull/1397))
+
+- Missing ~/.cache on macOS (#1378) ([#1378](https://github.com/nolabs-ai/nono/pull/1378))
+
+- *(tool-sandbox)* Grant env-shebang scripts their re-exec interpreter (#1394) ([#1394](https://github.com/nolabs-ai/nono/pull/1394))
+
+- *(registry)* Add X-Nono-Pull-Reason header to distinguish pull triggers (#1383) (#1386) ([#1386](https://github.com/nolabs-ai/nono/pull/1386))
+
+- *(profile)* Preserve platform_overrides through extends resolution (#1380) ([#1380](https://github.com/nolabs-ai/nono/pull/1380))
+
+- *(command-policy)* Resolve command_policies binaries once, in parallel, with caching (#1373) ([#1373](https://github.com/nolabs-ai/nono/pull/1373))
+
+- *(why)* Respect proxy domain filter in --profile and --self host queries (#1372) ([#1372](https://github.com/nolabs-ai/nono/pull/1372))
+
+- *(proxy)* Skip credential_capture entries with missing helper binaries (#1368) ([#1368](https://github.com/nolabs-ai/nono/pull/1368))
+
+
+### Dependencies
+
+- *(deps)* Bump sigstore-trust-root from 0.9.0 to 0.11.0 (#1410) ([#1410](https://github.com/nolabs-ai/nono/pull/1410))
+
+- *(deps)* Bump bytes from 1.12.0 to 1.12.1 (#1408) ([#1408](https://github.com/nolabs-ai/nono/pull/1408))
+
+- *(deps)* Bump regex from 1.12.4 to 1.13.0 (#1406) ([#1406](https://github.com/nolabs-ai/nono/pull/1406))
+
+- *(deps)* Bump sigstore-sign from 0.10.0 to 0.11.0 (#1407) ([#1407](https://github.com/nolabs-ai/nono/pull/1407))
+
+- *(deps)* Bump crossbeam-epoch from 0.9.18 to 0.9.20 (#1369) ([#1369](https://github.com/nolabs-ai/nono/pull/1369))
+
+- *(deps)* Bump clap_complete from 4.6.5 to 4.6.7 (#1360) ([#1360](https://github.com/nolabs-ai/nono/pull/1360))
+
+- *(deps)* Bump ignore from 0.4.26 to 0.4.27 (#1363) ([#1363](https://github.com/nolabs-ai/nono/pull/1363))
+
+- *(deps)* Bump time from 0.3.52 to 0.3.53 (#1358) ([#1358](https://github.com/nolabs-ai/nono/pull/1358))
+
+- *(deps)* Bump rand from 0.10.1 to 0.10.2 (#1362) ([#1362](https://github.com/nolabs-ai/nono/pull/1362))
+
+- *(deps)* Bump sigstore-sign from 0.8.0 to 0.10.0 (#1361) ([#1361](https://github.com/nolabs-ai/nono/pull/1361))
+
+- *(deps)* Bump docker/setup-buildx-action from 4.1.0 to 4.2.0 (#1359) ([#1359](https://github.com/nolabs-ai/nono/pull/1359))
+
+- *(deps)* Bump docker/login-action from 4.2.0 to 4.4.0 (#1357) ([#1357](https://github.com/nolabs-ai/nono/pull/1357))
+
+- *(deps)* Bump nolabs-ai/agent-sign from 0.0.11 to 0.1.0 (#1355) ([#1355](https://github.com/nolabs-ai/nono/pull/1355))
+
+- *(deps)* Bump docker/setup-qemu-action from 4.1.0 to 4.2.0 (#1354) ([#1354](https://github.com/nolabs-ai/nono/pull/1354))
+
+- *(deps)* Bump docker/build-push-action from 7.2.0 to 7.3.0 (#1356) ([#1356](https://github.com/nolabs-ai/nono/pull/1356))
+
+
+### Documentation
+
+- *(codex)* Clarify codex docs around the optional login-shell hardening (#1381) ([#1381](https://github.com/nolabs-ai/nono/pull/1381))
+
+
+### Features
+
+- *(resources)* Cap sandbox process count with --max-processes (cgroup v2 pids.max) (#1403) ([#1403](https://github.com/nolabs-ai/nono/pull/1403))
+
+- Add port range support to sandbox profiles (#1398) ([#1398](https://github.com/nolabs-ai/nono/pull/1398))
+
+- *(policy)* Add bun runtime preset (#1305) ([#1305](https://github.com/nolabs-ai/nono/pull/1305))
+
+- *(proxy)* Support plain HTTP forward-proxying via HTTP_PROXY (#1335) ([#1335](https://github.com/nolabs-ai/nono/pull/1335))
+
+- *(tool-sandbox)* Add per-command exec_paths for multi-call binaries (#1384) ([#1384](https://github.com/nolabs-ai/nono/pull/1384))
+
+- *(proxy)* Add deny_domain to block domains through the proxy (#1374) ([#1374](https://github.com/nolabs-ai/nono/pull/1374))
+
+- *(profile)* Add platform_overrides field for per-OS profile patches (#1371) ([#1371](https://github.com/nolabs-ai/nono/pull/1371))
+
+
+### Miscellaneous
+
+- Migrate registry namespace references from always-further to nolabs-ai (#1405) ([#1405](https://github.com/nolabs-ai/nono/pull/1405))
+
 ## [0.67.1] - 2026-07-06
 
 ### Bug Fixes

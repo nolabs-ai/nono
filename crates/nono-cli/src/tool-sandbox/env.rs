@@ -116,25 +116,12 @@ pub(crate) fn apply_environment_set_vars(
     Ok(())
 }
 
-/// Apply the caller's `export_env` list: copy the matching variables verbatim
-/// from the intercepted command's immediate-parent env (`request.env`) into the
-/// child, bypassing both `allow_vars` filtering and the `is_dangerous_env_var`
-/// blocklist.
-///
-/// `export_patterns` is the export list of the command's *resolved caller* (the
-/// caller command's `export_env`, or the top-level `session_export_env` when the
-/// caller is the session), not the callee's own config. This is the
-/// caller-declares model: the caller decides which of its own live variables
-/// flow down to the commands it invokes.
-///
-/// Patterns support exact names, trailing-`*` prefixes, and a bare `*` (all),
-/// via [`matches_env_var_patterns`]. `PATH` and any `NONO_*` key are always
-/// excluded — nono manages those — even under `*`. Each matching variable
-/// replaces any existing entry of the same name in `env`.
-///
-/// Values are taken verbatim and are NOT run through the credential broker:
-/// `export_env` is for interpreter/tooling variables, not nonce-bearing
-/// credentials (those flow through `use_credentials`/`allow_vars`).
+/// Copies `export_patterns`-matching vars from the caller's live env
+/// (`request.env`) into `env` verbatim, bypassing `allow_vars` and the
+/// dangerous-var blocklist — the caller-declares model, where the caller
+/// opts its own variables into a callee rather than the callee pulling from
+/// the broker. `PATH`/`NONO_*` and secrets are always excluded; loader vars
+/// need an exact-name pattern.
 pub(crate) fn apply_export_env(
     env: &mut Vec<Vec<u8>>,
     request: &ToolSandboxShimRequest,
@@ -156,6 +143,14 @@ pub(crate) fn apply_export_env(
             continue;
         }
         if !crate::exec_strategy::matches_env_var_patterns(key_str, export_patterns) {
+            continue;
+        }
+        if crate::exec_strategy::env_sanitization::is_forbidden_secret_env_var(key_str) {
+            continue;
+        }
+        if crate::exec_strategy::env_sanitization::is_loader_injection_env_var(key_str)
+            && !export_patterns.iter().any(|pattern| pattern == key_str)
+        {
             continue;
         }
         let mut prefix = key.to_vec();
@@ -655,6 +650,40 @@ mod tests {
         apply_export_env(&mut env, &request, &patterns(&["*"]));
         let out = rendered(&env);
         assert_eq!(out, vec!["NODE_OPTIONS=--require x".to_string()]);
+    }
+
+    #[test]
+    fn export_env_never_forwards_1password_secrets() {
+        let request = request_with(
+            &["OP_SERVICE_ACCOUNT_TOKEN=ops_x", "OP_SESSION_my=y"],
+            "/work",
+        );
+        let mut env: Vec<Vec<u8>> = Vec::new();
+        apply_export_env(
+            &mut env,
+            &request,
+            &patterns(&["OP_SERVICE_ACCOUNT_TOKEN", "OP_SESSION_my", "*"]),
+        );
+        assert!(env.is_empty());
+    }
+
+    #[test]
+    fn export_env_star_does_not_forward_loader_vars() {
+        let request = request_with(
+            &["LD_PRELOAD=/evil.so", "DYLD_INSERT_LIBRARIES=/evil.dylib"],
+            "/work",
+        );
+        let mut env: Vec<Vec<u8>> = Vec::new();
+        apply_export_env(&mut env, &request, &patterns(&["*", "LD_*", "DYLD_*"]));
+        assert!(env.is_empty());
+    }
+
+    #[test]
+    fn export_env_exact_name_pattern_forwards_loader_var() {
+        let request = request_with(&["LD_PRELOAD=/trusted.so"], "/work");
+        let mut env: Vec<Vec<u8>> = Vec::new();
+        apply_export_env(&mut env, &request, &patterns(&["LD_PRELOAD"]));
+        assert_eq!(rendered(&env), vec!["LD_PRELOAD=/trusted.so".to_string()]);
     }
 
     #[test]

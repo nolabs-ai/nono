@@ -1545,7 +1545,7 @@ fn handle_shim_stream_inner(
     let intercept = match command_config {
         Some(cc) => {
             match super::resolve_intercept_action(cc, &request.argv, || {
-                filter_child_env(state, &request, policy)
+                filter_child_env(state, &request, policy, &caller)
             }) {
                 Ok(intercept) => intercept,
                 Err(err) => {

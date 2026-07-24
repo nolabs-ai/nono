@@ -78,6 +78,37 @@ pub struct FsCapState {
     /// Capability source for diagnostics (`user`, `profile`, `group:<name>`, `system`)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    /// Device number of the resolved path at sandbox start (Linux file grants
+    /// only). Landlock rules bind to the inode that was open at ruleset build
+    /// time, not to the path, so a file replaced via write-temp-then-rename
+    /// carries no rule even though the grant still names it. `nono why`
+    /// compares this against a fresh stat to surface such stale grants.
+    /// Absent in states written by older builds and on non-Linux platforms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dev: Option<u64>,
+    /// Inode number of the resolved path at sandbox start (see `dev`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ino: Option<u64>,
+}
+
+/// Stat the resolved path of a file-level grant so its identity at sandbox
+/// start can be recorded, as a `(dev, ino)` pair — one is meaningless
+/// without the other. Landlock is the only backend that binds rules to
+/// inodes (macOS Seatbelt rules are path-based), so this is Linux-only.
+#[cfg(target_os = "linux")]
+fn grant_time_inode(cap: &nono::FsCapability) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    if !cap.is_file {
+        return None;
+    }
+    std::fs::metadata(&cap.resolved)
+        .ok()
+        .map(|md| (md.dev(), md.ino()))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn grant_time_inode(_cap: &nono::FsCapability) -> Option<(u64, u64)> {
+    None
 }
 
 impl SandboxState {
@@ -92,16 +123,21 @@ impl SandboxState {
             fs: caps
                 .fs_capabilities()
                 .iter()
-                .map(|c| FsCapState {
-                    original: c.original.display().to_string(),
-                    path: c.resolved.display().to_string(),
-                    access: match c.access {
-                        AccessMode::Read => "read".to_string(),
-                        AccessMode::Write => "write".to_string(),
-                        AccessMode::ReadWrite => "readwrite".to_string(),
-                    },
-                    is_file: c.is_file,
-                    source: Some(c.source.to_string()),
+                .map(|c| {
+                    let inode = grant_time_inode(c);
+                    FsCapState {
+                        original: c.original.display().to_string(),
+                        path: c.resolved.display().to_string(),
+                        access: match c.access {
+                            AccessMode::Read => "read".to_string(),
+                            AccessMode::Write => "write".to_string(),
+                            AccessMode::ReadWrite => "readwrite".to_string(),
+                        },
+                        is_file: c.is_file,
+                        source: Some(c.source.to_string()),
+                        dev: inode.map(|(dev, _)| dev),
+                        ino: inode.map(|(_, ino)| ino),
+                    }
                 })
                 .collect(),
             net_blocked: caps.is_network_blocked(),
@@ -407,6 +443,48 @@ fn validate_cap_file_path(path_str: &str) -> Result<PathBuf> {
     Ok(canonical)
 }
 
+/// Lenient variant of [`load_sandbox_state`] for opportunistic consumers,
+/// such as the stale-file-grant hints in non-`--self` `nono why` queries.
+///
+/// Returns `None` on any failure (unset env var, validation failure,
+/// unreadable file, parse error) instead of exiting. Callers of this variant
+/// worked without the state file before it was consulted and must not grow a
+/// hard dependency on its readability — inside a sandbox the state file is
+/// frequently not covered by any read grant. The fallback only means fewer
+/// diagnostics; enforcement is unaffected. `--self` queries, whose whole
+/// answer comes from the state file, keep the strict fail-loud loader.
+pub fn try_load_sandbox_state() -> Option<SandboxState> {
+    let cap_file_str = std::env::var("NONO_CAP_FILE").ok()?;
+
+    let validated_path = match validate_cap_file_path(&cap_file_str) {
+        Ok(path) => path,
+        Err(e) => {
+            debug!("Skipping sandbox state for diagnostics: {}", e);
+            return None;
+        }
+    };
+
+    let content = match std::fs::read_to_string(&validated_path) {
+        Ok(content) => content,
+        Err(e) => {
+            debug!(
+                "Skipping sandbox state for diagnostics: cannot read {}: {}",
+                validated_path.display(),
+                e
+            );
+            return None;
+        }
+    };
+
+    match serde_json::from_str(&content) {
+        Ok(state) => Some(state),
+        Err(e) => {
+            debug!("Skipping sandbox state for diagnostics: parse error: {}", e);
+            None
+        }
+    }
+}
+
 /// Load sandbox state from NONO_CAP_FILE environment variable
 ///
 /// Returns None if not running inside a nono sandbox (env var not set).
@@ -560,6 +638,68 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
+    fn test_from_caps_records_inode_for_file_grants_only() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempdir().expect("tempdir");
+        let file_path = dir.path().join("granted.txt");
+        std::fs::write(&file_path, b"ok").expect("write test file");
+
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(FsCapability::new_file(&file_path, AccessMode::Read).expect("file cap"));
+        caps.add_fs(FsCapability::new_dir(dir.path(), AccessMode::Read).expect("dir cap"));
+
+        let state = SandboxState::from_caps(&caps, &[], &[], &[]);
+        let file_state = state.fs.iter().find(|c| c.is_file).expect("file grant");
+        let dir_state = state.fs.iter().find(|c| !c.is_file).expect("dir grant");
+
+        let md = std::fs::metadata(&file_path).expect("stat");
+        assert_eq!(file_state.dev, Some(md.dev()));
+        assert_eq!(file_state.ino, Some(md.ino()));
+        assert_eq!(dir_state.dev, None);
+        assert_eq!(dir_state.ino, None);
+
+        // Directory grants must omit the keys entirely so states stay readable
+        // by older builds that don't know the fields.
+        let json = serde_json::to_string(&state).expect("serialize");
+        let v: serde_json::Value = serde_json::from_str(&json).expect("parse");
+        let dir_obj = v["fs"]
+            .as_array()
+            .expect("fs array")
+            .iter()
+            .find(|c| c["is_file"] == serde_json::Value::Bool(false))
+            .expect("dir entry");
+        assert!(dir_obj.get("ino").is_none());
+        assert!(dir_obj.get("dev").is_none());
+    }
+
+    #[test]
+    fn test_state_without_inode_fields_still_loads() {
+        // States written by older builds have no dev/ino keys on fs entries;
+        // strip them from a freshly serialized state to reproduce that shape.
+        let dir = tempdir().expect("tempdir");
+        let file_path = dir.path().join("granted.txt");
+        std::fs::write(&file_path, b"ok").expect("write test file");
+
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(FsCapability::new_file(&file_path, AccessMode::Read).expect("file cap"));
+        let state = SandboxState::from_caps(&caps, &[], &[], &[]);
+
+        let mut v = serde_json::to_value(&state).expect("serialize state");
+        for entry in v["fs"].as_array_mut().expect("fs array") {
+            let obj = entry.as_object_mut().expect("fs entry object");
+            obj.remove("dev");
+            obj.remove("ino");
+        }
+
+        let legacy: SandboxState = serde_json::from_value(v).expect("legacy state loads");
+        assert_eq!(legacy.fs[0].dev, None);
+        assert_eq!(legacy.fs[0].ino, None);
+        legacy.to_caps().expect("legacy state converts to caps");
+    }
+
+    #[test]
     fn test_sandbox_state_roundtrip_preserves_source() {
         let dir = tempdir().expect("tempdir");
         let file_path = dir.path().join("granted.txt");
@@ -664,6 +804,8 @@ mod tests {
                 access: "readwrite".to_string(),
                 is_file: true,
                 source: Some("profile".to_string()),
+                dev: None,
+                ino: None,
             }],
             net_blocked: false,
             allowed_commands: vec![],
@@ -834,6 +976,52 @@ mod cap_file_validation_tests {
             msg.contains("regular file") || msg.contains(".nono-"),
             "directory should be rejected: {msg}"
         );
+    }
+
+    #[test]
+    fn test_try_load_returns_none_instead_of_exiting_on_bad_cap_file() {
+        // Non-`--self` `nono why` consults the state only for staleness hints;
+        // a NONO_CAP_FILE that fails validation or cannot be read must degrade
+        // to None (pre-hint behavior), not abort the query like the strict
+        // loader does.
+        let _lock = match ENV_LOCK.lock() {
+            Ok(lock) => lock,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        // Unset: not in a sandbox.
+        {
+            let env = EnvVarGuard::set_all(&[("NONO_CAP_FILE", "placeholder")]);
+            env.remove("NONO_CAP_FILE");
+            assert!(try_load_sandbox_state().is_none());
+        }
+
+        // Validation failure (wrong location / pattern).
+        {
+            let _env = EnvVarGuard::set_all(&[("NONO_CAP_FILE", "/etc/hosts")]);
+            assert!(try_load_sandbox_state().is_none());
+        }
+
+        // Nonexistent file under a valid root.
+        {
+            let dir = tempfile::tempdir_in("/tmp").expect("tempdir");
+            let missing = dir.path().join(".nono-0000000000000000.json");
+            let missing_str = missing.to_str().expect("utf8");
+            let _env = EnvVarGuard::set_all(&[("NONO_CAP_FILE", missing_str)]);
+            assert!(try_load_sandbox_state().is_none());
+        }
+
+        // And a valid file still loads. Use env::temp_dir() rather than the
+        // /tmp anchor the other tests use: this case reads the file's
+        // contents (not just metadata), and sandboxed dev environments may
+        // grant /tmp write-only. Holding ENV_LOCK keeps TMPDIR stable here.
+        {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = write_cap_file(dir.path());
+            let path_str = path.to_str().expect("utf8");
+            let _env = EnvVarGuard::set_all(&[("NONO_CAP_FILE", path_str)]);
+            assert!(try_load_sandbox_state().is_some());
+        }
     }
 
     #[test]

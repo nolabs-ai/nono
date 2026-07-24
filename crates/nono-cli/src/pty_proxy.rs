@@ -352,7 +352,8 @@ impl PtyProxy {
     ) -> Result<Self> {
         let attach_path = crate::session::session_socket_path(session_id)?;
         remove_stale_attach_socket(&attach_path)?;
-        let attach_listener = bind_attach_listener(&attach_path)?;
+        let bind_path = crate::session::session_socket_bind_path(session_id)?;
+        let attach_listener = bind_attach_listener(&bind_path, &attach_path)?;
         attach_listener.set_nonblocking(true).map_err(|e| {
             NonoError::SandboxInit(format!("Failed to set attach socket nonblocking: {}", e))
         })?;
@@ -1486,7 +1487,7 @@ fn remove_stale_attach_socket(attach_path: &Path) -> Result<()> {
     })
 }
 
-fn bind_attach_listener(attach_path: &Path) -> Result<UnixListener> {
+fn bind_attach_listener(bind_path: &Path, canonical_path: &Path) -> Result<UnixListener> {
     struct UmaskGuard(libc::mode_t);
 
     impl Drop for UmaskGuard {
@@ -1498,16 +1499,17 @@ fn bind_attach_listener(attach_path: &Path) -> Result<UnixListener> {
     }
 
     let _umask_guard = UmaskGuard(unsafe { libc::umask(0o177) });
-    let listener = UnixListener::bind(attach_path).map_err(|e| NonoError::ConfigWrite {
-        path: attach_path.to_path_buf(),
+    // Bind through the short symlinked `bind_path` (keeps `sun_path` in-bounds),
+    let listener = UnixListener::bind(bind_path).map_err(|e| NonoError::ConfigWrite {
+        path: canonical_path.to_path_buf(),
         source: e,
     })?;
 
     #[cfg(unix)]
     {
         let perms = std::fs::Permissions::from_mode(0o600);
-        std::fs::set_permissions(attach_path, perms).map_err(|e| NonoError::ConfigWrite {
-            path: attach_path.to_path_buf(),
+        std::fs::set_permissions(canonical_path, perms).map_err(|e| NonoError::ConfigWrite {
+            path: canonical_path.to_path_buf(),
             source: e,
         })?;
     }
@@ -1992,7 +1994,9 @@ pub fn connect_to_session(session_id: &str) -> Result<UnixStream> {
         return Err(NonoError::SessionGone);
     }
 
-    let mut stream = UnixStream::connect(&sock_path).map_err(|e| {
+    // Connect through the short symlinked path so `sun_path` stays in bounds
+    let bind_path = crate::session::session_socket_bind_path(session_id)?;
+    let mut stream = UnixStream::connect(&bind_path).map_err(|e| {
         if is_socket_disconnect(&e)
             || matches!(
                 e.kind(),
@@ -2018,7 +2022,9 @@ pub fn request_session_detach(session_id: &str) -> Result<()> {
         return Err(NonoError::SessionGone);
     }
 
-    let mut stream = UnixStream::connect(&sock_path).map_err(|e| {
+    // Connect through the short symlinked path so `sun_path` stays in bounds
+    let bind_path = crate::session::session_socket_bind_path(session_id)?;
+    let mut stream = UnixStream::connect(&bind_path).map_err(|e| {
         if is_socket_disconnect(&e)
             || matches!(
                 e.kind(),
@@ -3308,5 +3314,74 @@ mod tests {
         assert!(forwarded.is_empty());
         assert!(!proxy.take_suspension_request());
         assert!(proxy.take_detach_request());
+    }
+
+    #[test]
+    fn attach_socket_binds_and_connects_over_sun_path_limit() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        // Usable `sockaddr_un.sun_path` bytes (sizeof - 1, for the NUL):
+        // macOS caps sun_path at 104, Linux/most others at 108.
+        let sun_path_max: usize = if cfg!(target_os = "macos") { 103 } else { 107 };
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("the system clock is set after the UNIX epoch")
+            .as_nanos();
+        let pid = std::process::id();
+
+        // A deep sessions directory whose "<dir>/<id>.sock" overflows sun_path
+        let root = std::env::temp_dir().join(format!("nono-sunpath-deep-{pid}-{nanos}"));
+        let mut deep = root.clone();
+        while deep.join("0123456789abcdef.sock").as_os_str().len() <= sun_path_max {
+            deep = deep.join("deeeeeeeeeeeeeeeeep");
+        }
+        std::fs::create_dir_all(&deep).expect("a unique deep dir tree under TMPDIR is creatable");
+        let canonical = deep.join("0123456789abcdef.sock");
+        assert!(
+            canonical.as_os_str().len() > sun_path_max,
+            "test setup: canonical socket path must exceed the sun_path limit"
+        );
+
+        assert!(
+            UnixListener::bind(&canonical).is_err(),
+            "precondition: over-long path must reject a direct bind"
+        );
+
+        // Address the socket through a short directory symlink pointing
+        // at the deep directory.
+        let link =
+            std::path::PathBuf::from("/tmp").join(format!("nono-sunpath-link-{pid}-{nanos}"));
+        std::os::unix::fs::symlink(&deep, &link).expect("short dir symlink is creatable");
+        let bind_path = link.join("0123456789abcdef.sock");
+        assert!(
+            bind_path.as_os_str().len() <= sun_path_max,
+            "the symlinked bind path must stay within sun_path"
+        );
+
+        // Binding through the short symlink succeeds and the socket inode lands at
+        // its canonical location.
+        let listener = UnixListener::bind(&bind_path)
+            .expect("binding through the short symlink keeps the address within sun_path");
+        assert!(
+            canonical.exists(),
+            "socket must exist at the canonical deep path, so stat/chmod/cleanup still work there"
+        );
+
+        // The client side (`nono attach`) connects through the same short path and
+        // reaches the listener.
+        assert!(
+            UnixStream::connect(&canonical).is_err(),
+            "precondition: over-long path must reject a direct connect"
+        );
+        let _client =
+            UnixStream::connect(&bind_path).expect("the short-path connect reaches the listener");
+        listener
+            .accept()
+            .expect("a client connection is pending, so accept returns it");
+
+        drop(listener);
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

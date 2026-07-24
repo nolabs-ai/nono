@@ -1645,6 +1645,7 @@ fn handle_shim_stream_inner(
     if let crate::command_policy::InterceptActionConfig::CaptureCredential {
         credential,
         grant_to,
+        shape,
     } = intercept_action
     {
         let grants = if grant_to.is_empty() {
@@ -1667,7 +1668,7 @@ fn handle_shim_stream_inner(
                 None,
                 Some(0),
             )?;
-            return Ok((0, nonce_stdout(nonce)));
+            return Ok((0, nonce_stdout(shape.apply(nonce)?)));
         }
 
         let active = state.active_count.fetch_add(1, Ordering::SeqCst);
@@ -1734,7 +1735,7 @@ fn handle_shim_stream_inner(
                     None,
                     Some(0),
                 )?;
-                Ok((0, nonce_stdout(nonce)))
+                Ok((0, nonce_stdout(shape.apply(nonce)?)))
             }
             Err(err) => {
                 record_command_policy_audit(
@@ -3592,7 +3593,7 @@ fn add_policy_fs(
         if matches!(write_access(&path), AccessMode::Read) {
             add_optional_read_file(caps, path)?;
         } else {
-            caps.add_fs(FsCapability::new_file(path, AccessMode::ReadWrite)?);
+            super::add_optional_write_file(caps, path)?;
         }
     }
     Ok(())

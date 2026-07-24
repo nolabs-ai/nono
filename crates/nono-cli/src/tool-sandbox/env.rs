@@ -134,18 +134,22 @@ pub(crate) fn inject_chaining_control_env(
 }
 
 /// Inject the URL-open socket env var and `BROWSER` for a brokered child whose
-/// command declares `open_urls` and did not opt into direct LaunchServices.
+/// command declares `open_urls` or `allow_launch_services`.
 ///
 /// Both vars are stripped first (a child cannot smuggle its own) then set to
-/// the runtime's URL socket and the open shim path. No-op when URL opening is
-/// not enabled for this command.
+/// the runtime's URL socket and the open shim path. Needed for
+/// `allow_launch_services` too: the shim only recognizes itself as the
+/// URL-open relay when this env var is present, and a bare `open` in the
+/// child's $PATH always resolves to the shim, never straight to
+/// `/usr/bin/open`, once any command in the profile needs the shim. No-op
+/// when URL opening is not enabled for this command.
 pub(crate) fn inject_url_open_env(
     env: &mut Vec<Vec<u8>>,
     policy: &CommandSandboxConfig,
     url_socket_path: Option<&Path>,
     url_open_shim_path: Option<&Path>,
 ) {
-    if policy.open_urls.is_none() || policy.allow_launch_services {
+    if policy.open_urls.is_none() && !policy.allow_launch_services {
         return;
     }
     let (Some(url_socket_path), Some(shim_path)) = (url_socket_path, url_open_shim_path) else {
@@ -536,5 +540,47 @@ mod tests {
                 "{var} must be allowed so tool-sandbox children can verify TLS through the intercept proxy"
             );
         }
+    }
+
+    #[test]
+    fn inject_url_open_env_covers_allow_launch_services_without_open_urls() {
+        let policy = CommandSandboxConfig {
+            allow_launch_services: true,
+            ..Default::default()
+        };
+        let mut env = Vec::new();
+        inject_url_open_env(
+            &mut env,
+            &policy,
+            Some(Path::new("/tmp/url.sock")),
+            Some(Path::new("/tmp/shims/open")),
+        );
+
+        let socket_prefix = format!("{TOOL_SANDBOX_URL_SOCKET_ENV}=").into_bytes();
+        assert!(
+            env.iter().any(|e| e.starts_with(&socket_prefix)),
+            "allow_launch_services must get the URL socket env var, since the shim only \
+             recognizes itself as the URL-open relay when it's present"
+        );
+        assert!(
+            env.iter().any(|e| e.starts_with(b"BROWSER=")),
+            "allow_launch_services must get BROWSER pointed at the shim too"
+        );
+    }
+
+    #[test]
+    fn inject_url_open_env_noop_without_open_urls_or_launch_services() {
+        let policy = CommandSandboxConfig::default();
+        let mut env = Vec::new();
+        inject_url_open_env(
+            &mut env,
+            &policy,
+            Some(Path::new("/tmp/url.sock")),
+            Some(Path::new("/tmp/shims/open")),
+        );
+        assert!(
+            env.is_empty(),
+            "a command with neither policy must get no URL-open env vars"
+        );
     }
 }

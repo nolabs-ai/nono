@@ -30,6 +30,7 @@ pub mod error;
 pub mod external;
 pub mod filter;
 pub mod forward;
+pub mod jwt_phantom;
 pub mod oauth2;
 pub mod oauth_capture;
 pub mod pool;

@@ -99,6 +99,90 @@ jobs:
           fi
           echo "OK: no libdbus dependency"
 
+      # Signing + notarization must happen before Package so the .tar.gz,
+      # SHA256SUMS, and build-provenance attestations all cover the signed
+      # binary. The Developer ID certificate lives in a throwaway keychain
+      # that is deleted in the always() cleanup step below.
+      - name: Import signing certificate (macOS)
+        if: runner.os == 'macOS'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN_PATH="$RUNNER_TEMP/signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(uuidgen)"
+          echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          echo -n "$APPLE_CERTIFICATE" | base64 --decode -o "$RUNNER_TEMP/certificate.p12"
+          security import "$RUNNER_TEMP/certificate.p12" \
+            -k "$KEYCHAIN_PATH" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign
+          rm "$RUNNER_TEMP/certificate.p12"
+
+          # Allow codesign to use the key without a UI password prompt.
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH" > /dev/null
+          security list-keychains -d user -s "$KEYCHAIN_PATH" login.keychain-db
+
+      - name: Sign binary (macOS)
+        if: runner.os == 'macOS'
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+          BIN="target/${{ matrix.target }}/release/nono"
+          codesign --force --timestamp --options runtime \
+            --identifier ai.nolabs.nono \
+            --sign "$APPLE_SIGNING_IDENTITY" \
+            "$BIN"
+          codesign --verify --strict --verbose=2 "$BIN"
+          codesign --display --verbose=2 "$BIN"
+
+      # notarytool only accepts zip/dmg/pkg, so the binary is submitted in a
+      # temporary zip. Stapling is skipped: tickets cannot be stapled to bare
+      # Mach-O executables, so Gatekeeper looks the ticket up online instead.
+      - name: Notarize binary (macOS)
+        if: runner.os == 'macOS'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          BIN="target/${{ matrix.target }}/release/nono"
+          ditto -c -k "$BIN" "$RUNNER_TEMP/nono-notarize.zip"
+
+          SUBMISSION_JSON="$(xcrun notarytool submit "$RUNNER_TEMP/nono-notarize.zip" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait --output-format json)"
+          echo "$SUBMISSION_JSON"
+
+          STATUS="$(echo "$SUBMISSION_JSON" | jq -r '.status')"
+          SUBMISSION_ID="$(echo "$SUBMISSION_JSON" | jq -r '.id')"
+          if [ "$STATUS" != "Accepted" ]; then
+            echo "::error::Notarization failed with status: $STATUS"
+            xcrun notarytool log "$SUBMISSION_ID" \
+              --apple-id "$APPLE_ID" \
+              --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+              --team-id "$APPLE_TEAM_ID"
+            exit 1
+          fi
+
+      - name: Clean up signing keychain (macOS)
+        if: always() && runner.os == 'macOS'
+        run: |
+          if [ -n "${KEYCHAIN_PATH:-}" ] && [ -f "$KEYCHAIN_PATH" ]; then
+            security delete-keychain "$KEYCHAIN_PATH"
+          fi
+
       - name: Package
         shell: bash
         run: |

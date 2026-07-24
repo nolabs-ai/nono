@@ -120,7 +120,7 @@ Each `intercept` entry is `{ "args": [...], "action": { "type": ... } }`. Rules 
 | `passthrough` | Run the real binary in its sandbox. This is the default when no rule matches. |
 | `respond` | Return a static `stdout` string to the caller without forking the binary. |
 | `capture` | Run the real binary, buffering its stdout for broker inspection before returning it. |
-| `capture_credential` | Run the real binary, store its stdout as a named ambient `credential`, and return a broker nonce. |
+| `capture_credential` | Run the real binary, store its stdout as a named ambient `credential`, and return a broker nonce. An optional `shape` controls the returned nonce's form: `opaque` (default) returns the bare `nono_<hex>`; `jwt` wraps it as a structurally-valid unsigned JWT (`<header>.<payload>.<nonce>`) for callers that validate token structure before use — the embedded nonce still resolves on egress. |
 | `approve` | Route the invocation through an approval backend before forking (optional `timeout_secs`). |
 | `exec` | Run the helper at `command[0]` — with `command[1..]` then the original arguments — in place of the real binary, inside the matched command's sandbox; stream its stdout/stderr and propagate its exit code. `command[0]` is `$VAR`-expanded, must be absolute, is resolved with identity expectations, and is subject to the same non-writable-executable trust gate as a pinned `executable`. |
 

@@ -2218,6 +2218,35 @@ mod tests {
             .to_string()
     }
 
+    /// Send `GET /svc/` through the proxy at `port` with a valid
+    /// `Proxy-Authorization: Basic` header carrying the session `token`, and
+    /// return the status line the proxy wrote back. Standard HTTP clients send
+    /// the session token as `Basic base64("nono:<token>")` userinfo.
+    async fn authenticated_reverse_request(port: u16, token: &str) -> String {
+        let creds = {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode(format!("nono:{token}"))
+        };
+        let request = format!(
+            "GET /svc/ HTTP/1.1\r\nHost: 127.0.0.1\r\nProxy-Authorization: Basic {creds}\r\n\r\n"
+        );
+        let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        client.write_all(request.as_bytes()).await.unwrap();
+        let mut resp = Vec::new();
+        // Read the response head; the upstream is tiny so a single read suffices.
+        let mut buf = [0u8; 1024];
+        if let Ok(n) = client.read(&mut buf).await {
+            resp.extend_from_slice(&buf[..n]);
+        }
+        String::from_utf8_lossy(&resp)
+            .lines()
+            .next()
+            .unwrap_or("")
+            .to_string()
+    }
+
     #[tokio::test]
     async fn test_no_auth_skips_reverse_proxy_authentication() {
         // Regression: `nono proxy --no-auth` (require_auth == false) must skip
@@ -2248,7 +2277,9 @@ mod tests {
     async fn reverse_proxy_rate_limit_rejects_after_burst() {
         // A route with a RouteRateLimiter of burst 1 and no delay budget lets
         // the first request through to the upstream (200) and rejects the
-        // second with 429 without forwarding it.
+        // second with 429 without forwarding it. The rate-limit gate sits inside
+        // the `require_auth` branch, so auth must be enabled and each request
+        // must carry a valid session token to reach the limiter.
         let upstream = spawn_mock_upstream().await;
         let mut route = declarative_route(&format!("http://{upstream}"));
         route.rate_limit = Some(crate::config::RouteRateLimitConfig {
@@ -2259,18 +2290,19 @@ mod tests {
         let config = ProxyConfig {
             routes: vec![route],
             allowed_hosts: vec!["127.0.0.1".to_string()],
-            require_auth: false,
+            require_auth: true,
             ..Default::default()
         };
         let handle = start(config).await.unwrap();
+        let token = handle.token.to_string();
 
-        let first = unauthenticated_reverse_request(handle.port).await;
+        let first = authenticated_reverse_request(handle.port, &token).await;
         assert!(
             first.contains("200"),
             "first request should reach the upstream, got: {first:?}"
         );
 
-        let second = unauthenticated_reverse_request(handle.port).await;
+        let second = authenticated_reverse_request(handle.port, &token).await;
         assert!(
             second.contains("429"),
             "second request should be rate limited with 429, got: {second:?}"

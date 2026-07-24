@@ -270,8 +270,11 @@ async fn handle_h2_stream(
         &ctx.route_store,
         &ctx.host,
         ctx.port,
-        &method_str,
-        &path,
+        handle::InterceptRouteRequest {
+            method: &method_str,
+            path: &path,
+            websocket_path: None,
+        },
         ctx.audit_log.as_ref(),
         ctx.approval_backends.as_ref(),
     )
@@ -283,8 +286,8 @@ async fn handle_h2_stream(
         }
         RouteSelection::Selected(selected) => selected,
     };
-    let service: Option<&str> = selected.map(|(s, _)| s);
-    let route: Option<&crate::route::LoadedRoute> = selected.map(|(_, r)| r);
+    let service = selected.map(|selected| selected.id);
+    let route = selected.map(|selected| selected.route);
 
     // Managed credential gating, AWS handling, and command-backed capture are
     // shared with the HTTP/1.1 path via [`handle::resolve_managed_credential`]
@@ -764,6 +767,7 @@ mod tests {
             aws_auth: None,
             endpoint_policy: None,
             spiffe: None,
+            upgrades: vec![],
         }];
         let route_store = RouteStore::load(&routes).await.unwrap();
         let credential_store = CredentialStore::load_with_diagnostics(&routes, tls_connector)
@@ -841,6 +845,7 @@ mod tests {
             aws_auth: None,
             endpoint_policy: None,
             spiffe: None,
+            upgrades: vec![],
         }];
         RouteStore::load(&routes).await.unwrap()
     }
@@ -1562,6 +1567,7 @@ mod tests {
             }),
             endpoint_policy: None,
             spiffe: None,
+            upgrades: vec![],
         }];
         let route_store = RouteStore::load(&routes).await.unwrap();
         // Set fake AWS credential env vars so the default chain succeeds and
@@ -1947,6 +1953,7 @@ mod tests {
                 aws_auth: None,
                 endpoint_policy: None,
                 spiffe: None,
+                upgrades: vec![],
             },
             RouteConfig {
                 prefix: "svc-b".to_string(),
@@ -1971,6 +1978,7 @@ mod tests {
                 aws_auth: None,
                 endpoint_policy: None,
                 spiffe: None,
+                upgrades: vec![],
             },
         ];
         let route_store = RouteStore::load(&routes).await.unwrap();
@@ -2147,6 +2155,7 @@ mod tests {
             aws_auth: None,
             endpoint_policy: None,
             spiffe: None,
+            upgrades: vec![],
         }];
         RouteStore::load(&routes).await.unwrap()
     }
@@ -2288,6 +2297,7 @@ mod tests {
                 }],
             }),
             spiffe: None,
+            upgrades: vec![],
         }];
         let route_store = RouteStore::load(&routes).await.unwrap();
         let credential_store = CredentialStore::empty();
@@ -2478,6 +2488,7 @@ mod tests {
                 aws_auth: None,
                 endpoint_policy: None,
                 spiffe: None,
+                upgrades: vec![],
             },
             // Endpoint-only restriction (_ep_ route)
             RouteConfig {
@@ -2509,6 +2520,7 @@ mod tests {
                 aws_auth: None,
                 endpoint_policy: None,
                 spiffe: None,
+                upgrades: vec![],
             },
         ];
         let route_store = RouteStore::load(&routes).await.unwrap();

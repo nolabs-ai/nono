@@ -3068,7 +3068,7 @@ fn add_policy_fs(
         if matches!(write_access(&path), AccessMode::Read) {
             add_optional_read_file(caps, path)?;
         } else {
-            caps.add_fs(FsCapability::new_file(path, AccessMode::ReadWrite)?);
+            super::add_optional_write_file(caps, path)?;
         }
     }
     Ok(())

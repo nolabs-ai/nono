@@ -1254,6 +1254,22 @@ pub(crate) fn print_allow_gpu_warning(silent: bool) {
     }
 }
 
+/// Register the caller's `$PATH` directories on the caps for metadata-only
+/// read (macOS). PATH is passed through unchanged, so nono's own PATH is what
+/// the sandboxed process resolves against. See `path_metadata_dirs`.
+#[cfg(target_os = "macos")]
+fn register_path_metadata_dirs(caps: &mut CapabilitySet) {
+    let Some(path_env) = std::env::var_os("PATH") else {
+        return;
+    };
+    // Absolute only — Seatbelt subpath needs it.
+    for dir in std::env::split_paths(&path_env) {
+        if dir.is_absolute() {
+            caps.add_path_metadata_dir(dir);
+        }
+    }
+}
+
 pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<PreparedSandbox> {
     sandbox_state::cleanup_stale_state_files();
     let detached_launch = std::env::var_os(DETACHED_LAUNCH_ENV).is_some();
@@ -1291,6 +1307,8 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         }
 
         let mut caps = CapabilitySet::try_from(&manifest)?;
+        #[cfg(target_os = "macos")]
+        register_path_metadata_dirs(&mut caps);
         let protected_roots = protected_paths::ProtectedRoots::from_defaults()?;
         protected_paths::validate_caps_against_protected_roots(
             &caps,
@@ -1554,6 +1572,10 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
             })?;
         }
     }
+
+    // Also done on the manifest branch above (which returns early).
+    #[cfg(target_os = "macos")]
+    register_path_metadata_dirs(&mut caps);
 
     let allow_launch_services_active = maybe_enable_macos_launch_services(
         &mut caps,

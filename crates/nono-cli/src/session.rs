@@ -605,6 +605,143 @@ pub(crate) fn session_socket_path(session_id: &str) -> Result<PathBuf> {
     Ok(ensure_sessions_dir()?.join(format!("{session_id}.sock")))
 }
 
+/// Usable bytes in an AF_UNIX `sockaddr_un.sun_path`, i.e. `sizeof(sun_path) - 1`
+///
+/// `std`'s socket-address builder rejects any `bind(2)`/`connect(2)` path whose length is `>=
+/// sizeof(sun_path)`. See `man 4 unix` (macOS) / `man 7 unix` (Linux).
+#[cfg(target_os = "macos")]
+pub(crate) const SUN_PATH_MAX: usize = 103;
+#[cfg(not(target_os = "macos"))]
+pub(crate) const SUN_PATH_MAX: usize = 107;
+
+/// Path used to `bind(2)`/`connect(2)` a session's attach socket.
+///
+/// The socket itself always lives at [`session_socket_path`]
+/// (`$XDG_STATE_HOME/nono/sessions/<id>.sock`), but that absolute path can exceed
+/// [`SUN_PATH_MAX`] when `$XDG_STATE_HOME` is too long, which makes `bind`/`connect`
+/// fail with `ENAMETOOLONG`. There is no `bindat`/`connectat` to anchor a
+/// relative address, so instead we route through a short, per-user directory
+/// symlink (`<short-base>/nono-<uid>` → the sessions directory). Addressing the
+/// socket as `<link>/<id>.sock` keeps the `sun_path` the kernel sees within the
+/// limit while it resolves to the same socket inode.
+#[cfg(unix)]
+pub(crate) fn session_socket_bind_path(session_id: &str) -> Result<PathBuf> {
+    validate_session_id(session_id)?;
+    let sessions = ensure_sessions_dir()?;
+    let leaf = format!("{session_id}.sock");
+    let uid = nix::unistd::geteuid().as_raw();
+    let link = ensure_socket_link(&sessions, uid, leaf.len())?;
+    let bind_path = link.join(&leaf);
+    if bind_path.as_os_str().len() > SUN_PATH_MAX {
+        return Err(NonoError::ConfigParse(format!(
+            "Session socket path {} exceeds the {}-byte sun_path limit even via the short link",
+            bind_path.display(),
+            SUN_PATH_MAX
+        )));
+    }
+    Ok(bind_path)
+}
+
+/// Short, per-user base directory that holds the session-socket symlink.
+///
+/// The base must itself be short, so we prefer a private `$XDG_RUNTIME_DIR` (i.e.
+/// `/run/user/<uid>`) and fall back to `/tmp`.
+#[cfg(unix)]
+fn socket_link_base(link_name: &str, leaf_len: usize) -> PathBuf {
+    let fits = |base: &Path| {
+        base.as_os_str()
+            .len()
+            .saturating_add(1)
+            .saturating_add(link_name.len())
+            .saturating_add(1)
+            .saturating_add(leaf_len)
+            <= SUN_PATH_MAX
+    };
+    if let Ok(raw) = std::env::var("XDG_RUNTIME_DIR") {
+        let base = PathBuf::from(&raw);
+        if base.is_absolute() && fits(&base) {
+            return base;
+        }
+    }
+    PathBuf::from("/tmp")
+}
+
+/// Create (or reuse) the short directory symlink pointing at `sessions`, and
+/// return its path.
+///
+/// The link is keyed by both `uid` and a short hash of the target.
+#[cfg(unix)]
+fn ensure_socket_link(sessions: &Path, uid: u32, leaf_len: usize) -> Result<PathBuf> {
+    use std::hash::{Hash, Hasher};
+
+    let target_canon = std::fs::canonicalize(sessions).map_err(|e| NonoError::ConfigWrite {
+        path: sessions.to_path_buf(),
+        source: e,
+    })?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    target_canon.as_os_str().hash(&mut hasher);
+    let tag = hasher.finish() as u32;
+    let link_name = format!("nono-{uid}-{tag:08x}");
+    let link = socket_link_base(&link_name, leaf_len).join(&link_name);
+    create_socket_link(&link, &target_canon, uid)?;
+    Ok(link)
+}
+
+/// Establish `link` as a symlink to `target`.
+#[cfg(unix)]
+fn create_socket_link(link: &Path, target: &Path, uid: u32) -> Result<()> {
+    let target_canon = std::fs::canonicalize(target).map_err(|e| NonoError::ConfigWrite {
+        path: target.to_path_buf(),
+        source: e,
+    })?;
+
+    for _ in 0..8 {
+        match std::os::unix::fs::symlink(target, link) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let meta = std::fs::symlink_metadata(link).map_err(|e| NonoError::ConfigWrite {
+                    path: link.to_path_buf(),
+                    source: e,
+                })?;
+                if !meta.file_type().is_symlink() {
+                    return Err(NonoError::ConfigParse(format!(
+                        "Refusing to use session socket link {}: not a symlink",
+                        link.display()
+                    )));
+                }
+                if meta.uid() != uid {
+                    return Err(NonoError::ConfigParse(format!(
+                        "Refusing to use session socket link {} owned by uid {}, expected {}",
+                        link.display(),
+                        meta.uid(),
+                        uid
+                    )));
+                }
+                match std::fs::canonicalize(link) {
+                    Ok(current) if current == target_canon => return Ok(()),
+                    _ => {
+                        std::fs::remove_file(link).map_err(|e| NonoError::ConfigWrite {
+                            path: link.to_path_buf(),
+                            source: e,
+                        })?;
+                        continue;
+                    }
+                }
+            }
+            Err(e) => {
+                return Err(NonoError::ConfigWrite {
+                    path: link.to_path_buf(),
+                    source: e,
+                });
+            }
+        }
+    }
+    Err(NonoError::ConfigParse(format!(
+        "Failed to establish session socket link {} after repeated races",
+        link.display()
+    )))
+}
+
 pub(crate) fn session_events_path(session_id: &str) -> Result<PathBuf> {
     validate_session_id(session_id)?;
     Ok(sessions_dir()?.join(format!("{session_id}.events.ndjson")))
@@ -782,6 +919,94 @@ mod tests {
     fn make_private_dir(path: &Path) {
         let perms = std::fs::Permissions::from_mode(0o700);
         std::fs::set_permissions(path, perms).expect("chmod 700");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_socket_link_creates_symlink_to_target() {
+        let base = tempdir().expect("tempdir");
+        let target = tempdir().expect("tempdir");
+        let uid = nix::unistd::geteuid().as_raw();
+        let link = base.path().join("nono-link");
+
+        create_socket_link(&link, target.path(), uid).expect("link is created");
+
+        let meta = std::fs::symlink_metadata(&link).expect("link exists");
+        assert!(meta.file_type().is_symlink(), "entry must be a symlink");
+        assert_eq!(
+            std::fs::canonicalize(&link).expect("resolves"),
+            std::fs::canonicalize(target.path()).expect("resolves"),
+            "link must resolve to the target sessions dir"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_socket_link_reuses_matching_link() {
+        let base = tempdir().expect("tempdir");
+        let target = tempdir().expect("tempdir");
+        let uid = nix::unistd::geteuid().as_raw();
+        let link = base.path().join("nono-link");
+
+        create_socket_link(&link, target.path(), uid).expect("first create");
+
+        create_socket_link(&link, target.path(), uid).expect("reuse existing link");
+        assert_eq!(
+            std::fs::canonicalize(&link).expect("resolves"),
+            std::fs::canonicalize(target.path()).expect("resolves"),
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_socket_link_replaces_stale_target() {
+        let base = tempdir().expect("tempdir");
+        let old_target = tempdir().expect("tempdir");
+        let new_target = tempdir().expect("tempdir");
+        let uid = nix::unistd::geteuid().as_raw();
+        let link = base.path().join("nono-link");
+
+        // A link we own that points at a since-abandoned dir (e.g. after
+        // `$XDG_STATE_HOME` changed) is repointed at the current target.
+        std::os::unix::fs::symlink(old_target.path(), &link).expect("seed stale link");
+        create_socket_link(&link, new_target.path(), uid).expect("stale link is replaced");
+        assert_eq!(
+            std::fs::canonicalize(&link).expect("resolves"),
+            std::fs::canonicalize(new_target.path()).expect("resolves"),
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_socket_link_refuses_non_symlink() {
+        let base = tempdir().expect("tempdir");
+        let target = tempdir().expect("tempdir");
+        let uid = nix::unistd::geteuid().as_raw();
+        let link = base.path().join("nono-link");
+
+        // A plain file where the link should be is refused, not removed.
+        std::fs::write(&link, b"not a symlink").expect("seed regular file");
+        let err =
+            create_socket_link(&link, target.path(), uid).expect_err("must refuse non-symlink");
+        assert!(
+            matches!(err, NonoError::ConfigParse(_)),
+            "expected a refusal, got {err:?}"
+        );
+        assert!(link.exists(), "the refused entry must be left untouched");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_socket_link_refuses_foreign_owner() {
+        let base = tempdir().expect("tempdir");
+        let target = tempdir().expect("tempdir");
+        let link = base.path().join("nono-link");
+        std::os::unix::fs::symlink(target.path(), &link).expect("seed our link");
+
+        let foreign = nix::unistd::geteuid().as_raw().wrapping_add(1);
+        let err = create_socket_link(&link, target.path(), foreign)
+            .expect_err("must refuse a link owned by another uid");
+        assert!(matches!(err, NonoError::ConfigParse(_)), "got {err:?}");
     }
 
     #[test]

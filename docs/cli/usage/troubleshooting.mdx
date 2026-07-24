@@ -38,6 +38,7 @@ Command fails with "Permission denied" or "Operation not permitted" errors.
 | Sensitive path blocked | Use `--bypass-protection` with your grant (see below) |
 | Relative path resolved differently | Use absolute paths |
 | Symlink target outside sandbox | Grant access to the symlink target |
+| File replaced after sandbox start (Linux) | Grant the containing directory, or restart the sandbox (see below) |
 
 ### Sensitive Paths
 
@@ -64,6 +65,25 @@ To intentionally access a blocked path, use `--bypass-protection` alongside your
 ```bash
 nono run --allow ~/.gnupg --bypass-protection ~/.gnupg -- gpg --list-keys
 ```
+
+### Stale File Grants (Linux)
+
+On Linux, a file-level grant (`--read-file`, `--write-file`, `--allow-file`, or profile `read_file`/`write_file`/`allow_file`) attaches to the file's *inode* at sandbox start, not to its path. If the file is later replaced atomically — the write-temp-then-`rename()` pattern used by editors, `git config`, systemd-resolved, and most config tools — the path points to a new inode that carries no rule, and access fails with `EACCES` for the rest of the session even though the grant still names the path.
+
+`nono why` detects this from inside the sandbox and reports it:
+
+```
+DENIED
+  Reason: stale_file_grant
+  Details: The sandbox granted this file, but the file at ... was replaced
+  after sandbox start (inode 39:175234 when the sandbox started, 39:175245
+  now). ...
+```
+
+Remedies:
+
+- Restart the sandbox session — grants re-resolve to the current file.
+- If the file is rewritten routinely, grant its containing directory instead: directory rules cover files created after sandbox start, so they survive atomic replacement (at the cost of a broader grant).
 
 ---
 

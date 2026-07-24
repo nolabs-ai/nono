@@ -3085,7 +3085,7 @@ fn add_policy_fs(
         if matches!(write_access(&path), AccessMode::Read) {
             add_optional_read_file(caps, path)?;
         } else {
-            caps.add_fs(FsCapability::new_file(path, AccessMode::ReadWrite)?);
+            super::add_optional_write_file(caps, path)?;
         }
     }
     Ok(())
@@ -3631,10 +3631,10 @@ fn normalize_captured_credential(mut output: Vec<u8>) -> Vec<u8> {
     output
 }
 
+/// No appended newline: a caller that captures raw stdout and reuses it
+/// verbatim (e.g. in an HTTP header) would otherwise get a corrupted value.
 fn nonce_stdout(nonce: String) -> Vec<u8> {
-    let mut output = nonce.into_bytes();
-    output.push(b'\n');
-    output
+    nonce.into_bytes()
 }
 
 fn launch_child_with_capture(
@@ -6924,6 +6924,13 @@ mod tests {
         let without_override = crate::tool_sandbox::ResolvedInterceptAction::passthrough();
         let effective = without_override.sandbox.unwrap_or(&command_sandbox);
         assert_eq!(effective.fs_read, vec!["/command/path".to_string()]);
+    }
+
+    #[test]
+    fn nonce_stdout_appends_no_trailing_newline() {
+        let phantom = format!("nono_{}", "a".repeat(64));
+        let stdout = nonce_stdout(phantom.clone());
+        assert_eq!(stdout, phantom.into_bytes());
     }
 
     #[test]

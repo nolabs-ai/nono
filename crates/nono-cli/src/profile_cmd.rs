@@ -6,8 +6,8 @@
 
 use crate::cli::{
     ProfileCmdArgs, ProfileCommands, ProfileDiffArgs, ProfileGroupsArgs, ProfileGuideArgs,
-    ProfileInitArgs, ProfileListArgs, ProfilePromoteArgs, ProfileSchemaArgs, ProfileShowArgs,
-    ProfileValidateArgs,
+    ProfileInitArgs, ProfileInitSource, ProfileListArgs, ProfilePromoteArgs, ProfileSchemaArgs,
+    ProfileShowArgs, ProfileValidateArgs,
 };
 use crate::config::embedded;
 use crate::policy::{self, AllowOps, DenyOps, Group};
@@ -88,10 +88,19 @@ fn cmd_init(args: ProfileInitArgs) -> Result<()> {
         )));
     }
 
-    // Determine output path
-    let output_path = match &args.output {
-        Some(path) => path.clone(),
-        None => profile::get_user_profile_path(&args.name)?,
+    let output_path = if args.draft {
+        if args.output.is_some() {
+            return Err(NonoError::ProfileParse(
+                "--output cannot be combined with --draft, the path is always the draft-profiles folder"
+                    .to_string(),
+            ));
+        }
+        profile::get_user_profile_draft_path(&args.name)?
+    } else {
+        match &args.output {
+            Some(path) => path.clone(),
+            None => profile::get_user_profile_path(&args.name)?,
+        }
     };
 
     // Check for existing file
@@ -100,6 +109,14 @@ fn cmd_init(args: ProfileInitArgs) -> Result<()> {
             "Profile file already exists: {}\nUse --force to overwrite",
             output_path.display()
         )));
+    }
+
+    let init_source = resolve_init_source(&args)?;
+
+    if args.full && init_source == ProfileInitSource::Existing {
+        return Err(NonoError::ProfileParse(
+            "--full is only supported when generating from a template".to_string(),
+        ));
     }
 
     // Block names that match an embedded built-in profile. Pack profiles use
@@ -146,8 +163,30 @@ fn cmd_init(args: ProfileInitArgs) -> Result<()> {
         }
     }
 
-    // Build skeleton JSON
-    let skeleton = build_skeleton(&args);
+    let mut base_sha: Option<String> = None;
+    let bytes: Vec<u8> = match init_source {
+        ProfileInitSource::Template => {
+            let skeleton = build_skeleton(&args);
+            let json = serde_json::to_string_pretty(&skeleton)
+                .map_err(|e| NonoError::ProfileParse(format!("JSON serialization failed: {e}")))?;
+            format!("{json}\n").into_bytes()
+        }
+        ProfileInitSource::Existing => {
+            let target_path = profile::get_user_profile_path(&args.name)?;
+            let target_bytes = read_regular_file(&target_path, "target profile")?;
+            let has_override_flags =
+                args.extends.is_some() || !args.groups.is_empty() || args.description.is_some();
+            let result_bytes = if has_override_flags {
+                apply_init_overrides_onto(&target_bytes, &args)?
+            } else {
+                target_bytes.clone()
+            };
+            if args.draft {
+                base_sha = Some(sha256_hex(&target_bytes));
+            }
+            result_bytes
+        }
+    };
 
     // Ensure parent directory exists
     if let Some(parent) = output_path.parent() {
@@ -160,11 +199,7 @@ fn cmd_init(args: ProfileInitArgs) -> Result<()> {
         })?;
     }
 
-    // Write file
-    let json = serde_json::to_string_pretty(&skeleton)
-        .map_err(|e| NonoError::ProfileParse(format!("JSON serialization failed: {e}")))?;
-
-    fs::write(&output_path, format!("{json}\n")).map_err(|e| {
+    fs::write(&output_path, &bytes).map_err(|e| {
         NonoError::ProfileParse(format!(
             "Failed to write profile to {}: {}",
             output_path.display(),
@@ -172,16 +207,34 @@ fn cmd_init(args: ProfileInitArgs) -> Result<()> {
         ))
     })?;
 
+    if let Some(base_contents) = base_sha {
+        let base_path = profile::get_user_profile_draft_base_path(&args.name)?;
+        atomic_write_file(&base_path, base_contents.as_bytes())?;
+    }
+
     eprintln!(
         "{} Created profile at {}",
         prefix(),
         output_path.display().to_string().bold()
     );
-    eprintln!(
-        "{} Validate with: nono profile validate {}",
-        prefix(),
-        profile_validate_target(&args, &output_path)
-    );
+    if args.draft {
+        eprintln!(
+            "{} Validate with: nono profile validate --draft {}",
+            prefix(),
+            args.name
+        );
+        eprintln!(
+            "{} Promote with:  nono profile promote {}",
+            prefix(),
+            args.name
+        );
+    } else {
+        eprintln!(
+            "{} Validate with: nono profile validate {}",
+            prefix(),
+            profile_validate_target(&args, &output_path)
+        );
+    }
     eprintln!(
         "{} For editor autocomplete: nono profile schema -o nono-profile.schema.json",
         prefix()
@@ -195,6 +248,94 @@ fn profile_validate_target(args: &ProfileInitArgs, output_path: &Path) -> String
         Ok(default_path) if default_path == output_path => args.name.clone(),
         _ => output_path.display().to_string(),
     }
+}
+
+fn resolve_init_source(args: &ProfileInitArgs) -> Result<ProfileInitSource> {
+    if !args.draft {
+        return Ok(ProfileInitSource::Template);
+    }
+    let target_path = profile::get_user_profile_path(&args.name)?;
+    let target_exists = regular_file_exists(&target_path, "target profile")?;
+    match (args.source, target_exists) {
+        (None, false) | (Some(ProfileInitSource::Template), false) => {
+            // Auto-detect, profile does not exist
+            Ok(ProfileInitSource::Template)
+        }
+        (None, true) | (Some(ProfileInitSource::Existing), true) => Ok(ProfileInitSource::Existing), // Auto-detect, profile exists
+        (Some(ProfileInitSource::Template), true) => Err(NonoError::ProfileParse(format!(
+            "Profile '{}' already exists, but --source=template requires the profile to not already be present",
+            args.name
+        ))),
+        (Some(ProfileInitSource::Existing), false) => Err(NonoError::ProfileParse(format!(
+            "Profile '{}' does not exist; cannot draft from --source=existing.",
+            args.name
+        ))),
+    }
+}
+
+/// Apply `--extends`/`--groups`/`--description` as overrides on top of an
+/// existing profile's raw bytes. `--full` is deliberately not handled here
+/// — `cmd_init` rejects `--full` together with `ProfileInitSource::Existing`
+/// before this is ever called (see the comment at that call site).
+fn apply_init_overrides_onto(target_bytes: &[u8], args: &ProfileInitArgs) -> Result<Vec<u8>> {
+    let value: serde_json::Value = serde_json::from_slice(target_bytes).map_err(|e| {
+        NonoError::ProfileParse(format!(
+            "cannot apply --extends/--groups/--description on top of \
+             the existing profile: it is not valid JSON: {e}"
+        ))
+    })?;
+    let mut root = match value {
+        serde_json::Value::Object(map) => map,
+        _ => {
+            return Err(NonoError::ProfileParse(
+                "cannot apply --extends/--groups/--description on top \
+                 of the existing profile: expected a JSON object at the top \
+                 level"
+                    .to_string(),
+            ));
+        }
+    };
+
+    if let Some(ref base) = args.extends {
+        root.insert(
+            "extends".to_string(),
+            serde_json::Value::String(base.clone()),
+        );
+    }
+
+    if let Some(ref desc) = args.description {
+        let meta = root
+            .entry("meta".to_string())
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+        if let serde_json::Value::Object(meta_map) = meta {
+            meta_map.insert(
+                "description".to_string(),
+                serde_json::Value::String(desc.clone()),
+            );
+        }
+    }
+
+    if !args.groups.is_empty() {
+        let groups = root
+            .entry("groups".to_string())
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+        if let serde_json::Value::Object(groups_map) = groups {
+            groups_map.insert(
+                "include".to_string(),
+                serde_json::Value::Array(
+                    args.groups
+                        .iter()
+                        .cloned()
+                        .map(serde_json::Value::String)
+                        .collect(),
+                ),
+            );
+        }
+    }
+
+    let json = serde_json::to_string_pretty(&serde_json::Value::Object(root))
+        .map_err(|e| NonoError::ProfileParse(format!("JSON serialization failed: {e}")))?;
+    Ok(format!("{json}\n").into_bytes())
 }
 
 /// Build a skeleton profile JSON value with controlled field ordering.
@@ -3299,6 +3440,8 @@ mod tests {
             full: false,
             output: None,
             force: false,
+            draft: false,
+            source: None,
         };
         let skeleton = build_skeleton(&args);
         let json = serde_json::to_string(&skeleton).expect("serialize");
@@ -3316,6 +3459,8 @@ mod tests {
             full: true,
             output: None,
             force: false,
+            draft: false,
+            source: None,
         };
         let skeleton = build_skeleton(&args);
         let json = serde_json::to_string(&skeleton).expect("serialize");
@@ -3338,6 +3483,8 @@ mod tests {
             full: false,
             output: None,
             force: false,
+            draft: false,
+            source: None,
         };
         let skeleton = build_skeleton(&args);
         let groups = skeleton["groups"]["include"].as_array().expect("array");
@@ -3355,6 +3502,8 @@ mod tests {
             full: false,
             output: None,
             force: false,
+            draft: false,
+            source: None,
         };
         let skeleton = build_skeleton(&args);
         // $schema is not emitted because the URL is not hosted;
@@ -3372,6 +3521,8 @@ mod tests {
             full: false,
             output: Some(PathBuf::from("/tmp/nono-test-bad.json")),
             force: false,
+            draft: false,
+            source: None,
         });
         assert!(result.is_err());
         let err = result.expect_err("error");
@@ -3388,6 +3539,8 @@ mod tests {
             full: false,
             output: Some(PathBuf::from("/tmp/nono-test-badgroup.json")),
             force: false,
+            draft: false,
+            source: None,
         });
         assert!(result.is_err());
         let err = result.expect_err("error");
@@ -3404,6 +3557,8 @@ mod tests {
             full: false,
             output: Some(PathBuf::from("/tmp/nono-test-badextends.json")),
             force: false,
+            draft: false,
+            source: None,
         });
         assert!(result.is_err());
         let err = result.expect_err("error");
@@ -3431,6 +3586,8 @@ mod tests {
             full: false,
             output: None,
             force: false,
+            draft: false,
+            source: None,
         });
         assert!(result.is_err());
         let err = result.expect_err("error");
@@ -3462,6 +3619,8 @@ mod tests {
             full: false,
             output: Some(out.clone()),
             force: false,
+            draft: false,
+            source: None,
         });
         assert!(result.is_err());
         let err = result.expect_err("error");
@@ -3517,8 +3676,590 @@ mod tests {
             full: false,
             output: None,
             force: false,
+            draft: false,
+            source: None,
         });
         assert!(result.is_ok(), "expected ok, got: {:?}", result.err());
+    }
+
+    // -------------------------------------------------------------------
+    // nono profile init --draft
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn init_draft_generates_skeleton_when_no_target_and_writes_no_base() {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let xdg = dir.path().join("config");
+        std::fs::create_dir_all(&xdg).expect("create xdg");
+        let xdg_str = xdg.to_str().expect("utf8 xdg");
+        let _env = crate::test_env::EnvVarGuard::set_all(&[("XDG_CONFIG_HOME", xdg_str)]);
+
+        let result = cmd_init(ProfileInitArgs {
+            name: "agent-local".to_string(),
+            extends: None,
+            groups: vec![],
+            description: None,
+            full: false,
+            output: None,
+            force: false,
+            draft: true,
+            source: None,
+        });
+        assert!(result.is_ok(), "expected ok, got: {:?}", result.err());
+
+        let draft_path = profile::get_user_profile_draft_path("agent-local").expect("draft path");
+        assert!(draft_path.exists(), "draft file should be created");
+        let content = fs::read_to_string(&draft_path).expect("read draft");
+        let profile: Profile = serde_json::from_str(&content).expect("parse draft");
+        assert_eq!(profile.meta.name, "agent-local");
+
+        let base_path =
+            profile::get_user_profile_draft_base_path("agent-local").expect("base path");
+        assert!(
+            !base_path.exists(),
+            "no .base should be written when target does not exist"
+        );
+    }
+
+    #[test]
+    fn init_draft_copies_existing_target_verbatim_when_no_source_flag() {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let xdg = dir.path().join("config");
+        std::fs::create_dir_all(&xdg).expect("create xdg");
+        let xdg_str = xdg.to_str().expect("utf8 xdg");
+        let _env = crate::test_env::EnvVarGuard::set_all(&[("XDG_CONFIG_HOME", xdg_str)]);
+
+        let profiles_dir = profile::user_profile_dir().expect("profile dir");
+        std::fs::create_dir_all(&profiles_dir).expect("create profiles");
+        let target = profile::get_user_profile_path("agent-local").expect("target path");
+        let target_bytes =
+            b"{\n  \"meta\": { \"name\": \"agent-local\" },\n  \"filesystem\": { \"read\": [\"/tmp\"] }\n}\n";
+        std::fs::write(&target, target_bytes).expect("write target");
+
+        let result = cmd_init(ProfileInitArgs {
+            name: "agent-local".to_string(),
+            extends: None,
+            groups: vec![],
+            description: None,
+            full: false,
+            output: None,
+            force: false,
+            draft: true,
+            source: None,
+        });
+        assert!(result.is_ok(), "expected ok, got: {:?}", result.err());
+
+        let draft_path = profile::get_user_profile_draft_path("agent-local").expect("draft path");
+        let draft_bytes = fs::read(&draft_path).expect("read draft");
+        assert_eq!(
+            draft_bytes, target_bytes,
+            "draft should be a byte-for-byte copy of the target"
+        );
+
+        let base_path =
+            profile::get_user_profile_draft_base_path("agent-local").expect("base path");
+        let base_hex = fs::read_to_string(&base_path).expect("read base");
+        assert_eq!(base_hex, sha256_hex(target_bytes));
+    }
+
+    #[test]
+    fn init_draft_source_existing_matches_auto_detect() {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let xdg = dir.path().join("config");
+        std::fs::create_dir_all(&xdg).expect("create xdg");
+        let xdg_str = xdg.to_str().expect("utf8 xdg");
+        let _env = crate::test_env::EnvVarGuard::set_all(&[("XDG_CONFIG_HOME", xdg_str)]);
+
+        let profiles_dir = profile::user_profile_dir().expect("profile dir");
+        std::fs::create_dir_all(&profiles_dir).expect("create profiles");
+        let target = profile::get_user_profile_path("agent-local").expect("target path");
+        let target_bytes = b"{\n  \"meta\": { \"name\": \"agent-local\" }\n}\n";
+        std::fs::write(&target, target_bytes).expect("write target");
+
+        let result = cmd_init(ProfileInitArgs {
+            name: "agent-local".to_string(),
+            extends: None,
+            groups: vec![],
+            description: None,
+            full: false,
+            output: None,
+            force: false,
+            draft: true,
+            source: Some(ProfileInitSource::Existing),
+        });
+        assert!(result.is_ok(), "expected ok, got: {:?}", result.err());
+
+        let draft_path = profile::get_user_profile_draft_path("agent-local").expect("draft path");
+        let draft_bytes = fs::read(&draft_path).expect("read draft");
+        assert_eq!(draft_bytes, target_bytes);
+    }
+
+    #[test]
+    fn init_draft_source_existing_without_target_errors_and_writes_nothing() {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let xdg = dir.path().join("config");
+        std::fs::create_dir_all(&xdg).expect("create xdg");
+        let xdg_str = xdg.to_str().expect("utf8 xdg");
+        let _env = crate::test_env::EnvVarGuard::set_all(&[("XDG_CONFIG_HOME", xdg_str)]);
+
+        let result = cmd_init(ProfileInitArgs {
+            name: "agent-local".to_string(),
+            extends: None,
+            groups: vec![],
+            description: None,
+            full: false,
+            output: None,
+            force: false,
+            draft: true,
+            source: Some(ProfileInitSource::Existing),
+        });
+        assert!(result.is_err());
+        let err = result.expect_err("error");
+        assert!(err.to_string().contains("does not exist"));
+
+        let draft_path = profile::get_user_profile_draft_path("agent-local").expect("draft path");
+        assert!(!draft_path.exists(), "nothing should be written on error");
+    }
+
+    #[test]
+    fn init_draft_source_template_without_target_generates_skeleton() {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let xdg = dir.path().join("config");
+        std::fs::create_dir_all(&xdg).expect("create xdg");
+        let xdg_str = xdg.to_str().expect("utf8 xdg");
+        let _env = crate::test_env::EnvVarGuard::set_all(&[("XDG_CONFIG_HOME", xdg_str)]);
+
+        let result = cmd_init(ProfileInitArgs {
+            name: "agent-local".to_string(),
+            extends: None,
+            groups: vec![],
+            description: None,
+            full: false,
+            output: None,
+            force: false,
+            draft: true,
+            source: Some(ProfileInitSource::Template),
+        });
+        assert!(result.is_ok(), "expected ok, got: {:?}", result.err());
+
+        let draft_path = profile::get_user_profile_draft_path("agent-local").expect("draft path");
+        assert!(draft_path.exists());
+        let base_path =
+            profile::get_user_profile_draft_base_path("agent-local").expect("base path");
+        assert!(!base_path.exists(), "no .base for a fresh template draft");
+    }
+
+    #[test]
+    fn init_draft_source_template_with_target_errors_and_writes_nothing() {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let xdg = dir.path().join("config");
+        std::fs::create_dir_all(&xdg).expect("create xdg");
+        let xdg_str = xdg.to_str().expect("utf8 xdg");
+        let _env = crate::test_env::EnvVarGuard::set_all(&[("XDG_CONFIG_HOME", xdg_str)]);
+
+        let profiles_dir = profile::user_profile_dir().expect("profile dir");
+        std::fs::create_dir_all(&profiles_dir).expect("create profiles");
+        let target = profile::get_user_profile_path("agent-local").expect("target path");
+        std::fs::write(
+            &target,
+            b"{\n  \"meta\": { \"name\": \"agent-local\" }\n}\n",
+        )
+        .expect("write target");
+
+        let result = cmd_init(ProfileInitArgs {
+            name: "agent-local".to_string(),
+            extends: None,
+            groups: vec![],
+            description: None,
+            full: false,
+            output: None,
+            force: false,
+            draft: true,
+            source: Some(ProfileInitSource::Template),
+        });
+        assert!(result.is_err());
+        let err = result.expect_err("error");
+        assert!(err.to_string().contains("already exists"));
+
+        let draft_path = profile::get_user_profile_draft_path("agent-local").expect("draft path");
+        assert!(!draft_path.exists(), "nothing should be written on error");
+    }
+
+    #[test]
+    fn init_draft_applies_cli_overrides_on_top_of_copy() {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let xdg = dir.path().join("config");
+        std::fs::create_dir_all(&xdg).expect("create xdg");
+        let xdg_str = xdg.to_str().expect("utf8 xdg");
+        let _env = crate::test_env::EnvVarGuard::set_all(&[("XDG_CONFIG_HOME", xdg_str)]);
+
+        let profiles_dir = profile::user_profile_dir().expect("profile dir");
+        std::fs::create_dir_all(&profiles_dir).expect("create profiles");
+        let target = profile::get_user_profile_path("agent-local").expect("target path");
+        std::fs::write(
+            &target,
+            r#"{
+  "meta": { "name": "agent-local", "description": "old description" },
+  "filesystem": { "read": ["/tmp"], "allow": ["/usr/bin/rg"] }
+}
+"#,
+        )
+        .expect("write target");
+
+        let result = cmd_init(ProfileInitArgs {
+            name: "agent-local".to_string(),
+            extends: Some("default".to_string()),
+            groups: vec!["deny_credentials".to_string()],
+            description: Some("new description".to_string()),
+            full: false,
+            output: None,
+            force: false,
+            draft: true,
+            source: None,
+        });
+        assert!(result.is_ok(), "expected ok, got: {:?}", result.err());
+
+        let draft_path = profile::get_user_profile_draft_path("agent-local").expect("draft path");
+        let content = fs::read_to_string(&draft_path).expect("read draft");
+        let value: serde_json::Value = serde_json::from_str(&content).expect("parse draft");
+        assert_eq!(value["extends"], "default");
+        assert_eq!(value["meta"]["description"], "new description");
+        assert_eq!(
+            value["groups"]["include"],
+            serde_json::json!(["deny_credentials"])
+        );
+        // Unrelated pre-existing content in the copy must survive untouched.
+        assert_eq!(value["filesystem"]["read"], serde_json::json!(["/tmp"]));
+        assert_eq!(
+            value["filesystem"]["allow"],
+            serde_json::json!(["/usr/bin/rg"])
+        );
+    }
+
+    #[test]
+    fn init_draft_full_is_rejected_when_seeded_from_existing() {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let xdg = dir.path().join("config");
+        std::fs::create_dir_all(&xdg).expect("create xdg");
+        let xdg_str = xdg.to_str().expect("utf8 xdg");
+        let _env = crate::test_env::EnvVarGuard::set_all(&[("XDG_CONFIG_HOME", xdg_str)]);
+
+        let profiles_dir = profile::user_profile_dir().expect("profile dir");
+        std::fs::create_dir_all(&profiles_dir).expect("create profiles");
+        let target = profile::get_user_profile_path("agent-local").expect("target path");
+        std::fs::write(
+            &target,
+            r#"{
+  "meta": { "name": "agent-local" },
+  "network": { "block": true, "allow_domain": ["example.com"] }
+}
+"#,
+        )
+        .expect("write target");
+
+        // Auto-detect resolves to `Existing` since the target already
+        // exists; `--full` has no defined meaning on top of a copy, so this
+        // must be rejected rather than attempting some merge.
+        let result = cmd_init(ProfileInitArgs {
+            name: "agent-local".to_string(),
+            extends: None,
+            groups: vec![],
+            description: None,
+            full: true,
+            output: None,
+            force: false,
+            draft: true,
+            source: None,
+        });
+        assert!(result.is_err());
+        let err = result.expect_err("error");
+        assert!(
+            err.to_string().contains("--full"),
+            "error should mention --full, got: {err}"
+        );
+
+        let draft_path = profile::get_user_profile_draft_path("agent-local").expect("draft path");
+        assert!(!draft_path.exists(), "nothing should be written on error");
+
+        // Same rejection when --source=existing is passed explicitly.
+        let result = cmd_init(ProfileInitArgs {
+            name: "agent-local".to_string(),
+            extends: None,
+            groups: vec![],
+            description: None,
+            full: true,
+            output: None,
+            force: false,
+            draft: true,
+            source: Some(ProfileInitSource::Existing),
+        });
+        assert!(result.is_err());
+        assert!(!draft_path.exists(), "nothing should be written on error");
+    }
+
+    #[test]
+    fn init_draft_and_output_are_mutually_exclusive() {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let xdg = dir.path().join("config");
+        std::fs::create_dir_all(&xdg).expect("create xdg");
+        let xdg_str = xdg.to_str().expect("utf8 xdg");
+        let _env = crate::test_env::EnvVarGuard::set_all(&[("XDG_CONFIG_HOME", xdg_str)]);
+
+        let result = cmd_init(ProfileInitArgs {
+            name: "agent-local".to_string(),
+            extends: None,
+            groups: vec![],
+            description: None,
+            full: false,
+            output: Some(PathBuf::from("/tmp/nono-test-draft-output.json")),
+            force: false,
+            draft: true,
+            source: None,
+        });
+        assert!(result.is_err());
+        let err = result.expect_err("error");
+        assert!(err.to_string().contains("--output cannot be combined"));
+    }
+
+    #[test]
+    fn init_draft_force_recreate_writes_base_once_target_appears() {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let xdg = dir.path().join("config");
+        std::fs::create_dir_all(&xdg).expect("create xdg");
+        let xdg_str = xdg.to_str().expect("utf8 xdg");
+        let _env = crate::test_env::EnvVarGuard::set_all(&[("XDG_CONFIG_HOME", xdg_str)]);
+
+        let base_path =
+            profile::get_user_profile_draft_base_path("agent-local").expect("base path");
+
+        // 1. Create the draft while the target is absent: no .base written.
+        let result = cmd_init(ProfileInitArgs {
+            name: "agent-local".to_string(),
+            extends: None,
+            groups: vec![],
+            description: None,
+            full: false,
+            output: None,
+            force: false,
+            draft: true,
+            source: None,
+        });
+        assert!(result.is_ok(), "expected ok, got: {:?}", result.err());
+        assert!(!base_path.exists());
+
+        // 2. Create the target out-of-band, then re-run with --force: a
+        // fresh .base must now be written.
+        let profiles_dir = profile::user_profile_dir().expect("profile dir");
+        std::fs::create_dir_all(&profiles_dir).expect("create profiles");
+        let target = profile::get_user_profile_path("agent-local").expect("target path");
+        let target_bytes = b"{\n  \"meta\": { \"name\": \"agent-local\" }\n}\n";
+        std::fs::write(&target, target_bytes).expect("write target");
+
+        let result = cmd_init(ProfileInitArgs {
+            name: "agent-local".to_string(),
+            extends: None,
+            groups: vec![],
+            description: None,
+            full: false,
+            output: None,
+            force: true,
+            draft: true,
+            source: None,
+        });
+        assert!(result.is_ok(), "expected ok, got: {:?}", result.err());
+        assert!(base_path.exists(), ".base should now be written");
+        let base_hex = fs::read_to_string(&base_path).expect("read base");
+        assert_eq!(base_hex, sha256_hex(target_bytes));
+
+        // 3. Remove the target again and re-run with --force. Clearing a
+        // stale `.base` here is deliberately NOT handled: `init --draft`
+        // only ever writes `.base` (when seeding from `Existing`) and
+        // otherwise leaves it alone. A leftover `.base` from a prior cycle
+        // just makes a later `promote` fail its hash check until the user
+        // regenerates the draft — a safe failure mode, not a correctness
+        // bug, and simpler than tracking removal here.
+        std::fs::remove_file(&target).expect("remove target");
+        let result = cmd_init(ProfileInitArgs {
+            name: "agent-local".to_string(),
+            extends: None,
+            groups: vec![],
+            description: None,
+            full: false,
+            output: None,
+            force: true,
+            draft: true,
+            source: None,
+        });
+        assert!(result.is_ok(), "expected ok, got: {:?}", result.err());
+        assert!(
+            base_path.exists(),
+            ".base is deliberately left in place (not cleared) once the target disappears again"
+        );
+    }
+
+    #[test]
+    fn init_draft_blocked_when_shadowing_builtin_and_no_target() {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let xdg = dir.path().join("config");
+        std::fs::create_dir_all(&xdg).expect("create xdg");
+        let xdg_str = xdg.to_str().expect("utf8 xdg");
+        let _env = crate::test_env::EnvVarGuard::set_all(&[("XDG_CONFIG_HOME", xdg_str)]);
+
+        let result = cmd_init(ProfileInitArgs {
+            name: "openclaw".to_string(),
+            extends: None,
+            groups: vec![],
+            description: None,
+            full: false,
+            output: None,
+            force: false,
+            draft: true,
+            source: None,
+        });
+        assert!(result.is_err());
+        let err = result.expect_err("error");
+        assert!(
+            matches!(err, nono::NonoError::Cancelled(_)),
+            "expected Cancelled (shadow block), got: {err}"
+        );
+    }
+
+    #[test]
+    fn init_draft_round_trip_promote_generate_mode() {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let xdg = dir.path().join("config");
+        std::fs::create_dir_all(&xdg).expect("create xdg");
+        let xdg_str = xdg.to_str().expect("utf8 xdg");
+        let _env = crate::test_env::EnvVarGuard::set_all(&[("XDG_CONFIG_HOME", xdg_str)]);
+
+        let init_result = cmd_init(ProfileInitArgs {
+            name: "agent-local".to_string(),
+            extends: None,
+            groups: vec![],
+            description: None,
+            full: false,
+            output: None,
+            force: false,
+            draft: true,
+            source: None,
+        });
+        assert!(init_result.is_ok(), "init: {:?}", init_result.err());
+
+        let draft_path = profile::get_user_profile_draft_path("agent-local").expect("draft path");
+        let draft_bytes = fs::read(&draft_path).expect("read draft");
+
+        let promote_result = cmd_promote(ProfilePromoteArgs {
+            name: "agent-local".to_string(),
+            diff: false,
+            yes: true,
+            help: None,
+        });
+        assert!(
+            promote_result.is_ok(),
+            "promote: {:?}",
+            promote_result.err()
+        );
+
+        let target = profile::get_user_profile_path("agent-local").expect("target path");
+        let target_bytes = fs::read(&target).expect("read target");
+        assert_eq!(target_bytes, draft_bytes);
+    }
+
+    #[test]
+    fn init_draft_round_trip_promote_template_with_full() {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let xdg = dir.path().join("config");
+        std::fs::create_dir_all(&xdg).expect("create xdg");
+        let xdg_str = xdg.to_str().expect("utf8 xdg");
+        let _env = crate::test_env::EnvVarGuard::set_all(&[("XDG_CONFIG_HOME", xdg_str)]);
+
+        // No live target: `--full` is only meaningful in `Template` mode,
+        // which is what auto-detect resolves to here.
+        let init_result = cmd_init(ProfileInitArgs {
+            name: "agent-local".to_string(),
+            extends: None,
+            groups: vec![],
+            description: None,
+            full: true,
+            output: None,
+            force: false,
+            draft: true,
+            source: None,
+        });
+        assert!(init_result.is_ok(), "init: {:?}", init_result.err());
+
+        let draft_path = profile::get_user_profile_draft_path("agent-local").expect("draft path");
+        let draft_bytes = fs::read(&draft_path).expect("read draft");
+
+        let promote_result = cmd_promote(ProfilePromoteArgs {
+            name: "agent-local".to_string(),
+            diff: false,
+            yes: true,
+            help: None,
+        });
+        assert!(
+            promote_result.is_ok(),
+            "promote: {:?}",
+            promote_result.err()
+        );
+
+        let target = profile::get_user_profile_path("agent-local").expect("target path");
+        let promoted_bytes = fs::read(&target).expect("read target");
+        assert_eq!(promoted_bytes, draft_bytes);
+        let promoted: serde_json::Value = serde_json::from_slice(&promoted_bytes).expect("parse");
+        assert_eq!(promoted["hooks"], serde_json::json!({}));
     }
 
     #[test]
@@ -3541,6 +4282,8 @@ mod tests {
             full: false,
             output: None,
             force: false,
+            draft: false,
+            source: None,
         };
         let output_path = profile::get_user_profile_path("copilot").expect("profile path");
 
@@ -3568,6 +4311,8 @@ mod tests {
             full: false,
             output: Some(output_path.clone()),
             force: false,
+            draft: false,
+            source: None,
         };
 
         assert_eq!(
@@ -3595,6 +4340,8 @@ mod tests {
             full: false,
             output: Some(tmp.clone()),
             force: false,
+            draft: false,
+            source: None,
         });
         assert!(result.is_err());
 
@@ -3607,6 +4354,8 @@ mod tests {
             full: false,
             output: Some(tmp.clone()),
             force: true,
+            draft: false,
+            source: None,
         });
         assert!(result.is_ok());
 
@@ -3629,6 +4378,8 @@ mod tests {
             full: false,
             output: None,
             force: false,
+            draft: false,
+            source: None,
         };
         let full_args = ProfileInitArgs {
             name: "full".to_string(),
@@ -3638,6 +4389,8 @@ mod tests {
             full: true,
             output: None,
             force: false,
+            draft: false,
+            source: None,
         };
         let minimal = build_skeleton(&minimal_args);
         let full = build_skeleton(&full_args);
@@ -3729,6 +4482,8 @@ mod tests {
             full: true,
             output: None,
             force: false,
+            draft: false,
+            source: None,
         };
         let skeleton = build_skeleton(&args);
         let json = serde_json::to_string(&skeleton).expect("serialize");
@@ -3754,6 +4509,8 @@ mod tests {
             full: false,
             output: None,
             force: false,
+            draft: false,
+            source: None,
         };
         let skeleton = build_skeleton(&args);
         let json = serde_json::to_string(&skeleton).expect("serialize");

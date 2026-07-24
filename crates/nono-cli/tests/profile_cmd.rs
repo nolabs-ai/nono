@@ -120,6 +120,125 @@ fn test_init_full_creates_all_additive_sections() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// ---------------------------------------------------------------------------
+// nono profile init --draft / nono profile promote
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_init_draft_then_promote_round_trip() {
+    let dir = std::env::temp_dir().join("nono-test-profile-init-draft-promote");
+    let _ = std::fs::remove_dir_all(&dir);
+    let xdg = dir.join("config");
+    std::fs::create_dir_all(&xdg).expect("create xdg config dir");
+
+    // 1. `init --draft` with no live target: should generate a fresh
+    // skeleton at ~/.config/nono/profile-drafts/<name>.json and write no
+    // .base sidecar.
+    let init = nono_bin()
+        .args([
+            "profile",
+            "init",
+            "draft-agent",
+            "--draft",
+            "--extends",
+            "default",
+            "--description",
+            "draft integration test",
+        ])
+        .env("XDG_CONFIG_HOME", &xdg)
+        .output()
+        .expect("failed to run nono profile init --draft");
+    assert!(
+        init.status.success(),
+        "expected exit 0, stderr: {}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+
+    let draft_path = xdg
+        .join("nono")
+        .join("profile-drafts")
+        .join("draft-agent.json");
+    assert!(draft_path.exists(), "draft file should be created");
+    let base_path = xdg
+        .join("nono")
+        .join("profile-drafts")
+        .join("draft-agent.base");
+    assert!(
+        !base_path.exists(),
+        ".base should not be written when there is no live target"
+    );
+
+    let draft_content = std::fs::read_to_string(&draft_path).expect("read draft");
+    let draft_val: serde_json::Value = serde_json::from_str(&draft_content).expect("parse json");
+    assert_eq!(draft_val["meta"]["name"], "draft-agent");
+    assert_eq!(draft_val["extends"], "default");
+
+    // 2. `nono profile validate --draft <name>` must accept it.
+    let validate = nono_bin()
+        .args(["profile", "validate", "--draft", "draft-agent"])
+        .env("XDG_CONFIG_HOME", &xdg)
+        .output()
+        .expect("failed to run nono profile validate --draft");
+    assert!(
+        validate.status.success(),
+        "draft should validate, stderr: {}",
+        String::from_utf8_lossy(&validate.stderr)
+    );
+
+    // 3. `nono profile promote <name>` should write the target and remove
+    // the draft.
+    let promote = nono_bin()
+        .args(["profile", "promote", "draft-agent", "--yes"])
+        .env("XDG_CONFIG_HOME", &xdg)
+        .output()
+        .expect("failed to run nono profile promote");
+    assert!(
+        promote.status.success(),
+        "expected exit 0, stderr: {}",
+        String::from_utf8_lossy(&promote.stderr)
+    );
+
+    let target_path = xdg.join("nono").join("profiles").join("draft-agent.json");
+    assert!(target_path.exists(), "promoted profile should exist");
+    assert!(
+        !draft_path.exists(),
+        "draft should be removed after promote"
+    );
+
+    let target_content = std::fs::read_to_string(&target_path).expect("read target");
+    assert_eq!(target_content, draft_content);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_init_draft_and_output_rejected() {
+    let dir = std::env::temp_dir().join("nono-test-profile-init-draft-output-conflict");
+    let _ = std::fs::remove_dir_all(&dir);
+    let xdg = dir.join("config");
+    std::fs::create_dir_all(&xdg).expect("create xdg config dir");
+    let out = dir.join("out.json");
+
+    let output = nono_bin()
+        .args(["profile", "init", "draft-agent", "--draft", "--output"])
+        .arg(&out)
+        .env("XDG_CONFIG_HOME", &xdg)
+        .output()
+        .expect("failed to run nono");
+
+    assert!(
+        !output.status.success(),
+        "--draft and --output should be mutually exclusive"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--output cannot be combined with --draft"),
+        "error should mention the conflict, got: {stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn test_init_rejects_existing_file_without_force() {
     let dir = std::env::temp_dir().join("nono-test-profile-init-noforce");

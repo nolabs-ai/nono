@@ -1438,24 +1438,7 @@ pub(crate) fn resolve_nonce_in_header_value(
     consumer: &str,
     resolver: &dyn crate::token::NonceResolver,
 ) -> Option<String> {
-    const NONCE_PREFIX: &str = "nono_";
-    const NONCE_LEN: usize = 5 + 64; // "nono_" + 64 hex chars
-
-    let start = value.find(NONCE_PREFIX)?;
-    let end = start.checked_add(NONCE_LEN)?;
-    if end > value.len() {
-        return None;
-    }
-    let nonce = &value[start..end];
-    if !nonce[NONCE_PREFIX.len()..]
-        .bytes()
-        .all(|b| b.is_ascii_hexdigit())
-    {
-        return None;
-    }
-    let real = resolver.resolve(nonce, consumer)?;
-    let real_str = std::str::from_utf8(&real).ok()?;
-    Some(format!("{}{}{}", &value[..start], real_str, &value[end..]))
+    resolver.rewrite_header_value(value, consumer)
 }
 
 /// Handle the AWS SigV4 arm of an intercepted inner request.

@@ -127,6 +127,7 @@ fn test_schema_command_policies_match_tool_sandbox_guide_shape() {
             "credential_format",
             "credential_key",
             "env_var",
+            "format",
             "inject_header",
             "mode",
             "path",

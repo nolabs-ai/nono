@@ -11,11 +11,11 @@ mod jwt;
 mod persist;
 mod rewrite;
 
-use self::endpoint::{LoadedOAuthEndpoint, load_endpoint, provider_consumer};
+use self::endpoint::{LoadedOAuthEndpoint, PhantomTemplate, load_endpoint, provider_consumer};
 use self::persist::{load_persisted_tokens, persist_tokens};
 use crate::config::OAuthCaptureConfig;
 use crate::error::{ProxyError, Result};
-use crate::token::NonceResolver;
+use crate::token::{NonceResolver, PHANTOM_BODY_HEX_LEN, rewrite_first_phantom};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -43,6 +43,9 @@ pub struct OAuthCaptureStore {
     by_host: HashMap<String, Vec<usize>>,
     phantoms: Mutex<HashMap<String, StoredOAuthToken>>,
     persist_path: Option<PathBuf>,
+    /// Distinct visible-phantom templates declared across all endpoints, used
+    /// to recognise and replace templated phantoms on egress.
+    templates: Vec<PhantomTemplate>,
 }
 
 const MAX_PERSISTED_PHANTOMS: usize = 4096;
@@ -92,11 +95,21 @@ impl OAuthCaptureStore {
             HashMap::new()
         };
 
+        let mut templates: Vec<PhantomTemplate> = Vec::new();
+        for endpoint in &endpoints {
+            for template in endpoint.templates() {
+                if !templates.contains(template) {
+                    templates.push(template.clone());
+                }
+            }
+        }
+
         Ok(Self {
             endpoints,
             by_host,
             phantoms: Mutex::new(phantoms),
             persist_path,
+            templates,
         })
     }
 
@@ -163,12 +176,14 @@ impl OAuthCaptureStore {
         endpoint
     }
 
+    /// Store `real` under the phantom key `phantom` (the string the sandbox
+    /// sees and later resents), admitting it for `admitted_consumers`.
     pub(super) fn store_phantom(
         &self,
+        phantom: &str,
         real: &[u8],
         admitted_consumers: &HashSet<String>,
-    ) -> Result<String> {
-        let phantom = generate_phantom()?;
+    ) -> Result<()> {
         let token = StoredOAuthToken {
             real: Zeroizing::new(real.to_vec()),
             admitted_consumers: admitted_consumers.clone(),
@@ -178,10 +193,10 @@ impl OAuthCaptureStore {
             .phantoms
             .lock()
             .map_err(|_| ProxyError::Config("OAuth capture store lock poisoned".to_string()))?;
-        guard.insert(phantom.clone(), token);
+        guard.insert(phantom.to_string(), token);
         prune_phantoms(&mut guard);
         self.persist_locked(&guard)?;
-        Ok(phantom)
+        Ok(())
     }
 
     fn persist_locked(&self, tokens: &HashMap<String, StoredOAuthToken>) -> Result<()> {
@@ -235,25 +250,38 @@ impl NonceResolver for OAuthCaptureStore {
         );
         Some(Zeroizing::new(token.real.to_vec()))
     }
+
+    fn rewrite_header_value(&self, value: &str, consumer: &str) -> Option<String> {
+        rewrite_first_phantom(value, &self.templates, |nonce| {
+            self.resolve(nonce, consumer)
+        })
+    }
 }
 
 fn phantom_fingerprint(phantom: &str) -> String {
-    let prefix_len = phantom.len().min(14);
-    format!("{}...", &phantom[..prefix_len])
+    // Take chars, not bytes: a templated phantom's prefix may be non-ASCII, and
+    // byte-slicing a multibyte boundary would panic in this log helper.
+    let head: String = phantom.chars().take(14).collect();
+    format!("{head}...")
 }
 
-fn generate_phantom() -> Result<String> {
+/// Generate a random 64-hex phantom body (32 bytes of entropy).
+fn generate_phantom_body() -> Result<String> {
     let mut bytes = [0u8; 32];
     getrandom::fill(&mut bytes)
         .map_err(|err| ProxyError::Config(format!("OAuth phantom token RNG failure: {err}")))?;
-    let mut out = String::with_capacity(69);
-    out.push_str("nono_");
+    let mut out = String::with_capacity(PHANTOM_BODY_HEX_LEN);
     for byte in bytes {
         out.push(HEX[(byte >> 4) as usize]);
         out.push(HEX[(byte & 0x0f) as usize]);
     }
     bytes.fill(0);
     Ok(out)
+}
+
+/// Generate a bare `nono_<64hex>` phantom.
+fn generate_phantom() -> Result<String> {
+    Ok(format!("nono_{}", generate_phantom_body()?))
 }
 
 const HEX: [char; 16] = [
@@ -485,8 +513,13 @@ mod tests {
     fn request_rewrite_resolves_form_refresh_phantom() {
         let store = store();
         let endpoint = store.lookup("auth.openai.com:443", "/oauth/token").unwrap();
-        let phantom = store
-            .store_phantom(b"real refresh/value", &endpoint.admitted_consumers)
+        let phantom = generate_phantom().unwrap();
+        store
+            .store_phantom(
+                &phantom,
+                b"real refresh/value",
+                &endpoint.admitted_consumers,
+            )
             .unwrap();
         let body = format!("grant_type=refresh_token&refresh_token={phantom}");
 
@@ -621,6 +654,7 @@ mod tests {
             .map(|path| OAuthTokenResponseFieldConfig {
                 path: path.to_string(),
                 kind: OAuthTokenResponseFieldKind::Opaque,
+                format: None,
             })
             .collect()
     }
@@ -629,6 +663,181 @@ mod tests {
         OAuthTokenResponseFieldConfig {
             path: path.to_string(),
             kind: OAuthTokenResponseFieldKind::Jwt,
+            format: None,
         }
+    }
+
+    fn templated_store(template: &str) -> OAuthCaptureStore {
+        OAuthCaptureStore::load(&[OAuthCaptureConfig {
+            provider: "anthropic".to_string(),
+            token_endpoints: vec![OAuthTokenEndpointConfig {
+                host: "https://platform.claude.com".to_string(),
+                path: "/v1/oauth/token".to_string(),
+                response_fields: vec![OAuthTokenResponseFieldConfig {
+                    path: "access_token".to_string(),
+                    kind: OAuthTokenResponseFieldKind::Opaque,
+                    format: Some(template.to_string()),
+                }],
+                request_body: OAuthTokenRequestBodyFormat::Auto,
+                request_nonce_fields: vec!["refresh_token".to_string()],
+            }],
+            admitted_consumers: vec!["proxy.anthropic".to_string()],
+        }])
+        .unwrap()
+    }
+
+    #[test]
+    fn templated_phantom_follows_template_and_round_trips_via_header() {
+        let store = templated_store("sk-ant-oat01-{}");
+        let endpoint = store
+            .lookup("platform.claude.com:443", "/v1/oauth/token")
+            .unwrap();
+        let rewritten = store
+            .rewrite_response_body(endpoint, br#"{"access_token":"real-oauth-token"}"#)
+            .unwrap();
+        let json: Value = serde_json::from_slice(&rewritten).unwrap();
+        let phantom = json["access_token"].as_str().unwrap();
+
+        // Visible phantom follows the template exactly: prefix + 64 hex, no marker.
+        assert!(phantom.starts_with("sk-ant-oat01-"));
+        assert!(!phantom.contains("nono_"));
+        let body = phantom.strip_prefix("sk-ant-oat01-").unwrap();
+        assert_eq!(body.len(), 64);
+        assert!(body.bytes().all(|b| b.is_ascii_hexdigit()));
+
+        // On egress the whole templated span resolves to the real token, with
+        // no leftover template text.
+        let header = format!("Bearer {phantom}");
+        let resolved = store
+            .rewrite_header_value(&header, "proxy.anthropic")
+            .expect("admitted consumer resolves templated phantom");
+        assert_eq!(resolved, "Bearer real-oauth-token");
+    }
+
+    #[test]
+    fn templated_phantom_does_not_resolve_for_unadmitted_consumer() {
+        let store = templated_store("sk-ant-oat01-{}");
+        let endpoint = store
+            .lookup("platform.claude.com:443", "/v1/oauth/token")
+            .unwrap();
+        let rewritten = store
+            .rewrite_response_body(endpoint, br#"{"access_token":"real-oauth-token"}"#)
+            .unwrap();
+        let json: Value = serde_json::from_slice(&rewritten).unwrap();
+        let phantom = json["access_token"].as_str().unwrap();
+        let header = format!("Bearer {phantom}");
+        assert!(
+            store.rewrite_header_value(&header, "proxy.other").is_none(),
+            "unadmitted consumer must not resolve"
+        );
+    }
+
+    #[test]
+    fn format_rejected_with_jwt_kind() {
+        let err = OAuthCaptureStore::load(&[OAuthCaptureConfig {
+            provider: "anthropic".to_string(),
+            token_endpoints: vec![OAuthTokenEndpointConfig {
+                host: "https://platform.claude.com".to_string(),
+                path: "/v1/oauth/token".to_string(),
+                response_fields: vec![OAuthTokenResponseFieldConfig {
+                    path: "access_token".to_string(),
+                    kind: OAuthTokenResponseFieldKind::Jwt,
+                    format: Some("sk-ant-oat01-{}".to_string()),
+                }],
+                request_body: OAuthTokenRequestBodyFormat::Auto,
+                request_nonce_fields: vec!["refresh_token".to_string()],
+            }],
+            admitted_consumers: vec!["proxy.anthropic".to_string()],
+        }]);
+        let msg = err.unwrap_err().to_string();
+        assert!(
+            msg.contains("only valid with kind 'opaque'"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn templated_capture_warns_on_drift_but_still_mints_and_resolves() {
+        // Real token does not match the declared prefix (drift). The phantom is
+        // still minted following the template and round-trips on egress.
+        let store = templated_store("sk-ant-oat01-{}");
+        let endpoint = store
+            .lookup("platform.claude.com:443", "/v1/oauth/token")
+            .unwrap();
+        let rewritten = store
+            .rewrite_response_body(endpoint, br#"{"access_token":"totally-different-shape"}"#)
+            .unwrap();
+        let json: Value = serde_json::from_slice(&rewritten).unwrap();
+        let phantom = json["access_token"].as_str().unwrap();
+        assert!(phantom.starts_with("sk-ant-oat01-"));
+        assert!(!phantom.contains("nono_"));
+        let resolved = store
+            .rewrite_header_value(&format!("Bearer {phantom}"), "proxy.anthropic")
+            .expect("drifted-format phantom still resolves");
+        assert_eq!(resolved, "Bearer totally-different-shape");
+    }
+
+    #[test]
+    fn multiple_templates_resolve_independently() {
+        // Two providers, two distinct template shapes on the same store.
+        let store = OAuthCaptureStore::load(&[
+            OAuthCaptureConfig {
+                provider: "anthropic".to_string(),
+                token_endpoints: vec![OAuthTokenEndpointConfig {
+                    host: "https://platform.claude.com".to_string(),
+                    path: "/v1/oauth/token".to_string(),
+                    response_fields: vec![OAuthTokenResponseFieldConfig {
+                        path: "access_token".to_string(),
+                        kind: OAuthTokenResponseFieldKind::Opaque,
+                        format: Some("sk-ant-oat01-{}".to_string()),
+                    }],
+                    request_body: OAuthTokenRequestBodyFormat::Auto,
+                    request_nonce_fields: vec!["refresh_token".to_string()],
+                }],
+                admitted_consumers: vec!["proxy.anthropic".to_string()],
+            },
+            OAuthCaptureConfig {
+                provider: "other".to_string(),
+                token_endpoints: vec![OAuthTokenEndpointConfig {
+                    host: "https://auth.other.com".to_string(),
+                    path: "/token".to_string(),
+                    response_fields: vec![OAuthTokenResponseFieldConfig {
+                        path: "access_token".to_string(),
+                        kind: OAuthTokenResponseFieldKind::Opaque,
+                        format: Some("oth_{}".to_string()),
+                    }],
+                    request_body: OAuthTokenRequestBodyFormat::Auto,
+                    request_nonce_fields: vec!["refresh_token".to_string()],
+                }],
+                admitted_consumers: vec!["proxy.other".to_string()],
+            },
+        ])
+        .unwrap();
+
+        let mint = |host: &str, path: &str, consumer: &str, real: &str| {
+            let endpoint = store.lookup(host, path).unwrap();
+            let body = format!(r#"{{"access_token":"{real}"}}"#);
+            let rewritten = store
+                .rewrite_response_body(endpoint, body.as_bytes())
+                .unwrap();
+            let json: Value = serde_json::from_slice(&rewritten).unwrap();
+            let phantom = json["access_token"].as_str().unwrap().to_string();
+            let resolved = store
+                .rewrite_header_value(&format!("Bearer {phantom}"), consumer)
+                .expect("resolves");
+            (phantom, resolved)
+        };
+
+        let (p_a, r_a) = mint(
+            "platform.claude.com:443",
+            "/v1/oauth/token",
+            "proxy.anthropic",
+            "A",
+        );
+        let (p_o, r_o) = mint("auth.other.com:443", "/token", "proxy.other", "B");
+        assert!(p_a.starts_with("sk-ant-oat01-"));
+        assert!(p_o.starts_with("oth_"));
+        assert_eq!(r_a, "Bearer A");
+        assert_eq!(r_o, "Bearer B");
     }
 }

@@ -864,6 +864,13 @@ impl crate::token::NonceResolver for CompositeNonceResolver {
             .and_then(|resolver| resolver.resolve(nonce, consumer))
             .or_else(|| self.oauth.resolve(nonce, consumer))
     }
+
+    fn rewrite_header_value(&self, value: &str, consumer: &str) -> Option<String> {
+        self.external
+            .as_ref()
+            .and_then(|resolver| resolver.rewrite_header_value(value, consumer))
+            .or_else(|| self.oauth.rewrite_header_value(value, consumer))
+    }
 }
 
 /// Start the proxy server.
@@ -2504,10 +2511,12 @@ mod tests {
                         crate::config::OAuthTokenResponseFieldConfig {
                             path: "access_token".to_string(),
                             kind: crate::config::OAuthTokenResponseFieldKind::Opaque,
+                            format: None,
                         },
                         crate::config::OAuthTokenResponseFieldConfig {
                             path: "refresh_token".to_string(),
                             kind: crate::config::OAuthTokenResponseFieldKind::Opaque,
+                            format: None,
                         },
                     ],
                     request_body: crate::config::OAuthTokenRequestBodyFormat::Auto,

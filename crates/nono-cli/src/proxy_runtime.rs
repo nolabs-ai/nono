@@ -2542,6 +2542,7 @@ fn synthesize_credential_provider_proxy_config(
                                 nono_proxy::config::OAuthTokenResponseFieldKind::Jwt
                             }
                         },
+                        format: field.format.clone(),
                     })
                     .collect(),
                 request_body: match endpoint.request_body {
@@ -2681,6 +2682,10 @@ struct TokenBrokerNonceResolver(crate::tool_sandbox::token_broker::SharedBroker)
 impl nono_proxy::NonceResolver for TokenBrokerNonceResolver {
     fn resolve(&self, nonce: &str, consumer: &str) -> Option<Zeroizing<Vec<u8>>> {
         self.0.lock().ok()?.resolve_nonce(nonce, consumer)
+    }
+
+    fn rewrite_header_value(&self, value: &str, consumer: &str) -> Option<String> {
+        self.0.lock().ok()?.rewrite_header_value(value, consumer)
     }
 }
 
@@ -4758,10 +4763,12 @@ mod tests {
                         crate::profile::CredentialProviderResponseField {
                             path: "access_token".to_string(),
                             kind: crate::profile::CredentialProviderResponseFieldKind::Opaque,
+                            format: None,
                         },
                         crate::profile::CredentialProviderResponseField {
                             path: "refresh_token".to_string(),
                             kind: crate::profile::CredentialProviderResponseFieldKind::Opaque,
+                            format: None,
                         },
                     ],
                     request_body: crate::profile::CredentialProviderRequestBodyFormat::Auto,

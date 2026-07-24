@@ -414,6 +414,10 @@
             "enum": ["opaque", "jwt"],
             "default": "opaque",
             "description": "Visible phantom format. Use jwt only when a client locally parses the token as a JWT and does not resend it as a bearer token."
+          },
+          "format": {
+            "type": "string",
+            "description": "Optional literal template for the visible phantom, with '{}' standing in for a freshly minted random body (e.g. 'sk-ant-oat01-{}'). The phantom follows the template exactly so a client that classifies a credential by sniffing a literal token prefix still recognises it. Stripped on egress before the real credential is substituted. Only valid with kind 'opaque'."
           }
         }
       }
@@ -1298,6 +1302,10 @@
         "tls_client_key": {
           "type": "string",
           "description": "Optional PEM client private key for proxy credential mutual TLS. Must be paired with tls_client_cert."
+        },
+        "format": {
+          "type": "string",
+          "description": "Optional literal template for the visible phantom the sandbox sees, with '{}' standing in for a freshly minted random body (e.g. 'sk-ant-oat01-{}'). Lets a client that classifies a credential by sniffing a literal token prefix recognise the phantom. Only valid for ambient credentials."
         }
       }
     },

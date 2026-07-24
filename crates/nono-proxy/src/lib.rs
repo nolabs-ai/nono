@@ -33,6 +33,7 @@ pub mod forward;
 pub mod oauth2;
 pub mod oauth_capture;
 pub mod pool;
+pub mod rate_limit;
 pub mod reverse;
 pub mod route;
 pub mod server;

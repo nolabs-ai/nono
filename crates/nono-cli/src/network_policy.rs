@@ -271,6 +271,7 @@ pub fn resolve_credentials(
                 oauth2,
                 aws_auth: cred.aws_auth.clone(),
                 spiffe: cred.spiffe.clone(),
+                rate_limit: cred.rate_limit.clone(),
             });
         } else if let Some(cred) = policy.credentials.get(name) {
             // Validate env_var against dangerous variable blocklist
@@ -305,6 +306,7 @@ pub fn resolve_credentials(
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                rate_limit: None,
             });
         }
         // We already validated existence above, so this else branch won't be hit
@@ -466,6 +468,7 @@ pub fn partition_allow_domain(
                         oauth2: None,
                         aws_auth: None,
                         spiffe: None,
+                        rate_limit: None,
                     });
                 }
             }
@@ -622,6 +625,7 @@ mod tests {
                 tls_client_key: None,
                 aws_auth: None,
                 spiffe: None,
+                rate_limit: None,
             },
         );
 
@@ -665,6 +669,7 @@ mod tests {
                 tls_client_key: None,
                 aws_auth: None,
                 spiffe: None,
+                rate_limit: None,
             },
         );
 
@@ -704,6 +709,7 @@ mod tests {
                 tls_client_key: None,
                 aws_auth: None,
                 spiffe: None,
+                rate_limit: None,
             },
         );
 
@@ -753,6 +759,7 @@ mod tests {
                 tls_client_key: None,
                 aws_auth: None,
                 spiffe: None,
+                rate_limit: None,
             },
         );
 
@@ -842,6 +849,7 @@ mod tests {
                 tls_client_key: None,
                 aws_auth: None,
                 spiffe: None,
+                rate_limit: None,
             },
         );
 
@@ -878,6 +886,7 @@ mod tests {
                 tls_client_key: None,
                 aws_auth: None,
                 spiffe: None,
+                rate_limit: None,
             },
         );
 
@@ -914,6 +923,7 @@ mod tests {
                 tls_client_key: None,
                 aws_auth: None,
                 spiffe: None,
+                rate_limit: None,
             },
         );
 
@@ -955,6 +965,7 @@ mod tests {
                 tls_client_key: None,
                 aws_auth: None,
                 spiffe: None,
+                rate_limit: None,
             },
         );
 
@@ -1090,6 +1101,7 @@ mod tests {
                 tls_client_key: None,
                 aws_auth: None,
                 spiffe: None,
+                rate_limit: None,
             },
         );
 
@@ -1183,6 +1195,7 @@ mod tests {
                 tls_client_key: None,
                 aws_auth: None,
                 spiffe: None,
+                rate_limit: None,
             },
         );
 
@@ -1234,6 +1247,7 @@ mod tests {
                 tls_client_key: None,
                 aws_auth: None,
                 spiffe: None,
+                rate_limit: None,
             },
         );
 
@@ -1391,6 +1405,7 @@ mod tests {
                 tls_client_key: None,
                 aws_auth: None,
                 spiffe: None,
+                rate_limit: None,
             },
         );
 
@@ -1433,6 +1448,7 @@ mod tests {
                 tls_client_key: None,
                 aws_auth: None,
                 spiffe: None,
+                rate_limit: None,
             },
         );
         custom.insert(
@@ -1456,6 +1472,7 @@ mod tests {
                 tls_client_key: None,
                 aws_auth: None,
                 spiffe: None,
+                rate_limit: None,
             },
         );
 

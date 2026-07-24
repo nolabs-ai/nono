@@ -821,6 +821,18 @@ pub struct RouteConfig {
     /// See `SpiffeAuthConfig` for JWT-SVID options.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spiffe: Option<SpiffeAuthConfig>,
+
+    /// Optional per-route request-rate limit (RouteRateLimiter).
+    ///
+    /// Caps the rate of L7 requests forwarded to this route's upstream to
+    /// contain a runaway or compromised agent. Absent means no limit.
+    ///
+    /// Applies **only to L7-visible traffic** — reverse-proxy routes and
+    /// TLS-intercepted CONNECT. It has no effect on an opaque CONNECT tunnel
+    /// (a route without interception), where the proxy sees a single TCP
+    /// stream and cannot count individual requests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit: Option<RouteRateLimitConfig>,
 }
 
 /// SPIFFE/SPIRE auth for an upstream route.
@@ -856,6 +868,41 @@ pub enum SpiffeAuthConfig {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         svid_hint: Option<String>,
     },
+}
+
+/// Per-route request-rate limit configuration for a [`RouteConfig`].
+///
+/// A token bucket refilling at `requests_per_minute` and holding up to `burst`
+/// tokens. When the bucket is empty, overshoot is delayed up to
+/// `max_delay_secs`; a request that would wait longer is rejected with HTTP
+/// 429. See
+/// `docs/adr/0001-route-rate-limiter-bounded-throttle-then-reject.md`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouteRateLimitConfig {
+    /// Sustained request rate, in requests per minute. The token bucket refills
+    /// at this rate. A value of 0 disables the limiter for the route.
+    pub requests_per_minute: u32,
+
+    /// Burst capacity: instantaneous requests allowed before throttling begins.
+    /// Clamped to at least 1 at runtime so a single request always passes on an
+    /// idle route.
+    #[serde(default = "default_rate_limit_burst")]
+    pub burst: u32,
+
+    /// Maximum seconds a request may be delayed before it is rejected (429).
+    /// Bounds the implicit delay queue so a flood cannot exhaust proxy
+    /// resources.
+    #[serde(default = "default_rate_limit_max_delay_secs")]
+    pub max_delay_secs: u64,
+}
+
+fn default_rate_limit_burst() -> u32 {
+    5
+}
+
+fn default_rate_limit_max_delay_secs() -> u64 {
+    5
 }
 
 /// Optional proxy-side overrides for credential injection shape.

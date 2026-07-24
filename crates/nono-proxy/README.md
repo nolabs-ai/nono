@@ -22,6 +22,37 @@ Network filtering proxy for the [nono](https://crates.io/crates/nono) sandbox.
 - **Credential isolation** -- API keys are loaded from the OS keyring, stored in `Zeroizing<String>`, injected at the HTTP header level, and never exposed to the sandboxed process.
 - **Constant-time token comparison** -- Prevents timing side-channel attacks on session token validation.
 
+## Rate Limiting
+
+Each route may declare an optional per-route request-rate limit (a
+`RouteRateLimiter`) to contain a runaway or compromised agent:
+
+```toml
+[[routes]]
+prefix = "openai"
+upstream = "https://api.openai.com"
+credential_key = "openai_api_key"
+
+[routes.rate_limit]
+requests_per_minute = 120   # token-bucket refill rate
+burst = 5                   # instantaneous headroom (default 5)
+max_delay_secs = 5          # longest a request waits before 429 (default 5)
+```
+
+A token bucket refills at `requests_per_minute` and holds up to `burst` tokens.
+When the bucket is empty, a request is delayed until a token accrues, up to
+`max_delay_secs`; a request that would wait longer is rejected with **HTTP 429**.
+Overload is a bounded delay then reject -- never a human approval prompt and
+never an unbounded wait (which would let a flood exhaust the proxy). See
+[`docs/adr/0001-route-rate-limiter-bounded-throttle-then-reject.md`](../../docs/adr/0001-route-rate-limiter-bounded-throttle-then-reject.md).
+
+**Scope:** the limiter acts only on **L7-visible** traffic -- reverse-proxy
+routes and TLS-intercepted CONNECT. It has **no effect** on an opaque CONNECT
+tunnel (a route without interception), where the proxy sees a single TCP stream
+and cannot count individual requests. Use per-route interception
+(`endpoint_rules` / `credential_key`) if you need request-level limiting on a
+CONNECT host.
+
 ## Usage
 
 ```rust

@@ -113,7 +113,7 @@ toml.workspace = true
 serde.workspace = true
 
 [dev-dependencies]
-jsonschema = "0.46"
+jsonschema = "0.48"
 proptest = "1"
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 

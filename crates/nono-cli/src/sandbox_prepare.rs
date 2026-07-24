@@ -771,14 +771,17 @@ fn has_proxy_intent(args: &SandboxArgs, prepared: &PreparedSandbox) -> bool {
         || prepared.upstream_proxy.is_some()
 }
 
+fn has_upstream_proxy(args: &SandboxArgs, prepared: &PreparedSandbox) -> bool {
+    args.external_proxy.is_some() || prepared.upstream_proxy.is_some()
+}
+
 pub(crate) fn validate_external_proxy_bypass(
     args: &SandboxArgs,
     prepared: &PreparedSandbox,
 ) -> Result<()> {
     let has_bypass = !args.external_proxy_bypass.is_empty() || !prepared.upstream_bypass.is_empty();
-    let has_external_proxy = args.external_proxy.is_some() || prepared.upstream_proxy.is_some();
 
-    if has_bypass && !has_external_proxy {
+    if has_bypass && !has_upstream_proxy(args, prepared) {
         return Err(NonoError::ConfigParse(
             "--upstream-bypass requires --upstream-proxy \
              (or upstream_proxy in profile network config)"
@@ -786,6 +789,14 @@ pub(crate) fn validate_external_proxy_bypass(
         ));
     }
     Ok(())
+}
+
+pub(crate) fn validate_proxy_conflicts(
+    args: &SandboxArgs,
+    prepared: &PreparedSandbox,
+) -> Result<()> {
+    validate_block_net_conflicts(args, prepared)?;
+    validate_external_proxy_bypass(args, prepared)
 }
 
 /// Validate that `--block-net` is not combined with flags that imply proxy
@@ -827,6 +838,14 @@ pub(crate) fn validate_block_net_conflicts(
             return Err(NonoError::ConfigParse(
                 "--block-net and --allow-domain are contradictory: \
                  domain filtering requires proxy mode"
+                    .to_string(),
+            ));
+        }
+
+        if has_upstream_proxy(args, prepared) {
+            return Err(NonoError::ConfigParse(
+                "--block-net and --upstream-proxy are contradictory: \
+                 upstream proxy routing requires proxy mode"
                     .to_string(),
             ));
         }
@@ -2509,6 +2528,24 @@ mod tests {
     }
 
     #[test]
+    fn block_net_with_upstream_proxy_errors() {
+        let args = SandboxArgs {
+            block_net: true,
+            external_proxy: Some("squid.corp:3128".to_string()),
+            ..Default::default()
+        };
+        let prepared = empty_prepared();
+        let result = validate_block_net_conflicts(&args, &prepared);
+        let Err(err) = result else {
+            panic!("expected error for --block-net + --upstream-proxy");
+        };
+        assert!(
+            err.to_string().contains("--block-net") && err.to_string().contains("--upstream-proxy"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn block_net_alone_is_valid() {
         let args = SandboxArgs {
             block_net: true,
@@ -2528,6 +2565,22 @@ mod tests {
             .expect_err("expected error for profile network block + profile credential");
         assert!(
             err.to_string().contains("--block-net") && err.to_string().contains("--credential"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn profile_network_block_with_upstream_proxy_from_profile_errors() {
+        let args = SandboxArgs::default();
+        let mut prepared = empty_prepared();
+        prepared.profile_network_block = true;
+        prepared.upstream_proxy = Some("squid.corp:3128".to_string());
+        let result = validate_block_net_conflicts(&args, &prepared);
+        let Err(err) = result else {
+            panic!("expected error for profile network block + profile upstream proxy");
+        };
+        assert!(
+            err.to_string().contains("--block-net") && err.to_string().contains("--upstream-proxy"),
             "unexpected error: {err}"
         );
     }

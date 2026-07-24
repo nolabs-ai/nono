@@ -227,6 +227,16 @@ async fn open_upstream_h2(
         })
 }
 
+/// `true` if `request` is an RFC 8441 extended CONNECT for the `websocket`
+/// protocol (`:method: CONNECT` + `:protocol: websocket`).
+fn is_extended_connect_websocket<T>(request: &Request<T>) -> bool {
+    request.method() == http::Method::CONNECT
+        && request
+            .extensions()
+            .get::<h2::ext::Protocol>()
+            .is_some_and(|protocol| protocol.as_str().eq_ignore_ascii_case("websocket"))
+}
+
 /// Handle a single h2 request stream: route selection, credential injection,
 /// and bidirectional body streaming.
 async fn handle_h2_stream(
@@ -264,14 +274,27 @@ async fn handle_h2_stream(
     // gRPC traffic.
     let method_str = method.as_str().to_string();
 
+    // RFC 8441 extended CONNECT (`:method: CONNECT` + `:protocol: websocket`) is
+    // the HTTP/2 equivalent of an HTTP/1.1 `Upgrade: websocket` request. This
+    // server doesn't call `enable_connect_protocol()`, so the h2 crate itself
+    // currently rejects such streams before they reach here — but the gate
+    // below must still route any that do arrive through the same
+    // `upgrade_rules` check as the HTTP/1.1 path, so enabling extended CONNECT
+    // in the future (e.g. for h2 WebSocket tunneling) can't silently bypass
+    // the route's WebSocket allowlist.
+    let is_websocket_upgrade = is_extended_connect_websocket(&request);
+
     // Audit context is populated per-stream when credentials are acquired.
     let mut spiffe_audit_ctx: Option<nono::undo::SpiffeAuditContext> = None;
     let selected = match handle::select_intercept_route(
         &ctx.route_store,
         &ctx.host,
         ctx.port,
-        &method_str,
-        &path,
+        handle::InterceptRouteRequest {
+            method: &method_str,
+            path: &path,
+            websocket_path: is_websocket_upgrade.then_some(path.as_str()),
+        },
         ctx.audit_log.as_ref(),
         ctx.approval_backends.as_ref(),
     )
@@ -283,8 +306,8 @@ async fn handle_h2_stream(
         }
         RouteSelection::Selected(selected) => selected,
     };
-    let service: Option<&str> = selected.map(|(s, _)| s);
-    let route: Option<&crate::route::LoadedRoute> = selected.map(|(_, r)| r);
+    let service = selected.map(|selected| selected.id);
+    let route = selected.map(|selected| selected.route);
 
     // Managed credential gating, AWS handling, and command-backed capture are
     // shared with the HTTP/1.1 path via [`handle::resolve_managed_credential`]
@@ -357,6 +380,7 @@ async fn handle_h2_stream(
     // carries a broker nonce in a header would forward the raw nonce upstream
     // instead of the resolved credential.
     let nonce_consumer = service.map(|s| format!("proxy.{s}"));
+    let redeem_phantoms: &[String] = route.map_or(&[], |r| r.redeem_phantoms.as_slice());
     let mut upstream_headers = HeaderMap::new();
     for (name, value) in request.headers() {
         let name_lower = name.as_str().to_lowercase();
@@ -401,7 +425,12 @@ async fn handle_h2_stream(
             .and_then(|v| {
                 nonce_consumer.as_deref().and_then(|consumer| {
                     ctx.nonce_resolver.as_deref().and_then(|resolver| {
-                        handle::resolve_nonce_in_header_value(v, consumer, resolver)
+                        handle::resolve_nonce_in_header_value(
+                            v,
+                            consumer,
+                            redeem_phantoms,
+                            resolver,
+                        )
                     })
                 })
             })
@@ -742,6 +771,7 @@ mod tests {
         tls_connector: &tokio_rustls::TlsConnector,
     ) -> (RouteStore, CredentialStore) {
         let routes = vec![RouteConfig {
+            redeem_phantoms: Vec::new(),
             prefix: "cmd-svc".to_string(),
             upstream: format!("https://{}:{}", host, port),
             credential_key: Some("cmd://my-cmd-cred".to_string()),
@@ -764,6 +794,7 @@ mod tests {
             aws_auth: None,
             endpoint_policy: None,
             spiffe: None,
+            upgrades: vec![],
         }];
         let route_store = RouteStore::load(&routes).await.unwrap();
         let credential_store = CredentialStore::load_with_diagnostics(&routes, tls_connector)
@@ -822,6 +853,7 @@ mod tests {
     /// Build a RouteStore with a single route pointing at `host:port`.
     async fn make_route_store(host: &str, port: u16, rules: Vec<EndpointRule>) -> RouteStore {
         let routes = vec![RouteConfig {
+            redeem_phantoms: Vec::new(),
             prefix: "test-svc".to_string(),
             upstream: format!("https://{}:{}", host, port),
             credential_key: None,
@@ -841,6 +873,7 @@ mod tests {
             aws_auth: None,
             endpoint_policy: None,
             spiffe: None,
+            upgrades: vec![],
         }];
         RouteStore::load(&routes).await.unwrap()
     }
@@ -1536,6 +1569,7 @@ mod tests {
 
         // Route configured for AWS SigV4 (h2 signing not yet implemented).
         let routes = vec![RouteConfig {
+            redeem_phantoms: Vec::new(),
             prefix: "aws-svc".to_string(),
             upstream: format!("https://localhost:{}", upstream_port),
             credential_key: None,
@@ -1562,6 +1596,7 @@ mod tests {
             }),
             endpoint_policy: None,
             spiffe: None,
+            upgrades: vec![],
         }];
         let route_store = RouteStore::load(&routes).await.unwrap();
         // Set fake AWS credential env vars so the default chain succeeds and
@@ -1925,6 +1960,7 @@ mod tests {
 
         let routes = vec![
             RouteConfig {
+                redeem_phantoms: Vec::new(),
                 prefix: "svc-a".to_string(),
                 upstream: format!("https://localhost:{}", upstream_port),
                 credential_key: None,
@@ -1947,8 +1983,10 @@ mod tests {
                 aws_auth: None,
                 endpoint_policy: None,
                 spiffe: None,
+                upgrades: vec![],
             },
             RouteConfig {
+                redeem_phantoms: Vec::new(),
                 prefix: "svc-b".to_string(),
                 upstream: format!("https://localhost:{}", upstream_port),
                 credential_key: None,
@@ -1971,6 +2009,7 @@ mod tests {
                 aws_auth: None,
                 endpoint_policy: None,
                 spiffe: None,
+                upgrades: vec![],
             },
         ];
         let route_store = RouteStore::load(&routes).await.unwrap();
@@ -2128,6 +2167,7 @@ mod tests {
         rules: Vec<EndpointRule>,
     ) -> RouteStore {
         let routes = vec![RouteConfig {
+            redeem_phantoms: Vec::new(),
             prefix: "_ep_test".to_string(),
             upstream: format!("https://{}:{}", host, port),
             credential_key: None,
@@ -2147,8 +2187,51 @@ mod tests {
             aws_auth: None,
             endpoint_policy: None,
             spiffe: None,
+            upgrades: vec![],
         }];
         RouteStore::load(&routes).await.unwrap()
+    }
+
+    // Regression tests for `is_extended_connect_websocket`: an RFC 8441
+    // extended CONNECT must be classified so it can be routed through the
+    // same `upgrade_rules` gate as the HTTP/1.1 `Upgrade: websocket` path
+    // (see `handle_h2_stream`, which previously hardcoded
+    // `websocket_path: None` and never applied this gate at all).
+
+    #[test]
+    fn is_extended_connect_websocket_true_for_connect_with_websocket_protocol() {
+        let request = http::Request::builder()
+            .method("CONNECT")
+            .extension(h2::ext::Protocol::from_static("websocket"))
+            .body(())
+            .unwrap();
+        assert!(is_extended_connect_websocket(&request));
+    }
+
+    #[test]
+    fn is_extended_connect_websocket_false_for_plain_connect() {
+        let request = http::Request::builder().method("CONNECT").body(()).unwrap();
+        assert!(!is_extended_connect_websocket(&request));
+    }
+
+    #[test]
+    fn is_extended_connect_websocket_false_for_non_connect_method_with_protocol_extension() {
+        let request = http::Request::builder()
+            .method("GET")
+            .extension(h2::ext::Protocol::from_static("websocket"))
+            .body(())
+            .unwrap();
+        assert!(!is_extended_connect_websocket(&request));
+    }
+
+    #[test]
+    fn is_extended_connect_websocket_false_for_other_protocol() {
+        let request = http::Request::builder()
+            .method("CONNECT")
+            .extension(h2::ext::Protocol::from_static("webtransport"))
+            .body(())
+            .unwrap();
+        assert!(!is_extended_connect_websocket(&request));
     }
 
     #[tokio::test]
@@ -2254,6 +2337,7 @@ mod tests {
         // No legacy endpoint_rules — so the legacy path would treat this as a
         // catch-all and forward the request.
         let routes = vec![RouteConfig {
+            redeem_phantoms: Vec::new(),
             prefix: "_ep_policy".to_string(),
             upstream: format!("https://localhost:{}", upstream_port),
             credential_key: None,
@@ -2288,6 +2372,7 @@ mod tests {
                 }],
             }),
             spiffe: None,
+            upgrades: vec![],
         }];
         let route_store = RouteStore::load(&routes).await.unwrap();
         let credential_store = CredentialStore::empty();
@@ -2459,6 +2544,7 @@ mod tests {
         let routes = vec![
             // Credential catch-all (no endpoint_rules)
             RouteConfig {
+                redeem_phantoms: Vec::new(),
                 prefix: "github-cred".to_string(),
                 upstream: format!("https://localhost:{}", upstream_port),
                 credential_key: Some("gh-token".to_string()),
@@ -2478,9 +2564,11 @@ mod tests {
                 aws_auth: None,
                 endpoint_policy: None,
                 spiffe: None,
+                upgrades: vec![],
             },
             // Endpoint-only restriction (_ep_ route)
             RouteConfig {
+                redeem_phantoms: Vec::new(),
                 prefix: "_ep_localhost".to_string(),
                 upstream: format!("https://localhost:{}", upstream_port),
                 credential_key: None,
@@ -2509,6 +2597,7 @@ mod tests {
                 aws_auth: None,
                 endpoint_policy: None,
                 spiffe: None,
+                upgrades: vec![],
             },
         ];
         let route_store = RouteStore::load(&routes).await.unwrap();

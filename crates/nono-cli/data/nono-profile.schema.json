@@ -903,7 +903,7 @@
     },
     "CustomCredentialDef": {
       "type": "object",
-      "description": "Custom credential route definition for the reverse proxy. Defines how to route requests and inject credentials for a service. Must have exactly one of: credential_key, auth, or aws_auth (mutually exclusive).",
+      "description": "Custom credential route definition for the reverse proxy. Defines how to route requests and inject credentials for a service. Must set at least one of: credential_key, auth, aws_auth, spiffe, or redeem_phantoms. credential_key/auth/aws_auth/spiffe are mutually exclusive with each other. redeem_phantoms may stand alone OR combine with credential_key/auth (but not aws_auth/spiffe).",
       "additionalProperties": false,
       "required": ["upstream"],
       "properties": {
@@ -913,7 +913,13 @@
         },
         "credential_key": {
           "type": "string",
-          "description": "Keystore account name for the credential (e.g., \"telegram_bot_token\"), or a 1Password op:// URI, Bitwarden bw:// URI, apple-password:// URI, file:// URI, env:// URI (e.g., \"env://MY_TOKEN\"), or cmd:// URI backed by credential_capture. Mutually exclusive with auth and aws_auth."
+          "description": "Keystore account name for the credential (e.g., \"telegram_bot_token\"), or a 1Password op:// URI, Bitwarden bw:// URI, apple-password:// URI, file:// URI, env:// URI (e.g., \"env://MY_TOKEN\"), or cmd:// URI backed by credential_capture. Mutually exclusive with auth and aws_auth; may combine with redeem_phantoms."
+        },
+        "redeem_phantoms": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [],
+          "description": "Broker credential names this route resolves from caller-presented phantoms (including JWT-shaped) found in request headers. By-value / proof-of-possession auth, gated route-side: a process that captured the token presents the phantom (possession), and the route authorizes which credential(s) it will resolve (a presented phantom resolves only if its credential name is in this list). A non-empty list forces interception even without credential_key. Composes with a managed credential_key/auth (managed value injected into inject_header; caller phantoms resolved on the other headers) or stands alone. Cannot combine with aws_auth or spiffe, which use dedicated intercept handlers that do not resolve caller nonces."
         },
         "auth": {
           "$ref": "#/$defs/OAuth2Config",

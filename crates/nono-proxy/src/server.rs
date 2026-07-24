@@ -864,6 +864,17 @@ impl crate::token::NonceResolver for CompositeNonceResolver {
             .and_then(|resolver| resolver.resolve(nonce, consumer))
             .or_else(|| self.oauth.resolve(nonce, consumer))
     }
+
+    fn resolve_for_credentials(
+        &self,
+        nonce: &str,
+        allowed_credentials: &[String],
+    ) -> Option<Zeroizing<Vec<u8>>> {
+        // Only the broker tracks credential names; OAuth-capture has none.
+        self.external
+            .as_ref()
+            .and_then(|resolver| resolver.resolve_for_credentials(nonce, allowed_credentials))
+    }
 }
 
 /// Start the proxy server.
@@ -2071,6 +2082,7 @@ mod tests {
     #[tokio::test]
     async fn normalize_authority_matches_ipv6_route_upstreams() -> Result<()> {
         let routes = vec![crate::config::RouteConfig {
+            redeem_phantoms: Vec::new(),
             prefix: "local".to_string(),
             upstream: "http://[::1]:8080/v1".to_string(),
             credential_key: Some("local".to_string()),
@@ -2090,6 +2102,7 @@ mod tests {
             oauth2: None,
             aws_auth: None,
             spiffe: None,
+            upgrades: vec![],
         }];
         let store = RouteStore::load(&routes).await?;
         let host_port = normalize_authority("::1:8080");
@@ -2171,6 +2184,7 @@ mod tests {
     /// moved back inside the guard.
     fn declarative_route(upstream: &str) -> crate::config::RouteConfig {
         crate::config::RouteConfig {
+            redeem_phantoms: Vec::new(),
             prefix: "svc".to_string(),
             upstream: upstream.to_string(),
             credential_key: None,
@@ -2190,6 +2204,7 @@ mod tests {
             oauth2: None,
             aws_auth: None,
             spiffe: None,
+            upgrades: vec![],
         }
     }
 
@@ -2259,6 +2274,116 @@ mod tests {
         assert!(
             status.contains("407"),
             "with auth required an unauthenticated reverse request must be challenged, got: {status:?}"
+        );
+        handle.shutdown();
+    }
+
+    /// Send a raw request through the proxy at `port` and return everything
+    /// the proxy wrote back (status line, headers, body).
+    async fn send_raw_request(port: u16, request: &[u8]) -> String {
+        let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        client.write_all(request).await.unwrap();
+        let mut resp = Vec::new();
+        let mut buf = [0u8; 4096];
+        if let Ok(n) = client.read(&mut buf).await {
+            resp.extend_from_slice(&buf[..n]);
+        }
+        String::from_utf8_lossy(&resp).to_string()
+    }
+
+    #[tokio::test]
+    async fn test_websocket_upgrade_returns_501_without_reaching_upstream() {
+        // A structurally valid WebSocket handshake must be rejected
+        // immediately with 501 rather than forwarded to the upstream (which
+        // would otherwise hang waiting for a 101 response that never comes).
+        let upstream = spawn_mock_upstream().await;
+        let config = ProxyConfig {
+            routes: vec![declarative_route(&format!("http://{upstream}"))],
+            allowed_hosts: vec!["127.0.0.1".to_string()],
+            require_auth: false,
+            ..Default::default()
+        };
+        let handle = start(config).await.unwrap();
+        let response = send_raw_request(
+            handle.port,
+            b"GET /svc/ HTTP/1.1\r\n\
+              Host: 127.0.0.1\r\n\
+              Upgrade: websocket\r\n\
+              Connection: Upgrade\r\n\
+              Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+              Sec-WebSocket-Version: 13\r\n\r\n",
+        )
+        .await;
+        assert!(
+            response.starts_with("HTTP/1.1 501"),
+            "valid websocket handshake must get 501, got: {response:?}"
+        );
+        assert!(
+            response.to_lowercase().contains("connection: close"),
+            "501 upgrade response must close the connection, got: {response:?}"
+        );
+
+        let events = handle.drain_audit_events();
+        assert!(
+            events.iter().any(|e| {
+                e.denial_category
+                    == Some(nono::undo::NetworkAuditDenialCategory::UnsupportedUpgrade)
+            }),
+            "expected an UnsupportedUpgrade audit event, got: {events:?}"
+        );
+
+        handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_websocket_upgrade_malformed_returns_400() {
+        // A request that claims to be an upgrade but is missing required
+        // handshake headers must be rejected as malformed, not forwarded.
+        let upstream = spawn_mock_upstream().await;
+        let config = ProxyConfig {
+            routes: vec![declarative_route(&format!("http://{upstream}"))],
+            allowed_hosts: vec!["127.0.0.1".to_string()],
+            require_auth: false,
+            ..Default::default()
+        };
+        let handle = start(config).await.unwrap();
+        let response = send_raw_request(
+            handle.port,
+            b"GET /svc/ HTTP/1.1\r\n\
+              Host: 127.0.0.1\r\n\
+              Upgrade: websocket\r\n\
+              Connection: Upgrade\r\n\r\n",
+        )
+        .await;
+        assert!(
+            response.starts_with("HTTP/1.1 400"),
+            "malformed websocket handshake must get 400, got: {response:?}"
+        );
+        assert!(
+            response.to_lowercase().contains("connection: close"),
+            "400 upgrade response must close the connection, got: {response:?}"
+        );
+        handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_ordinary_request_unaffected_by_upgrade_detection() {
+        // Regression guard: a plain (non-upgrade) request through a
+        // configured route must still be proxied normally.
+        let upstream = spawn_mock_upstream().await;
+        let config = ProxyConfig {
+            routes: vec![declarative_route(&format!("http://{upstream}"))],
+            allowed_hosts: vec!["127.0.0.1".to_string()],
+            require_auth: false,
+            ..Default::default()
+        };
+        let handle = start(config).await.unwrap();
+        let status = unauthenticated_reverse_request(handle.port).await;
+        assert!(
+            status.contains("200"),
+            "ordinary requests must be unaffected by upgrade detection, got: {status:?}"
         );
         handle.shutdown();
     }
@@ -2378,6 +2503,7 @@ mod tests {
         {
             let config = ProxyConfig {
                 routes: vec![crate::config::RouteConfig {
+                    redeem_phantoms: Vec::new(),
                     prefix: "openai".to_string(),
                     upstream: "https://api.openai.com".to_string(),
                     credential_key: Some("env://NONO_TEST_TOTALLY_MISSING".to_string()),
@@ -2397,6 +2523,7 @@ mod tests {
                     oauth2: None,
                     aws_auth: None,
                     spiffe: None,
+                    upgrades: vec![],
                 }],
                 intercept_ca_dir: Some(dir.path().to_path_buf()),
                 intercept_ca_env_vars: {
@@ -2455,6 +2582,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = ProxyConfig {
             routes: vec![crate::config::RouteConfig {
+                redeem_phantoms: Vec::new(),
                 prefix: "alias".to_string(),
                 upstream: "https://aliased.example.com".to_string(),
                 credential_key: None,
@@ -2474,6 +2602,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                upgrades: vec![],
             }],
             intercept_ca_dir: Some(dir.path().to_path_buf()),
             ..Default::default()
@@ -2539,6 +2668,7 @@ mod tests {
             .join("intercept");
         let config = ProxyConfig {
             routes: vec![crate::config::RouteConfig {
+                redeem_phantoms: Vec::new(),
                 prefix: "openai".to_string(),
                 upstream: "https://api.openai.com".to_string(),
                 credential_key: Some("env://NONO_TEST_TOTALLY_MISSING".to_string()),
@@ -2558,6 +2688,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                upgrades: vec![],
             }],
             intercept_ca_dir: Some(missing_dir),
             ..Default::default()
@@ -2588,6 +2719,7 @@ mod tests {
         let config = ProxyConfig {
             routes: vec![
                 crate::config::RouteConfig {
+                    redeem_phantoms: Vec::new(),
                     prefix: "openai".to_string(),
                     upstream: "https://api.openai.com".to_string(),
                     credential_key: Some("env://NONO_TEST_MISSING".to_string()),
@@ -2607,8 +2739,10 @@ mod tests {
                     oauth2: None,
                     aws_auth: None,
                     spiffe: None,
+                    upgrades: vec![],
                 },
                 crate::config::RouteConfig {
+                    redeem_phantoms: Vec::new(),
                     prefix: "alias".to_string(),
                     upstream: "https://aliased.example.com".to_string(),
                     credential_key: None,
@@ -2628,6 +2762,7 @@ mod tests {
                     oauth2: None,
                     aws_auth: None,
                     spiffe: None,
+                    upgrades: vec![],
                 },
             ],
             intercept_ca_dir: Some(dir.path().to_path_buf()),
@@ -2670,6 +2805,7 @@ mod tests {
             routes: vec![
                 // Credential catch-all route (no endpoint rules).
                 crate::config::RouteConfig {
+                    redeem_phantoms: Vec::new(),
                     prefix: "github_api".to_string(),
                     upstream: "https://api.github.com".to_string(),
                     credential_key: Some("env://NONO_TEST_MISSING".to_string()),
@@ -2689,9 +2825,11 @@ mod tests {
                     oauth2: None,
                     aws_auth: None,
                     spiffe: None,
+                    upgrades: vec![],
                 },
                 // Synthetic endpoint-authorization route for the same upstream.
                 crate::config::RouteConfig {
+                    redeem_phantoms: Vec::new(),
                     prefix: "_ep_api.github.com".to_string(),
                     upstream: "https://api.github.com".to_string(),
                     credential_key: None,
@@ -2711,6 +2849,7 @@ mod tests {
                     oauth2: None,
                     aws_auth: None,
                     spiffe: None,
+                    upgrades: vec![],
                 },
             ],
             intercept_ca_dir: Some(dir.path().to_path_buf()),
@@ -2753,6 +2892,7 @@ mod tests {
             routes: vec![
                 // Wildcard credential route.
                 crate::config::RouteConfig {
+                    redeem_phantoms: Vec::new(),
                     prefix: "github_raw".to_string(),
                     upstream: "https://*.githubusercontent.com".to_string(),
                     credential_key: Some("env://NONO_TEST_MISSING".to_string()),
@@ -2772,9 +2912,11 @@ mod tests {
                     oauth2: None,
                     aws_auth: None,
                     spiffe: None,
+                    upgrades: vec![],
                 },
                 // `_ep_` route on a concrete subdomain covered by the wildcard.
                 crate::config::RouteConfig {
+                    redeem_phantoms: Vec::new(),
                     prefix: "_ep_raw.githubusercontent.com".to_string(),
                     upstream: "https://raw.githubusercontent.com".to_string(),
                     credential_key: None,
@@ -2794,6 +2936,7 @@ mod tests {
                     oauth2: None,
                     aws_auth: None,
                     spiffe: None,
+                    upgrades: vec![],
                 },
             ],
             intercept_ca_dir: Some(dir.path().to_path_buf()),
@@ -2826,6 +2969,7 @@ mod tests {
     async fn test_route_diagnostics_omits_unreachable_upstream() {
         let dir = tempfile::tempdir().unwrap();
         let route = |prefix: &str, upstream: &str| crate::config::RouteConfig {
+            redeem_phantoms: Vec::new(),
             prefix: prefix.to_string(),
             upstream: upstream.to_string(),
             credential_key: Some("env://NONO_TEST_MISSING".to_string()),
@@ -2845,6 +2989,7 @@ mod tests {
             oauth2: None,
             aws_auth: None,
             spiffe: None,
+            upgrades: vec![],
         };
         let config = ProxyConfig {
             routes: vec![
@@ -2875,6 +3020,7 @@ mod tests {
     async fn test_route_diagnostics_respects_wildcard_allowlist() {
         let dir = tempfile::tempdir().unwrap();
         let route = |prefix: &str, upstream: &str| crate::config::RouteConfig {
+            redeem_phantoms: Vec::new(),
             prefix: prefix.to_string(),
             upstream: upstream.to_string(),
             credential_key: Some("env://NONO_TEST_MISSING".to_string()),
@@ -2894,6 +3040,7 @@ mod tests {
             oauth2: None,
             aws_auth: None,
             spiffe: None,
+            upgrades: vec![],
         };
         let config = ProxyConfig {
             routes: vec![
@@ -2989,6 +3136,7 @@ mod tests {
     async fn test_proxy_credential_env_vars() {
         let config = ProxyConfig {
             routes: vec![crate::config::RouteConfig {
+                redeem_phantoms: Vec::new(),
                 prefix: "openai".to_string(),
                 upstream: "https://api.openai.com".to_string(),
                 credential_key: None,
@@ -3008,6 +3156,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                upgrades: vec![],
             }],
             ..Default::default()
         };
@@ -3042,6 +3191,7 @@ mod tests {
         };
         let config = ProxyConfig {
             routes: vec![crate::config::RouteConfig {
+                redeem_phantoms: Vec::new(),
                 prefix: "openai".to_string(),
                 upstream: "https://api.openai.com".to_string(),
                 credential_key: Some("openai_api_key".to_string()),
@@ -3061,6 +3211,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                upgrades: vec![],
             }],
             ..Default::default()
         };
@@ -3104,6 +3255,7 @@ mod tests {
         };
         let config = ProxyConfig {
             routes: vec![crate::config::RouteConfig {
+                redeem_phantoms: Vec::new(),
                 prefix: "openai".to_string(),
                 upstream: "https://api.openai.com".to_string(),
                 credential_key: Some("op://Development/OpenAI/credential".to_string()),
@@ -3123,6 +3275,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                upgrades: vec![],
             }],
             ..Default::default()
         };
@@ -3172,6 +3325,7 @@ mod tests {
         let config = ProxyConfig {
             routes: vec![
                 crate::config::RouteConfig {
+                    redeem_phantoms: Vec::new(),
                     prefix: "openai".to_string(),
                     upstream: "https://api.openai.com".to_string(),
                     credential_key: Some("openai_api_key".to_string()),
@@ -3191,8 +3345,10 @@ mod tests {
                     oauth2: None,
                     aws_auth: None,
                     spiffe: None,
+                    upgrades: vec![],
                 },
                 crate::config::RouteConfig {
+                    redeem_phantoms: Vec::new(),
                     prefix: "github".to_string(),
                     upstream: "https://api.github.com".to_string(),
                     credential_key: Some("env://GITHUB_TOKEN".to_string()),
@@ -3212,6 +3368,7 @@ mod tests {
                     oauth2: None,
                     aws_auth: None,
                     spiffe: None,
+                    upgrades: vec![],
                 },
             ],
             ..Default::default()
@@ -3257,6 +3414,7 @@ mod tests {
         };
         let config = ProxyConfig {
             routes: vec![crate::config::RouteConfig {
+                redeem_phantoms: Vec::new(),
                 prefix: "myapi".to_string(),
                 upstream: "https://api.internal.corp".to_string(),
                 credential_key: None,
@@ -3282,6 +3440,7 @@ mod tests {
                     credential_format: None,
                     svid_hint: None,
                 }),
+                upgrades: vec![],
             }],
             ..Default::default()
         };
@@ -3319,6 +3478,7 @@ mod tests {
         // Test leading slash
         let config = ProxyConfig {
             routes: vec![crate::config::RouteConfig {
+                redeem_phantoms: Vec::new(),
                 prefix: "/anthropic".to_string(),
                 upstream: "https://api.anthropic.com".to_string(),
                 credential_key: None,
@@ -3338,6 +3498,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                upgrades: vec![],
             }],
             ..Default::default()
         };
@@ -3356,6 +3517,7 @@ mod tests {
         // Test trailing slash
         let config = ProxyConfig {
             routes: vec![crate::config::RouteConfig {
+                redeem_phantoms: Vec::new(),
                 prefix: "openai/".to_string(),
                 upstream: "https://api.openai.com".to_string(),
                 credential_key: None,
@@ -3375,6 +3537,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                upgrades: vec![],
             }],
             ..Default::default()
         };
@@ -3415,6 +3578,7 @@ mod tests {
         };
         let config_no_env_var = ProxyConfig {
             routes: vec![crate::config::RouteConfig {
+                redeem_phantoms: Vec::new(),
                 prefix: "anthropic".to_string(),
                 upstream: "https://api.anthropic.com".to_string(),
                 credential_key: None,
@@ -3434,6 +3598,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                upgrades: vec![],
             }],
             ..Default::default()
         };
@@ -3463,6 +3628,7 @@ mod tests {
         };
         let config_fixed = ProxyConfig {
             routes: vec![crate::config::RouteConfig {
+                redeem_phantoms: Vec::new(),
                 prefix: "anthropic".to_string(),
                 upstream: "https://api.anthropic.com".to_string(),
                 credential_key: Some("ANTHROPIC_API_KEY".to_string()),
@@ -3482,6 +3648,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                upgrades: vec![],
             }],
             ..Default::default()
         };
@@ -3737,6 +3904,7 @@ mod tests {
             allowed_hosts: vec!["api.openai.com".to_string()],
             direct_connect_ports: vec![443],
             routes: vec![crate::config::RouteConfig {
+                redeem_phantoms: Vec::new(),
                 prefix: "openai".to_string(),
                 upstream: "https://api.openai.com/v1".to_string(),
                 credential_key: Some("openai".to_string()),
@@ -3756,6 +3924,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                upgrades: vec![],
             }],
             ..Default::default()
         };
@@ -3781,6 +3950,7 @@ mod tests {
             allowed_hosts: vec!["openai.com".to_string()],
             direct_connect_ports: vec![443],
             routes: vec![crate::config::RouteConfig {
+                redeem_phantoms: Vec::new(),
                 prefix: "openai".to_string(),
                 upstream: "https://api.openai.com/v1".to_string(),
                 credential_key: Some("openai".to_string()),
@@ -3800,6 +3970,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                upgrades: vec![],
             }],
             ..Default::default()
         };
@@ -3849,6 +4020,7 @@ mod tests {
                 "redis".to_string(),
             ],
             routes: vec![crate::config::RouteConfig {
+                redeem_phantoms: Vec::new(),
                 prefix: "openai".to_string(),
                 upstream: "https://api.openai.com/v1".to_string(),
                 credential_key: Some("openai".to_string()),
@@ -3868,6 +4040,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                upgrades: vec![],
             }],
             ..Default::default()
         };
@@ -3887,6 +4060,7 @@ mod tests {
                 "redis".to_string(),
             ],
             routes: vec![crate::config::RouteConfig {
+                redeem_phantoms: Vec::new(),
                 prefix: "local".to_string(),
                 upstream: "http://[::1]:8080/v1".to_string(),
                 credential_key: Some("local".to_string()),
@@ -3906,6 +4080,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                upgrades: vec![],
             }],
             ..Default::default()
         };
@@ -3927,6 +4102,7 @@ mod tests {
                 "redis".to_string(),
             ],
             routes: vec![crate::config::RouteConfig {
+                redeem_phantoms: Vec::new(),
                 prefix: "internal".to_string(),
                 upstream: "https://*.dev.example.net".to_string(),
                 credential_key: Some("internal".to_string()),
@@ -3946,6 +4122,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                upgrades: vec![],
             }],
             ..Default::default()
         };
@@ -4124,6 +4301,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = ProxyConfig {
             routes: vec![crate::config::RouteConfig {
+                redeem_phantoms: Vec::new(),
                 prefix: "openai".to_string(),
                 upstream: "https://api.openai.com".to_string(),
                 credential_key: Some("env://NONO_TEST_TOTALLY_MISSING".to_string()),
@@ -4143,6 +4321,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                upgrades: vec![],
             }],
             intercept_ca_dir: Some(dir.path().to_path_buf()),
             ..Default::default()
@@ -4465,6 +4644,7 @@ mod tests {
         let config = ProxyConfig {
             allowed_hosts: vec!["127.0.0.1".to_string()],
             routes: vec![crate::config::RouteConfig {
+                redeem_phantoms: Vec::new(),
                 prefix: "svc".to_string(),
                 upstream: "https://api.example.com".to_string(),
                 credential_key: Some("env://NONO_TEST_TOTALLY_MISSING".to_string()),
@@ -4484,6 +4664,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                upgrades: vec![],
             }],
             ..ProxyConfig::default()
         };
@@ -4678,6 +4859,7 @@ mod tests {
         // reverse handler at all, not the forward path.
         let config = ProxyConfig {
             routes: vec![crate::config::RouteConfig {
+                redeem_phantoms: Vec::new(),
                 prefix: "openai".to_string(),
                 upstream: "https://api.openai.com".to_string(),
                 credential_key: Some("env://NONO_TEST_TOTALLY_MISSING".to_string()),
@@ -4697,6 +4879,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                upgrades: vec![],
             }],
             ..Default::default()
         };

@@ -10,7 +10,10 @@
 //! (inject mode, header name/value, raw secret). Both stores are keyed by the
 //! normalised route prefix and are consulted independently by the proxy handlers.
 
-use crate::config::{CompiledEndpointPolicy, CompiledEndpointRules, RouteConfig, SpiffeAuthConfig};
+use crate::config::{
+    CompiledEndpointPolicy, CompiledEndpointRules, CompiledUpgradeRules, RouteConfig,
+    SpiffeAuthConfig,
+};
 use crate::error::{ProxyError, Result};
 use nono::undo::{NetworkAuditAuthMechanism, NetworkAuditInjectionMode};
 use rustls::pki_types::pem::PemObject;
@@ -42,6 +45,10 @@ pub struct LoadedRoute {
     /// Pre-compiled explicit endpoint policy. When no explicit policy is
     /// configured this preserves legacy `endpoint_rules` semantics.
     pub endpoint_policy: CompiledEndpointPolicy,
+
+    /// Pre-compiled WebSocket upgrade allow-list. When empty (the default),
+    /// no upgrade requests are tunneled for this route.
+    pub upgrade_rules: CompiledUpgradeRules,
 
     /// Per-route TLS connector with custom CA trust, if configured.
     /// Built once at startup from the route's `tls_ca` certificate file.
@@ -83,6 +90,9 @@ pub struct LoadedRoute {
     /// Either X.509 mTLS or JWT bearer, chosen at load time from the route's
     /// `spiffe` config block. `None` for non-SPIFFE routes.
     pub managed_auth: Option<Arc<crate::auth::ManagedUpstreamAuth>>,
+
+    /// See [`crate::config::RouteConfig::redeem_phantoms`].
+    pub redeem_phantoms: Vec<String>,
 }
 
 impl std::fmt::Debug for LoadedRoute {
@@ -92,6 +102,7 @@ impl std::fmt::Debug for LoadedRoute {
             .field("upstream_host_port", &self.upstream_host_port)
             .field("endpoint_rules", &self.endpoint_rules)
             .field("endpoint_policy", &self.endpoint_policy)
+            .field("upgrade_rules", &self.upgrade_rules)
             .field("has_custom_tls_ca", &self.tls_connector.is_some())
             .field("requires_intercept", &self.requires_intercept)
             .field(
@@ -99,7 +110,8 @@ impl std::fmt::Debug for LoadedRoute {
                 &self.requires_managed_credential,
             )
             .field("managed_auth_mechanism", &self.managed_auth_mechanism)
-            .field("managed_injection_mode", &self.managed_injection_mode);
+            .field("managed_injection_mode", &self.managed_injection_mode)
+            .field("redeem_phantoms", &self.redeem_phantoms);
         let managed_auth_type = self.managed_auth.as_ref().map(|a| match a.as_ref() {
             crate::auth::ManagedUpstreamAuth::SpiffeJwt(_) => "spiffe_jwt",
         });
@@ -204,6 +216,8 @@ impl RouteStore {
                 &route.endpoint_rules,
             )
             .map_err(|e| ProxyError::Config(format!("route '{}': {}", normalized_prefix, e)))?;
+            let upgrade_rules = CompiledUpgradeRules::compile(&route.upgrades)
+                .map_err(|e| ProxyError::Config(format!("route '{}': {}", normalized_prefix, e)))?;
 
             let tls_config_key = route_tls_config_key(route);
             let (tls_connector, tls_client_config) = if route.tls_ca.is_some()
@@ -295,8 +309,10 @@ impl RouteStore {
                 || route.oauth2.is_some()
                 || route.aws_auth.is_some()
                 || route.spiffe.is_some();
-            let requires_intercept =
-                requires_managed_credential || !endpoint_policy.allows_all_without_l7();
+            let requires_intercept = requires_managed_credential
+                || !route.redeem_phantoms.is_empty()
+                || !endpoint_policy.allows_all_without_l7()
+                || !upgrade_rules.is_empty();
             let managed_auth_mechanism = auth_mechanism_for_route(route);
             let managed_injection_mode = injection_mode_for_route(route);
 
@@ -307,6 +323,7 @@ impl RouteStore {
                     upstream_host_port: Some(upstream_host_port),
                     endpoint_rules,
                     endpoint_policy,
+                    upgrade_rules,
                     tls_connector,
                     tls_client_config,
                     tls_config_key,
@@ -315,6 +332,7 @@ impl RouteStore {
                     managed_auth_mechanism,
                     managed_injection_mode,
                     managed_auth,
+                    redeem_phantoms: route.redeem_phantoms.clone(),
                 },
             );
         }
@@ -914,6 +932,7 @@ mod tests {
     async fn test_load_routes_without_credentials() {
         // Routes without credential_key should still be loaded into RouteStore
         let routes = vec![RouteConfig {
+            redeem_phantoms: Vec::new(),
             prefix: "/openai".to_string(),
             upstream: "https://api.openai.com".to_string(),
             credential_key: None,
@@ -942,6 +961,7 @@ mod tests {
             oauth2: None,
             aws_auth: None,
             spiffe: None,
+            upgrades: vec![],
         }];
 
         let store = RouteStore::load(&routes).await.unwrap();
@@ -965,6 +985,7 @@ mod tests {
     #[tokio::test]
     async fn test_load_routes_normalises_prefix() {
         let routes = vec![RouteConfig {
+            redeem_phantoms: Vec::new(),
             prefix: "/anthropic/".to_string(),
             upstream: "https://api.anthropic.com".to_string(),
             credential_key: None,
@@ -984,6 +1005,7 @@ mod tests {
             oauth2: None,
             aws_auth: None,
             spiffe: None,
+            upgrades: vec![],
         }];
 
         let store = RouteStore::load(&routes).await.unwrap();
@@ -994,6 +1016,7 @@ mod tests {
     #[tokio::test]
     async fn test_is_route_upstream() {
         let routes = vec![RouteConfig {
+            redeem_phantoms: Vec::new(),
             prefix: "openai".to_string(),
             upstream: "https://api.openai.com".to_string(),
             credential_key: None,
@@ -1013,6 +1036,7 @@ mod tests {
             oauth2: None,
             aws_auth: None,
             spiffe: None,
+            upgrades: vec![],
         }];
 
         let store = RouteStore::load(&routes).await.unwrap();
@@ -1024,6 +1048,7 @@ mod tests {
     async fn test_route_upstream_hosts() {
         let routes = vec![
             RouteConfig {
+                redeem_phantoms: Vec::new(),
                 prefix: "openai".to_string(),
                 upstream: "https://api.openai.com".to_string(),
                 credential_key: None,
@@ -1043,8 +1068,10 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                upgrades: vec![],
             },
             RouteConfig {
+                redeem_phantoms: Vec::new(),
                 prefix: "anthropic".to_string(),
                 upstream: "https://api.anthropic.com".to_string(),
                 credential_key: None,
@@ -1064,6 +1091,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                upgrades: vec![],
             },
         ];
 
@@ -1129,6 +1157,7 @@ mod tests {
     #[tokio::test]
     async fn test_route_store_matches_bracketed_ipv6_authority() -> Result<()> {
         let routes = vec![RouteConfig {
+            redeem_phantoms: Vec::new(),
             prefix: "local".to_string(),
             upstream: "http://[::1]:8080/v1".to_string(),
             credential_key: Some("local".to_string()),
@@ -1148,6 +1177,7 @@ mod tests {
             oauth2: None,
             aws_auth: None,
             spiffe: None,
+            upgrades: vec![],
         }];
 
         let store = RouteStore::load(&routes).await?;
@@ -1172,6 +1202,7 @@ mod tests {
             "https://api.openai.com:notaport",
         ] {
             let routes = vec![RouteConfig {
+                redeem_phantoms: Vec::new(),
                 prefix: "bad".to_string(),
                 upstream: upstream.to_string(),
                 credential_key: None,
@@ -1191,6 +1222,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                upgrades: vec![],
             }];
 
             assert!(
@@ -1227,10 +1259,12 @@ mod tests {
     #[test]
     fn test_loaded_route_debug() {
         let route = LoadedRoute {
+            redeem_phantoms: Vec::new(),
             upstream: "https://api.openai.com".to_string(),
             upstream_host_port: Some("api.openai.com:443".to_string()),
             endpoint_rules: CompiledEndpointRules::compile(&[]).unwrap(),
             endpoint_policy: CompiledEndpointPolicy::compile(None, &[]).unwrap(),
+            upgrade_rules: CompiledUpgradeRules::compile(&[]).unwrap(),
             tls_connector: None,
             tls_client_config: None,
             tls_config_key: None,
@@ -1252,6 +1286,7 @@ mod tests {
     #[tokio::test]
     async fn test_requires_intercept_credential_only() {
         let routes = vec![RouteConfig {
+            redeem_phantoms: Vec::new(),
             prefix: "openai".to_string(),
             upstream: "https://api.openai.com".to_string(),
             credential_key: Some("openai_api_key".to_string()),
@@ -1271,6 +1306,7 @@ mod tests {
             oauth2: None,
             aws_auth: None,
             spiffe: None,
+            upgrades: vec![],
         }];
         let store = RouteStore::load(&routes).await.unwrap();
         let hit = store.lookup_by_upstream("api.openai.com:443").unwrap();
@@ -1290,6 +1326,7 @@ mod tests {
     #[tokio::test]
     async fn test_requires_intercept_wildcard_credential_upstream() {
         let routes = vec![RouteConfig {
+            redeem_phantoms: Vec::new(),
             prefix: "internal_api".to_string(),
             upstream: "https://*.dev.example.net".to_string(),
             credential_key: Some("cmd://internal_api".to_string()),
@@ -1309,6 +1346,7 @@ mod tests {
             oauth2: None,
             aws_auth: None,
             spiffe: None,
+            upgrades: vec![],
         }];
         let store = RouteStore::load(&routes).await.unwrap();
 
@@ -1333,6 +1371,7 @@ mod tests {
         // L7-only route (no credential): rules alone are enough to require
         // interception.
         let routes = vec![RouteConfig {
+            redeem_phantoms: Vec::new(),
             prefix: "internal".to_string(),
             upstream: "https://internal.example.com".to_string(),
             credential_key: None,
@@ -1355,6 +1394,7 @@ mod tests {
             oauth2: None,
             aws_auth: None,
             spiffe: None,
+            upgrades: vec![],
         }];
         let store = RouteStore::load(&routes).await.unwrap();
         let hit = store
@@ -1369,6 +1409,7 @@ mod tests {
         // No credential, no rules — purely declarative route. CONNECT to
         // this upstream still gets the existing 403 (not intercepted).
         let routes = vec![RouteConfig {
+            redeem_phantoms: Vec::new(),
             prefix: "alias".to_string(),
             upstream: "https://aliased.example.com".to_string(),
             credential_key: None,
@@ -1388,6 +1429,7 @@ mod tests {
             oauth2: None,
             aws_auth: None,
             spiffe: None,
+            upgrades: vec![],
         }];
         let store = RouteStore::load(&routes).await.unwrap();
         assert!(store.is_route_upstream("aliased.example.com:443"));
@@ -1395,12 +1437,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_redeem_phantoms_forces_intercept_without_credential() {
+        // redeem_phantoms alone must force intercept and not trip the
+        // managed-credential-unavailable gate.
+        let routes = vec![RouteConfig {
+            redeem_phantoms: vec!["ddtool-token".to_string()],
+            prefix: "dealership".to_string(),
+            upstream: "https://dealership.us1.staging.dog".to_string(),
+            credential_key: None,
+            inject_mode: Default::default(),
+            inject_header: "Authorization".to_string(),
+            credential_format: None,
+            path_pattern: None,
+            path_replacement: None,
+            query_param_name: None,
+            proxy: None,
+            env_var: None,
+            endpoint_rules: vec![],
+            endpoint_policy: None,
+            tls_ca: None,
+            tls_client_cert: None,
+            tls_client_key: None,
+            oauth2: None,
+            aws_auth: None,
+            spiffe: None,
+            upgrades: vec![],
+        }];
+        let store = RouteStore::load(&routes).await.unwrap();
+        assert!(store.has_intercept_route("dealership.us1.staging.dog:443"));
+        let hit = store
+            .lookup_by_upstream("dealership.us1.staging.dog:443")
+            .unwrap();
+        assert!(!hit.1.requires_managed_credential);
+        assert!(!hit.1.missing_managed_credential(false, false, false, false));
+    }
+
+    #[tokio::test]
     async fn test_missing_managed_credential_policy() {
         let managed = LoadedRoute {
+            redeem_phantoms: Vec::new(),
             upstream: "https://api.openai.com".to_string(),
             upstream_host_port: Some("api.openai.com:443".to_string()),
             endpoint_rules: CompiledEndpointRules::compile(&[]).unwrap(),
             endpoint_policy: CompiledEndpointPolicy::compile(None, &[]).unwrap(),
+            upgrade_rules: CompiledUpgradeRules::compile(&[]).unwrap(),
             tls_connector: None,
             tls_client_config: None,
             tls_config_key: None,
@@ -1417,10 +1497,12 @@ mod tests {
         assert!(!managed.missing_managed_credential(false, false, false, true));
 
         let l7_only = LoadedRoute {
+            redeem_phantoms: Vec::new(),
             upstream: "https://internal.example.com".to_string(),
             upstream_host_port: Some("internal.example.com:443".to_string()),
             endpoint_rules: CompiledEndpointRules::compile(&[]).unwrap(),
             endpoint_policy: CompiledEndpointPolicy::compile(None, &[]).unwrap(),
+            upgrade_rules: CompiledUpgradeRules::compile(&[]).unwrap(),
             tls_connector: None,
             tls_client_config: None,
             tls_config_key: None,
@@ -1436,6 +1518,7 @@ mod tests {
     #[tokio::test]
     async fn test_lookup_by_upstream_returns_prefix() {
         let routes = vec![RouteConfig {
+            redeem_phantoms: Vec::new(),
             prefix: "openai".to_string(),
             upstream: "https://api.openai.com".to_string(),
             credential_key: Some("openai_api_key".to_string()),
@@ -1455,6 +1538,7 @@ mod tests {
             oauth2: None,
             aws_auth: None,
             spiffe: None,
+            upgrades: vec![],
         }];
         let store = RouteStore::load(&routes).await.unwrap();
         let hit = store.lookup_by_upstream("api.openai.com:443").unwrap();
@@ -1468,6 +1552,7 @@ mod tests {
     async fn test_lookup_all_by_upstream_returns_multiple_routes() {
         let routes = vec![
             RouteConfig {
+                redeem_phantoms: Vec::new(),
                 prefix: "github_org_a".to_string(),
                 upstream: "https://github.com".to_string(),
                 credential_key: Some("env://GH_TOKEN_A".to_string()),
@@ -1490,8 +1575,10 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                upgrades: vec![],
             },
             RouteConfig {
+                redeem_phantoms: Vec::new(),
                 prefix: "github_org_b".to_string(),
                 upstream: "https://github.com".to_string(),
                 credential_key: Some("env://GH_TOKEN_B".to_string()),
@@ -1514,6 +1601,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                upgrades: vec![],
             },
         ];
         let store = RouteStore::load(&routes).await.unwrap();
@@ -1570,6 +1658,7 @@ mod tests {
         // Helper to build a route with the given prefix and endpoint path.
         fn gh_route(prefix: &str, env: &str, path: &str) -> RouteConfig {
             RouteConfig {
+                redeem_phantoms: Vec::new(),
                 prefix: prefix.to_string(),
                 upstream: "https://github.com".to_string(),
                 credential_key: Some(format!("env://{env}")),
@@ -1592,6 +1681,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                upgrades: vec![],
             }
         }
 
@@ -1984,6 +2074,7 @@ h56ZLEEqHfVWFhJWIKRSabtxYPV/VJyMv+lo3L0QwSKsouHs3dtF1zVQ
         std::fs::write(&key_path, TEST_CLIENT_KEY_PEM).unwrap();
 
         let routes = vec![RouteConfig {
+            redeem_phantoms: Vec::new(),
             prefix: "k8s".to_string(),
             upstream: "https://192.168.64.1:6443".to_string(),
             credential_key: None,
@@ -2003,6 +2094,7 @@ h56ZLEEqHfVWFhJWIKRSabtxYPV/VJyMv+lo3L0QwSKsouHs3dtF1zVQ
             oauth2: None,
             aws_auth: None,
             spiffe: None,
+            upgrades: vec![],
         }];
 
         let store = RouteStore::load(&routes)
@@ -2013,5 +2105,19 @@ h56ZLEEqHfVWFhJWIKRSabtxYPV/VJyMv+lo3L0QwSKsouHs3dtF1zVQ
             route.tls_connector.is_some(),
             "connector must be built when tls_client_cert/key are set"
         );
+    }
+
+    #[tokio::test]
+    async fn websocket_rule_alone_requires_interception() {
+        let route: RouteConfig = serde_json::from_str(
+            r#"{
+                "prefix": "chat",
+                "upstream": "https://chat.example",
+                "upgrades": [{"path": "/socket"}]
+            }"#,
+        )
+        .unwrap();
+        let store = RouteStore::load(&[route]).await.unwrap();
+        assert!(store.get("chat").unwrap().requires_intercept);
     }
 }

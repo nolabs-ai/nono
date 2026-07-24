@@ -10,9 +10,9 @@ use crate::lineage_cgroup::LineageMarker;
 use crate::profile;
 use crate::tool_sandbox::credentials::{ResolvedCredential, resolve_credentials};
 use crate::tool_sandbox::env::{
-    apply_environment_set_vars, default_env_allow_patterns, effective_argv_for_binary,
-    env_shebang_target_interpreter, inject_chaining_control_env, inject_url_open_env,
-    split_env_entry,
+    apply_environment_set_vars, apply_export_env, default_env_allow_patterns,
+    effective_argv_for_binary, env_shebang_target_interpreter, inject_chaining_control_env,
+    inject_url_open_env, split_env_entry,
 };
 use crate::tool_sandbox::launch::{
     exit_status_code, prepare_launcher_command, remove_launch_spec, write_launch_spec,
@@ -1361,7 +1361,7 @@ fn handle_shim_stream_inner(
     if let Some(invocation_policy) =
         select_invocation_policy(&state.plan.config, &request.command, &caller)
     {
-        let child_env = match filter_child_env(state, &request, policy) {
+        let child_env = match filter_child_env(state, &request, policy, &caller) {
             Ok(env) => env,
             Err(err) => {
                 record_command_policy_audit(
@@ -1690,7 +1690,7 @@ fn handle_shim_stream_inner(
             ));
         }
         let result = (|| {
-            let launch = build_child_launch_spec(state, &request, effective_sandbox)?;
+            let launch = build_child_launch_spec(state, &request, effective_sandbox, &caller)?;
             launch_child_with_capture(state, &request.command, &caller, launch, stdio)
         })();
         state.active_count.fetch_sub(1, Ordering::SeqCst);
@@ -1778,7 +1778,7 @@ fn handle_shim_stream_inner(
             ));
         }
         let result = (|| {
-            let launch = build_child_launch_spec(state, &request, effective_sandbox)?;
+            let launch = build_child_launch_spec(state, &request, effective_sandbox, &caller)?;
             launch_child_with_capture(state, &request.command, &caller, launch, stdio)
         })();
         state.active_count.fetch_sub(1, Ordering::SeqCst);
@@ -1859,6 +1859,7 @@ fn handle_shim_stream_inner(
                 helper,
                 &extra_args,
                 false,
+                &caller,
             )?;
             launch_child(state, &request.command, &caller, launch, stdio)
         })();
@@ -1938,7 +1939,7 @@ fn handle_shim_stream_inner(
     }
 
     let result = (|| {
-        let launch = build_child_launch_spec(state, &request, effective_sandbox)?;
+        let launch = build_child_launch_spec(state, &request, effective_sandbox, &caller)?;
         launch_child(state, &request.command, &caller, launch, stdio)
     })();
     state.active_count.fetch_sub(1, Ordering::SeqCst);
@@ -2247,6 +2248,24 @@ fn select_effective_policy<'a>(
                 }),
             }
         }
+    }
+}
+
+/// The env vars the command's resolved caller exports to the commands it
+/// invokes. Caller-declares model: for a mediated command caller this is that
+/// command's `export_env`; for the session caller it is the top-level
+/// `session_export_env`. An unknown caller command exports nothing.
+fn caller_export_env<'a>(config: &'a CommandPoliciesConfig, caller: &Caller) -> &'a [String] {
+    match caller {
+        Caller::Session { .. } => &config.session_export_env,
+        Caller::Command {
+            command: caller_name,
+            ..
+        } => config
+            .commands
+            .get(caller_name)
+            .map(|command| command.export_env.as_slice())
+            .unwrap_or(&[]),
     }
 }
 
@@ -3244,6 +3263,7 @@ fn build_child_launch_spec(
     state: &ToolSandboxState,
     request: &ToolSandboxShimRequest,
     policy: &CommandSandboxConfig,
+    caller: &Caller,
 ) -> Result<ToolSandboxChildLaunchSpec> {
     let binary = state
         .plan
@@ -3253,7 +3273,7 @@ fn build_child_launch_spec(
         .ok_or_else(|| {
             NonoError::SandboxInit(format!("missing resolved binary for {}", request.command))
         })?;
-    build_child_launch_spec_for_binary(state, request, policy, binary, &[], true)
+    build_child_launch_spec_for_binary(state, request, policy, binary, &[], true, caller)
 }
 
 /// Build a child launch spec that runs `binary` (the command's real binary OR
@@ -3272,6 +3292,7 @@ fn build_child_launch_spec_for_binary(
     binary: &ResolvedCommandBinary,
     extra_args: &[Vec<u8>],
     preserve_caller_argv0: bool,
+    caller: &Caller,
 ) -> Result<ToolSandboxChildLaunchSpec> {
     let start_vbi = std::time::Instant::now();
     verify_binary_identity(binary)?;
@@ -3304,7 +3325,7 @@ fn build_child_launch_spec_for_binary(
     tool_sandbox_profile_log!("build_child_caps total: {:?}", start_caps.elapsed());
     caps.deduplicate();
 
-    let env = filter_child_env(state, request, policy)?;
+    let env = filter_child_env(state, request, policy, caller)?;
 
     // Build the execute allowlist. AccessMode::Read includes
     // AccessFs::Execute in the Landlock mapping; without an explicit
@@ -3900,6 +3921,7 @@ fn filter_child_env(
     state: &ToolSandboxState,
     request: &ToolSandboxShimRequest,
     policy: &CommandSandboxConfig,
+    caller: &Caller,
 ) -> Result<Vec<Vec<u8>>> {
     let allowed_patterns: Vec<String> = policy
         .environment
@@ -3941,6 +3963,15 @@ fn filter_child_env(
         }
     }
     drop(broker);
+    // Caller-declared export: the resolved caller's export_env (or session_export_env)
+    // copies matching vars verbatim from the intercepted command's parent env,
+    // bypassing allow_vars + the dangerous-var blocklist. Runs before
+    // PATH/chaining/set_vars/creds so nono-injected vars still win.
+    apply_export_env(
+        &mut env,
+        request,
+        caller_export_env(&state.plan.config, caller),
+    );
     if !has_path {
         env.push(format!("PATH={}", state.session_path).into_bytes());
     } else {

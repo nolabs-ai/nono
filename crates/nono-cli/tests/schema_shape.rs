@@ -107,6 +107,7 @@ fn test_schema_command_policies_match_tool_sandbox_guide_shape() {
             "deny_direct_exec_bypass",
             "entrypoint",
             "executable_dirs",
+            "session_export_env",
         ],
     );
     assert_schema_properties(
@@ -149,6 +150,7 @@ fn test_schema_command_policies_match_tool_sandbox_guide_shape() {
             "can_use",
             "daemon_pid_source",
             "executable",
+            "export_env",
             "from",
             "intercept",
             "sandbox",

@@ -229,6 +229,19 @@ pub struct CommandPoliciesConfig {
     pub commands: BTreeMap<String, CommandPolicyConfig>,
     #[serde(default)]
     pub deny_direct_exec_bypass: Vec<String>,
+    /// Environment variables the top-level session exports to commands it
+    /// invokes. When a command's resolved caller is the session (its literal
+    /// process ancestry reaches the session root without crossing a mediated
+    /// command — e.g. an unmediated wrapper spawns it), the matching variables
+    /// are copied verbatim from the intercepted command's immediate-parent
+    /// environment into the child, bypassing both `allow_vars` filtering and
+    /// the dangerous-variable blocklist.
+    ///
+    /// Patterns: exact names, trailing-`*` prefixes, or a bare `*` (all).
+    /// `PATH` and any `NONO_*` key are always excluded. Mirrors the per-command
+    /// `export_env` field for the session caller.
+    #[serde(default)]
+    pub session_export_env: Vec<String>,
 }
 
 impl CommandPoliciesConfig {
@@ -262,6 +275,7 @@ impl CommandPoliciesConfig {
             || self.approval_defaults.has_values()
             || !self.credentials.is_empty()
             || !self.deny_direct_exec_bypass.is_empty()
+            || !self.session_export_env.is_empty()
     }
 
     pub(crate) fn merge_child(&self, child: &Self) -> Self {
@@ -298,6 +312,7 @@ impl CommandPoliciesConfig {
                 &self.deny_direct_exec_bypass,
                 &child.deny_direct_exec_bypass,
             ),
+            session_export_env: dedup_append(&self.session_export_env, &child.session_export_env),
         }
     }
 }
@@ -519,6 +534,18 @@ pub struct CommandPolicyConfig {
     pub allow_writable_executable: bool,
     #[serde(default)]
     pub can_use: Vec<String>,
+    /// Environment variables this command exports to commands it invokes. When
+    /// a command's resolved caller is this command, the matching variables are
+    /// copied verbatim from the intercepted command's immediate-parent
+    /// environment into the child, bypassing both `allow_vars` filtering and
+    /// the dangerous-variable blocklist. This is the caller-declared escape
+    /// hatch for tools that must forward an interpreter/tooling variable (e.g.
+    /// an interpreter-injection variable) to the commands they launch.
+    ///
+    /// Patterns: exact names, trailing-`*` prefixes, or a bare `*` (all).
+    /// `PATH` and any `NONO_*` key are always excluded.
+    #[serde(default)]
+    pub export_env: Vec<String>,
     #[serde(default)]
     pub sandbox: Option<CommandSandboxConfig>,
     #[serde(default)]
@@ -565,6 +592,7 @@ impl CommandPolicyConfig {
             allow_writable_executable: self.allow_writable_executable
                 || child.allow_writable_executable,
             can_use: dedup_append(&self.can_use, &child.can_use),
+            export_env: dedup_append(&self.export_env, &child.export_env),
             sandbox: merge_optional_sandbox(&self.sandbox, &child.sandbox),
             from,
             allow_direct_exec_bypass: dedup_append(
@@ -1058,6 +1086,11 @@ pub(crate) fn validate_command_policies(
         &config.deny_direct_exec_bypass,
         &mut report,
     );
+    validate_export_env(
+        "command_policies.session_export_env",
+        &config.session_export_env,
+        &mut report,
+    );
     if config.allow_writable_executables {
         report.warning(
             "writable_executables_trust_downgrade",
@@ -1466,6 +1499,12 @@ fn validate_command(
     validate_identifier_list(
         &format!("commands.{command_name}.can_use"),
         &command.can_use,
+        report,
+    );
+
+    validate_export_env(
+        &format!("command '{command_name}' export_env"),
+        &command.export_env,
         report,
     );
 
@@ -2492,6 +2531,46 @@ fn validate_environment(
             report.error(
                 "invalid_environment_set_var",
                 format!("command '{command_name}' from.{caller} set_vars value for '{name}' contains NUL"),
+            );
+        }
+    }
+}
+
+/// Validate a caller-declared `export_env` pattern list. Patterns allow exact
+/// names, trailing-`*` prefixes, and a bare `*`. `PATH` and any `NONO_*` key
+/// are rejected — nono manages those and they are always excluded at build
+/// time regardless. `field_label` names the field for diagnostics (e.g.
+/// `command 'git' export_env` or `session_export_env`).
+fn validate_export_env(
+    field_label: &str,
+    patterns: &[String],
+    report: &mut CommandPolicyValidationReport,
+) {
+    if let Some(error) = crate::exec_strategy::validate_env_var_patterns(patterns, "export_env") {
+        report.error("invalid_export_env", format!("{field_label}: {error}"));
+    }
+    for pattern in patterns {
+        if pattern.is_empty() {
+            report.error(
+                "invalid_export_env",
+                format!("{field_label} has an empty pattern"),
+            );
+            continue;
+        }
+        if pattern.matches('*').count() > 1 {
+            report.error(
+                "invalid_export_env",
+                format!("{field_label} pattern '{pattern}' contains multiple wildcards"),
+            );
+        }
+        // Reject patterns that explicitly target reserved variables (exact
+        // `PATH` or the `NONO_*` namespace) — nono owns those. A bare `*` or a
+        // broad prefix is still fine: PATH and NONO_* are excluded at build
+        // time regardless, so the catch-all simply skips them.
+        if pattern == "PATH" || pattern.starts_with("NONO_") {
+            report.error(
+                "invalid_export_env",
+                format!("{field_label} pattern '{pattern}' targets reserved PATH/NONO_* variables"),
             );
         }
     }
@@ -3766,6 +3845,93 @@ mod tests {
                 .errors
                 .iter()
                 .any(|finding| finding.code == "invalid_environment_pattern")
+        );
+    }
+
+    #[test]
+    fn export_env_rejects_reserved_and_malformed_patterns() {
+        // A mid-string wildcard, exact PATH, and the NONO_* namespace must all
+        // be rejected on the caller-declared export list.
+        let mut config = active_git_config();
+        if let Some(git) = config.commands.get_mut("git") {
+            git.export_env = vec![
+                "A*B".to_string(),
+                "PATH".to_string(),
+                "NONO_FOO".to_string(),
+            ];
+        }
+
+        let report =
+            validate_command_policies(Some(&config), CommandPolicyValidationScope::Resolved);
+
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|finding| finding.code == "invalid_export_env")
+        );
+    }
+
+    #[test]
+    fn export_env_rejects_repeated_trailing_wildcards() {
+        // "A**" ends with '*' and doesn't start with '*', so it passes the
+        // shared validate_env_var_patterns check, but matches_env_var_patterns
+        // treats a `*`-containing prefix as unmatchable, silently excluding
+        // the variable at runtime. Enforce the same single-wildcard rule used
+        // for allow_vars.
+        let mut config = active_git_config();
+        if let Some(git) = config.commands.get_mut("git") {
+            git.export_env = vec!["A**".to_string()];
+        }
+
+        let report =
+            validate_command_policies(Some(&config), CommandPolicyValidationScope::Resolved);
+
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|finding| finding.code == "invalid_export_env")
+        );
+    }
+
+    #[test]
+    fn export_env_accepts_valid_patterns() {
+        // Exact names, trailing-`*` prefixes, and a bare `*` (which still
+        // excludes PATH/NONO_* at build time) are all accepted.
+        let mut config = active_git_config();
+        if let Some(git) = config.commands.get_mut("git") {
+            git.export_env = vec![
+                "TOOL_CONFIG".to_string(),
+                "AWS_*".to_string(),
+                "*".to_string(),
+            ];
+        }
+
+        let report =
+            validate_command_policies(Some(&config), CommandPolicyValidationScope::Resolved);
+
+        assert!(
+            !report
+                .errors
+                .iter()
+                .any(|finding| finding.code == "invalid_export_env")
+        );
+    }
+
+    #[test]
+    fn session_export_env_rejects_reserved_patterns() {
+        let mut config = active_git_config();
+        config.session_export_env = vec!["NONO_CAP_FILE".to_string()];
+
+        let report =
+            validate_command_policies(Some(&config), CommandPolicyValidationScope::Resolved);
+
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|finding| finding.code == "invalid_export_env")
         );
     }
 

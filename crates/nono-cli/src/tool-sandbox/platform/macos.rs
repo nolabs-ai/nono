@@ -3117,6 +3117,16 @@ fn add_policy_network(caps: &mut CapabilitySet, policy: &CommandSandboxConfig) -
     let Some(network) = &policy.network else {
         return Ok(());
     };
+    // Localhost bind grants (e.g. an OAuth callback listener) flow to the child
+    // via localhost_port_ranges → proxy_bind_port_ranges, so they compose with
+    // ProxyOnly mode. Only ranges are carried in the child spec, so singles are
+    // widened to [port, port].
+    for &port in &network.open_port {
+        caps.add_localhost_port_range(port, port)?;
+    }
+    for &[start, end] in &network.open_port_range {
+        caps.add_localhost_port_range(start, end)?;
+    }
     if network.allow_all {
         caps.set_network_mode_mut(NetworkMode::AllowAll);
         return Ok(());
@@ -6846,6 +6856,34 @@ mod tests {
         let selected = select_effective_policy(&config, "git", &Caller::Session)?;
 
         assert_eq!(selected.fs_read, sandbox.fs_read);
+        Ok(())
+    }
+
+    #[test]
+    fn open_port_grants_localhost_bind_ranges() -> Result<()> {
+        // A proxy-routed command's open_port must reach the child via
+        // localhost_port_ranges (→ proxy_bind_port_ranges), so an OAuth
+        // callback listener can bind. Singles are widened to [port, port].
+        let policy = CommandSandboxConfig {
+            network: Some(crate::command_policy::CommandNetworkConfig {
+                allow_domain: vec!["example.com".to_string()],
+                open_port: vec![8250],
+                open_port_range: vec![[8251, 8255]],
+                ..Default::default()
+            }),
+            ..CommandSandboxConfig::default()
+        };
+        let mut caps = CapabilitySet::new();
+        add_policy_network(&mut caps, &policy)?;
+        let ranges = caps.localhost_port_ranges();
+        assert!(
+            ranges.contains(&(8250, 8250)),
+            "single open_port widened to a range: {ranges:?}"
+        );
+        assert!(
+            ranges.contains(&(8251, 8255)),
+            "open_port_range preserved: {ranges:?}"
+        );
         Ok(())
     }
 

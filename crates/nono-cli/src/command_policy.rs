@@ -972,6 +972,14 @@ pub struct CommandNetworkConfig {
     pub tcp_connect_ports: Vec<u16>,
     #[serde(default)]
     pub tcp_bind_ports: Vec<u16>,
+    /// Localhost ports this command may bind (e.g. an OAuth callback listener).
+    /// Unlike `tcp_bind_ports` these are enforceable for tool-sandbox children
+    /// on macOS — they mirror the top-level `network.open_port`.
+    #[serde(default)]
+    pub open_port: Vec<u16>,
+    /// Localhost port ranges this command may bind, as `[start, end]` pairs.
+    #[serde(default)]
+    pub open_port_range: Vec<[u16; 2]>,
 }
 
 impl CommandNetworkConfig {
@@ -981,6 +989,8 @@ impl CommandNetworkConfig {
             allow_domain: dedup_append(&self.allow_domain, &child.allow_domain),
             tcp_connect_ports: dedup_append(&self.tcp_connect_ports, &child.tcp_connect_ports),
             tcp_bind_ports: dedup_append(&self.tcp_bind_ports, &child.tcp_bind_ports),
+            open_port: dedup_append(&self.open_port, &child.open_port),
+            open_port_range: dedup_append(&self.open_port_range, &child.open_port_range),
         }
     }
 }
@@ -3526,6 +3536,31 @@ mod tests {
             value.get("exec_paths").is_none(),
             "empty exec_paths should be omitted, got {value}"
         );
+    }
+
+    #[test]
+    fn command_network_open_port_merge_child_dedup_appends() {
+        let base = CommandNetworkConfig {
+            open_port: vec![8250],
+            open_port_range: vec![[3000, 3100]],
+            ..Default::default()
+        };
+        let child = CommandNetworkConfig {
+            open_port: vec![8250, 8251],
+            open_port_range: vec![[3000, 3100], [4000, 4100]],
+            ..Default::default()
+        };
+        let merged = base.merge_child(&child);
+        assert_eq!(merged.open_port, vec![8250, 8251]);
+        assert_eq!(merged.open_port_range, vec![[3000, 3100], [4000, 4100]]);
+    }
+
+    #[test]
+    fn command_network_open_port_round_trips() {
+        let json = r#"{"allow_domain":["vault.us1.ddbuild.io"],"open_port_range":[[8250,8255]]}"#;
+        let cfg: CommandNetworkConfig = serde_json::from_str(json).expect("parse");
+        assert_eq!(cfg.open_port_range, vec![[8250, 8255]]);
+        assert!(cfg.open_port.is_empty());
     }
 
     #[test]

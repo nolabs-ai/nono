@@ -1246,7 +1246,26 @@ fn handle_shim_stream_inner(
             NonoError::SandboxInit(format!("missing command config for {}", request.command))
         })?;
 
-    let intercept = super::resolve_intercept_action(command_config, &request.argv);
+    let intercept = match super::resolve_intercept_action(command_config, &request.argv, || {
+        filter_child_env(state, &request, policy)
+    }) {
+        Ok(intercept) => intercept,
+        Err(err) => {
+            record_command_policy_audit(
+                audit_recorder.as_ref(),
+                &request,
+                &state.redaction_policy,
+                session_id,
+                auth.peer_pid,
+                session_root_pid,
+                Some(&caller),
+                "denied",
+                Some(err.to_string()),
+                None,
+            )?;
+            return Err(err);
+        }
+    };
     let intercept_action = intercept.action;
 
     // A matched intercept rule may carry a sandbox that replaces the command's
@@ -5741,7 +5760,8 @@ mod tests {
             "tool".to_string(),
             CommandPolicyConfig {
                 intercept: vec![InterceptRuleConfig {
-                    args: vec![],
+                    args: Some(vec![]),
+                    match_config: None,
                     action: InterceptActionConfig::Exec {
                         command: vec![helper.to_string_lossy().into_owned()],
                     },
@@ -6915,7 +6935,7 @@ mod tests {
 
         let with_override = crate::tool_sandbox::ResolvedInterceptAction {
             action: &crate::command_policy::InterceptActionConfig::Passthrough,
-            rule_args: Some(&[]),
+            rule_label: Some(crate::tool_sandbox::ResolvedInterceptRuleLabel::Args(&[])),
             sandbox: Some(&override_sandbox),
         };
         let effective = with_override.sandbox.unwrap_or(&command_sandbox);

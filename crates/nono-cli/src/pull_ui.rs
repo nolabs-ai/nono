@@ -1,7 +1,7 @@
 //! Sleek TUI for `nono pull`. Streams per-file download progress as it
 //! happens, then renders the install summary. Same output for the
 //! explicit `nono pull <ref>` command and the auto-pull path triggered
-//! by `--profile always-further/claude`.
+//! by `--profile nolabs-ai/claude`.
 //!
 //! Design rules (do not relax without thinking):
 //!   - No spinners, no in-place line rewrites — output stays readable in

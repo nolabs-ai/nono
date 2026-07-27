@@ -113,6 +113,8 @@ pub(crate) struct ChildCapsSpec {
     pub(crate) network_blocked: bool,
     pub(crate) proxy_port: Option<u16>,
     pub(crate) proxy_bind_ports: Vec<u16>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) proxy_bind_port_ranges: Vec<(u16, u16)>,
     pub(crate) tcp_connect_ports: Vec<u16>,
     pub(crate) tcp_bind_ports: Vec<u16>,
 }
@@ -249,6 +251,28 @@ pub(crate) fn read_frame<T: for<'de> Deserialize<'de>>(stream: &mut UnixStream) 
     })?;
     serde_json::from_slice(&payload).map_err(|err| {
         NonoError::SandboxInit(format!("failed to parse tool-sandbox IPC frame: {err}"))
+    })
+}
+
+/// Send a 1-byte acknowledgement that the request frame has been fully read.
+///
+/// The runtime calls this after `read_frame` completes and before `recv_stdio_fds`.
+/// The shim waits for this ack before calling `send_stdio_fds`, ensuring the
+/// socket receive buffer is empty when `sendmsg` carries SCM_RIGHTS ancillary
+/// data. On macOS, `sendmsg` with ancillary data on a stream socket returns
+/// EMSGSIZE if the peer's receive buffer cannot accommodate the control message
+/// atomically — this ack eliminates that race.
+pub(crate) fn send_frame_ack(stream: &mut UnixStream) -> Result<()> {
+    stream
+        .write_all(&[0u8])
+        .map_err(|e| NonoError::SandboxInit(format!("tool-sandbox: failed to send frame ack: {e}")))
+}
+
+/// Receive the 1-byte acknowledgement sent by `send_frame_ack`.
+pub(crate) fn recv_frame_ack(stream: &mut UnixStream) -> Result<()> {
+    let mut buf = [0u8; 1];
+    stream.read_exact(&mut buf).map_err(|e| {
+        NonoError::SandboxInit(format!("tool-sandbox: failed to receive frame ack: {e}"))
     })
 }
 

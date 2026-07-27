@@ -103,7 +103,7 @@ fn cmd_init(args: ProfileInitArgs) -> Result<()> {
     }
 
     // Block names that match an embedded built-in profile. Pack profiles use
-    // `org/name` keys (e.g. `always-further/hermes`), which are invalid as
+    // `org/name` keys (e.g. `nolabs-ai/hermes`), which are invalid as
     // profile names, so a short name like `hermes` cannot shadow a pack.
     {
         let pol = policy::load_embedded_policy()?;
@@ -802,7 +802,7 @@ pub(crate) fn cmd_list(args: ProfileListArgs) -> Result<()> {
 }
 
 /// Like `print_profile_line` but appends the providing pack ref so the
-/// user sees `claude-code  Anthropic Claude Code …  always-further/claude`.
+/// user sees `claude-code  Anthropic Claude Code …  nolabs-ai/claude`.
 fn print_pack_profile_line(name: &str, pack_ref: &str, result: &Result<Profile>, t: &theme::Theme) {
     match result {
         Ok(p) => {
@@ -1026,6 +1026,7 @@ pub(crate) fn cmd_show(args: ProfileShowArgs) -> Result<()> {
         || !net.resolved_credentials().is_empty()
         || !net.open_port.is_empty()
         || !net.listen_port.is_empty()
+        || !net.no_proxy.is_empty()
         || net.upstream_proxy.is_some()
         || !net.upstream_bypass.is_empty();
 
@@ -1074,12 +1075,43 @@ pub(crate) fn cmd_show(args: ProfileShowArgs) -> Result<()> {
                 ports.join(", ")
             );
         }
+        if !net.open_port_range.is_empty() {
+            let ranges: Vec<String> = net
+                .open_port_range
+                .iter()
+                .map(|&[s, e]| format!("{}..={}", s, e))
+                .collect();
+            println!(
+                "    {}: {}",
+                theme::fg("open_port_range", t.subtext),
+                ranges.join(", ")
+            );
+        }
         if !net.listen_port.is_empty() {
             let ports: Vec<String> = net.listen_port.iter().map(|p| p.to_string()).collect();
             println!(
                 "    {}: {}",
                 theme::fg("listen_port", t.subtext),
                 ports.join(", ")
+            );
+        }
+        if !net.listen_port_range.is_empty() {
+            let ranges: Vec<String> = net
+                .listen_port_range
+                .iter()
+                .map(|&[s, e]| format!("{}..={}", s, e))
+                .collect();
+            println!(
+                "    {}: {}",
+                theme::fg("listen_port_range", t.subtext),
+                ranges.join(", ")
+            );
+        }
+        if !net.no_proxy.is_empty() {
+            println!(
+                "    {}: {}",
+                theme::fg("no_proxy", t.subtext),
+                net.no_proxy.join(", ")
             );
         }
         if let Some(ref ep) = net.upstream_proxy {
@@ -1268,6 +1300,7 @@ fn profile_to_json(
         "credentials": profile.network.resolved_credentials(),
         "open_port": profile.network.open_port,
         "listen_port": profile.network.listen_port,
+        "no_proxy": profile.network.no_proxy,
         "upstream_proxy": profile.network.upstream_proxy,
         "upstream_bypass": profile.network.upstream_bypass,
     });
@@ -1522,6 +1555,7 @@ pub(crate) fn cmd_diff(args: ProfileDiffArgs) -> Result<()> {
             p1.network.resolved_credentials(),
             p2.network.resolved_credentials(),
         ),
+        ("no_proxy", &p1.network.no_proxy, &p2.network.no_proxy),
         (
             "upstream_bypass",
             &p1.network.upstream_bypass,
@@ -2052,6 +2086,10 @@ fn diff_to_json(name1: &str, name2: &str, p1: &Profile, p2: &Profile) -> serde_j
             "upstream_bypass": diff_vec(
                 &p1.network.upstream_bypass,
                 &p2.network.upstream_bypass,
+            ),
+            "no_proxy": diff_vec(
+                &p1.network.no_proxy,
+                &p2.network.no_proxy,
             ),
             "custom_credentials": diff_custom_credentials_json(
                 &p1.network.custom_credentials,
@@ -3020,7 +3058,10 @@ fn resolve_to_manifest(
             .collect(),
         endpoints: manifest_endpoints,
         dns: true,
-        ports: if prof.network.listen_port.is_empty() && prof.network.open_port.is_empty() {
+        ports: if prof.network.listen_port.is_empty()
+            && prof.network.open_port.is_empty()
+            && prof.network.open_port_range.is_empty()
+        {
             None
         } else {
             Some(manifest::PortConfig {
@@ -3036,6 +3077,17 @@ fn resolve_to_manifest(
                     .open_port
                     .iter()
                     .filter_map(|p| std::num::NonZeroU64::new(u64::from(*p)))
+                    .collect(),
+                localhost_range: prof
+                    .network
+                    .open_port_range
+                    .iter()
+                    .filter_map(|&[s, e]| {
+                        Some([
+                            std::num::NonZeroU64::new(u64::from(s))?,
+                            std::num::NonZeroU64::new(u64::from(e))?,
+                        ])
+                    })
                     .collect(),
             })
         },
@@ -3176,6 +3228,9 @@ fn resolve_to_manifest(
         process,
         rollback,
         credentials,
+        // Profiles do not yet express resource limits; they are set via CLI
+        // flags or a hand-written manifest for now.
+        resources: None,
     })
 }
 

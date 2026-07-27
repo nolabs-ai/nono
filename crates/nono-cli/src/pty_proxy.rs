@@ -136,6 +136,33 @@ enum MasterProxyOutcome {
     Retry,
 }
 
+/// Tracks how far the teardown drain has matched a cursor-position reply
+/// (`ESC [ <params> R`). `step` returns `false` at the terminator or the first
+/// byte that cannot belong to a reply, so type-ahead is left for the shell
+/// rather than scanned for a stray `R`.
+#[derive(Clone, Copy)]
+enum CprReplyParse {
+    NeedEsc,
+    NeedBracket,
+    InParams,
+}
+
+impl CprReplyParse {
+    /// Feed one byte; returns `true` while more reply bytes may follow, `false`
+    /// once the reply ends (`R`) or the byte breaks the grammar.
+    fn step(&mut self, byte: u8) -> bool {
+        match (*self, byte) {
+            (Self::NeedEsc, 0x1b) => *self = Self::NeedBracket,
+            (Self::NeedBracket, b'[') => *self = Self::InParams,
+            // Parameter bytes (`<row>;<col>`) keep the reply going.
+            (Self::InParams, b'0'..=b'9' | b';') => {}
+            // `R` terminator, or any byte that cannot belong to a reply: stop.
+            _ => return false,
+        }
+        true
+    }
+}
+
 impl AttachedClient {
     fn terminal(read_fd: RawFd, write_fd: RawFd) -> Self {
         Self::Terminal { read_fd, write_fd }
@@ -325,7 +352,8 @@ impl PtyProxy {
     ) -> Result<Self> {
         let attach_path = crate::session::session_socket_path(session_id)?;
         remove_stale_attach_socket(&attach_path)?;
-        let attach_listener = bind_attach_listener(&attach_path)?;
+        let bind_path = crate::session::session_socket_bind_path(session_id)?;
+        let attach_listener = bind_attach_listener(&bind_path, &attach_path)?;
         attach_listener.set_nonblocking(true).map_err(|e| {
             NonoError::SandboxInit(format!("Failed to set attach socket nonblocking: {}", e))
         })?;
@@ -418,6 +446,13 @@ impl PtyProxy {
 
         let in_alt_screen = self.screen.alternate_screen_active();
         leave_attach_screen(in_alt_screen);
+        // Swallow a late cursor-position reply (`ESC[<row>;<col>R`) that an
+        // exiting TUI's `ESC[6n` query leaves in the input queue; otherwise it
+        // is handed to the shell and pasted into the next prompt (e.g. `3;1R`).
+        // Done here, still in raw mode, on the final teardown path only —
+        // `restore_terminal()` stays non-draining so the suspend/resume and
+        // temporary-prompt paths preserve type-ahead.
+        discard_late_terminal_input(libc::STDIN_FILENO, timeouts::TERMINAL_QUERY_REPLY_TIMEOUT);
         self.restore_terminal();
         // If the child's last output had no trailing newline, `\r\x1b[K` inside
         // `prepare_parent_output_area` would erase it.  Emit a newline first so
@@ -1452,7 +1487,7 @@ fn remove_stale_attach_socket(attach_path: &Path) -> Result<()> {
     })
 }
 
-fn bind_attach_listener(attach_path: &Path) -> Result<UnixListener> {
+fn bind_attach_listener(bind_path: &Path, canonical_path: &Path) -> Result<UnixListener> {
     struct UmaskGuard(libc::mode_t);
 
     impl Drop for UmaskGuard {
@@ -1464,16 +1499,17 @@ fn bind_attach_listener(attach_path: &Path) -> Result<UnixListener> {
     }
 
     let _umask_guard = UmaskGuard(unsafe { libc::umask(0o177) });
-    let listener = UnixListener::bind(attach_path).map_err(|e| NonoError::ConfigWrite {
-        path: attach_path.to_path_buf(),
+    // Bind through the short symlinked `bind_path` (keeps `sun_path` in-bounds),
+    let listener = UnixListener::bind(bind_path).map_err(|e| NonoError::ConfigWrite {
+        path: canonical_path.to_path_buf(),
         source: e,
     })?;
 
     #[cfg(unix)]
     {
         let perms = std::fs::Permissions::from_mode(0o600);
-        std::fs::set_permissions(attach_path, perms).map_err(|e| NonoError::ConfigWrite {
-            path: attach_path.to_path_buf(),
+        std::fs::set_permissions(canonical_path, perms).map_err(|e| NonoError::ConfigWrite {
+            path: canonical_path.to_path_buf(),
             source: e,
         })?;
     }
@@ -1802,6 +1838,73 @@ fn drain_terminal_output(fd: RawFd) {
     }
 }
 
+/// Wait briefly for, then consume, a late cursor-position reply on `fd`.
+///
+/// On final teardown an exiting TUI child may have just sent the terminal a
+/// cursor-position query (`ESC[6n`); the terminal's reply (`ESC[<row>;<col>R`)
+/// lands only after the child is gone, so nothing consumes it and it gets
+/// pasted into the next shell prompt (e.g. `3;1R`).
+///
+/// Reads one byte at a time up to `max_wait`, matching the CPR grammar and
+/// stopping at the terminator or the first byte that cannot belong to a reply —
+/// so queued type-ahead (which fails the grammar) is left for the shell rather
+/// than scanned for a stray `R`. Byte-at-a-time polling (not a single
+/// `tcflush`) lets a reply that arrives fragmented over a slow link be waited
+/// out without leaking its tail.
+///
+/// MUST run while the terminal is still in raw mode, so the reply — which has no
+/// trailing newline — is readable. No-op when `fd` is not a terminal.
+fn discard_late_terminal_input(fd: RawFd, max_wait: Duration) {
+    // SAFETY: `isatty` only inspects the borrowed fd and does not take ownership.
+    if unsafe { libc::isatty(fd) } != 1 {
+        return;
+    }
+    // Make sure the forwarded query has actually been transmitted so the
+    // terminal has a chance to reply before we wait for it.
+    drain_terminal_output(fd);
+
+    let deadline = Instant::now() + max_wait;
+    let mut parse = CprReplyParse::NeedEsc;
+    loop {
+        let remaining = match deadline.checked_duration_since(Instant::now()) {
+            Some(d) if !d.is_zero() => d,
+            _ => break,
+        };
+        let timeout_ms = remaining.as_millis().min(i32::MAX as u128) as i32;
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: single-fd poll over the borrowed terminal fd.
+        let ready = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+        if ready <= 0 || (pfd.revents & libc::POLLIN) == 0 {
+            // Timed out, errored, or woke for a non-readable event (e.g. HUP):
+            // there is nothing (more) to consume.
+            break;
+        }
+
+        let mut byte = [0u8; 1];
+        // SAFETY: reads a single byte into a stack buffer we own; `fd` is live.
+        let n = unsafe { libc::read(fd, byte.as_mut_ptr().cast::<libc::c_void>(), 1) };
+        match n {
+            // Keep reading while the byte extends a reply; stop once it is fully
+            // drained or the byte is type-ahead (leaving the rest for the shell).
+            1 if parse.step(byte[0]) => continue,
+            1 => break,
+            // EOF: nothing left to read.
+            0 => break,
+            // Negative: retry on EINTR, otherwise give up.
+            _ => {
+                if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                break;
+            }
+        }
+    }
+}
+
 fn write_all_fd(fd: RawFd, mut bytes: &[u8]) -> std::io::Result<()> {
     while !bytes.is_empty() {
         let written =
@@ -1891,7 +1994,9 @@ pub fn connect_to_session(session_id: &str) -> Result<UnixStream> {
         return Err(NonoError::SessionGone);
     }
 
-    let mut stream = UnixStream::connect(&sock_path).map_err(|e| {
+    // Connect through the short symlinked path so `sun_path` stays in bounds
+    let bind_path = crate::session::session_socket_bind_path(session_id)?;
+    let mut stream = UnixStream::connect(&bind_path).map_err(|e| {
         if is_socket_disconnect(&e)
             || matches!(
                 e.kind(),
@@ -1917,7 +2022,9 @@ pub fn request_session_detach(session_id: &str) -> Result<()> {
         return Err(NonoError::SessionGone);
     }
 
-    let mut stream = UnixStream::connect(&sock_path).map_err(|e| {
+    // Connect through the short symlinked path so `sun_path` stays in bounds
+    let bind_path = crate::session::session_socket_bind_path(session_id)?;
+    let mut stream = UnixStream::connect(&bind_path).map_err(|e| {
         if is_socket_disconnect(&e)
             || matches!(
                 e.kind(),
@@ -2470,12 +2577,13 @@ fn run_attach_loop(
 mod tests {
     use super::{
         ATTACH_HANDSHAKE_MAGIC, ATTACH_REQUEST_ATTACH, ATTACH_SCREEN_ENTER_ESCAPE,
-        AltScreenTracker, AttachedClient, DEFAULT_DETACH_SEQUENCE, ERASE_NATIVE_SCROLLBACK,
-        PtyProxy, ReadFdOutcome, ScreenState, TERMINAL_RESTORE_NORMAL, decode_attach_handshake,
-        encode_attach_request_frame, read_fd_once, select_attach_replay_bytes,
-        terminal_restore_escape, write_all_fd,
+        AltScreenTracker, AttachedClient, CprReplyParse, DEFAULT_DETACH_SEQUENCE,
+        ERASE_NATIVE_SCROLLBACK, PtyProxy, ReadFdOutcome, ScreenState, TERMINAL_RESTORE_NORMAL,
+        decode_attach_handshake, discard_late_terminal_input, encode_attach_request_frame,
+        read_fd_once, select_attach_replay_bytes, terminal_restore_escape, write_all_fd,
     };
     use nix::libc;
+    use nix::pty::{OpenptyResult, Winsize, openpty};
     use std::collections::VecDeque;
     use std::io::{Read, Write};
     use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
@@ -2483,6 +2591,135 @@ mod tests {
     use std::os::unix::net::UnixStream;
     use std::thread;
     use std::time::Duration;
+
+    #[test]
+    fn discard_late_terminal_input_drains_pending_query_reply() {
+        let OpenptyResult { master, slave } = raw_mode_pty();
+
+        // Simulate the terminal answering a child's `ESC[6n` cursor-position
+        // query after the child has gone: the reply lands in the input queue.
+        nix::unistd::write(&master, b"\x1b[3;1R").expect("write reply");
+
+        discard_late_terminal_input(slave.as_raw_fd(), Duration::from_millis(500));
+
+        // Nothing should remain queued for the next reader (the shell).
+        let mut pfd = libc::pollfd {
+            fd: slave.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: single-fd poll over the borrowed slave fd.
+        let pending = unsafe { libc::poll(&mut pfd, 1, 50) };
+        assert_eq!(pending, 0, "terminal input queue should have been drained");
+    }
+
+    /// Open a pty whose slave is in raw mode, mirroring the terminal state at
+    /// teardown where `discard_late_terminal_input` must run.
+    fn raw_mode_pty() -> OpenptyResult {
+        use nix::sys::termios::{SetArg, cfmakeraw, tcgetattr, tcsetattr};
+
+        let ws: Option<Winsize> = None;
+        let pair = openpty(ws.as_ref(), None).expect("openpty");
+        let mut attrs = tcgetattr(&pair.slave).expect("tcgetattr");
+        cfmakeraw(&mut attrs);
+        tcsetattr(&pair.slave, SetArg::TCSANOW, &attrs).expect("tcsetattr");
+        pair
+    }
+
+    #[test]
+    fn discard_late_terminal_input_preserves_type_ahead_behind_reply() {
+        let OpenptyResult { master, slave } = raw_mode_pty();
+
+        // The reply, immediately followed by a byte the user typed ahead.
+        nix::unistd::write(&master, b"\x1b[3;1Rx").expect("write reply + type-ahead");
+
+        discard_late_terminal_input(slave.as_raw_fd(), Duration::from_millis(500));
+
+        // Stopping at `R` must leave the typed `x` for the shell to read.
+        let mut buf = [0u8; 8];
+        let n = nix::unistd::read(&slave, &mut buf).expect("read leftover");
+        assert_eq!(
+            &buf[..n],
+            b"x",
+            "type-ahead behind the reply must be preserved"
+        );
+    }
+
+    #[test]
+    fn discard_late_terminal_input_waits_out_fragmented_reply() {
+        let OpenptyResult { master, slave } = raw_mode_pty();
+
+        // Deliver the reply in two fragments, as a slow/network tty might: a bare
+        // `tcflush` on the first `poll` wake would clear the head and leak the
+        // tail. Re-polling per byte must wait out the whole sequence.
+        //
+        // The writer borrows the master fd rather than owning it: `master` must
+        // stay open in this thread, otherwise closing it would raise `POLLHUP`
+        // on the slave and the final drained-queue poll would spuriously wake.
+        let master_fd = master.as_raw_fd();
+        let writer = thread::spawn(move || {
+            // SAFETY: `master` outlives this thread (joined below before drop).
+            let m = unsafe { std::os::fd::BorrowedFd::borrow_raw(master_fd) };
+            nix::unistd::write(m, b"\x1b[3;").expect("write head");
+            thread::sleep(Duration::from_millis(20));
+            nix::unistd::write(m, b"1R").expect("write tail");
+        });
+
+        discard_late_terminal_input(slave.as_raw_fd(), Duration::from_secs(2));
+        writer.join().expect("writer thread");
+
+        let mut pfd = libc::pollfd {
+            fd: slave.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: single-fd poll over the borrowed slave fd.
+        let pending = unsafe { libc::poll(&mut pfd, 1, 50) };
+        assert_eq!(
+            pending, 0,
+            "fragmented reply should have been fully consumed"
+        );
+    }
+
+    #[test]
+    fn discard_late_terminal_input_preserves_type_ahead_with_no_reply() {
+        let OpenptyResult { master, slave } = raw_mode_pty();
+
+        // No reply pending, only type-ahead. Grammar matching bails on the first
+        // non-reply byte rather than scanning ahead for a stray `R`.
+        nix::unistd::write(&master, b"xRy").expect("write type-ahead");
+
+        discard_late_terminal_input(slave.as_raw_fd(), Duration::from_millis(500));
+
+        let mut buf = [0u8; 8];
+        let n = nix::unistd::read(&slave, &mut buf).expect("read leftover");
+        assert_eq!(&buf[..n], b"Ry", "non-reply type-ahead must be preserved");
+    }
+
+    /// Feed `queue` through the grammar exactly as the drain loop does and
+    /// return how many bytes it consumes — lets the grammar be tested PTY-free.
+    fn bytes_consumed_by_drain(queue: &[u8]) -> usize {
+        let mut parse = CprReplyParse::NeedEsc;
+        let mut consumed = 0;
+        for &byte in queue {
+            consumed += 1;
+            if !parse.step(byte) {
+                break;
+            }
+        }
+        consumed
+    }
+
+    #[test]
+    fn cpr_grammar_stops_at_reply_end_or_type_ahead() {
+        // A well-formed reply is consumed through `R`; bytes after it remain.
+        assert_eq!(bytes_consumed_by_drain(b"\x1b[3;1R"), 6);
+        assert_eq!(bytes_consumed_by_drain(b"\x1b[12;240Rls\n"), 9);
+        // Type-ahead is not scanned for a stray `R`: matching stops at the first
+        // byte that cannot belong to a reply.
+        assert_eq!(bytes_consumed_by_drain(b"xRy"), 1);
+        assert_eq!(bytes_consumed_by_drain(b"\x1b[3Xrest"), 4);
+    }
 
     fn build_test_proxy_with_master(master: OwnedFd, sequence: &[u8]) -> PtyProxy {
         let temp_dir = tempfile::tempdir().expect("tempdir");
@@ -3077,5 +3314,74 @@ mod tests {
         assert!(forwarded.is_empty());
         assert!(!proxy.take_suspension_request());
         assert!(proxy.take_detach_request());
+    }
+
+    #[test]
+    fn attach_socket_binds_and_connects_over_sun_path_limit() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        // Usable `sockaddr_un.sun_path` bytes (sizeof - 1, for the NUL):
+        // macOS caps sun_path at 104, Linux/most others at 108.
+        let sun_path_max: usize = if cfg!(target_os = "macos") { 103 } else { 107 };
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("the system clock is set after the UNIX epoch")
+            .as_nanos();
+        let pid = std::process::id();
+
+        // A deep sessions directory whose "<dir>/<id>.sock" overflows sun_path
+        let root = std::env::temp_dir().join(format!("nono-sunpath-deep-{pid}-{nanos}"));
+        let mut deep = root.clone();
+        while deep.join("0123456789abcdef.sock").as_os_str().len() <= sun_path_max {
+            deep = deep.join("deeeeeeeeeeeeeeeeep");
+        }
+        std::fs::create_dir_all(&deep).expect("a unique deep dir tree under TMPDIR is creatable");
+        let canonical = deep.join("0123456789abcdef.sock");
+        assert!(
+            canonical.as_os_str().len() > sun_path_max,
+            "test setup: canonical socket path must exceed the sun_path limit"
+        );
+
+        assert!(
+            UnixListener::bind(&canonical).is_err(),
+            "precondition: over-long path must reject a direct bind"
+        );
+
+        // Address the socket through a short directory symlink pointing
+        // at the deep directory.
+        let link =
+            std::path::PathBuf::from("/tmp").join(format!("nono-sunpath-link-{pid}-{nanos}"));
+        std::os::unix::fs::symlink(&deep, &link).expect("short dir symlink is creatable");
+        let bind_path = link.join("0123456789abcdef.sock");
+        assert!(
+            bind_path.as_os_str().len() <= sun_path_max,
+            "the symlinked bind path must stay within sun_path"
+        );
+
+        // Binding through the short symlink succeeds and the socket inode lands at
+        // its canonical location.
+        let listener = UnixListener::bind(&bind_path)
+            .expect("binding through the short symlink keeps the address within sun_path");
+        assert!(
+            canonical.exists(),
+            "socket must exist at the canonical deep path, so stat/chmod/cleanup still work there"
+        );
+
+        // The client side (`nono attach`) connects through the same short path and
+        // reaches the listener.
+        assert!(
+            UnixStream::connect(&canonical).is_err(),
+            "precondition: over-long path must reject a direct connect"
+        );
+        let _client =
+            UnixStream::connect(&bind_path).expect("the short-path connect reaches the listener");
+        listener
+            .accept()
+            .expect("a client connection is pending, so accept returns it");
+
+        drop(listener);
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

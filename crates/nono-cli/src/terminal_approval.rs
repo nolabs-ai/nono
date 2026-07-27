@@ -265,11 +265,14 @@ mod tests {
     //
     // When stderr is not a terminal (e.g. in CI or when redirected), the
     // backend must return Denied for every request type without attempting to
-    // read from /dev/tty. These tests run fully automated.
+    // read from /dev/tty. These tests are skipped when running interactively
+    // (stderr is a TTY) because the real backend would block waiting for input.
 
     #[test]
     fn non_tty_auto_denies_capability_request() {
-        // In a test runner stderr is never a terminal.
+        if std::io::stderr().is_terminal() {
+            return;
+        }
         let backend = TerminalApproval;
         let decision = backend
             .request_approval(&capability_request())
@@ -282,6 +285,9 @@ mod tests {
 
     #[test]
     fn non_tty_auto_denies_network_request() {
+        if std::io::stderr().is_terminal() {
+            return;
+        }
         let backend = TerminalApproval;
         let decision = backend
             .request_approval(&network_request())
@@ -291,6 +297,9 @@ mod tests {
 
     #[test]
     fn non_tty_auto_denies_command_request() {
+        if std::io::stderr().is_terminal() {
+            return;
+        }
         let backend = TerminalApproval;
         let decision = backend
             .request_approval(&command_request())
@@ -300,6 +309,9 @@ mod tests {
 
     #[test]
     fn non_tty_auto_denies_endpoint_request() {
+        if std::io::stderr().is_terminal() {
+            return;
+        }
         let backend = TerminalApproval;
         let decision = backend
             .request_approval(&endpoint_request())
@@ -311,6 +323,9 @@ mod tests {
 
     #[test]
     fn non_tty_denial_carries_reason() {
+        if std::io::stderr().is_terminal() {
+            return;
+        }
         let backend = TerminalApproval;
         let decision = backend
             .request_approval(&command_request())

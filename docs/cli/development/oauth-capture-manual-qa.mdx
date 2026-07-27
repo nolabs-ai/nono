@@ -1,0 +1,103 @@
+---
+title: "OAuth Capture Manual QA"
+description: "Manual witness checks for declarative OAuth capture providers."
+---
+
+Declarative OAuth capture has unit coverage for parsing, response rewriting,
+phantom resolution, persistence, and fail-closed HTTP/2 behavior. Real agent
+logins are manual QA because they require live accounts, browser/device auth,
+and provider-specific service availability.
+
+Do not paste real token values into issues, logs, or chat. The useful evidence
+is shape and routing:
+
+- token endpoint paths are matched by OAuth capture
+- token responses are rewritten to phantoms
+- persisted auth files contain only phantom or synthetic JWT-shaped values
+- normal agent API calls resolve phantoms only through the admitted proxy route
+- denied Keychain or credential-store access does not prevent phantom-backed use
+
+## Claude Code
+
+Login capture:
+
+```sh
+RUST_LOG=nono_proxy::oauth_capture=debug,nono_proxy::tls_intercept=debug \
+target/debug/nono run \
+  --profile claude-oauth-login \
+  --allow-cwd \
+  --allow-launch-services \
+  -- claude auth login
+```
+
+Expected evidence:
+
+- `configured OAuth capture endpoint provider=claude_code`
+- `matched OAuth capture endpoint provider=claude_code`
+- `rewrote OAuth token response fields to phantoms`
+- `Login successful.`
+
+Use run mode without launch-services after login:
+
+```sh
+RUST_LOG=nono_proxy::oauth_capture=debug,nono_proxy::tls_intercept=debug \
+target/debug/nono run \
+  --profile claude-oauth \
+  --allow-cwd \
+  -- claude -p --no-session-persistence "reply with ok"
+```
+
+Expected evidence:
+
+- `loaded persisted OAuth phantom mappings`
+- `resolved OAuth phantom token for admitted consumer`
+- the command succeeds without granting raw Keychain access
+
+## Codex
+
+Device-code login:
+
+```sh
+RUST_LOG=nono_proxy::oauth_capture=debug,nono_proxy::tls_intercept=debug \
+target/debug/nono run \
+  --profile codex-oauth-login \
+  --allow-cwd \
+  -- codex login --device-auth
+```
+
+Expected evidence:
+
+- `/api/accounts/deviceauth/token` is matched during polling
+- `/oauth/token` is matched during token exchange
+- `rewrote OAuth token response fields to phantoms`
+- `Successfully logged in`
+
+Check stored auth shape without printing values:
+
+```sh
+jq 'paths(scalars) as $p
+  | select(($p|join("."))|test("token|auth|id"; "i"))
+  | {path:($p|join(".")), type:(getpath($p)|type)}' "$CODEX_HOME/auth.json"
+```
+
+Expected evidence:
+
+- access and refresh token fields exist as strings
+- ID token, if present, is JWT-shaped synthetic content
+- no real token material is printed
+
+Run mode:
+
+```sh
+RUST_LOG=nono_proxy::oauth_capture=debug,nono_proxy::tls_intercept=debug \
+target/debug/nono run \
+  --profile codex-oauth \
+  --allow-cwd \
+  -- codex exec "reply with ok"
+```
+
+Expected evidence:
+
+- `loaded persisted OAuth phantom mappings`
+- `resolved OAuth phantom token for admitted consumer`
+- the command succeeds through the authenticated session

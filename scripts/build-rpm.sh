@@ -76,7 +76,7 @@ Release:        ${RPM_RELEASE}
 Summary:        CLI for nono capability-based sandbox
 
 License:        Apache-2.0
-URL:            https://github.com/always-further/nono
+URL:            https://github.com/nolabs-ai/nono
 Source0:        %{name}-%{version}.tar.gz
 
 # This spec has no changelog; avoid distro macros trying to derive

@@ -191,7 +191,7 @@ Trust policy is defined in `trust-policy.json`, separate from the sandbox policy
 
 ```json
 {
-  "version": 1,
+  "predicate": "https://nono.sh/attestation/trust-policy/v1",
   "includes": [
     "SKILLS*",
     "CLAUDE*",
@@ -349,7 +349,7 @@ jobs:
 
 ```json
 {
-  "version": 1,
+  "predicate": "https://nono.sh/attestation/trust-policy/v1",
   "includes": ["SKILLS*", "CLAUDE*", "AGENT*"],
   "publishers": [
     {
@@ -484,7 +484,7 @@ This creates `~/.config/nono/trust-policy.json` with empty `includes` and your s
 
 ```json
 {
-  "version": 1,
+  "predicate": "https://nono.sh/attestation/trust-policy/v1",
   "includes": [],
   "publishers": [
     {

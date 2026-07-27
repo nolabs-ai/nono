@@ -55,6 +55,10 @@ pub enum QueryResult {
         source: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         endpoint_rules: Option<Vec<crate::sandbox_state::EndpointRuleState>>,
+        /// Advisory caveat: policy allows the operation, but enforcement may
+        /// still deny it (e.g. a sibling file grant went stale).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        warning: Option<String>,
     },
     /// The operation is denied
     #[serde(rename = "denied")]
@@ -181,6 +185,7 @@ pub fn query_path(
             access: Some(cap.access.to_string()),
             source: Some(cap.source.to_string()),
             endpoint_rules: None,
+            warning: None,
         });
     }
 
@@ -271,6 +276,7 @@ pub fn query_network(
                                     )),
                                     source: Some("domain allowlist".to_string()),
                                     endpoint_rules: Some(de.endpoints.clone()),
+                                    warning: None,
                                 }
                             } else {
                                 QueryResult::Denied {
@@ -301,6 +307,7 @@ pub fn query_network(
                             )),
                             source: Some("domain allowlist".to_string()),
                             endpoint_rules: Some(de.endpoints.clone()),
+                            warning: None,
                         },
                         (None, _) => QueryResult::Allowed {
                             reason: "proxy_allowed".to_string(),
@@ -321,6 +328,7 @@ pub fn query_network(
                                 "domain allowlist".to_string()
                             }),
                             endpoint_rules: None,
+                            warning: None,
                         },
                     }
                 }
@@ -334,16 +342,100 @@ pub fn query_network(
                 },
             }
         }
-        nono::NetworkMode::AllowAll => QueryResult::Allowed {
-            reason: "network_allowed".to_string(),
-            granted_path: None,
-            access: Some(format!(
-                "Connection to {}:{} would be allowed",
-                domain, port
-            )),
-            source: None,
-            endpoint_rules: None,
-        },
+        nono::NetworkMode::AllowAll => {
+            // OS-level network is unrestricted, but a proxy domain filter may still
+            // apply. When allowed_domains is non-empty the proxy is active with
+            // default-deny semantics — check it the same way ProxyOnly does.
+            if !allowed_domains.is_empty() {
+                let filter = nono::net_filter::HostFilter::new(allowed_domains);
+                match filter.check_host(&domain, &[]) {
+                    nono::net_filter::FilterResult::Allow => {
+                        let matching_endpoints = domain_endpoints
+                            .iter()
+                            .find(|de| de.domain.eq_ignore_ascii_case(&domain));
+
+                        match (matching_endpoints, &url_path) {
+                            (Some(de), Some(path)) => {
+                                if path_matches_endpoint_rules(path, &de.endpoints) {
+                                    QueryResult::Allowed {
+                                        reason: "proxy_allowed".to_string(),
+                                        granted_path: None,
+                                        access: Some(format!(
+                                            "Connection to {}:{} allowed via proxy \
+                                             (path {} matches endpoint rules)",
+                                            domain, port, path,
+                                        )),
+                                        source: Some("domain allowlist".to_string()),
+                                        endpoint_rules: Some(de.endpoints.clone()),
+                                        warning: None,
+                                    }
+                                } else {
+                                    QueryResult::Denied {
+                                        reason: "endpoint_restricted".to_string(),
+                                        details: Some(format!(
+                                            "{} is allowed but {} does not match any endpoint rule",
+                                            domain, path,
+                                        )),
+                                        policy_source: Some("endpoint rules".to_string()),
+                                        matching_capability: None,
+                                        suggested_flag: Some(format!(
+                                            "--allow-domain https://{}{}",
+                                            domain, path,
+                                        )),
+                                        endpoint_rules: Some(de.endpoints.clone()),
+                                    }
+                                }
+                            }
+                            (Some(de), None) => QueryResult::Allowed {
+                                reason: "proxy_allowed".to_string(),
+                                granted_path: None,
+                                access: Some(format!(
+                                    "Connection to {}:{} allowed via proxy \
+                                     (restricted to {} endpoint rules)",
+                                    domain,
+                                    port,
+                                    de.endpoints.len(),
+                                )),
+                                source: Some("domain allowlist".to_string()),
+                                endpoint_rules: Some(de.endpoints.clone()),
+                                warning: None,
+                            },
+                            (None, _) => QueryResult::Allowed {
+                                reason: "proxy_allowed".to_string(),
+                                granted_path: None,
+                                access: Some(format!(
+                                    "Connection to {}:{} would be allowed via proxy",
+                                    domain, port,
+                                )),
+                                source: Some("domain allowlist".to_string()),
+                                endpoint_rules: None,
+                                warning: None,
+                            },
+                        }
+                    }
+                    deny => QueryResult::Denied {
+                        reason: "proxy_filtered".to_string(),
+                        details: Some(format!("Domain filtering is active. {}", deny.reason())),
+                        policy_source: Some("proxy domain filter".to_string()),
+                        matching_capability: None,
+                        suggested_flag: Some(format!("--allow-domain {}", domain)),
+                        endpoint_rules: None,
+                    },
+                }
+            } else {
+                QueryResult::Allowed {
+                    reason: "network_allowed".to_string(),
+                    granted_path: None,
+                    access: Some(format!(
+                        "Connection to {}:{} would be allowed",
+                        domain, port
+                    )),
+                    source: None,
+                    endpoint_rules: None,
+                    warning: None,
+                }
+            }
+        }
     }
 }
 
@@ -489,6 +581,7 @@ pub fn print_result(result: &QueryResult) {
             access,
             source,
             endpoint_rules,
+            warning,
         } => {
             println!("{}", "ALLOWED".green().bold());
             println!("  Reason: {}", reason);
@@ -506,6 +599,9 @@ pub fn print_result(result: &QueryResult) {
                 for rule in rules {
                     println!("    {} {}", rule.method, rule.path);
                 }
+            }
+            if let Some(warn) = warning {
+                println!("  {} {}", "Warning:".yellow().bold(), warn);
             }
         }
         QueryResult::Denied {
@@ -996,7 +1092,7 @@ mod tests {
                 },
                 crate::sandbox_state::EndpointRuleState {
                     method: "*".to_string(),
-                    path: "/always-further/**".to_string(),
+                    path: "/nolabs-ai/**".to_string(),
                 },
             ],
         }];

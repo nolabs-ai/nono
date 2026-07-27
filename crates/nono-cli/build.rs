@@ -9,6 +9,7 @@ use std::path::Path;
 fn main() {
     // Rebuild if data files change
     println!("cargo:rerun-if-changed=data/");
+    println!("cargo:rerun-if-env-changed=NONO_INSTALL_SOURCE");
 
     let out_dir = env::var("OUT_DIR").expect("OUT_DIR not set");
     let out_path = Path::new(&out_dir);

@@ -178,6 +178,21 @@ impl SupervisorSocket {
         recv_fd_via_socket(self.stream.as_raw_fd())
     }
 
+    /// Read a raw fd number (4 bytes, native-endian) sent by the peer via `write()`.
+    ///
+    /// Used on the parent side to receive the proxy seccomp notify fd number
+    /// written by the child without `SCM_RIGHTS` (which would be intercepted
+    /// by the AF_UNIX BPF filter). The caller must use `pidfd_getfd` to
+    /// acquire the actual fd from the child process.
+    #[cfg(target_os = "linux")]
+    pub fn recv_raw_fd_number(&self) -> Result<std::os::unix::io::RawFd> {
+        let mut bytes = [0u8; 4];
+        (&self.stream).read_exact(&mut bytes).map_err(|e| {
+            crate::error::NonoError::SandboxInit(format!("recv_raw_fd_number failed: {e}"))
+        })?;
+        Ok(i32::from_ne_bytes(bytes))
+    }
+
     /// Authenticate the peer using platform-specific mechanisms.
     ///
     /// On Linux, uses `SO_PEERCRED` to get the peer's PID/UID/GID.
@@ -784,16 +799,15 @@ mod tests {
         assert_eq!(pid, std::process::id());
     }
 
-    /// Create a temp directory inside the cargo target dir for socket tests.
-    /// This avoids macOS Seatbelt denials when running tests inside a sandbox
-    /// (Seatbelt's `deny network*` blocks Unix socket connect on /var/folders).
+    /// Create a short-path temp directory for socket tests.
+    /// Socket paths must stay under the SUN_LEN limit (~104 bytes on macOS); use
+    /// /tmp directly rather than the cargo target dir, which under a git worktree
+    /// produces paths that exceed the limit and fail UnixListener::bind with EINVAL.
     fn socket_test_dir() -> tempfile::TempDir {
-        let target = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target");
-        std::fs::create_dir_all(&target).ok();
         tempfile::Builder::new()
             .prefix("sock-test-")
-            .tempdir_in(&target)
-            .expect("create test tmpdir in target/")
+            .tempdir_in(std::path::Path::new("/tmp"))
+            .expect("create test tmpdir in /tmp")
     }
 
     #[test]

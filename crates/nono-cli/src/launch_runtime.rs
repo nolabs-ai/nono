@@ -3,6 +3,7 @@ use crate::config;
 use crate::proxy_runtime::prepare_proxy_launch_options;
 use crate::sandbox_prepare::{
     PreparedSandbox, prepare_sandbox, print_allow_gpu_warning, print_allow_launch_services_warning,
+    validate_proxy_conflicts,
 };
 use crate::{exec_strategy, instruction_deny, profile, trust_scan};
 use colored::Colorize;
@@ -32,6 +33,10 @@ pub(crate) struct LaunchPlan {
     pub(crate) program: OsString,
     pub(crate) cmd_args: Vec<OsString>,
     pub(crate) caps: CapabilitySet,
+    /// Resolved filesystem deny paths (groups + profile `filesystem.deny`).
+    /// Threaded to the tool-sandbox so a mediated command's live working
+    /// directory can be rejected when it falls under a path the agent is denied.
+    pub(crate) deny_paths: Vec<PathBuf>,
     pub(crate) loaded_secrets: Vec<nono::LoadedSecret>,
     pub(crate) flags: ExecutionFlags,
 }
@@ -72,30 +77,35 @@ pub(crate) struct TrustLaunchOptions {
 }
 
 /// Plain CONNECT-tunnel domain allowlist entries and an optional network profile.
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct DomainFilterIntent {
     pub(crate) network_profile: Option<String>,
     /// Only `AllowDomainEntry::Plain` entries — endpoint-bearing entries live in
     /// `EndpointFilterIntent`.
     pub(crate) allow_domain: Vec<profile::AllowDomainEntry>,
+    /// Domains to deny regardless of the allowlist.
+    pub(crate) deny_domain: Vec<String>,
 }
 
 /// `WithEndpoints` allow-domain entries that require TLS interception so the
 /// proxy can inspect method and path before forwarding.
 /// All entries must be `AllowDomainEntry::WithEndpoints` (enforced by `debug_assert`
 /// at construction in `prepare_proxy_launch_options`).
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct EndpointFilterIntent {
     pub(crate) routes: Vec<profile::AllowDomainEntry>,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct CredentialProxyIntent {
     pub(crate) credentials: Vec<String>,
     pub(crate) custom_credentials: HashMap<String, profile::CustomCredentialDef>,
+    /// Per-credential endpoint restrictions from `--allow-endpoint SERVICE:METHOD:PATH`,
+    /// pre-parsed into `(service_name, rule)` pairs.
+    pub(crate) endpoint_restrictions: Vec<(String, nono_proxy::config::EndpointRule)>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct UpstreamProxyIntent {
     pub(crate) address: String,
     pub(crate) bypass: Vec<String>,
@@ -103,22 +113,23 @@ pub(crate) struct UpstreamProxyIntent {
 
 /// TLS interception configuration supplied by the user. Presence means the user
 /// configured TLS intercept settings; it does not by itself activate the proxy.
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct TlsInterceptIntent {
     /// macOS only: reuse a persistent CA bundle across sessions.
     #[cfg(target_os = "macos")]
     pub(crate) trust_proxy_ca: bool,
     pub(crate) ca_validity: Option<std::time::Duration>,
+    pub(crate) ca_env_vars: Vec<String>,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct OpenUrlIntent {
     pub(crate) origins: Vec<String>,
     pub(crate) allow_localhost: bool,
     pub(crate) allow_launch_services: bool,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct ProxyLaunchOptions {
     pub(crate) domain_filter: Option<DomainFilterIntent>,
     pub(crate) endpoint_filter: Option<EndpointFilterIntent>,
@@ -128,10 +139,10 @@ pub(crate) struct ProxyLaunchOptions {
     pub(crate) open_url: Option<OpenUrlIntent>,
     pub(crate) allow_bind_ports: Vec<u16>,
     pub(crate) proxy_port: Option<u16>,
-    /// True when the user requested `network.block` or `--block-net`.
-    /// Propagated to `ProxyConfig.strict_filter` so the filter denies
-    /// unlisted hosts instead of falling back to allow-all.
-    pub(crate) network_block: bool,
+    /// When `true`, the proxy denies any host not explicitly allowed rather
+    /// than falling back to allow-all. Set when the user combined proxy
+    /// features with `--block-net` or profile `network.block`.
+    pub(crate) strict_filter: bool,
     pub(crate) proxy_leaf_validity: Option<std::time::Duration>,
     pub(crate) command_policies: Option<crate::command_policy::CommandPoliciesConfig>,
     /// Environment variables the proxy must source (e.g. credential-bearing
@@ -146,6 +157,15 @@ pub(crate) struct ProxyLaunchOptions {
     pub(crate) session_id: String,
     /// Supervisor-side CLI command credential-capture entries.
     pub(crate) credential_capture: HashMap<String, profile::CredentialCaptureEntry>,
+    /// Declarative OAuth provider definitions.
+    pub(crate) credential_providers: HashMap<String, profile::CredentialProviderDef>,
+    /// Declarative OAuth provider route bindings.
+    pub(crate) credential_routes: Vec<profile::CredentialRouteDef>,
+    /// Enable HTTP/2 negotiation for upstream connections.
+    pub(crate) enable_h2: bool,
+    /// Profile-declared client-side proxy bypass entries for generated
+    /// NO_PROXY/no_proxy.
+    pub(crate) no_proxy: Vec<String>,
 }
 
 impl ProxyLaunchOptions {
@@ -156,7 +176,42 @@ impl ProxyLaunchOptions {
                 .credentials
                 .as_ref()
                 .is_some_and(|credentials| !credentials.credentials.is_empty())
+            || !self.credential_routes.is_empty()
             || self.upstream_proxy.is_some()
+    }
+}
+
+/// Resolved network intent, derived from CLI flags and profile before any
+/// proxy is started. This is the single source of truth for which network
+/// mode the sandbox will run in.
+///
+/// Variants are ordered by decreasing restriction:
+/// - `BlockAll` — OS sandbox denies all outbound connections.
+/// - `ProxyFiltered` — outbound connections are gated through the nono proxy.
+/// - `Unrestricted` — no network restriction.
+#[derive(Clone, Debug, Default)]
+pub(crate) enum NetworkIntent {
+    /// `--allow-net` or default when no network flags are given: no restriction.
+    #[default]
+    Unrestricted,
+    /// `--block-net` or profile `network.block` with no active proxy override:
+    /// outbound connections are denied by the OS sandbox.
+    BlockAll,
+    /// Proxy-activating features are configured. Proxy starts only if
+    /// `ProxyLaunchOptions::is_active()` — custom credentials alone do not.
+    ProxyFiltered(Box<ProxyLaunchOptions>),
+}
+
+impl NetworkIntent {
+    pub(crate) fn is_proxy_active(&self) -> bool {
+        matches!(self, Self::ProxyFiltered(opts) if opts.is_active())
+    }
+
+    pub(crate) fn proxy_options(&self) -> Option<&ProxyLaunchOptions> {
+        match self {
+            Self::ProxyFiltered(opts) => Some(opts),
+            _ => None,
+        }
     }
 }
 
@@ -168,11 +223,16 @@ pub(crate) struct ExecutionFlags {
     pub(crate) diagnostics_json: bool,
     pub(crate) diagnostic_verbosity: u8,
     pub(crate) silent: bool,
+    #[cfg(target_os = "linux")]
     pub(crate) capability_elevation: bool,
     #[cfg(target_os = "linux")]
     pub(crate) wsl2_proxy_policy: crate::profile::Wsl2ProxyPolicy,
     #[cfg(target_os = "linux")]
     pub(crate) af_unix_mediation: crate::profile::LinuxAfUnixMediation,
+    #[cfg(target_os = "linux")]
+    pub(crate) sandbox_policy: crate::profile::LinuxSandboxPolicy,
+    #[cfg(target_os = "linux")]
+    pub(crate) proc_comm_notify: bool,
     pub(crate) bypass_protection_paths: Vec<PathBuf>,
     pub(crate) ignored_denial_paths: Vec<PathBuf>,
     pub(crate) suppressed_system_service_operations: Vec<String>,
@@ -180,7 +240,7 @@ pub(crate) struct ExecutionFlags {
     pub(crate) session: SessionLaunchOptions,
     pub(crate) rollback: RollbackLaunchOptions,
     pub(crate) trust: TrustLaunchOptions,
-    pub(crate) proxy: ProxyLaunchOptions,
+    pub(crate) network: NetworkIntent,
     pub(crate) redaction_policy: nono::ScrubPolicy,
     pub(crate) session_hooks: profile::SessionHooks,
     pub(crate) allowed_env_vars: Option<Vec<String>>,
@@ -189,42 +249,60 @@ pub(crate) struct ExecutionFlags {
     pub(crate) set_vars: Option<Vec<(String, String)>>,
     pub(crate) startup_timeout_secs: Option<u64>,
     pub(crate) command_policies: Option<crate::command_policy::CommandPoliciesConfig>,
+    /// Command binaries already resolved while validating `command_policies`,
+    /// reused when building the tool-sandbox plan instead of re-resolving.
+    pub(crate) resolved_command_binaries: Option<crate::command_policy::ResolvedCommandBinaries>,
 }
 
 impl ExecutionFlags {
-    pub(crate) fn defaults(silent: bool) -> Result<Self> {
+    /// Build flags from a fully-prepared sandbox, with sensible defaults for
+    /// fields that are not sourced from the profile (strategy, workdir, etc.).
+    /// Call sites override only what they need via struct update syntax:
+    ///   `ExecutionFlags { strategy: ..., ..ExecutionFlags::from_prepared(&p, silent)? }`
+    pub(crate) fn from_prepared(
+        prepared: &crate::sandbox_prepare::PreparedSandbox,
+        silent: bool,
+    ) -> Result<Self> {
+        let cwd = std::env::current_dir()
+            .map_err(|e| NonoError::SandboxInit(format!("Failed to get cwd: {e}")))?;
         Ok(Self {
             strategy: exec_strategy::ExecStrategy::Supervised,
-            workdir: std::env::current_dir()
-                .map_err(|e| NonoError::SandboxInit(format!("Failed to get cwd: {e}")))?,
+            workdir: cwd.clone(),
             no_diagnostics: false,
             diagnostics_json: false,
             diagnostic_verbosity: 0,
             silent,
-            capability_elevation: false,
             #[cfg(target_os = "linux")]
-            wsl2_proxy_policy: crate::profile::Wsl2ProxyPolicy::Error,
+            capability_elevation: prepared.capability_elevation,
             #[cfg(target_os = "linux")]
-            af_unix_mediation: crate::profile::LinuxAfUnixMediation::Off,
-            bypass_protection_paths: Vec::new(),
-            ignored_denial_paths: Vec::new(),
-            suppressed_system_service_operations: Vec::new(),
-            profile_display_name: None,
+            wsl2_proxy_policy: prepared.wsl2_proxy_policy,
+            #[cfg(target_os = "linux")]
+            af_unix_mediation: prepared.af_unix_mediation,
+            #[cfg(target_os = "linux")]
+            sandbox_policy: prepared.sandbox_policy,
+            #[cfg(target_os = "linux")]
+            proc_comm_notify: prepared.proc_comm_notify,
+            bypass_protection_paths: prepared.bypass_protection_paths.clone(),
+            ignored_denial_paths: prepared.ignored_denial_paths.clone(),
+            suppressed_system_service_operations: prepared
+                .suppressed_system_service_operations
+                .clone(),
+            profile_display_name: prepared.profile_display_name.clone(),
             session: SessionLaunchOptions::default(),
             rollback: RollbackLaunchOptions::default(),
             trust: TrustLaunchOptions {
-                scan_root: std::env::current_dir()
-                    .map_err(|e| NonoError::SandboxInit(format!("Failed to get cwd: {e}")))?,
+                scan_root: cwd,
                 ..TrustLaunchOptions::default()
             },
-            proxy: ProxyLaunchOptions::default(),
+            network: NetworkIntent::default(),
             redaction_policy: nono::ScrubPolicy::secure_default(),
-            session_hooks: profile::SessionHooks::default(),
-            allowed_env_vars: None,
-            denied_env_vars: None,
-            set_vars: None,
+            session_hooks: prepared.session_hooks.clone(),
+            allowed_env_vars: prepared.allowed_env_vars.clone(),
+            denied_env_vars: prepared.denied_env_vars.clone(),
+            set_vars: prepared.set_vars.clone(),
             startup_timeout_secs: None,
-            command_policies: None,
+            command_policies: prepared.command_policies.clone(),
+            resolved_command_binaries: prepared.resolved_command_binaries.clone(),
         })
     }
 }
@@ -268,6 +346,7 @@ pub(crate) fn prepare_run_launch_plan(
     }
 
     let mut prepared = prepare_sandbox(&args, silent)?;
+    validate_proxy_conflicts(&args, &prepared)?;
     validate_rollback_destination(run_args.rollback_dest.as_ref(), &prepared)?;
 
     if prepared.allow_launch_services_active {
@@ -317,7 +396,7 @@ pub(crate) fn prepare_run_launch_plan(
         .ok()
         .filter(|id| !id.is_empty())
         .unwrap_or_else(crate::session::generate_session_id);
-    let proxy = prepare_proxy_launch_options(&args, &prepared, silent, session_id.clone())?;
+    let network = prepare_proxy_launch_options(&args, &prepared, silent, session_id.clone())?;
     let rollback_options = prepare_rollback_launch_options(
         &run_args.rollback_exclude,
         run_args.rollback_all,
@@ -328,61 +407,49 @@ pub(crate) fn prepare_run_launch_plan(
 
     let strategy = select_exec_strategy(
         rollback,
-        proxy.is_active(),
+        network.is_proxy_active(),
         prepared.capability_elevation,
         trust.interception_active,
         run_args.detached,
     );
 
+    let flags = ExecutionFlags {
+        strategy,
+        workdir: resolve_requested_workdir(args.workdir.as_ref()),
+        no_diagnostics,
+        diagnostics_json,
+        diagnostic_verbosity: args.verbose,
+        session: SessionLaunchOptions {
+            session_id: Some(session_id),
+            detached_start: run_args.detached,
+            session_name: run_args.name,
+            profile_name: args.profile.clone(),
+            detach_sequence,
+        },
+        rollback: RollbackLaunchOptions {
+            requested: rollback,
+            disabled: run_args.no_rollback,
+            prompt_disabled: no_rollback_prompt,
+            audit_disabled: no_audit,
+            no_audit_integrity,
+            audit_integrity: run_args.audit_integrity,
+            audit_sign_key,
+            destination: run_args.rollback_dest,
+            ..rollback_options
+        },
+        trust,
+        network,
+        redaction_policy,
+        startup_timeout_secs,
+        ..ExecutionFlags::from_prepared(&prepared, silent)?
+    };
     Ok(LaunchPlan {
         program,
         cmd_args,
         caps: prepared.caps,
+        deny_paths: prepared.deny_paths,
         loaded_secrets: prepared.secrets,
-        flags: ExecutionFlags {
-            strategy,
-            workdir: resolve_requested_workdir(args.workdir.as_ref()),
-            no_diagnostics,
-            diagnostics_json,
-            diagnostic_verbosity: args.verbose,
-            silent,
-            capability_elevation: prepared.capability_elevation,
-            #[cfg(target_os = "linux")]
-            wsl2_proxy_policy: prepared.wsl2_proxy_policy,
-            #[cfg(target_os = "linux")]
-            af_unix_mediation: prepared.af_unix_mediation,
-            bypass_protection_paths: prepared.bypass_protection_paths,
-            ignored_denial_paths: prepared.ignored_denial_paths,
-            suppressed_system_service_operations: prepared.suppressed_system_service_operations,
-            profile_display_name: prepared.profile_display_name,
-            session: SessionLaunchOptions {
-                session_id: Some(session_id),
-                detached_start: run_args.detached,
-                session_name: run_args.name,
-                profile_name: args.profile.clone(),
-                detach_sequence,
-            },
-            rollback: RollbackLaunchOptions {
-                requested: rollback,
-                disabled: run_args.no_rollback,
-                prompt_disabled: no_rollback_prompt,
-                audit_disabled: no_audit,
-                no_audit_integrity,
-                audit_integrity: run_args.audit_integrity,
-                audit_sign_key,
-                destination: run_args.rollback_dest,
-                ..rollback_options
-            },
-            trust,
-            proxy,
-            redaction_policy,
-            session_hooks: prepared.session_hooks,
-            allowed_env_vars: prepared.allowed_env_vars,
-            denied_env_vars: prepared.denied_env_vars,
-            set_vars: prepared.set_vars,
-            startup_timeout_secs,
-            command_policies: prepared.command_policies,
-        },
+        flags,
     })
 }
 
@@ -572,5 +639,89 @@ pub(crate) fn select_threading_context(
         exec_strategy::ThreadingContext::KeyringExpected
     } else {
         exec_strategy::ThreadingContext::Strict
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::SandboxArgs;
+
+    fn run_args_with_sandbox(sandbox: SandboxArgs) -> RunArgs {
+        RunArgs {
+            sandbox,
+            detached: false,
+            detach_timeout_secs: None,
+            rollback: false,
+            no_rollback_prompt: false,
+            no_rollback: false,
+            rollback_exclude: Vec::new(),
+            rollback_include: Vec::new(),
+            rollback_all: false,
+            skip_dir: Vec::new(),
+            rollback_dest: None,
+            no_diagnostics: false,
+            diagnostics_json: false,
+            startup_timeout_secs: None,
+            no_audit: false,
+            no_audit_integrity: false,
+            audit_integrity: false,
+            audit_sign_key: None,
+            trust_override: false,
+            name: None,
+            capability_elevation: false,
+            command: Vec::new(),
+            help: None,
+        }
+    }
+
+    #[test]
+    fn run_launch_plan_rejects_block_net_with_upstream_proxy() {
+        let _env_lock = crate::test_env::ENV_LOCK.lock().expect("env lock");
+        let test_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("target")
+            .join("test-env")
+            .join(format!(
+                "run-launch-block-net-upstream-proxy-{}",
+                std::process::id()
+            ));
+        let home = test_root.join("home");
+        let state = test_root.join("state");
+        let config = test_root.join("config");
+        let workdir = test_root.join("workdir");
+        std::fs::create_dir_all(&home).expect("create test home");
+        std::fs::create_dir_all(&state).expect("create test state");
+        std::fs::create_dir_all(&config).expect("create test config");
+        std::fs::create_dir_all(&workdir).expect("create test workdir");
+        let _env = crate::test_env::EnvVarGuard::set_all(&[
+            ("HOME", home.to_str().expect("home path is utf-8")),
+            (
+                "XDG_STATE_HOME",
+                state.to_str().expect("state path is utf-8"),
+            ),
+            (
+                "XDG_CONFIG_HOME",
+                config.to_str().expect("config path is utf-8"),
+            ),
+        ]);
+
+        let run_args = run_args_with_sandbox(SandboxArgs {
+            allow_cwd: true,
+            workdir: Some(workdir),
+            block_net: true,
+            external_proxy: Some("squid.corp:3128".to_string()),
+            ..SandboxArgs::default()
+        });
+
+        let result = prepare_run_launch_plan(run_args, OsString::from("/bin/echo"), vec![], true);
+        let Err(err) = result else {
+            panic!("expected run launch plan to reject --block-net + --upstream-proxy");
+        };
+        assert!(
+            err.to_string().contains("--block-net") && err.to_string().contains("--upstream-proxy"),
+            "unexpected error: {err}"
+        );
     }
 }

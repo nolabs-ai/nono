@@ -5,6 +5,9 @@ static PASSTHROUGH_INTERCEPT_ACTION: crate::command_policy::InterceptActionConfi
 pub(super) struct ResolvedInterceptAction<'a> {
     pub(super) action: &'a crate::command_policy::InterceptActionConfig,
     pub(super) rule_args: Option<&'a [String]>,
+    /// Per-rule sandbox override for this matched invocation (passthrough).
+    /// `None` for the fallthrough and rules without an override.
+    pub(super) sandbox: Option<&'a crate::command_policy::CommandSandboxConfig>,
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -13,6 +16,7 @@ impl<'a> ResolvedInterceptAction<'a> {
         Self {
             action: &PASSTHROUGH_INTERCEPT_ACTION,
             rule_args: None,
+            sandbox: None,
         }
     }
 
@@ -38,23 +42,115 @@ pub(super) fn resolve_intercept_action<'a>(
             return ResolvedInterceptAction {
                 action: &rule.action,
                 rule_args: Some(&rule.args),
+                sandbox: rule.sandbox.as_ref(),
             };
         }
-        if shim_args.len() >= rule.args.len()
-            && rule
-                .args
-                .iter()
-                .zip(shim_args.iter())
-                .all(|(expected, actual)| expected.as_bytes() == *actual)
-        {
+        if intercept_args_match(&rule.args, &shim_args) {
             return ResolvedInterceptAction {
                 action: &rule.action,
                 rule_args: Some(&rule.args),
+                sandbox: rule.sandbox.as_ref(),
             };
         }
     }
 
     ResolvedInterceptAction::passthrough()
+}
+
+fn intercept_args_match(expected_args: &[String], shim_args: &[&[u8]]) -> bool {
+    expected_args.is_empty()
+        || (shim_args.len() >= expected_args.len()
+            && shim_args.windows(expected_args.len()).any(|window| {
+                expected_args
+                    .iter()
+                    .zip(window.iter())
+                    .all(|(expected, actual)| expected.as_bytes() == *actual)
+            }))
+}
+
+/// Resolve the env-expanded helper path and forwarded extra args for an `exec`
+/// intercept action's `command`.
+///
+/// Returns `(helper_path, extra_args)` where `helper_path` is `command[0]`
+/// after `$VAR` expansion (used as the lookup key into the plan's pre-resolved
+/// `exec_helpers` map) and `extra_args` are `command[1..]` after `$VAR`
+/// expansion, to be inserted ahead of the forwarded original args. Platform
+/// dispatch resolves the actual `ResolvedCommandBinary` from its own state map
+/// using `helper_path`, so this stays platform-agnostic.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(super) fn resolve_exec_command(
+    command: &[String],
+) -> nono::Result<(std::path::PathBuf, Vec<Vec<u8>>)> {
+    let helper_raw = command.first().ok_or_else(|| {
+        nono::NonoError::SandboxInit("tool-sandbox exec action has empty command".to_string())
+    })?;
+    let helper_path = std::path::PathBuf::from(crate::policy::expand_env_vars_strict(helper_raw)?);
+    if !helper_path.is_absolute() {
+        return Err(nono::NonoError::SandboxInit(format!(
+            "tool-sandbox exec helper must be an absolute path; got '{}'",
+            helper_path.display()
+        )));
+    }
+    let mut extra_args = Vec::with_capacity(command.len().saturating_sub(1));
+    for arg in command.iter().skip(1) {
+        extra_args.push(crate::policy::expand_env_vars_strict(arg)?.into_bytes());
+    }
+    Ok((helper_path, extra_args))
+}
+
+/// Looks up the pre-resolved binary rather than re-resolving it, to reuse the
+/// TOCTOU-protected identity captured at plan-build time.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(super) fn resolve_exec_helper<'a>(
+    exec_helpers: &'a std::collections::BTreeMap<
+        std::path::PathBuf,
+        crate::command_policy::ResolvedCommandBinary,
+    >,
+    command: &[String],
+) -> nono::Result<(
+    &'a crate::command_policy::ResolvedCommandBinary,
+    Vec<Vec<u8>>,
+)> {
+    let (helper_path, extra_args) = resolve_exec_command(command)?;
+    let helper = exec_helpers.get(&helper_path).ok_or_else(|| {
+        nono::NonoError::SandboxInit(format!(
+            "tool-sandbox exec helper not pre-resolved: {}",
+            helper_path.display()
+        ))
+    })?;
+    Ok((helper, extra_args))
+}
+
+/// True if any command whose `exec` intercept resolves to `canonical_helper`
+/// opts into `allow_writable_executable`.
+///
+/// Expansion/canonicalize failures resolve to "not exempted" rather than
+/// erroring, so an unrelated command's bad env var can't abort plan build.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(super) fn command_referencing_exec_helper_allows_writable(
+    config: &crate::command_policy::CommandPoliciesConfig,
+    canonical_helper: &std::path::Path,
+) -> bool {
+    config.commands.values().any(|command| {
+        if !command.allow_writable_executable {
+            return false;
+        }
+        command.intercept.iter().any(|rule| {
+            let crate::command_policy::InterceptActionConfig::Exec {
+                command: exec_command,
+            } = &rule.action
+            else {
+                return false;
+            };
+            let Some(helper_raw) = exec_command.first() else {
+                return false;
+            };
+            crate::policy::expand_env_vars_strict(helper_raw)
+                .ok()
+                .and_then(|expanded| std::path::PathBuf::from(expanded).canonicalize().ok())
+                .is_some_and(|canonical| canonical == canonical_helper)
+        })
+    })
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -483,6 +579,7 @@ mod intercept_tests {
             intercept: vec![InterceptRuleConfig {
                 args: vec!["push".to_string(), "--force".to_string()],
                 action: InterceptActionConfig::Approve { timeout_secs: None },
+                sandbox: None,
             }],
             ..CommandPolicyConfig::default()
         };
@@ -498,11 +595,66 @@ mod intercept_tests {
     }
 
     #[test]
+    fn resolve_intercept_action_matches_after_leading_global_args() {
+        let config = CommandPolicyConfig {
+            intercept: vec![InterceptRuleConfig {
+                args: vec!["push".to_string(), "--force".to_string()],
+                action: InterceptActionConfig::Approve { timeout_secs: None },
+                sandbox: None,
+            }],
+            ..CommandPolicyConfig::default()
+        };
+        let argv = vec![
+            b"git".to_vec(),
+            b"-c".to_vec(),
+            b"foo=bar".to_vec(),
+            b"push".to_vec(),
+            b"--force".to_vec(),
+        ];
+
+        let resolved = resolve_intercept_action(&config, &argv);
+
+        assert_eq!(resolved.rule_label(), "push --force");
+        assert!(matches!(
+            resolved.action,
+            InterceptActionConfig::Approve { .. }
+        ));
+    }
+
+    #[test]
+    fn resolve_intercept_action_falls_through_when_rule_sequence_is_absent() {
+        let config = CommandPolicyConfig {
+            intercept: vec![InterceptRuleConfig {
+                args: vec!["push".to_string(), "--force".to_string()],
+                action: InterceptActionConfig::Approve { timeout_secs: None },
+                sandbox: None,
+            }],
+            ..CommandPolicyConfig::default()
+        };
+        let argv = vec![
+            b"git".to_vec(),
+            b"-c".to_vec(),
+            b"foo=bar".to_vec(),
+            b"pull".to_vec(),
+            b"--force".to_vec(),
+        ];
+
+        let resolved = resolve_intercept_action(&config, &argv);
+
+        assert_eq!(resolved.rule_label(), "passthrough");
+        assert!(matches!(
+            resolved.action,
+            InterceptActionConfig::Passthrough
+        ));
+    }
+
+    #[test]
     fn resolve_intercept_action_labels_catch_all_rule() {
         let config = CommandPolicyConfig {
             intercept: vec![InterceptRuleConfig {
                 args: Vec::new(),
                 action: InterceptActionConfig::Approve { timeout_secs: None },
+                sandbox: None,
             }],
             ..CommandPolicyConfig::default()
         };
@@ -515,6 +667,40 @@ mod intercept_tests {
             resolved.action,
             InterceptActionConfig::Approve { .. }
         ));
+    }
+
+    #[test]
+    fn resolve_intercept_action_exposes_rule_sandbox_override() {
+        let override_sandbox = CommandSandboxConfig {
+            use_credentials: vec!["github".to_string()],
+            ..CommandSandboxConfig::default()
+        };
+        let config = CommandPolicyConfig {
+            intercept: vec![
+                InterceptRuleConfig {
+                    args: vec!["with-override".to_string()],
+                    action: InterceptActionConfig::Passthrough,
+                    sandbox: Some(override_sandbox.clone()),
+                },
+                InterceptRuleConfig {
+                    args: vec!["no-override".to_string()],
+                    action: InterceptActionConfig::Passthrough,
+                    sandbox: None,
+                },
+            ],
+            ..CommandPolicyConfig::default()
+        };
+
+        let with = resolve_intercept_action(&config, &[b"git".to_vec(), b"with-override".to_vec()]);
+        assert_eq!(with.sandbox, Some(&override_sandbox));
+
+        let without =
+            resolve_intercept_action(&config, &[b"git".to_vec(), b"no-override".to_vec()]);
+        assert_eq!(without.sandbox, None);
+
+        // Fallthrough (no matching rule) also has no override.
+        let fallthrough = resolve_intercept_action(&config, &[b"git".to_vec(), b"other".to_vec()]);
+        assert_eq!(fallthrough.sandbox, None);
     }
 
     #[test]
@@ -638,5 +824,40 @@ mod intercept_tests {
             Some(message)
                 if message.contains("sandbox.resources is parsed by tool-sandbox Schema 2 but not yet enforced")
         ));
+    }
+
+    #[test]
+    fn resolve_exec_command_expands_helper_and_extra_args() {
+        let _lock = match crate::test_env::ENV_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let var = "NONO_TEST_EXEC_LIBEXEC";
+        let _env = crate::test_env::EnvVarGuard::set_all(&[(var, "/opt/vendor/libexec")]);
+        let command = vec![
+            format!("${var}/gh-wrapper"),
+            format!("${var}/data"),
+            "literal".to_string(),
+        ];
+        let (helper, extra) = resolve_exec_command(&command).expect("resolve");
+        assert_eq!(
+            helper,
+            std::path::PathBuf::from("/opt/vendor/libexec/gh-wrapper")
+        );
+        let rendered: Vec<String> = extra
+            .iter()
+            .map(|a| String::from_utf8_lossy(a).into_owned())
+            .collect();
+        assert_eq!(rendered, vec!["/opt/vendor/libexec/data", "literal"]);
+    }
+
+    #[test]
+    fn resolve_exec_command_rejects_empty_command() {
+        assert!(resolve_exec_command(&[]).is_err());
+    }
+
+    #[test]
+    fn resolve_exec_command_rejects_relative_helper() {
+        assert!(resolve_exec_command(&["relative/helper".to_string()]).is_err());
     }
 }

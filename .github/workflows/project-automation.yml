@@ -1,0 +1,237 @@
+# .github/workflows/project-automation.yml
+#
+# Project board automation for the "nono-core" project in the "nolabs-ai" org.
+#
+# NOTE: GitHub Actions cannot trigger directly on a Projects v2 column/status
+# move (those events are org-level webhooks only and item-move events are not
+# emitted to Actions). So instead of reacting to the Backlog -> Todo transition,
+# the `drop-triage-when-promoted` job runs on a schedule and reconciles state:
+# any open issue that has left the Backlog (status in PROMOTED_STATUSES) and
+# still carries the "triage" label gets it removed. This is idempotent.
+name: Project automation
+
+on:
+  issues:
+    types: [opened]
+  schedule:
+    - cron: "*/10 * * * *" # triage reconcile
+    - cron: "30 6 * * 1" # weekly backlog grooming (Mondays 06:30 UTC)
+  workflow_dispatch:
+
+permissions:
+  issues: write
+
+env:
+  PROJECT_ORG: nolabs-ai
+  PROJECT_TITLE: nono-core
+  # Statuses that mean an issue has been triaged out of the Backlog.
+  # The board columns are: Backlog | Blocked | In-Review | In-Progress | Todo | Done
+  PROMOTED_STATUSES: "Todo,In-Progress,In-Review,Blocked,Done"
+  # Backlog grooming knobs.
+  STALE_DAYS: "90" # no activity for this long -> mark `stale`
+  CLOSE_GRACE_DAYS: "14" # after marking, wait this long before closing
+  EXEMPT_LABELS: "pinned,keep,roadmap,epic" # never groom issues with these labels
+
+jobs:
+  # Unchanged behaviour: label brand-new issues for triage.
+  add-triage-label:
+    if: github.event_name == 'issues'
+    runs-on: ubuntu-latest
+    steps:
+      - run: gh issue edit "$NUMBER" --add-label "triage"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          NUMBER: ${{ github.event.issue.number }}
+
+  # Remove the "triage" label once an issue has moved out of Backlog on the board.
+  drop-triage-when-promoted:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Remove triage from promoted issues
+        env:
+          # Needs a token that can READ org Projects v2 and WRITE issues.
+          # The default GITHUB_TOKEN cannot read org-level projects, so provide a
+          # fine-grained PAT (Org -> Projects: Read, Repo -> Issues: Read & write)
+          # or a classic PAT with `project` + `repo` scopes, stored as PROJECTS_TOKEN.
+          GH_TOKEN: ${{ secrets.PROJECTS_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # Resolve the project number from its title.
+          # shellcheck disable=SC2016  # $org/$number/$cursor are GraphQL variables, not shell variables
+          project_number=$(gh api graphql -f query='
+            query($org: String!) {
+              organization(login: $org) {
+                projectsV2(first: 50) { nodes { number title } }
+              }
+            }' -f org="$PROJECT_ORG" \
+            --jq ".data.organization.projectsV2.nodes[] | select(.title == \"$PROJECT_TITLE\") | .number")
+
+          if [ -z "$project_number" ]; then
+            echo "::error::Project '$PROJECT_TITLE' not found in org '$PROJECT_ORG'"
+            exit 1
+          fi
+          echo "Reconciling project #$project_number ($PROJECT_TITLE)"
+
+          # shellcheck disable=SC2016  # $org/$number/$cursor are GraphQL variables, not shell variables
+          query='
+            query($org: String!, $number: Int!, $cursor: String) {
+              organization(login: $org) {
+                projectV2(number: $number) {
+                  items(first: 100, after: $cursor) {
+                    pageInfo { hasNextPage endCursor }
+                    nodes {
+                      status: fieldValueByName(name: "Status") {
+                        ... on ProjectV2ItemFieldSingleSelectValue { name }
+                      }
+                      content {
+                        ... on Issue {
+                          number
+                          state
+                          repository { nameWithOwner }
+                          labels(first: 50) { nodes { name } }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }'
+
+          cursor=""
+          while : ; do
+            if [ -z "$cursor" ]; then
+              page=$(gh api graphql -F org="$PROJECT_ORG" -F number="$project_number" -F cursor=null -f query="$query")
+            else
+              page=$(gh api graphql -F org="$PROJECT_ORG" -F number="$project_number" -f cursor="$cursor" -f query="$query")
+            fi
+
+            echo "$page" | jq -r --arg promoted "$PROMOTED_STATUSES" '
+              ($promoted | split(",")) as $ok
+              | .data.organization.projectV2.items.nodes[]
+              | select(.content.number != null)
+              | select(.content.state == "OPEN")
+              | select([.content.labels.nodes[].name] | index("triage"))
+              | select((.status.name // "") as $s | $ok | index($s))
+              | "\(.content.repository.nameWithOwner)#\(.content.number)"' \
+            | while IFS= read -r ref; do
+                [ -n "$ref" ] || continue
+                repo="${ref%#*}"; num="${ref##*#}"
+                echo "Removing 'triage' from $ref"
+                gh issue edit "$num" --repo "$repo" --remove-label "triage"
+              done
+
+            has_next=$(echo "$page" | jq -r '.data.organization.projectV2.items.pageInfo.hasNextPage')
+            cursor=$(echo "$page" | jq -r '.data.organization.projectV2.items.pageInfo.endCursor // ""')
+            [ "$has_next" = "true" ] || break
+          done
+
+  # Weekly grooming of the Backlog column: mark long-inactive issues `stale`,
+  # then close them after a grace period if still untouched.
+  #
+  # Prerequisite: a `stale` label must already exist in the repo(s) the board
+  # spans (gh cannot create labels on the fly).
+  groom-stale-backlog:
+    if: github.event.schedule == '30 6 * * 1' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mark and close stale backlog issues
+        env:
+          # Same token as the triage job: Projects v2 Read + Issues Read & write.
+          GH_TOKEN: ${{ secrets.PROJECTS_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # shellcheck disable=SC2016  # $org/$number/$cursor are GraphQL variables, not shell variables
+          project_number=$(gh api graphql -f query='
+            query($org: String!) {
+              organization(login: $org) {
+                projectsV2(first: 50) { nodes { number title } }
+              }
+            }' -f org="$PROJECT_ORG" \
+            --jq ".data.organization.projectsV2.nodes[] | select(.title == \"$PROJECT_TITLE\") | .number")
+
+          if [ -z "$project_number" ]; then
+            echo "::error::Project '$PROJECT_TITLE' not found in org '$PROJECT_ORG'"
+            exit 1
+          fi
+          echo "Grooming Backlog of project #$project_number ($PROJECT_TITLE)"
+
+          # shellcheck disable=SC2016  # $org/$number/$cursor are GraphQL variables, not shell variables
+          query='
+            query($org: String!, $number: Int!, $cursor: String) {
+              organization(login: $org) {
+                projectV2(number: $number) {
+                  items(first: 100, after: $cursor) {
+                    pageInfo { hasNextPage endCursor }
+                    nodes {
+                      status: fieldValueByName(name: "Status") {
+                        ... on ProjectV2ItemFieldSingleSelectValue { name }
+                      }
+                      content {
+                        ... on Issue {
+                          number
+                          state
+                          updatedAt
+                          repository { nameWithOwner }
+                          labels(first: 50) { nodes { name } }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }'
+
+          now=$(date -u +%s)
+          stale_secs=$(( STALE_DAYS * 86400 ))
+          grace_secs=$(( CLOSE_GRACE_DAYS * 86400 ))
+
+          cursor=""
+          while : ; do
+            if [ -z "$cursor" ]; then
+              page=$(gh api graphql -F org="$PROJECT_ORG" -F number="$project_number" -F cursor=null -f query="$query")
+            else
+              page=$(gh api graphql -F org="$PROJECT_ORG" -F number="$project_number" -f cursor="$cursor" -f query="$query")
+            fi
+
+            echo "$page" | jq -r --arg exempt "$EXEMPT_LABELS" '
+              ($exempt | split(",")) as $ex
+              | .data.organization.projectV2.items.nodes[]
+              | select(.content.number != null)
+              | select(.content.state == "OPEN")
+              | select((.status.name // "") == "Backlog")
+              | { ref: "\(.content.repository.nameWithOwner)#\(.content.number)",
+                  updatedAt: .content.updatedAt,
+                  labels: [.content.labels.nodes[].name] }
+              | select((.labels | any(. as $l | $ex | index($l))) | not)
+              | [ .ref, .updatedAt, (if (.labels | index("stale")) then "stale" else "fresh" end) ]
+              | @tsv' \
+            | while IFS=$'\t' read -r ref updated marker; do
+                [ -n "$ref" ] || continue
+                repo="${ref%#*}"; num="${ref##*#}"
+                upd=$(date -u -d "$updated" +%s)
+                age=$(( now - upd ))
+                age_days=$(( age / 86400 ))
+                if [ "$marker" = "stale" ]; then
+                  if [ "$age" -ge "$grace_secs" ]; then
+                    echo "Closing $ref (no activity for ${age_days}d since marked stale)"
+                    gh issue close "$num" --repo "$repo" \
+                      --comment "Closing this backlog issue: no activity for ${age_days} days since it was marked \`stale\`. Comment to reopen if it's still relevant."
+                  fi
+                else
+                  if [ "$age" -ge "$stale_secs" ]; then
+                    echo "Marking $ref stale (inactive ${age_days}d)"
+                    gh issue edit "$num" --repo "$repo" --add-label "stale"
+                    gh issue comment "$num" --repo "$repo" \
+                      --body "This backlog issue has had no activity for ${age_days} days, so it's been labelled \`stale\`. It will be closed in ${CLOSE_GRACE_DAYS} days unless there's new activity or the \`stale\` label is removed."
+                  fi
+                fi
+              done
+
+            has_next=$(echo "$page" | jq -r '.data.organization.projectV2.items.pageInfo.hasNextPage')
+            cursor=$(echo "$page" | jq -r '.data.organization.projectV2.items.pageInfo.endCursor // ""')
+            [ "$has_next" = "true" ] || break
+          done

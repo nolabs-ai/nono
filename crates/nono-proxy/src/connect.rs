@@ -24,6 +24,24 @@ use zeroize::Zeroizing;
 /// Timeout for upstream TCP connect.
 const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How the CONNECT handler treats `Proxy-Authorization` on the transparent
+/// tunnel path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConnectAuthMode {
+    /// Auth disabled (`nono proxy --no-auth`): skip the check entirely.
+    Disabled,
+    /// Sandboxed `run`/`shell`/`wrap`: validate but treat failure as non-fatal.
+    /// Node.js undici doesn't echo URL-userinfo credentials as
+    /// `Proxy-Authorization` on CONNECT, and the OS sandbox — not the token —
+    /// is the trust boundary, so an unauthenticated tunnel still proceeds
+    /// (host filtering continues to apply).
+    Lenient,
+    /// Standalone `nono proxy` with auth on: a failed check is fatal. Respond
+    /// `407` and stop before any DNS/filter/upstream handling, because the
+    /// session token is the auth boundary for the external tools pointed at it.
+    Strict,
+}
+
 /// Handle an HTTP CONNECT request.
 ///
 /// `first_line` is the already-read CONNECT line (e.g., "CONNECT api.openai.com:443 HTTP/1.1").
@@ -34,16 +52,29 @@ pub async fn handle_connect(
     filter: &ProxyFilter,
     session_token: &Zeroizing<String>,
     remaining_header: &[u8],
+    auth_mode: ConnectAuthMode,
     audit_log: Option<&audit::SharedAuditLog>,
 ) -> Result<()> {
     // Parse host:port from CONNECT line
     let (host, port) = parse_connect_target(first_line)?;
     debug!("CONNECT request to {}:{}", host, port);
 
-    // Validate session token from Proxy-Authorization header.
-    // Non-fatal for CONNECT: Node.js undici doesn't send Proxy-Authorization
-    // from URL userinfo for CONNECT requests.
-    if let Err(e) = validate_proxy_auth(remaining_header, session_token) {
+    // Validate session token from Proxy-Authorization header. See
+    // [`ConnectAuthMode`] for why each mode behaves the way it does.
+    if auth_mode != ConnectAuthMode::Disabled
+        && let Err(e) = validate_proxy_auth(remaining_header, session_token)
+    {
+        if auth_mode == ConnectAuthMode::Strict {
+            debug!("CONNECT auth failed: {}", e);
+            stream
+                .write_all(
+                    b"HTTP/1.1 407 Proxy Authentication Required\r\n\
+                      Proxy-Authenticate: Basic realm=\"nono\"\r\n\
+                      Content-Length: 0\r\n\r\n",
+                )
+                .await?;
+            return Ok(());
+        }
         debug!("CONNECT auth skipped: {}", e);
     }
 

@@ -4,7 +4,7 @@ header = """
 """
 body = """
 {%- macro remote_url() -%}
-  https://github.com/always-further/nono
+  https://github.com/nolabs-ai/nono
 {%- endmacro -%}
 
 {% if version -%}
@@ -47,5 +47,5 @@ commit_parsers = [
 ]
 
 [remote.github]
-owner = "always-further"
+owner = "nolabs-ai"
 repo = "nono"

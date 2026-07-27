@@ -15,7 +15,11 @@ When `environment.allow_vars` is set in a profile, nono:
 2. Passes through only variables matching the allow-list
 3. Adds back nono-injected credentials (from `env_credentials`) on top
 
-If the `environment` section is omitted entirely, all variables are passed through (backward compatible). Setting `allow_vars` to an empty array `[]` restricts the environment to only nono-injected credentials — no inherited variables are passed.
+There are three states:
+
+- **`environment` section omitted entirely**: all variables pass through (backward compatible).
+- **`environment` present, `allow_vars` not written** (e.g. only `deny_vars` or `set_vars`): all variables pass through, minus any `deny_vars`.
+- **`allow_vars: []` explicitly written**: restricts the environment to only nono-injected credentials — no inherited variables are passed.
 
 ## Configuration
 
@@ -170,8 +174,8 @@ nono maintains a built-in deny-list of dangerous environment variables (e.g., `L
 
 ## Security Properties
 
-- **Default-allow**: Without the `environment` section, all variables are passed through (no regression)
-- **Empty allow-list restricts all**: `"allow_vars": []` passes zero inherited variables — only nono-injected credentials reach the child
+- **Default-allow**: Without the `environment` section, or with `environment` present but `allow_vars` not written, all variables pass through (no regression)
+- **Explicit empty allow-list**: `"allow_vars": []` written explicitly passes zero inherited variables — only nono-injected credentials reach the child
 - **Explicit allow-list**: When `allow_vars` has entries, only matching variables reach the child process
 - **Operator deny-list**: `deny_vars` strips named variables even when `allow_vars` would otherwise pass them through
 - **Static values via `set_vars`**: explicit variables injected after filtering and before credentials; `PATH` and `NONO_*` are reserved, but the dangerous-variable blocklist does not apply (explicit operator intent)

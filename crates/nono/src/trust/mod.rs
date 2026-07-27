@@ -62,5 +62,5 @@ pub use signing::{
 };
 pub use types::{
     BlockedPublisher, Blocklist, BlocklistEntry, Enforcement, IncludePatterns, Publisher,
-    SignerIdentity, TRUST_POLICY_VERSION, TrustPolicy, VerificationOutcome, VerificationResult,
+    SignerIdentity, TRUST_POLICY_PREDICATE, TrustPolicy, VerificationOutcome, VerificationResult,
 };

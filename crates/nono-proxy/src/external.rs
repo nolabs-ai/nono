@@ -171,12 +171,14 @@ impl BypassMatcher {
 /// 4. Send CONNECT to enterprise proxy (with optional Proxy-Authorization)
 /// 5. Wait for enterprise proxy 200
 /// 6. Bidirectional tunnel: agent <-> enterprise proxy <-> upstream
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_external_proxy(
     first_line: &str,
     stream: &mut TcpStream,
     remaining_header: &[u8],
     filter: &ProxyFilter,
     session_token: &Zeroizing<String>,
+    require_auth: bool,
     external_config: &ExternalProxyConfig,
     audit_log: Option<&audit::SharedAuditLog>,
 ) -> Result<()> {
@@ -184,8 +186,8 @@ pub async fn handle_external_proxy(
     let (host, port) = parse_connect_target(first_line)?;
     debug!("External proxy CONNECT to {}:{}", host, port);
 
-    // Validate session token
-    validate_proxy_auth(remaining_header, session_token)?;
+    // Validate session token (skipped when auth is disabled)
+    enforce_proxy_auth(require_auth, remaining_header, session_token)?;
 
     // Check cloud metadata deny list.
     // Cloud metadata endpoints are always blocked even through enterprise proxies.
@@ -316,12 +318,17 @@ fn parse_connect_target(line: &str) -> Result<(String, u16)> {
     }
 }
 
-/// Validate Proxy-Authorization header.
+/// Enforce the Proxy-Authorization header, honouring `require_auth`.
 ///
-/// Delegates to `token::validate_proxy_auth` which accepts both Bearer
-/// and Basic auth formats.
-fn validate_proxy_auth(header_bytes: &[u8], session_token: &Zeroizing<String>) -> Result<()> {
-    token::validate_proxy_auth(header_bytes, session_token)
+/// Delegates to `token::enforce_proxy_auth`, which skips validation when
+/// `require_auth` is `false` and otherwise accepts both Bearer and Basic
+/// auth formats.
+fn enforce_proxy_auth(
+    require_auth: bool,
+    header_bytes: &[u8],
+    session_token: &Zeroizing<String>,
+) -> Result<()> {
+    token::enforce_proxy_auth(require_auth, header_bytes, session_token)
 }
 
 /// Parse HTTP status code from a response line.

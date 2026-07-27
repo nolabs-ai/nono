@@ -37,6 +37,10 @@
     "rollback": {
       "$ref": "#/$defs/Rollback",
       "description": "Rollback snapshot configuration controlling which files are excluded from undo snapshots."
+    },
+    "resources": {
+      "$ref": "#/$defs/Resources",
+      "description": "Resource ceilings for the sandboxed process tree (memory and max processes), enforced by the supervisor. Requires exec_strategy: \"supervised\"."
     }
   },
   "$defs": {
@@ -193,6 +197,16 @@
           "type": "array",
           "items": { "type": "integer", "minimum": 1, "maximum": 65535 },
           "description": "Localhost TCP ports allowed for bidirectional IPC (connect + bind)."
+        },
+        "localhost_range": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "items": { "type": "integer", "minimum": 1, "maximum": 65535 },
+            "minItems": 2,
+            "maxItems": 2
+          },
+          "description": "Inclusive localhost port ranges for bidirectional IPC. Each entry is [start, end]. All ranges combined must not exceed 16,384 total ports."
         }
       }
     },
@@ -350,6 +364,23 @@
           "type": "array",
           "items": { "type": "string" },
           "description": "Glob patterns to exclude from rollback snapshots."
+        }
+      }
+    },
+    "Resources": {
+      "type": "object",
+      "description": "Resource ceilings for the sandboxed process tree. Values are plain integers (bytes, counts) so the manifest is a fully-resolved machine contract; human-friendly sizes (e.g. '512M') are parsed only at the CLI. additionalProperties is false: this is a security object, so an unknown or misspelled key is a hard error rather than a silently-dropped limit.",
+      "additionalProperties": false,
+      "properties": {
+        "memory_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Maximum resident memory for the process tree, in bytes. Enforced via cgroup memory.max together with memory.swap.max=0 and memory.oom.group=1."
+        },
+        "max_processes": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Maximum number of processes and threads (tasks) in the sandboxed process tree. Enforced via cgroup pids.max: once the tree reaches this count the kernel refuses new fork/clone calls (EAGAIN) rather than killing anything, so it bounds fork bombs and runaway spawning."
         }
       }
     }

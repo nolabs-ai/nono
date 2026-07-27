@@ -1,6 +1,8 @@
 //! Linux sandbox implementation using Landlock LSM
 
-use crate::capability::{AccessMode, CapabilitySet, IpcMode, NetworkMode, SignalMode};
+use crate::capability::{
+    AccessMode, CapabilitySet, IpcMode, NetworkMode, SignalMode, merge_port_ranges,
+};
 use crate::error::{NonoError, Result};
 use crate::sandbox::SupportInfo;
 use landlock::{
@@ -338,7 +340,7 @@ struct LandlockAccess {
 /// writes (write to .tmp -> rename to target), which is the standard pattern
 /// used by most applications for safe config/build artifact updates.
 ///
-/// IoctlDev is NOT included here — it is added selectively in `apply_with_abi()`
+/// IoctlDev is NOT included here — it is added selectively in `apply_with_abi_inner()`
 /// only for paths that are actual device files (char/block devices), detected
 /// via `stat()` at rule-addition time. This avoids granting device ioctl access
 /// to non-device paths.
@@ -389,6 +391,59 @@ fn can_use_seccomp_network_block_fallback(caps: &CapabilitySet) -> bool {
         seccomp_network_fallback_mode(caps),
         SeccompNetFallback::BlockAll
     )
+}
+
+/// Linux `statfs` magic number for the 9P filesystem (`v9fs`).
+///
+/// Covers all 9P-backed mounts: WSL2 Windows host paths (`/mnt/c`, `/mnt/d`),
+/// QEMU virtfs, and other Plan 9 mounts. The 9P driver does not implement the
+/// LSM inode hooks that Landlock relies on, so `PathBeneath` rules for these
+/// paths are accepted by the kernel but silently have no enforcement effect.
+const V9FS_MAGIC: u64 = 0x0102_1997;
+
+/// Return `true` if `f_type` (from `statfs::f_type`) identifies a filesystem
+/// that does not support Landlock enforcement.
+#[inline]
+fn fs_type_unsupported(f_type: u64) -> bool {
+    f_type == V9FS_MAGIC
+}
+
+/// Return `true` if `path` sits on a filesystem that does not support Landlock.
+///
+/// Currently detects 9P mounts (`V9FS_MAGIC`), which includes WSL2 Windows
+/// host paths and QEMU virtfs. Uses `statfs(2)` on the path itself; falls back
+/// to `false` on any error so a detection failure never blocks sandbox startup.
+///
+/// Skips the syscall entirely for paths that cannot be on a 9P mount
+/// (anything not under `/mnt`), avoiding overhead on the common case.
+///
+/// Returns the device ID (`st_dev`) of the mount when unsupported, so the
+/// caller can deduplicate warnings per mount rather than per path. Returns
+/// `None` for supported filesystems or on any `statfs` error.
+fn unsupported_filesystem_dev(path: &Path) -> Option<u64> {
+    if !path.starts_with("/mnt") {
+        return None;
+    }
+    use std::ffi::CString;
+    use std::mem::MaybeUninit;
+    let Ok(cpath) = CString::new(path.as_os_str().as_encoded_bytes()) else {
+        return None;
+    };
+    // SAFETY: `buf` is a valid out-pointer for `statfs`; we initialise it
+    // through the syscall before reading any field.
+    unsafe {
+        let mut buf: MaybeUninit<libc::statfs> = MaybeUninit::uninit();
+        if libc::statfs(cpath.as_ptr(), buf.as_mut_ptr()) != 0 {
+            return None;
+        }
+        let stat = buf.assume_init();
+        if fs_type_unsupported(stat.f_type as u64) {
+            // fsid_t.__val is private; transmute the 8-byte struct to u64 for dedup.
+            Some(std::mem::transmute::<libc::fsid_t, u64>(stat.f_fsid))
+        } else {
+            None
+        }
+    }
 }
 
 /// Check if a path is a character or block device file.
@@ -454,38 +509,83 @@ fn requested_scopes(caps: &CapabilitySet, abi: &DetectedAbi) -> Result<BitFlags<
     Ok(scopes)
 }
 
-/// Apply Landlock sandbox with the given capabilities, auto-detecting ABI.
+/// Apply Landlock-only sandboxing with the given capabilities, auto-detecting ABI.
 ///
-/// This is a pure primitive - it applies ONLY the capabilities provided.
-/// The caller is responsible for including all necessary paths (including
-/// system paths like /usr, /lib, /bin if executables need to run).
-///
-/// Returns the seccomp network fallback mode that was determined but not
-/// yet fully installed. `BlockAll` is self-contained (installed inside apply).
-/// `ProxyOnly` signals the caller to install the proxy filter post-fork
-/// via `install_seccomp_proxy_filter()`.
-pub fn apply(caps: &CapabilitySet) -> Result<SeccompNetFallback> {
+/// If the kernel Landlock ABI does not support network filtering and network
+/// restrictions are requested, this returns an error rather
+///  Use `apply_auto` if you want automatic fallback behaviour.
+pub fn apply_landlock(caps: &CapabilitySet) -> Result<()> {
     let detected = detect_abi()?;
-    apply_with_abi(caps, &detected)
+    apply_landlock_with_abi(caps, &detected)
 }
 
-/// Apply Landlock sandbox with the given capabilities and a pre-detected ABI.
+/// Apply Landlock-only sandboxing with a pre-detected ABI.
 ///
-/// This variant avoids re-probing the kernel ABI when the caller has already
-/// detected it (e.g., the CLI probes once at startup).
+/// Same contract as `apply_landlock` but avoids re-probing the kernel ABI.
+pub fn apply_landlock_with_abi(caps: &CapabilitySet, abi: &DetectedAbi) -> Result<()> {
+    apply_with_abi_inner(caps, abi, TcpNetworkEnforcement::LandlockOnly).map(|_| ())
+}
+
+/// Apply Landlock filesystem/process sandboxing and use seccomp for TCP
+/// network fallback according to `opts`.
 ///
-/// # Security
+/// This is not a seccomp-only sandbox. Filesystem and process isolation always
+/// remain Landlock-enforced; `opts` controls only nono-managed TCP network
+/// handling when Landlock networking is unavailable or intentionally delegated.
+pub fn apply_seccomp(caps: &CapabilitySet, opts: SeccompOpts) -> Result<SeccompNetFallback> {
+    let detected = detect_abi()?;
+    apply_seccomp_with_abi(caps, &detected, opts)
+}
+
+/// Apply Landlock filesystem/process sandboxing and seccomp-controlled TCP
+/// handling with a pre-detected ABI.
+pub fn apply_seccomp_with_abi(
+    caps: &CapabilitySet,
+    abi: &DetectedAbi,
+    opts: SeccompOpts,
+) -> Result<SeccompNetFallback> {
+    apply_with_abi_inner(caps, abi, opts.tcp_network.into())
+}
+
+/// Declare that TCP network enforcement is managed externally.
 ///
-/// The provided ABI is validated against the kernel: the ruleset is created
-/// with `HardRequirement` for filesystem access rights. If the caller passes
-/// an ABI higher than the kernel supports, `handle_access()` will fail rather
-/// than silently dropping flags.
-pub fn apply_with_abi(caps: &CapabilitySet, abi: &DetectedAbi) -> Result<SeccompNetFallback> {
+/// This function intentionally installs no kernel policy. It exists only as an
+/// explicit marker for callers that have already applied the normal filesystem
+/// and process sandbox and are delegating TCP egress lockdown to infrastructure.
+pub fn apply_external() -> Result<()> {
+    info!("TCP network enforcement delegated externally");
+    Ok(())
+}
+
+/// Apply sandboxing with automatic Landlock → seccomp fallback, auto-detecting ABI.
+///
+/// This is the recommended choice when you want enforcement but can tolerate seccomp
+/// being used instead of Landlock when the kernel ABI lacks network support (V4+).
+/// Returns the seccomp network fallback mode: `BlockAll` is installed inline;
+/// `ProxyOnly` must be installed post-fork via `install_seccomp_proxy_filter()`.
+pub fn apply_auto(caps: &CapabilitySet) -> Result<SeccompNetFallback> {
+    let detected = detect_abi()?;
+    apply_auto_with_abi(caps, &detected)
+}
+
+/// Apply sandboxing with automatic fallback and a pre-detected ABI.
+pub fn apply_auto_with_abi(caps: &CapabilitySet, abi: &DetectedAbi) -> Result<SeccompNetFallback> {
+    apply_with_abi_inner(caps, abi, TcpNetworkEnforcement::AutoSeccompFallback)
+}
+
+/// Internal implementation shared by all public `apply_*` entry points.
+fn apply_with_abi_inner(
+    caps: &CapabilitySet,
+    abi: &DetectedAbi,
+    tcp_network: TcpNetworkEnforcement,
+) -> Result<SeccompNetFallback> {
     let target_abi = abi.abi;
     info!("Using Landlock ABI {:?}", target_abi);
     let scopes = requested_scopes(caps, abi)?;
 
-    if !matches!(caps.network_mode(), NetworkMode::AllowAll) && caps.localhost_ports().contains(&0)
+    if tcp_network.handles_tcp()
+        && !matches!(caps.network_mode(), NetworkMode::AllowAll)
+        && caps.localhost_ports().contains(&0)
     {
         return Err(NonoError::SandboxInit(
             "open_port 0 (localhost TCP wildcard) is macOS-only; on Linux use explicit ports or a network profile."
@@ -509,16 +609,19 @@ pub fn apply_with_abi(caps: &CapabilitySet, abi: &DetectedAbi) -> Result<Seccomp
         .set_compatibility(CompatLevel::BestEffort);
 
     // Determine if we need network handling (any mode besides AllowAll)
-    let needs_network_handling = !matches!(caps.network_mode(), NetworkMode::AllowAll)
-        || !caps.tcp_connect_ports().is_empty()
-        || !caps.tcp_bind_ports().is_empty();
+    let needs_network_handling = tcp_network.handles_tcp()
+        && (!matches!(caps.network_mode(), NetworkMode::AllowAll)
+            || !caps.tcp_connect_ports().is_empty()
+            || !caps.tcp_bind_ports().is_empty());
 
     let mut seccomp_net_fallback = SeccompNetFallback::None;
+    let mut landlock_network_active = false;
 
     let ruleset_builder = if needs_network_handling {
         let handled_net = AccessNet::from_all(target_abi);
         if !handled_net.is_empty() {
             debug!("Handling network access: {:?}", handled_net);
+            landlock_network_active = true;
             ruleset_builder
                 .set_compatibility(CompatLevel::HardRequirement)
                 .handle_access(handled_net)
@@ -529,7 +632,7 @@ pub fn apply_with_abi(caps: &CapabilitySet, abi: &DetectedAbi) -> Result<Seccomp
                     ))
                 })?
                 .set_compatibility(CompatLevel::BestEffort)
-        } else {
+        } else if tcp_network.allows_seccomp_fallback() {
             // Landlock ABI lacks AccessNet. Check seccomp fallback options.
             let fallback = seccomp_network_fallback_mode(caps);
             match &fallback {
@@ -563,8 +666,19 @@ pub fn apply_with_abi(caps: &CapabilitySet, abi: &DetectedAbi) -> Result<Seccomp
                     ));
                 }
             }
+        } else {
+            return Err(NonoError::SandboxInit(format!(
+                "Network filtering requested but Landlock ABI {:?} lacks network support \
+                 (requires V4+). Use apply_auto to enable seccomp fallback.",
+                target_abi
+            )));
         }
     } else {
+        if !tcp_network.handles_tcp() {
+            info!(
+                "TCP network enforcement delegated externally; applying filesystem and process sandbox only"
+            );
+        }
         ruleset_builder
     };
 
@@ -603,7 +717,7 @@ pub fn apply_with_abi(caps: &CapabilitySet, abi: &DetectedAbi) -> Result<Seccomp
     // Add Landlock network port rules ONLY when Landlock is handling networking.
     // When a seccomp fallback is active (BlockAll or ProxyOnly), the ruleset was
     // created without handle_access(AccessNet), so adding NetPort rules would fail.
-    if matches!(seccomp_net_fallback, SeccompNetFallback::None) {
+    if landlock_network_active {
         // Add per-port TCP connect rules (ProxyOnly port + explicit tcp_connect_ports)
         if let NetworkMode::ProxyOnly { port, bind_ports } = caps.network_mode() {
             debug!("Adding ProxyOnly TCP connect rule for port {}", port);
@@ -675,6 +789,30 @@ pub fn apply_with_abi(caps: &CapabilitySet, abi: &DetectedAbi) -> Result<Seccomp
                         ))
                     })?;
             }
+            for (start, end) in merge_port_ranges(caps.localhost_port_ranges()) {
+                debug!(
+                    "Adding localhost TCP rules for port range {}..={}",
+                    start, end
+                );
+                for port in start..=end {
+                    ruleset = ruleset
+                        .add_rule(NetPort::new(port, AccessNet::ConnectTcp))
+                        .map_err(|e| {
+                            NonoError::SandboxInit(format!(
+                                "Cannot add TCP connect rule for localhost port range {}..={}: {}",
+                                start, end, e
+                            ))
+                        })?;
+                    ruleset = ruleset
+                        .add_rule(NetPort::new(port, AccessNet::BindTcp))
+                        .map_err(|e| {
+                            NonoError::SandboxInit(format!(
+                                "Cannot add TCP bind rule for localhost port range {}..={}: {}",
+                                start, end, e
+                            ))
+                        })?;
+                }
+            }
         }
     }
 
@@ -690,6 +828,10 @@ pub fn apply_with_abi(caps: &CapabilitySet, abi: &DetectedAbi) -> Result<Seccomp
     // are not distinguishable on this Linux path until the seccomp AF_UNIX
     // allowlist work enforces UnixSocketCapability::covers().
     let ioctl_dev_available = AccessFs::from_all(target_abi).contains(AccessFs::IoctlDev);
+    // Track device IDs of mounts already warned about to emit one warning
+    // per mount, not one per capability path.
+    let mut warned_unsupported_devs: std::collections::HashSet<u64> =
+        std::collections::HashSet::new();
 
     for cap in caps.fs_capabilities() {
         let result = access_to_landlock(cap.access, target_abi);
@@ -717,6 +859,18 @@ pub fn apply_with_abi(caps: &CapabilitySet, abi: &DetectedAbi) -> Result<Seccomp
             access |= AccessFs::IoctlDev;
             debug!(
                 "Adding IoctlDev for device path: {}",
+                cap.resolved.display()
+            );
+        }
+
+        if let Some(dev) = unsupported_filesystem_dev(&cap.resolved)
+            && warned_unsupported_devs.insert(dev)
+        {
+            warn!(
+                "Path '{}' is on a 9P filesystem (e.g. WSL2 Windows host mount, QEMU virtfs). \
+                 Landlock enforcement on 9P paths is unreliable — grants may be silently ignored \
+                 or incompletely enforced, causing unexpected access denials. \
+                 Move your working directory to a native Linux filesystem to use nono safely.",
                 cap.resolved.display()
             );
         }
@@ -785,7 +939,11 @@ pub fn apply_with_abi(caps: &CapabilitySet, abi: &DetectedAbi) -> Result<Seccomp
 /// not listed here lose execute permission even if the main sandbox granted it
 /// via `AccessMode::Read`. Read/write grants from the main ruleset are unaffected.
 ///
-/// Call this after `apply()` / `apply_with_abi()` to lock down which binaries
+/// Also grants bare `Refer` on `/` — Landlock requires it in every layer
+/// for rename/link, so omitting it here silently breaks renames the main
+/// ruleset already permits. Bare `Refer` alone can't widen access.
+///
+/// Call this after `apply_auto()` / `apply_landlock()` to lock down which binaries
 /// an already-sandboxed process can exec.
 pub fn restrict_execute(paths: &[impl AsRef<Path>]) -> Result<()> {
     let abi = detect_abi()?;
@@ -805,6 +963,12 @@ pub fn restrict_execute(paths: &[impl AsRef<Path>]) -> Result<()> {
             ))
         })?
         .set_compatibility(CompatLevel::BestEffort)
+        .handle_access(AccessFs::Refer)
+        .map_err(|e| {
+            NonoError::SandboxInit(format!(
+                "Tool Sandbox  execute restriction: cannot handle Refer: {e}"
+            ))
+        })?
         .create()
         .map_err(|e| {
             NonoError::SandboxInit(format!(
@@ -826,6 +990,21 @@ pub fn restrict_execute(paths: &[impl AsRef<Path>]) -> Result<()> {
                 NonoError::SandboxInit(format!(
                     "Tool Sandbox  execute restriction: add_rule for {}: {e}",
                     p.display()
+                ))
+            })?;
+    }
+
+    if abi.has_refer() {
+        let root_fd = PathFd::new("/").map_err(|e| {
+            NonoError::SandboxInit(format!(
+                "Tool Sandbox  execute restriction: cannot open / for Refer grant: {e}"
+            ))
+        })?;
+        ruleset = ruleset
+            .add_rule(PathBeneath::new(root_fd, AccessFs::Refer))
+            .map_err(|e| {
+                NonoError::SandboxInit(format!(
+                    "Tool Sandbox  execute restriction: add_rule for / (Refer): {e}"
                 ))
             })?;
     }
@@ -1060,7 +1239,7 @@ struct SockFprog {
 
 /// Install a seccomp-notify BPF filter for openat/openat2.
 ///
-/// Returns the notify fd. Must be called BEFORE `Sandbox::apply()` (Landlock
+/// Returns the notify fd. Must be called BEFORE `Sandbox::apply_auto()` (Landlock
 /// `restrict_self()`), so the supervisor can still receive notifications for
 /// paths that Landlock would block.
 ///
@@ -1789,6 +1968,70 @@ pub enum SeccompNetFallback {
     },
 }
 
+/// Options for `apply_seccomp`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SeccompOpts {
+    tcp_network: SeccompTcpNetwork,
+}
+
+impl SeccompOpts {
+    /// Apply Landlock filesystem/process sandboxing and use seccomp as the
+    /// network fallback when Landlock lacks TCP filtering support.
+    #[must_use]
+    pub fn network_fallback() -> Self {
+        Self {
+            tcp_network: SeccompTcpNetwork::Fallback,
+        }
+    }
+
+    /// Apply Landlock filesystem/process sandboxing, but skip nono-managed TCP
+    /// network enforcement because the deployment enforces egress externally.
+    #[must_use]
+    pub fn external_tcp() -> Self {
+        Self {
+            tcp_network: SeccompTcpNetwork::External,
+        }
+    }
+}
+
+impl Default for SeccompOpts {
+    fn default() -> Self {
+        Self::network_fallback()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SeccompTcpNetwork {
+    Fallback,
+    External,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TcpNetworkEnforcement {
+    LandlockOnly,
+    AutoSeccompFallback,
+    External,
+}
+
+impl TcpNetworkEnforcement {
+    fn handles_tcp(self) -> bool {
+        !matches!(self, Self::External)
+    }
+
+    fn allows_seccomp_fallback(self) -> bool {
+        matches!(self, Self::AutoSeccompFallback)
+    }
+}
+
+impl From<SeccompTcpNetwork> for TcpNetworkEnforcement {
+    fn from(value: SeccompTcpNetwork) -> Self {
+        match value {
+            SeccompTcpNetwork::Fallback => Self::AutoSeccompFallback,
+            SeccompTcpNetwork::External => Self::External,
+        }
+    }
+}
+
 /// Determine the seccomp network fallback mode for the given capabilities.
 ///
 /// Called when Landlock ABI lacks `AccessNet`. Returns the appropriate
@@ -1853,6 +2096,8 @@ fn build_seccomp_proxy_filter(_has_bind_ports: bool) -> Vec<SockFilterInsn> {
     let bind_action = SECCOMP_RET_USER_NOTIF;
 
     // sendto(), sendmsg(), and sendmmsg() route unconditionally to USER_NOTIF.
+    // The IPC handshake completes before this filter is installed, so no
+    // fd-based exemption is needed.
     // The supervisor does the full-width NULL destination checks and inspects
     // each sendmmsg vector entry.
     //
@@ -2046,25 +2291,29 @@ fn build_seccomp_proxy_filter(_has_bind_ports: bool) -> Vec<SockFilterInsn> {
     ]
 }
 
-/// Build a BPF filter for opt-in pathname AF_UNIX mediation.
+/// Build a BPF filter for opt-in pathname AF_UNIX mediation (Linux-only).
 ///
-/// The filter routes `connect()`, `bind()`, `sendto()`, `sendmsg()`, and `sendmmsg()`
-/// to the supervisor so it can inspect `sockaddr_un` paths. Everything
-/// else is allowed by this filter: TCP policy remains Landlock's job on
-/// V4+ kernels.
+/// Routes `connect()`, `bind()`, `sendto()`, `sendmsg()`, and `sendmmsg()`
+/// to `USER_NOTIF` so the supervisor can inspect `sockaddr_un` paths.
+/// Everything else is allowed: TCP policy is Landlock's responsibility on
+/// V4+ kernels; this filter only handles AF_UNIX.
 ///
-/// The send syscalls route unconditionally. BPF cannot dereference
-/// `msghdr`/`mmsghdr`, and checking only half of a 64-bit `sendto` pointer
-/// is not a reliable NULL test.
+/// The IPC handshake (child→parent SCM_RIGHTS transfer of the notify fd)
+/// must complete *before* this filter is installed. That ordering removes
+/// the need for any fd-based exemption, so the filter is a pure allowlist
+/// with no internal plumbing holes.
+///
+/// BPF cannot dereference `msghdr`/`mmsghdr`; the supervisor performs those
+/// checks instead.
 ///
 /// Instruction layout:
 /// ```text
 ///  0: ld  [nr]
-///  1: jeq SYS_CONNECT  jt=+5 (-> 7: notify)
-///  2: jeq SYS_BIND     jt=+4 (-> 7: notify)
-///  3: jeq SYS_SENDTO   jt=+3 (-> 7: notify)
-///  4: jeq SYS_SENDMSG  jt=+2 (-> 7: notify)
-///  5: jeq SYS_SENDMMSG jt=+1 (-> 7: notify)
+///  1: jeq SYS_CONNECT  jt=+5 (->  7: notify)
+///  2: jeq SYS_BIND     jt=+4 (->  7: notify)
+///  3: jeq SYS_SENDTO   jt=+3 (->  7: notify)
+///  4: jeq SYS_SENDMSG  jt=+2 (->  7: notify)
+///  5: jeq SYS_SENDMMSG jt=+1 (->  7: notify)
 ///  6: ret ALLOW
 ///  7: ret USER_NOTIF
 /// ```
@@ -2129,13 +2378,19 @@ fn build_seccomp_af_unix_filter() -> Vec<SockFilterInsn> {
     ]
 }
 
-/// Install a seccomp-notify BPF filter for proxy-only network mode.
+/// Install a seccomp-notify BPF filter for proxy-only network mode (Linux-only).
 ///
-/// Returns the notify fd that the supervisor must poll for connect/bind
-/// notifications. Uses `SECCOMP_FILTER_FLAG_NEW_LISTENER`.
+/// Used on kernels without Landlock V4 TCP support as a fallback: traps
+/// `connect()`, `bind()`, `sendto()`, `sendmmsg()`, and `sendmsg()` for
+/// supervisor mediation. Returns the notify fd the supervisor must poll.
+/// Uses `SECCOMP_FILTER_FLAG_NEW_LISTENER`.
 ///
-/// Must be called AFTER `PR_SET_NO_NEW_PRIVS` is already set (either by
-/// a prior seccomp install or by Landlock's `restrict_self()`).
+/// The IPC handshake (SCM_RIGHTS transfer of the notify fd to the parent)
+/// must complete before this filter is installed so no fd-based exemption
+/// is needed.
+///
+/// Must be called after `PR_SET_NO_NEW_PRIVS` is set (either by a prior
+/// seccomp install or by Landlock's `restrict_self()`).
 ///
 /// # Errors
 ///
@@ -2144,7 +2399,19 @@ pub fn install_seccomp_proxy_filter(has_bind_ports: bool) -> Result<std::os::fd:
     install_seccomp_notify_filter(&build_seccomp_proxy_filter(has_bind_ports), "proxy filter")
 }
 
-/// Install a seccomp-notify BPF filter for pathname AF_UNIX mediation.
+/// Install a seccomp-notify BPF filter for pathname AF_UNIX mediation (Linux-only).
+///
+/// Enables `linux.af_unix_mediation: pathname` enforcement: traps AF_UNIX
+/// `connect()`, `bind()`, `sendto()`, `sendmmsg()`, and `sendmsg()` and
+/// routes them to the supervisor, which checks `sockaddr_un.sun_path`
+/// against the `unix_sockets` allowlist. Connections to unlisted paths
+/// are denied with `EACCES`. Returns the notify fd the supervisor must poll.
+///
+/// The IPC handshake (SCM_RIGHTS transfer of the notify fd to the parent)
+/// must complete before this filter is installed so no fd-based exemption
+/// is needed.
+///
+/// Must be called after `PR_SET_NO_NEW_PRIVS` is set.
 ///
 /// # Errors
 ///
@@ -2878,7 +3145,7 @@ mod tests {
                 libc::close(listener_fd);
             }
 
-            match apply_with_abi(&caps, &detected) {
+            match apply_auto_with_abi(&caps, &detected) {
                 Ok(_) => {
                     let (connected, errno) = connect_abstract_socket(name);
                     payload[0] = if connected { 0 } else { 1 };
@@ -3016,7 +3283,7 @@ mod tests {
             }
 
             let caps = CapabilitySet::new().set_signal_mode(SignalMode::AllowSameSandbox);
-            match apply_with_abi(&caps, &detected) {
+            match apply_auto_with_abi(&caps, &detected) {
                 Ok(_) => {
                     let kill_result = unsafe { libc::kill(target_pid, libc::SIGUSR1) };
                     let errno = std::io::Error::last_os_error()
@@ -3485,7 +3752,8 @@ mod tests {
         };
         let mut caps = CapabilitySet::new().block_network();
         caps.add_localhost_port(0);
-        let err = apply_with_abi(&caps, &detected).expect_err("port 0 wildcard must be rejected");
+        let err =
+            apply_auto_with_abi(&caps, &detected).expect_err("port 0 wildcard must be rejected");
         let msg = format!("{err}");
         assert!(msg.contains("macOS-only"), "unexpected error: {msg}");
     }
@@ -3524,6 +3792,17 @@ mod tests {
     }
 
     #[test]
+    fn test_seccomp_opts_external_tcp_disables_only_tcp_handling() {
+        let fallback: TcpNetworkEnforcement = SeccompOpts::network_fallback().tcp_network.into();
+        assert!(fallback.handles_tcp());
+        assert!(fallback.allows_seccomp_fallback());
+
+        let external: TcpNetworkEnforcement = SeccompOpts::external_tcp().tcp_network.into();
+        assert!(!external.handles_tcp());
+        assert!(!external.allows_seccomp_fallback());
+    }
+
+    #[test]
     fn test_legacy_can_use_seccomp_block_fallback() {
         // BlockAll => true
         assert!(can_use_seccomp_network_block_fallback(
@@ -3543,39 +3822,42 @@ mod tests {
     #[test]
     fn test_build_seccomp_proxy_filter_with_bind() {
         let filter = build_seccomp_proxy_filter(true);
-        // 23 instructions
+        // 23 instructions: no check_fd block
         assert_eq!(filter.len(), 23);
 
-        // Instruction 0 should be ld [nr]
         assert_eq!(filter[0].code, BPF_LD | BPF_W | BPF_ABS);
         assert_eq!(filter[0].k, SECCOMP_DATA_NR_OFFSET);
 
-        // Instruction 19 should be USER_NOTIF (connect)
+        // insn 6: jeq SENDMSG -> 21 (jt = 21-6-1 = 14)
+        assert_eq!(filter[6].k, SYS_SENDMSG as u32);
+        assert_eq!(filter[6].jt, 14);
+
+        // insn 19: USER_NOTIF (connect)
         assert_eq!(filter[19].code, BPF_RET | BPF_K);
         assert_eq!(filter[19].k, SECCOMP_RET_USER_NOTIF);
 
-        // Instruction 20 should be USER_NOTIF (bind; supervisor decides).
+        // insn 20: USER_NOTIF (bind)
         assert_eq!(filter[20].code, BPF_RET | BPF_K);
         assert_eq!(filter[20].k, SECCOMP_RET_USER_NOTIF);
 
-        // Instruction 21 should be USER_NOTIF (sendto/sendmsg/sendmmsg)
+        // insn 21: USER_NOTIF (sendto/sendmsg/sendmmsg)
         assert_eq!(filter[21].code, BPF_RET | BPF_K);
         assert_eq!(filter[21].k, SECCOMP_RET_USER_NOTIF);
+
+        // insn 22: ALLOW (good socket/socketpair family)
+        assert_eq!(filter[22].code, BPF_RET | BPF_K);
+        assert_eq!(filter[22].k, SECCOMP_RET_ALLOW);
     }
 
     /// Regression test for the Landlock V2 + `has_bind_ports=false`
     /// scenario (issue #685): even with no TCP bind ports configured,
     /// bind() must route to USER_NOTIF so the supervisor can allow
-    /// pathname AF_UNIX bind. Previously the filter short-circuited to
-    /// ERRNO in this branch, unconditionally failing AF_UNIX bind.
+    /// pathname AF_UNIX bind.
     #[test]
     fn test_build_seccomp_proxy_filter_without_bind() {
         let filter = build_seccomp_proxy_filter(false);
         assert_eq!(filter.len(), 23);
 
-        // Instruction 20 (bind) must ALSO route to USER_NOTIF -- the
-        // supervisor is the sole gate. This is the fix: previously this
-        // emitted ERRNO, which skipped the supervisor entirely.
         assert_eq!(filter[20].code, BPF_RET | BPF_K);
         assert_eq!(
             filter[20].k, SECCOMP_RET_USER_NOTIF,
@@ -3585,16 +3867,26 @@ mod tests {
     }
 
     #[test]
-    fn test_build_seccomp_af_unix_filter_notifies_connect_bind_sendto_sendmsg_sendmmsg() {
+    fn test_build_seccomp_af_unix_filter_notifies_all_syscalls() {
         let filter = build_seccomp_af_unix_filter();
+        // 8 instructions: 0 ld-nr, 1-5 jeq dispatch, 6 ALLOW, 7 USER_NOTIF
+        // No check_fd block — the IPC handshake completes before the filter
+        // is installed, so no fd-based exemption is needed.
         assert_eq!(filter.len(), 8);
         assert_eq!(filter[0].code, BPF_LD | BPF_W | BPF_ABS);
         assert_eq!(filter[0].k, SECCOMP_DATA_NR_OFFSET);
+
         assert_eq!(filter[1].k, SYS_CONNECT as u32);
+        assert_eq!(filter[1].jt, 5); // -> insn 7 (USER_NOTIF)
         assert_eq!(filter[2].k, SYS_BIND as u32);
+        assert_eq!(filter[2].jt, 4); // -> insn 7
         assert_eq!(filter[3].k, SYS_SENDTO as u32);
+        assert_eq!(filter[3].jt, 3); // -> insn 7
         assert_eq!(filter[4].k, SYS_SENDMSG as u32);
+        assert_eq!(filter[4].jt, 2); // -> insn 7 (no special exemption)
         assert_eq!(filter[5].k, SYS_SENDMMSG as u32);
+        assert_eq!(filter[5].jt, 1); // -> insn 7
+
         assert_eq!(filter[6].k, SECCOMP_RET_ALLOW);
         assert_eq!(filter[7].k, SECCOMP_RET_USER_NOTIF);
     }
@@ -4018,7 +4310,7 @@ mod tests {
     /// Integration test: ProxyOnly + Landlock V4+ does NOT install seccomp
     /// proxy filter (Landlock handles networking natively).
     ///
-    /// Verifies that apply_with_abi() returns SeccompNetFallback::None when
+    /// Verifies that apply_auto_with_abi() returns SeccompNetFallback::None when
     /// the kernel supports AccessNet, even with ProxyOnly mode.
     #[cfg(target_os = "linux")]
     #[test]
@@ -4034,15 +4326,15 @@ mod tests {
             return;
         }
 
-        // On V4+, Landlock handles ProxyOnly natively. apply_with_abi should
+        // On V4+, Landlock handles ProxyOnly natively. apply_auto_with_abi should
         // return None (no seccomp fallback needed). We can't actually call
-        // apply_with_abi in the parent (irreversible), so fork a child.
+        // apply_auto_with_abi in the parent (irreversible), so fork a child.
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "fork() failed");
 
         if pid == 0 {
             let caps = CapabilitySet::new().proxy_only(8080);
-            let exit_code = match apply_with_abi(&caps, &detected) {
+            let exit_code = match apply_auto_with_abi(&caps, &detected) {
                 Ok(SeccompNetFallback::None) => 0,
                 Ok(SeccompNetFallback::BlockAll) => 1,
                 Ok(SeccompNetFallback::ProxyOnly { .. }) => 2,
@@ -4064,7 +4356,7 @@ mod tests {
 
     /// Integration test: ProxyOnly on pre-V4 kernel returns ProxyOnly fallback.
     ///
-    /// Verifies that apply_with_abi() returns SeccompNetFallback::ProxyOnly
+    /// Verifies that apply_auto_with_abi() returns SeccompNetFallback::ProxyOnly
     /// when the kernel's Landlock ABI lacks AccessNet.
     #[cfg(target_os = "linux")]
     #[test]
@@ -4085,7 +4377,7 @@ mod tests {
 
         if pid == 0 {
             let caps = CapabilitySet::new().proxy_only(8080);
-            let exit_code = match apply_with_abi(&caps, &detected) {
+            let exit_code = match apply_auto_with_abi(&caps, &detected) {
                 Ok(SeccompNetFallback::ProxyOnly {
                     proxy_port: 8080, ..
                 }) => 0,
@@ -4265,5 +4557,128 @@ mod tests {
                 "Landlock must be available when WSL2 or native Linux"
             );
         }
+    }
+
+    // fs_type_unsupported: pure logic, runs on any CI platform
+
+    #[test]
+    fn test_fs_type_unsupported_v9fs_magic() {
+        assert!(
+            fs_type_unsupported(V9FS_MAGIC),
+            "V9FS_MAGIC must be unsupported"
+        );
+    }
+
+    #[test]
+    fn test_fs_type_unsupported_known_supported_types() {
+        const EXT4_MAGIC: u64 = 0xEF53;
+        const TMPFS_MAGIC: u64 = 0x0102_1994;
+        const PROC_MAGIC: u64 = 0x9FA0;
+        assert!(!fs_type_unsupported(EXT4_MAGIC));
+        assert!(!fs_type_unsupported(TMPFS_MAGIC));
+        assert!(!fs_type_unsupported(PROC_MAGIC));
+        assert!(!fs_type_unsupported(0));
+    }
+
+    // unsupported_filesystem_dev: exercises the statfs syscall path
+
+    #[test]
+    fn test_unsupported_filesystem_dev_native_paths() {
+        // /tmp and /proc are native Linux filesystems, never 9P.
+        assert!(
+            unsupported_filesystem_dev(std::path::Path::new("/tmp")).is_none(),
+            "/tmp should be on a supported filesystem"
+        );
+        assert!(
+            unsupported_filesystem_dev(std::path::Path::new("/proc")).is_none(),
+            "/proc should be on a supported filesystem"
+        );
+    }
+
+    #[test]
+    fn test_unsupported_filesystem_dev_nonexistent_path() {
+        // statfs fails on a nonexistent path — must return None, not panic.
+        assert!(
+            unsupported_filesystem_dev(std::path::Path::new("/nonexistent-nono-test-path-xyz"))
+                .is_none(),
+            "nonexistent path should return None, not panic"
+        );
+    }
+
+    #[test]
+    fn test_unsupported_filesystem_dev_wsl2_mount() {
+        // On a real WSL2 system /mnt/c is a 9P mount and must be detected.
+        // Skipped on native Linux where /mnt/c doesn't exist.
+        let mnt_c = std::path::Path::new("/mnt/c");
+        if mnt_c.exists() {
+            assert!(
+                unsupported_filesystem_dev(mnt_c).is_some(),
+                "/mnt/c exists but was not detected as a 9P filesystem"
+            );
+        }
+    }
+
+    #[test]
+    fn test_restrict_execute_does_not_break_rename_into_new_subdir() {
+        // Regression test for the missing-Refer bug: rename into a subdir
+        // created after restrict_execute() must still succeed.
+        let detected = match detect_abi() {
+            Ok(detected) => detected,
+            Err(_) => return,
+        };
+        if !detected.has_execute() {
+            return;
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "nono-restrict-execute-rename-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(root.join("_tmp")).expect("create _tmp dir");
+        let src = root.join("_tmp/srcfile");
+        std::fs::write(&src, b"x").expect("create srcfile");
+
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork() failed");
+
+        if pid == 0 {
+            let cap = crate::capability::FsCapability::new_dir(&root, AccessMode::ReadWrite)
+                .expect("build fs capability");
+            let mut caps = CapabilitySet::new();
+            caps.add_fs(cap);
+
+            if apply_landlock(&caps).is_err() {
+                unsafe { libc::_exit(2) };
+            }
+            if restrict_execute(&["/usr/bin"]).is_err() {
+                unsafe { libc::_exit(3) };
+            }
+
+            let new_subdir = root.join("sha256/abc/bin");
+            if std::fs::create_dir_all(&new_subdir).is_err() {
+                unsafe { libc::_exit(4) };
+            }
+            let dst = new_subdir.join("dstfile");
+            match std::fs::rename(&src, &dst) {
+                Ok(()) => unsafe { libc::_exit(0) },
+                Err(_) => unsafe { libc::_exit(1) },
+            }
+        }
+
+        let mut status: i32 = 0;
+        let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(waited, pid, "waitpid() failed");
+        assert!(
+            libc::WIFEXITED(status),
+            "child did not exit normally: status={status}"
+        );
+        let code = libc::WEXITSTATUS(status);
+        assert_eq!(
+            code, 0,
+            "rename into freshly-created subdir failed under stacked execute-restriction layer \
+             (exit code {code}; 1=rename EXDEV/denied, 2=apply_landlock failed, \
+             3=restrict_execute failed, 4=mkdir failed)"
+        );
     }
 }

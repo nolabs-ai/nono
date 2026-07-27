@@ -18,9 +18,39 @@ Network filtering proxy for the [nono](https://crates.io/crates/nono) sandbox.
 
 - **Cloud metadata deny list is hardcoded** -- Cloud metadata hostnames (169.254.169.254, metadata.google.internal, metadata.azure.internal) are always blocked regardless of allowlist configuration. Private network addresses (RFC1918) are allowed to support enterprise environments.
 - **DNS rebinding protection** -- The proxy resolves DNS, checks all resolved IPs against the link-local range (169.254.0.0/16, fe80::/10), and connects to resolved addresses (not re-resolved hostnames). This prevents DNS rebinding attacks targeting cloud metadata.
-- **Session token authentication** -- Each session generates a 256-bit random token. CONNECT requests use `Proxy-Authorization` (Basic or Bearer); reverse proxy requests use `X-Nono-Token`.
+- **Session token authentication** -- Each session generates a 256-bit random token. CONNECT requests use `Proxy-Authorization` (Basic or Bearer); reverse proxy requests are authenticated transparently — nono sets the credential env var (e.g. `GITHUB_TOKEN`) to a phantom token inside the sandbox, so standard API clients send it automatically in the service-specific auth header (e.g. `Authorization: Bearer`), which the proxy validates before injecting the real credential.
 - **Credential isolation** -- API keys are loaded from the OS keyring, stored in `Zeroizing<String>`, injected at the HTTP header level, and never exposed to the sandboxed process.
 - **Constant-time token comparison** -- Prevents timing side-channel attacks on session token validation.
+
+## Rate Limiting
+
+Each route may declare an optional per-route request-rate limit (a
+`RouteRateLimiter`) to contain a runaway or compromised agent:
+
+```toml
+[[routes]]
+prefix = "openai"
+upstream = "https://api.openai.com"
+credential_key = "openai_api_key"
+
+[routes.rate_limit]
+requests_per_minute = 120   # token-bucket refill rate
+burst = 5                   # instantaneous headroom (default 5)
+max_delay_secs = 5          # longest a request waits before 429 (default 5)
+```
+
+A token bucket refills at `requests_per_minute` and holds up to `burst` tokens.
+When the bucket is empty, a request is delayed until a token accrues, up to
+`max_delay_secs`; a request that would wait longer is rejected with **HTTP 429**.
+Overload is a bounded delay then reject -- never a human approval prompt and
+never an unbounded wait (which would let a flood exhaust the proxy).
+
+**Scope:** the limiter acts only on **L7-visible** traffic -- reverse-proxy
+routes and TLS-intercepted CONNECT. It has **no effect** on an opaque CONNECT
+tunnel (a route without interception), where the proxy sees a single TCP stream
+and cannot count individual requests. Use per-route interception
+(`endpoint_rules` / `credential_key`) if you need request-level limiting on a
+CONNECT host.
 
 ## Usage
 
@@ -41,7 +71,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Set these in the child process environment
     let env_vars = handle.env_vars();
-    // HTTP_PROXY, HTTPS_PROXY, NONO_PROXY_TOKEN, etc.
+    // HTTP_PROXY, HTTPS_PROXY, and the phantom credential env vars (e.g. GITHUB_TOKEN).
 
     // Shutdown when done
     handle.shutdown();

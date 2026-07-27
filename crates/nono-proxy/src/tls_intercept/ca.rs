@@ -438,7 +438,7 @@ mod tests {
     #[test]
     fn split_key_cert_pem_roundtrips() {
         let ca = EphemeralCa::generate_with_cn("nono-proxy-ca", CA_VALIDITY_DEFAULT).unwrap();
-        let combined = format!("{}{}", &*ca.key_pem(), ca.cert_pem());
+        let combined = format!("{}{}", *ca.key_pem(), ca.cert_pem());
 
         let (key_der, cert_pem) = split_key_cert_pem(&combined).unwrap();
         assert_eq!(&*key_der, ca.key_der());

@@ -12,8 +12,8 @@ edition = "2024"
 rust-version = "1.95"
 authors = ["Luke Hinds"]
 license = "Apache-2.0"
-repository = "https://github.com/always-further/nono"
-homepage = "https://github.com/always-further/nono"
+repository = "https://github.com/nolabs-ai/nono"
+homepage = "https://github.com/nolabs-ai/nono"
 
 [workspace.dependencies]
 # Error handling
@@ -46,8 +46,8 @@ getrandom = "0.4"
 
 # Async runtime and HTTP
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "signal", "sync", "time"] }
-hyper = { version = "1", features = ["http1", "server", "client"] }
-hyper-util = { version = "0.1", features = ["tokio", "server-auto"] }
+hyper = { version = "1", features = ["http1", "http2", "server", "client"] }
+hyper-util = { version = "0.1", features = ["tokio", "server-auto", "client-legacy", "http1", "http2"] }
 http-body-util = "0.1"
 
 # Testing

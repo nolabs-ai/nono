@@ -25,7 +25,7 @@ caps.allow_write("/path/to/write")?;
 caps.allow_execute("/usr/bin/ls")?;
 
 // Apply the sandbox (irreversible)
-Sandbox::apply(&caps)?;
+Sandbox::apply_auto(&caps)?;
 
 // All subsequent operations are restricted to granted capabilities
 ```

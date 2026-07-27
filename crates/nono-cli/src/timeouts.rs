@@ -21,6 +21,13 @@ pub const ATTACH_SOCKET_READ_TIMEOUT: Duration = Duration::from_millis(500);
 /// supervisor time to replay buffered screen content.
 pub const ATTACH_STDIN_DELAY: Duration = Duration::from_millis(250);
 
+/// Maximum time to wait on final teardown for a terminal's reply to a
+/// cursor-position query (`ESC[6n`) the exiting child emitted, so the reply is
+/// consumed instead of being pasted into the shell prompt. Bounds the
+/// byte-at-a-time read that waits out the (possibly fragmented) reply; kept
+/// short so it is imperceptible on exit.
+pub const TERMINAL_QUERY_REPLY_TIMEOUT: Duration = Duration::from_millis(30);
+
 /// Sleep before retrying a session connection that failed with `SessionGone`.
 pub const ATTACH_RETRY_DELAY: Duration = Duration::from_millis(150);
 

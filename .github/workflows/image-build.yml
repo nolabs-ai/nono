@@ -33,7 +33,7 @@ jobs:
     name: Resolve build parameters
     runs-on: ubuntu-latest
     if: >-
-      github.repository == 'always-further/nono' &&
+      github.repository == 'nolabs-ai/nono' &&
       ((github.event_name == 'workflow_dispatch') ||
       (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success'))
     outputs:
@@ -55,18 +55,24 @@ jobs:
             # Skip prereleases
             if [[ "$TAG" == *alpha* ]] || [[ "$TAG" == *beta* ]] || [[ "$TAG" == *rc* ]]; then
               echo "Skipping prerelease tag: $TAG"
-              echo "push=false" >> "$GITHUB_OUTPUT"
-              echo "ref=$TAG" >> "$GITHUB_OUTPUT"
-              echo "version=$TAG" >> "$GITHUB_OUTPUT"
+              {
+                echo "push=false"
+                echo "ref=$TAG"
+                echo "version=$TAG"
+              } >> "$GITHUB_OUTPUT"
               exit 0
             fi
-            echo "ref=$TAG" >> "$GITHUB_OUTPUT"
-            echo "version=$TAG" >> "$GITHUB_OUTPUT"
-            echo "push=true" >> "$GITHUB_OUTPUT"
+            {
+              echo "ref=$TAG"
+              echo "version=$TAG"
+              echo "push=true"
+            } >> "$GITHUB_OUTPUT"
           else
-            echo "ref=$WD_REF" >> "$GITHUB_OUTPUT"
-            echo "version=${WD_VERSION:-$WD_REF}" >> "$GITHUB_OUTPUT"
-            echo "push=$WD_PUSH" >> "$GITHUB_OUTPUT"
+            {
+              echo "ref=$WD_REF"
+              echo "version=${WD_VERSION:-$WD_REF}"
+              echo "push=$WD_PUSH"
+            } >> "$GITHUB_OUTPUT"
           fi
 
   build-binaries:
@@ -175,26 +181,28 @@ jobs:
             STABLE=false
           fi
 
-          TAGS="ghcr.io/always-further/nono:${VERSION}"
+          TAGS="ghcr.io/nolabs-ai/nono:${VERSION}"
           if [ "$BUILD_PUSH" = "true" ] && [ "$STABLE" = "true" ] && [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             MAJOR_MINOR="${VERSION%.*}"
-            TAGS="${TAGS},ghcr.io/always-further/nono:${MAJOR_MINOR}"
-            TAGS="${TAGS},ghcr.io/always-further/nono:latest"
+            TAGS="${TAGS},ghcr.io/nolabs-ai/nono:${MAJOR_MINOR}"
+            TAGS="${TAGS},ghcr.io/nolabs-ai/nono:latest"
           fi
 
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "stable=$STABLE" >> "$GITHUB_OUTPUT"
-          echo "tags=$TAGS" >> "$GITHUB_OUTPUT"
+          {
+            echo "version=$VERSION"
+            echo "stable=$STABLE"
+            echo "tags=$TAGS"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@06116385d9baf250c9f4dcb4858b16962ea869c3 # v4.1.0
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
       - name: Log in to ghcr.io
         if: ${{ needs.resolve.outputs.push == 'true' }}
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -202,7 +210,7 @@ jobs:
 
       - name: Build and push
         id: push
-        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: docker-context
           file: docker-context/Dockerfile
@@ -210,7 +218,7 @@ jobs:
           push: ${{ needs.resolve.outputs.push == 'true' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: |
-            org.opencontainers.image.source=https://github.com/always-further/nono
+            org.opencontainers.image.source=https://github.com/nolabs-ai/nono
             org.opencontainers.image.version=${{ steps.meta.outputs.version }}
             org.opencontainers.image.description=Capability-based sandboxing for untrusted AI agents
 
@@ -224,4 +232,4 @@ jobs:
           IMAGE_DIGEST: ${{ steps.push.outputs.digest }}
         run: |
           cosign sign --yes \
-            "ghcr.io/always-further/nono@${IMAGE_DIGEST}"
+            "ghcr.io/nolabs-ai/nono@${IMAGE_DIGEST}"

@@ -1,7 +1,7 @@
 # Issue #594 — Phase 2: Profile JSON Schema Restructuring
 
 **Status:** Design complete, ready for implementation planning.
-**Upstream issue:** https://github.com/always-further/nono/issues/594
+**Upstream issue:** https://github.com/nolabs-ai/nono/issues/594
 **Scope:** Phase 2 of the two-phase split. Phase 1 (CLI namespace consolidation) shipped in 5ff9bc3.
 
 ## Problem
@@ -374,7 +374,7 @@ profile JSON schema (#594)` with a body listing the nine key moves and
    (two-layer parsing, legacy capture structs), and `remove_by=v1.0.0`.
    Issue #594 serves as the deprecation tracking issue for the whole phase —
    no separate issue.
-2. Mirror in upstream `always-further/nono` if not already present.
+2. Mirror in upstream `nolabs-ai/nono` if not already present.
 
 ### Verification gates (all must pass before merge)
 

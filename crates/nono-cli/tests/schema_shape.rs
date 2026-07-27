@@ -147,12 +147,14 @@ fn test_schema_command_policies_match_tool_sandbox_guide_shape() {
             "allow_direct_exec_bypass_with_credentials",
             "allow_writable_executable",
             "can_use",
+            "daemon_pid_source",
             "executable",
             "from",
             "intercept",
             "sandbox",
         ],
     );
+    assert_schema_properties(&schema, "DaemonPidSource", &["argv", "env"]);
     assert_schema_properties(
         &schema,
         "CommandEdgeConfig",
@@ -175,6 +177,7 @@ fn test_schema_command_policies_match_tool_sandbox_guide_shape() {
             "open_urls",
             "resources",
             "stdio",
+            "unsafe_macos_seatbelt_rules",
             "use_credentials",
         ],
     );

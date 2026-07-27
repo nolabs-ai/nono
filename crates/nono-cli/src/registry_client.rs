@@ -26,6 +26,67 @@ pub struct RegistryClient {
     http: ureq::Agent,
 }
 
+/// Build the installation-context headers to attach to every registry request.
+///
+/// Headers included:
+/// - `X-Nono-UUID`: installation UUID if a state file exists (omitted otherwise)
+/// - `X-Nono-Platform`: OS name (`std::env::consts::OS`)
+/// - `X-Nono-Arch`: CPU architecture (`std::env::consts::ARCH`)
+/// - `X-Nono-CI`: `"true"` when a recognised CI environment is detected
+/// - `X-Nono-CI-Provider`: CI provider name when detected
+/// - `X-Nono-Install-Source`: install method (`homebrew`, `cargo`, `github_release`, `manual`, `unknown`)
+///
+/// This function never creates or writes any files.
+pub(crate) fn build_context_headers() -> Vec<(&'static str, String)> {
+    let mut headers: Vec<(&'static str, String)> = Vec::new();
+    if let Some(uuid) = crate::update_check::read_installation_uuid() {
+        headers.push(("X-Nono-UUID", uuid));
+    }
+    headers.push(("X-Nono-Platform", std::env::consts::OS.to_string()));
+    headers.push(("X-Nono-Arch", std::env::consts::ARCH.to_string()));
+    let ci_provider = crate::update_check::detect_ci_provider();
+    if ci_provider.is_some() {
+        headers.push(("X-Nono-CI", "true".to_string()));
+    }
+    if let Some(provider) = ci_provider {
+        headers.push(("X-Nono-CI-Provider", provider.to_string()));
+    }
+    headers.push((
+        "X-Nono-Install-Source",
+        crate::update_check::detect_install_source(),
+    ));
+    headers
+}
+
+/// Why a `/pull` request was made. Sent only on that request via the
+/// `X-Nono-Pull-Reason` header, so the registry can distinguish a
+/// deliberate user-initiated install from a CI-driven or implicit one.
+/// Unlike the installation-context headers above, this doesn't apply to
+/// every registry call — only `/pull` has more than one possible trigger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PullReason {
+    /// `nono pull <ns>/<name>` invoked directly.
+    Explicit,
+    /// `nono update` re-pulling an outdated pack.
+    Update,
+    /// First-run legacy-config migration auto-installing a suggested pack.
+    Migration,
+    /// Silent implicit pull because a `--profile <ns>/<name>` reference
+    /// (including an `extends` chain) wasn't installed locally.
+    ProfileAuto,
+}
+
+impl PullReason {
+    fn header_value(self) -> &'static str {
+        match self {
+            PullReason::Explicit => "explicit",
+            PullReason::Update => "update",
+            PullReason::Migration => "migration",
+            PullReason::ProfileAuto => "profile-auto",
+        }
+    }
+}
+
 impl RegistryClient {
     /// Build a registry client whose TLS verifier delegates to the OS-native
     /// trust store at handshake time (SecTrust on macOS, system CA stores on
@@ -33,11 +94,28 @@ impl RegistryClient {
     /// the kind injected by VPN-based TLS-inspecting proxies — that the bundled
     /// webpki roots wouldn't recognize, without any startup-time enumeration of
     /// the keychain (which can spuriously fail in restricted environments).
+    ///
+    /// Installation-context headers (`X-Nono-UUID`, `X-Nono-Platform`,
+    /// `X-Nono-Arch`, `X-Nono-CI`, `X-Nono-CI-Provider`,
+    /// `X-Nono-Install-Source`) are attached via a middleware registered on the
+    /// agent at construction time. The middleware only injects these headers
+    /// when the request host matches the registry host — preventing them from
+    /// being forwarded to CDN or other third-party hosts that may appear in
+    /// bundle or artifact download URLs.
     #[must_use]
     pub fn new(base_url: String) -> Self {
+        let version = env!("CARGO_PKG_VERSION");
         let tls_config = ureq::tls::TlsConfig::builder()
             .root_certs(ureq::tls::RootCerts::PlatformVerifier)
             .build();
+        let ctx_headers = build_context_headers();
+        // Extract the registry host once at construction; the middleware uses
+        // it to guard header injection so context headers are never forwarded
+        // to CDN hosts in bundle/artifact download URLs.
+        let registry_host = url::Url::parse(&base_url)
+            .ok()
+            .and_then(|u| u.host_str().map(|h| h.to_ascii_lowercase()))
+            .unwrap_or_default();
         let http = ureq::Agent::config_builder()
             .timeout_global(Some(REGISTRY_CALL_TIMEOUT))
             .timeout_resolve(Some(REGISTRY_CONNECT_TIMEOUT))
@@ -45,6 +123,27 @@ impl RegistryClient {
             .timeout_recv_response(Some(REGISTRY_RESPONSE_TIMEOUT))
             .timeout_recv_body(Some(REGISTRY_BODY_TIMEOUT))
             .tls_config(tls_config)
+            .user_agent(format!("nono-cli/{version}"))
+            .middleware(
+                move |mut req: ureq::http::Request<ureq::SendBody>,
+                      next: ureq::middleware::MiddlewareNext<'_>| {
+                    let req_host = req
+                        .uri()
+                        .host()
+                        .map(|h| h.to_ascii_lowercase())
+                        .unwrap_or_default();
+                    if req_host == registry_host {
+                        for (name, value) in &ctx_headers {
+                            if let Ok(hv) =
+                                ureq::http::header::HeaderValue::try_from(value.as_str())
+                            {
+                                req.headers_mut().insert(*name, hv);
+                            }
+                        }
+                    }
+                    next.handle(req)
+                },
+            )
             .build()
             .new_agent();
         Self {
@@ -57,6 +156,7 @@ impl RegistryClient {
         &self,
         package_ref: &PackageRef,
         version: &str,
+        reason: PullReason,
     ) -> Result<PullResponse> {
         let url = format!(
             "{}/api/v1/packages/{}/{}/versions/{version}/pull",
@@ -65,6 +165,7 @@ impl RegistryClient {
         let mut response = self
             .http
             .get(&url)
+            .header("X-Nono-Pull-Reason", reason.header_value())
             .config()
             .http_status_as_error(false)
             .build()
@@ -320,6 +421,7 @@ fn enforce_content_length(content_length: Option<u64>, limit: u64, url: &str) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_env::{ENV_LOCK, EnvVarGuard};
 
     #[test]
     fn registry_client_normalizes_base_url() {
@@ -327,5 +429,92 @@ mod tests {
         // TLS verification is delegated to the OS verifier at handshake time.
         let client = RegistryClient::new("https://example.invalid/".to_string());
         assert_eq!(client.base_url, "https://example.invalid");
+    }
+
+    #[test]
+    fn context_headers_contain_platform_and_arch() {
+        let headers = build_context_headers();
+        let platform = headers.iter().find(|(k, _)| *k == "X-Nono-Platform");
+        let arch = headers.iter().find(|(k, _)| *k == "X-Nono-Arch");
+        assert_eq!(
+            platform.map(|(_, v)| v.as_str()),
+            Some(std::env::consts::OS)
+        );
+        assert_eq!(arch.map(|(_, v)| v.as_str()), Some(std::env::consts::ARCH));
+    }
+
+    #[test]
+    fn context_headers_omit_ci_fields_outside_ci() {
+        let _lock = match ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        // Unset all recognised CI env vars so detect_ci_provider returns None.
+        let ci_vars: &[(&'static str, &str)] = &[
+            ("GITHUB_ACTIONS", ""),
+            ("GITLAB_CI", ""),
+            ("CIRCLECI", ""),
+            ("BUILDKITE", ""),
+            ("TF_BUILD", ""),
+            ("TRAVIS", ""),
+            ("JENKINS_URL", ""),
+            ("JENKINS_HOME", ""),
+            ("BITBUCKET_BUILD_NUMBER", ""),
+            ("APPVEYOR", ""),
+            ("TEAMCITY_VERSION", ""),
+            ("DRONE", ""),
+            ("SEMAPHORE", ""),
+            ("CODESHIP", ""),
+            ("WOODPECKER", ""),
+            ("NETLIFY", ""),
+            ("VERCEL", ""),
+            ("RENDER", ""),
+            ("CI", ""),
+        ];
+        let guard = EnvVarGuard::set_all(ci_vars);
+        for (k, _) in ci_vars {
+            guard.remove(k);
+        }
+
+        let headers = build_context_headers();
+        assert!(
+            !headers.iter().any(|(k, _)| *k == "X-Nono-CI"),
+            "X-Nono-CI should be absent outside CI"
+        );
+        assert!(
+            !headers.iter().any(|(k, _)| *k == "X-Nono-CI-Provider"),
+            "X-Nono-CI-Provider should be absent outside CI"
+        );
+    }
+
+    #[test]
+    fn context_headers_include_ci_fields_in_ci() {
+        let _lock = match ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let _guard = EnvVarGuard::set_all(&[("GITHUB_ACTIONS", "true")]);
+
+        let headers = build_context_headers();
+        let ci = headers.iter().find(|(k, _)| *k == "X-Nono-CI");
+        let provider = headers.iter().find(|(k, _)| *k == "X-Nono-CI-Provider");
+        assert_eq!(
+            ci.map(|(_, v)| v.as_str()),
+            Some("true"),
+            "X-Nono-CI should be 'true' in CI"
+        );
+        assert_eq!(
+            provider.map(|(_, v)| v.as_str()),
+            Some("github_actions"),
+            "X-Nono-CI-Provider should be 'github_actions'"
+        );
+    }
+
+    #[test]
+    fn pull_reason_header_values_are_distinct_and_stable() {
+        assert_eq!(PullReason::Explicit.header_value(), "explicit");
+        assert_eq!(PullReason::Update.header_value(), "update");
+        assert_eq!(PullReason::Migration.header_value(), "migration");
+        assert_eq!(PullReason::ProfileAuto.header_value(), "profile-auto");
     }
 }

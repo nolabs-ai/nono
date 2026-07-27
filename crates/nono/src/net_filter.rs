@@ -114,8 +114,10 @@ pub struct HostFilter {
     allowed_hosts: Vec<String>,
     /// Allowed wildcard suffixes (e.g., ".googleapis.com", lowercased)
     allowed_suffixes: Vec<String>,
-    /// Hostnames that are always denied
+    /// Exact hostnames that are always denied
     deny_hosts: Vec<String>,
+    /// Wildcard suffixes that are always denied (e.g., ".ads.example.com")
+    deny_suffixes: Vec<String>,
     /// When true, an empty allowlist denies instead of allowing.
     strict: bool,
 }
@@ -146,6 +148,7 @@ impl HostFilter {
             allowed_hosts: exact,
             allowed_suffixes: suffixes,
             deny_hosts: DENY_HOSTS.iter().map(|s| s.to_lowercase()).collect(),
+            deny_suffixes: Vec::new(),
             strict: false,
         }
     }
@@ -167,8 +170,26 @@ impl HostFilter {
             allowed_hosts: Vec::new(),
             allowed_suffixes: Vec::new(),
             deny_hosts: DENY_HOSTS.iter().map(|s| s.to_lowercase()).collect(),
+            deny_suffixes: Vec::new(),
             strict: false,
         }
+    }
+
+    /// Append user-configured deny entries on top of the hardcoded deny list.
+    ///
+    /// Supports the same wildcard syntax as the allowlist (`*.example.com`
+    /// matches `foo.example.com` but not `example.com` itself).
+    #[must_use]
+    pub fn with_denied_hosts(mut self, denied: &[String]) -> Self {
+        for entry in denied {
+            let lower = entry.to_lowercase();
+            if let Some(suffix) = lower.strip_prefix('*') {
+                self.deny_suffixes.push(suffix.to_string());
+            } else {
+                self.deny_hosts.push(lower);
+            }
+        }
+        self
     }
 
     /// Check a host against the filter.
@@ -188,11 +209,20 @@ impl HostFilter {
     pub fn check_host(&self, host: &str, resolved_ips: &[IpAddr]) -> FilterResult {
         let lower_host = host.to_lowercase();
 
-        // 1. Check deny hosts
+        // 1. Check deny hosts (exact match)
         if self.deny_hosts.contains(&lower_host) {
             return FilterResult::DenyHost {
                 host: host.to_string(),
             };
+        }
+
+        // 1b. Check deny suffixes (wildcard match, e.g. *.ads.example.com)
+        for suffix in &self.deny_suffixes {
+            if lower_host.ends_with(suffix.as_str()) && lower_host.len() > suffix.len() {
+                return FilterResult::DenyHost {
+                    host: host.to_string(),
+                };
+            }
         }
 
         // 2. Check resolved IPs for link-local addresses (cloud metadata protection)
@@ -423,6 +453,58 @@ mod tests {
             IpAddr::V4(Ipv4Addr::new(169, 254, 0, 1)),
         ];
         let result = filter.check_host("multi.example.com", &ips);
+        assert!(!result.is_allowed());
+    }
+
+    #[test]
+    fn test_user_deny_host_exact() {
+        let filter = HostFilter::allow_all().with_denied_hosts(&["evil.com".to_string()]);
+        let result = filter.check_host("evil.com", &public_ip());
+        assert!(!result.is_allowed());
+        assert!(matches!(result, FilterResult::DenyHost { .. }));
+    }
+
+    #[test]
+    fn test_user_deny_host_does_not_affect_others() {
+        let filter = HostFilter::allow_all().with_denied_hosts(&["evil.com".to_string()]);
+        let result = filter.check_host("good.com", &public_ip());
+        assert!(result.is_allowed());
+    }
+
+    #[test]
+    fn test_user_deny_host_wildcard() {
+        let filter = HostFilter::allow_all().with_denied_hosts(&["*.ads.example.com".to_string()]);
+        assert!(
+            !filter
+                .check_host("tracker.ads.example.com", &public_ip())
+                .is_allowed()
+        );
+        assert!(
+            !filter
+                .check_host("pixel.ads.example.com", &public_ip())
+                .is_allowed()
+        );
+        // bare domain must NOT match wildcard
+        assert!(
+            filter
+                .check_host("ads.example.com", &public_ip())
+                .is_allowed()
+        );
+    }
+
+    #[test]
+    fn test_user_deny_beats_allowlist() {
+        let filter =
+            HostFilter::new(&["evil.com".to_string()]).with_denied_hosts(&["evil.com".to_string()]);
+        let result = filter.check_host("evil.com", &public_ip());
+        assert!(!result.is_allowed());
+        assert!(matches!(result, FilterResult::DenyHost { .. }));
+    }
+
+    #[test]
+    fn test_user_deny_case_insensitive() {
+        let filter = HostFilter::allow_all().with_denied_hosts(&["Evil.COM".to_string()]);
+        let result = filter.check_host("evil.com", &public_ip());
         assert!(!result.is_allowed());
     }
 

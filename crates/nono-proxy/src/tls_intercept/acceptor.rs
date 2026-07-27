@@ -6,13 +6,14 @@
 //!
 //! ## ALPN
 //!
-//! We force ALPN to `http/1.1` and only `http/1.1`. The shared L7 forwarder
-//! ([`crate::reverse::handle_reverse_proxy`] today, soon a shared module) is
-//! HTTP/1.1-only. By restricting ALPN we prevent the agent's TLS client from
-//! negotiating HTTP/2 — clients that prefer h2 will gracefully fall back to
-//! h1 instead of negotiating something we can't speak. If a client refuses
-//! to fall back, the handshake fails and the request is denied (which is the
-//! correct behaviour for an intercept-required route).
+//! We advertise both `h2` and `http/1.1` in ALPN. After the handshake the
+//! caller inspects the negotiated protocol and dispatches to the appropriate
+//! forwarding path:
+//!
+//! * `h2` — [`super::h2_forward`] handles HTTP/2 framing with per-stream
+//!   credential injection (required for gRPC clients).
+//! * `http/1.1` — the existing [`super::handle`] request parser forwards a
+//!   single HTTP/1.1 request with credential injection.
 
 use crate::error::{ProxyError, Result};
 use crate::tls_intercept::cert_cache::CertCache;
@@ -28,15 +29,22 @@ use std::sync::Arc;
 /// * has no client-cert authentication (the OUTER CONNECT auth has already
 ///   established caller identity at the TCP layer);
 /// * resolves server certs via the supplied [`CertCache`];
-/// * advertises only `http/1.1` in ALPN.
-pub fn build_server_config(cert_cache: Arc<CertCache>) -> Result<Arc<ServerConfig>> {
+/// * advertises `h2` and `http/1.1` in ALPN.
+pub fn build_server_config(
+    cert_cache: Arc<CertCache>,
+    enable_h2: bool,
+) -> Result<Arc<ServerConfig>> {
     let mut config =
         ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
             .with_safe_default_protocol_versions()
             .map_err(|e| ProxyError::Config(format!("tls_intercept TLS config error: {}", e)))?
             .with_no_client_auth()
             .with_cert_resolver(cert_cache);
-    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    config.alpn_protocols = if enable_h2 {
+        vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+    } else {
+        vec![b"http/1.1".to_vec()]
+    };
     Ok(Arc::new(config))
 }
 
@@ -50,11 +58,14 @@ mod tests {
     use tokio::net::TcpListener;
 
     #[test]
-    fn alpn_is_h1_only() {
+    fn alpn_offers_h2_and_h1() {
         let ca = Arc::new(EphemeralCa::generate().unwrap());
         let cache = Arc::new(CertCache::new(ca));
-        let config = build_server_config(cache).unwrap();
-        assert_eq!(config.alpn_protocols, vec![b"http/1.1".to_vec()]);
+        let config = build_server_config(cache, true).unwrap();
+        assert_eq!(
+            config.alpn_protocols,
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+        );
     }
 
     /// Helper: build a rustls client `ClientConfig` that trusts `ca_pem`.
@@ -93,7 +104,7 @@ mod tests {
     async fn handshake_succeeds_when_client_trusts_ephemeral_ca() {
         let ca = Arc::new(EphemeralCa::generate().unwrap());
         let cache = Arc::new(CertCache::new(Arc::clone(&ca)));
-        let server_config = build_server_config(Arc::clone(&cache)).unwrap();
+        let server_config = build_server_config(Arc::clone(&cache), true).unwrap();
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -128,7 +139,7 @@ mod tests {
     async fn handshake_fails_when_client_pins_other_cert() {
         let ca = Arc::new(EphemeralCa::generate().unwrap());
         let cache = Arc::new(CertCache::new(Arc::clone(&ca)));
-        let server_config = build_server_config(Arc::clone(&cache)).unwrap();
+        let server_config = build_server_config(Arc::clone(&cache), true).unwrap();
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -148,6 +159,115 @@ mod tests {
         // ephemeral CA isn't in its (empty) trust store. This is the
         // cert-pinning hard-fail behaviour the design constraint demands.
         assert!(connector.connect(server_name, tcp).await.is_err());
+
+        server_task.await.unwrap();
+    }
+
+    /// Helper: build a client config that trusts `ca_pem` with a specific ALPN preference.
+    fn client_config_trusting_with_alpn(
+        ca_pem: &str,
+        alpn: Vec<Vec<u8>>,
+    ) -> Arc<rustls::ClientConfig> {
+        use rustls::pki_types::pem::PemObject;
+
+        let mut roots = rustls::RootCertStore::empty();
+        let cert = CertificateDer::from_pem_slice(ca_pem.as_bytes()).unwrap();
+        roots.add(cert).unwrap();
+        let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        config.alpn_protocols = alpn;
+        Arc::new(config)
+    }
+
+    #[tokio::test]
+    async fn alpn_negotiates_h2_when_client_prefers_h2() {
+        let ca = Arc::new(EphemeralCa::generate().unwrap());
+        let cache = Arc::new(CertCache::new(Arc::clone(&ca)));
+        let server_config = build_server_config(Arc::clone(&cache), true).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let acceptor = tokio_rustls::TlsAcceptor::from(server_config);
+            let tls = acceptor.accept(stream).await.unwrap();
+            let negotiated = tls.get_ref().1.alpn_protocol().map(|p| p.to_vec());
+            assert_eq!(negotiated, Some(b"h2".to_vec()));
+        });
+
+        let client_config = client_config_trusting_with_alpn(
+            ca.cert_pem(),
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+        );
+        let connector = tokio_rustls::TlsConnector::from(client_config);
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let server_name = ServerName::try_from("api.example.com").unwrap();
+        let tls = connector.connect(server_name, tcp).await.unwrap();
+        let negotiated = tls.get_ref().1.alpn_protocol().map(|p| p.to_vec());
+        assert_eq!(negotiated, Some(b"h2".to_vec()));
+
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn alpn_negotiates_h1_when_client_only_offers_h1() {
+        let ca = Arc::new(EphemeralCa::generate().unwrap());
+        let cache = Arc::new(CertCache::new(Arc::clone(&ca)));
+        let server_config = build_server_config(Arc::clone(&cache), true).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let acceptor = tokio_rustls::TlsAcceptor::from(server_config);
+            let tls = acceptor.accept(stream).await.unwrap();
+            let negotiated = tls.get_ref().1.alpn_protocol().map(|p| p.to_vec());
+            assert_eq!(negotiated, Some(b"http/1.1".to_vec()));
+        });
+
+        let client_config =
+            client_config_trusting_with_alpn(ca.cert_pem(), vec![b"http/1.1".to_vec()]);
+        let connector = tokio_rustls::TlsConnector::from(client_config);
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let server_name = ServerName::try_from("api.example.com").unwrap();
+        let tls = connector.connect(server_name, tcp).await.unwrap();
+        let negotiated = tls.get_ref().1.alpn_protocol().map(|p| p.to_vec());
+        assert_eq!(negotiated, Some(b"http/1.1".to_vec()));
+
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn alpn_negotiates_h2_when_client_only_offers_h2() {
+        let ca = Arc::new(EphemeralCa::generate().unwrap());
+        let cache = Arc::new(CertCache::new(Arc::clone(&ca)));
+        let server_config = build_server_config(Arc::clone(&cache), true).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let acceptor = tokio_rustls::TlsAcceptor::from(server_config);
+            let tls = acceptor.accept(stream).await.unwrap();
+            let negotiated = tls.get_ref().1.alpn_protocol().map(|p| p.to_vec());
+            assert_eq!(negotiated, Some(b"h2".to_vec()));
+        });
+
+        let client_config = client_config_trusting_with_alpn(ca.cert_pem(), vec![b"h2".to_vec()]);
+        let connector = tokio_rustls::TlsConnector::from(client_config);
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let server_name = ServerName::try_from("api.example.com").unwrap();
+        let tls = connector.connect(server_name, tcp).await.unwrap();
+        let negotiated = tls.get_ref().1.alpn_protocol().map(|p| p.to_vec());
+        assert_eq!(negotiated, Some(b"h2".to_vec()));
 
         server_task.await.unwrap();
     }

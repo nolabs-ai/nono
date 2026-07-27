@@ -19,7 +19,7 @@ use crate::error::{NonoError, Result};
 
 use super::types::{
     BlockedPublisher, Blocklist, BlocklistEntry, Enforcement, Publisher, SignerIdentity,
-    TrustPolicy, VerificationOutcome, VerificationResult,
+    TRUST_POLICY_PREDICATE, TrustPolicy, VerificationOutcome, VerificationResult,
 };
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -135,7 +135,8 @@ pub fn merge_policies(policies: &[TrustPolicy]) -> Result<TrustPolicy> {
     }
 
     Ok(TrustPolicy {
-        version: policies.iter().map(|p| p.version).max().unwrap_or(1),
+        predicate: Some(TRUST_POLICY_PREDICATE.to_string()),
+        version: None,
         includes: merged_patterns,
         files: merged_files,
         publishers: merged_publishers,
@@ -400,7 +401,8 @@ mod tests {
         blocklist_digests: Vec<BlocklistEntry>,
     ) -> TrustPolicy {
         TrustPolicy {
-            version: 1,
+            predicate: Some(TRUST_POLICY_PREDICATE.to_string()),
+            version: None,
             includes: vec!["SKILLS*".to_string(), "CLAUDE*".to_string()],
             files: vec![],
             publishers,
@@ -452,7 +454,7 @@ mod tests {
             "enforcement": "deny"
         }"#;
         let policy = load_policy_from_str(json).unwrap();
-        assert_eq!(policy.version, 1);
+        assert_eq!(policy.version, Some(1));
         assert_eq!(policy.enforcement, Enforcement::Deny);
         assert_eq!(policy.includes.len(), 1);
     }
@@ -657,14 +659,12 @@ mod tests {
     }
 
     #[test]
-    fn merge_rejects_unsupported_version() {
+    fn merge_ignores_legacy_version_field() {
+        // version is deprecated — merge succeeds regardless of its value.
         let p1 = make_policy(Enforcement::Audit, vec![], vec![]);
         let mut p2 = make_policy(Enforcement::Audit, vec![], vec![]);
-        p2.version = 99;
-        let result = merge_policies(&[p1, p2]);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("unsupported trust policy version"));
+        p2.version = Some(99);
+        assert!(merge_policies(&[p1, p2]).is_ok());
     }
 
     // -----------------------------------------------------------------------

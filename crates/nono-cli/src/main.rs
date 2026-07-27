@@ -34,6 +34,8 @@ mod launch_runtime;
 mod learn;
 mod learn_runtime;
 mod legacy_cleanup;
+#[cfg(target_os = "linux")]
+mod lineage_cgroup;
 #[cfg(target_os = "macos")]
 mod macos_trust;
 mod migration;
@@ -51,11 +53,14 @@ mod profile_cmd;
 mod profile_runtime;
 mod profile_save_runtime;
 mod protected_paths;
+mod proxy_command;
 mod proxy_runtime;
 mod pty_proxy;
 mod pull_ui;
 mod query_ext;
 mod registry_client;
+#[cfg(target_os = "linux")]
+mod resource_cgroup;
 mod rollback_commands;
 mod rollback_preflight;
 mod rollback_runtime;
@@ -105,7 +110,6 @@ const DETACHED_CWD_PROMPT_RESPONSE_ENV: &str = "NONO_DETACHED_CWD_PROMPT_RESPONS
 const DETACHED_SESSION_ID_ENV: &str = "NONO_DETACHED_SESSION_ID";
 
 pub(crate) use launch_runtime::rollback_base_exclusions;
-pub(crate) use proxy_runtime::merge_dedup_ports;
 
 fn main() {
     if tool_sandbox::maybe_run_internal_tool_sandbox_entrypoint() {
@@ -268,16 +272,18 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_effective_proxy_settings_allow_net_clears_profile_proxy_state() {
+    fn test_resolve_effective_proxy_settings_allow_net_clears_profile_proxy_state() -> Result<()> {
         let args = SandboxArgs {
             allow_net: true,
             ..sandbox_args()
         };
         let prepared = PreparedSandbox {
             caps: CapabilitySet::new(),
+            deny_paths: Vec::new(),
             secrets: Vec::new(),
             profile_display_name: None,
             command_policies: None,
+            resolved_command_binaries: None,
             session_hooks: crate::profile::SessionHooks::default(),
             rollback_exclude_patterns: Vec::new(),
             rollback_exclude_globs: Vec::new(),
@@ -285,10 +291,14 @@ mod tests {
             allow_domain: vec![profile::AllowDomainEntry::Plain(
                 "docs.python.org".to_string(),
             )],
+            deny_domain: Vec::new(),
             credentials: vec!["github".to_string()],
             custom_credentials: std::collections::HashMap::new(),
             credential_capture: std::collections::HashMap::new(),
+            credential_providers: std::collections::HashMap::new(),
+            credential_routes: Vec::new(),
             tls_intercept: None,
+            no_proxy: vec!["redis".to_string()],
             upstream_proxy: None,
             upstream_bypass: Vec::new(),
             listen_ports: Vec::new(),
@@ -297,8 +307,14 @@ mod tests {
             wsl2_proxy_policy: crate::profile::Wsl2ProxyPolicy::Error,
             #[cfg(target_os = "linux")]
             af_unix_mediation: crate::profile::LinuxAfUnixMediation::Off,
+            #[cfg(target_os = "linux")]
+            sandbox_policy: crate::profile::LinuxSandboxPolicy::Auto,
+            #[cfg(target_os = "linux")]
+            explicit_sandbox_policy: None,
             allow_launch_services_active: false,
             allow_gpu_active: false,
+            #[cfg(target_os = "linux")]
+            proc_comm_notify: false,
             open_url_origins: Vec::new(),
             open_url_allow_localhost: false,
             bypass_protection_paths: Vec::new(),
@@ -307,23 +323,27 @@ mod tests {
             allowed_env_vars: None,
             denied_env_vars: None,
             set_vars: None,
-            network_block_requested: false,
+            profile_network_block: false,
+            allow_http2_requested: false,
         };
 
-        let effective = resolve_effective_proxy_settings(&args, &prepared);
+        let effective = resolve_effective_proxy_settings(&args, &prepared)?;
 
         assert_eq!(
             effective,
             EffectiveProxySettings {
                 network_profile: None,
                 allow_domain: Vec::new(),
+                deny_domain: Vec::new(),
                 credentials: Vec::new(),
+                no_proxy: Vec::new(),
             }
         );
+        Ok(())
     }
 
     #[test]
-    fn test_resolve_effective_proxy_settings_merges_cli_and_profile() {
+    fn test_resolve_effective_proxy_settings_merges_cli_and_profile() -> Result<()> {
         let args = SandboxArgs {
             network_profile: Some("minimal".to_string()),
             allow_proxy: vec!["example.com".to_string()],
@@ -332,9 +352,11 @@ mod tests {
         };
         let prepared = PreparedSandbox {
             caps: CapabilitySet::new(),
+            deny_paths: Vec::new(),
             secrets: Vec::new(),
             profile_display_name: None,
             command_policies: None,
+            resolved_command_binaries: None,
             session_hooks: crate::profile::SessionHooks::default(),
             rollback_exclude_patterns: Vec::new(),
             rollback_exclude_globs: Vec::new(),
@@ -342,10 +364,14 @@ mod tests {
             allow_domain: vec![profile::AllowDomainEntry::Plain(
                 "docs.python.org".to_string(),
             )],
+            deny_domain: Vec::new(),
             credentials: vec!["github".to_string()],
             custom_credentials: std::collections::HashMap::new(),
             credential_capture: std::collections::HashMap::new(),
+            credential_providers: std::collections::HashMap::new(),
+            credential_routes: Vec::new(),
             tls_intercept: None,
+            no_proxy: vec!["redis".to_string()],
             upstream_proxy: None,
             upstream_bypass: Vec::new(),
             listen_ports: Vec::new(),
@@ -354,8 +380,14 @@ mod tests {
             wsl2_proxy_policy: crate::profile::Wsl2ProxyPolicy::Error,
             #[cfg(target_os = "linux")]
             af_unix_mediation: crate::profile::LinuxAfUnixMediation::Off,
+            #[cfg(target_os = "linux")]
+            sandbox_policy: crate::profile::LinuxSandboxPolicy::Auto,
+            #[cfg(target_os = "linux")]
+            explicit_sandbox_policy: None,
             allow_launch_services_active: false,
             allow_gpu_active: false,
+            #[cfg(target_os = "linux")]
+            proc_comm_notify: false,
             open_url_origins: Vec::new(),
             open_url_allow_localhost: false,
             bypass_protection_paths: Vec::new(),
@@ -364,10 +396,11 @@ mod tests {
             allowed_env_vars: None,
             denied_env_vars: None,
             set_vars: None,
-            network_block_requested: false,
+            profile_network_block: false,
+            allow_http2_requested: false,
         };
 
-        let effective = resolve_effective_proxy_settings(&args, &prepared);
+        let effective = resolve_effective_proxy_settings(&args, &prepared)?;
 
         assert_eq!(
             effective,
@@ -377,9 +410,12 @@ mod tests {
                     profile::AllowDomainEntry::Plain("docs.python.org".to_string()),
                     profile::AllowDomainEntry::Plain("example.com".to_string()),
                 ],
+                deny_domain: Vec::new(),
                 credentials: vec!["github".to_string(), "openai".to_string()],
+                no_proxy: vec!["redis".to_string()],
             }
         );
+        Ok(())
     }
 
     #[test]
@@ -475,7 +511,7 @@ mod tests {
         let helper = Cli::parse_from([
             "nono",
             "pack-update-hint-helper",
-            "always-further/claude",
+            "nolabs-ai/claude",
             "1.0.0",
         ]);
         assert!(!allows_pre_exec_update_check(&helper.command));
@@ -658,13 +694,13 @@ mod tests {
 
         let result = maybe_enable_gpu(&mut caps, true, true);
 
-        // On a GPU machine: Ok(true) with fs capabilities added.
+        // On a GPU machine: Ok(active=true) with fs capabilities added.
         // On a non-GPU CI machine: Err mentioning "no GPU devices found".
         // Either outcome is correct. What must NOT happen is an error about
         // /dev/dri specifically, which would break NVIDIA/ROCm-only setups.
         match result {
-            Ok(enabled) => {
-                assert!(enabled, "should be active when devices are found");
+            Ok(activation) => {
+                assert!(activation.active, "should be active when devices are found");
                 assert!(
                     caps.has_fs(),
                     "should have granted fs capabilities for GPU devices"

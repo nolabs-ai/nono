@@ -82,4 +82,4 @@ The `PKGBUILD` and `update.sh` were originally written and maintained by
 [sarovin86](https://aur.archlinux.org/account/sarovin86) in the
 [sarovin/nono-ai-bin](https://github.com/sarovin/nono-ai-bin) repository, and
 were moved here (with small adaptations for CI integration) as part of
-[#917](https://github.com/always-further/nono/issues/917).
+[#917](https://github.com/nolabs-ai/nono/issues/917).

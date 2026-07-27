@@ -1,0 +1,635 @@
+---
+title: Sandboxed OAuth Logins
+description: Let coding agents run OAuth login flows while the sandbox only receives phantom tokens
+---
+
+Some coding agents do not use static API keys. They run an OAuth login flow,
+receive access and refresh tokens, and store those tokens locally for later API
+calls.
+
+That creates a difficult sandboxing problem:
+
+- The agent must be allowed to run `/login`, `auth login`, or a device-code flow.
+- The real OAuth token response must not become readable by the sandboxed agent.
+- Later API calls still need to authenticate successfully.
+
+Sandboxed OAuth logins solve this by letting the login happen inside the
+sandbox while rewriting real token material before it reaches the agent.
+
+```
+OAuth provider  ->  nono proxy  ->  sandboxed agent
+real tokens         stores real      sees nono_<64hex> phantoms
+                    returns phantom
+```
+
+The agent stores and reuses phantom tokens. When it later calls the provider's
+API through the nono proxy, the proxy resolves the phantom back to the real
+token only for the declared API route.
+
+## When to use this
+
+Use sandboxed OAuth logins when all of these are true:
+
+- The tool has an interactive OAuth login flow.
+- The tool needs to persist a session for future runs.
+- You do not want to grant the sandbox access to raw OAuth tokens, API keys, or
+  host credential stores just so login works.
+
+Examples include coding agents such as Codex and Claude Code when they are
+logged in with a user account rather than a manually supplied API key.
+
+If you already have a static API key and the client can use a configurable base
+URL, start with [Credential Injection](/cli/features/credential-injection)
+instead. It is simpler.
+
+## What the sandbox sees
+
+The sandbox sees values shaped like credentials, but they are not credentials:
+
+```text
+access_token  = nono_<64hex>
+refresh_token = nono_<64hex>
+id_token      = eyJ...<synthetic JWT-shaped phantom>...
+```
+
+The real token material is stored outside the sandbox in nono's OAuth capture
+store. The sandbox cannot redeem a phantom directly with the provider. A
+phantom only works when it is sent back through a matching nono proxy route.
+
+<Note>
+  A JWT-shaped phantom is still a phantom. It exists for clients that locally
+  parse `id_token` as a JWT. The payload is synthetic and must not contain
+  provider-specific secrets. Use `jwt` only for fields the client parses
+  locally and does not later send as a bearer token.
+</Note>
+
+## The simplest profile
+
+Start with a profile that allows the tool to run normally and enables network
+access. Save this as `~/.config/nono/profiles/my-agent-oauth.json`.
+
+This example shows only the OAuth capture pieces:
+
+```json
+{
+  "extends": "default",
+  "meta": {
+    "name": "my-agent-oauth"
+  },
+  "network": {
+    "block": false
+  },
+  "credential_providers": {
+    "my_agent": {
+      "type": "oauth_capture",
+      "token_endpoints": [
+        {
+          "host": "https://auth.example.com",
+          "path": "/oauth/token",
+          "response_fields": [
+            { "path": "access_token", "kind": "opaque" },
+            { "path": "refresh_token", "kind": "opaque" }
+          ],
+          "request_body": "auto",
+          "request_nonce_fields": ["refresh_token"]
+        }
+      ],
+      "api_hosts": [
+        "https://api.example.com"
+      ]
+    }
+  },
+  "credential_routes": [
+    {
+      "name": "my_agent_api",
+      "provider": "my_agent"
+    }
+  ]
+}
+```
+
+Check that nono can load it:
+
+```bash
+nono profile show my-agent-oauth --format profile
+```
+
+Run the login command through that profile:
+
+```bash
+RUST_LOG=nono_proxy::oauth_capture=debug,nono_proxy::tls_intercept=debug \
+nono run --profile my-agent-oauth --allow-cwd -- my-agent login
+```
+
+Look for these log lines:
+
+```text
+configured OAuth capture endpoint provider=my_agent ...
+matched OAuth capture endpoint provider=my_agent ...
+rewrote OAuth token response fields to phantoms provider=my_agent ...
+```
+
+If you see those, the token endpoint response was intercepted and rewritten
+before the sandboxed process received it.
+
+## How the pieces fit
+
+### `credential_providers`
+
+A provider describes where login tokens come from and which API origins may use
+the resulting phantoms.
+
+```json
+"credential_providers": {
+  "my_agent": {
+    "type": "oauth_capture",
+    "token_endpoints": [],
+    "api_hosts": []
+  }
+}
+```
+
+Provider names are local to the profile. They are not built-in Rust provider
+names. Packs and local profiles can define their own providers without changing
+nono.
+
+### `token_endpoints`
+
+Each token endpoint is an HTTPS origin plus an absolute path. Path matching is
+exact after the query string is removed, so configure every token-bearing path
+the client may use.
+
+```json
+{
+  "host": "https://auth.example.com",
+  "path": "/oauth/token"
+}
+```
+
+If a provider uses more than one token endpoint, list each one. Device-code
+flows often poll one endpoint and then exchange at another.
+
+For safety, nono also inspects responses from configured capture hosts. If an
+unmatched path or error response contains common OAuth token fields such as
+`access_token`, `refresh_token`, or `id_token`, nono fails closed instead of
+streaming real token material back to the sandbox. This is a backstop, not
+configuration discovery; use debug logs to add the correct `token_endpoints` and
+`response_fields`.
+
+### `response_fields`
+
+`response_fields` declares which JSON fields contain real token material.
+
+```json
+"response_fields": [
+  { "path": "access_token", "kind": "opaque" },
+  { "path": "refresh_token", "kind": "opaque" },
+  { "path": "id_token", "kind": "jwt" }
+]
+```
+
+Use `opaque` for normal bearer tokens and refresh tokens. Use `jwt` only when
+the client locally parses that field as a JWT, usually `id_token`. Do not mark
+an access token as `jwt` if the client will later resend the whole JWT as
+`Authorization: Bearer ...`; the synthetic value is not a provider-valid JWT.
+
+### `request_body`
+
+When the client refreshes or exchanges tokens, it may send the phantom back to
+the token endpoint. nono must resolve that phantom before forwarding upstream.
+
+`request_body` controls how nono parses the outgoing token request:
+
+| Value | Use when |
+|-------|----------|
+| `auto` | You are not sure, or the provider may use JSON or form bodies. |
+| `json` | Token requests are JSON bodies. |
+| `form` | Token requests are `application/x-www-form-urlencoded` bodies. |
+
+Use `auto` first unless you know the client requires a specific format.
+
+### `request_nonce_fields`
+
+These are request fields where nono should look for phantoms before forwarding
+a token refresh or exchange request.
+
+```json
+"request_nonce_fields": ["refresh_token"]
+```
+
+For JSON bodies, dotted paths are supported. For form bodies, use top-level
+field names.
+
+### `api_hosts` and `credential_routes`
+
+`api_hosts` declares where phantoms may be resolved:
+
+```json
+"api_hosts": ["https://api.example.com"]
+```
+
+`credential_routes` binds a provider to one or more proxy routes:
+
+```json
+"credential_routes": [
+  {
+    "name": "my_agent_api",
+    "provider": "my_agent"
+  }
+]
+```
+
+Only those routes can resolve the provider's phantoms. A random process cannot
+take `nono_<64hex>` and use it directly against the provider.
+
+## Add endpoint policy
+
+Once the basic flow works, restrict what the logged-in agent can call. For
+example, allow only message creation:
+
+```json
+"credential_routes": [
+  {
+    "name": "my_agent_api",
+    "provider": "my_agent",
+    "endpoint_policy": {
+      "default": { "decision": "deny" },
+      "allow": [
+        { "method": "POST", "path": "/v1/messages" }
+      ]
+    }
+  }
+]
+```
+
+This is the same endpoint policy model used by normal proxy credential routes.
+
+## Add client-specific CA variables
+
+OAuth capture uses TLS interception for the configured token hosts. nono writes
+a temporary trust bundle and sets the common CA environment variables.
+
+Some clients need their own CA variable. Add it in the profile:
+
+```json
+"network": {
+  "block": false,
+  "tls_intercept": {
+    "ca_env_vars": ["CODEX_CA_CERTIFICATE"]
+  }
+}
+```
+
+This does not add a new trust root globally. It only tells the sandboxed child
+where the per-session nono trust bundle is.
+
+## Add credential-store detection
+
+Some tools persist auth state in a known JSON file or credential-store entry.
+You can describe that store so nono can create needed parent directories and
+detect whether expected fields contain phantoms.
+
+File JSON example:
+
+```json
+"credential_store": {
+  "type": "file_json",
+  "path": "$HOME/.my-agent/auth.json",
+  "phantom_fields": [
+    "tokens.access_token",
+    "tokens.refresh_token"
+  ]
+}
+```
+
+Keychain JSON example:
+
+```json
+"credential_store": {
+  "type": "keychain_json",
+  "service": "My Agent Credentials",
+  "account_candidates": ["unknown", "$USER", "my-agent-user"],
+  "phantom_fields": [
+    "oauth.accessToken",
+    "oauth.refreshToken"
+  ]
+}
+```
+
+<Warning>
+  Do not grant broad Keychain access just to make OAuth work. The goal is that
+  the agent persists phantoms, not raw tokens. If a client requires a native
+  credential store, verify the stored fields are phantom-shaped before relying
+  on the profile.
+</Warning>
+
+The OAuth capture store itself lives outside the sandbox under nono's state
+directory. It stores the real token material needed to resolve phantoms, with
+owner-only permissions. Entries are retained for up to 90 days and capped at
+4096 phantoms. Treat this as plaintext-at-rest under your user account: protect
+the state directory the same way you protect other local credential stores.
+
+## Add helper commands
+
+Helpers document how a user should check login state or start login/logout.
+They are command arrays, not shell strings:
+
+```json
+"helpers": {
+  "status": ["my-agent", "auth", "status"],
+  "login": ["my-agent", "auth", "login"],
+  "logout": ["my-agent", "auth", "logout"]
+}
+```
+
+Helpers are optional. They are useful in profiles and packs because a UI or TUI
+can show the right lifecycle command without hardcoding provider names.
+
+## Codex-style device auth
+
+Codex device auth uses OpenAI auth endpoints and may parse `id_token` locally as
+a JWT. A profile for that flow needs:
+
+- both token endpoints
+- JWT-shaped phantom output for `id_token`
+- `form` request body parsing
+- Codex's CA bundle variable
+
+Save this as `~/.config/nono/profiles/codex-oauth.json`:
+
+```json
+{
+  "extends": "default",
+  "meta": {
+    "name": "codex-oauth"
+  },
+  "filesystem": {
+    "allow": [
+      "$HOME/.codex-nono-oauth",
+      "$HOME/.agents"
+    ]
+  },
+  "environment": {
+    "deny_vars": [
+      "CODEX_*",
+      "OPENAI_*"
+    ],
+    "set_vars": {
+      "CODEX_HOME": "$HOME/.codex-nono-oauth"
+    }
+  },
+  "network": {
+    "block": false,
+    "tls_intercept": {
+      "ca_env_vars": ["CODEX_CA_CERTIFICATE"]
+    }
+  },
+  "credential_providers": {
+    "codex_openai": {
+      "type": "oauth_capture",
+      "token_endpoints": [
+        {
+          "host": "https://auth.openai.com",
+          "path": "/api/accounts/deviceauth/token",
+          "response_fields": [
+            { "path": "access_token", "kind": "opaque" },
+            { "path": "refresh_token", "kind": "opaque" },
+            { "path": "id_token", "kind": "jwt" }
+          ],
+          "request_body": "form",
+          "request_nonce_fields": ["refresh_token"]
+        },
+        {
+          "host": "https://auth.openai.com",
+          "path": "/oauth/token",
+          "response_fields": [
+            { "path": "access_token", "kind": "opaque" },
+            { "path": "refresh_token", "kind": "opaque" },
+            { "path": "id_token", "kind": "jwt" }
+          ],
+          "request_body": "form",
+          "request_nonce_fields": ["refresh_token"]
+        }
+      ],
+      "api_hosts": [
+        "https://api.openai.com",
+        "https://auth.openai.com"
+      ],
+      "credential_store": {
+        "type": "file_json",
+        "path": "$HOME/.codex-nono-oauth/auth.json",
+        "phantom_fields": [
+          "tokens.id_token",
+          "tokens.access_token",
+          "tokens.refresh_token"
+        ]
+      },
+      "helpers": {
+        "status": ["codex", "login", "status"],
+        "login": ["codex", "login"],
+        "logout": ["codex", "logout"]
+      }
+    }
+  },
+  "credential_routes": [
+    {
+      "name": "codex_openai_oauth",
+      "provider": "codex_openai"
+    }
+  ]
+}
+```
+
+Validate it:
+
+```bash
+nono profile show codex-oauth --format profile
+```
+
+Run device auth:
+
+```bash
+RUST_LOG=nono_proxy::oauth_capture=debug,nono_proxy::tls_intercept=debug \
+nono run --profile codex-oauth --allow-cwd -- codex login --device-auth
+```
+
+Expected evidence:
+
+```text
+matched OAuth capture endpoint provider=codex_openai ... path=/api/accounts/deviceauth/token
+matched OAuth capture endpoint provider=codex_openai ... path=/oauth/token
+rewrote OAuth token response fields to phantoms provider=codex_openai fields=3
+Successfully logged in
+```
+
+## Claude Code-style OAuth
+
+Claude Code's OAuth flow exchanges tokens through Claude hosts and then calls
+Anthropic API hosts. A profile for that flow usually needs:
+
+- token endpoints for `claude.ai`, `claude.com`, and `platform.claude.com`
+- API host access for `https://api.anthropic.com`
+- browser opening for the login command
+- client state paths such as `~/.claude`
+
+In practice, extend your normal Claude Code profile and add an OAuth capture
+provider. The provider section looks like this:
+
+```json
+{
+  "credential_providers": {
+    "claude_code": {
+      "type": "oauth_capture",
+      "token_endpoints": [
+        {
+          "host": "https://platform.claude.com",
+          "path": "/v1/oauth/token",
+          "response_fields": [
+            { "path": "access_token", "kind": "opaque" },
+            { "path": "refresh_token", "kind": "opaque" }
+          ],
+          "request_body": "auto",
+          "request_nonce_fields": ["refresh_token"]
+        }
+      ],
+      "api_hosts": [
+        "https://api.anthropic.com"
+      ],
+      "helpers": {
+        "status": ["claude", "auth", "status", "--json"],
+        "login": ["claude", "auth", "login"],
+        "logout": ["claude", "auth", "logout"]
+      }
+    }
+  },
+  "credential_routes": [
+    {
+      "name": "claude_code_oauth",
+      "provider": "claude_code"
+    }
+  ]
+}
+```
+
+Run login with browser-opening enabled:
+
+```bash
+RUST_LOG=nono_proxy::oauth_capture=debug,nono_proxy::tls_intercept=debug \
+nono run --profile claude-oauth --allow-cwd --allow-launch-services -- claude auth login
+```
+
+After login, run normal sessions without browser-opening flags:
+
+```bash
+RUST_LOG=nono_proxy::oauth_capture=debug,nono_proxy::tls_intercept=debug \
+nono run --profile claude-oauth --allow-cwd -- claude -p --no-session-persistence "reply with ok"
+```
+
+Expected evidence:
+
+```text
+loaded persisted OAuth phantom mappings ...
+resolved OAuth phantom token for admitted consumer ...
+```
+
+## Verify what was stored
+
+Do not print token values. Check only shape.
+
+For a JSON auth file:
+
+```bash
+jq 'paths(scalars) as $p
+  | select(($p|join("."))|test("token|auth|id"; "i"))
+  | {path:($p|join(".")), type:(getpath($p)|type)}' ~/.my-agent/auth.json
+```
+
+For logs, useful proof looks like:
+
+```text
+rewrote OAuth token response fields to phantoms provider=...
+resolved OAuth phantom token for admitted consumer consumer=...
+```
+
+Avoid logs that dump request bodies, response bodies, or full environment
+variables. Those can contain real credentials from unrelated tools.
+
+## Troubleshooting
+
+### Token endpoint is not matched
+
+Enable debug logging:
+
+```bash
+RUST_LOG=nono_proxy::oauth_capture=debug,nono_proxy::tls_intercept=debug \
+nono run --profile my-agent-oauth -- my-agent login
+```
+
+Look for:
+
+```text
+OAuth capture host request did not match configured endpoint path
+```
+
+Add the shown path to `token_endpoints`.
+
+### The client fails TLS verification
+
+Add the client's CA environment variable under
+`network.tls_intercept.ca_env_vars`. Keep the standard CA variables in place;
+this setting adds client-specific names.
+
+### The client says an ID token is invalid
+
+If the failing field is `id_token`, change its response field kind from
+`opaque` to `jwt`:
+
+```json
+{ "path": "id_token", "kind": "jwt" }
+```
+
+Do not add provider-specific real claims unless the profile schema explicitly
+supports that. The JWT-shaped value should remain synthetic.
+
+### Refresh fails after login
+
+Set `request_body` to the format the client actually uses:
+
+```json
+"request_body": "form"
+```
+
+or:
+
+```json
+"request_body": "json"
+```
+
+Then rerun with debug logging and confirm that refresh requests hit the
+configured token endpoint.
+
+### The client tries to read Keychain or another credential store
+
+Do not grant broad credential-store access as the first fix. First verify that
+the OAuth token response was captured and that the client stored phantoms. If
+the client truly requires a native credential store for session metadata, grant
+only the minimum client-specific paths or system services and confirm stored
+token fields remain phantom-shaped.
+
+## Security model
+
+Sandboxed OAuth login is designed around three boundaries:
+
+1. Real OAuth token responses are rewritten before the sandbox sees them.
+2. Phantoms resolve only through admitted proxy consumers.
+3. Token capture endpoints fail closed when nono cannot safely rewrite the
+   response.
+
+The unmatched-response backstop looks for common OAuth token field names. For
+providers that return token material under unusual names, configure the exact
+token endpoint and exhaustive `response_fields`; do not rely on the backstop as
+the primary control.
+
+That means a successful login should not give the agent a transferable bearer
+token. The agent can keep working through the nono-mediated route, but it cannot
+take `nono_<64hex>` and authenticate directly with the provider.

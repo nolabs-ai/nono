@@ -5433,9 +5433,16 @@ mod tests {
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
             #[cfg(target_os = "linux")]
+            proxy_bind_port_ranges: Vec::new(),
+            #[cfg(target_os = "linux")]
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
-            linux_network_notify_mode: LinuxNetworkNotifyMode::ProxyOnly,
+            seccomp_policy: SeccompPolicy {
+                capability_elevation: false,
+                proxy_fallback: false,
+                af_unix_mediation: false,
+                proc_comm_notify: false,
+            },
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             tool_sandbox_runtime: None,
         };

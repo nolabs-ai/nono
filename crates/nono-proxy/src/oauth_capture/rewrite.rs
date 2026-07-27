@@ -1,8 +1,8 @@
 use super::OAuthCaptureStore;
 use super::endpoint::{LoadedOAuthEndpoint, ResponseFieldFormat, provider_consumer};
-use super::jwt::jwt_shaped_phantom;
 use crate::config::OAuthTokenRequestBodyFormat;
 use crate::error::{ProxyError, Result};
+use crate::jwt_phantom::jwt_shaped_phantom;
 use crate::token::NonceResolver;
 use serde_json::Value;
 use std::collections::HashSet;

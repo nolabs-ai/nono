@@ -2090,6 +2090,7 @@ mod tests {
             oauth2: None,
             aws_auth: None,
             spiffe: None,
+            rate_limit: None,
         }];
         let store = RouteStore::load(&routes).await?;
         let host_port = normalize_authority("::1:8080");
@@ -2190,6 +2191,7 @@ mod tests {
             oauth2: None,
             aws_auth: None,
             spiffe: None,
+            rate_limit: None,
         }
     }
 
@@ -2203,6 +2205,35 @@ mod tests {
             .write_all(b"GET /svc/ HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
             .await
             .unwrap();
+        let mut resp = Vec::new();
+        // Read the response head; the upstream is tiny so a single read suffices.
+        let mut buf = [0u8; 1024];
+        if let Ok(n) = client.read(&mut buf).await {
+            resp.extend_from_slice(&buf[..n]);
+        }
+        String::from_utf8_lossy(&resp)
+            .lines()
+            .next()
+            .unwrap_or("")
+            .to_string()
+    }
+
+    /// Send `GET /svc/` through the proxy at `port` with a valid
+    /// `Proxy-Authorization: Basic` header carrying the session `token`, and
+    /// return the status line the proxy wrote back. Standard HTTP clients send
+    /// the session token as `Basic base64("nono:<token>")` userinfo.
+    async fn authenticated_reverse_request(port: u16, token: &str) -> String {
+        let creds = {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode(format!("nono:{token}"))
+        };
+        let request = format!(
+            "GET /svc/ HTTP/1.1\r\nHost: 127.0.0.1\r\nProxy-Authorization: Basic {creds}\r\n\r\n"
+        );
+        let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        client.write_all(request.as_bytes()).await.unwrap();
         let mut resp = Vec::new();
         // Read the response head; the upstream is tiny so a single read suffices.
         let mut buf = [0u8; 1024];
@@ -2239,6 +2270,44 @@ mod tests {
             !status.contains("407") && !status.contains("401"),
             "auth must not be enforced when disabled, got: {status:?}"
         );
+        handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn reverse_proxy_rate_limit_rejects_after_burst() {
+        // A route with a RouteRateLimiter of burst 1 and no delay budget lets
+        // the first request through to the upstream (200) and rejects the
+        // second with 429 without forwarding it. The rate-limit gate sits inside
+        // the `require_auth` branch, so auth must be enabled and each request
+        // must carry a valid session token to reach the limiter.
+        let upstream = spawn_mock_upstream().await;
+        let mut route = declarative_route(&format!("http://{upstream}"));
+        route.rate_limit = Some(crate::config::RouteRateLimitConfig {
+            requests_per_minute: 1,
+            burst: 1,
+            max_delay_secs: 0,
+        });
+        let config = ProxyConfig {
+            routes: vec![route],
+            allowed_hosts: vec!["127.0.0.1".to_string()],
+            require_auth: true,
+            ..Default::default()
+        };
+        let handle = start(config).await.unwrap();
+        let token = handle.token.to_string();
+
+        let first = authenticated_reverse_request(handle.port, &token).await;
+        assert!(
+            first.contains("200"),
+            "first request should reach the upstream, got: {first:?}"
+        );
+
+        let second = authenticated_reverse_request(handle.port, &token).await;
+        assert!(
+            second.contains("429"),
+            "second request should be rate limited with 429, got: {second:?}"
+        );
+
         handle.shutdown();
     }
 
@@ -2397,6 +2466,7 @@ mod tests {
                     oauth2: None,
                     aws_auth: None,
                     spiffe: None,
+                    rate_limit: None,
                 }],
                 intercept_ca_dir: Some(dir.path().to_path_buf()),
                 intercept_ca_env_vars: {
@@ -2474,6 +2544,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                rate_limit: None,
             }],
             intercept_ca_dir: Some(dir.path().to_path_buf()),
             ..Default::default()
@@ -2558,6 +2629,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                rate_limit: None,
             }],
             intercept_ca_dir: Some(missing_dir),
             ..Default::default()
@@ -2607,6 +2679,7 @@ mod tests {
                     oauth2: None,
                     aws_auth: None,
                     spiffe: None,
+                    rate_limit: None,
                 },
                 crate::config::RouteConfig {
                     prefix: "alias".to_string(),
@@ -2628,6 +2701,7 @@ mod tests {
                     oauth2: None,
                     aws_auth: None,
                     spiffe: None,
+                    rate_limit: None,
                 },
             ],
             intercept_ca_dir: Some(dir.path().to_path_buf()),
@@ -2689,6 +2763,7 @@ mod tests {
                     oauth2: None,
                     aws_auth: None,
                     spiffe: None,
+                    rate_limit: None,
                 },
                 // Synthetic endpoint-authorization route for the same upstream.
                 crate::config::RouteConfig {
@@ -2711,6 +2786,7 @@ mod tests {
                     oauth2: None,
                     aws_auth: None,
                     spiffe: None,
+                    rate_limit: None,
                 },
             ],
             intercept_ca_dir: Some(dir.path().to_path_buf()),
@@ -2772,6 +2848,7 @@ mod tests {
                     oauth2: None,
                     aws_auth: None,
                     spiffe: None,
+                    rate_limit: None,
                 },
                 // `_ep_` route on a concrete subdomain covered by the wildcard.
                 crate::config::RouteConfig {
@@ -2794,6 +2871,7 @@ mod tests {
                     oauth2: None,
                     aws_auth: None,
                     spiffe: None,
+                    rate_limit: None,
                 },
             ],
             intercept_ca_dir: Some(dir.path().to_path_buf()),
@@ -2845,6 +2923,7 @@ mod tests {
             oauth2: None,
             aws_auth: None,
             spiffe: None,
+            rate_limit: None,
         };
         let config = ProxyConfig {
             routes: vec![
@@ -2894,6 +2973,7 @@ mod tests {
             oauth2: None,
             aws_auth: None,
             spiffe: None,
+            rate_limit: None,
         };
         let config = ProxyConfig {
             routes: vec![
@@ -3008,6 +3088,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                rate_limit: None,
             }],
             ..Default::default()
         };
@@ -3061,6 +3142,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                rate_limit: None,
             }],
             ..Default::default()
         };
@@ -3123,6 +3205,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                rate_limit: None,
             }],
             ..Default::default()
         };
@@ -3191,6 +3274,7 @@ mod tests {
                     oauth2: None,
                     aws_auth: None,
                     spiffe: None,
+                    rate_limit: None,
                 },
                 crate::config::RouteConfig {
                     prefix: "github".to_string(),
@@ -3212,6 +3296,7 @@ mod tests {
                     oauth2: None,
                     aws_auth: None,
                     spiffe: None,
+                    rate_limit: None,
                 },
             ],
             ..Default::default()
@@ -3282,6 +3367,7 @@ mod tests {
                     credential_format: None,
                     svid_hint: None,
                 }),
+                rate_limit: None,
             }],
             ..Default::default()
         };
@@ -3338,6 +3424,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                rate_limit: None,
             }],
             ..Default::default()
         };
@@ -3375,6 +3462,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                rate_limit: None,
             }],
             ..Default::default()
         };
@@ -3434,6 +3522,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                rate_limit: None,
             }],
             ..Default::default()
         };
@@ -3482,6 +3571,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                rate_limit: None,
             }],
             ..Default::default()
         };
@@ -3756,6 +3846,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                rate_limit: None,
             }],
             ..Default::default()
         };
@@ -3800,6 +3891,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                rate_limit: None,
             }],
             ..Default::default()
         };
@@ -3868,6 +3960,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                rate_limit: None,
             }],
             ..Default::default()
         };
@@ -3906,6 +3999,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                rate_limit: None,
             }],
             ..Default::default()
         };
@@ -3946,6 +4040,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                rate_limit: None,
             }],
             ..Default::default()
         };
@@ -4143,6 +4238,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                rate_limit: None,
             }],
             intercept_ca_dir: Some(dir.path().to_path_buf()),
             ..Default::default()
@@ -4484,6 +4580,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                rate_limit: None,
             }],
             ..ProxyConfig::default()
         };
@@ -4697,6 +4794,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                rate_limit: None,
             }],
             ..Default::default()
         };

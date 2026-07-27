@@ -1896,6 +1896,7 @@ fn collect_tool_sandbox_proxy_grants(
                 .transpose()?,
             aws_auth: None,
             spiffe: None,
+            rate_limit: None,
         };
 
         if let Some(existing) = custom_credentials.get(&grant.name) {
@@ -2512,6 +2513,7 @@ fn synthesize_credential_provider_proxy_config(
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                rate_limit: None,
             });
             consumers_by_provider
                 .entry(route.provider.clone())
@@ -3404,6 +3406,7 @@ mod tests {
                 tls_client_key: None,
                 aws_auth: None,
                 spiffe: None,
+                rate_limit: None,
             },
         );
 
@@ -3892,6 +3895,7 @@ mod tests {
             oauth2: None,
             aws_auth: None,
             spiffe: None,
+            rate_limit: None,
         });
         let credential_env_vars = vec![
             (

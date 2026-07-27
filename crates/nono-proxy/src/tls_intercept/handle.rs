@@ -759,6 +759,41 @@ pub(crate) async fn select_intercept_route<'a>(
             method, path
         ),
     }
+
+    // Route request rate limit (RouteRateLimiter) for the selected route. Gate
+    // the authorized request before credential injection and upstream
+    // forwarding. Both the HTTP/1.1 and h2 intercept paths route through this
+    // function, so a 429 is emitted identically regardless of protocol. A
+    // passthrough selection (no route) has no limiter and is unaffected.
+    if let Some((prefix, route)) = selected
+        && let Some(limiter) = route.rate_limiter.as_ref()
+    {
+        match limiter.acquire() {
+            crate::rate_limit::RateLimitDecision::Proceed { delay } => {
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
+            }
+            crate::rate_limit::RateLimitDecision::Reject => {
+                let reason = "route request rate limit exceeded";
+                warn!("tls_intercept: {} for route '{}'", reason, prefix);
+                audit::log_denied(
+                    audit_log,
+                    audit::ProxyMode::ConnectIntercept,
+                    &audit::EventContext {
+                        route_id: Some(prefix),
+                        upstream: Some(&route.upstream),
+                        ..audit::EventContext::default()
+                    },
+                    host,
+                    port,
+                    reason,
+                );
+                return RouteSelection::Rejected(429);
+            }
+        }
+    }
+
     RouteSelection::Selected(selected)
 }
 
@@ -958,6 +993,7 @@ where
             RouteSelection::Rejected(status) => {
                 let msg = match status {
                     502 => "Bad Gateway",
+                    429 => "Too Many Requests",
                     _ => "Forbidden",
                 };
                 reverse::send_error_generic(tls_stream, status, msg).await?;
@@ -1841,6 +1877,7 @@ mod tests {
             aws_auth: None,
             endpoint_policy: None,
             spiffe: None,
+            rate_limit: None,
         }
     }
 
@@ -1875,6 +1912,7 @@ mod tests {
                 aws_auth: None,
                 endpoint_policy: None,
                 spiffe: None,
+                rate_limit: None,
             }
         }
 
@@ -1910,6 +1948,68 @@ mod tests {
             }
             RouteSelection::Rejected(status) => {
                 panic!("/other must pass through, got rejection with status {status}")
+            }
+        }
+    }
+
+    /// A selected route whose `RouteRateLimiter` has exhausted its burst and has
+    /// no delay budget must reject the request with HTTP 429. The first request
+    /// consumes the single burst token and is selected; the second overshoots
+    /// the empty bucket and is rejected. Both HTTP/1.1 and h2 intercept paths
+    /// route through `select_intercept_route`, so the 429 is emitted identically.
+    #[tokio::test]
+    async fn select_intercept_route_rate_limited_returns_429() {
+        let route = crate::config::RouteConfig {
+            prefix: "limited".to_string(),
+            upstream: "https://example.com".to_string(),
+            credential_key: Some("env://LIMITED_TOKEN".to_string()),
+            inject_mode: crate::config::InjectMode::Header,
+            inject_header: "Authorization".to_string(),
+            credential_format: Some("Bearer {}".to_string()),
+            path_pattern: None,
+            path_replacement: None,
+            query_param_name: None,
+            proxy: None,
+            env_var: None,
+            endpoint_rules: vec![crate::config::EndpointRule {
+                method: "GET".to_string(),
+                path: "/foo".to_string(),
+            }],
+            tls_ca: None,
+            tls_client_cert: None,
+            tls_client_key: None,
+            oauth2: None,
+            aws_auth: None,
+            endpoint_policy: None,
+            spiffe: None,
+            // Burst of 1 with no delay budget: the first request passes, the
+            // second is rejected within the same instant.
+            rate_limit: Some(crate::config::RouteRateLimitConfig {
+                requests_per_minute: 1,
+                burst: 1,
+                max_delay_secs: 0,
+            }),
+        };
+
+        let store = RouteStore::load(&[route]).await.unwrap();
+
+        // First request consumes the single burst token and selects the route.
+        match select_intercept_route(&store, "example.com", 443, "GET", "/foo", None, None).await {
+            RouteSelection::Selected(Some((svc, _))) => assert_eq!(svc, "limited"),
+            RouteSelection::Selected(None) => {
+                panic!("first request must select the limited route, not passthrough")
+            }
+            RouteSelection::Rejected(status) => {
+                panic!("first request must be allowed, got rejection with status {status}")
+            }
+        }
+
+        // Second request within the same instant: bucket empty, zero delay
+        // budget, so it is rejected with HTTP 429.
+        match select_intercept_route(&store, "example.com", 443, "GET", "/foo", None, None).await {
+            RouteSelection::Rejected(status) => assert_eq!(status, 429),
+            RouteSelection::Selected(selected) => {
+                panic!("second request must be rate limited with 429, got Selected({selected:?})")
             }
         }
     }

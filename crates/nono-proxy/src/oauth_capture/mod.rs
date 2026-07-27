@@ -7,7 +7,6 @@
 //! only for admitted consumers on egress.
 
 mod endpoint;
-mod jwt;
 mod persist;
 mod rewrite;
 

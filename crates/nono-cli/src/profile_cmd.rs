@@ -1262,9 +1262,8 @@ fn profile_to_json(
         val["linux"] = serde_json::json!({ "af_unix_mediation": v });
     }
 
-    // Filesystem (canonical schema — `allow`/`read`/`write`/`*_file`/`deny`/
-    // `bypass_protection`). Legacy keys deserialize into these fields via
-    // `deprecated_schema::LegacyPolicyPatch` before reaching `Profile`.
+    // Filesystem (canonical schema). Legacy keys deserialize into these fields
+    // via `deprecated_schema::LegacyPolicyPatch` before reaching `Profile`.
     val["filesystem"] = serde_json::json!({
         "allow": profile.filesystem.allow,
         "read": profile.filesystem.read,
@@ -1272,6 +1271,12 @@ fn profile_to_json(
         "allow_file": profile.filesystem.allow_file,
         "read_file": profile.filesystem.read_file,
         "write_file": profile.filesystem.write_file,
+        "unix_socket": profile.filesystem.unix_socket,
+        "unix_socket_bind": profile.filesystem.unix_socket_bind,
+        "unix_socket_dir": profile.filesystem.unix_socket_dir,
+        "unix_socket_dir_bind": profile.filesystem.unix_socket_dir_bind,
+        "unix_socket_subtree": profile.filesystem.unix_socket_subtree,
+        "unix_socket_subtree_bind": profile.filesystem.unix_socket_subtree_bind,
         "deny": profile.filesystem.deny,
         "bypass_protection": profile.filesystem.bypass_protection,
         "suppress_save_prompt": profile.filesystem.suppress_save_prompt,
@@ -3829,6 +3834,86 @@ mod tests {
         // openclaw extends default, so it should have default's base groups
         let has_deny = profile.groups.include.iter().any(|g| g.contains("deny"));
         assert!(has_deny, "openclaw should inherit deny groups");
+    }
+
+    #[test]
+    fn profile_to_json_includes_inherited_unix_socket_grants()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(
+            dir.path().join("base.json"),
+            r#"{
+                "meta": { "name": "base" },
+                "filesystem": {
+                    "unix_socket": ["$XDG_RUNTIME_DIR/base/connect.sock"],
+                    "unix_socket_bind": ["$XDG_RUNTIME_DIR/base/bind.sock"],
+                    "unix_socket_dir": ["$XDG_RUNTIME_DIR/base/connect"],
+                    "unix_socket_dir_bind": ["$XDG_RUNTIME_DIR/base/bind"],
+                    "unix_socket_subtree": ["$XDG_RUNTIME_DIR/base/connect-tree"],
+                    "unix_socket_subtree_bind": ["$XDG_RUNTIME_DIR/base/bind-tree"]
+                }
+            }"#,
+        )?;
+        let child_path = dir.path().join("child.json");
+        std::fs::write(
+            &child_path,
+            r#"{
+                "extends": "base",
+                "meta": { "name": "child" },
+                "filesystem": {
+                    "unix_socket": ["$XDG_RUNTIME_DIR/child/connect.sock"],
+                    "unix_socket_bind": ["$XDG_RUNTIME_DIR/child/bind.sock"],
+                    "unix_socket_dir": ["$XDG_RUNTIME_DIR/child/connect"],
+                    "unix_socket_dir_bind": ["$XDG_RUNTIME_DIR/child/bind"],
+                    "unix_socket_subtree": ["$XDG_RUNTIME_DIR/child/connect-tree"],
+                    "unix_socket_subtree_bind": ["$XDG_RUNTIME_DIR/child/bind-tree"]
+                }
+            }"#,
+        )?;
+
+        let profile = profile::load_profile_from_path(&child_path)?;
+        let value = profile_to_json("child", &profile, &Some(vec!["base".to_string()]));
+
+        assert_eq!(
+            value["filesystem"]["unix_socket"],
+            serde_json::json!([
+                "$XDG_RUNTIME_DIR/base/connect.sock",
+                "$XDG_RUNTIME_DIR/child/connect.sock"
+            ])
+        );
+        assert_eq!(
+            value["filesystem"]["unix_socket_bind"],
+            serde_json::json!([
+                "$XDG_RUNTIME_DIR/base/bind.sock",
+                "$XDG_RUNTIME_DIR/child/bind.sock"
+            ])
+        );
+        assert_eq!(
+            value["filesystem"]["unix_socket_dir"],
+            serde_json::json!([
+                "$XDG_RUNTIME_DIR/base/connect",
+                "$XDG_RUNTIME_DIR/child/connect"
+            ])
+        );
+        assert_eq!(
+            value["filesystem"]["unix_socket_dir_bind"],
+            serde_json::json!(["$XDG_RUNTIME_DIR/base/bind", "$XDG_RUNTIME_DIR/child/bind"])
+        );
+        assert_eq!(
+            value["filesystem"]["unix_socket_subtree"],
+            serde_json::json!([
+                "$XDG_RUNTIME_DIR/base/connect-tree",
+                "$XDG_RUNTIME_DIR/child/connect-tree"
+            ])
+        );
+        assert_eq!(
+            value["filesystem"]["unix_socket_subtree_bind"],
+            serde_json::json!([
+                "$XDG_RUNTIME_DIR/base/bind-tree",
+                "$XDG_RUNTIME_DIR/child/bind-tree"
+            ])
+        );
+        Ok(())
     }
 
     #[test]

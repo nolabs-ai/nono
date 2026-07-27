@@ -3075,7 +3075,7 @@ fn run_supervisor_loop(
         // Drain reparented orphans; if the primary child was among them,
         // surface its status directly.
         if let Some(status) = reap_reparented_orphans(child) {
-            return Ok((status, denials, ipc_denials));
+            return Ok((status, denials.fs, ipc_denials, denials.url));
         }
 
         match waitpid(child, Some(WaitPidFlag::WNOHANG)) {

@@ -1,5 +1,92 @@
 # Changelog
 
+## [0.70.0] - 2026-07-27
+
+### Bug Fixes
+
+- *(undo)* Skip symlinks when walking snapshots (#1493) ([#1493](https://github.com/nolabs-ai/nono/pull/1493))
+
+- *(registry)* Suppress X-Nono-UUID when update check is opted out (#1508) ([#1508](https://github.com/nolabs-ai/nono/pull/1508))
+
+- *(cli)* Add explicit intercept match predicates (#1364) ([#1364](https://github.com/nolabs-ai/nono/pull/1364))
+
+- *(pty)* Capability-elevation approval prompt PTY handoff (#1254) ([#1254](https://github.com/nolabs-ai/nono/pull/1254))
+
+- *(tool-sandbox)* Clean up runtime dir with sealed shims (#1492) ([#1492](https://github.com/nolabs-ai/nono/pull/1492))
+
+- *(proxy)* Prevent credential from enabling host filter (#1497) ([#1497](https://github.com/nolabs-ai/nono/pull/1497))
+
+- *(cli)* Support SOCKS proxies from environment (#1474) ([#1474](https://github.com/nolabs-ai/nono/pull/1474))
+
+- *(sandbox)* Grant metadata read on $PATH dirs for command resolution (#1455) ([#1455](https://github.com/nolabs-ai/nono/pull/1455))
+
+- *(tool-sandbox)* Grant command interpreter read of its script (#1467) ([#1467](https://github.com/nolabs-ai/nono/pull/1467))
+
+- *(pr-template)* Redundant release note check-box (#1499) ([#1499](https://github.com/nolabs-ai/nono/pull/1499))
+
+- *(tool-sandbox)* Let allow_launch_services reach the open shim on macOS (#1464) ([#1464](https://github.com/nolabs-ai/nono/pull/1464))
+
+- *(policy)* Survive atomic replacement of resolv.conf; report stale … (#1448) ([#1448](https://github.com/nolabs-ai/nono/pull/1448))
+
+- *(tool-sandbox)* Skip missing fs_write_file grants instead of denying (#1452) ([#1452](https://github.com/nolabs-ai/nono/pull/1452))
+
+- *(cli)* Reject upstream proxy with block net (#1392) ([#1392](https://github.com/nolabs-ai/nono/pull/1392))
+
+- *(session)* Route attach socket through symlink ([#1477](https://github.com/nolabs-ai/nono/pull/1477))
+
+- *(tool-sandbox)* Drop trailing newline from captured credential phantoms (#1475) ([#1475](https://github.com/nolabs-ai/nono/pull/1475))
+
+
+### CI/CD
+
+- *(release)* Add macos code signing and notarization (#1483) ([#1483](https://github.com/nolabs-ai/nono/pull/1483))
+
+
+### Dependencies
+
+- *(deps)* Bump hyper from 1.10.1 to 1.11.0 (#1513) ([#1513](https://github.com/nolabs-ai/nono/pull/1513))
+
+- *(deps)* Bump base64 from 0.22.1 to 0.23.0 (#1512) ([#1512](https://github.com/nolabs-ai/nono/pull/1512))
+
+- *(deps)* Bump clap from 4.6.2 to 4.6.4 (#1510) ([#1510](https://github.com/nolabs-ai/nono/pull/1510))
+
+- *(deps)* Bump docker/login-action from 4.4.0 to 4.5.1 (#1511) ([#1511](https://github.com/nolabs-ai/nono/pull/1511))
+
+- *(deps)* Bump actions/checkout from 7.0.0 to 7.0.1 (#1509) ([#1509](https://github.com/nolabs-ai/nono/pull/1509))
+
+- *(deps)* Bump jsonschema from 0.46.10 to 0.48.0 (#1460) ([#1460](https://github.com/nolabs-ai/nono/pull/1460))
+
+- *(deps)* Bump clap from 4.6.1 to 4.6.2 (#1461) ([#1461](https://github.com/nolabs-ai/nono/pull/1461))
+
+- *(deps)* Bump ignore from 0.4.29 to 0.4.30 (#1458) ([#1458](https://github.com/nolabs-ai/nono/pull/1458))
+
+- *(deps)* Bump actions/cache from 5.0.5 to 6.1.0 (#1457) ([#1457](https://github.com/nolabs-ai/nono/pull/1457))
+
+- *(deps)* Bump actions/attest from 4.1.1 to 4.2.0 (#1456) ([#1456](https://github.com/nolabs-ai/nono/pull/1456))
+
+- *(deps)* Bump softprops/action-gh-release from 3.0.1 to 3.0.2 (#1459) ([#1459](https://github.com/nolabs-ai/nono/pull/1459))
+
+
+### Features
+
+- Mediate vault login -method=oidc (custom inject header + per-command open_port) (#1476) ([#1476](https://github.com/nolabs-ai/nono/pull/1476))
+
+- *(cli)* Offer to save denied open-url origins on exit (#1222) ([#1222](https://github.com/nolabs-ai/nono/pull/1222))
+
+- *(proxy)* Add per-route request rate limiting (RouteRateLimiter) (#1428) ([#1428](https://github.com/nolabs-ai/nono/pull/1428))
+
+- *(tool-sandbox)* Add jwt-shaped nonce option for capture intercepts (#1453) ([#1453](https://github.com/nolabs-ai/nono/pull/1453))
+
+
+### Miscellaneous
+
+- Release v0.69.0 (#1449) ([#1449](https://github.com/nolabs-ai/nono/pull/1449))
+
+
+### Testing
+
+- *(nono-cli)* Hermetic git test commit.gpgsign (#1470) ([#1470](https://github.com/nolabs-ai/nono/pull/1470))
+
 ## [0.69.0] - 2026-07-20
 
 ### Bug Fixes

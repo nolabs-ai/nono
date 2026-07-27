@@ -113,7 +113,33 @@ An `intercept` rule may carry an optional `sandbox` (the same object described a
 
 ### Intercept Actions
 
-Each `intercept` entry is `{ "args": [...], "action": { "type": ... } }`. Rules are evaluated in order; the first whose `args` appear as a contiguous sequence in the invocation's arguments wins (an empty `args` is a catch-all). This lets subcommand rules match after command-global options, such as `git -c foo=bar push --force`. Broad single-argument rules like `["--force"]` match anywhere in the invocation, not only at the subcommand position. The `action.type` selects how the matched subcommand is handled:
+Each `intercept` entry selects an invocation with either legacy `args` or an explicit `match` predicate, then applies an `action`. Rules are evaluated in order; the first match wins. Legacy `args` is a contiguous argument sequence matched within the invocation's arguments (an empty `args` is a catch-all). This lets subcommand rules match after command-global options, such as `git -c foo=bar push --force`. Broad single-argument rules like `["--force"]` match anywhere in the invocation, not only at the subcommand position.
+
+Use `match` when a rule needs an explicit predicate instead of a literal `args` window. `match.argv` accepts the same matcher shapes as `invocation_policy`: `exact`, `prefix`, or `contains`. `match.env` checks environment variables after Tool Sandbox environment filtering, so profiles can mediate out-of-band behavior such as `GIT_SSH_COMMAND` without matching raw host environment state.
+
+```jsonc
+{
+  "match": {
+    "argv": { "contains": ["push", "--force"] }
+  },
+  "action": { "type": "approve" }
+}
+```
+
+```jsonc
+{
+  "match": {
+    "env": {
+      "GIT_SSH_COMMAND": { "equals": "ssh -i /tmp/fake_key" }
+    }
+  },
+  "action": { "type": "approve" }
+}
+```
+
+`match` is still a predicate over the argv and env that nono observes. It does not perform command-specific semantic normalization such as `--flag=value` versus `--flag value`, short versus long aliases (`-f` versus `--force`), repeated or duplicate flag folding, flag-order canonicalization, or git-specific parsing. It also does not expand environment references embedded inside argv tokens. If a shell expands `$FOO` before `exec`, nono sees the expanded argv; if a caller passes the literal token `$FOO`, nono matches that literal token.
+
+The `action.type` selects how the matched subcommand is handled:
 
 | `action.type` | Behavior |
 |---|---|

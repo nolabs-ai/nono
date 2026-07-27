@@ -203,7 +203,23 @@ async fn exchange_token(
     let scheme = parsed.scheme();
     let is_https = match scheme {
         "https" => true,
-        "http" => false,
+        "http" => {
+            // HTTP is only permitted for loopback addresses (testing / local
+            // mock servers). Sending a JWT-SVID or client_secret over plaintext
+            // HTTP to a non-loopback host exposes the credential on the network.
+            let is_loopback = parsed.host_str().is_some_and(|h| {
+                h == "localhost"
+                    || h.parse::<std::net::IpAddr>()
+                        .is_ok_and(|ip| ip.is_loopback())
+            });
+            if !is_loopback {
+                return Err(ProxyError::OAuth2Exchange(format!(
+                    "token_url '{}' must use https:// (http:// is only permitted for loopback addresses)",
+                    config.token_url
+                )));
+            }
+            false
+        }
         other => {
             return Err(ProxyError::OAuth2Exchange(format!(
                 "unsupported scheme '{}' in token_url",
@@ -403,6 +419,278 @@ fn parse_token_response(json: &str) -> Result<(Zeroizing<String>, Duration)> {
         Zeroizing::new(access_token.to_string()),
         Duration::from_secs(expires_in_secs),
     ))
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// SPIFFE JWT-SVID client assertion token cache
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Like [`TokenCache`] but uses a SPIFFE JWT-SVID as the OAuth2 `client_assertion`
+/// instead of a client_id/secret pair. Exchanges via `jwt-bearer` grant type.
+pub struct SpiffeAssertionTokenCache {
+    token: Arc<RwLock<CachedToken>>,
+    jwt_source: Arc<crate::spiffe::SpiffeJwtSource>,
+    token_url: String,
+    assertion_audience: Vec<String>,
+    extra_params: Vec<(String, String)>,
+    tls_connector: TlsConnector,
+    pub workload_spiffe_id: String,
+}
+
+impl std::fmt::Debug for SpiffeAssertionTokenCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SpiffeAssertionTokenCache")
+            .field("token_url", &self.token_url)
+            .finish()
+    }
+}
+
+impl SpiffeAssertionTokenCache {
+    pub async fn new(
+        token_url: String,
+        jwt_source: Arc<crate::spiffe::SpiffeJwtSource>,
+        assertion_audience: Vec<String>,
+        extra_params: Vec<(String, String)>,
+        tls_connector: TlsConnector,
+    ) -> Result<Self> {
+        let (access_token, expires_in, workload_spiffe_id) = exchange_jwt_assertion(
+            &token_url,
+            &jwt_source,
+            &assertion_audience,
+            &extra_params,
+            &tls_connector,
+        )
+        .await?;
+
+        Ok(Self {
+            token: Arc::new(RwLock::new(CachedToken {
+                access_token,
+                expires_at: Instant::now() + expires_in,
+            })),
+            jwt_source,
+            token_url,
+            assertion_audience,
+            extra_params,
+            tls_connector,
+            workload_spiffe_id,
+        })
+    }
+
+    pub async fn get_or_refresh(&self) -> Result<Zeroizing<String>> {
+        {
+            let guard = self.token.read().await;
+            if Instant::now() + Duration::from_secs(EXPIRY_BUFFER_SECS) < guard.expires_at {
+                return Ok(guard.access_token.clone());
+            }
+        }
+
+        let mut guard = self.token.write().await;
+        if Instant::now() + Duration::from_secs(EXPIRY_BUFFER_SECS) < guard.expires_at {
+            return Ok(guard.access_token.clone());
+        }
+
+        match exchange_jwt_assertion(
+            &self.token_url,
+            &self.jwt_source,
+            &self.assertion_audience,
+            &self.extra_params,
+            &self.tls_connector,
+        )
+        .await
+        {
+            Ok((new_token, expires_in, _)) => {
+                debug!(
+                    "OAuth2 jwt-bearer token refreshed, expires in {}s",
+                    expires_in.as_secs()
+                );
+                guard.access_token = new_token;
+                guard.expires_at = Instant::now() + expires_in;
+                Ok(guard.access_token.clone())
+            }
+            // SVID fetch failed — workload identity is gone; fail the request.
+            Err(e @ ProxyError::Credential(_)) => Err(e),
+            // Token exchange failed (network/auth) — use stale token if available.
+            Err(e) => {
+                warn!(
+                    "OAuth2 jwt-bearer token refresh failed, returning stale token: {}",
+                    e
+                );
+                Ok(guard.access_token.clone())
+            }
+        }
+    }
+}
+
+async fn exchange_jwt_assertion(
+    token_url: &str,
+    jwt_source: &crate::spiffe::SpiffeJwtSource,
+    audience: &[String],
+    extra_params: &[(String, String)],
+    tls_connector: &TlsConnector,
+) -> Result<(Zeroizing<String>, Duration, String)> {
+    let (assertion, spiffe_id) = jwt_source.fetch_token(audience).await?;
+
+    let mut body = Zeroizing::new(format!(
+        "grant_type={}&client_assertion_type={}&assertion={}",
+        urlencoding::encode("urn:ietf:params:oauth:grant-type:jwt-bearer"),
+        urlencoding::encode("urn:ietf:params:oauth:client-assertion-type:jwt-bearer"),
+        urlencoding::encode(assertion.as_str()),
+    ));
+    for (k, v) in extra_params {
+        body.push_str(&format!(
+            "&{}={}",
+            urlencoding::encode(k),
+            urlencoding::encode(v)
+        ));
+    }
+
+    let parsed = url::Url::parse(token_url)
+        .map_err(|e| ProxyError::OAuth2Exchange(format!("invalid token_url '{token_url}': {e}")))?;
+
+    let scheme = parsed.scheme();
+    let is_https = match scheme {
+        "https" => true,
+        "http" => {
+            let is_loopback = parsed.host_str().is_some_and(|h| {
+                h == "localhost"
+                    || h.parse::<std::net::IpAddr>()
+                        .is_ok_and(|ip| ip.is_loopback())
+            });
+            if !is_loopback {
+                return Err(ProxyError::OAuth2Exchange(format!(
+                    "token_url '{token_url}' must use https:// (http:// only allowed for loopback)"
+                )));
+            }
+            false
+        }
+        other => {
+            return Err(ProxyError::OAuth2Exchange(format!(
+                "unsupported scheme '{other}' in token_url"
+            )));
+        }
+    };
+
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| {
+            ProxyError::OAuth2Exchange(format!("missing host in token_url '{token_url}'"))
+        })?
+        .to_string();
+    let port = parsed.port().unwrap_or(if is_https { 443 } else { 80 });
+    let path = parsed.path().to_string();
+
+    let request = Zeroizing::new(format!(
+        "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\nAccept: application/json\r\nConnection: close\r\n\r\n{}",
+        path,
+        host,
+        body.len(),
+        body.as_str()
+    ));
+
+    let addr = format!("{}:{}", host, port);
+    let response_bytes = tokio::time::timeout(EXCHANGE_TIMEOUT, async {
+        let tcp = TcpStream::connect(&addr)
+            .await
+            .map_err(|e| ProxyError::OAuth2Exchange(format!("TCP connect to {addr}: {e}")))?;
+
+        async fn send_and_read<S: tokio::io::AsyncWrite + tokio::io::AsyncRead + Unpin>(
+            stream: &mut S,
+            request: &[u8],
+            host: &str,
+        ) -> Result<Vec<u8>> {
+            stream
+                .write_all(request)
+                .await
+                .map_err(|e| ProxyError::OAuth2Exchange(format!("write to {host}: {e}")))?;
+            stream
+                .flush()
+                .await
+                .map_err(|e| ProxyError::OAuth2Exchange(format!("flush to {host}: {e}")))?;
+            read_http_response(stream).await
+        }
+
+        if is_https {
+            let server_name =
+                rustls::pki_types::ServerName::try_from(host.clone()).map_err(|_| {
+                    ProxyError::OAuth2Exchange(format!("invalid TLS server name: {host}"))
+                })?;
+            let mut tls = tls_connector.connect(server_name, tcp).await.map_err(|e| {
+                ProxyError::OAuth2Exchange(format!("TLS handshake with {host}: {e}"))
+            })?;
+            send_and_read(&mut tls, request.as_bytes(), &host).await
+        } else {
+            let mut tcp = tcp;
+            send_and_read(&mut tcp, request.as_bytes(), &host).await
+        }
+    })
+    .await
+    .map_err(|_| ProxyError::OAuth2Exchange(format!("token exchange with {addr} timed out")))??;
+
+    let response_str = String::from_utf8(response_bytes)
+        .map_err(|_| ProxyError::OAuth2Exchange("non-UTF-8 token response".to_string()))?;
+    let body_start = response_str
+        .find("\r\n\r\n")
+        .map(|i| i + 4)
+        .or_else(|| response_str.find("\n\n").map(|i| i + 2))
+        .ok_or_else(|| ProxyError::OAuth2Exchange("malformed HTTP response".to_string()))?;
+    let status = parse_status_code(response_str.lines().next().unwrap_or(""));
+    let raw_body = &response_str[body_start..];
+    let is_chunked = response_str[..body_start].lines().any(|l| {
+        l.to_ascii_lowercase()
+            .contains("transfer-encoding: chunked")
+    });
+    let body = if is_chunked {
+        decode_chunked(raw_body)
+    } else {
+        raw_body.to_string()
+    };
+    if !(200..300).contains(&status) {
+        let preview: String = body.chars().take(200).collect();
+        return Err(ProxyError::OAuth2Exchange(format!(
+            "token endpoint returned HTTP {status}: {preview}"
+        )));
+    }
+    let (token, expires) = parse_token_response(&body)?;
+    Ok((token, expires, spiffe_id))
+}
+
+/// Decode an HTTP/1.1 chunked-encoded body into a plain string.
+fn decode_chunked(body: &str) -> String {
+    let mut out = String::new();
+    let mut rest = body;
+    loop {
+        // Each chunk: "<hex-size>\r\n<data>\r\n"
+        let end = rest
+            .find('\r')
+            .or_else(|| rest.find('\n'))
+            .unwrap_or(rest.len());
+        let size_str = rest[..end].trim();
+        if size_str.is_empty() {
+            break;
+        }
+        let size = usize::from_str_radix(size_str, 16).unwrap_or(0);
+        if size == 0 {
+            break;
+        }
+        let after_crlf = end
+            + if rest[end..].starts_with("\r\n") {
+                2
+            } else {
+                1
+            };
+        if after_crlf + size > rest.len() {
+            out.push_str(&rest[after_crlf..]);
+            break;
+        }
+        out.push_str(&rest[after_crlf..after_crlf + size]);
+        rest = &rest[after_crlf + size..];
+        if rest.starts_with("\r\n") {
+            rest = &rest[2..];
+        } else if rest.starts_with('\n') {
+            rest = &rest[1..];
+        }
+    }
+    out
 }
 
 // ────────────────────────────────────────────────────────────────────────────

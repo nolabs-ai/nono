@@ -1371,10 +1371,9 @@ fn extract_path_from_syscall(line: &str, syscall: &str) -> Option<String> {
     // For openat, skip AT_FDCWD
     let path_start = if syscall == "openat" {
         // Skip "AT_FDCWD, " or similar
-        if let Some(comma_idx) = after_paren.find(',') {
+        {
+            let comma_idx = after_paren.find(',')?;
             comma_idx + 2 // Skip ", "
-        } else {
-            return None;
         }
     } else {
         0

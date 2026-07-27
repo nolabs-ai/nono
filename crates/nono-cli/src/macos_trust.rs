@@ -110,7 +110,7 @@ fn generate_and_trust_new_ca(validity: Duration) -> Result<Option<PreloadedCa>> 
     // Single atomic write — concurrent processes race, but the bundle is always
     // a coherent key+cert pair (second writer wins, no mismatch possible).
     let key_pem = ca.key_pem();
-    let combined = Zeroizing::new(format!("{}{}", &*key_pem, cert_pem));
+    let combined = Zeroizing::new(format!("{}{}", *key_pem, cert_pem));
     passwords::set_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT, combined.as_bytes())
         .map_err(|e| {
             NonoError::SandboxInit(format!("failed to store CA bundle in Keychain: {e}"))
@@ -263,7 +263,7 @@ mod tests {
         use nono_proxy::tls_intercept::ca::split_key_cert_pem;
 
         let ca = generate_test_ca();
-        let combined = format!("{}{}", &*ca.key_pem(), ca.cert_pem());
+        let combined = format!("{}{}", *ca.key_pem(), ca.cert_pem());
 
         let (key_der, cert_pem) = split_key_cert_pem(&combined).unwrap();
         assert_eq!(&*key_der, ca.key_der());

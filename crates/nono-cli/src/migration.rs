@@ -43,7 +43,7 @@ const LEARN_MORE_URL: &str = "https://github.com/nolabs-ai/nono/discussions/780"
 const OFFICIAL_PACKS: &[OfficialPack] = &[
     OfficialPack {
         profile_name: "claude",
-        namespace: "always-further",
+        namespace: "nolabs-ai",
         pack_name: "claude",
         description: Some("Anthropic Claude Code sandbox profile + plugin"),
         installs_summary: Some("sandbox profile + Claude Code plugin (hooks, skill)"),
@@ -52,24 +52,24 @@ const OFFICIAL_PACKS: &[OfficialPack] = &[
     // renamed to `claude` so it matches the pack name. Once the pack
     // is installed, the resolver also accepts `claude-code` via the
     // artifact's `aliases` field. This entry only matters for users
-    // who type `--profile always-further/claude` *before* the pack is installed.
+    // who type `--profile nolabs-ai/claude` *before* the pack is installed.
     OfficialPack {
         profile_name: "claude-code",
-        namespace: "always-further",
+        namespace: "nolabs-ai",
         pack_name: "claude",
         description: Some("Anthropic Claude Code (legacy profile name; canonical is `claude`)"),
         installs_summary: Some("sandbox profile + Claude Code plugin (hooks, skill)"),
     },
     OfficialPack {
         profile_name: "codex",
-        namespace: "always-further",
+        namespace: "nolabs-ai",
         pack_name: "codex",
         description: Some("OpenAI Codex CLI sandbox profile + plugin"),
         installs_summary: Some("sandbox profile + Codex plugin (hooks, skill)"),
     },
     OfficialPack {
         profile_name: "opencode",
-        namespace: "always-further",
+        namespace: "nolabs-ai",
         pack_name: "opencode",
         description: Some("OpenCode AI coding assistant sandbox profile + plugin"),
         installs_summary: Some("sandbox profile + OpenCode plugin (hooks, skill)"),
@@ -166,7 +166,7 @@ pub fn check_and_run(profile_name: &str) -> Result<MigrationOutcome> {
 }
 
 fn is_claude_pack(provider: &ProfileProvider) -> bool {
-    provider.namespace == "always-further" && provider.name == "claude"
+    provider.namespace == "nolabs-ai" && provider.name == "claude"
 }
 
 fn official_pack_for(profile_name: &str) -> Option<&'static OfficialPack> {
@@ -315,7 +315,7 @@ mod tests {
 
     #[test]
     fn registry_ref_skips_migration() {
-        assert!(is_path_or_registry_ref("always-further/claude"));
+        assert!(is_path_or_registry_ref("nolabs-ai/claude"));
         assert!(is_path_or_registry_ref("./local.json"));
         assert!(is_path_or_registry_ref("path/to/profile.json"));
         assert!(!is_path_or_registry_ref("claude-code"));
@@ -348,7 +348,7 @@ mod tests {
             .expect("claude-code")
             .as_provider();
         assert_eq!(canonical.pack_ref(), legacy.pack_ref());
-        assert_eq!(canonical.pack_ref(), "always-further/claude");
+        assert_eq!(canonical.pack_ref(), "nolabs-ai/claude");
     }
 
     #[test]

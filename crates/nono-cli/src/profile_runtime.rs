@@ -28,6 +28,7 @@ pub(crate) struct PreparedProfile {
     pub(crate) credential_providers: HashMap<String, profile::CredentialProviderDef>,
     pub(crate) credential_routes: Vec<profile::CredentialRouteDef>,
     pub(crate) tls_intercept: Option<profile::TlsInterceptConfig>,
+    pub(crate) no_proxy: Vec<String>,
     pub(crate) upstream_proxy: Option<String>,
     pub(crate) upstream_bypass: Vec<String>,
     pub(crate) listen_ports: Vec<u16>,
@@ -709,7 +710,7 @@ fn prepare_profile_with_options(
             Some(profile_name),
             options.hook_output_silent,
         )?;
-        // If the profile was addressed by pack ref (e.g. --profile always-further/hermes),
+        // If the profile was addressed by pack ref (e.g. --profile nolabs-ai/hermes),
         // ensure that pack is verified even if the profile JSON doesn't list it in `packs`.
         // Pack refs are injected into profile.packs at load time for every
         // pack-store resolution — both direct registry refs and name/alias
@@ -762,6 +763,59 @@ fn prepare_profile_with_options(
     };
 
     precreate_file_json_credential_store_dirs(loaded_profile.as_ref(), workdir);
+
+    if let Some(profile) = loaded_profile.as_ref() {
+        for (label, ranges) in [
+            (
+                "open_port_range",
+                profile.network.open_port_range.as_slice(),
+            ),
+            (
+                "listen_port_range",
+                profile.network.listen_port_range.as_slice(),
+            ),
+        ] {
+            for &[start, end] in ranges {
+                if start > end {
+                    return Err(nono::NonoError::ProfileParse(format!(
+                        "{label} entry [{start}, {end}] is invalid: start must be <= end",
+                    )));
+                }
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let open_merged = nono::capability::merge_port_ranges(
+                &profile
+                    .network
+                    .open_port_range
+                    .iter()
+                    .map(|&[s, e]| (s, e))
+                    .collect::<Vec<_>>(),
+            );
+            let listen_merged = nono::capability::merge_port_ranges(
+                &profile
+                    .network
+                    .listen_port_range
+                    .iter()
+                    .map(|&[s, e]| (s, e))
+                    .collect::<Vec<_>>(),
+            );
+            let total_range_ports: u32 = open_merged
+                .iter()
+                .chain(listen_merged.iter())
+                .map(|&(s, e)| (e as u32).saturating_sub(s as u32).saturating_add(1))
+                .fold(0u32, |acc, n| acc.saturating_add(n));
+            if total_range_ports > nono::capability::MACOS_PORT_RANGE_LIMIT {
+                return Err(nono::NonoError::ProfileParse(format!(
+                    "port ranges expand to {} unique ports, which exceeds the macOS limit of {} \
+                     (sandbox_init crashes above ~17,770 rules); use smaller or fewer ranges",
+                    total_range_ports,
+                    nono::capability::MACOS_PORT_RANGE_LIMIT
+                )));
+            }
+        }
+    }
 
     Ok(PreparedProfile {
         capability_elevation: loaded_profile
@@ -831,6 +885,10 @@ fn prepare_profile_with_options(
         tls_intercept: loaded_profile
             .as_ref()
             .and_then(|profile| profile.network.tls_intercept.clone()),
+        no_proxy: loaded_profile
+            .as_ref()
+            .map(|profile| profile.network.no_proxy.clone())
+            .unwrap_or_default(),
         upstream_proxy: loaded_profile
             .as_ref()
             .and_then(|profile| profile.network.upstream_proxy.clone()),
@@ -838,10 +896,30 @@ fn prepare_profile_with_options(
             .as_ref()
             .map(|profile| profile.network.upstream_bypass.clone())
             .unwrap_or_default(),
-        listen_ports: loaded_profile
-            .as_ref()
-            .map(|profile| profile.network.listen_port.clone())
-            .unwrap_or_default(),
+        listen_ports: {
+            let mut ports = loaded_profile
+                .as_ref()
+                .map(|profile| profile.network.listen_port.clone())
+                .unwrap_or_default();
+            if let Some(profile) = loaded_profile.as_ref() {
+                let raw: Vec<(u16, u16)> = profile
+                    .network
+                    .listen_port_range
+                    .iter()
+                    .map(|&[s, e]| (s, e))
+                    .collect();
+                for (start, end) in nono::capability::merge_port_ranges(&raw) {
+                    if start == 0 {
+                        return Err(nono::NonoError::ConfigParse(
+                            "listen_port_range entry starting at 0 is invalid; port 0 has no defined meaning in a range"
+                                .to_string(),
+                        ));
+                    }
+                    ports.extend(start..=end);
+                }
+            }
+            ports
+        },
         open_url_origins: loaded_profile
             .as_ref()
             .and_then(|profile| profile.open_urls.as_ref())
@@ -1694,6 +1772,7 @@ mod tests {
                 "rollback": { "exclude_patterns": ["target"] },
                 "network": {
                     "allow_domain": ["example.com"],
+                    "no_proxy": ["redis"],
                     "upstream_bypass": ["localhost"],
                     "listen_port": [8080]
                 },
@@ -1738,6 +1817,7 @@ mod tests {
         assert_eq!(runtime.allow_domain, preflight.allow_domain);
         assert_eq!(runtime.credentials, preflight.credentials);
         assert_eq!(runtime.custom_credentials, preflight.custom_credentials);
+        assert_eq!(runtime.no_proxy, preflight.no_proxy);
         assert_eq!(runtime.upstream_proxy, preflight.upstream_proxy);
         assert_eq!(runtime.upstream_bypass, preflight.upstream_bypass);
         assert_eq!(runtime.listen_ports, preflight.listen_ports);

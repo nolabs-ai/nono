@@ -139,6 +139,23 @@ Use `--allow-domain` on the command line or `allow_domain` in a profile to add d
 nono run --allow-cwd --network-profile developer --allow-domain my-internal-api.example.com -- my-agent
 ```
 
+### Client-Side Proxy Bypass
+
+Profiles can add host patterns to the generated `NO_PROXY` and `no_proxy` environment variables with `network.no_proxy`. nono still emits loopback defaults and any safe direct-connect bypasses first; parent-shell `NO_PROXY` values are not inherited. These entries do not grant network access; on macOS ProxyOnly and other restricted modes, direct connections still require matching sandbox permissions.
+
+```json
+{
+  "network": {
+    "network_profile": "developer",
+    "no_proxy": ["redis", ".internal.example"]
+  }
+}
+```
+
+Entries must be host patterns, not URLs or `host:port` values. Bare multi-label domains and protected metadata suffix tokens are rejected because common clients treat them as suffix matches; use a safe single-label local alias like `redis`, a canonical IP literal, or an explicit suffix pattern such as `.internal.example`. Patterns conflicting with proxy-allowed hosts or credential/L7-filtered route upstreams fail configuration so that traffic stays on the local nono proxy.
+
+Generated `NO_PROXY` / `no_proxy` values use common environment-client syntax, so profile `*.internal.example` is emitted as `.internal.example`. nono also emits `NONO_NO_PROXY` with canonical nono patterns, preserving forms such as `*.internal.example`, so wrappers can translate them to runtime-specific formats like Java `http.nonProxyHosts`.
+
 ## Reverse Proxy (Credential Injection)
 
 When `--credential` is active, the proxy runs a reverse proxy alongside the CONNECT tunnel. The sandboxed process sends plain HTTP requests to `http://localhost:<port>/<service>/...`, and the proxy injects the real API key and forwards to the upstream over TLS.
@@ -385,6 +402,7 @@ The following destinations are always blocked by the proxy, regardless of config
 | Destination | Why |
 |-------------|-----|
 | `169.254.169.254` | AWS/GCP/Azure instance metadata |
+| `fd00:ec2::254` | AWS IMDS IPv6 endpoint |
 | `metadata.google.internal` | GCP metadata alias |
 | `metadata.azure.internal` | Azure metadata alias |
 | `169.254.0.0/16` (resolved IP) | IPv4 link-local — DNS rebinding protection |

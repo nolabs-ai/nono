@@ -13,13 +13,13 @@ struct OfficialPackStatusTarget {
 }
 
 const CLAUDE_PACK: OfficialPackStatusTarget = OfficialPackStatusTarget {
-    namespace: "always-further",
+    namespace: "nolabs-ai",
     name: "claude",
     profiles: &["claude", "claude-code"],
 };
 
 const CODEX_PACK: OfficialPackStatusTarget = OfficialPackStatusTarget {
-    namespace: "always-further",
+    namespace: "nolabs-ai",
     name: "codex",
     profiles: &["codex"],
 };
@@ -179,8 +179,8 @@ mod tests {
             }),
         };
 
-        let message = yanked_message("always-further/claude", "1.2.2", &status);
-        assert!(message.contains("nono pull always-further/claude@1.2.3 --force"));
+        let message = yanked_message("nolabs-ai/claude", "1.2.2", &status);
+        assert!(message.contains("nono pull nolabs-ai/claude@1.2.3 --force"));
         assert!(message.contains("security"));
         assert!(message.contains("high - profile policy fix"));
     }
@@ -196,23 +196,17 @@ mod tests {
 
     #[test]
     fn canonical_package_refs_target_official_packs() {
+        assert!(is_official_package_ref(CLAUDE_PACK, "nolabs-ai/claude"));
         assert!(is_official_package_ref(
             CLAUDE_PACK,
-            "always-further/claude"
+            "nolabs-ai/claude@1.2.3"
         ));
-        assert!(is_official_package_ref(
-            CLAUDE_PACK,
-            "always-further/claude@1.2.3"
-        ));
-        assert!(is_official_package_ref(CODEX_PACK, "always-further/codex"));
-        assert!(is_official_package_ref(
-            CODEX_PACK,
-            "always-further/codex@1.2.3"
-        ));
+        assert!(is_official_package_ref(CODEX_PACK, "nolabs-ai/codex"));
+        assert!(is_official_package_ref(CODEX_PACK, "nolabs-ai/codex@1.2.3"));
         assert!(!is_official_package_ref(CLAUDE_PACK, "someone/claude"));
         assert!(!is_official_package_ref(
             CODEX_PACK,
-            "always-further/codex-extra"
+            "nolabs-ai/codex-extra"
         ));
     }
 }

@@ -175,6 +175,7 @@ mod tests {
                 path: Some("/v1/chat".to_string()),
                 status: Some(403),
                 reason: Some("policy".to_string()),
+                spiffe_context: None,
             })
             .unwrap();
         recorder

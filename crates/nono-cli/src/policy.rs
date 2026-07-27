@@ -1634,7 +1634,7 @@ mod tests {
     #[test]
     fn test_embedded_claude_code_profile_was_removed() {
         // Removed in v0.43.0: claude-code now ships via the registry pack
-        // `always-further/claude`. The platform GROUPS it referenced
+        // `nolabs-ai/claude` (formerly `always-further/claude`). The platform GROUPS it referenced
         // (claude_code_macos / claude_code_linux) remain so the pack profile
         // can resolve them by name.
         let policy = load_embedded_policy().expect("embedded policy");

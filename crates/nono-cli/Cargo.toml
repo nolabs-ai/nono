@@ -1,6 +1,6 @@
 [package]
 name = "nono-cli"
-version = "0.67.1"
+version = "0.69.0"
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
@@ -41,8 +41,8 @@ system-keyring = ["dep:keyring", "nono/system-keyring", "nono-proxy/system-keyri
 test-trust-overrides = []
 
 [dependencies]
-nono = { version = "0.67.1", path = "../nono", default-features = false }
-nono-proxy = { version = "0.67.1", path = "../nono-proxy", default-features = false }
+nono = { version = "0.69.0", path = "../nono", default-features = false }
+nono-proxy = { version = "0.69.0", path = "../nono-proxy", default-features = false }
 clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"
 colored = "3"
@@ -70,10 +70,10 @@ aws-lc-rs = "1"
 keyring = { version = "3", optional = true, default-features = false }
 
 # Keyless (Sigstore/Fulcio/Rekor) signing for instruction file attestation
-sigstore-sign = "0.10.0"
+sigstore-sign = "0.11.0"
 tokio = { version = "1", features = ["rt"] }
 
-ureq = { version = "3", features = ["platform-verifier"] }
+ureq = { version = "3", features = ["platform-verifier", "socks-proxy"] }
 semver = "1"
 
 zeroize.workspace = true
@@ -113,7 +113,7 @@ toml.workspace = true
 serde.workspace = true
 
 [dev-dependencies]
-jsonschema = "0.46"
+jsonschema = "0.48"
 proptest = "1"
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 

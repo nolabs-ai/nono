@@ -6,8 +6,8 @@
 # Claude state and config
 .claude/
 
-# misc
-proj/
+# Demo assets and runtime (not part of the distributed codebase)
+demo/
 .worktrees
 .nono
 diagnostics.json

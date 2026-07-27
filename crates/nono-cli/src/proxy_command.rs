@@ -178,7 +178,7 @@ fn load_preloaded_ca(
 
     // `split_key_cert_pem` extracts the PKCS#8 key as DER and returns the cert
     // PEM; the key must come first in the combined bundle.
-    let combined = zeroize::Zeroizing::new(format!("{}{}", &*key_pem, cert_pem));
+    let combined = zeroize::Zeroizing::new(format!("{}{}", *key_pem, cert_pem));
     let (key_der, cert_pem) = nono_proxy::tls_intercept::ca::split_key_cert_pem(&combined)
         .map_err(|e| NonoError::ConfigParse(format!("invalid proxy CA material: {e}")))?;
 
@@ -387,17 +387,17 @@ fn print_connection_info(
         // userinfo). Surface it directly plus the raw token for Bearer clients.
         println!(
             "  proxy URL: {}",
-            format!("http://nono:{}@{}:{}", &*handle.token, addr, port).cyan()
+            format!("http://nono:{}@{}:{}", *handle.token, addr, port).cyan()
         );
         println!("  token:     {}", (*handle.token).dimmed());
         println!();
         println!(
             "  export HTTPS_PROXY=http://nono:{}@{}:{}",
-            &*handle.token, addr, port
+            *handle.token, addr, port
         );
         println!(
             "  export HTTP_PROXY=http://nono:{}@{}:{}",
-            &*handle.token, addr, port
+            *handle.token, addr, port
         );
     }
 

@@ -232,6 +232,7 @@ mod tests {
                 path: Some("/".to_string()),
                 status: Some(200),
                 reason: None,
+                spiffe_context: None,
             }],
             audit_event_count: 9,
             audit_integrity: Some(AuditIntegritySummary {

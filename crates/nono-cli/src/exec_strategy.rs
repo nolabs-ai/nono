@@ -66,10 +66,13 @@ pub fn resolve_program(program: &str) -> Result<PathBuf> {
 /// Main thread (1) + up to 3 keyring threads for D-Bus/Security.framework.
 const MAX_KEYRING_THREADS: usize = 4;
 /// Maximum threads allowed when crypto library thread pool is active.
-/// Main thread (1) + tokio proxy workers (2) + aws-lc-rs ECDSA pool (4).
-/// When --network-profile is used with trust scanning, both the proxy runtime
-/// and crypto verification threads may be active simultaneously.
-const MAX_CRYPTO_THREADS: usize = 7;
+/// Main thread (1) + tokio proxy workers (2) + aws-lc-rs ECDSA pool (4), plus
+/// headroom for the OS-managed libdispatch workqueue threads that
+/// Security.framework spawns for `SecTrustSettings*` XPC during proxy CA setup
+/// on macOS (2-5 observed, scales with load). Those workqueue threads are
+/// unnamed, parked, and fork-safe, but a tighter budget intermittently tripped
+/// on them (issue: fork thread-count flake).
+const MAX_CRYPTO_THREADS: usize = 12;
 /// Hard cap on retained denial records to prevent memory exhaustion.
 const MAX_DENIAL_RECORDS: usize = 1000;
 /// Hard cap on request IDs tracked for replay detection.
@@ -348,6 +351,9 @@ pub struct SupervisorConfig<'a> {
     /// Bind ports allowed for seccomp proxy-only fallback.
     #[cfg(target_os = "linux")]
     pub proxy_bind_ports: Vec<u16>,
+    /// Inclusive bind port ranges allowed for seccomp proxy-only fallback.
+    #[cfg(target_os = "linux")]
+    pub proxy_bind_port_ranges: Vec<(u16, u16)>,
     /// Pathname AF_UNIX socket grants allowed for seccomp proxy-only fallback.
     #[cfg(target_os = "linux")]
     pub unix_socket_allowlist: &'a [nono::UnixSocketCapability],
@@ -799,12 +805,20 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
     // the parent hardens itself immediately after fork and the child hardens
     // itself after sandbox/filter setup whenever procfs inspection is not
     // required.
+
+    // Become a child-subreaper whenever the supervisor may need to read a
+    // descendant's /proc/<pid>/mem: tool-sandbox command mediation
+    // (`tool_sandbox_runtime`) or seccomp-notify mediation of network/AF_UNIX/
+    // openat (`child_requires_dumpable`). That read is ancestry-gated by
+    // ptrace_may_access under Yama ptrace_scope=1, so a descendant that
+    // daemonizes and reparents to pid 1 leaves our ancestry and gets its
+    // connect()/bind()/openat() denied with EPERM. Subreaping keeps it ours.
     #[cfg(target_os = "linux")]
-    if config.tool_sandbox_runtime.is_some() {
+    if config.tool_sandbox_runtime.is_some() || config.seccomp_policy.child_requires_dumpable() {
         let ret = unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) };
         if ret != 0 {
             return Err(NonoError::SandboxInit(format!(
-                "Failed to set PR_SET_CHILD_SUBREAPER for tool-sandbox supervisor: {}",
+                "Failed to set PR_SET_CHILD_SUBREAPER for supervisor: {}",
                 std::io::Error::last_os_error()
             )));
         }
@@ -2621,6 +2635,7 @@ fn run_supervisor_loop(
                             &mut denials,
                             &mut seen_request_ids,
                             trust_interceptor.as_mut(),
+                            pty.as_deref_mut(),
                         ) {
                             warn!("Error handling supervisor message: {}", e);
                         }
@@ -2716,6 +2731,34 @@ fn run_supervisor_loop(
 
     let status = wait_for_child(child)?;
     Ok((status, denials))
+}
+
+/// Reap descendants that reparented onto this supervisor (a child-subreaper),
+/// so short-lived detached processes don't linger as zombies for the session.
+///
+/// `waitpid(-1, WNOHANG)` returns only terminated children, so a live child is
+/// never consumed. If the primary `child` is reaped here, its status is
+/// returned rather than dropped.
+#[cfg(target_os = "linux")]
+fn reap_reparented_orphans(child: Pid) -> Option<WaitStatus> {
+    loop {
+        match waitpid(Some(Pid::from_raw(-1)), Some(WaitPidFlag::WNOHANG)) {
+            Ok(status @ (WaitStatus::Exited(pid, _) | WaitStatus::Signaled(pid, _, _))) => {
+                if pid == child {
+                    return Some(status);
+                }
+                debug!("Reaped reparented orphan {}", pid);
+            }
+            // Nothing reapable now; no WUNTRACED/WCONTINUED, so ignore stop/continue.
+            Ok(_) => return None,
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(nix::errno::Errno::ECHILD) => return None,
+            Err(e) => {
+                debug!("waitpid(-1) during orphan reap failed: {}", e);
+                return None;
+            }
+        }
+    }
 }
 
 /// Supervisor IPC event loop for capability expansion (Linux).
@@ -2905,6 +2948,7 @@ fn run_supervisor_loop(
                                 &mut denials,
                                 &mut seen_request_ids,
                                 trust_interceptor.as_mut(),
+                                pty.as_deref_mut(),
                             ) {
                                 warn!("Error handling supervisor message: {}", e);
                             }
@@ -2933,9 +2977,12 @@ fn run_supervisor_loop(
                         child,
                         config,
                         initial_caps,
-                        &mut rate_limiter,
-                        &mut denials,
-                        trust_interceptor.as_mut(),
+                        supervisor_linux::SeccompNotificationState {
+                            rate_limiter: &mut rate_limiter,
+                            denials: &mut denials,
+                            trust_interceptor: trust_interceptor.as_mut(),
+                            pty: pty.as_deref_mut(),
+                        },
                     )
                 {
                     debug!("Error handling seccomp notification: {}", e);
@@ -3024,6 +3071,12 @@ fn run_supervisor_loop(
         );
         handle_pty_suspension(pty.as_deref_mut(), child);
 
+        // Drain reparented orphans; if the primary child was among them,
+        // surface its status directly.
+        if let Some(status) = reap_reparented_orphans(child) {
+            return Ok((status, denials, ipc_denials));
+        }
+
         match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
             Ok(WaitStatus::StillAlive) => {
                 if let Some((deadline, timeout_cfg)) = startup_deadline
@@ -3070,6 +3123,28 @@ fn run_supervisor_loop(
     Ok((status, denials, ipc_denials))
 }
 
+/// Run an approval request with the PTY relay paused.
+///
+/// While a terminal client is attached to the PTY relay, the real terminal is
+/// in raw mode and relaying keystrokes to the child, so an interactive prompt
+/// would render garbled and never see the user's answer. Pause the relay
+/// (restoring cooked mode) for the duration of the request and re-enter relay
+/// mode afterwards. A no-op when no terminal-backed client is attached.
+fn request_approval_with_relay_paused(
+    config: &SupervisorConfig<'_>,
+    request: &nono::supervisor::ApprovalRequest,
+    mut pty: Option<&mut crate::pty_proxy::PtyProxy>,
+) -> Result<ApprovalDecision> {
+    let paused_for_prompt = pty
+        .as_mut()
+        .is_some_and(|proxy| proxy.pause_terminal_for_prompt());
+    let result = config.approval_backend.request_approval(request);
+    if paused_for_prompt && let Some(proxy) = pty.as_mut() {
+        proxy.resume_terminal_after_prompt();
+    }
+    result
+}
+
 /// Handle a single supervisor IPC message.
 ///
 /// Flow:
@@ -3078,6 +3153,7 @@ fn run_supervisor_loop(
 /// 3. If granted, open the path and send the fd via `SCM_RIGHTS`
 /// 4. Send the decision response
 /// 5. Record denials for diagnostic footer
+#[allow(clippy::too_many_arguments)]
 fn handle_supervisor_message(
     sock: &mut SupervisorSocket,
     msg: SupervisorMessage,
@@ -3086,6 +3162,7 @@ fn handle_supervisor_message(
     denials: &mut Vec<DenialRecord>,
     seen_request_ids: &mut HashSet<String>,
     mut trust_interceptor: Option<&mut crate::trust_intercept::TrustInterceptor>,
+    mut pty: Option<&mut crate::pty_proxy::PtyProxy>,
 ) -> Result<()> {
     match msg {
         SupervisorMessage::Request(request) => {
@@ -3170,8 +3247,10 @@ fn handle_supervisor_message(
                         // Stash the verified digest for TOCTOU re-check at open time
                         verified_digest = Some(verified.digest);
                         // Instruction file verified — proceed to approval backend
-                        match config.approval_backend.request_approval(
+                        match request_approval_with_relay_paused(
+                            config,
                             &nono::supervisor::ApprovalRequest::from(request.clone()),
+                            pty.as_deref_mut(),
                         ) {
                             Ok(d) => {
                                 if d.is_denied() {
@@ -3224,10 +3303,11 @@ fn handle_supervisor_message(
                 }
             } else {
                 // 3. Delegate to approval backend (non-instruction files)
-                match config
-                    .approval_backend
-                    .request_approval(&nono::supervisor::ApprovalRequest::from(request.clone()))
-                {
+                match request_approval_with_relay_paused(
+                    config,
+                    &nono::supervisor::ApprovalRequest::from(request.clone()),
+                    pty,
+                ) {
                     Ok(d) => {
                         if d.is_denied() {
                             record_denial(
@@ -4760,6 +4840,8 @@ mod tests {
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
             #[cfg(target_os = "linux")]
+            proxy_bind_port_ranges: Vec::new(),
+            #[cfg(target_os = "linux")]
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
             seccomp_policy: SeccompPolicy {
@@ -4885,6 +4967,8 @@ mod tests {
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
             #[cfg(target_os = "linux")]
+            proxy_bind_port_ranges: Vec::new(),
+            #[cfg(target_os = "linux")]
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
             seccomp_policy: SeccompPolicy {
@@ -4976,6 +5060,8 @@ mod tests {
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
             #[cfg(target_os = "linux")]
+            proxy_bind_port_ranges: Vec::new(),
+            #[cfg(target_os = "linux")]
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
             seccomp_policy: SeccompPolicy {
@@ -5024,6 +5110,8 @@ mod tests {
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
             #[cfg(target_os = "linux")]
+            proxy_bind_port_ranges: Vec::new(),
+            #[cfg(target_os = "linux")]
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
             seccomp_policy: SeccompPolicy {
@@ -5070,6 +5158,8 @@ mod tests {
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
             #[cfg(target_os = "linux")]
+            proxy_bind_port_ranges: Vec::new(),
+            #[cfg(target_os = "linux")]
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
             seccomp_policy: SeccompPolicy {
@@ -5097,6 +5187,8 @@ mod tests {
             proxy_port: 0,
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
+            #[cfg(target_os = "linux")]
+            proxy_bind_port_ranges: Vec::new(),
             #[cfg(target_os = "linux")]
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
@@ -5148,6 +5240,8 @@ mod tests {
             proxy_port: 0,
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
+            #[cfg(target_os = "linux")]
+            proxy_bind_port_ranges: Vec::new(),
             #[cfg(target_os = "linux")]
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
@@ -5305,6 +5399,8 @@ mod tests {
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
             #[cfg(target_os = "linux")]
+            proxy_bind_port_ranges: Vec::new(),
+            #[cfg(target_os = "linux")]
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
             seccomp_policy: SeccompPolicy {
@@ -5361,6 +5457,8 @@ mod tests {
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
             #[cfg(target_os = "linux")]
+            proxy_bind_port_ranges: Vec::new(),
+            #[cfg(target_os = "linux")]
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
             seccomp_policy: SeccompPolicy {
@@ -5405,6 +5503,8 @@ mod tests {
             proxy_port: 0,
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
+            #[cfg(target_os = "linux")]
+            proxy_bind_port_ranges: Vec::new(),
             #[cfg(target_os = "linux")]
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
@@ -5469,6 +5569,8 @@ mod tests {
             proxy_port: 0,
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
+            #[cfg(target_os = "linux")]
+            proxy_bind_port_ranges: Vec::new(),
             #[cfg(target_os = "linux")]
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]

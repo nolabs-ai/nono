@@ -50,7 +50,7 @@ impl CapabilityManifest {
     ///
     /// Checks for:
     /// - `rollback.enabled` requires `exec_strategy: "supervised"`
-    /// - `resources` (memory_bytes) require `exec_strategy: "supervised"`
+    /// - `resources` (memory_bytes / max_processes) require `exec_strategy: "supervised"`
     /// - URI manager credential sources require `env_var`
     /// - `url_path` inject mode requires `path_pattern`
     /// - `query_param` inject mode requires `query_param_name`
@@ -76,7 +76,7 @@ impl CapabilityManifest {
         // exec_strategy: "supervised". An empty `resources` object carries no limit,
         // so it's a no-op and doesn't trigger the requirement.
         if let Some(ref res) = self.resources
-            && res.memory_bytes.is_some()
+            && (res.memory_bytes.is_some() || res.max_processes.is_some())
         {
             let exec_strategy = self
                 .process
@@ -84,7 +84,7 @@ impl CapabilityManifest {
                 .map_or(ExecStrategy::Monitor, |p| p.exec_strategy);
             if exec_strategy != ExecStrategy::Supervised {
                 return Err(crate::NonoError::ConfigParse(
-                    "resources (memory_bytes) require \
+                    "resources (memory_bytes / max_processes) require \
                      exec_strategy: \"supervised\" \
                      (limits are enforced by the supervising parent process)"
                         .to_string(),
@@ -205,14 +205,75 @@ mod resource_tests {
         );
     }
 
-    // ---- Memory-only schema contract ----
+    // ---- Resources schema contract (memory_bytes + max_processes) ----
+
+    #[test]
+    fn max_processes_roundtrips_and_requires_supervised() {
+        // max_processes flows through parse -> validate -> re-serialize like
+        // memory_bytes, and (being enforced by the supervising parent) it requires
+        // exec_strategy: "supervised".
+        let json = r#"{
+            "version": "0.1.0",
+            "process": { "exec_strategy": "supervised" },
+            "resources": { "max_processes": 64 }
+        }"#;
+        let manifest = CapabilityManifest::from_json(json).expect("parse");
+        assert_eq!(
+            manifest
+                .resources
+                .as_ref()
+                .and_then(|r| r.max_processes)
+                .map(|n| n.get()),
+            Some(64)
+        );
+        manifest.validate().expect("valid: supervised");
+
+        // Under the default (monitor) strategy the same ceiling must be rejected.
+        let unsupervised = r#"{ "version": "0.1.0", "resources": { "max_processes": 64 } }"#;
+        let manifest = CapabilityManifest::from_json(unsupervised).expect("parse");
+        assert!(
+            matches!(manifest.validate(), Err(crate::NonoError::ConfigParse(_))),
+            "max_processes without supervised must fail validation via ConfigParse"
+        );
+
+        // Survives a serialize/reparse round-trip (reusing the supervised json above).
+        let out = CapabilityManifest::from_json(json)
+            .expect("parse")
+            .to_json()
+            .expect("serialize");
+        let reparsed = CapabilityManifest::from_json(&out).expect("reparse");
+        assert_eq!(
+            reparsed
+                .resources
+                .and_then(|r| r.max_processes)
+                .map(|n| n.get()),
+            Some(64)
+        );
+    }
+
+    #[test]
+    fn max_processes_rejects_zero_and_negative_via_schema_minimum() {
+        // schema minimum:1 generates Option<NonZeroU64>, so 0 (which must never be
+        // read as "unlimited") and a negative count fail at parse time.
+        let zero = r#"{ "version": "0.1.0", "resources": { "max_processes": 0 } }"#;
+        assert!(
+            CapabilityManifest::from_json(zero).is_err(),
+            "max_processes: 0 violates minimum:1 (NonZeroU64) and must fail to parse"
+        );
+        let negative = r#"{ "version": "0.1.0", "resources": { "max_processes": -1 } }"#;
+        assert!(
+            CapabilityManifest::from_json(negative).is_err(),
+            "negative max_processes cannot fit an unsigned ceiling and must fail to parse"
+        );
+    }
 
     #[test]
     fn resources_rejects_removed_cpu_and_procs_keys() {
-        // Memory-only contract: cpu_max_percent and max_procs were removed from the
-        // Resources schema. Since Resources is additionalProperties:false
-        // (deny_unknown_fields), a manifest still carrying either must fail to PARSE
-        // — the removal is enforced by the schema, not ignored at runtime.
+        // cpu_max_percent and the old max_procs key were removed from the Resources
+        // schema (distinct from the current max_processes). Since Resources is
+        // additionalProperties:false (deny_unknown_fields), a manifest still carrying
+        // either must fail to PARSE — the removal is enforced by the schema, not
+        // ignored at runtime.
         let with_cpu = r#"{
             "version": "0.1.0",
             "process": { "exec_strategy": "supervised" },

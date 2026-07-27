@@ -697,9 +697,21 @@ nono run --memory 512M -- my-agent
 
 Sizes take an optional unit suffix: `512M`/`512MiB` (binary, 1024-based), `512MB` (decimal, 1000-based), and `K`/`G`/`T` likewise; a bare number is bytes.
 
-- **Linux only**, enforced via cgroup v2, and requires a systemd `Delegate=yes` user session. On other platforms the request is refused rather than silently ignored.
-- Enforced on `nono run` and `nono shell` (supervised). `nono wrap` execs directly and does not accept `--memory`.
-- Granting the sandbox **write** access overlapping `/sys/fs/cgroup` (e.g. `--allow /sys`) is refused while `--memory` is active, since it would let the process rewrite its own cap. Use `--read /sys` instead if a workload needs it.
+#### `--max-processes`
+
+Cap how many processes and threads (tasks) the sandboxed tree may have alive at once. Unlike the memory cap, hitting it **kills nothing** — the kernel refuses the next `fork`/`clone` with `EAGAIN`. This bounds fork bombs and runaway spawning.
+
+```bash
+nono run --max-processes 64 -- my-agent
+```
+
+The value is a plain count (minimum `1`) and counts threads as well as processes, so leave headroom for the threads your workload uses. Combine it with `--memory` freely.
+
+Both resource flags share the same enforcement path:
+
+- **Linux only**, enforced via cgroup v2 (`memory.max` / `pids.max`), and requires a systemd `Delegate=yes` user session with the relevant controller (`memory` / `pids`) delegated. Otherwise the request is refused rather than silently ignored.
+- Enforced on `nono run` and `nono shell` (supervised). `nono wrap` execs directly and does not accept `--memory` or `--max-processes`.
+- Granting the sandbox **write** access overlapping `/sys/fs/cgroup` (e.g. `--allow /sys`) is refused while a resource limit is active, since it would let the process rewrite its own cap. Use `--read /sys` instead if a workload needs it.
 
 See [Resource Limits](/cli/features/resource-limits) for the full details.
 

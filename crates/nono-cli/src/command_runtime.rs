@@ -11,8 +11,7 @@ use crate::profile;
 use crate::proxy_runtime::prepare_proxy_launch_options;
 use crate::sandbox_prepare::{
     prepare_sandbox, print_allow_gpu_warning, print_allow_launch_services_warning,
-    should_auto_enable_claude_launch_services, validate_block_net_conflicts,
-    validate_external_proxy_bypass,
+    should_auto_enable_claude_launch_services, validate_proxy_conflicts,
 };
 use crate::theme;
 use nono::{CapabilitySet, NonoError, Result};
@@ -212,8 +211,7 @@ pub(crate) fn run_sandbox(mut run_args: RunArgs, silent: bool) -> Result<()> {
 
     if args.dry_run {
         let prepared = prepare_sandbox(&args, silent)?;
-        validate_block_net_conflicts(&args, &prepared)?;
-        validate_external_proxy_bypass(&args, &prepared)?;
+        validate_proxy_conflicts(&args, &prepared)?;
         if !prepared.secrets.is_empty() && !silent {
             eprintln!(
                 "  Would inject {} credential(s) as environment variables",
@@ -242,6 +240,7 @@ pub(crate) fn run_shell(args: ShellArgs, silent: bool) -> Result<()> {
 
     if args.sandbox.dry_run {
         let prepared = prepare_sandbox(&args.sandbox, silent)?;
+        validate_proxy_conflicts(&args.sandbox, &prepared)?;
         reject_run_only_sandbox_policy("shell", &args.sandbox, &prepared)?;
         if !prepared.secrets.is_empty() && !silent {
             eprintln!(
@@ -255,6 +254,7 @@ pub(crate) fn run_shell(args: ShellArgs, silent: bool) -> Result<()> {
     }
 
     let prepared = prepare_sandbox(&args.sandbox, silent)?;
+    validate_proxy_conflicts(&args.sandbox, &prepared)?;
     reject_run_only_sandbox_policy("shell", &args.sandbox, &prepared)?;
 
     if prepared.allow_launch_services_active {
@@ -420,8 +420,36 @@ pub(crate) fn run_wrap(wrap_args: WrapArgs, silent: bool) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::reject_resource_limits_under_wrap;
+    use super::{reject_resource_limits_under_wrap, run_shell};
+    use crate::cli::{SandboxArgs, ShellArgs};
     use nono::{CapabilitySet, ResourceLimits};
+    use std::path::PathBuf;
+
+    #[test]
+    fn shell_dry_run_rejects_block_net_with_upstream_proxy() {
+        let args = ShellArgs {
+            sandbox: SandboxArgs {
+                dry_run: true,
+                allow_cwd: true,
+                block_net: true,
+                external_proxy: Some("squid.corp:3128".to_string()),
+                ..SandboxArgs::default()
+            },
+            shell: Some(PathBuf::from("/bin/sh")),
+            name: None,
+            startup_timeout_secs: None,
+            help: None,
+        };
+
+        let result = run_shell(args, true);
+        let Err(err) = result else {
+            panic!("expected shell dry-run to reject --block-net + --upstream-proxy");
+        };
+        assert!(
+            err.to_string().contains("--block-net") && err.to_string().contains("--upstream-proxy"),
+            "unexpected error: {err}"
+        );
+    }
 
     #[test]
     fn wrap_rejects_caps_carrying_a_memory_limit() {

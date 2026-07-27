@@ -211,6 +211,7 @@
           "/usr/local/lib",
           "/usr/local/lib64",
           "/etc/resolv.conf",
+          "/run/systemd/resolve",
           "/etc/hosts",
           "/etc/nsswitch.conf",
           "/etc/gai.conf",

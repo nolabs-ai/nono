@@ -299,13 +299,7 @@ fn is_opted_out() -> bool {
     if std::env::var(NO_PACK_UPDATE_HINTS_ENV).is_ok() {
         return true;
     }
-    if std::env::var("NONO_NO_UPDATE_CHECK").is_ok() {
-        return true;
-    }
-    match crate::config::user::load_user_config() {
-        Ok(Some(config)) => !config.updates.check,
-        _ => false,
-    }
+    crate::update_check::update_check_opted_out()
 }
 
 fn is_newer(installed: &str, latest: &str) -> bool {

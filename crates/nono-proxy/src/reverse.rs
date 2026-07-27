@@ -377,6 +377,34 @@ pub async fn handle_reverse_proxy(
             send_error(stream, 407, "Proxy Authentication Required").await?;
             return Ok(());
         }
+
+        // Route request rate limit (RouteRateLimiter). Gate the authorized request
+        // before credential injection and upstream forwarding: bounded delay, then
+        // HTTP 429 — never a human approval, never an unbounded wait. Opaque CONNECT
+        // tunnels never reach this reverse-proxy path, so they are unaffected.
+        if let Some(limiter) = route.rate_limiter.as_ref() {
+            match limiter.acquire() {
+                crate::rate_limit::RateLimitDecision::Proceed { delay } => {
+                    if !delay.is_zero() {
+                        tokio::time::sleep(delay).await;
+                    }
+                }
+                crate::rate_limit::RateLimitDecision::Reject => {
+                    let reason = "route request rate limit exceeded";
+                    warn!("reverse proxy: {} for service '{}'", reason, service);
+                    audit::log_denied(
+                        ctx.audit_log,
+                        audit::ProxyMode::Reverse,
+                        &route_ctx,
+                        &service,
+                        0,
+                        reason,
+                    );
+                    send_error(stream, 429, "Too Many Requests").await?;
+                    return Ok(());
+                }
+            }
+        }
     }
 
     let captured_credential = if let Some(cmd) = cmd_route

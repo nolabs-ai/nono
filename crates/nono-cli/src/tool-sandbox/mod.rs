@@ -152,6 +152,34 @@ pub(crate) fn lexically_normalize(path: &std::path::Path) -> std::path::PathBuf 
     normalized
 }
 
+/// Restore owner-write on every directory in `dir`'s tree so a following
+/// `remove_dir_all` can unlink entries inside sealed subdirectories.
+///
+/// The shim directory is sealed to `0o500` while the sandbox runs so its
+/// private shim copies stay immutable. Unlinking a file needs write on its
+/// *parent* directory and `remove_dir_all` does not chmod as it descends, so
+/// without this the per-invocation runtime directory leaks on every exit.
+/// Best-effort and never follows or modifies symlinks; a real failure still
+/// surfaces from the subsequent `remove_dir_all`.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn restore_dir_tree_writable(dir: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(meta) = std::fs::symlink_metadata(dir) else {
+        return;
+    };
+    if !meta.is_dir() || meta.file_type().is_symlink() {
+        return;
+    }
+    // Grant owner rwx before descending so we can traverse and unlink children.
+    let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        restore_dir_tree_writable(&entry.path());
+    }
+}
+
 /// Whether the agent's own filesystem grants admit *writing* `path` directly.
 ///
 /// True when `path` is (or is under) the agent's own `--workdir`

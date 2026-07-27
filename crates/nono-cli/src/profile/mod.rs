@@ -373,6 +373,15 @@ pub struct CustomCredentialDef {
     /// SPIFFE/SPIRE Workload API auth. Mutually exclusive with `credential_key`, `auth`, and `aws_auth`.
     #[serde(default)]
     pub spiffe: Option<nono_proxy::config::SpiffeAuthConfig>,
+
+    /// Optional per-route request-rate limit (RouteRateLimiter).
+    ///
+    /// Caps the rate of L7 requests forwarded to this credential's upstream to
+    /// contain a runaway or compromised agent. Applies only to L7-visible
+    /// traffic (reverse-proxy routes and TLS-intercepted CONNECT); it has no
+    /// effect on an opaque CONNECT tunnel.
+    #[serde(default)]
+    pub rate_limit: Option<nono_proxy::config::RouteRateLimitConfig>,
 }
 
 /// Host-side source that materializes a proxy credential for `cmd://<name>`.
@@ -5186,6 +5195,7 @@ mod tests {
             tls_client_key: None,
             aws_auth: None,
             spiffe: None,
+            rate_limit: None,
         }
     }
 
@@ -5355,6 +5365,7 @@ mod tests {
                 credential_format: None,
                 svid_hint: None,
             }),
+            rate_limit: None,
         };
         assert!(validate_custom_credential("testapi", &cred).is_ok());
     }
@@ -5404,6 +5415,7 @@ mod tests {
             tls_client_key: None,
             aws_auth: None,
             spiffe: None,
+            rate_limit: None,
         };
         assert!(validate_custom_credential("telegram", &cred).is_ok());
     }
@@ -5429,6 +5441,7 @@ mod tests {
             tls_client_key: None,
             aws_auth: None,
             spiffe: None,
+            rate_limit: None,
         };
         let result = validate_custom_credential("telegram", &cred);
         let err = result.expect_err("missing path_pattern should be rejected");
@@ -5456,6 +5469,7 @@ mod tests {
             tls_client_key: None,
             aws_auth: None,
             spiffe: None,
+            rate_limit: None,
         };
         let result = validate_custom_credential("telegram", &cred);
         let err = result.expect_err("pattern without {} should be rejected");
@@ -5483,6 +5497,7 @@ mod tests {
             tls_client_key: None,
             aws_auth: None,
             spiffe: None,
+            rate_limit: None,
         };
         assert!(validate_custom_credential("telegram", &cred).is_ok());
     }
@@ -5508,6 +5523,7 @@ mod tests {
             tls_client_key: None,
             aws_auth: None,
             spiffe: None,
+            rate_limit: None,
         };
         let result = validate_custom_credential("telegram", &cred);
         let err = result.expect_err("replacement without {} should be rejected");
@@ -5535,6 +5551,7 @@ mod tests {
             tls_client_key: None,
             aws_auth: None,
             spiffe: None,
+            rate_limit: None,
         };
         assert!(validate_custom_credential("google_maps", &cred).is_ok());
     }
@@ -5560,6 +5577,7 @@ mod tests {
             tls_client_key: None,
             aws_auth: None,
             spiffe: None,
+            rate_limit: None,
         };
         let result = validate_custom_credential("google_maps", &cred);
         let err = result.expect_err("missing query_param_name should be rejected");
@@ -5587,6 +5605,7 @@ mod tests {
             tls_client_key: None,
             aws_auth: None,
             spiffe: None,
+            rate_limit: None,
         };
         let result = validate_custom_credential("google_maps", &cred);
         let err = result.expect_err("empty query_param_name should be rejected");
@@ -5614,6 +5633,7 @@ mod tests {
             tls_client_key: None,
             aws_auth: None,
             spiffe: None,
+            rate_limit: None,
         };
         // BasicAuth mode doesn't require additional fields
         // Credential value is expected to be "username:password" format
@@ -5820,6 +5840,7 @@ mod tests {
             tls_client_key: None,
             aws_auth: None,
             spiffe: None,
+            rate_limit: None,
         }
     }
 
@@ -5956,6 +5977,60 @@ mod tests {
         assert_eq!(auth.client_id, "my-client");
         assert_eq!(auth.client_secret, "env://CLIENT_SECRET");
         assert_eq!(auth.scope, "api.read");
+    }
+
+    #[test]
+    fn test_parse_profile_with_rate_limit() {
+        let json = r#"{
+            "meta": { "name": "rate-limit-test" },
+            "network": {
+                "custom_credentials": {
+                    "my_api": {
+                        "upstream": "https://api.example.com",
+                        "credential_key": "env://MY_API_KEY",
+                        "rate_limit": {
+                            "requests_per_minute": 120,
+                            "burst": 10,
+                            "max_delay_secs": 3
+                        }
+                    }
+                }
+            }
+        }"#;
+        let dir = tempdir().expect("tmpdir");
+        let path = dir.path().join("rate-limit-test.json");
+        std::fs::write(&path, json).expect("write profile");
+        let profile = load_profile_from_path(&path).expect("parse profile");
+        let cred = &profile.network.custom_credentials["my_api"];
+        let rl = cred.rate_limit.as_ref().expect("rate_limit should be set");
+        assert_eq!(rl.requests_per_minute, 120);
+        assert_eq!(rl.burst, 10);
+        assert_eq!(rl.max_delay_secs, 3);
+    }
+
+    #[test]
+    fn test_parse_profile_rate_limit_defaults() {
+        let json = r#"{
+            "meta": { "name": "rate-limit-defaults" },
+            "network": {
+                "custom_credentials": {
+                    "my_api": {
+                        "upstream": "https://api.example.com",
+                        "credential_key": "env://MY_API_KEY",
+                        "rate_limit": { "requests_per_minute": 60 }
+                    }
+                }
+            }
+        }"#;
+        let dir = tempdir().expect("tmpdir");
+        let path = dir.path().join("rate-limit-defaults.json");
+        std::fs::write(&path, json).expect("write profile");
+        let profile = load_profile_from_path(&path).expect("parse profile");
+        let cred = &profile.network.custom_credentials["my_api"];
+        let rl = cred.rate_limit.as_ref().expect("rate_limit should be set");
+        assert_eq!(rl.requests_per_minute, 60);
+        assert_eq!(rl.burst, 5, "burst should default to 5");
+        assert_eq!(rl.max_delay_secs, 5, "max_delay_secs should default to 5");
     }
 
     #[test]
@@ -6428,6 +6503,7 @@ mod tests {
                 tls_client_key: None,
                 aws_auth: None,
                 spiffe: None,
+                rate_limit: None,
             },
         );
 
@@ -6453,6 +6529,7 @@ mod tests {
                 tls_client_key: None,
                 aws_auth: None,
                 spiffe: None,
+                rate_limit: None,
             },
         );
 
@@ -6596,6 +6673,7 @@ mod tests {
                 tls_client_key: None,
                 aws_auth: None,
                 spiffe: None,
+                rate_limit: None,
             },
         );
 
@@ -6621,6 +6699,7 @@ mod tests {
                 tls_client_key: None,
                 aws_auth: None,
                 spiffe: None,
+                rate_limit: None,
             },
         );
 
@@ -8364,6 +8443,7 @@ mod tests {
             tls_client_key: None,
             aws_auth: None,
             spiffe: None,
+            rate_limit: None,
         };
         assert!(
             validate_custom_credential("example", &cred).is_ok(),
@@ -8392,6 +8472,7 @@ mod tests {
             tls_client_key: None,
             aws_auth: None,
             spiffe: None,
+            rate_limit: None,
         };
         let result = validate_custom_credential("example", &cred);
         let err = result.expect_err("file:// URI without env_var should be rejected");
@@ -8423,6 +8504,7 @@ mod tests {
             tls_client_key: None,
             aws_auth: None,
             spiffe: None,
+            rate_limit: None,
         };
         let result = validate_custom_credential("example", &cred);
         let err = result.expect_err("file:// URI with relative path should be rejected");
@@ -8454,6 +8536,7 @@ mod tests {
             tls_client_key: None,
             aws_auth: None,
             spiffe: None,
+            rate_limit: None,
         };
         let result = validate_custom_credential("example", &cred);
         assert!(
@@ -8517,6 +8600,7 @@ mod tests {
             tls_client_key: None,
             aws_auth: None,
             spiffe: None,
+            rate_limit: None,
         };
         assert!(validate_custom_credential("example", &cred).is_ok());
     }
@@ -8926,6 +9010,7 @@ mod tests {
             tls_client_key: None,
             aws_auth: None,
             spiffe: None,
+            rate_limit: None,
         };
         let result = validate_custom_credential("example", &cred);
         assert!(result.is_err(), "env://LD_PRELOAD should be rejected");
@@ -9729,6 +9814,7 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             spiffe: None,
+            rate_limit: None,
         }
     }
 
@@ -9814,6 +9900,7 @@ mod tests {
             auth: None,
             aws_auth: None,
             spiffe: None,
+            rate_limit: None,
             ..aws_auth_cred_builder()
         };
         let result = validate_custom_credential("bedrock", &cred);

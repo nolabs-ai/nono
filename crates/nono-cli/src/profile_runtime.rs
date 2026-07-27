@@ -1234,6 +1234,8 @@ mod tests {
                 provider_type: profile::CredentialProviderType::OauthCapture,
                 token_endpoints: Vec::new(),
                 api_hosts: Vec::new(),
+                inject_header: None,
+                credential_format: None,
                 credential_store: Some(profile::CredentialProviderStore::FileJson {
                     path: "$HOME/.codex-nono-oauth/auth.json".to_string(),
                     phantom_fields: vec!["tokens.access_token".to_string()],
@@ -1287,6 +1289,8 @@ mod tests {
                 provider_type: profile::CredentialProviderType::OauthCapture,
                 token_endpoints: Vec::new(),
                 api_hosts: Vec::new(),
+                inject_header: None,
+                credential_format: None,
                 credential_store: Some(profile::CredentialProviderStore::FileJson {
                     path: "$HOME/.codex-nono-oauth/auth.json".to_string(),
                     phantom_fields: vec!["tokens.access_token".to_string()],

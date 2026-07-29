@@ -222,7 +222,7 @@ pub enum Commands {
   nono why --path ./src --op write --allow .   # Check with capability context
   nono why --json --path ~/.aws --op read      # JSON output for agents
   nono why --host api.openai.com --port 443    # Query network access
-  nono why --self --path /tmp --op write       # Inside sandbox, query own capabilities
+  nono why --self --path /var --op write       # Inside sandbox, query own capabilities
   nono why --profile gh --command gh -- issue comment 1052
                                                 # Query ETI command argv policy
 

@@ -3,8 +3,16 @@ name: SPIRE
 on:
   pull_request:
     branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - '**.md'
+      - '**.mdx'
   push:
     branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - '**.md'
+      - '**.mdx'
 
 permissions:
   contents: read

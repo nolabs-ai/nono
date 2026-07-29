@@ -19,7 +19,7 @@ Command fails with "Permission denied" or "Operation not permitted" errors.
 2. **Query capabilities from inside the sandbox**:
    ```bash
    # Check if a specific path is accessible
-   nono run --allow-cwd -- nono why --self --path /tmp --op write --json
+   nono run --allow-cwd -- nono why --self --path /var --op write --json
 
    # Human-readable output
    nono run --allow-cwd -- nono why --self --path ~/.ssh --op read

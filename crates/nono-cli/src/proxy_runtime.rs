@@ -1461,6 +1461,18 @@ pub(crate) fn prepare_proxy_launch_options(
         network_profile.is_some() || !allow_domain.is_empty() || !deny_domain.is_empty();
     let has_credentials = !credentials.is_empty();
     let would_activate = has_domain_filter || has_credentials || upstream_proxy_addr.is_some();
+    let open_url = if !prepared.open_url_origins.is_empty()
+        || prepared.open_url_allow_localhost
+        || prepared.allow_launch_services_active
+    {
+        Some(OpenUrlIntent {
+            origins: prepared.open_url_origins.clone(),
+            allow_localhost: prepared.open_url_allow_localhost,
+            allow_launch_services: prepared.allow_launch_services_active,
+        })
+    } else {
+        None
+    };
 
     // Normal launch validation rejects hard-block plus proxy-mode inputs before
     // this fallback can choose BlockAll or strict filtering.
@@ -1478,7 +1490,7 @@ pub(crate) fn prepare_proxy_launch_options(
                 );
             }
         }
-        return Ok(NetworkIntent::BlockAll);
+        return Ok(NetworkIntent::BlockAll { open_url });
     }
 
     let strict_filter = prepared.profile_network_block;
@@ -1553,19 +1565,6 @@ pub(crate) fn prepare_proxy_launch_options(
         Some(TlsInterceptIntent {
             ca_validity: tls_options.ca_validity,
             ca_env_vars: tls_options.ca_env_vars,
-        })
-    } else {
-        None
-    };
-
-    let open_url = if !prepared.open_url_origins.is_empty()
-        || prepared.open_url_allow_localhost
-        || prepared.allow_launch_services_active
-    {
-        Some(OpenUrlIntent {
-            origins: prepared.open_url_origins.clone(),
-            allow_localhost: prepared.open_url_allow_localhost,
-            allow_launch_services: prepared.allow_launch_services_active,
         })
     } else {
         None

@@ -1,7 +1,7 @@
 use crate::audit_attestation::AuditSigner;
 use crate::audit_integrity::AuditRecorder;
 use crate::launch_runtime::{
-    ProxyLaunchOptions, RollbackLaunchOptions, SessionLaunchOptions, TrustLaunchOptions,
+    OpenUrlIntent, RollbackLaunchOptions, SessionLaunchOptions, TrustLaunchOptions,
 };
 use crate::rollback_runtime::{
     AuditState, RollbackExitContext, create_audit_state, finalize_supervised_exit,
@@ -31,7 +31,7 @@ pub(crate) struct SupervisedRuntimeContext<'a> {
     pub(crate) session: &'a SessionLaunchOptions,
     pub(crate) rollback: &'a RollbackLaunchOptions,
     pub(crate) trust: &'a TrustLaunchOptions,
-    pub(crate) proxy: Option<&'a ProxyLaunchOptions>,
+    pub(crate) open_url: Option<&'a OpenUrlIntent>,
     pub(crate) proxy_handle: Option<&'a nono_proxy::server::ProxyHandle>,
     pub(crate) executable_identity: Option<&'a ExecutableIdentity>,
     pub(crate) audit_signer: Option<&'a AuditSigner>,
@@ -193,7 +193,7 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
         session,
         rollback,
         trust,
-        proxy,
+        open_url,
         proxy_handle,
         executable_identity,
         audit_signer,
@@ -283,21 +283,12 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
         session_id: &supervisor_session_id,
         attach_initial_client: !session.detached_start,
         detach_sequence: session.detach_sequence.as_deref(),
-        open_url_origins: proxy
-            .and_then(|p| p.open_url.as_ref())
-            .map(|o| o.origins.as_slice())
-            .unwrap_or(&[]),
-        open_url_allow_localhost: proxy
-            .and_then(|p| p.open_url.as_ref())
-            .map(|o| o.allow_localhost)
-            .unwrap_or(false),
+        open_url_origins: open_url.map(|o| o.origins.as_slice()).unwrap_or(&[]),
+        open_url_allow_localhost: open_url.map(|o| o.allow_localhost).unwrap_or(false),
         audit_recorder: audit_recorder.clone(),
         network_audit_events: supervisor_network_audit_events.as_ref(),
         redaction_policy,
-        allow_launch_services_active: proxy
-            .and_then(|p| p.open_url.as_ref())
-            .map(|o| o.allow_launch_services)
-            .unwrap_or(false),
+        allow_launch_services_active: open_url.map(|o| o.allow_launch_services).unwrap_or(false),
         #[cfg(target_os = "linux")]
         proxy_port: match caps.network_mode() {
             nono::NetworkMode::ProxyOnly { port, .. } => *port,

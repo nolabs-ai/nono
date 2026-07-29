@@ -195,8 +195,9 @@ pub(crate) enum NetworkIntent {
     #[default]
     Unrestricted,
     /// `--block-net` or profile `network.block` with no active proxy override:
-    /// outbound connections are denied by the OS sandbox.
-    BlockAll,
+    /// outbound connections are denied by the OS sandbox. URL-opening requests
+    /// are handled by the supervisor and may still carry their own allowlist.
+    BlockAll { open_url: Option<OpenUrlIntent> },
     /// Proxy-activating features are configured. Proxy starts only if
     /// `ProxyLaunchOptions::is_active()` — custom credentials alone do not.
     ProxyFiltered(Box<ProxyLaunchOptions>),
@@ -211,6 +212,14 @@ impl NetworkIntent {
         match self {
             Self::ProxyFiltered(opts) => Some(opts),
             _ => None,
+        }
+    }
+
+    pub(crate) fn open_url_options(&self) -> Option<&OpenUrlIntent> {
+        match self {
+            Self::BlockAll { open_url } => open_url.as_ref(),
+            Self::ProxyFiltered(opts) => opts.open_url.as_ref(),
+            Self::Unrestricted => None,
         }
     }
 }
@@ -673,6 +682,23 @@ mod tests {
             command: Vec::new(),
             help: None,
         }
+    }
+
+    #[test]
+    fn blocked_network_preserves_open_url_options_without_proxy_activation() {
+        let intent = NetworkIntent::BlockAll {
+            open_url: Some(OpenUrlIntent {
+                origins: vec!["https://example.com".to_string()],
+                allow_localhost: true,
+                allow_launch_services: false,
+            }),
+        };
+
+        assert!(!intent.is_proxy_active());
+        assert!(intent.proxy_options().is_none());
+        let open_url = intent.open_url_options().expect("open URL options");
+        assert_eq!(open_url.origins, ["https://example.com"]);
+        assert!(open_url.allow_localhost);
     }
 
     #[test]

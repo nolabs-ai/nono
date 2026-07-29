@@ -162,6 +162,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
     let trust = &flags.trust;
     let network = &flags.network;
     let proxy = network.proxy_options();
+    let open_url = network.open_url_options();
     let session = &flags.session;
     let tool_sandbox_active = flags
         .command_policies
@@ -672,7 +673,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
                 session,
                 rollback,
                 trust,
-                proxy,
+                open_url,
                 proxy_handle: proxy_handle.as_ref(),
                 executable_identity: executable_identity.as_ref(),
                 audit_signer: audit_signer.as_ref(),

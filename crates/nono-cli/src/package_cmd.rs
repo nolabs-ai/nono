@@ -868,6 +868,24 @@ fn download_and_verify_artifacts(
     let bundle_path = Path::new(".nono-trust.bundle");
     let tempdir = TempDir::new().map_err(NonoError::Io)?;
 
+    // A static or internal registry serves unsigned packs, so its pull response
+    // carries no bundle URL. Catch that here: handing the empty URL to the
+    // bundle loader surfaces an opaque JSON parse error that says nothing about
+    // the actual situation or the way out of it.
+    if verify && pull.bundle_url.is_empty() {
+        return Err(NonoError::PackageVerification {
+            package: package_ref.key(),
+            reason: format!(
+                "the registry served no signature for this pack (its pull response carries no bundle URL); \
+                 static and internal registries serve unsigned packs\n\
+                 install it without signature verification: nono pull {}@{} --insecure\n\
+                 or disable verification fleet-wide in config.toml: [registry] verify = false",
+                package_ref.key(),
+                pull.version
+            ),
+        });
+    }
+
     // When verification is enabled, download the single multi-subject bundle,
     // verify its signature against the embedded Sigstore root, and build the
     // set of trusted subject digests. When disabled (internal/air-gapped
@@ -1629,5 +1647,72 @@ mod tests {
         )
         .expect("parse latest");
         assert_eq!(latest.version, "1.0.2");
+    }
+
+    /// Verifying a pack whose registry advertises no bundle must fail with a
+    /// message that names the situation and the way out, not with the JSON
+    /// parse error the bundle loader raises when handed an empty URL. The
+    /// early return happens before any request, so the client is never used.
+    #[test]
+    fn verify_without_bundle_url_explains_how_to_install_unsigned() {
+        let package_ref = PackageRef {
+            namespace: "acme".to_string(),
+            name: "widget".to_string(),
+            version: None,
+        };
+        let pull = PullResponse {
+            namespace: "acme".to_string(),
+            name: "widget".to_string(),
+            version: "1.0.0".to_string(),
+            provenance: None,
+            artifacts: Vec::new(),
+            bundle_url: String::new(),
+            scan_passed: true,
+        };
+        let client = RegistryClient::new("http://127.0.0.1:1".to_string());
+
+        let message = match download_and_verify_artifacts(&client, &package_ref, &pull, true, None)
+        {
+            Ok(_) => panic!("verification must fail when no bundle is advertised"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            message.contains("no signature for this pack"),
+            "message should name the cause, got: {message}"
+        );
+        assert!(
+            message.contains("nono pull acme/widget@1.0.0 --insecure"),
+            "message should give the per-command way out, got: {message}"
+        );
+        assert!(
+            message.contains("verify = false"),
+            "message should give the fleet-wide way out, got: {message}"
+        );
+    }
+
+    /// The same call with verification disabled must not trip the new guard:
+    /// an absent bundle is the expected shape for a static registry.
+    #[test]
+    fn missing_bundle_url_is_fine_when_not_verifying() {
+        let package_ref = PackageRef {
+            namespace: "acme".to_string(),
+            name: "widget".to_string(),
+            version: None,
+        };
+        let pull = PullResponse {
+            namespace: "acme".to_string(),
+            name: "widget".to_string(),
+            version: "1.0.0".to_string(),
+            provenance: None,
+            artifacts: Vec::new(),
+            bundle_url: String::new(),
+            scan_passed: true,
+        };
+        let client = RegistryClient::new("http://127.0.0.1:1".to_string());
+
+        match download_and_verify_artifacts(&client, &package_ref, &pull, false, None) {
+            Ok(verified) => assert!(verified.bundle_json.is_none()),
+            Err(error) => panic!("unsigned install must not require a bundle: {error}"),
+        }
     }
 }

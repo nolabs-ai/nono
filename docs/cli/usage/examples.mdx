@@ -74,7 +74,7 @@ nono why --path ./src --op read --profile always-further/claude
 
 ```bash
 # AI agents can query their own capabilities
-nono run --allow-cwd -- nono why --self --path /tmp --op write --json
+nono run --allow-cwd -- nono why --self --path /var --op write --json
 # {"status":"denied","reason":"not_in_allowed_paths",...}
 ```
 
@@ -191,7 +191,7 @@ nono run -vvv --allow-cwd -- command
 nono run --allow . -- sh -c "echo test > ./allowed.txt"
 
 # Should fail - writing outside allowed path
-nono run --allow-cwd -- sh -c "echo test > /tmp/blocked.txt"
+nono run --allow-cwd -- sh -c "echo test > /var/blocked.txt"
 
 # Should succeed - network allowed by default
 nono run --allow-cwd -- curl https://example.com

@@ -3154,6 +3154,20 @@ fn parse_profile_file(path: &Path) -> Result<Profile> {
     parse_profile_bytes(&content)
 }
 
+/// Canonicalize and parse a file-backed profile as a single source identity.
+///
+/// Inheritance context must come from the same resolved path that is read. In
+/// particular, reading through a symlink while retaining its lexical parent
+/// would make transitive `extends` resolution depend on the link location.
+fn parse_file_backed_profile(path: &Path) -> Result<(Profile, PathBuf)> {
+    let source_path = path.canonicalize().map_err(|e| NonoError::ProfileRead {
+        path: path.to_path_buf(),
+        source: e,
+    })?;
+    let profile = parse_profile_file(&source_path)?;
+    Ok((profile, source_path))
+}
+
 #[allow(deprecated)]
 pub(crate) fn parse_profile_bytes(content: &[u8]) -> Result<Profile> {
     let text = std::str::from_utf8(content)
@@ -3200,10 +3214,10 @@ pub(crate) fn parse_profile_bytes(content: &[u8]) -> Result<Profile> {
 /// Load a profile from a JSON file, resolving inheritance. The parent
 /// directory is passed as context so `extends` can resolve sibling profiles.
 fn load_from_file(path: &Path, cli_extends: &[String]) -> Result<Profile> {
-    let mut profile = parse_profile_file(path)?;
+    let (mut profile, source_path) = parse_file_backed_profile(path)?;
     prepend_cli_extends(&mut profile, cli_extends);
-    let context_dir = path.parent();
-    resolve_extends(profile, &mut Vec::new(), 0, context_dir, Some(path))
+    let context_dir = source_path.parent();
+    resolve_extends(profile, &mut Vec::new(), 0, context_dir, Some(&source_path))
 }
 
 fn prepend_cli_extends(profile: &mut Profile, cli_extends: &[String]) {
@@ -3280,17 +3294,16 @@ fn resolve_extends(
         visited.push(base_name.clone());
 
         let resolved = load_base_profile_raw(base_name, context_dir, source_file)?;
-        let (base, next_context, next_source) = match resolved {
-            ResolvedBase::Sibling(p, path) => (p, context_dir, Some(path)),
-            ResolvedBase::Global(p) => (p, None, None),
+        let resolved_base = match resolved {
+            ResolvedBase::Sibling(base, source_path) => resolve_extends(
+                base,
+                visited,
+                depth + 1,
+                source_path.parent(),
+                Some(&source_path),
+            )?,
+            ResolvedBase::Global(base) => resolve_extends(base, visited, depth + 1, None, None)?,
         };
-        let resolved_base = resolve_extends(
-            base,
-            visited,
-            depth + 1,
-            next_context,
-            next_source.as_deref(),
-        )?;
         // Pop to restore the stack to the pre-base state. On the error path
         // above (? propagation), visited is abandoned so the missing pop is harmless.
         visited.pop();
@@ -3308,10 +3321,9 @@ fn resolve_extends(
 }
 
 /// Distinguishes where a base profile was resolved from so `resolve_extends`
-/// can propagate `context_dir` only for sibling-resolved profiles. Global
-/// sources (user dir, pack-store, built-in) clear the context to prevent
-/// project-local files from hijacking built-in inheritance chains. `Sibling`
-/// carries the file path so the next recursion level can skip self-references.
+/// can propagate the canonical source directory only for sibling-resolved
+/// profiles. Global sources clear the context to prevent project-local files
+/// from hijacking built-in inheritance chains.
 enum ResolvedBase {
     Sibling(Profile, PathBuf),
     Global(Profile),
@@ -3353,17 +3365,17 @@ fn load_base_profile_raw(
     //    self-references (e.g. `.nono/codex.json` extending "codex").
     if let Some(dir) = context_dir {
         let sibling_path = dir.join(format!("{name}.json"));
-        let is_self = source_file.is_some_and(|src| sibling_path == src);
-        if !is_self && sibling_path.is_file() {
-            tracing::debug!(
-                "Resolved '{}' from sibling: {}",
-                name,
-                sibling_path.display()
-            );
-            return Ok(ResolvedBase::Sibling(
-                parse_profile_file(&sibling_path)?,
-                sibling_path,
-            ));
+        if sibling_path.is_file() {
+            let (profile, source_path) = parse_file_backed_profile(&sibling_path)?;
+            let is_self = source_file.is_some_and(|src| source_path == src);
+            if !is_self {
+                tracing::debug!(
+                    "Resolved '{}' from sibling: {}",
+                    name,
+                    source_path.display()
+                );
+                return Ok(ResolvedBase::Sibling(profile, source_path));
+            }
         }
     }
 
@@ -6747,6 +6759,43 @@ mod tests {
         );
         // extends should be consumed
         assert!(profile.extends.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_transitive_extends_uses_symlinked_parent_referent()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let dir = tempdir()?;
+        let profiles_dir = dir.path().join("profiles");
+        let referent_dir = dir.path().join("referent");
+        std::fs::create_dir_all(&profiles_dir)?;
+        std::fs::create_dir_all(&referent_dir)?;
+
+        std::fs::write(
+            referent_dir.join("base.json"),
+            r#"{ "meta": { "name": "base" }, "filesystem": { "read": ["/referent-base"] } }"#,
+        )?;
+        std::fs::write(
+            referent_dir.join("parent.json"),
+            r#"{ "extends": "base", "meta": { "name": "parent" } }"#,
+        )?;
+        std::fs::write(
+            profiles_dir.join("base.json"),
+            r#"{ "meta": { "name": "decoy" }, "filesystem": { "read": ["/link-base"] } }"#,
+        )?;
+        std::fs::write(
+            profiles_dir.join("child.json"),
+            r#"{ "extends": "parent", "meta": { "name": "child" } }"#,
+        )?;
+        std::os::unix::fs::symlink(
+            referent_dir.join("parent.json"),
+            profiles_dir.join("parent.json"),
+        )?;
+
+        let profile = load_from_file(&profiles_dir.join("child.json"), &[])?;
+
+        assert_eq!(profile.filesystem.read, vec!["/referent-base"]);
+        Ok(())
     }
 
     #[test]

@@ -2556,6 +2556,14 @@ pub fn load_profile_extends(name_or_path: &str) -> Option<Vec<String>> {
             .and_then(|p| p.extends);
     }
 
+    // Registry refs are not valid bare profile names, so resolve them from the
+    // pack store before the name check below rejects them.
+    if is_registry_ref(name_or_path) {
+        return find_pack_store_profile(name_or_path)
+            .and_then(|(profile_path, _)| parse_profile_file(&profile_path).ok())
+            .and_then(|p| p.extends);
+    }
+
     if !is_valid_profile_name(name_or_path) {
         return None;
     }
@@ -3001,7 +3009,16 @@ fn load_registry_profile(name_or_path: &str, cli_extends: &[String]) -> Result<P
     // Find the profile JSON in the installed pack
     for artifact in &manifest.artifacts {
         if artifact.artifact_type == crate::package::ArtifactType::Profile {
-            let install_name = artifact.install_as.as_deref().unwrap_or(&artifact.path);
+            let Some(install_name) = artifact.install_as.as_deref() else {
+                // `nono pull` rejects profile artifacts without `install_as`,
+                // so this only happens for a hand-built store.
+                tracing::warn!(
+                    "pack '{}' declares profile artifact '{}' without install_as; skipping",
+                    package_ref.key(),
+                    artifact.path
+                );
+                continue;
+            };
             let profile_path = install_dir
                 .join("profiles")
                 .join(format!("{install_name}.json"));
@@ -9879,6 +9896,93 @@ mod tests {
             after.source_pack.as_ref().map(PackageRef::key).as_deref(),
             Some("acme/widget-pack"),
             "absolute-path after hook must still have source_pack set"
+        );
+    }
+
+    #[test]
+    fn test_load_profile_extends_resolves_registry_refs_via_pack_store() {
+        let (from_ref, from_install_as) = with_config_env(|config_dir| {
+            build_fake_pack_store(
+                config_dir,
+                "acme",
+                "widget-pack",
+                "widget",
+                r#"{
+                    "meta": { "name": "widget" },
+                    "extends": ["node-dev", "default"]
+                }"#,
+                None,
+            );
+            (
+                load_profile_extends("acme/widget-pack"),
+                load_profile_extends("widget"),
+            )
+        });
+
+        assert_eq!(
+            from_ref.as_deref(),
+            Some(["node-dev".to_string(), "default".to_string()].as_slice()),
+            "registry ref must report the pack profile's bases"
+        );
+        assert_eq!(
+            from_ref, from_install_as,
+            "registry ref and install_as short name must agree"
+        );
+    }
+
+    #[test]
+    fn test_load_profile_extends_returns_none_for_unknown_registry_ref() {
+        let extends = with_config_env(|_config_dir| load_profile_extends("acme/not-installed"));
+        assert!(
+            extends.is_none(),
+            "an uninstalled pack ref has no resolvable bases"
+        );
+    }
+
+    #[test]
+    fn test_profile_artifact_without_install_as_is_rejected_by_load_and_extends() {
+        let (loaded, extends) = with_config_env(|config_dir| {
+            let install_dir = config_dir
+                .join("nono")
+                .join("packages")
+                .join("acme")
+                .join("no-install-as");
+            std::fs::create_dir_all(install_dir.join("profiles")).expect("create profiles dir");
+            std::fs::write(
+                install_dir.join("package.json"),
+                r#"{
+                  "schema_version": 1,
+                  "name": "no-install-as",
+                  "artifacts": [{
+                    "type": "profile",
+                    "path": "widget"
+                  }]
+                }"#,
+            )
+            .expect("write package.json");
+            std::fs::write(
+                install_dir.join("profiles").join("widget.json"),
+                r#"{
+                    "meta": { "name": "widget" },
+                    "extends": "nolabs-ai/claude"
+                }"#,
+            )
+            .expect("write pack profile");
+
+            (
+                load_profile_no_migrate("acme/no-install-as"),
+                load_profile_extends("acme/no-install-as"),
+            )
+        });
+
+        let err = loaded.expect_err("artifact without install_as must not resolve");
+        assert!(
+            err.to_string().contains("no profile found in pack"),
+            "expected a no-profile-found error, got: {err}"
+        );
+        assert!(
+            extends.is_none(),
+            "extends resolution must agree with the loader and report no bases"
         );
     }
 

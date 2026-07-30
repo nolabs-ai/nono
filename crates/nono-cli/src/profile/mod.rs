@@ -9403,17 +9403,7 @@ mod tests {
     where
         F: FnOnce(&Path) -> R,
     {
-        let _guard = match crate::test_env::ENV_LOCK.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
-        let tmp = tempdir().expect("tmpdir");
-        let config_dir = tmp.path().canonicalize().expect("canonicalize");
-        let _env = crate::test_env::EnvVarGuard::set_all(&[(
-            "XDG_CONFIG_HOME",
-            config_dir.to_str().expect("utf8"),
-        )]);
-        f(&config_dir)
+        crate::test_env::with_isolated_config_home(f)
     }
 
     /// Build a minimal pack store under `config_dir` (used as XDG_CONFIG_HOME).
@@ -9432,39 +9422,15 @@ mod tests {
         profile_json: &str,
         hook_file: Option<&str>,
     ) -> PathBuf {
-        let install_dir = config_dir
-            .join("nono")
-            .join("packages")
-            .join(ns)
-            .join(pack_name);
-        std::fs::create_dir_all(install_dir.join("profiles")).expect("create profiles dir");
-        if let Some(hf) = hook_file {
-            let hooks_dir = install_dir.join("hooks");
-            std::fs::create_dir_all(&hooks_dir).expect("create hooks dir");
-            std::fs::write(hooks_dir.join(hf), "#!/bin/sh\n").expect("write hook file");
-        }
-        // Write package.json manifest
-        let manifest = format!(
-            r#"{{
-              "schema_version": 1,
-              "name": "{pack_name}",
-              "artifacts": [{{
-                "type": "profile",
-                "path": "profiles/{install_as}.json",
-                "install_as": "{install_as}"
-              }}]
-            }}"#
-        );
-        std::fs::write(install_dir.join("package.json"), &manifest).expect("write package.json");
-        // Write profile JSON
-        std::fs::write(
-            install_dir
-                .join("profiles")
-                .join(format!("{install_as}.json")),
+        crate::test_env::write_fake_pack(
+            config_dir,
+            ns,
+            pack_name,
+            install_as,
             profile_json,
+            &[],
+            hook_file,
         )
-        .expect("write profile json");
-        install_dir
     }
 
     /// Test 1: A hook script starting with `$PACK_DIR` in a registry-pack profile

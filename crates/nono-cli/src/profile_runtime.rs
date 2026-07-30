@@ -708,6 +708,7 @@ fn prepare_profile_with_options(
         let profile = profile::load_profile_with_extends(profile_name, &args.extends)?;
         crate::package_status::enforce_for_active_profile(
             Some(profile_name),
+            &args.extends,
             options.hook_output_silent,
         )?;
         // If the profile was addressed by pack ref (e.g. --profile nolabs-ai/hermes),

@@ -6,6 +6,8 @@ use crate::config;
 use crate::credential_runtime::load_env_credentials;
 use crate::network_policy;
 use crate::output;
+#[cfg(unix)]
+use crate::package_status::profile_selects_claude_code;
 use crate::profile;
 use crate::profile::WorkdirAccess;
 use crate::profile_runtime::{prepare_profile, prepare_profile_for_preflight};
@@ -33,25 +35,6 @@ fn print_allow_domain_port_warnings(entries: &[String], context: &str, silent: b
     for warning in network_policy::collect_allow_domain_port_warnings(entries, context) {
         output::print_warning(&warning);
     }
-}
-
-/// Returns `true` if `profile_name` is `"claude-code"` or transitively extends it.
-fn is_claude_code_profile(profile_name: &str) -> bool {
-    fn check(name: &str, visited: &mut Vec<String>) -> bool {
-        if name == "claude-code" {
-            return true;
-        }
-        if visited.iter().any(|v| v == name) {
-            return false; // cycle — bail out
-        }
-        visited.push(name.to_string());
-        let bases = match profile::load_profile_extends(name) {
-            Some(bases) => bases,
-            None => return false,
-        };
-        bases.iter().any(|base| check(base, visited))
-    }
-    check(profile_name, &mut Vec::new())
 }
 
 fn collect_missing_cli_requested_paths(args: &SandboxArgs) -> Vec<String> {
@@ -333,7 +316,10 @@ pub(crate) fn should_auto_enable_claude_launch_services(
     cmd_args: &[std::ffi::OsString],
 ) -> bool {
     if args.allow_launch_services
-        || !args.profile.as_deref().is_some_and(is_claude_code_profile)
+        || !args
+            .profile
+            .as_deref()
+            .is_some_and(|profile| profile_selects_claude_code(profile, &args.extends))
         || !command_is_claude(program)
         || claude_session_has_non_browser_auth(cmd_args)
     {
@@ -1474,7 +1460,11 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
     print_allow_domain_port_warnings(&args.deny_proxy, "--deny-domain", silent);
 
     #[cfg(unix)]
-    if args.profile.as_deref().is_some_and(is_claude_code_profile) {
+    if args
+        .profile
+        .as_deref()
+        .is_some_and(|profile| profile_selects_claude_code(profile, &args.extends))
+    {
         let home = config::validated_home()?;
         let home_path = std::path::Path::new(&home);
 
@@ -1916,10 +1906,24 @@ mod tests {
         );
     }
 
+    /// Isolate every env var the Claude preflight decision reads. Callers must
+    /// hold `test_env::ENV_LOCK`.
+    ///
+    /// `XDG_CONFIG_HOME` is part of that set because the profile-name check
+    /// (`profile_selects_claude_code`) resolves the name against the user
+    /// profile dir and the pack store, both under the nono config dir. Leaving
+    /// it to the ambient environment lets a developer's own
+    /// `~/.config/nono/profiles/claude-code.json` decide these assertions.
     #[cfg(target_os = "macos")]
     fn claude_preflight_env(home: &Path, config_dir: &Path) -> crate::test_env::EnvVarGuard {
+        let xdg_config_home = home.join(".config");
+        fs::create_dir_all(&xdg_config_home).expect("mkdir XDG_CONFIG_HOME");
         let env = crate::test_env::EnvVarGuard::set_all(&[
             ("HOME", home.to_str().unwrap_or("/tmp")),
+            (
+                "XDG_CONFIG_HOME",
+                xdg_config_home.to_str().unwrap_or("/tmp/.config"),
+            ),
             (
                 "CLAUDE_CONFIG_DIR",
                 config_dir.to_str().unwrap_or("/tmp/.claude"),

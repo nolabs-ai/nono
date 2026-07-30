@@ -60,3 +60,91 @@ impl Drop for EnvVarGuard {
         }
     }
 }
+
+/// Run `f` with `$XDG_CONFIG_HOME` pointed at a fresh empty directory, so the
+/// user profile dir and the pack store start out empty and only contain what
+/// the test writes.
+pub(crate) fn with_isolated_config_home<F, R>(f: F) -> R
+where
+    F: FnOnce(&std::path::Path) -> R,
+{
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempfile::tempdir().expect("tempdir");
+    // Canonicalize: `resolve_user_config_dir` canonicalizes XDG_CONFIG_HOME,
+    // so hand back the same form the code under test will compute (on macOS
+    // the temp dir is under /var, a symlink to /private/var).
+    let config_home = tmp.path().canonicalize().expect("canonicalize temp dir");
+    let _env = EnvVarGuard::set_all(&[(
+        "XDG_CONFIG_HOME",
+        config_home.to_str().expect("utf-8 temp path"),
+    )]);
+    f(&config_home)
+}
+
+/// Install a fake pack under `config_home` providing one profile artifact
+/// installed as `install_as` and also answering to `aliases`.
+///
+/// Creates:
+///   `<config_home>/nono/packages/<ns>/<pack_name>/package.json`
+///   `<config_home>/nono/packages/<ns>/<pack_name>/profiles/<install_as>.json`
+///   `<config_home>/nono/packages/<ns>/<pack_name>/hooks/<hook_file>` (empty)
+///
+/// Returns the install directory.
+pub(crate) fn write_fake_pack(
+    config_home: &std::path::Path,
+    namespace: &str,
+    pack_name: &str,
+    install_as: &str,
+    profile_json: &str,
+    aliases: &[&str],
+    hook_file: Option<&str>,
+) -> std::path::PathBuf {
+    let install_dir = config_home
+        .join("nono")
+        .join("packages")
+        .join(namespace)
+        .join(pack_name);
+    std::fs::create_dir_all(install_dir.join("profiles")).expect("create profiles dir");
+    if let Some(hook_file) = hook_file {
+        let hooks_dir = install_dir.join("hooks");
+        std::fs::create_dir_all(&hooks_dir).expect("create hooks dir");
+        std::fs::write(hooks_dir.join(hook_file), "#!/bin/sh\n").expect("write hook file");
+    }
+    let aliases = aliases
+        .iter()
+        .map(|alias| format!("\"{alias}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    std::fs::write(
+        install_dir.join("package.json"),
+        format!(
+            r#"{{
+              "schema_version": 1,
+              "name": "{pack_name}",
+              "artifacts": [{{
+                "type": "profile",
+                "path": "profiles/{install_as}.json",
+                "install_as": "{install_as}",
+                "aliases": [{aliases}]
+              }}]
+            }}"#
+        ),
+    )
+    .expect("write package.json");
+    std::fs::write(
+        install_dir
+            .join("profiles")
+            .join(format!("{install_as}.json")),
+        profile_json,
+    )
+    .expect("write pack profile");
+    install_dir
+}
+
+/// Write a user profile to `<config_home>/nono/profiles/<name>.json`, the
+/// location that shadows both pack-store and built-in profiles of that name.
+pub(crate) fn write_user_profile(config_home: &std::path::Path, name: &str, profile_json: &str) {
+    let profiles = config_home.join("nono").join("profiles");
+    std::fs::create_dir_all(&profiles).expect("create profiles dir");
+    std::fs::write(profiles.join(format!("{name}.json")), profile_json).expect("write profile");
+}

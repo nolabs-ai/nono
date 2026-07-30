@@ -202,7 +202,7 @@ The correct approach:
 
 1. Inspect the current pack profile:
    ```bash
-   nono profile show --raw nolabs-ai/claude
+   nono profile show --raw nolabs-ai/claude --json
    ```
 
 2. Copy all `filesystem.allow`, `filesystem.read`, `filesystem.allow_file`, and group entries into a new local profile, omitting `$HOME/Library/Keychains` from `filesystem.allow` and removing it from `filesystem.bypass_protection` entirely.

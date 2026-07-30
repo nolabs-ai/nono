@@ -11,10 +11,10 @@ Supervised execution is the default for `nono run` and `nono shell`. No extra fl
 
 ```bash
 # Supervised by default
-nono run --profile always-further/claude -- claude
+nono run --profile nolabs-ai/claude -- claude
 
 # Enable rollback snapshots
-nono run --rollback --profile always-further/claude -- claude
+nono run --rollback --profile nolabs-ai/claude -- claude
 ```
 
 The execution model:
@@ -28,7 +28,23 @@ For the operational runtime workflow built on top of supervisor mode, see [Sessi
 
 ## Capability Expansion (Linux)
 
-On Linux, supervisor mode enables transparent capability expansion. When the sandboxed process tries to access a file outside its allowed paths, instead of getting `EPERM`, the supervisor intercepts the request and can grant access on the fly.
+Capability expansion is **disabled by default** and must be explicitly enabled. To turn it on, use one of:
+
+- CLI flag: `--capability-elevation`
+- Environment variable: `NONO_CAPABILITY_ELEVATION=1`
+- Profile setting: `security.capability_elevation = true`
+
+```bash
+# Enable via flag
+nono run --capability-elevation --profile nolabs-ai/claude -- claude
+
+# Enable via environment variable
+NONO_CAPABILITY_ELEVATION=1 nono run --profile nolabs-ai/claude -- claude
+```
+
+Without one of these, a sandboxed process that tries to access a path outside its granted set will receive `EPERM` as normal — no prompt will appear.
+
+When capability expansion is enabled, the supervisor intercepts the request and can grant access on the fly.
 
 ### How It Works
 

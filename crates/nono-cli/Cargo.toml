@@ -61,7 +61,7 @@ chrono = { version = "0.4", features = ["serde"] }
 itoa = "1"
 
 # Signing key PKCS#8 serialization (already transitive via sigstore-verify)
-aws-lc-rs = "1"
+aws-lc-rs = "1.17.3"
 
 # Keystore access for trust signing keys (optional). Linux uses the pure-Rust
 # zbus Secret Service backend (see linux target deps), so no libdbus is linked.

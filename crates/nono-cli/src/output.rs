@@ -1225,7 +1225,7 @@ mod tests {
 
     #[test]
     fn render_diagnostic_footer_preserves_line_structure() {
-        let footer = "nono diagnostic\n────────\nThe command failed.\n  Learn: nono learn";
+        let footer = "nono diagnostic\n────────\nThe command failed.\n  Learn: nono run --profile my-profile -- my-app";
         let rendered = render_diagnostic_footer(footer);
         assert_eq!(rendered.lines().count(), 4);
     }

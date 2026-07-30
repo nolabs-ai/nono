@@ -1436,27 +1436,6 @@ pub fn get_dangerous_commands(policy: &Policy) -> HashSet<String> {
     result
 }
 
-/// Get all system read paths from allow.read groups for the current platform.
-///
-/// Collects `allow.read` entries from all platform-matching groups. Paths are
-/// returned unexpanded (with `~` and `$TMPDIR` intact) for caller to expand.
-/// Used by learn mode.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-pub fn get_system_read_paths(policy: &Policy) -> Vec<String> {
-    let mut result = Vec::new();
-
-    for group in policy.groups.values() {
-        if !group_matches_platform(group) {
-            continue;
-        }
-        if let Some(allow) = &group.allow {
-            result.extend(allow.read.iter().cloned());
-        }
-    }
-
-    result
-}
-
 /// Validate that a group exclusion list does not attempt to remove required groups.
 ///
 /// Required groups have `required: true` in policy.json and cannot be excluded

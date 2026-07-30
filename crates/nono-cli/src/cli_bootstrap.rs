@@ -217,7 +217,6 @@ fn cli_log_override(cli: &Cli) -> Option<&'static str> {
 
 fn cli_verbosity(cli: &Cli) -> u8 {
     match &cli.command {
-        Commands::Learn(args) => args.verbose,
         Commands::Run(args) => args.sandbox.verbose,
         Commands::Shell(args) => args.sandbox.verbose,
         Commands::Wrap(args) => args.sandbox.verbose,

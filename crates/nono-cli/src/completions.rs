@@ -117,7 +117,7 @@ mod tests {
     fn test_bash_completions_contain_subcommands() -> TestResult<()> {
         let output = generate_to_string(CompletionShell::Bash)?;
         // Core subcommands must appear in bash completions
-        for sub in &["run", "shell", "wrap", "learn", "why", "setup"] {
+        for sub in &["run", "shell", "wrap", "why", "setup"] {
             assert!(
                 output.contains(sub),
                 "bash completions missing subcommand: {sub}"

@@ -79,6 +79,32 @@ impl IpcDenialRecord {
     }
 }
 
+/// Why a URL open request was denied during a supervised session.
+///
+/// Only carries the fixable reasons that can be persisted as a profile grant.
+/// Non-fixable denials (bad scheme, oversize, parse errors, browser-launch
+/// failures) are classified CLI-side and never produce a record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UrlDenialReason {
+    /// The URL's origin is not in the profile's allow_origins list.
+    /// Fixable: user can grant the origin in the save prompt.
+    OriginNotAllowed,
+    /// A localhost URL was blocked because allow_localhost is false.
+    /// Fixable: user can enable allow_localhost in the save prompt.
+    LocalhostNotAllowed,
+}
+
+/// Record of a denied URL open attempt during a supervised session.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UrlDenialRecord {
+    /// The URL origin (scheme + host), e.g. "https://accounts.google.com".
+    /// Derived from the URL via `url::Url::origin().unicode_serialization()`.
+    /// Never carries the full URL (which may contain OAuth tokens in query strings).
+    pub origin: String,
+    /// Why the URL open was denied.
+    pub reason: UrlDenialReason,
+}
+
 /// Best-effort sandbox violation recovered from OS-native logging.
 ///
 /// On macOS, Seatbelt does not stream deny events back to the supervisor like

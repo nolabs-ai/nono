@@ -19,6 +19,7 @@
 
 pub mod approval;
 pub mod audit;
+pub mod auth;
 pub mod aws;
 pub mod capture;
 pub mod config;
@@ -29,12 +30,15 @@ pub mod error;
 pub mod external;
 pub mod filter;
 pub mod forward;
+pub mod jwt_phantom;
 pub mod oauth2;
 pub mod oauth_capture;
 pub mod pool;
+pub mod rate_limit;
 pub mod reverse;
 pub mod route;
 pub mod server;
+pub mod spiffe;
 pub mod tls_intercept;
 pub mod token;
 

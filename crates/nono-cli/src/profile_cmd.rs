@@ -103,7 +103,7 @@ fn cmd_init(args: ProfileInitArgs) -> Result<()> {
     }
 
     // Block names that match an embedded built-in profile. Pack profiles use
-    // `org/name` keys (e.g. `always-further/hermes`), which are invalid as
+    // `org/name` keys (e.g. `nolabs-ai/hermes`), which are invalid as
     // profile names, so a short name like `hermes` cannot shadow a pack.
     {
         let pol = policy::load_embedded_policy()?;
@@ -802,7 +802,7 @@ pub(crate) fn cmd_list(args: ProfileListArgs) -> Result<()> {
 }
 
 /// Like `print_profile_line` but appends the providing pack ref so the
-/// user sees `claude-code  Anthropic Claude Code …  always-further/claude`.
+/// user sees `claude-code  Anthropic Claude Code …  nolabs-ai/claude`.
 fn print_pack_profile_line(name: &str, pack_ref: &str, result: &Result<Profile>, t: &theme::Theme) {
     match result {
         Ok(p) => {
@@ -1026,6 +1026,7 @@ pub(crate) fn cmd_show(args: ProfileShowArgs) -> Result<()> {
         || !net.resolved_credentials().is_empty()
         || !net.open_port.is_empty()
         || !net.listen_port.is_empty()
+        || !net.no_proxy.is_empty()
         || net.upstream_proxy.is_some()
         || !net.upstream_bypass.is_empty();
 
@@ -1074,12 +1075,43 @@ pub(crate) fn cmd_show(args: ProfileShowArgs) -> Result<()> {
                 ports.join(", ")
             );
         }
+        if !net.open_port_range.is_empty() {
+            let ranges: Vec<String> = net
+                .open_port_range
+                .iter()
+                .map(|&[s, e]| format!("{}..={}", s, e))
+                .collect();
+            println!(
+                "    {}: {}",
+                theme::fg("open_port_range", t.subtext),
+                ranges.join(", ")
+            );
+        }
         if !net.listen_port.is_empty() {
             let ports: Vec<String> = net.listen_port.iter().map(|p| p.to_string()).collect();
             println!(
                 "    {}: {}",
                 theme::fg("listen_port", t.subtext),
                 ports.join(", ")
+            );
+        }
+        if !net.listen_port_range.is_empty() {
+            let ranges: Vec<String> = net
+                .listen_port_range
+                .iter()
+                .map(|&[s, e]| format!("{}..={}", s, e))
+                .collect();
+            println!(
+                "    {}: {}",
+                theme::fg("listen_port_range", t.subtext),
+                ranges.join(", ")
+            );
+        }
+        if !net.no_proxy.is_empty() {
+            println!(
+                "    {}: {}",
+                theme::fg("no_proxy", t.subtext),
+                net.no_proxy.join(", ")
             );
         }
         if let Some(ref ep) = net.upstream_proxy {
@@ -1230,9 +1262,8 @@ fn profile_to_json(
         val["linux"] = serde_json::json!({ "af_unix_mediation": v });
     }
 
-    // Filesystem (canonical schema — `allow`/`read`/`write`/`*_file`/`deny`/
-    // `bypass_protection`). Legacy keys deserialize into these fields via
-    // `deprecated_schema::LegacyPolicyPatch` before reaching `Profile`.
+    // Filesystem (canonical schema). Legacy keys deserialize into these fields
+    // via `deprecated_schema::LegacyPolicyPatch` before reaching `Profile`.
     val["filesystem"] = serde_json::json!({
         "allow": profile.filesystem.allow,
         "read": profile.filesystem.read,
@@ -1240,6 +1271,12 @@ fn profile_to_json(
         "allow_file": profile.filesystem.allow_file,
         "read_file": profile.filesystem.read_file,
         "write_file": profile.filesystem.write_file,
+        "unix_socket": profile.filesystem.unix_socket,
+        "unix_socket_bind": profile.filesystem.unix_socket_bind,
+        "unix_socket_dir": profile.filesystem.unix_socket_dir,
+        "unix_socket_dir_bind": profile.filesystem.unix_socket_dir_bind,
+        "unix_socket_subtree": profile.filesystem.unix_socket_subtree,
+        "unix_socket_subtree_bind": profile.filesystem.unix_socket_subtree_bind,
         "deny": profile.filesystem.deny,
         "bypass_protection": profile.filesystem.bypass_protection,
         "suppress_save_prompt": profile.filesystem.suppress_save_prompt,
@@ -1268,6 +1305,7 @@ fn profile_to_json(
         "credentials": profile.network.resolved_credentials(),
         "open_port": profile.network.open_port,
         "listen_port": profile.network.listen_port,
+        "no_proxy": profile.network.no_proxy,
         "upstream_proxy": profile.network.upstream_proxy,
         "upstream_bypass": profile.network.upstream_bypass,
     });
@@ -1522,6 +1560,7 @@ pub(crate) fn cmd_diff(args: ProfileDiffArgs) -> Result<()> {
             p1.network.resolved_credentials(),
             p2.network.resolved_credentials(),
         ),
+        ("no_proxy", &p1.network.no_proxy, &p2.network.no_proxy),
         (
             "upstream_bypass",
             &p1.network.upstream_bypass,
@@ -2052,6 +2091,10 @@ fn diff_to_json(name1: &str, name2: &str, p1: &Profile, p2: &Profile) -> serde_j
             "upstream_bypass": diff_vec(
                 &p1.network.upstream_bypass,
                 &p2.network.upstream_bypass,
+            ),
+            "no_proxy": diff_vec(
+                &p1.network.no_proxy,
+                &p2.network.no_proxy,
             ),
             "custom_credentials": diff_custom_credentials_json(
                 &p1.network.custom_credentials,
@@ -3020,7 +3063,10 @@ fn resolve_to_manifest(
             .collect(),
         endpoints: manifest_endpoints,
         dns: true,
-        ports: if prof.network.listen_port.is_empty() && prof.network.open_port.is_empty() {
+        ports: if prof.network.listen_port.is_empty()
+            && prof.network.open_port.is_empty()
+            && prof.network.open_port_range.is_empty()
+        {
             None
         } else {
             Some(manifest::PortConfig {
@@ -3036,6 +3082,17 @@ fn resolve_to_manifest(
                     .open_port
                     .iter()
                     .filter_map(|p| std::num::NonZeroU64::new(u64::from(*p)))
+                    .collect(),
+                localhost_range: prof
+                    .network
+                    .open_port_range
+                    .iter()
+                    .filter_map(|&[s, e]| {
+                        Some([
+                            std::num::NonZeroU64::new(u64::from(s))?,
+                            std::num::NonZeroU64::new(u64::from(e))?,
+                        ])
+                    })
                     .collect(),
             })
         },
@@ -3777,6 +3834,86 @@ mod tests {
         // openclaw extends default, so it should have default's base groups
         let has_deny = profile.groups.include.iter().any(|g| g.contains("deny"));
         assert!(has_deny, "openclaw should inherit deny groups");
+    }
+
+    #[test]
+    fn profile_to_json_includes_inherited_unix_socket_grants()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(
+            dir.path().join("base.json"),
+            r#"{
+                "meta": { "name": "base" },
+                "filesystem": {
+                    "unix_socket": ["$XDG_RUNTIME_DIR/base/connect.sock"],
+                    "unix_socket_bind": ["$XDG_RUNTIME_DIR/base/bind.sock"],
+                    "unix_socket_dir": ["$XDG_RUNTIME_DIR/base/connect"],
+                    "unix_socket_dir_bind": ["$XDG_RUNTIME_DIR/base/bind"],
+                    "unix_socket_subtree": ["$XDG_RUNTIME_DIR/base/connect-tree"],
+                    "unix_socket_subtree_bind": ["$XDG_RUNTIME_DIR/base/bind-tree"]
+                }
+            }"#,
+        )?;
+        let child_path = dir.path().join("child.json");
+        std::fs::write(
+            &child_path,
+            r#"{
+                "extends": "base",
+                "meta": { "name": "child" },
+                "filesystem": {
+                    "unix_socket": ["$XDG_RUNTIME_DIR/child/connect.sock"],
+                    "unix_socket_bind": ["$XDG_RUNTIME_DIR/child/bind.sock"],
+                    "unix_socket_dir": ["$XDG_RUNTIME_DIR/child/connect"],
+                    "unix_socket_dir_bind": ["$XDG_RUNTIME_DIR/child/bind"],
+                    "unix_socket_subtree": ["$XDG_RUNTIME_DIR/child/connect-tree"],
+                    "unix_socket_subtree_bind": ["$XDG_RUNTIME_DIR/child/bind-tree"]
+                }
+            }"#,
+        )?;
+
+        let profile = profile::load_profile_from_path(&child_path)?;
+        let value = profile_to_json("child", &profile, &Some(vec!["base".to_string()]));
+
+        assert_eq!(
+            value["filesystem"]["unix_socket"],
+            serde_json::json!([
+                "$XDG_RUNTIME_DIR/base/connect.sock",
+                "$XDG_RUNTIME_DIR/child/connect.sock"
+            ])
+        );
+        assert_eq!(
+            value["filesystem"]["unix_socket_bind"],
+            serde_json::json!([
+                "$XDG_RUNTIME_DIR/base/bind.sock",
+                "$XDG_RUNTIME_DIR/child/bind.sock"
+            ])
+        );
+        assert_eq!(
+            value["filesystem"]["unix_socket_dir"],
+            serde_json::json!([
+                "$XDG_RUNTIME_DIR/base/connect",
+                "$XDG_RUNTIME_DIR/child/connect"
+            ])
+        );
+        assert_eq!(
+            value["filesystem"]["unix_socket_dir_bind"],
+            serde_json::json!(["$XDG_RUNTIME_DIR/base/bind", "$XDG_RUNTIME_DIR/child/bind"])
+        );
+        assert_eq!(
+            value["filesystem"]["unix_socket_subtree"],
+            serde_json::json!([
+                "$XDG_RUNTIME_DIR/base/connect-tree",
+                "$XDG_RUNTIME_DIR/child/connect-tree"
+            ])
+        );
+        assert_eq!(
+            value["filesystem"]["unix_socket_subtree_bind"],
+            serde_json::json!([
+                "$XDG_RUNTIME_DIR/base/bind-tree",
+                "$XDG_RUNTIME_DIR/child/bind-tree"
+            ])
+        );
+        Ok(())
     }
 
     #[test]

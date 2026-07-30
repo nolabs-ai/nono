@@ -29,7 +29,9 @@ pub struct RegistryClient {
 /// Build the installation-context headers to attach to every registry request.
 ///
 /// Headers included:
-/// - `X-Nono-UUID`: installation UUID if a state file exists (omitted otherwise)
+/// - `X-Nono-UUID`: installation UUID (omitted when the update check is opted
+///   out via `NONO_NO_UPDATE_CHECK` or `[updates] check = false`, or when no
+///   state file exists)
 /// - `X-Nono-Platform`: OS name (`std::env::consts::OS`)
 /// - `X-Nono-Arch`: CPU architecture (`std::env::consts::ARCH`)
 /// - `X-Nono-CI`: `"true"` when a recognised CI environment is detected
@@ -507,6 +509,75 @@ mod tests {
             provider.map(|(_, v)| v.as_str()),
             Some("github_actions"),
             "X-Nono-CI-Provider should be 'github_actions'"
+        );
+    }
+
+    #[test]
+    fn context_headers_gate_uuid_on_opt_out() {
+        let _lock = match ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let state = tmp.path().join("state");
+        let config = tmp.path().join("config");
+        std::fs::create_dir_all(&home).expect("home dir");
+        std::fs::create_dir_all(state.join("nono")).expect("state dir");
+        std::fs::create_dir_all(&config).expect("config dir");
+        // A state file exists, so any absent UUID is attributable to the
+        // opt-out, not to a missing file.
+        let uuid = "22222222-2222-4222-8222-222222222222";
+        std::fs::write(
+            state.join("nono").join("update-check.json"),
+            format!(
+                r#"{{"uuid":"{uuid}","last_check":"1970-01-01T00:00:00Z","cached_result":null}}"#
+            ),
+        )
+        .expect("write state file");
+        let home_str = home.to_string_lossy().to_string();
+        let state_str = state.to_string_lossy().to_string();
+        let config_str = config.to_string_lossy().to_string();
+
+        let env = EnvVarGuard::set_all(&[
+            ("HOME", &home_str),
+            ("XDG_STATE_HOME", &state_str),
+            ("XDG_CONFIG_HOME", &config_str),
+            // Managed so we can force it absent for the opted-in case and still
+            // restore any ambient value on drop.
+            ("NONO_NO_UPDATE_CHECK", ""),
+        ]);
+        env.remove("NONO_NO_UPDATE_CHECK");
+
+        // Opted in: the UUID header is attached.
+        let headers = build_context_headers();
+        assert_eq!(
+            headers
+                .iter()
+                .find(|(k, _)| *k == "X-Nono-UUID")
+                .map(|(_, v)| v.as_str()),
+            Some(uuid),
+            "X-Nono-UUID should be present when not opted out"
+        );
+
+        // Opted out: the UUID header is omitted even though the state file
+        // still exists — this is the fix for the residual-identifier bug.
+        let _optout = EnvVarGuard::set_all(&[("NONO_NO_UPDATE_CHECK", "1")]);
+        let headers = build_context_headers();
+        assert!(
+            !headers.iter().any(|(k, _)| *k == "X-Nono-UUID"),
+            "X-Nono-UUID must be omitted when the update check is opted out"
+        );
+        // The coarse fingerprinting headers are intentionally still sent when
+        // opted out (out of scope for this fix; see the residual-identifiers
+        // note in the privacy documentation).
+        assert!(
+            headers.iter().any(|(k, _)| *k == "X-Nono-Platform"),
+            "X-Nono-Platform should still be sent when opted out"
+        );
+        assert!(
+            headers.iter().any(|(k, _)| *k == "X-Nono-Install-Source"),
+            "X-Nono-Install-Source should still be sent when opted out"
         );
     }
 

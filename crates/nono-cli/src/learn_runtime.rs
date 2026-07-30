@@ -2,7 +2,7 @@ use crate::cli::LearnArgs;
 #[cfg(target_os = "macos")]
 use crate::command_display::format_command_line;
 use crate::profile_save_runtime::{
-    PreparedProfileSave, SaveAction, command_name, confirm, patch_has_policy_overrides,
+    PreparedProfileSave, SaveAction, confirm, offer_command_name, patch_has_policy_overrides,
     print_patch_preview, print_profile_save, suggested_profile_name, would_shadow_existing_profile,
     write_profile,
 };
@@ -157,10 +157,12 @@ fn print_macos_run_guidance(args: &LearnArgs, silent: bool) -> Result<()> {
 
 fn offer_save_profile(
     result: &learn::LearnResult,
-    command: &[String],
+    command: &[std::ffi::OsString],
     compared_profile: Option<&str>,
 ) -> Result<()> {
-    let cmd_name = command_name(command)?;
+    let Some(cmd_name) = offer_command_name(command) else {
+        return Ok(());
+    };
 
     // Compute the patch early so we can preview it before asking any questions.
     let patch = result.to_profile_patch()?;

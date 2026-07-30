@@ -369,6 +369,19 @@ pub struct CustomCredentialDef {
     /// credential chain). Mutually exclusive with `credential_key` and `auth`.
     #[serde(default)]
     pub aws_auth: Option<nono_proxy::config::AwsAuthConfig>,
+
+    /// SPIFFE/SPIRE Workload API auth. Mutually exclusive with `credential_key`, `auth`, and `aws_auth`.
+    #[serde(default)]
+    pub spiffe: Option<nono_proxy::config::SpiffeAuthConfig>,
+
+    /// Optional per-route request-rate limit (RouteRateLimiter).
+    ///
+    /// Caps the rate of L7 requests forwarded to this credential's upstream to
+    /// contain a runaway or compromised agent. Applies only to L7-visible
+    /// traffic (reverse-proxy routes and TLS-intercepted CONNECT); it has no
+    /// effect on an opaque CONNECT tunnel.
+    #[serde(default)]
+    pub rate_limit: Option<nono_proxy::config::RouteRateLimitConfig>,
 }
 
 /// Host-side source that materializes a proxy credential for `cmd://<name>`.
@@ -476,7 +489,7 @@ fn default_inject_header() -> String {
     "Authorization".to_string()
 }
 
-/// Check if a character is a valid HTTP token character per RFC 7230.
+/// Check if a character is a valid HTTP header token character.
 fn is_http_token_char(c: char) -> bool {
     c.is_ascii_alphanumeric()
         || matches!(
@@ -601,12 +614,36 @@ fn validate_custom_credential(name: &str, cred: &CustomCredentialDef) -> Result<
         )));
     }
 
-    // At least one of credential_key, auth, or aws_auth must be set
-    if cred.credential_key.is_none() && cred.auth.is_none() && cred.aws_auth.is_none() {
+    // Mutual exclusion: spiffe is incompatible with credential_key, auth (oauth2), and aws_auth.
+    if cred.spiffe.is_some()
+        && (cred.credential_key.is_some() || cred.auth.is_some() || cred.aws_auth.is_some())
+    {
         return Err(NonoError::ProfileParse(format!(
-            "custom credential '{}' must have either 'credential_key', 'auth', or 'aws_auth' set",
+            "custom credential '{}' has 'spiffe' set together with 'credential_key', 'auth' \
+             (oauth2), or 'aws_auth'; spiffe is mutually exclusive with all other auth fields",
             name
         )));
+    }
+
+    // At least one auth mechanism must be set
+    if cred.credential_key.is_none()
+        && cred.auth.is_none()
+        && cred.aws_auth.is_none()
+        && cred.spiffe.is_none()
+    {
+        return Err(NonoError::ProfileParse(format!(
+            "custom credential '{}' must have either 'credential_key', 'auth', 'aws_auth', \
+             or 'spiffe' set",
+            name
+        )));
+    }
+
+    // Validate inject_header for SPIFFE routes (credential_key has its own validate_header_mode()).
+    if let Some(nono_proxy::config::SpiffeAuthConfig::Jwt {
+        ref inject_header, ..
+    }) = cred.spiffe
+    {
+        validate_header_name(name, inject_header)?;
     }
 
     // Validate OAuth2 auth if present
@@ -820,20 +857,42 @@ fn validate_oauth2_auth(name: &str, auth: &OAuth2Config) -> Result<()> {
     // Validate token_url — same rules as upstream URL (HTTPS or loopback HTTP)
     validate_upstream_url(&auth.token_url, &format!("{}/auth.token_url", name))?;
 
-    // client_id must not be empty
-    if auth.client_id.is_empty() {
-        return Err(NonoError::ProfileParse(format!(
-            "auth.client_id for custom credential '{}' cannot be empty",
-            name
-        )));
-    }
-
-    // client_secret must not be empty
-    if auth.client_secret.is_empty() {
-        return Err(NonoError::ProfileParse(format!(
-            "auth.client_secret for custom credential '{}' cannot be empty",
-            name
-        )));
+    // When using client_assertion, client_id/client_secret are not required,
+    // but the assertion config itself must have valid fields.
+    if let Some(ref assertion) = auth.client_assertion {
+        match assertion {
+            nono_proxy::config::ClientAssertionConfig::SpiffeJwt {
+                workload_api_socket,
+                audience,
+                ..
+            } => {
+                if workload_api_socket.is_empty() {
+                    return Err(NonoError::ProfileParse(format!(
+                        "auth.client_assertion.workload_api_socket for custom credential '{}' cannot be empty",
+                        name
+                    )));
+                }
+                if audience.is_empty() {
+                    return Err(NonoError::ProfileParse(format!(
+                        "auth.client_assertion.audience for custom credential '{}' cannot be empty",
+                        name
+                    )));
+                }
+            }
+        }
+    } else {
+        if auth.client_id.is_empty() {
+            return Err(NonoError::ProfileParse(format!(
+                "auth.client_id for custom credential '{}' cannot be empty",
+                name
+            )));
+        }
+        if auth.client_secret.is_empty() {
+            return Err(NonoError::ProfileParse(format!(
+                "auth.client_secret for custom credential '{}' cannot be empty",
+                name
+            )));
+        }
     }
 
     Ok(())
@@ -885,8 +944,26 @@ fn validate_aws_auth(name: &str, aws: &nono_proxy::config::AwsAuthConfig) -> Res
 }
 
 /// Validate header injection mode fields.
+/// Validate a single header name: non-empty, valid HTTP token characters only.
+fn validate_header_name(cred_name: &str, header: &str) -> Result<()> {
+    if header.is_empty() {
+        return Err(NonoError::ProfileParse(format!(
+            "inject_header for custom credential '{}' cannot be empty",
+            cred_name
+        )));
+    }
+    if !header.chars().all(is_http_token_char) {
+        return Err(NonoError::ProfileParse(format!(
+            "inject_header '{}' for custom credential '{}' contains invalid characters; \
+             header names must be valid HTTP tokens (alphanumeric and !#$%&'*+-.^_`|~)",
+            header, cred_name
+        )));
+    }
+    Ok(())
+}
+
 fn validate_header_mode(name: &str, cred: &CustomCredentialDef) -> Result<()> {
-    // Validate inject_header (RFC 7230 token)
+    // Validate inject_header
     if cred.inject_header.is_empty() {
         return Err(NonoError::ProfileParse(format!(
             "inject_header for custom credential '{}' cannot be empty",
@@ -1042,6 +1119,45 @@ fn validate_upstream_url(url: &str, service_name: &str) -> Result<()> {
 fn validate_profile_custom_credentials(profile: &Profile) -> Result<()> {
     for (name, cred) in &profile.network.custom_credentials {
         validate_custom_credential(name, cred)?;
+    }
+    Ok(())
+}
+
+#[must_use = "network.no_proxy validation result must be handled"]
+fn validate_profile_no_proxy(profile: &Profile) -> Result<()> {
+    for entry in &profile.network.no_proxy {
+        nono_proxy::config::validate_no_proxy_entry(entry).map_err(|err| match err {
+            nono_proxy::ProxyError::Config(message) => NonoError::ProfileParse(format!(
+                "network.no_proxy entry '{entry}' is invalid: {message}"
+            )),
+            other => NonoError::ProfileParse(format!(
+                "network.no_proxy entry '{entry}' is invalid: {other}"
+            )),
+        })?;
+    }
+
+    validate_no_proxy_allow_domain_conflicts(
+        &profile.network.no_proxy,
+        &profile.network.allow_domain,
+    )
+}
+
+#[must_use = "network.no_proxy allow_domain conflict validation result must be handled"]
+pub(crate) fn validate_no_proxy_allow_domain_conflicts(
+    no_proxy: &[String],
+    allow_domain: &[AllowDomainEntry],
+) -> Result<()> {
+    for allow_entry in allow_domain {
+        let domain = allow_entry.domain();
+        for no_proxy_entry in no_proxy {
+            if nono_proxy::config::no_proxy_entry_overlaps_host_pattern(no_proxy_entry, domain) {
+                return Err(NonoError::ProfileParse(format!(
+                    "network.no_proxy entry '{no_proxy_entry}' conflicts with \
+                     network.allow_domain entry '{domain}': allow_domain traffic must \
+                     go through the proxy allowlist/L7 route, not bypass it"
+                )));
+            }
+        }
     }
     Ok(())
 }
@@ -1516,14 +1632,35 @@ pub struct NetworkConfig {
         alias = "allow_port"
     )]
     pub open_port: Vec<u16>,
+    /// Inclusive port ranges for bidirectional localhost TCP IPC (connect + bind).
+    /// Multiple ranges are supported. Example: `[[3000, 3010], [8000, 8100]]`.
+    /// Each port becomes an individual rule — larger ranges take longer to apply at startup.
+    /// macOS enforces a combined limit of 16,384 unique ports across all ranges (2¹⁴);
+    /// Linux has no such restriction. Overlapping ranges are merged before applying rules.
+    #[serde(default)]
+    pub open_port_range: Vec<[u16; 2]>,
     /// TCP ports the sandboxed child may listen on.
     /// Equivalent to `--listen-port` CLI flag.
     #[serde(default)]
     pub listen_port: Vec<u16>,
+    /// Inclusive port ranges for TCP listen (bind only). Same platform behaviour as
+    /// `open_port_range` for the bind side; no outbound connect rules are added.
+    /// Overlapping ranges are merged before applying rules.
+    #[serde(default)]
+    pub listen_port_range: Vec<[u16; 2]>,
     /// Outbound TCP connect ports (allowlist). Linux Landlock V4+ only.
     /// Equivalent to `--allow-connect-port` CLI flag.
     #[serde(default)]
     pub connect_port: Vec<u16>,
+    /// Additional client-side proxy bypass entries for generated
+    /// NO_PROXY/no_proxy in proxy mode.
+    ///
+    /// Entries are host patterns only: single-label local aliases, IP
+    /// literals, `*.example.com` wildcard suffixes, or `.example.com` suffix
+    /// patterns. Bare multi-label domains, full URLs, credentials, schemes,
+    /// ports, paths, and catch-all `*` are rejected at load time.
+    #[serde(default)]
+    pub no_proxy: Vec<String>,
     /// Custom credential definitions for services not in network-policy.json.
     /// Keys are service names (used with `--credential`), values define
     /// how to route and inject credentials for that service.
@@ -2108,9 +2245,9 @@ pub struct Profile {
     /// ALIAS(canonical="env_credentials", introduced="v0.0.0", remove_by="indefinite", issue="#143")
     #[serde(default, alias = "secrets")]
     pub env_credentials: SecretsConfig,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub environment: Option<EnvironmentConfig>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command_policies: Option<CommandPoliciesConfig>,
     #[serde(default)]
     pub credential_capture: HashMap<String, CredentialCaptureEntry>,
@@ -2134,22 +2271,22 @@ pub struct Profile {
     /// When `None` (absent from JSON), inherits from the base profile.
     /// When `Some`, replaces the base profile's config entirely, allowing
     /// derived profiles to narrow permissions.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub open_urls: Option<OpenUrlConfig>,
     /// Opt-in gate for temporary direct LaunchServices opens on macOS.
     /// Must be paired with the CLI flag `--allow-launch-services`.
     /// When `None`, inherits from the base profile.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allow_launch_services: Option<bool>,
     /// Opt-in gate for GPU access (Metal/IOKit on macOS, render nodes on Linux).
     /// Must be paired with the CLI flag `--allow-gpu`.
     /// When `None`, inherits from the base profile.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allow_gpu: Option<bool>,
     /// Opt-in to allow parent-of-protected-root grants on macOS.
     /// When `true` (and on macOS), `--allow ~` is permitted because Seatbelt deny
     /// rules protect `~/.nono`. Ignored on Linux. Default is `false`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allow_parent_of_protected: Option<bool>,
     /// Deprecated: Parsed for backward compatibility but ignored.
     /// Supervised mode preserves TTY by default, making this unnecessary.
@@ -2166,7 +2303,7 @@ pub struct Profile {
     /// Binary path or command name to run when no trailing `-- <command>` is given.
     /// Resolved via `PATH` lookup or canonicalized if absolute. Only honoured
     /// for user-authored profiles (ignored for pack and built-in profiles).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binary: Option<String>,
     /// Extra arguments appended to the child command at launch.
     /// Supports variable expansion (e.g. `$NONO_PACKAGES`).
@@ -2462,7 +2599,7 @@ pub fn load_profile_extends(name_or_path: &str) -> Option<Vec<String>> {
 ///    `install_as` matches the requested name. Self-heals Claude Code plugin
 ///    wiring (symlink + `enabledPlugins`) on every successful resolution.
 /// 3. Built-in profiles (compiled into binary).
-/// 4. Auto-pull prompt for the registry pack `always-further/claude` when
+/// 4. Auto-pull prompt for the registry pack `nolabs-ai/claude` when
 ///    the requested profile is `claude-code` (or inherits from it).
 pub fn load_profile(name_or_path: &str) -> Result<Profile> {
     load_profile_impl(name_or_path, &[])
@@ -2605,9 +2742,9 @@ fn load_profile_inner(name_or_path: &str, cli_extends: &[String]) -> Result<Opti
         if !profile.packs.contains(&pack_key) {
             profile.packs.push(pack_key);
         }
-        // If we just resolved through `always-further/claude`, also offer
+        // If we just resolved through `nolabs-ai/claude`, also offer
         // to strip pre-0.43 inbuilt-hook leftovers. Catches the path
-        // where users `nono pull always-further/claude` directly,
+        // where users `nono pull nolabs-ai/claude` directly,
         // bypassing the post-pull cleanup hook in `migration::check_and_run`.
         // Idempotent: silent no-op when no legacy artifacts exist, so safe
         // to fire on every claude resolution.
@@ -2633,7 +2770,7 @@ fn load_profile_inner(name_or_path: &str, cli_extends: &[String]) -> Result<Opti
     Ok(None)
 }
 
-/// True when `profile_path` lives inside `<package_store>/always-further/claude/`.
+/// True when `profile_path` lives inside `<package_store>/nolabs-ai/claude/`.
 /// Used to gate legacy-cleanup invocation on the canonical claude pack
 /// rather than any pack that happens to publish a profile named `claude`
 /// or `claude-code`.
@@ -2933,6 +3070,10 @@ pub(crate) fn finalize_profile(mut profile: Profile) -> Result<Profile> {
         return Err(NonoError::ProfileParse(err));
     }
     merge_implicit_default_groups(&mut profile)?;
+    // Re-run after extends/platform overrides: base and child profiles can
+    // independently add no_proxy and allow_domain entries that only conflict
+    // once the final effective profile has been assembled.
+    validate_profile_no_proxy(&profile)?;
     validate_credential_capture_resolved(&profile)?;
     validate_credential_provider_resolved(&profile)?;
     validate_profile_tls_intercept(&profile)?;
@@ -3019,6 +3160,10 @@ pub(crate) fn parse_profile_bytes(content: &[u8]) -> Result<Profile> {
         .map_err(|e| NonoError::ProfileParse(format!("invalid UTF-8: {e}")))?;
 
     let profile: Profile = crate::jsonc::parse(text).map_err(NonoError::ProfileParse)?;
+
+    // Validate raw no_proxy entries for direct parse/profile-edit UX. Finalize
+    // re-validates after inheritance and platform overrides have been applied.
+    validate_profile_no_proxy(&profile)?;
 
     // Validate custom credentials for security issues
     validate_profile_custom_credentials(&profile)?;
@@ -3189,7 +3334,7 @@ enum ResolvedBase {
 /// This handles the v0.42 → v0.43 upgrade case where a user profile
 /// `extends: ["claude-code"]` and the inbuilt `claude-code` is gone:
 /// instead of an inscrutable "base profile not found" error, the user
-/// sees the same install prompt that `--profile always-further/claude` would
+/// sees the same install prompt that `--profile nolabs-ai/claude` would
 /// produce, with the chain still resolving cleanly on accept.
 fn load_base_profile_raw(
     name: &str,
@@ -3433,8 +3578,17 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
             ),
             deny_domain: dedup_append(&base.network.deny_domain, &child.network.deny_domain),
             open_port: dedup_append(&base.network.open_port, &child.network.open_port),
+            open_port_range: dedup_append(
+                &base.network.open_port_range,
+                &child.network.open_port_range,
+            ),
             listen_port: dedup_append(&base.network.listen_port, &child.network.listen_port),
+            listen_port_range: dedup_append(
+                &base.network.listen_port_range,
+                &child.network.listen_port_range,
+            ),
             connect_port: dedup_append(&base.network.connect_port, &child.network.connect_port),
+            no_proxy: dedup_append(&base.network.no_proxy, &child.network.no_proxy),
             // Child `Some([])` overrides parent credentials to empty (disables proxy).
             // Child `None` inherits parent credentials. Child `Some([...])` merges with parent.
             credentials: match child.network.credentials {
@@ -3886,7 +4040,7 @@ pub fn list_profiles() -> Vec<String> {
     }
 
     // Add pack-store profiles — names exposed by installed packs via
-    // `install_as`. Without this, `--profile always-further/claude` works (the
+    // `install_as`. Without this, `--profile nolabs-ai/claude` works (the
     // resolver finds it) but `nono profile list` doesn't surface it,
     // confusing users who expect a one-stop catalogue.
     for (name, _pack_ref) in list_pack_store_profiles() {
@@ -4572,9 +4726,9 @@ mod tests {
         assert!(profiles.contains(&"openclaw".to_string()));
         assert!(profiles.contains(&"swival".to_string()));
         // These profiles were removed from built-ins; they ship via registry packs:
-        //   claude-code / claude → always-further/claude   (removed v0.43.0)
-        //   codex               → always-further/codex    (removed v0.43.0)
-        //   opencode            → always-further/opencode (removed)
+        //   claude-code / claude → nolabs-ai/claude   (formerly always-further/claude, removed v0.43.0)
+        //   codex               → nolabs-ai/codex    (formerly always-further/codex, removed v0.43.0)
+        //   opencode            → nolabs-ai/opencode (formerly always-further/opencode, removed)
         assert!(!profiles.contains(&"claude-code".to_string()));
         assert!(!profiles.contains(&"codex".to_string()));
         assert!(!profiles.contains(&"opencode".to_string()));
@@ -5066,7 +5220,7 @@ mod tests {
     }
 
     // ============================================================================
-    // is_http_token_char tests (RFC 7230)
+    // is_http_token_char tests
     // ============================================================================
 
     #[test]
@@ -5079,7 +5233,7 @@ mod tests {
 
     #[test]
     fn test_http_token_char_special_chars() {
-        // RFC 7230 tchar: !#$%&'*+-.^_`|~
+        // valid special chars in header token names: !#$%&'*+-.^_`|~
         for c in "!#$%&'*+-.^_`|~".chars() {
             assert!(is_http_token_char(c), "Expected '{}' to be valid tchar", c);
         }
@@ -5100,7 +5254,7 @@ mod tests {
     // Custom credential validation integration tests
     //
     // These test the full validation chain including:
-    // - inject_header (RFC 7230 token validation)
+    // - inject_header (token validation)
     // - credential_format (CRLF injection prevention)
     // - credential_key (alphanumeric + underscore)
     // - upstream URL (HTTPS required, HTTP only for loopback)
@@ -5125,6 +5279,8 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             aws_auth: None,
+            spiffe: None,
+            rate_limit: None,
         }
     }
 
@@ -5267,6 +5423,58 @@ mod tests {
         assert!(validate_custom_credential("local", &cred).is_ok());
     }
 
+    #[test]
+    fn test_validate_custom_credential_spiffe_only_valid() {
+        let cred = CustomCredentialDef {
+            upstream: "http://127.0.0.1:8080".to_string(),
+            credential_key: None,
+            auth: None,
+            inject_mode: InjectMode::Header,
+            inject_header: "Authorization".to_string(),
+            credential_format: None,
+            path_pattern: None,
+            path_replacement: None,
+            query_param_name: None,
+            proxy: None,
+            env_var: None,
+            endpoint_rules: vec![],
+            endpoint_policy: None,
+            tls_ca: None,
+            tls_client_cert: None,
+            tls_client_key: None,
+            aws_auth: None,
+            spiffe: Some(nono_proxy::config::SpiffeAuthConfig::Jwt {
+                workload_api_socket: "/run/spire/agent/api.sock".to_string(),
+                audience: vec!["test-audience".to_string()],
+                inject_header: "Authorization".to_string(),
+                credential_format: None,
+                svid_hint: None,
+            }),
+            rate_limit: None,
+        };
+        assert!(validate_custom_credential("testapi", &cred).is_ok());
+    }
+
+    #[test]
+    fn test_validate_custom_credential_spiffe_with_credential_key_rejected() {
+        let mut cred = header_cred_builder();
+        cred.spiffe = Some(nono_proxy::config::SpiffeAuthConfig::Jwt {
+            workload_api_socket: "/run/spire/agent/api.sock".to_string(),
+            audience: vec!["test-audience".to_string()],
+            inject_header: "Authorization".to_string(),
+            credential_format: None,
+            svid_hint: None,
+        });
+        let result = validate_custom_credential("test", &cred);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("spiffe is mutually exclusive")
+        );
+    }
+
     // ============================================================================
     // Injection Mode Validation Tests
     // ============================================================================
@@ -5291,6 +5499,8 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             aws_auth: None,
+            spiffe: None,
+            rate_limit: None,
         };
         assert!(validate_custom_credential("telegram", &cred).is_ok());
     }
@@ -5315,6 +5525,8 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             aws_auth: None,
+            spiffe: None,
+            rate_limit: None,
         };
         let result = validate_custom_credential("telegram", &cred);
         let err = result.expect_err("missing path_pattern should be rejected");
@@ -5341,6 +5553,8 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             aws_auth: None,
+            spiffe: None,
+            rate_limit: None,
         };
         let result = validate_custom_credential("telegram", &cred);
         let err = result.expect_err("pattern without {} should be rejected");
@@ -5367,6 +5581,8 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             aws_auth: None,
+            spiffe: None,
+            rate_limit: None,
         };
         assert!(validate_custom_credential("telegram", &cred).is_ok());
     }
@@ -5391,6 +5607,8 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             aws_auth: None,
+            spiffe: None,
+            rate_limit: None,
         };
         let result = validate_custom_credential("telegram", &cred);
         let err = result.expect_err("replacement without {} should be rejected");
@@ -5417,6 +5635,8 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             aws_auth: None,
+            spiffe: None,
+            rate_limit: None,
         };
         assert!(validate_custom_credential("google_maps", &cred).is_ok());
     }
@@ -5441,6 +5661,8 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             aws_auth: None,
+            spiffe: None,
+            rate_limit: None,
         };
         let result = validate_custom_credential("google_maps", &cred);
         let err = result.expect_err("missing query_param_name should be rejected");
@@ -5467,6 +5689,8 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             aws_auth: None,
+            spiffe: None,
+            rate_limit: None,
         };
         let result = validate_custom_credential("google_maps", &cred);
         let err = result.expect_err("empty query_param_name should be rejected");
@@ -5493,6 +5717,8 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             aws_auth: None,
+            spiffe: None,
+            rate_limit: None,
         };
         // BasicAuth mode doesn't require additional fields
         // Credential value is expected to be "username:password" format
@@ -5681,6 +5907,8 @@ mod tests {
                 client_id: "my-client".to_string(),
                 client_secret: "env://CLIENT_SECRET".to_string(),
                 scope: "read write".to_string(),
+                client_assertion: None,
+                extra_params: Default::default(),
             }),
             inject_mode: InjectMode::Header,
             inject_header: "Authorization".to_string(),
@@ -5696,6 +5924,8 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             aws_auth: None,
+            spiffe: None,
+            rate_limit: None,
         }
     }
 
@@ -5732,6 +5962,8 @@ mod tests {
             client_id: "my-client".to_string(),
             client_secret: "env://SECRET".to_string(),
             scope: String::new(),
+            client_assertion: None,
+            extra_params: Default::default(),
         });
         let result = validate_custom_credential("test", &cred);
         let err = result.expect_err("HTTP to remote token_url should be rejected");
@@ -5746,6 +5978,8 @@ mod tests {
             client_id: "my-client".to_string(),
             client_secret: "env://SECRET".to_string(),
             scope: String::new(),
+            client_assertion: None,
+            extra_params: Default::default(),
         });
         assert!(validate_custom_credential("test", &cred).is_ok());
     }
@@ -5758,6 +5992,8 @@ mod tests {
             client_id: "".to_string(),
             client_secret: "env://SECRET".to_string(),
             scope: String::new(),
+            client_assertion: None,
+            extra_params: Default::default(),
         });
         let result = validate_custom_credential("test", &cred);
         let err = result.expect_err("empty client_id should be rejected");
@@ -5773,6 +6009,8 @@ mod tests {
             client_id: "my-client".to_string(),
             client_secret: "".to_string(),
             scope: String::new(),
+            client_assertion: None,
+            extra_params: Default::default(),
         });
         let result = validate_custom_credential("test", &cred);
         let err = result.expect_err("empty client_secret should be rejected");
@@ -5788,6 +6026,8 @@ mod tests {
             client_id: "my-client".to_string(),
             client_secret: "env://SECRET".to_string(),
             scope: String::new(),
+            client_assertion: None,
+            extra_params: Default::default(),
         });
         assert!(validate_custom_credential("test", &cred).is_ok());
     }
@@ -5822,6 +6062,60 @@ mod tests {
         assert_eq!(auth.client_id, "my-client");
         assert_eq!(auth.client_secret, "env://CLIENT_SECRET");
         assert_eq!(auth.scope, "api.read");
+    }
+
+    #[test]
+    fn test_parse_profile_with_rate_limit() {
+        let json = r#"{
+            "meta": { "name": "rate-limit-test" },
+            "network": {
+                "custom_credentials": {
+                    "my_api": {
+                        "upstream": "https://api.example.com",
+                        "credential_key": "env://MY_API_KEY",
+                        "rate_limit": {
+                            "requests_per_minute": 120,
+                            "burst": 10,
+                            "max_delay_secs": 3
+                        }
+                    }
+                }
+            }
+        }"#;
+        let dir = tempdir().expect("tmpdir");
+        let path = dir.path().join("rate-limit-test.json");
+        std::fs::write(&path, json).expect("write profile");
+        let profile = load_profile_from_path(&path).expect("parse profile");
+        let cred = &profile.network.custom_credentials["my_api"];
+        let rl = cred.rate_limit.as_ref().expect("rate_limit should be set");
+        assert_eq!(rl.requests_per_minute, 120);
+        assert_eq!(rl.burst, 10);
+        assert_eq!(rl.max_delay_secs, 3);
+    }
+
+    #[test]
+    fn test_parse_profile_rate_limit_defaults() {
+        let json = r#"{
+            "meta": { "name": "rate-limit-defaults" },
+            "network": {
+                "custom_credentials": {
+                    "my_api": {
+                        "upstream": "https://api.example.com",
+                        "credential_key": "env://MY_API_KEY",
+                        "rate_limit": { "requests_per_minute": 60 }
+                    }
+                }
+            }
+        }"#;
+        let dir = tempdir().expect("tmpdir");
+        let path = dir.path().join("rate-limit-defaults.json");
+        std::fs::write(&path, json).expect("write profile");
+        let profile = load_profile_from_path(&path).expect("parse profile");
+        let cred = &profile.network.custom_credentials["my_api"];
+        let rl = cred.rate_limit.as_ref().expect("rate_limit should be set");
+        assert_eq!(rl.requests_per_minute, 60);
+        assert_eq!(rl.burst, 5, "burst should default to 5");
+        assert_eq!(rl.max_delay_secs, 5, "max_delay_secs should default to 5");
     }
 
     #[test]
@@ -5912,8 +6206,11 @@ mod tests {
                 allow_domain: vec![AllowDomainEntry::Plain("base.example.com".to_string())],
                 deny_domain: vec![],
                 open_port: vec![3000],
+                open_port_range: vec![],
                 listen_port: vec![4000],
+                listen_port_range: vec![],
                 connect_port: vec![],
+                no_proxy: vec!["base.local".to_string()],
                 credentials: Some(vec!["base_cred".to_string()]),
                 custom_credentials: HashMap::new(),
                 tls_intercept: None,
@@ -6001,8 +6298,11 @@ mod tests {
                 allow_domain: vec![AllowDomainEntry::Plain("child.example.com".to_string())],
                 deny_domain: vec![],
                 open_port: vec![3000, 5000],
+                open_port_range: vec![],
                 listen_port: vec![4000, 6000],
+                listen_port_range: vec![],
                 connect_port: vec![],
+                no_proxy: vec!["base.local".to_string(), "child.local".to_string()],
                 credentials: None,
                 custom_credentials: HashMap::new(),
                 tls_intercept: None,
@@ -6072,6 +6372,15 @@ mod tests {
         let merged = merge_profiles(base_profile(), child_profile());
         // base has [3000], child has [3000, 5000] — merged should dedup to [3000, 5000]
         assert_eq!(merged.network.open_port, vec![3000, 5000]);
+    }
+
+    #[test]
+    fn test_merge_profiles_deduplicates_no_proxy() {
+        let merged = merge_profiles(base_profile(), child_profile());
+        assert_eq!(
+            merged.network.no_proxy,
+            vec!["base.local".to_string(), "child.local".to_string()]
+        );
     }
 
     #[test]
@@ -6278,6 +6587,8 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 aws_auth: None,
+                spiffe: None,
+                rate_limit: None,
             },
         );
 
@@ -6302,6 +6613,8 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 aws_auth: None,
+                spiffe: None,
+                rate_limit: None,
             },
         );
 
@@ -6444,6 +6757,8 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 aws_auth: None,
+                spiffe: None,
+                rate_limit: None,
             },
         );
 
@@ -6468,6 +6783,8 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 aws_auth: None,
+                spiffe: None,
+                rate_limit: None,
             },
         );
 
@@ -7409,6 +7726,46 @@ mod tests {
         );
     }
 
+    /// Regression for https://github.com/nolabs-ai/nono/issues/1400.
+    ///
+    /// The post-run save flow serializes a resolved `Profile` and writes it
+    /// to disk. Inheritable `Option` fields whose `None` means "inherit from
+    /// base" must be OMITTED from the output, not serialized as `null`.
+    /// `command_policies` additionally rejects an explicit `null` on read
+    /// (see `test_command_policies_null_rejected`), so serializing `None` as
+    /// `null` produced a file that could never be reloaded — the user-visible
+    /// "saving throws an error, yet the profile is updated on disk" symptom.
+    #[test]
+    fn test_inheritable_options_omitted_when_none_and_round_trip() {
+        // A default Profile has every inheritable Option set to None.
+        let profile = Profile::default();
+
+        let json = serde_json::to_string(&profile).expect("serialize");
+
+        // None of these keys may appear in the serialized form; emitting any
+        // of them as `null` either breaks reload (command_policies) or
+        // wrongly clears an inherited value (the rest).
+        for key in [
+            "\"environment\"",
+            "\"command_policies\"",
+            "\"open_urls\"",
+            "\"allow_launch_services\"",
+            "\"allow_gpu\"",
+            "\"allow_parent_of_protected\"",
+            "\"binary\"",
+        ] {
+            assert!(
+                !json.contains(key),
+                "serialized Profile should omit {key} when None, got: {json}"
+            );
+        }
+
+        // The whole point: the saved file must reload successfully.
+        let reparsed: Profile = serde_json::from_str(&json).expect("saved profile must round-trip");
+        assert_eq!(reparsed.command_policies, None);
+        assert_eq!(reparsed.open_urls, None);
+    }
+
     #[test]
     fn test_unknown_fields_rejected_in_profile() {
         // A typo like "add_deny_acces" (missing 's') must be caught at parse
@@ -7487,6 +7844,7 @@ mod tests {
                     "credentials": ["openai"],
                     "open_port": [3000],
                     "listen_port": [4000],
+                    "no_proxy": ["redis"],
                     "upstream_proxy": "squid.corp:3128",
                     "upstream_bypass": ["internal.corp"]
                 }
@@ -7501,8 +7859,122 @@ mod tests {
         assert!(network.contains_key("credentials"));
         assert!(network.contains_key("open_port"));
         assert!(network.contains_key("listen_port"));
+        assert!(network.contains_key("no_proxy"));
         assert!(network.contains_key("upstream_proxy"));
         assert!(network.contains_key("upstream_bypass"));
+    }
+
+    #[test]
+    fn test_network_no_proxy_deserializes_plain_host_patterns() -> Result<()> {
+        let profile = parse_profile_bytes(
+            br#"{
+                "meta": { "name": "no-proxy" },
+                "network": {
+                    "no_proxy": ["redis", "*.internal.example", ".svc.cluster.local"]
+                }
+            }"#,
+        )?;
+
+        assert_eq!(
+            profile.network.no_proxy,
+            vec![
+                "redis".to_string(),
+                "*.internal.example".to_string(),
+                ".svc.cluster.local".to_string()
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_network_no_proxy_rejects_url_credentials_and_path_entries() {
+        for entry in [
+            "https://dev.local",
+            "user@dev.local",
+            "dev.local/path",
+            "dev.local?debug=true",
+            "dev.local:8080",
+            "dev.local",
+            "api.openai.com",
+            "API.OPENAI.COM",
+            "169.254.169.254",
+            "169.254.1.2",
+            "internal",
+            "fd00:ec2::254",
+            "fd00:0ec2::254",
+            "fd00:ec2:0:0:0:0:0:254",
+            "[fd00:ec2::254]",
+            "[fd00:0ec2::254]",
+            "[fe80::1]",
+            "metadata.google.internal",
+            ".google.internal",
+            "[::1]:8443",
+            "*",
+        ] {
+            let json = format!(
+                r#"{{
+                    "meta": {{ "name": "bad-no-proxy" }},
+                    "network": {{ "no_proxy": ["{entry}"] }}
+                }}"#
+            );
+            let result = parse_profile_bytes(json.as_bytes());
+            assert!(
+                result.is_err(),
+                "network.no_proxy entry {entry:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_network_no_proxy_rejects_allow_domain_overlap() {
+        for (allow_domain, no_proxy) in [
+            (r#""api.internal.corp""#, ".internal.corp"),
+            (r#""redis""#, "redis"),
+            (
+                r#"{ "domain": "api.github.com", "endpoints": [{ "method": "GET", "path": "/repos/**" }] }"#,
+                ".github.com",
+            ),
+        ] {
+            let json = format!(
+                r#"{{
+                    "meta": {{ "name": "bad-no-proxy-overlap" }},
+                    "network": {{
+                        "allow_domain": [{allow_domain}],
+                        "no_proxy": ["{no_proxy}"]
+                    }}
+                }}"#
+            );
+            let result = parse_profile_bytes(json.as_bytes());
+            assert!(
+                result.is_err(),
+                "allow_domain {allow_domain} and no_proxy {no_proxy:?} should conflict"
+            );
+        }
+    }
+
+    #[test]
+    fn test_finalize_profile_rejects_inherited_no_proxy_allow_domain_overlap() -> Result<()> {
+        let base = parse_profile_bytes(
+            br#"{
+                "meta": { "name": "base" },
+                "network": { "no_proxy": [".internal.corp"] }
+            }"#,
+        )?;
+        let child = parse_profile_bytes(
+            br#"{
+                "meta": { "name": "child" },
+                "network": { "allow_domain": ["api.internal.corp"] }
+            }"#,
+        )?;
+
+        let merged = merge_profiles(base, child);
+        let result = finalize_profile(merged);
+
+        assert!(
+            result.is_err(),
+            "inherited allow_domain/no_proxy conflicts must fail after profile merge"
+        );
+        Ok(())
     }
 
     #[test]
@@ -8055,6 +8527,8 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             aws_auth: None,
+            spiffe: None,
+            rate_limit: None,
         };
         assert!(
             validate_custom_credential("example", &cred).is_ok(),
@@ -8082,6 +8556,8 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             aws_auth: None,
+            spiffe: None,
+            rate_limit: None,
         };
         let result = validate_custom_credential("example", &cred);
         let err = result.expect_err("file:// URI without env_var should be rejected");
@@ -8112,6 +8588,8 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             aws_auth: None,
+            spiffe: None,
+            rate_limit: None,
         };
         let result = validate_custom_credential("example", &cred);
         let err = result.expect_err("file:// URI with relative path should be rejected");
@@ -8142,6 +8620,8 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             aws_auth: None,
+            spiffe: None,
+            rate_limit: None,
         };
         let result = validate_custom_credential("example", &cred);
         assert!(
@@ -8204,6 +8684,8 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             aws_auth: None,
+            spiffe: None,
+            rate_limit: None,
         };
         assert!(validate_custom_credential("example", &cred).is_ok());
     }
@@ -8612,6 +9094,8 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             aws_auth: None,
+            spiffe: None,
+            rate_limit: None,
         };
         let result = validate_custom_credential("example", &cred);
         assert!(result.is_err(), "env://LD_PRELOAD should be rejected");
@@ -9414,6 +9898,8 @@ mod tests {
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
+            spiffe: None,
+            rate_limit: None,
         }
     }
 
@@ -9477,6 +9963,8 @@ mod tests {
                 client_id: "cid".to_string(),
                 client_secret: "env://SECRET".to_string(),
                 scope: String::new(),
+                client_assertion: None,
+                extra_params: Default::default(),
             }),
             ..aws_auth_cred_builder()
         };
@@ -9496,6 +9984,8 @@ mod tests {
             credential_key: None,
             auth: None,
             aws_auth: None,
+            spiffe: None,
+            rate_limit: None,
             ..aws_auth_cred_builder()
         };
         let result = validate_custom_credential("bedrock", &cred);
@@ -9944,6 +10434,112 @@ mod tests {
         assert!(
             !exec_paths.contains(&"/other/exec".to_string()),
             "other platform's exec_path must not be present: {exec_paths:?}"
+        );
+    }
+
+    #[test]
+    fn platform_overrides_merge_adds_command_daemon_pid_source() {
+        // `daemon_pid_source` declared only in the current platform's override must
+        // land on the command's effective policy, alongside the base's fields.
+        let current_os = crate::platform::current_os_name();
+        let json = format!(
+            r#"{{
+                "meta": {{"name": "test"}},
+                "command_policies": {{"commands": {{"tmux": {{"sandbox": {{"exec_paths": ["/base/exec"]}}}}}}}},
+                "platform_overrides": {{
+                    "{current_os}": {{"command_policies": {{"commands": {{"tmux": {{"daemon_pid_source": {{"argv": ["tmux-pid"]}}}}}}}}}}
+                }}
+            }}"#
+        );
+        let profile: Profile = serde_json::from_str(&json).expect("parse");
+        let finalized = finalize_profile(profile).expect("finalize");
+        let tmux = &finalized
+            .command_policies
+            .expect("command_policies")
+            .commands["tmux"];
+        assert_eq!(
+            tmux.daemon_pid_source
+                .as_ref()
+                .map(|source| source.argv.clone()),
+            Some(vec!["tmux-pid".to_string()]),
+            "current-OS override must add daemon_pid_source"
+        );
+        assert_eq!(
+            tmux.sandbox.as_ref().expect("sandbox").exec_paths,
+            vec!["/base/exec".to_string()],
+            "base sandbox must survive the override merge"
+        );
+    }
+
+    #[test]
+    fn platform_overrides_other_platform_daemon_pid_source_not_applied() {
+        // A `daemon_pid_source` override for the non-current platform must not leak in.
+        let other_os = if crate::platform::current_os_name() == "macos" {
+            "linux"
+        } else {
+            "macos"
+        };
+        let json = format!(
+            r#"{{
+                "meta": {{"name": "test"}},
+                "command_policies": {{"commands": {{"tmux": {{"sandbox": {{"exec_paths": ["/base/exec"]}}}}}}}},
+                "platform_overrides": {{
+                    "{other_os}": {{"command_policies": {{"commands": {{"tmux": {{"daemon_pid_source": {{"argv": ["tmux-pid"]}}}}}}}}}}
+                }}
+            }}"#
+        );
+        let profile: Profile = serde_json::from_str(&json).expect("parse");
+        let finalized = finalize_profile(profile).expect("finalize");
+        assert_eq!(
+            finalized
+                .command_policies
+                .expect("command_policies")
+                .commands["tmux"]
+                .daemon_pid_source,
+            None,
+            "other platform's daemon_pid_source must not be present"
+        );
+    }
+
+    #[test]
+    fn extends_child_daemon_pid_source_replaces_base() {
+        // resolve_extends folds `merge_profiles(base, child)`; the child (more
+        // derived) helper wins.
+        let base: Profile = serde_json::from_str(
+            r#"{"meta":{"name":"base"},"command_policies":{"commands":{"tmux":{"daemon_pid_source":{"argv":["base-pid"]}}}}}"#,
+        )
+        .expect("parse base");
+        let child: Profile = serde_json::from_str(
+            r#"{"meta":{"name":"child"},"command_policies":{"commands":{"tmux":{"daemon_pid_source":{"argv":["child-pid"]}}}}}"#,
+        )
+        .expect("parse child");
+        let merged = merge_profiles(base, child);
+        assert_eq!(
+            merged.command_policies.expect("command_policies").commands["tmux"]
+                .daemon_pid_source
+                .as_ref()
+                .map(|source| source.argv.clone()),
+            Some(vec!["child-pid".to_string()])
+        );
+    }
+
+    #[test]
+    fn extends_inherits_base_daemon_pid_source_when_child_omits() {
+        let base: Profile = serde_json::from_str(
+            r#"{"meta":{"name":"base"},"command_policies":{"commands":{"tmux":{"daemon_pid_source":{"argv":["base-pid"]}}}}}"#,
+        )
+        .expect("parse base");
+        let child: Profile = serde_json::from_str(
+            r#"{"meta":{"name":"child"},"command_policies":{"commands":{"tmux":{}}}}"#,
+        )
+        .expect("parse child");
+        let merged = merge_profiles(base, child);
+        assert_eq!(
+            merged.command_policies.expect("command_policies").commands["tmux"]
+                .daemon_pid_source
+                .as_ref()
+                .map(|source| source.argv.clone()),
+            Some(vec!["base-pid".to_string()])
         );
     }
 

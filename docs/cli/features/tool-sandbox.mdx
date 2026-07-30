@@ -66,6 +66,7 @@ Each entry under `commands` uses the command name as the key:
 | `intercept` | array | Ordered argument-sequence mediation rules evaluated after invocation policy. |
 | `allow_direct_exec_bypass` | absolute path array | Compatibility escape hatch for direct canonical-path invocation. |
 | `allow_direct_exec_bypass_with_credentials` | boolean | Required when a credential-using command also allows direct exec bypass. |
+| `daemon_pid_source` | `{ argv: string[], env?: string[] }` | macOS only. Helper nono runs to learn the pid of a daemon this command spawns that double-forks and reparents to pid 1 (e.g. a tmux server), so a request from that daemon can still be attributed to this command. `argv` is the helper program (expanded, then must be absolute); `env` allowlists daemon-env keys forwarded to it. See [Daemon Attribution](#daemon-attribution). |
 
 `from` entries accept three value shapes:
 
@@ -112,14 +113,40 @@ An `intercept` rule may carry an optional `sandbox` (the same object described a
 
 ### Intercept Actions
 
-Each `intercept` entry is `{ "args": [...], "action": { "type": ... } }`. Rules are evaluated in order; the first whose `args` appear as a contiguous sequence in the invocation's arguments wins (an empty `args` is a catch-all). This lets subcommand rules match after command-global options, such as `git -c foo=bar push --force`. Broad single-argument rules like `["--force"]` match anywhere in the invocation, not only at the subcommand position. The `action.type` selects how the matched subcommand is handled:
+Each `intercept` entry selects an invocation with either legacy `args` or an explicit `match` predicate, then applies an `action`. Rules are evaluated in order; the first match wins. Legacy `args` is a contiguous argument sequence matched within the invocation's arguments (an empty `args` is a catch-all). This lets subcommand rules match after command-global options, such as `git -c foo=bar push --force`. Broad single-argument rules like `["--force"]` match anywhere in the invocation, not only at the subcommand position.
+
+Use `match` when a rule needs an explicit predicate instead of a literal `args` window. `match.argv` accepts the same matcher shapes as `invocation_policy`: `exact`, `prefix`, or `contains`. `match.env` checks environment variables after Tool Sandbox environment filtering, so profiles can mediate out-of-band behavior such as `GIT_SSH_COMMAND` without matching raw host environment state.
+
+```jsonc
+{
+  "match": {
+    "argv": { "contains": ["push", "--force"] }
+  },
+  "action": { "type": "approve" }
+}
+```
+
+```jsonc
+{
+  "match": {
+    "env": {
+      "GIT_SSH_COMMAND": { "equals": "ssh -i /tmp/fake_key" }
+    }
+  },
+  "action": { "type": "approve" }
+}
+```
+
+`match` is still a predicate over the argv and env that nono observes. It does not perform command-specific semantic normalization such as `--flag=value` versus `--flag value`, short versus long aliases (`-f` versus `--force`), repeated or duplicate flag folding, flag-order canonicalization, or git-specific parsing. It also does not expand environment references embedded inside argv tokens. If a shell expands `$FOO` before `exec`, nono sees the expanded argv; if a caller passes the literal token `$FOO`, nono matches that literal token.
+
+The `action.type` selects how the matched subcommand is handled:
 
 | `action.type` | Behavior |
 |---|---|
 | `passthrough` | Run the real binary in its sandbox. This is the default when no rule matches. |
 | `respond` | Return a static `stdout` string to the caller without forking the binary. |
 | `capture` | Run the real binary, buffering its stdout for broker inspection before returning it. |
-| `capture_credential` | Run the real binary, store its stdout as a named ambient `credential`, and return a broker nonce. |
+| `capture_credential` | Run the real binary, store its stdout as a named ambient `credential`, and return a broker nonce. An optional `shape` controls the returned nonce's form: `opaque` (default) returns the bare `nono_<hex>`; `jwt` wraps it as a structurally-valid unsigned JWT (`<header>.<payload>.<nonce>`) for callers that validate token structure before use — the embedded nonce still resolves on egress. |
 | `approve` | Route the invocation through an approval backend before forking (optional `timeout_secs`). |
 | `exec` | Run the helper at `command[0]` — with `command[1..]` then the original arguments — in place of the real binary, inside the matched command's sandbox; stream its stdout/stderr and propagate its exit code. `command[0]` is `$VAR`-expanded, must be absolute, is resolved with identity expectations, and is subject to the same non-writable-executable trust gate as a pinned `executable`. |
 
@@ -173,7 +200,9 @@ The `@git:common-dir` token runs `git rev-parse --git-common-dir` from nono's wo
 | `allow_all` | boolean | Allows unrestricted child network access. |
 | `allow_domain` | string array | Hostname allow-list. Valid only with an enforceable nono proxy/helper mode. |
 | `tcp_connect_ports` | port array | Raw TCP connect ports on Linux Landlock. Not hostname-filtered. |
-| `tcp_bind_ports` | port array | Raw TCP bind ports on Linux Landlock. |
+| `tcp_bind_ports` | port array | Raw TCP bind ports on Linux Landlock. Cannot be enforced for tool-sandbox children on macOS. |
+| `open_port` | port array | Localhost bind ports (e.g. an OAuth/OIDC loopback callback listener). Mirrors the top-level `network.open_port`; enforceable for children on macOS and Linux. |
+| `open_port_range` | `[start, end]` array | Inclusive localhost bind port ranges, e.g. `[[8250, 8255]]`. |
 
 `environment.allow_vars` accepts exact names such as `PATH`, trailing-prefix wildcards such as `AWS_*`, and the bare wildcard `*`. `environment.set_vars` injects static values after filtering; `PATH` and `NONO_*` are reserved.
 
@@ -241,6 +270,33 @@ This is broader than `commands.<name>.allow_writable_executable`: it also covers
 Linux launches the verified executable object by file descriptor. macOS verifies the pinned file before sandboxing but must still call `execve()` by path, so a sandbox-writable executable or parent directory remains replaceable before launch. Avoid `allow_writable_executable` for high-assurance macOS policies.
 
 Interpreter-packaged tools, such as a Python `aws` entrypoint, are classified as shebang scripts. Tool Sandbox grants the selected script, its interpreter, and the interpreter's ELF loader closure. Language package directories, virtualenvs, SDK homes, and tool-specific data are not guessed by Tool Sandbox; grant those explicitly with `fs_read`, `fs_read_file`, `fs_write`, or `fs_write_file`.
+
+## Daemon Attribution
+
+Tool Sandbox authorizes a request by walking the caller's process ancestry to the session. A daemon that double-forks and reparents to pid 1 (a tmux server, for example) severs that chain, so a request from it can no longer be tied to the command that spawned it. Rather than fall back to something replayable, Tool Sandbox attributes such a caller by a platform lineage marker, or denies it:
+
+- **Linux** places each Tool Sandbox command in a per-command cgroup that survives reparenting; a severed caller is attributed by reading its cgroup. No writable cgroup base means severed callers are denied.
+- **macOS** uses `commands.<name>.daemon_pid_source`: a helper nono runs to learn the pid of the daemon the command spawns. When a caller reparented to pid 1 is seen, nono runs each declared helper and attributes the caller to a command only if the reported pid matches, pinned by the daemon's kernel identity. No declared helper means severed callers are denied.
+
+Either way a severed caller resolves only to the command that spawned it, never the session, and is denied on any mismatch.
+
+The macOS helper is declared as `{ "argv": [...], "env": [...] }`. nono passes the daemon's context as a single JSON object on **stdin**:
+
+```json
+{
+  "schema_version": 1,
+  "command": "<command name>",
+  "candidate_pid": 48213,
+  "workdir": "/abs/session/workdir",
+  "daemon_cwd": "/abs/daemon/cwd",
+  "daemon_argv": ["/path/to/daemon", "..."],
+  "daemon_env": { "SOME_KEY": "value" }
+}
+```
+
+`candidate_pid` is the severed daemon nono walked to; `daemon_cwd`, `daemon_argv`, and `daemon_env` describe it, read from the kernel, and are omitted when unreadable. `daemon_env` carries only the keys named in `env` that are present in the daemon's environment; credential-named keys are always dropped. The helper prints the pid it believes is its server on stdout; nono accepts only if that equals `candidate_pid`.
+
+The helper runs **unsandboxed** in the supervisor. It MUST only read and emit a single pid (for example, the pid file the daemon writes) and MUST NOT execute workspace-controlled code. nono hardens the launch — the `argv` program is expanded (`~`, `$WORKDIR`, `$TMPDIR`, `$UID`, XDG) and must then be an absolute path, its environment is cleared to a minimal set, its working directory is neutral, and it is killed if it exceeds a short timeout — but cannot vet what the declared helper itself does.
 
 ## Examples
 

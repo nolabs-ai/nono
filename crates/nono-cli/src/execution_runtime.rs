@@ -184,12 +184,8 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         });
     }
 
-    let command: Vec<String> = std::iter::once(program.to_string_lossy().into_owned())
-        .chain(
-            cmd_args
-                .iter()
-                .map(|arg| arg.to_string_lossy().into_owned()),
-        )
+    let command: Vec<std::ffi::OsString> = std::iter::once(program.clone())
+        .chain(cmd_args.iter().cloned())
         .collect();
 
     if command.is_empty() {
@@ -197,6 +193,11 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
     }
 
     let resolved_program = exec_strategy::resolve_program(&command[0])?;
+
+    // Lossy is sound for the policy lookups below because every key they match
+    // against comes from JSON, so it is valid UTF-8.
+    let program_display = command[0].to_string_lossy().into_owned();
+
     let known_builtin_profile = recommended_builtin_profile(&resolved_program);
     let recommended_profile = if flags.session.profile_name.is_none() {
         known_builtin_profile
@@ -207,7 +208,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
     let recommended_program_name = resolved_program
         .file_name()
         .and_then(|name| name.to_str())
-        .unwrap_or(&command[0]);
+        .unwrap_or(&program_display);
 
     if let Some(profile) = recommended_profile {
         output::print_profile_hint(recommended_program_name, profile, flags.silent);
@@ -407,7 +408,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     let tool_sandbox_initial_shim = tool_sandbox_runtime
         .as_ref()
-        .and_then(|runtime| runtime.shim_for_initial_command(&command[0]))
+        .and_then(|runtime| runtime.shim_for_initial_command(&program_display))
         .map(std::path::Path::to_path_buf);
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     let exec_resolved_program = tool_sandbox_initial_shim
@@ -418,7 +419,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     if let Some(runtime) = tool_sandbox_runtime.as_ref()
-        && let Some(err) = runtime.validate_initial_exec(&command[0], &resolved_program)?
+        && let Some(err) = runtime.validate_initial_exec(&program_display, &resolved_program)?
     {
         return Err(err);
     }
@@ -660,10 +661,14 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
             unreachable!("execute_direct only returns on error");
         }
         exec_strategy::ExecStrategy::Supervised => {
+            let command_display: Vec<String> = command
+                .iter()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect();
             let exit_result = execute_supervised_runtime(SupervisedRuntimeContext {
                 config: &config,
                 caps: &caps,
-                command: &command,
+                command: &command_display,
                 session,
                 rollback,
                 trust,

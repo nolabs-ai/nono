@@ -491,7 +491,7 @@ pub fn run_learn(args: &LearnArgs) -> Result<LearnResult> {
 /// nettop runs in CSV logging mode (`-L 0`) polling at 1-second intervals.
 #[cfg(target_os = "macos")]
 fn run_fs_usage_and_nettop(
-    command: &[String],
+    command: &[std::ffi::OsString],
     timeout: Option<u64>,
 ) -> Result<(Vec<FileAccess>, Vec<NetworkAccess>)> {
     use std::time::Duration;
@@ -1177,7 +1177,7 @@ enum TracedAccess {
 /// Run strace on the command and collect file accesses, network accesses, and DNS queries
 #[cfg(target_os = "linux")]
 fn run_strace(
-    command: &[String],
+    command: &[std::ffi::OsString],
     timeout: Option<u64>,
 ) -> Result<(Vec<FileAccess>, Vec<NetworkAccess>, Vec<String>)> {
     use std::time::{Duration, Instant};
@@ -1186,16 +1186,18 @@ fn run_strace(
         return Err(NonoError::NoCommand);
     }
 
-    let mut strace_args = vec![
-        "-f".to_string(),  // Follow forks
-        "-s".to_string(),  // Increase max string size for DNS packet capture
-        "256".to_string(),
-        "-e".to_string(),  // Trace these syscalls
+    // OsString, not String: everything after `--` is the traced command's own
+    // argv and must reach it byte-for-byte.
+    let mut strace_args: Vec<std::ffi::OsString> = vec![
+        "-f".into(),  // Follow forks
+        "-s".into(),  // Increase max string size for DNS packet capture
+        "256".into(),
+        "-e".into(),  // Trace these syscalls
         "openat,open,access,stat,lstat,readlink,execve,creat,mkdir,rename,unlink,connect,bind,sendto,sendmsg"
-            .to_string(),
-        "-o".to_string(),
-        "/dev/stderr".to_string(), // Output to stderr so we can capture it
-        "--".to_string(),
+            .into(),
+        "-o".into(),
+        "/dev/stderr".into(), // Output to stderr so we can capture it
+        "--".into(),
     ];
     strace_args.extend(command.iter().cloned());
 

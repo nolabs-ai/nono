@@ -34,6 +34,8 @@ mod launch_runtime;
 mod learn;
 mod learn_runtime;
 mod legacy_cleanup;
+#[cfg(target_os = "linux")]
+mod lineage_cgroup;
 #[cfg(target_os = "macos")]
 mod macos_trust;
 mod migration;
@@ -115,12 +117,13 @@ fn main() {
     }
     tool_sandbox::record_main_start();
 
-    let legacy_network_warnings = collect_legacy_network_warnings();
+    let os_args: Vec<_> = std::env::args_os().collect();
+
+    let legacy_network_warnings = collect_legacy_network_warnings(&os_args);
     normalize_legacy_flag_env_vars();
     // Emit one deprecation warning per distinct legacy long flag before clap
     // parses. clap's `alias` rebinds `--override-deny` to `--bypass-protection`
     // silently; without this scan the user would never see a removal notice.
-    let os_args: Vec<_> = std::env::args_os().collect();
     deprecated_schema::warn_for_deprecated_flags(&os_args);
     let cli = Cli::parse();
     init_tracing(&cli);
@@ -270,7 +273,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_effective_proxy_settings_allow_net_clears_profile_proxy_state() {
+    fn test_resolve_effective_proxy_settings_allow_net_clears_profile_proxy_state() -> Result<()> {
         let args = SandboxArgs {
             allow_net: true,
             ..sandbox_args()
@@ -296,6 +299,7 @@ mod tests {
             credential_providers: std::collections::HashMap::new(),
             credential_routes: Vec::new(),
             tls_intercept: None,
+            no_proxy: vec!["redis".to_string()],
             upstream_proxy: None,
             upstream_bypass: Vec::new(),
             listen_ports: Vec::new(),
@@ -324,7 +328,7 @@ mod tests {
             allow_http2_requested: false,
         };
 
-        let effective = resolve_effective_proxy_settings(&args, &prepared);
+        let effective = resolve_effective_proxy_settings(&args, &prepared)?;
 
         assert_eq!(
             effective,
@@ -333,12 +337,14 @@ mod tests {
                 allow_domain: Vec::new(),
                 deny_domain: Vec::new(),
                 credentials: Vec::new(),
+                no_proxy: Vec::new(),
             }
         );
+        Ok(())
     }
 
     #[test]
-    fn test_resolve_effective_proxy_settings_merges_cli_and_profile() {
+    fn test_resolve_effective_proxy_settings_merges_cli_and_profile() -> Result<()> {
         let args = SandboxArgs {
             network_profile: Some("minimal".to_string()),
             allow_proxy: vec!["example.com".to_string()],
@@ -366,6 +372,7 @@ mod tests {
             credential_providers: std::collections::HashMap::new(),
             credential_routes: Vec::new(),
             tls_intercept: None,
+            no_proxy: vec!["redis".to_string()],
             upstream_proxy: None,
             upstream_bypass: Vec::new(),
             listen_ports: Vec::new(),
@@ -394,7 +401,7 @@ mod tests {
             allow_http2_requested: false,
         };
 
-        let effective = resolve_effective_proxy_settings(&args, &prepared);
+        let effective = resolve_effective_proxy_settings(&args, &prepared)?;
 
         assert_eq!(
             effective,
@@ -406,8 +413,10 @@ mod tests {
                 ],
                 deny_domain: Vec::new(),
                 credentials: vec!["github".to_string(), "openai".to_string()],
+                no_proxy: vec!["redis".to_string()],
             }
         );
+        Ok(())
     }
 
     #[test]
@@ -503,7 +512,7 @@ mod tests {
         let helper = Cli::parse_from([
             "nono",
             "pack-update-hint-helper",
-            "always-further/claude",
+            "nolabs-ai/claude",
             "1.0.0",
         ]);
         assert!(!allows_pre_exec_update_check(&helper.command));

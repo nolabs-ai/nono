@@ -152,6 +152,34 @@ pub(crate) fn lexically_normalize(path: &std::path::Path) -> std::path::PathBuf 
     normalized
 }
 
+/// Restore owner-write on every directory in `dir`'s tree so a following
+/// `remove_dir_all` can unlink entries inside sealed subdirectories.
+///
+/// The shim directory is sealed to `0o500` while the sandbox runs so its
+/// private shim copies stay immutable. Unlinking a file needs write on its
+/// *parent* directory and `remove_dir_all` does not chmod as it descends, so
+/// without this the per-invocation runtime directory leaks on every exit.
+/// Best-effort and never follows or modifies symlinks; a real failure still
+/// surfaces from the subsequent `remove_dir_all`.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn restore_dir_tree_writable(dir: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(meta) = std::fs::symlink_metadata(dir) else {
+        return;
+    };
+    if !meta.is_dir() || meta.file_type().is_symlink() {
+        return;
+    }
+    // Grant owner rwx before descending so we can traverse and unlink children.
+    let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        restore_dir_tree_writable(&entry.path());
+    }
+}
+
 /// Whether the agent's own filesystem grants admit *writing* `path` directly.
 ///
 /// True when `path` is (or is under) the agent's own `--workdir`
@@ -171,6 +199,54 @@ pub(crate) fn agent_can_write(
     let denied = deny_paths.iter().any(|deny| path.starts_with(deny));
     !denied
         && (path.starts_with(policy_root) || caps_grant(outer_caps, path, nono::AccessMode::Write))
+}
+
+// A policy's fs_write_file entries are best-effort: not every candidate
+// path exists on every machine (e.g. a log file some other tool creates
+// lazily). Skip a missing one rather than denying the whole command —
+// mirrors add_optional_dir/add_optional_read_file in each platform module.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn add_optional_write_file(
+    caps: &mut nono::CapabilitySet,
+    path: std::path::PathBuf,
+) -> nono::Result<()> {
+    match nono::FsCapability::new_file(&path, nono::AccessMode::ReadWrite) {
+        Ok(capability) => {
+            caps.add_fs(capability);
+            Ok(())
+        }
+        Err(nono::NonoError::PathNotFound(_)) => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(test)]
+mod add_optional_write_file_tests {
+    use super::add_optional_write_file;
+    use nono::CapabilitySet;
+    use std::path::PathBuf;
+
+    #[test]
+    fn missing_path_is_skipped_not_an_error() {
+        let mut caps = CapabilitySet::new();
+
+        let result = add_optional_write_file(&mut caps, PathBuf::from("/no/such/path.log"));
+
+        assert!(result.is_ok());
+        assert!(caps.fs_capabilities().is_empty());
+    }
+
+    #[test]
+    fn existing_path_is_granted() {
+        let mut caps = CapabilitySet::new();
+        let file = tempfile::NamedTempFile::new().expect("tempfile");
+
+        let result = add_optional_write_file(&mut caps, file.path().to_path_buf());
+
+        assert!(result.is_ok());
+        assert_eq!(caps.fs_capabilities().len(), 1);
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]

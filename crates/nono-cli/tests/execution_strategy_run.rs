@@ -13,6 +13,8 @@
 
 use std::fs;
 use std::net::TcpListener;
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -59,6 +61,15 @@ fn write_profile(home: &Path, name: &str, json: &str) -> PathBuf {
 fn python3_available() -> bool {
     Command::new("python3")
         .args(["-c", "import socket"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "linux")]
+fn cc_available() -> bool {
+    Command::new("cc")
+        .arg("--version")
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
@@ -421,5 +432,142 @@ fn env_credentials_with_command_policies_non_shim_entry_succeeds() {
     assert!(
         output.status.success(),
         "env_credentials + command_policies with a non-shim entry must succeed\nstdout: {stdout}\nstderr: {stderr}",
+    );
+}
+
+/// A script written into a writable grant-dir (cwd) must still execute under
+/// an active `command_policies` outer exec gate.
+#[test]
+#[cfg(target_os = "linux")]
+fn command_policies_allows_script_exec_in_writable_grant_dir() {
+    let (_tmp, home, workspace) = setup_isolated_home("cmd-policies-script-exec");
+
+    let script_path = workspace.join("s.sh");
+    fs::write(&script_path, "#!/usr/bin/env bash\necho ok\n").expect("write script");
+    fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755))
+        .expect("chmod script executable");
+
+    let profile_path = write_profile(
+        &home,
+        "cmd-policies-script-exec",
+        &format!(
+            r#"{{
+                "meta": {{ "name": "cmd-policies-script-exec-test" }},
+                "filesystem": {{ "allow": ["{workspace}"] }},
+                "network": {{ "block": true }},
+                "command_policies": {{
+                    "commands": {{
+                        "cat": {{
+                            "executable": "/bin/cat"
+                        }}
+                    }}
+                }}
+            }}"#,
+            workspace = workspace.display()
+        ),
+    );
+
+    let output = run_nono(
+        &[
+            "run",
+            "--profile",
+            profile_path.to_str().expect("profile path"),
+            "--no-rollback",
+            "--",
+            "bash",
+            "-c",
+            "./s.sh",
+        ],
+        &home,
+        &workspace,
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "a script in a writable grant-dir must still execute under command_policies\nstdout: {stdout}\nstderr: {stderr}",
+    );
+    assert!(
+        stdout.contains("ok"),
+        "expected script output in stdout\nstdout: {stdout}\nstderr: {stderr}",
+    );
+}
+
+/// Same as above but for a binary compiled at runtime, so it wasn't on disk
+/// when the outer exec gate was set up.
+#[test]
+#[cfg(target_os = "linux")]
+fn command_policies_allows_compiled_binary_exec_in_writable_grant_dir() {
+    if !cc_available() {
+        eprintln!("skipping: cc not available");
+        return;
+    }
+
+    let (_tmp, home, workspace) = setup_isolated_home("cmd-policies-bin-exec");
+
+    let source_path = workspace.join("b.c");
+    fs::write(
+        &source_path,
+        "#include <stdio.h>\nint main(void) { printf(\"ok\\n\"); return 0; }\n",
+    )
+    .expect("write source");
+    let binary_path = workspace.join("b");
+    let compile_status = Command::new("cc")
+        .args([
+            "-o",
+            binary_path.to_str().expect("binary path"),
+            source_path.to_str().expect("source path"),
+        ])
+        .status()
+        .expect("run cc");
+    assert!(compile_status.success(), "cc must compile the test binary");
+
+    let profile_path = write_profile(
+        &home,
+        "cmd-policies-bin-exec",
+        &format!(
+            r#"{{
+                "meta": {{ "name": "cmd-policies-bin-exec-test" }},
+                "filesystem": {{ "allow": ["{workspace}"] }},
+                "network": {{ "block": true }},
+                "command_policies": {{
+                    "commands": {{
+                        "cat": {{
+                            "executable": "/bin/cat"
+                        }}
+                    }}
+                }}
+            }}"#,
+            workspace = workspace.display()
+        ),
+    );
+
+    let output = run_nono(
+        &[
+            "run",
+            "--profile",
+            profile_path.to_str().expect("profile path"),
+            "--no-rollback",
+            "--",
+            "bash",
+            "-c",
+            "./b",
+        ],
+        &home,
+        &workspace,
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "a freshly compiled binary in a writable grant-dir must still execute under command_policies\nstdout: {stdout}\nstderr: {stderr}",
+    );
+    assert!(
+        stdout.contains("ok"),
+        "expected binary output in stdout\nstdout: {stdout}\nstderr: {stderr}",
     );
 }

@@ -299,13 +299,7 @@ fn is_opted_out() -> bool {
     if std::env::var(NO_PACK_UPDATE_HINTS_ENV).is_ok() {
         return true;
     }
-    if std::env::var("NONO_NO_UPDATE_CHECK").is_ok() {
-        return true;
-    }
-    match crate::config::user::load_user_config() {
-        Ok(Some(config)) => !config.updates.check,
-        _ => false,
-    }
+    crate::update_check::update_check_opted_out()
 }
 
 fn is_newer(installed: &str, latest: &str) -> bool {
@@ -331,8 +325,8 @@ mod tests {
     #[test]
     fn refresh_helper_args_round_trip() {
         let stale = vec![
-            ("always-further/claude".to_string(), "1.0.0".to_string()),
-            ("always-further/codex".to_string(), "2.3.4".to_string()),
+            ("nolabs-ai/claude".to_string(), "1.0.0".to_string()),
+            ("nolabs-ai/codex".to_string(), "2.3.4".to_string()),
         ];
 
         let args = refresh_helper_args(&stale);
@@ -342,7 +336,7 @@ mod tests {
 
     #[test]
     fn refresh_helper_args_reject_odd_values() {
-        assert!(parse_refresh_helper_args(vec!["always-further/claude".to_string()]).is_none());
+        assert!(parse_refresh_helper_args(vec!["nolabs-ai/claude".to_string()]).is_none());
     }
 
     #[test]

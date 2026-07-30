@@ -435,6 +435,37 @@ pub enum LocalSocketMode {
     Connect,
 }
 
+/// Shape of the broker nonce a capture intercept returns to the caller.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CapturedNonceShape {
+    /// Opaque `nono_<64hex>` (default).
+    #[default]
+    Opaque,
+    /// JWT-shaped `<header>.<payload>.nono_<64hex>`, for consumers that
+    /// validate token structure before use. The embedded nonce still resolves.
+    Jwt,
+}
+
+impl CapturedNonceShape {
+    /// Whether this is the default ([`CapturedNonceShape::Opaque`]).
+    pub fn is_opaque(&self) -> bool {
+        matches!(self, Self::Opaque)
+    }
+
+    /// Apply this shape to a freshly issued broker `nonce` before it is returned
+    /// to the caller. The JWT shape embeds the bare nonce in the signature
+    /// segment, so it still resolves on egress.
+    pub fn apply(&self, nonce: String) -> nono::Result<String> {
+        match self {
+            Self::Opaque => Ok(nonce),
+            Self::Jwt => nono_proxy::jwt_phantom::jwt_shaped_phantom(&nonce).map_err(|err| {
+                nono::NonoError::SandboxInit(format!("jwt-shape capture nonce: {err}"))
+            }),
+        }
+    }
+}
+
 /// Action to take when an [`InterceptRuleConfig`] matches.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -461,6 +492,11 @@ pub enum InterceptActionConfig {
         /// An empty list means any consumer may redeem (equivalent to `GrantSet::All`).
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         grant_to: Vec<String>,
+        /// Shape of the nonce returned to the caller. `jwt` wraps it so
+        /// structure-validating consumers accept the phantom; the embedded
+        /// nonce still promotes on egress.
+        #[serde(default, skip_serializing_if = "CapturedNonceShape::is_opaque")]
+        shape: CapturedNonceShape,
     },
     /// Block and route through `ApprovalBackend` before forking the child.
     /// On denial the shim receives an error response; no child is forked.
@@ -490,15 +526,21 @@ pub enum InterceptActionConfig {
 
 /// A sub-command mediation rule on a [`CommandPolicyConfig`].
 ///
-/// Rules are evaluated in order; the first match wins. An empty `args` list
-/// is a catch-all and must appear last in the list. If no rule matches the
-/// default action is `Passthrough`.
+/// Rules are evaluated in order; the first match wins. Legacy `args` matches a
+/// contiguous argument sequence. Predicate `match` rules can match argv and/or
+/// env. An explicit empty `args` list is a catch-all and must appear last in the
+/// list. If no rule matches the default action is `Passthrough`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct InterceptRuleConfig {
     /// Contiguous argument sequence to match within argv[1..] of the shim invocation.
     /// An empty list is a catch-all.
-    pub args: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub args: Option<Vec<String>>,
+    /// Explicit predicate match for argv and/or env. Serialized as `match` in
+    /// profile JSON because that is the user-facing policy term.
+    #[serde(rename = "match", default, skip_serializing_if = "Option::is_none")]
+    pub match_config: Option<InterceptRuleMatchConfig>,
     /// Action to take when this rule matches.
     #[serde(default)]
     pub action: InterceptActionConfig,
@@ -508,6 +550,15 @@ pub struct InterceptRuleConfig {
     /// omitting `credentials`/`use_credentials` injects none here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox: Option<CommandSandboxConfig>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct InterceptRuleMatchConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub argv: Option<ArgvMatcherConfig>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, EnvMatcherConfig>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -529,6 +580,24 @@ pub struct CommandPolicyConfig {
     pub allow_direct_exec_bypass_with_credentials: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub intercept: Vec<InterceptRuleConfig>,
+    /// Helper that reports the pid of a daemon this command spawns (e.g. a tmux
+    /// server that reparents to pid 1), letting the lineage marker attribute a
+    /// severed caller back to this command. Consumed on macOS only for now.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_pid_source: Option<DaemonPidSource>,
+}
+
+/// The helper the lineage marker runs to attribute a severed daemon back to a
+/// command, plus the daemon-env keys it may see.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DaemonPidSource {
+    /// Helper program + args. The program is expanded (`~`, `$WORKDIR`, `$TMPDIR`,
+    /// `$UID`, XDG) and must then be an absolute path.
+    pub argv: Vec<String>,
+    /// Daemon-env keys nono may forward into the helper's JSON `daemon_env`.
+    #[serde(default)]
+    pub env: Vec<String>,
 }
 
 impl CommandPolicyConfig {
@@ -568,6 +637,11 @@ impl CommandPolicyConfig {
                 }
                 rules
             },
+            // Child (more-derived) replaces the base helper: replace, not merge.
+            daemon_pid_source: child
+                .daemon_pid_source
+                .clone()
+                .or_else(|| self.daemon_pid_source.clone()),
         }
     }
 }
@@ -949,6 +1023,14 @@ pub struct CommandNetworkConfig {
     pub tcp_connect_ports: Vec<u16>,
     #[serde(default)]
     pub tcp_bind_ports: Vec<u16>,
+    /// Localhost ports this command may bind (e.g. an OAuth callback listener).
+    /// Unlike `tcp_bind_ports` these are enforceable for tool-sandbox children
+    /// on macOS — they mirror the top-level `network.open_port`.
+    #[serde(default)]
+    pub open_port: Vec<u16>,
+    /// Localhost port ranges this command may bind, as `[start, end]` pairs.
+    #[serde(default)]
+    pub open_port_range: Vec<[u16; 2]>,
 }
 
 impl CommandNetworkConfig {
@@ -958,6 +1040,8 @@ impl CommandNetworkConfig {
             allow_domain: dedup_append(&self.allow_domain, &child.allow_domain),
             tcp_connect_ports: dedup_append(&self.tcp_connect_ports, &child.tcp_connect_ports),
             tcp_bind_ports: dedup_append(&self.tcp_bind_ports, &child.tcp_bind_ports),
+            open_port: dedup_append(&self.open_port, &child.open_port),
+            open_port_range: dedup_append(&self.open_port_range, &child.open_port_range),
         }
     }
 }
@@ -1361,6 +1445,78 @@ pub(crate) fn resolve_policy_exec_helpers(
     Ok(helpers)
 }
 
+/// Pre-resolve every command's `daemon_pid_source` helper, keyed by command
+/// name (each command declares at most one), exactly like `exec` intercept
+/// helpers: identity (dev/ino/size/mtime/sha256) is captured up front for
+/// TOCTOU protection, rather than only checking the helper path is absolute
+/// at dispatch time. A declared helper that fails to resolve is a hard error —
+/// a daemon_pid_source that can never run would silently fail closed on every
+/// severed-daemon check, which should surface at profile-build time instead.
+// daemon_pid_source is consumed on macOS only for now (see CommandPolicyConfig
+// doc comment); unlike exec_helpers this isn't wired up on Linux, so keep the
+// cfg gate macOS-only or `-D warnings` flags it as dead code there.
+#[cfg(any(test, target_os = "macos"))]
+pub(crate) fn resolve_policy_daemon_pid_source_helpers(
+    config: &CommandPoliciesConfig,
+) -> nono::Result<BTreeMap<String, ResolvedCommandBinary>> {
+    let mut helpers = BTreeMap::new();
+    for (command_name, command) in &config.commands {
+        let Some(source) = &command.daemon_pid_source else {
+            continue;
+        };
+        let Some(helper_raw) = source.argv.first() else {
+            continue;
+        };
+        let helper_path = crate::policy::expand_path(helper_raw).map_err(|err| {
+            nono::NonoError::ProfileParse(format!(
+                "command '{command_name}' daemon_pid_source helper '{helper_raw}' could not be expanded: {err}"
+            ))
+        })?;
+        if !helper_path.is_absolute() {
+            return Err(nono::NonoError::ProfileParse(format!(
+                "command '{command_name}' daemon_pid_source helper must be an absolute path; got '{}'",
+                helper_path.display()
+            )));
+        }
+        // Not scoped by the command-hash cache, same rationale as exec helpers above.
+        let (resolved, _) = candidate_command_match(&helper_path, &HashMap::new())?
+            .ok_or_else(|| {
+                nono::NonoError::ProfileParse(format!(
+                    "command '{command_name}' daemon_pid_source helper '{}' not found or not executable",
+                    helper_path.display()
+                ))
+            })?;
+        helpers.insert(
+            command_name.clone(),
+            ResolvedCommandBinary {
+                name: format!("{command_name}.daemon_pid_source"),
+                canonical_path: resolved.canonical_path,
+                dev: resolved.dev,
+                ino: resolved.ino,
+                size: resolved.size,
+                mtime_nanos: resolved.mtime_nanos,
+                sha256: resolved.sha256,
+                duplicate_paths: Vec::new(),
+                shape: resolved.shape,
+            },
+        );
+    }
+    Ok(helpers)
+}
+
+/// True if the named command's `daemon_pid_source` helper opts into
+/// `allow_writable_executable`. Mirrors `command_referencing_exec_helper_allows_writable`.
+#[cfg(target_os = "macos")]
+pub(crate) fn command_daemon_pid_source_helper_allows_writable(
+    config: &CommandPoliciesConfig,
+    command_name: &str,
+) -> bool {
+    config
+        .commands
+        .get(command_name)
+        .is_some_and(|command| command.allow_writable_executable)
+}
+
 fn validate_command(
     command_name: &str,
     command: &CommandPolicyConfig,
@@ -1486,7 +1642,27 @@ fn validate_command(
         }
     }
 
+    if let Some(source) = &command.daemon_pid_source {
+        validate_daemon_pid_source(command_name, source, report);
+    }
+
     validate_intercept_rules(command_name, &command.intercept, config, scope, report);
+}
+
+/// An empty `argv` fails closed at runtime (`argv.first()` is `None`, so the
+/// command's severed-daemon attribution is silently disabled) rather than
+/// surfacing a clear error, so reject it at profile-load time instead.
+fn validate_daemon_pid_source(
+    command_name: &str,
+    source: &DaemonPidSource,
+    report: &mut CommandPolicyValidationReport,
+) {
+    if source.argv.is_empty() {
+        report.error(
+            "daemon_pid_source_empty_argv",
+            format!("command '{command_name}' daemon_pid_source.argv must not be empty"),
+        );
+    }
 }
 
 fn validate_intercept_rules(
@@ -1506,8 +1682,28 @@ fn validate_intercept_rules(
                 ),
             );
         }
-        if rule.args.is_empty() {
-            saw_catch_all = true;
+        let label = format!("commands.{command_name}.intercept[{i}]");
+        match (&rule.args, &rule.match_config) {
+            (Some(_), Some(_)) => {
+                report.error(
+                    "invalid_intercept_matcher",
+                    format!("{label} must define either args or match, not both"),
+                );
+            }
+            (None, None) => {
+                report.error(
+                    "invalid_intercept_matcher",
+                    format!("{label} must define args or match"),
+                );
+            }
+            (Some(args), None) => {
+                if args.is_empty() {
+                    saw_catch_all = true;
+                }
+            }
+            (None, Some(match_config)) => {
+                validate_intercept_matcher(&label, match_config, report);
+            }
         }
         if let InterceptActionConfig::Respond { stdout } = &rule.action
             && stdout.len() > 1024 * 1024
@@ -1571,6 +1767,23 @@ fn validate_intercept_rules(
             validate_exec_action(command_name, i, command, report);
         }
     }
+}
+
+fn validate_intercept_matcher(
+    label: &str,
+    matcher: &InterceptRuleMatchConfig,
+    report: &mut CommandPolicyValidationReport,
+) {
+    if matcher.argv.is_none() && matcher.env.is_empty() {
+        report.error(
+            "invalid_intercept_matcher",
+            format!("{label}.match must define argv or env"),
+        );
+    }
+    if let Some(argv) = &matcher.argv {
+        validate_argv_matcher(label, "invalid_intercept_matcher", argv, true, report);
+    }
+    validate_env_matchers(label, "invalid_intercept_env_matcher", &matcher.env, report);
 }
 
 /// Validate an `exec` intercept action's `command`.
@@ -2027,47 +2240,75 @@ fn validate_invocation_rule(
     validate_positive_timeout(label, rule.timeout_secs, report);
 
     if let Some(argv) = &rule.argv {
-        let matcher_count = usize::from(argv.exact.is_some())
-            + usize::from(argv.prefix.is_some())
-            + usize::from(argv.contains.is_some());
-        if matcher_count != 1 {
-            report.error(
-                "invalid_invocation_matcher",
-                format!("{label} must define exactly one argv matcher"),
-            );
+        validate_argv_matcher(label, "invalid_invocation_matcher", argv, false, report);
+    }
+
+    validate_env_matchers(label, "invalid_invocation_env_matcher", &rule.env, report);
+}
+
+fn validate_argv_matcher(
+    label: &str,
+    code: &'static str,
+    argv: &ArgvMatcherConfig,
+    reject_empty_matcher: bool,
+    report: &mut CommandPolicyValidationReport,
+) {
+    let matcher_count = usize::from(argv.exact.is_some())
+        + usize::from(argv.prefix.is_some())
+        + usize::from(argv.contains.is_some());
+    if matcher_count != 1 {
+        report.error(
+            code,
+            format!("{label} must define exactly one argv matcher"),
+        );
+    }
+    for value in argv
+        .exact
+        .iter()
+        .chain(argv.prefix.iter())
+        .chain(argv.contains.iter())
+        .flat_map(|values| values.iter())
+    {
+        if value.contains('\0') {
+            report.error(code, format!("{label} argv matcher contains NUL"));
         }
-        for value in argv
+    }
+    if reject_empty_matcher {
+        for values in argv
             .exact
             .iter()
             .chain(argv.prefix.iter())
             .chain(argv.contains.iter())
-            .flat_map(|values| values.iter())
         {
-            if value.contains('\0') {
-                report.error(
-                    "invalid_invocation_matcher",
-                    format!("{label} argv matcher contains NUL"),
-                );
+            if values.is_empty() {
+                report.error(code, format!("{label} argv matcher cannot be empty"));
             }
         }
     }
+}
 
-    for (name, matcher) in &rule.env {
+fn validate_env_matchers(
+    label: &str,
+    code: &'static str,
+    env: &BTreeMap<String, EnvMatcherConfig>,
+    report: &mut CommandPolicyValidationReport,
+) {
+    for (name, matcher) in env {
         if !valid_env_matcher_name(name) {
             report.error(
-                "invalid_invocation_env_matcher",
+                code,
                 format!("{label} env matcher has invalid name '{name}'"),
             );
         }
         if matcher.equals.is_none() && matcher.one_of.is_empty() {
             report.error(
-                "invalid_invocation_env_matcher",
+                code,
                 format!("{label} env matcher for '{name}' must define equals or one_of"),
             );
         }
         if matcher.equals.is_some() && !matcher.one_of.is_empty() {
             report.error(
-                "invalid_invocation_env_matcher",
+                code,
                 format!("{label} env matcher for '{name}' cannot define both equals and one_of"),
             );
         }
@@ -2754,7 +2995,10 @@ fn read_command_prefix(path: &Path, max_bytes: usize) -> nono::Result<Vec<u8>> {
 }
 
 #[cfg(any(test, target_os = "linux", target_os = "macos"))]
-fn classify_executable_shape(path: &Path, bytes: &[u8]) -> nono::Result<ResolvedExecutableShape> {
+pub(crate) fn classify_executable_shape(
+    path: &Path,
+    bytes: &[u8],
+) -> nono::Result<ResolvedExecutableShape> {
     if bytes.starts_with(b"\x7fELF") {
         return Ok(ResolvedExecutableShape {
             kind: ResolvedExecutableKind::Elf,
@@ -3411,6 +3655,31 @@ mod tests {
             value.get("exec_paths").is_none(),
             "empty exec_paths should be omitted, got {value}"
         );
+    }
+
+    #[test]
+    fn command_network_open_port_merge_child_dedup_appends() {
+        let base = CommandNetworkConfig {
+            open_port: vec![8250],
+            open_port_range: vec![[3000, 3100]],
+            ..Default::default()
+        };
+        let child = CommandNetworkConfig {
+            open_port: vec![8250, 8251],
+            open_port_range: vec![[3000, 3100], [4000, 4100]],
+            ..Default::default()
+        };
+        let merged = base.merge_child(&child);
+        assert_eq!(merged.open_port, vec![8250, 8251]);
+        assert_eq!(merged.open_port_range, vec![[3000, 3100], [4000, 4100]]);
+    }
+
+    #[test]
+    fn command_network_open_port_round_trips() {
+        let json = r#"{"allow_domain":["vault.us1.ddbuild.io"],"open_port_range":[[8250,8255]]}"#;
+        let cfg: CommandNetworkConfig = serde_json::from_str(json).expect("parse");
+        assert_eq!(cfg.open_port_range, vec![[8250, 8255]]);
+        assert!(cfg.open_port.is_empty());
     }
 
     #[test]
@@ -4236,12 +4505,60 @@ mod tests {
         let action = InterceptActionConfig::CaptureCredential {
             credential: "github".to_string(),
             grant_to: vec![],
+            shape: CapturedNonceShape::Opaque,
         };
         let json = serde_json::to_string(&action).expect("serialize");
 
         assert!(json.contains("capture_credential"));
+        // The default opaque shape is omitted from the serialized form.
+        assert!(!json.contains("shape"), "{json}");
         let back: InterceptActionConfig = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(action, back);
+    }
+
+    #[test]
+    fn capture_credential_shape_defaults_to_opaque() {
+        let action: InterceptActionConfig =
+            serde_json::from_str(r#"{"type":"capture_credential","credential":"github"}"#)
+                .expect("deserialize without shape");
+        assert_eq!(
+            action,
+            InterceptActionConfig::CaptureCredential {
+                credential: "github".to_string(),
+                grant_to: vec![],
+                shape: CapturedNonceShape::Opaque,
+            }
+        );
+    }
+
+    #[test]
+    fn capture_credential_shape_jwt_roundtrip() {
+        let action = InterceptActionConfig::CaptureCredential {
+            credential: "api_jwt".to_string(),
+            grant_to: vec![],
+            shape: CapturedNonceShape::Jwt,
+        };
+        let json = serde_json::to_string(&action).expect("serialize");
+        assert!(json.contains("\"shape\":\"jwt\""), "{json}");
+        let back: InterceptActionConfig = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(action, back);
+    }
+
+    #[test]
+    fn captured_nonce_shape_apply() {
+        let nonce = format!("nono_{}", "a".repeat(64));
+        // Opaque returns the nonce unchanged.
+        assert_eq!(
+            CapturedNonceShape::Opaque
+                .apply(nonce.clone())
+                .expect("opaque"),
+            nonce
+        );
+        // Jwt wraps it as three segments with the bare nonce as the signature.
+        let jwt = CapturedNonceShape::Jwt.apply(nonce.clone()).expect("jwt");
+        let segments: Vec<&str> = jwt.split('.').collect();
+        assert_eq!(segments.len(), 3);
+        assert_eq!(segments[2], nonce);
     }
 
     #[test]
@@ -4266,7 +4583,8 @@ mod tests {
         let mut config = active_git_config();
         let git = config.commands.get_mut("git").expect("git command");
         git.intercept.push(InterceptRuleConfig {
-            args: vec!["auth".to_string(), "switch".to_string()],
+            args: Some(vec!["auth".to_string(), "switch".to_string()]),
+            match_config: None,
             action: InterceptActionConfig::Exec { command },
             sandbox: None,
         });
@@ -4362,6 +4680,114 @@ mod tests {
         );
     }
 
+    fn git_config_with_daemon_pid_source(argv: Vec<String>) -> CommandPoliciesConfig {
+        let mut config = active_git_config();
+        let git = config.commands.get_mut("git").expect("git command");
+        git.daemon_pid_source = Some(DaemonPidSource {
+            argv,
+            env: Vec::new(),
+        });
+        config
+    }
+
+    #[test]
+    fn daemon_pid_source_rejects_empty_argv() {
+        let config = git_config_with_daemon_pid_source(vec![]);
+        let report =
+            validate_command_policies(Some(&config), CommandPolicyValidationScope::Resolved);
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|finding| finding.code == "daemon_pid_source_empty_argv"),
+            "{:?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn daemon_pid_source_accepts_nonempty_argv() {
+        let config = git_config_with_daemon_pid_source(vec!["/usr/bin/true".to_string()]);
+        let report =
+            validate_command_policies(Some(&config), CommandPolicyValidationScope::Resolved);
+        assert!(
+            !report
+                .errors
+                .iter()
+                .any(|finding| finding.code == "daemon_pid_source_empty_argv"),
+            "{:?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn daemon_pid_source_helper_resolution_captures_identity() {
+        let helper = ["/usr/bin/true", "/bin/true"]
+            .into_iter()
+            .map(PathBuf::from)
+            .find(|p| p.exists());
+        let Some(helper) = helper else {
+            return; // no stable helper available; skip rather than fail spuriously.
+        };
+        let config = git_config_with_daemon_pid_source(vec![helper.display().to_string()]);
+        let helpers = resolve_policy_daemon_pid_source_helpers(&config).expect("resolve helpers");
+        let resolved = helpers.get("git").expect("helper resolved for git");
+        assert!(!resolved.sha256.is_empty());
+        assert!(resolved.canonical_path.is_absolute());
+    }
+
+    #[test]
+    fn resolve_policy_daemon_pid_source_helpers_rejects_relative_helper() {
+        let config = git_config_with_daemon_pid_source(vec!["relative/helper".to_string()]);
+        let err = resolve_policy_daemon_pid_source_helpers(&config)
+            .expect_err("must reject relative helper");
+        assert!(
+            err.to_string().contains("absolute path"),
+            "expected absolute-path rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_policy_daemon_pid_source_helpers_rejects_missing_helper() {
+        let config =
+            git_config_with_daemon_pid_source(vec!["/nonexistent/nono-test-helper".to_string()]);
+        let err = resolve_policy_daemon_pid_source_helpers(&config)
+            .expect_err("must reject a helper that does not exist");
+        assert!(
+            err.to_string().contains("not found or not executable"),
+            "expected not-found rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_policy_daemon_pid_source_helpers_expands_vars_in_program_path() {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let dir = std::env::temp_dir().join(format!(
+            "nono-daemon-pid-source-expand-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).expect("mkdir");
+        let helper = dir.join("helper.sh");
+        fs::write(&helper, "#!/bin/sh\necho 1\n").expect("write");
+        fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let dir_str = dir.to_string_lossy().into_owned();
+        let _env = crate::test_env::EnvVarGuard::set_all(&[("NONO_TEST_HELPER_DIR", &dir_str)]);
+
+        let config =
+            git_config_with_daemon_pid_source(vec!["$NONO_TEST_HELPER_DIR/helper.sh".to_string()]);
+        let helpers = resolve_policy_daemon_pid_source_helpers(&config).expect("resolve helpers");
+        let resolved = helpers.get("git").expect("helper resolved for git");
+        assert_eq!(
+            resolved.canonical_path,
+            helper.canonicalize().expect("canonicalize")
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn ambient_credential_capture_validates() {
         let mut config = active_git_config();
@@ -4377,10 +4803,12 @@ mod tests {
         );
         let git = config.commands.get_mut("git").expect("git command");
         git.intercept.push(InterceptRuleConfig {
-            args: vec!["auth".to_string(), "token".to_string()],
+            args: Some(vec!["auth".to_string(), "token".to_string()]),
+            match_config: None,
             action: InterceptActionConfig::CaptureCredential {
                 credential: "github".to_string(),
                 grant_to: vec![],
+                shape: CapturedNonceShape::Opaque,
             },
             sandbox: None,
         });
@@ -4406,10 +4834,12 @@ mod tests {
         );
         let git = config.commands.get_mut("git").expect("git command");
         git.intercept.push(InterceptRuleConfig {
-            args: vec!["auth".to_string(), "token".to_string()],
+            args: Some(vec!["auth".to_string(), "token".to_string()]),
+            match_config: None,
             action: InterceptActionConfig::CaptureCredential {
                 credential: "agent".to_string(),
                 grant_to: vec![],
+                shape: CapturedNonceShape::Opaque,
             },
             sandbox: None,
         });
@@ -4426,12 +4856,14 @@ mod tests {
     #[test]
     fn intercept_rule_merge_child_appends_child_rules() {
         let parent_rule = InterceptRuleConfig {
-            args: vec!["push".to_string()],
+            args: Some(vec!["push".to_string()]),
+            match_config: None,
             action: InterceptActionConfig::Approve { timeout_secs: None },
             sandbox: None,
         };
         let child_rule = InterceptRuleConfig {
-            args: vec!["fetch".to_string()],
+            args: Some(vec!["fetch".to_string()]),
+            match_config: None,
             action: InterceptActionConfig::Passthrough,
             sandbox: None,
         };
@@ -4450,7 +4882,8 @@ mod tests {
     #[test]
     fn intercept_rule_merge_child_does_not_duplicate() {
         let rule = InterceptRuleConfig {
-            args: vec!["push".to_string()],
+            args: Some(vec!["push".to_string()]),
+            match_config: None,
             action: InterceptActionConfig::Passthrough,
             sandbox: None,
         };
@@ -4467,17 +4900,96 @@ mod tests {
     }
 
     #[test]
+    fn daemon_pid_source_child_replaces_parent() {
+        let parent = CommandPolicyConfig {
+            daemon_pid_source: Some(DaemonPidSource {
+                argv: vec!["parent-helper".to_string()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let child = CommandPolicyConfig {
+            daemon_pid_source: Some(DaemonPidSource {
+                argv: vec!["child-helper".to_string()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            parent.merge_child(&child).daemon_pid_source,
+            Some(DaemonPidSource {
+                argv: vec!["child-helper".to_string()],
+                ..Default::default()
+            })
+        );
+    }
+
+    #[test]
+    fn daemon_pid_source_inherited_when_child_omits_it() {
+        let parent = CommandPolicyConfig {
+            daemon_pid_source: Some(DaemonPidSource {
+                argv: vec!["parent-helper".to_string()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let child = CommandPolicyConfig::default();
+        assert_eq!(
+            parent.merge_child(&child).daemon_pid_source,
+            Some(DaemonPidSource {
+                argv: vec!["parent-helper".to_string()],
+                ..Default::default()
+            })
+        );
+        // Child adds it where the parent has none.
+        assert_eq!(
+            child.merge_child(&parent).daemon_pid_source,
+            Some(DaemonPidSource {
+                argv: vec!["parent-helper".to_string()],
+                ..Default::default()
+            })
+        );
+    }
+
+    #[test]
+    fn daemon_pid_source_round_trips_through_serde() {
+        let config = CommandPolicyConfig {
+            daemon_pid_source: Some(DaemonPidSource {
+                argv: vec!["tmux-server-pid".to_string(), "--workspace".to_string()],
+                env: vec!["BAZEL_OUTPUT_USER_ROOT".to_string()],
+            }),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&config).expect("serialize");
+        assert!(
+            json.contains("daemon_pid_source"),
+            "field must serialize: {json}"
+        );
+        let parsed: CommandPolicyConfig = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed.daemon_pid_source, config.daemon_pid_source);
+
+        // Omitted by default (skip_serializing_if) and parses back as None.
+        let empty = serde_json::to_string(&CommandPolicyConfig::default()).expect("serialize");
+        assert!(
+            !empty.contains("daemon_pid_source"),
+            "absent by default: {empty}"
+        );
+    }
+
+    #[test]
     fn validate_intercept_catch_all_must_be_last() {
         let mut config = active_git_config();
         if let Some(git) = config.commands.get_mut("git") {
             git.intercept = vec![
                 InterceptRuleConfig {
-                    args: vec![],
+                    args: Some(vec![]),
+                    match_config: None,
                     action: InterceptActionConfig::Passthrough,
                     sandbox: None,
                 },
                 InterceptRuleConfig {
-                    args: vec!["push".to_string()],
+                    args: Some(vec!["push".to_string()]),
+                    match_config: None,
                     action: InterceptActionConfig::Approve { timeout_secs: None },
                     sandbox: None,
                 },
@@ -4500,12 +5012,14 @@ mod tests {
         if let Some(git) = config.commands.get_mut("git") {
             git.intercept = vec![
                 InterceptRuleConfig {
-                    args: vec!["push".to_string()],
+                    args: Some(vec!["push".to_string()]),
+                    match_config: None,
                     action: InterceptActionConfig::Approve { timeout_secs: None },
                     sandbox: None,
                 },
                 InterceptRuleConfig {
-                    args: vec![],
+                    args: Some(vec![]),
+                    match_config: None,
                     action: InterceptActionConfig::Passthrough,
                     sandbox: None,
                 },
@@ -4523,11 +5037,285 @@ mod tests {
     }
 
     #[test]
+    fn validate_intercept_match_only_rule_is_valid() {
+        let mut config = active_git_config();
+        if let Some(git) = config.commands.get_mut("git") {
+            git.intercept = vec![InterceptRuleConfig {
+                args: None,
+                match_config: Some(InterceptRuleMatchConfig {
+                    argv: Some(ArgvMatcherConfig {
+                        exact: None,
+                        prefix: None,
+                        contains: Some(vec!["push".to_string(), "--force".to_string()]),
+                    }),
+                    env: BTreeMap::from([(
+                        "GIT_SSH_COMMAND".to_string(),
+                        EnvMatcherConfig {
+                            one_of: Vec::new(),
+                            equals: Some("ssh -i /tmp/fake_key".to_string()),
+                        },
+                    )]),
+                }),
+                action: InterceptActionConfig::Approve { timeout_secs: None },
+                sandbox: None,
+            }];
+        }
+
+        let report =
+            validate_command_policies(Some(&config), CommandPolicyValidationScope::Resolved);
+
+        assert!(
+            !report
+                .errors
+                .iter()
+                .any(|f| f.code.starts_with("invalid_intercept")),
+            "unexpected intercept matcher validation error: {:?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn validate_intercept_rejects_args_and_match_together() {
+        let mut config = active_git_config();
+        if let Some(git) = config.commands.get_mut("git") {
+            git.intercept = vec![InterceptRuleConfig {
+                args: Some(vec!["push".to_string()]),
+                match_config: Some(InterceptRuleMatchConfig {
+                    argv: Some(ArgvMatcherConfig {
+                        exact: None,
+                        prefix: Some(vec!["push".to_string()]),
+                        contains: None,
+                    }),
+                    env: BTreeMap::new(),
+                }),
+                action: InterceptActionConfig::Passthrough,
+                sandbox: None,
+            }];
+        }
+
+        let report =
+            validate_command_policies(Some(&config), CommandPolicyValidationScope::Resolved);
+
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|f| f.code == "invalid_intercept_matcher"
+                    && f.message.contains("either args or match")),
+            "expected args+match rejection: {:?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn validate_intercept_rejects_missing_matcher() {
+        let mut config = active_git_config();
+        if let Some(git) = config.commands.get_mut("git") {
+            git.intercept = vec![InterceptRuleConfig {
+                args: None,
+                match_config: None,
+                action: InterceptActionConfig::Passthrough,
+                sandbox: None,
+            }];
+        }
+
+        let report =
+            validate_command_policies(Some(&config), CommandPolicyValidationScope::Resolved);
+
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|f| f.code == "invalid_intercept_matcher"
+                    && f.message.contains("must define args or match")),
+            "expected missing matcher rejection: {:?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn validate_intercept_rejects_empty_match_object() {
+        let mut config = active_git_config();
+        if let Some(git) = config.commands.get_mut("git") {
+            git.intercept = vec![InterceptRuleConfig {
+                args: None,
+                match_config: Some(InterceptRuleMatchConfig::default()),
+                action: InterceptActionConfig::Passthrough,
+                sandbox: None,
+            }];
+        }
+
+        let report =
+            validate_command_policies(Some(&config), CommandPolicyValidationScope::Resolved);
+
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|f| f.code == "invalid_intercept_matcher"
+                    && f.message.contains("must define argv or env")),
+            "expected empty match rejection: {:?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn validate_intercept_reuses_argv_and_env_matcher_validation() {
+        let mut config = active_git_config();
+        if let Some(git) = config.commands.get_mut("git") {
+            git.intercept = vec![InterceptRuleConfig {
+                args: None,
+                match_config: Some(InterceptRuleMatchConfig {
+                    argv: Some(ArgvMatcherConfig {
+                        exact: Some(vec!["push".to_string()]),
+                        prefix: Some(vec!["push".to_string()]),
+                        contains: None,
+                    }),
+                    env: BTreeMap::from([(
+                        "BAD=NAME".to_string(),
+                        EnvMatcherConfig {
+                            one_of: Vec::new(),
+                            equals: None,
+                        },
+                    )]),
+                }),
+                action: InterceptActionConfig::Passthrough,
+                sandbox: None,
+            }];
+        }
+
+        let report =
+            validate_command_policies(Some(&config), CommandPolicyValidationScope::Resolved);
+
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|f| f.code == "invalid_intercept_matcher"
+                    && f.message.contains("exactly one argv matcher")),
+            "expected argv matcher validation: {:?}",
+            report.errors
+        );
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|f| f.code == "invalid_intercept_env_matcher"
+                    && f.message.contains("invalid name")),
+            "expected env name validation: {:?}",
+            report.errors
+        );
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|f| f.code == "invalid_intercept_env_matcher"
+                    && f.message.contains("must define equals or one_of")),
+            "expected env matcher validation: {:?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn validate_intercept_rejects_empty_argv_matcher() {
+        for argv in [
+            ArgvMatcherConfig {
+                exact: Some(Vec::new()),
+                prefix: None,
+                contains: None,
+            },
+            ArgvMatcherConfig {
+                exact: None,
+                prefix: Some(Vec::new()),
+                contains: None,
+            },
+            ArgvMatcherConfig {
+                exact: None,
+                prefix: None,
+                contains: Some(Vec::new()),
+            },
+        ] {
+            let mut config = active_git_config();
+            if let Some(git) = config.commands.get_mut("git") {
+                git.intercept = vec![InterceptRuleConfig {
+                    args: None,
+                    match_config: Some(InterceptRuleMatchConfig {
+                        argv: Some(argv),
+                        env: BTreeMap::new(),
+                    }),
+                    action: InterceptActionConfig::Passthrough,
+                    sandbox: None,
+                }];
+            }
+
+            let report =
+                validate_command_policies(Some(&config), CommandPolicyValidationScope::Resolved);
+
+            assert!(
+                report
+                    .errors
+                    .iter()
+                    .any(|f| f.code == "invalid_intercept_matcher"
+                        && f.message.contains("cannot be empty")),
+                "expected empty argv matcher validation: {:?}",
+                report.errors
+            );
+        }
+    }
+
+    #[test]
+    fn validate_invocation_allows_empty_argv_matcher_for_compatibility() {
+        for argv in [
+            ArgvMatcherConfig {
+                exact: Some(Vec::new()),
+                prefix: None,
+                contains: None,
+            },
+            ArgvMatcherConfig {
+                exact: None,
+                prefix: Some(Vec::new()),
+                contains: None,
+            },
+            ArgvMatcherConfig {
+                exact: None,
+                prefix: None,
+                contains: Some(Vec::new()),
+            },
+        ] {
+            let mut report = CommandPolicyValidationReport::default();
+            let rule = InvocationRuleConfig {
+                argv: Some(argv),
+                env: BTreeMap::new(),
+                backend: None,
+                reason: None,
+                timeout_secs: None,
+            };
+            validate_invocation_rule(
+                "commands.git.from.session.invocation_policy.approve[0]",
+                "approve",
+                &rule,
+                &CommandPoliciesConfig::default(),
+                &mut report,
+            );
+
+            assert!(
+                !report
+                    .errors
+                    .iter()
+                    .any(|f| f.code == "invalid_invocation_matcher"),
+                "empty invocation argv matcher must remain compatible: {:?}",
+                report.errors
+            );
+        }
+    }
+
+    #[test]
     fn validate_intercept_respond_stdout_too_large() {
         let mut config = active_git_config();
         if let Some(git) = config.commands.get_mut("git") {
             git.intercept = vec![InterceptRuleConfig {
-                args: vec![],
+                args: Some(vec![]),
+                match_config: None,
                 action: InterceptActionConfig::Respond {
                     stdout: "x".repeat(1024 * 1024 + 1),
                 },
@@ -4580,7 +5368,8 @@ mod tests {
     #[test]
     fn intercept_rule_omits_absent_sandbox_override() {
         let rule = InterceptRuleConfig {
-            args: vec!["status".to_string()],
+            args: Some(vec!["status".to_string()]),
+            match_config: None,
             action: InterceptActionConfig::Passthrough,
             sandbox: None,
         };
@@ -4589,6 +5378,45 @@ mod tests {
             !serialized.contains("sandbox"),
             "absent sandbox override should be skipped in serialization: {serialized}"
         );
+    }
+
+    #[test]
+    fn intercept_match_rule_omits_absent_predicate_fields() {
+        let argv_rule = InterceptRuleConfig {
+            args: None,
+            match_config: Some(InterceptRuleMatchConfig {
+                argv: Some(ArgvMatcherConfig {
+                    exact: None,
+                    prefix: Some(vec!["push".to_string()]),
+                    contains: None,
+                }),
+                env: BTreeMap::new(),
+            }),
+            action: InterceptActionConfig::Approve { timeout_secs: None },
+            sandbox: None,
+        };
+        let argv_json = serde_json::to_value(&argv_rule).expect("serialize argv-only match rule");
+        assert!(argv_json["match"].get("argv").is_some());
+        assert!(argv_json["match"].get("env").is_none());
+
+        let env_rule = InterceptRuleConfig {
+            args: None,
+            match_config: Some(InterceptRuleMatchConfig {
+                argv: None,
+                env: BTreeMap::from([(
+                    "GIT_SSH_COMMAND".to_string(),
+                    EnvMatcherConfig {
+                        one_of: Vec::new(),
+                        equals: Some("ssh -i /tmp/fake_key".to_string()),
+                    },
+                )]),
+            }),
+            action: InterceptActionConfig::Approve { timeout_secs: None },
+            sandbox: None,
+        };
+        let env_json = serde_json::to_value(&env_rule).expect("serialize env-only match rule");
+        assert!(env_json["match"].get("argv").is_none());
+        assert!(env_json["match"].get("env").is_some());
     }
 
     #[test]
@@ -4609,7 +5437,8 @@ mod tests {
                     })),
                 )]),
                 intercept: vec![InterceptRuleConfig {
-                    args: vec!["push".to_string()],
+                    args: Some(vec!["push".to_string()]),
+                    match_config: None,
                     action: InterceptActionConfig::Passthrough,
                     sandbox: Some(CommandSandboxConfig {
                         unsafe_macos_seatbelt_rules: vec!["(allow intercept-sandbox)".to_string()],
@@ -4662,7 +5491,8 @@ mod tests {
                     })),
                 )]),
                 intercept: vec![InterceptRuleConfig {
-                    args: vec!["push".to_string()],
+                    args: Some(vec!["push".to_string()]),
+                    match_config: None,
                     action: InterceptActionConfig::Passthrough,
                     sandbox: Some(CommandSandboxConfig {
                         unsafe_macos_seatbelt_rules: vec!["(allow intercept-sandbox)".to_string()],
@@ -4699,7 +5529,8 @@ mod tests {
         );
         let git = config.commands.get_mut("git").expect("git command");
         git.intercept.push(InterceptRuleConfig {
-            args: vec!["status".to_string()],
+            args: Some(vec!["status".to_string()]),
+            match_config: None,
             action: InterceptActionConfig::Passthrough,
             sandbox: Some(CommandSandboxConfig {
                 fs_read: vec![".".to_string()],
@@ -4719,7 +5550,8 @@ mod tests {
         let mut config = active_git_config();
         let git = config.commands.get_mut("git").expect("git command");
         git.intercept.push(InterceptRuleConfig {
-            args: vec!["status".to_string()],
+            args: Some(vec!["status".to_string()]),
+            match_config: None,
             action: InterceptActionConfig::Passthrough,
             sandbox: Some(CommandSandboxConfig {
                 use_credentials: vec!["does-not-exist".to_string()],
@@ -4746,7 +5578,8 @@ mod tests {
         let mut config = active_git_config();
         let git = config.commands.get_mut("git").expect("git command");
         git.intercept.push(InterceptRuleConfig {
-            args: vec!["status".to_string()],
+            args: Some(vec!["status".to_string()]),
+            match_config: None,
             action: InterceptActionConfig::Respond {
                 stdout: String::new(),
             },
@@ -4783,10 +5616,12 @@ mod tests {
         // capture_credential launches the real binary, so a sandbox override is
         // meaningful and must be accepted.
         git.intercept.push(InterceptRuleConfig {
-            args: vec!["status".to_string()],
+            args: Some(vec!["status".to_string()]),
+            match_config: None,
             action: InterceptActionConfig::CaptureCredential {
                 credential: "github".to_string(),
                 grant_to: Vec::new(),
+                shape: CapturedNonceShape::Opaque,
             },
             sandbox: Some(CommandSandboxConfig {
                 fs_read: vec![".".to_string()],
@@ -4830,7 +5665,8 @@ mod tests {
         if let Some(git) = config.commands.get_mut("git") {
             git.sandbox = None;
             git.intercept = vec![InterceptRuleConfig {
-                args: vec!["push".to_string()],
+                args: Some(vec!["push".to_string()]),
+                match_config: None,
                 action: InterceptActionConfig::Approve {
                     timeout_secs: Some(0),
                 },

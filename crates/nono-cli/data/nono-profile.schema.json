@@ -831,6 +831,11 @@
           "items": { "type": "integer" },
           "description": "TCP ports the sandboxed child may listen on."
         },
+        "no_proxy": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Additional client-side proxy bypass entries appended to generated NO_PROXY/no_proxy in proxy mode. This does not grant network access; direct connections still require matching sandbox permissions. Entries must be host patterns only: safe single-label local aliases, canonical IP literals, *.<domain> wildcard suffixes, or .<domain> suffix patterns. Bare multi-label domains, protected metadata suffix tokens, full URLs, credentials, ports, paths, comma-separated lists, and catch-all * are rejected."
+        },
         "custom_credentials": {
           "type": "object",
           "additionalProperties": {
@@ -1001,6 +1006,13 @@
             { "type": "null" }
           ],
           "description": "Path to the PEM-encoded private key corresponding to tls_client_cert. Must be set together with tls_client_cert."
+        },
+        "rate_limit": {
+          "oneOf": [
+            { "$ref": "#/$defs/RouteRateLimitConfig" },
+            { "type": "null" }
+          ],
+          "description": "Optional per-route request-rate limit (RouteRateLimiter). Caps the rate of L7 requests forwarded to this credential's upstream to contain a runaway or compromised agent. Applies only to L7-visible traffic (reverse-proxy and TLS-intercepted CONNECT); it has no effect on opaque CONNECT tunnels."
         }
       }
     },
@@ -1142,6 +1154,31 @@
              { "type": "null" }
            ],
            "description": "Explicit SigV4 service name (e.g., \"bedrock\", \"s3\"). If omitted, auto-detected from the upstream URL. Must be non-empty and contain no whitespace if set."
+         }
+       }
+     },
+     "RouteRateLimitConfig": {
+       "type": "object",
+       "description": "Per-route request-rate limit (RouteRateLimiter). A token bucket refilling at requests_per_minute and holding up to burst tokens. When the bucket is empty, a request is delayed up to max_delay_secs; a request that would wait longer is rejected with HTTP 429 (bounded delay then reject).",
+       "additionalProperties": false,
+       "required": ["requests_per_minute"],
+       "properties": {
+         "requests_per_minute": {
+           "type": "integer",
+           "minimum": 0,
+           "description": "Sustained request rate, in requests per minute. The token bucket refills at this rate. 0 disables the limiter for the route."
+         },
+         "burst": {
+           "type": "integer",
+           "minimum": 0,
+           "default": 5,
+           "description": "Burst capacity: instantaneous requests allowed before throttling begins. Clamped to at least 1 at runtime."
+         },
+         "max_delay_secs": {
+           "type": "integer",
+           "minimum": 0,
+           "default": 5,
+           "description": "Maximum seconds a request may be delayed before it is rejected with HTTP 429. Bounds the delay queue so a flood cannot exhaust proxy resources."
          }
        }
      },
@@ -1384,14 +1421,28 @@
     "InterceptRuleConfig": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["args"],
+      "oneOf": [{ "required": ["args"] }, { "required": ["match"] }],
       "properties": {
         "args": {
           "type": "array",
           "items": { "type": "string" },
           "description": "Contiguous argument sequence matched within argv[1..]. An empty list is a catch-all and must be last. Broad single-argument rules such as [\"--force\"] match anywhere in the invocation, not only at the subcommand position."
         },
+        "match": { "$ref": "#/$defs/InterceptRuleMatchConfig" },
         "action": { "$ref": "#/$defs/InterceptActionConfig" }
+      }
+    },
+    "InterceptRuleMatchConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "anyOf": [{ "required": ["argv"] }, { "required": ["env"] }],
+      "properties": {
+        "argv": { "$ref": "#/$defs/InterceptArgvMatcherConfig" },
+        "env": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": { "$ref": "#/$defs/EnvMatcherConfig" }
+        }
       }
     },
     "InterceptActionConfig": {
@@ -1500,6 +1551,27 @@
         "allow_direct_exec_bypass_with_credentials": {
           "type": "boolean",
           "description": "Second opt-in required before a credential-using command may have direct exec bypass."
+        },
+        "daemon_pid_source": {
+          "$ref": "#/$defs/DaemonPidSource",
+          "description": "Helper nono runs to learn the pid of a daemon this command spawns (e.g. a tmux server that double-forks and reparents to pid 1). When a caller's process ancestry is severed by that reparenting, the lineage marker runs this helper and attributes the severed daemon to this command only if the reported pid matches. Prints one pid. Consumed on macOS only for now."
+        }
+      }
+    },
+    "DaemonPidSource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["argv"],
+      "properties": {
+        "argv": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Helper program and args. The program is expanded (~, $WORKDIR, $TMPDIR, $UID, XDG) and must then be an absolute path. nono passes the daemon's context as a JSON object on stdin and reads the pid the helper prints on stdout."
+        },
+        "env": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Allowlist of the daemon's environment keys nono may forward into the helper's JSON input. Credential-named keys are dropped regardless."
         }
       }
     },
@@ -1690,6 +1762,47 @@
         },
         "contains": {
           "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "InterceptArgvMatcherConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "required": ["exact"],
+          "not": {
+            "anyOf": [{ "required": ["prefix"] }, { "required": ["contains"] }]
+          }
+        },
+        {
+          "required": ["prefix"],
+          "not": {
+            "anyOf": [{ "required": ["exact"] }, { "required": ["contains"] }]
+          }
+        },
+        {
+          "required": ["contains"],
+          "not": {
+            "anyOf": [{ "required": ["exact"] }, { "required": ["prefix"] }]
+          }
+        }
+      ],
+      "properties": {
+        "exact": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string" }
+        },
+        "prefix": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string" }
+        },
+        "contains": {
+          "type": "array",
+          "minItems": 1,
           "items": { "type": "string" }
         }
       }

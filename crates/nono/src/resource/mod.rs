@@ -20,6 +20,11 @@ pub struct ResourceLimits {
     /// (cgroup `memory.max` + `memory.swap.max=0` + `memory.oom.group=1`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_bytes: Option<u64>,
+    /// Maximum number of processes and threads (tasks) in the process tree
+    /// (cgroup `pids.max`). Unlike the memory cap, a breach does not kill
+    /// anything: the kernel refuses new `fork`/`clone` calls with `EAGAIN`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_processes: Option<u64>,
 }
 
 impl ResourceLimits {
@@ -27,16 +32,21 @@ impl ResourceLimits {
     /// supervised run.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.memory_bytes.is_none()
+        self.memory_bytes.is_none() && self.max_processes.is_none()
     }
 
-    /// One-line human-readable summary for `--dry-run` / capability output.
+    /// One-line human-readable summary for `--dry-run` / capability output. Both
+    /// ceilings are always shown (an unset one reads `unlimited`) so the summary
+    /// is a complete statement of the enforced limits, not just the set ones.
     #[must_use]
     pub fn summary(&self) -> String {
         let mem = self
             .memory_bytes
             .map_or_else(|| "unlimited".to_string(), format_bytes);
-        format!("memory={mem}")
+        let procs = self
+            .max_processes
+            .map_or_else(|| "unlimited".to_string(), |n| n.to_string());
+        format!("memory={mem}, processes={procs}")
     }
 }
 
@@ -194,19 +204,36 @@ mod tests {
 
         let some = ResourceLimits {
             memory_bytes: Some(512 * 1024 * 1024),
+            max_processes: None,
         };
         assert!(!some.is_empty());
         let s = some.summary();
-        assert_eq!(s, "memory=512.0 MiB");
+        assert_eq!(s, "memory=512.0 MiB, processes=unlimited");
+
+        // A process-only ceiling is non-empty too, and reads with memory unlimited.
+        let procs = ResourceLimits {
+            memory_bytes: None,
+            max_processes: Some(64),
+        };
+        assert!(!procs.is_empty());
+        assert_eq!(procs.summary(), "memory=unlimited, processes=64");
+
+        // Both ceilings set: both rendered.
+        let both = ResourceLimits {
+            memory_bytes: Some(512 * 1024 * 1024),
+            max_processes: Some(64),
+        };
+        assert_eq!(both.summary(), "memory=512.0 MiB, processes=64");
 
         let unset = ResourceLimits::default();
-        assert_eq!(unset.summary(), "memory=unlimited");
+        assert_eq!(unset.summary(), "memory=unlimited, processes=unlimited");
     }
 
     #[test]
     fn limits_serde_roundtrip() {
         let limits = ResourceLimits {
             memory_bytes: Some(1024),
+            max_processes: Some(32),
         };
         let json = serde_json::to_string(&limits).unwrap();
         let back: ResourceLimits = serde_json::from_str(&json).unwrap();
@@ -297,41 +324,37 @@ mod tests {
     }
 
     #[test]
-    fn format_bytes_via_summary_exact_boundaries() {
-        // format_bytes is private; exercise it via summary() (which prepends
-        // "memory="). Pin the rendering at unit boundaries, the sub-KiB whole-byte
-        // branch, a TiB value, the unit cap, and a rounding case.
-        let mem = |b: u64| {
-            ResourceLimits {
-                memory_bytes: Some(b),
-            }
-            .summary()
-        };
-
+    fn format_bytes_exact_boundaries() {
+        // Pin format_bytes at unit boundaries, the sub-KiB whole-byte branch, a TiB
+        // value, the unit cap, and a rounding case. (summary() embeds this same
+        // rendering; the summary format itself is pinned in limits_is_empty_and_summary.)
         // Under 1 KiB: whole bytes, no decimal, ' B' suffix.
-        assert_eq!(mem(1), "memory=1 B");
-        assert_eq!(mem(1023), "memory=1023 B");
+        assert_eq!(format_bytes(1), "1 B");
+        assert_eq!(format_bytes(1023), "1023 B");
         // Exactly 1 KiB: switches to one-decimal binary unit.
-        assert_eq!(mem(1024), "memory=1.0 KiB");
+        assert_eq!(format_bytes(1024), "1.0 KiB");
         // Half a KiB above 1 KiB.
-        assert_eq!(mem(1536), "memory=1.5 KiB");
+        assert_eq!(format_bytes(1536), "1.5 KiB");
         // 1587 / 1024 = 1.5498 -> rounds to one decimal as 1.5.
-        assert_eq!(mem(1587), "memory=1.5 KiB");
+        assert_eq!(format_bytes(1587), "1.5 KiB");
         // 1100 / 1024 = 1.0742 -> rounds to 1.1.
-        assert_eq!(mem(1100), "memory=1.1 KiB");
+        assert_eq!(format_bytes(1100), "1.1 KiB");
         // Exact MiB / GiB.
-        assert_eq!(mem(1024 * 1024), "memory=1.0 MiB");
-        assert_eq!(mem(1024 * 1024 * 1024), "memory=1.0 GiB");
+        assert_eq!(format_bytes(1024 * 1024), "1.0 MiB");
+        assert_eq!(format_bytes(1024 * 1024 * 1024), "1.0 GiB");
         // Exact TiB (1024^4).
-        assert_eq!(mem(1024_u64.pow(4)), "memory=1.0 TiB");
-        assert_eq!(mem(1024_u64.pow(4) + 1024_u64.pow(4) / 2), "memory=1.5 TiB");
+        assert_eq!(format_bytes(1024_u64.pow(4)), "1.0 TiB");
+        assert_eq!(
+            format_bytes(1024_u64.pow(4) + 1024_u64.pow(4) / 2),
+            "1.5 TiB"
+        );
         // 1 PiB has no PiB unit: the loop caps at TiB, so it reads as 1024.0 TiB.
-        assert_eq!(mem(1024_u64.pow(5)), "memory=1024.0 TiB");
+        assert_eq!(format_bytes(1024_u64.pow(5)), "1024.0 TiB");
     }
 
     #[test]
     fn parse_size_format_bytes_roundtrip_on_exact_binary_values() {
-        // For exact single-unit binary multiples, summary()'s rendered form
+        // For exact single-unit binary multiples, format_bytes' rendered form
         // re-parses back to the same byte count: a closed loop proving the units
         // and the parser agree.
         for (bytes, unit) in [
@@ -342,13 +365,9 @@ mod tests {
             (1024 * 1024 * 1024, "GiB"),
             (1024_u64.pow(4), "TiB"),
         ] {
-            // summary renders e.g. "memory=1.0 KiB"; strip the prefix and the ".0"
-            // to reconstruct the integer+unit the parser accepts.
-            let summary = ResourceLimits {
-                memory_bytes: Some(bytes),
-            }
-            .summary();
-            let rendered = summary.strip_prefix("memory=").unwrap();
+            // format_bytes renders e.g. "1.0 KiB"; strip the ".0" to reconstruct the
+            // integer+unit the parser accepts.
+            let rendered = format_bytes(bytes);
             let (value, suffix) = rendered.split_once(' ').unwrap();
             assert_eq!(suffix, unit, "unexpected unit for {bytes}");
             // The integer magnitude in the rendered "<n>.0" form, re-attached to
@@ -360,18 +379,30 @@ mod tests {
     }
 
     #[test]
-    fn is_empty_tracks_memory_field_and_summary_unlimited() {
-        // is_empty is exactly memory_bytes.is_none(); summary reflects the same.
-        let empty = ResourceLimits { memory_bytes: None };
-        assert!(empty.is_empty());
-        assert_eq!(empty.summary(), "memory=unlimited");
-
-        // Even a 1-byte limit makes it non-empty and is rendered, not elided.
-        let set = ResourceLimits {
-            memory_bytes: Some(1),
+    fn is_empty_tracks_both_fields_and_summary_unlimited() {
+        // is_empty is true only when BOTH ceilings are unset; summary reflects the
+        // same, showing each field as unlimited when unset.
+        let empty = ResourceLimits {
+            memory_bytes: None,
+            max_processes: None,
         };
-        assert!(!set.is_empty());
-        assert_eq!(set.summary(), "memory=1 B");
+        assert!(empty.is_empty());
+        assert_eq!(empty.summary(), "memory=unlimited, processes=unlimited");
+
+        // Either field alone makes it non-empty and is rendered, not elided.
+        let mem = ResourceLimits {
+            memory_bytes: Some(1),
+            max_processes: None,
+        };
+        assert!(!mem.is_empty());
+        assert_eq!(mem.summary(), "memory=1 B, processes=unlimited");
+
+        let procs = ResourceLimits {
+            memory_bytes: None,
+            max_processes: Some(1),
+        };
+        assert!(!procs.is_empty());
+        assert_eq!(procs.summary(), "memory=unlimited, processes=1");
 
         // Default is the unlimited/empty state.
         assert!(ResourceLimits::default().is_empty());
@@ -405,11 +436,12 @@ mod tests {
 
     #[test]
     fn some_memory_serializes_with_exactly_one_key_and_roundtrips() {
-        // Some(N) must serialize to exactly { "memory_bytes": N } and round-trip.
-        // (The roundtrip test would miss a stray leaked key — serde ignores unknown
-        // fields on read — so this pins the exact serialized shape.)
+        // memory alone must serialize to exactly { "memory_bytes": N } and round-trip
+        // (max_processes: None is skipped). This pins the exact serialized shape,
+        // which the roundtrip alone would miss (serde ignores unknown fields on read).
         let some = ResourceLimits {
             memory_bytes: Some(536_870_912),
+            max_processes: None,
         };
         let v: serde_json::Value = serde_json::to_value(some).unwrap();
         let obj = v.as_object().expect("object");
@@ -418,8 +450,36 @@ mod tests {
             obj.get("memory_bytes").and_then(serde_json::Value::as_u64),
             Some(536_870_912)
         );
+        assert!(!obj.contains_key("max_processes"), "None field is skipped");
 
         let back: ResourceLimits = serde_json::from_value(v).unwrap();
         assert_eq!(back, some);
+    }
+
+    #[test]
+    fn max_processes_serializes_independently_and_roundtrips() {
+        // A process-only ceiling serializes to exactly { "max_processes": N } (memory
+        // skipped), and deserializes back — mirror of the memory-only contract so the
+        // two ceilings are provably independent on the wire.
+        let procs = ResourceLimits {
+            memory_bytes: None,
+            max_processes: Some(64),
+        };
+        let v: serde_json::Value = serde_json::to_value(procs).unwrap();
+        let obj = v.as_object().expect("object");
+        assert_eq!(obj.len(), 1, "exactly one serialized key, got {obj:?}");
+        assert_eq!(
+            obj.get("max_processes").and_then(serde_json::Value::as_u64),
+            Some(64)
+        );
+        assert!(!obj.contains_key("memory_bytes"), "None field is skipped");
+
+        let back: ResourceLimits = serde_json::from_value(v).unwrap();
+        assert_eq!(back, procs);
+
+        // Deserializing an explicit null for max_processes yields None (serde default).
+        let from_null: ResourceLimits = serde_json::from_str(r#"{"max_processes":null}"#).unwrap();
+        assert!(from_null.max_processes.is_none());
+        assert!(from_null.is_empty());
     }
 }

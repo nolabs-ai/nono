@@ -1,6 +1,5 @@
 //! Audit logging for proxy requests.
 //!
-//! Logs all proxy requests with structured fields via `tracing`.
 //! Sensitive data (authorization headers, tokens, request bodies)
 //! is never included in audit logs.
 
@@ -45,6 +44,7 @@ pub struct EventContext<'a> {
     pub endpoint_policy_rule: Option<&'a str>,
     pub approval_backend: Option<&'a str>,
     pub upstream: Option<&'a str>,
+    pub spiffe_context: Option<nono::undo::SpiffeAuditContext>,
 }
 
 impl std::fmt::Display for ProxyMode {
@@ -58,13 +58,11 @@ impl std::fmt::Display for ProxyMode {
     }
 }
 
-/// Create a shared in-memory audit log.
 #[must_use]
 pub fn new_audit_log() -> SharedAuditLog {
     Arc::new(Mutex::new(Vec::new()))
 }
 
-/// Drain all network audit events collected so far.
 #[must_use]
 pub fn drain_audit_events(audit_log: &SharedAuditLog) -> Vec<NetworkAuditEvent> {
     match audit_log.lock() {
@@ -134,7 +132,6 @@ fn push_event(audit_log: Option<&SharedAuditLog>, event: NetworkAuditEvent) {
     }
 }
 
-/// Log an allowed proxy request.
 pub fn log_allowed(
     audit_log: Option<&SharedAuditLog>,
     mode: ProxyMode,
@@ -181,6 +178,7 @@ pub fn log_allowed(
             credential_capture_header_names: None,
             credential_capture_stdin_mode: None,
             credential_capture_interactive: None,
+            spiffe_context: ctx.spiffe_context.clone(),
             target: host.to_string(),
             upstream: ctx.upstream.map(str::to_string),
             port: Some(port),
@@ -192,7 +190,6 @@ pub fn log_allowed(
     );
 }
 
-/// Log a denied proxy request.
 pub fn log_denied(
     audit_log: Option<&SharedAuditLog>,
     mode: ProxyMode,
@@ -239,6 +236,7 @@ pub fn log_denied(
             credential_capture_header_names: None,
             credential_capture_stdin_mode: None,
             credential_capture_interactive: None,
+            spiffe_context: ctx.spiffe_context.clone(),
             target: host.to_string(),
             upstream: ctx.upstream.map(str::to_string),
             port: Some(port),
@@ -250,11 +248,8 @@ pub fn log_denied(
     );
 }
 
-/// Log an L7 request that the proxy decoded (reverse proxy or intercepted CONNECT).
-///
-/// Used for both `Reverse` and `ConnectIntercept` modes. `External` and
-/// `Connect` (transparent tunnel) modes have no L7 visibility and use
-/// `log_allowed`/`log_denied` instead.
+/// Used for `Reverse` and `ConnectIntercept` modes. `External` and `Connect`
+/// (transparent tunnel) modes have no L7 visibility and use `log_allowed`/`log_denied`.
 pub fn log_l7_request(
     audit_log: Option<&SharedAuditLog>,
     mode: ProxyMode,
@@ -302,6 +297,7 @@ pub fn log_l7_request(
             credential_capture_header_names: None,
             credential_capture_stdin_mode: None,
             credential_capture_interactive: None,
+            spiffe_context: ctx.spiffe_context.clone(),
             target: target.to_string(),
             upstream: ctx.upstream.map(str::to_string),
             port: None,
@@ -313,7 +309,7 @@ pub fn log_l7_request(
     );
 }
 
-/// Log an L7 endpoint-policy decision before the upstream request is made.
+/// Logs an endpoint-policy decision (before the upstream request).
 #[allow(clippy::too_many_arguments)]
 pub fn log_l7_policy_decision(
     audit_log: Option<&SharedAuditLog>,
@@ -368,6 +364,7 @@ pub fn log_l7_policy_decision(
             credential_capture_header_names: None,
             credential_capture_stdin_mode: None,
             credential_capture_interactive: None,
+            spiffe_context: ctx.spiffe_context.clone(),
             target: target.to_string(),
             upstream: ctx.upstream.map(str::to_string),
             port,
@@ -379,7 +376,6 @@ pub fn log_l7_policy_decision(
     );
 }
 
-/// Structured details for a command-backed credential capture audit event.
 #[derive(Debug, Clone)]
 pub struct CredentialCaptureAudit<'a> {
     pub route_id: &'a str,
@@ -405,9 +401,8 @@ pub struct CredentialCaptureAudit<'a> {
     pub reason: Option<&'a str>,
 }
 
-/// Log a command-backed credential capture event. The captured credential value
-/// is never recorded; only command metadata, timing, byte counts, and redacted
-/// diagnostics are persisted.
+/// The captured credential value is never recorded — only command metadata,
+/// timing, byte counts, and redacted stderr are persisted.
 pub fn log_credential_capture(
     audit_log: Option<&SharedAuditLog>,
     mode: ProxyMode,
@@ -455,6 +450,7 @@ pub fn log_credential_capture(
             credential_capture_header_names: event.header_names.map(<[String]>::to_vec),
             credential_capture_stdin_mode: event.stdin_mode.map(str::to_string),
             credential_capture_interactive: event.interactive,
+            spiffe_context: None,
             target: event.request_host.to_string(),
             upstream: event.upstream.map(str::to_string),
             port: event.request_port,
@@ -463,31 +459,6 @@ pub fn log_credential_capture(
             status: None,
             reason: event.reason.map(str::to_string),
         },
-    );
-}
-
-/// Compatibility shim for the previous `log_reverse_proxy` API. New code
-/// should call [`log_l7_request`] directly with the appropriate
-/// [`ProxyMode`] instead.
-#[deprecated(since = "0.46.0", note = "use log_l7_request with ProxyMode::Reverse")]
-pub fn log_reverse_proxy(
-    audit_log: Option<&SharedAuditLog>,
-    service: &str,
-    method: &str,
-    path: &str,
-    status: u16,
-) {
-    log_l7_request(
-        audit_log,
-        ProxyMode::Reverse,
-        &EventContext {
-            route_id: Some(service),
-            ..EventContext::default()
-        },
-        service,
-        method,
-        path,
-        status,
     );
 }
 

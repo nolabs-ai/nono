@@ -25,7 +25,7 @@ use nono::supervisor::{ApprovalDecision, AuditEntry, SupervisorMessage, Supervis
 use nono::{
     ApprovalBackend, CapabilitySet, DenialReason, DenialRecord, NonoError, Result, Sandbox,
     SessionDiagnosticReport, SupervisorListener, SupervisorSocket, UnixSocketCapability,
-    UnixSocketMode,
+    UnixSocketMode, UrlDenialReason, UrlDenialRecord,
 };
 use std::collections::HashSet;
 use std::ffi::{CString, OsStr};
@@ -53,65 +53,74 @@ pub(crate) use env_sanitization::validate_set_vars;
 ///
 /// # Errors
 /// Returns an error if the program cannot be found in PATH or as a valid path.
-pub fn resolve_program(program: &str) -> Result<PathBuf> {
+pub fn resolve_program(program: &OsStr) -> Result<PathBuf> {
     which::which(program).map_err(|e| {
+        // Escaped only when the name is not valid UTF-8: this message names the
+        // program that could not be found, so those bytes must stay legible,
+        // but escaping the ordinary case would just add quotes to every miss.
+        let shown = program
+            .to_str()
+            .map_or_else(|| format!("{program:?}"), str::to_owned);
         NonoError::CommandExecution(std::io::Error::new(
             std::io::ErrorKind::NotFound,
-            format!("{}: {}", program, e),
+            format!("{shown}: {e}"),
         ))
     })
+}
+
+/// Build the `argv` vector handed to `execve`: the resolved program followed by
+/// each argument.
+///
+/// Rejects an embedded NUL, which cannot be represented in argv at all.
+fn build_execve_argv(program_c: &CString, cmd_args: &[std::ffi::OsString]) -> Result<Vec<CString>> {
+    let mut argv_c: Vec<CString> = Vec::with_capacity(1 + cmd_args.len());
+    argv_c.push(program_c.clone());
+    for arg in cmd_args {
+        argv_c.push(CString::new(arg.as_bytes()).map_err(|_| {
+            NonoError::SandboxInit(format!("Argument contains null byte: {arg:?}"))
+        })?);
+    }
+    Ok(argv_c)
 }
 
 /// Maximum threads allowed when keyring backend is active.
 /// Main thread (1) + up to 3 keyring threads for D-Bus/Security.framework.
 const MAX_KEYRING_THREADS: usize = 4;
 /// Maximum threads allowed when crypto library thread pool is active.
-/// Main thread (1) + tokio proxy workers (2) + aws-lc-rs ECDSA pool (4).
-/// When --network-profile is used with trust scanning, both the proxy runtime
-/// and crypto verification threads may be active simultaneously.
-const MAX_CRYPTO_THREADS: usize = 7;
+/// Main thread (1) + tokio proxy workers (2) + aws-lc-rs ECDSA pool (4), plus
+/// headroom for the OS-managed libdispatch workqueue threads that
+/// Security.framework spawns for `SecTrustSettings*` XPC during proxy CA setup
+/// on macOS (2-5 observed, scales with load). Those workqueue threads are
+/// unnamed, parked, and fork-safe, but a tighter budget intermittently tripped
+/// on them (issue: fork thread-count flake).
+const MAX_CRYPTO_THREADS: usize = 12;
 /// Hard cap on retained denial records to prevent memory exhaustion.
 const MAX_DENIAL_RECORDS: usize = 1000;
 /// Hard cap on request IDs tracked for replay detection.
 const MAX_TRACKED_REQUEST_IDS: usize = 4096;
 use crate::timeouts;
 
-struct ProfileSaveOffer<'a> {
-    policy_explanations: &'a [crate::diagnostic::PolicyExplanation],
-    error_observation: &'a crate::diagnostic::ErrorObservation,
-    caps: &'a CapabilitySet,
-    command: &'a [String],
-    compared_profile: Option<&'a str>,
-    sandbox_violations: &'a [nono::SandboxViolation],
-    ignored_denial_paths: &'a [std::path::PathBuf],
+pub(crate) struct ProfileSaveOffer<'a> {
+    pub(crate) policy_explanations: &'a [crate::diagnostic::PolicyExplanation],
+    pub(crate) error_observation: &'a crate::diagnostic::ErrorObservation,
+    pub(crate) caps: &'a CapabilitySet,
+    pub(crate) command: &'a [std::ffi::OsString],
+    pub(crate) compared_profile: Option<&'a str>,
+    pub(crate) sandbox_violations: &'a [nono::SandboxViolation],
+    pub(crate) ignored_denial_paths: &'a [std::path::PathBuf],
+    pub(crate) url_denials: &'a [UrlDenialRecord],
 }
 
 fn offer_profile_save_for_child(
     pty: Option<&mut crate::pty_proxy::PtyProxy>,
-    offer: ProfileSaveOffer<'_>,
+    offer: &ProfileSaveOffer<'_>,
 ) -> Result<()> {
     if let Some(proxy) = pty {
         let _released_terminal = proxy.release_terminal_for_prompt();
-        return crate::profile_save_runtime::offer_save_run_profile(
-            offer.policy_explanations,
-            offer.error_observation,
-            offer.caps,
-            offer.command,
-            offer.compared_profile,
-            offer.sandbox_violations,
-            offer.ignored_denial_paths,
-        );
+        return crate::profile_save_runtime::offer_save_run_profile(offer);
     }
 
-    crate::profile_save_runtime::offer_save_run_profile(
-        offer.policy_explanations,
-        offer.error_observation,
-        offer.caps,
-        offer.command,
-        offer.compared_profile,
-        offer.sandbox_violations,
-        offer.ignored_denial_paths,
-    )
+    crate::profile_save_runtime::offer_save_run_profile(offer)
 }
 
 /// Linux procfs context for resolving child-relative procfs paths in the supervisor.
@@ -238,7 +247,7 @@ impl SeccompPolicy {
 /// Configuration for command execution.
 pub struct ExecConfig<'a> {
     /// The command to execute (program + args).
-    pub command: &'a [String],
+    pub command: &'a [std::ffi::OsString],
     /// Pre-resolved absolute path to the program.
     /// This is resolved BEFORE the sandbox is applied to ensure the program
     /// can be found even if its directory is not in the sandbox's allowed paths.
@@ -348,6 +357,9 @@ pub struct SupervisorConfig<'a> {
     /// Bind ports allowed for seccomp proxy-only fallback.
     #[cfg(target_os = "linux")]
     pub proxy_bind_ports: Vec<u16>,
+    /// Inclusive bind port ranges allowed for seccomp proxy-only fallback.
+    #[cfg(target_os = "linux")]
+    pub proxy_bind_port_ranges: Vec<(u16, u16)>,
     /// Pathname AF_UNIX socket grants allowed for seccomp proxy-only fallback.
     #[cfg(target_os = "linux")]
     pub unix_socket_allowlist: &'a [nono::UnixSocketCapability],
@@ -517,25 +529,17 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
     let program = &config.command[0];
     let cmd_args = &config.command[1..];
 
-    info!("Executing (supervised): {} {:?}", program, cmd_args);
+    info!("Executing (supervised): {:?} {:?}", program, cmd_args);
 
     // Use pre-resolved program path (resolved before fork)
     let program_path = config.resolved_program;
 
-    // Convert program path to CString for execve
-    let program_c = CString::new(program_path.to_string_lossy().as_bytes())
+    let program_c = CString::new(program_path.as_os_str().as_bytes())
         .map_err(|_| NonoError::SandboxInit("Program path contains null byte".to_string()))?;
     let current_dir_c = CString::new(config.current_dir.as_os_str().as_bytes())
         .map_err(|_| NonoError::SandboxInit("Working directory contains null byte".to_string()))?;
 
-    // Build argv: [program, args..., NULL]
-    let mut argv_c: Vec<CString> = Vec::with_capacity(1 + cmd_args.len());
-    argv_c.push(program_c.clone());
-    for arg in cmd_args {
-        argv_c.push(CString::new(arg.as_bytes()).map_err(|_| {
-            NonoError::SandboxInit(format!("Argument contains null byte: {}", arg))
-        })?);
-    }
+    let argv_c = build_execve_argv(&program_c, cmd_args)?;
 
     // Create supervisor socket pair only when the exec'd child actually needs
     // to talk back to the unsandboxed parent. The supervised parent/session
@@ -799,12 +803,20 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
     // the parent hardens itself immediately after fork and the child hardens
     // itself after sandbox/filter setup whenever procfs inspection is not
     // required.
+
+    // Become a child-subreaper whenever the supervisor may need to read a
+    // descendant's /proc/<pid>/mem: tool-sandbox command mediation
+    // (`tool_sandbox_runtime`) or seccomp-notify mediation of network/AF_UNIX/
+    // openat (`child_requires_dumpable`). That read is ancestry-gated by
+    // ptrace_may_access under Yama ptrace_scope=1, so a descendant that
+    // daemonizes and reparents to pid 1 leaves our ancestry and gets its
+    // connect()/bind()/openat() denied with EPERM. Subreaping keeps it ours.
     #[cfg(target_os = "linux")]
-    if config.tool_sandbox_runtime.is_some() {
+    if config.tool_sandbox_runtime.is_some() || config.seccomp_policy.child_requires_dumpable() {
         let ret = unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) };
         if ret != 0 {
             return Err(NonoError::SandboxInit(format!(
-                "Failed to set PR_SET_CHILD_SUBREAPER for tool-sandbox supervisor: {}",
+                "Failed to set PR_SET_CHILD_SUBREAPER for supervisor: {}",
                 std::io::Error::last_os_error()
             )));
         }
@@ -1521,11 +1533,11 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
             };
 
             let mut killed_by_timeout = false;
-            let (status, denials, ipc_denials) =
+            let (status, denials, ipc_denials, url_denials) =
                 if let (Some(sup_cfg), Some(mut sup_sock)) = (supervisor, supervisor_sock) {
                     #[cfg(target_os = "linux")]
                     {
-                        let (status, denials, ipc_denials) = run_supervisor_loop(
+                        let (status, denials, ipc_denials, url_denials) = run_supervisor_loop(
                             child,
                             &mut sup_sock,
                             sup_cfg,
@@ -1538,11 +1550,11 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
                             url_listener.as_ref().map(|(l, _)| l),
                             &mut killed_by_timeout,
                         )?;
-                        (status, denials, ipc_denials)
+                        (status, denials, ipc_denials, url_denials)
                     }
                     #[cfg(not(target_os = "linux"))]
                     {
-                        let (status, denials) = run_supervisor_loop(
+                        let (status, denials, url_denials) = run_supervisor_loop(
                             child,
                             &mut sup_sock,
                             sup_cfg,
@@ -1552,7 +1564,7 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
                             url_listener.as_ref().map(|(l, _)| l),
                             &mut killed_by_timeout,
                         )?;
-                        (status, denials, Vec::new())
+                        (status, denials, Vec::new(), url_denials)
                     }
                 } else {
                     let status = wait_for_child_with_pty(
@@ -1561,7 +1573,7 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
                         config.startup_timeout,
                         &mut killed_by_timeout,
                     )?;
-                    (status, Vec::new(), Vec::new())
+                    (status, Vec::new(), Vec::new(), Vec::new())
                 };
 
             // Close the attach listener immediately so no new attach
@@ -1719,11 +1731,16 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
                     )
                     .with_canonical_denial_paths(canonical_denial_paths);
                 if let Some(program) = config.command.first() {
+                    let argv_display: Vec<String> = config
+                        .command
+                        .iter()
+                        .map(|arg| arg.to_string_lossy().into_owned())
+                        .collect();
                     base_formatter =
                         base_formatter.with_command(crate::diagnostic::CommandContext {
-                            program: program.clone(),
+                            program: program.to_string_lossy().into_owned(),
                             resolved_path: config.resolved_program.to_path_buf(),
-                            args: nono::scrub_argv_with_policy(config.command, redaction_policy),
+                            args: nono::scrub_argv_with_policy(&argv_display, redaction_policy),
                         });
                 }
 
@@ -1750,24 +1767,24 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
                     &prompt_policy_explanations,
                     &prompt_error_observation,
                     &visible_sandbox_violations,
+                    &url_denials,
                 )
             {
                 // Clear the forwarding target before prompting. The child is
                 // already dead; keeping CHILD_PID set would cause forward_signal
                 // to send Ctrl-C to the dead PID, swallowing it silently.
                 clear_signal_forwarding_target();
-                offer_profile_save_for_child(
-                    pty_proxy.as_mut(),
-                    ProfileSaveOffer {
-                        policy_explanations: &prompt_policy_explanations,
-                        error_observation: &prompt_error_observation,
-                        caps: config.caps,
-                        command: config.command,
-                        compared_profile: config.profile_save_base,
-                        sandbox_violations: &visible_sandbox_violations,
-                        ignored_denial_paths: config.ignored_denial_paths,
-                    },
-                )?;
+                let offer = ProfileSaveOffer {
+                    policy_explanations: &prompt_policy_explanations,
+                    error_observation: &prompt_error_observation,
+                    caps: config.caps,
+                    command: config.command,
+                    compared_profile: config.profile_save_base,
+                    sandbox_violations: &visible_sandbox_violations,
+                    ignored_denial_paths: config.ignored_denial_paths,
+                    url_denials: &url_denials,
+                };
+                offer_profile_save_for_child(pty_proxy.as_mut(), &offer)?;
             }
 
             Ok(exit_code)
@@ -1960,12 +1977,24 @@ fn should_offer_profile_save(
     policy_explanations: &[crate::diagnostic::PolicyExplanation],
     error_observation: &crate::diagnostic::ErrorObservation,
     sandbox_violations: &[nono::SandboxViolation],
+    url_denials: &[UrlDenialRecord],
 ) -> bool {
     !no_diagnostics
         && (exit_code != 0
             || !policy_explanations.is_empty()
             || !error_observation.path_hints.is_empty()
-            || crate::profile_save_runtime::has_saveable_system_service_rules(sandbox_violations))
+            || crate::profile_save_runtime::has_saveable_system_service_rules(sandbox_violations)
+            || has_fixable_url_denials(url_denials))
+}
+
+/// Returns true if any URL denial is fixable (OriginNotAllowed or LocalhostNotAllowed).
+fn has_fixable_url_denials(url_denials: &[UrlDenialRecord]) -> bool {
+    url_denials.iter().any(|r| {
+        matches!(
+            r.reason,
+            UrlDenialReason::OriginNotAllowed | UrlDenialReason::LocalhostNotAllowed
+        )
+    })
 }
 
 /// Close inherited file descriptors, keeping stdin/stdout/stderr and specified FDs.
@@ -2543,7 +2572,7 @@ fn run_supervisor_loop(
     mut pty: Option<&mut crate::pty_proxy::PtyProxy>,
     url_listener: Option<&SupervisorListener>,
     killed_by_timeout: &mut bool,
-) -> Result<(WaitStatus, Vec<DenialRecord>)> {
+) -> Result<(WaitStatus, Vec<DenialRecord>, Vec<UrlDenialRecord>)> {
     // Start the macOS tool-sandbox background listener thread (no-op if tool-sandbox not active).
     #[cfg(target_os = "macos")]
     if let Some(tool_sandbox_runtime) = config.tool_sandbox_runtime
@@ -2555,11 +2584,13 @@ fn run_supervisor_loop(
     {
         debug!("tool-sandbox handle_listener error: {e}");
     }
-
     let mut sock_fd = sock.as_raw_fd();
     let listener_fd = url_listener.map_or(-1, |l| l.as_raw_fd());
-    let mut denials = Vec::new();
-    let mut seen_request_ids = HashSet::new();
+    let mut denials = SupervisorDenials {
+        fs: Vec::new(),
+        url: Vec::new(),
+        seen_request_ids: HashSet::new(),
+    };
     let startup_deadline = startup_timeout.map(|cfg| (Instant::now() + cfg.timeout, cfg));
 
     loop {
@@ -2619,8 +2650,8 @@ fn run_supervisor_loop(
                             child,
                             config,
                             &mut denials,
-                            &mut seen_request_ids,
                             trust_interceptor.as_mut(),
+                            pty.as_deref_mut(),
                         ) {
                             warn!("Error handling supervisor message: {}", e);
                         }
@@ -2637,7 +2668,7 @@ fn run_supervisor_loop(
                 && pfds[5].revents & libc::POLLIN != 0
                 && let Some(listener) = url_listener
             {
-                handle_url_listener_connection(listener, config, &mut denials);
+                handle_url_listener_connection(listener, config, &mut denials.url);
             }
 
             if let Some(ref mut p) = pty
@@ -2687,7 +2718,7 @@ fn run_supervisor_loop(
                     );
                     *killed_by_timeout = true;
                     let _ = signal::kill(child, Signal::SIGKILL);
-                    return Ok((wait_for_child(child)?, denials));
+                    return Ok((wait_for_child(child)?, denials.fs, denials.url));
                 }
                 continue;
             }
@@ -2699,11 +2730,11 @@ fn run_supervisor_loop(
                 debug!("Child continued, keeping supervisor alive");
                 continue;
             }
-            Ok(status) => return Ok((status, denials)),
+            Ok(status) => return Ok((status, denials.fs, denials.url)),
             Err(nix::errno::Errno::EINTR) => continue,
             Err(nix::errno::Errno::ECHILD) => {
                 warn!("Child already reaped in supervisor loop");
-                return Ok((WaitStatus::Exited(child, 1), denials));
+                return Ok((WaitStatus::Exited(child, 1), denials.fs, denials.url));
             }
             Err(e) => {
                 return Err(NonoError::SandboxInit(format!(
@@ -2715,7 +2746,45 @@ fn run_supervisor_loop(
     }
 
     let status = wait_for_child(child)?;
-    Ok((status, denials))
+    Ok((status, denials.fs, denials.url))
+}
+
+/// Result of the Linux supervisor loop: child wait status plus the filesystem,
+/// IPC, and URL denial records collected during the run.
+#[cfg(target_os = "linux")]
+type SupervisorLoopResult = (
+    WaitStatus,
+    Vec<DenialRecord>,
+    Vec<nono::diagnostic::IpcDenialRecord>,
+    Vec<UrlDenialRecord>,
+);
+
+/// Reap descendants that reparented onto this supervisor (a child-subreaper),
+/// so short-lived detached processes don't linger as zombies for the session.
+///
+/// `waitpid(-1, WNOHANG)` returns only terminated children, so a live child is
+/// never consumed. If the primary `child` is reaped here, its status is
+/// returned rather than dropped.
+#[cfg(target_os = "linux")]
+fn reap_reparented_orphans(child: Pid) -> Option<WaitStatus> {
+    loop {
+        match waitpid(Some(Pid::from_raw(-1)), Some(WaitPidFlag::WNOHANG)) {
+            Ok(status @ (WaitStatus::Exited(pid, _) | WaitStatus::Signaled(pid, _, _))) => {
+                if pid == child {
+                    return Some(status);
+                }
+                debug!("Reaped reparented orphan {}", pid);
+            }
+            // Nothing reapable now; no WUNTRACED/WCONTINUED, so ignore stop/continue.
+            Ok(_) => return None,
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(nix::errno::Errno::ECHILD) => return None,
+            Err(e) => {
+                debug!("waitpid(-1) during orphan reap failed: {}", e);
+                return None;
+            }
+        }
+    }
 }
 
 /// Supervisor IPC event loop for capability expansion (Linux).
@@ -2750,11 +2819,7 @@ fn run_supervisor_loop(
     mut pty: Option<&mut crate::pty_proxy::PtyProxy>,
     url_listener: Option<&SupervisorListener>,
     killed_by_timeout: &mut bool,
-) -> Result<(
-    WaitStatus,
-    Vec<DenialRecord>,
-    Vec<nono::diagnostic::IpcDenialRecord>,
-)> {
+) -> Result<SupervisorLoopResult> {
     struct LoopTimer {
         start: Instant,
         iterations: u64,
@@ -2791,9 +2856,12 @@ fn run_supervisor_loop(
     let tool_sandbox_url_listener_fd =
         tool_sandbox_runtime.and_then(|runtime| runtime.url_listener_fd());
     let mut rate_limiter = supervisor_linux::RateLimiter::new(10, 5);
-    let mut denials = Vec::new();
+    let mut denials = SupervisorDenials {
+        fs: Vec::new(),
+        url: Vec::new(),
+        seen_request_ids: HashSet::new(),
+    };
     let mut ipc_denials = Vec::new();
-    let mut seen_request_ids = HashSet::new();
     let mut sock_fd_active = true;
     let startup_deadline = startup_timeout.map(|cfg| (Instant::now() + cfg.timeout, cfg));
 
@@ -2903,8 +2971,8 @@ fn run_supervisor_loop(
                                 child,
                                 config,
                                 &mut denials,
-                                &mut seen_request_ids,
                                 trust_interceptor.as_mut(),
+                                pty.as_deref_mut(),
                             ) {
                                 warn!("Error handling supervisor message: {}", e);
                             }
@@ -2933,9 +3001,12 @@ fn run_supervisor_loop(
                         child,
                         config,
                         initial_caps,
-                        &mut rate_limiter,
-                        &mut denials,
-                        trust_interceptor.as_mut(),
+                        supervisor_linux::SeccompNotificationState {
+                            rate_limiter: &mut rate_limiter,
+                            denials: &mut denials.fs,
+                            trust_interceptor: trust_interceptor.as_mut(),
+                            pty: pty.as_deref_mut(),
+                        },
                     )
                 {
                     debug!("Error handling seccomp notification: {}", e);
@@ -2948,7 +3019,7 @@ fn run_supervisor_loop(
                         pfd,
                         config,
                         &mut rate_limiter,
-                        &mut denials,
+                        &mut denials.fs,
                         &mut ipc_denials,
                     )
                 {
@@ -2960,7 +3031,7 @@ fn run_supervisor_loop(
                     && pfds[listener_idx].revents & libc::POLLIN != 0
                     && let Some(listener) = url_listener
                 {
-                    handle_url_listener_connection(listener, config, &mut denials);
+                    handle_url_listener_connection(listener, config, &mut denials.url);
                 }
 
                 if let (Some(tool_sandbox_idx), Some(runtime)) =
@@ -3024,6 +3095,12 @@ fn run_supervisor_loop(
         );
         handle_pty_suspension(pty.as_deref_mut(), child);
 
+        // Drain reparented orphans; if the primary child was among them,
+        // surface its status directly.
+        if let Some(status) = reap_reparented_orphans(child) {
+            return Ok((status, denials.fs, ipc_denials, denials.url));
+        }
+
         match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
             Ok(WaitStatus::StillAlive) => {
                 if let Some((deadline, timeout_cfg)) = startup_deadline
@@ -3037,7 +3114,7 @@ fn run_supervisor_loop(
                     );
                     *killed_by_timeout = true;
                     let _ = signal::kill(child, Signal::SIGKILL);
-                    return Ok((wait_for_child(child)?, denials, ipc_denials));
+                    return Ok((wait_for_child(child)?, denials.fs, ipc_denials, denials.url));
                 }
                 continue;
             }
@@ -3050,12 +3127,31 @@ fn run_supervisor_loop(
                 continue;
             }
             Ok(status) => {
-                return Ok((status, denials, ipc_denials));
+                drain_pending_network_notifications(
+                    proxy_notify_raw_fd,
+                    config,
+                    &mut rate_limiter,
+                    &mut denials.fs,
+                    &mut ipc_denials,
+                );
+                return Ok((status, denials.fs, ipc_denials, denials.url));
             }
             Err(nix::errno::Errno::EINTR) => continue,
             Err(nix::errno::Errno::ECHILD) => {
                 warn!("Child already reaped in supervisor loop");
-                return Ok((WaitStatus::Exited(child, 1), denials, ipc_denials));
+                drain_pending_network_notifications(
+                    proxy_notify_raw_fd,
+                    config,
+                    &mut rate_limiter,
+                    &mut denials.fs,
+                    &mut ipc_denials,
+                );
+                return Ok((
+                    WaitStatus::Exited(child, 1),
+                    denials.fs,
+                    ipc_denials,
+                    denials.url,
+                ));
             }
             Err(e) => {
                 return Err(NonoError::SandboxInit(format!(
@@ -3067,7 +3163,75 @@ fn run_supervisor_loop(
     }
 
     let status = wait_for_child(child)?;
-    Ok((status, denials, ipc_denials))
+    Ok((status, denials.fs, ipc_denials, denials.url))
+}
+
+#[cfg(target_os = "linux")]
+fn drain_pending_network_notifications(
+    proxy_notify_raw_fd: Option<std::os::fd::RawFd>,
+    config: &SupervisorConfig<'_>,
+    rate_limiter: &mut supervisor_linux::RateLimiter,
+    denials: &mut Vec<DenialRecord>,
+    ipc_denials: &mut Vec<nono::diagnostic::IpcDenialRecord>,
+) {
+    let Some(fd) = proxy_notify_raw_fd else {
+        return;
+    };
+
+    loop {
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ret = unsafe { libc::poll(&mut pfd, 1, 0) };
+        if ret <= 0 || pfd.revents & libc::POLLIN == 0 {
+            return;
+        }
+        if let Err(err) = supervisor_linux::handle_network_notification(
+            fd,
+            config,
+            rate_limiter,
+            denials,
+            ipc_denials,
+        ) {
+            debug!("Error draining pending proxy seccomp notification: {}", err);
+            return;
+        }
+    }
+}
+
+/// Mutable denial accumulators threaded through the supervisor loop.
+///
+/// Groups the three vecs/maps the supervisor populates while handling IPC
+/// messages, so `handle_supervisor_message` takes a single `&mut` instead
+/// of three (keeping it under clippy's `too_many_arguments` threshold).
+struct SupervisorDenials {
+    fs: Vec<DenialRecord>,
+    url: Vec<UrlDenialRecord>,
+    seen_request_ids: HashSet<String>,
+}
+
+/// Run an approval request with the PTY relay paused.
+///
+/// While a terminal client is attached to the PTY relay, the real terminal is
+/// in raw mode and relaying keystrokes to the child, so an interactive prompt
+/// would render garbled and never see the user's answer. Pause the relay
+/// (restoring cooked mode) for the duration of the request and re-enter relay
+/// mode afterwards. A no-op when no terminal-backed client is attached.
+fn request_approval_with_relay_paused(
+    config: &SupervisorConfig<'_>,
+    request: &nono::supervisor::ApprovalRequest,
+    mut pty: Option<&mut crate::pty_proxy::PtyProxy>,
+) -> Result<ApprovalDecision> {
+    let paused_for_prompt = pty
+        .as_mut()
+        .is_some_and(|proxy| proxy.pause_terminal_for_prompt());
+    let result = config.approval_backend.request_approval(request);
+    if paused_for_prompt && let Some(proxy) = pty.as_mut() {
+        proxy.resume_terminal_after_prompt();
+    }
+    result
 }
 
 /// Handle a single supervisor IPC message.
@@ -3078,22 +3242,23 @@ fn run_supervisor_loop(
 /// 3. If granted, open the path and send the fd via `SCM_RIGHTS`
 /// 4. Send the decision response
 /// 5. Record denials for diagnostic footer
+#[allow(clippy::too_many_arguments)]
 fn handle_supervisor_message(
     sock: &mut SupervisorSocket,
     msg: SupervisorMessage,
     child: Pid,
     config: &SupervisorConfig<'_>,
-    denials: &mut Vec<DenialRecord>,
-    seen_request_ids: &mut HashSet<String>,
+    denials: &mut SupervisorDenials,
     mut trust_interceptor: Option<&mut crate::trust_intercept::TrustInterceptor>,
+    mut pty: Option<&mut crate::pty_proxy::PtyProxy>,
 ) -> Result<()> {
     match msg {
         SupervisorMessage::Request(request) => {
             let decision_started = Instant::now();
             // Replay detection and bounded request-id cache.
-            let replay_denial_reason = if seen_request_ids.contains(&request.request_id) {
+            let replay_denial_reason = if denials.seen_request_ids.contains(&request.request_id) {
                 Some("Duplicate request_id rejected (replay detected)")
-            } else if seen_request_ids.len() >= MAX_TRACKED_REQUEST_IDS {
+            } else if denials.seen_request_ids.len() >= MAX_TRACKED_REQUEST_IDS {
                 Some("Request replay cache is full; refusing request")
             } else {
                 None
@@ -3101,7 +3266,7 @@ fn handle_supervisor_message(
 
             if let Some(reason) = replay_denial_reason {
                 record_denial(
-                    denials,
+                    &mut denials.fs,
                     DenialRecord {
                         path: request.path.clone(),
                         access: request.access,
@@ -3123,7 +3288,7 @@ fn handle_supervisor_message(
                 )?;
                 return Ok(());
             }
-            seen_request_ids.insert(request.request_id.clone());
+            denials.seen_request_ids.insert(request.request_id.clone());
 
             // Digest from trust verification, used for TOCTOU re-check at open time.
             // Set by the trust interceptor branch when an instruction file is verified.
@@ -3141,7 +3306,7 @@ fn handle_supervisor_message(
                     protected_root.display()
                 );
                 record_denial(
-                    denials,
+                    &mut denials.fs,
                     DenialRecord {
                         path: request.path.clone(),
                         access: request.access,
@@ -3170,13 +3335,15 @@ fn handle_supervisor_message(
                         // Stash the verified digest for TOCTOU re-check at open time
                         verified_digest = Some(verified.digest);
                         // Instruction file verified — proceed to approval backend
-                        match config.approval_backend.request_approval(
+                        match request_approval_with_relay_paused(
+                            config,
                             &nono::supervisor::ApprovalRequest::from(request.clone()),
+                            pty.as_deref_mut(),
                         ) {
                             Ok(d) => {
                                 if d.is_denied() {
                                     record_denial(
-                                        denials,
+                                        &mut denials.fs,
                                         DenialRecord {
                                             path: request.path.clone(),
                                             access: request.access,
@@ -3189,7 +3356,7 @@ fn handle_supervisor_message(
                             Err(e) => {
                                 warn!("Approval backend error: {}", e);
                                 record_denial(
-                                    denials,
+                                    &mut denials.fs,
                                     DenialRecord {
                                         path: request.path.clone(),
                                         access: request.access,
@@ -3210,7 +3377,7 @@ fn handle_supervisor_message(
                             reason
                         );
                         record_denial(
-                            denials,
+                            &mut denials.fs,
                             DenialRecord {
                                 path: request.path.clone(),
                                 access: request.access,
@@ -3224,14 +3391,15 @@ fn handle_supervisor_message(
                 }
             } else {
                 // 3. Delegate to approval backend (non-instruction files)
-                match config
-                    .approval_backend
-                    .request_approval(&nono::supervisor::ApprovalRequest::from(request.clone()))
-                {
+                match request_approval_with_relay_paused(
+                    config,
+                    &nono::supervisor::ApprovalRequest::from(request.clone()),
+                    pty,
+                ) {
                     Ok(d) => {
                         if d.is_denied() {
                             record_denial(
-                                denials,
+                                &mut denials.fs,
                                 DenialRecord {
                                     path: request.path.clone(),
                                     access: request.access,
@@ -3244,7 +3412,7 @@ fn handle_supervisor_message(
                     Err(e) => {
                         warn!("Approval backend error: {}", e);
                         record_denial(
-                            denials,
+                            &mut denials.fs,
                             DenialRecord {
                                 path: request.path.clone(),
                                 access: request.access,
@@ -3322,19 +3490,25 @@ fn handle_supervisor_message(
         SupervisorMessage::OpenUrl(url_request) => {
             let request_id = url_request.request_id.clone();
 
-            let (success, error) = match validate_and_open_url(&url_request.url, config) {
-                Ok(()) => {
-                    info!("Supervisor: opened URL {} for child", url_request.url);
-                    (true, None)
-                }
-                Err(reason) => {
-                    warn!(
-                        "Supervisor: URL open denied for {}: {}",
-                        url_request.url, reason
-                    );
-                    (false, Some(reason))
-                }
-            };
+            let (success, error, push_denial) =
+                match validate_and_open_url(&url_request.url, config) {
+                    Ok(()) => {
+                        info!("Supervisor: opened URL {} for child", url_request.url);
+                        (true, None, None)
+                    }
+                    Err(denial) => {
+                        let msg = denial.to_warn_message();
+                        warn!(
+                            "Supervisor: URL open denied for {}: {}",
+                            url_request.url, msg
+                        );
+                        let record = denial.to_record();
+                        (false, Some(msg), record)
+                    }
+                };
+            if let Some(record) = push_denial {
+                record_url_denial(&mut denials.url, record);
+            }
             let response = SupervisorResponse::UrlOpened {
                 request_id,
                 success,
@@ -3360,7 +3534,7 @@ fn handle_supervisor_message(
 fn handle_url_listener_connection(
     listener: &SupervisorListener,
     config: &SupervisorConfig<'_>,
-    _denials: &mut Vec<DenialRecord>,
+    url_denials: &mut Vec<UrlDenialRecord>,
 ) {
     let mut sock = match listener.accept() {
         Ok(Some(s)) => s,
@@ -3382,22 +3556,28 @@ fn handle_url_listener_connection(
     match msg {
         SupervisorMessage::OpenUrl(url_request) => {
             let request_id = url_request.request_id.clone();
-            let (success, error) = match validate_and_open_url(&url_request.url, config) {
-                Ok(()) => {
-                    info!(
-                        "Supervisor (listener): opened URL {} for child",
-                        url_request.url
-                    );
-                    (true, None)
-                }
-                Err(reason) => {
-                    warn!(
-                        "Supervisor (listener): URL open denied for {}: {}",
-                        url_request.url, reason
-                    );
-                    (false, Some(reason))
-                }
-            };
+            let (success, error, push_denial) =
+                match validate_and_open_url(&url_request.url, config) {
+                    Ok(()) => {
+                        info!(
+                            "Supervisor (listener): opened URL {} for child",
+                            url_request.url
+                        );
+                        (true, None, None)
+                    }
+                    Err(denial) => {
+                        let msg = denial.to_warn_message();
+                        warn!(
+                            "Supervisor (listener): URL open denied for {}: {}",
+                            url_request.url, msg
+                        );
+                        let record = denial.to_record();
+                        (false, Some(msg), record)
+                    }
+                };
+            if let Some(record) = push_denial {
+                record_url_denial(url_denials, record);
+            }
             let response = SupervisorResponse::UrlOpened {
                 request_id,
                 success,
@@ -3453,8 +3633,85 @@ fn record_capability_audit(
 }
 
 /// Maximum URL length to prevent abuse via oversized URLs.
-#[cfg(test)]
 const MAX_URL_LENGTH: usize = crate::url_open::MAX_URL_LENGTH;
+
+/// Typed result of URL validation.
+///
+/// Separates fixable denials (OriginNotAllowed, LocalhostNotAllowed) from
+/// non-fixable ones (bad schemes, oversize, parse errors, browser-launch
+/// failures) so the save prompt can decide what to offer.
+#[derive(Debug)]
+enum UrlDenial {
+    OriginNotAllowed {
+        origin: String,
+    },
+    LocalhostNotAllowed,
+    NonHttpsScheme {
+        scheme: String,
+    },
+    LocalhostBadScheme {
+        scheme: String,
+    },
+    Oversized {
+        len: usize,
+    },
+    ParseError {
+        message: String,
+    },
+    /// The URL validated but the browser opener failed to launch.
+    /// Not fixable by a profile grant, so never offered in the save prompt.
+    BrowserLaunchFailed {
+        message: String,
+    },
+}
+
+impl UrlDenial {
+    fn to_warn_message(&self) -> String {
+        match self {
+            Self::OriginNotAllowed { origin } => {
+                format!("Origin {origin} is not in the profile's open_urls.allow_origins list")
+            }
+            Self::LocalhostNotAllowed => {
+                "Localhost URLs are not allowed by this profile".to_string()
+            }
+            Self::NonHttpsScheme { scheme } => {
+                format!(
+                    "Only https:// URLs are allowed (got {scheme}://). \
+                     file://, javascript:, data:, and other schemes are blocked."
+                )
+            }
+            Self::LocalhostBadScheme { scheme } => {
+                format!("Localhost URL must use http or https scheme, got: {scheme}")
+            }
+            Self::Oversized { len } => {
+                format!("URL exceeds maximum length ({len} > {MAX_URL_LENGTH})")
+            }
+            Self::ParseError { message } => {
+                format!("Invalid URL: {message}")
+            }
+            Self::BrowserLaunchFailed { message } => {
+                format!("Failed to open URL in browser: {message}")
+            }
+        }
+    }
+
+    /// Map to a persisted record. Returns `None` for non-fixable denials,
+    /// which are recorded only for the audit log and never offered in the
+    /// save prompt.
+    fn to_record(&self) -> Option<UrlDenialRecord> {
+        match self {
+            Self::OriginNotAllowed { origin } => Some(UrlDenialRecord {
+                origin: origin.clone(),
+                reason: UrlDenialReason::OriginNotAllowed,
+            }),
+            Self::LocalhostNotAllowed => Some(UrlDenialRecord {
+                origin: String::new(),
+                reason: UrlDenialReason::LocalhostNotAllowed,
+            }),
+            _ => None,
+        }
+    }
+}
 
 /// Validate a URL against the profile's allowed origins, then open it in the user's browser.
 ///
@@ -3463,23 +3720,63 @@ const MAX_URL_LENGTH: usize = crate::url_open::MAX_URL_LENGTH;
 fn validate_and_open_url(
     url: &str,
     config: &SupervisorConfig<'_>,
-) -> std::result::Result<(), String> {
+) -> std::result::Result<(), UrlDenial> {
     validate_url(url, config)?;
     crate::url_open::open_url_in_browser(url)
+        .map_err(|msg| UrlDenial::BrowserLaunchFailed { message: msg })
 }
 
 /// Validate a URL against the profile's allowed origins and scheme rules.
 ///
-/// Thin wrapper over [`crate::url_open::validate_url`] that sources the
-/// allow-list from the supervisor config. The shared implementation is the
-/// single source of truth for this security-critical check so the supervisor
-/// and the tool-sandbox runtime cannot diverge.
-fn validate_url(url: &str, config: &SupervisorConfig<'_>) -> std::result::Result<(), String> {
-    crate::url_open::validate_url(
-        url,
-        config.open_url_origins,
-        config.open_url_allow_localhost,
-    )
+/// Returns `Ok(())` if the URL passes all checks. Does not open the browser.
+///
+/// This implementation must stay in sync with [`crate::url_open::validate_url`],
+/// which is the shared implementation used by the tool-sandbox runtime.
+/// TODO: Refactor `crate::url_open::validate_url` to return `UrlDenial` directly
+/// so this function can delegate without duplicating the logic.
+fn validate_url(url: &str, config: &SupervisorConfig<'_>) -> std::result::Result<(), UrlDenial> {
+    // Length check
+    if url.len() > MAX_URL_LENGTH {
+        return Err(UrlDenial::Oversized { len: url.len() });
+    }
+
+    // Parse URL to extract origin
+    let parsed = url::Url::parse(url).map_err(|e| UrlDenial::ParseError {
+        message: e.to_string(),
+    })?;
+
+    let scheme = parsed.scheme();
+    let host = parsed.host_str().unwrap_or("");
+
+    // Check localhost first
+    let is_localhost = host == "localhost" || host == "127.0.0.1" || host == "::1";
+    if is_localhost {
+        if scheme != "http" && scheme != "https" {
+            return Err(UrlDenial::LocalhostBadScheme {
+                scheme: scheme.to_string(),
+            });
+        }
+        if !config.open_url_allow_localhost {
+            return Err(UrlDenial::LocalhostNotAllowed);
+        }
+    } else {
+        // Non-localhost: must be https
+        if scheme != "https" {
+            return Err(UrlDenial::NonHttpsScheme {
+                scheme: scheme.to_string(),
+            });
+        }
+
+        // Check against allowed origins
+        let url_origin = parsed.origin().unicode_serialization();
+        let origin_allowed = config.open_url_origins.contains(&url_origin);
+
+        if !origin_allowed {
+            return Err(UrlDenial::OriginNotAllowed { origin: url_origin });
+        }
+    }
+
+    Ok(())
 }
 
 /// Clear `FD_CLOEXEC` on a file descriptor so it survives `execve()`.
@@ -3548,6 +3845,16 @@ fn clear_close_on_exec(fd: i32) -> Result<()> {
 pub(super) fn record_denial(denials: &mut Vec<DenialRecord>, record: DenialRecord) {
     if denials.len() < MAX_DENIAL_RECORDS {
         denials.push(record);
+    }
+}
+
+/// Push a URL denial record to the vec, capping at MAX_DENIAL_RECORDS.
+///
+/// Deduplicates inline so a child polling the same blocked URL in a retry loop
+/// cannot exhaust the buffer and crowd out other unique denials.
+fn record_url_denial(url_denials: &mut Vec<UrlDenialRecord>, record: UrlDenialRecord) {
+    if url_denials.len() < MAX_DENIAL_RECORDS && !url_denials.contains(&record) {
+        url_denials.push(record);
     }
 }
 
@@ -4093,6 +4400,49 @@ mod tests {
             .collect()
     }
 
+    /// Issue #1504: argv elements are byte strings on Unix, so an argument that
+    /// is not valid UTF-8 must reach `execve` unchanged rather than being
+    /// lossily rewritten to U+FFFD.
+    #[test]
+    fn build_execve_argv_preserves_non_utf8_bytes() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let program_c = CString::new("/bin/echo").expect("program cstring");
+        let raw = OsStr::from_bytes(b"pre\xffpost").to_os_string();
+        let args = vec![OsString::from("plain"), raw];
+
+        let argv = build_execve_argv(&program_c, &args).expect("build argv");
+
+        assert_eq!(argv.len(), 3, "program plus both arguments");
+        assert_eq!(argv[0].as_bytes(), b"/bin/echo");
+        assert_eq!(argv[1].as_bytes(), b"plain");
+        assert_eq!(
+            argv[2].as_bytes(),
+            b"pre\xffpost",
+            "non-UTF-8 argument must survive byte-for-byte"
+        );
+        assert!(
+            !argv[2]
+                .as_bytes()
+                .windows(3)
+                .any(|w| w == [0xef, 0xbf, 0xbd]),
+            "argument must not contain the U+FFFD replacement character"
+        );
+    }
+
+    /// An embedded NUL cannot be represented in argv, so it is the one input
+    /// that must be rejected rather than forwarded.
+    #[test]
+    fn build_execve_argv_rejects_embedded_nul() {
+        use std::ffi::OsString;
+
+        let program_c = CString::new("/bin/echo").expect("program cstring");
+        let args = vec![OsString::from("bad\0arg")];
+
+        assert!(build_execve_argv(&program_c, &args).is_err());
+    }
+
     #[test]
     fn push_set_vars_appends_new_keys() {
         let mut env_c = vec![CString::new("HOME=/home/x").expect("cstring")];
@@ -4399,6 +4749,7 @@ mod tests {
             &explanations,
             &observation,
             &[],
+            &[],
         ));
     }
 
@@ -4417,6 +4768,7 @@ mod tests {
             &explanations,
             &observation,
             &violations,
+            &[],
         ));
     }
 
@@ -4438,6 +4790,7 @@ mod tests {
             &explanations,
             &observation,
             &visible,
+            &[],
         ));
     }
 
@@ -4469,6 +4822,66 @@ mod tests {
     }
 
     #[test]
+    fn test_profile_save_prompt_triggers_on_url_denial_with_zero_exit() {
+        use nono::UrlDenialReason;
+
+        let explanations = Vec::new();
+        let observation = crate::diagnostic::ErrorObservation::default();
+        let url_denials = vec![UrlDenialRecord {
+            origin: "https://accounts.google.com".to_string(),
+            reason: UrlDenialReason::OriginNotAllowed,
+        }];
+
+        // Fixable URL denial must trigger save prompt even with exit code 0
+        assert!(should_offer_profile_save(
+            false,
+            0,
+            &explanations,
+            &observation,
+            &[],
+            &url_denials,
+        ));
+
+        // No URL denials (and no other signal) must NOT trigger save prompt.
+        // Non-fixable denials never become records, so the empty slice models
+        // a run where only non-fixable URL opens were rejected.
+        assert!(!should_offer_profile_save(
+            false,
+            0,
+            &explanations,
+            &observation,
+            &[],
+            &[],
+        ));
+    }
+
+    #[test]
+    fn test_record_url_denial_dedupes_repeated_records() {
+        let mut denials = Vec::new();
+        let record = UrlDenialRecord {
+            origin: "https://accounts.google.com".to_string(),
+            reason: UrlDenialReason::OriginNotAllowed,
+        };
+
+        // A child polling the same blocked URL must not fill the buffer with
+        // identical records.
+        for _ in 0..100 {
+            record_url_denial(&mut denials, record.clone());
+        }
+        assert_eq!(denials.len(), 1);
+
+        // Distinct records are still recorded.
+        record_url_denial(
+            &mut denials,
+            UrlDenialRecord {
+                origin: String::new(),
+                reason: UrlDenialReason::LocalhostNotAllowed,
+            },
+        );
+        assert_eq!(denials.len(), 2);
+    }
+
+    #[test]
     fn test_profile_save_prompt_preserves_nonzero_exit_behavior() {
         let explanations = Vec::new();
         let observation = crate::diagnostic::ErrorObservation::default();
@@ -4479,12 +4892,14 @@ mod tests {
             &explanations,
             &observation,
             &[],
+            &[],
         ));
         assert!(!should_offer_profile_save(
             true,
             1,
             &explanations,
             &observation,
+            &[],
             &[],
         ));
     }
@@ -4760,6 +5175,8 @@ mod tests {
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
             #[cfg(target_os = "linux")]
+            proxy_bind_port_ranges: Vec::new(),
+            #[cfg(target_os = "linux")]
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
             seccomp_policy: SeccompPolicy {
@@ -4811,12 +5228,12 @@ mod tests {
                 );
 
                 #[cfg(target_os = "linux")]
-                let (status, denials, ipc_denials) = result
+                let (status, denials, ipc_denials, _url_denials) = result
                     .map_err(|e| format!("supervisor loop: {e}"))
                     .expect("supervisor loop failed");
 
                 #[cfg(not(target_os = "linux"))]
-                let (status, denials) = result
+                let (status, denials, _url_denials) = result
                     .map_err(|e| format!("supervisor loop: {e}"))
                     .expect("supervisor loop failed");
 
@@ -4885,6 +5302,8 @@ mod tests {
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
             #[cfg(target_os = "linux")]
+            proxy_bind_port_ranges: Vec::new(),
+            #[cfg(target_os = "linux")]
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
             seccomp_policy: SeccompPolicy {
@@ -4925,7 +5344,7 @@ mod tests {
                     &mut false,
                 );
 
-                let (status, denials, ipc_denials) = result
+                let (status, denials, ipc_denials, _url_denials) = result
                     .map_err(|e| format!("supervisor loop: {e}"))
                     .expect("supervisor loop should not deadlock");
                 assert!(denials.is_empty());
@@ -4976,6 +5395,8 @@ mod tests {
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
             #[cfg(target_os = "linux")]
+            proxy_bind_port_ranges: Vec::new(),
+            #[cfg(target_os = "linux")]
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
             seccomp_policy: SeccompPolicy {
@@ -4994,13 +5415,9 @@ mod tests {
 
         // Disallowed origin: must fail validation
         let result = validate_url("https://evil.example.com/phishing", &config);
-        assert!(result.is_err());
         assert!(
-            result
-                .as_ref()
-                .err()
-                .map(|e| e.contains("not in the profile"))
-                .unwrap_or(false)
+            matches!(result, Err(UrlDenial::OriginNotAllowed { .. })),
+            "Expected OriginNotAllowed, got: {result:?}"
         );
     }
 
@@ -5024,6 +5441,8 @@ mod tests {
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
             #[cfg(target_os = "linux")]
+            proxy_bind_port_ranges: Vec::new(),
+            #[cfg(target_os = "linux")]
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
             seccomp_policy: SeccompPolicy {
@@ -5037,17 +5456,91 @@ mod tests {
         };
 
         let result = validate_url("file:///etc/passwd", &config);
-        assert!(result.is_err());
         assert!(
-            result
-                .as_ref()
-                .err()
-                .map(|e| e.contains("Only https://"))
-                .unwrap_or(false)
+            matches!(result, Err(UrlDenial::NonHttpsScheme { .. })),
+            "Expected NonHttpsScheme, got: {result:?}"
         );
 
         let result = validate_url("javascript:alert(1)", &config);
-        assert!(result.is_err());
+        assert!(
+            matches!(result, Err(UrlDenial::NonHttpsScheme { .. })),
+            "Expected NonHttpsScheme for javascript:, got: {result:?}"
+        );
+    }
+
+    /// A denied URL must flow through validation into a persistable
+    /// `UrlDenialRecord`. Fixable denials (disallowed origin, blocked localhost)
+    /// produce a record with the right reason and an origin-only payload (never
+    /// the full URL); non-fixable denials produce no record so they are never
+    /// offered in the save prompt.
+    #[test]
+    fn test_url_denial_maps_to_record_for_save_prompt() {
+        let backend = TestDenyBackend;
+        let origins = vec!["https://claude.ai".to_string()];
+        let config = SupervisorConfig {
+            protected_roots: &[],
+            approval_backend: &backend,
+            session_id: "test",
+            attach_initial_client: false,
+            detach_sequence: None,
+            open_url_origins: &origins,
+            open_url_allow_localhost: false,
+            audit_recorder: None,
+            network_audit_events: None,
+            redaction_policy: &nono::ScrubPolicy::secure_default(),
+            allow_launch_services_active: false,
+            #[cfg(target_os = "linux")]
+            proxy_port: 0,
+            #[cfg(target_os = "linux")]
+            proxy_bind_ports: Vec::new(),
+            #[cfg(target_os = "linux")]
+            proxy_bind_port_ranges: Vec::new(),
+            #[cfg(target_os = "linux")]
+            unix_socket_allowlist: &[],
+            #[cfg(target_os = "linux")]
+            seccomp_policy: SeccompPolicy {
+                capability_elevation: false,
+                proxy_fallback: false,
+                af_unix_mediation: false,
+                proc_comm_notify: false,
+            },
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            tool_sandbox_runtime: None,
+        };
+
+        // Disallowed origin -> OriginNotAllowed record carrying only the origin,
+        // not the full URL with its OAuth query string.
+        let denial = validate_url(
+            "https://accounts.google.com/o/oauth2/auth?token=secret",
+            &config,
+        )
+        .expect_err("disallowed origin must be denied");
+        let record = denial.to_record().expect("origin denial must be saveable");
+        assert_eq!(record.reason, UrlDenialReason::OriginNotAllowed);
+        assert_eq!(record.origin, "https://accounts.google.com");
+
+        // Blocked localhost -> LocalhostNotAllowed record with empty origin.
+        let denial = validate_url("http://localhost:8080/callback", &config)
+            .expect_err("localhost must be denied when allow_localhost is false");
+        let record = denial
+            .to_record()
+            .expect("localhost denial must be saveable");
+        assert_eq!(record.reason, UrlDenialReason::LocalhostNotAllowed);
+        assert!(record.origin.is_empty());
+
+        // Non-fixable denials must NOT produce a record.
+        let non_fixable = [
+            "file:///etc/passwd",
+            "not a url",
+            &format!("https://example.com/{}", "a".repeat(MAX_URL_LENGTH)),
+        ];
+        for url in non_fixable {
+            let denial = validate_url(url, &config).expect_err("must be denied");
+            assert!(
+                denial.to_record().is_none(),
+                "non-fixable denial must not be saveable: {denial:?}"
+            );
+        }
     }
 
     #[test]
@@ -5069,6 +5562,8 @@ mod tests {
             proxy_port: 0,
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
+            #[cfg(target_os = "linux")]
+            proxy_bind_port_ranges: Vec::new(),
             #[cfg(target_os = "linux")]
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
@@ -5098,6 +5593,8 @@ mod tests {
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
             #[cfg(target_os = "linux")]
+            proxy_bind_port_ranges: Vec::new(),
+            #[cfg(target_os = "linux")]
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
             seccomp_policy: SeccompPolicy {
@@ -5112,13 +5609,9 @@ mod tests {
 
         // Localhost denied when not allowed
         let result = validate_url("http://localhost:8080/callback", &config_deny);
-        assert!(result.is_err());
         assert!(
-            result
-                .as_ref()
-                .err()
-                .map(|e| e.contains("not allowed"))
-                .unwrap_or(false)
+            matches!(result, Err(UrlDenial::LocalhostNotAllowed)),
+            "Expected LocalhostNotAllowed, got: {result:?}"
         );
 
         // Localhost allowed when configured
@@ -5149,6 +5642,8 @@ mod tests {
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
             #[cfg(target_os = "linux")]
+            proxy_bind_port_ranges: Vec::new(),
+            #[cfg(target_os = "linux")]
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
             seccomp_policy: SeccompPolicy {
@@ -5163,13 +5658,9 @@ mod tests {
 
         let long_url = format!("https://example.com/{}", "a".repeat(MAX_URL_LENGTH));
         let result = validate_url(&long_url, &config);
-        assert!(result.is_err());
         assert!(
-            result
-                .as_ref()
-                .err()
-                .map(|e| e.contains("maximum length"))
-                .unwrap_or(false)
+            matches!(result, Err(UrlDenial::Oversized { .. })),
+            "Expected Oversized, got: {result:?}"
         );
     }
 
@@ -5305,6 +5796,8 @@ mod tests {
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
             #[cfg(target_os = "linux")]
+            proxy_bind_port_ranges: Vec::new(),
+            #[cfg(target_os = "linux")]
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
             seccomp_policy: SeccompPolicy {
@@ -5361,6 +5854,8 @@ mod tests {
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
             #[cfg(target_os = "linux")]
+            proxy_bind_port_ranges: Vec::new(),
+            #[cfg(target_os = "linux")]
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
             seccomp_policy: SeccompPolicy {
@@ -5405,6 +5900,8 @@ mod tests {
             proxy_port: 0,
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
+            #[cfg(target_os = "linux")]
+            proxy_bind_port_ranges: Vec::new(),
             #[cfg(target_os = "linux")]
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
@@ -5469,6 +5966,8 @@ mod tests {
             proxy_port: 0,
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
+            #[cfg(target_os = "linux")]
+            proxy_bind_port_ranges: Vec::new(),
             #[cfg(target_os = "linux")]
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]

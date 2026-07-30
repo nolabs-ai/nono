@@ -61,7 +61,7 @@ Inherit from another profile by name:
   selected profile as the final override layer. Inherited grants can widen
   sandbox permissions.
 - Scalar fields: child overrides base.
-- Array fields (`groups.include`, `groups.exclude`, `commands.allow`, `commands.deny`, `filesystem.*`, `allow_domain`, `deny_domain`, `open_port`, `listen_port`, `rollback.*`, `upstream_bypass`): child values are appended to base values and deduplicated. To remove inherited entries, use `groups.exclude` for groups; there is no mechanism to remove inherited filesystem paths. For `allow_domain` entries with endpoint rules, rules for the same domain are merged (appended) rather than replaced. `deny_domain` entries are additive — child profiles can only add more denies, never remove inherited ones.
+- Array fields (`groups.include`, `groups.exclude`, `commands.allow`, `commands.deny`, `filesystem.*`, `allow_domain`, `deny_domain`, `open_port`, `open_port_range`, `listen_port`, `listen_port_range`, `no_proxy`, `rollback.*`, `upstream_bypass`): child values are appended to base values and deduplicated. To remove inherited entries, use `groups.exclude` for groups; there is no mechanism to remove inherited filesystem paths. For `allow_domain` entries with endpoint rules, rules for the same domain are merged (appended) rather than replaced. `deny_domain` entries are additive — child profiles can only add more denies, never remove inherited ones.
 - Map fields (`env_credentials`, `hooks`, `custom_credentials`): child entries are merged into base; child keys override matching base keys.
 - `network_profile` supports three-state inheritance via `InheritableValue`: absent = inherit base value, `null` = explicitly clear, string = override. This is the only field that supports null-clearing.
 - `open_urls`: if the child provides the field (even as `{}`), it replaces the base entirely. If absent, the base value is inherited. Setting to `null` in JSON is equivalent to omitting it (both inherit the base).
@@ -315,8 +315,11 @@ All path fields support variable expansion (see Section 6).
 | `allow_domain`          | array of string or object         | `[]`     | Additional domains to allow through the proxy. Entries can be plain strings (CONNECT tunnel) or objects with endpoint rules (TLS-intercepted L7 filtering). Aliases: `proxy_allow`, `allow_proxy`. |
 | `deny_domain`           | array of string                   | `[]`     | Domains to block through the proxy regardless of the allowlist. Evaluated before `allow_domain`. Supports wildcard subdomains (`*.ads.example.com`). Equivalent to `--deny-domain`. |
 | `credentials`           | array of string                   | `[]`     | Credential services to enable via reverse proxy. Alias: `proxy_credentials`. |
-| `open_port`             | array of integer                  | `[]`     | Localhost TCP IPC. Aliases: `port_allow`, `allow_port`. Port **0**: macOS only (`localhost:*` outbound); Linux: explicit ports. |
-| `listen_port`           | array of integer                  | `[]`     | TCP ports the sandboxed child may listen on. |
+| `open_port`             | array of integer                  | `[]`     | Localhost TCP IPC (connect + bind). Aliases: `port_allow`, `allow_port`. Port **0**: macOS only (`localhost:*` outbound); Linux: explicit ports. |
+| `open_port_range`       | array of `[start, end]`           | `[]`     | Inclusive port ranges for bidirectional localhost TCP (connect + bind). Multiple ranges are supported. Example: `[[3000, 3010], [8000, 8100]]`. Each port becomes an individual rule; overlapping ranges are merged automatically. **macOS**: hard limit of 16,384 unique ports across all ranges (2¹⁴) due to `sandbox_init` rule limits. **Linux**: no limit beyond the 16-bit port space (1–65535). |
+| `listen_port`           | array of integer                  | `[]`     | TCP ports the sandboxed child may listen on (bind only). |
+| `listen_port_range`     | array of `[start, end]`           | `[]`     | Inclusive port ranges for TCP listen (bind only). Multiple ranges are supported. Example: `[[8000, 8100], [9000, 9010]]`. Overlapping ranges are merged automatically. Same platform limits as `open_port_range`. |
+| `no_proxy`              | array of string                   | `[]`     | Additional client-side `NO_PROXY` / `no_proxy` entries in proxy mode. This does not grant network access; direct connections still require matching sandbox permissions. Entries must be host patterns only (safe single-label local alias, canonical IP literal, `*.` wildcard suffix, or leading-dot suffix); bare multi-label domains, protected metadata suffix tokens, URLs, credentials, ports, paths, comma-separated lists, and `*` are rejected. |
 | `custom_credentials`    | map of string to credential def   | `{}`     | Custom credential route definitions (see below). Defines the route only — the proxy does not activate unless the service name also appears in `credentials`. |
 | `upstream_proxy`        | string                            | `null`   | Enterprise proxy address (`host:port`). Alias: `external_proxy`. |
 | `upstream_bypass`       | array of string                   | `[]`     | Hosts to bypass the upstream proxy. Supports `*.` wildcard suffixes. Alias: `external_proxy_bypass`. |
@@ -1024,7 +1027,76 @@ nono profile groups               # List available security groups
 nono profile diff <a> <b>         # Compare two profiles
 ```
 
-## 6. Variable Expansion
+## 6. Profile Drafts
+
+Profile drafts are a staging area for creating or editing profiles before they are applied. Drafts live in `~/.config/nono/profile-drafts/` (or `$XDG_CONFIG_HOME/nono/profile-drafts/`). The live profiles directory (`~/.config/nono/profiles/`) is read-only inside a running agent sandbox, so the draft workflow is the correct way for an agent to propose profile changes.
+
+### Creating a new profile via draft
+
+Write the profile JSON to the drafts directory using the profile name as the filename:
+
+```
+~/.config/nono/profile-drafts/my-agent.json
+```
+
+The `meta.name` field inside the JSON must match the filename (without `.json`). Then validate and promote:
+
+```
+nono profile validate --draft my-agent   # Validate the draft before promoting
+nono profile promote my-agent            # Show diff and prompt for confirmation
+nono profile promote --diff my-agent     # Preview the diff without applying
+nono profile promote --yes my-agent      # Apply without interactive confirmation
+```
+
+On success, `promote` atomically writes the profile to `~/.config/nono/profiles/my-agent.json` and deletes the draft file.
+
+### Editing an existing profile via draft
+
+When drafting a change to a profile that already exists, you must also create a `.base` file alongside the draft JSON. The `.base` file contains the SHA-256 hex digest of the current profile bytes. `promote` checks this hash to detect if the live profile changed while the draft was in progress.
+
+Steps:
+
+1. Read the current profile: `~/.config/nono/profiles/my-agent.json`
+2. Compute its SHA-256 hex digest and write it to `~/.config/nono/profile-drafts/my-agent.base`
+3. Write your modified profile JSON to `~/.config/nono/profile-drafts/my-agent.json`
+4. Validate and promote:
+
+```
+nono profile validate --draft my-agent
+nono profile promote my-agent
+```
+
+The `.base` file must contain exactly 64 lowercase hex characters. If the live profile was modified after the draft was created and the hash no longer matches, `promote` exits with:
+
+```
+draft base hash does not match current profile. The profile changed after the draft was written; regenerate or review the draft before promoting.
+```
+
+Reread the current profile, recompute the hash, and update your draft.
+
+### Extending a built-in or pack profile
+
+`promote` refuses to replace a built-in or pack-installed profile. Instead, draft a derived profile that extends it:
+
+```json
+{
+  "meta": { "name": "default-local", "version": "1", "description": "My customisations" },
+  "extends": "default"
+}
+```
+
+Draft name: `~/.config/nono/profile-drafts/default-local.json` (no `.base` needed — this is a new profile).
+
+Then start sessions with `nono run --profile default-local -- <command>`.
+
+### Summary of draft files
+
+| File | Purpose |
+|------|---------|
+| `~/.config/nono/profile-drafts/<name>.json` | Draft profile JSON |
+| `~/.config/nono/profile-drafts/<name>.base` | SHA-256 of live profile at draft creation time (required only when editing an existing profile) |
+
+## 7. Variable Expansion
 
 The following variables are expanded in all path fields (`filesystem.*`, including `filesystem.allow`, `filesystem.read`, `filesystem.write`, `filesystem.deny`, `filesystem.bypass_protection`, and `filesystem.suppress_save_prompt`), in `command_args`, and in the values of `environment.set_vars`.
 
@@ -1042,7 +1114,7 @@ The following variables are expanded in all path fields (`filesystem.*`, includi
 
 Always use these variables instead of hardcoded absolute paths to keep profiles portable across machines and users.
 
-## 7. Platform Predicates
+## 8. Platform Predicates
 
 Profile entries that list paths, group names, URL origins, or env credentials can be unconditional strings or conditional objects with `when`.
 
@@ -1070,7 +1142,7 @@ Profile entries that list paths, group names, URL origins, or env credentials ca
 
 Supported predicate forms include `linux`, `macos`, `linux:fedora`, `linux:rhel-like`, `linux:ubuntu:>=24.04`, `macos:>=15`, negation such as `!linux:nixos`, and arrays for any-of matching.
 
-## 8. Key Rules
+## 9. Key Rules
 
 - A profile with no `groups.include` has no deny rules. Always include appropriate deny groups for untrusted workloads.
 - `filesystem.bypass_protection` only removes the deny rule. It does not grant access. You must also add the path via `filesystem.allow`, `filesystem.read`, or `filesystem.write` (or the matching `*_file` variant).
@@ -1082,7 +1154,7 @@ Supported predicate forms include `linux`, `macos`, `linux:fedora`, `linux:rhel-
 - `network.block: true` blocks all network access. It cannot be combined with proxy settings.
 - `custom_credentials` upstream URLs must use HTTPS. HTTP is only accepted for loopback addresses (localhost, 127.0.0.1, ::1).
 
-## 9. Migration from previous schema
+## 10. Migration from previous schema
 
 Issue [#594](https://github.com/nolabs-ai/nono/issues/594) restructured the profile JSON schema. The old `policy.*` namespace has been dissolved into `filesystem`, `groups`, and `commands`; `security.groups` and `security.allowed_commands` have moved to top-level `groups.include` and `commands.allow`.
 

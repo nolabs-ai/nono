@@ -64,7 +64,7 @@ fn policy_show_alias() {
 fn policy_diff_alias() {
     // Both profiles must be embedded so the test doesn't depend on a
     // registry pack being installed. `claude-code` was used here
-    // before it was moved to the always-further/claude pack.
+    // before it was moved to the nolabs-ai/claude pack.
     let (ok_old, stdout_old, stderr_old) =
         run(&["policy", "diff", "default", "node-dev", "--json"]);
     let (ok_new, stdout_new, _) = run(&["profile", "diff", "default", "node-dev", "--json"]);

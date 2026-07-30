@@ -784,24 +784,29 @@ pub(crate) fn suggested_flag_parts(path: &Path, requested: AccessMode) -> (&'sta
 
 /// Returns true for directories that should never be used as a widened grant target:
 /// the filesystem root, the user's home directory, and XDG base directories.
-fn is_sensitive_root(path: &Path) -> bool {
+///
+/// All candidate roots are canonicalized before comparison so that symlinked home
+/// directories (e.g. macOS `/Users/foo` → `/private/Users/foo`) match the
+/// canonicalized `path` that arrives from `suggested_flag_parts`.
+pub(crate) fn is_sensitive_root(path: &Path) -> bool {
     if path == Path::new("/") {
         return true;
     }
 
     if let Some(home) = dirs::home_dir()
-        && path == home
+        && try_canonicalize(&home) == path
     {
         return true;
     }
 
     // XDG base directories (use env vars with standard defaults).
+    let home = dirs::home_dir();
     let xdg_roots: Vec<PathBuf> = [
         std::env::var("XDG_CONFIG_HOME")
             .ok()
             .map(PathBuf::from)
             .unwrap_or_else(|| {
-                dirs::home_dir()
+                home.as_deref()
                     .map(|h| h.join(".config"))
                     .unwrap_or_default()
             }),
@@ -809,7 +814,7 @@ fn is_sensitive_root(path: &Path) -> bool {
             .ok()
             .map(PathBuf::from)
             .unwrap_or_else(|| {
-                dirs::home_dir()
+                home.as_deref()
                     .map(|h| h.join(".local/share"))
                     .unwrap_or_default()
             }),
@@ -817,13 +822,22 @@ fn is_sensitive_root(path: &Path) -> bool {
             .ok()
             .map(PathBuf::from)
             .unwrap_or_else(|| {
-                dirs::home_dir()
+                home.as_deref()
                     .map(|h| h.join(".local/state"))
+                    .unwrap_or_default()
+            }),
+        std::env::var("XDG_CACHE_HOME")
+            .ok()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                home.as_deref()
+                    .map(|h| h.join(".cache"))
                     .unwrap_or_default()
             }),
     ]
     .into_iter()
     .filter(|p| !p.as_os_str().is_empty())
+    .map(|p| try_canonicalize(&p))
     .collect();
 
     xdg_roots.iter().any(|root| path == root)

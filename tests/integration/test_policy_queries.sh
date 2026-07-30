@@ -32,7 +32,7 @@ expect_output_contains "sensitive path is denied" "\"reason\": \"sensitive_path\
 expect_output_contains "non-granted path is denied" "\"reason\": \"path_not_granted\"" \
     "$NONO_BIN" --silent why --json --path "$DENIED_PATH" --op read
 
-expect_output_contains "non-granted path suggests exact flag" "\"suggested_flag\": \"--read $HOME\"" \
+expect_output_contains "non-granted path suggests exact flag" "\"suggested_flag\": \"--read-file $DENIED_PATH\"" \
     "$NONO_BIN" --silent why --json --path "$DENIED_PATH" --op read
 
 expect_output_contains "allow grants write for matching path" "\"status\": \"allowed\"" \

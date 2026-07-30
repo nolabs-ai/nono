@@ -3480,7 +3480,18 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
         },
         env_credentials: SecretsConfig {
             mappings: {
+                // Child overrides base by destination env var (matches `set_vars`
+                // semantics). `HashMap::extend` only replaces an entry when the
+                // account name (the map key) matches, so two different accounts
+                // targeting the SAME env var would both survive and race
+                // non-deterministically at load time (`keystore::load_secrets`
+                // iterates the map in random per-process order, and the env is
+                // assembled last-write-wins). Drop any base entry whose
+                // destination a child overrides before extending.
+                let child_destinations: std::collections::HashSet<String> =
+                    child.env_credentials.mappings.values().cloned().collect();
                 let mut merged = base.env_credentials.mappings;
+                merged.retain(|_account, dest| !child_destinations.contains(dest));
                 merged.extend(child.env_credentials.mappings);
                 merged
             },
@@ -3957,6 +3968,80 @@ pub fn list_pack_store_profiles() -> Vec<(String, String)> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn env_credentials_child_overrides_base_by_destination_env_var() {
+        // Regression for https://github.com/nolabs-ai/nono/issues/1532: a child
+        // account and a base account targeting the SAME env var must not both
+        // survive the merge (they would race non-deterministically in
+        // keystore::load_secrets). The child must win, matching `set_vars`.
+        let base = Profile {
+            env_credentials: SecretsConfig {
+                mappings: [
+                    ("base_account".to_string(), "MY_TOKEN".to_string()),
+                    ("other".to_string(), "OTHER_VAR".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            },
+            ..Default::default()
+        };
+        let child = Profile {
+            env_credentials: SecretsConfig {
+                mappings: [("child_account".to_string(), "MY_TOKEN".to_string())]
+                    .into_iter()
+                    .collect(),
+            },
+            ..Default::default()
+        };
+
+        let merged = merge_profiles(base, child);
+
+        // Child wins for the colliding destination; base's entry is dropped.
+        assert_eq!(
+            merged.env_credentials.mappings.get("child_account"),
+            Some(&"MY_TOKEN".to_string()),
+        );
+        assert!(!merged.env_credentials.mappings.contains_key("base_account"));
+        // Unrelated base entry is preserved.
+        assert_eq!(
+            merged.env_credentials.mappings.get("other"),
+            Some(&"OTHER_VAR".to_string()),
+        );
+        assert_eq!(merged.env_credentials.mappings.len(), 2);
+    }
+
+    #[test]
+    fn env_credentials_child_extends_base_without_collision() {
+        // No destination collision -> child entry is added, base entry kept.
+        let base = Profile {
+            env_credentials: SecretsConfig {
+                mappings: [("a".to_string(), "VAR_A".to_string())]
+                    .into_iter()
+                    .collect(),
+            },
+            ..Default::default()
+        };
+        let child = Profile {
+            env_credentials: SecretsConfig {
+                mappings: [("b".to_string(), "VAR_B".to_string())]
+                    .into_iter()
+                    .collect(),
+            },
+            ..Default::default()
+        };
+
+        let merged = merge_profiles(base, child);
+        assert_eq!(merged.env_credentials.mappings.len(), 2);
+        assert_eq!(
+            merged.env_credentials.mappings.get("a"),
+            Some(&"VAR_A".to_string())
+        );
+        assert_eq!(
+            merged.env_credentials.mappings.get("b"),
+            Some(&"VAR_B".to_string())
+        );
+    }
 
     #[test]
     fn profile_path_is_in_pack_matches_canonical_layout() {

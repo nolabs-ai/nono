@@ -19,7 +19,7 @@ Command fails with "Permission denied" or "Operation not permitted" errors.
 2. **Query capabilities from inside the sandbox**:
    ```bash
    # Check if a specific path is accessible
-   nono run --allow-cwd -- nono why --self --path /tmp --op write --json
+   nono run --allow-cwd -- nono why --self --path /var --op write --json
 
    # Human-readable output
    nono run --allow-cwd -- nono why --self --path ~/.ssh --op read
@@ -283,8 +283,8 @@ nono run --allow . -- nono why --self --path ./src --op write
 # Output: ALLOWED - Granted by: --allow .
 
 # JSON output for programmatic use (useful for AI agents)
-nono run --allow-cwd -- nono why --self --path /tmp --op write --json
-# {"status":"denied","reason":"not_in_allowed_paths","suggestion":"--write /tmp"}
+nono run --allow-cwd -- nono why --self --path /var --op write --json
+# {"status":"denied","reason":"not_in_allowed_paths","suggestion":"--write /var"}
 
 # Check network status
 nono run --allow-cwd -- nono why --self --host api.openai.com

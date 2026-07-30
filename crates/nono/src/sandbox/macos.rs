@@ -12,7 +12,7 @@ use crate::error::{NonoError, Result};
 use crate::sandbox::SupportInfo;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::ptr;
 use tracing::{debug, info};
 
@@ -279,9 +279,35 @@ fn has_explicit_keychain_db_access(caps: &CapabilitySet) -> bool {
         false
     };
 
-    caps.fs_capabilities()
-        .iter()
-        .any(|cap| is_keychain_db(&cap.original) || is_keychain_db(&cap.resolved))
+    // Collect all known keychain DB paths for coverage checks below.
+    let all_keychain_dbs: Vec<PathBuf> = user_keychain_dbs
+        .as_ref()
+        .map(|dbs| dbs.to_vec())
+        .unwrap_or_default()
+        .into_iter()
+        .chain(system_keychain_dbs.iter().cloned())
+        .collect();
+
+    // Only user-intent grants unlock Mach IPC to keychain daemons. Group grants
+    // must not suppress the secd/securityd denies — Mach IPC bypasses file-level
+    // rules, so a group-sourced keychain cap would reopen access even when
+    // deny_keychains_macos is active.
+    //
+    // A directory grant covering a keychain DB also counts — e.g. a profile that
+    // allows ~/Library/Keychains (directory) covers login.keychain-db within it.
+    caps.fs_capabilities().iter().any(|cap| {
+        if !cap.source.is_user_intent() {
+            return false;
+        }
+        if cap.is_file {
+            is_keychain_db(&cap.original) || is_keychain_db(&cap.resolved)
+        } else {
+            // Directory grant: check if it covers any known keychain DB.
+            all_keychain_dbs
+                .iter()
+                .any(|db| db.starts_with(&cap.resolved) || db.starts_with(&cap.original))
+        }
+    })
 }
 
 /// Escape a path for use in Seatbelt profile strings.
@@ -874,7 +900,6 @@ pub fn apply(caps: &CapabilitySet) -> Result<()> {
     let profile = generate_profile(caps)?;
 
     debug!("Generated Seatbelt profile ({} bytes)", profile.len());
-
     let profile_cstr = CString::new(profile)
         .map_err(|e| NonoError::SandboxInit(format!("Invalid profile string: {}", e)))?;
 
@@ -1472,6 +1497,58 @@ mod tests {
             resolved: metadata_keychain_db,
             access: AccessMode::Read,
             is_file: true,
+            source: CapabilitySource::Profile,
+        });
+
+        let profile = generate_profile(&caps).unwrap();
+
+        assert!(!profile.contains("(deny mach-lookup (global-name \"com.apple.SecurityServer\"))"));
+        assert!(!profile.contains("(deny mach-lookup (global-name \"com.apple.securityd\"))"));
+        assert!(
+            !profile.contains("(deny mach-lookup (global-name \"com.apple.security.keychaind\"))")
+        );
+        assert!(!profile.contains("(deny mach-lookup (global-name \"com.apple.secd\"))"));
+        assert!(!profile.contains("(deny mach-lookup (global-name \"com.apple.security.agent\"))"));
+    }
+
+    #[test]
+    fn test_generate_profile_group_sourced_keychain_does_not_suppress_mach_deny() {
+        // Group-sourced keychain caps must not suppress Mach IPC denies.
+        let mut caps = CapabilitySet::new();
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/test".to_string());
+        let keychain = PathBuf::from(home).join("Library/Keychains/login.keychain-db");
+        caps.add_fs(FsCapability {
+            original: keychain.clone(),
+            resolved: keychain,
+            access: AccessMode::ReadWrite,
+            is_file: true,
+            source: CapabilitySource::Group("claude_code_macos".to_string()),
+        });
+
+        let profile = generate_profile(&caps).unwrap();
+
+        assert!(profile.contains("(deny mach-lookup (global-name \"com.apple.SecurityServer\"))"));
+        assert!(profile.contains("(deny mach-lookup (global-name \"com.apple.securityd\"))"));
+        assert!(
+            profile.contains("(deny mach-lookup (global-name \"com.apple.security.keychaind\"))")
+        );
+        assert!(profile.contains("(deny mach-lookup (global-name \"com.apple.secd\"))"));
+        assert!(profile.contains("(deny mach-lookup (global-name \"com.apple.security.agent\"))"));
+    }
+
+    #[test]
+    fn test_generate_profile_directory_grant_covering_keychain_suppresses_mach_deny() {
+        // A profile-level directory grant covering ~/Library/Keychains must suppress
+        // Mach IPC denies, the same as an explicit file grant for login.keychain-db.
+        // Regression: nolabs-ai/claude grants the Keychains directory, not individual files.
+        let mut caps = CapabilitySet::new();
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/test".to_string());
+        let keychains_dir = PathBuf::from(home).join("Library/Keychains");
+        caps.add_fs(FsCapability {
+            original: keychains_dir.clone(),
+            resolved: keychains_dir,
+            access: AccessMode::ReadWrite,
+            is_file: false,
             source: CapabilitySource::Profile,
         });
 

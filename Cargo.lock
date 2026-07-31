@@ -1484,7 +1484,7 @@ checksum = "59600e2c2d636fde9b65e99cc6445ac770c63d3628195ff39932b8d6d7409903"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -2735,7 +2735,7 @@ dependencies = [
 name = "nono"
 version = "0.70.0"
 dependencies = [
- "der 0.7.10",
+ "der 0.8.1",
  "getrandom 0.4.3",
  "globset",
  "ignore",

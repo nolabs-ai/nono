@@ -2756,7 +2756,7 @@ fn load_profile_inner(name_or_path: &str, cli_extends: &[String]) -> Result<Opti
         // bypassing the post-pull cleanup hook in `migration::check_and_run`.
         // Idempotent: silent no-op when no legacy artifacts exist, so safe
         // to fire on every claude resolution.
-        if is_always_further_claude_pack(&profile_path) {
+        if is_official_claude_pack(&profile_path) {
             crate::legacy_cleanup::check_and_offer_cleanup()?;
         }
         return Ok(Some(profile));
@@ -2778,15 +2778,19 @@ fn load_profile_inner(name_or_path: &str, cli_extends: &[String]) -> Result<Opti
     Ok(None)
 }
 
-/// True when `profile_path` lives inside `<package_store>/nolabs-ai/claude/`.
-/// Used to gate legacy-cleanup invocation on the canonical claude pack
-/// rather than any pack that happens to publish a profile named `claude`
-/// or `claude-code`.
-fn is_always_further_claude_pack(profile_path: &Path) -> bool {
+/// Returns `true` when `profile_path` lives inside `<package_store>/<ns>/claude/` for one of the
+/// namespaces the official claude pack has been published under. Used to gate legacy-cleanup
+/// invocation on the canonical claude pack rather than any pack that happens to publish a profile
+/// named `claude` or `claude-code`.
+///
+/// The namespace list comes from `package_status` so both modules agree on what counts as the
+/// official pack.
+fn is_official_claude_pack(profile_path: &Path) -> bool {
     let Ok(store) = crate::package::package_store_dir() else {
         return false;
     };
-    profile_path_is_in_pack(profile_path, &store, "always-further", "claude")
+    crate::package_status::official_claude_pack_namespaces()
+        .any(|ns| profile_path_is_in_pack(profile_path, &store, ns, "claude"))
 }
 
 /// Pure path-component matcher: does `profile_path` live under
@@ -4265,6 +4269,35 @@ mod tests {
             "always-further",
             "claude"
         ));
+    }
+
+    /// Wrapped in `with_config_env` so `package_store_dir()` returns the same
+    /// path here and inside `is_official_claude_pack`. It reads
+    /// `XDG_CONFIG_HOME` live on every call, so without holding `ENV_LOCK` a
+    /// parallel test swapping the env between the two reads would make them
+    /// disagree.
+    #[test]
+    fn official_claude_pack_matches_both_published_namespaces() {
+        with_config_env(|_config_dir| {
+            let store = crate::package::package_store_dir().expect("package store dir");
+
+            for ns in ["nolabs-ai", "always-further"] {
+                let path = store.join(ns).join("claude").join("profiles/claude.json");
+                assert!(
+                    is_official_claude_pack(&path),
+                    "{ns}/claude is the official claude pack"
+                );
+            }
+
+            let third_party = store
+                .join("someone-else")
+                .join("claude")
+                .join("profiles/claude.json");
+            assert!(
+                !is_official_claude_pack(&third_party),
+                "a third-party pack publishing a `claude` profile must not trigger legacy cleanup"
+            );
+        });
     }
 
     #[test]

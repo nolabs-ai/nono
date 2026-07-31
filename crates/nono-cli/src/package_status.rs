@@ -9,18 +9,21 @@ use nono::{NonoError, Result};
 struct OfficialPackStatusTarget {
     namespace: &'static str,
     name: &'static str,
+    legacy_namespaces: &'static [&'static str],
     profiles: &'static [&'static str],
 }
 
 const CLAUDE_PACK: OfficialPackStatusTarget = OfficialPackStatusTarget {
     namespace: "nolabs-ai",
     name: "claude",
+    legacy_namespaces: &["always-further"],
     profiles: &["claude", "claude-code"],
 };
 
 const CODEX_PACK: OfficialPackStatusTarget = OfficialPackStatusTarget {
     namespace: "nolabs-ai",
     name: "codex",
+    legacy_namespaces: &[],
     profiles: &["codex"],
 };
 
@@ -31,6 +34,17 @@ impl OfficialPackStatusTarget {
         format!("{}/{}", self.namespace, self.name)
     }
 
+    /// Every namespace this pack has been published under, current one first.
+    fn namespaces(self) -> impl Iterator<Item = &'static str> {
+        std::iter::once(self.namespace).chain(self.legacy_namespaces.iter().copied())
+    }
+
+    /// Every `<namespace>/<name>` this pack has been published under.
+    fn keys(self) -> impl Iterator<Item = String> {
+        self.namespaces()
+            .map(move |ns| format!("{ns}/{}", self.name))
+    }
+
     fn package_ref(self) -> PackageRef {
         PackageRef {
             namespace: self.namespace.to_string(),
@@ -38,6 +52,14 @@ impl OfficialPackStatusTarget {
             version: None,
         }
     }
+}
+
+/// Namespaces the official claude pack has been published under.
+///
+/// Exposed so `profile` can gate legacy cleanup on the same list this module
+/// matches against, rather than keeping a second copy that can drift.
+pub(crate) fn official_claude_pack_namespaces() -> impl Iterator<Item = &'static str> {
+    CLAUDE_PACK.namespaces()
 }
 
 /// Enforce official-pack status for the profile this run selected.
@@ -263,7 +285,7 @@ fn name_resolves_to_official_pack(target: OfficialPackStatusTarget, name: &str) 
         // An installed pack owns the name it installs, even when that name is
         // one the official pack publishes — `--profile claude` resolves to
         // that pack, so this run is not the official one.
-        return pack_key == target.key();
+        return target.keys().any(|key| key == pack_key);
     }
     is_official_profile_name(target, name)
 }
@@ -273,8 +295,9 @@ fn is_official_profile_name(target: OfficialPackStatusTarget, name: &str) -> boo
 }
 
 fn is_official_package_ref(target: OfficialPackStatusTarget, value: &str) -> bool {
-    let key = target.key();
-    value == key || value.starts_with(&format!("{key}@"))
+    target
+        .keys()
+        .any(|key| value == key || value.starts_with(&format!("{key}@")))
 }
 
 #[cfg(test)]
@@ -359,6 +382,32 @@ mod tests {
             CODEX_PACK,
             "nolabs-ai/codex-extra"
         ));
+    }
+
+    /// The claude pack predates the org rename, so an install or an `extends`
+    /// written against the old namespace is still the official pack.
+    #[test]
+    fn legacy_namespace_refs_target_the_claude_pack() {
+        assert!(is_official_package_ref(
+            CLAUDE_PACK,
+            "always-further/claude"
+        ));
+        assert!(is_official_package_ref(
+            CLAUDE_PACK,
+            "always-further/claude@1.2.3"
+        ));
+        assert!(!is_official_package_ref(CODEX_PACK, "always-further/codex"));
+    }
+
+    #[test]
+    fn claude_pack_installed_under_the_legacy_namespace_selects_claude_code() {
+        with_isolated_config_home(|config_home| {
+            write_pack_profile(config_home, "always-further", "claude", "claude", &["cc"]);
+
+            assert!(selects_claude_code("claude"));
+            assert!(selects_claude_code("cc"));
+            assert!(loads_claude_pack("claude"));
+        });
     }
 
     #[test]

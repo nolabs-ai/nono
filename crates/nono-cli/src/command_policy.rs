@@ -3359,7 +3359,7 @@ mod tests {
 
     #[test]
     fn print_command_not_found_summary_ignores_non_matching_codes() {
-        let warnings = vec![
+        let warnings = [
             CommandPolicyFinding::new(
                 "command_not_found",
                 "command policy 'glab' could not be resolved on PATH; skipping",

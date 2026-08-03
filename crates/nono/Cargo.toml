@@ -72,7 +72,7 @@ keyring = { version = "3", features = ["apple-native"], optional = true, default
 typify = "0.7"
 serde_json.workspace = true
 syn = "2"
-prettyplease = "0.2"
+prettyplease = "0.3"
 
 [dev-dependencies]
 tempfile.workspace = true

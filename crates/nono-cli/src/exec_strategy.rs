@@ -42,7 +42,6 @@ use tracing::{debug, info, warn};
 pub(crate) use env_sanitization::is_dangerous_env_var;
 #[cfg(target_os = "linux")]
 pub(crate) use env_sanitization::is_env_var_allowed;
-use env_sanitization::should_skip_env_var;
 pub(crate) use env_sanitization::validate_env_var_patterns;
 pub(crate) use env_sanitization::validate_set_vars;
 
@@ -260,6 +259,10 @@ pub struct ExecConfig<'a> {
     pub cap_file: &'a std::path::Path,
     /// Directory the child process should start in.
     pub current_dir: &'a std::path::Path,
+    /// A child's `$PWD` that differs from the parent's.
+    pub child_pwd: Option<&'a std::path::Path>,
+    /// The inherited `$PWD`.
+    pub host_pwd: Option<&'a std::ffi::OsStr>,
     /// Whether to suppress diagnostic output.
     pub no_diagnostics: bool,
     /// Emit session diagnostics as JSON on stderr after the run.
@@ -390,30 +393,38 @@ pub fn execute_direct(config: &ExecConfig<'_>) -> Result<()> {
     cmd.env_clear();
     cmd.current_dir(config.current_dir);
 
+    const BLOCKED_EXTRA: &[&str] = &[
+        "NONO_CAP_FILE",
+        DETACHED_LAUNCH_ENV,
+        DETACHED_SESSION_ID_ENV,
+        DETACHED_CWD_PROMPT_RESPONSE_ENV,
+    ];
+
+    // `host_pwd` was resolved pre-sandbox; only the syscall-free policy gate is left
+    // to apply here, over this strategy's own filters.
+    let child_pwd = config.child_pwd.filter(|_| {
+        env_sanitization::pwd_rewrite_permitted(
+            &config.env_vars,
+            &config.set_vars,
+            BLOCKED_EXTRA,
+            config.denied_env_vars.as_deref(),
+            config.allowed_env_vars.as_deref(),
+        )
+    });
+
     for (key, value) in std::env::vars() {
-        if should_skip_env_var(
+        if !env_sanitization::env_var_survives_filters(
             &key,
             &config.env_vars,
-            &[
-                "NONO_CAP_FILE",
-                DETACHED_LAUNCH_ENV,
-                DETACHED_SESSION_ID_ENV,
-                DETACHED_CWD_PROMPT_RESPONSE_ENV,
-            ],
+            BLOCKED_EXTRA,
+            config.denied_env_vars.as_deref(),
+            config.allowed_env_vars.as_deref(),
         ) {
             continue;
         }
-        if let Some(ref denied) = config.denied_env_vars
-            && env_sanitization::is_env_var_denied(&key, denied)
-        {
-            continue;
-        }
-        if let Some(ref allowed) = config.allowed_env_vars
-            && !env_sanitization::is_env_var_allowed(&key, allowed)
-        {
-            continue;
-        }
-        cmd.env(&key, &value);
+        let value = env_sanitization::rewrite_workdir_env_var(&key, config.host_pwd, child_pwd)
+            .unwrap_or_else(|| value.as_ref());
+        cmd.env(&key, value);
     }
 
     cmd.args(cmd_args).env("NONO_CAP_FILE", config.cap_file);
@@ -572,33 +583,46 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     let mut browser_shim: Option<BrowserShim> = None;
 
+    const BLOCKED_EXTRA: &[&str] = &[
+        "NONO_CAP_FILE",
+        "NONO_SUPERVISOR_PATH",
+        DETACHED_LAUNCH_ENV,
+        DETACHED_SESSION_ID_ENV,
+        DETACHED_CWD_PROMPT_RESPONSE_ENV,
+    ];
+
+    let child_pwd = config.child_pwd.filter(|_| {
+        env_sanitization::pwd_rewrite_permitted(
+            &config.env_vars,
+            &config.set_vars,
+            BLOCKED_EXTRA,
+            config.denied_env_vars.as_deref(),
+            config.allowed_env_vars.as_deref(),
+        )
+    });
+
     // Copy current environment, filtering dangerous and overridden vars
     for (key, value) in std::env::vars_os() {
         if let (Some(k), Some(v)) = (key.to_str(), value.to_str()) {
-            if should_skip_env_var(
+            if !env_sanitization::env_var_survives_filters(
                 k,
                 &config.env_vars,
-                &[
-                    "NONO_CAP_FILE",
-                    "NONO_SUPERVISOR_PATH",
-                    DETACHED_LAUNCH_ENV,
-                    DETACHED_SESSION_ID_ENV,
-                    DETACHED_CWD_PROMPT_RESPONSE_ENV,
-                ],
+                BLOCKED_EXTRA,
+                config.denied_env_vars.as_deref(),
+                config.allowed_env_vars.as_deref(),
             ) {
                 continue;
             }
-            if let Some(ref denied) = config.denied_env_vars
-                && env_sanitization::is_env_var_denied(k, denied)
-            {
-                continue;
-            }
-            if let Some(ref allowed) = config.allowed_env_vars
-                && !env_sanitization::is_env_var_allowed(k, allowed)
-            {
-                continue;
-            }
-            if let Ok(cstr) = CString::new(format!("{}={}", k, v)) {
+            // A rewritten working directory can be non-UTF-8 even when the
+            // inherited value was not, so assemble `KEY=VALUE` from raw bytes.
+            let replacement =
+                env_sanitization::rewrite_workdir_env_var(k, config.host_pwd, child_pwd);
+            let value_bytes = replacement.map_or_else(|| v.as_bytes(), OsStr::as_bytes);
+            let mut kv = Vec::with_capacity(k.len() + 1 + value_bytes.len());
+            kv.extend_from_slice(k.as_bytes());
+            kv.push(b'=');
+            kv.extend_from_slice(value_bytes);
+            if let Ok(cstr) = CString::new(kv) {
                 env_c.push(cstr);
             }
         }

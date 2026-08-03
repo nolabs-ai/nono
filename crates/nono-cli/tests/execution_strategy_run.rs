@@ -39,15 +39,20 @@ fn setup_isolated_home(prefix: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {
     (tmp, home, workspace)
 }
 
-fn run_nono(args: &[&str], home: &Path, cwd: &Path) -> Output {
-    nono_bin()
-        .args(args)
+fn nono_cmd(args: &[&str], home: &Path, cwd: &Path) -> Command {
+    let mut cmd = nono_bin();
+    cmd.args(args)
         .env("HOME", home)
         .env("XDG_CONFIG_HOME", home.join(".config"))
         .env("XDG_STATE_HOME", home.join(".local").join("state"))
         .env("NONO_NO_SAVE_PROMPT", "1")
         .env_remove("NONO_DETACHED_LAUNCH")
-        .current_dir(cwd)
+        .current_dir(cwd);
+    cmd
+}
+
+fn run_nono(args: &[&str], home: &Path, cwd: &Path) -> Output {
+    nono_cmd(args, home, cwd)
         .output()
         .expect("failed to run nono")
 }
@@ -569,5 +574,133 @@ fn command_policies_allows_compiled_binary_exec_in_writable_grant_dir() {
     assert!(
         stdout.contains("ok"),
         "expected binary output in stdout\nstdout: {stdout}\nstderr: {stderr}",
+    );
+}
+
+/// A granted project directory to hand the child via `--workdir`, plus a launch
+/// directory that is deliberately outside the capability set.
+struct WorkdirCase {
+    _tmp: tempfile::TempDir,
+    home: PathBuf,
+    profile: PathBuf,
+    launch: PathBuf,
+    project: PathBuf,
+}
+
+fn setup_workdir_case(prefix: &str) -> WorkdirCase {
+    let (tmp, home, workspace) = setup_isolated_home(prefix);
+    let launch = tmp.path().join("launch");
+    fs::create_dir_all(&launch).expect("create launch dir");
+
+    let profile = write_profile(
+        &home,
+        prefix,
+        &format!(
+            r#"{{
+                "meta": {{ "name": "{prefix}-test" }},
+                "filesystem": {{ "allow": ["{workspace}"] }},
+                "network": {{ "block": true }}
+            }}"#,
+            workspace = workspace.display()
+        ),
+    );
+
+    WorkdirCase {
+        _tmp: tmp,
+        home,
+        profile,
+        launch,
+        project: workspace,
+    }
+}
+
+/// The child's own `$PWD`, as reported by `/usr/bin/env`.
+fn child_pwd(stdout: &str) -> Option<&str> {
+    stdout.lines().find_map(|line| line.strip_prefix("PWD="))
+}
+
+/// Run `nono <subcommand> --workdir <project>` from the uncovered launch directory,
+/// exporting `host_pwd` as the inherited `$PWD`.
+fn run_workdir_case(case: &WorkdirCase, subcommand: &str, host_pwd: &Path) -> Output {
+    let mut args = vec![
+        subcommand,
+        "--profile",
+        case.profile.to_str().expect("profile path"),
+    ];
+    if subcommand == "run" {
+        args.push("--no-rollback");
+    }
+    args.extend([
+        "--workdir",
+        case.project.to_str().expect("project path"),
+        "--",
+        "/usr/bin/env",
+    ]);
+
+    nono_cmd(&args, &case.home, &case.launch)
+        .env("PWD", host_pwd)
+        .output()
+        .expect("failed to run nono")
+}
+
+/// `--workdir` must reach the child's `$PWD` even though nono was launched from a
+/// directory outside the capability set.
+#[test]
+fn direct_workdir_sets_child_pwd_from_uncovered_launch_dir() {
+    let case = setup_workdir_case("workdir-pwd-direct");
+    let output = run_workdir_case(&case, "wrap", &case.launch);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(
+        child_pwd(&stdout),
+        case.project.to_str(),
+        "nono wrap --workdir must set the child's $PWD to the workdir\nstdout: {stdout}\nstderr: {stderr}",
+    );
+}
+
+#[test]
+fn supervised_workdir_sets_child_pwd_from_uncovered_launch_dir() {
+    let case = setup_workdir_case("workdir-pwd-supervised");
+    let output = run_workdir_case(&case, "run", &case.launch);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(
+        child_pwd(&stdout),
+        case.project.to_str(),
+        "nono run --workdir must set the child's $PWD to the workdir\nstdout: {stdout}\nstderr: {stderr}",
+    );
+}
+
+#[test]
+fn direct_workdir_overrides_untrusted_host_pwd() {
+    let case = setup_workdir_case("workdir-pwd-stale-direct");
+    let output = run_workdir_case(&case, "wrap", &case.home);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(
+        child_pwd(&stdout),
+        case.project.to_str(),
+        "a stale inherited $PWD must not suppress the correction\nstdout: {stdout}\nstderr: {stderr}",
+    );
+}
+
+#[test]
+fn supervised_workdir_overrides_untrusted_host_pwd() {
+    let case = setup_workdir_case("workdir-pwd-stale-supervised");
+    let output = run_workdir_case(&case, "run", &case.home);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(
+        child_pwd(&stdout),
+        case.project.to_str(),
+        "a stale inherited $PWD must not suppress the correction\nstdout: {stdout}\nstderr: {stderr}",
     );
 }

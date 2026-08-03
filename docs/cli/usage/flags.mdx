@@ -829,6 +829,8 @@ Working directory for `$WORKDIR` expansion in profiles (defaults to current dire
 nono run --profile always-further/claude --workdir ./my-project -- claude
 ```
 
+It also sets the directory the sandboxed process starts in, but only when the capability set covers that directory; otherwise the process starts in `/`. Whenever the directory the child starts in differs from the one nono was launched in — with or without this flag — the child's `$PWD` and `$OLDPWD` are rewritten to describe where it actually is. See [Environment Variable Filtering](/cli/features/environment).
+
 #### `--allow-cwd`
 
 Allow access to the current working directory without prompting. By default, nono prompts interactively for CWD sharing. The access level is determined by the profile's `[workdir]` config or defaults to read-only.

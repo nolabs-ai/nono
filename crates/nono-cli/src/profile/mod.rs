@@ -3382,7 +3382,8 @@ fn load_base_profile_raw(
     // 1. User profiles take precedence.
     let profile_path = resolve_user_profile_path(name)?;
     if profile_path.exists() {
-        return Ok(ResolvedBase::Global(parse_profile_file(&profile_path)?));
+        let (profile, source_path) = parse_file_backed_profile(&profile_path)?;
+        return Ok(ResolvedBase::Sibling(profile, source_path));
     }
 
     // 2. Pack-store: any installed pack with a matching `install_as`.
@@ -4623,6 +4624,81 @@ mod tests {
                 "/tmp/cli-b".to_string(),
                 "/tmp/json-base".to_string(),
                 "/tmp/child".to_string(),
+            ]
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_cli_extends_preserves_global_file_source_context()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let dir = tempdir()?;
+        let config_dir = dir.path().join("config");
+        let profiles_dir = config_dir.join("nono").join("profiles");
+        let referent_dir = dir.path().join("referent");
+        let selected_dir = dir.path().join("selected");
+        std::fs::create_dir_all(&profiles_dir)?;
+        std::fs::create_dir_all(&referent_dir)?;
+        std::fs::create_dir_all(&selected_dir)?;
+        let config_dir_string = config_dir.to_string_lossy().into_owned();
+        let _env = crate::test_env::EnvVarGuard::set_all(&[(
+            "XDG_CONFIG_HOME",
+            config_dir_string.as_str(),
+        )]);
+
+        std::fs::write(
+            referent_dir.join("referent-base.json"),
+            r#"{
+                "meta": { "name": "referent-base" },
+                "filesystem": { "read": ["/tmp/referent-base"] }
+            }"#,
+        )?;
+        std::fs::write(
+            referent_dir.join("linked-parent.json"),
+            r#"{
+                "extends": "referent-base",
+                "meta": { "name": "linked-parent" }
+            }"#,
+        )?;
+        std::os::unix::fs::symlink(
+            referent_dir.join("linked-parent.json"),
+            profiles_dir.join("linked-parent.json"),
+        )?;
+        std::fs::write(
+            profiles_dir.join("user-layer.json"),
+            r#"{
+                "extends": "linked-parent",
+                "meta": { "name": "user-layer" },
+                "filesystem": { "read": ["/tmp/user-layer"] }
+            }"#,
+        )?;
+        let selected_path = selected_dir.join("selected.json");
+        std::fs::write(
+            &selected_path,
+            r#"{
+                "meta": { "name": "selected" },
+                "filesystem": { "read": ["/tmp/selected"] }
+            }"#,
+        )?;
+
+        let profile = load_profile_with_extends(
+            selected_path
+                .to_str()
+                .ok_or("selected path is not valid UTF-8")?,
+            &["user-layer".to_string()],
+        )?;
+
+        assert_eq!(
+            profile.filesystem.read,
+            vec![
+                "/tmp/referent-base".to_string(),
+                "/tmp/user-layer".to_string(),
+                "/tmp/selected".to_string(),
             ]
         );
         Ok(())

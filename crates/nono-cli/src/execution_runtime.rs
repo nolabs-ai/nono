@@ -137,6 +137,52 @@ pub(crate) fn execution_start_dir(
     }
 }
 
+/// A child's `$PWD` that differs from the parent's.
+fn child_pwd_for(
+    spelt: &std::path::Path,
+    requested_canonical: &std::path::Path,
+    start_dir: &std::path::Path,
+    launch_cwd: Option<&std::path::Path>,
+) -> Option<std::path::PathBuf> {
+    // `launch_cwd` comes from `getcwd`, so it is the resolved spelling of the
+    // invoking shell's logical `$PWD`.
+    if launch_cwd == Some(start_dir) {
+        return None;
+    }
+    if requested_canonical == start_dir
+        && let Some(logical) = logical_workdir(spelt, launch_cwd)
+    {
+        return Some(logical);
+    }
+    Some(start_dir.to_path_buf())
+}
+
+/// The `--workdir` spelling as an absolute path, with symlinks left unresolved.
+///
+/// A relative spelling is anchored to the launch directory the same way
+/// [`crate::sandbox_prepare`]'s `resolved_workdir` anchors one, so `--workdir ./link`
+/// and `--workdir /abs/cwd/link` reach the child as the same `$PWD`. Symlinks in the
+/// spelling survive, as a shell's logical `$PWD` does; `..` cannot be normalised away
+/// without resolving them, so such a spelling is discarded in favour of the directory
+/// the child actually starts in.
+fn logical_workdir(
+    spelt: &std::path::Path,
+    launch_cwd: Option<&std::path::Path>,
+) -> Option<std::path::PathBuf> {
+    let absolute = if spelt.is_absolute() {
+        spelt.to_path_buf()
+    } else {
+        launch_cwd?.join(spelt)
+    };
+    if absolute
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return None;
+    }
+    Some(absolute.components().collect())
+}
+
 fn recommended_builtin_profile(program: &Path) -> Option<&'static str> {
     let name = program.file_name()?.to_str()?;
     match name {
@@ -344,6 +390,14 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
     } else {
         execution_start_dir(&flags.workdir, &caps)?
     };
+    let launch_cwd = std::env::current_dir().ok();
+    let child_pwd = child_pwd_for(
+        &flags.workdir,
+        &requested_workdir,
+        &current_dir,
+        launch_cwd.as_deref(),
+    );
+    let host_pwd = exec_strategy::env_sanitization::host_pwd_before_sandbox(launch_cwd.as_deref());
     #[cfg(target_os = "linux")]
     let tool_sandbox_runtime = if let Some(command_policies) = flags
         .command_policies
@@ -611,6 +665,8 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         env_vars,
         cap_file: &cap_file_path,
         current_dir: &current_dir,
+        child_pwd: child_pwd.as_deref(),
+        host_pwd: host_pwd.as_deref(),
         no_diagnostics: flags.no_diagnostics || flags.silent,
         diagnostics_json: flags.diagnostics_json,
         proxy_diagnostics: proxy_handle.as_ref().and_then(|handle| {
@@ -786,12 +842,153 @@ fn write_capability_state_file(
 #[cfg(test)]
 mod tests {
     use super::{
-        compute_executable_identity, recommended_builtin_profile,
+        child_pwd_for, compute_executable_identity, recommended_builtin_profile,
         validate_command_policy_execution_support,
     };
     use sha2::{Digest, Sha256};
     use std::fs;
     use std::path::Path;
+
+    #[test]
+    fn child_pwd_for_relative_workdir_is_absolute() {
+        // `--workdir ./my-project`: the spelling reaches us unresolved, so
+        // preferring it verbatim would hand the child a relative `$PWD`.
+        let pwd = child_pwd_for(
+            Path::new("./my-project"),
+            Path::new("/abs/cwd/my-project"),
+            Path::new("/abs/cwd/my-project"),
+            Some(Path::new("/abs/cwd")),
+        );
+        assert_eq!(pwd.as_deref(), Some(Path::new("/abs/cwd/my-project")));
+    }
+
+    #[test]
+    fn child_pwd_for_spells_relative_and_absolute_workdirs_alike() {
+        // `/abs/cwd/link` resolves elsewhere, so both spellings of the same
+        // directory must reach the child as the logical path, not the resolved
+        // one. Anchoring the relative spelling to the launch dir is what keeps
+        // the two forms from disagreeing.
+        let canonical = Path::new("/private/tmp/real");
+        for spelt in ["./link", "link", "/abs/cwd/link"] {
+            let pwd = child_pwd_for(
+                Path::new(spelt),
+                canonical,
+                canonical,
+                Some(Path::new("/abs/cwd")),
+            );
+            assert_eq!(
+                pwd.as_deref(),
+                Some(Path::new("/abs/cwd/link")),
+                "spelling {spelt} should reach the child as /abs/cwd/link"
+            );
+        }
+    }
+
+    #[test]
+    fn child_pwd_for_falls_back_when_the_launch_dir_is_unknown() {
+        // `getcwd` failed, so a relative spelling cannot be anchored and the
+        // child is told where it actually starts.
+        let canonical = Path::new("/private/tmp/real");
+        assert_eq!(
+            child_pwd_for(Path::new("./link"), canonical, canonical, None).as_deref(),
+            Some(canonical)
+        );
+        // An absolute spelling needs no anchor, so it still survives.
+        assert_eq!(
+            child_pwd_for(Path::new("/tmp/link"), canonical, canonical, None).as_deref(),
+            Some(Path::new("/tmp/link"))
+        );
+    }
+
+    #[test]
+    fn child_pwd_for_keeps_absolute_spelling_of_symlinked_workdir() {
+        // `--workdir /tmp/link` where the link resolves elsewhere: keep the
+        // logical path, as a shell would.
+        let pwd = child_pwd_for(
+            Path::new("/tmp/link"),
+            Path::new("/private/tmp/real"),
+            Path::new("/private/tmp/real"),
+            Some(Path::new("/abs/cwd")),
+        );
+        assert_eq!(pwd.as_deref(), Some(Path::new("/tmp/link")));
+    }
+
+    #[test]
+    fn child_pwd_for_uses_start_dir_when_workdir_is_not_covered() {
+        // `execution_start_dir` fell back to `/` because the capability set does
+        // not cover the requested directory; `$PWD` must name where the child
+        // actually lands.
+        let pwd = child_pwd_for(
+            Path::new("/abs/cwd/my-project"),
+            Path::new("/abs/cwd/my-project"),
+            Path::new("/"),
+            Some(Path::new("/abs/cwd")),
+        );
+        assert_eq!(pwd.as_deref(), Some(Path::new("/")));
+    }
+
+    #[test]
+    fn child_pwd_for_leaves_env_alone_when_child_stays_in_launch_dir() {
+        let start = Path::new("/private/tmp/project");
+        assert_eq!(
+            child_pwd_for(start, start, start, Some(start)),
+            None,
+            "same directory, no rewrite"
+        );
+
+        assert_eq!(
+            child_pwd_for(Path::new("."), start, start, Some(start)),
+            None
+        );
+    }
+
+    #[test]
+    fn child_pwd_for_normalizes_noise_in_the_workdir_spelling() {
+        // `/tmp/link` resolves elsewhere, so the expected values differ from the
+        // start dir: each case can only pass by normalizing the spelling, not by
+        // falling back to the directory the child actually lands in.
+        let canonical = Path::new("/private/tmp/real");
+        let cases = [
+            ("/tmp/./link/", "/tmp/link"),
+            ("/tmp//link", "/tmp/link"),
+            ("/tmp/link/.", "/tmp/link"),
+        ];
+        for (spelt, expected) in cases {
+            let pwd = child_pwd_for(
+                Path::new(spelt),
+                canonical,
+                canonical,
+                Some(Path::new("/abs/cwd")),
+            );
+            assert_eq!(
+                pwd.as_deref().map(Path::as_os_str),
+                Some(std::ffi::OsStr::new(expected)),
+                "spelling {spelt} should reach the child as {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn child_pwd_for_discards_parent_dir_spelling() {
+        // `..` cannot be normalized away without resolving symlinks, so the
+        // spelling is dropped in favour of where the child actually starts —
+        // including when the `..` only appears once the relative spelling has
+        // been anchored to the launch dir.
+        let canonical = Path::new("/private/tmp/real");
+        for spelt in ["/tmp/other/../link", "../link", "./other/../link"] {
+            let pwd = child_pwd_for(
+                Path::new(spelt),
+                canonical,
+                canonical,
+                Some(Path::new("/abs/cwd")),
+            );
+            assert_eq!(
+                pwd.as_deref(),
+                Some(canonical),
+                "spelling {spelt} should not reach the child"
+            );
+        }
+    }
 
     #[test]
     fn recommended_builtin_profile_matches_known_agent_commands() {

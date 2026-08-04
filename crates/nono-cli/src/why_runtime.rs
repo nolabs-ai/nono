@@ -16,25 +16,17 @@ struct WhyContext {
 }
 
 /// Resolve the proxy domain allowlist from a profile's network config.
-fn resolve_allowed_domains(profile: &profile::Profile) -> Vec<String> {
+///
+/// Errors rather than degrading: a half-resolved allowlist answers wrongly in
+/// both directions, and `nono run` already refuses to start on these.
+fn resolve_allowed_domains(profile: &profile::Profile) -> Result<Vec<String>> {
     let policy_json = crate::config::embedded::embedded_network_policy_json();
-    let net_policy = match network_policy::load_network_policy(policy_json) {
-        Ok(p) => p,
-        Err(_) => {
-            return profile
-                .network
-                .allow_domain
-                .iter()
-                .map(|e| e.domain().to_string())
-                .collect();
-        }
-    };
+    let net_policy = network_policy::load_network_policy(policy_json)?;
 
     let mut domains = Vec::new();
 
-    if let Some(net_profile_name) = profile.network.resolved_network_profile()
-        && let Ok(resolved) = network_policy::resolve_network_profile(&net_policy, net_profile_name)
-    {
+    if let Some(net_profile_name) = profile.network.resolved_network_profile() {
+        let resolved = network_policy::resolve_network_profile(&net_policy, net_profile_name)?;
         domains.extend(resolved.hosts);
         for suffix in &resolved.suffixes {
             let wildcard = if suffix.starts_with('.') {
@@ -57,7 +49,7 @@ fn resolve_allowed_domains(profile: &profile::Profile) -> Vec<String> {
         &plain_entries,
     ));
 
-    domains
+    Ok(domains)
 }
 
 /// Extract domain endpoint restrictions from a profile's allow_domain entries.
@@ -171,7 +163,7 @@ pub(crate) fn run_why(args: WhyArgs) -> Result<()> {
             }
         }
 
-        let allowed_domains = resolve_allowed_domains(&profile);
+        let allowed_domains = resolve_allowed_domains(&profile)?;
         let domain_endpoints = resolve_domain_endpoints(&profile);
         let command_policies = profile.command_policies.clone();
 
@@ -638,6 +630,102 @@ mod tests {
         InvocationRuleConfig, PolicyDecision, PolicyDecisionConfig,
     };
     use std::collections::BTreeMap;
+
+    fn profile_from_json(json: &str) -> profile::Profile {
+        serde_json::from_str(json).expect("parse profile")
+    }
+
+    /// Query a host against a profile the same way `run_why --profile` does.
+    fn why_profile_host(json: &str, host: &str) -> query_ext::QueryResult {
+        let profile = profile_from_json(json);
+        let mut caps = CapabilitySet::new();
+        if profile.network.block {
+            caps.set_network_blocked(true);
+        }
+        query_ext::query_network(
+            host,
+            443,
+            &caps,
+            &resolve_allowed_domains(&profile).expect("resolve allowlist"),
+            &resolve_domain_endpoints(&profile),
+        )
+    }
+
+    fn reason_of(result: &query_ext::QueryResult) -> &str {
+        match result {
+            query_ext::QueryResult::Allowed { reason, .. }
+            | query_ext::QueryResult::Denied { reason, .. } => reason,
+            other => panic!("unexpected query result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn unknown_network_profile_is_an_error() {
+        let profile = profile_from_json(r#"{"network":{"network_profile":"no-such-profile"}}"#);
+        assert!(resolve_allowed_domains(&profile).is_err());
+    }
+
+    #[test]
+    fn profile_host_outside_allowlist_is_denied() {
+        let result = why_profile_host(
+            r#"{"network":{"allow_domain":["docs.rs"]}}"#,
+            "www.rfc-editor.org",
+        );
+        assert_eq!(reason_of(&result), "proxy_filtered");
+    }
+
+    #[test]
+    fn profile_host_in_allowlist_is_allowed() {
+        let result = why_profile_host(r#"{"network":{"allow_domain":["docs.rs"]}}"#, "docs.rs");
+        assert_eq!(reason_of(&result), "proxy_allowed");
+    }
+
+    /// Matching is exact, not subtree: an apex entry grants no subdomains.
+    #[test]
+    fn profile_plain_entry_does_not_grant_subdomains() {
+        let result = why_profile_host(
+            r#"{"network":{"allow_domain":["auth0.com"]}}"#,
+            "foo.auth0.com",
+        );
+        assert_eq!(reason_of(&result), "proxy_filtered");
+    }
+
+    /// `*.` grants subdomains only. The apex stays excluded.
+    #[test]
+    fn profile_wildcard_grants_subdomain_not_apex() {
+        let config = r#"{"network":{"allow_domain":["*.auth0c.com"]}}"#;
+        assert_eq!(
+            reason_of(&why_profile_host(config, "x.auth0c.com")),
+            "proxy_allowed"
+        );
+        assert_eq!(
+            reason_of(&why_profile_host(config, "auth0c.com")),
+            "proxy_filtered"
+        );
+    }
+
+    #[test]
+    fn known_network_profile_contributes_hosts() {
+        let profile = profile_from_json(r#"{"network":{"network_profile":"claude-code"}}"#);
+        let domains = resolve_allowed_domains(&profile).expect("resolve allowlist");
+        assert!(!domains.is_empty());
+    }
+
+    /// No proxy-activating feature means no proxy, so unrestricted is correct.
+    #[test]
+    fn profile_without_network_config_reports_allowed() {
+        let result = why_profile_host(r#"{}"#, "anything.example.com");
+        assert_eq!(reason_of(&result), "network_allowed");
+    }
+
+    #[test]
+    fn profile_proxy_denies_cloud_metadata() {
+        let result = why_profile_host(
+            r#"{"network":{"allow_domain":["169.254.169.254"]}}"#,
+            "169.254.169.254",
+        );
+        assert!(matches!(result, query_ext::QueryResult::Denied { .. }));
+    }
 
     fn gh_policy() -> CommandPoliciesConfig {
         CommandPoliciesConfig {

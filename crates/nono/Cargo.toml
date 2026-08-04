@@ -71,7 +71,7 @@ keyring = { version = "3", features = ["apple-native"], optional = true, default
 [build-dependencies]
 typify = "0.7"
 serde_json.workspace = true
-syn = "2"
+syn = "3"
 prettyplease = "0.3"
 
 [dev-dependencies]

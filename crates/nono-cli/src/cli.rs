@@ -33,7 +33,6 @@ const STYLES: Styles = Styles::plain().header(Style::new().bold());
   wrap       Apply sandbox and exec into command (nono disappears)
 
 \x1b[1mEXPLORATION & DEBUGGING\x1b[0m
-  learn      [deprecated] Use `nono run` to learn from sandbox denials
   why        Check why filesystem, network, scope, or command access would be allowed or denied
   proxy      Run the network filtering / credential proxy as a standalone server
 
@@ -181,34 +180,6 @@ pub enum Commands {
     Wrap(Box<WrapArgs>),
 
     // ── Exploration & debugging ─────────────────────────────────────────
-    /// [deprecated] Use `nono run` to learn from sandbox denials
-    /// DEPRECATED(canonical="nono run", introduced="v0.50.1", remove_by="v1.0.0", issue="#445")
-    #[command(trailing_var_arg = true)]
-    #[command(help_template = "\
-{about}
-
-\x1b[1mUSAGE\x1b[0m
-  nono learn [flags] <program>...
-
-{all-args}
-{after-help}")]
-    #[command(after_help = "\x1b[1mDEPRECATED\x1b[0m
-  Use `nono run --profile <name> -- <command>` instead. `nono run` keeps the
-  command sandboxed, reports denials, and offers to save profile updates.
-
-\x1b[1mEXAMPLES\x1b[0m
-  nono run --profile my-profile -- my-app      # Preferred learning workflow
-  nono learn --profile my-profile -- my-app    # Deprecated compatibility path
-  nono learn --json -- node server.js          # Output as JSON for profile
-  nono learn --timeout 30 -- my-app            # Limit trace duration
-
-\x1b[1mPLATFORM NOTES\x1b[0m
-  Linux   Uses strace (install with: apt install strace)
-  macOS   Prefer: nono run --profile <name> -- <command>
-          Legacy unsandboxed fs_usage/nettop tracing: nono learn --trace -- <command>
-")]
-    Learn(Box<LearnArgs>),
-
     /// Check why filesystem, network, scope, or command access would be allowed or denied
     #[command(help_template = "\
 {about}
@@ -2295,55 +2266,6 @@ pub struct WhyArgs {
     pub help: Option<bool>,
 }
 
-#[derive(Parser, Debug)]
-#[command(disable_help_flag = true)]
-pub struct LearnArgs {
-    /// Use a named profile to compare against (shows only missing paths)
-    #[arg(long, short = 'p', value_name = "NAME", help_heading = "OPTIONS")]
-    pub profile: Option<String>,
-
-    /// Extend the selected profile with an additional base profile for this comparison
-    #[arg(
-        long,
-        value_name = "PROFILE",
-        requires = "profile",
-        help_heading = "OPTIONS"
-    )]
-    pub extends: Vec<String>,
-
-    /// Output discovered paths as JSON fragment for profile
-    #[arg(long, help_heading = "OPTIONS")]
-    pub json: bool,
-
-    /// Timeout in seconds (default: run until command exits)
-    #[arg(long, value_name = "SECS", help_heading = "OPTIONS")]
-    pub timeout: Option<u64>,
-
-    /// Show all accessed paths, not just those that would be blocked
-    #[arg(long, help_heading = "OPTIONS")]
-    pub all: bool,
-
-    /// Skip reverse DNS lookups for discovered IPs
-    #[arg(long, help_heading = "OPTIONS")]
-    pub no_rdns: bool,
-
-    /// On macOS, use legacy unsandboxed fs_usage/nettop tracing
-    #[arg(long, help_heading = "OPTIONS")]
-    pub trace: bool,
-
-    /// Enable verbose output
-    #[arg(long, short = 'v', action = clap::ArgAction::Count, help_heading = "OPTIONS")]
-    pub verbose: u8,
-
-    /// Command to trace
-    #[arg(required = true, hide = true)]
-    pub command: Vec<OsString>,
-
-    /// Print help
-    #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
-    pub help: Option<bool>,
-}
-
 /// Operation type for why command
 #[derive(Clone, Debug, ValueEnum)]
 pub enum WhyOp {
@@ -3219,7 +3141,7 @@ mod tests {
     }
 
     #[test]
-    fn test_why_and_learn_extends_parse() {
+    fn test_why_extends_parse() {
         let cli = Cli::parse_from([
             "nono",
             "why",
@@ -3233,20 +3155,6 @@ mod tests {
         match cli.command {
             Commands::Why(args) => assert_eq!(args.extends, vec!["base".to_string()]),
             _ => panic!("Expected Why command"),
-        }
-
-        let cli = Cli::parse_from([
-            "nono",
-            "learn",
-            "--profile",
-            "agent",
-            "--extends",
-            "base",
-            "echo",
-        ]);
-        match cli.command {
-            Commands::Learn(args) => assert_eq!(args.extends, vec!["base".to_string()]),
-            _ => panic!("Expected Learn command"),
         }
     }
 
@@ -4508,7 +4416,6 @@ mod tests {
         "run",
         "shell",
         "wrap",
-        "learn",
         "why",
         "proxy",
         "ps",

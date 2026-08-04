@@ -52,17 +52,6 @@ pub const STOP_POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// Poll interval when tailing a log file and the reader reaches EOF.
 pub const LOG_TAIL_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
-// learn
-
-/// Delay after spawning `fs_usage` to let it attach the kernel trace
-/// facility before the child command starts (macOS).
-#[cfg(target_os = "macos")]
-pub const FS_USAGE_SETTLE_TIME: Duration = Duration::from_secs(2);
-
-/// Grace period after SIGTERM before escalating to SIGKILL (learn mode).
-#[cfg(target_os = "macos")]
-pub const SIGTERM_GRACE_PERIOD: Duration = Duration::from_secs(3);
-
 // Configurable user-facing timeouts
 
 /// Read `NONO_DETACH_STARTUP_TIMEOUT` (seconds). Returns the default when

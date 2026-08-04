@@ -219,11 +219,7 @@ impl ResolvedToolSandboxPlan {
                 crate::command_policy::resolve_policy_command_binaries(config, path_env.clone())?
             }
         };
-        for w in &resolved.warnings {
-            if w.code == "command_not_found" {
-                eprintln!("  [nono] Warning: {}", w.message);
-            }
-        }
+        crate::command_policy::print_command_not_found_summary(&resolved.warnings);
         // Validate PATH/configured executable directories before using them
         // for deny-only resolution and the outer executable identity gate.
         // The gate allows non-controlled executables while excluding

@@ -162,7 +162,6 @@ SUITES=(
     "test_audit.sh:Audit Trail"
     "test_rollback.sh:Rollback"
     "test_setup.sh:Setup"
-    "test_learn.sh:Learn Mode"
     "test_bypass_protection.sh:Bypass Protection"
 )
 

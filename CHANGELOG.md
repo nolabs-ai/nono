@@ -1,5 +1,53 @@
 # Changelog
 
+## [0.71.0] - 2026-07-31
+
+### Bug Fixes
+
+- *(query)* Dont widen grant suggestions to $HOME or XDG roots (#1541) ([#1541](https://github.com/nolabs-ai/nono/pull/1541))
+
+- *(tool-sandbox)* Collapse command-not-found warnings into one summary line (#1550) ([#1550](https://github.com/nolabs-ai/nono/pull/1550))
+
+- *(deps)* Bump aws-lc-rs to 1.17.3 for hardened RPM builds (#1544) ([#1544](https://github.com/nolabs-ai/nono/pull/1544))
+
+- *(audit)* Record and show seccomp capability decisions (#1525) ([#1525](https://github.com/nolabs-ai/nono/pull/1525))
+
+- *(macos)* Group-sourced keychain caps must not bypass deny_keychains_macos (#1539) ([#1539](https://github.com/nolabs-ai/nono/pull/1539))
+
+- *(profile)* Resolve symlinked parent extends (#1536) ([#1536](https://github.com/nolabs-ai/nono/pull/1536))
+
+- *(profile)* Child overrides base in env_credentials by destination env var (#1533) ([#1533](https://github.com/nolabs-ai/nono/pull/1533))
+
+- Allow non-UTF-8 command line arguments (#1521) ([#1521](https://github.com/nolabs-ai/nono/pull/1521))
+
+- *(profile)* Include all Unix socket grant fields in JSON output (#1516) ([#1516](https://github.com/nolabs-ai/nono/pull/1516))
+
+
+### Dependencies
+
+- *(deps)* Bump x509-cert from 0.2.5 to 0.3.0 (#1462) ([#1462](https://github.com/nolabs-ai/nono/pull/1462))
+
+
+### Documentation
+
+- Add git_config paths and document --format manifest for profile show (#1545) ([#1545](https://github.com/nolabs-ai/nono/pull/1545))
+
+- *(supervisor)* Clarify that capability elevation is disabled by default (#1540) ([#1540](https://github.com/nolabs-ai/nono/pull/1540))
+
+- Fix examples that used /tmp as a blocked path on Linux (#1531) ([#1531](https://github.com/nolabs-ai/nono/pull/1531))
+
+- *(profile)* Add profile-drafts section to guide (#1530) ([#1530](https://github.com/nolabs-ai/nono/pull/1530))
+
+
+### Features
+
+- *(cli)* Add platform enrollment and audit delivery (#1538) ([#1538](https://github.com/nolabs-ai/nono/pull/1538))
+
+
+### Miscellaneous
+
+- Remove deprecated nono learn command (#1543) ([#1543](https://github.com/nolabs-ai/nono/pull/1543))
+
 ## [0.70.0] - 2026-07-27
 
 ### Bug Fixes

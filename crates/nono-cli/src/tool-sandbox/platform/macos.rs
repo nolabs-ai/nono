@@ -210,11 +210,7 @@ impl ResolvedToolSandboxPlan {
                 crate::command_policy::resolve_policy_command_binaries(config, path_env.clone())?
             }
         };
-        for w in &resolved.warnings {
-            if w.code == "command_not_found" {
-                eprintln!("  [nono] Warning: {}", w.message);
-            }
-        }
+        crate::command_policy::print_command_not_found_summary(&resolved.warnings);
         let exec_helpers = crate::command_policy::resolve_policy_exec_helpers(config)?;
         validate_controlled_exec_helper_immutability(config, &exec_helpers, outer_caps)?;
         let daemon_pid_source_helpers =

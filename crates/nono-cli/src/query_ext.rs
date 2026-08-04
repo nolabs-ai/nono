@@ -757,8 +757,8 @@ pub(crate) fn suggested_flag_parts(path: &Path, requested: AccessMode) -> (&'sta
     let target = if path.exists() || path.is_dir() || path.parent().is_none() {
         path.to_path_buf()
     } else if let Some(parent) = path.parent() {
-        // Never suggest granting access to the root filesystem
-        if parent == Path::new("/") {
+        if is_sensitive_root(parent) {
+            // Never widen to a sensitive top-level directory; suggest the exact path instead.
             path.to_path_buf()
         } else {
             parent.to_path_buf()
@@ -767,7 +767,80 @@ pub(crate) fn suggested_flag_parts(path: &Path, requested: AccessMode) -> (&'sta
         path.to_path_buf()
     };
 
+    // When the target is an exact file path (not widened to a directory), use
+    // file-specific flags regardless of whether the file currently exists.
+    let flag = if target == path && !path.is_dir() {
+        match requested {
+            AccessMode::Read => "--read-file",
+            AccessMode::Write => "--write-file",
+            AccessMode::ReadWrite => "--allow-file",
+        }
+    } else {
+        flag
+    };
+
     (flag, target)
+}
+
+/// Returns true for directories that should never be used as a widened grant target:
+/// the filesystem root, the user's home directory, and XDG base directories.
+///
+/// All candidate roots are canonicalized before comparison so that symlinked home
+/// directories (e.g. macOS `/Users/foo` → `/private/Users/foo`) match the
+/// canonicalized `path` that arrives from `suggested_flag_parts`.
+pub(crate) fn is_sensitive_root(path: &Path) -> bool {
+    if path == Path::new("/") {
+        return true;
+    }
+
+    if let Some(home) = dirs::home_dir()
+        && try_canonicalize(&home) == path
+    {
+        return true;
+    }
+
+    // XDG base directories (use env vars with standard defaults).
+    let home = dirs::home_dir();
+    let xdg_roots: Vec<PathBuf> = [
+        std::env::var("XDG_CONFIG_HOME")
+            .ok()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                home.as_deref()
+                    .map(|h| h.join(".config"))
+                    .unwrap_or_default()
+            }),
+        std::env::var("XDG_DATA_HOME")
+            .ok()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                home.as_deref()
+                    .map(|h| h.join(".local/share"))
+                    .unwrap_or_default()
+            }),
+        std::env::var("XDG_STATE_HOME")
+            .ok()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                home.as_deref()
+                    .map(|h| h.join(".local/state"))
+                    .unwrap_or_default()
+            }),
+        std::env::var("XDG_CACHE_HOME")
+            .ok()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                home.as_deref()
+                    .map(|h| h.join(".cache"))
+                    .unwrap_or_default()
+            }),
+    ]
+    .into_iter()
+    .filter(|p| !p.as_os_str().is_empty())
+    .map(|p| try_canonicalize(&p))
+    .collect();
+
+    xdg_roots.iter().any(|root| path == root)
 }
 
 #[cfg(test)]
@@ -1229,5 +1302,55 @@ mod tests {
     #[test]
     fn test_path_matches_empty_rules_allows_all() {
         assert!(path_matches_endpoint_rules("/any/path", &[]));
+    }
+
+    // suggested_flag_parts: non-existent file directly under $HOME must not widen to ~/
+    #[test]
+    fn test_suggested_flag_parts_home_dir_file() {
+        let home = dirs::home_dir().expect("home dir required for this test");
+        let nonexistent = home.join("nono-blocked.txt");
+        // File must not exist for the widening path to be triggered.
+        assert!(!nonexistent.exists());
+
+        let (flag, target) = suggested_flag_parts(&nonexistent, AccessMode::Write);
+        assert_eq!(
+            flag, "--write-file",
+            "should suggest a file grant, not a directory grant"
+        );
+        assert_eq!(
+            target, nonexistent,
+            "should not widen to the home directory"
+        );
+    }
+
+    // suggested_flag_parts: non-existent file under XDG_CONFIG_HOME must not widen to that root
+    #[test]
+    fn test_suggested_flag_parts_xdg_config_home_file() {
+        let home = dirs::home_dir().expect("home dir required for this test");
+        let xdg_config = std::env::var("XDG_CONFIG_HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| home.join(".config"));
+        let nonexistent = xdg_config.join("nono-blocked.txt");
+        assert!(!nonexistent.exists());
+
+        let (flag, target) = suggested_flag_parts(&nonexistent, AccessMode::Write);
+        assert_eq!(flag, "--write-file");
+        assert_eq!(target, nonexistent, "should not widen to XDG_CONFIG_HOME");
+    }
+
+    // suggested_flag_parts: non-existent file under a nested project subdir should still widen
+    // to the parent (this is the intentional behavior we must not regress).
+    #[test]
+    fn test_suggested_flag_parts_nested_subdir_widens() {
+        // Use a temp dir that is guaranteed to exist so we get a real parent, but the
+        // file inside it does not exist.
+        let dir = tempdir().expect("tempdir");
+        let nonexistent = dir.path().join("dist").join("bundle.js");
+        assert!(!nonexistent.exists());
+
+        let (flag, target) = suggested_flag_parts(&nonexistent, AccessMode::Write);
+        // The parent "dist" doesn't exist either, so it widens to it — that is correct.
+        assert_eq!(flag, "--write");
+        assert_eq!(target, dir.path().join("dist"));
     }
 }

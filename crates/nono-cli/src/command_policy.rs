@@ -47,6 +47,35 @@ impl CommandPolicyFinding {
     }
 }
 
+/// Extracts the command name from a `command_not_found` finding's message
+/// (`"command policy '<name>' could not be resolved on PATH; skipping"`) by
+/// taking the text between the first pair of single quotes.
+fn command_not_found_name(message: &str) -> Option<&str> {
+    message.split('\'').nth(1)
+}
+
+/// Prints one collapsed summary line for all `command_not_found` warnings
+/// instead of one `eprintln!` per unresolved command. Most machines are
+/// missing only a handful of the many optional tools listed across the
+/// unified profile's `command_policies`, and a line-per-miss floods stderr
+/// on every launch (shadowfax#570). A no-op when there are no such warnings.
+pub(crate) fn print_command_not_found_summary(warnings: &[CommandPolicyFinding]) {
+    let names: Vec<&str> = warnings
+        .iter()
+        .filter(|w| w.code == "command_not_found")
+        .filter_map(|w| command_not_found_name(&w.message))
+        .collect();
+    if names.is_empty() {
+        return;
+    }
+    eprintln!(
+        "  [nono] Warning: {} command polic{} not found on PATH, skipping: {}",
+        names.len(),
+        if names.len() == 1 { "y" } else { "ies" },
+        names.join(", ")
+    );
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct CommandPolicyValidationReport {
     pub activation: CommandPolicyActivation,
@@ -3315,6 +3344,34 @@ mod tests {
         let mut permissions = fs::metadata(path).expect("stat executable").permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(path, permissions).expect("make executable");
+    }
+
+    #[test]
+    fn command_not_found_name_extracts_quoted_command() {
+        assert_eq!(
+            command_not_found_name(
+                "command policy 'data-sniffer' could not be resolved on PATH; skipping"
+            ),
+            Some("data-sniffer")
+        );
+        assert_eq!(command_not_found_name("no quotes here"), None);
+    }
+
+    #[test]
+    fn print_command_not_found_summary_ignores_non_matching_codes() {
+        let warnings = [
+            CommandPolicyFinding::new(
+                "command_not_found",
+                "command policy 'glab' could not be resolved on PATH; skipping",
+            ),
+            CommandPolicyFinding::new("script_entrypoint", "unrelated finding"),
+        ];
+        let names: Vec<&str> = warnings
+            .iter()
+            .filter(|w| w.code == "command_not_found")
+            .filter_map(|w| command_not_found_name(&w.message))
+            .collect();
+        assert_eq!(names, vec!["glab"]);
     }
 
     #[test]

@@ -122,14 +122,6 @@ nono why --scope <SCOPE> [OPTIONS]
 nono why --self --path <PATH> --op <OP> [OPTIONS]  # Inside sandbox
 ```
 
-### `nono learn`
-
-Discover required filesystem paths and network activity. On Linux, `nono learn` uses `strace`. On macOS, use `nono run --profile <name> -- <command>` for sandboxed profile learning; legacy unsandboxed tracing is available with `nono learn --trace`.
-
-```bash
-nono learn [OPTIONS] -- <COMMAND> [ARGS...]
-```
-
 ### `nono setup`
 
 Set up nono on this system. Verifies installation, tests sandbox support, and optionally generates example profiles.
@@ -174,68 +166,6 @@ Subcommands:
 - `list` - List files and their verification status
 - `keygen` - Generate a new signing key pair
 - `export-key` - Export the public key for a signing key
-
-## `nono learn` Options
-
-<Note>
-  On Linux, `nono learn` runs WITHOUT sandbox restrictions using `strace` (install with `apt install strace`). On macOS, profile learning happens through sandboxed `nono run`; use `nono learn --trace` only when you explicitly want the legacy unsandboxed `fs_usage` + `nettop` tracer.
-</Note>
-
-### `--profile`, `-p`
-
-Compare against an existing profile to show only missing paths.
-
-```bash
-nono learn --profile always-further/opencode -- opencode
-```
-
-### `--extends`
-
-Compose the selected `--profile` with an additional base profile for this comparison. Repeatable; bases are applied left-to-right before any `extends` already declared by the selected profile. Requires `--profile`.
-
-```bash
-nono learn --profile my-agent --extends linux-host-compat -- my-agent
-```
-
-### `--json`
-
-Output discovered paths as a JSON fragment suitable for a profile.
-
-```bash
-nono learn --json -- my-app > paths.json
-```
-
-### `--timeout`
-
-Limit trace duration in seconds.
-
-```bash
-nono learn --timeout 30 -- my-long-running-app
-```
-
-### `--all`
-
-Show all accessed paths, not just those that would be blocked by the sandbox.
-
-```bash
-nono learn --all -- my-app
-```
-
-### `--trace`
-
-On macOS, use the legacy unsandboxed `fs_usage` + `nettop` tracer.
-
-```bash
-nono learn --trace -- my-app
-```
-
-### `--verbose`, `-v`
-
-Enable verbose output. Can be specified multiple times.
-
-```bash
-nono learn -vv -- my-app
-```
 
 ## `nono run` Options
 

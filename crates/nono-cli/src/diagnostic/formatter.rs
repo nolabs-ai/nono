@@ -1391,7 +1391,7 @@ impl<'a> DiagnosticFormatter<'a> {
             };
             match remediation {
                 NonoRemediation::RunDiscovery => {
-                    if let Some(command) = self.format_command_for_learn() {
+                    if let Some(command) = self.format_command_for_run() {
                         lines.push(format!(
                             "[nono]   Add permissions: nono run --allow <path> -- {}",
                             command
@@ -1894,7 +1894,7 @@ impl<'a> DiagnosticFormatter<'a> {
         }
     }
 
-    fn format_command_for_learn(&self) -> Option<String> {
+    fn format_command_for_run(&self) -> Option<String> {
         let command = self.command.as_ref()?;
         if command.args.is_empty() {
             return None;

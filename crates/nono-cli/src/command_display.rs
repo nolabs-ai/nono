@@ -2,10 +2,9 @@
 //!
 //! Commands passed to `nono` (e.g. after `--`) preserve each argument
 //! separately, as an `OsString` on the execution path. When we echo those
-//! commands back to the user — in the `nono learn` "Run with:" hint, the dry-run
-//! banner, `nono ps` details, audit/rollback listings — we want the rendered
-//! line to round-trip: a user copy-pasting it into a shell must execute the
-//! exact same argv that was learned or recorded.
+//! commands back to the user — in the dry-run banner, `nono ps` details,
+//! audit/rollback listings — we want the rendered line to round-trip: a user
+//! copy-pasting it into a shell must execute the exact same argv that was recorded.
 //!
 //! A naive `command.join(" ")` breaks that contract as soon as any argument
 //! contains whitespace, quotes, `$`, backslashes, etc. `echo 'foo bar' baz`
@@ -145,7 +144,7 @@ mod tests {
 
     #[test]
     fn issue_660_repro() {
-        // From issue #660: `nono learn -- echo 'foo bar' 'baz'` must not
+        // From issue #660: `nono run -- echo 'foo bar' 'baz'` must not
         // render as `echo foo bar baz`.
         let rendered =
             format_command_line(&["echo".to_string(), "foo bar".to_string(), "baz".to_string()]);

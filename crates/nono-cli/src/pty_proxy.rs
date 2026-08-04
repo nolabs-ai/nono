@@ -739,6 +739,37 @@ impl PtyProxy {
         MasterProxyOutcome::Data
     }
 
+    /// Relay one immediately ready child-output chunk before a parent prompt.
+    ///
+    /// A zero-timeout readiness check keeps approval prompts responsive. Reading
+    /// only one chunk prevents a continuously writing child from delaying them.
+    fn relay_ready_master_output_once(&mut self) {
+        let mut pfd = libc::pollfd {
+            fd: self.master.as_raw_fd(),
+            events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
+            revents: 0,
+        };
+
+        // SAFETY: `pfd` points to one initialized pollfd that borrows the PTY
+        // master fd for this synchronous, zero-timeout readiness check.
+        let ret = unsafe { libc::poll(&mut pfd, 1, 0) };
+        if ret <= 0 {
+            if ret < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() != std::io::ErrorKind::Interrupted {
+                    debug!("PTY proxy: prompt relay poll failed: {}", err);
+                }
+            }
+            return;
+        }
+
+        if pfd.revents & libc::POLLNVAL == 0
+            && pfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0
+        {
+            let _ = self.proxy_master_to_client_once();
+        }
+    }
+
     /// Drain child output still queued on the PTY master after the child exits.
     ///
     /// `waitpid` can report the child exit before the supervisor has relayed the
@@ -859,20 +890,45 @@ impl PtyProxy {
 
     /// Temporarily restore the local terminal so the parent can prompt.
     ///
+    /// Child output must be relayed before the parent writes its prompt; otherwise
+    /// the two terminal writers can appear in the wrong order. The parent output
+    /// area is then normalized explicitly because restoring termios does not move
+    /// the cursor or clear a partial line.
+    ///
     /// Returns true when a terminal-backed client was paused and must later
     /// be resumed with [`Self::resume_terminal_after_prompt`].
     pub fn pause_terminal_for_prompt(&mut self) -> bool {
-        if self
+        if !self
             .client
             .as_ref()
             .is_some_and(AttachedClient::is_terminal)
         {
-            leave_attach_screen(self.screen.alternate_screen_active());
-            self.restore_terminal();
-            true
-        } else {
-            false
+            return false;
         }
+
+        self.relay_ready_master_output_once();
+
+        // A failed terminal write may detach the client while draining output.
+        // Do not claim that the terminal was paused in that case.
+        if !self
+            .client
+            .as_ref()
+            .is_some_and(AttachedClient::is_terminal)
+        {
+            return false;
+        }
+
+        let in_alt_screen = self.screen.alternate_screen_active();
+        leave_attach_screen(in_alt_screen);
+        self.restore_terminal();
+        if !in_alt_screen {
+            let (_row, col) = self.screen.cursor_position();
+            if col > 0 {
+                let _ = write_all_fd(libc::STDOUT_FILENO, b"\n");
+            }
+        }
+        prepare_parent_output_area();
+        true
     }
 
     /// Re-enter relay terminal mode after a supervisor-owned prompt.
@@ -2869,6 +2925,38 @@ mod tests {
         proxy.drain_master_output(Duration::from_millis(10));
 
         assert!(proxy.screen_plaintext().contains("final child stderr line"));
+    }
+
+    #[test]
+    fn relay_ready_master_output_once_forwards_pending_output() {
+        let (master_reader, mut master_writer) = UnixStream::pair().expect("socket pair");
+        master_writer
+            .write_all(b"pending child stderr line\r\n")
+            .expect("write PTY output");
+        let master = unsafe { OwnedFd::from_raw_fd(master_reader.into_raw_fd()) };
+        let mut proxy = build_test_proxy_with_master(master, &DEFAULT_DETACH_SEQUENCE);
+
+        proxy.relay_ready_master_output_once();
+
+        assert!(
+            proxy
+                .screen_plaintext()
+                .contains("pending child stderr line")
+        );
+    }
+
+    #[test]
+    fn relay_ready_master_output_once_processes_one_chunk() {
+        let (master_reader, mut master_writer) = UnixStream::pair().expect("socket pair");
+        let output = vec![b'x'; 8192];
+        master_writer.write_all(&output).expect("write PTY output");
+        let master = unsafe { OwnedFd::from_raw_fd(master_reader.into_raw_fd()) };
+        let mut proxy = build_test_proxy_with_master(master, &DEFAULT_DETACH_SEQUENCE);
+
+        proxy.relay_ready_master_output_once();
+
+        assert!(!proxy.scrollback.is_empty());
+        assert!(proxy.scrollback.len() < output.len());
     }
 
     #[test]

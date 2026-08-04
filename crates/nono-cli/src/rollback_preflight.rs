@@ -105,7 +105,7 @@ pub(crate) fn run_preflight(
     let mut capped = false;
 
     'outer: for tracked in tracked_paths {
-        if !tracked.exists() || tracked.is_file() {
+        if !tracked.exists() || tracked.is_file() || is_symlink(tracked) {
             continue;
         }
 
@@ -115,6 +115,9 @@ pub(crate) fn run_preflight(
             .filter_entry(|e| !exclusion.is_excluded(e.path()))
             .filter_map(|e| e.ok())
         {
+            if entry.file_type().is_symlink() {
+                continue;
+            }
             if entry.path().is_file() {
                 file_count = file_count.saturating_add(1);
             }
@@ -145,7 +148,7 @@ fn detect_heavy_dirs(
     let mut size_check_candidates = Vec::new();
 
     for tracked in tracked_paths {
-        if !tracked.exists() || tracked.is_file() {
+        if !tracked.exists() || tracked.is_file() || is_symlink(tracked) {
             continue;
         }
 
@@ -156,7 +159,7 @@ fn detect_heavy_dirs(
 
         for entry in entries.filter_map(|e| e.ok()) {
             let path = entry.path();
-            if !path.is_dir() {
+            if is_symlink(&path) || !path.is_dir() {
                 continue;
             }
 
@@ -200,7 +203,7 @@ fn detect_heavy_dirs(
         if size_check_start.elapsed() >= SIZE_CHECK_TOTAL_CAP {
             break;
         }
-        if exceeds_file_threshold(&path, exclusion) {
+        if exceeds_file_threshold(&path, exclusion, SIZE_THRESHOLD) {
             found.push(HeavyDir {
                 path,
                 name: name_str,
@@ -216,12 +219,17 @@ fn detect_heavy_dirs(
 }
 
 /// Check if a directory exceeds the file count threshold via bounded walk.
-/// Returns true if the directory contains more than `SIZE_THRESHOLD` files,
+/// Returns true if the directory contains more than `threshold` files,
 /// or if the time cap is hit before counting completes (assumes large).
 ///
-/// Applies the exclusion filter to skip already-excluded subtrees, ensuring
-/// the count reflects the effective snapshot scope.
-fn exceeds_file_threshold(path: &std::path::Path, exclusion: &ExclusionFilter) -> bool {
+/// Applies the exclusion filter to skip already-excluded subtrees, and skips
+/// symlinks the way the snapshot walk does, so the count reflects the
+/// effective snapshot scope.
+fn exceeds_file_threshold(
+    path: &std::path::Path,
+    exclusion: &ExclusionFilter,
+    threshold: usize,
+) -> bool {
     let start = Instant::now();
     let mut count: usize = 0;
 
@@ -231,19 +239,26 @@ fn exceeds_file_threshold(path: &std::path::Path, exclusion: &ExclusionFilter) -
         .filter_entry(|e| !exclusion.is_excluded(e.path()))
         .filter_map(|e| e.ok())
     {
-        if entry.path().is_file() {
+        if !entry.file_type().is_symlink() && entry.path().is_file() {
             count = count.saturating_add(1);
         }
-        if count > SIZE_THRESHOLD {
+        if count > threshold {
             return true;
         }
         if start.elapsed() >= SIZE_CHECK_TIME_CAP {
             // Time cap hit before we finished counting — treat as large
-            return count > SIZE_THRESHOLD / 2;
+            return count > threshold / 2;
         }
     }
 
     false
+}
+
+/// Whether `path` is a symlink, without following it.
+fn is_symlink(path: &std::path::Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
 }
 
 /// Print a one-line auto-exclude notice to stderr.
@@ -286,6 +301,68 @@ mod tests {
             force_include: Vec::new(),
         };
         ExclusionFilter::new(config, dir.path()).expect("filter")
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn heavy_dirs_ignores_symlinked_child() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let tracked = dir.path().join("project");
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir_all(&tracked).expect("create tracked");
+        std::fs::create_dir_all(&elsewhere).expect("create elsewhere");
+        std::os::unix::fs::symlink(&elsewhere, tracked.join("node_modules")).expect("symlink");
+
+        let found = detect_heavy_dirs(&[tracked], &make_filter(vec![]), &[]);
+
+        let names: Vec<&str> = found.iter().map(|d| d.name.as_str()).collect();
+        assert!(
+            found.is_empty(),
+            "snapshotting skips symlinks, so none should be offered for exclusion: {names:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn heavy_dirs_ignores_symlinked_tracked_root() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let real = dir.path().join("real");
+        std::fs::create_dir_all(real.join("node_modules")).expect("create heavy dir");
+        let root_link = dir.path().join("linked-root");
+        std::os::unix::fs::symlink(&real, &root_link).expect("symlink");
+
+        let found = detect_heavy_dirs(&[root_link], &make_filter(vec![]), &[]);
+
+        assert!(
+            found.is_empty(),
+            "a symlinked tracked root is never walked at snapshot time"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn file_threshold_ignores_symlinks() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let target = dir.path().join("target.bin");
+        std::fs::write(&target, b"payload").expect("write target");
+        let links = dir.path().join("links");
+        std::fs::create_dir_all(&links).expect("create links dir");
+        for i in 0..5 {
+            std::os::unix::fs::symlink(&target, links.join(format!("link{i}"))).expect("symlink");
+        }
+
+        assert!(
+            !exceeds_file_threshold(&links, &make_filter(vec![]), 2),
+            "symlinks must not count toward the heavy-directory threshold"
+        );
+
+        for i in 0..5 {
+            std::fs::write(links.join(format!("real{i}.txt")), b"x").expect("write real file");
+        }
+        assert!(
+            exceeds_file_threshold(&links, &make_filter(vec![]), 2),
+            "real files still count"
+        );
     }
 
     #[test]

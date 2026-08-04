@@ -52,8 +52,10 @@ pub(crate) fn run_url_open_shim() -> Result<()> {
             )
         })?;
 
-    let url = std::env::args()
+    // A non-UTF-8 argument cannot be an http(s) URL
+    let url = std::env::args_os()
         .skip(1)
+        .filter_map(|arg| arg.into_string().ok())
         .find(|arg| arg.starts_with("http://") || arg.starts_with("https://"))
         .ok_or_else(|| {
             NonoError::SandboxInit(

@@ -373,6 +373,15 @@ pub struct CustomCredentialDef {
     /// SPIFFE/SPIRE Workload API auth. Mutually exclusive with `credential_key`, `auth`, and `aws_auth`.
     #[serde(default)]
     pub spiffe: Option<nono_proxy::config::SpiffeAuthConfig>,
+
+    /// Optional per-route request-rate limit (RouteRateLimiter).
+    ///
+    /// Caps the rate of L7 requests forwarded to this credential's upstream to
+    /// contain a runaway or compromised agent. Applies only to L7-visible
+    /// traffic (reverse-proxy routes and TLS-intercepted CONNECT); it has no
+    /// effect on an opaque CONNECT tunnel.
+    #[serde(default)]
+    pub rate_limit: Option<nono_proxy::config::RouteRateLimitConfig>,
 }
 
 /// Host-side source that materializes a proxy credential for `cmd://<name>`.
@@ -3145,6 +3154,20 @@ fn parse_profile_file(path: &Path) -> Result<Profile> {
     parse_profile_bytes(&content)
 }
 
+/// Canonicalize and parse a file-backed profile as a single source identity.
+///
+/// Inheritance context must come from the same resolved path that is read. In
+/// particular, reading through a symlink while retaining its lexical parent
+/// would make transitive `extends` resolution depend on the link location.
+fn parse_file_backed_profile(path: &Path) -> Result<(Profile, PathBuf)> {
+    let source_path = path.canonicalize().map_err(|e| NonoError::ProfileRead {
+        path: path.to_path_buf(),
+        source: e,
+    })?;
+    let profile = parse_profile_file(&source_path)?;
+    Ok((profile, source_path))
+}
+
 #[allow(deprecated)]
 pub(crate) fn parse_profile_bytes(content: &[u8]) -> Result<Profile> {
     let text = std::str::from_utf8(content)
@@ -3191,10 +3214,10 @@ pub(crate) fn parse_profile_bytes(content: &[u8]) -> Result<Profile> {
 /// Load a profile from a JSON file, resolving inheritance. The parent
 /// directory is passed as context so `extends` can resolve sibling profiles.
 fn load_from_file(path: &Path, cli_extends: &[String]) -> Result<Profile> {
-    let mut profile = parse_profile_file(path)?;
+    let (mut profile, source_path) = parse_file_backed_profile(path)?;
     prepend_cli_extends(&mut profile, cli_extends);
-    let context_dir = path.parent();
-    resolve_extends(profile, &mut Vec::new(), 0, context_dir, Some(path))
+    let context_dir = source_path.parent();
+    resolve_extends(profile, &mut Vec::new(), 0, context_dir, Some(&source_path))
 }
 
 fn prepend_cli_extends(profile: &mut Profile, cli_extends: &[String]) {
@@ -3271,17 +3294,16 @@ fn resolve_extends(
         visited.push(base_name.clone());
 
         let resolved = load_base_profile_raw(base_name, context_dir, source_file)?;
-        let (base, next_context, next_source) = match resolved {
-            ResolvedBase::Sibling(p, path) => (p, context_dir, Some(path)),
-            ResolvedBase::Global(p) => (p, None, None),
+        let resolved_base = match resolved {
+            ResolvedBase::Sibling(base, source_path) => resolve_extends(
+                base,
+                visited,
+                depth + 1,
+                source_path.parent(),
+                Some(&source_path),
+            )?,
+            ResolvedBase::Global(base) => resolve_extends(base, visited, depth + 1, None, None)?,
         };
-        let resolved_base = resolve_extends(
-            base,
-            visited,
-            depth + 1,
-            next_context,
-            next_source.as_deref(),
-        )?;
         // Pop to restore the stack to the pre-base state. On the error path
         // above (? propagation), visited is abandoned so the missing pop is harmless.
         visited.pop();
@@ -3299,10 +3321,9 @@ fn resolve_extends(
 }
 
 /// Distinguishes where a base profile was resolved from so `resolve_extends`
-/// can propagate `context_dir` only for sibling-resolved profiles. Global
-/// sources (user dir, pack-store, built-in) clear the context to prevent
-/// project-local files from hijacking built-in inheritance chains. `Sibling`
-/// carries the file path so the next recursion level can skip self-references.
+/// can propagate the canonical source directory only for sibling-resolved
+/// profiles. Global sources clear the context to prevent project-local files
+/// from hijacking built-in inheritance chains.
 enum ResolvedBase {
     Sibling(Profile, PathBuf),
     Global(Profile),
@@ -3344,24 +3365,25 @@ fn load_base_profile_raw(
     //    self-references (e.g. `.nono/codex.json` extending "codex").
     if let Some(dir) = context_dir {
         let sibling_path = dir.join(format!("{name}.json"));
-        let is_self = source_file.is_some_and(|src| sibling_path == src);
-        if !is_self && sibling_path.is_file() {
-            tracing::debug!(
-                "Resolved '{}' from sibling: {}",
-                name,
-                sibling_path.display()
-            );
-            return Ok(ResolvedBase::Sibling(
-                parse_profile_file(&sibling_path)?,
-                sibling_path,
-            ));
+        if sibling_path.is_file() {
+            let (profile, source_path) = parse_file_backed_profile(&sibling_path)?;
+            let is_self = source_file.is_some_and(|src| source_path == src);
+            if !is_self {
+                tracing::debug!(
+                    "Resolved '{}' from sibling: {}",
+                    name,
+                    source_path.display()
+                );
+                return Ok(ResolvedBase::Sibling(profile, source_path));
+            }
         }
     }
 
     // 1. User profiles take precedence.
     let profile_path = resolve_user_profile_path(name)?;
     if profile_path.exists() {
-        return Ok(ResolvedBase::Global(parse_profile_file(&profile_path)?));
+        let (profile, source_path) = parse_file_backed_profile(&profile_path)?;
+        return Ok(ResolvedBase::Sibling(profile, source_path));
     }
 
     // 2. Pack-store: any installed pack with a matching `install_as`.
@@ -3625,7 +3647,18 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
         },
         env_credentials: SecretsConfig {
             mappings: {
+                // Child overrides base by destination env var (matches `set_vars`
+                // semantics). `HashMap::extend` only replaces an entry when the
+                // account name (the map key) matches, so two different accounts
+                // targeting the SAME env var would both survive and race
+                // non-deterministically at load time (`keystore::load_secrets`
+                // iterates the map in random per-process order, and the env is
+                // assembled last-write-wins). Drop any base entry whose
+                // destination a child overrides before extending.
+                let child_destinations: std::collections::HashSet<String> =
+                    child.env_credentials.mappings.values().cloned().collect();
                 let mut merged = base.env_credentials.mappings;
+                merged.retain(|_account, dest| !child_destinations.contains(dest));
                 merged.extend(child.env_credentials.mappings);
                 merged
             },
@@ -4104,6 +4137,80 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn env_credentials_child_overrides_base_by_destination_env_var() {
+        // Regression for https://github.com/nolabs-ai/nono/issues/1532: a child
+        // account and a base account targeting the SAME env var must not both
+        // survive the merge (they would race non-deterministically in
+        // keystore::load_secrets). The child must win, matching `set_vars`.
+        let base = Profile {
+            env_credentials: SecretsConfig {
+                mappings: [
+                    ("base_account".to_string(), "MY_TOKEN".to_string()),
+                    ("other".to_string(), "OTHER_VAR".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            },
+            ..Default::default()
+        };
+        let child = Profile {
+            env_credentials: SecretsConfig {
+                mappings: [("child_account".to_string(), "MY_TOKEN".to_string())]
+                    .into_iter()
+                    .collect(),
+            },
+            ..Default::default()
+        };
+
+        let merged = merge_profiles(base, child);
+
+        // Child wins for the colliding destination; base's entry is dropped.
+        assert_eq!(
+            merged.env_credentials.mappings.get("child_account"),
+            Some(&"MY_TOKEN".to_string()),
+        );
+        assert!(!merged.env_credentials.mappings.contains_key("base_account"));
+        // Unrelated base entry is preserved.
+        assert_eq!(
+            merged.env_credentials.mappings.get("other"),
+            Some(&"OTHER_VAR".to_string()),
+        );
+        assert_eq!(merged.env_credentials.mappings.len(), 2);
+    }
+
+    #[test]
+    fn env_credentials_child_extends_base_without_collision() {
+        // No destination collision -> child entry is added, base entry kept.
+        let base = Profile {
+            env_credentials: SecretsConfig {
+                mappings: [("a".to_string(), "VAR_A".to_string())]
+                    .into_iter()
+                    .collect(),
+            },
+            ..Default::default()
+        };
+        let child = Profile {
+            env_credentials: SecretsConfig {
+                mappings: [("b".to_string(), "VAR_B".to_string())]
+                    .into_iter()
+                    .collect(),
+            },
+            ..Default::default()
+        };
+
+        let merged = merge_profiles(base, child);
+        assert_eq!(merged.env_credentials.mappings.len(), 2);
+        assert_eq!(
+            merged.env_credentials.mappings.get("a"),
+            Some(&"VAR_A".to_string())
+        );
+        assert_eq!(
+            merged.env_credentials.mappings.get("b"),
+            Some(&"VAR_B".to_string())
+        );
+    }
+
+    #[test]
     fn profile_path_is_in_pack_matches_canonical_layout() {
         let store = Path::new("/store");
         let claude_profile = Path::new("/store/always-further/claude/profile/claude.json");
@@ -4517,6 +4624,81 @@ mod tests {
                 "/tmp/cli-b".to_string(),
                 "/tmp/json-base".to_string(),
                 "/tmp/child".to_string(),
+            ]
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_cli_extends_preserves_global_file_source_context()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let dir = tempdir()?;
+        let config_dir = dir.path().join("config");
+        let profiles_dir = config_dir.join("nono").join("profiles");
+        let referent_dir = dir.path().join("referent");
+        let selected_dir = dir.path().join("selected");
+        std::fs::create_dir_all(&profiles_dir)?;
+        std::fs::create_dir_all(&referent_dir)?;
+        std::fs::create_dir_all(&selected_dir)?;
+        let config_dir_string = config_dir.to_string_lossy().into_owned();
+        let _env = crate::test_env::EnvVarGuard::set_all(&[(
+            "XDG_CONFIG_HOME",
+            config_dir_string.as_str(),
+        )]);
+
+        std::fs::write(
+            referent_dir.join("referent-base.json"),
+            r#"{
+                "meta": { "name": "referent-base" },
+                "filesystem": { "read": ["/tmp/referent-base"] }
+            }"#,
+        )?;
+        std::fs::write(
+            referent_dir.join("linked-parent.json"),
+            r#"{
+                "extends": "referent-base",
+                "meta": { "name": "linked-parent" }
+            }"#,
+        )?;
+        std::os::unix::fs::symlink(
+            referent_dir.join("linked-parent.json"),
+            profiles_dir.join("linked-parent.json"),
+        )?;
+        std::fs::write(
+            profiles_dir.join("user-layer.json"),
+            r#"{
+                "extends": "linked-parent",
+                "meta": { "name": "user-layer" },
+                "filesystem": { "read": ["/tmp/user-layer"] }
+            }"#,
+        )?;
+        let selected_path = selected_dir.join("selected.json");
+        std::fs::write(
+            &selected_path,
+            r#"{
+                "meta": { "name": "selected" },
+                "filesystem": { "read": ["/tmp/selected"] }
+            }"#,
+        )?;
+
+        let profile = load_profile_with_extends(
+            selected_path
+                .to_str()
+                .ok_or("selected path is not valid UTF-8")?,
+            &["user-layer".to_string()],
+        )?;
+
+        assert_eq!(
+            profile.filesystem.read,
+            vec![
+                "/tmp/referent-base".to_string(),
+                "/tmp/user-layer".to_string(),
+                "/tmp/selected".to_string(),
             ]
         );
         Ok(())
@@ -5186,6 +5368,7 @@ mod tests {
             tls_client_key: None,
             aws_auth: None,
             spiffe: None,
+            rate_limit: None,
         }
     }
 
@@ -5355,6 +5538,7 @@ mod tests {
                 credential_format: None,
                 svid_hint: None,
             }),
+            rate_limit: None,
         };
         assert!(validate_custom_credential("testapi", &cred).is_ok());
     }
@@ -5404,6 +5588,7 @@ mod tests {
             tls_client_key: None,
             aws_auth: None,
             spiffe: None,
+            rate_limit: None,
         };
         assert!(validate_custom_credential("telegram", &cred).is_ok());
     }
@@ -5429,6 +5614,7 @@ mod tests {
             tls_client_key: None,
             aws_auth: None,
             spiffe: None,
+            rate_limit: None,
         };
         let result = validate_custom_credential("telegram", &cred);
         let err = result.expect_err("missing path_pattern should be rejected");
@@ -5456,6 +5642,7 @@ mod tests {
             tls_client_key: None,
             aws_auth: None,
             spiffe: None,
+            rate_limit: None,
         };
         let result = validate_custom_credential("telegram", &cred);
         let err = result.expect_err("pattern without {} should be rejected");
@@ -5483,6 +5670,7 @@ mod tests {
             tls_client_key: None,
             aws_auth: None,
             spiffe: None,
+            rate_limit: None,
         };
         assert!(validate_custom_credential("telegram", &cred).is_ok());
     }
@@ -5508,6 +5696,7 @@ mod tests {
             tls_client_key: None,
             aws_auth: None,
             spiffe: None,
+            rate_limit: None,
         };
         let result = validate_custom_credential("telegram", &cred);
         let err = result.expect_err("replacement without {} should be rejected");
@@ -5535,6 +5724,7 @@ mod tests {
             tls_client_key: None,
             aws_auth: None,
             spiffe: None,
+            rate_limit: None,
         };
         assert!(validate_custom_credential("google_maps", &cred).is_ok());
     }
@@ -5560,6 +5750,7 @@ mod tests {
             tls_client_key: None,
             aws_auth: None,
             spiffe: None,
+            rate_limit: None,
         };
         let result = validate_custom_credential("google_maps", &cred);
         let err = result.expect_err("missing query_param_name should be rejected");
@@ -5587,6 +5778,7 @@ mod tests {
             tls_client_key: None,
             aws_auth: None,
             spiffe: None,
+            rate_limit: None,
         };
         let result = validate_custom_credential("google_maps", &cred);
         let err = result.expect_err("empty query_param_name should be rejected");
@@ -5614,6 +5806,7 @@ mod tests {
             tls_client_key: None,
             aws_auth: None,
             spiffe: None,
+            rate_limit: None,
         };
         // BasicAuth mode doesn't require additional fields
         // Credential value is expected to be "username:password" format
@@ -5820,6 +6013,7 @@ mod tests {
             tls_client_key: None,
             aws_auth: None,
             spiffe: None,
+            rate_limit: None,
         }
     }
 
@@ -5956,6 +6150,60 @@ mod tests {
         assert_eq!(auth.client_id, "my-client");
         assert_eq!(auth.client_secret, "env://CLIENT_SECRET");
         assert_eq!(auth.scope, "api.read");
+    }
+
+    #[test]
+    fn test_parse_profile_with_rate_limit() {
+        let json = r#"{
+            "meta": { "name": "rate-limit-test" },
+            "network": {
+                "custom_credentials": {
+                    "my_api": {
+                        "upstream": "https://api.example.com",
+                        "credential_key": "env://MY_API_KEY",
+                        "rate_limit": {
+                            "requests_per_minute": 120,
+                            "burst": 10,
+                            "max_delay_secs": 3
+                        }
+                    }
+                }
+            }
+        }"#;
+        let dir = tempdir().expect("tmpdir");
+        let path = dir.path().join("rate-limit-test.json");
+        std::fs::write(&path, json).expect("write profile");
+        let profile = load_profile_from_path(&path).expect("parse profile");
+        let cred = &profile.network.custom_credentials["my_api"];
+        let rl = cred.rate_limit.as_ref().expect("rate_limit should be set");
+        assert_eq!(rl.requests_per_minute, 120);
+        assert_eq!(rl.burst, 10);
+        assert_eq!(rl.max_delay_secs, 3);
+    }
+
+    #[test]
+    fn test_parse_profile_rate_limit_defaults() {
+        let json = r#"{
+            "meta": { "name": "rate-limit-defaults" },
+            "network": {
+                "custom_credentials": {
+                    "my_api": {
+                        "upstream": "https://api.example.com",
+                        "credential_key": "env://MY_API_KEY",
+                        "rate_limit": { "requests_per_minute": 60 }
+                    }
+                }
+            }
+        }"#;
+        let dir = tempdir().expect("tmpdir");
+        let path = dir.path().join("rate-limit-defaults.json");
+        std::fs::write(&path, json).expect("write profile");
+        let profile = load_profile_from_path(&path).expect("parse profile");
+        let cred = &profile.network.custom_credentials["my_api"];
+        let rl = cred.rate_limit.as_ref().expect("rate_limit should be set");
+        assert_eq!(rl.requests_per_minute, 60);
+        assert_eq!(rl.burst, 5, "burst should default to 5");
+        assert_eq!(rl.max_delay_secs, 5, "max_delay_secs should default to 5");
     }
 
     #[test]
@@ -6428,6 +6676,7 @@ mod tests {
                 tls_client_key: None,
                 aws_auth: None,
                 spiffe: None,
+                rate_limit: None,
             },
         );
 
@@ -6453,6 +6702,7 @@ mod tests {
                 tls_client_key: None,
                 aws_auth: None,
                 spiffe: None,
+                rate_limit: None,
             },
         );
 
@@ -6596,6 +6846,7 @@ mod tests {
                 tls_client_key: None,
                 aws_auth: None,
                 spiffe: None,
+                rate_limit: None,
             },
         );
 
@@ -6621,6 +6872,7 @@ mod tests {
                 tls_client_key: None,
                 aws_auth: None,
                 spiffe: None,
+                rate_limit: None,
             },
         );
 
@@ -6668,6 +6920,43 @@ mod tests {
         );
         // extends should be consumed
         assert!(profile.extends.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_transitive_extends_uses_symlinked_parent_referent()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let dir = tempdir()?;
+        let profiles_dir = dir.path().join("profiles");
+        let referent_dir = dir.path().join("referent");
+        std::fs::create_dir_all(&profiles_dir)?;
+        std::fs::create_dir_all(&referent_dir)?;
+
+        std::fs::write(
+            referent_dir.join("base.json"),
+            r#"{ "meta": { "name": "base" }, "filesystem": { "read": ["/referent-base"] } }"#,
+        )?;
+        std::fs::write(
+            referent_dir.join("parent.json"),
+            r#"{ "extends": "base", "meta": { "name": "parent" } }"#,
+        )?;
+        std::fs::write(
+            profiles_dir.join("base.json"),
+            r#"{ "meta": { "name": "decoy" }, "filesystem": { "read": ["/link-base"] } }"#,
+        )?;
+        std::fs::write(
+            profiles_dir.join("child.json"),
+            r#"{ "extends": "parent", "meta": { "name": "child" } }"#,
+        )?;
+        std::os::unix::fs::symlink(
+            referent_dir.join("parent.json"),
+            profiles_dir.join("parent.json"),
+        )?;
+
+        let profile = load_from_file(&profiles_dir.join("child.json"), &[])?;
+
+        assert_eq!(profile.filesystem.read, vec!["/referent-base"]);
+        Ok(())
     }
 
     #[test]
@@ -8364,6 +8653,7 @@ mod tests {
             tls_client_key: None,
             aws_auth: None,
             spiffe: None,
+            rate_limit: None,
         };
         assert!(
             validate_custom_credential("example", &cred).is_ok(),
@@ -8392,6 +8682,7 @@ mod tests {
             tls_client_key: None,
             aws_auth: None,
             spiffe: None,
+            rate_limit: None,
         };
         let result = validate_custom_credential("example", &cred);
         let err = result.expect_err("file:// URI without env_var should be rejected");
@@ -8423,6 +8714,7 @@ mod tests {
             tls_client_key: None,
             aws_auth: None,
             spiffe: None,
+            rate_limit: None,
         };
         let result = validate_custom_credential("example", &cred);
         let err = result.expect_err("file:// URI with relative path should be rejected");
@@ -8454,6 +8746,7 @@ mod tests {
             tls_client_key: None,
             aws_auth: None,
             spiffe: None,
+            rate_limit: None,
         };
         let result = validate_custom_credential("example", &cred);
         assert!(
@@ -8517,6 +8810,7 @@ mod tests {
             tls_client_key: None,
             aws_auth: None,
             spiffe: None,
+            rate_limit: None,
         };
         assert!(validate_custom_credential("example", &cred).is_ok());
     }
@@ -8926,6 +9220,7 @@ mod tests {
             tls_client_key: None,
             aws_auth: None,
             spiffe: None,
+            rate_limit: None,
         };
         let result = validate_custom_credential("example", &cred);
         assert!(result.is_err(), "env://LD_PRELOAD should be rejected");
@@ -9729,6 +10024,7 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             spiffe: None,
+            rate_limit: None,
         }
     }
 
@@ -9814,6 +10110,7 @@ mod tests {
             auth: None,
             aws_auth: None,
             spiffe: None,
+            rate_limit: None,
             ..aws_auth_cred_builder()
         };
         let result = validate_custom_credential("bedrock", &cred);

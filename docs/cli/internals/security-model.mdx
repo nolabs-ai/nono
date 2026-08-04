@@ -196,11 +196,23 @@ Security implication:
 
 This was chosen as a compatibility tradeoff for the Claude profile. Users who need a tighter boundary should use a custom profile instead of relying on the pack-provided `claude-code` profile.
 
-For users who want the Claude profile shape without macOS keychain access, nono also provides:
+For users who want the Claude profile shape without macOS keychain access, you need to create a full custom profile rather than a simple extension. The keychain access in `nolabs-ai/claude` comes from `filesystem.allow` and `filesystem.bypass_protection` entries in the pack profile itself — not from the `claude_code_macos` group — so excluding the group alone is not sufficient.
 
-- `claude-no-kc`
+The correct approach:
 
-That profile keeps the normal Claude filesystem/runtime allowances but does not relax the macOS keychain deny for `~/Library/Keychains`.
+1. Inspect the current pack profile:
+   ```bash
+   nono profile show --raw nolabs-ai/claude --json
+   ```
+
+2. Copy all `filesystem.allow`, `filesystem.read`, `filesystem.allow_file`, and group entries into a new local profile, omitting `$HOME/Library/Keychains` from `filesystem.allow` and removing it from `filesystem.bypass_protection` entirely.
+
+3. Save the profile and run with it:
+   ```bash
+   nono run --profile claude-no-kc -- claude
+   ```
+
+The `deny_keychains_macos` required group is always active in every profile. Without the `filesystem.allow` + `filesystem.bypass_protection` pair for `~/Library/Keychains`, the deny wins and keychain access is fully blocked at both the file level and via Mach IPC.
 
 ## The fd Injection Model
 

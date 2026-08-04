@@ -960,6 +960,11 @@ pub struct CapabilitySet {
     /// Plumbed through here so they ride the serialization layer like other
     /// policy; enforced by the supervisor via cgroup v2 on Linux.
     resource_limits: Option<ResourceLimits>,
+    /// `$PATH` dirs granted metadata-only read so libc command resolution
+    /// gets `ENOENT` (not a Seatbelt `EPERM`) on ungranted/missing entries and
+    /// doesn't abort the PATH walk. macOS-only; see `generate_profile`.
+    #[cfg(target_os = "macos")]
+    path_metadata_dirs: Vec<PathBuf>,
 }
 
 impl CapabilitySet {
@@ -1271,6 +1276,20 @@ impl CapabilitySet {
     /// [`UnixSocketCapability`].
     pub fn add_unix_socket(&mut self, cap: UnixSocketCapability) {
         self.unix_sockets.push(cap);
+    }
+
+    /// Register a `$PATH` directory for metadata-only read. The path need not
+    /// exist on disk. See [`path_metadata_dirs`](Self::path_metadata_dirs).
+    #[cfg(target_os = "macos")]
+    pub fn add_path_metadata_dir(&mut self, dir: PathBuf) {
+        self.path_metadata_dirs.push(dir);
+    }
+
+    /// Get the `$PATH` directories granted metadata-only read.
+    #[cfg(target_os = "macos")]
+    #[must_use]
+    pub fn path_metadata_dirs(&self) -> &[PathBuf] {
+        &self.path_metadata_dirs
     }
 
     /// Set network blocking state

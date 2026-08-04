@@ -210,11 +210,7 @@ impl ResolvedToolSandboxPlan {
                 crate::command_policy::resolve_policy_command_binaries(config, path_env.clone())?
             }
         };
-        for w in &resolved.warnings {
-            if w.code == "command_not_found" {
-                eprintln!("  [nono] Warning: {}", w.message);
-            }
-        }
+        crate::command_policy::print_command_not_found_summary(&resolved.warnings);
         let exec_helpers = crate::command_policy::resolve_policy_exec_helpers(config)?;
         validate_controlled_exec_helper_immutability(config, &exec_helpers, outer_caps)?;
         let daemon_pid_source_helpers =
@@ -872,8 +868,8 @@ fn handle_url_open_stream(
 }
 
 /// Resolve the requesting command from the connecting PID and validate the URL
-/// against that command's `open_urls` policy. Returns `Ok(())` if the open is
-/// permitted, or a denial reason otherwise. Does not open the browser.
+/// against that command's policy. Returns `Ok(())` if the open is permitted,
+/// or a denial reason otherwise. Does not open the browser.
 fn validate_url_open(
     state: &ToolSandboxState,
     peer_pid: u32,
@@ -890,6 +886,22 @@ fn validate_url_open(
 
     let policy = select_effective_policy(&state.plan.config, &command_name, &launch_caller)
         .map_err(|err| format!("policy resolution failed: {err}"))?;
+
+    check_url_open_policy(policy, &command_name, url)
+}
+
+/// Pure policy check, split out from [`validate_url_open`] for unit testing
+/// without a real process tree. `allow_launch_services` trusts the command to
+/// open any URL, matching a real exec of `/usr/bin/open`; otherwise the URL
+/// must pass `open_urls.allow_origins`.
+fn check_url_open_policy(
+    policy: &CommandSandboxConfig,
+    command_name: &str,
+    url: &str,
+) -> std::result::Result<(), String> {
+    if policy.allow_launch_services {
+        return Ok(());
+    }
 
     let open_urls = policy
         .open_urls
@@ -1230,7 +1242,26 @@ fn handle_shim_stream_inner(
             NonoError::SandboxInit(format!("missing command config for {}", request.command))
         })?;
 
-    let intercept = super::resolve_intercept_action(command_config, &request.argv);
+    let intercept = match super::resolve_intercept_action(command_config, &request.argv, || {
+        filter_child_env(state, &request, policy)
+    }) {
+        Ok(intercept) => intercept,
+        Err(err) => {
+            record_command_policy_audit(
+                audit_recorder.as_ref(),
+                &request,
+                &state.redaction_policy,
+                session_id,
+                auth.peer_pid,
+                session_root_pid,
+                Some(&caller),
+                "denied",
+                Some(err.to_string()),
+                None,
+            )?;
+            return Err(err);
+        }
+    };
     let intercept_action = intercept.action;
 
     // A matched intercept rule may carry a sandbox that replaces the command's
@@ -1320,6 +1351,7 @@ fn handle_shim_stream_inner(
     if let InterceptActionConfig::CaptureCredential {
         credential,
         grant_to,
+        shape,
     } = intercept_action
     {
         let grants = if grant_to.is_empty() {
@@ -1342,7 +1374,7 @@ fn handle_shim_stream_inner(
                 None,
                 Some(0),
             )?;
-            return Ok((0, nonce_stdout(nonce)));
+            return Ok((0, nonce_stdout(shape.apply(nonce)?)));
         }
 
         let active = state.active_count.fetch_add(1, Ordering::SeqCst);
@@ -1409,7 +1441,7 @@ fn handle_shim_stream_inner(
                     None,
                     Some(0),
                 )?;
-                Ok((0, nonce_stdout(nonce)))
+                Ok((0, nonce_stdout(shape.apply(nonce)?)))
             }
             Err(err) => {
                 record_command_policy_audit(
@@ -2675,15 +2707,15 @@ fn add_launch_services_caps(caps: &mut CapabilitySet, policy: &CommandSandboxCon
 }
 
 /// Grant the brokered child connect access to the URL listener socket and read
-/// access to the open shim, when the command declares `open_urls` and did not
-/// opt into direct LaunchServices. The shim is added to the exec gate by
+/// access to the open shim, when the command declares `open_urls` or
+/// `allow_launch_services`. The shim is added to the exec gate by
 /// [`add_child_process_exec_gate_with_policy`].
 fn add_url_open_caps(
     caps: &mut CapabilitySet,
     state: &ToolSandboxState,
     policy: &CommandSandboxConfig,
 ) -> Result<()> {
-    if policy.open_urls.is_none() || policy.allow_launch_services {
+    if policy.open_urls.is_none() && !policy.allow_launch_services {
         return Ok(());
     }
     let (Some(url_socket_path), Some(shim)) =
@@ -2854,15 +2886,16 @@ fn add_child_process_exec_gate_with_policy(
             .map(|identity| identity.path.clone()),
     );
     if let Some(policy) = policy {
-        // Allow execing the browser-open shim only when this command may open
-        // URLs without direct LaunchServices.
-        if policy.open_urls.is_some()
-            && !policy.allow_launch_services
+        // A bare `open` always resolves to this shim (mediated $PATH puts the
+        // shim dir first) once any command needs one, so both `open_urls` and
+        // `allow_launch_services` commands must be allowed to exec it.
+        if (policy.open_urls.is_some() || policy.allow_launch_services)
             && let Some(shim) = state.url_open_shim.as_ref()
         {
             allowed.push(shim.path.clone());
         }
-        // Direct LaunchServices opt-in: permit execing /usr/bin/open.
+        // Direct LaunchServices opt-in: also permit execing /usr/bin/open
+        // directly, for callers that resolve it by absolute path.
         if policy.allow_launch_services {
             let open_path = Path::new("/usr/bin/open");
             if open_path.exists() {
@@ -3068,7 +3101,7 @@ fn add_policy_fs(
         if matches!(write_access(&path), AccessMode::Read) {
             add_optional_read_file(caps, path)?;
         } else {
-            caps.add_fs(FsCapability::new_file(path, AccessMode::ReadWrite)?);
+            super::add_optional_write_file(caps, path)?;
         }
     }
     Ok(())
@@ -3100,6 +3133,16 @@ fn add_policy_network(caps: &mut CapabilitySet, policy: &CommandSandboxConfig) -
     let Some(network) = &policy.network else {
         return Ok(());
     };
+    // Localhost bind grants (e.g. an OAuth callback listener) flow to the child
+    // via localhost_port_ranges → proxy_bind_port_ranges, so they compose with
+    // ProxyOnly mode. Only ranges are carried in the child spec, so singles are
+    // widened to [port, port].
+    for &port in &network.open_port {
+        caps.add_localhost_port_range(port, port)?;
+    }
+    for &[start, end] in &network.open_port_range {
+        caps.add_localhost_port_range(start, end)?;
+    }
     if network.allow_all {
         caps.set_network_mode_mut(NetworkMode::AllowAll);
         return Ok(());
@@ -4719,12 +4762,9 @@ fn guarded_remove_runtime_dir(dir: &Path) -> Result<()> {
             dir.display()
         )));
     }
-    fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).map_err(|e| {
-        NonoError::ConfigWrite {
-            path: dir.to_path_buf(),
-            source: e,
-        }
-    })?;
+    // The `shims` subdir is sealed to 0o500; re-grant owner-write across the
+    // tree so `remove_dir_all` can unlink the sealed shim copies inside it.
+    crate::tool_sandbox::restore_dir_tree_writable(dir);
     fs::remove_dir_all(dir).map_err(|e| NonoError::ConfigWrite {
         path: dir.to_path_buf(),
         source: e,
@@ -5404,6 +5444,166 @@ mod tests {
     }
 
     #[test]
+    fn exec_gate_allows_open_shim_for_allow_launch_services_without_open_urls() -> Result<()> {
+        let temp = test_tempdir()?;
+        let command = temp.path().join("tool");
+        create_executable(&command)?;
+        let binary = test_binary("tool", &command)?;
+
+        let shim_path = temp.path().join("open");
+        create_executable(&shim_path)?;
+        let shim_path =
+            shim_path
+                .canonicalize()
+                .map_err(|source| NonoError::PathCanonicalization {
+                    path: shim_path,
+                    source,
+                })?;
+        let mut state = test_state();
+        state.url_open_shim = Some(ShimIdentity {
+            path: shim_path.clone(),
+            id: FileId { dev: 0, ino: 0 },
+        });
+
+        let policy = CommandSandboxConfig {
+            allow_launch_services: true,
+            ..Default::default()
+        };
+
+        let mut caps = CapabilitySet::new();
+        add_child_process_exec_gate_with_policy(&mut caps, &state, &binary, Some(&policy))?;
+
+        assert!(
+            has_exec_rule(&caps, &shim_path)?,
+            "allow_launch_services must let the command exec the open shim, since the \
+             mediated $PATH resolves `open` there rather than /usr/bin/open"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn url_open_policy_allows_launch_services_without_open_urls() {
+        let policy = CommandSandboxConfig {
+            allow_launch_services: true,
+            ..Default::default()
+        };
+        assert!(check_url_open_policy(&policy, "tool", "https://example.com/anything").is_ok());
+    }
+
+    #[test]
+    fn url_open_policy_denies_without_open_urls_or_launch_services() {
+        let policy = CommandSandboxConfig::default();
+        assert!(check_url_open_policy(&policy, "tool", "https://example.com").is_err());
+    }
+
+    #[test]
+    fn url_open_policy_still_enforces_allow_origins_without_launch_services() {
+        let policy = CommandSandboxConfig {
+            open_urls: Some(crate::profile::OpenUrlConfig {
+                allow_origins: vec!["https://example.com".to_string()],
+                allow_localhost: false,
+            }),
+            ..Default::default()
+        };
+        assert!(check_url_open_policy(&policy, "tool", "https://example.com/login").is_ok());
+        assert!(check_url_open_policy(&policy, "tool", "https://evil.example").is_err());
+    }
+
+    #[test]
+    fn url_open_caps_granted_for_allow_launch_services_without_open_urls() -> Result<()> {
+        let temp = test_tempdir()?;
+        let shim_path = temp.path().join("open");
+        create_executable(&shim_path)?;
+        let shim_path =
+            shim_path
+                .canonicalize()
+                .map_err(|source| NonoError::PathCanonicalization {
+                    path: shim_path,
+                    source,
+                })?;
+        let socket_path = temp.path().join("url.sock");
+        std::fs::File::create(&socket_path).map_err(|source| NonoError::ConfigRead {
+            path: socket_path.clone(),
+            source,
+        })?;
+        let socket_path =
+            socket_path
+                .canonicalize()
+                .map_err(|source| NonoError::PathCanonicalization {
+                    path: socket_path,
+                    source,
+                })?;
+
+        let mut state = test_state();
+        state.url_socket_path = Some(socket_path.clone());
+        state.url_open_shim = Some(ShimIdentity {
+            path: shim_path,
+            id: FileId { dev: 0, ino: 0 },
+        });
+
+        let policy = CommandSandboxConfig {
+            allow_launch_services: true,
+            ..Default::default()
+        };
+
+        let mut caps = CapabilitySet::new();
+        add_url_open_caps(&mut caps, &state, &policy)?;
+
+        assert!(
+            caps.unix_socket_capabilities()
+                .iter()
+                .any(|cap| cap.resolved == socket_path),
+            "allow_launch_services must get connect access to the URL listener socket, since \
+             the shim always relays through it rather than execing /usr/bin/open directly"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn url_open_caps_not_granted_without_open_urls_or_launch_services() -> Result<()> {
+        let temp = test_tempdir()?;
+        let shim_path = temp.path().join("open");
+        create_executable(&shim_path)?;
+        let shim_path =
+            shim_path
+                .canonicalize()
+                .map_err(|source| NonoError::PathCanonicalization {
+                    path: shim_path,
+                    source,
+                })?;
+        let socket_path = temp.path().join("url.sock");
+        std::fs::File::create(&socket_path).map_err(|source| NonoError::ConfigRead {
+            path: socket_path.clone(),
+            source,
+        })?;
+        let socket_path =
+            socket_path
+                .canonicalize()
+                .map_err(|source| NonoError::PathCanonicalization {
+                    path: socket_path,
+                    source,
+                })?;
+
+        let mut state = test_state();
+        state.url_socket_path = Some(socket_path.clone());
+        state.url_open_shim = Some(ShimIdentity {
+            path: shim_path,
+            id: FileId { dev: 0, ino: 0 },
+        });
+
+        let policy = CommandSandboxConfig::default();
+
+        let mut caps = CapabilitySet::new();
+        add_url_open_caps(&mut caps, &state, &policy)?;
+
+        assert!(
+            caps.unix_socket_capabilities().is_empty(),
+            "a command with neither policy must get no URL socket access"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn outer_process_exec_gate_allows_exec_but_denies_controlled_paths() -> Result<()> {
         let temp = test_tempdir()?;
         let bin_dir = temp.path().join("bin");
@@ -5564,7 +5764,8 @@ mod tests {
             "tool".to_string(),
             CommandPolicyConfig {
                 intercept: vec![InterceptRuleConfig {
-                    args: vec![],
+                    args: Some(vec![]),
+                    match_config: None,
                     action: InterceptActionConfig::Exec {
                         command: vec![helper.to_string_lossy().into_owned()],
                     },
@@ -5929,6 +6130,43 @@ mod tests {
         let second = materialize_shim(&source_path, dir.path(), "xargs")?;
 
         assert_ne!(first.id, second.id);
+        Ok(())
+    }
+
+    #[test]
+    fn guarded_remove_deletes_runtime_dir_with_sealed_shims() -> Result<()> {
+        let tmp = test_tempdir()?;
+        let runtime = tmp.path().join("nono-tool-sandbox-test");
+        fs::create_dir(&runtime).map_err(|source| NonoError::ConfigWrite {
+            path: runtime.clone(),
+            source,
+        })?;
+        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).map_err(|source| {
+            NonoError::ConfigWrite {
+                path: runtime.clone(),
+                source,
+            }
+        })?;
+        let shim_dir = create_shim_dir(&runtime)?;
+        let shim = shim_dir.join("git");
+        fs::write(&shim, b"shim").map_err(|source| NonoError::ConfigWrite {
+            path: shim.clone(),
+            source,
+        })?;
+        fs::set_permissions(&shim, fs::Permissions::from_mode(0o500)).map_err(|source| {
+            NonoError::ConfigWrite {
+                path: shim.clone(),
+                source,
+            }
+        })?;
+        // Seal the shim dir to 0o500 exactly as the live runtime does.
+        seal_shim_dir(&shim_dir)?;
+
+        // Regression: with the shim dir sealed, a naive remove_dir_all cannot
+        // unlink its contents, so cleanup must first re-grant owner-write.
+        guarded_remove_runtime_dir(&runtime)?;
+
+        assert!(!runtime.exists(), "sealed runtime dir was not removed");
         Ok(())
     }
 
@@ -6673,6 +6911,34 @@ mod tests {
     }
 
     #[test]
+    fn open_port_grants_localhost_bind_ranges() -> Result<()> {
+        // A proxy-routed command's open_port must reach the child via
+        // localhost_port_ranges (→ proxy_bind_port_ranges), so an OAuth
+        // callback listener can bind. Singles are widened to [port, port].
+        let policy = CommandSandboxConfig {
+            network: Some(crate::command_policy::CommandNetworkConfig {
+                allow_domain: vec!["example.com".to_string()],
+                open_port: vec![8250],
+                open_port_range: vec![[8251, 8255]],
+                ..Default::default()
+            }),
+            ..CommandSandboxConfig::default()
+        };
+        let mut caps = CapabilitySet::new();
+        add_policy_network(&mut caps, &policy)?;
+        let ranges = caps.localhost_port_ranges();
+        assert!(
+            ranges.contains(&(8250, 8250)),
+            "single open_port widened to a range: {ranges:?}"
+        );
+        assert!(
+            ranges.contains(&(8251, 8255)),
+            "open_port_range preserved: {ranges:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn session_caller_prefers_from_session_edge_without_entrypoint() -> Result<()> {
         let root_sandbox = CommandSandboxConfig {
             fs_read: vec!["root".to_string()],
@@ -6738,7 +7004,7 @@ mod tests {
 
         let with_override = crate::tool_sandbox::ResolvedInterceptAction {
             action: &crate::command_policy::InterceptActionConfig::Passthrough,
-            rule_args: Some(&[]),
+            rule_label: Some(crate::tool_sandbox::ResolvedInterceptRuleLabel::Args(&[])),
             sandbox: Some(&override_sandbox),
         };
         let effective = with_override.sandbox.unwrap_or(&command_sandbox);

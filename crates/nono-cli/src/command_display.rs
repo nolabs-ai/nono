@@ -1,20 +1,25 @@
 //! Helpers for rendering user-supplied commands for display.
 //!
-//! Commands passed to `nono` (e.g. after `--`) preserve each argument as a
-//! separate `String`. When we echo those commands back to the user — in the
-//! `nono learn` "Run with:" hint, the dry-run banner, `nono ps` details,
+//! Commands passed to `nono` (e.g. after `--`) preserve each argument
+//! separately, as an `OsString` on the execution path. When we echo those
+//! commands back to the user — in the dry-run banner, `nono ps` details,
 //! audit/rollback listings — we want the rendered line to round-trip: a user
-//! copy-pasting it into a shell must execute the exact same argv that was
-//! learned or recorded.
+//! copy-pasting it into a shell must execute the exact same argv that was recorded.
 //!
 //! A naive `command.join(" ")` breaks that contract as soon as any argument
 //! contains whitespace, quotes, `$`, backslashes, etc. `echo 'foo bar' baz`
 //! becomes `echo foo bar baz` (three args instead of two). See issue #660.
 //!
+//! Round-tripping holds only for arguments that are valid UTF-8. Rendering is
+//! infallible by design, so invalid bytes become U+FFFD and no longer name what
+//! the child received; word boundaries survive, the bytes do not. Nothing here
+//! may feed an execution path — see `exec_strategy::build_execve_argv`.
+//!
 //! This module centralises shell-quoting via [`shlex::try_quote`] so all
 //! display sites stay consistent.
 
 use std::borrow::Cow;
+use std::ffi::OsStr;
 
 /// Quote a single argument for POSIX shell display.
 ///
@@ -36,10 +41,10 @@ fn quote_arg(arg: &str) -> Cow<'_, str> {
 ///
 /// Each element is quoted independently with [`shlex::try_quote`] and joined
 /// with spaces. Empty `command` returns an empty string.
-pub(crate) fn format_command_line(command: &[String]) -> String {
+pub(crate) fn format_command_line<S: AsRef<OsStr>>(command: &[S]) -> String {
     command
         .iter()
-        .map(|a| quote_arg(a))
+        .map(|a| quote_arg(&a.as_ref().to_string_lossy()).into_owned())
         .collect::<Vec<_>>()
         .join(" ")
 }
@@ -78,7 +83,7 @@ pub(crate) fn truncate_chars(s: &str, max_len: usize) -> String {
 ///
 /// Thin wrapper over [`truncate_chars`]; see that function for truncation
 /// semantics.
-pub(crate) fn truncate_command(command: &[String], max_len: usize) -> String {
+pub(crate) fn truncate_command<S: AsRef<OsStr>>(command: &[S], max_len: usize) -> String {
     truncate_chars(&format_command_line(command), max_len)
 }
 
@@ -134,12 +139,12 @@ mod tests {
 
     #[test]
     fn empty_command_returns_empty_string() {
-        assert_eq!(format_command_line(&[]), "");
+        assert_eq!(format_command_line::<&str>(&[]), "");
     }
 
     #[test]
     fn issue_660_repro() {
-        // From issue #660: `nono learn -- echo 'foo bar' 'baz'` must not
+        // From issue #660: `nono run -- echo 'foo bar' 'baz'` must not
         // render as `echo foo bar baz`.
         let rendered =
             format_command_line(&["echo".to_string(), "foo bar".to_string(), "baz".to_string()]);
@@ -168,6 +173,31 @@ mod tests {
         // Char-aware: keep `max_len - 3 = 2` chars (`'é`), append "...".
         assert_eq!(result, "'é...");
         assert!(result.chars().count() <= 5);
+    }
+
+    /// Issue #1504: argv reaching this module may contain bytes that are not
+    /// valid UTF-8. Rendering must stay infallible and must not panic; losing
+    /// the exact bytes is expected here, since this output is for humans.
+    #[test]
+    fn non_utf8_args_render_lossily_without_panicking() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let cmd = vec![
+            OsString::from("echo"),
+            OsStr::from_bytes(b"pre\xffpost").to_os_string(),
+        ];
+
+        let out = format_command_line(&cmd);
+
+        assert!(out.starts_with("echo "), "out: {out}");
+        assert!(
+            out.contains('\u{FFFD}'),
+            "invalid bytes should surface as U+FFFD, out: {out}"
+        );
+        // Still a single shell word, so the rendered line remains parseable.
+        let reparsed = shlex::split(&out).expect("round-trips through shlex");
+        assert_eq!(reparsed.len(), 2, "reparsed: {reparsed:?}");
     }
 
     #[test]

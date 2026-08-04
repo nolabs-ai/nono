@@ -15,6 +15,15 @@ pub struct CredentialProviderDef {
     /// API origins where phantom tokens are resolved on egress.
     #[serde(default)]
     pub api_hosts: Vec<String>,
+    /// Header the resolved credential is injected into on `api_hosts` egress.
+    /// Defaults to `Authorization` (OAuth Bearer APIs). Vault, for example,
+    /// needs `X-Vault-Token`.
+    #[serde(default)]
+    pub inject_header: Option<String>,
+    /// Format applied to the resolved credential before injection; `{}` is the
+    /// token. Defaults to `Bearer {}`. Use `{}` for a raw token (e.g. Vault).
+    #[serde(default)]
+    pub credential_format: Option<String>,
     /// Optional provider-specific logout/session detection.
     #[serde(default)]
     pub credential_store: Option<CredentialProviderStore>,
@@ -158,11 +167,10 @@ pub(super) fn validate_credential_provider_entries(profile: &Profile) -> Result<
                     &field.path,
                 )?;
             }
-            if endpoint.request_nonce_fields.is_empty() {
-                return Err(NonoError::ProfileParse(format!(
-                    "credential_providers.{name}.token_endpoints[{index}].request_nonce_fields must not be empty"
-                )));
-            }
+            // request_nonce_fields is only meaningful for refresh/exchange
+            // flows that re-send a phantom in the request body. Capture-only
+            // endpoints (e.g. Vault's OIDC callback, whose token is captured
+            // from the response and later sent in a header) leave it empty.
             for field in &endpoint.request_nonce_fields {
                 validate_provider_field(
                     &format!(
@@ -177,6 +185,38 @@ pub(super) fn validate_credential_provider_entries(profile: &Profile) -> Result<
                 &format!("credential_providers.{name}.api_hosts[{index}]"),
                 api_host,
             )?;
+        }
+        // A custom injection format must carry the `{}` token placeholder, or
+        // the redemption route would inject a constant header that never
+        // contains the resolved credential.
+        if provider
+            .credential_format
+            .as_deref()
+            .is_some_and(|format| !format.contains("{}"))
+        {
+            return Err(NonoError::ProfileParse(format!(
+                "credential_providers.{name}.credential_format must contain the '{{}}' token placeholder"
+            )));
+        }
+        // Same raw header-value path as the header name; reject control chars
+        // to prevent header injection.
+        if provider
+            .credential_format
+            .as_deref()
+            .is_some_and(|format| format.bytes().any(|b| b.is_ascii_control() && b != b'\t'))
+        {
+            return Err(NonoError::ProfileParse(format!(
+                "credential_providers.{name}.credential_format must not contain control characters"
+            )));
+        }
+        if provider
+            .inject_header
+            .as_deref()
+            .is_some_and(|header| !is_valid_http_header_name(header))
+        {
+            return Err(NonoError::ProfileParse(format!(
+                "credential_providers.{name}.inject_header must be a valid HTTP header name (RFC 7230 token)"
+            )));
         }
         if let Some(store) = &provider.credential_store {
             validate_credential_provider_store(name, store)?;
@@ -386,4 +426,117 @@ fn validate_provider_field(context: &str, field: &str) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// RFC 7230 `token`: the grammar for an HTTP header field name. Rejects
+/// whitespace, colons, and control characters so a malformed `inject_header`
+/// can't break the outbound request or smuggle extra header material.
+fn is_valid_http_header_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(
+                    b,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn provider_with(inject_header: Option<&str>, credential_format: Option<&str>) -> Profile {
+        let mut profile = Profile::default();
+        profile.credential_providers.insert(
+            "vault_oidc".to_string(),
+            CredentialProviderDef {
+                provider_type: CredentialProviderType::OauthCapture,
+                token_endpoints: vec![CredentialProviderTokenEndpoint {
+                    host: "https://vault.example.com".to_string(),
+                    path: "/v1/auth/oidc/oidc/callback".to_string(),
+                    response_fields: vec![CredentialProviderResponseField {
+                        path: "auth.client_token".to_string(),
+                        kind: CredentialProviderResponseFieldKind::Opaque,
+                    }],
+                    request_body: CredentialProviderRequestBodyFormat::Auto,
+                    // Capture-only endpoint: intentionally no request_nonce_fields.
+                    request_nonce_fields: vec![],
+                }],
+                api_hosts: vec!["https://vault.example.com".to_string()],
+                inject_header: inject_header.map(str::to_string),
+                credential_format: credential_format.map(str::to_string),
+                credential_store: None,
+                helpers: None,
+            },
+        );
+        profile
+    }
+
+    #[test]
+    fn credential_format_without_placeholder_is_rejected() {
+        let profile = provider_with(Some("X-Vault-Token"), Some("Bearer"));
+        let err = validate_credential_provider_entries(&profile).expect_err("must reject");
+        assert!(
+            err.to_string().contains("credential_format"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn credential_format_with_control_chars_is_rejected() {
+        for bad in [
+            "{}\r\nEvil: 1",
+            "Bearer {}\n",
+            "{}\0",
+            "{}\x01",
+            "{}\x0b",
+            "{}\x0c",
+            "{}\x7f",
+        ] {
+            let profile = provider_with(Some("X-Vault-Token"), Some(bad));
+            let err = validate_credential_provider_entries(&profile)
+                .expect_err(&format!("must reject format {bad:?}"));
+            assert!(
+                err.to_string().contains("credential_format"),
+                "unexpected error for {bad:?}: {err}"
+            );
+        }
+        // Horizontal tab is a legal field-value character.
+        let ok = provider_with(Some("X-Vault-Token"), Some("Bearer\t{}"));
+        validate_credential_provider_entries(&ok).expect("tab is allowed");
+    }
+
+    #[test]
+    fn invalid_inject_header_is_rejected() {
+        for bad in ["", "  ", "X Vault Token", "X-Vault-Token:", "X\r\nEvil"] {
+            let profile = provider_with(Some(bad), Some("{}"));
+            let err = validate_credential_provider_entries(&profile)
+                .expect_err(&format!("must reject header {bad:?}"));
+            assert!(
+                err.to_string().contains("inject_header"),
+                "unexpected error for {bad:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn custom_header_and_capture_only_endpoint_ok() {
+        // Raw-token header + empty request_nonce_fields (capture-only) is valid.
+        let profile = provider_with(Some("X-Vault-Token"), Some("{}"));
+        validate_credential_provider_entries(&profile).expect("valid provider");
+    }
 }

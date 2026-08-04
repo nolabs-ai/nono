@@ -17,6 +17,7 @@ pub use observation::{
     follow_up_diagnostics,
 };
 pub use records::{
-    DenialReason, DenialRecord, IpcDenialRecord, SandboxViolation, seatbelt_operation_to_access,
+    DenialReason, DenialRecord, IpcDenialRecord, SandboxViolation, UrlDenialReason,
+    UrlDenialRecord, seatbelt_operation_to_access,
 };
 pub use report::{SessionDiagnosticReport, dedupe_denials, filesystem_denials_from_violations};

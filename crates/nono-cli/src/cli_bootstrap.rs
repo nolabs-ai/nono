@@ -17,9 +17,17 @@ pub(crate) fn normalize_legacy_flag_env_vars() {
     copy_legacy_env_var("NONO_EXTERNAL_PROXY_BYPASS", "NONO_UPSTREAM_BYPASS");
 }
 
-pub(crate) fn collect_legacy_network_warnings() -> Vec<String> {
+/// Collect deprecation warnings for legacy network flags and env vars.
+///
+/// Every legacy flag below is ASCII, so comparing lossily can only fail to
+/// match an argument that was never a legacy flag to begin with.
+pub(crate) fn collect_legacy_network_warnings(args: &[std::ffi::OsString]) -> Vec<String> {
     let mut warnings = Vec::new();
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let args: Vec<std::borrow::Cow<'_, str>> = args
+        .iter()
+        .skip(1)
+        .map(|arg| arg.to_string_lossy())
+        .collect();
 
     // (legacy, replacement, remove_by)
     for (legacy, replacement, remove_by) in [
@@ -44,7 +52,7 @@ pub(crate) fn collect_legacy_network_warnings() -> Vec<String> {
     ] {
         if args
             .iter()
-            .any(|arg| arg == legacy || arg.starts_with(&format!("{legacy}=")))
+            .any(|arg| arg.as_ref() == legacy || arg.starts_with(&format!("{legacy}=")))
         {
             let mut message = if let Some(replacement) = replacement {
                 format!("Warning: `{legacy}` is deprecated; use `{replacement}` instead.")
@@ -209,7 +217,6 @@ fn cli_log_override(cli: &Cli) -> Option<&'static str> {
 
 fn cli_verbosity(cli: &Cli) -> u8 {
     match &cli.command {
-        Commands::Learn(args) => args.verbose,
         Commands::Run(args) => args.sandbox.verbose,
         Commands::Shell(args) => args.sandbox.verbose,
         Commands::Wrap(args) => args.sandbox.verbose,
@@ -219,6 +226,7 @@ fn cli_verbosity(cli: &Cli) -> u8 {
         | Commands::Rollback(_)
         | Commands::Trust(_)
         | Commands::Audit(_)
+        | Commands::Platform(_)
         | Commands::Pull(_)
         | Commands::Remove(_)
         | Commands::Update(_)
@@ -291,9 +299,58 @@ impl Write for SharedFileWriter {
 
 #[cfg(test)]
 mod tests {
-    use super::SharedFileMakeWriter;
+    use super::{SharedFileMakeWriter, collect_legacy_network_warnings};
+    use std::ffi::{OsStr, OsString};
     use std::io::{Read, Write};
+    use std::os::unix::ffi::OsStrExt;
     use tracing_subscriber::fmt::writer::MakeWriter;
+
+    /// Issue #1504: this scan runs before clap, so reading argv as `String`
+    /// aborted the process before any diagnostic could be printed.
+    #[test]
+    fn legacy_network_warnings_tolerate_non_utf8_args() {
+        let args = vec![
+            OsString::from("nono"),
+            OsString::from("run"),
+            OsStr::from_bytes(b"\xff").to_os_string(),
+        ];
+
+        assert!(collect_legacy_network_warnings(&args).is_empty());
+    }
+
+    /// A non-UTF-8 element elsewhere in argv must not stop the scan from
+    /// recognising a legacy flag that really is present.
+    #[test]
+    fn legacy_network_warnings_still_match_alongside_non_utf8_args() {
+        let args = vec![
+            OsString::from("nono"),
+            OsString::from("run"),
+            OsString::from("--allow-net"),
+            OsStr::from_bytes(b"\xff").to_os_string(),
+        ];
+
+        let warnings = collect_legacy_network_warnings(&args);
+
+        assert_eq!(warnings.len(), 1, "warnings: {warnings:?}");
+        assert!(
+            warnings[0].contains("`--allow-net` is deprecated"),
+            "warnings: {warnings:?}"
+        );
+    }
+
+    /// The scan starts at argv[1] because argv[0] holds the program, which a
+    /// caller may set to anything. The same string warns when passed as a flag
+    /// and must not warn when it is the program.
+    #[test]
+    fn legacy_network_warnings_ignore_the_program_slot() {
+        let flag = OsString::from("--allow-net");
+
+        let as_program = vec![flag.clone()];
+        assert!(collect_legacy_network_warnings(&as_program).is_empty());
+
+        let as_flag = vec![OsString::from("/usr/local/bin/nono"), flag];
+        assert_eq!(collect_legacy_network_warnings(&as_flag).len(), 1);
+    }
 
     #[test]
     fn shared_file_make_writer_appends_output() {

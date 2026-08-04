@@ -3,10 +3,10 @@ use crate::cli::{Cli, Commands, RunArgs, SetupArgs};
 use crate::command_runtime::{run_sandbox, run_shell, run_wrap};
 use crate::completions::run_completions;
 use crate::deprecated_policy;
-use crate::learn_runtime::run_learn;
 use crate::open_url_runtime::run_open_url_helper;
 use crate::output;
 use crate::package_cmd;
+use crate::platform_client;
 use crate::profile_cmd;
 use crate::proxy_command;
 use crate::registry_client::PullReason;
@@ -40,7 +40,6 @@ fn dispatch_command(
     update_handle: &mut Option<update_check::UpdateCheckHandle>,
 ) -> Result<()> {
     match command {
-        Commands::Learn(args) => run_learn(*args, silent),
         Commands::Run(args) => {
             run_command_with_update(update_handle, silent, || run_or_detach(*args, silent))
         }
@@ -66,6 +65,9 @@ fn dispatch_command(
         Commands::Audit(args) => {
             run_command_with_update(update_handle, silent, || audit_commands::run_audit(args))
         }
+        Commands::Platform(args) => run_command_with_update(update_handle, silent, || {
+            platform_client::run_platform(args)
+        }),
         Commands::Ps(args) => {
             run_command_with_update(update_handle, silent, || session_commands::run_ps(&args))
         }

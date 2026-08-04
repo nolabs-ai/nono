@@ -83,6 +83,13 @@ pub struct LoadedRoute {
     /// Either X.509 mTLS or JWT bearer, chosen at load time from the route's
     /// `spiffe` config block. `None` for non-SPIFFE routes.
     pub managed_auth: Option<Arc<crate::auth::ManagedUpstreamAuth>>,
+
+    /// Optional per-route request-rate limiter (RouteRateLimiter).
+    ///
+    /// Built from `RouteConfig::rate_limit` at load time. `None` means the
+    /// route is unlimited. Shared behind an `Arc` because the limiter carries
+    /// interior-mutable token-bucket state consulted on every request.
+    pub rate_limiter: Option<std::sync::Arc<crate::rate_limit::RouteRateLimiter>>,
 }
 
 impl std::fmt::Debug for LoadedRoute {
@@ -99,7 +106,8 @@ impl std::fmt::Debug for LoadedRoute {
                 &self.requires_managed_credential,
             )
             .field("managed_auth_mechanism", &self.managed_auth_mechanism)
-            .field("managed_injection_mode", &self.managed_injection_mode);
+            .field("managed_injection_mode", &self.managed_injection_mode)
+            .field("has_rate_limiter", &self.rate_limiter.is_some());
         let managed_auth_type = self.managed_auth.as_ref().map(|a| match a.as_ref() {
             crate::auth::ManagedUpstreamAuth::SpiffeJwt(_) => "spiffe_jwt",
         });
@@ -300,6 +308,15 @@ impl RouteStore {
             let managed_auth_mechanism = auth_mechanism_for_route(route);
             let managed_injection_mode = injection_mode_for_route(route);
 
+            let rate_limiter = route.rate_limit.as_ref().and_then(|rl| {
+                crate::rate_limit::RouteRateLimiter::new(
+                    rl.requests_per_minute,
+                    rl.burst,
+                    std::time::Duration::from_secs(rl.max_delay_secs),
+                )
+                .map(std::sync::Arc::new)
+            });
+
             loaded.insert(
                 normalized_prefix,
                 LoadedRoute {
@@ -315,6 +332,7 @@ impl RouteStore {
                     managed_auth_mechanism,
                     managed_injection_mode,
                     managed_auth,
+                    rate_limiter,
                 },
             );
         }
@@ -942,6 +960,7 @@ mod tests {
             oauth2: None,
             aws_auth: None,
             spiffe: None,
+            rate_limit: None,
         }];
 
         let store = RouteStore::load(&routes).await.unwrap();
@@ -984,6 +1003,7 @@ mod tests {
             oauth2: None,
             aws_auth: None,
             spiffe: None,
+            rate_limit: None,
         }];
 
         let store = RouteStore::load(&routes).await.unwrap();
@@ -1013,6 +1033,7 @@ mod tests {
             oauth2: None,
             aws_auth: None,
             spiffe: None,
+            rate_limit: None,
         }];
 
         let store = RouteStore::load(&routes).await.unwrap();
@@ -1043,6 +1064,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                rate_limit: None,
             },
             RouteConfig {
                 prefix: "anthropic".to_string(),
@@ -1064,6 +1086,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                rate_limit: None,
             },
         ];
 
@@ -1148,6 +1171,7 @@ mod tests {
             oauth2: None,
             aws_auth: None,
             spiffe: None,
+            rate_limit: None,
         }];
 
         let store = RouteStore::load(&routes).await?;
@@ -1191,6 +1215,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                rate_limit: None,
             }];
 
             assert!(
@@ -1239,6 +1264,7 @@ mod tests {
             managed_auth_mechanism: None,
             managed_injection_mode: None,
             managed_auth: None,
+            rate_limiter: None,
         };
         let debug_output = format!("{:?}", route);
         assert!(debug_output.contains("api.openai.com"));
@@ -1271,6 +1297,7 @@ mod tests {
             oauth2: None,
             aws_auth: None,
             spiffe: None,
+            rate_limit: None,
         }];
         let store = RouteStore::load(&routes).await.unwrap();
         let hit = store.lookup_by_upstream("api.openai.com:443").unwrap();
@@ -1309,6 +1336,7 @@ mod tests {
             oauth2: None,
             aws_auth: None,
             spiffe: None,
+            rate_limit: None,
         }];
         let store = RouteStore::load(&routes).await.unwrap();
 
@@ -1355,6 +1383,7 @@ mod tests {
             oauth2: None,
             aws_auth: None,
             spiffe: None,
+            rate_limit: None,
         }];
         let store = RouteStore::load(&routes).await.unwrap();
         let hit = store
@@ -1388,6 +1417,7 @@ mod tests {
             oauth2: None,
             aws_auth: None,
             spiffe: None,
+            rate_limit: None,
         }];
         let store = RouteStore::load(&routes).await.unwrap();
         assert!(store.is_route_upstream("aliased.example.com:443"));
@@ -1409,6 +1439,7 @@ mod tests {
             managed_auth_mechanism: Some(NetworkAuditAuthMechanism::PhantomHeader),
             managed_injection_mode: Some(NetworkAuditInjectionMode::Header),
             managed_auth: None,
+            rate_limiter: None,
         };
         assert!(managed.missing_managed_credential(false, false, false, false));
         assert!(!managed.missing_managed_credential(true, false, false, false));
@@ -1429,6 +1460,7 @@ mod tests {
             managed_auth_mechanism: None,
             managed_injection_mode: None,
             managed_auth: None,
+            rate_limiter: None,
         };
         assert!(!l7_only.missing_managed_credential(false, false, false, false));
     }
@@ -1455,6 +1487,7 @@ mod tests {
             oauth2: None,
             aws_auth: None,
             spiffe: None,
+            rate_limit: None,
         }];
         let store = RouteStore::load(&routes).await.unwrap();
         let hit = store.lookup_by_upstream("api.openai.com:443").unwrap();
@@ -1490,6 +1523,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                rate_limit: None,
             },
             RouteConfig {
                 prefix: "github_org_b".to_string(),
@@ -1514,6 +1548,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                rate_limit: None,
             },
         ];
         let store = RouteStore::load(&routes).await.unwrap();
@@ -1592,6 +1627,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                rate_limit: None,
             }
         }
 
@@ -2003,6 +2039,7 @@ h56ZLEEqHfVWFhJWIKRSabtxYPV/VJyMv+lo3L0QwSKsouHs3dtF1zVQ
             oauth2: None,
             aws_auth: None,
             spiffe: None,
+            rate_limit: None,
         }];
 
         let store = RouteStore::load(&routes)

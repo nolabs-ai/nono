@@ -611,7 +611,7 @@ fn extract_fulcio_extensions(cert_der: &[u8], bundle_path: &Path) -> Result<Fulc
         reason: format!("failed to decode certificate DER: {e}"),
     })?;
 
-    let extensions = match &cert.tbs_certificate.extensions {
+    let extensions = match cert.tbs_certificate().extensions() {
         Some(exts) => exts,
         None => {
             return Ok(FulcioExtensions {

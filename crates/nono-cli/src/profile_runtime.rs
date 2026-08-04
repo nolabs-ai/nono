@@ -704,7 +704,7 @@ fn prepare_profile_with_options(
     let (loaded_profile, resolved_command_binaries) = if let Some(ref profile_name) = args.profile {
         // The claude-code → registry-pack migration is wired into
         // `load_profile` itself so it fires from every call site (run,
-        // wrap, shell, profile show, why, learn) without duplication.
+        // wrap, shell, profile show, why) without duplication.
         let profile = profile::load_profile_with_extends(profile_name, &args.extends)?;
         crate::package_status::enforce_for_active_profile(
             Some(profile_name),
@@ -1234,6 +1234,8 @@ mod tests {
                 provider_type: profile::CredentialProviderType::OauthCapture,
                 token_endpoints: Vec::new(),
                 api_hosts: Vec::new(),
+                inject_header: None,
+                credential_format: None,
                 credential_store: Some(profile::CredentialProviderStore::FileJson {
                     path: "$HOME/.codex-nono-oauth/auth.json".to_string(),
                     phantom_fields: vec!["tokens.access_token".to_string()],
@@ -1287,6 +1289,8 @@ mod tests {
                 provider_type: profile::CredentialProviderType::OauthCapture,
                 token_endpoints: Vec::new(),
                 api_hosts: Vec::new(),
+                inject_header: None,
+                credential_format: None,
                 credential_store: Some(profile::CredentialProviderStore::FileJson {
                     path: "$HOME/.codex-nono-oauth/auth.json".to_string(),
                     phantom_fields: vec!["tokens.access_token".to_string()],

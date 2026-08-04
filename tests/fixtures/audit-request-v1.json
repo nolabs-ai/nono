@@ -1,0 +1,9 @@
+{
+  "method": "POST",
+  "path": "/api/v1/audit/ingest",
+  "subject_id": "subject-1",
+  "timestamp_ms": "1783100000000",
+  "request_id": "0197d04c-c000-7000-8000-000000000001",
+  "body_digest": "sha256:abc123",
+  "canonical": "nono-request-v1\nPOST\n/api/v1/audit/ingest\nsubject-1\n1783100000000\n0197d04c-c000-7000-8000-000000000001\nsha256:abc123"
+}

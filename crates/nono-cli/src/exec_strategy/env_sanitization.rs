@@ -163,8 +163,90 @@ pub(crate) fn validate_set_vars(
     None
 }
 
+/// Replacement value for an inherited env var that names a working directory,
+/// or `None` to copy the inherited value through unchanged.
+///
+/// `child_pwd` is `Some` only when the child starts in a directory other than the
+/// one nono was launched from. `host_pwd` is `Some` only when the inherited `$PWD`
+/// was vouched for by [`trusted_host_pwd`].
+pub(super) fn rewrite_workdir_env_var<'a>(
+    key: &str,
+    host_pwd: Option<&'a std::ffi::OsStr>,
+    child_pwd: Option<&'a std::path::Path>,
+) -> Option<&'a std::ffi::OsStr> {
+    let child_pwd = child_pwd?;
+    let child_pwd = child_pwd.as_os_str();
+    if host_pwd == Some(child_pwd) {
+        return None;
+    }
+    match key {
+        "PWD" => Some(child_pwd),
+        "OLDPWD" => host_pwd,
+        _ => None,
+    }
+}
+
+/// Whether the working-directory rewrite may run at all for this session.
+///
+/// `set_vars` is injected after the inherited-env loop, so an operator-supplied
+/// `PWD` wins over any rewrite. Standing down keeps `$OLDPWD` from describing a
+/// move away from a directory that `$PWD` never names.
+pub(super) fn pwd_rewrite_permitted(
+    config_env_vars: &[(&str, &str)],
+    set_vars: &[(String, String)],
+    blocked_extra: &[&str],
+    denied_env_vars: Option<&[String]>,
+    allowed_env_vars: Option<&[String]>,
+) -> bool {
+    if set_vars.iter().any(|(key, _)| key == "PWD") {
+        return false;
+    }
+    env_var_survives_filters(
+        "PWD",
+        config_env_vars,
+        blocked_extra,
+        denied_env_vars,
+        allowed_env_vars,
+    )
+}
+
+/// The host `$PWD` eligible to drive `$OLDPWD` in [`rewrite_workdir_env_var`], or
+/// `None` when the inherited value cannot be trusted.
+pub(crate) fn host_pwd_before_sandbox(
+    launch_cwd: Option<&std::path::Path>,
+) -> Option<std::ffi::OsString> {
+    trusted_host_pwd(std::env::var_os("PWD"), launch_cwd)
+}
+
+/// The host `$PWD`, accepted only when it is a spelling of the directory nono was
+/// launched from.
+///
+/// Mirrors the guard in [`crate::sandbox_prepare`]'s `resolved_workdir`: a `$PWD` that
+/// does not canonicalise to `getcwd()` is stale or spoofed, and copying it into the
+/// child's `$OLDPWD` would tell the child it came from a directory it was never in.
+/// When `getcwd()` itself is unavailable there is nothing to validate against, so the
+/// value is rejected rather than trusted. Rejection only stands the `$OLDPWD` arm of
+/// the rewrite down; correcting `$PWD` needs no trust in the inherited value.
+fn trusted_host_pwd(
+    raw_pwd: Option<std::ffi::OsString>,
+    launch_cwd: Option<&std::path::Path>,
+) -> Option<std::ffi::OsString> {
+    let pwd = raw_pwd?;
+    // A non-UTF-8 value is dropped from the child environment, so a `PWD` spelt
+    // in one never reaches the child; rewriting `$OLDPWD` from it would claim a
+    // move away from a directory the child is never told it started in.
+    pwd.to_str()?;
+
+    let launch_cwd = launch_cwd?;
+    let path = std::path::Path::new(&pwd);
+    if !path.is_absolute() || path.canonicalize().ok()? != launch_cwd {
+        return None;
+    }
+    Some(pwd)
+}
+
 /// Decide whether an inherited env var should be dropped for sandbox execution.
-pub(super) fn should_skip_env_var(
+fn should_skip_env_var(
     key: &str,
     config_env_vars: &[(&str, &str)],
     blocked_extra: &[&str],
@@ -174,9 +256,35 @@ pub(super) fn should_skip_env_var(
         || is_dangerous_env_var(key)
 }
 
+/// Whether an inherited env var survives every environment filter and reaches the
+/// sandboxed child.
+pub(super) fn env_var_survives_filters(
+    key: &str,
+    config_env_vars: &[(&str, &str)],
+    blocked_extra: &[&str],
+    denied_env_vars: Option<&[String]>,
+    allowed_env_vars: Option<&[String]>,
+) -> bool {
+    if should_skip_env_var(key, config_env_vars, blocked_extra) {
+        return false;
+    }
+    if let Some(denied) = denied_env_vars
+        && is_env_var_denied(key, denied)
+    {
+        return false;
+    }
+    if let Some(allowed) = allowed_env_vars
+        && !is_env_var_allowed(key, allowed)
+    {
+        return false;
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsStr;
 
     // ============================================================================
     // 1Password env var blocklist — security-critical regression tests
@@ -453,5 +561,242 @@ mod tests {
     fn test_set_vars_empty_is_ok() {
         let set_vars: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         assert_eq!(validate_set_vars(&set_vars), None);
+    }
+
+    #[test]
+    fn test_workdir_vars_rewritten_when_child_relocates() {
+        let child = Some(std::path::Path::new("/tmp/foo"));
+        assert_eq!(
+            rewrite_workdir_env_var("PWD", Some(OsStr::new("/tmp/bar")), child),
+            Some(OsStr::new("/tmp/foo"))
+        );
+        assert_eq!(
+            rewrite_workdir_env_var("OLDPWD", Some(OsStr::new("/tmp/bar")), child),
+            Some(OsStr::new("/tmp/bar"))
+        );
+    }
+
+    #[test]
+    fn test_workdir_vars_inherited_when_child_stays_put() {
+        assert_eq!(
+            rewrite_workdir_env_var("PWD", Some(OsStr::new("/tmp/bar")), None),
+            None
+        );
+        assert_eq!(
+            rewrite_workdir_env_var("OLDPWD", Some(OsStr::new("/tmp/bar")), None),
+            None
+        );
+    }
+
+    #[test]
+    fn test_pwd_corrected_even_when_host_pwd_is_untrusted() {
+        let child = Some(std::path::Path::new("/tmp/foo"));
+        assert_eq!(
+            rewrite_workdir_env_var("PWD", None, child),
+            Some(OsStr::new("/tmp/foo"))
+        );
+    }
+
+    #[test]
+    fn test_rewrite_replaces_but_never_introduces() {
+        let child = Some(std::path::Path::new("/tmp/foo"));
+        assert_eq!(rewrite_workdir_env_var("OLDPWD", None, child), None);
+    }
+
+    #[test]
+    fn test_oldpwd_unchanged_when_pwd_is_correct() {
+        let child = Some(std::path::Path::new("/tmp/foo"));
+        assert_eq!(
+            rewrite_workdir_env_var("OLDPWD", Some(OsStr::new("/tmp/foo")), child),
+            None
+        );
+    }
+
+    #[test]
+    fn test_unrelated_keys_never_rewritten() {
+        let child = Some(std::path::Path::new("/tmp/foo"));
+        for key in ["HOME", "PWDX", "MYPWD", "pwd", ""] {
+            assert_eq!(
+                rewrite_workdir_env_var(key, Some(OsStr::new("/tmp/bar")), child),
+                None,
+                "key {key} should not be rewritten"
+            );
+        }
+    }
+
+    #[test]
+    fn test_non_utf8_workdir_round_trips() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let raw = b"/tmp/\xff\xfeinvalid";
+        let child = std::path::Path::new(OsStr::from_bytes(raw));
+        let rewritten = rewrite_workdir_env_var("PWD", Some(OsStr::new("/tmp/bar")), Some(child));
+        assert_eq!(rewritten.map(OsStr::as_bytes), Some(&raw[..]));
+    }
+
+    #[test]
+    fn test_pwd_dropped_by_policy_is_ineligible_for_rewrite() {
+        // A profile that strips `PWD` must not receive the same value as
+        // `$OLDPWD`, so filtering decides eligibility for both.
+        let denied = vec!["PWD".to_string()];
+        assert!(!env_var_survives_filters(
+            "PWD",
+            &[],
+            &[],
+            Some(&denied),
+            None
+        ));
+
+        let allowed_without_pwd = vec!["PATH".to_string(), "HOME".to_string()];
+        assert!(!env_var_survives_filters(
+            "PWD",
+            &[],
+            &[],
+            None,
+            Some(&allowed_without_pwd)
+        ));
+
+        let allowed_with_pwd = vec!["PWD".to_string()];
+        assert!(env_var_survives_filters(
+            "PWD",
+            &[],
+            &[],
+            None,
+            Some(&allowed_with_pwd)
+        ));
+        assert!(env_var_survives_filters("PWD", &[], &[], None, None));
+    }
+
+    #[test]
+    fn test_pwd_rewrite_stands_down_when_pwd_is_injected_or_filtered() {
+        assert!(pwd_rewrite_permitted(&[], &[], &[], None, None));
+
+        // `set_vars` lands after the inherited-env loop, so its `PWD` wins; the
+        // rewrite must not leave `$OLDPWD` describing a move `$PWD` denies.
+        let set_pwd = vec![("PWD".to_string(), "/injected".to_string())];
+        assert!(!pwd_rewrite_permitted(&[], &set_pwd, &[], None, None));
+
+        // An unrelated `set_vars` entry leaves the rewrite alone.
+        let set_other = vec![("EDITOR".to_string(), "vi".to_string())];
+        assert!(pwd_rewrite_permitted(&[], &set_other, &[], None, None));
+
+        // A `set_vars` `OLDPWD` overrides only that key; `PWD` still tracks the
+        // directory the child starts in.
+        let set_oldpwd = vec![("OLDPWD".to_string(), "/elsewhere".to_string())];
+        assert!(pwd_rewrite_permitted(&[], &set_oldpwd, &[], None, None));
+
+        // Credentials and env filters gate the rewrite the same way.
+        assert!(!pwd_rewrite_permitted(
+            &[("PWD", "/injected")],
+            &[],
+            &[],
+            None,
+            None
+        ));
+        let denied = vec!["PWD".to_string()];
+        assert!(!pwd_rewrite_permitted(&[], &[], &[], Some(&denied), None));
+    }
+
+    #[test]
+    fn test_trusted_host_pwd_accepts_a_spelling_of_the_launch_dir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real = dir.path().join("real");
+        let link = dir.path().join("link");
+        std::fs::create_dir(&real).expect("create real dir");
+        std::os::unix::fs::symlink(&real, &link).expect("create symlink");
+        // `getcwd` reports the resolved path even when the shell's `$PWD` names
+        // the symlink, so the guard must accept the symlink spelling.
+        let launch_cwd = real.canonicalize().expect("canonicalize real dir");
+
+        assert_eq!(
+            trusted_host_pwd(Some(link.clone().into_os_string()), Some(&launch_cwd)),
+            Some(link.into_os_string()),
+            "a symlink spelling of the launch dir is the shell's logical `$PWD`"
+        );
+        assert_eq!(
+            trusted_host_pwd(Some(launch_cwd.clone().into_os_string()), Some(&launch_cwd)),
+            Some(launch_cwd.clone().into_os_string())
+        );
+    }
+
+    #[test]
+    fn test_trusted_host_pwd_rejects_untrustworthy_values() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let launch_cwd = dir.path().canonicalize().expect("canonicalize tempdir");
+        let elsewhere = launch_cwd.join("elsewhere");
+        std::fs::create_dir(&elsewhere).expect("create sibling dir");
+
+        // Unset: the child is never told a working directory, so there is
+        // nothing to rewrite and nothing to introduce.
+        assert_eq!(trusted_host_pwd(None, Some(&launch_cwd)), None);
+
+        // Non-UTF-8: dropped from the child environment, so it must not become
+        // the child's `$OLDPWD` either.
+        let non_utf8 = std::ffi::OsString::from_vec(b"/tmp/\xff\xfeinvalid".to_vec());
+        assert_eq!(trusted_host_pwd(Some(non_utf8), Some(&launch_cwd)), None);
+
+        // Stale or spoofed: resolves somewhere other than `getcwd`.
+        assert_eq!(
+            trusted_host_pwd(Some(elsewhere.into_os_string()), Some(&launch_cwd)),
+            None,
+            "a `$PWD` that does not canonicalise to `getcwd` is not the launch dir"
+        );
+
+        // Nonexistent, so it cannot be shown to name the launch dir.
+        let missing = launch_cwd.join("gone");
+        assert_eq!(
+            trusted_host_pwd(Some(missing.into_os_string()), Some(&launch_cwd)),
+            None
+        );
+
+        // Relative values cannot be compared against `getcwd` verbatim.
+        assert_eq!(
+            trusted_host_pwd(Some(std::ffi::OsString::from(".")), Some(&launch_cwd)),
+            None
+        );
+
+        // No `getcwd` means nothing to validate against, so the rewrite stands
+        // down rather than trusting the inherited value.
+        assert_eq!(
+            trusted_host_pwd(Some(launch_cwd.clone().into_os_string()), None),
+            None
+        );
+    }
+
+    #[test]
+    fn test_env_var_survives_filters_honors_overrides_and_blocklist() {
+        assert!(!env_var_survives_filters(
+            "PWD",
+            &[("PWD", "/injected")],
+            &[],
+            None,
+            None
+        ));
+        assert!(!env_var_survives_filters(
+            "NONO_CAP_FILE",
+            &[],
+            &["NONO_CAP_FILE"],
+            None,
+            None
+        ));
+        assert!(!env_var_survives_filters(
+            "LD_PRELOAD",
+            &[],
+            &[],
+            None,
+            None
+        ));
+        // Deny wins over an explicit allow entry for the same key.
+        let denied = vec!["GITHUB_*".to_string()];
+        let allowed = vec!["GITHUB_TOKEN".to_string()];
+        assert!(!env_var_survives_filters(
+            "GITHUB_TOKEN",
+            &[],
+            &[],
+            Some(&denied),
+            Some(&allowed)
+        ));
     }
 }

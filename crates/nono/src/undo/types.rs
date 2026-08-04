@@ -4,7 +4,7 @@
 //! used by the object store and snapshot manager.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -478,6 +478,9 @@ pub struct SnapshotManifest {
     pub parent: Option<u32>,
     /// Map of file paths to their state at snapshot time
     pub files: HashMap<PathBuf, FileState>,
+    /// Symlinks present under the tracked roots at snapshot time.
+    #[serde(default)]
+    pub symlinks: HashSet<PathBuf>,
     /// Merkle root over all file hashes (cryptographic state commitment)
     pub merkle_root: ContentHash,
 }
@@ -549,6 +552,7 @@ mod tests {
             timestamp: "2025-01-01T00:00:00Z".to_string(),
             parent: None,
             files: HashMap::new(),
+            symlinks: HashSet::new(),
             merkle_root: ContentHash::from_bytes([0u8; 32]),
         };
         let json = serde_json::to_string(&manifest).expect("should serialize");
@@ -556,5 +560,19 @@ mod tests {
         assert_eq!(parsed.number, 0);
         assert!(parsed.parent.is_none());
         assert!(parsed.files.is_empty());
+        assert!(parsed.symlinks.is_empty());
+    }
+
+    #[test]
+    fn snapshot_manifest_loads_without_symlink_field() {
+        let json = r#"{
+            "number": 0,
+            "timestamp": "2025-01-01T00:00:00Z",
+            "parent": null,
+            "files": {},
+            "merkle_root": "0000000000000000000000000000000000000000000000000000000000000000"
+        }"#;
+        let parsed: SnapshotManifest = serde_json::from_str(json).expect("should deserialize");
+        assert!(parsed.symlinks.is_empty());
     }
 }

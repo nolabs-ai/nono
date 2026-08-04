@@ -113,14 +113,40 @@ An `intercept` rule may carry an optional `sandbox` (the same object described a
 
 ### Intercept Actions
 
-Each `intercept` entry is `{ "args": [...], "action": { "type": ... } }`. Rules are evaluated in order; the first whose `args` appear as a contiguous sequence in the invocation's arguments wins (an empty `args` is a catch-all). This lets subcommand rules match after command-global options, such as `git -c foo=bar push --force`. Broad single-argument rules like `["--force"]` match anywhere in the invocation, not only at the subcommand position. The `action.type` selects how the matched subcommand is handled:
+Each `intercept` entry selects an invocation with either legacy `args` or an explicit `match` predicate, then applies an `action`. Rules are evaluated in order; the first match wins. Legacy `args` is a contiguous argument sequence matched within the invocation's arguments (an empty `args` is a catch-all). This lets subcommand rules match after command-global options, such as `git -c foo=bar push --force`. Broad single-argument rules like `["--force"]` match anywhere in the invocation, not only at the subcommand position.
+
+Use `match` when a rule needs an explicit predicate instead of a literal `args` window. `match.argv` accepts the same matcher shapes as `invocation_policy`: `exact`, `prefix`, or `contains`. `match.env` checks environment variables after Tool Sandbox environment filtering, so profiles can mediate out-of-band behavior such as `GIT_SSH_COMMAND` without matching raw host environment state.
+
+```jsonc
+{
+  "match": {
+    "argv": { "contains": ["push", "--force"] }
+  },
+  "action": { "type": "approve" }
+}
+```
+
+```jsonc
+{
+  "match": {
+    "env": {
+      "GIT_SSH_COMMAND": { "equals": "ssh -i /tmp/fake_key" }
+    }
+  },
+  "action": { "type": "approve" }
+}
+```
+
+`match` is still a predicate over the argv and env that nono observes. It does not perform command-specific semantic normalization such as `--flag=value` versus `--flag value`, short versus long aliases (`-f` versus `--force`), repeated or duplicate flag folding, flag-order canonicalization, or git-specific parsing. It also does not expand environment references embedded inside argv tokens. If a shell expands `$FOO` before `exec`, nono sees the expanded argv; if a caller passes the literal token `$FOO`, nono matches that literal token.
+
+The `action.type` selects how the matched subcommand is handled:
 
 | `action.type` | Behavior |
 |---|---|
 | `passthrough` | Run the real binary in its sandbox. This is the default when no rule matches. |
 | `respond` | Return a static `stdout` string to the caller without forking the binary. |
 | `capture` | Run the real binary, buffering its stdout for broker inspection before returning it. |
-| `capture_credential` | Run the real binary, store its stdout as a named ambient `credential`, and return a broker nonce. |
+| `capture_credential` | Run the real binary, store its stdout as a named ambient `credential`, and return a broker nonce. An optional `shape` controls the returned nonce's form: `opaque` (default) returns the bare `nono_<hex>`; `jwt` wraps it as a structurally-valid unsigned JWT (`<header>.<payload>.<nonce>`) for callers that validate token structure before use — the embedded nonce still resolves on egress. |
 | `approve` | Route the invocation through an approval backend before forking (optional `timeout_secs`). |
 | `exec` | Run the helper at `command[0]` — with `command[1..]` then the original arguments — in place of the real binary, inside the matched command's sandbox; stream its stdout/stderr and propagate its exit code. `command[0]` is `$VAR`-expanded, must be absolute, is resolved with identity expectations, and is subject to the same non-writable-executable trust gate as a pinned `executable`. |
 
@@ -174,7 +200,9 @@ The `@git:common-dir` token runs `git rev-parse --git-common-dir` from nono's wo
 | `allow_all` | boolean | Allows unrestricted child network access. |
 | `allow_domain` | string array | Hostname allow-list. Valid only with an enforceable nono proxy/helper mode. |
 | `tcp_connect_ports` | port array | Raw TCP connect ports on Linux Landlock. Not hostname-filtered. |
-| `tcp_bind_ports` | port array | Raw TCP bind ports on Linux Landlock. |
+| `tcp_bind_ports` | port array | Raw TCP bind ports on Linux Landlock. Cannot be enforced for tool-sandbox children on macOS. |
+| `open_port` | port array | Localhost bind ports (e.g. an OAuth/OIDC loopback callback listener). Mirrors the top-level `network.open_port`; enforceable for children on macOS and Linux. |
+| `open_port_range` | `[start, end]` array | Inclusive localhost bind port ranges, e.g. `[[8250, 8255]]`. |
 
 `environment.allow_vars` accepts exact names such as `PATH`, trailing-prefix wildcards such as `AWS_*`, and the bare wildcard `*`. `environment.set_vars` injects static values after filtering; `PATH` and `NONO_*` are reserved.
 

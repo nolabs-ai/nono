@@ -12,7 +12,7 @@ use crate::error::{NonoError, Result};
 use crate::sandbox::SupportInfo;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::ptr;
 use tracing::{debug, info};
 
@@ -279,9 +279,35 @@ fn has_explicit_keychain_db_access(caps: &CapabilitySet) -> bool {
         false
     };
 
-    caps.fs_capabilities()
-        .iter()
-        .any(|cap| is_keychain_db(&cap.original) || is_keychain_db(&cap.resolved))
+    // Collect all known keychain DB paths for coverage checks below.
+    let all_keychain_dbs: Vec<PathBuf> = user_keychain_dbs
+        .as_ref()
+        .map(|dbs| dbs.to_vec())
+        .unwrap_or_default()
+        .into_iter()
+        .chain(system_keychain_dbs.iter().cloned())
+        .collect();
+
+    // Only user-intent grants unlock Mach IPC to keychain daemons. Group grants
+    // must not suppress the secd/securityd denies — Mach IPC bypasses file-level
+    // rules, so a group-sourced keychain cap would reopen access even when
+    // deny_keychains_macos is active.
+    //
+    // A directory grant covering a keychain DB also counts — e.g. a profile that
+    // allows ~/Library/Keychains (directory) covers login.keychain-db within it.
+    caps.fs_capabilities().iter().any(|cap| {
+        if !cap.source.is_user_intent() {
+            return false;
+        }
+        if cap.is_file {
+            is_keychain_db(&cap.original) || is_keychain_db(&cap.resolved)
+        } else {
+            // Directory grant: check if it covers any known keychain DB.
+            all_keychain_dbs
+                .iter()
+                .any(|db| db.starts_with(&cap.resolved) || db.starts_with(&cap.original))
+        }
+    })
 }
 
 /// Escape a path for use in Seatbelt profile strings.
@@ -715,6 +741,62 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
         profile.push('\n');
     }
 
+    // Lets libc command resolution get ENOENT (not a deny's EPERM, which aborts
+    // the PATH walk) on ungranted/missing $PATH entries. Metadata only, emitted
+    // last so it overrides read denies without exposing file contents.
+    // Separate sets: a dir may appear both as a $PATH target (needs a direct-
+    // children regex, to cover <dir>/<command>) and as another entry's
+    // ancestor (needs only literal). Tracking them together would let an
+    // ancestor-first literal suppress the later direct-children grant and
+    // re-break nested lookups.
+    let mut seen_dir = std::collections::HashSet::new();
+    let mut seen_ancestor = std::collections::HashSet::new();
+    for dir in caps.path_metadata_dirs() {
+        let dir_str = dir.to_str().ok_or_else(|| {
+            NonoError::SandboxInit(format!(
+                "PATH directory contains non-UTF-8 bytes: {}",
+                dir.display()
+            ))
+        })?;
+        if seen_dir.insert(dir_str.to_string()) {
+            // Command resolution only stats direct children (`<dir>/<command>`),
+            // never descends recursively, so scope the grant to that instead of
+            // a recursive `subpath` — the latter would expose metadata for the
+            // entire subtree nested under a $PATH dir.
+            let literal = escape_path(dir_str)?;
+            profile.push_str(&format!(
+                "(allow file-read-metadata (literal \"{}\"))\n",
+                literal
+            ));
+            let regex = regex_escape_path_for_seatbelt(dir_str)?;
+            profile.push_str(&format!(
+                "(allow file-read-metadata (regex \"^{}/[^/]+$\"))\n",
+                regex
+            ));
+        }
+        // Ancestors (literal): Seatbelt checks metadata on every component
+        // during traversal. A dir's own grant already covers it and its
+        // ancestors-were-walked, so stop at the first already-covered one.
+        let mut current = dir.parent();
+        while let Some(parent) = current {
+            let Some(parent_str) = parent.to_str() else {
+                break;
+            };
+            if parent_str == "/" || parent_str.is_empty() {
+                break;
+            }
+            if seen_dir.contains(parent_str) || !seen_ancestor.insert(parent_str.to_string()) {
+                break;
+            }
+            let escaped = escape_path(parent_str)?;
+            profile.push_str(&format!(
+                "(allow file-read-metadata (literal \"{}\"))\n",
+                escaped
+            ));
+            current = parent.parent();
+        }
+    }
+
     // Network rules
     //
     // DNS resolution rules for restricted modes (Blocked/ProxyOnly):
@@ -818,7 +900,6 @@ pub fn apply(caps: &CapabilitySet) -> Result<()> {
     let profile = generate_profile(caps)?;
 
     debug!("Generated Seatbelt profile ({} bytes)", profile.len());
-
     let profile_cstr = CString::new(profile)
         .map_err(|e| NonoError::SandboxInit(format!("Invalid profile string: {}", e)))?;
 
@@ -1021,6 +1102,66 @@ mod tests {
         assert!(profile.contains("(deny network*)"));
         // Should NOT have general outbound allow (only mDNSResponder path allows)
         assert!(!profile.contains("(allow network-outbound)\n"));
+    }
+
+    #[test]
+    fn test_generate_profile_path_metadata_dirs() {
+        let mut caps = CapabilitySet::new();
+        // A non-existent PATH dir: no fs grant, so only the metadata rule
+        // makes its probe resolve to ENOENT instead of EPERM.
+        caps.add_path_metadata_dir(PathBuf::from("/nonexistent/tools/bin"));
+        caps.add_path_metadata_dir(PathBuf::from("/opt/homebrew/bin"));
+        // Duplicate must be de-duplicated.
+        caps.add_path_metadata_dir(PathBuf::from("/opt/homebrew/bin"));
+
+        let profile = generate_profile(&caps).unwrap();
+
+        assert!(
+            profile.contains("(allow file-read-metadata (literal \"/nonexistent/tools/bin\"))")
+        );
+        assert!(
+            profile
+                .contains("(allow file-read-metadata (regex \"^/nonexistent/tools/bin/[^/]+$\"))")
+        );
+        assert_eq!(
+            profile
+                .matches("(allow file-read-metadata (literal \"/opt/homebrew/bin\"))")
+                .count(),
+            1,
+            "duplicate PATH dirs should emit a single rule"
+        );
+        assert_eq!(
+            profile
+                .matches("(allow file-read-metadata (regex \"^/opt/homebrew/bin/[^/]+$\"))")
+                .count(),
+            1,
+            "duplicate PATH dirs should emit a single rule"
+        );
+        // Ancestors are literals so path resolution can traverse to the dir.
+        assert!(profile.contains("(allow file-read-metadata (literal \"/nonexistent/tools\"))"));
+        assert!(profile.contains("(allow file-read-metadata (literal \"/nonexistent\"))"));
+        // Metadata only, direct children only — never grants data reads or
+        // recursive metadata reads on PATH dirs.
+        assert!(!profile.contains("(allow file-read* (subpath \"/nonexistent/tools/bin\"))"));
+        assert!(
+            !profile.contains("(allow file-read-metadata (subpath \"/nonexistent/tools/bin\"))")
+        );
+        assert!(!profile.contains("(allow file-read-metadata (subpath \"/opt/homebrew/bin\"))"));
+    }
+
+    #[test]
+    fn test_path_metadata_dir_that_is_also_an_ancestor_still_gets_own_grant() {
+        // Regression: a dir emitted as a literal ancestor of an earlier entry
+        // must still get its own direct-children grant when it appears as a
+        // $PATH entry, otherwise nested lookups in it fail (EPERM aborts the
+        // walk).
+        let mut caps = CapabilitySet::new();
+        caps.add_path_metadata_dir(PathBuf::from("/opt/homebrew/bin")); // emits literal /opt/homebrew
+        caps.add_path_metadata_dir(PathBuf::from("/opt/homebrew")); // must still get its own grant
+
+        let profile = generate_profile(&caps).unwrap();
+
+        assert!(profile.contains("(allow file-read-metadata (regex \"^/opt/homebrew/[^/]+$\"))"));
     }
 
     #[test]
@@ -1356,6 +1497,58 @@ mod tests {
             resolved: metadata_keychain_db,
             access: AccessMode::Read,
             is_file: true,
+            source: CapabilitySource::Profile,
+        });
+
+        let profile = generate_profile(&caps).unwrap();
+
+        assert!(!profile.contains("(deny mach-lookup (global-name \"com.apple.SecurityServer\"))"));
+        assert!(!profile.contains("(deny mach-lookup (global-name \"com.apple.securityd\"))"));
+        assert!(
+            !profile.contains("(deny mach-lookup (global-name \"com.apple.security.keychaind\"))")
+        );
+        assert!(!profile.contains("(deny mach-lookup (global-name \"com.apple.secd\"))"));
+        assert!(!profile.contains("(deny mach-lookup (global-name \"com.apple.security.agent\"))"));
+    }
+
+    #[test]
+    fn test_generate_profile_group_sourced_keychain_does_not_suppress_mach_deny() {
+        // Group-sourced keychain caps must not suppress Mach IPC denies.
+        let mut caps = CapabilitySet::new();
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/test".to_string());
+        let keychain = PathBuf::from(home).join("Library/Keychains/login.keychain-db");
+        caps.add_fs(FsCapability {
+            original: keychain.clone(),
+            resolved: keychain,
+            access: AccessMode::ReadWrite,
+            is_file: true,
+            source: CapabilitySource::Group("claude_code_macos".to_string()),
+        });
+
+        let profile = generate_profile(&caps).unwrap();
+
+        assert!(profile.contains("(deny mach-lookup (global-name \"com.apple.SecurityServer\"))"));
+        assert!(profile.contains("(deny mach-lookup (global-name \"com.apple.securityd\"))"));
+        assert!(
+            profile.contains("(deny mach-lookup (global-name \"com.apple.security.keychaind\"))")
+        );
+        assert!(profile.contains("(deny mach-lookup (global-name \"com.apple.secd\"))"));
+        assert!(profile.contains("(deny mach-lookup (global-name \"com.apple.security.agent\"))"));
+    }
+
+    #[test]
+    fn test_generate_profile_directory_grant_covering_keychain_suppresses_mach_deny() {
+        // A profile-level directory grant covering ~/Library/Keychains must suppress
+        // Mach IPC denies, the same as an explicit file grant for login.keychain-db.
+        // Regression: nolabs-ai/claude grants the Keychains directory, not individual files.
+        let mut caps = CapabilitySet::new();
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/test".to_string());
+        let keychains_dir = PathBuf::from(home).join("Library/Keychains");
+        caps.add_fs(FsCapability {
+            original: keychains_dir.clone(),
+            resolved: keychains_dir,
+            access: AccessMode::ReadWrite,
+            is_file: false,
             source: CapabilitySource::Profile,
         });
 

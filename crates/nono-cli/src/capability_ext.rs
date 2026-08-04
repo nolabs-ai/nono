@@ -7,6 +7,7 @@ use crate::cli::SandboxArgs;
 use crate::policy;
 use crate::profile::{Profile, expand_vars};
 use crate::protected_paths::{self, ProtectedRoots};
+use crate::query_ext::is_sensitive_root;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::tool_sandbox::dynamic_providers::expand_dynamic_tokens;
 
@@ -185,6 +186,7 @@ fn add_cli_unix_socket_caps(
                     caps.add_fs(cap);
                 }
             } else if let Some(parent) = path.parent()
+                && !is_sensitive_root(parent)
                 && let Some(cap) = try_new_dir(
                     parent,
                     AccessMode::ReadWrite,
@@ -861,6 +863,7 @@ impl CapabilitySetExt for CapabilitySet {
                         caps.add_fs(cap);
                     }
                 } else if let Some(parent) = path.parent()
+                    && !is_sensitive_root(parent)
                     && let Some(mut cap) = try_new_dir(parent, AccessMode::ReadWrite, &label)?
                 {
                     cap.source = CapabilitySource::Profile;

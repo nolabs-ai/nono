@@ -708,8 +708,12 @@ fn hash_merkle_node(left: [u8; 32], right: [u8; 32]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-/// Compute the alpha session digest used by the append-only ledger.
-pub fn compute_session_digest(metadata: &SessionMetadata) -> Result<ContentHash> {
+/// Encode the canonical alpha payload committed by the session digest.
+///
+/// The returned bytes are suitable for transport to an independent verifier.
+/// Consumers must hash these exact bytes with [`SESSION_DIGEST_DOMAIN_ALPHA`]
+/// rather than reserializing a parsed representation.
+pub fn canonical_session_digest_payload(metadata: &SessionMetadata) -> Result<Vec<u8>> {
     let payload = SessionDigestPayload {
         session_id: &metadata.session_id,
         started: &metadata.started,
@@ -734,9 +738,14 @@ pub fn compute_session_digest(metadata: &SessionMetadata) -> Result<ContentHash>
         audit_integrity: &metadata.audit_integrity,
         audit_attestation: &metadata.audit_attestation,
     };
-    let bytes = serde_json::to_vec(&payload).map_err(|e| {
+    serde_json::to_vec(&payload).map_err(|e| {
         NonoError::Snapshot(format!("Failed to serialize session digest payload: {e}"))
-    })?;
+    })
+}
+
+/// Compute the alpha session digest used by the append-only ledger.
+pub fn compute_session_digest(metadata: &SessionMetadata) -> Result<ContentHash> {
+    let bytes = canonical_session_digest_payload(metadata)?;
     let mut hasher = Sha256::new();
     hasher.update(SESSION_DIGEST_DOMAIN_ALPHA);
     hasher.update(bytes);

@@ -4,10 +4,17 @@ static PASSTHROUGH_INTERCEPT_ACTION: crate::command_policy::InterceptActionConfi
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(super) struct ResolvedInterceptAction<'a> {
     pub(super) action: &'a crate::command_policy::InterceptActionConfig,
-    pub(super) rule_args: Option<&'a [String]>,
+    pub(super) rule_label: Option<ResolvedInterceptRuleLabel<'a>>,
     /// Per-rule sandbox override for this matched invocation (passthrough).
     /// `None` for the fallthrough and rules without an override.
     pub(super) sandbox: Option<&'a crate::command_policy::CommandSandboxConfig>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Clone, Copy)]
+pub(super) enum ResolvedInterceptRuleLabel<'a> {
+    Args(&'a [String]),
+    Predicate(usize),
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -15,15 +22,18 @@ impl<'a> ResolvedInterceptAction<'a> {
     pub(super) fn passthrough() -> Self {
         Self {
             action: &PASSTHROUGH_INTERCEPT_ACTION,
-            rule_args: None,
+            rule_label: None,
             sandbox: None,
         }
     }
 
     pub(super) fn rule_label(&self) -> String {
-        match self.rule_args {
-            Some([]) => "<catch-all>".to_string(),
-            Some(args) => args.join(" "),
+        match self.rule_label {
+            Some(ResolvedInterceptRuleLabel::Args([])) => "<catch-all>".to_string(),
+            Some(ResolvedInterceptRuleLabel::Args(args)) => args.join(" "),
+            Some(ResolvedInterceptRuleLabel::Predicate(index)) => {
+                format!("intercept[{index}].match")
+            }
             None => "passthrough".to_string(),
         }
     }
@@ -33,39 +43,128 @@ impl<'a> ResolvedInterceptAction<'a> {
 pub(super) fn resolve_intercept_action<'a>(
     command_config: &'a crate::command_policy::CommandPolicyConfig,
     argv: &[Vec<u8>],
-) -> ResolvedInterceptAction<'a> {
+    mut env_supplier: impl FnMut() -> nono::Result<Vec<Vec<u8>>>,
+) -> nono::Result<ResolvedInterceptAction<'a>> {
     // argv[0] is the synthesised command name; match against argv[1..].
     let shim_args: Vec<&[u8]> = argv.iter().skip(1).map(|v| v.as_slice()).collect();
+    let mut predicate_env = None;
 
-    for rule in &command_config.intercept {
-        if rule.args.is_empty() {
-            return ResolvedInterceptAction {
-                action: &rule.action,
-                rule_args: Some(&rule.args),
-                sandbox: rule.sandbox.as_ref(),
-            };
+    for (index, rule) in command_config.intercept.iter().enumerate() {
+        if let Some(args) = &rule.args {
+            if intercept_args_match(args, &shim_args) {
+                return Ok(ResolvedInterceptAction {
+                    action: &rule.action,
+                    rule_label: Some(ResolvedInterceptRuleLabel::Args(args)),
+                    sandbox: rule.sandbox.as_ref(),
+                });
+            }
+            continue;
         }
-        if intercept_args_match(&rule.args, &shim_args) {
-            return ResolvedInterceptAction {
+
+        if let Some(match_config) = &rule.match_config
+            && intercept_match_config_matches(
+                match_config,
+                &shim_args,
+                &mut predicate_env,
+                &mut env_supplier,
+            )?
+        {
+            return Ok(ResolvedInterceptAction {
                 action: &rule.action,
-                rule_args: Some(&rule.args),
+                rule_label: Some(ResolvedInterceptRuleLabel::Predicate(index)),
                 sandbox: rule.sandbox.as_ref(),
-            };
+            });
         }
     }
 
-    ResolvedInterceptAction::passthrough()
+    Ok(ResolvedInterceptAction::passthrough())
 }
 
 fn intercept_args_match(expected_args: &[String], shim_args: &[&[u8]]) -> bool {
-    expected_args.is_empty()
-        || (shim_args.len() >= expected_args.len()
-            && shim_args.windows(expected_args.len()).any(|window| {
-                expected_args
+    if expected_args.is_empty() {
+        return true;
+    }
+    if shim_args.len() < expected_args.len() {
+        return false;
+    }
+    shim_args.windows(expected_args.len()).any(|window| {
+        expected_args
+            .iter()
+            .zip(window.iter())
+            .all(|(expected, actual)| expected.as_bytes() == *actual)
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn intercept_match_config_matches(
+    matcher: &crate::command_policy::InterceptRuleMatchConfig,
+    args: &[&[u8]],
+    env: &mut Option<std::collections::BTreeMap<String, String>>,
+    env_supplier: &mut impl FnMut() -> nono::Result<Vec<Vec<u8>>>,
+) -> nono::Result<bool> {
+    if let Some(argv_matcher) = &matcher.argv
+        && !intercept_argv_matcher_matches(argv_matcher, args)
+    {
+        return Ok(false);
+    }
+    if !matcher.env.is_empty() {
+        if env.is_none() {
+            let supplied_env = env_supplier()?;
+            *env = Some(invocation_env(&supplied_env)?);
+        }
+        let Some(predicate_env) = env.as_ref() else {
+            return Ok(false);
+        };
+        if !env_matchers_match(&matcher.env, predicate_env) {
+            return Ok(false);
+        }
+    }
+    Ok(matcher.argv.is_some() || !matcher.env.is_empty())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn intercept_argv_matcher_matches(
+    matcher: &crate::command_policy::ArgvMatcherConfig,
+    args: &[&[u8]],
+) -> bool {
+    if let Some(exact) = &matcher.exact {
+        if exact.is_empty() {
+            return false;
+        }
+        return args.len() == exact.len()
+            && exact
+                .iter()
+                .zip(args.iter())
+                .all(|(expected, actual)| expected.as_bytes() == *actual);
+    }
+    if let Some(prefix) = &matcher.prefix {
+        if prefix.is_empty() {
+            return false;
+        }
+        return args.len() >= prefix.len()
+            && prefix
+                .iter()
+                .zip(args.iter())
+                .all(|(expected, actual)| expected.as_bytes() == *actual);
+    }
+    if let Some(contains) = &matcher.contains {
+        if contains.is_empty() {
+            return false;
+        }
+        return args.len() >= contains.len()
+            && args.windows(contains.len()).any(|window| {
+                contains
                     .iter()
                     .zip(window.iter())
                     .all(|(expected, actual)| expected.as_bytes() == *actual)
-            }))
+            });
+    }
+    false
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+fn empty_intercept_env() -> nono::Result<Vec<Vec<u8>>> {
+    Ok(Vec::new())
 }
 
 /// Resolve the env-expanded helper path and forwarded extra args for an `exec`
@@ -395,7 +494,15 @@ fn invocation_rule_matches(
     {
         return false;
     }
-    for (name, matcher) in &rule.env {
+    env_matchers_match(&rule.env, env)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn env_matchers_match(
+    matchers: &std::collections::BTreeMap<String, crate::command_policy::EnvMatcherConfig>,
+    env: &std::collections::BTreeMap<String, String>,
+) -> bool {
+    for (name, matcher) in matchers {
         let Some(value) = env.get(name) else {
             return false;
         };
@@ -568,8 +675,8 @@ mod intercept_tests {
     use crate::command_policy::{
         ApprovalBackendConfig, ApprovalBackendType, ArgvMatcherConfig, CommandPoliciesConfig,
         CommandPolicyConfig, CommandResourceConfig, CommandSandboxConfig, EnvMatcherConfig,
-        InterceptActionConfig, InterceptRuleConfig, InvocationPolicyConfig, InvocationRuleConfig,
-        PolicyDecision, PolicyDecisionConfig,
+        InterceptActionConfig, InterceptRuleConfig, InterceptRuleMatchConfig,
+        InvocationPolicyConfig, InvocationRuleConfig, PolicyDecision, PolicyDecisionConfig,
     };
     use std::collections::BTreeMap;
 
@@ -577,7 +684,8 @@ mod intercept_tests {
     fn resolve_intercept_action_tracks_matched_rule_label() {
         let config = CommandPolicyConfig {
             intercept: vec![InterceptRuleConfig {
-                args: vec!["push".to_string(), "--force".to_string()],
+                args: Some(vec!["push".to_string(), "--force".to_string()]),
+                match_config: None,
                 action: InterceptActionConfig::Approve { timeout_secs: None },
                 sandbox: None,
             }],
@@ -585,7 +693,8 @@ mod intercept_tests {
         };
         let argv = vec![b"git".to_vec(), b"push".to_vec(), b"--force".to_vec()];
 
-        let resolved = resolve_intercept_action(&config, &argv);
+        let resolved = resolve_intercept_action(&config, &argv, empty_intercept_env)
+            .expect("resolve intercept");
 
         assert_eq!(resolved.rule_label(), "push --force");
         assert!(matches!(
@@ -598,7 +707,8 @@ mod intercept_tests {
     fn resolve_intercept_action_matches_after_leading_global_args() {
         let config = CommandPolicyConfig {
             intercept: vec![InterceptRuleConfig {
-                args: vec!["push".to_string(), "--force".to_string()],
+                args: Some(vec!["push".to_string(), "--force".to_string()]),
+                match_config: None,
                 action: InterceptActionConfig::Approve { timeout_secs: None },
                 sandbox: None,
             }],
@@ -612,7 +722,8 @@ mod intercept_tests {
             b"--force".to_vec(),
         ];
 
-        let resolved = resolve_intercept_action(&config, &argv);
+        let resolved = resolve_intercept_action(&config, &argv, empty_intercept_env)
+            .expect("resolve intercept");
 
         assert_eq!(resolved.rule_label(), "push --force");
         assert!(matches!(
@@ -625,7 +736,8 @@ mod intercept_tests {
     fn resolve_intercept_action_falls_through_when_rule_sequence_is_absent() {
         let config = CommandPolicyConfig {
             intercept: vec![InterceptRuleConfig {
-                args: vec!["push".to_string(), "--force".to_string()],
+                args: Some(vec!["push".to_string(), "--force".to_string()]),
+                match_config: None,
                 action: InterceptActionConfig::Approve { timeout_secs: None },
                 sandbox: None,
             }],
@@ -639,7 +751,8 @@ mod intercept_tests {
             b"--force".to_vec(),
         ];
 
-        let resolved = resolve_intercept_action(&config, &argv);
+        let resolved = resolve_intercept_action(&config, &argv, empty_intercept_env)
+            .expect("resolve intercept");
 
         assert_eq!(resolved.rule_label(), "passthrough");
         assert!(matches!(
@@ -649,10 +762,351 @@ mod intercept_tests {
     }
 
     #[test]
+    fn resolve_intercept_action_matches_argv_contains_predicate() {
+        let config = CommandPolicyConfig {
+            intercept: vec![InterceptRuleConfig {
+                args: None,
+                match_config: Some(InterceptRuleMatchConfig {
+                    argv: Some(ArgvMatcherConfig {
+                        exact: None,
+                        prefix: None,
+                        contains: Some(vec!["push".to_string(), "--force".to_string()]),
+                    }),
+                    env: BTreeMap::new(),
+                }),
+                action: InterceptActionConfig::Approve { timeout_secs: None },
+                sandbox: None,
+            }],
+            ..CommandPolicyConfig::default()
+        };
+        let argv = vec![
+            b"git".to_vec(),
+            b"-c".to_vec(),
+            b"foo=bar".to_vec(),
+            b"push".to_vec(),
+            b"--force".to_vec(),
+        ];
+
+        let resolved = resolve_intercept_action(&config, &argv, empty_intercept_env)
+            .expect("resolve intercept");
+
+        assert_eq!(resolved.rule_label(), "intercept[0].match");
+        assert!(matches!(
+            resolved.action,
+            InterceptActionConfig::Approve { .. }
+        ));
+    }
+
+    #[test]
+    fn resolve_intercept_action_matches_argv_prefix_predicate() {
+        let config = CommandPolicyConfig {
+            intercept: vec![InterceptRuleConfig {
+                args: None,
+                match_config: Some(InterceptRuleMatchConfig {
+                    argv: Some(ArgvMatcherConfig {
+                        exact: None,
+                        prefix: Some(vec!["push".to_string()]),
+                        contains: None,
+                    }),
+                    env: BTreeMap::new(),
+                }),
+                action: InterceptActionConfig::Approve { timeout_secs: None },
+                sandbox: None,
+            }],
+            ..CommandPolicyConfig::default()
+        };
+        let argv = vec![b"git".to_vec(), b"push".to_vec(), b"--force".to_vec()];
+
+        let resolved = resolve_intercept_action(&config, &argv, empty_intercept_env)
+            .expect("resolve intercept");
+
+        assert_eq!(resolved.rule_label(), "intercept[0].match");
+        assert!(matches!(
+            resolved.action,
+            InterceptActionConfig::Approve { .. }
+        ));
+    }
+
+    #[test]
+    fn resolve_intercept_action_exact_predicate_rejects_extra_args() {
+        let config = CommandPolicyConfig {
+            intercept: vec![InterceptRuleConfig {
+                args: None,
+                match_config: Some(InterceptRuleMatchConfig {
+                    argv: Some(ArgvMatcherConfig {
+                        exact: Some(vec!["push".to_string(), "--force".to_string()]),
+                        prefix: None,
+                        contains: None,
+                    }),
+                    env: BTreeMap::new(),
+                }),
+                action: InterceptActionConfig::Approve { timeout_secs: None },
+                sandbox: None,
+            }],
+            ..CommandPolicyConfig::default()
+        };
+        let argv = vec![
+            b"git".to_vec(),
+            b"-c".to_vec(),
+            b"foo=bar".to_vec(),
+            b"push".to_vec(),
+            b"--force".to_vec(),
+        ];
+
+        let resolved = resolve_intercept_action(&config, &argv, empty_intercept_env)
+            .expect("resolve intercept");
+
+        assert_eq!(resolved.rule_label(), "passthrough");
+        assert!(matches!(
+            resolved.action,
+            InterceptActionConfig::Passthrough
+        ));
+    }
+
+    #[test]
+    fn resolve_intercept_action_empty_argv_predicates_fall_through() {
+        for argv_matcher in [
+            ArgvMatcherConfig {
+                exact: Some(Vec::new()),
+                prefix: None,
+                contains: None,
+            },
+            ArgvMatcherConfig {
+                exact: None,
+                prefix: Some(Vec::new()),
+                contains: None,
+            },
+            ArgvMatcherConfig {
+                exact: None,
+                prefix: None,
+                contains: Some(Vec::new()),
+            },
+        ] {
+            let config = CommandPolicyConfig {
+                intercept: vec![InterceptRuleConfig {
+                    args: None,
+                    match_config: Some(InterceptRuleMatchConfig {
+                        argv: Some(argv_matcher),
+                        env: BTreeMap::new(),
+                    }),
+                    action: InterceptActionConfig::Approve { timeout_secs: None },
+                    sandbox: None,
+                }],
+                ..CommandPolicyConfig::default()
+            };
+            let argv = vec![b"git".to_vec(), b"push".to_vec(), b"--force".to_vec()];
+
+            let resolved = resolve_intercept_action(&config, &argv, empty_intercept_env)
+                .expect("resolve intercept");
+
+            assert_eq!(resolved.rule_label(), "passthrough");
+            assert!(matches!(
+                resolved.action,
+                InterceptActionConfig::Passthrough
+            ));
+        }
+    }
+
+    #[test]
+    fn resolve_intercept_action_matches_env_predicate() {
+        let config = CommandPolicyConfig {
+            intercept: vec![InterceptRuleConfig {
+                args: None,
+                match_config: Some(InterceptRuleMatchConfig {
+                    argv: None,
+                    env: BTreeMap::from([(
+                        "GIT_SSH_COMMAND".to_string(),
+                        EnvMatcherConfig {
+                            one_of: Vec::new(),
+                            equals: Some("ssh -i /tmp/fake_key".to_string()),
+                        },
+                    )]),
+                }),
+                action: InterceptActionConfig::Approve { timeout_secs: None },
+                sandbox: None,
+            }],
+            ..CommandPolicyConfig::default()
+        };
+        let argv = vec![b"git".to_vec(), b"push".to_vec()];
+        let env = vec![b"GIT_SSH_COMMAND=ssh -i /tmp/fake_key".to_vec()];
+
+        let resolved = resolve_intercept_action(&config, &argv, || Ok(env.clone()))
+            .expect("resolve intercept");
+
+        assert_eq!(resolved.rule_label(), "intercept[0].match");
+        assert!(matches!(
+            resolved.action,
+            InterceptActionConfig::Approve { .. }
+        ));
+    }
+
+    #[test]
+    fn resolve_intercept_action_env_predicate_falls_through_when_missing() {
+        let config = CommandPolicyConfig {
+            intercept: vec![InterceptRuleConfig {
+                args: None,
+                match_config: Some(InterceptRuleMatchConfig {
+                    argv: None,
+                    env: BTreeMap::from([(
+                        "GIT_SSH_COMMAND".to_string(),
+                        EnvMatcherConfig {
+                            one_of: Vec::new(),
+                            equals: Some("ssh -i /tmp/fake_key".to_string()),
+                        },
+                    )]),
+                }),
+                action: InterceptActionConfig::Approve { timeout_secs: None },
+                sandbox: None,
+            }],
+            ..CommandPolicyConfig::default()
+        };
+        let argv = vec![b"git".to_vec(), b"push".to_vec()];
+
+        let resolved = resolve_intercept_action(&config, &argv, empty_intercept_env)
+            .expect("resolve intercept");
+
+        assert_eq!(resolved.rule_label(), "passthrough");
+        assert!(matches!(
+            resolved.action,
+            InterceptActionConfig::Passthrough
+        ));
+    }
+
+    #[test]
+    fn resolve_intercept_action_stops_before_later_env_predicate() {
+        let config = CommandPolicyConfig {
+            intercept: vec![
+                InterceptRuleConfig {
+                    args: Some(vec!["push".to_string()]),
+                    match_config: None,
+                    action: InterceptActionConfig::Approve { timeout_secs: None },
+                    sandbox: None,
+                },
+                InterceptRuleConfig {
+                    args: None,
+                    match_config: Some(InterceptRuleMatchConfig {
+                        argv: None,
+                        env: BTreeMap::from([(
+                            "GIT_SSH_COMMAND".to_string(),
+                            EnvMatcherConfig {
+                                one_of: Vec::new(),
+                                equals: Some("ssh -i /tmp/fake_key".to_string()),
+                            },
+                        )]),
+                    }),
+                    action: InterceptActionConfig::Respond {
+                        stdout: "env match".to_string(),
+                    },
+                    sandbox: None,
+                },
+            ],
+            ..CommandPolicyConfig::default()
+        };
+        let argv = vec![b"git".to_vec(), b"push".to_vec()];
+        let mut env_requested = false;
+
+        let resolved = resolve_intercept_action(&config, &argv, || {
+            env_requested = true;
+            Err(nono::NonoError::SandboxInit(
+                "env should not be read".to_string(),
+            ))
+        })
+        .expect("resolve intercept");
+
+        assert!(!env_requested);
+        assert_eq!(resolved.rule_label(), "push");
+        assert!(matches!(
+            resolved.action,
+            InterceptActionConfig::Approve { .. }
+        ));
+    }
+
+    #[test]
+    fn resolve_intercept_action_stops_before_later_argv_predicate() {
+        let config = CommandPolicyConfig {
+            intercept: vec![
+                InterceptRuleConfig {
+                    args: Some(vec!["push".to_string()]),
+                    match_config: None,
+                    action: InterceptActionConfig::Approve { timeout_secs: None },
+                    sandbox: None,
+                },
+                InterceptRuleConfig {
+                    args: None,
+                    match_config: Some(InterceptRuleMatchConfig {
+                        argv: Some(ArgvMatcherConfig {
+                            exact: Some(vec!["status".to_string()]),
+                            prefix: None,
+                            contains: None,
+                        }),
+                        env: BTreeMap::new(),
+                    }),
+                    action: InterceptActionConfig::Respond {
+                        stdout: "argv match".to_string(),
+                    },
+                    sandbox: None,
+                },
+            ],
+            ..CommandPolicyConfig::default()
+        };
+        let argv = vec![b"git".to_vec(), b"push".to_vec(), vec![0xff]];
+
+        let resolved = resolve_intercept_action(&config, &argv, empty_intercept_env)
+            .expect("resolve intercept");
+
+        assert_eq!(resolved.rule_label(), "push");
+        assert!(matches!(
+            resolved.action,
+            InterceptActionConfig::Approve { .. }
+        ));
+    }
+
+    #[test]
+    fn resolve_intercept_action_non_utf8_argv_predicate_falls_through() {
+        let config = CommandPolicyConfig {
+            intercept: vec![
+                InterceptRuleConfig {
+                    args: None,
+                    match_config: Some(InterceptRuleMatchConfig {
+                        argv: Some(ArgvMatcherConfig {
+                            exact: Some(vec!["status".to_string()]),
+                            prefix: None,
+                            contains: None,
+                        }),
+                        env: BTreeMap::new(),
+                    }),
+                    action: InterceptActionConfig::Respond {
+                        stdout: "argv match".to_string(),
+                    },
+                    sandbox: None,
+                },
+                InterceptRuleConfig {
+                    args: Some(vec!["push".to_string()]),
+                    match_config: None,
+                    action: InterceptActionConfig::Approve { timeout_secs: None },
+                    sandbox: None,
+                },
+            ],
+            ..CommandPolicyConfig::default()
+        };
+        let argv = vec![b"git".to_vec(), b"push".to_vec(), vec![0xff]];
+
+        let resolved = resolve_intercept_action(&config, &argv, empty_intercept_env)
+            .expect("resolve intercept");
+
+        assert_eq!(resolved.rule_label(), "push");
+        assert!(matches!(
+            resolved.action,
+            InterceptActionConfig::Approve { .. }
+        ));
+    }
+
+    #[test]
     fn resolve_intercept_action_labels_catch_all_rule() {
         let config = CommandPolicyConfig {
             intercept: vec![InterceptRuleConfig {
-                args: Vec::new(),
+                args: Some(Vec::new()),
+                match_config: None,
                 action: InterceptActionConfig::Approve { timeout_secs: None },
                 sandbox: None,
             }],
@@ -660,7 +1114,8 @@ mod intercept_tests {
         };
         let argv = vec![b"git".to_vec(), b"status".to_vec()];
 
-        let resolved = resolve_intercept_action(&config, &argv);
+        let resolved = resolve_intercept_action(&config, &argv, empty_intercept_env)
+            .expect("resolve intercept");
 
         assert_eq!(resolved.rule_label(), "<catch-all>");
         assert!(matches!(
@@ -678,12 +1133,14 @@ mod intercept_tests {
         let config = CommandPolicyConfig {
             intercept: vec![
                 InterceptRuleConfig {
-                    args: vec!["with-override".to_string()],
+                    args: Some(vec!["with-override".to_string()]),
+                    match_config: None,
                     action: InterceptActionConfig::Passthrough,
                     sandbox: Some(override_sandbox.clone()),
                 },
                 InterceptRuleConfig {
-                    args: vec!["no-override".to_string()],
+                    args: Some(vec!["no-override".to_string()]),
+                    match_config: None,
                     action: InterceptActionConfig::Passthrough,
                     sandbox: None,
                 },
@@ -691,15 +1148,29 @@ mod intercept_tests {
             ..CommandPolicyConfig::default()
         };
 
-        let with = resolve_intercept_action(&config, &[b"git".to_vec(), b"with-override".to_vec()]);
+        let with = resolve_intercept_action(
+            &config,
+            &[b"git".to_vec(), b"with-override".to_vec()],
+            empty_intercept_env,
+        )
+        .expect("resolve intercept");
         assert_eq!(with.sandbox, Some(&override_sandbox));
 
-        let without =
-            resolve_intercept_action(&config, &[b"git".to_vec(), b"no-override".to_vec()]);
+        let without = resolve_intercept_action(
+            &config,
+            &[b"git".to_vec(), b"no-override".to_vec()],
+            empty_intercept_env,
+        )
+        .expect("resolve intercept");
         assert_eq!(without.sandbox, None);
 
         // Fallthrough (no matching rule) also has no override.
-        let fallthrough = resolve_intercept_action(&config, &[b"git".to_vec(), b"other".to_vec()]);
+        let fallthrough = resolve_intercept_action(
+            &config,
+            &[b"git".to_vec(), b"other".to_vec()],
+            empty_intercept_env,
+        )
+        .expect("resolve intercept");
         assert_eq!(fallthrough.sandbox, None);
     }
 

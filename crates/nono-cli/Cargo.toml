@@ -1,6 +1,6 @@
 [package]
 name = "nono-cli"
-version = "0.69.0"
+version = "0.71.0"
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
@@ -41,8 +41,8 @@ system-keyring = ["dep:keyring", "nono/system-keyring", "nono-proxy/system-keyri
 test-trust-overrides = []
 
 [dependencies]
-nono = { version = "0.69.0", path = "../nono", default-features = false }
-nono-proxy = { version = "0.69.0", path = "../nono-proxy", default-features = false }
+nono = { version = "0.71.0", path = "../nono", default-features = false }
+nono-proxy = { version = "0.71.0", path = "../nono-proxy", default-features = false }
 clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"
 colored = "3"
@@ -55,13 +55,15 @@ dirs = "6"
 walkdir.workspace = true
 ignore.workspace = true
 chrono = { version = "0.4", features = ["serde"] }
+uuid.workspace = true
+base64.workspace = true
 
 # Allocation-free integer formatting for the post-fork cgroup self-attach path
 # (resource_cgroup::child_self_attach), where malloc could deadlock.
 itoa = "1"
 
 # Signing key PKCS#8 serialization (already transitive via sigstore-verify)
-aws-lc-rs = "1"
+aws-lc-rs = "1.17.3"
 
 # Keystore access for trust signing keys (optional). Linux uses the pure-Rust
 # zbus Secret Service backend (see linux target deps), so no libdbus is linked.
@@ -73,7 +75,7 @@ keyring = { version = "3", optional = true, default-features = false }
 sigstore-sign = "0.11.0"
 tokio = { version = "1", features = ["rt"] }
 
-ureq = { version = "3", features = ["platform-verifier"] }
+ureq = { version = "3", features = ["platform-verifier", "socks-proxy"] }
 semver = "1"
 
 zeroize.workspace = true
@@ -113,7 +115,7 @@ toml.workspace = true
 serde.workspace = true
 
 [dev-dependencies]
-jsonschema = "0.46"
+jsonschema = "0.48"
 proptest = "1"
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 

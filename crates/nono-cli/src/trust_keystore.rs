@@ -7,6 +7,7 @@
 //! Integration tests can also opt into a directory-backed store by setting
 //! `NONO_TRUST_TEST_KEYSTORE_DIR`, which avoids interactive keychain prompts.
 
+use std::fs;
 #[cfg(feature = "test-trust-overrides")]
 use std::path::Path;
 use std::path::PathBuf;
@@ -280,6 +281,55 @@ impl TrustKeyStore {
         }
     }
 
+    /// Remove a stored secret. Removing an absent secret succeeds so cleanup
+    /// paths can be retried.
+    fn remove(&self, service: &str, account: &str) -> Result<()> {
+        match self {
+            Self::System => {
+                #[cfg(not(feature = "system-keyring"))]
+                {
+                    let _ = (service, account);
+                    Err(NonoError::KeystoreAccess(
+                        "system keyring is not available (built without system-keyring feature)"
+                            .to_string(),
+                    ))
+                }
+                #[cfg(feature = "system-keyring")]
+                {
+                    let entry = keyring::Entry::new(service, account).map_err(|e| {
+                        NonoError::KeystoreAccess(format!("failed to access keystore: {e}"))
+                    })?;
+                    match entry.delete_credential() {
+                        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+                        Err(other) => Err(NonoError::KeystoreAccess(format!(
+                            "failed to delete key '{account}': {other}"
+                        ))),
+                    }
+                }
+            }
+            #[cfg(feature = "test-trust-overrides")]
+            Self::Directory(root) => {
+                let path = directory_path(root, service, account);
+                match fs::remove_file(&path) {
+                    Ok(()) => Ok(()),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    Err(error) => Err(NonoError::KeystoreAccess(format!(
+                        "failed to delete key '{account}' at {}: {error}",
+                        path.display()
+                    ))),
+                }
+            }
+            Self::DirectFile(path) => match fs::remove_file(path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(NonoError::KeystoreAccess(format!(
+                    "failed to delete key at {}: {error}",
+                    path.display()
+                ))),
+            },
+        }
+    }
+
     fn store(&self, service: &str, account: &str, secret: &str) -> Result<()> {
         match self {
             Self::System => {
@@ -367,6 +417,14 @@ pub(crate) fn store_secret_for_ref(
     secret: &str,
 ) -> Result<()> {
     TrustKeyStore::from_ref(key_ref).store(service, account, secret)
+}
+
+pub(crate) fn remove_secret_for_ref(
+    key_ref: &TrustKeyRef,
+    service: &str,
+    account: &str,
+) -> Result<()> {
+    TrustKeyStore::from_ref(key_ref).remove(service, account)
 }
 
 // Legacy API — used by `load_signing_key` and `load_public_key_bytes` which are

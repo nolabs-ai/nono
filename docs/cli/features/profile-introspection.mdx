@@ -129,6 +129,9 @@ nono profile show claude-code --raw
 
 # Machine-readable output
 nono profile show claude-code --json
+
+# Emit fully resolved effective rules as JSON (same resolution as nono run)
+nono profile show claude-code --format manifest
 ```
 
 Example output:
@@ -176,6 +179,7 @@ The `--raw` flag shows path variables as written in the profile (e.g., `$HOME/.c
 | `<PROFILE>` | Profile name or file path |
 | `--json` | Output as JSON |
 | `--raw` | Show raw paths before variable expansion |
+| `--format manifest` | Emit the fully resolved effective rules as JSON (same resolution as `nono run`) |
 
 ### `nono profile diff`
 
@@ -311,6 +315,14 @@ nono profile validate ./profile.json --json | jq '.valid'
 ```
 
 ## Use Cases
+
+### Resolved effective rules
+
+`--format manifest` emits the fully resolved effective rules as JSON, using the same extends + group resolution that `nono run` uses. This is useful for policy-as-code pipelines, diffing resolved rules across environments, or feeding the output into other tooling:
+
+```bash
+nono profile show claude-code --format manifest
+```
 
 ### Auditing security posture
 

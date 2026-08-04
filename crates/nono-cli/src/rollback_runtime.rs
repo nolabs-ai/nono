@@ -1,4 +1,5 @@
 use crate::audit_attestation::{AuditSigner, write_audit_attestation};
+use crate::audit_client;
 use crate::audit_integrity::AuditRecorder;
 use crate::audit_ledger;
 use crate::launch_runtime::{RollbackLaunchOptions, rollback_base_exclusions};
@@ -565,6 +566,9 @@ pub(crate) fn finalize_supervised_exit(ctx: RollbackExitContext<'_>) -> Result<(
         if let Some(audit_state) = audit_state {
             nono::undo::SnapshotManager::write_session_metadata(&audit_state.session_dir, &meta)?;
             audit_ledger::append_session(&meta)?;
+            if let Err(error) = audit_client::maybe_ship_session(&audit_state.session_dir, &meta) {
+                warn!("Audit delivery remains queued: {error}");
+            }
         }
         audit_saved = true;
 
@@ -612,6 +616,9 @@ pub(crate) fn finalize_supervised_exit(ctx: RollbackExitContext<'_>) -> Result<(
         }
         nono::undo::SnapshotManager::write_session_metadata(&audit_state.session_dir, &meta)?;
         audit_ledger::append_session(&meta)?;
+        if let Err(error) = audit_client::maybe_ship_session(&audit_state.session_dir, &meta) {
+            warn!("Audit delivery remains queued: {error}");
+        }
     }
 
     Ok(())

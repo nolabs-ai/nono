@@ -895,10 +895,6 @@ fn render_diagnostic_line(idx: usize, line: &str, t: &theme::Theme) -> String {
         return format!("  {} {}", fg("Why:", t.blue).bold(), fg(rest, t.text));
     }
 
-    if let Some(rest) = line.strip_prefix("  Learn: ") {
-        return format!("  {} {}", fg("Learn:", t.teal).bold(), fg(rest, t.text));
-    }
-
     if let Some(rest) = line.strip_prefix("  Re-use ") {
         return format!("  {}", fg(&format!("Re-use {rest}"), t.subtext));
     }
@@ -1225,9 +1221,14 @@ mod tests {
 
     #[test]
     fn render_diagnostic_footer_preserves_line_structure() {
-        let footer = "nono diagnostic\n────────\nThe command failed.\n  Learn: nono learn";
+        let footer = "nono diagnostic\n────────\nThe command failed.\n  Try: nono run --profile my-profile -- my-app";
         let rendered = render_diagnostic_footer(footer);
         assert_eq!(rendered.lines().count(), 4);
+        assert!(
+            rendered.contains("NONO DIAGNOSTIC"),
+            "header should be uppercased"
+        );
+        assert!(rendered.contains("Try:"), "Try: prefix should be present");
     }
 
     #[test]

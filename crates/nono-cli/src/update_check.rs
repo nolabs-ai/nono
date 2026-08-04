@@ -18,7 +18,9 @@
 //! attached as HTTP headers to every `RegistryClient` request (see
 //! `registry_client.rs`). Version is conveyed via the `User-Agent` header
 //! rather than a dedicated field. The privacy posture is otherwise identical:
-//! the same anonymous installation identity, no PII.
+//! the same anonymous installation identity, no PII. When the update check is
+//! opted out (see [`update_check_opted_out`]) the `X-Nono-UUID` header is
+//! suppressed, so an opted-out install transmits no persistent identifier.
 //!
 //! To disable the update check, set `NONO_NO_UPDATE_CHECK=1` or add
 //! `[updates] check = false` to `$XDG_CONFIG_HOME/nono/config.toml` (default `~/.config/nono/config.toml`).
@@ -129,13 +131,7 @@ impl UpdateCheckHandle {
 ///   an update was found)
 /// - The state directory is unavailable
 pub fn start_background_check() -> Option<UpdateCheckHandle> {
-    // Check env var opt-out
-    if std::env::var("NONO_NO_UPDATE_CHECK").is_ok() {
-        return None;
-    }
-
-    // Check config file opt-out
-    if is_opted_out_via_config() {
+    if update_check_opted_out() {
         return None;
     }
 
@@ -191,8 +187,21 @@ pub fn start_background_check() -> Option<UpdateCheckHandle> {
     })
 }
 
-/// Check user config for update opt-out
-fn is_opted_out_via_config() -> bool {
+/// Whether the user has opted out of the update check.
+///
+/// Either source opts out:
+/// - the `NONO_NO_UPDATE_CHECK` environment variable is set — any value,
+///   including an empty string; presence alone opts out; or
+/// - the user config sets `[updates] check = false`.
+///
+/// This is the single authoritative opt-out predicate. It also gates the
+/// persistent installation identifier: when it returns `true`,
+/// [`read_installation_uuid`] returns `None`, so the `X-Nono-UUID` header is
+/// never attached to registry requests (see `registry_client.rs`).
+pub(crate) fn update_check_opted_out() -> bool {
+    if std::env::var("NONO_NO_UPDATE_CHECK").is_ok() {
+        return true;
+    }
     match crate::config::user::load_user_config() {
         Ok(Some(config)) => !config.updates.check,
         _ => false,
@@ -292,7 +301,13 @@ fn is_newer_version(current: &str, latest: &str) -> bool {
     }
 }
 
-/// Return the persisted installation UUID, or `None` if no state file exists yet. Never writes.
+/// Return the persisted installation UUID, or `None`. Never writes.
+///
+/// Returns `None` when the user has opted out of the update check (see
+/// [`update_check_opted_out`]) or when no state file exists yet. Gating on the
+/// opt-out here — rather than only at the call site — ensures the persistent
+/// identifier is suppressed for every consumer, so an opted-out install never
+/// transmits `X-Nono-UUID` even if a state file was written on an earlier run.
 ///
 /// Intentionally does not delegate to `load_or_create_state()` — that function
 /// creates the state file when none exists, which would violate this function's
@@ -300,6 +315,9 @@ fn is_newer_version(current: &str, latest: &str) -> bool {
 /// If `UpdateCheckState` changes (e.g. the `uuid` field is renamed), update
 /// both sites.
 pub(crate) fn read_installation_uuid() -> Option<String> {
+    if update_check_opted_out() {
+        return None;
+    }
     let path = state_file_path()?;
     if !path.exists() {
         return None;
@@ -490,6 +508,71 @@ mod tests {
         let _env = crate::test_env::EnvVarGuard::set_all(&[("NONO_NO_UPDATE_CHECK", "1")]);
         let handle = start_background_check();
         assert!(handle.is_none());
+    }
+
+    #[test]
+    fn test_read_installation_uuid_respects_opt_out() {
+        let _lock = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let state = tmp.path().join("state");
+        let config = tmp.path().join("config");
+        std::fs::create_dir_all(&home).expect("home dir");
+        std::fs::create_dir_all(state.join("nono")).expect("state dir");
+        std::fs::create_dir_all(&config).expect("config dir");
+        let home_str = home.to_string_lossy().to_string();
+        let state_str = state.to_string_lossy().to_string();
+        let config_str = config.to_string_lossy().to_string();
+
+        // Write a valid state file with a known UUID.
+        let uuid = "11111111-1111-4111-8111-111111111111";
+        let state_json = serde_json::to_string(&UpdateCheckState {
+            uuid: uuid.to_string(),
+            last_check: DateTime::UNIX_EPOCH,
+            cached_result: None,
+        })
+        .expect("serialize state");
+        std::fs::write(state.join("nono").join(UPDATE_STATE_FILE), state_json)
+            .expect("write state file");
+
+        let env = crate::test_env::EnvVarGuard::set_all(&[
+            ("HOME", &home_str),
+            ("XDG_STATE_HOME", &state_str),
+            ("XDG_CONFIG_HOME", &config_str),
+            // Managed so we can force it absent below while still restoring any
+            // ambient value on drop.
+            ("NONO_NO_UPDATE_CHECK", ""),
+        ]);
+        // Force the opt-out env var absent for the opted-in assertion,
+        // independent of the developer's ambient environment.
+        env.remove("NONO_NO_UPDATE_CHECK");
+
+        // Not opted out: the stored UUID is returned.
+        assert_eq!(read_installation_uuid().as_deref(), Some(uuid));
+
+        // Opted out via env var: the UUID is suppressed even though the state
+        // file still exists on disk. This is the fix for the residual-identifier
+        // bug — an opted-out install must not transmit X-Nono-UUID.
+        let optout = crate::test_env::EnvVarGuard::set_all(&[("NONO_NO_UPDATE_CHECK", "1")]);
+        assert_eq!(read_installation_uuid(), None);
+        drop(optout);
+
+        // Opting back out via config also suppresses it, and the state file is
+        // left untouched on disk (transmission stops; we never delete it).
+        std::fs::create_dir_all(config.join("nono")).expect("config/nono dir");
+        std::fs::write(
+            config.join("nono").join("config.toml"),
+            "[updates]\ncheck = false\n",
+        )
+        .expect("write config");
+        assert_eq!(read_installation_uuid(), None);
+        assert!(
+            state.join("nono").join(UPDATE_STATE_FILE).exists(),
+            "state file must not be deleted by opt-out"
+        );
     }
 
     #[test]

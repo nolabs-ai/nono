@@ -5,6 +5,7 @@
 
 use clap::builder::styling::{Style, Styles};
 use clap::{Parser, Subcommand, ValueEnum};
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 const STYLES: Styles = Styles::plain().header(Style::new().bold());
@@ -32,7 +33,6 @@ const STYLES: Styles = Styles::plain().header(Style::new().bold());
   wrap       Apply sandbox and exec into command (nono disappears)
 
 \x1b[1mEXPLORATION & DEBUGGING\x1b[0m
-  learn      [deprecated] Use `nono run` to learn from sandbox denials
   why        Check why filesystem, network, scope, or command access would be allowed or denied
   proxy      Run the network filtering / credential proxy as a standalone server
 
@@ -46,6 +46,7 @@ const STYLES: Styles = Styles::plain().header(Style::new().bold());
   session    Manage runtime session storage
   rollback   Manage rollback sessions (browse, restore, cleanup)
   audit      View audit trail of sandboxed commands
+  platform   Enroll with and inspect an audit control plane
   trust      Manage file trust and attestation
 
 \x1b[1mPACKS\x1b[0m
@@ -179,34 +180,6 @@ pub enum Commands {
     Wrap(Box<WrapArgs>),
 
     // ── Exploration & debugging ─────────────────────────────────────────
-    /// [deprecated] Use `nono run` to learn from sandbox denials
-    /// DEPRECATED(canonical="nono run", introduced="v0.50.1", remove_by="v1.0.0", issue="#445")
-    #[command(trailing_var_arg = true)]
-    #[command(help_template = "\
-{about}
-
-\x1b[1mUSAGE\x1b[0m
-  nono learn [flags] <program>...
-
-{all-args}
-{after-help}")]
-    #[command(after_help = "\x1b[1mDEPRECATED\x1b[0m
-  Use `nono run --profile <name> -- <command>` instead. `nono run` keeps the
-  command sandboxed, reports denials, and offers to save profile updates.
-
-\x1b[1mEXAMPLES\x1b[0m
-  nono run --profile my-profile -- my-app      # Preferred learning workflow
-  nono learn --profile my-profile -- my-app    # Deprecated compatibility path
-  nono learn --json -- node server.js          # Output as JSON for profile
-  nono learn --timeout 30 -- my-app            # Limit trace duration
-
-\x1b[1mPLATFORM NOTES\x1b[0m
-  Linux   Uses strace (install with: apt install strace)
-  macOS   Prefer: nono run --profile <name> -- <command>
-          Legacy unsandboxed fs_usage/nettop tracing: nono learn --trace -- <command>
-")]
-    Learn(Box<LearnArgs>),
-
     /// Check why filesystem, network, scope, or command access would be allowed or denied
     #[command(help_template = "\
 {about}
@@ -221,7 +194,7 @@ pub enum Commands {
   nono why --path ./src --op write --allow .   # Check with capability context
   nono why --json --path ~/.aws --op read      # JSON output for agents
   nono why --host api.openai.com --port 443    # Query network access
-  nono why --self --path /tmp --op write       # Inside sandbox, query own capabilities
+  nono why --self --path /var --op write       # Inside sandbox, query own capabilities
   nono why --profile gh --command gh -- issue comment 1052
                                                 # Query ETI command argv policy
 
@@ -294,6 +267,23 @@ pub enum Commands {
   nono audit show <id> --json                  # Export as JSON
 ")]
     Audit(AuditArgs),
+
+    /// Enroll with and inspect an audit control plane
+    #[command(subcommand_help_heading = "COMMANDS", disable_help_subcommand = true)]
+    #[command(help_template = "\
+{about}
+
+\x1b[1mUSAGE\x1b[0m
+  nono platform <command>
+
+{all-args}
+{after-help}")]
+    #[command(after_help = "\x1b[1mEXAMPLES\x1b[0m
+  nono platform enroll --url https://nono.example.com --token \"$TOKEN\"
+  nono platform status
+  nono platform status --json
+")]
+    Platform(PlatformArgs),
 
     /// Manage file trust and attestation
     #[command(subcommand_help_heading = "COMMANDS", disable_help_subcommand = true)]
@@ -2120,7 +2110,7 @@ pub struct RunArgs {
 
     /// Command to run inside the sandbox (optional if profile specifies `binary`)
     #[arg(hide = true)]
-    pub command: Vec<String>,
+    pub command: Vec<OsString>,
 
     /// Print help
     #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
@@ -2168,7 +2158,7 @@ pub struct WrapArgs {
 
     /// Command to run inside the sandbox
     #[arg(required = true, hide = true)]
-    pub command: Vec<String>,
+    pub command: Vec<OsString>,
 
     /// Print help
     #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
@@ -2212,7 +2202,7 @@ pub struct WhyArgs {
 
     /// Arguments for --command after `--`
     #[arg(last = true, value_name = "ARGS", help_heading = "QUERY")]
-    pub command_args: Vec<String>,
+    pub command_args: Vec<OsString>,
 
     /// Path to check
     #[arg(long, help_heading = "QUERY")]
@@ -2288,55 +2278,6 @@ pub struct WhyArgs {
     /// Working directory for $WORKDIR expansion in profiles
     #[arg(long, value_name = "DIR", help_heading = "CONTEXT")]
     pub workdir: Option<PathBuf>,
-
-    /// Print help
-    #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
-    pub help: Option<bool>,
-}
-
-#[derive(Parser, Debug)]
-#[command(disable_help_flag = true)]
-pub struct LearnArgs {
-    /// Use a named profile to compare against (shows only missing paths)
-    #[arg(long, short = 'p', value_name = "NAME", help_heading = "OPTIONS")]
-    pub profile: Option<String>,
-
-    /// Extend the selected profile with an additional base profile for this comparison
-    #[arg(
-        long,
-        value_name = "PROFILE",
-        requires = "profile",
-        help_heading = "OPTIONS"
-    )]
-    pub extends: Vec<String>,
-
-    /// Output discovered paths as JSON fragment for profile
-    #[arg(long, help_heading = "OPTIONS")]
-    pub json: bool,
-
-    /// Timeout in seconds (default: run until command exits)
-    #[arg(long, value_name = "SECS", help_heading = "OPTIONS")]
-    pub timeout: Option<u64>,
-
-    /// Show all accessed paths, not just those that would be blocked
-    #[arg(long, help_heading = "OPTIONS")]
-    pub all: bool,
-
-    /// Skip reverse DNS lookups for discovered IPs
-    #[arg(long, help_heading = "OPTIONS")]
-    pub no_rdns: bool,
-
-    /// On macOS, use legacy unsandboxed fs_usage/nettop tracing
-    #[arg(long, help_heading = "OPTIONS")]
-    pub trace: bool,
-
-    /// Enable verbose output
-    #[arg(long, short = 'v', action = clap::ArgAction::Count, help_heading = "OPTIONS")]
-    pub verbose: u8,
-
-    /// Command to trace
-    #[arg(required = true, hide = true)]
-    pub command: Vec<String>,
 
     /// Print help
     #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
@@ -2520,6 +2461,111 @@ pub enum AuditCommands {
     Verify(AuditVerifyArgs),
     /// Remove old audit sessions
     Cleanup(AuditCleanupArgs),
+    /// Deliver queued final audit sessions to the enrolled platform
+    Sync(AuditSyncArgs),
+    /// Show audit delivery queue status
+    Status(AuditStatusArgs),
+}
+
+#[derive(Parser, Debug)]
+#[command(disable_help_flag = true)]
+pub struct AuditSyncArgs {
+    /// Print delivery results as JSON
+    #[arg(long)]
+    pub json: bool,
+
+    /// Print help
+    #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
+    pub help: Option<bool>,
+}
+
+#[derive(Parser, Debug)]
+#[command(disable_help_flag = true)]
+pub struct AuditStatusArgs {
+    /// Print status as JSON
+    #[arg(long)]
+    pub json: bool,
+
+    /// Print help
+    #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
+    pub help: Option<bool>,
+}
+
+// ---------------------------------------------------------------------------
+// Platform enrollment command args
+// ---------------------------------------------------------------------------
+
+#[derive(Parser, Debug)]
+#[command(disable_help_flag = true)]
+pub struct PlatformArgs {
+    #[command(subcommand)]
+    pub command: PlatformCommands,
+
+    /// Print help
+    #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
+    pub help: Option<bool>,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum PlatformCommands {
+    /// Exchange a one-time token for an audit-only enrolled identity
+    Enroll(PlatformEnrollArgs),
+    /// Show the locally enrolled platform identity
+    Status(PlatformStatusArgs),
+    /// Remove the local platform enrollment
+    Unenroll(PlatformUnenrollArgs),
+}
+
+#[derive(Parser, Debug)]
+#[command(disable_help_flag = true)]
+pub struct PlatformEnrollArgs {
+    /// Platform origin, for example https://nono.example.com
+    #[arg(long)]
+    pub url: String,
+
+    /// Short-lived, single-use enrollment token
+    #[arg(long)]
+    pub token: String,
+
+    /// Enroll as a durable workload instead of a developer device
+    #[arg(long)]
+    pub workload: bool,
+
+    /// Operator-facing label for this device or workload
+    #[arg(long)]
+    pub name: Option<String>,
+
+    /// Private key location (keystore:// name or absolute file:// URI)
+    #[arg(long, default_value = "keystore://platform-device")]
+    pub keyref: String,
+
+    /// Print help
+    #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
+    pub help: Option<bool>,
+}
+
+#[derive(Parser, Debug)]
+#[command(disable_help_flag = true)]
+pub struct PlatformStatusArgs {
+    /// Print status as JSON
+    #[arg(long)]
+    pub json: bool,
+
+    /// Print help
+    #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
+    pub help: Option<bool>,
+}
+
+#[derive(Parser, Debug)]
+#[command(disable_help_flag = true)]
+pub struct PlatformUnenrollArgs {
+    /// Also delete the local signing key (the next enrollment mints a new one)
+    #[arg(long)]
+    pub delete_key: bool,
+
+    /// Print help
+    #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
+    pub help: Option<bool>,
 }
 
 #[derive(Parser, Debug)]
@@ -3113,7 +3159,7 @@ mod tests {
     }
 
     #[test]
-    fn test_why_and_learn_extends_parse() {
+    fn test_why_extends_parse() {
         let cli = Cli::parse_from([
             "nono",
             "why",
@@ -3127,20 +3173,6 @@ mod tests {
         match cli.command {
             Commands::Why(args) => assert_eq!(args.extends, vec!["base".to_string()]),
             _ => panic!("Expected Why command"),
-        }
-
-        let cli = Cli::parse_from([
-            "nono",
-            "learn",
-            "--profile",
-            "agent",
-            "--extends",
-            "base",
-            "echo",
-        ]);
-        match cli.command {
-            Commands::Learn(args) => assert_eq!(args.extends, vec!["base".to_string()]),
-            _ => panic!("Expected Learn command"),
         }
     }
 
@@ -4466,7 +4498,6 @@ mod tests {
         "run",
         "shell",
         "wrap",
-        "learn",
         "why",
         "proxy",
         "ps",
@@ -4478,6 +4509,7 @@ mod tests {
         "session",
         "rollback",
         "audit",
+        "platform",
         "trust",
         "policy",
         "profile",

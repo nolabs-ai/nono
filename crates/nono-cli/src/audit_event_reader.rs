@@ -1,6 +1,7 @@
 use crate::audit_integrity::{
     AUDIT_EVENTS_FILENAME, AuditEventPayload, AuditEventRecord, CommandPolicyAuditEvent,
 };
+use nono::supervisor::AuditEntry;
 use nono::{NonoError, Result};
 use serde::Serialize;
 use std::fs::File;
@@ -80,4 +81,41 @@ pub(crate) fn command_policy_events_json(session_dir: &Path) -> Result<Vec<serde
         values.push(value);
     }
     Ok(values)
+}
+
+pub(crate) fn load_capability_decisions(session_dir: &Path) -> Result<Vec<AuditEntry>> {
+    let path = session_dir.join(AUDIT_EVENTS_FILENAME);
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let file = File::open(&path).map_err(|e| {
+        NonoError::Snapshot(format!(
+            "Failed to open audit event log {}: {e}",
+            path.display()
+        ))
+    })?;
+    let reader = BufReader::new(file);
+    let mut events = Vec::new();
+    for (index, line) in reader.lines().enumerate() {
+        let line = line.map_err(|e| {
+            NonoError::Snapshot(format!(
+                "Failed to read audit event log {}: {e}",
+                path.display()
+            ))
+        })?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let record: AuditEventRecord = serde_json::from_str(&line).map_err(|e| {
+            NonoError::Snapshot(format!(
+                "Failed to parse audit event record {} line {}: {e}",
+                path.display(),
+                index.saturating_add(1)
+            ))
+        })?;
+        if let AuditEventPayload::CapabilityDecision { entry } = record.event {
+            events.push(entry);
+        }
+    }
+    Ok(events)
 }

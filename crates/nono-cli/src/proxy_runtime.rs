@@ -1462,7 +1462,8 @@ pub(crate) fn prepare_proxy_launch_options(
     let has_credentials = !credentials.is_empty();
     let would_activate = has_domain_filter || has_credentials || upstream_proxy_addr.is_some();
 
-    // --block-net always wins; profile network.block yields to any proxy config.
+    // Normal launch validation rejects hard-block plus proxy-mode inputs before
+    // this fallback can choose BlockAll or strict filtering.
     let block_wins = args.block_net || (prepared.profile_network_block && !would_activate);
     if block_wins {
         if would_activate {
@@ -1480,7 +1481,6 @@ pub(crate) fn prepare_proxy_launch_options(
         return Ok(NetworkIntent::BlockAll);
     }
 
-    // Profile network.block + proxy flags → strict mode: deny unlisted hosts.
     let strict_filter = prepared.profile_network_block;
 
     let (plain_entries, endpoint_entries): (Vec<_>, Vec<_>) = allow_domain
@@ -1896,6 +1896,7 @@ fn collect_tool_sandbox_proxy_grants(
                 .transpose()?,
             aws_auth: None,
             spiffe: None,
+            rate_limit: None,
         };
 
         if let Some(existing) = custom_credentials.get(&grant.name) {
@@ -2354,6 +2355,16 @@ pub(crate) fn build_proxy_config_from_flags(
         .unwrap_or(&[]);
     let (_, endpoint_routes) =
         network_policy::partition_allow_domain(&net_policy, endpoint_allow_domain)?;
+    // Keep the user's host-filtering intent separate from entries derived for
+    // proxy internals. An open policy is represented downstream by an empty
+    // allowlist; adding a credential upstream to that empty list would
+    // accidentally turn allow-all into allow-only-that-upstream (#1485).
+    let host_allowlist_active = proxy.strict_filter
+        || !resolved.hosts.is_empty()
+        || !resolved.suffixes.is_empty()
+        || !plain_hosts.is_empty()
+        || !endpoint_routes.is_empty();
+
     // Endpoint-restricted domains need filter allowlist access so the proxy
     // can reach upstream after TLS interception (h2 checks the filter at
     // connection setup, before per-stream route matching).
@@ -2369,24 +2380,26 @@ pub(crate) fn build_proxy_config_from_flags(
     // when the child curls the real upstream URL (CONNECT + TLS intercept).
     // Use url::Url::parse so credentials embedded in the URL (user:pass@host)
     // don't end up in the allowlist as a garbled "user:pass@host:port" string.
-    for route in &routes {
-        if let Ok(parsed) = url::Url::parse(&route.upstream)
-            && let Some(host) = parsed.host_str()
-        {
-            let default_port = if parsed.scheme() == "https" {
-                443u16
-            } else {
-                80u16
-            };
-            let port = parsed.port().unwrap_or(default_port);
-            let host_port = format!("{}:{}", host, port);
-            if !plain_hosts.iter().any(|h| h == &host_port) {
-                plain_hosts.push(host_port);
-            }
-            // HostFilter matches on hostname only; also allow the bare host so
-            // CONNECT targets like localhost:19871 pass the filter as "localhost".
-            if !plain_hosts.iter().any(|h| h == host) {
-                plain_hosts.push(host.to_string());
+    if host_allowlist_active {
+        for route in &routes {
+            if let Ok(parsed) = url::Url::parse(&route.upstream)
+                && let Some(host) = parsed.host_str()
+            {
+                let default_port = if parsed.scheme() == "https" {
+                    443u16
+                } else {
+                    80u16
+                };
+                let port = parsed.port().unwrap_or(default_port);
+                let host_port = format!("{}:{}", host, port);
+                if !plain_hosts.iter().any(|h| h == &host_port) {
+                    plain_hosts.push(host_port);
+                }
+                // HostFilter matches on hostname only; also allow the bare host so
+                // CONNECT targets like localhost:19871 pass the filter as "localhost".
+                if !plain_hosts.iter().any(|h| h == host) {
+                    plain_hosts.push(host.to_string());
+                }
             }
         }
     }
@@ -2490,8 +2503,16 @@ fn synthesize_credential_provider_proxy_config(
                 upstream: api_host.clone(),
                 credential_key: None,
                 inject_mode: InjectMode::Header,
-                inject_header: "Authorization".to_string(),
-                credential_format: Some("Bearer {}".to_string()),
+                inject_header: provider
+                    .inject_header
+                    .clone()
+                    .unwrap_or_else(|| "Authorization".to_string()),
+                credential_format: Some(
+                    provider
+                        .credential_format
+                        .clone()
+                        .unwrap_or_else(|| "Bearer {}".to_string()),
+                ),
                 path_pattern: None,
                 path_replacement: None,
                 query_param_name: None,
@@ -2512,6 +2533,7 @@ fn synthesize_credential_provider_proxy_config(
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                rate_limit: None,
             });
             consumers_by_provider
                 .entry(route.provider.clone())
@@ -3294,6 +3316,89 @@ mod tests {
         );
     }
 
+    fn proxy_with_custom_credential(
+        strict_filter: bool,
+        allow_domain: Vec<crate::profile::AllowDomainEntry>,
+    ) -> ProxyLaunchOptions {
+        let credential = serde_json::from_value(serde_json::json!({
+            "upstream": "https://bedrock-runtime.us-east-1.amazonaws.com",
+            "aws_auth": { "region": "us-east-1" }
+        }))
+        .expect("custom credential should deserialize");
+
+        ProxyLaunchOptions {
+            domain_filter: (!allow_domain.is_empty()).then_some(DomainFilterIntent {
+                network_profile: None,
+                allow_domain,
+                deny_domain: Vec::new(),
+            }),
+            credentials: Some(CredentialProxyIntent {
+                credentials: vec!["bedrock".to_string()],
+                custom_credentials: HashMap::from([("bedrock".to_string(), credential)]),
+                endpoint_restrictions: Vec::new(),
+            }),
+            strict_filter,
+            ..ProxyLaunchOptions::default()
+        }
+    }
+
+    /// Regression test for #1485: adding a credential route to an open network
+    /// policy must not populate the host allowlist and restrict all other egress.
+    #[test]
+    fn test_custom_credential_preserves_open_network_policy() {
+        let proxy = proxy_with_custom_credential(false, Vec::new());
+        let config = build_proxy_config_from_flags(&proxy).expect("build proxy config");
+
+        assert!(
+            config.allowed_hosts.is_empty(),
+            "an open network policy must retain the empty allowlist sentinel"
+        );
+        assert!(
+            config.routes.iter().any(|route| route.prefix == "bedrock"),
+            "the credential route must still be active"
+        );
+    }
+
+    #[test]
+    fn test_custom_credential_upstream_is_added_to_active_host_allowlist() {
+        let proxy = proxy_with_custom_credential(
+            false,
+            vec![crate::profile::AllowDomainEntry::Plain(
+                "www.example.com".to_string(),
+            )],
+        );
+        let config = build_proxy_config_from_flags(&proxy).expect("build proxy config");
+
+        assert!(
+            config
+                .allowed_hosts
+                .iter()
+                .any(|host| host == "www.example.com"),
+            "the explicit allowlist entry must be preserved"
+        );
+        assert!(
+            config
+                .allowed_hosts
+                .iter()
+                .any(|host| host == "bedrock-runtime.us-east-1.amazonaws.com:443"),
+            "the credential upstream must remain reachable in allowlist mode"
+        );
+    }
+
+    #[test]
+    fn test_custom_credential_upstream_is_added_to_strict_empty_allowlist() {
+        let proxy = proxy_with_custom_credential(true, Vec::new());
+        let config = build_proxy_config_from_flags(&proxy).expect("build proxy config");
+
+        assert!(
+            config
+                .allowed_hosts
+                .iter()
+                .any(|host| host == "bedrock-runtime.us-east-1.amazonaws.com:443"),
+            "the credential upstream must remain reachable in strict mode"
+        );
+    }
+
     #[test]
     fn test_build_proxy_config_propagates_no_proxy() -> Result<()> {
         let proxy = ProxyLaunchOptions {
@@ -3404,6 +3509,7 @@ mod tests {
                 tls_client_key: None,
                 aws_auth: None,
                 spiffe: None,
+                rate_limit: None,
             },
         );
 
@@ -3892,6 +3998,7 @@ mod tests {
             oauth2: None,
             aws_auth: None,
             spiffe: None,
+            rate_limit: None,
         });
         let credential_env_vars = vec![
             (
@@ -4768,6 +4875,8 @@ mod tests {
                     request_nonce_fields: vec!["refresh_token".to_string()],
                 }],
                 api_hosts: vec!["https://api.openai.com".to_string()],
+                inject_header: None,
+                credential_format: None,
                 credential_store: None,
                 helpers: None,
             },
@@ -4815,6 +4924,57 @@ mod tests {
             !route.endpoint_rules.is_empty(),
             "provider API routes must force L7 visibility even with allow-all policy"
         );
+        // Default injection is an OAuth Bearer Authorization header.
+        assert_eq!(route.inject_header, "Authorization");
+        assert_eq!(route.credential_format.as_deref(), Some("Bearer {}"));
+    }
+
+    #[test]
+    fn test_credential_provider_route_honors_custom_inject_header() {
+        // Vault authenticates with the raw token in `X-Vault-Token`, not an
+        // OAuth `Authorization: Bearer` header.
+        let mut providers = HashMap::new();
+        providers.insert(
+            "vault_oidc".to_string(),
+            crate::profile::CredentialProviderDef {
+                provider_type: crate::profile::CredentialProviderType::OauthCapture,
+                token_endpoints: vec![crate::profile::CredentialProviderTokenEndpoint {
+                    host: "https://vault.us1.ddbuild.io".to_string(),
+                    path: "/v1/auth/oidc/oidc/callback".to_string(),
+                    response_fields: vec![crate::profile::CredentialProviderResponseField {
+                        path: "auth.client_token".to_string(),
+                        kind: crate::profile::CredentialProviderResponseFieldKind::Opaque,
+                    }],
+                    request_body: crate::profile::CredentialProviderRequestBodyFormat::Auto,
+                    request_nonce_fields: vec![],
+                }],
+                api_hosts: vec!["https://vault.us1.ddbuild.io".to_string()],
+                inject_header: Some("X-Vault-Token".to_string()),
+                credential_format: Some("{}".to_string()),
+                credential_store: None,
+                helpers: None,
+            },
+        );
+        let proxy = ProxyLaunchOptions {
+            credential_providers: providers,
+            credential_routes: vec![crate::profile::CredentialRouteDef {
+                name: "vault".to_string(),
+                provider: "vault_oidc".to_string(),
+                env_var: None,
+                base_url_env_var: None,
+                endpoint_policy: None,
+            }],
+            ..ProxyLaunchOptions::default()
+        };
+
+        let config = build_proxy_config_from_flags(&proxy).expect("provider proxy config builds");
+        let route = config
+            .routes
+            .iter()
+            .find(|route| route.prefix == "vault")
+            .expect("API route must be synthesized");
+        assert_eq!(route.inject_header, "X-Vault-Token");
+        assert_eq!(route.credential_format.as_deref(), Some("{}"));
     }
 
     // Verify that a credential helper with `stdio: true` (interaction.stdio) does not

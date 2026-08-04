@@ -3,7 +3,7 @@
 //! Handles `nono audit list|show` for viewing the audit trail of sandboxed sessions.
 
 use crate::audit_attestation::verify_audit_attestation;
-use crate::audit_event_reader::command_policy_events_json;
+use crate::audit_event_reader::{command_policy_events_json, load_capability_decisions};
 use crate::audit_integrity::verify_audit_log;
 use crate::audit_ledger::verify_session_in_ledger;
 use crate::audit_session::{
@@ -34,6 +34,8 @@ pub fn run_audit(args: AuditArgs) -> Result<()> {
         AuditCommands::Show(args) => cmd_show(args),
         AuditCommands::Verify(args) => cmd_verify(args),
         AuditCommands::Cleanup(args) => cmd_cleanup(args),
+        AuditCommands::Sync(args) => crate::audit_client::run_sync(args),
+        AuditCommands::Status(args) => crate::audit_client::run_status(args),
     }
 }
 
@@ -422,7 +424,43 @@ fn cmd_show(args: AuditShowArgs) -> Result<()> {
         }
     }
 
+    let capability_decisions = load_capability_decisions(&session.dir)?;
+    if !capability_decisions.is_empty() {
+        eprintln!();
+        eprintln!("  Capability Decisions: {}", capability_decisions.len());
+        for record in &capability_decisions {
+            print_capability_decision(record);
+        }
+    }
+
     Ok(())
+}
+
+fn print_capability_decision(entry: &nono::supervisor::AuditEntry) {
+    use nono::supervisor::{ApprovalDecision, ApprovalRequest};
+
+    let ApprovalRequest::Capability { path, access, .. } = &entry.request else {
+        return;
+    };
+    let decision = match &entry.decision {
+        ApprovalDecision::Granted => "granted".green(),
+        ApprovalDecision::Denied { .. } => "denied".red(),
+        ApprovalDecision::Timeout => "timeout".red(),
+    };
+    let reason = match &entry.decision {
+        ApprovalDecision::Denied { reason } => format!(" reason={}", sanitize_for_terminal(reason)),
+        ApprovalDecision::Granted | ApprovalDecision::Timeout => String::new(),
+    };
+
+    eprintln!(
+        "    {} {} {} backend={} duration={}ms{}",
+        decision,
+        access,
+        sanitize_for_terminal(&path.display().to_string()),
+        sanitize_for_terminal(&entry.backend),
+        entry.duration_ms,
+        reason,
+    );
 }
 
 fn cmd_verify(args: AuditVerifyArgs) -> Result<()> {

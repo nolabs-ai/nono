@@ -882,7 +882,14 @@ pub fn apply_macos_keychain_db_exception(caps: &mut CapabilitySet) {
     let mut explicit_paths: HashMap<PathBuf, AccessMode> = HashMap::new();
     let mut keychain_roots: HashMap<PathBuf, AccessMode> = HashMap::new();
 
-    for cap in caps.fs_capabilities().iter().filter(|cap| cap.is_file) {
+    // Only user-intent grants trigger the exception. Group-sourced caps must not
+    // emit specific-op allows — they land after the deny_keychains_macos rules
+    // and would win under Seatbelt last-rule-wins, reopening the keychain.
+    for cap in caps
+        .fs_capabilities()
+        .iter()
+        .filter(|cap| cap.is_file && cap.source.is_user_intent())
+    {
         if !is_keychain_db(&cap.resolved) {
             continue;
         }
@@ -1423,27 +1430,6 @@ pub fn get_dangerous_commands(policy: &Policy) -> HashSet<String> {
             for cmd in &deny.commands {
                 result.insert(cmd.clone());
             }
-        }
-    }
-
-    result
-}
-
-/// Get all system read paths from allow.read groups for the current platform.
-///
-/// Collects `allow.read` entries from all platform-matching groups. Paths are
-/// returned unexpanded (with `~` and `$TMPDIR` intact) for caller to expand.
-/// Used by learn mode.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-pub fn get_system_read_paths(policy: &Policy) -> Vec<String> {
-    let mut result = Vec::new();
-
-    for group in policy.groups.values() {
-        if !group_matches_platform(group) {
-            continue;
-        }
-        if let Some(allow) = &group.allow {
-            result.extend(allow.read.iter().cloned());
         }
     }
 
@@ -3078,6 +3064,38 @@ mod tests {
             )),
             "expected metadata keychain DB file-write-data rule (to override specific deny), got: {}",
             rules
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_apply_macos_keychain_db_exception_ignores_group_sourced_caps() {
+        // Group-sourced keychain caps must not trigger the exception.
+        let mut caps = CapabilitySet::new();
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/test".to_string());
+        let login_db = PathBuf::from(home).join("Library/Keychains/login.keychain-db");
+        caps.add_fs(FsCapability {
+            original: login_db.clone(),
+            resolved: login_db.clone(),
+            access: AccessMode::ReadWrite,
+            is_file: true,
+            source: CapabilitySource::Group("claude_code_macos".to_string()),
+        });
+
+        apply_macos_keychain_db_exception(&mut caps);
+
+        let rules = caps.platform_rules().join("\n");
+        assert!(
+            !rules.contains("file-read-data"),
+            "group-sourced cap must not generate file-read-data exception rule, got: {rules}"
+        );
+        assert!(
+            !rules.contains("file-write-data"),
+            "group-sourced cap must not generate file-write-data exception rule, got: {rules}"
+        );
+        assert!(
+            rules.is_empty(),
+            "group-sourced cap must not generate any exception rules, got: {rules}"
         );
     }
 

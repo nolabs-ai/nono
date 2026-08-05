@@ -306,10 +306,8 @@ fn is_opted_out() -> bool {
     // air-gapped / internal-registry posture, where the static registry
     // does not serve the status endpoint and a background hint check would
     // just time out on an unreachable host.
-    matches!(
-        crate::config::user::load_user_config(),
-        Ok(Some(config)) if !config.registry.verify
-    )
+    let config = crate::config::user::load_user_config().ok().flatten();
+    !crate::registry_client::resolve_registry(None, false, config.as_ref()).verify
 }
 
 fn is_newer(installed: &str, latest: &str) -> bool {
@@ -356,6 +354,27 @@ mod tests {
             Err(p) => p.into_inner(),
         };
         let _env = crate::test_env::EnvVarGuard::set_all(&[(NO_PACK_UPDATE_HINTS_ENV, "1")]);
+
+        assert!(is_opted_out());
+    }
+
+    /// The air-gapped posture can be requested through the env var alone, with
+    /// nothing in `config.toml`. The hint check must honour it too, otherwise
+    /// it fires a background request at a registry that cannot answer.
+    #[test]
+    fn pack_hint_opts_out_when_verification_disabled_by_env() {
+        let _lock = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let env = crate::test_env::EnvVarGuard::set_all(&[
+            (NO_PACK_UPDATE_HINTS_ENV, ""),
+            ("NONO_NO_UPDATE_CHECK", ""),
+            ("NONO_REGISTRY_INSECURE", "1"),
+        ]);
+        // Isolate the two other opt-out paths so only the insecure flag is left.
+        env.remove(NO_PACK_UPDATE_HINTS_ENV);
+        env.remove("NONO_NO_UPDATE_CHECK");
 
         assert!(is_opted_out());
     }

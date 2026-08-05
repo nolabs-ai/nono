@@ -133,10 +133,8 @@ pub fn check_and_run(profile_name: &str) -> Result<MigrationOutcome> {
         // (air-gapped/internal) registry does not serve it, so skip the lookup
         // when signature verification is disabled — the in-tree
         // `official_pack_for` path above still works for known packs.
-        let verify = match crate::config::user::load_user_config() {
-            Ok(Some(config)) => config.registry.verify,
-            _ => true,
-        };
+        let config = crate::config::user::load_user_config().ok().flatten();
+        let verify = crate::registry_client::resolve_registry(None, false, config.as_ref()).verify;
         if !verify {
             return Ok(MigrationOutcome::NotApplicable);
         }

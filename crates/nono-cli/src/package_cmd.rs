@@ -316,6 +316,13 @@ fn highest_published_version(versions_dir: &Path, current: &str) -> Result<Strin
 
     if let Ok(entries) = fs::read_dir(versions_dir) {
         for entry in entries.flatten() {
+            // Only published version *directories* are candidates: a stray
+            // file or symlink named like a semver would otherwise be picked
+            // as `latest` and make the later `versions/<latest>/pull` read
+            // fail with ENOTDIR.
+            if !entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+                continue;
+            }
             let Ok(name) = entry.file_name().into_string() else {
                 continue;
             };
@@ -1647,6 +1654,22 @@ mod tests {
         )
         .expect("parse latest");
         assert_eq!(latest.version, "1.0.2");
+    }
+
+    /// A stray *file* whose name parses as semver must not be mistaken for a
+    /// published version directory: selecting it as `latest` would make the
+    /// `versions/<latest>/pull` read fail with ENOTDIR.
+    #[test]
+    fn highest_published_version_ignores_non_directories() {
+        let tmp = TempDir::new().expect("tmpdir");
+        let versions = tmp.path().join("versions");
+        fs::create_dir_all(versions.join("1.0.0")).expect("version dir");
+        fs::write(versions.join("9.9.9"), b"not a version dir").expect("stray file");
+
+        let latest =
+            highest_published_version(&versions, "1.0.0").expect("highest_published_version");
+
+        assert_eq!(latest, "1.0.0");
     }
 
     /// Verifying a pack whose registry advertises no bundle must fail with a

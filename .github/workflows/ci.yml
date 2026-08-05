@@ -144,6 +144,9 @@ jobs:
       - name: Run tests
         run: cargo test --workspace --verbose
 
+      - name: Run doc tests
+        run: cargo test --doc --workspace --verbose
+
   fmt:
     name: Rustfmt
     needs: changes

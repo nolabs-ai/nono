@@ -47,6 +47,10 @@ jobs:
             os: ubuntu-22.04
             artifact: nono
 
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-22.04
+            artifact: nono
+
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -56,7 +60,7 @@ jobs:
       # required now that the Linux keyring backend is pure-Rust (zbus).
       - name: Install system dependencies (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y pkg-config rpm
+        run: sudo apt-get update && sudo apt-get install -y pkg-config rpm musl-tools
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
@@ -211,7 +215,7 @@ jobs:
           cargo deb --target aarch64-unknown-linux-gnu --no-build --deb-version "$VERSION"
 
       - name: Build .rpm
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && matrix.target != 'x86_64-unknown-linux-musl'
         run: |
           VERSION="${{ env.RELEASE_TAG }}"
           VERSION="${VERSION#v}"

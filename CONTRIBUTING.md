@@ -231,6 +231,47 @@ with a link to the PR.
 
 ---
 
+## Issue Lifecycle and Stale Issues
+
+Open issues are expected to represent work someone still intends to do. To keep
+the backlog an accurate signal rather than an archive, inactive issues are aged
+out automatically by
+[`.github/workflows/stale.yml`](./.github/workflows/stale.yml), which runs
+daily:
+
+1. An issue with **no activity for 90 days** gets the `stale` label and a
+   comment.
+2. If nothing happens for a further **14 days**, it is closed as `not planned`.
+
+**Never marked stale:**
+
+- issues with an assignee
+- issues in a milestone
+- issues labelled `keep`
+
+The `keep` label exists solely to opt out of this automation — it says nothing
+about priority. Pull requests are never marked stale.
+
+### If your issue gets labelled `stale`
+
+Any of the following keeps it open. The `stale` label is removed automatically
+in every case, by
+[`.github/workflows/unstale.yml`](./.github/workflows/unstale.yml):
+
+| What you do | Outcome |
+| --- | --- |
+| Comment on it | Stays open; the 90-day clock restarts |
+| Assign someone | Stays open for as long as it has an assignee |
+| Add it to a milestone | Stays open for as long as it is in one |
+| Apply `keep` | Stays open indefinitely |
+| Remove the `stale` label yourself | Stays open; the 90-day clock restarts |
+| Nothing | Closed as `not planned` once the 14 days are up |
+
+Closing is not a verdict on the idea. A closed issue can be reopened at any
+time, and reopening the original is preferred over filing a duplicate.
+
+---
+
 ## Scope: What nono Does and Does Not Do
 
 nono applies OS-enforced capability restrictions to sandbox AI agents and

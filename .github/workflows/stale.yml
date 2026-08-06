@@ -1,0 +1,71 @@
+# .github/workflows/stale.yml
+#
+# Ages inactive issues out of the backlog: 90 days idle -> `stale` label,
+# a further 14 days idle -> closed as not planned.
+#
+# Contributor-facing policy is documented in CONTRIBUTING.md ("Issue Lifecycle
+# and Stale Issues"); keep the two in sync when changing any threshold here.
+name: Stale issues
+
+on:
+  schedule:
+    - cron: "30 6 * * *" # daily 06:30 UTC
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: "Log what would be marked/closed without writing anything"
+        type: boolean
+        default: false
+
+permissions:
+  issues: write
+
+concurrency:
+  group: stale-issues
+  cancel-in-progress: false
+
+jobs:
+  stale:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/stale@4391f3da665fdf50b6810c1a66712fb9ba21aa93 # v11.0.0
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+          days-before-issue-stale: 90
+          days-before-issue-close: 14
+          # -1 leaves pull requests alone.
+          days-before-pr-stale: -1
+          days-before-pr-close: -1
+
+          stale-issue-label: stale
+          close-issue-reason: not_planned
+
+          stale-issue-message: >
+            This issue has had no activity for 90 days, so it has been labelled
+            `stale`. It will be closed in 14 days unless there is new activity.
+
+
+            If this is still relevant, comment saying so (or remove the `stale`
+            label) and it will be kept open. Closing is not a judgement on the
+            idea — a closed issue can be reopened at any time.
+
+          close-issue-message: >
+            Closing as stale: no activity in the 14 days since this was
+            labelled. Comment here to reopen if it is still relevant.
+
+          # Ways to keep an issue open regardless of activity.
+          exempt-all-issue-assignees: true
+          exempt-all-issue-milestones: true
+          exempt-issue-labels: keep
+
+          # Least recently updated first, so the operations budget goes to the
+          # issues most likely to be stale.
+          sort-by: updated
+          ascending: true
+          # Raised from the default 30 to cover a full pass over the backlog.
+          operations-per-run: 200
+
+          remove-issue-stale-when-updated: true
+          enable-statistics: true
+          debug-only: ${{ inputs.dry-run || false }}

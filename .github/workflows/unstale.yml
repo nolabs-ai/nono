@@ -1,0 +1,38 @@
+# .github/workflows/unstale.yml
+#
+# Drops the `stale` label as soon as an issue shows a sign of life.
+#
+# stale.yml removes the label itself when an issue is merely commented on, but
+# it skips exempt issues entirely, so assigning/milestoning/`keep`-ing a stale
+# issue would otherwise leave the label stuck on it. This reacts to those
+# events directly.
+name: Unstale on activity
+
+on:
+  issues:
+    types: [assigned, milestoned, reopened, labeled]
+  issue_comment:
+    types: [created]
+
+permissions:
+  issues: write
+
+jobs:
+  remove-stale-label:
+    # Only act on labelled-stale issues, and only for a `keep` label when the
+    # trigger was a label being added — otherwise stale.yml adding `stale`
+    # would be undone here. Bot senders are ignored so the stale run cannot
+    # cancel its own work.
+    if: >
+      !github.event.issue.pull_request &&
+      github.event.sender.type != 'Bot' &&
+      contains(github.event.issue.labels.*.name, 'stale') &&
+      (github.event.action != 'labeled' || github.event.label.name == 'keep')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Remove stale label
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE: ${{ github.event.issue.number }}
+          REPO: ${{ github.repository }}
+        run: gh issue edit "$ISSUE" --repo "$REPO" --remove-label stale

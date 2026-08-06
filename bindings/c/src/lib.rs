@@ -135,6 +135,7 @@ pub(crate) fn map_error(e: &nono::NonoError) -> types::NonoErrorCode {
         nono::NonoError::Io(_) | nono::NonoError::CommandExecution(_) => NonoErrorCode::ErrIo,
         nono::NonoError::ObjectStore(_)
         | nono::NonoError::Snapshot(_)
+        | nono::NonoError::AuditLedgerCorrupt { .. }
         | nono::NonoError::HashMismatch { .. }
         | nono::NonoError::SessionNotFound(_) => NonoErrorCode::ErrIo,
         nono::NonoError::TrustVerification { .. }

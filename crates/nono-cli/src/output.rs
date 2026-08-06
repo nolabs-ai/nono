@@ -575,6 +575,68 @@ pub fn print_applying_sandbox(silent: bool) {
     eprintln!();
 }
 
+/// Report that a completed session was not committed to the global audit ledger.
+///
+/// An append also fails on a lock timeout, a full disk, or an unwritable audit
+/// root, none of which outlive the run that hit them. Only a ledger that no
+/// longer parses is permanent, so only that error earns the "stopped growing"
+/// and "no repair command" story.
+pub fn print_audit_ledger_append_failure(error: &NonoError, ledger: Option<&Path>) {
+    let t = theme::current();
+    eprintln!();
+    eprintln!(
+        "  {} {}",
+        fg("warning:", t.red).bold(),
+        fg("this session was not recorded in the audit ledger", t.text),
+    );
+    eprintln!("    {}", fg(&error.to_string(), t.text));
+    if let Some(ledger) = ledger {
+        eprintln!(
+            "    {}",
+            fg(&format!("ledger: {}", ledger.display()), t.subtext),
+        );
+    }
+    if !matches!(error, NonoError::AuditLedgerCorrupt { .. }) {
+        return;
+    }
+    eprintln!(
+        "    {}",
+        fg(
+            "The tamper-evident chain has stopped growing: no run is recorded \
+             until the ledger parses again.",
+            t.subtext
+        ),
+    );
+    eprintln!(
+        "    {}",
+        fg(
+            "There is no repair command. Moving the file aside starts a fresh \
+             chain, after which `nono audit verify` no longer finds the sessions \
+             the old one held.",
+            t.subtext
+        ),
+    );
+}
+
+/// Report the status nono exits with after a session was left out of the ledger.
+///
+/// The failure itself is already on stderr from
+/// [`print_audit_ledger_append_failure`]; this only accounts for the status,
+/// which differs from the child's own only when a clean run is downgraded so
+/// that a gap in the chain cannot be read as a recorded success.
+pub fn print_audit_ledger_exit_status(child_exit_code: i32, reported_exit_code: i32) {
+    let t = theme::current();
+    let status = if child_exit_code == reported_exit_code {
+        format!("the command exited {child_exit_code}; that status is preserved")
+    } else {
+        format!(
+            "the command exited {child_exit_code}, but nono exits \
+             {reported_exit_code} because the run is missing from the ledger"
+        )
+    };
+    eprintln!("    {}", fg(&status, t.subtext));
+}
+
 /// Report a post-run finalization failure.
 ///
 /// Some work runs after the sandboxed command has already exited: the

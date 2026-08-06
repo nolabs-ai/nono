@@ -4,7 +4,7 @@ use crate::launch_runtime::{
     ProxyLaunchOptions, RollbackLaunchOptions, SessionLaunchOptions, TrustLaunchOptions,
 };
 use crate::rollback_runtime::{
-    AuditState, RollbackExitContext, create_audit_state, finalize_supervised_exit,
+    AuditState, FinalizeOutcome, RollbackExitContext, create_audit_state, finalize_supervised_exit,
     initialize_audit_snapshots, initialize_rollback_state, warn_if_rollback_flags_ignored,
 };
 use crate::{
@@ -456,16 +456,31 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
         silent,
         rollback_prompt_disabled: rollback.prompt_disabled,
     });
-    if let Err(error) = finalize_result {
-        let reported = exit_code_after_finalization_failure(exit_code);
-        output::print_session_finalization_failure(&error, exit_code, reported);
-        // Returned as a status rather than an `Err` so the caller still runs the
-        // after-hook and drops the proxy handle; propagating would skip both and
-        // leave the TLS-intercept trust bundle behind on `process::exit`.
-        return Ok(reported);
+    // Both arms return a status rather than an `Err` so the caller still runs the
+    // after-hook and drops the proxy handle; propagating would skip both and
+    // leave the TLS-intercept trust bundle behind on `process::exit`.
+    match finalize_result {
+        Err(error) => {
+            let reported = exit_code_after_finalization_failure(exit_code);
+            output::print_session_finalization_failure(&error, exit_code, reported);
+            Ok(reported)
+        }
+        // A skipped ledger append is the same class of failure as any other
+        // unfinished bookkeeping and gets the same downgrade: exiting 0 would
+        // report a recorded run to a caller that only reads the status, and the
+        // gap is permanent when the ledger no longer parses. The warning is
+        // already on stderr from the append itself.
+        Ok(FinalizeOutcome {
+            ledger_recorded: false,
+        }) => {
+            let reported = exit_code_after_finalization_failure(exit_code);
+            output::print_audit_ledger_exit_status(exit_code, reported);
+            Ok(reported)
+        }
+        Ok(FinalizeOutcome {
+            ledger_recorded: true,
+        }) => Ok(exit_code),
     }
-
-    Ok(exit_code)
 }
 
 #[cfg(test)]

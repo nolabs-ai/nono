@@ -450,6 +450,18 @@ pub struct Completed {
 }
 
 impl Completed {
+    /// A signalled child has no code, so `Option` inequality also catches the
+    /// crash that `assert_failure` would wave through.
+    pub fn assert_exit_code(self, code: i32, why: &str) -> Self {
+        assert_eq!(
+            self.output.status.code(),
+            Some(code),
+            "{}",
+            self.context(&format!("expected exit {code}: {why}"))
+        );
+        self
+    }
+
     pub fn assert_failure(self, why: &str) -> Self {
         assert!(
             !self.output.status.success(),

@@ -157,6 +157,24 @@ fn resource_limits_unsupported_platform() -> nono::NonoError {
     )
 }
 
+/// Exit status for a run whose command succeeded but whose post-exit
+/// bookkeeping did not.
+const FINALIZATION_FAILURE_EXIT_CODE: i32 = 1;
+
+/// The status to report when post-exit bookkeeping failed.
+///
+/// A non-zero child status is the child's own report and must survive untouched.
+/// A zero one would otherwise hand the caller a clean success for a run whose
+/// rollback review, session metadata or attestation never completed.
+#[must_use]
+const fn exit_code_after_finalization_failure(child_exit_code: i32) -> i32 {
+    if child_exit_code == 0 {
+        FINALIZATION_FAILURE_EXIT_CODE
+    } else {
+        child_exit_code
+    }
+}
+
 /// True only for the exit code a whole-sandbox OOM kill produces (128 + SIGKILL =
 /// 137). Gating the memory-cap diagnostic on this keeps a clean exit, an ordinary
 /// crash, or a different signal from borrowing the "out of memory" story.
@@ -417,7 +435,9 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
     }
 
     let ended = chrono::Local::now().to_rfc3339();
-    finalize_supervised_exit(RollbackExitContext {
+
+    // Bookkeeping after the child has exited.
+    let finalize_result = finalize_supervised_exit(RollbackExitContext {
         audit_state: audit_state.as_ref(),
         rollback_state,
         audit_snapshot_state,
@@ -435,7 +455,15 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
         exit_code,
         silent,
         rollback_prompt_disabled: rollback.prompt_disabled,
-    })?;
+    });
+    if let Err(error) = finalize_result {
+        let reported = exit_code_after_finalization_failure(exit_code);
+        output::print_session_finalization_failure(&error, exit_code, reported);
+        // Returned as a status rather than an `Err` so the caller still runs the
+        // after-hook and drops the proxy handle; propagating would skip both and
+        // leave the TLS-intercept trust bundle behind on `process::exit`.
+        return Ok(reported);
+    }
 
     Ok(exit_code)
 }
@@ -443,6 +471,18 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
 #[cfg(test)]
 mod tests {
     use super::should_open_supervised_pty;
+
+    /// A finalize failure is nono's own, so it may not overwrite what the child
+    /// reported: only a clean run is downgraded, which is the one case where the
+    /// substituted status cannot be mistaken for the command's own.
+    #[test]
+    fn finalization_failure_downgrades_only_a_clean_exit() {
+        use super::exit_code_after_finalization_failure;
+        assert_eq!(exit_code_after_finalization_failure(0), 1);
+        assert_eq!(exit_code_after_finalization_failure(1), 1);
+        assert_eq!(exit_code_after_finalization_failure(7), 7);
+        assert_eq!(exit_code_after_finalization_failure(137), 137);
+    }
 
     /// Off-Linux, a requested memory limit is refused with UnsupportedPlatform (not
     /// SandboxInit), so it maps to the right diagnostic/exit and reads naturally.

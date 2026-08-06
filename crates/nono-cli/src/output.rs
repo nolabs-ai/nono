@@ -575,6 +575,49 @@ pub fn print_applying_sandbox(silent: bool) {
     eprintln!();
 }
 
+/// Report a post-run finalization failure.
+///
+/// Some work runs after the sandboxed command has already exited: the
+/// audit-ledger append, session metadata, attestation and the rollback review.
+/// A failure there is nono's, not the child's, so `child_exit_code` is what the
+/// command itself returned and `reported_exit_code` is what nono will exit with.
+/// They differ only when a clean command is downgraded to signal that its
+/// session never finished.
+pub fn print_session_finalization_failure(
+    error: &NonoError,
+    child_exit_code: i32,
+    reported_exit_code: i32,
+) {
+    let t = theme::current();
+    eprintln!();
+    eprintln!(
+        "  {} {}",
+        fg("warning:", t.red).bold(),
+        fg(
+            "session finalization failed after the command exited",
+            t.text
+        ),
+    );
+    eprintln!("    {}", fg(&error.to_string(), t.text));
+    eprintln!(
+        "    {}",
+        fg(
+            "The rollback review, session metadata and attestation for this run \
+             may be missing or incomplete.",
+            t.subtext
+        ),
+    );
+    let status = if child_exit_code == reported_exit_code {
+        format!("the command exited {child_exit_code}; that status is preserved")
+    } else {
+        format!(
+            "the command exited {child_exit_code}, but nono exits \
+             {reported_exit_code} because the session could not be finalized"
+        )
+    };
+    eprintln!("    {}", fg(&status, t.subtext));
+}
+
 /// Print a styled warning message to stderr
 pub fn print_warning(message: &str) {
     let t = theme::current();

@@ -1509,6 +1509,47 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
                         // Decide whether the upstream leg should chain through
                         // the corporate proxy. Mirrors the bypass logic used for
                         // transparent CONNECT below.
+                        let intercept_proxy_auth: Option<Zeroizing<String>> = if let Some(
+                            ref ext_config,
+                        ) =
+                            state.config.external_proxy
+                        {
+                            let bypassed = !state.bypass_matcher.is_empty()
+                                && state.bypass_matcher.matches(&host);
+                            if bypassed {
+                                None
+                            } else {
+                                match ext_config
+                                    .auth
+                                    .as_ref()
+                                    .map(external::build_basic_proxy_auth_header)
+                                    .transpose()
+                                {
+                                    Ok(h) => h,
+                                    Err(e) => {
+                                        audit::log_denied(
+                                                Some(&state.audit_log),
+                                                audit::ProxyMode::ConnectIntercept,
+                                                &audit::EventContext {
+                                                    route_id,
+                                                    auth_mechanism: Some(nono::undo::NetworkAuditAuthMechanism::ProxyAuthorization),
+                                                    auth_outcome: Some(nono::undo::NetworkAuditAuthOutcome::Failed),
+                                                    denial_category: Some(nono::undo::NetworkAuditDenialCategory::AuthenticationFailed),
+                                                    ..audit::EventContext::default()
+                                                },
+                                                &host,
+                                                port,
+                                                &e.to_string(),
+                                            );
+                                        external::send_response(&mut stream, 502, "Bad Gateway")
+                                            .await?;
+                                        return Err(e);
+                                    }
+                                }
+                            }
+                        } else {
+                            None
+                        };
                         let upstream_proxy =
                             if let Some(ref ext_config) = state.config.external_proxy {
                                 let bypassed = !state.bypass_matcher.is_empty()
@@ -1516,34 +1557,12 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
                                 if bypassed {
                                     debug!("tls_intercept: bypassing upstream proxy for {}", host);
                                     None
-                                } else if ext_config.auth.is_some() {
-                                    // Auth is configured but not yet implemented.
-                                    // Fail loudly rather than silently connecting
-                                    // without auth — the corporate proxy would
-                                    // reject anyway.
-                                    let msg = "external proxy authentication is configured \
-                                         but not yet implemented; remove the auth \
-                                         section from the external proxy config or \
-                                         wait for a future release";
-                                    audit::log_denied(
-                                        Some(&state.audit_log),
-                                        audit::ProxyMode::ConnectIntercept,
-                                        &audit::EventContext {
-                                            route_id,
-                                            ..audit::EventContext::default()
-                                        },
-                                        &host,
-                                        port,
-                                        msg,
-                                    );
-                                    let response =
-                                        "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n";
-                                    stream.write_all(response.as_bytes()).await?;
-                                    return Err(ProxyError::ExternalProxy(msg.to_string()));
                                 } else {
                                     Some(tls_intercept::InterceptUpstreamProxy {
                                         proxy_addr: &ext_config.address,
-                                        proxy_auth_header: None,
+                                        proxy_auth_header: intercept_proxy_auth
+                                            .as_ref()
+                                            .map(|s| s.as_str()),
                                     })
                                 }
                             } else {

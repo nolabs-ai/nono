@@ -1514,7 +1514,7 @@ fn handle_shim_stream_inner(
                 } else {
                     (
                         "invocation_approve_denied",
-                        Some("approval_denied".to_string()),
+                        Some(super::approval_deny_reason(&decision)),
                     )
                 };
                 record_command_policy_audit(
@@ -1639,7 +1639,10 @@ fn handle_shim_stream_inner(
         let (audit_decision, deny_reason) = if decision.is_granted() {
             ("approve_granted", None)
         } else {
-            ("approve_denied", Some("approval_denied".to_string()))
+            (
+                "approve_denied",
+                Some(super::approval_deny_reason(&decision)),
+            )
         };
         record_command_policy_audit(
             audit_recorder.as_ref(),

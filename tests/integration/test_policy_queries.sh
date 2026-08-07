@@ -26,7 +26,7 @@ echo ""
 
 echo "--- Path Policy Queries ---"
 
-expect_output_contains "sensitive path is denied" "\"reason\": \"sensitive_path\"" \
+expect_output_contains "sensitive path is denied" "\"reason\": \"filesystem_deny\"" \
     "$NONO_BIN" --silent why --json --path ~/.ssh --op read
 
 expect_output_contains "non-granted path is denied" "\"reason\": \"path_not_granted\"" \
@@ -57,7 +57,7 @@ expect_output_contains "human why output shows source on allow" "Source: user" \
     "$NONO_BIN" --silent why --path "$TMPDIR/write-target.txt" --op write --allow "$TMPDIR"
 
 if [[ -f ~/.zshrc ]]; then
-    expect_output_contains "read-file on sensitive path stays denied" "\"reason\": \"sensitive_path\"" \
+    expect_output_contains "read-file on sensitive path stays denied" "\"reason\": \"filesystem_deny\"" \
         "$NONO_BIN" --silent why --json --path ~/.zshrc --op read --read-file ~/.zshrc
 
     expect_output_contains "sensitive path reports policy source in human output" "Policy:" \

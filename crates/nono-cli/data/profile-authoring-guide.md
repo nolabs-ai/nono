@@ -1029,7 +1029,9 @@ nono profile diff <a> <b>         # Compare two profiles
 
 ## 6. Profile Drafts
 
-Profile drafts are a staging area for creating or editing profiles before they are applied. Drafts live in `~/.config/nono/profile-drafts/` (or `$XDG_CONFIG_HOME/nono/profile-drafts/`). The live profiles directory (`~/.config/nono/profiles/`) is read-only inside a running agent sandbox, so the draft workflow is the correct way for an agent to propose profile changes.
+Profile drafts are a staging area for creating or editing profiles before they are applied. Drafts live in `~/.config/nono/profile-drafts/` (or `$XDG_CONFIG_HOME/nono/profile-drafts/`). The live profiles directory (`~/.config/nono/profiles/`) is read-only inside a running agent sandbox by default, so the draft workflow is the correct way for an agent to propose profile changes.
+
+**Note:** this default only holds if the sandbox's capability grants don't cover `~/.config/nono/profiles/`. Granting write access to an ancestor directory — `~/.config`, `$HOME`, or any parent of the profiles path — extends that access to the profiles directory too, since it is not currently designated as a protected state root (unlike `~/.nono` and `$XDG_STATE_HOME/nono`, which nono's `ProtectedRoots` mechanism rejects grants against). The same ancestor grant also exposes other sensitive files under `~/.config/nono/`, including `config.toml` and `packages/` (installed pack manifests, hooks, and skills). Scope `--allow` grants as narrowly as possible (e.g. to the specific config subdirectory an agent actually needs) to avoid inadvertently making these paths writable.
 
 ### Creating a new profile via draft
 

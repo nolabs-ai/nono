@@ -576,6 +576,19 @@ pub(super) fn resolve_approval_route(
     })
 }
 
+/// Deny reason for a non-granted approval decision, carrying the backend's
+/// stated reason when it provided one so audit entries record who refused
+/// and why, not just that a refusal happened.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(super) fn approval_deny_reason(decision: &nono::supervisor::ApprovalDecision) -> String {
+    match decision {
+        nono::supervisor::ApprovalDecision::Denied { reason } if !reason.is_empty() => {
+            format!("approval_denied: {reason}")
+        }
+        _ => "approval_denied".to_string(),
+    }
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(super) fn policy_credential_names(
     policy: &crate::command_policy::CommandSandboxConfig,
@@ -614,14 +627,18 @@ pub(super) fn reject_unenforced_resources(
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(super) fn shim_error_message(error: &nono::NonoError) -> String {
-    match error {
+    const MAX_SHIM_ERROR_CHARS: usize = 4096;
+
+    let message = match error {
         nono::NonoError::BlockedCommand { reason, .. }
             if reason.starts_with("Tool execution chain denied.") =>
         {
             reason.clone()
         }
         _ => error.to_string(),
-    }
+    };
+    let sanitized = crate::terminal_approval::sanitize_for_terminal(&message);
+    crate::command_display::truncate_chars(&sanitized, MAX_SHIM_ERROR_CHARS)
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1277,6 +1294,24 @@ mod intercept_tests {
 
         assert_eq!(route.backend, "security-review");
         assert_eq!(route.timeout_secs, 30);
+    }
+
+    #[test]
+    fn shim_error_message_sanitizes_and_bounds_backend_reason() {
+        let reason = format!(
+            "approval_denied: prefix\x1b]52;c;Y29weQ==\x07{}",
+            "x".repeat(5000)
+        );
+        let error = nono::NonoError::BlockedCommand {
+            command: "git".to_string(),
+            reason,
+        };
+
+        let message = shim_error_message(&error);
+
+        assert!(!message.chars().any(char::is_control));
+        assert!(message.chars().count() <= 4096);
+        assert!(message.ends_with("..."));
     }
 
     #[test]

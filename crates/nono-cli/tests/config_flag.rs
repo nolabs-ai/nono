@@ -1,71 +1,55 @@
 //! Integration tests for `nono run --config <manifest>`.
 
-use std::io::Write;
-use std::process::Command;
+use nono_test_support::{Argv, NonoTest, nono_test};
+use std::fs;
+use std::path::PathBuf;
 
-fn nono_bin() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_nono"))
+/// Every case runs the same child; `--dry-run` never execs it.
+fn echo_hello() -> Argv {
+    Argv::new("echo").arg("hello")
+}
+
+fn write_manifest(t: &NonoTest, name: &str, json: &str) -> PathBuf {
+    let path = t.root().join(name);
+    fs::write(&path, json).expect("root is a fresh dir this test owns");
+    path
 }
 
 #[test]
 fn config_with_valid_manifest_is_accepted() {
-    let mut f = tempfile::NamedTempFile::new().expect("create temp file");
-    write!(
-        f,
-        r#"{{
+    let t = nono_test!("config-valid");
+    let manifest = write_manifest(
+        &t,
+        "valid.json",
+        r#"{
             "version": "0.1.0",
-            "filesystem": {{
-                "grants": [{{ "path": "/tmp", "access": "read" }}]
-            }},
-            "network": {{ "mode": "blocked" }}
-        }}"#
-    )
-    .expect("write manifest");
-
-    let output = nono_bin()
-        .args([
-            "run",
-            "--config",
-            f.path().to_str().expect("path"),
-            "--dry-run",
-            "--",
-            "echo",
-            "hello",
-        ])
-        .output()
-        .expect("failed to run nono");
-
-    // --dry-run prints what would happen and exits 0
-    assert!(
-        output.status.success(),
-        "expected success, stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
+            "filesystem": {
+                "grants": [{ "path": "/tmp", "access": "read" }]
+            },
+            "network": { "mode": "blocked" }
+        }"#,
     );
+
+    t.run()
+        .config(&manifest)
+        .dry_run()
+        .exec(echo_hello())
+        .assert_success("--dry-run reports a valid manifest and exits 0");
 }
 
 #[test]
 fn config_with_invalid_json_fails() {
-    let mut f = tempfile::NamedTempFile::new().expect("create temp file");
-    write!(f, "not json at all").expect("write");
+    let t = nono_test!("config-invalid-json");
+    let manifest = write_manifest(&t, "invalid.json", "not json at all");
 
-    let output = nono_bin()
-        .args([
-            "run",
-            "--config",
-            f.path().to_str().expect("path"),
-            "--dry-run",
-            "--",
-            "echo",
-            "hello",
-        ])
-        .output()
-        .expect("failed to run nono");
+    let completed = t
+        .run()
+        .config(&manifest)
+        .dry_run()
+        .exec(echo_hello())
+        .assert_failure("a manifest that is not JSON is rejected");
 
-    assert!(
-        !output.status.success(),
-        "expected failure for invalid JSON"
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = completed.stderr();
     assert!(
         stderr.contains("invalid") || stderr.contains("error"),
         "expected error message, got: {stderr}"
@@ -74,146 +58,80 @@ fn config_with_invalid_json_fails() {
 
 #[test]
 fn config_with_missing_version_fails() {
-    let mut f = tempfile::NamedTempFile::new().expect("create temp file");
-    write!(f, r#"{{ "filesystem": {{ }} }}"#).expect("write");
+    let t = nono_test!("config-missing-version");
+    let manifest = write_manifest(&t, "missing-version.json", r#"{ "filesystem": { } }"#);
 
-    let output = nono_bin()
-        .args([
-            "run",
-            "--config",
-            f.path().to_str().expect("path"),
-            "--dry-run",
-            "--",
-            "echo",
-            "hello",
-        ])
-        .output()
-        .expect("failed to run nono");
-
-    assert!(
-        !output.status.success(),
-        "expected failure for missing version"
-    );
+    t.run()
+        .config(&manifest)
+        .dry_run()
+        .exec(echo_hello())
+        .assert_failure("a manifest without a version is rejected");
 }
 
 #[test]
 fn config_conflicts_with_allow() {
-    let mut f = tempfile::NamedTempFile::new().expect("create temp file");
-    write!(f, r#"{{ "version": "0.1.0" }}"#).expect("write");
+    let t = nono_test!("config-vs-allow");
+    let manifest = write_manifest(&t, "conflict-allow.json", r#"{ "version": "0.1.0" }"#);
 
-    let output = nono_bin()
-        .args([
-            "run",
-            "--config",
-            f.path().to_str().expect("path"),
-            "--allow",
-            "/tmp",
-            "--dry-run",
-            "--",
-            "echo",
-            "hello",
-        ])
-        .output()
-        .expect("failed to run nono");
-
-    assert!(
-        !output.status.success(),
-        "expected failure: --config conflicts with --allow"
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("cannot be used with"),
-        "expected conflict error, got: {stderr}"
-    );
+    t.run()
+        .config(&manifest)
+        .allow("/tmp")
+        .dry_run()
+        .exec(echo_hello())
+        .assert_failure("--config conflicts with --allow")
+        .assert_stderr_contains("cannot be used with");
 }
 
 #[test]
 fn config_conflicts_with_profile() {
-    let mut f = tempfile::NamedTempFile::new().expect("create temp file");
-    write!(f, r#"{{ "version": "0.1.0" }}"#).expect("write");
+    let t = nono_test!("config-vs-profile");
+    let manifest = write_manifest(&t, "conflict-profile.json", r#"{ "version": "0.1.0" }"#);
 
-    let output = nono_bin()
-        .args([
-            "run",
-            "--config",
-            f.path().to_str().expect("path"),
-            "--profile",
-            "default",
-            "--dry-run",
-            "--",
-            "echo",
-            "hello",
-        ])
-        .output()
-        .expect("failed to run nono");
-
-    assert!(
-        !output.status.success(),
-        "expected failure: --config conflicts with --profile"
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("cannot be used with"),
-        "expected conflict error, got: {stderr}"
-    );
+    t.run()
+        .config(&manifest)
+        .profile_name("default")
+        .dry_run()
+        .exec(echo_hello())
+        .assert_failure("--config conflicts with --profile")
+        .assert_stderr_contains("cannot be used with");
 }
 
 #[test]
 fn config_nonexistent_file_fails() {
-    let output = nono_bin()
-        .args([
-            "run",
-            "--config",
-            "/tmp/nono-test-does-not-exist-12345.json",
-            "--dry-run",
-            "--",
-            "echo",
-            "hello",
-        ])
-        .output()
-        .expect("failed to run nono");
+    let t = nono_test!("config-missing-file");
 
-    assert!(
-        !output.status.success(),
-        "expected failure for nonexistent file"
-    );
+    t.run()
+        .config(t.root().join("does-not-exist.json"))
+        .dry_run()
+        .exec(echo_hello())
+        .assert_failure("a manifest path that does not exist is rejected");
 }
 
 #[test]
 fn config_semantic_validation_rejects_bad_inject() {
-    let mut f = tempfile::NamedTempFile::new().expect("create temp file");
-    write!(
-        f,
-        r#"{{
+    let t = nono_test!("config-bad-inject");
+    let manifest = write_manifest(
+        &t,
+        "bad-inject.json",
+        r#"{
             "version": "0.1.0",
-            "credentials": [{{
+            "credentials": [{
                 "name": "test",
                 "source": "env://TOKEN",
                 "upstream": "https://api.example.com",
-                "inject": {{ "mode": "url_path" }}
-            }}]
-        }}"#
-    )
-    .expect("write");
-
-    let output = nono_bin()
-        .args([
-            "run",
-            "--config",
-            f.path().to_str().expect("path"),
-            "--dry-run",
-            "--",
-            "echo",
-            "hello",
-        ])
-        .output()
-        .expect("failed to run nono");
-
-    assert!(
-        !output.status.success(),
-        "expected failure: url_path without path_pattern"
+                "inject": { "mode": "url_path" }
+            }]
+        }"#,
     );
-    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    let completed = t
+        .run()
+        .config(&manifest)
+        .dry_run()
+        .exec(echo_hello())
+        .assert_failure("url_path inject without path_pattern is rejected");
+
+    let stderr = completed.stderr();
     assert!(
         stderr.contains("url_path") || stderr.contains("path_pattern"),
         "expected validation error about url_path, got: {stderr}"

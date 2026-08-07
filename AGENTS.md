@@ -4,11 +4,12 @@
 
 nono is a capability-based sandboxing system for running untrusted AI agents with OS-enforced isolation. It uses Landlock (Linux) and Seatbelt (macOS) to create sandboxes, and then layers on top a policy system, diagnostic tools, and a rollback mechanism for recovery. The library is designed to be a pure sandbox primitive with no built-in policy, while the CLI implements all security policy and UX.
 
-The project is a Cargo workspace with three members:
+The project is a Cargo workspace with five members:
 - **nono** (`crates/nono/`) - Core library. Pure sandbox primitive with no built-in security policy.
 - **nono-cli** (`crates/nono-cli/`) - CLI binary. Owns all security policy, profiles, hooks, and UX.
 - **nono-ffi** (`bindings/c/`) - C FFI bindings. Exposes the library via `extern "C"` functions and auto-generated `nono.h` header.
 - **nono-proxy** - Proxy that provides network filtering and credential injection
+- **nono-test-support** (`crates/nono-test-support/`) - Test-only harness for the `nono-cli` integration tests. Not published.
 
 ### Library vs CLI Boundary
 

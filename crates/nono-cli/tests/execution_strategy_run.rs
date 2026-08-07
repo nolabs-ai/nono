@@ -11,57 +11,13 @@
 //!
 //! AF_UNIX mediation integration tests live in `socket_access_run.rs`.
 
+use nono_test_support::{Argv, Completed, NonoTest, Profile, Sandboxed, Sandboxing, nono_test};
 use std::fs;
 use std::net::TcpListener;
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
-
-fn nono_bin() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_nono"))
-}
-
-fn setup_isolated_home(prefix: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {
-    let temp_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("target")
-        .join("test-artifacts");
-    fs::create_dir_all(&temp_root).expect("create test-artifacts root");
-    let tmp = tempfile::Builder::new()
-        .prefix(&format!("nono-{prefix}-it-"))
-        .tempdir_in(&temp_root)
-        .expect("create tempdir");
-    let home = tmp.path().join("home");
-    let workspace = tmp.path().join("workspace");
-    fs::create_dir_all(home.join(".config")).expect("create .config dir");
-    fs::create_dir_all(home.join(".local").join("state")).expect("create state dir");
-    fs::create_dir_all(&workspace).expect("create workspace dir");
-    (tmp, home, workspace)
-}
-
-fn nono_cmd(args: &[&str], home: &Path, cwd: &Path) -> Command {
-    let mut cmd = nono_bin();
-    cmd.args(args)
-        .env("HOME", home)
-        .env("XDG_CONFIG_HOME", home.join(".config"))
-        .env("XDG_STATE_HOME", home.join(".local").join("state"))
-        .env("NONO_NO_SAVE_PROMPT", "1")
-        .env_remove("NONO_DETACHED_LAUNCH")
-        .current_dir(cwd);
-    cmd
-}
-
-fn run_nono(args: &[&str], home: &Path, cwd: &Path) -> Output {
-    nono_cmd(args, home, cwd)
-        .output()
-        .expect("failed to run nono")
-}
-
-fn write_profile(home: &Path, name: &str, json: &str) -> PathBuf {
-    let path = home.join(format!("{name}.json"));
-    fs::write(&path, json).expect("write profile");
-    path
-}
+use std::process::Command;
 
 fn python3_available() -> bool {
     Command::new("python3")
@@ -69,6 +25,21 @@ fn python3_available() -> bool {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+/// A profile allowing only the test's workspace, with the network blocked.
+fn workspace_only_profile(t: &NonoTest, name: &str) -> Profile {
+    t.write_profile(
+        name,
+        &format!(
+            r#"{{
+                "meta": {{ "name": "{name}-test" }},
+                "filesystem": {{ "allow": ["{workspace}"] }},
+                "network": {{ "block": true }}
+            }}"#,
+            workspace = t.workspace().display()
+        ),
+    )
 }
 
 #[test]
@@ -79,7 +50,7 @@ fn cli_auto_block_net_uses_static_seccomp_baseline() {
         return;
     }
 
-    let (_tmp, home, workspace) = setup_isolated_home("network-baseline");
+    let t = nono_test!("network-baseline");
     let script = "import ctypes, socket
 try:
     socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -90,30 +61,15 @@ libc = ctypes.CDLL(None, use_errno=True)
 result = libc.syscall(425, 1, None)
 print('IO_URING', result, ctypes.get_errno())";
 
-    let output = run_nono(
-        &[
-            "run",
-            "--allow-cwd",
-            "--block-net",
-            "--no-rollback",
-            "--",
-            "python3",
-            "-c",
-            script,
-        ],
-        &home,
-        &workspace,
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    assert!(
-        output.status.success(),
-        "baseline probe failed\nstdout: {stdout}\nstderr: {stderr}"
-    );
-    assert!(stdout.contains("UDP_BLOCKED 1"), "stdout: {stdout}");
-    assert!(!stdout.contains("UDP_OPEN"), "stdout: {stdout}");
-    assert!(stdout.contains("IO_URING -1 1"), "stdout: {stdout}");
+    t.run()
+        .allow_cwd()
+        .block_net()
+        .no_rollback()
+        .exec(Argv::new("python3").arg("-c").arg(script))
+        .assert_success("the baseline probe itself runs")
+        .assert_stdout_contains("UDP_BLOCKED 1")
+        .assert_stdout_lacks("UDP_OPEN")
+        .assert_stdout_contains("IO_URING -1 1");
 }
 
 #[cfg(target_os = "linux")]
@@ -128,46 +84,15 @@ fn cc_available() -> bool {
 #[test]
 #[cfg(target_os = "linux")]
 fn direct_denies_path_outside_grant() {
-    let (_tmp, home, workspace) = setup_isolated_home("direct-deny");
+    let t = nono_test!("direct-deny");
+    let profile = workspace_only_profile(&t, "direct-deny");
 
-    let profile_path = write_profile(
-        &home,
-        "direct-deny",
-        &format!(
-            r#"{{
-                "meta": {{ "name": "direct-deny-test" }},
-                "filesystem": {{ "allow": ["{workspace}"] }},
-                "network": {{ "block": true }}
-            }}"#,
-            workspace = workspace.display()
-        ),
-    );
-
-    let output = run_nono(
-        &[
-            "run",
-            "--profile",
-            profile_path.to_str().expect("profile path"),
-            "--no-rollback",
-            "--",
-            "/bin/cat",
-            "/etc/shadow",
-        ],
-        &home,
-        &workspace,
-    );
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    assert!(
-        !output.status.success(),
-        "nono run must deny /etc/shadow outside the grant set\nstdout: {stdout}\nstderr: {stderr}",
-    );
-    assert!(
-        !stdout.contains("root:"),
-        "secret content must not appear in stdout\nstdout: {stdout}",
-    );
+    t.run()
+        .profile(&profile)
+        .no_rollback()
+        .exec(Argv::new("/bin/cat").arg("/etc/shadow"))
+        .assert_failure("/etc/shadow is outside the grant set")
+        .assert_stdout_lacks("root:");
 }
 
 /// On macOS, Seatbelt is used. `/etc/passwd` is world-readable and included in
@@ -177,190 +102,69 @@ fn direct_denies_path_outside_grant() {
 #[test]
 #[cfg(target_os = "macos")]
 fn direct_denies_path_outside_grant_macos() {
-    let (tmp, home, workspace) = setup_isolated_home("direct-deny-macos");
+    let t = nono_test!("direct-deny-macos");
 
-    let secret = tmp.path().join("outside-secret.txt");
+    let secret = t.root().join("outside-secret.txt");
     fs::write(&secret, "TOPSECRET-outside-grant\n").expect("write secret");
 
-    let profile_path = write_profile(
-        &home,
-        "direct-deny-macos",
-        &format!(
-            r#"{{
-                "meta": {{ "name": "direct-deny-macos-test" }},
-                "filesystem": {{ "allow": ["{workspace}"] }},
-                "network": {{ "block": true }}
-            }}"#,
-            workspace = workspace.display()
-        ),
-    );
+    let profile = workspace_only_profile(&t, "direct-deny-macos");
 
-    let output = run_nono(
-        &[
-            "run",
-            "--profile",
-            profile_path.to_str().expect("profile path"),
-            "--no-rollback",
-            "--",
-            "/bin/cat",
-            secret.to_str().expect("secret path"),
-        ],
-        &home,
-        &workspace,
-    );
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    assert!(
-        !output.status.success(),
-        "nono run must deny a path outside the grant set\nstdout: {stdout}\nstderr: {stderr}",
-    );
-    assert!(
-        !stdout.contains("TOPSECRET"),
-        "secret content must not appear in stdout\nstdout: {stdout}",
-    );
+    t.run()
+        .profile(&profile)
+        .no_rollback()
+        .exec(Argv::new("/bin/cat").arg(&secret))
+        .assert_failure("a path outside the grant set is denied")
+        .assert_stdout_lacks("TOPSECRET");
 }
 
 #[test]
 #[cfg(target_os = "linux")]
 fn deny_outside_grant_produces_diagnostic_footer() {
-    let (_tmp, home, workspace) = setup_isolated_home("deny-diag");
+    let t = nono_test!("deny-diag");
 
-    let target = home.join("secret.txt");
+    let target = t.home().join("secret.txt");
     fs::write(&target, "forbidden-content").expect("write secret");
 
-    let profile_path = write_profile(
-        &home,
-        "deny-diag",
-        &format!(
-            r#"{{
-                "meta": {{ "name": "deny-diag-test" }},
-                "filesystem": {{ "allow": ["{workspace}"] }},
-                "network": {{ "block": true }}
-            }}"#,
-            workspace = workspace.display()
-        ),
-    );
+    let profile = workspace_only_profile(&t, "deny-diag");
 
-    let output = run_nono(
-        &[
-            "run",
-            "--profile",
-            profile_path.to_str().expect("profile path"),
-            "--no-rollback",
-            "--",
-            "/bin/cat",
-            target.to_str().expect("target path"),
-        ],
-        &home,
-        &workspace,
-    );
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    assert!(
-        !output.status.success(),
-        "nono run must deny a path outside the grant set\nstdout: {stdout}\nstderr: {stderr}",
-    );
-    assert!(
-        !stdout.contains("forbidden-content"),
-        "forbidden content leaked to stdout\nstdout: {stdout}",
-    );
+    t.run()
+        .profile(&profile)
+        .no_rollback()
+        .exec(Argv::new("/bin/cat").arg(&target))
+        .assert_failure("a path outside the grant set is denied")
+        .assert_stdout_lacks("forbidden-content");
 }
 
 #[test]
 #[cfg(target_os = "linux")]
 fn supervised_denies_path_outside_grant() {
-    let (_tmp, home, workspace) = setup_isolated_home("supervised-deny");
+    let t = nono_test!("supervised-deny");
+    let profile = workspace_only_profile(&t, "supervised-deny");
 
-    let profile_path = write_profile(
-        &home,
-        "supervised-deny",
-        &format!(
-            r#"{{
-                "meta": {{ "name": "supervised-deny-test" }},
-                "filesystem": {{ "allow": ["{workspace}"] }},
-                "network": {{ "block": true }}
-            }}"#,
-            workspace = workspace.display()
-        ),
-    );
-
-    let output = run_nono(
-        &[
-            "run",
-            "--profile",
-            profile_path.to_str().expect("profile path"),
-            "--no-rollback",
-            "--",
-            "/bin/cat",
-            "/etc/shadow",
-        ],
-        &home,
-        &workspace,
-    );
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    assert!(
-        !output.status.success(),
-        "nono run must deny /etc/shadow outside the grant set\nstdout: {stdout}\nstderr: {stderr}",
-    );
-    assert!(
-        !stdout.contains("root:"),
-        "secret content must not appear in stdout\nstdout: {stdout}",
-    );
+    t.run()
+        .profile(&profile)
+        .no_rollback()
+        .exec(Argv::new("/bin/cat").arg("/etc/shadow"))
+        .assert_failure("/etc/shadow is outside the grant set")
+        .assert_stdout_lacks("root:");
 }
 
 /// Positive control: reading a file inside the granted set must succeed.
 #[test]
 fn granted_path_exits_zero() {
-    let (_tmp, home, workspace) = setup_isolated_home("grant-ok");
+    let t = nono_test!("grant-ok");
 
-    let sentinel = workspace.join("hello.txt");
+    let sentinel = t.workspace().join("hello.txt");
     fs::write(&sentinel, "hello from nono test").expect("write sentinel");
 
-    let profile_path = write_profile(
-        &home,
-        "grant-ok",
-        &format!(
-            r#"{{
-                "meta": {{ "name": "grant-ok-test" }},
-                "filesystem": {{ "allow": ["{workspace}"] }},
-                "network": {{ "block": true }}
-            }}"#,
-            workspace = workspace.display()
-        ),
-    );
+    let profile = workspace_only_profile(&t, "grant-ok");
 
-    let output = run_nono(
-        &[
-            "run",
-            "--profile",
-            profile_path.to_str().expect("profile path"),
-            "--no-rollback",
-            "--",
-            "/bin/cat",
-            sentinel.to_str().expect("sentinel path"),
-        ],
-        &home,
-        &workspace,
-    );
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    assert!(
-        output.status.success(),
-        "nono run must succeed for a path inside the grant set\nstderr: {stderr}",
-    );
-    assert!(
-        stdout.contains("hello from nono test"),
-        "expected sentinel content in stdout\nstdout: {stdout}\nstderr: {stderr}",
-    );
+    t.run()
+        .profile(&profile)
+        .no_rollback()
+        .exec(Argv::new("/bin/cat").arg(&sentinel))
+        .assert_success("a path inside the grant set is readable")
+        .assert_stdout_contains("hello from nono test");
 }
 
 /// `network.block: true` must prevent outbound TCP connections. We bind a
@@ -373,23 +177,12 @@ fn network_block_denies_outbound_tcp() {
         return;
     }
 
-    let (_tmp, home, workspace) = setup_isolated_home("net-block");
+    let t = nono_test!("net-block");
 
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
     let port = listener.local_addr().expect("local addr").port();
 
-    let profile_path = write_profile(
-        &home,
-        "net-block",
-        &format!(
-            r#"{{
-                "meta": {{ "name": "net-block-test" }},
-                "filesystem": {{ "allow": ["{workspace}"] }},
-                "network": {{ "block": true }}
-            }}"#,
-            workspace = workspace.display()
-        ),
-    );
+    let profile = workspace_only_profile(&t, "net-block");
 
     // connect_ex() returns the errno on failure so the script exits 1 on any
     // connect error. Without a sandbox, connecting to the bound listener
@@ -399,28 +192,11 @@ fn network_block_denies_outbound_tcp() {
          code=s.connect_ex(('127.0.0.1', {port})); sys.exit(0 if code == 0 else 1)"
     );
 
-    let output = run_nono(
-        &[
-            "run",
-            "--profile",
-            profile_path.to_str().expect("profile path"),
-            "--no-rollback",
-            "--",
-            "python3",
-            "-c",
-            &py_script,
-        ],
-        &home,
-        &workspace,
-    );
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    assert!(
-        !output.status.success(),
-        "network block must deny outbound TCP to a live listener\nstdout: {stdout}\nstderr: {stderr}",
-    );
+    t.run()
+        .profile(&profile)
+        .no_rollback()
+        .exec(Argv::new("python3").arg("-c").arg(&py_script))
+        .assert_failure("network block denies outbound TCP to a live listener");
 }
 
 /// A profile combining `env_credentials` (env://) and `command_policies` must
@@ -430,10 +206,9 @@ fn network_block_denies_outbound_tcp() {
 #[test]
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn env_credentials_with_command_policies_non_shim_entry_succeeds() {
-    let (_tmp, home, workspace) = setup_isolated_home("env-creds-cmd-policies");
+    let t = nono_test!("env-creds-cmd-policies");
 
-    let profile_path = write_profile(
-        &home,
+    let profile = t.write_profile(
         "env-creds-cmd-policies",
         &format!(
             r#"{{
@@ -451,38 +226,16 @@ fn env_credentials_with_command_policies_non_shim_entry_succeeds() {
                     }}
                 }}
             }}"#,
-            workspace = workspace.display()
+            workspace = t.workspace().display()
         ),
     );
 
-    let output = nono_bin()
-        .args([
-            "run",
-            "--profile",
-            profile_path.to_str().expect("profile path"),
-            "--no-rollback",
-            "--",
-            "sh",
-            "-c",
-            "exit 0",
-        ])
-        .env("HOME", &home)
-        .env("XDG_CONFIG_HOME", home.join(".config"))
-        .env("XDG_STATE_HOME", home.join(".local").join("state"))
-        .env("NONO_NO_SAVE_PROMPT", "1")
+    t.run()
+        .profile(&profile)
+        .no_rollback()
         .env("API_TOKEN", "secret-value")
-        .env_remove("NONO_DETACHED_LAUNCH")
-        .current_dir(&workspace)
-        .output()
-        .expect("failed to run nono");
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    assert!(
-        output.status.success(),
-        "env_credentials + command_policies with a non-shim entry must succeed\nstdout: {stdout}\nstderr: {stderr}",
-    );
+        .exec(Argv::new("sh").arg("-c").arg("exit 0"))
+        .assert_success("env_credentials + command_policies with a non-shim entry launches");
 }
 
 /// A script written into a writable grant-dir (cwd) must still execute under
@@ -490,59 +243,21 @@ fn env_credentials_with_command_policies_non_shim_entry_succeeds() {
 #[test]
 #[cfg(target_os = "linux")]
 fn command_policies_allows_script_exec_in_writable_grant_dir() {
-    let (_tmp, home, workspace) = setup_isolated_home("cmd-policies-script-exec");
+    let t = nono_test!("cmd-policies-script-exec");
 
-    let script_path = workspace.join("s.sh");
+    let script_path = t.workspace().join("s.sh");
     fs::write(&script_path, "#!/usr/bin/env bash\necho ok\n").expect("write script");
     fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755))
         .expect("chmod script executable");
 
-    let profile_path = write_profile(
-        &home,
-        "cmd-policies-script-exec",
-        &format!(
-            r#"{{
-                "meta": {{ "name": "cmd-policies-script-exec-test" }},
-                "filesystem": {{ "allow": ["{workspace}"] }},
-                "network": {{ "block": true }},
-                "command_policies": {{
-                    "commands": {{
-                        "cat": {{
-                            "executable": "/bin/cat"
-                        }}
-                    }}
-                }}
-            }}"#,
-            workspace = workspace.display()
-        ),
-    );
+    let profile = command_policies_profile(&t, "cmd-policies-script-exec");
 
-    let output = run_nono(
-        &[
-            "run",
-            "--profile",
-            profile_path.to_str().expect("profile path"),
-            "--no-rollback",
-            "--",
-            "bash",
-            "-c",
-            "./s.sh",
-        ],
-        &home,
-        &workspace,
-    );
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    assert!(
-        output.status.success(),
-        "a script in a writable grant-dir must still execute under command_policies\nstdout: {stdout}\nstderr: {stderr}",
-    );
-    assert!(
-        stdout.contains("ok"),
-        "expected script output in stdout\nstdout: {stdout}\nstderr: {stderr}",
-    );
+    t.run()
+        .profile(&profile)
+        .no_rollback()
+        .exec(Argv::new("bash").arg("-c").arg("./s.sh"))
+        .assert_success("a script in a writable grant-dir executes under command_policies")
+        .assert_stdout_contains("ok");
 }
 
 /// Same as above but for a binary compiled at runtime, so it wasn't on disk
@@ -555,31 +270,43 @@ fn command_policies_allows_compiled_binary_exec_in_writable_grant_dir() {
         return;
     }
 
-    let (_tmp, home, workspace) = setup_isolated_home("cmd-policies-bin-exec");
+    let t = nono_test!("cmd-policies-bin-exec");
 
-    let source_path = workspace.join("b.c");
+    let source_path = t.workspace().join("b.c");
     fs::write(
         &source_path,
         "#include <stdio.h>\nint main(void) { printf(\"ok\\n\"); return 0; }\n",
     )
     .expect("write source");
-    let binary_path = workspace.join("b");
+    let binary_path = t.workspace().join("b");
     let compile_status = Command::new("cc")
-        .args([
-            "-o",
-            binary_path.to_str().expect("binary path"),
-            source_path.to_str().expect("source path"),
-        ])
+        .arg("-o")
+        .arg(&binary_path)
+        .arg(&source_path)
         .status()
         .expect("run cc");
     assert!(compile_status.success(), "cc must compile the test binary");
 
-    let profile_path = write_profile(
-        &home,
-        "cmd-policies-bin-exec",
+    let profile = command_policies_profile(&t, "cmd-policies-bin-exec");
+
+    t.run()
+        .profile(&profile)
+        .no_rollback()
+        .exec(Argv::new("bash").arg("-c").arg("./b"))
+        .assert_success(
+            "a freshly compiled binary in a writable grant-dir executes under command_policies",
+        )
+        .assert_stdout_contains("ok");
+}
+
+/// Workspace-only profile with an active `command_policies` outer exec gate.
+#[cfg(target_os = "linux")]
+fn command_policies_profile(t: &NonoTest, name: &str) -> Profile {
+    t.write_profile(
+        name,
         &format!(
             r#"{{
-                "meta": {{ "name": "cmd-policies-bin-exec-test" }},
+                "meta": {{ "name": "{name}-test" }},
                 "filesystem": {{ "allow": ["{workspace}"] }},
                 "network": {{ "block": true }},
                 "command_policies": {{
@@ -590,102 +317,66 @@ fn command_policies_allows_compiled_binary_exec_in_writable_grant_dir() {
                     }}
                 }}
             }}"#,
-            workspace = workspace.display()
+            workspace = t.workspace().display()
         ),
-    );
-
-    let output = run_nono(
-        &[
-            "run",
-            "--profile",
-            profile_path.to_str().expect("profile path"),
-            "--no-rollback",
-            "--",
-            "bash",
-            "-c",
-            "./b",
-        ],
-        &home,
-        &workspace,
-    );
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    assert!(
-        output.status.success(),
-        "a freshly compiled binary in a writable grant-dir must still execute under command_policies\nstdout: {stdout}\nstderr: {stderr}",
-    );
-    assert!(
-        stdout.contains("ok"),
-        "expected binary output in stdout\nstdout: {stdout}\nstderr: {stderr}",
-    );
+    )
 }
 
 /// A granted project directory to hand the child via `--workdir`, plus a launch
 /// directory that is deliberately outside the capability set.
 struct WorkdirCase {
-    _tmp: tempfile::TempDir,
-    home: PathBuf,
-    profile: PathBuf,
+    t: NonoTest,
+    profile: Profile,
     launch: PathBuf,
     project: PathBuf,
 }
 
 fn setup_workdir_case(prefix: &str) -> WorkdirCase {
-    let (tmp, home, workspace) = setup_isolated_home(prefix);
-    let launch = tmp.path().join("launch");
-    fs::create_dir_all(&launch).expect("create launch dir");
+    let t = nono_test!(prefix);
+    let launch = t.root().join("launch");
+    fs::create_dir_all(&launch).expect("root is a fresh dir this test owns");
 
-    let profile = write_profile(
-        &home,
-        prefix,
-        &format!(
-            r#"{{
-                "meta": {{ "name": "{prefix}-test" }},
-                "filesystem": {{ "allow": ["{workspace}"] }},
-                "network": {{ "block": true }}
-            }}"#,
-            workspace = workspace.display()
-        ),
-    );
+    let project = t.workspace().to_path_buf();
+    let profile = workspace_only_profile(&t, prefix);
 
     WorkdirCase {
-        _tmp: tmp,
-        home,
+        t,
         profile,
         launch,
-        project: workspace,
+        project,
     }
 }
 
-/// The child's own `$PWD`, as reported by `/usr/bin/env`.
-fn child_pwd(stdout: &str) -> Option<&str> {
-    stdout.lines().find_map(|line| line.strip_prefix("PWD="))
+/// Asserts the child's own `$PWD` is the workdir.
+///
+/// Takes the first `PWD=` line rather than looking for a matching one anywhere:
+/// a corrected entry appended after a stale one would not undo it, since
+/// `getenv` resolves to the first match.
+fn assert_child_pwd(completed: &Completed, case: &WorkdirCase) {
+    let stdout = completed.stdout();
+    assert_eq!(
+        stdout.lines().find_map(|line| line.strip_prefix("PWD=")),
+        case.project.to_str(),
+        "--workdir must set the child's $PWD\nstdout: {stdout}\nstderr: {}",
+        completed.stderr(),
+    );
 }
 
-/// Run `nono <subcommand> --workdir <project>` from the uncovered launch directory,
-/// exporting `host_pwd` as the inherited `$PWD`.
-fn run_workdir_case(case: &WorkdirCase, subcommand: &str, host_pwd: &Path) -> Output {
-    let mut args = vec![
-        subcommand,
-        "--profile",
-        case.profile.to_str().expect("profile path"),
-    ];
-    if subcommand == "run" {
-        args.push("--no-rollback");
-    }
-    args.extend([
-        "--workdir",
-        case.project.to_str().expect("project path"),
-        "--",
-        "/usr/bin/env",
-    ]);
-
-    nono_cmd(&args, &case.home, &case.launch)
+/// Runs `nono <subcommand> --workdir <project> -- /usr/bin/env` from the
+/// uncovered launch directory, exporting `host_pwd` as the inherited `$PWD`.
+///
+/// Generic over the subcommand: `run` and `wrap` differ in which rollback flags
+/// they accept, so each caller supplies an already-configured builder.
+fn run_workdir_case<M: Sandboxing>(
+    case: &WorkdirCase,
+    cmd: Sandboxed<'_, M>,
+    host_pwd: &Path,
+) -> Completed {
+    cmd.profile(&case.profile)
+        .workdir(&case.project)
+        .launch_dir(&case.launch)
         .env("PWD", host_pwd)
-        .output()
-        .expect("failed to run nono")
+        .exec("/usr/bin/env")
 }
 
 /// `--workdir` must reach the child's `$PWD` even though nono was launched from a
@@ -693,59 +384,33 @@ fn run_workdir_case(case: &WorkdirCase, subcommand: &str, host_pwd: &Path) -> Ou
 #[test]
 fn direct_workdir_sets_child_pwd_from_uncovered_launch_dir() {
     let case = setup_workdir_case("workdir-pwd-direct");
-    let output = run_workdir_case(&case, "wrap", &case.launch);
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    assert_eq!(
-        child_pwd(&stdout),
-        case.project.to_str(),
-        "nono wrap --workdir must set the child's $PWD to the workdir\nstdout: {stdout}\nstderr: {stderr}",
-    );
+    let completed = run_workdir_case(&case, case.t.wrap(), &case.launch);
+    assert_child_pwd(&completed, &case);
 }
 
 #[test]
 fn supervised_workdir_sets_child_pwd_from_uncovered_launch_dir() {
     let case = setup_workdir_case("workdir-pwd-supervised");
-    let output = run_workdir_case(&case, "run", &case.launch);
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    assert_eq!(
-        child_pwd(&stdout),
-        case.project.to_str(),
-        "nono run --workdir must set the child's $PWD to the workdir\nstdout: {stdout}\nstderr: {stderr}",
-    );
+    let completed = run_workdir_case(&case, case.t.run().no_rollback(), &case.launch);
+    assert_child_pwd(&completed, &case);
 }
 
+/// A stale inherited `$PWD` — here a directory nono was not launched from —
+/// must not suppress the correction.
 #[test]
 fn direct_workdir_overrides_untrusted_host_pwd() {
     let case = setup_workdir_case("workdir-pwd-stale-direct");
-    let output = run_workdir_case(&case, "wrap", &case.home);
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    assert_eq!(
-        child_pwd(&stdout),
-        case.project.to_str(),
-        "a stale inherited $PWD must not suppress the correction\nstdout: {stdout}\nstderr: {stderr}",
-    );
+    let completed = run_workdir_case(&case, case.t.wrap(), case.t.home());
+    assert_child_pwd(&completed, &case);
 }
 
 #[test]
 fn supervised_workdir_overrides_untrusted_host_pwd() {
     let case = setup_workdir_case("workdir-pwd-stale-supervised");
-    let output = run_workdir_case(&case, "run", &case.home);
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    assert_eq!(
-        child_pwd(&stdout),
-        case.project.to_str(),
-        "a stale inherited $PWD must not suppress the correction\nstdout: {stdout}\nstderr: {stderr}",
-    );
+    let completed = run_workdir_case(&case, case.t.run().no_rollback(), case.t.home());
+    assert_child_pwd(&completed, &case);
 }

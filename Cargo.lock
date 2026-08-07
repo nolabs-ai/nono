@@ -2786,6 +2786,7 @@ dependencies = [
  "nix 0.31.3",
  "nono",
  "nono-proxy",
+ "nono-test-support",
  "proptest",
  "rand 0.10.2",
  "regex",
@@ -2865,6 +2866,14 @@ dependencies = [
  "webpki-roots",
  "x509-parser",
  "zeroize",
+]
+
+[[package]]
+name = "nono-test-support"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

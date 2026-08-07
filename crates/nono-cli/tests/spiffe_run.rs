@@ -14,55 +14,11 @@
 //! routes through the nono proxy, which fetches the SVID and injects the header.
 #![allow(clippy::unwrap_used)]
 
-use std::fs;
+use nono_test_support::{Argv, nono_test};
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
 use std::sync::{Arc, Mutex};
 use std::thread;
-
-// ─── Helpers shared with other integration tests ─────────────────────────────
-
-fn nono_bin() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_nono"))
-}
-
-fn setup_isolated_home(prefix: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {
-    let temp_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("target")
-        .join("test-artifacts");
-    fs::create_dir_all(&temp_root).expect("create test-artifacts root");
-    let tmp = tempfile::Builder::new()
-        .prefix(&format!("nono-spiffe-{prefix}-"))
-        .tempdir_in(&temp_root)
-        .expect("create tempdir");
-    let home = tmp.path().join("home");
-    let workspace = tmp.path().join("workspace");
-    fs::create_dir_all(home.join(".config")).expect("create .config dir");
-    fs::create_dir_all(home.join(".local").join("state")).expect("create state dir");
-    fs::create_dir_all(&workspace).expect("create workspace dir");
-    (tmp, home, workspace)
-}
-
-fn run_nono(args: &[&str], home: &Path, cwd: &Path) -> Output {
-    nono_bin()
-        .args(args)
-        .env("HOME", home)
-        .env("XDG_CONFIG_HOME", home.join(".config"))
-        .env("XDG_STATE_HOME", home.join(".local").join("state"))
-        .env("NONO_NO_SAVE_PROMPT", "1")
-        .env_remove("NONO_DETACHED_LAUNCH")
-        .current_dir(cwd)
-        .output()
-        .expect("failed to run nono")
-}
-
-fn write_profile(home: &Path, name: &str, json: &str) -> PathBuf {
-    let path = home.join(format!("{name}.json"));
-    fs::write(&path, json).expect("write profile");
-    path
-}
 
 /// Returns the SPIRE agent socket path, or `None` to skip the test.
 fn live_socket() -> Option<String> {
@@ -146,15 +102,14 @@ fn spiffe_jwt_credential_injected_end_to_end() {
         None => return,
     };
 
-    let (_tmp, home, workspace) = setup_isolated_home("jwt-inject");
+    let t = nono_test!("spiffe-jwt-inject");
     let mock = MockHttpServer::start();
     let upstream = format!("http://127.0.0.1:{}", mock.port);
 
     // Credential name must be hyphen-free: it becomes MOCKAPI_BASE_URL / MOCKAPI_API_KEY
     // in the child environment. The proxy routes by URL path prefix (/mockapi/...) and
     // strips it before forwarding to the upstream.
-    let profile_path = write_profile(
-        &home,
+    let profile = t.write_profile(
         "spiffe-jwt",
         &format!(
             r#"{{
@@ -180,30 +135,16 @@ fn spiffe_jwt_credential_injected_end_to_end() {
     // curl routes $MOCKAPI_BASE_URL through HTTP_PROXY (127.0.0.1 is removed from
     // NO_PROXY because the upstream is loopback). The proxy normalises the absolute
     // URL, matches the mockapi route, fetches a JWT-SVID, and injects it.
-    let output = run_nono(
-        &[
-            "run",
-            "--profile",
-            profile_path.to_str().expect("profile path"),
-            "--no-rollback",
-            "--",
-            "sh",
-            "-c",
-            "curl --silent --show-error \"$MOCKAPI_BASE_URL/\"",
-        ],
-        &home,
-        &workspace,
+    let completed = t.run().profile(&profile).no_rollback().exec(
+        Argv::new("sh")
+            .arg("-c")
+            .arg("curl --silent --show-error \"$MOCKAPI_BASE_URL/\""),
     );
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
 
     let headers = mock.wait_for_headers(std::time::Duration::from_secs(10));
 
-    assert!(
-        output.status.success(),
-        "nono run should succeed\nstdout: {stdout}\nstderr: {stderr}"
-    );
+    let stderr = completed.stderr().into_owned();
+    completed.assert_success("nono run with a SPIFFE credential completes");
 
     let auth_header = headers
         .iter()
@@ -236,10 +177,9 @@ fn spiffe_jwt_proxy_starts_with_live_agent() {
         None => return,
     };
 
-    let (_tmp, home, workspace) = setup_isolated_home("jwt-start");
+    let t = nono_test!("spiffe-jwt-start");
 
-    let profile_path = write_profile(
-        &home,
+    let profile = t.write_profile(
         "spiffe-jwt-start",
         &format!(
             r#"{{
@@ -262,24 +202,9 @@ fn spiffe_jwt_proxy_starts_with_live_agent() {
         ),
     );
 
-    let output = run_nono(
-        &[
-            "run",
-            "--profile",
-            profile_path.to_str().expect("profile path"),
-            "--no-rollback",
-            "--",
-            "true",
-        ],
-        &home,
-        &workspace,
-    );
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    assert!(
-        output.status.success(),
-        "nono run should start cleanly with a live SPIRE agent\nstdout: {stdout}\nstderr: {stderr}"
-    );
+    t.run()
+        .profile(&profile)
+        .no_rollback()
+        .exec("true")
+        .assert_success("nono run starts cleanly with a live SPIRE agent");
 }

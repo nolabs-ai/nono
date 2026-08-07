@@ -1857,6 +1857,7 @@ fn collect_tool_sandbox_proxy_grants(
         };
 
         let route = crate::profile::CustomCredentialDef {
+            redeem_phantoms: Vec::new(),
             upstream,
             credential_key,
             auth: None,
@@ -2498,7 +2499,16 @@ fn synthesize_credential_provider_proxy_config(
         let endpoint_policy = route.endpoint_policy.clone();
         for (index, api_host) in provider.api_hosts.iter().enumerate() {
             let prefix = provider_route_prefix(&route.name, index, provider.api_hosts.len());
+            let upgrades: Vec<nono_proxy::config::WebSocketRuleConfig> = route
+                .upgrades
+                .iter()
+                .filter(|rule| &rule.origin == api_host)
+                .map(|rule| nono_proxy::config::WebSocketRuleConfig {
+                    path: rule.path.clone(),
+                })
+                .collect();
             proxy_config.routes.push(nono_proxy::config::RouteConfig {
+                redeem_phantoms: Vec::new(),
                 prefix: prefix.clone(),
                 upstream: api_host.clone(),
                 credential_key: None,
@@ -2534,6 +2544,7 @@ fn synthesize_credential_provider_proxy_config(
                 aws_auth: None,
                 spiffe: None,
                 rate_limit: None,
+                upgrades,
             });
             consumers_by_provider
                 .entry(route.provider.clone())
@@ -2703,6 +2714,17 @@ struct TokenBrokerNonceResolver(crate::tool_sandbox::token_broker::SharedBroker)
 impl nono_proxy::NonceResolver for TokenBrokerNonceResolver {
     fn resolve(&self, nonce: &str, consumer: &str) -> Option<Zeroizing<Vec<u8>>> {
         self.0.lock().ok()?.resolve_nonce(nonce, consumer)
+    }
+
+    fn resolve_for_credentials(
+        &self,
+        nonce: &str,
+        allowed_credentials: &[String],
+    ) -> Option<Zeroizing<Vec<u8>>> {
+        self.0
+            .lock()
+            .ok()?
+            .resolve_nonce_for_credentials(nonce, allowed_credentials)
     }
 }
 
@@ -3491,6 +3513,7 @@ mod tests {
         custom_credentials.insert(
             "mockhttp".to_string(),
             CustomCredentialDef {
+                redeem_phantoms: Vec::new(),
                 upstream: "https://mockhttp.org".to_string(),
                 credential_key: Some("env://MOCK_API_KEY".to_string()),
                 auth: None,
@@ -3979,6 +4002,7 @@ mod tests {
 
         let mut proxy_config = nono_proxy::config::ProxyConfig::default();
         proxy_config.routes.push(nono_proxy::config::RouteConfig {
+            redeem_phantoms: Vec::new(),
             prefix: "github-api".to_string(),
             upstream: "https://api.github.com".to_string(),
             credential_key: Some("github-token".to_string()),
@@ -3999,6 +4023,7 @@ mod tests {
             aws_auth: None,
             spiffe: None,
             rate_limit: None,
+            upgrades: vec![],
         });
         let credential_env_vars = vec![
             (
@@ -4889,6 +4914,7 @@ mod tests {
                 env_var: Some("OPENAI_API_KEY".to_string()),
                 base_url_env_var: Some("OPENAI_BASE_URL".to_string()),
                 endpoint_policy: None,
+                upgrades: vec![],
             }],
             ..ProxyLaunchOptions::default()
         };
@@ -4963,6 +4989,7 @@ mod tests {
                 env_var: None,
                 base_url_env_var: None,
                 endpoint_policy: None,
+                upgrades: vec![],
             }],
             ..ProxyLaunchOptions::default()
         };

@@ -698,6 +698,53 @@ Controls which environment variables are passed to the sandboxed process. When `
 
 Inheritance: child `allow_vars` and `deny_vars` are appended to base values and deduplicated; `set_vars` merges as a map, with the child's value winning on key conflict.
 
+### export_env (caller-declared environment pass-through)
+
+`export_env` lets a **caller** declare which of its own live environment variables flow down, verbatim, to the commands it invokes — bypassing both the callee's `allow_vars` filtering and the built-in dangerous-variable blocklist (`LD_PRELOAD`, `NODE_OPTIONS`, `PYTHONPATH`, …). It is the escape hatch for tools that must forward an interpreter/tooling variable to the programs they launch (for example an interpreter-injection variable a wrapper sets before spawning a child interpreter).
+
+This is a **caller-declared** control: the field lives on the command doing the invoking (or on the session, for the top-level case), not on the command being invoked. When a command is intercepted, nono attributes it to its resolved caller, then copies the matching variables from that intercepted command's **immediate-parent environment** into the child. The caller's list is only the filter; the values always come from the live parent environment.
+
+- **Patterns:** exact names (`"TOOL_CONFIG"`), trailing-`*` prefixes (`"AWS_*"`), or a bare `"*"` (all). Mid-string wildcards are rejected at load time.
+- **`PATH` and any `NONO_*` key are always excluded** — nono manages those — even under `"*"`. A pattern that explicitly targets them (exact `PATH`, or the `NONO_` prefix) is rejected at load time.
+- Values are taken verbatim and are **not** run through the credential broker. Use `export_env` for tooling variables, not credentials — those flow through `use_credentials`/`allow_vars`.
+- Applied on both the macOS and Linux tool-sandbox paths, before PATH/chaining/`set_vars`/credential injection, so nono-injected variables still win. Merges by dedup-append across the inheritance chain.
+
+#### Per-command caller: `commands.<caller>.export_env`
+
+When the invoking command is itself mediated, declare `export_env` on that command. Example: `git` runs a hook that spawns `node`; `node`'s resolved caller is `git`, so `git`'s `export_env` decides what reaches `node`:
+
+```json
+{
+  "command_policies": {
+    "commands": {
+      "git": {
+        "can_use": ["node"],
+        "export_env": ["TOOL_CONFIG"]
+      }
+    }
+  }
+}
+```
+
+#### Session caller: `session_export_env`
+
+When the intercepted command's nearest mediated ancestor is the session itself — for example an **unmediated** wrapper spawns it, so the ancestry walk reaches the session root without crossing a mediated command — its caller is the session. Declare the top-level `session_export_env` to cover this case:
+
+```json
+{
+  "command_policies": {
+    "session_export_env": ["TOOL_CONFIG"],
+    "commands": {
+      "node": {
+        "from": { "session": { "fs_read": ["."] } }
+      }
+    }
+  }
+}
+```
+
+Here an unmediated wrapper invokes `node` while holding `TOOL_CONFIG` in its environment; `node`'s caller resolves to the session, so `session_export_env` copies `TOOL_CONFIG` into `node` verbatim.
+
 ### hooks
 
 Map of application name to hook configuration:

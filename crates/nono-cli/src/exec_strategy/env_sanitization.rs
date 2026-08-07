@@ -12,9 +12,7 @@
 /// injection (BASH_ENV, PROMPT_COMMAND, IFS), and interpreter code/module injection
 /// (NODE_OPTIONS, PYTHONPATH, PERL5OPT, RUBYOPT, JAVA_TOOL_OPTIONS, etc.).
 pub(crate) fn is_dangerous_env_var(key: &str) -> bool {
-    // Linker injection
-    key.starts_with("LD_")
-        || key.starts_with("DYLD_")
+    is_loader_injection_env_var(key)
         // Shell injection
         || key == "BASH_ENV"
         || key == "ENV"
@@ -44,12 +42,22 @@ pub(crate) fn is_dangerous_env_var(key: &str) -> bool {
         || key == "DOTNET_STARTUP_HOOKS"
         // Go injection
         || key == "GOFLAGS"
-        // 1Password secrets and session tokens — meta-secrets used by
-        // the parent to authenticate `op` CLI, must never leak to sandboxed child
-        || key == "OP_SERVICE_ACCOUNT_TOKEN"
+        || is_forbidden_secret_env_var(key)
+}
+
+/// 1Password meta-secrets — credentials, not tooling vars, so `export_env`
+/// must never re-admit them even by exact name.
+pub(crate) fn is_forbidden_secret_env_var(key: &str) -> bool {
+    key == "OP_SERVICE_ACCOUNT_TOKEN"
         || key == "OP_CONNECT_TOKEN"
         || key == "OP_CONNECT_HOST"
         || key.starts_with("OP_SESSION_")
+}
+
+/// Loader vars hit any dynamically-linked child, not just an interpreter, so
+/// `export_env` requires an exact-name pattern for these — `*`/prefix isn't enough.
+pub(crate) fn is_loader_injection_env_var(key: &str) -> bool {
+    key.starts_with("LD_") || key.starts_with("DYLD_")
 }
 
 /// Returns true if `key` matches any pattern in `patterns`.
@@ -58,7 +66,7 @@ pub(crate) fn is_dangerous_env_var(key: &str) -> bool {
 /// (`"AWS_*"` matches `AWS_REGION`, `AWS_SECRET_ACCESS_KEY`, etc.).
 /// A bare `"*"` matches everything. The `*` wildcard is only valid as a
 /// trailing suffix — patterns like `"A*B"` or `"*X"` are skipped.
-fn matches_env_var_patterns(key: &str, patterns: &[String]) -> bool {
+pub(crate) fn matches_env_var_patterns(key: &str, patterns: &[String]) -> bool {
     for pattern in patterns {
         if let Some(prefix) = pattern.strip_suffix('*') {
             if prefix.contains('*') {

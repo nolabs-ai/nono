@@ -116,6 +116,52 @@ pub(crate) fn apply_environment_set_vars(
     Ok(())
 }
 
+/// Copies `export_patterns`-matching vars from the caller's live env
+/// (`request.env`) into `env` verbatim, bypassing `allow_vars` and the
+/// dangerous-var blocklist — the caller-declares model, where the caller
+/// opts its own variables into a callee rather than the callee pulling from
+/// the broker. `PATH`/`NONO_*` and secrets are always excluded; loader vars
+/// need an exact-name pattern.
+pub(crate) fn apply_export_env(
+    env: &mut Vec<Vec<u8>>,
+    request: &ToolSandboxShimRequest,
+    export_patterns: &[String],
+) {
+    if export_patterns.is_empty() {
+        return;
+    }
+    for entry in &request.env {
+        let Some((key, value)) = split_env_entry(entry) else {
+            continue;
+        };
+        let Ok(key_str) = std::str::from_utf8(key) else {
+            continue;
+        };
+        // nono owns PATH and its own NONO_* namespace; never let the export
+        // list re-admit them, including under a bare `*`.
+        if key_str == "PATH" || key_str.starts_with("NONO_") {
+            continue;
+        }
+        if !crate::exec_strategy::matches_env_var_patterns(key_str, export_patterns) {
+            continue;
+        }
+        if crate::exec_strategy::env_sanitization::is_forbidden_secret_env_var(key_str) {
+            continue;
+        }
+        if crate::exec_strategy::env_sanitization::is_loader_injection_env_var(key_str)
+            && !export_patterns.iter().any(|pattern| pattern == key_str)
+        {
+            continue;
+        }
+        let mut prefix = key.to_vec();
+        prefix.push(b'=');
+        env.retain(|existing| !existing.starts_with(&prefix));
+        let mut new_entry = prefix;
+        new_entry.extend_from_slice(value);
+        env.push(new_entry);
+    }
+}
+
 pub(crate) fn inject_chaining_control_env(
     env: &mut Vec<Vec<u8>>,
     socket_path: &Path,
@@ -523,6 +569,121 @@ mod tests {
         let policy = CommandSandboxConfig::default();
         let extra = vec![b"a\0b".to_vec()];
         assert!(effective_argv_for_binary(&helper, &request, &policy, &extra, false).is_err());
+    }
+
+    fn patterns(list: &[&str]) -> Vec<String> {
+        list.iter().map(|v| v.to_string()).collect()
+    }
+
+    fn request_with(env: &[&str], cwd: &str) -> ToolSandboxShimRequest {
+        ToolSandboxShimRequest {
+            command: "node".to_string(),
+            argv: vec![b"node".to_vec()],
+            env: env.iter().map(|e| e.as_bytes().to_vec()).collect(),
+            cwd: cwd.as_bytes().to_vec(),
+            stdio_tty: [false; 3],
+        }
+    }
+
+    fn rendered(env: &[Vec<u8>]) -> Vec<String> {
+        env.iter()
+            .map(|e| String::from_utf8_lossy(e).into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn export_env_passes_blocklisted_var_from_parent() {
+        // A var on the dangerous blocklist still passes through when the caller
+        // exports it, carrying the intercepted command's parent value verbatim.
+        let request = request_with(&["PYTHONPATH=/opt/lib"], "/work");
+        let mut env: Vec<Vec<u8>> = Vec::new();
+        apply_export_env(&mut env, &request, &patterns(&["PYTHONPATH"]));
+        assert_eq!(rendered(&env), vec!["PYTHONPATH=/opt/lib"]);
+    }
+
+    #[test]
+    fn export_env_skips_var_not_matched_by_caller() {
+        // Only variables matching the caller's export list flow through.
+        let request = request_with(&["PYTHONPATH=/opt/lib", "TZ=UTC"], "/work");
+        let mut env: Vec<Vec<u8>> = Vec::new();
+        apply_export_env(&mut env, &request, &patterns(&["NODE_OPTIONS"]));
+        assert!(env.is_empty());
+    }
+
+    #[test]
+    fn export_env_replaces_existing_entry() {
+        // A var already present in the (allow-filtered) env is overridden with
+        // the exported parent value rather than duplicated.
+        let request = request_with(&["NODE_TESTVAR=parent"], "/work");
+        let mut env: Vec<Vec<u8>> = vec![b"NODE_TESTVAR=stale".to_vec()];
+        apply_export_env(&mut env, &request, &patterns(&["NODE_TESTVAR"]));
+        assert_eq!(rendered(&env), vec!["NODE_TESTVAR=parent"]);
+    }
+
+    #[test]
+    fn export_env_noop_without_patterns() {
+        let request = request_with(&["PYTHONPATH=/opt/lib"], "/work");
+        let mut env: Vec<Vec<u8>> = Vec::new();
+        apply_export_env(&mut env, &request, &[]);
+        assert!(env.is_empty());
+    }
+
+    #[test]
+    fn export_env_prefix_pattern_matches() {
+        let request = request_with(&["AWS_REGION=eu", "AWS_PROFILE=dev", "TZ=UTC"], "/work");
+        let mut env: Vec<Vec<u8>> = Vec::new();
+        apply_export_env(&mut env, &request, &patterns(&["AWS_*"]));
+        let out = rendered(&env);
+        assert!(out.contains(&"AWS_REGION=eu".to_string()));
+        assert!(out.contains(&"AWS_PROFILE=dev".to_string()));
+        assert!(!out.iter().any(|e| e.starts_with("TZ=")));
+    }
+
+    #[test]
+    fn export_env_star_excludes_path_and_nono() {
+        // A bare `*` forwards everything EXCEPT nono-managed PATH and NONO_*.
+        let request = request_with(
+            &["PATH=/evil", "NONO_CAP_FILE=/x", "NODE_OPTIONS=--require x"],
+            "/work",
+        );
+        let mut env: Vec<Vec<u8>> = Vec::new();
+        apply_export_env(&mut env, &request, &patterns(&["*"]));
+        let out = rendered(&env);
+        assert_eq!(out, vec!["NODE_OPTIONS=--require x".to_string()]);
+    }
+
+    #[test]
+    fn export_env_never_forwards_1password_secrets() {
+        let request = request_with(
+            &["OP_SERVICE_ACCOUNT_TOKEN=ops_x", "OP_SESSION_my=y"],
+            "/work",
+        );
+        let mut env: Vec<Vec<u8>> = Vec::new();
+        apply_export_env(
+            &mut env,
+            &request,
+            &patterns(&["OP_SERVICE_ACCOUNT_TOKEN", "OP_SESSION_my", "*"]),
+        );
+        assert!(env.is_empty());
+    }
+
+    #[test]
+    fn export_env_star_does_not_forward_loader_vars() {
+        let request = request_with(
+            &["LD_PRELOAD=/evil.so", "DYLD_INSERT_LIBRARIES=/evil.dylib"],
+            "/work",
+        );
+        let mut env: Vec<Vec<u8>> = Vec::new();
+        apply_export_env(&mut env, &request, &patterns(&["*", "LD_*", "DYLD_*"]));
+        assert!(env.is_empty());
+    }
+
+    #[test]
+    fn export_env_exact_name_pattern_forwards_loader_var() {
+        let request = request_with(&["LD_PRELOAD=/trusted.so"], "/work");
+        let mut env: Vec<Vec<u8>> = Vec::new();
+        apply_export_env(&mut env, &request, &patterns(&["LD_PRELOAD"]));
+        assert_eq!(rendered(&env), vec!["LD_PRELOAD=/trusted.so".to_string()]);
     }
 
     #[test]

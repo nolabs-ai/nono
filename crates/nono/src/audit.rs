@@ -801,12 +801,11 @@ pub fn append_session_to_ledger_file(
             if line.trim().is_empty() {
                 continue;
             }
-            let record: LedgerRecord = serde_json::from_str(&line).map_err(|e| {
-                NonoError::Snapshot(format!(
-                    "Failed to parse audit ledger line {}: {e}",
-                    index.saturating_add(1)
-                ))
-            })?;
+            let record: LedgerRecord =
+                serde_json::from_str(&line).map_err(|e| NonoError::AuditLedgerCorrupt {
+                    line: index.saturating_add(1),
+                    reason: e.to_string(),
+                })?;
             previous_chain = Some(record.chain_hash);
             next_sequence = record.sequence.saturating_add(1);
         }
@@ -880,12 +879,11 @@ pub fn verify_session_in_ledger_reader<R: BufRead>(
         if line.trim().is_empty() {
             continue;
         }
-        let record: LedgerRecord = serde_json::from_str(&line).map_err(|e| {
-            NonoError::Snapshot(format!(
-                "Failed to parse audit ledger line {}: {e}",
-                index.saturating_add(1)
-            ))
-        })?;
+        let record: LedgerRecord =
+            serde_json::from_str(&line).map_err(|e| NonoError::AuditLedgerCorrupt {
+                line: index.saturating_add(1),
+                reason: e.to_string(),
+            })?;
         if record.sequence != entry_count {
             return Err(NonoError::Snapshot(format!(
                 "Audit ledger sequence mismatch at line {}",

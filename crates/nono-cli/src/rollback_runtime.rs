@@ -52,6 +52,18 @@ pub(crate) struct RollbackExitContext<'a> {
     pub(crate) rollback_prompt_disabled: bool,
 }
 
+/// What post-exit bookkeeping managed to complete.
+///
+/// The ledger append is reported rather than propagated so the audit shipping,
+/// rollback review and temp-file cleanup that follow it still run. The caller
+/// turns a missing entry into the exit status once all of that is done.
+#[must_use = "dropping the outcome loses the ledger gap the caller owes the exit status"]
+pub(crate) struct FinalizeOutcome {
+    /// False only when an append was attempted and failed. A run with auditing
+    /// off never attempts one, which is not a gap in the chain.
+    pub(crate) ledger_recorded: bool,
+}
+
 fn rollback_vcs_exclusions() -> Vec<String> {
     [".git", ".hg", ".svn"]
         .iter()
@@ -474,7 +486,23 @@ pub(crate) fn initialize_rollback_state(
     }))
 }
 
-pub(crate) fn finalize_supervised_exit(ctx: RollbackExitContext<'_>) -> Result<()> {
+/// Commit a completed session to the global audit ledger, reporting whether the
+/// entry landed.
+///
+/// The error is printed here instead of returned because the caller must keep
+/// going: an unappendable ledger may not cost the run its audit delivery or its
+/// rollback review. The gap still reaches the exit status via
+/// [`FinalizeOutcome`].
+#[must_use = "on `false` the session is absent from the chain and the caller MUST NOT report success"]
+fn record_session_in_ledger(metadata: &nono::undo::SessionMetadata) -> bool {
+    let Err(error) = audit_ledger::append_session(metadata) else {
+        return true;
+    };
+    output::print_audit_ledger_append_failure(&error, audit_ledger::ledger_path().ok().as_deref());
+    false
+}
+
+pub(crate) fn finalize_supervised_exit(ctx: RollbackExitContext<'_>) -> Result<FinalizeOutcome> {
     let RollbackExitContext {
         audit_state,
         rollback_state,
@@ -526,6 +554,7 @@ pub(crate) fn finalize_supervised_exit(ctx: RollbackExitContext<'_>) -> Result<(
 
     let scrubbed_command = nono::scrub_argv_with_policy(command, redaction_policy);
     let mut audit_saved = false;
+    let mut ledger_recorded = true;
 
     if let Some(RollbackRuntimeState {
         session_dir,
@@ -565,7 +594,7 @@ pub(crate) fn finalize_supervised_exit(ctx: RollbackExitContext<'_>) -> Result<(
         manager.save_session_metadata(&meta)?;
         if let Some(audit_state) = audit_state {
             nono::undo::SnapshotManager::write_session_metadata(&audit_state.session_dir, &meta)?;
-            audit_ledger::append_session(&meta)?;
+            ledger_recorded = record_session_in_ledger(&meta);
             if let Err(error) = audit_client::maybe_ship_session(&audit_state.session_dir, &meta) {
                 warn!("Audit delivery remains queued: {error}");
             }
@@ -615,13 +644,13 @@ pub(crate) fn finalize_supervised_exit(ctx: RollbackExitContext<'_>) -> Result<(
             )?);
         }
         nono::undo::SnapshotManager::write_session_metadata(&audit_state.session_dir, &meta)?;
-        audit_ledger::append_session(&meta)?;
+        ledger_recorded = record_session_in_ledger(&meta);
         if let Err(error) = audit_client::maybe_ship_session(&audit_state.session_dir, &meta) {
             warn!("Audit delivery remains queued: {error}");
         }
     }
 
-    Ok(())
+    Ok(FinalizeOutcome { ledger_recorded })
 }
 
 #[cfg(test)]
@@ -940,5 +969,46 @@ mod tests {
             verify_audit_attestation(&audit_dir, &attested_metadata, None).expect("verify");
         assert!(verification.signature_verified);
         assert!(verification.verification_error.is_none());
+    }
+
+    /// A failed append has to leave a trace in the return value: reporting it on
+    /// stderr alone would let `finalize_supervised_exit` return a clean outcome
+    /// for a run that never entered the chain, and the caller's exit-status
+    /// downgrade is what keeps that from reading as success.
+    #[test]
+    fn a_failed_ledger_append_is_reported_as_unrecorded() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state");
+        fs::create_dir_all(&state).unwrap();
+        let home = tmp.path().to_string_lossy().to_string();
+        let state_str = state.to_string_lossy().to_string();
+        let _env = EnvVarGuard::set_all(&[("HOME", &home), ("XDG_STATE_HOME", &state_str)]);
+
+        let mut metadata = SessionMetadata {
+            session_id: "20260421-200000-11111".to_string(),
+            started: "2026-04-21T20:00:00Z".to_string(),
+            ended: Some("2026-04-21T20:00:01Z".to_string()),
+            command: vec!["/bin/pwd".to_string()],
+            executable_identity: None,
+            tracked_paths: vec![PathBuf::from("/tmp/project")],
+            snapshot_count: 0,
+            exit_code: Some(0),
+            merkle_roots: Vec::new(),
+            network_events: Vec::new(),
+            audit_event_count: 2,
+            audit_integrity: None,
+            audit_attestation: None,
+        };
+        assert!(record_session_in_ledger(&metadata));
+
+        // Two records on one line with no separator i.e. a corrupt ledger.
+        let path = audit_ledger::ledger_path().unwrap();
+        let record = fs::read_to_string(&path).unwrap();
+        let record = record.trim_end().to_string();
+        fs::write(&path, format!("{record}{record}\n")).unwrap();
+
+        metadata.session_id = "20260421-200001-22222".to_string();
+        assert!(!record_session_in_ledger(&metadata));
     }
 }

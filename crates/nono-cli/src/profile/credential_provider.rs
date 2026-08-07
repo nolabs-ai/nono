@@ -64,6 +64,13 @@ pub struct CredentialProviderResponseField {
     pub path: String,
     #[serde(default)]
     pub kind: CredentialProviderResponseFieldKind,
+    /// Optional literal template for the visible phantom, with `{}` standing in
+    /// for a freshly minted random body (e.g. `"sk-ant-oat01-{}"`). The phantom
+    /// follows the template exactly so a client that classifies a credential by
+    /// sniffing a literal token prefix still recognises it. Only valid with
+    /// `kind: opaque`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -166,6 +173,24 @@ pub(super) fn validate_credential_provider_entries(profile: &Profile) -> Result<
                     ),
                     &field.path,
                 )?;
+                if let Some(template) = &field.format {
+                    let context = format!(
+                        "credential_providers.{name}.token_endpoints[{index}].response_fields.format"
+                    );
+                    if field.kind != CredentialProviderResponseFieldKind::Opaque {
+                        return Err(NonoError::ProfileParse(format!(
+                            "{context} is only valid with kind 'opaque'"
+                        )));
+                    }
+                    match template.match_indices("{}").count() {
+                        1 => {}
+                        _ => {
+                            return Err(NonoError::ProfileParse(format!(
+                                "{context} '{template}' must contain exactly one '{{}}' placeholder"
+                            )));
+                        }
+                    }
+                }
             }
             // request_nonce_fields is only meaningful for refresh/exchange
             // flows that re-send a phantom in the request body. Capture-only
@@ -471,6 +496,7 @@ mod tests {
                     response_fields: vec![CredentialProviderResponseField {
                         path: "auth.client_token".to_string(),
                         kind: CredentialProviderResponseFieldKind::Opaque,
+                        format: None,
                     }],
                     request_body: CredentialProviderRequestBodyFormat::Auto,
                     // Capture-only endpoint: intentionally no request_nonce_fields.

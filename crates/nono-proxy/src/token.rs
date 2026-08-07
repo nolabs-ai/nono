@@ -25,11 +25,158 @@ use zeroize::Zeroizing;
 /// proxy server so that nonces appearing in request headers can be swapped for
 /// real credential values immediately before the request is forwarded upstream.
 pub trait NonceResolver: Send + Sync {
-    /// Resolve `nonce` (a `nono_<64hex>` string) for `consumer`.
+    /// Resolve `nonce` for `consumer`.
     ///
-    /// Returns the real credential bytes if the nonce is known and admitted
+    /// `nonce` is the phantom string used as the store key — a bare
+    /// `nono_<64hex>` for broker/opaque phantoms, or the full templated phantom
+    /// (e.g. `sk-ant-oat01-<64hex>`) for a formatted OAuth capture field.
+    /// Returns the real credential bytes if the phantom is known and admitted
     /// for `consumer` (`"proxy.<route_id>"`), or `None` otherwise (fail-closed).
     fn resolve(&self, nonce: &str, consumer: &str) -> Option<Zeroizing<Vec<u8>>>;
+
+    /// Rewrite any phantom this resolver minted that appears in `value`,
+    /// substituting the real credential for `consumer`. Returns the rewritten
+    /// value, or `None` if no phantom for this resolver/consumer was found.
+    ///
+    /// The default recognises a bare `nono_<64hex>` nonce. Resolvers that also
+    /// mint templated phantoms override this, passing their registered
+    /// templates to [`rewrite_first_phantom`].
+    fn rewrite_header_value(&self, value: &str, consumer: &str) -> Option<String> {
+        rewrite_first_phantom(value, &[], |nonce| self.resolve(nonce, consumer))
+    }
+}
+
+/// Rewrite the first phantom found in `value` to its real credential.
+///
+/// Tries each templated phantom shape in `templates` (whole-span replace so no
+/// template literal reaches upstream), then a bare `nono_<64hex>` nonce.
+/// `resolve` maps a phantom string to its real value (returning `None` when
+/// unknown/unadmitted). Returns the rewritten value, or `None` if nothing
+/// resolved — callers forward the original value unchanged (fail-closed). The
+/// single implementation keeps the broker and OAuth-capture egress paths in
+/// lockstep.
+pub fn rewrite_first_phantom(
+    value: &str,
+    templates: &[PhantomTemplate],
+    resolve: impl Fn(&str) -> Option<Zeroizing<Vec<u8>>>,
+) -> Option<String> {
+    let spans = templates
+        .iter()
+        .filter_map(|template| template.find_in(value))
+        .chain(find_bare_nonce(value));
+    for (start, end) in spans {
+        if let Some(real) = resolve(&value[start..end])
+            && let Ok(real_str) = std::str::from_utf8(&real)
+        {
+            return Some(format!("{}{}{}", &value[..start], real_str, &value[end..]));
+        }
+    }
+    None
+}
+
+/// Byte length of a bare nonce: `"nono_"` (5) + 64 hex chars.
+pub const BARE_NONCE_LEN: usize = 5 + 64;
+
+/// Number of hex characters in a minted phantom body (32 bytes → 64 hex).
+pub const PHANTOM_BODY_HEX_LEN: usize = 64;
+
+/// A literal template wrapping a minted phantom body, split around the single
+/// `{}` placeholder. The visible phantom is `prefix + <body> + suffix`, where
+/// `<body>` is [`PHANTOM_BODY_HEX_LEN`] hex characters. Lets a client that
+/// classifies a credential by sniffing a literal token prefix recognise the
+/// phantom; the template is stripped on egress so it never reaches upstream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PhantomTemplate {
+    pub prefix: String,
+    pub suffix: String,
+}
+
+impl PhantomTemplate {
+    /// Parse a template string containing exactly one `{}` placeholder.
+    pub fn parse(template: &str) -> std::result::Result<Self, String> {
+        let open = template
+            .find("{}")
+            .ok_or_else(|| format!("format '{template}' must contain the '{{}}' placeholder"))?;
+        let prefix = &template[..open];
+        let suffix = &template[open + 2..];
+        if suffix.contains("{}") {
+            return Err(format!(
+                "format '{template}' must contain exactly one '{{}}' placeholder"
+            ));
+        }
+        Ok(Self {
+            prefix: prefix.to_string(),
+            suffix: suffix.to_string(),
+        })
+    }
+
+    /// Render the visible phantom for a minted `body`.
+    #[must_use]
+    pub fn render(&self, body: &str) -> String {
+        format!("{}{}{}", self.prefix, body, self.suffix)
+    }
+
+    /// Whether `real` is consistent with this template's literal prefix and
+    /// suffix. A mismatch means the declared `format` no longer matches the
+    /// token the provider actually returns (config drift) — the phantom is
+    /// still safe (its body is random), but a prefix-sniffing client may
+    /// classify it wrongly. Callers log a warning rather than fail, so a
+    /// provider-side format change never blocks login.
+    #[must_use]
+    pub fn matches(&self, real: &str) -> bool {
+        real.len() >= self.prefix.len().saturating_add(self.suffix.len())
+            && real.starts_with(&self.prefix)
+            && real.ends_with(&self.suffix)
+    }
+
+    /// Locate the first `prefix + <64hex> + suffix` occurrence in `value`,
+    /// returning its `[start, end)` byte range (the whole templated span).
+    ///
+    /// Slices the underlying bytes, not the `str`, so a crafted header value
+    /// whose multibyte UTF-8 straddles the body window cannot panic. The body
+    /// is required to be 64 ASCII hex, so a matched span always falls on char
+    /// boundaries — the returned range is safe to slice as a `str`.
+    #[must_use]
+    pub fn find_in(&self, value: &str) -> Option<(usize, usize)> {
+        let bytes = value.as_bytes();
+        let mut from = 0;
+        while let Some(rel) = value.get(from..)?.find(&self.prefix) {
+            let pstart = from.checked_add(rel)?;
+            let bstart = pstart.checked_add(self.prefix.len())?;
+            let bend = bstart.checked_add(PHANTOM_BODY_HEX_LEN)?;
+            if bend <= bytes.len()
+                && bytes[bstart..bend].iter().all(u8::is_ascii_hexdigit)
+                && bytes[bend..].starts_with(self.suffix.as_bytes())
+            {
+                let send = bend.checked_add(self.suffix.len())?;
+                return Some((pstart, send));
+            }
+            // Advance at least one byte so an empty prefix still terminates.
+            from = pstart.checked_add(self.prefix.len().max(1))?;
+        }
+        None
+    }
+}
+
+/// Locate the first bare `nono_<64hex>` nonce in `value`, returning its
+/// `[start, end)` byte range, or `None` if absent.
+///
+/// Byte-slices the body window so a crafted value cannot panic on a UTF-8
+/// boundary; the 64-hex body guarantees the returned range is char-safe.
+#[must_use]
+pub fn find_bare_nonce(value: &str) -> Option<(usize, usize)> {
+    const NONCE_PREFIX: &str = "nono_";
+    let start = value.find(NONCE_PREFIX)?;
+    let end = start.checked_add(BARE_NONCE_LEN)?;
+    let bytes = value.as_bytes();
+    if end > bytes.len() {
+        return None;
+    }
+    let body_start = start.checked_add(NONCE_PREFIX.len())?;
+    if !bytes[body_start..end].iter().all(u8::is_ascii_hexdigit) {
+        return None;
+    }
+    Some((start, end))
 }
 
 /// Length of the random token in bytes (256 bits of entropy).
@@ -160,6 +307,177 @@ fn validate_basic_auth(encoded: &str, session_token: &Zeroizing<String>) -> Resu
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    const HEX64: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn phantom_template_parse_requires_placeholder() {
+        let err = PhantomTemplate::parse("sk-ant-").unwrap_err();
+        assert!(err.contains("must contain the '{}' placeholder"), "{err}");
+    }
+
+    #[test]
+    fn phantom_template_parse_rejects_multiple_placeholders() {
+        assert!(
+            PhantomTemplate::parse("a{}b{}c")
+                .unwrap_err()
+                .contains("exactly one")
+        );
+        assert!(
+            PhantomTemplate::parse("{}{}")
+                .unwrap_err()
+                .contains("exactly one")
+        );
+    }
+
+    #[test]
+    fn phantom_template_parse_splits_prefix_suffix() {
+        let t = PhantomTemplate::parse("sk-ant-oat01-{}").unwrap();
+        assert_eq!(t.prefix, "sk-ant-oat01-");
+        assert_eq!(t.suffix, "");
+        let mid = PhantomTemplate::parse("pre-{}-post").unwrap();
+        assert_eq!(mid.prefix, "pre-");
+        assert_eq!(mid.suffix, "-post");
+    }
+
+    #[test]
+    fn phantom_template_render_wraps_body() {
+        let t = PhantomTemplate::parse("pre-{}-post").unwrap();
+        assert_eq!(t.render("BODY"), "pre-BODY-post");
+        // Empty template renders the body unchanged.
+        assert_eq!(PhantomTemplate::parse("{}").unwrap().render("BODY"), "BODY");
+    }
+
+    #[test]
+    fn phantom_template_matches_true_and_drift_false() {
+        let t = PhantomTemplate::parse("sk-ant-oat01-{}").unwrap();
+        assert!(t.matches("sk-ant-oat01-realtoken"));
+        assert!(!t.matches("ghp_somethingelse"));
+        let mid = PhantomTemplate::parse("pre-{}-post").unwrap();
+        assert!(mid.matches("pre-x-post"));
+        assert!(!mid.matches("pre-x")); // missing suffix
+    }
+
+    #[test]
+    fn phantom_template_matches_length_guard() {
+        // prefix+suffix longer than the value must not double-count via
+        // starts_with/ends_with overlapping on the same bytes.
+        let t = PhantomTemplate::parse("aa{}aa").unwrap();
+        assert!(!t.matches("aaa"));
+        assert!(t.matches("aaXXaa"));
+    }
+
+    #[test]
+    fn phantom_template_find_in_locates_span() {
+        let t = PhantomTemplate::parse("sk-ant-oat01-{}").unwrap();
+        let value = format!("Bearer sk-ant-oat01-{HEX64} trailing");
+        let (start, end) = t.find_in(&value).unwrap();
+        assert_eq!(&value[start..end], format!("sk-ant-oat01-{HEX64}"));
+    }
+
+    #[test]
+    fn phantom_template_find_in_with_suffix() {
+        let t = PhantomTemplate::parse("pre-{}-post").unwrap();
+        let value = format!("x pre-{HEX64}-post y");
+        let (start, end) = t.find_in(&value).unwrap();
+        assert_eq!(&value[start..end], format!("pre-{HEX64}-post"));
+    }
+
+    #[test]
+    fn phantom_template_find_in_empty_prefix_terminates() {
+        let t = PhantomTemplate::parse("{}").unwrap();
+        assert_eq!(t.find_in(HEX64), Some((0, 64)));
+        // No 64-hex run: must terminate (not hang) and return None.
+        assert_eq!(t.find_in("short"), None);
+    }
+
+    #[test]
+    fn phantom_template_find_in_too_short_body() {
+        let t = PhantomTemplate::parse("sk-ant-oat01-{}").unwrap();
+        let value = format!("sk-ant-oat01-{}", &HEX64[..40]);
+        assert_eq!(t.find_in(&value), None);
+    }
+
+    #[test]
+    fn phantom_template_find_in_non_hex_body() {
+        let t = PhantomTemplate::parse("sk-ant-oat01-{}").unwrap();
+        let value = format!("sk-ant-oat01-{}", "g".repeat(64));
+        assert_eq!(t.find_in(&value), None);
+    }
+
+    #[test]
+    fn phantom_template_find_in_no_match() {
+        let t = PhantomTemplate::parse("sk-ant-oat01-{}").unwrap();
+        assert_eq!(t.find_in("no prefix here"), None);
+        // Prefix + body but wrong suffix.
+        let s = PhantomTemplate::parse("pre-{}-post").unwrap();
+        assert_eq!(s.find_in(&format!("pre-{HEX64}-WRONG")), None);
+    }
+
+    #[test]
+    fn phantom_template_find_in_utf8_safe() {
+        // A multibyte char straddling the body window must not panic.
+        let t = PhantomTemplate::parse("sk-ant-oat01-{}").unwrap();
+        let value = format!("sk-ant-oat01-{}€tail", &HEX64[..63]);
+        assert_eq!(t.find_in(&value), None);
+        // Empty-prefix template over multibyte content also must not panic.
+        let empty = PhantomTemplate::parse("{}").unwrap();
+        assert_eq!(empty.find_in("héllo wörld with £ and €"), None);
+    }
+
+    #[test]
+    fn find_bare_nonce_locates_first() {
+        let value = format!("a nono_{HEX64} b nono_{HEX64} c");
+        let (start, end) = find_bare_nonce(&value).unwrap();
+        assert_eq!(&value[start..end], format!("nono_{HEX64}"));
+        assert_eq!(start, 2); // first occurrence wins
+    }
+
+    #[test]
+    fn find_bare_nonce_rejects_truncated() {
+        let value = format!("nono_{}", &HEX64[..40]);
+        assert_eq!(find_bare_nonce(&value), None);
+    }
+
+    #[test]
+    fn find_bare_nonce_rejects_non_hex_and_absent() {
+        assert_eq!(find_bare_nonce(&format!("nono_{}", "z".repeat(64))), None);
+        assert_eq!(find_bare_nonce("no nonce here"), None);
+    }
+
+    #[test]
+    fn find_bare_nonce_utf8_safe() {
+        // Multibyte char right after `nono_` must not panic.
+        assert_eq!(find_bare_nonce("nono_€€€€€€€€€€€€€€€€€€€€€€"), None);
+    }
+
+    #[test]
+    fn rewrite_first_phantom_resolves_bare_nonce() {
+        let value = format!("Bearer nono_{HEX64}");
+        let out = rewrite_first_phantom(&value, &[], |n| {
+            (n == format!("nono_{HEX64}")).then(|| Zeroizing::new(b"REAL".to_vec()))
+        });
+        assert_eq!(out.as_deref(), Some("Bearer REAL"));
+    }
+
+    #[test]
+    fn rewrite_first_phantom_resolves_templated_whole_span() {
+        let t = PhantomTemplate::parse("sk-ant-oat01-{}").unwrap();
+        let phantom = format!("sk-ant-oat01-{HEX64}");
+        let value = format!("Bearer {phantom}");
+        let out = rewrite_first_phantom(&value, std::slice::from_ref(&t), |n| {
+            (n == phantom).then(|| Zeroizing::new(b"sk-ant-oat01-REAL".to_vec()))
+        });
+        // Whole templated span replaced; no leftover template literal.
+        assert_eq!(out.as_deref(), Some("Bearer sk-ant-oat01-REAL"));
+    }
+
+    #[test]
+    fn rewrite_first_phantom_none_when_unresolved() {
+        let value = format!("Bearer nono_{HEX64}");
+        assert_eq!(rewrite_first_phantom(&value, &[], |_| None), None);
+        assert_eq!(rewrite_first_phantom("no phantom", &[], |_| None), None);
+    }
 
     #[test]
     fn test_generate_token_length() {

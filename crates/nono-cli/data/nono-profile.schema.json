@@ -676,17 +676,17 @@
         "allow": {
           "type": "array",
           "items": { "$ref": "#/$defs/ConditionalPath" },
-          "description": "Directories with read+write access."
+          "description": "Directories with read+write access. Supports * (single path segment) and ** (any depth) glob patterns, expanded at sandbox start."
         },
         "read": {
           "type": "array",
           "items": { "$ref": "#/$defs/ConditionalPath" },
-          "description": "Directories with read-only access."
+          "description": "Directories or files with read-only access. Supports * (single path segment) and ** (any depth) glob patterns, expanded at sandbox start."
         },
         "write": {
           "type": "array",
           "items": { "$ref": "#/$defs/ConditionalPath" },
-          "description": "Directories with write-only access."
+          "description": "Directories with write-only access. Supports * (single path segment) and ** (any depth) glob patterns, expanded at sandbox start."
         },
         "allow_file": {
           "type": "array",
@@ -706,12 +706,12 @@
         "deny": {
           "type": "array",
           "items": { "$ref": "#/$defs/ConditionalPath" },
-          "description": "Paths denied filesystem access. Denies apply regardless of other allow rules."
+          "description": "Paths denied filesystem access. Denies apply regardless of other allow rules. Supports * (single path segment) and ** (any depth) glob patterns, expanded at sandbox start. On macOS a runtime regex rule also covers files created after sandbox start; on Linux only paths present at start time are covered."
         },
         "bypass_protection": {
           "type": "array",
           "items": { "$ref": "#/$defs/ConditionalPath" },
-          "description": "Paths exempted from group-level deny rules. Each path must also appear in an allow/read/write section to actually grant access; bypass_protection only removes the deny."
+          "description": "Paths exempted from group-level deny rules. Each path must also appear in an allow/read/write section to actually grant access; bypass_protection only removes the deny. Supports * (single path segment) and ** (any depth) glob patterns, expanded at sandbox start."
         },
         "suppress_save_prompt": {
           "type": "array",

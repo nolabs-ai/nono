@@ -40,6 +40,8 @@ pub mod cert_cache;
 pub(crate) mod h2_forward;
 pub(crate) mod h2_probe;
 pub mod handle;
+pub(crate) mod http1;
+pub(crate) mod websocket;
 
 pub use acceptor::build_server_config;
 pub use bundle::{BundleInputs, write_bundle};

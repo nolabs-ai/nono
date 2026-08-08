@@ -2850,6 +2850,7 @@ dependencies = [
  "rustls-native-certs",
  "serde",
  "serde_json",
+ "sha1",
  "sha2 0.11.0",
  "spiffe",
  "subtle",

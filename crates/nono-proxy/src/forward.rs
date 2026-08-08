@@ -160,7 +160,7 @@ where
 }
 
 /// Open an upstream HTTPS connection (Direct TLS or ExternalProxy + TLS).
-async fn open_https_upstream(
+pub(crate) async fn open_https_upstream(
     upstream: &UpstreamSpec<'_>,
 ) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
     let tcp = open_tcp_upstream(upstream).await?;

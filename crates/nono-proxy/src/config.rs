@@ -822,6 +822,15 @@ pub struct RouteConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spiffe: Option<SpiffeAuthConfig>,
 
+    /// Optional allow-list of WebSocket upgrade targets for this route.
+    ///
+    /// When a client requests an HTTP `Upgrade` on this route, it is only
+    /// tunneled if its normalized path matches one of these rules. Classic
+    /// WebSockets imply HTTP/1.1 GET. Empty (the default) permits no upgrades — the request is
+    /// rejected before any upstream contact is made.
+    #[serde(default)]
+    pub upgrades: Vec<WebSocketRuleConfig>,
+
     /// Optional per-route request-rate limit (RouteRateLimiter).
     ///
     /// Caps the rate of L7 requests forwarded to this route's upstream to
@@ -833,6 +842,17 @@ pub struct RouteConfig {
     /// stream and cannot count individual requests.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_limit: Option<RouteRateLimitConfig>,
+}
+
+/// A WebSocket path allow-listed on one concrete upstream route.
+///
+/// Origin selection belongs to the profile layer that expands a credential
+/// provider into concrete routes. Keeping only the path here makes it
+/// impossible for the runtime to silently ignore a security-relevant origin.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebSocketRuleConfig {
+    pub path: String,
 }
 
 /// SPIFFE/SPIRE auth for an upstream route.
@@ -1060,6 +1080,68 @@ pub enum EndpointPolicyOutcome<'a> {
     },
 }
 
+/// Pre-compiled WebSocket upgrade allow-list for the request hot path.
+///
+/// Built once at proxy startup from route-local [`WebSocketRuleConfig`]
+/// entries. Classic WebSocket handshakes are always HTTP/1.1 GET requests,
+/// so the runtime policy only needs to retain normalized paths.
+#[derive(Debug, Default)]
+pub struct CompiledUpgradeRules {
+    rules: Vec<CompiledUpgradeRule>,
+}
+
+#[derive(Debug)]
+struct CompiledUpgradeRule {
+    path: String,
+}
+
+impl CompiledUpgradeRules {
+    /// Compile upgrade rules for one route. There is no glob support here —
+    /// `path` is matched exactly (after normalization) on purpose, since
+    /// upgrade targets are a small fixed set of endpoints, not a broad API
+    /// surface.
+    pub fn compile(rules: &[WebSocketRuleConfig]) -> Result<Self, String> {
+        let mut compiled = Vec::with_capacity(rules.len());
+        for rule in rules {
+            if !rule.path.starts_with('/') {
+                return Err(format!(
+                    "WebSocket path must start with '/': '{}'",
+                    rule.path
+                ));
+            }
+            if rule.path.contains(['?', '#']) || rule.path.chars().any(char::is_control) {
+                return Err(format!(
+                    "WebSocket path must be an absolute path without query, fragment, or control characters: '{}'",
+                    rule.path
+                ));
+            }
+            let path = normalize_path(&rule.path);
+            if !compiled
+                .iter()
+                .any(|entry: &CompiledUpgradeRule| entry.path == path)
+            {
+                compiled.push(CompiledUpgradeRule { path });
+            }
+        }
+        Ok(Self { rules: compiled })
+    }
+
+    /// `true` if `protocol`+`method`+`path` matches one of the compiled
+    /// rules. `path` is normalized (query string stripped, percent-decoded,
+    /// trailing slash removed) before comparison so callers can pass the raw
+    /// request path.
+    #[must_use]
+    pub fn matches(&self, path: &str) -> bool {
+        let normalized = normalize_path(path);
+        self.rules.iter().any(|r| r.path == normalized)
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.rules.is_empty()
+    }
+}
+
 impl CompiledEndpointRules {
     /// Compile endpoint rules into matchers. Invalid glob patterns are
     /// rejected at startup with an error, not silently ignored at runtime.
@@ -1274,10 +1356,13 @@ fn endpoint_allowed(rules: &[EndpointRule], method: &str, path: &str) -> bool {
 }
 
 /// Normalize a URL path for matching: percent-decode, strip query string,
-/// collapse double slashes, strip trailing slash (but preserve root "/").
+/// collapse double slashes and `.`/`..` dot-segments, strip trailing slash
+/// (but preserve root "/").
 ///
 /// Percent-decoding prevents bypass via encoded characters (e.g.,
-/// `/api/%70rojects` evading a rule for `/api/projects/*`).
+/// `/api/%70rojects` evading a rule for `/api/projects/*`). Dot-segment
+/// collapsing prevents `/api/../secret` from being treated as a distinct
+/// path from its resolved form by matchers that assume a canonical path.
 fn normalize_path(path: &str) -> String {
     // Strip query string before percent-decoding: a literal %3F must not be
     // treated as a query delimiter, so the split must precede the decode.
@@ -1289,9 +1374,19 @@ fn normalize_path(path: &str) -> String {
     let binary = urlencoding::decode_binary(path.as_bytes());
     let decoded = String::from_utf8_lossy(&binary);
 
-    // Collapse double slashes by splitting on '/' and filtering empties,
-    // then rejoin. This also strips trailing slash.
-    let segments: Vec<&str> = decoded.split('/').filter(|s| !s.is_empty()).collect();
+    // Collapse double slashes and `.`/`..` dot-segments by splitting on '/'
+    // and resolving segments in order. Attempts to climb above root are
+    // clamped rather than allowed to escape (no negative traversal).
+    let mut segments: Vec<&str> = Vec::new();
+    for segment in decoded.split('/').filter(|s| !s.is_empty()) {
+        match segment {
+            "." => {}
+            ".." => {
+                segments.pop();
+            }
+            _ => segments.push(segment),
+        }
+    }
     if segments.is_empty() {
         "/".to_string()
     } else {
@@ -2171,5 +2266,56 @@ mod tests {
         let json = r#"{"prefix": "openai", "upstream": "https://api.openai.com"}"#;
         let route: RouteConfig = serde_json::from_str(json).unwrap();
         assert!(route.spiffe.is_none());
+    }
+
+    #[test]
+    fn websocket_rules_validate_and_deduplicate_paths() {
+        let rules = vec![
+            WebSocketRuleConfig {
+                path: "/backend-api/codex/responses".to_string(),
+            },
+            WebSocketRuleConfig {
+                path: "/backend-api//codex/responses/".to_string(),
+            },
+        ];
+        let compiled = CompiledUpgradeRules::compile(&rules).unwrap();
+        assert!(compiled.matches("/backend-api/codex/responses?session=1"));
+        assert!(!compiled.matches("/backend-api/codex/other"));
+    }
+
+    #[test]
+    fn websocket_rules_reject_ambiguous_or_non_absolute_paths() {
+        for path in ["relative", "/socket?scope=all", "/socket#fragment"] {
+            assert!(
+                CompiledUpgradeRules::compile(&[WebSocketRuleConfig {
+                    path: path.to_string(),
+                }])
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn normalize_path_collapses_dot_segments() {
+        assert_eq!(normalize_path("/a/../b"), "/b");
+        assert_eq!(normalize_path("/a/./b"), "/a/b");
+        assert_eq!(normalize_path("/a/b/.."), "/a");
+    }
+
+    #[test]
+    fn normalize_path_clamps_traversal_above_root() {
+        assert_eq!(normalize_path("/a/../../b"), "/b");
+        assert_eq!(normalize_path("/../../.."), "/");
+        assert_eq!(normalize_path(".."), "/");
+    }
+
+    #[test]
+    fn websocket_rules_do_not_match_dot_segment_traversal_of_denied_path() {
+        let compiled = CompiledUpgradeRules::compile(&[WebSocketRuleConfig {
+            path: "/backend-api/codex/responses".to_string(),
+        }])
+        .unwrap();
+        assert!(compiled.matches("/backend-api/codex/../codex/responses"));
+        assert!(!compiled.matches("/backend-api/codex/../other/responses"));
     }
 }

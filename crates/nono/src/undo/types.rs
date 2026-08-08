@@ -295,6 +295,7 @@ pub enum NetworkAuditDenialCategory {
     UpstreamConnectFailed,
     ConnectBypassesL7,
     ExternalProxyRejected,
+    UnsupportedUpgrade,
 }
 
 /// A single network audit event captured by the proxy.

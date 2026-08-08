@@ -263,6 +263,69 @@ fn test_schema_command_policies_match_tool_sandbox_guide_shape() {
 }
 
 #[test]
+fn test_schema_credential_route_has_upgrades() {
+    let schema = load_schema();
+    assert_schema_properties(
+        &schema,
+        "CredentialRouteDef",
+        &[
+            "name",
+            "provider",
+            "env_var",
+            "base_url_env_var",
+            "endpoint_policy",
+            "upgrades",
+        ],
+    );
+    assert_schema_properties(&schema, "CredentialWebSocketRuleDef", &["origin", "path"]);
+}
+
+#[test]
+fn test_schema_validates_credential_route_with_upgrades() {
+    let schema = load_schema();
+    let validator = jsonschema::validator_for(&schema).expect("schema compiles");
+    let profile = json!({
+        "credential_routes": [{
+            "name": "codex",
+            "provider": "codex",
+            "upgrades": [{
+                "origin": "https://api.openai.com",
+                "path": "/v1/realtime"
+            }]
+        }]
+    });
+
+    validator
+        .validate(&profile)
+        .expect("credential route with upgrades should validate");
+}
+
+#[test]
+fn test_schema_rejects_malformed_credential_route_upgrades() {
+    let schema = load_schema();
+    let validator = jsonschema::validator_for(&schema).expect("schema compiles");
+    for upgrade in [
+        json!({ "origin": "http://api.openai.com", "path": "/v1/realtime" }),
+        json!({ "origin": "https://api.openai.com/extra", "path": "/v1/realtime" }),
+        json!({ "origin": "https://api.openai.com", "path": "v1/realtime" }),
+        json!({ "origin": "https://api.openai.com", "path": "" }),
+    ] {
+        let profile = json!({
+            "credential_routes": [{
+                "name": "codex",
+                "provider": "codex",
+                "upgrades": [upgrade]
+            }]
+        });
+
+        assert!(
+            validator.validate(&profile).is_err(),
+            "malformed upgrades entry should be rejected by the schema"
+        );
+    }
+}
+
+#[test]
 fn test_schema_validates_intercept_match_rule() {
     let schema = load_schema();
     let validator = jsonschema::validator_for(&schema).expect("schema compiles");

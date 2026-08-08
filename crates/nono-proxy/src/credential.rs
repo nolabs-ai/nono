@@ -987,6 +987,7 @@ mod tests {
             }),
             aws_auth: None,
             spiffe: None,
+            upgrades: vec![],
             rate_limit: None,
         }
     }
@@ -1014,6 +1015,7 @@ mod tests {
             oauth2: None,
             aws_auth: None,
             spiffe: None,
+            upgrades: vec![],
             rate_limit: None,
         }];
         let outcome = CredentialStore::load_with_diagnostics(&routes, &tls)
@@ -1135,6 +1137,7 @@ mod tests {
             oauth2: None,
             aws_auth: None,
             spiffe: None,
+            upgrades: vec![],
             rate_limit: None,
         }];
         let outcome = CredentialStore::load_with_diagnostics(&routes, &tls).await;
@@ -1178,6 +1181,7 @@ mod tests {
             oauth2: None,
             aws_auth: None,
             spiffe: None,
+            upgrades: vec![],
             rate_limit: None,
         }];
         let store = CredentialStore::load_with_diagnostics(&routes, &tls)
@@ -1283,6 +1287,7 @@ mod tests {
             oauth2: None,
             aws_auth: None,
             spiffe: None,
+            upgrades: vec![],
             rate_limit: None,
         }];
         let store = CredentialStore::load_with_diagnostics(&routes, &tls)
@@ -1321,6 +1326,7 @@ mod tests {
             oauth2: None,
             aws_auth: None,
             spiffe: None,
+            upgrades: vec![],
             rate_limit: None,
         }];
         let store = CredentialStore::load_with_diagnostics(&routes, &tls)
@@ -1372,6 +1378,7 @@ mod tests {
             }),
             aws_auth: None,
             spiffe: None,
+            upgrades: vec![],
             rate_limit: None,
         }];
 

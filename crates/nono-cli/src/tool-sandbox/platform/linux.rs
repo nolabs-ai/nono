@@ -3,7 +3,7 @@ use crate::audit_integrity::{
     CommandPolicyStdioStreamAudit,
 };
 use crate::command_policy::{
-    CommandFromConfig, CommandPoliciesConfig, CommandSandboxConfig, ResolvedCommandBinaries,
+    CommandFromConfig, CommandPoliciesConfig, CommandSandboxConfig, CommandUnixSocketConfig, CommandUnixSocketMode, CommandUnixSocketScope, ResolvedCommandBinaries,
     ResolvedCommandBinary, ResolvedExecutableKind, classify_executable_shape,
     has_explicit_self_invocation_entry,
 };
@@ -3484,6 +3484,7 @@ fn build_child_caps(
         &state.deny_paths,
     )?;
     add_policy_network(&mut caps, policy)?;
+    add_policy_unix_sockets(&mut caps, policy)?;
     add_policy_proxy_network(&mut caps, state, request, policy)?;
     add_proxy_trust_bundle_caps(&mut caps, state, policy)?;
     add_policy_credentials(&mut caps, state, policy)?;
@@ -3824,6 +3825,34 @@ fn add_policy_network(caps: &mut CapabilitySet, policy: &CommandSandboxConfig) -
     }
     Ok(())
 }
+fn add_policy_unix_sockets(caps: &mut CapabilitySet, policy: &CommandSandboxConfig) -> Result<()> {
+    for cfg in &policy.unix_sockets {
+        // A socket path that fails env expansion is a policy error: fail closed
+        // rather than launch the sandbox with a silently missing grant.
+        let expanded = crate::policy::expand_env_vars_strict(&cfg.path).map_err(|err| {
+            NonoError::SandboxInit(format!(
+                "command sandbox unix socket path {path} could not be expanded: {err}",
+                path = cfg.path
+            ))
+        })?;
+        let unix_mode = match cfg.mode {
+            CommandUnixSocketMode::ConnectBind => UnixSocketMode::ConnectBind,
+            CommandUnixSocketMode::Connect => UnixSocketMode::Connect,
+        };
+        let capability = match cfg.scope {
+            CommandUnixSocketScope::DirSubtree => {
+                UnixSocketCapability::new_dir_subtree(&expanded, unix_mode)?
+            }
+            CommandUnixSocketScope::DirChildren => {
+                UnixSocketCapability::new_dir(&expanded, unix_mode)?
+            }
+            CommandUnixSocketScope::File => UnixSocketCapability::new_file(&expanded, unix_mode)?,
+        };
+        caps.add_unix_socket(capability);
+    }
+    Ok(())
+}
+
 
 fn add_policy_proxy_network(
     caps: &mut CapabilitySet,

@@ -1590,6 +1590,41 @@
         }
       }
     },
+    "CommandUnixSocketScope": {
+      "type": "string",
+      "enum": ["file", "dir_children", "dir_subtree"],
+      "description": "AF_UNIX socket access scope for this command sandbox. file grants access only to the named socket file; dir_children grants access to direct children of the socket's parent directory; dir_subtree grants access to the entire ancestor file tree of the socket file."
+    },
+    "CommandUnixSocketMode": {
+      "type": "string",
+      "enum": ["connect", "connect_bind"],
+      "description": "AF_UNIX socket access mode. connect allows connecting out to the socket; connect_bind additionally allows binding a socket on the given path."
+    },
+    "CommandUnixSocketConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path"],
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "Filesystem-visible path of the AF_UNIX socket. May contain exactly one $VAR environment reference (expandable at child-launch time); otherwise must be absolute."
+        },
+        "mode": {
+          "type": "string",
+          "enum": ["connect", "connect_bind"],
+          "description": "Access mode. connect allows connecting to the socket; connect_bind also allows binding at this path."
+        },
+        "scope": {
+          "type": "string",
+          "enum": ["file", "dir_children", "dir_subtree"],
+          "description": "Access scope. file (default) covers the socket file itself; dir_children covers direct children of its parent directory; dir_subtree covers the full ancestor file tree."
+        },
+        "path_env": {
+          "type": "string",
+          "description": "Explicit environment variable used to resolve the socket path at child-launch time, when the path is $VAR-prefixed."
+        }
+      }
+    },
     "CommandSandboxConfig": {
       "type": "object",
       "additionalProperties": false,
@@ -1661,6 +1696,11 @@
           "type": "array",
           "items": { "type": "string" },
           "description": "macOS-only. Expert escape hatch: raw Seatbelt S-expression rules appended to this command's child sandbox profile, emitted after the generated denies (including the exec gate's (deny process-exec*)), so a later (allow ...) wins under Seatbelt's last-matching-rule semantics. Scoped to a single command or per-intercept override. Ignored on Linux."
+        },
+        "unix_sockets": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/CommandUnixSocketConfig" },
+          "description": "AF_UNIX socket access grants (connect and/or bind) for this command's child sandbox. Each entry carries a filesystem-visible socket path, a connect/bind mode, and a scope controlling whether the grant covers the socket file itself, its parent directory's direct children, or its full ancestor file tree. Omitted when empty."
         }
       }
     },

@@ -801,6 +801,11 @@ pub struct CommandSandboxConfig {
     /// tools like `git` that re-exec their own helpers by absolute path.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub exec_paths: Vec<String>,
+    /// AF_UNIX socket paths this command may open/connect/bind, scoped
+    /// per-command so only specific tool calls can reach privileged
+    /// sockets (e.g. `/var/run/docker.sock`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unix_sockets: Vec<CommandUnixSocketConfig>,
 }
 
 impl CommandSandboxConfig {
@@ -829,9 +834,67 @@ impl CommandSandboxConfig {
                 &child.unsafe_macos_seatbelt_rules,
             ),
             exec_paths: dedup_append(&self.exec_paths, &child.exec_paths),
+            unix_sockets: dedup_append(&self.unix_sockets, &child.unix_sockets),
         }
     }
 }
+
+
+/// A sandbox grant for a Unix/abstract socket path accessible to a command.
+///
+/// Grants this command the ability to open (and, with `ConnectBind` mode, both connect
+/// and bind) an AF_UNIX socket rooted at `path`.
+///
+/// This is the policy-level representation of an AF_UNIX socket capability (see `nono`'s
+/// `UnixSocketCapability`). A command that must reach the Docker socket, for example,
+/// declares `path = "/var/run/docker.sock"` (rootful) or `path = "$XDG_RUNTIME_DIR/docker.sock"`
+/// (rootless) here. Mirror the [`CommandCredentialConfig`] doc-comment style.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+pub enum CommandUnixSocketMode {
+    /// Connect to an existing socket endpoint.
+    #[default]
+    Connect,
+    /// Connect to and bind a socket endpoint.
+    ConnectBind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+pub enum CommandUnixSocketScope {
+    /// The grant covers just `path` itself.
+    #[default]
+    File,
+    /// The grant covers direct children of `path`, but not deeper descendants.
+    DirChildren,
+    /// The grant covers the entire subtree beneath `path`.
+    DirSubtree,
+}
+
+/// A per-command grant that lets a tool reach a Unix socket at `path`.
+///
+/// Grants this command the ability to open an AF_UNIX socket rooted at `path`, and in
+/// `ConnectBind` mode to bind and connect it. The `path` is canonical and may contain
+/// `$VAR` references (for example `$XDG_RUNTIME_DIR/docker.sock`), in which case
+/// `path_env` should name the variable used so it can be resolved before the environment
+/// is stripped.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommandUnixSocketConfig {
+    /// Canonical socket path (e.g. `/var/run/docker.sock` for rootful Docker,
+    /// or `$XDG_RUNTIME_DIR/docker.sock` for rootless Docker).
+    pub path: String,
+    /// Access mode granted to the socket. Defaults to `Connect`.
+    #[serde(default)]
+    pub mode: CommandUnixSocketMode,
+    /// Scope of the grant relative to `path`. Defaults to `File`.
+    #[serde(default)]
+    pub scope: CommandUnixSocketScope,
+    /// Name of the env var referenced by `path` when it uses `$VAR` expansion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_env: Option<String>,
+}
+
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -1958,6 +2021,7 @@ fn validate_sandbox(
             ),
         );
     }
+    validate_unix_sockets(command_name, caller, &sandbox.unix_sockets, report);
 
     if scope == CommandPolicyValidationScope::Resolved {
         validate_sandbox_credentials(command_name, caller, sandbox, config, report);
@@ -2037,6 +2101,64 @@ fn validate_unsafe_seatbelt_rules(
             rules.len()
         ),
     );
+}
+
+fn validate_unix_sockets(
+    command_name: &str,
+    caller: &str,
+    unix_sockets: &[CommandUnixSocketConfig],
+    report: &mut CommandPolicyValidationReport,
+) {
+    if unix_sockets.is_empty() {
+        return;
+    }
+    for cfg in unix_sockets {
+        let path = &cfg.path;
+        if path.is_empty() {
+            report.error(
+                "invalid_unix_socket",
+                format!("command '{command_name}' from.{caller} unix_sockets path is empty"),
+            );
+            continue;
+        }
+        if path.contains('\0') {
+            report.error(
+                "invalid_unix_socket",
+                format!("command '{command_name}' from.{caller} unix_sockets path contains NUL"),
+            );
+            continue;
+        }
+        if let Some(env_name) = &cfg.path_env {
+            // `path_env` is set: `$VAR`-prefixed paths are allowed, but the env
+            // var name itself must still be a valid identifier.
+            if !is_valid_identifier(env_name) {
+                report.error(
+                    "invalid_unix_socket",
+                    format!(
+                        "command '{command_name}' from.{caller} unix_sockets path_env '{env_name}' is not a valid identifier"
+                    ),
+                );
+                continue;
+            }
+        } else if !path.contains('$') {
+            // No env-var expansion involved, so the path must be absolute.
+            if !Path::new(path).is_absolute() {
+                report.error(
+                    "invalid_unix_socket",
+                    format!(
+                        "command '{command_name}' from.{caller} unix_sockets path '{path}' is not absolute"
+                    ),
+                );
+                continue;
+            }
+        }
+        report.warning(
+            "unix_socket_access",
+            format!(
+                "command '{command_name}' from.{caller} will be granted AF_UNIX connect/bind access to socket '{path}'"
+            ),
+        );
+    }
 }
 
 fn validate_invocation_policy(
@@ -3715,6 +3837,15 @@ mod tests {
     }
 
     #[test]
+    fn command_sandbox_empty_unix_sockets_omitted_from_serialization() {
+        let value = serde_json::to_value(CommandSandboxConfig::default()).expect("serialize");
+        assert!(
+            value.get("unix_sockets").is_none(),
+            "empty unix_sockets should be omitted, got {value}"
+        );
+    }
+
+    #[test]
     fn command_network_open_port_merge_child_dedup_appends() {
         let base = CommandNetworkConfig {
             open_port: vec![8250],
@@ -3738,6 +3869,24 @@ mod tests {
         assert_eq!(cfg.open_port_range, vec![[8250, 8255]]);
         assert!(cfg.open_port.is_empty());
     }
+
+    #[test]
+    fn command_unix_socket_config_round_trips() {
+        let json = r#"{"path":"/var/run/docker.sock","mode":"connect"}"#;
+        let cfg: CommandUnixSocketConfig = serde_json::from_str(json).expect("parse");
+        assert_eq!(cfg.path, "/var/run/docker.sock");
+        assert_eq!(cfg.mode, CommandUnixSocketMode::Connect);
+        assert_eq!(cfg.scope, CommandUnixSocketScope::File);
+        assert_eq!(cfg.path_env, None);
+    }
+
+    #[test]
+    fn command_unix_socket_config_deny_unknown_fields() {
+        let json = r#"{"path":"/var/run/docker.sock","mode":"connect","bogus_key":true}"#;
+        let err = serde_json::from_str::<CommandUnixSocketConfig>(json).unwrap_err();
+        assert!(err.to_string().contains("unknown field"));
+    }
+
 
     #[test]
     fn command_sandbox_unsafe_seatbelt_rules_empty_rule_errors() {

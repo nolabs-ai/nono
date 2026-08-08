@@ -179,6 +179,7 @@ fn test_schema_command_policies_match_tool_sandbox_guide_shape() {
             "resources",
             "stdio",
             "unsafe_macos_seatbelt_rules",
+            "unix_sockets",
             "use_credentials",
         ],
     );

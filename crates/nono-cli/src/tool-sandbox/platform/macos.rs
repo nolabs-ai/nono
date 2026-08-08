@@ -3,8 +3,8 @@ use crate::audit_integrity::{
     CommandPolicyStdioStreamAudit,
 };
 use crate::command_policy::{
-    CommandPoliciesConfig, CommandSandboxConfig, InterceptActionConfig, ResolvedCommandBinaries,
-    ResolvedCommandBinary, has_explicit_self_invocation_entry,
+    CommandPoliciesConfig, CommandSandboxConfig, CommandUnixSocketMode, CommandUnixSocketScope,
+    InterceptActionConfig, ResolvedCommandBinaries, ResolvedCommandBinary, has_explicit_self_invocation_entry,
 };
 use crate::tool_sandbox::credentials::{ResolvedCredential, resolve_credentials};
 use crate::tool_sandbox::env::{
@@ -3106,6 +3106,30 @@ fn add_policy_fs(
         } else {
             super::add_optional_write_file(caps, path)?;
         }
+    }
+    for cfg in &policy.unix_sockets {
+        // A socket path that fails env expansion is a policy error: fail closed
+        // rather than launch the sandbox with a silently missing grant.
+        let expanded = crate::policy::expand_env_vars_strict(&cfg.path).map_err(|err| {
+            NonoError::SandboxInit(format!(
+                "command sandbox unix socket path {path} could not be expanded: {err}",
+                path = cfg.path
+            ))
+        })?;
+        let unix_mode = match cfg.mode {
+            CommandUnixSocketMode::ConnectBind => UnixSocketMode::ConnectBind,
+            CommandUnixSocketMode::Connect => UnixSocketMode::Connect,
+        };
+        let capability = match cfg.scope {
+            CommandUnixSocketScope::DirSubtree => {
+                UnixSocketCapability::new_dir_subtree(&expanded, unix_mode)?
+            }
+            CommandUnixSocketScope::DirChildren => {
+                UnixSocketCapability::new_dir(&expanded, unix_mode)?
+            }
+            CommandUnixSocketScope::File => UnixSocketCapability::new_file(&expanded, unix_mode)?,
+        };
+        caps.add_unix_socket(capability);
     }
     Ok(())
 }

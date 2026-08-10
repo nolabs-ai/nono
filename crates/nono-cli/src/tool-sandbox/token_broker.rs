@@ -69,6 +69,9 @@ impl GrantSet {
 pub(crate) struct TokenBroker {
     map: std::collections::HashMap<String, (Zeroizing<Vec<u8>>, GrantSet)>,
     named: std::collections::HashMap<String, (Zeroizing<Vec<u8>>, GrantSet)>,
+    /// Phantom → credential name (named credentials only). Gate by name, not
+    /// value: one name (e.g. `partner-token`) holds different per-audience values.
+    phantom_names: std::collections::HashMap<String, String>,
 }
 
 impl TokenBroker {
@@ -76,6 +79,7 @@ impl TokenBroker {
         Self {
             map: std::collections::HashMap::new(),
             named: std::collections::HashMap::new(),
+            phantom_names: std::collections::HashMap::new(),
         }
     }
 
@@ -109,8 +113,11 @@ impl TokenBroker {
     /// `grants` scopes which consumers may redeem nonces issued for this credential.
     pub(crate) fn store_named(&mut self, name: String, value: Vec<u8>, grants: GrantSet) -> String {
         let zeroized = Zeroizing::new(value);
-        self.named.insert(name, (zeroized.clone(), grants.clone()));
-        self.issue_granted(zeroized, grants)
+        self.named
+            .insert(name.clone(), (zeroized.clone(), grants.clone()));
+        let nonce = self.issue_granted(zeroized, grants);
+        self.phantom_names.insert(nonce.clone(), name);
+        nonce
     }
 
     /// Issue a fresh nonce for a previously stored named supervisor credential.
@@ -121,7 +128,9 @@ impl TokenBroker {
         let (value, grants) = self.named.get(name)?;
         let value = value.clone();
         let grants = grants.clone();
-        Some(self.issue_granted(value, grants))
+        let nonce = self.issue_granted(value, grants);
+        self.phantom_names.insert(nonce.clone(), name.to_string());
+        Some(nonce)
     }
 
     /// If `env_entry` has the form `NAME=nono_<64hex>` and the nonce is known to
@@ -162,6 +171,24 @@ impl TokenBroker {
         Some(real.clone())
     }
 
+    /// Resolve a phantom iff its credential name is in `allowed_credentials`; the
+    /// route's `redeem_phantoms` is the authority, so the grant set is not consulted.
+    pub(crate) fn resolve_phantom_for_credentials(
+        &self,
+        nonce: &str,
+        allowed_credentials: &[String],
+    ) -> Option<Zeroizing<Vec<u8>>> {
+        if !is_nonce(nonce) {
+            return None;
+        }
+        let name = self.phantom_names.get(nonce)?;
+        if !allowed_credentials.iter().any(|a| a == name) {
+            return None;
+        }
+        let (real, _grants) = self.map.get(nonce)?;
+        Some(real.clone())
+    }
+
     /// Scan `input` for broker nonces or broker-held values and issue fresh
     /// nonces for each one found, returning the substituted buffer.
     ///
@@ -196,8 +223,12 @@ impl TokenBroker {
                     && is_nonce(s)
                     && let Some((real, grants)) = self.map.get(s).cloned()
                 {
-                    // Re-issue a fresh nonce for the real value, inheriting grants
+                    // Inherit the credential name so redeem_phantoms still resolves the reissue.
+                    let name = self.phantom_names.get(s).cloned();
                     let new_nonce = self.issue_granted(real, grants);
+                    if let Some(name) = name {
+                        self.phantom_names.insert(new_nonce.clone(), name);
+                    }
                     out.extend_from_slice(new_nonce.as_bytes());
                     i += NONCE_LEN;
                     continue;
@@ -206,7 +237,13 @@ impl TokenBroker {
 
             if let Some((real, grants)) = self.longest_secret_value_at(&input[i..]) {
                 let len = real.len();
+                // Preserve the credential name so a redacted raw value stays
+                // redeemable by redeem_phantoms, like the phantom path above.
+                let name = self.credential_name_for_value(&real);
                 let new_nonce = self.issue_granted(real, grants);
+                if let Some(name) = name {
+                    self.phantom_names.insert(new_nonce.clone(), name);
+                }
                 out.extend_from_slice(new_nonce.as_bytes());
                 i += len;
                 continue;
@@ -216,6 +253,18 @@ impl TokenBroker {
             i = i.saturating_add(1);
         }
         out
+    }
+
+    /// Credential name for a raw `value`. Searches `phantom_names` rather than `named`
+    /// so a value overwritten by a later capture still relabels to its own name.
+    fn credential_name_for_value(&self, value: &[u8]) -> Option<String> {
+        self.map.iter().find_map(|(nonce, (v, _))| {
+            if v.as_slice() == value {
+                self.phantom_names.get(nonce).cloned()
+            } else {
+                None
+            }
+        })
     }
 
     fn longest_secret_value_at(&self, input: &[u8]) -> Option<(Zeroizing<Vec<u8>>, GrantSet)> {
@@ -470,5 +519,134 @@ mod tests {
             .expect("stored gitlab credential should be available");
         assert!(broker.resolve_nonce(&n2, "cmd.glab").is_some());
         assert!(broker.resolve_nonce(&n2, "cmd.curl").is_none());
+    }
+
+    #[test]
+    fn resolve_phantom_for_credentials_gates_by_name() {
+        let mut broker = TokenBroker::new();
+        // GrantSet::All: the name allow-list, not the grant set, is the gate.
+        let partner = broker.store_named(
+            "partner-token".to_string(),
+            b"real-partner-jwt".to_vec(),
+            GrantSet::All,
+        );
+        let other = broker.store_named(
+            "orgstore".to_string(),
+            b"other-secret".to_vec(),
+            GrantSet::All,
+        );
+
+        // Listed credential resolves.
+        let allowed = vec!["partner-token".to_string()];
+        let resolved = broker
+            .resolve_phantom_for_credentials(&partner, &allowed)
+            .expect("listed credential must resolve");
+        assert_eq!(resolved.as_slice(), b"real-partner-jwt");
+        // A phantom for a credential the route does not list fails closed.
+        assert!(
+            broker
+                .resolve_phantom_for_credentials(&other, &allowed)
+                .is_none()
+        );
+        // Empty allow-list never resolves.
+        assert!(
+            broker
+                .resolve_phantom_for_credentials(&partner, &[])
+                .is_none()
+        );
+        // Input that is not a phantom fails closed.
+        assert!(
+            broker
+                .resolve_phantom_for_credentials("not-a-phantom", &allowed)
+                .is_none()
+        );
+        // An anonymous phantom (no credential name) never resolves route-side.
+        let anon = broker.issue(Zeroizing::new(b"anon".to_vec()));
+        assert!(
+            broker
+                .resolve_phantom_for_credentials(&anon, &allowed)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn resolve_phantom_for_credentials_gates_by_name_not_value() {
+        // An earlier phantom must resolve to its own value even after a later
+        // store_named overwrites the name's value.
+        let mut broker = TokenBroker::new();
+        let allowed = vec!["partner-token".to_string()];
+        let first = broker.store_named(
+            "partner-token".to_string(),
+            b"audience-A".to_vec(),
+            GrantSet::All,
+        );
+        // A later capture under the same name with a different value.
+        let second = broker.store_named(
+            "partner-token".to_string(),
+            b"audience-B".to_vec(),
+            GrantSet::All,
+        );
+
+        let r1 = broker
+            .resolve_phantom_for_credentials(&first, &allowed)
+            .expect("first phantom resolves by name");
+        let r2 = broker
+            .resolve_phantom_for_credentials(&second, &allowed)
+            .expect("second phantom resolves by name");
+        assert_eq!(r1.as_slice(), b"audience-A");
+        assert_eq!(r2.as_slice(), b"audience-B");
+    }
+
+    #[test]
+    fn reissued_phantom_keeps_credential_name() {
+        let mut broker = TokenBroker::new();
+        let allowed = vec!["partner-token".to_string()];
+        let original = broker.store_named(
+            "partner-token".to_string(),
+            b"jwt-value".to_vec(),
+            GrantSet::All,
+        );
+        let reissued_buf = broker.scan_and_reissue(original.as_bytes());
+        let reissued = std::str::from_utf8(&reissued_buf).expect("utf8 phantom");
+        assert_ne!(reissued, original, "reissue mints a fresh phantom");
+        let resolved = broker
+            .resolve_phantom_for_credentials(reissued, &allowed)
+            .expect("reissued phantom resolves by inherited name");
+        assert_eq!(resolved.as_slice(), b"jwt-value");
+    }
+
+    #[test]
+    fn reissued_raw_value_keeps_credential_name() {
+        // A raw credential value in captured stdout is redacted to a fresh
+        // phantom that stays redeemable by name — even for a historical value
+        // after store_named overwrote the name's current value.
+        let mut broker = TokenBroker::new();
+        let allowed = vec!["partner-token".to_string()];
+        broker.store_named(
+            "partner-token".to_string(),
+            b"audience-A".to_vec(),
+            GrantSet::All,
+        );
+        // Overwrite the name's current value with a newer audience.
+        broker.store_named(
+            "partner-token".to_string(),
+            b"audience-B".to_vec(),
+            GrantSet::All,
+        );
+
+        let reissued_buf = broker.scan_and_reissue(b"prefix audience-A suffix");
+        let reissued = std::str::from_utf8(&reissued_buf).expect("utf8");
+        assert!(
+            !reissued.contains("audience-A"),
+            "historical raw value must be redacted"
+        );
+        let nonce = reissued
+            .split_whitespace()
+            .find(|w| is_nonce(w))
+            .expect("a phantom replaced the raw value");
+        let resolved = broker
+            .resolve_phantom_for_credentials(nonce, &allowed)
+            .expect("historical raw value resolves by inherited name");
+        assert_eq!(resolved.as_slice(), b"audience-A");
     }
 }

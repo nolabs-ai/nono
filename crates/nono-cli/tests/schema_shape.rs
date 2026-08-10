@@ -497,6 +497,7 @@ fn test_schema_custom_credential_def_matches_rust_model() {
             "tls_client_cert",
             "tls_client_key",
             "rate_limit",
+            "redeem_phantoms",
         ],
     );
 }

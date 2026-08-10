@@ -2768,7 +2768,7 @@ name = "nono-cli"
 version = "0.73.0"
 dependencies = [
  "aws-lc-rs",
- "base64 0.22.1",
+ "base64 0.23.0",
  "chrono",
  "clap",
  "clap_complete",

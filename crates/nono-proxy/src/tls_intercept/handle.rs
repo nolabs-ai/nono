@@ -356,7 +356,7 @@ pub(crate) enum RouteSelection<'a> {
     Selected(Option<SelectedRoute<'a>>),
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct SelectedRoute<'a> {
     pub id: &'a str,
     pub route: &'a crate::route::LoadedRoute,
@@ -2745,6 +2745,7 @@ mod tests {
             proxy: None,
             env_var: None,
             endpoint_rules: vec![],
+            upgrades: vec![],
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
@@ -2795,8 +2796,11 @@ mod tests {
             &store,
             "example.com",
             443,
-            "GET",
-            "/gated",
+            InterceptRouteRequest {
+                method: "GET",
+                path: "/gated",
+                websocket_path: None,
+            },
             None,
             Some(&registry),
         )
@@ -2826,8 +2830,11 @@ mod tests {
             &store,
             "example.com",
             443,
-            "GET",
-            "/gated",
+            InterceptRouteRequest {
+                method: "GET",
+                path: "/gated",
+                websocket_path: None,
+            },
             None,
             Some(&registry),
         )
@@ -2855,8 +2862,11 @@ mod tests {
             &store,
             "example.com",
             443,
-            "GET",
-            "/gated",
+            InterceptRouteRequest {
+                method: "GET",
+                path: "/gated",
+                websocket_path: None,
+            },
             Some(&audit_log),
             Some(&registry),
         )
@@ -2894,14 +2904,17 @@ mod tests {
             &store,
             "example.com",
             443,
-            "GET",
-            "/gated",
+            InterceptRouteRequest {
+                method: "GET",
+                path: "/gated",
+                websocket_path: None,
+            },
             None,
             Some(&registry),
         )
         .await
         {
-            RouteSelection::Selected(Some((svc, _))) => assert_eq!(svc, "gated"),
+            RouteSelection::Selected(Some(selected)) => assert_eq!(selected.id, "gated"),
             RouteSelection::Selected(None) => {
                 panic!("granted approval must select the gated route, not passthrough")
             }

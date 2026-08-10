@@ -175,6 +175,7 @@ impl ProfileDef {
             credential_capture: HashMap::new(),
             credential_providers: HashMap::new(),
             credential_routes: Vec::new(),
+            oauth_capture_store_backend: Default::default(),
             workdir: self.workdir.clone(),
             hooks: self.hooks.clone(),
             session_hooks: profile::SessionHooks::default(),

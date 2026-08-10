@@ -1590,6 +1590,7 @@ pub(crate) fn prepare_proxy_launch_options(
         credential_capture: prepared.credential_capture.clone(),
         credential_providers: prepared.credential_providers.clone(),
         credential_routes: prepared.credential_routes.clone(),
+        oauth_capture_store_backend: prepared.oauth_capture_store_backend,
         enable_h2: prepared.allow_http2_requested,
         no_proxy,
     };
@@ -2447,11 +2448,16 @@ pub(crate) fn build_proxy_config_from_flags(
     proxy_config.no_proxy = proxy.no_proxy.clone();
     synthesize_credential_provider_proxy_config(proxy, &mut proxy_config)?;
     if !proxy_config.oauth_capture.is_empty() {
+        // On macOS, `OAuthCaptureStore::load_with_runtime_persistence`
+        // ignores this path and persists to the Keychain instead — it's
+        // used only as the "persistence enabled" signal there. Non-macOS
+        // platforms still read/write this exact file.
         proxy_config.oauth_capture_store_path = Some(
             crate::state_paths::user_state_dir()?
                 .join("oauth-capture")
                 .join("providers.json"),
         );
+        proxy_config.oauth_capture_store_backend = proxy.oauth_capture_store_backend;
     }
 
     Ok(proxy_config)
@@ -3532,6 +3538,7 @@ mod tests {
             credential_capture: HashMap::new(),
             credential_providers: HashMap::new(),
             credential_routes: Vec::new(),
+            oauth_capture_store_backend: Default::default(),
             tls_intercept: None,
             session_hooks: crate::profile::SessionHooks::default(),
             rollback_exclude_patterns: Vec::new(),
@@ -3603,6 +3610,7 @@ mod tests {
             credential_capture: HashMap::new(),
             credential_providers: HashMap::new(),
             credential_routes: Vec::new(),
+            oauth_capture_store_backend: Default::default(),
             tls_intercept: None,
             session_hooks: crate::profile::SessionHooks::default(),
             rollback_exclude_patterns: Vec::new(),
@@ -3669,6 +3677,7 @@ mod tests {
             credential_capture: HashMap::new(),
             credential_providers: HashMap::new(),
             credential_routes: Vec::new(),
+            oauth_capture_store_backend: Default::default(),
             tls_intercept: None,
             session_hooks: crate::profile::SessionHooks::default(),
             rollback_exclude_patterns: Vec::new(),

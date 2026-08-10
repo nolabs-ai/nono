@@ -685,6 +685,84 @@ pub(crate) fn has_explicit_self_invocation_entry(
     })
 }
 
+/// The command whose subprocess reads of the OAuth-capture Keychain item the
+/// derived mediation refuses.
+const OAUTH_CAPTURE_SECURITY_COMMAND: &str = "security";
+
+/// Derive the `security` mediation that refuses subprocess reads of the
+/// OAuth-capture Keychain item, so enabling OAuth capture can never leave the
+/// item readable by a bare `security find-generic-password` from inside the
+/// sandbox.
+///
+/// `keychain_active` is `true` only when the Keychain backend is actually in
+/// use (macOS + at least one `oauth_capture` provider + backend not forced to
+/// `file`); the caller computes it. When active, the resolved profile MUST
+/// already define a `security` command policy with a session sandbox — a
+/// mediated command with no session sandbox is unreachable by the agent, which
+/// would break *every* `security` call, not just the refused account read.
+/// Rather than silently break `security` or guess a sandbox for it, this fails
+/// closed with an actionable error (opt out with `oauth_capture_store_backend
+/// = "file"`).
+///
+/// On success it prepends a first-match intercept rule that returns empty
+/// output for reads of the `oauth_capture_store` account, leaving all other
+/// `security` invocations to pass through. Idempotent.
+pub(crate) fn derive_oauth_capture_security_mediation(
+    command_policies: &mut Option<CommandPoliciesConfig>,
+    keychain_active: bool,
+) -> nono::Result<()> {
+    if !keychain_active {
+        return Ok(());
+    }
+
+    let account = nono_proxy::config::OAUTH_CAPTURE_STORE_ACCOUNT;
+    let missing = || {
+        nono::NonoError::ProfileParse(format!(
+            "profile enables OAuth-capture Keychain persistence on macOS but does not define a \
+             command_policies.commands.\"{OAUTH_CAPTURE_SECURITY_COMMAND}\" policy with a session \
+             sandbox. Define command_policies.commands.\"{OAUTH_CAPTURE_SECURITY_COMMAND}\".sandbox \
+             (or .from.session) so the agent's other `security` calls keep working while reads of \
+             account '{account}' are refused, or set oauth_capture_store_backend = \"file\" to opt \
+             out of the Keychain backend."
+        ))
+    };
+
+    let security = command_policies
+        .as_mut()
+        .and_then(|policies| policies.commands.get_mut(OAUTH_CAPTURE_SECURITY_COMMAND))
+        .ok_or_else(missing)?;
+
+    // A mediated command needs a session sandbox (its own `sandbox` or a
+    // `from.session` edge) or the agent cannot invoke it at all.
+    if security.sandbox.is_none() && !security.from.contains_key("session") {
+        return Err(missing());
+    }
+
+    let rule = InterceptRuleConfig {
+        args: None,
+        match_config: Some(InterceptRuleMatchConfig {
+            argv: Some(ArgvMatcherConfig {
+                exact: None,
+                prefix: None,
+                contains: Some(vec!["-a".to_string(), account.to_string()]),
+            }),
+            env: BTreeMap::new(),
+        }),
+        action: InterceptActionConfig::Respond {
+            stdout: String::new(),
+        },
+        sandbox: None,
+    };
+
+    // Prepend so it wins over any existing catch-all; only once so repeated
+    // resolution stays idempotent.
+    if !security.intercept.contains(&rule) {
+        security.intercept.insert(0, rule);
+    }
+
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum CommandFromConfig {
@@ -3337,6 +3415,84 @@ mod tests {
             commands,
             ..Default::default()
         }
+    }
+
+    fn security_policies_with_session_sandbox() -> CommandPoliciesConfig {
+        let mut commands = BTreeMap::new();
+        commands.insert(
+            "security".to_string(),
+            CommandPolicyConfig {
+                sandbox: Some(CommandSandboxConfig::default()),
+                ..Default::default()
+            },
+        );
+        CommandPoliciesConfig {
+            commands,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn derive_security_mediation_is_noop_when_inactive() {
+        let mut policies = None;
+        derive_oauth_capture_security_mediation(&mut policies, false).expect("inactive is ok");
+        assert!(policies.is_none(), "inactive must not synthesize policy");
+    }
+
+    #[test]
+    fn derive_security_mediation_fails_closed_without_security_policy() {
+        let mut policies = Some(CommandPoliciesConfig::default());
+        let err = derive_oauth_capture_security_mediation(&mut policies, true)
+            .expect_err("no security policy must fail closed");
+        assert!(err.to_string().contains("oauth_capture_store"));
+    }
+
+    #[test]
+    fn derive_security_mediation_fails_closed_without_session_sandbox() {
+        let mut commands = BTreeMap::new();
+        commands.insert("security".to_string(), CommandPolicyConfig::default());
+        let mut policies = Some(CommandPoliciesConfig {
+            commands,
+            ..Default::default()
+        });
+        derive_oauth_capture_security_mediation(&mut policies, true)
+            .expect_err("security without a session sandbox must fail closed");
+    }
+
+    #[test]
+    fn derive_security_mediation_prepends_rule_and_is_idempotent() {
+        let mut policies = Some(security_policies_with_session_sandbox());
+
+        derive_oauth_capture_security_mediation(&mut policies, true).expect("first derive ok");
+        derive_oauth_capture_security_mediation(&mut policies, true).expect("second derive ok");
+
+        let security = policies
+            .as_ref()
+            .and_then(|p| p.commands.get("security"))
+            .expect("security entry");
+        assert_eq!(
+            security.intercept.len(),
+            1,
+            "rule must be injected exactly once"
+        );
+        let rule = &security.intercept[0];
+        let contains = rule
+            .match_config
+            .as_ref()
+            .and_then(|m| m.argv.as_ref())
+            .and_then(|a| a.contains.as_ref())
+            .expect("argv.contains matcher");
+        assert_eq!(
+            contains,
+            &vec![
+                "-a".to_string(),
+                nono_proxy::config::OAUTH_CAPTURE_STORE_ACCOUNT.to_string()
+            ]
+        );
+        assert!(matches!(
+            rule.action,
+            InterceptActionConfig::Respond { ref stdout } if stdout.is_empty()
+        ));
     }
 
     fn write_executable(path: &Path, contents: &[u8]) {

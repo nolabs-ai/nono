@@ -759,13 +759,29 @@ pub(crate) fn derive_oauth_capture_security_mediation(
         return Err(missing());
     }
 
-    let rule = InterceptRuleConfig {
+    // Mediate any `security` invocation that could reach the OAuth-capture
+    // item, matching on EITHER selector the `security` CLI accepts to resolve
+    // it:
+    //   security find-generic-password   -a oauth_capture_store ...
+    //   security delete-generic-password -a oauth_capture_store ...
+    //   security find-generic-password   -s nono -w              (no -a!)
+    //
+    // Matching only `-a oauth_capture_store` was bypassable: the item also
+    // resolves by its service name, so a child running `-s nono -w` (omitting
+    // `-a` entirely) slipped past the mediation and triggered the item's ACL
+    // Allow/Deny dialog — a social-engineering vector. `contains` is an AND
+    // over argv tokens and cannot express OR, so we install one rule per
+    // selector; each returns empty output WITHOUT executing the real command,
+    // so reads and deletes targeting service `nono` or account
+    // `oauth_capture_store` are all neutralised.
+    let service = nono::keystore::DEFAULT_SERVICE;
+    let respond_empty_rule = |tokens: Vec<String>| InterceptRuleConfig {
         args: None,
         match_config: Some(InterceptRuleMatchConfig {
             argv: Some(ArgvMatcherConfig {
                 exact: None,
                 prefix: None,
-                contains: Some(vec!["-a".to_string(), account.to_string()]),
+                contains: Some(tokens),
             }),
             env: BTreeMap::new(),
         }),
@@ -774,11 +790,18 @@ pub(crate) fn derive_oauth_capture_security_mediation(
         },
         sandbox: None,
     };
+    let rules = [
+        respond_empty_rule(vec!["-a".to_string(), account.to_string()]),
+        respond_empty_rule(vec!["-s".to_string(), service.to_string()]),
+    ];
 
-    // Prepend so it wins over any existing catch-all; only once so repeated
-    // resolution stays idempotent.
-    if !security.intercept.contains(&rule) {
-        security.intercept.insert(0, rule);
+    // Prepend so they win over any existing catch-all; skip any already present
+    // so repeated resolution stays idempotent. Insert in reverse so the final
+    // front-of-list order matches `rules`.
+    for rule in rules.into_iter().rev() {
+        if !security.intercept.contains(&rule) {
+            security.intercept.insert(0, rule);
+        }
     }
 
     Ok(())
@@ -3501,7 +3524,7 @@ mod tests {
     }
 
     #[test]
-    fn derive_security_mediation_prepends_rule_and_is_idempotent() {
+    fn derive_security_mediation_prepends_rules_and_is_idempotent() {
         let mut policies = Some(security_policies_with_session_sandbox());
 
         derive_oauth_capture_security_mediation(&mut policies, true).expect("first derive ok");
@@ -3511,29 +3534,50 @@ mod tests {
             .as_ref()
             .and_then(|p| p.commands.get("security"))
             .expect("security entry");
+
+        // Both selector rules are injected exactly once (idempotent across
+        // repeated resolution), and every rule responds with empty output
+        // without executing the real `security` command.
         assert_eq!(
             security.intercept.len(),
-            1,
-            "rule must be injected exactly once"
+            2,
+            "both selector rules must be injected exactly once"
         );
-        let rule = &security.intercept[0];
-        let contains = rule
-            .match_config
-            .as_ref()
-            .and_then(|m| m.argv.as_ref())
-            .and_then(|a| a.contains.as_ref())
-            .expect("argv.contains matcher");
-        assert_eq!(
-            contains,
-            &vec![
-                "-a".to_string(),
-                nono_proxy::config::OAUTH_CAPTURE_STORE_ACCOUNT.to_string()
-            ]
+        let contains_sets: Vec<&Vec<String>> = security
+            .intercept
+            .iter()
+            .map(|rule| {
+                assert!(
+                    matches!(
+                        rule.action,
+                        InterceptActionConfig::Respond { ref stdout } if stdout.is_empty()
+                    ),
+                    "mediation rule must respond with empty output"
+                );
+                rule.match_config
+                    .as_ref()
+                    .and_then(|m| m.argv.as_ref())
+                    .and_then(|a| a.contains.as_ref())
+                    .expect("argv.contains matcher")
+            })
+            .collect();
+
+        let account = nono_proxy::config::OAUTH_CAPTURE_STORE_ACCOUNT.to_string();
+        let service = nono::keystore::DEFAULT_SERVICE.to_string();
+        let account_rule = vec!["-a".to_string(), account];
+        let service_rule = vec!["-s".to_string(), service];
+
+        assert!(
+            contains_sets.contains(&&account_rule),
+            "must mediate reads/deletes selected by account (-a oauth_capture_store)"
         );
-        assert!(matches!(
-            rule.action,
-            InterceptActionConfig::Respond { ref stdout } if stdout.is_empty()
-        ));
+        // Regression guard for the bypass: `security find-generic-password -s
+        // nono -w` omits `-a` entirely but still resolves the item by service
+        // name, so the service selector MUST be mediated too.
+        assert!(
+            contains_sets.contains(&&service_rule),
+            "must mediate reads/deletes selected by service (-s nono), closing the -a bypass"
+        );
     }
 
     fn write_executable(path: &Path, contents: &[u8]) {

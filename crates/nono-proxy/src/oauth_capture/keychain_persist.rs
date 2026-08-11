@@ -135,10 +135,12 @@ fn resolved_exe_path() -> Result<std::path::PathBuf> {
 /// Load the persisted phantom map from the Keychain, or an empty map if no
 /// entry exists or the entry is stale (binary-path mismatch).
 ///
-/// A locked keychain is **not** treated as empty: it returns
-/// `Err(ProxyError::Keystore(..))` so the caller fails closed rather than
-/// silently continuing without persistence. There is no in-memory fallback —
-/// capture is unavailable until the login keychain is unlocked.
+/// A locked or otherwise inaccessible keychain (e.g. SSH/headless, where the
+/// item's nono-only ACL cannot be satisfied) is treated as an empty store with
+/// a warning — see `load_in_process`. OAuth-capture persistence is an optional
+/// cache, so its unavailability must never abort proxy/sandbox startup; the
+/// session simply runs without a persisted token store. The write path still
+/// fails closed and never falls back to plaintext.
 pub(super) fn load_persisted_tokens() -> Result<HashMap<String, StoredOAuthToken>> {
     let Some(raw) = load_in_process(KEYCHAIN_SERVICE, OAUTH_CAPTURE_ACCOUNT)? else {
         return Ok(HashMap::new());
@@ -418,6 +420,33 @@ fn is_locked_keychain_status(status: i32) -> bool {
     LOCKED_KEYCHAIN_STATUSES.contains(&status)
 }
 
+/// How the load path should react to a `find_generic_password` OSStatus.
+#[derive(Debug, PartialEq, Eq)]
+enum LoadDisposition {
+    /// `errSecItemNotFound` — no entry has been persisted yet.
+    Empty,
+    /// The keychain is locked or its nono-only ACL prompt cannot be presented
+    /// (headless/SSH). The optional cache is unreadable this session; degrade
+    /// to empty and warn instead of aborting startup.
+    Locked,
+    /// A genuine, unexpected fault that should surface to the caller.
+    Fatal,
+}
+
+/// Classify a load-path `find_generic_password` failure code. Pure and total
+/// so the load path's fail-open-vs-fail-closed decision can be unit-tested
+/// without a live keychain.
+fn classify_load_status(code: i32) -> LoadDisposition {
+    use security_framework_sys::base::errSecItemNotFound;
+    if code == errSecItemNotFound {
+        LoadDisposition::Empty
+    } else if is_locked_keychain_status(code) {
+        LoadDisposition::Locked
+    } else {
+        LoadDisposition::Fatal
+    }
+}
+
 /// Single user-facing message for any locked-keychain situation.
 fn locked_keychain_message(op: &str, service: &str, account: &str, status: i32) -> String {
     format!(
@@ -445,25 +474,35 @@ fn load_in_process(service: &str, account: &str) -> Result<Option<String>> {
             })?;
             Ok(Some(s.to_owned()))
         }
-        Err(e) => {
-            // errSecItemNotFound (-25300) → no entry yet; any other error is
-            // real.
-            use security_framework_sys::base::errSecItemNotFound;
-            if e.code() == errSecItemNotFound {
+        Err(e) => match classify_load_status(e.code()) {
+            // No entry yet — a fresh store.
+            LoadDisposition::Empty => Ok(None),
+            // A locked or otherwise inaccessible keychain must NOT abort
+            // proxy/sandbox startup: OAuth-capture persistence is an optional
+            // cache, so on the load path we degrade to an empty store and warn
+            // rather than failing closed. This is critical in headless/SSH
+            // sessions, where the item's nono-only ACL cannot be satisfied by a
+            // GUI prompt and the read returns errSecInteractionNotAllowed
+            // (-25308) / errSecAuthFailed (-25293); propagating that as fatal
+            // would crash every launch. The write path (`save_with_nono_acl`)
+            // still fails closed — it never falls back to plaintext.
+            LoadDisposition::Locked => {
+                tracing::warn!(
+                    service = %service,
+                    account = %account,
+                    os_status = e.code(),
+                    "OAuth capture persistence unavailable this session: keychain locked or \
+                     inaccessible (e.g. SSH/headless, post-sleep without GUI unlock, or the \
+                     nono-only ACL prompt cannot be presented). Continuing without a persisted \
+                     token store; previously captured tokens will not be restored."
+                );
                 Ok(None)
-            } else if is_locked_keychain_status(e.code()) {
-                Err(ProxyError::Keystore(locked_keychain_message(
-                    "load",
-                    service,
-                    account,
-                    e.code(),
-                )))
-            } else {
-                Err(ProxyError::Keystore(format!(
-                    "OAuth capture store load from {service}/{account}: {e}"
-                )))
             }
-        }
+            // A genuine, unexpected fault surfaces to the caller.
+            LoadDisposition::Fatal => Err(ProxyError::Keystore(format!(
+                "OAuth capture store load from {service}/{account}: {e}"
+            ))),
+        },
     }
 }
 
@@ -553,5 +592,31 @@ mod tests {
         assert!(is_locked_keychain_status(-25293));
         assert!(is_locked_keychain_status(-25304));
         assert!(!is_locked_keychain_status(-25300));
+    }
+
+    #[test]
+    fn load_degrades_gracefully_on_locked_or_inaccessible_keychain() {
+        // Regression guard: on the load path a locked / ACL-prompt-not-
+        // presentable keychain (headless/SSH) must NOT be fatal — it degrades
+        // to an empty store so proxy/sandbox startup never crashes.
+        // errSecInteractionNotAllowed (-25308) and errSecAuthFailed (-25293)
+        // are the headless signatures called out in the finding.
+        assert_eq!(classify_load_status(-25308), LoadDisposition::Locked);
+        assert_eq!(classify_load_status(-25293), LoadDisposition::Locked);
+        assert_eq!(classify_load_status(-25304), LoadDisposition::Locked);
+        // No entry yet is a fresh, empty store.
+        assert_eq!(classify_load_status(-25300), LoadDisposition::Empty);
+        // A genuinely unexpected status still surfaces as a hard error.
+        assert_eq!(classify_load_status(-1), LoadDisposition::Fatal);
+
+        // Both recoverable dispositions keep startup alive (Ok in the caller);
+        // only Fatal propagates.
+        for code in [-25308, -25293, -25304, -25300] {
+            assert_ne!(
+                classify_load_status(code),
+                LoadDisposition::Fatal,
+                "OSStatus {code} must not abort sandbox startup"
+            );
+        }
     }
 }

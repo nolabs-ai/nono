@@ -1,5 +1,34 @@
 # Changelog
 
+## [0.73.0] - 2026-08-10
+
+### Bug Fixes
+
+- *(cli)* Add profile schema fields missing from Rust model (#1607) ([#1607](https://github.com/nolabs-ai/nono/pull/1607))
+
+- *(cli)* Grant read access to the sandbox own capability-state file (#1606) ([#1606](https://github.com/nolabs-ai/nono/pull/1606))
+
+- *(proxy)* Add missing upgrades field to test RouteConfig literals (#1605) ([#1605](https://github.com/nolabs-ai/nono/pull/1605))
+
+- *(proxy)* Redeem phantom nonces on absolute-form forward-proxy requests (#1589) ([#1589](https://github.com/nolabs-ai/nono/pull/1589))
+
+- *(proxy)* Add authenticated WebSocket tunneling for CONNECT/TLS-intercept routes (#1443) ([#1443](https://github.com/nolabs-ai/nono/pull/1443))
+
+
+### Documentation
+
+- *(assets)* Add project screenshot (#1601) ([#1601](https://github.com/nolabs-ai/nono/pull/1601))
+
+
+### Features
+
+- *(profile)* Glob pattern support in filesystem path fields (#1580) ([#1580](https://github.com/nolabs-ai/nono/pull/1580))
+
+
+### Testing
+
+- *(audit)* Add per-variant golden vectors for AuditEventPayload (#1603) ([#1603](https://github.com/nolabs-ai/nono/pull/1603))
+
 ## [0.72.0] - 2026-08-07
 
 ### Bug Fixes

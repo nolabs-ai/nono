@@ -177,6 +177,54 @@ fn strip_proxy_headers(header_bytes: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Like [`strip_proxy_headers`], but also redeems any `nono_…` phantom nonce
+/// via `resolver`/`consumer`, fail-open per [`tls_intercept::handle::resolve_nonce_in_header_value`].
+///
+/// Returns the rewritten headers and whether a real credential was swapped in,
+/// so the audit event can distinguish an injected credential from a bare route
+/// match (no credential configured, or a nonce that failed to redeem).
+fn strip_and_redeem_proxy_headers(
+    header_bytes: &[u8],
+    consumer: &str,
+    resolver: &dyn crate::token::NonceResolver,
+) -> (Vec<u8>, bool) {
+    let header_str = match std::str::from_utf8(header_bytes) {
+        Ok(s) => s,
+        Err(_) => return (header_bytes.to_vec(), false),
+    };
+    let mut redeemed = false;
+    let mut out = Vec::with_capacity(header_bytes.len());
+    for line in header_str.split_inclusive("\r\n") {
+        let Some((name, rest)) = line.split_once(':') else {
+            out.extend_from_slice(line.as_bytes());
+            continue;
+        };
+        let trimmed_name = name.trim();
+        if trimmed_name.eq_ignore_ascii_case("proxy-connection")
+            || trimmed_name.eq_ignore_ascii_case("proxy-authorization")
+        {
+            continue;
+        }
+        let (value, line_ending) = match rest.strip_suffix("\r\n") {
+            Some(v) => (v, "\r\n"),
+            None => (rest, ""),
+        };
+        match tls_intercept::handle::resolve_nonce_in_header_value(value.trim(), consumer, resolver)
+        {
+            Some(resolved) => {
+                redeemed = true;
+                out.extend_from_slice(name.as_bytes());
+                out.push(b':');
+                out.push(b' ');
+                out.extend_from_slice(resolved.as_bytes());
+                out.extend_from_slice(line_ending.as_bytes());
+            }
+            None => out.extend_from_slice(line.as_bytes()),
+        }
+    }
+    (out, redeemed)
+}
+
 #[must_use]
 fn proxy_diagnostic_code_label(code: crate::diagnostic::ProxyDiagnosticCode) -> &'static str {
     code.as_str()
@@ -1915,7 +1963,26 @@ async fn handle_forward_http(
         .unwrap_or("GET")
         .to_string();
 
-    let filtered_headers = strip_proxy_headers(header_bytes);
+    // Target matches a route's upstream (not nono's own port, handled above) —
+    // redeem any phantom nonce before forwarding, as CONNECT already does.
+    let host_port = crate::route::format_host_port(&host, port);
+    let matched_route = state
+        .route_store
+        .lookup_by_upstream(&host_port)
+        .map(|(prefix, _)| prefix.to_string());
+    let (filtered_headers, credential_redeemed) =
+        match (&matched_route, state.nonce_resolver.as_deref()) {
+            (Some(prefix), Some(resolver)) => {
+                debug!(
+                    "forward-http: absolute-form target {} matches route '{}' upstream; \
+                 redeeming phantom headers before forwarding",
+                    host_port, prefix
+                );
+                let consumer = format!("proxy.{prefix}");
+                strip_and_redeem_proxy_headers(header_bytes, &consumer, resolver)
+            }
+            _ => (strip_proxy_headers(header_bytes), false),
+        };
     let mut request_bytes = Vec::with_capacity(origin_line.len() + filtered_headers.len() + 2);
     request_bytes.extend_from_slice(origin_line.as_bytes());
     request_bytes.extend_from_slice(&filtered_headers);
@@ -1987,9 +2054,10 @@ async fn handle_forward_http(
         log: Some(&state.audit_log),
         mode: audit::ProxyMode::Reverse,
         event_ctx: audit::EventContext {
+            route_id: matched_route.as_deref(),
             auth_mechanism: Some(nono::undo::NetworkAuditAuthMechanism::ProxyAuthorization),
             auth_outcome: Some(nono::undo::NetworkAuditAuthOutcome::Succeeded),
-            managed_credential_active: Some(false),
+            managed_credential_active: Some(credential_redeemed),
             ..audit::EventContext::default()
         },
         target: &host,
@@ -4580,6 +4648,92 @@ mod tests {
         );
     }
 
+    struct TestResolver {
+        nonce: String,
+        real: Vec<u8>,
+        admitted_consumer: String,
+    }
+
+    impl crate::token::NonceResolver for TestResolver {
+        fn resolve(&self, nonce: &str, consumer: &str) -> Option<Zeroizing<Vec<u8>>> {
+            if nonce == self.nonce && consumer == self.admitted_consumer {
+                Some(Zeroizing::new(self.real.clone()))
+            } else {
+                None
+            }
+        }
+    }
+
+    fn make_nonce() -> String {
+        format!("nono_{}", "b".repeat(64))
+    }
+
+    #[test]
+    fn strip_and_redeem_proxy_headers_redeems_admitted_nonce() {
+        let nonce = make_nonce();
+        let resolver = TestResolver {
+            nonce: nonce.clone(),
+            real: b"real-secret".to_vec(),
+            admitted_consumer: "proxy.headroom".to_string(),
+        };
+        let headers = format!(
+            "Host: 127.0.0.1:8787\r\nAuthorization: Bearer {nonce}\r\nProxy-Authorization: Basic abc\r\n"
+        );
+        let (redeemed, swapped) =
+            strip_and_redeem_proxy_headers(headers.as_bytes(), "proxy.headroom", &resolver);
+        assert!(swapped, "a real credential was swapped in");
+        let s = String::from_utf8(redeemed).unwrap();
+        assert!(
+            s.contains("Authorization: Bearer real-secret"),
+            "got: {s:?}"
+        );
+        assert!(
+            !s.contains(&nonce),
+            "phantom nonce must not reach upstream: {s:?}"
+        );
+        assert!(
+            !s.to_lowercase().contains("proxy-authorization"),
+            "Proxy-Authorization must still be stripped, got: {s:?}"
+        );
+        assert!(s.contains("Host: 127.0.0.1:8787"));
+    }
+
+    #[test]
+    fn strip_and_redeem_proxy_headers_leaves_unadmitted_nonce_unchanged() {
+        let nonce = make_nonce();
+        let resolver = TestResolver {
+            nonce: nonce.clone(),
+            real: b"real-secret".to_vec(),
+            admitted_consumer: "proxy.other-route".to_string(),
+        };
+        let headers = format!("Authorization: Bearer {nonce}\r\n");
+        let (redeemed, swapped) =
+            strip_and_redeem_proxy_headers(headers.as_bytes(), "proxy.headroom", &resolver);
+        assert!(
+            !swapped,
+            "no credential was swapped in for an unadmitted nonce"
+        );
+        let s = String::from_utf8(redeemed).unwrap();
+        assert!(
+            s.contains(&nonce),
+            "unadmitted nonce should be forwarded unchanged (fail-open, matches CONNECT path): {s:?}"
+        );
+    }
+
+    #[test]
+    fn strip_and_redeem_proxy_headers_leaves_headers_without_nonce_unchanged() {
+        let resolver = TestResolver {
+            nonce: make_nonce(),
+            real: b"real-secret".to_vec(),
+            admitted_consumer: "proxy.headroom".to_string(),
+        };
+        let headers = b"Host: 127.0.0.1:8787\r\nAccept: */*\r\n";
+        let (redeemed, swapped) =
+            strip_and_redeem_proxy_headers(headers, "proxy.headroom", &resolver);
+        assert!(!swapped);
+        assert_eq!(redeemed, headers);
+    }
+
     /// Spawn a one-shot local HTTP/1.1 origin server that echoes the received
     /// request line back in the body and returns 200. Returns its address and
     /// a receiver that yields the raw request bytes it saw.
@@ -4776,6 +4930,182 @@ mod tests {
             l7.managed_credential_active,
             Some(false),
             "forward path must audit managed_credential_active=false: {l7:?}"
+        );
+
+        handle.shutdown();
+    }
+
+    /// Absolute-form request matching a route's loopback upstream must redeem
+    /// its phantom nonce before forwarding (the bug report's scenario).
+    #[tokio::test]
+    async fn forward_http_matching_route_upstream_redeems_phantom() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+
+        let (origin_addr, origin_rx) = spawn_echo_origin().await;
+        let nonce = make_nonce();
+
+        let config = ProxyConfig {
+            allowed_hosts: vec!["127.0.0.1".to_string()],
+            routes: vec![crate::config::RouteConfig {
+                prefix: "local".to_string(),
+                upstream: format!("http://127.0.0.1:{}", origin_addr.port()),
+                credential_key: None,
+                inject_mode: Default::default(),
+                inject_header: "Authorization".to_string(),
+                credential_format: None,
+                path_pattern: None,
+                path_replacement: None,
+                query_param_name: None,
+                proxy: None,
+                env_var: None,
+                endpoint_rules: vec![],
+                endpoint_policy: None,
+                tls_ca: None,
+                tls_client_cert: None,
+                tls_client_key: None,
+                oauth2: None,
+                aws_auth: None,
+                spiffe: None,
+                rate_limit: None,
+                upgrades: vec![],
+            }],
+            ..ProxyConfig::default()
+        };
+        let resolver = TestResolver {
+            nonce: nonce.clone(),
+            real: b"real-secret".to_vec(),
+            admitted_consumer: "proxy.local".to_string(),
+        };
+        let handle = start_with_nonce_resolver(config, None, None, Some(Arc::new(resolver)))
+            .await
+            .unwrap();
+        let token = handle.token.to_string();
+
+        let mut stream = TcpStream::connect(("127.0.0.1", handle.port))
+            .await
+            .unwrap();
+        let creds = {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode(format!("nono:{}", token))
+        };
+        // Client sends the phantom it was issued, never the real credential.
+        let request = format!(
+            "GET http://127.0.0.1:{}/data HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nProxy-Authorization: Basic {}\r\nAuthorization: Bearer {}\r\n\r\n",
+            origin_addr.port(),
+            origin_addr.port(),
+            creds,
+            nonce,
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        let response_str = String::from_utf8_lossy(&response);
+        assert!(
+            response_str.starts_with("HTTP/1.1 200"),
+            "expected upstream 200, got: {}",
+            response_str
+        );
+
+        let received = origin_rx.await.unwrap();
+        assert!(
+            received.contains("Authorization: Bearer real-secret"),
+            "upstream must see the redeemed real credential: {received:?}"
+        );
+        assert!(
+            !received.contains(&nonce),
+            "phantom nonce must never reach the upstream: {received:?}"
+        );
+
+        let events = handle.drain_audit_events();
+        let l7 = events
+            .iter()
+            .find(|e| e.status == Some(200))
+            .expect("expected an L7 audit event for the forwarded request");
+        assert_eq!(
+            l7.managed_credential_active,
+            Some(true),
+            "matched-route forward must audit managed_credential_active=true: {l7:?}"
+        );
+
+        handle.shutdown();
+    }
+
+    /// A route match alone is not a credential: when the request carries no
+    /// redeemable phantom, the audit event must not claim a managed credential
+    /// was active.
+    #[tokio::test]
+    async fn forward_http_matching_route_without_phantom_audits_inactive() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+
+        let (origin_addr, _origin_rx) = spawn_echo_origin().await;
+
+        let config = ProxyConfig {
+            allowed_hosts: vec!["127.0.0.1".to_string()],
+            routes: vec![crate::config::RouteConfig {
+                prefix: "local".to_string(),
+                upstream: format!("http://127.0.0.1:{}", origin_addr.port()),
+                credential_key: None,
+                inject_mode: Default::default(),
+                inject_header: "Authorization".to_string(),
+                credential_format: None,
+                path_pattern: None,
+                path_replacement: None,
+                query_param_name: None,
+                proxy: None,
+                env_var: None,
+                endpoint_rules: vec![],
+                endpoint_policy: None,
+                tls_ca: None,
+                tls_client_cert: None,
+                tls_client_key: None,
+                oauth2: None,
+                aws_auth: None,
+                spiffe: None,
+                rate_limit: None,
+                upgrades: vec![],
+            }],
+            ..ProxyConfig::default()
+        };
+        let resolver = TestResolver {
+            nonce: make_nonce(),
+            real: b"real-secret".to_vec(),
+            admitted_consumer: "proxy.local".to_string(),
+        };
+        let handle = start_with_nonce_resolver(config, None, None, Some(Arc::new(resolver)))
+            .await
+            .unwrap();
+        let token = handle.token.to_string();
+
+        let mut stream = TcpStream::connect(("127.0.0.1", handle.port))
+            .await
+            .unwrap();
+        let creds = {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode(format!("nono:{}", token))
+        };
+        let request = format!(
+            "GET http://127.0.0.1:{}/data HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nProxy-Authorization: Basic {}\r\n\r\n",
+            origin_addr.port(),
+            origin_addr.port(),
+            creds,
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+
+        let events = handle.drain_audit_events();
+        let l7 = events
+            .iter()
+            .find(|e| e.status == Some(200))
+            .expect("expected an L7 audit event for the forwarded request");
+        assert_eq!(
+            l7.managed_credential_active,
+            Some(false),
+            "route match without a redeemed credential must audit false: {l7:?}"
         );
 
         handle.shutdown();

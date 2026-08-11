@@ -9,7 +9,7 @@ use crate::{
     output, sandbox_state, session,
 };
 use nono::undo::{ContentHash, ExecutableIdentity};
-use nono::{CapabilitySet, NonoError, Result, Sandbox};
+use nono::{AccessMode, CapabilitySet, FsCapability, NonoError, Result, Sandbox};
 use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::Read;
@@ -347,6 +347,9 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         flags.silent,
     );
     let cap_file_path = cap_file.unwrap_or_else(|| std::path::PathBuf::from("/dev/null"));
+    if cap_file_path != Path::new("/dev/null") {
+        caps.add_fs(FsCapability::new_file(&cap_file_path, AccessMode::Read)?);
+    }
 
     for secret in &loaded_secrets {
         if exec_strategy::is_dangerous_env_var(&secret.env_var) {

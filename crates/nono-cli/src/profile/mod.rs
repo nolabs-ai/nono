@@ -860,6 +860,12 @@ fn validate_oauth2_auth(name: &str, auth: &OAuth2Config) -> Result<()> {
     // When using client_assertion, client_id/client_secret are not required,
     // but the assertion config itself must have valid fields.
     if let Some(ref assertion) = auth.client_assertion {
+        if !auth.client_id.is_empty() || !auth.client_secret.is_empty() {
+            return Err(NonoError::ProfileParse(format!(
+                "auth.client_assertion for custom credential '{}' is mutually exclusive with client_id/client_secret",
+                name
+            )));
+        }
         match assertion {
             nono_proxy::config::ClientAssertionConfig::SpiffeJwt {
                 workload_api_socket,
@@ -6185,6 +6191,64 @@ mod tests {
         let err = result.expect_err("empty client_secret should be rejected");
         assert!(err.to_string().contains("client_secret"));
         assert!(err.to_string().contains("cannot be empty"));
+    }
+
+    #[test]
+    fn test_validate_oauth2_client_assertion_valid() {
+        let mut cred = oauth2_cred_builder();
+        cred.auth = Some(OAuth2Config {
+            token_url: "https://auth.example.com/oauth/token".to_string(),
+            client_id: String::new(),
+            client_secret: String::new(),
+            scope: String::new(),
+            client_assertion: Some(nono_proxy::config::ClientAssertionConfig::SpiffeJwt {
+                workload_api_socket: "/run/spire/sockets/agent.sock".to_string(),
+                audience: vec!["auth.example.com".to_string()],
+                svid_hint: None,
+            }),
+            extra_params: Default::default(),
+        });
+        assert!(validate_custom_credential("test", &cred).is_ok());
+    }
+
+    #[test]
+    fn test_validate_oauth2_client_assertion_and_client_id_mutually_exclusive() {
+        let mut cred = oauth2_cred_builder();
+        cred.auth = Some(OAuth2Config {
+            token_url: "https://auth.example.com/oauth/token".to_string(),
+            client_id: "my-client".to_string(),
+            client_secret: String::new(),
+            scope: String::new(),
+            client_assertion: Some(nono_proxy::config::ClientAssertionConfig::SpiffeJwt {
+                workload_api_socket: "/run/spire/sockets/agent.sock".to_string(),
+                audience: vec!["auth.example.com".to_string()],
+                svid_hint: None,
+            }),
+            extra_params: Default::default(),
+        });
+        let result = validate_custom_credential("test", &cred);
+        let err = result.expect_err("client_id with client_assertion should be rejected");
+        assert!(err.to_string().contains("mutually exclusive"));
+    }
+
+    #[test]
+    fn test_validate_oauth2_client_assertion_and_client_secret_mutually_exclusive() {
+        let mut cred = oauth2_cred_builder();
+        cred.auth = Some(OAuth2Config {
+            token_url: "https://auth.example.com/oauth/token".to_string(),
+            client_id: String::new(),
+            client_secret: "env://CLIENT_SECRET".to_string(),
+            scope: String::new(),
+            client_assertion: Some(nono_proxy::config::ClientAssertionConfig::SpiffeJwt {
+                workload_api_socket: "/run/spire/sockets/agent.sock".to_string(),
+                audience: vec!["auth.example.com".to_string()],
+                svid_hint: None,
+            }),
+            extra_params: Default::default(),
+        });
+        let result = validate_custom_credential("test", &cred);
+        let err = result.expect_err("client_secret with client_assertion should be rejected");
+        assert!(err.to_string().contains("mutually exclusive"));
     }
 
     #[test]

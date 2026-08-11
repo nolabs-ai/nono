@@ -17,7 +17,8 @@
           "type": "array",
           "items": { "type": "string" },
           "minItems": 1
-        }
+        },
+        { "type": "null" }
       ],
       "description": "Name of a base profile (or array of base profiles) to inherit from. All fields from the base profile are used as defaults, with this profile's values taking precedence. When an array is given, bases are merged left-to-right before the child is applied. Shared transitive bases are deduplicated: each profile is resolved at most once."
     },
@@ -159,6 +160,32 @@
       "type": "array",
       "items": { "type": "string" },
       "description": "macOS-only. Expert escape hatch: raw Seatbelt S-expression rules applied verbatim to the sandbox policy. Each entry must be a valid S-expression, e.g. \"(allow iokit-open)\". Rules are validated at load time and rejected if malformed. Ignored on Linux. Surfaced prominently in 'nono profile show' output. If a rule pattern becomes common, prefer promoting it to a typed first-class capability instead."
+    },
+    "allow_parent_of_protected": {
+      "oneOf": [
+        { "type": "boolean" },
+        { "type": "null" }
+      ],
+      "description": "Opt-in to allow parent-of-protected-root grants on macOS. When true (and on macOS), --allow ~ is permitted because Seatbelt deny rules protect ~/.nono. Ignored on Linux. Set to null to inherit from the base profile. Default is false."
+    },
+    "skipdirs": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Directory names to skip during trust scanning and rollback preflight. Treated like built-in heavy directories (for example \"target\")."
+    },
+    "binary": {
+      "oneOf": [
+        { "type": "string" },
+        { "type": "null" }
+      ],
+      "description": "Binary path or command name to run when no trailing -- <command> is given. Resolved via PATH lookup or canonicalized if absolute. Only honoured for user-authored profiles (ignored for pack and built-in profiles)."
+    },
+    "platform_overrides": {
+      "oneOf": [
+        { "$ref": "#/$defs/PlatformOverrides" },
+        { "type": "null" }
+      ],
+      "description": "Per-OS profile patches merged after extends resolution. Only the entry matching the current platform is applied. Nesting extends or platform_overrides inside an override block is a parse error."
     }
   },
   "$defs": {
@@ -351,6 +378,20 @@
           "items": { "$ref": "#/$defs/UrlOrigin" },
           "minItems": 1,
           "description": "API URL origins where phantom tokens issued by this provider may be resolved back to real credentials on egress."
+        },
+        "inject_header": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "null" }
+          ],
+          "description": "HTTP header the resolved credential is injected into on api_hosts egress. Defaults to Authorization (OAuth Bearer APIs). Some providers (e.g. Vault) need a different header, such as X-Vault-Token. Must be a valid HTTP header name (RFC 7230 token)."
+        },
+        "credential_format": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "null" }
+          ],
+          "description": "Format applied to the resolved credential before injection; {} is replaced by the token. Defaults to \"Bearer {}\". Use \"{}\" alone for a raw token (e.g. Vault)."
         },
         "credential_store": {
           "oneOf": [
@@ -619,6 +660,13 @@
             { "type": "null" }
           ],
           "description": "Opt-in pathname AF_UNIX mediation. 'off' preserves compatibility. 'pathname' requires explicit filesystem.unix_socket* grants for pathname Unix socket connect/bind."
+        },
+        "sandbox_policy": {
+          "oneOf": [
+            { "$ref": "#/$defs/LinuxSandboxPolicy" },
+            { "type": "null" }
+          ],
+          "description": "Which Linux sandboxing mechanism to install. Defaults to 'auto' (Landlock plus a static seccomp network baseline, falling back to seccomp-only networking when the kernel ABI lacks Landlock network support)."
         }
       }
     },
@@ -626,6 +674,11 @@
       "type": "string",
       "enum": ["off", "pathname"],
       "description": "Linux pathname AF_UNIX mediation mode."
+    },
+    "LinuxSandboxPolicy": {
+      "type": "string",
+      "enum": ["auto", "landlock", "external"],
+      "description": "Which sandboxing mechanism nono installs on Linux. 'auto' (default): Landlock plus a static seccomp network baseline, with automatic seccomp fallback when the kernel ABI lacks Landlock network support (< V4). 'landlock': Landlock only; errors at startup if the kernel cannot satisfy network restrictions via Landlock alone. 'external': TCP network egress enforcement is managed externally (iptables, cgroups, systemd, etc.); nono still installs filesystem/process sandboxing and skips only its own TCP network lockdown."
     },
     "ProfileSignalMode": {
       "type": "string",
@@ -703,17 +756,17 @@
         "allow": {
           "type": "array",
           "items": { "$ref": "#/$defs/ConditionalPath" },
-          "description": "Directories with read+write access."
+          "description": "Directories with read+write access. Supports * (single path segment) and ** (any depth) glob patterns, expanded at sandbox start."
         },
         "read": {
           "type": "array",
           "items": { "$ref": "#/$defs/ConditionalPath" },
-          "description": "Directories with read-only access."
+          "description": "Directories or files with read-only access. Supports * (single path segment) and ** (any depth) glob patterns, expanded at sandbox start."
         },
         "write": {
           "type": "array",
           "items": { "$ref": "#/$defs/ConditionalPath" },
-          "description": "Directories with write-only access."
+          "description": "Directories with write-only access. Supports * (single path segment) and ** (any depth) glob patterns, expanded at sandbox start."
         },
         "allow_file": {
           "type": "array",
@@ -730,15 +783,45 @@
           "items": { "$ref": "#/$defs/ConditionalPath" },
           "description": "Single files with write-only access."
         },
+        "unix_socket": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/ConditionalPath" },
+          "description": "Single AF_UNIX socket paths, connect only. Implies read access on the socket path."
+        },
+        "unix_socket_bind": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/ConditionalPath" },
+          "description": "Single AF_UNIX socket paths, connect and bind. Implies read+write access on the socket path when it exists, or on its parent directory when it does not yet exist. Dangling symlinks are rejected at grant time; prefer unix_socket_dir_bind for runtime-generated filenames."
+        },
+        "unix_socket_dir": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/ConditionalPath" },
+          "description": "Directories where any direct-child AF_UNIX socket may be connected to. Non-recursive. Implies read access on the directory."
+        },
+        "unix_socket_dir_bind": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/ConditionalPath" },
+          "description": "Directories where any direct-child AF_UNIX socket may be connected to or bound. Non-recursive. Implies read+write access on the directory."
+        },
+        "unix_socket_subtree": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/ConditionalPath" },
+          "description": "Directories where any descendant AF_UNIX socket may be connected to. Recursive. Implies read access on the directory."
+        },
+        "unix_socket_subtree_bind": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/ConditionalPath" },
+          "description": "Directories where any descendant AF_UNIX socket may be connected to or bound. Recursive. Implies read+write access on the directory."
+        },
         "deny": {
           "type": "array",
           "items": { "$ref": "#/$defs/ConditionalPath" },
-          "description": "Paths denied filesystem access. Denies apply regardless of other allow rules."
+          "description": "Paths denied filesystem access. Denies apply regardless of other allow rules. Supports * (single path segment) and ** (any depth) glob patterns, expanded at sandbox start. On macOS a runtime regex rule also covers files created after sandbox start; on Linux only paths present at start time are covered."
         },
         "bypass_protection": {
           "type": "array",
           "items": { "$ref": "#/$defs/ConditionalPath" },
-          "description": "Paths exempted from group-level deny rules. Each path must also appear in an allow/read/write section to actually grant access; bypass_protection only removes the deny."
+          "description": "Paths exempted from group-level deny rules. Each path must also appear in an allow/read/write section to actually grant access; bypass_protection only removes the deny. Supports * (single path segment) and ** (any depth) glob patterns, expanded at sandbox start."
         },
         "suppress_save_prompt": {
           "type": "array",
@@ -843,6 +926,36 @@
           "items": { "type": "integer" },
           "description": "Localhost TCP IPC (connect+bind). Port 0: macOS only (localhost:* outbound); Linux needs explicit ports."
         },
+        "connect_port": {
+          "type": "array",
+          "items": { "type": "integer" },
+          "description": "Outbound TCP ports the sandboxed child may connect to (dial-only, no listen). Linux Landlock V4+ only; not supported on macOS: Seatbelt cannot filter outbound connections by TCP port."
+        },
+        "open_port_range": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "items": { "type": "integer" },
+            "minItems": 2,
+            "maxItems": 2
+          },
+          "description": "Inclusive port ranges for bidirectional localhost TCP IPC (connect + bind), e.g. [[3000, 3010], [8000, 8100]]. macOS enforces a combined limit of 16,384 unique ports across all ranges; Linux has no such restriction. Overlapping ranges are merged before applying rules."
+        },
+        "listen_port_range": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "items": { "type": "integer" },
+            "minItems": 2,
+            "maxItems": 2
+          },
+          "description": "Inclusive port ranges for TCP listen (bind only). Same platform behaviour as open_port_range for the bind side; no outbound connect rules are added. Overlapping ranges are merged before applying rules."
+        },
+        "deny_domain": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Domains to deny through the proxy regardless of the allowlist. Supports the same wildcard syntax as allow_domain (e.g. *.ads.example.com)."
+        },
         "port_allow": {
           "type": "array",
           "items": { "type": "integer" },
@@ -930,20 +1043,82 @@
     },
     "CustomCredentialDef": {
       "type": "object",
-      "description": "Custom credential route definition for the reverse proxy. Defines how to route requests and inject credentials for a service. Must have exactly one of: credential_key, auth, or aws_auth (mutually exclusive).",
+      "description": "Custom credential route definition for the reverse proxy. Defines how to route requests and inject credentials for a service. credential_key, auth, aws_auth, and spiffe are mutually exclusive — at most one may be set.",
       "additionalProperties": false,
       "required": ["upstream"],
+      "anyOf": [
+        { "required": ["credential_key"], "properties": { "credential_key": { "not": { "type": "null" } } } },
+        { "required": ["auth"], "properties": { "auth": { "not": { "type": "null" } } } },
+        { "required": ["aws_auth"], "properties": { "aws_auth": { "not": { "type": "null" } } } },
+        { "required": ["spiffe"], "properties": { "spiffe": { "not": { "type": "null" } } } }
+      ],
+      "allOf": [
+        {
+          "not": {
+            "allOf": [
+              { "required": ["credential_key"], "properties": { "credential_key": { "not": { "type": "null" } } } },
+              { "required": ["auth"], "properties": { "auth": { "not": { "type": "null" } } } }
+            ]
+          }
+        },
+        {
+          "not": {
+            "allOf": [
+              { "required": ["credential_key"], "properties": { "credential_key": { "not": { "type": "null" } } } },
+              { "required": ["aws_auth"], "properties": { "aws_auth": { "not": { "type": "null" } } } }
+            ]
+          }
+        },
+        {
+          "not": {
+            "allOf": [
+              { "required": ["credential_key"], "properties": { "credential_key": { "not": { "type": "null" } } } },
+              { "required": ["spiffe"], "properties": { "spiffe": { "not": { "type": "null" } } } }
+            ]
+          }
+        },
+        {
+          "not": {
+            "allOf": [
+              { "required": ["auth"], "properties": { "auth": { "not": { "type": "null" } } } },
+              { "required": ["aws_auth"], "properties": { "aws_auth": { "not": { "type": "null" } } } }
+            ]
+          }
+        },
+        {
+          "not": {
+            "allOf": [
+              { "required": ["auth"], "properties": { "auth": { "not": { "type": "null" } } } },
+              { "required": ["spiffe"], "properties": { "spiffe": { "not": { "type": "null" } } } }
+            ]
+          }
+        },
+        {
+          "not": {
+            "allOf": [
+              { "required": ["aws_auth"], "properties": { "aws_auth": { "not": { "type": "null" } } } },
+              { "required": ["spiffe"], "properties": { "spiffe": { "not": { "type": "null" } } } }
+            ]
+          }
+        }
+      ],
       "properties": {
         "upstream": {
           "type": "string",
           "description": "Upstream URL to proxy requests to (e.g., \"https://api.telegram.org\"). Must use HTTPS, or HTTP only for loopback addresses."
         },
         "credential_key": {
-          "type": "string",
+          "oneOf": [
+            { "type": "string" },
+            { "type": "null" }
+          ],
           "description": "Keystore account name for the credential (e.g., \"telegram_bot_token\"), or a 1Password op:// URI, Bitwarden bw:// URI, apple-password:// URI, file:// URI, env:// URI (e.g., \"env://MY_TOKEN\"), or cmd:// URI backed by credential_capture. Mutually exclusive with auth and aws_auth."
         },
         "auth": {
-          "$ref": "#/$defs/OAuth2Config",
+          "oneOf": [
+            { "$ref": "#/$defs/OAuth2Config" },
+            { "type": "null" }
+          ],
           "description": "OAuth2 client_credentials configuration. When present, the proxy handles token exchange automatically. Mutually exclusive with credential_key and aws_auth."
         },
         "aws_auth": {
@@ -1040,6 +1215,20 @@
             { "type": "null" }
           ],
           "description": "Optional per-route request-rate limit (RouteRateLimiter). Caps the rate of L7 requests forwarded to this credential's upstream to contain a runaway or compromised agent. Applies only to L7-visible traffic (reverse-proxy and TLS-intercepted CONNECT); it has no effect on opaque CONNECT tunnels."
+        },
+        "endpoint_policy": {
+          "oneOf": [
+            { "$ref": "#/$defs/EndpointPolicyConfig" },
+            { "type": "null" }
+          ],
+          "description": "Explicit L7 endpoint policy with allow/deny/approve routes. Alternative to endpoint_rules for more granular control."
+        },
+        "spiffe": {
+          "oneOf": [
+            { "$ref": "#/$defs/SpiffeAuthConfig" },
+            { "type": "null" }
+          ],
+          "description": "SPIFFE/SPIRE Workload API authentication. Mutually exclusive with credential_key, auth, and aws_auth."
         }
       }
     },
@@ -1132,83 +1321,257 @@
       }
     },
     "OAuth2Config": {
-       "type": "object",
-       "description": "OAuth2 client_credentials configuration for automatic token exchange. The proxy exchanges client_id + client_secret for an access_token, caches it, and refreshes automatically before expiry.",
-       "additionalProperties": false,
-       "required": ["token_url", "client_id", "client_secret"],
-       "properties": {
-         "token_url": {
-           "type": "string",
-           "description": "Token endpoint URL (e.g., \"https://auth.example.com/oauth/token\"). Must use HTTPS, or HTTP only for loopback addresses."
-         },
-         "client_id": {
-           "type": "string",
-           "description": "Client ID — plain value or credential reference (env://, file://, op://)."
-         },
-         "client_secret": {
-           "type": "string",
-           "description": "Client secret — credential reference (env://, file://, op://)."
-         },
-         "scope": {
-           "type": "string",
-           "description": "OAuth2 scopes (space-separated). Empty or omitted means no scope parameter is sent.",
-           "default": ""
-         }
-       }
-     },
-     "AwsAuthConfig": {
-       "type": "object",
-       "description": "AWS SigV4 signing configuration for a credential route. All fields are optional: an empty {} block uses the default credential chain with region and service auto-detected from the upstream URL.",
-       "additionalProperties": false,
-       "properties": {
-         "profile": {
-           "oneOf": [
-             { "type": "string" },
-             { "type": "null" }
-           ],
-           "description": "AWS profile name to use for credentials. If omitted, the default credential chain is used (environment variables → AWS_PROFILE → default profile → instance metadata). Must be non-empty if set."
-         },
-         "region": {
-           "oneOf": [
-             { "type": "string" },
-             { "type": "null" }
-           ],
-           "description": "Explicit SigV4 signing region (e.g., \"us-east-1\"). If omitted, auto-detected from the upstream URL. Must be non-empty and contain no whitespace if set."
-         },
-         "service": {
-           "oneOf": [
-             { "type": "string" },
-             { "type": "null" }
-           ],
-           "description": "Explicit SigV4 service name (e.g., \"bedrock\", \"s3\"). If omitted, auto-detected from the upstream URL. Must be non-empty and contain no whitespace if set."
-         }
-       }
-     },
-     "RouteRateLimitConfig": {
-       "type": "object",
-       "description": "Per-route request-rate limit (RouteRateLimiter). A token bucket refilling at requests_per_minute and holding up to burst tokens. When the bucket is empty, a request is delayed up to max_delay_secs; a request that would wait longer is rejected with HTTP 429 (bounded delay then reject).",
-       "additionalProperties": false,
-       "required": ["requests_per_minute"],
-       "properties": {
-         "requests_per_minute": {
-           "type": "integer",
-           "minimum": 0,
-           "description": "Sustained request rate, in requests per minute. The token bucket refills at this rate. 0 disables the limiter for the route."
-         },
-         "burst": {
-           "type": "integer",
-           "minimum": 0,
-           "default": 5,
-           "description": "Burst capacity: instantaneous requests allowed before throttling begins. Clamped to at least 1 at runtime."
-         },
-         "max_delay_secs": {
-           "type": "integer",
-           "minimum": 0,
-           "default": 5,
-           "description": "Maximum seconds a request may be delayed before it is rejected with HTTP 429. Bounds the delay queue so a flood cannot exhaust proxy resources."
-         }
-       }
-     },
+      "type": "object",
+      "description": "OAuth2 client_credentials configuration for automatic token exchange. The proxy exchanges client_id + client_secret (or a client_assertion, e.g. SPIFFE private_key_jwt) for an access_token, caches it, and refreshes automatically before expiry. client_assertion is mutually exclusive with client_id/client_secret.",
+      "additionalProperties": false,
+      "required": ["token_url"],
+      "anyOf": [
+        { "required": ["client_id", "client_secret"] },
+        {
+          "required": ["client_assertion"],
+          "properties": {
+            "client_assertion": { "$ref": "#/$defs/ClientAssertionConfig" }
+          }
+        }
+      ],
+      "allOf": [
+        {
+          "not": {
+            "allOf": [
+              { "required": ["client_id"] },
+              { "required": ["client_assertion"], "properties": { "client_assertion": { "not": { "type": "null" } } } }
+            ]
+          }
+        },
+        {
+          "not": {
+            "allOf": [
+              { "required": ["client_secret"] },
+              { "required": ["client_assertion"], "properties": { "client_assertion": { "not": { "type": "null" } } } }
+            ]
+          }
+        }
+      ],
+      "properties": {
+        "token_url": {
+          "type": "string",
+          "description": "Token endpoint URL (e.g., \"https://auth.example.com/oauth/token\"). Must use HTTPS, or HTTP only for loopback addresses."
+        },
+        "client_id": {
+          "type": "string",
+          "description": "Client ID — plain value or credential reference (env://, file://, op://). Mutually exclusive with client_assertion.",
+          "default": ""
+        },
+        "client_secret": {
+          "type": "string",
+          "description": "Client secret — credential reference (env://, file://, op://). Mutually exclusive with client_assertion.",
+          "default": ""
+        },
+        "scope": {
+          "type": "string",
+          "description": "OAuth2 scopes (space-separated). Empty or omitted means no scope parameter is sent.",
+          "default": ""
+        },
+        "client_assertion": {
+          "oneOf": [
+            { "$ref": "#/$defs/ClientAssertionConfig" },
+            { "type": "null" }
+          ],
+          "description": "Client assertion configuration (e.g. SPIFFE private_key_jwt) used in place of client_id/client_secret."
+        },
+        "extra_params": {
+          "type": "object",
+          "additionalProperties": { "type": "string" },
+          "description": "Extra parameters merged into the token exchange POST body verbatim.",
+          "default": {}
+        }
+      }
+    },
+    "ClientAssertionConfig": {
+      "type": "object",
+      "description": "Client assertion used for OAuth2 token exchange instead of a client secret.",
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "workload_api_socket", "audience"],
+          "properties": {
+            "type": { "type": "string", "enum": ["spiffe_jwt"] },
+            "workload_api_socket": {
+              "type": "string",
+              "description": "Path to the SPIRE agent Unix domain socket."
+            },
+            "audience": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "Audience(s) for the minted JWT-SVID."
+            },
+            "svid_hint": {
+              "oneOf": [
+                { "type": "string" },
+                { "type": "null" }
+              ],
+              "description": "Select a specific SVID by SPIFFE ID when the Workload API returns multiple SVIDs for the same workload."
+            }
+          }
+        }
+      ]
+    },
+    "AwsAuthConfig": {
+      "type": "object",
+      "description": "AWS SigV4 signing configuration for a credential route. All fields are optional: an empty {} block uses the default credential chain with region and service auto-detected from the upstream URL.",
+      "additionalProperties": false,
+      "properties": {
+        "profile": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "null" }
+          ],
+          "description": "AWS profile name to use for credentials. If omitted, the default credential chain is used (environment variables → AWS_PROFILE → default profile → instance metadata). Must be non-empty if set."
+        },
+        "region": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "null" }
+          ],
+          "description": "Explicit SigV4 signing region (e.g., \"us-east-1\"). If omitted, auto-detected from the upstream URL. Must be non-empty and contain no whitespace if set."
+        },
+        "service": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "null" }
+          ],
+          "description": "Explicit SigV4 service name (e.g., \"bedrock\", \"s3\"). If omitted, auto-detected from the upstream URL. Must be non-empty and contain no whitespace if set."
+        }
+      }
+    },
+    "SpiffeAuthConfig": {
+      "type": "object",
+      "description": "SPIFFE/SPIRE Workload API authentication. Currently only type \"jwt\" is supported: a JWT-SVID is fetched from the SPIRE Workload API and injected as a bearer token; the sandboxed process sends plain requests with no credentials.",
+      "additionalProperties": false,
+      "required": ["type", "workload_api_socket", "audience"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["jwt"],
+          "description": "SPIFFE auth variant. Only \"jwt\" is currently supported."
+        },
+        "workload_api_socket": {
+          "type": "string",
+          "description": "Path to the SPIRE agent Unix domain socket."
+        },
+        "audience": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Audience(s) for the minted JWT-SVID."
+        },
+        "inject_header": {
+          "type": "string",
+          "description": "HTTP header to inject the JWT into.",
+          "default": "Authorization"
+        },
+        "credential_format": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "null" }
+          ],
+          "description": "Template with {} for the token. Defaults to \"Bearer {}\"."
+        },
+        "svid_hint": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "null" }
+          ],
+          "description": "Select a specific SVID by SPIFFE ID when the Workload API returns multiple SVIDs for the same workload. When absent, the first SVID returned by the agent is used."
+        }
+      }
+    },
+    "PlatformOverrides": {
+      "type": "object",
+      "description": "Per-OS profile patches merged after extends resolution. Only the entry matching the current platform is applied; others are ignored.",
+      "additionalProperties": false,
+      "properties": {
+        "macos": {
+          "allOf": [
+            { "$ref": "#" },
+            {
+              "not": {
+                "required": ["extends"],
+                "properties": { "extends": { "not": { "type": "null" } } }
+              }
+            },
+            {
+              "not": {
+                "required": ["platform_overrides"],
+                "properties": { "platform_overrides": { "not": { "type": "null" } } }
+              }
+            }
+          ],
+          "description": "Override block applied only on macOS. Nesting extends or platform_overrides here is a parse error."
+        },
+        "linux": {
+          "allOf": [
+            { "$ref": "#" },
+            {
+              "not": {
+                "required": ["extends"],
+                "properties": { "extends": { "not": { "type": "null" } } }
+              }
+            },
+            {
+              "not": {
+                "required": ["platform_overrides"],
+                "properties": { "platform_overrides": { "not": { "type": "null" } } }
+              }
+            }
+          ],
+          "description": "Override block applied only on Linux. Nesting extends or platform_overrides here is a parse error."
+        },
+        "windows": {
+          "allOf": [
+            { "$ref": "#" },
+            {
+              "not": {
+                "required": ["extends"],
+                "properties": { "extends": { "not": { "type": "null" } } }
+              }
+            },
+            {
+              "not": {
+                "required": ["platform_overrides"],
+                "properties": { "platform_overrides": { "not": { "type": "null" } } }
+              }
+            }
+          ],
+          "description": "Override block applied only on Windows. Nesting extends or platform_overrides here is a parse error."
+        }
+      }
+    },
+    "RouteRateLimitConfig": {
+      "type": "object",
+      "description": "Per-route request-rate limit (RouteRateLimiter). A token bucket refilling at requests_per_minute and holding up to burst tokens. When the bucket is empty, a request is delayed up to max_delay_secs; a request that would wait longer is rejected with HTTP 429 (bounded delay then reject).",
+      "additionalProperties": false,
+      "required": ["requests_per_minute"],
+      "properties": {
+        "requests_per_minute": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Sustained request rate, in requests per minute. The token bucket refills at this rate. 0 disables the limiter for the route."
+        },
+        "burst": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 5,
+          "description": "Burst capacity: instantaneous requests allowed before throttling begins. Clamped to at least 1 at runtime."
+        },
+        "max_delay_secs": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 5,
+          "description": "Maximum seconds a request may be delayed before it is rejected with HTTP 429. Bounds the delay queue so a flood cannot exhaust proxy resources."
+        }
+      }
+    },
     "SecretsConfig": {
       "type": "object",
       "description": "Maps keystore account names (or op://, bw://, apple-password://, env:// URIs) to environment variable names. Secrets are loaded from the system keystore under the service name \"nono\".",

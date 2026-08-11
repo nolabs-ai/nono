@@ -331,6 +331,202 @@ pub(crate) fn expand_path(path_str: &str) -> Result<PathBuf> {
     Ok(PathBuf::from(expanded))
 }
 
+/// Expands a path pattern containing `*` or `**` into matching filesystem paths.
+///
+/// Literal paths (no `*`) are returned as-is without touching the filesystem.
+/// Env vars in the literal prefix are expanded via [`expand_path`]. The walk
+/// root is the expanded literal prefix — already computed during that step.
+/// Results are sorted and deduplicated. Empty match emits a warning and returns
+/// an empty `Vec` — not an error. `?` and `[` are unsupported and return an error.
+pub(crate) fn expand_glob_path(pattern: &str) -> Result<Vec<PathBuf>> {
+    let (matches, _escaped) = expand_glob_path_impl(pattern)?;
+    if matches.is_empty() {
+        warn!(
+            "Glob pattern {pattern:?} matched no existing paths; \
+             the rule will have no effect until matching files are created"
+        );
+    }
+    Ok(matches)
+}
+
+/// Like [`expand_glob_path`], but for deny callers: also includes the literal
+/// path of any glob match that is a symlink resolving outside the walk root.
+///
+/// [`expand_glob_path`] drops those matches (with a warning) because for an
+/// *allow* glob, following the symlink would grant access at an arbitrary
+/// location outside the intended directory. For a *deny* glob the same
+/// escape must not have the opposite effect of silently un-denying the
+/// match — the symlink itself is still inside the walk root and named like
+/// the pattern, so it must still be covered. The escaped target is not
+/// added here: denying it too is harmless, but it's `add_deny_access_rules`
+/// (called by every user of this function) that already canonicalizes each
+/// returned path and denies both forms.
+pub(crate) fn expand_glob_deny_paths(pattern: &str) -> Result<Vec<PathBuf>> {
+    let (mut matches, escaped) = expand_glob_path_impl(pattern)?;
+    if matches.is_empty() && escaped.is_empty() {
+        warn!(
+            "Glob pattern {pattern:?} matched no existing paths; \
+             the rule will have no effect until matching files are created"
+        );
+    }
+    matches.extend(escaped);
+    matches.sort();
+    matches.dedup();
+    Ok(matches)
+}
+
+/// Shared implementation for [`expand_glob_path`] and [`expand_glob_deny_paths`].
+/// Returns `(in_root_matches, escaped_symlink_literal_paths)`.
+fn expand_glob_path_impl(pattern: &str) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
+    if !pattern.starts_with('/') {
+        return Err(NonoError::ConfigParse(format!(
+            "expand_glob_path requires an absolute pattern; got {pattern:?}. \
+             Call abs_glob() before expand_glob_path()."
+        )));
+    }
+
+    if !pattern.contains('*') {
+        return Ok((vec![expand_path(pattern)?], Vec::new()));
+    }
+
+    // Split at the first glob component so expand_path can validate and expand
+    // the literal prefix (env vars, ~, $HOME, etc.).
+    let star = pattern
+        .char_indices()
+        .find(|(_, c)| *c == '*')
+        .map(|(i, _)| i)
+        .unwrap_or(pattern.len());
+    let prefix_end = pattern[..star].rfind('/').map(|i| i + 1).unwrap_or(0);
+    let (literal_prefix, glob_suffix) = pattern.split_at(prefix_end);
+
+    // trim_end_matches('/') on "/" yields "" which expand_path rejects; preserve root.
+    let prefix_trimmed = literal_prefix.trim_end_matches('/');
+    let walk_root = if prefix_trimmed.is_empty() {
+        PathBuf::from("/")
+    } else {
+        expand_path(prefix_trimmed)?
+    };
+    // `?` and `[...]` are documented as unsupported (only `*`/`**` are wildcards),
+    // but without this check globset would silently treat them as its own
+    // single-char/character-class syntax — quietly widening or narrowing a
+    // pattern the profile author wrote expecting literal characters.
+    if let Some(c) = glob_suffix.chars().find(|c| matches!(c, '?' | '[' | ']')) {
+        return Err(NonoError::ConfigParse(format!(
+            "Unsupported glob metacharacter '{c}' in pattern {pattern:?}: \
+             only * and ** are supported"
+        )));
+    }
+
+    // The literal root is a real filesystem path, not something the profile
+    // author wrote as a glob — escape any characters globset would otherwise
+    // reinterpret as syntax (e.g. a directory literally named `[locale]`,
+    // common in Next.js-style route trees) so matching stays literal there.
+    let escaped_root = escape_glob_literal(&walk_root.display().to_string());
+    let escaped_suffix = escape_glob_literal(glob_suffix);
+    let expanded = format!("{escaped_root}/{escaped_suffix}");
+
+    let glob = globset::GlobBuilder::new(&expanded)
+        .literal_separator(true) // * does not cross /
+        .build()
+        .map_err(|e| NonoError::ConfigParse(format!("Invalid glob pattern {pattern:?}: {e}")))?;
+    let matcher = globset::GlobSet::builder()
+        .add(glob)
+        .build()
+        .map_err(|e| NonoError::ConfigParse(format!("Failed to build glob matcher: {e}")))?;
+
+    // Canonicalize the walk root so escaped matches can be detected by comparing
+    // resolved paths, not raw strings (a symlink can point anywhere on disk).
+    // A missing root just means an empty match set, same as today.
+    let canonical_root = match walk_root.canonicalize() {
+        Ok(root) => root,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        Err(source) => {
+            return Err(NonoError::PathCanonicalization {
+                path: walk_root.clone(),
+                source,
+            });
+        }
+    };
+
+    let mut matches: Vec<PathBuf> = Vec::new();
+    let mut escaped: Vec<PathBuf> = Vec::new();
+    walk_and_match(
+        &walk_root,
+        &canonical_root,
+        &matcher,
+        &mut matches,
+        &mut escaped,
+    );
+    matches.sort();
+    matches.dedup();
+    escaped.sort();
+    escaped.dedup();
+
+    Ok((matches, escaped))
+}
+
+/// Backslash-escapes globset metacharacters (`\`, `?`, `[`, `]`, `{`, `}`) so a
+/// string that is supposed to be matched literally — a real filesystem path
+/// component, or a suffix segment outside `*`/`**` — isn't reinterpreted as
+/// glob syntax. Leaves `*` untouched; callers pass wildcard tokens through
+/// unescaped.
+fn escape_glob_literal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(c, '\\' | '?' | '[' | ']' | '{' | '}') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+fn walk_and_match(
+    dir: &Path,
+    canonical_root: &Path,
+    matcher: &globset::GlobSet,
+    out: &mut Vec<PathBuf>,
+    escaped_out: &mut Vec<PathBuf>,
+) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if matcher.is_match(&path) {
+            // A symlink resolving outside the walk root would otherwise let the
+            // grant it's turned into (by canonicalizing again downstream) point
+            // at an arbitrary location, e.g. `$WORKDIR/escape -> ~/.ssh`. Only
+            // accept matches whose real, resolved location stays under the root
+            // as an *allow* target. The literal symlink path itself is still
+            // collected separately (`escaped_out`) — deny callers need it so
+            // the escape can't be used to bypass a deny rule (see
+            // `expand_glob_deny_paths`); allow callers ignore that list.
+            match path.canonicalize() {
+                Ok(resolved) if resolved.starts_with(canonical_root) => out.push(path.clone()),
+                Ok(resolved) => {
+                    warn!(
+                        "Skipping glob match {} — resolves outside the walk root ({})",
+                        path.display(),
+                        resolved.display()
+                    );
+                    escaped_out.push(path.clone());
+                }
+                Err(_) => {} // broken symlink or race; skip like a non-existent path
+            }
+        }
+        // Use DirEntry::file_type() to avoid following symlinks — path.is_dir()
+        // follows symlinks and would recurse into symlinked directories, allowing
+        // scope escape and causing infinite recursion on cycles.
+        let is_real_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        if is_real_dir {
+            walk_and_match(&path, canonical_root, matcher, out, escaped_out);
+        }
+    }
+}
+
 /// Expand `$VAR` references in a string against the process environment,
 /// erroring on an unset variable rather than leaving it literal like
 /// [`expand_env_vars`] — collapsing `$X/helper` to `/helper` on a typo'd var
@@ -428,6 +624,100 @@ fn escape_seatbelt_regex_path(path: &str) -> Result<String> {
         }
     }
     Ok(out)
+}
+
+/// Builds an anchored ICU regex string for Seatbelt's `(regex #"...")` filter
+/// from a literal path prefix plus a glob suffix.
+///
+/// `literal_prefix` is a real, already-canonicalized filesystem path (symlinks
+/// resolved by the caller) — not something the profile author wrote as a
+/// glob — so it may itself contain characters like `[` or `?` (e.g. a Next.js
+/// `[locale]` route directory). It's escaped and embedded as a literal;
+/// `glob_suffix` is the part the profile author actually wrote as glob syntax:
+/// - `*`  — any characters within a single path segment (never crosses `/`)
+/// - `**` — any characters across segment boundaries; `**/` also matches at
+///   the root so `**/foo` covers both `foo` and `dir/foo`
+///
+/// `?` and `[…]` in `glob_suffix` are not supported and return an error.
+/// Extend [`push_glob_as_seatbelt_regex`] when there is a concrete user need
+/// for them.
+///
+/// Note: `foo/**` matches `foo/` and everything beneath it but does NOT match
+/// `foo` itself (no trailing slash). Use a separate literal deny for the
+/// parent directory if that is also required.
+///
+/// The returned string is anchored (`^…$`) and ready to embed in a Seatbelt
+/// S-expression; double-quote characters are backslash-escaped.
+#[cfg(target_os = "macos")]
+pub(crate) fn glob_to_seatbelt_regex_with_literal_prefix(
+    literal_prefix: &str,
+    glob_suffix: &str,
+) -> Result<String> {
+    let mut out = String::with_capacity((literal_prefix.len() + glob_suffix.len()) * 2 + 4);
+    out.push('^');
+    out.push_str(&escape_seatbelt_regex_path(literal_prefix)?);
+    push_glob_as_seatbelt_regex(glob_suffix, &mut out)?;
+    out.push('$');
+    Ok(out)
+}
+
+/// Translates glob syntax (`*`, `**`) into ICU regex, appending to `out`.
+/// Shared by [`glob_to_seatbelt_regex`] and
+/// [`glob_to_seatbelt_regex_with_literal_prefix`]; callers own the `^`/`$` anchors.
+#[cfg(target_os = "macos")]
+fn push_glob_as_seatbelt_regex(glob: &str, out: &mut String) -> Result<()> {
+    let chars: Vec<char> = glob.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c.is_control() {
+            return Err(NonoError::ConfigParse(format!(
+                "Glob pattern contains control character: {glob:?}"
+            )));
+        }
+        match c {
+            '*' => {
+                if i + 1 < chars.len() && chars[i + 1] == '*' {
+                    i += 2;
+                    if i < chars.len() && chars[i] == '/' {
+                        // **/ → optional path prefix so **/foo matches both
+                        // foo and subdir/foo at any depth.
+                        out.push_str("(?:.*/)?");
+                        i += 1;
+                    } else {
+                        // ** at end or before a non-slash: match anything
+                        out.push_str(".*");
+                    }
+                } else {
+                    out.push_str("[^/]*");
+                    i += 1;
+                }
+            }
+            '?' | '[' => {
+                return Err(NonoError::ConfigParse(format!(
+                    "Unsupported glob metacharacter '{c}' in pattern {glob:?}: \
+                     only * and ** are supported"
+                )));
+            }
+            // ICU regex metacharacters that are literal in the supported glob syntax
+            '.' | '+' | '(' | ')' | '{' | '}' | '|' | '^' | '$' | '\\' => {
+                out.push('\\');
+                out.push(c);
+                i += 1;
+            }
+            // Escape double-quote for embedding in Seatbelt's quoted string
+            '"' => {
+                out.push_str("\\\"");
+                i += 1;
+            }
+            _ => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+
+    Ok(())
 }
 
 // ============================================================================
@@ -705,6 +995,62 @@ fn resolve_parent_symlinks(path: &Path) -> Result<Option<PathBuf>> {
     }
 
     Ok((resolved != path).then_some(resolved))
+}
+
+/// Applies deny rules for a glob pattern.
+///
+/// Expands the pattern against the filesystem at sandbox start and calls
+/// [`add_deny_access_rules`] for each match (both platforms).
+///
+/// On macOS, also emits a Seatbelt `(regex …)` deny rule so files created after
+/// sandbox start are covered at the kernel level. The literal path prefix is
+/// canonicalized before generating the regex so it matches the kernel's view.
+///
+/// On Linux, emits a debug-level note that coverage is build-time only.
+pub(crate) fn add_glob_deny_rules(
+    pattern: &str,
+    caps: &mut CapabilitySet,
+    deny_paths: &mut Vec<PathBuf>,
+) -> Result<()> {
+    for path in expand_glob_deny_paths(pattern)? {
+        add_deny_access_rules(path_to_utf8(&path)?, caps, deny_paths)?;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        // Canonicalize the literal prefix so the regex matches kernel-resolved paths.
+        // The prefix directory may not exist yet (denying a path before the sandboxed
+        // process creates it is the normal use case for this feature) — plain
+        // `canonicalize()` fails in that case, so fall back to resolving symlinks in
+        // the nearest existing ancestor instead of using the raw, unresolved prefix.
+        // Skipping that fallback would silently defeat the deny on macOS, where common
+        // roots like /tmp, /etc, and /var are themselves symlinks into /private.
+        let star = pattern.find('*').unwrap_or(pattern.len());
+        let prefix_end = pattern[..star].rfind('/').map(|i| i + 1).unwrap_or(0);
+        let (raw_prefix, glob_suffix) = pattern.split_at(prefix_end);
+        let raw_prefix_path = Path::new(raw_prefix.trim_end_matches('/'));
+        let canonical_prefix = match raw_prefix_path.canonicalize() {
+            Ok(resolved) => resolved,
+            Err(_) => resolve_parent_symlinks(raw_prefix_path)?
+                .unwrap_or_else(|| raw_prefix_path.to_path_buf()),
+        };
+        let prefix_str = format!("{}/", canonical_prefix.display());
+        let re = glob_to_seatbelt_regex_with_literal_prefix(&prefix_str, glob_suffix)?;
+        caps.add_platform_rule(format!("(allow file-read-metadata (regex #\"{re}\"))"))?;
+        caps.add_platform_rule(format!("(deny file-read-data (regex #\"{re}\"))"))?;
+        caps.add_platform_rule(format!("(deny file-write* (regex #\"{re}\"))"))?;
+        // Unix socket connect(2) is mediated as network-outbound, not file I/O.
+        caps.add_platform_rule(format!("(deny network-outbound (regex #\"{re}\"))"))?;
+    }
+
+    #[cfg(target_os = "linux")]
+    debug!(
+        "Glob deny {pattern:?}: pattern is expanded at sandbox start — files created \
+         after the sandbox is applied are not covered. Enable capability_elevation \
+         for runtime enforcement."
+    );
+
+    Ok(())
 }
 
 /// Add deny.access rules, collecting the expanded path for validation.
@@ -1986,6 +2332,157 @@ mod tests {
             // On Linux, no platform rules generated (Landlock has no deny semantics)
             assert!(caps.platform_rules().is_empty());
         }
+    }
+
+    #[test]
+    fn test_add_glob_deny_rules_expands_and_denies_matches() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+
+        std::fs::write(root.join("appsettings.json"), "").expect("write");
+        std::fs::write(root.join("appsettings.dev.json"), "").expect("write");
+        std::fs::write(root.join("other.txt"), "").expect("write");
+        std::fs::create_dir(root.join("sub")).expect("mkdir");
+        std::fs::write(root.join("sub").join("appsettings.json"), "").expect("write");
+
+        let pattern = format!("{}/**/*.json", root.display());
+        let mut caps = CapabilitySet::new();
+        let mut deny_paths: Vec<PathBuf> = Vec::new();
+
+        add_glob_deny_rules(&pattern, &mut caps, &mut deny_paths).expect("ok");
+
+        // All three .json files must be in deny_paths (exact files get canonical too,
+        // so there may be more entries — just check the three originals are present).
+        assert!(deny_paths.contains(&root.join("appsettings.json")));
+        assert!(deny_paths.contains(&root.join("appsettings.dev.json")));
+        assert!(deny_paths.contains(&root.join("sub").join("appsettings.json")));
+
+        // .txt must not appear
+        assert!(
+            !deny_paths
+                .iter()
+                .any(|p| p.extension().is_some_and(|e| e == "txt"))
+        );
+
+        #[cfg(target_os = "macos")]
+        {
+            // A regex-based Seatbelt rule must have been emitted for runtime coverage.
+            let rules = caps.platform_rules();
+            assert!(
+                rules
+                    .iter()
+                    .any(|r| r.contains("deny file-read-data") && r.contains("regex"))
+            );
+            assert!(
+                rules
+                    .iter()
+                    .any(|r| r.contains("deny file-write*") && r.contains("regex"))
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_glob_deny_blocks_future_unix_socket_connections() {
+        // Socket does not exist yet at sandbox start — the normal case.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("runtime-sockets");
+        std::fs::create_dir(&root).expect("mkdir");
+        let sock_path = root.join("agent.sock");
+        assert!(
+            !sock_path.exists(),
+            "precondition: socket must not exist yet"
+        );
+
+        let pattern = format!("{}/*.sock", root.display());
+        let mut caps = CapabilitySet::new();
+        let mut deny_paths: Vec<PathBuf> = Vec::new();
+        add_glob_deny_rules(&pattern, &mut caps, &mut deny_paths).expect("must not error");
+
+        let rules = caps.platform_rules();
+        assert!(
+            rules
+                .iter()
+                .any(|r| r.contains("deny network-outbound") && r.contains("regex")),
+            "glob deny must emit a network-outbound regex rule to cover future Unix socket connects"
+        );
+    }
+
+    #[test]
+    fn test_add_glob_deny_rules_with_bracket_in_root_path() {
+        // A literal `[` in an ancestor directory (e.g. a Next.js `[locale]`
+        // route dir) must not make deny-glob setup fail: the seatbelt regex
+        // generator must treat the canonicalized prefix as literal, not glob
+        // syntax, matching expand_glob_path's escaping.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("app[locale]");
+        std::fs::create_dir(&root).expect("mkdir");
+        std::fs::write(root.join(".env"), "secret").expect("write");
+
+        let pattern = format!("{}/**/.env", root.display());
+        let mut caps = CapabilitySet::new();
+        let mut deny_paths: Vec<PathBuf> = Vec::new();
+        add_glob_deny_rules(&pattern, &mut caps, &mut deny_paths).expect("must not error");
+
+        assert!(deny_paths.contains(&root.join(".env")));
+
+        #[cfg(target_os = "macos")]
+        {
+            let rules = caps.platform_rules();
+            assert!(
+                rules
+                    .iter()
+                    .any(|r| r.contains("deny file-read-data") && r.contains("regex"))
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_add_glob_deny_rules_prefix_not_yet_existing_resolves_symlinked_ancestor() {
+        // The deny prefix directory does not exist yet at setup time — denying a
+        // path before the sandboxed process creates it is the normal use case for
+        // this feature. `tempfile::tempdir()` on macOS lives under `/var/...`,
+        // itself a symlink to `/private/var/...`, so this exercises the exact
+        // real-world condition: a not-yet-existing directory whose *existing*
+        // ancestor is a symlink. Regression test for the bug where a bare
+        // `canonicalize()` failure fell back to the raw, unresolved prefix,
+        // producing a regex anchored on `/var/...` that the kernel (which only
+        // ever reports `/private/var/...`) would never match.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let not_yet = dir.path().join("not-yet-created");
+        assert!(!not_yet.exists(), "precondition: prefix must not exist yet");
+
+        let pattern = format!("{}/**", not_yet.display());
+        let mut caps = CapabilitySet::new();
+        let mut deny_paths: Vec<PathBuf> = Vec::new();
+        add_glob_deny_rules(&pattern, &mut caps, &mut deny_paths).expect("must not error");
+
+        let rules = caps.platform_rules();
+        let deny_rule = rules
+            .iter()
+            .find(|r| r.contains("deny file-read-data") && r.contains("regex"))
+            .expect("macOS regex deny rule must be emitted even when the prefix is missing");
+
+        // Extract the regex out of `(deny file-read-data (regex #"...^...$"))`.
+        let re_str = deny_rule
+            .split("#\"")
+            .nth(1)
+            .and_then(|s| s.split('"').next())
+            .expect("regex literal must be embeddable in the platform rule string");
+        let re = regex::Regex::new(re_str).expect("emitted regex must compile");
+
+        let canonical_leak_path = dir
+            .path()
+            .canonicalize()
+            .expect("canon dir")
+            .join("not-yet-created")
+            .join("leak.json");
+        assert!(
+            re.is_match(canonical_leak_path.to_str().expect("utf8")),
+            "regex {re_str:?} must match the kernel-resolved (canonical) path {canonical_leak_path:?} \
+             — falling back to the raw, unresolved prefix would silently defeat the deny"
+        );
     }
 
     #[test]
@@ -3465,5 +3962,314 @@ mod tests {
         let conflicts = find_denied_user_grants(&[path], &caps, &policy);
         assert_eq!(conflicts.len(), 1);
         assert!(conflicts[0].1.is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    mod glob_regex_tests {
+        use super::*;
+
+        /// These tests exercise the whole pattern as glob syntax (no separate
+        /// literal-path prefix), matching the pre-refactor `glob_to_seatbelt_regex`.
+        fn glob_to_seatbelt_regex(glob: &str) -> Result<String> {
+            glob_to_seatbelt_regex_with_literal_prefix("", glob)
+        }
+
+        #[test]
+        fn test_glob_regex_literal_path() {
+            let re = glob_to_seatbelt_regex("/home/user/file.json").expect("ok");
+            assert_eq!(re, r"^/home/user/file\.json$");
+        }
+
+        #[test]
+        fn test_glob_regex_single_star() {
+            let re = glob_to_seatbelt_regex("/tmp/*.json").expect("ok");
+            assert_eq!(re, r"^/tmp/[^/]*\.json$");
+        }
+
+        #[test]
+        fn test_glob_regex_double_star_slash_prefix() {
+            let re = glob_to_seatbelt_regex("**/appsettings.json").expect("ok");
+            assert_eq!(re, r"^(?:.*/)?appsettings\.json$");
+        }
+
+        #[test]
+        fn test_glob_regex_double_star_mid_pattern() {
+            let re = glob_to_seatbelt_regex("/repo/**/appsettings.json").expect("ok");
+            assert_eq!(re, r"^/repo/(?:.*/)?appsettings\.json$");
+        }
+
+        #[test]
+        fn test_glob_regex_double_star_at_end() {
+            // Does NOT match the prefix itself without a trailing slash.
+            let re = glob_to_seatbelt_regex("/repo/**").expect("ok");
+            assert_eq!(re, r"^/repo/.*$");
+        }
+
+        #[test]
+        fn test_glob_regex_question_mark_errors() {
+            let err = glob_to_seatbelt_regex("/tmp/emacs?").expect_err("must error");
+            assert!(matches!(err, NonoError::ConfigParse(_)));
+        }
+
+        #[test]
+        fn test_glob_regex_character_class_errors() {
+            let err = glob_to_seatbelt_regex("/path/file[0-9].log").expect_err("must error");
+            assert!(matches!(err, NonoError::ConfigParse(_)));
+        }
+
+        #[test]
+        fn test_glob_regex_double_star_with_prefix_wildcard() {
+            let re = glob_to_seatbelt_regex("/repo/**/appsettings*.json").expect("ok");
+            assert_eq!(re, r"^/repo/(?:.*/)?appsettings[^/]*\.json$");
+        }
+
+        #[test]
+        fn test_glob_regex_dot_env_wildcard() {
+            let re = glob_to_seatbelt_regex("**/.env.*").expect("ok");
+            assert_eq!(re, r"^(?:.*/)?\.env\.[^/]*$");
+        }
+
+        #[test]
+        fn test_glob_regex_metachar_escaping() {
+            let re = glob_to_seatbelt_regex("/path/f(o+o)|bar$.txt").expect("ok");
+            assert_eq!(re, r"^/path/f\(o\+o\)\|bar\$\.txt$");
+        }
+
+        #[test]
+        fn test_glob_regex_double_quote_escaped() {
+            let re = glob_to_seatbelt_regex("/path/say\"hello\"").expect("ok");
+            assert_eq!(re, "^/path/say\\\"hello\\\"$");
+        }
+
+        #[test]
+        fn test_glob_regex_control_character_errors() {
+            let err = glob_to_seatbelt_regex("/path/\x01bad").expect_err("must error");
+            assert!(matches!(err, NonoError::ConfigParse(_)));
+        }
+
+        #[test]
+        fn test_glob_regex_trailing_star() {
+            let re = glob_to_seatbelt_regex("/var/folders/emacs*").expect("ok");
+            assert_eq!(re, r"^/var/folders/emacs[^/]*$");
+        }
+
+        #[test]
+        fn test_glob_regex_double_star_trailing() {
+            // ^/path/.*$ requires the slash — does not match /path without one.
+            let re = glob_to_seatbelt_regex("/path/**").expect("ok");
+            assert_eq!(re, r"^/path/.*$");
+        }
+    }
+
+    #[test]
+    fn test_expand_glob_path_literal_passthrough() {
+        let result = expand_glob_path("/nonexistent/literal/path.json").expect("ok");
+        assert_eq!(
+            result,
+            vec![PathBuf::from("/nonexistent/literal/path.json")]
+        );
+    }
+
+    #[test]
+    fn test_expand_glob_path_single_star_stays_in_level() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+
+        std::fs::write(root.join("a.json"), "").expect("write");
+        std::fs::write(root.join("b.json"), "").expect("write");
+        std::fs::write(root.join("c.txt"), "").expect("write");
+        std::fs::create_dir(root.join("sub")).expect("mkdir");
+        std::fs::write(root.join("sub").join("d.json"), "").expect("write");
+
+        let pattern = format!("{}/*.json", root.display());
+        let mut result = expand_glob_path(&pattern).expect("ok");
+        result.sort();
+
+        assert_eq!(result, vec![root.join("a.json"), root.join("b.json")]);
+        assert!(!result.iter().any(|p| p.ends_with("d.json")));
+    }
+
+    #[test]
+    fn test_expand_glob_path_double_star_crosses_directories() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+
+        std::fs::create_dir_all(root.join("a/b")).expect("mkdir");
+        std::fs::write(root.join("top.json"), "").expect("write");
+        std::fs::write(root.join("a").join("mid.json"), "").expect("write");
+        std::fs::write(root.join("a/b").join("deep.json"), "").expect("write");
+        std::fs::write(root.join("a").join("other.txt"), "").expect("write");
+
+        let pattern = format!("{}/**/*.json", root.display());
+        let mut result = expand_glob_path(&pattern).expect("ok");
+        result.sort();
+
+        assert!(result.contains(&root.join("top.json")));
+        assert!(result.contains(&root.join("a").join("mid.json")));
+        assert!(result.contains(&root.join("a/b").join("deep.json")));
+        assert!(
+            !result
+                .iter()
+                .any(|p| p.extension().is_some_and(|e| e == "txt"))
+        );
+    }
+
+    #[test]
+    fn test_expand_glob_path_empty_match_returns_empty() {
+        let result = expand_glob_path("/nonexistent/path/**/*.json").expect("ok");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_expand_glob_path_star_does_not_enter_siblings() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+
+        std::fs::create_dir(root.join("sibling")).expect("mkdir");
+        std::fs::write(root.join("sibling").join("secret.json"), "").expect("write");
+        std::fs::write(root.join("safe.json"), "").expect("write");
+
+        let pattern = format!("{}/*.json", root.display());
+        let result = expand_glob_path(&pattern).expect("ok");
+
+        assert_eq!(result, vec![root.join("safe.json")]);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_expand_glob_path_rejects_symlink_escaping_root_via_double_star() {
+        let outside = tempfile::tempdir().expect("tempdir");
+        std::fs::write(outside.path().join("secret"), "top secret").expect("write");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::os::unix::fs::symlink(outside.path(), root.join("escape")).expect("symlink");
+
+        let pattern = format!("{}/**", root.display());
+        let result = expand_glob_path(&pattern).expect("ok");
+
+        assert!(
+            !result.iter().any(|p| p.starts_with(outside.path())),
+            "escaped outside root: {result:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_expand_glob_path_allows_symlink_pointing_inside_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::create_dir(root.join("real")).expect("mkdir");
+        std::fs::write(root.join("real").join("data.json"), "").expect("write");
+        std::os::unix::fs::symlink(root.join("real"), root.join("alias")).expect("symlink");
+
+        let pattern = format!("{}/*", root.display());
+        let result = expand_glob_path(&pattern).expect("ok");
+
+        // The symlink itself resolves inside the root, so matching it is fine —
+        // it doesn't widen the grant beyond $root.
+        assert!(result.contains(&root.join("alias")));
+        assert!(result.contains(&root.join("real")));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_expand_glob_path_skips_broken_symlink() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::os::unix::fs::symlink(root.join("does-not-exist"), root.join("broken.json"))
+            .expect("symlink");
+
+        let pattern = format!("{}/*.json", root.display());
+        let result = expand_glob_path(&pattern).expect("ok");
+
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_expand_glob_path_does_not_recurse_through_symlinked_dir_even_when_matching() {
+        let outside = tempfile::tempdir().expect("tempdir");
+        std::fs::write(outside.path().join("nested.json"), "").expect("write");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::os::unix::fs::symlink(outside.path(), root.join("escape")).expect("symlink");
+
+        let pattern = format!("{}/**/*.json", root.display());
+        let result = expand_glob_path(&pattern).expect("ok");
+
+        assert!(
+            !result.iter().any(|p| p.starts_with(outside.path())),
+            "walked into a symlinked directory outside root: {result:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_expand_glob_path_rejects_symlink_cycle_without_hanging() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::create_dir(root.join("a")).expect("mkdir");
+        std::os::unix::fs::symlink(root.join("a"), root.join("a").join("cycle")).expect("symlink");
+
+        let pattern = format!("{}/**", root.display());
+        let result = expand_glob_path(&pattern).expect("ok");
+
+        // Should terminate (no infinite recursion via the self-referential symlink)
+        // and the cycle entry itself resolves inside root, so it's allowed.
+        assert!(result.contains(&root.join("a")));
+    }
+
+    #[test]
+    fn test_expand_glob_path_literal_bracket_in_ancestor_dir_name_still_matches() {
+        // Next.js-style dynamic route directories use literal `[param]` names;
+        // a bracket anywhere in the walk root must not be glob-reinterpreted.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("proj[x]");
+        std::fs::create_dir(&root).expect("mkdir");
+        std::fs::write(root.join("safe.json"), "").expect("write");
+
+        let pattern = format!("{}/*.json", root.display());
+        let result = expand_glob_path(&pattern).expect("ok");
+
+        assert_eq!(result, vec![root.join("safe.json")]);
+    }
+
+    #[test]
+    fn test_expand_glob_path_question_mark_in_suffix_errors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::write(root.join("fileA.json"), "").expect("write");
+
+        // '*' forces the code past the literal-passthrough early-return, into the
+        // globset-building branch; '?' there must be rejected, not silently
+        // treated as a single-char wildcard.
+        let pattern = format!("{}/file?.*", root.display());
+        expand_glob_path(&pattern).expect_err("must reject '?' as unsupported");
+    }
+
+    #[test]
+    fn test_expand_glob_path_bracket_class_in_suffix_errors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::write(root.join("fileA.json"), "").expect("write");
+
+        let pattern = format!("{}/file[A-Z]*.json", root.display());
+        expand_glob_path(&pattern).expect_err("must reject '[...]' as unsupported");
+    }
+
+    #[test]
+    fn test_expand_glob_path_literal_bracket_in_matched_filename() {
+        // A real file whose own name contains brackets/braces must still be
+        // matchable by a trailing `*` — the escaping must not break real matches.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::write(root.join("weird{name}.json"), "").expect("write");
+
+        let pattern = format!("{}/*.json", root.display());
+        let result = expand_glob_path(&pattern).expect("ok");
+
+        assert_eq!(result, vec![root.join("weird{name}.json")]);
     }
 }

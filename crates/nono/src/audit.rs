@@ -1950,4 +1950,212 @@ mod tests {
             )
         );
     }
+
+    /// Golden vectors for each `AuditEventPayload` variant, shared with nono-py.
+    ///
+    /// Each case pins the exact JSON emitted by `serde_json::to_string` and the
+    /// corresponding alpha leaf hash.  If this test fails the wire format diverged
+    /// across language bindings -- fix the divergence, never the vector.
+    ///
+    /// Companion test in nono-py: `tests/test_audit.py::TestAuditEventPayloadGoldenVectors`
+    #[test]
+    fn audit_event_payload_golden_vectors() {
+        use crate::AccessMode;
+        use crate::supervisor::{ApprovalDecision, ApprovalRequest, UrlOpenRequest};
+        use crate::undo::{NetworkAuditDecision, NetworkAuditEvent, NetworkAuditMode};
+        use std::path::PathBuf;
+        use std::time::{Duration, UNIX_EPOCH};
+
+        fn check(
+            label: &str,
+            payload: &AuditEventPayload,
+            expected_json: &str,
+            expected_leaf: &str,
+        ) {
+            let json = serde_json::to_string(payload).unwrap();
+            assert_eq!(json, expected_json, "{label}: JSON mismatch");
+            let leaf = hash_event(json.as_bytes());
+            assert_eq!(
+                leaf.to_string(),
+                expected_leaf,
+                "{label}: leaf hash mismatch"
+            );
+        }
+
+        check(
+            "SessionStarted",
+            &AuditEventPayload::SessionStarted {
+                started: "2026-04-21T20:00:00Z".to_string(),
+                command: vec!["claude".to_string()],
+                redaction_policy: None,
+            },
+            r#"{"type":"session_started","started":"2026-04-21T20:00:00Z","command":["claude"]}"#,
+            "c33fec3894d439b2cb313e7b24d142d8a87ce4e839e8c8e66851d14ad7595c69",
+        );
+
+        check(
+            "SessionEnded",
+            &AuditEventPayload::SessionEnded {
+                ended: "2026-04-21T20:00:01Z".to_string(),
+                exit_code: 0,
+            },
+            r#"{"type":"session_ended","ended":"2026-04-21T20:00:01Z","exit_code":0}"#,
+            "076e559e44135ff9a3d27403d1d6ad389bb04542956a064fc23acb37824c70bb",
+        );
+
+        // Note: AuditEntry.timestamp (SystemTime) serializes as
+        // {"secs_since_epoch":N,"nanos_since_epoch":M}.  ApprovalDecision uses
+        // untagged enum serialization, producing {"Denied":{"reason":"..."}}.
+        check(
+            "CapabilityDecision",
+            &AuditEventPayload::CapabilityDecision {
+                entry: crate::supervisor::AuditEntry {
+                    timestamp: UNIX_EPOCH + Duration::from_secs(5),
+                    request: ApprovalRequest::Capability {
+                        request_id: "req-1".to_string(),
+                        path: PathBuf::from("/tmp/example"),
+                        access: AccessMode::ReadWrite,
+                        reason: Some("need scratch space".to_string()),
+                        child_pid: 42,
+                        session_id: "sess-1".to_string(),
+                    },
+                    decision: ApprovalDecision::Denied {
+                        reason: "outside policy".to_string(),
+                    },
+                    backend: "terminal".to_string(),
+                    duration_ms: 12,
+                },
+            },
+            concat!(
+                r#"{"type":"capability_decision","entry":{"timestamp":{"secs_since_epoch":5,"nanos_since_epoch":0},"#,
+                r#""request":{"capability_type":"capability","request_id":"req-1","path":"/tmp/example","#,
+                r#""access":"ReadWrite","reason":"need scratch space","child_pid":42,"session_id":"sess-1"},"#,
+                r#""decision":{"Denied":{"reason":"outside policy"}},"backend":"terminal","duration_ms":12}}"#,
+            ),
+            "fb0ff01abb9de69f3c50deb6b828a25d941d7541856d81b8fa3da84b95aa125a",
+        );
+
+        // Note: UrlOpen.error has no skip_serializing_if, so None serializes as null.
+        check(
+            "UrlOpen",
+            &AuditEventPayload::UrlOpen {
+                request: UrlOpenRequest {
+                    request_id: "open-1".to_string(),
+                    url: "https://example.com/callback".to_string(),
+                    child_pid: 42,
+                    session_id: "sess-1".to_string(),
+                },
+                success: true,
+                error: None,
+            },
+            concat!(
+                r#"{"type":"url_open","request":{"request_id":"open-1","#,
+                r#""url":"https://example.com/callback","child_pid":42,"session_id":"sess-1"},"#,
+                r#""success":true,"error":null}"#,
+            ),
+            "ce74e0fa39cd9c9f74ba3eaf509cf88d2b39b771360f646fae3e385c1ca37f2d",
+        );
+
+        check(
+            "Network",
+            &AuditEventPayload::Network {
+                event: Box::new(NetworkAuditEvent {
+                    timestamp_unix_ms: 5,
+                    mode: NetworkAuditMode::Reverse,
+                    decision: NetworkAuditDecision::Deny,
+                    route_id: None,
+                    auth_mechanism: None,
+                    auth_outcome: None,
+                    managed_credential_active: None,
+                    injection_mode: None,
+                    denial_category: None,
+                    endpoint_policy_action: None,
+                    endpoint_policy_rule: None,
+                    approval_backend: None,
+                    credential_capture_action: None,
+                    credential_capture_name: None,
+                    credential_capture_command: None,
+                    credential_capture_argv: None,
+                    credential_capture_exit_status: None,
+                    credential_capture_duration_ms: None,
+                    credential_capture_stdout_bytes: None,
+                    credential_capture_stderr: None,
+                    credential_capture_cache_scope: None,
+                    credential_capture_output_format: None,
+                    credential_capture_header_names: None,
+                    credential_capture_stdin_mode: None,
+                    credential_capture_interactive: None,
+                    spiffe_context: None,
+                    target: "api.example.com".to_string(),
+                    upstream: None,
+                    port: Some(443),
+                    method: Some("POST".to_string()),
+                    path: Some("/v1/chat".to_string()),
+                    status: Some(403),
+                    reason: Some("policy".to_string()),
+                }),
+            },
+            concat!(
+                r#"{"type":"network","event":{"timestamp_unix_ms":5,"mode":"reverse","decision":"deny","#,
+                r#""target":"api.example.com","port":443,"method":"POST","path":"/v1/chat","status":403,"reason":"policy"}}"#,
+            ),
+            "629b456dfbf72482f4c68050d40978bdd644947584605f1df4d39346b67875f8",
+        );
+
+        check(
+            "SandboxRuntime",
+            &AuditEventPayload::SandboxRuntime {
+                event: SandboxRuntimeAuditEvent {
+                    timestamp: "2026-04-21T20:00:00Z".to_string(),
+                    platform: "macOS".to_string(),
+                    landlock_abi: None,
+                    landlock_execute_enforced: None,
+                    tool_sandbox_active: false,
+                },
+            },
+            concat!(
+                r#"{"type":"sandbox_runtime","event":{"timestamp":"2026-04-21T20:00:00Z","#,
+                r#""platform":"macOS","tool_sandbox_active":false}}"#,
+            ),
+            "de97a52ba94e3201c97dc53ebc51e901ef7b3c965c6bb336365e2fa367522109",
+        );
+
+        // Note: CommandPolicy.reason has no skip_serializing_if, so None -> null.
+        // env_display uses skip_serializing_if = "Vec::is_empty" so [] is omitted.
+        check(
+            "CommandPolicy",
+            &AuditEventPayload::CommandPolicy {
+                event: Box::new(CommandPolicyAuditEvent {
+                    timestamp: "2026-04-21T20:00:00Z".to_string(),
+                    session_id: Some("sess-1".to_string()),
+                    command: "git".to_string(),
+                    caller: "session".to_string(),
+                    caller_kind: None,
+                    caller_command: None,
+                    caller_pid: None,
+                    shim_pid: None,
+                    session_root_pid: None,
+                    decision: "allow".to_string(),
+                    reason: None,
+                    stdio_mode: "piped".to_string(),
+                    argv_hash: "aabbcc".to_string(),
+                    env_name_hash: "ddeeff".to_string(),
+                    cwd_hash: "001122".to_string(),
+                    argv_display: vec!["git".to_string(), "status".to_string()],
+                    env_names_display: vec![],
+                    env_display: vec![],
+                    cwd_display: "/home/user".to_string(),
+                    exit_code: Some(0),
+                    stdio: None,
+                }),
+            },
+            concat!(
+                r#"{"type":"command_policy","event":{"timestamp":"2026-04-21T20:00:00Z","session_id":"sess-1","#,
+                r#""command":"git","caller":"session","decision":"allow","reason":null,"stdio_mode":"piped","#,
+                r#""argv_hash":"aabbcc","env_name_hash":"ddeeff","cwd_hash":"001122","#,
+                r#""argv_display":["git","status"],"env_names_display":[],"cwd_display":"/home/user","exit_code":0}}"#,
+            ),
+            "ae7caf84865bfd686729a67a04fc3fd6af72dbd700eb77403d9f338491c4815d",
+        );
+    }
 }

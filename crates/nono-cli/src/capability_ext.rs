@@ -18,6 +18,17 @@ fn expand_path(template: &str, workdir: &Path) -> nono::Result<PathBuf> {
     let after_env = policy::expand_env_vars(template);
     expand_vars(&after_env, workdir)
 }
+
+/// Root a glob pattern at `workdir` if it has no absolute prefix.
+/// Patterns like `**/.env` have no leading `/`, so `expand_glob_path`
+/// would walk from the process working directory instead of the sandbox workdir.
+fn abs_glob(raw: &str, workdir: &Path) -> String {
+    if raw.starts_with('/') {
+        raw.to_string()
+    } else {
+        format!("{}/{}", workdir.display(), raw)
+    }
+}
 use nono::{
     AccessMode, CapabilitySet, CapabilitySource, FsCapability, NonoError, Result, SocketScope,
     UnixSocketCapability, UnixSocketMode,
@@ -674,73 +685,53 @@ impl CapabilitySetExt for CapabilitySet {
         // representing the project workspace are tracked).
         let fs = &profile.filesystem;
 
-        // Directories with read+write access
-        let allow_expanded = expand_dynamic_tokens(&fs.allow, Some(workdir))?;
-        for path_template in &allow_expanded {
-            let path = expand_path(path_template, workdir)?;
-            validate_requested_dir(
-                &path,
-                "Profile",
-                &protected_roots,
-                allow_parent_of_protected,
-            )?;
-            let label = format!("Profile path '{}' does not exist, skipping", path_template);
-            if let Some(mut cap) = try_new_dir(&path, AccessMode::ReadWrite, &label)? {
-                cap.source = CapabilitySource::Profile;
-                caps.add_fs(cap);
+        // Expand a list of path templates (may contain globs) and add a filesystem
+        // capability for each resolved path, dispatching file vs dir automatically.
+        let mut add_fs_paths = |templates: &[String], mode: AccessMode| -> Result<()> {
+            let expanded = expand_dynamic_tokens(templates, Some(workdir))?;
+            for path_template in &expanded {
+                let pre = expand_path(path_template, workdir)?;
+                let pre_str = policy::path_to_utf8(&pre)?;
+                let paths = if pre_str.contains('*') {
+                    policy::expand_glob_path(&abs_glob(pre_str, workdir))?
+                } else {
+                    vec![pre]
+                };
+                for path in paths {
+                    let label =
+                        format!("Profile path '{}' does not exist, skipping", path_template);
+                    let is_file = std::fs::metadata(&path)
+                        .map(|m| !m.is_dir())
+                        .unwrap_or(false);
+                    let maybe_cap = if is_file {
+                        validate_requested_file(
+                            &path,
+                            "Profile",
+                            &protected_roots,
+                            allow_parent_of_protected,
+                        )?;
+                        try_new_file(&path, mode, &label)?
+                    } else {
+                        validate_requested_dir(
+                            &path,
+                            "Profile",
+                            &protected_roots,
+                            allow_parent_of_protected,
+                        )?;
+                        try_new_dir(&path, mode, &label)?
+                    };
+                    if let Some(mut cap) = maybe_cap {
+                        cap.source = CapabilitySource::Profile;
+                        caps.add_fs(cap);
+                    }
+                }
             }
-        }
+            Ok(())
+        };
 
-        // Read-only filesystem entries (directory or file)
-        let read_expanded = expand_dynamic_tokens(&fs.read, Some(workdir))?;
-        for path_template in &read_expanded {
-            let path = expand_path(path_template, workdir)?;
-            let label = format!("Profile path '{}' does not exist, skipping", path_template);
-
-            let reads_file = std::fs::metadata(&path)
-                .map(|metadata| !metadata.is_dir())
-                .unwrap_or(false);
-
-            let maybe_cap = if reads_file {
-                validate_requested_file(
-                    &path,
-                    "Profile",
-                    &protected_roots,
-                    allow_parent_of_protected,
-                )?;
-                try_new_file(&path, AccessMode::Read, &label)?
-            } else {
-                validate_requested_dir(
-                    &path,
-                    "Profile",
-                    &protected_roots,
-                    allow_parent_of_protected,
-                )?;
-                try_new_dir(&path, AccessMode::Read, &label)?
-            };
-
-            if let Some(mut cap) = maybe_cap {
-                cap.source = CapabilitySource::Profile;
-                caps.add_fs(cap);
-            }
-        }
-
-        // Directories with write-only access
-        let write_expanded = expand_dynamic_tokens(&fs.write, Some(workdir))?;
-        for path_template in &write_expanded {
-            let path = expand_path(path_template, workdir)?;
-            validate_requested_dir(
-                &path,
-                "Profile",
-                &protected_roots,
-                allow_parent_of_protected,
-            )?;
-            let label = format!("Profile path '{}' does not exist, skipping", path_template);
-            if let Some(mut cap) = try_new_dir(&path, AccessMode::Write, &label)? {
-                cap.source = CapabilitySource::Profile;
-                caps.add_fs(cap);
-            }
-        }
+        add_fs_paths(&fs.allow, AccessMode::ReadWrite)?;
+        add_fs_paths(&fs.read, AccessMode::Read)?;
+        add_fs_paths(&fs.write, AccessMode::Write)?;
 
         // Single files with read+write access
         let allow_file_expanded = expand_dynamic_tokens(&fs.allow_file, Some(workdir))?;
@@ -988,13 +979,16 @@ impl CapabilitySetExt for CapabilitySet {
         let deny_expanded = expand_dynamic_tokens(&profile.filesystem.deny, Some(workdir))?;
         for path_template in &deny_expanded {
             let path = expand_path(path_template, workdir)?;
-            let path_str = path.to_str().ok_or_else(|| {
-                NonoError::ConfigParse(format!(
-                    "Profile filesystem deny path contains non-UTF-8 bytes: {}",
-                    path.display()
-                ))
-            })?;
-            policy::add_deny_access_rules(path_str, &mut caps, &mut resolved.deny_paths)?;
+            let path_str = policy::path_to_utf8(&path)?;
+            if path_str.contains('*') {
+                policy::add_glob_deny_rules(
+                    &abs_glob(path_str, workdir),
+                    &mut caps,
+                    &mut resolved.deny_paths,
+                )?;
+            } else {
+                policy::add_deny_access_rules(path_str, &mut caps, &mut resolved.deny_paths)?;
+            }
         }
 
         for cmd in &profile.commands.deny {
@@ -1076,17 +1070,25 @@ impl CapabilitySetExt for CapabilitySet {
             expand_dynamic_tokens(&profile.filesystem.bypass_protection, Some(workdir))?;
         let mut profile_overrides = Vec::with_capacity(bypass_expanded.len());
         for path_template in &bypass_expanded {
-            let path = expand_path(path_template, workdir)?;
-            if path.exists() {
-                profile_overrides.push(path);
+            let pre = expand_path(path_template, workdir)?;
+            let pre_str = policy::path_to_utf8(&pre)?;
+            let paths = if pre_str.contains('*') {
+                policy::expand_glob_path(&abs_glob(pre_str, workdir))?
             } else {
-                tracing::warn!(
-                    "filesystem.bypass_protection entry {path_template:?} expanded to \
-                     {} which does not exist on this system; skipping. The deny rule \
-                     remains in force. If you meant to bypass a deny on this path, \
-                     check for typos or platform-specific path differences.",
-                    path.display()
-                );
+                vec![pre]
+            };
+            for path in paths {
+                if path.exists() {
+                    profile_overrides.push(path);
+                } else {
+                    tracing::warn!(
+                        "filesystem.bypass_protection entry {path_template:?} expanded to \
+                         {} which does not exist on this system; skipping. The deny rule \
+                         remains in force. If you meant to bypass a deny on this path, \
+                         check for typos or platform-specific path differences.",
+                        path.display()
+                    );
+                }
             }
         }
 
@@ -1761,6 +1763,177 @@ mod tests {
         assert_eq!(read_cap.access, AccessMode::Read);
         assert_eq!(write_cap.access, AccessMode::Write);
         assert_eq!(rw_cap.access, AccessMode::ReadWrite);
+    }
+
+    #[test]
+    fn test_from_profile_glob_allow_expands_to_matching_dirs() {
+        let dir = tempdir().expect("tmpdir");
+        let a = dir.path().join("pkg-a");
+        let b = dir.path().join("pkg-b");
+        let other = dir.path().join("pkg-a-extra");
+        std::fs::create_dir_all(&a).expect("mkdir a");
+        std::fs::create_dir_all(&b).expect("mkdir b");
+        std::fs::create_dir_all(&other).expect("mkdir other");
+
+        let pattern_star = format!("{}/pkg-*", dir.path().display());
+
+        let profile_path = dir.path().join("glob-allow.json");
+        std::fs::write(
+            &profile_path,
+            format!(
+                r#"{{"meta":{{"name":"glob-allow"}},"filesystem":{{"allow":["{}"]}}}}"#,
+                pattern_star
+            ),
+        )
+        .expect("write profile");
+        let profile = crate::profile::load_profile_from_path(&profile_path).expect("load");
+        let workdir = tempdir().expect("workdir");
+        let (caps, _) =
+            from_profile_locked(&profile, workdir.path(), &sandbox_args()).expect("build caps");
+
+        let a_canon = a.canonicalize().expect("canon a");
+        let b_canon = b.canonicalize().expect("canon b");
+        let other_canon = other.canonicalize().expect("canon other");
+        let granted: Vec<_> = caps
+            .fs_capabilities()
+            .iter()
+            .filter(|c| c.access == AccessMode::ReadWrite && !c.is_file)
+            .map(|c| c.resolved.clone())
+            .collect();
+
+        assert!(granted.contains(&a_canon), "pkg-a should be granted");
+        assert!(granted.contains(&b_canon), "pkg-b should be granted");
+        assert!(
+            granted.contains(&other_canon),
+            "pkg-a-extra should also match pkg-*"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_from_profile_glob_allow_does_not_grant_symlink_escape_target() {
+        let secret = tempdir().expect("secret dir");
+        std::fs::write(secret.path().join("id_rsa"), b"private").expect("write secret");
+
+        let dir = tempdir().expect("tmpdir");
+        std::os::unix::fs::symlink(secret.path(), dir.path().join("escape")).expect("symlink");
+
+        let pattern = format!("{}/**", dir.path().display());
+        let profile_path = dir.path().join("glob-allow-escape.json");
+        std::fs::write(
+            &profile_path,
+            format!(
+                r#"{{"meta":{{"name":"glob-allow-escape"}},"filesystem":{{"allow":["{}"]}}}}"#,
+                pattern
+            ),
+        )
+        .expect("write profile");
+        let profile = crate::profile::load_profile_from_path(&profile_path).expect("load");
+        let workdir = tempdir().expect("workdir");
+        let (caps, _) =
+            from_profile_locked(&profile, workdir.path(), &sandbox_args()).expect("build caps");
+
+        let secret_canon = secret.path().canonicalize().expect("canon secret");
+        let granted_outside_root: Vec<_> = caps
+            .fs_capabilities()
+            .iter()
+            .filter(|c| c.resolved.starts_with(&secret_canon))
+            .collect();
+
+        assert!(
+            granted_outside_root.is_empty(),
+            "symlink escape granted access outside root: {granted_outside_root:?}"
+        );
+    }
+
+    #[test]
+    fn test_from_profile_glob_read_expands_matching_files_and_dirs() {
+        let dir = tempdir().expect("tmpdir");
+        let subdir = dir.path().join("config");
+        std::fs::create_dir_all(&subdir).expect("mkdir config");
+        std::fs::write(subdir.join("app.toml"), b"").expect("write app.toml");
+        std::fs::write(subdir.join("db.toml"), b"").expect("write db.toml");
+        std::fs::write(subdir.join("ignore.json"), b"").expect("write ignore.json");
+
+        let pattern = format!("{}/*.toml", subdir.display());
+        let profile_path = dir.path().join("glob-read.json");
+        std::fs::write(
+            &profile_path,
+            format!(
+                r#"{{"meta":{{"name":"glob-read"}},"filesystem":{{"read":["{}"]}}}}"#,
+                pattern
+            ),
+        )
+        .expect("write profile");
+        let profile = crate::profile::load_profile_from_path(&profile_path).expect("load");
+        let workdir = tempdir().expect("workdir");
+        let (caps, _) =
+            from_profile_locked(&profile, workdir.path(), &sandbox_args()).expect("build caps");
+
+        let app_canon = subdir.join("app.toml").canonicalize().expect("canon app");
+        let db_canon = subdir.join("db.toml").canonicalize().expect("canon db");
+        let json_canon = subdir
+            .join("ignore.json")
+            .canonicalize()
+            .expect("canon json");
+        let read_files: Vec<_> = caps
+            .fs_capabilities()
+            .iter()
+            .filter(|c| c.access == AccessMode::Read && c.is_file)
+            .map(|c| c.resolved.clone())
+            .collect();
+
+        assert!(
+            read_files.contains(&app_canon),
+            "app.toml should be granted"
+        );
+        assert!(read_files.contains(&db_canon), "db.toml should be granted");
+        assert!(
+            !read_files.contains(&json_canon),
+            "ignore.json must not match *.toml"
+        );
+    }
+
+    #[test]
+    fn test_from_profile_glob_write_expands_matching_dirs() {
+        let dir = tempdir().expect("tmpdir");
+        // Put target dirs in a subdirectory so the profile JSON doesn't match the glob.
+        let target = dir.path().join("target");
+        let logs = target.join("logs");
+        let tmp = target.join("tmp");
+        let src = target.join("src");
+        std::fs::create_dir_all(&logs).expect("mkdir logs");
+        std::fs::create_dir_all(&tmp).expect("mkdir tmp");
+        std::fs::create_dir_all(&src).expect("mkdir src");
+
+        let pattern_star = format!("{}/*", target.display());
+        let profile_path = dir.path().join("glob-write.json");
+        std::fs::write(
+            &profile_path,
+            format!(
+                r#"{{"meta":{{"name":"glob-write"}},"filesystem":{{"write":["{}"]}}}}"#,
+                pattern_star
+            ),
+        )
+        .expect("write profile");
+        let profile = crate::profile::load_profile_from_path(&profile_path).expect("load");
+        let workdir = tempdir().expect("workdir");
+        let (caps, _) =
+            from_profile_locked(&profile, workdir.path(), &sandbox_args()).expect("build caps");
+
+        let write_dirs: Vec<_> = caps
+            .fs_capabilities()
+            .iter()
+            .filter(|c| c.access == AccessMode::Write && !c.is_file)
+            .map(|c| c.resolved.clone())
+            .collect();
+
+        let logs_canon = logs.canonicalize().expect("canon logs");
+        let tmp_canon = tmp.canonicalize().expect("canon tmp");
+        let src_canon = src.canonicalize().expect("canon src");
+        assert!(write_dirs.contains(&logs_canon), "logs should be granted");
+        assert!(write_dirs.contains(&tmp_canon), "tmp should be granted");
+        assert!(write_dirs.contains(&src_canon), "src should also match /*");
     }
 
     /// Regression test for the `--allow-cwd` deny-bypass bug.

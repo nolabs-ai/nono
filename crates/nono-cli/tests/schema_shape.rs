@@ -115,6 +115,7 @@ fn test_schema_top_level_profile_matches_rust_model() {
             "credential_capture",
             "credential_providers",
             "credential_routes",
+            "oauth_capture_store_backend",
             "workdir",
             "hooks",
             "session_hooks",

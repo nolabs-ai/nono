@@ -8507,6 +8507,31 @@ mod tests {
     }
 
     #[test]
+    fn test_schema_validates_oauth_capture_store_backend() {
+        for backend in ["auto", "file", "keychain"] {
+            let json = format!(
+                r#"{{
+                    "meta": {{ "name": "oauth-capture-backend" }},
+                    "oauth_capture_store_backend": "{backend}"
+                }}"#
+            );
+            validate_against_schema(&json).unwrap_or_else(|e| {
+                panic!("backend '{backend}' should pass schema validation: {e}")
+            });
+        }
+    }
+
+    #[test]
+    fn test_schema_rejects_invalid_oauth_capture_store_backend() {
+        let json = r#"{
+            "meta": { "name": "oauth-capture-backend-invalid" },
+            "oauth_capture_store_backend": "not-a-real-backend"
+        }"#;
+        validate_against_schema(json)
+            .expect_err("unknown oauth_capture_store_backend value should fail schema validation");
+    }
+
+    #[test]
     fn test_schema_rejects_extends_empty_array() {
         let json = r#"{
             "extends": [],

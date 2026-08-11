@@ -18,7 +18,7 @@ pub(super) struct PersistedOAuthStore {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(super) struct PersistedOAuthToken {
-    pub(super) real: String,
+    pub(super) real: Zeroizing<String>,
     #[serde(default)]
     pub(super) admitted_consumers: Vec<String>,
     #[serde(default = "now_secs")]
@@ -39,18 +39,27 @@ pub(super) fn decode_tokens(raw: &[u8]) -> Result<HashMap<String, StoredOAuthTok
         tokens.insert(
             phantom,
             StoredOAuthToken {
-                real: Zeroizing::new(token.real.into_bytes()),
+                real: Zeroizing::new(token.real.as_bytes().to_vec()),
                 admitted_consumers: token.admitted_consumers.into_iter().collect(),
                 created_at_secs: token.created_at_secs,
             },
         );
+        // `token.real` (a `Zeroizing<String>`) is dropped here, scrubbing the
+        // intermediate copy now that its bytes have been re-wrapped above.
     }
     Ok(tokens)
 }
 
 /// Encode the in-memory phantom map into the `PersistedOAuthStore` JSON
 /// payload shared by the file and macOS Keychain backends.
-pub(super) fn encode_tokens(tokens: &HashMap<String, StoredOAuthToken>) -> Result<Vec<u8>> {
+///
+/// Both the intermediate `PersistedOAuthStore`/`PersistedOAuthToken` and the
+/// returned serialized buffer hold real token material, so the buffer is
+/// `Zeroizing`-wrapped and `persisted` is dropped (scrubbing its
+/// `Zeroizing<String>` fields) before returning.
+pub(super) fn encode_tokens(
+    tokens: &HashMap<String, StoredOAuthToken>,
+) -> Result<Zeroizing<Vec<u8>>> {
     let mut persisted = PersistedOAuthStore {
         version: 1,
         tokens: HashMap::new(),
@@ -62,14 +71,16 @@ pub(super) fn encode_tokens(tokens: &HashMap<String, StoredOAuthToken>) -> Resul
         persisted.tokens.insert(
             phantom.clone(),
             PersistedOAuthToken {
-                real: real.to_string(),
+                real: Zeroizing::new(real.to_string()),
                 admitted_consumers: token.admitted_consumers.iter().cloned().collect(),
                 created_at_secs: token.created_at_secs,
             },
         );
     }
-    serde_json::to_vec_pretty(&persisted)
-        .map_err(|err| ProxyError::Config(format!("failed to encode OAuth capture store: {err}")))
+    let raw = serde_json::to_vec_pretty(&persisted)
+        .map_err(|err| ProxyError::Config(format!("failed to encode OAuth capture store: {err}")));
+    drop(persisted);
+    Ok(Zeroizing::new(raw?))
 }
 
 pub(super) fn load_persisted_tokens(path: &Path) -> Result<HashMap<String, StoredOAuthToken>> {

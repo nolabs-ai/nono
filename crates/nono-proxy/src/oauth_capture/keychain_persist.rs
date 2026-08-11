@@ -118,6 +118,20 @@ struct KeychainEnvelope {
     nono_path: Option<String>,
 }
 
+/// Resolve the running nono binary's path for staleness comparison and ACL
+/// binding.
+///
+/// Canonicalizes away symlinks (best-effort) so that launching nono via a
+/// symlink vs. its resolved target — or vice versa on a later run — compares
+/// equal instead of looking like a binary-path mismatch. An uncanonicalizable
+/// path (e.g. the binary was deleted or replaced mid-run) falls back to the
+/// raw `current_exe()` path rather than failing the caller.
+fn resolved_exe_path() -> Result<std::path::PathBuf> {
+    let exe_path = std::env::current_exe()
+        .map_err(|e| ProxyError::Keystore(format!("resolve nono binary path: {e}")))?;
+    Ok(std::fs::canonicalize(&exe_path).unwrap_or(exe_path))
+}
+
 /// Load the persisted phantom map from the Keychain, or an empty map if no
 /// entry exists or the entry is stale (binary-path mismatch).
 ///
@@ -136,8 +150,7 @@ pub(super) fn load_persisted_tokens() -> Result<HashMap<String, StoredOAuthToken
         ))
     })?;
 
-    let exe_path = std::env::current_exe()
-        .map_err(|err| ProxyError::Keystore(format!("resolve nono binary path: {err}")))?;
+    let exe_path = resolved_exe_path()?;
     let is_stale = match envelope.nono_path.as_deref() {
         Some(saved_path) => saved_path != exe_path.to_string_lossy(),
         None => true,
@@ -163,8 +176,7 @@ pub(super) fn persist_tokens(tokens: &HashMap<String, StoredOAuthToken>) -> Resu
         ProxyError::Keystore(format!("failed to encode OAuth capture store: {err}"))
     })?;
 
-    let exe_path = std::env::current_exe()
-        .map_err(|err| ProxyError::Keystore(format!("resolve nono binary path: {err}")))?;
+    let exe_path = resolved_exe_path()?;
     let envelope = KeychainEnvelope {
         store,
         nono_path: Some(exe_path.to_string_lossy().into_owned()),
@@ -345,8 +357,7 @@ fn save_with_nono_acl(service: &str, account: &str, payload: &Zeroizing<String>)
     };
     use security_framework_sys::keychain_item::SecItemAdd;
 
-    let exe_path = std::env::current_exe()
-        .map_err(|e| ProxyError::Keystore(format!("resolve nono binary path: {e}")))?;
+    let exe_path = resolved_exe_path()?;
 
     let access = create_nono_access(&exe_path)?;
 

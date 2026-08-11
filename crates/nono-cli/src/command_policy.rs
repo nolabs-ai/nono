@@ -696,13 +696,27 @@ const OAUTH_CAPTURE_SECURITY_COMMAND: &str = "security";
 ///
 /// `keychain_active` is `true` only when the Keychain backend is actually in
 /// use (macOS + at least one `oauth_capture` provider + backend not forced to
-/// `file`); the caller computes it. When active, the resolved profile MUST
-/// already define a `security` command policy with a session sandbox — a
-/// mediated command with no session sandbox is unreachable by the agent, which
-/// would break *every* `security` call, not just the refused account read.
-/// Rather than silently break `security` or guess a sandbox for it, this fails
-/// closed with an actionable error (opt out with `oauth_capture_store_backend
-/// = "file"`).
+/// `file`); the caller computes it.
+///
+/// This mediation only exists for profiles that already run the tool-sandbox
+/// subsystem (i.e. `command_policies.is_active()` is already `true` from the
+/// profile's own configuration). A profile that has never opted into
+/// tool-sandboxing has no mediation of subprocess `security` calls at all
+/// today, mediated or otherwise, so there is nothing to derive: synthesizing
+/// a `commands.security` entry purely to add this protection would itself
+/// flip `is_active()` to `true` and start blocking every other unconfigured
+/// command the agent tries to run — a much bigger behavior change than
+/// "protect this one Keychain item". In that case the entry's `SecAccess` ACL
+/// (see `keychain_persist.rs`) remains the sole protection layer: a
+/// `security` subprocess not in the ACL still triggers a visible Allow/Deny
+/// dialog rather than a silent read.
+///
+/// When tool-sandboxing IS already active, the resolved profile MUST define a
+/// `security` command policy with a session sandbox — a mediated command with
+/// no session sandbox is unreachable by the agent, which would break *every*
+/// `security` call, not just the refused account read. Rather than silently
+/// break `security` or guess a sandbox for it, this fails closed with an
+/// actionable error (opt out with `oauth_capture_store_backend = "file"`).
 ///
 /// On success it prepends a first-match intercept rule that returns empty
 /// output for reads of the `oauth_capture_store` account, leaving all other
@@ -712,6 +726,13 @@ pub(crate) fn derive_oauth_capture_security_mediation(
     keychain_active: bool,
 ) -> nono::Result<()> {
     if !keychain_active {
+        return Ok(());
+    }
+
+    if !command_policies
+        .as_ref()
+        .is_some_and(CommandPoliciesConfig::is_active)
+    {
         return Ok(());
     }
 
@@ -3440,10 +3461,30 @@ mod tests {
     }
 
     #[test]
-    fn derive_security_mediation_fails_closed_without_security_policy() {
+    fn derive_security_mediation_is_noop_when_tool_sandbox_inactive() {
+        // Tool-sandboxing was never opted into (empty `commands`), so there is
+        // nothing to mediate — synthesizing a `security` entry here would
+        // itself activate the whole subsystem and start blocking every other
+        // unconfigured command.
         let mut policies = Some(CommandPoliciesConfig::default());
+        derive_oauth_capture_security_mediation(&mut policies, true)
+            .expect("inactive tool-sandbox must not fail closed");
+        assert_eq!(
+            policies,
+            Some(CommandPoliciesConfig::default()),
+            "inactive tool-sandbox must not synthesize a security policy"
+        );
+    }
+
+    #[test]
+    fn derive_security_mediation_fails_closed_when_active_without_security_policy() {
+        // Tool-sandboxing is already active (via `git`), so the profile is
+        // already sandboxing subprocesses; a missing `security` policy in
+        // that case is an actionable misconfiguration, not something to
+        // silently skip.
+        let mut policies = Some(active_git_config());
         let err = derive_oauth_capture_security_mediation(&mut policies, true)
-            .expect_err("no security policy must fail closed");
+            .expect_err("no security policy must fail closed when tool-sandbox is active");
         assert!(err.to_string().contains("oauth_capture_store"));
     }
 

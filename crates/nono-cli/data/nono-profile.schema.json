@@ -72,6 +72,11 @@
       "$ref": "#/$defs/CommandPoliciesConfig",
       "description": "tool-sandbox command-control policy. tool-sandbox activates only when commands is non-empty; broker-mediated enforcement is available on Linux and macOS, with platform-specific capability limits."
     },
+    "oauth_capture_store_backend": {
+      "type": "string",
+      "enum": ["auto", "file", "keychain"],
+      "description": "Persistence backend for the OAuth-capture phantom-token store. 'auto' (default) resolves to an ACL-restricted macOS Keychain item on macOS and the plaintext providers.json file elsewhere. 'file' forces the plaintext file backend on every platform. 'keychain' forces the Keychain backend on macOS (file backend on other platforms)."
+    },
     "workdir": {
       "$ref": "#/$defs/WorkdirConfig",
       "description": "Working directory access configuration controlling whether and how the current working directory is shared with the sandboxed process."

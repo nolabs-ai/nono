@@ -2,11 +2,9 @@
 
 use crate::cli::{AuditStatusArgs, AuditSyncArgs};
 use crate::platform_client::{
-    PlatformState, REQUEST_PROTOCOL_V1, canonical_request_v1, endpoint_url, http_agent,
-    load_signing_key, load_state, write_json_secure,
+    PlatformState, REQUEST_PROTOCOL_V1, endpoint_url, http_agent, load_state, sign_request_v1,
+    write_json_secure,
 };
-use aws_lc_rs::rand::SystemRandom;
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use nono::audit::{
     AUDIT_EVENTS_FILENAME, canonical_session_digest_payload, compute_session_digest,
     verify_audit_log,
@@ -14,11 +12,10 @@ use nono::audit::{
 use nono::undo::{SessionMetadata, SnapshotManager};
 use nono::{NonoError, Result};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use uuid::Uuid;
 
 const OUTBOX_DIRNAME: &str = "audit-outbox";
@@ -328,21 +325,13 @@ fn deliver_queued(state: &PlatformState, path: &Path, queued: &QueuedAudit) -> R
         .path()
         .to_string();
     let body = queued.wire_body()?;
-    let body_digest = format!("sha256:{}", sha256_hex(body.as_bytes()));
-    let timestamp = current_timestamp_ms()?.to_string();
-    let request_id = queued.ingest_id().to_string();
-    let canonical = canonical_request_v1(
+    let signed = sign_request_v1(
+        state,
         "POST",
         &request_path,
-        &state.subject_id,
-        &timestamp,
-        &request_id,
-        &body_digest,
-    );
-    let key_pair = load_signing_key(state)?;
-    let signature = key_pair
-        .sign(&SystemRandom::new(), canonical.as_bytes())
-        .map_err(|_| NonoError::KeystoreAccess("failed to sign audit request".to_string()))?;
+        queued.ingest_id(),
+        body.as_bytes(),
+    )?;
 
     let mut response = http_agent(Duration::from_secs(15))
         .post(&endpoint)
@@ -352,13 +341,10 @@ fn deliver_queued(state: &PlatformState, path: &Path, queued: &QueuedAudit) -> R
         .header("Content-Type", "application/json")
         .header("X-Nono-Protocol-Version", REQUEST_PROTOCOL_V1)
         .header("X-Nono-Subject-Id", &state.subject_id)
-        .header("X-Nono-Timestamp", &timestamp)
-        .header("X-Nono-Request-Id", &request_id)
-        .header("X-Nono-Content-SHA256", &body_digest)
-        .header(
-            "X-Nono-Signature",
-            format!("p256-sha256={}", URL_SAFE_NO_PAD.encode(signature.as_ref())),
-        )
+        .header("X-Nono-Timestamp", &signed.timestamp)
+        .header("X-Nono-Request-Id", &signed.request_id)
+        .header("X-Nono-Content-SHA256", &signed.body_digest)
+        .header("X-Nono-Signature", &signed.signature)
         .send(&body)
         .map_err(|error| NonoError::Snapshot(format!("audit ingest request failed: {error}")))?;
     if !response.status().is_success() {
@@ -523,22 +509,6 @@ fn outbox_path(ingest_id: Uuid) -> Result<PathBuf> {
 
 fn outbox_dir() -> Result<PathBuf> {
     Ok(crate::state_paths::user_state_dir()?.join(OUTBOX_DIRNAME))
-}
-
-fn current_timestamp_ms() -> Result<u128> {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis())
-        .map_err(|error| NonoError::Snapshot(format!("system clock is before Unix epoch: {error}")))
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    let mut encoded = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        encoded.push_str(&format!("{byte:02x}"));
-    }
-    encoded
 }
 
 #[cfg(test)]

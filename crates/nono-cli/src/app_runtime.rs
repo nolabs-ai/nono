@@ -68,9 +68,34 @@ fn dispatch_command(
         Commands::Platform(args) => run_command_with_update(update_handle, silent, || {
             platform_client::run_platform(args)
         }),
-        Commands::Ps(args) => {
-            run_command_with_update(update_handle, silent, || session_commands::run_ps(&args))
-        }
+        Commands::Connect(args) => run_command_with_update(update_handle, silent, || {
+            #[cfg(unix)]
+            {
+                crate::connect_client::run_connect(args)
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = args;
+                Err(nono::NonoError::UnsupportedPlatform(
+                    "remote terminal attach currently requires a Unix terminal".to_string(),
+                ))
+            }
+        }),
+        Commands::Ps(args) => run_command_with_update(update_handle, silent, || {
+            if args.remote {
+                #[cfg(unix)]
+                {
+                    return crate::connect_client::run_remote_ps(&args);
+                }
+                #[cfg(not(unix))]
+                {
+                    return Err(nono::NonoError::UnsupportedPlatform(
+                        "remote session listing is not implemented on this platform".to_string(),
+                    ));
+                }
+            }
+            session_commands::run_ps(&args)
+        }),
         Commands::Stop(args) => {
             run_command_with_update(update_handle, silent, || session_commands::run_stop(&args))
         }

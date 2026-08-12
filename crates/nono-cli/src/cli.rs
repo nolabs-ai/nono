@@ -41,6 +41,7 @@ const STYLES: Styles = Styles::plain().header(Style::new().bold());
   stop       Stop a running sandbox session
   detach     Detach from an interactive runtime session
   attach     Attach to a detached runtime session
+  connect    Connect this terminal to a session hosted by nono-console
   logs       View runtime session event logs
   inspect    Show detailed runtime session state
   session    Manage runtime session storage
@@ -307,7 +308,7 @@ pub enum Commands {
 ")]
     Trust(TrustArgs),
 
-    /// List running sandboxed sessions
+    /// List local or remote sandboxed sessions
     #[command(help_template = "\
 {about}
 
@@ -322,6 +323,12 @@ pub enum Commands {
 
     # Show all sessions (including exited)
     nono ps --all
+
+    # Show sessions hosted by the enrolled tenant's nono-console
+    nono ps --remote
+
+    # Show all remote sessions as JSON
+    nono ps --remote --all --json
 
     # JSON output
     nono ps --json
@@ -399,6 +406,29 @@ IN-BAND DETACH:
 "
     )]
     Attach(AttachArgs),
+
+    /// Connect this terminal to a session hosted by nono-console
+    #[command(
+        help_template = "\
+{about}
+
+\x1b[1mUSAGE\x1b[0m
+  nono connect [session|url] [flags]
+
+{all-args}
+{after-help}",
+        after_help = "EXAMPLES:
+    # Discover the enrolled tenant's console, list live sessions, then choose one
+    nono connect
+
+    # Attach directly by global session ID
+    nono connect local:host:abc123
+
+    # Escape hatch: use a complete WebSocket attach URL
+    nono connect wss://console.example.com/api/v1/sessions/local:host:abc123/terminal
+"
+    )]
+    Connect(ConnectArgs),
 
     /// View event log for a session
     #[command(help_template = "\
@@ -2663,6 +2693,18 @@ pub enum SessionCommands {
 
 #[derive(Parser, Debug)]
 pub struct PsArgs {
+    /// List sessions hosted by the enrolled tenant's nono-console
+    #[arg(long)]
+    pub remote: bool,
+
+    /// nono-console origin override (valid only with --remote)
+    #[arg(long, requires = "remote")]
+    pub console: Option<String>,
+
+    /// Explicit console token-file override (valid only with --remote)
+    #[arg(long, value_name = "PATH", requires = "remote")]
+    pub token_file: Option<PathBuf>,
+
     /// Output as JSON
     #[arg(long)]
     pub json: bool,
@@ -2696,6 +2738,24 @@ pub struct DetachArgs {
 pub struct AttachArgs {
     /// Session ID, prefix, or name
     pub session: String,
+}
+
+#[derive(Parser, Debug)]
+pub struct ConnectArgs {
+    /// Session name/global ID, or a complete ws(s) terminal URL
+    pub target: Option<String>,
+
+    /// nono-console origin; defaults to signed discovery from device enrollment
+    #[arg(long, env = "NONO_CONSOLE_URL")]
+    pub console: Option<String>,
+
+    /// Explicit token-file override; normally browser authorization is automatic
+    #[arg(long, env = "NONO_CONNECT_TOKEN_FILE")]
+    pub token_file: Option<PathBuf>,
+
+    /// Spectate without sending terminal input (reserved until console fan-out lands)
+    #[arg(long)]
+    pub read_only: bool,
 }
 
 #[derive(Parser, Debug)]
@@ -4273,6 +4333,40 @@ mod tests {
     }
 
     #[test]
+    fn test_ps_remote_flags_parse() {
+        let cli = Cli::try_parse_from([
+            "nono",
+            "ps",
+            "--remote",
+            "--all",
+            "--json",
+            "--console",
+            "https://console.example.com",
+            "--token-file",
+            "/tmp/console-token",
+        ])
+        .expect("ps remote flags must parse");
+        let Commands::Ps(args) = cli.command else {
+            panic!("expected Commands::Ps");
+        };
+        assert!(args.remote);
+        assert!(args.all);
+        assert!(args.json);
+        assert_eq!(args.console.as_deref(), Some("https://console.example.com"));
+        assert_eq!(
+            args.token_file.as_deref(),
+            Some(std::path::Path::new("/tmp/console-token"))
+        );
+    }
+
+    #[test]
+    fn test_ps_console_requires_remote() {
+        let result =
+            Cli::try_parse_from(["nono", "ps", "--console", "https://console.example.com"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn test_profile_schema_with_output() {
         let cli = Cli::parse_from(["nono", "profile", "schema", "-o", "/tmp/schema.json"]);
         match cli.command {
@@ -4422,6 +4516,7 @@ mod tests {
         "stop",
         "detach",
         "attach",
+        "connect",
         "logs",
         "inspect",
         "session",

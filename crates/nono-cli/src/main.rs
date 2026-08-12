@@ -20,6 +20,8 @@ mod command_policy;
 mod command_runtime;
 mod completions;
 mod config;
+#[cfg(unix)]
+mod connect_client;
 mod credential_runtime;
 mod deprecated_policy;
 mod deprecated_schema;
@@ -134,6 +136,12 @@ fn main() {
 
     let cli_result = run_cli(cli);
     tool_sandbox::log_main_total();
+    #[cfg(unix)]
+    if cli_result.is_ok()
+        && let Some(code) = connect_client::take_remote_exit_code()
+    {
+        std::process::exit(code.clamp(1, 255));
+    }
     if let Err(e) = cli_result {
         if let nono::NonoError::ActionRequired(message) = &e {
             eprintln!("{message}");

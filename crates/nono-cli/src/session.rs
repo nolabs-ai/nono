@@ -95,6 +95,9 @@ impl SessionGuard {
     pub fn set_exited(&mut self, exit_code: i32) {
         self.record.status = SessionStatus::Exited;
         self.record.exit_code = Some(exit_code);
+        if let Err(e) = update_session_file(&self.path, &self.record) {
+            warn!("Failed to persist session exit status: {}", e);
+        }
     }
 }
 
@@ -1157,6 +1160,41 @@ mod tests {
         let loaded = load_session_file(&file_path).expect("load");
         assert_eq!(loaded.status, SessionStatus::Exited);
         assert_eq!(loaded.exit_code, Some(-1));
+    }
+
+    #[test]
+    fn session_guard_persists_real_exit_code_before_drop() {
+        let dir = tempdir().expect("tempdir");
+        #[cfg(unix)]
+        make_private_dir(dir.path());
+        let path = dir.path().join("guard-exit.json");
+        let record = SessionRecord {
+            session_id: "guard-exit".to_string(),
+            name: None,
+            supervisor_pid: 300,
+            child_pid: 301,
+            started: "2026-08-12T00:00:00+00:00".to_string(),
+            started_epoch: 77777,
+            status: SessionStatus::Running,
+            attachment: SessionAttachment::Detached,
+            exit_code: None,
+            command: vec!["test".to_string()],
+            profile: None,
+            workdir: PathBuf::from("/tmp"),
+            network: "blocked".to_string(),
+            rollback_session: None,
+        };
+        write_session_file(&path, &record).expect("write initial session");
+        let mut guard = SessionGuard {
+            record,
+            path: path.clone(),
+        };
+
+        guard.set_exited(7);
+
+        let persisted = load_session_file(&path).expect("load persisted session");
+        assert_eq!(persisted.status, SessionStatus::Exited);
+        assert_eq!(persisted.exit_code, Some(7));
     }
 
     #[test]

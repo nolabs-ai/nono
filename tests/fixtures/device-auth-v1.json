@@ -1,0 +1,8 @@
+{
+  "protocol_version": "1",
+  "device_code": "v1_test_device_code_0123456789",
+  "user_code": "ABCD-EFGH",
+  "verification_path": "/platform/device",
+  "expires_in": 600,
+  "interval": 5
+}

@@ -12,12 +12,14 @@ use base64::{
 };
 use nono::{NonoError, Result};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use uuid::Uuid;
 use zeroize::Zeroizing;
 
 pub(crate) const REQUEST_PROTOCOL_V1: &str = "1";
@@ -314,6 +316,62 @@ pub(crate) fn canonical_request_v1(
     format!(
         "nono-request-v1\n{method}\n{path}\n{subject_id}\n{timestamp_ms}\n{request_id}\n{body_digest}"
     )
+}
+
+#[derive(Debug)]
+pub(crate) struct SignedRequestHeaders {
+    pub(crate) timestamp: String,
+    pub(crate) request_id: String,
+    pub(crate) body_digest: String,
+    pub(crate) signature: String,
+}
+
+pub(crate) fn sign_request_v1(
+    state: &PlatformState,
+    method: &str,
+    path: &str,
+    request_id: Uuid,
+    body: &[u8],
+) -> Result<SignedRequestHeaders> {
+    let timestamp = current_timestamp_ms()?.to_string();
+    let request_id = request_id.to_string();
+    let body_digest = format!("sha256:{}", sha256_hex(body));
+    let canonical = canonical_request_v1(
+        method,
+        path,
+        &state.subject_id,
+        &timestamp,
+        &request_id,
+        &body_digest,
+    );
+    let key_pair = load_signing_key(state)?;
+    let signature = key_pair
+        .sign(&SystemRandom::new(), canonical.as_bytes())
+        .map_err(|_| NonoError::KeystoreAccess("failed to sign platform request".to_string()))?;
+    Ok(SignedRequestHeaders {
+        timestamp,
+        request_id,
+        body_digest,
+        signature: format!("p256-sha256={}", URL_SAFE_NO_PAD.encode(signature.as_ref())),
+    })
+}
+
+fn current_timestamp_ms() -> Result<u128> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .map_err(|error| {
+            NonoError::ConfigParse(format!("system clock is before Unix epoch: {error}"))
+        })
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        encoded.push_str(&format!("{byte:02x}"));
+    }
+    encoded
 }
 
 pub(crate) fn endpoint_url(platform_url: &str, path: &str) -> Result<String> {

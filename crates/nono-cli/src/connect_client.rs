@@ -343,6 +343,12 @@ fn load_cached_authorization(
 
 fn authorize_device(state: &crate::platform_client::PlatformState) -> Result<Zeroizing<String>> {
     let mut response = signed_post(state, "/api/v1/auth/device/code", &[], None)?;
+    if matches!(response.status().as_u16(), 401 | 403) {
+        return Err(NonoError::ActionRequired(
+            "platform authentication failed; renew the platform enrollment and try again"
+                .to_string(),
+        ));
+    }
     require_success(&response, "starting human authorization")?;
     let body = read_response(&mut response, "device authorization response")?;
     let code: DeviceCodeResponse = serde_json::from_str(&body).map_err(|error| {

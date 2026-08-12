@@ -228,6 +228,10 @@ Client to server:
 ```
 
 Detach closes this attachment only. It must not stop the hosted session.
+Terminal-native clients recognize the configured detach sequence in both
+traditional control-byte form and modern CSI-u keyboard encoding. On return,
+they restore termios and terminal-emulator keyboard, mouse, focus, and paste
+modes before handing control back to the local shell.
 
 ### Attached
 

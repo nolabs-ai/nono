@@ -14,6 +14,10 @@ use std::io::{BufRead, Seek, SeekFrom};
 use std::path::Path;
 use tracing::debug;
 
+const BRIDGE_STATUS_READY: &str = "\x1b]777;nono-attach-v1=ready\x07";
+const BRIDGE_STATUS_BUSY: &str = "\x1b]777;nono-attach-v1=busy\x07";
+const BRIDGE_STATUS_GONE: &str = "\x1b]777;nono-attach-v1=gone\x07";
+
 /// Refuse to run if we're inside a nono sandbox.
 ///
 /// Commands that send signals or delete files (stop, prune) must not run
@@ -320,6 +324,11 @@ pub fn run_attach(args: &AttachArgs) -> Result<()> {
     let record = session::load_session(&args.session)?;
 
     if record.status == SessionStatus::Exited {
+        if args.bridge_status {
+            eprint!("{BRIDGE_STATUS_GONE}");
+            let _ = std::io::Write::flush(&mut std::io::stderr());
+            return Ok(());
+        }
         match record.exit_code {
             Some(code) => {
                 eprintln!(
@@ -335,13 +344,20 @@ pub fn run_attach(args: &AttachArgs) -> Result<()> {
     }
 
     if !session::is_process_alive(record.supervisor_pid, record.started_epoch) {
+        if args.bridge_status {
+            eprint!("{BRIDGE_STATUS_GONE}");
+            let _ = std::io::Write::flush(&mut std::io::stderr());
+            return Ok(());
+        }
         return Err(NonoError::ConfigParse(format!(
             "Session {} supervisor (PID {}) is no longer running",
             record.session_id, record.supervisor_pid
         )));
     }
 
-    eprintln!("[nono] Attaching to session {}...", record.session_id);
+    if !args.bridge_status {
+        eprintln!("[nono] Attaching to session {}...", record.session_id);
+    }
 
     if record.status == SessionStatus::Paused {
         return Err(NonoError::ConfigParse(format!(
@@ -350,8 +366,21 @@ pub fn run_attach(args: &AttachArgs) -> Result<()> {
         )));
     }
 
-    match crate::pty_proxy::attach_to_session(&record.session_id) {
+    let result = if args.bridge_status {
+        crate::pty_proxy::attach_to_session_with_ready(&record.session_id, || {
+            eprint!("{BRIDGE_STATUS_READY}");
+            let _ = std::io::Write::flush(&mut std::io::stderr());
+        })
+    } else {
+        crate::pty_proxy::attach_to_session(&record.session_id)
+    };
+    match result {
         Err(NonoError::AttachBusy) => {
+            if args.bridge_status {
+                eprint!("{BRIDGE_STATUS_BUSY}");
+                let _ = std::io::Write::flush(&mut std::io::stderr());
+                return Ok(());
+            }
             eprintln!(
                 "[nono] Session {} already has an active attached client.",
                 record.session_id
@@ -359,6 +388,11 @@ pub fn run_attach(args: &AttachArgs) -> Result<()> {
             Ok(())
         }
         Err(NonoError::SessionGone) => {
+            if args.bridge_status {
+                eprint!("{BRIDGE_STATUS_GONE}");
+                let _ = std::io::Write::flush(&mut std::io::stderr());
+                return Ok(());
+            }
             eprintln!(
                 "[nono] Session {} exited before attach could complete.",
                 record.session_id

@@ -31,6 +31,7 @@ const DEVICE_AUTH_PROTOCOL_V1: &str = "1";
 const DEVICE_AUTH_VERIFICATION_PATH: &str = "/platform/device";
 const DEVICE_AUTH_CACHE_FILENAME: &str = "platform-console-auth.json";
 const DEFAULT_DETACH_SEQUENCE: &[u8] = &[0x1d, b'd'];
+const WEBSOCKET_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 static REMOTE_EXIT_CODE: AtomicI32 = AtomicI32::new(0);
 
 #[derive(Debug, Deserialize)]
@@ -132,6 +133,12 @@ enum ServerControl {
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AttachOutcome {
+    Detached,
+    SessionExited,
+}
+
 pub(crate) fn run_connect(args: ConnectArgs) -> Result<()> {
     if args.read_only {
         return Err(NonoError::ActionRequired(
@@ -157,7 +164,11 @@ pub(crate) fn run_connect(args: ConnectArgs) -> Result<()> {
         .map_err(|error| {
             NonoError::ConfigParse(format!("could not start connect runtime: {error}"))
         })?;
-    runtime.block_on(attach(attach_url, token, detach_sequence))
+    match runtime.block_on(attach(attach_url, token, detach_sequence))? {
+        AttachOutcome::Detached => eprintln!("\nDetached from remote session."),
+        AttachOutcome::SessionExited => {}
+    }
+    Ok(())
 }
 
 /// List sessions visible through the enrolled tenant's nono-console.
@@ -955,7 +966,11 @@ fn terminal_url(console: &Url, session_id: &str) -> Result<Url> {
     Ok(url)
 }
 
-async fn attach(url: Url, token: Zeroizing<String>, detach_sequence: Vec<u8>) -> Result<()> {
+async fn attach(
+    url: Url,
+    token: Zeroizing<String>,
+    detach_sequence: Vec<u8>,
+) -> Result<AttachOutcome> {
     let mut request = url
         .as_str()
         .into_client_request()
@@ -968,9 +983,15 @@ async fn attach(url: Url, token: Zeroizing<String>, detach_sequence: Vec<u8>) ->
         HeaderValue::from_static("nono.terminal.v1"),
     );
 
-    let (socket, response) = tokio_tungstenite::connect_async(request)
-        .await
-        .map_err(|error| NonoError::ConfigParse(format!("terminal connection failed: {error}")))?;
+    let (socket, response) = tokio::time::timeout(
+        WEBSOCKET_CONNECT_TIMEOUT,
+        tokio_tungstenite::connect_async(request),
+    )
+    .await
+    .map_err(|_| {
+        NonoError::ConfigParse("terminal connection timed out after 15 seconds".to_string())
+    })?
+    .map_err(|error| NonoError::ConfigParse(format!("terminal connection failed: {error}")))?;
     let selected_protocol = response
         .headers()
         .get(SEC_WEBSOCKET_PROTOCOL)
@@ -997,7 +1018,7 @@ async fn attach(url: Url, token: Zeroizing<String>, detach_sequence: Vec<u8>) ->
                 let read = read.map_err(NonoError::Io)?;
                 if read == 0 {
                     send_detach(&mut ws_tx).await?;
-                    return Ok(());
+                    return Ok(AttachOutcome::Detached);
                 }
                 let matched = matcher.push(&input[..read]);
                 if !matched.forward.is_empty() {
@@ -1007,7 +1028,7 @@ async fn attach(url: Url, token: Zeroizing<String>, detach_sequence: Vec<u8>) ->
                 }
                 if matched.detach {
                     send_detach(&mut ws_tx).await?;
-                    return Ok(());
+                    return Ok(AttachOutcome::Detached);
                 }
             }
             _ = resize.recv() => {
@@ -1029,7 +1050,9 @@ async fn attach(url: Url, token: Zeroizing<String>, detach_sequence: Vec<u8>) ->
                             }
                             let _ = (cols, rows);
                         }
-                        Ok(ServerControl::SessionExited { exit_code: Some(0) }) => return Ok(()),
+                        Ok(ServerControl::SessionExited { exit_code: Some(0) }) => {
+                            return Ok(AttachOutcome::SessionExited);
+                        }
                         Ok(ServerControl::SessionExited { exit_code: Some(code) }) => {
                             if code < 0 {
                                 return Err(NonoError::ConfigParse(
@@ -1038,7 +1061,7 @@ async fn attach(url: Url, token: Zeroizing<String>, detach_sequence: Vec<u8>) ->
                                 ));
                             }
                             REMOTE_EXIT_CODE.store(code, Ordering::Release);
-                            return Ok(());
+                            return Ok(AttachOutcome::SessionExited);
                         }
                         Ok(ServerControl::SessionExited { exit_code: None }) => {
                             return Err(NonoError::ConfigParse(
@@ -1122,6 +1145,7 @@ impl RawTerminal {
 
 impl Drop for RawTerminal {
     fn drop(&mut self) {
+        crate::pty_proxy::restore_terminal_modes_after_attach();
         let stdin = io::stdin();
         let _ = nix::sys::termios::tcsetattr(
             &stdin,
@@ -1155,39 +1179,114 @@ struct DetachMatch {
 
 struct DetachMatcher {
     sequence: Vec<u8>,
-    pending: Vec<u8>,
+    pending_match_len: usize,
+    pending_escape: Vec<u8>,
 }
 
 impl DetachMatcher {
     fn new(sequence: Vec<u8>) -> Self {
         Self {
             sequence,
-            pending: Vec::new(),
+            pending_match_len: 0,
+            pending_escape: Vec::new(),
         }
     }
 
     fn push(&mut self, input: &[u8]) -> DetachMatch {
         let mut forward = Vec::with_capacity(input.len());
-        for &byte in input {
-            self.pending.push(byte);
-            while !self.sequence.starts_with(&self.pending) {
-                forward.push(self.pending.remove(0));
-                if self.pending.is_empty() {
-                    break;
+        for (index, &byte) in input.iter().enumerate() {
+            if !self.pending_escape.is_empty() {
+                self.pending_escape.push(byte);
+                let Some(&expected) = self.sequence.get(self.pending_match_len) else {
+                    self.flush_pending(&mut forward);
+                    continue;
+                };
+                match crate::pty_proxy::match_enhanced_key_sequence(&self.pending_escape, expected)
+                {
+                    crate::pty_proxy::EnhancedKeyMatch::Pending => {
+                        if self.pending_escape.len()
+                            > crate::pty_proxy::MAX_ENHANCED_KEY_SEQUENCE_LEN
+                        {
+                            self.flush_pending(&mut forward);
+                        }
+                    }
+                    crate::pty_proxy::EnhancedKeyMatch::Matched => {
+                        self.pending_escape.clear();
+                        self.pending_match_len += 1;
+                        if self.pending_match_len == self.sequence.len() {
+                            self.pending_match_len = 0;
+                            return DetachMatch {
+                                forward,
+                                detach: true,
+                            };
+                        }
+                    }
+                    crate::pty_proxy::EnhancedKeyMatch::Invalid => {
+                        self.flush_pending(&mut forward);
+                    }
+                }
+                continue;
+            }
+
+            if self.sequence.is_empty() {
+                forward.push(byte);
+                continue;
+            }
+
+            if byte == self.sequence[self.pending_match_len] {
+                self.pending_match_len += 1;
+                if self.pending_match_len == self.sequence.len() {
+                    self.pending_match_len = 0;
+                    return DetachMatch {
+                        forward,
+                        detach: true,
+                    };
+                }
+                continue;
+            }
+
+            if byte == b'\x1b'
+                && input.get(index + 1).copied() == Some(b'[')
+                && self
+                    .sequence
+                    .get(self.pending_match_len)
+                    .copied()
+                    .is_some_and(crate::pty_proxy::detach_key_supports_enhanced_match)
+            {
+                self.pending_escape.push(byte);
+                continue;
+            }
+
+            if self.pending_match_len > 0 {
+                forward.extend_from_slice(&self.sequence[..self.pending_match_len]);
+                self.pending_match_len = 0;
+                if byte == self.sequence[0] {
+                    self.pending_match_len = 1;
+                    continue;
                 }
             }
-            if self.pending == self.sequence {
-                self.pending.clear();
-                return DetachMatch {
-                    forward,
-                    detach: true,
-                };
-            }
+            forward.push(byte);
         }
         DetachMatch {
             forward,
             detach: false,
         }
+    }
+
+    fn flush_pending(&mut self, forward: &mut Vec<u8>) {
+        if self.pending_match_len > 0 {
+            forward.extend_from_slice(&self.sequence[..self.pending_match_len]);
+            self.pending_match_len = 0;
+        }
+        forward.extend_from_slice(&self.pending_escape);
+        self.pending_escape.clear();
+    }
+}
+
+#[cfg(test)]
+impl DetachMatcher {
+    fn pending_bytes(&self) -> bool {
+        self.pending_match_len > 0 || !self.pending_escape.is_empty()
     }
 }
 
@@ -1306,12 +1405,46 @@ mod tests {
         let first = matcher.push(b"abc\x1d");
         assert_eq!(first.forward, b"abc");
         assert!(!first.detach);
+        assert!(matcher.pending_bytes());
         let mismatch = matcher.push(b"x");
         assert_eq!(mismatch.forward, b"\x1dx");
         assert!(!mismatch.detach);
         let matched = matcher.push(b"z\x1ddtail");
         assert_eq!(matched.forward, b"z");
         assert!(matched.detach);
+    }
+
+    #[test]
+    fn detach_matcher_accepts_csi_u_control_prefix() {
+        let mut matcher = DetachMatcher::new(vec![0x1d, b'd']);
+        let matched = matcher.push(b"\x1b[93;5ud");
+        assert!(matched.forward.is_empty());
+        assert!(matched.detach);
+        assert!(!matcher.pending_bytes());
+    }
+
+    #[test]
+    fn detach_matcher_accepts_chunked_csi_u_control_prefix() {
+        let mut matcher = DetachMatcher::new(vec![0x1d, b'd']);
+        let first = matcher.push(b"\x1b[93;");
+        assert!(first.forward.is_empty());
+        assert!(!first.detach);
+        assert!(matcher.pending_bytes());
+        let second = matcher.push(b"5u");
+        assert!(second.forward.is_empty());
+        assert!(!second.detach);
+        let third = matcher.push(b"d");
+        assert!(third.forward.is_empty());
+        assert!(third.detach);
+    }
+
+    #[test]
+    fn detach_matcher_forwards_unrelated_csi_u_input() {
+        let mut matcher = DetachMatcher::new(vec![0x1d, b'd']);
+        let unmatched = matcher.push(b"\x1b[99;5u");
+        assert_eq!(unmatched.forward, b"\x1b[99;5u");
+        assert!(!unmatched.detach);
+        assert!(!matcher.pending_bytes());
     }
 
     #[test]

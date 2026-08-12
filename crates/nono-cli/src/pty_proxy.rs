@@ -39,7 +39,7 @@ const RESIZE_MESSAGE_LEN: usize = 4;
 const SCROLLBACK_LIMIT_BYTES: usize = 8 * 1024 * 1024;
 const VT_SCROLLBACK_ROWS: usize = 10_000;
 const DEFAULT_DETACH_SEQUENCE: [u8; 2] = [0x1d, b'd'];
-const MAX_ENHANCED_KEY_SEQUENCE_LEN: usize = 32;
+pub(crate) const MAX_ENHANCED_KEY_SEQUENCE_LEN: usize = 32;
 const ATTACH_ACK_OK: u8 = 0;
 const ATTACH_ACK_BUSY: u8 = 1;
 const ATTACH_ACK_DENIED: u8 = 2;
@@ -1263,17 +1263,17 @@ impl PtyProxy {
     }
 }
 
-enum EnhancedKeyMatch {
+pub(crate) enum EnhancedKeyMatch {
     Pending,
     Matched,
     Invalid,
 }
 
-fn detach_key_supports_enhanced_match(key: u8) -> bool {
+pub(crate) fn detach_key_supports_enhanced_match(key: u8) -> bool {
     key.is_ascii_graphic() || key == b' ' || control_key_candidates(key).is_some()
 }
 
-fn match_enhanced_key_sequence(bytes: &[u8], expected_key: u8) -> EnhancedKeyMatch {
+pub(crate) fn match_enhanced_key_sequence(bytes: &[u8], expected_key: u8) -> EnhancedKeyMatch {
     if bytes.is_empty() {
         return EnhancedKeyMatch::Pending;
     }
@@ -1387,6 +1387,16 @@ fn control_key_candidates(expected_key: u8) -> Option<[u32; 2]> {
         ]),
         _ => None,
     }
+}
+
+/// Reset terminal input-reporting modes after a terminal-native attach client.
+///
+/// A hosted application may enable kitty CSI-u keyboard reporting, mouse
+/// tracking, or bracketed paste. Termios restoration alone does not disable
+/// those terminal-emulator modes, so a returning shell would otherwise receive
+/// encoded input such as `\x1b[99;5u` for Ctrl-C.
+pub(crate) fn restore_terminal_modes_after_attach() {
+    let _ = write_all_fd(libc::STDOUT_FILENO, TERMINAL_RESTORE_NORMAL);
 }
 
 fn compose_replay_body(
@@ -2392,6 +2402,16 @@ fn print_detach_notice(session_id: Option<&str>) {
 /// mid-shutdown when we connected) to give a clean "session exited" message
 /// instead of a raw "Broken pipe" error.
 pub fn attach_to_session(session_id: &str) -> Result<()> {
+    attach_to_session_with_ready(session_id, || {})
+}
+
+/// Attach and invoke `on_ready` only after the supervisor accepted this client
+/// as its active writer. nono-console uses this boundary to avoid announcing a
+/// WebSocket attachment before the underlying writer slot is actually held.
+pub fn attach_to_session_with_ready<F>(session_id: &str, on_ready: F) -> Result<()>
+where
+    F: FnOnce(),
+{
     let stream = match connect_to_session(session_id) {
         Err(NonoError::SessionGone) => {
             // The supervisor may have been mid-shutdown. Wait briefly and
@@ -2403,6 +2423,7 @@ pub fn attach_to_session(session_id: &str) -> Result<()> {
         other => other?,
     };
     wait_for_attach_ready(stream.as_raw_fd(), timeouts::pty_attach_timeout_ms())?;
+    on_ready();
     attach_to_stream(stream, Some(session_id))
 }
 

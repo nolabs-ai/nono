@@ -2738,6 +2738,10 @@ pub struct DetachArgs {
 pub struct AttachArgs {
     /// Session ID, prefix, or name
     pub session: String,
+
+    /// Emit the private nono-console attach-helper readiness protocol
+    #[arg(long, hide = true)]
+    pub bridge_status: bool,
 }
 
 #[derive(Parser, Debug)]

@@ -12,6 +12,7 @@ use security_framework::certificate::SecCertificate;
 use security_framework::os::macos::keychain::SecKeychain;
 use security_framework::passwords;
 use security_framework::trust_settings::{Domain, TrustSettings, TrustSettingsForCertificate};
+use std::io::IsTerminal;
 use std::time::{Duration, SystemTime};
 use tracing::{debug, info, warn};
 use x509_parser::pem::parse_x509_pem;
@@ -24,6 +25,12 @@ enum TrustCertError {
     Other(NonoError),
 }
 
+enum ProxyCaOutcome {
+    Ready(PreloadedCa),
+    EphemeralFallback,
+    InteractionUnavailable,
+}
+
 // Service name for Keychain items. Sufficiently specific to avoid collision
 // with other apps. set_generic_password overwrites on conflict (desired).
 const KEYCHAIN_SERVICE: &str = "nono-proxy-ca";
@@ -31,24 +38,39 @@ const KEYCHAIN_ACCOUNT: &str = "ca-bundle";
 
 /// Load or generate a shared CA and ensure it's trusted in the macOS user
 /// trust store. Returns `Some(PreloadedCa)` on success, `None` if the user
-/// cancelled the auth prompt or setup failed (fallback to ephemeral CA).
+/// cancelled the auth prompt or setup failed (fallback to ephemeral CA), and
+/// refuses if a persistent trust mutation would require unavailable user
+/// interaction.
 ///
-/// All logging happens internally — the caller just checks the Option.
-pub(crate) fn load_or_generate_proxy_ca(validity: Duration) -> Option<PreloadedCa> {
-    match try_ensure_trusted_ca(validity) {
-        Ok(Some(ca)) => Some(ca),
-        Ok(None) => None,
+/// All logging happens internally — the caller propagates the result and
+/// checks the Option.
+pub(crate) fn load_or_generate_proxy_ca(validity: Duration) -> Result<Option<PreloadedCa>> {
+    finish_proxy_ca_outcome(try_ensure_trusted_ca(validity))
+}
+
+fn finish_proxy_ca_outcome(outcome: Result<ProxyCaOutcome>) -> Result<Option<PreloadedCa>> {
+    match outcome {
+        Ok(ProxyCaOutcome::Ready(ca)) => Ok(Some(ca)),
+        Ok(ProxyCaOutcome::EphemeralFallback) => Ok(None),
+        Ok(ProxyCaOutcome::InteractionUnavailable) => Err(NonoError::SandboxInit(
+            "--trust-proxy-ca cannot add or re-trust the proxy CA without an interactive \
+             terminal; establish trust interactively once or use a session-scoped CA bundle"
+                .to_string(),
+        )),
         Err(e) => {
             warn!("Shared CA setup failed: {e}. Falling back to ephemeral CA.");
-            None
+            Ok(None)
         }
     }
 }
 
-fn try_ensure_trusted_ca(validity: Duration) -> Result<Option<PreloadedCa>> {
+fn try_ensure_trusted_ca(validity: Duration) -> Result<ProxyCaOutcome> {
     match load_existing_ca()? {
         Some((key_der, cert_pem)) => {
             if !cert_pem_is_valid(&cert_pem)? {
+                if !persistent_trust_interaction_available() {
+                    return Ok(ProxyCaOutcome::InteractionUnavailable);
+                }
                 debug!("stored proxy CA has expired; regenerating");
                 remove_cert_from_keychain(&cert_pem);
                 delete_existing_ca();
@@ -61,6 +83,9 @@ fn try_ensure_trusted_ca(validity: Duration) -> Result<Option<PreloadedCa>> {
             })?;
 
             if !is_cert_trusted(&cert) {
+                if !persistent_trust_interaction_available() {
+                    return Ok(ProxyCaOutcome::InteractionUnavailable);
+                }
                 info!("Re-trusting proxy CA (you may be prompted for authentication)...");
                 if let Err(e) = trust_cert(&cert) {
                     match e {
@@ -69,7 +94,7 @@ fn try_ensure_trusted_ca(validity: Duration) -> Result<Option<PreloadedCa>> {
                                 "Trust store auth cancelled. Falling back to ephemeral CA. \
                                  Go CLI tools won't validate proxy certs; other tools still work."
                             );
-                            return Ok(None);
+                            return Ok(ProxyCaOutcome::EphemeralFallback);
                         }
                         TrustCertError::Other(err) => return Err(err),
                     }
@@ -79,13 +104,21 @@ fn try_ensure_trusted_ca(validity: Duration) -> Result<Option<PreloadedCa>> {
                 info!("Reusing proxy CA from Keychain (already trusted)");
             }
 
-            Ok(Some(PreloadedCa { key_der, cert_pem }))
+            Ok(ProxyCaOutcome::Ready(PreloadedCa { key_der, cert_pem }))
         }
         None => {
             debug!("no existing proxy CA in Keychain; generating new one");
             generate_and_trust_new_ca(validity)
         }
     }
+}
+
+fn persistent_trust_interaction_available() -> bool {
+    persistent_trust_interaction_available_for(std::io::stderr().is_terminal())
+}
+
+const fn persistent_trust_interaction_available_for(stderr_is_terminal: bool) -> bool {
+    stderr_is_terminal
 }
 
 fn load_existing_ca() -> Result<Option<(Zeroizing<Vec<u8>>, String)>> {
@@ -100,7 +133,11 @@ fn load_existing_ca() -> Result<Option<(Zeroizing<Vec<u8>>, String)>> {
         .map_err(|e| NonoError::SandboxInit(format!("{e}")))
 }
 
-fn generate_and_trust_new_ca(validity: Duration) -> Result<Option<PreloadedCa>> {
+fn generate_and_trust_new_ca(validity: Duration) -> Result<ProxyCaOutcome> {
+    if !persistent_trust_interaction_available() {
+        return Ok(ProxyCaOutcome::InteractionUnavailable);
+    }
+
     let ca =
         nono_proxy::tls_intercept::ca::EphemeralCa::generate_with_cn("nono-proxy-ca", validity)
             .map_err(|e| NonoError::SandboxInit(format!("failed to generate CA: {e}")))?;
@@ -131,14 +168,14 @@ fn generate_and_trust_new_ca(validity: Duration) -> Result<Option<PreloadedCa>> 
                     "Trust store auth cancelled. Falling back to ephemeral CA. \
                      Go CLI tools won't validate proxy certs; other tools still work."
                 );
-                return Ok(None);
+                return Ok(ProxyCaOutcome::EphemeralFallback);
             }
             TrustCertError::Other(err) => return Err(err),
         }
     }
 
     info!("Proxy CA added to macOS trust store");
-    Ok(Some(PreloadedCa { key_der, cert_pem }))
+    Ok(ProxyCaOutcome::Ready(PreloadedCa { key_der, cert_pem }))
 }
 
 fn ensure_cert_in_keychain(cert: &SecCertificate) -> Result<()> {
@@ -308,5 +345,29 @@ mod tests {
         assert!(is_user_cancelled_osstatus(ERR_SEC_INTERACTION_NOT_ALLOWED));
         assert!(!is_user_cancelled_osstatus(-25299)); // errSecDuplicateItem
         assert!(!is_user_cancelled_osstatus(0));
+    }
+
+    #[test]
+    fn persistent_trust_mutation_requires_an_interactive_terminal() {
+        assert!(persistent_trust_interaction_available_for(true));
+        assert!(!persistent_trust_interaction_available_for(false));
+    }
+
+    #[test]
+    fn unavailable_interaction_is_a_typed_startup_refusal() {
+        let Err(error) = finish_proxy_ca_outcome(Ok(ProxyCaOutcome::InteractionUnavailable)) else {
+            panic!("noninteractive trust mutation must refuse");
+        };
+        assert!(matches!(
+            error,
+            NonoError::SandboxInit(message)
+                if message.contains("without an interactive terminal")
+        ));
+
+        assert!(
+            finish_proxy_ca_outcome(Ok(ProxyCaOutcome::EphemeralFallback))
+                .unwrap()
+                .is_none()
+        );
     }
 }

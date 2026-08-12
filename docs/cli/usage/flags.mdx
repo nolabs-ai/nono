@@ -538,6 +538,11 @@ The CA is persisted in macOS Keychain and shared across sessions. It regenerates
 - **Subsequent runs**: Loads from Keychain with zero prompts
 - **After expiry**: Removes the expired CA and regenerates
 
+Adding or re-trusting the CA requires an interactive terminal. A noninteractive
+invocation that needs either mutation refuses before the requested child starts,
+instead of waiting indefinitely for an authorization interaction that the caller
+cannot service. Noninteractive invocations may still reuse an already-trusted CA.
+
 <Note>
 This flag has no effect without `--credential` (or another TLS-intercepting route). If no credential routes are configured, nono warns and skips CA generation.
 </Note>

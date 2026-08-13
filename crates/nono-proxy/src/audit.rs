@@ -93,6 +93,7 @@ pub struct EventContext<'a> {
     pub approval_backend: Option<&'a str>,
     pub upstream: Option<&'a str>,
     pub spiffe_context: Option<nono::undo::SpiffeAuditContext>,
+    pub aauth_context: Option<nono::undo::AauthAuditContext>,
 }
 
 /// Log label for a denial category. Matches its serialized audit-event form.
@@ -239,6 +240,7 @@ fn ctx_event(
         credential_capture_stdin_mode: None,
         credential_capture_interactive: None,
         spiffe_context: ctx.spiffe_context.clone(),
+        aauth_context: ctx.aauth_context.clone(),
         target: target.to_string(),
         upstream: ctx
             .upstream
@@ -407,6 +409,7 @@ pub fn log_host_approval(
             credential_capture_stdin_mode: None,
             credential_capture_interactive: None,
             spiffe_context: ctx.spiffe_context.clone(),
+            aauth_context: ctx.aauth_context.clone(),
             target: host.to_string(),
             upstream: ctx.upstream.map(str::to_string),
             port: Some(port),

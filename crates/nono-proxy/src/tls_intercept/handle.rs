@@ -2739,6 +2739,7 @@ mod tests {
             aws_auth: None,
             endpoint_policy: None,
             spiffe: None,
+            aauth: None,
             upgrades: vec![],
             rate_limit: None,
         }
@@ -2776,6 +2777,7 @@ mod tests {
                 aws_auth: None,
                 endpoint_policy: None,
                 spiffe: None,
+                aauth: None,
                 upgrades: vec![],
                 rate_limit: None,
             }
@@ -2867,6 +2869,7 @@ mod tests {
                 spiffe: None,
                 upgrades: vec![],
                 rate_limit: None,
+                aauth: None,
             }
         }
 
@@ -2924,6 +2927,7 @@ mod tests {
             aws_auth: None,
             endpoint_policy: None,
             spiffe: None,
+            aauth: None,
             upgrades: vec![],
             // Burst of 1 with no delay budget: the first request passes, the
             // second is rejected within the same instant.
@@ -3031,6 +3035,7 @@ mod tests {
                 allow: vec![],
             }),
             spiffe: None,
+            aauth: None,
             rate_limit: None,
         }
     }

@@ -1697,6 +1697,7 @@ fn network_denial_event(
         credential_capture_stdin_mode: None,
         credential_capture_interactive: None,
         spiffe_context: None,
+        aauth_context: None,
         target,
         upstream: None,
         port,

@@ -17,6 +17,7 @@
 //! The proxy runs **unsandboxed** in the supervisor process. The sandboxed
 //! child can only reach `localhost:<port>` via `NetworkMode::ProxyOnly`.
 
+pub mod aauth;
 pub mod approval;
 pub mod audit;
 pub mod auth;

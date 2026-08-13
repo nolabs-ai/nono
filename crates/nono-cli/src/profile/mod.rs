@@ -371,6 +371,13 @@ pub struct CustomCredentialDef {
     #[serde(default)]
     pub spiffe: Option<nono_proxy::config::SpiffeAuthConfig>,
 
+    /// Whether this credential's requests are signed with the profile's
+    /// `aauth_identity` (RFC 9421 HTTP Message Signatures). `None` defers to
+    /// `aauth_sign_all_outbound`. Mutually exclusive with `credential_key`,
+    /// `auth`, `aws_auth`, and `spiffe`.
+    #[serde(default)]
+    pub aauth: Option<bool>,
+
     /// Optional per-route request-rate limit (RouteRateLimiter).
     ///
     /// Caps the rate of L7 requests forwarded to this credential's upstream to
@@ -379,6 +386,40 @@ pub struct CustomCredentialDef {
     /// effect on an opaque CONNECT tunnel.
     #[serde(default)]
     pub rate_limit: Option<nono_proxy::config::RouteRateLimitConfig>,
+}
+
+impl CustomCredentialDef {
+    /// Apply the signing default only when this route has no other auth source.
+    fn aauth_enabled(&self, sign_all_outbound: bool) -> bool {
+        nono_proxy::config::resolve_aauth_enabled(
+            self.aauth,
+            sign_all_outbound,
+            self.credential_key.is_some()
+                || self.auth.is_some()
+                || self.aws_auth.is_some()
+                || self.spiffe.is_some()
+                || !self.redeem_phantoms.is_empty(),
+        )
+    }
+}
+
+/// The agent's persistent aauth identity (RFC 9421 request signing).
+///
+/// `key_ref` accepts an existing absolute path or file://, keyring://,
+/// or env:// reference. Files accept unencrypted Ed25519 PKCS#8 PEM, DER,
+/// or legacy base64 DER. Existing keys can be used without import.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AauthIdentityDef {
+    /// Required `aauth:local@domain` subject under `jwt`, with the issuer's
+    /// domain. Optional local audit label under `hwk`; omitted under raw
+    /// `jwks_uri`, whose identity is the issuer itself.
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    pub key_ref: String,
+    /// Which `Signature-Key` scheme to sign with. Defaults to `hwk`.
+    #[serde(default)]
+    pub scheme: nono_proxy::config::AauthSigSchemeConfig,
 }
 
 /// Host-side source that materializes a proxy credential for `cmd://<name>`.
@@ -581,7 +622,11 @@ fn validate_credential_key(context_name: &str, key: &str) -> Result<()> {
 ///   - `url_path`: path_pattern required, no CRLF in patterns
 ///   - `query_param`: query_param_name required, valid query param name
 ///   - `basic_auth`: no additional required fields
-fn validate_custom_credential(name: &str, cred: &CustomCredentialDef) -> Result<()> {
+fn validate_custom_credential(
+    name: &str,
+    cred: &CustomCredentialDef,
+    aauth_sign_all_outbound: bool,
+) -> Result<()> {
     // Mutual exclusion: aws_auth is incompatible with credential_key and auth.
     if cred.aws_auth.is_some() && (cred.credential_key.is_some() || cred.auth.is_some()) {
         return Err(NonoError::ProfileParse(format!(
@@ -611,27 +656,47 @@ fn validate_custom_credential(name: &str, cred: &CustomCredentialDef) -> Result<
         )));
     }
 
-    // aws_auth/spiffe branch to dedicated handlers that never run the
+    let aauth_enabled = cred.aauth_enabled(aauth_sign_all_outbound);
+
+    // aws_auth/spiffe/aauth branch to dedicated handlers that never run the
     // phantom-resolution loop, so redeem_phantoms would be silently ignored.
-    if !cred.redeem_phantoms.is_empty() && (cred.aws_auth.is_some() || cred.spiffe.is_some()) {
+    if !cred.redeem_phantoms.is_empty()
+        && (cred.aws_auth.is_some() || cred.spiffe.is_some() || aauth_enabled)
+    {
         return Err(NonoError::ProfileParse(format!(
             "custom credential '{}' sets 'redeem_phantoms' together with 'aws_auth' or \
-             'spiffe'; those use dedicated intercept handlers that do not resolve caller phantoms, \
+             'spiffe' or 'aauth'; those use dedicated intercept handlers that do not resolve caller phantoms, \
              so redeem_phantoms could not be honored — remove one",
             name
         )));
     }
 
-    // At least one auth mechanism must be set
+    // Mutual exclusion: aauth is incompatible with every other auth mechanism.
+    if aauth_enabled
+        && (cred.credential_key.is_some()
+            || cred.auth.is_some()
+            || cred.aws_auth.is_some()
+            || cred.spiffe.is_some())
+    {
+        return Err(NonoError::ProfileParse(format!(
+            "custom credential '{}' has 'aauth' (explicitly or via aauth_sign_all_outbound) set \
+             together with 'credential_key', 'auth' (oauth2), 'aws_auth', or 'spiffe'; aauth is \
+             mutually exclusive with all other auth fields",
+            name
+        )));
+    }
+
+    // At least one auth mechanism must be set.
     if cred.credential_key.is_none()
         && cred.auth.is_none()
         && cred.aws_auth.is_none()
         && cred.spiffe.is_none()
         && cred.redeem_phantoms.is_empty()
+        && !aauth_enabled
     {
         return Err(NonoError::ProfileParse(format!(
             "custom credential '{}' must have either 'credential_key', 'auth', 'aws_auth', \
-             'spiffe', or 'redeem_phantoms' set",
+             'spiffe', 'redeem_phantoms', or 'aauth' set",
             name
         )));
     }
@@ -1136,8 +1201,24 @@ fn validate_upstream_url(url: &str, service_name: &str) -> Result<()> {
 
 /// Validate all custom credentials in a profile.
 fn validate_profile_custom_credentials(profile: &Profile) -> Result<()> {
+    let aauth_sign_all_outbound = profile.network.aauth_sign_all_outbound;
+    let mut any_aauth_route = false;
     for (name, cred) in &profile.network.custom_credentials {
-        validate_custom_credential(name, cred)?;
+        validate_custom_credential(name, cred, aauth_sign_all_outbound)?;
+        any_aauth_route |= cred.aauth_enabled(aauth_sign_all_outbound);
+    }
+    if any_aauth_route && profile.network.aauth_identity.is_none() {
+        return Err(NonoError::ProfileParse(
+            "network.custom_credentials has a route signing with aauth, but \
+             network.aauth_identity is not configured"
+                .to_string(),
+        ));
+    }
+    if let Some(identity) = &profile.network.aauth_identity {
+        identity
+            .scheme
+            .validate_identity(identity.agent_id.as_deref())
+            .map_err(|error| NonoError::ProfileParse(format!("network.aauth_identity: {error}")))?;
     }
     Ok(())
 }
@@ -1175,7 +1256,7 @@ pub(crate) fn credentials_from_manifest(
         }
 
         let custom_def = custom_credential_from_manifest_entry(cred);
-        validate_custom_credential(&name, &custom_def)?;
+        validate_custom_credential(&name, &custom_def, false)?;
         custom.insert(name, custom_def);
     }
 
@@ -1233,6 +1314,7 @@ fn custom_credential_from_manifest_entry(cred: &nono::manifest::Credential) -> C
     CustomCredentialDef {
         upstream: cred.upstream.as_str().to_string(),
         credential_key: Some(cred.source.as_str().to_string()),
+        aauth: None,
         redeem_phantoms: Vec::new(),
         auth: None,
         inject_mode,
@@ -1834,6 +1916,17 @@ pub struct NetworkConfig {
     /// how to route and inject credentials for that service.
     #[serde(default)]
     pub custom_credentials: HashMap<String, CustomCredentialDef>,
+    /// The agent's persistent aauth identity (RFC 9421 request signing), if
+    /// configured. One identity per profile; individual `custom_credentials`
+    /// entries opt into signing with it via their `aauth` field (or
+    /// `aauth_sign_all_outbound` below signs every route by default).
+    #[serde(default)]
+    pub aauth_identity: Option<AauthIdentityDef>,
+    /// When `true`, every custom credential route signs with `aauth_identity`
+    /// unless it sets `aauth: false`. When `false` (the default), routes
+    /// must opt in with `aauth: true`.
+    #[serde(default)]
+    pub aauth_sign_all_outbound: bool,
     /// TLS interception controls for L7 proxy routes.
     #[serde(default)]
     pub tls_intercept: Option<TlsInterceptConfig>,
@@ -3811,6 +3904,9 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
                 merged.extend(child.network.custom_credentials);
                 merged
             },
+            aauth_identity: child.network.aauth_identity.or(base.network.aauth_identity),
+            aauth_sign_all_outbound: child.network.aauth_sign_all_outbound
+                || base.network.aauth_sign_all_outbound,
             tls_intercept: child.network.tls_intercept.or(base.network.tls_intercept),
             // Child overrides base upstream proxy; if child has None, inherit base
             upstream_proxy: child.network.upstream_proxy.or(base.network.upstream_proxy),
@@ -5656,13 +5752,14 @@ mod tests {
             aws_auth: None,
             spiffe: None,
             rate_limit: None,
+            aauth: None,
         }
     }
 
     #[test]
     fn test_validate_custom_credential_valid() {
         let cred = header_cred_builder();
-        assert!(validate_custom_credential("test", &cred).is_ok());
+        assert!(validate_custom_credential("test", &cred, false).is_ok());
     }
 
     /// Issue #1690: manifest credentials with inline routes must become
@@ -5812,14 +5909,14 @@ mod tests {
         let mut cred = header_cred_builder();
         cred.upstream = "http://127.0.0.1:8080/api".to_string();
         cred.credential_key = Some("local_key".to_string());
-        assert!(validate_custom_credential("local", &cred).is_ok());
+        assert!(validate_custom_credential("local", &cred, false).is_ok());
     }
 
     #[test]
     fn test_validate_custom_credential_http_remote_rejected() {
         let mut cred = header_cred_builder();
         cred.upstream = "http://api.example.com".to_string();
-        let result = validate_custom_credential("test", &cred);
+        let result = validate_custom_credential("test", &cred, false);
         let err = result.expect_err("HTTP to remote should be rejected");
         assert!(err.to_string().contains("HTTPS"));
     }
@@ -5828,7 +5925,7 @@ mod tests {
     fn test_validate_custom_credential_invalid_header_rejected() {
         let mut cred = header_cred_builder();
         cred.inject_header = "X-Header\r\nEvil: injected".to_string();
-        let result = validate_custom_credential("test", &cred);
+        let result = validate_custom_credential("test", &cred, false);
         let err = result.expect_err("CRLF in header should be rejected");
         assert!(err.to_string().contains("invalid characters"));
     }
@@ -5837,7 +5934,7 @@ mod tests {
     fn test_validate_custom_credential_invalid_format_rejected() {
         let mut cred = header_cred_builder();
         cred.credential_format = Some("Bearer {}\r\nEvil: header".to_string());
-        let result = validate_custom_credential("test", &cred);
+        let result = validate_custom_credential("test", &cred, false);
         let err = result.expect_err("CRLF in format should be rejected");
         assert!(err.to_string().contains("CRLF"));
     }
@@ -5846,7 +5943,7 @@ mod tests {
     fn test_validate_custom_credential_invalid_key_rejected() {
         let mut cred = header_cred_builder();
         cred.credential_key = Some("api-key".to_string()); // hyphens not allowed
-        let result = validate_custom_credential("test", &cred);
+        let result = validate_custom_credential("test", &cred, false);
         let err = result.expect_err("hyphen in key should be rejected");
         assert!(err.to_string().contains("alphanumeric"));
     }
@@ -5855,7 +5952,7 @@ mod tests {
     fn test_validate_custom_credential_empty_header_rejected() {
         let mut cred = header_cred_builder();
         cred.inject_header = "".to_string();
-        let result = validate_custom_credential("test", &cred);
+        let result = validate_custom_credential("test", &cred, false);
         let err = result.expect_err("empty header should be rejected");
         assert!(err.to_string().contains("cannot be empty"));
     }
@@ -5864,7 +5961,7 @@ mod tests {
     fn test_validate_custom_credential_header_with_space_rejected() {
         let mut cred = header_cred_builder();
         cred.inject_header = "X Header".to_string();
-        let result = validate_custom_credential("test", &cred);
+        let result = validate_custom_credential("test", &cred, false);
         let err = result.expect_err("space in header should be rejected");
         assert!(err.to_string().contains("invalid characters"));
     }
@@ -5873,7 +5970,7 @@ mod tests {
     fn test_validate_custom_credential_header_with_colon_rejected() {
         let mut cred = header_cred_builder();
         cred.inject_header = "X-Header:".to_string();
-        let result = validate_custom_credential("test", &cred);
+        let result = validate_custom_credential("test", &cred, false);
         let err = result.expect_err("colon in header should be rejected");
         assert!(err.to_string().contains("invalid characters"));
     }
@@ -5882,14 +5979,14 @@ mod tests {
     fn test_validate_custom_credential_valid_special_header_chars() {
         let mut cred = header_cred_builder();
         cred.inject_header = "X-Header!".to_string(); // ! is valid tchar
-        assert!(validate_custom_credential("test", &cred).is_ok());
+        assert!(validate_custom_credential("test", &cred, false).is_ok());
     }
 
     #[test]
     fn test_validate_custom_credential_format_with_cr_rejected() {
         let mut cred = header_cred_builder();
         cred.credential_format = Some("Bearer {}\rEvil: header".to_string());
-        let result = validate_custom_credential("test", &cred);
+        let result = validate_custom_credential("test", &cred, false);
         let err = result.expect_err("CR in format should be rejected");
         assert!(err.to_string().contains("CRLF"));
     }
@@ -5898,7 +5995,7 @@ mod tests {
     fn test_validate_custom_credential_format_with_lf_rejected() {
         let mut cred = header_cred_builder();
         cred.credential_format = Some("Bearer {}\nEvil: header".to_string());
-        let result = validate_custom_credential("test", &cred);
+        let result = validate_custom_credential("test", &cred, false);
         let err = result.expect_err("LF in format should be rejected");
         assert!(err.to_string().contains("CRLF"));
     }
@@ -5909,7 +6006,7 @@ mod tests {
             let mut cred = header_cred_builder();
             cred.credential_format = Some(format.to_string());
             assert!(
-                validate_custom_credential("test", &cred).is_ok(),
+                validate_custom_credential("test", &cred, false).is_ok(),
                 "Expected format '{}' to be valid",
                 format
             );
@@ -5921,7 +6018,7 @@ mod tests {
         let mut cred = header_cred_builder();
         cred.upstream = "http://localhost:3000/api".to_string();
         cred.credential_key = Some("local_key".to_string());
-        assert!(validate_custom_credential("local", &cred).is_ok());
+        assert!(validate_custom_credential("local", &cred, false).is_ok());
     }
 
     #[test]
@@ -5929,7 +6026,7 @@ mod tests {
         let mut cred = header_cred_builder();
         cred.upstream = "http://[::1]:8080/api".to_string();
         cred.credential_key = Some("local_key".to_string());
-        assert!(validate_custom_credential("local", &cred).is_ok());
+        assert!(validate_custom_credential("local", &cred, false).is_ok());
     }
 
     #[test]
@@ -5937,7 +6034,7 @@ mod tests {
         let mut cred = header_cred_builder();
         cred.upstream = "http://0.0.0.0:3000/api".to_string();
         cred.credential_key = Some("local_key".to_string());
-        assert!(validate_custom_credential("local", &cred).is_ok());
+        assert!(validate_custom_credential("local", &cred, false).is_ok());
     }
 
     #[test]
@@ -5969,8 +6066,9 @@ mod tests {
                 svid_hint: None,
             }),
             rate_limit: None,
+            aauth: None,
         };
-        assert!(validate_custom_credential("testapi", &cred).is_ok());
+        assert!(validate_custom_credential("testapi", &cred, false).is_ok());
     }
 
     #[test]
@@ -5980,7 +6078,7 @@ mod tests {
         // value goes into inject_header, caller phantoms resolve on other headers.
         let mut cred = header_cred_builder();
         cred.redeem_phantoms = vec!["partner-token".to_string()];
-        assert!(validate_custom_credential("test", &cred).is_ok());
+        assert!(validate_custom_credential("test", &cred, false).is_ok());
     }
 
     /// `redeem_phantoms` alone satisfies the at-least-one-auth-mechanism rule.
@@ -5989,7 +6087,7 @@ mod tests {
         let mut cred = header_cred_builder();
         cred.credential_key = None;
         cred.redeem_phantoms = vec!["partner-token".to_string()];
-        assert!(validate_custom_credential("test", &cred).is_ok());
+        assert!(validate_custom_credential("test", &cred, false).is_ok());
     }
 
     #[test]
@@ -5998,7 +6096,7 @@ mod tests {
         cred.credential_key = None;
         cred.redeem_phantoms = vec!["partner-token".to_string()];
         cred.aws_auth = Some(nono_proxy::config::AwsAuthConfig::default());
-        let err = validate_custom_credential("test", &cred)
+        let err = validate_custom_credential("test", &cred, false)
             .expect_err("redeem_phantoms + aws_auth must be rejected");
         assert!(err.to_string().contains("redeem_phantoms"));
     }
@@ -6008,7 +6106,7 @@ mod tests {
         let mut cred = header_cred_builder();
         cred.credential_key = None;
         cred.redeem_phantoms = vec!["".to_string()];
-        let err = validate_custom_credential("test", &cred)
+        let err = validate_custom_credential("test", &cred, false)
             .expect_err("empty redeem_phantoms name must be rejected");
         assert!(err.to_string().contains("redeem_phantoms"));
     }
@@ -6027,7 +6125,7 @@ mod tests {
             credential_format: None,
             svid_hint: None,
         });
-        let err = validate_custom_credential("test", &cred)
+        let err = validate_custom_credential("test", &cred, false)
             .expect_err("redeem_phantoms + spiffe must be rejected");
         assert!(err.to_string().contains("redeem_phantoms"));
     }
@@ -6042,7 +6140,7 @@ mod tests {
             credential_format: None,
             svid_hint: None,
         });
-        let result = validate_custom_credential("test", &cred);
+        let result = validate_custom_credential("test", &cred, false);
         assert!(result.is_err());
         assert!(
             result
@@ -6050,6 +6148,199 @@ mod tests {
                 .to_string()
                 .contains("spiffe is mutually exclusive")
         );
+    }
+
+    // ============================================================================
+    // aauth Validation Tests
+    // ============================================================================
+
+    #[test]
+    fn test_aauth_default_preserves_existing_auth_without_requiring_identity() {
+        let mut profile = Profile::default();
+        profile.network.aauth_sign_all_outbound = true;
+        profile
+            .network
+            .custom_credentials
+            .insert("bearer".to_string(), header_cred_builder());
+        let mut phantom = header_cred_builder();
+        phantom.credential_key = None;
+        phantom.redeem_phantoms = vec!["partner-token".to_string()];
+        profile
+            .network
+            .custom_credentials
+            .insert("phantom".to_string(), phantom);
+        assert!(validate_profile_custom_credentials(&profile).is_ok());
+    }
+
+    #[test]
+    fn test_explicit_aauth_rejects_phantom_redemption() {
+        let mut cred = header_cred_builder();
+        cred.credential_key = None;
+        cred.redeem_phantoms = vec!["partner-token".to_string()];
+        cred.aauth = Some(true);
+        let error = validate_custom_credential("test", &cred, false)
+            .expect_err("aauth handler cannot redeem phantoms");
+        assert!(error.to_string().contains("redeem_phantoms"));
+    }
+
+    #[test]
+    fn test_validate_custom_credential_aauth_only_valid() {
+        let mut cred = header_cred_builder();
+        cred.credential_key = None;
+        cred.aauth = Some(true);
+        assert!(validate_custom_credential("testapi", &cred, false).is_ok());
+    }
+
+    #[test]
+    fn test_validate_custom_credential_aauth_with_credential_key_rejected() {
+        let mut cred = header_cred_builder();
+        cred.aauth = Some(true);
+        let result = validate_custom_credential("test", &cred, false);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("aauth is mutually exclusive")
+        );
+    }
+
+    #[test]
+    fn test_validate_custom_credential_aauth_false_does_not_count_as_auth_mechanism() {
+        let mut cred = header_cred_builder();
+        cred.credential_key = None;
+        cred.aauth = Some(false);
+        let result = validate_custom_credential("test", &cred, false);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("must have either"));
+    }
+
+    #[test]
+    fn test_validate_custom_credential_aauth_sign_all_outbound_default_is_valid_with_no_fields() {
+        let mut cred = header_cred_builder();
+        cred.credential_key = None;
+        cred.aauth = None;
+        // No per-route field set, but the profile-wide default signs everything.
+        assert!(validate_custom_credential("test", &cred, true).is_ok());
+    }
+
+    #[test]
+    fn test_validate_custom_credential_aauth_false_opts_out_of_sign_all_outbound() {
+        let mut cred = header_cred_builder();
+        cred.aauth = Some(false);
+        // credential_key is still set, so this is a normal header-credential
+        // route that explicitly opts out of the profile-wide aauth default.
+        assert!(validate_custom_credential("test", &cred, true).is_ok());
+    }
+
+    #[test]
+    fn test_validate_profile_custom_credentials_requires_aauth_identity() {
+        let mut profile = Profile::default();
+        let mut cred = header_cred_builder();
+        cred.credential_key = None;
+        cred.aauth = Some(true);
+        profile
+            .network
+            .custom_credentials
+            .insert("testapi".to_string(), cred);
+        let result = validate_profile_custom_credentials(&profile);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("aauth_identity is not configured")
+        );
+    }
+
+    #[test]
+    fn test_validate_profile_custom_credentials_aauth_identity_present_is_ok() {
+        let mut profile = Profile::default();
+        profile.network.aauth_identity = Some(AauthIdentityDef {
+            agent_id: Some("aauth:demo@nono.local".to_string()),
+            key_ref: "file:///tmp/key.pem".to_string(),
+            scheme: nono_proxy::config::AauthSigSchemeConfig::Hwk,
+        });
+        let mut cred = header_cred_builder();
+        cred.credential_key = None;
+        cred.aauth = Some(true);
+        profile
+            .network
+            .custom_credentials
+            .insert("testapi".to_string(), cred);
+        assert!(validate_profile_custom_credentials(&profile).is_ok());
+    }
+
+    #[test]
+    fn test_validate_profile_custom_credentials_jwks_uri_valid_issuer_is_ok() {
+        let mut profile = Profile::default();
+        profile.network.aauth_identity = Some(AauthIdentityDef {
+            agent_id: None,
+            key_ref: "file:///tmp/key.pem".to_string(),
+            scheme: nono_proxy::config::AauthSigSchemeConfig::JwksUri {
+                issuer: "https://agent.example.com".to_string(),
+            },
+        });
+        let mut cred = header_cred_builder();
+        cred.credential_key = None;
+        cred.aauth = Some(true);
+        profile
+            .network
+            .custom_credentials
+            .insert("testapi".to_string(), cred);
+        assert!(validate_profile_custom_credentials(&profile).is_ok());
+    }
+
+    #[test]
+    fn test_validate_profile_custom_credentials_jwks_uri_rejects_explicit_agent_id() {
+        let mut profile = Profile::default();
+        profile.network.aauth_identity = Some(AauthIdentityDef {
+            agent_id: Some("aauth:should-not-be-set@nono.local".to_string()),
+            key_ref: "file:///tmp/key.pem".to_string(),
+            scheme: nono_proxy::config::AauthSigSchemeConfig::JwksUri {
+                issuer: "https://agent.example.com".to_string(),
+            },
+        });
+        let mut cred = header_cred_builder();
+        cred.credential_key = None;
+        cred.aauth = Some(true);
+        profile
+            .network
+            .custom_credentials
+            .insert("testapi".to_string(), cred);
+        let result = validate_profile_custom_credentials(&profile);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("must not be set under jwks_uri")
+        );
+    }
+
+    #[test]
+    fn test_validate_profile_custom_credentials_jwks_uri_rejects_malformed_issuer() {
+        for bad_issuer in [
+            "http://agent.example.com",       // wrong scheme
+            "https://agent.example.com:8443", // must not have a port
+            "https://agent.example.com/path", // must not have a path
+            "not-a-url",
+        ] {
+            let mut profile = Profile::default();
+            profile.network.aauth_identity = Some(AauthIdentityDef {
+                agent_id: None,
+                key_ref: "file:///tmp/key.pem".to_string(),
+                scheme: nono_proxy::config::AauthSigSchemeConfig::JwksUri {
+                    issuer: bad_issuer.to_string(),
+                },
+            });
+            let result = validate_profile_custom_credentials(&profile);
+            assert!(result.is_err(), "issuer '{bad_issuer}' should be rejected");
+            assert!(
+                result.unwrap_err().to_string().contains("issuer"),
+                "error for '{bad_issuer}' should mention the issuer field"
+            );
+        }
     }
 
     // ============================================================================
@@ -6079,8 +6370,9 @@ mod tests {
             aws_auth: None,
             spiffe: None,
             rate_limit: None,
+            aauth: None,
         };
-        assert!(validate_custom_credential("telegram", &cred).is_ok());
+        assert!(validate_custom_credential("telegram", &cred, false).is_ok());
     }
 
     #[test]
@@ -6106,8 +6398,9 @@ mod tests {
             aws_auth: None,
             spiffe: None,
             rate_limit: None,
+            aauth: None,
         };
-        let result = validate_custom_credential("telegram", &cred);
+        let result = validate_custom_credential("telegram", &cred, false);
         let err = result.expect_err("missing path_pattern should be rejected");
         assert!(err.to_string().contains("path_pattern is required"));
     }
@@ -6135,8 +6428,9 @@ mod tests {
             aws_auth: None,
             spiffe: None,
             rate_limit: None,
+            aauth: None,
         };
-        let result = validate_custom_credential("telegram", &cred);
+        let result = validate_custom_credential("telegram", &cred, false);
         let err = result.expect_err("pattern without {} should be rejected");
         assert!(err.to_string().contains("{}"));
     }
@@ -6164,8 +6458,9 @@ mod tests {
             aws_auth: None,
             spiffe: None,
             rate_limit: None,
+            aauth: None,
         };
-        assert!(validate_custom_credential("telegram", &cred).is_ok());
+        assert!(validate_custom_credential("telegram", &cred, false).is_ok());
     }
 
     #[test]
@@ -6191,8 +6486,9 @@ mod tests {
             aws_auth: None,
             spiffe: None,
             rate_limit: None,
+            aauth: None,
         };
-        let result = validate_custom_credential("telegram", &cred);
+        let result = validate_custom_credential("telegram", &cred, false);
         let err = result.expect_err("replacement without {} should be rejected");
         assert!(err.to_string().contains("{}"));
     }
@@ -6220,8 +6516,9 @@ mod tests {
             aws_auth: None,
             spiffe: None,
             rate_limit: None,
+            aauth: None,
         };
-        assert!(validate_custom_credential("google_maps", &cred).is_ok());
+        assert!(validate_custom_credential("google_maps", &cred, false).is_ok());
     }
 
     #[test]
@@ -6247,8 +6544,9 @@ mod tests {
             aws_auth: None,
             spiffe: None,
             rate_limit: None,
+            aauth: None,
         };
-        let result = validate_custom_credential("google_maps", &cred);
+        let result = validate_custom_credential("google_maps", &cred, false);
         let err = result.expect_err("missing query_param_name should be rejected");
         assert!(err.to_string().contains("query_param_name is required"));
     }
@@ -6276,8 +6574,9 @@ mod tests {
             aws_auth: None,
             spiffe: None,
             rate_limit: None,
+            aauth: None,
         };
-        let result = validate_custom_credential("google_maps", &cred);
+        let result = validate_custom_credential("google_maps", &cred, false);
         let err = result.expect_err("empty query_param_name should be rejected");
         assert!(err.to_string().contains("cannot be empty"));
     }
@@ -6305,10 +6604,11 @@ mod tests {
             aws_auth: None,
             spiffe: None,
             rate_limit: None,
+            aauth: None,
         };
         // BasicAuth mode doesn't require additional fields
         // Credential value is expected to be "username:password" format
-        assert!(validate_custom_credential("example", &cred).is_ok());
+        assert!(validate_custom_credential("example", &cred, false).is_ok());
     }
 
     #[test]
@@ -6323,7 +6623,7 @@ mod tests {
             query_param_name: None,
         });
 
-        let result = validate_custom_credential("test", &cred);
+        let result = validate_custom_credential("test", &cred, false);
         let err = result.expect_err("proxy query_param_name should be required");
         assert!(
             err.to_string()
@@ -6344,7 +6644,7 @@ mod tests {
             query_param_name: None,
         });
 
-        assert!(validate_custom_credential("test", &cred).is_ok());
+        assert!(validate_custom_credential("test", &cred, false).is_ok());
     }
 
     #[test]
@@ -6360,7 +6660,7 @@ mod tests {
             query_param_name: None,
         });
 
-        assert!(validate_custom_credential("test", &cred).is_ok());
+        assert!(validate_custom_credential("test", &cred, false).is_ok());
     }
 
     // ============================================================================
@@ -6374,7 +6674,7 @@ mod tests {
         let mut cred = header_cred_builder();
         cred.credential_key = Some("op://Development/OpenAI/credential".to_string());
         cred.env_var = None;
-        let result = validate_custom_credential("openai", &cred);
+        let result = validate_custom_credential("openai", &cred, false);
         let err = result.expect_err("op:// URI without env_var should be rejected");
         assert!(err.to_string().contains("env_var is required"));
     }
@@ -6384,7 +6684,7 @@ mod tests {
         let mut cred = header_cred_builder();
         cred.credential_key = Some("op://Development/OpenAI/credential".to_string());
         cred.env_var = Some("OPENAI_API_KEY".to_string());
-        assert!(validate_custom_credential("openai", &cred).is_ok());
+        assert!(validate_custom_credential("openai", &cred, false).is_ok());
     }
 
     #[test]
@@ -6392,7 +6692,7 @@ mod tests {
         let mut cred = header_cred_builder();
         cred.credential_key = Some("bw://my-api-key".to_string());
         cred.env_var = None;
-        let result = validate_custom_credential("openai", &cred);
+        let result = validate_custom_credential("openai", &cred, false);
         let err = result.expect_err("bw:// URI without env_var should be rejected");
         assert!(err.to_string().contains("env_var is required"));
     }
@@ -6402,7 +6702,7 @@ mod tests {
         let mut cred = header_cred_builder();
         cred.credential_key = Some("bw://my-api-key".to_string());
         cred.env_var = Some("OPENAI_API_KEY".to_string());
-        assert!(validate_custom_credential("openai", &cred).is_ok());
+        assert!(validate_custom_credential("openai", &cred, false).is_ok());
     }
 
     #[test]
@@ -6410,7 +6710,7 @@ mod tests {
         let mut cred = header_cred_builder();
         cred.credential_key = Some("bw://my-item/password".to_string());
         cred.env_var = Some("OPENAI_API_KEY".to_string());
-        assert!(validate_custom_credential("openai", &cred).is_ok());
+        assert!(validate_custom_credential("openai", &cred, false).is_ok());
     }
 
     #[test]
@@ -6418,7 +6718,7 @@ mod tests {
         let mut cred = header_cred_builder();
         cred.credential_key = Some("bw://".to_string());
         cred.env_var = Some("MY_VAR".to_string());
-        let err = validate_custom_credential("openai", &cred)
+        let err = validate_custom_credential("openai", &cred, false)
             .expect_err("empty bw:// item ID should be rejected");
         assert!(
             err.to_string().contains("Bitwarden URI"),
@@ -6432,7 +6732,7 @@ mod tests {
         let mut cred = header_cred_builder();
         cred.credential_key = Some("apple-password://github.com/alice@example.com".to_string());
         cred.env_var = None;
-        let result = validate_custom_credential("github", &cred);
+        let result = validate_custom_credential("github", &cred, false);
         let err = result.expect_err("apple-password URI without env_var should be rejected");
         assert!(err.to_string().contains("env_var is required"));
     }
@@ -6442,14 +6742,14 @@ mod tests {
         let mut cred = header_cred_builder();
         cred.credential_key = Some("apple-password://github.com/alice@example.com".to_string());
         cred.env_var = Some("GITHUB_PASSWORD".to_string());
-        assert!(validate_custom_credential("github", &cred).is_ok());
+        assert!(validate_custom_credential("github", &cred, false).is_ok());
     }
 
     #[test]
     fn test_validate_env_var_empty_rejected() {
         let mut cred = header_cred_builder();
         cred.env_var = Some("".to_string());
-        let result = validate_custom_credential("test", &cred);
+        let result = validate_custom_credential("test", &cred, false);
         let err = result.expect_err("empty env_var should be rejected");
         assert!(err.to_string().contains("cannot be empty"));
     }
@@ -6458,7 +6758,7 @@ mod tests {
     fn test_validate_env_var_invalid_chars_rejected() {
         let mut cred = header_cred_builder();
         cred.env_var = Some("OPEN-AI_KEY".to_string()); // hyphens not allowed
-        let result = validate_custom_credential("test", &cred);
+        let result = validate_custom_credential("test", &cred, false);
         let err = result.expect_err("env_var with hyphens should be rejected");
         assert!(err.to_string().contains("alphanumeric"));
     }
@@ -6469,7 +6769,7 @@ mod tests {
         // (backward compat: falls back to cred_key.to_uppercase())
         let mut cred = header_cred_builder();
         cred.env_var = None;
-        assert!(validate_custom_credential("test", &cred).is_ok());
+        assert!(validate_custom_credential("test", &cred, false).is_ok());
     }
 
     #[test]
@@ -6477,7 +6777,7 @@ mod tests {
         // Explicit env_var with a keyring key is allowed (overrides default)
         let mut cred = header_cred_builder();
         cred.env_var = Some("MY_CUSTOM_VAR".to_string());
-        assert!(validate_custom_credential("test", &cred).is_ok());
+        assert!(validate_custom_credential("test", &cred, false).is_ok());
     }
 
     // ============================================================================
@@ -6513,20 +6813,21 @@ mod tests {
             aws_auth: None,
             spiffe: None,
             rate_limit: None,
+            aauth: None,
         }
     }
 
     #[test]
     fn test_validate_oauth2_auth_valid() {
         let cred = oauth2_cred_builder();
-        assert!(validate_custom_credential("test", &cred).is_ok());
+        assert!(validate_custom_credential("test", &cred, false).is_ok());
     }
 
     #[test]
     fn test_validate_oauth2_auth_and_credential_key_mutually_exclusive() {
         let mut cred = oauth2_cred_builder();
         cred.credential_key = Some("some_key".to_string());
-        let result = validate_custom_credential("test", &cred);
+        let result = validate_custom_credential("test", &cred, false);
         let err = result.expect_err("both auth and credential_key should be rejected");
         assert!(err.to_string().contains("mutually exclusive"));
     }
@@ -6536,7 +6837,7 @@ mod tests {
         let mut cred = oauth2_cred_builder();
         cred.credential_key = None;
         cred.auth = None;
-        let result = validate_custom_credential("test", &cred);
+        let result = validate_custom_credential("test", &cred, false);
         let err = result.expect_err("neither auth nor credential_key should be rejected");
         assert!(err.to_string().contains("must have either"));
     }
@@ -6552,7 +6853,7 @@ mod tests {
             client_assertion: None,
             extra_params: Default::default(),
         });
-        let result = validate_custom_credential("test", &cred);
+        let result = validate_custom_credential("test", &cred, false);
         let err = result.expect_err("HTTP to remote token_url should be rejected");
         assert!(err.to_string().contains("HTTPS"));
     }
@@ -6568,7 +6869,7 @@ mod tests {
             client_assertion: None,
             extra_params: Default::default(),
         });
-        assert!(validate_custom_credential("test", &cred).is_ok());
+        assert!(validate_custom_credential("test", &cred, false).is_ok());
     }
 
     #[test]
@@ -6582,7 +6883,7 @@ mod tests {
             client_assertion: None,
             extra_params: Default::default(),
         });
-        let result = validate_custom_credential("test", &cred);
+        let result = validate_custom_credential("test", &cred, false);
         let err = result.expect_err("empty client_id should be rejected");
         assert!(err.to_string().contains("client_id"));
         assert!(err.to_string().contains("cannot be empty"));
@@ -6599,7 +6900,7 @@ mod tests {
             client_assertion: None,
             extra_params: Default::default(),
         });
-        let result = validate_custom_credential("test", &cred);
+        let result = validate_custom_credential("test", &cred, false);
         let err = result.expect_err("empty client_secret should be rejected");
         assert!(err.to_string().contains("client_secret"));
         assert!(err.to_string().contains("cannot be empty"));
@@ -6620,7 +6921,7 @@ mod tests {
             }),
             extra_params: Default::default(),
         });
-        assert!(validate_custom_credential("test", &cred).is_ok());
+        assert!(validate_custom_credential("test", &cred, false).is_ok());
     }
 
     #[test]
@@ -6638,7 +6939,7 @@ mod tests {
             }),
             extra_params: Default::default(),
         });
-        let result = validate_custom_credential("test", &cred);
+        let result = validate_custom_credential("test", &cred, false);
         let err = result.expect_err("client_id with client_assertion should be rejected");
         assert!(err.to_string().contains("mutually exclusive"));
     }
@@ -6658,7 +6959,7 @@ mod tests {
             }),
             extra_params: Default::default(),
         });
-        let result = validate_custom_credential("test", &cred);
+        let result = validate_custom_credential("test", &cred, false);
         let err = result.expect_err("client_secret with client_assertion should be rejected");
         assert!(err.to_string().contains("mutually exclusive"));
     }
@@ -6674,7 +6975,7 @@ mod tests {
             client_assertion: None,
             extra_params: Default::default(),
         });
-        assert!(validate_custom_credential("test", &cred).is_ok());
+        assert!(validate_custom_credential("test", &cred, false).is_ok());
     }
 
     #[test]
@@ -6858,6 +7159,8 @@ mod tests {
                 upstream_bypass: Vec::new(),
                 approval_backends: BTreeMap::new(),
                 approval_defaults: None,
+                aauth_identity: None,
+                aauth_sign_all_outbound: false,
             },
             diagnostics: DiagnosticsConfig::default(),
             linux: LinuxConfig::default(),
@@ -6951,6 +7254,8 @@ mod tests {
                 upstream_bypass: Vec::new(),
                 approval_backends: BTreeMap::new(),
                 approval_defaults: None,
+                aauth_identity: None,
+                aauth_sign_all_outbound: false,
             },
             diagnostics: DiagnosticsConfig::default(),
             linux: LinuxConfig::default(),
@@ -7467,6 +7772,7 @@ mod tests {
                 aws_auth: None,
                 spiffe: None,
                 rate_limit: None,
+                aauth: None,
             },
         );
 
@@ -7494,6 +7800,7 @@ mod tests {
                 aws_auth: None,
                 spiffe: None,
                 rate_limit: None,
+                aauth: None,
             },
         );
 
@@ -7658,6 +7965,7 @@ mod tests {
                 aws_auth: None,
                 spiffe: None,
                 rate_limit: None,
+                aauth: None,
             },
         );
 
@@ -7685,6 +7993,7 @@ mod tests {
                 aws_auth: None,
                 spiffe: None,
                 rate_limit: None,
+                aauth: None,
             },
         );
 
@@ -9770,7 +10079,7 @@ mod tests {
         cred.credential_key = Some("keyring://my_service/my_account".to_string());
         cred.env_var = Some("EXAMPLE_TOKEN".to_string());
         assert!(
-            validate_custom_credential("krtest", &cred).is_ok(),
+            validate_custom_credential("krtest", &cred, false).is_ok(),
             "keyring:// URI with env_var should be accepted"
         );
     }
@@ -9781,7 +10090,7 @@ mod tests {
         cred.credential_key = Some("keyring://gh:github.com/alice?decode=go-keyring".to_string());
         cred.env_var = Some("GH_TOKEN".to_string());
         assert!(
-            validate_custom_credential("github", &cred).is_ok(),
+            validate_custom_credential("github", &cred, false).is_ok(),
             "keyring:// URI with ?decode=go-keyring should be accepted"
         );
     }
@@ -9791,7 +10100,7 @@ mod tests {
         let mut cred = header_cred_builder();
         cred.credential_key = Some("keyring://my_service/my_account".to_string());
         cred.env_var = None;
-        let err = validate_custom_credential("krtest", &cred)
+        let err = validate_custom_credential("krtest", &cred, false)
             .expect_err("keyring:// URI without env_var should be rejected");
         assert!(
             err.to_string().contains("env_var is required"),
@@ -9810,7 +10119,7 @@ mod tests {
         let mut cred = header_cred_builder();
         cred.credential_key = Some("keyring://my_service".to_string());
         cred.env_var = Some("EXAMPLE_TOKEN".to_string());
-        let err = validate_custom_credential("krtest", &cred)
+        let err = validate_custom_credential("krtest", &cred, false)
             .expect_err("keyring:// URI without an account segment should be rejected");
         assert!(
             err.to_string().contains("keyring URI"),
@@ -9824,7 +10133,7 @@ mod tests {
         let mut cred = header_cred_builder();
         cred.credential_key = Some("keyring://my_service/alice;rm -rf".to_string());
         cred.env_var = Some("EXAMPLE_TOKEN".to_string());
-        let err = validate_custom_credential("krtest", &cred)
+        let err = validate_custom_credential("krtest", &cred, false)
             .expect_err("keyring:// URI with a shell metacharacter should be rejected");
         assert!(
             err.to_string().contains("forbidden character"),
@@ -9838,7 +10147,7 @@ mod tests {
         let mut cred = header_cred_builder();
         cred.credential_key = Some("keyring://my_service/alice?foo=bar".to_string());
         cred.env_var = Some("EXAMPLE_TOKEN".to_string());
-        let err = validate_custom_credential("krtest", &cred)
+        let err = validate_custom_credential("krtest", &cred, false)
             .expect_err("keyring:// URI with an unknown query parameter should be rejected");
         assert!(
             err.to_string().contains("unknown query parameter"),
@@ -9905,9 +10214,10 @@ mod tests {
             aws_auth: None,
             spiffe: None,
             rate_limit: None,
+            aauth: None,
         };
         assert!(
-            validate_custom_credential("example", &cred).is_ok(),
+            validate_custom_credential("example", &cred, false).is_ok(),
             "file:// URI with env_var should be accepted"
         );
     }
@@ -9935,8 +10245,9 @@ mod tests {
             aws_auth: None,
             spiffe: None,
             rate_limit: None,
+            aauth: None,
         };
-        let result = validate_custom_credential("example", &cred);
+        let result = validate_custom_credential("example", &cred, false);
         let err = result.expect_err("file:// URI without env_var should be rejected");
         assert!(
             err.to_string().contains("env_var is required"),
@@ -9968,8 +10279,9 @@ mod tests {
             aws_auth: None,
             spiffe: None,
             rate_limit: None,
+            aauth: None,
         };
-        let result = validate_custom_credential("example", &cred);
+        let result = validate_custom_credential("example", &cred, false);
         let err = result.expect_err("file:// URI with relative path should be rejected");
         assert!(
             err.to_string().contains("file://"),
@@ -10001,8 +10313,9 @@ mod tests {
             aws_auth: None,
             spiffe: None,
             rate_limit: None,
+            aauth: None,
         };
-        let result = validate_custom_credential("example", &cred);
+        let result = validate_custom_credential("example", &cred, false);
         assert!(
             result.is_err(),
             "file:// URI with path traversal should be rejected"
@@ -10066,8 +10379,9 @@ mod tests {
             aws_auth: None,
             spiffe: None,
             rate_limit: None,
+            aauth: None,
         };
-        assert!(validate_custom_credential("example", &cred).is_ok());
+        assert!(validate_custom_credential("example", &cred, false).is_ok());
     }
 
     #[test]
@@ -10560,8 +10874,9 @@ mod tests {
             aws_auth: None,
             spiffe: None,
             rate_limit: None,
+            aauth: None,
         };
-        let result = validate_custom_credential("example", &cred);
+        let result = validate_custom_credential("example", &cred, false);
         assert!(result.is_err(), "env://LD_PRELOAD should be rejected");
     }
 
@@ -11370,13 +11685,14 @@ mod tests {
             tls_client_key: None,
             spiffe: None,
             rate_limit: None,
+            aauth: None,
         }
     }
 
     #[test]
     fn test_aws_auth_minimal_valid() {
         let cred = aws_auth_cred_builder();
-        assert!(validate_custom_credential("bedrock", &cred).is_ok());
+        assert!(validate_custom_credential("bedrock", &cred, false).is_ok());
     }
 
     #[test]
@@ -11389,7 +11705,7 @@ mod tests {
             }),
             ..aws_auth_cred_builder()
         };
-        assert!(validate_custom_credential("bedrock", &cred).is_ok());
+        assert!(validate_custom_credential("bedrock", &cred, false).is_ok());
     }
 
     #[test]
@@ -11399,7 +11715,7 @@ mod tests {
             upstream: "http://bedrock-runtime.us-east-1.amazonaws.com".to_string(),
             ..aws_auth_cred_builder()
         };
-        let result = validate_custom_credential("bedrock", &cred);
+        let result = validate_custom_credential("bedrock", &cred, false);
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(
@@ -11415,7 +11731,7 @@ mod tests {
             credential_key: Some("my_aws_key".to_string()),
             ..aws_auth_cred_builder()
         };
-        let result = validate_custom_credential("bedrock", &cred);
+        let result = validate_custom_credential("bedrock", &cred, false);
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(
@@ -11438,7 +11754,7 @@ mod tests {
             }),
             ..aws_auth_cred_builder()
         };
-        let result = validate_custom_credential("bedrock", &cred);
+        let result = validate_custom_credential("bedrock", &cred, false);
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(
@@ -11458,7 +11774,7 @@ mod tests {
             rate_limit: None,
             ..aws_auth_cred_builder()
         };
-        let result = validate_custom_credential("bedrock", &cred);
+        let result = validate_custom_credential("bedrock", &cred, false);
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(
@@ -11478,7 +11794,7 @@ mod tests {
             }),
             ..aws_auth_cred_builder()
         };
-        let result = validate_custom_credential("bedrock", &cred);
+        let result = validate_custom_credential("bedrock", &cred, false);
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(
@@ -11498,7 +11814,7 @@ mod tests {
             }),
             ..aws_auth_cred_builder()
         };
-        let result = validate_custom_credential("bedrock", &cred);
+        let result = validate_custom_credential("bedrock", &cred, false);
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(
@@ -11518,7 +11834,7 @@ mod tests {
             }),
             ..aws_auth_cred_builder()
         };
-        let result = validate_custom_credential("bedrock", &cred);
+        let result = validate_custom_credential("bedrock", &cred, false);
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(
@@ -11538,7 +11854,7 @@ mod tests {
             }),
             ..aws_auth_cred_builder()
         };
-        let result = validate_custom_credential("bedrock", &cred);
+        let result = validate_custom_credential("bedrock", &cred, false);
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(
@@ -11558,7 +11874,7 @@ mod tests {
             }),
             ..aws_auth_cred_builder()
         };
-        let result = validate_custom_credential("bedrock", &cred);
+        let result = validate_custom_credential("bedrock", &cred, false);
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(
@@ -11603,7 +11919,7 @@ mod tests {
             }),
             ..aws_auth_cred_builder()
         };
-        let result = validate_custom_credential("bedrock", &cred);
+        let result = validate_custom_credential("bedrock", &cred, false);
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(
@@ -11623,7 +11939,7 @@ mod tests {
             }),
             ..aws_auth_cred_builder()
         };
-        let result = validate_custom_credential("bedrock", &cred);
+        let result = validate_custom_credential("bedrock", &cred, false);
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(
@@ -11643,7 +11959,7 @@ mod tests {
             }),
             ..aws_auth_cred_builder()
         };
-        assert!(validate_custom_credential("bedrock", &cred).is_ok());
+        assert!(validate_custom_credential("bedrock", &cred, false).is_ok());
     }
 
     // --- region lowercase enforcement ---
@@ -11658,7 +11974,7 @@ mod tests {
             }),
             ..aws_auth_cred_builder()
         };
-        let result = validate_custom_credential("bedrock", &cred);
+        let result = validate_custom_credential("bedrock", &cred, false);
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(
@@ -11678,7 +11994,7 @@ mod tests {
             }),
             ..aws_auth_cred_builder()
         };
-        let result = validate_custom_credential("bedrock", &cred);
+        let result = validate_custom_credential("bedrock", &cred, false);
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(
@@ -11700,7 +12016,7 @@ mod tests {
             }),
             ..aws_auth_cred_builder()
         };
-        let result = validate_custom_credential("bedrock", &cred);
+        let result = validate_custom_credential("bedrock", &cred, false);
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(
@@ -11720,7 +12036,7 @@ mod tests {
             }),
             ..aws_auth_cred_builder()
         };
-        let result = validate_custom_credential("bedrock", &cred);
+        let result = validate_custom_credential("bedrock", &cred, false);
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(
@@ -11740,7 +12056,7 @@ mod tests {
             }),
             ..aws_auth_cred_builder()
         };
-        assert!(validate_custom_credential("cf", &cred).is_ok());
+        assert!(validate_custom_credential("cf", &cred, false).is_ok());
     }
 
     #[test]
@@ -11753,7 +12069,7 @@ mod tests {
             }),
             ..aws_auth_cred_builder()
         };
-        assert!(validate_custom_credential("apigw", &cred).is_ok());
+        assert!(validate_custom_credential("apigw", &cred, false).is_ok());
     }
 
     // --- platform_overrides tests ---

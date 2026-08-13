@@ -1,0 +1,301 @@
+---
+title: Aauth Agent Identity
+description: Give sandboxed applications a self-hosted Aauth identity and sign permitted API calls on the host.
+---
+
+nono signs API requests on behalf of a sandboxed application. The application uses a local
+base URL; the host proxy checks endpoint policy, attaches an agent token, and signs the request
+before forwarding it to the real API over HTTPS.
+
+```text
+Application → local nono URL → endpoint policy → token + signature → HTTPS API
+                                                                    ↓
+                                                 issuer metadata → public JWKS
+```
+
+The application needs no Aauth library or access to the private key. The receiving API verifies
+the agent token against your hosted public key, then verifies the request against the key bound
+into that token. It decides whether the identified agent may access the resource.
+
+This MVP implements the [self-hosted agent pattern](https://dickhardt.github.io/AAuth/draft-hardt-aauth-bootstrap.html#section-4.3):
+one persistent Ed25519 key signs both the agent token and HTTP requests. It supports resources
+that accept agent identity alone. Person-server consent, access-server authorization, and
+external agent-provider enrollment are outside this implementation.
+
+## End-to-end setup
+
+You need an Ed25519 private key, a public HTTPS host for its discovery documents, and an API
+that accepts Aauth agent identity. The examples use `https://identity.example.com` for your
+issuer; replace it with a host you control.
+
+### 1. Generate or choose a key
+
+```bash
+nono aauth keygen --keyref "$HOME/.config/nono/aauth-keys/agent.pem"
+nono aauth show --keyref "$HOME/.config/nono/aauth-keys/agent.pem"
+```
+
+`keygen` creates an unencrypted Ed25519 PKCS#8 PEM file. It refuses to overwrite an existing file;
+`--force` explicitly replaces it. `show` prints the algorithm, public JWK, and thumbprint.
+Existing supported keys can be referenced directly; there is no import command.
+
+Keep the key outside all directories granted to the sandbox. The recommended directory is
+`~/.config/nono/aauth-keys/`; keys can live elsewhere. JSON profiles must use an absolute path,
+because `~` and `$HOME` are not expanded inside JSON.
+
+### 2. Publish two public JSON documents
+
+Export the public JWKS:
+
+```bash
+mkdir -p aauth-public/.well-known
+nono aauth show --keyref "$HOME/.config/nono/aauth-keys/agent.pem" --jwks > aauth-public/jwks.json
+```
+
+The output has this shape; `x` and `kid` come from your key:
+
+```json
+{
+  "keys": [
+    {
+      "kty": "OKP",
+      "crv": "Ed25519",
+      "x": "<public-key>",
+      "alg": "Ed25519",
+      "kid": "<key-thumbprint>"
+    }
+  ]
+}
+```
+
+Choose a bare HTTPS origin under your control, such as `https://identity.example.com`.
+Create `aauth-public/.well-known/aauth-agent.json`:
+
+```json
+{
+  "issuer": "https://identity.example.com",
+  "jwks_uri": "https://identity.example.com/jwks.json"
+}
+```
+
+Replace the example domain with your real host in both fields. Deploy **only the
+`aauth-public` directory** to a static HTTPS host, preserving the `.well-known` directory.
+No application server or token endpoint is needed. Do not publish the private key or agent token.
+
+Check both URLs from outside your machine:
+
+```bash
+curl --fail https://identity.example.com/.well-known/aauth-agent.json
+curl --fail https://identity.example.com/jwks.json
+```
+
+The receiver follows the token's issuer to its metadata, reads `jwks_uri`, and selects the
+published key matching the token header's `kid`. The issuer must be reachable with a trusted
+HTTPS certificate. nono does not host these files or check their reachability at startup.
+
+Discovery must be at the origin's root: `https://identity.example.com/.well-known/aauth-agent.json`.
+An issuer cannot include a path, port, or trailing slash. The `jwks_uri` may include a path or
+point to another HTTPS host.
+
+### 3. Configure the identity and a Whoami route
+
+Save this as `whoami-aauth.json`. Replace the issuer, the domain in `agent_id`, and the absolute
+key path. The route calls the public Whoami resource and allows only `GET /`:
+
+```json
+{
+  "network": {
+    "credentials": ["aauthapi"],
+    "aauth_identity": {
+      "key_ref": "/home/alice/.config/nono/aauth-keys/agent.pem",
+      "agent_id": "aauth:nono-agent@identity.example.com",
+      "scheme": {
+        "type": "jwt",
+        "issuer": "https://identity.example.com"
+      }
+    },
+    "custom_credentials": {
+      "aauthapi": {
+        "upstream": "https://whoami.aauth.dev",
+        "aauth": true,
+        "endpoint_policy": {
+          "default": { "decision": "deny" },
+          "allow": [
+            { "method": "GET", "path": "/" }
+          ]
+        }
+      }
+    }
+  }
+}
+```
+
+The `jwt` scheme is the Aauth **agent-token** flow. `jwks_uri` is still the field in your
+hosted metadata; it is not the request scheme in this flow.
+
+`agent_id` is the token's stable subject, in the form `aauth:local@domain`. Its domain must
+match the issuer host. The local part supports 1–255 ASCII letters, digits, hyphens, underscores,
+and periods, with case preserved. This MVP issues top-level agents only.
+
+Route definitions must also appear in `network.credentials` to become active.
+The route name produces `AAUTHAPI_BASE_URL` inside the sandbox. Use simple names such as
+`aauthapi`, since hyphens are preserved in environment variable names.
+
+### 4. Make an allowed request
+
+```bash
+nono run --profile whoami-aauth.json -- \
+  sh -c 'curl --noproxy "" --max-time 30 --fail-with-body "$AAUTHAPI_BASE_URL/"'
+```
+
+The application calls the local URL. nono creates the agent token at startup, signs the allowed
+request, and forwards it to `https://whoami.aauth.dev/`. The application needs no signing or
+token-management code. A successful response identifies the issuer and agent, with this shape
+for the example configuration:
+
+```json
+{
+  "iss": "https://identity.example.com",
+  "sub": "aauth:nono-agent@identity.example.com"
+}
+```
+
+For this profile:
+
+| Request | Proxy behavior |
+|---|---|
+| `GET /` | Sign and forward; Whoami returns the authenticated identity |
+| `GET /not-permitted` | Return HTTP 403 without forwarding |
+| `POST /` | Return HTTP 403 without forwarding |
+
+The policy matches the method and normalized path. It does not separately restrict query
+parameters or body contents. Denied requests are rejected before signing.
+
+To use your own API, change `upstream` and the permitted methods/paths. For example, an API at
+`https://api.example.com` with an allow rule for `GET /widgets` is called through
+`$AAUTHAPI_BASE_URL/widgets`. The API must implement verification and decide whether the
+identified agent is authorized; a valid signature alone does not grant access.
+
+### 5. Inspect the audit
+
+```bash
+nono audit list --json
+nono audit show <session-id> --json
+```
+
+A successful signed request includes fields like these (illustrative values):
+
+```json
+{
+  "decision": "allow",
+  "route_id": "aauthapi",
+  "auth_mechanism": "aauth_signature",
+  "auth_outcome": "succeeded",
+  "aauth_context": {
+    "scheme": "jwt",
+    "agent_id": "aauth:nono-agent@identity.example.com",
+    "issuer": "https://identity.example.com",
+    "key_thumbprint": "<key-thumbprint>"
+  },
+  "method": "GET",
+  "path": "/",
+  "status": 200
+}
+```
+
+A policy denial identifies the rule that blocked the request:
+
+```json
+{
+  "decision": "deny",
+  "route_id": "aauthapi",
+  "denial_category": "endpoint_policy",
+  "endpoint_policy_rule": "endpoint_policy.default",
+  "method": "GET",
+  "path": "/not-permitted",
+  "status": null
+}
+```
+
+Its upstream `status` is null: nono returned the 403 itself. There is no Aauth signing context
+because the signer was never used. Audit events contain neither the agent token nor private
+key.
+
+## Token lifetime and signing
+
+At startup, nono self-issues a token with `typ: "aa-agent+jwt"`, `alg: "Ed25519"`,
+the hosted key's `kid`, and these claims:
+
+- `iss`: your issuer origin.
+- `sub`: the configured `agent_id`.
+- `dwk`: `aauth-agent.json`.
+- `jti`: a fresh random token identifier.
+- `iat` and `exp`: issuance time and expiry one hour later.
+- `cnf.jwk`: the request-signing public key, including `alg: "Ed25519"`.
+
+The token stays in host memory and is reused within the session. Each request carries
+`Signature-Key: sig=jwt;jwt="…"` and a fresh HTTP Message Signature. The token is bound to the
+signing key; copying it does not let a caller sign requests without the private key.
+
+There is no automatic renewal in this MVP. After one hour, signing fails closed; restart the
+nono session to issue a fresh token. The persistent key and agent ID need not change.
+
+nono generates `Signature`, `Signature-Input`, `Signature-Key`, and `Content-Digest`.
+Signatures cover method, authority, path, non-empty query, signature key, and the SHA-256 body
+digest, including empty bodies. Content-Type, Content-Encoding, Idempotency-Key, and Aauth-Mission
+are covered when present; duplicate semantic headers are rejected. Client-supplied authentication
+and signature headers are stripped.
+
+Each request includes a random signed nonce, creation time, and expiry 60 seconds later,
+capped at the agent token's expiry. The API must check required components, token type and
+signature, request signature, expiry, issuer trust, and authorization. It must atomically reject
+replayed nonces for the same key. nono does not enroll agents or implement API revocation policy.
+
+## Use alongside other credentials
+
+Signing is off by default. Set `aauth: true` on selected routes. Other custom credentials can
+continue using bearer tokens, OAuth, AWS, SPIFFE, or phantom redemption in the same session.
+
+`aauth_sign_all_outbound: true` enables signing by default for configured routes that have no
+other authentication mechanism. `aauth: false` opts a route out. The name does not grant access
+to arbitrary destinations. Explicitly combining Aauth with another auth mechanism on one route
+is rejected.
+
+## Key protection and rotation
+
+- Generated files use mode `0600`; new key directories use `0700`. Creation and replacement
+  are atomic. Files must be regular, owned by the invoking user, and inaccessible to group/others.
+  Symlinks and multiple hard links are rejected.
+- File keys must stay outside sandbox filesystem grants; nono rejects conflicting grants before
+  the child starts. Environment-backed private keys are removed from the child's environment.
+- `key_ref` accepts absolute paths, `file://`, `env://`, and `keyring://`. Files support
+  unencrypted Ed25519 PKCS#8 PEM, DER, and legacy base64 DER. Environment and keyring sources
+  accept PEM or base64 DER. Encrypted PEM, SSH keys, and other key types are unsupported.
+- File-backed keys are unencrypted at rest. An OS-keyring reference is an alternative.
+- Missing, malformed, or unsafe keys stop startup. Signing failures never fall back to unsigned
+  requests.
+
+Keys load at startup. Replacing or deleting the file does not change an already-running signer.
+To rotate, publish the new public key alongside the old key, update the private-key reference,
+and restart affected sessions. Retain the old public key while still-valid tokens require it,
+subject to your API's revocation policy.
+
+## Other signing modes and current limits
+
+| Request scheme | Purpose | Identity |
+|---|---|---|
+| `jwt` | Aauth agent identity; recommended for this workflow | Configured `aauth:local@domain` subject |
+| `hwk` (configuration default) | Generic HTTP signatures with an inline public key | Key possession; optional local `agent_id` audit label |
+| `jwks_uri` | Generic HTTP signatures with key discovery | Issuer URL; a separate `agent_id` is rejected |
+
+The current Aauth agent protocol requires `jwt`; the other modes are generic HTTP Signature Keys
+features, not substitutes for an agent token. Configure `scheme` explicitly for Aauth.
+
+Use the route's local HTTP/1.1 `*_BASE_URL`. The Aauth forwarding path currently uses HTTP/1.1;
+HTTPS is required for non-loopback upstreams. CONNECT interception rejects Aauth routes with
+HTTP 403. Route endpoint policies and rate limits apply before forwarding. For standalone
+`nono proxy`, the existing `--no-auth` skips the local session-token check but preserves Aauth
+signing, endpoint policy, and rate limits.
+
+External AP tokens/enrollment, automatic renewal, person/access-server flows, challenge
+negotiation, sub-agent issuance, X.509, and token exchange are not implemented.

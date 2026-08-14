@@ -32,10 +32,10 @@ pub use linux::is_wsl2;
 #[cfg(target_os = "linux")]
 pub use linux::{
     OpenHow, PreparedLandlockSandbox, PreparedSeccompNotifyFilter, RawSandboxError,
-    RawSandboxStage, SYS_BIND, SYS_CONNECT, SYS_OPENAT, SYS_OPENAT2, SYS_SENDMMSG, SYS_SENDMSG,
-    SYS_SENDTO, SeccompData, SeccompNetFallback, SeccompNotif, SeccompOpts, SockaddrInfo,
-    UnixSocketKind, classify_access_from_flags, classify_af_unix, continue_notif, deny_notif,
-    inject_fd, install_seccomp_af_unix_filter, install_seccomp_notify,
+    RawSandboxStage, SYS_BIND, SYS_CONNECT, SYS_MKDIRAT, SYS_OPENAT, SYS_OPENAT2, SYS_SENDMMSG,
+    SYS_SENDMSG, SYS_SENDTO, SYS_UNLINKAT, SeccompData, SeccompNetFallback, SeccompNotif,
+    SeccompOpts, SockaddrInfo, UnixSocketKind, classify_access_from_flags, classify_af_unix,
+    continue_notif, deny_notif, inject_fd, install_seccomp_af_unix_filter, install_seccomp_notify,
     install_seccomp_proxy_filter, notif_id_valid, prepare_seccomp_af_unix_filter,
     prepare_seccomp_proxy_filter, prepare_seccomp_with_abi, probe_seccomp_block_network_support,
     read_mmsghdr_dests, read_msghdr_dest, read_notif_path, read_notif_sockaddr, read_open_how,

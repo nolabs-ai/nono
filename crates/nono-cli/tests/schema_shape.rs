@@ -981,6 +981,7 @@ fn test_schema_filesystem_config_matches_rust_model() {
             "bypass_protection",
             "suppress_save_prompt",
             "ignore",
+            "allow_lock_dir",
         ],
     );
 }

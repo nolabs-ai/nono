@@ -368,6 +368,10 @@ pub struct SupervisorConfig<'a> {
     /// Pathname AF_UNIX socket grants allowed for seccomp proxy-only fallback.
     #[cfg(target_os = "linux")]
     pub unix_socket_allowlist: &'a [nono::UnixSocketCapability],
+    /// Exact-path lock directory grants mediated via seccomp-notify
+    /// `mkdirat`/`unlinkat`. See `CapabilitySet::lock_dirs`.
+    #[cfg(target_os = "linux")]
+    pub lock_dir_allowlist: &'a [std::path::PathBuf],
     /// Prepared tool-sandbox runtime listener for command-policy shim requests.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub tool_sandbox_runtime: Option<&'a crate::tool_sandbox::PreparedToolSandboxRuntime>,
@@ -539,6 +543,18 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
     #[cfg(not(target_os = "linux"))]
     let _ = resource_procs_fd;
 
+    // Lock-dir grants need the same openat/openat2/mkdirat/unlinkat filter
+    // as capability elevation, so any lock dir grant implies installing it
+    // even when capability_elevation itself is off.
+    #[cfg(target_os = "linux")]
+    let openat_family_notify =
+        config.seccomp_policy.needs_openat_notify() || !config.caps.lock_dirs().is_empty();
+    // Lock dir mediation also reads the child's /proc/PID/mem, so it needs
+    // the same dumpable/subreaper treatment as openat/network notify.
+    #[cfg(target_os = "linux")]
+    let child_requires_dumpable =
+        config.seccomp_policy.child_requires_dumpable() || !config.caps.lock_dirs().is_empty();
+
     let program = &config.command[0];
     let cmd_args = &config.command[1..];
 
@@ -562,7 +578,7 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
     // improves compatibility with CLIs that abort on unexpected inherited fds.
     #[cfg(target_os = "linux")]
     let needs_child_ipc = supervisor.is_some()
-        && (config.seccomp_policy.child_requires_dumpable()
+        && (child_requires_dumpable
             || trust_interceptor.is_some()
             || config.tool_sandbox_runtime.is_some()
             || supervisor.is_some_and(|cfg| {
@@ -838,7 +854,7 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
     // daemonizes and reparents to pid 1 leaves our ancestry and gets its
     // connect()/bind()/openat() denied with EPERM. Subreaping keeps it ours.
     #[cfg(target_os = "linux")]
-    if config.tool_sandbox_runtime.is_some() || config.seccomp_policy.child_requires_dumpable() {
+    if config.tool_sandbox_runtime.is_some() || child_requires_dumpable {
         let ret = unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) };
         if ret != 0 {
             return Err(NonoError::SandboxInit(format!(
@@ -1086,7 +1102,7 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
             // have disabled these flags, but we check again as defense in depth.
             #[cfg(target_os = "linux")]
             {
-                if config.seccomp_policy.needs_openat_notify() && nono::sandbox::is_wsl2() {
+                if openat_family_notify && nono::sandbox::is_wsl2() {
                     let msg = b"nono: WSL2 detected, seccomp-notify required but unavailable\n";
                     unsafe {
                         libc::write(
@@ -1096,9 +1112,7 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
                         );
                         libc::_exit(126);
                     }
-                } else if config.seccomp_policy.needs_openat_notify()
-                    && let Some(fd) = child_sock_fd
-                {
+                } else if openat_family_notify && let Some(fd) = child_sock_fd {
                     match nono::sandbox::install_seccomp_notify() {
                         Ok(notify_fd) => {
                             if let Err(e) = nono::supervisor::socket::send_fd_via_socket(
@@ -1134,7 +1148,7 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
                             }
                         }
                     }
-                } else if config.seccomp_policy.needs_openat_notify() {
+                } else if openat_family_notify {
                     let msg =
                         b"nono: seccomp-notify required but supervisor socket is unavailable\n";
                     unsafe {
@@ -1276,7 +1290,7 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
                     child_keep_fds.push(pnf.as_raw_fd());
                 }
 
-                if !config.seccomp_policy.child_requires_dumpable() {
+                if !child_requires_dumpable {
                     use nix::sys::prctl;
 
                     if let Err(e) = prctl::set_dumpable(false) {
@@ -1419,8 +1433,7 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
             // notify fd from the child. If the child cannot provide it, this is
             // a sandbox initialisation failure rather than a degraded mode.
             #[cfg(target_os = "linux")]
-            let seccomp_notify_fd: Option<OwnedFd> = if config.seccomp_policy.needs_openat_notify()
-            {
+            let seccomp_notify_fd: Option<OwnedFd> = if openat_family_notify {
                 if let Some(ref sup_sock) = supervisor_sock {
                     match sup_sock.recv_fd() {
                         Ok(fd) => {
@@ -5208,6 +5221,8 @@ mod tests {
             #[cfg(target_os = "linux")]
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
+            lock_dir_allowlist: &[],
+            #[cfg(target_os = "linux")]
             seccomp_policy: SeccompPolicy {
                 capability_elevation: false,
                 proxy_fallback: true,
@@ -5335,6 +5350,8 @@ mod tests {
             #[cfg(target_os = "linux")]
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
+            lock_dir_allowlist: &[],
+            #[cfg(target_os = "linux")]
             seccomp_policy: SeccompPolicy {
                 capability_elevation: false,
                 proxy_fallback: true,
@@ -5428,6 +5445,8 @@ mod tests {
             #[cfg(target_os = "linux")]
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
+            lock_dir_allowlist: &[],
+            #[cfg(target_os = "linux")]
             seccomp_policy: SeccompPolicy {
                 capability_elevation: false,
                 proxy_fallback: true,
@@ -5473,6 +5492,8 @@ mod tests {
             proxy_bind_port_ranges: Vec::new(),
             #[cfg(target_os = "linux")]
             unix_socket_allowlist: &[],
+            #[cfg(target_os = "linux")]
+            lock_dir_allowlist: &[],
             #[cfg(target_os = "linux")]
             seccomp_policy: SeccompPolicy {
                 capability_elevation: false,
@@ -5526,6 +5547,8 @@ mod tests {
             proxy_bind_port_ranges: Vec::new(),
             #[cfg(target_os = "linux")]
             unix_socket_allowlist: &[],
+            #[cfg(target_os = "linux")]
+            lock_dir_allowlist: &[],
             #[cfg(target_os = "linux")]
             seccomp_policy: SeccompPolicy {
                 capability_elevation: false,
@@ -5596,6 +5619,8 @@ mod tests {
             #[cfg(target_os = "linux")]
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
+            lock_dir_allowlist: &[],
+            #[cfg(target_os = "linux")]
             seccomp_policy: SeccompPolicy {
                 capability_elevation: false,
                 proxy_fallback: true,
@@ -5625,6 +5650,8 @@ mod tests {
             proxy_bind_port_ranges: Vec::new(),
             #[cfg(target_os = "linux")]
             unix_socket_allowlist: &[],
+            #[cfg(target_os = "linux")]
+            lock_dir_allowlist: &[],
             #[cfg(target_os = "linux")]
             seccomp_policy: SeccompPolicy {
                 capability_elevation: false,
@@ -5674,6 +5701,8 @@ mod tests {
             proxy_bind_port_ranges: Vec::new(),
             #[cfg(target_os = "linux")]
             unix_socket_allowlist: &[],
+            #[cfg(target_os = "linux")]
+            lock_dir_allowlist: &[],
             #[cfg(target_os = "linux")]
             seccomp_policy: SeccompPolicy {
                 capability_elevation: false,
@@ -5829,6 +5858,8 @@ mod tests {
             #[cfg(target_os = "linux")]
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
+            lock_dir_allowlist: &[],
+            #[cfg(target_os = "linux")]
             seccomp_policy: SeccompPolicy {
                 capability_elevation: false,
                 proxy_fallback: true,
@@ -5887,6 +5918,8 @@ mod tests {
             #[cfg(target_os = "linux")]
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
+            lock_dir_allowlist: &[],
+            #[cfg(target_os = "linux")]
             seccomp_policy: SeccompPolicy {
                 capability_elevation: false,
                 proxy_fallback: true,
@@ -5933,6 +5966,8 @@ mod tests {
             proxy_bind_port_ranges: Vec::new(),
             #[cfg(target_os = "linux")]
             unix_socket_allowlist: &[],
+            #[cfg(target_os = "linux")]
+            lock_dir_allowlist: &[],
             #[cfg(target_os = "linux")]
             seccomp_policy: SeccompPolicy {
                 capability_elevation: false,
@@ -5999,6 +6034,8 @@ mod tests {
             proxy_bind_port_ranges: Vec::new(),
             #[cfg(target_os = "linux")]
             unix_socket_allowlist: &[],
+            #[cfg(target_os = "linux")]
+            lock_dir_allowlist: &[],
             #[cfg(target_os = "linux")]
             seccomp_policy: SeccompPolicy {
                 capability_elevation: false,

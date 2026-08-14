@@ -331,6 +331,8 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
         #[cfg(target_os = "linux")]
         unix_socket_allowlist: caps.unix_socket_capabilities(),
         #[cfg(target_os = "linux")]
+        lock_dir_allowlist: caps.lock_dirs(),
+        #[cfg(target_os = "linux")]
         seccomp_policy: config.seccomp_policy,
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         tool_sandbox_runtime: config.tool_sandbox_runtime,

@@ -207,6 +207,14 @@ pub struct FilesystemConfig {
         deserialize_with = "deserialize_conditional_path_vec"
     )]
     pub suppress_save_prompt: Vec<String>,
+    /// Exact lock directory paths a tool creates and removes transiently
+    /// (`mkdir`/`rmdir`) outside any directory otherwise granted, such as a
+    /// PID-file-style lock next to a config file in `$HOME`. Linux-only:
+    /// mediated via seccomp-notify rather than a Landlock subtree grant, so
+    /// nothing else under the parent directory becomes creatable or
+    /// removable. Ignored on macOS.
+    #[serde(default, deserialize_with = "deserialize_conditional_path_vec")]
+    pub allow_lock_dir: Vec<String>,
 }
 
 /// Group composition — include/exclude pair for policy groups.
@@ -3611,6 +3619,10 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
                 &base.filesystem.suppress_save_prompt,
                 &child.filesystem.suppress_save_prompt,
             ),
+            allow_lock_dir: dedup_append(
+                &base.filesystem.allow_lock_dir,
+                &child.filesystem.allow_lock_dir,
+            ),
         },
         network: NetworkConfig {
             block: base.network.block || child.network.block,
@@ -6410,6 +6422,7 @@ mod tests {
                 deny: vec!["/base/policy-deny".to_string()],
                 bypass_protection: vec!["/base/override-deny".to_string()],
                 suppress_save_prompt: vec!["/base/no-prompt".to_string()],
+                allow_lock_dir: vec![],
             },
             network: NetworkConfig {
                 block: false,
@@ -6502,6 +6515,7 @@ mod tests {
                 deny: vec!["/child/policy-deny".to_string()],
                 bypass_protection: vec!["/child/override-deny".to_string()],
                 suppress_save_prompt: vec!["/child/no-prompt".to_string()],
+                allow_lock_dir: vec![],
             },
             network: NetworkConfig {
                 block: false,

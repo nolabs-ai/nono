@@ -827,6 +827,11 @@
           "type": "array",
           "items": { "$ref": "#/$defs/ConditionalPath" },
           "description": "Alias for suppress_save_prompt. Prefer filesystem.suppress_save_prompt in new profiles."
+        },
+        "allow_lock_dir": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/ConditionalPath" },
+          "description": "Exact lock directory paths a tool creates and removes transiently (mkdir/rmdir) outside any directory otherwise granted. Linux-only: mediated via seccomp-notify rather than a Landlock subtree grant. Ignored on macOS."
         }
       }
     },

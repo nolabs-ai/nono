@@ -155,6 +155,100 @@ fn open_proc_comm_for_access(
     options.open(path)
 }
 
+/// Handle a `mkdirat`/`unlinkat` seccomp notification.
+///
+/// The BPF filter traps every `mkdirat`/`unlinkat` in the process, not just
+/// ones aimed at a `lock_dirs` entry — seccomp filters route by syscall
+/// number, not by argument, so this is unavoidable once the filter is
+/// installed at all. Anything that isn't an exact match for `lock_dirs` is
+/// handled with [`continue_notif`], which resumes the child's original
+/// syscall unchanged — Landlock then enforces exactly as it would have if
+/// this filter didn't exist. Only an exact match gets special treatment.
+///
+/// Exact matches are not brokered the way `openat` is (there is no fd to
+/// inject): the supervisor performs the real `mkdir`/`rmdir` itself, on its
+/// own unsandboxed path, and relays the exact result back to the child. The
+/// child's own syscall never runs in that case — so this can only ever
+/// widen access to the literal paths in `lock_dirs`, never anything else.
+///
+/// `unlinkat` is only treated as a potential match when `AT_REMOVEDIR` is
+/// set; a plain file unlink on one of these paths is passed through
+/// unchanged like any other non-matching request.
+fn handle_lock_dir_notification(
+    notify_fd: std::os::fd::RawFd,
+    notif: nono::sandbox::SeccompNotif,
+    lock_dirs: &[std::path::PathBuf],
+) -> Result<()> {
+    use nono::sandbox::{
+        SYS_MKDIRAT, continue_notif, notif_id_valid, read_notif_path, resolve_notif_path,
+        respond_notif_errno,
+    };
+
+    // args[0] = dirfd, args[1] = pathname for both mkdirat and unlinkat.
+    let path = match read_notif_path(notif.pid, notif.data.args[1]) {
+        Ok(raw_path) => match resolve_notif_path(notif.pid, notif.data.args[0], &raw_path) {
+            Ok(resolved) => resolved,
+            Err(e) => {
+                debug!(
+                    "Failed to resolve dirfd-relative path '{}' for mkdirat/unlinkat, continuing: {}",
+                    raw_path.display(),
+                    e
+                );
+                let _ = continue_notif(notify_fd, notif.id);
+                return Ok(());
+            }
+        },
+        Err(e) => {
+            debug!(
+                "Failed to read path from mkdirat/unlinkat seccomp notification, continuing: {}",
+                e
+            );
+            let _ = continue_notif(notify_fd, notif.id);
+            return Ok(());
+        }
+    };
+
+    let is_mkdirat = notif.data.nr == SYS_MKDIRAT;
+    if !is_mkdirat {
+        // unlinkat: args[2] is the flags integer; only a candidate match
+        // when AT_REMOVEDIR is set.
+        let flags = notif.data.args[2] as i32;
+        if flags & libc::AT_REMOVEDIR == 0 {
+            let _ = continue_notif(notify_fd, notif.id);
+            return Ok(());
+        }
+    }
+
+    if !lock_dirs.iter().any(|allowed| allowed == &path) {
+        let _ = continue_notif(notify_fd, notif.id);
+        return Ok(());
+    }
+
+    if !notif_id_valid(notify_fd, notif.id)? {
+        debug!("Seccomp notification expired (lock dir TOCTOU check)");
+        return Ok(());
+    }
+
+    // Same TOCTOU acceptance as the openat broker path: the notification ID
+    // check above only proves liveness, not that a symlink in the parent
+    // chain hasn't changed since resolution. The result is still the exact
+    // outcome of a real mkdir/rmdir at this path, performed by the
+    // supervisor's own (unsandboxed) privileges — never the child's.
+    let result = if is_mkdirat {
+        std::fs::create_dir(&path)
+    } else {
+        std::fs::remove_dir(&path)
+    };
+
+    let errno = match result {
+        Ok(()) => 0,
+        Err(e) => e.raw_os_error().unwrap_or(libc::EIO),
+    };
+
+    respond_notif_errno(notify_fd, notif.id, errno)?;
+    Ok(())
+}
+
 /// Handle a seccomp notification on Linux.
 ///
 /// Flow:
@@ -202,6 +296,13 @@ pub(super) fn handle_seccomp_notification(
 
     // 1. Receive the notification
     let notif = recv_notif(notify_fd)?;
+
+    if matches!(
+        notif.data.nr,
+        nono::sandbox::SYS_MKDIRAT | nono::sandbox::SYS_UNLINKAT
+    ) {
+        return handle_lock_dir_notification(notify_fd, notif, config.lock_dir_allowlist);
+    }
 
     // 2. Read the path from the child's memory (args[1] = pathname for openat/openat2)
     //    Then resolve dirfd-relative paths using /proc/PID/fd/DIRFD or /proc/PID/cwd.
@@ -1676,6 +1777,7 @@ mod tests {
                 proxy_bind_ports,
                 proxy_bind_port_ranges,
                 unix_socket_allowlist,
+                lock_dir_allowlist: &[],
                 seccomp_policy: super::super::SeccompPolicy {
                     capability_elevation: false,
                     proxy_fallback: true,

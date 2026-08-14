@@ -404,6 +404,17 @@ pub(crate) fn new_future_file_capability(path: &Path, access: AccessMode) -> Res
 
 #[cfg(target_os = "macos")]
 fn resolve_missing_leaf_path(path: &Path) -> Result<PathBuf> {
+    resolve_possibly_missing_path(path)
+}
+
+/// Resolve `path` even if its leaf does not exist yet, by canonicalizing the
+/// nearest existing ancestor (following any symlinks in it) and re-appending
+/// the remaining components verbatim.
+///
+/// Used for grants on paths that a tool creates and removes transiently
+/// (e.g. a lock directory), where requiring the path to exist at
+/// profile-resolution time would make the grant unusable.
+fn resolve_possibly_missing_path(path: &Path) -> Result<PathBuf> {
     for ancestor in path.ancestors() {
         match ancestor.canonicalize() {
             Ok(mut canonical) => {
@@ -794,6 +805,28 @@ impl CapabilitySetExt for CapabilitySet {
                 cap.source = CapabilitySource::Profile;
                 caps.add_fs(cap);
             }
+        }
+
+        // Exact-path lock directories (Linux seccomp-notify mediation only;
+        // see `CapabilitySet::lock_dirs`). The target need not exist yet —
+        // it is normally created and removed transiently by the sandboxed
+        // process — so only the parent chain is resolved/validated here.
+        let allow_lock_dir_expanded = expand_dynamic_tokens(&fs.allow_lock_dir, Some(workdir))?;
+        for path_template in &allow_lock_dir_expanded {
+            let path = expand_path(path_template, workdir)?;
+            let resolved = resolve_possibly_missing_path(&path)?;
+            // Exact-path grant, not a subtree: only check the leaf itself
+            // against protected roots, not whether its parent overlaps one
+            // (unlike a real directory grant, nothing beneath the parent
+            // becomes accessible here).
+            protected_paths::validate_requested_path_against_protected_roots(
+                &resolved,
+                true,
+                "Profile",
+                protected_roots.as_paths(),
+                allow_parent_of_protected,
+            )?;
+            caps.add_lock_dir(resolved);
         }
 
         // AF_UNIX socket capabilities from profile (issue #685 / #696).

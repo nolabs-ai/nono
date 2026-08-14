@@ -930,6 +930,15 @@ pub struct CapabilitySet {
     /// AF_UNIX socket capabilities (pathname grants only; see
     /// [`UnixSocketCapability`] and issue #685).
     unix_sockets: Vec<UnixSocketCapability>,
+    /// Exact-path directory create/remove grants for lock directories that
+    /// tools create transiently (`mkdir`+`rmdir`) outside any directory the
+    /// sandbox otherwise grants. Unlike [`FsCapability`], these are not
+    /// subtree grants: on Linux the supervisor mediates `mkdirat`/`unlinkat`
+    /// via seccomp-notify and performs the operation itself only when the
+    /// resolved path matches an entry here exactly, so nothing else under
+    /// the parent directory becomes creatable or removable. Linux-only;
+    /// ignored on macOS.
+    lock_dirs: Vec<PathBuf>,
     /// Network access mode (default: AllowAll)
     network_mode: NetworkMode,
     /// Per-port TCP connect allowlist (Linux Landlock V4+ only).
@@ -1298,6 +1307,15 @@ impl CapabilitySet {
         self.unix_sockets.push(cap);
     }
 
+    /// Grant exact-path create/remove access to a lock directory.
+    ///
+    /// `path` must already be resolved (symlinks in its parent chain
+    /// followed) by the caller, since the target itself need not exist yet.
+    /// See [`Self::lock_dirs`] for how this is enforced.
+    pub fn add_lock_dir(&mut self, path: PathBuf) {
+        self.lock_dirs.push(path);
+    }
+
     /// Register a `$PATH` directory for metadata-only read. The path need not
     /// exist on disk. See [`path_metadata_dirs`](Self::path_metadata_dirs).
     #[cfg(target_os = "macos")]
@@ -1499,6 +1517,12 @@ impl CapabilitySet {
     #[must_use]
     pub fn unix_socket_capabilities(&self) -> &[UnixSocketCapability] {
         &self.unix_sockets
+    }
+
+    /// Get exact-path lock directory grants.
+    #[must_use]
+    pub fn lock_dirs(&self) -> &[PathBuf] {
+        &self.lock_dirs
     }
 
     /// True if any AF_UNIX socket capability covers `sockaddr_path` and

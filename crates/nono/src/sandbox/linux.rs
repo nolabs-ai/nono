@@ -1555,6 +1555,14 @@ const SYS_SOCKETPAIR: i32 = libc::SYS_socketpair as i32;
 #[cfg(target_os = "linux")]
 const SYS_IO_URING_SETUP: i32 = libc::SYS_io_uring_setup as i32;
 
+// Syscall numbers for mkdirat/unlinkat (public for CLI supervisor handler).
+// Used to mediate exact-path lock directory create/remove; see
+// `CapabilitySet::lock_dirs`.
+#[cfg(target_os = "linux")]
+pub const SYS_MKDIRAT: i32 = libc::SYS_mkdirat as i32;
+#[cfg(target_os = "linux")]
+pub const SYS_UNLINKAT: i32 = libc::SYS_unlinkat as i32;
+
 // Syscall numbers for connect/bind (public for CLI supervisor handler)
 #[cfg(target_os = "linux")]
 pub const SYS_CONNECT: i32 = libc::SYS_connect as i32;
@@ -1729,8 +1737,12 @@ fn prepend_seccomp_arch_guard_vec(
 /// `restrict_self()`), so the supervisor can still receive notifications for
 /// paths that Landlock would block.
 ///
-/// The BPF filter routes openat/openat2 to `SECCOMP_RET_USER_NOTIF` and
-/// allows all other syscalls with `SECCOMP_RET_ALLOW`.
+/// The BPF filter routes openat/openat2/mkdirat/unlinkat to
+/// `SECCOMP_RET_USER_NOTIF` and allows all other syscalls with
+/// `SECCOMP_RET_ALLOW`. mkdirat/unlinkat notifications are only ever acted
+/// on by the supervisor when the target matches a `CapabilitySet::lock_dirs`
+/// entry exactly; everything else is denied, so this filter does not by
+/// itself grant any new access.
 ///
 /// # Errors
 ///
@@ -1745,6 +1757,8 @@ pub fn install_seccomp_notify() -> Result<std::os::fd::OwnedFd> {
     //   ld  [nr]                     ; load syscall number
     //   jeq SYS_OPENAT, notify       ; if openat -> notify
     //   jeq SYS_OPENAT2, notify      ; if openat2 -> notify
+    //   jeq SYS_MKDIRAT, notify      ; if mkdirat -> notify
+    //   jeq SYS_UNLINKAT, notify     ; if unlinkat -> notify
     //   ret SECCOMP_RET_ALLOW        ; else allow
     //   notify: ret SECCOMP_RET_USER_NOTIF
     let filter = [
@@ -1755,28 +1769,42 @@ pub fn install_seccomp_notify() -> Result<std::os::fd::OwnedFd> {
             jf: 0,
             k: SECCOMP_DATA_NR_OFFSET,
         },
-        // 1: If openat, jump to 4 (notify)
+        // 1: If openat, jump to 6 (notify)
         SockFilterInsn {
             code: BPF_JMP | BPF_JEQ | BPF_K,
-            jt: 2, // jump +2 to instruction 4 (notify)
+            jt: 4, // jump +4 to instruction 6 (notify)
             jf: 0,
             k: SYS_OPENAT as u32,
         },
-        // 2: If openat2, jump to 4 (notify)
+        // 2: If openat2, jump to 6 (notify)
         SockFilterInsn {
             code: BPF_JMP | BPF_JEQ | BPF_K,
-            jt: 1, // jump +1 to instruction 4 (notify)
+            jt: 3, // jump +3 to instruction 6 (notify)
             jf: 0,
             k: SYS_OPENAT2 as u32,
         },
-        // 3: Allow all other syscalls
+        // 3: If mkdirat, jump to 6 (notify)
+        SockFilterInsn {
+            code: BPF_JMP | BPF_JEQ | BPF_K,
+            jt: 2, // jump +2 to instruction 6 (notify)
+            jf: 0,
+            k: SYS_MKDIRAT as u32,
+        },
+        // 4: If unlinkat, jump to 6 (notify)
+        SockFilterInsn {
+            code: BPF_JMP | BPF_JEQ | BPF_K,
+            jt: 1, // jump +1 to instruction 6 (notify)
+            jf: 0,
+            k: SYS_UNLINKAT as u32,
+        },
+        // 5: Allow all other syscalls
         SockFilterInsn {
             code: BPF_RET | BPF_K,
             jt: 0,
             jf: 0,
             k: SECCOMP_RET_ALLOW,
         },
-        // 4: Route to user notification
+        // 6: Route to user notification
         SockFilterInsn {
             code: BPF_RET | BPF_K,
             jt: 0,

@@ -84,8 +84,8 @@ impl QueryContext {
             query_path_buf.as_path()
         };
 
-        for cap in self.caps.fs_capabilities() {
-            let covers = if cap.is_file {
+        let covering = self.caps.scan_covering(requested, |cap| {
+            if cap.is_file {
                 // File capability: exact match against resolved, or if not
                 // canonicalized, also check against original
                 query_path == cap.resolved
@@ -96,28 +96,32 @@ impl QueryContext {
                 // (symlink path) for non-existent paths.
                 query_path.starts_with(&cap.resolved)
                     || (full_canonical.is_none() && path.starts_with(&cap.original))
-            };
-
-            if covers {
-                let sufficient = matches!(
-                    (cap.access, requested),
-                    (AccessMode::ReadWrite, _)
-                        | (AccessMode::Read, AccessMode::Read)
-                        | (AccessMode::Write, AccessMode::Write)
-                );
-
-                if sufficient {
-                    return QueryResult::Allowed(AllowReason::GrantedPath {
-                        granted_path: cap.resolved.display().to_string(),
-                        access: cap.access.to_string(),
-                    });
-                } else {
-                    return QueryResult::Denied(DenyReason::InsufficientAccess {
-                        granted: cap.access.to_string(),
-                        requested: requested.to_string(),
-                    });
-                }
             }
+        });
+
+        if let Some(cap) = covering.best_sufficient {
+            return QueryResult::Allowed(AllowReason::GrantedPath {
+                granted_path: cap.resolved.display().to_string(),
+                access: cap.access.to_string(),
+            });
+        }
+
+        if let (Some(read_cap), Some(write_cap)) = (covering.best_read, covering.best_write) {
+            return QueryResult::Allowed(AllowReason::GrantedPath {
+                granted_path: format!(
+                    "{} (read) + {} (write)",
+                    read_cap.resolved.display(),
+                    write_cap.resolved.display()
+                ),
+                access: AccessMode::ReadWrite.to_string(),
+            });
+        }
+
+        if let Some(cap) = covering.best_covering {
+            return QueryResult::Denied(DenyReason::InsufficientAccess {
+                granted: cap.access.to_string(),
+                requested: requested.to_string(),
+            });
         }
 
         QueryResult::Denied(DenyReason::PathNotGranted)
@@ -163,6 +167,62 @@ mod tests {
             result,
             QueryResult::Denied(DenyReason::PathNotGranted)
         ));
+    }
+
+    #[test]
+    fn test_query_path_prefers_most_specific_grant_regardless_of_order() {
+        // A broad grant added before a narrower, sufficient one must not
+        // shadow it just because it was inserted first.
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(FsCapability {
+            original: PathBuf::from("/test"),
+            resolved: PathBuf::from("/test"),
+            access: AccessMode::Read,
+            is_file: false,
+            source: CapabilitySource::User,
+        });
+        caps.add_fs(FsCapability {
+            original: PathBuf::from("/test/sub"),
+            resolved: PathBuf::from("/test/sub"),
+            access: AccessMode::ReadWrite,
+            is_file: false,
+            source: CapabilitySource::User,
+        });
+
+        let ctx = QueryContext::new(caps);
+        let result = ctx.query_path(Path::new("/test/sub/file.txt"), AccessMode::Write);
+        assert!(
+            matches!(result, QueryResult::Allowed(_)),
+            "narrower ReadWrite grant should win over the broader read-only one, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_query_path_readwrite_from_two_separate_grants() {
+        // Read and write for the same path can come from two distinct
+        // capabilities rather than one ReadWrite grant.
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(FsCapability {
+            original: PathBuf::from("/test"),
+            resolved: PathBuf::from("/test"),
+            access: AccessMode::Read,
+            is_file: false,
+            source: CapabilitySource::User,
+        });
+        caps.add_fs(FsCapability {
+            original: PathBuf::from("/test/sub"),
+            resolved: PathBuf::from("/test/sub"),
+            access: AccessMode::Write,
+            is_file: false,
+            source: CapabilitySource::User,
+        });
+
+        let ctx = QueryContext::new(caps);
+        let result = ctx.query_path(Path::new("/test/sub/file.txt"), AccessMode::ReadWrite);
+        assert!(
+            matches!(result, QueryResult::Allowed(_)),
+            "readwrite covered by two separate grants should be allowed, got: {result:?}"
+        );
     }
 
     #[test]

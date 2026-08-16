@@ -271,6 +271,7 @@ pub fn resolve_credentials(
                 oauth2,
                 aws_auth: cred.aws_auth.clone(),
                 spiffe: cred.spiffe.clone(),
+                upgrades: vec![],
                 rate_limit: cred.rate_limit.clone(),
             });
         } else if let Some(cred) = policy.credentials.get(name) {
@@ -306,6 +307,7 @@ pub fn resolve_credentials(
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                upgrades: vec![],
                 rate_limit: None,
             });
         }
@@ -468,6 +470,7 @@ pub fn partition_allow_domain(
                         oauth2: None,
                         aws_auth: None,
                         spiffe: None,
+                        upgrades: vec![],
                         rate_limit: None,
                     });
                 }

@@ -1,5 +1,92 @@
 # Changelog
 
+## [0.73.0] - 2026-08-10
+
+### Bug Fixes
+
+- *(cli)* Add profile schema fields missing from Rust model (#1607) ([#1607](https://github.com/nolabs-ai/nono/pull/1607))
+
+- *(cli)* Grant read access to the sandbox own capability-state file (#1606) ([#1606](https://github.com/nolabs-ai/nono/pull/1606))
+
+- *(proxy)* Add missing upgrades field to test RouteConfig literals (#1605) ([#1605](https://github.com/nolabs-ai/nono/pull/1605))
+
+- *(proxy)* Redeem phantom nonces on absolute-form forward-proxy requests (#1589) ([#1589](https://github.com/nolabs-ai/nono/pull/1589))
+
+- *(proxy)* Add authenticated WebSocket tunneling for CONNECT/TLS-intercept routes (#1443) ([#1443](https://github.com/nolabs-ai/nono/pull/1443))
+
+
+### Documentation
+
+- *(assets)* Add project screenshot (#1601) ([#1601](https://github.com/nolabs-ai/nono/pull/1601))
+
+
+### Features
+
+- *(profile)* Glob pattern support in filesystem path fields (#1580) ([#1580](https://github.com/nolabs-ai/nono/pull/1580))
+
+
+### Testing
+
+- *(audit)* Add per-variant golden vectors for AuditEventPayload (#1603) ([#1603](https://github.com/nolabs-ai/nono/pull/1603))
+
+## [0.72.0] - 2026-08-07
+
+### Bug Fixes
+
+- *(proxy)* Fail closed on non-granted endpoint approvals in TLS intercept (#1585) ([#1585](https://github.com/nolabs-ai/nono/pull/1585))
+
+- *(deps)* Update event-listener 5.4.1 → 5.4.2 (RUSTSEC-2026-0221) (#1581) ([#1581](https://github.com/nolabs-ai/nono/pull/1581))
+
+- Allow config files for Claude (#1547) ([#1547](https://github.com/nolabs-ai/nono/pull/1547))
+
+- *(exec)* Update `PWD` with `--workdir` (#1564) ([#1564](https://github.com/nolabs-ai/nono/pull/1564))
+
+- *(profile)* Preserve user profile source context (#1571) ([#1571](https://github.com/nolabs-ai/nono/pull/1571))
+
+- *(why)* Fail on unresolvable network policy instead of degrading (#1554) ([#1554](https://github.com/nolabs-ai/nono/pull/1554))
+
+
+### CI/CD
+
+- Add doc tests to CI and ship musl release artifact (#1578) ([#1578](https://github.com/nolabs-ai/nono/pull/1578))
+
+- *(issue-triage)* Remove automatic triage label on new issues (#1575) ([#1575](https://github.com/nolabs-ai/nono/pull/1575))
+
+- Add COPR build validation on release PRs (#1572) ([#1572](https://github.com/nolabs-ai/nono/pull/1572))
+
+
+### Dependencies
+
+- *(deps)* Bump prettyplease from 0.2.37 to 0.3.0 (#1563) ([#1563](https://github.com/nolabs-ai/nono/pull/1563))
+
+- *(deps)* Bump tokio from 1.52.3 to 1.53.1 (#1562) ([#1562](https://github.com/nolabs-ai/nono/pull/1562))
+
+- *(deps)* Bump uuid from 1.23.5 to 1.24.0 (#1561) ([#1561](https://github.com/nolabs-ai/nono/pull/1561))
+
+- *(deps)* Bump sigstore-verify from 0.9.0 to 0.11.0 (#1560) ([#1560](https://github.com/nolabs-ai/nono/pull/1560))
+
+- *(deps)* Bump aws-config from 1.9.0 to 1.10.1 (#1558) ([#1558](https://github.com/nolabs-ai/nono/pull/1558))
+
+- *(deps)* Bump actions/attest from 4.2.0 to 4.2.1 (#1559) ([#1559](https://github.com/nolabs-ai/nono/pull/1559))
+
+- *(deps)* Bump docker/login-action from 4.5.1 to 4.6.0 (#1557) ([#1557](https://github.com/nolabs-ai/nono/pull/1557))
+
+
+### Documentation
+
+- *(profiles)* Clarify profiles dir is read-only by default, unless explicitly allowed via `--allow` (#1587) ([#1587](https://github.com/nolabs-ai/nono/pull/1587))
+
+- *(cli)* Fix curl command for fetching latest version (#1569) ([#1569](https://github.com/nolabs-ai/nono/pull/1569))
+
+
+### Features
+
+- *(sandbox)* Add static seccomp network baseline on linux (#1590) ([#1590](https://github.com/nolabs-ai/nono/pull/1590))
+
+- *(why)* Report explicit deny paths from sandbox policy (#1556) ([#1556](https://github.com/nolabs-ai/nono/pull/1556))
+
+- *(profiles)* Remove openclaw and swival as built-in profiles (#1582) ([#1582](https://github.com/nolabs-ai/nono/pull/1582))
+
 ## [0.71.0] - 2026-07-31
 
 ### Bug Fixes

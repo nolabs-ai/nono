@@ -146,6 +146,17 @@ pub enum NonoError {
     #[error("Session exited before attach could complete")]
     SessionGone,
 
+    // Audit errors
+    /// A line of the global audit ledger is not a valid record.
+    ///
+    /// Separate from [`Self::Snapshot`] because it is permanent: every later
+    /// append re-reads the same line and fails the same way, so no run is
+    /// recorded until the file parses again. The I/O failures that share the
+    /// append path clear themselves on the next write, and callers must not
+    /// tell a user the two stories interchangeably.
+    #[error("Failed to parse audit ledger line {line}: {reason}")]
+    AuditLedgerCorrupt { line: usize, reason: String },
+
     // Trust/attestation errors
     #[error("Trust verification failed for {path}: {reason}")]
     TrustVerification { path: String, reason: String },
@@ -250,6 +261,7 @@ impl NonoError {
             | Self::PathCanonicalization { .. }
             | Self::HashMismatch { .. }
             | Self::SessionNotFound(_)
+            | Self::AuditLedgerCorrupt { .. }
             | Self::ObjectStore(_)
             | Self::Snapshot(_) => NonoDiagnosticCode::Other,
             #[cfg(target_os = "linux")]

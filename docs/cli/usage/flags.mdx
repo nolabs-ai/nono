@@ -352,6 +352,8 @@ Block all network access. Network is **allowed by default**.
 nono run --allow . --block-net -- cargo build
 ```
 
+On Linux this always installs a static seccomp filter that denies non-Unix sockets and `io_uring_setup()`, with Landlock layered underneath. This closes Landlock's UDP gap, but also breaks programs using io_uring only for file I/O. Local Unix-domain IPC remains available subject to its normal grants.
+
 #### `--network-profile`
 
 Use a predefined network profile for host-level filtering. When set, outbound traffic is routed through a localhost proxy that only allows connections to hosts in the profile.
@@ -603,7 +605,7 @@ nono run --network-profile claude-code --open-port 4000 --allow-cwd -- claude
 ```
 
 Works across all network modes:
-- **`--block-net`**: The port becomes an exception to the block (localhost only)
+- **`--block-net`**: The TCP port becomes an exception to the block
 - **Proxy mode**: The port is allowed in addition to the proxy port
 - **Default (AllowAll)**: No-op — all ports are already reachable
 
@@ -612,7 +614,7 @@ Can be specified multiple times for multiple ports.
 <Warning>
 **macOS limitation:** Seatbelt cannot filter bind/inbound by port number. When `--open-port` is specified on macOS, the sandbox permits binding to **any** port (same tradeoff as `--listen-port`). Outbound connections are still restricted to only the specified localhost ports.
 
-**Linux limitation:** Landlock ABI v4+ enforces both connect and bind per-port, but **cannot filter by destination IP**. The ConnectTcp rule allows connecting to the specified port on any IP, not just localhost. In practice this is mitigated by using `--block-net` (which blocks all outbound except the allowed ports) or proxy mode (which routes outbound through the localhost proxy). Only the `--open-port` + default AllowAll combination (a no-op) would theoretically permit non-localhost connections on the port.
+**Linux limitation:** Landlock ABI v4+ enforces connect and bind by port but **cannot filter by destination or bind address**. `--open-port 3000` permits connecting to port 3000 on any IP, not just localhost, and permits binding port 3000 on any local interface. `--block-net` blocks other ports but does not narrow the granted port to loopback. Use proxy mode when destination-host enforcement is required. On kernels without Landlock V4, port exceptions fail closed.
 </Warning>
 
 ### Resource Limits
@@ -1174,8 +1176,8 @@ Profiles can set this via `capability_elevation` in their security config. The C
 
 | Value | Behaviour |
 |-------|-----------|
-| `auto` | Landlock LSM with automatic seccomp fallback when the kernel ABI lacks network support (< v4). **Default.** Preserves existing behaviour. |
-| `landlock` | Landlock only. Returns an error at startup if the running kernel cannot satisfy network restrictions via Landlock alone — no silent seccomp fallback. |
+| `auto` | Landlock plus a static seccomp baseline for restricted networking, with automatic fallback when the kernel ABI lacks network support (< v4). **Default.** |
+| `landlock` | Landlock only. Returns an error at startup if the running kernel cannot satisfy TCP restrictions via Landlock alone. Because Landlock network rules cover TCP only, this explicit mode does not block UDP. |
 | `external` | Delegate TCP network lockdown to the deployment. nono still installs filesystem/process sandboxing, but skips its own localhost/proxy-port network enforcement. Use only when infrastructure such as iptables, cgroups, systemd units, or container policy forces egress through the proxy. |
 
 ```bash

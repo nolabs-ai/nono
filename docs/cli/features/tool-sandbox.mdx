@@ -532,6 +532,52 @@ Pattern syntax is intentionally small:
 
 `PATH` and `NONO_*` are reserved and cannot be set with `set_vars`.
 
+### Forwarding Caller Variables
+
+`allow_vars` filters the environment nono builds. It does not let a calling command pass its own variables through to a command it invokes — that is what `export_env` is for:
+
+```json
+{
+  "npm": {
+    "export_env": ["NODE_OPTIONS", "NPM_CONFIG_*"]
+  }
+}
+```
+
+`session_export_env` does the same for commands whose resolved caller is the session itself:
+
+```json
+{
+  "tool_sandbox": {
+    "session_export_env": ["PYTHONPATH"]
+  }
+}
+```
+
+Both accept the same three pattern forms as `allow_vars`, and both deliberately bypass `allow_vars` and the dangerous-variable blocklist. That is the point of the feature — `NODE_OPTIONS` and `PYTHONPATH` are on the blocklist precisely because an untrusted process should not be able to set them, but a legitimate build tool often must.
+
+<Warning>
+Values forwarded by `export_env` come from the **calling command's environment**, not from the profile. Anything that can set a variable in that process controls what the child receives. Forward the narrowest set that works, and prefer exact names over `*`.
+</Warning>
+
+Three classes of variable are treated differently, regardless of how broad your pattern is:
+
+| Class | Examples | Behaviour |
+|---|---|---|
+| Reserved | `PATH`, `NONO_*` | Never forwarded. nono owns these. |
+| Credentials | `OP_SERVICE_ACCOUNT_TOKEN`, `OP_CONNECT_TOKEN`, `OP_CONNECT_HOST`, `OP_SESSION_*` | Never forwarded. Use a broker credential instead. |
+| Loader injection | `LD_*`, `DYLD_*` | Forwarded only when named exactly. `*` and `LD_*` skip them. |
+
+The loader rule exists because `LD_PRELOAD` and friends load code into *any* dynamically-linked child, not just an interpreter, and that child may hold an injected credential socket. Preloading is legitimate for sanitizers and similar tools, so it stays possible — but it has to be deliberate:
+
+```json
+{
+  "make": {
+    "export_env": ["LD_PRELOAD"]
+  }
+}
+```
+
 ## Mandatory Arguments
 
 Use `argv_prepend` when a selected child policy needs mandatory mode flags. The arguments are inserted after the synthesized `argv[0]` and before caller-provided arguments.

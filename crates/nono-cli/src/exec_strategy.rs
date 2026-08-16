@@ -42,6 +42,8 @@ use tracing::{debug, info, warn};
 pub(crate) use env_sanitization::is_dangerous_env_var;
 #[cfg(target_os = "linux")]
 pub(crate) use env_sanitization::is_env_var_allowed;
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
+pub(crate) use env_sanitization::matches_env_var_patterns;
 pub(crate) use env_sanitization::validate_env_var_patterns;
 pub(crate) use env_sanitization::validate_set_vars;
 
@@ -1017,7 +1019,10 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
                 }
 
                 let sandbox_result = match config.sandbox_policy {
-                    crate::profile::LinuxSandboxPolicy::Auto => Sandbox::apply_auto(effective_caps),
+                    crate::profile::LinuxSandboxPolicy::Auto => Sandbox::apply_seccomp(
+                        effective_caps,
+                        nono::SeccompOpts::network_baseline(),
+                    ),
                     crate::profile::LinuxSandboxPolicy::Landlock => {
                         Sandbox::apply_landlock(effective_caps)
                             .map(|_| nono::sandbox::SeccompNetFallback::None)

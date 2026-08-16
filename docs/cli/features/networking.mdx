@@ -3,7 +3,7 @@ title: Networking
 description: Network access control — proxy modes, domain filtering, credential injection, and localhost IPC
 ---
 
-By default the sandboxed process has unrestricted network access. When you restrict networking, nono routes traffic through an HTTP proxy running in the unsandboxed supervisor process. The sandboxed child can only reach `localhost:<proxy-port>` — all other outbound TCP is blocked at the kernel level.
+By default the sandboxed process has unrestricted network access. Domain and credential policies route traffic through an HTTP proxy running in the unsandboxed supervisor process. Plain `--block-net` instead installs a static kernel filter and does not start a proxy.
 
 The same proxy can also be run on its own with [`nono proxy`](#standalone-proxy-nono-proxy) — a foreground server with no sandboxed child — so you can point external workloads (containers, microVMs) at nono's domain filtering and credential injection.
 
@@ -40,7 +40,9 @@ A 256-bit session token is generated for each proxy session. The child must incl
 nono run --allow-cwd --block-net -- cargo build
 ```
 
-No outbound connections are permitted. See [Localhost IPC](#localhost-ipc) for allowing specific ports as exceptions.
+No outbound IP connections are permitted. Local Unix-domain IPC remains available subject to its filesystem/socket grants. See [Localhost IPC](#localhost-ipc) for allowing specific TCP ports as exceptions.
+
+On Linux, the CLI installs a small static seccomp filter on every supported kernel, with Landlock layered underneath. The filter denies Internet socket creation and `io_uring_setup()`, closing the UDP gap in Landlock's TCP-only network controls. Consequently, programs using io_uring solely for file I/O also need to disable that feature when run with `--block-net`.
 
 In a profile, set `network.block` to `true`:
 
@@ -414,9 +416,19 @@ Private network addresses (RFC1918: 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16) a
 
 ### Linux
 
-Network filtering uses Landlock V4+ per-port TCP rules. The sandbox restricts `connect()` to only the proxy port. All other outbound TCP is blocked at the kernel level.
+Restricted CLI network modes always include a static seccomp baseline:
 
-**Requirements:** Landlock ABI v4+ (Linux 6.7+)
+- Plain `--block-net` denies every non-Unix socket plus `io_uring_setup()`.
+- Policies with port exceptions permit only Internet TCP stream sockets; Landlock V4+ then enforces the TCP connect/bind port allowlist.
+- Proxy-only mode adds a seccomp user notification layer on top, checking the real destination address of every `connect()`. This layer is always active for proxy-only mode, on every Landlock ABI, because Landlock's own network rules have no destination-address component.
+
+Landlock rules match TCP ports, not IP addresses: a plain `--allow-connect-port`/`--open-port` grant for port 3000 permits that port on any destination, and a bind grant can listen on any local interface. The domain proxy doesn't share this gap — its destination-host enforcement comes from the seccomp layer above, not from Landlock's port rule alone. Use the domain proxy, not a raw port grant, when destination-host enforcement matters.
+
+**Requirements:** Plain `--block-net` works on every Linux kernel supported by nono. TCP port exceptions require Landlock ABI V4+ (Linux 6.7+) and fail closed on older kernels.
+
+The static baseline also denies `io_uring_setup()`. This prevents io_uring network operations from bypassing syscall filtering, but it also breaks workloads using io_uring only for ordinary file I/O.
+
+nono closes inherited descriptors before executing the target. Unix-domain IPC grants should nevertheless be treated as trusted channels: an allowed Unix peer can deliberately pass an already-connected Internet socket with `SCM_RIGHTS`, and neither a socket-creation filter nor Landlock's connect/bind hooks can retroactively restrict that connected descriptor.
 
 ### macOS
 
@@ -428,6 +440,8 @@ Network filtering uses Seatbelt rules. The sandbox allows only `(remote tcp "loc
 (allow system-socket (socket-domain AF_INET) (socket-type SOCK_STREAM))
 (allow system-socket (socket-domain AF_INET6) (socket-type SOCK_STREAM))
 ```
+
+DNS names may still resolve through the macOS system resolver even though the sandbox cannot connect to the resolved address. When any listen port is granted, Seatbelt permits bind/inbound broadly because it cannot restrict those operations by port number.
 
 ### WSL2
 

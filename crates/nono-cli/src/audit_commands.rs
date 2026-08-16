@@ -371,7 +371,7 @@ fn cmd_show(args: AuditShowArgs) -> Result<()> {
                 details.push(format!("status={status}"));
             }
             if let Some(ref reason) = event.reason {
-                details.push(format!("reason={}", sanitize_for_terminal(reason)));
+                details.push(format!("reason={}", sanitize_reason_for_terminal(reason)));
             }
 
             if details.is_empty() {
@@ -412,7 +412,7 @@ fn cmd_show(args: AuditShowArgs) -> Result<()> {
             let reason = event
                 .get("reason")
                 .and_then(serde_json::Value::as_str)
-                .map(sanitize_for_terminal);
+                .map(sanitize_reason_for_terminal);
             if let Some(reason) = reason {
                 eprintln!(
                     "    {} {} caller={} reason={}",
@@ -448,7 +448,9 @@ fn print_capability_decision(entry: &nono::supervisor::AuditEntry) {
         ApprovalDecision::Timeout => "timeout".red(),
     };
     let reason = match &entry.decision {
-        ApprovalDecision::Denied { reason } => format!(" reason={}", sanitize_for_terminal(reason)),
+        ApprovalDecision::Denied { reason } => {
+            format!(" reason={}", sanitize_reason_for_terminal(reason))
+        }
         ApprovalDecision::Granted | ApprovalDecision::Timeout => String::new(),
     };
 
@@ -995,9 +997,16 @@ fn sanitize_for_terminal(input: &str) -> String {
     result
 }
 
+fn sanitize_reason_for_terminal(input: &str) -> String {
+    const MAX_REASON_CHARS: usize = 4096;
+
+    let sanitized = sanitize_for_terminal(input);
+    crate::command_display::truncate_chars(&sanitized, MAX_REASON_CHARS)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::sanitize_for_terminal;
+    use super::{sanitize_for_terminal, sanitize_reason_for_terminal};
 
     #[test]
     fn sanitize_for_terminal_removes_carriage_return() {
@@ -1025,5 +1034,16 @@ mod tests {
         assert!(!sanitized.contains('\x07'));
         assert!(sanitized.contains("x"));
         assert!(sanitized.contains("path"));
+    }
+
+    #[test]
+    fn sanitize_reason_for_terminal_removes_control_sequences_and_bounds_length() {
+        let input = format!("prefix\x1b]52;c;Y29weQ==\x07{}", "x".repeat(5000));
+
+        let sanitized = sanitize_reason_for_terminal(&input);
+
+        assert!(!sanitized.chars().any(char::is_control));
+        assert!(sanitized.chars().count() <= 4096);
+        assert!(sanitized.ends_with("..."));
     }
 }

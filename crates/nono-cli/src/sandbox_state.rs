@@ -33,6 +33,14 @@ pub struct SandboxState {
     /// ALIAS(canonical="bypass_protection_paths", introduced="v0.41.0", remove_by="v1.0.0", issue="#594")
     #[serde(default, alias = "override_deny_paths")]
     pub bypass_protection_paths: Vec<String>,
+    /// Resolved filesystem deny paths enforced by the active profile.
+    ///
+    /// These are not filesystem capabilities: on macOS they are explicit
+    /// Seatbelt deny rules which override covering allows. Persist them so
+    /// `nono why --self` reports the kernel policy rather than only the allow
+    /// side of the capability set.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deny_paths: Vec<String>,
     /// Proxy domain allowlist at sandbox creation time
     #[serde(default)]
     pub allowed_domains: Vec<String>,
@@ -113,9 +121,27 @@ fn grant_time_inode(_cap: &nono::FsCapability) -> Option<(u64, u64)> {
 
 impl SandboxState {
     /// Create sandbox state from a CapabilitySet, bypass_protection paths, and domain allowlist
+    #[cfg(test)]
     pub fn from_caps(
         caps: &CapabilitySet,
         bypass_protection_paths: &[PathBuf],
+        allowed_domains: &[String],
+        domain_endpoints: &[DomainEndpointState],
+    ) -> Self {
+        Self::from_caps_with_denies(
+            caps,
+            bypass_protection_paths,
+            &[],
+            allowed_domains,
+            domain_endpoints,
+        )
+    }
+
+    /// Create sandbox state including explicit filesystem deny paths.
+    pub fn from_caps_with_denies(
+        caps: &CapabilitySet,
+        bypass_protection_paths: &[PathBuf],
+        deny_paths: &[PathBuf],
         allowed_domains: &[String],
         domain_endpoints: &[DomainEndpointState],
     ) -> Self {
@@ -147,6 +173,7 @@ impl SandboxState {
                 .iter()
                 .map(|p| p.display().to_string())
                 .collect(),
+            deny_paths: deny_paths.iter().map(|p| p.display().to_string()).collect(),
             allowed_domains: allowed_domains.to_vec(),
             domain_endpoints: domain_endpoints.to_vec(),
             resource_limits: caps.resource_limits().copied(),
@@ -159,6 +186,11 @@ impl SandboxState {
             .iter()
             .map(PathBuf::from)
             .collect()
+    }
+
+    /// Get resolved filesystem deny paths for query use.
+    pub fn deny_paths_as_paths(&self) -> Vec<PathBuf> {
+        self.deny_paths.iter().map(PathBuf::from).collect()
     }
 
     /// Convert back to a CapabilitySet
@@ -620,6 +652,32 @@ mod tests {
     }
 
     #[test]
+    fn test_sandbox_state_roundtrip_preserves_deny_paths() {
+        let caps = CapabilitySet::new();
+        let deny_paths = vec![PathBuf::from("/workspace/blocked.txt")];
+        let state = SandboxState::from_caps_with_denies(&caps, &[], &deny_paths, &[], &[]);
+
+        let json = serde_json::to_string(&state).expect("serialize state");
+        let restored: SandboxState = serde_json::from_str(&json).expect("deserialize state");
+
+        assert_eq!(restored.deny_paths_as_paths(), deny_paths);
+    }
+
+    #[test]
+    fn test_legacy_sandbox_state_without_deny_paths_still_loads() {
+        let caps = CapabilitySet::new();
+        let state = SandboxState::from_caps(&caps, &[], &[], &[]);
+        let mut value = serde_json::to_value(&state).expect("serialize state");
+        value
+            .as_object_mut()
+            .expect("state object")
+            .remove("deny_paths");
+
+        let restored: SandboxState = serde_json::from_value(value).expect("legacy state loads");
+        assert!(restored.deny_paths.is_empty());
+    }
+
+    #[test]
     fn test_sandbox_state_write_and_read() {
         let dir = tempdir().expect("Failed to create temp dir");
         let file_path = dir.path().join("test_state.json");
@@ -811,6 +869,7 @@ mod tests {
             allowed_commands: vec![],
             blocked_commands: vec![],
             bypass_protection_paths: vec![],
+            deny_paths: vec![],
             allowed_domains: vec![],
             domain_endpoints: vec![],
             resource_limits: None,

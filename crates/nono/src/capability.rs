@@ -133,6 +133,22 @@ pub struct FsCapability {
     pub source: CapabilitySource,
 }
 
+/// Result of [`CapabilitySet::scan_covering`].
+#[derive(Debug, Default)]
+pub struct CoveringCapabilities<'a> {
+    /// Most specific covering capability, regardless of access mode.
+    pub best_covering: Option<&'a FsCapability>,
+    /// Most specific covering capability whose own access alone satisfies
+    /// the requested mode.
+    pub best_sufficient: Option<&'a FsCapability>,
+    /// Most specific covering capability granting read access (only
+    /// populated when the requested mode is `ReadWrite`).
+    pub best_read: Option<&'a FsCapability>,
+    /// Most specific covering capability granting write access (only
+    /// populated when the requested mode is `ReadWrite`).
+    pub best_write: Option<&'a FsCapability>,
+}
+
 impl FsCapability {
     /// Create a new directory capability, canonicalizing the path
     ///
@@ -846,7 +862,8 @@ pub enum IpcMode {
 /// forcing all traffic through the nono proxy.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NetworkMode {
-    /// All network access blocked (Landlock deny-all TCP, Seatbelt deny network*)
+    /// All network access blocked (static seccomp + Landlock on Linux,
+    /// Seatbelt deny network* on macOS).
     Blocked,
     /// All network access allowed (no filtering)
     #[default]
@@ -924,9 +941,12 @@ pub struct CapabilitySet {
     /// These apply regardless of NetworkMode.
     ///
     /// On macOS (Seatbelt), outbound is scoped to localhost per-port.
-    /// On Linux (Landlock), ConnectTcp/BindTcp filter by port only, not
-    /// by destination IP. Use with `--block-net` or proxy mode to ensure
-    /// only localhost is reachable.
+    /// On Linux (Landlock), ConnectTcp/BindTcp filter by port only, not by
+    /// destination or bind address, and `--block-net` doesn't narrow this
+    /// grant to localhost either. `NetworkMode::ProxyOnly` gets real
+    /// destination-host enforcement from nono-cli's seccomp-notify layer
+    /// (`SeccompPolicy::proxy_fallback`); this port grant has no such layer
+    /// and stays port-only on Linux.
     localhost_ports: Vec<u16>,
     /// Inclusive port ranges for bidirectional localhost IPC (connect + bind).
     ///
@@ -1405,6 +1425,74 @@ impl CapabilitySet {
     #[must_use]
     pub fn fs_capabilities(&self) -> &[FsCapability] {
         &self.fs
+    }
+
+    /// Scan filesystem capabilities for the ones covering a queried path,
+    /// scoring by specificity (longest `resolved` path wins) and tracking
+    /// read/write coverage separately.
+    ///
+    /// Read and write for the same path can come from two distinct
+    /// capabilities rather than one `ReadWrite` grant (e.g. a broad
+    /// read-only group plus a narrower write-only group); neither alone is
+    /// sufficient for a `ReadWrite` request, but their union is. Callers
+    /// asking a `ReadWrite` query should treat `best_read.is_some() &&
+    /// best_write.is_some()` as satisfying the request even when
+    /// `best_sufficient` is `None`.
+    ///
+    /// `covers` decides whether a capability applies to the queried path;
+    /// left to the caller since path canonicalization/fallback strategies
+    /// differ slightly between call sites.
+    #[must_use]
+    pub fn scan_covering(
+        &self,
+        requested: AccessMode,
+        mut covers: impl FnMut(&FsCapability) -> bool,
+    ) -> CoveringCapabilities<'_> {
+        let mut result = CoveringCapabilities::default();
+        let mut best_covering_score = 0usize;
+        let mut best_sufficient_score = 0usize;
+        let mut best_read_score = 0usize;
+        let mut best_write_score = 0usize;
+
+        for cap in &self.fs {
+            if !covers(cap) {
+                continue;
+            }
+
+            let score = cap.resolved.as_os_str().len();
+            if score >= best_covering_score {
+                result.best_covering = Some(cap);
+                best_covering_score = score;
+            }
+
+            let sufficient = matches!(
+                (cap.access, requested),
+                (AccessMode::ReadWrite, _)
+                    | (AccessMode::Read, AccessMode::Read)
+                    | (AccessMode::Write, AccessMode::Write)
+            );
+            if sufficient && score >= best_sufficient_score {
+                result.best_sufficient = Some(cap);
+                best_sufficient_score = score;
+            }
+
+            if requested == AccessMode::ReadWrite {
+                if matches!(cap.access, AccessMode::Read | AccessMode::ReadWrite)
+                    && score >= best_read_score
+                {
+                    result.best_read = Some(cap);
+                    best_read_score = score;
+                }
+                if matches!(cap.access, AccessMode::Write | AccessMode::ReadWrite)
+                    && score >= best_write_score
+                {
+                    result.best_write = Some(cap);
+                    best_write_score = score;
+                }
+            }
+        }
+
+        result
     }
 
     /// Get AF_UNIX socket capabilities.

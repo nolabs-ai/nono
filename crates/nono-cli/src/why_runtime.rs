@@ -9,6 +9,7 @@ use nono::{AccessMode, CapabilitySet, NonoError, Result};
 
 struct WhyContext {
     caps: CapabilitySet,
+    deny_paths: Vec<std::path::PathBuf>,
     overridden_paths: Vec<std::path::PathBuf>,
     allowed_domains: Vec<String>,
     domain_endpoints: Vec<sandbox_state::DomainEndpointState>,
@@ -110,6 +111,7 @@ pub(crate) fn run_why(args: WhyArgs) -> Result<()> {
                 let domain_endpoints = state.domain_endpoints.clone();
                 WhyContext {
                     caps: state.to_caps()?,
+                    deny_paths: state.deny_paths_as_paths(),
                     overridden_paths: paths,
                     allowed_domains: state.allowed_domains.clone(),
                     domain_endpoints,
@@ -174,6 +176,7 @@ pub(crate) fn run_why(args: WhyArgs) -> Result<()> {
         }
         WhyContext {
             caps,
+            deny_paths: prepared.deny_paths,
             overridden_paths: override_paths,
             allowed_domains,
             domain_endpoints,
@@ -199,6 +202,7 @@ pub(crate) fn run_why(args: WhyArgs) -> Result<()> {
         }
         WhyContext {
             caps,
+            deny_paths: prepared.deny_paths,
             overridden_paths: vec![],
             allowed_domains: vec![],
             domain_endpoints: vec![],
@@ -220,7 +224,20 @@ pub(crate) fn run_why(args: WhyArgs) -> Result<()> {
             Some(WhyOp::ReadWrite) => AccessMode::ReadWrite,
             None => AccessMode::Read,
         };
-        let result = query_path(path, op, &ctx.caps, &ctx.overridden_paths)?;
+        let result = match matching_deny_path(path, &ctx.deny_paths) {
+            Some(deny_path) => QueryResult::Denied {
+                reason: "filesystem_deny".to_string(),
+                details: Some(format!(
+                    "Path is covered by filesystem.deny rule: {}",
+                    deny_path.display()
+                )),
+                policy_source: Some("filesystem.deny".to_string()),
+                matching_capability: None,
+                suggested_flag: None,
+                endpoint_rules: None,
+            },
+            None => query_path(path, op, &ctx.caps, &ctx.overridden_paths)?,
+        };
         apply_file_grant_staleness(
             result,
             path,
@@ -254,6 +271,26 @@ pub(crate) fn run_why(args: WhyArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Return the most specific deny path that covers a query path.
+///
+/// Deny paths are retained separately from allow capabilities because macOS
+/// Seatbelt deny rules take precedence over a broader allow rule. Resolve the
+/// query through existing ancestors so missing leaf paths (the common
+/// create-file case) compare the same way as the rules installed at launch.
+fn matching_deny_path<'a>(
+    path: &std::path::Path,
+    deny_paths: &'a [std::path::PathBuf],
+) -> Option<&'a std::path::PathBuf> {
+    let resolved = nono::try_canonicalize(path);
+    deny_paths
+        .iter()
+        .filter(|deny| {
+            let resolved_deny = nono::try_canonicalize(deny);
+            resolved.starts_with(&resolved_deny)
+        })
+        .max_by_key(|deny| deny.as_os_str().len())
 }
 
 /// A file-level grant whose Landlock rule no longer matches the file at the
@@ -705,6 +742,18 @@ mod tests {
     }
 
     #[test]
+    fn explicit_deny_covers_missing_leaf_under_denied_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let denied = dir.path().join("blocked");
+        let query = denied.join("future.txt");
+
+        assert_eq!(
+            matching_deny_path(&query, std::slice::from_ref(&denied)),
+            Some(&denied)
+        );
+    }
+
+    #[test]
     fn known_network_profile_contributes_hosts() {
         let profile = profile_from_json(r#"{"network":{"network_profile":"claude-code"}}"#);
         let domains = resolve_allowed_domains(&profile).expect("resolve allowlist");
@@ -725,6 +774,15 @@ mod tests {
             "169.254.169.254",
         );
         assert!(matches!(result, query_ext::QueryResult::Denied { .. }));
+    }
+
+    #[test]
+    fn explicit_deny_does_not_match_sibling_prefix() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let denied = dir.path().join("blocked");
+        let sibling = dir.path().join("blocked-backup");
+
+        assert!(matching_deny_path(&sibling, &[denied]).is_none());
     }
 
     fn gh_policy() -> CommandPoliciesConfig {

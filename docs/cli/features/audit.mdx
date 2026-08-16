@@ -337,6 +337,8 @@ The audit trail is intentionally narrow in what it claims to prove.
 
 - The event log is recorded by the trusted supervisor, not by the sandboxed child.
 - The default integrity structure protects the audit event stream for a single session and also records that session into the global audit ledger.
+- Recording into the global ledger can fail after the command has already exited (for example when the ledger file no longer parses, or the audit directory is unwritable). The session's own directory is still written, but the ledger has no entry for that run, so `nono audit verify` reports it as missing from the chain. The failure is printed on stderr and the run's exit status is downgraded to `1` if the command itself succeeded; a command that failed keeps its own exit status, so a non-zero status is not by itself proof that the run was recorded.
+- A ledger that no longer parses stops every later run from being recorded, and there is no repair command. Moving the file aside starts a fresh chain, after which `nono audit verify` no longer finds the sessions the old one held.
 - `--audit-sign-key` adds a keyed supervisor-side signature over the session audit Merkle root and session context, but that still depends on trusting the configured signing key and how its public key is distributed.
 - Without an external timestamp, transparency log, or other anchor, this remains host-local attestation material rather than a globally witnessed timestamped proof.
 - For supervised runs, the supervisor hashes the main executable binary selected for launch and records its canonical path and SHA-256 digest.

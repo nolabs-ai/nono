@@ -1335,14 +1335,13 @@ impl<'a> DiagnosticFormatter<'a> {
     }
 
     fn actionable_observed_access(&self, path: &Path, inferred: AccessMode) -> Option<AccessMode> {
-        let Some(cap) = self.closest_covering_capability_any(path) else {
-            return Some(inferred);
-        };
-
-        if cap.access.contains(inferred) {
-            return None;
+        match self.covering_access_union(path) {
+            Some(access) if access.contains(inferred) => return None,
+            None => return Some(inferred),
+            Some(_) => {}
         }
 
+        let cap = self.closest_covering_capability_any(path)?;
         match (cap.access, inferred) {
             (AccessMode::Read, AccessMode::ReadWrite) => Some(AccessMode::Write),
             (AccessMode::Write, AccessMode::ReadWrite) => Some(AccessMode::Read),
@@ -1355,28 +1354,38 @@ impl<'a> DiagnosticFormatter<'a> {
         path: &Path,
     ) -> Option<&nono::capability::FsCapability> {
         let canonical = try_canonicalize(path);
-        let mut best_covering: Option<&nono::capability::FsCapability> = None;
-        let mut best_covering_score = 0usize;
+        self.caps
+            .scan_covering(AccessMode::ReadWrite, |cap| {
+                if cap.is_file {
+                    cap.resolved == canonical
+                } else {
+                    canonical.starts_with(&cap.resolved)
+                }
+            })
+            .best_covering
+    }
 
-        for cap in self.caps.fs_capabilities() {
-            let covers = if cap.is_file {
+    /// Union access covering `path` across *all* matching capabilities, not
+    /// just the single most-specific one. Read and write for the same path
+    /// can come from two separate grants (e.g. a broad read-only group plus
+    /// a narrower write-only group); neither alone is ReadWrite, but their
+    /// union is. Returns `None` if nothing covers `path`.
+    fn covering_access_union(&self, path: &Path) -> Option<AccessMode> {
+        let canonical = try_canonicalize(path);
+        let covering = self.caps.scan_covering(AccessMode::ReadWrite, |cap| {
+            if cap.is_file {
                 cap.resolved == canonical
             } else {
                 canonical.starts_with(&cap.resolved)
-            };
-
-            if !covers {
-                continue;
             }
+        });
 
-            let score = cap.resolved.as_os_str().len();
-            if score >= best_covering_score {
-                best_covering = Some(cap);
-                best_covering_score = score;
-            }
+        match (covering.best_read.is_some(), covering.best_write.is_some()) {
+            (true, true) => Some(AccessMode::ReadWrite),
+            (true, false) => Some(AccessMode::Read),
+            (false, true) => Some(AccessMode::Write),
+            (false, false) => None,
         }
-
-        best_covering
     }
 
     fn format_follow_up_from_diagnostics(
@@ -1936,11 +1945,14 @@ impl<'a> DiagnosticFormatter<'a> {
         path: &Path,
         requested: AccessMode,
     ) -> Option<String> {
-        let cap = self.closest_covering_capability_any(path)?;
-        if cap.access.contains(requested) {
+        if self
+            .covering_access_union(path)
+            .is_some_and(|access| access.contains(requested))
+        {
             return None;
         }
 
+        let cap = self.closest_covering_capability_any(path)?;
         let target = cap.resolved.clone();
 
         let requested = match (cap.access, requested) {
@@ -2952,6 +2964,47 @@ mod tests {
         ));
         assert!(output.contains("Sandbox denial:"));
         assert!(output.contains(&denied.display().to_string()));
+    }
+
+    #[test]
+    fn test_observed_readwrite_hint_satisfied_by_two_separate_grants_not_reported() {
+        // Read and write covering a path can come from two separate
+        // capabilities. An observed readwrite access must not be reported
+        // as missing when their union already satisfies it.
+        let mut caps = CapabilitySet::new().block_network();
+        caps.add_fs(FsCapability {
+            original: PathBuf::from("/test/project"),
+            resolved: PathBuf::from("/test/project"),
+            access: AccessMode::Read,
+            is_file: false,
+            source: CapabilitySource::Group("read_group".to_string()),
+        });
+        caps.add_fs(FsCapability {
+            original: PathBuf::from("/test/project/sub"),
+            resolved: PathBuf::from("/test/project/sub"),
+            access: AccessMode::Write,
+            is_file: false,
+            source: CapabilitySource::Group("write_group".to_string()),
+        });
+
+        let path = PathBuf::from("/test/project/sub/file.txt");
+        let formatter = DiagnosticFormatter::new(&caps).with_error_observation(ErrorObservation {
+            primary_verdict: None,
+            blocked_protected_file: None,
+            path_hints: vec![ObservedPathHint {
+                path: path.clone(),
+                access: AccessMode::ReadWrite,
+            }],
+            missing_paths: Vec::new(),
+            non_sandbox_failure: None,
+            network_blocked_hint: false,
+        });
+
+        let output = formatter.format_footer(0);
+        assert!(
+            !output.contains("Sandbox denial:"),
+            "readwrite covered by two separate grants must not be reported as missing, got: {output}"
+        );
     }
 
     #[test]

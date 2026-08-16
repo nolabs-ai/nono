@@ -1376,12 +1376,12 @@ pub struct SandboxArgs {
 
     /// Linux sandbox enforcement mechanism [auto|landlock|external] (default: auto).
     ///
-    /// auto     — Landlock with automatic seccomp fallback when the kernel
-    ///            lacks network support (ABI < V4). This is the default.
+    /// auto     — Landlock plus a static seccomp baseline for restricted
+    ///            networking, with fallback on ABI < V4. This is the default.
     /// landlock — Landlock only; fails at startup if network restrictions
     ///            cannot be satisfied without seccomp.
-    /// external — No sandbox installed by nono; enforcement is managed
-    ///            externally (iptables, cgroups, systemd, etc.).
+    /// external — Landlock still handles filesystem/process policy, while
+    ///            TCP enforcement is delegated externally.
     #[cfg(target_os = "linux")]
     #[arg(long, help_heading = "OPTIONS", value_name = "POLICY")]
     pub sandbox_policy: Option<crate::profile::LinuxSandboxPolicy>,

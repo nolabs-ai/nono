@@ -65,8 +65,9 @@ pub mod undo;
 
 // Re-exports for convenience
 pub use capability::{
-    AccessMode, CapabilitySet, CapabilitySource, FsCapability, IpcMode, NetworkMode,
-    ProcessInfoMode, SignalMode, SocketScope, UnixSocketCapability, UnixSocketMode, UnixSocketOp,
+    AccessMode, CapabilitySet, CapabilitySource, CoveringCapabilities, FsCapability, IpcMode,
+    NetworkMode, ProcessInfoMode, SignalMode, SocketScope, UnixSocketCapability, UnixSocketMode,
+    UnixSocketOp,
 };
 pub use diagnostic::{
     DenialReason, DenialRecord, IpcDenialRecord, NonoDiagnostic, NonoDiagnosticCode,

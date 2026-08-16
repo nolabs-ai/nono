@@ -133,7 +133,7 @@ echo "--- nono why with bypass_protection ---"
 if [[ -d "$DOCKER_DIR" ]]; then
     # Without bypass, ~/.docker should be denied
     expect_output_contains "nono why reports .docker denied without bypass" \
-        "sensitive_path" \
+        "filesystem_deny" \
         "$NONO_BIN" --silent why --json --path "$DOCKER_DIR" --op read
 
     # With profile bypass_protection, ~/.docker should be allowed
@@ -218,7 +218,7 @@ echo "--- Bypass scope is targeted ---"
 if [[ -d "$DOCKER_DIR" ]] && [[ -d "$HOME/.ssh" ]]; then
     # Bypassing .docker must NOT also unlock .ssh
     expect_output_contains "bypass_protection for .docker does not bypass .ssh deny" \
-        "sensitive_path" \
+        "filesystem_deny" \
         "$NONO_BIN" --silent why --json --profile "$PROFILES_DIR/docker-bypass.json" \
             --path "$HOME/.ssh" --op read
 else

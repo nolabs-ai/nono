@@ -1,4 +1,5 @@
 /target
+crates/*/target/
 .vscode/
 .idea/
 .DS_Store

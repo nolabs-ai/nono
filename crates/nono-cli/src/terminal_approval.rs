@@ -144,7 +144,7 @@ impl ApprovalBackend for TerminalApproval {
 /// - DCS (ESC P), APC (ESC _), PM (ESC ^), SOS (ESC X): all consume through ST
 ///
 /// All control characters (0x00-0x1F, 0x7F) are replaced with space.
-fn sanitize_for_terminal(input: &str) -> String {
+pub(crate) fn sanitize_for_terminal(input: &str) -> String {
     let mut result = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
 

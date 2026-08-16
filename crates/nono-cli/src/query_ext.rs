@@ -141,44 +141,18 @@ pub fn query_path(
         });
     }
 
-    // Check capabilities. Prefer the most specific matching grant so broad system
-    // reads (e.g. /private on macOS) do not shadow explicit user grants.
-    let mut best_covering: Option<&nono::FsCapability> = None;
-    let mut best_sufficient: Option<&nono::FsCapability> = None;
-    let mut best_covering_score = 0usize;
-    let mut best_sufficient_score = 0usize;
-
-    for cap in caps.fs_capabilities() {
-        let covers = if cap.is_file {
+    // Prefer the most specific matching grant so broad system reads (e.g.
+    // /private on macOS) do not shadow explicit user grants, and union
+    // separate read/write grants for a `readwrite` query.
+    let covering = caps.scan_covering(requested, |cap| {
+        if cap.is_file {
             cap.resolved == canonical
         } else {
             canonical.starts_with(&cap.resolved)
-        };
-
-        if !covers {
-            continue;
         }
+    });
 
-        let score = cap.resolved.as_os_str().len();
-        if score >= best_covering_score {
-            best_covering = Some(cap);
-            best_covering_score = score;
-        }
-
-        let sufficient = matches!(
-            (cap.access, requested),
-            (AccessMode::ReadWrite, _)
-                | (AccessMode::Read, AccessMode::Read)
-                | (AccessMode::Write, AccessMode::Write)
-        );
-
-        if sufficient && score >= best_sufficient_score {
-            best_sufficient = Some(cap);
-            best_sufficient_score = score;
-        }
-    }
-
-    if let Some(cap) = best_sufficient {
+    if let Some(cap) = covering.best_sufficient {
         return Ok(QueryResult::Allowed {
             reason: "granted_path".to_string(),
             granted_path: Some(cap.resolved.display().to_string()),
@@ -189,7 +163,22 @@ pub fn query_path(
         });
     }
 
-    if let Some(cap) = best_covering {
+    if let (Some(read_cap), Some(write_cap)) = (covering.best_read, covering.best_write) {
+        return Ok(QueryResult::Allowed {
+            reason: "granted_path_union".to_string(),
+            granted_path: Some(format!(
+                "{} (read) + {} (write)",
+                read_cap.resolved.display(),
+                write_cap.resolved.display()
+            )),
+            access: Some("readwrite".to_string()),
+            source: Some(format!("{} + {}", read_cap.source, write_cap.source)),
+            endpoint_rules: None,
+            warning: None,
+        });
+    }
+
+    if let Some(cap) = covering.best_covering {
         return Ok(QueryResult::Denied {
             reason: "insufficient_access".to_string(),
             details: Some(format!(
@@ -885,6 +874,55 @@ mod tests {
                 assert_eq!(access.as_deref(), Some("read+write"));
             }
             _ => panic!("expected allowed result"),
+        }
+    }
+
+    #[test]
+    fn test_query_path_readwrite_from_two_separate_grants() {
+        // #1628: read and write granted by two separate capabilities should
+        // still satisfy a `readwrite` query.
+        let dir = tempdir().expect("Failed to create temp dir");
+        let dir_canonical = dir.path().canonicalize().expect("canonicalize dir");
+        let subdir = dir_canonical.join("sub");
+        std::fs::create_dir(&subdir).expect("create subdir");
+
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(FsCapability {
+            original: dir_canonical.clone(),
+            resolved: dir_canonical.clone(),
+            access: AccessMode::Read,
+            is_file: false,
+            source: CapabilitySource::Group("read_group".to_string()),
+        });
+        caps.add_fs(FsCapability {
+            original: subdir.clone(),
+            resolved: subdir.clone(),
+            access: AccessMode::Write,
+            is_file: false,
+            source: CapabilitySource::Group("write_group".to_string()),
+        });
+
+        let result = query_path(&subdir, AccessMode::Read, &caps, &[]).expect("query failed");
+        assert!(
+            matches!(result, QueryResult::Allowed { .. }),
+            "expected read alone to be allowed"
+        );
+
+        let result = query_path(&subdir, AccessMode::Write, &caps, &[]).expect("query failed");
+        assert!(
+            matches!(result, QueryResult::Allowed { .. }),
+            "expected write alone to be allowed"
+        );
+
+        let result = query_path(&subdir, AccessMode::ReadWrite, &caps, &[]).expect("query failed");
+        match result {
+            QueryResult::Allowed { access, source, .. } => {
+                assert_eq!(access.as_deref(), Some("readwrite"));
+                let source = source.expect("expected a source");
+                assert!(source.contains("read_group"), "got: {source}");
+                assert!(source.contains("write_group"), "got: {source}");
+            }
+            other => panic!("expected readwrite to be allowed via union, got: {other:?}"),
         }
     }
 

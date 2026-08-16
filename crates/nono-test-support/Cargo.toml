@@ -1,0 +1,18 @@
+[package]
+name = "nono-test-support"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Shared scaffolding for nono integration tests"
+publish = false
+
+[dependencies]
+serde_json.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

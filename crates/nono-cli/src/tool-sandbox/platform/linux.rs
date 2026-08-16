@@ -11,9 +11,9 @@ use crate::lineage_cgroup::LineageMarker;
 use crate::profile;
 use crate::tool_sandbox::credentials::{ResolvedCredential, resolve_credentials};
 use crate::tool_sandbox::env::{
-    apply_environment_set_vars, default_env_allow_patterns, effective_argv_for_binary,
-    env_shebang_target_interpreter, inject_chaining_control_env, inject_url_open_env,
-    split_env_entry,
+    apply_environment_set_vars, apply_export_env, default_env_allow_patterns,
+    effective_argv_for_binary, env_shebang_target_interpreter, inject_chaining_control_env,
+    inject_url_open_env, split_env_entry,
 };
 use crate::tool_sandbox::launch::{
     exit_status_code, prepare_launcher_command, remove_launch_spec, write_launch_spec,
@@ -913,7 +913,7 @@ fn run_child_launcher() -> Result<()> {
     let caps = caps_from_spec(&spec.caps)?;
     tool_sandbox_profile_log!("launcher:caps_from_spec: {:?}", start_caps_from.elapsed());
     let start_sandbox_apply = std::time::Instant::now();
-    Sandbox::apply_auto(&caps)?;
+    Sandbox::apply_seccomp(&caps, nono::SeccompOpts::network_baseline())?;
     tool_sandbox_profile_log!(
         "launcher:sandbox_apply: {:?}",
         start_sandbox_apply.elapsed()
@@ -1358,7 +1358,7 @@ fn handle_shim_stream_inner(
     if let Some(invocation_policy) =
         select_invocation_policy(&state.plan.config, &request.command, &caller)
     {
-        let child_env = match filter_child_env(state, &request, policy) {
+        let child_env = match filter_child_env(state, &request, policy, &caller) {
             Ok(env) => env,
             Err(err) => {
                 record_command_policy_audit(
@@ -1514,7 +1514,7 @@ fn handle_shim_stream_inner(
                 } else {
                     (
                         "invocation_approve_denied",
-                        Some("approval_denied".to_string()),
+                        Some(super::approval_deny_reason(&decision)),
                     )
                 };
                 record_command_policy_audit(
@@ -1545,7 +1545,7 @@ fn handle_shim_stream_inner(
     let intercept = match command_config {
         Some(cc) => {
             match super::resolve_intercept_action(cc, &request.argv, || {
-                filter_child_env(state, &request, policy)
+                filter_child_env(state, &request, policy, &caller)
             }) {
                 Ok(intercept) => intercept,
                 Err(err) => {
@@ -1639,7 +1639,10 @@ fn handle_shim_stream_inner(
         let (audit_decision, deny_reason) = if decision.is_granted() {
             ("approve_granted", None)
         } else {
-            ("approve_denied", Some("approval_denied".to_string()))
+            (
+                "approve_denied",
+                Some(super::approval_deny_reason(&decision)),
+            )
         };
         record_command_policy_audit(
             audit_recorder.as_ref(),
@@ -1710,7 +1713,7 @@ fn handle_shim_stream_inner(
             ));
         }
         let result = (|| {
-            let launch = build_child_launch_spec(state, &request, effective_sandbox)?;
+            let launch = build_child_launch_spec(state, &request, effective_sandbox, &caller)?;
             launch_child_with_capture(state, &request.command, &caller, launch, stdio)
         })();
         state.active_count.fetch_sub(1, Ordering::SeqCst);
@@ -1798,7 +1801,7 @@ fn handle_shim_stream_inner(
             ));
         }
         let result = (|| {
-            let launch = build_child_launch_spec(state, &request, effective_sandbox)?;
+            let launch = build_child_launch_spec(state, &request, effective_sandbox, &caller)?;
             launch_child_with_capture(state, &request.command, &caller, launch, stdio)
         })();
         state.active_count.fetch_sub(1, Ordering::SeqCst);
@@ -1879,6 +1882,7 @@ fn handle_shim_stream_inner(
                 helper,
                 &extra_args,
                 false,
+                &caller,
             )?;
             launch_child(state, &request.command, &caller, launch, stdio)
         })();
@@ -1958,7 +1962,7 @@ fn handle_shim_stream_inner(
     }
 
     let result = (|| {
-        let launch = build_child_launch_spec(state, &request, effective_sandbox)?;
+        let launch = build_child_launch_spec(state, &request, effective_sandbox, &caller)?;
         launch_child(state, &request.command, &caller, launch, stdio)
     })();
     state.active_count.fetch_sub(1, Ordering::SeqCst);
@@ -2267,6 +2271,22 @@ fn select_effective_policy<'a>(
                 }),
             }
         }
+    }
+}
+
+/// The export list the resolved caller declares: its own `export_env`, or the
+/// top-level `session_export_env`. An unknown caller command exports nothing.
+fn caller_export_env<'a>(config: &'a CommandPoliciesConfig, caller: &Caller) -> &'a [String] {
+    match caller {
+        Caller::Session { .. } => &config.session_export_env,
+        Caller::Command {
+            command: caller_name,
+            ..
+        } => config
+            .commands
+            .get(caller_name)
+            .map(|command| command.export_env.as_slice())
+            .unwrap_or(&[]),
     }
 }
 
@@ -3264,6 +3284,7 @@ fn build_child_launch_spec(
     state: &ToolSandboxState,
     request: &ToolSandboxShimRequest,
     policy: &CommandSandboxConfig,
+    caller: &Caller,
 ) -> Result<ToolSandboxChildLaunchSpec> {
     let binary = state
         .plan
@@ -3273,7 +3294,7 @@ fn build_child_launch_spec(
         .ok_or_else(|| {
             NonoError::SandboxInit(format!("missing resolved binary for {}", request.command))
         })?;
-    build_child_launch_spec_for_binary(state, request, policy, binary, &[], true)
+    build_child_launch_spec_for_binary(state, request, policy, binary, &[], true, caller)
 }
 
 /// Build a child launch spec that runs `binary` (the command's real binary OR
@@ -3292,6 +3313,7 @@ fn build_child_launch_spec_for_binary(
     binary: &ResolvedCommandBinary,
     extra_args: &[Vec<u8>],
     preserve_caller_argv0: bool,
+    caller: &Caller,
 ) -> Result<ToolSandboxChildLaunchSpec> {
     let start_vbi = std::time::Instant::now();
     verify_binary_identity(binary)?;
@@ -3324,7 +3346,7 @@ fn build_child_launch_spec_for_binary(
     tool_sandbox_profile_log!("build_child_caps total: {:?}", start_caps.elapsed());
     caps.deduplicate();
 
-    let env = filter_child_env(state, request, policy)?;
+    let env = filter_child_env(state, request, policy, caller)?;
 
     // Build the execute allowlist. AccessMode::Read includes
     // AccessFs::Execute in the Landlock mapping; without an explicit
@@ -4053,6 +4075,7 @@ fn filter_child_env(
     state: &ToolSandboxState,
     request: &ToolSandboxShimRequest,
     policy: &CommandSandboxConfig,
+    caller: &Caller,
 ) -> Result<Vec<Vec<u8>>> {
     let allowed_patterns: Vec<String> = policy
         .environment
@@ -4094,6 +4117,12 @@ fn filter_child_env(
         }
     }
     drop(broker);
+    // Runs before PATH/chaining/set_vars/creds so nono-injected vars still win.
+    apply_export_env(
+        &mut env,
+        request,
+        caller_export_env(&state.plan.config, caller),
+    );
     if !has_path {
         env.push(format!("PATH={}", state.session_path).into_bytes());
     } else {
@@ -6112,6 +6141,48 @@ mod tests {
         let denied = resolve_caller_with(DAEMONIZED_PEER, UNRELATED_ROOT, &state, "git", |_| None);
         assert!(matches!(denied, Err(NonoError::SandboxInit(_))));
         Ok(())
+    }
+
+    #[test]
+    fn caller_export_env_selects_the_resolved_callers_own_list() {
+        let mut config = CommandPoliciesConfig {
+            session_export_env: vec!["SESSION_*".to_string()],
+            ..Default::default()
+        };
+        config.commands.insert(
+            "git".to_string(),
+            CommandPolicyConfig {
+                export_env: vec!["GIT_*".to_string()],
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            caller_export_env(&config, &Caller::Session { pid: 1 }),
+            ["SESSION_*".to_string()]
+        );
+        assert_eq!(
+            caller_export_env(
+                &config,
+                &Caller::Command {
+                    command: "git".to_string(),
+                    pid: 2,
+                }
+            ),
+            ["GIT_*".to_string()]
+        );
+        // A caller with no policy of its own must not fall back to the session
+        // list, or an unmediated wrapper would inherit the session's exports.
+        assert!(
+            caller_export_env(
+                &config,
+                &Caller::Command {
+                    command: "unknown".to_string(),
+                    pid: 3,
+                }
+            )
+            .is_empty()
+        );
     }
 
     #[test]

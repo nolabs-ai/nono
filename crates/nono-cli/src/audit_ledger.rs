@@ -15,6 +15,11 @@ use std::path::{Path, PathBuf};
 const AUDIT_LEDGER_FILENAME: &str = "ledger.ndjson";
 const AUDIT_LEDGER_LOCK_FILENAME: &str = "ledger.lock";
 
+/// Path of the global append-only ledger.
+pub(crate) fn ledger_path() -> Result<PathBuf> {
+    Ok(audit_root()?.join(AUDIT_LEDGER_FILENAME))
+}
+
 pub(crate) fn append_session(metadata: &SessionMetadata) -> Result<LedgerRecord> {
     validate_ledger_session_id(&metadata.session_id)?;
 
@@ -163,6 +168,41 @@ mod tests {
         assert!(verified.session_digest_matches);
         assert!(verified.ledger_chain_verified);
         assert_eq!(verified.entry_count, 1);
+    }
+
+    #[test]
+    fn append_fails_closed_on_an_unparseable_ledger() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        let home = tmp.path().to_string_lossy().to_string();
+        let state_str = state.to_string_lossy().to_string();
+        let _env = EnvVarGuard::set_all(&[("HOME", &home), ("XDG_STATE_HOME", &state_str)]);
+
+        append_session(&sample_metadata("20260421-200000-11111")).unwrap();
+
+        // Two records on one line with no separator i.e. a corrupt ledger.
+        let path = ledger_path().unwrap();
+        let record = std::fs::read_to_string(&path).unwrap();
+        let record = record.trim_end();
+        let corrupt = format!("{record}{record}\n");
+        std::fs::write(&path, &corrupt).unwrap();
+
+        let err = match append_session(&sample_metadata("20260421-200001-22222")) {
+            Ok(_) => panic!("append onto an unparseable ledger should fail"),
+            Err(err) => err,
+        };
+
+        assert!(
+            matches!(err, NonoError::AuditLedgerCorrupt { .. }),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            corrupt,
+            "a failed append must leave the ledger byte-identical"
+        );
     }
 
     #[test]

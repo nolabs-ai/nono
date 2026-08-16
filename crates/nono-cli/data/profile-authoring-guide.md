@@ -287,17 +287,63 @@ All filesystem grants, denials, and deny-rule exemptions live under this single 
 
 | Field               | Type            | Description |
 |---------------------|-----------------|-------------|
-| `allow`             | array of string | Directories with read+write access. |
-| `read`              | array of string | Directories with read-only access. |
-| `write`             | array of string | Directories with write-only access. |
+| `allow`             | array of string | Directories with read+write access. Supports glob patterns (see below). |
+| `read`              | array of string | Directories or files with read-only access. Supports glob patterns (see below). |
+| `write`             | array of string | Directories with write-only access. Supports glob patterns (see below). |
 | `allow_file`        | array of string | Single files with read+write access. |
 | `read_file`         | array of string | Single files with read-only access. |
 | `write_file`        | array of string | Single files with write-only access. |
-| `deny`              | array of string | Paths denied filesystem access. |
-| `bypass_protection` | array of string | Paths exempted from deny groups. **This flag does not implicitly grant access** — `bypass_protection` only removes the deny rule; each path must also appear in `filesystem.allow`, `filesystem.read`, or `filesystem.write` (or the matching `*_file` variant) to become accessible. |
+| `deny`              | array of string | Paths denied filesystem access. Supports glob patterns (see below). |
+| `bypass_protection` | array of string | Paths exempted from deny groups. **This flag does not implicitly grant access** — `bypass_protection` only removes the deny rule; each path must also appear in `filesystem.allow`, `filesystem.read`, or `filesystem.write` (or the matching `*_file` variant) to become accessible. Supports glob patterns (see below). |
 | `ignore`            | array of string | Paths whose runtime denials should not be offered in save-profile prompts. Does not grant access or hide diagnostics. |
 
 All path fields support variable expansion (see Section 6).
+
+#### Glob patterns in path fields
+
+`allow`, `read`, `write`, `deny`, and `bypass_protection` support `*` and `**` glob patterns:
+
+| Pattern | Matches |
+|---------|---------|
+| `*` | Any filename within a single directory level. Does not cross `/`. Matches hidden files too — `src/*` matches `src/.env` the same as `src/index.js` (unlike a shell, which skips leading-dot names by default). |
+| `**` | Zero or more path segments, including across directories. `foo/**` matches everything *inside* `foo/`, at any depth, but does **not** match `foo` itself — add a separate literal entry for `foo` if you need that too. |
+| `**/<name>` | A file or directory named `<name>` at any depth, including at the root of the pattern. |
+
+Patterns without an absolute prefix (e.g. `**/.env`) are rooted at the workdir. Patterns are expanded at sandbox start against the filesystem as it exists at that moment.
+
+Basic example — grant read access to every `.json` config file directly under `config/`, without touching anything else in that directory:
+
+```json
+{
+  "filesystem": {
+    "read": ["$WORKDIR/config/*.json"]
+  }
+}
+```
+
+**Matching a directory grants everything inside it, recursively — regardless of `*` vs `**`.** The `*`/`**` distinction only controls what the *search* finds, not how much access a found directory grants. If `proj/*` matches a subdirectory `proj/sub`, that whole subdirectory becomes a normal recursive directory grant — the same as writing `"allow": ["proj/sub"]` directly — so everything under `sub`, at any depth, is included even though the pattern that found it only looked one level deep. To grant only specific files and exclude their siblings' subdirectories, target files by name/extension (`proj/*.json`) rather than matching the directory that contains them.
+
+Only `*` and `**` are wildcards — every other character, including in real path segments the pattern happens to walk through (e.g. a directory literally named `[locale]`), is matched literally. `?` and character classes (`[abc]`) are rejected with a parse error rather than silently treated as wildcards.
+
+**Symlinks**: a glob only ever matches entries whose real, resolved location stays inside the directory the pattern is rooted at. A symlink inside that directory pointing elsewhere on disk (e.g. `$WORKDIR/link -> ~/.ssh`) is skipped, and the pattern never follows it to grant access outside the intended root — even though a symlink pointing *within* the root still matches normally.
+
+**Platform differences**:
+- **macOS**: `filesystem.deny` glob patterns also emit a Seatbelt regex rule that enforces the deny at runtime, including for files created after the sandbox starts.
+- **Linux**: glob patterns are expanded once at sandbox start. Files created after the sandbox starts are not covered.
+- **Linux and `deny`-within-`allow`**: Landlock is strictly allow-list — it has no kernel-level "deny" primitive, so it cannot carve an exception out of a broader grant. If a `deny` pattern overlaps a path already covered by `allow`/`read`/`write` (e.g. `deny: ["$WORKDIR/src/.env"]` alongside `allow: ["$WORKDIR/src"]`), nono refuses to start on Linux rather than silently leave the deny unenforced. This is a hard error, not a warning — Seatbelt on macOS *can* express this and enforces it correctly, so the same profile behaves differently across platforms.
+
+For a profile that works identically on both, write the `allow`/`read`/`write` patterns narrowly enough that they never match what you want denied, instead of granting broadly and subtracting after the fact:
+
+```json
+{
+  "filesystem": {
+    "read": ["$WORKDIR/src/**/*.ts", "$WORKDIR/src/**/*.tsx"],
+    "deny": ["**/.env", "**/.secrets"]
+  }
+}
+```
+
+Here `read` only ever matches `.ts`/`.tsx` files, so it can never overlap `.env`/`.secrets` — the `deny` entries are a backstop that costs nothing on either platform, rather than a carve-out that only macOS can honor. If your files can't be filtered by a naming pattern, list the specific files/directories you need instead of granting their parent wholesale.
 
 ### workdir
 
@@ -697,6 +743,53 @@ Controls which environment variables are passed to the sandboxed process. When `
 | `set_vars`    | object (string→string) | `{}` | Static environment variables injected after allow/deny filtering and before credential injection (injected credentials win on conflict). Values support the same expansion as profile paths (`$HOME`, `~`, `$WORKDIR`, `$TMPDIR`, `$XDG_*`, `$NONO_CONFIG`, `$NONO_PACKAGES`); keys are not expanded. `PATH` and any `NONO_*` key are reserved and rejected at load time. Unlike inherited host vars, keys here are NOT subject to the dangerous-variable blocklist (`LD_PRELOAD`, `NODE_OPTIONS`, …) — setting one is an explicit operator decision. |
 
 Inheritance: child `allow_vars` and `deny_vars` are appended to base values and deduplicated; `set_vars` merges as a map, with the child's value winning on key conflict.
+
+### export_env (caller-declared environment pass-through)
+
+`export_env` lets a **caller** declare which of its own live environment variables flow down, verbatim, to the commands it invokes — bypassing both the callee's `allow_vars` filtering and the built-in dangerous-variable blocklist (`LD_PRELOAD`, `NODE_OPTIONS`, `PYTHONPATH`, …). It is the escape hatch for tools that must forward an interpreter/tooling variable to the programs they launch (for example an interpreter-injection variable a wrapper sets before spawning a child interpreter).
+
+This is a **caller-declared** control: the field lives on the command doing the invoking (or on the session, for the top-level case), not on the command being invoked. When a command is intercepted, nono attributes it to its resolved caller, then copies the matching variables from that intercepted command's **immediate-parent environment** into the child. The caller's list is only the filter; the values always come from the live parent environment.
+
+- **Patterns:** exact names (`"TOOL_CONFIG"`), trailing-`*` prefixes (`"AWS_*"`), or a bare `"*"` (all). Mid-string wildcards are rejected at load time.
+- **`PATH` and any `NONO_*` key are always excluded** — nono manages those — even under `"*"`. A pattern that explicitly targets them (exact `PATH`, or the `NONO_` prefix) is rejected at load time.
+- Values are taken verbatim and are **not** run through the credential broker. Use `export_env` for tooling variables, not credentials — those flow through `use_credentials`/`allow_vars`.
+- Applied on both the macOS and Linux tool-sandbox paths, before PATH/chaining/`set_vars`/credential injection, so nono-injected variables still win. Merges by dedup-append across the inheritance chain.
+
+#### Per-command caller: `commands.<caller>.export_env`
+
+When the invoking command is itself mediated, declare `export_env` on that command. Example: `git` runs a hook that spawns `node`; `node`'s resolved caller is `git`, so `git`'s `export_env` decides what reaches `node`:
+
+```json
+{
+  "command_policies": {
+    "commands": {
+      "git": {
+        "can_use": ["node"],
+        "export_env": ["TOOL_CONFIG"]
+      }
+    }
+  }
+}
+```
+
+#### Session caller: `session_export_env`
+
+When the intercepted command's nearest mediated ancestor is the session itself — for example an **unmediated** wrapper spawns it, so the ancestry walk reaches the session root without crossing a mediated command — its caller is the session. Declare the top-level `session_export_env` to cover this case:
+
+```json
+{
+  "command_policies": {
+    "session_export_env": ["TOOL_CONFIG"],
+    "commands": {
+      "node": {
+        "from": { "session": { "fs_read": ["."] } }
+      }
+    }
+  }
+}
+```
+
+Here an unmediated wrapper invokes `node` while holding `TOOL_CONFIG` in its environment; `node`'s caller resolves to the session, so `session_export_env` copies `TOOL_CONFIG` into `node` verbatim.
 
 ### hooks
 

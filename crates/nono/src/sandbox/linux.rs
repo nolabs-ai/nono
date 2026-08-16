@@ -9,9 +9,222 @@ use landlock::{
     ABI, Access, AccessFs, AccessNet, BitFlags, CompatLevel, Compatible, NetPort, PathBeneath,
     PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr, Scope,
 };
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use tracing::{debug, info, warn};
+
+const LANDLOCK_RULE_PATH_BENEATH: u32 = 1;
+const LANDLOCK_RULE_NET_PORT: u32 = 2;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RawLandlockRulesetAttr {
+    handled_access_fs: u64,
+    handled_access_net: u64,
+    scoped: u64,
+}
+
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+struct RawLandlockPathBeneathAttr {
+    allowed_access: u64,
+    parent_fd: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RawLandlockNetPortAttr {
+    allowed_access: u64,
+    port: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RawSandboxStage {
+    NoNewPrivs,
+    CreateRuleset,
+    AddPathRule,
+    AddNetRule,
+    RestrictSelf,
+    InstallStaticFilter,
+    InstallNotifyFilter,
+}
+
+/// Fixed-size error returned by child-safe sandbox operations.
+///
+/// This type intentionally owns no heap data.  Callers using raw `clone(2)`
+/// can inspect it or write a static diagnostic and `_exit` without invoking
+/// an allocator in the child.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RawSandboxError {
+    stage: RawSandboxStage,
+    errno: i32,
+}
+
+impl RawSandboxError {
+    #[must_use]
+    pub fn stage(self) -> RawSandboxStage {
+        self.stage
+    }
+
+    #[must_use]
+    pub fn errno(self) -> i32 {
+        self.errno
+    }
+}
+
+fn raw_errno() -> i32 {
+    // SAFETY: errno is thread-local and the pointer is valid for this thread.
+    unsafe { *libc::__errno_location() }
+}
+
+struct PreparedPathRule {
+    path_fd: OwnedFd,
+    allowed_access: u64,
+}
+
+fn move_fd_above_stdio(fd: OwnedFd) -> std::io::Result<OwnedFd> {
+    if fd.as_raw_fd() >= 3 {
+        return Ok(fd);
+    }
+
+    // Prepared descriptors must survive child stdio wiring.  F_DUPFD_CLOEXEC
+    // creates an independent slot at or above 3; dropping `fd` then restores
+    // the caller's originally closed stdio slot.
+    // SAFETY: `fd` is a valid, open descriptor owned by this `OwnedFd` for the
+    // duration of the call, so passing its raw value to `fcntl` is valid.
+    let duplicate = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
+    if duplicate < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `duplicate` is >= 0 here, so `fcntl` succeeded and returned a
+    // fresh, uniquely-owned descriptor; wrapping it in `OwnedFd` is valid and
+    // gives us sole ownership.
+    Ok(unsafe { OwnedFd::from_raw_fd(duplicate) })
+}
+
+#[derive(Clone, Copy)]
+struct PreparedNetRule {
+    port: u16,
+    allowed_access: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StaticNetworkFilter {
+    None,
+    BlockAll,
+    TcpOnly,
+}
+
+/// A Landlock ruleset whose allocation and path opening happened in the
+/// parent, before a raw-cloned child exists.
+///
+/// `apply_raw()` creates the ruleset, adds the already-opened path/port rules,
+/// and restricts the calling task using raw syscalls only.  It neither
+/// allocates nor consumes this value, which lets the parent retain its copy of
+/// every path fd until a `CLONE_FILES` child has detached its descriptor table.
+pub struct PreparedLandlockSandbox {
+    attr: RawLandlockRulesetAttr,
+    path_rules: Vec<PreparedPathRule>,
+    net_rules: Vec<PreparedNetRule>,
+    static_network_filter: StaticNetworkFilter,
+    fallback: SeccompNetFallback,
+}
+
+impl PreparedLandlockSandbox {
+    #[must_use]
+    pub fn fallback(&self) -> &SeccompNetFallback {
+        &self.fallback
+    }
+
+    /// Apply this prepared policy without heap allocation or libc coordination
+    /// wrappers.  This is intended for the child side of raw `clone(2)`.
+    pub fn apply_raw(&self) -> std::result::Result<(), RawSandboxError> {
+        // SAFETY: all pointers below refer to fixed-size stack values or data
+        // owned by `self`, which remains live for the duration of each syscall.
+        unsafe {
+            let ruleset_fd = libc::syscall(
+                libc::SYS_landlock_create_ruleset,
+                &self.attr as *const RawLandlockRulesetAttr,
+                std::mem::size_of::<RawLandlockRulesetAttr>(),
+                0_u32,
+            ) as i32;
+            if ruleset_fd < 0 {
+                return Err(RawSandboxError {
+                    stage: RawSandboxStage::CreateRuleset,
+                    errno: raw_errno(),
+                });
+            }
+
+            for rule in &self.path_rules {
+                let attr = RawLandlockPathBeneathAttr {
+                    allowed_access: rule.allowed_access,
+                    parent_fd: rule.path_fd.as_raw_fd(),
+                };
+                if libc::syscall(
+                    libc::SYS_landlock_add_rule,
+                    ruleset_fd,
+                    LANDLOCK_RULE_PATH_BENEATH,
+                    &attr as *const RawLandlockPathBeneathAttr,
+                    0_u32,
+                ) < 0
+                {
+                    let errno = raw_errno();
+                    libc::syscall(libc::SYS_close, ruleset_fd);
+                    return Err(RawSandboxError {
+                        stage: RawSandboxStage::AddPathRule,
+                        errno,
+                    });
+                }
+            }
+
+            for rule in &self.net_rules {
+                let attr = RawLandlockNetPortAttr {
+                    allowed_access: rule.allowed_access,
+                    port: u64::from(rule.port),
+                };
+                if libc::syscall(
+                    libc::SYS_landlock_add_rule,
+                    ruleset_fd,
+                    LANDLOCK_RULE_NET_PORT,
+                    &attr as *const RawLandlockNetPortAttr,
+                    0_u32,
+                ) < 0
+                {
+                    let errno = raw_errno();
+                    libc::syscall(libc::SYS_close, ruleset_fd);
+                    return Err(RawSandboxError {
+                        stage: RawSandboxStage::AddNetRule,
+                        errno,
+                    });
+                }
+            }
+
+            if libc::syscall(libc::SYS_prctl, libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0 {
+                let errno = raw_errno();
+                libc::syscall(libc::SYS_close, ruleset_fd);
+                return Err(RawSandboxError {
+                    stage: RawSandboxStage::NoNewPrivs,
+                    errno,
+                });
+            }
+
+            if libc::syscall(libc::SYS_landlock_restrict_self, ruleset_fd, 0_u32) < 0 {
+                let errno = raw_errno();
+                libc::syscall(libc::SYS_close, ruleset_fd);
+                return Err(RawSandboxError {
+                    stage: RawSandboxStage::RestrictSelf,
+                    errno,
+                });
+            }
+            libc::syscall(libc::SYS_close, ruleset_fd);
+        }
+        install_static_network_filter_raw(self.static_network_filter)?;
+        Ok(())
+    }
+}
 
 /// Detected Landlock ABI version with feature query methods.
 ///
@@ -547,6 +760,167 @@ pub fn apply_seccomp_with_abi(
     apply_with_abi_inner(caps, abi, opts.tcp_network.into())
 }
 
+/// Prepare the Linux sandbox policy for child-side, allocation-free apply.
+///
+/// All path lookup, descriptor opening, rule-vector construction, and policy
+/// validation happens here.  The returned value can be inherited across a raw
+/// `clone(2)` and applied with [`PreparedLandlockSandbox::apply_raw`].
+pub fn prepare_seccomp_with_abi(
+    caps: &CapabilitySet,
+    abi: &DetectedAbi,
+    opts: SeccompOpts,
+) -> Result<PreparedLandlockSandbox> {
+    prepare_with_abi_inner(caps, abi, opts.tcp_network.into())
+}
+
+fn prepare_with_abi_inner(
+    caps: &CapabilitySet,
+    abi: &DetectedAbi,
+    tcp_network: TcpNetworkEnforcement,
+) -> Result<PreparedLandlockSandbox> {
+    let target_abi = abi.abi;
+    let scopes = requested_scopes(caps, abi)?;
+
+    if tcp_network.handles_tcp()
+        && !matches!(caps.network_mode(), NetworkMode::AllowAll)
+        && caps.localhost_ports().contains(&0)
+    {
+        return Err(NonoError::SandboxInit(
+            "open_port 0 (localhost TCP wildcard) is macOS-only; on Linux use explicit ports or a network profile."
+                .to_string(),
+        ));
+    }
+
+    let handled_fs = AccessFs::from_all(target_abi);
+    let needs_network_handling = tcp_network.handles_tcp()
+        && (!matches!(caps.network_mode(), NetworkMode::AllowAll)
+            || !caps.tcp_connect_ports().is_empty()
+            || !caps.tcp_bind_ports().is_empty());
+
+    let mut fallback = SeccompNetFallback::None;
+    let mut handled_net = BitFlags::<AccessNet>::EMPTY;
+    if needs_network_handling {
+        handled_net = AccessNet::from_all(target_abi);
+        if handled_net.is_empty() {
+            if tcp_network.allows_seccomp_fallback() {
+                fallback = seccomp_network_fallback_mode(caps);
+                if matches!(fallback, SeccompNetFallback::None) {
+                    return Err(NonoError::SandboxInit(
+                        "Network filtering requested but kernel Landlock ABI doesn't support it \
+                         (requires V4+). On this kernel, only full --block-net or --proxy-only \
+                         fallback via seccomp is supported."
+                            .to_string(),
+                    ));
+                }
+            } else {
+                return Err(NonoError::SandboxInit(format!(
+                    "Network filtering requested but Landlock ABI {:?} lacks network support \
+                     (requires V4+). Use apply_auto to enable seccomp fallback.",
+                    target_abi
+                )));
+            }
+        }
+    }
+
+    let mut net_rules = Vec::new();
+    if !handled_net.is_empty() {
+        let connect = BitFlags::from(AccessNet::ConnectTcp).bits();
+        let bind = BitFlags::from(AccessNet::BindTcp).bits();
+
+        if let NetworkMode::ProxyOnly { port, bind_ports } = caps.network_mode() {
+            net_rules.push(PreparedNetRule {
+                port: *port,
+                allowed_access: connect,
+            });
+            net_rules.extend(bind_ports.iter().map(|port| PreparedNetRule {
+                port: *port,
+                allowed_access: bind,
+            }));
+        }
+        net_rules.extend(caps.tcp_connect_ports().iter().map(|port| PreparedNetRule {
+            port: *port,
+            allowed_access: connect,
+        }));
+        net_rules.extend(caps.tcp_bind_ports().iter().map(|port| PreparedNetRule {
+            port: *port,
+            allowed_access: bind,
+        }));
+
+        if !matches!(caps.network_mode(), NetworkMode::AllowAll) {
+            for port in caps.localhost_ports() {
+                net_rules.push(PreparedNetRule {
+                    port: *port,
+                    allowed_access: connect,
+                });
+                net_rules.push(PreparedNetRule {
+                    port: *port,
+                    allowed_access: bind,
+                });
+            }
+            for (start, end) in merge_port_ranges(caps.localhost_port_ranges()) {
+                for port in start..=end {
+                    net_rules.push(PreparedNetRule {
+                        port,
+                        allowed_access: connect,
+                    });
+                    net_rules.push(PreparedNetRule {
+                        port,
+                        allowed_access: bind,
+                    });
+                }
+            }
+        }
+    }
+
+    let ioctl_dev_available = AccessFs::from_all(target_abi).contains(AccessFs::IoctlDev);
+    let mut path_rules = Vec::with_capacity(caps.fs_capabilities().len());
+    for cap in caps.fs_capabilities() {
+        let result = access_to_landlock(cap.access, target_abi);
+        let mut access = result.effective;
+        if ioctl_dev_available
+            && matches!(cap.access, AccessMode::Write | AccessMode::ReadWrite)
+            && (is_device_path(&cap.resolved) || is_device_directory(&cap.resolved))
+        {
+            access |= AccessFs::IoctlDev;
+        }
+
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH | libc::O_CLOEXEC)
+            .open(&cap.resolved)
+            .map_err(|e| {
+                NonoError::SandboxInit(format!(
+                    "Cannot pre-open Landlock rule path {}: {}",
+                    cap.resolved.display(),
+                    e
+                ))
+            })?;
+        let path_fd = move_fd_above_stdio(file.into()).map_err(|e| {
+            NonoError::SandboxInit(format!(
+                "Cannot reserve Landlock rule descriptor for {}: {}",
+                cap.resolved.display(),
+                e
+            ))
+        })?;
+        path_rules.push(PreparedPathRule {
+            path_fd,
+            allowed_access: access.bits(),
+        });
+    }
+
+    Ok(PreparedLandlockSandbox {
+        attr: RawLandlockRulesetAttr {
+            handled_access_fs: handled_fs.bits(),
+            handled_access_net: handled_net.bits(),
+            scoped: scopes.bits(),
+        },
+        path_rules,
+        net_rules,
+        static_network_filter: selected_static_network_filter(tcp_network, caps, &fallback),
+        fallback,
+    })
+}
+
 /// Declare that TCP network enforcement is managed externally.
 ///
 /// This function intentionally installs no kernel policy. It exists only as an
@@ -559,8 +933,10 @@ pub fn apply_external() -> Result<()> {
 
 /// Apply sandboxing with automatic Landlock → seccomp fallback, auto-detecting ABI.
 ///
-/// This is the recommended choice when you want enforcement but can tolerate seccomp
-/// being used instead of Landlock when the kernel ABI lacks network support (V4+).
+/// This preserves the compatibility-oriented library behavior: seccomp is
+/// used only when the kernel ABI lacks Landlock network support (V4+). Use
+/// [`SeccompOpts::network_baseline`] with [`apply_seccomp`] to layer the static
+/// socket filter on every supported kernel.
 /// Returns the seccomp network fallback mode: `BlockAll` is installed inline;
 /// `ProxyOnly` must be installed post-fork via `install_seccomp_proxy_filter()`.
 pub fn apply_auto(caps: &CapabilitySet) -> Result<SeccompNetFallback> {
@@ -915,14 +1291,26 @@ fn apply_with_abi_inner(
         }
     }
 
-    if matches!(seccomp_net_fallback, SeccompNetFallback::BlockAll) {
-        install_seccomp_block_network().map_err(|e| {
-            NonoError::SandboxInit(format!(
-                "Failed to install seccomp network block fallback: {}",
-                e
-            ))
-        })?;
-        info!("Seccomp network block fallback enforced");
+    match selected_static_network_filter(tcp_network, caps, &seccomp_net_fallback) {
+        StaticNetworkFilter::None => {}
+        StaticNetworkFilter::BlockAll => {
+            install_seccomp_block_network().map_err(|e| {
+                NonoError::SandboxInit(format!(
+                    "Failed to install seccomp full-network block: {}",
+                    e
+                ))
+            })?;
+            info!("Seccomp full-network block enforced");
+        }
+        StaticNetworkFilter::TcpOnly => {
+            install_seccomp_tcp_only_network().map_err(|e| {
+                NonoError::SandboxInit(format!(
+                    "Failed to install seccomp TCP-only baseline: {}",
+                    e
+                ))
+            })?;
+            info!("Seccomp TCP-only network baseline enforced");
+        }
     }
     // ProxyOnly is NOT installed here — it requires a notify fd that must
     // be sent to the supervisor parent via SCM_RIGHTS. The caller (CLI)
@@ -1126,16 +1514,27 @@ const SECCOMP_USER_NOTIF_FLAG_CONTINUE: u32 = 1;
 
 // BPF constants
 const BPF_LD: u16 = 0x00;
+const BPF_ALU: u16 = 0x04;
 const BPF_W: u16 = 0x00;
 const BPF_ABS: u16 = 0x20;
 const BPF_JMP: u16 = 0x05;
 const BPF_JEQ: u16 = 0x10;
+const BPF_JSET: u16 = 0x40;
+const BPF_AND: u16 = 0x50;
 const BPF_K: u16 = 0x00;
 const BPF_RET: u16 = 0x06;
 
 const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
 const SECCOMP_RET_USER_NOTIF: u32 = 0x7fc0_0000;
 const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
+
+const SECCOMP_DATA_ARCH_OFFSET: u32 = 4;
+const X32_SYSCALL_BIT: u32 = 0x4000_0000;
+
+#[cfg(target_arch = "x86_64")]
+const NATIVE_AUDIT_ARCH: u32 = 0xc000_003e;
+#[cfg(target_arch = "aarch64")]
+const NATIVE_AUDIT_ARCH: u32 = 0xc000_00b7;
 
 // Syscall numbers for x86_64 (public for CLI to distinguish openat vs openat2)
 #[cfg(target_arch = "x86_64")]
@@ -1219,6 +1618,9 @@ pub fn validate_openat2_size(how_size: usize) -> bool {
 // Offset of `nr` field in seccomp_data (used by BPF)
 const SECCOMP_DATA_NR_OFFSET: u32 = 0;
 const SECCOMP_DATA_ARG0_OFFSET: u32 = 16;
+const SECCOMP_DATA_ARG1_OFFSET: u32 = 24;
+const SECCOMP_DATA_ARG2_OFFSET: u32 = 32;
+const SOCK_TYPE_MASK: u32 = 0xf;
 
 /// A single BPF instruction.
 #[repr(C)]
@@ -1235,6 +1637,90 @@ struct SockFilterInsn {
 struct SockFprog {
     len: u16,
     filter: *const SockFilterInsn,
+}
+
+/// Prefix a syscall-number filter with native-architecture validation.
+///
+/// The architecture check closes the compat-ABI path (for example, i386
+/// `socketcall` from an x86_64 process). The syscall-bit check separately
+/// rejects x32, which reports the x86_64 audit architecture while setting a
+/// marker bit in the syscall number. Keeping this as a fixed-size array means
+/// raw-cloned children can build static filters without allocating.
+fn seccomp_arch_guard(errno_ret: u32) -> [SockFilterInsn; 6] {
+    [
+        SockFilterInsn {
+            code: BPF_LD | BPF_W | BPF_ABS,
+            jt: 0,
+            jf: 0,
+            k: SECCOMP_DATA_ARCH_OFFSET,
+        },
+        SockFilterInsn {
+            code: BPF_JMP | BPF_JEQ | BPF_K,
+            jt: 1,
+            jf: 0,
+            k: NATIVE_AUDIT_ARCH,
+        },
+        SockFilterInsn {
+            code: BPF_RET | BPF_K,
+            jt: 0,
+            jf: 0,
+            k: errno_ret,
+        },
+        SockFilterInsn {
+            code: BPF_LD | BPF_W | BPF_ABS,
+            jt: 0,
+            jf: 0,
+            k: SECCOMP_DATA_NR_OFFSET,
+        },
+        SockFilterInsn {
+            code: BPF_JMP | BPF_JSET | BPF_K,
+            jt: 0,
+            jf: 1,
+            k: X32_SYSCALL_BIT,
+        },
+        SockFilterInsn {
+            code: BPF_RET | BPF_K,
+            jt: 0,
+            jf: 0,
+            k: errno_ret,
+        },
+    ]
+}
+
+fn prepend_seccomp_arch_guard<const N: usize, const M: usize>(
+    tail: [SockFilterInsn; N],
+    errno_ret: u32,
+) -> [SockFilterInsn; M] {
+    let mut guarded = [SockFilterInsn {
+        code: BPF_RET | BPF_K,
+        jt: 0,
+        jf: 0,
+        k: errno_ret,
+    }; M];
+    let prefix = seccomp_arch_guard(errno_ret);
+
+    let mut index = 0;
+    while index < prefix.len() {
+        guarded[index] = prefix[index];
+        index += 1;
+    }
+    let mut tail_index = 0;
+    while tail_index < tail.len() {
+        guarded[prefix.len() + tail_index] = tail[tail_index];
+        tail_index += 1;
+    }
+    guarded
+}
+
+fn prepend_seccomp_arch_guard_vec(
+    tail: Vec<SockFilterInsn>,
+    errno_ret: u32,
+) -> Vec<SockFilterInsn> {
+    let prefix = seccomp_arch_guard(errno_ret);
+    let mut guarded = Vec::with_capacity(prefix.len() + tail.len());
+    guarded.extend_from_slice(&prefix);
+    guarded.extend(tail);
+    guarded
 }
 
 /// Install a seccomp-notify BPF filter for openat/openat2.
@@ -1372,10 +1858,10 @@ pub fn install_seccomp_notify() -> Result<std::os::fd::OwnedFd> {
 /// `AccessNet`. It enforces a fail-closed `--block-net` policy by allowing
 /// only Unix-domain sockets and denying `socket()`, `socketpair()`, and
 /// `io_uring_setup()` attempts that could drive network I/O.
-fn build_seccomp_block_network_filter() -> [SockFilterInsn; 10] {
+fn build_seccomp_block_network_filter() -> [SockFilterInsn; 16] {
     let errno_ret = SECCOMP_RET_ERRNO | (libc::EPERM as u32);
 
-    [
+    let filter = [
         SockFilterInsn {
             code: BPF_LD | BPF_W | BPF_ABS,
             jt: 0,
@@ -1436,7 +1922,231 @@ fn build_seccomp_block_network_filter() -> [SockFilterInsn; 10] {
             jf: 0,
             k: SECCOMP_RET_ALLOW,
         },
-    ]
+    ];
+    prepend_seccomp_arch_guard::<10, 16>(filter, errno_ret)
+}
+
+/// Build the static baseline used when Landlock supplies TCP port decisions.
+///
+/// Unix-domain sockets remain available for local IPC. Internet sockets must
+/// be TCP streams (`SOCK_STREAM` with protocol 0 or `IPPROTO_TCP`); UDP, raw,
+/// SCTP, netlink, and every other family are denied. `io_uring_setup()` is
+/// denied because io_uring can create and drive sockets without a visible
+/// syscall for each network operation.
+fn build_seccomp_tcp_only_network_filter() -> [SockFilterInsn; 29] {
+    let errno_ret = SECCOMP_RET_ERRNO | (libc::EPERM as u32);
+
+    let filter = [
+        // 0: ld syscall number
+        SockFilterInsn {
+            code: BPF_LD | BPF_W | BPF_ABS,
+            jt: 0,
+            jf: 0,
+            k: SECCOMP_DATA_NR_OFFSET,
+        },
+        // 1: socket() -> family/type/protocol checks at 6
+        SockFilterInsn {
+            code: BPF_JMP | BPF_JEQ | BPF_K,
+            jt: 4,
+            jf: 0,
+            k: SYS_SOCKET as u32,
+        },
+        // 2: socketpair() -> AF_UNIX check at 19
+        SockFilterInsn {
+            code: BPF_JMP | BPF_JEQ | BPF_K,
+            jt: 16,
+            jf: 0,
+            k: SYS_SOCKETPAIR as u32,
+        },
+        // 3: io_uring_setup() -> deny at 5
+        SockFilterInsn {
+            code: BPF_JMP | BPF_JEQ | BPF_K,
+            jt: 1,
+            jf: 0,
+            k: SYS_IO_URING_SETUP as u32,
+        },
+        // 4: unrelated syscall -> allow
+        SockFilterInsn {
+            code: BPF_RET | BPF_K,
+            jt: 0,
+            jf: 0,
+            k: SECCOMP_RET_ALLOW,
+        },
+        // 5: deny
+        SockFilterInsn {
+            code: BPF_RET | BPF_K,
+            jt: 0,
+            jf: 0,
+            k: errno_ret,
+        },
+        // 6: socket family
+        SockFilterInsn {
+            code: BPF_LD | BPF_W | BPF_ABS,
+            jt: 0,
+            jf: 0,
+            k: SECCOMP_DATA_ARG0_OFFSET,
+        },
+        // 7: AF_UNIX -> allow at 22
+        SockFilterInsn {
+            code: BPF_JMP | BPF_JEQ | BPF_K,
+            jt: 14,
+            jf: 0,
+            k: libc::AF_UNIX as u32,
+        },
+        // 8: AF_INET -> type check at 11
+        SockFilterInsn {
+            code: BPF_JMP | BPF_JEQ | BPF_K,
+            jt: 2,
+            jf: 0,
+            k: libc::AF_INET as u32,
+        },
+        // 9: AF_INET6 -> type check at 11
+        SockFilterInsn {
+            code: BPF_JMP | BPF_JEQ | BPF_K,
+            jt: 1,
+            jf: 0,
+            k: libc::AF_INET6 as u32,
+        },
+        // 10: other socket family -> deny
+        SockFilterInsn {
+            code: BPF_RET | BPF_K,
+            jt: 0,
+            jf: 0,
+            k: errno_ret,
+        },
+        // 11: socket type (possibly ORed with CLOEXEC/NONBLOCK)
+        SockFilterInsn {
+            code: BPF_LD | BPF_W | BPF_ABS,
+            jt: 0,
+            jf: 0,
+            k: SECCOMP_DATA_ARG1_OFFSET,
+        },
+        // 12: retain the base socket type
+        SockFilterInsn {
+            code: BPF_ALU | BPF_AND | BPF_K,
+            jt: 0,
+            jf: 0,
+            k: SOCK_TYPE_MASK,
+        },
+        // 13: SOCK_STREAM -> protocol check at 15
+        SockFilterInsn {
+            code: BPF_JMP | BPF_JEQ | BPF_K,
+            jt: 1,
+            jf: 0,
+            k: libc::SOCK_STREAM as u32,
+        },
+        // 14: non-stream Internet socket -> deny
+        SockFilterInsn {
+            code: BPF_RET | BPF_K,
+            jt: 0,
+            jf: 0,
+            k: errno_ret,
+        },
+        // 15: protocol
+        SockFilterInsn {
+            code: BPF_LD | BPF_W | BPF_ABS,
+            jt: 0,
+            jf: 0,
+            k: SECCOMP_DATA_ARG2_OFFSET,
+        },
+        // 16: protocol 0 lets the kernel select TCP -> allow at 22
+        SockFilterInsn {
+            code: BPF_JMP | BPF_JEQ | BPF_K,
+            jt: 5,
+            jf: 0,
+            k: 0,
+        },
+        // 17: explicit TCP -> allow at 22
+        SockFilterInsn {
+            code: BPF_JMP | BPF_JEQ | BPF_K,
+            jt: 4,
+            jf: 0,
+            k: libc::IPPROTO_TCP as u32,
+        },
+        // 18: non-TCP stream protocol -> deny
+        SockFilterInsn {
+            code: BPF_RET | BPF_K,
+            jt: 0,
+            jf: 0,
+            k: errno_ret,
+        },
+        // 19: socketpair family
+        SockFilterInsn {
+            code: BPF_LD | BPF_W | BPF_ABS,
+            jt: 0,
+            jf: 0,
+            k: SECCOMP_DATA_ARG0_OFFSET,
+        },
+        // 20: only AF_UNIX socketpairs -> allow at 22
+        SockFilterInsn {
+            code: BPF_JMP | BPF_JEQ | BPF_K,
+            jt: 1,
+            jf: 0,
+            k: libc::AF_UNIX as u32,
+        },
+        // 21: non-Unix socketpair -> deny
+        SockFilterInsn {
+            code: BPF_RET | BPF_K,
+            jt: 0,
+            jf: 0,
+            k: errno_ret,
+        },
+        // 22: allow validated socket/socketpair
+        SockFilterInsn {
+            code: BPF_RET | BPF_K,
+            jt: 0,
+            jf: 0,
+            k: SECCOMP_RET_ALLOW,
+        },
+    ];
+    prepend_seccomp_arch_guard::<23, 29>(filter, errno_ret)
+}
+
+fn install_static_network_filter_raw(
+    selected: StaticNetworkFilter,
+) -> std::result::Result<(), RawSandboxError> {
+    match selected {
+        StaticNetworkFilter::None => Ok(()),
+        StaticNetworkFilter::BlockAll => {
+            let filter = build_seccomp_block_network_filter();
+            install_static_network_filter_program_raw(&filter)
+        }
+        StaticNetworkFilter::TcpOnly => {
+            let filter = build_seccomp_tcp_only_network_filter();
+            install_static_network_filter_program_raw(&filter)
+        }
+    }
+}
+
+fn install_static_network_filter_program_raw(
+    filter: &[SockFilterInsn],
+) -> std::result::Result<(), RawSandboxError> {
+    let prog = SockFprog {
+        len: filter.len() as u16,
+        filter: filter.as_ptr(),
+    };
+
+    unsafe {
+        if libc::syscall(libc::SYS_prctl, libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0 {
+            return Err(RawSandboxError {
+                stage: RawSandboxStage::NoNewPrivs,
+                errno: raw_errno(),
+            });
+        }
+        if libc::syscall(
+            libc::SYS_seccomp,
+            SECCOMP_SET_MODE_FILTER,
+            0_u32,
+            &prog as *const SockFprog,
+        ) < 0
+        {
+            return Err(RawSandboxError {
+                stage: RawSandboxStage::InstallStaticFilter,
+                errno: raw_errno(),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Install a seccomp filter that blocks non-Unix socket creation.
@@ -1446,43 +2156,22 @@ fn build_seccomp_block_network_filter() -> [SockFilterInsn; 10] {
 /// only Unix-domain sockets and denying `socket()`, `socketpair()`, and
 /// `io_uring_setup()` attempts that could drive network I/O.
 pub fn install_seccomp_block_network() -> Result<()> {
-    let filter = build_seccomp_block_network_filter();
+    install_static_network_filter(StaticNetworkFilter::BlockAll, "network block")
+}
 
-    let prog = SockFprog {
-        len: filter.len() as u16,
-        filter: filter.as_ptr(),
-    };
+fn install_seccomp_tcp_only_network() -> Result<()> {
+    install_static_network_filter(StaticNetworkFilter::TcpOnly, "TCP-only network baseline")
+}
 
-    // SAFETY: `prctl(PR_SET_NO_NEW_PRIVS)` is process-local, takes only scalar
-    // arguments here, and does not dereference pointers.
-    let ret = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
-    if ret != 0 {
-        return Err(NonoError::SandboxInit(format!(
-            "prctl(PR_SET_NO_NEW_PRIVS) failed: {}",
-            std::io::Error::last_os_error()
-        )));
-    }
-
-    // SAFETY: `seccomp(SECCOMP_SET_MODE_FILTER)` reads the provided BPF program
-    // during the syscall. `prog` points to a stack-allocated filter array that
-    // remains alive for the duration of the call.
-    let ret = unsafe {
-        libc::syscall(
-            libc::SYS_seccomp,
-            SECCOMP_SET_MODE_FILTER,
-            0,
-            &prog as *const SockFprog,
-        )
-    };
-
-    if ret < 0 {
-        return Err(NonoError::SandboxInit(format!(
-            "seccomp(SECCOMP_SET_MODE_FILTER) for network block failed: {}",
-            std::io::Error::last_os_error()
-        )));
-    }
-
-    Ok(())
+fn install_static_network_filter(selected: StaticNetworkFilter, label: &str) -> Result<()> {
+    install_static_network_filter_raw(selected).map_err(|error| {
+        NonoError::SandboxInit(format!(
+            "seccomp filter installation for {} failed at {:?}: {}",
+            label,
+            error.stage(),
+            std::io::Error::from_raw_os_error(error.errno())
+        ))
+    })
 }
 
 /// Probe whether the seccomp full-network-block fallback can be installed.
@@ -1984,10 +2673,37 @@ impl SeccompOpts {
         }
     }
 
+    /// Layer a static seccomp network baseline underneath Landlock.
+    ///
+    /// Restricted policies deny UDP, raw/non-IP socket families, and
+    /// `io_uring_setup()`. Plain block-network denies all non-Unix sockets;
+    /// policies with TCP port grants allow only Internet TCP stream sockets
+    /// and rely on Landlock V4+ for the connect/bind port allowlist. Kernels
+    /// without Landlock networking fail closed for those port-grant policies.
+    #[must_use]
+    pub fn network_baseline() -> Self {
+        Self {
+            tcp_network: SeccompTcpNetwork::Baseline,
+        }
+    }
+
     /// Apply Landlock filesystem/process sandboxing, but skip nono-managed TCP
     /// network enforcement because the deployment enforces egress externally.
     #[must_use]
     pub fn external_tcp() -> Self {
+        Self {
+            tcp_network: SeccompTcpNetwork::External,
+        }
+    }
+
+    /// Apply Landlock filesystem/process sandboxing without installing TCP
+    /// policy because the caller has already installed a TCP seccomp filter.
+    ///
+    /// This is the post-listener half of a split sandbox application.  The
+    /// caller is responsible for keeping the preinstalled filter active and
+    /// servicing any notification listener it returned.
+    #[must_use]
+    pub fn preinstalled_tcp_filter() -> Self {
         Self {
             tcp_network: SeccompTcpNetwork::External,
         }
@@ -2003,6 +2719,7 @@ impl Default for SeccompOpts {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SeccompTcpNetwork {
     Fallback,
+    Baseline,
     External,
 }
 
@@ -2010,6 +2727,7 @@ enum SeccompTcpNetwork {
 enum TcpNetworkEnforcement {
     LandlockOnly,
     AutoSeccompFallback,
+    SeccompBaseline,
     External,
 }
 
@@ -2019,7 +2737,11 @@ impl TcpNetworkEnforcement {
     }
 
     fn allows_seccomp_fallback(self) -> bool {
-        matches!(self, Self::AutoSeccompFallback)
+        matches!(self, Self::AutoSeccompFallback | Self::SeccompBaseline)
+    }
+
+    fn installs_static_baseline(self) -> bool {
+        matches!(self, Self::SeccompBaseline)
     }
 }
 
@@ -2027,6 +2749,7 @@ impl From<SeccompTcpNetwork> for TcpNetworkEnforcement {
     fn from(value: SeccompTcpNetwork) -> Self {
         match value {
             SeccompTcpNetwork::Fallback => Self::AutoSeccompFallback,
+            SeccompTcpNetwork::Baseline => Self::SeccompBaseline,
             SeccompTcpNetwork::External => Self::External,
         }
     }
@@ -2043,6 +2766,7 @@ pub fn seccomp_network_fallback_mode(caps: &CapabilitySet) -> SeccompNetFallback
             if caps.tcp_connect_ports().is_empty()
                 && caps.tcp_bind_ports().is_empty()
                 && caps.localhost_ports().is_empty()
+                && caps.localhost_port_ranges().is_empty()
             {
                 SeccompNetFallback::BlockAll
             } else {
@@ -2056,6 +2780,44 @@ pub fn seccomp_network_fallback_mode(caps: &CapabilitySet) -> SeccompNetFallback
             bind_ports: bind_ports.clone(),
         },
         NetworkMode::AllowAll => SeccompNetFallback::None,
+    }
+}
+
+fn static_network_baseline_filter(caps: &CapabilitySet) -> StaticNetworkFilter {
+    match caps.network_mode() {
+        NetworkMode::Blocked => {
+            if caps.tcp_connect_ports().is_empty()
+                && caps.tcp_bind_ports().is_empty()
+                && caps.localhost_ports().is_empty()
+                && caps.localhost_port_ranges().is_empty()
+            {
+                StaticNetworkFilter::BlockAll
+            } else {
+                StaticNetworkFilter::TcpOnly
+            }
+        }
+        NetworkMode::ProxyOnly { .. } => StaticNetworkFilter::TcpOnly,
+        NetworkMode::AllowAll => {
+            if caps.tcp_connect_ports().is_empty() && caps.tcp_bind_ports().is_empty() {
+                StaticNetworkFilter::None
+            } else {
+                StaticNetworkFilter::TcpOnly
+            }
+        }
+    }
+}
+
+fn selected_static_network_filter(
+    tcp_network: TcpNetworkEnforcement,
+    caps: &CapabilitySet,
+    fallback: &SeccompNetFallback,
+) -> StaticNetworkFilter {
+    if matches!(fallback, SeccompNetFallback::BlockAll) {
+        StaticNetworkFilter::BlockAll
+    } else if tcp_network.installs_static_baseline() {
+        static_network_baseline_filter(caps)
+    } else {
+        StaticNetworkFilter::None
     }
 }
 
@@ -2078,7 +2840,8 @@ pub fn seccomp_network_fallback_mode(caps: &CapabilitySet) -> SeccompNetFallback
 /// failed AF_UNIX bind (regression on Landlock V2 kernels where this
 /// fallback fires). The supervisor is the sole arbiter now.
 ///
-/// `socket()` is allowed only for `AF_UNIX`, `AF_INET`, `AF_INET6`.
+/// `socket()` allows all `AF_UNIX` types and only TCP streams for
+/// `AF_INET`/`AF_INET6`.
 /// `socketpair()` is allowed only for `AF_UNIX`.
 /// `io_uring_setup()` is denied.
 fn build_seccomp_proxy_filter(_has_bind_ports: bool) -> Vec<SockFilterInsn> {
@@ -2101,7 +2864,9 @@ fn build_seccomp_proxy_filter(_has_bind_ports: bool) -> Vec<SockFilterInsn> {
     // The supervisor does the full-width NULL destination checks and inspects
     // each sendmmsg vector entry.
     //
-    // Target instruction index table (jt/jf are offsets from next insn):
+    // Tail instruction index table (jt/jf are offsets from the next insn).
+    // A six-instruction architecture guard is prepended after this tail is
+    // built; every target shifts equally, so these relative jumps stay valid:
     //  0: ld [nr]
     //  1: jeq SOCKET     jt=9  -> insn 11
     //  2: jeq CONNECT    jt=16 -> insn 19
@@ -2114,19 +2879,27 @@ fn build_seccomp_proxy_filter(_has_bind_ports: bool) -> Vec<SockFilterInsn> {
     //  9: ret ALLOW
     // 10: ret ERRNO
     // 11: ld [args[0]]
-    // 12: jeq AF_UNIX    jt=9  -> insn 22
+    // 12: jeq AF_UNIX    jt=17 -> insn 30
     // 13: jeq AF_INET    jt=8  -> insn 22
     // 14: jeq AF_INET6   jt=7  -> insn 22
     // 15: ret ERRNO            (bad socket family)
     // 16: ld [args[0]]
-    // 17: jeq AF_UNIX    jt=4  -> insn 22
+    // 17: jeq AF_UNIX    jt=12 -> insn 30
     // 18: ret ERRNO            (bad socketpair family)
     // 19: ret USER_NOTIF       (connect)
     // 20: ret bind_action      (bind)
     // 21: ret USER_NOTIF       (sendto/sendmsg/sendmmsg)
-    // 22: ret ALLOW            (good socket/socketpair)
+    // 22: ld [args[1]]         (Internet socket type)
+    // 23: and SOCK_TYPE_MASK
+    // 24: jeq SOCK_STREAM -> insn 26
+    // 25: ret ERRNO            (UDP/raw/non-stream Internet socket)
+    // 26: ld [args[2]]         (Internet socket protocol)
+    // 27: jeq 0 -> insn 30
+    // 28: jeq IPPROTO_TCP -> insn 30
+    // 29: ret ERRNO            (non-TCP stream protocol)
+    // 30: ret ALLOW            (validated socket/socketpair)
 
-    vec![
+    let filter = vec![
         // 0: ld [nr]
         SockFilterInsn {
             code: BPF_LD | BPF_W | BPF_ABS,
@@ -2211,10 +2984,10 @@ fn build_seccomp_proxy_filter(_has_bind_ports: bool) -> Vec<SockFilterInsn> {
             jf: 0,
             k: SECCOMP_DATA_ARG0_OFFSET,
         },
-        // 12: jeq AF_UNIX -> 22 (jt = 22-12-1 = 9)
+        // 12: jeq AF_UNIX -> 30 (jt = 30-12-1 = 17)
         SockFilterInsn {
             code: BPF_JMP | BPF_JEQ | BPF_K,
-            jt: 9,
+            jt: 17,
             jf: 0,
             k: libc::AF_UNIX as u32,
         },
@@ -2246,10 +3019,10 @@ fn build_seccomp_proxy_filter(_has_bind_ports: bool) -> Vec<SockFilterInsn> {
             jf: 0,
             k: SECCOMP_DATA_ARG0_OFFSET,
         },
-        // 17: jeq AF_UNIX -> 22 (jt = 22-17-1 = 4)
+        // 17: jeq AF_UNIX -> 30 (jt = 30-17-1 = 12)
         SockFilterInsn {
             code: BPF_JMP | BPF_JEQ | BPF_K,
-            jt: 4,
+            jt: 12,
             jf: 0,
             k: libc::AF_UNIX as u32,
         },
@@ -2281,14 +3054,71 @@ fn build_seccomp_proxy_filter(_has_bind_ports: bool) -> Vec<SockFilterInsn> {
             jf: 0,
             k: SECCOMP_RET_USER_NOTIF,
         },
-        // 22: ret ALLOW -- good socket/socketpair family
+        // 22: ld [args[1]] -- Internet socket type
+        SockFilterInsn {
+            code: BPF_LD | BPF_W | BPF_ABS,
+            jt: 0,
+            jf: 0,
+            k: SECCOMP_DATA_ARG1_OFFSET,
+        },
+        // 23: retain the base socket type
+        SockFilterInsn {
+            code: BPF_ALU | BPF_AND | BPF_K,
+            jt: 0,
+            jf: 0,
+            k: SOCK_TYPE_MASK,
+        },
+        // 24: SOCK_STREAM -> protocol check at 26
+        SockFilterInsn {
+            code: BPF_JMP | BPF_JEQ | BPF_K,
+            jt: 1,
+            jf: 0,
+            k: libc::SOCK_STREAM as u32,
+        },
+        // 25: UDP/raw/non-stream Internet socket -> deny
+        SockFilterInsn {
+            code: BPF_RET | BPF_K,
+            jt: 0,
+            jf: 0,
+            k: errno_ret,
+        },
+        // 26: ld [args[2]] -- Internet socket protocol
+        SockFilterInsn {
+            code: BPF_LD | BPF_W | BPF_ABS,
+            jt: 0,
+            jf: 0,
+            k: SECCOMP_DATA_ARG2_OFFSET,
+        },
+        // 27: protocol 0 -> allow at 30
+        SockFilterInsn {
+            code: BPF_JMP | BPF_JEQ | BPF_K,
+            jt: 2,
+            jf: 0,
+            k: 0,
+        },
+        // 28: explicit TCP -> allow at 30
+        SockFilterInsn {
+            code: BPF_JMP | BPF_JEQ | BPF_K,
+            jt: 1,
+            jf: 0,
+            k: libc::IPPROTO_TCP as u32,
+        },
+        // 29: non-TCP stream protocol -> deny
+        SockFilterInsn {
+            code: BPF_RET | BPF_K,
+            jt: 0,
+            jf: 0,
+            k: errno_ret,
+        },
+        // 30: ret ALLOW -- validated socket/socketpair
         SockFilterInsn {
             code: BPF_RET | BPF_K,
             jt: 0,
             jf: 0,
             k: SECCOMP_RET_ALLOW,
         },
-    ]
+    ];
+    prepend_seccomp_arch_guard_vec(filter, errno_ret)
 }
 
 /// Build a BPF filter for opt-in pathname AF_UNIX mediation (Linux-only).
@@ -2385,9 +3215,9 @@ fn build_seccomp_af_unix_filter() -> Vec<SockFilterInsn> {
 /// supervisor mediation. Returns the notify fd the supervisor must poll.
 /// Uses `SECCOMP_FILTER_FLAG_NEW_LISTENER`.
 ///
-/// The IPC handshake (SCM_RIGHTS transfer of the notify fd to the parent)
-/// must complete before this filter is installed so no fd-based exemption
-/// is needed.
+/// Installing the filter traps `sendmsg()`, so callers must arrange a handoff
+/// that does not rely on post-install `SCM_RIGHTS` (for example a short
+/// `CLONE_FILES` bootstrap or the legacy raw-number/pidfd protocol).
 ///
 /// Must be called after `PR_SET_NO_NEW_PRIVS` is set (either by a prior
 /// seccomp install or by Landlock's `restrict_self()`).
@@ -2396,7 +3226,15 @@ fn build_seccomp_af_unix_filter() -> Vec<SockFilterInsn> {
 ///
 /// Returns an error if the seccomp syscall fails.
 pub fn install_seccomp_proxy_filter(has_bind_ports: bool) -> Result<std::os::fd::OwnedFd> {
-    install_seccomp_notify_filter(&build_seccomp_proxy_filter(has_bind_ports), "proxy filter")
+    prepare_seccomp_proxy_filter(has_bind_ports).install_owned("proxy filter")
+}
+
+/// Pre-build the proxy-only seccomp BPF program in the parent.
+#[must_use]
+pub fn prepare_seccomp_proxy_filter(has_bind_ports: bool) -> PreparedSeccompNotifyFilter {
+    PreparedSeccompNotifyFilter {
+        filter: build_seccomp_proxy_filter(has_bind_ports),
+    }
 }
 
 /// Install a seccomp-notify BPF filter for pathname AF_UNIX mediation (Linux-only).
@@ -2407,9 +3245,8 @@ pub fn install_seccomp_proxy_filter(has_bind_ports: bool) -> Result<std::os::fd:
 /// against the `unix_sockets` allowlist. Connections to unlisted paths
 /// are denied with `EACCES`. Returns the notify fd the supervisor must poll.
 ///
-/// The IPC handshake (SCM_RIGHTS transfer of the notify fd to the parent)
-/// must complete before this filter is installed so no fd-based exemption
-/// is needed.
+/// Installing the filter traps `sendmsg()`, so callers must arrange a handoff
+/// that does not rely on post-install `SCM_RIGHTS`.
 ///
 /// Must be called after `PR_SET_NO_NEW_PRIVS` is set.
 ///
@@ -2417,74 +3254,88 @@ pub fn install_seccomp_proxy_filter(has_bind_ports: bool) -> Result<std::os::fd:
 ///
 /// Returns an error if the seccomp syscall fails.
 pub fn install_seccomp_af_unix_filter() -> Result<std::os::fd::OwnedFd> {
-    install_seccomp_notify_filter(&build_seccomp_af_unix_filter(), "AF_UNIX mediation filter")
+    prepare_seccomp_af_unix_filter().install_owned("AF_UNIX mediation filter")
 }
 
-fn install_seccomp_notify_filter(
-    filter: &[SockFilterInsn],
-    label: &str,
-) -> Result<std::os::fd::OwnedFd> {
-    use std::os::fd::FromRawFd;
-
-    let prog = SockFprog {
-        len: filter.len() as u16,
-        filter: filter.as_ptr(),
-    };
-
-    // PR_SET_NO_NEW_PRIVS should already be set by the openat-notify filter
-    // or by Landlock restrict_self(). Set it again defensively (idempotent).
-    // SAFETY: prctl with PR_SET_NO_NEW_PRIVS is always safe to call.
-    let ret = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
-    if ret != 0 {
-        return Err(NonoError::SandboxInit(format!(
-            "prctl(PR_SET_NO_NEW_PRIVS) failed: {}",
-            std::io::Error::last_os_error()
-        )));
+/// Pre-build the pathname AF_UNIX mediation BPF program in the parent.
+#[must_use]
+pub fn prepare_seccomp_af_unix_filter() -> PreparedSeccompNotifyFilter {
+    PreparedSeccompNotifyFilter {
+        filter: build_seccomp_af_unix_filter(),
     }
+}
 
-    // Try with WAIT_KILLABLE_RECV first (kernel 5.19+).
-    let flags = SECCOMP_FILTER_FLAG_NEW_LISTENER | SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV;
+/// A seccomp notification program prepared before raw clone.
+pub struct PreparedSeccompNotifyFilter {
+    filter: Vec<SockFilterInsn>,
+}
 
-    // SAFETY: seccomp() with SECCOMP_SET_MODE_FILTER installs a BPF filter.
-    // The prog pointer is valid for the duration of the syscall.
-    let ret = unsafe {
-        libc::syscall(
-            libc::SYS_seccomp,
-            SECCOMP_SET_MODE_FILTER,
-            flags,
-            &prog as *const SockFprog,
-        )
-    };
+impl PreparedSeccompNotifyFilter {
+    /// Install the prepared filter and return the listener as a borrowed raw
+    /// slot.  The caller must establish private fd-table ownership before
+    /// constructing `OwnedFd` or running Rust destructors for this slot.
+    pub fn install_raw(&self) -> std::result::Result<RawFd, RawSandboxError> {
+        let prog = SockFprog {
+            len: self.filter.len() as u16,
+            filter: self.filter.as_ptr(),
+        };
 
-    let notify_fd = if ret < 0 {
-        let flags = SECCOMP_FILTER_FLAG_NEW_LISTENER;
+        // SAFETY: the program is immutable and remains live across both raw
+        // syscalls.  Raw prctl avoids libc post-fork coordination wrappers.
+        unsafe {
+            if libc::syscall(libc::SYS_prctl, libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0 {
+                return Err(RawSandboxError {
+                    stage: RawSandboxStage::NoNewPrivs,
+                    errno: raw_errno(),
+                });
+            }
 
-        // SAFETY: Same as above, retrying with fewer flags.
-        let ret = unsafe {
-            libc::syscall(
+            let flags = SECCOMP_FILTER_FLAG_NEW_LISTENER | SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV;
+            let first = libc::syscall(
                 libc::SYS_seccomp,
                 SECCOMP_SET_MODE_FILTER,
                 flags,
                 &prog as *const SockFprog,
-            )
-        };
+            );
+            if first >= 0 {
+                return Ok(first as RawFd);
+            }
 
-        if ret < 0 {
-            return Err(NonoError::SandboxInit(format!(
-                "seccomp(SECCOMP_SET_MODE_FILTER) for {} failed: {}. \
-                 Requires kernel >= 5.0 with SECCOMP_FILTER_FLAG_NEW_LISTENER.",
-                label,
-                std::io::Error::last_os_error()
-            )));
+            let second = libc::syscall(
+                libc::SYS_seccomp,
+                SECCOMP_SET_MODE_FILTER,
+                SECCOMP_FILTER_FLAG_NEW_LISTENER,
+                &prog as *const SockFprog,
+            );
+            if second < 0 {
+                return Err(RawSandboxError {
+                    stage: RawSandboxStage::InstallNotifyFilter,
+                    errno: raw_errno(),
+                });
+            }
+            Ok(second as RawFd)
         }
-        ret as i32
-    } else {
-        ret as i32
-    };
+    }
 
-    // SAFETY: The fd returned by seccomp() with NEW_LISTENER is a valid,
-    // newly-created file descriptor that we now own.
-    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(notify_fd) })
+    fn install_owned(&self, label: &str) -> Result<OwnedFd> {
+        let notify_fd = self.install_raw().map_err(|error| {
+            if error.stage() == RawSandboxStage::NoNewPrivs {
+                NonoError::SandboxInit(format!(
+                    "prctl(PR_SET_NO_NEW_PRIVS) failed: {}",
+                    std::io::Error::from_raw_os_error(error.errno())
+                ))
+            } else {
+                NonoError::SandboxInit(format!(
+                    "seccomp(SECCOMP_SET_MODE_FILTER) for {} failed: {}. \
+                     Requires kernel >= 5.0 with SECCOMP_FILTER_FLAG_NEW_LISTENER.",
+                    label,
+                    std::io::Error::from_raw_os_error(error.errno())
+                ))
+            }
+        })?;
+        // SAFETY: install_raw returned a fresh listener in our private table.
+        Ok(unsafe { OwnedFd::from_raw_fd(notify_fd) })
+    }
 }
 
 /// Read a sockaddr from a seccomp notification's connect/bind arguments.
@@ -3527,31 +4378,171 @@ mod tests {
         assert_eq!(filter.len(), 5);
     }
 
+    fn evaluate_static_bpf(filter: &[SockFilterInsn], nr: i32, args: [u64; 6]) -> u32 {
+        evaluate_static_bpf_with_arch(filter, NATIVE_AUDIT_ARCH, nr as u32, args)
+    }
+
+    fn evaluate_static_bpf_with_arch(
+        filter: &[SockFilterInsn],
+        arch: u32,
+        nr: u32,
+        args: [u64; 6],
+    ) -> u32 {
+        let mut accumulator = 0_u32;
+        let mut pc = 0_usize;
+        loop {
+            let instruction = filter.get(pc).expect("BPF jump stayed in bounds");
+            match instruction.code {
+                code if code == BPF_LD | BPF_W | BPF_ABS => {
+                    accumulator = match instruction.k {
+                        SECCOMP_DATA_NR_OFFSET => nr,
+                        SECCOMP_DATA_ARCH_OFFSET => arch,
+                        SECCOMP_DATA_ARG0_OFFSET => args[0] as u32,
+                        SECCOMP_DATA_ARG1_OFFSET => args[1] as u32,
+                        SECCOMP_DATA_ARG2_OFFSET => args[2] as u32,
+                        offset => panic!("unexpected seccomp_data offset {offset}"),
+                    };
+                    pc += 1;
+                }
+                code if code == BPF_ALU | BPF_AND | BPF_K => {
+                    accumulator &= instruction.k;
+                    pc += 1;
+                }
+                code if code == BPF_JMP | BPF_JEQ | BPF_K => {
+                    let offset = if accumulator == instruction.k {
+                        instruction.jt
+                    } else {
+                        instruction.jf
+                    };
+                    pc += usize::from(offset) + 1;
+                }
+                code if code == BPF_JMP | BPF_JSET | BPF_K => {
+                    let offset = if accumulator & instruction.k != 0 {
+                        instruction.jt
+                    } else {
+                        instruction.jf
+                    };
+                    pc += usize::from(offset) + 1;
+                }
+                code if code == BPF_RET | BPF_K => return instruction.k,
+                code => panic!("unexpected BPF opcode {code:#x}"),
+            }
+        }
+    }
+
     #[test]
     fn test_build_seccomp_block_network_filter() {
         let filter = build_seccomp_block_network_filter();
+        let denied = SECCOMP_RET_ERRNO | (libc::EPERM as u32);
 
-        assert_eq!(filter.len(), 10);
-        assert_eq!(filter[0].k, SECCOMP_DATA_NR_OFFSET);
+        assert_eq!(filter.len(), 16);
+        assert_eq!(filter[0].k, SECCOMP_DATA_ARCH_OFFSET);
+        assert_eq!(filter[1].k, NATIVE_AUDIT_ARCH);
+        assert_eq!(filter[2].k, denied);
+        assert_eq!(filter[3].k, SECCOMP_DATA_NR_OFFSET);
+        assert_eq!(filter[4].code, BPF_JMP | BPF_JSET | BPF_K);
+        assert_eq!(filter[4].k, X32_SYSCALL_BIT);
+        assert_eq!(filter[5].k, denied);
 
-        assert_eq!(filter[1].k, SYS_SOCKET as u32);
-        assert_eq!(filter[1].jt, 4);
+        assert_eq!(filter[6].k, SECCOMP_DATA_NR_OFFSET);
+        assert_eq!(filter[7].k, SYS_SOCKET as u32);
+        assert_eq!(filter[7].jt, 4);
 
-        assert_eq!(filter[2].k, SYS_SOCKETPAIR as u32);
-        assert_eq!(filter[2].jt, 3);
+        assert_eq!(filter[8].k, SYS_SOCKETPAIR as u32);
+        assert_eq!(filter[8].jt, 3);
 
-        assert_eq!(filter[3].k, SYS_IO_URING_SETUP as u32);
-        assert_eq!(filter[3].jt, 1);
+        assert_eq!(filter[9].k, SYS_IO_URING_SETUP as u32);
+        assert_eq!(filter[9].jt, 1);
 
-        assert_eq!(filter[4].k, SECCOMP_RET_ALLOW);
-        assert_eq!(filter[5].k, SECCOMP_RET_ERRNO | (libc::EPERM as u32));
+        assert_eq!(filter[10].k, SECCOMP_RET_ALLOW);
+        assert_eq!(filter[11].k, denied);
 
-        assert_eq!(filter[6].k, SECCOMP_DATA_ARG0_OFFSET);
-        assert_eq!(filter[7].k, libc::AF_UNIX as u32);
-        assert_eq!(filter[7].jt, 1);
+        assert_eq!(filter[12].k, SECCOMP_DATA_ARG0_OFFSET);
+        assert_eq!(filter[13].k, libc::AF_UNIX as u32);
+        assert_eq!(filter[13].jt, 1);
 
-        assert_eq!(filter[8].k, SECCOMP_RET_ERRNO | (libc::EPERM as u32));
-        assert_eq!(filter[9].k, SECCOMP_RET_ALLOW);
+        assert_eq!(filter[14].k, denied);
+        assert_eq!(filter[15].k, SECCOMP_RET_ALLOW);
+
+        assert_eq!(
+            evaluate_static_bpf_with_arch(
+                &filter,
+                NATIVE_AUDIT_ARCH ^ 1,
+                SYS_SOCKET as u32,
+                [libc::AF_UNIX as u64, 0, 0, 0, 0, 0],
+            ),
+            denied
+        );
+        assert_eq!(
+            evaluate_static_bpf_with_arch(
+                &filter,
+                NATIVE_AUDIT_ARCH,
+                (SYS_SOCKET as u32) | X32_SYSCALL_BIT,
+                [libc::AF_UNIX as u64, 0, 0, 0, 0, 0],
+            ),
+            denied
+        );
+    }
+
+    #[test]
+    fn test_tcp_only_baseline_allows_only_unix_and_internet_tcp() {
+        let filter = build_seccomp_tcp_only_network_filter();
+        let denied = SECCOMP_RET_ERRNO | (libc::EPERM as u32);
+        let socket = |family: i32, socket_type: i32, protocol: i32| {
+            evaluate_static_bpf(
+                &filter,
+                SYS_SOCKET,
+                [family as u64, socket_type as u64, protocol as u64, 0, 0, 0],
+            )
+        };
+
+        assert_eq!(
+            socket(libc::AF_UNIX, libc::SOCK_DGRAM, 0),
+            SECCOMP_RET_ALLOW
+        );
+        assert_eq!(
+            socket(libc::AF_INET, libc::SOCK_STREAM, 0),
+            SECCOMP_RET_ALLOW
+        );
+        assert_eq!(
+            socket(
+                libc::AF_INET6,
+                libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+                libc::IPPROTO_TCP,
+            ),
+            SECCOMP_RET_ALLOW
+        );
+        assert_eq!(socket(libc::AF_INET, libc::SOCK_DGRAM, 0), denied);
+        assert_eq!(socket(libc::AF_INET6, libc::SOCK_RAW, 0), denied);
+        assert_eq!(
+            socket(libc::AF_INET, libc::SOCK_STREAM, libc::IPPROTO_SCTP),
+            denied
+        );
+        assert_eq!(socket(libc::AF_NETLINK, libc::SOCK_RAW, 0), denied);
+        assert_eq!(
+            evaluate_static_bpf(
+                &filter,
+                SYS_SOCKETPAIR,
+                [libc::AF_UNIX as u64, 0, 0, 0, 0, 0],
+            ),
+            SECCOMP_RET_ALLOW
+        );
+        assert_eq!(
+            evaluate_static_bpf(
+                &filter,
+                SYS_SOCKETPAIR,
+                [libc::AF_INET as u64, 0, 0, 0, 0, 0],
+            ),
+            denied
+        );
+        assert_eq!(
+            evaluate_static_bpf(&filter, SYS_IO_URING_SETUP, [0; 6]),
+            denied
+        );
+        assert_eq!(
+            evaluate_static_bpf(&filter, libc::SYS_read as i32, [0; 6]),
+            SECCOMP_RET_ALLOW
+        );
     }
 
     #[test]
@@ -3744,6 +4735,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_seccomp_network_fallback_mode_blocked_with_port_range_is_none() {
+        let caps = CapabilitySet::new()
+            .block_network()
+            .allow_localhost_port_range(3000, 3010)
+            .expect("valid port range");
+        assert_eq!(
+            seccomp_network_fallback_mode(&caps),
+            SeccompNetFallback::None
+        );
+    }
+
+    #[test]
+    fn test_static_network_baseline_selection() {
+        assert_eq!(
+            static_network_baseline_filter(&CapabilitySet::new()),
+            StaticNetworkFilter::None
+        );
+        assert_eq!(
+            static_network_baseline_filter(&CapabilitySet::new().block_network()),
+            StaticNetworkFilter::BlockAll
+        );
+
+        let with_port = CapabilitySet::new().block_network().allow_tcp_connect(443);
+        assert_eq!(
+            static_network_baseline_filter(&with_port),
+            StaticNetworkFilter::TcpOnly
+        );
+        assert_eq!(
+            static_network_baseline_filter(&CapabilitySet::new().proxy_only(8080)),
+            StaticNetworkFilter::TcpOnly
+        );
+    }
+
     /// Rejects `open_port: [0]` on Linux for any restricted network mode (not Landlock-only).
     #[test]
     fn test_reject_localhost_port_wildcard_zero_on_linux() {
@@ -3796,10 +4821,84 @@ mod tests {
         let fallback: TcpNetworkEnforcement = SeccompOpts::network_fallback().tcp_network.into();
         assert!(fallback.handles_tcp());
         assert!(fallback.allows_seccomp_fallback());
+        assert!(!fallback.installs_static_baseline());
+
+        let baseline: TcpNetworkEnforcement = SeccompOpts::network_baseline().tcp_network.into();
+        assert!(baseline.handles_tcp());
+        assert!(baseline.allows_seccomp_fallback());
+        assert!(baseline.installs_static_baseline());
 
         let external: TcpNetworkEnforcement = SeccompOpts::external_tcp().tcp_network.into();
         assert!(!external.handles_tcp());
         assert!(!external.allows_seccomp_fallback());
+        assert!(!external.installs_static_baseline());
+
+        let preinstalled: TcpNetworkEnforcement =
+            SeccompOpts::preinstalled_tcp_filter().tcp_network.into();
+        assert!(!preinstalled.handles_tcp());
+        assert!(!preinstalled.allows_seccomp_fallback());
+        assert!(!preinstalled.installs_static_baseline());
+    }
+
+    #[test]
+    fn prepared_proxy_policy_splits_listener_from_landlock_apply() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let caps = CapabilitySet::new()
+            .allow_path(temp.path(), AccessMode::Read)
+            .expect("path capability")
+            .proxy_only_with_bind(8080, vec![3000]);
+        let abi = DetectedAbi::new(ABI::V2);
+
+        let normal = prepare_seccomp_with_abi(&caps, &abi, SeccompOpts::network_fallback())
+            .expect("prepare fallback policy");
+        assert_eq!(
+            normal.fallback(),
+            &SeccompNetFallback::ProxyOnly {
+                proxy_port: 8080,
+                bind_ports: vec![3000],
+            }
+        );
+        assert_eq!(normal.attr.handled_access_net, 0);
+        assert_eq!(normal.static_network_filter, StaticNetworkFilter::None);
+
+        let baseline = prepare_seccomp_with_abi(&caps, &abi, SeccompOpts::network_baseline())
+            .expect("prepare baseline policy");
+        assert_eq!(
+            baseline.fallback(),
+            &SeccompNetFallback::ProxyOnly {
+                proxy_port: 8080,
+                bind_ports: vec![3000],
+            }
+        );
+        assert_eq!(baseline.static_network_filter, StaticNetworkFilter::TcpOnly);
+
+        let split = prepare_seccomp_with_abi(&caps, &abi, SeccompOpts::preinstalled_tcp_filter())
+            .expect("prepare listener-first post-detach policy");
+        assert_eq!(split.fallback(), &SeccompNetFallback::None);
+        assert_eq!(split.attr.handled_access_net, 0);
+        assert_eq!(split.static_network_filter, StaticNetworkFilter::None);
+        assert!(split.net_rules.is_empty());
+        assert!(
+            split
+                .path_rules
+                .iter()
+                .all(|rule| rule.path_fd.as_raw_fd() >= 3)
+        );
+    }
+
+    #[test]
+    fn prepared_landlock_raw_structs_match_uapi_layout() {
+        assert_eq!(std::mem::size_of::<RawLandlockRulesetAttr>(), 24);
+        assert_eq!(std::mem::size_of::<RawLandlockPathBeneathAttr>(), 12);
+        assert_eq!(std::mem::size_of::<RawLandlockNetPortAttr>(), 16);
+    }
+
+    #[test]
+    fn prepared_notify_filters_own_their_bpf_storage() {
+        let proxy = prepare_seccomp_proxy_filter(true);
+        assert_eq!(proxy.filter.len(), 37);
+        let unix = prepare_seccomp_af_unix_filter();
+        assert_eq!(unix.filter.len(), 8);
     }
 
     #[test]
@@ -3822,31 +4921,50 @@ mod tests {
     #[test]
     fn test_build_seccomp_proxy_filter_with_bind() {
         let filter = build_seccomp_proxy_filter(true);
-        // 23 instructions: no check_fd block
-        assert_eq!(filter.len(), 23);
+        assert_eq!(filter.len(), 37);
 
         assert_eq!(filter[0].code, BPF_LD | BPF_W | BPF_ABS);
-        assert_eq!(filter[0].k, SECCOMP_DATA_NR_OFFSET);
+        assert_eq!(filter[0].k, SECCOMP_DATA_ARCH_OFFSET);
+        assert_eq!(filter[6].k, SECCOMP_DATA_NR_OFFSET);
 
-        // insn 6: jeq SENDMSG -> 21 (jt = 21-6-1 = 14)
-        assert_eq!(filter[6].k, SYS_SENDMSG as u32);
-        assert_eq!(filter[6].jt, 14);
+        // Tail insn 6 (actual 12): jeq SENDMSG -> tail 21.
+        assert_eq!(filter[12].k, SYS_SENDMSG as u32);
+        assert_eq!(filter[12].jt, 14);
 
-        // insn 19: USER_NOTIF (connect)
-        assert_eq!(filter[19].code, BPF_RET | BPF_K);
-        assert_eq!(filter[19].k, SECCOMP_RET_USER_NOTIF);
+        // Tail insn 19 (actual 25): USER_NOTIF (connect)
+        assert_eq!(filter[25].code, BPF_RET | BPF_K);
+        assert_eq!(filter[25].k, SECCOMP_RET_USER_NOTIF);
 
-        // insn 20: USER_NOTIF (bind)
-        assert_eq!(filter[20].code, BPF_RET | BPF_K);
-        assert_eq!(filter[20].k, SECCOMP_RET_USER_NOTIF);
+        // Tail insn 20 (actual 26): USER_NOTIF (bind)
+        assert_eq!(filter[26].code, BPF_RET | BPF_K);
+        assert_eq!(filter[26].k, SECCOMP_RET_USER_NOTIF);
 
-        // insn 21: USER_NOTIF (sendto/sendmsg/sendmmsg)
-        assert_eq!(filter[21].code, BPF_RET | BPF_K);
-        assert_eq!(filter[21].k, SECCOMP_RET_USER_NOTIF);
+        // Tail insn 21 (actual 27): USER_NOTIF (sendto/sendmsg/sendmmsg)
+        assert_eq!(filter[27].code, BPF_RET | BPF_K);
+        assert_eq!(filter[27].k, SECCOMP_RET_USER_NOTIF);
 
-        // insn 22: ALLOW (good socket/socketpair family)
-        assert_eq!(filter[22].code, BPF_RET | BPF_K);
-        assert_eq!(filter[22].k, SECCOMP_RET_ALLOW);
+        // Internet sockets are restricted to TCP before destination
+        // operations reach the supervisor.
+        assert_eq!(
+            evaluate_static_bpf(
+                &filter,
+                SYS_SOCKET,
+                [libc::AF_INET as u64, libc::SOCK_STREAM as u64, 0, 0, 0, 0,],
+            ),
+            SECCOMP_RET_ALLOW
+        );
+        assert_eq!(
+            evaluate_static_bpf(
+                &filter,
+                SYS_SOCKET,
+                [libc::AF_INET as u64, libc::SOCK_DGRAM as u64, 0, 0, 0, 0,],
+            ),
+            SECCOMP_RET_ERRNO | (libc::EACCES as u32)
+        );
+
+        // Tail insn 30 (actual 36): ALLOW (validated socket/socketpair)
+        assert_eq!(filter[36].code, BPF_RET | BPF_K);
+        assert_eq!(filter[36].k, SECCOMP_RET_ALLOW);
     }
 
     /// Regression test for the Landlock V2 + `has_bind_ports=false`
@@ -3856,11 +4974,11 @@ mod tests {
     #[test]
     fn test_build_seccomp_proxy_filter_without_bind() {
         let filter = build_seccomp_proxy_filter(false);
-        assert_eq!(filter.len(), 23);
+        assert_eq!(filter.len(), 37);
 
-        assert_eq!(filter[20].code, BPF_RET | BPF_K);
+        assert_eq!(filter[26].code, BPF_RET | BPF_K);
         assert_eq!(
-            filter[20].k, SECCOMP_RET_USER_NOTIF,
+            filter[26].k, SECCOMP_RET_USER_NOTIF,
             "bind must route to USER_NOTIF regardless of has_bind_ports so \
              the supervisor can permit AF_UNIX pathname bind (#685)"
         );

@@ -95,7 +95,7 @@ urlencoding = "2"
 tempfile.workspace = true
 vt100 = "0.16.2"
 shlex = "2"
-jsonc-parser = { version = "0.32", features = ["serde"] }
+jsonc-parser = { version = "0.33", features = ["serde"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { workspace = true, features = ["process", "signal", "fs", "user", "term"] }

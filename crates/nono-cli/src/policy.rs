@@ -1537,6 +1537,27 @@ pub fn apply_unlink_overrides(caps: &mut CapabilitySet) {
                 format!("subpath \"{}\"", escaped)
             };
             unlink_rules.push(format!("(allow file-write-unlink ({}))", filter));
+
+            // Atomic replacement unlinks/renames the sibling temp file as well as
+            // the destination. This rule is emitted after the global unlink deny,
+            // matching the narrow temp-file grant added for writable file caps.
+            if cap.is_file {
+                let regex_path = match escape_seatbelt_regex_path(path_str) {
+                    Ok(path) => path,
+                    Err(e) => {
+                        tracing::warn!(
+                            "Skipping atomic-write unlink override for {}: {}",
+                            path.display(),
+                            e
+                        );
+                        continue;
+                    }
+                };
+                unlink_rules.push(format!(
+                    "(allow file-write-unlink (regex #\"^{}\\.tmp\\.[0-9]+\\.[0-9a-f]+$\"))",
+                    regex_path
+                ));
+            }
         }
     }
 
@@ -3451,6 +3472,16 @@ mod tests {
                 escaped
             )),
             "expected literal unlink override for writable file cap, got: {}",
+            rules
+        );
+        let regex_path = escape_seatbelt_regex_path(file_path.to_str().expect("utf8 path"))
+            .expect("escaped regex path");
+        assert!(
+            rules.contains(&format!(
+                "(allow file-write-unlink (regex #\"^{}\\.tmp\\.[0-9]+\\.[0-9a-f]+$\"))",
+                regex_path
+            )),
+            "expected atomic temp-file unlink override for writable file cap, got: {}",
             rules
         );
     }

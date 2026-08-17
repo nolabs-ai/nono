@@ -21,6 +21,8 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 #[cfg(unix)]
+use std::io::Write;
+#[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "macos")]
@@ -34,6 +36,75 @@ fn print_allow_domain_port_warnings(entries: &[String], context: &str, silent: b
 
     for warning in network_policy::collect_allow_domain_port_warnings(entries, context) {
         output::print_warning(&warning);
+    }
+}
+
+#[cfg(unix)]
+fn initialize_claude_json(path: &Path) -> std::io::Result<()> {
+    let mut file = match std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let metadata = std::fs::symlink_metadata(path)?;
+            if !metadata.file_type().is_file() || metadata.len() != 0 {
+                return Ok(());
+            }
+            std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(path)?
+        }
+        Err(error) => return Err(error),
+    };
+    file.write_all(b"{}\n")
+}
+
+#[cfg(unix)]
+fn prepare_claude_json_redirect(home_path: &Path) {
+    let claude_json = home_path.join(".claude.json");
+    let claude_dir = home_path.join(".claude");
+    let redirect_target = claude_dir.join("claude.json");
+
+    if let Err(error) = std::fs::create_dir_all(&claude_dir) {
+        warn!("Failed to create ~/.claude: {error}");
+        return;
+    }
+
+    if claude_json.is_symlink() {
+        if std::fs::read_link(&claude_json)
+            .is_ok_and(|target| target == Path::new(".claude/claude.json"))
+            && let Err(error) = initialize_claude_json(&redirect_target)
+        {
+            warn!(
+                "Failed to initialize redirected Claude configuration {}: {error}",
+                redirect_target.display()
+            );
+        }
+        return;
+    }
+
+    if claude_json.exists() {
+        // Preserve an existing configuration by moving it behind the redirect.
+        if let Err(error) = std::fs::rename(&claude_json, &redirect_target) {
+            warn!("Failed to move ~/.claude.json to ~/.claude/claude.json: {error}");
+            return;
+        }
+    } else if let Err(error) = initialize_claude_json(&redirect_target) {
+        warn!(
+            "Failed to initialize redirected Claude configuration {}: {error}",
+            redirect_target.display()
+        );
+        return;
+    }
+
+    if let Err(error) = std::os::unix::fs::symlink(".claude/claude.json", &claude_json)
+        && error.kind() != std::io::ErrorKind::AlreadyExists
+    {
+        warn!("Failed to create ~/.claude.json symlink: {error}");
     }
 }
 
@@ -1494,40 +1565,11 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         // grant permission for these dynamically-named files in ~/, so token
         // refreshes silently fail and the user is logged out.
         //
-        // Fix: redirect ~/.claude.json to ~/.claude/claude.json via a
+        // Redirect ~/.claude.json to ~/.claude/claude.json via a
         // symlink.  Claude Code resolves symlinks before computing the temp
         // file path, so temp files land in ~/.claude/ (already readwrite)
         // instead of ~/ (not writable inside the sandbox).
-        let claude_json = home_path.join(".claude.json");
-        let claude_dir = home_path.join(".claude");
-        let redirect_target = claude_dir.join("claude.json");
-
-        if let Err(e) = std::fs::create_dir_all(&claude_dir) {
-            warn!("Failed to create ~/.claude: {}", e);
-        } else if !claude_json.is_symlink() {
-            if claude_json.exists() {
-                // Regular file present — move it into ~/.claude/ then symlink.
-                if let Err(e) = std::fs::rename(&claude_json, &redirect_target) {
-                    warn!(
-                        "Failed to move ~/.claude.json to ~/.claude/claude.json: {}",
-                        e
-                    );
-                } else if let Err(e) =
-                    std::os::unix::fs::symlink(".claude/claude.json", &claude_json)
-                {
-                    warn!("Failed to create ~/.claude.json symlink: {}", e);
-                }
-            } else {
-                // File doesn't exist yet — pre-create the target so the
-                // sandbox can attach a path rule to it, then symlink.
-                precreate(&redirect_target, false);
-                if let Err(e) = std::os::unix::fs::symlink(".claude/claude.json", &claude_json)
-                    && e.kind() != std::io::ErrorKind::AlreadyExists
-                {
-                    warn!("Failed to create ~/.claude.json symlink: {}", e);
-                }
-            }
-        }
+        prepare_claude_json_redirect(home_path);
     }
 
     let prepared = if let Some(ref profile) = loaded_profile {
@@ -1782,9 +1824,84 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(target_os = "macos")]
+    #[cfg(unix)]
     use std::fs;
     use tempfile::tempdir;
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_redirect_initializes_valid_private_json_for_fresh_home() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().expect("tmpdir");
+        let home = dir.path().join("home");
+        fs::create_dir_all(&home).expect("mkdir home");
+
+        prepare_claude_json_redirect(&home);
+
+        let link = home.join(".claude.json");
+        let target = home.join(".claude/claude.json");
+        assert_eq!(
+            fs::read_link(&link).expect("read Claude redirect"),
+            Path::new(".claude/claude.json")
+        );
+        let contents = fs::read(&target).expect("read Claude configuration");
+        serde_json::from_slice::<serde_json::Value>(&contents)
+            .expect("fresh Claude configuration must be valid JSON");
+        assert_eq!(contents, b"{}\n");
+        assert_eq!(
+            fs::metadata(target)
+                .expect("Claude metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_redirect_repairs_only_zero_byte_target() {
+        let dir = tempdir().expect("tmpdir");
+        let home = dir.path().join("home");
+        let claude_dir = home.join(".claude");
+        fs::create_dir_all(&claude_dir).expect("mkdir Claude home");
+        fs::write(claude_dir.join("claude.json"), b"").expect("write empty target");
+        std::os::unix::fs::symlink(".claude/claude.json", home.join(".claude.json"))
+            .expect("create Claude redirect");
+
+        prepare_claude_json_redirect(&home);
+        assert_eq!(
+            fs::read(claude_dir.join("claude.json")).expect("read repaired target"),
+            b"{}\n"
+        );
+
+        fs::write(claude_dir.join("claude.json"), b"{\"existing\":true}\n")
+            .expect("write existing configuration");
+        prepare_claude_json_redirect(&home);
+        assert_eq!(
+            fs::read(claude_dir.join("claude.json")).expect("read existing configuration"),
+            b"{\"existing\":true}\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_redirect_preserves_existing_root_configuration() {
+        let dir = tempdir().expect("tmpdir");
+        let home = dir.path().join("home");
+        fs::create_dir_all(&home).expect("mkdir home");
+        fs::write(home.join(".claude.json"), b"{\"existing\":true}\n")
+            .expect("write existing configuration");
+
+        prepare_claude_json_redirect(&home);
+
+        assert!(home.join(".claude.json").is_symlink());
+        assert_eq!(
+            fs::read(home.join(".claude/claude.json")).expect("read moved configuration"),
+            b"{\"existing\":true}\n"
+        );
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

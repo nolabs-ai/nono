@@ -8,10 +8,12 @@
 //! [`connect_via_proxy`] so the TLS-intercept upstream leg can reuse it.
 
 use crate::audit;
-use crate::config::ExternalProxyConfig;
+use crate::config::{ExternalProxyAuth, ExternalProxyConfig};
+use crate::credential::redact_credential_ref;
 use crate::error::{ProxyError, Result};
 use crate::filter::ProxyFilter;
 use crate::token;
+use base64::Engine;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tracing::debug;
@@ -163,6 +165,31 @@ impl BypassMatcher {
     }
 }
 
+const KEYRING_SERVICE: &str = nono::keystore::DEFAULT_SERVICE;
+
+/// Build a `Basic <token>` Proxy-Authorization header value for `auth`.
+pub(crate) fn build_basic_proxy_auth_header(auth: &ExternalProxyAuth) -> Result<Zeroizing<String>> {
+    if auth.scheme != "basic" {
+        return Err(ProxyError::ExternalProxy(format!(
+            "unsupported external proxy auth scheme '{}'; only 'basic' is supported",
+            auth.scheme
+        )));
+    }
+    let redacted_ref = redact_credential_ref(&auth.keyring_account);
+    let password = nono::keystore::load_secret_by_ref(KEYRING_SERVICE, &auth.keyring_account)
+        .map_err(|e| {
+            ProxyError::ExternalProxy(format!(
+                "proxy auth credential '{}' unavailable: {}",
+                redacted_ref, e
+            ))
+        })?;
+    let plaintext = Zeroizing::new(format!("{}:{}", auth.username, password.as_str()));
+    let mut encoded = base64::engine::general_purpose::STANDARD.encode(plaintext.as_bytes());
+    let header = Zeroizing::new(format!("Basic {}", encoded));
+    zeroize::Zeroize::zeroize(&mut encoded);
+    Ok(header)
+}
+
 /// Handle a CONNECT request by chaining it to an external proxy.
 ///
 /// 1. Validate session token
@@ -211,22 +238,42 @@ pub async fn handle_external_proxy(
         return Err(ProxyError::HostDenied { host, reason });
     }
 
-    // External proxy authentication is not yet implemented. If auth is
-    // configured, fail loudly rather than silently sending unauthenticated
-    // requests that the enterprise proxy will reject.
-    if external_config.auth.is_some() {
-        return Err(ProxyError::ExternalProxy(
-            "external proxy authentication is configured but not yet implemented; \
-             remove the auth section from the external proxy config or wait for \
-             a future release"
-                .to_string(),
-        ));
-    }
+    let proxy_auth = if let Some(ref auth) = external_config.auth {
+        match build_basic_proxy_auth_header(auth) {
+            Ok(h) => Some(h),
+            Err(e) => {
+                audit::log_denied(
+                    audit_log,
+                    audit::ProxyMode::External,
+                    &audit::EventContext {
+                        auth_mechanism: Some(
+                            nono::undo::NetworkAuditAuthMechanism::ProxyAuthorization,
+                        ),
+                        auth_outcome: Some(nono::undo::NetworkAuditAuthOutcome::Failed),
+                        denial_category: Some(
+                            nono::undo::NetworkAuditDenialCategory::AuthenticationFailed,
+                        ),
+                        ..audit::EventContext::default()
+                    },
+                    &host,
+                    port,
+                    &e.to_string(),
+                );
+                send_response(stream, 502, "Bad Gateway").await?;
+                return Err(e);
+            }
+        }
+    } else {
+        None
+    };
 
-    // Connect to enterprise proxy and CONNECT through it to the upstream.
-    // Auth is gated above; pass None until configurable proxy auth lands.
-    let mut proxy_stream = match connect_via_proxy(&external_config.address, &host, port, None)
-        .await
+    let mut proxy_stream = match connect_via_proxy(
+        &external_config.address,
+        &host,
+        port,
+        proxy_auth.as_ref().map(|s| s.as_str()),
+    )
+    .await
     {
         Ok(s) => s,
         Err(ProxyError::ExternalProxy(msg)) if msg.contains("rejected CONNECT") => {
@@ -346,7 +393,7 @@ fn parse_status_code(line: &str) -> Result<u16> {
 }
 
 /// Send an HTTP response line.
-async fn send_response(stream: &mut TcpStream, status: u16, reason: &str) -> Result<()> {
+pub(crate) async fn send_response(stream: &mut TcpStream, status: u16, reason: &str) -> Result<()> {
     let response = format!("HTTP/1.1 {} {}\r\n\r\n", status, reason);
     stream.write_all(response.as_bytes()).await?;
     stream.flush().await?;
@@ -357,6 +404,29 @@ async fn send_response(stream: &mut TcpStream, status: u16, reason: &str) -> Res
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct EnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        key: &'static str,
+    }
+
+    impl EnvGuard {
+        #[allow(clippy::disallowed_methods)]
+        fn set(key: &'static str, value: &str) -> Self {
+            let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            unsafe { std::env::set_var(key, value) };
+            Self { _lock: lock, key }
+        }
+    }
+
+    #[allow(clippy::disallowed_methods)]
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe { std::env::remove_var(self.key) };
+        }
+    }
 
     #[test]
     fn test_parse_connect_target() {
@@ -466,5 +536,28 @@ mod tests {
         let matcher = BypassMatcher::new(&["*.".to_string()]);
         assert!(matcher.is_empty());
         assert!(!matcher.matches("anything.com"));
+    }
+
+    #[test]
+    fn build_basic_proxy_auth_header_encodes_correctly() {
+        let _guard = EnvGuard::set("NONO_TEST_PROXY_PASS", "s3cr3t");
+        let auth = ExternalProxyAuth {
+            username: "alice".to_string(),
+            keyring_account: "env://NONO_TEST_PROXY_PASS".to_string(),
+            scheme: "basic".to_string(),
+        };
+        let header = build_basic_proxy_auth_header(&auth).unwrap();
+        // "alice:s3cr3t" base64-encoded is "YWxpY2U6czNjcjN0"
+        assert_eq!(header.as_str(), "Basic YWxpY2U6czNjcjN0");
+    }
+
+    #[test]
+    fn build_basic_proxy_auth_header_missing_credential_returns_error() {
+        let auth = ExternalProxyAuth {
+            username: "alice".to_string(),
+            keyring_account: "env://NONO_TEST_PROXY_PASS_MISSING_XYZ".to_string(),
+            scheme: "basic".to_string(),
+        };
+        assert!(build_basic_proxy_auth_header(&auth).is_err());
     }
 }

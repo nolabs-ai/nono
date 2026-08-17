@@ -2835,7 +2835,7 @@ pub(crate) fn apply_tls_intercept_config(
                 .as_ref()
                 .and_then(|t| t.ca_validity)
                 .unwrap_or(nono_proxy::tls_intercept::ca::CA_VALIDITY_DEFAULT);
-            proxy_config.preloaded_ca = crate::macos_trust::load_or_generate_proxy_ca(validity);
+            proxy_config.preloaded_ca = crate::macos_trust::load_or_generate_proxy_ca(validity)?;
         } else {
             tracing::warn!(
                 "--trust-proxy-ca has no effect without TLS-intercepting credential routes"

@@ -66,7 +66,7 @@ An agent could potentially leak small amounts of information through timing side
 
 ### Resource Exhaustion
 
-nono does not limit CPU, memory, or disk usage. A malicious agent could attempt denial-of-service through resource exhaustion.
+On Linux, nono can enforce memory and process-count ceilings on the sandboxed process tree via cgroup v2 (`memory.max`, `pids.max`) — see [Resource Limits](/cli/features/resource-limits). CPU and disk usage are not limited, and there is no equivalent enforcement on macOS yet. A malicious agent could still attempt denial-of-service through CPU or disk exhaustion, or resource exhaustion on macOS.
 
 ### Data Within Allowed Paths
 

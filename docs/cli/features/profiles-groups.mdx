@@ -145,7 +145,7 @@ Profiles use JSON format:
 
 ## Session Hooks
 
-Session hooks are scripts that run before or after the sandboxed process, outside the sandbox with host privileges. Useful for setup and cleanup tasks the sandboxed process should not have access to -- for example, creating a private TMPDIR per session.
+Session hooks are scripts that run before or after the sandboxed process, outside the sandbox with host privileges. This is the mechanism for custom instrumentation around a run — for example, replacing an external wrapper script that sets up or tears down per-session state. There are exactly two events, `before` and `after`; there is no mid-session or per-tool-call hook here. (That's a different, unrelated feature: see [Hooks](#hooks-pack-declared-legacy-profile-field) below, which packs use to install an *agent's own* hook system, e.g. Claude Code's tool-call hooks.)
 
 ### Configuration
 
@@ -160,18 +160,26 @@ Both `before` and `after` are optional. Each hook specifies a script path and an
 }
 ```
 
-- `script` (required): absolute path to an executable script.
-- `timeout_secs` (optional): kills the script if it exceeds this duration.
+- `script` (required): absolute path to an executable script. It must resolve to a regular file, be owned by you or root, and not sit in a world-writable directory — this rejects `/tmp` and similar shared directories even when the sticky bit is set. Put session hook scripts somewhere private, e.g. under `$XDG_CONFIG_HOME/nono/hooks/`.
+- `timeout_secs` (optional): kills the whole script process group if it exceeds this duration.
+
+Both hook types also receive `NONO_HOOK_TYPE` (`before` or `after`), in addition to the variables listed below.
+
+<Note>
+  **Hooks fail open.** An invalid script path, a non-zero exit, or a timeout never blocks the sandboxed process — nono logs a warning and continues. A timeout discards any environment variables the before-hook had already written; a plain non-zero exit does not — variables written before `exit` still take effect.
+</Note>
 
 ### Before hook
 
-Runs before the sandboxed process starts. The script receives `NONO_SESSION_ID`, `NONO_WORKDIR`, and `NONO_ENV_FILE` -- a temporary file where `KEY=VALUE` lines can be written to export environment variables to the sandboxed process.
+Runs before the sandboxed process starts. The script receives `NONO_SESSION_ID`, `NONO_WORKDIR`, and `NONO_ENV_FILE` -- a temporary file where `KEY=VALUE` lines (blank lines and `#` comments are skipped) can be written to export environment variables to the sandboxed process.
 
 ```sh
 #!/bin/sh
 mkdir -p "/tmp/$NONO_SESSION_ID"
 echo "TMPDIR=/tmp/$NONO_SESSION_ID" >> "$NONO_ENV_FILE"
 ```
+
+A small set of dangerous variables (e.g. `LD_PRELOAD`) is filtered out of the before-hook's exports before they reach the sandboxed process, regardless of what the script writes to `NONO_ENV_FILE`.
 
 ### After hook
 
@@ -182,7 +190,7 @@ Runs after the sandboxed process exits. Receives `NONO_SESSION_ID`, `NONO_WORKDI
 rm -rf "/tmp/$NONO_SESSION_ID"
 ```
 
-### AF_UNIX Socket Grants
+## AF_UNIX Socket Grants
 
 The `unix_socket*` filesystem fields grant `connect(2)` (and optionally
 `bind(2)`) on pathname AF_UNIX sockets. Abstract-namespace and unnamed
@@ -213,7 +221,7 @@ Under restricted network modes (`--block-net` or `--network-profile`),
 `connect(2)` to a Unix socket requires an explicit `unix_socket*` grant
 — a plain `allow_file`/`allow` grant no longer implicitly permits it.
 
-### Working Directory
+## Working Directory
 
 The `workdir` section controls whether and how the current working directory is automatically shared with the sandboxed process.
 
@@ -467,23 +475,11 @@ The `custom_credentials` field lets you define credential services for any API:
 
 See [Credential Injection](/cli/features/credential-injection#custom-credential-definitions) for complete documentation.
 
-### Hooks
+### Hooks (pack-declared, legacy profile field)
 
-The `hooks` section defines hooks that nono will automatically install for specific applications.
+The `hooks` field is a legacy declaration surface: since v0.44.0, setting it in a profile no longer installs anything itself — nono just prints a one-line note. Actual agent-hook wiring (e.g. installing a script into `~/.claude/hooks/` and patching `settings.json`) is now done by a pack's `package.json` `wiring` directives, executed on `nono pull`/`nono resolve`. See [Package Publishing](/cli/features/package-publishing) if you're authoring a pack that needs this.
 
-```json
-{
-  "hooks": {
-    "claude-code": {
-      "event": "PostToolUseFailure",
-      "matcher": "Read|Write|Edit|Bash",
-      "script": "nono-hook.sh"
-    }
-  }
-}
-```
-
-Hook installation is idempotent - nono only installs or updates when needed.
+This is unrelated to **Session Hooks** above, which is a currently-active profile feature for running host-privileged setup/cleanup scripts around the sandboxed process itself.
 
 ### Interactive Mode (deprecated)
 

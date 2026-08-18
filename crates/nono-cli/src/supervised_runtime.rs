@@ -278,14 +278,29 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
             .lock()
             .map_err(|_| nono::NonoError::Snapshot("Audit recorder lock poisoned".to_string()))?;
         recorder.record_session_started(started.clone(), command.to_vec())?;
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         if let Some(tool_sandbox_runtime) = config.tool_sandbox_runtime {
+            #[cfg(target_os = "linux")]
+            let (platform, landlock_abi, landlock_execute_enforced) = (
+                "linux",
+                Some(tool_sandbox_runtime.landlock_abi_version().to_string()),
+                Some(true),
+            );
+            // Seatbelt has no Landlock analogue to report, but the mediation
+            // marker must still be recorded: without it a macOS session that
+            // configured mediation and invoked nothing is indistinguishable
+            // from one that ran unmediated in every audit reader.
+            #[cfg(target_os = "macos")]
+            let (platform, landlock_abi, landlock_execute_enforced) = {
+                let _ = tool_sandbox_runtime;
+                ("macos", None::<String>, None::<bool>)
+            };
             recorder.record_sandbox_runtime_event(
                 crate::audit_integrity::SandboxRuntimeAuditEvent {
                     timestamp: chrono::Utc::now().to_rfc3339(),
-                    platform: "linux".to_string(),
-                    landlock_abi: Some(tool_sandbox_runtime.landlock_abi_version().to_string()),
-                    landlock_execute_enforced: Some(true),
+                    platform: platform.to_string(),
+                    landlock_abi,
+                    landlock_execute_enforced,
                     tool_sandbox_active: true,
                 },
             )?;

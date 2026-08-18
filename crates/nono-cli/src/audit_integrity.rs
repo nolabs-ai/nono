@@ -1,18 +1,19 @@
 pub(crate) use nono::audit::{
     AUDIT_EVENTS_FILENAME, AuditEventPayload, AuditEventRecord, AuditRecorder,
     CommandPolicyAuditEvent, CommandPolicyEnvAuditEntry, CommandPolicyStdioAudit,
-    CommandPolicyStdioStreamAudit, verify_audit_log,
+    CommandPolicyStdioStreamAudit, CommandPolicySummaryBuilder, verify_audit_log,
 };
 
 #[cfg(test)]
 pub(crate) use nono::audit::AUDIT_HASH_ALGORITHM;
-#[cfg(any(test, target_os = "linux"))]
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
 pub(crate) use nono::audit::SandboxRuntimeAuditEvent;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::tool_sandbox::command_policy_decision::CommandPolicyDecision;
     use nono::AccessMode;
     use nono::supervisor::{ApprovalDecision, ApprovalRequest, AuditEntry, UrlOpenRequest};
     use nono::undo::{NetworkAuditDecision, NetworkAuditEvent, NetworkAuditMode};
@@ -188,41 +189,44 @@ mod tests {
             })
             .unwrap();
         recorder
-            .record_command_policy_event(CommandPolicyAuditEvent {
-                timestamp: "2026-04-21T00:00:00Z".to_string(),
-                session_id: Some("sess-1".to_string()),
-                command: "curl".to_string(),
-                caller: "session".to_string(),
-                caller_kind: Some("session".to_string()),
-                caller_command: None,
-                caller_pid: Some(41),
-                shim_pid: Some(42),
-                session_root_pid: Some(41),
-                decision: "denied".to_string(),
-                reason: Some("entrypoint missing".to_string()),
-                stdio_mode: "pty".to_string(),
-                argv_hash: "argv-hash".to_string(),
-                env_name_hash: "env-hash".to_string(),
-                cwd_hash: "cwd-hash".to_string(),
-                argv_display: vec!["curl".to_string(), "--version".to_string()],
-                env_names_display: vec!["PATH".to_string()],
-                env_display: vec![CommandPolicyEnvAuditEntry {
-                    name: "PATH".to_string(),
-                    value_display: "/bin".to_string(),
-                }],
-                cwd_display: "/work".to_string(),
-                exit_code: None,
-                stdio: Some(CommandPolicyStdioAudit {
-                    stdout: Some(CommandPolicyStdioStreamAudit {
-                        total_bytes: 1024,
-                        forwarded_bytes: 512,
-                        max_bytes: Some(512),
-                        limit_exceeded: true,
-                        on_limit: Some("truncate".to_string()),
+            .record_command_policy_event(
+                CommandPolicyAuditEvent {
+                    timestamp: "2026-04-21T00:00:00Z".to_string(),
+                    session_id: Some("sess-1".to_string()),
+                    command: "curl".to_string(),
+                    caller: "session".to_string(),
+                    caller_kind: Some("session".to_string()),
+                    caller_command: None,
+                    caller_pid: Some(41),
+                    shim_pid: Some(42),
+                    session_root_pid: Some(41),
+                    decision: CommandPolicyDecision::Denied.as_str().to_string(),
+                    reason: Some("entrypoint missing".to_string()),
+                    stdio_mode: "pty".to_string(),
+                    argv_hash: "argv-hash".to_string(),
+                    env_name_hash: "env-hash".to_string(),
+                    cwd_hash: "cwd-hash".to_string(),
+                    argv_display: vec!["curl".to_string(), "--version".to_string()],
+                    env_names_display: vec!["PATH".to_string()],
+                    env_display: vec![CommandPolicyEnvAuditEntry {
+                        name: "PATH".to_string(),
+                        value_display: "/bin".to_string(),
+                    }],
+                    cwd_display: "/work".to_string(),
+                    exit_code: None,
+                    stdio: Some(CommandPolicyStdioAudit {
+                        stdout: Some(CommandPolicyStdioStreamAudit {
+                            total_bytes: 1024,
+                            forwarded_bytes: 512,
+                            max_bytes: Some(512),
+                            limit_exceeded: true,
+                            on_limit: Some("truncate".to_string()),
+                        }),
+                        stderr: None,
                     }),
-                    stderr: None,
-                }),
-            })
+                },
+                CommandPolicyDecision::Denied.outcome(),
+            )
             .unwrap();
         recorder
             .record_session_ended("2026-04-21T00:00:01Z".to_string(), 7)

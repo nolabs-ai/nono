@@ -23,7 +23,9 @@ A Tool Sandbox profile answers three questions:
 
 Each child command starts from a minimal runtime baseline. It does not inherit outer `--allow`, CWD access, broad profile groups, raw credential paths, or outer network access.
 
-When Tool Sandbox is active, the outer process can execute the initial program and the Tool Sandbox shims. Further tool launches should be modeled as command-policy hops. This keeps direct executable-path bypasses blocked without building a host-wide allow-list of every executable on `PATH`.
+When Tool Sandbox is active, the outer session's execute grant is built from every trusted directory on `PATH`: nono scans each non-writable `PATH` directory and allow-lists every executable file found there, plus its shared-library dependency closure — not just the initial program and the Tool Sandbox shims. A binary that lives outside `PATH` (for example a JVM's `jspawnhelper` under `/usr/lib/jvm/.../lib/`) is not covered by this scan and is denied unless it's reachable through `PATH`, added to `command_policies.executable_dirs`, or modeled as a command-policy hop with its own `sandbox.exec_paths` entry.
+
+Tool Sandbox's real security boundary is at policy-controlled *commands*, not at execute-vs-no-execute for the outer session: once a command becomes a Tool Sandbox entry, everything it invokes is governed by `can_use`/`from` edges regardless of `PATH` membership.
 
 ## Available Fields
 
@@ -673,6 +675,51 @@ is active:
   }
 }
 ```
+
+## Audit Record
+
+Every command-policy decision is recorded as an audit event by the broker, not by
+the mediated tool. Each event records what the broker decided as a `decision`
+string drawn from a closed vocabulary that mixes lifecycle stages with terminal
+results, such as `invocation_allowed` for clearing an invocation gate and
+`allowed`, `denied`, or `capture` for a terminal result. The vocabulary only ever
+grows, and a decision an older nono does not recognize is summarized as
+unclassified rather than counted as allowed or denied.
+
+The broker also folds these events into a per-command rollup stored in the
+session's `session.json`, so listing sessions never has to parse event logs. The
+rollup classifies each `decision` as allowed, denied, or unclassifiable, and
+counts only terminal ones, so a command that clears an invocation gate and then
+runs records two events but counts as one allowed invocation.
+
+`nono audit list` names the mediated commands per session, and `nono audit show`
+still carries every individual decision:
+
+```bash
+# Which tools did recent sessions mediate, and what was denied?
+nono audit list --recent 10
+
+# Every mediated decision for one session, with reasons and stdio counts
+nono audit show <session-id> --json
+
+# What has a session mediated so far, while it is still running
+nono inspect <session-id>
+```
+
+```
+20260219-092017-8117  just now  completed  claude
+  tools: gh (3 allowed, 1 denied), git (12 allowed)
+```
+
+The rollup is covered by the session digest committed to the ledger, so a denial
+edited out of `session.json` fails `nono audit verify`. See
+[Audit Trail](/cli/features/audit#mediated-tool-summary) for the rollup's bounds
+and how it renders.
+
+A session writes `session.json` only when it finalizes. While it is still
+running, `nono inspect` reports the same rollup recomputed from the event log,
+marked `[live]` because the session can still mediate more commands. See
+[Session Lifecycle](/cli/features/session-lifecycle#mediated-tools-while-the-session-runs).
 
 ## Direct Exec Bypass
 

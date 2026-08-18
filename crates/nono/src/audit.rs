@@ -8,12 +8,15 @@
 use crate::supervisor::{AuditEntry, UrlOpenRequest};
 use crate::trust;
 use crate::undo::{
-    AuditAttestationSummary, AuditIntegritySummary, ContentHash, NetworkAuditEvent, SessionMetadata,
+    AuditAttestationSummary, AuditIntegritySummary, COMMAND_POLICY_SUMMARY_MAX_COMMANDS,
+    CommandPolicyCommandSummary, CommandPolicyOutcome, CommandPolicySummary, ContentHash,
+    NetworkAuditEvent, SessionMetadata,
 };
 use crate::{NonoError, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sigstore_verify::types::bundle::SignatureContent;
+use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 #[cfg(unix)]
@@ -262,6 +265,10 @@ struct SessionDigestPayload<'a> {
     audit_event_count: u64,
     audit_integrity: &'a Option<AuditIntegritySummary>,
     audit_attestation: &'a Option<AuditAttestationSummary>,
+    // Skipped when absent so that sessions written before the summary existed
+    // still hash to the digest they were committed to the ledger under.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    command_policy_summary: &'a Option<CommandPolicySummary>,
 }
 
 #[derive(Serialize)]
@@ -405,6 +412,7 @@ pub struct AuditRecorder {
     previous_chain: Option<ContentHash>,
     leaf_hashes: Vec<ContentHash>,
     redaction_policy: crate::ScrubPolicy,
+    command_policy_summary: CommandPolicySummaryBuilder,
 }
 
 impl AuditRecorder {
@@ -435,6 +443,7 @@ impl AuditRecorder {
             previous_chain: None,
             leaf_hashes: Vec::new(),
             redaction_policy,
+            command_policy_summary: CommandPolicySummaryBuilder::new(),
         })
     }
 
@@ -484,15 +493,41 @@ impl AuditRecorder {
     /// Record sandbox runtime metadata.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub fn record_sandbox_runtime_event(&mut self, event: SandboxRuntimeAuditEvent) -> Result<()> {
-        self.append_event(AuditEventPayload::SandboxRuntime { event })
+        let mediation_active = event.tool_sandbox_active;
+        self.append_event(AuditEventPayload::SandboxRuntime { event })?;
+        if mediation_active {
+            self.command_policy_summary.observe_mediation_active();
+        }
+        Ok(())
     }
 
     /// Record a tool sandbox command policy decision.
+    ///
+    /// `outcome` is how the event's `decision` folds into the session rollup;
+    /// the caller owns that vocabulary and so owns the classification.
+    ///
+    /// The rollup is folded only after the record reaches the log: a failed
+    /// append refuses one command but leaves the session alive to finalize, so
+    /// folding first would commit a `session.json` rollup claiming events the
+    /// log does not hold.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    pub fn record_command_policy_event(&mut self, event: CommandPolicyAuditEvent) -> Result<()> {
+    pub fn record_command_policy_event(
+        &mut self,
+        event: CommandPolicyAuditEvent,
+        outcome: CommandPolicyOutcome,
+    ) -> Result<()> {
+        let event = Box::new(event);
         self.append_event(AuditEventPayload::CommandPolicy {
-            event: Box::new(event),
-        })
+            event: event.clone(),
+        })?;
+        self.command_policy_summary.observe(&event, outcome);
+        Ok(())
+    }
+
+    /// Rollup of the command policy events recorded so far.
+    #[must_use]
+    pub fn command_policy_summary(&self) -> Option<CommandPolicySummary> {
+        self.command_policy_summary.clone().finish()
     }
 
     /// Number of events appended by this recorder.
@@ -542,6 +577,88 @@ impl AuditRecorder {
         self.previous_chain = Some(chain_hash);
         self.leaf_hashes.push(leaf_hash);
         Ok(())
+    }
+}
+
+/// Running rollup of command policy events, folded one event at a time.
+///
+/// Memory is bounded by the number of distinct mediated commands rather than by
+/// the number of events, so an endlessly mediating session stays fixed-size.
+#[derive(Debug, Default, Clone)]
+pub struct CommandPolicySummaryBuilder {
+    mediation_active: bool,
+    event_count: u64,
+    invocation_count: u64,
+    commands: BTreeMap<String, CommandPolicyCommandSummary>,
+    truncated: bool,
+}
+
+impl CommandPolicySummaryBuilder {
+    /// Create an empty builder.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Note that command mediation was configured for this session.
+    ///
+    /// Separate from [`Self::observe`] because a session can configure mediation
+    /// without ever invoking a command, and the two must not read alike.
+    pub fn observe_mediation_active(&mut self) {
+        self.mediation_active = true;
+    }
+
+    /// Fold one command policy event into the rollup.
+    ///
+    /// The caller classifies: the `decision` vocabulary is authored by whoever
+    /// writes the events, so only they can say which strings are terminal.
+    pub fn observe(&mut self, event: &CommandPolicyAuditEvent, outcome: CommandPolicyOutcome) {
+        self.event_count = self.event_count.saturating_add(1);
+
+        if outcome == CommandPolicyOutcome::Pending {
+            return;
+        }
+        self.invocation_count = self.invocation_count.saturating_add(1);
+
+        let entry = match self.commands.get_mut(&event.command) {
+            Some(entry) => entry,
+            None => {
+                if self.commands.len() >= COMMAND_POLICY_SUMMARY_MAX_COMMANDS {
+                    self.truncated = true;
+                    return;
+                }
+                self.commands
+                    .entry(event.command.clone())
+                    .or_insert(CommandPolicyCommandSummary {
+                        command: event.command.clone(),
+                        allowed: 0,
+                        denied: 0,
+                        other: 0,
+                    })
+            }
+        };
+        match outcome {
+            CommandPolicyOutcome::Allowed => entry.allowed = entry.allowed.saturating_add(1),
+            CommandPolicyOutcome::Denied => entry.denied = entry.denied.saturating_add(1),
+            CommandPolicyOutcome::Other => entry.other = entry.other.saturating_add(1),
+            CommandPolicyOutcome::Pending => {}
+        }
+    }
+
+    /// Finish the rollup, or `None` when the session neither configured
+    /// mediation nor recorded a command policy event.
+    #[must_use]
+    pub fn finish(self) -> Option<CommandPolicySummary> {
+        if !self.mediation_active && self.event_count == 0 {
+            return None;
+        }
+        Some(CommandPolicySummary {
+            mediation_active: self.mediation_active,
+            event_count: self.event_count,
+            invocation_count: self.invocation_count,
+            commands: self.commands.into_values().collect(),
+            truncated: self.truncated,
+        })
     }
 }
 
@@ -737,6 +854,7 @@ pub fn canonical_session_digest_payload(metadata: &SessionMetadata) -> Result<Ve
         audit_event_count: metadata.audit_event_count,
         audit_integrity: &metadata.audit_integrity,
         audit_attestation: &metadata.audit_attestation,
+        command_policy_summary: &metadata.command_policy_summary,
     };
     serde_json::to_vec(&payload).map_err(|e| {
         NonoError::Snapshot(format!("Failed to serialize session digest payload: {e}"))
@@ -1675,6 +1793,196 @@ mod tests {
         assert!(!verify_inclusion_proof(&proof));
     }
 
+    fn command_policy_event(command: &str, decision: &str) -> CommandPolicyAuditEvent {
+        CommandPolicyAuditEvent {
+            timestamp: "2026-04-21T00:00:00Z".to_string(),
+            session_id: Some("sess-1".to_string()),
+            command: command.to_string(),
+            caller: "session".to_string(),
+            caller_kind: Some("session".to_string()),
+            caller_command: None,
+            caller_pid: Some(41),
+            shim_pid: Some(42),
+            session_root_pid: Some(41),
+            decision: decision.to_string(),
+            reason: None,
+            stdio_mode: "direct_fds".to_string(),
+            argv_hash: "argv-hash".to_string(),
+            env_name_hash: "env-hash".to_string(),
+            cwd_hash: "cwd-hash".to_string(),
+            argv_display: vec![command.to_string()],
+            env_names_display: Vec::new(),
+            env_display: Vec::new(),
+            cwd_display: "/work".to_string(),
+            exit_code: None,
+            stdio: None,
+        }
+    }
+
+    #[test]
+    fn summary_counts_one_invocation_per_terminal_decision() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut recorder = AuditRecorder::new(dir.path().to_path_buf()).unwrap();
+        // One invocation passes the gate and runs; a second is refused at it.
+        // Three events, two invocations.
+        recorder
+            .record_command_policy_event(
+                command_policy_event("gh", "invocation_allowed"),
+                CommandPolicyOutcome::Pending,
+            )
+            .unwrap();
+        recorder
+            .record_command_policy_event(
+                command_policy_event("gh", "allowed"),
+                CommandPolicyOutcome::Allowed,
+            )
+            .unwrap();
+        recorder
+            .record_command_policy_event(
+                command_policy_event("gh", "invocation_denied"),
+                CommandPolicyOutcome::Denied,
+            )
+            .unwrap();
+
+        let summary = recorder.command_policy_summary().unwrap();
+        assert_eq!(summary.event_count, 3);
+        assert_eq!(summary.invocation_count, 2);
+        assert_eq!(summary.commands.len(), 1);
+        assert_eq!(summary.commands[0].command, "gh");
+        assert_eq!(summary.commands[0].allowed, 1);
+        assert_eq!(summary.commands[0].denied, 1);
+        assert_eq!(summary.commands[0].other, 0);
+    }
+
+    #[test]
+    fn mediation_active_is_summarized_without_any_invocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut recorder = AuditRecorder::new(dir.path().to_path_buf()).unwrap();
+        recorder
+            .record_session_started("2026-04-21T00:00:00Z".to_string(), vec!["pwd".to_string()])
+            .unwrap();
+        recorder
+            .record_sandbox_runtime_event(SandboxRuntimeAuditEvent {
+                timestamp: "2026-04-21T00:00:00Z".to_string(),
+                platform: "linux".to_string(),
+                landlock_abi: Some("v5".to_string()),
+                landlock_execute_enforced: Some(true),
+                tool_sandbox_active: true,
+            })
+            .unwrap();
+
+        let summary = recorder.command_policy_summary().unwrap();
+        assert!(summary.mediation_active);
+        assert_eq!(summary.event_count, 0);
+        assert!(summary.commands.is_empty());
+    }
+
+    #[test]
+    fn a_session_without_mediation_has_no_summary() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut recorder = AuditRecorder::new(dir.path().to_path_buf()).unwrap();
+        recorder
+            .record_session_started("2026-04-21T00:00:00Z".to_string(), vec!["pwd".to_string()])
+            .unwrap();
+        recorder
+            .record_sandbox_runtime_event(SandboxRuntimeAuditEvent {
+                timestamp: "2026-04-21T00:00:00Z".to_string(),
+                platform: "linux".to_string(),
+                landlock_abi: Some("v5".to_string()),
+                landlock_execute_enforced: Some(true),
+                tool_sandbox_active: false,
+            })
+            .unwrap();
+
+        assert!(recorder.command_policy_summary().is_none());
+    }
+
+    /// A failed append refuses one command but leaves the session running to
+    /// finalize, and `session.json` presents its rollup as a digest-covered
+    /// claim about the log. Counting an event the log never received would
+    /// make that claim unverifiable against a refold of the log.
+    #[test]
+    fn an_append_failure_is_left_out_of_the_rollup() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut recorder = AuditRecorder::new(dir.path().to_path_buf()).unwrap();
+        // A read-only handle to the same log fails every write without
+        // disturbing the rest of the recorder's state.
+        recorder.file = File::open(dir.path().join(AUDIT_EVENTS_FILENAME)).unwrap();
+
+        assert!(
+            recorder
+                .record_sandbox_runtime_event(SandboxRuntimeAuditEvent {
+                    timestamp: "2026-04-21T00:00:00Z".to_string(),
+                    platform: "linux".to_string(),
+                    landlock_abi: Some("v5".to_string()),
+                    landlock_execute_enforced: Some(true),
+                    tool_sandbox_active: true,
+                })
+                .is_err()
+        );
+        assert!(
+            recorder
+                .record_command_policy_event(
+                    command_policy_event("gh", "allowed"),
+                    CommandPolicyOutcome::Allowed,
+                )
+                .is_err()
+        );
+
+        assert!(recorder.command_policy_summary().is_none());
+    }
+
+    #[test]
+    fn summary_bounds_distinct_commands() {
+        let mut builder = CommandPolicySummaryBuilder::new();
+        let overflow = COMMAND_POLICY_SUMMARY_MAX_COMMANDS.saturating_add(10);
+        for index in 0..overflow {
+            builder.observe(
+                &command_policy_event(&format!("cmd-{index:04}"), "denied"),
+                CommandPolicyOutcome::Denied,
+            );
+        }
+        let summary = builder.finish().unwrap();
+
+        assert_eq!(summary.commands.len(), COMMAND_POLICY_SUMMARY_MAX_COMMANDS);
+        assert_eq!(summary.event_count, overflow as u64);
+        // Totals stay honest even for commands dropped from the rollup.
+        assert_eq!(summary.invocation_count, overflow as u64);
+        assert!(summary.truncated);
+    }
+
+    #[test]
+    fn session_digest_covers_the_command_policy_summary() {
+        let baseline = sample_metadata("20260421-200000-11111");
+        let baseline_digest = compute_session_digest(&baseline).unwrap();
+
+        let mut with_summary = baseline.clone();
+        with_summary.command_policy_summary = Some(CommandPolicySummary {
+            mediation_active: true,
+            event_count: 2,
+            invocation_count: 1,
+            commands: vec![CommandPolicyCommandSummary {
+                command: "gh".to_string(),
+                allowed: 0,
+                denied: 1,
+                other: 0,
+            }],
+            truncated: false,
+        });
+        let with_summary_digest = compute_session_digest(&with_summary).unwrap();
+        assert_ne!(baseline_digest, with_summary_digest);
+
+        let mut tampered = with_summary.clone();
+        if let Some(summary) = tampered.command_policy_summary.as_mut() {
+            summary.commands[0].denied = 0;
+            summary.commands[0].allowed = 1;
+        }
+        assert_ne!(
+            compute_session_digest(&tampered).unwrap(),
+            with_summary_digest
+        );
+    }
+
     fn sample_metadata(id: &str) -> SessionMetadata {
         SessionMetadata {
             session_id: id.to_string(),
@@ -1690,6 +1998,7 @@ mod tests {
             audit_event_count: 2,
             audit_integrity: None,
             audit_attestation: None,
+            command_policy_summary: None,
         }
     }
 
@@ -1795,6 +2104,7 @@ mod tests {
                 merkle_root: ContentHash::from_bytes([3; 32]),
             }),
             audit_attestation: None,
+            command_policy_summary: None,
         };
         let base_digest = compute_session_digest(&base).unwrap();
 
@@ -1912,6 +2222,28 @@ mod tests {
         assert_eq!(
             compute_session_digest(&meta).unwrap().to_string(),
             "3a1ed53d426d6ea2544cec6cf6b95ccdc31fda4570d86931239ee0f7d7d39012"
+        );
+
+        // A summary is skipped when absent, so the vector above pins only the
+        // encoding every session written before the field existed still hashes
+        // under. Without this second vector a port could omit the field
+        // entirely and match on every pre-existing session.
+        let mut mediated = sample_metadata("20260421-200000-11111");
+        mediated.command_policy_summary = Some(CommandPolicySummary {
+            mediation_active: true,
+            event_count: 3,
+            invocation_count: 2,
+            commands: vec![CommandPolicyCommandSummary {
+                command: "gh".to_string(),
+                allowed: 1,
+                denied: 1,
+                other: 0,
+            }],
+            truncated: false,
+        });
+        assert_eq!(
+            compute_session_digest(&mediated).unwrap().to_string(),
+            "20ed86fc30467af40a12f1b9d70b77f1bf3b11f24bcf7cf1fed094fe84f01b37"
         );
 
         let dir = tempfile::tempdir().unwrap();

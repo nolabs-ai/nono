@@ -2607,6 +2607,10 @@ pub struct AuditListArgs {
     #[arg(long, value_name = "N")]
     pub recent: Option<usize>,
 
+    /// Hide the per-session mediated tool summary
+    #[arg(long)]
+    pub no_tools: bool,
+
     /// Output as JSON
     #[arg(long)]
     pub json: bool,

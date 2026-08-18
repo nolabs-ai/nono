@@ -221,6 +221,7 @@ h56ZLEEqHfVWFhJWIKRSabtxYPV/VJyMv+lo3L0QwSKsouHs3dtF1zVQ
                 merkle_root: ContentHash::from_bytes([0x22; 32]),
             }),
             audit_attestation: None,
+            command_policy_summary: None,
         }
     }
 

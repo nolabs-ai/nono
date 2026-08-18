@@ -410,6 +410,66 @@ pub struct AuditIntegritySummary {
     pub merkle_root: ContentHash,
 }
 
+/// Maximum distinct mediated command names retained in a command policy summary.
+///
+/// Command names come from profile configuration rather than from the sandboxed
+/// process, but the bound keeps a pathological profile from growing
+/// `session.json` without limit. Commands past it are counted in the totals
+/// only, and set `truncated`.
+pub const COMMAND_POLICY_SUMMARY_MAX_COMMANDS: usize = 256;
+
+/// Terminal classification of a command policy decision.
+///
+/// An event's `decision` is an open, platform-defined vocabulary mixing
+/// lifecycle stages with terminal outcomes. This closed classification is never
+/// persisted, so `decision` stays the event schema's single source of truth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandPolicyOutcome {
+    /// The mediated command was permitted to run.
+    Allowed,
+    /// The mediated command was refused.
+    Denied,
+    /// A non-terminal lifecycle stage; a later event carries the outcome.
+    Pending,
+    /// A decision outside the classifier's vocabulary.
+    Other,
+}
+
+/// Per-command rollup of mediated command policy decisions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandPolicyCommandSummary {
+    /// Mediated command name.
+    pub command: String,
+    /// Invocations permitted to run.
+    pub allowed: u64,
+    /// Invocations refused.
+    pub denied: u64,
+    /// Invocations with a terminal decision the classifier did not recognize.
+    pub other: u64,
+}
+
+/// Denormalized rollup of the command policy events in a session's audit log.
+///
+/// Only terminal decisions are counted, so an invocation that passes an
+/// invocation gate and then runs contributes exactly one `allowed`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandPolicySummary {
+    /// Whether command mediation was configured for the session.
+    ///
+    /// Derived from the sandbox runtime audit event. Sessions recorded before
+    /// macOS emitted that event can report `false` despite having mediated.
+    #[serde(default)]
+    pub mediation_active: bool,
+    /// Every command policy event, including non-terminal lifecycle stages.
+    pub event_count: u64,
+    /// Terminal decisions across all commands.
+    pub invocation_count: u64,
+    /// Per-command rollup, ordered by command name.
+    pub commands: Vec<CommandPolicyCommandSummary>,
+    /// Whether distinct commands exceeded [`COMMAND_POLICY_SUMMARY_MAX_COMMANDS`].
+    pub truncated: bool,
+}
+
 /// Signed attestation metadata for an audit session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditAttestationSummary {
@@ -466,6 +526,12 @@ pub struct SessionMetadata {
     /// Optional keyed signature over the audit Merkle root and session context
     #[serde(default)]
     pub audit_attestation: Option<AuditAttestationSummary>,
+    /// Optional rollup of command policy events, denormalized for session listing.
+    ///
+    /// Omitted rather than emitted as null so that metadata written before the
+    /// field existed keeps its session digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_policy_summary: Option<CommandPolicySummary>,
 }
 
 /// A snapshot manifest capturing filesystem state at a point in time

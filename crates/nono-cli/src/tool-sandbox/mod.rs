@@ -29,6 +29,9 @@ pub(crate) fn log_main_total() {}
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod audit_context;
+// Unconditional: readers of an event log classify decisions on every platform,
+// and both platforms' emitters type-check against the same vocabulary.
+pub(crate) mod command_policy_decision;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod credentials;
 #[cfg(any(target_os = "linux", target_os = "macos"))]

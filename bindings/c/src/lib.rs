@@ -143,6 +143,7 @@ pub(crate) fn map_error(e: &nono::NonoError) -> types::NonoErrorCode {
         | nono::NonoError::TrustPolicy(_)
         | nono::NonoError::BlocklistBlocked { .. }
         | nono::NonoError::InstructionFileDenied { .. }
+        | nono::NonoError::AuditSessionOutsideRoot { .. }
         | nono::NonoError::PackageVerification { .. } => NonoErrorCode::ErrTrustVerification,
         nono::NonoError::PackageInstall(_)
         | nono::NonoError::RegistryError(_)

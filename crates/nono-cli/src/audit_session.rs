@@ -94,37 +94,86 @@ pub fn discover_sessions() -> Result<Vec<SessionInfo>> {
     Ok(sessions)
 }
 
-/// Load a specific audit session by ID.
-pub fn load_session(session_id: &str) -> Result<SessionInfo> {
+/// Directories that could hold the named session, in discovery-root order.
+///
+/// Yielded lazily so callers that accept an earlier root's entry never
+/// evaluate later ones: a defective entry in the rollback root must not block
+/// a session that resolves validly under the primary audit root.
+///
+/// Each yielded directory is canonical and confirmed to resolve inside the
+/// root it was found under, so a symlinked session directory cannot point a
+/// reader outside the audit roots — and files later opened under the returned
+/// path stay inside the checked target even if the entry is re-pointed.
+fn candidate_session_dirs(session_id: &str) -> Result<impl Iterator<Item = Result<PathBuf>>> {
     validate_session_id(session_id)?;
-    let primary_root = audit_root()?;
-    let legacy_roots = state_paths::LegacyRootSet::resolve()?;
     let mut roots: Vec<PathBuf> = state_paths::audit_discovery_roots()?;
     roots.extend(state_paths::rollback_discovery_roots()?);
+    let session_id = session_id.to_string();
 
-    for root in roots {
-        let dir = root.join(session_id);
+    Ok(roots.into_iter().filter_map(move |root| {
+        let dir = root.join(&session_id);
         if !dir.exists() {
+            return None;
+        }
+        Some(confirm_contained_session_dir(&root, &dir, &session_id))
+    }))
+}
+
+fn confirm_contained_session_dir(root: &Path, dir: &Path, session_id: &str) -> Result<PathBuf> {
+    let canonical_root = root.canonicalize().map_err(|e| {
+        NonoError::Snapshot(format!(
+            "Failed to canonicalize audit root {}: {e}",
+            root.display()
+        ))
+    })?;
+    // The entry exists, so a canonicalize failure is an I/O fault to surface;
+    // SessionNotFound would render it as a session that was never there.
+    let canonical_dir = dir.canonicalize().map_err(|e| {
+        NonoError::Snapshot(format!(
+            "Failed to canonicalize audit session directory {}: {e}",
+            dir.display()
+        ))
+    })?;
+    // Skipping the entry instead would leave the caller unable to separate
+    // an escape from a session that was never there.
+    if !canonical_dir.starts_with(&canonical_root) {
+        return Err(NonoError::AuditSessionOutsideRoot {
+            session_id: session_id.to_string(),
+            root: canonical_root.display().to_string(),
+        });
+    }
+    Ok(canonical_dir)
+}
+
+/// Resolve an audit session's directory without reading its metadata.
+///
+/// Sessions only gain a `session.json` when they finalize, so [`load_session`]
+/// cannot reach the event log of a session that is still running. Applies the
+/// same rollback-backed filter as [`load_session`] so the two agree on which
+/// directory, if any, holds a session's audit data.
+pub fn resolve_session_dir(session_id: &str) -> Result<PathBuf> {
+    for dir in candidate_session_dirs(session_id)? {
+        let dir = dir?;
+        // A directory without metadata is still a candidate: only
+        // finalization writes session.json.
+        if !is_primary_audit_session(&dir)
+            && SnapshotManager::load_session_metadata(&dir).is_ok_and(|m| m.snapshot_count > 0)
+        {
             continue;
         }
+        return Ok(dir);
+    }
+    Err(NonoError::SessionNotFound(session_id.to_string()))
+}
 
-        let canonical_root = root.canonicalize().map_err(|e| {
-            NonoError::SessionNotFound(format!(
-                "Cannot canonicalize audit root {}: {}",
-                root.display(),
-                e
-            ))
-        })?;
-        let canonical_dir = dir
-            .canonicalize()
-            .map_err(|_| NonoError::SessionNotFound(session_id.to_string()))?;
-        if !canonical_dir.starts_with(&canonical_root) {
-            continue;
-        }
+/// Load a specific audit session by ID.
+pub fn load_session(session_id: &str) -> Result<SessionInfo> {
+    let legacy_roots = state_paths::LegacyRootSet::resolve()?;
 
+    for dir in candidate_session_dirs(session_id)? {
+        let dir = dir?;
         let metadata = SnapshotManager::load_session_metadata(&dir)?;
-        let is_primary = dir.starts_with(&primary_root);
-        if !is_primary && metadata.snapshot_count > 0 {
+        if !is_primary_audit_session(&dir) && metadata.snapshot_count > 0 {
             continue;
         }
 
@@ -266,6 +315,7 @@ mod tests {
                 audit_event_count: 2,
                 audit_integrity: None,
                 audit_attestation: None,
+                command_policy_summary: None,
             },
         )
         .unwrap();
@@ -290,6 +340,7 @@ mod tests {
                 audit_event_count: 2,
                 audit_integrity: None,
                 audit_attestation: None,
+                command_policy_summary: None,
             },
         )
         .unwrap();
@@ -314,6 +365,7 @@ mod tests {
                 audit_event_count: 2,
                 audit_integrity: None,
                 audit_attestation: None,
+                command_policy_summary: None,
             },
         )
         .unwrap();
@@ -359,6 +411,7 @@ mod tests {
                 audit_event_count: 1,
                 audit_integrity: None,
                 audit_attestation: None,
+                command_policy_summary: None,
             },
         )
         .unwrap();
@@ -411,6 +464,7 @@ mod tests {
                 audit_event_count: 1,
                 audit_integrity: None,
                 audit_attestation: None,
+                command_policy_summary: None,
             },
         )
         .unwrap();
@@ -418,5 +472,162 @@ mod tests {
         let sessions = discover_sessions().unwrap();
         assert_eq!(sessions.len(), 1);
         assert!(is_primary_audit_session(&sessions[0].dir));
+    }
+
+    #[test]
+    fn session_dir_resolves_before_the_session_writes_metadata() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state");
+        fs::create_dir_all(&state).unwrap();
+        let home = tmp.path().to_string_lossy().to_string();
+        let state_str = state.to_string_lossy().to_string();
+        let _env = EnvVarGuard::set_all(&[("HOME", &home), ("XDG_STATE_HOME", &state_str)]);
+
+        let dir = audit_root().unwrap().join("20260813-120000-4242");
+        fs::create_dir_all(&dir).unwrap();
+
+        assert_eq!(
+            resolve_session_dir("20260813-120000-4242").unwrap(),
+            dir.canonicalize().unwrap(),
+            "a session directory without metadata should still resolve"
+        );
+        assert!(load_session("20260813-120000-4242").is_err());
+    }
+
+    /// A defective entry in a later discovery root must not block a session
+    /// that resolves validly under the primary audit root.
+    #[test]
+    fn a_bad_entry_in_a_later_root_does_not_block_the_primary_session() {
+        let _env_lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state");
+        fs::create_dir_all(&state).unwrap();
+        let home = tmp.path().to_string_lossy().to_string();
+        let state_str = state.to_string_lossy().to_string();
+        let _env = EnvVarGuard::set_all(&[("HOME", &home), ("XDG_STATE_HOME", &state_str)]);
+
+        let session_id = "20260813-120000-4242";
+        let dir = audit_root().unwrap().join(session_id);
+        fs::create_dir_all(&dir).unwrap();
+        SnapshotManager::write_session_metadata(
+            &dir,
+            &SessionMetadata {
+                session_id: session_id.to_string(),
+                started: "2026-08-13T12:00:00+01:00".to_string(),
+                ended: Some("2026-08-13T12:00:01+01:00".to_string()),
+                command: vec!["/bin/pwd".to_string()],
+                executable_identity: None,
+                tracked_paths: vec![PathBuf::from("/tmp/work")],
+                snapshot_count: 0,
+                exit_code: Some(0),
+                merkle_roots: Vec::new(),
+                network_events: Vec::new(),
+                audit_event_count: 2,
+                audit_integrity: None,
+                audit_attestation: None,
+                command_policy_summary: None,
+            },
+        )
+        .unwrap();
+
+        let outside = tmp.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        let rollback_root = state_paths::rollback_root().unwrap();
+        fs::create_dir_all(&rollback_root).unwrap();
+        std::os::unix::fs::symlink(&outside, rollback_root.join(session_id)).unwrap();
+
+        assert_eq!(
+            resolve_session_dir(session_id).unwrap(),
+            dir.canonicalize().unwrap()
+        );
+        assert_eq!(
+            load_session(session_id).unwrap().metadata.session_id,
+            session_id
+        );
+    }
+
+    /// `resolve_session_dir` applies the same rollback-backed filter as
+    /// `load_session`, so `nono inspect` cannot summarize an event log that
+    /// `nono audit show` refuses to load.
+    #[test]
+    fn resolve_skips_rollback_backed_entries_like_load_does() {
+        let _env_lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state");
+        fs::create_dir_all(&state).unwrap();
+        let home = tmp.path().to_string_lossy().to_string();
+        let state_str = state.to_string_lossy().to_string();
+        let _env = EnvVarGuard::set_all(&[("HOME", &home), ("XDG_STATE_HOME", &state_str)]);
+
+        let session_id = "20260813-120000-4242";
+        let rollback_dir = state_paths::rollback_root().unwrap().join(session_id);
+        fs::create_dir_all(&rollback_dir).unwrap();
+        SnapshotManager::write_session_metadata(
+            &rollback_dir,
+            &SessionMetadata {
+                session_id: session_id.to_string(),
+                started: "2026-08-13T12:00:00+01:00".to_string(),
+                ended: Some("2026-08-13T12:00:01+01:00".to_string()),
+                command: vec!["/bin/pwd".to_string()],
+                executable_identity: None,
+                tracked_paths: vec![PathBuf::from("/tmp/work")],
+                snapshot_count: 2,
+                exit_code: Some(0),
+                merkle_roots: Vec::new(),
+                network_events: Vec::new(),
+                audit_event_count: 2,
+                audit_integrity: None,
+                audit_attestation: None,
+                command_policy_summary: None,
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(
+            resolve_session_dir(session_id),
+            Err(NonoError::SessionNotFound(_))
+        ));
+        assert!(matches!(
+            load_session(session_id),
+            Err(NonoError::SessionNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn session_dir_rejects_a_traversing_id() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state");
+        fs::create_dir_all(&state).unwrap();
+        let home = tmp.path().to_string_lossy().to_string();
+        let state_str = state.to_string_lossy().to_string();
+        let _env = EnvVarGuard::set_all(&[("HOME", &home), ("XDG_STATE_HOME", &state_str)]);
+
+        assert!(resolve_session_dir("../sessions").is_err());
+        assert!(resolve_session_dir("").is_err());
+    }
+
+    #[test]
+    fn session_dir_rejects_a_symlink_out_of_the_audit_root() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state");
+        fs::create_dir_all(&state).unwrap();
+        let home = tmp.path().to_string_lossy().to_string();
+        let state_str = state.to_string_lossy().to_string();
+        let _env = EnvVarGuard::set_all(&[("HOME", &home), ("XDG_STATE_HOME", &state_str)]);
+
+        let outside = tmp.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        let root = audit_root().unwrap();
+        fs::create_dir_all(&root).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("20260813-120000-4242")).unwrap();
+
+        // Not SessionNotFound: callers render an absent session as ordinary.
+        assert!(matches!(
+            resolve_session_dir("20260813-120000-4242"),
+            Err(NonoError::AuditSessionOutsideRoot { .. })
+        ));
     }
 }

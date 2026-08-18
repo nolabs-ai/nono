@@ -9,6 +9,7 @@ use crate::command_policy::{
 };
 use crate::lineage_cgroup::LineageMarker;
 use crate::profile;
+use crate::tool_sandbox::command_policy_decision::CommandPolicyDecision;
 use crate::tool_sandbox::credentials::{ResolvedCredential, resolve_credentials};
 use crate::tool_sandbox::env::{
     apply_environment_set_vars, apply_export_env, default_env_allow_patterns,
@@ -1281,7 +1282,7 @@ fn handle_shim_stream_inner(
                 auth.peer_pid,
                 session_root_pid,
                 None,
-                "denied",
+                CommandPolicyDecision::Denied,
                 Some(err.to_string()),
                 None,
             )?;
@@ -1298,7 +1299,7 @@ fn handle_shim_stream_inner(
             auth.peer_pid,
             session_root_pid,
             Some(&caller),
-            "denied",
+            CommandPolicyDecision::Denied,
             Some("legacy_blocked_command".to_string()),
             None,
         )?;
@@ -1332,7 +1333,7 @@ fn handle_shim_stream_inner(
                 auth.peer_pid,
                 session_root_pid,
                 Some(&caller),
-                "denied",
+                CommandPolicyDecision::Denied,
                 Some(err.to_string()),
                 None,
             )?;
@@ -1348,7 +1349,7 @@ fn handle_shim_stream_inner(
             auth.peer_pid,
             session_root_pid,
             Some(&caller),
-            "denied",
+            CommandPolicyDecision::Denied,
             Some(err.to_string()),
             None,
         )?;
@@ -1369,7 +1370,7 @@ fn handle_shim_stream_inner(
                     auth.peer_pid,
                     session_root_pid,
                     Some(&caller),
-                    "invocation_denied",
+                    CommandPolicyDecision::InvocationDenied,
                     Some(err.to_string()),
                     None,
                 )?;
@@ -1388,7 +1389,7 @@ fn handle_shim_stream_inner(
                         auth.peer_pid,
                         session_root_pid,
                         Some(&caller),
-                        "invocation_denied",
+                        CommandPolicyDecision::InvocationDenied,
                         Some(err.to_string()),
                         None,
                     )?;
@@ -1405,7 +1406,7 @@ fn handle_shim_stream_inner(
                     auth.peer_pid,
                     session_root_pid,
                     Some(&caller),
-                    "invocation_allowed",
+                    CommandPolicyDecision::InvocationAllowed,
                     None,
                     None,
                 )?;
@@ -1419,7 +1420,7 @@ fn handle_shim_stream_inner(
                     auth.peer_pid,
                     session_root_pid,
                     Some(&caller),
-                    "invocation_denied",
+                    CommandPolicyDecision::InvocationDenied,
                     Some(reason.clone()),
                     None,
                 )?;
@@ -1449,7 +1450,7 @@ fn handle_shim_stream_inner(
                             auth.peer_pid,
                             session_root_pid,
                             Some(&caller),
-                            "invocation_approve_denied",
+                            CommandPolicyDecision::InvocationApproveDenied,
                             Some(err.to_string()),
                             None,
                         )?;
@@ -1473,7 +1474,7 @@ fn handle_shim_stream_inner(
                             auth.peer_pid,
                             session_root_pid,
                             Some(&caller),
-                            "invocation_approve_denied",
+                            CommandPolicyDecision::InvocationApproveDenied,
                             Some(err.to_string()),
                             None,
                         )?;
@@ -1510,10 +1511,10 @@ fn handle_shim_stream_inner(
                     move || backend.request_approval(&approval_request),
                 )?;
                 let (audit_decision, deny_reason) = if decision.is_granted() {
-                    ("invocation_approve_granted", None)
+                    (CommandPolicyDecision::InvocationApproveGranted, None)
                 } else {
                     (
-                        "invocation_approve_denied",
+                        CommandPolicyDecision::InvocationApproveDenied,
                         Some(super::approval_deny_reason(&decision)),
                     )
                 };
@@ -1557,7 +1558,7 @@ fn handle_shim_stream_inner(
                         auth.peer_pid,
                         session_root_pid,
                         Some(&caller),
-                        "denied",
+                        CommandPolicyDecision::Denied,
                         Some(err.to_string()),
                         None,
                     )?;
@@ -1591,7 +1592,7 @@ fn handle_shim_stream_inner(
             auth.peer_pid,
             session_root_pid,
             Some(&caller),
-            "respond",
+            CommandPolicyDecision::Respond,
             None,
             Some(0),
         )?;
@@ -1637,10 +1638,10 @@ fn handle_shim_stream_inner(
             run_with_timeout(timeout, move || backend.request_approval(&approval_request))?;
 
         let (audit_decision, deny_reason) = if decision.is_granted() {
-            ("approve_granted", None)
+            (CommandPolicyDecision::ApproveGranted, None)
         } else {
             (
-                "approve_denied",
+                CommandPolicyDecision::ApproveDenied,
                 Some(super::approval_deny_reason(&decision)),
             )
         };
@@ -1686,7 +1687,7 @@ fn handle_shim_stream_inner(
                 auth.peer_pid,
                 session_root_pid,
                 Some(&caller),
-                "capture_credential_cached",
+                CommandPolicyDecision::CaptureCredentialCached,
                 None,
                 Some(0),
             )?;
@@ -1704,7 +1705,7 @@ fn handle_shim_stream_inner(
                 auth.peer_pid,
                 session_root_pid,
                 Some(&caller),
-                "denied",
+                CommandPolicyDecision::Denied,
                 Some("resource_limit".to_string()),
                 None,
             )?;
@@ -1728,7 +1729,7 @@ fn handle_shim_stream_inner(
                         auth.peer_pid,
                         session_root_pid,
                         Some(&caller),
-                        "denied",
+                        CommandPolicyDecision::Denied,
                         Some("credential_capture_failed".to_string()),
                         Some(exit_code),
                     )?;
@@ -1753,7 +1754,7 @@ fn handle_shim_stream_inner(
                     auth.peer_pid,
                     session_root_pid,
                     Some(&caller),
-                    "capture_credential",
+                    CommandPolicyDecision::CaptureCredential,
                     None,
                     Some(0),
                 )?;
@@ -1768,7 +1769,7 @@ fn handle_shim_stream_inner(
                     auth.peer_pid,
                     session_root_pid,
                     Some(&caller),
-                    "denied",
+                    CommandPolicyDecision::Denied,
                     Some(err.to_string()),
                     None,
                 )?;
@@ -1792,7 +1793,7 @@ fn handle_shim_stream_inner(
                 auth.peer_pid,
                 session_root_pid,
                 Some(&caller),
-                "denied",
+                CommandPolicyDecision::Denied,
                 Some("resource_limit".to_string()),
                 None,
             )?;
@@ -1828,7 +1829,7 @@ fn handle_shim_stream_inner(
                     auth.peer_pid,
                     session_root_pid,
                     Some(&caller),
-                    "capture",
+                    CommandPolicyDecision::Capture,
                     None,
                     Some(*exit_code),
                 )?;
@@ -1843,7 +1844,7 @@ fn handle_shim_stream_inner(
                     auth.peer_pid,
                     session_root_pid,
                     Some(&caller),
-                    "denied",
+                    CommandPolicyDecision::Denied,
                     Some(err.to_string()),
                     None,
                 )?;
@@ -1864,7 +1865,7 @@ fn handle_shim_stream_inner(
                 auth.peer_pid,
                 session_root_pid,
                 Some(&caller),
-                "denied",
+                CommandPolicyDecision::Denied,
                 Some("resource_limit".to_string()),
                 None,
             )?;
@@ -1898,7 +1899,7 @@ fn handle_shim_stream_inner(
                         auth.peer_pid,
                         session_root_pid,
                         Some(&caller),
-                        "denied",
+                        CommandPolicyDecision::Denied,
                         Some(reason.clone()),
                         None,
                         launch_result.stdio,
@@ -1916,7 +1917,7 @@ fn handle_shim_stream_inner(
                     auth.peer_pid,
                     session_root_pid,
                     Some(&caller),
-                    "exec",
+                    CommandPolicyDecision::Exec,
                     None,
                     Some(launch_result.exit_code),
                     launch_result.stdio,
@@ -1932,7 +1933,7 @@ fn handle_shim_stream_inner(
                     auth.peer_pid,
                     session_root_pid,
                     Some(&caller),
-                    "denied",
+                    CommandPolicyDecision::Denied,
                     Some(err.to_string()),
                     None,
                 )?;
@@ -1952,7 +1953,7 @@ fn handle_shim_stream_inner(
             auth.peer_pid,
             session_root_pid,
             Some(&caller),
-            "denied",
+            CommandPolicyDecision::Denied,
             Some("resource_limit".to_string()),
             None,
         )?;
@@ -1977,7 +1978,7 @@ fn handle_shim_stream_inner(
                     auth.peer_pid,
                     session_root_pid,
                     Some(&caller),
-                    "denied",
+                    CommandPolicyDecision::Denied,
                     Some(reason.clone()),
                     None,
                     launch_result.stdio,
@@ -1995,7 +1996,7 @@ fn handle_shim_stream_inner(
                 auth.peer_pid,
                 session_root_pid,
                 Some(&caller),
-                "allowed",
+                CommandPolicyDecision::Allowed,
                 None,
                 Some(launch_result.exit_code),
                 launch_result.stdio,
@@ -2011,7 +2012,7 @@ fn handle_shim_stream_inner(
                 auth.peer_pid,
                 session_root_pid,
                 Some(&caller),
-                "denied",
+                CommandPolicyDecision::Denied,
                 Some(err.to_string()),
                 None,
             )?;
@@ -2349,7 +2350,7 @@ fn record_command_policy_audit(
     shim_pid: u32,
     session_root_pid: u32,
     caller: Option<&Caller>,
-    decision: &str,
+    decision: CommandPolicyDecision,
     reason: Option<String>,
     exit_code: Option<i32>,
 ) -> Result<()> {
@@ -2377,7 +2378,7 @@ fn record_command_policy_audit_with_stdio(
     shim_pid: u32,
     session_root_pid: u32,
     caller: Option<&Caller>,
-    decision: &str,
+    decision: CommandPolicyDecision,
     reason: Option<String>,
     exit_code: Option<i32>,
     stdio: Option<CommandPolicyStdioAudit>,
@@ -2397,7 +2398,7 @@ fn record_command_policy_audit_with_stdio(
         caller_pid: caller_pid(caller),
         shim_pid: Some(shim_pid),
         session_root_pid: Some(session_root_pid),
-        decision: decision.to_string(),
+        decision: decision.as_str().to_string(),
         reason,
         stdio_mode: selected_stdio_mode(request).to_string(),
         argv_hash: hash_byte_fields(&request.argv),
@@ -2413,7 +2414,7 @@ fn record_command_policy_audit_with_stdio(
     let mut recorder = recorder
         .lock()
         .map_err(|_| NonoError::Snapshot("Audit recorder lock poisoned".to_string()))?;
-    recorder.record_command_policy_event(event)
+    recorder.record_command_policy_event(event, decision.outcome())
 }
 
 fn hash_byte_fields(fields: &[Vec<u8>]) -> String {

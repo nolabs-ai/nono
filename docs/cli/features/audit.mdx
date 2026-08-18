@@ -49,6 +49,7 @@ Each session records:
 | **Merkle roots** | Filesystem-state commitments (when `--audit-integrity` or `--rollback` is active) |
 | **Snapshots** | Content-addressable rollback metadata (when `--rollback` is active) |
 | **Audit integrity summary** | Hash-chain head and Merkle root for the audit event stream unless disabled with `--no-audit-integrity` |
+| **Command policy summary** | Per-command rollup of allowed and denied [Sandboxed Tool Execution](/cli/features/tool-sandbox) decisions (when the profile mediates commands) |
 
 ## Modes
 
@@ -99,6 +100,8 @@ Every audited session writes an append-only `audit-events.ndjson` file. In plain
 | **Session** | One audited `nono run` |
 | **Audit event** | One recorded fact within that session, such as `session_started`, `session_ended`, a capability decision, or a supervisor-observed URL-open event |
 | **Filesystem-state hashing** | Walking the tracked writable paths and hashing the files under them to commit their state before and after the run |
+| **Command policy event** | One mediated tool decision recorded by the Capability Broker, carrying the `decision` string that names the lifecycle stage or terminal result |
+| **Invocation** | One mediated tool decision that reached a terminal outcome. An invocation that clears an invocation gate and then runs records two events but counts once |
 
 ## Integrity Flow
 
@@ -211,6 +214,9 @@ nono audit list --path ~/dev/my-project
 # Show only the 10 most recent
 nono audit list --recent 10
 
+# Hide the per-session mediated tool summary
+nono audit list --no-tools
+
 # Machine-readable output
 nono audit list --json
 ```
@@ -222,6 +228,7 @@ nono 14 command(s)
 
   ~/dev/sprockets (11 commands)
     20260219-092017-8117  just now  completed  claude
+      tools: gh (3 allowed, 1 denied), git (12 allowed)
     20260219-091403-90291  5m ago  completed  claude
     20260218-134433-28210  1d ago  completed  claude
     ...
@@ -238,6 +245,35 @@ Filters can be combined:
 # Claude sessions from last week that touched the project directory
 nono audit list --command claude --path ~/project --since 2026-02-10
 ```
+
+#### Mediated Tool Summary
+
+Sessions that ran under a profile with [Sandboxed Tool Execution](/cli/features/tool-sandbox) get a second `tools:` line naming each mediated command with its allowed and denied counts. Sessions that ran without mediation print nothing extra, and `--no-tools` suppresses the line entirely.
+
+The line is read from the rollup stored in `session.json`, never from the event log, so listing stays fast no matter how many events a session recorded. A few renderings are worth recognizing:
+
+| Rendering | Meaning |
+|---|---|
+| `active, no invocations` | Mediation was configured and no mediated command was ever invoked. Distinct from a session that ran without mediation at all, which prints no `tools:` line |
+| `N event(s), no completed invocations` | Command policy events were recorded but none reached a terminal decision, which is what a session killed mid-invocation looks like |
+| `N unclassified` | A terminal decision nono could not classify as allowed or denied. Read the event itself with `nono audit show` |
+| `+N more` | More distinct commands were mediated than the list line names. The full per-command rollup is still in `nono audit list --json` |
+| `rollup truncated` | The stored rollup itself dropped commands past its bound, so per-command counts for them are not recoverable from session metadata. The session totals still include them |
+
+`--no-tools` only affects the human-readable listing. `--json` always carries the same data per session as `tool_sandbox_active` and the full `command_policy_summary` object, and `nono audit show --json` reports the underlying `command_policy_events`, one entry per mediated decision.
+
+Those two fields answer different questions, so read them apart:
+
+| Field | True when |
+|---|---|
+| `tool_sandbox_active` | The session has a rollup at all: mediation was configured, or a mediated command was invoked. Equivalent to `command_policy_summary != null` |
+| `command_policy_summary.mediation_active` | Mediation was configured, read from the sandbox runtime audit event. Sessions recorded before macOS emitted that event can report `false` despite having mediated commands |
+
+A session only writes `session.json` when it finalizes, so `nono audit list` and `nono audit show` cover finished sessions. For a session that is still running, [`nono inspect`](/cli/features/session-lifecycle#mediated-tools-while-the-session-runs) reports the same rollup recomputed from the event log.
+
+<Note>
+  Whether mediation was configured is read from the sandbox runtime audit event. Sessions recorded by older nono versions (before macOS emitted that event) that configured mediation but never invoked a mediated command print no `tools:` line, the same as a session that ran without mediation.
+</Note>
 
 ### `nono audit show`
 
@@ -281,6 +317,8 @@ When an attestation is present, verification checks:
 - the attested Merkle root against the session's stored audit integrity summary
 - the session id bound into the attestation predicate
 - the provided public key, if `--public-key-file` is supplied
+
+The command policy rollup shown by `nono audit list` is covered by the session digest committed to the ledger, so editing `session.json` to hide a denial changes the digest and fails verification. The rollup is a view over events that remain individually recorded and hash-chained; `nono audit show` is where an operator confirms what the rollup summarizes.
 
 ## Use Cases
 
@@ -326,7 +364,7 @@ Audit, audit integrity, and rollback are separate layers that share the same ses
 | Default | Always on | Event-log integrity on by default; filesystem hashing opt-in via `--audit-integrity` | Opt-in (`--rollback`) |
 | Opt-out | `--no-audit` | `--no-audit-integrity` disables event-log integrity | `--no-rollback` |
 | Purpose | Record what happened | Detect tampering in the recorded audit log and optionally commit filesystem state | Restore filesystem state |
-| Data | Command, timestamps, exit code, audit events, network events, tracked paths, optional audit attestation | Event count, chain head, Merkle root, optional filesystem Merkle roots | Full file content snapshots + Merkle roots |
+| Data | Command, timestamps, exit code, audit events, network events, tracked paths, command policy summary, optional audit attestation | Event count, chain head, Merkle root, optional filesystem Merkle roots | Full file content snapshots + Merkle roots |
 | Commands | `nono audit list/show/verify/cleanup` | `nono audit show/verify` | `nono rollback list/show/restore/verify/cleanup` |
 
 When rollback is active, it enriches the audit record with snapshots and restore metadata. When filesystem audit integrity is active, `nono audit show` also includes tracked paths and filesystem Merkle roots.
@@ -339,6 +377,8 @@ The audit trail is intentionally narrow in what it claims to prove.
 - The default integrity structure protects the audit event stream for a single session and also records that session into the global audit ledger.
 - Recording into the global ledger can fail after the command has already exited (for example when the ledger file no longer parses, or the audit directory is unwritable). The session's own directory is still written, but the ledger has no entry for that run, so `nono audit verify` reports it as missing from the chain. The failure is printed on stderr and the run's exit status is downgraded to `1` if the command itself succeeded; a command that failed keeps its own exit status, so a non-zero status is not by itself proof that the run was recorded.
 - A ledger that no longer parses stops every later run from being recorded, and there is no repair command. Moving the file aside starts a fresh chain, after which `nono audit verify` no longer finds the sessions the old one held.
+- The command policy rollup in `session.json` is a convenience view for listing sessions, not an independent record. It is covered by the session digest committed to the ledger, so editing it fails `nono audit verify`; `nono audit show` remains the per-decision record.
+- That rollup names a bounded number of distinct commands. A session that mediates more than the bound drops the per-command counts for the overflow and sets `truncated`; the session totals stay correct and every decision is still in the event log.
 - `--audit-sign-key` adds a keyed supervisor-side signature over the session audit Merkle root and session context, but that still depends on trusting the configured signing key and how its public key is distributed.
 - Without an external timestamp, transparency log, or other anchor, this remains host-local attestation material rather than a globally witnessed timestamped proof.
 - For supervised runs, the supervisor hashes the main executable binary selected for launch and records its canonical path and SHA-256 digest.

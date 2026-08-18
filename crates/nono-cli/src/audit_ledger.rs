@@ -147,6 +147,7 @@ mod tests {
             audit_event_count: 2,
             audit_integrity: None,
             audit_attestation: None,
+            command_policy_summary: None,
         }
     }
 
@@ -282,6 +283,7 @@ mod tests {
                 merkle_root: ContentHash::from_bytes([3; 32]),
             }),
             audit_attestation: None,
+            command_policy_summary: None,
         };
         let base_digest = compute_session_digest(&base).unwrap();
 

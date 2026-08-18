@@ -1332,6 +1332,7 @@ mod tests {
             audit_event_count: 0,
             audit_integrity: None,
             audit_attestation: None,
+            command_policy_summary: None,
         };
 
         let session = SessionInfo {
@@ -1367,6 +1368,7 @@ mod tests {
             audit_event_count: 0,
             audit_integrity: None,
             audit_attestation: None,
+            command_policy_summary: None,
         };
         let meta2 = SessionMetadata {
             session_id: "20260219-110000-67890".to_string(),
@@ -1382,6 +1384,7 @@ mod tests {
             audit_event_count: 0,
             audit_integrity: None,
             audit_attestation: None,
+            command_policy_summary: None,
         };
 
         let s1 = SessionInfo {
@@ -1428,6 +1431,7 @@ mod tests {
             audit_event_count: 0,
             audit_integrity: None,
             audit_attestation: None,
+            command_policy_summary: None,
         };
 
         let session = SessionInfo {

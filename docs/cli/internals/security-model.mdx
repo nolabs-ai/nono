@@ -287,6 +287,7 @@ The audit subsystem has a narrower security claim than the sandbox itself.
 - The keyed audit attestation is only as strong as the signing key distribution model. If the verifier does not pin the expected public key, a rewritten session could also rewrite the embedded public key and remain self-consistent.
 - `nono audit verify --public-key-file <FILE>` is the path that pins verification to an expected signer key. Without that, attestation verification checks the keyed signature against the public key recorded in session metadata.
 - Filesystem Merkle roots under `--audit-integrity` or `--rollback` commit tracked writable paths, not the full machine state.
+- Session metadata carries a denormalized rollup of Tool Sandbox command-policy decisions so that session listings do not have to parse event logs. That rollup is derived data, not a second record: it is covered by the session digest committed to the ledger, so editing it fails `nono audit verify`, but it is not independently recomputed from the events during verification. A rollup read without verifying is only as trustworthy as the file it came from, and `nono audit show` is the authoritative per-decision record.
 
 The correct way to read the feature today is:
 

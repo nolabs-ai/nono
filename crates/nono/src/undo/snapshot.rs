@@ -1581,6 +1581,7 @@ mod tests {
             audit_event_count: 0,
             audit_integrity: None,
             audit_attestation: None,
+            command_policy_summary: None,
         };
 
         manager.save_session_metadata(&meta).expect("save metadata");
@@ -1640,6 +1641,7 @@ mod tests {
             audit_event_count: 0,
             audit_integrity: None,
             audit_attestation: None,
+            command_policy_summary: None,
         };
         manager.save_session_metadata(&meta).expect("save");
 

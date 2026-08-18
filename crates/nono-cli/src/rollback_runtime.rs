@@ -533,24 +533,25 @@ pub(crate) fn finalize_supervised_exit(ctx: RollbackExitContext<'_>) -> Result<F
         })?;
         network_events.extend(supervisor_events.drain(..));
     }
-    let (audit_event_count, audit_integrity) = if let Some(recorder_mutex) = audit_recorder {
-        let mut recorder = recorder_mutex
-            .lock()
-            .map_err(|_| nono::NonoError::Snapshot("Audit recorder lock poisoned".to_string()))?;
-        for event in &network_events {
-            recorder.record_network_event(event.clone())?;
-        }
-        recorder.record_session_ended(ended.to_string(), exit_code)?;
-        let event_count = recorder.event_count();
-        let integrity = if audit_integrity_enabled {
-            recorder.finalize()
+    let (audit_event_count, audit_integrity, command_policy_summary) =
+        if let Some(recorder_mutex) = audit_recorder {
+            let mut recorder = recorder_mutex.lock().map_err(|_| {
+                nono::NonoError::Snapshot("Audit recorder lock poisoned".to_string())
+            })?;
+            for event in &network_events {
+                recorder.record_network_event(event.clone())?;
+            }
+            recorder.record_session_ended(ended.to_string(), exit_code)?;
+            let event_count = recorder.event_count();
+            let integrity = if audit_integrity_enabled {
+                recorder.finalize()
+            } else {
+                None
+            };
+            (event_count, integrity, recorder.command_policy_summary())
         } else {
-            None
+            (0, None, None)
         };
-        (event_count, integrity)
-    } else {
-        (0, None)
-    };
 
     let scrubbed_command = nono::scrub_argv_with_policy(command, redaction_policy);
     let mut audit_saved = false;
@@ -582,6 +583,7 @@ pub(crate) fn finalize_supervised_exit(ctx: RollbackExitContext<'_>) -> Result<F
             audit_event_count,
             audit_integrity: audit_integrity.clone(),
             audit_attestation: None,
+            command_policy_summary: command_policy_summary.clone(),
         };
         if let Some(signer) = audit_signer {
             meta.audit_attestation = Some(write_audit_attestation(
@@ -634,6 +636,7 @@ pub(crate) fn finalize_supervised_exit(ctx: RollbackExitContext<'_>) -> Result<F
             audit_event_count,
             audit_integrity,
             audit_attestation: None,
+            command_policy_summary: command_policy_summary.clone(),
         };
         if let Some(signer) = audit_signer {
             meta.audit_attestation = Some(write_audit_attestation(
@@ -939,6 +942,7 @@ mod tests {
                 merkle_root: nono::undo::ContentHash::from_bytes([0x22; 32]),
             }),
             audit_attestation: None,
+            command_policy_summary: None,
         };
 
         let summary = write_audit_attestation(
@@ -999,6 +1003,7 @@ mod tests {
             audit_event_count: 2,
             audit_integrity: None,
             audit_attestation: None,
+            command_policy_summary: None,
         };
         assert!(record_session_in_ledger(&metadata));
 

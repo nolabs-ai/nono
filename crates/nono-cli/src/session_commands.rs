@@ -8,6 +8,7 @@ use crate::command_display::{format_command_line, truncate_chars};
 use crate::session::{self, SessionAttachment, SessionRecord, SessionStatus};
 use colored::Colorize;
 use nix::libc;
+use nono::undo::{CommandPolicySummary, SnapshotManager};
 use nono::{NonoError, Result};
 use std::collections::VecDeque;
 use std::io::{BufRead, Seek, SeekFrom};
@@ -424,9 +425,15 @@ pub fn run_logs(args: &LogsArgs) -> Result<()> {
 /// Dispatch `nono inspect` — placeholder for Step 4.
 pub fn run_inspect(args: &InspectArgs) -> Result<()> {
     let record = session::load_session(&args.session)?;
+    let tools = ToolSummaryView::for_session(&record);
 
     if args.json {
-        let json = serde_json::to_string_pretty(&record)
+        let mut value = serde_json::to_value(&record)
+            .map_err(|e| NonoError::ConfigParse(format!("JSON serialization failed: {e}")))?;
+        if let Some(object) = value.as_object_mut() {
+            tools.extend_json(object)?;
+        }
+        let json = serde_json::to_string_pretty(&value)
             .map_err(|e| NonoError::ConfigParse(format!("JSON serialization failed: {e}")))?;
         println!("{json}");
         return Ok(());
@@ -455,8 +462,141 @@ pub fn run_inspect(args: &InspectArgs) -> Result<()> {
     if let Some(ref rollback) = record.rollback_session {
         println!("Rollback:   {}", rollback);
     }
+    if let Some(line) = tools.render() {
+        println!("Tools:      {line}");
+    }
 
     Ok(())
+}
+
+/// A session's mediated-command rollup, as `nono inspect` reports it.
+///
+/// Read from session metadata once the session has finalized — that rollup is
+/// authoritative and digest-covered — and recomputed from the audit event log
+/// otherwise, since only finalization writes the stored one.
+struct ToolSummaryView {
+    summary: Option<CommandPolicySummary>,
+    /// The session can still mediate commands, so the counts are not final.
+    live: bool,
+    /// The log ended mid-record, so the counts trail the running session.
+    partial: bool,
+    /// Why the log could not be summarized, reported rather than swallowed.
+    error: Option<String>,
+}
+
+impl ToolSummaryView {
+    fn for_session(record: &SessionRecord) -> Self {
+        let live = record.status != SessionStatus::Exited;
+        let empty = Self {
+            summary: None,
+            live,
+            partial: false,
+            error: None,
+        };
+
+        let Some(session_id) = record.rollback_session.as_deref() else {
+            return empty;
+        };
+        let session_dir = match crate::audit_session::resolve_session_dir(session_id) {
+            Ok(dir) => dir,
+            // Audit sessions are removed by `nono audit cleanup` independently
+            // of the session registry, so a missing directory is ordinary.
+            Err(NonoError::SessionNotFound(_)) => {
+                debug!("No audit session directory for {session_id}");
+                return empty;
+            }
+            // A containment failure must not render as "mediated nothing".
+            Err(e) => {
+                return Self {
+                    error: Some(e.to_string()),
+                    ..empty
+                };
+            }
+        };
+
+        if !live {
+            match SnapshotManager::load_session_metadata(&session_dir) {
+                Ok(metadata) => {
+                    return Self {
+                        summary: metadata.command_policy_summary,
+                        ..empty
+                    };
+                }
+                // No session.json: the session died before finalizing, so the
+                // log is all there is and its tail may be legitimately torn.
+                Err(NonoError::SessionNotFound(_)) => {}
+                // Unreadable metadata must not render as "mediated nothing".
+                Err(e) => {
+                    return Self {
+                        error: Some(e.to_string()),
+                        ..empty
+                    };
+                }
+            }
+        }
+
+        match crate::audit_event_reader::recompute_command_policy_summary(&session_dir) {
+            Ok((summary, partial)) => Self {
+                summary,
+                live,
+                partial,
+                error: None,
+            },
+            Err(e) => Self {
+                error: Some(e.to_string()),
+                ..empty
+            },
+        }
+    }
+
+    /// The reported line, or `None` when the session never mediated anything.
+    fn render(&self) -> Option<String> {
+        if let Some(error) = self.error.as_deref() {
+            return Some(format!("unavailable: {error}"));
+        }
+        let mut line = match self.summary.as_ref() {
+            Some(summary) => crate::audit_commands::format_tool_summary_detail(summary),
+            // A log whose only content is a torn record may be hiding the
+            // session's only mediation events, so it must not go silent while
+            // the JSON output reports the partial flag.
+            None if self.partial => "no complete records".to_string(),
+            None => return None,
+        };
+        if self.live {
+            line.push_str(" [live]");
+        }
+        if self.partial {
+            line.push_str(if self.live {
+                " [a record is still being written]"
+            } else {
+                " [the log ends mid-record]"
+            });
+        }
+        Some(line)
+    }
+
+    fn extend_json(&self, object: &mut serde_json::Map<String, serde_json::Value>) -> Result<()> {
+        let summary = serde_json::to_value(&self.summary)
+            .map_err(|e| NonoError::ConfigParse(format!("JSON serialization failed: {e}")))?;
+        object.insert("command_policy_summary".to_string(), summary);
+        object.insert(
+            "command_policy_summary_live".to_string(),
+            serde_json::Value::Bool(self.live),
+        );
+        if self.partial {
+            object.insert(
+                "command_policy_summary_partial".to_string(),
+                serde_json::Value::Bool(true),
+            );
+        }
+        if let Some(error) = self.error.as_deref() {
+            object.insert(
+                "command_policy_summary_error".to_string(),
+                serde_json::Value::String(error.to_string()),
+            );
+        }
+        Ok(())
+    }
 }
 
 /// Dispatch `nono prune`.
@@ -652,5 +792,280 @@ mod tests {
         let started = (now - chrono::Duration::minutes(5)).to_rfc3339();
         let result = format_uptime(&started);
         assert!(result.ends_with('m'));
+    }
+
+    mod tool_summary {
+        use super::super::*;
+        use crate::audit_integrity::{AuditRecorder, SandboxRuntimeAuditEvent};
+        use crate::test_env::{ENV_LOCK, EnvVarGuard};
+        use crate::tool_sandbox::command_policy_decision::CommandPolicyDecision;
+        use nono::audit::CommandPolicyAuditEvent;
+        use std::path::PathBuf;
+
+        const SESSION_ID: &str = "20260813-120000-4242";
+
+        fn running_session(rollback_session: Option<&str>) -> SessionRecord {
+            SessionRecord {
+                session_id: "abc123".to_string(),
+                name: Some("brave-otter".to_string()),
+                supervisor_pid: 41,
+                child_pid: 42,
+                started: "2026-08-13T12:00:00Z".to_string(),
+                started_epoch: 0,
+                status: SessionStatus::Running,
+                attachment: SessionAttachment::Attached,
+                exit_code: None,
+                command: vec!["claude".to_string()],
+                profile: Some("claude".to_string()),
+                workdir: PathBuf::from("/work"),
+                network: "blocked".to_string(),
+                rollback_session: rollback_session.map(str::to_string),
+            }
+        }
+
+        /// Writes a mediating session's event log where the CLI will look for
+        /// it, without the `session.json` that only finalization writes.
+        fn write_running_audit_session(state: &std::path::Path) {
+            let dir = state.join("nono").join("audit").join(SESSION_ID);
+            std::fs::create_dir_all(&dir).expect("the test owns this temp state dir");
+            let mut recorder = AuditRecorder::new(dir).expect("the directory was just created");
+            recorder
+                .record_sandbox_runtime_event(SandboxRuntimeAuditEvent {
+                    timestamp: "2026-08-13T12:00:00Z".to_string(),
+                    platform: "linux".to_string(),
+                    landlock_abi: Some("v5".to_string()),
+                    landlock_execute_enforced: Some(true),
+                    tool_sandbox_active: true,
+                })
+                .expect("recorder writes to a directory it opened");
+            for decision in [
+                CommandPolicyDecision::Allowed,
+                CommandPolicyDecision::Denied,
+            ] {
+                recorder
+                    .record_command_policy_event(
+                        CommandPolicyAuditEvent {
+                            timestamp: "2026-08-13T12:00:01Z".to_string(),
+                            session_id: Some(SESSION_ID.to_string()),
+                            command: "gh".to_string(),
+                            caller: "session".to_string(),
+                            caller_kind: Some("session".to_string()),
+                            caller_command: None,
+                            caller_pid: Some(41),
+                            shim_pid: Some(42),
+                            session_root_pid: Some(41),
+                            decision: decision.as_str().to_string(),
+                            reason: None,
+                            stdio_mode: "direct_fds".to_string(),
+                            argv_hash: "argv-hash".to_string(),
+                            env_name_hash: "env-hash".to_string(),
+                            cwd_hash: "cwd-hash".to_string(),
+                            argv_display: vec!["gh".to_string()],
+                            env_names_display: Vec::new(),
+                            env_display: Vec::new(),
+                            cwd_display: "/work".to_string(),
+                            exit_code: None,
+                            stdio: None,
+                        },
+                        decision.outcome(),
+                    )
+                    .expect("recorder writes to a directory it opened");
+            }
+        }
+
+        #[test]
+        fn a_running_session_reports_its_decisions_so_far() {
+            let _env_lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let state = tmp.path().join("state");
+            std::fs::create_dir_all(&state).expect("the test owns this temp dir");
+            let home = tmp.path().to_string_lossy().to_string();
+            let state_str = state.to_string_lossy().to_string();
+            let _env = EnvVarGuard::set_all(&[("HOME", &home), ("XDG_STATE_HOME", &state_str)]);
+            write_running_audit_session(&state);
+
+            let line = ToolSummaryView::for_session(&running_session(Some(SESSION_ID)))
+                .render()
+                .expect("a mediating session renders a rollup");
+
+            assert!(line.contains("gh"), "{line}");
+            assert!(line.contains("1 allowed"), "{line}");
+            assert!(line.contains("1 denied"), "{line}");
+            assert!(
+                line.contains("[live]"),
+                "a running session's counts are not final: {line}"
+            );
+        }
+
+        #[test]
+        fn an_exited_session_reports_final_counts() {
+            let _env_lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let state = tmp.path().join("state");
+            std::fs::create_dir_all(&state).expect("the test owns this temp dir");
+            let home = tmp.path().to_string_lossy().to_string();
+            let state_str = state.to_string_lossy().to_string();
+            let _env = EnvVarGuard::set_all(&[("HOME", &home), ("XDG_STATE_HOME", &state_str)]);
+            write_running_audit_session(&state);
+
+            let mut record = running_session(Some(SESSION_ID));
+            record.status = SessionStatus::Exited;
+            record.exit_code = Some(0);
+
+            let line = ToolSummaryView::for_session(&record)
+                .render()
+                .expect("a mediating session renders a rollup");
+
+            assert!(!line.contains("[live]"), "{line}");
+        }
+
+        /// The finalized rollup is authoritative and digest-covered, so an
+        /// exited session's line must come from metadata, not a refold that
+        /// post-finalize log damage could poison.
+        #[test]
+        fn a_finalized_session_reports_the_stored_summary() {
+            let _env_lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let state = tmp.path().join("state");
+            std::fs::create_dir_all(&state).expect("the test owns this temp dir");
+            let home = tmp.path().to_string_lossy().to_string();
+            let state_str = state.to_string_lossy().to_string();
+            let _env = EnvVarGuard::set_all(&[("HOME", &home), ("XDG_STATE_HOME", &state_str)]);
+            write_running_audit_session(&state);
+
+            let dir = state.join("nono").join("audit").join(SESSION_ID);
+            nono::undo::SnapshotManager::write_session_metadata(
+                &dir,
+                &nono::undo::SessionMetadata {
+                    session_id: SESSION_ID.to_string(),
+                    started: "2026-08-13T12:00:00Z".to_string(),
+                    ended: Some("2026-08-13T12:00:02Z".to_string()),
+                    command: vec!["claude".to_string()],
+                    executable_identity: None,
+                    tracked_paths: Vec::new(),
+                    snapshot_count: 0,
+                    exit_code: Some(0),
+                    merkle_roots: Vec::new(),
+                    network_events: Vec::new(),
+                    audit_event_count: 4,
+                    audit_integrity: None,
+                    audit_attestation: None,
+                    command_policy_summary: Some(nono::undo::CommandPolicySummary {
+                        mediation_active: true,
+                        event_count: 3,
+                        invocation_count: 3,
+                        commands: vec![nono::undo::CommandPolicyCommandSummary {
+                            command: "git".to_string(),
+                            allowed: 3,
+                            denied: 0,
+                            other: 0,
+                        }],
+                        truncated: false,
+                    }),
+                },
+            )
+            .expect("the test owns this audit session dir");
+            // Damage the log after finalize: the stored rollup must survive it.
+            std::fs::write(dir.join("audit-events.ndjson"), b"{\"sequence\":0,")
+                .expect("the test owns this audit session dir");
+
+            let mut record = running_session(Some(SESSION_ID));
+            record.status = SessionStatus::Exited;
+            record.exit_code = Some(0);
+
+            let line = ToolSummaryView::for_session(&record)
+                .render()
+                .expect("a finalized mediating session renders its stored rollup");
+
+            assert!(line.contains("git"), "{line}");
+            assert!(line.contains("3 allowed"), "{line}");
+        }
+
+        /// A session killed before finalizing has no stored rollup and may
+        /// have a legitimately torn final record; the decisions recorded
+        /// before the kill must still be reported.
+        #[test]
+        fn a_killed_session_reports_the_decisions_before_the_torn_tail() {
+            let _env_lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let state = tmp.path().join("state");
+            std::fs::create_dir_all(&state).expect("the test owns this temp dir");
+            let home = tmp.path().to_string_lossy().to_string();
+            let state_str = state.to_string_lossy().to_string();
+            let _env = EnvVarGuard::set_all(&[("HOME", &home), ("XDG_STATE_HOME", &state_str)]);
+            write_running_audit_session(&state);
+
+            let log = state
+                .join("nono")
+                .join("audit")
+                .join(SESSION_ID)
+                .join("audit-events.ndjson");
+            let mut contents = std::fs::read(&log).expect("the recorder wrote this log");
+            contents.extend_from_slice(br#"{"sequence":5,"prev_chain":"#);
+            std::fs::write(&log, contents).expect("the test owns this audit session dir");
+
+            let mut record = running_session(Some(SESSION_ID));
+            record.status = SessionStatus::Exited;
+            record.exit_code = Some(-1);
+
+            let line = ToolSummaryView::for_session(&record)
+                .render()
+                .expect("the decisions recorded before the kill are reported");
+
+            assert!(line.contains("1 allowed"), "{line}");
+            assert!(line.contains("1 denied"), "{line}");
+            assert!(line.contains("[the log ends mid-record]"), "{line}");
+            assert!(!line.contains("[live]"), "{line}");
+        }
+
+        #[test]
+        fn a_session_that_mediated_nothing_reports_nothing() {
+            let _env_lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let state = tmp.path().join("state");
+            std::fs::create_dir_all(&state).expect("the test owns this temp dir");
+            let home = tmp.path().to_string_lossy().to_string();
+            let state_str = state.to_string_lossy().to_string();
+            let _env = EnvVarGuard::set_all(&[("HOME", &home), ("XDG_STATE_HOME", &state_str)]);
+
+            assert!(
+                ToolSummaryView::for_session(&running_session(None))
+                    .render()
+                    .is_none()
+            );
+            assert!(
+                ToolSummaryView::for_session(&running_session(Some(SESSION_ID)))
+                    .render()
+                    .is_none(),
+                "a cleaned-up audit session is not an error"
+            );
+        }
+
+        /// An escape resolves to no directory just as cleanup does, so reusing
+        /// cleanup's silence here would report a containment failure as a
+        /// session that mediated nothing.
+        #[test]
+        fn a_session_directory_outside_the_audit_root_is_reported() {
+            let _env_lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let state = tmp.path().join("state");
+            std::fs::create_dir_all(&state).expect("the test owns this temp dir");
+            let home = tmp.path().to_string_lossy().to_string();
+            let state_str = state.to_string_lossy().to_string();
+            let _env = EnvVarGuard::set_all(&[("HOME", &home), ("XDG_STATE_HOME", &state_str)]);
+
+            let outside = tmp.path().join("outside");
+            std::fs::create_dir_all(&outside).expect("the test owns this temp dir");
+            let root = crate::audit_session::audit_root().expect("HOME is set above");
+            std::fs::create_dir_all(&root).expect("the test owns this temp dir");
+            std::os::unix::fs::symlink(&outside, root.join(SESSION_ID))
+                .expect("the test owns this temp dir");
+
+            let line = ToolSummaryView::for_session(&running_session(Some(SESSION_ID)))
+                .render()
+                .expect("a containment failure is reported, not swallowed");
+
+            assert!(line.starts_with("unavailable:"), "{line}");
+        }
     }
 }

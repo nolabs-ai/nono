@@ -178,12 +178,25 @@ It includes:
 - workdir
 - network mode
 - rollback session id, when present
+- mediated tool decisions so far, when the profile mediates commands
 
 For scripts and tooling:
 
 ```bash
 nono inspect a3f7c2 --json
 ```
+
+### Mediated Tools While the Session Runs
+
+Sessions running under [Sandboxed Tool Execution](/cli/features/tool-sandbox) report their allowed and denied counts as they accumulate:
+
+```
+Tools:      gh (3 allowed, 1 denied), git (12 allowed) [live]
+```
+
+The rollup is recomputed from the session's audit event log, which the supervisor appends and flushes on every mediated decision. `[live]` marks a session that can still mediate more commands, so the counts are not final; it is absent once the session has exited. If the log ends mid-record, the line says so and the counts trail the session by that record. Once a session has finalized, `nono inspect` reports the digest-covered rollup stored in `session.json` instead; the event log is refolded for an exited session only when it died before finalizing, where a mid-record tail marks the counts as trailing the kill.
+
+`nono audit list` reports the same rollup from `session.json`, which a session only writes when it finalizes — so `nono inspect` is where a running session's decisions are visible. In `--json`, the same data is `command_policy_summary`, with `command_policy_summary_live` marking a session that can still mediate.
 
 ## Pruning Old Session Records
 

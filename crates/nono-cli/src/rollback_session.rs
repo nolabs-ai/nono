@@ -319,6 +319,7 @@ mod tests {
                 audit_event_count: 0,
                 audit_integrity: None,
                 audit_attestation: None,
+                command_policy_summary: None,
             },
         )
         .expect("write metadata");

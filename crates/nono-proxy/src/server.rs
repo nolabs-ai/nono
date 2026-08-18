@@ -1836,7 +1836,8 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
 ///
 /// Steps:
 /// 1. Enforce `Proxy-Authorization` (same session-token gate as CONNECT /
-///    reverse). On failure: 407 + audit denial, matching the reverse path's
+///    reverse), honouring `require_auth` so `--no-auth` exempts this path too.
+///    On failure: 407 + audit denial, matching the reverse path's
 ///    no-credential branch.
 /// 2. Parse host+port from the absolute URL and run the host filter. On deny:
 ///    403 + `HostDenied` audit event, mirroring the no-routes inline `else`.
@@ -1864,8 +1865,20 @@ async fn handle_forward_http(
 ) -> Result<()> {
     // 1. Proxy-Authorization gate — identical to the reverse-proxy
     //    no-credential branch: 407 on missing/invalid auth, with an audit
-    //    denial recording the authentication failure. No auth bypass.
-    if let Err(e) = token::validate_proxy_auth(header_bytes, &state.session_token) {
+    //    denial recording the authentication failure.
+    //
+    //    Routed through `enforce_proxy_auth` so the `require_auth` toggle is
+    //    honoured here exactly as it is on the CONNECT and reverse paths.
+    //    Without it, `nono proxy --no-auth` still answered plain-HTTP forward
+    //    requests with 407 while accepting CONNECT tunnels, splitting
+    //    behaviour by scheme (see issue #1666: `apt-get` over `http://`
+    //    failed where `apk` over HTTPS succeeded). With auth disabled the
+    //    host filter below remains the authoritative trust boundary.
+    if let Err(e) = token::enforce_proxy_auth(
+        state.config.require_auth,
+        header_bytes,
+        &state.session_token,
+    ) {
         // Parse the target host for the audit record where possible; fall
         // back to a placeholder so a malformed line still audits.
         let (host, port) =
@@ -2398,6 +2411,74 @@ mod tests {
         assert!(
             status.contains("407"),
             "with auth required an unauthenticated reverse request must be challenged, got: {status:?}"
+        );
+        handle.shutdown();
+    }
+
+    /// Send an absolute-form `GET http://{upstream}/` forward-proxy request
+    /// through the proxy at `port` with no `Proxy-Authorization` header, and
+    /// return the status line the proxy wrote back.
+    async fn unauthenticated_forward_request(port: u16, upstream: &str) -> String {
+        let request = format!(
+            "GET http://{upstream}/ HTTP/1.1\r\nHost: {upstream}\r\nUser-Agent: Debian APT-HTTP/1.3\r\n\r\n"
+        );
+        let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        client.write_all(request.as_bytes()).await.unwrap();
+        let mut buf = [0u8; 1024];
+        let n = client.read(&mut buf).await.unwrap_or(0);
+        String::from_utf8_lossy(&buf[..n])
+            .lines()
+            .next()
+            .unwrap_or("")
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn test_no_auth_skips_forward_http_authentication() {
+        // Regression (issue #1666): `nono proxy --no-auth` accepted CONNECT
+        // tunnels without credentials but still answered plain-HTTP forward
+        // requests with 407, because the forward path called
+        // `validate_proxy_auth` directly instead of honouring `require_auth`.
+        // That split behaviour by scheme and broke `apt-get` over `http://`.
+        // The opposite direction (auth required => 407) is locked by
+        // `forward_http_missing_proxy_auth_is_rejected_407`.
+        let upstream = spawn_mock_upstream().await;
+        let config = ProxyConfig {
+            allowed_hosts: vec!["127.0.0.1".to_string()],
+            require_auth: false,
+            ..Default::default()
+        };
+        let handle = start(config).await.unwrap();
+        let status = unauthenticated_forward_request(handle.port, &upstream).await;
+        assert!(
+            status.contains("200"),
+            "with --no-auth an unauthenticated forward request must reach the upstream, got: {status:?}"
+        );
+        assert!(
+            !status.contains("407"),
+            "auth must not be enforced on the forward path when disabled, got: {status:?}"
+        );
+        handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_no_auth_forward_http_still_enforces_host_filter() {
+        // With auth disabled the host filter remains the authoritative trust
+        // boundary: a forward request to a host outside the allowlist must
+        // still be denied (403), not forwarded.
+        let upstream = spawn_mock_upstream().await;
+        let config = ProxyConfig {
+            allowed_hosts: vec!["allowed.invalid".to_string()],
+            require_auth: false,
+            ..Default::default()
+        };
+        let handle = start(config).await.unwrap();
+        let status = unauthenticated_forward_request(handle.port, &upstream).await;
+        assert!(
+            status.contains("403"),
+            "--no-auth must not bypass the host allowlist on the forward path, got: {status:?}"
         );
         handle.shutdown();
     }

@@ -2779,6 +2779,16 @@ fn collect_outer_exec_writable_dirs(
         .fs_capabilities()
         .iter()
         .filter(|cap| !cap.is_file && cap.access.contains(AccessMode::Write))
+        // `/dev/fd` and `/proc/self/fd` are process-relative aliases. Their
+        // canonical paths contain the preparing parent's PID. Reopening that
+        // path in the supervised child is rejected by Yama, and granting
+        // Execute beneath a descriptor directory would be an unsafe bypass of
+        // the per-file outer execution gate even where procfs permits it.
+        .filter(|cap| {
+            cap.original != Path::new("/dev/fd")
+                && cap.original != Path::new("/proc/self/fd")
+                && !cap.resolved.starts_with("/proc")
+        })
         .map(|cap| cap.resolved.clone())
         .filter(|dir| !executable_dirs.contains(dir))
         .collect();
@@ -6502,6 +6512,21 @@ mod tests {
              (exit code {code}; 1=rename EXDEV/denied, 2=apply_landlock failed, \
              3=apply_outer_exec_gate failed)"
         );
+    }
+
+    #[test]
+    fn outer_exec_writable_dirs_exclude_process_relative_descriptor_paths() -> Result<()> {
+        let writable = test_tempdir()?;
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(FsCapability::new_dir("/dev/fd", AccessMode::ReadWrite)?);
+        let writable_cap = FsCapability::new_dir(writable.path(), AccessMode::ReadWrite)?;
+        let writable_path = writable_cap.resolved.clone();
+        caps.add_fs(writable_cap);
+
+        let dirs = collect_outer_exec_writable_dirs(&caps, &[]);
+        assert!(dirs.contains(&writable_path));
+        assert!(!dirs.iter().any(|path| path.starts_with("/proc")));
+        Ok(())
     }
 
     #[test]

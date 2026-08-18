@@ -694,6 +694,7 @@ mod tests {
 
     fn run_args_with_sandbox(sandbox: SandboxArgs) -> RunArgs {
         RunArgs {
+            remote_options: Default::default(),
             sandbox,
             detached: false,
             detach_timeout_secs: None,

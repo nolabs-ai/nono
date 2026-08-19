@@ -1436,7 +1436,11 @@ pub(crate) fn prepare_proxy_launch_options(
         &mut tool_sandbox_base_url_env_vars,
         &mut tool_sandbox_proxy_credentials,
     )?;
-    let allow_bind_ports = merge_dedup_ports(&prepared.listen_ports, &args.allow_bind);
+    let allow_bind_ports = merge_bind_ports_with_ranges(
+        &prepared.listen_ports,
+        &args.allow_bind,
+        &args.allow_bind_range,
+    );
     #[cfg(target_os = "macos")]
     let trust_proxy_ca = args.trust_proxy_ca;
     #[cfg(not(target_os = "macos"))]
@@ -2252,6 +2256,47 @@ pub(crate) fn parse_allow_domain_arg(input: &str) -> crate::profile::AllowDomain
 pub(crate) fn merge_dedup_ports(a: &[u16], b: &[u16]) -> Vec<u16> {
     let mut ports = a.to_vec();
     ports.extend_from_slice(b);
+    ports.sort_unstable();
+    ports.dedup();
+    ports
+}
+
+/// Parse `--open-port-range` / `--listen-port-range` values (`START:END`, inclusive).
+pub(crate) fn parse_port_range_arg(value: &str) -> std::result::Result<(u16, u16), String> {
+    let (start_raw, end_raw) = value.split_once(':').ok_or_else(|| {
+        format!(
+            "invalid port range '{value}': expected inclusive START:END (e.g. 3000:3010)"
+        )
+    })?;
+    let start: u16 = start_raw.parse().map_err(|_| {
+        format!("invalid port range start in '{value}': '{start_raw}' is not a valid port")
+    })?;
+    let end: u16 = end_raw.parse().map_err(|_| {
+        format!("invalid port range end in '{value}': '{end_raw}' is not a valid port")
+    })?;
+    if start == 0 {
+        return Err(format!(
+            "invalid port range '{value}': start port 0 is not allowed in a range; use --open-port 0 on macOS for localhost:*"
+        ));
+    }
+    if start > end {
+        return Err(format!(
+            "invalid port range '{value}': start ({start}) must be <= end ({end})"
+        ));
+    }
+    Ok((start, end))
+}
+
+/// Merge profile/CLI listen ports with optional inclusive bind ranges.
+pub(crate) fn merge_bind_ports_with_ranges(
+    listen_ports: &[u16],
+    allow_bind: &[u16],
+    allow_bind_ranges: &[(u16, u16)],
+) -> Vec<u16> {
+    let mut ports = merge_dedup_ports(listen_ports, allow_bind);
+    for &(start, end) in allow_bind_ranges {
+        ports.extend(start..=end);
+    }
     ports.sort_unstable();
     ports.dedup();
     ports
@@ -3262,6 +3307,29 @@ mod tests {
         assert!(matches!(err, NonoError::SandboxInit(_)));
         assert!(err.to_string().contains("TLS-intercept dir"));
         Ok(())
+    }
+
+    #[test]
+    fn parse_port_range_arg_accepts_inclusive_range() {
+        assert_eq!(parse_port_range_arg("3000:3010").expect("valid"), (3000, 3010));
+    }
+
+    #[test]
+    fn parse_port_range_arg_rejects_zero_start() {
+        assert!(parse_port_range_arg("0:100").is_err());
+    }
+
+    #[test]
+    fn parse_port_range_arg_rejects_inverted_range() {
+        assert!(parse_port_range_arg("3010:3000").is_err());
+    }
+
+    #[test]
+    fn merge_bind_ports_with_ranges_expands_and_dedups() {
+        assert_eq!(
+            merge_bind_ports_with_ranges(&[8080], &[8080, 9000], &[(9100, 9101)]),
+            vec![8080, 9000, 9100, 9101]
+        );
     }
 
     #[test]

@@ -687,9 +687,32 @@ pub(super) enum NetworkDecision {
 ///    no path to check.
 ///
 /// 2. For `AF_INET`/`AF_INET6`:
-///    - `connect()` is allowed only to `127.0.0.1:proxy_port` (the nono proxy).
-///    - `bind()` is allowed on ports in `proxy_bind_ports` or within any range in `proxy_bind_port_ranges`.
-///    - Everything else is denied.
+///    - `connect()`/`sendto()`/`sendmsg()`/`sendmmsg()` to loopback are allowed on
+///      `proxy_port`, `proxy_bind_ports`, or within `proxy_bind_port_ranges`
+///      (mirrors macOS ProxyOnly `open_port` outbound rules; issue #1652).
+///    - `bind()` is allowed on `proxy_bind_ports` or within `proxy_bind_port_ranges`
+///      (loopback only). The proxy listener port is connect-only.
+///    - Non-loopback destinations are denied.
+pub(super) fn is_allowed_loopback_tcp_bind_port(
+    port: u16,
+    config: &SupervisorConfig<'_>,
+) -> bool {
+    if config.proxy_bind_ports.contains(&port) {
+        return true;
+    }
+    config
+        .proxy_bind_port_ranges
+        .iter()
+        .any(|&(start, end)| port >= start && port <= end)
+}
+
+pub(super) fn is_allowed_loopback_tcp_connect_port(
+    port: u16,
+    config: &SupervisorConfig<'_>,
+) -> bool {
+    port == config.proxy_port || is_allowed_loopback_tcp_bind_port(port, config)
+}
+
 pub(super) fn decide_network_notification(
     child_pid: u32,
     syscall: i32,
@@ -736,10 +759,9 @@ pub(super) fn decide_network_notification(
 
     match syscall {
         SYS_CONNECT | SYS_SENDTO | SYS_SENDMSG | SYS_SENDMMSG => {
-            // Allow connect/sendto/sendmsg/sendmmsg only to loopback + proxy port.
             // sendto/sendmsg/sendmmsg with a destination address is semantically
             // equivalent to connect for network reach-out (issue #1089).
-            if sockaddr.is_loopback && sockaddr.port == config.proxy_port {
+            if sockaddr.is_loopback && is_allowed_loopback_tcp_connect_port(sockaddr.port, config) {
                 debug!(
                     "Proxy seccomp: allowing network syscall nr={} to loopback:{}",
                     syscall, sockaddr.port
@@ -755,11 +777,8 @@ pub(super) fn decide_network_notification(
         }
         SYS_BIND => {
             let port = sockaddr.port;
-            let allowed = config.proxy_bind_ports.contains(&port)
-                || config
-                    .proxy_bind_port_ranges
-                    .iter()
-                    .any(|&(s, e)| port >= s && port <= e);
+            let allowed = sockaddr.is_loopback
+                && is_allowed_loopback_tcp_bind_port(port, config);
             if allowed {
                 debug!("Proxy seccomp: allowing bind on port {}", port);
                 NetworkDecision::Allow
@@ -2202,6 +2221,62 @@ mod tests {
             assert_eq!(
                 decide_network_notification(test_pid(), SYS_BIND, &inet_loopback(49201), &config),
                 NetworkDecision::Deny
+            );
+        }
+
+        /// Regression (#1652): open_port localhost IPC must allow connect back to
+        /// declared ports in proxy mode, not only to the proxy listener port.
+        #[test]
+        fn af_inet_connect_to_open_port_localhost_allowed() {
+            let backend = DenyAllBackend;
+            let config = make_config_with_ranges(&backend, 8080, vec![], vec![(8250, 8255)], &[]);
+            for port in [8250u16, 8253, 8255] {
+                assert_eq!(
+                    decide_network_notification(
+                        test_pid(),
+                        SYS_CONNECT,
+                        &inet_loopback(port),
+                        &config,
+                    ),
+                    NetworkDecision::Allow,
+                    "connect to open_port range port {port} must be allowed"
+                );
+            }
+            assert_eq!(
+                decide_network_notification(test_pid(), SYS_CONNECT, &inet_loopback(8249), &config),
+                NetworkDecision::Deny,
+                "connect outside declared range must be denied"
+            );
+        }
+
+        #[test]
+        fn af_inet_connect_to_proxy_bind_port_allowed() {
+            let backend = DenyAllBackend;
+            let config = make_config(&backend, 8080, vec![9000], &[]);
+            assert_eq!(
+                decide_network_notification(test_pid(), SYS_CONNECT, &inet_loopback(9000), &config),
+                NetworkDecision::Allow,
+                "connect to listen_port bind grant must be allowed"
+            );
+            assert_eq!(
+                decide_network_notification(test_pid(), SYS_CONNECT, &inet_loopback(9001), &config),
+                NetworkDecision::Deny
+            );
+        }
+
+        #[test]
+        fn af_inet_connect_to_non_loopback_declared_port_denied() {
+            let backend = DenyAllBackend;
+            let config = make_config_with_ranges(&backend, 8080, vec![], vec![(8250, 8255)], &[]);
+            assert_eq!(
+                decide_network_notification(
+                    test_pid(),
+                    SYS_CONNECT,
+                    &inet_external(8250),
+                    &config,
+                ),
+                NetworkDecision::Deny,
+                "declared ports must not bypass loopback restriction"
             );
         }
 

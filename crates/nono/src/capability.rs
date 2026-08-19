@@ -1647,6 +1647,23 @@ impl CapabilitySet {
         &self.localhost_port_ranges
     }
 
+    /// Single [`localhost_ports`](Self::localhost_ports) entries widened to `(port, port)`
+    /// ranges and merged with [`localhost_port_ranges`](Self::localhost_port_ranges).
+    ///
+    /// Port `0` (macOS-only wildcard) is omitted — it has no defined meaning as a
+    /// range endpoint. Used when expanding localhost IPC grants into per-port
+    /// sandbox rules or seccomp bind/connect allowlists.
+    #[must_use]
+    pub fn merged_localhost_port_ranges(&self) -> Vec<(u16, u16)> {
+        let mut ranges = self.localhost_port_ranges().to_vec();
+        for &port in self.localhost_ports() {
+            if port != 0 {
+                ranges.push((port, port));
+            }
+        }
+        merge_port_ranges(&ranges)
+    }
+
     /// Check if sandbox extensions are enabled for runtime capability expansion
     #[must_use]
     pub fn extensions_enabled(&self) -> bool {
@@ -3077,6 +3094,27 @@ mod tests {
         );
         let mut caps = CapabilitySet::new();
         assert!(caps.add_localhost_port_range(0, 100).is_err());
+    }
+
+    #[test]
+    fn test_merged_localhost_port_ranges_widens_singles_and_merges() {
+        let caps = CapabilitySet::new()
+            .allow_localhost_port(8250)
+            .allow_localhost_port(8251)
+            .allow_localhost_port_range(3000, 3010)
+            .expect("valid range");
+        assert_eq!(
+            caps.merged_localhost_port_ranges(),
+            vec![(3000, 3010), (8250, 8251)]
+        );
+    }
+
+    #[test]
+    fn test_merged_localhost_port_ranges_omits_port_zero() {
+        let caps = CapabilitySet::new()
+            .allow_localhost_port(0)
+            .allow_localhost_port(8080);
+        assert_eq!(caps.merged_localhost_port_ranges(), vec![(8080, 8080)]);
     }
 
     #[test]

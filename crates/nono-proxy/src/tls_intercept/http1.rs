@@ -1,8 +1,9 @@
 //! Strict HTTP/1 head parsing and single-response framing for TLS interception.
 
 use crate::error::{ProxyError, Result};
+use crate::line_reader;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
 const MAX_RESPONSE_BODY: u64 = 16 * 1024 * 1024;
 const RESPONSE_BODY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -188,7 +189,10 @@ where
     let mut total = 0u64;
     loop {
         let mut size_line = String::new();
-        if reader.read_line(&mut size_line).await? == 0 {
+        if line_reader::read_line_limited_string(reader, &mut size_line, line_reader::MAX_LINE_SIZE)
+            .await?
+            == 0
+        {
             return Err(ProxyError::HttpParse(
                 "truncated chunked response".to_string(),
             ));
@@ -216,7 +220,14 @@ where
         }
         loop {
             let mut trailer = String::new();
-            if reader.read_line(&mut trailer).await? == 0 {
+            if line_reader::read_line_limited_string(
+                reader,
+                &mut trailer,
+                line_reader::MAX_LINE_SIZE,
+            )
+            .await?
+                == 0
+            {
                 return Err(ProxyError::HttpParse(
                     "truncated chunked trailers".to_string(),
                 ));

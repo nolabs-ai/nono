@@ -11,8 +11,9 @@ use crate::audit;
 use crate::config::ExternalProxyConfig;
 use crate::error::{ProxyError, Result};
 use crate::filter::ProxyFilter;
+use crate::line_reader;
 use crate::token;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tracing::debug;
 use zeroize::Zeroizing;
@@ -61,15 +62,18 @@ pub async fn connect_via_proxy(
 
     let mut buf_reader = BufReader::new(&mut proxy_stream);
     let mut response_line = String::new();
-    buf_reader
-        .read_line(&mut response_line)
-        .await
-        .map_err(|e| {
-            ProxyError::ExternalProxy(format!(
-                "failed to read response from external proxy: {}",
-                e
-            ))
-        })?;
+    line_reader::read_line_limited_string(
+        &mut buf_reader,
+        &mut response_line,
+        line_reader::MAX_LINE_SIZE,
+    )
+    .await
+    .map_err(|e| {
+        ProxyError::ExternalProxy(format!(
+            "failed to read response from external proxy: {}",
+            e
+        ))
+    })?;
 
     let status = parse_status_code(&response_line)?;
     if status != 200 {
@@ -82,7 +86,13 @@ pub async fn connect_via_proxy(
     // Drain headers up to the empty line.
     loop {
         let mut line = String::new();
-        buf_reader.read_line(&mut line).await.map_err(|e| {
+        line_reader::read_line_limited_string(
+            &mut buf_reader,
+            &mut line,
+            line_reader::MAX_LINE_SIZE,
+        )
+        .await
+        .map_err(|e| {
             ProxyError::ExternalProxy(format!("failed to drain proxy response headers: {}", e))
         })?;
         if line.trim().is_empty() {

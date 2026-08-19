@@ -16,6 +16,7 @@ use crate::error::{ProxyError, Result};
 use crate::external;
 use crate::filter::ProxyFilter;
 use crate::forward::{self, AuditCtx, UpstreamScheme, UpstreamSpec, UpstreamStrategy};
+use crate::line_reader;
 use crate::oauth_capture::OAuthCaptureStore;
 use crate::pool::UpstreamPool;
 use crate::reverse;
@@ -26,7 +27,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
@@ -1372,7 +1373,12 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
     // to prevent data loss (BufReader may read ahead into the body).
     let mut buf_reader = BufReader::new(&mut stream);
     let mut first_line = String::new();
-    buf_reader.read_line(&mut first_line).await?;
+    line_reader::read_line_limited_string(
+        &mut buf_reader,
+        &mut first_line,
+        line_reader::MAX_LINE_SIZE,
+    )
+    .await?;
 
     if first_line.is_empty() {
         return Ok(()); // Client disconnected
@@ -1382,7 +1388,12 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
     let mut header_bytes = Vec::new();
     loop {
         let mut line = String::new();
-        let n = buf_reader.read_line(&mut line).await?;
+        let n = line_reader::read_line_limited_string(
+            &mut buf_reader,
+            &mut line,
+            line_reader::MAX_LINE_SIZE,
+        )
+        .await?;
         if n == 0 || line.trim().is_empty() {
             break;
         }
@@ -1514,14 +1525,24 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
                                     // the same connection.
                                     let mut buf_reader = BufReader::new(&mut stream);
                                     let mut retry_line = String::new();
-                                    buf_reader.read_line(&mut retry_line).await?;
+                                    line_reader::read_line_limited_string(
+                                        &mut buf_reader,
+                                        &mut retry_line,
+                                        line_reader::MAX_LINE_SIZE,
+                                    )
+                                    .await?;
                                     if retry_line.is_empty() {
                                         return Ok(()); // client disconnected
                                     }
                                     let mut retry_headers = Vec::new();
                                     loop {
                                         let mut line = String::new();
-                                        let n = buf_reader.read_line(&mut line).await?;
+                                        let n = line_reader::read_line_limited_string(
+                                            &mut buf_reader,
+                                            &mut line,
+                                            line_reader::MAX_LINE_SIZE,
+                                        )
+                                        .await?;
                                         if n == 0 || line.trim().is_empty() {
                                             break;
                                         }

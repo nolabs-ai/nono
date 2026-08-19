@@ -18,13 +18,14 @@ use crate::credential::CredentialStore;
 use crate::error::{ProxyError, Result};
 use crate::filter::ProxyFilter;
 use crate::forward::{self, AuditCtx, UpstreamScheme, UpstreamSpec, UpstreamStrategy};
+use crate::line_reader;
 use crate::oauth_capture::OAuthCaptureStore;
 use crate::reverse;
 use crate::route::RouteStore;
 use crate::tls_intercept::cert_cache::CertCache;
 use crate::tls_intercept::{acceptor, h2_forward, websocket};
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, warn};
@@ -306,7 +307,12 @@ where
 {
     let mut buf_reader = BufReader::new(&mut *stream);
     let mut first_line = String::new();
-    buf_reader.read_line(&mut first_line).await?;
+    line_reader::read_line_limited_string(
+        &mut buf_reader,
+        &mut first_line,
+        line_reader::MAX_LINE_SIZE,
+    )
+    .await?;
     if first_line.is_empty() {
         return Ok(None);
     }
@@ -314,7 +320,12 @@ where
     let mut header_bytes = Vec::new();
     loop {
         let mut line = String::new();
-        let n = buf_reader.read_line(&mut line).await?;
+        let n = line_reader::read_line_limited_string(
+            &mut buf_reader,
+            &mut line,
+            line_reader::MAX_LINE_SIZE,
+        )
+        .await?;
         if n == 0 || line.trim().is_empty() {
             break;
         }

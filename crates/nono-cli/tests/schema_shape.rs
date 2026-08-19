@@ -1074,6 +1074,8 @@ fn test_schema_security_config_matches_rust_model() {
             "process_info_mode",
             "ipc_mode",
             "capability_elevation",
+            "approval_backends",
+            "approval_defaults",
             "wsl2_proxy_policy",
         ],
     );

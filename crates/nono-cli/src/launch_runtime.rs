@@ -252,6 +252,12 @@ pub(crate) struct ExecutionFlags {
     /// Command binaries already resolved while validating `command_policies`,
     /// reused when building the tool-sandbox plan instead of re-resolving.
     pub(crate) resolved_command_binaries: Option<crate::command_policy::ResolvedCommandBinaries>,
+    /// Named approval backends from the profile `security` section (decoupled
+    /// from `command_policies`). Drives the supervised-mode approval backend.
+    pub(crate) approval_backends:
+        std::collections::BTreeMap<String, crate::command_policy::ApprovalBackendConfig>,
+    /// Default routing for `approval_backends`.
+    pub(crate) approval_defaults: Option<crate::command_policy::ApprovalDefaultsConfig>,
 }
 
 impl ExecutionFlags {
@@ -303,6 +309,8 @@ impl ExecutionFlags {
             startup_timeout_secs: None,
             command_policies: prepared.command_policies.clone(),
             resolved_command_binaries: prepared.resolved_command_binaries.clone(),
+            approval_backends: prepared.approval_backends.clone(),
+            approval_defaults: prepared.approval_defaults.clone(),
         })
     }
 }

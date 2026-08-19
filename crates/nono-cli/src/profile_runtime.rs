@@ -9,6 +9,13 @@ pub(crate) struct PreparedProfile {
     pub(crate) loaded_profile: Option<profile::Profile>,
     pub(crate) command_policies: Option<crate::command_policy::CommandPoliciesConfig>,
     pub(crate) capability_elevation: bool,
+    /// Named approval backends from the profile `security` section (decoupled
+    /// from `command_policies`). Drives the supervised-mode approval backend.
+    pub(crate) approval_backends:
+        std::collections::BTreeMap<String, crate::command_policy::ApprovalBackendConfig>,
+    /// Default routing for `approval_backends` (the backend name for supervised
+    /// approvals).
+    pub(crate) approval_defaults: Option<crate::command_policy::ApprovalDefaultsConfig>,
     #[cfg(target_os = "linux")]
     pub(crate) wsl2_proxy_policy: profile::Wsl2ProxyPolicy,
     #[cfg(target_os = "linux")]
@@ -823,6 +830,13 @@ fn prepare_profile_with_options(
             .as_ref()
             .and_then(|profile| profile.security.capability_elevation)
             .unwrap_or(false),
+        approval_backends: loaded_profile
+            .as_ref()
+            .map(|profile| profile.security.approval_backends.clone())
+            .unwrap_or_default(),
+        approval_defaults: loaded_profile
+            .as_ref()
+            .and_then(|profile| profile.security.approval_defaults.clone()),
         #[cfg(target_os = "linux")]
         wsl2_proxy_policy: loaded_profile
             .as_ref()

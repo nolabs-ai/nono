@@ -20,12 +20,13 @@ use credential_provider::{
 };
 
 use crate::command_policy::{
-    CommandPoliciesConfig, CommandPolicyValidationScope, validate_command_policies,
+    ApprovalBackendConfig, ApprovalDefaultsConfig, CommandPoliciesConfig,
+    CommandPolicyValidationScope, validate_command_policies,
     validate_legacy_blocked_command_interactions,
 };
 use nono::{NonoError, Result};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as DeError};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -2081,6 +2082,21 @@ pub struct SecurityConfig {
     /// the sandbox is static — no seccomp interception, no PTY mux, no prompts.
     #[serde(default)]
     pub capability_elevation: Option<bool>,
+    /// Named approval backends for supervised-mode filesystem/capability traps.
+    ///
+    /// Decoupled from `command_policies` (which triggers tool-sandbox mode): a
+    /// backend configured here routes supervised approval prompts to, e.g., a
+    /// `webhook` WITHOUT forcing the tool-sandbox runtime. Empty (default)
+    /// keeps the interactive terminal prompt. Reuses the same
+    /// [`ApprovalBackendConfig`] shape as `command_policies.approval_backends`.
+    #[serde(default)]
+    pub approval_backends: BTreeMap<String, ApprovalBackendConfig>,
+    /// Default routing for `approval_backends`. `backend` names the entry used
+    /// for supervised approvals. `None` (default) means no override — the
+    /// terminal prompt is used unless `approval_backends` is set, in which case
+    /// a default must be resolvable.
+    #[serde(default)]
+    pub approval_defaults: Option<ApprovalDefaultsConfig>,
     /// WSL2 proxy fallback policy. Controls behavior when ProxyOnly network
     /// mode cannot be kernel-enforced on WSL2 (seccomp notify returns EBUSY).
     /// Default: `error` — refuse to run. Set to `insecure_proxy` to allow
@@ -3561,6 +3577,17 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
                 .security
                 .capability_elevation
                 .or(base.security.capability_elevation),
+            approval_backends: {
+                // Child overrides base by backend name, matching the child-wins
+                // key semantics used for `set_vars`/`credential_providers`.
+                let mut merged = base.security.approval_backends;
+                merged.extend(child.security.approval_backends);
+                merged
+            },
+            approval_defaults: child
+                .security
+                .approval_defaults
+                .or(base.security.approval_defaults),
             wsl2_proxy_policy: child
                 .security
                 .wsl2_proxy_policy
@@ -6627,6 +6654,85 @@ mod tests {
     }
 
     #[test]
+    fn test_merge_profiles_unions_security_approval_backends() {
+        let mut base = base_profile();
+        base.security.approval_backends.insert(
+            "terminal-gate".to_string(),
+            ApprovalBackendConfig {
+                backend_type: crate::command_policy::ApprovalBackendType::Terminal,
+                url: None,
+                timeout_secs: None,
+                mode: None,
+                backends: Vec::new(),
+            },
+        );
+        base.security.approval_defaults = Some(ApprovalDefaultsConfig {
+            backend: Some("terminal-gate".to_string()),
+            timeout_secs: None,
+        });
+
+        let mut child = child_profile();
+        child.security.approval_backends.insert(
+            "webhook-gate".to_string(),
+            ApprovalBackendConfig {
+                backend_type: crate::command_policy::ApprovalBackendType::Webhook,
+                url: Some("https://approval.example".to_string()),
+                timeout_secs: Some(30),
+                mode: None,
+                backends: Vec::new(),
+            },
+        );
+
+        let merged = merge_profiles(base, child);
+        // Both backends survive the union; child adds without dropping base.
+        assert!(
+            merged
+                .security
+                .approval_backends
+                .contains_key("terminal-gate")
+        );
+        assert!(
+            merged
+                .security
+                .approval_backends
+                .contains_key("webhook-gate")
+        );
+        // Child has no defaults, so base's default is inherited (child.or(base)).
+        assert_eq!(
+            merged
+                .security
+                .approval_defaults
+                .and_then(|d| d.backend)
+                .as_deref(),
+            Some("terminal-gate")
+        );
+    }
+
+    #[test]
+    fn test_merge_profiles_child_approval_defaults_win() {
+        let mut base = base_profile();
+        base.security.approval_defaults = Some(ApprovalDefaultsConfig {
+            backend: Some("base-default".to_string()),
+            timeout_secs: None,
+        });
+        let mut child = child_profile();
+        child.security.approval_defaults = Some(ApprovalDefaultsConfig {
+            backend: Some("child-default".to_string()),
+            timeout_secs: None,
+        });
+
+        let merged = merge_profiles(base, child);
+        assert_eq!(
+            merged
+                .security
+                .approval_defaults
+                .and_then(|d| d.backend)
+                .as_deref(),
+            Some("child-default")
+        );
+    }
+
+    #[test]
     fn test_merge_profiles_deduplicates_vecs() {
         let mut base = base_profile();
         let mut child = child_profile();
@@ -8727,6 +8833,46 @@ mod tests {
             .expect("documented tool-sandbox edge policy should pass schema validation");
         serde_json::from_str::<Profile>(json)
             .expect("documented tool-sandbox edge policy should parse as a profile");
+    }
+
+    #[test]
+    fn test_schema_and_parse_security_approval_backend() {
+        // A supervised-mode approval backend configured under `security`
+        // (decoupled from command_policies) parses and passes schema validation.
+        let json = r#"{
+            "meta": { "name": "webhook-approvals" },
+            "security": {
+                "approval_backends": {
+                    "security-review": {
+                        "type": "webhook",
+                        "url": "https://approval.example",
+                        "timeout_secs": 30
+                    }
+                },
+                "approval_defaults": { "backend": "security-review" }
+            }
+        }"#;
+        validate_against_schema(json)
+            .expect("security.approval_backends should pass schema validation");
+        let profile = serde_json::from_str::<Profile>(json)
+            .expect("security.approval_backends should parse as a profile");
+        let backend = profile
+            .security
+            .approval_backends
+            .get("security-review")
+            .expect("configured backend should deserialize");
+        assert_eq!(
+            backend.backend_type,
+            crate::command_policy::ApprovalBackendType::Webhook
+        );
+        assert_eq!(
+            profile
+                .security
+                .approval_defaults
+                .and_then(|d| d.backend)
+                .as_deref(),
+            Some("security-review")
+        );
     }
 
     #[test]

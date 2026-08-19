@@ -484,6 +484,12 @@ pub(crate) struct PreparedSandbox {
     /// Reused by the tool-sandbox plan build so every controlled binary is
     /// only read and hashed once per invocation, not twice.
     pub(crate) resolved_command_binaries: Option<crate::command_policy::ResolvedCommandBinaries>,
+    /// Named approval backends from the profile `security` section, decoupled
+    /// from `command_policies`. Drives the supervised-mode approval backend.
+    pub(crate) approval_backends:
+        std::collections::BTreeMap<String, crate::command_policy::ApprovalBackendConfig>,
+    /// Default routing for `approval_backends`.
+    pub(crate) approval_defaults: Option<crate::command_policy::ApprovalDefaultsConfig>,
     pub(crate) session_hooks: profile::SessionHooks,
     pub(crate) rollback_exclude_patterns: Vec<String>,
     pub(crate) rollback_exclude_globs: Vec<String>,
@@ -1409,6 +1415,8 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
                 profile_display_name: None,
                 command_policies: None,
                 resolved_command_binaries: None,
+                approval_backends: std::collections::BTreeMap::new(),
+                approval_defaults: None,
                 session_hooks: profile::SessionHooks::default(),
                 rollback_exclude_patterns,
                 rollback_exclude_globs,
@@ -1460,6 +1468,8 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         mut loaded_profile,
         mut command_policies,
         capability_elevation,
+        approval_backends: profile_approval_backends,
+        approval_defaults: profile_approval_defaults,
         #[cfg(target_os = "linux")]
         wsl2_proxy_policy,
         #[cfg(target_os = "linux")]
@@ -1775,6 +1785,8 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
             profile_display_name,
             command_policies,
             resolved_command_binaries: profile_resolved_command_binaries,
+            approval_backends: profile_approval_backends,
+            approval_defaults: profile_approval_defaults,
             session_hooks,
             rollback_exclude_patterns: profile_rollback_patterns,
             rollback_exclude_globs: profile_rollback_globs,
@@ -2557,6 +2569,8 @@ mod tests {
             profile_display_name: None,
             command_policies: None,
             resolved_command_binaries: None,
+            approval_backends: std::collections::BTreeMap::new(),
+            approval_defaults: None,
             session_hooks: profile::SessionHooks::default(),
             rollback_exclude_patterns: Vec::new(),
             rollback_exclude_globs: Vec::new(),

@@ -36,6 +36,10 @@ pub(crate) struct SupervisedRuntimeContext<'a> {
     pub(crate) executable_identity: Option<&'a ExecutableIdentity>,
     pub(crate) audit_signer: Option<&'a AuditSigner>,
     pub(crate) redaction_policy: &'a nono::ScrubPolicy,
+    /// Approval backend for supervised-mode filesystem/capability traps,
+    /// resolved from the profile `security.approval_backends`. `None` falls
+    /// back to the interactive terminal prompt (no behavior change).
+    pub(crate) approval_backend: Option<Arc<dyn nono::ApprovalBackend>>,
     pub(crate) silent: bool,
 }
 
@@ -216,6 +220,7 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
         executable_identity,
         audit_signer,
         redaction_policy,
+        approval_backend: configured_approval_backend,
         silent,
     } = ctx;
 
@@ -308,11 +313,22 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
     }
 
     let protected_roots = protected_paths::ProtectedRoots::from_defaults()?;
-    let approval_backend = terminal_approval::TerminalApproval;
+    // Select the supervised-mode approval backend. A backend configured under
+    // the profile `security.approval_backends` (e.g. a `webhook`) takes over the
+    // filesystem/capability approval traps; with nothing configured we fall back
+    // to the interactive terminal prompt (unchanged behavior). Both are bound to
+    // locals that outlive `supervisor_cfg` so the `&dyn ApprovalBackend` it holds
+    // stays valid for the whole supervised run.
+    let terminal_approval_fallback = terminal_approval::TerminalApproval;
+    let approval_backend: &dyn nono::ApprovalBackend = match configured_approval_backend.as_deref()
+    {
+        Some(backend) => backend,
+        None => &terminal_approval_fallback,
+    };
     let supervisor_session_id = build_supervisor_session_id(audit_state.as_ref());
     let supervisor_cfg = exec_strategy::SupervisorConfig {
         protected_roots: protected_roots.as_paths(),
-        approval_backend: &approval_backend,
+        approval_backend,
         session_id: &supervisor_session_id,
         attach_initial_client: !session.detached_start,
         detach_sequence: session.detach_sequence.as_deref(),

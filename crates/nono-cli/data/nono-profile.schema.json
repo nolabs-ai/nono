@@ -630,6 +630,18 @@
           ],
           "description": "Enable runtime capability elevation via seccomp-notify (Linux). When true, the supervisor intercepts file opens and can grant access to paths not in the initial capability set. When false, the sandbox is static."
         },
+        "approval_backends": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/ApprovalBackendConfig" },
+          "description": "Named approval backends for supervised-mode filesystem/capability traps. Decoupled from command_policies (does not activate tool-sandbox): a configured backend (e.g. a webhook) routes supervised approval prompts. Empty keeps the interactive terminal prompt."
+        },
+        "approval_defaults": {
+          "oneOf": [
+            { "$ref": "#/$defs/ApprovalDefaultsConfig" },
+            { "type": "null" }
+          ],
+          "description": "Default routing for security.approval_backends. The backend name selects the entry used for supervised approvals; when null the terminal prompt is used unless approval_backends is set, in which case a default must resolve."
+        },
         "wsl2_proxy_policy": {
           "oneOf": [
             { "$ref": "#/$defs/Wsl2ProxyPolicy" },

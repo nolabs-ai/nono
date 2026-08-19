@@ -734,6 +734,18 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
                 .iter()
                 .map(|arg| arg.to_string_lossy().into_owned())
                 .collect();
+            // Resolve the supervised-mode approval backend from the profile
+            // `security` section (decoupled from `command_policies`). Fails
+            // closed: if backends are configured but the default can't be built
+            // or resolved, this is a hard error rather than a silent fallback to
+            // the terminal prompt. `None` (nothing configured) keeps the prompt.
+            let approval_backend = crate::approval_runtime::resolve_supervised_approval_backend(
+                &flags.approval_backends,
+                flags
+                    .approval_defaults
+                    .as_ref()
+                    .and_then(|d| d.backend.clone()),
+            )?;
             let exit_result = execute_supervised_runtime(SupervisedRuntimeContext {
                 config: &config,
                 caps: &caps,
@@ -746,6 +758,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
                 executable_identity: executable_identity.as_ref(),
                 audit_signer: audit_signer.as_ref(),
                 redaction_policy: &flags.redaction_policy,
+                approval_backend,
                 silent: flags.silent,
             });
 

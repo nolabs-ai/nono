@@ -20,37 +20,70 @@ pub(crate) fn build_proxy_approval_registry(
         return Ok(None);
     }
 
-    let backends = build_approval_backends(config)?;
-    Ok(Some(nono_proxy::approval::ApprovalBackendRegistry::new(
+    Ok(Some(build_approval_registry_from(
+        &config.approval_backends,
         config.approval_defaults.backend.clone(),
-        backends,
-    )))
+    )?))
 }
 
 pub(crate) fn build_approval_registry(
     config: &CommandPoliciesConfig,
 ) -> Result<nono_proxy::approval::ApprovalBackendRegistry> {
-    let backends = build_approval_backends(config)?;
-    Ok(nono_proxy::approval::ApprovalBackendRegistry::new(
+    build_approval_registry_from(
+        &config.approval_backends,
         config.approval_defaults.backend.clone(),
-        backends,
+    )
+}
+
+/// Build an approval registry from a raw backend map and an optional default
+/// backend name. Shared by the `command_policies` path and the profile
+/// `security.approval_backends` path so both surfaces resolve backends through
+/// the same builder (including chain-cycle detection and webhook construction).
+pub(crate) fn build_approval_registry_from(
+    backends: &BTreeMap<String, ApprovalBackendConfig>,
+    default_backend_name: Option<String>,
+) -> Result<nono_proxy::approval::ApprovalBackendRegistry> {
+    let built = build_approval_backends_from(backends)?;
+    Ok(nono_proxy::approval::ApprovalBackendRegistry::new(
+        default_backend_name,
+        built,
     ))
 }
 
-fn build_approval_backends(
-    config: &CommandPoliciesConfig,
+/// Resolve the approval backend used for supervised-mode filesystem/capability
+/// traps from the profile `security` section.
+///
+/// Returns `Ok(None)` when no backends are configured, so the caller falls back
+/// to the interactive terminal prompt (no behavior change for existing users).
+/// When backends ARE configured, any failure to build or resolve the default
+/// backend is a hard error — never a silent fallback to the less-supervised
+/// terminal prompt.
+pub(crate) fn resolve_supervised_approval_backend(
+    backends: &BTreeMap<String, ApprovalBackendConfig>,
+    default_backend_name: Option<String>,
+) -> Result<Option<Arc<dyn ApprovalBackend>>> {
+    if backends.is_empty() {
+        return Ok(None);
+    }
+    let registry = build_approval_registry_from(backends, default_backend_name)?;
+    let (_name, backend) = registry.resolve(None)?;
+    Ok(Some(backend))
+}
+
+fn build_approval_backends_from(
+    backends: &BTreeMap<String, ApprovalBackendConfig>,
 ) -> Result<BTreeMap<String, Arc<dyn ApprovalBackend>>> {
     let mut built = BTreeMap::new();
     let mut visiting = BTreeSet::new();
-    for name in config.approval_backends.keys() {
-        build_approval_backend(name, config, &mut built, &mut visiting)?;
+    for name in backends.keys() {
+        build_approval_backend(name, backends, &mut built, &mut visiting)?;
     }
     Ok(built)
 }
 
 fn build_approval_backend(
     name: &str,
-    config: &CommandPoliciesConfig,
+    backends: &BTreeMap<String, ApprovalBackendConfig>,
     built: &mut BTreeMap<String, Arc<dyn ApprovalBackend>>,
     visiting: &mut BTreeSet<String>,
 ) -> Result<Arc<dyn ApprovalBackend>> {
@@ -63,8 +96,7 @@ fn build_approval_backend(
         )));
     }
 
-    let backend_config = config
-        .approval_backends
+    let backend_config = backends
         .get(name)
         .ok_or_else(|| NonoError::ConfigParse(format!("unknown approval backend '{name}'")))?;
     let backend: Arc<dyn ApprovalBackend> = match backend_config.backend_type {
@@ -78,7 +110,7 @@ fn build_approval_backend(
             })?;
             let mut children = Vec::with_capacity(backend_config.backends.len());
             for child in &backend_config.backends {
-                children.push(build_approval_backend(child, config, built, visiting)?);
+                children.push(build_approval_backend(child, backends, built, visiting)?);
             }
             Arc::new(ChainApproval {
                 name: name.to_string(),
@@ -384,6 +416,83 @@ mod tests {
         };
 
         assert!(chain.request_approval(&request()).unwrap().is_granted());
+    }
+
+    #[test]
+    fn supervised_backend_resolves_configured_webhook() {
+        let mut backends = BTreeMap::new();
+        backends.insert(
+            "security-review".to_string(),
+            ApprovalBackendConfig {
+                backend_type: ApprovalBackendType::Webhook,
+                url: Some("https://approval.example".to_string()),
+                timeout_secs: Some(5),
+                mode: None,
+                backends: Vec::new(),
+            },
+        );
+
+        let resolved =
+            resolve_supervised_approval_backend(&backends, Some("security-review".to_string()))
+                .unwrap();
+        match resolved {
+            Some(backend) => assert_eq!(backend.backend_name(), "security-review"),
+            None => panic!("configured backend should resolve to Some"),
+        }
+    }
+
+    #[test]
+    fn supervised_backend_resolves_single_backend_without_explicit_default() {
+        let mut backends = BTreeMap::new();
+        backends.insert(
+            "gate".to_string(),
+            ApprovalBackendConfig {
+                backend_type: ApprovalBackendType::Terminal,
+                url: None,
+                timeout_secs: None,
+                mode: None,
+                backends: Vec::new(),
+            },
+        );
+
+        // No default name given, but the registry default must be present for a
+        // supervised resolve to succeed — a lone backend is not auto-selected,
+        // so resolve(None) fails closed rather than guess. `Ok(Option<Arc<dyn
+        // ApprovalBackend>>)` is not `Debug`, so assert on the `Err` arm directly.
+        match resolve_supervised_approval_backend(&backends, None) {
+            Ok(_) => panic!("a lone backend without a default must fail closed"),
+            Err(err) => assert!(err.to_string().contains("missing approval backend")),
+        }
+    }
+
+    #[test]
+    fn supervised_backend_none_when_unconfigured() {
+        let backends = BTreeMap::new();
+        let resolved = resolve_supervised_approval_backend(&backends, None).unwrap();
+        assert!(
+            resolved.is_none(),
+            "no configured backends must fall back to terminal (None)"
+        );
+    }
+
+    #[test]
+    fn supervised_backend_unknown_default_is_hard_error() {
+        let mut backends = BTreeMap::new();
+        backends.insert(
+            "gate".to_string(),
+            ApprovalBackendConfig {
+                backend_type: ApprovalBackendType::Terminal,
+                url: None,
+                timeout_secs: None,
+                mode: None,
+                backends: Vec::new(),
+            },
+        );
+
+        match resolve_supervised_approval_backend(&backends, Some("missing".to_string())) {
+            Ok(_) => panic!("an unknown default backend must be a hard error"),
+            Err(err) => assert!(err.to_string().contains("unknown approval backend")),
+        }
     }
 
     #[test]

@@ -3015,11 +3015,13 @@ fn load_registry_profile(name_or_path: &str, cli_extends: &[String]) -> Result<P
         })?;
 
     if !manifest.has_profile_artifact() {
+        let key = package_ref.key();
+        let pull_ref = crate::package_status::canonicalize_legacy_pack_ref(&key)
+            .unwrap_or_else(|| key.clone());
         return Err(NonoError::ProfileParse(format!(
             "pack '{}' has no profile artifact and cannot be used with --profile.\n\
              Use 'nono pull {}' to install it instead.",
-            package_ref.key(),
-            package_ref.key()
+            key, pull_ref
         )));
     }
 

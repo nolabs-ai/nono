@@ -113,8 +113,22 @@ pub struct ProxyConfig {
     /// The sandboxed process never receives this path. It only sees phantom
     /// tokens in provider-owned credential files; the proxy uses this file to
     /// resolve those phantoms in later nono sessions.
+    ///
+    /// On macOS this doubles as the "persistence enabled" signal; the actual
+    /// backend is chosen by [`Self::oauth_capture_store_backend`]. On other
+    /// platforms it is always the file that is read and written.
     #[serde(default, skip)]
     pub oauth_capture_store_path: Option<PathBuf>,
+
+    /// Which persistence backend the OAuth capture store uses.
+    ///
+    /// Defaults to [`OAuthCaptureStoreBackend::Auto`], which resolves to the
+    /// ACL-restricted macOS Keychain on macOS and the file backend elsewhere.
+    /// An operator can force [`OAuthCaptureStoreBackend::File`] to keep the
+    /// plaintext `providers.json` behaviour on macOS as well (e.g. for
+    /// headless/SSH hosts where the login keychain is not unlocked).
+    #[serde(default)]
+    pub oauth_capture_store_backend: OAuthCaptureStoreBackend,
 
     /// External (enterprise) proxy URL for passthrough mode.
     /// When set, CONNECT requests are chained to this proxy.
@@ -250,6 +264,7 @@ impl Default for ProxyConfig {
             routes: Vec::new(),
             oauth_capture: Vec::new(),
             oauth_capture_store_path: None,
+            oauth_capture_store_backend: OAuthCaptureStoreBackend::default(),
             external_proxy: None,
             direct_connect_ports: Vec::new(),
             no_proxy: Vec::new(),
@@ -276,6 +291,34 @@ pub fn default_intercept_ca_env_vars() -> Vec<String> {
     .into_iter()
     .map(str::to_string)
     .collect()
+}
+
+/// Keychain account name for the OAuth-capture phantom-token store on macOS.
+///
+/// Single source of truth shared by the Keychain backend (which creates the
+/// item under this account) and nono-cli's derived `security` mediation (which
+/// refuses subprocess reads of this account). Keeping both sides on one
+/// constant guarantees the deny rule and the ACL entry can never name
+/// different items.
+pub const OAUTH_CAPTURE_STORE_ACCOUNT: &str = "oauth_capture_store";
+
+/// Persistence backend for the OAuth capture phantom-token store.
+///
+/// `Auto` picks the platform default (ACL-restricted Keychain on macOS, file
+/// elsewhere). `File` forces the plaintext `providers.json` file backend on
+/// every platform, including macOS, for operators who do not want the store in
+/// the login keychain. `Keychain` forces the Keychain backend and is honoured
+/// only on macOS; on other platforms it resolves to the file backend.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OAuthCaptureStoreBackend {
+    /// Platform default: Keychain on macOS, file elsewhere.
+    #[default]
+    Auto,
+    /// Force the plaintext file backend on every platform.
+    File,
+    /// Force the macOS Keychain backend (file backend on non-macOS).
+    Keychain,
 }
 
 /// Declarative OAuth capture provider configuration.

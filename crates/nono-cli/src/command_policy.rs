@@ -698,6 +698,128 @@ pub(crate) fn has_explicit_self_invocation_entry(
     })
 }
 
+/// The command whose subprocess reads of the OAuth-capture Keychain item the
+/// derived mediation refuses.
+const OAUTH_CAPTURE_SECURITY_COMMAND: &str = "security";
+
+/// Derive the `security` mediation that refuses subprocess reads of the
+/// OAuth-capture Keychain item, so enabling OAuth capture can never leave the
+/// item readable by a bare `security find-generic-password` from inside the
+/// sandbox.
+///
+/// `keychain_active` is `true` only when the Keychain backend is actually in
+/// use (macOS + at least one `oauth_capture` provider + backend not forced to
+/// `file`); the caller computes it.
+///
+/// This mediation only exists for profiles that already run the tool-sandbox
+/// subsystem (i.e. `command_policies.is_active()` is already `true` from the
+/// profile's own configuration). A profile that has never opted into
+/// tool-sandboxing has no mediation of subprocess `security` calls at all
+/// today, mediated or otherwise, so there is nothing to derive: synthesizing
+/// a `commands.security` entry purely to add this protection would itself
+/// flip `is_active()` to `true` and start blocking every other unconfigured
+/// command the agent tries to run — a much bigger behavior change than
+/// "protect this one Keychain item". In that case the entry's `SecAccess` ACL
+/// (see `keychain_persist.rs`) remains the sole protection layer: a
+/// `security` subprocess not in the ACL still triggers a visible Allow/Deny
+/// dialog rather than a silent read.
+///
+/// When tool-sandboxing IS already active, the resolved profile MUST define a
+/// `security` command policy with a session sandbox — a mediated command with
+/// no session sandbox is unreachable by the agent, which would break *every*
+/// `security` call, not just the refused account read. Rather than silently
+/// break `security` or guess a sandbox for it, this fails closed with an
+/// actionable error (opt out with `oauth_capture_store_backend = "file"`).
+///
+/// On success it prepends a first-match intercept rule that returns empty
+/// output for reads of the `oauth_capture_store` account, leaving all other
+/// `security` invocations to pass through. Idempotent.
+pub(crate) fn derive_oauth_capture_security_mediation(
+    command_policies: &mut Option<CommandPoliciesConfig>,
+    keychain_active: bool,
+) -> nono::Result<()> {
+    if !keychain_active {
+        return Ok(());
+    }
+
+    if !command_policies
+        .as_ref()
+        .is_some_and(CommandPoliciesConfig::is_active)
+    {
+        return Ok(());
+    }
+
+    let account = nono_proxy::config::OAUTH_CAPTURE_STORE_ACCOUNT;
+    let missing = || {
+        nono::NonoError::ProfileParse(format!(
+            "profile enables OAuth-capture Keychain persistence on macOS but does not define a \
+             command_policies.commands.\"{OAUTH_CAPTURE_SECURITY_COMMAND}\" policy with a session \
+             sandbox. Define command_policies.commands.\"{OAUTH_CAPTURE_SECURITY_COMMAND}\".sandbox \
+             (or .from.session) so the agent's other `security` calls keep working while reads of \
+             account '{account}' are refused, or set oauth_capture_store_backend = \"file\" to opt \
+             out of the Keychain backend."
+        ))
+    };
+
+    let security = command_policies
+        .as_mut()
+        .and_then(|policies| policies.commands.get_mut(OAUTH_CAPTURE_SECURITY_COMMAND))
+        .ok_or_else(missing)?;
+
+    // A mediated command needs a session sandbox (its own `sandbox` or a
+    // `from.session` edge) or the agent cannot invoke it at all.
+    if security.sandbox.is_none() && !security.from.contains_key("session") {
+        return Err(missing());
+    }
+
+    // Mediate any `security` invocation that could reach the OAuth-capture
+    // item, matching on EITHER selector the `security` CLI accepts to resolve
+    // it:
+    //   security find-generic-password   -a oauth_capture_store ...
+    //   security delete-generic-password -a oauth_capture_store ...
+    //   security find-generic-password   -s nono -w              (no -a!)
+    //
+    // Matching only `-a oauth_capture_store` was bypassable: the item also
+    // resolves by its service name, so a child running `-s nono -w` (omitting
+    // `-a` entirely) slipped past the mediation and triggered the item's ACL
+    // Allow/Deny dialog — a social-engineering vector. `contains` is an AND
+    // over argv tokens and cannot express OR, so we install one rule per
+    // selector; each returns empty output WITHOUT executing the real command,
+    // so reads and deletes targeting service `nono` or account
+    // `oauth_capture_store` are all neutralised.
+    let service = nono::keystore::DEFAULT_SERVICE;
+    let respond_empty_rule = |tokens: Vec<String>| InterceptRuleConfig {
+        args: None,
+        match_config: Some(InterceptRuleMatchConfig {
+            argv: Some(ArgvMatcherConfig {
+                exact: None,
+                prefix: None,
+                contains: Some(tokens),
+            }),
+            env: BTreeMap::new(),
+        }),
+        action: InterceptActionConfig::Respond {
+            stdout: String::new(),
+        },
+        sandbox: None,
+    };
+    let rules = [
+        respond_empty_rule(vec!["-a".to_string(), account.to_string()]),
+        respond_empty_rule(vec!["-s".to_string(), service.to_string()]),
+    ];
+
+    // Prepend so they win over any existing catch-all; skip any already present
+    // so repeated resolution stays idempotent. Insert in reverse so the final
+    // front-of-list order matches `rules`.
+    for rule in rules.into_iter().rev() {
+        if !security.intercept.contains(&rule) {
+            security.intercept.insert(0, rule);
+        }
+    }
+
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum CommandFromConfig {
@@ -3396,6 +3518,125 @@ mod tests {
             commands,
             ..Default::default()
         }
+    }
+
+    fn security_policies_with_session_sandbox() -> CommandPoliciesConfig {
+        let mut commands = BTreeMap::new();
+        commands.insert(
+            "security".to_string(),
+            CommandPolicyConfig {
+                sandbox: Some(CommandSandboxConfig::default()),
+                ..Default::default()
+            },
+        );
+        CommandPoliciesConfig {
+            commands,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn derive_security_mediation_is_noop_when_inactive() {
+        let mut policies = None;
+        derive_oauth_capture_security_mediation(&mut policies, false).expect("inactive is ok");
+        assert!(policies.is_none(), "inactive must not synthesize policy");
+    }
+
+    #[test]
+    fn derive_security_mediation_is_noop_when_tool_sandbox_inactive() {
+        // Tool-sandboxing was never opted into (empty `commands`), so there is
+        // nothing to mediate — synthesizing a `security` entry here would
+        // itself activate the whole subsystem and start blocking every other
+        // unconfigured command.
+        let mut policies = Some(CommandPoliciesConfig::default());
+        derive_oauth_capture_security_mediation(&mut policies, true)
+            .expect("inactive tool-sandbox must not fail closed");
+        assert_eq!(
+            policies,
+            Some(CommandPoliciesConfig::default()),
+            "inactive tool-sandbox must not synthesize a security policy"
+        );
+    }
+
+    #[test]
+    fn derive_security_mediation_fails_closed_when_active_without_security_policy() {
+        // Tool-sandboxing is already active (via `git`), so the profile is
+        // already sandboxing subprocesses; a missing `security` policy in
+        // that case is an actionable misconfiguration, not something to
+        // silently skip.
+        let mut policies = Some(active_git_config());
+        let err = derive_oauth_capture_security_mediation(&mut policies, true)
+            .expect_err("no security policy must fail closed when tool-sandbox is active");
+        assert!(err.to_string().contains("oauth_capture_store"));
+    }
+
+    #[test]
+    fn derive_security_mediation_fails_closed_without_session_sandbox() {
+        let mut commands = BTreeMap::new();
+        commands.insert("security".to_string(), CommandPolicyConfig::default());
+        let mut policies = Some(CommandPoliciesConfig {
+            commands,
+            ..Default::default()
+        });
+        derive_oauth_capture_security_mediation(&mut policies, true)
+            .expect_err("security without a session sandbox must fail closed");
+    }
+
+    #[test]
+    fn derive_security_mediation_prepends_rules_and_is_idempotent() {
+        let mut policies = Some(security_policies_with_session_sandbox());
+
+        derive_oauth_capture_security_mediation(&mut policies, true).expect("first derive ok");
+        derive_oauth_capture_security_mediation(&mut policies, true).expect("second derive ok");
+
+        let security = policies
+            .as_ref()
+            .and_then(|p| p.commands.get("security"))
+            .expect("security entry");
+
+        // Both selector rules are injected exactly once (idempotent across
+        // repeated resolution), and every rule responds with empty output
+        // without executing the real `security` command.
+        assert_eq!(
+            security.intercept.len(),
+            2,
+            "both selector rules must be injected exactly once"
+        );
+        let contains_sets: Vec<&Vec<String>> = security
+            .intercept
+            .iter()
+            .map(|rule| {
+                assert!(
+                    matches!(
+                        rule.action,
+                        InterceptActionConfig::Respond { ref stdout } if stdout.is_empty()
+                    ),
+                    "mediation rule must respond with empty output"
+                );
+                rule.match_config
+                    .as_ref()
+                    .and_then(|m| m.argv.as_ref())
+                    .and_then(|a| a.contains.as_ref())
+                    .expect("argv.contains matcher")
+            })
+            .collect();
+
+        let account = nono_proxy::config::OAUTH_CAPTURE_STORE_ACCOUNT.to_string();
+        let service = nono::keystore::DEFAULT_SERVICE.to_string();
+        let account_rule = vec!["-a".to_string(), account];
+        let service_rule = vec!["-s".to_string(), service];
+
+        assert!(
+            contains_sets.contains(&&account_rule),
+            "must mediate reads/deletes selected by account (-a oauth_capture_store)"
+        );
+        // Regression guard for the bypass: `security find-generic-password -s
+        // nono -w` omits `-a` entirely but still resolves the item by service
+        // name, so the service selector MUST be mediated too.
+        assert!(
+            contains_sets.contains(&&service_rule),
+            "must mediate reads/deletes selected by service (-s nono), closing the -a bypass"
+        );
     }
 
     fn write_executable(path: &Path, contents: &[u8]) {

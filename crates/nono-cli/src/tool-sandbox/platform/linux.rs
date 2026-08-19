@@ -5189,9 +5189,10 @@ thread_local! {
     /// launch latency. Canonicalization is a pure function of the (read-only,
     /// during prep) filesystem, so caching is safe within a pass.
     static ELF_CANON_CACHE: RefCell<HashMap<PathBuf, PathBuf>> = RefCell::new(HashMap::new());
-    /// Memoizes shared-library name resolution, keyed by `(soname, search_dirs)`
-    /// — the only inputs that determine the result.
-    static ELF_LIB_CACHE: RefCell<HashMap<(String, Vec<String>), PathBuf>> =
+    /// Memoizes shared-library name resolution, keyed by
+    /// `(soname, search_dirs, interpreter_dir)` — the only inputs that
+    /// determine the result.
+    static ELF_LIB_CACHE: RefCell<HashMap<(String, Vec<String>, Option<PathBuf>), PathBuf>> =
         RefCell::new(HashMap::new());
     /// Memoizes `parse_elf` (which reads the whole file) keyed by canonical path,
     /// so each shared object is read+parsed once per pass rather than once per
@@ -5250,12 +5251,49 @@ fn cached_file_id(canonical: &Path) -> Result<FileId> {
 fn elf_dependency_closure(binary: &Path) -> Result<Vec<PathBuf>> {
     let mut seen = HashSet::new();
     let mut result = Vec::new();
-    resolve_elf_recursive(binary, &mut seen, &mut result)?;
+    let interpreter_dir = interpreter_dir_of(binary)?;
+    resolve_elf_recursive(binary, interpreter_dir.as_deref(), &mut seen, &mut result)?;
     Ok(result)
 }
 
+/// Directory containing `binary`'s own ELF interpreter (`PT_INTERP`), if any.
+///
+/// A dynamic linker built by Nix (`ld-linux-x86-64.so.2` under a specific
+/// `glibc` store path) resolves `NEEDED` entries that carry no
+/// `DT_RPATH`/`DT_RUNPATH` of their own — e.g. `libgcc_s.so.1` depending on
+/// `libc.so.6` — by falling back to its own compiled-in default search path,
+/// which is the directory it itself lives in. Threading that directory
+/// through as an extra fallback mirrors what the real dynamic linker does at
+/// runtime, without hard-coding anything Nix-specific: on FHS systems it is
+/// already covered by the standard defaults below.
+///
+/// Verified directly: on a NixOS system, `libgcc_s.so.1` (from the
+/// `gcc-*-libgcc` package) carries an empty `DT_RUNPATH` and needs
+/// `libc.so.6` by bare soname; `ldd` still resolves it, via the interpreter
+/// named in the requesting binary's own `PT_INTERP`
+/// (`<glibc>/lib/ld-linux-x86-64.so.2`), to `libc.so.6` sitting right next to
+/// that same interpreter in `<glibc>/lib`.
+fn interpreter_dir_of(binary: &Path) -> Result<Option<PathBuf>> {
+    let canonical = cached_canonicalize(binary)?;
+    let parsed = parse_elf_cached(&canonical)?;
+    // `parsed.interpreter` is already canonicalized by `read_cstr_path`.
+    Ok(parsed
+        .interpreter
+        .and_then(|i| i.parent().map(Path::to_path_buf)))
+}
+
+/// Recursively walks `path`'s ELF dependency graph into `result`.
+///
+/// `interpreter_dir` is fixed for the whole closure — it comes from the
+/// top-level binary's own `PT_INTERP` (see [`interpreter_dir_of`]) and must
+/// be threaded through unchanged at every recursion depth, not recomputed
+/// per nested file: a real process has exactly one dynamic linker instance,
+/// so its default search path fallback applies uniformly to every
+/// transitively `NEEDED` library, not just the top-level binary's direct
+/// dependencies.
 fn resolve_elf_recursive(
     path: &Path,
+    interpreter_dir: Option<&Path>,
     seen: &mut HashSet<FileId>,
     result: &mut Vec<PathBuf>,
 ) -> Result<()> {
@@ -5266,11 +5304,12 @@ fn resolve_elf_recursive(
     result.push(canonical.clone());
     let parsed = parse_elf_cached(&canonical)?;
     if let Some(interpreter) = parsed.interpreter {
-        resolve_elf_recursive(&interpreter, seen, result)?;
+        resolve_elf_recursive(&interpreter, interpreter_dir, seen, result)?;
     }
     for needed in parsed.needed {
-        let dep = resolve_shared_library(&needed, &parsed.search_dirs, &canonical)?;
-        resolve_elf_recursive(&dep, seen, result)?;
+        let dep =
+            resolve_shared_library(&needed, &parsed.search_dirs, interpreter_dir, &canonical)?;
+        resolve_elf_recursive(&dep, interpreter_dir, seen, result)?;
     }
     Ok(())
 }
@@ -5457,11 +5496,24 @@ fn parse_dynamic(
     })
 }
 
-fn resolve_shared_library(name: &str, search_dirs: &[String], binary: &Path) -> Result<PathBuf> {
-    // The result depends only on (soname, search_dirs); memoize it so a library
-    // referenced by many objects in the closure is searched + canonicalized once
-    // rather than once per referencing edge.
-    let cache_key = (name.to_string(), search_dirs.to_vec());
+/// Resolves the `NEEDED` soname `name` to a file, searching in order:
+/// `search_dirs` (the referencing object's own `DT_RPATH`/`DT_RUNPATH`),
+/// then `interpreter_dir` (see [`interpreter_dir_of`]), then the standard
+/// FHS default directories.
+fn resolve_shared_library(
+    name: &str,
+    search_dirs: &[String],
+    interpreter_dir: Option<&Path>,
+    binary: &Path,
+) -> Result<PathBuf> {
+    // The result depends only on (soname, search_dirs, interpreter_dir);
+    // memoize it so a library referenced by many objects in the closure is
+    // searched + canonicalized once rather than once per referencing edge.
+    let cache_key = (
+        name.to_string(),
+        search_dirs.to_vec(),
+        interpreter_dir.map(Path::to_path_buf),
+    );
     if let Some(resolved) = ELF_LIB_CACHE.with(|cache| cache.borrow().get(&cache_key).cloned()) {
         return Ok(resolved);
     }
@@ -5477,12 +5529,10 @@ fn resolve_shared_library(name: &str, search_dirs: &[String], binary: &Path) -> 
         "/usr/local/lib",
         "/usr/local/lib64",
     ];
-    for dir in search_dirs
-        .iter()
-        .map(String::as_str)
-        .chain(defaults.iter().copied())
-    {
-        let candidate = Path::new(dir).join(name);
+    let search_dir_paths = search_dirs.iter().map(|dir| Path::new(dir.as_str()));
+    let default_paths = defaults.iter().copied().map(Path::new);
+    for dir in search_dir_paths.chain(interpreter_dir).chain(default_paths) {
+        let candidate = dir.join(name);
         if candidate.is_file() {
             let resolved = cached_canonicalize(&candidate)?;
             ELF_LIB_CACHE.with(|cache| {
@@ -6654,5 +6704,144 @@ mod tests {
         let phantom = format!("nono_{}", "a".repeat(64));
         let stdout = nonce_stdout(phantom.clone());
         assert_eq!(stdout, phantom.into_bytes());
+    }
+
+    #[test]
+    fn interpreter_dir_of_reads_a_real_binarys_own_pt_interp() -> Result<()> {
+        // Exercises the actual PT_INTERP-parsing path (interpreter_dir_of /
+        // elf_dependency_closure), which the resolve_shared_library-focused
+        // tests below don't reach: the current test binary itself is a real
+        // dynamically linked ELF, so no synthetic ELF bytes are needed.
+        reset_elf_resolution_cache();
+        let exe = std::env::current_exe().map_err(|source| NonoError::ConfigRead {
+            path: PathBuf::from("/proc/self/exe"),
+            source,
+        })?;
+
+        let Some(dir) = interpreter_dir_of(&exe)? else {
+            // A statically linked test binary (e.g. a musl target) has no
+            // PT_INTERP at all — nothing to verify here, and returning
+            // `None` is the correct, already-handled production behavior
+            // for that case.
+            return Ok(());
+        };
+        assert!(
+            dir.is_dir(),
+            "interpreter directory must resolve to a real directory: {dir:?}"
+        );
+
+        let closure = elf_dependency_closure(&exe)?;
+        assert!(
+            closure.len() > 1,
+            "a real binary's dependency closure must include more than itself: {closure:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_shared_library_falls_back_to_interpreter_dir_when_runpath_empty() -> Result<()> {
+        // Regression for the Nix/NixOS case: a NEEDED entry with no RPATH/
+        // RUNPATH of its own (e.g. `libgcc_s.so.1` needing `libc.so.6`) is
+        // resolved by the real dynamic linker via its own default search
+        // path, which is the directory the interpreter itself lives in.
+        reset_elf_resolution_cache();
+        let tmp = test_tempdir()?;
+        let interp_dir = tmp.path().join("interp-dir");
+        create_dir(&interp_dir)?;
+        let lib_path = interp_dir.join("libneeded.so.1");
+        fs::write(&lib_path, b"stand-in for a real shared object").map_err(|source| {
+            NonoError::ConfigWrite {
+                path: lib_path.clone(),
+                source,
+            }
+        })?;
+        let lib_canon =
+            lib_path
+                .canonicalize()
+                .map_err(|source| NonoError::PathCanonicalization {
+                    path: lib_path.clone(),
+                    source,
+                })?;
+
+        let resolved =
+            resolve_shared_library("libneeded.so.1", &[], Some(&interp_dir), Path::new("/prog"))?;
+
+        assert_eq!(
+            resolved, lib_canon,
+            "NEEDED entry with no RPATH/RUNPATH must resolve via the interpreter's own directory"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_shared_library_prefers_search_dirs_over_interpreter_dir() -> Result<()> {
+        // Pins the documented precedence: a NEEDED entry's own RPATH/RUNPATH
+        // (search_dirs) must win over the interpreter-dir fallback when both
+        // provide a same-named candidate.
+        reset_elf_resolution_cache();
+        let tmp = test_tempdir()?;
+        let rpath_dir = tmp.path().join("rpath-dir");
+        create_dir(&rpath_dir)?;
+        let rpath_lib = rpath_dir.join("libneeded.so.1");
+        fs::write(&rpath_lib, b"from rpath").map_err(|source| NonoError::ConfigWrite {
+            path: rpath_lib.clone(),
+            source,
+        })?;
+        let rpath_canon =
+            rpath_lib
+                .canonicalize()
+                .map_err(|source| NonoError::PathCanonicalization {
+                    path: rpath_lib.clone(),
+                    source,
+                })?;
+
+        let interp_dir = tmp.path().join("interp-dir");
+        create_dir(&interp_dir)?;
+        let interp_lib = interp_dir.join("libneeded.so.1");
+        fs::write(&interp_lib, b"from interpreter dir").map_err(|source| {
+            NonoError::ConfigWrite {
+                path: interp_lib.clone(),
+                source,
+            }
+        })?;
+
+        let resolved = resolve_shared_library(
+            "libneeded.so.1",
+            &[rpath_dir.to_string_lossy().into_owned()],
+            Some(&interp_dir),
+            Path::new("/prog"),
+        )?;
+
+        assert_eq!(
+            resolved, rpath_canon,
+            "search_dirs (RPATH/RUNPATH) must take precedence over the interpreter-dir fallback"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_shared_library_still_fails_when_absent_from_interpreter_dir() -> Result<()> {
+        // The interpreter-dir fallback must not paper over a genuinely
+        // missing dependency: nothing in RPATH, the (empty) interpreter dir,
+        // or the FHS defaults provides `libmissing.so.1`, so resolution must
+        // still report a clear error rather than silently succeeding.
+        reset_elf_resolution_cache();
+        let tmp = test_tempdir()?;
+        let interp_dir = tmp.path().join("interp-dir");
+        create_dir(&interp_dir)?;
+
+        let err = resolve_shared_library(
+            "libmissing.so.1",
+            &[],
+            Some(&interp_dir),
+            Path::new("/prog"),
+        )
+        .expect_err("missing NEEDED entry must error");
+
+        assert!(
+            err.to_string().contains("libmissing.so.1"),
+            "error must name the unresolved dependency: {err}"
+        );
+        Ok(())
     }
 }

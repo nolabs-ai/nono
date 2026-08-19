@@ -50,14 +50,13 @@ pub(crate) fn build_approval_registry_from(
     ))
 }
 
-/// Resolve the approval backend used for supervised-mode filesystem/capability
-/// traps from the profile `security` section.
+/// Work out which approval backend should answer supervised-mode file and
+/// capability prompts, based on the profile `security` section.
 ///
-/// Returns `Ok(None)` when no backends are configured, so the caller falls back
-/// to the interactive terminal prompt (no behavior change for existing users).
-/// When backends ARE configured, any failure to build or resolve the default
-/// backend is a hard error — never a silent fallback to the less-supervised
-/// terminal prompt.
+/// Returns `Ok(None)` when nothing is configured, so the caller keeps the
+/// interactive terminal prompt (existing behavior is unchanged). When a backend
+/// IS configured, any failure to build it or pick the default is a hard error —
+/// we never quietly fall back to the weaker terminal prompt.
 pub(crate) fn resolve_supervised_approval_backend(
     backends: &BTreeMap<String, ApprovalBackendConfig>,
     default_backend_name: Option<String>,

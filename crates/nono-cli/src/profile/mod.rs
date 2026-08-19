@@ -2082,19 +2082,19 @@ pub struct SecurityConfig {
     /// the sandbox is static — no seccomp interception, no PTY mux, no prompts.
     #[serde(default)]
     pub capability_elevation: Option<bool>,
-    /// Named approval backends for supervised-mode filesystem/capability traps.
+    /// Where supervised-mode file/capability approval prompts are sent.
     ///
-    /// Decoupled from `command_policies` (which triggers tool-sandbox mode): a
-    /// backend configured here routes supervised approval prompts to, e.g., a
-    /// `webhook` WITHOUT forcing the tool-sandbox runtime. Empty (default)
-    /// keeps the interactive terminal prompt. Reuses the same
+    /// A named backend here (e.g. a `webhook`) answers the prompts instead of
+    /// the terminal. This is kept separate from `command_policies` on purpose:
+    /// setting it does NOT switch on the tool-sandbox runtime. Empty (default)
+    /// keeps the interactive terminal prompt. Uses the same
     /// [`ApprovalBackendConfig`] shape as `command_policies.approval_backends`.
     #[serde(default)]
     pub approval_backends: BTreeMap<String, ApprovalBackendConfig>,
-    /// Default routing for `approval_backends`. `backend` names the entry used
-    /// for supervised approvals. `None` (default) means no override — the
-    /// terminal prompt is used unless `approval_backends` is set, in which case
-    /// a default must be resolvable.
+    /// Which entry in `approval_backends` to use by default. `backend` names it.
+    /// `None` (default) means no override: the terminal prompt is used unless
+    /// `approval_backends` is set, in which case a default must be resolvable
+    /// (we fail rather than guess).
     #[serde(default)]
     pub approval_defaults: Option<ApprovalDefaultsConfig>,
     /// WSL2 proxy fallback policy. Controls behavior when ProxyOnly network

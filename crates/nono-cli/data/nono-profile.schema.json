@@ -633,14 +633,14 @@
         "approval_backends": {
           "type": "object",
           "additionalProperties": { "$ref": "#/$defs/ApprovalBackendConfig" },
-          "description": "Named approval backends for supervised-mode filesystem/capability traps. Decoupled from command_policies (does not activate tool-sandbox): a configured backend (e.g. a webhook) routes supervised approval prompts. Empty keeps the interactive terminal prompt."
+          "description": "Where supervised-mode file/capability approval prompts are sent. A named backend here (e.g. a webhook) answers the prompts instead of the terminal. Kept separate from command_policies on purpose: setting it does not switch on tool-sandbox. Empty keeps the interactive terminal prompt."
         },
         "approval_defaults": {
           "oneOf": [
             { "$ref": "#/$defs/ApprovalDefaultsConfig" },
             { "type": "null" }
           ],
-          "description": "Default routing for security.approval_backends. The backend name selects the entry used for supervised approvals; when null the terminal prompt is used unless approval_backends is set, in which case a default must resolve."
+          "description": "Which entry in security.approval_backends to use by default; 'backend' names it. When null the terminal prompt is used unless approval_backends is set, in which case a default must resolve (we fail rather than guess)."
         },
         "wsl2_proxy_policy": {
           "oneOf": [

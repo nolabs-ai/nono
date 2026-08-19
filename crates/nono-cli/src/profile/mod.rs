@@ -3138,6 +3138,14 @@ pub(crate) fn finalize_profile(mut profile: Profile) -> Result<Profile> {
         &profile.commands.allow,
     )
     .into_result()?;
+    // Validate the profile `security.approval_backends` surface on the merged,
+    // effective profile — same static checks command_policies gets, so a
+    // malformed supervised-approval backend fails at load rather than at
+    // supervised-launch build time.
+    crate::command_policy::validate_security_approval_backends(
+        &profile.security.approval_backends,
+        profile.security.approval_defaults.as_ref(),
+    )?;
     Ok(profile)
 }
 

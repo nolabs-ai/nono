@@ -1155,7 +1155,12 @@ pub(crate) fn validate_command_policies(
     if let Some(entrypoint) = &config.entrypoint {
         validate_identifier("entrypoint", entrypoint, &mut report);
     }
-    validate_approval_defaults(config, &mut report);
+    validate_approval_defaults(
+        "approval_defaults",
+        &config.approval_backends,
+        Some(&config.approval_defaults),
+        &mut report,
+    );
     validate_absolute_file_path_list(
         "command_policies.deny_direct_exec_bypass",
         &config.deny_direct_exec_bypass,
@@ -1177,7 +1182,7 @@ pub(crate) fn validate_command_policies(
         validate_credential(name, credential, &mut report);
     }
     for (name, backend) in &config.approval_backends {
-        validate_approval_backend(name, backend, config, &mut report);
+        validate_approval_backend(name, backend, &config.approval_backends, &mut report);
     }
 
     for (command_name, command) in &config.commands {
@@ -2091,21 +2096,26 @@ fn validate_invocation_policy(
 }
 
 fn validate_approval_defaults(
-    config: &CommandPoliciesConfig,
+    defaults_label: &str,
+    backends: &BTreeMap<String, ApprovalBackendConfig>,
+    defaults: Option<&ApprovalDefaultsConfig>,
     report: &mut CommandPolicyValidationReport,
 ) {
-    if let Some(backend) = &config.approval_defaults.backend {
-        validate_identifier("approval_defaults.backend", backend, report);
-        if !config.approval_backends.contains_key(backend) {
+    let Some(defaults) = defaults else {
+        return;
+    };
+    if let Some(backend) = &defaults.backend {
+        validate_identifier(&format!("{defaults_label}.backend"), backend, report);
+        if !backends.contains_key(backend) {
             report.error(
                 "unknown_approval_backend",
-                format!("approval_defaults references unknown backend '{backend}'"),
+                format!("{defaults_label} references unknown backend '{backend}'"),
             );
         }
     }
     validate_positive_timeout(
-        "approval_defaults.timeout_secs",
-        config.approval_defaults.timeout_secs,
+        &format!("{defaults_label}.timeout_secs"),
+        defaults.timeout_secs,
         report,
     );
 }
@@ -2113,7 +2123,7 @@ fn validate_approval_defaults(
 fn validate_approval_backend(
     name: &str,
     backend: &ApprovalBackendConfig,
-    config: &CommandPoliciesConfig,
+    backends: &BTreeMap<String, ApprovalBackendConfig>,
     report: &mut CommandPolicyValidationReport,
 ) {
     match backend.backend_type {
@@ -2171,7 +2181,7 @@ fn validate_approval_backend(
                         "invalid_approval_backend",
                         format!("approval backend '{name}' cannot chain to itself"),
                     );
-                } else if !config.approval_backends.contains_key(child_backend) {
+                } else if !backends.contains_key(child_backend) {
                     report.error(
                         "unknown_approval_backend",
                         format!(
@@ -2196,6 +2206,31 @@ fn validate_approval_backend(
         backend.timeout_secs,
         report,
     );
+}
+
+/// Validate the profile `security.approval_backends` surface at profile-load
+/// time, so a malformed backend is rejected with a clean error instead of
+/// deferring to a supervised-launch build failure. This reuses the exact
+/// per-backend checks the `command_policies` surface gets — identifier syntax
+/// and collisions, per-type field consistency (webhook needs a url; chain needs
+/// a mode and child list; terminal takes none of those), self-chaining,
+/// references to unknown backends, NUL-in-url, and positive timeouts.
+pub(crate) fn validate_security_approval_backends(
+    backends: &BTreeMap<String, ApprovalBackendConfig>,
+    defaults: Option<&ApprovalDefaultsConfig>,
+) -> nono::Result<()> {
+    let mut report = CommandPolicyValidationReport::default();
+    validate_identifier_set("approval backend", backends.keys(), &mut report);
+    validate_approval_defaults(
+        "security.approval_defaults",
+        backends,
+        defaults,
+        &mut report,
+    );
+    for (name, backend) in backends {
+        validate_approval_backend(name, backend, backends, &mut report);
+    }
+    report.into_result()
 }
 
 fn validate_policy_default(
@@ -5842,6 +5877,106 @@ mod tests {
             report.errors
         );
         assert!(report.is_ok(), "{:?}", report.errors);
+    }
+
+    fn security_backend(backend_type: ApprovalBackendType) -> ApprovalBackendConfig {
+        ApprovalBackendConfig {
+            backend_type,
+            url: None,
+            timeout_secs: None,
+            mode: None,
+            backends: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn security_approval_backends_accepts_valid_webhook_with_default() {
+        let mut backends = BTreeMap::new();
+        backends.insert(
+            "review".to_string(),
+            ApprovalBackendConfig {
+                url: Some("https://approval.example".to_string()),
+                timeout_secs: Some(30),
+                ..security_backend(ApprovalBackendType::Webhook)
+            },
+        );
+        let defaults = ApprovalDefaultsConfig {
+            backend: Some("review".to_string()),
+            timeout_secs: None,
+        };
+        assert!(validate_security_approval_backends(&backends, Some(&defaults)).is_ok());
+    }
+
+    #[test]
+    fn security_approval_backends_empty_is_ok() {
+        let backends = BTreeMap::new();
+        assert!(validate_security_approval_backends(&backends, None).is_ok());
+    }
+
+    #[test]
+    fn security_approval_backends_rejects_webhook_without_url() {
+        let mut backends = BTreeMap::new();
+        backends.insert(
+            "review".to_string(),
+            security_backend(ApprovalBackendType::Webhook),
+        );
+        match validate_security_approval_backends(&backends, None) {
+            Ok(()) => panic!("a webhook backend without a url must be rejected"),
+            Err(err) => assert!(err.to_string().contains("must define url"), "{err}"),
+        }
+    }
+
+    #[test]
+    fn security_approval_backends_rejects_terminal_with_url() {
+        let mut backends = BTreeMap::new();
+        backends.insert(
+            "term".to_string(),
+            ApprovalBackendConfig {
+                url: Some("https://nope.example".to_string()),
+                ..security_backend(ApprovalBackendType::Terminal)
+            },
+        );
+        match validate_security_approval_backends(&backends, None) {
+            Ok(()) => panic!("a terminal backend with a url must be rejected"),
+            Err(err) => assert!(err.to_string().contains("cannot define url"), "{err}"),
+        }
+    }
+
+    #[test]
+    fn security_approval_backends_rejects_unknown_default() {
+        let mut backends = BTreeMap::new();
+        backends.insert(
+            "review".to_string(),
+            security_backend(ApprovalBackendType::Terminal),
+        );
+        let defaults = ApprovalDefaultsConfig {
+            backend: Some("missing".to_string()),
+            timeout_secs: None,
+        };
+        match validate_security_approval_backends(&backends, Some(&defaults)) {
+            Ok(()) => panic!("a default pointing at an unknown backend must be rejected"),
+            Err(err) => assert!(
+                err.to_string().contains("unknown backend 'missing'"),
+                "{err}"
+            ),
+        }
+    }
+
+    #[test]
+    fn security_approval_backends_rejects_self_chain() {
+        let mut backends = BTreeMap::new();
+        backends.insert(
+            "loop".to_string(),
+            ApprovalBackendConfig {
+                mode: Some(ApprovalChainMode::All),
+                backends: vec!["loop".to_string()],
+                ..security_backend(ApprovalBackendType::Chain)
+            },
+        );
+        match validate_security_approval_backends(&backends, None) {
+            Ok(()) => panic!("a self-chaining backend must be rejected"),
+            Err(err) => assert!(err.to_string().contains("cannot chain to itself"), "{err}"),
+        }
     }
 
     #[test]

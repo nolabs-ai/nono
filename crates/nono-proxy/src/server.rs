@@ -170,6 +170,8 @@ fn strip_proxy_headers(header_bytes: &[u8]) -> Vec<u8> {
         let name = line.split(':').next().unwrap_or("").trim();
         if name.eq_ignore_ascii_case("proxy-connection")
             || name.eq_ignore_ascii_case("proxy-authorization")
+            || name.eq_ignore_ascii_case("content-length")
+            || name.eq_ignore_ascii_case("transfer-encoding")
         {
             continue;
         }
@@ -203,6 +205,8 @@ fn strip_and_redeem_proxy_headers(
         let trimmed_name = name.trim();
         if trimmed_name.eq_ignore_ascii_case("proxy-connection")
             || trimmed_name.eq_ignore_ascii_case("proxy-authorization")
+            || trimmed_name.eq_ignore_ascii_case("content-length")
+            || trimmed_name.eq_ignore_ascii_case("transfer-encoding")
         {
             continue;
         }
@@ -1978,8 +1982,16 @@ async fn handle_forward_http(
         return Ok(());
     }
 
-    // 3. Build the origin-form request bytes: rewritten request line +
-    //    proxy-header-stripped header block + terminating CRLF.
+    // 3. Read the request body before building upstream headers so chunked
+    //    framing can be decoded and re-written with Content-Length.
+    let body = match reverse::read_request_body(stream, header_bytes, buffered).await? {
+        Some(body) => body,
+        None => return Ok(()), // send_error already written (e.g. 413 / 400)
+    };
+
+    // Build the origin-form request bytes: rewritten request line +
+    // proxy-header-stripped header block + optional Content-Length +
+    // terminating CRLF.
     let origin_line = rewrite_absolute_to_origin_form(first_line)?;
     let inbound_path = origin_line
         .split_whitespace()
@@ -2012,18 +2024,14 @@ async fn handle_forward_http(
             }
             _ => (strip_proxy_headers(header_bytes), false),
         };
-    let mut request_bytes = Vec::with_capacity(origin_line.len() + filtered_headers.len() + 2);
+
+    let mut request_bytes = Vec::with_capacity(origin_line.len() + filtered_headers.len() + 64);
     request_bytes.extend_from_slice(origin_line.as_bytes());
     request_bytes.extend_from_slice(&filtered_headers);
+    if !body.is_empty() {
+        request_bytes.extend_from_slice(format!("Content-Length: {}\r\n", body.len()).as_bytes());
+    }
     request_bytes.extend_from_slice(b"\r\n");
-
-    // Read the request body honoring Content-Length. `buffered` holds any
-    // bytes the BufReader already read past the header terminator.
-    let content_length = reverse::extract_content_length(header_bytes);
-    let body = match reverse::read_request_body(stream, content_length, buffered).await? {
-        Some(body) => body,
-        None => return Ok(()), // send_error already written (e.g. 413)
-    };
 
     // 4. Choose the upstream strategy: chain through the external/enterprise
     //    proxy when configured (unless the host is a bypass host), else

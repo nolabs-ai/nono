@@ -1234,11 +1234,11 @@ where
         filtered_headers.retain(|(name, _)| !name.eq_ignore_ascii_case("accept-encoding"));
         filtered_headers.push(("Accept-Encoding".to_string(), "identity".to_string()));
     }
-    let content_length = reverse::extract_content_length(&req.header_bytes);
-    let body = match reverse::read_request_body(tls_stream, content_length, &req.buffered).await? {
-        Some(b) => b,
-        None => return Ok(()),
-    };
+    let body =
+        match reverse::read_request_body(tls_stream, &req.header_bytes, &req.buffered).await? {
+            Some(b) => b,
+            None => return Ok(()),
+        };
     let body = if let Some(endpoint) = oauth_endpoint {
         ctx.oauth_capture_store
             .rewrite_request_body(endpoint, &body)?
@@ -1511,11 +1511,11 @@ where
 
     let strip_header = inject_header.as_deref().unwrap_or("");
     let filtered_headers = reverse::filter_headers(&req.header_bytes, strip_header);
-    let content_length = reverse::extract_content_length(&req.header_bytes);
-    let body = match reverse::read_request_body(tls_stream, content_length, &req.buffered).await? {
-        Some(b) => b,
-        None => return Ok(()),
-    };
+    let body =
+        match reverse::read_request_body(tls_stream, &req.header_bytes, &req.buffered).await? {
+            Some(b) => b,
+            None => return Ok(()),
+        };
 
     let upstream_authority = reverse::format_host_header(UpstreamScheme::Https, ctx.host, ctx.port);
     let mut request = Zeroizing::new(format!(
@@ -1661,11 +1661,11 @@ where
     let mut filtered_headers = reverse::filter_headers(&req.header_bytes, "");
     filtered_headers.retain(|(name, _)| !crate::aws::sign::is_aws_auth_header(name));
 
-    let content_length = reverse::extract_content_length(&req.header_bytes);
-    let body = match reverse::read_request_body(tls_stream, content_length, &req.buffered).await? {
-        Some(b) => b,
-        None => return Ok(()),
-    };
+    let body =
+        match reverse::read_request_body(tls_stream, &req.header_bytes, &req.buffered).await? {
+            Some(b) => b,
+            None => return Ok(()),
+        };
 
     // --- Resolve upstream IPs (DNS-rebind-safe via filter) ---
     let resolved_addrs = match resolve_upstream_or_deny(

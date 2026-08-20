@@ -532,11 +532,12 @@ Without `--proxy-port`, nono uses an OS-assigned ephemeral port and sets environ
 nono run --allow-cwd --credential github --trust-proxy-ca -- gh api /user
 ```
 
-The CA is persisted in macOS Keychain and shared across sessions. It regenerates automatically when expired (default: 1 day, configurable via `--proxy-ca-validity`):
+The CA is persisted in macOS Keychain and shared across sessions. It renews automatically as it nears expiry (validity default: 1 day, configurable via `--proxy-ca-validity`):
 
 - **First run**: Generates a new ECDSA P-256 CA, stores it in Keychain, and adds it to the user trust store (one biometric/password prompt)
 - **Subsequent runs**: Loads from Keychain with zero prompts
-- **After expiry**: Removes the expired CA and regenerates
+- **Nearing expiry**: Re-issues the certificate over the same key, trusts and stores it, then retires the superseded one (one prompt). Certificates already minted for intercepted hosts keep working, because the key — and so the anchor — is unchanged
+- **Mid-session**: A running session picks up a certificate another session renewed with no prompt at all, and renews itself only if nothing newer is available. If renewal cannot complete, the session keeps using its current certificate rather than re-prompting
 
 <Note>
 This flag has no effect without `--credential` (or another TLS-intercepting route). If no credential routes are configured, nono warns and skips CA generation.

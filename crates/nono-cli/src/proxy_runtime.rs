@@ -2960,6 +2960,22 @@ pub(crate) fn start_proxy_runtime(
     if !proxy_diagnostics.is_empty() {
         crate::output::print_proxy_diagnostics(proxy_diagnostics);
     }
+
+    // A session-lifecycle CA is neither shared nor able to outlive its session.
+    #[cfg(target_os = "macos")]
+    if proxy
+        .tls_intercept
+        .as_ref()
+        .is_some_and(|t| t.trust_proxy_ca)
+        && let Some(rotator) = handle.intercept_rotator()
+    {
+        let validity = proxy
+            .tls_intercept
+            .as_ref()
+            .and_then(|t| t.ca_validity)
+            .unwrap_or(nono_proxy::tls_intercept::ca::CA_VALIDITY_DEFAULT);
+        crate::macos_ca_renewal::spawn_supervisor(rotator, validity);
+    }
     caps.set_network_mode_mut(nono::NetworkMode::ProxyOnly {
         port,
         bind_ports: proxy.allow_bind_ports.clone(),

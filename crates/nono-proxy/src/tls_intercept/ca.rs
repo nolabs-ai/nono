@@ -128,27 +128,38 @@ impl EphemeralCa {
             ProxyError::Config(format!("failed to generate ephemeral CA key pair: {}", e))
         })?;
         let key_pkcs8_der = Zeroizing::new(key_pair.serialize_der());
-
-        let mut params = CertificateParams::default();
-        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-        params.key_usages = vec![
-            KeyUsagePurpose::KeyCertSign,
-            KeyUsagePurpose::CrlSign,
-            KeyUsagePurpose::DigitalSignature,
-        ];
-
-        let now = SystemTime::now();
-        let not_after = now + validity;
-        params.not_before = system_time_to_offset(now)?;
-        params.not_after = system_time_to_offset(not_after)?;
-
-        let mut dn = DistinguishedName::new();
-        dn.push(DnType::CommonName, cn);
-        params.distinguished_name = dn;
+        let (params, not_after) = ca_params(cn, validity)?;
 
         let self_signed = params
             .self_signed(&key_pair)
             .map_err(|e| ProxyError::Config(format!("failed to self-sign ephemeral CA: {}", e)))?;
+        let cert_pem = self_signed.pem();
+        let cert_der = self_signed.der().to_vec();
+        let issuer = Issuer::new(params, key_pair);
+
+        Ok(Self {
+            key_pkcs8_der,
+            issuer,
+            cert_der,
+            cert_pem,
+            not_after,
+        })
+    }
+
+    /// Re-issue a certificate over an existing CA key, with a fresh validity window.
+    ///
+    /// Subject, key and the key-derived authority key id are unchanged, so leaves
+    /// minted under the old cert still chain to the new one.
+    pub fn reissue_with_cn(key_der: &[u8], cn: &str, validity: Duration) -> Result<Self> {
+        let pkcs8 = PrivatePkcs8KeyDer::from(key_der);
+        let key_pair = KeyPair::from_der_and_sign_algo(&pkcs8.into(), &PKCS_ECDSA_P256_SHA256)
+            .map_err(|e| ProxyError::Config(format!("failed to load CA key for re-issue: {e}")))?;
+        let key_pkcs8_der = Zeroizing::new(key_der.to_vec());
+        let (params, not_after) = ca_params(cn, validity)?;
+
+        let self_signed = params
+            .self_signed(&key_pair)
+            .map_err(|e| ProxyError::Config(format!("failed to self-sign re-issued CA: {e}")))?;
         let cert_pem = self_signed.pem();
         let cert_der = self_signed.der().to_vec();
         let issuer = Issuer::new(params, key_pair);
@@ -306,6 +317,29 @@ pub fn split_key_cert_pem(combined: &str) -> Result<(Zeroizing<Vec<u8>>, String)
 }
 
 /// Convert `SystemTime` to the `time::OffsetDateTime` that `rcgen` expects.
+/// Shared by fresh generation and re-issue, so a re-issued cert differs from its
+/// predecessor only in its validity window.
+fn ca_params(cn: &str, validity: Duration) -> Result<(CertificateParams, SystemTime)> {
+    let mut params = CertificateParams::default();
+    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    params.key_usages = vec![
+        KeyUsagePurpose::KeyCertSign,
+        KeyUsagePurpose::CrlSign,
+        KeyUsagePurpose::DigitalSignature,
+    ];
+
+    let now = SystemTime::now();
+    let not_after = now + validity;
+    params.not_before = system_time_to_offset(now)?;
+    params.not_after = system_time_to_offset(not_after)?;
+
+    let mut dn = DistinguishedName::new();
+    dn.push(DnType::CommonName, cn);
+    params.distinguished_name = dn;
+
+    Ok((params, not_after))
+}
+
 fn system_time_to_offset(t: SystemTime) -> Result<OffsetDateTime> {
     OffsetDateTime::from_unix_timestamp(
         t.duration_since(SystemTime::UNIX_EPOCH)
@@ -394,6 +428,68 @@ mod tests {
             original_der.as_ref(),
             "cert_der() must return the original cert DER, not the re-signed reconstruction"
         );
+    }
+
+    #[test]
+    fn reissue_keeps_key_and_subject_but_extends_validity() {
+        let original =
+            EphemeralCa::generate_with_cn("nono-proxy-ca", Duration::from_secs(60)).unwrap();
+        let reissued = EphemeralCa::reissue_with_cn(
+            original.key_der(),
+            "nono-proxy-ca",
+            Duration::from_secs(7 * 24 * 60 * 60),
+        )
+        .unwrap();
+
+        assert_eq!(reissued.key_der(), original.key_der());
+        assert!(reissued.not_after() > original.not_after());
+        assert_ne!(reissued.cert_pem(), original.cert_pem());
+
+        // Same public key: the re-issued cert is an interchangeable anchor.
+        let spki = |der: &[u8]| {
+            let (_, c) = x509_parser::parse_x509_certificate(der).unwrap();
+            c.public_key().subject_public_key.data.to_vec()
+        };
+        assert_eq!(spki(reissued.cert_der()), spki(original.cert_der()));
+    }
+
+    #[test]
+    fn reissued_ca_verifies_leaves_minted_under_the_old_cert() {
+        use crate::tls_intercept::CertCache;
+        use std::sync::Arc;
+
+        let original =
+            EphemeralCa::generate_with_cn("nono-proxy-ca", Duration::from_secs(3600)).unwrap();
+        let leaf = CertCache::new(Arc::new(
+            EphemeralCa::from_existing(original.key_der(), original.cert_pem()).unwrap(),
+        ))
+        .get_or_mint("api.github.com")
+        .unwrap();
+
+        let reissued = EphemeralCa::reissue_with_cn(
+            original.key_der(),
+            "nono-proxy-ca",
+            Duration::from_secs(7 * 24 * 60 * 60),
+        )
+        .unwrap();
+
+        // Issuer name and authority key id must match, or the old leaf stops chaining.
+        let (_, leaf_x509) = x509_parser::parse_x509_certificate(leaf.cert[0].as_ref()).unwrap();
+        let (_, new_ca) = x509_parser::parse_x509_certificate(reissued.cert_der()).unwrap();
+        assert_eq!(leaf_x509.issuer(), new_ca.subject());
+        leaf_x509
+            .verify_signature(Some(new_ca.public_key()))
+            .expect("leaf minted under the previous cert must verify against the re-issued CA");
+    }
+
+    #[test]
+    fn reissue_rejects_a_key_it_cannot_load() {
+        let result = EphemeralCa::reissue_with_cn(
+            b"not-a-pkcs8-key",
+            "nono-proxy-ca",
+            Duration::from_secs(60),
+        );
+        assert!(result.is_err());
     }
 
     #[test]

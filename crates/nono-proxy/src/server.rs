@@ -2028,7 +2028,9 @@ async fn handle_forward_http(
     let mut request_bytes = Vec::with_capacity(origin_line.len() + filtered_headers.len() + 64);
     request_bytes.extend_from_slice(origin_line.as_bytes());
     request_bytes.extend_from_slice(&filtered_headers);
-    if !body.is_empty() {
+    // Always re-frame when the client declared a body (CL or chunked TE),
+    // including empty bodies — otherwise upstreams may answer 411 or hang.
+    if reverse::should_reframe_with_content_length(header_bytes) {
         request_bytes.extend_from_slice(format!("Content-Length: {}\r\n", body.len()).as_bytes());
     }
     request_bytes.extend_from_slice(b"\r\n");

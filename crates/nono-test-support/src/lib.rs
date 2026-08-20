@@ -105,6 +105,16 @@ impl NonoTest {
         cli::RollbackCmd::new(self)
     }
 
+    pub fn credential(&self) -> cli::Credential<'_> {
+        cli::Credential::new(self)
+    }
+
+    /// A hermetic `nono` invocation for a test that drives the process itself
+    /// — a pty, a signal — instead of collecting output through a builder.
+    pub fn command(&self) -> Command {
+        self.hermetic_command()
+    }
+
     /// A `nono` invocation with a hermetic environment and no arguments.
     fn hermetic_command(&self) -> Command {
         let mut cmd = Command::new(&self.bin);

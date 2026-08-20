@@ -376,6 +376,97 @@ impl RollbackCleanup<'_> {
     }
 }
 
+/// `nono credential <…>`
+pub struct Credential<'t> {
+    t: &'t NonoTest,
+}
+
+impl<'t> Credential<'t> {
+    pub fn list(self) -> CredentialList<'t> {
+        CredentialList {
+            inner: self.invoke(&["credential", "list"]),
+        }
+    }
+
+    pub fn rm(self) -> CredentialRm<'t> {
+        CredentialRm {
+            inner: self.invoke(&["credential", "rm"]),
+        }
+    }
+
+    pub fn set(self) -> CredentialSet<'t> {
+        CredentialSet {
+            inner: self.invoke(&["credential", "set"]),
+        }
+    }
+
+    pub(crate) fn new(t: &'t NonoTest) -> Self {
+        Self { t }
+    }
+
+    fn invoke(&self, subcommand: &[&str]) -> Invocation<'t> {
+        let mut inner = Invocation::new(self.t, subcommand);
+        // Every keystore-backed service is probed on `list` and loaded on
+        // `check`. On a headless runner with no Secret Service that probe
+        // would otherwise sit on the 120 s default.
+        inner.env("NONO_KEYRING_TIMEOUT_SECS", "2");
+        inner
+    }
+}
+
+#[must_use = "a dropped builder never spawns nono, so the test asserts nothing"]
+pub struct CredentialList<'t> {
+    inner: Invocation<'t>,
+}
+
+impl CredentialList<'_> {
+    pub fn json(mut self) -> serde_json::Value {
+        self.inner.flag("--json");
+        self.inner.finish().json()
+    }
+}
+
+#[must_use = "a dropped builder never spawns nono, so the test asserts nothing"]
+pub struct CredentialRm<'t> {
+    inner: Invocation<'t>,
+}
+
+impl CredentialRm<'_> {
+    pub fn account(mut self, account: &str) -> Self {
+        self.inner.opt("--account", account);
+        self
+    }
+
+    #[must_use = "a Completed that is dropped asserts nothing about the run"]
+    pub fn output(self) -> Completed {
+        self.inner.finish()
+    }
+}
+
+#[must_use = "a dropped builder never spawns nono, so the test asserts nothing"]
+pub struct CredentialSet<'t> {
+    inner: Invocation<'t>,
+}
+
+impl CredentialSet<'_> {
+    pub fn account(mut self, account: &str) -> Self {
+        self.inner.opt("--account", account);
+        self
+    }
+
+    /// The service is positional but optional — clap requires it only without
+    /// `--account` — so it is a builder method rather than a parameter.
+    pub fn service(mut self, name: &str) -> Self {
+        self.inner.raw(name);
+        self
+    }
+
+    #[must_use = "a Completed that is dropped asserts nothing about the run"]
+    pub fn output(self) -> Completed {
+        self.inner.finish()
+    }
+}
+
 /// Accumulates argv/env for one `nono` invocation.
 struct Invocation<'t> {
     t: &'t NonoTest,

@@ -135,14 +135,8 @@ For the default `~/.claude` config directory, no extra flags or directories are 
 
 Instead of keeping your API key in environment variable exports or shell config files, load it from the system keystore:
 
-**macOS:**
 ```bash
-security add-generic-password -s "nono" -a "anthropic_api_key" -w
-```
-
-**Linux:**
-```bash
-secret-tool store --label="nono: anthropic_api_key" service nono username anthropic_api_key
+nono credential set --account anthropic_api_key
 ```
 
 Then run with secrets:

@@ -6,6 +6,8 @@
 //! - All sandbox execution strategies must share one allow/deny implementation
 //!   to avoid drift in security behavior across code paths.
 
+use std::borrow::Cow;
+
 /// Returns true if an environment variable is unsafe to inherit into a sandboxed child.
 ///
 /// Covers linker injection (LD_PRELOAD, DYLD_INSERT_LIBRARIES), shell startup
@@ -60,60 +62,84 @@ pub(crate) fn is_loader_injection_env_var(key: &str) -> bool {
     key.starts_with("LD_") || key.starts_with("DYLD_")
 }
 
-/// Returns true if `key` matches any pattern in `patterns`.
-///
-/// Supports exact names (`"PATH"`) and prefix patterns ending with `*`
-/// (`"AWS_*"` matches `AWS_REGION`, `AWS_SECRET_ACCESS_KEY`, etc.).
-/// A bare `"*"` matches everything. The `*` wildcard is only valid as a
-/// trailing suffix — patterns like `"A*B"` or `"*X"` are skipped.
-pub(crate) fn matches_env_var_patterns(key: &str, patterns: &[String]) -> bool {
-    for pattern in patterns {
-        if let Some(prefix) = pattern.strip_suffix('*') {
-            if prefix.contains('*') {
-                continue;
-            }
-            if key.starts_with(prefix) {
-                return true;
-            }
-        } else if !pattern.contains('*') && key == *pattern {
-            return true;
+/// Whether `text` matches `pattern`, where `*` in `pattern` matches any run of
+/// zero or more characters (including none), anchored to the full string.
+/// `*` is the only wildcard; every other character is matched literally.
+fn glob_matches(pattern: &str, text: &str) -> bool {
+    // An empty pattern is invalid and must never act as an implicit match-all
+    // (every branch below treats "" as "no constraint").
+    if pattern.is_empty() {
+        return false;
+    }
+    // `split('*')` always yields at least one item, so an empty `parts` here
+    // is impossible; a pattern with no `*` is just an exact match.
+    let mut parts = pattern.split('*');
+    let first = parts.next().unwrap_or_default();
+    let Some(mut rest) = text.strip_prefix(first) else {
+        return false;
+    };
+    let mut parts = parts.peekable();
+    while let Some(part) = parts.next() {
+        if parts.peek().is_none() {
+            // Last segment: must match the remaining text as a suffix.
+            return rest.ends_with(part);
+        }
+        if part.is_empty() {
+            continue;
+        }
+        match rest.find(part) {
+            Some(idx) => rest = &rest[idx + part.len()..],
+            None => return false,
         }
     }
-    false
+    true
+}
+
+/// Returns true if `key` matches any pattern in `patterns`.
+///
+/// `*` may appear anywhere in a pattern — leading, trailing, or infix — and
+/// matches any run of characters: `"AWS_*"`, `"*_TOKEN"`, `"*SECRET*"`, and
+/// `"AWS_*_TOKEN"` are all valid. A bare `"*"` matches everything. Matching
+/// is anchored to the full variable name.
+///
+/// When `case_insensitive` is true, both `key` and every pattern are
+/// lowercased (ASCII-only) before comparison.
+pub(crate) fn matches_env_var_patterns(
+    key: &str,
+    patterns: &[String],
+    case_insensitive: bool,
+) -> bool {
+    let key = if case_insensitive {
+        Cow::Owned(key.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(key)
+    };
+    patterns.iter().any(|pattern| {
+        if case_insensitive {
+            glob_matches(&pattern.to_ascii_lowercase(), &key)
+        } else {
+            glob_matches(pattern, &key)
+        }
+    })
 }
 
 /// Returns true if an environment variable matches the allow-list.
-///
-/// Supports exact names (`"PATH"`) and prefix patterns ending with `*`
-/// (`"AWS_*"` matches `AWS_REGION`, `AWS_SECRET_ACCESS_KEY`, etc.).
-/// A bare `"*"` matches everything.
+/// See [`matches_env_var_patterns`] for the pattern grammar.
 pub(crate) fn is_env_var_allowed(key: &str, allowed_env_vars: &[String]) -> bool {
-    matches_env_var_patterns(key, allowed_env_vars)
+    matches_env_var_patterns(key, allowed_env_vars, false)
 }
 
-/// Returns true if an environment variable matches the deny-list.
-///
-/// Uses the same pattern syntax as `is_env_var_allowed`: exact names and
-/// trailing-`*` prefix patterns.
-pub(crate) fn is_env_var_denied(key: &str, denied_env_vars: &[String]) -> bool {
-    matches_env_var_patterns(key, denied_env_vars)
-}
-
-/// Validates that all env var patterns use `*` only as a trailing suffix.
+/// Validates env var patterns before they are used for matching.
 /// `field_name` is used in the error message (e.g. `"allow_vars"` or `"deny_vars"`).
 /// Returns an error message describing the first invalid pattern, or None if valid.
 pub(crate) fn validate_env_var_patterns(patterns: &[String], field_name: &str) -> Option<String> {
     for pattern in patterns {
-        if pattern.contains('*') && !pattern.ends_with('*') {
-            return Some(format!(
-                "Invalid {} pattern '{}': '*' is only valid as a trailing suffix",
-                field_name, pattern
-            ));
+        if pattern.is_empty() {
+            return Some(format!("Invalid {field_name} pattern: empty pattern"));
         }
-        if pattern.starts_with('*') && pattern.len() > 1 {
+        if pattern.contains('\0') {
             return Some(format!(
-                "Invalid {} pattern '{}': use a bare '*' to match all variables, or a specific prefix like 'AWS_*'",
-                field_name, pattern
+                "Invalid {field_name} pattern '{pattern}': contains a NUL byte"
             ));
         }
     }
@@ -205,6 +231,7 @@ pub(super) fn pwd_rewrite_permitted(
     blocked_extra: &[&str],
     denied_env_vars: Option<&[String]>,
     allowed_env_vars: Option<&[String]>,
+    case_insensitive_env_vars: bool,
 ) -> bool {
     if set_vars.iter().any(|(key, _)| key == "PWD") {
         return false;
@@ -215,6 +242,7 @@ pub(super) fn pwd_rewrite_permitted(
         blocked_extra,
         denied_env_vars,
         allowed_env_vars,
+        case_insensitive_env_vars,
     )
 }
 
@@ -272,17 +300,18 @@ pub(super) fn env_var_survives_filters(
     blocked_extra: &[&str],
     denied_env_vars: Option<&[String]>,
     allowed_env_vars: Option<&[String]>,
+    case_insensitive_env_vars: bool,
 ) -> bool {
     if should_skip_env_var(key, config_env_vars, blocked_extra) {
         return false;
     }
     if let Some(denied) = denied_env_vars
-        && is_env_var_denied(key, denied)
+        && matches_env_var_patterns(key, denied, case_insensitive_env_vars)
     {
         return false;
     }
     if let Some(allowed) = allowed_env_vars
-        && !is_env_var_allowed(key, allowed)
+        && !matches_env_var_patterns(key, allowed, case_insensitive_env_vars)
     {
         return false;
     }
@@ -416,10 +445,43 @@ mod tests {
     }
 
     #[test]
-    fn test_env_var_allowed_mid_star_ignored() {
+    fn test_env_var_allowed_mid_star_matches_infix_wildcard() {
         let allowed: Vec<String> = vec!["A*B".into()];
-        assert!(!is_env_var_allowed("AXB", &allowed));
-        assert!(!is_env_var_allowed("A*B", &allowed));
+        assert!(is_env_var_allowed("AXB", &allowed));
+        assert!(is_env_var_allowed("AB", &allowed));
+        assert!(!is_env_var_allowed("AXBY", &allowed));
+        assert!(!is_env_var_allowed("XAB", &allowed));
+    }
+
+    #[test]
+    fn test_env_var_allowed_leading_star_matches_suffix() {
+        let allowed: Vec<String> = vec!["*_TOKEN".into()];
+        assert!(is_env_var_allowed("GH_TOKEN", &allowed));
+        assert!(!is_env_var_allowed("GH_SECRET", &allowed));
+    }
+
+    #[test]
+    fn test_env_var_allowed_contains_star_matches_substring() {
+        let allowed: Vec<String> = vec!["*SECRET*".into()];
+        assert!(is_env_var_allowed("MY_SECRET_KEY", &allowed));
+        assert!(is_env_var_allowed("SECRET", &allowed));
+        assert!(!is_env_var_allowed("PUBLIC_KEY", &allowed));
+    }
+
+    #[test]
+    fn test_env_var_allowed_prefix_and_suffix_wildcard() {
+        let allowed: Vec<String> = vec!["AWS_*_TOKEN".into()];
+        assert!(is_env_var_allowed("AWS_SESSION_TOKEN", &allowed));
+        assert!(!is_env_var_allowed("AWS_SESSION_SECRET", &allowed));
+    }
+
+    #[test]
+    fn test_env_var_allowed_case_insensitive_mode() {
+        let allowed: Vec<String> = vec!["*token*".into()];
+        assert!(matches_env_var_patterns("JENKINS_TOKEN", &allowed, true));
+        assert!(matches_env_var_patterns("jenkins_token", &allowed, true));
+        assert!(matches_env_var_patterns("Jenkins_Token", &allowed, true));
+        assert!(!matches_env_var_patterns("JENKINS_TOKEN", &allowed, false));
     }
 
     // ============================================================================
@@ -428,24 +490,43 @@ mod tests {
 
     #[test]
     fn test_validate_valid_patterns() {
-        let patterns: Vec<String> = vec!["PATH".into(), "AWS_*".into(), "*".into()];
+        let patterns: Vec<String> = vec![
+            "PATH".into(),
+            "AWS_*".into(),
+            "*".into(),
+            "*_TOKEN".into(),
+            "*SECRET*".into(),
+            "AWS_*_TOKEN".into(),
+        ];
         assert!(validate_env_var_patterns(&patterns, "allow_vars").is_none());
     }
 
     #[test]
-    fn test_validate_rejects_mid_star() {
-        let patterns: Vec<String> = vec!["A*B".into()];
+    fn test_validate_rejects_empty_pattern() {
+        let patterns: Vec<String> = vec!["".into()];
         let err = validate_env_var_patterns(&patterns, "allow_vars");
         assert!(err.is_some());
-        assert!(err.as_ref().is_some_and(|e| e.contains("A*B")));
     }
 
     #[test]
-    fn test_validate_rejects_leading_star_with_suffix() {
-        let patterns: Vec<String> = vec!["*X".into()];
-        let err = validate_env_var_patterns(&patterns, "allow_vars");
-        assert!(err.is_some());
-        assert!(err.as_ref().is_some_and(|e| e.contains("*X")));
+    fn test_empty_pattern_never_matches_anything() {
+        // `prepare_profile` only warns on an invalid pattern rather than
+        // dropping it, so the matcher itself must fail closed here: a stray
+        // `""` in `allow_vars` must never act as an implicit "*".
+        let patterns: Vec<String> = vec!["".into()];
+        assert!(!matches_env_var_patterns(
+            "ANTHROPIC_API_KEY",
+            &patterns,
+            false
+        ));
+        assert!(!matches_env_var_patterns("", &patterns, false));
+    }
+
+    #[test]
+    fn test_validate_rejects_nul_byte() {
+        let patterns: Vec<String> = vec!["AWS_\0TOKEN".into()];
+        let err = validate_env_var_patterns(&patterns, "deny_vars");
+        assert!(err.as_ref().is_some_and(|e| e.contains("deny_vars")));
     }
 
     #[test]
@@ -460,14 +541,6 @@ mod tests {
         assert!(validate_env_var_patterns(&patterns, "allow_vars").is_none());
     }
 
-    #[test]
-    fn test_validate_deny_vars_field_name_in_error() {
-        let patterns: Vec<String> = vec!["A*B".into()];
-        let err = validate_env_var_patterns(&patterns, "deny_vars");
-        assert!(err.as_ref().is_some_and(|e| e.contains("deny_vars")));
-        assert!(err.as_ref().is_some_and(|e| e.contains("A*B")));
-    }
-
     // ============================================================================
     // is_env_var_denied
     // ============================================================================
@@ -475,29 +548,33 @@ mod tests {
     #[test]
     fn test_env_var_denied_exact_match() {
         let denied: Vec<String> = vec!["GH_TOKEN".into(), "ANTHROPIC_API_KEY".into()];
-        assert!(is_env_var_denied("GH_TOKEN", &denied));
-        assert!(is_env_var_denied("ANTHROPIC_API_KEY", &denied));
+        assert!(matches_env_var_patterns("GH_TOKEN", &denied, false));
+        assert!(matches_env_var_patterns(
+            "ANTHROPIC_API_KEY",
+            &denied,
+            false
+        ));
     }
 
     #[test]
     fn test_env_var_denied_prefix_match() {
         let denied: Vec<String> = vec!["GITHUB_*".into()];
-        assert!(is_env_var_denied("GITHUB_TOKEN", &denied));
-        assert!(is_env_var_denied("GITHUB_ACTIONS", &denied));
-        assert!(!is_env_var_denied("GH_TOKEN", &denied));
+        assert!(matches_env_var_patterns("GITHUB_TOKEN", &denied, false));
+        assert!(matches_env_var_patterns("GITHUB_ACTIONS", &denied, false));
+        assert!(!matches_env_var_patterns("GH_TOKEN", &denied, false));
     }
 
     #[test]
     fn test_env_var_denied_no_match() {
         let denied: Vec<String> = vec!["GH_TOKEN".into()];
-        assert!(!is_env_var_denied("PATH", &denied));
-        assert!(!is_env_var_denied("HOME", &denied));
+        assert!(!matches_env_var_patterns("PATH", &denied, false));
+        assert!(!matches_env_var_patterns("HOME", &denied, false));
     }
 
     #[test]
     fn test_env_var_denied_empty_list() {
         let denied: Vec<String> = vec![];
-        assert!(!is_env_var_denied("GH_TOKEN", &denied));
+        assert!(!matches_env_var_patterns("GH_TOKEN", &denied, false));
     }
 
     #[test]
@@ -506,7 +583,7 @@ mod tests {
         // deny wins: denied should return true regardless of allowed
         let denied: Vec<String> = vec!["GH_TOKEN".into()];
         let allowed: Vec<String> = vec!["GH_TOKEN".into()];
-        assert!(is_env_var_denied("GH_TOKEN", &denied));
+        assert!(matches_env_var_patterns("GH_TOKEN", &denied, false));
         assert!(is_env_var_allowed("GH_TOKEN", &allowed));
         // In exec path, deny is checked before allow, so GH_TOKEN is stripped
     }
@@ -652,7 +729,8 @@ mod tests {
             &[],
             &[],
             Some(&denied),
-            None
+            None,
+            false
         ));
 
         let allowed_without_pwd = vec!["PATH".to_string(), "HOME".to_string()];
@@ -661,7 +739,8 @@ mod tests {
             &[],
             &[],
             None,
-            Some(&allowed_without_pwd)
+            Some(&allowed_without_pwd),
+            false
         ));
 
         let allowed_with_pwd = vec!["PWD".to_string()];
@@ -670,28 +749,50 @@ mod tests {
             &[],
             &[],
             None,
-            Some(&allowed_with_pwd)
+            Some(&allowed_with_pwd),
+            false
         ));
-        assert!(env_var_survives_filters("PWD", &[], &[], None, None));
+        assert!(env_var_survives_filters("PWD", &[], &[], None, None, false));
     }
 
     #[test]
     fn test_pwd_rewrite_stands_down_when_pwd_is_injected_or_filtered() {
-        assert!(pwd_rewrite_permitted(&[], &[], &[], None, None));
+        assert!(pwd_rewrite_permitted(&[], &[], &[], None, None, false));
 
         // `set_vars` lands after the inherited-env loop, so its `PWD` wins; the
         // rewrite must not leave `$OLDPWD` describing a move `$PWD` denies.
         let set_pwd = vec![("PWD".to_string(), "/injected".to_string())];
-        assert!(!pwd_rewrite_permitted(&[], &set_pwd, &[], None, None));
+        assert!(!pwd_rewrite_permitted(
+            &[],
+            &set_pwd,
+            &[],
+            None,
+            None,
+            false
+        ));
 
         // An unrelated `set_vars` entry leaves the rewrite alone.
         let set_other = vec![("EDITOR".to_string(), "vi".to_string())];
-        assert!(pwd_rewrite_permitted(&[], &set_other, &[], None, None));
+        assert!(pwd_rewrite_permitted(
+            &[],
+            &set_other,
+            &[],
+            None,
+            None,
+            false
+        ));
 
         // A `set_vars` `OLDPWD` overrides only that key; `PWD` still tracks the
         // directory the child starts in.
         let set_oldpwd = vec![("OLDPWD".to_string(), "/elsewhere".to_string())];
-        assert!(pwd_rewrite_permitted(&[], &set_oldpwd, &[], None, None));
+        assert!(pwd_rewrite_permitted(
+            &[],
+            &set_oldpwd,
+            &[],
+            None,
+            None,
+            false
+        ));
 
         // Credentials and env filters gate the rewrite the same way.
         assert!(!pwd_rewrite_permitted(
@@ -699,10 +800,18 @@ mod tests {
             &[],
             &[],
             None,
-            None
+            None,
+            false
         ));
         let denied = vec!["PWD".to_string()];
-        assert!(!pwd_rewrite_permitted(&[], &[], &[], Some(&denied), None));
+        assert!(!pwd_rewrite_permitted(
+            &[],
+            &[],
+            &[],
+            Some(&denied),
+            None,
+            false
+        ));
     }
 
     #[test]
@@ -780,21 +889,24 @@ mod tests {
             &[("PWD", "/injected")],
             &[],
             None,
-            None
+            None,
+            false
         ));
         assert!(!env_var_survives_filters(
             "NONO_CAP_FILE",
             &[],
             &["NONO_CAP_FILE"],
             None,
-            None
+            None,
+            false
         ));
         assert!(!env_var_survives_filters(
             "LD_PRELOAD",
             &[],
             &[],
             None,
-            None
+            None,
+            false
         ));
         // Deny wins over an explicit allow entry for the same key.
         let denied = vec!["GITHUB_*".to_string()];
@@ -804,7 +916,42 @@ mod tests {
             &[],
             &[],
             Some(&denied),
-            Some(&allowed)
+            Some(&allowed),
+            false
         ));
+
+        // Case-insensitive mode matches regardless of casing on either side.
+        let denied_ci = vec!["*secret*".to_string()];
+        assert!(!env_var_survives_filters(
+            "MY_SECRET",
+            &[],
+            &[],
+            Some(&denied_ci),
+            None,
+            true
+        ));
+    }
+
+    #[test]
+    fn test_profile_authoring_guide_environment_example_matches_as_documented() {
+        // The exact allow_vars/deny_vars/case_insensitive_vars example from
+        // the "environment" section of profile-authoring-guide.md.
+        let allowed = vec!["*".to_string()];
+        let denied = vec![
+            "*TOKEN*".to_string(),
+            "*KEY*".to_string(),
+            "*SECRET*".to_string(),
+        ];
+        let survives = |key: &str| {
+            env_var_survives_filters(key, &[], &[], Some(&denied), Some(&allowed), true)
+        };
+
+        // Secret-shaped names are stripped, case-insensitively.
+        assert!(!survives("GH_TOKEN"));
+        assert!(!survives("gh_token"));
+        assert!(!survives("AWS_SECRET_ACCESS_KEY"));
+        // Everything else still passes through the "*" allow.
+        assert!(survives("PATH"));
+        assert!(survives("HOME"));
     }
 }

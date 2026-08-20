@@ -719,6 +719,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         sandbox_policy: flags.sandbox_policy,
         allowed_env_vars: flags.allowed_env_vars,
         denied_env_vars: flags.denied_env_vars,
+        case_insensitive_env_vars: flags.case_insensitive_env_vars,
         set_vars: flags.set_vars.unwrap_or_default(),
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         tool_sandbox_runtime: tool_sandbox_runtime.as_ref(),

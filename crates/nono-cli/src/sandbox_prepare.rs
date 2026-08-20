@@ -528,6 +528,7 @@ pub(crate) struct PreparedSandbox {
     pub(crate) suppressed_system_service_operations: Vec<String>,
     pub(crate) allowed_env_vars: Option<Vec<String>>,
     pub(crate) denied_env_vars: Option<Vec<String>>,
+    pub(crate) case_insensitive_env_vars: bool,
     /// Expanded `environment.set_vars` (key, expanded-value), `None` if absent.
     pub(crate) set_vars: Option<Vec<(String, String)>>,
     /// True when the profile's `network.block` is set. The CLI `--block-net`
@@ -1453,6 +1454,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
                 suppressed_system_service_operations: Vec::new(),
                 allowed_env_vars: None,
                 denied_env_vars: None,
+                case_insensitive_env_vars: false,
                 set_vars: None,
                 profile_network_block: false,
                 allow_http2_requested: args.allow_http2,
@@ -1503,6 +1505,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         suppressed_system_service_operations,
         allowed_env_vars: profile_allowed_env_vars,
         denied_env_vars: profile_denied_env_vars,
+        case_insensitive_env_vars: profile_case_insensitive_env_vars,
         set_vars: profile_set_vars,
         resolved_command_binaries: profile_resolved_command_binaries,
     } = prepared_profile;
@@ -1823,6 +1826,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
             suppressed_system_service_operations,
             allowed_env_vars: profile_allowed_env_vars,
             denied_env_vars: profile_denied_env_vars,
+            case_insensitive_env_vars: profile_case_insensitive_env_vars,
             set_vars: profile_set_vars,
             profile_network_block,
             allow_http2_requested,
@@ -2607,6 +2611,7 @@ mod tests {
             suppressed_system_service_operations: Vec::new(),
             allowed_env_vars: None,
             denied_env_vars: None,
+            case_insensitive_env_vars: false,
             set_vars: None,
             profile_network_block: false,
             allow_http2_requested: false,

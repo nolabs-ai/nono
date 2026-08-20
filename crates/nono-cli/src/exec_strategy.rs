@@ -294,13 +294,16 @@ pub struct ExecConfig<'a> {
     #[cfg(target_os = "linux")]
     pub sandbox_policy: crate::profile::LinuxSandboxPolicy,
     /// Allow-list of environment variable names. When set, only variables
-    /// matching an exact name or prefix pattern (e.g. `"AWS_*"`) are
+    /// matching a glob pattern (e.g. `"AWS_*"`, `"*_TOKEN"`, `"*SECRET*"`) are
     /// passed to the child. Nono-injected credentials always bypass this.
     pub allowed_env_vars: Option<Vec<String>>,
-    /// Deny-list of environment variable names. Variables matching an exact
-    /// name or prefix pattern (e.g. `"GITHUB_*"`) are stripped even if they
-    /// also appear in `allowed_env_vars`. Nono-injected credentials bypass this.
+    /// Deny-list of environment variable names. Variables matching a glob
+    /// pattern (e.g. `"GITHUB_*"`, `"*_TOKEN"`) are stripped even if they
+    /// also match `allowed_env_vars`. Nono-injected credentials bypass this.
     pub denied_env_vars: Option<Vec<String>>,
+    /// When true, `allowed_env_vars`/`denied_env_vars` patterns are matched
+    /// case-insensitively.
+    pub case_insensitive_env_vars: bool,
     /// Static environment variables (`environment.set_vars`) injected after host
     /// env filtering and before `env_vars` (credentials/proxy/hooks). Values are
     /// already variable-expanded. Bypasses allow/deny filtering by design.
@@ -411,6 +414,7 @@ pub fn execute_direct(config: &ExecConfig<'_>) -> Result<()> {
             BLOCKED_EXTRA,
             config.denied_env_vars.as_deref(),
             config.allowed_env_vars.as_deref(),
+            config.case_insensitive_env_vars,
         )
     });
 
@@ -421,6 +425,7 @@ pub fn execute_direct(config: &ExecConfig<'_>) -> Result<()> {
             BLOCKED_EXTRA,
             config.denied_env_vars.as_deref(),
             config.allowed_env_vars.as_deref(),
+            config.case_insensitive_env_vars,
         ) {
             continue;
         }
@@ -600,6 +605,7 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
             BLOCKED_EXTRA,
             config.denied_env_vars.as_deref(),
             config.allowed_env_vars.as_deref(),
+            config.case_insensitive_env_vars,
         )
     });
 
@@ -612,6 +618,7 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
                 BLOCKED_EXTRA,
                 config.denied_env_vars.as_deref(),
                 config.allowed_env_vars.as_deref(),
+                config.case_insensitive_env_vars,
             ) {
                 continue;
             }

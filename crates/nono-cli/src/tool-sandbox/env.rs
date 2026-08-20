@@ -139,7 +139,7 @@ pub(crate) fn apply_export_env(
         if key_str == "PATH" || key_str.starts_with("NONO_") {
             continue;
         }
-        if !crate::exec_strategy::matches_env_var_patterns(key_str, export_patterns) {
+        if !crate::exec_strategy::matches_env_var_patterns(key_str, export_patterns, false) {
             continue;
         }
         if crate::exec_strategy::env_sanitization::is_forbidden_secret_env_var(key_str) {
@@ -633,6 +633,20 @@ mod tests {
         let out = rendered(&env);
         assert!(out.contains(&"AWS_REGION=eu".to_string()));
         assert!(out.contains(&"AWS_PROFILE=dev".to_string()));
+        assert!(!out.iter().any(|e| e.starts_with("TZ=")));
+    }
+
+    #[test]
+    fn export_env_infix_pattern_matches() {
+        let request = request_with(
+            &["AWS_SESSION_TOKEN=eu", "AWS_SESSION_SECRET=x", "TZ=UTC"],
+            "/work",
+        );
+        let mut env: Vec<Vec<u8>> = Vec::new();
+        apply_export_env(&mut env, &request, &patterns(&["AWS_*_TOKEN"]));
+        let out = rendered(&env);
+        assert!(out.contains(&"AWS_SESSION_TOKEN=eu".to_string()));
+        assert!(!out.iter().any(|e| e.starts_with("AWS_SESSION_SECRET=")));
         assert!(!out.iter().any(|e| e.starts_with("TZ=")));
     }
 

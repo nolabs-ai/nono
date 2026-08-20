@@ -1,0 +1,9 @@
+#!/bin/sh
+set -eu
+
+if [ -z "${KUBERNETES_BEARER_TOKEN:-}" ]; then
+  echo "KUBERNETES_BEARER_TOKEN is not available" >&2
+  exit 1
+fi
+
+printf '{"apiVersion":"client.authentication.k8s.io/v1","kind":"ExecCredential","status":{"token":"%s"}}\n' "$KUBERNETES_BEARER_TOKEN"

@@ -1,0 +1,111 @@
+speed: 80
+delay: 50
+clear: true
+show_exit_status: false
+
+setup:
+  - export BUCKET=my-example-bucket
+  - mkdir -p ~/allowed ~/denied
+  - printf 'you can read me\n' > ~/allowed/note.txt
+  - printf 'top secret\n' > ~/denied/secret.txt
+
+steps:
+  # ------------------------------------------------------------------
+  # Intro: nono gates the filesystem. --allow grants a path; anything
+  # outside the allow-list is denied by the OS sandbox.
+  # ------------------------------------------------------------------
+  - pause
+  - comment: "nono gates the filesystem: --allow grants this path, so the read works."
+    style: blue
+  - text: >-
+      nono run --allow-cwd --allow ~/allowed -- cat ~/allowed/note.txt
+
+  - pause
+  - comment: "Anything outside the allow-list is blocked by the sandbox."
+    style: blue
+  - text: >-
+      nono run --allow-cwd --allow ~/allowed -- cat ~/denied/secret.txt
+
+  # ------------------------------------------------------------------
+  # The profile: AWS SigV4 signing brokered entirely host-side.
+  # ------------------------------------------------------------------
+  - pause
+  - comment: "Credential config: aws_auth resolves real AWS credentials on the host and re-signs each request -- the sandbox never holds a usable credential."
+    style: blue
+  - text: >-
+      jq '.network.custom_credentials["s3-regional"] | {upstream, aws_auth, endpoint_policy}' ./aws-cli-profile-macos.json
+
+  - pause
+  - comment: "L7 endpoint policy: GET/HEAD allowed, PUT/POST/DELETE denied -- enforced by the proxy before any request reaches AWS."
+    style: blue
+  - text: >-
+      jq '.network.custom_credentials["s3-regional"].endpoint_policy | {default, allow: [.allow[] | "\(.method) \(.path)"], deny: [.deny[] | "\(.method) \(.path)"]}' ./aws-cli-profile-macos.json
+
+  # ------------------------------------------------------------------
+  # Credential brokering: the sandbox only ever sees a placeholder.
+  # ------------------------------------------------------------------
+  - pause
+  - comment: "Inside the sandbox, AWS_ACCESS_KEY_ID is a dummy placeholder -- the real credential never enters the sandbox at all."
+    style: blue
+  - text: >-
+      nono run -s --no-audit --allow-cwd --profile ./aws-cli-profile-macos.json -- sh -c 'echo "AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID"'
+
+  - pause
+  - comment: "Yet the real S3 request succeeds: nono resolved the real AWS credential on the host and signed the request there."
+    style: blue
+  - text: >-
+      nono run -s --allow-cwd --profile ./aws-cli-profile-macos.json -- aws s3 ls s3://$BUCKET/
+
+  # ------------------------------------------------------------------
+  # Reads: allowed by the L7 policy.
+  # ------------------------------------------------------------------
+  - pause
+  - comment: "GetObject: a permitted read reaches the real object."
+    style: blue
+  - text: >-
+      nono run -s --allow-cwd --profile ./aws-cli-profile-macos.json -- aws s3 cp s3://$BUCKET/hello.txt -
+
+  # ------------------------------------------------------------------
+  # Mutations: denied at the L7 layer, before AWS ever sees them.
+  # ------------------------------------------------------------------
+  - pause
+  - comment: "Deny policy: PUT/POST/DELETE are blocked by the endpoint policy."
+    style: blue
+  - text: >-
+      jq '.network.custom_credentials["s3-regional"].endpoint_policy.deny | map("\(.method) \(.path)")' ./aws-cli-profile-macos.json
+
+  - pause
+  - comment: "L7 deny: uploading a local file is blocked -- PutObject never reaches AWS."
+    style: blue
+  - text: >-
+      nono run -s --no-audit --no-diagnostics --allow-cwd --profile ./aws-cli-profile-macos.json -- sh -c 'echo nono-l7-deny-test > /tmp/mutate.txt && aws s3 cp /tmp/mutate.txt s3://'"$BUCKET"'/mutate.txt'
+
+  - pause
+  - comment: "L7 deny: deleting the object is blocked -- DeleteObject never reaches AWS."
+    style: blue
+  - text: >-
+      nono run -s --no-audit --no-diagnostics --allow-cwd --profile ./aws-cli-profile-macos.json -- aws s3 rm s3://$BUCKET/hello.txt
+
+  - pause
+  - comment: "Child mediation: wrapping aws in sh does not bypass the endpoint policy -- enforcement is at the network layer, not the process layer."
+    style: blue
+  - text: >-
+      nono run -s --no-audit --no-diagnostics --allow-cwd --profile ./aws-cli-profile-macos.json -- sh -c 'echo wrapped-bypass-attempt > /tmp/leak.txt && aws s3 cp /tmp/leak.txt s3://'"$BUCKET"'/leak.txt'
+
+  - pause
+  - comment: "Confirming from the real AWS side: the object was never modified."
+    style: blue
+  - text: >-
+      aws s3 ls s3://$BUCKET/
+
+  # ------------------------------------------------------------------
+  # Audit trail.
+  # ------------------------------------------------------------------
+  - pause
+  - comment: "Audit trail: the policy decisions nono recorded for a recent command."
+    style: blue
+  - text: "nono audit list --recent 5"
+    capture:
+      name: audit_id
+      pattern: '([0-9a-f]{16})'
+  - text: "nono audit show {audit_id} --json | jq '.network_events | map({sequence, method, path, decision, reason})' 2>/dev/null || nono audit show {audit_id} --json | jq"

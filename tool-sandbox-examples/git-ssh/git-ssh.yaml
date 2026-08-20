@@ -1,0 +1,92 @@
+speed: 80
+delay: 50
+clear: true
+show_exit_status: false
+
+setup:
+  - mkdir -p ~/allowed ~/denied
+  - printf 'you can read me\n' > ~/allowed/note.txt
+  - printf 'top secret\n' > ~/denied/secret.txt
+
+steps:
+  # ------------------------------------------------------------------
+  # Intro: nono gates the filesystem. --allow grants a path; anything
+  # outside the allow-list is denied by the OS sandbox.
+  # ------------------------------------------------------------------
+  - pause
+  - comment: "nono gates the filesystem: --allow grants this path, so the read works."
+    style: blue
+  - text: >-
+      nono run --allow-cwd --allow ~/allowed -- cat ~/allowed/note.txt
+
+  - pause
+  - comment: "Anything outside the allow-list is blocked by the sandbox."
+    style: blue
+  - text: >-
+      nono run --allow-cwd --allow ~/allowed -- cat ~/denied/secret.txt
+
+  # ------------------------------------------------------------------
+  # The profile: SSH-agent socket brokering, not a bearer token or
+  # a static key file.
+  # ------------------------------------------------------------------
+  - pause
+  - comment: "Credential config: a mediated connect() to the real ssh-agent socket -- no key file, no bearer token."
+    style: blue
+  - text: >-
+      jq '.command_policies.credentials["ssh-agent"]' ./git-ssh-profile-macos.json
+
+  - pause
+  - comment: "git may invoke ssh as a helper (can_use), and ssh gets its own scoped sandbox when called by git."
+    style: blue
+  - text: >-
+      jq '{git_can_use: .command_policies.commands.git.can_use, ssh_from_git: .command_policies.commands.ssh.from.git}' ./git-ssh-profile-macos.json
+
+  # ------------------------------------------------------------------
+  # Credential brokering: the sandbox never sees the private key.
+  # ------------------------------------------------------------------
+  - pause
+  - comment: "The sandbox is never granted read access to any private key file -- only the agent socket, known_hosts, and ssh config."
+    style: blue
+  - text: >-
+      nono run -s --no-audit --allow-cwd --profile ./git-ssh-profile-macos.json -- sh -c 'ls ~/.ssh 2>&1'
+
+  - pause
+  - comment: "Yet a real SSH clone succeeds: git delegates signing to the agent over the mediated socket."
+    style: blue
+  - text: >-
+      nono run -s --allow-cwd --profile ./git-ssh-profile-macos.json -- git clone git@github.com:octocat/Hello-World.git
+
+  - pause
+  - comment: "The clone is real."
+    style: blue
+  - text: "cat Hello-World/README"
+
+  # ------------------------------------------------------------------
+  # Mutations: denied at the argv layer, before any network attempt.
+  # ------------------------------------------------------------------
+  - pause
+  - comment: "Deny policy: push is blocked by argv, before git even opens a connection."
+    style: blue
+  - text: >-
+      jq '.command_policies.commands.git.from.session.invocation_policy.deny | map(.argv.prefix | join(" "))' ./git-ssh-profile-macos.json
+
+  - pause
+  - comment: "Arg deny: git push is blocked before any network attempt."
+    style: blue
+  - text: >-
+      cd Hello-World && nono run -s --no-audit --no-diagnostics --allow-cwd --profile ../git-ssh-profile-macos.json -- git push origin master
+
+  - pause
+  - comment: "Child mediation: wrapping git in sh does not bypass policy."
+    style: blue
+  - text: >-
+      nono run -s --no-audit --no-diagnostics --allow-cwd --profile ./git-ssh-profile-macos.json -- sh -c 'cd Hello-World && git push origin master'
+
+  - pause
+  - comment: "Audit trail: the policy decisions nono recorded for a recent command."
+    style: blue
+  - text: "nono audit list --recent 5"
+    capture:
+      name: audit_id
+      pattern: '([0-9a-f]{16})'
+  - text: "nono audit show {audit_id} --json | jq '.command_policy_events | map({sequence, command, decision, reason, argv: .argv_display})'"

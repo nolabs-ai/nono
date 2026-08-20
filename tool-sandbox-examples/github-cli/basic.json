@@ -1,0 +1,64 @@
+{
+  "extends": "default",
+  "meta": {
+    "name": "basic",
+    "description": "Contrast profile: gh can read its non-secret config and run, but no credential is granted — the keychain token is invisible and no phantom GH_TOKEN is injected, so gh operates anonymously."
+  },
+  "groups": {
+    "include": [],
+    "exclude": []
+  },
+  "commands": {
+    "allow": [],
+    "deny": []
+  },
+  "workdir": {
+    "access": "readwrite"
+  },
+  "filesystem": {
+    "allow": [],
+    "read": [
+      ".",
+      "/opt/homebrew/Cellar/gh/2.89.0/bin"
+    ],
+    "write": [],
+    "allow_file": [],
+    "read_file": [
+      "$HOME/.config/gh/hosts.yml",
+      "$HOME/.config/gh/config.yml",
+      "$HOME/.CFUserTextEncoding",
+      "/Library/Preferences/Logging/com.apple.diagnosticd.filter.plist",
+      "/dev/autofs_nowait",
+      "/dev/dtracehelper",
+      "/opt/homebrew/bin/gh"
+    ],
+    "write_file": [
+      "/dev/dtracehelper"
+    ],
+    "deny": [],
+    "bypass_protection": [
+      "/Library/Preferences/Logging/com.apple.diagnosticd.filter.plist",
+      "/dev/autofs_nowait",
+      "/dev/dtracehelper",
+      "/opt/homebrew/Cellar/gh/2.89.0/bin",
+      "/opt/homebrew/bin/gh"
+    ],
+    "suppress_save_prompt": [
+      "$HOME/.CFUserTextEncoding"
+    ]
+  },
+  "network": {
+    "block": false,
+    "allow_domain": [],
+    "credentials": [],
+    "open_port": [],
+    "listen_port": [],
+    "custom_credentials": {}
+  },
+  "env_credentials": {},
+  "hooks": {},
+  "rollback": {
+    "exclude_patterns": [],
+    "exclude_globs": []
+  }
+}

@@ -1,0 +1,163 @@
+speed: 80
+delay: 50
+clear: true
+show_exit_status: false
+
+setup:
+  - export BASIC_PROFILE=./basic.json
+  - mkdir -p ~/allowed ~/denied
+  - printf 'you can read me\n' > ~/allowed/note.txt
+  - printf 'top secret\n' > ~/denied/secret.txt
+
+steps:
+  # ------------------------------------------------------------------
+  # Intro: nono gates the filesystem. --allow grants a path; anything
+  # outside the allow-list is denied by the OS sandbox.
+  # ------------------------------------------------------------------
+  - pause
+  - comment: "nono gates the filesystem: --allow grants this path, so the read works."
+    style: blue
+  - text: >-
+      nono run --allow-cwd --allow ~/allowed -- cat ~/allowed/note.txt
+
+  - pause
+  - comment: "Anything outside the allow-list is blocked by the sandbox."
+    style: blue
+  - text: >-
+      nono run --allow-cwd --allow ~/allowed -- cat ~/denied/secret.txt
+
+  # ------------------------------------------------------------------
+  # The profile: a tool sandbox built specifically for the gh CLI.
+  # ------------------------------------------------------------------
+  - pause
+  - comment: "Credential config: the real token is read from the OS keyring and injected upstream by the proxy -- the sandbox only ever sees a phantom."
+    style: blue
+  - text: >-
+      jq '{credentials: .command_policies.credentials}' ./ghcli-profile-macos.json
+
+  - pause
+  - comment: "A tool sandbox configured just for gh: pinned binary, filesystem reads, L7 endpoint policy, and argv policy."
+    style: blue
+  - text: >-
+      jq '.command_policies.commands.gh | { executable, sandbox_reads: .from.session.sandbox.fs_read, sandbox_config_files: .from.session.sandbox.fs_read_file, l7_endpoint_policy: (.from.session.sandbox.credentials[0].endpoint_policy | {default, allow: [.allow[] | "\(.method) \(.path)"], deny: [.deny[] | "\(.method) \(.path)"]}), argv_policy: (.from.session.invocation_policy | {default, allow: [.allow[].argv | (.prefix // .exact) | join(" ")], deny: [.deny[].argv | (.prefix // .exact) | join(" ")]}) }' ./ghcli-profile-macos.json
+
+  # ------------------------------------------------------------------
+  # Credential brokering: L7 injects a phantom token, basic has none.
+  # ------------------------------------------------------------------
+  - pause
+  - comment: "L7: proxy injects a phantom GH_TOKEN; the real token never enters the sandbox."
+    style: blue
+  - text: >-
+      nono run -s --allow-cwd --profile ./ghcli-profile-macos.json -- gh auth token
+
+  - pause
+  - comment: "basic: no credential granted -- gh finds no token."
+    style: blue
+  - text: >-
+      nono run -s --no-audit --allow-cwd --profile "$BASIC_PROFILE" -- gh auth token
+
+  - pause
+  - comment: "Environment: no phantom GH_TOKEN -- the variable is empty."
+    style: blue
+  - text: >-
+      nono run -s --no-audit --allow-cwd --profile "$BASIC_PROFILE" -- sh -c 'echo "GH_TOKEN=[$GH_TOKEN]"'
+
+  - pause
+  - comment: "Keychain: where the token really lives -- the sandbox seals the store on disk."
+    style: blue
+  - text: >-
+      nono run -s --no-audit --allow-cwd --profile "$BASIC_PROFILE" -- cat "$HOME/Library/Keychains/login.keychain-db"
+
+  # ------------------------------------------------------------------
+  # Authenticated vs anonymous: same request, with and without the token.
+  # ------------------------------------------------------------------
+  - pause
+  - comment: "L7: authenticated -- proxy swaps in the real token, so the limit is 5000."
+    style: blue
+  - text: >-
+      nono run -s --no-audit --allow-cwd --profile ./ghcli-profile-macos.json -- gh api rate_limit | jq '{core: .resources.core}'
+
+  - pause
+  - comment: "basic: same command, no credential -- anonymous, the limit drops to 60."
+    style: blue
+  - text: >-
+      nono run -s --no-audit --allow-cwd --profile "$BASIC_PROFILE" -- gh api rate_limit | jq '{core: .resources.core}'
+
+  # ------------------------------------------------------------------
+  # Reads: allowed under L7 (argv + L7 layers), rejected without a token.
+  # ------------------------------------------------------------------
+  - pause
+  - comment: "L7: allowed read -- gh issue view succeeds."
+    style: blue
+  - text: >-
+      nono run -s --allow-cwd --profile ./ghcli-profile-macos.json -- gh issue view 1052 --repo nolabs-ai/nono --json title,url,state | jq
+
+  - pause
+  - comment: "basic: no token -- the same read is rejected (HTTP 401)."
+    style: blue
+  - text: >-
+      nono run -s --no-audit --allow-cwd --profile "$BASIC_PROFILE" -- gh issue view 1052 --repo nolabs-ai/nono --json title,url,state
+
+  - pause
+  - comment: "L7: gh api on a permitted GET issue path is allowed."
+    style: blue
+  - text: >-
+      nono run -s --allow-cwd --profile ./ghcli-profile-macos.json -- gh api repos/nolabs-ai/nono/issues/1052 --jq .title
+
+  # ------------------------------------------------------------------
+  # Mutations: denied at the argv and HTTP layers, and audited.
+  # ------------------------------------------------------------------
+  - pause
+  - comment: "Deny policy: these issue mutations are blocked by argv."
+    style: blue
+  - text: >-
+      jq '.command_policies.commands.gh.from.session.invocation_policy.deny | map(select(.argv.prefix[0]=="issue")) | map(.argv.prefix|join(" "))' ./ghcli-profile-macos.json
+
+  - pause
+  - comment: "Arg deny: gh issue comment blocked before any API call."
+    style: blue
+  - text: >-
+      nono run -s --no-audit --no-diagnostics --allow-cwd --profile ./ghcli-profile-macos.json -- gh issue comment 1052 --repo nolabs-ai/nono --body 'nono arg deny test'
+
+  - pause
+  - comment: "L7 deny: proxy blocks the POST to the comments endpoint."
+    style: blue
+  - text: >-
+      nono run -s --no-audit --no-diagnostics --allow-cwd --profile ./ghcli-profile-macos.json -- gh api -X POST repos/nolabs-ai/nono/issues/1052/comments -f body='nono L7 deny test'
+
+  - pause
+  - comment: "Child mediation: wrapping gh in sh does not bypass policy."
+    style: blue
+  - text: >-
+      nono run -s --no-audit --no-diagnostics --allow-cwd --profile ./ghcli-profile-macos.json -- sh -c 'gh issue comment 1052 --repo nolabs-ai/nono --body "wrapped bypass attempt"'
+
+  - pause
+  - comment: "Audit trail: the policy decisions nono recorded for a recent command."
+    style: blue
+  - text: "nono audit list --recent 5"
+    capture:
+      name: audit_id
+      pattern: '([0-9a-f]{16})'
+  - text: "nono audit show {audit_id} --json | jq '.command_policy_events | map({sequence, command, decision, reason, argv: .argv_display})'"
+
+  # ------------------------------------------------------------------
+  # Same policy, autonomous agent: this profile extends nolabs-ai/claude,
+  # so Claude Code runs under it and every gh call it makes is mediated.
+  # ------------------------------------------------------------------
+  - pause
+  - comment: "This profile extends the Claude Code profile, so the agent inherits the same gh policy."
+    style: blue
+  - text: >-
+      jq '{extends, gh_allow: [.command_policies.commands.gh.from.session.invocation_policy.allow[].argv | (.prefix // .exact) | join(" ")], gh_deny: [.command_policies.commands.gh.from.session.invocation_policy.deny[].argv | (.prefix // .exact) | join(" ")]}' ./ghcli-profile-macos.json
+
+  - pause
+  - comment: "Agent read: Claude uses gh to read the issue -- allowed."
+    style: blue
+  - text: >-
+      nono run -s --allow-cwd --profile ./ghcli-profile-macos.json -- claude 'Use gh to fetch the title and state of issue 1052 in the nolabs-ai/nono repo, then report just those.' --dangerously-skip-permissions --allowedTools Bash
+
+  - pause
+  - comment: "Agent write: Claude tries to comment -- nono blocks the gh mutation at the tool boundary."
+    style: blue
+  - text: >-
+      nono run -s --allow-cwd --profile ./ghcli-profile-macos.json -- claude 'Use gh to post a comment saying hello on issue 1052 in the nolabs-ai/nono repo. If it fails, tell me exactly why.' --dangerously-skip-permissions --allowedTools Bash

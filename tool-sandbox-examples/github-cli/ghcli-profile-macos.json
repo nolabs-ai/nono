@@ -1,0 +1,304 @@
+{
+  "extends": [
+    "nolabs-ai/claude"
+  ],
+  "meta": {
+    "name": "gh-issues-readonly-l7",
+    "version": "0.1.0",
+    "description": "Showcase: GitHub CLI reads issues through TLS-intercepted L7 filtering (plus rate-limit and phantom-token inspection), while issue mutations are denied. Policy-only enforcement, no approval backends."
+  },
+  "workdir": {
+    "access": "read"
+  },
+  "network": {
+    "tls_intercept": {
+      "ca_lifecycle": "trusted",
+      "ca_validity": "24h",
+      "leaf_validity": "15m"
+    },
+    "allow_domain": [
+      "api.anthropic.com",
+      "claude.ai",
+      "console.anthropic.com",
+      "statsig.anthropic.com"
+    ]
+  },
+  "command_policies": {
+    "credentials": {
+      "github-keyring": {
+        "type": "proxy",
+        "upstream": "https://api.github.com",
+        "credential_key": "keyring://gh:github.com/lukehinds?decode=go-keyring",
+        "env_var": "GH_TOKEN",
+        "inject_header": "Authorization",
+        "credential_format": "Bearer {}"
+      }
+    },
+    "commands": {
+      "gh": {
+        "executable": "/opt/homebrew/bin/gh",
+        "from": {
+          "session": {
+            "sandbox": {
+              "credentials": [
+                {
+                  "name": "github-keyring",
+                  "endpoint_policy": {
+                    "default": "deny",
+                    "deny": [
+                      {
+                        "method": "POST",
+                        "path": "/user",
+                        "reason": "agents may authenticate to GitHub but not mutate the user resource"
+                      },
+                      {
+                        "method": "POST",
+                        "path": "/repos/nolabs-ai/nono/issues/**",
+                        "reason": "agents may read GitHub issues but not create or comment on them"
+                      },
+                      {
+                        "method": "PATCH",
+                        "path": "/repos/nolabs-ai/nono/issues/**",
+                        "reason": "agents may read GitHub issues but not modify issue state"
+                      },
+                      {
+                        "method": "DELETE",
+                        "path": "/**",
+                        "reason": "destructive GitHub API calls are denied"
+                      }
+                    ],
+                    "allow": [
+                      {
+                        "method": "GET",
+                        "path": "/rate_limit",
+                        "reason": "GitHub rate-limit inspection is permitted"
+                      },
+                      {
+                        "method": "GET",
+                        "path": "/user"
+                      },
+                      {
+                        "method": "GET",
+                        "path": "/repos/nolabs-ai/nono/issues"
+                      },
+                      {
+                        "method": "GET",
+                        "path": "/repos/nolabs-ai/nono/issues/*"
+                      },
+                      {
+                        "method": "GET",
+                        "path": "/repos/nolabs-ai/nono/issues/*/comments"
+                      },
+                      {
+                        "method": "POST",
+                        "path": "/graphql"
+                      }
+                    ]
+                  }
+                }
+              ],
+              "fs_read": [
+                ".",
+                "/opt/homebrew/Cellar/gh/2.89.0/bin"
+              ],
+              "fs_read_file": [
+                "$HOME/.config/gh/hosts.yml",
+                "$HOME/.config/gh/config.yml",
+                "$HOME/.CFUserTextEncoding",
+                "/Library/Preferences/Logging/com.apple.diagnosticd.filter.plist",
+                "/dev/autofs_nowait",
+                "/dev/dtracehelper",
+                "/opt/homebrew/bin/gh"
+              ],
+              "fs_write_file": [
+                "/dev/dtracehelper"
+              ],
+              "environment": {
+                "allow_vars": [
+                  "PATH",
+                  "HOME",
+                  "LANG",
+                  "LC_*",
+                  "TERM",
+                  "GH_TOKEN",
+                  "GITHUB_TOKEN",
+                  "GH_HOST",
+                  "GH_REPO",
+                  "GH_CONFIG_DIR",
+                  "GH_PROMPT_DISABLED",
+                  "GH_NO_UPDATE_NOTIFIER",
+                  "HTTP_PROXY",
+                  "HTTPS_PROXY",
+                  "NO_PROXY",
+                  "http_proxy",
+                  "https_proxy",
+                  "no_proxy",
+                  "NONO_PROXY_TOKEN",
+                  "SSL_CERT_FILE",
+                  "REQUESTS_CA_BUNDLE",
+                  "NODE_EXTRA_CA_CERTS",
+                  "CURL_CA_BUNDLE",
+                  "GIT_SSL_CAINFO"
+                ],
+                "set_vars": {
+                  "GH_PROMPT_DISABLED": "1",
+                  "GH_NO_UPDATE_NOTIFIER": "1"
+                }
+              },
+              "stdio": {
+                "stdout": {
+                  "max_bytes": 1048576,
+                  "on_limit": "truncate"
+                },
+                "stderr": {
+                  "max_bytes": 262144,
+                  "on_limit": "truncate"
+                }
+              }
+            },
+            "invocation_policy": {
+              "default": "deny",
+              "deny": [
+                {
+                  "argv": {
+                    "prefix": [
+                      "api",
+                      "graphql"
+                    ]
+                  },
+                  "reason": "direct GraphQL API calls are not part of the read-only issue demo"
+                },
+                {
+                  "argv": {
+                    "prefix": [
+                      "api",
+                      "-X",
+                      "POST",
+                      "graphql"
+                    ]
+                  },
+                  "reason": "direct GraphQL API calls are not part of the read-only issue demo"
+                },
+                {
+                  "argv": {
+                    "prefix": [
+                      "api",
+                      "--method",
+                      "POST",
+                      "graphql"
+                    ]
+                  },
+                  "reason": "direct GraphQL API calls are not part of the read-only issue demo"
+                },
+                {
+                  "argv": {
+                    "prefix": [
+                      "issue",
+                      "comment"
+                    ]
+                  },
+                  "reason": "agents may read issues but not comment on them"
+                },
+                {
+                  "argv": {
+                    "prefix": [
+                      "issue",
+                      "create"
+                    ]
+                  },
+                  "reason": "agents may read issues but not create them"
+                },
+                {
+                  "argv": {
+                    "prefix": [
+                      "issue",
+                      "close"
+                    ]
+                  },
+                  "reason": "agents may read issues but not close them"
+                },
+                {
+                  "argv": {
+                    "prefix": [
+                      "release",
+                      "upload"
+                    ]
+                  },
+                  "reason": "agents may read issues, but not upload release artifacts!"
+                }
+              ],
+              "allow": [
+                {
+                  "argv": {
+                    "exact": [
+                      "auth",
+                      "token"
+                    ]
+                  },
+                  "reason": "GitHub phantom-token inspection is permitted"
+                },
+                {
+                  "argv": {
+                    "prefix": [
+                      "issue",
+                      "list"
+                    ]
+                  },
+                  "reason": "agents may list GitHub issues"
+                },
+                {
+                  "argv": {
+                    "prefix": [
+                      "issue",
+                      "view"
+                    ]
+                  },
+                  "reason": "agents may view GitHub issues"
+                },
+                {
+                  "argv": {
+                    "prefix": [
+                      "api"
+                    ]
+                  },
+                  "reason": "gh api is constrained by the L7 endpoint policy"
+                }
+              ]
+            }
+          }
+        }
+      }
+    }
+  },
+  "unsafe_macos_seatbelt_rules": [
+    "(allow user-preference-read)"
+  ],
+  "filesystem": {
+    "read": [
+      ".",
+      "/opt/homebrew/Cellar/gh/2.89.0/bin"
+    ],
+    "read_file": [
+      "$HOME/.config/gh/hosts.yml",
+      "$HOME/.config/gh/config.yml",
+      "$HOME/.CFUserTextEncoding",
+      "/Library/Preferences/Logging/com.apple.diagnosticd.filter.plist",
+      "/dev/autofs_nowait",
+      "/dev/dtracehelper",
+      "/opt/homebrew/bin/gh"
+    ],
+    "write_file": [
+      "/dev/dtracehelper"
+    ],
+    "bypass_protection": [
+      "/Library/Preferences/Logging/com.apple.diagnosticd.filter.plist",
+      "/dev/autofs_nowait",
+      "/dev/dtracehelper",
+      "/opt/homebrew/Cellar/gh/2.89.0/bin",
+      "/opt/homebrew/bin/gh"
+    ],
+    "suppress_save_prompt": [
+      "$HOME/.CFUserTextEncoding"
+    ]
+  }
+}

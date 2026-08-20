@@ -1,0 +1,99 @@
+speed: 80
+delay: 50
+clear: true
+show_exit_status: false
+
+setup:
+  - mkdir -p ~/allowed ~/denied
+  - printf 'you can read me\n' > ~/allowed/note.txt
+  - printf 'top secret\n' > ~/denied/secret.txt
+  - mkdir -p .nono-npm-cache .nono-npmrc
+  - printf '//registry.npmjs.org/:_authToken=${NPM_TOKEN}\n' > .nono-npmrc/.npmrc
+  - mkdir -p fake-pkg
+  - printf '{"name":"nono-l7-deny-demo-pkg","version":"0.0.1"}\n' > fake-pkg/package.json
+
+steps:
+  # ------------------------------------------------------------------
+  # Intro: nono gates the filesystem. --allow grants a path; anything
+  # outside the allow-list is denied by the OS sandbox.
+  # ------------------------------------------------------------------
+  - pause
+  - comment: "nono gates the filesystem: --allow grants this path, so the read works."
+    style: blue
+  - text: >-
+      nono run --allow-cwd --allow ~/allowed -- cat ~/allowed/note.txt
+
+  - pause
+  - comment: "Anything outside the allow-list is blocked by the sandbox."
+    style: blue
+  - text: >-
+      nono run --allow-cwd --allow ~/allowed -- cat ~/denied/secret.txt
+
+  # ------------------------------------------------------------------
+  # The profile: an env-var-sourced proxy credential -- a common
+  # CI-style pattern, distinct from github-cli's macOS-keychain source.
+  # ------------------------------------------------------------------
+  - pause
+  - comment: "Credential config: NPM_TOKEN is read from the host environment (not the keychain) and injected upstream by the proxy."
+    style: blue
+  - text: >-
+      jq '.network.custom_credentials.npm | {upstream, credential_key, inject_header, endpoint_policy}' ./npm-profile-macos.json
+
+  - pause
+  - comment: "L7 endpoint policy: GET (view/install/search) allowed, PUT/POST/DELETE (publish/unpublish) denied -- enforced by the proxy before any request reaches the registry."
+    style: blue
+  - text: >-
+      jq '.network.custom_credentials.npm.endpoint_policy | {default, allow: [.allow[] | "\(.method) \(.path)"], deny: [.deny[] | "\(.method) \(.path)"]}' ./npm-profile-macos.json
+
+  # ------------------------------------------------------------------
+  # Credential brokering: the sandbox only ever sees a placeholder.
+  # ------------------------------------------------------------------
+  - pause
+  - comment: "Inside the sandbox, NPM_TOKEN is a dummy placeholder -- the real token (from the host environment) never enters the sandbox at all."
+    style: blue
+  - text: >-
+      nono run -s --no-audit --allow-cwd --profile ./npm-profile-macos.json -- sh -c 'echo "NPM_TOKEN=[$NPM_TOKEN]"'
+
+  - pause
+  - comment: "Yet the real registry read succeeds: nono swapped in the real token from the host's NPM_TOKEN before forwarding."
+    style: blue
+  - text: >-
+      nono run -s --allow-cwd --profile ./npm-profile-macos.json -- npm view left-pad version
+
+  # ------------------------------------------------------------------
+  # Mutations: denied at the L7 layer, before the registry ever sees them.
+  # ------------------------------------------------------------------
+  - pause
+  - comment: "Deny policy: PUT/POST/DELETE (publish/unpublish/deprecate) are blocked by the endpoint policy."
+    style: blue
+  - text: >-
+      jq '.network.custom_credentials.npm.endpoint_policy.deny | map("\(.method) \(.path)")' ./npm-profile-macos.json
+
+  - pause
+  - comment: "L7 deny: npm publish is blocked -- the real registry never sees the PUT."
+    style: blue
+  - text: >-
+      nono run -s --no-audit --no-diagnostics --allow-cwd --profile ./npm-profile-macos.json -- npm publish ./fake-pkg
+
+  - pause
+  - comment: "Child mediation: wrapping npm in sh does not bypass the endpoint policy -- enforcement is at the network layer, not the process layer."
+    style: blue
+  - text: >-
+      nono run -s --no-audit --no-diagnostics --allow-cwd --profile ./npm-profile-macos.json -- sh -c 'npm publish ./fake-pkg'
+
+  - pause
+  - comment: "Confirming from the real npm side: the package was never published."
+    style: blue
+  - text: "npm view nono-l7-deny-demo-pkg 2>&1 | head -3"
+
+  # ------------------------------------------------------------------
+  # Audit trail.
+  # ------------------------------------------------------------------
+  - pause
+  - comment: "Audit trail: the policy decisions nono recorded for a recent command."
+    style: blue
+  - text: "nono audit list --recent 5"
+    capture:
+      name: audit_id
+      pattern: '([0-9a-f]{16})'
+  - text: "nono audit show {audit_id} --json | jq '.network_events | map({sequence, method, path, decision, reason})' 2>/dev/null || nono audit show {audit_id} --json | jq"

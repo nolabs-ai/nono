@@ -1,0 +1,334 @@
+{
+  "extends": "nolabs-ai/claude",
+  "meta": {
+    "name": "demo-kubectl-staging-admin",
+    "version": "1.0.0",
+    "description": "Demo: kubectl is constrained to a staging kubeconfig, Kubernetes API L7 policy, bounded output, and non-destructive cluster administration commands. Policy-only enforcement, no approval backends."
+  },
+  "environment": {
+    "allow_vars": [
+      "PATH",
+      "HOME",
+      "TMPDIR",
+      "TERM",
+      "COLORTERM",
+      "TERM_PROGRAM",
+      "TERM_PROGRAM_VERSION",
+      "LANG",
+      "LC_*"
+    ],
+    "deny_vars": [
+      "AWS_*",
+      "GITHUB_TOKEN",
+      "GH_TOKEN",
+      "KUBECONFIG",
+      "KUBE_TOKEN",
+      "KUBERNETES_BEARER_TOKEN"
+    ]
+  },
+  "workdir": {
+    "access": "readwrite"
+  },
+  "filesystem": {
+    "deny": [
+      "$HOME/.ssh"
+    ],
+    "write": [
+      "~/.local/share/claude/versions",
+      "~/.local/bin"
+    ],
+    "read": [
+      "~/nono-gateway/.config/nono/packages/always-further/claude"
+    ],
+    "suppress_save_prompt": [
+      "~/",
+      "~/Library/Application Support/Arc/User Data",
+      "~/Library/Application Support/BraveSoftware/Brave-Browser",
+      "~/Library/Application Support/Chromium",
+      "~/Library/Application Support/Google/Chrome",
+      "~/Library/Application Support/Microsoft Edge",
+      "~/Library/Application Support/Vivaldi",
+      "~/Library/Application Support/com.operasoftware.Opera",
+      "~/nono-gateway/.config/nono/packages/always-further/claude",
+      "~/.local/bin",
+      "~/dev/nono-workspace/tool-sandbox-package/.git"
+    ]
+  },
+  "command_policies": {
+    "credentials": {
+      "kubernetes-api-staging": {
+        "type": "proxy",
+        "upstream": "https://127.0.0.1:6443",
+        "credential_key": "env://NONO_DEMO_KUBERNETES_BEARER_TOKEN",
+        "env_var": "KUBERNETES_BEARER_TOKEN",
+        "base_url_env_var": "KUBERNETES_API_PROXY_URL",
+        "inject_header": "Authorization",
+        "credential_format": "Bearer {}",
+        "tls_ca": "/Users/lukehinds/dev/nono-workspace/tool-sandbox-package/kubernetes/staging-ca.pem"
+      }
+    },
+    "commands": {
+      "kubectl": {
+        "can_use": [
+          "nono-kube-token-helper"
+        ],
+        "from": {
+          "session": {
+            "sandbox": {
+              "fs_read": [
+                "."
+              ],
+              "fs_read_file": [
+                "/Users/lukehinds/dev/nono-workspace/tool-sandbox-package/kubernetes/staging-proxy.kubeconfig"
+              ],
+              "fs_write": [
+                ".",
+                "$TMPDIR"
+              ],
+              "network": {
+                "allow_all": true
+              },
+              "credentials": [
+                {
+                  "name": "kubernetes-api-staging",
+                  "endpoint_policy": {
+                    "default": "deny",
+                    "deny": [
+                      {
+                        "method": "DELETE",
+                        "path": "/api/v1/namespaces/*",
+                        "reason": "namespace deletion is outside the staging administration profile"
+                      },
+                      {
+                        "method": "DELETE",
+                        "path": "/apis/**",
+                        "reason": "destructive Kubernetes API calls require a separate break-glass profile"
+                      }
+                    ],
+                    "allow": [
+                      {
+                        "method": "PATCH",
+                        "path": "/apis/apps/v1/namespaces/*/deployments/*",
+                        "reason": "deployment mutation is permitted in the staging admin profile"
+                      },
+                      {
+                        "method": "PATCH",
+                        "path": "/apis/apps/v1/namespaces/*/deployments/*/scale",
+                        "reason": "deployment scaling is permitted in the staging admin profile"
+                      },
+                      {
+                        "method": "GET",
+                        "path": "/version"
+                      },
+                      {
+                        "method": "GET",
+                        "path": "/api"
+                      },
+                      {
+                        "method": "GET",
+                        "path": "/api/v1"
+                      },
+                      {
+                        "method": "GET",
+                        "path": "/apis"
+                      },
+                      {
+                        "method": "GET",
+                        "path": "/api/v1/namespaces"
+                      },
+                      {
+                        "method": "GET",
+                        "path": "/api/v1/namespaces/*"
+                      },
+                      {
+                        "method": "GET",
+                        "path": "/api/v1/namespaces/*/pods/**"
+                      },
+                      {
+                        "method": "GET",
+                        "path": "/api/v1/namespaces/*/services/**"
+                      },
+                      {
+                        "method": "GET",
+                        "path": "/apis/apps/v1/namespaces/*/deployments/**"
+                      },
+                      {
+                        "method": "GET",
+                        "path": "/apis/batch/v1/namespaces/*/jobs/**"
+                      }
+                    ]
+                  }
+                }
+              ],
+              "environment": {
+                "allow_vars": [
+                  "PATH",
+                  "HOME",
+                  "TMPDIR",
+                  "LANG",
+                  "LC_*",
+                  "KUBECONFIG",
+                  "KUBERNETES_API_PROXY_URL",
+                  "KUBERNETES_BEARER_TOKEN"
+                ],
+                "set_vars": {
+                  "KUBECONFIG": "/Users/lukehinds/dev/nono-workspace/tool-sandbox-package/kubernetes/staging-proxy.kubeconfig"
+                }
+              },
+              "stdio": {
+                "stdout": {
+                  "max_bytes": 1048576,
+                  "on_limit": "truncate"
+                },
+                "stderr": {
+                  "max_bytes": 262144,
+                  "on_limit": "terminate"
+                }
+              }
+            },
+            "invocation_policy": {
+              "default": "deny",
+              "deny": [
+                {
+                  "argv": {
+                    "prefix": [
+                      "delete",
+                      "namespace"
+                    ]
+                  },
+                  "reason": "kubectl delete namespace is blocked in the staging admin profile"
+                },
+                {
+                  "argv": {
+                    "prefix": [
+                      "delete",
+                      "namespaces"
+                    ]
+                  },
+                  "reason": "kubectl delete namespaces is blocked in the staging admin profile"
+                },
+                {
+                  "argv": {
+                    "prefix": [
+                      "delete",
+                      "ns"
+                    ]
+                  },
+                  "reason": "kubectl delete ns is blocked in the staging admin profile"
+                }
+              ],
+              "allow": [
+                {
+                  "argv": {
+                    "prefix": [
+                      "rollout",
+                      "restart"
+                    ]
+                  },
+                  "reason": "rollout restart is permitted in the staging admin profile"
+                },
+                {
+                  "argv": {
+                    "prefix": [
+                      "rollout",
+                      "status"
+                    ]
+                  }
+                },
+                {
+                  "argv": {
+                    "prefix": [
+                      "scale"
+                    ]
+                  },
+                  "reason": "scaling is permitted in the staging admin profile"
+                },
+                {
+                  "argv": {
+                    "prefix": [
+                      "get"
+                    ]
+                  }
+                },
+                {
+                  "argv": {
+                    "prefix": [
+                      "describe"
+                    ]
+                  }
+                },
+                {
+                  "argv": {
+                    "exact": [
+                      "config",
+                      "current-context"
+                    ]
+                  }
+                },
+                {
+                  "argv": {
+                    "exact": [
+                      "version",
+                      "--client"
+                    ]
+                  }
+                }
+              ]
+            }
+          }
+        },
+        "executable": "/opt/homebrew/bin/kubectl",
+        "allow_writable_executable": true
+      },
+      "nono-kube-token-helper": {
+        "from": {
+          "kubectl": {
+            "sandbox": {
+              "fs_read": [
+                "/Users/lukehinds/dev/nono-workspace/tool-sandbox-package/kubernetes"
+              ],
+              "fs_read_file": [
+                "/Users/lukehinds/dev/nono-workspace/tool-sandbox-package/kubernetes/nono-kube-token-helper"
+              ],
+              "fs_write": [
+                "$TMPDIR"
+              ],
+              "environment": {
+                "allow_vars": [
+                  "PATH",
+                  "HOME",
+                  "TMPDIR",
+                  "LANG",
+                  "LC_*",
+                  "KUBERNETES_BEARER_TOKEN"
+                ]
+              },
+              "stdio": {
+                "stdout": {
+                  "max_bytes": 4096,
+                  "on_limit": "terminate"
+                },
+                "stderr": {
+                  "max_bytes": 4096,
+                  "on_limit": "terminate"
+                }
+              }
+            },
+            "invocation_policy": {
+              "default": "deny",
+              "allow": [
+                {
+                  "argv": {
+                    "exact": []
+                  }
+                }
+              ]
+            }
+          }
+        },
+        "executable": "/Users/lukehinds/dev/nono-workspace/tool-sandbox-package/kubernetes/nono-kube-token-helper",
+        "allow_writable_executable": true
+      }
+    }
+  }
+}

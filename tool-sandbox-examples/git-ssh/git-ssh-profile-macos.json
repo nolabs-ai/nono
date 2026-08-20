@@ -1,0 +1,61 @@
+{
+  "meta": {
+    "name": "git-ssh-readonly",
+    "version": "0.1.0",
+    "description": "Showcase: SSH-agent socket brokering for git-over-SSH. nono mediates a connect() to the real ssh-agent socket so ssh can request signatures for the SSH handshake -- the private key material itself never enters the sandbox, whether it lives on disk or only inside a hardware-backed agent (e.g. 1Password, a YubiKey). Read-only operations (clone/fetch/pull/ls-remote) are permitted; push is denied at the argv layer before any network connection is attempted."
+  },
+  "workdir": { "access": "readwrite" },
+  "command_policies": {
+    "credentials": {
+      "ssh-agent": {
+        "type": "local-socket",
+        "path": "$SSH_AUTH_SOCK",
+        "mode": "connect",
+        "env_var": "SSH_AUTH_SOCK"
+      }
+    },
+    "commands": {
+      "git": {
+        "executable": "/opt/homebrew/bin/git",
+        "can_use": ["ssh"],
+        "from": {
+          "session": {
+            "sandbox": {
+              "use_credentials": ["ssh-agent"],
+              "fs_read": [".", "/opt/homebrew"],
+              "fs_read_file": ["/opt/homebrew/bin/git", "$HOME/.gitconfig"],
+              "fs_write": ["."],
+              "environment": {
+                "allow_vars": ["PATH", "HOME", "LANG", "LC_*", "TERM", "SSH_AUTH_SOCK"],
+                "set_vars": {}
+              }
+            },
+            "invocation_policy": {
+              "default": "deny",
+              "allow": [
+                { "argv": { "prefix": ["clone"] }, "reason": "cloning a repo is read-only" },
+                { "argv": { "prefix": ["fetch"] }, "reason": "fetching is read-only" },
+                { "argv": { "prefix": ["pull"] }, "reason": "pulling is read-only" },
+                { "argv": { "prefix": ["ls-remote"] }, "reason": "listing remote refs is read-only" }
+              ],
+              "deny": [
+                { "argv": { "prefix": ["push"] }, "reason": "pushing is not part of the read-only demo" }
+              ]
+            }
+          }
+        }
+      },
+      "ssh": {
+        "from": {
+          "git": {
+            "use_credentials": ["ssh-agent"],
+            "fs_read_file": ["$HOME/.ssh/known_hosts", "$HOME/.ssh/config"],
+            "fs_write_file": ["$HOME/.ssh/known_hosts"],
+            "network": { "allow_all": true },
+            "argv_prepend": ["-o", "ControlMaster=no", "-o", "ControlPath=none"]
+          }
+        }
+      }
+    }
+  }
+}

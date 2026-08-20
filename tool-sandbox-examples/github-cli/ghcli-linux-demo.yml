@@ -1,0 +1,63 @@
+speed: 80
+delay: 50
+clear: true
+show_exit_status: false
+
+setup:
+  - export GH_PROFILE=./ghcli-profile-linux.json
+  - export GH_TOKEN="$(gh auth token)"
+
+steps:
+  - pause
+  - text: >-
+      jq '{approval_backends: .command_policies.approval_backends, credential: .command_policies.credentials["github-api"].credential_key}' "$GH_PROFILE"
+    comment: >-
+      Show the local approval backend and credential source. Expected: approval uses the built-in terminal backend named local-policy, while the Linux demo loads the real GitHub token from GH_TOKEN in the parent shell.
+
+  - pause
+  - text: >-
+      jq '{command_approve: .command_policies.commands.gh.from.session.invocation_policy.approve, endpoint_approve: .command_policies.commands.gh.from.session.sandbox.credentials[0].endpoint_policy.approve}' "$GH_PROFILE"
+    comment: >-
+      Show the approval rules. Expected: gh auth token and GET /rate_limit require local approval before they run.
+
+  - pause
+  - text: >-
+      nono run -s --no-audit --allow-cwd --profile "$GH_PROFILE" -- gh auth token
+    comment: >-
+      Exercise command approval and credential brokering. Expected: nono asks for local approval, then gh prints a phantom token rather than the real GitHub token.
+
+  - pause
+  - text: >-
+      nono run -s --no-audit --allow-cwd --profile "$GH_PROFILE" -- gh api rate_limit | jq '{core: .resources.core}'
+    comment: >-
+      Exercise endpoint approval. Expected: nono asks for local approval for GET /rate_limit, then the proxy injects the real upstream credential and GitHub returns rate-limit data.
+
+  - pause
+  - text: >-
+      nono run -s --no-audit --allow-cwd --profile "$GH_PROFILE" -- gh issue view 1052 --repo always-further/nono --json title,url,state | jq
+    comment: >-
+      Exercise an allowed high-level read. Expected: gh issue view succeeds because the invocation policy allows issue reads.
+
+  - pause
+  - text: >-
+      nono run -s --no-audit --allow-cwd --profile "$GH_PROFILE" -- gh api repos/always-further/nono/issues/1052 | jq .title
+    comment: >-
+      Exercise an allowed L7 API read. Expected: gh api succeeds because endpoint policy allows GET issue paths.
+
+  - pause
+  - text: >-
+      nono run -s --no-audit --no-diagnostics --allow-cwd --profile "$GH_PROFILE" -- gh issue comment 1052 --repo always-further/nono --body 'nono arg deny test'
+    comment: >-
+      Exercise invocation-policy denial. Expected: nono blocks gh issue comment before the GitHub API is contacted.
+
+  - pause
+  - text: >-
+      nono run -s --no-audit --no-diagnostics --allow-cwd --profile "$GH_PROFILE" -- gh api -X POST repos/always-further/nono/issues/1052/comments -f body='nono L7 deny test'
+    comment: >-
+      Exercise endpoint-policy denial. Expected: the invocation is allowed through gh api, but the proxy denies the POST to the issue comments endpoint.
+
+  - pause
+  - text: >-
+      nono run -s --no-audit --no-diagnostics --allow-cwd --profile "$GH_PROFILE" -- sh -c 'gh issue comment 1052 --repo always-further/nono --body "wrapped bypass attempt"'
+    comment: >-
+      Exercise child-command mediation. Expected: wrapping gh in sh does not bypass policy; nono still blocks the child gh issue comment.

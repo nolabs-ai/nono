@@ -1,0 +1,273 @@
+{
+  "extends": ["always-further/claude"],
+  "meta": {
+    "name": "gh-cli-demo",
+    "version": "0.1.0",
+    "description": "Demo: GitHub CLI can read issues through L7 filtering, while issue mutations are denied.",
+    "author": null
+  },
+  "security": {
+    "signal_mode": null,
+    "process_info_mode": null,
+    "ipc_mode": null,
+    "capability_elevation": null,
+    "wsl2_proxy_policy": null
+  },
+  "groups": {
+    "include": [],
+    "exclude": []
+  },
+  "commands": {
+    "allow": [],
+    "deny": []
+  },
+  "filesystem": {
+    "allow": [],
+    "read": ["~/demos/.git", "/usr/bin", "/usr/lib64"],
+    "write": [],
+    "allow_file": [],
+    "read_file": ["/usr/bin/gh"],
+    "write_file": [],
+    "bypass_protection": [],
+    "suppress_save_prompt": [
+      "/etc/passwd",
+      "~/.config/gh",
+      "~/.local/share/gh",
+      "~/.local/state/gh",
+      "~/.terminfo"
+    ]
+  },
+  "diagnostics": {
+    "suppress_system_services": []
+  },
+  "linux": {
+    "af_unix_mediation": null
+  },
+  "network": {},
+  "env_credentials": {},
+  "environment": null,
+  "command_policies": {
+    "executable_dirs": [],
+    "allow_writable_executables": false,
+    "entrypoint": null,
+    "approval_backends": {
+      "local-webhook": {
+        "type": "webhook",
+        "url": "http://127.0.0.1:8765/approve",
+        "timeout_secs": 5
+      }
+    },
+    "approval_defaults": {
+      "backend": "local-webhook",
+      "timeout_secs": 5
+    },
+    "credentials": {
+      "github-api": {
+        "type": "proxy",
+        "upstream": "https://api.github.com",
+        "credential_key": "env://GH_TOKEN",
+        "env_var": "GH_TOKEN",
+        "inject_header": "Authorization",
+        "credential_format": "Bearer {}"
+      }
+    },
+    "commands": {
+      "gh": {
+        "executable": "/usr/bin/gh",
+        "allow_writable_executable": false,
+        "from": {
+          "session": {
+            "sandbox": {
+              "fs_read": [".", "/usr/bin", "/usr/lib64"],
+              "fs_write": ["/tmp"],
+              "fs_read_file": ["/usr/bin/gh"],
+              "fs_write_file": [],
+              "credentials": [
+                {
+                  "name": "github-api",
+                  "endpoint_policy": {
+                    "default": "deny",
+                    "deny": [
+                      {
+                        "method": "POST",
+                        "path": "/user",
+                        "reason": "agents may authenticate to GitHub but not mutate the user resource"
+                      },
+                      {
+                        "method": "POST",
+                        "path": "/repos/always-further/nono/issues/**",
+                        "reason": "agents may read GitHub issues but not create or comment on them"
+                      },
+                      {
+                        "method": "PATCH",
+                        "path": "/repos/always-further/nono/issues/**",
+                        "reason": "agents may read GitHub issues but not modify issue state"
+                      },
+                      {
+                        "method": "DELETE",
+                        "path": "/**",
+                        "reason": "destructive GitHub API calls are denied"
+                      }
+                    ],
+                    "approve": [
+                      {
+                        "method": "GET",
+                        "path": "/rate_limit",
+                        "backend": "local-webhook",
+                        "reason": "GitHub rate-limit inspection requires approval in this demo"
+                      }
+                    ],
+                    "allow": [
+                      {
+                        "method": "GET",
+                        "path": "/user"
+                      },
+                      {
+                        "method": "GET",
+                        "path": "/repos/always-further/nono/issues"
+                      },
+                      {
+                        "method": "GET",
+                        "path": "/repos/always-further/nono/issues/*"
+                      },
+                      {
+                        "method": "GET",
+                        "path": "/repos/always-further/nono/issues/*/comments"
+                      },
+                      {
+                        "method": "POST",
+                        "path": "/graphql"
+                      }
+                    ]
+                  }
+                }
+              ],
+              "environment": {
+                "allow_vars": [
+                  "PATH",
+                  "HOME",
+                  "LANG",
+                  "LC_*",
+                  "TERM",
+                  "GH_TOKEN",
+                  "GITHUB_TOKEN",
+                  "GH_HOST",
+                  "GH_REPO",
+                  "GH_PROMPT_DISABLED",
+                  "GH_NO_UPDATE_NOTIFIER",
+                  "HTTP_PROXY",
+                  "HTTPS_PROXY",
+                  "NO_PROXY",
+                  "http_proxy",
+                  "https_proxy",
+                  "no_proxy",
+                  "NONO_PROXY_TOKEN",
+                  "SSL_CERT_FILE",
+                  "REQUESTS_CA_BUNDLE",
+                  "NODE_EXTRA_CA_CERTS",
+                  "CURL_CA_BUNDLE",
+                  "GIT_SSL_CAINFO"
+                ],
+                "set_vars": {
+                  "GH_CONFIG_DIR": "/tmp/nono-gh-config",
+                  "GH_PROMPT_DISABLED": "1",
+                  "GH_NO_UPDATE_NOTIFIER": "1"
+                }
+              }
+            },
+            "invocation_policy": {
+              "default": "deny",
+              "deny": [
+                {
+                  "argv": {
+                    "prefix": ["api", "graphql"]
+                  },
+                  "reason": "direct GraphQL API calls are not part of the read-only issue demo"
+                },
+                {
+                  "argv": {
+                    "prefix": ["api", "-X", "POST", "graphql"]
+                  },
+                  "reason": "direct GraphQL API calls are not part of the read-only issue demo"
+                },
+                {
+                  "argv": {
+                    "prefix": ["api", "--method", "POST", "graphql"]
+                  },
+                  "reason": "direct GraphQL API calls are not part of the read-only issue demo"
+                },
+                {
+                  "argv": {
+                    "prefix": ["issue", "comment"]
+                  },
+                  "reason": "agents may read issues but not comment on them"
+                },
+                {
+                  "argv": {
+                    "prefix": ["issue", "create"]
+                  },
+                  "reason": "agents may read issues but not create them"
+                },
+                {
+                  "argv": {
+                    "prefix": ["issue", "close"]
+                  },
+                  "reason": "agents may read issues but not close them"
+                }
+              ],
+              "approve": [
+                {
+                  "argv": {
+                    "exact": ["auth", "token"]
+                  },
+                  "backend": "local-webhook",
+                  "reason": "GitHub phantom-token inspection requires approval in this demo"
+                }
+              ],
+              "allow": [
+                {
+                  "argv": {
+                    "prefix": ["issue", "list"]
+                  },
+                  "reason": "agents may list GitHub issues"
+                },
+                {
+                  "argv": {
+                    "prefix": ["issue", "view"]
+                  },
+                  "reason": "agents may view GitHub issues"
+                },
+                {
+                  "argv": {
+                    "prefix": ["api"]
+                  },
+                  "reason": "gh api is constrained by the L7 endpoint policy"
+                }
+              ]
+            }
+          }
+        }
+      }
+    },
+    "deny_direct_exec_bypass": []
+  },
+  "workdir": {
+    "access": "readwrite"
+  },
+  "hooks": {},
+  "session_hooks": {},
+  "rollback": {
+    "exclude_patterns": [],
+    "exclude_globs": []
+  },
+  "open_urls": null,
+  "allow_launch_services": null,
+  "allow_gpu": null,
+  "allow_parent_of_protected": null,
+  "interactive": false,
+  "skipdirs": [],
+  "packs": [],
+  "binary": null,
+  "command_args": [],
+  "unsafe_macos_seatbelt_rules": []
+}

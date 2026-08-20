@@ -1,0 +1,4 @@
+/kubernetes/staging-ca.pem
+/kubernetes/staging-proxy.kubeconfig
+/kubernetes/staging.yaml
+/kubernetes/.kube/

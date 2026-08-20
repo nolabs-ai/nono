@@ -1,0 +1,58 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nono-demo-web
+  namespace: nono-demo-system
+  labels:
+    app.kubernetes.io/name: nono-demo-web
+    app.kubernetes.io/part-of: nono-approval-demo
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: nono-demo-web
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: nono-demo-web
+        app.kubernetes.io/part-of: nono-approval-demo
+    spec:
+      containers:
+        - name: web
+          image: registry.k8s.io/e2e-test-images/agnhost:2.45
+          args:
+            - netexec
+            - --http-port=8080
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nono-demo-web
+  namespace: nono-demo-system
+  labels:
+    app.kubernetes.io/name: nono-demo-web
+    app.kubernetes.io/part-of: nono-approval-demo
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: nono-demo-web
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

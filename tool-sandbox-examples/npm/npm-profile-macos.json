@@ -1,0 +1,54 @@
+{
+  "meta": {
+    "name": "npm-registry-readonly",
+    "version": "0.1.0",
+    "description": "Showcase: npm registry access with an env-var-sourced proxy credential (a common CI-style pattern: a token exported into the environment, distinct from github-cli's macOS-keychain source). The real NPM_TOKEN never enters the sandbox -- nono reads it from the host environment and injects it upstream. Read-only registry access (GET) is permitted; publish/unpublish (PUT/DELETE) are denied at the L7 endpoint-policy layer before they reach the real registry."
+  },
+  "workdir": { "access": "read" },
+  "network": {
+    "tls_intercept": {
+      "ca_lifecycle": "session"
+    },
+    "credentials": ["npm"],
+    "custom_credentials": {
+      "npm": {
+        "upstream": "https://registry.npmjs.org",
+        "credential_key": "env://NPM_TOKEN",
+        "inject_header": "Authorization",
+        "credential_format": "Bearer {}",
+        "endpoint_policy": {
+          "default": { "decision": "deny" },
+          "allow": [
+            { "method": "GET", "path": "/**", "reason": "read-only registry access (view/install/search) is permitted" }
+          ],
+          "deny": [
+            { "method": "PUT", "path": "/**", "reason": "publish is denied" },
+            { "method": "POST", "path": "/**", "reason": "deprecate/other mutating calls are denied" },
+            { "method": "DELETE", "path": "/**", "reason": "unpublish is denied" }
+          ]
+        }
+      }
+    }
+  },
+  "environment": {
+    "allow_vars": [
+      "PATH", "HOME", "LANG", "LC_*", "TERM",
+      "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "NODE_EXTRA_CA_CERTS",
+      "NPM_CONFIG_CACHE", "NPM_CONFIG_USERCONFIG",
+      "NPM_TOKEN"
+    ],
+    "set_vars": {
+      "NPM_CONFIG_CACHE": "./.nono-npm-cache",
+      "NPM_CONFIG_USERCONFIG": "./.nono-npmrc/.npmrc",
+      "NPM_TOKEN": "dummy-placeholder-token"
+    }
+  },
+  "filesystem": {
+    "read": [".", "/opt/homebrew"],
+    "allow": ["./.nono-npm-cache"],
+    "read_file": ["./.nono-npmrc/.npmrc"]
+  },
+  "commands": {
+    "allow": ["npm"]
+  }
+}

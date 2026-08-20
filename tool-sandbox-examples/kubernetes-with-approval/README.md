@@ -1,5 +1,7 @@
 # Kubernetes Tool-Sandbox Demo
 
+Author: [@lukehinds](https://github.com/lukehinds)
+
 This demo runs `kubectl` through nono command policy and a brokered Kubernetes
 API credential. The sandboxed `kubectl` does not receive the real ServiceAccount
 token. It receives a per-run phantom token from `nono-kube-token-helper`, sends

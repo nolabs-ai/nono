@@ -1,5 +1,7 @@
 # GitHub CLI Tool-Sandbox Demo
 
+Author: [@lukehinds](https://github.com/lukehinds)
+
 This demo runs `gh` through nono command policy and a brokered GitHub API
 credential. The sandboxed `gh` process receives a nono phantom `GH_TOKEN`; the
 nono proxy validates that token, strips it, and injects the real GitHub

@@ -1,5 +1,7 @@
 # aws-cli — nono AWS SigV4 credential-brokering demo
 
+Author: [@kipz](https://github.com/kipz)
+
 A [demonator](https://github.com/nolabs-ai/demonator) walkthrough showing how **nono** brokers
 AWS credentials for the `aws` CLI without a bearer token or credential file ever touching the
 sandbox: nono resolves your real AWS credentials on the host (via the standard profile/default

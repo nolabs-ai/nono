@@ -1,5 +1,7 @@
 # git-ssh — nono SSH-agent socket brokering demo
 
+Author: [@kipz](https://github.com/kipz)
+
 A [demonator](https://github.com/nolabs-ai/demonator) walkthrough showing how **nono** brokers
 SSH identity for `git` over SSH via a mediated connection to the real **ssh-agent socket**,
 instead of a bearer token (`github-cli`, `npm`) or a signed request (`aws-cli`). The sandboxed process

@@ -1,5 +1,7 @@
 # npm — nono env-var credential-brokering demo
 
+Author: [@kipz](https://github.com/kipz)
+
 A [demonator](https://github.com/nolabs-ai/demonator) walkthrough showing how **nono** brokers an
 npm registry token sourced from the host **environment** rather than the macOS keychain (the
 source `github-cli` uses) -- a common CI-style pattern where a token is exported into the process

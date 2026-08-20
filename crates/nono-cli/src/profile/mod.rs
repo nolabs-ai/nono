@@ -2141,8 +2141,9 @@ pub struct RollbackConfig {
 pub struct EnvironmentConfig {
     /// Allow-list of environment variable names passed to the sandboxed process.
     ///
-    /// Supports exact names (`"PATH"`) and prefix patterns ending with `*`
-    /// (`"AWS_*"` matches `AWS_REGION`, `AWS_SECRET_ACCESS_KEY`, etc.).
+    /// Supports exact names (`"PATH"`), and glob patterns where `*` may appear
+    /// anywhere in the name (`"AWS_*"`, `"*_TOKEN"`, `"*SECRET*"`). A bare `"*"`
+    /// matches everything.
     ///
     /// - Absent (field not written in JSON): no filter, all variables pass through.
     /// - `[]` (explicitly empty): blocks all inherited variables; only nono-injected
@@ -2155,12 +2156,18 @@ pub struct EnvironmentConfig {
 
     /// Deny-list of environment variable names stripped from the sandboxed process.
     ///
-    /// Supports exact names (`"GH_TOKEN"`) and prefix patterns ending with `*`
-    /// (`"GITHUB_*"` strips all vars starting with `GITHUB_`).
-    /// Denied vars are stripped even if they also appear in `allow_vars`.
-    /// Use this to strip specific secrets while keeping everything else inherited.
+    /// Supports the same glob syntax as `allow_vars` (`"GH_TOKEN"`, `"GITHUB_*"`,
+    /// `"*_TOKEN"`, `"*SECRET*"`). Denied vars are stripped even if they also
+    /// match `allow_vars`. Use this to strip specific secrets while keeping
+    /// everything else inherited.
     #[serde(default)]
     pub deny_vars: Vec<String>,
+
+    /// When true, `allow_vars`/`deny_vars` patterns are matched against
+    /// variable names case-insensitively (so `*token*` also matches
+    /// `JENKINS_TOKEN`, `jenkins_token`, and `Jenkins_Token`).
+    #[serde(default)]
+    pub case_insensitive_vars: bool,
 
     /// Static environment variables injected into the sandboxed process.
     ///
@@ -3743,6 +3750,11 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
                     (Some(base), Some(child)) => Some(dedup_append(base, child)),
                 },
                 deny_vars: dedup_append(&base_env.deny_vars, &child_env.deny_vars),
+                // Sticky: once a base profile opts into case-insensitive
+                // matching, a child cannot silently reintroduce a
+                // case-sensitive bypass by omitting the flag.
+                case_insensitive_vars: base_env.case_insensitive_vars
+                    || child_env.case_insensitive_vars,
                 set_vars: {
                     let mut merged = base_env.set_vars.clone();
                     merged.extend(child_env.set_vars.clone());
@@ -5091,6 +5103,7 @@ mod tests {
             environment: Some(EnvironmentConfig {
                 allow_vars: None,
                 deny_vars: vec!["GH_TOKEN".into()],
+                case_insensitive_vars: false,
                 set_vars: Default::default(),
             }),
             ..Default::default()
@@ -5099,6 +5112,7 @@ mod tests {
             environment: Some(EnvironmentConfig {
                 allow_vars: None,
                 deny_vars: vec!["ANTHROPIC_API_KEY".into()],
+                case_insensitive_vars: false,
                 set_vars: Default::default(),
             }),
             ..Default::default()
@@ -5116,6 +5130,7 @@ mod tests {
             environment: Some(EnvironmentConfig {
                 allow_vars: None,
                 deny_vars: vec!["GH_TOKEN".into(), "ANTHROPIC_API_KEY".into()],
+                case_insensitive_vars: false,
                 set_vars: Default::default(),
             }),
             ..Default::default()
@@ -5124,6 +5139,7 @@ mod tests {
             environment: Some(EnvironmentConfig {
                 allow_vars: None,
                 deny_vars: vec!["ANTHROPIC_API_KEY".into()],
+                case_insensitive_vars: false,
                 set_vars: Default::default(),
             }),
             ..Default::default()

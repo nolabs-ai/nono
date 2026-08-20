@@ -4143,6 +4143,26 @@ mod tests {
     }
 
     #[test]
+    fn export_env_accepts_single_mid_string_wildcard() {
+        // validate_env_var_patterns permits infix `*`; only a *repeated*
+        // wildcard (>1 `*` in one pattern) is rejected below.
+        let mut config = active_git_config();
+        if let Some(git) = config.commands.get_mut("git") {
+            git.export_env = vec!["A*B".to_string()];
+        }
+
+        let report =
+            validate_command_policies(Some(&config), CommandPolicyValidationScope::Resolved);
+
+        assert!(
+            !report
+                .errors
+                .iter()
+                .any(|finding| finding.code == "invalid_export_env")
+        );
+    }
+
+    #[test]
     fn session_export_env_rejects_reserved_patterns() {
         let mut config = active_git_config();
         config.session_export_env = vec!["NONO_CAP_FILE".to_string()];

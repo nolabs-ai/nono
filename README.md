@@ -52,7 +52,7 @@ From here **fork the config**, tweak it, theme it, make it your own, and share i
 
 >  "Security is embedded in everything we build at Okta. nono gives us the confidence to innovate with AI agents by isolating their execution in a highly secure, pol
 icy-controlled sandbox. It ensures our credentials remain locked down and protected, without sacrificing developer velocity"
-> Principal Engineer, Okta
+> Leonardo Zanivan", Principal Engineer, Okta
 
 **Copied by many** — nono pioneered the zero-latency, zero-setup agent sandbox, and continues to innovate and lead the way in agent sandboxing.
 

@@ -419,9 +419,9 @@ async fn handle_h2_stream(
             .ok()
             .and_then(|v| {
                 nonce_consumer.as_deref().and_then(|consumer| {
-                    ctx.nonce_resolver.as_deref().and_then(|resolver| {
-                        handle::resolve_nonce_in_header_value(v, consumer, resolver)
-                    })
+                    ctx.nonce_resolver
+                        .as_deref()
+                        .and_then(|resolver| resolver.rewrite_header_value(v, consumer))
                 })
             })
             .and_then(|resolved| HeaderValue::from_str(&resolved).ok());
@@ -1953,10 +1953,12 @@ mod tests {
                         crate::config::OAuthTokenResponseFieldConfig {
                             path: "access_token".to_string(),
                             kind: crate::config::OAuthTokenResponseFieldKind::Opaque,
+                            format: None,
                         },
                         crate::config::OAuthTokenResponseFieldConfig {
                             path: "refresh_token".to_string(),
                             kind: crate::config::OAuthTokenResponseFieldKind::Opaque,
+                            format: None,
                         },
                     ],
                     request_body: crate::config::OAuthTokenRequestBodyFormat::Auto,

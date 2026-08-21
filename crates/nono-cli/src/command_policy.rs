@@ -418,6 +418,11 @@ pub struct CommandCredentialConfig {
     pub tls_client_key: Option<String>,
     #[serde(default)]
     pub source: Option<AmbientCredentialSourceConfig>,
+    /// Literal template for the visible phantom, `{}` standing in for the random
+    /// body (e.g. `"sk-ant-oat01-{}"`), so a client that classifies a credential by
+    /// sniffing a token prefix still recognises it. `ambient` credentials only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
 }
 
 impl Default for CommandCredentialConfig {
@@ -436,6 +441,7 @@ impl Default for CommandCredentialConfig {
             tls_client_cert: None,
             tls_client_key: None,
             source: None,
+            format: None,
         }
     }
 }
@@ -1771,14 +1777,28 @@ fn validate_intercept_rules(
                 format!("command '{command_name}' intercept rule {i} respond stdout exceeds 1 MiB"),
             );
         }
-        if let InterceptActionConfig::CaptureCredential { credential, .. } = &rule.action {
+        if let InterceptActionConfig::CaptureCredential {
+            credential, shape, ..
+        } = &rule.action
+        {
             validate_identifier(
                 &format!("commands.{command_name}.intercept[{i}].action.credential"),
                 credential,
                 report,
             );
             match config.credentials.get(credential) {
-                Some(config) if config.credential_type == CommandCredentialType::Ambient => {}
+                Some(cred) if cred.credential_type == CommandCredentialType::Ambient => {
+                    // A `format` here would land inside the JWT signature
+                    // segment rather than shaping the visible token.
+                    if *shape == CapturedNonceShape::Jwt && cred.format.is_some() {
+                        report.error(
+                            "invalid_credential_capture",
+                            format!(
+                                "command '{command_name}' intercept rule {i} capture_credential shape 'jwt' cannot be combined with credential '{credential}' format"
+                            ),
+                        );
+                    }
+                }
                 Some(_) => {
                     report.error(
                         "invalid_credential_capture",
@@ -2479,6 +2499,19 @@ fn validate_credential(
     credential: &CommandCredentialConfig,
     report: &mut CommandPolicyValidationReport,
 ) {
+    if let Some(template) = &credential.format {
+        if credential.credential_type != CommandCredentialType::Ambient {
+            report.error(
+                "invalid_credential",
+                format!("credential '{name}' format is only valid for ambient credentials"),
+            );
+        } else if let Err(err) = nono_proxy::token::PhantomTemplate::parse(template) {
+            report.error(
+                "invalid_credential",
+                format!("ambient credential '{name}' {err}"),
+            );
+        }
+    }
     match credential.credential_type {
         CommandCredentialType::LocalSocket => {
             if credential.path.as_deref().unwrap_or_default().is_empty() {
@@ -6229,5 +6262,115 @@ mod tests {
         let restored: CommandHashCacheFile =
             serde_json::from_str("{}").expect("missing entries should default to empty");
         assert!(restored.entries.is_empty());
+    }
+
+    fn validate_one(credential: &CommandCredentialConfig) -> CommandPolicyValidationReport {
+        let mut report = CommandPolicyValidationReport::default();
+        validate_credential("cred", credential, &mut report);
+        report
+    }
+
+    #[test]
+    fn ambient_format_single_placeholder_accepted() {
+        let cred = CommandCredentialConfig {
+            credential_type: CommandCredentialType::Ambient,
+            format: Some("sk-ant-oat01-{}".to_string()),
+            ..Default::default()
+        };
+        assert!(
+            validate_one(&cred).errors.is_empty(),
+            "single-placeholder ambient format should validate"
+        );
+    }
+
+    #[test]
+    fn ambient_format_with_control_characters_rejected() {
+        let cred = CommandCredentialConfig {
+            credential_type: CommandCredentialType::Ambient,
+            format: Some("a\r\nX: y{}".to_string()),
+            ..Default::default()
+        };
+        let errors = validate_one(&cred).errors;
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("must not contain control characters")),
+            "expected control-character error, got {errors:?}"
+        );
+    }
+
+    fn capture_credential_config(
+        format: Option<&str>,
+        shape: CapturedNonceShape,
+    ) -> CommandPoliciesConfig {
+        let mut config = active_git_config();
+        config.credentials.insert(
+            "anthropic".to_string(),
+            CommandCredentialConfig {
+                credential_type: CommandCredentialType::Ambient,
+                format: format.map(str::to_string),
+                ..Default::default()
+            },
+        );
+        let git = config.commands.get_mut("git").expect("git command");
+        git.intercept.push(InterceptRuleConfig {
+            args: Some(vec!["status".to_string()]),
+            match_config: None,
+            action: InterceptActionConfig::CaptureCredential {
+                credential: "anthropic".to_string(),
+                grant_to: Vec::new(),
+                shape,
+            },
+            sandbox: None,
+        });
+        config
+    }
+
+    fn capture_shape_errors(format: Option<&str>, shape: CapturedNonceShape) -> Vec<String> {
+        validate_command_policies(
+            Some(&capture_credential_config(format, shape)),
+            CommandPolicyValidationScope::Resolved,
+        )
+        .errors
+        .into_iter()
+        .filter(|finding| finding.code == "invalid_credential_capture")
+        .map(|finding| finding.message)
+        .collect()
+    }
+
+    #[test]
+    fn ambient_format_with_jwt_capture_shape_rejected() {
+        let errors = capture_shape_errors(Some("sk-ant-oat01-{}"), CapturedNonceShape::Jwt);
+        assert!(
+            errors
+                .iter()
+                .any(|message| message.contains("shape 'jwt' cannot be combined")),
+            "expected jwt-shape/format conflict, got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn ambient_format_with_opaque_capture_shape_accepted() {
+        assert!(
+            capture_shape_errors(Some("sk-ant-oat01-{}"), CapturedNonceShape::Opaque).is_empty()
+        );
+        assert!(capture_shape_errors(None, CapturedNonceShape::Jwt).is_empty());
+    }
+
+    #[test]
+    fn format_rejected_on_non_ambient_credential() {
+        let cred = CommandCredentialConfig {
+            credential_type: CommandCredentialType::Proxy,
+            format: Some("sk-{}".to_string()),
+            upstream: Some("https://example.com".to_string()),
+            inject_header: Some("Authorization".to_string()),
+            ..Default::default()
+        };
+        assert!(
+            validate_one(&cred)
+                .errors
+                .iter()
+                .any(|e| e.message.contains("only valid for ambient credentials"))
+        );
     }
 }

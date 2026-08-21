@@ -318,6 +318,12 @@ pub struct OAuthTokenResponseFieldConfig {
     pub path: String,
     #[serde(default)]
     pub kind: OAuthTokenResponseFieldKind,
+    /// Literal template for the visible phantom, `{}` standing in for the random
+    /// body (e.g. `"sk-ant-oat01-{}"`), so a client that classifies a credential by
+    /// sniffing a token prefix still recognises it. The whole templated span is
+    /// replaced on egress, so no template literal reaches upstream. `opaque` only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

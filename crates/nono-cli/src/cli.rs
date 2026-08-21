@@ -1269,6 +1269,7 @@ pub struct SandboxArgs {
 
     /// Inclusive TCP listen port range (bind only; repeatable; START:END).
     /// Equivalent to profile `listen_port_range`.
+    /// ALIAS(canonical="--listen-port-range", introduced="v0.75.0", remove_by="indefinite", issue="#1652")
     #[arg(
         long = "listen-port-range",
         alias = "allow-bind-range",
@@ -1290,6 +1291,7 @@ pub struct SandboxArgs {
 
     /// Inclusive localhost TCP port range for bidirectional IPC (repeatable; START:END).
     /// Equivalent to profile `open_port_range`. macOS: combined ranges limited to 16,384 ports.
+    /// ALIAS(canonical="--open-port-range", introduced="v0.75.0", remove_by="indefinite", issue="#1652")
     #[arg(
         long = "open-port-range",
         alias = "allow-port-range",
@@ -1851,6 +1853,7 @@ pub struct WrapSandboxArgs {
 
     /// Inclusive TCP listen port range (bind only; repeatable; START:END).
     /// Equivalent to profile `listen_port_range`.
+    /// ALIAS(canonical="--listen-port-range", introduced="v0.75.0", remove_by="indefinite", issue="#1652")
     #[arg(
         long = "listen-port-range",
         alias = "allow-bind-range",
@@ -1872,6 +1875,7 @@ pub struct WrapSandboxArgs {
 
     /// Inclusive localhost TCP port range for bidirectional IPC (repeatable; START:END).
     /// Equivalent to profile `open_port_range`. macOS: combined ranges limited to 16,384 ports.
+    /// ALIAS(canonical="--open-port-range", introduced="v0.75.0", remove_by="indefinite", issue="#1652")
     #[arg(
         long = "open-port-range",
         alias = "allow-port-range",

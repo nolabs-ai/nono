@@ -961,6 +961,15 @@ pub struct CapabilitySet {
     tcp_connect_ports: Vec<u16>,
     /// Per-port TCP bind allowlist (Linux Landlock V4+ only).
     tcp_bind_ports: Vec<u16>,
+    /// Inclusive TCP bind-only port ranges (listen/bind, no outbound connect).
+    ///
+    /// Linux Landlock V4+ expands each port to a BindTcp rule. macOS Seatbelt
+    /// cannot filter bind by port, so a non-empty set enables blanket
+    /// `(allow network-bind)` / `(allow network-inbound)` — the same tradeoff
+    /// as [`NetworkMode::ProxyOnly`] bind_ports. Distinct from
+    /// [`tcp_bind_ports`](Self::tcp_bind_ports), which remains a raw per-port
+    /// request and is rejected on macOS.
+    tcp_bind_port_ranges: Vec<(u16, u16)>,
     /// TCP ports allowed for bidirectional IPC (connect + bind).
     /// These apply regardless of NetworkMode.
     ///
@@ -1180,6 +1189,16 @@ impl CapabilitySet {
         self
     }
 
+    /// Allow an inclusive TCP bind-only port range (listen/bind, no connect).
+    ///
+    /// Returns an error if `start` is 0 (port 0 has no defined meaning in a
+    /// range). See [`tcp_bind_port_ranges`](Self::tcp_bind_port_ranges) for
+    /// platform-specific enforcement.
+    pub fn allow_tcp_bind_port_range(mut self, start: u16, end: u16) -> Result<Self> {
+        self.add_tcp_bind_port_range(start, end)?;
+        Ok(self)
+    }
+
     /// Allow bidirectional localhost TCP on a specific port (builder pattern).
     ///
     /// The sandboxed process can both connect to and bind/listen on
@@ -1376,6 +1395,20 @@ impl CapabilitySet {
     /// Add a TCP bind port to the allowlist (mutable)
     pub fn add_tcp_bind_port(&mut self, port: u16) {
         self.tcp_bind_ports.push(port);
+    }
+
+    /// Add an inclusive TCP bind-only port range (mutable).
+    ///
+    /// Returns an error if `start` is 0 (port 0 has no defined meaning in a range).
+    pub fn add_tcp_bind_port_range(&mut self, start: u16, end: u16) -> Result<()> {
+        if start == 0 {
+            return Err(NonoError::ConfigParse(
+                "port range starting at 0 is invalid; port 0 has no defined meaning in a range"
+                    .to_string(),
+            ));
+        }
+        self.tcp_bind_port_ranges.push((start, end));
+        Ok(())
     }
 
     /// Localhost IPC port; `0` is macOS-only (`localhost:*` TCP outbound).
@@ -1633,6 +1666,12 @@ impl CapabilitySet {
     #[must_use]
     pub fn tcp_bind_ports(&self) -> &[u16] {
         &self.tcp_bind_ports
+    }
+
+    /// Get TCP bind-only port ranges
+    #[must_use]
+    pub fn tcp_bind_port_ranges(&self) -> &[(u16, u16)] {
+        &self.tcp_bind_port_ranges
     }
 
     /// Get localhost IPC ports
@@ -2031,6 +2070,14 @@ impl CapabilitySet {
         if !self.tcp_bind_ports.is_empty() {
             let ports: Vec<String> = self.tcp_bind_ports.iter().map(|p| p.to_string()).collect();
             lines.push(format!("  tcp bind ports: {}", ports.join(", ")));
+        }
+        if !self.tcp_bind_port_ranges.is_empty() {
+            let ranges: Vec<String> = self
+                .tcp_bind_port_ranges
+                .iter()
+                .map(|(start, end)| format!("{start}-{end}"))
+                .collect();
+            lines.push(format!("  tcp bind port ranges: {}", ranges.join(", ")));
         }
 
         lines.join("\n")
@@ -3031,6 +3078,28 @@ mod tests {
             .allow_tcp_bind(8080)
             .allow_tcp_bind(3000);
         assert_eq!(caps.tcp_bind_ports(), &[8080, 3000]);
+    }
+
+    #[test]
+    fn test_tcp_bind_port_range_builder() {
+        let caps = CapabilitySet::new()
+            .allow_tcp_bind_port_range(8000, 8100)
+            .expect("valid range")
+            .allow_tcp_bind_port_range(9000, 9001)
+            .expect("valid range");
+        assert_eq!(caps.tcp_bind_port_ranges(), &[(8000, 8100), (9000, 9001)]);
+    }
+
+    #[test]
+    fn test_tcp_bind_port_range_rejects_zero_start() {
+        assert!(
+            CapabilitySet::new()
+                .allow_tcp_bind_port_range(0, 100)
+                .is_err()
+        );
+        let mut caps = CapabilitySet::new();
+        assert!(caps.add_tcp_bind_port_range(0, 100).is_err());
+        assert!(caps.tcp_bind_port_ranges().is_empty());
     }
 
     #[test]

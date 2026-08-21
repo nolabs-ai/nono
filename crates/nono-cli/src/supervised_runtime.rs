@@ -354,7 +354,11 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
             _ => Vec::new(),
         },
         #[cfg(target_os = "linux")]
-        proxy_bind_port_ranges: caps.merged_localhost_port_ranges(),
+        proxy_bind_port_ranges: {
+            let mut ranges = caps.merged_localhost_port_ranges();
+            ranges.extend(caps.tcp_bind_port_ranges().iter().copied());
+            nono::capability::merge_port_ranges(&ranges)
+        },
         #[cfg(target_os = "linux")]
         unix_socket_allowlist: caps.unix_socket_capabilities(),
         #[cfg(target_os = "linux")]

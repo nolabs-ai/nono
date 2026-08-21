@@ -217,16 +217,16 @@ fn refresh_helper_args(stale: &[(String, String)]) -> Vec<String> {
 }
 
 fn parse_refresh_helper_args(args: Vec<String>) -> Option<Vec<(String, String)>> {
-    let mut chunks = args.chunks_exact(2);
-    let stale = chunks
-        .by_ref()
-        .map(|chunk| (chunk[0].clone(), chunk[1].clone()))
-        .collect();
-    if chunks.remainder().is_empty() {
-        Some(stale)
-    } else {
-        None
+    let (chunks, remainder) = args.as_chunks::<2>();
+    if !remainder.is_empty() {
+        return None;
     }
+    Some(
+        chunks
+            .iter()
+            .map(|chunk| (chunk[0].clone(), chunk[1].clone()))
+            .collect(),
+    )
 }
 
 // ---------------------------------------------------------------------------

@@ -53,11 +53,12 @@ pub(crate) fn load_or_generate_proxy_ca(validity: Duration) -> Option<PreloadedC
 fn try_ensure_trusted_ca(validity: Duration) -> Result<Option<PreloadedCa>> {
     match load_existing_ca()? {
         Some((key_der, cert_pem)) => {
-            if !cert_pem_is_valid(&cert_pem)? {
-                debug!("stored proxy CA has expired; regenerating");
-                remove_cert_from_keychain(&cert_pem);
-                delete_existing_ca();
-                return generate_and_trust_new_ca(validity);
+            match cert_validity(&cert_pem)? {
+                CertValidity::Valid => {}
+                state => {
+                    debug!("stored proxy CA needs renewal ({state:?}); re-issuing over stored key");
+                    return rotate_ca(&key_der, &cert_pem, validity, state);
+                }
             }
 
             let cert_der = pem_to_der(&cert_pem)?;
@@ -93,6 +94,46 @@ fn try_ensure_trusted_ca(validity: Duration) -> Result<Option<PreloadedCa>> {
     }
 }
 
+/// The CA shared through Keychain, as `(key DER, cert PEM)`.
+pub(crate) fn read_shared_ca() -> Result<Option<(Zeroizing<Vec<u8>>, String)>> {
+    load_existing_ca()
+}
+
+/// Re-issue the shared CA over its stored key and retire the previous certificate.
+///
+/// `Ok(None)` means nothing changed: no stored CA, or a declined trust prompt.
+pub(crate) fn renew_shared_ca(validity: Duration) -> Result<Option<PreloadedCa>> {
+    let Some((key_der, cert_pem)) = load_existing_ca()? else {
+        return Ok(None);
+    };
+    let state = cert_validity(&cert_pem)?;
+    match rotate_ca(&key_der, &cert_pem, validity, state)? {
+        Some(ca) if ca.cert_pem != cert_pem => Ok(Some(ca)),
+        _ => Ok(None),
+    }
+}
+
+/// Whether adopting `candidate` gains runway over `current`.
+pub(crate) fn supersedes(candidate: &str, current: &str) -> Result<bool> {
+    Ok(not_after_of(candidate)? > not_after_of(current)?)
+}
+
+pub(crate) fn stored_cert_is_trusted(cert_pem: &str) -> Result<bool> {
+    let der = pem_to_der(cert_pem)?;
+    let cert = SecCertificate::from_der(&der)
+        .map_err(|e| NonoError::SandboxInit(format!("failed to parse stored CA cert: {e}")))?;
+    Ok(is_cert_trusted(&cert))
+}
+
+fn not_after_of(cert_pem: &str) -> Result<i64> {
+    let (_, pem) = parse_x509_pem(cert_pem.as_bytes())
+        .map_err(|e| NonoError::SandboxInit(format!("failed to parse CA cert PEM: {e}")))?;
+    let cert = pem
+        .parse_x509()
+        .map_err(|e| NonoError::SandboxInit(format!("failed to parse X.509 from PEM: {e}")))?;
+    Ok(cert.validity().not_after.timestamp())
+}
+
 fn load_existing_ca() -> Result<Option<(Zeroizing<Vec<u8>>, String)>> {
     let bundle = match passwords::get_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT) {
         Ok(data) => data,
@@ -103,6 +144,81 @@ fn load_existing_ca() -> Result<Option<(Zeroizing<Vec<u8>>, String)>> {
     nono_proxy::tls_intercept::ca::split_key_cert_pem(&combined)
         .map(Some)
         .map_err(|e| NonoError::SandboxInit(format!("{e}")))
+}
+
+/// Re-issue the CA certificate over the stored key and hand the new one over.
+///
+/// Trust the new cert before retiring the old, so nothing fails mid-swap. The key is
+/// unchanged, so leaves minted under the old cert still chain to the new one.
+fn rotate_ca(
+    key_der: &Zeroizing<Vec<u8>>,
+    old_cert_pem: &str,
+    validity: Duration,
+    state: CertValidity,
+) -> Result<Option<PreloadedCa>> {
+    let ca = match nono_proxy::tls_intercept::ca::EphemeralCa::reissue_with_cn(
+        key_der,
+        "nono-proxy-ca",
+        validity,
+    ) {
+        Ok(ca) => ca,
+        Err(e) => {
+            // No usable stored key: only a whole new anchor can recover.
+            warn!("Cannot re-issue over the stored proxy CA key ({e}); generating a new CA.");
+            remove_cert_from_keychain(old_cert_pem);
+            delete_existing_ca();
+            return generate_and_trust_new_ca(validity);
+        }
+    };
+    let cert_pem = ca.cert_pem().to_string();
+
+    let cert_der = pem_to_der(&cert_pem)?;
+    let sec_cert = SecCertificate::from_der(&cert_der)
+        .map_err(|e| NonoError::SandboxInit(format!("failed to create SecCertificate: {e}")))?;
+
+    info!("Renewing proxy CA (you may be prompted for authentication)...");
+    if let Err(e) = trust_cert(&sec_cert) {
+        match e {
+            TrustCertError::UserCancelled => {
+                // The old cert is untouched, so declining costs nothing until it expires.
+                if state == CertValidity::RenewDue {
+                    warn!(
+                        "Proxy CA renewal cancelled; continuing on the current \
+                         certificate. It will be retried next launch."
+                    );
+                    return Ok(Some(PreloadedCa {
+                        key_der: key_der.clone(),
+                        cert_pem: old_cert_pem.to_string(),
+                    }));
+                }
+                warn!(
+                    "Proxy CA renewal cancelled and the stored certificate has \
+                     expired. Falling back to ephemeral CA; Go CLI tools won't \
+                     validate proxy certs."
+                );
+                return Ok(None);
+            }
+            TrustCertError::Other(err) => return Err(err),
+        }
+    }
+
+    let key_pem = ca.key_pem();
+    let combined = Zeroizing::new(format!("{}{}", *key_pem, cert_pem));
+    passwords::set_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT, combined.as_bytes())
+        .map_err(|e| {
+            NonoError::SandboxInit(format!(
+                "failed to store renewed CA bundle in Keychain: {e}"
+            ))
+        })?;
+
+    remove_cert_from_keychain(old_cert_pem);
+    flush_trust_cache();
+
+    info!("Proxy CA renewed");
+    Ok(Some(PreloadedCa {
+        key_der: Zeroizing::new(ca.key_der().to_vec()),
+        cert_pem,
+    }))
 }
 
 fn generate_and_trust_new_ca(validity: Duration) -> Result<Option<PreloadedCa>> {
@@ -303,18 +419,63 @@ fn delete_existing_ca() {
     let _ = passwords::delete_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT);
 }
 
-fn cert_pem_is_valid(cert_pem: &str) -> Result<bool> {
+/// Remaining life below which the CA is renewed at launch, so every session starts
+/// with runway.
+const RENEWAL_HEADROOM: Duration = Duration::from_secs(24 * 60 * 60);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CertValidity {
+    Valid,
+    RenewDue,
+    Expired,
+}
+
+pub(crate) fn cert_validity(cert_pem: &str) -> Result<CertValidity> {
     let (_, pem) = parse_x509_pem(cert_pem.as_bytes())
         .map_err(|e| NonoError::SandboxInit(format!("failed to parse stored CA cert PEM: {e}")))?;
     let cert = pem.parse_x509().map_err(|e| {
         NonoError::SandboxInit(format!("failed to parse X.509 from stored PEM: {e}"))
     })?;
-    let not_after = cert.validity().not_after.timestamp();
     let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map_err(|e| NonoError::SandboxInit(format!("system clock before UNIX epoch: {e}")))?
         .as_secs() as i64;
-    Ok(now < not_after)
+    let not_before = cert.validity().not_before.timestamp();
+    let not_after = cert.validity().not_after.timestamp();
+    Ok(classify_validity(
+        not_after,
+        now,
+        renewal_headroom(not_after.saturating_sub(not_before)),
+    ))
+}
+
+/// Proportional, so a 7-day cert prompts at most weekly and a short-lived one still
+/// gets warning.
+pub(crate) fn renewal_headroom(lifetime_secs: i64) -> Duration {
+    let quarter = Duration::from_secs(lifetime_secs.max(0) as u64 / 4);
+    quarter.min(RENEWAL_HEADROOM)
+}
+
+fn classify_validity(not_after: i64, now: i64, headroom: Duration) -> CertValidity {
+    if now >= not_after {
+        CertValidity::Expired
+    } else if not_after - now <= headroom.as_secs() as i64 {
+        CertValidity::RenewDue
+    } else {
+        CertValidity::Valid
+    }
+}
+
+/// Trust settings live in a data vault with no cache-invalidation API, so restarting
+/// `trustd` is the only reliable flush. Best-effort: a stale cache only delays.
+fn flush_trust_cache() {
+    match std::process::Command::new("/usr/bin/killall")
+        .args(["-q", "trustd"])
+        .status()
+    {
+        Ok(status) => debug!("trustd flush exited with {status}"),
+        Err(e) => debug!("could not run killall to flush trustd: {e}"),
+    }
 }
 
 fn pem_to_der(cert_pem: &str) -> Result<Vec<u8>> {
@@ -351,14 +512,63 @@ mod tests {
     }
 
     #[test]
-    fn cert_pem_is_valid_returns_true_for_fresh_cert() {
-        let ca = generate_test_ca();
-        assert!(cert_pem_is_valid(ca.cert_pem()).unwrap());
+    fn cert_validity_sees_a_week_old_cert_as_valid() {
+        let ca =
+            EphemeralCa::generate_with_cn("nono-proxy-ca", Duration::from_secs(7 * 86400)).unwrap();
+        assert_eq!(cert_validity(ca.cert_pem()).unwrap(), CertValidity::Valid);
     }
 
     #[test]
-    fn cert_pem_is_valid_rejects_garbage() {
-        assert!(cert_pem_is_valid("not a cert").is_err());
+    fn cert_validity_scales_the_headroom_to_a_short_lived_cert() {
+        // A 120s cert must not be born renew-due, or every launch rotates.
+        let ca = EphemeralCa::generate_with_cn("nono-proxy-ca", Duration::from_secs(120)).unwrap();
+        assert_eq!(cert_validity(ca.cert_pem()).unwrap(), CertValidity::Valid);
+
+        let not_after = not_after_of(ca.cert_pem()).unwrap();
+        assert_eq!(
+            classify_validity(not_after, not_after - 20, renewal_headroom(120)),
+            CertValidity::RenewDue,
+            "20s of life left on a 120s cert is inside the 30s headroom"
+        );
+    }
+
+    #[test]
+    fn renewal_headroom_is_a_quarter_of_life_capped_at_a_day() {
+        assert_eq!(renewal_headroom(120), Duration::from_secs(30));
+        assert_eq!(
+            renewal_headroom(7 * 86400),
+            Duration::from_secs(24 * 60 * 60),
+            "a week-long cert renews a day out, not 42 hours out"
+        );
+        assert_eq!(renewal_headroom(-1), Duration::ZERO);
+    }
+
+    #[test]
+    fn cert_validity_rejects_garbage() {
+        assert!(cert_validity("not a cert").is_err());
+    }
+
+    #[test]
+    fn classify_validity_boundaries() {
+        let headroom = Duration::from_secs(86400);
+        // not_after exactly now, and one second past it, are both expired.
+        assert_eq!(
+            classify_validity(1_000, 1_000, headroom),
+            CertValidity::Expired
+        );
+        assert_eq!(
+            classify_validity(1_000, 1_001, headroom),
+            CertValidity::Expired
+        );
+        // Exactly one headroom of life left still counts as due.
+        assert_eq!(
+            classify_validity(1_000 + 86_400, 1_000, headroom),
+            CertValidity::RenewDue
+        );
+        assert_eq!(
+            classify_validity(1_000 + 86_401, 1_000, headroom),
+            CertValidity::Valid
+        );
     }
 
     #[test]

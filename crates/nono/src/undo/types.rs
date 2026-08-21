@@ -303,6 +303,12 @@ pub enum NetworkAuditDenialCategory {
 pub struct NetworkAuditEvent {
     /// Event timestamp in Unix milliseconds
     pub timestamp_unix_ms: u64,
+    /// ID shared by related CONNECT / policy / auth / response events for one network interaction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interaction_id: Option<String>,
+    /// Parent mediated-command invocation ID when reliably attributable; leave None if not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invocation_id: Option<String>,
     /// Proxy mode handling the request
     pub mode: NetworkAuditMode,
     /// Allow or deny decision
@@ -602,6 +608,18 @@ mod tests {
         let json = serde_json::to_string(&hash).expect("should serialize");
         let parsed: ContentHash = serde_json::from_str(&json).expect("should deserialize");
         assert_eq!(hash, parsed);
+    }
+
+    #[test]
+    fn network_audit_event_deserializes_without_correlation_fields() {
+        let json = concat!(
+            r#"{"timestamp_unix_ms":1,"mode":"connect","decision":"allow","#,
+            r#""target":"example.com","port":443,"method":"CONNECT","path":null,"status":null,"reason":null}"#
+        );
+        let event: NetworkAuditEvent =
+            serde_json::from_str(json).expect("legacy network audit JSON should deserialize");
+        assert_eq!(event.interaction_id, None);
+        assert_eq!(event.invocation_id, None);
     }
 
     #[test]

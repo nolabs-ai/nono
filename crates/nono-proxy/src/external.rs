@@ -194,6 +194,7 @@ pub async fn handle_external_proxy(
 ) -> Result<()> {
     // Parse CONNECT target
     let (host, port) = parse_connect_target(first_line)?;
+    let interaction_id = audit::new_audit_correlation_id();
     debug!("External proxy CONNECT to {}:{}", host, port);
 
     // Validate session token (skipped when auth is disabled)
@@ -211,7 +212,7 @@ pub async fn handle_external_proxy(
                 auth_mechanism: Some(nono::undo::NetworkAuditAuthMechanism::ProxyAuthorization),
                 auth_outcome: Some(nono::undo::NetworkAuditAuthOutcome::Succeeded),
                 denial_category: Some(nono::undo::NetworkAuditDenialCategory::HostDenied),
-                ..audit::EventContext::default()
+                ..audit::EventContext::interaction(&interaction_id)
             },
             &host,
             port,
@@ -252,7 +253,7 @@ pub async fn handle_external_proxy(
                     denial_category: Some(
                         nono::undo::NetworkAuditDenialCategory::ExternalProxyRejected,
                     ),
-                    ..audit::EventContext::default()
+                    ..audit::EventContext::interaction(&interaction_id)
                 },
                 &host,
                 port,
@@ -271,7 +272,7 @@ pub async fn handle_external_proxy(
                     denial_category: Some(
                         nono::undo::NetworkAuditDenialCategory::UpstreamConnectFailed,
                     ),
-                    ..audit::EventContext::default()
+                    ..audit::EventContext::interaction(&interaction_id)
                 },
                 &host,
                 port,
@@ -290,7 +291,7 @@ pub async fn handle_external_proxy(
         &audit::EventContext {
             auth_mechanism: Some(nono::undo::NetworkAuditAuthMechanism::ProxyAuthorization),
             auth_outcome: Some(nono::undo::NetworkAuditAuthOutcome::Succeeded),
-            ..audit::EventContext::default()
+            ..audit::EventContext::interaction(&interaction_id)
         },
         &host,
         port,

@@ -123,6 +123,9 @@ pub struct CommandPolicyAuditEvent {
     /// Session identifier.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// Stable ID shared by all command-policy events for one mediated invocation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invocation_id: Option<String>,
     /// Command name being mediated.
     pub command: String,
     /// Caller label.
@@ -205,6 +208,12 @@ pub struct CommandPolicyStdioStreamAudit {
     /// Action taken when the limit was exceeded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_limit: Option<String>,
+}
+
+/// Opaque correlation ID for audit event grouping (UUID v7).
+#[must_use]
+pub fn new_audit_correlation_id() -> String {
+    uuid::Uuid::now_v7().to_string()
 }
 
 /// One line of `audit-events.ndjson`.
@@ -1680,6 +1689,8 @@ mod tests {
         recorder
             .record_network_event(NetworkAuditEvent {
                 timestamp_unix_ms: 123,
+                interaction_id: None,
+                invocation_id: None,
                 mode: NetworkAuditMode::Reverse,
                 decision: NetworkAuditDecision::Deny,
                 route_id: None,
@@ -1797,6 +1808,7 @@ mod tests {
         CommandPolicyAuditEvent {
             timestamp: "2026-04-21T00:00:00Z".to_string(),
             session_id: Some("sess-1".to_string()),
+            invocation_id: None,
             command: command.to_string(),
             caller: "session".to_string(),
             caller_kind: Some("session".to_string()),
@@ -2063,6 +2075,8 @@ mod tests {
             merkle_roots: vec![ContentHash::from_bytes([1; 32])],
             network_events: vec![NetworkAuditEvent {
                 timestamp_unix_ms: 5,
+                interaction_id: None,
+                invocation_id: None,
                 mode: NetworkAuditMode::Connect,
                 decision: NetworkAuditDecision::Allow,
                 route_id: None,
@@ -2391,6 +2405,8 @@ mod tests {
             &AuditEventPayload::Network {
                 event: Box::new(NetworkAuditEvent {
                     timestamp_unix_ms: 5,
+                    interaction_id: None,
+                    invocation_id: None,
                     mode: NetworkAuditMode::Reverse,
                     decision: NetworkAuditDecision::Deny,
                     route_id: None,
@@ -2458,6 +2474,7 @@ mod tests {
                 event: Box::new(CommandPolicyAuditEvent {
                     timestamp: "2026-04-21T20:00:00Z".to_string(),
                     session_id: Some("sess-1".to_string()),
+                    invocation_id: None,
                     command: "git".to_string(),
                     caller: "session".to_string(),
                     caller_kind: None,
@@ -2487,5 +2504,52 @@ mod tests {
             ),
             "ae7caf84865bfd686729a67a04fc3fd6af72dbd700eb77403d9f338491c4815d",
         );
+    }
+
+    #[test]
+    fn command_policy_event_deserializes_without_invocation_id() {
+        let json = concat!(
+            r#"{"timestamp":"2026-04-21T00:00:00Z","session_id":"sess-1","#,
+            r#""command":"git","caller":"session","decision":"allow","reason":null,"#,
+            r#""stdio_mode":"piped","argv_hash":"a","env_name_hash":"b","cwd_hash":"c","#,
+            r#""argv_display":["git"],"env_names_display":[],"cwd_display":"/work","exit_code":null}"#
+        );
+        let event: CommandPolicyAuditEvent = serde_json::from_str(json).unwrap();
+        assert_eq!(event.invocation_id, None);
+        assert_eq!(event.command, "git");
+    }
+
+    #[test]
+    fn command_policy_event_round_trips_with_invocation_id() {
+        let mut event = command_policy_event("gh", "allowed");
+        event.invocation_id = Some("0194abcd-0000-7000-8000-000000000001".to_string());
+
+        let json = serde_json::to_string(&event).unwrap();
+        let decoded: CommandPolicyAuditEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.invocation_id, event.invocation_id);
+        assert_eq!(decoded.command, "gh");
+    }
+
+    #[test]
+    fn verify_audit_log_accepts_events_with_and_without_invocation_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut recorder = AuditRecorder::new(dir.path().to_path_buf()).unwrap();
+
+        let mut with_id = command_policy_event("git", "allowed");
+        with_id.invocation_id = Some(new_audit_correlation_id());
+        recorder
+            .record_command_policy_event(with_id, CommandPolicyOutcome::Allowed)
+            .unwrap();
+        recorder
+            .record_command_policy_event(
+                command_policy_event("curl", "denied"),
+                CommandPolicyOutcome::Denied,
+            )
+            .unwrap();
+
+        let summary = recorder.finalize().unwrap();
+        let verified = verify_audit_log(dir.path(), Some(&summary)).unwrap();
+        assert_eq!(verified.event_count, 2);
+        assert!(verified.records_verified);
     }
 }

@@ -1258,6 +1258,8 @@ fn record_network_audit_denial(
     let reason = network_audit_denial_reason(sockaddr, syscall);
     let event = nono::undo::NetworkAuditEvent {
         timestamp_unix_ms: current_unix_millis(),
+        interaction_id: None,
+        invocation_id: None,
         mode: nono::undo::NetworkAuditMode::Connect,
         decision: nono::undo::NetworkAuditDecision::Deny,
         route_id: None,

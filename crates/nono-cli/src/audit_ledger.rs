@@ -242,6 +242,8 @@ mod tests {
             merkle_roots: vec![ContentHash::from_bytes([1; 32])],
             network_events: vec![NetworkAuditEvent {
                 timestamp_unix_ms: 5,
+                interaction_id: None,
+                invocation_id: None,
                 mode: NetworkAuditMode::Connect,
                 decision: NetworkAuditDecision::Allow,
                 route_id: None,

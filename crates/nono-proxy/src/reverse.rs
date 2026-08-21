@@ -61,11 +61,11 @@ pub(crate) fn audit_injection_mode_for_inject_mode(
     }
 }
 
-fn proxy_auth_event_ctx<'a>(route_id: &'a str) -> audit::EventContext<'a> {
+fn proxy_auth_event_ctx<'a>(route_id: &'a str, interaction_id: &'a str) -> audit::EventContext<'a> {
     audit::EventContext {
         route_id: Some(route_id),
         auth_mechanism: Some(nono::undo::NetworkAuditAuthMechanism::ProxyAuthorization),
-        ..audit::EventContext::default()
+        ..audit::EventContext::interaction(interaction_id)
     }
 }
 
@@ -73,13 +73,14 @@ fn managed_credential_event_ctx<'a>(
     route_id: &'a str,
     proxy_mode: &InjectMode,
     inject_mode: nono::undo::NetworkAuditInjectionMode,
+    interaction_id: &'a str,
 ) -> audit::EventContext<'a> {
     audit::EventContext {
         route_id: Some(route_id),
         auth_mechanism: Some(auth_mechanism_for_inject_mode(proxy_mode)),
         managed_credential_active: Some(true),
         injection_mode: Some(inject_mode),
-        ..audit::EventContext::default()
+        ..audit::EventContext::interaction(interaction_id)
     }
 }
 
@@ -111,6 +112,8 @@ pub struct ReverseProxyCtx<'a> {
     pub approval_backends: Option<crate::approval::ApprovalBackendRegistry>,
     /// Optional supervisor capture backend for command-backed credentials.
     pub credential_capture_backend: Option<Arc<dyn CredentialCaptureBackend>>,
+    /// Correlation ID shared by audit events for one reverse-proxy request.
+    pub interaction_id: &'a str,
 }
 
 /// Handle a non-CONNECT HTTP request (reverse proxy mode).
@@ -191,6 +194,7 @@ pub async fn handle_reverse_proxy(
                 &service,
                 &cred.proxy_inject_mode,
                 audit_injection_mode_for_inject_mode(&cred.inject_mode),
+                ctx.interaction_id,
             )
         })
         .or_else(|| {
@@ -199,6 +203,7 @@ pub async fn handle_reverse_proxy(
                     &service,
                     &cmd.proxy_inject_mode,
                     audit_injection_mode_for_inject_mode(&cmd.inject_mode),
+                    ctx.interaction_id,
                 )
             })
         });
@@ -207,7 +212,7 @@ pub async fn handle_reverse_proxy(
         auth_mechanism: Some(nono::undo::NetworkAuditAuthMechanism::PhantomHeader),
         managed_credential_active: Some(true),
         injection_mode: Some(nono::undo::NetworkAuditInjectionMode::OAuth2),
-        ..audit::EventContext::default()
+        ..audit::EventContext::interaction(ctx.interaction_id)
     });
     let has_spiffe = route.has_spiffe_source();
     let route_ctx = managed_ctx
@@ -216,7 +221,7 @@ pub async fn handle_reverse_proxy(
         .unwrap_or_else(|| audit::EventContext {
             route_id: Some(&service),
             managed_credential_active: Some(false),
-            ..audit::EventContext::default()
+            ..audit::EventContext::interaction(ctx.interaction_id)
         });
 
     let cmd_available = cmd_route.is_some() && ctx.credential_capture_backend.is_some();
@@ -240,7 +245,7 @@ pub async fn handle_reverse_proxy(
             denial_category: Some(
                 nono::undo::NetworkAuditDenialCategory::ManagedCredentialUnavailable,
             ),
-            ..audit::EventContext::default()
+            ..audit::EventContext::interaction(ctx.interaction_id)
         };
         audit::log_denied(
             ctx.audit_log,
@@ -391,7 +396,7 @@ pub async fn handle_reverse_proxy(
             let deny_ctx = audit::EventContext {
                 auth_outcome: Some(nono::undo::NetworkAuditAuthOutcome::Failed),
                 denial_category: Some(nono::undo::NetworkAuditDenialCategory::AuthenticationFailed),
-                ..proxy_auth_event_ctx(&service)
+                ..proxy_auth_event_ctx(&service, ctx.interaction_id)
             };
             audit::log_denied(
                 ctx.audit_log,
@@ -448,6 +453,7 @@ pub async fn handle_reverse_proxy(
             audit::ProxyMode::Reverse,
             ctx.audit_log,
             ctx.credential_capture_backend.clone(),
+            ctx.interaction_id,
         )
         .await
         {
@@ -463,7 +469,7 @@ pub async fn handle_reverse_proxy(
                     denial_category: Some(
                         nono::undo::NetworkAuditDenialCategory::ManagedCredentialUnavailable,
                     ),
-                    ..audit::EventContext::default()
+                    ..audit::EventContext::interaction(ctx.interaction_id)
                 };
                 audit::log_denied(
                     ctx.audit_log,
@@ -564,7 +570,7 @@ pub async fn handle_reverse_proxy(
         audit::EventContext {
             auth_outcome: Some(nono::undo::NetworkAuditAuthOutcome::Succeeded),
             managed_credential_active: Some(false),
-            ..proxy_auth_event_ctx(&service)
+            ..proxy_auth_event_ctx(&service, ctx.interaction_id)
         }
     };
 
@@ -797,7 +803,7 @@ async fn handle_spiffe_route(
         managed_credential_active: Some(true),
         injection_mode: route.managed_injection_mode.clone(),
         spiffe_context: Some(spiffe_ctx),
-        ..audit::EventContext::default()
+        ..audit::EventContext::interaction(ctx.interaction_id)
     };
 
     let upstream_url = format!("{}{}", route.upstream.trim_end_matches('/'), upstream_path);
@@ -943,6 +949,7 @@ pub(crate) async fn capture_cmd_credential(
     proxy_mode: audit::ProxyMode,
     audit_log: Option<&audit::SharedAuditLog>,
     backend: Option<Arc<dyn CredentialCaptureBackend>>,
+    interaction_id: &str,
 ) -> Result<LoadedCredential> {
     let Some(backend) = backend else {
         let reason = format!(
@@ -974,6 +981,8 @@ pub(crate) async fn capture_cmd_credential(
                 request_method,
                 request_path,
                 reason: Some(&reason),
+                interaction_id: Some(interaction_id),
+                invocation_id: None,
             },
         );
         return Err(ProxyError::Credential(reason));
@@ -1019,6 +1028,8 @@ pub(crate) async fn capture_cmd_credential(
                     request_method,
                     request_path,
                     reason: None,
+                    interaction_id: Some(interaction_id),
+                    invocation_id: None,
                 },
             );
             Ok(cmd.materialize(response.material))
@@ -1049,6 +1060,8 @@ pub(crate) async fn capture_cmd_credential(
                     request_method,
                     request_path,
                     reason: Some(&err.reason),
+                    interaction_id: Some(interaction_id),
+                    invocation_id: None,
                 },
             );
             Err(ProxyError::Credential(err.reason))
@@ -1448,7 +1461,7 @@ async fn handle_oauth2_like(
             injection_mode: Some(injection_mode),
             spiffe_context: spiffe_context.clone(),
             denial_category: Some(nono::undo::NetworkAuditDenialCategory::AuthenticationFailed),
-            ..audit::EventContext::default()
+            ..audit::EventContext::interaction(ctx.interaction_id)
         };
         audit::log_denied(
             ctx.audit_log,
@@ -1538,7 +1551,7 @@ async fn handle_oauth2_like(
         managed_credential_active: Some(true),
         injection_mode: Some(injection_mode),
         spiffe_context,
-        ..audit::EventContext::default()
+        ..audit::EventContext::interaction(ctx.interaction_id)
     };
 
     match pool_forward(ctx.upstream_pool, tls_config, req, stream).await {
@@ -2165,7 +2178,7 @@ fn log_upgrade_rejection(
         audit::ProxyMode::Reverse,
         &audit::EventContext {
             denial_category: Some(nono::undo::NetworkAuditDenialCategory::UnsupportedUpgrade),
-            ..audit::EventContext::default()
+            ..audit::EventContext::interaction(ctx.interaction_id)
         },
         &target,
         None,

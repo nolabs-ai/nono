@@ -2759,6 +2759,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tracing",
  "typify",
+ "uuid",
  "walkdir",
  "x509-cert 0.3.0",
  "zeroize",

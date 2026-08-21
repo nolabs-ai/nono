@@ -145,6 +145,8 @@ mod tests {
         recorder
             .record_network_event(NetworkAuditEvent {
                 timestamp_unix_ms: 123,
+                interaction_id: None,
+                invocation_id: None,
                 mode: NetworkAuditMode::Reverse,
                 decision: NetworkAuditDecision::Deny,
                 route_id: None,
@@ -193,6 +195,7 @@ mod tests {
                 CommandPolicyAuditEvent {
                     timestamp: "2026-04-21T00:00:00Z".to_string(),
                     session_id: Some("sess-1".to_string()),
+                    invocation_id: None,
                     command: "curl".to_string(),
                     caller: "session".to_string(),
                     caller_kind: Some("session".to_string()),

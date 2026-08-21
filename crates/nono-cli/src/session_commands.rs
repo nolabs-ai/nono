@@ -847,6 +847,7 @@ mod tests {
                         CommandPolicyAuditEvent {
                             timestamp: "2026-08-13T12:00:01Z".to_string(),
                             session_id: Some(SESSION_ID.to_string()),
+                            invocation_id: None,
                             command: "gh".to_string(),
                             caller: "session".to_string(),
                             caller_kind: Some("session".to_string()),

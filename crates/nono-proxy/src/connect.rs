@@ -57,6 +57,7 @@ pub async fn handle_connect(
 ) -> Result<()> {
     // Parse host:port from CONNECT line
     let (host, port) = parse_connect_target(first_line)?;
+    let interaction_id = audit::new_audit_correlation_id();
     debug!("CONNECT request to {}:{}", host, port);
 
     // Validate session token from Proxy-Authorization header. See
@@ -87,7 +88,7 @@ pub async fn handle_connect(
             audit::ProxyMode::Connect,
             &audit::EventContext {
                 denial_category: Some(nono::undo::NetworkAuditDenialCategory::HostDenied),
-                ..audit::EventContext::default()
+                ..audit::EventContext::interaction(&interaction_id)
             },
             &host,
             port,
@@ -107,7 +108,8 @@ pub async fn handle_connect(
         // doesn't shadow the more descriptive UpstreamConnect error below.
         // The audit entry is recorded inside write_upstream_failure before
         // the response is sent, so audit coverage is preserved regardless.
-        let _ = write_upstream_failure(stream, audit_log, &host, port, &reason).await;
+        let _ =
+            write_upstream_failure(stream, audit_log, &host, port, &reason, &interaction_id).await;
         return Err(ProxyError::UpstreamConnect {
             host: host.clone(),
             reason,
@@ -126,7 +128,9 @@ pub async fn handle_connect(
             };
             // Discard the write result for the same reason as the empty-DNS
             // branch above: preserve the original UpstreamConnect error.
-            let _ = write_upstream_failure(stream, audit_log, &host, port, &reason).await;
+            let _ =
+                write_upstream_failure(stream, audit_log, &host, port, &reason, &interaction_id)
+                    .await;
             return Err(err);
         }
     };
@@ -136,7 +140,7 @@ pub async fn handle_connect(
     audit::log_allowed(
         audit_log,
         audit::ProxyMode::Connect,
-        &audit::EventContext::default(),
+        &audit::EventContext::interaction(&interaction_id),
         &host,
         port,
         "CONNECT",
@@ -238,13 +242,14 @@ async fn write_upstream_failure<S: AsyncWrite + Unpin>(
     host: &str,
     port: u16,
     reason: &str,
+    interaction_id: &str,
 ) -> Result<()> {
     audit::log_denied(
         audit_log,
         audit::ProxyMode::Connect,
         &audit::EventContext {
             denial_category: Some(nono::undo::NetworkAuditDenialCategory::UpstreamConnectFailed),
-            ..audit::EventContext::default()
+            ..audit::EventContext::interaction(interaction_id)
         },
         host,
         port,
@@ -322,9 +327,16 @@ mod tests {
         let (server, client) = duplex(1024);
         let mut server = server;
 
-        write_upstream_failure(&mut server, None, "example.com", 443, "connection refused")
-            .await
-            .unwrap();
+        write_upstream_failure(
+            &mut server,
+            None,
+            "example.com",
+            443,
+            "connection refused",
+            "test-interaction",
+        )
+        .await
+        .unwrap();
         drop(server);
 
         let response = read_to_string(client).await;
@@ -351,6 +363,7 @@ mod tests {
             "example.com",
             443,
             "connection refused",
+            "test-interaction",
         )
         .await
         .unwrap();
@@ -373,9 +386,16 @@ mod tests {
     async fn write_upstream_failure_without_audit_log_still_writes_response() {
         let (mut server, client) = duplex(1024);
 
-        write_upstream_failure(&mut server, None, "example.com", 443, "connection refused")
-            .await
-            .unwrap();
+        write_upstream_failure(
+            &mut server,
+            None,
+            "example.com",
+            443,
+            "connection refused",
+            "test-interaction",
+        )
+        .await
+        .unwrap();
         drop(server);
 
         let response = read_to_string(client).await;
@@ -392,6 +412,7 @@ mod tests {
             "example.com",
             443,
             "connection refused\r\nX-Injected: yes",
+            "test-interaction",
         )
         .await
         .unwrap();
@@ -436,6 +457,7 @@ mod tests {
             "slow.example.com",
             443,
             "connection timed out",
+            "test-interaction",
         )
         .await
         .unwrap();

@@ -31,6 +31,7 @@ ignore.workspace = true
 globset.workspace = true
 regress = "0.11"
 idna.workspace = true
+uuid.workspace = true
 
 # Unix socket IPC for supervisor
 libc = "0.2"

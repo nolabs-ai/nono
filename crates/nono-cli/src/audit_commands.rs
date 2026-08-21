@@ -992,6 +992,7 @@ mod list_tests {
             CommandPolicyAuditEvent {
                 timestamp: "2026-05-03T16:30:30Z".to_string(),
                 session_id: Some("sess-tool_sandbox".to_string()),
+                invocation_id: None,
                 command: "ssh".to_string(),
                 caller: "git".to_string(),
                 caller_kind: Some("command".to_string()),

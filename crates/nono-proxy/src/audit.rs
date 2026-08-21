@@ -3,6 +3,8 @@
 //! Sensitive data (authorization headers, tokens, request bodies)
 //! is never included in audit logs.
 
+pub use nono::audit::new_audit_correlation_id;
+
 use nono::undo::{
     NetworkAuditAuthMechanism, NetworkAuditAuthOutcome, NetworkAuditDecision,
     NetworkAuditDenialCategory, NetworkAuditEvent, NetworkAuditInjectionMode, NetworkAuditMode,
@@ -34,6 +36,8 @@ pub enum ProxyMode {
 /// Optional structured audit context attached to a proxy event.
 #[derive(Debug, Clone, Default)]
 pub struct EventContext<'a> {
+    pub interaction_id: Option<&'a str>,
+    pub invocation_id: Option<&'a str>,
     pub route_id: Option<&'a str>,
     pub auth_mechanism: Option<NetworkAuditAuthMechanism>,
     pub auth_outcome: Option<NetworkAuditAuthOutcome>,
@@ -45,6 +49,17 @@ pub struct EventContext<'a> {
     pub approval_backend: Option<&'a str>,
     pub upstream: Option<&'a str>,
     pub spiffe_context: Option<nono::undo::SpiffeAuditContext>,
+}
+
+impl<'a> EventContext<'a> {
+    /// Context seeded with an interaction correlation ID.
+    #[must_use]
+    pub fn interaction(interaction_id: &'a str) -> Self {
+        Self {
+            interaction_id: Some(interaction_id),
+            ..Self::default()
+        }
+    }
 }
 
 impl std::fmt::Display for ProxyMode {
@@ -154,6 +169,8 @@ pub fn log_allowed(
         audit_log,
         NetworkAuditEvent {
             timestamp_unix_ms: now_unix_millis(),
+            interaction_id: ctx.interaction_id.map(str::to_string),
+            invocation_id: ctx.invocation_id.map(str::to_string),
             mode: map_mode(mode),
             decision: NetworkAuditDecision::Allow,
             route_id: ctx.route_id.map(str::to_string),
@@ -212,6 +229,8 @@ pub fn log_denied(
         audit_log,
         NetworkAuditEvent {
             timestamp_unix_ms: now_unix_millis(),
+            interaction_id: ctx.interaction_id.map(str::to_string),
+            invocation_id: ctx.invocation_id.map(str::to_string),
             mode: map_mode(mode),
             decision: NetworkAuditDecision::Deny,
             route_id: ctx.route_id.map(str::to_string),
@@ -273,6 +292,8 @@ pub fn log_l7_request(
         audit_log,
         NetworkAuditEvent {
             timestamp_unix_ms: now_unix_millis(),
+            interaction_id: ctx.interaction_id.map(str::to_string),
+            invocation_id: ctx.invocation_id.map(str::to_string),
             mode: map_mode(mode),
             decision: NetworkAuditDecision::Allow,
             route_id: ctx.route_id.map(str::to_string),
@@ -340,6 +361,8 @@ pub fn log_l7_policy_decision(
         audit_log,
         NetworkAuditEvent {
             timestamp_unix_ms: now_unix_millis(),
+            interaction_id: ctx.interaction_id.map(str::to_string),
+            invocation_id: ctx.invocation_id.map(str::to_string),
             mode: map_mode(mode),
             decision,
             route_id: ctx.route_id.map(str::to_string),
@@ -399,6 +422,8 @@ pub struct CredentialCaptureAudit<'a> {
     pub request_method: &'a str,
     pub request_path: &'a str,
     pub reason: Option<&'a str>,
+    pub interaction_id: Option<&'a str>,
+    pub invocation_id: Option<&'a str>,
 }
 
 /// The captured credential value is never recorded — only command metadata,
@@ -424,6 +449,8 @@ pub fn log_credential_capture(
         audit_log,
         NetworkAuditEvent {
             timestamp_unix_ms: now_unix_millis(),
+            interaction_id: event.interaction_id.map(str::to_string),
+            invocation_id: event.invocation_id.map(str::to_string),
             mode: map_mode(mode),
             decision: event.decision,
             route_id: Some(event.route_id.to_string()),
@@ -570,5 +597,44 @@ mod tests {
         assert_eq!(event.method.as_deref(), Some("POST"));
         assert_eq!(event.path.as_deref(), Some("/v1/tasks/123/comments"));
         assert_eq!(event.reason.as_deref(), Some("approval required"));
+    }
+
+    #[test]
+    fn log_calls_with_shared_interaction_id_match() {
+        let log = new_audit_log();
+        let ctx = EventContext::interaction("interaction-abc");
+
+        log_allowed(
+            Some(&log),
+            ProxyMode::Connect,
+            &ctx,
+            "api.example.com",
+            443,
+            "CONNECT",
+        );
+        log_denied(
+            Some(&log),
+            ProxyMode::Connect,
+            &ctx,
+            "api.example.com",
+            443,
+            "denied",
+        );
+        log_l7_request(
+            Some(&log),
+            ProxyMode::Reverse,
+            &ctx,
+            "api.example.com",
+            "GET",
+            "/v1",
+            200,
+        );
+
+        let events = drain_audit_events(&log);
+        assert_eq!(events.len(), 3);
+        for event in &events {
+            assert_eq!(event.interaction_id.as_deref(), Some("interaction-abc"));
+            assert_eq!(event.invocation_id, None);
+        }
     }
 }

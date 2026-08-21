@@ -1498,6 +1498,7 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
                                         "tls_intercept: CONNECT to {}:{} missing/invalid proxy auth — {}",
                                         host, port, e
                                     );
+                                    let interaction_id = audit::new_audit_correlation_id();
                                     audit::log_denied(
                                         Some(&state.audit_log),
                                         audit::ProxyMode::ConnectIntercept,
@@ -1512,7 +1513,7 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
                                             denial_category: Some(
                                                 nono::undo::NetworkAuditDenialCategory::AuthenticationFailed,
                                             ),
-                                            ..audit::EventContext::default()
+                                            ..audit::EventContext::interaction(&interaction_id)
                                         },
                                         &host,
                                         port,
@@ -1594,12 +1595,13 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
                                          but not yet implemented; remove the auth \
                                          section from the external proxy config or \
                                          wait for a future release";
+                                    let interaction_id = audit::new_audit_correlation_id();
                                     audit::log_denied(
                                         Some(&state.audit_log),
                                         audit::ProxyMode::ConnectIntercept,
                                         &audit::EventContext {
                                             route_id,
-                                            ..audit::EventContext::default()
+                                            ..audit::EventContext::interaction(&interaction_id)
                                         },
                                         &host,
                                         port,
@@ -1694,6 +1696,7 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
                             "Blocked CONNECT to route upstream {} — use reverse proxy path instead",
                             authority
                         );
+                        let interaction_id = audit::new_audit_correlation_id();
                         audit::log_denied(
                             Some(&state.audit_log),
                             audit::ProxyMode::Connect,
@@ -1702,7 +1705,7 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
                                 denial_category: Some(
                                     nono::undo::NetworkAuditDenialCategory::ConnectBypassesL7,
                                 ),
-                                ..audit::EventContext::default()
+                                ..audit::EventContext::interaction(&interaction_id)
                             },
                             &host,
                             port,
@@ -1805,6 +1808,7 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
         Ok(())
     } else if !state.route_store.is_empty() {
         // Non-CONNECT request with routes configured -> reverse proxy
+        let interaction_id = audit::new_audit_correlation_id();
         let ctx = reverse::ReverseProxyCtx {
             route_store: &state.route_store,
             credential_store: &state.credential_store,
@@ -1817,6 +1821,7 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
             audit_log: Some(&state.audit_log),
             approval_backends: state.approval_backends.clone(),
             credential_capture_backend: state.credential_capture_backend.clone(),
+            interaction_id: &interaction_id,
         };
         reverse::handle_reverse_proxy(first_line, &mut stream, &header_bytes, &ctx, &buffered).await
     } else {
@@ -1825,12 +1830,13 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
         let check = state.filter.check_host(&host, port).await?;
         if !check.result.is_allowed() {
             let reason = check.result.reason();
+            let interaction_id = audit::new_audit_correlation_id();
             audit::log_denied(
                 Some(&state.audit_log),
                 audit::ProxyMode::Connect,
                 &audit::EventContext {
                     denial_category: Some(nono::undo::NetworkAuditDenialCategory::HostDenied),
-                    ..audit::EventContext::default()
+                    ..audit::EventContext::interaction(&interaction_id)
                 },
                 &host,
                 port,
@@ -1904,6 +1910,7 @@ async fn handle_forward_http(
         // back to a placeholder so a malformed line still audits.
         let (host, port) =
             parse_non_connect_target(first_line).unwrap_or_else(|_| ("unknown".to_string(), 0));
+        let interaction_id = audit::new_audit_correlation_id();
         audit::log_denied(
             Some(&state.audit_log),
             audit::ProxyMode::Reverse,
@@ -1911,7 +1918,7 @@ async fn handle_forward_http(
                 auth_mechanism: Some(nono::undo::NetworkAuditAuthMechanism::ProxyAuthorization),
                 auth_outcome: Some(nono::undo::NetworkAuditAuthOutcome::Failed),
                 denial_category: Some(nono::undo::NetworkAuditDenialCategory::AuthenticationFailed),
-                ..audit::EventContext::default()
+                ..audit::EventContext::interaction(&interaction_id)
             },
             &host,
             port,
@@ -1941,6 +1948,7 @@ async fn handle_forward_http(
     if port == state.bound_port
         && (host == "127.0.0.1" || host == "localhost" || host == "[::1]" || host == "::1")
     {
+        let interaction_id = audit::new_audit_correlation_id();
         let ctx = reverse::ReverseProxyCtx {
             route_store: &state.route_store,
             credential_store: &state.credential_store,
@@ -1953,6 +1961,7 @@ async fn handle_forward_http(
             audit_log: Some(&state.audit_log),
             approval_backends: state.approval_backends.clone(),
             credential_capture_backend: state.credential_capture_backend.clone(),
+            interaction_id: &interaction_id,
         };
         return reverse::handle_reverse_proxy(first_line, stream, header_bytes, &ctx, buffered)
             .await;
@@ -1961,12 +1970,13 @@ async fn handle_forward_http(
     let check = state.filter.check_host(&host, port).await?;
     if !check.result.is_allowed() {
         let reason = check.result.reason();
+        let interaction_id = audit::new_audit_correlation_id();
         audit::log_denied(
             Some(&state.audit_log),
             audit::ProxyMode::Reverse,
             &audit::EventContext {
                 denial_category: Some(nono::undo::NetworkAuditDenialCategory::HostDenied),
-                ..audit::EventContext::default()
+                ..audit::EventContext::interaction(&interaction_id)
             },
             &host,
             port,
@@ -2037,6 +2047,7 @@ async fn handle_forward_http(
                 let msg = "external proxy authentication is configured but not yet \
                      implemented; remove the auth section from the external proxy \
                      config or wait for a future release";
+                let interaction_id = audit::new_audit_correlation_id();
                 audit::log_denied(
                     Some(&state.audit_log),
                     audit::ProxyMode::Reverse,
@@ -2044,7 +2055,7 @@ async fn handle_forward_http(
                         denial_category: Some(
                             nono::undo::NetworkAuditDenialCategory::UpstreamConnectFailed,
                         ),
-                        ..audit::EventContext::default()
+                        ..audit::EventContext::interaction(&interaction_id)
                     },
                     &host,
                     port,
@@ -2079,6 +2090,7 @@ async fn handle_forward_http(
         tls_connector: &state.tls_connector,
     };
 
+    let interaction_id = audit::new_audit_correlation_id();
     let audit_ctx = AuditCtx {
         log: Some(&state.audit_log),
         mode: audit::ProxyMode::Reverse,
@@ -2087,7 +2099,7 @@ async fn handle_forward_http(
             auth_mechanism: Some(nono::undo::NetworkAuditAuthMechanism::ProxyAuthorization),
             auth_outcome: Some(nono::undo::NetworkAuditAuthOutcome::Succeeded),
             managed_credential_active: Some(credential_redeemed),
-            ..audit::EventContext::default()
+            ..audit::EventContext::interaction(&interaction_id)
         },
         target: &host,
         method: &method,
@@ -2098,6 +2110,7 @@ async fn handle_forward_http(
         Ok(_status) => Ok(()),
         Err(e) => {
             warn!("forward-http upstream connection failed: {}", e);
+            let interaction_id = audit::new_audit_correlation_id();
             audit::log_denied(
                 Some(&state.audit_log),
                 audit::ProxyMode::Reverse,
@@ -2105,7 +2118,7 @@ async fn handle_forward_http(
                     denial_category: Some(
                         nono::undo::NetworkAuditDenialCategory::UpstreamConnectFailed,
                     ),
-                    ..audit::EventContext::default()
+                    ..audit::EventContext::interaction(&interaction_id)
                 },
                 &host,
                 port,

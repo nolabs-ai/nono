@@ -158,6 +158,7 @@ pub struct InterceptCtx<'a> {
 /// * Validate strict OUTER `Proxy-Authorization` against the session token.
 /// * Confirm `route_store.has_intercept_route(host, port)`.
 pub async fn handle_intercept_connect(stream: &mut TcpStream, ctx: InterceptCtx<'_>) -> Result<()> {
+    let connect_interaction_id = audit::new_audit_correlation_id();
     debug!(
         "tls_intercept: accepting CONNECT to {}:{} for L7 inspection",
         ctx.host, ctx.port
@@ -194,7 +195,7 @@ pub async fn handle_intercept_connect(stream: &mut TcpStream, ctx: InterceptCtx<
                     denial_category: Some(
                         nono::undo::NetworkAuditDenialCategory::InterceptHandshakeFailed,
                     ),
-                    ..audit::EventContext::default()
+                    ..audit::EventContext::interaction(&connect_interaction_id)
                 },
                 ctx.host,
                 ctx.port,
@@ -213,7 +214,7 @@ pub async fn handle_intercept_connect(stream: &mut TcpStream, ctx: InterceptCtx<
             route_id: ctx.route_id,
             auth_mechanism: Some(nono::undo::NetworkAuditAuthMechanism::ProxyAuthorization),
             auth_outcome: Some(nono::undo::NetworkAuditAuthOutcome::Succeeded),
-            ..audit::EventContext::default()
+            ..audit::EventContext::interaction(&connect_interaction_id)
         },
         ctx.host,
         ctx.port,
@@ -401,6 +402,7 @@ pub(crate) async fn select_intercept_route<'a>(
     request: InterceptRouteRequest<'_>,
     audit_log: Option<&audit::SharedAuditLog>,
     approval_backends: Option<&crate::approval::ApprovalBackendRegistry>,
+    interaction_id: &str,
 ) -> RouteSelection<'a> {
     let method = request.method;
     let path = request.path;
@@ -445,7 +447,7 @@ pub(crate) async fn select_intercept_route<'a>(
                         endpoint_policy_action: Some("allow"),
                         endpoint_policy_rule: Some(&rule_label),
                         upstream: Some(&route.upstream),
-                        ..audit::EventContext::default()
+                        ..audit::EventContext::interaction(interaction_id)
                     },
                     host,
                     Some(port),
@@ -486,7 +488,7 @@ pub(crate) async fn select_intercept_route<'a>(
                             endpoint_policy_action: Some("approve"),
                             endpoint_policy_rule: Some(&rule_label),
                             upstream: Some(&route.upstream),
-                            ..audit::EventContext::default()
+                            ..audit::EventContext::interaction(interaction_id)
                         },
                         host,
                         port,
@@ -511,7 +513,7 @@ pub(crate) async fn select_intercept_route<'a>(
                                 endpoint_policy_action: Some("approve"),
                                 endpoint_policy_rule: Some(&rule_label),
                                 upstream: Some(&route.upstream),
-                                ..audit::EventContext::default()
+                                ..audit::EventContext::interaction(interaction_id)
                             },
                             host,
                             Some(port),
@@ -537,7 +539,7 @@ pub(crate) async fn select_intercept_route<'a>(
                     endpoint_policy_rule: Some(&rule_label),
                     approval_backend: Some(&backend_name),
                     upstream: Some(&route.upstream),
-                    ..audit::EventContext::default()
+                    ..audit::EventContext::interaction(interaction_id)
                 };
                 audit::log_l7_policy_decision(
                     audit_log,
@@ -729,7 +731,7 @@ pub(crate) async fn select_intercept_route<'a>(
                         endpoint_policy_action: Some("deny"),
                         endpoint_policy_rule: Some(&rule_label),
                         upstream: Some(&route.upstream),
-                        ..audit::EventContext::default()
+                        ..audit::EventContext::interaction(interaction_id)
                     },
                     host,
                     Some(port),
@@ -758,7 +760,7 @@ pub(crate) async fn select_intercept_route<'a>(
             audit::ProxyMode::ConnectIntercept,
             &audit::EventContext {
                 denial_category: Some(nono::undo::NetworkAuditDenialCategory::EndpointPolicy),
-                ..audit::EventContext::default()
+                ..audit::EventContext::interaction(interaction_id)
             },
             host,
             port,
@@ -790,7 +792,7 @@ pub(crate) async fn select_intercept_route<'a>(
             audit::ProxyMode::ConnectIntercept,
             &audit::EventContext {
                 denial_category: Some(nono::undo::NetworkAuditDenialCategory::EndpointPolicy),
-                ..audit::EventContext::default()
+                ..audit::EventContext::interaction(interaction_id)
             },
             host,
             port,
@@ -810,7 +812,7 @@ pub(crate) async fn select_intercept_route<'a>(
             audit::ProxyMode::ConnectIntercept,
             &audit::EventContext {
                 denial_category: Some(nono::undo::NetworkAuditDenialCategory::UnsupportedUpgrade),
-                ..audit::EventContext::default()
+                ..audit::EventContext::interaction(interaction_id)
             },
             host,
             port,
@@ -852,7 +854,7 @@ pub(crate) async fn select_intercept_route<'a>(
                     &audit::EventContext {
                         route_id: Some(prefix),
                         upstream: Some(&route.upstream),
-                        ..audit::EventContext::default()
+                        ..audit::EventContext::interaction(interaction_id)
                     },
                     host,
                     port,
@@ -920,6 +922,7 @@ pub(crate) async fn resolve_managed_credential<'a>(
     route: Option<&crate::route::LoadedRoute>,
     method: &str,
     path: &str,
+    interaction_id: &str,
 ) -> CredentialResolution<'a> {
     let static_cred = service.and_then(|s| credential_store.get(s));
     let cmd_route = service.and_then(|s| credential_store.get_cmd(s));
@@ -954,7 +957,7 @@ pub(crate) async fn resolve_managed_credential<'a>(
                 denial_category: Some(
                     nono::undo::NetworkAuditDenialCategory::ManagedCredentialUnavailable,
                 ),
-                ..audit::EventContext::default()
+                ..audit::EventContext::interaction(interaction_id)
             },
             host,
             port,
@@ -986,6 +989,7 @@ pub(crate) async fn resolve_managed_credential<'a>(
             audit::ProxyMode::ConnectIntercept,
             audit_log,
             credential_capture_backend.cloned(),
+            interaction_id,
         )
         .await
         {
@@ -1009,7 +1013,7 @@ pub(crate) async fn resolve_managed_credential<'a>(
                         denial_category: Some(
                             nono::undo::NetworkAuditDenialCategory::ManagedCredentialUnavailable,
                         ),
-                        ..audit::EventContext::default()
+                        ..audit::EventContext::interaction(interaction_id)
                     },
                     host,
                     port,
@@ -1031,6 +1035,7 @@ async fn handle_inner_request<S>(tls_stream: &mut S, ctx: &InterceptCtx<'_>) -> 
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
+    let interaction_id = audit::new_audit_correlation_id();
     let req = match parse_inner_request(tls_stream).await? {
         Some(r) => r,
         None => return Ok(()),
@@ -1055,7 +1060,7 @@ where
                         denial_category: Some(
                             nono::undo::NetworkAuditDenialCategory::UnsupportedUpgrade,
                         ),
-                        ..audit::EventContext::default()
+                        ..audit::EventContext::interaction(&interaction_id)
                     },
                     ctx.host,
                     ctx.port,
@@ -1089,6 +1094,7 @@ where
             },
             ctx.audit_log,
             ctx.approval_backends.as_ref(),
+            &interaction_id,
         )
         .await
         {
@@ -1119,7 +1125,7 @@ where
             &audit::EventContext {
                 route_id: service,
                 denial_category: Some(nono::undo::NetworkAuditDenialCategory::UnsupportedUpgrade),
-                ..audit::EventContext::default()
+                ..audit::EventContext::interaction(&interaction_id)
             },
             ctx.host,
             ctx.port,
@@ -1134,8 +1140,17 @@ where
     if route.is_some_and(|rt| rt.has_spiffe_source())
         && let (Some(svc), Some(rt)) = (service, route)
     {
-        return handle_spiffe_intercept_request(tls_stream, ctx, &req, svc, rt, &method, &path)
-            .await;
+        return handle_spiffe_intercept_request(
+            tls_stream,
+            ctx,
+            &req,
+            svc,
+            rt,
+            &method,
+            &path,
+            &interaction_id,
+        )
+        .await;
     }
 
     // OAuth2 presence only affects the audit `managed_credential_active` flag
@@ -1148,7 +1163,16 @@ where
     // a 501 stub for the aws_route case.
     let aws_route = service.and_then(|s| ctx.credential_store.get_aws(s));
     if let Some(aws) = aws_route {
-        return handle_inner_request_aws(tls_stream, ctx, aws, route, service, &req).await;
+        return handle_inner_request_aws(
+            tls_stream,
+            ctx,
+            aws,
+            route,
+            service,
+            &req,
+            &interaction_id,
+        )
+        .await;
     }
 
     // Managed credential gating and command-backed capture are shared with the
@@ -1164,6 +1188,7 @@ where
         route,
         &method,
         &path,
+        &interaction_id,
     )
     .await
     {
@@ -1186,7 +1211,16 @@ where
     // ordinary managed-credential/passthrough routes on identical L7 policy,
     // while still refusing to tunnel anything not explicitly allow-listed.
     if is_websocket_upgrade {
-        return handle_websocket_upgrade(tls_stream, ctx, route, service, &req, cred).await;
+        return handle_websocket_upgrade(
+            tls_stream,
+            ctx,
+            route,
+            service,
+            &req,
+            cred,
+            &interaction_id,
+        )
+        .await;
     }
 
     // --- Path / credential transformation ---
@@ -1202,7 +1236,7 @@ where
             managed_credential_active: Some(cred.is_some() || oauth2_route.is_some()),
             injection_mode: cred
                 .map(|c| reverse::audit_injection_mode_for_inject_mode(&c.inject_mode)),
-            ..audit::EventContext::default()
+            ..audit::EventContext::interaction(&interaction_id)
         },
     )
     .await?
@@ -1336,7 +1370,7 @@ where
             }),
         spiffe_context: spiffe_audit_ctx,
         denial_category: None,
-        ..audit::EventContext::default()
+        ..audit::EventContext::interaction(&interaction_id)
     };
     let audit_ctx = AuditCtx {
         log: ctx.audit_log,
@@ -1411,6 +1445,7 @@ async fn handle_spiffe_intercept_request<S>(
     route: &crate::route::LoadedRoute,
     method: &str,
     path: &str,
+    interaction_id: &str,
 ) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -1436,7 +1471,7 @@ where
                         denial_category: Some(
                             nono::undo::NetworkAuditDenialCategory::ManagedCredentialUnavailable,
                         ),
-                        ..audit::EventContext::default()
+                        ..audit::EventContext::interaction(interaction_id)
                     },
                     ctx.host,
                     ctx.port,
@@ -1461,7 +1496,7 @@ where
                     denial_category: Some(
                         nono::undo::NetworkAuditDenialCategory::ManagedCredentialUnavailable,
                     ),
-                    ..audit::EventContext::default()
+                    ..audit::EventContext::interaction(interaction_id)
                 },
                 ctx.host,
                 ctx.port,
@@ -1480,7 +1515,7 @@ where
         managed_credential_active: Some(true),
         injection_mode: route.managed_injection_mode.clone(),
         spiffe_context: Some(spiffe_ctx),
-        ..audit::EventContext::default()
+        ..audit::EventContext::interaction(interaction_id)
     };
 
     let resolved_addrs = match resolve_upstream_or_deny(
@@ -1490,7 +1525,7 @@ where
             route_id: Some(service),
             managed_credential_active: Some(true),
             injection_mode: route.managed_injection_mode.clone(),
-            ..audit::EventContext::default()
+            ..audit::EventContext::interaction(interaction_id)
         },
     )
     .await?
@@ -1651,6 +1686,7 @@ async fn handle_inner_request_aws<S>(
     route: Option<&crate::route::LoadedRoute>,
     service: Option<&str>,
     req: &ParsedRequest,
+    interaction_id: &str,
 ) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -1675,7 +1711,7 @@ where
             route_id: service,
             managed_credential_active: Some(true),
             injection_mode: Some(nono::undo::NetworkAuditInjectionMode::Header),
-            ..audit::EventContext::default()
+            ..audit::EventContext::interaction(interaction_id)
         },
     )
     .await?
@@ -1736,7 +1772,7 @@ where
                     denial_category: Some(
                         nono::undo::NetworkAuditDenialCategory::ManagedCredentialUnavailable,
                     ),
-                    ..audit::EventContext::default()
+                    ..audit::EventContext::interaction(interaction_id)
                 },
                 ctx.host,
                 ctx.port,
@@ -1775,7 +1811,7 @@ where
         managed_credential_active: Some(true),
         injection_mode: Some(nono::undo::NetworkAuditInjectionMode::Header),
         denial_category: None,
-        ..audit::EventContext::default()
+        ..audit::EventContext::interaction(interaction_id)
     };
     let audit_ctx = AuditCtx {
         log: ctx.audit_log,
@@ -1830,6 +1866,7 @@ async fn handle_websocket_upgrade<S>(
     service: Option<&str>,
     req: &ParsedRequest,
     cred: Option<&crate::credential::LoadedCredential>,
+    interaction_id: &str,
 ) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -1842,7 +1879,7 @@ where
             managed_credential_active: Some(cred.is_some()),
             injection_mode: cred
                 .map(|c| reverse::audit_injection_mode_for_inject_mode(&c.inject_mode)),
-            ..audit::EventContext::default()
+            ..audit::EventContext::interaction(interaction_id)
         },
     )
     .await?
@@ -1889,7 +1926,7 @@ where
                     denial_category: Some(
                         nono::undo::NetworkAuditDenialCategory::ManagedCredentialUnavailable,
                     ),
-                    ..audit::EventContext::default()
+                    ..audit::EventContext::interaction(interaction_id)
                 },
                 ctx.host,
                 ctx.port,
@@ -1914,7 +1951,7 @@ where
     let deny_ctx = audit::EventContext {
         route_id: service,
         denial_category: Some(nono::undo::NetworkAuditDenialCategory::UpstreamConnectFailed),
-        ..audit::EventContext::default()
+        ..audit::EventContext::interaction(interaction_id)
     };
 
     let mut upstream = match forward::open_https_upstream(&upstream_spec).await {
@@ -1943,6 +1980,7 @@ where
         req,
         &request,
         &client_key,
+        interaction_id,
     )
     .await
 }
@@ -1968,6 +2006,7 @@ async fn run_websocket_tunnel<S, U>(
     req: &ParsedRequest,
     request: &Zeroizing<String>,
     client_key: &str,
+    interaction_id: &str,
 ) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -1976,7 +2015,7 @@ where
     let deny_ctx = audit::EventContext {
         route_id: service,
         denial_category: Some(nono::undo::NetworkAuditDenialCategory::UpstreamConnectFailed),
-        ..audit::EventContext::default()
+        ..audit::EventContext::interaction(interaction_id)
     };
 
     if let Err(e) = upstream.write_all(request.as_bytes()).await {
@@ -2052,7 +2091,7 @@ where
             &audit::EventContext {
                 route_id: service,
                 denial_category: Some(nono::undo::NetworkAuditDenialCategory::UnsupportedUpgrade),
-                ..audit::EventContext::default()
+                ..audit::EventContext::interaction(interaction_id)
             },
             ctx.host,
             ctx.port,
@@ -2085,7 +2124,7 @@ where
             managed_credential_active: Some(cred.is_some()),
             injection_mode: cred
                 .map(|c| reverse::audit_injection_mode_for_inject_mode(&c.inject_mode)),
-            ..audit::EventContext::default()
+            ..audit::EventContext::interaction(interaction_id)
         },
         ctx.host,
         &req.method,
@@ -2601,8 +2640,16 @@ mod tests {
 
         // Each path selects its own route; the sibling route's default-deny must
         // not turn this into a 403.
-        match select_intercept_route(&store, "example.com", 443, req("GET", "/foo"), None, None)
-            .await
+        match select_intercept_route(
+            &store,
+            "example.com",
+            443,
+            req("GET", "/foo"),
+            None,
+            None,
+            "test-interaction-id",
+        )
+        .await
         {
             RouteSelection::Selected(Some(selected)) => assert_eq!(selected.id, "foo"),
             RouteSelection::Selected(None) => {
@@ -2612,8 +2659,16 @@ mod tests {
                 panic!("/foo must be allowed, got rejection with status {status}")
             }
         }
-        match select_intercept_route(&store, "example.com", 443, req("GET", "/bar"), None, None)
-            .await
+        match select_intercept_route(
+            &store,
+            "example.com",
+            443,
+            req("GET", "/bar"),
+            None,
+            None,
+            "test-interaction-id",
+        )
+        .await
         {
             RouteSelection::Selected(Some(selected)) => assert_eq!(selected.id, "bar"),
             RouteSelection::Selected(None) => {
@@ -2624,8 +2679,16 @@ mod tests {
             }
         }
         // A path covered by neither route: passthrough without credentials, not a 403.
-        match select_intercept_route(&store, "example.com", 443, req("GET", "/other"), None, None)
-            .await
+        match select_intercept_route(
+            &store,
+            "example.com",
+            443,
+            req("GET", "/other"),
+            None,
+            None,
+            "test-interaction-id",
+        )
+        .await
         {
             RouteSelection::Selected(None) => {}
             RouteSelection::Selected(Some(selected)) => {
@@ -2691,8 +2754,16 @@ mod tests {
         }
 
         // First request consumes the single burst token and selects the route.
-        match select_intercept_route(&store, "example.com", 443, req("GET", "/foo"), None, None)
-            .await
+        match select_intercept_route(
+            &store,
+            "example.com",
+            443,
+            req("GET", "/foo"),
+            None,
+            None,
+            "test-interaction-id",
+        )
+        .await
         {
             RouteSelection::Selected(Some(selected)) => assert_eq!(selected.id, "limited"),
             RouteSelection::Selected(None) => {
@@ -2705,8 +2776,16 @@ mod tests {
 
         // Second request within the same instant: bucket empty, zero delay
         // budget, so it is rejected with HTTP 429.
-        match select_intercept_route(&store, "example.com", 443, req("GET", "/foo"), None, None)
-            .await
+        match select_intercept_route(
+            &store,
+            "example.com",
+            443,
+            req("GET", "/foo"),
+            None,
+            None,
+            "test-interaction-id",
+        )
+        .await
         {
             RouteSelection::Rejected(status) => assert_eq!(status, 429),
             RouteSelection::Selected(Some(selected)) => {
@@ -2814,6 +2893,7 @@ mod tests {
             },
             None,
             Some(&registry),
+            "test-interaction-id",
         )
         .await
         {
@@ -2848,6 +2928,7 @@ mod tests {
             },
             None,
             Some(&registry),
+            "test-interaction-id",
         )
         .await
         {
@@ -2880,6 +2961,7 @@ mod tests {
             },
             Some(&audit_log),
             Some(&registry),
+            "test-interaction-id",
         )
         .await
         {
@@ -2922,6 +3004,7 @@ mod tests {
             },
             None,
             Some(&registry),
+            "test-interaction-id",
         )
         .await
         {
@@ -3140,6 +3223,7 @@ mod tests {
             },
             None,
             None,
+            "test-interaction-id",
         )
         .await;
         assert!(matches!(selection, RouteSelection::Rejected(403)));
@@ -3207,6 +3291,7 @@ mod tests {
                     &req,
                     &request,
                     RFC6455_CLIENT_KEY,
+                    "test-interaction-id",
                 ),
                 async {
                     // Upstream receives the rewritten request headers
@@ -3312,6 +3397,7 @@ mod tests {
                     &req,
                     &request,
                     RFC6455_CLIENT_KEY,
+                    "test-interaction-id",
                 ),
                 async {
                     // Drain the request the tunnel writes upstream so it

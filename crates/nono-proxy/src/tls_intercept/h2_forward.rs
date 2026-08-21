@@ -235,6 +235,7 @@ async fn handle_h2_stream(
     client_send: &mut h2::client::SendRequest<Bytes>,
     ctx: &SharedH2Ctx,
 ) -> Result<()> {
+    let interaction_id = audit::new_audit_correlation_id();
     let method = request.method().clone();
     let path = request
         .uri()
@@ -293,6 +294,7 @@ async fn handle_h2_stream(
         },
         ctx.audit_log.as_ref(),
         ctx.approval_backends.as_ref(),
+        &interaction_id,
     )
     .await
     {
@@ -319,6 +321,7 @@ async fn handle_h2_stream(
         route,
         &method_str,
         &path,
+        &interaction_id,
     )
     .await
     {
@@ -587,7 +590,7 @@ async fn handle_h2_stream(
                 .map(|c| reverse::audit_injection_mode_for_inject_mode(&c.inject_mode)),
             denial_category: None,
             spiffe_context: spiffe_audit_ctx,
-            ..audit::EventContext::default()
+            ..audit::EventContext::interaction(&interaction_id)
         },
         &ctx.host,
         &method_str,

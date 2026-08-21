@@ -3271,10 +3271,20 @@ pub(crate) fn parse_profile_bytes(content: &[u8]) -> Result<Profile> {
 
 /// Load a profile from a JSON file, resolving inheritance. The parent
 /// directory is passed as context so `extends` can resolve sibling profiles.
+///
+/// Exception: files under `profile-drafts/` do **not** use the drafts directory
+/// as sibling context. Draft sibling lookup can shadow a same-named user/pack
+/// base and make `show`/`validate` disagree with post-`promote` resolution
+/// (#1565). Drafts resolve `extends` the same way as `resolve_and_finalize_profile`
+/// (user profiles → packs → builtins).
 fn load_from_file(path: &Path, cli_extends: &[String]) -> Result<Profile> {
     let (mut profile, source_path) = parse_file_backed_profile(path)?;
     prepend_cli_extends(&mut profile, cli_extends);
-    let context_dir = source_path.parent();
+    let context_dir = if is_under_user_profile_draft_dir(&source_path) {
+        None
+    } else {
+        source_path.parent()
+    };
     resolve_extends(profile, &mut Vec::new(), 0, context_dir, Some(&source_path))
 }
 
@@ -3925,6 +3935,25 @@ pub fn display_trust_policy_path() -> String {
 
 pub(crate) fn user_profile_draft_dir() -> Result<PathBuf> {
     Ok(crate::package::nono_config_dir()?.join("profile-drafts"))
+}
+
+/// True when `path` is inside the user profile-drafts directory.
+///
+/// Uses canonicalized [`Path::starts_with`] (not string prefix matching) so
+/// lookalike paths such as `profile-drafts-evil/` cannot match.
+pub(crate) fn is_under_user_profile_draft_dir(path: &Path) -> bool {
+    let Ok(drafts) = user_profile_draft_dir() else {
+        return false;
+    };
+    let Ok(drafts_canon) = drafts.canonicalize() else {
+        // Drafts dir missing or unreadable → nothing can be under it.
+        return false;
+    };
+    let canon = match path.canonicalize() {
+        Ok(p) => p,
+        Err(_) => path.to_path_buf(),
+    };
+    canon.starts_with(&drafts_canon)
 }
 
 pub(crate) fn get_user_profile_draft_path(name: &str) -> Result<PathBuf> {
@@ -4666,6 +4695,106 @@ mod tests {
                 .contains(&"deny_credentials".to_string())
         );
         assert!(profile.groups.include.contains(&"node_runtime".to_string()));
+    }
+
+    /// Regression for https://github.com/nolabs-ai/nono/issues/1565:
+    /// a draft sibling must not shadow a same-named user profile base.
+    #[test]
+    fn draft_extends_skips_draft_sibling_shadow_of_user_base() {
+        with_config_env(|config_dir| {
+            let profiles = config_dir.join("nono").join("profiles");
+            let drafts = config_dir.join("nono").join("profile-drafts");
+            std::fs::create_dir_all(&profiles).expect("profiles dir");
+            std::fs::create_dir_all(&drafts).expect("drafts dir");
+
+            std::fs::write(
+                profiles.join("base-grants.json"),
+                r#"{
+                    "meta": { "name": "base-grants" },
+                    "filesystem": {
+                        "read": ["/tmp/gh-nono", "/tmp/nono-ssh", "/tmp/agent.sock", "/tmp/extra"]
+                    }
+                }"#,
+            )
+            .expect("write user base");
+            // Incomplete draft sibling with the same name as the intended base.
+            std::fs::write(
+                drafts.join("base-grants.json"),
+                r#"{
+                    "meta": { "name": "base-grants" }
+                }"#,
+            )
+            .expect("write draft sibling");
+
+            let draft_path = drafts.join("claude-harness-config.json");
+            std::fs::write(
+                &draft_path,
+                r#"{
+                    "extends": "base-grants",
+                    "meta": { "name": "claude-harness-config" },
+                    "filesystem": { "read": ["/tmp/child-only"] }
+                }"#,
+            )
+            .expect("write draft child");
+
+            let from_draft = load_profile_from_path(&draft_path).expect("load draft");
+            assert!(
+                from_draft
+                    .filesystem
+                    .read
+                    .iter()
+                    .any(|p| p.contains("gh-nono")),
+                "draft must resolve the user-profile base, not the empty draft sibling; got {:?}",
+                from_draft.filesystem.read
+            );
+            assert!(
+                from_draft
+                    .filesystem
+                    .read
+                    .iter()
+                    .any(|p| p.contains("child-only")),
+                "child grants must still merge"
+            );
+        });
+    }
+
+    /// Draft-only extends targets (no user/pack/builtin) must fail closed
+    /// rather than silently resolving via draft siblings (#1565).
+    #[test]
+    fn draft_extends_draft_only_base_fails_closed() {
+        with_config_env(|config_dir| {
+            let drafts = config_dir.join("nono").join("profile-drafts");
+            std::fs::create_dir_all(&drafts).expect("drafts dir");
+            std::fs::write(
+                drafts.join("draft-only-base.json"),
+                r#"{
+                    "meta": { "name": "draft-only-base" },
+                    "filesystem": { "read": ["/tmp/should-not-merge"] }
+                }"#,
+            )
+            .expect("write draft-only base");
+            let draft_path = drafts.join("child.json");
+            std::fs::write(
+                &draft_path,
+                r#"{
+                    "extends": "draft-only-base",
+                    "meta": { "name": "child" }
+                }"#,
+            )
+            .expect("write draft child");
+
+            let err =
+                load_profile_from_path(&draft_path).expect_err("must not resolve draft sibling");
+            assert!(
+                matches!(err, NonoError::ProfileInheritance(_)),
+                "expected inheritance error, got {err:?}"
+            );
+            let msg = err.to_string();
+            assert!(
+                msg.contains("draft-only-base") && msg.contains("not found"),
+                "error should name the missing base: {msg}"
+            );
+        });
     }
 
     #[test]

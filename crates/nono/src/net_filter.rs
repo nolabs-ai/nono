@@ -370,7 +370,7 @@ impl HostFilter {
     /// Check only the deny list, skipping the allowlist (which a wildcard
     /// `*` would otherwise satisfy before a port-scoped deny is checked).
     pub fn check_deny(&self, host: &str) -> Option<FilterResult> {
-        // Infallible: deny_hosts/deny_suffixes are populated via the same
+        // Infallible: deny_hosts/deny_patterns are populated via the same
         // fallback (normalize_entry), so a fallible lookup here could miss
         // an entry that IDNA rejects (e.g. a host:port or IPv6 literal).
         let lower_host = normalize_entry(host);
@@ -381,12 +381,14 @@ impl HostFilter {
             });
         }
 
-        for suffix in &self.deny_suffixes {
-            if lower_host.ends_with(suffix.as_str()) && lower_host.len() > suffix.len() {
-                return Some(FilterResult::DenyHost {
-                    host: host.to_string(),
-                });
-            }
+        if self
+            .deny_patterns
+            .iter()
+            .any(|pattern| host_pattern_matches(pattern, &lower_host))
+        {
+            return Some(FilterResult::DenyHost {
+                host: host.to_string(),
+            });
         }
 
         None

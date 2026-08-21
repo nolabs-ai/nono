@@ -693,10 +693,7 @@ pub(super) enum NetworkDecision {
 ///    - `bind()` is allowed on `proxy_bind_ports` or within `proxy_bind_port_ranges`
 ///      (loopback only). The proxy listener port is connect-only.
 ///    - Non-loopback destinations are denied.
-pub(super) fn is_allowed_loopback_tcp_bind_port(
-    port: u16,
-    config: &SupervisorConfig<'_>,
-) -> bool {
+pub(super) fn is_allowed_loopback_tcp_bind_port(port: u16, config: &SupervisorConfig<'_>) -> bool {
     if config.proxy_bind_ports.contains(&port) {
         return true;
     }
@@ -777,8 +774,7 @@ pub(super) fn decide_network_notification(
         }
         SYS_BIND => {
             let port = sockaddr.port;
-            let allowed = sockaddr.is_loopback
-                && is_allowed_loopback_tcp_bind_port(port, config);
+            let allowed = sockaddr.is_loopback && is_allowed_loopback_tcp_bind_port(port, config);
             if allowed {
                 debug!("Proxy seccomp: allowing bind on port {}", port);
                 NetworkDecision::Allow
@@ -2269,12 +2265,7 @@ mod tests {
             let backend = DenyAllBackend;
             let config = make_config_with_ranges(&backend, 8080, vec![], vec![(8250, 8255)], &[]);
             assert_eq!(
-                decide_network_notification(
-                    test_pid(),
-                    SYS_CONNECT,
-                    &inet_external(8250),
-                    &config,
-                ),
+                decide_network_notification(test_pid(), SYS_CONNECT, &inet_external(8250), &config,),
                 NetworkDecision::Deny,
                 "declared ports must not bypass loopback restriction"
             );

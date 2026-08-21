@@ -2264,9 +2264,7 @@ pub(crate) fn merge_dedup_ports(a: &[u16], b: &[u16]) -> Vec<u16> {
 /// Parse `--open-port-range` / `--listen-port-range` values (`START:END`, inclusive).
 pub(crate) fn parse_port_range_arg(value: &str) -> std::result::Result<(u16, u16), String> {
     let (start_raw, end_raw) = value.split_once(':').ok_or_else(|| {
-        format!(
-            "invalid port range '{value}': expected inclusive START:END (e.g. 3000:3010)"
-        )
+        format!("invalid port range '{value}': expected inclusive START:END (e.g. 3000:3010)")
     })?;
     let start: u16 = start_raw.parse().map_err(|_| {
         format!("invalid port range start in '{value}': '{start_raw}' is not a valid port")
@@ -3311,7 +3309,10 @@ mod tests {
 
     #[test]
     fn parse_port_range_arg_accepts_inclusive_range() {
-        assert_eq!(parse_port_range_arg("3000:3010").expect("valid"), (3000, 3010));
+        assert_eq!(
+            parse_port_range_arg("3000:3010").expect("valid"),
+            (3000, 3010)
+        );
     }
 
     #[test]

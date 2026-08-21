@@ -2611,7 +2611,7 @@ pub(crate) fn cmd_promote(args: ProfilePromoteArgs) -> Result<()> {
     }
 
     if let Some(current) = current_bytes.as_deref() {
-        verify_base_hash(&base_path, current)?;
+        verify_or_infer_base_hash(&base_path, current)?;
     }
 
     print_promote_diff(&args.name, current_bytes.as_deref(), &draft_bytes);
@@ -2687,6 +2687,25 @@ fn reserved_profile_source(name: &str) -> Result<Option<&'static str>> {
         return Ok(Some("installed pack"));
     }
     Ok(None)
+}
+
+fn verify_or_infer_base_hash(base_path: &Path, current_bytes: &[u8]) -> Result<()> {
+    match regular_file_exists(base_path, "profile draft base hash")? {
+        true => verify_base_hash(base_path, current_bytes),
+        false => {
+            // Agents often write only the draft JSON. Infer the baseline from
+            // the live profile so promote can still show a diff; staleness
+            // relative to an older draft-time snapshot cannot be proven.
+            eprintln!(
+                "{} missing {}; treating the current profile as the draft baseline. \
+                 Concurrent edits to the live profile since the draft was written cannot be detected. \
+                 To pin a baseline next time, write the live profile SHA-256 hex to that path.",
+                prefix(),
+                base_path.display()
+            );
+            Ok(())
+        }
+    }
 }
 
 fn verify_base_hash(base_path: &Path, current_bytes: &[u8]) -> Result<()> {
@@ -4134,6 +4153,49 @@ mod tests {
     }
 
     #[test]
+    fn promote_existing_profile_infers_missing_base_hash() {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let xdg = dir.path().join("config");
+        std::fs::create_dir_all(&xdg).expect("create xdg");
+        let xdg_str = xdg.to_str().expect("utf8 xdg");
+        let _env = crate::test_env::EnvVarGuard::set_all(&[("XDG_CONFIG_HOME", xdg_str)]);
+
+        let profiles_dir = profile::user_profile_dir().expect("profile dir");
+        let draft_dir = profile::user_profile_draft_dir().expect("draft dir");
+        std::fs::create_dir_all(&profiles_dir).expect("create profiles");
+        std::fs::create_dir_all(&draft_dir).expect("create drafts");
+
+        let target = profile::get_user_profile_path("agent-local").expect("target path");
+        let old = b"{\n  \"meta\": { \"name\": \"agent-local\" },\n  \"filesystem\": { \"read\": [\"/tmp\"] }\n}\n";
+        std::fs::write(&target, old).expect("write target");
+        let draft = profile::get_user_profile_draft_path("agent-local").expect("draft path");
+        std::fs::write(
+            &draft,
+            "{\n  \"meta\": { \"name\": \"agent-local\" },\n  \"filesystem\": { \"read\": [\"/var/tmp\"] }\n}\n",
+        )
+        .expect("write draft");
+
+        // No .base file: promote should still succeed using the live profile as baseline.
+        let result = cmd_promote(ProfilePromoteArgs {
+            name: "agent-local".to_string(),
+            diff: false,
+            yes: true,
+            help: None,
+        });
+        assert!(
+            result.is_ok(),
+            "promote without .base should succeed: {result:?}"
+        );
+        let promoted = std::fs::read_to_string(&target).expect("read promoted");
+        assert!(promoted.contains("/var/tmp"));
+        assert!(!draft.exists(), "draft should be removed after promote");
+    }
+
+    #[test]
     fn promote_existing_profile_requires_matching_base_hash() {
         let _guard = match crate::test_env::ENV_LOCK.lock() {
             Ok(guard) => guard,
@@ -4160,19 +4222,23 @@ mod tests {
         )
         .expect("write draft");
 
-        let missing_base = cmd_promote(ProfilePromoteArgs {
+        let base = profile::get_user_profile_draft_base_path("agent-local").expect("base path");
+        std::fs::write(&base, "0".repeat(64)).expect("write mismatched base");
+        let mismatched = cmd_promote(ProfilePromoteArgs {
             name: "agent-local".to_string(),
             diff: false,
             yes: true,
             help: None,
         });
-        assert!(
-            missing_base.is_err(),
-            "existing profile promote must require .base"
-        );
+        assert!(mismatched.is_err(), "mismatched .base must still fail");
 
-        let base = profile::get_user_profile_draft_base_path("agent-local").expect("base path");
-        std::fs::write(&base, sha256_hex(old)).expect("write base");
+        std::fs::write(&base, sha256_hex(old)).expect("write matching base");
+        // Re-write draft (previous promote attempt did not consume it on error).
+        std::fs::write(
+            &draft,
+            "{\n  \"meta\": { \"name\": \"agent-local\" },\n  \"filesystem\": { \"read\": [\"/var/tmp\"] }\n}\n",
+        )
+        .expect("rewrite draft");
         let result = cmd_promote(ProfilePromoteArgs {
             name: "agent-local".to_string(),
             diff: false,

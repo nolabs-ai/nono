@@ -354,7 +354,7 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
             _ => Vec::new(),
         },
         #[cfg(target_os = "linux")]
-        proxy_bind_port_ranges: caps.localhost_port_ranges().to_vec(),
+        proxy_bind_port_ranges: caps.merged_localhost_port_ranges(),
         #[cfg(target_os = "linux")]
         unix_socket_allowlist: caps.unix_socket_capabilities(),
         #[cfg(target_os = "linux")]

@@ -3858,7 +3858,7 @@ fn caps_to_spec(caps: &CapabilitySet) -> ChildCapsSpec {
             NetworkMode::ProxyOnly { bind_ports, .. } => bind_ports.clone(),
             _ => Vec::new(),
         },
-        proxy_bind_port_ranges: caps.localhost_port_ranges().to_vec(),
+        proxy_bind_port_ranges: caps.merged_localhost_port_ranges(),
         tcp_connect_ports: caps.tcp_connect_ports().to_vec(),
         tcp_bind_ports: caps.tcp_bind_ports().to_vec(),
     }

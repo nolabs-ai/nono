@@ -8,7 +8,27 @@
 //! 5. Property-based: randomly generated profiles round-trip through manifests
 
 use std::io::Write;
+use std::path::Path;
 use std::process::Command;
+
+/// Filesystem grants needed to actually exec a tiny child under `--config`.
+///
+/// `--config` does not load default policy groups, so a `/tmp`-only manifest
+/// is enough on macOS (Seatbelt allows `process-exec*`) but fails closed on
+/// Linux Landlock, which cannot exec `/bin/sh` without those trees. Only
+/// directories that exist on this host are emitted so the same test can run
+/// on both platforms.
+fn existing_exec_fs_grants_json() -> String {
+    [
+        "/tmp", "/bin", "/usr", "/lib", "/lib64", "/etc", "/dev", "/System", "/private", "/opt",
+        "/nix",
+    ]
+    .into_iter()
+    .filter(|path| Path::new(path).is_dir())
+    .map(|path| format!(r#"{{ "path": "{path}", "access": "read" }}"#))
+    .collect::<Vec<_>>()
+    .join(", ")
+}
 
 fn nono_bin() -> Command {
     Command::new(env!("CARGO_BIN_EXE_nono"))
@@ -465,6 +485,7 @@ fn manifest_credential_env_var_accepted_and_round_trips() {
 #[test]
 fn manifest_custom_credential_does_not_unknown_service() {
     let mut f = tempfile::NamedTempFile::new().expect("create temp file");
+    let fs_grants = existing_exec_fs_grants_json();
     write!(
         f,
         r#"{{
@@ -485,7 +506,7 @@ fn manifest_custom_credential_does_not_unknown_service() {
                 }}
             }}],
             "filesystem": {{
-                "grants": [{{ "path": "/tmp", "access": "read" }}]
+                "grants": [{fs_grants}]
             }}
         }}"#
     )
@@ -507,13 +528,14 @@ fn manifest_custom_credential_does_not_unknown_service() {
         .expect("failed to run nono");
 
     let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         !stderr.contains("Unknown credential service"),
         "inline custom credential must not yield Unknown credential service, stderr: {stderr}"
     );
     assert!(
         output.status.success(),
-        "expected success for --config with inline custom credential, stderr: {stderr}"
+        "expected success for --config with inline custom credential, stdout: {stdout}, stderr: {stderr}"
     );
 }
 

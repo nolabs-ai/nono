@@ -50,9 +50,8 @@ From here **fork the config**, tweak it, theme it, make it your own, and share i
 > “Datadog engineers want their agents to move fast, and we want our credentials and production systems kept safe while they do. nono is the only sandbox that gives us both fine-grained, per-command policies and sophisticated credential management that fits existing, complex real-world toolchains.”
 > James Carnegie -- Staff Security Engineer, Datadog
 
->  "Security is embedded in everything we build at Okta. nono gives us the confidence to innovate with AI agents by isolating their execution in a highly secure, pol
-icy-controlled sandbox. It ensures our credentials remain locked down and protected, without sacrificing developer velocity"
-> Leonardo Zanivan", Principal Engineer, Okta
+> "Security is embedded in everything we build at Okta. nono gives us the confidence to innovate with AI agents by isolating their execution in a highly secure, policy-controlled sandbox. It ensures our credentials remain locked down and protected, without sacrificing developer velocity"
+> Leonardo Zanivan, Principal Engineer, Okta
 
 **Copied by many** — nono pioneered the zero-latency, zero-setup agent sandbox, and continues to innovate and lead the way in agent sandboxing.
 

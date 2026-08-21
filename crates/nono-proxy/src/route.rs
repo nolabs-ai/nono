@@ -707,12 +707,13 @@ fn route_tls_config_key(route: &RouteConfig) -> Option<String> {
     ))
 }
 
+/// `pattern` and `target` are `host:port` strings. Uses nono's shared
+/// hostname wildcard grammar (see [`nono::net_filter::host_pattern_matches`])
+/// for the host part, so route matching can never drift from network
+/// allow/deny matching.
 pub(crate) fn host_port_matches(pattern: &str, target: &str) -> bool {
     if pattern == target {
         return true;
-    }
-    if !pattern.starts_with("*.") {
-        return false;
     }
 
     let Some((pattern_host, pattern_port)) = pattern.rsplit_once(':') else {
@@ -721,16 +722,7 @@ pub(crate) fn host_port_matches(pattern: &str, target: &str) -> bool {
     let Some((target_host, target_port)) = target.rsplit_once(':') else {
         return false;
     };
-    if pattern_port != target_port {
-        return false;
-    }
-
-    let Some(suffix) = pattern_host.strip_prefix("*.") else {
-        return false;
-    };
-    target_host
-        .strip_suffix(suffix)
-        .is_some_and(|prefix| prefix.ends_with('.') && prefix.len() > 1)
+    pattern_port == target_port && nono::net_filter::host_pattern_matches(pattern_host, target_host)
 }
 
 /// Read a PEM file, producing a clear `ProxyError::Config` for common failure modes.
@@ -1265,6 +1257,26 @@ mod tests {
         assert!(!host_port_matches(
             "*.dev.example.net:443",
             "api.admin.other.net:443"
+        ));
+    }
+
+    #[test]
+    fn test_host_port_matches_non_leading_wildcard_label() {
+        assert!(host_port_matches(
+            "jenkins.*.ci.example.com:443",
+            "jenkins.prod.ci.example.com:443"
+        ));
+        assert!(!host_port_matches(
+            "jenkins.*.ci.example.com:443",
+            "jenkins.ci.example.com:443"
+        ));
+        assert!(!host_port_matches(
+            "jenkins.*.ci.example.com:443",
+            "jenkins.foo.bar.ci.example.com:443"
+        ));
+        assert!(!host_port_matches(
+            "jenkins.*.ci.example.com:8443",
+            "jenkins.prod.ci.example.com:443"
         ));
     }
 

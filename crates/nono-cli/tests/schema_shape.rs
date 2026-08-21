@@ -1146,7 +1146,12 @@ fn test_schema_environment_config_matches_rust_model() {
     assert_schema_properties(
         &schema,
         "EnvironmentConfig",
-        &["allow_vars", "deny_vars", "set_vars"],
+        &[
+            "allow_vars",
+            "deny_vars",
+            "case_insensitive_vars",
+            "set_vars",
+        ],
     );
 }
 
@@ -1248,4 +1253,48 @@ fn test_schema_validates_credential_provider_inject_header_and_format() {
     validator
         .validate(&profile)
         .expect("credential provider inject_header/credential_format should validate");
+}
+
+#[test]
+fn test_schema_rejects_empty_and_nul_env_patterns() {
+    let schema = load_schema();
+    let validator = jsonschema::validator_for(&schema).expect("schema compiles");
+
+    let empty_pattern = json!({ "environment": { "allow_vars": [""] } });
+    assert!(
+        validator.validate(&empty_pattern).is_err(),
+        "schema should reject an empty allow_vars pattern"
+    );
+
+    let nul_pattern = json!({ "environment": { "deny_vars": ["AWS_\0TOKEN"] } });
+    assert!(
+        validator.validate(&nul_pattern).is_err(),
+        "schema should reject a NUL byte in a deny_vars pattern"
+    );
+
+    let valid_infix = json!({ "environment": { "allow_vars": ["*_TOKEN", "AWS_*_TOKEN"] } });
+    assert!(
+        validator.validate(&valid_infix).is_ok(),
+        "schema should accept infix/leading wildcard patterns"
+    );
+}
+
+#[test]
+fn test_schema_validates_profile_authoring_guide_environment_example() {
+    // The exact JSON snippet from the "environment" section of
+    // profile-authoring-guide.md — must stay valid as the schema evolves.
+    let schema = load_schema();
+    let validator = jsonschema::validator_for(&schema).expect("schema compiles");
+    let profile = json!({
+        "environment": {
+            "allow_vars": ["*"],
+            "deny_vars": ["*TOKEN*", "*KEY*", "*SECRET*"],
+            "case_insensitive_vars": true,
+            "set_vars": { "RUST_LOG": "debug", "XDG_CONFIG_HOME": "$HOME/.config" }
+        }
+    });
+
+    validator
+        .validate(&profile)
+        .expect("profile-authoring-guide.md environment example should validate");
 }

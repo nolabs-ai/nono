@@ -178,15 +178,39 @@ fn strip_proxy_headers(header_bytes: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Like [`strip_proxy_headers`], but also redeems any `nono_…` phantom nonce
-/// via `resolver`/`consumer`, fail-open per [`tls_intercept::handle::resolve_nonce_in_header_value`].
+/// Credential names every route on `host_port` redeems. The absolute-form path
+/// has only the target host to go on, so when several routes share an upstream it
+/// must not grant one route's phantoms to another: intersect instead.
 ///
-/// Returns the rewritten headers and whether a real credential was swapped in,
-/// so the audit event can distinguish an injected credential from a bare route
-/// match (no credential configured, or a nonce that failed to redeem).
+/// `None` means the routes declared by-value redemption but agree on nothing —
+/// no header may be redeemed at all, not even via the grant set.
+fn shared_redeem_phantoms(
+    store: &crate::route::RouteStore,
+    host_port: &str,
+) -> Option<Vec<String>> {
+    let candidates = store.lookup_all_by_upstream(host_port);
+    let any_declared = candidates
+        .iter()
+        .any(|(_, route)| !route.redeem_phantoms.is_empty());
+    let mut routes = candidates.into_iter();
+    let (_, first) = routes.next()?;
+    let mut shared = first.redeem_phantoms.clone();
+    for (_, route) in routes {
+        shared.retain(|name| route.redeem_phantoms.contains(name));
+    }
+    if any_declared && shared.is_empty() {
+        return None;
+    }
+    Some(shared)
+}
+
+/// Like [`strip_proxy_headers`], but also redeems any phantom via
+/// `resolver`. The returned flag lets the audit event distinguish an injected
+/// credential from a bare route match.
 fn strip_and_redeem_proxy_headers(
     header_bytes: &[u8],
     consumer: &str,
+    allowed_credentials: &[String],
     resolver: &dyn crate::token::NonceResolver,
 ) -> (Vec<u8>, bool) {
     let header_str = match std::str::from_utf8(header_bytes) {
@@ -210,8 +234,12 @@ fn strip_and_redeem_proxy_headers(
             Some(v) => (v, "\r\n"),
             None => (rest, ""),
         };
-        match tls_intercept::handle::resolve_nonce_in_header_value(value.trim(), consumer, resolver)
-        {
+        match tls_intercept::handle::resolve_nonce_in_header_value(
+            value.trim(),
+            consumer,
+            allowed_credentials,
+            resolver,
+        ) {
             Some(resolved) => {
                 redeemed = true;
                 out.extend_from_slice(name.as_bytes());
@@ -924,6 +952,17 @@ impl crate::token::NonceResolver for CompositeNonceResolver {
             .as_ref()
             .and_then(|resolver| resolver.resolve(nonce, consumer))
             .or_else(|| self.oauth.resolve(nonce, consumer))
+    }
+
+    fn resolve_for_credentials(
+        &self,
+        nonce: &str,
+        allowed_credentials: &[String],
+    ) -> Option<Zeroizing<Vec<u8>>> {
+        // Only the broker tracks credential names; OAuth-capture has none.
+        self.external
+            .as_ref()
+            .and_then(|resolver| resolver.resolve_for_credentials(nonce, allowed_credentials))
     }
 }
 
@@ -2015,16 +2054,22 @@ async fn handle_forward_http(
         .route_store
         .lookup_by_upstream(&host_port)
         .map(|(prefix, _)| prefix.to_string());
+    let redeemable = matched_route.as_ref().and_then(|prefix| {
+        Some((
+            prefix,
+            shared_redeem_phantoms(&state.route_store, &host_port)?,
+        ))
+    });
     let (filtered_headers, credential_redeemed) =
-        match (&matched_route, state.nonce_resolver.as_deref()) {
-            (Some(prefix), Some(resolver)) => {
+        match (&redeemable, state.nonce_resolver.as_deref()) {
+            (Some((prefix, redeem_phantoms)), Some(resolver)) => {
                 debug!(
                     "forward-http: absolute-form target {} matches route '{}' upstream; \
                  redeeming phantom headers before forwarding",
                     host_port, prefix
                 );
                 let consumer = format!("proxy.{prefix}");
-                strip_and_redeem_proxy_headers(header_bytes, &consumer, resolver)
+                strip_and_redeem_proxy_headers(header_bytes, &consumer, redeem_phantoms, resolver)
             }
             _ => (strip_proxy_headers(header_bytes), false),
         };
@@ -2189,6 +2234,7 @@ mod tests {
     #[tokio::test]
     async fn normalize_authority_matches_ipv6_route_upstreams() -> Result<()> {
         let routes = vec![crate::config::RouteConfig {
+            redeem_phantoms: Vec::new(),
             prefix: "local".to_string(),
             upstream: "http://[::1]:8080/v1".to_string(),
             credential_key: Some("local".to_string()),
@@ -2291,6 +2337,7 @@ mod tests {
     /// moved back inside the guard.
     fn declarative_route(upstream: &str) -> crate::config::RouteConfig {
         crate::config::RouteConfig {
+            redeem_phantoms: Vec::new(),
             prefix: "svc".to_string(),
             upstream: upstream.to_string(),
             credential_key: None,
@@ -2784,6 +2831,7 @@ mod tests {
         {
             let config = ProxyConfig {
                 routes: vec![crate::config::RouteConfig {
+                    redeem_phantoms: Vec::new(),
                     prefix: "openai".to_string(),
                     upstream: "https://api.openai.com".to_string(),
                     credential_key: Some("env://NONO_TEST_TOTALLY_MISSING".to_string()),
@@ -2863,6 +2911,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = ProxyConfig {
             routes: vec![crate::config::RouteConfig {
+                redeem_phantoms: Vec::new(),
                 prefix: "alias".to_string(),
                 upstream: "https://aliased.example.com".to_string(),
                 credential_key: None,
@@ -2949,6 +2998,7 @@ mod tests {
             .join("intercept");
         let config = ProxyConfig {
             routes: vec![crate::config::RouteConfig {
+                redeem_phantoms: Vec::new(),
                 prefix: "openai".to_string(),
                 upstream: "https://api.openai.com".to_string(),
                 credential_key: Some("env://NONO_TEST_TOTALLY_MISSING".to_string()),
@@ -3000,6 +3050,7 @@ mod tests {
         let config = ProxyConfig {
             routes: vec![
                 crate::config::RouteConfig {
+                    redeem_phantoms: Vec::new(),
                     prefix: "openai".to_string(),
                     upstream: "https://api.openai.com".to_string(),
                     credential_key: Some("env://NONO_TEST_MISSING".to_string()),
@@ -3023,6 +3074,7 @@ mod tests {
                     rate_limit: None,
                 },
                 crate::config::RouteConfig {
+                    redeem_phantoms: Vec::new(),
                     prefix: "alias".to_string(),
                     upstream: "https://aliased.example.com".to_string(),
                     credential_key: None,
@@ -3086,6 +3138,7 @@ mod tests {
             routes: vec![
                 // Credential catch-all route (no endpoint rules).
                 crate::config::RouteConfig {
+                    redeem_phantoms: Vec::new(),
                     prefix: "github_api".to_string(),
                     upstream: "https://api.github.com".to_string(),
                     credential_key: Some("env://NONO_TEST_MISSING".to_string()),
@@ -3110,6 +3163,7 @@ mod tests {
                 },
                 // Synthetic endpoint-authorization route for the same upstream.
                 crate::config::RouteConfig {
+                    redeem_phantoms: Vec::new(),
                     prefix: "_ep_api.github.com".to_string(),
                     upstream: "https://api.github.com".to_string(),
                     credential_key: None,
@@ -3173,6 +3227,7 @@ mod tests {
             routes: vec![
                 // Wildcard credential route.
                 crate::config::RouteConfig {
+                    redeem_phantoms: Vec::new(),
                     prefix: "github_raw".to_string(),
                     upstream: "https://*.githubusercontent.com".to_string(),
                     credential_key: Some("env://NONO_TEST_MISSING".to_string()),
@@ -3197,6 +3252,7 @@ mod tests {
                 },
                 // `_ep_` route on a concrete subdomain covered by the wildcard.
                 crate::config::RouteConfig {
+                    redeem_phantoms: Vec::new(),
                     prefix: "_ep_raw.githubusercontent.com".to_string(),
                     upstream: "https://raw.githubusercontent.com".to_string(),
                     credential_key: None,
@@ -3250,6 +3306,7 @@ mod tests {
     async fn test_route_diagnostics_omits_unreachable_upstream() {
         let dir = tempfile::tempdir().unwrap();
         let route = |prefix: &str, upstream: &str| crate::config::RouteConfig {
+            redeem_phantoms: Vec::new(),
             prefix: prefix.to_string(),
             upstream: upstream.to_string(),
             credential_key: Some("env://NONO_TEST_MISSING".to_string()),
@@ -3301,6 +3358,7 @@ mod tests {
     async fn test_route_diagnostics_respects_wildcard_allowlist() {
         let dir = tempfile::tempdir().unwrap();
         let route = |prefix: &str, upstream: &str| crate::config::RouteConfig {
+            redeem_phantoms: Vec::new(),
             prefix: prefix.to_string(),
             upstream: upstream.to_string(),
             credential_key: Some("env://NONO_TEST_MISSING".to_string()),
@@ -3417,6 +3475,7 @@ mod tests {
     async fn test_proxy_credential_env_vars() {
         let config = ProxyConfig {
             routes: vec![crate::config::RouteConfig {
+                redeem_phantoms: Vec::new(),
                 prefix: "openai".to_string(),
                 upstream: "https://api.openai.com".to_string(),
                 credential_key: None,
@@ -3472,6 +3531,7 @@ mod tests {
         };
         let config = ProxyConfig {
             routes: vec![crate::config::RouteConfig {
+                redeem_phantoms: Vec::new(),
                 prefix: "openai".to_string(),
                 upstream: "https://api.openai.com".to_string(),
                 credential_key: Some("openai_api_key".to_string()),
@@ -3536,6 +3596,7 @@ mod tests {
         };
         let config = ProxyConfig {
             routes: vec![crate::config::RouteConfig {
+                redeem_phantoms: Vec::new(),
                 prefix: "openai".to_string(),
                 upstream: "https://api.openai.com".to_string(),
                 credential_key: Some("op://Development/OpenAI/credential".to_string()),
@@ -3606,6 +3667,7 @@ mod tests {
         let config = ProxyConfig {
             routes: vec![
                 crate::config::RouteConfig {
+                    redeem_phantoms: Vec::new(),
                     prefix: "openai".to_string(),
                     upstream: "https://api.openai.com".to_string(),
                     credential_key: Some("openai_api_key".to_string()),
@@ -3629,6 +3691,7 @@ mod tests {
                     rate_limit: None,
                 },
                 crate::config::RouteConfig {
+                    redeem_phantoms: Vec::new(),
                     prefix: "github".to_string(),
                     upstream: "https://api.github.com".to_string(),
                     credential_key: Some("env://GITHUB_TOKEN".to_string()),
@@ -3695,6 +3758,7 @@ mod tests {
         };
         let config = ProxyConfig {
             routes: vec![crate::config::RouteConfig {
+                redeem_phantoms: Vec::new(),
                 prefix: "myapi".to_string(),
                 upstream: "https://api.internal.corp".to_string(),
                 credential_key: None,
@@ -3759,6 +3823,7 @@ mod tests {
         // Test leading slash
         let config = ProxyConfig {
             routes: vec![crate::config::RouteConfig {
+                redeem_phantoms: Vec::new(),
                 prefix: "/anthropic".to_string(),
                 upstream: "https://api.anthropic.com".to_string(),
                 credential_key: None,
@@ -3798,6 +3863,7 @@ mod tests {
         // Test trailing slash
         let config = ProxyConfig {
             routes: vec![crate::config::RouteConfig {
+                redeem_phantoms: Vec::new(),
                 prefix: "openai/".to_string(),
                 upstream: "https://api.openai.com".to_string(),
                 credential_key: None,
@@ -3859,6 +3925,7 @@ mod tests {
         };
         let config_no_env_var = ProxyConfig {
             routes: vec![crate::config::RouteConfig {
+                redeem_phantoms: Vec::new(),
                 prefix: "anthropic".to_string(),
                 upstream: "https://api.anthropic.com".to_string(),
                 credential_key: None,
@@ -3909,6 +3976,7 @@ mod tests {
         };
         let config_fixed = ProxyConfig {
             routes: vec![crate::config::RouteConfig {
+                redeem_phantoms: Vec::new(),
                 prefix: "anthropic".to_string(),
                 upstream: "https://api.anthropic.com".to_string(),
                 credential_key: Some("ANTHROPIC_API_KEY".to_string()),
@@ -4185,6 +4253,7 @@ mod tests {
             allowed_hosts: vec!["api.openai.com".to_string()],
             direct_connect_ports: vec![443],
             routes: vec![crate::config::RouteConfig {
+                redeem_phantoms: Vec::new(),
                 prefix: "openai".to_string(),
                 upstream: "https://api.openai.com/v1".to_string(),
                 credential_key: Some("openai".to_string()),
@@ -4231,6 +4300,7 @@ mod tests {
             allowed_hosts: vec!["openai.com".to_string()],
             direct_connect_ports: vec![443],
             routes: vec![crate::config::RouteConfig {
+                redeem_phantoms: Vec::new(),
                 prefix: "openai".to_string(),
                 upstream: "https://api.openai.com/v1".to_string(),
                 credential_key: Some("openai".to_string()),
@@ -4301,6 +4371,7 @@ mod tests {
                 "redis".to_string(),
             ],
             routes: vec![crate::config::RouteConfig {
+                redeem_phantoms: Vec::new(),
                 prefix: "openai".to_string(),
                 upstream: "https://api.openai.com/v1".to_string(),
                 credential_key: Some("openai".to_string()),
@@ -4341,6 +4412,7 @@ mod tests {
                 "redis".to_string(),
             ],
             routes: vec![crate::config::RouteConfig {
+                redeem_phantoms: Vec::new(),
                 prefix: "local".to_string(),
                 upstream: "http://[::1]:8080/v1".to_string(),
                 credential_key: Some("local".to_string()),
@@ -4383,6 +4455,7 @@ mod tests {
                 "redis".to_string(),
             ],
             routes: vec![crate::config::RouteConfig {
+                redeem_phantoms: Vec::new(),
                 prefix: "internal".to_string(),
                 upstream: "https://*.dev.example.net".to_string(),
                 credential_key: Some("internal".to_string()),
@@ -4582,6 +4655,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = ProxyConfig {
             routes: vec![crate::config::RouteConfig {
+                redeem_phantoms: Vec::new(),
                 prefix: "openai".to_string(),
                 upstream: "https://api.openai.com".to_string(),
                 credential_key: Some("env://NONO_TEST_TOTALLY_MISSING".to_string()),
@@ -4804,11 +4878,24 @@ mod tests {
         nonce: String,
         real: Vec<u8>,
         admitted_consumer: String,
+        credential_name: String,
     }
 
     impl crate::token::NonceResolver for TestResolver {
         fn resolve(&self, nonce: &str, consumer: &str) -> Option<Zeroizing<Vec<u8>>> {
             if nonce == self.nonce && consumer == self.admitted_consumer {
+                Some(Zeroizing::new(self.real.clone()))
+            } else {
+                None
+            }
+        }
+
+        fn resolve_for_credentials(
+            &self,
+            nonce: &str,
+            allowed: &[String],
+        ) -> Option<Zeroizing<Vec<u8>>> {
+            if nonce == self.nonce && allowed.iter().any(|a| a == &self.credential_name) {
                 Some(Zeroizing::new(self.real.clone()))
             } else {
                 None
@@ -4827,12 +4914,13 @@ mod tests {
             nonce: nonce.clone(),
             real: b"real-secret".to_vec(),
             admitted_consumer: "proxy.headroom".to_string(),
+            credential_name: "partner-token".to_string(),
         };
         let headers = format!(
             "Host: 127.0.0.1:8787\r\nAuthorization: Bearer {nonce}\r\nProxy-Authorization: Basic abc\r\n"
         );
         let (redeemed, swapped) =
-            strip_and_redeem_proxy_headers(headers.as_bytes(), "proxy.headroom", &resolver);
+            strip_and_redeem_proxy_headers(headers.as_bytes(), "proxy.headroom", &[], &resolver);
         assert!(swapped, "a real credential was swapped in");
         let s = String::from_utf8(redeemed).unwrap();
         assert!(
@@ -4857,10 +4945,11 @@ mod tests {
             nonce: nonce.clone(),
             real: b"real-secret".to_vec(),
             admitted_consumer: "proxy.other-route".to_string(),
+            credential_name: "partner-token".to_string(),
         };
         let headers = format!("Authorization: Bearer {nonce}\r\n");
         let (redeemed, swapped) =
-            strip_and_redeem_proxy_headers(headers.as_bytes(), "proxy.headroom", &resolver);
+            strip_and_redeem_proxy_headers(headers.as_bytes(), "proxy.headroom", &[], &resolver);
         assert!(
             !swapped,
             "no credential was swapped in for an unadmitted nonce"
@@ -4872,18 +4961,112 @@ mod tests {
         );
     }
 
+    /// Two routes sharing an upstream are indistinguishable on the absolute-form
+    /// path, so only credentials both routes redeem may be honored.
+    #[tokio::test]
+    async fn shared_redeem_phantoms_intersects_routes_on_one_upstream() {
+        let mut a = declarative_route("https://api.example.com");
+        a.prefix = "svc-a".to_string();
+        a.redeem_phantoms = vec!["shared-token".to_string(), "a-only".to_string()];
+        let mut b = declarative_route("https://api.example.com");
+        b.prefix = "svc-b".to_string();
+        b.redeem_phantoms = vec!["shared-token".to_string(), "b-only".to_string()];
+        let mut solo = declarative_route("https://other.example.com");
+        solo.prefix = "svc-solo".to_string();
+        solo.redeem_phantoms = vec!["solo-token".to_string()];
+
+        let store = crate::route::RouteStore::load(&[a, b, solo]).await.unwrap();
+        assert_eq!(
+            shared_redeem_phantoms(&store, "api.example.com:443"),
+            Some(vec!["shared-token".to_string()])
+        );
+        assert_eq!(
+            shared_redeem_phantoms(&store, "other.example.com:443"),
+            Some(vec!["solo-token".to_string()])
+        );
+        assert_eq!(
+            shared_redeem_phantoms(&store, "unrelated.example.com:443"),
+            None
+        );
+    }
+
+    /// Disjoint lists must deny outright, not fall back to grant-set auth — an
+    /// empty allow-list is the grant-set sentinel, so it cannot mean "deny".
+    #[tokio::test]
+    async fn shared_redeem_phantoms_denies_when_routes_agree_on_nothing() {
+        let mut a = declarative_route("https://api.example.com");
+        a.prefix = "svc-a".to_string();
+        a.redeem_phantoms = vec!["a-only".to_string()];
+        let mut b = declarative_route("https://api.example.com");
+        b.prefix = "svc-b".to_string();
+        b.redeem_phantoms = vec!["b-only".to_string()];
+
+        let store = crate::route::RouteStore::load(&[a, b]).await.unwrap();
+        assert_eq!(shared_redeem_phantoms(&store, "api.example.com:443"), None);
+    }
+
+    /// Routes that declare nothing keep the pre-existing grant-set path.
+    #[tokio::test]
+    async fn shared_redeem_phantoms_empty_when_no_route_declares_any() {
+        let mut a = declarative_route("https://api.example.com");
+        a.prefix = "svc-a".to_string();
+        let mut b = declarative_route("https://api.example.com");
+        b.prefix = "svc-b".to_string();
+
+        let store = crate::route::RouteStore::load(&[a, b]).await.unwrap();
+        assert_eq!(
+            shared_redeem_phantoms(&store, "api.example.com:443"),
+            Some(Vec::new())
+        );
+    }
+
     #[test]
     fn strip_and_redeem_proxy_headers_leaves_headers_without_nonce_unchanged() {
         let resolver = TestResolver {
             nonce: make_nonce(),
             real: b"real-secret".to_vec(),
             admitted_consumer: "proxy.headroom".to_string(),
+            credential_name: "partner-token".to_string(),
         };
         let headers = b"Host: 127.0.0.1:8787\r\nAccept: */*\r\n";
         let (redeemed, swapped) =
-            strip_and_redeem_proxy_headers(headers, "proxy.headroom", &resolver);
+            strip_and_redeem_proxy_headers(headers, "proxy.headroom", &[], &resolver);
         assert!(!swapped);
         assert_eq!(redeemed, headers);
+    }
+
+    /// A route declaring `redeem_phantoms` redeems by credential name, so the
+    /// absolute-form path must admit a phantom the consumer grant set would not.
+    #[test]
+    fn strip_and_redeem_proxy_headers_redeems_by_value_for_declared_route() {
+        let nonce = make_nonce();
+        let resolver = TestResolver {
+            nonce: nonce.clone(),
+            real: b"real-secret".to_vec(),
+            admitted_consumer: "proxy.other-route".to_string(),
+            credential_name: "partner-token".to_string(),
+        };
+        let headers = format!("Authorization: Bearer {nonce}\r\n");
+        let allowed = vec!["partner-token".to_string()];
+        let (redeemed, swapped) = strip_and_redeem_proxy_headers(
+            headers.as_bytes(),
+            "proxy.headroom",
+            &allowed,
+            &resolver,
+        );
+        assert!(
+            swapped,
+            "declared redeem_phantoms admits the phantom by value"
+        );
+        let s = String::from_utf8(redeemed).unwrap();
+        assert!(
+            s.contains("Authorization: Bearer real-secret"),
+            "got: {s:?}"
+        );
+        assert!(
+            !s.contains(&nonce),
+            "phantom nonce must not reach upstream: {s:?}"
+        );
     }
 
     /// Spawn a one-shot local HTTP/1.1 origin server that echoes the received
@@ -5011,6 +5194,7 @@ mod tests {
         let config = ProxyConfig {
             allowed_hosts: vec!["127.0.0.1".to_string()],
             routes: vec![crate::config::RouteConfig {
+                redeem_phantoms: Vec::new(),
                 prefix: "svc".to_string(),
                 upstream: "https://api.example.com".to_string(),
                 credential_key: Some("env://NONO_TEST_TOTALLY_MISSING".to_string()),
@@ -5120,6 +5304,7 @@ mod tests {
                 aws_auth: None,
                 spiffe: None,
                 rate_limit: None,
+                redeem_phantoms: Vec::new(),
                 upgrades: vec![],
             }],
             ..ProxyConfig::default()
@@ -5128,6 +5313,7 @@ mod tests {
             nonce: nonce.clone(),
             real: b"real-secret".to_vec(),
             admitted_consumer: "proxy.local".to_string(),
+            credential_name: "partner-token".to_string(),
         };
         let handle = start_with_nonce_resolver(config, None, None, Some(Arc::new(resolver)))
             .await
@@ -5217,6 +5403,7 @@ mod tests {
                 aws_auth: None,
                 spiffe: None,
                 rate_limit: None,
+                redeem_phantoms: Vec::new(),
                 upgrades: vec![],
             }],
             ..ProxyConfig::default()
@@ -5225,6 +5412,7 @@ mod tests {
             nonce: make_nonce(),
             real: b"real-secret".to_vec(),
             admitted_consumer: "proxy.local".to_string(),
+            credential_name: "partner-token".to_string(),
         };
         let handle = start_with_nonce_resolver(config, None, None, Some(Arc::new(resolver)))
             .await
@@ -5402,6 +5590,7 @@ mod tests {
         // reverse handler at all, not the forward path.
         let config = ProxyConfig {
             routes: vec![crate::config::RouteConfig {
+                redeem_phantoms: Vec::new(),
                 prefix: "openai".to_string(),
                 upstream: "https://api.openai.com".to_string(),
                 credential_key: Some("env://NONO_TEST_TOTALLY_MISSING".to_string()),

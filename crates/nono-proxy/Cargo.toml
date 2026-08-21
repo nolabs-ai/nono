@@ -74,6 +74,9 @@ time = { version = "0.3", default-features = false, features = ["std"] }
 # naming in the workspace.
 spiffe-workload = { package = "spiffe", version = "0.16", features = ["jwt-source"] }
 
+# aauth: RFC 9421 request signing with a persistent agent keypair.
+aauth-core = "0.1.2"
+
 [dev-dependencies]
 tempfile.workspace = true
 tokio = { version = "1", features = ["test-util", "rt-multi-thread", "macros"] }

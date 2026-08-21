@@ -43,6 +43,7 @@ test-trust-overrides = []
 [dependencies]
 nono = { version = "0.74.0", path = "../nono", default-features = false }
 nono-proxy = { version = "0.74.0", path = "../nono-proxy", default-features = false }
+aauth-core = "0.1.2"
 clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"
 colored = "3"

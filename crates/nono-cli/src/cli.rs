@@ -49,6 +49,7 @@ const STYLES: Styles = Styles::plain().header(Style::new().bold());
   audit      View audit trail of sandboxed commands
   platform   Enroll with and inspect an audit control plane
   trust      Manage file trust and attestation
+  aauth      Manage aauth agent identity keys (RFC 9421 request signing)
 
 \x1b[1mPACKS\x1b[0m
   pull       Install a signed nono pack from the registry
@@ -308,6 +309,23 @@ pub enum Commands {
   nono trust keygen                            # Generate a new signing key pair
 ")]
     Trust(TrustArgs),
+
+    /// Manage aauth agent identity keys (RFC 9421 request signing)
+    #[command(help_template = "\
+{about}
+
+\x1b[1mUSAGE\x1b[0m
+  nono aauth <subcommand>
+
+{all-args}
+{after-help}")]
+    #[command(after_help = "\x1b[1mEXAMPLES\x1b[0m
+  nono aauth keygen --keyref file:///path/to/key.pem   # Generate a new agent identity
+  nono aauth import --keyref file:///path/to/key.pem --pem-file mine.pem
+                                                        # Import a user-supplied Ed25519 key
+  nono aauth show --keyref file:///path/to/key.pem     # Print public key / thumbprint
+")]
+    Aauth(AauthArgs),
 
     /// List local or remote sandboxed sessions
     #[command(help_template = "\
@@ -3034,6 +3052,82 @@ pub struct TrustExportKeyArgs {
     pub help: Option<bool>,
 }
 
+#[derive(Parser, Debug)]
+#[command(disable_help_flag = true)]
+pub struct AauthArgs {
+    #[command(subcommand)]
+    pub command: AauthCommands,
+
+    /// Print help
+    #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
+    pub help: Option<bool>,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum AauthCommands {
+    /// Generate a new Ed25519 agent identity keypair
+    Keygen(AauthKeygenArgs),
+    /// Import a user-supplied Ed25519 PEM keypair as an agent identity
+    Import(AauthImportArgs),
+    /// Print an identity's public key, agent_id placeholder, and JWK thumbprint
+    Show(AauthShowArgs),
+}
+
+#[derive(Parser, Debug)]
+#[command(disable_help_flag = true)]
+pub struct AauthKeygenArgs {
+    /// Key reference URI to store the private key at (`file:///path/to/key.pem`,
+    /// `keyring://name`, or `env://VAR` — same scheme as `credential_key`).
+    #[arg(long, value_name = "URI")]
+    pub keyref: String,
+
+    /// Overwrite an existing key at the same key_ref.
+    #[arg(long)]
+    pub force: bool,
+
+    /// Print help
+    #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
+    pub help: Option<bool>,
+}
+
+#[derive(Parser, Debug)]
+#[command(disable_help_flag = true)]
+pub struct AauthImportArgs {
+    /// Key reference URI to store the imported private key at.
+    #[arg(long, value_name = "URI")]
+    pub keyref: String,
+
+    /// Path to a PKCS#8 PEM-encoded Ed25519 private key
+    /// (e.g. from `openssl genpkey -algorithm ed25519`).
+    #[arg(long, value_name = "FILE")]
+    pub pem_file: PathBuf,
+
+    /// Overwrite an existing key at the same key_ref.
+    #[arg(long)]
+    pub force: bool,
+
+    /// Print help
+    #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
+    pub help: Option<bool>,
+}
+
+#[derive(Parser, Debug)]
+#[command(disable_help_flag = true)]
+pub struct AauthShowArgs {
+    /// Key reference URI the identity's private key is stored at.
+    #[arg(long, value_name = "URI")]
+    pub keyref: String,
+
+    /// Print the JWKS document to host at your `jwks_uri` (to stdout,
+    /// nothing else) instead of the human-readable summary.
+    #[arg(long)]
+    pub jwks: bool,
+
+    /// Print help
+    #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
+    pub help: Option<bool>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4590,6 +4684,7 @@ mod tests {
         "audit",
         "platform",
         "trust",
+        "aauth",
         "policy",
         "profile",
         "pull",

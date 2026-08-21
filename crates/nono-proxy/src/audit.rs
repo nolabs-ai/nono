@@ -45,6 +45,7 @@ pub struct EventContext<'a> {
     pub approval_backend: Option<&'a str>,
     pub upstream: Option<&'a str>,
     pub spiffe_context: Option<nono::undo::SpiffeAuditContext>,
+    pub aauth_context: Option<nono::undo::AauthAuditContext>,
 }
 
 impl std::fmt::Display for ProxyMode {
@@ -179,6 +180,7 @@ pub fn log_allowed(
             credential_capture_stdin_mode: None,
             credential_capture_interactive: None,
             spiffe_context: ctx.spiffe_context.clone(),
+            aauth_context: ctx.aauth_context.clone(),
             target: host.to_string(),
             upstream: ctx.upstream.map(str::to_string),
             port: Some(port),
@@ -237,6 +239,7 @@ pub fn log_denied(
             credential_capture_stdin_mode: None,
             credential_capture_interactive: None,
             spiffe_context: ctx.spiffe_context.clone(),
+            aauth_context: ctx.aauth_context.clone(),
             target: host.to_string(),
             upstream: ctx.upstream.map(str::to_string),
             port: Some(port),
@@ -298,6 +301,7 @@ pub fn log_l7_request(
             credential_capture_stdin_mode: None,
             credential_capture_interactive: None,
             spiffe_context: ctx.spiffe_context.clone(),
+            aauth_context: ctx.aauth_context.clone(),
             target: target.to_string(),
             upstream: ctx.upstream.map(str::to_string),
             port: None,
@@ -365,6 +369,7 @@ pub fn log_l7_policy_decision(
             credential_capture_stdin_mode: None,
             credential_capture_interactive: None,
             spiffe_context: ctx.spiffe_context.clone(),
+            aauth_context: ctx.aauth_context.clone(),
             target: target.to_string(),
             upstream: ctx.upstream.map(str::to_string),
             port,
@@ -451,6 +456,7 @@ pub fn log_credential_capture(
             credential_capture_stdin_mode: event.stdin_mode.map(str::to_string),
             credential_capture_interactive: event.interactive,
             spiffe_context: None,
+            aauth_context: None,
             target: event.request_host.to_string(),
             upstream: event.upstream.map(str::to_string),
             port: event.request_port,

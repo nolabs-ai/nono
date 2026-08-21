@@ -987,6 +987,7 @@ mod tests {
             }),
             aws_auth: None,
             spiffe: None,
+            aauth: None,
             upgrades: vec![],
             rate_limit: None,
         }
@@ -1015,6 +1016,7 @@ mod tests {
             oauth2: None,
             aws_auth: None,
             spiffe: None,
+            aauth: None,
             upgrades: vec![],
             rate_limit: None,
         }];
@@ -1137,6 +1139,7 @@ mod tests {
             oauth2: None,
             aws_auth: None,
             spiffe: None,
+            aauth: None,
             upgrades: vec![],
             rate_limit: None,
         }];
@@ -1181,6 +1184,7 @@ mod tests {
             oauth2: None,
             aws_auth: None,
             spiffe: None,
+            aauth: None,
             upgrades: vec![],
             rate_limit: None,
         }];
@@ -1287,6 +1291,7 @@ mod tests {
             oauth2: None,
             aws_auth: None,
             spiffe: None,
+            aauth: None,
             upgrades: vec![],
             rate_limit: None,
         }];
@@ -1326,6 +1331,7 @@ mod tests {
             oauth2: None,
             aws_auth: None,
             spiffe: None,
+            aauth: None,
             upgrades: vec![],
             rate_limit: None,
         }];
@@ -1378,6 +1384,7 @@ mod tests {
             }),
             aws_auth: None,
             spiffe: None,
+            aauth: None,
             upgrades: vec![],
             rate_limit: None,
         }];

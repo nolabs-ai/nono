@@ -1,3 +1,4 @@
+use crate::aauth_cmd;
 use crate::audit_commands;
 use crate::cli::{Cli, Commands, RunArgs, SetupArgs};
 use crate::command_runtime::{run_sandbox, run_shell, run_wrap};
@@ -61,6 +62,9 @@ fn dispatch_command(
         }),
         Commands::Trust(args) => {
             run_command_with_update(update_handle, silent, || trust_cmd::run_trust(args))
+        }
+        Commands::Aauth(args) => {
+            run_command_with_update(update_handle, silent, || aauth_cmd::run_aauth(args))
         }
         Commands::Audit(args) => {
             run_command_with_update(update_handle, silent, || audit_commands::run_audit(args))

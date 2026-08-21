@@ -2,6 +2,7 @@
 //!
 //! This is the CLI binary that uses the nono library for OS-level sandboxing.
 
+mod aauth_cmd;
 mod app_runtime;
 mod approval_runtime;
 mod audit_attestation;
@@ -336,6 +337,8 @@ mod tests {
             set_vars: None,
             profile_network_block: false,
             allow_http2_requested: false,
+            aauth_identity: None,
+            aauth_sign_all_outbound: false,
         };
 
         let effective = resolve_effective_proxy_settings(&args, &prepared)?;
@@ -411,6 +414,8 @@ mod tests {
             set_vars: None,
             profile_network_block: false,
             allow_http2_requested: false,
+            aauth_identity: None,
+            aauth_sign_all_outbound: false,
         };
 
         let effective = resolve_effective_proxy_settings(&args, &prepared)?;

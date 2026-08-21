@@ -223,6 +223,9 @@ pub enum NetworkAuditAuthMechanism {
     /// SPIFFE JWT-SVID used as an OAuth2 `client_assertion` (RFC 7523) to exchange
     /// for an access token, which is then injected into the upstream request
     SpiffeOAuthAssertion,
+    /// aauth: the request itself is signed (RFC 9421 HTTP Message Signatures)
+    /// with the agent's persistent keypair, instead of a bearer credential
+    AauthSignature,
 }
 
 /// Outcome of proxy-side authentication or phantom-token validation.
@@ -246,6 +249,8 @@ pub enum NetworkAuditInjectionMode {
     OAuth2,
     /// SPIFFE JWT-SVID injected directly as a bearer header value
     SpiffeJwt,
+    /// aauth: `Signature`/`Signature-Input`/`Signature-Key` headers added by signing the request
+    AauthSignature,
 }
 
 /// SPIFFE workload identity context attached to a network audit event when a
@@ -265,6 +270,25 @@ pub struct SpiffeAuditContext {
     /// Delegation chain from the JWT `act` claim, when present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delegation: Option<SpiffeDelegationContext>,
+}
+
+/// aauth identity context attached to a network audit event when an aauth
+/// signing route was active — which agent identity signed the request, with
+/// which scheme, and (for `jwks_uri`) where its key is discoverable.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AauthAuditContext {
+    /// Human-readable identity label. Always the issuer under `jwks_uri`;
+    /// under `hwk`, only set if the profile configured one explicitly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    /// Signing scheme used: `"hwk"` or `"jwks_uri"`.
+    pub scheme: String,
+    /// The `issuer` used for JWKS discovery. Only present under `jwks_uri`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issuer: Option<String>,
+    /// JWK thumbprint of the signing key (`kid` under `jwks_uri`, and the
+    /// same value `nono aauth show --jwks` prints for this key either way).
+    pub key_thumbprint: String,
 }
 
 /// Delegation context extracted from the `act` claim of a JWT-SVID.
@@ -380,6 +404,9 @@ pub struct NetworkAuditEvent {
     /// SPIFFE workload identity context when a SPIFFE auth route was active.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spiffe_context: Option<SpiffeAuditContext>,
+    /// aauth identity context when an aauth signing route was active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aauth_context: Option<AauthAuditContext>,
     /// Hostname or logical service target (for reverse proxy events)
     pub target: String,
     /// Upstream URL for route-scoped L7 events, without credentials.

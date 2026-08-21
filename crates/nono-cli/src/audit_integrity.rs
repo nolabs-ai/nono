@@ -177,6 +177,7 @@ mod tests {
                 status: Some(403),
                 reason: Some("policy".to_string()),
                 spiffe_context: None,
+                aauth_context: None,
             })
             .unwrap();
         recorder

@@ -308,6 +308,23 @@ pub async fn handle_reverse_proxy(
         return Ok(());
     }
 
+    if let Some(aauth_signer) = route.aauth_signer.clone() {
+        return handle_aauth_route(
+            aauth_signer,
+            route,
+            &service,
+            &method,
+            &upstream_path,
+            &version,
+            remaining_header,
+            buffered_body,
+            stream,
+            ctx,
+            &route_ctx,
+        )
+        .await;
+    }
+
     if has_spiffe {
         return handle_spiffe_route(
             route,
@@ -914,6 +931,224 @@ async fn handle_spiffe_route(
         forward::forward_request(stream, request.as_bytes(), &body, upstream_spec, audit_ctx).await
     {
         warn!("SPIFFE upstream connection failed: {}", e);
+        send_error(stream, 502, "Bad Gateway").await?;
+        let deny_ctx = audit::EventContext {
+            denial_category: Some(nono::undo::NetworkAuditDenialCategory::UpstreamConnectFailed),
+            ..success_ctx
+        };
+        audit::log_denied(
+            ctx.audit_log,
+            audit::ProxyMode::Reverse,
+            &deny_ctx,
+            service,
+            0,
+            &e.to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Sign the outbound request with the route's aauth identity (RFC 9421
+/// HTTP Message Signatures) and forward it — no bearer credential to fetch
+/// or inject, the signature over the request itself is the credential.
+#[allow(clippy::too_many_arguments)]
+async fn handle_aauth_route(
+    signer: Arc<crate::aauth::AauthSigner>,
+    route: &crate::route::LoadedRoute,
+    service: &str,
+    method: &str,
+    upstream_path: &str,
+    version: &str,
+    remaining_header: &[u8],
+    buffered_body: &[u8],
+    stream: &mut TcpStream,
+    ctx: &ReverseProxyCtx<'_>,
+    route_ctx: &audit::EventContext<'_>,
+) -> Result<()> {
+    if let Err(e) = validate_reverse_local_auth(remaining_header, upstream_path, ctx.session_token)
+    {
+        let deny_ctx = audit::EventContext {
+            auth_outcome: Some(nono::undo::NetworkAuditAuthOutcome::Failed),
+            denial_category: Some(nono::undo::NetworkAuditDenialCategory::AuthenticationFailed),
+            ..route_ctx.clone()
+        };
+        audit::log_denied(
+            ctx.audit_log,
+            audit::ProxyMode::Reverse,
+            &deny_ctx,
+            service,
+            0,
+            &e.to_string(),
+        );
+        send_error(stream, 407, "Proxy Authentication Required").await?;
+        return Ok(());
+    }
+
+    let upstream_url = format!("{}{}", route.upstream.trim_end_matches('/'), upstream_path);
+    debug!(
+        "aauth ({}) forward to upstream: {} {}",
+        signer.agent_id(),
+        method,
+        upstream_url
+    );
+    let (upstream_scheme, upstream_host, upstream_port, upstream_path_full) =
+        parse_upstream_url(&upstream_url)?;
+    let check = ctx.filter.check_host(&upstream_host, upstream_port).await?;
+    if !check.result.is_allowed() {
+        let reason = check.result.reason();
+        warn!("Upstream host denied by filter: {}", reason);
+        send_error(stream, 403, "Forbidden").await?;
+        let deny_ctx = audit::EventContext {
+            denial_category: Some(nono::undo::NetworkAuditDenialCategory::HostDenied),
+            ..route_ctx.clone()
+        };
+        audit::log_denied(
+            ctx.audit_log,
+            audit::ProxyMode::Reverse,
+            &deny_ctx,
+            service,
+            0,
+            &reason,
+        );
+        return Ok(());
+    }
+    if let Err(reason) =
+        validate_http_upstream_target(upstream_scheme, &upstream_host, &check.resolved_addrs)
+    {
+        warn!("{}", reason);
+        send_error(stream, 502, "Bad Gateway").await?;
+        let deny_ctx = audit::EventContext {
+            denial_category: Some(nono::undo::NetworkAuditDenialCategory::UpstreamConnectFailed),
+            ..route_ctx.clone()
+        };
+        audit::log_denied(
+            ctx.audit_log,
+            audit::ProxyMode::Reverse,
+            &deny_ctx,
+            service,
+            0,
+            &reason,
+        );
+        return Ok(());
+    }
+
+    // Strip any signature headers the sandboxed process itself sent — the
+    // agent never holds the signing key, so only nono's own signature may
+    // reach the upstream. Also strip `Authorization`/`x-api-key`: the local
+    // reverse-proxy auth boundary (`validate_reverse_local_auth` above)
+    // accepts the session token via either header, and aauth signing never
+    // sets its own `Authorization`, so without stripping, a client that
+    // authenticates that way would leak its session token to the real
+    // upstream verbatim — the same reason `handle_spiffe_route` strips them.
+    let filtered_headers = filter_headers_multi(
+        remaining_header,
+        &[
+            "Signature",
+            "Signature-Input",
+            "Signature-Key",
+            "Authorization",
+            "x-api-key",
+        ],
+    );
+    let content_length = extract_content_length(remaining_header);
+    let body = match read_request_body(stream, content_length, buffered_body).await? {
+        Some(body) => body,
+        None => return Ok(()),
+    };
+
+    let signature_headers = match signer.sign(method, &upstream_url, &body) {
+        Ok(headers) => headers,
+        Err(e) => {
+            warn!("aauth signing failed: {}", e);
+            let deny_ctx = audit::EventContext {
+                auth_mechanism: route.managed_auth_mechanism.clone(),
+                auth_outcome: Some(nono::undo::NetworkAuditAuthOutcome::Failed),
+                denial_category: Some(
+                    nono::undo::NetworkAuditDenialCategory::ManagedCredentialUnavailable,
+                ),
+                aauth_context: Some(signer.audit_context()),
+                ..route_ctx.clone()
+            };
+            audit::log_denied(
+                ctx.audit_log,
+                audit::ProxyMode::Reverse,
+                &deny_ctx,
+                service,
+                0,
+                &e.to_string(),
+            );
+            send_error(stream, 503, "Service Unavailable").await?;
+            return Ok(());
+        }
+    };
+
+    let success_ctx = audit::EventContext {
+        route_id: Some(service),
+        auth_mechanism: route.managed_auth_mechanism.clone(),
+        auth_outcome: Some(nono::undo::NetworkAuditAuthOutcome::Succeeded),
+        managed_credential_active: Some(true),
+        injection_mode: route.managed_injection_mode.clone(),
+        aauth_context: Some(signer.audit_context()),
+        ..audit::EventContext::default()
+    };
+
+    let upstream_authority = format_host_header(upstream_scheme, &upstream_host, upstream_port);
+    let mut request = Zeroizing::new(format!(
+        "{} {} {}\r\nHost: {}\r\n",
+        method, upstream_path_full, version, upstream_authority
+    ));
+
+    for (name, value) in &signature_headers {
+        request.push_str(name);
+        request.push_str(": ");
+        request.push_str(value);
+        request.push_str("\r\n");
+    }
+
+    for (name, value) in &filtered_headers {
+        if name.contains(['\r', '\n']) || value.contains(['\r', '\n']) {
+            warn!("dropping header with CRLF in name or value: {:?}", name);
+            continue;
+        }
+        request.push_str(name);
+        request.push_str(": ");
+        request.push_str(value);
+        request.push_str("\r\n");
+    }
+
+    request.push_str("Connection: close\r\n");
+    if !body.is_empty() {
+        request.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    }
+    request.push_str("\r\n");
+
+    let default_connector = route
+        .tls_connector
+        .as_ref()
+        .unwrap_or(ctx.tls_connector)
+        .clone();
+    let connector = &default_connector;
+    let upstream_spec = UpstreamSpec {
+        scheme: upstream_scheme,
+        host: &upstream_host,
+        port: upstream_port,
+        strategy: UpstreamStrategy::Direct {
+            resolved_addrs: &check.resolved_addrs,
+        },
+        tls_connector: connector,
+    };
+    let audit_ctx = AuditCtx {
+        log: ctx.audit_log,
+        mode: audit::ProxyMode::Reverse,
+        event_ctx: success_ctx.clone(),
+        target: service,
+        method,
+        path: upstream_path,
+    };
+    if let Err(e) =
+        forward::forward_request(stream, request.as_bytes(), &body, upstream_spec, audit_ctx).await
+    {
+        warn!("aauth upstream connection failed: {}", e);
         send_error(stream, 502, "Bad Gateway").await?;
         let deny_ctx = audit::EventContext {
             denial_category: Some(nono::undo::NetworkAuditDenialCategory::UpstreamConnectFailed),
@@ -2675,6 +2910,53 @@ mod tests {
     #[test]
     fn test_parse_request_line_malformed() {
         assert!(parse_request_line("GET").is_err());
+    }
+
+    #[test]
+    fn test_aauth_route_strips_client_supplied_auth_and_signature_headers() {
+        // Regression test: the aauth path must strip Authorization/x-api-key
+        // in addition to Signature*. aauth signing never sets its own
+        // Authorization header, and `validate_reverse_local_auth` accepts
+        // the local session token via either of those two headers — without
+        // stripping them, a client's session token would be forwarded to
+        // the real upstream verbatim, on top of the legitimate signature.
+        let raw = b"Host: example.com\r\n\
+Authorization: Bearer local-session-token\r\n\
+x-api-key: also-a-local-token\r\n\
+Signature: fake\r\n\
+Signature-Input: fake\r\n\
+Signature-Key: fake\r\n\
+Content-Type: application/json\r\n\
+\r\n";
+        let filtered = filter_headers_multi(
+            raw,
+            &[
+                "Signature",
+                "Signature-Input",
+                "Signature-Key",
+                "Authorization",
+                "x-api-key",
+            ],
+        );
+        let names: Vec<&str> = filtered.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(
+            !names
+                .iter()
+                .any(|n| n.eq_ignore_ascii_case("Authorization"))
+        );
+        assert!(!names.iter().any(|n| n.eq_ignore_ascii_case("x-api-key")));
+        assert!(!names.iter().any(|n| n.eq_ignore_ascii_case("Signature")));
+        assert!(
+            !names
+                .iter()
+                .any(|n| n.eq_ignore_ascii_case("Signature-Input"))
+        );
+        assert!(
+            !names
+                .iter()
+                .any(|n| n.eq_ignore_ascii_case("Signature-Key"))
+        );
+        assert!(names.iter().any(|n| n.eq_ignore_ascii_case("Content-Type")));
     }
 
     #[test]

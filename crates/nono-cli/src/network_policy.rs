@@ -271,6 +271,7 @@ pub fn resolve_credentials(
                 oauth2,
                 aws_auth: cred.aws_auth.clone(),
                 spiffe: cred.spiffe.clone(),
+                aauth: cred.aauth,
                 upgrades: vec![],
                 rate_limit: cred.rate_limit.clone(),
             });
@@ -307,6 +308,7 @@ pub fn resolve_credentials(
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                aauth: None,
                 upgrades: vec![],
                 rate_limit: None,
             });
@@ -470,6 +472,7 @@ pub fn partition_allow_domain(
                         oauth2: None,
                         aws_auth: None,
                         spiffe: None,
+                        aauth: None,
                         upgrades: vec![],
                         rate_limit: None,
                     });
@@ -629,6 +632,7 @@ mod tests {
                 aws_auth: None,
                 spiffe: None,
                 rate_limit: None,
+                aauth: None,
             },
         );
 
@@ -673,6 +677,7 @@ mod tests {
                 aws_auth: None,
                 spiffe: None,
                 rate_limit: None,
+                aauth: None,
             },
         );
 
@@ -713,6 +718,7 @@ mod tests {
                 aws_auth: None,
                 spiffe: None,
                 rate_limit: None,
+                aauth: None,
             },
         );
 
@@ -763,6 +769,7 @@ mod tests {
                 aws_auth: None,
                 spiffe: None,
                 rate_limit: None,
+                aauth: None,
             },
         );
 
@@ -853,6 +860,7 @@ mod tests {
                 aws_auth: None,
                 spiffe: None,
                 rate_limit: None,
+                aauth: None,
             },
         );
 
@@ -890,6 +898,7 @@ mod tests {
                 aws_auth: None,
                 spiffe: None,
                 rate_limit: None,
+                aauth: None,
             },
         );
 
@@ -927,6 +936,7 @@ mod tests {
                 aws_auth: None,
                 spiffe: None,
                 rate_limit: None,
+                aauth: None,
             },
         );
 
@@ -934,6 +944,45 @@ mod tests {
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0].inject_header, "X-Custom-Auth");
         assert_eq!(routes[0].credential_format.as_deref(), Some("Token {}"));
+    }
+
+    #[test]
+    fn test_resolve_credentials_propagates_aauth() {
+        use crate::profile::CustomCredentialDef;
+
+        let json = embedded_network_policy_json();
+        let policy = load_network_policy(json).unwrap();
+
+        let mut custom = HashMap::new();
+        custom.insert(
+            "test".to_string(),
+            CustomCredentialDef {
+                upstream: "https://api.example.com".to_string(),
+                credential_key: None,
+                auth: None,
+                inject_mode: InjectMode::Header,
+                inject_header: "Authorization".to_string(),
+                credential_format: None,
+                path_pattern: None,
+                path_replacement: None,
+                query_param_name: None,
+                proxy: None,
+                env_var: None,
+                endpoint_rules: vec![],
+                endpoint_policy: None,
+                tls_ca: None,
+                tls_client_cert: None,
+                tls_client_key: None,
+                aws_auth: None,
+                spiffe: None,
+                rate_limit: None,
+                aauth: Some(true),
+            },
+        );
+
+        let routes = resolve_credentials(&policy, &["test".to_string()], &custom).unwrap();
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].aauth, Some(true));
     }
 
     #[test]
@@ -969,6 +1018,7 @@ mod tests {
                 aws_auth: None,
                 spiffe: None,
                 rate_limit: None,
+                aauth: None,
             },
         );
 
@@ -1105,6 +1155,7 @@ mod tests {
                 aws_auth: None,
                 spiffe: None,
                 rate_limit: None,
+                aauth: None,
             },
         );
 
@@ -1199,6 +1250,7 @@ mod tests {
                 aws_auth: None,
                 spiffe: None,
                 rate_limit: None,
+                aauth: None,
             },
         );
 
@@ -1251,6 +1303,7 @@ mod tests {
                 aws_auth: None,
                 spiffe: None,
                 rate_limit: None,
+                aauth: None,
             },
         );
 
@@ -1409,6 +1462,7 @@ mod tests {
                 aws_auth: None,
                 spiffe: None,
                 rate_limit: None,
+                aauth: None,
             },
         );
 
@@ -1452,6 +1506,7 @@ mod tests {
                 aws_auth: None,
                 spiffe: None,
                 rate_limit: None,
+                aauth: None,
             },
         );
         custom.insert(
@@ -1476,6 +1531,7 @@ mod tests {
                 aws_auth: None,
                 spiffe: None,
                 rate_limit: None,
+                aauth: None,
             },
         );
 

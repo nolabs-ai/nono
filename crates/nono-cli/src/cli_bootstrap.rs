@@ -225,6 +225,7 @@ fn cli_verbosity(cli: &Cli) -> u8 {
         Commands::Why(_)
         | Commands::Rollback(_)
         | Commands::Trust(_)
+        | Commands::Aauth(_)
         | Commands::Audit(_)
         | Commands::Platform(_)
         | Commands::Connect(_)

@@ -32,6 +32,8 @@ pub(crate) struct PreparedProfile {
     pub(crate) deny_domain: Vec<String>,
     pub(crate) credentials: Vec<String>,
     pub(crate) custom_credentials: HashMap<String, profile::CustomCredentialDef>,
+    pub(crate) aauth_identity: Option<profile::AauthIdentityDef>,
+    pub(crate) aauth_sign_all_outbound: bool,
     pub(crate) credential_providers: HashMap<String, profile::CredentialProviderDef>,
     pub(crate) credential_routes: Vec<profile::CredentialRouteDef>,
     pub(crate) tls_intercept: Option<profile::TlsInterceptConfig>,
@@ -889,6 +891,12 @@ fn prepare_profile_with_options(
             .as_ref()
             .map(|profile| profile.network.custom_credentials.clone())
             .unwrap_or_default(),
+        aauth_identity: loaded_profile
+            .as_ref()
+            .and_then(|profile| profile.network.aauth_identity.clone()),
+        aauth_sign_all_outbound: loaded_profile
+            .as_ref()
+            .is_some_and(|profile| profile.network.aauth_sign_all_outbound),
         credential_providers: loaded_profile
             .as_ref()
             .map(|profile| profile.credential_providers.clone())

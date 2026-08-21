@@ -11,8 +11,8 @@
 //! normalised route prefix and are consulted independently by the proxy handlers.
 
 use crate::config::{
-    CompiledEndpointPolicy, CompiledEndpointRules, CompiledUpgradeRules, RouteConfig,
-    SpiffeAuthConfig,
+    AauthIdentityConfig, CompiledEndpointPolicy, CompiledEndpointRules, CompiledUpgradeRules,
+    RouteConfig, SpiffeAuthConfig,
 };
 use crate::error::{ProxyError, Result};
 use nono::undo::{NetworkAuditAuthMechanism, NetworkAuditInjectionMode};
@@ -91,6 +91,11 @@ pub struct LoadedRoute {
     /// `spiffe` config block. `None` for non-SPIFFE routes.
     pub managed_auth: Option<Arc<crate::auth::ManagedUpstreamAuth>>,
 
+    /// aauth signer for this route, if it opted into request signing (via
+    /// `RouteConfig::aauth` or the profile's `aauth_sign_all_outbound`
+    /// default). Shared across every route using the same profile identity.
+    pub aauth_signer: Option<Arc<crate::aauth::AauthSigner>>,
+
     /// Optional per-route request-rate limiter (RouteRateLimiter).
     ///
     /// Built from `RouteConfig::rate_limit` at load time. `None` means the
@@ -120,11 +125,42 @@ impl std::fmt::Debug for LoadedRoute {
             crate::auth::ManagedUpstreamAuth::SpiffeJwt(_) => "spiffe_jwt",
         });
         s.field("managed_auth_type", &managed_auth_type);
+        s.field("has_aauth_signer", &self.aauth_signer.is_some());
         s.finish()
     }
 }
 
-fn auth_mechanism_for_route(route: &RouteConfig) -> Option<NetworkAuditAuthMechanism> {
+/// Resolve whether `route` signs with aauth, applying the profile-wide
+/// `aauth_sign_all_outbound` default **only** to routes that have no other
+/// auth mechanism configured.
+///
+/// This is the one place that default gets resolved — every other site
+/// (mutual-exclusion check, audit mechanism/injection-mode, dispatch) must
+/// use this rather than recompute `route.aauth.unwrap_or(aauth_sign_all_outbound)`
+/// directly, or `aauth_sign_all_outbound: true` would silently override any
+/// `RouteConfig` from another subsystem (credential providers, network-policy
+/// built-ins, tool-sandbox credentials) that leaves `aauth` unset expecting to
+/// keep its own `credential_key`/`oauth2`/`aws_auth`/`spiffe`.
+fn resolve_aauth_enabled(route: &RouteConfig, aauth_sign_all_outbound: bool) -> bool {
+    let has_other_mechanism = route.spiffe.is_some()
+        || route.credential_key.is_some()
+        || route.oauth2.is_some()
+        || route.aws_auth.is_some();
+    match route.aauth {
+        Some(explicit) => explicit,
+        None if has_other_mechanism => false,
+        None => aauth_sign_all_outbound,
+    }
+}
+
+fn auth_mechanism_for_route(
+    route: &RouteConfig,
+    aauth_sign_all_outbound: bool,
+) -> Option<NetworkAuditAuthMechanism> {
+    if resolve_aauth_enabled(route, aauth_sign_all_outbound) {
+        return Some(NetworkAuditAuthMechanism::AauthSignature);
+    }
+
     if let Some(spiffe) = &route.spiffe {
         let SpiffeAuthConfig::Jwt { .. } = spiffe;
         return Some(NetworkAuditAuthMechanism::SpiffeJwtBearer);
@@ -157,7 +193,14 @@ fn auth_mechanism_for_route(route: &RouteConfig) -> Option<NetworkAuditAuthMecha
     None
 }
 
-fn injection_mode_for_route(route: &RouteConfig) -> Option<NetworkAuditInjectionMode> {
+fn injection_mode_for_route(
+    route: &RouteConfig,
+    aauth_sign_all_outbound: bool,
+) -> Option<NetworkAuditInjectionMode> {
+    if resolve_aauth_enabled(route, aauth_sign_all_outbound) {
+        return Some(NetworkAuditInjectionMode::AauthSignature);
+    }
+
     if let Some(spiffe) = &route.spiffe {
         let SpiffeAuthConfig::Jwt { .. } = spiffe;
         return Some(NetworkAuditInjectionMode::SpiffeJwt);
@@ -200,7 +243,23 @@ impl RouteStore {
     /// Each route's endpoint rules are compiled at startup so the hot path
     /// does a regex match, not a glob compile. Routes with a `tls_ca` field
     /// get a per-route TLS connector built from the custom CA certificate.
+    ///
+    /// No aauth identity — equivalent to `load_with_aauth(routes, None, false)`.
     pub async fn load(routes: &[RouteConfig]) -> Result<Self> {
+        Self::load_with_aauth(routes, None, false).await
+    }
+
+    /// Like [`Self::load`], but additionally resolves aauth request signing
+    /// from the profile's identity and default.
+    pub async fn load_with_aauth(
+        routes: &[RouteConfig],
+        aauth_identity: Option<&AauthIdentityConfig>,
+        aauth_sign_all_outbound: bool,
+    ) -> Result<Self> {
+        // Loaded lazily: only if some route actually needs it, and only once
+        // even if many routes share the same identity.
+        let mut aauth_signer: Option<Arc<crate::aauth::AauthSigner>> = None;
+
         let mut loaded = HashMap::new();
 
         let base_root_store = build_base_root_store();
@@ -259,21 +318,43 @@ impl RouteStore {
             // `route_upstream_hosts()` — and CONNECT to those still gets
             // blocked with 403 (the "force SDK cooperation" path).
             // Managed credential sources are mutually exclusive.
+            // Explicit conflicts only: two fields *both* set on the same
+            // route. `aauth_sign_all_outbound` is deliberately not folded in
+            // here — `resolve_aauth_enabled` below already ensures the
+            // default never activates on a route that has one of these
+            // explicitly set, so it can never itself create a conflict.
             let managed_count = [
                 route.spiffe.is_some(),
                 route.credential_key.is_some(),
                 route.oauth2.is_some(),
                 route.aws_auth.is_some(),
+                route.aauth == Some(true),
             ]
             .iter()
             .filter(|&&v| v)
             .count();
             if managed_count > 1 {
                 return Err(ProxyError::Config(format!(
-                    "route '{}': `spiffe`, `credential_key`, `oauth2`, and `aws_auth` are mutually exclusive",
+                    "route '{}': `spiffe`, `credential_key`, `oauth2`, `aws_auth`, and `aauth` are mutually exclusive",
                     normalized_prefix
                 )));
             }
+
+            let route_aauth_enabled = resolve_aauth_enabled(route, aauth_sign_all_outbound);
+            if route_aauth_enabled && aauth_signer.is_none() {
+                let identity = aauth_identity.ok_or_else(|| {
+                    ProxyError::Config(format!(
+                        "route '{}': aauth signing requested but no `aauth_identity` is configured",
+                        normalized_prefix
+                    ))
+                })?;
+                aauth_signer = Some(Arc::new(crate::aauth::AauthSigner::load(identity)?));
+            }
+            let route_aauth_signer = if route_aauth_enabled {
+                aauth_signer.clone()
+            } else {
+                None
+            };
 
             // Connect to the SPIRE Workload API for SPIFFE routes. This blocks
             // startup (fail-closed) if the socket is unreachable within the
@@ -312,12 +393,13 @@ impl RouteStore {
             let requires_managed_credential = route.credential_key.is_some()
                 || route.oauth2.is_some()
                 || route.aws_auth.is_some()
-                || route.spiffe.is_some();
+                || route.spiffe.is_some()
+                || route_aauth_enabled;
             let requires_intercept = requires_managed_credential
                 || !endpoint_policy.allows_all_without_l7()
                 || !upgrade_rules.is_empty();
-            let managed_auth_mechanism = auth_mechanism_for_route(route);
-            let managed_injection_mode = injection_mode_for_route(route);
+            let managed_auth_mechanism = auth_mechanism_for_route(route, aauth_sign_all_outbound);
+            let managed_injection_mode = injection_mode_for_route(route, aauth_sign_all_outbound);
 
             let rate_limiter = route.rate_limit.as_ref().and_then(|rl| {
                 crate::rate_limit::RouteRateLimiter::new(
@@ -344,6 +426,7 @@ impl RouteStore {
                     managed_auth_mechanism,
                     managed_injection_mode,
                     managed_auth,
+                    aauth_signer: route_aauth_signer,
                     rate_limiter,
                 },
             );
@@ -635,6 +718,7 @@ impl LoadedRoute {
             && !has_oauth2
             && !has_aws
             && !has_spiffe
+            && self.aauth_signer.is_none()
     }
 }
 
@@ -931,6 +1015,7 @@ fn build_tls_connector_with_ca(ca_path: &str) -> Result<tokio_rustls::TlsConnect
 mod tests {
     use super::*;
     use crate::config::EndpointRule;
+    use base64::Engine as _;
 
     #[test]
     fn test_empty_route_store() {
@@ -972,6 +1057,7 @@ mod tests {
             oauth2: None,
             aws_auth: None,
             spiffe: None,
+            aauth: None,
             upgrades: vec![],
             rate_limit: None,
         }];
@@ -1016,6 +1102,7 @@ mod tests {
             oauth2: None,
             aws_auth: None,
             spiffe: None,
+            aauth: None,
             upgrades: vec![],
             rate_limit: None,
         }];
@@ -1047,6 +1134,7 @@ mod tests {
             oauth2: None,
             aws_auth: None,
             spiffe: None,
+            aauth: None,
             upgrades: vec![],
             rate_limit: None,
         }];
@@ -1079,6 +1167,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                aauth: None,
                 upgrades: vec![],
                 rate_limit: None,
             },
@@ -1102,6 +1191,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                aauth: None,
                 upgrades: vec![],
                 rate_limit: None,
             },
@@ -1188,6 +1278,7 @@ mod tests {
             oauth2: None,
             aws_auth: None,
             spiffe: None,
+            aauth: None,
             upgrades: vec![],
             rate_limit: None,
         }];
@@ -1233,6 +1324,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                aauth: None,
                 upgrades: vec![],
                 rate_limit: None,
             }];
@@ -1284,6 +1376,7 @@ mod tests {
             managed_auth_mechanism: None,
             managed_injection_mode: None,
             managed_auth: None,
+            aauth_signer: None,
             rate_limiter: None,
         };
         let debug_output = format!("{:?}", route);
@@ -1317,6 +1410,7 @@ mod tests {
             oauth2: None,
             aws_auth: None,
             spiffe: None,
+            aauth: None,
             upgrades: vec![],
             rate_limit: None,
         }];
@@ -1357,6 +1451,7 @@ mod tests {
             oauth2: None,
             aws_auth: None,
             spiffe: None,
+            aauth: None,
             upgrades: vec![],
             rate_limit: None,
         }];
@@ -1405,6 +1500,7 @@ mod tests {
             oauth2: None,
             aws_auth: None,
             spiffe: None,
+            aauth: None,
             upgrades: vec![],
             rate_limit: None,
         }];
@@ -1440,6 +1536,7 @@ mod tests {
             oauth2: None,
             aws_auth: None,
             spiffe: None,
+            aauth: None,
             upgrades: vec![],
             rate_limit: None,
         }];
@@ -1464,6 +1561,7 @@ mod tests {
             managed_auth_mechanism: Some(NetworkAuditAuthMechanism::PhantomHeader),
             managed_injection_mode: Some(NetworkAuditInjectionMode::Header),
             managed_auth: None,
+            aauth_signer: None,
             rate_limiter: None,
         };
         assert!(managed.missing_managed_credential(false, false, false, false));
@@ -1486,6 +1584,7 @@ mod tests {
             managed_auth_mechanism: None,
             managed_injection_mode: None,
             managed_auth: None,
+            aauth_signer: None,
             rate_limiter: None,
         };
         assert!(!l7_only.missing_managed_credential(false, false, false, false));
@@ -1513,6 +1612,7 @@ mod tests {
             oauth2: None,
             aws_auth: None,
             spiffe: None,
+            aauth: None,
             upgrades: vec![],
             rate_limit: None,
         }];
@@ -1550,6 +1650,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                aauth: None,
                 upgrades: vec![],
                 rate_limit: None,
             },
@@ -1576,6 +1677,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                aauth: None,
                 upgrades: vec![],
                 rate_limit: None,
             },
@@ -1656,6 +1758,7 @@ mod tests {
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                aauth: None,
                 upgrades: vec![],
                 rate_limit: None,
             }
@@ -2069,6 +2172,7 @@ h56ZLEEqHfVWFhJWIKRSabtxYPV/VJyMv+lo3L0QwSKsouHs3dtF1zVQ
             oauth2: None,
             aws_auth: None,
             spiffe: None,
+            aauth: None,
             upgrades: vec![],
             rate_limit: None,
         }];
@@ -2095,5 +2199,191 @@ h56ZLEEqHfVWFhJWIKRSabtxYPV/VJyMv+lo3L0QwSKsouHs3dtF1zVQ
         .unwrap();
         let store = RouteStore::load(&[route]).await.unwrap();
         assert!(store.get("chat").unwrap().requires_intercept);
+    }
+
+    // ============================================================================
+    // aauth tests
+    // ============================================================================
+
+    /// A real generated identity, stored at a temp `file://` path, for tests
+    /// that need `load_with_aauth` to actually succeed in loading a signer.
+    fn test_aauth_identity(dir: &std::path::Path) -> crate::config::AauthIdentityConfig {
+        let (private_key, _) = aauth_core::keys::generate_ed25519_keypair();
+        let der = private_key.to_pkcs8_der().expect("encode key");
+        let path = dir.join("aauth-test-key.pem");
+        nono::store_secret_file(
+            &path,
+            &base64::engine::general_purpose::STANDARD.encode(&*der),
+        )
+        .expect("store test key");
+        crate::config::AauthIdentityConfig {
+            agent_id: Some("aauth:test@nono.local".to_string()),
+            key_ref: format!("file://{}", path.display()),
+            scheme: crate::config::AauthSigSchemeConfig::Hwk,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_aauth_sign_all_outbound_does_not_override_credential_key_route() {
+        // Regression test: `aauth_sign_all_outbound: true` must never
+        // silently take over a route that already has its own auth
+        // mechanism (`credential_key` here) and simply leaves `aauth`
+        // unset — that would mean nono-proxy signs the request but never
+        // injects the configured credential, and the mutual-exclusion
+        // check would have no way to catch it since nothing was set
+        // explicitly.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let identity = test_aauth_identity(dir.path());
+
+        let routes = vec![RouteConfig {
+            prefix: "api".to_string(),
+            upstream: "https://api.example.com".to_string(),
+            credential_key: Some("env://TEST_API_KEY".to_string()),
+            inject_mode: Default::default(),
+            inject_header: "Authorization".to_string(),
+            credential_format: Some("Bearer {}".to_string()),
+            path_pattern: None,
+            path_replacement: None,
+            query_param_name: None,
+            proxy: None,
+            env_var: None,
+            endpoint_rules: vec![],
+            endpoint_policy: None,
+            tls_ca: None,
+            tls_client_cert: None,
+            tls_client_key: None,
+            oauth2: None,
+            aws_auth: None,
+            spiffe: None,
+            aauth: None,
+            upgrades: vec![],
+            rate_limit: None,
+        }];
+
+        let store = RouteStore::load_with_aauth(&routes, Some(&identity), true)
+            .await
+            .expect(
+                "route with its own credential_key must still load under a global aauth default",
+            );
+        let route = store.get("api").expect("route loaded");
+        assert!(
+            route.aauth_signer.is_none(),
+            "a route with credential_key set must not also get an aauth signer just because \
+             aauth_sign_all_outbound is true"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_aauth_sign_all_outbound_signs_bare_routes() {
+        // The flip side of the above: a route with *no* explicit auth
+        // mechanism at all should pick up the profile-wide default.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let identity = test_aauth_identity(dir.path());
+
+        let routes = vec![RouteConfig {
+            prefix: "api".to_string(),
+            upstream: "https://api.example.com".to_string(),
+            credential_key: None,
+            inject_mode: Default::default(),
+            inject_header: "Authorization".to_string(),
+            credential_format: None,
+            path_pattern: None,
+            path_replacement: None,
+            query_param_name: None,
+            proxy: None,
+            env_var: None,
+            endpoint_rules: vec![],
+            endpoint_policy: None,
+            tls_ca: None,
+            tls_client_cert: None,
+            tls_client_key: None,
+            oauth2: None,
+            aws_auth: None,
+            spiffe: None,
+            aauth: None,
+            upgrades: vec![],
+            rate_limit: None,
+        }];
+
+        let store = RouteStore::load_with_aauth(&routes, Some(&identity), true)
+            .await
+            .expect("bare route should load and sign under the global aauth default");
+        let route = store.get("api").expect("route loaded");
+        assert!(
+            route.aauth_signer.is_some(),
+            "a route with no other auth mechanism should sign under aauth_sign_all_outbound"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_aauth_explicit_true_conflicts_with_credential_key() {
+        // Explicitly setting both must still be rejected as a config error
+        // — only the *implicit* default is forgiving, not an explicit
+        // per-route conflict.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let identity = test_aauth_identity(dir.path());
+
+        let routes = vec![RouteConfig {
+            prefix: "api".to_string(),
+            upstream: "https://api.example.com".to_string(),
+            credential_key: Some("env://TEST_API_KEY".to_string()),
+            inject_mode: Default::default(),
+            inject_header: "Authorization".to_string(),
+            credential_format: Some("Bearer {}".to_string()),
+            path_pattern: None,
+            path_replacement: None,
+            query_param_name: None,
+            proxy: None,
+            env_var: None,
+            endpoint_rules: vec![],
+            endpoint_policy: None,
+            tls_ca: None,
+            tls_client_cert: None,
+            tls_client_key: None,
+            oauth2: None,
+            aws_auth: None,
+            spiffe: None,
+            aauth: Some(true),
+            upgrades: vec![],
+            rate_limit: None,
+        }];
+
+        let err = RouteStore::load_with_aauth(&routes, Some(&identity), false)
+            .await
+            .expect_err("explicit aauth:true + credential_key must be rejected");
+        assert!(err.to_string().contains("mutually exclusive"));
+    }
+
+    #[tokio::test]
+    async fn test_aauth_true_without_identity_fails_closed() {
+        let routes = vec![RouteConfig {
+            prefix: "api".to_string(),
+            upstream: "https://api.example.com".to_string(),
+            credential_key: None,
+            inject_mode: Default::default(),
+            inject_header: "Authorization".to_string(),
+            credential_format: None,
+            path_pattern: None,
+            path_replacement: None,
+            query_param_name: None,
+            proxy: None,
+            env_var: None,
+            endpoint_rules: vec![],
+            endpoint_policy: None,
+            tls_ca: None,
+            tls_client_cert: None,
+            tls_client_key: None,
+            oauth2: None,
+            aws_auth: None,
+            spiffe: None,
+            aauth: Some(true),
+            upgrades: vec![],
+            rate_limit: None,
+        }];
+
+        let err = RouteStore::load_with_aauth(&routes, None, false)
+            .await
+            .expect_err("aauth:true with no configured identity must fail closed");
+        assert!(err.to_string().contains("aauth_identity"));
     }
 }

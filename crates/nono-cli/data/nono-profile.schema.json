@@ -990,6 +990,14 @@
           },
           "description": "Custom credential definitions for services not in network-policy.json. Keys are service names used with --credential."
         },
+        "aauth_identity": {
+          "$ref": "#/$defs/AauthIdentityDef",
+          "description": "The agent's persistent aauth identity (RFC 9421 request signing). One identity per profile; individual custom_credentials entries opt into signing with it via their aauth field."
+        },
+        "aauth_sign_all_outbound": {
+          "type": "boolean",
+          "description": "When true, every custom credential route with no other auth mechanism signs with aauth_identity by default, unless it sets aauth: false. When false (the default), routes must opt in with aauth: true."
+        },
         "tls_intercept": {
           "$ref": "#/$defs/TlsInterceptConfig",
           "description": "TLS interception certificate lifecycle controls for L7 proxy routes."
@@ -1050,14 +1058,15 @@
     },
     "CustomCredentialDef": {
       "type": "object",
-      "description": "Custom credential route definition for the reverse proxy. Defines how to route requests and inject credentials for a service. credential_key, auth, aws_auth, and spiffe are mutually exclusive — at most one may be set.",
+      "description": "Custom credential route definition for the reverse proxy. Defines how to route requests and inject credentials for a service. credential_key, auth, aws_auth, spiffe, and aauth are mutually exclusive — at most one may be set (aauth here means an explicit aauth: true; relying on the profile-wide aauth_sign_all_outbound default with no fields set at all is valid at runtime but can't be expressed in this per-object schema).",
       "additionalProperties": false,
       "required": ["upstream"],
       "anyOf": [
         { "required": ["credential_key"], "properties": { "credential_key": { "not": { "type": "null" } } } },
         { "required": ["auth"], "properties": { "auth": { "not": { "type": "null" } } } },
         { "required": ["aws_auth"], "properties": { "aws_auth": { "not": { "type": "null" } } } },
-        { "required": ["spiffe"], "properties": { "spiffe": { "not": { "type": "null" } } } }
+        { "required": ["spiffe"], "properties": { "spiffe": { "not": { "type": "null" } } } },
+        { "required": ["aauth"], "properties": { "aauth": { "const": true } } }
       ],
       "allOf": [
         {
@@ -1087,6 +1096,14 @@
         {
           "not": {
             "allOf": [
+              { "required": ["credential_key"], "properties": { "credential_key": { "not": { "type": "null" } } } },
+              { "required": ["aauth"], "properties": { "aauth": { "const": true } } }
+            ]
+          }
+        },
+        {
+          "not": {
+            "allOf": [
               { "required": ["auth"], "properties": { "auth": { "not": { "type": "null" } } } },
               { "required": ["aws_auth"], "properties": { "aws_auth": { "not": { "type": "null" } } } }
             ]
@@ -1103,8 +1120,32 @@
         {
           "not": {
             "allOf": [
+              { "required": ["auth"], "properties": { "auth": { "not": { "type": "null" } } } },
+              { "required": ["aauth"], "properties": { "aauth": { "const": true } } }
+            ]
+          }
+        },
+        {
+          "not": {
+            "allOf": [
               { "required": ["aws_auth"], "properties": { "aws_auth": { "not": { "type": "null" } } } },
               { "required": ["spiffe"], "properties": { "spiffe": { "not": { "type": "null" } } } }
+            ]
+          }
+        },
+        {
+          "not": {
+            "allOf": [
+              { "required": ["aws_auth"], "properties": { "aws_auth": { "not": { "type": "null" } } } },
+              { "required": ["aauth"], "properties": { "aauth": { "const": true } } }
+            ]
+          }
+        },
+        {
+          "not": {
+            "allOf": [
+              { "required": ["spiffe"], "properties": { "spiffe": { "not": { "type": "null" } } } },
+              { "required": ["aauth"], "properties": { "aauth": { "const": true } } }
             ]
           }
         }
@@ -1236,6 +1277,13 @@
             { "type": "null" }
           ],
           "description": "SPIFFE/SPIRE Workload API authentication. Mutually exclusive with credential_key, auth, and aws_auth."
+        },
+        "aauth": {
+          "oneOf": [
+            { "type": "boolean" },
+            { "type": "null" }
+          ],
+          "description": "Whether this route signs outbound requests with the profile's aauth_identity. true to sign, false to opt out of aauth_sign_all_outbound. Mutually exclusive with credential_key, auth, aws_auth, and spiffe."
         }
       }
     },
@@ -1492,6 +1540,54 @@
           "description": "Select a specific SVID by SPIFFE ID when the Workload API returns multiple SVIDs for the same workload. When absent, the first SVID returned by the agent is used."
         }
       }
+    },
+    "AauthIdentityDef": {
+      "type": "object",
+      "description": "The agent's persistent aauth identity (RFC 9421 request signing). key_ref uses the same URI scheme as credential_key (keyring://, file://, env://); the referenced secret is the Ed25519 private key's PKCS#8 DER, base64-encoded.",
+      "additionalProperties": false,
+      "required": ["key_ref"],
+      "properties": {
+        "agent_id": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "null" }
+          ],
+          "description": "Label for nono's own audit log, never part of the signature. Must be omitted under jwks_uri (it is always the issuer there). Under hwk, defaults to the key's thumbprint when omitted."
+        },
+        "key_ref": {
+          "type": "string",
+          "description": "Where the private key is stored: file://, keyring://, or env://, same scheme as credential_key."
+        },
+        "scheme": {
+          "$ref": "#/$defs/AauthSigSchemeConfig",
+          "description": "Which Signature-Key scheme to sign with. Defaults to hwk."
+        }
+      }
+    },
+    "AauthSigSchemeConfig": {
+      "description": "Which Signature-Key scheme an aauth identity signs with. hwk needs no infrastructure (the public key travels inline). jwks_uri sends id/dwk/kid, so the upstream discovers the key by fetching {issuer}/.well-known/aauth-agent.json.",
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type"],
+          "properties": {
+            "type": { "type": "string", "enum": ["hwk"] }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "issuer"],
+          "properties": {
+            "type": { "type": "string", "enum": ["jwks_uri"] },
+            "issuer": {
+              "type": "string",
+              "description": "This agent's issuer identifier: an HTTPS URL with no port or path (e.g. https://agent.example.com), matching the issuer field of the hosted aauth-agent.json."
+            }
+          }
+        }
+      ]
     },
     "PlatformOverrides": {
       "type": "object",

@@ -100,6 +100,18 @@ pub struct ProxyConfig {
     #[serde(default)]
     pub routes: Vec<RouteConfig>,
 
+    /// The agent's persistent aauth identity, if any. One identity per
+    /// profile — individual routes opt into signing with it via
+    /// `RouteConfig::aauth` (or `aauth_sign_all_outbound` below).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aauth_identity: Option<AauthIdentityConfig>,
+
+    /// When `true`, every route signs with `aauth_identity` unless it sets
+    /// `aauth: false`. When `false` (the default), routes must opt in with
+    /// `aauth: true`.
+    #[serde(default)]
+    pub aauth_sign_all_outbound: bool,
+
     /// Declarative OAuth token capture routes.
     ///
     /// These are not reverse-proxy routes. They mark OAuth token endpoints
@@ -248,6 +260,8 @@ impl Default for ProxyConfig {
             strict_connect_auth: false,
             session_token: None,
             routes: Vec::new(),
+            aauth_identity: None,
+            aauth_sign_all_outbound: false,
             oauth_capture: Vec::new(),
             oauth_capture_store_path: None,
             external_proxy: None,
@@ -822,6 +836,12 @@ pub struct RouteConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spiffe: Option<SpiffeAuthConfig>,
 
+    /// Whether this route signs outbound requests with the profile's
+    /// `aauth_identity`. `None` defers to `ProxyConfig::aauth_sign_all_outbound`.
+    /// Mutually exclusive with `credential_key`, `oauth2`, `aws_auth`, and `spiffe`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aauth: Option<bool>,
+
     /// Optional allow-list of WebSocket upgrade targets for this route.
     ///
     /// When a client requests an HTTP `Upgrade` on this route, it is only
@@ -887,6 +907,58 @@ pub enum SpiffeAuthConfig {
         /// the same workload. When absent, nono uses the first SVID returned by the agent.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         svid_hint: Option<String>,
+    },
+}
+
+/// The agent's persistent aauth identity (RFC 9421 request signing).
+///
+/// One identity per profile. `key_ref` uses the same `nono::keystore` URI
+/// scheme as `credential_key` (`file://`, `keyring://`, `env://`); the
+/// stored secret is the private key's PKCS#8 DER, base64-encoded, exactly
+/// as `nono aauth keygen` writes it.
+///
+/// `agent_id` is a label for nono's own audit log — never part of the
+/// signature. Its meaning depends on `scheme`:
+/// - Under `jwks_uri`, the protocol itself has no identity finer than the
+///   issuer at this scheme (`Signature-Key` carries only `id`/`dwk`/`kid`,
+///   and a verifying resource reports `id` back as the recovered identity —
+///   see `aauth_core::resource::RequestVerifier`). So `agent_id` here is
+///   always `scheme`'s `issuer`; setting it explicitly is rejected at
+///   profile-validation time rather than left to silently drift from what
+///   a resource actually sees.
+/// - Under `hwk` there is no protocol identity at all — the request is
+///   pseudonymous. `agent_id` here is purely a local label to recognize an
+///   audit entry by; when omitted, it defaults to the key's JWK thumbprint
+///   so every entry is still traceable to a specific key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AauthIdentityConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    pub key_ref: String,
+    /// Which `Signature-Key` scheme to sign with. Defaults to `hwk`
+    /// (pseudonymous, public key inline — no hosting required).
+    #[serde(default)]
+    pub scheme: AauthSigSchemeConfig,
+}
+
+/// Which `Signature-Key` scheme an aauth identity signs with.
+///
+/// `hwk` needs no infrastructure: the public key travels inline in every
+/// request. `jwks_uri` instead sends `id`/`dwk`/`kid`, so the upstream
+/// discovers the key by fetching `{issuer}/.well-known/aauth-agent.json` →
+/// `jwks_uri` → the JWKS — which means `issuer` must actually be hosting
+/// that document (see `nono aauth show --jwks` for the JSON to publish
+/// there) before a `jwks_uri`-signed request can be verified.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AauthSigSchemeConfig {
+    #[default]
+    Hwk,
+    JwksUri {
+        /// This agent's issuer identifier — an HTTPS URL with no port or
+        /// path (e.g. `https://agent.example.com`), matching the `issuer`
+        /// field of the hosted `aauth-agent.json`.
+        issuer: String,
     },
 }
 

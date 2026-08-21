@@ -37,6 +37,12 @@ pub(crate) struct ActiveProxyRuntime {
     pub(crate) tool_sandbox_credential_env_vars: BTreeMap<String, Vec<(String, String)>>,
     pub(crate) tool_sandbox_trust_bundle_paths: Vec<std::path::PathBuf>,
     pub(crate) handle: Option<nono_proxy::server::ProxyHandle>,
+    /// Env var name holding the aauth signing key, when `aauth_identity.key_ref`
+    /// is `env://VAR` — the caller must deny this to the sandboxed child, or
+    /// nono's own full-environment passthrough would hand the agent its
+    /// signing key directly, the same way `enforce_aauth_key_isolation`
+    /// prevents a `file://` key ref from falling under a granted read path.
+    pub(crate) aauth_env_var_to_deny: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1598,6 +1604,8 @@ pub(crate) fn prepare_proxy_launch_options(
         credential_capture: prepared.credential_capture.clone(),
         credential_providers: prepared.credential_providers.clone(),
         credential_routes: prepared.credential_routes.clone(),
+        aauth_identity: prepared.aauth_identity.clone(),
+        aauth_sign_all_outbound: prepared.aauth_sign_all_outbound,
         enable_h2: prepared.allow_http2_requested,
         no_proxy,
     };
@@ -1912,6 +1920,7 @@ fn collect_tool_sandbox_proxy_grants(
                 .transpose()?,
             aws_auth: None,
             spiffe: None,
+            aauth: None,
             rate_limit: None,
         };
 
@@ -2461,6 +2470,16 @@ pub(crate) fn build_proxy_config_from_flags(
     proxy_config.leaf_validity = proxy.proxy_leaf_validity;
     proxy_config.enable_h2 = proxy.enable_h2;
     proxy_config.no_proxy = proxy.no_proxy.clone();
+    proxy_config.aauth_identity =
+        proxy
+            .aauth_identity
+            .as_ref()
+            .map(|identity| nono_proxy::config::AauthIdentityConfig {
+                agent_id: identity.agent_id.clone(),
+                key_ref: identity.key_ref.clone(),
+                scheme: identity.scheme.clone(),
+            });
+    proxy_config.aauth_sign_all_outbound = proxy.aauth_sign_all_outbound;
     synthesize_credential_provider_proxy_config(proxy, &mut proxy_config)?;
     if !proxy_config.oauth_capture.is_empty() {
         proxy_config.oauth_capture_store_path = Some(
@@ -2557,6 +2576,7 @@ fn synthesize_credential_provider_proxy_config(
                 oauth2: None,
                 aws_auth: None,
                 spiffe: None,
+                aauth: None,
                 upgrades,
                 rate_limit: None,
             });
@@ -2823,6 +2843,71 @@ fn enforce_spiffe_socket_isolation(
     Ok(())
 }
 
+/// aauth hardening: deny the sandboxed child direct filesystem access to its
+/// own signing key. The proxy holds the key and signs on the child's behalf;
+/// the child must never be able to read it and sign as itself outside the
+/// proxy's audit trail.
+///
+/// Hard error if a `file://` key ref falls inside any granted filesystem
+/// capability — same shape as `enforce_spiffe_socket_isolation`. `keyring://`
+/// and `env://` key refs have no filesystem path to isolate here.
+fn enforce_aauth_key_isolation(
+    proxy_config: &nono_proxy::config::ProxyConfig,
+    caps: &mut CapabilitySet,
+) -> Result<()> {
+    let Some(identity) = &proxy_config.aauth_identity else {
+        return Ok(());
+    };
+    let Some(key_path) = identity.key_ref.strip_prefix("file://") else {
+        return Ok(());
+    };
+    // Unlike try_canonicalize's callers elsewhere, this check must fail
+    // closed: falling back to an unresolved (possibly relative) path on a
+    // canonicalize error would let it bypass the containment comparison
+    // below instead of being rejected.
+    let key_path = std::fs::canonicalize(key_path).map_err(|e| {
+        NonoError::ConfigParse(format!(
+            "aauth_identity.key_ref file '{key_path}' could not be resolved: {e}"
+        ))
+    })?;
+
+    for cap in caps.fs_capabilities() {
+        let granted = try_canonicalize(cap.resolved.as_path());
+        if key_path == granted || key_path.starts_with(&granted) {
+            return Err(NonoError::ConfigParse(format!(
+                "aauth_identity.key_ref file '{}' is inside a filesystem capability granted \
+                 to the sandboxed process ('{}'); this would let the agent read its own \
+                 signing key directly and sign as itself outside the proxy — move the key \
+                 outside any --allow/--read/--write path, or narrow the grant",
+                key_path.display(),
+                granted.display()
+            )));
+        }
+    }
+
+    // On macOS, emit an explicit Seatbelt deny so the child can't reach the
+    // key even if a future capability accidentally covers it. Landlock on
+    // Linux is strictly allow-list with no equivalent deny-within-allow —
+    // the conflict check above is the only guard there.
+    #[cfg(target_os = "macos")]
+    {
+        let escaped = crate::policy::escape_seatbelt_path(&key_path.to_string_lossy())?;
+        caps.add_platform_rule(format!("(deny file-read* (path \"{escaped}\"))"))?;
+        // Also deny writes: `file-read*` alone would leave the key file open
+        // to overwrite/truncation/unlink if a future capability accidentally
+        // grants write access over it too. There is no single `file*` class
+        // covering both in Seatbelt's SBPL — `(deny file* ...)` is silently
+        // a no-op, so read and write must be denied as two separate rules.
+        caps.add_platform_rule(format!("(deny file-write* (path \"{escaped}\"))"))?;
+        debug!(
+            "aauth: emitted Seatbelt deny for signing key {}",
+            key_path.display()
+        );
+    }
+
+    Ok(())
+}
+
 /// Wire up TLS interception on a `ProxyConfig`: pick a session-scoped
 /// directory for the ephemeral CA bundle, merge any parent `SSL_CERT_FILE`
 /// so corporate trust survives our env-var override, and (on macOS) load a
@@ -2880,6 +2965,7 @@ pub(crate) fn start_proxy_runtime(
             env_vars: Vec::new(),
             tool_sandbox_credential_env_vars: BTreeMap::new(),
             tool_sandbox_trust_bundle_paths: Vec::new(),
+            aauth_env_var_to_deny: None,
             handle: None,
         });
     };
@@ -2888,6 +2974,7 @@ pub(crate) fn start_proxy_runtime(
             env_vars: Vec::new(),
             tool_sandbox_credential_env_vars: BTreeMap::new(),
             tool_sandbox_trust_bundle_paths: Vec::new(),
+            aauth_env_var_to_deny: None,
             handle: None,
         });
     }
@@ -2965,14 +3052,13 @@ pub(crate) fn start_proxy_runtime(
         bind_ports: proxy.allow_bind_ports.clone(),
     });
 
-    // SPIFFE/SPIRE hardening: deny the sandboxed child direct access to the
-    // SPIRE Workload API socket. The proxy holds the SPIFFE identity; the
-    // child must not be able to obtain SVIDs independently. This prevents a
-    // compromised agent from escalating its own identity.
-    //
-    // Hard error if the user has explicitly granted the socket via unix_socket
-    // caps — that combination undermines the isolation guarantee.
     enforce_spiffe_socket_isolation(&proxy_config, caps)?;
+    enforce_aauth_key_isolation(&proxy_config, caps)?;
+    let aauth_env_var_to_deny = proxy_config
+        .aauth_identity
+        .as_ref()
+        .and_then(|identity| identity.key_ref.strip_prefix("env://"))
+        .map(str::to_string);
 
     // Grant the sandboxed child a read capability on the ephemeral
     // trust bundle so `SSL_CERT_FILE` etc. are actually openable after
@@ -3050,6 +3136,7 @@ pub(crate) fn start_proxy_runtime(
         tool_sandbox_credential_env_vars,
         tool_sandbox_trust_bundle_paths,
         handle: Some(handle),
+        aauth_env_var_to_deny,
     })
 }
 
@@ -3246,6 +3333,129 @@ mod tests {
     // never race on fd 0 when cargo runs them concurrently.
     #[cfg(unix)]
     static STDIN_MANIPULATION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn aauth_config_with_file_key(path: &std::path::Path) -> nono_proxy::config::ProxyConfig {
+        nono_proxy::config::ProxyConfig {
+            aauth_identity: Some(nono_proxy::config::AauthIdentityConfig {
+                agent_id: None,
+                key_ref: format!("file://{}", path.display()),
+                scheme: nono_proxy::config::AauthSigSchemeConfig::Hwk,
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn aauth_config_with_env_key(var: &str) -> nono_proxy::config::ProxyConfig {
+        nono_proxy::config::ProxyConfig {
+            aauth_identity: Some(nono_proxy::config::AauthIdentityConfig {
+                agent_id: None,
+                key_ref: format!("env://{var}"),
+                scheme: nono_proxy::config::AauthSigSchemeConfig::Hwk,
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// Regression test: a `file://` aauth key sitting inside a directory the
+    /// sandboxed process is granted read access to must be rejected — that
+    /// combination would let the agent read its own signing key directly.
+    #[test]
+    fn enforce_aauth_key_isolation_rejects_key_under_granted_read_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let key_path = tmp.path().join("key.pem");
+        std::fs::write(&key_path, "not a real key").expect("write key file");
+
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(nono::FsCapability {
+            original: tmp.path().to_path_buf(),
+            resolved: tmp.path().to_path_buf(),
+            access: nono::AccessMode::Read,
+            is_file: false,
+            source: nono::CapabilitySource::User,
+        });
+
+        let proxy_config = aauth_config_with_file_key(&key_path);
+        let err = enforce_aauth_key_isolation(&proxy_config, &mut caps)
+            .expect_err("key under a granted read path must be rejected");
+        assert!(err.to_string().contains("filesystem capability"));
+    }
+
+    /// The Seatbelt fallback must deny both reads and writes to the key —
+    /// `(deny file* ...)` is not a real SBPL operation class (it's silently
+    /// a no-op), so this must be two separate `file-read*`/`file-write*`
+    /// rules, not a single combined one.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn enforce_aauth_key_isolation_denies_both_read_and_write_on_macos() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let key_path = tmp.path().join("key.pem");
+        std::fs::write(&key_path, "not a real key").expect("write key file");
+
+        let mut caps = CapabilitySet::new();
+        let proxy_config = aauth_config_with_file_key(&key_path);
+        enforce_aauth_key_isolation(&proxy_config, &mut caps).expect("key outside grants is ok");
+
+        let rules = caps.platform_rules();
+        assert!(
+            rules.iter().any(|r| r.contains("deny file-read*")),
+            "expected a file-read* deny rule, got {rules:?}"
+        );
+        assert!(
+            rules.iter().any(|r| r.contains("deny file-write*")),
+            "expected a file-write* deny rule, got {rules:?}"
+        );
+    }
+
+    /// The flip side: a key outside every granted path must load cleanly.
+    #[test]
+    fn enforce_aauth_key_isolation_allows_key_outside_granted_paths() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let key_path = tmp.path().join("key.pem");
+        std::fs::write(&key_path, "not a real key").expect("write key file");
+
+        let other = tempfile::tempdir().expect("tempdir");
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(nono::FsCapability {
+            original: other.path().to_path_buf(),
+            resolved: other.path().to_path_buf(),
+            access: nono::AccessMode::Read,
+            is_file: false,
+            source: nono::CapabilitySource::User,
+        });
+
+        let proxy_config = aauth_config_with_file_key(&key_path);
+        assert!(enforce_aauth_key_isolation(&proxy_config, &mut caps).is_ok());
+    }
+
+    /// A key path that can't be canonicalized (e.g. the file doesn't exist)
+    /// must fail closed rather than silently comparing an unresolved path
+    /// against granted capabilities and letting it through.
+    #[test]
+    fn enforce_aauth_key_isolation_rejects_key_that_does_not_exist() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let key_path = tmp.path().join("missing-key.pem");
+
+        let mut caps = CapabilitySet::new();
+        let proxy_config = aauth_config_with_file_key(&key_path);
+        let err = enforce_aauth_key_isolation(&proxy_config, &mut caps)
+            .expect_err("a key path that can't be resolved must be rejected, not skipped");
+        assert!(err.to_string().contains("could not be resolved"));
+    }
+
+    /// Regression test: an `env://` aauth key ref must be surfaced for
+    /// denial to the sandboxed child — otherwise nono's default
+    /// full-environment passthrough would hand the agent its own signing
+    /// key via `env`/`printenv`.
+    #[test]
+    fn start_proxy_runtime_marks_env_key_ref_for_denial() {
+        let proxy_config = aauth_config_with_env_key("MY_AAUTH_KEY");
+        let aauth_env_var_to_deny = proxy_config
+            .aauth_identity
+            .as_ref()
+            .and_then(|identity| identity.key_ref.strip_prefix("env://"))
+            .map(str::to_string);
+        assert_eq!(aauth_env_var_to_deny, Some("MY_AAUTH_KEY".to_string()));
+    }
 
     #[cfg(unix)]
     #[test]
@@ -3535,6 +3745,7 @@ mod tests {
                 aws_auth: None,
                 spiffe: None,
                 rate_limit: None,
+                aauth: None,
             },
         );
 
@@ -3586,6 +3797,8 @@ mod tests {
             set_vars: None,
             profile_network_block: false,
             allow_http2_requested: false,
+            aauth_identity: None,
+            aauth_sign_all_outbound: false,
         };
 
         let args = crate::cli::SandboxArgs::default();
@@ -3659,6 +3872,8 @@ mod tests {
             set_vars: None,
             profile_network_block: false,
             allow_http2_requested: false,
+            aauth_identity: None,
+            aauth_sign_all_outbound: false,
         };
         let args = crate::cli::SandboxArgs {
             allow_proxy: vec!["api.internal.corp".to_string()],
@@ -3727,6 +3942,8 @@ mod tests {
             set_vars: None,
             profile_network_block: false,
             allow_http2_requested: false,
+            aauth_identity: None,
+            aauth_sign_all_outbound: false,
         };
         let args = crate::cli::SandboxArgs::default();
         let intent = prepare_proxy_launch_options(&args, &prepared, true, String::new())?;
@@ -4029,6 +4246,7 @@ mod tests {
             oauth2: None,
             aws_auth: None,
             spiffe: None,
+            aauth: None,
             upgrades: vec![],
             rate_limit: None,
         });

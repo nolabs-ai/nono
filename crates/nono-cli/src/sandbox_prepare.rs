@@ -1759,7 +1759,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
     // Capture the profile's `network.allow_http2` intent alongside the CLI flag.
     let profile_allow_http2 = loaded_profile
         .as_ref()
-        .map(|p| p.network.allow_http2)
+        .map(|p| p.network.resolved_allow_http2())
         .unwrap_or(false);
     let allow_http2_requested = args.allow_http2 || profile_allow_http2;
 

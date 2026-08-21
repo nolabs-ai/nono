@@ -476,7 +476,9 @@ By default, the proxy uses HTTP/1.1 with keep-alive connection pooling for all u
 nono run --profile claude-code --allow-http2 -- claude
 ```
 
-It can also be set in a profile with `network.allow_http2`, which both `nono run` and `nono proxy` honor.
+It can also be set in a profile with `network.allow_http2`, which both `nono run` and `nono proxy` honor. A child profile can set `"allow_http2": false` (or `null`) to override an inherited `true`; omitting the field keeps the parent's value.
+
+The `--allow-http2` CLI flag is still combined with the **resolved** profile value using OR: the flag can enable HTTP/2 but cannot disable a profile that resolved `true`.
 
 When enabled:
 

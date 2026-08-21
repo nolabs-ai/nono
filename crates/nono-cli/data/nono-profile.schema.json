@@ -888,8 +888,11 @@
           "description": "Block network access. Network is allowed by default; set to true to deny all outbound traffic."
         },
         "allow_http2": {
-          "type": "boolean",
-          "description": "Allow HTTP/2 to upstream servers via ALPN negotiation. Defaults to false (HTTP/1.1 with keep-alive). Equivalent to the --allow-http2 CLI flag."
+          "oneOf": [
+            { "type": "boolean" },
+            { "type": "null" }
+          ],
+          "description": "Allow HTTP/2 to upstream servers via ALPN negotiation. When omitted on a root profile, defaults to false (HTTP/1.1 with keep-alive). Absent inherits the parent profile; true/false override; null clears an inherited true. Equivalent to the --allow-http2 CLI flag, which is OR'd with the resolved profile value at launch."
         },
         "network_profile": {
           "oneOf": [

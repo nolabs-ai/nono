@@ -357,8 +357,9 @@ fn build_launch_options(args: &ProxyArgs) -> Result<ProxyLaunchOptions> {
     };
 
     // Enable HTTP/2 to upstreams when requested via the CLI flag or the
-    // profile's `network.allow_http2`, mirroring the sandboxed `run` path.
-    let enable_h2 = args.allow_http2 || network.map(|n| n.allow_http2).unwrap_or(false);
+    // resolved profile `network.allow_http2`, mirroring the sandboxed `run`
+    // path. This OR is CLI-vs-resolved-profile, not profile-to-profile merge.
+    let enable_h2 = args.allow_http2 || network.map(|n| n.resolved_allow_http2()).unwrap_or(false);
 
     Ok(ProxyLaunchOptions {
         domain_filter,
@@ -655,6 +656,65 @@ mod tests {
             .map(crate::profile::AllowDomainEntry::domain)
             .collect();
         assert_eq!(domains, vec!["solo.example.com"]);
+    }
+
+    #[test]
+    fn profile_allow_http2_false_overrides_inherited_true() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _env = cleared_env();
+        let dir = tempfile::tempdir().expect("tmpdir");
+        std::fs::write(
+            dir.path().join("h2-base.json"),
+            r#"{
+                "meta": { "name": "h2-base" },
+                "network": { "allow_http2": true }
+            }"#,
+        )
+        .expect("write base profile");
+        let child_path = dir.path().join("h2-child.json");
+        std::fs::write(
+            &child_path,
+            r#"{
+                "meta": { "name": "h2-child" },
+                "extends": "h2-base",
+                "network": { "allow_http2": false }
+            }"#,
+        )
+        .expect("write child profile");
+
+        let args = parse_args(&["--profile", child_path.to_str().expect("valid utf8")]);
+        let opts = build_launch_options(&args).expect("child profile is valid");
+        assert!(
+            !opts.enable_h2,
+            "child allow_http2:false must disable inherited HTTP/2"
+        );
+    }
+
+    #[test]
+    fn allow_http2_flag_ors_with_resolved_profile_false() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _env = cleared_env();
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let profile_path = dir.path().join("h2-off.json");
+        std::fs::write(
+            &profile_path,
+            r#"{
+                "meta": { "name": "h2-off" },
+                "network": { "allow_http2": false }
+            }"#,
+        )
+        .expect("write profile");
+
+        let args = parse_args(&[
+            "--profile",
+            profile_path.to_str().expect("valid utf8"),
+            "--allow-http2",
+        ]);
+        let opts = build_launch_options(&args).expect("CLI flag with profile false is valid");
+        assert!(
+            opts.enable_h2,
+            "CLI --allow-http2 must still enable HTTP/2 when the resolved profile is false"
+        );
     }
 
     #[test]

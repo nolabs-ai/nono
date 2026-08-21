@@ -91,6 +91,27 @@ fn test_schema_network_config_matches_rust_model() {
 }
 
 #[test]
+fn test_schema_allow_http2_accepts_boolean_or_null() {
+    let schema = load_schema();
+    let allow_http2 = schema
+        .pointer("/$defs/NetworkConfig/properties/allow_http2")
+        .unwrap_or_else(|| panic!("NetworkConfig.allow_http2 must exist"));
+    let one_of = allow_http2
+        .get("oneOf")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("allow_http2 must be oneOf boolean|null"));
+    let types = one_of
+        .iter()
+        .filter_map(|entry| entry.get("type").and_then(Value::as_str))
+        .collect::<BTreeSet<_>>();
+    let expected = ["boolean", "null"].into_iter().collect::<BTreeSet<_>>();
+    assert_eq!(
+        types, expected,
+        "allow_http2 must accept boolean override and null-clear like network_profile"
+    );
+}
+
+#[test]
 fn test_schema_top_level_profile_matches_rust_model() {
     let schema = load_schema();
     assert_properties_at(

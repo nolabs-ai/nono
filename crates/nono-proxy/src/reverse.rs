@@ -28,8 +28,7 @@ use base64::Engine as _;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::io::AsyncReadExt;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tracing::{debug, warn};
@@ -570,8 +569,7 @@ pub async fn handle_reverse_proxy(
 
     let strip_header = cred.map(|c| c.proxy_header_name.as_str()).unwrap_or("");
     let filtered_headers = filter_headers(remaining_header, strip_header);
-    let content_length = extract_content_length(remaining_header);
-    let body = match read_request_body(stream, content_length, buffered_body).await? {
+    let body = match read_request_body(stream, remaining_header, buffered_body).await? {
         Some(body) => body,
         None => return Ok(()),
     };
@@ -848,8 +846,7 @@ async fn handle_spiffe_route(
         remaining_header,
         &[inject_header_str, "Authorization", "x-api-key"],
     );
-    let content_length = extract_content_length(remaining_header);
-    let body = match read_request_body(stream, content_length, buffered_body).await? {
+    let body = match read_request_body(stream, remaining_header, buffered_body).await? {
         Some(body) => body,
         None => return Ok(()),
     };
@@ -882,7 +879,9 @@ async fn handle_spiffe_route(
     }
 
     request.push_str("Connection: close\r\n");
-    if !body.is_empty() {
+    // Always re-frame when the client declared a body (CL or chunked TE),
+    // including empty bodies — otherwise upstreams may answer 411 or hang.
+    if should_reframe_with_content_length(remaining_header) {
         request.push_str(&format!("Content-Length: {}\r\n", body.len()));
     }
     request.push_str("\r\n");
@@ -1484,8 +1483,7 @@ async fn handle_oauth2_like(
         remaining_header,
         &[inject_header, "Authorization", "x-api-key"],
     );
-    let content_length = extract_content_length(remaining_header);
-    let body = match read_request_body(stream, content_length, buffered_body).await? {
+    let body = match read_request_body(stream, remaining_header, buffered_body).await? {
         Some(b) => b,
         None => return Ok(()),
     };
@@ -1611,15 +1609,32 @@ async fn handle_oauth2_credential(
 /// `buffered_body` contains bytes the BufReader read ahead beyond headers.
 /// Generic over the inbound stream so the TLS-intercept handler can reuse
 /// it on a `TlsStream<…>` without duplication.
+///
+/// When `Transfer-Encoding: chunked` is present, the body is decoded from
+/// the stream and returned as a plain buffer (re-framed upstream with
+/// `Content-Length`). Malformed chunk framing yields 400 Bad Request.
 pub(crate) async fn read_request_body<S>(
     stream: &mut S,
-    content_length: Option<usize>,
+    header_bytes: &[u8],
     buffered_body: &[u8],
 ) -> Result<Option<Vec<u8>>>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    if let Some(len) = content_length {
+    if has_chunked_transfer_encoding(header_bytes) {
+        return match read_chunked_request_body(stream, buffered_body).await {
+            Ok(body) => Ok(Some(body)),
+            Err(ProxyError::HttpParse(ref msg)) if msg.contains("exceeds size limit") => {
+                send_error_generic(stream, 413, "Payload Too Large").await?;
+                Ok(None)
+            }
+            Err(_) => {
+                send_error_generic(stream, 400, "Bad Request").await?;
+                Ok(None)
+            }
+        };
+    }
+    if let Some(len) = extract_content_length(header_bytes) {
         if len > MAX_REQUEST_BODY {
             send_error_generic(stream, 413, "Payload Too Large").await?;
             return Ok(None);
@@ -1630,12 +1645,124 @@ where
         let remaining = len - pre;
         if remaining > 0 {
             let mut rest = vec![0u8; remaining];
-            stream.read_exact(&mut rest).await?;
+            stream.read_exact(&mut rest).await.map_err(|e| {
+                ProxyError::HttpParse(format!("truncated Content-Length request body: {e}"))
+            })?;
             buf.extend_from_slice(&rest);
         }
         Ok(Some(buf))
     } else {
         Ok(Some(Vec::new()))
+    }
+}
+
+/// Returns true when headers declare `Transfer-Encoding: chunked`.
+pub(crate) fn has_chunked_transfer_encoding(header_bytes: &[u8]) -> bool {
+    let header_str = match std::str::from_utf8(header_bytes) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    for line in header_str.lines() {
+        if line.to_lowercase().starts_with("transfer-encoding:") {
+            let value = line.split_once(':').map(|(_, v)| v).unwrap_or("");
+            if value
+                .split(',')
+                .any(|part| part.trim().eq_ignore_ascii_case("chunked"))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// True when the inbound request declared a body framing header that we strip
+/// and must re-add as `Content-Length` after decode (including length 0).
+pub(crate) fn should_reframe_with_content_length(header_bytes: &[u8]) -> bool {
+    has_chunked_transfer_encoding(header_bytes) || extract_content_length(header_bytes).is_some()
+}
+
+/// Cap on trailer header lines after the final `0` chunk (DoS bound).
+const MAX_CHUNK_TRAILER_LINES: usize = 64;
+
+async fn read_chunked_request_body<S>(stream: &mut S, buffered_body: &[u8]) -> Result<Vec<u8>>
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    let prefix = std::io::Cursor::new(buffered_body.to_vec());
+    let chained = prefix.chain(stream);
+    let mut reader = BufReader::new(chained);
+    let mut out = Vec::new();
+    let mut total = 0usize;
+    loop {
+        let mut size_line = String::new();
+        if crate::line_reader::read_line_limited_string(
+            &mut reader,
+            &mut size_line,
+            crate::line_reader::MAX_LINE_SIZE,
+        )
+        .await?
+            == 0
+        {
+            return Err(ProxyError::HttpParse(
+                "truncated chunked request".to_string(),
+            ));
+        }
+        let size_text = size_line.trim_end().split(';').next().unwrap_or("");
+        let size = usize::from_str_radix(size_text.trim(), 16)
+            .map_err(|_| ProxyError::HttpParse("invalid chunk size".to_string()))?;
+        total = total
+            .checked_add(size)
+            .ok_or_else(|| ProxyError::HttpParse("chunked request size overflow".to_string()))?;
+        if total > MAX_REQUEST_BODY {
+            return Err(ProxyError::HttpParse(
+                "chunked request exceeds size limit".to_string(),
+            ));
+        }
+        if size > 0 {
+            let mut chunk = vec![0u8; size];
+            reader.read_exact(&mut chunk).await.map_err(|e| {
+                ProxyError::HttpParse(format!("truncated chunked request body: {e}"))
+            })?;
+            let mut crlf = [0u8; 2];
+            reader.read_exact(&mut crlf).await.map_err(|e| {
+                ProxyError::HttpParse(format!("truncated chunked request body: {e}"))
+            })?;
+            if crlf != *b"\r\n" {
+                return Err(ProxyError::HttpParse(
+                    "malformed chunk data terminator".to_string(),
+                ));
+            }
+            out.extend_from_slice(&chunk);
+            continue;
+        }
+        let mut trailer_lines = 0usize;
+        loop {
+            let mut trailer = String::new();
+            if crate::line_reader::read_line_limited_string(
+                &mut reader,
+                &mut trailer,
+                crate::line_reader::MAX_LINE_SIZE,
+            )
+            .await?
+                == 0
+            {
+                return Err(ProxyError::HttpParse(
+                    "truncated chunked request trailers".to_string(),
+                ));
+            }
+            if trailer == "\r\n" || trailer == "\n" {
+                return Ok(out);
+            }
+            trailer_lines = trailer_lines.checked_add(1).ok_or_else(|| {
+                ProxyError::HttpParse("chunked request trailer count overflow".to_string())
+            })?;
+            if trailer_lines > MAX_CHUNK_TRAILER_LINES {
+                return Err(ProxyError::HttpParse(
+                    "too many chunked request trailers".to_string(),
+                ));
+            }
+        }
     }
 }
 
@@ -1843,6 +1970,7 @@ fn validate_phantom_token_basic(
 /// Always strips:
 /// - `Host` (rewritten to upstream)
 /// - `Content-Length` (re-added after body is read)
+/// - `Transfer-Encoding` (body is decoded and re-framed upstream)
 /// - `Proxy-Authorization` (hop-by-hop, contains session token)
 ///
 /// When `cred_header` is non-empty, also strips that header (it contains
@@ -1861,6 +1989,7 @@ pub(crate) fn filter_headers_multi(header_bytes: &[u8], strip: &[&str]) -> Vec<(
         let lower = line.to_lowercase();
         if lower.starts_with("host:")
             || lower.starts_with("content-length:")
+            || lower.starts_with("transfer-encoding:")
             || lower.starts_with("connection:")
             || lower.starts_with("proxy-connection:")
             || lower.starts_with("proxy-authorization:")
@@ -1889,6 +2018,7 @@ pub(crate) fn filter_headers(header_bytes: &[u8], cred_header: &str) -> Vec<(Str
         let lower = line.to_lowercase();
         if lower.starts_with("host:")
             || lower.starts_with("content-length:")
+            || lower.starts_with("transfer-encoding:")
             || lower.starts_with("connection:")
             || lower.starts_with("proxy-connection:")
             || lower.starts_with("proxy-authorization:")
@@ -3142,6 +3272,142 @@ mod tests {
     fn test_extract_content_length_missing() {
         let header = b"Content-Type: application/json\r\n\r\n";
         assert_eq!(extract_content_length(header), None);
+    }
+
+    #[test]
+    fn test_has_chunked_transfer_encoding() {
+        let header = b"Transfer-Encoding: chunked\r\nHost: example.com\r\n\r\n";
+        assert!(has_chunked_transfer_encoding(header));
+        let header = b"Transfer-Encoding: gzip, chunked\r\n\r\n";
+        assert!(has_chunked_transfer_encoding(header));
+        let header = b"Content-Type: application/json\r\n\r\n";
+        assert!(!has_chunked_transfer_encoding(header));
+    }
+
+    #[test]
+    fn test_should_reframe_with_content_length() {
+        assert!(should_reframe_with_content_length(
+            b"Transfer-Encoding: chunked\r\n\r\n"
+        ));
+        assert!(should_reframe_with_content_length(
+            b"Content-Length: 0\r\n\r\n"
+        ));
+        assert!(should_reframe_with_content_length(
+            b"Content-Length: 5\r\n\r\n"
+        ));
+        assert!(!should_reframe_with_content_length(
+            b"Content-Type: text/plain\r\n\r\n"
+        ));
+    }
+
+    #[test]
+    fn test_filter_headers_strips_transfer_encoding() {
+        let header = b"Transfer-Encoding: chunked\r\nContent-Type: text/plain\r\n\r\n";
+        let filtered = filter_headers(header, "");
+        assert!(
+            !filtered
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("transfer-encoding"))
+        );
+        assert!(
+            filtered
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+        );
+    }
+
+    #[tokio::test]
+    async fn read_request_body_decodes_chunked_body() {
+        let headers = b"Transfer-Encoding: chunked\r\n\r\n";
+        let payload = b"hello";
+        let chunked = format!("5\r\n{}\r\n0\r\n\r\n", String::from_utf8_lossy(payload));
+        let (mut client, server) = tokio::io::duplex(4096);
+        client.write_all(chunked.as_bytes()).await.unwrap();
+        drop(client);
+        let mut stream = server;
+        let body = read_request_body(&mut stream, headers, &[])
+            .await
+            .unwrap()
+            .expect("body");
+        assert_eq!(body, payload);
+    }
+
+    #[tokio::test]
+    async fn read_request_body_decodes_empty_chunked_body() {
+        let headers = b"Transfer-Encoding: chunked\r\n\r\n";
+        let (mut client, server) = tokio::io::duplex(64);
+        client.write_all(b"0\r\n\r\n").await.unwrap();
+        drop(client);
+        let mut stream = server;
+        let body = read_request_body(&mut stream, headers, &[])
+            .await
+            .unwrap()
+            .expect("body");
+        assert!(body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn read_request_body_malformed_chunk_returns_none_after_400() {
+        let headers = b"Transfer-Encoding: chunked\r\n\r\n";
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        client.write_all(b"not-hex\r\n").await.unwrap();
+        let read_task =
+            tokio::spawn(async move { read_request_body(&mut server, headers, &[]).await });
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        let result = read_task.await.unwrap().unwrap();
+        assert!(result.is_none());
+        let text = String::from_utf8_lossy(&response);
+        assert!(text.contains("400 Bad Request"));
+    }
+
+    #[tokio::test]
+    async fn read_request_body_content_length_regression() {
+        let headers = b"Content-Length: 5\r\n\r\n";
+        let (mut client, server) = tokio::io::duplex(64);
+        client.write_all(b"hello").await.unwrap();
+        drop(client);
+        let mut stream = server;
+        let body = read_request_body(&mut stream, headers, &[])
+            .await
+            .unwrap()
+            .expect("body");
+        assert_eq!(body, b"hello");
+    }
+
+    #[tokio::test]
+    async fn read_request_body_chunked_uses_buffered_prefix() {
+        let headers = b"Transfer-Encoding: chunked\r\n\r\n";
+        let buffered = b"5\r\nhel";
+        let (mut client, server) = tokio::io::duplex(64);
+        client.write_all(b"lo\r\n0\r\n\r\n").await.unwrap();
+        drop(client);
+        let mut stream = server;
+        let body = read_request_body(&mut stream, headers, buffered)
+            .await
+            .unwrap()
+            .expect("body");
+        assert_eq!(body, b"hello");
+    }
+
+    #[tokio::test]
+    async fn read_request_body_rejects_excessive_trailers() {
+        let headers = b"Transfer-Encoding: chunked\r\n\r\n";
+        let mut payload = String::from("0\r\n");
+        for i in 0..=MAX_CHUNK_TRAILER_LINES {
+            payload.push_str(&format!("X-Trailer-{i}: 1\r\n"));
+        }
+        payload.push_str("\r\n");
+        let (mut client, mut server) = tokio::io::duplex(64 * 1024);
+        client.write_all(payload.as_bytes()).await.unwrap();
+        let read_task =
+            tokio::spawn(async move { read_request_body(&mut server, headers, &[]).await });
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        let result = read_task.await.unwrap().unwrap();
+        assert!(result.is_none());
+        let text = String::from_utf8_lossy(&response);
+        assert!(text.contains("400 Bad Request"));
     }
 
     #[test]

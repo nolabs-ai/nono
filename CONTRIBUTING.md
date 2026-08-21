@@ -1,7 +1,7 @@
 # Contributing to nono
 
-nono is a capability-based sandboxing system for running untrusted AI agents
-with OS-enforced isolation. Contributions are welcome from anyone who
+nono is a capability-based process level sandboxing system for running untrusted AI agents,
+using OS-enforced isolation. Contributions are welcome from anyone who
 understands what they are submitting.
 
 If anything here is unclear, ask in [Discord](https://discord.gg/G6qDa7cC7x)
@@ -51,8 +51,7 @@ value. Rust runs unit tests in parallel; an unrestored env var causes flaky
 failures in unrelated tests.
 
 **Security posture.** On any error, deny access. Never silently degrade to
-a less secure state. No escape hatch: once a sandbox is applied, there is no
-API to expand permissions.
+a less secure state.
 
 ---
 
@@ -233,13 +232,8 @@ with a link to the PR.
 
 ## Scope: What nono Does and Does Not Do
 
-nono applies OS-enforced capability restrictions to sandbox AI agents and
-the tools they call. Once a sandbox is applied, there is no API to expand
-permissions. The policy lives in the profile, not in the prompt.
-
-nono is in alpha. Security guarantees are not yet stable. A third-party
-security audit is planned prior to v1.0. Do not overstate what the current
-implementation guarantees.
+nono applies OS-enforced capability process restrictions to sandbox AI agents and
+the tools they call.
 
 ---
 

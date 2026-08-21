@@ -1,11 +1,16 @@
 ---
 title: Security Model
-description: Tool-level capability control, supervisor trust, and the isolation boundary nono provides
+description: Process level fine-grained capability control, supervisor trust, and the isolation boundary nono provides.
 ---
 
-nono provides fine-grained **capability control** sandboxing, where policy can be enforced down to the level of a system call. This is different from a guest/host isolation boundary sandbox model. It reduces the authority available to a process and any child process it spawns, but it does not create a separate kernel or hardware boundary. It is a capability model, not a VM model.
+## Sandboxing
 
-That distinction is intentional, especially in the context of autonomous agents. An agent needs to use real development tools, reach selected services, and sometimes request additional access. This level of delegation is incompatible with a permanently sealed process model provided by a VM or container.
+Sandboxing is a security technique that runs a workload inside a boundary that limits what it can do and what it can access. Under the term 'Sandbox' there are many different models, everything from a full hypervisor or microVM to a browser tab, process, or even a single function call. The common theme is that the sandboxed process is restricted in what it can do and what it can access.
+
+
+nono provides fine-grained **capability control** sandboxing, where policy can be enforced down to the level of a single file / folder access, network access, or in some cases specific system call. **This is intentionally a different model from a guest/host isolation boundary sandbox model**. It reduces the authority available to a process and any child process it spawns, but it does not create a separate kernel or hardware boundary. It is a capability model, not a VM model.
+
+That distinction is intentional and important to understand, especially in the context of autonomous agents. An agent needs to use real development tools, reach selected services, and sometimes request additional access. This level of delegation is incompatible with a permanently sealed process model provided by a VM or container and in most cases practically impossible to implement with the level of granularity nono provides.
 
 So a model that promises both an absolute, permanently sealed boundary and fine-grained, runtime delegation would be contradictory.
 
@@ -13,9 +18,56 @@ The security goal is therefore:
 
 > Make each grant of authority explicit, narrow, enforceable, and auditable at the point where a process and its child processes spawn.
 
-## The Tool Sandbox Model
+nono answers this question "how do I limit the execution path of a single spawned process and its children?" It does not answer "how do I create a separate kernel or single monolithic hardware boundary?" nono provides the former, and it can be combined with the latter when the deployment requires it.
 
-With `command_policies` enabled, the outer agent session does not inherit every capability required by every tool. Instead, selected command names resolve to nono-managed shims:
+### Capability model vs. isolation model
+
+```mermaid
+flowchart LR
+    subgraph vm["microVM — perimeter isolation"]
+        direction TB
+        VAgent(("Agent"))
+        VFile1["Project files"]
+        VFile2["Unrelated files"]
+        VCred["Credentials"]
+        VProc["Other processes"]
+        VAgent --> VFile1
+        VAgent --> VFile2
+        VAgent --> VCred
+        VAgent --> VProc
+    end
+
+    subgraph nn["nono — capability isolation"]
+        direction TB
+        NAgent(("Agent"))
+        NFile1["Project files<br/>granted"]
+        NFile2["Unrelated files<br/>not granted"]
+        NCred["Credentials<br/>not granted"]
+        NProc["Other processes<br/>not granted"]
+        NAgent --> NFile1
+        NAgent --x NFile2
+        NAgent --x NCred
+        NAgent --x NProc
+    end
+
+    style vm stroke:#dc2626,stroke-width:4px
+    style nn stroke:#2563eb,stroke-width:1px,stroke-dasharray: 4 3
+
+    classDef reachable fill:#059669,color:#fff,stroke:#064e3b;
+    classDef blocked fill:#6b7280,color:#fff,stroke:#374151;
+    classDef flat fill:#f59e0b,color:#000,stroke:#92400e;
+
+    class VFile1,VFile2,VCred,VProc flat
+    class NFile1 reachable
+    class NFile2,NCred,NProc blocked
+```
+
+The perimeter is strong, but once inside it, everything is flat: an agent running in a microVM can freely reach every asset in the box — project files, unrelated files, credentials, other processes — because the guest OS does not itself distinguish between them.
+
+nono does the opposite: it does not add a perimeter around the whole box, but it protects the assets *inside* the agent's own operating context. Each file, credential, and process the agent can reach is the result of an explicit grant; anything not granted stays out of reach even though it runs on the same shared kernel.
+
+## Process Sandboxing and Command Policies
+
 
 1. The agent invokes a selected command such as `git`, `kubectl`, or `curl`.
 2. The shim sends the invocation and caller identity to the trusted supervisor.

@@ -4,7 +4,7 @@ Capability-based sandboxing library using Landlock (Linux) and Seatbelt (macOS).
 
 ## Overview
 
-nono provides OS-enforced sandboxing where unauthorized operations are structurally impossible. Once a sandbox is applied, there is no API to expand permissions - the kernel enforces all restrictions.
+nono provides OS-enforced process level sandboxing. It allows you to restrict filesystem access, network access, and process execution for your application and its child processes.
 
 ## Installation
 
@@ -34,8 +34,7 @@ Sandbox::apply_auto(&caps)?;
 
 - **Landlock** (Linux 5.13+) - Filesystem access control
 - **Seatbelt** (macOS) - Filesystem and network restrictions
-- **No escape hatch** - Once applied, restrictions cannot be lifted
-- **Child process inheritance** - All spawned processes inherit restrictions
+- **Child process inheritance** - All spawned processes inherit restrictions and individual policy may be applied to child processes (tool sandboxing)
 
 ## Platform Support
 

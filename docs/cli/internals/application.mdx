@@ -62,7 +62,6 @@ OS-Level (nono):
 │           User Space                │
 │  ┌──────────────────────────────┐   │
 │  │         Agent Process        │   │
-│  │    (cannot escape sandbox)   │   │
 │  └──────────────────────────────┘   │
 └─────────────────────────────────────┘
 ```
@@ -79,7 +78,7 @@ agent._permission_check = lambda *args: True
 os.system("rm -rf /")  # Bypasses application controls entirely
 ```
 
-**OS-level (nono):** Cannot be modified after application
+**OS-level (nono)**
 
 ```c
 // After sandbox_init() or landlock_restrict_self()

@@ -50,7 +50,8 @@ fn normalize_entry(entry: &str) -> String {
 /// Both must already be normalized (lowercased) the same way, e.g. via
 /// [`normalize_entry`].
 ///
-/// Two wildcard forms are supported:
+/// Three wildcard forms are supported:
+/// - A bare `*` matches any non-empty host, regardless of label count.
 /// - A leading `*.` matches one or more labels (subdomain wildcard):
 ///   `*.example.com` matches `a.example.com` and `a.b.example.com`, but not
 ///   `example.com` itself.
@@ -64,6 +65,11 @@ fn normalize_entry(entry: &str) -> String {
 /// matches anything.
 #[must_use]
 pub fn host_pattern_matches(pattern: &str, host: &str) -> bool {
+    // A bare "*" matches any non-empty host, regardless of label count.
+    if pattern == "*" {
+        return !host.is_empty();
+    }
+
     if let Some(suffix) = pattern.strip_prefix('*') {
         if !suffix.starts_with('.') {
             return false;

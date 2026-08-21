@@ -26,7 +26,7 @@ use crate::command_policy::{
 };
 use nono::{NonoError, Result};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as DeError};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -1128,6 +1128,120 @@ fn validate_profile_custom_credentials(profile: &Profile) -> Result<()> {
         validate_custom_credential(name, cred)?;
     }
     Ok(())
+}
+
+/// Map capability-manifest `credentials[]` into the CLI activation list and
+/// custom route map used by the reverse proxy.
+///
+/// Every entry's name is added to the activation list. Entries whose names are
+/// **not** built-in network-policy services are converted into
+/// [`CustomCredentialDef`] (the inverse of `profile show --format manifest`)
+/// and validated with the same rules as profile `custom_credentials`.
+///
+/// Built-in names keep embedded network-policy routes — inline
+/// upstream/source fields on those entries are ignored so built-in behavior is
+/// unchanged.
+#[must_use = "manifest credential mapping result must be handled"]
+pub(crate) fn credentials_from_manifest(
+    credentials: &[nono::manifest::Credential],
+    builtin_credential_names: &HashSet<String>,
+) -> Result<(Vec<String>, HashMap<String, CustomCredentialDef>)> {
+    let mut names = Vec::with_capacity(credentials.len());
+    let mut custom = HashMap::new();
+
+    for cred in credentials {
+        let name = cred.name.as_str().to_string();
+        if names.iter().any(|existing| existing == &name) {
+            return Err(NonoError::ConfigParse(format!(
+                "duplicate credential name '{name}' in manifest credentials[]"
+            )));
+        }
+        names.push(name.clone());
+
+        if builtin_credential_names.contains(&name) {
+            continue;
+        }
+
+        let custom_def = custom_credential_from_manifest_entry(cred);
+        validate_custom_credential(&name, &custom_def)?;
+        custom.insert(name, custom_def);
+    }
+
+    Ok((names, custom))
+}
+
+/// Convert one manifest credential entry into a profile-side custom route.
+///
+/// Manifest credentials always carry a static `source` (OAuth2 / aws_auth /
+/// spiffe are not representable in the capability-manifest schema yet).
+fn custom_credential_from_manifest_entry(cred: &nono::manifest::Credential) -> CustomCredentialDef {
+    let (
+        inject_mode,
+        inject_header,
+        credential_format,
+        path_pattern,
+        path_replacement,
+        query_param_name,
+    ) = match &cred.inject {
+        Some(inject) => {
+            let inject_mode = match inject.mode {
+                nono::manifest::InjectMode::Header => InjectMode::Header,
+                nono::manifest::InjectMode::UrlPath => InjectMode::UrlPath,
+                nono::manifest::InjectMode::QueryParam => InjectMode::QueryParam,
+                nono::manifest::InjectMode::BasicAuth => InjectMode::BasicAuth,
+            };
+            (
+                inject_mode,
+                inject.header.clone(),
+                Some(inject.format.clone()),
+                inject.path_pattern.clone(),
+                inject.path_replacement.clone(),
+                inject.query_param_name.clone(),
+            )
+        }
+        None => (
+            InjectMode::Header,
+            default_inject_header(),
+            None,
+            None,
+            None,
+            None,
+        ),
+    };
+
+    let endpoint_rules = cred
+        .endpoint_rules
+        .iter()
+        .map(|rule| nono_proxy::config::EndpointRule {
+            method: rule.method.as_str().to_string(),
+            path: rule.path.as_str().to_string(),
+        })
+        .collect();
+
+    CustomCredentialDef {
+        upstream: cred.upstream.as_str().to_string(),
+        credential_key: Some(cred.source.as_str().to_string()),
+        auth: None,
+        inject_mode,
+        inject_header,
+        credential_format,
+        path_pattern,
+        path_replacement,
+        query_param_name,
+        proxy: None,
+        env_var: cred
+            .env_var
+            .as_ref()
+            .map(|value| value.as_str().to_string()),
+        endpoint_rules,
+        endpoint_policy: None,
+        tls_ca: None,
+        tls_client_cert: None,
+        tls_client_key: None,
+        aws_auth: None,
+        spiffe: None,
+        rate_limit: None,
+    }
 }
 
 #[must_use = "network.no_proxy validation result must be handled"]
@@ -5477,6 +5591,146 @@ mod tests {
     fn test_validate_custom_credential_valid() {
         let cred = header_cred_builder();
         assert!(validate_custom_credential("test", &cred).is_ok());
+    }
+
+    /// Issue #1690: manifest credentials with inline routes must become
+    /// custom_credentials entries that resolve_credentials accepts.
+    #[test]
+    fn test_credentials_from_manifest_maps_inline_custom_route() {
+        let json = r#"{
+            "version": "0.1.0",
+            "credentials": [{
+                "name": "my_api",
+                "upstream": "http://127.0.0.1:6335",
+                "source": "file:///tmp/my_api.token",
+                "env_var": "MY_API_PHANTOM",
+                "inject": {
+                    "mode": "header",
+                    "header": "Authorization",
+                    "format": "Bearer {}"
+                }
+            }]
+        }"#;
+        let manifest =
+            nono::manifest::CapabilityManifest::from_json(json).expect("manifest should parse");
+        manifest.validate().expect("manifest should validate");
+
+        let builtin = HashSet::new();
+        let (names, custom) =
+            credentials_from_manifest(&manifest.credentials, &builtin).expect("map credentials");
+
+        assert_eq!(names, vec!["my_api".to_string()]);
+        let route = custom.get("my_api").expect("custom route present");
+        assert_eq!(route.upstream, "http://127.0.0.1:6335");
+        assert_eq!(
+            route.credential_key.as_deref(),
+            Some("file:///tmp/my_api.token")
+        );
+        assert_eq!(route.env_var.as_deref(), Some("MY_API_PHANTOM"));
+        assert_eq!(route.inject_mode, InjectMode::Header);
+        assert_eq!(route.inject_header, "Authorization");
+        assert_eq!(route.credential_format.as_deref(), Some("Bearer {}"));
+
+        // End-to-end: resolve_credentials must accept the mapped route.
+        let net_policy = crate::network_policy::load_network_policy(
+            crate::config::embedded::embedded_network_policy_json(),
+        )
+        .expect("load network policy");
+        let routes = crate::network_policy::resolve_credentials(&net_policy, &names, &custom)
+            .expect("custom route should resolve");
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].prefix, "my_api");
+        assert_eq!(routes[0].upstream, "http://127.0.0.1:6335");
+    }
+
+    /// Built-in service names stay name-only; inline fields do not override
+    /// the embedded network-policy route.
+    #[test]
+    fn test_credentials_from_manifest_builtin_name_not_custom() {
+        let json = r#"{
+            "version": "0.1.0",
+            "credentials": [{
+                "name": "openai",
+                "upstream": "https://example.invalid/override",
+                "source": "env://OPENAI_API_KEY"
+            }]
+        }"#;
+        let manifest =
+            nono::manifest::CapabilityManifest::from_json(json).expect("manifest should parse");
+
+        let builtin: HashSet<String> = ["openai".to_string()].into_iter().collect();
+        let (names, custom) =
+            credentials_from_manifest(&manifest.credentials, &builtin).expect("map credentials");
+
+        assert_eq!(names, vec!["openai".to_string()]);
+        assert!(
+            custom.is_empty(),
+            "built-in names must not create custom_credentials overrides"
+        );
+
+        let net_policy = crate::network_policy::load_network_policy(
+            crate::config::embedded::embedded_network_policy_json(),
+        )
+        .expect("load network policy");
+        let routes = crate::network_policy::resolve_credentials(&net_policy, &names, &custom)
+            .expect("built-in openai should resolve from network policy");
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].prefix, "openai");
+        assert_ne!(
+            routes[0].upstream, "https://example.invalid/override",
+            "built-in route must come from network policy, not manifest override"
+        );
+    }
+
+    /// Fail closed: non-loopback HTTP upstream is rejected with a clear error.
+    #[test]
+    fn test_credentials_from_manifest_rejects_illegal_upstream() {
+        let json = r#"{
+            "version": "0.1.0",
+            "credentials": [{
+                "name": "bad_api",
+                "upstream": "http://api.example.com",
+                "source": "env://BAD_TOKEN"
+            }]
+        }"#;
+        let manifest =
+            nono::manifest::CapabilityManifest::from_json(json).expect("manifest should parse");
+
+        let err = credentials_from_manifest(&manifest.credentials, &HashSet::new())
+            .expect_err("non-loopback HTTP upstream must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("HTTPS") || msg.contains("http"),
+            "error should mention HTTPS/http requirement, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_credentials_from_manifest_rejects_duplicate_names() {
+        let json = r#"{
+            "version": "0.1.0",
+            "credentials": [
+                {
+                    "name": "dup",
+                    "upstream": "https://a.example.com",
+                    "source": "env://A"
+                },
+                {
+                    "name": "dup",
+                    "upstream": "https://b.example.com",
+                    "source": "env://B"
+                }
+            ]
+        }"#;
+        let manifest =
+            nono::manifest::CapabilityManifest::from_json(json).expect("manifest should parse");
+
+        let err = credentials_from_manifest(&manifest.credentials, &HashSet::new())
+            .expect_err("duplicate credential names must be rejected");
+        assert!(
+            err.to_string().contains("duplicate credential name"),
+            "error should mention duplicate name, got: {err}"
+        );
     }
 
     #[test]

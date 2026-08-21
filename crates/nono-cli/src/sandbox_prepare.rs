@@ -1401,11 +1401,16 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
             .into_iter()
             .map(profile::AllowDomainEntry::Plain)
             .collect();
-        let credentials = manifest
-            .credentials
-            .iter()
-            .map(|credential| credential.name.as_str().to_string())
-            .collect();
+        // Map inline manifest credential routes into custom_credentials so
+        // `profile show --format manifest` → `run --config` round-trips.
+        // Built-in network-policy names stay name-only (no route override).
+        let net_policy = network_policy::load_network_policy(
+            crate::config::embedded::embedded_network_policy_json(),
+        )?;
+        let builtin_credential_names: std::collections::HashSet<String> =
+            net_policy.credentials.keys().cloned().collect();
+        let (credentials, custom_credentials) =
+            profile::credentials_from_manifest(&manifest.credentials, &builtin_credential_names)?;
 
         return finalize_prepared_sandbox(
             PreparedSandbox {
@@ -1424,7 +1429,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
                 allow_domain,
                 deny_domain: Vec::new(),
                 credentials,
-                custom_credentials: HashMap::new(),
+                custom_credentials,
                 credential_capture: HashMap::new(),
                 credential_providers: HashMap::new(),
                 credential_routes: Vec::new(),

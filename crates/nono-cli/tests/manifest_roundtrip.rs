@@ -458,6 +458,65 @@ fn manifest_credential_env_var_accepted_and_round_trips() {
     );
 }
 
+/// Issue #1690: custom credential routes in a capability manifest must be
+/// honored by `nono run --config` (not only by `--profile`). Credential
+/// resolution runs when the proxy is configured, so this test avoids
+/// `--dry-run`.
+#[test]
+fn manifest_custom_credential_does_not_unknown_service() {
+    let mut f = tempfile::NamedTempFile::new().expect("create temp file");
+    write!(
+        f,
+        r#"{{
+            "version": "0.1.0",
+            "network": {{
+                "mode": "proxy",
+                "allow_domains": ["api.example.com"]
+            }},
+            "credentials": [{{
+                "name": "my_api",
+                "upstream": "https://api.example.com",
+                "source": "env://MY_API_TOKEN",
+                "env_var": "MY_API_PHANTOM",
+                "inject": {{
+                    "mode": "header",
+                    "header": "Authorization",
+                    "format": "Bearer {{}}"
+                }}
+            }}],
+            "filesystem": {{
+                "grants": [{{ "path": "/tmp", "access": "read" }}]
+            }}
+        }}"#
+    )
+    .expect("write manifest");
+
+    let output = nono_bin()
+        .args([
+            "run",
+            "--silent",
+            "--config",
+            f.path().to_str().expect("path"),
+            "--",
+            "sh",
+            "-c",
+            "echo ok",
+        ])
+        .env("MY_API_TOKEN", "test-token-value")
+        .output()
+        .expect("failed to run nono");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("Unknown credential service"),
+        "inline custom credential must not yield Unknown credential service, stderr: {stderr}"
+    );
+    assert!(
+        output.status.success(),
+        "expected success for --config with inline custom credential, stderr: {stderr}"
+    );
+}
+
 #[test]
 fn manifest_uri_credential_without_env_var_fails_validation() {
     // A credential with an op:// source but no env_var should fail validation

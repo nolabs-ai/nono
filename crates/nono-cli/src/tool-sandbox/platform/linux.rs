@@ -3091,6 +3091,12 @@ fn add_outer_exec_file_with_deps(
     Ok(())
 }
 
+/// Stack a Landlock layer that restricts execute to `paths` and `writable_dirs`.
+///
+/// Also grants bare `Refer` on `/`. Landlock requires Refer in every stacked
+/// layer for rename/link, so omitting it here silently breaks same-FS
+/// renames the outer sandbox already permits (`command_policies` / #1689).
+/// Bare `Refer` alone cannot widen access. Mirrors `restrict_execute`.
 fn apply_outer_exec_gate(
     paths: &[PathBuf],
     writable_dirs: &[PathBuf],
@@ -3112,6 +3118,12 @@ fn apply_outer_exec_gate(
             ))
         })?
         .set_compatibility(CompatLevel::BestEffort)
+        .handle_access(AccessFs::Refer)
+        .map_err(|err| {
+            NonoError::SandboxInit(format!(
+                "tool-sandbox outer exec gate cannot handle Refer: {err}"
+            ))
+        })?
         .create()
         .map_err(|err| {
             NonoError::SandboxInit(format!(
@@ -3150,6 +3162,21 @@ fn apply_outer_exec_gate(
                 NonoError::SandboxInit(format!(
                     "tool-sandbox outer exec gate add_rule for {}: {err}",
                     dir.display()
+                ))
+            })?;
+    }
+
+    if abi.has_refer() {
+        let root_fd = PathFd::new("/").map_err(|err| {
+            NonoError::SandboxInit(format!(
+                "tool-sandbox outer exec gate cannot open / for Refer grant: {err}"
+            ))
+        })?;
+        ruleset = ruleset
+            .add_rule(PathBeneath::new(root_fd, AccessFs::Refer))
+            .map_err(|err| {
+                NonoError::SandboxInit(format!(
+                    "tool-sandbox outer exec gate add_rule for / (Refer): {err}"
                 ))
             })?;
     }
@@ -6031,6 +6058,74 @@ mod tests {
         let result =
             ensure_outer_exec_gate_fully_enforced(landlock::RulesetStatus::PartiallyEnforced);
         assert!(matches!(result, Err(err) if err.to_string().contains("partially enforced")));
+    }
+
+    #[test]
+    fn outer_exec_gate_does_not_break_same_fs_rename_from_child_dir() {
+        // Regression for #1689: stacked outer exec gate must keep Refer so
+        // pending/result.json -> result.json succeeds on the same filesystem.
+        let detected = match nono::detect_abi() {
+            Ok(detected) => detected,
+            Err(_) => return,
+        };
+        if !detected.has_execute() {
+            return;
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "nono-outer-exec-rename-test-{}",
+            std::process::id()
+        ));
+        let pending = root.join("pending");
+        if let Err(err) = std::fs::create_dir_all(&pending) {
+            panic!("create pending dir: {err}");
+        }
+        let src = pending.join("result.json");
+        if let Err(err) = std::fs::write(&src, b"{}") {
+            let _ = std::fs::remove_dir_all(&root);
+            panic!("create pending/result.json: {err}");
+        }
+
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork() failed");
+
+        if pid == 0 {
+            let cap = match FsCapability::new_dir(&root, AccessMode::ReadWrite) {
+                Ok(cap) => cap,
+                Err(_) => unsafe { libc::_exit(2) },
+            };
+            let mut caps = CapabilitySet::new();
+            caps.add_fs(cap);
+
+            if Sandbox::apply_landlock(&caps).is_err() {
+                unsafe { libc::_exit(2) };
+            }
+            if apply_outer_exec_gate(&["/usr/bin".into()], &[], detected).is_err() {
+                unsafe { libc::_exit(3) };
+            }
+
+            let dst = root.join("result.json");
+            match std::fs::rename(&src, &dst) {
+                Ok(()) => unsafe { libc::_exit(0) },
+                Err(_) => unsafe { libc::_exit(1) },
+            }
+        }
+
+        let mut status: i32 = 0;
+        let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(waited, pid, "waitpid() failed");
+        assert!(
+            libc::WIFEXITED(status),
+            "child did not exit normally: status={status}"
+        );
+        let code = libc::WEXITSTATUS(status);
+        assert_eq!(
+            code, 0,
+            "same-FS rename pending/result.json -> result.json failed under stacked outer exec gate \
+             (exit code {code}; 1=rename EXDEV/denied, 2=apply_landlock failed, \
+             3=apply_outer_exec_gate failed)"
+        );
     }
 
     #[test]

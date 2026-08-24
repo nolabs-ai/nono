@@ -5706,6 +5706,7 @@ mod tests {
             ],
             tmp.path(),
             tmp.path(),
+            &CapabilitySet::default(),
         )?;
 
         assert!(
@@ -5926,7 +5927,9 @@ mod tests {
     #[test]
     fn resolve_exec_paths_empty_yields_empty() -> Result<()> {
         let tmp = test_tempdir()?;
-        assert!(resolve_exec_paths(&[], tmp.path(), tmp.path())?.is_empty());
+        assert!(
+            resolve_exec_paths(&[], tmp.path(), tmp.path(), &CapabilitySet::default())?.is_empty()
+        );
         Ok(())
     }
 

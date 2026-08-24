@@ -49,6 +49,7 @@ const STYLES: Styles = Styles::plain().header(Style::new().bold());
   audit      View audit trail of sandboxed commands
   platform   Enroll with and inspect an audit control plane
   trust      Manage file trust and attestation
+  credential Store and inspect keystore credentials used by --credential
 
 \x1b[1mPACKS\x1b[0m
   pull       Install a signed nono pack from the registry
@@ -308,6 +309,25 @@ pub enum Commands {
   nono trust keygen                            # Generate a new signing key pair
 ")]
     Trust(TrustArgs),
+
+    /// Store and inspect keystore credentials used by --credential
+    #[command(subcommand_help_heading = "COMMANDS", disable_help_subcommand = true)]
+    #[command(help_template = "\
+{about}
+
+\x1b[1mUSAGE\x1b[0m
+  nono credential <command>
+
+{all-args}
+{after-help}")]
+    #[command(after_help = "\x1b[1mEXAMPLES\x1b[0m
+  nono credential set openai                   # Prompt for the secret, store it
+  nono credential list                         # Show services, sources, availability
+  nono credential list --profile my-agent      # Include the profile's own services
+  nono credential check openai                 # Verify the credential loads
+  nono credential rm openai                    # Remove a stored credential
+")]
+    Credential(CredentialArgs),
 
     /// List local or remote sandboxed sessions
     #[command(help_template = "\
@@ -3034,6 +3054,110 @@ pub struct TrustExportKeyArgs {
     pub help: Option<bool>,
 }
 
+#[derive(Parser, Debug)]
+#[command(disable_help_flag = true)]
+pub struct CredentialArgs {
+    #[command(subcommand)]
+    pub command: CredentialCommands,
+
+    /// Print help
+    #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
+    pub help: Option<bool>,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum CredentialCommands {
+    /// Store a credential in the system keystore
+    Set(CredentialSetArgs),
+    /// List credential services, their source, and availability
+    List(CredentialListArgs),
+    /// Remove a stored credential from the system keystore
+    #[command(alias = "rm")]
+    Remove(CredentialRmArgs),
+    /// Silently verify a service's credential loads
+    Check(CredentialCheckArgs),
+}
+
+#[derive(Parser, Debug)]
+#[command(disable_help_flag = true)]
+pub struct CredentialSetArgs {
+    /// Credential service name, as passed to --credential
+    #[arg(value_name = "SERVICE", required_unless_present = "account")]
+    pub service: Option<String>,
+
+    /// Write this keystore account instead of the one the service resolves to
+    #[arg(long, value_name = "NAME")]
+    pub account: Option<String>,
+
+    /// Resolve the service against this profile's custom credentials too
+    #[arg(long, value_name = "NAME")]
+    pub profile: Option<String>,
+
+    /// Print help
+    #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
+    pub help: Option<bool>,
+}
+
+#[derive(Parser, Debug)]
+#[command(disable_help_flag = true)]
+pub struct CredentialListArgs {
+    /// Also list the custom credentials defined by this profile
+    #[arg(long, value_name = "NAME")]
+    pub profile: Option<String>,
+
+    /// Output as JSON
+    #[arg(long)]
+    pub json: bool,
+
+    /// Print help
+    #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
+    pub help: Option<bool>,
+}
+
+#[derive(Parser, Debug)]
+#[command(disable_help_flag = true)]
+pub struct CredentialRmArgs {
+    /// Credential service name, as passed to --credential
+    #[arg(value_name = "SERVICE", required_unless_present = "account")]
+    pub service: Option<String>,
+
+    /// Remove this keystore account instead of the one the service resolves to
+    #[arg(long, value_name = "NAME")]
+    pub account: Option<String>,
+
+    /// Resolve the service against this profile's custom credentials too
+    #[arg(long, value_name = "NAME")]
+    pub profile: Option<String>,
+
+    /// Skip the confirmation prompt
+    #[arg(long, short = 'y')]
+    pub yes: bool,
+
+    /// Print help
+    #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
+    pub help: Option<bool>,
+}
+
+#[derive(Parser, Debug)]
+#[command(disable_help_flag = true)]
+pub struct CredentialCheckArgs {
+    /// Credential service name, as passed to --credential
+    #[arg(value_name = "SERVICE", required_unless_present = "account")]
+    pub service: Option<String>,
+
+    /// Check this keystore account instead of the one the service resolves to
+    #[arg(long, value_name = "NAME")]
+    pub account: Option<String>,
+
+    /// Resolve the service against this profile's custom credentials too
+    #[arg(long, value_name = "NAME")]
+    pub profile: Option<String>,
+
+    /// Print help
+    #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
+    pub help: Option<bool>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4602,6 +4726,7 @@ mod tests {
         "audit",
         "platform",
         "trust",
+        "credential",
         "policy",
         "profile",
         "pull",

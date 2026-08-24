@@ -22,6 +22,7 @@ mod completions;
 mod config;
 #[cfg(unix)]
 mod connect_client;
+mod credential_cmd;
 mod credential_runtime;
 mod deprecated_policy;
 mod deprecated_schema;

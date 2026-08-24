@@ -74,6 +74,18 @@ fn keyring_timeout() -> Option<Duration> {
     }
 }
 
+/// What a timed-out keyring call may have left behind.
+#[cfg(feature = "system-keyring")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimeoutEffect {
+    /// A lookup: the abandoned thread changes nothing the caller can observe.
+    Read,
+    /// A write or delete: the abandoned thread may still apply the change
+    /// after the timeout error is returned, so the error must not be reported
+    /// as "the entry is unchanged".
+    Write,
+}
+
 /// Call a blocking keyring function with an optional timeout.
 ///
 /// When `timeout` is `None`, the closure is called inline on the current
@@ -90,7 +102,12 @@ fn keyring_timeout() -> Option<Duration> {
 /// leaks because the `Zeroizing<String>` result is dropped on the thread
 /// side once the channel receiver is gone.
 #[cfg(feature = "system-keyring")]
-fn call_with_keyring_timeout<F, T>(timeout: Option<Duration>, label: &str, f: F) -> Result<T>
+fn call_with_keyring_timeout<F, T>(
+    timeout: Option<Duration>,
+    label: &str,
+    effect: TimeoutEffect,
+    f: F,
+) -> Result<T>
 where
     F: FnOnce() -> Result<T> + Send + 'static,
     T: Send + 'static,
@@ -105,11 +122,20 @@ where
     });
 
     rx.recv_timeout(dur).unwrap_or_else(|_| {
+        let caveat = match effect {
+            TimeoutEffect::Read => "",
+            TimeoutEffect::Write => {
+                " The keychain call cannot be cancelled, so it may still \
+                 apply after this error; re-read the entry before assuming \
+                 it was left unchanged."
+            }
+        };
         Err(NonoError::KeystoreAccess(format!(
-            "{} timed out after {}s waiting for keychain access. \
+            "{} timed out after {}s waiting for keychain access.{} \
              Set NONO_KEYRING_TIMEOUT_SECS=N to adjust (0 = wait forever).",
             label,
-            dur.as_secs()
+            dur.as_secs(),
+            caveat
         )))
     })
 }
@@ -1101,7 +1127,7 @@ fn load_single_secret(service: &str, account: &str) -> Result<Zeroizing<String>>
     let account = account.to_string();
     let label = format!("keyring lookup for '{}'", account);
 
-    call_with_keyring_timeout(timeout, &label, move || {
+    call_with_keyring_timeout(timeout, &label, TimeoutEffect::Read, move || {
         let entry = keyring::Entry::new(&service, &account).map_err(|e| {
             NonoError::KeystoreAccess(format!(
                 "Failed to access keystore for '{}': {}",
@@ -1135,6 +1161,129 @@ fn load_single_secret(_service: &str, account: &str) -> Result<Zeroizing<String>
          cannot load '{}'. Use env://, file://, or op:// credential references instead.",
         account
     )))
+}
+
+/// Error returned by the write helpers when the binary was built without
+/// system keyring support.
+#[cfg(not(feature = "system-keyring"))]
+fn keyring_unavailable(action: &str, account: &str) -> NonoError {
+    NonoError::KeystoreAccess(format!(
+        "system keyring is not available (built without system-keyring feature); \
+         cannot {} '{}'.",
+        action, account
+    ))
+}
+
+/// Store a secret in the system keystore, replacing any existing value.
+#[cfg(feature = "system-keyring")]
+pub fn store_secret(service: &str, account: &str, secret: &str) -> Result<()> {
+    let timeout = keyring_timeout();
+    let service = service.to_string();
+    let account = account.to_string();
+
+    // Sensitive data
+    let secret = Zeroizing::new(secret.to_string());
+    let label = format!("keyring write for '{}'", account);
+
+    call_with_keyring_timeout(timeout, &label, TimeoutEffect::Write, move || {
+        let entry = keyring::Entry::new(&service, &account).map_err(|e| {
+            NonoError::KeystoreAccess(format!(
+                "Failed to access keystore for '{}': {}",
+                account, e
+            ))
+        })?;
+
+        entry
+            .set_password(&secret)
+            .map_err(|e| NonoError::KeystoreAccess(format!("Cannot store '{}': {}", account, e)))?;
+        tracing::debug!("Stored secret '{}'", account);
+        Ok(())
+    })
+}
+
+#[cfg(not(feature = "system-keyring"))]
+pub fn store_secret(_service: &str, account: &str, _secret: &str) -> Result<()> {
+    Err(keyring_unavailable("store", account))
+}
+
+/// Delete a secret from the system keystore.
+///
+/// Returns `false` when no entry existed.
+#[cfg(feature = "system-keyring")]
+pub fn delete_secret(service: &str, account: &str) -> Result<bool> {
+    let timeout = keyring_timeout();
+    let service = service.to_string();
+    let account = account.to_string();
+    let label = format!("keyring delete for '{}'", account);
+
+    call_with_keyring_timeout(timeout, &label, TimeoutEffect::Write, move || {
+        let entry = keyring::Entry::new(&service, &account).map_err(|e| {
+            NonoError::KeystoreAccess(format!(
+                "Failed to access keystore for '{}': {}",
+                account, e
+            ))
+        })?;
+
+        match entry.delete_credential() {
+            Ok(()) => {
+                tracing::debug!("Deleted secret '{}'", account);
+                Ok(true)
+            }
+            Err(keyring::Error::NoEntry) => Ok(false),
+            Err(e) => Err(NonoError::KeystoreAccess(format!(
+                "Cannot delete '{}': {}",
+                account, e
+            ))),
+        }
+    })
+}
+
+#[cfg(not(feature = "system-keyring"))]
+pub fn delete_secret(_service: &str, account: &str) -> Result<bool> {
+    Err(keyring_unavailable("delete", account))
+}
+
+/// Report whether a secret exists in the system keystore.
+#[cfg(feature = "system-keyring")]
+pub fn secret_exists(service: &str, account: &str) -> Result<bool> {
+    let timeout = keyring_timeout();
+    let service = service.to_string();
+    let account = account.to_string();
+    let label = format!("keyring lookup for '{}'", account);
+
+    call_with_keyring_timeout(timeout, &label, TimeoutEffect::Read, move || {
+        let entry = keyring::Entry::new(&service, &account).map_err(|e| {
+            NonoError::KeystoreAccess(format!(
+                "Failed to access keystore for '{}': {}",
+                account, e
+            ))
+        })?;
+
+        match entry.get_password() {
+            Ok(password) => {
+                // Sensitive data
+                drop(Zeroizing::new(password));
+                Ok(true)
+            }
+            Err(keyring::Error::NoEntry) => Ok(false),
+            // An ambiguous entry exists but cannot be loaded, so reporting it
+            // as present would promise an injection that fails at run time.
+            Err(keyring::Error::Ambiguous(creds)) => Err(NonoError::KeystoreAccess(format!(
+                "Multiple entries ({}) found for '{}' - resolve manually",
+                creds.len(),
+                account
+            ))),
+            Err(e) => Err(NonoError::KeystoreAccess(format!(
+                "Cannot access '{}': {}",
+                account, e
+            ))),
+        }
+    })
+}
+
+#[cfg(not(feature = "system-keyring"))]
+pub fn secret_exists(_service: &str, account: &str) -> Result<bool> {
+    Err(keyring_unavailable("check", account))
 }
 
 /// Load a secret from 1Password using the `op` CLI.
@@ -1481,7 +1630,7 @@ fn load_from_keyring_uri(uri: &str) -> Result<Zeroizing<String>> {
     let redacted_clone = redacted.clone();
     let label = format!("keyring lookup for '{}'", redacted);
 
-    call_with_keyring_timeout(timeout, &label, move || {
+    call_with_keyring_timeout(timeout, &label, TimeoutEffect::Read, move || {
         let entry = keyring::Entry::new(&service, &account).map_err(|e| {
             NonoError::KeystoreAccess(format!(
                 "Failed to access keyring for '{}': {}",
@@ -3849,27 +3998,60 @@ mod tests {
         #[test]
         fn call_with_keyring_timeout_none_runs_inline() {
             // None = no timeout; closure runs directly, no thread spawned
-            let result: Result<u32> = call_with_keyring_timeout(None, "test", || Ok(42_u32));
+            let result: Result<u32> =
+                call_with_keyring_timeout(None, "test", TimeoutEffect::Read, || Ok(42_u32));
             assert_eq!(result.unwrap(), 42);
         }
 
         #[test]
         fn call_with_keyring_timeout_fast_call_returns_value() {
-            let result: Result<u32> =
-                call_with_keyring_timeout(Some(Duration::from_secs(5)), "test", || Ok(99_u32));
+            let result: Result<u32> = call_with_keyring_timeout(
+                Some(Duration::from_secs(5)),
+                "test",
+                TimeoutEffect::Read,
+                || Ok(99_u32),
+            );
             assert_eq!(result.unwrap(), 99);
         }
 
         #[test]
         fn call_with_keyring_timeout_slow_call_fires() {
-            let result: Result<u32> =
-                call_with_keyring_timeout(Some(Duration::from_millis(50)), "slow-test", || {
+            let result: Result<u32> = call_with_keyring_timeout(
+                Some(Duration::from_millis(50)),
+                "slow-test",
+                TimeoutEffect::Read,
+                || {
                     std::thread::sleep(Duration::from_secs(10));
                     Ok(0_u32)
-                });
+                },
+            );
             let err = result.unwrap_err().to_string();
             assert!(
                 err.contains("timed out") && err.contains("NONO_KEYRING_TIMEOUT_SECS"),
+                "got: {}",
+                err
+            );
+            assert!(
+                !err.contains("cannot be cancelled"),
+                "a read leaves nothing behind: {}",
+                err
+            );
+        }
+
+        #[test]
+        fn call_with_keyring_timeout_write_reports_an_ambiguous_outcome() {
+            let result: Result<u32> = call_with_keyring_timeout(
+                Some(Duration::from_millis(50)),
+                "keyring write for 'openai'",
+                TimeoutEffect::Write,
+                || {
+                    std::thread::sleep(Duration::from_secs(10));
+                    Ok(0_u32)
+                },
+            );
+            let err = result.unwrap_err().to_string();
+            assert!(
+                err.contains("may still apply after this error"),
                 "got: {}",
                 err
             );
@@ -4064,5 +4246,183 @@ mod tests {
     fn test_build_mappings_file_uri_without_var_name_is_error() {
         let result = build_mappings_from_list("file:///run/secrets/api-token");
         assert!(result.is_err());
+    }
+
+    #[cfg(feature = "system-keyring")]
+    mod secret_write_tests {
+        use super::*;
+        use keyring::credential::{
+            Credential, CredentialApi, CredentialBuilderApi, CredentialPersistence,
+        };
+        use std::collections::HashMap;
+        use std::sync::{Mutex, Once, OnceLock};
+
+        type FakeStore = Mutex<HashMap<(String, String), Vec<u8>>>;
+
+        fn store() -> &'static FakeStore {
+            static STORE: OnceLock<FakeStore> = OnceLock::new();
+            STORE.get_or_init(|| Mutex::new(HashMap::new()))
+        }
+
+        /// A keyring backend that persists across `Entry` instances.
+        struct FakeCredential {
+            key: (String, String),
+        }
+
+        impl CredentialApi for FakeCredential {
+            fn set_secret(&self, secret: &[u8]) -> keyring::Result<()> {
+                let mut store = store()
+                    .lock()
+                    .expect("no test panics while holding the lock");
+                store.insert(self.key.clone(), secret.to_vec());
+                Ok(())
+            }
+
+            fn get_secret(&self) -> keyring::Result<Vec<u8>> {
+                let store = store()
+                    .lock()
+                    .expect("no test panics while holding the lock");
+                store.get(&self.key).cloned().ok_or(keyring::Error::NoEntry)
+            }
+
+            fn delete_credential(&self) -> keyring::Result<()> {
+                let mut store = store()
+                    .lock()
+                    .expect("no test panics while holding the lock");
+                match store.remove(&self.key) {
+                    Some(_) => Ok(()),
+                    None => Err(keyring::Error::NoEntry),
+                }
+            }
+
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+
+        struct FakeBuilder;
+
+        impl CredentialBuilderApi for FakeBuilder {
+            fn build(
+                &self,
+                _target: Option<&str>,
+                service: &str,
+                user: &str,
+            ) -> keyring::Result<Box<Credential>> {
+                Ok(Box::new(FakeCredential {
+                    key: (service.to_string(), user.to_string()),
+                }))
+            }
+
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+
+            fn persistence(&self) -> CredentialPersistence {
+                CredentialPersistence::ProcessOnly
+            }
+        }
+
+        /// Redirect every `keyring::Entry` in this process at the fake store.
+        fn install_fake_keyring() {
+            static INSTALL: Once = Once::new();
+            INSTALL.call_once(|| keyring::set_default_credential_builder(Box::new(FakeBuilder)));
+        }
+
+        #[test]
+        fn store_secret_writes_the_entry_load_reads() {
+            install_fake_keyring();
+            let account = "roundtrip-account";
+
+            store_secret(DEFAULT_SERVICE, account, "sk-test-value")
+                .expect("fake keyring accepts writes");
+            let loaded =
+                load_single_secret(DEFAULT_SERVICE, account).expect("stored secret should load");
+
+            assert_eq!(loaded.as_str(), "sk-test-value");
+        }
+
+        #[test]
+        fn store_secret_replaces_an_existing_value() {
+            install_fake_keyring();
+            let account = "replace-account";
+
+            store_secret(DEFAULT_SERVICE, account, "first").expect("fake keyring accepts writes");
+            store_secret(DEFAULT_SERVICE, account, "second").expect("fake keyring accepts writes");
+            let loaded =
+                load_single_secret(DEFAULT_SERVICE, account).expect("stored secret should load");
+
+            assert_eq!(loaded.as_str(), "second");
+        }
+
+        #[test]
+        fn secret_exists_follows_the_write_and_the_delete() {
+            install_fake_keyring();
+            let account = "exists-account";
+
+            assert!(!secret_exists(DEFAULT_SERVICE, account).expect("probe should not error"));
+            store_secret(DEFAULT_SERVICE, account, "value").expect("fake keyring accepts writes");
+            assert!(secret_exists(DEFAULT_SERVICE, account).expect("probe should not error"));
+            delete_secret(DEFAULT_SERVICE, account).expect("delete should not error");
+            assert!(!secret_exists(DEFAULT_SERVICE, account).expect("probe should not error"));
+        }
+
+        #[test]
+        fn delete_secret_reports_whether_an_entry_was_removed() {
+            install_fake_keyring();
+            let account = "delete-account";
+
+            store_secret(DEFAULT_SERVICE, account, "value").expect("fake keyring accepts writes");
+            assert!(
+                delete_secret(DEFAULT_SERVICE, account).expect("delete should not error"),
+                "removing a stored entry reports true"
+            );
+            assert!(
+                !delete_secret(DEFAULT_SERVICE, account).expect("delete should not error"),
+                "a missing entry is a no-op, not an error"
+            );
+        }
+
+        #[test]
+        fn entries_are_scoped_by_keystore_service() {
+            install_fake_keyring();
+            let account = "scoped-account";
+
+            store_secret("gh:github.com", account, "gh-value")
+                .expect("fake keyring accepts writes");
+
+            assert!(secret_exists("gh:github.com", account).expect("probe should not error"));
+            assert!(
+                !secret_exists(DEFAULT_SERVICE, account).expect("probe should not error"),
+                "a custom keyring:// service must not alias the default service"
+            );
+        }
+    }
+
+    #[cfg(not(feature = "system-keyring"))]
+    mod secret_write_unavailable_tests {
+        use super::*;
+
+        #[test]
+        fn store_secret_reports_the_missing_feature() {
+            let err = store_secret(DEFAULT_SERVICE, "openai", "value")
+                .expect_err("no keyring backend is compiled in");
+            assert!(err.to_string().contains("system-keyring"), "got: {}", err);
+            assert!(err.to_string().contains("openai"), "got: {}", err);
+        }
+
+        #[test]
+        fn delete_secret_reports_the_missing_feature() {
+            let err = delete_secret(DEFAULT_SERVICE, "openai")
+                .expect_err("no keyring backend is compiled in");
+            assert!(err.to_string().contains("system-keyring"), "got: {}", err);
+        }
+
+        #[test]
+        fn secret_exists_reports_the_missing_feature() {
+            let err = secret_exists(DEFAULT_SERVICE, "openai")
+                .expect_err("no keyring backend is compiled in");
+            assert!(err.to_string().contains("system-keyring"), "got: {}", err);
+        }
     }
 }

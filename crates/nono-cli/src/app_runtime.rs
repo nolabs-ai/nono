@@ -2,6 +2,7 @@ use crate::audit_commands;
 use crate::cli::{Cli, Commands, RunArgs, SetupArgs};
 use crate::command_runtime::{run_sandbox, run_shell, run_wrap};
 use crate::completions::run_completions;
+use crate::credential_cmd;
 use crate::deprecated_policy;
 use crate::open_url_runtime::run_open_url_helper;
 use crate::output;
@@ -62,6 +63,9 @@ fn dispatch_command(
         Commands::Trust(args) => {
             run_command_with_update(update_handle, silent, || trust_cmd::run_trust(args))
         }
+        Commands::Credential(args) => run_command_with_update(update_handle, silent, || {
+            credential_cmd::run_credential(args)
+        }),
         Commands::Audit(args) => {
             run_command_with_update(update_handle, silent, || audit_commands::run_audit(args))
         }

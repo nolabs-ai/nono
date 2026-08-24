@@ -76,14 +76,8 @@ nono run --profile nolabs-ai/opencode -- opencode
 
 Load your AI provider API key from the system keystore instead of environment exports:
 
-**macOS:**
 ```bash
-security add-generic-password -s "nono" -a "openai_api_key" -w
-```
-
-**Linux:**
-```bash
-secret-tool store --label="nono: openai_api_key" service nono username openai_api_key
+nono credential set --account openai_api_key
 ```
 
 Then run:

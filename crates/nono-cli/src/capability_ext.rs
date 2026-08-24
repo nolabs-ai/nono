@@ -38,7 +38,11 @@ use tracing::{debug, info, warn};
 
 // Platform-specific cfg fallbacks (placed here after all use statements)
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn expand_dynamic_tokens(entries: &[String], _workdir: Option<&Path>) -> nono::Result<Vec<String>> {
+fn expand_dynamic_tokens(
+    entries: &[String],
+    _workdir: Option<&Path>,
+    _outer_caps: &CapabilitySet,
+) -> nono::Result<Vec<String>> {
     Ok(entries.to_vec())
 }
 
@@ -695,42 +699,49 @@ impl CapabilitySetExt for CapabilitySet {
 
         // Expand a list of path templates (may contain globs) and add a filesystem
         // capability for each resolved path, dispatching file vs dir automatically.
+        // Expand and add one template at a time, rather than expanding the
+        // whole list up front, so a literal grant earlier in the list is
+        // already in `caps` (and sanitizes PATH) by the time a `@git:*`
+        // token later in the same list spawns git.
         let mut add_fs_paths = |templates: &[String], mode: AccessMode| -> Result<()> {
-            let expanded = expand_dynamic_tokens(templates, Some(workdir))?;
-            for path_template in &expanded {
-                let pre = expand_path(path_template, workdir)?;
-                let pre_str = policy::path_to_utf8(&pre)?;
-                let paths = if pre_str.contains('*') {
-                    policy::expand_glob_path(&abs_glob(pre_str, workdir))?
-                } else {
-                    vec![pre]
-                };
-                for path in paths {
-                    let label =
-                        format!("Profile path '{}' does not exist, skipping", path_template);
-                    let is_file = std::fs::metadata(&path)
-                        .map(|m| !m.is_dir())
-                        .unwrap_or(false);
-                    let maybe_cap = if is_file {
-                        validate_requested_file(
-                            &path,
-                            "Profile",
-                            &protected_roots,
-                            allow_parent_of_protected,
-                        )?;
-                        try_new_file(&path, mode, &label)?
+            for template in templates {
+                let expanded =
+                    expand_dynamic_tokens(std::slice::from_ref(template), Some(workdir), &caps)?;
+                for path_template in &expanded {
+                    let pre = expand_path(path_template, workdir)?;
+                    let pre_str = policy::path_to_utf8(&pre)?;
+                    let paths = if pre_str.contains('*') {
+                        policy::expand_glob_path(&abs_glob(pre_str, workdir))?
                     } else {
-                        validate_requested_dir(
-                            &path,
-                            "Profile",
-                            &protected_roots,
-                            allow_parent_of_protected,
-                        )?;
-                        try_new_dir(&path, mode, &label)?
+                        vec![pre]
                     };
-                    if let Some(mut cap) = maybe_cap {
-                        cap.source = CapabilitySource::Profile;
-                        caps.add_fs(cap);
+                    for path in paths {
+                        let label =
+                            format!("Profile path '{}' does not exist, skipping", path_template);
+                        let is_file = std::fs::metadata(&path)
+                            .map(|m| !m.is_dir())
+                            .unwrap_or(false);
+                        let maybe_cap = if is_file {
+                            validate_requested_file(
+                                &path,
+                                "Profile",
+                                &protected_roots,
+                                allow_parent_of_protected,
+                            )?;
+                            try_new_file(&path, mode, &label)?
+                        } else {
+                            validate_requested_dir(
+                                &path,
+                                "Profile",
+                                &protected_roots,
+                                allow_parent_of_protected,
+                            )?;
+                            try_new_dir(&path, mode, &label)?
+                        };
+                        if let Some(mut cap) = maybe_cap {
+                            cap.source = CapabilitySource::Profile;
+                            caps.add_fs(cap);
+                        }
                     }
                 }
             }
@@ -741,58 +752,69 @@ impl CapabilitySetExt for CapabilitySet {
         add_fs_paths(&fs.read, AccessMode::Read)?;
         add_fs_paths(&fs.write, AccessMode::Write)?;
 
-        // Single files with read+write access
-        let allow_file_expanded = expand_dynamic_tokens(&fs.allow_file, Some(workdir))?;
-        for path_template in &allow_file_expanded {
-            let path = expand_path(path_template, workdir)?;
-            let label = format!("Profile file '{}' does not exist, skipping", path_template);
-            if let Some(mut cap) = try_new_profile_exact_path(
-                &path,
-                AccessMode::ReadWrite,
-                &label,
-                &protected_roots,
-                allow_parent_of_protected,
-            )? {
-                // Also allow atomic-write temp files (e.g. .claude.json.tmp.PID.TS).
-                // Many tools write to a temp file then rename for crash safety.
-                add_atomic_write_rule(&mut caps, &cap)?;
-                cap.source = CapabilitySource::Profile;
-                caps.add_fs(cap);
+        // Single files with read+write access. Expanded one template at a
+        // time (see `add_fs_paths` above) so earlier grants in the list are
+        // visible to later `@git:*` tokens.
+        for template in &fs.allow_file {
+            let expanded =
+                expand_dynamic_tokens(std::slice::from_ref(template), Some(workdir), &caps)?;
+            for path_template in &expanded {
+                let path = expand_path(path_template, workdir)?;
+                let label = format!("Profile file '{}' does not exist, skipping", path_template);
+                if let Some(mut cap) = try_new_profile_exact_path(
+                    &path,
+                    AccessMode::ReadWrite,
+                    &label,
+                    &protected_roots,
+                    allow_parent_of_protected,
+                )? {
+                    // Also allow atomic-write temp files (e.g. .claude.json.tmp.PID.TS).
+                    // Many tools write to a temp file then rename for crash safety.
+                    add_atomic_write_rule(&mut caps, &cap)?;
+                    cap.source = CapabilitySource::Profile;
+                    caps.add_fs(cap);
+                }
             }
         }
 
         // Single files with read-only access
-        let read_file_expanded = expand_dynamic_tokens(&fs.read_file, Some(workdir))?;
-        for path_template in &read_file_expanded {
-            let path = expand_path(path_template, workdir)?;
-            let label = format!("Profile file '{}' does not exist, skipping", path_template);
-            if let Some(mut cap) = try_new_profile_exact_path(
-                &path,
-                AccessMode::Read,
-                &label,
-                &protected_roots,
-                allow_parent_of_protected,
-            )? {
-                cap.source = CapabilitySource::Profile;
-                caps.add_fs(cap);
+        for template in &fs.read_file {
+            let expanded =
+                expand_dynamic_tokens(std::slice::from_ref(template), Some(workdir), &caps)?;
+            for path_template in &expanded {
+                let path = expand_path(path_template, workdir)?;
+                let label = format!("Profile file '{}' does not exist, skipping", path_template);
+                if let Some(mut cap) = try_new_profile_exact_path(
+                    &path,
+                    AccessMode::Read,
+                    &label,
+                    &protected_roots,
+                    allow_parent_of_protected,
+                )? {
+                    cap.source = CapabilitySource::Profile;
+                    caps.add_fs(cap);
+                }
             }
         }
 
         // Single files with write-only access
-        let write_file_expanded = expand_dynamic_tokens(&fs.write_file, Some(workdir))?;
-        for path_template in &write_file_expanded {
-            let path = expand_path(path_template, workdir)?;
-            let label = format!("Profile file '{}' does not exist, skipping", path_template);
-            if let Some(mut cap) = try_new_profile_exact_path(
-                &path,
-                AccessMode::Write,
-                &label,
-                &protected_roots,
-                allow_parent_of_protected,
-            )? {
-                add_atomic_write_rule(&mut caps, &cap)?;
-                cap.source = CapabilitySource::Profile;
-                caps.add_fs(cap);
+        for template in &fs.write_file {
+            let expanded =
+                expand_dynamic_tokens(std::slice::from_ref(template), Some(workdir), &caps)?;
+            for path_template in &expanded {
+                let path = expand_path(path_template, workdir)?;
+                let label = format!("Profile file '{}' does not exist, skipping", path_template);
+                if let Some(mut cap) = try_new_profile_exact_path(
+                    &path,
+                    AccessMode::Write,
+                    &label,
+                    &protected_roots,
+                    allow_parent_of_protected,
+                )? {
+                    add_atomic_write_rule(&mut caps, &cap)?;
+                    cap.source = CapabilitySource::Profile;
+                    caps.add_fs(cap);
+                }
             }
         }
 
@@ -984,7 +1006,7 @@ impl CapabilitySetExt for CapabilitySet {
         // drain sources `filesystem.allow` / `.read` / `.write`). The core
         // allow/read/write entries are already applied above — these branches
         // apply the remaining deny and deny-command surfaces.
-        let deny_expanded = expand_dynamic_tokens(&profile.filesystem.deny, Some(workdir))?;
+        let deny_expanded = expand_dynamic_tokens(&profile.filesystem.deny, Some(workdir), &caps)?;
         for path_template in &deny_expanded {
             let path = expand_path(path_template, workdir)?;
             let path_str = policy::path_to_utf8(&path)?;
@@ -1075,7 +1097,7 @@ impl CapabilitySetExt for CapabilitySet {
         // so `nono -v ...` and the diagnostic footer surface the typo,
         // while keeping the security posture unchanged.
         let bypass_expanded =
-            expand_dynamic_tokens(&profile.filesystem.bypass_protection, Some(workdir))?;
+            expand_dynamic_tokens(&profile.filesystem.bypass_protection, Some(workdir), &caps)?;
         let mut profile_overrides = Vec::with_capacity(bypass_expanded.len());
         for path_template in &bypass_expanded {
             let pre = expand_path(path_template, workdir)?;
@@ -3499,5 +3521,76 @@ mod tests {
             "$VAR in fs.allow should expand to the real path"
         );
         assert_eq!(fs_matches[0].access, AccessMode::ReadWrite);
+    }
+
+    /// Regression test for a real gap found via live manual pentest: `fs.allow`
+    /// used to expand every template in one batch call before adding any of
+    /// them to `caps`, so a writable-dir grant listed *before* a `@git:*`
+    /// token in the same list still wasn't visible when that token sanitized
+    /// PATH. A trojan `git` planted in that writable dir was executed by the
+    /// host, unsandboxed. Fixed by expanding templates one at a time so
+    /// earlier grants land in `caps` before later tokens spawn anything.
+    #[test]
+    fn test_from_profile_git_token_sees_earlier_writable_grant_in_same_fs_allow_list() {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+
+        let tmp = tempfile::TempDir::new_in(
+            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+        )
+        .expect("tmpdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("create repo");
+        let repo_str = repo.to_str().expect("utf8");
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", repo_str])
+                .status()
+                .expect("git init")
+                .success()
+        );
+
+        // A directory the sandbox will be granted write access to, planted
+        // with a trojan `git` that writes a marker if ever executed.
+        let writable_dir = tmp.path().join("writable_path_dir");
+        std::fs::create_dir_all(&writable_dir).expect("create writable dir");
+        let marker = tmp.path().join("marker");
+        let trojan = writable_dir.join("git");
+        std::fs::write(
+            &trojan,
+            format!("#!/bin/sh\ntouch {}\nexit 1\n", marker.display()),
+        )
+        .expect("write trojan");
+        let mut perms = std::fs::metadata(&trojan).expect("meta").permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&trojan, perms).expect("chmod");
+
+        let real_path = std::env::var("PATH").unwrap_or_default();
+        let poisoned_path = format!("{}:{real_path}", writable_dir.display());
+        let _env = crate::test_env::EnvVarGuard::set_all(&[("PATH", &poisoned_path)]);
+
+        let profile_dir = tmp.path().join("profile");
+        std::fs::create_dir_all(&profile_dir).expect("create profile dir");
+        let profile_path = profile_dir.join("test.json");
+        std::fs::write(
+            &profile_path,
+            format!(
+                r#"{{"meta":{{"name":"test"}},"filesystem":{{"allow":["{}", "@git:config-files"]}}}}"#,
+                writable_dir.display()
+            ),
+        )
+        .expect("write profile");
+        let profile = crate::profile::load_profile_from_path(&profile_path).expect("load profile");
+
+        // Direct from_profile call: we already hold ENV_LOCK.
+        CapabilitySet::from_profile(&profile, &repo, &sandbox_args()).expect("from_profile");
+
+        assert!(
+            !marker.exists(),
+            "trojan git in a directory granted write access earlier in the same \
+             filesystem.allow list must not run when a later @git:* token resolves"
+        );
     }
 }

@@ -195,6 +195,85 @@ mod tests {
             .expect("127.0.0.1 must be allowed when allow_localhost is true");
     }
 
+    /// Live manual/regression test: plant a trojan `open`/`xdg-open` in a
+    /// directory the sandbox has write access to, and confirm
+    /// `open_url_in_browser` doesn't execute it. A real fallback binary
+    /// sits in a separate, non-granted directory so the sanitized PATH still
+    /// resolves to something real.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn open_url_in_browser_skips_trojan_in_writable_path_dir() {
+        use nono::{AccessMode, CapabilitySource, FsCapability};
+        use std::os::unix::fs::PermissionsExt;
+
+        #[cfg(target_os = "macos")]
+        const OPENER: &str = "open";
+        #[cfg(target_os = "linux")]
+        const OPENER: &str = "xdg-open";
+
+        let root = tempfile::tempdir().expect("tempdir");
+
+        let writable_dir = root.path().join("writable_path_dir");
+        std::fs::create_dir_all(&writable_dir).expect("mkdir writable");
+        let marker = root.path().join("marker");
+        let trojan = writable_dir.join(OPENER);
+        std::fs::write(
+            &trojan,
+            format!("#!/bin/sh\n/usr/bin/touch {}\nexit 0\n", marker.display()),
+        )
+        .expect("write trojan");
+        let mut perms = std::fs::metadata(&trojan).expect("meta").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&trojan, perms).expect("chmod trojan");
+
+        // A real fallback binary in a directory the sandbox has no grant on
+        // at all, standing in for the real `open`/`xdg-open` so we don't
+        // launch an actual browser during the test.
+        let real_dir = root.path().join("real_bin_dir");
+        std::fs::create_dir_all(&real_dir).expect("mkdir real");
+        let real_marker = root.path().join("real_marker");
+        let real_bin = real_dir.join(OPENER);
+        std::fs::write(
+            &real_bin,
+            format!(
+                "#!/bin/sh\n/usr/bin/touch {}\nexit 0\n",
+                real_marker.display()
+            ),
+        )
+        .expect("write real bin");
+        let mut perms = std::fs::metadata(&real_bin).expect("meta").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&real_bin, perms).expect("chmod real");
+
+        let mut caps = nono::CapabilitySet::new();
+        caps.add_fs(FsCapability {
+            original: writable_dir.clone(),
+            resolved: nono::try_canonicalize(&writable_dir),
+            access: AccessMode::Write,
+            is_file: false,
+            source: CapabilitySource::User,
+        });
+
+        let poisoned_path = format!("{}:{}", writable_dir.display(), real_dir.display());
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let _env = crate::test_env::EnvVarGuard::set_all(&[("PATH", &poisoned_path)]);
+
+        open_url_in_browser("https://example.com/callback", &caps)
+            .expect("real fallback binary should run and succeed");
+
+        assert!(
+            !marker.exists(),
+            "trojan {OPENER} in a sandbox-writable PATH dir must not run"
+        );
+        assert!(
+            real_marker.exists(),
+            "the real (fallback) {OPENER} binary should have run instead"
+        );
+    }
+
     #[test]
     fn origin_includes_port() {
         // A listed origin without a port must not match a URL with a port.

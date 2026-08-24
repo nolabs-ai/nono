@@ -67,6 +67,15 @@ fn is_entry_safe(entry: &Path, outer_caps: &CapabilitySet) -> bool {
     if entry.as_os_str().is_empty() || entry.is_relative() {
         return false;
     }
+    // An embedded NUL makes `symlink_metadata` fail with `InvalidInput`,
+    // which `walk_chain` would otherwise treat as "resolved, nothing
+    // writable" via its catch-all arm. Reject it explicitly rather than
+    // relying on that fallthrough, since callers may not always pass the
+    // result straight to `Command::env` (which independently rejects a NUL
+    // in an env value rather than truncating it).
+    if entry.as_os_str().as_encoded_bytes().contains(&0) {
+        return false;
+    }
     matches!(walk_chain(entry, outer_caps), Some(false))
 }
 
@@ -489,17 +498,16 @@ mod tests {
 
     #[test]
     fn drops_entry_with_null_byte_gracefully() {
-        // A PATH entry that can't exist as a real filesystem path (embedded
-        // NUL) must be dropped, not panic the sanitizer.
+        // An embedded NUL must be rejected explicitly, not left to whatever
+        // a downstream `symlink_metadata`/`Command::env` call happens to do
+        // with it.
         let caps = CapabilitySet::new();
         #[cfg(unix)]
         {
             use std::os::unix::ffi::OsStrExt;
             let raw = std::ffi::OsStr::from_bytes(b"/tmp/evil\0dir");
             let path_value = raw.to_string_lossy().into_owned();
-            // Just must not panic; result content is not asserted since the
-            // NUL makes this an invalid path on the OS level either way.
-            let _ = sanitize_broker_path(&path_value, &caps);
+            assert_eq!(sanitize_broker_path(&path_value, &caps), "");
         }
     }
 

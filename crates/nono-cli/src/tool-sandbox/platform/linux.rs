@@ -3452,7 +3452,12 @@ fn build_child_launch_spec_for_binary(
     }
     // Let multi-call tools (e.g. git) exec the helpers they invoke by
     // absolute path.
-    for path in resolve_exec_paths(&policy.exec_paths, &state.policy_root, &cwd)? {
+    for path in resolve_exec_paths(
+        &policy.exec_paths,
+        &state.policy_root,
+        &cwd,
+        &state.outer_caps,
+    )? {
         allowed_exec_paths.push(path.as_os_str().as_bytes().to_vec());
     }
 
@@ -3773,20 +3778,20 @@ fn add_policy_fs(
     // `@git:*` tokens run git in the command's live cwd so they resolve to the
     // repo the command is actually operating in (e.g. its worktree / .git
     // common-dir), not the repo the agent was launched in.
-    for entry in &expand_dynamic_tokens(&policy.fs_read, Some(cwd))? {
+    for entry in &expand_dynamic_tokens(&policy.fs_read, Some(cwd), outer_caps)? {
         let path = resolve_policy_path(entry, policy_root, cwd)?;
         add_optional_dir(caps, path, AccessMode::Read)?;
     }
-    for entry in &expand_dynamic_tokens(&policy.fs_write, Some(cwd))? {
+    for entry in &expand_dynamic_tokens(&policy.fs_write, Some(cwd), outer_caps)? {
         let path = resolve_policy_path(entry, policy_root, cwd)?;
         let access = write_access(&path);
         add_optional_dir(caps, path, access)?;
     }
-    for entry in &expand_dynamic_tokens(&policy.fs_read_file, Some(cwd))? {
+    for entry in &expand_dynamic_tokens(&policy.fs_read_file, Some(cwd), outer_caps)? {
         let path = resolve_policy_path(entry, policy_root, cwd)?;
         add_optional_read_file(caps, path)?;
     }
-    for entry in &expand_dynamic_tokens(&policy.fs_write_file, Some(cwd))? {
+    for entry in &expand_dynamic_tokens(&policy.fs_write_file, Some(cwd), outer_caps)? {
         let path = resolve_policy_path(entry, policy_root, cwd)?;
         if matches!(write_access(&path), AccessMode::Read) {
             add_optional_read_file(caps, path)?;
@@ -3834,9 +3839,12 @@ fn resolve_exec_paths(
     exec_paths: &[String],
     policy_root: &Path,
     cwd: &Path,
+    outer_caps: &CapabilitySet,
 ) -> Result<Vec<PathBuf>> {
     let mut resolved = Vec::new();
-    for entry in &super::dynamic_providers::expand_dynamic_tokens(exec_paths, Some(cwd))? {
+    for entry in
+        &super::dynamic_providers::expand_dynamic_tokens(exec_paths, Some(cwd), outer_caps)?
+    {
         let path = resolve_policy_path(entry, policy_root, cwd)?;
         if path.exists() {
             resolved.push(path);

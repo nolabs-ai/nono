@@ -4784,6 +4784,74 @@ mod tests {
         );
     }
 
+    /// Live regression test for the tool-sandbox-proxy-credential variant of
+    /// `load_command_credential_source` (this file has its own copy,
+    /// separate from `tool_sandbox::policy`'s). Same bare-name-resolution
+    /// broker as the other copy — a trojan on a sandbox-writable PATH dir
+    /// must not run.
+    #[cfg(unix)]
+    #[test]
+    fn load_command_credential_source_skips_trojan_in_writable_path_dir() {
+        use nono::{AccessMode, CapabilitySource, FsCapability};
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let writable_dir = root.path().join("writable-bin");
+        let real_dir = root.path().join("real-bin");
+        std::fs::create_dir_all(&writable_dir).expect("mkdir writable");
+        std::fs::create_dir_all(&real_dir).expect("mkdir real");
+
+        let trojan_marker = root.path().join("trojan_marker");
+        let real_marker = root.path().join("real_marker");
+        for (dir, marker, output) in [
+            (&writable_dir, &trojan_marker, "trojan-secret"),
+            (&real_dir, &real_marker, "real-secret"),
+        ] {
+            let script = dir.join("mycreds");
+            std::fs::write(
+                &script,
+                format!(
+                    "#!/bin/sh\n/usr/bin/touch {}\necho {}\nexit 0\n",
+                    marker.display(),
+                    output
+                ),
+            )
+            .expect("write script");
+            let mut perms = std::fs::metadata(&script).expect("meta").permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms).expect("chmod");
+        }
+
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(FsCapability {
+            original: writable_dir.clone(),
+            resolved: nono::try_canonicalize(&writable_dir),
+            access: AccessMode::ReadWrite,
+            is_file: false,
+            source: CapabilitySource::User,
+        });
+
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let poisoned_path = format!("{}:{}", writable_dir.display(), real_dir.display());
+        let _env = crate::test_env::EnvVarGuard::set_all(&[("PATH", &poisoned_path)]);
+
+        let result = load_command_credential_source("mycreds", &[], None, &caps)
+            .expect("real fallback binary should run and succeed");
+
+        assert!(
+            !trojan_marker.exists(),
+            "trojan in the sandbox-writable directory must not have run"
+        );
+        assert!(
+            real_marker.exists(),
+            "real binary in the non-writable directory should have run"
+        );
+        assert_eq!(result.trim(), "real-secret");
+    }
+
     #[test]
     fn resolve_capture_command_malformed_reference_still_errors() {
         let result = resolve_capture_command("foo/bar", &nono::CapabilitySet::default());

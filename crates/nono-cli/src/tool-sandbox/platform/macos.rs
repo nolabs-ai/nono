@@ -3096,20 +3096,20 @@ fn add_policy_fs(
     // `@git:*` tokens run git in the command's live cwd so they resolve to the
     // repo the command is actually operating in (e.g. its worktree / .git
     // common-dir), not the repo the agent was launched in.
-    for entry in &expand_dynamic_tokens(&policy.fs_read, Some(cwd))? {
+    for entry in &expand_dynamic_tokens(&policy.fs_read, Some(cwd), outer_caps)? {
         let path = resolve_policy_path(entry, policy_root, cwd)?;
         add_optional_dir(caps, path, AccessMode::Read)?;
     }
-    for entry in &expand_dynamic_tokens(&policy.fs_write, Some(cwd))? {
+    for entry in &expand_dynamic_tokens(&policy.fs_write, Some(cwd), outer_caps)? {
         let path = resolve_policy_path(entry, policy_root, cwd)?;
         let access = write_access(&path);
         add_optional_dir(caps, path, access)?;
     }
-    for entry in &expand_dynamic_tokens(&policy.fs_read_file, Some(cwd))? {
+    for entry in &expand_dynamic_tokens(&policy.fs_read_file, Some(cwd), outer_caps)? {
         let path = resolve_policy_path(entry, policy_root, cwd)?;
         add_optional_read_file(caps, path)?;
     }
-    for entry in &expand_dynamic_tokens(&policy.fs_write_file, Some(cwd))? {
+    for entry in &expand_dynamic_tokens(&policy.fs_write_file, Some(cwd), outer_caps)? {
         let path = resolve_policy_path(entry, policy_root, cwd)?;
         if matches!(write_access(&path), AccessMode::Read) {
             add_optional_read_file(caps, path)?;

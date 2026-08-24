@@ -206,6 +206,10 @@ const FORBIDDEN_URI_CHARS: &[char] = &[
 /// # Arguments
 /// * `service` - The service name in the keystore (e.g., "nono")
 /// * `mappings` - Map of credential reference -> env var name
+/// * `outer_caps` - Capability grants for the sandbox about to be launched,
+///   if known yet. Used to sanitize PATH before `op`/`bw`/`security` are
+///   resolved by bare name; pass `None` only when no such grants exist yet
+///   to sanitize against.
 ///
 /// # Returns
 /// Vector of loaded secrets ready to be set as env vars
@@ -219,7 +223,7 @@ const FORBIDDEN_URI_CHARS: &[char] = &[
 /// let mut mappings = HashMap::new();
 /// mappings.insert("api_key".to_string(), "API_KEY".to_string());
 ///
-/// let secrets = load_secrets(DEFAULT_SERVICE, &mappings)?;
+/// let secrets = load_secrets(DEFAULT_SERVICE, &mappings, None)?;
 /// for secret in secrets {
 ///     // SAFETY: single-threaded setup before spawning workers.
 ///     unsafe { std::env::set_var(&secret.env_var, secret.value.as_str()) };
@@ -230,12 +234,13 @@ const FORBIDDEN_URI_CHARS: &[char] = &[
 pub fn load_secrets(
     service: &str,
     mappings: &HashMap<String, String>,
+    outer_caps: Option<&CapabilitySet>,
 ) -> Result<Vec<LoadedSecret>> {
     let mut secrets = Vec::with_capacity(mappings.len());
 
     for (account, env_var) in mappings {
         tracing::debug!("Loading secret '{}' -> ${}", account, env_var);
-        let secret = load_secret_by_ref(service, account, None)?;
+        let secret = load_secret_by_ref(service, account, outer_caps)?;
         secrets.push(LoadedSecret {
             env_var: env_var.clone(),
             value: secret,
@@ -2132,6 +2137,85 @@ mod tests {
         assert!(
             real_marker.exists(),
             "real binary on the non-writable directory should have run"
+        );
+    }
+
+    /// Regression test for a real gap found via live manual pentest:
+    /// `load_secrets` (the `--env-credential` path, which runs before the
+    /// sandbox for this invocation exists) always called `load_secret_by_ref`
+    /// with `outer_caps: None`, even when the CLI's `--allow`/`--write`
+    /// grants for this same invocation were already known. A trojan `op`
+    /// planted in a directory about to be granted write access ran
+    /// unsandboxed. Fixed by threading the already-built `CapabilitySet`
+    /// through `load_secrets`.
+    #[cfg(unix)]
+    #[test]
+    fn load_secrets_sanitizes_path_against_known_outer_caps() {
+        use crate::capability::{AccessMode, CapabilitySource, FsCapability};
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let writable_dir = root.path().join("writable-bin");
+        std::fs::create_dir_all(&writable_dir).expect("mkdir");
+        let marker = root.path().join("marker");
+        let trojan = writable_dir.join("op");
+        std::fs::write(
+            &trojan,
+            format!("#!/bin/sh\n/usr/bin/touch {}\nexit 1\n", marker.display()),
+        )
+        .expect("write trojan");
+        let mut perms = std::fs::metadata(&trojan).expect("meta").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&trojan, perms).expect("chmod");
+
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(FsCapability {
+            original: writable_dir.clone(),
+            resolved: crate::path::try_canonicalize(&writable_dir),
+            access: AccessMode::ReadWrite,
+            is_file: false,
+            source: CapabilitySource::User,
+        });
+
+        // broker_command_with_path (exercised via load_secrets -> load_secret_by_ref)
+        // reads PATH from the process environment directly, so this test needs
+        // a real (locked, restored) mutation rather than passing PATH as a
+        // parameter.
+        static PATH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        struct PathGuard(Option<String>);
+        impl Drop for PathGuard {
+            fn drop(&mut self) {
+                // SAFETY: serialized via PATH_LOCK, held for the guard's lifetime.
+                match &self.0 {
+                    Some(v) => unsafe { std::env::set_var("PATH", v) },
+                    None => unsafe { std::env::remove_var("PATH") },
+                }
+            }
+        }
+
+        let _guard = match PATH_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let real_path = std::env::var("PATH").ok();
+        let poisoned_path = format!(
+            "{}:{}",
+            writable_dir.display(),
+            real_path.clone().unwrap_or_default()
+        );
+        // SAFETY: serialized via PATH_LOCK, restored by PathGuard's Drop.
+        unsafe { std::env::set_var("PATH", &poisoned_path) };
+        let _path_guard = PathGuard(real_path);
+
+        let mut mappings = HashMap::new();
+        mappings.insert("op://vault/item/field".to_string(), "MY_VAR".to_string());
+        // Real op:// resolution will fail (no real `op` on the test host, or
+        // it exits non-zero) — we only care that the trojan never ran.
+        let _ = load_secrets(DEFAULT_SERVICE, &mappings, Some(&caps));
+
+        assert!(
+            !marker.exists(),
+            "trojan op in a directory about to be granted write access must not run"
         );
     }
 

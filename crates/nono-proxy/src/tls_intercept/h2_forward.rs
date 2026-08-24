@@ -787,7 +787,7 @@ mod tests {
             rate_limit: None,
         }];
         let route_store = RouteStore::load(&routes).await.unwrap();
-        let credential_store = CredentialStore::load_with_diagnostics(&routes, tls_connector)
+        let credential_store = CredentialStore::load_with_diagnostics(&routes, tls_connector, None)
             .await
             .unwrap()
             .store;
@@ -1694,10 +1694,11 @@ mod tests {
                 ),
             ])
         };
-        let credential_store = CredentialStore::load_with_diagnostics(&routes, &tls_connector)
-            .await
-            .unwrap()
-            .store;
+        let credential_store =
+            CredentialStore::load_with_diagnostics(&routes, &tls_connector, None)
+                .await
+                .unwrap()
+                .store;
         let cert_cache = Arc::new(CertCache::new(Arc::clone(&ca)));
         let filter = ProxyFilter::allow_all();
         let session_token = Zeroizing::new("session-tok".to_string());

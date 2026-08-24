@@ -1074,8 +1074,12 @@ pub async fn start_with_nonce_resolver(
     let (credential_store, proxy_diagnostics) = if config.routes.is_empty() {
         (CredentialStore::empty(), Vec::new())
     } else {
-        let outcome =
-            CredentialStore::load_with_diagnostics(&config.routes, &tls_connector).await?;
+        let outcome = CredentialStore::load_with_diagnostics(
+            &config.routes,
+            &tls_connector,
+            config.outer_caps.as_ref(),
+        )
+        .await?;
         (outcome.store, outcome.diagnostics)
     };
     let mut loaded_routes = credential_store.loaded_prefixes();

@@ -328,6 +328,7 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
         session_id: &supervisor_session_id,
         attach_initial_client: !session.detached_start,
         detach_sequence: session.detach_sequence.as_deref(),
+        caps,
         open_url_origins: proxy
             .and_then(|p| p.open_url.as_ref())
             .map(|o| o.origins.as_slice())

@@ -405,17 +405,22 @@ fn loopback_http_proxy_port(value: &str) -> Option<u16> {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(super) fn load_supervisor_credential_source(
     source: &crate::command_policy::AmbientCredentialSourceConfig,
+    outer_caps: &nono::CapabilitySet,
 ) -> nono::Result<Vec<u8>> {
     match source {
         crate::command_policy::AmbientCredentialSourceConfig::Keystore { key } => {
-            let secret = nono::keystore::load_secret_by_ref(nono::keystore::DEFAULT_SERVICE, key)?;
+            let secret = nono::keystore::load_secret_by_ref(
+                nono::keystore::DEFAULT_SERVICE,
+                key,
+                Some(outer_caps),
+            )?;
             Ok(secret.as_bytes().to_vec())
         }
         crate::command_policy::AmbientCredentialSourceConfig::Command {
             command,
             args,
             timeout_secs,
-        } => load_command_credential_source(command, args, *timeout_secs),
+        } => load_command_credential_source(command, args, *timeout_secs, outer_caps),
     }
 }
 
@@ -424,10 +429,21 @@ fn load_command_credential_source(
     command: &str,
     args: &[String],
     timeout_secs: Option<u64>,
+    outer_caps: &nono::CapabilitySet,
 ) -> nono::Result<Vec<u8>> {
     let timeout = std::time::Duration::from_secs(timeout_secs.unwrap_or(30));
+    // `command` may be a bare name resolved by PATH lookup, and this process
+    // runs host-side, unsandboxed. Strip any PATH entry the sandbox could
+    // write to before spawning, so it can't plant a trojan for this lookup
+    // to find.
+    let safe_path = nono::sanitize_broker_path_for_binary(
+        &std::env::var("PATH").unwrap_or_default(),
+        command,
+        outer_caps,
+    );
     let mut child = std::process::Command::new(command)
         .args(args)
+        .env("PATH", &safe_path)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())

@@ -46,6 +46,7 @@
 //! - **Other platforms**: Returns `UnsupportedPlatform` error
 
 pub mod audit;
+pub mod broker_path;
 pub mod capability;
 pub mod diagnostic;
 pub mod error;
@@ -64,6 +65,7 @@ pub mod trust;
 pub mod undo;
 
 // Re-exports for convenience
+pub use broker_path::{sanitize_broker_path, sanitize_broker_path_for_binary};
 pub use capability::{
     AccessMode, CapabilitySet, CapabilitySource, CoveringCapabilities, FsCapability, IpcMode,
     NetworkMode, ProcessInfoMode, SignalMode, SocketScope, UnixSocketCapability, UnixSocketMode,

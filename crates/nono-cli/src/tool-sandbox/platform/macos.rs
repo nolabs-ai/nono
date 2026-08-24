@@ -396,6 +396,12 @@ impl PreparedToolSandboxRuntime {
 
     /// Grants Seatbelt capabilities for shim dir execution, socket access,
     /// and metadata-only cwd traversal so getcwd() works inside the sandbox.
+    ///
+    /// Invariant: must never add a filesystem Write grant. `caps` is cloned
+    /// into `ToolSandboxState.outer_caps` (and into the proxy's credential
+    /// capture backend) *before* this runs, and those clones are what
+    /// `nono::sanitize_broker_path_for_binary` checks for the lifetime of the session —
+    /// a Write grant added here would silently bypass that check.
     pub(crate) fn grant_outer_caps(&self, caps: &mut CapabilitySet) -> Result<()> {
         caps.add_fs(FsCapability::new_dir(
             &self.inner.shim_dir,
@@ -822,7 +828,7 @@ fn handle_url_open_stream(
 
     let (success, error) = match validate_url_open(state, peer_pid, session_root_pid, &request.url)
     {
-        Ok(()) => match crate::url_open::open_url_in_browser(&request.url) {
+        Ok(()) => match crate::url_open::open_url_in_browser(&request.url, &state.outer_caps) {
             Ok(()) => (true, None),
             Err(reason) => (false, Some(reason)),
         },
@@ -3650,7 +3656,10 @@ fn load_ambient_credential_source(
     match state.credential_handles.get(credential) {
         Some(ResolvedCredential::Ambient {
             source: Some(source),
-        }) => Ok(Some(super::load_supervisor_credential_source(source)?)),
+        }) => Ok(Some(super::load_supervisor_credential_source(
+            source,
+            &state.outer_caps,
+        )?)),
         Some(ResolvedCredential::Ambient { source: None }) => Ok(None),
         Some(_) => Err(NonoError::SandboxInit(format!(
             "tool-sandbox credential '{credential}' is not ambient"

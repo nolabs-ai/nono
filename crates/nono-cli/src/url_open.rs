@@ -73,11 +73,29 @@ pub(crate) fn validate_url(
 /// Open a URL in the user's default browser.
 ///
 /// Uses `open` on macOS and `xdg-open` on Linux. Must be called from an
-/// unsandboxed process so the browser has full system access.
-pub(crate) fn open_url_in_browser(url: &str) -> std::result::Result<(), String> {
+/// unsandboxed process so the browser has full system access. `outer_caps`
+/// is the sandbox's write policy: PATH entries the sandbox could write to
+/// are stripped before this bare-name lookup runs, so a sandboxed process
+/// cannot plant a trojan `open`/`xdg-open` for this host-side broker to run.
+pub(crate) fn open_url_in_browser(
+    url: &str,
+    outer_caps: &nono::CapabilitySet,
+) -> std::result::Result<(), String> {
+    #[cfg(target_os = "macos")]
+    const BROWSER_OPENER: &str = "open";
+    #[cfg(target_os = "linux")]
+    const BROWSER_OPENER: &str = "xdg-open";
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    let safe_path = nono::sanitize_broker_path_for_binary(
+        &std::env::var("PATH").unwrap_or_default(),
+        BROWSER_OPENER,
+        outer_caps,
+    );
+
     #[cfg(target_os = "macos")]
     let result = std::process::Command::new("open")
         .arg(url)
+        .env("PATH", &safe_path)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -86,6 +104,7 @@ pub(crate) fn open_url_in_browser(url: &str) -> std::result::Result<(), String> 
     #[cfg(target_os = "linux")]
     let result = std::process::Command::new("xdg-open")
         .arg(url)
+        .env("PATH", &safe_path)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())

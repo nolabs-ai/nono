@@ -209,6 +209,15 @@ pub struct ProxyConfig {
     /// fail-closed auth are independent of this flag.
     #[serde(default = "default_enable_network_audit")]
     pub enable_network_audit: bool,
+
+    /// The sandboxed session's write policy, when this proxy instance is
+    /// serving one. Used to strip sandbox-writable PATH entries before this
+    /// host-side, unsandboxed proxy resolves `op`/`bw`/`security` by bare
+    /// name to load a keystore-backed credential (see
+    /// [`nono::keystore::load_secret_by_ref`]). `None` for the standalone
+    /// `nono proxy` command, which has no sandboxed child.
+    #[serde(default, skip)]
+    pub outer_caps: Option<nono::CapabilitySet>,
 }
 
 /// Pre-generated CA key material for cross-session CA reuse.
@@ -271,6 +280,7 @@ impl Default for ProxyConfig {
             leaf_validity: None,
             enable_h2: false,
             enable_network_audit: default_enable_network_audit(),
+            outer_caps: None,
         }
     }
 }

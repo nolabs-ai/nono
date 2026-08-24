@@ -73,12 +73,15 @@ fn glob_matches(pattern: &str, text: &str) -> bool {
     }
     // `split('*')` always yields at least one item, so an empty `parts` here
     // is impossible; a pattern with no `*` is just an exact match.
-    let mut parts = pattern.split('*');
+    let mut parts = pattern.split('*').peekable();
     let first = parts.next().unwrap_or_default();
     let Some(mut rest) = text.strip_prefix(first) else {
         return false;
     };
-    let mut parts = parts.peekable();
+    if parts.peek().is_none() {
+        // No `*`: exact full-string match.
+        return rest.is_empty();
+    }
     while let Some(part) = parts.next() {
         if parts.peek().is_none() {
             // Last segment: must match the remaining text as a suffix.
@@ -396,6 +399,16 @@ mod tests {
     fn test_env_var_allowed_exact_no_match() {
         let allowed: Vec<String> = vec!["PATH".into(), "HOME".into()];
         assert!(!is_env_var_allowed("SECRET", &allowed));
+    }
+
+    #[test]
+    fn test_env_var_allowed_exact_does_not_match_superstring() {
+        assert!(!is_env_var_allowed("PATH_X", &["PATH".into()]));
+        assert!(!matches_env_var_patterns(
+            "GH_TOKEN_BAK",
+            &["GH_TOKEN".into()],
+            false
+        ));
     }
 
     #[test]

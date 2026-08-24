@@ -2671,14 +2671,6 @@ fn validate_environment(
                     format!("command '{command_name}' from.{caller} has empty allow_vars pattern"),
                 );
             }
-            if pattern.matches('*').count() > 1 {
-                report.error(
-                    "invalid_environment_pattern",
-                    format!(
-                        "command '{command_name}' from.{caller} allow_vars pattern '{pattern}' contains multiple wildcards"
-                    ),
-                );
-            }
         }
 
         if let Some(error) =
@@ -2728,12 +2720,6 @@ fn validate_export_env(
                 format!("{field_label} has an empty pattern"),
             );
             continue;
-        }
-        if pattern.matches('*').count() > 1 {
-            report.error(
-                "invalid_export_env",
-                format!("{field_label} pattern '{pattern}' contains multiple wildcards"),
-            );
         }
         // nono owns PATH/NONO_*, so naming them is an error. A broad pattern is
         // fine — they are excluded at build time regardless.
@@ -2796,6 +2782,14 @@ fn validate_network(
                 "command '{command_name}' from.{caller} uses network.allow_domain through the supervisor proxy; execution fails closed if no loopback proxy is available"
             ),
         );
+    }
+    for pattern in &network.allow_domain {
+        if let Err(err) = nono::net_filter::validate_host_pattern(pattern) {
+            report.error(
+                "invalid_network_pattern",
+                format!("command '{command_name}' from.{caller} allow_domain: {err}"),
+            );
+        }
     }
 
     if !network.tcp_connect_ports.is_empty() || !network.tcp_bind_ports.is_empty() {
@@ -4051,7 +4045,7 @@ mod tests {
     }
 
     #[test]
-    fn environment_rejects_non_trailing_wildcards() {
+    fn environment_accepts_multi_wildcard_patterns() {
         let mut config = active_git_config();
         if let Some(git) = config.commands.get_mut("git") {
             git.sandbox = Some(CommandSandboxConfig {
@@ -4067,7 +4061,7 @@ mod tests {
             validate_command_policies(Some(&config), CommandPolicyValidationScope::Resolved);
 
         assert!(
-            report
+            !report
                 .errors
                 .iter()
                 .any(|finding| finding.code == "invalid_environment_pattern")
@@ -4099,9 +4093,7 @@ mod tests {
     }
 
     #[test]
-    fn export_env_rejects_repeated_trailing_wildcards() {
-        // "A**" passes validate_env_var_patterns but matches_env_var_patterns
-        // treats it as unmatchable, silently excluding the var at runtime.
+    fn export_env_accepts_repeated_wildcards() {
         let mut config = active_git_config();
         if let Some(git) = config.commands.get_mut("git") {
             git.export_env = vec!["A**".to_string()];
@@ -4111,7 +4103,7 @@ mod tests {
             validate_command_policies(Some(&config), CommandPolicyValidationScope::Resolved);
 
         assert!(
-            report
+            !report
                 .errors
                 .iter()
                 .any(|finding| finding.code == "invalid_export_env")
@@ -4144,8 +4136,6 @@ mod tests {
 
     #[test]
     fn export_env_accepts_single_mid_string_wildcard() {
-        // validate_env_var_patterns permits infix `*`; only a *repeated*
-        // wildcard (>1 `*` in one pattern) is rejected below.
         let mut config = active_git_config();
         if let Some(git) = config.commands.get_mut("git") {
             git.export_env = vec!["A*B".to_string()];

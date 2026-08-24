@@ -972,29 +972,20 @@ fn prepare_profile_with_options(
             .as_ref()
             .map(|profile| profile.diagnostics.suppress_system_services.clone())
             .unwrap_or_default(),
+        // Patterns are validated at profile load; already well-formed here.
         allowed_env_vars: loaded_profile.as_ref().and_then(|profile| {
-            profile.environment.as_ref().and_then(|env_config| {
-                let vars = env_config.allow_vars.as_ref()?;
-                if let Some(err) =
-                    crate::exec_strategy::validate_env_var_patterns(vars, "allow_vars")
-                {
-                    eprintln!("Warning: {}", err);
-                }
-                Some(vars.clone())
-            })
+            profile
+                .environment
+                .as_ref()
+                .and_then(|env_config| env_config.allow_vars.clone())
         }),
         denied_env_vars: loaded_profile.as_ref().and_then(|profile| {
             profile.environment.as_ref().and_then(|env_config| {
                 if env_config.deny_vars.is_empty() {
-                    return None;
+                    None
+                } else {
+                    Some(env_config.deny_vars.clone())
                 }
-                if let Some(err) = crate::exec_strategy::validate_env_var_patterns(
-                    &env_config.deny_vars,
-                    "deny_vars",
-                ) {
-                    eprintln!("Warning: {}", err);
-                }
-                Some(env_config.deny_vars.clone())
             })
         }),
         case_insensitive_env_vars: loaded_profile

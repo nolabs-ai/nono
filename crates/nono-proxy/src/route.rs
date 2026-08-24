@@ -669,6 +669,9 @@ pub(crate) fn format_host_port(host: &str, port: u16) -> String {
             std::net::IpAddr::V6(v6) => format!("[{v6}]:{port}"),
         }
     } else {
+        // Mirror HostFilter's normalization so route matching agrees with
+        // network authorization on what a hostname is.
+        let host = nono::net_filter::HostFilter::normalize_authority_host(&host);
         format!("{host}:{port}")
     }
 }
@@ -1257,6 +1260,18 @@ mod tests {
         assert!(!host_port_matches(
             "*.dev.example.net:443",
             "api.admin.other.net:443"
+        ));
+    }
+
+    #[test]
+    fn test_format_host_port_strips_trailing_fqdn_dot() {
+        assert_eq!(
+            format_host_port("example.com.", 443),
+            format_host_port("example.com", 443)
+        );
+        assert!(host_port_matches(
+            &format_host_port("example.com", 443),
+            &format_host_port("example.com.", 443)
         ));
     }
 

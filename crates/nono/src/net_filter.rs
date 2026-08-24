@@ -104,6 +104,48 @@ pub fn host_pattern_matches(pattern: &str, host: &str) -> bool {
     }
 }
 
+/// Validates that `pattern` is a well-formed entry under the wildcard grammar
+/// documented on [`host_pattern_matches`], returning `Err` with a description
+/// of the problem if not. A pattern outside that grammar can never match any
+/// real hostname.
+pub fn validate_host_pattern(pattern: &str) -> Result<(), String> {
+    if pattern.is_empty() {
+        return Err("pattern is empty".to_string());
+    }
+    if pattern == "*" {
+        return Ok(());
+    }
+    if let Some(suffix) = pattern.strip_prefix('*') {
+        if !suffix.starts_with('.') {
+            return Err(format!(
+                "pattern '{pattern}': a leading '*' must be followed by '.' (e.g. '*.example.com')"
+            ));
+        }
+        let rest = &suffix[1..];
+        if rest.is_empty() {
+            return Err(format!(
+                "pattern '{pattern}': '*.' must be followed by a domain"
+            ));
+        }
+        if rest.contains('*') {
+            return Err(format!(
+                "pattern '{pattern}': a leading '*.' wildcard cannot be combined with another '*' \
+                 elsewhere in the pattern — the remainder is matched literally, so this can never match"
+            ));
+        }
+        return Ok(());
+    }
+    for label in pattern.split('.') {
+        if label.contains('*') && label != "*" {
+            return Err(format!(
+                "pattern '{pattern}': '*' must occupy a whole label (e.g. 'a.*.b.com'), not part of \
+                 one like '{label}' — a real hostname label can never contain '*', so this can never match"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Result of a host filter check.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FilterResult {
@@ -424,6 +466,40 @@ mod tests {
 
     fn public_ip() -> Vec<IpAddr> {
         vec![IpAddr::V4(Ipv4Addr::new(104, 18, 7, 96))]
+    }
+
+    #[test]
+    fn test_validate_host_pattern_accepts_all_three_wildcard_forms() {
+        assert!(validate_host_pattern("*").is_ok());
+        assert!(validate_host_pattern("*.example.com").is_ok());
+        assert!(validate_host_pattern("jenkins.*.ci.example.com").is_ok());
+        assert!(validate_host_pattern("api.openai.com").is_ok());
+    }
+
+    #[test]
+    fn test_validate_host_pattern_rejects_empty() {
+        assert!(validate_host_pattern("").is_err());
+    }
+
+    #[test]
+    fn test_validate_host_pattern_rejects_partial_label_wildcard() {
+        assert!(validate_host_pattern("foo*bar.com").is_err());
+        assert!(validate_host_pattern("foo.ba*r.com").is_err());
+    }
+
+    #[test]
+    fn test_validate_host_pattern_rejects_bare_leading_star_without_dot() {
+        assert!(validate_host_pattern("*example.com").is_err());
+    }
+
+    #[test]
+    fn test_validate_host_pattern_rejects_dangling_leading_wildcard() {
+        assert!(validate_host_pattern("*.").is_err());
+    }
+
+    #[test]
+    fn test_validate_host_pattern_rejects_leading_wildcard_combined_with_another() {
+        assert!(validate_host_pattern("*.foo.*.com").is_err());
     }
 
     #[test]

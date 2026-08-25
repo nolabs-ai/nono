@@ -3397,6 +3397,12 @@ mod tests {
 
     #[test]
     fn test_from_profile_filesystem_allow_expands_git_dynamic_token() {
+        // Shells out to real git, so take ENV_LOCK: another test in this
+        // file temporarily narrows the real process PATH under that lock.
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
         let tmp = tempfile::TempDir::new_in(
             std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
         )

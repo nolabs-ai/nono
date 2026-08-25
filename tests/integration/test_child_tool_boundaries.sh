@@ -238,6 +238,30 @@ run_in_dir() {
     cd "$dir" && "$@"
 }
 
+expect_file_contains() {
+    local name="$1"
+    local path="$2"
+    local expected="$3"
+
+    TESTS_RUN=$((TESTS_RUN + 1))
+
+    if [[ -f "$path" ]] && grep -q "$expected" "$path"; then
+        echo -e "  ${GREEN}PASS${NC}: $name"
+        TESTS_PASSED=$((TESTS_PASSED + 1))
+        return 0
+    fi
+
+    echo -e "  ${RED}FAIL${NC}: $name"
+    echo "       Expected file '$path' to contain: '$expected'"
+    if [[ -f "$path" ]]; then
+        echo "       Actual content: '$(<"$path")'"
+    else
+        echo "       File does not exist"
+    fi
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    return 0
+}
+
 # =============================================================================
 # Primary Child Sandbox
 # =============================================================================
@@ -313,6 +337,81 @@ else
         run_in_dir "$TMPDIR" "$NONO_BIN" run --profile "$TOOL_NO_CREDENTIAL_USE_PROFILE" --silent --no-audit --allow-cwd -- \
         sh -c 'IFS= read -r value < "$1" || exit 77; printf "%s" "$value"' sh "$TMPDIR/tool-raw-secret.txt"
 fi
+
+# =============================================================================
+# Fire-and-forget chaining
+# =============================================================================
+
+echo ""
+echo "--- Fire-and-forget Chaining ---"
+
+FIRE_FORGET_DIR="$TMPDIR/fire-forget"
+mkdir -p "$FIRE_FORGET_DIR"
+FIRE_FORGET_PROFILE="$FIRE_FORGET_DIR/profile.json"
+
+# `parent` backgrounds `child` and exits immediately, so by the time `child`'s
+# launch request is mediated, `parent` (its authorizing ancestor) has already
+# been reaped and `child` is reparented to init. `child` must still resolve to
+# `parent`'s policy edge rather than being denied as an unattributable caller.
+cat > "$FIRE_FORGET_DIR/parent" <<'EOF'
+#!/bin/sh
+set -eu
+echo "parent: launching child (fire & forget)"
+child &
+EOF
+chmod 755 "$FIRE_FORGET_DIR/parent"
+
+cat > "$FIRE_FORGET_DIR/child" <<'EOF'
+#!/bin/sh
+set -eu
+echo "child: writing file"
+echo "written by child at $(date)" > "$(dirname "$0")/out.txt"
+EOF
+chmod 755 "$FIRE_FORGET_DIR/child"
+
+cat > "$FIRE_FORGET_PROFILE" <<EOF
+{
+  "meta": { "name": "integration-fire-and-forget" },
+  "workdir": { "access": "read" },
+  "command_policies": {
+    "executable_dirs": ["."],
+    "commands": {
+      "parent": {
+        "can_use": ["child"],
+        "from": { "session": { "sandbox": { "fs_read": ["\$WORKDIR"] } } }
+      },
+      "child": {
+        "can_use": ["date", "dirname"],
+        "from": {
+          "parent": {
+            "sandbox": {
+              "fs_read": ["\$WORKDIR"],
+              "fs_write_file": ["\$WORKDIR/out.txt"]
+            }
+          }
+        }
+      },
+      "date":    { "from": { "child": { "sandbox": {} } } },
+      "dirname": { "from": { "child": { "sandbox": {} } } }
+    }
+  }
+}
+EOF
+
+# `child` itself launches further mediated subprocesses (`date`, `dirname`)
+# before it writes out.txt, so poll for the file instead of guessing a fixed
+# delay for the whole chain to finish; bounded to 5s total.
+expect_success "outer session survives a fire-and-forget child launch (#1274)" \
+    run_in_dir "$FIRE_FORGET_DIR" "$NONO_BIN" run --silent --no-audit --profile "$FIRE_FORGET_PROFILE" --allow-cwd -- \
+    sh -c 'parent
+i=0
+while [ ! -s out.txt ] && [ "$i" -lt 50 ]; do
+    sleep 0.1
+    i=$((i + 1))
+done'
+
+expect_file_contains "fire-and-forget child was authorized under parent's policy edge (#1274)" \
+    "$FIRE_FORGET_DIR/out.txt" "written by child at"
 
 # =============================================================================
 # Summary

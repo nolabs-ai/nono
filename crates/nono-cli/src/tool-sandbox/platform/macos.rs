@@ -2615,7 +2615,7 @@ fn resolve_url_open_command(
             return Ok(Some(found));
         }
     }
-    Ok(None)
+    Ok(session_id_of(peer_pid).and_then(|sid| state.session_lineage.resolve_sid(sid)))
 }
 
 fn is_pid_alive_with_start(pid: u32, expected_start_usec: u64) -> bool {
@@ -7244,6 +7244,39 @@ mod tests {
         let blocked = resolve_caller_with(pid, UNRELATED_ROOT, &state, "child", |_| None);
 
         assert!(matches!(blocked, Err(NonoError::BlockedCommand { .. })));
+    }
+
+    #[test]
+    fn resolve_url_open_command_resolves_ordinary_orphan_via_session_lineage() -> Result<()> {
+        let state = test_state();
+        let leader = SessionLeaderChild::spawn();
+        state.session_lineage.record(
+            leader.sid(),
+            "parent",
+            &Caller::Session,
+            Some(leader.identity()),
+        );
+
+        let found = resolve_url_open_command(leader.sid(), &state)?;
+
+        assert!(
+            matches!(found, Some((name, Caller::Session)) if name == "parent"),
+            "a severed caller's URL-open request must still resolve via session lineage, \
+             the same fallback resolve_caller_with already gets"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_url_open_command_denies_when_no_session_record() -> Result<()> {
+        let state = test_state();
+        let pid = std::process::id();
+
+        // Fail-closed: nothing recorded this pid's session, and no active_children match.
+        let found = resolve_url_open_command(pid, &state)?;
+
+        assert!(found.is_none());
+        Ok(())
     }
 
     #[test]

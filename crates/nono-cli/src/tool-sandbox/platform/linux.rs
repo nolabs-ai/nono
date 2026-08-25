@@ -463,6 +463,11 @@ impl PreparedToolSandboxRuntime {
             .collect())
     }
 
+    /// Invariant: must never add a filesystem Write grant. `caps` is cloned
+    /// into `ToolSandboxState.outer_caps` (and into the proxy's credential
+    /// capture backend) *before* this runs, and those clones are what
+    /// `nono::sanitize_broker_path_for_binary` checks for the lifetime of the session —
+    /// a Write grant added here would silently bypass that check.
     pub(crate) fn grant_outer_caps(&self, caps: &mut CapabilitySet) -> Result<()> {
         caps.add_fs(FsCapability::new_dir(
             &self.inner.shim_dir,
@@ -1151,7 +1156,7 @@ fn handle_url_open_stream(
 
     let (success, error) = match validate_url_open(state, peer_pid, session_root_pid, &request.url)
     {
-        Ok(()) => match crate::url_open::open_url_in_browser(&request.url) {
+        Ok(()) => match crate::url_open::open_url_in_browser(&request.url, &state.outer_caps) {
             Ok(()) => (true, None),
             Err(reason) => (false, Some(reason)),
         },
@@ -3447,7 +3452,12 @@ fn build_child_launch_spec_for_binary(
     }
     // Let multi-call tools (e.g. git) exec the helpers they invoke by
     // absolute path.
-    for path in resolve_exec_paths(&policy.exec_paths, &state.policy_root, &cwd)? {
+    for path in resolve_exec_paths(
+        &policy.exec_paths,
+        &state.policy_root,
+        &cwd,
+        &state.outer_caps,
+    )? {
         allowed_exec_paths.push(path.as_os_str().as_bytes().to_vec());
     }
 
@@ -3768,20 +3778,20 @@ fn add_policy_fs(
     // `@git:*` tokens run git in the command's live cwd so they resolve to the
     // repo the command is actually operating in (e.g. its worktree / .git
     // common-dir), not the repo the agent was launched in.
-    for entry in &expand_dynamic_tokens(&policy.fs_read, Some(cwd))? {
+    for entry in &expand_dynamic_tokens(&policy.fs_read, Some(cwd), outer_caps)? {
         let path = resolve_policy_path(entry, policy_root, cwd)?;
         add_optional_dir(caps, path, AccessMode::Read)?;
     }
-    for entry in &expand_dynamic_tokens(&policy.fs_write, Some(cwd))? {
+    for entry in &expand_dynamic_tokens(&policy.fs_write, Some(cwd), outer_caps)? {
         let path = resolve_policy_path(entry, policy_root, cwd)?;
         let access = write_access(&path);
         add_optional_dir(caps, path, access)?;
     }
-    for entry in &expand_dynamic_tokens(&policy.fs_read_file, Some(cwd))? {
+    for entry in &expand_dynamic_tokens(&policy.fs_read_file, Some(cwd), outer_caps)? {
         let path = resolve_policy_path(entry, policy_root, cwd)?;
         add_optional_read_file(caps, path)?;
     }
-    for entry in &expand_dynamic_tokens(&policy.fs_write_file, Some(cwd))? {
+    for entry in &expand_dynamic_tokens(&policy.fs_write_file, Some(cwd), outer_caps)? {
         let path = resolve_policy_path(entry, policy_root, cwd)?;
         if matches!(write_access(&path), AccessMode::Read) {
             add_optional_read_file(caps, path)?;
@@ -3829,9 +3839,12 @@ fn resolve_exec_paths(
     exec_paths: &[String],
     policy_root: &Path,
     cwd: &Path,
+    outer_caps: &CapabilitySet,
 ) -> Result<Vec<PathBuf>> {
     let mut resolved = Vec::new();
-    for entry in &super::dynamic_providers::expand_dynamic_tokens(exec_paths, Some(cwd))? {
+    for entry in
+        &super::dynamic_providers::expand_dynamic_tokens(exec_paths, Some(cwd), outer_caps)?
+    {
         let path = resolve_policy_path(entry, policy_root, cwd)?;
         if path.exists() {
             resolved.push(path);
@@ -4530,7 +4543,10 @@ fn load_ambient_credential_source(
     match state.credential_handles.get(credential) {
         Some(ResolvedCredential::Ambient {
             source: Some(source),
-        }) => Ok(Some(super::load_supervisor_credential_source(source)?)),
+        }) => Ok(Some(super::load_supervisor_credential_source(
+            source,
+            &state.outer_caps,
+        )?)),
         Some(ResolvedCredential::Ambient { source: None }) => Ok(None),
         Some(_) => Err(NonoError::SandboxInit(format!(
             "tool-sandbox credential '{credential}' is not ambient"
@@ -5690,6 +5706,7 @@ mod tests {
             ],
             tmp.path(),
             tmp.path(),
+            &CapabilitySet::default(),
         )?;
 
         assert!(
@@ -5910,7 +5927,9 @@ mod tests {
     #[test]
     fn resolve_exec_paths_empty_yields_empty() -> Result<()> {
         let tmp = test_tempdir()?;
-        assert!(resolve_exec_paths(&[], tmp.path(), tmp.path())?.is_empty());
+        assert!(
+            resolve_exec_paths(&[], tmp.path(), tmp.path(), &CapabilitySet::default())?.is_empty()
+        );
         Ok(())
     }
 

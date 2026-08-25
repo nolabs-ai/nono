@@ -19,6 +19,7 @@
 //! All secrets are wrapped in `Zeroizing<String>` to ensure they are securely
 //! cleared from memory after use.
 
+use crate::capability::CapabilitySet;
 use crate::error::{NonoError, Result};
 use std::collections::HashMap;
 use std::io::Write;
@@ -205,6 +206,10 @@ const FORBIDDEN_URI_CHARS: &[char] = &[
 /// # Arguments
 /// * `service` - The service name in the keystore (e.g., "nono")
 /// * `mappings` - Map of credential reference -> env var name
+/// * `outer_caps` - Capability grants for the sandbox about to be launched,
+///   if known yet. Used to sanitize PATH before `op`/`bw`/`security` are
+///   resolved by bare name; pass `None` only when no such grants exist yet
+///   to sanitize against.
 ///
 /// # Returns
 /// Vector of loaded secrets ready to be set as env vars
@@ -218,7 +223,7 @@ const FORBIDDEN_URI_CHARS: &[char] = &[
 /// let mut mappings = HashMap::new();
 /// mappings.insert("api_key".to_string(), "API_KEY".to_string());
 ///
-/// let secrets = load_secrets(DEFAULT_SERVICE, &mappings)?;
+/// let secrets = load_secrets(DEFAULT_SERVICE, &mappings, None)?;
 /// for secret in secrets {
 ///     // SAFETY: single-threaded setup before spawning workers.
 ///     unsafe { std::env::set_var(&secret.env_var, secret.value.as_str()) };
@@ -229,12 +234,13 @@ const FORBIDDEN_URI_CHARS: &[char] = &[
 pub fn load_secrets(
     service: &str,
     mappings: &HashMap<String, String>,
+    outer_caps: Option<&CapabilitySet>,
 ) -> Result<Vec<LoadedSecret>> {
     let mut secrets = Vec::with_capacity(mappings.len());
 
     for (account, env_var) in mappings {
         tracing::debug!("Loading secret '{}' -> ${}", account, env_var);
-        let secret = load_secret_by_ref(service, account)?;
+        let secret = load_secret_by_ref(service, account, outer_caps)?;
         secrets.push(LoadedSecret {
             env_var: env_var.clone(),
             value: secret,
@@ -259,6 +265,13 @@ pub fn load_secrets(
 /// * `service` - Keyring service name (only used for keyring backend)
 /// * `credential_ref` - A keyring account name, `file://` URI, `op://` URI,
 ///   `bw://` URI, Apple Passwords URI, or `env://` URI
+/// * `outer_caps` - The sandbox's write policy, when resolving this
+///   credential on behalf of an active sandboxed session; `None` otherwise
+///   (e.g. resolving a secret for the launcher's own use before any sandbox
+///   exists). The `op`/`bw`/`security` CLIs are resolved by bare name via
+///   PATH; `Some(caps)` strips any PATH directory the sandbox could write to
+///   before that lookup runs, so the sandboxed process can't plant a trojan
+///   for this host-side broker to execute. `None` uses PATH as-is.
 ///
 /// # Security
 /// The returned value is wrapped in `Zeroizing<String>`. For URI-based managers
@@ -267,7 +280,11 @@ pub fn load_secrets(
 /// zeroized — this is the same class of limitation as the keyring crate's
 /// internal buffers.
 #[must_use = "loaded secret should be used or explicitly dropped"]
-pub fn load_secret_by_ref(service: &str, credential_ref: &str) -> Result<Zeroizing<String>> {
+pub fn load_secret_by_ref(
+    service: &str,
+    credential_ref: &str,
+    outer_caps: Option<&CapabilitySet>,
+) -> Result<Zeroizing<String>> {
     if credential_ref.starts_with(CMD_URI_PREFIX) {
         Err(NonoError::KeystoreAccess(
             "cmd:// credentials can only be resolved by the supervisor credential capture path"
@@ -278,11 +295,11 @@ pub fn load_secret_by_ref(service: &str, credential_ref: &str) -> Result<Zeroizi
     } else if credential_ref.starts_with(ENV_URI_PREFIX) {
         load_from_env(credential_ref)
     } else if credential_ref.starts_with(OP_URI_PREFIX) {
-        load_from_op(credential_ref)
+        load_from_op(credential_ref, outer_caps)
     } else if is_bw_uri(credential_ref) {
-        load_from_bw(credential_ref)
+        load_from_bw(credential_ref, outer_caps)
     } else if is_apple_password_uri(credential_ref) {
-        load_from_apple_password(credential_ref)
+        load_from_apple_password(credential_ref, outer_caps)
     } else if is_keyring_uri(credential_ref) {
         load_from_keyring_uri(credential_ref)
     } else {
@@ -1137,6 +1154,32 @@ fn load_single_secret(_service: &str, account: &str) -> Result<Zeroizing<String>
     )))
 }
 
+/// Build a `Command` for a bare-name host-side broker binary (`op`, `bw`,
+/// `security`), with PATH stripped of any sandbox-writable directory when
+/// `outer_caps` is provided. See [`load_secret_by_ref`] for why this matters.
+fn broker_command(program: &str, outer_caps: Option<&CapabilitySet>) -> Command {
+    let ambient_path = std::env::var("PATH").unwrap_or_default();
+    broker_command_with_path(program, &ambient_path, outer_caps)
+}
+
+/// Core of [`broker_command`], taking the PATH value as a parameter rather
+/// than reading the process environment, so tests can exercise PATH
+/// resolution without mutating global process state (unsafe under a
+/// parallel test runner).
+fn broker_command_with_path(
+    program: &str,
+    ambient_path: &str,
+    outer_caps: Option<&CapabilitySet>,
+) -> Command {
+    let mut command = Command::new(program);
+    if let Some(caps) = outer_caps {
+        let safe_path =
+            crate::broker_path::sanitize_broker_path_for_binary(ambient_path, program, caps);
+        command.env("PATH", safe_path);
+    }
+    command
+}
+
 /// Load a secret from 1Password using the `op` CLI.
 ///
 /// Runs `op read <uri>` and captures stdout. The `op` binary must be
@@ -1149,12 +1192,12 @@ fn load_single_secret(_service: &str, account: &str) -> Result<Zeroizing<String>
 /// - The URI is validated before being passed to `op` to prevent argument injection.
 /// - `Command::new` is used (no shell), so shell metacharacters in the URI
 ///   cannot cause command injection.
-fn load_from_op(uri: &str) -> Result<Zeroizing<String>> {
+fn load_from_op(uri: &str, outer_caps: Option<&CapabilitySet>) -> Result<Zeroizing<String>> {
     validate_op_uri(uri)?;
 
     tracing::debug!("Loading secret from 1Password: {}", redact_op_uri(uri));
 
-    let mut child = Command::new("op")
+    let mut child = broker_command("op", outer_caps)
         .args(["read", "--", uri])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1217,7 +1260,7 @@ fn load_from_op(uri: &str) -> Result<Zeroizing<String>> {
 /// - The URI is validated before being passed to `bw` to prevent argument injection.
 /// - `Command::new` is used (no shell), so shell metacharacters in the URI
 ///   cannot cause command injection.
-fn load_from_bw(uri: &str) -> Result<Zeroizing<String>> {
+fn load_from_bw(uri: &str, outer_caps: Option<&CapabilitySet>) -> Result<Zeroizing<String>> {
     validate_bw_uri(uri)?;
 
     let path = uri.strip_prefix(BW_URI_PREFIX).ok_or_else(|| {
@@ -1240,7 +1283,7 @@ fn load_from_bw(uri: &str) -> Result<Zeroizing<String>> {
     } else {
         "password"
     };
-    let mut child = Command::new("bw")
+    let mut child = broker_command("bw", outer_caps)
         .args(["get", bw_object, "--", item_id])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1398,10 +1441,14 @@ struct BwCustomField {
 ///
 /// Runs `security find-internet-password -s <server> -a <account> -w` and captures
 /// stdout. This backend is macOS-only.
-fn load_from_apple_password(uri: &str) -> Result<Zeroizing<String>> {
+fn load_from_apple_password(
+    uri: &str,
+    outer_caps: Option<&CapabilitySet>,
+) -> Result<Zeroizing<String>> {
     #[cfg(not(target_os = "macos"))]
     {
         let _ = uri;
+        let _ = outer_caps;
         Err(NonoError::KeystoreAccess(
             "Apple Passwords credentials are only supported on macOS".to_string(),
         ))
@@ -1415,7 +1462,7 @@ fn load_from_apple_password(uri: &str) -> Result<Zeroizing<String>> {
             redact_apple_password_uri(uri)
         );
 
-        let mut child = Command::new("security")
+        let mut child = broker_command("security", outer_caps)
             .args(["find-internet-password", "-s", server, "-a", account, "-w"])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -2036,6 +2083,141 @@ pub fn build_secret_mappings(
 #[allow(clippy::disallowed_methods)] // Tests use unique env var names (NONO_TEST_*), no contention.
 mod tests {
     use super::*;
+
+    /// Real-world shape: a sandboxed session is granted write access to a
+    /// directory that's also on the ambient PATH (e.g. `$HOME/go/bin`), and
+    /// the real `op`/`bw`/`security` binary lives further down PATH. A
+    /// trojan planted in the writable directory must not be picked up when
+    /// this host-side, unsandboxed broker resolves the binary by bare name.
+    #[cfg(unix)]
+    #[test]
+    fn broker_command_skips_trojan_in_writable_path_dir() {
+        use crate::capability::{AccessMode, CapabilitySource, FsCapability};
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let writable_bin = root.path().join("writable-bin");
+        let real_bin = root.path().join("real-bin");
+        std::fs::create_dir_all(&writable_bin).expect("mkdir writable");
+        std::fs::create_dir_all(&real_bin).expect("mkdir real");
+
+        let marker_dir = root.path().join("markers");
+        std::fs::create_dir_all(&marker_dir).expect("mkdir markers");
+        let trojan_marker = marker_dir.join("pwned");
+        let real_marker = marker_dir.join("legit");
+
+        for (dir, marker) in [(&writable_bin, &trojan_marker), (&real_bin, &real_marker)] {
+            let script = dir.join("op");
+            std::fs::write(&script, format!("#!/bin/sh\n: > '{}'\n", marker.display()))
+                .expect("write script");
+            let mut perms = std::fs::metadata(&script).expect("metadata").permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms).expect("chmod");
+        }
+
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(FsCapability {
+            original: writable_bin.clone(),
+            resolved: crate::path::try_canonicalize(&writable_bin),
+            access: AccessMode::ReadWrite,
+            is_file: false,
+            source: CapabilitySource::User,
+        });
+
+        let ambient_path = format!("{}:{}", writable_bin.display(), real_bin.display());
+        let status = broker_command_with_path("op", &ambient_path, Some(&caps))
+            .status()
+            .expect("spawn op via sanitized PATH");
+        assert!(status.success());
+
+        assert!(
+            !trojan_marker.exists(),
+            "trojan in the sandbox-writable directory must not have run"
+        );
+        assert!(
+            real_marker.exists(),
+            "real binary on the non-writable directory should have run"
+        );
+    }
+
+    /// Regression test for a real gap found via live manual pentest:
+    /// `load_secrets` (the `--env-credential` path, which runs before the
+    /// sandbox for this invocation exists) always called `load_secret_by_ref`
+    /// with `outer_caps: None`, even when the CLI's `--allow`/`--write`
+    /// grants for this same invocation were already known. A trojan `op`
+    /// planted in a directory about to be granted write access ran
+    /// unsandboxed. Fixed by threading the already-built `CapabilitySet`
+    /// through `load_secrets`.
+    #[cfg(unix)]
+    #[test]
+    fn load_secrets_sanitizes_path_against_known_outer_caps() {
+        use crate::capability::{AccessMode, CapabilitySource, FsCapability};
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let writable_dir = root.path().join("writable-bin");
+        std::fs::create_dir_all(&writable_dir).expect("mkdir");
+        let marker = root.path().join("marker");
+        let trojan = writable_dir.join("op");
+        std::fs::write(
+            &trojan,
+            format!("#!/bin/sh\n/usr/bin/touch {}\nexit 1\n", marker.display()),
+        )
+        .expect("write trojan");
+        let mut perms = std::fs::metadata(&trojan).expect("meta").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&trojan, perms).expect("chmod");
+
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(FsCapability {
+            original: writable_dir.clone(),
+            resolved: crate::path::try_canonicalize(&writable_dir),
+            access: AccessMode::ReadWrite,
+            is_file: false,
+            source: CapabilitySource::User,
+        });
+
+        // broker_command_with_path (exercised via load_secrets -> load_secret_by_ref)
+        // reads PATH from the process environment directly, so this test needs
+        // a real (locked, restored) mutation rather than passing PATH as a
+        // parameter.
+        static PATH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        struct PathGuard(Option<String>);
+        impl Drop for PathGuard {
+            fn drop(&mut self) {
+                // SAFETY: serialized via PATH_LOCK, held for the guard's lifetime.
+                match &self.0 {
+                    Some(v) => unsafe { std::env::set_var("PATH", v) },
+                    None => unsafe { std::env::remove_var("PATH") },
+                }
+            }
+        }
+
+        let _guard = match PATH_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let real_path = std::env::var("PATH").ok();
+        let poisoned_path = format!(
+            "{}:{}",
+            writable_dir.display(),
+            real_path.clone().unwrap_or_default()
+        );
+        // SAFETY: serialized via PATH_LOCK, restored by PathGuard's Drop.
+        unsafe { std::env::set_var("PATH", &poisoned_path) };
+        let _path_guard = PathGuard(real_path);
+
+        let mut mappings = HashMap::new();
+        mappings.insert("op://vault/item/field".to_string(), "MY_VAR".to_string());
+        // Real op:// resolution will fail (no real `op` on the test host, or
+        // it exits non-zero) — we only care that the trojan never ran.
+        let _ = load_secrets(DEFAULT_SERVICE, &mappings, Some(&caps));
+
+        assert!(
+            !marker.exists(),
+            "trojan op in a directory about to be granted write access must not run"
+        );
+    }
 
     #[test]
     fn test_build_mappings_from_list() {
@@ -3107,6 +3289,7 @@ mod tests {
         let result = load_secret_by_ref(
             DEFAULT_SERVICE,
             "bw://nono-test-item-that-does-not-exist-xyz",
+            None,
         );
         match result {
             Ok(secret) => {
@@ -3375,7 +3558,7 @@ mod tests {
         // Verify that op:// URIs are routed to the 1Password backend, not keyring.
         // We expect a 1Password-specific error (op not installed or auth failure),
         // NOT a keyring "entry not found" error.
-        let result = load_secret_by_ref("nono", "op://vault/item/field");
+        let result = load_secret_by_ref("nono", "op://vault/item/field", None);
         assert!(result.is_err());
         let err = result.expect_err("should be rejected").to_string();
         assert!(
@@ -3390,7 +3573,11 @@ mod tests {
         // Verify that Apple Password URIs are routed to the Apple backend.
         // On macOS this should return an Apple Passwords / security-specific error.
         // On non-macOS it should return the explicit unsupported-platform error.
-        let result = load_secret_by_ref("nono", "apple-password://github.com/alice@example.com");
+        let result = load_secret_by_ref(
+            "nono",
+            "apple-password://github.com/alice@example.com",
+            None,
+        );
         assert!(result.is_err());
         let err = result.expect_err("should be rejected").to_string();
         assert!(
@@ -3546,7 +3733,7 @@ mod tests {
         let test_var = "NONO_TEST_REF_DISPATCH_12345";
         unsafe { std::env::set_var(test_var, "dispatched_ok") };
 
-        let result = load_secret_by_ref("nono", &format!("env://{}", test_var));
+        let result = load_secret_by_ref("nono", &format!("env://{}", test_var), None);
         assert!(
             result.is_ok(),
             "should dispatch to env backend: {:?}",
@@ -4044,7 +4231,7 @@ mod tests {
         let path = dir.path().join("token.txt");
         std::fs::write(&path, "secret-value\n").unwrap();
         let uri = format!("file://{}", path.display());
-        let result = load_secret_by_ref("nono", &uri);
+        let result = load_secret_by_ref("nono", &uri, None);
         assert!(result.is_ok());
         assert_eq!(result.unwrap().as_str(), "secret-value");
     }

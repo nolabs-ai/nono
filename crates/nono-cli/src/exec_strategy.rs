@@ -338,6 +338,10 @@ pub struct SupervisorConfig<'a> {
     pub attach_initial_client: bool,
     /// Configured in-band PTY detach sequence.
     pub detach_sequence: Option<&'a [u8]>,
+    /// The session's write policy, used to strip sandbox-writable PATH
+    /// entries before the unsandboxed browser-open helper resolves
+    /// `open`/`xdg-open` by bare name.
+    pub caps: &'a CapabilitySet,
     /// Allowed URL origins for supervisor-delegated browser opens (from profile).
     /// Empty means no URLs are allowed.
     pub open_url_origins: &'a [String],
@@ -3751,7 +3755,7 @@ fn validate_and_open_url(
     config: &SupervisorConfig<'_>,
 ) -> std::result::Result<(), UrlDenial> {
     validate_url(url, config)?;
-    crate::url_open::open_url_in_browser(url)
+    crate::url_open::open_url_in_browser(url, config.caps)
         .map_err(|msg| UrlDenial::BrowserLaunchFailed { message: msg })
 }
 
@@ -5193,6 +5197,7 @@ mod tests {
             session_id: "test-session",
             attach_initial_client: false,
             detach_sequence: None,
+            caps: &nono::CapabilitySet::default(),
             open_url_origins: &[],
             open_url_allow_localhost: false,
             audit_recorder: None,
@@ -5320,6 +5325,7 @@ mod tests {
             session_id: "test-proxy-v4",
             attach_initial_client: false,
             detach_sequence: None,
+            caps: &nono::CapabilitySet::default(),
             open_url_origins: &[],
             open_url_allow_localhost: false,
             audit_recorder: None,
@@ -5413,6 +5419,7 @@ mod tests {
             session_id: "test",
             attach_initial_client: false,
             detach_sequence: None,
+            caps: &nono::CapabilitySet::default(),
             open_url_origins: &origins,
             open_url_allow_localhost: false,
             audit_recorder: None,
@@ -5459,6 +5466,7 @@ mod tests {
             session_id: "test",
             attach_initial_client: false,
             detach_sequence: None,
+            caps: &nono::CapabilitySet::default(),
             open_url_origins: &[],
             open_url_allow_localhost: false,
             audit_recorder: None,
@@ -5512,6 +5520,7 @@ mod tests {
             session_id: "test",
             attach_initial_client: false,
             detach_sequence: None,
+            caps: &nono::CapabilitySet::default(),
             open_url_origins: &origins,
             open_url_allow_localhost: false,
             audit_recorder: None,
@@ -5581,6 +5590,7 @@ mod tests {
             session_id: "test",
             attach_initial_client: false,
             detach_sequence: None,
+            caps: &nono::CapabilitySet::default(),
             open_url_origins: &[],
             open_url_allow_localhost: true,
             audit_recorder: None,
@@ -5611,6 +5621,7 @@ mod tests {
             session_id: "test",
             attach_initial_client: false,
             detach_sequence: None,
+            caps: &nono::CapabilitySet::default(),
             open_url_origins: &[],
             open_url_allow_localhost: false,
             audit_recorder: None,
@@ -5660,6 +5671,7 @@ mod tests {
             session_id: "test",
             attach_initial_client: false,
             detach_sequence: None,
+            caps: &nono::CapabilitySet::default(),
             open_url_origins: &[],
             open_url_allow_localhost: false,
             audit_recorder: None,
@@ -5814,6 +5826,7 @@ mod tests {
             session_id: "test",
             attach_initial_client: false,
             detach_sequence: None,
+            caps: &nono::CapabilitySet::default(),
             open_url_origins: &[],
             open_url_allow_localhost: false,
             audit_recorder: None,
@@ -5872,6 +5885,7 @@ mod tests {
             session_id: "test",
             attach_initial_client: false,
             detach_sequence: None,
+            caps: &nono::CapabilitySet::default(),
             open_url_origins: &origins,
             open_url_allow_localhost: false,
             audit_recorder: None,
@@ -5919,6 +5933,7 @@ mod tests {
             session_id: "test",
             attach_initial_client: false,
             detach_sequence: None,
+            caps: &nono::CapabilitySet::default(),
             open_url_origins: &[],
             open_url_allow_localhost: true,
             audit_recorder: None,
@@ -5985,6 +6000,7 @@ mod tests {
             session_id: "test",
             attach_initial_client: false,
             detach_sequence: None,
+            caps: &nono::CapabilitySet::default(),
             open_url_origins: &[],
             open_url_allow_localhost: false,
             audit_recorder: None,

@@ -141,6 +141,10 @@ struct ProxyCredentialCaptureBackend {
     active: Mutex<HashSet<String>>,
     active_cv: Condvar,
     redaction_policy: nono::ScrubPolicy,
+    /// The sandbox's write policy, used to strip sandbox-writable
+    /// directories from PATH before the credential-capture browser helper
+    /// (an unsandboxed host-side process) resolves `open`/`xdg-open`.
+    outer_caps: CapabilitySet,
 }
 
 struct ActiveCaptureGuard<'a> {
@@ -204,6 +208,7 @@ impl ProxyCredentialCaptureBackend {
     fn new(
         entries: &HashMap<String, crate::profile::CredentialCaptureEntry>,
         session_id: String,
+        outer_caps: CapabilitySet,
     ) -> Result<Self> {
         let mut resolved = HashMap::new();
         for (name, entry) in entries {
@@ -213,7 +218,7 @@ impl ProxyCredentialCaptureBackend {
                         "credential_capture.{name}.provider.command must not be empty"
                     )));
                 };
-                let command_path = match resolve_capture_command(command)? {
+                let command_path = match resolve_capture_command(command, &outer_caps)? {
                     CaptureCommandResolution::Resolved(path) => path,
                     CaptureCommandResolution::Unavailable(reason) => {
                         warn!(
@@ -238,7 +243,7 @@ impl ProxyCredentialCaptureBackend {
                         "credential_capture.{name}.command must not be empty"
                     )));
                 };
-                let command_path = match resolve_capture_command(command)? {
+                let command_path = match resolve_capture_command(command, &outer_caps)? {
                     CaptureCommandResolution::Resolved(path) => path,
                     CaptureCommandResolution::Unavailable(reason) => {
                         warn!(
@@ -307,6 +312,7 @@ impl ProxyCredentialCaptureBackend {
             active: Mutex::new(HashSet::new()),
             active_cv: Condvar::new(),
             redaction_policy: nono::ScrubPolicy::secure_default(),
+            outer_caps,
         })
     }
 
@@ -391,14 +397,15 @@ impl ProxyCredentialCaptureBackend {
         } else {
             Stdio::piped()
         };
-        let browser_bridge = prepare_capture_browser_bridge(entry, request).map_err(|err| {
-            self.capture_error(
-                entry,
-                CaptureErrorDetails::new("browser_setup_failed", start.elapsed()).reason(format!(
-                    "failed to prepare credential capture browser support: {err}"
-                )),
-            )
-        })?;
+        let browser_bridge = prepare_capture_browser_bridge(entry, request, &self.outer_caps)
+            .map_err(|err| {
+                self.capture_error(
+                    entry,
+                    CaptureErrorDetails::new("browser_setup_failed", start.elapsed()).reason(
+                        format!("failed to prepare credential capture browser support: {err}"),
+                    ),
+                )
+            })?;
         command
             .args(entry.source.args())
             .stdin(stdin)
@@ -761,6 +768,7 @@ impl nono_proxy::capture::CredentialCaptureBackend for ProxyCredentialCaptureBac
 fn prepare_capture_browser_bridge(
     entry: &ResolvedCredentialCaptureEntry,
     request: &nono_proxy::capture::CredentialCaptureRequest,
+    outer_caps: &CapabilitySet,
 ) -> Result<Option<CaptureBrowserBridge>> {
     let Some(policy) = entry.open_urls.clone() else {
         return Ok(None);
@@ -786,6 +794,7 @@ fn prepare_capture_browser_bridge(
     let credential_name = request.credential_name.clone();
     let route_id = request.route_id.clone();
     let session_id = request.session_id.clone();
+    let outer_caps = outer_caps.clone();
     let thread = std::thread::spawn(move || {
         while !stop_for_thread.load(Ordering::SeqCst) {
             match listener.accept() {
@@ -796,6 +805,7 @@ fn prepare_capture_browser_bridge(
                         &credential_name,
                         &route_id,
                         &session_id,
+                        &outer_caps,
                     );
                 }
                 Ok(None) => std::thread::sleep(Duration::from_millis(25)),
@@ -821,6 +831,7 @@ fn handle_capture_url_connection(
     credential_name: &str,
     route_id: &str,
     session_id: &str,
+    outer_caps: &CapabilitySet,
 ) {
     let msg = match socket.recv_message() {
         Ok(msg) => msg,
@@ -838,7 +849,7 @@ fn handle_capture_url_connection(
     }
     let request_id = request.request_id.clone();
     let (success, error) = match validate_capture_url(&request.url, policy)
-        .and_then(|()| open_url_in_browser(&request.url))
+        .and_then(|()| crate::url_open::open_url_in_browser(&request.url, outer_caps))
     {
         Ok(()) => {
             info!(
@@ -914,37 +925,6 @@ fn validate_capture_url(
         Err(format!(
             "Origin {origin} is not in credential_capture interaction.open_urls.allow_origins"
         ))
-    }
-}
-
-fn open_url_in_browser(url: &str) -> std::result::Result<(), String> {
-    #[cfg(target_os = "macos")]
-    let result = std::process::Command::new("open")
-        .arg(url)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-
-    #[cfg(target_os = "linux")]
-    let result = std::process::Command::new("xdg-open")
-        .arg(url)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    let result: std::result::Result<std::process::ExitStatus, std::io::Error> =
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "URL opening not supported on this platform",
-        ));
-
-    match result {
-        Ok(status) if status.success() => Ok(()),
-        Ok(status) => Err(format!("Browser opener exited with status: {status}")),
-        Err(err) => Err(format!("Failed to launch browser: {err}")),
     }
 }
 
@@ -1346,7 +1326,22 @@ enum CaptureCommandResolution {
     Unavailable(String),
 }
 
-fn resolve_capture_command(command: &str) -> Result<CaptureCommandResolution> {
+fn resolve_capture_command(
+    command: &str,
+    outer_caps: &CapabilitySet,
+) -> Result<CaptureCommandResolution> {
+    resolve_capture_command_with_path(command, std::env::var_os("PATH").as_deref(), outer_caps)
+}
+
+/// Core of [`resolve_capture_command`], taking the PATH value as a parameter
+/// rather than reading the process environment, so tests can exercise PATH
+/// resolution without mutating global process state (which is unsafe to do
+/// under a parallel test runner).
+fn resolve_capture_command_with_path(
+    command: &str,
+    path_var: Option<&std::ffi::OsStr>,
+    outer_caps: &CapabilitySet,
+) -> Result<CaptureCommandResolution> {
     let expanded = crate::policy::expand_env_vars(command);
     let command = expanded.as_str();
     let path = PathBuf::from(command);
@@ -1358,19 +1353,28 @@ fn resolve_capture_command(command: &str) -> Result<CaptureCommandResolution> {
             "credential_capture command '{command}' must be an absolute path or bare command name"
         )));
     }
-    let Some(path_var) = std::env::var_os("PATH") else {
+    let Some(path_var) = path_var else {
         return Ok(CaptureCommandResolution::Unavailable(format!(
             "credential_capture command '{command}' could not be resolved because PATH is unset"
         )));
     };
-    for dir in std::env::split_paths(&path_var) {
+    // A bare command name is resolved by walking PATH, same as any shell
+    // would. If a directory earlier on PATH than the real binary is
+    // sandbox-writable (e.g. `$HOME/go/bin`, commonly both on PATH and
+    // granted write access), the sandboxed process could plant a binary
+    // there and this broker — which runs host-side, unsandboxed — would
+    // pick it up instead of the real one. Only resolve within directories
+    // proven read-only to the sandbox.
+    let safe_path =
+        nono::sanitize_broker_path_for_binary(&path_var.to_string_lossy(), command, outer_caps);
+    for dir in std::env::split_paths(&safe_path) {
         let candidate = dir.join(command);
         if candidate.is_file() {
             return validate_capture_command_path(candidate);
         }
     }
     Ok(CaptureCommandResolution::Unavailable(format!(
-        "credential_capture command '{command}' was not found in PATH"
+        "credential_capture command '{command}' was not found on a sandbox-read-only PATH directory"
     )))
 }
 
@@ -1430,6 +1434,7 @@ pub(crate) fn prepare_proxy_launch_options(
     let mut tool_sandbox_proxy_credentials = HashSet::new();
     extend_proxy_settings_with_tool_sandbox_credentials(
         prepared.command_policies.as_ref(),
+        &prepared.caps,
         &mut credentials,
         &mut custom_credentials,
         &mut proxy_source_env_vars,
@@ -1738,6 +1743,7 @@ pub(crate) fn resolve_effective_proxy_settings(
 
 fn extend_proxy_settings_with_tool_sandbox_credentials(
     config: Option<&CommandPoliciesConfig>,
+    outer_caps: &CapabilitySet,
     credentials: &mut Vec<String>,
     custom_credentials: &mut HashMap<String, crate::profile::CustomCredentialDef>,
     proxy_source_env_vars: &mut HashMap<String, String>,
@@ -1753,6 +1759,7 @@ fn extend_proxy_settings_with_tool_sandbox_credentials(
             collect_tool_sandbox_proxy_grants(
                 config,
                 sandbox,
+                outer_caps,
                 credentials,
                 custom_credentials,
                 proxy_source_env_vars,
@@ -1765,6 +1772,7 @@ fn extend_proxy_settings_with_tool_sandbox_credentials(
                 CommandFromConfig::Edge(edge) => collect_tool_sandbox_proxy_grants(
                     config,
                     &edge.sandbox,
+                    outer_caps,
                     credentials,
                     custom_credentials,
                     proxy_source_env_vars,
@@ -1774,6 +1782,7 @@ fn extend_proxy_settings_with_tool_sandbox_credentials(
                 CommandFromConfig::Policy(sandbox) => collect_tool_sandbox_proxy_grants(
                     config,
                     sandbox,
+                    outer_caps,
                     credentials,
                     custom_credentials,
                     proxy_source_env_vars,
@@ -1788,9 +1797,11 @@ fn extend_proxy_settings_with_tool_sandbox_credentials(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_tool_sandbox_proxy_grants(
     config: &CommandPoliciesConfig,
     sandbox: &CommandSandboxConfig,
+    outer_caps: &CapabilitySet,
     credentials: &mut Vec<String>,
     custom_credentials: &mut HashMap<String, crate::profile::CustomCredentialDef>,
     proxy_source_env_vars: &mut HashMap<String, String>,
@@ -1866,7 +1877,7 @@ fn collect_tool_sandbox_proxy_grants(
 
         let credential_key = if let Some(source) = &credential.source {
             let env_var = proxy_source_env_var(&grant.name);
-            let value = load_supervisor_credential_source(source)?;
+            let value = load_supervisor_credential_source(source, outer_caps)?;
             proxy_source_env_vars.insert(env_var.clone(), value);
             Some(format!("env://{env_var}"))
         } else {
@@ -1958,17 +1969,22 @@ fn proxy_source_env_var(name: &str) -> String {
 
 fn load_supervisor_credential_source(
     source: &crate::command_policy::AmbientCredentialSourceConfig,
+    outer_caps: &CapabilitySet,
 ) -> Result<String> {
     match source {
         crate::command_policy::AmbientCredentialSourceConfig::Keystore { key } => {
-            nono::keystore::load_secret_by_ref(nono::keystore::DEFAULT_SERVICE, key)
-                .map(|secret| secret.to_string())
+            nono::keystore::load_secret_by_ref(
+                nono::keystore::DEFAULT_SERVICE,
+                key,
+                Some(outer_caps),
+            )
+            .map(|secret| secret.to_string())
         }
         crate::command_policy::AmbientCredentialSourceConfig::Command {
             command,
             args,
             timeout_secs,
-        } => load_command_credential_source(command, args, *timeout_secs),
+        } => load_command_credential_source(command, args, *timeout_secs, outer_caps),
     }
 }
 
@@ -1976,10 +1992,21 @@ fn load_command_credential_source(
     command: &str,
     args: &[String],
     timeout_secs: Option<u64>,
+    outer_caps: &CapabilitySet,
 ) -> Result<String> {
     let timeout = Duration::from_secs(timeout_secs.unwrap_or(30));
+    // `command` may be a bare name resolved by PATH lookup, and this process
+    // runs host-side, unsandboxed. Strip any PATH entry the sandbox could
+    // write to before spawning, so it can't plant a trojan for this lookup
+    // to find.
+    let safe_path = nono::sanitize_broker_path_for_binary(
+        &std::env::var("PATH").unwrap_or_default(),
+        command,
+        outer_caps,
+    );
     let mut child = Command::new(command)
         .args(args)
+        .env("PATH", &safe_path)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -2484,6 +2511,7 @@ pub(crate) fn build_proxy_config_from_flags(
 pub(crate) fn build_credential_capture_backend(
     credential_capture: &HashMap<String, crate::profile::CredentialCaptureEntry>,
     session_id: String,
+    outer_caps: CapabilitySet,
 ) -> Result<Option<Arc<dyn nono_proxy::capture::CredentialCaptureBackend>>> {
     if credential_capture.is_empty() {
         return Ok(None);
@@ -2491,6 +2519,7 @@ pub(crate) fn build_credential_capture_backend(
     Ok(Some(Arc::new(ProxyCredentialCaptureBackend::new(
         credential_capture,
         session_id,
+        outer_caps,
     )?)))
 }
 
@@ -2897,6 +2926,7 @@ pub(crate) fn start_proxy_runtime(
     let _source_env_guard = ScopedEnvVars::set(&proxy.proxy_source_env_vars);
     let mut proxy_config = build_proxy_config_from_flags(proxy)?;
     proxy_config.direct_connect_ports = caps.tcp_connect_ports().to_vec();
+    proxy_config.outer_caps = Some(caps.clone());
 
     apply_tls_intercept_config(&mut proxy_config, proxy)?;
 
@@ -2907,8 +2937,11 @@ pub(crate) fn start_proxy_runtime(
         .map_err(|e| NonoError::SandboxInit(format!("Failed to start proxy runtime: {}", e)))?;
     let approval_registry =
         crate::approval_runtime::build_proxy_approval_registry(proxy.command_policies.as_ref())?;
-    let credential_capture_backend =
-        build_credential_capture_backend(&proxy.credential_capture, proxy.session_id.clone())?;
+    let credential_capture_backend = build_credential_capture_backend(
+        &proxy.credential_capture,
+        proxy.session_id.clone(),
+        caps.clone(),
+    )?;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     let nonce_resolver: Option<Arc<dyn nono_proxy::NonceResolver>> = shared_broker
         .map(|b| -> Arc<dyn nono_proxy::NonceResolver> { Arc::new(TokenBrokerNonceResolver(b)) });
@@ -3239,6 +3272,8 @@ fn read_parent_ssl_cert_file() -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nono::{AccessMode, CapabilitySource, FsCapability};
+
     use crate::command_policy::{
         ApprovalBackendConfig, ApprovalBackendType, CommandCredentialConfig,
         CommandCredentialGrantPolicyConfig, CommandPolicyConfig, EndpointRuleConfig,
@@ -3844,6 +3879,7 @@ mod tests {
         let mut tool_sandbox_proxy_credentials = HashSet::new();
         extend_proxy_settings_with_tool_sandbox_credentials(
             Some(&policies),
+            &nono::CapabilitySet::default(),
             &mut credentials,
             &mut custom_credentials,
             &mut proxy_source_env_vars,
@@ -3906,6 +3942,7 @@ mod tests {
         let mut tool_sandbox_proxy_credentials = HashSet::new();
         let err = extend_proxy_settings_with_tool_sandbox_credentials(
             Some(&policies),
+            &nono::CapabilitySet::default(),
             &mut credentials,
             &mut custom_credentials,
             &mut proxy_source_env_vars,
@@ -4016,6 +4053,7 @@ mod tests {
         let mut tool_sandbox_proxy_credentials = HashSet::new();
         extend_proxy_settings_with_tool_sandbox_credentials(
             Some(&policies),
+            &nono::CapabilitySet::default(),
             &mut credentials,
             &mut custom_credentials,
             &mut proxy_source_env_vars,
@@ -4109,7 +4147,11 @@ mod tests {
             "github".to_string(),
             test_capture_entry(vec!["/bin/echo".to_string(), "ghp_test".to_string()]),
         );
-        let backend = ProxyCredentialCaptureBackend::new(&entries, "sess-test".to_string())?;
+        let backend = ProxyCredentialCaptureBackend::new(
+            &entries,
+            "sess-test".to_string(),
+            nono::CapabilitySet::default(),
+        )?;
         let request = nono_proxy::capture::CredentialCaptureRequest {
             credential_name: "github".to_string(),
             route_id: "github".to_string(),
@@ -4156,6 +4198,7 @@ mod tests {
         let backend = std::sync::Arc::new(ProxyCredentialCaptureBackend::new(
             &entries,
             "sess-parallel".to_string(),
+            nono::CapabilitySet::default(),
         )?);
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
 
@@ -4213,7 +4256,11 @@ mod tests {
             "empty".to_string(),
             test_capture_entry_no_cache(vec!["/bin/echo".to_string()]),
         );
-        let backend = ProxyCredentialCaptureBackend::new(&entries, "sess-test".to_string())?;
+        let backend = ProxyCredentialCaptureBackend::new(
+            &entries,
+            "sess-test".to_string(),
+            nono::CapabilitySet::default(),
+        )?;
         let request = nono_proxy::capture::CredentialCaptureRequest {
             credential_name: "empty".to_string(),
             route_id: "empty".to_string(),
@@ -4242,7 +4289,11 @@ mod tests {
                 "printf 'Authorization: Bearer ghp_secret\\n' >&2; exit 7".to_string(),
             ]),
         );
-        let backend = ProxyCredentialCaptureBackend::new(&entries, "sess-test".to_string())?;
+        let backend = ProxyCredentialCaptureBackend::new(
+            &entries,
+            "sess-test".to_string(),
+            nono::CapabilitySet::default(),
+        )?;
         let request = nono_proxy::capture::CredentialCaptureRequest {
             credential_name: "github".to_string(),
             route_id: "github".to_string(),
@@ -4278,7 +4329,11 @@ mod tests {
         entry.cache_path_regex = Some("^/(?:repos/|orgs/)?([^/]+)".to_string());
         let mut entries = HashMap::new();
         entries.insert("github".to_string(), entry);
-        let backend = ProxyCredentialCaptureBackend::new(&entries, "sess-test".to_string())?;
+        let backend = ProxyCredentialCaptureBackend::new(
+            &entries,
+            "sess-test".to_string(),
+            nono::CapabilitySet::default(),
+        )?;
         let request = nono_proxy::capture::CredentialCaptureRequest {
             credential_name: "github".to_string(),
             route_id: "github".to_string(),
@@ -4315,7 +4370,11 @@ mod tests {
         );
         let mut entries = HashMap::new();
         entries.insert("gateway".to_string(), entry);
-        let backend = ProxyCredentialCaptureBackend::new(&entries, "sess-test".to_string())?;
+        let backend = ProxyCredentialCaptureBackend::new(
+            &entries,
+            "sess-test".to_string(),
+            nono::CapabilitySet::default(),
+        )?;
         let response = nono_proxy::capture::CredentialCaptureBackend::capture(
             &backend,
             nono_proxy::capture::CredentialCaptureRequest {
@@ -4369,7 +4428,11 @@ mod tests {
         });
         let mut entries = HashMap::new();
         entries.insert("acme_mcp".to_string(), entry);
-        let backend = ProxyCredentialCaptureBackend::new(&entries, "sess-provider".to_string())?;
+        let backend = ProxyCredentialCaptureBackend::new(
+            &entries,
+            "sess-provider".to_string(),
+            nono::CapabilitySet::default(),
+        )?;
         let response = nono_proxy::capture::CredentialCaptureBackend::capture(
             &backend,
             nono_proxy::capture::CredentialCaptureRequest {
@@ -4427,7 +4490,11 @@ mod tests {
         );
         let mut entries = HashMap::new();
         entries.insert("gateway".to_string(), entry);
-        let backend = ProxyCredentialCaptureBackend::new(&entries, "sess-provider".to_string())?;
+        let backend = ProxyCredentialCaptureBackend::new(
+            &entries,
+            "sess-provider".to_string(),
+            nono::CapabilitySet::default(),
+        )?;
         let response = nono_proxy::capture::CredentialCaptureBackend::capture(
             &backend,
             nono_proxy::capture::CredentialCaptureRequest {
@@ -4465,7 +4532,11 @@ mod tests {
         entry.cache_path_regex = Some("^/orgs/([^/]+)".to_string());
         let mut entries = HashMap::new();
         entries.insert("github".to_string(), entry);
-        let backend = ProxyCredentialCaptureBackend::new(&entries, "sess-stdin".to_string())?;
+        let backend = ProxyCredentialCaptureBackend::new(
+            &entries,
+            "sess-stdin".to_string(),
+            nono::CapabilitySet::default(),
+        )?;
         let response = nono_proxy::capture::CredentialCaptureBackend::capture(
             &backend,
             nono_proxy::capture::CredentialCaptureRequest {
@@ -4511,7 +4582,11 @@ mod tests {
         });
         let mut entries = HashMap::new();
         entries.insert("github".to_string(), entry);
-        let backend = ProxyCredentialCaptureBackend::new(&entries, "sess-browser".to_string())?;
+        let backend = ProxyCredentialCaptureBackend::new(
+            &entries,
+            "sess-browser".to_string(),
+            nono::CapabilitySet::default(),
+        )?;
         let response = nono_proxy::capture::CredentialCaptureBackend::capture(
             &backend,
             nono_proxy::capture::CredentialCaptureRequest {
@@ -4536,7 +4611,11 @@ mod tests {
         let entry = test_capture_entry_no_cache(vec!["nono-nonexistent-helper-xyz".to_string()]);
         let mut entries = HashMap::new();
         entries.insert("ghost".to_string(), entry);
-        let backend = ProxyCredentialCaptureBackend::new(&entries, "sess-ghost".to_string())?;
+        let backend = ProxyCredentialCaptureBackend::new(
+            &entries,
+            "sess-ghost".to_string(),
+            nono::CapabilitySet::default(),
+        )?;
 
         let err = nono_proxy::capture::CredentialCaptureBackend::capture(
             &backend,
@@ -4566,7 +4645,11 @@ mod tests {
         let mut entries = HashMap::new();
         entries.insert("present".to_string(), resolvable);
         entries.insert("ghost".to_string(), missing);
-        let backend = ProxyCredentialCaptureBackend::new(&entries, "sess-mixed".to_string())?;
+        let backend = ProxyCredentialCaptureBackend::new(
+            &entries,
+            "sess-mixed".to_string(),
+            nono::CapabilitySet::default(),
+        )?;
 
         let response = nono_proxy::capture::CredentialCaptureBackend::capture(
             &backend,
@@ -4609,8 +4692,11 @@ mod tests {
         });
         let mut entries = HashMap::new();
         entries.insert("ghost_provider".to_string(), entry);
-        let backend =
-            ProxyCredentialCaptureBackend::new(&entries, "sess-ghost-provider".to_string())?;
+        let backend = ProxyCredentialCaptureBackend::new(
+            &entries,
+            "sess-ghost-provider".to_string(),
+            nono::CapabilitySet::default(),
+        )?;
 
         let err = nono_proxy::capture::CredentialCaptureBackend::capture(
             &backend,
@@ -4629,9 +4715,146 @@ mod tests {
         Ok(())
     }
 
+    /// A directory-only PATH check can't see a write grant scoped to one
+    /// exact file inside an otherwise-safe directory. `resolve_capture_command`
+    /// knows the binary name it's resolving, so it must check the resolved
+    /// candidate itself, not just the directory it lives in.
+    #[cfg(unix)]
+    #[test]
+    fn resolve_capture_command_rejects_file_scoped_write_grant_on_exact_binary_name() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let bin_dir = root.path().join("usr-local-bin"); // not directory-writable
+        std::fs::create_dir_all(&bin_dir).expect("mkdir");
+
+        let trojan = bin_dir.join("ocm");
+        std::fs::write(&trojan, "#!/bin/sh\necho trojan\n").expect("write trojan");
+        let mut perms = std::fs::metadata(&trojan).expect("metadata").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&trojan, perms).expect("chmod");
+
+        // File-scoped write grant on the exact resolved binary path, not the
+        // directory. The directory itself has no grant at all.
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(FsCapability {
+            original: trojan.clone(),
+            resolved: nono::try_canonicalize(&trojan),
+            access: AccessMode::Write,
+            is_file: true,
+            source: CapabilitySource::User,
+        });
+
+        let path_var = std::ffi::OsString::from(bin_dir.display().to_string());
+        let resolution = resolve_capture_command_with_path("ocm", Some(&path_var), &caps)
+            .expect("resolution should not error");
+        assert!(
+            matches!(resolution, CaptureCommandResolution::Unavailable(_)),
+            "must not resolve a binary with a file-scoped write grant directly \
+             on it, even though the containing directory itself is not writable, \
+             got {resolution:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_capture_command_absolute_path_ignores_unset_path_env() {
+        // An absolute command never needs PATH lookup at all; a missing PATH
+        // env var must not make it "Unavailable" — that's specifically a
+        // bare-name-resolution failure mode.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = dir.path().join("real-tool");
+        std::fs::write(&script, "#!/bin/sh\necho hi\n").expect("write script");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script).expect("metadata").permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms).expect("chmod");
+        }
+
+        let result = resolve_capture_command_with_path(
+            script.to_str().expect("utf8 path"),
+            None,
+            &CapabilitySet::default(),
+        )
+        .expect("absolute path resolution should not error");
+        assert!(
+            matches!(result, CaptureCommandResolution::Resolved(_)),
+            "absolute path must resolve without consulting PATH, got {result:?}"
+        );
+    }
+
+    /// Live regression test for the tool-sandbox-proxy-credential variant of
+    /// `load_command_credential_source` (this file has its own copy,
+    /// separate from `tool_sandbox::policy`'s). Same bare-name-resolution
+    /// broker as the other copy — a trojan on a sandbox-writable PATH dir
+    /// must not run.
+    #[cfg(unix)]
+    #[test]
+    fn load_command_credential_source_skips_trojan_in_writable_path_dir() {
+        use nono::{AccessMode, CapabilitySource, FsCapability};
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let writable_dir = root.path().join("writable-bin");
+        let real_dir = root.path().join("real-bin");
+        std::fs::create_dir_all(&writable_dir).expect("mkdir writable");
+        std::fs::create_dir_all(&real_dir).expect("mkdir real");
+
+        let trojan_marker = root.path().join("trojan_marker");
+        let real_marker = root.path().join("real_marker");
+        for (dir, marker, output) in [
+            (&writable_dir, &trojan_marker, "trojan-secret"),
+            (&real_dir, &real_marker, "real-secret"),
+        ] {
+            let script = dir.join("mycreds");
+            std::fs::write(
+                &script,
+                format!(
+                    "#!/bin/sh\n/usr/bin/touch {}\necho {}\nexit 0\n",
+                    marker.display(),
+                    output
+                ),
+            )
+            .expect("write script");
+            let mut perms = std::fs::metadata(&script).expect("meta").permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms).expect("chmod");
+        }
+
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(FsCapability {
+            original: writable_dir.clone(),
+            resolved: nono::try_canonicalize(&writable_dir),
+            access: AccessMode::ReadWrite,
+            is_file: false,
+            source: CapabilitySource::User,
+        });
+
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let poisoned_path = format!("{}:{}", writable_dir.display(), real_dir.display());
+        let _env = crate::test_env::EnvVarGuard::set_all(&[("PATH", &poisoned_path)]);
+
+        let result = load_command_credential_source("mycreds", &[], None, &caps)
+            .expect("real fallback binary should run and succeed");
+
+        assert!(
+            !trojan_marker.exists(),
+            "trojan in the sandbox-writable directory must not have run"
+        );
+        assert!(
+            real_marker.exists(),
+            "real binary in the non-writable directory should have run"
+        );
+        assert_eq!(result.trim(), "real-secret");
+    }
+
     #[test]
     fn resolve_capture_command_malformed_reference_still_errors() {
-        let result = resolve_capture_command("foo/bar");
+        let result = resolve_capture_command("foo/bar", &nono::CapabilitySet::default());
         assert!(
             matches!(result, Err(NonoError::ConfigParse(_))),
             "relative path with separator should still be a hard error, got {result:?}"
@@ -4642,11 +4865,70 @@ mod tests {
     fn resolve_capture_command_rejects_non_native_separator() {
         // A relative command embedding a backslash must be rejected on every
         // platform, not just on Windows where `\` is the native separator.
-        let result = resolve_capture_command("foo\\bar");
+        let result = resolve_capture_command("foo\\bar", &nono::CapabilitySet::default());
         assert!(
             matches!(result, Err(NonoError::ConfigParse(_))),
             "relative path with non-native separator should still be a hard error, got {result:?}"
         );
+    }
+
+    /// Real-world shape: `$HOME/go/bin` (or similar) is both on the ambient
+    /// PATH *and* granted write access by the profile (e.g. `filesystem.allow`)
+    /// because legitimate build output lands there. If the sandboxed process
+    /// plants a same-named binary in that writable directory, a bare-name
+    /// `credential_capture` command (e.g. `command: ["ocm", "auth", "datahub"]`)
+    /// must not resolve to it — even though it comes first on PATH — and must
+    /// instead fall through to the real binary further down PATH.
+    #[cfg(unix)]
+    #[test]
+    fn credential_capture_command_skips_trojan_in_writable_path_dir() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let writable_bin = root.path().join("home-go-bin");
+        let real_bin = root.path().join("usr-local-bin");
+        std::fs::create_dir_all(&writable_bin).expect("mkdir writable");
+        std::fs::create_dir_all(&real_bin).expect("mkdir real");
+
+        let trojan = writable_bin.join("ocm");
+        let real = real_bin.join("ocm");
+        std::fs::write(&trojan, b"#!/bin/sh\necho trojan\n").expect("write trojan");
+        std::fs::write(&real, b"#!/bin/sh\necho real\n").expect("write real");
+        for p in [&trojan, &real] {
+            let mut perms = std::fs::metadata(p).expect("metadata").permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(p, perms).expect("chmod");
+        }
+
+        // Mirrors `filesystem.allow: ["$HOME/go/bin"]` from the profile.
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(FsCapability {
+            original: writable_bin.clone(),
+            resolved: nono::try_canonicalize(&writable_bin),
+            access: AccessMode::ReadWrite,
+            is_file: false,
+            source: CapabilitySource::User,
+        });
+
+        // Ambient PATH exactly as described: the writable dir comes first,
+        // same as `PATH=/Users/me/go/bin:/usr/bin` in the real report.
+        let path_var =
+            std::ffi::OsString::from(format!("{}:{}", writable_bin.display(), real_bin.display()));
+
+        let resolution = resolve_capture_command_with_path("ocm", Some(&path_var), &caps)
+            .expect("resolution should not error");
+        match resolution {
+            CaptureCommandResolution::Resolved(path) => {
+                assert_eq!(
+                    path,
+                    real.canonicalize().expect("canonicalize real"),
+                    "must resolve to the real binary on the read-only directory, not the trojan"
+                );
+            }
+            CaptureCommandResolution::Unavailable(reason) => {
+                panic!("expected the real binary to resolve, got Unavailable: {reason}")
+            }
+        }
     }
 
     #[cfg(unix)]
@@ -4667,7 +4949,11 @@ mod tests {
         let entry = test_capture_entry_no_cache(vec![path.to_string_lossy().into_owned()]);
         let mut entries = HashMap::new();
         entries.insert("not_exec".to_string(), entry);
-        let backend = ProxyCredentialCaptureBackend::new(&entries, "sess-not-exec".to_string())?;
+        let backend = ProxyCredentialCaptureBackend::new(
+            &entries,
+            "sess-not-exec".to_string(),
+            nono::CapabilitySet::default(),
+        )?;
 
         let err = nono_proxy::capture::CredentialCaptureBackend::capture(
             &backend,
@@ -4697,7 +4983,11 @@ mod tests {
         let entry = test_capture_entry_no_cache(vec![link_path.to_string_lossy().into_owned()]);
         let mut entries = HashMap::new();
         entries.insert("dangling".to_string(), entry);
-        let backend = ProxyCredentialCaptureBackend::new(&entries, "sess-dangling".to_string())?;
+        let backend = ProxyCredentialCaptureBackend::new(
+            &entries,
+            "sess-dangling".to_string(),
+            nono::CapabilitySet::default(),
+        )?;
 
         let err = nono_proxy::capture::CredentialCaptureBackend::capture(
             &backend,
@@ -4722,7 +5012,11 @@ mod tests {
         let entry = test_capture_entry_no_cache(vec![temp.path().to_string_lossy().into_owned()]);
         let mut entries = HashMap::new();
         entries.insert("a_directory".to_string(), entry);
-        let backend = ProxyCredentialCaptureBackend::new(&entries, "sess-directory".to_string())?;
+        let backend = ProxyCredentialCaptureBackend::new(
+            &entries,
+            "sess-directory".to_string(),
+            nono::CapabilitySet::default(),
+        )?;
 
         let err = nono_proxy::capture::CredentialCaptureBackend::capture(
             &backend,
@@ -5102,8 +5396,11 @@ mod tests {
             });
             let mut entries = HashMap::new();
             entries.insert("test-cred".to_string(), entry);
-            let backend =
-                ProxyCredentialCaptureBackend::new(&entries, "sess-stdio-stdin".to_string())?;
+            let backend = ProxyCredentialCaptureBackend::new(
+                &entries,
+                "sess-stdio-stdin".to_string(),
+                nono::CapabilitySet::default(),
+            )?;
             let response = nono_proxy::capture::CredentialCaptureBackend::capture(
                 &backend,
                 nono_proxy::capture::CredentialCaptureRequest {
@@ -5181,8 +5478,11 @@ mod tests {
             });
             let mut entries = HashMap::new();
             entries.insert("test-cred".to_string(), entry);
-            let backend =
-                ProxyCredentialCaptureBackend::new(&entries, "sess-inherit-stdin".to_string())?;
+            let backend = ProxyCredentialCaptureBackend::new(
+                &entries,
+                "sess-inherit-stdin".to_string(),
+                nono::CapabilitySet::default(),
+            )?;
             let response = nono_proxy::capture::CredentialCaptureBackend::capture(
                 &backend,
                 nono_proxy::capture::CredentialCaptureRequest {

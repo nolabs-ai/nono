@@ -25,6 +25,8 @@ use crate::tool_sandbox::protocol::{
     send_frame_ack, send_stdio_fds, validate_ipc_request, write_frame, write_response,
 };
 use nix::libc;
+use nix::sys::signal::{self, Signal};
+use nix::unistd::{Pid, getpgid};
 use nono::supervisor::ApprovalRequest;
 use nono::{
     AccessMode, CapabilitySet, FsCapability, NetworkMode, NonoError, Result, Sandbox,
@@ -42,8 +44,8 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, trace, warn};
 use zeroize::Zeroizing;
@@ -110,6 +112,7 @@ struct ShimIdentity {
     id: FileId,
 }
 
+#[derive(Clone)]
 struct ActiveChild {
     command: String,
     /// The caller this command was launched under (its policy edge). A URL-open
@@ -120,6 +123,14 @@ struct ActiveChild {
     /// Monotonic start time (pbi_start_tvsec * 1_000_000 + pbi_start_tvusec)
     /// used to detect stale pid map entries.
     start_usec: u64,
+    /// pid of the shim that requested this launch.
+    requester_pid: u32,
+    /// The requester's process group at request time.
+    requester_pgid: Option<Pid>,
+    /// The requester's kernel identity at request time..
+    requester_identity: Option<DaemonIdentity>,
+    /// The requester's session at request time.
+    requester_sid: Option<u32>,
 }
 
 struct ChildLaunchResult {
@@ -349,6 +360,7 @@ impl PreparedToolSandboxRuntime {
             listener: Arc::new(listener),
             url_listener,
         };
+        register_active_tool_sandbox_state(&runtime.inner);
         cleanup.disarm();
         Ok(runtime)
     }
@@ -481,6 +493,7 @@ impl PreparedToolSandboxRuntime {
         session_id: &str,
         audit_recorder: Option<Arc<Mutex<crate::audit_integrity::AuditRecorder>>>,
     ) -> Result<()> {
+        start_signal_relay_thread();
         self.spawn_url_listener(session_root_pid, session_id, audit_recorder.clone());
         let state = Arc::clone(&self.inner);
         let listener = Arc::clone(&self.listener);
@@ -1411,7 +1424,14 @@ fn handle_shim_stream_inner(
         }
         let result = (|| {
             let launch = build_child_launch_spec(state, &request, effective_sandbox, &caller)?;
-            launch_child_with_capture(state, &request.command, &caller, launch, stdio)
+            launch_child_with_capture(
+                state,
+                &request.command,
+                &caller,
+                auth.peer_pid,
+                launch,
+                stdio,
+            )
         })();
         state.active_count.fetch_sub(1, Ordering::SeqCst);
         return match result {
@@ -1501,7 +1521,14 @@ fn handle_shim_stream_inner(
         }
         let result = (|| {
             let launch = build_child_launch_spec(state, &request, effective_sandbox, &caller)?;
-            launch_child_with_capture(state, &request.command, &caller, launch, stdio)
+            launch_child_with_capture(
+                state,
+                &request.command,
+                &caller,
+                auth.peer_pid,
+                launch,
+                stdio,
+            )
         })();
         state.active_count.fetch_sub(1, Ordering::SeqCst);
         return match result {
@@ -1584,7 +1611,14 @@ fn handle_shim_stream_inner(
                 false,
                 &caller,
             )?;
-            launch_child(state, &request.command, &caller, launch, stdio)
+            launch_child(
+                state,
+                &request.command,
+                &caller,
+                auth.peer_pid,
+                launch,
+                stdio,
+            )
         })();
         state.active_count.fetch_sub(1, Ordering::SeqCst);
         return match result {
@@ -1663,7 +1697,14 @@ fn handle_shim_stream_inner(
     }
     let result = (|| {
         let launch = build_child_launch_spec(state, &request, effective_sandbox, &caller)?;
-        launch_child(state, &request.command, &caller, launch, stdio)
+        launch_child(
+            state,
+            &request.command,
+            &caller,
+            auth.peer_pid,
+            launch,
+            stdio,
+        )
     })();
     state.active_count.fetch_sub(1, Ordering::SeqCst);
     match result {
@@ -2578,6 +2619,11 @@ fn resolve_url_open_command(
 }
 
 fn is_pid_alive_with_start(pid: u32, expected_start_usec: u64) -> bool {
+    tracked_pid_start_usec(pid) == Some(expected_start_usec)
+}
+
+/// `pid`'s BSD start time.
+fn tracked_pid_start_usec(pid: u32) -> Option<u64> {
     let mut info: ProcBsdInfo = unsafe { std::mem::zeroed() };
     let size = std::mem::size_of::<ProcBsdInfo>() as i32;
     // SAFETY: same as parent_pid.
@@ -2591,10 +2637,20 @@ fn is_pid_alive_with_start(pid: u32, expected_start_usec: u64) -> bool {
         )
     };
     if ret != size {
-        return false;
+        return None;
     }
-    let start_usec = info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec as u64;
-    start_usec == expected_start_usec
+    Some(info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec as u64)
+}
+
+/// Whether a signal sent to the process group `pid` leads can still reach
+/// something that belongs to this tracked child.
+fn pgroup_may_be_reachable(pid: u32, expected_start_usec: u64) -> bool {
+    match tracked_pid_start_usec(pid) {
+        Some(start_usec) => start_usec == expected_start_usec,
+        // Signal 0: an existence probe, which succeeds while the group still has
+        // any member.
+        None => signal::kill(Pid::from_raw(-(pid as i32)), None).is_ok(),
+    }
 }
 
 fn track_child(
@@ -2602,20 +2658,28 @@ fn track_child(
     child_pid: u32,
     command_name: &str,
     launch_caller: &Caller,
+    requester_pid: u32,
 ) -> Result<()> {
     let identity = daemon_identity(child_pid);
     let start_usec = identity.map_or(0, |identity| identity.start_usec);
+    let requester_pgid = getpgid(Some(Pid::from_raw(requester_pid as i32))).ok();
+    let requester_identity = daemon_identity(requester_pid);
+    let requester_sid = session_id_of(requester_pid);
     let mut map = state
         .active_children
         .lock()
         .map_err(|_| NonoError::SandboxInit("tool-sandbox pid map lock poisoned".to_string()))?;
-    map.retain(|pid, child| is_pid_alive_with_start(*pid, child.start_usec));
+    map.retain(|pid, child| pgroup_may_be_reachable(*pid, child.start_usec));
     map.insert(
         child_pid,
         ActiveChild {
             command: command_name.to_string(),
             launch_caller: launch_caller.clone(),
             start_usec,
+            requester_pid,
+            requester_pgid,
+            requester_identity,
+            requester_sid,
         },
     );
     drop(map);
@@ -2632,6 +2696,292 @@ fn untrack_child(state: &ToolSandboxState, child_pid: u32) -> Result<()> {
         .map_err(|_| NonoError::SandboxInit("tool-sandbox pid map lock poisoned".to_string()))?;
     map.remove(&child_pid);
     Ok(())
+}
+
+static ACTIVE_TOOL_SANDBOX_STATE: Mutex<Option<Weak<ToolSandboxState>>> = Mutex::new(None);
+
+fn register_active_tool_sandbox_state(state: &Arc<ToolSandboxState>) {
+    if let Ok(mut slot) = ACTIVE_TOOL_SANDBOX_STATE.lock() {
+        *slot = Some(Arc::downgrade(state));
+    }
+}
+
+fn active_tool_sandbox_state() -> Option<Arc<ToolSandboxState>> {
+    ACTIVE_TOOL_SANDBOX_STATE.lock().ok()?.as_ref()?.upgrade()
+}
+
+/// Send `sig` to every mediated child whose requesting shim currently belongs
+/// to process group `pgid`..
+pub(crate) fn signal_active_children_in_pgroup(pgid: Pid, sig: Signal) {
+    let Some(state) = active_tool_sandbox_state() else {
+        return;
+    };
+    signal_children_in_pgroup_for_state(&state, pgid, sig);
+}
+
+/// `SIGSTOP` the mediated children of the job whose process group is `pgid`.
+pub(crate) fn stop_active_children_in_pgroup(pgid: Pid) -> Vec<u32> {
+    let Some(state) = active_tool_sandbox_state() else {
+        return Vec::new();
+    };
+    signal_children_in_pgroup_for_state(&state, pgid, Signal::SIGSTOP)
+}
+
+/// `SIGCONT` the mediated children named by a preceding
+/// [`stop_active_children_in_pgroup`].
+pub(crate) fn resume_mediated_children(pids: &[u32]) {
+    let Some(state) = active_tool_sandbox_state() else {
+        return;
+    };
+    resume_children_for_state(&state, pids);
+}
+
+/// Core of [`resume_mediated_children`], taking the state explicitly rather
+/// than through the process-global registration.
+fn resume_children_for_state(state: &ToolSandboxState, pids: &[u32]) {
+    // Recycle guard, on the same terms as the relay that stopped them: a child
+    // that died since could have handed its pid to an unrelated process group.
+    let tracked: Vec<(u32, u64)> = {
+        let Ok(map) = state.active_children.lock() else {
+            return;
+        };
+        pids.iter()
+            .filter_map(|&pid| map.get(&pid).map(|child| (pid, child.start_usec)))
+            .collect()
+    };
+    for (pid, start_usec) in tracked {
+        if pgroup_may_be_reachable(pid, start_usec) {
+            let _ = signal::kill(Pid::from_raw(-(pid as i32)), Signal::SIGCONT);
+        }
+    }
+}
+
+/// One tracked child resolved for a single relay pass.
+struct RelayTarget {
+    pid: u32,
+    /// Whether it was launched from the job being signalled.
+    in_pgroup: bool,
+    /// The session its requesting shim belongs to, for the nesting walk.
+    requester_session: Option<u32>,
+}
+
+/// Core of the per-job signal paths ([`signal_active_children_in_pgroup`],
+/// [`stop_active_children_in_pgroup`], and the relay), taking the state
+/// explicitly rather than through the process-global registration. Returns the
+/// pids signalled.
+fn signal_children_in_pgroup_for_state(
+    state: &ToolSandboxState,
+    pgid: Pid,
+    sig: Signal,
+) -> Vec<u32> {
+    let tracked: Vec<(u32, ActiveChild)> = {
+        let Ok(map) = state.active_children.lock() else {
+            return Vec::new();
+        };
+        map.iter()
+            .map(|(&pid, child)| (pid, child.clone()))
+            .collect()
+    };
+    let targets: Vec<RelayTarget> = tracked
+        .into_iter()
+        .filter(|(pid, child)| pgroup_may_be_reachable(*pid, child.start_usec))
+        .map(|(pid, child)| {
+            let requester_live = requester_is_live(&child);
+            RelayTarget {
+                pid,
+                in_pgroup: requester_in_pgroup(&child, pgid, requester_live),
+                requester_session: requester_session(&child, requester_live),
+            }
+        })
+        .collect();
+
+    let mut matched: HashSet<u32> = targets
+        .iter()
+        .filter(|target| target.in_pgroup)
+        .map(|target| target.pid)
+        .collect();
+
+    loop {
+        let mut grew = false;
+        for target in &targets {
+            if matched.contains(&target.pid) {
+                continue;
+            }
+            if target
+                .requester_session
+                .is_some_and(|sid| matched.contains(&sid))
+            {
+                matched.insert(target.pid);
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+
+    let signalled: Vec<u32> = matched.into_iter().collect();
+    for &pid in &signalled {
+        let _ = signal::kill(Pid::from_raw(-(pid as i32)), sig);
+    }
+    signalled
+}
+
+/// Whether `child` was launched from the job whose process group is `pgid`.
+fn requester_in_pgroup(child: &ActiveChild, pgid: Pid, requester_live: bool) -> bool {
+    if requester_live {
+        return getpgid(Some(Pid::from_raw(child.requester_pid as i32)))
+            .is_ok_and(|requester_pgid| requester_pgid == pgid);
+    }
+    child.requester_pgid == Some(pgid)
+}
+
+/// The session `child`'s requesting shim belongs to.
+fn requester_session(child: &ActiveChild, requester_live: bool) -> Option<u32> {
+    if requester_live {
+        return session_id_of(child.requester_pid);
+    }
+    child.requester_sid
+}
+
+/// Whether the process at `requester_pid` is still the shim that made the
+/// request.
+fn requester_is_live(child: &ActiveChild) -> bool {
+    child
+        .requester_identity
+        .is_some_and(|recorded| daemon_identity(child.requester_pid) == Some(recorded))
+}
+
+/// Deliver one relayed signal to mediated children.
+fn relay_signal_for_state(state: &ToolSandboxState, sig: Signal, foreground_pgid: Option<Pid>) {
+    if sig == Signal::SIGHUP {
+        signal_all_children_for_state(state, sig);
+        return;
+    }
+    match foreground_pgid {
+        Some(pgid) => {
+            signal_children_in_pgroup_for_state(state, pgid, sig);
+        }
+        None => signal_all_children_for_state(state, sig),
+    }
+}
+
+/// Send `sig` to every live mediated child regardless of which job launched it.
+fn signal_all_children_for_state(state: &ToolSandboxState, sig: Signal) {
+    let tracked: Vec<(u32, u64)> = {
+        let Ok(map) = state.active_children.lock() else {
+            return;
+        };
+        map.iter()
+            .map(|(&pid, child)| (pid, child.start_usec))
+            .collect()
+    };
+    for (pid, start_usec) in tracked {
+        if !pgroup_may_be_reachable(pid, start_usec) {
+            continue;
+        }
+        let _ = signal::kill(Pid::from_raw(-(pid as i32)), sig);
+    }
+}
+
+static TOOL_SANDBOX_SIGNAL_RELAY_WRITE_FD: AtomicI32 = AtomicI32::new(-1);
+
+/// Join handle for the thread [`start_signal_relay_thread`] spawns, so
+/// [`stop_signal_relay`] can wait for it to finish the bytes already in the pipe.
+static TOOL_SANDBOX_SIGNAL_RELAY_THREAD: Mutex<Option<std::thread::JoinHandle<()>>> =
+    Mutex::new(None);
+
+/// Write end of the pipe `exec_strategy::forward_signal` writes a signal byte
+/// into from async-signal-safe context.
+pub(crate) fn signal_relay_write_fd() -> i32 {
+    TOOL_SANDBOX_SIGNAL_RELAY_WRITE_FD.load(Ordering::SeqCst)
+}
+
+/// Start the ordinary thread that turns a relayed signal byte into a
+/// foreground-scoped `signal_active_children_in_pgroup` call.
+fn start_signal_relay_thread() {
+    let mut fds = [-1i32; 2];
+    // SAFETY: `fds` is a valid 2-element buffer for pipe(2) to fill.
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        warn!(
+            "tool-sandbox signal relay disabled, pipe(2) failed: {}",
+            std::io::Error::last_os_error()
+        );
+        return;
+    }
+    // SAFETY: fcntl on freshly created, still process-local fds. O_NONBLOCK on
+    // the write end keeps `forward_signal` from ever blocking inside a signal
+    // handler behind a full pipe.
+    unsafe {
+        libc::fcntl(fds[0], libc::F_SETFD, libc::FD_CLOEXEC);
+        libc::fcntl(fds[1], libc::F_SETFD, libc::FD_CLOEXEC);
+        libc::fcntl(fds[1], libc::F_SETFL, libc::O_NONBLOCK);
+    }
+    TOOL_SANDBOX_SIGNAL_RELAY_WRITE_FD.store(fds[1], Ordering::SeqCst);
+    let read_fd = fds[0];
+    let handle = std::thread::spawn(move || {
+        loop {
+            let mut byte = [0u8; 1];
+            // SAFETY: read_fd is a valid, owned pipe read end for the life of
+            // this process; the buffer is a stack-allocated single byte.
+            let n = unsafe { libc::read(read_fd, byte.as_mut_ptr().cast(), 1) };
+            if n <= 0 {
+                if n < 0
+                    && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+                {
+                    continue;
+                }
+                break;
+            }
+            let Ok(sig) = Signal::try_from(byte[0] as i32) else {
+                continue;
+            };
+            let Some(state) = active_tool_sandbox_state() else {
+                continue;
+            };
+            relay_signal_for_state(&state, sig, terminal_foreground_pgid());
+        }
+        // SAFETY: the loop is done with it and this thread is its only owner.
+        unsafe { libc::close(read_fd) };
+    });
+    if let Ok(mut slot) = TOOL_SANDBOX_SIGNAL_RELAY_THREAD.lock() {
+        *slot = Some(handle);
+    }
+}
+
+/// Close the relay pipe's write end and wait for the relay thread to deliver
+/// whatever is already queued in it.
+pub(crate) fn stop_signal_relay() {
+    let write_fd = TOOL_SANDBOX_SIGNAL_RELAY_WRITE_FD.swap(-1, Ordering::SeqCst);
+    if write_fd >= 0 {
+        // SAFETY: the swap above makes this the only close of the only write
+        // end; a `forward_signal` that already loaded the number can at worst
+        // write to a closed fd, the same exposure `close_pause_pipe` carries.
+        unsafe { libc::close(write_fd) };
+    }
+    let handle = TOOL_SANDBOX_SIGNAL_RELAY_THREAD
+        .lock()
+        .ok()
+        .and_then(|mut slot| slot.take());
+    if let Some(handle) = handle {
+        let _ = handle.join();
+    }
+}
+
+/// The current foreground process group of the terminal the requesting shims
+/// run under.
+fn terminal_foreground_pgid() -> Option<Pid> {
+    if let Some(pgid) = crate::exec_strategy::pty_foreground_pgid() {
+        return Some(pgid);
+    }
+    [libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO]
+        .into_iter()
+        .find_map(|fd| {
+            // SAFETY: the standard fds outlive this call; tcgetpgrp fails
+            // cleanly (ENOTTY) on a redirected one.
+            let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+            nix::unistd::tcgetpgrp(fd).ok()
+        })
 }
 
 fn file_id(metadata: &fs::Metadata) -> FileId {
@@ -3506,6 +3856,7 @@ fn filter_child_env(
     Ok(result)
 }
 
+/// Give the launched command its own POSIX session, pre-exec, so `track_child`'s
 /// `session_lineage` record stays resolvable after this process exits..
 fn install_session_lineage(command: &mut Command) {
     // SAFETY: runs post-fork/pre-exec, so must be async-signal-safe; setsid(2)
@@ -3541,12 +3892,20 @@ fn launch_child(
     state: &ToolSandboxState,
     command_name: &str,
     launch_caller: &Caller,
+    requester_pid: u32,
     spec: ToolSandboxChildLaunchSpec,
     stdio: StdioFds,
 ) -> Result<ChildLaunchResult> {
     let spec_path = write_launch_spec(&state.runtime_dir, &spec)?;
-    let result =
-        launch_child_with_direct_fds(state, command_name, launch_caller, &spec_path, &spec, stdio);
+    let result = launch_child_with_direct_fds(
+        state,
+        command_name,
+        launch_caller,
+        requester_pid,
+        &spec_path,
+        &spec,
+        stdio,
+    );
     remove_launch_spec(&spec_path);
     result
 }
@@ -3555,6 +3914,7 @@ fn launch_child_with_direct_fds(
     state: &ToolSandboxState,
     command_name: &str,
     launch_caller: &Caller,
+    requester_pid: u32,
     spec_path: &Path,
     spec: &ToolSandboxChildLaunchSpec,
     stdio: StdioFds,
@@ -3564,6 +3924,7 @@ fn launch_child_with_direct_fds(
             state,
             command_name,
             launch_caller,
+            requester_pid,
             spec_path,
             spec,
             stdio,
@@ -3575,7 +3936,13 @@ fn launch_child_with_direct_fds(
         .stdout(Stdio::from(File::from(stdio.stdout)))
         .stderr(Stdio::from(File::from(stdio.stderr)));
     let mut child = command.spawn().map_err(NonoError::CommandExecution)?;
-    let exit_code = wait_for_tracked_child(state, command_name, launch_caller, &mut child)?;
+    let exit_code = wait_for_tracked_child(
+        state,
+        command_name,
+        launch_caller,
+        requester_pid,
+        &mut child,
+    )?;
     Ok(ChildLaunchResult {
         exit_code,
         stdio: None,
@@ -3587,6 +3954,7 @@ fn launch_child_with_brokered_stdio(
     state: &ToolSandboxState,
     command_name: &str,
     launch_caller: &Caller,
+    requester_pid: u32,
     spec_path: &Path,
     spec: &ToolSandboxChildLaunchSpec,
     stdio: StdioFds,
@@ -3610,7 +3978,13 @@ fn launch_child_with_brokered_stdio(
 
     let mut child = command.spawn().map_err(NonoError::CommandExecution)?;
     drop(command);
-    track_child(state, child.id(), command_name, launch_caller)?;
+    track_child(
+        state,
+        child.id(),
+        command_name,
+        launch_caller,
+        requester_pid,
+    )?;
 
     let exceeded = Arc::new(AtomicBool::new(false));
     let stdout_exceeded = exceeded.clone();
@@ -3848,6 +4222,7 @@ fn launch_child_with_capture(
     state: &ToolSandboxState,
     command_name: &str,
     launch_caller: &Caller,
+    requester_pid: u32,
     spec: ToolSandboxChildLaunchSpec,
     stdio: StdioFds,
 ) -> Result<(i32, Vec<u8>)> {
@@ -3871,7 +4246,13 @@ fn launch_child_with_capture(
 
     let mut child = command.spawn().map_err(NonoError::CommandExecution)?;
     drop(command);
-    track_child(state, child.id(), command_name, launch_caller)?;
+    track_child(
+        state,
+        child.id(),
+        command_name,
+        launch_caller,
+        requester_pid,
+    )?;
 
     let mut captured = Vec::new();
     let mut pipe_reader =
@@ -3899,9 +4280,16 @@ fn wait_for_tracked_child(
     state: &ToolSandboxState,
     command_name: &str,
     launch_caller: &Caller,
+    requester_pid: u32,
     child: &mut Child,
 ) -> Result<i32> {
-    track_child(state, child.id(), command_name, launch_caller)?;
+    track_child(
+        state,
+        child.id(),
+        command_name,
+        launch_caller,
+        requester_pid,
+    )?;
     let status = child.wait().map_err(NonoError::CommandExecution);
     untrack_child(state, child.id())?;
     status.map(exit_status_code)
@@ -6508,7 +6896,7 @@ mod tests {
     fn resolve_caller_prefers_active_command_for_peer_pid() -> Result<()> {
         let state = test_state();
         let pid = std::process::id();
-        track_child(&state, pid, "git", &Caller::Session)?;
+        track_child(&state, pid, "git", &Caller::Session, pid)?;
 
         let caller = resolve_caller(pid, pid, &state, "ssh")?;
 
@@ -6520,7 +6908,7 @@ mod tests {
     fn resolve_caller_uses_launch_caller_for_self_invocation() -> Result<()> {
         let state = test_state();
         let pid = std::process::id();
-        track_child(&state, pid, "git", &Caller::Session)?;
+        track_child(&state, pid, "git", &Caller::Session, pid)?;
 
         let caller = resolve_caller(pid, pid, &state, "git")?;
 
@@ -6539,7 +6927,7 @@ mod tests {
             },
         );
         let pid = std::process::id();
-        track_child(&state, pid, "git", &Caller::Session)?;
+        track_child(&state, pid, "git", &Caller::Session, pid)?;
 
         let caller = resolve_caller(pid, pid, &state, "git")?;
 
@@ -6818,7 +7206,7 @@ mod tests {
             return Ok(());
         }
 
-        track_child(&state, launcher_pid, "parent", &Caller::Session)?;
+        track_child(&state, launcher_pid, "parent", &Caller::Session, 1)?;
 
         assert!(
             matches!(state.session_lineage.resolve_sid(launcher_pid), Some((name, _)) if name == "parent"),
@@ -7526,6 +7914,481 @@ mod tests {
             matches!(caller, Caller::Command { name } if name == "parent"),
             "an ordinary orphan must attribute to the command that self-assigned its session"
         );
+    }
+
+    #[test]
+    fn active_tool_sandbox_state_upgrades_only_while_registered() {
+        let state = Arc::new(test_state());
+        register_active_tool_sandbox_state(&state);
+        assert!(
+            active_tool_sandbox_state().is_some(),
+            "must resolve while the runtime's Arc is still alive"
+        );
+        drop(state);
+        assert!(
+            active_tool_sandbox_state().is_none(),
+            "must go stale once the runtime's Arc is dropped, so a torn-down \
+             tool-sandbox runtime can't receive a stray relayed signal"
+        );
+    }
+
+    #[test]
+    fn stop_signal_relay_closes_the_pipe_and_joins_the_thread() {
+        start_signal_relay_thread();
+        let write_fd = signal_relay_write_fd();
+        assert!(write_fd >= 0, "the relay pipe must be open");
+        // SAFETY: one byte into the relay pipe's write end, exactly as
+        // `exec_strategy::forward_signal` writes it.
+        let written = unsafe { libc::write(write_fd, [Signal::SIGHUP as u8].as_ptr().cast(), 1) };
+        assert_eq!(written, 1, "the queued byte is what teardown must drain");
+
+        stop_signal_relay();
+
+        assert_eq!(
+            signal_relay_write_fd(),
+            -1,
+            "a torn-down relay must not accept further signal bytes"
+        );
+        assert!(
+            TOOL_SANDBOX_SIGNAL_RELAY_THREAD
+                .lock()
+                .is_ok_and(|slot| slot.is_none()),
+            "the thread must have been joined, not left racing nono's exit"
+        );
+    }
+
+    fn spawn_setsid_sleep() -> std::process::Child {
+        let mut command = std::process::Command::new("sleep");
+        command.arg("20");
+        install_session_lineage(&mut command);
+        command.spawn().expect("spawn sleep")
+    }
+
+    #[test]
+    #[ignore = "spawns and signals real processes; run with --ignored"]
+    fn live_signal_children_in_pgroup_only_signals_the_foreground_job() {
+        use nix::sys::wait::{WaitStatus, waitpid};
+
+        let state = test_state();
+        let target_pgid = getpgid(None).expect("getpgid(self)");
+
+        // Reaped below via `nix::sys::wait::waitpid` directly (not
+        // `Child::wait`), so clippy can't see it's collected.
+        #[allow(clippy::zombie_processes)]
+        let foreground_child = spawn_setsid_sleep();
+        track_child(
+            &state,
+            foreground_child.id(),
+            "sleep",
+            &Caller::Session,
+            std::process::id(),
+        )
+        .expect("track_child foreground");
+
+        // A distinct, unrelated pgroup standing in for a backgrounded job's
+        // shim.
+        let mut background_requester = spawn_setsid_sleep();
+        let mut background_child = spawn_setsid_sleep();
+        track_child(
+            &state,
+            background_child.id(),
+            "sleep",
+            &Caller::Session,
+            background_requester.id(),
+        )
+        .expect("track_child background");
+
+        signal_children_in_pgroup_for_state(&state, target_pgid, Signal::SIGTERM);
+
+        match waitpid(Pid::from_raw(foreground_child.id() as i32), None) {
+            Ok(WaitStatus::Signaled(_, Signal::SIGTERM, _)) => {}
+            other => panic!("expected the foreground-pgroup child to be SIGTERM'd, got {other:?}"),
+        }
+
+        // Long enough for a wrongly-delivered SIGTERM to have taken effect.
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            background_child.try_wait().expect("try_wait"),
+            None,
+            "a child whose requester is outside the target pgroup must not be signaled"
+        );
+
+        let _ = background_child.kill();
+        let _ = background_child.wait();
+
+        // A dead requester must not break scoping.
+        #[allow(clippy::zombie_processes)]
+        let orphaned_child = spawn_setsid_sleep();
+        let orphaned_pgid = getpgid(Some(Pid::from_raw(background_requester.id() as i32)))
+            .expect("getpgid of the live requester");
+        track_child(
+            &state,
+            orphaned_child.id(),
+            "sleep",
+            &Caller::Session,
+            background_requester.id(),
+        )
+        .expect("track_child orphaned");
+        let _ = background_requester.kill();
+        let _ = background_requester.wait(); // reaped: the live getpgid lookup now fails
+
+        signal_children_in_pgroup_for_state(&state, orphaned_pgid, Signal::SIGTERM);
+
+        match waitpid(Pid::from_raw(orphaned_child.id() as i32), None) {
+            Ok(WaitStatus::Signaled(_, Signal::SIGTERM, _)) => {}
+            other => panic!(
+                "expected the dead-requester child to be SIGTERM'd via the snapshot pgid, got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    #[ignore = "spawns and signals real processes; run with --ignored"]
+    fn live_signal_children_in_pgroup_reaches_a_chained_mediated_child() {
+        use nix::sys::wait::{WaitStatus, waitpid};
+
+        let state = test_state();
+        let target_pgid = getpgid(None).expect("getpgid(self)");
+
+        #[allow(clippy::zombie_processes)]
+        let outer = spawn_setsid_sleep();
+        track_child(
+            &state,
+            outer.id(),
+            "sleep",
+            &Caller::Session,
+            std::process::id(),
+        )
+        .expect("track_child outer");
+
+        #[allow(clippy::zombie_processes)]
+        let inner = spawn_setsid_sleep();
+        track_child(&state, inner.id(), "sleep", &Caller::Session, outer.id())
+            .expect("track_child inner");
+
+        signal_children_in_pgroup_for_state(&state, target_pgid, Signal::SIGTERM);
+
+        match waitpid(Pid::from_raw(outer.id() as i32), None) {
+            Ok(WaitStatus::Signaled(_, Signal::SIGTERM, _)) => {}
+            other => panic!("expected the first-tier child to be SIGTERM'd, got {other:?}"),
+        }
+        match waitpid(Pid::from_raw(inner.id() as i32), None) {
+            Ok(WaitStatus::Signaled(_, Signal::SIGTERM, _)) => {}
+            other => panic!(
+                "a mediated child requested from inside another mediated child's session must \
+                 still be reached by the relay, got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    #[ignore = "spawns and signals real processes; run with --ignored"]
+    fn live_signal_children_in_pgroup_reaches_a_chained_child_whose_shim_died() -> Result<()> {
+        use nix::sys::wait::{WaitStatus, waitpid};
+
+        let state = test_state();
+        let target_pgid = getpgid(None).expect("getpgid(self)");
+
+        let dir = test_tempdir()?;
+        let pid_file = dir.path().join("shim.pid");
+        let mut command = std::process::Command::new("sh");
+        command.arg("-c").arg(format!(
+            "sleep 20 & echo $! > {}; sleep 20",
+            pid_file.display()
+        ));
+        install_session_lineage(&mut command);
+        #[allow(clippy::zombie_processes)]
+        let outer = command.spawn().map_err(NonoError::CommandExecution)?;
+        let shim = read_pid_file(&pid_file).expect("the script writes the pid before sleeping");
+        track_child(
+            &state,
+            outer.id(),
+            "sh",
+            &Caller::Session,
+            std::process::id(),
+        )
+        .expect("track_child outer");
+
+        #[allow(clippy::zombie_processes)]
+        let inner = spawn_setsid_sleep();
+        track_child(&state, inner.id(), "sleep", &Caller::Session, shim)
+            .expect("track_child inner");
+
+        signal::kill(Pid::from_raw(shim as i32), Signal::SIGKILL).expect("kill the shim");
+        assert!(
+            wait_until(|| daemon_identity(shim).is_none()),
+            "the shim must read as dead before the relay runs"
+        );
+
+        signal_children_in_pgroup_for_state(&state, target_pgid, Signal::SIGTERM);
+
+        match waitpid(Pid::from_raw(inner.id() as i32), None) {
+            Ok(WaitStatus::Signaled(_, Signal::SIGTERM, _)) => {}
+            other => panic!(
+                "a mediated child whose requesting shim died before the relay must still be \
+                 reached through the session recorded at request time, got {other:?}"
+            ),
+        }
+        let _ = waitpid(Pid::from_raw(outer.id() as i32), None);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "spawns and signals real processes; run with --ignored"]
+    fn live_signal_children_in_pgroup_reaches_a_pgroup_behind_a_zombie_leader() -> Result<()> {
+        use nix::sys::wait::waitpid;
+
+        let state = test_state();
+        let target_pgid = getpgid(None).expect("getpgid(self)");
+
+        // The leader exits at once, leaving `sleep` running in its process
+        // group, and is not reaped until the end so it stays a zombie.
+        let dir = test_tempdir()?;
+        let pid_file = dir.path().join("descendant.pid");
+        let mut command = std::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg(format!("sleep 20 & echo $! > {}", pid_file.display()));
+        install_session_lineage(&mut command);
+        #[allow(clippy::zombie_processes)]
+        let leader = command.spawn().map_err(NonoError::CommandExecution)?;
+        let descendant =
+            read_pid_file(&pid_file).expect("the script writes the pid before exiting");
+        track_child(
+            &state,
+            leader.id(),
+            "sh",
+            &Caller::Session,
+            std::process::id(),
+        )
+        .expect("track_child");
+        let start_usec = state
+            .active_children
+            .lock()
+            .expect("lock active_children")
+            .get(&leader.id())
+            .expect("tracked child")
+            .start_usec;
+
+        assert!(
+            wait_until(|| !is_pid_alive_with_start(leader.id(), start_usec)),
+            "precondition: an unreaped exit must make the leader read back as gone"
+        );
+        assert!(
+            pgroup_may_be_reachable(leader.id(), start_usec),
+            "its process group still holds a live descendant"
+        );
+
+        signal_children_in_pgroup_for_state(&state, target_pgid, Signal::SIGTERM);
+
+        assert!(
+            wait_until(|| daemon_identity(descendant).is_none()),
+            "a descendant left running in the exited child's process group must still be \
+             reached by the relay"
+        );
+        let _ = waitpid(Pid::from_raw(leader.id() as i32), None);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "spawns and signals real processes; run with --ignored"]
+    fn live_signal_children_in_pgroup_ignores_a_recycled_requester_pid() {
+        let state = test_state();
+        let target_pgid = getpgid(None).expect("getpgid(self)");
+
+        let mut child = spawn_setsid_sleep();
+        track_child(
+            &state,
+            child.id(),
+            "sleep",
+            &Caller::Session,
+            std::process::id(),
+        )
+        .expect("track_child");
+        {
+            let mut map = state.active_children.lock().expect("lock active_children");
+            let entry = map.get_mut(&child.id()).expect("tracked child");
+            entry.requester_identity = Some(DaemonIdentity {
+                uniqueid: u64::MAX,
+                start_usec: u64::MAX,
+            });
+            entry.requester_pgid = Some(Pid::from_raw(-1));
+        }
+
+        signal_children_in_pgroup_for_state(&state, target_pgid, Signal::SIGTERM);
+
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            child.try_wait().expect("try_wait"),
+            None,
+            "a child whose requester identity no longer matches must not be signaled"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// `SSTOP` from `<sys/proc.h>`.
+    const PROC_STATUS_STOPPED: u32 = 4;
+
+    fn process_is_stopped(pid: u32) -> bool {
+        let mut info: ProcBsdInfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<ProcBsdInfo>() as i32;
+        // SAFETY: same call shape as `is_pid_alive_with_start`.
+        let ret = unsafe {
+            proc_pidinfo(
+                pid as i32,
+                PROC_PIDTBSDINFO,
+                0,
+                &mut info as *mut _ as *mut libc::c_void,
+                size,
+            )
+        };
+        ret == size && info.pbi_status == PROC_STATUS_STOPPED
+    }
+
+    #[test]
+    #[ignore = "spawns and signals real processes; run with --ignored"]
+    fn live_resume_lifts_only_the_children_the_stop_relay_stopped() {
+        let state = test_state();
+        let target_pgid = getpgid(None).expect("getpgid(self)");
+
+        // Reaped below via `nix::sys::wait::waitpid` directly.
+        #[allow(clippy::zombie_processes)]
+        let mut foreground_child = spawn_setsid_sleep();
+        track_child(
+            &state,
+            foreground_child.id(),
+            "sleep",
+            &Caller::Session,
+            std::process::id(),
+        )
+        .expect("track_child foreground");
+
+        let mut background_requester = spawn_setsid_sleep();
+        #[allow(clippy::zombie_processes)]
+        let mut background_child = spawn_setsid_sleep();
+        track_child(
+            &state,
+            background_child.id(),
+            "sleep",
+            &Caller::Session,
+            background_requester.id(),
+        )
+        .expect("track_child background");
+        let _ = background_requester.kill();
+        let _ = background_requester.wait();
+        signal::kill(
+            Pid::from_raw(-(background_child.id() as i32)),
+            Signal::SIGSTOP,
+        )
+        .expect("stop the unrelated job's child");
+        assert!(
+            wait_until(|| process_is_stopped(background_child.id())),
+            "precondition: the unrelated child must be stopped before the resume runs"
+        );
+
+        let stopped = signal_children_in_pgroup_for_state(&state, target_pgid, Signal::SIGSTOP);
+
+        assert_eq!(
+            stopped,
+            vec![foreground_child.id()],
+            "only the foreground job's child may be reported stopped"
+        );
+        assert!(wait_until(|| process_is_stopped(foreground_child.id())));
+
+        resume_children_for_state(&state, &stopped);
+
+        assert!(
+            wait_until(|| !process_is_stopped(foreground_child.id())),
+            "the stopped child must be resumed even though nothing live still ties it \
+             to the job it was launched from"
+        );
+        assert!(
+            process_is_stopped(background_child.id()),
+            "a deliberately-stopped child of an unrelated job must not be resumed by \
+             another job's Ctrl-Z resume"
+        );
+
+        let _ = foreground_child.kill();
+        let _ = foreground_child.wait();
+        let _ = signal::kill(
+            Pid::from_raw(-(background_child.id() as i32)),
+            Signal::SIGKILL,
+        );
+        let _ = background_child.wait();
+    }
+
+    #[test]
+    #[ignore = "spawns and signals real processes; run with --ignored"]
+    fn live_signal_all_children_reaches_a_backgrounded_job() {
+        use nix::sys::wait::{WaitStatus, waitpid};
+
+        let state = test_state();
+
+        let mut background_requester = spawn_setsid_sleep();
+        // Reaped below via `nix::sys::wait::waitpid` directly.
+        #[allow(clippy::zombie_processes)]
+        let mut background_child = spawn_setsid_sleep();
+        track_child(
+            &state,
+            background_child.id(),
+            "sleep",
+            &Caller::Session,
+            background_requester.id(),
+        )
+        .expect("track_child background");
+
+        let foreground_pgid = getpgid(None).expect("getpgid(self)");
+        signal_children_in_pgroup_for_state(&state, foreground_pgid, Signal::SIGHUP);
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            background_child.try_wait().ok().flatten(),
+            None,
+            "precondition: the foreground-scoped relay must not reach a background job"
+        );
+
+        signal_all_children_for_state(&state, Signal::SIGHUP);
+
+        match waitpid(Pid::from_raw(background_child.id() as i32), None) {
+            Ok(WaitStatus::Signaled(_, Signal::SIGHUP, _)) => {}
+            other => panic!("expected a backgrounded job's child to be SIGHUP'd, got {other:?}"),
+        }
+
+        let _ = background_requester.kill();
+        let _ = background_requester.wait();
+    }
+
+    #[test]
+    #[ignore = "spawns and signals real processes; run with --ignored"]
+    fn live_relay_without_a_terminal_reaches_every_mediated_child() {
+        use nix::sys::wait::{WaitStatus, waitpid};
+
+        let state = test_state();
+        let mut requester = spawn_setsid_sleep();
+        // Reaped below via `nix::sys::wait::waitpid` directly.
+        #[allow(clippy::zombie_processes)]
+        let child = spawn_setsid_sleep();
+        track_child(
+            &state,
+            child.id(),
+            "sleep",
+            &Caller::Session,
+            requester.id(),
+        )
+        .expect("track_child");
+
+        relay_signal_for_state(&state, Signal::SIGTERM, None);
+
+        match waitpid(Pid::from_raw(child.id() as i32), None) {
+            Ok(WaitStatus::Signaled(_, Signal::SIGTERM, _)) => {}
+            other => panic!(
+                "expected a mediated child to be SIGTERM'd when no terminal resolves, got {other:?}"
+            ),
+        }
+
+        let _ = requester.kill();
+        let _ = requester.wait();
     }
 
     #[test]

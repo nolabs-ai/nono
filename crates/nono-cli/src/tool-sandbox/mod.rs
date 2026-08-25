@@ -27,6 +27,29 @@ pub(crate) fn record_main_start() {}
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub(crate) fn log_main_total() {}
 
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn signal_active_children_in_pgroup(
+    _pgid: nix::unistd::Pid,
+    _sig: nix::sys::signal::Signal,
+) {
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn stop_active_children_in_pgroup(_pgid: nix::unistd::Pid) -> Vec<u32> {
+    Vec::new()
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn resume_mediated_children(_pids: &[u32]) {}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn signal_relay_write_fd() -> i32 {
+    -1
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn stop_signal_relay() {}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod audit_context;
 // Unconditional: readers of an event log classify decisions on every platform,
@@ -490,5 +513,6 @@ mod macos;
 #[cfg(target_os = "macos")]
 pub(crate) use macos::{
     PreparedToolSandboxRuntime, log_main_total, maybe_run_internal_tool_sandbox_entrypoint,
-    record_main_start,
+    record_main_start, resume_mediated_children, signal_active_children_in_pgroup,
+    signal_relay_write_fd, stop_active_children_in_pgroup, stop_signal_relay,
 };

@@ -324,6 +324,17 @@ expect_file_content "tool sandbox directory write reached host file" \
 expect_file_content "tool sandbox single-file write reached host file" \
     "$TMPDIR/tool-write-file.txt" "tool-file-write"
 
+# --trust-override skips the trust scan, which is what otherwise leaves the
+# aws-lc-rs pool threads behind and puts the supervised fork in
+# ThreadingContext::CryptoExpected. Without it the fork runs under Strict,
+# where a single stray thread started while preparing the tool-sandbox runtime
+# aborts the run before the child ever execs.
+expect_output_payload "tool sandbox forks under strict threading (--trust-override)" \
+    "strict-threading-ok" \
+    run_in_dir "$TMPDIR" "$NONO_BIN" run --profile "$TOOL_PROFILE" --silent --no-audit \
+    --allow-cwd --trust-override -- \
+    sh -c 'printf "%s" "strict-threading-ok"'
+
 if is_macos; then
     skip_test "tool sandbox does not inherit outer --allow directory" "macOS temp path denial is host-dependent"
     skip_test "tool sandbox raw-file credential requires use_credentials" "macOS temp path denial is host-dependent"

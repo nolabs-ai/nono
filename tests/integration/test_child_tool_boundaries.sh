@@ -455,6 +455,121 @@ else
 fi
 
 # =============================================================================
+# Fire-and-forget from an unmediated launcher
+# =============================================================================
+
+echo ""
+echo "--- Unmediated Fire-and-forget Launcher ---"
+
+UNMEDIATED_DIR="$TMPDIR/unmediated-fire-forget"
+mkdir -p "$UNMEDIATED_DIR"
+UNMEDIATED_PROFILE="$UNMEDIATED_DIR/profile.json"
+
+# The launcher is a plain fork of the session root, so nothing mediated it and
+# no per-command lineage marker names it. Attribution then rests on the session
+# nono created for its direct child, which exists only when nono allocated a pty
+# (all three stdio a terminal), hence the python pty harness below. On Linux the
+# cgroup marker attributes severed callers to commands only, never the session,
+# so the scenario still fails closed there.
+if [[ "$(uname)" == "Darwin" ]] && command_exists python3; then
+
+cat > "$UNMEDIATED_DIR/launcher.sh" <<'EOF'
+#!/bin/sh
+set -eu
+echo "launcher: firing child (fire & forget)"
+child &
+EOF
+chmod 755 "$UNMEDIATED_DIR/launcher.sh"
+
+cat > "$UNMEDIATED_DIR/child" <<'EOF'
+#!/bin/sh
+set -eu
+echo "child: writing file"
+echo "written by child at $(date)" > out.txt
+EOF
+chmod 755 "$UNMEDIATED_DIR/child"
+
+# fs_write_file only grants an existing file, so pre-create it empty; the poll
+# below waits for it to become non-empty, so this can't pass vacuously.
+printf "" > "$UNMEDIATED_DIR/out.txt"
+
+# pty.spawn's stdin copy loop never sees EOF under the suite's stdio, so drive
+# the pty directly and drain it until the child closes the slave.
+cat > "$UNMEDIATED_DIR/pty_run.py" <<'EOF'
+import os
+import pty
+import select
+import sys
+import time
+
+pid, master = pty.fork()
+if pid == 0:
+    os.execvp(sys.argv[1], sys.argv[1:])
+
+deadline = time.time() + 60
+while time.time() < deadline:
+    readable, _, _ = select.select([master], [], [], 0.2)
+    if readable:
+        try:
+            if not os.read(master, 4096):
+                break
+        except OSError:
+            break
+    reaped, status = os.waitpid(pid, os.WNOHANG)
+    if reaped:
+        sys.exit(os.WEXITSTATUS(status) if os.WIFEXITED(status) else 1)
+
+_, status = os.waitpid(pid, 0)
+sys.exit(os.WEXITSTATUS(status) if os.WIFEXITED(status) else 1)
+EOF
+
+# `launcher.sh` is deliberately absent from `commands`: an unmediated launcher is
+# the shape this case is about. Same group exclusions as the block above.
+cat > "$UNMEDIATED_PROFILE" <<EOF
+{
+  "meta": { "name": "integration-unmediated-fire-and-forget" },
+  "workdir": { "access": "read" },
+  "groups": { "exclude": ["system_write_linux", "system_write_macos"] },
+  "command_policies": {
+    "executable_dirs": ["."],
+    "commands": {
+      "child": {
+        "can_use": ["date"],
+        "from": {
+          "session": {
+            "sandbox": {
+              "fs_read": ["\$WORKDIR"],
+              "fs_write_file": ["\$WORKDIR/out.txt"]
+            }
+          }
+        }
+      },
+      "date": { "from": { "child": { "sandbox": {} } } },
+      "sleep": { "from": { "session": { "sandbox": {} } } }
+    }
+  }
+}
+EOF
+
+expect_success "outer session survives an unmediated fire-and-forget launcher (#1274)" \
+    run_in_dir "$UNMEDIATED_DIR" python3 "$UNMEDIATED_DIR/pty_run.py" \
+    "$NONO_BIN" run --silent --no-audit --profile "$UNMEDIATED_PROFILE" --allow-cwd -- \
+    sh -c './launcher.sh
+i=0
+while [ ! -s out.txt ] && [ "$i" -lt 50 ]; do
+    sleep 0.1
+    i=$((i + 1))
+done'
+
+expect_file_contains "unmediated launcher's orphan was authorized under the session policy (#1274)" \
+    "$UNMEDIATED_DIR/out.txt" "written by child at"
+
+else
+    skip_test "unmediated fire-and-forget launcher (#1274)" \
+        "session-lineage attribution is macOS-only and needs python3 for a pty"
+fi
+
+# =============================================================================
 # Summary
 # =============================================================================
 

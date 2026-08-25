@@ -39,8 +39,9 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -160,6 +161,7 @@ struct ToolSandboxState {
     /// Attributes severed-ancestry callers to their spawning command. See the
     /// daemon-lineage section below.
     lineage: LineageMarker,
+    session_lineage: SessionLineage,
     active_count: AtomicUsize,
     queued_requests: AtomicUsize,
     emitted_error_response: AtomicBool,
@@ -336,6 +338,7 @@ impl PreparedToolSandboxRuntime {
                 proxy_trust_bundle_paths: proxy_trust_bundle_paths.to_vec(),
                 active_children: Mutex::new(HashMap::new()),
                 lineage,
+                session_lineage: SessionLineage::default(),
                 active_count: AtomicUsize::new(0),
                 queued_requests: AtomicUsize::new(0),
                 emitted_error_response: AtomicBool::new(false),
@@ -1861,8 +1864,23 @@ fn resolve_caller_with(
             Err(_) => break,
         };
     }
-    // Walk stopped short of the root: an ancestor daemonized (reparented to pid 1).
-    // Fail closed unless the marker verifies `last_non_init` by pid identity.
+    // Walk stopped short of the root: an ancestor exited before this connection
+    // was mediated.
+    let peer_sid = session_id_of(peer_pid);
+    if let Some((name, launch_caller)) =
+        peer_sid.and_then(|sid| state.session_lineage.resolve_sid(sid))
+    {
+        if name == command_name
+            && !has_explicit_self_invocation_entry(&state.plan.config, command_name)
+        {
+            return Ok(launch_caller);
+        }
+        return Ok(Caller::Command { name });
+    }
+    if peer_sid == Some(session_root_pid) {
+        return Ok(Caller::Session);
+    }
+    // A genuine daemon calls its own setsid().
     if let Some(caller) = resolve_severed(last_non_init) {
         return Ok(caller);
     }
@@ -1870,6 +1888,111 @@ fn resolve_caller_with(
         command: "unknown".to_string(),
         reason: "caller ancestry did not reach session root".to_string(),
     })
+}
+
+// `install_session_lineage` puts every mediated launch in its own POSIX
+// session pre-exec. `setsid()` can't join another session, so this is
+// unforgeable (unlike pgid). Orphans keep their sid across reparenting, so
+// `resolve` finds them after `resolve_caller`'s ancestry walk breaks. Real
+// daemons (double-fork + own `setsid()`) get an untracked session and still
+// need the `daemon_pid_source` fallback.
+
+const MAX_SESSION_LINEAGE_ENTRIES: usize = 4096;
+
+#[derive(Default)]
+struct SessionLineage {
+    owners: Mutex<SessionLineageOwners>,
+}
+
+#[derive(Clone)]
+struct SessionLineageEntry {
+    command: String,
+    launch_caller: Caller,
+    identity: Option<DaemonIdentity>,
+    used: u64,
+}
+
+#[derive(Default)]
+struct SessionLineageOwners {
+    by_sid: HashMap<u32, SessionLineageEntry>,
+    next_used: u64,
+}
+
+impl SessionLineageOwners {
+    /// Drop the least-recently-used entries until at most `MAX_SESSION_LINEAGE_ENTRIES`
+    /// remain.
+    fn evict_to_cap(&mut self) {
+        while self.by_sid.len() > MAX_SESSION_LINEAGE_ENTRIES {
+            let Some(stalest) = self
+                .by_sid
+                .iter()
+                .min_by_key(|(_, entry)| entry.used)
+                .map(|(&sid, _)| sid)
+            else {
+                break;
+            };
+            self.by_sid.remove(&stalest);
+        }
+    }
+
+    fn remove(&mut self, sid: u32) {
+        self.by_sid.remove(&sid);
+    }
+
+    /// Stamp `sid` as most recently used.
+    fn touch(&mut self, sid: u32) {
+        let used = self.next_used;
+        self.next_used = self.next_used.saturating_add(1);
+        if let Some(entry) = self.by_sid.get_mut(&sid) {
+            entry.used = used;
+        }
+    }
+}
+
+impl SessionLineage {
+    /// Record `sid` as owned by `command`, pinned by `identity` when one could
+    /// be read.
+    fn record(
+        &self,
+        sid: u32,
+        command: &str,
+        launch_caller: &Caller,
+        identity: Option<DaemonIdentity>,
+    ) {
+        let Ok(mut owners) = self.owners.lock() else {
+            return;
+        };
+        let used = owners.next_used;
+        owners.next_used = owners.next_used.saturating_add(1);
+        owners.by_sid.insert(
+            sid,
+            SessionLineageEntry {
+                command: command.to_string(),
+                launch_caller: launch_caller.clone(),
+                identity,
+                used,
+            },
+        );
+        owners.evict_to_cap();
+    }
+
+    fn resolve_sid(&self, sid: u32) -> Option<(String, Caller)> {
+        let mut owners = self.owners.lock().ok()?;
+        let entry = owners.by_sid.get(&sid)?.clone();
+        let (name, launch_caller, recorded_identity) =
+            (entry.command, entry.launch_caller, entry.identity);
+
+        let stale = match recorded_identity {
+            Some(recorded) => daemon_identity(sid).is_some_and(|current| current != recorded),
+            None => true,
+        };
+        if stale && session_id_of(sid) == Some(sid) {
+            owners.remove(sid);
+            return None;
+        }
+        owners.touch(sid);
+        Some((name, launch_caller))
+    }
 }
 
 // ── Daemon lineage ─────────────────────────────────────────────────────────
@@ -2107,6 +2230,11 @@ fn daemon_identity(pid: u32) -> Option<DaemonIdentity> {
         uniqueid: uinfo.p_uniqueid,
         start_usec: binfo.pbi_start_tvsec * 1_000_000 + binfo.pbi_start_tvusec,
     })
+}
+
+fn session_id_of(pid: u32) -> Option<u32> {
+    let sid = nix::unistd::getsid(Some(nix::unistd::Pid::from_raw(pid as i32))).ok()?;
+    u32::try_from(sid.as_raw()).ok().filter(|sid| *sid > 0)
 }
 
 /// Bumped only on an incompatible change to the helper's JSON input.
@@ -2475,23 +2603,8 @@ fn track_child(
     command_name: &str,
     launch_caller: &Caller,
 ) -> Result<()> {
-    let mut info: ProcBsdInfo = unsafe { std::mem::zeroed() };
-    let size = std::mem::size_of::<ProcBsdInfo>() as i32;
-    // SAFETY: same as parent_pid.
-    let ret = unsafe {
-        proc_pidinfo(
-            child_pid as i32,
-            PROC_PIDTBSDINFO,
-            0,
-            &mut info as *mut _ as *mut libc::c_void,
-            size,
-        )
-    };
-    let start_usec = if ret == size {
-        info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec as u64
-    } else {
-        0
-    };
+    let identity = daemon_identity(child_pid);
+    let start_usec = identity.map_or(0, |identity| identity.start_usec);
     let mut map = state
         .active_children
         .lock()
@@ -2505,6 +2618,10 @@ fn track_child(
             start_usec,
         },
     );
+    drop(map);
+    state
+        .session_lineage
+        .record(child_pid, command_name, launch_caller, identity);
     Ok(())
 }
 
@@ -3389,6 +3506,37 @@ fn filter_child_env(
     Ok(result)
 }
 
+/// `session_lineage` record stays resolvable after this process exits..
+fn install_session_lineage(command: &mut Command) {
+    // SAFETY: runs post-fork/pre-exec, so must be async-signal-safe; setsid(2)
+    // is on the POSIX async-signal-safe list. _exit(126)s on failure (fail
+    // closed) rather than launching without the marker in place.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                libc::_exit(126);
+            }
+            Ok(())
+        });
+    }
+}
+
+/// SIGKILL the mediated child and every descendant still in its process group.
+fn kill_mediated_child_group(child: &mut std::process::Child) {
+    // SAFETY: kill(2) takes plain integers, no pointers. The negated pid
+    // addresses the child's whole process group.
+    unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
+    // Fallback for a child that does not lead its own group, for which the
+    // group kill above is an ESRCH no-op.
+    let _ = child.kill();
+}
+
+fn prepare_mediated_command(spec_path: &Path) -> Result<Command> {
+    let mut command = prepare_launcher_command(spec_path)?;
+    install_session_lineage(&mut command);
+    Ok(command)
+}
+
 fn launch_child(
     state: &ToolSandboxState,
     command_name: &str,
@@ -3421,7 +3569,7 @@ fn launch_child_with_direct_fds(
             stdio,
         );
     }
-    let mut command = prepare_launcher_command(spec_path)?;
+    let mut command = prepare_mediated_command(spec_path)?;
     command
         .stdin(Stdio::from(File::from(stdio.stdin)))
         .stdout(Stdio::from(File::from(stdio.stdout)))
@@ -3454,7 +3602,7 @@ fn launch_child_with_brokered_stdio(
         stderr,
     } = stdio;
 
-    let mut command = prepare_launcher_command(spec_path)?;
+    let mut command = prepare_mediated_command(spec_path)?;
     command
         .stdin(Stdio::from(File::from(stdin)))
         .stdout(Stdio::from(File::from(stdout_write)))
@@ -3478,7 +3626,7 @@ fn launch_child_with_brokered_stdio(
 
     let status = loop {
         if exceeded.load(Ordering::SeqCst) {
-            let _ = child.kill();
+            kill_mediated_child_group(&mut child);
             break child.wait().map_err(NonoError::CommandExecution)?;
         }
         if let Some(status) = child.try_wait().map_err(NonoError::CommandExecution)? {
@@ -3714,7 +3862,7 @@ fn launch_child_with_capture(
     let pipe_write = unsafe { File::from_raw_fd(pipe_fds[1]) };
 
     let spec_path = write_launch_spec(&state.runtime_dir, &spec)?;
-    let mut command = prepare_launcher_command(&spec_path)?;
+    let mut command = prepare_mediated_command(&spec_path)?;
     command
         .stdin(Stdio::from(File::from(stdio.stdin)))
         .stdout(Stdio::from(pipe_write))
@@ -5008,6 +5156,7 @@ mod tests {
             proxy_trust_bundle_paths: Vec::new(),
             active_children: Mutex::new(HashMap::new()),
             lineage: LineageMarker::Disabled,
+            session_lineage: SessionLineage::default(),
             active_count: AtomicUsize::new(0),
             queued_requests: AtomicUsize::new(0),
             emitted_error_response: AtomicBool::new(false),
@@ -5147,6 +5296,29 @@ mod tests {
             path: PathBuf::from("/tmp"),
             source,
         })
+    }
+
+    /// Poll `ready` every 10ms for up to two seconds; false if it never held.
+    fn wait_until(mut ready: impl FnMut() -> bool) -> bool {
+        for _ in 0..200 {
+            if ready() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        false
+    }
+
+    /// The pid a spawned script wrote to `path`, waiting for it to appear.
+    fn read_pid_file(path: &Path) -> Option<u32> {
+        let mut pid = None;
+        wait_until(|| {
+            pid = fs::read_to_string(path)
+                .ok()
+                .and_then(|text| text.trim().parse::<u32>().ok());
+            pid.is_some()
+        });
+        pid
     }
 
     fn create_dir(path: &Path) -> Result<()> {
@@ -6267,6 +6439,33 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "spawns and kills real processes; run with --ignored"]
+    fn live_kill_mediated_child_group_reaches_a_descendant() -> Result<()> {
+        let dir = test_tempdir()?;
+        let pid_file = dir.path().join("descendant.pid");
+        let mut command = std::process::Command::new("sh");
+        command.arg("-c").arg(format!(
+            "sleep 30 & echo $! > {}; sleep 30",
+            pid_file.display()
+        ));
+        install_session_lineage(&mut command);
+        let mut child = command.spawn().map_err(NonoError::CommandExecution)?;
+        let descendant =
+            read_pid_file(&pid_file).expect("the script writes the pid before sleeping");
+        let identity = daemon_identity(descendant).expect("the descendant is still live");
+
+        kill_mediated_child_group(&mut child);
+        let _ = child.wait();
+
+        let gone = wait_until(|| daemon_identity(descendant) != Some(identity));
+        assert!(
+            gone,
+            "the descendant outlived the stdio-limit kill, in a session nothing can reach"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn verify_binary_identity_accepts_unchanged_binary() -> Result<()> {
         let dir = test_tempdir()?;
         let path = dir.path().join("multitool");
@@ -6368,6 +6567,109 @@ mod tests {
         config
     }
 
+    /// A live child that leads its own POSIX session, so `getsid` and
+    /// `daemon_identity` reads on the session leader pid both succeed. The test
+    /// process's own session leader is not a substitute: on a CI runner it can be
+    /// launchd or an already-exited login process, whose identity is unreadable.
+    struct SessionLeaderChild {
+        child: std::process::Child,
+    }
+
+    impl SessionLeaderChild {
+        fn spawn() -> Self {
+            let mut command = std::process::Command::new("/bin/sleep");
+            command.arg("30");
+            install_session_lineage(&mut command);
+            let leader = Self {
+                child: command.spawn().expect("spawning /bin/sleep must succeed"),
+            };
+            let sid = leader.sid();
+            for _ in 0..200 {
+                // SAFETY: getsid is a pure syscall wrapper; the pid is a plain integer.
+                if unsafe { libc::getsid(sid as libc::pid_t) } == sid as libc::pid_t
+                    && daemon_identity(sid).is_some()
+                {
+                    return leader;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            panic!("install_session_lineage must make the child an identifiable session leader");
+        }
+
+        fn identity(&self) -> DaemonIdentity {
+            daemon_identity(self.sid()).expect("a live session leader's identity stays readable")
+        }
+
+        fn sid(&self) -> u32 {
+            self.child.id()
+        }
+    }
+
+    impl Drop for SessionLeaderChild {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    struct SeveredSessionRootOrphan {
+        root: std::process::Child,
+        orphan_pid: u32,
+    }
+
+    impl SeveredSessionRootOrphan {
+        fn spawn() -> Self {
+            use std::io::BufRead;
+
+            let mut command = std::process::Command::new("/bin/sh");
+            command
+                .arg("-c")
+                // The inner shell exits right after backgrounding `sleep`, severing
+                // the orphan's walk; `exec` keeps the outer shell's pid, and with it
+                // the session it leads, on the surviving process.
+                .arg(r#"sh -c 'sleep 30 & printf "%s\n" "$!"'; exec sleep 30"#)
+                .stdout(std::process::Stdio::piped());
+            install_session_lineage(&mut command);
+            let mut root = command.spawn().expect("spawning /bin/sh must succeed");
+            let stdout = root.stdout.take().expect("stdout is piped above");
+            let mut line = String::new();
+            std::io::BufReader::new(stdout)
+                .read_line(&mut line)
+                .expect("the launcher prints the backgrounded pid before it exits");
+            let orphan_pid = line
+                .trim()
+                .parse()
+                .expect("`$!` is a pid, so the printed line parses");
+            let severed = Self { root, orphan_pid };
+            for _ in 0..200 {
+                if parent_pid(orphan_pid).ok() == Some(1) {
+                    assert_eq!(
+                        session_id_of(orphan_pid),
+                        Some(severed.root_pid()),
+                        "the orphan must stay in the session its root leads"
+                    );
+                    return severed;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            panic!("the backgrounded command must reparent to 1 once its launcher exits");
+        }
+
+        fn root_pid(&self) -> u32 {
+            self.root.id()
+        }
+    }
+
+    impl Drop for SeveredSessionRootOrphan {
+        fn drop(&mut self) {
+            // SAFETY: kill(2) takes plain integers, no pointers. The orphan belongs to
+            // init now, so it can only be signalled here, never waited for.
+            unsafe { libc::kill(self.orphan_pid as libc::pid_t, libc::SIGKILL) };
+            let _ = self.root.kill();
+            let _ = self.root.wait();
+        }
+    }
+
     fn test_context(candidate_pid: u32) -> DaemonHelperContext {
         DaemonHelperContext {
             schema_version: DAEMON_HELPER_SCHEMA_VERSION,
@@ -6401,6 +6703,318 @@ mod tests {
         let blocked = resolve_caller_with(DAEMONIZED_PEER, UNRELATED_ROOT, &state, "git", |_| None);
         assert!(matches!(blocked, Err(NonoError::BlockedCommand { .. })));
         Ok(())
+    }
+
+    #[test]
+    fn resolve_caller_resolves_ordinary_orphan_via_session_lineage() -> Result<()> {
+        let state = test_state();
+        let leader = SessionLeaderChild::spawn();
+        state.session_lineage.record(
+            leader.sid(),
+            "parent",
+            &Caller::Session,
+            Some(leader.identity()),
+        );
+
+        let caller = resolve_caller_with(leader.sid(), UNRELATED_ROOT, &state, "child", |_| None)?;
+
+        assert!(matches!(caller, Caller::Command { name } if name == "parent"));
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_caller_session_lineage_uses_launch_caller_for_self_invocation() -> Result<()> {
+        let state = test_state();
+        let leader = SessionLeaderChild::spawn();
+        state.session_lineage.record(
+            leader.sid(),
+            "git",
+            &Caller::Session,
+            Some(leader.identity()),
+        );
+
+        let caller = resolve_caller_with(leader.sid(), UNRELATED_ROOT, &state, "git", |_| None)?;
+
+        assert!(matches!(caller, Caller::Session));
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_caller_attributes_a_severed_session_root_descendant_to_the_session() -> Result<()> {
+        let state = test_state();
+        let severed = SeveredSessionRootOrphan::spawn();
+
+        let caller = resolve_caller_with(
+            severed.orphan_pid,
+            severed.root_pid(),
+            &state,
+            "child",
+            |_| None,
+        )?;
+
+        assert!(
+            matches!(caller, Caller::Session),
+            "an orphan of an unmediated launcher must keep the session's policy edge"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_caller_blocks_a_severed_orphan_of_another_session() {
+        let state = test_state();
+        let severed = SeveredSessionRootOrphan::spawn();
+
+        // A session root that does not lead the orphan's session: that session is one
+        // nono never created (e.g. the user's terminal, shared with processes outside
+        // the sandboxed tree), so membership proves no descent from the session root.
+        let blocked =
+            resolve_caller_with(severed.orphan_pid, UNRELATED_ROOT, &state, "child", |_| {
+                None
+            });
+
+        assert!(
+            matches!(blocked, Err(NonoError::BlockedCommand { .. })),
+            "only the session nono created may stand in for the ancestry walk"
+        );
+    }
+
+    #[test]
+    fn session_lineage_resolves_entry_recorded_without_an_identity_pin() {
+        let state = test_state();
+        let mut probe = std::process::Command::new("/usr/bin/true")
+            .spawn()
+            .expect("spawning /usr/bin/true must succeed");
+        let dead_sid = probe.id();
+        probe.wait().expect("reaping the probe must succeed");
+        // SAFETY: getsid is a pure syscall wrapper; the pid is a plain integer.
+        if unsafe { libc::getsid(dead_sid as libc::pid_t) } >= 0 {
+            return;
+        }
+
+        state
+            .session_lineage
+            .record(dead_sid, "parent", &Caller::Session, None);
+
+        assert!(
+            matches!(state.session_lineage.resolve_sid(dead_sid), Some((name, Caller::Session)) if name == "parent"),
+            "an unpinned entry must still resolve while no live leader holds its pid"
+        );
+    }
+
+    #[test]
+    fn track_child_records_session_lineage_for_an_already_exited_launcher() -> Result<()> {
+        let state = test_state();
+        let mut launcher = std::process::Command::new("/usr/bin/true")
+            .spawn()
+            .expect("spawning /usr/bin/true must succeed");
+        let launcher_pid = launcher.id();
+        launcher.wait().expect("reaping the launcher must succeed");
+        assert!(
+            daemon_identity(launcher_pid).is_none(),
+            "an exited launcher must have no readable identity"
+        );
+        // SAFETY: getsid is a pure syscall wrapper; the pid is a plain integer.
+        if unsafe { libc::getsid(launcher_pid as libc::pid_t) } >= 0 {
+            return Ok(());
+        }
+
+        track_child(&state, launcher_pid, "parent", &Caller::Session)?;
+
+        assert!(
+            matches!(state.session_lineage.resolve_sid(launcher_pid), Some((name, _)) if name == "parent"),
+            "the orphan's session must stay attributable to its launcher"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn session_lineage_evicts_unpinned_entry_whose_leader_pid_was_recycled() {
+        let state = test_state();
+        let squatter = SessionLeaderChild::spawn();
+        let sid = squatter.sid();
+
+        state
+            .session_lineage
+            .record(sid, "parent", &Caller::Session, None);
+
+        assert!(
+            state.session_lineage.resolve_sid(sid).is_none(),
+            "an unpinned entry must fail closed once a live session leader holds its pid"
+        );
+        assert!(
+            state.session_lineage.resolve_sid(sid).is_none(),
+            "the stale entry must have been evicted, not merely rejected once"
+        );
+    }
+
+    #[test]
+    fn resolve_caller_denies_severed_caller_with_no_session_record() {
+        let state = test_state();
+        let pid = std::process::id();
+
+        // Fail-closed: nothing recorded this pid's session, and no daemon match either.
+        let blocked = resolve_caller_with(pid, UNRELATED_ROOT, &state, "child", |_| None);
+
+        assert!(matches!(blocked, Err(NonoError::BlockedCommand { .. })));
+    }
+
+    #[test]
+    fn resolve_caller_denies_stale_session_after_pid_reuse() {
+        let state = test_state();
+        let leader = SessionLeaderChild::spawn();
+
+        // Simulate a stale record left behind by a long-exited command whose
+        // session id was later recycled by the live leader spawned above.
+        {
+            let mut owners = state.session_lineage.owners.lock().expect("lock owners");
+            owners.by_sid.insert(
+                leader.sid(),
+                SessionLineageEntry {
+                    command: "stale-command".to_string(),
+                    launch_caller: Caller::Session,
+                    identity: Some(DaemonIdentity {
+                        uniqueid: 0,
+                        start_usec: 0,
+                    }),
+                    used: 0,
+                },
+            );
+        }
+
+        let blocked = resolve_caller_with(leader.sid(), UNRELATED_ROOT, &state, "child", |_| None);
+
+        assert!(matches!(blocked, Err(NonoError::BlockedCommand { .. })));
+    }
+
+    #[test]
+    fn session_lineage_survives_innocent_leader_pid_reuse() {
+        let state = test_state();
+
+        let mut bystander = std::process::Command::new("sleep")
+            .arg("20")
+            .spawn()
+            .expect("spawn sleep");
+        let sid = bystander.id();
+        state.session_lineage.record(
+            sid,
+            "parent",
+            &Caller::Session,
+            Some(DaemonIdentity {
+                uniqueid: 0,
+                start_usec: 0,
+            }),
+        );
+
+        let resolved = state.session_lineage.resolve_sid(sid);
+        assert!(
+            matches!(&resolved, Some((name, _)) if name == "parent"),
+            "innocent reuse of the dead leader's pid must not break attribution, got {resolved:?}"
+        );
+        assert!(
+            state.session_lineage.resolve_sid(sid).is_some(),
+            "the entry must also survive (not be evicted) for later requests"
+        );
+
+        let _ = bystander.kill();
+        let _ = bystander.wait();
+    }
+
+    #[test]
+    fn session_lineage_re_record_after_eviction_outlives_older_fillers() {
+        let state = test_state();
+        let leader = SessionLeaderChild::spawn();
+        let sid = leader.sid();
+        let real_identity = leader.identity();
+
+        // Fabricate a stale record under our own live sid so `resolve` evicts
+        // it via the identity-mismatch path, exactly as in the test above.
+        {
+            let mut owners = state.session_lineage.owners.lock().expect("lock owners");
+            owners.by_sid.insert(
+                sid,
+                SessionLineageEntry {
+                    command: "stale-command".to_string(),
+                    launch_caller: Caller::Session,
+                    identity: Some(DaemonIdentity {
+                        uniqueid: 0,
+                        start_usec: 0,
+                    }),
+                    used: 0,
+                },
+            );
+        }
+        assert!(
+            state.session_lineage.resolve_sid(sid).is_none(),
+            "identity mismatch must evict the stale record"
+        );
+
+        // Re-record that same sid as a legitimate fresh session (the number
+        // was reused) behind a full cap of older fillers, then cross the cap.
+        // The fresh entry is the newest of all of them, so every filler is a
+        // better eviction victim; an evicted sid must leave nothing behind
+        // that outranks it.
+        for i in 0..MAX_SESSION_LINEAGE_ENTRIES - 1 {
+            let filler_sid = 1_000_000 + i as u32;
+            state.session_lineage.record(
+                filler_sid,
+                "filler",
+                &Caller::Session,
+                Some(real_identity),
+            );
+        }
+        state
+            .session_lineage
+            .record(sid, "fresh-command", &Caller::Session, Some(real_identity));
+        state.session_lineage.record(
+            1_000_000 + MAX_SESSION_LINEAGE_ENTRIES as u32,
+            "filler",
+            &Caller::Session,
+            Some(real_identity),
+        );
+
+        let resolved = state.session_lineage.resolve_sid(sid);
+        assert!(
+            matches!(&resolved, Some((name, _)) if name == "fresh-command"),
+            "fresh record for a reused sid must survive cap eviction (only fillers are actually oldest), got {resolved:?}"
+        );
+    }
+
+    #[test]
+    fn session_lineage_resolve_refreshes_recency_for_lru_eviction() {
+        let state = test_state();
+        let leader = SessionLeaderChild::spawn();
+        let sid = leader.sid();
+        let identity = leader.identity();
+
+        // Oldest entry: the session a long-lived orphan keeps resolving through.
+        state
+            .session_lineage
+            .record(sid, "parent", &Caller::Session, Some(identity));
+        for i in 0..MAX_SESSION_LINEAGE_ENTRIES - 1 {
+            state.session_lineage.record(
+                1_000_000 + i as u32,
+                "filler",
+                &Caller::Session,
+                Some(identity),
+            );
+        }
+        assert!(
+            state.session_lineage.resolve_sid(sid).is_some(),
+            "entry must still resolve at exactly the cap"
+        );
+
+        // Under FIFO this launch would evict the orphan's entry (the first
+        // recorded); the resolve above must have refreshed it so the stalest
+        // filler goes instead.
+        state
+            .session_lineage
+            .record(2_000_000, "filler", &Caller::Session, Some(identity));
+
+        let resolved = state.session_lineage.resolve_sid(sid);
+        assert!(
+            matches!(&resolved, Some((name, _)) if name == "parent"),
+            "an actively-resolving session must not be the eviction victim, got {resolved:?}"
+        );
     }
 
     #[test]
@@ -6767,10 +7381,6 @@ mod tests {
         assert_eq!(cache.len(), 1);
     }
 
-    /// LIVE: the property the marker exists for. A real setsid+double-fork daemon
-    /// reparented to pid 1, named by a `daemon_pid_source` helper, resolves to
-    /// `Command{tmux}`; an unnamed reparented daemon is denied. `#[ignore]`: forks
-    /// real processes; run with --ignored.
     #[test]
     #[ignore = "forks real reparented daemons; run with --ignored"]
     fn live_severed_daemon_attributed_to_its_command() {
@@ -6849,6 +7459,73 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore = "forks real reparented processes; run with --ignored"]
+    fn live_ordinary_orphan_attributed_via_session_lineage() {
+        use nix::sys::wait::waitpid;
+        use nix::unistd::{ForkResult, fork};
+
+        fn spawn_ordinary_orphan(state: &ToolSandboxState) -> u32 {
+            let mut fds = [0i32; 2];
+            assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
+            let [read_fd, write_fd] = fds;
+            // SAFETY: post-fork children use only async-signal-safe libc calls.
+            match unsafe { fork() }.expect("fork") {
+                ForkResult::Child => {
+                    unsafe { libc::setsid() };
+                    match unsafe { fork() }.expect("fork") {
+                        ForkResult::Child => {
+                            let pid = unsafe { libc::getpid() };
+                            let bytes = pid.to_ne_bytes();
+                            unsafe {
+                                libc::write(write_fd, bytes.as_ptr().cast(), bytes.len());
+                                libc::usleep(800_000);
+                                libc::_exit(0);
+                            }
+                        }
+                        // The launching process exits immediately without waiting,
+                        // exactly like `parent`'s script ending right after `child &`.
+                        ForkResult::Parent { .. } => unsafe { libc::_exit(0) },
+                    }
+                }
+                ForkResult::Parent { child } => {
+                    unsafe { libc::close(write_fd) };
+                    // What `track_child` records once `install_session_lineage`'s
+                    // setsid() has made the launched command its own session leader.
+                    let identity = daemon_identity(child.as_raw() as u32)
+                        .expect("setsid-ing process is still queryable pre-reap");
+                    state.session_lineage.record(
+                        child.as_raw() as u32,
+                        "parent",
+                        &Caller::Session,
+                        Some(identity),
+                    );
+                    let _ = waitpid(child, None); // reap the setsid-ing process
+                    let mut buf = [0u8; 4];
+                    let n = unsafe { libc::read(read_fd, buf.as_mut_ptr().cast(), buf.len()) };
+                    assert_eq!(n, 4, "expected the orphan's pid");
+                    unsafe { libc::close(read_fd) };
+                    i32::from_ne_bytes(buf) as u32
+                }
+            }
+        }
+
+        let state = test_state();
+        let orphan = spawn_ordinary_orphan(&state);
+        assert_eq!(
+            parent_pid(orphan).ok(),
+            Some(1),
+            "backgrounded descendant must reparent to 1 once its launcher exits"
+        );
+
+        let caller = resolve_caller_with(orphan, UNRELATED_ROOT, &state, "child", |_| None)
+            .expect("resolve_caller_with");
+        assert!(
+            matches!(caller, Caller::Command { name } if name == "parent"),
+            "an ordinary orphan must attribute to the command that self-assigned its session"
+        );
     }
 
     #[test]

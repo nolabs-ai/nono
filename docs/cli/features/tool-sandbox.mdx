@@ -282,6 +282,10 @@ Tool Sandbox authorizes a request by walking the caller's process ancestry to th
 
 Either way a severed caller resolves only to the command that spawned it, never the session, and is denied on any mismatch.
 
+macOS adds one case where the session is the answer: a launcher nono never mediated — a plain fork of the session root, such as an agent's status-line script that backgrounds a command and returns — leaves no marker naming it. nono then accepts the orphan under the **session** policy when it is a member of the session nono created for its direct child. Membership is proof of descent: a session can only be created, never joined.
+
+That session exists only when nono allocated a pty for the direct child, which it does when stdin, stdout and stderr are all a terminal. With any of them redirected — a piped or CI run — the direct child inherits nono's own session, shared with every other process in the user's terminal session, so membership proves nothing and such a caller is denied.
+
 The macOS helper is declared as `{ "argv": [...], "env": [...] }`. nono passes the daemon's context as a single JSON object on **stdin**:
 
 ```json

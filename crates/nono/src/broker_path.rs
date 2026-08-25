@@ -52,6 +52,44 @@ pub fn sanitize_broker_path_for_binary(
     })
 }
 
+/// Return every `PATH` entry the sandbox can write to, whole directories and
+/// individually-exposed files alike.
+///
+/// This is a diagnostic, not an enforcement point: brokers already sanitize
+/// their own lookups, so a non-empty result here doesn't mean a broker is at
+/// risk. It means the *host* is: once the sandboxed process plants (or
+/// overwrites, for the file case) a binary at one of these paths, anything
+/// else on the machine that later resolves that name by bare `PATH` lookup —
+/// a shell, a cron job, an unrelated tool — runs it with full user
+/// privileges, entirely outside nono's view. Callers use this to warn about
+/// (or refuse) that exposure at startup, before any of it can happen.
+///
+/// A directory that's safe on its own can still contain one exact file the
+/// sandbox has a *file-scoped* write grant on (e.g.
+/// `filesystem.write: ["/usr/local/bin/gh"]`) — that grant doesn't carry a
+/// directory-level entry for [`is_entry_safe`] to see, so it's checked
+/// separately and reported as that one file rather than the whole directory.
+#[must_use]
+pub fn writable_path_dirs(path_value: &str, outer_caps: &CapabilitySet) -> Vec<PathBuf> {
+    let mut writable = Vec::new();
+    for entry in std::env::split_paths(path_value) {
+        if !is_entry_safe(&entry, outer_caps) {
+            writable.push(entry);
+            continue;
+        }
+        let canonical_dir = try_canonicalize(&entry);
+        for cap in outer_caps.fs_capabilities() {
+            if cap.is_file
+                && cap.access.contains(AccessMode::Write)
+                && cap.resolved.parent() == Some(canonical_dir.as_path())
+            {
+                writable.push(cap.resolved.clone());
+            }
+        }
+    }
+    writable
+}
+
 fn filter_path(path_value: &str, mut keep: impl FnMut(&Path) -> bool) -> String {
     let kept: Vec<PathBuf> = std::env::split_paths(path_value)
         .filter(|entry| keep(entry))
@@ -565,6 +603,62 @@ mod tests {
         assert!(
             safe_marker.exists(),
             "real tool on the read-only directory did not run"
+        );
+    }
+
+    #[test]
+    fn writable_path_dirs_reports_the_writable_entry_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let writable = dir.path().join("writable");
+        let safe = dir.path().join("safe");
+        std::fs::create_dir_all(&writable).expect("mkdir writable");
+        std::fs::create_dir_all(&safe).expect("mkdir safe");
+
+        let caps = caps_with_write(&writable);
+        let path = format!("{}:{}", writable.display(), safe.display());
+
+        let reported = writable_path_dirs(&path, &caps);
+        assert_eq!(reported, vec![writable]);
+    }
+
+    #[test]
+    fn writable_path_dirs_empty_when_nothing_is_writable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let safe = dir.path().join("safe");
+        std::fs::create_dir_all(&safe).expect("mkdir safe");
+
+        let caps = caps_with_read(&safe);
+        let path = safe.display().to_string();
+
+        assert_eq!(writable_path_dirs(&path, &caps), Vec::<PathBuf>::new());
+    }
+
+    /// A file-scoped write grant on one binary doesn't add a directory-level
+    /// capability entry, so the directory-only check in `is_entry_safe`
+    /// cannot see it. `writable_path_dirs` must check file-scoped grants
+    /// separately and report the exact file, not the (otherwise safe)
+    /// directory it lives in.
+    #[test]
+    fn writable_path_dirs_reports_file_scoped_grant_without_flagging_whole_dir() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let bin_dir = root.path().join("bin");
+        std::fs::create_dir_all(&bin_dir).expect("mkdir bin");
+        let gh = bin_dir.join("gh");
+        std::fs::write(&gh, "").expect("write gh");
+
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(FsCapability {
+            original: gh.clone(),
+            resolved: try_canonicalize(&gh),
+            access: AccessMode::Write,
+            is_file: true,
+            source: CapabilitySource::User,
+        });
+
+        let path = bin_dir.display().to_string();
+        assert_eq!(
+            writable_path_dirs(&path, &caps),
+            vec![try_canonicalize(&gh)]
         );
     }
 

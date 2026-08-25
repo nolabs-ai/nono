@@ -872,6 +872,22 @@ nono run --allow-gpu -- llama-cli -m ./model.gguf -p "hello"
   When used with a profile, the profile must opt into `allow_gpu`; otherwise nono fails closed with an error. Without a profile, the CLI flag alone is sufficient.
 </Note>
 
+#### `--strict-broker-path`
+
+Refuse to start, instead of warning, when a filesystem grant (`--allow`/`--write`/a profile's `filesystem.allow`) overlaps the ambient `PATH` — either a whole directory, or one binary inside an otherwise-unwritable directory via a file-scoped grant (e.g. `filesystem.write: ["/usr/local/bin/gh"]`).
+
+This isn't about nono's own credential/browser brokers — they already sanitize `PATH` before resolving anything by bare name (see [PATH Sanitization for Host-Side Brokers](/cli/internals/security-model#path-sanitization-for-host-side-brokers)). It's about the writable path itself: once the sandboxed process can write there, it can plant (or overwrite) a same-named binary that anything *else* on the host — a shell, a cron job, an unrelated tool — will run with full privileges the next time it does an ordinary `PATH` lookup, entirely outside nono.
+
+By default nono only warns about this and proceeds, since directories like `$HOME/go/bin` are a common and often legitimate grant. `--strict-broker-path` turns that warning into a hard failure for sessions where you want to rule out the exposure entirely.
+
+```bash
+nono run --allow "$HOME/go/bin" --strict-broker-path -- my-agent
+```
+
+<Note>
+  Not available on `nono wrap`. Warnings are unconditional there; only the strict refusal is opt-in, and `wrap` keeps a minimal flag surface.
+</Note>
+
 #### `--allow-http2`
 
 Enable HTTP/2 multiplexing for upstream proxy connections. When set, the proxy negotiates h2 via ALPN with upstreams that support it, and the CONNECT intercept advertises both `h2` and `http/1.1`.

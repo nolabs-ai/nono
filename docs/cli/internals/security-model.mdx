@@ -408,6 +408,12 @@ Before any of these lookups, nono strips every `PATH` entry that isn't provably 
 
 This has no bearing on the standalone `nono proxy` command, which launches no sandboxed child and therefore has no capability set to check `PATH` against — its own credential resolution uses `PATH` as given, the same trust level as running the CLI directly in a shell.
 
+#### Host-Side Persistence Risk (Separate From Broker Safety)
+
+Sanitizing `PATH` for nono's own brokers doesn't make a writable-and-on-`PATH` location safe in general — it only means nono itself won't be tricked. That location can still be used as a planting ground for something else entirely: once the sandboxed process writes (or, for a file-scoped grant like `filesystem.write: ["/usr/local/bin/gh"]`, overwrites) a same-named binary there, anything *else* on the host that later does an ordinary bare-name `PATH` lookup — a shell you open yourself, a cron job, an unrelated CLI tool — resolves and runs it with full user privileges, completely outside nono's view. Nono has no way to intervene there; it isn't in that lookup at all. The startup check below (and `--strict-broker-path`) covers both shapes: a whole directory grant, and a file-scoped grant on one binary inside an otherwise-unwritable directory.
+
+Rather than refusing to start whenever this configuration appears — which would break the common and often legitimate case of granting somewhere like `$HOME/go/bin` — nono warns about it once at startup and proceeds. `--strict-broker-path` (see [Flags](/cli/usage/flags#--strict-broker-path)) turns that warning into a hard failure for sessions where the operator wants to rule the exposure out entirely rather than accept and note it.
+
 ### Proxy Failure Modes
 
 | Failure | Behavior | Safety Property |

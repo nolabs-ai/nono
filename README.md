@@ -118,7 +118,11 @@ nono attach a3f7c2
 
 Start a session attached and walk away with `Ctrl-] d`, or start it `--detached` from the beginning and reattach whenever you want — from the same terminal or a different one. The agent keeps running while you're disconnected; nothing is paused just because no one is watching. Pair `--detached` with `--rollback` to let an agent work unattended with a safety net to review or restore from if it goes off the rails.
 
+<div align="center">
+
 <img src="assets/sessions-demo.gif" alt="nono session management demo: detach, ps, attach, and stop" width="760"/>
+
+</div>
 
 Read more in [Session Lifecycle](https://nono.sh/docs/cli/features/session-lifecycle).
 

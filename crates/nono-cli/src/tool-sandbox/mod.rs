@@ -27,6 +27,25 @@ pub(crate) fn record_main_start() {}
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub(crate) fn log_main_total() {}
 
+// Ctrl-C/Ctrl-Z relay to tool-sandbox mediated children is macOS-only: only
+// macOS's `install_session_lineage` detaches mediated children from the
+// terminal's process group via `setsid()` (needed for unforgeable
+// session-based attribution). Linux gets unforgeable attribution from
+// cgroup-based lineage instead, without detaching from the session, so its
+// mediated children already receive both signals via ordinary kernel
+// foreground-process-group delivery — no relay needed.
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn signal_active_children_in_pgroup(
+    _pgid: nix::unistd::Pid,
+    _sig: nix::sys::signal::Signal,
+) {
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn signal_relay_write_fd() -> i32 {
+    -1
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod audit_context;
 // Unconditional: readers of an event log classify decisions on every platform,
@@ -490,5 +509,5 @@ mod macos;
 #[cfg(target_os = "macos")]
 pub(crate) use macos::{
     PreparedToolSandboxRuntime, log_main_total, maybe_run_internal_tool_sandbox_entrypoint,
-    record_main_start,
+    record_main_start, signal_active_children_in_pgroup, signal_relay_write_fd,
 };

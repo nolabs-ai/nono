@@ -2264,6 +2264,15 @@ static PTY_MASTER_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI3
 static PAUSE_PIPE_WRITE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 static PAUSE_PIPE_READ: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
+/// The pty master fd nono created for its own direct child, if any — used by
+/// the tool-sandbox signal-relay thread (macOS only, see
+/// `tool_sandbox::signal_active_children_in_pgroup`) to find the terminal's
+/// current foreground process group via `tcgetpgrp`.
+pub(crate) fn pty_master_fd() -> Option<i32> {
+    let fd = PTY_MASTER_FD.load(std::sync::atomic::Ordering::SeqCst);
+    (fd >= 0).then_some(fd)
+}
+
 fn create_pause_pipe() -> i32 {
     let mut fds = [0i32; 2];
     let ret = unsafe { libc::pipe(fds.as_mut_ptr()) };
@@ -2323,6 +2332,19 @@ extern "C" fn forward_signal(sig: libc::c_int) {
                 }
             }
         } else {
+            // Also relay to tool-sandbox mediated children (macOS only — see
+            // `tool_sandbox::signal_relay_write_fd`): `child_raw` alone
+            // doesn't reach them, since `setsid()` detached them from this
+            // process's session. Async-signal-safe: only an atomic load and
+            // `write()`, same as the SIGUSR1 branch above; the real relay
+            // logic runs on an ordinary thread reading this pipe.
+            let relay_fd = crate::tool_sandbox::signal_relay_write_fd();
+            if relay_fd >= 0 {
+                let byte = [sig as u8];
+                unsafe {
+                    libc::write(relay_fd, byte.as_ptr().cast(), 1);
+                }
+            }
             unsafe {
                 libc::kill(child_raw, sig);
             }
@@ -2450,6 +2472,12 @@ fn handle_pty_suspension(pty: Option<&mut crate::pty_proxy::PtyProxy>, child: Pi
         Some(pgid) => pgid.as_raw() == child.as_raw(),
         None => true,
     };
+    // Captured once, before suspension changes anything, and reused on
+    // resume — the pgid a tool-sandbox mediated child's requester belongs to
+    // doesn't change across the suspend/resume pair. See
+    // `tool_sandbox::signal_active_children_in_pgroup` (macOS only; a no-op
+    // on other platforms).
+    let target_pgid = fg_pgid.unwrap_or(child);
 
     // Nested job: forward SIGTSTP and let the inner shell handle it. Do not
     // waitpid() — the stopped job is not our child, and the inner shell is
@@ -2457,6 +2485,7 @@ fn handle_pty_suspension(pty: Option<&mut crate::pty_proxy::PtyProxy>, child: Pi
     if !child_is_foreground {
         if let Some(pgid) = fg_pgid {
             let _ = signal::kill(Pid::from_raw(-pgid.as_raw()), Signal::SIGTSTP);
+            crate::tool_sandbox::signal_active_children_in_pgroup(pgid, Signal::SIGTSTP);
         }
         return;
     }
@@ -2464,6 +2493,7 @@ fn handle_pty_suspension(pty: Option<&mut crate::pty_proxy::PtyProxy>, child: Pi
     // Direct child (orphaned PG): SIGSTOP is uncatchable, unlike SIGTSTP which
     // an interactive bash ignores, so it forces the stopped state immediately.
     signal_pty_foreground_group(pty, child, Signal::SIGSTOP);
+    crate::tool_sandbox::signal_active_children_in_pgroup(target_pgid, Signal::SIGSTOP);
 
     loop {
         match waitpid(child, Some(WaitPidFlag::WUNTRACED)) {
@@ -2514,6 +2544,7 @@ fn handle_pty_suspension(pty: Option<&mut crate::pty_proxy::PtyProxy>, child: Pi
     pty.reenter_screen_for_resume();
 
     signal_pty_foreground_group(pty, child, Signal::SIGCONT);
+    crate::tool_sandbox::signal_active_children_in_pgroup(target_pgid, Signal::SIGCONT);
 
     // SIGSTOP doesn't give the child a chance to clean up its terminal state.
     // When resumed, TUI apps (opencode, vim, htop) don't know they need to

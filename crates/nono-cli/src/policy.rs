@@ -362,12 +362,7 @@ pub(crate) fn expand_glob_path(pattern: &str) -> Result<Vec<PathBuf>> {
 /// returned path and denies both forms.
 pub(crate) fn expand_glob_deny_paths(pattern: &str) -> Result<Vec<PathBuf>> {
     let (mut matches, escaped) = expand_glob_path_impl(pattern)?;
-    if matches.is_empty() && escaped.is_empty() {
-        warn!(
-            "Glob pattern {pattern:?} matched no existing paths; \
-             the rule will have no effect until matching files are created"
-        );
-    }
+    // No warning on an empty match here — the caller logs platform-appropriately.
     matches.extend(escaped);
     matches.sort();
     matches.dedup();
@@ -1011,8 +1006,24 @@ pub(crate) fn add_glob_deny_rules(
     caps: &mut CapabilitySet,
     deny_paths: &mut Vec<PathBuf>,
 ) -> Result<()> {
-    for path in expand_glob_deny_paths(pattern)? {
+    let expanded = expand_glob_deny_paths(pattern)?;
+    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+    let matched_existing = !expanded.is_empty();
+    for path in expanded {
         add_deny_access_rules(path_to_utf8(&path)?, caps, deny_paths)?;
+    }
+
+    // Landlock is allow-list only, so an unmatched deny glob leaves later-created
+    // matches uncovered — warn so the profile can be scoped accordingly.
+    #[cfg(target_os = "linux")]
+    if !matched_existing {
+        warn!(
+            "Glob deny {pattern:?} matched no existing paths at sandbox start; \
+             Landlock has no deny semantics, so files matching this pattern \
+             created after startup will NOT be denied. Scope deny globs to \
+             paths that already exist, or enable capability_elevation for \
+             runtime enforcement."
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -1041,13 +1052,6 @@ pub(crate) fn add_glob_deny_rules(
         // Unix socket connect(2) is mediated as network-outbound, not file I/O.
         caps.add_platform_rule(format!("(deny network-outbound (regex #\"{re}\"))"))?;
     }
-
-    #[cfg(target_os = "linux")]
-    debug!(
-        "Glob deny {pattern:?}: pattern is expanded at sandbox start — files created \
-         after the sandbox is applied are not covered. Enable capability_elevation \
-         for runtime enforcement."
-    );
 
     Ok(())
 }
@@ -2136,6 +2140,31 @@ mod tests {
             assert!(rules.contains("allow file-read-metadata"));
         } else {
             // On Linux, no platform rules (Landlock has no deny semantics)
+            assert!(caps.platform_rules().is_empty());
+        }
+    }
+
+    #[test]
+    fn test_add_glob_deny_rules_unmatched_pattern_still_covers_future_files_on_macos() {
+        // #1735: an unmatched deny glob still enforces prospectively on macOS
+        // (Seatbelt regex rule), but not on Linux (Landlock is allow-list only).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pattern = format!("{}/**/.env", dir.path().display());
+
+        let mut caps = CapabilitySet::new();
+        let mut deny_paths = Vec::new();
+        add_glob_deny_rules(&pattern, &mut caps, &mut deny_paths).expect("add_glob_deny_rules");
+
+        // No existing file matched, so nothing was carved out of the allow-list.
+        assert!(deny_paths.is_empty());
+
+        if cfg!(target_os = "macos") {
+            // The regex-based rule still denies future-created matches.
+            let rules = caps.platform_rules().join("\n");
+            assert!(rules.contains("deny file-write*"));
+            assert!(rules.contains("deny file-read-data"));
+        } else {
+            // Landlock has no deny semantics; nothing to enforce prospectively.
             assert!(caps.platform_rules().is_empty());
         }
     }

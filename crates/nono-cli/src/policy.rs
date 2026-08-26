@@ -341,8 +341,8 @@ pub(crate) fn expand_glob_path(pattern: &str) -> Result<Vec<PathBuf>> {
     let (matches, _escaped) = expand_glob_path_impl(pattern)?;
     if matches.is_empty() {
         warn!(
-            "Glob pattern {pattern:?} matched no existing paths; \
-             the rule will have no effect until matching files are created"
+            "Glob pattern {pattern:?} matched no existing paths; allow globs are \
+             evaluated once at sandbox start, so files created later will NOT be granted access"
         );
     }
     Ok(matches)
@@ -1000,31 +1000,26 @@ fn resolve_parent_symlinks(path: &Path) -> Result<Option<PathBuf>> {
 /// sandbox start are covered at the kernel level. The literal path prefix is
 /// canonicalized before generating the regex so it matches the kernel's view.
 ///
-/// On Linux, emits a debug-level note that coverage is build-time only.
+/// On Linux, always warns that coverage is build-time only (Landlock has no
+/// deny semantics, so matches created after sandbox start are never covered —
+/// this holds regardless of whether other matches already existed at start).
 pub(crate) fn add_glob_deny_rules(
     pattern: &str,
     caps: &mut CapabilitySet,
     deny_paths: &mut Vec<PathBuf>,
 ) -> Result<()> {
     let expanded = expand_glob_deny_paths(pattern)?;
-    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
-    let matched_existing = !expanded.is_empty();
     for path in expanded {
         add_deny_access_rules(path_to_utf8(&path)?, caps, deny_paths)?;
     }
 
-    // Landlock is allow-list only, so an unmatched deny glob leaves later-created
-    // matches uncovered — warn so the profile can be scoped accordingly.
     #[cfg(target_os = "linux")]
-    if !matched_existing {
-        warn!(
-            "Glob deny {pattern:?} matched no existing paths at sandbox start; \
-             Landlock has no deny semantics, so files matching this pattern \
-             created after startup will NOT be denied. Scope deny globs to \
-             paths that already exist, or enable capability_elevation for \
-             runtime enforcement."
-        );
-    }
+    warn!(
+        "Glob deny {pattern:?}: Landlock has no deny semantics, so this pattern is only \
+         enforced against paths that existed at sandbox start — files matching it created \
+         afterward will NOT be denied. Scope deny globs to paths that already exist, or \
+         enable capability_elevation for runtime enforcement."
+    );
 
     #[cfg(target_os = "macos")]
     {

@@ -35,7 +35,7 @@ pub(crate) fn prepare_audit_signer(secret_ref: Option<&str>) -> Result<Option<Au
     };
 
     let normalized_ref = normalize_signing_secret_ref(secret_ref);
-    let pkcs8_b64 = nono::load_secret_by_ref(trust_cmd::TRUST_SERVICE, &normalized_ref)?;
+    let pkcs8_b64 = nono::load_secret_by_ref(trust_cmd::TRUST_SERVICE, &normalized_ref, None)?;
     let pkcs8_bytes =
         Zeroizing::new(trust_cmd::base64_decode(pkcs8_b64.as_str()).map_err(|e| {
             NonoError::TrustSigning {

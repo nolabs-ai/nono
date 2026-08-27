@@ -1405,6 +1405,16 @@ pub struct SandboxArgs {
     #[arg(long, help_heading = "OPTIONS")]
     pub allow_gpu: bool,
 
+    /// Refuse to start instead of warning when a filesystem grant overlaps a
+    /// directory on PATH. nono's own credential/browser brokers already
+    /// sanitize PATH before resolving anything by bare name, so this isn't
+    /// about protecting them — it's about the directory itself: once the
+    /// sandboxed process can plant a same-named binary there, anything else
+    /// on the host that later resolves that name (a shell, cron, another
+    /// tool) runs it with full privileges, outside nono entirely
+    #[arg(long, help_heading = "OPTIONS")]
+    pub strict_broker_path: bool,
+
     /// Linux sandbox enforcement mechanism [auto|landlock|external] (default: auto).
     ///
     /// auto     — Landlock plus a static seccomp baseline for restricted
@@ -1977,6 +1987,10 @@ impl From<WrapSandboxArgs> for SandboxArgs {
             extends: args.extends,
             allow_launch_services: args.allow_launch_services,
             allow_gpu: args.allow_gpu,
+            // Not exposed as a `wrap` flag, matching its already-minimal flag
+            // surface (e.g. no `--memory`). `wrap` still gets the warning,
+            // which is unconditional — only the strict refusal is opt-in.
+            strict_broker_path: false,
             allow_http2: false,
             config: args.config,
             verbose: args.verbose,

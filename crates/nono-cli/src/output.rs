@@ -350,6 +350,59 @@ fn print_blocked_grants(
     );
 }
 
+/// Warn that a filesystem grant overlaps a path on the ambient `PATH` — a
+/// whole directory, or a single binary via a file-scoped grant inside an
+/// otherwise-unwritable one.
+///
+/// Not a broker-safety warning — nono's own brokers already sanitize `PATH`
+/// before resolving anything by bare name. This is about the path itself:
+/// once the sandbox can write there, anything else on the host that later
+/// does a bare-name `PATH` lookup can pick up whatever gets planted.
+///
+/// Terse by default, matching [`print_blocked_grants`]'s convention: one
+/// summary line unless `-v` asks for the full explanation and listing.
+pub fn print_writable_path_warning(paths: &[std::path::PathBuf], verbose: u8, silent: bool) {
+    if silent || paths.is_empty() {
+        return;
+    }
+
+    let t = theme::current();
+    let badge_str = badge("warn ", t.yellow, BADGE_FG_DARK);
+
+    if verbose == 0 {
+        let n = paths.len();
+        let noun = if n == 1 { "entry" } else { "entries" };
+        eprintln!(
+            "  {} {}",
+            badge_str,
+            fg(
+                &format!(
+                    "{n} PATH {noun} sandbox-writable (-v to show, --strict-broker-path to fail closed)"
+                ),
+                t.subtext,
+            ),
+        );
+        return;
+    }
+
+    eprintln!(
+        "  {} {}",
+        badge_str,
+        fg("PATH entries the sandbox can write to:", t.text),
+    );
+    for path in paths {
+        eprintln!("       {}", fg(&path.to_string_lossy(), t.text));
+    }
+    eprintln!(
+        "       {}",
+        fg(
+            "anything on this host that resolves a planted name from here later \
+             runs it unsandboxed — use --strict-broker-path to fail closed instead",
+            t.subtext,
+        ),
+    );
+}
+
 fn format_access_badge(access: &AccessMode) -> String {
     let t = theme::current();
     match access {

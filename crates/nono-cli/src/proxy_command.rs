@@ -92,9 +92,14 @@ pub(crate) fn run_proxy(args: ProxyArgs, silent: bool) -> Result<()> {
     // approval registry from the profile, mirroring `start_proxy_runtime`. Without
     // these, `cmd://` routes fail with "managed credential unavailable" because the
     // proxy has no backend to invoke the capture command.
+    // Standalone mode has no sandboxed child (see module doc comment above),
+    // so there is nothing untrusted that could have written to PATH; pass an
+    // empty capability set so the credential-capture browser helper's PATH
+    // is left untouched beyond dropping empty/relative entries.
     let credential_capture_backend = crate::proxy_runtime::build_credential_capture_backend(
         &proxy.credential_capture,
         proxy.session_id.clone(),
+        nono::CapabilitySet::default(),
     )?;
     let approval_registry =
         crate::approval_runtime::build_proxy_approval_registry(proxy.command_policies.as_ref())?;

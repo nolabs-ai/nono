@@ -1,244 +1,115 @@
 ---
 title: Security Model
-description: Trust boundaries, Landlock + seccomp-notify layering, and the rationale behind nono's supervisor architecture
+description: Process level fine-grained capability control, supervisor trust, and the isolation boundary nono provides.
 ---
 
-nono's security model is built on a single premise: **the sandboxed process is untrusted**. Every architectural decision follows from this. The sandbox must be enforced by the kernel, must be irreversible once applied, and must not depend on the cooperation of the sandboxed process.
+## Sandboxing
 
-This page explains the layered enforcement architecture, the trust boundaries between components, and why specific mechanisms were chosen.
+Sandboxing is a security technique that runs a workload inside a boundary that limits what it can do and what it can access. Under the term 'Sandbox' there are many different models, everything from a full hypervisor or microVM to a browser tab, process, or even a single function call. The common theme is that the sandboxed process is restricted in what it can do and what it can access.
+
+
+nono provides fine-grained **capability control** sandboxing, where policy can be enforced down to the level of a single file / folder access, network access, or in some cases specific system call. **This is intentionally a different model from a guest/host isolation boundary sandbox model**. It reduces the authority available to a process and any child process it spawns, but it does not create a separate kernel or hardware boundary. It is a capability model, not a VM model.
+
+That distinction is intentional and important to understand, especially in the context of autonomous agents. An agent needs to use real development tools, reach selected services, and sometimes request additional access. This level of delegation is incompatible with a permanently sealed process model provided by a VM or container and in most cases practically impossible to implement with the level of granularity nono provides.
+
+So a model that promises both an absolute, permanently sealed boundary and fine-grained, runtime delegation would be contradictory.
+
+The security goal is therefore:
+
+> Make each grant of authority explicit, narrow, enforceable, and auditable at the point where a process and its child processes spawn.
+
+nono answers this question "how do I limit the execution path of a single spawned process and its children?" It does not answer "how do I create a separate kernel or single monolithic hardware boundary?" nono provides the former, and it can be combined with the latter when the deployment requires it.
+
+### Capability model vs. isolation model
+
+```mermaid
+flowchart LR
+    subgraph vm["microVM — perimeter isolation"]
+        direction TB
+        VAgent(("Agent"))
+        VFile1["Project files"]
+        VFile2["Unrelated files"]
+        VCred["Credentials"]
+        VProc["Other processes"]
+        VAgent --> VFile1
+        VAgent --> VFile2
+        VAgent --> VCred
+        VAgent --> VProc
+    end
+
+    subgraph nn["nono — capability isolation"]
+        direction TB
+        NAgent(("Agent"))
+        NFile1["Project files<br/>granted"]
+        NFile2["Unrelated files<br/>not granted"]
+        NCred["Credentials<br/>not granted"]
+        NProc["Other processes<br/>not granted"]
+        NAgent --> NFile1
+        NAgent --x NFile2
+        NAgent --x NCred
+        NAgent --x NProc
+    end
+
+    style vm stroke:#dc2626,stroke-width:4px
+    style nn stroke:#2563eb,stroke-width:1px,stroke-dasharray: 4 3
+
+    classDef reachable fill:#059669,color:#fff,stroke:#064e3b;
+    classDef blocked fill:#6b7280,color:#fff,stroke:#374151;
+    classDef flat fill:#f59e0b,color:#000,stroke:#92400e;
+
+    class VFile1,VFile2,VCred,VProc flat
+    class NFile1 reachable
+    class NFile2,NCred,NProc blocked
+```
+
+The perimeter is strong, but once inside it, everything is flat: an agent running in a microVM can freely reach every asset in the box — project files, unrelated files, credentials, other processes — because the guest OS does not itself distinguish between them.
+
+nono does the opposite: it does not add a perimeter around the whole box, but it protects the assets *inside* the agent's own operating context. Each file, credential, and process the agent can reach is the result of an explicit grant; anything not granted stays out of reach even though it runs on the same shared kernel.
+
+## Process Sandboxing and Command Policies
+
+
+1. The agent invokes a selected command such as `git`, `kubectl`, or `curl`.
+2. The shim sends the invocation and caller identity to the trusted supervisor.
+3. The supervisor resolves the applicable command or caller-to-command policy.
+4. nono launches the tool in a fresh child sandbox containing a minimal runtime baseline plus that policy's filesystem, network, environment, credential, argument, output, and resource grants.
+5. A chained command crosses the broker again and receives its own policy.
+
+This makes the **tool invocation** the main capability boundary. A build tool and a deployment tool do not need to share authority merely because the same agent invokes both.
+
+See [Sandboxed Tool Execution](/cli/features/tool-sandbox) for the policy schema and chaining model.
 
 ## Trust Boundaries
 
-![Trust boundaries: kernel space (Landlock, seccomp, Seatbelt), sandboxed child (untrusted), and supervisor (trusted)](/assets/kernel-space.png)
+| Component | Trust assumption | Responsibility |
+|---|---|---|
+| Host kernel | Trusted | Enforces Landlock, seccomp, and Seatbelt restrictions applied to sandboxed processes. |
+| nono supervisor and broker | Trusted | Resolves command policy, launches tool sandboxes, mediates approvals, proxy access, credentials, audit recording, and other runtime services. |
+| Profile and command policy | Trusted configuration | Defines which commands and invocation paths receive authority. A broad or unsafe policy produces a broad or unsafe sandbox. |
+| Selected tool process | Restricted workload | Receives the capabilities in its effective command policy and can exercise all of them. It need not cooperate with policy enforcement. |
+| Agent and tool inputs | Not trusted to choose policy | May request operations, but do not directly decide which capabilities the broker grants. |
+| Container or microVM, when used | Optional outer boundary | Limits the effect of a nono, policy, kernel, or tool-sandbox bypass. |
 
-There are three trust domains:
+The supervisor is deliberately outside the child sandboxes and runs with the invoking user's host permissions. It is part of nono's trusted computing base, not a less-privileged peer of the agent.
 
-| Domain | Trust Level | Role |
-|--------|-------------|------|
-| Kernel | Fully trusted | Enforces Landlock rules, delivers seccomp notifications, blocks unauthorized syscalls |
-| Supervisor (parent) | Trusted | Records audit events, receives trapped syscalls, consults approval backend, opens files, injects file descriptors |
-| Sandboxed child | Untrusted | Runs the agent command under full kernel enforcement |
+Profiles are security-sensitive code. Command resolution, writable executable exceptions, direct-exec bypasses, raw credentials, unsafe Seatbelt rules, broad filesystem grants, and permissive approval rules all change the effective boundary.
 
-The supervisor is trusted but constrained. It can only grant access to files it can open itself (standard Unix permissions apply), and protected nono state roots are checked before any approval backend is consulted.
+## Capability Expansion and Irreversibility
 
-In supervised mode, audit recording also lives in this trust boundary. The sandboxed child does not write its own audit log. Instead, the trusted parent records session metadata, supervisor-observed events, session-local integrity data, the global audit ledger entry for that session, and any optional audit attestation signature.
+Landlock and Seatbelt restrictions applied to an individual child are not removable by that child. Its descendants inherit those restrictions.
 
-In plain terms: the child can generate events by doing things, but it does not control the audit writer. The trusted parent is the component that records the session, commits the event log into the integrity structure, and optionally signs the completed session. That is why the child cannot directly tamper with its own recorded audit trail.
+That does **not** make the nono session as a whole irreversible:
 
-When proxy mode is active, a fourth domain exists:
+- The trusted supervisor remains outside the child's sandbox.
+- The supervisor can launch a new tool child with the capabilities selected by a command policy.
+- On supported Linux systems, explicit capability elevation can let the supervisor open an approved file and inject its file descriptor into a child.
+- Brokered network access, credential injection, URL opening, and approval backends intentionally perform operations the child cannot perform directly.
 
-| Domain | Trust Level | Role |
-|--------|-------------|------|
-| Network proxy | Trusted (runs in supervisor) | Filters outbound connections by host, injects credentials, enforces deny CIDRs |
+The accurate invariant is: **a sandboxed process cannot expand its own kernel policy; only a trusted component outside that sandbox can delegate additional authority through an enabled, policy-controlled path.**
 
-The proxy runs in the unsandboxed parent process alongside the supervisor. The sandboxed child can only reach `localhost:<port>` — all other outbound TCP is blocked at the kernel level. A session token (256-bit random) prevents other localhost processes from using the proxy.
+Runtime delegation is a feature, not an escape. It must still be treated as a security decision because an approval or command policy can give the requesting workload access it did not previously have.
 
-## Attach and Detach Security Model
-
-A natural question is: if the child is structurally sandboxed, how can `nono attach` reconnect to its terminal later?
-
-The answer is that attach does **not** connect to the sandboxed child directly.
-
-The PTY architecture is:
-
-1. The sandboxed child runs on the **slave** side of a PTY
-2. The trusted supervisor owns the **master** side of that PTY
-3. `nono attach` connects to a **local Unix socket exposed by the supervisor**
-4. The supervisor relays terminal I/O between the attached client and the PTY master
-
-So the attach path stays entirely inside the already-trusted supervisor boundary. The sandboxed child never gains a new capability just because a human attaches to watch or interact with it.
-
-### What attach does not do
-
-- It does **not** disable or relax the kernel sandbox
-- It does **not** give the child new filesystem or network rights
-- It does **not** create a backchannel from the child to arbitrary host terminals
-- It does **not** bypass supervisor mediation or protected-root checks
-
-Attach is a terminal transport, not a capability expansion mechanism.
-
-### Why this does not weaken the sandbox boundary
-
-In supervised mode, the supervisor is already part of the trusted computing base. It already:
-
-- owns the seccomp-notify fd
-- mediates approvals
-- may run rollback snapshots
-- records audit events and session metadata
-- may compute audit-log integrity metadata
-- may run the network proxy
-- manages the session registry and PTY
-
-The attach socket does not introduce a new trust domain. It is another supervisor-owned interface inside that same trusted boundary.
-
-The important distinction is:
-
-- **sandbox boundary**: kernel-enforced restrictions on the child
-- **attach boundary**: who is allowed to connect to the supervisor's PTY relay
-
-These are separate concerns. Attach affects terminal access to the session, but it does not alter the kernel sandbox applied to the child.
-
-### Local authentication model
-
-Current attach is local-only and same-user only.
-
-The supervisor protects attach with:
-
-- a private session registry directory
-- owner-only attach socket permissions
-- kernel peer-credential checks on accepted Unix socket peers
-
-This is strong enough for the current local runtime model:
-
-- another local user should not be able to attach
-- a peer with the wrong uid is rejected before terminal replay or client attach proceeds
-
-This is **not** a remote authentication protocol. It does not distinguish between two processes running as the same uid, and it is not intended to support cross-host attach. Future HTTP or remote attach will support a much stronger authentication and authorization layer.
-
-nono's trust boundary is agent containment — restricting what the sandboxed child can access — not guest/host isolation between same-user processes. If an attacker has arbitrary code execution as your user, they already own all your processes and files; the attach socket does not expand their capabilities. If you need stronger isolation between same-user processes — for example, in a multi-tenant hosting environment — run nono inside a container or microVM. That adds a guest/host boundary that nono does not provide on its own.
-
-### Session metadata on disk
-
-Session JSON files in `$XDG_STATE_HOME/nono/sessions/` (default `~/.local/state/nono/sessions/`) contain supervisor and child PIDs, the command line, profile name, working directory, and network mode. These files are protected by directory permissions (`0o700`) and file permissions (`0o600`), but are readable by any process running as the same user.
-
-nono applies best-effort redaction before persisting command arguments in session metadata, audit records, rollback metadata, and audit attestations. It scrubs common secret-bearing forms such as `--token VALUE`, `--api-key=VALUE`, sensitive HTTP headers, URL userinfo, and sensitive query parameters.
-
-The default redaction policy can be extended in `~/.config/nono/config.toml` with `[redaction].extra_flags`, `[redaction].extra_headers`, and `[redaction].extra_query_keys`. Removing a built-in default is treated as unsafe debugging behavior: `[redaction].allow_unredacted_defaults` is rejected unless `[redaction].unsafe_redaction_overrides = true` is also set. When a session uses a non-default redaction policy, audit events and audit attestations include a redaction-policy diff.
-
-This is a safety net, not a secret-management boundary. Avoid passing secrets as CLI arguments — use keystore-backed credential injection or proxy credential injection instead.
-
-## The Two-Layer Architecture
-
-### Layer 1: Landlock (the floor)
-
-Landlock LSM provides the hard security floor. Once `restrict_self()` is called, the child process is permanently restricted to its initial capability set. No API exists to expand or remove the restrictions. Child processes inherit them. The only escape is a kernel exploit.
-
-Landlock is:
-- **Unprivileged** — any process can sandbox itself without `CAP_SYS_ADMIN` or root
-- **Irreversible** — the kernel provides no undo mechanism
-- **Inherited** — all child processes and threads inherit the ruleset
-- **Available** — present on any kernel 5.13+ (Ubuntu 22.04+, Fedora 35+, Debian 12+)
-
-This layer alone provides a complete sandbox. A process restricted by Landlock cannot access paths outside its allowed set, period. The second layer exists to make the sandbox more usable, not more secure.
-
-### Layer 2: seccomp-notify (the gate)
-
-seccomp user notification (`SECCOMP_RET_USER_NOTIF`) provides dynamic capability expansion on top of the Landlock floor. A BPF filter traps `openat` and `openat2` syscalls before they reach Landlock and routes them to the supervisor for a decision.
-
-The critical property: **seccomp runs before Landlock**. When the child calls `open()`, the seccomp filter fires first, suspending the syscall and notifying the supervisor. The supervisor can then:
-
-1. **Deny** — return `EPERM` to the child (the syscall never reaches Landlock)
-2. **Approve** — open the file itself and inject the fd into the child via `SECCOMP_IOCTL_NOTIF_ADDFD`
-
-On approval, the child's `open()` call returns a valid file descriptor. The child never executes its own `openat` — the supervisor's `open()` is the single point of truth. The agent does not need to know nono exists; its standard file operations succeed after a brief pause during approval.
-
-### Why This Ordering Matters
-
-![Child open() flow: seccomp BPF traps openat, supervisor decides, fd injected or Landlock enforces](/assets/child-flow.png)
-
-If the supervisor has a bug and fails to inject an fd, the child's syscall falls through to Landlock, which denies it. The Landlock floor catches supervisor failures. This is defense in depth: the dynamic layer can only grant access within what the supervisor can open; the static layer ensures the child never exceeds its baseline even if the dynamic layer breaks.
-
-## Why Not Other Mechanisms
-
-### Why not `SECCOMP_USER_NOTIF_FLAG_CONTINUE`?
-
-`CONTINUE` tells the kernel to let the child's original syscall proceed. For syscalls that take pointer arguments (like `openat`, which takes a path string), this creates a TOCTOU race: the child can change the path in memory between the supervisor's check and the kernel's execution. The child could get the supervisor to approve `/tmp/harmless` and then swap the pointer to `/etc/shadow` before the kernel reads it.
-
-fd injection via `SECCOMP_IOCTL_NOTIF_ADDFD` eliminates this entirely. The supervisor opens the file itself — whatever path it read from the child's memory is what gets opened. The child's memory contents after that point are irrelevant.
-
-nono therefore avoids `CONTINUE` for any path that requires a supervisor authorization decision. The only Linux supervised-mode exceptions are tightly scoped compatibility cases where Landlock is already the enforcement floor:
-
-- **Initial allow-list hits outside procfs**: if the requested path is already inside the initial capability set, the supervisor can let the child's original syscall proceed because Landlock will independently enforce the same boundary.
-- **Missing-path probes (`ENOENT`/`ENOTDIR`)**: runtimes often probe optional files (`/$bunfs/...`, loader fallback paths, locale assets). Letting the original syscall continue preserves the kernel's native "not found" behavior instead of converting those probes into policy denials.
-
-For procfs paths, nono still resolves `/proc/self/...` in the child context and uses supervisor-opened fds so that procfs symlinks such as `/proc/<pid>/fd/*` cannot bypass target-path validation.
-
-### Why not mount namespaces?
-
-A mount namespace with a minimal filesystem view would eliminate the information leak surface (the child could not `stat` paths outside the namespace). However:
-
-- `unshare(CLONE_NEWUSER | CLONE_NEWNS)` requires unprivileged user namespaces
-- Unprivileged user namespaces are disabled by default on Debian, restricted by AppArmor on Ubuntu 23.10+, and turned off in many enterprise configurations
-- Building a core security boundary on a mechanism that distro maintainers are actively restricting is fragile
-
-Landlock + seccomp are both available to unprivileged processes on any kernel 5.14+, which covers the vast majority of active Linux installations. A sandbox that requires kernel configuration flags or elevated privileges is a sandbox that gets disabled in practice.
-
-Mount namespaces remain a potential future hardening layer: detect availability at runtime, use them opportunistically when present, fall back to pure Landlock + seccomp when they are not. The security properties of the base architecture remain identical either way.
-
-### Why not DYLD interposition on macOS?
-
-Transparent capability expansion on macOS would require intercepting `open()` calls via `DYLD_INSERT_LIBRARIES`. This fails for three reasons:
-
-1. **SIP strips the variable** — Apple's System Integrity Protection removes `DYLD_INSERT_LIBRARIES` from Apple Platform Binaries (`/usr/bin/env`, `/bin/bash`, `/bin/sh`). Any command that routes through these interpreters loses the interposition.
-2. **Version manager shims break the chain** — Tools like `pyenv` and `rbenv` use shims that exec through SIP-protected interpreters.
-3. **Calling convention mismatch** — The variadic `open(const char*, int, ...)` function cannot be safely interposed on arm64 without matching the exact register layout, which causes crashes.
-
-macOS supervised mode provides rollback snapshots and diagnostic output, but does not attempt capability expansion. Seatbelt (`sandbox_init()`) provides the kernel enforcement layer on macOS, with the same irreversibility guarantees as Landlock on Linux.
-
-### macOS Claude Code keychain scope
-
-The `claude-code` profile on macOS grants read-write access to the **user** keychain root:
-
-- `~/Library/Keychains`
-
-It also keeps explicit grants for:
-
-- `~/Library/Keychains/login.keychain-db`
-- `~/Library/Keychains/metadata.keychain-db`
-
-This is broader than the older "two DB files only" model. In practice, Claude Code's login and token persistence flow touches more of the user keychain runtime surface than those two files alone, so the narrower grant was not sufficient for reliable auth.
-
-This does **not** grant the system keychain at `/Library/Keychains`.
-
-Security implication:
-
-- a process running under the macOS `claude-code` profile can interact with the user's keychain subtree, not just Claude-specific entries
-
-This was chosen as a compatibility tradeoff for the Claude profile. Users who need a tighter boundary should use a custom profile instead of relying on the pack-provided `claude-code` profile.
-
-For users who want the Claude profile shape without macOS keychain access, you need to create a full custom profile rather than a simple extension. The keychain access in `nolabs-ai/claude` comes from `filesystem.allow` and `filesystem.bypass_protection` entries in the pack profile itself — not from the `claude_code_macos` group — so excluding the group alone is not sufficient.
-
-The correct approach:
-
-1. Inspect the current pack profile:
-   ```bash
-   nono profile show --raw nolabs-ai/claude --json
-   ```
-
-2. Copy all `filesystem.allow`, `filesystem.read`, `filesystem.allow_file`, and group entries into a new local profile, omitting `$HOME/Library/Keychains` from `filesystem.allow` and removing it from `filesystem.bypass_protection` entirely.
-
-3. Save the profile and run with it:
-   ```bash
-   nono run --profile claude-no-kc -- claude
-   ```
-
-The `deny_keychains_macos` required group is always active in every profile. Without the `filesystem.allow` + `filesystem.bypass_protection` pair for `~/Library/Keychains`, the deny wins and keychain access is fully blocked at both the file level and via Mach IPC.
-
-## The fd Injection Model
-
-When the supervisor approves a request, it does not tell the child "go ahead and open it yourself." It opens the file and hands the child a file descriptor. This distinction is fundamental to the security model.
-
-### What the supervisor does on approval
-
-1. Reads the requested path from `/proc/CHILD/mem`
-2. Validates the notification is still live (`SECCOMP_IOCTL_NOTIF_ID_VALID`)
-3. Checks the path against protected nono state roots
-4. Canonicalizes the path to resolve symlinks
-5. Re-checks protected roots on the canonical path (a symlink from an innocuous path could point to a protected target)
-6. Walks the canonical path component-by-component using `openat` with `O_NOFOLLOW` at each step (prevents symlink substitution between canonicalization and open)
-7. Injects the resulting fd into the child via `SECCOMP_IOCTL_NOTIF_ADDFD` with `SECCOMP_ADDFD_FLAG_SEND`
-
-The `SECCOMP_ADDFD_FLAG_SEND` flag is critical: it atomically injects the fd and completes the child's syscall in one operation. The child's `open()` returns the injected fd directly.
-
-### What the supervisor does NOT do
-
-- **Does not pass `O_CREAT`** — the supervisor cannot be tricked into creating files that do not exist
-- **Does not pass `O_TRUNC`** — the child cannot use the supervisor as a proxy to truncate files; it receives a plain writable fd and can seek/write within the file, but truncation is an explicit operation on an fd the user approved
-- **Does not use `SECCOMP_USER_NOTIF_FLAG_CONTINUE` for supervisor-approved paths** — authorization decisions still resolve to supervisor-opened fds, not the child's own `openat`
-
-### Scope of an approved fd
-
-Once injected, the child holds the fd until it closes it. There is no revocation mechanism — this is an inherent property of Unix file descriptors. The approval grants access for the remainder of the session.
+See [Supervisor Mode](/cli/features/supervisor) for capability elevation and [Execution Modes](/cli/features/execution-modes) for the process model.
 
 ## Syscall Scope
 
@@ -398,6 +269,22 @@ In reverse proxy mode, API credentials are loaded from the system keyring at pro
 
 If the child's traffic is captured (e.g., by a rogue library logging HTTP requests), only the local proxy URL is visible. The real API key never appears in the child's address space.
 
+### PATH Sanitization for Host-Side Brokers
+
+Several credential paths run a helper CLI host-side, unsandboxed, resolved by bare name via `PATH` — `op`/`bw`/`security` for keystore-backed credentials, the `command`/`source.command` fields on ambient and `credential_capture` credentials, `open`/`xdg-open` for browser-open requests, and `git` for `@git:*` dynamic profile tokens (`@git:config-files`, `@git:hooks-path`). Because these helpers run outside the sandbox with the real user's privileges, a directory on `PATH` that the sandbox has write access to (a workdir, a cache directory, anything under `filesystem.allow`) is a planting ground: if that directory is also on the ambient `PATH` — common in practice, e.g. `$HOME/go/bin` — the sandboxed child could write a same-named binary there and have it run host-side instead of the real one.
+
+Before any of these lookups, nono strips every `PATH` entry that isn't provably read-only to the sandbox's capability set — checking the entry itself, its parent, and each hop of its symlink chain (a writable parent lets the sandbox swap out a symlink regardless of where it currently points). Since the exact binary name being resolved is always known ahead of time, the check also covers write grants scoped to that one file rather than its containing directory (e.g. `filesystem.write: ["/usr/local/bin/gh"]`) — a directory-only check would miss this, since the directory itself carries no grant. An entry that can't be proven safe (unresolvable, a symlink cycle, empty/relative) is dropped rather than kept. This applies independently of whether the sandboxed session has actually run yet: the check is against the capability set the profile grants, not against runtime state, so it also covers the case of a directory poisoned by an earlier session sharing the same profile.
+
+`@git:*` tokens are the one exception to "the full capability set": they resolve while the profile's `filesystem.allow`/`read`/`write` lists are still being assembled entry by entry, so a token only sees grants that appear *earlier in the same list* — a policy-group grant, or a literal path listed before the token in that same `filesystem.allow`/`read`/`write` array. It does not see grants from a CLI `--allow`/`--write`/`--read` flag (always applied after these profile fields finish processing) or from an entry later in the same list. In practice this means a `@git:*` token protected only by a CLI flag, or listed before the profile entry that would otherwise cover it, resolves against an unsanitized directory for that one lookup. Every other broker on this list checks the fully-assembled capability set for the run, with no such ordering dependency.
+
+This has no bearing on the standalone `nono proxy` command, which launches no sandboxed child and therefore has no capability set to check `PATH` against — its own credential resolution uses `PATH` as given, the same trust level as running the CLI directly in a shell.
+
+#### Host-Side Persistence Risk (Separate From Broker Safety)
+
+Sanitizing `PATH` for nono's own brokers doesn't make a writable-and-on-`PATH` location safe in general — it only means nono itself won't be tricked. That location can still be used as a planting ground for something else entirely: once the sandboxed process writes (or, for a file-scoped grant like `filesystem.write: ["/usr/local/bin/gh"]`, overwrites) a same-named binary there, anything *else* on the host that later does an ordinary bare-name `PATH` lookup — a shell you open yourself, a cron job, an unrelated CLI tool — resolves and runs it with full user privileges, completely outside nono's view. Nono has no way to intervene there; it isn't in that lookup at all. The startup check below (and `--strict-broker-path`) covers both shapes: a whole directory grant, and a file-scoped grant on one binary inside an otherwise-unwritable directory.
+
+Rather than refusing to start whenever this configuration appears — which would break the common and often legitimate case of granting somewhere like `$HOME/go/bin` — nono warns about it once at startup and proceeds. `--strict-broker-path` (see [Flags](/cli/usage/flags#--strict-broker-path)) turns that warning into a hard failure for sessions where the operator wants to rule the exposure out entirely rather than accept and note it.
+
 ### Proxy Failure Modes
 
 | Failure | Behavior | Safety Property |
@@ -431,48 +318,39 @@ Supervised mode on macOS provides rollback snapshots (content-addressable filesy
 
 ## Isolation Scope and Deployment Model
 
-nono provides fine-grained, kernel-enforced capability control, but it is not a monolithic isolation stack. Understanding this distinction matters when deciding how to set policy and deploy nono.
+nono provides fine-grained, kernel-enforced capability control, but it is not a monolithic isolation stack. Its effectiveness depends on the policy, the tools being delegated to, and the environment in which that policy runs.
 
-### What nono is
+Operating systems and Linux distributions differ in filesystem layout, package managers, runtime services, sockets, and executable locations. A policy that is narrow and correct on one host may be incomplete or overly broad on another. nono can ship useful defaults, but no default profile can fully model every host.
 
-nono is a capability-based sandbox that provides fine-grained isolation controls and operates at the OS syscall level. It uses Landlock on Linux and Seatbelt on macOS. It gives precise, per-path, per-domain, per-socket, per-env-var, per-operation control over what a process can touch and see. It's designed for the nuances of an agent acting within its operating context—something not practical or even possible with a microVM or container.
+This is why nono is best understood as a capability layer for agent workflows:
 
-### What nono is not
+- It can distinguish individual files and operations inside a working tree.
+- It can give different tools different authority.
+- It can broker credentials and network routes without granting them to the outer agent session.
+- It makes runtime delegation explicit where a permanently sealed process model would prevent the workflow entirely.
 
-nono is not Firecracker, not a hypervisor, and not a container runtime. It does not provide a separate kernel boundary, hardware-level memory isolation, or full filesystem namespace separation. The sandboxed process shares the host kernel with everything else running on the machine.
+### Composing with an outer boundary
 
-This has a direct practical implication: **nono's effectiveness is proportional to the accuracy of the policy applied to the environment it runs in.** Operating systems and Linux distributions vary significantly in their default filesystem layouts. Package managers, init systems, and service daemons leave files in locations that differ between distributions, and `/run` is a clear example, where contents and structure can vary widely. nono ships with sensible defaults for common layouts, but no default set can anticipate every variation, and an incorrectly scoped policy can leave gaps.
+For higher-assurance or multi-tenant deployments, put nono inside a stronger outer isolation boundary:
 
-This is not a weakness unique to nono. SELinux, AppArmor, and seccomp profiles all require tuning to the environment and face the same problem. The difference is that nono makes policy explicit and declarative.
+| Deployment | Outer isolation | Capability granularity |
+|---|---|---|
+| nono on the host | Shared host kernel and user account | Fine-grained tool and operation policy |
+| Standard container | Namespaces, cgroups, and the shared host kernel | Coarse mounts and network namespace policy |
+| Hardened container runtime | Runtime-specific isolation, often stronger than a standard container | Coarse outer boundary |
+| microVM | Separate guest kernel and hardware virtualization | Coarse virtual devices, mounts, and network |
+| nono inside a container or microVM | Container or VM perimeter around nono and the workload | Fine-grained tool policy inside the outer boundary |
 
-<Callout type="info">
-  nono can act as a complete isolation layer when its policy is correctly tuned to the environment it runs in. It is not a turnkey solution that works identically out of the box across every distribution and service configuration, it is a primitive that rewards correct configuration.
-</Callout>
+A container and a microVM are not equivalent: a standard container still shares the host kernel, while a microVM supplies a separate guest kernel and hardware-backed isolation. Hardened runtimes occupy different points between those models.
 
-### Combining nono with hardware isolation
+For local development and CI, nono on the host can substantially reduce an agent's ambient authority. For hostile-code execution, multi-tenant services, or deployments that require a strong guest/host boundary, use a suitable container or microVM as the perimeter and use nono for fine-grained control inside it.
 
-For deployments that require the strongest possible guarantees, nono composes cleanly with existing isolation layers. Running nono inside a container or microVM gives you both layers simultaneously:
+## Design Guidance
 
-- The hardware-level boundary, kernel isolation, and namespace separation of the container or VM
-- The fine-grained per-path, per-operation capability control of nono inside that boundary
+1. Grant capabilities to the narrowest tool and invocation path that needs them.
+2. Treat the supervisor, profile, approval backend, and resolved executable identity as security-sensitive parts of the trusted computing base.
+3. Prefer brokered credentials and scoped network routes over raw secrets and unrestricted egress.
+4. Regard every approval and bypass option as a deliberate expansion of authority.
+5. Use a container or microVM when the threat model includes adversarial code escaping the same-user, shared-kernel boundary.
 
-Neither layer replaces the other. A microVM or container without nono cannot restrict an agent to specific files within a mounted directory, short of managing potentially hundreds of volume mounts, an approach that becomes operationally unworkable at any real scale. nono without a microVM trusts the host kernel and the host filesystem layout is aligned with the policy.
-
-| Deployment | Perimeter | Granularity |
-|------------|-----------|-------------|
-| nono alone | Host kernel (Landlock / Seatbelt) | Per-path, per-operation |
-| Container alone | Namespace + cgroup boundary | Coarse (mount, network namespace) |
-| microVM alone | Hardware VMM boundary | Coarse (virtual device, network) |
-| nono inside container or microVM | Hardware VMM + kernel enforcement | Per-path, per-operation within the VM boundary |
-
-The recommended posture for the highest-assurance deployments is: use a lightweight VM (Firecracker, etc) or hardened container runtimes (Edera, Kata) for the outer perimeter, and nono inside for fine-grained capability control. For most development, CI, and local agent use cases, nono alone, correctly configured for the host environment, provides meaningful, kernel-enforced isolation without the operational overhead of a VM.
-
-## Summary
-
-The architecture optimizes for three properties simultaneously:
-
-1. **Unprivileged deployment** — no root, no `CAP_SYS_ADMIN`, no kernel configuration changes. Works on any kernel 5.14+ out of the box.
-2. **Defense in depth** — Landlock provides a hard floor that catches failures in the dynamic layer. The supervisor can only grant what it can open. Protected-root checks ensure internal nono state remains off-limits to dynamic grants.
-3. **Transparency** — the sandboxed agent does not need to know about nono. Standard `open()` calls succeed after supervisor approval. No retries, no special APIs, no agent modifications.
-
-The result is a sandbox that is both strong (kernel-enforced, irreversible, fail-closed) and usable (agents work unmodified, users approve access interactively, the hot path has zero overhead).
+The result is not an escape-proof sandbox. It is a practical capability system for controlling how agents use tools, designed to compose with stronger isolation when the deployment requires it.

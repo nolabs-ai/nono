@@ -87,7 +87,7 @@ mod tests {
     impl ApprovalBackend for TestBackend {
         fn request_approval(
             &self,
-            _request: &nono::ApprovalRequest,
+            _request: &nono::supervisor::ApprovalRequest,
         ) -> nono::Result<nono::ApprovalDecision> {
             Ok(nono::ApprovalDecision::Granted)
         }

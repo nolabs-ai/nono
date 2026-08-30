@@ -233,12 +233,6 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
     )?;
     warn_if_rollback_flags_ignored(rollback, silent);
 
-    // Create the session guard (writes session file) and PTY pair BEFORE
-    // rollback initialization.  Rollback's baseline snapshot can take many
-    // seconds on large repos.  In detached mode the launcher is polling for
-    // the session file and attach socket — if we delay session registration
-    // until after the baseline walk, the 30-second startup timeout can fire
-    // before the session becomes attachable.
     let trust_interceptor = create_trust_interceptor(trust);
     let session_runtime = create_session_runtime_state(
         command,

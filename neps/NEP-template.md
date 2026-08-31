@@ -33,7 +33,7 @@ The actual design. For sandboxing/capability changes, be explicit about:
 - What new API surface (if any) this adds to the `nono` library vs
   `nono-cli`, per the library/CLI split in
   [security-model.mdx](../docs/cli/internals/security-model.mdx)
-- How it's expressed on Linux (Landlock) and macOS (Seatbelt) — call out
+- How it's expressed on Linux (Landlock) and macOS (Seatbelt). Call out
   any behavior that can't be made equivalent on both platforms. Note in
   particular that Landlock is strictly allow-list and cannot express
   deny-within-allow (macOS Seatbelt can, via `deny.access`/`deny.unlink`);

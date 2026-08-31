@@ -6,11 +6,11 @@ types, changes to sandbox enforcement semantics, policy model changes,
 new sandboxing backends, or anything that touches the security model
 described in [docs/cli/internals/security-model.mdx](../docs/cli/internals/security-model.mdx).
 
-A NEP can encapsulate a large part of the project at once — a major
+A NEP can encapsulate a large part of the project at once: a major
 feature, a breaking change, or a large fix that reshapes an existing
-subsystem — not just a single new capability. This is what distinguishes
+subsystem, not just a single new capability. This is what distinguishes
 NEPs from `docs/protocols/` (specifications for existing wire/data
-protocols): a NEP is where the decision to make a large or
+protocols). A NEP is where the decision to make a large or
 security-consequential change gets proposed and reviewed *before* any
 implementation planning or specification work begins.
 

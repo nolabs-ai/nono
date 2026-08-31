@@ -22,9 +22,9 @@ For scoped, well-defined starting points, see the
 [good-first-issue](https://github.com/nolabs-ai/nono/issues?q=is%3Aopen+label%3A%22good+first+issue%22)
 label.
 
-For large-scale, capability-related, or security-sensitive changes —
-a major new feature, a breaking change, or anything touching the
-library/CLI security boundary — open a NEP first. See
+For large-scale, capability-related, or security-sensitive changes,
+such as a major new feature, a breaking change, or anything touching
+the library/CLI security boundary, open a NEP first. See
 [neps/README.md](./neps/README.md) for when one is needed and the process
 for writing one.
 

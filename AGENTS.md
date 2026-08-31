@@ -123,7 +123,7 @@ make fmt             # Auto-format
 
 These rules are mandatory for any automated or AI-assisted contribution.
 
-Some changes additionally require a NEP (nono Enhancement Proposal) — see
+Some changes additionally require a NEP (nono Enhancement Proposal). See
 [neps/README.md](neps/README.md) for when one is needed (major features,
 breaking changes, large fixes that reshape a subsystem, or anything
 touching the library/CLI security boundary). An agent must not implement

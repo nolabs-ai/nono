@@ -151,6 +151,8 @@ This gives you:
 - **Path-level control** from nono -- the agent can only touch `/work`, even though the container filesystem is larger
 - **Credential blocking** from nono -- sensitive paths are denied automatically, even if a home directory is mounted in
 
+If you use domain filtering (`--allow-domain`) inside the container, add `--cap-add=SYS_PTRACE` to the `docker run` invocation -- nono's seccomp-based network proxy needs it to hand a file descriptor across the fork boundary, and Docker drops that capability by default. See [Troubleshooting](/cli/usage/troubleshooting#running-inside-docker-podman) for details.
+
 ## Threat Model Comparison
 
 ### What nono Protects Against

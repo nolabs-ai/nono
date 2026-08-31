@@ -1501,9 +1501,14 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
                                 Err(e) => {
                                     let _ = signal::kill(child, Signal::SIGKILL);
                                     let _ = waitpid(child, None);
+                                    // Unwrap to avoid doubling the "Sandbox
+                                    // initialization failed: " prefix.
+                                    let detail = match e {
+                                        NonoError::SandboxInit(msg) => msg,
+                                        other => other.to_string(),
+                                    };
                                     return Err(NonoError::SandboxInit(format!(
-                                        "Failed to acquire required network seccomp notify fd from child: {}",
-                                        e
+                                        "failed to acquire required network seccomp notify fd from child: {detail}"
                                     )));
                                 }
                             }
@@ -3847,10 +3852,16 @@ fn acquire_fd_from_child(
     let new_fd_raw =
         unsafe { libc::syscall(libc::SYS_pidfd_getfd, pidfd.as_raw_fd(), child_fd, 0_u32) };
     if new_fd_raw < 0 {
+        let err = std::io::Error::last_os_error();
+        let hint = if err.raw_os_error() == Some(libc::EPERM) {
+            " (this commonly happens inside a container: pidfd_getfd requires \
+             CAP_SYS_PTRACE, which container runtimes drop by default -- retry with \
+             `docker run --cap-add=SYS_PTRACE ...` or the equivalent for your runtime)"
+        } else {
+            ""
+        };
         return Err(NonoError::SandboxInit(format!(
-            "pidfd_getfd failed for child fd {}: {}",
-            child_fd,
-            std::io::Error::last_os_error()
+            "pidfd_getfd failed for child fd {child_fd}: {err}{hint}"
         )));
     }
     // SAFETY: pidfd_getfd returned a fresh owned fd duplicated from the child.

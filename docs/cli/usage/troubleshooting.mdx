@@ -410,6 +410,22 @@ This reports the detected kernel version, Landlock ABI, WSL2 detection status, a
 
 ---
 
+## Running Inside Docker/Podman
+
+### `pidfd_getfd failed ... Operation not permitted`
+
+**Symptom:** `Sandbox initialization failed: Failed to acquire required network seccomp notify fd from child: pidfd_getfd failed for child fd N: Operation not permitted (os error 1)` when using `--allow-domain` (or any other capability that falls back to the seccomp proxy) inside a container.
+
+**Cause:** The proxy fallback hands the network-notify file descriptor across the fork boundary with `pidfd_getfd(2)`, which requires `CAP_SYS_PTRACE`. Docker (and most container runtimes) drop that capability by default, so the call returns `EPERM`.
+
+**Solution:** Add the capability back when starting the container:
+
+```bash
+docker run --cap-add=SYS_PTRACE ...
+```
+
+or the equivalent in your Compose file / Kubernetes `securityContext.capabilities.add: ["SYS_PTRACE"]`. This doesn't weaken the container boundary in a way relevant to nono's threat model -- it only lets nono's own parent process duplicate a file descriptor from its own sandboxed child.
+
 ## Getting Help
 
 If you're still stuck:

@@ -3,7 +3,7 @@ nep: 0000
 title: NEP process
 authors:
   - johndoe
-status: proposed
+status: accepted
 created: 2026-08-28
 superseded-by:
 ---

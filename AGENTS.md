@@ -123,6 +123,13 @@ make fmt             # Auto-format
 
 These rules are mandatory for any automated or AI-assisted contribution.
 
+Some changes additionally require a NEP (nono Enhancement Proposal) — see
+[neps/README.md](neps/README.md) for when one is needed (major features,
+breaking changes, large fixes that reshape a subsystem, or anything
+touching the library/CLI security boundary). An agent must not implement
+code for a change that requires a NEP until that NEP has been accepted;
+opening or drafting the NEP itself is fine, but implementation must wait.
+
 ### 1. Hard stop conditions
 
 An agent **must not** open or submit a pull request if any of the following are true:

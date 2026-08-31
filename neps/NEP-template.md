@@ -34,7 +34,11 @@ The actual design. For sandboxing/capability changes, be explicit about:
   `nono-cli`, per the library/CLI split in
   [security-model.mdx](../docs/cli/internals/security-model.mdx)
 - How it's expressed on Linux (Landlock) and macOS (Seatbelt) — call out
-  any behavior that can't be made equivalent on both platforms
+  any behavior that can't be made equivalent on both platforms. Note in
+  particular that Landlock is strictly allow-list and cannot express
+  deny-within-allow (macOS Seatbelt can, via `deny.access`/`deny.unlink`);
+  a design that relies on deny-within-allow semantics will not work on
+  Linux
 - Backward compatibility: does this change existing capability/policy
   semantics for anyone already using them
 
@@ -51,6 +55,10 @@ the model in [security-model.mdx](../docs/cli/internals/security-model.mdx):
   exposure to TOCTOU or symlink-escape issues
 - Library/CLI boundary: does this keep policy decisions in `nono-cli` and
   mechanism in the `nono` library
+- Credential & secret secrecy: if this design introduces or handles API
+  keys, bearer tokens, or other credentials, does it ensure they use
+  zeroizing types, are redacted before formatting for logs/diagnostics,
+  and are kept out of child processes
 
 ## Alternatives Considered
 

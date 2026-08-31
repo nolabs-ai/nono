@@ -2260,6 +2260,18 @@ pub struct WhyArgs {
     #[arg(long, default_value = "443", help_heading = "QUERY")]
     pub port: u16,
 
+    /// Add a domain to the proxy allowlist for this query (repeatable)
+    #[arg(
+        long = "allow-domain",
+        value_name = "DOMAIN_OR_URL",
+        help_heading = "QUERY"
+    )]
+    pub allow_proxy: Vec<String>,
+
+    /// Block a domain through the proxy for this query (repeatable)
+    #[arg(long = "deny-domain", value_name = "DOMAIN", help_heading = "QUERY")]
+    pub deny_proxy: Vec<String>,
+
     /// Output JSON instead of human-readable format
     #[arg(long, help_heading = "OPTIONS")]
     pub json: bool,

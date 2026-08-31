@@ -12,6 +12,7 @@ struct WhyContext {
     deny_paths: Vec<std::path::PathBuf>,
     overridden_paths: Vec<std::path::PathBuf>,
     allowed_domains: Vec<String>,
+    denied_domains: Vec<String>,
     domain_endpoints: Vec<sandbox_state::DomainEndpointState>,
     command_policies: Option<CommandPoliciesConfig>,
 }
@@ -50,6 +51,41 @@ fn resolve_allowed_domains(profile: &profile::Profile) -> Result<Vec<String>> {
         &plain_entries,
     ));
 
+    Ok(domains)
+}
+
+/// Resolve the proxy domain denylist from a profile's network config.
+fn resolve_denied_domains(profile: &profile::Profile) -> Result<Vec<String>> {
+    let policy_json = crate::config::embedded::embedded_network_policy_json();
+    let net_policy = network_policy::load_network_policy(policy_json)?;
+    Ok(network_policy::expand_proxy_deny(
+        &net_policy,
+        &profile.network.deny_domain,
+    ))
+}
+
+/// Merge `--allow-domain` overrides into a resolved allowlist.
+fn merge_cli_allow_domains(
+    mut domains: Vec<String>,
+    cli_entries: &[String],
+) -> Result<Vec<String>> {
+    if cli_entries.is_empty() {
+        return Ok(domains);
+    }
+    let policy_json = crate::config::embedded::embedded_network_policy_json();
+    let net_policy = network_policy::load_network_policy(policy_json)?;
+    domains.extend(network_policy::expand_proxy_allow(&net_policy, cli_entries));
+    Ok(domains)
+}
+
+/// Merge `--deny-domain` overrides into a resolved denylist.
+fn merge_cli_deny_domains(mut domains: Vec<String>, cli_entries: &[String]) -> Result<Vec<String>> {
+    if cli_entries.is_empty() {
+        return Ok(domains);
+    }
+    let policy_json = crate::config::embedded::embedded_network_policy_json();
+    let net_policy = network_policy::load_network_policy(policy_json)?;
+    domains.extend(network_policy::expand_proxy_deny(&net_policy, cli_entries));
     Ok(domains)
 }
 
@@ -114,6 +150,7 @@ pub(crate) fn run_why(args: WhyArgs) -> Result<()> {
                     deny_paths: state.deny_paths_as_paths(),
                     overridden_paths: paths,
                     allowed_domains: state.allowed_domains.clone(),
+                    denied_domains: state.denied_domains.clone(),
                     domain_endpoints,
                     command_policies: None,
                 }
@@ -165,7 +202,10 @@ pub(crate) fn run_why(args: WhyArgs) -> Result<()> {
             }
         }
 
-        let allowed_domains = resolve_allowed_domains(&profile)?;
+        let allowed_domains =
+            merge_cli_allow_domains(resolve_allowed_domains(&profile)?, &args.allow_proxy)?;
+        let denied_domains =
+            merge_cli_deny_domains(resolve_denied_domains(&profile)?, &args.deny_proxy)?;
         let domain_endpoints = resolve_domain_endpoints(&profile);
         let command_policies = profile.command_policies.clone();
 
@@ -179,6 +219,7 @@ pub(crate) fn run_why(args: WhyArgs) -> Result<()> {
             deny_paths: prepared.deny_paths,
             overridden_paths: override_paths,
             allowed_domains,
+            denied_domains,
             domain_endpoints,
             command_policies,
         }
@@ -204,7 +245,8 @@ pub(crate) fn run_why(args: WhyArgs) -> Result<()> {
             caps,
             deny_paths: prepared.deny_paths,
             overridden_paths: vec![],
-            allowed_domains: vec![],
+            allowed_domains: merge_cli_allow_domains(Vec::new(), &args.allow_proxy)?,
+            denied_domains: merge_cli_deny_domains(Vec::new(), &args.deny_proxy)?,
             domain_endpoints: vec![],
             command_policies: None,
         }
@@ -252,6 +294,7 @@ pub(crate) fn run_why(args: WhyArgs) -> Result<()> {
             args.port,
             &ctx.caps,
             &ctx.allowed_domains,
+            &ctx.denied_domains,
             &ctx.domain_endpoints,
         )
     } else if let Some(ref scope) = args.scope {
@@ -684,6 +727,7 @@ mod tests {
             443,
             &caps,
             &resolve_allowed_domains(&profile).expect("resolve allowlist"),
+            &resolve_denied_domains(&profile).expect("resolve denylist"),
             &resolve_domain_endpoints(&profile),
         )
     }
@@ -765,6 +809,58 @@ mod tests {
     fn profile_without_network_config_reports_allowed() {
         let result = why_profile_host(r#"{}"#, "anything.example.com");
         assert_eq!(reason_of(&result), "network_allowed");
+    }
+
+    /// #1742: deny_domain must win over allow_domain for the same host.
+    #[test]
+    fn profile_deny_domain_beats_allow_domain() {
+        let config =
+            r#"{"network":{"allow_domain":["pypi.org","example.com"],"deny_domain":["pypi.org"]}}"#;
+        assert_eq!(
+            reason_of(&why_profile_host(config, "pypi.org")),
+            "domain_deny"
+        );
+        // Control: a host in allow_domain but not deny_domain stays allowed.
+        assert_eq!(
+            reason_of(&why_profile_host(config, "example.com")),
+            "proxy_allowed"
+        );
+    }
+
+    /// deny_domain also wins under a `network_profile` allowlist.
+    #[test]
+    fn profile_deny_domain_beats_network_profile() {
+        let config =
+            r#"{"network":{"network_profile":"claude-code","deny_domain":["api.anthropic.com"]}}"#;
+        assert_eq!(
+            reason_of(&why_profile_host(config, "api.anthropic.com")),
+            "domain_deny"
+        );
+    }
+
+    /// deny_domain alone (no allowlist) still denies its listed hosts.
+    #[test]
+    fn profile_deny_domain_alone_still_denies() {
+        let config = r#"{"network":{"deny_domain":["evil.example.com"]}}"#;
+        assert_eq!(
+            reason_of(&why_profile_host(config, "evil.example.com")),
+            "domain_deny"
+        );
+        assert_eq!(
+            reason_of(&why_profile_host(config, "anything-else.example.com")),
+            "proxy_allowed"
+        );
+    }
+
+    /// Wildcard deny_domain entries are enforced too.
+    #[test]
+    fn profile_wildcard_deny_domain_matches_subdomains() {
+        let config =
+            r#"{"network":{"allow_domain":["*.npmjs.org"],"deny_domain":["*.npmjs.org"]}}"#;
+        assert_eq!(
+            reason_of(&why_profile_host(config, "registry.npmjs.org")),
+            "domain_deny"
+        );
     }
 
     #[test]

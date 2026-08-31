@@ -212,17 +212,37 @@ pub fn query_path(
     })
 }
 
+/// Check host:port then bare host against the deny list, so a port-scoped
+/// `deny_domain` entry isn't shadowed by a wildcard allowlist. Mirrors
+/// `ProxyFilter::check_host_result` (`nono-proxy/src/filter.rs`) minus DNS.
+fn check_domain_deny(
+    filter: &nono::net_filter::HostFilter,
+    domain: &str,
+    port: u16,
+) -> Option<nono::net_filter::FilterResult> {
+    let normalized_domain = nono::net_filter::HostFilter::normalize_authority_host(domain);
+    // Bracket IPv6 literals so their colons aren't mistaken for the port separator.
+    let host_port = if normalized_domain.parse::<std::net::Ipv6Addr>().is_ok() {
+        format!("[{normalized_domain}]:{port}")
+    } else {
+        format!("{normalized_domain}:{port}")
+    };
+    filter
+        .check_deny(&host_port)
+        .or_else(|| filter.check_deny(domain))
+}
+
 /// Query whether network access is permitted.
 ///
-/// `allowed_domains` contains the resolved proxy allowlist (from profile
-/// `allow_domain`, network profile hosts, and CLI `--allow-domain`).
-/// When the network mode is `ProxyOnly`, delegates to `HostFilter` for
-/// consistent matching with the proxy (including cloud metadata deny list).
+/// `allowed_domains`/`denied_domains` are the resolved proxy allow/deny
+/// lists (profile config + CLI `--allow-domain`/`--deny-domain`); deny is
+/// evaluated before allow, matching real proxy precedence.
 pub fn query_network(
     host: &str,
     port: u16,
     caps: &CapabilitySet,
     allowed_domains: &[String],
+    denied_domains: &[String],
     domain_endpoints: &[crate::sandbox_state::DomainEndpointState],
 ) -> QueryResult {
     let (domain, url_path) = parse_host_input(host);
@@ -244,9 +264,12 @@ pub fn query_network(
                 nono::net_filter::HostFilter::allow_all()
             } else {
                 nono::net_filter::HostFilter::new(allowed_domains)
-            };
+            }
+            .with_denied_hosts(denied_domains);
             // Pass empty IPs: DNS resolution happens at proxy time, not query time.
-            match filter.check_host(&domain, &[]) {
+            let check_result = check_domain_deny(&filter, &domain, port)
+                .unwrap_or_else(|| filter.check_host(&domain, &[]));
+            match check_result {
                 nono::net_filter::FilterResult::Allow => {
                     let matching_endpoints = domain_endpoints
                         .iter()
@@ -321,6 +344,19 @@ pub fn query_network(
                         },
                     }
                 }
+                deny_result @ nono::net_filter::FilterResult::DenyHost { .. } => {
+                    QueryResult::Denied {
+                        reason: "domain_deny".to_string(),
+                        details: Some(format!(
+                            "Host is blocked by network.deny_domain. {}",
+                            deny_result.reason()
+                        )),
+                        policy_source: Some("proxy domain filter (deny_domain)".to_string()),
+                        matching_capability: None,
+                        suggested_flag: None,
+                        endpoint_rules: None,
+                    }
+                }
                 deny => QueryResult::Denied {
                     reason: "proxy_filtered".to_string(),
                     details: Some(format!("Domain filtering is active. {}", deny.reason())),
@@ -332,12 +368,18 @@ pub fn query_network(
             }
         }
         nono::NetworkMode::AllowAll => {
-            // OS-level network is unrestricted, but a proxy domain filter may still
-            // apply. When allowed_domains is non-empty the proxy is active with
-            // default-deny semantics — check it the same way ProxyOnly does.
-            if !allowed_domains.is_empty() {
-                let filter = nono::net_filter::HostFilter::new(allowed_domains);
-                match filter.check_host(&domain, &[]) {
+            // OS-level network is unrestricted, but a domain filter is active
+            // whenever either list is non-empty — check it like ProxyOnly does.
+            if !allowed_domains.is_empty() || !denied_domains.is_empty() {
+                let filter = if allowed_domains.is_empty() {
+                    nono::net_filter::HostFilter::allow_all()
+                } else {
+                    nono::net_filter::HostFilter::new(allowed_domains)
+                }
+                .with_denied_hosts(denied_domains);
+                let check_result = check_domain_deny(&filter, &domain, port)
+                    .unwrap_or_else(|| filter.check_host(&domain, &[]));
+                match check_result {
                     nono::net_filter::FilterResult::Allow => {
                         let matching_endpoints = domain_endpoints
                             .iter()
@@ -402,6 +444,17 @@ pub fn query_network(
                             },
                         }
                     }
+                    nono::net_filter::FilterResult::DenyHost { .. } => QueryResult::Denied {
+                        reason: "domain_deny".to_string(),
+                        details: Some(format!(
+                            "Host is blocked by network.deny_domain. {}",
+                            check_result.reason()
+                        )),
+                        policy_source: Some("proxy domain filter (deny_domain)".to_string()),
+                        matching_capability: None,
+                        suggested_flag: None,
+                        endpoint_rules: None,
+                    },
                     deny => QueryResult::Denied {
                         reason: "proxy_filtered".to_string(),
                         details: Some(format!("Domain filtering is active. {}", deny.reason())),
@@ -1068,14 +1121,14 @@ mod tests {
     #[test]
     fn test_query_network_allowed() {
         let caps = CapabilitySet::new();
-        let result = query_network("example.com", 443, &caps, &[], &[]);
+        let result = query_network("example.com", 443, &caps, &[], &[], &[]);
         assert!(matches!(result, QueryResult::Allowed { .. }));
     }
 
     #[test]
     fn test_query_network_blocked() {
         let caps = CapabilitySet::new().block_network();
-        let result = query_network("example.com", 443, &caps, &[], &[]);
+        let result = query_network("example.com", 443, &caps, &[], &[], &[]);
         assert!(matches!(result, QueryResult::Denied { .. }));
     }
 
@@ -1107,10 +1160,10 @@ mod tests {
         });
         let allowed = vec!["api.example.com".to_string()];
 
-        let result = query_network("api.example.com", 443, &caps, &allowed, &[]);
+        let result = query_network("api.example.com", 443, &caps, &allowed, &[], &[]);
         assert!(matches!(result, QueryResult::Allowed { .. }));
 
-        match query_network("evil.com", 443, &caps, &allowed, &[]) {
+        match query_network("evil.com", 443, &caps, &allowed, &[], &[]) {
             QueryResult::Denied {
                 reason,
                 suggested_flag,
@@ -1132,12 +1185,12 @@ mod tests {
         let allowed = vec!["*.example.com".to_string()];
 
         assert!(matches!(
-            query_network("sub.example.com", 443, &caps, &allowed, &[]),
+            query_network("sub.example.com", 443, &caps, &allowed, &[], &[]),
             QueryResult::Allowed { .. }
         ));
         // *.example.com must NOT match bare example.com (mirrors HostFilter)
         assert!(matches!(
-            query_network("example.com", 443, &caps, &allowed, &[]),
+            query_network("example.com", 443, &caps, &allowed, &[], &[]),
             QueryResult::Denied { .. }
         ));
     }
@@ -1149,7 +1202,7 @@ mod tests {
             bind_ports: vec![],
         });
         assert!(matches!(
-            query_network("anything.com", 443, &caps, &[], &[]),
+            query_network("anything.com", 443, &caps, &[], &[], &[]),
             QueryResult::Allowed { .. }
         ));
     }
@@ -1162,14 +1215,35 @@ mod tests {
         });
         // Cloud metadata endpoints are denied even with an empty allowlist
         assert!(matches!(
-            query_network("169.254.169.254", 80, &caps, &[], &[]),
+            query_network("169.254.169.254", 80, &caps, &[], &[], &[]),
             QueryResult::Denied { .. }
         ));
         // Also denied even if explicitly in the allowlist
         let allowed = vec!["169.254.169.254".to_string()];
         assert!(matches!(
-            query_network("169.254.169.254", 80, &caps, &allowed, &[]),
+            query_network("169.254.169.254", 80, &caps, &allowed, &[], &[]),
             QueryResult::Denied { .. }
+        ));
+    }
+
+    /// A port-scoped deny entry must bracket an IPv6 literal (`[::1]:8975`),
+    /// not naively append `:port` (ambiguous `::1:8975`).
+    #[test]
+    fn test_query_network_port_scoped_deny_matches_ipv6_literal() {
+        let caps = CapabilitySet::new().set_network_mode(nono::NetworkMode::ProxyOnly {
+            port: 0,
+            bind_ports: vec![],
+        });
+        let allowed = vec!["*".to_string()];
+        let denied = vec!["[::1]:8975".to_string()];
+        assert!(matches!(
+            query_network("::1", 8975, &caps, &allowed, &denied, &[]),
+            QueryResult::Denied { reason, .. } if reason == "domain_deny"
+        ));
+        // Different port on the same host is unaffected by a port-scoped deny.
+        assert!(matches!(
+            query_network("::1", 8787, &caps, &allowed, &denied, &[]),
+            QueryResult::Allowed { .. }
         ));
     }
 
@@ -1182,7 +1256,14 @@ mod tests {
         let allowed = vec!["github.com".to_string()];
         // Full URL should extract domain and match
         assert!(matches!(
-            query_network("https://github.com/some/repo", 443, &caps, &allowed, &[]),
+            query_network(
+                "https://github.com/some/repo",
+                443,
+                &caps,
+                &allowed,
+                &[],
+                &[]
+            ),
             QueryResult::Allowed { .. }
         ));
     }
@@ -1213,6 +1294,7 @@ mod tests {
             443,
             &caps,
             &allowed,
+            &[],
             &endpoints,
         );
         assert!(matches!(result, QueryResult::Allowed { .. }));
@@ -1238,6 +1320,7 @@ mod tests {
             443,
             &caps,
             &allowed,
+            &[],
             &endpoints,
         );
         match result {
@@ -1276,7 +1359,7 @@ mod tests {
             }],
         }];
         // Bare domain (no path) shows allowed with endpoint rules
-        let result = query_network("github.com", 443, &caps, &allowed, &endpoints);
+        let result = query_network("github.com", 443, &caps, &allowed, &[], &endpoints);
         match result {
             QueryResult::Allowed {
                 endpoint_rules,

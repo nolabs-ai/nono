@@ -44,6 +44,9 @@ pub struct SandboxState {
     /// Proxy domain allowlist at sandbox creation time
     #[serde(default)]
     pub allowed_domains: Vec<String>,
+    /// Proxy domain denylist (`network.deny_domain`) at sandbox creation time.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub denied_domains: Vec<String>,
     /// Endpoint-restricted domains with method+path rules
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub domain_endpoints: Vec<DomainEndpointState>,
@@ -133,6 +136,7 @@ impl SandboxState {
             bypass_protection_paths,
             &[],
             allowed_domains,
+            &[],
             domain_endpoints,
         )
     }
@@ -143,6 +147,7 @@ impl SandboxState {
         bypass_protection_paths: &[PathBuf],
         deny_paths: &[PathBuf],
         allowed_domains: &[String],
+        denied_domains: &[String],
         domain_endpoints: &[DomainEndpointState],
     ) -> Self {
         Self {
@@ -175,6 +180,7 @@ impl SandboxState {
                 .collect(),
             deny_paths: deny_paths.iter().map(|p| p.display().to_string()).collect(),
             allowed_domains: allowed_domains.to_vec(),
+            denied_domains: denied_domains.to_vec(),
             domain_endpoints: domain_endpoints.to_vec(),
             resource_limits: caps.resource_limits().copied(),
         }
@@ -655,7 +661,7 @@ mod tests {
     fn test_sandbox_state_roundtrip_preserves_deny_paths() {
         let caps = CapabilitySet::new();
         let deny_paths = vec![PathBuf::from("/workspace/blocked.txt")];
-        let state = SandboxState::from_caps_with_denies(&caps, &[], &deny_paths, &[], &[]);
+        let state = SandboxState::from_caps_with_denies(&caps, &[], &deny_paths, &[], &[], &[]);
 
         let json = serde_json::to_string(&state).expect("serialize state");
         let restored: SandboxState = serde_json::from_str(&json).expect("deserialize state");
@@ -871,6 +877,7 @@ mod tests {
             bypass_protection_paths: vec![],
             deny_paths: vec![],
             allowed_domains: vec![],
+            denied_domains: vec![],
             domain_endpoints: vec![],
             resource_limits: None,
         };

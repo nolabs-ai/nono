@@ -318,6 +318,20 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
     } else {
         plain_domain_strs
     };
+    // Expand `deny_domain` the same way for `nono why --self`.
+    let denied_domain_strs: Vec<String> = domain_filter
+        .map(|d| d.deny_domain.as_slice())
+        .map(|deny_domain| {
+            let policy_json = config::embedded::embedded_network_policy_json();
+            match network_policy::load_network_policy(policy_json) {
+                Ok(net_policy) => network_policy::expand_proxy_deny(&net_policy, deny_domain),
+                Err(e) => {
+                    warn!("failed to load network policy for sandbox state: {e}");
+                    deny_domain.to_vec()
+                }
+            }
+        })
+        .unwrap_or_default();
     let domain_endpoints: Vec<sandbox_state::DomainEndpointState> = all_domain_entries
         .iter()
         .filter_map(|e| match e {
@@ -343,6 +357,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         &flags.bypass_protection_paths,
         &deny_paths,
         &allowed_domain_strs,
+        &denied_domain_strs,
         &domain_endpoints,
         flags.silent,
     );
@@ -820,6 +835,7 @@ fn write_capability_state_file(
     bypass_protection_paths: &[std::path::PathBuf],
     deny_paths: &[std::path::PathBuf],
     allowed_domains: &[String],
+    denied_domains: &[String],
     domain_endpoints: &[sandbox_state::DomainEndpointState],
     silent: bool,
 ) -> Option<std::path::PathBuf> {
@@ -828,6 +844,7 @@ fn write_capability_state_file(
         bypass_protection_paths,
         deny_paths,
         allowed_domains,
+        denied_domains,
         domain_endpoints,
     );
 

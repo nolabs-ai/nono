@@ -9,6 +9,11 @@
 //!
 //! # Security
 //!
+//! - Script paths support the same `$WORKDIR`/`$HOME`/`$TMPDIR`/XDG/etc.
+//!   variable expansion as other profile paths (see `profile::expand_vars`),
+//!   so a shared profile need not hardcode a per-machine absolute path.
+//!   Expansion happens first; the result must still resolve to an absolute
+//!   path.
 //! - Script paths are validated before every execution
 //!   (absolute, canonical, regular file, executable, owned by user, not world-writable)
 //! - Hooks run as subprocesses
@@ -65,7 +70,8 @@ pub(crate) fn execute_before_hook(
     session_id: &str,
     workdir: &Path,
 ) -> Result<Vec<(String, String)>> {
-    let script_path = validate_hook_script(&hook.script)?;
+    let expanded = profile::expand_vars(&hook.script.to_string_lossy(), workdir)?;
+    let script_path = validate_hook_script(&expanded)?;
     let env_file = EnvFileGuard::create(session_id)?;
 
     let mut cmd = build_hook_command(
@@ -123,7 +129,8 @@ pub(crate) fn execute_after_hook(
     workdir: &Path,
     child_exit_code: i32,
 ) -> Result<()> {
-    let script_path = validate_hook_script(&hook.script)?;
+    let expanded = profile::expand_vars(&hook.script.to_string_lossy(), workdir)?;
+    let script_path = validate_hook_script(&expanded)?;
     let mut cmd = build_hook_command(
         &script_path,
         session_id,
@@ -534,6 +541,29 @@ mod tests {
         assert!(result.contains(&("CUSTOM_VAR".into(), "hello".into())));
         assert!(!result.iter().any(|(k, _)| k == "LD_PRELOAD"));
         assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn test_execute_before_hook_expands_workdir() {
+        let (_lock, _env, _home) = isolated_home();
+
+        let dir = TempDir::new().unwrap();
+        let script = dir.path().join("hook.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nprintf 'CUSTOM_VAR=hello' > \"$NONO_ENV_FILE\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let hook = profile::SessionHook {
+            script: PathBuf::from("$WORKDIR/hook.sh"),
+            timeout_secs: Some(5),
+            source_pack: None,
+        };
+
+        let result = execute_before_hook(&hook, "test-expand", dir.path()).unwrap();
+        assert!(result.contains(&("CUSTOM_VAR".into(), "hello".into())));
     }
 
     #[test]

@@ -1998,8 +1998,11 @@ pub struct HooksConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionHook {
-    /// Absolute path to the hook script.
-    /// Must be an executable regular file. Validated at execution time.
+    /// Path to the hook script.
+    /// Supports the same `$WORKDIR`/`$HOME`/`$TMPDIR`/XDG/etc. variable
+    /// expansion as other profile paths (see `expand_vars`); the expanded
+    /// result must be an absolute path. Must be an executable regular file.
+    /// Expanded and validated at execution time.
     pub script: PathBuf,
 
     /// Optional timeout in seconds.

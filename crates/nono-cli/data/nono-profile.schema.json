@@ -2433,7 +2433,7 @@
       "properties": {
         "script": {
           "type": "string",
-          "description": "Absolute path to the hook script. Must be an executable regular file owned by the current user or root, not located in a world-writable directory. Validated at execution time."
+          "description": "Path to the hook script. Supports variable expansion ($HOME, $WORKDIR, $TMPDIR, $XDG_*, $NONO_CONFIG, $NONO_PACKAGES) so shared profiles don't need a hardcoded per-machine path; the expanded result must be an absolute path. Must be an executable regular file owned by the current user or root, not located in a world-writable directory. Expanded and validated at execution time."
         },
         "timeout_secs": {
           "type": "integer",

@@ -36,7 +36,7 @@ When submitting a report, identify the specific policy or documented security gu
 If a vulnerability is identified by a Large Language Model (LLM):
 
 * ❌ Do **not** report it blindly
-* ✅ Ensure you **fully understand and can explain** the issue, humans with a security background will be corresponding with you.
+* ✅ Ensure you **fully understand and can explain** the issue — humans with a security background will be corresponding with you.
 * ✅ Validate the impact and reproducibility
 
 Low-quality or speculative reports slow down response time and reduce overall security effectiveness.
@@ -45,7 +45,7 @@ Low-quality or speculative reports slow down response time and reduce overall se
 
 ## Expectations
 
-Given the alpha status:
+Given the project's current early development status:
 
 * Breaking changes may occur without notice
 * Security guarantees are **not yet stable**

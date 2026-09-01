@@ -1,5 +1,88 @@
 # Changelog
 
+## [0.75.0] - 2026-09-01
+
+### Bug Fixes
+
+- *(sandbox)* Use capturing group in ** deny-glob Seatbelt regex (#1764) ([#1764](https://github.com/nolabs-ai/nono/pull/1764))
+
+- *(sandbox)* Expand env vars anywhere in local-socket path, not just as prefix (#1762) ([#1762](https://github.com/nolabs-ai/nono/pull/1762))
+
+- *(why)* Evaluate network.deny_domain in nono why host queries (#1751) ([#1751](https://github.com/nolabs-ai/nono/pull/1751))
+
+- *(cli)* Hint at CAP_SYS_PTRACE on pidfd_getfd EPERM, fix doubled error prefix (#1750) ([#1750](https://github.com/nolabs-ai/nono/pull/1750))
+
+- *(hooks)* Expand $WORKDIR/$HOME/etc. in session hook script paths (#1749) ([#1749](https://github.com/nolabs-ai/nono/pull/1749))
+
+- *(cli)* Honor inline custom credential routes in --config manifests (#1705) ([#1705](https://github.com/nolabs-ai/nono/pull/1705))
+
+- *(credentials)* Configurable phantom format for prefix-sniffing clients (#1489) ([#1489](https://github.com/nolabs-ai/nono/pull/1489))
+
+- *(policy)* Make unmatched deny-glob warning platform-accurate (#1738) ([#1738](https://github.com/nolabs-ai/nono/pull/1738))
+
+- *(proxy)* Add redeem_phantoms for by-value phantom redemption (#1469) ([#1469](https://github.com/nolabs-ai/nono/pull/1469))
+
+- *(cli)* Warn when a draft profile cannot resolve its extends chain (#1702) ([#1702](https://github.com/nolabs-ai/nono/pull/1702))
+
+- *(cli)* Make profile promote work for existing profiles (#1703) ([#1703](https://github.com/nolabs-ai/nono/pull/1703))
+
+- *(sandbox)* Grant Refer on command_policies outer exec gate (#1722) ([#1722](https://github.com/nolabs-ai/nono/pull/1722))
+
+- *(proxy)* Skip network audit buffer when --no-audit is set (#1682) ([#1682](https://github.com/nolabs-ai/nono/pull/1682))
+
+- *(proxy)* Decode Basic auth for basic_auth phantom validation (#1683) ([#1683](https://github.com/nolabs-ai/nono/pull/1683))
+
+- *(proxy)* Honor host:port deny entries under wildcard allow (#1709) ([#1709](https://github.com/nolabs-ai/nono/pull/1709))
+
+- Broken quote formatting in README (#1707) ([#1707](https://github.com/nolabs-ai/nono/pull/1707))
+
+
+### Dependencies
+
+- *(deps)* Bump globset from 0.4.19 to 0.4.20 (#1753) ([#1753](https://github.com/nolabs-ai/nono/pull/1753))
+
+- *(deps)* Bump hyper from 1.11.0 to 1.11.1 (#1755) ([#1755](https://github.com/nolabs-ai/nono/pull/1755))
+
+- *(deps)* Bump which from 8.0.5 to 8.0.6 (#1756) ([#1756](https://github.com/nolabs-ai/nono/pull/1756))
+
+- *(deps)* Bump rcgen from 0.14.8 to 0.14.9 (#1752) ([#1752](https://github.com/nolabs-ai/nono/pull/1752))
+
+- *(deps)* Bump ureq from 3.3.0 to 3.4.0 (#1754) ([#1754](https://github.com/nolabs-ai/nono/pull/1754))
+
+- *(deps)* Bump aws-lc-rs from 1.17.3 to 1.18.0 (#1726) ([#1726](https://github.com/nolabs-ai/nono/pull/1726))
+
+- *(deps)* Bump tokio-tungstenite from 0.28.0 to 0.30.0 (#1728) ([#1728](https://github.com/nolabs-ai/nono/pull/1728))
+
+- *(deps)* Bump base64 from 0.23.0 to 0.23.1 (#1727) ([#1727](https://github.com/nolabs-ai/nono/pull/1727))
+
+- *(deps)* Bump thiserror from 2.0.18 to 2.0.20 (#1725) ([#1725](https://github.com/nolabs-ai/nono/pull/1725))
+
+- *(deps)* Bump similar from 3.1.1 to 3.2.0 (#1729) ([#1729](https://github.com/nolabs-ai/nono/pull/1729))
+
+- *(deps)* Bump docker/setup-buildx-action from 4.2.0 to 4.3.0 (#1730) ([#1730](https://github.com/nolabs-ai/nono/pull/1730))
+
+
+### Documentation
+
+- Add NEP process for design proposals (#1743) ([#1743](https://github.com/nolabs-ai/nono/pull/1743))
+
+- Update SECURITY.md to clarify security model (#1747) ([#1747](https://github.com/nolabs-ai/nono/pull/1747))
+
+- *(security)* Security model clarification  (#1734) ([#1734](https://github.com/nolabs-ai/nono/pull/1734))
+
+
+### Features
+
+- *(profile,proxy)* Glob patterns for env var and hostname allow/deny lists (#1692) ([#1692](https://github.com/nolabs-ai/nono/pull/1692))
+
+- *(broker-path)* Sanitize PATH for host-side credential and URL brokers (#1733) ([#1733](https://github.com/nolabs-ai/nono/pull/1733))
+
+- *(examples)* Add initial set of tool sandbox examples (#1696) ([#1696](https://github.com/nolabs-ai/nono/pull/1696))
+
+- *(cli)* Show resolved command_policies in profile show (#1685) ([#1685](https://github.com/nolabs-ai/nono/pull/1685))
+
+- *(cli)* Support --extends on nono proxy (#1686) ([#1686](https://github.com/nolabs-ai/nono/pull/1686))
+
 ## [0.74.0] - 2026-08-19
 
 ### Bug Fixes

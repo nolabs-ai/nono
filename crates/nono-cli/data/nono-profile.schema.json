@@ -1686,7 +1686,7 @@
         },
         "path": {
           "type": "string",
-          "description": "Path for raw-file credentials or local-socket credentials, commonly $SSH_AUTH_SOCK for SSH agent."
+          "description": "Path for raw-file credentials or local-socket credentials. For local-socket, may reference environment variables anywhere in the string, e.g. \"$XDG_RUNTIME_DIR/sccache.sock\"; commonly $SSH_AUTH_SOCK for SSH agent."
         },
         "mode": {
           "type": "string",

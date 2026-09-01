@@ -625,7 +625,11 @@ hostname/network enforcement on macOS:
 }
 ```
 
-If `SSH_AUTH_SOCK` is unset, a command that selects this credential fails before launch with a Tool Sandbox error. Prefer the agent socket over raw private-key file grants.
+`path` may reference environment variables, optionally followed by a literal suffix,
+such as `"$XDG_RUNTIME_DIR/sccache.sock"`. Variables are expanded anywhere in 
+the string; if a referenced variable is unset, a command that selects the 
+credential fails before launch with a Tool Sandbox error naming the variable.
+Prefer the agent socket over raw private-key file grants.
 
 ## Stdio Output Mediation
 

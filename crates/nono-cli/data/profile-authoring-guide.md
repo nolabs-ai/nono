@@ -359,8 +359,8 @@ Here `read` only ever matches `.ts`/`.tsx` files, so it can never overlap `.env`
 | `block`                 | boolean                           | `false`  | Block all network access. |
 | `allow_http2`           | boolean                           | `false`  | Allow HTTP/2 to upstream servers via ALPN negotiation. Default is HTTP/1.1 with keep-alive. Equivalent to `--allow-http2`. |
 | `network_profile`       | string or null                    | inherit  | Name from `network-policy.json` for proxy filtering. Set to `null` to clear inherited value. |
-| `allow_domain`          | array of string or object         | `[]`     | Additional domains to allow through the proxy. Entries can be plain strings (CONNECT tunnel) or objects with endpoint rules (TLS-intercepted L7 filtering). Aliases: `proxy_allow`, `allow_proxy`. |
-| `deny_domain`           | array of string                   | `[]`     | Domains to block through the proxy regardless of the allowlist. Evaluated before `allow_domain`. Supports wildcard subdomains (`*.ads.example.com`). Equivalent to `--deny-domain`. |
+| `allow_domain`          | array of string or object         | `[]`     | Additional domains to allow through the proxy. Entries can be plain strings (CONNECT tunnel) or objects with endpoint rules (TLS-intercepted L7 filtering). Supports wildcard subdomains (`*.googleapis.com`) and a whole-label wildcard in a non-leading position (`jenkins.*.ci.example.com`, matching exactly one label there). Aliases: `proxy_allow`, `allow_proxy`. |
+| `deny_domain`           | array of string                   | `[]`     | Domains to block through the proxy regardless of the allowlist. Evaluated before `allow_domain`. Supports the same wildcard grammar as `allow_domain` (`*.ads.example.com`, `jenkins.*.ci.example.com`). Equivalent to `--deny-domain`. |
 | `credentials`           | array of string                   | `[]`     | Credential services to enable via reverse proxy. Alias: `proxy_credentials`. |
 | `open_port`             | array of integer                  | `[]`     | Localhost TCP IPC (connect + bind). Aliases: `port_allow`, `allow_port`. Port **0**: macOS only (`localhost:*` outbound); Linux: explicit ports. |
 | `open_port_range`       | array of `[start, end]`           | `[]`     | Inclusive port ranges for bidirectional localhost TCP (connect + bind). Multiple ranges are supported. Example: `[[3000, 3010], [8000, 8100]]`. Each port becomes an individual rule; overlapping ranges are merged automatically. **macOS**: hard limit of 16,384 unique ports across all ranges (2¹⁴) due to `sandbox_init` rule limits. **Linux**: no limit beyond the 16-bit port space (1–65535). |
@@ -370,6 +370,17 @@ Here `read` only ever matches `.ts`/`.tsx` files, so it can never overlap `.env`
 | `custom_credentials`    | map of string to credential def   | `{}`     | Custom credential route definitions (see below). Defines the route only — the proxy does not activate unless the service name also appears in `credentials`. |
 | `upstream_proxy`        | string                            | `null`   | Enterprise proxy address (`host:port`). Alias: `external_proxy`. |
 | `upstream_bypass`       | array of string                   | `[]`     | Hosts to bypass the upstream proxy. Supports `*.` wildcard suffixes. Alias: `external_proxy_bypass`. |
+
+#### Hostname wildcard patterns
+
+`allow_domain`, `deny_domain`, and `custom_credentials.<name>.upstream` all share one hostname matcher, so a host that reaches the proxy is authorized and routed by the same rule:
+
+| Pattern | Matches |
+|---------|---------|
+| `*.example.com` | One or more labels under `example.com` — `api.example.com` and `a.b.example.com` both match, but not `example.com` itself. |
+| `jenkins.*.ci.example.com` | Exactly one label in the `*` position — `jenkins.prod.ci.example.com` matches; `jenkins.ci.example.com` (zero labels) and `jenkins.a.b.ci.example.com` (two labels) do not. |
+
+A `*` occupying only part of a label (`jenkins-*.example.com`) is not a wildcard and can never match, since a real hostname label never contains `*`.
 
 #### allow_domain with endpoint restrictions
 
@@ -637,7 +648,7 @@ generated trust bundle.
           "host": "https://platform.claude.com",
           "path": "/v1/oauth/token",
           "response_fields": [
-            { "path": "access_token", "kind": "opaque" },
+            { "path": "access_token", "kind": "opaque", "format": "sk-ant-oat01-{}" },
             { "path": "refresh_token", "kind": "opaque" },
             { "path": "id_token", "kind": "jwt" }
           ],
@@ -682,7 +693,7 @@ generated trust bundle.
 | `type`               | string          | yes      | Currently `oauth_capture`. |
 | `token_endpoints`    | array           | yes      | HTTPS OAuth token origins and exact paths whose JSON responses are captured and rewritten to phantom tokens. Configure every token-bearing path the client may use. |
 | `api_hosts`          | array           | yes      | HTTPS API URL origins where this provider's phantom tokens may be resolved on egress. |
-| `response_fields`    | array           | yes      | Token response fields to rewrite. Each entry declares a `path` and a visible phantom `kind` of `opaque` or `jwt`; use `jwt` only for locally parsed fields, not bearer tokens resent upstream. |
+| `response_fields`    | array           | yes      | Token response fields to rewrite. Each entry declares a `path` and a visible phantom `kind` of `opaque` or `jwt`; use `jwt` only for locally parsed fields, not bearer tokens resent upstream. An optional `format` (e.g. `"sk-ant-oat01-{}"`, `kind: opaque` only) shapes the visible phantom — `{}` is a random body — so a client that classifies a credential by its literal prefix recognises it; the template is stripped on egress. |
 | `request_body`       | string          | no       | Token request body format for refresh/exchange rewriting: `auto`, `json`, or `form`. |
 | `credential_store`   | object          | no       | Optional session/logout detection, such as a keychain JSON record or file JSON record with fields expected to contain phantoms. |
 | `helpers`            | object          | no       | Optional status, login, and logout commands for humans or CLI workflows. Commands are arrays and are not run through a shell. |
@@ -730,20 +741,24 @@ Controls which environment variables are passed to the sandboxed process. When `
 ```json
 {
   "environment": {
-    "allow_vars": ["PATH", "HOME", "TERM", "AWS_*"],
-    "deny_vars": ["GH_TOKEN"],
+    "allow_vars": ["*"],
+    "deny_vars": ["*TOKEN*", "*KEY*", "*SECRET*"],
+    "case_insensitive_vars": true,
     "set_vars": { "RUST_LOG": "debug", "XDG_CONFIG_HOME": "$HOME/.config" }
   }
 }
 ```
 
-| Field         | Type            | Default | Description |
-|---------------|-----------------|---------|-------------|
-| `allow_vars`  | array of string | absent  | Allow-list of environment variable names. Supports exact names (`"PATH"`) and prefix patterns ending with `*` (`"AWS_*"` matches `AWS_REGION`, `AWS_SECRET_ACCESS_KEY`, etc.). The `*` wildcard is only valid as a trailing suffix. When omitted (or when the `environment` section is absent entirely), all variables pass through. When explicitly set to `[]`, no inherited variables are passed (only nono-injected credentials). When non-empty, only matching variables pass. Nono-injected credentials always bypass this list. |
-| `deny_vars`   | array of string | `[]`    | Deny-list of environment variable names stripped from the child. Same pattern syntax as `allow_vars` (exact names and trailing `*`). Denied vars are stripped even if they also match `allow_vars`. |
-| `set_vars`    | object (string→string) | `{}` | Static environment variables injected after allow/deny filtering and before credential injection (injected credentials win on conflict). Values support the same expansion as profile paths (`$HOME`, `~`, `$WORKDIR`, `$TMPDIR`, `$XDG_*`, `$NONO_CONFIG`, `$NONO_PACKAGES`); keys are not expanded. `PATH` and any `NONO_*` key are reserved and rejected at load time. Unlike inherited host vars, keys here are NOT subject to the dangerous-variable blocklist (`LD_PRELOAD`, `NODE_OPTIONS`, …) — setting one is an explicit operator decision. |
+| Field                   | Type            | Default | Description |
+|-------------------------|-----------------|---------|-------------|
+| `allow_vars`            | array of string | absent  | Allow-list of environment variable names. Supports exact names (`"PATH"`) and glob patterns where `*` may appear anywhere in the name — leading, trailing, or infix (`"AWS_*"`, `"*_TOKEN"`, `"*SECRET*"`, `"AWS_*_TOKEN"`). A bare `"*"` matches everything. When omitted (or when the `environment` section is absent entirely), all variables pass through. When explicitly set to `[]`, no inherited variables are passed (only nono-injected credentials). When non-empty, only matching variables pass. Nono-injected credentials always bypass this list. |
+| `deny_vars`             | array of string | `[]`    | Deny-list of environment variable names stripped from the child. Same glob syntax as `allow_vars`. Denied vars are stripped even if they also match `allow_vars`. |
+| `case_insensitive_vars` | boolean         | `false` | When `true`, `allow_vars`/`deny_vars` patterns are matched case-insensitively, so `"*token*"` also matches `JENKINS_TOKEN`, `jenkins_token`, and `Jenkins_Token`. |
+| `set_vars`              | object (string→string) | `{}` | Static environment variables injected after allow/deny filtering and before credential injection (injected credentials win on conflict). Values support the same expansion as profile paths (`$HOME`, `~`, `$WORKDIR`, `$TMPDIR`, `$XDG_*`, `$NONO_CONFIG`, `$NONO_PACKAGES`); keys are not expanded. `PATH` and any `NONO_*` key are reserved and rejected at load time. Unlike inherited host vars, keys here are NOT subject to the dangerous-variable blocklist (`LD_PRELOAD`, `NODE_OPTIONS`, …) — setting one is an explicit operator decision. |
 
-Inheritance: child `allow_vars` and `deny_vars` are appended to base values and deduplicated; `set_vars` merges as a map, with the child's value winning on key conflict.
+Matching is always anchored to the full variable name — a pattern never matches a substring implicitly unless it uses `*` to say so.
+
+Inheritance: child `allow_vars` and `deny_vars` are appended to base values and deduplicated; `case_insensitive_vars` is sticky (once any profile in the chain sets it `true`, a child cannot revert it to `false`); `set_vars` merges as a map, with the child's value winning on key conflict.
 
 ### export_env (caller-declared environment pass-through)
 
@@ -751,7 +766,7 @@ Inheritance: child `allow_vars` and `deny_vars` are appended to base values and 
 
 This is a **caller-declared** control: the field lives on the command doing the invoking (or on the session, for the top-level case), not on the command being invoked. When a command is intercepted, nono attributes it to its resolved caller, then copies the matching variables from that intercepted command's **immediate-parent environment** into the child. The caller's list is only the filter; the values always come from the live parent environment.
 
-- **Patterns:** exact names (`"TOOL_CONFIG"`), trailing-`*` prefixes (`"AWS_*"`), or a bare `"*"` (all). Mid-string wildcards are rejected at load time.
+- **Patterns:** exact names (`"TOOL_CONFIG"`) or a glob with a single `*` anywhere in the name (`"AWS_*"`, `"*_TOKEN"`, `"AWS_*_TOKEN"`), or a bare `"*"` (all). A pattern with more than one `*` (e.g. `"A**B"`) is rejected at load time.
 - **`PATH` and any `NONO_*` key are always excluded** — nono manages those — even under `"*"`. A pattern that explicitly targets them (exact `PATH`, or the `NONO_` prefix) is rejected at load time.
 - Values are taken verbatim and are **not** run through the credential broker. Use `export_env` for tooling variables, not credentials — those flow through `use_credentials`/`allow_vars`.
 - Applied on both the macOS and Linux tool-sandbox paths, before PATH/chaining/`set_vars`/credential injection, so nono-injected variables still win. Merges by dedup-append across the inheritance chain.

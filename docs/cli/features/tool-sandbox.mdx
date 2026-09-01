@@ -631,6 +631,23 @@ the string; if a referenced variable is unset, a command that selects the
 credential fails before launch with a Tool Sandbox error naming the variable.
 Prefer the agent socket over raw private-key file grants.
 
+### Shaping an ambient credential's phantom
+
+An `ambient` credential may declare a `format`: a literal template with exactly one `{}` placeholder, such as `"sk-ant-oat01-{}"`. Every phantom issued for that credential renders as the template with a 64-hex body in place of `{}`, instead of the default bare `nono_<hex>`. Use it when the consuming client classifies a credential by sniffing a literal token prefix and would otherwise reject the phantom. The template is stripped on egress, so the real credential — never the template — reaches upstream.
+
+```json
+{
+  "credentials": {
+    "anthropic-oauth": {
+      "type": "ambient",
+      "format": "sk-ant-oat01-{}"
+    }
+  }
+}
+```
+
+`format` is rejected on non-ambient credentials, when it carries control characters, and when the `capture_credential` rule that mints the phantom also sets `shape: "jwt"` (the JWT shape already dictates the phantom's structure).
+
 ## Stdio Output Mediation
 
 Tool Sandbox treats stdout and stderr as output capabilities. A tool that can print

@@ -211,12 +211,18 @@ impl CredentialStore {
     ///
     /// The `tls_connector` is required for OAuth2 token exchange HTTPS calls.
     ///
+    /// `outer_caps` is the sandboxed session's write policy, when this proxy
+    /// is serving one (`None` for the standalone `nono proxy` command). It's
+    /// used to strip sandbox-writable PATH entries before resolving `op`/
+    /// `bw`/`security` by bare name for a keystore-backed credential.
+    ///
     /// Returns an error only for hard failures (config parse errors,
     /// non-UTF-8 values). Missing credentials are logged, recorded in
     /// `diagnostics`, and the route is skipped.
     pub async fn load_with_diagnostics(
         routes: &[RouteConfig],
         tls_connector: &TlsConnector,
+        outer_caps: Option<&nono::CapabilitySet>,
     ) -> Result<CredentialLoadOutcome> {
         let mut credentials = HashMap::new();
         let mut cmd_routes = HashMap::new();
@@ -272,42 +278,43 @@ impl CredentialStore {
                     normalized_prefix, route.inject_mode
                 );
 
-                let secret = match nono::keystore::load_secret_by_ref(KEYRING_SERVICE, key) {
-                    Ok(s) => s,
-                    Err(nono::NonoError::SecretNotFound(_)) => {
-                        let hint = build_credential_miss_hint(key);
-                        let redacted = redact_credential_ref(key);
-                        let message = format!(
-                            "Credential not found for route '{normalized_prefix}' — \
+                let secret =
+                    match nono::keystore::load_secret_by_ref(KEYRING_SERVICE, key, outer_caps) {
+                        Ok(s) => s,
+                        Err(nono::NonoError::SecretNotFound(_)) => {
+                            let hint = build_credential_miss_hint(key);
+                            let redacted = redact_credential_ref(key);
+                            let message = format!(
+                                "Credential not found for route '{normalized_prefix}' — \
                              managed-credential requests on this route will be denied until \
                              the credential is available.{hint}"
-                        );
-                        warn!("{message}");
-                        diagnostics.push(
-                            ProxyDiagnostic::warning(
-                                ProxyDiagnosticCode::CredentialNotFound,
+                            );
+                            warn!("{message}");
+                            diagnostics.push(
+                                ProxyDiagnostic::warning(
+                                    ProxyDiagnosticCode::CredentialNotFound,
+                                    &normalized_prefix,
+                                    message,
+                                )
+                                .with_credential_ref(redacted)
+                                .with_hint(strip_tip_prefix(&hint)),
+                            );
+                            continue;
+                        }
+                        Err(nono::NonoError::KeystoreAccess(msg)) => {
+                            push_secret_unavailable_diagnostic(
+                                &mut diagnostics,
+                                ProxyDiagnosticCode::CredentialUnavailable,
                                 &normalized_prefix,
-                                message,
-                            )
-                            .with_credential_ref(redacted)
-                            .with_hint(strip_tip_prefix(&hint)),
-                        );
-                        continue;
-                    }
-                    Err(nono::NonoError::KeystoreAccess(msg)) => {
-                        push_secret_unavailable_diagnostic(
-                            &mut diagnostics,
-                            ProxyDiagnosticCode::CredentialUnavailable,
-                            &normalized_prefix,
-                            key,
-                            &msg,
-                            "Credential",
-                            true,
-                        );
-                        continue;
-                    }
-                    Err(e) => return Err(ProxyError::Credential(e.to_string())),
-                };
+                                key,
+                                &msg,
+                                "Credential",
+                                true,
+                            );
+                            continue;
+                        }
+                        Err(e) => return Err(ProxyError::Credential(e.to_string())),
+                    };
 
                 let effective_format = crate::config::resolved_credential_format(
                     route.inject_header.as_str(),
@@ -458,6 +465,7 @@ impl CredentialStore {
                         &oauth2.client_id,
                         "OAuth2 client_id",
                         ProxyDiagnosticCode::OAuthClientIdUnavailable,
+                        outer_caps,
                     )?
                     else {
                         continue;
@@ -469,6 +477,7 @@ impl CredentialStore {
                         &oauth2.client_secret,
                         "OAuth2 client_secret",
                         ProxyDiagnosticCode::OAuthClientSecretUnavailable,
+                        outer_caps,
                     )?
                     else {
                         continue;
@@ -588,7 +597,7 @@ impl CredentialStore {
         routes: &[RouteConfig],
         tls_connector: &TlsConnector,
     ) -> Result<CredentialStore> {
-        Self::load_with_diagnostics(routes, tls_connector)
+        Self::load_with_diagnostics(routes, tls_connector, None)
             .await
             .map(|outcome| outcome.store)
     }
@@ -742,8 +751,9 @@ fn load_oauth_keystore_ref(
     key: &str,
     subject: &str,
     code: ProxyDiagnosticCode,
+    outer_caps: Option<&nono::CapabilitySet>,
 ) -> Result<Option<Zeroizing<String>>> {
-    match nono::keystore::load_secret_by_ref(KEYRING_SERVICE, key) {
+    match nono::keystore::load_secret_by_ref(KEYRING_SERVICE, key, outer_caps) {
         Ok(s) => Ok(Some(s)),
         Err(nono::NonoError::SecretNotFound(msg)) => {
             push_secret_unavailable_diagnostic(
@@ -798,7 +808,7 @@ fn build_credential_miss_hint(key: &str) -> String {
     // Case 1: `env://X` failed → the env var isn't set. Check whether a
     // bare-name keyring entry exists; if so, suggest dropping the prefix.
     if let Some(var) = key.strip_prefix("env://") {
-        if nono::keystore::load_secret_by_ref(KEYRING_SERVICE, var).is_ok() {
+        if nono::keystore::load_secret_by_ref(KEYRING_SERVICE, var, None).is_ok() {
             return format!(
                 " Tip: a keyring entry exists for '{}'. Change credential_key to bare \
                  '{}' (no env:// prefix) to use the keyring, or set the env var.",
@@ -961,6 +971,7 @@ mod tests {
         use crate::config::OAuth2Config;
 
         RouteConfig {
+            redeem_phantoms: Vec::new(),
             prefix: prefix.to_string(),
             upstream: "https://api.example.com".to_string(),
             credential_key: None,
@@ -996,6 +1007,7 @@ mod tests {
     async fn test_load_missing_env_credential_records_credential_not_found() {
         let tls = test_tls_connector();
         let routes = vec![RouteConfig {
+            redeem_phantoms: Vec::new(),
             prefix: "preview-missing".to_string(),
             upstream: "https://api.example.com".to_string(),
             credential_key: Some("env://NONO_PROXY_TEST_MISSING_CRED".to_string()),
@@ -1018,7 +1030,7 @@ mod tests {
             upgrades: vec![],
             rate_limit: None,
         }];
-        let outcome = CredentialStore::load_with_diagnostics(&routes, &tls)
+        let outcome = CredentialStore::load_with_diagnostics(&routes, &tls, None)
             .await
             .expect("load");
         assert!(outcome.store.is_empty());
@@ -1079,7 +1091,7 @@ mod tests {
             "env://NONO_PROXY_TEST_CLIENT_SECRET",
             "https://127.0.0.1:1/oauth/token",
         )];
-        let outcome = CredentialStore::load_with_diagnostics(&routes, &tls)
+        let outcome = CredentialStore::load_with_diagnostics(&routes, &tls, None)
             .await
             .expect("load");
         assert!(outcome.store.is_empty());
@@ -1103,7 +1115,7 @@ mod tests {
             "env://NONO_PROXY_TEST_MISSING_CLIENT_SECRET",
             "https://127.0.0.1:1/oauth/token",
         )];
-        let outcome = CredentialStore::load_with_diagnostics(&routes, &tls)
+        let outcome = CredentialStore::load_with_diagnostics(&routes, &tls, None)
             .await
             .expect("load");
         assert!(outcome.store.is_empty());
@@ -1118,6 +1130,7 @@ mod tests {
     async fn test_load_no_credential_routes() {
         let tls = test_tls_connector();
         let routes = vec![RouteConfig {
+            redeem_phantoms: Vec::new(),
             prefix: "/test".to_string(),
             upstream: "https://example.com".to_string(),
             credential_key: None,
@@ -1140,7 +1153,7 @@ mod tests {
             upgrades: vec![],
             rate_limit: None,
         }];
-        let outcome = CredentialStore::load_with_diagnostics(&routes, &tls).await;
+        let outcome = CredentialStore::load_with_diagnostics(&routes, &tls, None).await;
         assert!(outcome.is_ok());
         let store = outcome
             .unwrap_or_else(|_| CredentialLoadOutcome {
@@ -1162,6 +1175,7 @@ mod tests {
     async fn test_load_cmd_uri_registers_lazy_route() {
         let tls = test_tls_connector();
         let routes = vec![RouteConfig {
+            redeem_phantoms: Vec::new(),
             prefix: "/github".to_string(),
             upstream: "https://api.github.com".to_string(),
             credential_key: Some("cmd://github".to_string()),
@@ -1184,7 +1198,7 @@ mod tests {
             upgrades: vec![],
             rate_limit: None,
         }];
-        let store = CredentialStore::load_with_diagnostics(&routes, &tls)
+        let store = CredentialStore::load_with_diagnostics(&routes, &tls, None)
             .await
             .expect("credential store loads")
             .store;
@@ -1268,6 +1282,7 @@ mod tests {
         };
         let tls = test_tls_connector();
         let routes = vec![RouteConfig {
+            redeem_phantoms: Vec::new(),
             prefix: "litellm".to_string(),
             upstream: "https://litellm".to_string(),
             credential_key: Some("env://NONO_PROXY_TEST_LITELLM_TOKEN".to_string()),
@@ -1290,7 +1305,7 @@ mod tests {
             upgrades: vec![],
             rate_limit: None,
         }];
-        let store = CredentialStore::load_with_diagnostics(&routes, &tls)
+        let store = CredentialStore::load_with_diagnostics(&routes, &tls, None)
             .await
             .expect("credential load")
             .store;
@@ -1307,6 +1322,7 @@ mod tests {
         };
         let tls = test_tls_connector();
         let routes = vec![RouteConfig {
+            redeem_phantoms: Vec::new(),
             prefix: "api".to_string(),
             upstream: "https://api.example.com".to_string(),
             credential_key: Some("env://NONO_PROXY_TEST_API_KEY".to_string()),
@@ -1329,7 +1345,7 @@ mod tests {
             upgrades: vec![],
             rate_limit: None,
         }];
-        let store = CredentialStore::load_with_diagnostics(&routes, &tls)
+        let store = CredentialStore::load_with_diagnostics(&routes, &tls, None)
             .await
             .expect("credential load")
             .store;
@@ -1350,6 +1366,7 @@ mod tests {
         };
         let tls = test_tls_connector();
         let routes = vec![RouteConfig {
+            redeem_phantoms: Vec::new(),
             prefix: "my-api".to_string(),
             upstream: "https://api.example.com".to_string(),
             credential_key: None,
@@ -1382,7 +1399,7 @@ mod tests {
             rate_limit: None,
         }];
 
-        let outcome = CredentialStore::load_with_diagnostics(&routes, &tls).await;
+        let outcome = CredentialStore::load_with_diagnostics(&routes, &tls, None).await;
 
         // load() should succeed (route skipped, not hard error)
         assert!(

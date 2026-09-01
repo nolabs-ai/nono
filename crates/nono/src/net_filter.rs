@@ -14,7 +14,9 @@
 //!   (169.254.0.0/16, fe80::/10) are always denied to prevent DNS rebinding
 //!   attacks targeting cloud metadata services.
 //! - **Wildcard subdomain matching**: `*.googleapis.com` matches
-//!   `storage.googleapis.com` but not `googleapis.com` itself.
+//!   `storage.googleapis.com` but not `googleapis.com` itself. A `*` may
+//!   also occupy a whole label in a non-leading position, matching exactly
+//!   one label there — see [`host_pattern_matches`].
 //! - **Normalized comparison**: hostnames are IDNA-normalized before
 //!   matching, so a trailing dot, mixed case, or Unicode/punycode spelling
 //!   can't slip past a deny entry. Unparseable hosts are denied.
@@ -44,13 +46,104 @@ fn normalize_entry(entry: &str) -> String {
     normalize_host(entry).unwrap_or_else(|_| entry.trim().trim_end_matches('.').to_lowercase())
 }
 
-/// Normalize a wildcard suffix (e.g. `.example.com`, taken from `*.example.com`),
-/// preserving the leading dot that anchors the subdomain match.
-fn normalize_suffix(suffix: &str) -> String {
-    match suffix.strip_prefix('.') {
-        Some(domain) => format!(".{}", normalize_entry(domain)),
-        None => normalize_entry(suffix),
+/// Whether `host` matches `pattern` under nono's hostname wildcard grammar.
+/// Both must already be normalized (lowercased) the same way, e.g. via
+/// [`normalize_entry`].
+///
+/// Three wildcard forms are supported:
+/// - A bare `*` matches any non-empty host, regardless of label count.
+/// - A leading `*.` matches one or more labels (subdomain wildcard):
+///   `*.example.com` matches `a.example.com` and `a.b.example.com`, but not
+///   `example.com` itself.
+/// - `*` occupying an entire label in any other position matches exactly
+///   one non-empty label: `jenkins.*.ci.example.com` matches
+///   `jenkins.prod.ci.example.com`, but not `jenkins.ci.example.com` or
+///   `jenkins.a.b.ci.example.com`.
+///
+/// A `*` that only occupies part of a label (`foo*bar`) is not a wildcard;
+/// since a real hostname label can never contain `*`, such a pattern never
+/// matches anything.
+#[must_use]
+pub fn host_pattern_matches(pattern: &str, host: &str) -> bool {
+    // A bare "*" matches any non-empty host, regardless of label count.
+    if pattern == "*" {
+        return !host.is_empty();
     }
+
+    if let Some(suffix) = pattern.strip_prefix('*') {
+        if !suffix.starts_with('.') {
+            return false;
+        }
+        let Some(prefix) = host.strip_suffix(suffix) else {
+            return false;
+        };
+        // Require a real (non-empty) label before the suffix: `idna` lets
+        // through empty DNS labels, so `prefix` ending in `.` (e.g. from
+        // `..example.com`) must not count as "one or more labels".
+        return !prefix.is_empty() && !prefix.ends_with('.');
+    }
+
+    let mut pattern_labels = pattern.split('.');
+    let mut host_labels = host.split('.');
+    loop {
+        match (pattern_labels.next(), host_labels.next()) {
+            (Some(p), Some(h)) => {
+                // `idna` lets through empty labels (e.g. `jenkins..ci...`),
+                // so an empty `h` here must not satisfy the wildcard.
+                if p == "*" {
+                    if h.is_empty() {
+                        return false;
+                    }
+                } else if p != h {
+                    return false;
+                }
+            }
+            (None, None) => return true,
+            _ => return false,
+        }
+    }
+}
+
+/// Validates that `pattern` is a well-formed entry under the wildcard grammar
+/// documented on [`host_pattern_matches`], returning `Err` with a description
+/// of the problem if not. A pattern outside that grammar can never match any
+/// real hostname.
+pub fn validate_host_pattern(pattern: &str) -> Result<(), String> {
+    if pattern.is_empty() {
+        return Err("pattern is empty".to_string());
+    }
+    if pattern == "*" {
+        return Ok(());
+    }
+    if let Some(suffix) = pattern.strip_prefix('*') {
+        if !suffix.starts_with('.') {
+            return Err(format!(
+                "pattern '{pattern}': a leading '*' must be followed by '.' (e.g. '*.example.com')"
+            ));
+        }
+        let rest = &suffix[1..];
+        if rest.is_empty() {
+            return Err(format!(
+                "pattern '{pattern}': '*.' must be followed by a domain"
+            ));
+        }
+        if rest.contains('*') {
+            return Err(format!(
+                "pattern '{pattern}': a leading '*.' wildcard cannot be combined with another '*' \
+                 elsewhere in the pattern — the remainder is matched literally, so this can never match"
+            ));
+        }
+        return Ok(());
+    }
+    for label in pattern.split('.') {
+        if label.contains('*') && label != "*" {
+            return Err(format!(
+                "pattern '{pattern}': '*' must occupy a whole label (e.g. 'a.*.b.com'), not part of \
+                 one like '{label}' — a real hostname label can never contain '*', so this can never match"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Result of a host filter check.
@@ -152,6 +245,22 @@ const DENY_HOSTS: &[&str] = &[
     "metadata.azure.internal",
 ];
 
+/// Split raw host entries into normalized exact hosts and normalized
+/// wildcard patterns (anything containing `*`), the categorization shared
+/// by every constructor of [`HostFilter`].
+fn partition_hosts(entries: &[String]) -> (Vec<String>, Vec<String>) {
+    let mut exact = Vec::new();
+    let mut patterns = Vec::new();
+    for entry in entries {
+        if entry.contains('*') {
+            patterns.push(normalize_entry(entry));
+        } else {
+            exact.push(normalize_entry(entry));
+        }
+    }
+    (exact, patterns)
+}
+
 /// A filter for host-based network access control.
 ///
 /// Supports exact domain match and wildcard subdomains (`*.googleapis.com`).
@@ -163,12 +272,12 @@ const DENY_HOSTS: &[&str] = &[
 pub struct HostFilter {
     /// Allowed exact hosts (lowercased)
     allowed_hosts: Vec<String>,
-    /// Allowed wildcard suffixes (e.g., ".googleapis.com", lowercased)
-    allowed_suffixes: Vec<String>,
+    /// Allowed wildcard patterns (e.g., `*.googleapis.com`, `jenkins.*.ci.example.com`), lowercased
+    allowed_patterns: Vec<String>,
     /// Exact hostnames that are always denied
     deny_hosts: Vec<String>,
-    /// Wildcard suffixes that are always denied (e.g., ".ads.example.com")
-    deny_suffixes: Vec<String>,
+    /// Wildcard patterns that are always denied (e.g., `*.ads.example.com`)
+    deny_patterns: Vec<String>,
     /// When true, an empty allowlist denies instead of allowing.
     strict: bool,
 }
@@ -178,27 +287,18 @@ impl HostFilter {
     ///
     /// Cloud metadata endpoints are automatically denied and cannot be removed.
     ///
-    /// Hosts starting with `*.` are treated as wildcard subdomain patterns.
-    /// All other entries are exact matches. Matching is case-insensitive.
+    /// Entries containing `*` are treated as wildcard patterns (see
+    /// [`host_pattern_matches`]). All other entries are exact matches.
+    /// Matching is case-insensitive.
     #[must_use]
     pub fn new(allowed_hosts: &[String]) -> Self {
-        let mut exact = Vec::new();
-        let mut suffixes = Vec::new();
-
-        for host in allowed_hosts {
-            if let Some(suffix) = host.strip_prefix('*') {
-                // *.example.com -> .example.com
-                suffixes.push(normalize_suffix(suffix));
-            } else {
-                exact.push(normalize_entry(host));
-            }
-        }
+        let (exact, patterns) = partition_hosts(allowed_hosts);
 
         Self {
             allowed_hosts: exact,
-            allowed_suffixes: suffixes,
+            allowed_patterns: patterns,
             deny_hosts: DENY_HOSTS.iter().map(|s| normalize_entry(s)).collect(),
-            deny_suffixes: Vec::new(),
+            deny_patterns: Vec::new(),
             strict: false,
         }
     }
@@ -218,26 +318,22 @@ impl HostFilter {
     pub fn allow_all() -> Self {
         Self {
             allowed_hosts: Vec::new(),
-            allowed_suffixes: Vec::new(),
+            allowed_patterns: Vec::new(),
             deny_hosts: DENY_HOSTS.iter().map(|s| normalize_entry(s)).collect(),
-            deny_suffixes: Vec::new(),
+            deny_patterns: Vec::new(),
             strict: false,
         }
     }
 
     /// Append user-configured deny entries on top of the hardcoded deny list.
     ///
-    /// Supports the same wildcard syntax as the allowlist (`*.example.com`
-    /// matches `foo.example.com` but not `example.com` itself).
+    /// Supports the same wildcard syntax as the allowlist (see
+    /// [`host_pattern_matches`]).
     #[must_use]
     pub fn with_denied_hosts(mut self, denied: &[String]) -> Self {
-        for entry in denied {
-            if let Some(suffix) = entry.strip_prefix('*') {
-                self.deny_suffixes.push(normalize_suffix(suffix));
-            } else {
-                self.deny_hosts.push(normalize_entry(entry));
-            }
-        }
+        let (exact, patterns) = partition_hosts(denied);
+        self.deny_hosts.extend(exact);
+        self.deny_patterns.extend(patterns);
         self
     }
 
@@ -271,13 +367,15 @@ impl HostFilter {
             };
         }
 
-        // 1b. Check deny suffixes (wildcard match, e.g. *.ads.example.com)
-        for suffix in &self.deny_suffixes {
-            if lower_host.ends_with(suffix.as_str()) && lower_host.len() > suffix.len() {
-                return FilterResult::DenyHost {
-                    host: host.to_string(),
-                };
-            }
+        // 1b. Check deny patterns (wildcard match, e.g. *.ads.example.com)
+        if self
+            .deny_patterns
+            .iter()
+            .any(|pattern| host_pattern_matches(pattern, &lower_host))
+        {
+            return FilterResult::DenyHost {
+                host: host.to_string(),
+            };
         }
 
         // 2. Check resolved IPs for link-local addresses (cloud metadata protection)
@@ -288,7 +386,7 @@ impl HostFilter {
         }
 
         // 3. Empty allowlist: deny when strict, allow otherwise.
-        if self.allowed_hosts.is_empty() && self.allowed_suffixes.is_empty() {
+        if self.allowed_hosts.is_empty() && self.allowed_patterns.is_empty() {
             if self.strict {
                 return FilterResult::DenyNotAllowed {
                     host: host.to_string(),
@@ -302,11 +400,13 @@ impl HostFilter {
             return FilterResult::Allow;
         }
 
-        // 5. Check wildcard subdomain match
-        for suffix in &self.allowed_suffixes {
-            if lower_host.ends_with(suffix.as_str()) && lower_host.len() > suffix.len() {
-                return FilterResult::Allow;
-            }
+        // 5. Check wildcard pattern match
+        if self
+            .allowed_patterns
+            .iter()
+            .any(|pattern| host_pattern_matches(pattern, &lower_host))
+        {
+            return FilterResult::Allow;
         }
 
         // 6. Not in allowlist
@@ -318,7 +418,7 @@ impl HostFilter {
     /// Check only the deny list, skipping the allowlist (which a wildcard
     /// `*` would otherwise satisfy before a port-scoped deny is checked).
     pub fn check_deny(&self, host: &str) -> Option<FilterResult> {
-        // Infallible: deny_hosts/deny_suffixes are populated via the same
+        // Infallible: deny_hosts/deny_patterns are populated via the same
         // fallback (normalize_entry), so a fallible lookup here could miss
         // an entry that IDNA rejects (e.g. a host:port or IPv6 literal).
         let lower_host = normalize_entry(host);
@@ -329,12 +429,14 @@ impl HostFilter {
             });
         }
 
-        for suffix in &self.deny_suffixes {
-            if lower_host.ends_with(suffix.as_str()) && lower_host.len() > suffix.len() {
-                return Some(FilterResult::DenyHost {
-                    host: host.to_string(),
-                });
-            }
+        if self
+            .deny_patterns
+            .iter()
+            .any(|pattern| host_pattern_matches(pattern, &lower_host))
+        {
+            return Some(FilterResult::DenyHost {
+                host: host.to_string(),
+            });
         }
 
         None
@@ -352,7 +454,7 @@ impl HostFilter {
     pub fn allowed_count(&self) -> usize {
         self.allowed_hosts
             .len()
-            .saturating_add(self.allowed_suffixes.len())
+            .saturating_add(self.allowed_patterns.len())
     }
 }
 
@@ -364,6 +466,40 @@ mod tests {
 
     fn public_ip() -> Vec<IpAddr> {
         vec![IpAddr::V4(Ipv4Addr::new(104, 18, 7, 96))]
+    }
+
+    #[test]
+    fn test_validate_host_pattern_accepts_all_three_wildcard_forms() {
+        assert!(validate_host_pattern("*").is_ok());
+        assert!(validate_host_pattern("*.example.com").is_ok());
+        assert!(validate_host_pattern("jenkins.*.ci.example.com").is_ok());
+        assert!(validate_host_pattern("api.openai.com").is_ok());
+    }
+
+    #[test]
+    fn test_validate_host_pattern_rejects_empty() {
+        assert!(validate_host_pattern("").is_err());
+    }
+
+    #[test]
+    fn test_validate_host_pattern_rejects_partial_label_wildcard() {
+        assert!(validate_host_pattern("foo*bar.com").is_err());
+        assert!(validate_host_pattern("foo.ba*r.com").is_err());
+    }
+
+    #[test]
+    fn test_validate_host_pattern_rejects_bare_leading_star_without_dot() {
+        assert!(validate_host_pattern("*example.com").is_err());
+    }
+
+    #[test]
+    fn test_validate_host_pattern_rejects_dangling_leading_wildcard() {
+        assert!(validate_host_pattern("*.").is_err());
+    }
+
+    #[test]
+    fn test_validate_host_pattern_rejects_leading_wildcard_combined_with_another() {
+        assert!(validate_host_pattern("*.foo.*.com").is_err());
     }
 
     #[test]
@@ -408,6 +544,89 @@ mod tests {
         // Bare domain should NOT match wildcard
         let result = filter.check_host("googleapis.com", &public_ip());
         assert!(!result.is_allowed());
+    }
+
+    #[test]
+    fn test_partial_label_wildcard_never_matches() {
+        // profile-authoring-guide.md: a `*` occupying only part of a label
+        // (`jenkins-*.example.com`) is not a wildcard and can never match,
+        // since a real hostname label never contains `*`.
+        assert!(!host_pattern_matches(
+            "jenkins-*.example.com",
+            "jenkins-prod.example.com"
+        ));
+    }
+
+    #[test]
+    fn test_leading_wildcard_rejects_empty_label_before_suffix() {
+        // "*.example.com" requires one or more non-empty labels; a
+        // double-dot host must not satisfy that via an empty label.
+        assert!(!host_pattern_matches("*.example.com", "..example.com"));
+        assert!(!host_pattern_matches("*.example.com", "a..example.com"));
+        assert!(host_pattern_matches("*.example.com", "a.example.com"));
+        assert!(host_pattern_matches("*.example.com", "a.b.example.com"));
+    }
+
+    #[test]
+    fn test_non_leading_wildcard_label_matches_exactly_one_label() {
+        let filter = HostFilter::new(&["jenkins.*.ci.example.com".to_string()]);
+
+        assert!(
+            filter
+                .check_host("jenkins.prod.ci.example.com", &public_ip())
+                .is_allowed()
+        );
+        assert!(
+            filter
+                .check_host("jenkins.stage.ci.example.com", &public_ip())
+                .is_allowed()
+        );
+
+        // Zero labels in the wildcard slot: no match.
+        assert!(
+            !filter
+                .check_host("jenkins.ci.example.com", &public_ip())
+                .is_allowed()
+        );
+        // Two labels in the wildcard slot: no match.
+        assert!(
+            !filter
+                .check_host("jenkins.foo.bar.ci.example.com", &public_ip())
+                .is_allowed()
+        );
+        // Different fixed labels: no match.
+        assert!(
+            !filter
+                .check_host("other.prod.ci.example.com", &public_ip())
+                .is_allowed()
+        );
+    }
+
+    #[test]
+    fn test_non_leading_wildcard_label_rejects_empty_label() {
+        // The wildcard slot must require a real (non-empty) label, not a
+        // double-dot's empty one.
+        assert!(!host_pattern_matches(
+            "jenkins.*.ci.example.com",
+            "jenkins..ci.example.com"
+        ));
+    }
+
+    #[test]
+    fn test_non_leading_wildcard_label_deny() {
+        let filter =
+            HostFilter::allow_all().with_denied_hosts(&["jenkins.*.ci.example.com".to_string()]);
+
+        assert!(
+            !filter
+                .check_host("jenkins.prod.ci.example.com", &public_ip())
+                .is_allowed()
+        );
+        assert!(
+            filter
+                .check_host("jenkins.ci.example.com", &public_ip())
+                .is_allowed()
+        );
     }
 
     #[test]

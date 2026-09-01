@@ -144,9 +144,12 @@ pub(super) mod git {
     /// See [`read_hooks_path`] for directory-typed paths.
     ///
     /// Returns an empty list if `git` is absent or exits non-zero.
-    pub(crate) fn read_files(workdir: Option<&Path>) -> Result<Vec<String>> {
+    pub(crate) fn read_files(
+        workdir: Option<&Path>,
+        outer_caps: &nono::CapabilitySet,
+    ) -> Result<Vec<String>> {
         let cwd = git_toplevel(workdir);
-        Ok(run(cwd.as_deref(), None)?.files)
+        Ok(run(cwd.as_deref(), None, outer_caps)?.files)
     }
 
     /// Invoke `git config --list --show-origin --show-scope` and return
@@ -156,9 +159,12 @@ pub(super) mod git {
     /// `workdir` is used as the git working directory when provided.
     ///
     /// Returned paths are intended for `fs_read` lists.
-    pub(crate) fn read_hooks_path(workdir: Option<&Path>) -> Result<Vec<String>> {
+    pub(crate) fn read_hooks_path(
+        workdir: Option<&Path>,
+        outer_caps: &nono::CapabilitySet,
+    ) -> Result<Vec<String>> {
         let cwd = git_toplevel(workdir);
-        Ok(run(cwd.as_deref(), None)?.dirs)
+        Ok(run(cwd.as_deref(), None, outer_caps)?.dirs)
     }
 
     /// Return the path to the git common directory (`.git` or the main repo's
@@ -325,7 +331,7 @@ pub(super) mod git {
     /// files+dirs split.
     #[cfg(test)]
     pub(super) fn read_paths_with_global(global_config: &Path) -> Result<GitConfigPaths> {
-        run(None, Some(global_config))
+        run(None, Some(global_config), &nono::CapabilitySet::default())
     }
 
     /// Test seam: run the provider with both a specific cwd and a fixed
@@ -335,12 +341,56 @@ pub(super) mod git {
         cwd: &Path,
         global_config: Option<&Path>,
     ) -> Result<GitConfigPaths> {
-        run(Some(cwd), global_config)
+        run(Some(cwd), global_config, &nono::CapabilitySet::default())
     }
 
-    fn run(cwd: Option<&Path>, global_config_override: Option<&Path>) -> Result<GitConfigPaths> {
+    /// Test seam: run the provider with an explicit ambient PATH and
+    /// capability set, to exercise PATH sanitization without touching the
+    /// real process environment.
+    #[cfg(test)]
+    pub(super) fn read_paths_with_ambient_path(
+        cwd: &Path,
+        ambient_path: &str,
+        outer_caps: &nono::CapabilitySet,
+    ) -> Result<GitConfigPaths> {
+        run_with_path(Some(cwd), None, ambient_path, outer_caps)
+    }
+
+    fn run(
+        cwd: Option<&Path>,
+        global_config_override: Option<&Path>,
+        outer_caps: &nono::CapabilitySet,
+    ) -> Result<GitConfigPaths> {
+        run_with_path(
+            cwd,
+            global_config_override,
+            &std::env::var("PATH").unwrap_or_default(),
+            outer_caps,
+        )
+    }
+
+    /// Core of [`run`], taking the PATH value as a parameter rather than
+    /// reading the process environment, so tests can exercise PATH
+    /// resolution without mutating global process state (unsafe under a
+    /// parallel test runner).
+    fn run_with_path(
+        cwd: Option<&Path>,
+        global_config_override: Option<&Path>,
+        ambient_path: &str,
+        outer_caps: &nono::CapabilitySet,
+    ) -> Result<GitConfigPaths> {
         let mut cmd = Command::new("git");
         cmd.args(["config", "--list", "--show-origin", "--show-scope"]);
+        // `git` is resolved by bare name via PATH, and this runs host-side,
+        // unsandboxed, while the CapabilitySet for the current invocation is
+        // still being assembled by the caller. `outer_caps` reflects
+        // whatever grants have already been added at this point in that
+        // assembly (see `expand_dynamic_tokens` callers in
+        // `capability_ext.rs`) — not the final set, but enough to catch a
+        // sandbox-writable PATH directory from a literal `filesystem.allow`
+        // entry processed earlier in the same profile.
+        let safe_path = nono::sanitize_broker_path_for_binary(ambient_path, "git", outer_caps);
+        cmd.env("PATH", &safe_path);
         if let Some(d) = cwd {
             cmd.current_dir(d);
         }
@@ -442,11 +492,12 @@ fn dispatch_token(
     provider: &str,
     query: &str,
     workdir: Option<&std::path::Path>,
+    outer_caps: &nono::CapabilitySet,
 ) -> Result<Vec<String>> {
     match provider {
         "git" => match query {
-            "config-files" => git::read_files(workdir),
-            "hooks-path" => git::read_hooks_path(workdir),
+            "config-files" => git::read_files(workdir, outer_caps),
+            "hooks-path" => git::read_hooks_path(workdir, outer_caps),
             "common-dir" => git::read_common_dir(workdir),
             "worktree" => git::read_main_worktree(workdir),
             "toplevel" => git::read_toplevel(workdir),
@@ -466,14 +517,22 @@ fn dispatch_token(
 ///
 /// `workdir` is forwarded to git providers so that `@git:*` tokens resolve
 /// relative to the intended working directory rather than the process cwd.
+///
+/// `outer_caps` is whatever capability grants the caller has assembled so
+/// far — used to sanitize PATH before a provider spawns a host-side helper
+/// (e.g. `git`) by bare name. It is not necessarily the final capability set
+/// for the session; see the call sites in `capability_ext.rs`.
 pub(crate) fn expand_dynamic_tokens(
     entries: &[String],
     workdir: Option<&std::path::Path>,
+    outer_caps: &nono::CapabilitySet,
 ) -> Result<Vec<String>> {
     let mut out = Vec::with_capacity(entries.len());
     for entry in entries {
         match parse_token(entry) {
-            Some((provider, query)) => out.extend(dispatch_token(provider, query, workdir)?),
+            Some((provider, query)) => {
+                out.extend(dispatch_token(provider, query, workdir, outer_caps)?)
+            }
             None => out.push(entry.clone()),
         }
     }
@@ -520,22 +579,84 @@ mod tests {
     #[test]
     fn expand_dynamic_tokens_passes_literal_paths_through_unchanged() {
         let input = vec!["~/.gitconfig".to_string(), "/etc/static".to_string()];
-        let out = expand_dynamic_tokens(&input, None).expect("literal pass-through");
+        let out = expand_dynamic_tokens(&input, None, &nono::CapabilitySet::default())
+            .expect("literal pass-through");
         assert_eq!(out, vec!["~/.gitconfig", "/etc/static"]);
     }
 
     #[test]
     fn expand_dynamic_tokens_errors_on_unknown_provider() {
         let input = vec!["@unknown:query".to_string()];
-        let err = expand_dynamic_tokens(&input, None).expect_err("unknown provider");
+        let err = expand_dynamic_tokens(&input, None, &nono::CapabilitySet::default())
+            .expect_err("unknown provider");
         assert!(format!("{err}").contains("unknown"));
     }
 
     #[test]
     fn expand_dynamic_tokens_errors_on_unknown_git_query() {
         let input = vec!["@git:nonsense".to_string()];
-        let err = expand_dynamic_tokens(&input, None).expect_err("unknown git query");
+        let err = expand_dynamic_tokens(&input, None, &nono::CapabilitySet::default())
+            .expect_err("unknown git query");
         assert!(format!("{err}").contains("nonsense"));
+    }
+
+    /// Real-world shape: a profile grants write access to a directory
+    /// earlier in the same `filesystem.allow`-style pass, and that same
+    /// directory is also on the ambient PATH `git` would be resolved from.
+    /// A trojan `git` planted there must not be picked up when a later
+    /// `@git:*` token in the profile triggers this provider.
+    #[cfg(unix)]
+    #[test]
+    fn git_provider_skips_trojan_in_writable_path_dir() {
+        use nono::{AccessMode, CapabilitySet, CapabilitySource, FsCapability};
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).expect("mkdir repo/.git");
+
+        let writable_bin = root.path().join("writable-bin");
+        let real_bin = root.path().join("real-bin");
+        std::fs::create_dir_all(&writable_bin).expect("mkdir writable-bin");
+        std::fs::create_dir_all(&real_bin).expect("mkdir real-bin");
+
+        let trojan_marker = root.path().join("PWNED");
+        let real_marker = root.path().join("legit");
+        for (dir, marker) in [(&writable_bin, &trojan_marker), (&real_bin, &real_marker)] {
+            let script = dir.join("git");
+            std::fs::write(
+                &script,
+                format!(
+                    "#!/bin/sh\n: > '{}'\necho 'core.hookspath=global\\tfile:/dev/null\\tcore.hookspath=/tmp/hooks'\n",
+                    marker.display()
+                ),
+            )
+            .expect("write script");
+            let mut perms = std::fs::metadata(&script).expect("metadata").permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms).expect("chmod");
+        }
+
+        // Mirrors a `filesystem.allow` grant on the writable directory,
+        // already applied earlier in the same profile-assembly pass.
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(FsCapability {
+            original: writable_bin.clone(),
+            resolved: nono::try_canonicalize(&writable_bin),
+            access: AccessMode::ReadWrite,
+            is_file: false,
+            source: CapabilitySource::User,
+        });
+
+        let ambient_path = format!("{}:{}", writable_bin.display(), real_bin.display());
+        let result = git::read_paths_with_ambient_path(&repo, &ambient_path, &caps)
+            .expect("provider should not error");
+        // Whatever the parsed result, the trojan must never have run.
+        let _ = result;
+        assert!(
+            !trojan_marker.exists(),
+            "trojan git in the sandbox-writable directory must not have run"
+        );
     }
 
     #[test]

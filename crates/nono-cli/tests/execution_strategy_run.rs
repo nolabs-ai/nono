@@ -299,6 +299,29 @@ fn command_policies_allows_compiled_binary_exec_in_writable_grant_dir() {
         .assert_stdout_contains("ok");
 }
 
+/// Same-FS rename from a child directory to its parent must succeed under
+/// `command_policies`. The outer exec gate must grant Landlock Refer (#1689).
+#[test]
+#[cfg(target_os = "linux")]
+fn command_policies_allows_same_fs_rename_from_child_dir() {
+    let t = nono_test!("cmd-policies-refer-rename");
+    let profile = command_policies_profile(&t, "cmd-policies-refer-rename");
+
+    let script = "set -e
+mkdir -p pending
+echo '{}' > pending/result.json
+mv pending/result.json result.json
+test -f result.json
+echo rename succeeded";
+
+    t.run()
+        .profile(&profile)
+        .no_rollback()
+        .exec(Argv::new("bash").arg("-c").arg(script))
+        .assert_success("same-FS rename pending/result.json -> result.json under command_policies")
+        .assert_stdout_contains("rename succeeded");
+}
+
 /// Workspace-only profile with an active `command_policies` outer exec gate.
 #[cfg(target_os = "linux")]
 fn command_policies_profile(t: &NonoTest, name: &str) -> Profile {

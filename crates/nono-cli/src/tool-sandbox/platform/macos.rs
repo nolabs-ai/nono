@@ -396,6 +396,12 @@ impl PreparedToolSandboxRuntime {
 
     /// Grants Seatbelt capabilities for shim dir execution, socket access,
     /// and metadata-only cwd traversal so getcwd() works inside the sandbox.
+    ///
+    /// Invariant: must never add a filesystem Write grant. `caps` is cloned
+    /// into `ToolSandboxState.outer_caps` (and into the proxy's credential
+    /// capture backend) *before* this runs, and those clones are what
+    /// `nono::sanitize_broker_path_for_binary` checks for the lifetime of the session —
+    /// a Write grant added here would silently bypass that check.
     pub(crate) fn grant_outer_caps(&self, caps: &mut CapabilitySet) -> Result<()> {
         caps.add_fs(FsCapability::new_dir(
             &self.inner.shim_dir,
@@ -822,7 +828,7 @@ fn handle_url_open_stream(
 
     let (success, error) = match validate_url_open(state, peer_pid, session_root_pid, &request.url)
     {
-        Ok(()) => match crate::url_open::open_url_in_browser(&request.url) {
+        Ok(()) => match crate::url_open::open_url_in_browser(&request.url, &state.outer_caps) {
             Ok(()) => (true, None),
             Err(reason) => (false, Some(reason)),
         },
@@ -1425,13 +1431,17 @@ fn handle_shim_stream_inner(
                     )));
                 }
                 let captured = normalize_captured_credential(raw_output);
+                let template = state
+                    .credential_handles
+                    .get(credential)
+                    .and_then(ResolvedCredential::phantom_template);
                 let nonce = {
                     let mut broker = state.token_broker.lock().map_err(|_| {
                         NonoError::SandboxInit(
                             "tool-sandbox token broker lock poisoned".to_string(),
                         )
                     })?;
-                    broker.store_named(credential.clone(), captured, grants.clone())
+                    broker.store_named(credential.clone(), captured, grants.clone(), template)
                 };
                 record_command_policy_audit(
                     audit_recorder.as_ref(),
@@ -3090,20 +3100,20 @@ fn add_policy_fs(
     // `@git:*` tokens run git in the command's live cwd so they resolve to the
     // repo the command is actually operating in (e.g. its worktree / .git
     // common-dir), not the repo the agent was launched in.
-    for entry in &expand_dynamic_tokens(&policy.fs_read, Some(cwd))? {
+    for entry in &expand_dynamic_tokens(&policy.fs_read, Some(cwd), outer_caps)? {
         let path = resolve_policy_path(entry, policy_root, cwd)?;
         add_optional_dir(caps, path, AccessMode::Read)?;
     }
-    for entry in &expand_dynamic_tokens(&policy.fs_write, Some(cwd))? {
+    for entry in &expand_dynamic_tokens(&policy.fs_write, Some(cwd), outer_caps)? {
         let path = resolve_policy_path(entry, policy_root, cwd)?;
         let access = write_access(&path);
         add_optional_dir(caps, path, access)?;
     }
-    for entry in &expand_dynamic_tokens(&policy.fs_read_file, Some(cwd))? {
+    for entry in &expand_dynamic_tokens(&policy.fs_read_file, Some(cwd), outer_caps)? {
         let path = resolve_policy_path(entry, policy_root, cwd)?;
         add_optional_read_file(caps, path)?;
     }
-    for entry in &expand_dynamic_tokens(&policy.fs_write_file, Some(cwd))? {
+    for entry in &expand_dynamic_tokens(&policy.fs_write_file, Some(cwd), outer_caps)? {
         let path = resolve_policy_path(entry, policy_root, cwd)?;
         if matches!(write_access(&path), AccessMode::Read) {
             add_optional_read_file(caps, path)?;
@@ -3633,6 +3643,10 @@ fn issue_existing_ambient_credential_nonce(
     let Some(value) = load_ambient_credential_source(state, credential)? else {
         return Ok(None);
     };
+    let template = state
+        .credential_handles
+        .get(credential)
+        .and_then(ResolvedCredential::phantom_template);
     let mut broker = state.token_broker.lock().map_err(|_| {
         NonoError::SandboxInit("tool-sandbox token broker lock poisoned".to_string())
     })?;
@@ -3640,6 +3654,7 @@ fn issue_existing_ambient_credential_nonce(
         credential.to_string(),
         value,
         grants,
+        template,
     )))
 }
 
@@ -3650,8 +3665,12 @@ fn load_ambient_credential_source(
     match state.credential_handles.get(credential) {
         Some(ResolvedCredential::Ambient {
             source: Some(source),
-        }) => Ok(Some(super::load_supervisor_credential_source(source)?)),
-        Some(ResolvedCredential::Ambient { source: None }) => Ok(None),
+            ..
+        }) => Ok(Some(super::load_supervisor_credential_source(
+            source,
+            &state.outer_caps,
+        )?)),
+        Some(ResolvedCredential::Ambient { source: None, .. }) => Ok(None),
         Some(_) => Err(NonoError::SandboxInit(format!(
             "tool-sandbox credential '{credential}' is not ambient"
         ))),

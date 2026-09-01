@@ -376,6 +376,7 @@ async fn handle_h2_stream(
     // carries a broker nonce in a header would forward the raw nonce upstream
     // instead of the resolved credential.
     let nonce_consumer = service.map(|s| format!("proxy.{s}"));
+    let redeem_phantoms: &[String] = route.map_or(&[], |r| r.redeem_phantoms.as_slice());
     let mut upstream_headers = HeaderMap::new();
     for (name, value) in request.headers() {
         let name_lower = name.as_str().to_lowercase();
@@ -420,7 +421,12 @@ async fn handle_h2_stream(
             .and_then(|v| {
                 nonce_consumer.as_deref().and_then(|consumer| {
                     ctx.nonce_resolver.as_deref().and_then(|resolver| {
-                        handle::resolve_nonce_in_header_value(v, consumer, resolver)
+                        handle::resolve_nonce_in_header_value(
+                            v,
+                            consumer,
+                            redeem_phantoms,
+                            resolver,
+                        )
                     })
                 })
             })
@@ -761,6 +767,7 @@ mod tests {
         tls_connector: &tokio_rustls::TlsConnector,
     ) -> (RouteStore, CredentialStore) {
         let routes = vec![RouteConfig {
+            redeem_phantoms: Vec::new(),
             prefix: "cmd-svc".to_string(),
             upstream: format!("https://{}:{}", host, port),
             credential_key: Some("cmd://my-cmd-cred".to_string()),
@@ -787,7 +794,7 @@ mod tests {
             rate_limit: None,
         }];
         let route_store = RouteStore::load(&routes).await.unwrap();
-        let credential_store = CredentialStore::load_with_diagnostics(&routes, tls_connector)
+        let credential_store = CredentialStore::load_with_diagnostics(&routes, tls_connector, None)
             .await
             .unwrap()
             .store;
@@ -843,6 +850,7 @@ mod tests {
     /// Build a RouteStore with a single route pointing at `host:port`.
     async fn make_route_store(host: &str, port: u16, rules: Vec<EndpointRule>) -> RouteStore {
         let routes = vec![RouteConfig {
+            redeem_phantoms: Vec::new(),
             prefix: "test-svc".to_string(),
             upstream: format!("https://{}:{}", host, port),
             credential_key: None,
@@ -1647,6 +1655,7 @@ mod tests {
 
         // Route configured for AWS SigV4 (h2 signing not yet implemented).
         let routes = vec![RouteConfig {
+            redeem_phantoms: Vec::new(),
             prefix: "aws-svc".to_string(),
             upstream: format!("https://localhost:{}", upstream_port),
             credential_key: None,
@@ -1694,10 +1703,11 @@ mod tests {
                 ),
             ])
         };
-        let credential_store = CredentialStore::load_with_diagnostics(&routes, &tls_connector)
-            .await
-            .unwrap()
-            .store;
+        let credential_store =
+            CredentialStore::load_with_diagnostics(&routes, &tls_connector, None)
+                .await
+                .unwrap()
+                .store;
         let cert_cache = Arc::new(CertCache::new(Arc::clone(&ca)));
         let filter = ProxyFilter::allow_all();
         let session_token = Zeroizing::new("session-tok".to_string());
@@ -1953,10 +1963,12 @@ mod tests {
                         crate::config::OAuthTokenResponseFieldConfig {
                             path: "access_token".to_string(),
                             kind: crate::config::OAuthTokenResponseFieldKind::Opaque,
+                            format: None,
                         },
                         crate::config::OAuthTokenResponseFieldConfig {
                             path: "refresh_token".to_string(),
                             kind: crate::config::OAuthTokenResponseFieldKind::Opaque,
+                            format: None,
                         },
                     ],
                     request_body: crate::config::OAuthTokenRequestBodyFormat::Auto,
@@ -2038,6 +2050,7 @@ mod tests {
 
         let routes = vec![
             RouteConfig {
+                redeem_phantoms: Vec::new(),
                 prefix: "svc-a".to_string(),
                 upstream: format!("https://localhost:{}", upstream_port),
                 credential_key: None,
@@ -2064,6 +2077,7 @@ mod tests {
                 rate_limit: None,
             },
             RouteConfig {
+                redeem_phantoms: Vec::new(),
                 prefix: "svc-b".to_string(),
                 upstream: format!("https://localhost:{}", upstream_port),
                 credential_key: None,
@@ -2245,6 +2259,7 @@ mod tests {
         rules: Vec<EndpointRule>,
     ) -> RouteStore {
         let routes = vec![RouteConfig {
+            redeem_phantoms: Vec::new(),
             prefix: "_ep_test".to_string(),
             upstream: format!("https://{}:{}", host, port),
             credential_key: None,
@@ -2373,6 +2388,7 @@ mod tests {
         // No legacy endpoint_rules — so the legacy path would treat this as a
         // catch-all and forward the request.
         let routes = vec![RouteConfig {
+            redeem_phantoms: Vec::new(),
             prefix: "_ep_policy".to_string(),
             upstream: format!("https://localhost:{}", upstream_port),
             credential_key: None,
@@ -2580,6 +2596,7 @@ mod tests {
         let routes = vec![
             // Credential catch-all (no endpoint_rules)
             RouteConfig {
+                redeem_phantoms: Vec::new(),
                 prefix: "github-cred".to_string(),
                 upstream: format!("https://localhost:{}", upstream_port),
                 credential_key: Some("gh-token".to_string()),
@@ -2604,6 +2621,7 @@ mod tests {
             },
             // Endpoint-only restriction (_ep_ route)
             RouteConfig {
+                redeem_phantoms: Vec::new(),
                 prefix: "_ep_localhost".to_string(),
                 upstream: format!("https://localhost:{}", upstream_port),
                 credential_key: None,

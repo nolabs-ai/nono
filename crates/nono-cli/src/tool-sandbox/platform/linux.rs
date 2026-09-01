@@ -463,6 +463,11 @@ impl PreparedToolSandboxRuntime {
             .collect())
     }
 
+    /// Invariant: must never add a filesystem Write grant. `caps` is cloned
+    /// into `ToolSandboxState.outer_caps` (and into the proxy's credential
+    /// capture backend) *before* this runs, and those clones are what
+    /// `nono::sanitize_broker_path_for_binary` checks for the lifetime of the session —
+    /// a Write grant added here would silently bypass that check.
     pub(crate) fn grant_outer_caps(&self, caps: &mut CapabilitySet) -> Result<()> {
         caps.add_fs(FsCapability::new_dir(
             &self.inner.shim_dir,
@@ -1151,7 +1156,7 @@ fn handle_url_open_stream(
 
     let (success, error) = match validate_url_open(state, peer_pid, session_root_pid, &request.url)
     {
-        Ok(()) => match crate::url_open::open_url_in_browser(&request.url) {
+        Ok(()) => match crate::url_open::open_url_in_browser(&request.url, &state.outer_caps) {
             Ok(()) => (true, None),
             Err(reason) => (false, Some(reason)),
         },
@@ -1738,13 +1743,17 @@ fn handle_shim_stream_inner(
                     )));
                 }
                 let captured = normalize_captured_credential(raw_output);
+                let template = state
+                    .credential_handles
+                    .get(credential)
+                    .and_then(ResolvedCredential::phantom_template);
                 let nonce = {
                     let mut broker = state.token_broker.lock().map_err(|_| {
                         NonoError::SandboxInit(
                             "tool-sandbox token broker lock poisoned".to_string(),
                         )
                     })?;
-                    broker.store_named(credential.clone(), captured, grants.clone())
+                    broker.store_named(credential.clone(), captured, grants.clone(), template)
                 };
                 record_command_policy_audit(
                     audit_recorder.as_ref(),
@@ -3091,6 +3100,12 @@ fn add_outer_exec_file_with_deps(
     Ok(())
 }
 
+/// Stack a Landlock layer that restricts execute to `paths` and `writable_dirs`.
+///
+/// Also grants bare `Refer` on `/`. Landlock requires Refer in every stacked
+/// layer for rename/link, so omitting it here silently breaks same-FS
+/// renames the outer sandbox already permits (`command_policies` / #1689).
+/// Bare `Refer` alone cannot widen access. Mirrors `restrict_execute`.
 fn apply_outer_exec_gate(
     paths: &[PathBuf],
     writable_dirs: &[PathBuf],
@@ -3112,6 +3127,12 @@ fn apply_outer_exec_gate(
             ))
         })?
         .set_compatibility(CompatLevel::BestEffort)
+        .handle_access(AccessFs::Refer)
+        .map_err(|err| {
+            NonoError::SandboxInit(format!(
+                "tool-sandbox outer exec gate cannot handle Refer: {err}"
+            ))
+        })?
         .create()
         .map_err(|err| {
             NonoError::SandboxInit(format!(
@@ -3150,6 +3171,21 @@ fn apply_outer_exec_gate(
                 NonoError::SandboxInit(format!(
                     "tool-sandbox outer exec gate add_rule for {}: {err}",
                     dir.display()
+                ))
+            })?;
+    }
+
+    if abi.has_refer() {
+        let root_fd = PathFd::new("/").map_err(|err| {
+            NonoError::SandboxInit(format!(
+                "tool-sandbox outer exec gate cannot open / for Refer grant: {err}"
+            ))
+        })?;
+        ruleset = ruleset
+            .add_rule(PathBeneath::new(root_fd, AccessFs::Refer))
+            .map_err(|err| {
+                NonoError::SandboxInit(format!(
+                    "tool-sandbox outer exec gate add_rule for / (Refer): {err}"
                 ))
             })?;
     }
@@ -3420,7 +3456,12 @@ fn build_child_launch_spec_for_binary(
     }
     // Let multi-call tools (e.g. git) exec the helpers they invoke by
     // absolute path.
-    for path in resolve_exec_paths(&policy.exec_paths, &state.policy_root, &cwd)? {
+    for path in resolve_exec_paths(
+        &policy.exec_paths,
+        &state.policy_root,
+        &cwd,
+        &state.outer_caps,
+    )? {
         allowed_exec_paths.push(path.as_os_str().as_bytes().to_vec());
     }
 
@@ -3741,20 +3782,20 @@ fn add_policy_fs(
     // `@git:*` tokens run git in the command's live cwd so they resolve to the
     // repo the command is actually operating in (e.g. its worktree / .git
     // common-dir), not the repo the agent was launched in.
-    for entry in &expand_dynamic_tokens(&policy.fs_read, Some(cwd))? {
+    for entry in &expand_dynamic_tokens(&policy.fs_read, Some(cwd), outer_caps)? {
         let path = resolve_policy_path(entry, policy_root, cwd)?;
         add_optional_dir(caps, path, AccessMode::Read)?;
     }
-    for entry in &expand_dynamic_tokens(&policy.fs_write, Some(cwd))? {
+    for entry in &expand_dynamic_tokens(&policy.fs_write, Some(cwd), outer_caps)? {
         let path = resolve_policy_path(entry, policy_root, cwd)?;
         let access = write_access(&path);
         add_optional_dir(caps, path, access)?;
     }
-    for entry in &expand_dynamic_tokens(&policy.fs_read_file, Some(cwd))? {
+    for entry in &expand_dynamic_tokens(&policy.fs_read_file, Some(cwd), outer_caps)? {
         let path = resolve_policy_path(entry, policy_root, cwd)?;
         add_optional_read_file(caps, path)?;
     }
-    for entry in &expand_dynamic_tokens(&policy.fs_write_file, Some(cwd))? {
+    for entry in &expand_dynamic_tokens(&policy.fs_write_file, Some(cwd), outer_caps)? {
         let path = resolve_policy_path(entry, policy_root, cwd)?;
         if matches!(write_access(&path), AccessMode::Read) {
             add_optional_read_file(caps, path)?;
@@ -3802,9 +3843,12 @@ fn resolve_exec_paths(
     exec_paths: &[String],
     policy_root: &Path,
     cwd: &Path,
+    outer_caps: &CapabilitySet,
 ) -> Result<Vec<PathBuf>> {
     let mut resolved = Vec::new();
-    for entry in &super::dynamic_providers::expand_dynamic_tokens(exec_paths, Some(cwd))? {
+    for entry in
+        &super::dynamic_providers::expand_dynamic_tokens(exec_paths, Some(cwd), outer_caps)?
+    {
         let path = resolve_policy_path(entry, policy_root, cwd)?;
         if path.exists() {
             resolved.push(path);
@@ -4486,6 +4530,10 @@ fn issue_existing_ambient_credential_nonce(
     let Some(value) = load_ambient_credential_source(state, credential)? else {
         return Ok(None);
     };
+    let template = state
+        .credential_handles
+        .get(credential)
+        .and_then(ResolvedCredential::phantom_template);
     let mut broker = state.token_broker.lock().map_err(|_| {
         NonoError::SandboxInit("tool-sandbox token broker lock poisoned".to_string())
     })?;
@@ -4493,6 +4541,7 @@ fn issue_existing_ambient_credential_nonce(
         credential.to_string(),
         value,
         grants,
+        template,
     )))
 }
 
@@ -4503,8 +4552,12 @@ fn load_ambient_credential_source(
     match state.credential_handles.get(credential) {
         Some(ResolvedCredential::Ambient {
             source: Some(source),
-        }) => Ok(Some(super::load_supervisor_credential_source(source)?)),
-        Some(ResolvedCredential::Ambient { source: None }) => Ok(None),
+            ..
+        }) => Ok(Some(super::load_supervisor_credential_source(
+            source,
+            &state.outer_caps,
+        )?)),
+        Some(ResolvedCredential::Ambient { source: None, .. }) => Ok(None),
         Some(_) => Err(NonoError::SandboxInit(format!(
             "tool-sandbox credential '{credential}' is not ambient"
         ))),
@@ -5663,6 +5716,7 @@ mod tests {
             ],
             tmp.path(),
             tmp.path(),
+            &CapabilitySet::default(),
         )?;
 
         assert!(
@@ -5883,7 +5937,9 @@ mod tests {
     #[test]
     fn resolve_exec_paths_empty_yields_empty() -> Result<()> {
         let tmp = test_tempdir()?;
-        assert!(resolve_exec_paths(&[], tmp.path(), tmp.path())?.is_empty());
+        assert!(
+            resolve_exec_paths(&[], tmp.path(), tmp.path(), &CapabilitySet::default())?.is_empty()
+        );
         Ok(())
     }
 
@@ -6031,6 +6087,74 @@ mod tests {
         let result =
             ensure_outer_exec_gate_fully_enforced(landlock::RulesetStatus::PartiallyEnforced);
         assert!(matches!(result, Err(err) if err.to_string().contains("partially enforced")));
+    }
+
+    #[test]
+    fn outer_exec_gate_does_not_break_same_fs_rename_from_child_dir() {
+        // Regression for #1689: stacked outer exec gate must keep Refer so
+        // pending/result.json -> result.json succeeds on the same filesystem.
+        let detected = match nono::detect_abi() {
+            Ok(detected) => detected,
+            Err(_) => return,
+        };
+        if !detected.has_execute() {
+            return;
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "nono-outer-exec-rename-test-{}",
+            std::process::id()
+        ));
+        let pending = root.join("pending");
+        if let Err(err) = std::fs::create_dir_all(&pending) {
+            panic!("create pending dir: {err}");
+        }
+        let src = pending.join("result.json");
+        if let Err(err) = std::fs::write(&src, b"{}") {
+            let _ = std::fs::remove_dir_all(&root);
+            panic!("create pending/result.json: {err}");
+        }
+
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork() failed");
+
+        if pid == 0 {
+            let cap = match FsCapability::new_dir(&root, AccessMode::ReadWrite) {
+                Ok(cap) => cap,
+                Err(_) => unsafe { libc::_exit(2) },
+            };
+            let mut caps = CapabilitySet::new();
+            caps.add_fs(cap);
+
+            if Sandbox::apply_landlock(&caps).is_err() {
+                unsafe { libc::_exit(2) };
+            }
+            if apply_outer_exec_gate(&["/usr/bin".into()], &[], detected).is_err() {
+                unsafe { libc::_exit(3) };
+            }
+
+            let dst = root.join("result.json");
+            match std::fs::rename(&src, &dst) {
+                Ok(()) => unsafe { libc::_exit(0) },
+                Err(_) => unsafe { libc::_exit(1) },
+            }
+        }
+
+        let mut status: i32 = 0;
+        let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(waited, pid, "waitpid() failed");
+        assert!(
+            libc::WIFEXITED(status),
+            "child did not exit normally: status={status}"
+        );
+        let code = libc::WEXITSTATUS(status);
+        assert_eq!(
+            code, 0,
+            "same-FS rename pending/result.json -> result.json failed under stacked outer exec gate \
+             (exit code {code}; 1=rename EXDEV/denied, 2=apply_landlock failed, \
+             3=apply_outer_exec_gate failed)"
+        );
     }
 
     #[test]

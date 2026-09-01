@@ -49,6 +49,7 @@ pub(crate) struct PreparedProfile {
     pub(crate) suppressed_system_service_operations: Vec<String>,
     pub(crate) allowed_env_vars: Option<Vec<String>>,
     pub(crate) denied_env_vars: Option<Vec<String>>,
+    pub(crate) case_insensitive_env_vars: bool,
     /// Expanded `environment.set_vars` entries (key, expanded-value). `None`
     /// when the profile has no `set_vars`. Values are expanded with
     /// [`profile::expand_vars`] at prepare time.
@@ -971,31 +972,26 @@ fn prepare_profile_with_options(
             .as_ref()
             .map(|profile| profile.diagnostics.suppress_system_services.clone())
             .unwrap_or_default(),
+        // Patterns are validated at profile load; already well-formed here.
         allowed_env_vars: loaded_profile.as_ref().and_then(|profile| {
-            profile.environment.as_ref().and_then(|env_config| {
-                let vars = env_config.allow_vars.as_ref()?;
-                if let Some(err) =
-                    crate::exec_strategy::validate_env_var_patterns(vars, "allow_vars")
-                {
-                    eprintln!("Warning: {}", err);
-                }
-                Some(vars.clone())
-            })
+            profile
+                .environment
+                .as_ref()
+                .and_then(|env_config| env_config.allow_vars.clone())
         }),
         denied_env_vars: loaded_profile.as_ref().and_then(|profile| {
             profile.environment.as_ref().and_then(|env_config| {
                 if env_config.deny_vars.is_empty() {
-                    return None;
+                    None
+                } else {
+                    Some(env_config.deny_vars.clone())
                 }
-                if let Some(err) = crate::exec_strategy::validate_env_var_patterns(
-                    &env_config.deny_vars,
-                    "deny_vars",
-                ) {
-                    eprintln!("Warning: {}", err);
-                }
-                Some(env_config.deny_vars.clone())
             })
         }),
+        case_insensitive_env_vars: loaded_profile
+            .as_ref()
+            .and_then(|profile| profile.environment.as_ref())
+            .is_some_and(|env_config| env_config.case_insensitive_vars),
         command_policies: loaded_profile
             .as_ref()
             .and_then(|profile| profile.command_policies.clone()),
@@ -1201,6 +1197,7 @@ mod tests {
         profile.environment = Some(profile::EnvironmentConfig {
             allow_vars: None,
             deny_vars: vec![],
+            case_insensitive_vars: false,
             set_vars,
         });
 
@@ -1898,6 +1895,7 @@ mod tests {
         profile.environment = Some(profile::EnvironmentConfig {
             allow_vars: None,
             deny_vars: vec!["GH_TOKEN".to_string()],
+            case_insensitive_vars: false,
             set_vars: Default::default(),
         });
         assert_eq!(
@@ -1917,6 +1915,7 @@ mod tests {
         profile.environment = Some(profile::EnvironmentConfig {
             allow_vars: Some(vec![]),
             deny_vars: vec![],
+            case_insensitive_vars: false,
             set_vars: Default::default(),
         });
         assert_eq!(
@@ -1937,6 +1936,7 @@ mod tests {
         profile.environment = Some(profile::EnvironmentConfig {
             allow_vars: None,
             deny_vars: vec![],
+            case_insensitive_vars: false,
             set_vars,
         });
         assert_eq!(

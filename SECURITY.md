@@ -1,14 +1,5 @@
 # Security Policy
 
-## Project Status
-
-This project is currently in **alpha**.
-It is under active, rapid development and **security issues are expected** as the design and implementation evolve.
-
-We strongly encourage responsible disclosure and collaboration while the project matures.
-
----
-
 ## Reporting a Vulnerability
 
 **Do not report security issues publicly.**
@@ -28,12 +19,24 @@ This ensures:
 
 ---
 
+## Understand nono’s security model
+
+Before reporting a security vulnerability, read and understand nono’s security model.
+
+nono is a fine-grained, kernel-enforced capability sandbox. It is not a VM, microVM, hypervisor, or separate guest/host isolation boundary, and it does not provide a separate kernel. Instead, it restricts processes and their descendants within the host’s shared kernel and user context.
+
+A sandbox escape occurs when an untrusted process exceeds the authority granted by its effective policy—for example, by bypassing filesystem, network, credential, command, or approval controls. Access explicitly granted by policy is not an escape. Behavior outside nono’s documented enforcement scope or threat model is not, by itself, an escape unless it violates another documented security guarantee.
+
+Other violations of documented security guarantees, such as compromising the trusted supervisor or broker, disclosing protected credentials, or causing enforcement to fail open, may constitute security vulnerabilities.
+
+When submitting a report, identify the specific policy or documented security guarantee that is bypassed.
+
 ## LLM-Generated Findings
 
 If a vulnerability is identified by a Large Language Model (LLM):
 
 * ❌ Do **not** report it blindly
-* ✅ Ensure you **fully understand and can explain** the issue
+* ✅ Ensure you **fully understand and can explain** the issue — humans with a security background will be corresponding with you.
 * ✅ Validate the impact and reproducibility
 
 Low-quality or speculative reports slow down response time and reduce overall security effectiveness.
@@ -42,23 +45,13 @@ Low-quality or speculative reports slow down response time and reduce overall se
 
 ## Expectations
 
-Given the alpha status:
+Given the project's current early development status:
 
 * Breaking changes may occur without notice
 * Security guarantees are **not yet stable**
 * Some classes of vulnerabilities may not yet be fully mitigated
 
 Use in production environments is **not recommended** at this stage.
-
----
-
-## Future Security Work
-
-Prior to reaching **v1.0**, the project will undergo:
-
-* A **comprehensive third-party security audit**
-* Hardening of core components and interfaces
-* Formalization of security guarantees and threat models
 
 ---
 

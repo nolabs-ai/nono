@@ -1660,12 +1660,15 @@ mod tests {
         ) -> SupervisorConfig<'a> {
             static REDACTION_POLICY: std::sync::LazyLock<nono::ScrubPolicy> =
                 std::sync::LazyLock::new(nono::ScrubPolicy::secure_default);
+            static EMPTY_CAPS: std::sync::LazyLock<nono::CapabilitySet> =
+                std::sync::LazyLock::new(nono::CapabilitySet::default);
             SupervisorConfig {
                 protected_roots: &[],
                 approval_backend: backend,
                 session_id: "test-net-decision",
                 attach_initial_client: false,
                 detach_sequence: None,
+                caps: &EMPTY_CAPS,
                 open_url_origins: &[],
                 open_url_allow_localhost: false,
                 audit_recorder: None,

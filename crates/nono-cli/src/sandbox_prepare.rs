@@ -256,7 +256,11 @@ fn claude_keychain_account_name() -> String {
 
 #[cfg(target_os = "macos")]
 fn read_keychain_item(account: &str, service_name: &str) -> Option<String> {
-    let output = Command::new("security")
+    // Absolute path, not a bare name: this runs before any sandbox exists
+    // for the invocation, so there is no capability set to sanitize PATH
+    // against. `/usr/bin/security` is Apple's fixed system location — using
+    // it directly skips PATH resolution entirely rather than trusting it.
+    let output = Command::new("/usr/bin/security")
         .args([
             "find-generic-password",
             "-a",
@@ -528,6 +532,7 @@ pub(crate) struct PreparedSandbox {
     pub(crate) suppressed_system_service_operations: Vec<String>,
     pub(crate) allowed_env_vars: Option<Vec<String>>,
     pub(crate) denied_env_vars: Option<Vec<String>>,
+    pub(crate) case_insensitive_env_vars: bool,
     /// Expanded `environment.set_vars` (key, expanded-value), `None` if absent.
     pub(crate) set_vars: Option<Vec<(String, String)>>,
     /// True when the profile's `network.block` is set. The CLI `--block-net`
@@ -697,6 +702,13 @@ fn finalize_prepared_sandbox(
         silent,
         proxy_pending,
     );
+
+    check_writable_path_dirs(
+        &prepared.caps,
+        args.strict_broker_path,
+        args.verbose,
+        silent,
+    )?;
 
     if let Some(ref profile_name) = args.profile {
         crate::pack_update_hint::show_pack_update_hints(profile_name, silent);
@@ -1036,6 +1048,45 @@ pub(crate) fn maybe_enable_macos_gpu(
         ));
     }
     Ok(false)
+}
+
+/// Warn (or, with `--strict-broker-path`, refuse) when a filesystem grant
+/// overlaps a directory on the ambient `PATH`.
+///
+/// This is unrelated to whether nono's own brokers are safe — they already
+/// sanitize `PATH` before resolving anything by bare name (see
+/// `nono::sanitize_broker_path_for_binary`). It's about what happens once the
+/// sandboxed process plants a same-named binary in one of these directories:
+/// anything *else* on the host that later resolves that name by a bare
+/// `PATH` lookup — a shell, cron, an unrelated tool — runs it with full user
+/// privileges, entirely outside nono. Detecting the configuration once at
+/// startup lets the user know that risk exists, without changing what the
+/// sandbox itself is allowed to do.
+fn check_writable_path_dirs(
+    caps: &CapabilitySet,
+    strict: bool,
+    verbose: u8,
+    silent: bool,
+) -> Result<()> {
+    let ambient_path = std::env::var("PATH").unwrap_or_default();
+    let writable_dirs = nono::writable_path_dirs(&ambient_path, caps);
+    if writable_dirs.is_empty() {
+        return Ok(());
+    }
+
+    if strict {
+        let list = writable_dirs
+            .iter()
+            .map(|d| d.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(NonoError::SandboxInit(format!(
+            "--strict-broker-path: PATH is sandbox-writable: {list}"
+        )));
+    }
+
+    output::print_writable_path_warning(&writable_dirs, verbose, silent);
+    Ok(())
 }
 
 pub(crate) fn print_allow_launch_services_warning(silent: bool) {
@@ -1401,11 +1452,16 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
             .into_iter()
             .map(profile::AllowDomainEntry::Plain)
             .collect();
-        let credentials = manifest
-            .credentials
-            .iter()
-            .map(|credential| credential.name.as_str().to_string())
-            .collect();
+        // Map inline manifest credential routes into custom_credentials so
+        // `profile show --format manifest` → `run --config` round-trips.
+        // Built-in network-policy names stay name-only (no route override).
+        let net_policy = network_policy::load_network_policy(
+            crate::config::embedded::embedded_network_policy_json(),
+        )?;
+        let builtin_credential_names: std::collections::HashSet<String> =
+            net_policy.credentials.keys().cloned().collect();
+        let (credentials, custom_credentials) =
+            profile::credentials_from_manifest(&manifest.credentials, &builtin_credential_names)?;
 
         return finalize_prepared_sandbox(
             PreparedSandbox {
@@ -1424,7 +1480,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
                 allow_domain,
                 deny_domain: Vec::new(),
                 credentials,
-                custom_credentials: HashMap::new(),
+                custom_credentials,
                 credential_capture: HashMap::new(),
                 credential_providers: HashMap::new(),
                 credential_routes: Vec::new(),
@@ -1453,6 +1509,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
                 suppressed_system_service_operations: Vec::new(),
                 allowed_env_vars: None,
                 denied_env_vars: None,
+                case_insensitive_env_vars: false,
                 set_vars: None,
                 profile_network_block: false,
                 allow_http2_requested: args.allow_http2,
@@ -1503,6 +1560,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         suppressed_system_service_operations,
         allowed_env_vars: profile_allowed_env_vars,
         denied_env_vars: profile_denied_env_vars,
+        case_insensitive_env_vars: profile_case_insensitive_env_vars,
         set_vars: profile_set_vars,
         resolved_command_binaries: profile_resolved_command_binaries,
     } = prepared_profile;
@@ -1775,7 +1833,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         .as_ref()
         .map(|profile| profile.credential_capture.clone())
         .unwrap_or_default();
-    let loaded_secrets = load_env_credentials(args, &profile_secrets, silent)?;
+    let loaded_secrets = load_env_credentials(args, &profile_secrets, silent, &caps)?;
 
     finalize_prepared_sandbox(
         PreparedSandbox {
@@ -1823,6 +1881,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
             suppressed_system_service_operations,
             allowed_env_vars: profile_allowed_env_vars,
             denied_env_vars: profile_denied_env_vars,
+            case_insensitive_env_vars: profile_case_insensitive_env_vars,
             set_vars: profile_set_vars,
             profile_network_block,
             allow_http2_requested,
@@ -1839,6 +1898,140 @@ mod tests {
     #[cfg(unix)]
     use std::fs;
     use tempfile::tempdir;
+
+    /// `check_writable_path_dirs` reads real PATH, so these mutate it under
+    /// the shared env lock rather than mocking — mirrors the pattern used
+    /// for the broker sanitization tests it's a companion to.
+    #[test]
+    fn check_writable_path_dirs_warns_without_error_by_default() {
+        let dir = tempdir().expect("tempdir");
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let _env = crate::test_env::EnvVarGuard::set_all(&[(
+            "PATH",
+            dir.path().to_str().expect("utf8 path"),
+        )]);
+
+        let mut caps = nono::CapabilitySet::new();
+        caps.add_fs(nono::FsCapability {
+            original: dir.path().to_path_buf(),
+            resolved: nono::try_canonicalize(dir.path()),
+            access: nono::AccessMode::ReadWrite,
+            is_file: false,
+            source: nono::CapabilitySource::User,
+        });
+
+        check_writable_path_dirs(&caps, false, 0, true)
+            .expect("non-strict mode must warn, not error");
+    }
+
+    #[test]
+    fn check_writable_path_dirs_errors_in_strict_mode() {
+        let dir = tempdir().expect("tempdir");
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let _env = crate::test_env::EnvVarGuard::set_all(&[(
+            "PATH",
+            dir.path().to_str().expect("utf8 path"),
+        )]);
+
+        let mut caps = nono::CapabilitySet::new();
+        caps.add_fs(nono::FsCapability {
+            original: dir.path().to_path_buf(),
+            resolved: nono::try_canonicalize(dir.path()),
+            access: nono::AccessMode::ReadWrite,
+            is_file: false,
+            source: nono::CapabilitySource::User,
+        });
+
+        let err = check_writable_path_dirs(&caps, true, 0, true)
+            .expect_err("strict mode must refuse when PATH overlaps a grant");
+        assert!(
+            err.to_string().contains("strict-broker-path"),
+            "error should name the flag: {err}"
+        );
+    }
+
+    #[test]
+    fn check_writable_path_dirs_ok_when_nothing_overlaps() {
+        let dir = tempdir().expect("tempdir");
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let _env = crate::test_env::EnvVarGuard::set_all(&[(
+            "PATH",
+            dir.path().to_str().expect("utf8 path"),
+        )]);
+
+        // No grants at all — the sandbox can't write anywhere on PATH.
+        let caps = nono::CapabilitySet::new();
+        check_writable_path_dirs(&caps, true, 0, true).expect("nothing to flag");
+    }
+
+    /// Live regression test: `read_keychain_item` runs before any sandbox
+    /// exists, so it has no `CapabilitySet` to sanitize PATH against. It
+    /// must use the absolute `/usr/bin/security` path rather than resolving
+    /// `security` by bare name, or a trojan `security` earlier on PATH
+    /// would run with the real user's privileges. Plant one and confirm.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn read_keychain_item_ignores_trojan_security_on_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().expect("tmpdir");
+        let trojan_dir = dir.path().join("bin");
+        std::fs::create_dir_all(&trojan_dir).expect("mkdir");
+        let marker = dir.path().join("marker");
+        let trojan = trojan_dir.join("security");
+        std::fs::write(
+            &trojan,
+            format!(
+                "#!/bin/sh\n/usr/bin/touch {}\necho fake-password\nexit 0\n",
+                marker.display()
+            ),
+        )
+        .expect("write trojan");
+        let mut perms = std::fs::metadata(&trojan).expect("meta").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&trojan, perms).expect("chmod");
+
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        // Put the trojan directory first so a bare-name lookup would find it
+        // before the real /usr/bin/security.
+        let poisoned_path = format!(
+            "{}:{}",
+            trojan_dir.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let _env = crate::test_env::EnvVarGuard::set_all(&[("PATH", &poisoned_path)]);
+
+        // Use a service name that will not exist in the real keychain, so
+        // the real /usr/bin/security call fails closed (returns None)
+        // rather than returning a real secret.
+        let result = read_keychain_item(
+            "nono-pentest-nonexistent-account",
+            "nono-pentest-nonexistent-service-xyz",
+        );
+
+        assert!(
+            !marker.exists(),
+            "trojan security on PATH must not run; read_keychain_item must use \
+             the absolute /usr/bin/security path"
+        );
+        assert_eq!(
+            result, None,
+            "a nonexistent keychain entry via the real /usr/bin/security must return None, \
+             not the trojan's fake output"
+        );
+    }
 
     #[cfg(unix)]
     #[test]
@@ -2607,6 +2800,7 @@ mod tests {
             suppressed_system_service_operations: Vec::new(),
             allowed_env_vars: None,
             denied_env_vars: None,
+            case_insensitive_env_vars: false,
             set_vars: None,
             profile_network_block: false,
             allow_http2_requested: false,

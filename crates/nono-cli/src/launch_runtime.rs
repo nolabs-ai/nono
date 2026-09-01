@@ -255,6 +255,7 @@ pub(crate) struct ExecutionFlags {
     pub(crate) session_hooks: profile::SessionHooks,
     pub(crate) allowed_env_vars: Option<Vec<String>>,
     pub(crate) denied_env_vars: Option<Vec<String>>,
+    pub(crate) case_insensitive_env_vars: bool,
     /// Expanded `environment.set_vars` (key, expanded-value), `None` if absent.
     pub(crate) set_vars: Option<Vec<(String, String)>>,
     pub(crate) startup_timeout_secs: Option<u64>,
@@ -315,6 +316,7 @@ impl ExecutionFlags {
             session_hooks: prepared.session_hooks.clone(),
             allowed_env_vars: prepared.allowed_env_vars.clone(),
             denied_env_vars: prepared.denied_env_vars.clone(),
+            case_insensitive_env_vars: prepared.case_insensitive_env_vars,
             set_vars: prepared.set_vars.clone(),
             startup_timeout_secs: None,
             command_policies: prepared.command_policies.clone(),

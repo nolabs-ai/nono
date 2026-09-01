@@ -141,6 +141,29 @@ Use `--allow-domain` on the command line or `allow_domain` in a profile to add d
 nono run --allow-cwd --network-profile developer --allow-domain my-internal-api.example.com -- my-agent
 ```
 
+`allow_domain`/`deny_domain` entries support three wildcard forms:
+
+- A bare `*` matches any host.
+- A leading `*.` matches one or more subdomain labels: `*.example.com` matches `a.example.com` and `a.b.example.com`, but not `example.com` itself.
+- `*` occupying a whole label anywhere else matches exactly one label there: `jenkins.*.ci.example.com` matches `jenkins.prod.ci.example.com`, but not `jenkins.ci.example.com` (missing label) or `jenkins.a.b.ci.example.com` (extra label).
+
+A `*` that only occupies part of a label (`foo*bar.com`), or a leading `*.` combined with another `*` elsewhere in the same pattern, can never match a real hostname — these are rejected at profile load time rather than silently matching nothing.
+
+### Denying Domains
+
+`deny_domain` blocks specific hosts through the proxy even when they'd otherwise be allowed — it's checked before the allowlist, so it can carve an exception out of a broad `allow_domain` or `network_profile` entry:
+
+```json
+{
+  "network": {
+    "network_profile": "developer",
+    "deny_domain": ["*.ads.example.com"]
+  }
+}
+```
+
+`--deny-domain` is the CLI equivalent. `deny_domain` is additive across profile inheritance, same as `allow_domain`.
+
 ### Client-Side Proxy Bypass
 
 Profiles can add host patterns to the generated `NO_PROXY` and `no_proxy` environment variables with `network.no_proxy`. nono still emits loopback defaults and any safe direct-connect bypasses first; parent-shell `NO_PROXY` values are not inherited. These entries do not grant network access; on macOS ProxyOnly and other restricted modes, direct connections still require matching sandbox permissions.

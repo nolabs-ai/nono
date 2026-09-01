@@ -26,7 +26,7 @@ use crate::command_policy::{
 };
 use nono::{NonoError, Result};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as DeError};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -269,6 +269,10 @@ pub struct CustomCredentialDef {
     /// Mutually exclusive with `auth` — use one or the other.
     #[serde(default)]
     pub credential_key: Option<String>,
+    /// Broker credential names this route redeems from a caller-presented phantom.
+    /// Not honored with `aws_auth`/`spiffe`, whose handlers skip phantom resolution.
+    #[serde(default)]
+    pub redeem_phantoms: Vec<String>,
     /// Optional OAuth2 client_credentials configuration.
     /// When present, the proxy handles token exchange automatically.
     /// Mutually exclusive with `credential_key` — use one or the other.
@@ -626,17 +630,43 @@ fn validate_custom_credential(name: &str, cred: &CustomCredentialDef) -> Result<
         )));
     }
 
+    // aws_auth/spiffe branch to dedicated handlers that never run the
+    // phantom-resolution loop, so redeem_phantoms would be silently ignored.
+    if !cred.redeem_phantoms.is_empty() && (cred.aws_auth.is_some() || cred.spiffe.is_some()) {
+        return Err(NonoError::ProfileParse(format!(
+            "custom credential '{}' sets 'redeem_phantoms' together with 'aws_auth' or \
+             'spiffe'; those use dedicated intercept handlers that do not resolve caller phantoms, \
+             so redeem_phantoms could not be honored — remove one",
+            name
+        )));
+    }
+
     // At least one auth mechanism must be set
     if cred.credential_key.is_none()
         && cred.auth.is_none()
         && cred.aws_auth.is_none()
         && cred.spiffe.is_none()
+        && cred.redeem_phantoms.is_empty()
     {
         return Err(NonoError::ProfileParse(format!(
             "custom credential '{}' must have either 'credential_key', 'auth', 'aws_auth', \
-             or 'spiffe' set",
+             'spiffe', or 'redeem_phantoms' set",
             name
         )));
+    }
+
+    for cred_name in &cred.redeem_phantoms {
+        if cred_name.is_empty()
+            || !cred_name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'+' | b'-'))
+        {
+            return Err(NonoError::ProfileParse(format!(
+                "custom credential '{}' has an invalid 'redeem_phantoms' entry '{}'; \
+                 names must be non-empty and contain only [A-Za-z0-9._+-]",
+                name, cred_name
+            )));
+        }
     }
 
     // Validate inject_header for SPIFFE routes (credential_key has its own validate_header_mode()).
@@ -1130,6 +1160,121 @@ fn validate_profile_custom_credentials(profile: &Profile) -> Result<()> {
     Ok(())
 }
 
+/// Map capability-manifest `credentials[]` into the CLI activation list and
+/// custom route map used by the reverse proxy.
+///
+/// Every entry's name is added to the activation list. Entries whose names are
+/// **not** built-in network-policy services are converted into
+/// [`CustomCredentialDef`] (the inverse of `profile show --format manifest`)
+/// and validated with the same rules as profile `custom_credentials`.
+///
+/// Built-in names keep embedded network-policy routes — inline
+/// upstream/source fields on those entries are ignored so built-in behavior is
+/// unchanged.
+#[must_use = "manifest credential mapping result must be handled"]
+pub(crate) fn credentials_from_manifest(
+    credentials: &[nono::manifest::Credential],
+    builtin_credential_names: &HashSet<String>,
+) -> Result<(Vec<String>, HashMap<String, CustomCredentialDef>)> {
+    let mut names = Vec::with_capacity(credentials.len());
+    let mut custom = HashMap::new();
+
+    for cred in credentials {
+        let name = cred.name.as_str().to_string();
+        if names.iter().any(|existing| existing == &name) {
+            return Err(NonoError::ConfigParse(format!(
+                "duplicate credential name '{name}' in manifest credentials[]"
+            )));
+        }
+        names.push(name.clone());
+
+        if builtin_credential_names.contains(&name) {
+            continue;
+        }
+
+        let custom_def = custom_credential_from_manifest_entry(cred);
+        validate_custom_credential(&name, &custom_def)?;
+        custom.insert(name, custom_def);
+    }
+
+    Ok((names, custom))
+}
+
+/// Convert one manifest credential entry into a profile-side custom route.
+///
+/// Manifest credentials always carry a static `source` (OAuth2 / aws_auth /
+/// spiffe are not representable in the capability-manifest schema yet).
+fn custom_credential_from_manifest_entry(cred: &nono::manifest::Credential) -> CustomCredentialDef {
+    let (
+        inject_mode,
+        inject_header,
+        credential_format,
+        path_pattern,
+        path_replacement,
+        query_param_name,
+    ) = match &cred.inject {
+        Some(inject) => {
+            let inject_mode = match inject.mode {
+                nono::manifest::InjectMode::Header => InjectMode::Header,
+                nono::manifest::InjectMode::UrlPath => InjectMode::UrlPath,
+                nono::manifest::InjectMode::QueryParam => InjectMode::QueryParam,
+                nono::manifest::InjectMode::BasicAuth => InjectMode::BasicAuth,
+            };
+            (
+                inject_mode,
+                inject.header.clone(),
+                Some(inject.format.clone()),
+                inject.path_pattern.clone(),
+                inject.path_replacement.clone(),
+                inject.query_param_name.clone(),
+            )
+        }
+        None => (
+            InjectMode::Header,
+            default_inject_header(),
+            None,
+            None,
+            None,
+            None,
+        ),
+    };
+
+    let endpoint_rules = cred
+        .endpoint_rules
+        .iter()
+        .map(|rule| nono_proxy::config::EndpointRule {
+            method: rule.method.as_str().to_string(),
+            path: rule.path.as_str().to_string(),
+        })
+        .collect();
+
+    CustomCredentialDef {
+        upstream: cred.upstream.as_str().to_string(),
+        credential_key: Some(cred.source.as_str().to_string()),
+        redeem_phantoms: Vec::new(),
+        auth: None,
+        inject_mode,
+        inject_header,
+        credential_format,
+        path_pattern,
+        path_replacement,
+        query_param_name,
+        proxy: None,
+        env_var: cred
+            .env_var
+            .as_ref()
+            .map(|value| value.as_str().to_string()),
+        endpoint_rules,
+        endpoint_policy: None,
+        tls_ca: None,
+        tls_client_cert: None,
+        tls_client_key: None,
+        aws_auth: None,
+        spiffe: None,
+        rate_limit: None,
+    }
+}
+
 #[must_use = "network.no_proxy validation result must be handled"]
 fn validate_profile_no_proxy(profile: &Profile) -> Result<()> {
     for entry in &profile.network.no_proxy {
@@ -1147,6 +1292,40 @@ fn validate_profile_no_proxy(profile: &Profile) -> Result<()> {
         &profile.network.no_proxy,
         &profile.network.allow_domain,
     )
+}
+
+/// Validate `environment.allow_vars`/`deny_vars` glob patterns.
+fn validate_profile_env_var_patterns(profile: &Profile) -> Result<()> {
+    let Some(env_config) = profile.environment.as_ref() else {
+        return Ok(());
+    };
+    if let Some(allow_vars) = env_config.allow_vars.as_ref()
+        && let Some(err) = crate::exec_strategy::validate_env_var_patterns(allow_vars, "allow_vars")
+    {
+        return Err(NonoError::ProfileParse(err));
+    }
+    if !env_config.deny_vars.is_empty()
+        && let Some(err) =
+            crate::exec_strategy::validate_env_var_patterns(&env_config.deny_vars, "deny_vars")
+    {
+        return Err(NonoError::ProfileParse(err));
+    }
+    Ok(())
+}
+
+/// Validate `network.allow_domain`/`deny_domain` hostname patterns.
+fn validate_profile_domain_patterns(profile: &Profile) -> Result<()> {
+    for entry in &profile.network.allow_domain {
+        nono::net_filter::validate_host_pattern(entry.domain()).map_err(|err| {
+            NonoError::ProfileParse(format!("network.allow_domain entry invalid: {err}"))
+        })?;
+    }
+    for pattern in &profile.network.deny_domain {
+        nono::net_filter::validate_host_pattern(pattern).map_err(|err| {
+            NonoError::ProfileParse(format!("network.deny_domain entry invalid: {err}"))
+        })?;
+    }
+    Ok(())
 }
 
 #[must_use = "network.no_proxy allow_domain conflict validation result must be handled"]
@@ -1819,8 +1998,11 @@ pub struct HooksConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionHook {
-    /// Absolute path to the hook script.
-    /// Must be an executable regular file. Validated at execution time.
+    /// Path to the hook script.
+    /// Supports the same `$WORKDIR`/`$HOME`/`$TMPDIR`/XDG/etc. variable
+    /// expansion as other profile paths (see `expand_vars`); the expanded
+    /// result must be an absolute path. Must be an executable regular file.
+    /// Expanded and validated at execution time.
     pub script: PathBuf,
 
     /// Optional timeout in seconds.
@@ -2141,8 +2323,9 @@ pub struct RollbackConfig {
 pub struct EnvironmentConfig {
     /// Allow-list of environment variable names passed to the sandboxed process.
     ///
-    /// Supports exact names (`"PATH"`) and prefix patterns ending with `*`
-    /// (`"AWS_*"` matches `AWS_REGION`, `AWS_SECRET_ACCESS_KEY`, etc.).
+    /// Supports exact names (`"PATH"`), and glob patterns where `*` may appear
+    /// anywhere in the name (`"AWS_*"`, `"*_TOKEN"`, `"*SECRET*"`). A bare `"*"`
+    /// matches everything.
     ///
     /// - Absent (field not written in JSON): no filter, all variables pass through.
     /// - `[]` (explicitly empty): blocks all inherited variables; only nono-injected
@@ -2155,12 +2338,18 @@ pub struct EnvironmentConfig {
 
     /// Deny-list of environment variable names stripped from the sandboxed process.
     ///
-    /// Supports exact names (`"GH_TOKEN"`) and prefix patterns ending with `*`
-    /// (`"GITHUB_*"` strips all vars starting with `GITHUB_`).
-    /// Denied vars are stripped even if they also appear in `allow_vars`.
-    /// Use this to strip specific secrets while keeping everything else inherited.
+    /// Supports the same glob syntax as `allow_vars` (`"GH_TOKEN"`, `"GITHUB_*"`,
+    /// `"*_TOKEN"`, `"*SECRET*"`). Denied vars are stripped even if they also
+    /// match `allow_vars`. Use this to strip specific secrets while keeping
+    /// everything else inherited.
     #[serde(default)]
     pub deny_vars: Vec<String>,
+
+    /// When true, `allow_vars`/`deny_vars` patterns are matched against
+    /// variable names case-insensitively (so `*token*` also matches
+    /// `JENKINS_TOKEN`, `jenkins_token`, and `Jenkins_Token`).
+    #[serde(default)]
+    pub case_insensitive_vars: bool,
 
     /// Static environment variables injected into the sandboxed process.
     ///
@@ -3119,6 +3308,8 @@ pub(crate) fn finalize_profile(mut profile: Profile) -> Result<Profile> {
     {
         return Err(NonoError::ProfileParse(err));
     }
+    validate_profile_env_var_patterns(&profile)?;
+    validate_profile_domain_patterns(&profile)?;
     merge_implicit_default_groups(&mut profile)?;
     // Re-run after extends/platform overrides: base and child profiles can
     // independently add no_proxy and allow_domain entries that only conflict
@@ -3253,6 +3444,8 @@ pub(crate) fn parse_profile_bytes(content: &[u8]) -> Result<Profile> {
     {
         return Err(NonoError::ProfileParse(err));
     }
+    validate_profile_env_var_patterns(&profile)?;
+    validate_profile_domain_patterns(&profile)?;
 
     validate_command_policies(
         profile.command_policies.as_ref(),
@@ -3271,10 +3464,20 @@ pub(crate) fn parse_profile_bytes(content: &[u8]) -> Result<Profile> {
 
 /// Load a profile from a JSON file, resolving inheritance. The parent
 /// directory is passed as context so `extends` can resolve sibling profiles.
+///
+/// Exception: files under `profile-drafts/` do **not** use the drafts directory
+/// as sibling context. Draft sibling lookup can shadow a same-named user/pack
+/// base and make `show`/`validate` disagree with post-`promote` resolution
+/// (#1565). Drafts resolve `extends` the same way as `resolve_and_finalize_profile`
+/// (user profiles → packs → builtins).
 fn load_from_file(path: &Path, cli_extends: &[String]) -> Result<Profile> {
     let (mut profile, source_path) = parse_file_backed_profile(path)?;
     prepend_cli_extends(&mut profile, cli_extends);
-    let context_dir = source_path.parent();
+    let context_dir = if is_under_user_profile_draft_dir(&source_path) {
+        None
+    } else {
+        source_path.parent()
+    };
     resolve_extends(profile, &mut Vec::new(), 0, context_dir, Some(&source_path))
 }
 
@@ -3743,6 +3946,11 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
                     (Some(base), Some(child)) => Some(dedup_append(base, child)),
                 },
                 deny_vars: dedup_append(&base_env.deny_vars, &child_env.deny_vars),
+                // Sticky: once a base profile opts into case-insensitive
+                // matching, a child cannot silently reintroduce a
+                // case-sensitive bypass by omitting the flag.
+                case_insensitive_vars: base_env.case_insensitive_vars
+                    || child_env.case_insensitive_vars,
                 set_vars: {
                     let mut merged = base_env.set_vars.clone();
                     merged.extend(child_env.set_vars.clone());
@@ -3925,6 +4133,23 @@ pub fn display_trust_policy_path() -> String {
 
 pub(crate) fn user_profile_draft_dir() -> Result<PathBuf> {
     Ok(crate::package::nono_config_dir()?.join("profile-drafts"))
+}
+
+/// True when `path` is inside the user profile-drafts directory.
+///
+/// `path` must already be canonical. The only caller, `load_from_file`,
+/// passes the path returned by `parse_file_backed_profile`.
+/// Uses [`Path::starts_with`] (not string prefix matching) so lookalike
+/// paths such as `profile-drafts-evil/` cannot match.
+pub(crate) fn is_under_user_profile_draft_dir(path: &Path) -> bool {
+    let Ok(drafts) = user_profile_draft_dir() else {
+        return false;
+    };
+    let Ok(drafts_canon) = drafts.canonicalize() else {
+        // Drafts dir missing or unreadable → nothing can be under it.
+        return false;
+    };
+    path.starts_with(&drafts_canon)
 }
 
 pub(crate) fn get_user_profile_draft_path(name: &str) -> Result<PathBuf> {
@@ -4668,6 +4893,168 @@ mod tests {
         assert!(profile.groups.include.contains(&"node_runtime".to_string()));
     }
 
+    /// Regression for https://github.com/nolabs-ai/nono/issues/1565:
+    /// a draft sibling must not shadow a same-named user profile base.
+    #[test]
+    fn draft_extends_skips_draft_sibling_shadow_of_user_base() {
+        with_config_env(|config_dir| {
+            let profiles = config_dir.join("nono").join("profiles");
+            let drafts = config_dir.join("nono").join("profile-drafts");
+            std::fs::create_dir_all(&profiles).expect("profiles dir");
+            std::fs::create_dir_all(&drafts).expect("drafts dir");
+
+            std::fs::write(
+                profiles.join("base-grants.json"),
+                r#"{
+                    "meta": { "name": "base-grants" },
+                    "filesystem": {
+                        "read": ["/tmp/gh-nono", "/tmp/nono-ssh", "/tmp/agent.sock", "/tmp/extra"]
+                    }
+                }"#,
+            )
+            .expect("write user base");
+            // Incomplete draft sibling with the same name as the intended base.
+            std::fs::write(
+                drafts.join("base-grants.json"),
+                r#"{
+                    "meta": { "name": "base-grants" }
+                }"#,
+            )
+            .expect("write draft sibling");
+
+            let draft_path = drafts.join("claude-harness-config.json");
+            std::fs::write(
+                &draft_path,
+                r#"{
+                    "extends": "base-grants",
+                    "meta": { "name": "claude-harness-config" },
+                    "filesystem": { "read": ["/tmp/child-only"] }
+                }"#,
+            )
+            .expect("write draft child");
+
+            let from_draft = load_profile_from_path(&draft_path).expect("load draft");
+            assert!(
+                from_draft
+                    .filesystem
+                    .read
+                    .iter()
+                    .any(|p| p.contains("gh-nono")),
+                "draft must resolve the user-profile base, not the empty draft sibling; got {:?}",
+                from_draft.filesystem.read
+            );
+            assert!(
+                from_draft
+                    .filesystem
+                    .read
+                    .iter()
+                    .any(|p| p.contains("child-only")),
+                "child grants must still merge"
+            );
+        });
+    }
+
+    /// Draft-only extends targets (no user/pack/builtin) must fail closed
+    /// rather than silently resolving via draft siblings (#1565).
+    #[test]
+    fn draft_extends_draft_only_base_fails_closed() {
+        with_config_env(|config_dir| {
+            let drafts = config_dir.join("nono").join("profile-drafts");
+            std::fs::create_dir_all(&drafts).expect("drafts dir");
+            std::fs::write(
+                drafts.join("draft-only-base.json"),
+                r#"{
+                    "meta": { "name": "draft-only-base" },
+                    "filesystem": { "read": ["/tmp/should-not-merge"] }
+                }"#,
+            )
+            .expect("write draft-only base");
+            let draft_path = drafts.join("child.json");
+            std::fs::write(
+                &draft_path,
+                r#"{
+                    "extends": "draft-only-base",
+                    "meta": { "name": "child" }
+                }"#,
+            )
+            .expect("write draft child");
+
+            let err =
+                load_profile_from_path(&draft_path).expect_err("must not resolve draft sibling");
+            assert!(
+                matches!(err, NonoError::ProfileInheritance(_)),
+                "expected inheritance error, got {err:?}"
+            );
+            let msg = err.to_string();
+            assert!(
+                msg.contains("draft-only-base") && msg.contains("not found"),
+                "error should name the missing base: {msg}"
+            );
+        });
+    }
+
+    #[test]
+    fn is_under_user_profile_draft_dir_matches_canonical_path() {
+        with_config_env(|config_dir| {
+            let drafts = config_dir.join("nono").join("profile-drafts");
+            std::fs::create_dir_all(&drafts).expect("drafts dir");
+            let file = drafts.join("child.json");
+            std::fs::write(&file, "{}").expect("write");
+            let canon = file.canonicalize().expect("canonicalize");
+            assert!(
+                is_under_user_profile_draft_dir(&canon),
+                "canonical draft path must match"
+            );
+        });
+    }
+
+    #[test]
+    fn is_under_user_profile_draft_dir_rejects_relative_path() {
+        with_config_env(|config_dir| {
+            let drafts = config_dir.join("nono").join("profile-drafts");
+            std::fs::create_dir_all(&drafts).expect("drafts dir");
+            std::fs::write(drafts.join("child.json"), "{}").expect("write");
+            let relative = Path::new("profile-drafts").join("child.json");
+            assert!(
+                !is_under_user_profile_draft_dir(&relative),
+                "relative path must not match; callers canonicalize first"
+            );
+        });
+    }
+
+    #[test]
+    fn draft_loaded_via_lexical_path_still_skips_sibling_context() {
+        with_config_env(|config_dir| {
+            let drafts = config_dir.join("nono").join("profile-drafts");
+            std::fs::create_dir_all(drafts.join("nested")).expect("drafts dir");
+            std::fs::write(
+                drafts.join("draft-only-base.json"),
+                r#"{
+                    "meta": { "name": "draft-only-base" },
+                    "filesystem": { "read": ["/tmp/should-not-merge"] }
+                }"#,
+            )
+            .expect("write draft-only base");
+            std::fs::write(
+                drafts.join("child.json"),
+                r#"{
+                    "extends": "draft-only-base",
+                    "meta": { "name": "child" }
+                }"#,
+            )
+            .expect("write draft child");
+
+            // `..` is not canonical; parse_file_backed_profile canonicalizes
+            // before draft-dir detection, so sibling lookup must stay skipped.
+            let lexical = drafts.join("nested").join("..").join("child.json");
+            let err = load_profile_from_path(&lexical).expect_err("must not resolve draft sibling");
+            assert!(
+                matches!(err, NonoError::ProfileInheritance(_)),
+                "expected inheritance error, got {err:?}"
+            );
+        });
+    }
+
     #[test]
     fn test_load_profile_from_nonexistent_path() {
         let result = load_profile("/tmp/does-not-exist-nono-test.json");
@@ -5091,6 +5478,7 @@ mod tests {
             environment: Some(EnvironmentConfig {
                 allow_vars: None,
                 deny_vars: vec!["GH_TOKEN".into()],
+                case_insensitive_vars: false,
                 set_vars: Default::default(),
             }),
             ..Default::default()
@@ -5099,6 +5487,7 @@ mod tests {
             environment: Some(EnvironmentConfig {
                 allow_vars: None,
                 deny_vars: vec!["ANTHROPIC_API_KEY".into()],
+                case_insensitive_vars: false,
                 set_vars: Default::default(),
             }),
             ..Default::default()
@@ -5116,6 +5505,7 @@ mod tests {
             environment: Some(EnvironmentConfig {
                 allow_vars: None,
                 deny_vars: vec!["GH_TOKEN".into(), "ANTHROPIC_API_KEY".into()],
+                case_insensitive_vars: false,
                 set_vars: Default::default(),
             }),
             ..Default::default()
@@ -5124,6 +5514,7 @@ mod tests {
             environment: Some(EnvironmentConfig {
                 allow_vars: None,
                 deny_vars: vec!["ANTHROPIC_API_KEY".into()],
+                case_insensitive_vars: false,
                 set_vars: Default::default(),
             }),
             ..Default::default()
@@ -5451,6 +5842,7 @@ mod tests {
 
     fn header_cred_builder() -> CustomCredentialDef {
         CustomCredentialDef {
+            redeem_phantoms: Vec::new(),
             upstream: "https://api.example.com".to_string(),
             credential_key: Some("api_key".to_string()),
             auth: None,
@@ -5477,6 +5869,148 @@ mod tests {
     fn test_validate_custom_credential_valid() {
         let cred = header_cred_builder();
         assert!(validate_custom_credential("test", &cred).is_ok());
+    }
+
+    /// Issue #1690: manifest credentials with inline routes must become
+    /// custom_credentials entries that resolve_credentials accepts.
+    #[test]
+    fn test_credentials_from_manifest_maps_inline_custom_route() {
+        let json = r#"{
+            "version": "0.1.0",
+            "credentials": [{
+                "name": "my_api",
+                "upstream": "http://127.0.0.1:6335",
+                "source": "file:///tmp/my_api.token",
+                "env_var": "MY_API_PHANTOM",
+                "inject": {
+                    "mode": "header",
+                    "header": "Authorization",
+                    "format": "Bearer {}"
+                }
+            }]
+        }"#;
+        let manifest =
+            nono::manifest::CapabilityManifest::from_json(json).expect("manifest should parse");
+        manifest.validate().expect("manifest should validate");
+
+        let builtin = HashSet::new();
+        let (names, custom) =
+            credentials_from_manifest(&manifest.credentials, &builtin).expect("map credentials");
+
+        assert_eq!(names, vec!["my_api".to_string()]);
+        let route = custom.get("my_api").expect("custom route present");
+        assert_eq!(route.upstream, "http://127.0.0.1:6335");
+        assert_eq!(
+            route.credential_key.as_deref(),
+            Some("file:///tmp/my_api.token")
+        );
+        assert_eq!(route.env_var.as_deref(), Some("MY_API_PHANTOM"));
+        assert_eq!(route.inject_mode, InjectMode::Header);
+        assert_eq!(route.inject_header, "Authorization");
+        assert_eq!(route.credential_format.as_deref(), Some("Bearer {}"));
+        // Manifest Credential has no redeem_phantoms field; do not invent names.
+        assert!(route.redeem_phantoms.is_empty());
+
+        // End-to-end: resolve_credentials must accept the mapped route.
+        let net_policy = crate::network_policy::load_network_policy(
+            crate::config::embedded::embedded_network_policy_json(),
+        )
+        .expect("load network policy");
+        let routes = crate::network_policy::resolve_credentials(&net_policy, &names, &custom)
+            .expect("custom route should resolve");
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].prefix, "my_api");
+        assert_eq!(routes[0].upstream, "http://127.0.0.1:6335");
+    }
+
+    /// Built-in service names stay name-only; inline fields do not override
+    /// the embedded network-policy route.
+    #[test]
+    fn test_credentials_from_manifest_builtin_name_not_custom() {
+        let json = r#"{
+            "version": "0.1.0",
+            "credentials": [{
+                "name": "openai",
+                "upstream": "https://example.invalid/override",
+                "source": "env://OPENAI_API_KEY"
+            }]
+        }"#;
+        let manifest =
+            nono::manifest::CapabilityManifest::from_json(json).expect("manifest should parse");
+
+        let builtin: HashSet<String> = ["openai".to_string()].into_iter().collect();
+        let (names, custom) =
+            credentials_from_manifest(&manifest.credentials, &builtin).expect("map credentials");
+
+        assert_eq!(names, vec!["openai".to_string()]);
+        assert!(
+            custom.is_empty(),
+            "built-in names must not create custom_credentials overrides"
+        );
+
+        let net_policy = crate::network_policy::load_network_policy(
+            crate::config::embedded::embedded_network_policy_json(),
+        )
+        .expect("load network policy");
+        let routes = crate::network_policy::resolve_credentials(&net_policy, &names, &custom)
+            .expect("built-in openai should resolve from network policy");
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].prefix, "openai");
+        assert_ne!(
+            routes[0].upstream, "https://example.invalid/override",
+            "built-in route must come from network policy, not manifest override"
+        );
+    }
+
+    /// Fail closed: non-loopback HTTP upstream is rejected with a clear error.
+    #[test]
+    fn test_credentials_from_manifest_rejects_illegal_upstream() {
+        let json = r#"{
+            "version": "0.1.0",
+            "credentials": [{
+                "name": "bad_api",
+                "upstream": "http://api.example.com",
+                "source": "env://BAD_TOKEN"
+            }]
+        }"#;
+        let manifest =
+            nono::manifest::CapabilityManifest::from_json(json).expect("manifest should parse");
+
+        let err = credentials_from_manifest(&manifest.credentials, &HashSet::new())
+            .expect_err("non-loopback HTTP upstream must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("HTTPS") || msg.contains("http"),
+            "error should mention HTTPS/http requirement, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_credentials_from_manifest_rejects_duplicate_names() {
+        let json = r#"{
+            "version": "0.1.0",
+            "credentials": [
+                {
+                    "name": "dup",
+                    "upstream": "https://a.example.com",
+                    "source": "env://A"
+                },
+                {
+                    "name": "dup",
+                    "upstream": "https://b.example.com",
+                    "source": "env://B"
+                }
+            ]
+        }"#;
+        let manifest =
+            nono::manifest::CapabilityManifest::from_json(json).expect("manifest should parse");
+
+        let err = credentials_from_manifest(&manifest.credentials, &HashSet::new())
+            .expect_err("duplicate credential names must be rejected");
+        assert!(
+            err.to_string().contains("duplicate credential name"),
+            "error should mention duplicate name, got: {err}"
+        );
     }
 
     #[test]
@@ -5615,6 +6149,7 @@ mod tests {
     #[test]
     fn test_validate_custom_credential_spiffe_only_valid() {
         let cred = CustomCredentialDef {
+            redeem_phantoms: Vec::new(),
             upstream: "http://127.0.0.1:8080".to_string(),
             credential_key: None,
             auth: None,
@@ -5645,6 +6180,65 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_redeem_phantoms_composes_with_credential_key() {
+        // A route may both inject a managed credential (credential_key) and
+        // resolve caller-presented phantoms (redeem_phantoms): the managed
+        // value goes into inject_header, caller phantoms resolve on other headers.
+        let mut cred = header_cred_builder();
+        cred.redeem_phantoms = vec!["partner-token".to_string()];
+        assert!(validate_custom_credential("test", &cred).is_ok());
+    }
+
+    /// `redeem_phantoms` alone satisfies the at-least-one-auth-mechanism rule.
+    #[test]
+    fn test_validate_redeem_phantoms_alone_is_sufficient_auth() {
+        let mut cred = header_cred_builder();
+        cred.credential_key = None;
+        cred.redeem_phantoms = vec!["partner-token".to_string()];
+        assert!(validate_custom_credential("test", &cred).is_ok());
+    }
+
+    #[test]
+    fn test_validate_redeem_phantoms_with_aws_auth_rejected() {
+        let mut cred = header_cred_builder();
+        cred.credential_key = None;
+        cred.redeem_phantoms = vec!["partner-token".to_string()];
+        cred.aws_auth = Some(nono_proxy::config::AwsAuthConfig::default());
+        let err = validate_custom_credential("test", &cred)
+            .expect_err("redeem_phantoms + aws_auth must be rejected");
+        assert!(err.to_string().contains("redeem_phantoms"));
+    }
+
+    #[test]
+    fn test_validate_redeem_phantoms_rejects_empty_name() {
+        let mut cred = header_cred_builder();
+        cred.credential_key = None;
+        cred.redeem_phantoms = vec!["".to_string()];
+        let err = validate_custom_credential("test", &cred)
+            .expect_err("empty redeem_phantoms name must be rejected");
+        assert!(err.to_string().contains("redeem_phantoms"));
+    }
+
+    #[test]
+    fn test_validate_redeem_phantoms_with_spiffe_rejected() {
+        // spiffe branches to its own intercept handler that never resolves
+        // caller phantoms, so redeem_phantoms could not be honored — reject.
+        let mut cred = header_cred_builder();
+        cred.credential_key = None;
+        cred.redeem_phantoms = vec!["partner-token".to_string()];
+        cred.spiffe = Some(nono_proxy::config::SpiffeAuthConfig::Jwt {
+            workload_api_socket: "/run/spire/agent/api.sock".to_string(),
+            audience: vec!["test-audience".to_string()],
+            inject_header: "Authorization".to_string(),
+            credential_format: None,
+            svid_hint: None,
+        });
+        let err = validate_custom_credential("test", &cred)
+            .expect_err("redeem_phantoms + spiffe must be rejected");
+        assert!(err.to_string().contains("redeem_phantoms"));
+    }
+
+    #[test]
     fn test_validate_custom_credential_spiffe_with_credential_key_rejected() {
         let mut cred = header_cred_builder();
         cred.spiffe = Some(nono_proxy::config::SpiffeAuthConfig::Jwt {
@@ -5671,6 +6265,7 @@ mod tests {
     #[test]
     fn test_validate_url_path_mode_valid() {
         let cred = CustomCredentialDef {
+            redeem_phantoms: Vec::new(),
             upstream: "https://api.telegram.org".to_string(),
             credential_key: Some("telegram_token".to_string()),
             auth: None,
@@ -5697,6 +6292,7 @@ mod tests {
     #[test]
     fn test_validate_url_path_mode_missing_pattern() {
         let cred = CustomCredentialDef {
+            redeem_phantoms: Vec::new(),
             upstream: "https://api.telegram.org".to_string(),
             credential_key: Some("telegram_token".to_string()),
             auth: None,
@@ -5725,6 +6321,7 @@ mod tests {
     #[test]
     fn test_validate_url_path_mode_pattern_without_placeholder() {
         let cred = CustomCredentialDef {
+            redeem_phantoms: Vec::new(),
             upstream: "https://api.telegram.org".to_string(),
             credential_key: Some("telegram_token".to_string()),
             auth: None,
@@ -5753,6 +6350,7 @@ mod tests {
     #[test]
     fn test_validate_url_path_mode_with_replacement() {
         let cred = CustomCredentialDef {
+            redeem_phantoms: Vec::new(),
             upstream: "https://api.telegram.org".to_string(),
             credential_key: Some("telegram_token".to_string()),
             auth: None,
@@ -5779,6 +6377,7 @@ mod tests {
     #[test]
     fn test_validate_url_path_mode_replacement_without_placeholder() {
         let cred = CustomCredentialDef {
+            redeem_phantoms: Vec::new(),
             upstream: "https://api.telegram.org".to_string(),
             credential_key: Some("telegram_token".to_string()),
             auth: None,
@@ -5807,6 +6406,7 @@ mod tests {
     #[test]
     fn test_validate_query_param_mode_valid() {
         let cred = CustomCredentialDef {
+            redeem_phantoms: Vec::new(),
             upstream: "https://maps.googleapis.com".to_string(),
             credential_key: Some("google_maps_key".to_string()),
             auth: None,
@@ -5833,6 +6433,7 @@ mod tests {
     #[test]
     fn test_validate_query_param_mode_missing_param_name() {
         let cred = CustomCredentialDef {
+            redeem_phantoms: Vec::new(),
             upstream: "https://maps.googleapis.com".to_string(),
             credential_key: Some("google_maps_key".to_string()),
             auth: None,
@@ -5861,6 +6462,7 @@ mod tests {
     #[test]
     fn test_validate_query_param_mode_empty_param_name() {
         let cred = CustomCredentialDef {
+            redeem_phantoms: Vec::new(),
             upstream: "https://maps.googleapis.com".to_string(),
             credential_key: Some("google_maps_key".to_string()),
             auth: None,
@@ -5889,6 +6491,7 @@ mod tests {
     #[test]
     fn test_validate_basic_auth_mode_valid() {
         let cred = CustomCredentialDef {
+            redeem_phantoms: Vec::new(),
             upstream: "https://api.example.com".to_string(),
             credential_key: Some("example_basic_auth".to_string()),
             auth: None,
@@ -6089,6 +6692,7 @@ mod tests {
 
     fn oauth2_cred_builder() -> CustomCredentialDef {
         CustomCredentialDef {
+            redeem_phantoms: Vec::new(),
             upstream: "https://api.example.com".to_string(),
             credential_key: None,
             auth: Some(OAuth2Config {
@@ -6896,6 +7500,7 @@ mod tests {
         base.network.custom_credentials.insert(
             "svc_a".to_string(),
             CustomCredentialDef {
+                redeem_phantoms: Vec::new(),
                 upstream: "https://a.example.com".to_string(),
                 credential_key: Some("key_a".to_string()),
                 auth: None,
@@ -6922,6 +7527,7 @@ mod tests {
         child.network.custom_credentials.insert(
             "svc_b".to_string(),
             CustomCredentialDef {
+                redeem_phantoms: Vec::new(),
                 upstream: "https://b.example.com".to_string(),
                 credential_key: Some("key_b".to_string()),
                 auth: None,
@@ -7066,6 +7672,7 @@ mod tests {
         base.network.custom_credentials.insert(
             "svc_shared".to_string(),
             CustomCredentialDef {
+                redeem_phantoms: Vec::new(),
                 upstream: "https://base.example.com".to_string(),
                 credential_key: Some("key_base".to_string()),
                 auth: None,
@@ -7092,6 +7699,7 @@ mod tests {
         child.network.custom_credentials.insert(
             "svc_shared".to_string(),
             CustomCredentialDef {
+                redeem_phantoms: Vec::new(),
                 upstream: "https://child.example.com".to_string(),
                 credential_key: Some("key_child".to_string()),
                 auth: None,
@@ -8913,6 +9521,7 @@ mod tests {
     #[test]
     fn test_validate_custom_credential_file_uri_accepted() {
         let cred = CustomCredentialDef {
+            redeem_phantoms: Vec::new(),
             upstream: "https://api.example.com".to_string(),
             credential_key: Some("file:///run/secrets/api-token".to_string()),
             auth: None,
@@ -8942,6 +9551,7 @@ mod tests {
     #[test]
     fn test_validate_custom_credential_file_uri_requires_env_var() {
         let cred = CustomCredentialDef {
+            redeem_phantoms: Vec::new(),
             upstream: "https://api.example.com".to_string(),
             credential_key: Some("file:///run/secrets/api-token".to_string()),
             auth: None,
@@ -8974,6 +9584,7 @@ mod tests {
     #[test]
     fn test_validate_custom_credential_file_uri_invalid_rejected() {
         let cred = CustomCredentialDef {
+            redeem_phantoms: Vec::new(),
             upstream: "https://api.example.com".to_string(),
             credential_key: Some("file://relative/path".to_string()),
             auth: None,
@@ -9006,6 +9617,7 @@ mod tests {
     #[test]
     fn test_validate_custom_credential_file_uri_traversal_rejected() {
         let cred = CustomCredentialDef {
+            redeem_phantoms: Vec::new(),
             upstream: "https://api.example.com".to_string(),
             credential_key: Some("file:///run/secrets/../../../etc/shadow".to_string()),
             auth: None,
@@ -9070,6 +9682,7 @@ mod tests {
     #[test]
     fn test_validate_custom_credential_env_uri_accepted() {
         let cred = CustomCredentialDef {
+            redeem_phantoms: Vec::new(),
             upstream: "https://api.example.com".to_string(),
             credential_key: Some("env://MY_API_TOKEN".to_string()),
             auth: None,
@@ -9379,6 +9992,89 @@ mod tests {
     }
 
     #[test]
+    fn credential_provider_format_opaque_single_placeholder_parses() {
+        let json = br#"{
+            "meta": { "name": "fmt-ok" },
+            "credential_providers": {
+                "claude_code": {
+                    "type": "oauth_capture",
+                    "token_endpoints": [{
+                        "host": "https://platform.claude.com",
+                        "path": "/v1/oauth/token",
+                        "response_fields": [
+                            { "path": "access_token", "kind": "opaque", "format": "sk-ant-oat01-{}" }
+                        ],
+                        "request_nonce_fields": ["refresh_token"]
+                    }],
+                    "api_hosts": ["https://api.anthropic.com"]
+                }
+            }
+        }"#;
+        let profile = parse_profile_bytes(json).expect("format profile parses");
+        finalize_profile(profile.clone()).expect("opaque single-placeholder format validates");
+        let field = &profile
+            .credential_providers
+            .get("claude_code")
+            .expect("provider")
+            .token_endpoints[0]
+            .response_fields[0];
+        assert_eq!(field.format.as_deref(), Some("sk-ant-oat01-{}"));
+    }
+
+    #[test]
+    fn credential_provider_format_rejected_with_jwt_kind() {
+        let json = br#"{
+            "meta": { "name": "fmt-jwt" },
+            "credential_providers": {
+                "claude_code": {
+                    "type": "oauth_capture",
+                    "token_endpoints": [{
+                        "host": "https://platform.claude.com",
+                        "path": "/v1/oauth/token",
+                        "response_fields": [
+                            { "path": "access_token", "kind": "jwt", "format": "sk-{}" }
+                        ],
+                        "request_nonce_fields": ["refresh_token"]
+                    }],
+                    "api_hosts": ["https://api.anthropic.com"]
+                }
+            }
+        }"#;
+        let err = parse_profile_bytes(json).expect_err("format+jwt should reject");
+        assert!(
+            err.to_string().contains("only valid with kind 'opaque'"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn credential_provider_format_rejects_control_characters() {
+        let json = br#"{
+            "meta": { "name": "fmt-crlf" },
+            "credential_providers": {
+                "claude_code": {
+                    "type": "oauth_capture",
+                    "token_endpoints": [{
+                        "host": "https://platform.claude.com",
+                        "path": "/v1/oauth/token",
+                        "response_fields": [
+                            { "path": "access_token", "kind": "opaque", "format": "a\r\nX: y{}" }
+                        ],
+                        "request_nonce_fields": ["refresh_token"]
+                    }],
+                    "api_hosts": ["https://api.anthropic.com"]
+                }
+            }
+        }"#;
+        let err = parse_profile_bytes(json).expect_err("CRLF-bearing format should reject");
+        assert!(
+            err.to_string()
+                .contains("must not contain control characters"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn test_profile_credential_route_rejects_unknown_provider() {
         let json = br#"{
             "meta": { "name": "provider-oauth-capture" },
@@ -9480,6 +10176,7 @@ mod tests {
     #[test]
     fn test_validate_custom_credential_env_uri_dangerous_var_rejected() {
         let cred = CustomCredentialDef {
+            redeem_phantoms: Vec::new(),
             upstream: "https://api.example.com".to_string(),
             credential_key: Some("env://LD_PRELOAD".to_string()),
             auth: None,
@@ -10333,6 +11030,7 @@ mod tests {
 
     fn aws_auth_cred_builder() -> CustomCredentialDef {
         CustomCredentialDef {
+            redeem_phantoms: Vec::new(),
             upstream: "https://bedrock-runtime.us-east-1.amazonaws.com".to_string(),
             credential_key: None,
             auth: None,

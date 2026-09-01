@@ -96,10 +96,6 @@ nono blocks access to sensitive paths by default, even if a parent directory is 
 
 ## Security Properties
 
-### Irreversibility
-
-Once the sandbox is applied, there is no API to expand or remove it. Not even nono itself can undo the restrictions.
-
 ### Fail-Closed
 
 If sandbox initialization fails, nono exits with an error rather than running the command unrestricted.

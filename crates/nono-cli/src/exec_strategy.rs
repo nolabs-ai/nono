@@ -294,13 +294,16 @@ pub struct ExecConfig<'a> {
     #[cfg(target_os = "linux")]
     pub sandbox_policy: crate::profile::LinuxSandboxPolicy,
     /// Allow-list of environment variable names. When set, only variables
-    /// matching an exact name or prefix pattern (e.g. `"AWS_*"`) are
+    /// matching a glob pattern (e.g. `"AWS_*"`, `"*_TOKEN"`, `"*SECRET*"`) are
     /// passed to the child. Nono-injected credentials always bypass this.
     pub allowed_env_vars: Option<Vec<String>>,
-    /// Deny-list of environment variable names. Variables matching an exact
-    /// name or prefix pattern (e.g. `"GITHUB_*"`) are stripped even if they
-    /// also appear in `allowed_env_vars`. Nono-injected credentials bypass this.
+    /// Deny-list of environment variable names. Variables matching a glob
+    /// pattern (e.g. `"GITHUB_*"`, `"*_TOKEN"`) are stripped even if they
+    /// also match `allowed_env_vars`. Nono-injected credentials bypass this.
     pub denied_env_vars: Option<Vec<String>>,
+    /// When true, `allowed_env_vars`/`denied_env_vars` patterns are matched
+    /// case-insensitively.
+    pub case_insensitive_env_vars: bool,
     /// Static environment variables (`environment.set_vars`) injected after host
     /// env filtering and before `env_vars` (credentials/proxy/hooks). Values are
     /// already variable-expanded. Bypasses allow/deny filtering by design.
@@ -338,6 +341,10 @@ pub struct SupervisorConfig<'a> {
     pub attach_initial_client: bool,
     /// Configured in-band PTY detach sequence.
     pub detach_sequence: Option<&'a [u8]>,
+    /// The session's write policy, used to strip sandbox-writable PATH
+    /// entries before the unsandboxed browser-open helper resolves
+    /// `open`/`xdg-open` by bare name.
+    pub caps: &'a CapabilitySet,
     /// Allowed URL origins for supervisor-delegated browser opens (from profile).
     /// Empty means no URLs are allowed.
     pub open_url_origins: &'a [String],
@@ -411,6 +418,7 @@ pub fn execute_direct(config: &ExecConfig<'_>) -> Result<()> {
             BLOCKED_EXTRA,
             config.denied_env_vars.as_deref(),
             config.allowed_env_vars.as_deref(),
+            config.case_insensitive_env_vars,
         )
     });
 
@@ -421,6 +429,7 @@ pub fn execute_direct(config: &ExecConfig<'_>) -> Result<()> {
             BLOCKED_EXTRA,
             config.denied_env_vars.as_deref(),
             config.allowed_env_vars.as_deref(),
+            config.case_insensitive_env_vars,
         ) {
             continue;
         }
@@ -600,6 +609,7 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
             BLOCKED_EXTRA,
             config.denied_env_vars.as_deref(),
             config.allowed_env_vars.as_deref(),
+            config.case_insensitive_env_vars,
         )
     });
 
@@ -612,6 +622,7 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
                 BLOCKED_EXTRA,
                 config.denied_env_vars.as_deref(),
                 config.allowed_env_vars.as_deref(),
+                config.case_insensitive_env_vars,
             ) {
                 continue;
             }
@@ -1490,9 +1501,14 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
                                 Err(e) => {
                                     let _ = signal::kill(child, Signal::SIGKILL);
                                     let _ = waitpid(child, None);
+                                    // Unwrap to avoid doubling the "Sandbox
+                                    // initialization failed: " prefix.
+                                    let detail = match e {
+                                        NonoError::SandboxInit(msg) => msg,
+                                        other => other.to_string(),
+                                    };
                                     return Err(NonoError::SandboxInit(format!(
-                                        "Failed to acquire required network seccomp notify fd from child: {}",
-                                        e
+                                        "failed to acquire required network seccomp notify fd from child: {detail}"
                                     )));
                                 }
                             }
@@ -3751,7 +3767,7 @@ fn validate_and_open_url(
     config: &SupervisorConfig<'_>,
 ) -> std::result::Result<(), UrlDenial> {
     validate_url(url, config)?;
-    crate::url_open::open_url_in_browser(url)
+    crate::url_open::open_url_in_browser(url, config.caps)
         .map_err(|msg| UrlDenial::BrowserLaunchFailed { message: msg })
 }
 
@@ -3836,10 +3852,16 @@ fn acquire_fd_from_child(
     let new_fd_raw =
         unsafe { libc::syscall(libc::SYS_pidfd_getfd, pidfd.as_raw_fd(), child_fd, 0_u32) };
     if new_fd_raw < 0 {
+        let err = std::io::Error::last_os_error();
+        let hint = if err.raw_os_error() == Some(libc::EPERM) {
+            " (this commonly happens inside a container: pidfd_getfd requires \
+             CAP_SYS_PTRACE, which container runtimes drop by default -- retry with \
+             `docker run --cap-add=SYS_PTRACE ...` or the equivalent for your runtime)"
+        } else {
+            ""
+        };
         return Err(NonoError::SandboxInit(format!(
-            "pidfd_getfd failed for child fd {}: {}",
-            child_fd,
-            std::io::Error::last_os_error()
+            "pidfd_getfd failed for child fd {child_fd}: {err}{hint}"
         )));
     }
     // SAFETY: pidfd_getfd returned a fresh owned fd duplicated from the child.
@@ -5193,6 +5215,7 @@ mod tests {
             session_id: "test-session",
             attach_initial_client: false,
             detach_sequence: None,
+            caps: &nono::CapabilitySet::default(),
             open_url_origins: &[],
             open_url_allow_localhost: false,
             audit_recorder: None,
@@ -5320,6 +5343,7 @@ mod tests {
             session_id: "test-proxy-v4",
             attach_initial_client: false,
             detach_sequence: None,
+            caps: &nono::CapabilitySet::default(),
             open_url_origins: &[],
             open_url_allow_localhost: false,
             audit_recorder: None,
@@ -5413,6 +5437,7 @@ mod tests {
             session_id: "test",
             attach_initial_client: false,
             detach_sequence: None,
+            caps: &nono::CapabilitySet::default(),
             open_url_origins: &origins,
             open_url_allow_localhost: false,
             audit_recorder: None,
@@ -5459,6 +5484,7 @@ mod tests {
             session_id: "test",
             attach_initial_client: false,
             detach_sequence: None,
+            caps: &nono::CapabilitySet::default(),
             open_url_origins: &[],
             open_url_allow_localhost: false,
             audit_recorder: None,
@@ -5512,6 +5538,7 @@ mod tests {
             session_id: "test",
             attach_initial_client: false,
             detach_sequence: None,
+            caps: &nono::CapabilitySet::default(),
             open_url_origins: &origins,
             open_url_allow_localhost: false,
             audit_recorder: None,
@@ -5581,6 +5608,7 @@ mod tests {
             session_id: "test",
             attach_initial_client: false,
             detach_sequence: None,
+            caps: &nono::CapabilitySet::default(),
             open_url_origins: &[],
             open_url_allow_localhost: true,
             audit_recorder: None,
@@ -5611,6 +5639,7 @@ mod tests {
             session_id: "test",
             attach_initial_client: false,
             detach_sequence: None,
+            caps: &nono::CapabilitySet::default(),
             open_url_origins: &[],
             open_url_allow_localhost: false,
             audit_recorder: None,
@@ -5660,6 +5689,7 @@ mod tests {
             session_id: "test",
             attach_initial_client: false,
             detach_sequence: None,
+            caps: &nono::CapabilitySet::default(),
             open_url_origins: &[],
             open_url_allow_localhost: false,
             audit_recorder: None,
@@ -5814,6 +5844,7 @@ mod tests {
             session_id: "test",
             attach_initial_client: false,
             detach_sequence: None,
+            caps: &nono::CapabilitySet::default(),
             open_url_origins: &[],
             open_url_allow_localhost: false,
             audit_recorder: None,
@@ -5872,6 +5903,7 @@ mod tests {
             session_id: "test",
             attach_initial_client: false,
             detach_sequence: None,
+            caps: &nono::CapabilitySet::default(),
             open_url_origins: &origins,
             open_url_allow_localhost: false,
             audit_recorder: None,
@@ -5919,6 +5951,7 @@ mod tests {
             session_id: "test",
             attach_initial_client: false,
             detach_sequence: None,
+            caps: &nono::CapabilitySet::default(),
             open_url_origins: &[],
             open_url_allow_localhost: true,
             audit_recorder: None,
@@ -5985,6 +6018,7 @@ mod tests {
             session_id: "test",
             attach_initial_client: false,
             detach_sequence: None,
+            caps: &nono::CapabilitySet::default(),
             open_url_origins: &[],
             open_url_allow_localhost: false,
             audit_recorder: None,

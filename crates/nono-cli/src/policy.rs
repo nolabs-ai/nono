@@ -675,8 +675,9 @@ fn push_glob_as_seatbelt_regex(glob: &str, out: &mut String) -> Result<()> {
                     i += 2;
                     if i < chars.len() && chars[i] == '/' {
                         // **/ → optional path prefix so **/foo matches both
-                        // foo and subdir/foo at any depth.
-                        out.push_str("(?:.*/)?");
+                        // foo and subdir/foo at any depth. Must be a capturing
+                        // group: Seatbelt's regex matcher silently ignores `(?:...)`.
+                        out.push_str("(.*/)?");
                         i += 1;
                     } else {
                         // ** at end or before a non-slash: match anything
@@ -4043,13 +4044,13 @@ mod tests {
         #[test]
         fn test_glob_regex_double_star_slash_prefix() {
             let re = glob_to_seatbelt_regex("**/appsettings.json").expect("ok");
-            assert_eq!(re, r"^(?:.*/)?appsettings\.json$");
+            assert_eq!(re, r"^(.*/)?appsettings\.json$");
         }
 
         #[test]
         fn test_glob_regex_double_star_mid_pattern() {
             let re = glob_to_seatbelt_regex("/repo/**/appsettings.json").expect("ok");
-            assert_eq!(re, r"^/repo/(?:.*/)?appsettings\.json$");
+            assert_eq!(re, r"^/repo/(.*/)?appsettings\.json$");
         }
 
         #[test]
@@ -4074,13 +4075,13 @@ mod tests {
         #[test]
         fn test_glob_regex_double_star_with_prefix_wildcard() {
             let re = glob_to_seatbelt_regex("/repo/**/appsettings*.json").expect("ok");
-            assert_eq!(re, r"^/repo/(?:.*/)?appsettings[^/]*\.json$");
+            assert_eq!(re, r"^/repo/(.*/)?appsettings[^/]*\.json$");
         }
 
         #[test]
         fn test_glob_regex_dot_env_wildcard() {
             let re = glob_to_seatbelt_regex("**/.env.*").expect("ok");
-            assert_eq!(re, r"^(?:.*/)?\.env\.[^/]*$");
+            assert_eq!(re, r"^(.*/)?\.env\.[^/]*$");
         }
 
         #[test]

@@ -446,6 +446,36 @@ fn is_dir_empty(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Effective update status for an installed pack.
+///
+/// Dynamic registries report `installed_status` directly. Static registries
+/// (`nono pack publish-static`) serve flat status files that omit it, so fall
+/// back to a client-side semver comparison against `latest`; otherwise every
+/// installed pack would look outdated and `nono update` would re-pull packs
+/// that are already current.
+fn effective_installed_status(status: &package::PackageStatusResponse, installed: &str) -> String {
+    match status.installed_status.as_deref() {
+        Some(s) if s != "unknown" => s.to_string(),
+        _ => {
+            let (Ok(installed), Some(Ok(latest))) = (
+                parse_version(installed, "installed version"),
+                status
+                    .latest
+                    .as_deref()
+                    .map(|latest| parse_version(latest, "latest version")),
+            ) else {
+                return "unknown".to_string();
+            };
+            match installed.cmp(&latest) {
+                Ordering::Equal => "current",
+                Ordering::Greater => "ahead",
+                Ordering::Less => "outdated",
+            }
+            .to_string()
+        }
+    }
+}
+
 pub fn run_update(args: UpdateArgs) -> Result<()> {
     let lockfile = package::read_lockfile()?;
 
@@ -519,16 +549,16 @@ pub fn run_update(args: UpdateArgs) -> Result<()> {
             }
         };
 
-        match status.installed_status.as_deref() {
-            Some("current") => {
+        match effective_installed_status(&status, &pkg.version).as_str() {
+            "current" => {
                 eprintln!("  {key} {} — up to date", pkg.version);
                 skipped = skipped.saturating_add(1);
             }
-            Some("ahead") => {
+            "ahead" => {
                 eprintln!("  {key} {} is ahead of registry — skipped", pkg.version);
                 skipped = skipped.saturating_add(1);
             }
-            Some("yanked") => {
+            "yanked" => {
                 eprintln!(
                     "  {key}@{} has been yanked — run `nono pull {key}` to install the latest safe release",
                     pkg.version
@@ -748,12 +778,12 @@ pub fn run_outdated(args: OutdatedArgs) -> Result<()> {
 
         match client.fetch_package_status(&pkg_ref, Some(&pkg.version)) {
             Ok(status) => {
-                let status_str = status.installed_status.as_deref().unwrap_or("unknown");
+                let status_str = effective_installed_status(&status, &pkg.version);
                 entries.push(OutdatedEntry {
                     key: key.clone(),
                     installed: pkg.version.clone(),
                     latest: status.latest.clone(),
-                    status: status_str.to_string(),
+                    status: status_str,
                     pinned: pkg.pinned,
                 });
             }
@@ -1560,6 +1590,53 @@ fn format_timestamp(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn status_response(
+        latest: Option<&str>,
+        installed_status: Option<&str>,
+    ) -> package::PackageStatusResponse {
+        package::PackageStatusResponse {
+            schema_version: 1,
+            latest: latest.map(str::to_string),
+            installed_status: installed_status.map(str::to_string),
+            yank_reason: None,
+            advisory: None,
+        }
+    }
+
+    #[test]
+    fn effective_status_derives_from_semver_when_server_omits_it() {
+        // Static registry status files carry `latest` but no `installed_status`.
+        let status = status_response(Some("1.2.0"), None);
+        assert_eq!(effective_installed_status(&status, "1.2.0"), "current");
+        assert_eq!(effective_installed_status(&status, "1.1.0"), "outdated");
+        assert_eq!(effective_installed_status(&status, "1.3.0"), "ahead");
+    }
+
+    #[test]
+    fn effective_status_rederives_server_unknown() {
+        let status = status_response(Some("2.0.0"), Some("unknown"));
+        assert_eq!(effective_installed_status(&status, "2.0.0"), "current");
+    }
+
+    #[test]
+    fn effective_status_trusts_explicit_server_status() {
+        // A yanked verdict wins even when the versions match client-side.
+        let status = status_response(Some("1.0.0"), Some("yanked"));
+        assert_eq!(effective_installed_status(&status, "1.0.0"), "yanked");
+    }
+
+    #[test]
+    fn effective_status_stays_unknown_without_comparable_versions() {
+        assert_eq!(
+            effective_installed_status(&status_response(None, None), "1.0.0"),
+            "unknown"
+        );
+        assert_eq!(
+            effective_installed_status(&status_response(Some("not-semver"), None), "1.0.0"),
+            "unknown"
+        );
+    }
 
     #[test]
     fn compare_versions_honors_prerelease_ordering() {

@@ -179,7 +179,6 @@
           "/Applications",
           "/cores",
           "/opt",
-          "/Volumes",
           "/run",
           "/nix"
         ]

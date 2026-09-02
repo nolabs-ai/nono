@@ -4327,4 +4327,30 @@ mod tests {
 
         assert_eq!(result, vec![root.join("weird{name}.json")]);
     }
+
+    #[test]
+    fn test_system_read_macos_does_not_grant_plain_volumes() {
+        // Regression for the overbroad grant reported in discussion #1482:
+        // `/Volumes` is where external drives, disk images, and network
+        // shares mount, and unlike `/System/Volumes` (needed only to match
+        // APFS firmlink-resolved paths, see docs/cli/internals/seatbelt.mdx),
+        // no executable needs it to function. Granting it by default handed
+        // every sandboxed process read access to the contents of any mounted
+        // volume, regardless of what the invocation actually touches.
+        let policy = load_embedded_policy().expect("load embedded policy");
+        let group = policy
+            .groups
+            .get("system_read_macos")
+            .expect("system_read_macos group must exist");
+        let read_paths = &group.allow.as_ref().expect("allow ops").read;
+
+        assert!(
+            !read_paths.iter().any(|p| p == "/Volumes"),
+            "system_read_macos must not grant plain /Volumes: {read_paths:?}"
+        );
+        assert!(
+            read_paths.iter().any(|p| p == "/System/Volumes"),
+            "system_read_macos should still grant /System/Volumes for firmlink resolution: {read_paths:?}"
+        );
+    }
 }

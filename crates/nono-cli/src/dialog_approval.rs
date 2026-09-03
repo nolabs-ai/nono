@@ -629,10 +629,8 @@ mod tests {
 
         // Register both vars in the guard so originals are captured and
         // restored on drop, then remove them to simulate a headless session.
-        let _env = crate::test_env::EnvVarGuard::set_all(&[
-            ("WAYLAND_DISPLAY", ""),
-            ("DISPLAY", ""),
-        ]);
+        let _env =
+            crate::test_env::EnvVarGuard::set_all(&[("WAYLAND_DISPLAY", ""), ("DISPLAY", "")]);
         _env.remove("WAYLAND_DISPLAY");
         _env.remove("DISPLAY");
 

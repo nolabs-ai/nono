@@ -4,7 +4,7 @@
 //! Adopting a certificate another launch already renewed is preferred over renewing
 //! here, because only the latter writes to the trust store and prompts.
 
-use crate::macos_trust::{self, CertValidity};
+use crate::macos_trust::{self, CertValidity, RenewOutcome};
 use nono_proxy::tls_intercept::InterceptCaRotator;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -33,7 +33,10 @@ pub(crate) fn spawn_supervisor(rotator: Arc<InterceptCaRotator>, validity: Durat
             let mut delay = interval;
             loop {
                 std::thread::sleep(delay);
-                delay = next_delay(supervise_once(&rotator, validity), interval);
+                match next_delay(supervise_once(&rotator, validity), interval) {
+                    Some(d) => delay = d,
+                    None => return,
+                }
             }
         })
         .map(|_| ())
@@ -61,20 +64,27 @@ enum Outcome {
     /// A trust prompt was declined or a trust write failed; still serving the old
     /// cert. Backs off, since re-prompting hourly would be worse than the expiry.
     Deferred,
+    /// No interactive session exists to show the trust prompt (e.g. a headless
+    /// `nono proxy`). Retrying later in the same session can't succeed either,
+    /// since there's still nobody to ask.
+    NoInteraction,
 }
 
 /// How long to sleep before the next check, given the last one's outcome.
+/// `None` means stop the supervisor loop entirely.
 ///
 /// Only a declined prompt or a failed trust write backs off; losing the lock
 /// race to another session is routine and should retry on the normal interval
-/// so this session adopts what the winner just wrote.
-fn next_delay(outcome: nono::Result<Outcome>, interval: Duration) -> Duration {
+/// so this session adopts what the winner just wrote. No interactive session
+/// ever succeeding again in this run, so it doesn't retry at all.
+fn next_delay(outcome: nono::Result<Outcome>, interval: Duration) -> Option<Duration> {
     match outcome {
-        Ok(Outcome::Deferred) => BACKOFF_AFTER_FAILURE,
-        Ok(_) => interval,
+        Ok(Outcome::Deferred) => Some(BACKOFF_AFTER_FAILURE),
+        Ok(Outcome::NoInteraction) => None,
+        Ok(_) => Some(interval),
         Err(e) => {
             warn!("Proxy CA renewal check failed: {e}");
-            BACKOFF_AFTER_FAILURE
+            Some(BACKOFF_AFTER_FAILURE)
         }
     }
 }
@@ -102,18 +112,26 @@ fn supervise_once(rotator: &InterceptCaRotator, validity: Duration) -> nono::Res
     }
 
     match macos_trust::renew_shared_ca(validity)? {
-        Some(renewed) => {
+        RenewOutcome::Renewed(renewed) => {
             install(rotator, &renewed.key_der, &renewed.cert_pem)?;
             info!("Proxy CA renewed mid-session; no restart needed");
             Ok(Outcome::Renewed)
         }
-        None => {
+        RenewOutcome::Unchanged => {
             warn!(
                 "Proxy CA could not be renewed (authentication declined or trust write failed). \
                  Still serving the current certificate; will retry later. Intercepted routes will \
                  fail once it expires — restart the agent to recover."
             );
             Ok(Outcome::Deferred)
+        }
+        RenewOutcome::NoInteraction => {
+            tracing::error!(
+                "Proxy CA needs renewal but no interactive session is available to authorize it \
+                 (headless session). Not retrying; the current certificate will expire and \
+                 intercepted routes will fail — restart in an interactive session to recover."
+            );
+            Ok(Outcome::NoInteraction)
         }
     }
 }
@@ -218,7 +236,7 @@ mod tests {
     fn losing_the_lock_race_retries_on_the_normal_interval_not_backoff() {
         assert_eq!(
             next_delay(Ok(Outcome::Busy), Duration::from_secs(42)),
-            Duration::from_secs(42),
+            Some(Duration::from_secs(42)),
             "lock contention is routine; it must not trigger the failure backoff"
         );
     }
@@ -227,7 +245,16 @@ mod tests {
     fn a_declined_or_failed_trust_attempt_backs_off() {
         assert_eq!(
             next_delay(Ok(Outcome::Deferred), Duration::from_secs(42)),
-            BACKOFF_AFTER_FAILURE
+            Some(BACKOFF_AFTER_FAILURE)
+        );
+    }
+
+    #[test]
+    fn no_interactive_session_stops_the_supervisor_for_good() {
+        assert_eq!(
+            next_delay(Ok(Outcome::NoInteraction), Duration::from_secs(42)),
+            None,
+            "a headless session can never satisfy a trust prompt; retrying is pointless"
         );
     }
 

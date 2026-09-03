@@ -22,10 +22,15 @@ use tracing::{debug, info, warn};
 use x509_parser::pem::parse_x509_pem;
 use zeroize::Zeroizing;
 
-/// Internal error type to distinguish user-cancelled trust prompts from other
-/// failures without relying on string matching.
+/// Internal error type to distinguish user-cancelled trust prompts, and prompts
+/// that couldn't be shown at all, from other failures without relying on string
+/// matching.
 enum TrustCertError {
     UserCancelled,
+    /// No interactive session exists to show the prompt (e.g. a headless `nono
+    /// proxy`). Unlike a decline, a later retry with the same session can't
+    /// succeed either — only a new interactive session can.
+    NoInteractionAvailable,
     Other(NonoError),
 }
 
@@ -57,7 +62,10 @@ fn try_ensure_trusted_ca(validity: Duration) -> Result<Option<PreloadedCa>> {
                 CertValidity::Valid => {}
                 state => {
                     debug!("stored proxy CA needs renewal ({state:?}); re-issuing over stored key");
-                    return rotate_ca(&key_der, &cert_pem, validity, state);
+                    return match rotate_ca(&key_der, &cert_pem, validity, state)? {
+                        RotateOutcome::Cert(ca) => Ok(Some(ca)),
+                        RotateOutcome::Unavailable | RotateOutcome::NoInteraction => Ok(None),
+                    };
                 }
             }
 
@@ -70,10 +78,11 @@ fn try_ensure_trusted_ca(validity: Duration) -> Result<Option<PreloadedCa>> {
                 info!("Re-trusting proxy CA (you may be prompted for authentication)...");
                 if let Err(e) = trust_cert(&cert) {
                     match e {
-                        TrustCertError::UserCancelled => {
+                        TrustCertError::UserCancelled | TrustCertError::NoInteractionAvailable => {
                             warn!(
-                                "Trust store auth cancelled. Falling back to ephemeral CA. \
-                                 Go CLI tools won't validate proxy certs; other tools still work."
+                                "Trust store auth cancelled or unavailable. Falling back to \
+                                 ephemeral CA. Go CLI tools won't validate proxy certs; other \
+                                 tools still work."
                             );
                             return Ok(None);
                         }
@@ -99,17 +108,28 @@ pub(crate) fn read_shared_ca() -> Result<Option<(Zeroizing<Vec<u8>>, String)>> {
     load_existing_ca()
 }
 
+/// Outcome of a mid-session renewal attempt via [`renew_shared_ca`].
+pub(crate) enum RenewOutcome {
+    /// A new certificate was installed.
+    Renewed(PreloadedCa),
+    /// Nothing changed: no stored CA, a declined prompt, or a failed trust
+    /// write. Safe to retry later — the same session may succeed next time.
+    Unchanged,
+    /// No interactive session exists to show the trust prompt (e.g. a headless
+    /// `nono proxy`). Retrying later in the same session can't succeed either.
+    NoInteraction,
+}
+
 /// Re-issue the shared CA over its stored key and retire the previous certificate.
-///
-/// `Ok(None)` means nothing changed: no stored CA, or a declined trust prompt.
-pub(crate) fn renew_shared_ca(validity: Duration) -> Result<Option<PreloadedCa>> {
+pub(crate) fn renew_shared_ca(validity: Duration) -> Result<RenewOutcome> {
     let Some((key_der, cert_pem)) = load_existing_ca()? else {
-        return Ok(None);
+        return Ok(RenewOutcome::Unchanged);
     };
     let state = cert_validity(&cert_pem)?;
     match rotate_ca(&key_der, &cert_pem, validity, state)? {
-        Some(ca) if ca.cert_pem != cert_pem => Ok(Some(ca)),
-        _ => Ok(None),
+        RotateOutcome::Cert(ca) if ca.cert_pem != cert_pem => Ok(RenewOutcome::Renewed(ca)),
+        RotateOutcome::NoInteraction => Ok(RenewOutcome::NoInteraction),
+        RotateOutcome::Cert(_) | RotateOutcome::Unavailable => Ok(RenewOutcome::Unchanged),
     }
 }
 
@@ -166,6 +186,23 @@ fn load_existing_ca() -> Result<Option<(Zeroizing<Vec<u8>>, String)>> {
         .map_err(|e| NonoError::SandboxInit(format!("{e}")))
 }
 
+/// Outcome of attempting to re-issue and re-trust the shared CA over its
+/// stored key. Internal to the rotate/generate fallback chain — callers see
+/// [`RenewOutcome`] (mid-session) or a plain `Option` (launch).
+enum RotateOutcome {
+    /// A certificate to serve: either genuinely re-issued, or (when the
+    /// prompt was declined but the old one still has life left) the
+    /// unchanged previous certificate.
+    Cert(PreloadedCa),
+    /// Declined or failed, and the previous certificate has expired; caller
+    /// falls back to an ephemeral CA.
+    Unavailable,
+    /// No interactive session exists to show the trust prompt (e.g. a
+    /// headless `nono proxy`). Retrying later in the same session can't
+    /// succeed either.
+    NoInteraction,
+}
+
 /// Re-issue the CA certificate over the stored key and hand the new one over.
 ///
 /// Trust the new cert before retiring the old, so nothing fails mid-swap. The key is
@@ -175,7 +212,7 @@ fn rotate_ca(
     old_cert_pem: &str,
     validity: Duration,
     state: CertValidity,
-) -> Result<Option<PreloadedCa>> {
+) -> Result<RotateOutcome> {
     let ca = match nono_proxy::tls_intercept::ca::EphemeralCa::reissue_with_cn(
         key_der,
         "nono-proxy-ca",
@@ -187,7 +224,10 @@ fn rotate_ca(
             warn!("Cannot re-issue over the stored proxy CA key ({e}); generating a new CA.");
             remove_cert_from_keychain(old_cert_pem);
             delete_existing_ca();
-            return generate_and_trust_new_ca(validity);
+            return Ok(match generate_and_trust_new_ca(validity)? {
+                Some(ca) => RotateOutcome::Cert(ca),
+                None => RotateOutcome::Unavailable,
+            });
         }
     };
     let cert_pem = ca.cert_pem().to_string();
@@ -206,7 +246,7 @@ fn rotate_ca(
                         "Proxy CA renewal cancelled; continuing on the current \
                          certificate. It will be retried next launch."
                     );
-                    return Ok(Some(PreloadedCa {
+                    return Ok(RotateOutcome::Cert(PreloadedCa {
                         key_der: key_der.clone(),
                         cert_pem: old_cert_pem.to_string(),
                     }));
@@ -216,7 +256,14 @@ fn rotate_ca(
                      expired. Falling back to ephemeral CA; Go CLI tools won't \
                      validate proxy certs."
                 );
-                return Ok(None);
+                return Ok(RotateOutcome::Unavailable);
+            }
+            TrustCertError::NoInteractionAvailable => {
+                warn!(
+                    "Proxy CA renewal needs authentication but no interactive session is \
+                     available to authorize it. Continuing on the current certificate."
+                );
+                return Ok(RotateOutcome::NoInteraction);
             }
             TrustCertError::Other(err) => return Err(err),
         }
@@ -232,10 +279,9 @@ fn rotate_ca(
         })?;
 
     remove_cert_from_keychain(old_cert_pem);
-    flush_trust_cache();
 
     info!("Proxy CA renewed");
-    Ok(Some(PreloadedCa {
+    Ok(RotateOutcome::Cert(PreloadedCa {
         key_der: Zeroizing::new(ca.key_der().to_vec()),
         cert_pem,
     }))
@@ -267,9 +313,9 @@ fn generate_and_trust_new_ca(validity: Duration) -> Result<Option<PreloadedCa>> 
         // doesn't linger untrusted and confuse the next session's load path.
         delete_existing_ca();
         match e {
-            TrustCertError::UserCancelled => {
+            TrustCertError::UserCancelled | TrustCertError::NoInteractionAvailable => {
                 warn!(
-                    "Trust store auth cancelled. Falling back to ephemeral CA. \
+                    "Trust store auth cancelled or unavailable. Falling back to ephemeral CA. \
                      Go CLI tools won't validate proxy certs; other tools still work."
                 );
                 return Ok(None);
@@ -299,13 +345,13 @@ fn ensure_cert_in_keychain(cert: &SecCertificate) -> Result<()> {
 /// OSStatus codes that indicate the user refused the authentication prompt.
 const ERR_SEC_USER_CANCELED: i32 = -128;
 const ERR_SEC_AUTH_FAILED: i32 = -25293;
+/// No interactive session exists to show the prompt at all (e.g. a headless
+/// `nono proxy`). Distinct from a decline: retrying later in the same session
+/// can't succeed either, since there's still nobody to ask.
 const ERR_SEC_INTERACTION_NOT_ALLOWED: i32 = -25308;
 
 fn is_user_cancelled_osstatus(code: i32) -> bool {
-    matches!(
-        code,
-        ERR_SEC_USER_CANCELED | ERR_SEC_AUTH_FAILED | ERR_SEC_INTERACTION_NOT_ALLOWED
-    )
+    matches!(code, ERR_SEC_USER_CANCELED | ERR_SEC_AUTH_FAILED)
 }
 
 fn trust_cert(cert: &SecCertificate) -> std::result::Result<(), TrustCertError> {
@@ -313,7 +359,9 @@ fn trust_cert(cert: &SecCertificate) -> std::result::Result<(), TrustCertError> 
     TrustSettings::new(Domain::User)
         .set_trust_settings_always(cert)
         .map_err(|e| {
-            if is_user_cancelled_osstatus(e.code()) {
+            if e.code() == ERR_SEC_INTERACTION_NOT_ALLOWED {
+                TrustCertError::NoInteractionAvailable
+            } else if is_user_cancelled_osstatus(e.code()) {
                 TrustCertError::UserCancelled
             } else {
                 TrustCertError::Other(NonoError::SandboxInit(format!(
@@ -486,21 +534,6 @@ fn classify_validity(not_after: i64, now: i64, headroom: Duration) -> CertValidi
     }
 }
 
-/// Trust settings live in a data vault with no cache-invalidation API, so restarting
-/// `trustd` is the only reliable flush. Best-effort: a stale cache only delays.
-///
-/// Unprivileged `killall` only signals the invoking user's own processes, so this
-/// restarts the per-user `trustd` and doesn't affect other users' sessions.
-fn flush_trust_cache() {
-    match std::process::Command::new("/usr/bin/killall")
-        .args(["-q", "trustd"])
-        .status()
-    {
-        Ok(status) => debug!("trustd flush exited with {status}"),
-        Err(e) => debug!("could not run killall to flush trustd: {e}"),
-    }
-}
-
 fn pem_to_der(cert_pem: &str) -> Result<Vec<u8>> {
     let (_, pem) = parse_x509_pem(cert_pem.as_bytes())
         .map_err(|e| NonoError::SandboxInit(format!("failed to parse CA cert PEM: {e}")))?;
@@ -651,8 +684,9 @@ mod tests {
     fn is_user_cancelled_osstatus_detects_known_codes() {
         assert!(is_user_cancelled_osstatus(ERR_SEC_USER_CANCELED));
         assert!(is_user_cancelled_osstatus(ERR_SEC_AUTH_FAILED));
-        assert!(is_user_cancelled_osstatus(ERR_SEC_INTERACTION_NOT_ALLOWED));
         assert!(!is_user_cancelled_osstatus(-25299)); // errSecDuplicateItem
         assert!(!is_user_cancelled_osstatus(0));
+        // interaction-not-allowed is a distinct case, handled separately in trust_cert
+        assert!(!is_user_cancelled_osstatus(ERR_SEC_INTERACTION_NOT_ALLOWED));
     }
 }

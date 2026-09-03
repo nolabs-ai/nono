@@ -4,35 +4,37 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
     # Pin x86_64-darwin to a stable release branch for older macOS Intel
-    # compatibility. See references/flake-templates/darwin-legacy-pin.md.
-    nixpkgs-darwin-legacy.url = "github:NixOS/nixpkgs/nixpkgs-24.05-darwin";
+    # compatibility. Bumped from 24.05 to 26.05 because the project requires
+    # Rust 1.95 (edition2024), which 24.05-darwin does not ship.
+    # See references/flake-templates/darwin-legacy-pin.md.
+    nixpkgs-darwin-legacy.url = "github:NixOS/nixpkgs/nixpkgs-26.05-darwin";
   };
 
   outputs = { self, nixpkgs, nixpkgs-darwin-legacy, ... }:
   let
-    version = "0.71.0";
+    version = "0.75.0";
 
     assets = {
       "x86_64-linux" = {
         file = "nono-v${version}-x86_64-unknown-linux-gnu.tar.gz";
-        sha256 = "sha256-nuKWYYTor6ZkGZwh4Inq5ZbI12M3GiUxBGI+D1sPCi0=";
+        sha256 = "sha256-L4gyaYJNhflqdfuHiPbDFhnmDSwIZek0AtLzR0YQVPo=";
       };
       "aarch64-linux" = {
         file = "nono-v${version}-aarch64-unknown-linux-gnu.tar.gz";
-        sha256 = "sha256-81+Xnasz1gS+RCME8ZRfYL/XoOal333Yw9Q6vc35IaE=";
+        sha256 = "sha256-xdIUIHerCbA4Kc9aA8IU6rdh4mpEC5ZIWPWJUNuTzQA=";
       };
       "x86_64-darwin" = {
         file = "nono-v${version}-x86_64-apple-darwin.tar.gz";
-        sha256 = "sha256-yg/z4k0Evjxx92romLBp78H9uGXb5+1PR3r3BkzaIso=";
+        sha256 = "sha256-9GDpKoIHUqib4G7/Z7iIIn5NuvmeBa27Nt0CfOtJgj4=";
       };
       "aarch64-darwin" = {
         file = "nono-v${version}-aarch64-apple-darwin.tar.gz";
-        sha256 = "sha256-1kJYcpdhmIdegmi4uMdfcE6l+47OdPzT/MHlG27XcFk=";
+        sha256 = "sha256-fzPxE7GTkAYAtUlRwwYTetfgQ0at66oUKDx1K3Zzx9A=";
       };
     };
 
     allSystems = builtins.attrNames assets;
-    forAllSystems = f: nixpkgs.lib.genAttrs allSystems (system: f system);
+    forAllSystems = f: nixpkgs.lib.genAttrs allSystems f;
 
     # Prebuilt binary from release tarball
     prebuiltFor = system: let
@@ -47,7 +49,7 @@
 
       src = pkgs.fetchurl {
         url = "https://github.com/nolabs-ai/nono/releases/download/v${version}/${asset.file}";
-        sha256 = asset.sha256;
+        inherit (asset) sha256;
       };
 
       sourceRoot = ".";
@@ -94,14 +96,19 @@
         owner = "nolabs-ai";
         repo = "nono";
         rev = "v${version}";
-        hash = "sha256-Xrqd8Do1R2kCwTAmju2VmOLAf329eoOSslfa8i9ogJc=";
+        hash = "sha256-4HrWe6RamlfXJ1hDIc+E80a+lDxuHWzeXmpkuRp0r7U=";
       };
 
-      cargoHash = "sha256-bMGrLh3DEA3yJsyb62Xdt+SfhzFY5VXawai4V6xttpI=";
+      cargoHash = "sha256-N6lyAQJeFm9Aa78hYW1vMQ+IBHUhxfqGKAb5TH3oyh4=";
 
       nativeBuildInputs = [ pkgs.pkg-config ];
 
       buildInputs = [ pkgs.dbus ];
+
+      # Tests are run by the project's own CI, not the Nix flake. Many tests
+      # fail in the Nix sandbox (require /bin/pwd, /usr/bin/env, git, /var/folders,
+      # network, etc.) — the upstream nixpkgs derivation skips the same tests.
+      doCheck = false;
 
       meta = {
         description = "Secure, kernel-enforced sandbox for AI agents, MCP and LLM workloads";
@@ -154,13 +161,7 @@
     in {
       default = pkgs.mkShell {
         nativeBuildInputs = [ pkgs.pkg-config ];
-        buildInputs =
-          [ pkgs.dbus pkgs.rustc pkgs.cargo ]
-          ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
-            pkgs.libiconv
-            pkgs.darwin.apple_sdk.frameworks.Security
-            pkgs.darwin.apple_sdk.frameworks.SystemConfiguration
-          ];
+        buildInputs = [ pkgs.dbus pkgs.rustc pkgs.cargo ];
       };
     });
   };

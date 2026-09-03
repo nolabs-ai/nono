@@ -17,3 +17,7 @@ diagnostics.json
 # Library tests
 bindings/python/.venv*
 bindings/node/node_modules*
+
+# Nix build artifacts
+/result
+/result-*

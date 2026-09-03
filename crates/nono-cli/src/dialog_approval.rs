@@ -623,25 +623,30 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_denies_without_display() {
-        use std::sync::{Mutex, OnceLock};
-        // Serialize env mutation across tests in this process.
-        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock();
+        let _guard = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
 
         let saved_wayland = std::env::var_os("WAYLAND_DISPLAY");
         let saved_x11 = std::env::var_os("DISPLAY");
-        std::env::remove_var("WAYLAND_DISPLAY");
-        std::env::remove_var("DISPLAY");
+        // SAFETY: test holds crate::test_env::ENV_LOCK, serializing all env mutations.
+        unsafe {
+            std::env::remove_var("WAYLAND_DISPLAY");
+            std::env::remove_var("DISPLAY");
+        }
 
         let backend = DialogApproval::new("desktop", &config(Some(1)));
         let decision = backend.request_approval(&command_request(None));
 
         // Restore before asserting so a failure can't leak env state.
-        if let Some(v) = saved_wayland {
-            std::env::set_var("WAYLAND_DISPLAY", v);
-        }
-        if let Some(v) = saved_x11 {
-            std::env::set_var("DISPLAY", v);
+        // SAFETY: test holds crate::test_env::ENV_LOCK, serializing all env mutations.
+        unsafe {
+            if let Some(v) = saved_wayland {
+                std::env::set_var("WAYLAND_DISPLAY", v);
+            }
+            if let Some(v) = saved_x11 {
+                std::env::set_var("DISPLAY", v);
+            }
         }
 
         match decision {

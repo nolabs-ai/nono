@@ -378,6 +378,7 @@ pub struct ApprovalBackendConfig {
 #[serde(rename_all = "kebab-case")]
 pub enum ApprovalBackendType {
     Terminal,
+    Dialog,
     Webhook,
     Chain,
 }
@@ -2152,6 +2153,17 @@ fn validate_approval_backend(
                 report.error(
                     "invalid_approval_backend",
                     format!("approval backend '{name}' type terminal cannot define url, mode, or backends"),
+                );
+            }
+        }
+        ApprovalBackendType::Dialog => {
+            // Dialog takes only an optional timeout_secs (validated below).
+            if backend.url.is_some() || backend.mode.is_some() || !backend.backends.is_empty() {
+                report.error(
+                    "invalid_approval_backend",
+                    format!(
+                        "approval backend '{name}' type dialog cannot define url, mode, or backends"
+                    ),
                 );
             }
         }
@@ -5981,6 +5993,39 @@ mod tests {
         );
         match validate_security_approval_backends(&backends, None) {
             Ok(()) => panic!("a terminal backend with a url must be rejected"),
+            Err(err) => assert!(err.to_string().contains("cannot define url"), "{err}"),
+        }
+    }
+
+    #[test]
+    fn security_approval_backends_accepts_dialog_with_timeout() {
+        let mut backends = BTreeMap::new();
+        backends.insert(
+            "desktop".to_string(),
+            ApprovalBackendConfig {
+                timeout_secs: Some(45),
+                ..security_backend(ApprovalBackendType::Dialog)
+            },
+        );
+        let defaults = ApprovalDefaultsConfig {
+            backend: Some("desktop".to_string()),
+            timeout_secs: None,
+        };
+        assert!(validate_security_approval_backends(&backends, Some(&defaults)).is_ok());
+    }
+
+    #[test]
+    fn security_approval_backends_rejects_dialog_with_url() {
+        let mut backends = BTreeMap::new();
+        backends.insert(
+            "desktop".to_string(),
+            ApprovalBackendConfig {
+                url: Some("https://nope.example".to_string()),
+                ..security_backend(ApprovalBackendType::Dialog)
+            },
+        );
+        match validate_security_approval_backends(&backends, None) {
+            Ok(()) => panic!("a dialog backend with a url must be rejected"),
             Err(err) => assert!(err.to_string().contains("cannot define url"), "{err}"),
         }
     }

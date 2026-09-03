@@ -127,6 +127,47 @@ fn access_mode_label(access: &nono::AccessMode) -> &'static str {
     }
 }
 
+/// Format a `Label: value` line, wrapping long values with a hanging indent.
+///
+/// Lines longer than `WRAP_WIDTH` chars are broken at word boundaries. Each
+/// continuation is indented by the label width so columns stay aligned.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn wrap_command_line(label: &str, value: &str) -> String {
+    const WRAP_WIDTH: usize = 80;
+    let prefix = format!("{label}: ");
+    let indent = " ".repeat(prefix.len());
+    let available = WRAP_WIDTH.saturating_sub(prefix.len());
+
+    let mut out = String::new();
+    let mut line_buf = String::new();
+    for token in value.split_whitespace() {
+        if line_buf.is_empty() {
+            line_buf.push_str(token);
+        } else if line_buf.len() + 1 + token.len() <= available {
+            line_buf.push(' ');
+            line_buf.push_str(token);
+        } else {
+            if out.is_empty() {
+                out.push_str(&prefix);
+            } else {
+                out.push_str(&indent);
+            }
+            out.push_str(&line_buf);
+            out.push('\n');
+            line_buf.clear();
+            line_buf.push_str(token);
+        }
+    }
+    if out.is_empty() {
+        out.push_str(&prefix);
+    } else {
+        out.push_str(&indent);
+    }
+    out.push_str(&line_buf);
+    out.push('\n');
+    out
+}
+
 /// Build the human-readable dialog body for a request.
 ///
 /// The returned string always starts with a fixed, non-`-` prefix so that when
@@ -168,11 +209,13 @@ fn build_message(request: &ApprovalRequest) -> String {
             ..
         } => {
             m.push_str("Type: Command launch\n");
-            m.push_str(&format!("Command: {}\n", field(command)));
-            let display_args: Vec<String> = args.iter().skip(1).map(|a| field(a)).collect();
-            if !display_args.is_empty() {
-                m.push_str(&format!("Args: {}\n", display_args.join(" ")));
-            }
+            let full_args: Vec<String> = args.iter().skip(1).map(|a| field(a)).collect();
+            let full_cmd = if full_args.is_empty() {
+                field(command)
+            } else {
+                format!("{} {}", field(command), full_args.join(" "))
+            };
+            m.push_str(&wrap_command_line("Command", &full_cmd));
             m.push_str(&format!("Caller: {}\n", field(caller)));
             append_reason(&mut m, reason);
         }

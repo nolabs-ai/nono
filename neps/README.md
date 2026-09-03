@@ -70,4 +70,3 @@ whoever merges second renumbering their file.
 | NEP  | Title                     | Status   |
 |------|---------------------------|----------|
 | 0000 | NEP process               | accepted |
-| 0001 | Network approval backends | accepted |

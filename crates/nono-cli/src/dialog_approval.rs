@@ -369,7 +369,7 @@ const OSASCRIPT_NETWORK_PROGRAM: &str = r#"on run argv
     set allowSession to "Always allow (this session)"
     set denyOnce to "Deny once"
     set denySession to "Always deny (this session)"
-    set theResult to choose from list {allowOnce, allowSession, denyOnce, denySession} with title theTitle with prompt theText default items {denyOnce} OK button name "Choose" cancel button name "Deny"
+    set theResult to choose from list {denyOnce, allowOnce, allowSession, denySession} with title theTitle with prompt theText default items {denyOnce} OK button name "Choose" cancel button name "Deny"
     if theResult is false then
         return "DENY"
     end if
@@ -556,9 +556,9 @@ fn detect_and_prompt(
                 .arg(format!("--text={message}"))
                 .arg("--column=Action")
                 .arg("--hide-header")
+                .arg(NET_DENY_ONCE)
                 .arg(NET_ALLOW_ONCE)
                 .arg(NET_ALLOW_SESSION)
-                .arg(NET_DENY_ONCE)
                 .arg(NET_DENY_SESSION)
                 .arg(format!("--timeout={secs}"));
             match run_with_timeout(cmd, wall)? {
@@ -605,12 +605,12 @@ fn detect_and_prompt(
                 .arg(TITLE)
                 .arg("--menu")
                 .arg(&message)
+                .arg("deny")
+                .arg(NET_DENY_ONCE)
                 .arg("allow")
                 .arg(NET_ALLOW_ONCE)
                 .arg("allow_session")
                 .arg(NET_ALLOW_SESSION)
-                .arg("deny")
-                .arg(NET_DENY_ONCE)
                 .arg("deny_session")
                 .arg(NET_DENY_SESSION);
             match run_with_timeout(cmd, wall)? {

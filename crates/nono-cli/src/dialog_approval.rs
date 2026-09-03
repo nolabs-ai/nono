@@ -76,6 +76,20 @@ impl ApprovalBackend for DialogApproval {
     fn backend_name(&self) -> &str {
         &self.name
     }
+
+    fn approval_timeout(&self) -> Option<std::time::Duration> {
+        // The dialog engines force-close at `timeout + WALL_CLOCK_GRACE` (see
+        // `run_with_timeout`), so report that ceiling as the hint. On platforms
+        // with no dialog engine the prompt short-circuits to a denial anyway.
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            Some(self.timeout.saturating_add(WALL_CLOCK_GRACE))
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            Some(self.timeout)
+        }
+    }
 }
 
 // ── shared message construction (unix engines) ───────────────────────────────

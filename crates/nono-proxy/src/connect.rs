@@ -22,19 +22,74 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::sync::watch;
 use tracing::{debug, warn};
 use zeroize::Zeroizing;
 
 /// Timeout for upstream TCP connect.
 const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Backstop wall-clock cap on an interactive network-approval prompt.
+/// Grace added on top of a backend's own configured timeout when sizing the
+/// backstop deadline, so the backstop never preempts a legitimately-configured
+/// (possibly long) prompt timeout — the backend's own timeout fires first,
+/// yielding a clean `Timeout` decision.
+const NETWORK_APPROVAL_BACKSTOP_GRACE: Duration = Duration::from_secs(30);
+
+/// Backstop wall-clock cap applied only to a backend that reports no timeout of
+/// its own ([`nono::ApprovalBackend::approval_timeout`] returns `None`, e.g. a
+/// `terminal` backend blocking on `/dev/tty`). Without this, such a backend
+/// could pin a blocking-pool thread indefinitely. On expiry the request is
+/// denied. A backend that reports a timeout is instead bounded by that timeout
+/// plus [`NETWORK_APPROVAL_BACKSTOP_GRACE`].
+const NETWORK_APPROVAL_UNBOUNDED_BACKSTOP: Duration = Duration::from_secs(600);
+
+/// Map coordinating in-flight approval prompts, keyed by `(host, port)`, so
+/// concurrent first-touch connections to the same host share a single prompt.
+pub type InFlightMap = Mutex<HashMap<(String, u16), Arc<InFlight>>>;
+
+/// Shared slot coordinating concurrent first-touch approval attempts for one
+/// `(host, port)`.
 ///
-/// Each configured backend enforces its own (usually shorter) timeout — the
-/// dialog force-kills, the webhook has an HTTP deadline. This only bounds a
-/// backend that could otherwise block a blocking-pool thread indefinitely (e.g.
-/// a `terminal` backend reading `/dev/tty`). On expiry the request is denied.
-const NETWORK_APPROVAL_HARD_TIMEOUT: Duration = Duration::from_secs(600);
+/// The first connection to a not-yet-decided host (the leader) fires the
+/// prompt; concurrent connections (followers) await the leader's decision
+/// instead of firing a duplicate prompt. This is a UX de-duplication only —
+/// each connection still independently re-resolves and re-vets the host against
+/// the SSRF guard before connecting, so coalescing the *decision* never widens
+/// the security check.
+pub struct InFlight {
+    /// `None` until the leader decides, then `Some(allow)`.
+    tx: watch::Sender<Option<bool>>,
+}
+
+impl InFlight {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            tx: watch::channel(None).0,
+        })
+    }
+
+    /// Publish the leader's decision to any waiting followers.
+    fn resolve(&self, allow: bool) {
+        // Ignored error means no followers are listening — nothing to do.
+        let _ = self.tx.send(Some(allow));
+    }
+
+    /// Await the leader's decision. Returns the leader's `allow` boolean, or
+    /// `false` (fail secure) if the leader vanished without deciding.
+    async fn await_decision(&self) -> bool {
+        let mut rx = self.tx.subscribe();
+        loop {
+            if let Some(allow) = *rx.borrow_and_update() {
+                return allow;
+            }
+            if rx.changed().await.is_err() {
+                // All senders dropped without a decision (leader task gone):
+                // deny rather than hang or fail open.
+                return false;
+            }
+        }
+    }
+}
 
 /// Interactive network-approval context threaded into the CONNECT handler.
 ///
@@ -49,6 +104,9 @@ pub struct NetworkApproval<'a> {
     /// handled by one proxy (one session), so "Always allow"/"Always deny"
     /// suppress re-prompting for the rest of the session.
     pub session_decisions: &'a Mutex<HashMap<(String, u16), bool>>,
+    /// In-flight prompt coordination so concurrent first-touch connections to
+    /// the same host share one prompt instead of stacking duplicate dialogs.
+    pub in_flight: &'a InFlightMap,
     /// Session identifier recorded in the approval request.
     pub session_id: &'a str,
 }
@@ -138,12 +196,44 @@ pub async fn handle_connect(
     // it (or approved it earlier this session) — but only a plain allowlist
     // miss is eligible; metadata / link-local / deny-list denials are hard and
     // never reach a prompt. See `maybe_approve_host`.
+    //
+    // `approved_backend` carries the approval backend name when the host was
+    // authorized by an operator decision (interactive or session-cached), so
+    // the success audit below records `ApproveGranted` rather than a plain
+    // allowlist `Allow` — keeping the audit trail able to distinguish a runtime
+    // approval from a static allowlist hit.
+    let mut approved_backend: Option<String> = None;
     let resolved: Vec<SocketAddr> = if check.result.is_allowed() {
         check.resolved_addrs
     } else {
         match maybe_approve_host(&host, port, &check.result, network_approval, filter).await? {
-            Some(addrs) => addrs,
-            None => {
+            ApprovalOutcome::Approved { addrs, backend } => {
+                approved_backend = Some(backend);
+                addrs
+            }
+            ApprovalOutcome::Denied { backend, reason } => {
+                // The operator (or a cached session decision / backend) refused
+                // this host, or the approved host was blocked by the SSRF guard.
+                // Record it as an approval denial, distinct from a static deny.
+                let reason = reason.unwrap_or_else(|| check.result.reason());
+                audit::log_connect_approval(
+                    audit_log,
+                    &audit::EventContext {
+                        denial_category: Some(nono::undo::NetworkAuditDenialCategory::HostDenied),
+                        approval_backend: Some(&backend),
+                        ..audit::EventContext::default()
+                    },
+                    &host,
+                    port,
+                    nono::undo::NetworkAuditDecision::ApproveDenied,
+                    Some(&reason),
+                );
+                send_response(stream, 403, &format!("Forbidden: {}", reason)).await?;
+                return Err(ProxyError::HostDenied { host, reason });
+            }
+            ApprovalOutcome::NotApplicable => {
+                // Not approval-eligible (hard SSRF/deny-list denial) or no
+                // backend configured: the historical static-deny audit path.
                 let reason = check.result.reason();
                 audit::log_denied(
                     audit_log,
@@ -199,14 +289,30 @@ pub async fn handle_connect(
 
     // Send 200 Connection Established
     send_response(stream, 200, "Connection Established").await?;
-    audit::log_allowed(
-        audit_log,
-        audit::ProxyMode::Connect,
-        &audit::EventContext::default(),
-        &host,
-        port,
-        "CONNECT",
-    );
+    if let Some(backend) = approved_backend.as_deref() {
+        // Host was authorized by a runtime approval decision, not the static
+        // allowlist — record it as such, with the deciding backend.
+        audit::log_connect_approval(
+            audit_log,
+            &audit::EventContext {
+                approval_backend: Some(backend),
+                ..audit::EventContext::default()
+            },
+            &host,
+            port,
+            nono::undo::NetworkAuditDecision::ApproveGranted,
+            None,
+        );
+    } else {
+        audit::log_allowed(
+            audit_log,
+            audit::ProxyMode::Connect,
+            &audit::EventContext::default(),
+            &host,
+            port,
+            "CONNECT",
+        );
+    }
 
     // Bidirectional relay
     let result = tokio::io::copy_bidirectional(stream, &mut upstream).await;
@@ -215,50 +321,118 @@ pub async fn handle_connect(
     Ok(())
 }
 
+/// The result of evaluating a not-allowlisted host for interactive approval.
+enum ApprovalOutcome {
+    /// Not approval-eligible (a hard SSRF/deny-list denial), or no approval
+    /// backend is configured. The caller uses the historical static-deny path.
+    NotApplicable,
+    /// Authorized by an operator decision (interactive, or a cached session
+    /// decision). `addrs` are freshly resolved and re-vetted against the SSRF
+    /// guard, safe to connect to without re-resolving. `backend` is the
+    /// deciding backend's name, for the audit trail.
+    Approved {
+        addrs: Vec<SocketAddr>,
+        backend: String,
+    },
+    /// Refused by the operator (interactive or cached), by the backend, on
+    /// timeout/error (fail secure), or because the approved host resolved to an
+    /// address the SSRF guard blocks. `backend` is the deciding backend's name;
+    /// `reason` overrides the default 403 reason when set (e.g. SSRF block).
+    Denied {
+        backend: String,
+        reason: Option<String>,
+    },
+}
+
 /// Decide whether a not-allowed host may still be tunnelled, via the session
 /// cache or an interactive approval prompt.
-///
-/// Returns `Ok(Some(addrs))` when the connection is authorized — `addrs` are
-/// freshly resolved and re-vetted against the SSRF guard, safe to connect to
-/// without re-resolving. Returns `Ok(None)` when the caller must send a 403:
-/// the host is not approval-eligible, no backend is configured, the operator
-/// (or a cached session decision) denied it, or the approval backend errored
-/// (fail-secure).
 ///
 /// Only a plain allowlist miss ([`FilterResult::DenyNotAllowed`]) is eligible.
 /// A metadata / link-local / deny-list denial ([`FilterResult::DenyHost`] /
 /// [`FilterResult::DenyLinkLocal`]) is authoritative and never prompts —
 /// approval can never override an SSRF-guard denial.
+///
+/// Concurrent first-touch connections to the same host coalesce onto a single
+/// prompt: the first (leader) prompts; the rest (followers) await its decision.
+/// Every authorized connection independently re-resolves and re-vets the host
+/// (see [`resolve_approved`]), so coalescing the decision never widens the SSRF
+/// check.
 async fn maybe_approve_host(
     host: &str,
     port: u16,
     result: &FilterResult,
     network_approval: Option<&NetworkApproval<'_>>,
     filter: &ProxyFilter,
-) -> Result<Option<Vec<SocketAddr>>> {
+) -> Result<ApprovalOutcome> {
     if !matches!(result, FilterResult::DenyNotAllowed { .. }) {
-        return Ok(None);
+        return Ok(ApprovalOutcome::NotApplicable);
     }
     let Some(approval) = network_approval else {
-        return Ok(None);
+        return Ok(ApprovalOutcome::NotApplicable);
     };
 
+    let backend_name = approval.backend.backend_name().to_string();
     let key = (host.to_string(), port);
 
     // Fast path: a session-scoped decision already exists — no re-prompt.
     if let Some(allow) = approval.cached_decision(&key) {
-        return if allow {
-            resolve_approved(filter, host, port).await
-        } else {
+        if !allow {
             debug!("network approval: {host}:{port} denied by session cache");
-            Ok(None)
-        };
+        }
+        return outcome_from_allow(allow, backend_name, filter, host, port).await;
     }
 
-    // `request_approval` is synchronous and may block (dialog subprocess,
-    // webhook HTTP, terminal read) — it must never run on a Tokio worker
-    // thread. Move it to the blocking pool and bound it with a backstop
-    // deadline so a wedged backend cannot hang the connection forever.
+    // Coalesce concurrent first-touch prompts: become the leader that prompts,
+    // or a follower that awaits the leader's decision.
+    let leader = {
+        let mut map = approval.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+        match map.get(&key) {
+            Some(existing) => Err(Arc::clone(existing)),
+            None => {
+                let shared = InFlight::new();
+                map.insert(key.clone(), Arc::clone(&shared));
+                Ok(shared)
+            }
+        }
+    };
+
+    let allow = match leader {
+        Err(follower) => follower.await_decision().await,
+        Ok(shared) => {
+            let allow = run_prompt(approval, &backend_name, host, port, &key).await;
+            // Publish to any waiting followers, then release the slot so a
+            // later burst re-prompts. Both happen unconditionally so a follower
+            // can never be left waiting on a vanished leader.
+            shared.resolve(allow);
+            approval
+                .in_flight
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&key);
+            allow
+        }
+    };
+
+    outcome_from_allow(allow, backend_name, filter, host, port).await
+}
+
+/// Run the interactive prompt as the leader and return the authorization
+/// boolean, populating the session cache for session-scoped decisions.
+///
+/// `request_approval` is synchronous and may block (dialog subprocess, webhook
+/// HTTP, terminal read), so it never runs on a Tokio worker thread — it is
+/// moved to the blocking pool and bounded by a backstop deadline. The backstop
+/// is derived from the backend's own configured timeout so it never preempts a
+/// legitimately-longer prompt; a backend that reports no timeout is capped by
+/// [`NETWORK_APPROVAL_UNBOUNDED_BACKSTOP`]. Any error, task failure, or backstop
+/// expiry fails secure (denies).
+async fn run_prompt(
+    approval: &NetworkApproval<'_>,
+    backend_name: &str,
+    host: &str,
+    port: u16,
+    key: &(String, u16),
+) -> bool {
     let request = ApprovalRequest::Network {
         request_id: format!("net-{host}:{port}"),
         host: host.to_string(),
@@ -269,39 +443,75 @@ async fn maybe_approve_host(
         child_pid: 0,
         session_id: approval.session_id.to_string(),
     };
+    let backstop = approval
+        .backend
+        .approval_timeout()
+        .map(|t| t.saturating_add(NETWORK_APPROVAL_BACKSTOP_GRACE))
+        .unwrap_or(NETWORK_APPROVAL_UNBOUNDED_BACKSTOP);
+
     let backend = Arc::clone(approval.backend);
     let decision = match tokio::time::timeout(
-        NETWORK_APPROVAL_HARD_TIMEOUT,
+        backstop,
         tokio::task::spawn_blocking(move || backend.request_approval(&request)),
     )
     .await
     {
         Ok(Ok(Ok(decision))) => decision,
         Ok(Ok(Err(e))) => {
-            warn!("network approval backend error for {host}:{port}: {e}");
-            return Ok(None);
+            warn!("network approval backend '{backend_name}' error for {host}:{port}: {e}");
+            return false;
         }
         Ok(Err(e)) => {
             warn!("network approval task failed for {host}:{port}: {e}");
-            return Ok(None);
+            return false;
         }
         Err(_) => {
             warn!("network approval timed out for {host}:{port}");
-            return Ok(None);
+            return false;
         }
     };
 
     match decision {
-        ApprovalDecision::Granted => resolve_approved(filter, host, port).await,
+        ApprovalDecision::Granted => true,
         ApprovalDecision::GrantedForSession => {
-            approval.remember(key, true);
-            resolve_approved(filter, host, port).await
+            approval.remember(key.clone(), true);
+            true
         }
         ApprovalDecision::DeniedForSession => {
-            approval.remember(key, false);
-            Ok(None)
+            approval.remember(key.clone(), false);
+            false
         }
-        ApprovalDecision::Denied { .. } | ApprovalDecision::Timeout => Ok(None),
+        ApprovalDecision::Denied { .. } | ApprovalDecision::Timeout => false,
+    }
+}
+
+/// Turn an authorization boolean into an [`ApprovalOutcome`], re-resolving and
+/// re-vetting the host against the SSRF guard on the allow path.
+async fn outcome_from_allow(
+    allow: bool,
+    backend: String,
+    filter: &ProxyFilter,
+    host: &str,
+    port: u16,
+) -> Result<ApprovalOutcome> {
+    if !allow {
+        return Ok(ApprovalOutcome::Denied {
+            backend,
+            reason: None,
+        });
+    }
+    match resolve_approved(filter, host, port).await? {
+        Some(addrs) => Ok(ApprovalOutcome::Approved { addrs, backend }),
+        None => {
+            warn!("network approval: {host}:{port} approved but blocked by SSRF guard");
+            Ok(ApprovalOutcome::Denied {
+                backend,
+                reason: Some(
+                    "approved host resolved to a blocked address (cloud-metadata/link-local guard)"
+                        .to_string(),
+                ),
+            })
+        }
     }
 }
 
@@ -320,7 +530,6 @@ async fn resolve_approved(
     if check.result.is_allowed() {
         Ok(Some(check.resolved_addrs))
     } else {
-        warn!("network approval: {host}:{port} approved but blocked by SSRF guard");
         Ok(None)
     }
 }
@@ -654,6 +863,20 @@ mod tests {
         }
     }
 
+    fn empty_in_flight() -> InFlightMap {
+        Mutex::new(HashMap::new())
+    }
+
+    impl ApprovalOutcome {
+        fn is_denied(&self) -> bool {
+            matches!(self, ApprovalOutcome::Denied { .. })
+        }
+
+        fn is_not_applicable(&self) -> bool {
+            matches!(self, ApprovalOutcome::NotApplicable)
+        }
+    }
+
     #[test]
     fn session_cache_round_trips_allow_and_deny() {
         let decisions = Mutex::new(HashMap::new());
@@ -663,9 +886,11 @@ mod tests {
             },
             calls: Arc::new(AtomicUsize::new(0)),
         });
+        let in_flight = empty_in_flight();
         let approval = NetworkApproval {
             backend: &backend,
             session_decisions: &decisions,
+            in_flight: &in_flight,
             session_id: "test",
         };
 
@@ -692,9 +917,11 @@ mod tests {
             decision: ApprovalDecision::Granted,
             calls: Arc::clone(&calls),
         });
+        let in_flight = empty_in_flight();
         let approval = NetworkApproval {
             backend: &backend,
             session_decisions: &decisions,
+            in_flight: &in_flight,
             session_id: "test",
         };
         let filter = ProxyFilter::allow_all();
@@ -709,7 +936,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(out.is_none());
+        assert!(out.is_not_applicable());
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
@@ -725,7 +952,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(out.is_none());
+        assert!(out.is_not_applicable());
     }
 
     #[tokio::test]
@@ -740,9 +967,11 @@ mod tests {
             decision: ApprovalDecision::Granted,
             calls: Arc::clone(&calls),
         });
+        let in_flight = empty_in_flight();
         let approval = NetworkApproval {
             backend: &backend,
             session_decisions: &decisions,
+            in_flight: &in_flight,
             session_id: "test",
         };
         let filter = ProxyFilter::new(&[]);
@@ -757,7 +986,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(out.is_none(), "cached deny must block the connection");
+        assert!(out.is_denied(), "cached deny must block the connection");
         assert_eq!(
             calls.load(Ordering::SeqCst),
             0,
@@ -773,9 +1002,11 @@ mod tests {
             decision: ApprovalDecision::DeniedForSession,
             calls: Arc::clone(&calls),
         });
+        let in_flight = empty_in_flight();
         let approval = NetworkApproval {
             backend: &backend,
             session_decisions: &decisions,
+            in_flight: &in_flight,
             session_id: "test",
         };
         let filter = ProxyFilter::new(&[]);
@@ -790,7 +1021,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(out.is_none());
+        assert!(out.is_denied());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(
             approval.cached_decision(&("blocked.example.com".to_string(), 443)),
@@ -809,9 +1040,11 @@ mod tests {
             },
             calls: Arc::clone(&calls),
         });
+        let in_flight = empty_in_flight();
         let approval = NetworkApproval {
             backend: &backend,
             session_decisions: &decisions,
+            in_flight: &in_flight,
             session_id: "test",
         };
         let filter = ProxyFilter::new(&[]);
@@ -826,12 +1059,88 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(out.is_none());
+        assert!(out.is_denied());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(
             approval.cached_decision(&("blocked.example.com".to_string(), 443)),
             None,
             "a one-shot Denied must not populate the session cache"
+        );
+    }
+
+    /// An approval backend that blocks briefly before answering, so a burst of
+    /// concurrent first-touch connections is guaranteed to overlap the leader's
+    /// prompt and exercise the follower path.
+    struct SlowBackend {
+        decision: ApprovalDecision,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl nono::ApprovalBackend for SlowBackend {
+        fn request_approval(&self, _request: &ApprovalRequest) -> nono::Result<ApprovalDecision> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(50));
+            Ok(self.decision.clone())
+        }
+
+        fn backend_name(&self) -> &str {
+            "slow"
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_first_touch_prompts_coalesce_onto_one_backend_call() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let decisions = Mutex::new(HashMap::new());
+        let backend: Arc<dyn nono::ApprovalBackend> = Arc::new(SlowBackend {
+            // A session denial avoids any DNS re-resolution on the allow path,
+            // keeping the test hermetic while still exercising coalescing.
+            decision: ApprovalDecision::DeniedForSession,
+            calls: Arc::clone(&calls),
+        });
+        let in_flight = empty_in_flight();
+        let approval = NetworkApproval {
+            backend: &backend,
+            session_decisions: &decisions,
+            in_flight: &in_flight,
+            session_id: "test",
+        };
+        let filter = ProxyFilter::new(&[]);
+
+        // Fire several concurrent first-touch attempts for the same host. They
+        // are polled on one task by `join!`, so the first to reach the in-flight
+        // lock leads and the rest follow its single prompt.
+        let result = deny_not_allowed("blocked.example.com");
+        let attempt = || {
+            maybe_approve_host(
+                "blocked.example.com",
+                443,
+                &result,
+                Some(&approval),
+                &filter,
+            )
+        };
+        let outcomes = tokio::join!(
+            attempt(),
+            attempt(),
+            attempt(),
+            attempt(),
+            attempt(),
+            attempt(),
+            attempt(),
+            attempt(),
+        );
+
+        for outcome in [
+            outcomes.0, outcomes.1, outcomes.2, outcomes.3, outcomes.4, outcomes.5, outcomes.6,
+            outcomes.7,
+        ] {
+            assert!(outcome.unwrap().is_denied());
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "concurrent first-touch prompts must coalesce onto a single backend call"
         );
     }
 }

@@ -3009,6 +3009,7 @@ pub(crate) fn start_proxy_runtime(
                 credential_capture_backend,
                 nonce_resolver,
                 network_approval_backend,
+                proxy.session_id.clone(),
             )
             .await
         })

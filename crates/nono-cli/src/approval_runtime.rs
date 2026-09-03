@@ -278,6 +278,10 @@ impl ApprovalBackend for WebhookApproval {
     fn backend_name(&self) -> &str {
         &self.name
     }
+
+    fn approval_timeout(&self) -> Option<Duration> {
+        Some(self.timeout)
+    }
 }
 
 struct ChainApproval {
@@ -296,6 +300,18 @@ impl ApprovalBackend for ChainApproval {
 
     fn backend_name(&self) -> &str {
         &self.name
+    }
+
+    fn approval_timeout(&self) -> Option<Duration> {
+        // Backends are consulted sequentially in both modes, so the worst-case
+        // wall-clock is the sum of their timeouts. If any child is unbounded
+        // (e.g. a terminal prompt), so is the chain — the caller applies its
+        // own floor. Saturating on overflow keeps the hint total.
+        let mut total = Duration::ZERO;
+        for backend in &self.backends {
+            total = total.saturating_add(backend.approval_timeout()?);
+        }
+        Some(total)
     }
 }
 

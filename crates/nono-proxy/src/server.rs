@@ -928,6 +928,15 @@ struct ProxyState {
     /// are not re-prompted. Lives for the proxy's lifetime (one session).
     network_session_decisions:
         Arc<std::sync::Mutex<std::collections::HashMap<(String, u16), bool>>>,
+    /// Coordinates concurrent first-touch network-approval prompts (keyed by
+    /// `(host, port)`) so a burst of connections to the same not-yet-decided
+    /// host shares one prompt instead of stacking duplicate dialogs. Lives for
+    /// the proxy's lifetime (one session).
+    network_inflight: Arc<connect::InFlightMap>,
+    /// Session identifier recorded in network approval requests, so a backend
+    /// (dialog/webhook) and the audit trail can attribute a prompt to the
+    /// originating sandbox session.
+    network_session_id: String,
     /// Optional supervisor-backed capture backend for command-backed credentials.
     credential_capture_backend: Option<Arc<dyn CredentialCaptureBackend>>,
     /// Optional resolver for tool-sandbox broker nonces found in request headers.
@@ -1058,6 +1067,7 @@ pub async fn start_with_nonce_resolver(
         credential_capture_backend,
         nonce_resolver,
         None,
+        String::new(),
     )
     .await
 }
@@ -1069,12 +1079,18 @@ pub async fn start_with_nonce_resolver(
 /// answers L7 endpoint-policy `approve` decisions): it gates the transparent
 /// CONNECT tunnel itself. When `None`, a not-allowed host is denied with an
 /// immediate 403, exactly as before.
+///
+/// `network_session_id` is recorded in each network approval request so the
+/// backend and audit trail can attribute a prompt to the originating sandbox
+/// session; pass an empty string when there is no session context.
+#[allow(clippy::too_many_arguments)]
 pub async fn start_with_network_approval(
     config: ProxyConfig,
     approval_backends: Option<crate::approval::ApprovalBackendRegistry>,
     credential_capture_backend: Option<Arc<dyn CredentialCaptureBackend>>,
     nonce_resolver: Option<Arc<dyn crate::token::NonceResolver>>,
     network_approval_backend: Option<Arc<dyn nono::ApprovalBackend>>,
+    network_session_id: String,
 ) -> Result<ProxyHandle> {
     validate_no_proxy_config(&config)?;
 
@@ -1373,6 +1389,8 @@ pub async fn start_with_network_approval(
         network_session_decisions: Arc::new(
             std::sync::Mutex::new(std::collections::HashMap::new()),
         ),
+        network_inflight: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        network_session_id,
         credential_capture_backend,
         nonce_resolver: effective_nonce_resolver,
         bypass_matcher,
@@ -1879,7 +1897,8 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
                 .map(|backend| connect::NetworkApproval {
                     backend,
                     session_decisions: state.network_session_decisions.as_ref(),
-                    session_id: "proxy",
+                    in_flight: state.network_inflight.as_ref(),
+                    session_id: &state.network_session_id,
                 });
 
         if let Some(ext_config) = use_external {

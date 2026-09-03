@@ -918,6 +918,16 @@ struct ProxyState {
     audit_log: Option<audit::SharedAuditLog>,
     /// Optional approval backend registry for L7 endpoint-policy approve routes.
     approval_backends: Option<crate::approval::ApprovalBackendRegistry>,
+    /// Optional backend that answers interactive approval prompts for CONNECT
+    /// hosts not on the allowlist (profile `network.approval_backends`). `None`
+    /// keeps the historical behavior: a not-allowed host gets an immediate 403.
+    network_approval_backend: Option<Arc<dyn nono::ApprovalBackend>>,
+    /// Session-scoped network approval decisions keyed by `(host, port)`
+    /// (`true` = allow, `false` = deny). Populated by "Always allow"/"Always
+    /// deny" choices so repeated connections to the same host within a session
+    /// are not re-prompted. Lives for the proxy's lifetime (one session).
+    network_session_decisions:
+        Arc<std::sync::Mutex<std::collections::HashMap<(String, u16), bool>>>,
     /// Optional supervisor-backed capture backend for command-backed credentials.
     credential_capture_backend: Option<Arc<dyn CredentialCaptureBackend>>,
     /// Optional resolver for tool-sandbox broker nonces found in request headers.
@@ -1041,6 +1051,30 @@ pub async fn start_with_nonce_resolver(
     approval_backends: Option<crate::approval::ApprovalBackendRegistry>,
     credential_capture_backend: Option<Arc<dyn CredentialCaptureBackend>>,
     nonce_resolver: Option<Arc<dyn crate::token::NonceResolver>>,
+) -> Result<ProxyHandle> {
+    start_with_network_approval(
+        config,
+        approval_backends,
+        credential_capture_backend,
+        nonce_resolver,
+        None,
+    )
+    .await
+}
+
+/// Start the proxy server with all optional backends, including an interactive
+/// approval backend for CONNECT hosts that are not on the allowlist.
+///
+/// `network_approval_backend` is distinct from `approval_backends` (which
+/// answers L7 endpoint-policy `approve` decisions): it gates the transparent
+/// CONNECT tunnel itself. When `None`, a not-allowed host is denied with an
+/// immediate 403, exactly as before.
+pub async fn start_with_network_approval(
+    config: ProxyConfig,
+    approval_backends: Option<crate::approval::ApprovalBackendRegistry>,
+    credential_capture_backend: Option<Arc<dyn CredentialCaptureBackend>>,
+    nonce_resolver: Option<Arc<dyn crate::token::NonceResolver>>,
+    network_approval_backend: Option<Arc<dyn nono::ApprovalBackend>>,
 ) -> Result<ProxyHandle> {
     validate_no_proxy_config(&config)?;
 
@@ -1335,6 +1369,10 @@ pub async fn start_with_nonce_resolver(
         active_connections: AtomicUsize::new(0),
         audit_log: audit_log.clone(),
         approval_backends,
+        network_approval_backend,
+        network_session_decisions: Arc::new(
+            std::sync::Mutex::new(std::collections::HashMap::new()),
+        ),
         credential_capture_backend,
         nonce_resolver: effective_nonce_resolver,
         bypass_matcher,
@@ -1830,6 +1868,20 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
             None
         };
 
+        // Interactive approval for CONNECT hosts not on the allowlist, when a
+        // `network.approval_backends` backend is configured. Shared session
+        // cache lets "Always allow"/"Always deny" suppress re-prompts. Not
+        // applied to the chained external-proxy path (that upstream enforces).
+        let network_approval =
+            state
+                .network_approval_backend
+                .as_ref()
+                .map(|backend| connect::NetworkApproval {
+                    backend,
+                    session_decisions: state.network_session_decisions.as_ref(),
+                    session_id: "proxy",
+                });
+
         if let Some(ext_config) = use_external {
             external::handle_external_proxy(
                 first_line,
@@ -1860,6 +1912,7 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
                 &header_bytes,
                 connect_auth_mode,
                 state.audit_log.as_ref(),
+                network_approval.as_ref(),
             )
             .await
         } else {
@@ -1871,6 +1924,7 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
                 &header_bytes,
                 connect_auth_mode,
                 state.audit_log.as_ref(),
+                network_approval.as_ref(),
             )
             .await
         }

@@ -1021,6 +1021,18 @@
           "type": "array",
           "items": { "type": "string" },
           "description": "Legacy alias for upstream_bypass."
+        },
+        "approval_backends": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/ApprovalBackendConfig" },
+          "description": "Where runtime host-approval prompts are sent when a CONNECT target is not on the allowlist. A named backend (terminal, dialog, webhook, or chain) answers the prompt; an approved host is tunnelled, a denied one gets a 403. Empty (default) keeps the immediate-403 behavior. Session-scoped 'Always allow'/'Always deny' answers suppress re-prompting for the rest of the session."
+        },
+        "approval_defaults": {
+          "oneOf": [
+            { "$ref": "#/$defs/ApprovalDefaultsConfig" },
+            { "type": "null" }
+          ],
+          "description": "Which entry in network.approval_backends answers host-approval prompts by default; 'backend' names it. When null, no prompt occurs unless approval_backends is set, in which case a default must resolve (we fail rather than guess)."
         }
       }
     },

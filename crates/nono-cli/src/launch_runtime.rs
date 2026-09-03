@@ -170,6 +170,13 @@ pub(crate) struct ProxyLaunchOptions {
     /// buffer. Set from `--no-audit`. Does not change filter, credentials,
     /// or fail-closed auth.
     pub(crate) audit_disabled: bool,
+    /// Named approval backends from the profile `network` section. When
+    /// non-empty, a CONNECT host that is not on the allowlist triggers a
+    /// runtime approval prompt instead of an immediate 403.
+    pub(crate) network_approval_backends:
+        std::collections::BTreeMap<String, crate::command_policy::ApprovalBackendConfig>,
+    /// Default routing for `network_approval_backends`.
+    pub(crate) network_approval_defaults: Option<crate::command_policy::ApprovalDefaultsConfig>,
 }
 
 impl ProxyLaunchOptions {

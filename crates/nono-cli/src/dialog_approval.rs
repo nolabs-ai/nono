@@ -339,6 +339,57 @@ const OSASCRIPT_PROGRAM: &str = r#"on run argv
     return "DENY"
 end run"#;
 
+/// AppleScript program for the Network variant, which offers four
+/// session-scoped choices. `display dialog` caps at three buttons, so we use
+/// `choose from list` instead. Choice labels are compile-time constants; all
+/// untrusted content stays in `theText` (the prompt), never in a choice.
+///
+/// `choose from list` has no "giving up after", so the dialog's own timeout does
+/// not apply here — the wall-clock backstop in `run_with_timeout` force-closes it
+/// and the caller maps that to `Timeout` (a denial). Cancel returns `false`.
+#[cfg(target_os = "macos")]
+const OSASCRIPT_NETWORK_PROGRAM: &str = r#"on run argv
+    set theText to item 1 of argv
+    set theTitle to item 2 of argv
+    set allowOnce to "Allow once"
+    set allowSession to "Always allow (this session)"
+    set denyOnce to "Deny once"
+    set denySession to "Always deny (this session)"
+    set theResult to choose from list {allowOnce, allowSession, denyOnce, denySession} with title theTitle with prompt theText default items {denyOnce} OK button name "Choose" cancel button name "Deny"
+    if theResult is false then
+        return "DENY"
+    end if
+    set chosen to item 1 of theResult
+    if chosen is allowOnce then
+        return "ALLOW"
+    else if chosen is allowSession then
+        return "ALLOW_SESSION"
+    else if chosen is denySession then
+        return "DENY_SESSION"
+    else
+        return "DENY"
+    end if
+end run"#;
+
+/// Map a dialog tool's decision token (from stdout) to an [`ApprovalDecision`].
+/// The four network tokens are produced only by the session-scoped engines;
+/// non-network prompts only ever emit `ALLOW`/`DENY`/`TIMEOUT`.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn decision_from_token(token: &str, unknown_reason: impl FnOnce() -> String) -> ApprovalDecision {
+    match token {
+        "ALLOW" => ApprovalDecision::Granted,
+        "ALLOW_SESSION" => ApprovalDecision::GrantedForSession,
+        "DENY_SESSION" => ApprovalDecision::DeniedForSession,
+        "TIMEOUT" => ApprovalDecision::Timeout,
+        "DENY" => ApprovalDecision::Denied {
+            reason: "user denied via dialog".to_string(),
+        },
+        _ => ApprovalDecision::Denied {
+            reason: unknown_reason(),
+        },
+    }
+}
+
 /// True only when the current process runs inside an Aqua (GUI login) session.
 ///
 /// A process reached over SSH runs in a non-Aqua domain even if a user is
@@ -367,31 +418,31 @@ fn detect_and_prompt(
     let message = build_message(request);
     let secs = timeout.as_secs().max(1);
     let wall = timeout.saturating_add(WALL_CLOCK_GRACE);
+    let is_network = matches!(request, ApprovalRequest::Network { .. });
 
     let mut cmd = std::process::Command::new("/usr/bin/osascript");
-    cmd.arg("-e")
-        .arg(OSASCRIPT_PROGRAM)
-        // argv items 1..=3 for the run handler. `message` begins with a fixed
-        // prefix, so it cannot be parsed as an osascript option.
-        .arg(&message)
-        .arg(TITLE)
-        .arg(secs.to_string());
+    cmd.arg("-e");
+    if is_network {
+        // The network program ignores the timeout arg (choose from list has no
+        // "giving up after"); the wall-clock backstop below handles it.
+        cmd.arg(OSASCRIPT_NETWORK_PROGRAM).arg(&message).arg(TITLE);
+    } else {
+        cmd.arg(OSASCRIPT_PROGRAM)
+            // argv items 1..=3 for the run handler. `message` begins with a
+            // fixed prefix, so it cannot be parsed as an osascript option.
+            .arg(&message)
+            .arg(TITLE)
+            .arg(secs.to_string());
+    }
 
     match run_with_timeout(cmd, wall)? {
         None => Ok(Some(ApprovalDecision::Timeout)),
-        Some((status, out)) => Ok(Some(match out.trim() {
-            "ALLOW" => ApprovalDecision::Granted,
-            "TIMEOUT" => ApprovalDecision::Timeout,
-            "DENY" => ApprovalDecision::Denied {
-                reason: "user denied via dialog".to_string(),
-            },
-            _ => ApprovalDecision::Denied {
-                reason: format!(
-                    "dialog approval could not be presented (osascript exit {:?})",
-                    status.code()
-                ),
-            },
-        })),
+        Some((status, out)) => Ok(Some(decision_from_token(out.trim(), || {
+            format!(
+                "dialog approval could not be presented (osascript exit {:?})",
+                status.code()
+            )
+        }))),
     }
 }
 
@@ -444,6 +495,29 @@ fn escape_markup(input: &str) -> String {
         .replace('>', "&gt;")
 }
 
+/// Session-scoped choice labels (zenity `--list` rows) and kdialog `--menu`
+/// tags. Compile-time constants: untrusted text never becomes a choice.
+#[cfg(target_os = "linux")]
+const NET_ALLOW_ONCE: &str = "Allow once";
+#[cfg(target_os = "linux")]
+const NET_ALLOW_SESSION: &str = "Always allow (this session)";
+#[cfg(target_os = "linux")]
+const NET_DENY_ONCE: &str = "Deny once";
+#[cfg(target_os = "linux")]
+const NET_DENY_SESSION: &str = "Always deny (this session)";
+
+/// Map a selected network choice (zenity row text or kdialog tag) to the token
+/// understood by [`decision_from_token`]. Anything unrecognized denies.
+#[cfg(target_os = "linux")]
+fn network_choice_token(selection: &str) -> &'static str {
+    match selection {
+        NET_ALLOW_ONCE | "allow" => "ALLOW",
+        NET_ALLOW_SESSION | "allow_session" => "ALLOW_SESSION",
+        NET_DENY_SESSION | "deny_session" => "DENY_SESSION",
+        _ => "DENY",
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn detect_and_prompt(
     request: &ApprovalRequest,
@@ -455,8 +529,37 @@ fn detect_and_prompt(
     let message = escape_markup(&build_message(request));
     let secs = timeout.as_secs().max(1);
     let wall = timeout.saturating_add(WALL_CLOCK_GRACE);
+    let is_network = matches!(request, ApprovalRequest::Network { .. });
 
     let decision = match dialog {
+        LinuxDialog::Zenity(path) if is_network => {
+            let mut cmd = std::process::Command::new(path);
+            // A single-column list of the four fixed choices. `--opt=value`
+            // binds untrusted values to their option; the row args are
+            // compile-time constants (never start with `-`).
+            cmd.arg("--list")
+                .arg(format!("--title={TITLE}"))
+                .arg(format!("--text={message}"))
+                .arg("--column=Action")
+                .arg("--hide-header")
+                .arg(NET_ALLOW_ONCE)
+                .arg(NET_ALLOW_SESSION)
+                .arg(NET_DENY_ONCE)
+                .arg(NET_DENY_SESSION)
+                .arg(format!("--timeout={secs}"));
+            match run_with_timeout(cmd, wall)? {
+                None => ApprovalDecision::Timeout,
+                Some((status, out)) => match status.code() {
+                    Some(0) => decision_from_token(network_choice_token(out.trim()), || {
+                        "user denied via dialog".to_string()
+                    }),
+                    Some(5) => ApprovalDecision::Timeout,
+                    _ => ApprovalDecision::Denied {
+                        reason: "user denied via dialog".to_string(),
+                    },
+                },
+            }
+        }
         LinuxDialog::Zenity(path) => {
             let mut cmd = std::process::Command::new(path);
             // `--opt=value` binds each untrusted value to its option, so it can
@@ -473,6 +576,35 @@ fn detect_and_prompt(
                 Some((status, _)) => match status.code() {
                     Some(0) => ApprovalDecision::Granted,
                     Some(5) => ApprovalDecision::Timeout,
+                    _ => ApprovalDecision::Denied {
+                        reason: "user denied via dialog".to_string(),
+                    },
+                },
+            }
+        }
+        LinuxDialog::Kdialog(path) if is_network => {
+            let mut cmd = std::process::Command::new(path);
+            // `--menu <text> <tag> <label> …` returns the chosen tag on stdout.
+            // The message is the `--menu` value and begins with a fixed prefix,
+            // so it is never parsed as an option; tags/labels are constants.
+            cmd.arg("--title")
+                .arg(TITLE)
+                .arg("--menu")
+                .arg(&message)
+                .arg("allow")
+                .arg(NET_ALLOW_ONCE)
+                .arg("allow_session")
+                .arg(NET_ALLOW_SESSION)
+                .arg("deny")
+                .arg(NET_DENY_ONCE)
+                .arg("deny_session")
+                .arg(NET_DENY_SESSION);
+            match run_with_timeout(cmd, wall)? {
+                None => ApprovalDecision::Timeout,
+                Some((status, out)) => match status.code() {
+                    Some(0) => decision_from_token(network_choice_token(out.trim()), || {
+                        "user denied via dialog".to_string()
+                    }),
                     _ => ApprovalDecision::Denied {
                         reason: "user denied via dialog".to_string(),
                     },
@@ -686,5 +818,57 @@ mod tests {
             }
             other => panic!("expected fail-secure Denied, got {other:?}"),
         }
+    }
+
+    // ── decision token mapping (session-scoped network choices) ───────────────
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn decision_from_token_maps_all_network_choices() {
+        assert!(matches!(
+            decision_from_token("ALLOW", || "x".to_string()),
+            ApprovalDecision::Granted
+        ));
+        assert!(matches!(
+            decision_from_token("ALLOW_SESSION", || "x".to_string()),
+            ApprovalDecision::GrantedForSession
+        ));
+        assert!(matches!(
+            decision_from_token("DENY_SESSION", || "x".to_string()),
+            ApprovalDecision::DeniedForSession
+        ));
+        assert!(matches!(
+            decision_from_token("TIMEOUT", || "x".to_string()),
+            ApprovalDecision::Timeout
+        ));
+        assert!(matches!(
+            decision_from_token("DENY", || "x".to_string()),
+            ApprovalDecision::Denied { .. }
+        ));
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn decision_from_token_denies_unknown_with_reason() {
+        match decision_from_token("garbage", || "unexpected token".to_string()) {
+            ApprovalDecision::Denied { reason } => assert_eq!(reason, "unexpected token"),
+            other => panic!("unknown token must fail secure, got {other:?}"),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn network_choice_token_maps_rows_and_tags() {
+        // zenity emits the full row text; kdialog emits the lowercase tag.
+        assert_eq!(network_choice_token(NET_ALLOW_ONCE), "ALLOW");
+        assert_eq!(network_choice_token("allow"), "ALLOW");
+        assert_eq!(network_choice_token(NET_ALLOW_SESSION), "ALLOW_SESSION");
+        assert_eq!(network_choice_token("allow_session"), "ALLOW_SESSION");
+        assert_eq!(network_choice_token(NET_DENY_SESSION), "DENY_SESSION");
+        assert_eq!(network_choice_token("deny_session"), "DENY_SESSION");
+        // "Deny once" and anything unrecognized fail secure to DENY.
+        assert_eq!(network_choice_token(NET_DENY_ONCE), "DENY");
+        assert_eq!(network_choice_token("deny"), "DENY");
+        assert_eq!(network_choice_token(""), "DENY");
     }
 }

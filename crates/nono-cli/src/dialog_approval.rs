@@ -627,27 +627,17 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
 
-        let saved_wayland = std::env::var_os("WAYLAND_DISPLAY");
-        let saved_x11 = std::env::var_os("DISPLAY");
-        // SAFETY: test holds crate::test_env::ENV_LOCK, serializing all env mutations.
-        unsafe {
-            std::env::remove_var("WAYLAND_DISPLAY");
-            std::env::remove_var("DISPLAY");
-        }
+        // Register both vars in the guard so originals are captured and
+        // restored on drop, then remove them to simulate a headless session.
+        let _env = crate::test_env::EnvVarGuard::set_all(&[
+            ("WAYLAND_DISPLAY", ""),
+            ("DISPLAY", ""),
+        ]);
+        _env.remove("WAYLAND_DISPLAY");
+        _env.remove("DISPLAY");
 
         let backend = DialogApproval::new("desktop", &config(Some(1)));
         let decision = backend.request_approval(&command_request(None));
-
-        // Restore before asserting so a failure can't leak env state.
-        // SAFETY: test holds crate::test_env::ENV_LOCK, serializing all env mutations.
-        unsafe {
-            if let Some(v) = saved_wayland {
-                std::env::set_var("WAYLAND_DISPLAY", v);
-            }
-            if let Some(v) = saved_x11 {
-                std::env::set_var("DISPLAY", v);
-            }
-        }
 
         match decision {
             Ok(ApprovalDecision::Denied { reason }) => {

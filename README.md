@@ -100,6 +100,32 @@ nono run --profile opencode -- opencode
 
 Are you an agent developer and want to publish your own agent package? We would love to have you and promote your work! [See the docs](https://nono.sh/docs/cli/features/package-publishing).
 
+## Run many agents at once, detach, and check back later
+
+Every `nono run` starts its own supervised session with its own id, its own PTY, and its own attach socket — so you can run as many sandboxed agents as you want side by side and manage each independently:
+
+```bash
+nono run --detached --profile nolabs-ai/claude --allow-cwd -- claude
+# Started detached session a3f7c2.
+# Attach with: nono attach a3f7c2
+
+nono ps
+# SESSION    NAME         STATUS     ATTACH     PID      UPTIME     PROFILE        COMMAND
+# a3f7c2     calm-node    running    detached   4821     2m         claude-code    claude
+
+nono attach a3f7c2
+```
+
+Start a session attached and walk away with `Ctrl-] d`, or start it `--detached` from the beginning and reattach whenever you want — from the same terminal or a different one. The agent keeps running while you're disconnected; nothing is paused just because no one is watching. Pair `--detached` with `--rollback` to let an agent work unattended with a safety net to review or restore from if it goes off the rails.
+
+<div align="center">
+
+<img src="assets/sessions-demo.gif" alt="nono session management demo: detach, ps, attach, and stop" width="760"/>
+
+</div>
+
+Read more in [Session Lifecycle](https://nono.sh/docs/cli/features/session-lifecycle).
+
 ## Sandbox the tools agents call
 
 nono does not stop at "put the agent in a sandbox". Agents delegate real work to tools: `git`, `gh`, `curl`, `kubectl`, package managers, build scripts, MCP clients / servers, and whatever else is on `PATH`. Those tools are often where secrets, network access, and side effects show up. Most sandboxes just give the agent a blanket policy where a secret is universally available to the entire agent and every tool, but nono is different:
@@ -165,7 +191,7 @@ Read more in [Sandboxed Tool Execution](https://nono.sh/docs/cli/features/tool-s
 
 ## Ready to go deep?
 
-Head over to the [docs](https://nono.sh/docs) and discover nono's rich composable policy system, credentials injection, L7 filtering, supply chain security, rollback, multiplexing, audit and more.
+Head over to the [docs](https://nono.sh/docs) and discover nono's rich composable policy system, credentials injection, L7 filtering, supply chain security, rollback, session management, audit and more.
 
 ## Library support
 

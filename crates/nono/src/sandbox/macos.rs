@@ -876,6 +876,7 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
 
     let localhost_ports = caps.localhost_ports();
     let has_localhost_tcp = !localhost_ports.is_empty() || !merged_ranges.is_empty();
+    let has_tcp_bind_ranges = !caps.tcp_bind_port_ranges().is_empty();
     match caps.network_mode() {
         NetworkMode::Blocked => {
             profile.push_str("(deny network*)\n");
@@ -902,6 +903,18 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
                 // Seatbelt cannot filter bind/inbound by port
                 profile.push_str("(allow network-bind)\n");
                 profile.push_str("(allow network-inbound)\n");
+            } else if has_tcp_bind_ranges {
+                // Bind-only listen ranges: Seatbelt cannot filter bind by port,
+                // so this is a blanket allow (same tradeoff as ProxyOnly bind_ports).
+                // Do not add localhost outbound — that would widen listen into open.
+                profile.push_str(
+                    "(allow system-socket (socket-domain AF_INET) (socket-type SOCK_STREAM))\n",
+                );
+                profile.push_str(
+                    "(allow system-socket (socket-domain AF_INET6) (socket-type SOCK_STREAM))\n",
+                );
+                profile.push_str("(allow network-bind)\n");
+                profile.push_str("(allow network-inbound)\n");
             }
         }
         NetworkMode::ProxyOnly { port, bind_ports } => {
@@ -926,10 +939,10 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
             profile.push_str(
                 "(allow system-socket (socket-domain AF_INET6) (socket-type SOCK_STREAM))\n",
             );
-            // If bind ports or localhost IPC ports are specified, allow network-bind
-            // and network-inbound. Seatbelt cannot filter bind/inbound by port,
-            // so this is a blanket allow.
-            if !bind_ports.is_empty() || has_localhost_tcp {
+            // If bind ports, listen ranges, or localhost IPC ports are specified,
+            // allow network-bind and network-inbound. Seatbelt cannot filter
+            // bind/inbound by port, so this is a blanket allow.
+            if !bind_ports.is_empty() || has_localhost_tcp || has_tcp_bind_ranges {
                 profile.push_str("(allow network-bind)\n");
                 profile.push_str("(allow network-inbound)\n");
             }
@@ -2064,6 +2077,34 @@ mod tests {
         let caps = CapabilitySet::new().allow_tcp_bind(8080);
         let result = generate_profile(&caps);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_generate_profile_blocked_with_tcp_bind_port_range_is_blanket_bind() {
+        let caps = CapabilitySet::new()
+            .block_network()
+            .allow_tcp_bind_port_range(8000, 8100)
+            .expect("valid range");
+        let profile = generate_profile(&caps).unwrap();
+
+        assert!(profile.contains("(deny network*)"));
+        assert!(profile.contains("(allow network-bind)"));
+        assert!(profile.contains("(allow network-inbound)"));
+        assert!(profile.contains("(allow system-socket"));
+        // Bind-only: no per-port localhost outbound (that would be open_port).
+        assert!(!profile.contains("(allow network-outbound (remote tcp \"localhost:8000\"))"));
+        assert!(!profile.contains("(allow network-outbound (remote tcp \"localhost:8100\"))"));
+    }
+
+    #[test]
+    fn test_generate_profile_blocked_without_tcp_bind_port_range_has_no_bind() {
+        let caps = CapabilitySet::new().block_network();
+        assert!(caps.tcp_bind_port_ranges().is_empty());
+        let profile = generate_profile(&caps).unwrap();
+
+        assert!(profile.contains("(deny network*)"));
+        assert!(!profile.contains("(allow network-bind)"));
+        assert!(!profile.contains("(allow network-inbound)"));
     }
 
     #[test]

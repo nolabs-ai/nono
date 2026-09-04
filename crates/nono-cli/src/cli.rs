@@ -1267,6 +1267,18 @@ pub struct SandboxArgs {
     )]
     pub allow_bind: Vec<u16>,
 
+    /// Inclusive TCP listen port range (bind only; repeatable; START:END).
+    /// Equivalent to profile `listen_port_range`.
+    /// ALIAS(canonical="--listen-port-range", introduced="v0.75.0", remove_by="indefinite", issue="#1652")
+    #[arg(
+        long = "listen-port-range",
+        alias = "allow-bind-range",
+        value_name = "START:END",
+        value_parser = crate::proxy_runtime::parse_port_range_arg,
+        help_heading = "NETWORK"
+    )]
+    pub allow_bind_range: Vec<(u16, u16)>,
+
     /// Allow bidirectional localhost TCP on a port: connect + listen (repeatable)
     /// ALIAS(canonical="--open-port", introduced="v0.0.0", remove_by="indefinite", issue="#415")
     #[arg(
@@ -1276,6 +1288,18 @@ pub struct SandboxArgs {
         help_heading = "NETWORK"
     )]
     pub allow_port: Vec<u16>,
+
+    /// Inclusive localhost TCP port range for bidirectional IPC (repeatable; START:END).
+    /// Equivalent to profile `open_port_range`. macOS: combined ranges limited to 16,384 ports.
+    /// ALIAS(canonical="--open-port-range", introduced="v0.75.0", remove_by="indefinite", issue="#1652")
+    #[arg(
+        long = "open-port-range",
+        alias = "allow-port-range",
+        value_name = "START:END",
+        value_parser = crate::proxy_runtime::parse_port_range_arg,
+        help_heading = "NETWORK"
+    )]
+    pub allow_port_range: Vec<(u16, u16)>,
 
     /// Allow outbound TCP connect to a specific port (repeatable; Linux Landlock V4+ only)
     #[arg(
@@ -1464,7 +1488,8 @@ pub struct SandboxArgs {
             "allow_unix_socket_subtree", "allow_unix_socket_subtree_bind",
             "profile", "extends", "bypass_protection", "suppress_save_prompt", "allow_cwd",
             "block_net", "allow_net", "network_profile", "allow_proxy",
-            "allow_bind", "allow_port", "allow_connect_port", "external_proxy", "proxy_port",
+            "allow_bind", "allow_bind_range", "allow_port", "allow_port_range",
+            "allow_connect_port", "external_proxy", "proxy_port",
             "proxy_credential", "allow_endpoint", "env_credential", "env_credential_map",
             "allow_command", "block_command", "allow_launch_services", "allow_gpu", "allow_http2",
             "memory", "max_processes",
@@ -1836,6 +1861,18 @@ pub struct WrapSandboxArgs {
     )]
     pub allow_bind: Vec<u16>,
 
+    /// Inclusive TCP listen port range (bind only; repeatable; START:END).
+    /// Equivalent to profile `listen_port_range`.
+    /// ALIAS(canonical="--listen-port-range", introduced="v0.75.0", remove_by="indefinite", issue="#1652")
+    #[arg(
+        long = "listen-port-range",
+        alias = "allow-bind-range",
+        value_name = "START:END",
+        value_parser = crate::proxy_runtime::parse_port_range_arg,
+        help_heading = "NETWORK"
+    )]
+    pub allow_bind_range: Vec<(u16, u16)>,
+
     /// Allow bidirectional localhost TCP on a port: connect + listen (repeatable)
     /// ALIAS(canonical="--open-port", introduced="v0.0.0", remove_by="indefinite", issue="#415")
     #[arg(
@@ -1845,6 +1882,18 @@ pub struct WrapSandboxArgs {
         help_heading = "NETWORK"
     )]
     pub allow_port: Vec<u16>,
+
+    /// Inclusive localhost TCP port range for bidirectional IPC (repeatable; START:END).
+    /// Equivalent to profile `open_port_range`. macOS: combined ranges limited to 16,384 ports.
+    /// ALIAS(canonical="--open-port-range", introduced="v0.75.0", remove_by="indefinite", issue="#1652")
+    #[arg(
+        long = "open-port-range",
+        alias = "allow-port-range",
+        value_name = "START:END",
+        value_parser = crate::proxy_runtime::parse_port_range_arg,
+        help_heading = "NETWORK"
+    )]
+    pub allow_port_range: Vec<(u16, u16)>,
 
     /// Allow outbound TCP connect to a specific port (repeatable; Linux Landlock V4+ only)
     #[arg(
@@ -1923,7 +1972,8 @@ pub struct WrapSandboxArgs {
             "allow_unix_socket_dir", "allow_unix_socket_dir_bind",
             "allow_unix_socket_subtree", "allow_unix_socket_subtree_bind",
             "profile", "extends", "bypass_protection", "suppress_save_prompt", "allow_cwd",
-            "block_net", "allow_bind", "allow_port", "allow_connect_port",
+            "block_net", "allow_bind", "allow_bind_range", "allow_port", "allow_port_range",
+            "allow_connect_port",
             "env_credential", "env_credential_map",
             "allow_command", "block_command", "allow_launch_services", "allow_gpu",
         ],
@@ -1969,7 +2019,9 @@ impl From<WrapSandboxArgs> for SandboxArgs {
             allow_proxy: Vec::new(),
             deny_proxy: Vec::new(),
             allow_bind: args.allow_bind,
+            allow_bind_range: args.allow_bind_range,
             allow_port: args.allow_port,
+            allow_port_range: args.allow_port_range,
             allow_connect_port: args.allow_connect_port,
             external_proxy: None,
             external_proxy_bypass: Vec::new(),

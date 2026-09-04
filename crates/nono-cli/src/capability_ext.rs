@@ -645,6 +645,12 @@ impl CapabilitySetExt for CapabilitySet {
         for port in &args.allow_port {
             caps.add_localhost_port(*port);
         }
+        for &(start, end) in &args.allow_port_range {
+            caps.add_localhost_port_range(start, end)?;
+        }
+        for &(start, end) in &args.allow_bind_range {
+            caps.add_tcp_bind_port_range(start, end)?;
+        }
 
         // Outbound TCP connect port allowlist (Linux Landlock V4+ only)
         #[cfg(target_os = "macos")]
@@ -1038,6 +1044,9 @@ impl CapabilitySetExt for CapabilitySet {
         for &[start, end] in &profile.network.open_port_range {
             caps.add_localhost_port_range(start, end)?;
         }
+        for &[start, end] in &profile.network.listen_port_range {
+            caps.add_tcp_bind_port_range(start, end)?;
+        }
 
         // Outbound TCP connect port allowlist from profile (Linux Landlock V4+ only)
         #[cfg(target_os = "macos")]
@@ -1263,6 +1272,12 @@ fn add_cli_overrides(
     // Localhost IPC ports from CLI
     for port in &args.allow_port {
         caps.add_localhost_port(*port);
+    }
+    for &(start, end) in &args.allow_port_range {
+        caps.add_localhost_port_range(start, end)?;
+    }
+    for &(start, end) in &args.allow_bind_range {
+        caps.add_tcp_bind_port_range(start, end)?;
     }
 
     // Outbound TCP connect port allowlist from CLI (Linux Landlock V4+ only)
@@ -2794,6 +2809,84 @@ mod tests {
         assert!(
             err.to_string().contains("not supported on macOS"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_from_args_listen_port_range_populates_tcp_bind_port_ranges() {
+        let args = SandboxArgs {
+            allow_bind_range: vec![(8000, 8100)],
+            ..sandbox_args()
+        };
+
+        let (caps, _) = from_args_locked(&args).expect("build caps");
+        assert_eq!(caps.tcp_bind_port_ranges(), &[(8000, 8100)]);
+        assert!(
+            caps.localhost_port_ranges().is_empty(),
+            "listen-port-range must not grant bidirectional localhost IPC"
+        );
+    }
+
+    #[test]
+    fn test_from_args_without_listen_port_range_has_no_bind_range() {
+        let (caps, _) = from_args_locked(&sandbox_args()).expect("build caps");
+        assert!(
+            caps.tcp_bind_port_ranges().is_empty(),
+            "undeclared listen-port-range must not appear in the capability set"
+        );
+    }
+
+    #[test]
+    fn test_from_profile_listen_port_range_populates_tcp_bind_port_ranges() {
+        let dir = tempdir().expect("tmpdir");
+        let profile_path = dir.path().join("listen-port-range-profile.json");
+        std::fs::write(
+            &profile_path,
+            r#"{
+                "meta": { "name": "listen-port-range-profile" },
+                "network": { "listen_port_range": [[9000, 9010]] }
+            }"#,
+        )
+        .expect("write profile");
+        let profile = crate::profile::load_profile_from_path(&profile_path).expect("load profile");
+
+        let workdir = tempdir().expect("workdir");
+        let args = sandbox_args();
+
+        let (caps, _) = from_profile_locked(&profile, workdir.path(), &args).expect("build caps");
+        assert_eq!(caps.tcp_bind_port_ranges(), &[(9000, 9010)]);
+    }
+
+    #[test]
+    fn test_cli_listen_port_range_overrides_profile() {
+        let dir = tempdir().expect("tmpdir");
+        let profile_path = dir.path().join("listen-port-range-override.json");
+        std::fs::write(
+            &profile_path,
+            r#"{
+                "meta": { "name": "listen-port-range-override" },
+                "network": { "listen_port_range": [[9000, 9010]] }
+            }"#,
+        )
+        .expect("write profile");
+        let profile = crate::profile::load_profile_from_path(&profile_path).expect("load profile");
+
+        let workdir = tempdir().expect("workdir");
+        let args = SandboxArgs {
+            allow_bind_range: vec![(8000, 8005)],
+            ..sandbox_args()
+        };
+
+        let (caps, _) = from_profile_locked(&profile, workdir.path(), &args).expect("build caps");
+        assert!(
+            caps.tcp_bind_port_ranges().contains(&(9000, 9010)),
+            "profile listen_port_range should be present: {:?}",
+            caps.tcp_bind_port_ranges()
+        );
+        assert!(
+            caps.tcp_bind_port_ranges().contains(&(8000, 8005)),
+            "CLI --listen-port-range should be present: {:?}",
+            caps.tcp_bind_port_ranges()
         );
     }
 

@@ -1,0 +1,94 @@
+name: Nix flake
+
+# Validates the flake (flake.nix). For most nixify targets Nix is a side
+# concern and the full build can take 10+ minutes, so this workflow runs
+# only on manual dispatch or when a release is published — not on every
+# push or PR. If the project wants per-PR validation, add a `pull_request`
+# trigger with `paths:` filtered to flake files (see customization notes).
+#
+# Cross-platform matrix: runs on ubuntu-latest, macos-13 (Intel), and
+# macos-14 (ARM). `nix flake check --all-systems --no-build` evaluates
+# every system's outputs without realising fetchurl derivations, so a
+# hash mismatch on darwin is invisible without actually building on
+# darwin. The matrix is the only way CI catches cross-platform hash
+# mismatches and darwin-specific build failures.
+#
+# Steps, in order of what they catch:
+#   1. nix flake check --all-systems  — every system's outputs evaluate
+#      (including darwin on an ubuntu runner).
+#   2. nix build .#default            — fetchurl + autoPatchelf + install
+#      layout actually realises for the runner's system.
+#   3. nix run .#default -- --version — the patched binary actually execs.
+#      This is the only step that catches the `let ... in rec` shadowing
+#      class of bug (passes flake check, fails nix run). Do NOT drop it.
+#   4. nix build .#source (if #source output exists) — the from-source
+#      build path realises for the runner's system. Skip if the flake
+#      does not expose a #source output.
+
+on:
+  workflow_dispatch: {}
+  pull_request:
+    branches: [main]
+    paths:
+      - "flake.nix"
+      - "flake.lock"
+      - "**/*.nix"
+      - ".github/workflows/nix.yml"
+      - "Cargo.lock"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nix-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: nix flake check (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, macos-13, macos-14]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+
+      # magic-nix-cache is Linux-only: the v14 static binary on arm64-darwin
+      # fails with `dyld: Symbol not found: __ZNSt13exception_ptr...` because
+      # it was built against a newer libc++ than the macos-14 runner ships.
+      # See DeterminateSystems/nix-installer#1684 and llvm/llvm-project#86077.
+      # Darwin builds work without the cache, just slower.
+      #
+      # Gated to non-PR events to prevent cache poisoning: a forked PR could
+      # push poisoned cache entries that would be reused by main builds.
+      # PRs from forks run without the cache (slower but safe).
+      - uses: DeterminateSystems/magic-nix-cache-action@908b263ff629f4cc17666315b7fd3ec127c6244d # v14
+        if: runner.os == 'Linux' && github.event_name != 'pull_request'
+        with:
+          use-flakehub: false
+
+      - name: nix flake check --all-systems
+        run: nix flake check --all-systems --no-build
+
+      - name: nix build .#default
+        run: nix build .#default --print-build-logs
+
+      - name: nix run .#default -- --version
+        if: github.event_name != 'pull_request'
+        run: nix run .#default -- --version
+
+      - name: nix build .#source (if exists)
+        run: |
+          if nix flake show --json 2>/dev/null | jq -e 'any(.packages[]?; has("source"))' >/dev/null 2>&1; then
+            nix build .#source --print-build-logs
+          else
+            echo "No #source output — skipping"
+          fi

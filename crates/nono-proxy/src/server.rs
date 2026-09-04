@@ -1082,9 +1082,14 @@ pub async fn start_with_nonce_resolver(
 
     info!("Proxy server listening on {}", local_addr);
 
-    let oauth_capture_store = OAuthCaptureStore::load_with_persistence(
+    // The backend is chosen by `oauth_capture_store_backend`: on macOS `Auto`
+    // routes to ACL-restricted Keychain persistence (the path is only the
+    // "persistence enabled" signal), while `File` keeps the plaintext file
+    // backend at this path. On other platforms it's always the file backend.
+    let oauth_capture_store = OAuthCaptureStore::load_with_runtime_persistence(
         &config.oauth_capture,
         config.oauth_capture_store_path.clone(),
+        config.oauth_capture_store_backend,
     )?;
     let oauth_capture_store = Arc::new(oauth_capture_store);
     let effective_nonce_resolver: Option<Arc<dyn crate::token::NonceResolver>> =

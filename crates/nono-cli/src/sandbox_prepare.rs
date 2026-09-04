@@ -505,6 +505,9 @@ pub(crate) struct PreparedSandbox {
     pub(crate) credential_capture: HashMap<String, profile::CredentialCaptureEntry>,
     pub(crate) credential_providers: HashMap<String, profile::CredentialProviderDef>,
     pub(crate) credential_routes: Vec<profile::CredentialRouteDef>,
+    /// Persistence backend for the OAuth-capture phantom-token store, from the
+    /// resolved profile. Threaded into `ProxyConfig` at proxy-launch time.
+    pub(crate) oauth_capture_store_backend: nono_proxy::config::OAuthCaptureStoreBackend,
     pub(crate) tls_intercept: Option<profile::TlsInterceptConfig>,
     pub(crate) no_proxy: Vec<String>,
     pub(crate) upstream_proxy: Option<String>,
@@ -1484,6 +1487,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
                 credential_capture: HashMap::new(),
                 credential_providers: HashMap::new(),
                 credential_routes: Vec::new(),
+                oauth_capture_store_backend: Default::default(),
                 tls_intercept: None,
                 no_proxy: Vec::new(),
                 upstream_proxy: None,
@@ -1833,6 +1837,26 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         .as_ref()
         .map(|profile| profile.credential_capture.clone())
         .unwrap_or_default();
+    let profile_oauth_capture_store_backend = loaded_profile
+        .as_ref()
+        .map(|profile| profile.oauth_capture_store_backend)
+        .unwrap_or_default();
+
+    // Derive the `security` mediation that refuses subprocess reads of the
+    // OAuth-capture Keychain item whenever that backend is actually in use.
+    // Fails closed if the profile enables it without a `security` session
+    // sandbox (see derive_oauth_capture_security_mediation).
+    // `credential_providers` are OAuth-capture providers (the only provider
+    // type today), so a non-empty map means OAuth capture is enabled.
+    let oauth_capture_keychain_active = cfg!(target_os = "macos")
+        && !profile_credential_providers.is_empty()
+        && profile_oauth_capture_store_backend
+            != nono_proxy::config::OAuthCaptureStoreBackend::File;
+    crate::command_policy::derive_oauth_capture_security_mediation(
+        &mut command_policies,
+        oauth_capture_keychain_active,
+    )?;
+
     let loaded_secrets = load_env_credentials(args, &profile_secrets, silent, &caps)?;
 
     finalize_prepared_sandbox(
@@ -1856,6 +1880,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
             credential_capture: profile_credential_capture,
             credential_providers: profile_credential_providers,
             credential_routes: profile_credential_routes,
+            oauth_capture_store_backend: profile_oauth_capture_store_backend,
             tls_intercept: profile_tls_intercept,
             no_proxy: profile_no_proxy,
             upstream_proxy: profile_upstream_proxy,
@@ -2775,6 +2800,7 @@ mod tests {
             credential_capture: std::collections::HashMap::new(),
             credential_providers: std::collections::HashMap::new(),
             credential_routes: Vec::new(),
+            oauth_capture_store_backend: Default::default(),
             tls_intercept: None,
             no_proxy: Vec::new(),
             upstream_proxy: None,

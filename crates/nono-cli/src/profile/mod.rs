@@ -2473,6 +2473,15 @@ pub struct Profile {
     pub credential_providers: HashMap<String, CredentialProviderDef>,
     #[serde(default)]
     pub credential_routes: Vec<CredentialRouteDef>,
+    /// Persistence backend for the OAuth-capture phantom-token store.
+    ///
+    /// Defaults to `auto` (ACL-restricted macOS Keychain on macOS, plaintext
+    /// `providers.json` file elsewhere). Set to `file` to keep the file
+    /// backend on macOS too — e.g. for headless/SSH hosts where the login
+    /// keychain is not unlocked. This is a managed, profile-wide scalar; user
+    /// fragments cannot weaken it.
+    #[serde(default)]
+    pub oauth_capture_store_backend: nono_proxy::config::OAuthCaptureStoreBackend,
     #[serde(default)]
     pub workdir: WorkdirConfig,
     #[serde(default)]
@@ -2645,6 +2654,8 @@ struct ProfileDeserialize {
     #[serde(default)]
     credential_routes: Vec<CredentialRouteDef>,
     #[serde(default)]
+    oauth_capture_store_backend: nono_proxy::config::OAuthCaptureStoreBackend,
+    #[serde(default)]
     workdir: WorkdirConfig,
     #[serde(default)]
     hooks: HooksConfig,
@@ -2701,6 +2712,7 @@ impl From<ProfileDeserialize> for Profile {
             credential_capture: raw.credential_capture,
             credential_providers: raw.credential_providers,
             credential_routes: raw.credential_routes,
+            oauth_capture_store_backend: raw.oauth_capture_store_backend,
             workdir: raw.workdir,
             hooks: raw.hooks,
             session_hooks: raw.session_hooks,
@@ -3973,6 +3985,20 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
             let mut merged = base.credential_routes;
             merged.extend(child.credential_routes);
             merged
+        },
+        // Managed profile-wide scalar. A child that leaves it at the default
+        // (`Auto`) inherits the base value; an explicit non-default child value
+        // overrides. Hard "user fragments cannot change the managed backend"
+        // enforcement belongs at the fragment boundary (where managed vs user
+        // layers are distinguishable), alongside the other managed-scalar
+        // protections — not in this generic base/child merge.
+        oauth_capture_store_backend: {
+            use nono_proxy::config::OAuthCaptureStoreBackend::Auto;
+            if child.oauth_capture_store_backend == Auto {
+                base.oauth_capture_store_backend
+            } else {
+                child.oauth_capture_store_backend
+            }
         },
         // NOTE: WorkdirAccess::None serves as both "not specified" and "explicitly no access".
         // A child cannot override a base's workdir grant to None. This is a v1 limitation;
@@ -7082,6 +7108,7 @@ mod tests {
             credential_capture: HashMap::new(),
             credential_providers: HashMap::new(),
             credential_routes: Vec::new(),
+            oauth_capture_store_backend: Default::default(),
             workdir: WorkdirConfig {
                 access: WorkdirAccess::ReadWrite,
             },
@@ -7174,6 +7201,7 @@ mod tests {
             credential_capture: HashMap::new(),
             credential_providers: HashMap::new(),
             credential_routes: Vec::new(),
+            oauth_capture_store_backend: Default::default(),
             workdir: WorkdirConfig {
                 access: WorkdirAccess::None,
             },
@@ -9267,6 +9295,31 @@ mod tests {
         }"#;
         validate_against_schema(json)
             .expect("extends as single-element array should pass schema validation");
+    }
+
+    #[test]
+    fn test_schema_validates_oauth_capture_store_backend() {
+        for backend in ["auto", "file", "keychain"] {
+            let json = format!(
+                r#"{{
+                    "meta": {{ "name": "oauth-capture-backend" }},
+                    "oauth_capture_store_backend": "{backend}"
+                }}"#
+            );
+            validate_against_schema(&json).unwrap_or_else(|e| {
+                panic!("backend '{backend}' should pass schema validation: {e}")
+            });
+        }
+    }
+
+    #[test]
+    fn test_schema_rejects_invalid_oauth_capture_store_backend() {
+        let json = r#"{
+            "meta": { "name": "oauth-capture-backend-invalid" },
+            "oauth_capture_store_backend": "not-a-real-backend"
+        }"#;
+        validate_against_schema(json)
+            .expect_err("unknown oauth_capture_store_backend value should fail schema validation");
     }
 
     #[test]

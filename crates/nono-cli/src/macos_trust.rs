@@ -64,7 +64,8 @@ fn try_ensure_trusted_ca(validity: Duration) -> Result<Option<PreloadedCa>> {
                     debug!("stored proxy CA needs renewal ({state:?}); re-issuing over stored key");
                     return match rotate_ca(&key_der, &cert_pem, validity, state)? {
                         RotateOutcome::Cert(ca) => Ok(Some(ca)),
-                        RotateOutcome::Unavailable | RotateOutcome::NoInteraction => Ok(None),
+                        RotateOutcome::NoInteraction { fallback } => Ok(fallback),
+                        RotateOutcome::Unavailable => Ok(None),
                     };
                 }
             }
@@ -128,7 +129,10 @@ pub(crate) fn renew_shared_ca(validity: Duration) -> Result<RenewOutcome> {
     let state = cert_validity(&cert_pem)?;
     match rotate_ca(&key_der, &cert_pem, validity, state)? {
         RotateOutcome::Cert(ca) if ca.cert_pem != cert_pem => Ok(RenewOutcome::Renewed(ca)),
-        RotateOutcome::NoInteraction => Ok(RenewOutcome::NoInteraction),
+        // A headless session can't satisfy the trust prompt now or later in this
+        // session, regardless of whether the launch path has a still-valid cert
+        // to fall back on; the supervisor backs off on this outcome either way.
+        RotateOutcome::NoInteraction { .. } => Ok(RenewOutcome::NoInteraction),
         RotateOutcome::Cert(_) | RotateOutcome::Unavailable => Ok(RenewOutcome::Unchanged),
     }
 }
@@ -199,8 +203,10 @@ enum RotateOutcome {
     Unavailable,
     /// No interactive session exists to show the trust prompt (e.g. a
     /// headless `nono proxy`). Retrying later in the same session can't
-    /// succeed either.
-    NoInteraction,
+    /// succeed either. Carries the still-valid previous certificate when one
+    /// exists, so the launch path can keep serving it instead of dropping to
+    /// an untrusted ephemeral CA.
+    NoInteraction { fallback: Option<PreloadedCa> },
 }
 
 /// Re-issue the CA certificate over the stored key and hand the new one over.
@@ -263,7 +269,13 @@ fn rotate_ca(
                     "Proxy CA renewal needs authentication but no interactive session is \
                      available to authorize it. Continuing on the current certificate."
                 );
-                return Ok(RotateOutcome::NoInteraction);
+                // Mirrors the `UserCancelled` branch above: only a still-valid
+                // stored cert is worth handing back as a fallback.
+                let fallback = (state == CertValidity::RenewDue).then(|| PreloadedCa {
+                    key_der: key_der.clone(),
+                    cert_pem: old_cert_pem.to_string(),
+                });
+                return Ok(RotateOutcome::NoInteraction { fallback });
             }
             TrustCertError::Other(err) => return Err(err),
         }

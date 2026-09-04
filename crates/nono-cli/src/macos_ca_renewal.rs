@@ -31,12 +31,17 @@ pub(crate) fn spawn_supervisor(rotator: Arc<InterceptCaRotator>, validity: Durat
         .name("nono-ca-renewal".to_string())
         .spawn(move || {
             let mut delay = interval;
+            // Sticky once set: this session can never satisfy a trust prompt, but
+            // it should keep polling so it can still adopt a cert some other,
+            // interactive session renews in the meantime.
+            let mut renewal_disabled = false;
             loop {
                 std::thread::sleep(delay);
-                match next_delay(supervise_once(&rotator, validity), interval) {
-                    Some(d) => delay = d,
-                    None => return,
+                let outcome = supervise_once(&rotator, validity, renewal_disabled);
+                if matches!(outcome, Ok(Outcome::NoInteraction)) {
+                    renewal_disabled = true;
                 }
+                delay = next_delay(outcome, interval);
             }
         })
         .map(|_| ())
@@ -65,31 +70,35 @@ enum Outcome {
     /// cert. Backs off, since re-prompting hourly would be worse than the expiry.
     Deferred,
     /// No interactive session exists to show the trust prompt (e.g. a headless
-    /// `nono proxy`). Retrying later in the same session can't succeed either,
-    /// since there's still nobody to ask.
+    /// `nono proxy`). This session will never prompt again, but keeps polling
+    /// at the normal interval in case another, interactive session renews the
+    /// CA in the meantime and this one can adopt it.
     NoInteraction,
 }
 
 /// How long to sleep before the next check, given the last one's outcome.
-/// `None` means stop the supervisor loop entirely.
 ///
 /// Only a declined prompt or a failed trust write backs off; losing the lock
-/// race to another session is routine and should retry on the normal interval
-/// so this session adopts what the winner just wrote. No interactive session
-/// ever succeeding again in this run, so it doesn't retry at all.
-fn next_delay(outcome: nono::Result<Outcome>, interval: Duration) -> Option<Duration> {
+/// race to another session, and having no interactive session to prompt, are
+/// both routine and retry on the normal interval — the former so this session
+/// adopts what the winner just wrote, the latter so it can still adopt a cert
+/// renewed elsewhere even though it can never renew one itself.
+fn next_delay(outcome: nono::Result<Outcome>, interval: Duration) -> Duration {
     match outcome {
-        Ok(Outcome::Deferred) => Some(BACKOFF_AFTER_FAILURE),
-        Ok(Outcome::NoInteraction) => None,
-        Ok(_) => Some(interval),
+        Ok(Outcome::Deferred) => BACKOFF_AFTER_FAILURE,
+        Ok(_) => interval,
         Err(e) => {
             warn!("Proxy CA renewal check failed: {e}");
-            Some(BACKOFF_AFTER_FAILURE)
+            BACKOFF_AFTER_FAILURE
         }
     }
 }
 
-fn supervise_once(rotator: &InterceptCaRotator, validity: Duration) -> nono::Result<Outcome> {
+fn supervise_once(
+    rotator: &InterceptCaRotator,
+    validity: Duration,
+    renewal_disabled: bool,
+) -> nono::Result<Outcome> {
     let live = rotator
         .current_cert_pem()
         .map_err(|e| nono::NonoError::SandboxInit(format!("{e}")))?;
@@ -99,6 +108,13 @@ fn supervise_once(rotator: &InterceptCaRotator, validity: Duration) -> nono::Res
     }
     if macos_trust::cert_validity(&live)? == CertValidity::Valid {
         return Ok(Outcome::NothingToDo);
+    }
+    if renewal_disabled {
+        debug!(
+            "proxy CA renewal needs authentication but no interactive session is available in \
+             this run; only adopting certs renewed by another session"
+        );
+        return Ok(Outcome::NoInteraction);
     }
 
     // Renewal writes to the trust store and prompts; one winner per machine.
@@ -128,8 +144,9 @@ fn supervise_once(rotator: &InterceptCaRotator, validity: Duration) -> nono::Res
         RenewOutcome::NoInteraction => {
             tracing::error!(
                 "Proxy CA needs renewal but no interactive session is available to authorize it \
-                 (headless session). Not retrying; the current certificate will expire and \
-                 intercepted routes will fail — restart in an interactive session to recover."
+                 (headless session). Won't prompt again this run; the current certificate will \
+                 expire and intercepted routes will fail unless another, interactive session \
+                 renews it and this one adopts the result."
             );
             Ok(Outcome::NoInteraction)
         }
@@ -236,7 +253,7 @@ mod tests {
     fn losing_the_lock_race_retries_on_the_normal_interval_not_backoff() {
         assert_eq!(
             next_delay(Ok(Outcome::Busy), Duration::from_secs(42)),
-            Some(Duration::from_secs(42)),
+            Duration::from_secs(42),
             "lock contention is routine; it must not trigger the failure backoff"
         );
     }
@@ -245,16 +262,17 @@ mod tests {
     fn a_declined_or_failed_trust_attempt_backs_off() {
         assert_eq!(
             next_delay(Ok(Outcome::Deferred), Duration::from_secs(42)),
-            Some(BACKOFF_AFTER_FAILURE)
+            BACKOFF_AFTER_FAILURE
         );
     }
 
     #[test]
-    fn no_interactive_session_stops_the_supervisor_for_good() {
+    fn no_interactive_session_retries_on_the_normal_interval_not_forever() {
         assert_eq!(
             next_delay(Ok(Outcome::NoInteraction), Duration::from_secs(42)),
-            None,
-            "a headless session can never satisfy a trust prompt; retrying is pointless"
+            Duration::from_secs(42),
+            "a headless session can't renew, but must keep polling so it can still adopt a cert \
+             renewed by another, interactive session"
         );
     }
 

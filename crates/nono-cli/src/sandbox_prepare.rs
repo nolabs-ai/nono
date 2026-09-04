@@ -509,6 +509,13 @@ pub(crate) struct PreparedSandbox {
     pub(crate) no_proxy: Vec<String>,
     pub(crate) upstream_proxy: Option<String>,
     pub(crate) upstream_bypass: Vec<String>,
+    /// Named approval backends from the profile `network` section. When
+    /// non-empty, a CONNECT host not on the allowlist triggers a runtime
+    /// approval prompt (instead of an immediate 403) at proxy launch time.
+    pub(crate) network_approval_backends:
+        std::collections::BTreeMap<String, crate::command_policy::ApprovalBackendConfig>,
+    /// Default routing for `network_approval_backends`.
+    pub(crate) network_approval_defaults: Option<crate::command_policy::ApprovalDefaultsConfig>,
     pub(crate) listen_ports: Vec<u16>,
     pub(crate) capability_elevation: bool,
     #[cfg(target_os = "linux")]
@@ -1488,6 +1495,8 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
                 no_proxy: Vec::new(),
                 upstream_proxy: None,
                 upstream_bypass: Vec::new(),
+                network_approval_backends: std::collections::BTreeMap::new(),
+                network_approval_defaults: None,
                 listen_ports: Vec::new(),
                 capability_elevation: false,
                 #[cfg(target_os = "linux")]
@@ -1549,6 +1558,8 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         no_proxy: profile_no_proxy,
         upstream_proxy: profile_upstream_proxy,
         upstream_bypass: profile_upstream_bypass,
+        network_approval_backends: profile_network_approval_backends,
+        network_approval_defaults: profile_network_approval_defaults,
         listen_ports: profile_listen_ports,
         open_url_origins,
         open_url_allow_localhost,
@@ -1860,6 +1871,8 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
             no_proxy: profile_no_proxy,
             upstream_proxy: profile_upstream_proxy,
             upstream_bypass: profile_upstream_bypass,
+            network_approval_backends: profile_network_approval_backends,
+            network_approval_defaults: profile_network_approval_defaults,
             listen_ports: profile_listen_ports,
             capability_elevation,
             #[cfg(target_os = "linux")]
@@ -2779,6 +2792,8 @@ mod tests {
             no_proxy: Vec::new(),
             upstream_proxy: None,
             upstream_bypass: Vec::new(),
+            network_approval_backends: std::collections::BTreeMap::new(),
+            network_approval_defaults: None,
             listen_ports: Vec::new(),
             capability_elevation: false,
             #[cfg(target_os = "linux")]

@@ -1606,6 +1606,8 @@ pub(crate) fn prepare_proxy_launch_options(
         enable_h2: prepared.allow_http2_requested,
         no_proxy,
         audit_disabled: false,
+        network_approval_backends: prepared.network_approval_backends.clone(),
+        network_approval_defaults: prepared.network_approval_defaults.clone(),
     };
 
     // Infra-only flags make no sense without an activating proxy feature.
@@ -2976,6 +2978,18 @@ pub(crate) fn start_proxy_runtime(
         .map_err(|e| NonoError::SandboxInit(format!("Failed to start proxy runtime: {}", e)))?;
     let approval_registry =
         crate::approval_runtime::build_proxy_approval_registry(proxy.command_policies.as_ref())?;
+    // Interactive host-approval backend for CONNECT targets not on the
+    // allowlist. `None` when the profile's `network.approval_backends` is empty,
+    // preserving the immediate-403 behavior for not-allowed hosts. A configured
+    // backend that fails to build is a hard error — we never fall back to the
+    // weaker "no prompt" path.
+    let network_approval_backend = crate::approval_runtime::resolve_supervised_approval_backend(
+        &proxy.network_approval_backends,
+        proxy
+            .network_approval_defaults
+            .as_ref()
+            .and_then(|d| d.backend.clone()),
+    )?;
     let credential_capture_backend = build_credential_capture_backend(
         &proxy.credential_capture,
         proxy.session_id.clone(),
@@ -2989,11 +3003,13 @@ pub(crate) fn start_proxy_runtime(
 
     let handle = rt
         .block_on(async {
-            nono_proxy::server::start_with_nonce_resolver(
+            nono_proxy::server::start_with_network_approval(
                 proxy_config.clone(),
                 approval_registry,
                 credential_capture_backend,
                 nonce_resolver,
+                network_approval_backend,
+                proxy.session_id.clone(),
             )
             .await
         })
@@ -3675,6 +3691,8 @@ mod tests {
             upstream_proxy: None,
             no_proxy: Vec::new(),
             upstream_bypass: Vec::new(),
+            network_approval_backends: std::collections::BTreeMap::new(),
+            network_approval_defaults: None,
             listen_ports: Vec::new(),
             capability_elevation: false,
             #[cfg(target_os = "linux")]
@@ -3749,6 +3767,8 @@ mod tests {
             upstream_proxy: None,
             no_proxy: vec![".internal.corp".to_string()],
             upstream_bypass: Vec::new(),
+            network_approval_backends: std::collections::BTreeMap::new(),
+            network_approval_defaults: None,
             listen_ports: Vec::new(),
             capability_elevation: false,
             #[cfg(target_os = "linux")]
@@ -3818,6 +3838,8 @@ mod tests {
             upstream_proxy: Some("127.0.0.1:9".to_string()),
             no_proxy: vec!["redis".to_string(), "*.internal.example".to_string()],
             upstream_bypass: Vec::new(),
+            network_approval_backends: std::collections::BTreeMap::new(),
+            network_approval_defaults: None,
             listen_ports: Vec::new(),
             capability_elevation: false,
             #[cfg(target_os = "linux")]

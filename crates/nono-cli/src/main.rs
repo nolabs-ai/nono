@@ -27,6 +27,7 @@ mod deprecated_policy;
 mod deprecated_schema;
 mod deprecation_warnings;
 mod diagnostic;
+mod dialog_approval;
 mod exec_strategy;
 mod execution_runtime;
 #[cfg(unix)]
@@ -312,6 +313,8 @@ mod tests {
             no_proxy: vec!["redis".to_string()],
             upstream_proxy: None,
             upstream_bypass: Vec::new(),
+            network_approval_backends: std::collections::BTreeMap::new(),
+            network_approval_defaults: None,
             listen_ports: Vec::new(),
             capability_elevation: false,
             #[cfg(target_os = "linux")]
@@ -388,6 +391,8 @@ mod tests {
             no_proxy: vec!["redis".to_string()],
             upstream_proxy: None,
             upstream_bypass: Vec::new(),
+            network_approval_backends: std::collections::BTreeMap::new(),
+            network_approval_defaults: None,
             listen_ports: Vec::new(),
             capability_elevation: false,
             #[cfg(target_os = "linux")]

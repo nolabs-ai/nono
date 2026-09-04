@@ -6,6 +6,13 @@ name: Nix flake
 # push or PR. If the project wants per-PR validation, add a `pull_request`
 # trigger with `paths:` filtered to flake files (see customization notes).
 #
+# Cross-platform matrix: runs on ubuntu-latest, macos-13 (Intel), and
+# macos-14 (ARM). `nix flake check --all-systems --no-build` evaluates
+# every system's outputs without realising fetchurl derivations, so a
+# hash mismatch on darwin is invisible without actually building on
+# darwin. The matrix is the only way CI catches cross-platform hash
+# mismatches and darwin-specific build failures.
+#
 # Steps, in order of what they catch:
 #   1. nix flake check --all-systems  — every system's outputs evaluate
 #      (including darwin on an ubuntu runner).
@@ -20,8 +27,6 @@ name: Nix flake
 
 on:
   workflow_dispatch: {}
-  release:
-    types: [published]
   pull_request:
     branches: [main]
     paths:
@@ -40,9 +45,13 @@ concurrency:
 
 jobs:
   check:
-    name: nix flake check
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
+    name: nix flake check (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, macos-13, macos-14]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
@@ -51,6 +60,20 @@ jobs:
 
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+
+      # magic-nix-cache is Linux-only: the v14 static binary on arm64-darwin
+      # fails with `dyld: Symbol not found: __ZNSt13exception_ptr...` because
+      # it was built against a newer libc++ than the macos-14 runner ships.
+      # See DeterminateSystems/nix-installer#1684 and llvm/llvm-project#86077.
+      # Darwin builds work without the cache, just slower.
+      #
+      # Gated to non-PR events to prevent cache poisoning: a forked PR could
+      # push poisoned cache entries that would be reused by main builds.
+      # PRs from forks run without the cache (slower but safe).
+      - uses: DeterminateSystems/magic-nix-cache-action@908b263ff629f4cc17666315b7fd3ec127c6244d # v14
+        if: runner.os == 'Linux' && github.event_name != 'pull_request'
+        with:
+          use-flakehub: false
 
       - name: nix flake check --all-systems
         run: nix flake check --all-systems --no-build

@@ -1768,10 +1768,16 @@ pub struct NetworkConfig {
     #[serde(default)]
     pub block: bool,
     /// Allow HTTP/2 to upstream servers via ALPN negotiation.
-    /// When `false` (default), the proxy negotiates HTTP/1.1 with keep-alive
-    /// connection pooling. Equivalent to the `--allow-http2` CLI flag.
-    #[serde(default)]
-    pub allow_http2: bool,
+    ///
+    /// Three-state inheritance (same as `network_profile`):
+    /// absent = inherit the parent, `null` = clear an inherited `true` back
+    /// to HTTP/1.1, explicit `true`/`false` = override. A root profile that
+    /// omits the field resolves to `false` (HTTP/1.1 with keep-alive).
+    ///
+    /// Equivalent to `--allow-http2`, which is still OR'd with the *resolved*
+    /// profile value at launch and cannot disable a resolved `true`.
+    #[serde(default, skip_serializing_if = "InheritableValue::is_inherit")]
+    pub allow_http2: InheritableValue<bool>,
     /// Network proxy profile name (from network-policy.json).
     /// When set, outbound traffic is filtered through the proxy.
     ///
@@ -1893,6 +1899,14 @@ pub enum TlsCaLifecycle {
 impl NetworkConfig {
     pub fn resolved_network_profile(&self) -> Option<&str> {
         self.network_profile.as_ref().map(String::as_str)
+    }
+
+    /// Returns whether HTTP/2 is enabled after profile inheritance.
+    ///
+    /// Only an explicit `true` enables HTTP/2. Absent, `null` (clear), and
+    /// explicit `false` all resolve to the default (HTTP/1.1).
+    pub fn resolved_allow_http2(&self) -> bool {
+        matches!(self.allow_http2, InheritableValue::Set(true))
     }
 
     /// Returns the resolved credentials list, defaulting to empty if unset.
@@ -3852,7 +3866,7 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
         },
         network: NetworkConfig {
             block: base.network.block || child.network.block,
-            allow_http2: base.network.allow_http2 || child.network.allow_http2,
+            allow_http2: child.network.allow_http2.merge(base.network.allow_http2),
             network_profile: child
                 .network
                 .network_profile
@@ -7052,7 +7066,7 @@ mod tests {
             },
             network: NetworkConfig {
                 block: false,
-                allow_http2: false,
+                allow_http2: InheritableValue::Inherit,
                 network_profile: InheritableValue::Set("base-net".to_string()),
                 allow_domain: vec![AllowDomainEntry::Plain("base.example.com".to_string())],
                 deny_domain: vec![],
@@ -7144,7 +7158,7 @@ mod tests {
             },
             network: NetworkConfig {
                 block: false,
-                allow_http2: false,
+                allow_http2: InheritableValue::Inherit,
                 network_profile: InheritableValue::Inherit,
                 allow_domain: vec![AllowDomainEntry::Plain("child.example.com".to_string())],
                 deny_domain: vec![],
@@ -7579,6 +7593,66 @@ mod tests {
 
         let merged = merge_profiles(base, child);
         assert_eq!(merged.network.resolved_network_profile(), None);
+    }
+
+    fn profile_with_allow_http2(value: InheritableValue<bool>) -> Profile {
+        Profile {
+            network: NetworkConfig {
+                allow_http2: value,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_merge_profiles_allow_http2_parent_true_child_absent_inherits() {
+        let merged = merge_profiles(
+            profile_with_allow_http2(InheritableValue::Set(true)),
+            profile_with_allow_http2(InheritableValue::Inherit),
+        );
+        assert_eq!(merged.network.allow_http2, InheritableValue::Set(true));
+        assert!(merged.network.resolved_allow_http2());
+    }
+
+    #[test]
+    fn test_merge_profiles_allow_http2_parent_true_child_false_overrides() {
+        let merged = merge_profiles(
+            profile_with_allow_http2(InheritableValue::Set(true)),
+            profile_with_allow_http2(InheritableValue::Set(false)),
+        );
+        assert_eq!(merged.network.allow_http2, InheritableValue::Set(false));
+        assert!(!merged.network.resolved_allow_http2());
+    }
+
+    #[test]
+    fn test_merge_profiles_allow_http2_parent_false_child_true_overrides() {
+        let merged = merge_profiles(
+            profile_with_allow_http2(InheritableValue::Set(false)),
+            profile_with_allow_http2(InheritableValue::Set(true)),
+        );
+        assert_eq!(merged.network.allow_http2, InheritableValue::Set(true));
+        assert!(merged.network.resolved_allow_http2());
+    }
+
+    #[test]
+    fn test_merge_profiles_allow_http2_null_clears_inherited_true() {
+        let merged = merge_profiles(
+            profile_with_allow_http2(InheritableValue::Set(true)),
+            profile_with_allow_http2(InheritableValue::Clear),
+        );
+        assert_eq!(merged.network.allow_http2, InheritableValue::Clear);
+        assert!(!merged.network.resolved_allow_http2());
+    }
+
+    #[test]
+    fn test_merge_profiles_allow_http2_multi_level_child_false_overrides() {
+        let grandparent = profile_with_allow_http2(InheritableValue::Set(true));
+        let parent = profile_with_allow_http2(InheritableValue::Inherit);
+        let child = profile_with_allow_http2(InheritableValue::Set(false));
+        let merged = merge_profiles(merge_profiles(grandparent, parent), child);
+        assert_eq!(merged.network.allow_http2, InheritableValue::Set(false));
+        assert!(!merged.network.resolved_allow_http2());
     }
 
     #[test]
@@ -8671,6 +8745,75 @@ mod tests {
     }
 
     #[test]
+    fn test_allow_http2_deserialization_distinguishes_absent_null_true_false() {
+        let absent: Profile = serde_json::from_str(r#"{ "meta": { "name": "absent" } }"#)
+            .expect("parse absent profile");
+        assert_eq!(absent.network.allow_http2, InheritableValue::Inherit);
+        assert!(!absent.network.resolved_allow_http2());
+
+        let cleared: Profile = serde_json::from_str(
+            r#"{
+                "meta": { "name": "cleared" },
+                "network": { "allow_http2": null }
+            }"#,
+        )
+        .expect("parse cleared allow_http2");
+        assert_eq!(cleared.network.allow_http2, InheritableValue::Clear);
+        assert!(!cleared.network.resolved_allow_http2());
+
+        let enabled: Profile = serde_json::from_str(
+            r#"{
+                "meta": { "name": "enabled" },
+                "network": { "allow_http2": true }
+            }"#,
+        )
+        .expect("parse allow_http2 true");
+        assert_eq!(enabled.network.allow_http2, InheritableValue::Set(true));
+        assert!(enabled.network.resolved_allow_http2());
+
+        let disabled: Profile = serde_json::from_str(
+            r#"{
+                "meta": { "name": "disabled" },
+                "network": { "allow_http2": false }
+            }"#,
+        )
+        .expect("parse allow_http2 false");
+        assert_eq!(disabled.network.allow_http2, InheritableValue::Set(false));
+        assert!(!disabled.network.resolved_allow_http2());
+    }
+
+    #[test]
+    fn test_allow_http2_round_trip_preserves_absent_null_and_bool() {
+        let cases = [
+            (InheritableValue::Inherit, None),
+            (InheritableValue::Clear, Some(serde_json::Value::Null)),
+            (
+                InheritableValue::Set(true),
+                Some(serde_json::Value::Bool(true)),
+            ),
+            (
+                InheritableValue::Set(false),
+                Some(serde_json::Value::Bool(false)),
+            ),
+        ];
+        for (stored, expected_json) in cases {
+            let mut profile = Profile::default();
+            profile.meta.name = "round-trip".to_string();
+            profile.network.allow_http2 = stored.clone();
+            let json = serde_json::to_value(&profile).expect("serialize profile");
+            let actual = json.pointer("/network/allow_http2").cloned();
+            assert_eq!(actual, expected_json, "serialize {stored:?}");
+            let reparsed: Profile =
+                serde_json::from_value(json).expect("deserialized profile must round-trip");
+            assert_eq!(
+                reparsed.network.resolved_allow_http2(),
+                matches!(stored, InheritableValue::Set(true))
+            );
+            assert_eq!(reparsed.network.allow_http2, stored);
+        }
+    }
+
+    #[test]
     fn test_top_level_schema_field_allowed_in_profile() {
         let profile: Profile = serde_json::from_str(
             r#"{
@@ -9111,6 +9254,70 @@ mod tests {
             profile.groups.include.contains(&"mise_manager".to_string()),
             "expected groups from mise-dev to still be inherited",
         );
+    }
+
+    #[test]
+    fn test_extends_allow_http2_child_false_overrides_inherited_true() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        std::fs::write(
+            dir.path().join("h2-grand.json"),
+            r#"{
+                "meta": { "name": "h2-grand" },
+                "network": { "allow_http2": true }
+            }"#,
+        )
+        .expect("write grandparent profile");
+        std::fs::write(
+            dir.path().join("h2-parent.json"),
+            r#"{
+                "meta": { "name": "h2-parent" },
+                "extends": "h2-grand"
+            }"#,
+        )
+        .expect("write parent profile");
+        let child_path = dir.path().join("h2-child.json");
+        std::fs::write(
+            &child_path,
+            r#"{
+                "meta": { "name": "h2-child" },
+                "extends": "h2-parent",
+                "network": { "allow_http2": false }
+            }"#,
+        )
+        .expect("write child profile");
+
+        let profile = load_from_file(&child_path, &[]).expect("load child with extends");
+        assert_eq!(profile.network.allow_http2, InheritableValue::Set(false));
+        assert!(
+            !profile.network.resolved_allow_http2(),
+            "child allow_http2:false must override inherited true"
+        );
+    }
+
+    #[test]
+    fn test_extends_allow_http2_child_absent_inherits_true() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        std::fs::write(
+            dir.path().join("h2-base.json"),
+            r#"{
+                "meta": { "name": "h2-base" },
+                "network": { "allow_http2": true }
+            }"#,
+        )
+        .expect("write base profile");
+        let child_path = dir.path().join("h2-absent.json");
+        std::fs::write(
+            &child_path,
+            r#"{
+                "meta": { "name": "h2-absent" },
+                "extends": "h2-base"
+            }"#,
+        )
+        .expect("write child profile");
+
+        let profile = load_from_file(&child_path, &[]).expect("load child with extends");
+        assert_eq!(profile.network.allow_http2, InheritableValue::Set(true));
+        assert!(profile.network.resolved_allow_http2());
     }
 
     #[test]

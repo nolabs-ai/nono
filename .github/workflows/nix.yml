@@ -28,9 +28,9 @@ jobs:
       fail-fast: false
       matrix:
         # ubuntu-latest: x86_64-linux + aarch64-linux (cross-eval)
-        # macos-15-intel: x86_64-darwin (Intel, retires Aug 2027)
-        # macos-14: aarch64-darwin (Apple Silicon)
-        runner: [ubuntu-latest, macos-15-intel, macos-14]
+        # macos-26-intel: x86_64-darwin (Intel, retires ~Nov 2028)
+        # macos-26: aarch64-darwin (Apple Silicon)
+        runner: [ubuntu-latest, macos-26-intel, macos-26]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     steps:

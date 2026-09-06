@@ -697,7 +697,7 @@
 
 ### Features
 
-- Add Nix flake support for installing nono via `nix run` or `nix profile add` from prebuilt release binaries or from source
+- Add Nix flake support for installing nono via `nix run` or `nix profile add`
 
 - *(profile)* Add repeatable `--extends <PROFILE>` support for profile-consuming commands, allowing one invocation to compose a selected `--profile` with additional base profiles ([#956](https://github.com/nolabs-ai/nono/issues/956))
 

@@ -7,7 +7,7 @@ use colored::Colorize;
 use nono::SandboxViolation;
 use nono::{AccessMode, CapabilitySet, NonoError, Result, UrlDenialReason, UrlDenialRecord};
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{BufRead, IsTerminal, Write};
+use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy)]
@@ -225,9 +225,10 @@ pub(crate) fn terminal_prompts_available() -> bool {
     ) {
         return false;
     }
-    std::io::stdin().is_terminal()
-        || std::io::stderr().is_terminal()
-        || std::fs::File::open("/dev/tty").is_ok()
+    // stdin/stderr being a tty doesn't mean we have a controlling terminal
+    // (e.g. a new session can inherit a tty stdin with none). Check /dev/tty
+    // directly so we don't promise a prompt we can't open later.
+    std::fs::File::open("/dev/tty").is_ok()
 }
 
 pub(crate) fn offer_save_run_profile(offer: &ProfileSaveOffer<'_>) -> Result<()> {

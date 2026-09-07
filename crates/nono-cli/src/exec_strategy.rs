@@ -1829,7 +1829,10 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
                     ignored_denial_paths: config.ignored_denial_paths,
                     url_denials: &url_denials,
                 };
-                offer_profile_save_for_child(pty_proxy.as_mut(), &offer)?;
+                // Don't let a prompt failure override the child's exit code.
+                if let Err(e) = offer_profile_save_for_child(pty_proxy.as_mut(), &offer) {
+                    eprintln!("nono: {e}");
+                }
             }
 
             Ok(exit_code)

@@ -92,7 +92,7 @@ pub enum NonoError {
     #[error("Setup error: {0}")]
     Setup(String),
 
-    #[error("Learn mode error: {0}")]
+    #[error("Profile save error: {0}")]
     LearnError(String),
 
     #[error("Hook installation error: {0}")]

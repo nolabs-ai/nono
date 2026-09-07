@@ -303,7 +303,7 @@ fn strip_settings_entries(path: &Path, home: &Path) -> Result<Vec<(String, Strin
     let serialized = serde_json::to_string_pretty(&settings)
         .map_err(|e| NonoError::HookInstall(format!("serialize {}: {e}", path.display())))?;
     let tmp = path.with_extension("json.nono-tmp");
-    fs::write(&tmp, format!("{serialized}\n")).map_err(NonoError::Io)?;
+    crate::wiring::write_tmp_file(&tmp, format!("{serialized}\n").as_bytes(), None)?;
     fs::rename(&tmp, path).map_err(NonoError::Io)?;
 
     Ok(removed)

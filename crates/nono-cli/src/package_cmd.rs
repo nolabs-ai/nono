@@ -958,7 +958,8 @@ fn install_manifest_artifact(
 fn copy_instruction_to_project(artifact: &ArtifactEntry, source_path: &Path) -> Result<()> {
     let cwd = std::env::current_dir().map_err(NonoError::Io)?;
     let path = cwd.join(file_name(&artifact.path)?);
-    if path.exists() {
+    // symlink_metadata, not exists() — a dangling symlink must count as occupied.
+    if path.symlink_metadata().is_ok() {
         return Ok(());
     }
     copy_path(source_path, &path)
@@ -1296,5 +1297,50 @@ mod tests {
 
         assert_eq!(prerelease_vs_stable, Ordering::Less);
         assert_eq!(stable_vs_prerelease, Ordering::Greater);
+    }
+
+    #[test]
+    fn copy_instruction_to_project_refuses_dangling_symlink_at_dest() {
+        use crate::test_env::ENV_LOCK;
+        use std::os::unix::fs as unix_fs;
+
+        let _g = match ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let original_cwd = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(dir.path()).expect("chdir into tempdir");
+
+        let victim = dir.path().join("victim");
+        fs::write(&victim, "sensitive").expect("seed victim");
+        // A dangling symlink: exists() is false for it, but it still
+        // occupies the path and must not be written through.
+        unix_fs::symlink(
+            dir.path().join("does-not-exist"),
+            dir.path().join("CLAUDE.md"),
+        )
+        .expect("plant dangling symlink");
+
+        let source = dir.path().join("source.md");
+        fs::write(&source, "pack instructions").expect("seed source");
+        let artifact = ArtifactEntry {
+            artifact_type: ArtifactType::Instruction,
+            path: "CLAUDE.md".to_string(),
+            install_as: None,
+            placement: None,
+            prefix: None,
+            aliases: Vec::new(),
+        };
+
+        let result = copy_instruction_to_project(&artifact, &source);
+        std::env::set_current_dir(original_cwd).expect("restore cwd");
+
+        result.expect("must not error, just skip");
+        assert_eq!(
+            fs::read_to_string(&victim).expect("victim readable"),
+            "sensitive",
+            "victim must never be written through the dangling symlink"
+        );
     }
 }

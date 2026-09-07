@@ -377,7 +377,15 @@ fn execute_one(
             //     changes and we mustn't clobber them).
             //   - In pack_owned_files and content matches → overwrite
             //     freely (true idempotent re-pull).
-            if dest_path.exists() {
+            if let Ok(dest_meta) = fs::symlink_metadata(&dest_path) {
+                if !dest_meta.is_file() {
+                    return Err(NonoError::PackageInstall(format!(
+                        "write_file: refusing to write '{}' — occupied by a \
+                         symlink or special file, not a regular file. Remove \
+                         it manually then re-pull.",
+                        dest_path.display()
+                    )));
+                }
                 let recorded_hash = pack_owned_files.get(&dest_path);
                 let current_hash = match fs::read(&dest_path) {
                     Ok(b) => hash_bytes(&b),
@@ -544,7 +552,17 @@ fn reverse_one(record: &WiringRecord) -> Result<()> {
             // we wrote — otherwise the user has modified it and we
             // leave it alone (security review fix).
             let path = Path::new(dest);
-            if !path.exists() {
+            let meta = match fs::symlink_metadata(path) {
+                Ok(m) => m,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(e) => return Err(NonoError::Io(e)),
+            };
+            if !meta.is_file() {
+                tracing::info!(
+                    "write_file: leaving '{}' in place — occupied by a \
+                     symlink or special file, not the regular file we wrote.",
+                    path.display()
+                );
                 return Ok(());
             }
             let bytes = fs::read(path).map_err(NonoError::Io)?;
@@ -745,10 +763,11 @@ fn copy_file_atomic(source: &Path, dest: &Path) -> Result<CopyOutcome> {
     let source_bytes = fs::read(source).map_err(NonoError::Io)?;
     let source_perms = safe_perms(fs::metadata(source).map_err(NonoError::Io)?.permissions());
     let sha256 = hash_bytes(&source_bytes);
-    // Skip-no-op only if existing content matches exactly. Caller has
-    // already enforced the conflict policy (only owned files reach
-    // here when dest exists), so a hash match is a real no-op re-pull.
-    if let Ok(existing) = fs::read(dest)
+    // No-op only on a hash match against a plain dest file — never read
+    // or chmod through a symlink (caller already enforced ownership).
+    let dest_is_plain_file = fs::symlink_metadata(dest).is_ok_and(|m| m.is_file());
+    if dest_is_plain_file
+        && let Ok(existing) = fs::read(dest)
         && existing == source_bytes
     {
         sync_permissions(dest, &source_perms)?;
@@ -758,7 +777,7 @@ fn copy_file_atomic(source: &Path, dest: &Path) -> Result<CopyOutcome> {
         });
     }
     let tmp = dest.with_extension("nono-tmp");
-    write_tmp_file(&tmp, &source_bytes, &source_perms)?;
+    write_tmp_file(&tmp, &source_bytes, Some(&source_perms))?;
     fs::rename(&tmp, dest).map_err(NonoError::Io)?;
     Ok(CopyOutcome {
         mutated: true,
@@ -766,25 +785,32 @@ fn copy_file_atomic(source: &Path, dest: &Path) -> Result<CopyOutcome> {
     })
 }
 
-/// Creates `tmp` fresh with `perms` set at creation, so it never exists at a
-/// looser mode and never writes through a pre-planted symlink. Retries once
-/// past a leftover tmp file from an interrupted prior run.
-fn write_tmp_file(tmp: &Path, bytes: &[u8], perms: &std::fs::Permissions) -> Result<()> {
+/// Creates `tmp` fresh (mode set at creation, default `0o644`), refusing to
+/// follow a pre-planted symlink. Shared by every `.nono-tmp`-then-rename site.
+pub(crate) fn write_tmp_file(
+    tmp: &Path,
+    bytes: &[u8],
+    perms: Option<&std::fs::Permissions>,
+) -> Result<()> {
     for _ in 0..2 {
         #[cfg(unix)]
         let opened = {
             use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            let mode = perms.map_or(0o644, std::fs::Permissions::mode);
             fs::OpenOptions::new()
                 .create_new(true)
                 .write(true)
-                .mode(perms.mode())
+                .mode(mode)
                 .open(tmp)
         };
         #[cfg(not(unix))]
-        let opened = fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(tmp);
+        let opened = {
+            let _ = perms;
+            fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(tmp)
+        };
 
         match opened {
             Ok(mut file) => {
@@ -1101,7 +1127,7 @@ fn write_json(path: &Path, value: &Value) -> Result<()> {
     let pretty = serde_json::to_string_pretty(value)
         .map_err(|e| NonoError::PackageInstall(format!("serialize {}: {e}", path.display())))?;
     let tmp = path.with_extension("json.nono-tmp");
-    fs::write(&tmp, format!("{pretty}\n")).map_err(NonoError::Io)?;
+    write_tmp_file(&tmp, format!("{pretty}\n").as_bytes(), None)?;
     fs::rename(&tmp, path).map_err(NonoError::Io)?;
     Ok(())
 }
@@ -1398,7 +1424,7 @@ fn write_yaml(path: &Path, value: &Value) -> Result<()> {
     let serialized = yaml::to_string(&yaml_val)
         .map_err(|e| NonoError::PackageInstall(format!("serialize {}: {e}", path.display())))?;
     let tmp = path.with_extension("yaml.nono-tmp");
-    fs::write(&tmp, &serialized).map_err(NonoError::Io)?;
+    write_tmp_file(&tmp, serialized.as_bytes(), None)?;
     fs::rename(&tmp, path).map_err(NonoError::Io)?;
     Ok(())
 }
@@ -1516,7 +1542,7 @@ fn upsert_toml_block(file: &Path, marker_id: &str, body: &str) -> Result<bool> {
         fs::create_dir_all(parent).map_err(NonoError::Io)?;
     }
     let tmp = file.with_extension("toml.nono-tmp");
-    fs::write(&tmp, &updated).map_err(NonoError::Io)?;
+    write_tmp_file(&tmp, updated.as_bytes(), None)?;
     fs::rename(&tmp, file).map_err(NonoError::Io)?;
     Ok(true)
 }
@@ -1537,7 +1563,7 @@ fn strip_toml_block(file: &Path, marker_id: &str) -> Result<()> {
         out.pop();
     }
     let tmp = file.with_extension("toml.nono-tmp");
-    fs::write(&tmp, &out).map_err(NonoError::Io)?;
+    write_tmp_file(&tmp, out.as_bytes(), None)?;
     fs::rename(&tmp, file).map_err(NonoError::Io)?;
     Ok(())
 }
@@ -2132,6 +2158,31 @@ mod tests {
     }
 
     #[test]
+    fn write_file_refuses_to_write_when_dest_is_symlink() {
+        with_fake_home(|home| {
+            let pack = home.join("pack");
+            fs::create_dir_all(&pack).expect("mkdir pack");
+            fs::write(pack.join("file"), "pack content").expect("seed source");
+            let victim = home.join("victim");
+            fs::write(&victim, "sensitive").expect("seed victim");
+            unix_fs::symlink(&victim, home.join("dest")).expect("plant symlink at dest");
+            let ctx = ctx_in(home, pack);
+            let directives = vec![WiringDirective::WriteFile {
+                source: "file".to_string(),
+                dest: "$HOME/dest".to_string(),
+            }];
+
+            let result = exec(&directives, &ctx);
+            assert!(result.is_err(), "must refuse a dest occupied by a symlink");
+            assert_eq!(
+                fs::read_to_string(&victim).expect("victim readable"),
+                "sensitive",
+                "victim must never be read or chmod'd through the symlink"
+            );
+        });
+    }
+
+    #[test]
     fn write_file_refuses_to_overwrite_unmanaged_file() {
         with_fake_home(|home| {
             let pack = home.join("pack");
@@ -2376,6 +2427,38 @@ mod tests {
             assert_eq!(
                 fs::read_to_string(home.join("dest")).expect("read"),
                 "user edited",
+            );
+        });
+    }
+
+    #[test]
+    fn write_file_reverse_leaves_symlinked_dest_alone() {
+        with_fake_home(|home| {
+            let pack = home.join("pack");
+            fs::create_dir_all(&pack).expect("mkdir pack");
+            fs::write(pack.join("file"), "from-pack").expect("seed source");
+            let ctx = ctx_in(home, pack);
+            let directives = vec![WiringDirective::WriteFile {
+                source: "file".to_string(),
+                dest: "$HOME/dest".to_string(),
+            }];
+            let r1 = exec(&directives, &ctx).expect("install");
+
+            let victim = home.join("victim");
+            fs::write(&victim, "sensitive").expect("seed victim");
+            fs::remove_file(home.join("dest")).expect("remove installed file");
+            unix_fs::symlink(&victim, home.join("dest")).expect("plant symlink at dest");
+
+            rev(&r1.records);
+
+            assert!(
+                home.join("dest").is_symlink(),
+                "reverse must not blindly remove a symlink at dest"
+            );
+            assert_eq!(
+                fs::read_to_string(&victim).expect("victim readable"),
+                "sensitive",
+                "victim must never be read through the symlink during reverse"
             );
         });
     }

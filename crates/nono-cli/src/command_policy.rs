@@ -820,6 +820,12 @@ pub struct CommandSandboxConfig {
     /// tools like `git` that re-exec their own helpers by absolute path.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub exec_paths: Vec<String>,
+    /// Exact-file Unix domain socket grants this command may `connect` or
+    /// `bind` to (e.g. a daemon's IPC socket it starts on demand). Mirrors
+    /// the agent-level `filesystem.unix_socket_bind` field but scoped to a
+    /// single command. Supports dynamic-provider tokens.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unix_socket_bind: Vec<String>,
 }
 
 impl CommandSandboxConfig {
@@ -848,6 +854,7 @@ impl CommandSandboxConfig {
                 &child.unsafe_macos_seatbelt_rules,
             ),
             exec_paths: dedup_append(&self.exec_paths, &child.exec_paths),
+            unix_socket_bind: dedup_append(&self.unix_socket_bind, &child.unix_socket_bind),
         }
     }
 }

@@ -123,6 +123,8 @@ tool-sandbox policies live under `command_policies`. Use `commands.<name>.execut
 
 Command sandbox path lists (`fs_read`, `fs_write`, `fs_read_file`, `fs_write_file`) may use dynamic provider tokens. `@git:config-files` expands to trusted global/system Git config files, Git file settings (attributes, excludes, commit templates), and the declared target of every `include.path` and `includeIf.*.path` directive — including conditional includes that do not currently fire. `@git:hooks-path` expands to trusted global/system `core.hooksPath` directories. `@git:common-dir` expands to the git common directory (`.git` in a regular repo, or the absolute path to the main repo's `.git` in a worktree). `@git:worktree` expands to the main worktree root (empty in a regular repo). `@git:toplevel` expands to the current checkout root. `@git:toplevel-parent` expands to the parent of the current checkout root. These tokens are opt-in per profile and ignore repo-local/worktree Git config so a checkout cannot grant itself extra host filesystem access.
 
+`unix_socket_bind` (command sandbox only) grants `connect(2)`/`bind(2)` on named pathname AF_UNIX sockets, with the same implied filesystem coupling as the agent-level field of the same name. It also accepts the `@git:fsmonitor-socket` dynamic token, which expands to `fsmonitor--daemon.ipc` under the current worktree's private git-dir — resolved by a pure filesystem walk (no `git` process spawn), so an attacker-controlled working directory cannot influence resolution through `.git/config`.
+
 ```json
 {
   "command_policies": {

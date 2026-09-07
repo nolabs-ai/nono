@@ -72,14 +72,13 @@ pub(super) mod git {
         }
     }
 
-    /// Resolve the git-dir for the repo/worktree rooted at `worktree_root`.
-    /// A `.git` directory resolves to itself; a `.git` file (linked worktree)
-    /// is followed via its `gitdir: <path>` line. Never spawns a process.
+    /// Resolves a `.git` file's `gitdir:` pointer with backlink verification
+    /// (agent-controlled), pre-canonicalized to avoid a TOCTOU re-resolve.
     fn resolve_git_dir(worktree_root: &Path) -> Option<PathBuf> {
         let dot_git = worktree_root.join(".git");
         let meta = std::fs::symlink_metadata(&dot_git).ok()?;
         if meta.is_dir() {
-            return Some(dot_git);
+            return dot_git.canonicalize().ok();
         }
         let contents = std::fs::read_to_string(&dot_git).ok()?;
         let raw = contents
@@ -92,19 +91,36 @@ pub(super) mod git {
             return None;
         }
         let pointed = PathBuf::from(raw);
-        Some(if pointed.is_absolute() {
+        let candidate = if pointed.is_absolute() {
             pointed
         } else {
             worktree_root.join(pointed)
-        })
+        };
+        verify_worktree_backlink(&candidate, &dot_git)
     }
 
-    /// Resolve the git *common* directory for the repo/worktree rooted at
-    /// `worktree_root` — the main repo's `.git` even when called from a
-    /// linked worktree. Follows the `commondir` file git itself writes
-    /// inside a linked worktree's private gitdir (pointing back at the main
-    /// repo's `.git`, relative to that private gitdir) if present. Never
-    /// spawns a process.
+    /// Rejects a forged `gitdir:` pointer lacking the real worktree's
+    /// backlink to `dot_git`.
+    fn verify_worktree_backlink(candidate: &Path, dot_git: &Path) -> Option<PathBuf> {
+        let canonical_candidate = candidate.canonicalize().ok()?;
+        let contents = std::fs::read_to_string(canonical_candidate.join("gitdir")).ok()?;
+        let raw = contents.lines().next()?.trim();
+        if raw.is_empty() {
+            return None;
+        }
+        let backlink_raw = PathBuf::from(raw);
+        let backlink_path = if backlink_raw.is_absolute() {
+            backlink_raw
+        } else {
+            canonical_candidate.join(backlink_raw)
+        };
+        let backlink = backlink_path.canonicalize().ok()?;
+        let expected = dot_git.canonicalize().ok()?;
+        (backlink == expected).then_some(canonical_candidate)
+    }
+
+    /// Resolves `commondir` with backlink verification, or a writable `.git`
+    /// could grant itself write access anywhere via `@git:common-dir`.
     fn resolve_common_dir(worktree_root: &Path) -> Option<PathBuf> {
         let git_dir = resolve_git_dir(worktree_root)?;
         let commondir_file = git_dir.join("commondir");
@@ -116,11 +132,22 @@ pub(super) mod git {
             return Some(git_dir);
         }
         let pointed = PathBuf::from(raw);
-        Some(if pointed.is_absolute() {
+        let candidate = if pointed.is_absolute() {
             pointed
         } else {
             git_dir.join(pointed)
-        })
+        };
+        verify_common_dir_backlink(&candidate, &git_dir)
+    }
+
+    /// Rejects a forged `commondir` pointer lacking the real common-dir's
+    /// `worktrees/<name>` backlink to `git_dir`.
+    fn verify_common_dir_backlink(candidate: &Path, git_dir: &Path) -> Option<PathBuf> {
+        let canonical_candidate = candidate.canonicalize().ok()?;
+        let name = git_dir.file_name()?;
+        let expected_link = canonical_candidate.join("worktrees").join(name);
+        let backlink = expected_link.canonicalize().ok()?;
+        (backlink == git_dir).then_some(canonical_candidate)
     }
 
     /// Run `git rev-parse --show-toplevel` from `cwd` (or the process cwd when
@@ -218,6 +245,38 @@ pub(super) mod git {
         run_main_worktree(Some(cwd))
     }
 
+    /// Uses the per-worktree git-dir, not the common dir, since the fsmonitor
+    /// daemon watches one working directory.
+    pub(crate) fn read_fsmonitor_socket(workdir: Option<&Path>) -> Result<Vec<String>> {
+        run_fsmonitor_socket(workdir)
+    }
+
+    fn run_fsmonitor_socket(cwd: Option<&Path>) -> Result<Vec<String>> {
+        let start = match cwd {
+            Some(d) => d.to_path_buf(),
+            None => match std::env::current_dir() {
+                Ok(d) => d,
+                Err(_) => return Ok(vec![]),
+            },
+        };
+        let Some(toplevel) = find_git_toplevel(&start) else {
+            return Ok(vec![]);
+        };
+        let Some(git_dir) = resolve_git_dir(&toplevel) else {
+            return Ok(vec![]);
+        };
+        let Some(path) = git_dir.to_str() else {
+            return Ok(vec![]);
+        };
+        Ok(vec![format!("{path}/fsmonitor--daemon.ipc")])
+    }
+
+    /// Test seam: run the fsmonitor-socket provider from a specific directory.
+    #[cfg(test)]
+    pub(super) fn read_fsmonitor_socket_in(cwd: &Path) -> Result<Vec<String>> {
+        run_fsmonitor_socket(Some(cwd))
+    }
+
     /// Return the absolute path of the current git checkout root
     /// (`git rev-parse --show-toplevel`).
     ///
@@ -303,7 +362,10 @@ pub(super) mod git {
             return Ok(vec![]);
         };
 
-        let is_regular_dot_git = common_dir == toplevel.join(".git");
+        // `common_dir` is canonical, so compare against a canonical
+        // `toplevel/.git` or a symlinked cwd (e.g. /tmp) misses the match.
+        let canonical_dot_git = toplevel.join(".git").canonicalize().ok();
+        let is_regular_dot_git = canonical_dot_git.as_deref() == Some(common_dir.as_path());
         let started_at_toplevel = match (start.canonicalize(), toplevel.canonicalize()) {
             (Ok(a), Ok(b)) => a == b,
             _ => false,
@@ -312,10 +374,7 @@ pub(super) mod git {
             return Ok(vec![".git".to_string()]);
         }
 
-        let Ok(canonical) = common_dir.canonicalize() else {
-            return Ok(vec![]);
-        };
-        let Some(path) = canonical.to_str() else {
+        let Some(path) = common_dir.to_str() else {
             return Ok(vec![]);
         };
         Ok(vec![path.to_string()])
@@ -502,6 +561,7 @@ fn dispatch_token(
             "worktree" => git::read_main_worktree(workdir),
             "toplevel" => git::read_toplevel(workdir),
             "toplevel-parent" => git::read_toplevel_parent(workdir),
+            "fsmonitor-socket" => git::read_fsmonitor_socket(workdir),
             other => Err(NonoError::ProfileParse(format!(
                 "unknown git provider query '{other}'"
             ))),
@@ -1079,6 +1139,78 @@ global\tfile:/home/u/.gitconfig\tuser.name=Alice
     }
 
     #[test]
+    fn git_read_common_dir_rejects_forged_commondir_pointer_in_regular_repo() {
+        // A forged `commondir` pointing at an arbitrary directory must not
+        // resolve — that directory lacks the real worktrees/<name> backlink.
+        use std::process::Command;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).expect("mkdir repo");
+        Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&repo)
+            .status()
+            .expect("git init");
+        let victim = tmp.path().join("victim");
+        std::fs::create_dir(&victim).expect("mkdir victim");
+
+        std::fs::write(
+            repo.join(".git").join("commondir"),
+            format!("{}\n", victim.display()),
+        )
+        .expect("write forged commondir file");
+
+        let result = git::read_common_dir_in(&repo).expect("read_common_dir");
+        assert!(
+            result.is_empty(),
+            "must not resolve a commondir: pointer lacking the real worktrees/<name> backlink, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn git_read_common_dir_rejects_commondir_pointer_with_mismatched_backlink() {
+        // A worktrees/<name> entry that resolves to the wrong git-dir must
+        // not count as a valid backlink.
+        use std::process::Command;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).expect("mkdir repo");
+        Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&repo)
+            .status()
+            .expect("git init");
+        let victim = tmp.path().join("victim");
+        let repo_git_name = repo
+            .join(".git")
+            .canonicalize()
+            .expect("canonicalize")
+            .file_name()
+            .expect("file_name")
+            .to_owned();
+        std::fs::create_dir_all(victim.join("worktrees")).expect("mkdir victim/worktrees");
+        let unrelated = tmp.path().join("unrelated-gitdir");
+        std::fs::create_dir(&unrelated).expect("mkdir unrelated");
+        std::os::unix::fs::symlink(&unrelated, victim.join("worktrees").join(&repo_git_name))
+            .expect("symlink victim/worktrees/<name> to unrelated dir");
+
+        std::fs::write(
+            repo.join(".git").join("commondir"),
+            format!("{}\n", victim.display()),
+        )
+        .expect("write forged commondir file");
+
+        let result = git::read_common_dir_in(&repo).expect("read_common_dir");
+        assert!(
+            result.is_empty(),
+            "must not resolve when victim/worktrees/<name> resolves to a different directory than this repo's git-dir, got {:?}",
+            result
+        );
+    }
+
+    #[test]
     fn git_read_main_worktree_returns_empty_in_regular_repo() {
         use std::process::Command;
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -1164,6 +1296,186 @@ global\tfile:/home/u/.gitconfig\tuser.name=Alice
             result.is_empty(),
             "expected empty outside repo, got {:?}",
             result
+        );
+    }
+
+    #[test]
+    fn git_read_fsmonitor_socket_returns_path_under_dot_git_in_regular_repo() {
+        use std::process::Command;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).expect("mkdir repo");
+        Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&repo)
+            .status()
+            .expect("git init");
+
+        let result = git::read_fsmonitor_socket_in(&repo).expect("read_fsmonitor_socket");
+        assert_eq!(result.len(), 1, "expected one entry, got {:?}", result);
+        let socket = std::path::Path::new(&result[0]);
+        assert_eq!(
+            socket,
+            repo.join(".git")
+                .canonicalize()
+                .expect("canonicalize")
+                .join("fsmonitor--daemon.ipc"),
+        );
+    }
+
+    #[test]
+    fn git_read_fsmonitor_socket_returns_path_under_private_worktree_gitdir() {
+        use std::process::Command;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).expect("mkdir repo");
+        Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&repo)
+            .status()
+            .expect("git init");
+        let commit = Command::new("git")
+            .args([
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "user.email=t@t.com",
+                "-c",
+                "user.name=T",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "init",
+            ])
+            .current_dir(&repo)
+            .status()
+            .expect("git commit");
+        assert!(commit.success(), "git commit failed: {commit}");
+
+        let wt = tmp.path().join("worktree");
+        let worktree_add = Command::new("git")
+            .args(["worktree", "add", wt.to_str().expect("utf8")])
+            .current_dir(&repo)
+            .status()
+            .expect("git worktree add");
+        assert!(
+            worktree_add.success(),
+            "git worktree add failed: {worktree_add}"
+        );
+
+        let result = git::read_fsmonitor_socket_in(&wt).expect("read_fsmonitor_socket in worktree");
+        assert_eq!(result.len(), 1, "expected one entry, got {:?}", result);
+        let socket = std::path::Path::new(&result[0]);
+        assert_eq!(
+            socket,
+            repo.join(".git")
+                .join("worktrees")
+                .join("worktree")
+                .canonicalize()
+                .expect("canonicalize")
+                .join("fsmonitor--daemon.ipc"),
+            "fsmonitor socket must live under the worktree's own private git-dir, not the common dir"
+        );
+    }
+
+    #[test]
+    fn git_read_fsmonitor_socket_returns_empty_outside_git_repo() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let result = git::read_fsmonitor_socket_in(tmp.path()).expect("read_fsmonitor_socket");
+        assert!(
+            result.is_empty(),
+            "expected empty outside repo, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn git_read_fsmonitor_socket_rejects_gitdir_pointer_without_backlink() {
+        // A forged `gitdir:` pointer at an arbitrary directory must not
+        // resolve — that directory lacks the real gitdir backlink.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let checkout = tmp.path().join("checkout");
+        std::fs::create_dir(&checkout).expect("mkdir checkout");
+        let victim = tmp.path().join("victim");
+        std::fs::create_dir(&victim).expect("mkdir victim");
+
+        std::fs::write(
+            checkout.join(".git"),
+            format!("gitdir: {}\n", victim.display()),
+        )
+        .expect("write forged .git file");
+
+        let result = git::read_fsmonitor_socket_in(&checkout).expect("read_fsmonitor_socket");
+        assert!(
+            result.is_empty(),
+            "must not resolve a gitdir: pointer lacking the real backlink, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn git_read_fsmonitor_socket_rejects_gitdir_pointer_with_mismatched_backlink() {
+        // A `gitdir` backlink naming the wrong `.git` file must not count.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let checkout = tmp.path().join("checkout");
+        std::fs::create_dir(&checkout).expect("mkdir checkout");
+        let victim = tmp.path().join("victim");
+        std::fs::create_dir(&victim).expect("mkdir victim");
+        let unrelated = tmp.path().join("unrelated.git");
+        std::fs::write(&unrelated, "").expect("write unrelated file");
+
+        std::fs::write(
+            checkout.join(".git"),
+            format!("gitdir: {}\n", victim.display()),
+        )
+        .expect("write forged .git file");
+        std::fs::write(victim.join("gitdir"), format!("{}\n", unrelated.display()))
+            .expect("write mismatched backlink");
+
+        let result = git::read_fsmonitor_socket_in(&checkout).expect("read_fsmonitor_socket");
+        assert!(
+            result.is_empty(),
+            "must not resolve when the backlink names a different .git file, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn git_read_fsmonitor_socket_accepts_gitdir_pointer_with_relative_backlink() {
+        // The private gitdir's own `gitdir` backlink file is resolved
+        // relative to the private gitdir itself, not the process cwd, so a
+        // valid relative backlink (as a real repository may write) must
+        // still verify.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let checkout = tmp.path().join("checkout");
+        std::fs::create_dir(&checkout).expect("mkdir checkout");
+        let private = tmp.path().join("repo/.git/worktrees/wt");
+        std::fs::create_dir_all(&private).expect("mkdir private gitdir");
+
+        std::fs::write(
+            checkout.join(".git"),
+            format!("gitdir: {}\n", private.display()),
+        )
+        .expect("write .git file");
+        // Relative from `private` (tmp/repo/.git/worktrees/wt) back up to
+        // `checkout/.git`.
+        std::fs::write(private.join("gitdir"), "../../../../checkout/.git\n")
+            .expect("write relative backlink");
+
+        let result = git::read_fsmonitor_socket_in(&checkout).expect("read_fsmonitor_socket");
+        assert_eq!(
+            result.len(),
+            1,
+            "a valid relative backlink must still resolve, got {:?}",
+            result
+        );
+        let socket = std::path::Path::new(&result[0]);
+        assert_eq!(
+            socket,
+            private
+                .canonicalize()
+                .expect("canonicalize")
+                .join("fsmonitor--daemon.ipc"),
         );
     }
 

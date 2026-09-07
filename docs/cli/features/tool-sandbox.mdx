@@ -96,6 +96,7 @@ The selected `sandbox` object describes what the child receives:
 | `allow_launch_services` | boolean | macOS-only direct LaunchServices URL opening. |
 | `allow_raw_file_credentials_in_chained_policy` | boolean | Required before non-session callers can receive raw-file credentials. |
 | `unsafe_macos_seatbelt_rules` | string array | macOS-only escape hatch: raw Seatbelt rules appended to this command's child profile after the deny gate (last-match-wins). Mirrors the top-level `unsafe_macos_seatbelt_rules` but scoped to one command/intercept. Use sparingly — e.g. to let a command exec + read a binary it forks by absolute path. Honoured only for **user-authored profiles** (same trust boundary as `binary` — see below); pack and built-in profiles have these rules stripped with a warning. |
+| `unix_socket_bind` | path array | Grant `connect(2)` and `bind(2)` on the named pathname AF_UNIX socket files (supports the dynamic tokens below). Implied filesystem grant is ReadWrite on the file if it already exists, otherwise ReadWrite on its parent directory (so `bind(2)` can create it) — mirrors the agent-level `unix_socket_bind` field, see [AF_UNIX Socket Grants](/cli/features/profiles-groups#af-unix-socket-grants). A path that resolves to an existing dangling symlink is rejected. |
 
 ### Per-Intercept Sandbox Override
 
@@ -170,6 +171,7 @@ Supported tokens:
 | `@git:worktree` | `fs_read`, `fs_write` | The main worktree root (parent of `@git:common-dir`). Empty in a regular repo; in a linked worktree it is the absolute path to the main repo root. `git worktree add` changes CWD to the main repo root, so without this `getcwd()` fails with EPERM. |
 | `@git:toplevel` | `fs_read`, `fs_write` | Absolute path of the current checkout root (`git rev-parse --show-toplevel`). In a linked worktree this is the worktree's own root, not the main repo. |
 | `@git:toplevel-parent` | `fs_write` | Parent directory of `@git:toplevel`. Required for `git worktree add ../sibling`, where the new worktree is created adjacent to the current checkout. |
+| `@git:fsmonitor-socket` | `unix_socket_bind` | Path to `fsmonitor--daemon.ipc` under the current worktree's private git-dir (not the shared common dir — each worktree runs its own fsmonitor daemon). Pair with `unix_socket_bind` to let `core.fsmonitor=true` reach the daemon's socket. |
 
 Example:
 
@@ -192,6 +194,8 @@ Example:
 The Git provider reads `git config --list --show-origin --show-scope` and keeps only `global` and `system` scoped paths. It ignores `local` and `worktree` scopes so a repository cannot grant itself additional host filesystem access through `.git/config`. If `git` is unavailable or returns no matching paths, the token expands to no paths.
 
 The `@git:common-dir` token runs `git rev-parse --git-common-dir` from nono's working directory at sandbox-prepare time. In a regular repo it returns `.git` (relative, resolved against `$WORKDIR`). In a worktree it returns the absolute path to the main repo's `.git`. If git is unavailable or the process is not inside a repo, the token expands to no paths. The `@git:worktree`, `@git:toplevel`, and `@git:toplevel-parent` tokens are derived from the same git invocations and behave the same way when git is unavailable.
+
+`@git:fsmonitor-socket` is resolved without spawning `git`: it walks the filesystem from the current working directory to find the checkout (reading `.git`, then following a `gitdir:`/`commondir` pointer file when present) and appends `fsmonitor--daemon.ipc` to the private per-worktree git-dir. This mirrors the no-process-spawn approach the other path-resolution tokens use internally, so a working directory with an attacker-controlled `.git/config` cannot influence resolution through `core.pager` or similar. If the process is not inside a git repo, the token expands to no paths.
 
 `@git:config-files` expands to the config files git reads in the current context, plus the declared target of every `include.path` and `includeIf.*.path` directive in trusted `global` and `system` scopes — including conditional includes whose condition does not currently fire (e.g. a `hasconfig:remote.*.url` rule that only matches certain repositories). A conditional include that is false now is still grantable because a later git operation — such as `git worktree add` for a repo with a matching remote — may make the condition fire. Like the other git tokens it keeps only `global` and `system` scopes; per-repo `.git/config` entries are not trusted.
 

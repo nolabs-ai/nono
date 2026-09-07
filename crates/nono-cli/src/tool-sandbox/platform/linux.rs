@@ -3544,6 +3544,14 @@ fn build_child_caps(
         &state.outer_caps,
         &state.deny_paths,
     )?;
+    add_policy_unix_sockets(
+        &mut caps,
+        policy,
+        &state.policy_root,
+        cwd,
+        &state.outer_caps,
+        &state.deny_paths,
+    )?;
     add_policy_network(&mut caps, policy)?;
     add_policy_proxy_network(&mut caps, state, request, policy)?;
     add_proxy_trust_bundle_caps(&mut caps, state, policy)?;
@@ -3804,6 +3812,74 @@ fn add_policy_fs(
         }
     }
     Ok(())
+}
+
+fn add_policy_unix_sockets(
+    caps: &mut CapabilitySet,
+    policy: &CommandSandboxConfig,
+    policy_root: &Path,
+    cwd: &Path,
+    outer_caps: &CapabilitySet,
+    deny_paths: &[PathBuf],
+) -> Result<()> {
+    use super::dynamic_providers::expand_dynamic_tokens;
+    // Must canonicalize cwd to match dynamic-token providers, or a symlinked
+    // cwd escapes the write non-escalation downgrade.
+    let canonical_cwd = cwd
+        .canonicalize()
+        .unwrap_or_else(|_| super::lexically_normalize(cwd));
+    let write_access = |path: &Path| {
+        let normalized = super::lexically_normalize(path);
+        // `normalized` is only lexically cleaned, not canonicalized, so it
+        // must be compared against both the raw and canonical cwd or a
+        // symlinked cwd bypasses the downgrade below.
+        if (normalized.starts_with(cwd) || normalized.starts_with(&canonical_cwd))
+            && !super::agent_can_write(&normalized, policy_root, outer_caps, deny_paths)
+        {
+            AccessMode::Read
+        } else {
+            AccessMode::ReadWrite
+        }
+    };
+    for entry in &expand_dynamic_tokens(&policy.unix_socket_bind, Some(cwd), outer_caps)? {
+        let path = resolve_policy_path(entry, policy_root, cwd)?;
+        let access = write_access(&path);
+        add_optional_unix_socket_bind(caps, path, access)?;
+    }
+    Ok(())
+}
+
+fn add_optional_unix_socket_bind(
+    caps: &mut CapabilitySet,
+    path: PathBuf,
+    access: AccessMode,
+) -> Result<()> {
+    // Dangling-symlink guard: bind(2) would punch through to the link
+    // target, so reject rather than silently skip.
+    if path.symlink_metadata().is_ok() && !path.exists() {
+        return Err(NonoError::SandboxInit(format!(
+            "unix_socket_bind rejects dangling symlink (bind would punch \
+             through to the link target): '{}'",
+            path.display()
+        )));
+    }
+    match UnixSocketCapability::new_file(&path, UnixSocketMode::ConnectBind) {
+        Ok(capability) => {
+            caps.add_unix_socket(capability);
+            // bind(2) creates the socket if absent, so grant the parent dir
+            // when it doesn't exist yet, or the exact file when it does.
+            if path.exists() {
+                caps.add_fs(FsCapability::new_file(&path, access)?);
+            } else if let Some(parent) = path.parent()
+                && !crate::query_ext::is_sensitive_root(parent)
+            {
+                add_optional_dir(caps, parent.to_path_buf(), access)?;
+            }
+            Ok(())
+        }
+        Err(NonoError::PathNotFound(_)) => Ok(()),
+        Err(err) => Err(err),
+    }
 }
 
 fn add_optional_dir(caps: &mut CapabilitySet, path: PathBuf, access: AccessMode) -> Result<()> {
@@ -6641,6 +6717,321 @@ mod tests {
         assert_eq!(restored_cap.original, link);
         assert_eq!(restored_cap.resolved, resolved);
 
+        Ok(())
+    }
+
+    #[test]
+    fn add_optional_unix_socket_bind_rejects_dangling_symlink() -> Result<()> {
+        let temp = test_tempdir()?;
+        let link = temp.path().join("dangling.sock");
+        let missing_target = temp.path().join("does-not-exist");
+        symlink_path(&missing_target, &link)?;
+
+        let mut caps = CapabilitySet::new();
+        let err = add_optional_unix_socket_bind(&mut caps, link, AccessMode::ReadWrite)
+            .expect_err("dangling symlink must be rejected");
+        assert!(
+            format!("{err}").contains("dangling symlink"),
+            "unexpected error: {err}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn add_optional_unix_socket_bind_accepts_nonexistent_path_and_widens_fs_to_parent() -> Result<()>
+    {
+        let temp = test_tempdir()?;
+        let pending = temp.path().join("future.sock");
+        assert!(!pending.exists(), "test precondition: path must not exist");
+
+        let mut caps = CapabilitySet::new();
+        add_optional_unix_socket_bind(&mut caps, pending.clone(), AccessMode::ReadWrite)?;
+
+        let socks = caps.unix_socket_capabilities();
+        assert_eq!(socks.len(), 1);
+        assert_eq!(socks[0].mode, UnixSocketMode::ConnectBind);
+
+        let canonical_parent =
+            temp.path()
+                .canonicalize()
+                .map_err(|source| NonoError::PathCanonicalization {
+                    path: temp.path().to_path_buf(),
+                    source,
+                })?;
+        let parent_grant = caps
+            .fs_capabilities()
+            .iter()
+            .find(|c| !c.is_file && c.resolved == canonical_parent)
+            .expect("implied parent-dir fs grant missing");
+        assert_eq!(parent_grant.access, AccessMode::ReadWrite);
+        Ok(())
+    }
+
+    #[test]
+    fn add_optional_unix_socket_bind_existing_grants_readwrite_fs() -> Result<()> {
+        let temp = test_tempdir()?;
+        let sock = temp.path().join("existing.sock");
+        std::os::unix::net::UnixListener::bind(&sock).expect("create socket");
+
+        let mut caps = CapabilitySet::new();
+        add_optional_unix_socket_bind(&mut caps, sock.clone(), AccessMode::ReadWrite)?;
+
+        let socks = caps.unix_socket_capabilities();
+        assert_eq!(socks.len(), 1);
+        assert_eq!(socks[0].mode, UnixSocketMode::ConnectBind);
+
+        let canonical_sock =
+            sock.canonicalize()
+                .map_err(|source| NonoError::PathCanonicalization {
+                    path: sock.clone(),
+                    source,
+                })?;
+        let fs_match = caps
+            .fs_capabilities()
+            .iter()
+            .find(|c| c.is_file && c.resolved == canonical_sock)
+            .expect("implied fs grant not found");
+        assert_eq!(fs_match.access, AccessMode::ReadWrite);
+        Ok(())
+    }
+
+    #[test]
+    fn add_policy_unix_sockets_expands_git_fsmonitor_socket_token() -> Result<()> {
+        let temp = test_tempdir()?;
+        let repo = temp.path().join("repo");
+        create_dir(&repo)?;
+        assert!(
+            std::process::Command::new("git")
+                .arg("init")
+                .arg("-q")
+                .current_dir(&repo)
+                .status()
+                .expect("run git init")
+                .success()
+        );
+
+        let policy = CommandSandboxConfig {
+            unix_socket_bind: vec!["@git:fsmonitor-socket".to_string()],
+            ..Default::default()
+        };
+        let outer_caps = CapabilitySet::new();
+        let mut caps = CapabilitySet::new();
+        add_policy_unix_sockets(&mut caps, &policy, &repo, &repo, &outer_caps, &[])?;
+
+        let socks = caps.unix_socket_capabilities();
+        assert_eq!(socks.len(), 1);
+        assert_eq!(socks[0].mode, UnixSocketMode::ConnectBind);
+        assert!(
+            socks[0].resolved.ends_with("fsmonitor--daemon.ipc"),
+            "expected fsmonitor socket path, got {:?}",
+            socks[0].resolved
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn add_policy_unix_sockets_grants_none_when_undeclared() -> Result<()> {
+        let temp = test_tempdir()?;
+        let repo = temp.path().join("repo");
+        create_dir(&repo)?;
+
+        let policy = CommandSandboxConfig::default();
+        let outer_caps = CapabilitySet::new();
+        let mut caps = CapabilitySet::new();
+        add_policy_unix_sockets(&mut caps, &policy, &repo, &repo, &outer_caps, &[])?;
+
+        assert!(
+            caps.unix_socket_capabilities().is_empty(),
+            "a command with no unix_socket_bind entries must get no socket capability"
+        );
+        Ok(())
+    }
+
+    /// A symlinked `cwd` must not escape the write non-escalation check.
+    /// Mirrors the macOS parity test.
+    #[test]
+    fn add_policy_unix_sockets_downgrades_to_read_when_cwd_resolves_through_symlink() -> Result<()>
+    {
+        let temp = test_tempdir()?;
+        let repo = temp.path().join("repo");
+        create_dir(&repo)?;
+        assert!(
+            std::process::Command::new("git")
+                .arg("init")
+                .arg("-q")
+                .current_dir(&repo)
+                .status()
+                .expect("run git init")
+                .success()
+        );
+
+        // policy_root (the agent's own --workdir) is a sibling of the repo,
+        // so the agent itself has no write authority under the repo.
+        let policy_root = temp.path().join("agent-workdir");
+        create_dir(&policy_root)?;
+
+        let policy = CommandSandboxConfig {
+            unix_socket_bind: vec!["@git:fsmonitor-socket".to_string()],
+            ..Default::default()
+        };
+        let outer_caps = CapabilitySet::new();
+        let mut caps = CapabilitySet::new();
+        // `repo` is passed raw (un-canonicalized), exactly as a real
+        // command's `cwd` would be.
+        add_policy_unix_sockets(&mut caps, &policy, &policy_root, &repo, &outer_caps, &[])?;
+
+        let canonical_git_dir =
+            repo.join(".git")
+                .canonicalize()
+                .map_err(|source| NonoError::PathCanonicalization {
+                    path: repo.join(".git"),
+                    source,
+                })?;
+        let parent_grant = caps
+            .fs_capabilities()
+            .iter()
+            .find(|c| !c.is_file && c.resolved == canonical_git_dir)
+            .expect("implied parent-dir fs grant for the socket missing");
+        assert_eq!(
+            parent_grant.access,
+            AccessMode::Read,
+            "socket under a cwd the agent cannot write must be downgraded to \
+             Read even when cwd resolves through a symlink"
+        );
+        Ok(())
+    }
+
+    /// A literal (non-`@git:`) relative `unix_socket_bind` entry is resolved
+    /// against the raw `cwd`, so `normalized` is never canonicalized even
+    /// when `cwd` resolves through a symlink. The downgrade check must still
+    /// catch it by also comparing against the raw `cwd`.
+    #[test]
+    fn add_policy_unix_sockets_downgrades_to_read_for_literal_relative_socket_under_symlinked_cwd()
+    -> Result<()> {
+        let temp = test_tempdir()?;
+        let repo = temp.path().join("repo");
+        create_dir(&repo)?;
+
+        // policy_root (the agent's own --workdir) is a sibling of the repo,
+        // so the agent itself has no write authority under the repo.
+        let policy_root = temp.path().join("agent-workdir");
+        create_dir(&policy_root)?;
+
+        let policy = CommandSandboxConfig {
+            unix_socket_bind: vec!["my.sock".to_string()],
+            ..Default::default()
+        };
+        let outer_caps = CapabilitySet::new();
+        let mut caps = CapabilitySet::new();
+        // `repo` is passed raw (un-canonicalized), exactly as a real
+        // command's `cwd` would be.
+        add_policy_unix_sockets(&mut caps, &policy, &policy_root, &repo, &outer_caps, &[])?;
+
+        let canonical_repo =
+            repo.canonicalize()
+                .map_err(|source| NonoError::PathCanonicalization {
+                    path: repo.clone(),
+                    source,
+                })?;
+        let parent_grant = caps
+            .fs_capabilities()
+            .iter()
+            .find(|c| !c.is_file && c.resolved == canonical_repo)
+            .expect("implied parent-dir fs grant for the socket missing");
+        assert_eq!(
+            parent_grant.access,
+            AccessMode::Read,
+            "a literal relative socket path under a cwd the agent cannot \
+             write must be downgraded to Read even when cwd resolves \
+             through a symlink"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn add_optional_unix_socket_bind_sensitive_root_parent_skips_fs_widening() -> Result<()> {
+        let _guard = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let temp = test_tempdir()?;
+        let home = temp.path().join("home");
+        create_dir(&home)?;
+        // is_sensitive_root compares against a canonicalized $HOME, so match it.
+        let home = home
+            .canonicalize()
+            .map_err(|source| NonoError::PathCanonicalization {
+                path: home.clone(),
+                source,
+            })?;
+        let home_str = home.to_string_lossy().into_owned();
+        let _env = crate::test_env::EnvVarGuard::set_all(&[("HOME", home_str.as_str())]);
+
+        let pending = home.join("fsmonitor--daemon.ipc");
+        assert!(!pending.exists(), "test precondition: path must not exist");
+
+        let mut caps = CapabilitySet::new();
+        add_optional_unix_socket_bind(&mut caps, pending, AccessMode::ReadWrite)?;
+
+        assert_eq!(
+            caps.unix_socket_capabilities().len(),
+            1,
+            "socket capability itself must still be granted"
+        );
+        assert!(
+            caps.fs_capabilities().is_empty(),
+            "must not widen a filesystem grant onto a sensitive root like $HOME"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn add_optional_unix_socket_bind_downgrades_to_read_outside_agent_write_authority() -> Result<()>
+    {
+        let temp = test_tempdir()?;
+        // policy_root is a sibling of cwd, so the agent has no write
+        // authority under cwd — mirrors a cwd outside the writable root.
+        let policy_root = temp.path().join("agent-workdir");
+        create_dir(&policy_root)?;
+        let repo = temp.path().join("repo");
+        create_dir(&repo)?;
+        let pending = repo.join("future.sock");
+
+        // Mirrors add_policy_fs's write non-escalation check: a path under
+        // cwd that the agent itself cannot write is downgraded to Read.
+        let outer_caps = CapabilitySet::new();
+        let write_access = |path: &Path| {
+            let normalized = crate::tool_sandbox::lexically_normalize(path);
+            if normalized.starts_with(&repo)
+                && !crate::tool_sandbox::agent_can_write(
+                    &normalized,
+                    &policy_root,
+                    &outer_caps,
+                    &[],
+                )
+            {
+                AccessMode::Read
+            } else {
+                AccessMode::ReadWrite
+            }
+        };
+        let access = write_access(&pending);
+        assert_eq!(access, AccessMode::Read);
+
+        let mut caps = CapabilitySet::new();
+        add_optional_unix_socket_bind(&mut caps, pending, access)?;
+
+        let canonical_parent =
+            repo.canonicalize()
+                .map_err(|source| NonoError::PathCanonicalization {
+                    path: repo.clone(),
+                    source,
+                })?;
+        let parent_grant = caps
+            .fs_capabilities()
+            .iter()
+            .find(|c| !c.is_file && c.resolved == canonical_parent)
+            .expect("implied parent-dir fs grant missing");
+        assert_eq!(parent_grant.access, AccessMode::Read);
         Ok(())
     }
 

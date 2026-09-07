@@ -2040,6 +2040,11 @@
           "items": { "type": "string" },
           "description": "Exact file write grants for the selected child-tool-sandbox policy."
         },
+        "unix_socket_bind": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "AF_UNIX socket bind grants for the selected child-tool-sandbox policy."
+        },
         "use_credentials": {
           "type": "array",
           "items": { "$ref": "#/$defs/CommandPolicyIdentifier" },

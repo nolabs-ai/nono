@@ -664,6 +664,7 @@ fn test_schema_command_policies_match_tool_sandbox_guide_shape() {
             "open_urls",
             "resources",
             "stdio",
+            "unix_socket_bind",
             "unsafe_macos_seatbelt_rules",
             "use_credentials",
         ],

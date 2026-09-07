@@ -3843,6 +3843,33 @@ mod tests {
         }
     }
 
+    /// `open_path_rule` opens `cap.resolved` with `O_PATH`, so the kernel
+    /// resolves the whole chain before Landlock sees a literal path.
+    #[test]
+    fn test_open_path_rule_resolves_multi_hop_symlink_through_symlinked_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let canonical_dir = dir.path().canonicalize().expect("canonicalize");
+
+        let hosts = canonical_dir.join("hosts");
+        let mymac = hosts.join("mymac");
+        std::fs::create_dir_all(&mymac).expect("mkdir mymac");
+        let real_gitconfig = mymac.join("gitconfig");
+        std::fs::write(&real_gitconfig, "[user]\n").expect("write gitconfig");
+
+        let current = hosts.join("current");
+        std::os::unix::fs::symlink(&mymac, &current).expect("symlink dir");
+
+        let gitconfig_link = canonical_dir.join(".gitconfig");
+        std::os::unix::fs::symlink(current.join("gitconfig"), &gitconfig_link)
+            .expect("symlink leaf");
+
+        let cap = crate::capability::FsCapability::new_file(&gitconfig_link, AccessMode::Read)
+            .expect("gitconfig capability");
+
+        let rule = open_path_rule(&cap, ABI::V5).expect("open multi-hop symlink rule");
+        assert!(rule.access.effective.contains(AccessFs::ReadFile));
+    }
+
     #[test]
     fn test_open_path_rule_rejects_removed_path() {
         let temp = tempfile::tempdir().expect("tempdir");

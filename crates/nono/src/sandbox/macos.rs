@@ -9,6 +9,7 @@ use crate::capability::{
     AccessMode, CapabilitySet, MACOS_PORT_RANGE_LIMIT, NetworkMode, merge_port_ranges,
 };
 use crate::error::{NonoError, Result};
+use crate::path::collect_symlink_hops;
 use crate::sandbox::SupportInfo;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
@@ -185,6 +186,33 @@ pub fn support_info() -> SupportInfo {
 fn collect_parent_dirs(caps: &CapabilitySet) -> std::collections::HashSet<String> {
     let mut parents = std::collections::HashSet::new();
 
+    let insert_ancestors = |parents: &mut std::collections::HashSet<String>, path: &Path| {
+        let mut current = path.parent();
+        while let Some(parent) = current {
+            let parent_str = parent.to_string_lossy().to_string();
+
+            // Stop at root
+            if parent_str == "/" || parent_str.is_empty() {
+                break;
+            }
+
+            // If already present, ancestors were processed too - early exit
+            if !parents.insert(parent_str) {
+                break;
+            }
+            current = parent.parent();
+        }
+    };
+
+    // Intermediate hops need their own metadata grant, or the kernel
+    // denies access to them during dereference.
+    let grant_hops = |parents: &mut std::collections::HashSet<String>, original: &Path| {
+        for hop in collect_symlink_hops(original) {
+            insert_ancestors(parents, &hop);
+            parents.insert(hop.to_string_lossy().to_string());
+        }
+    };
+
     for cap in caps.fs_capabilities() {
         // Collect parents for both resolved and original paths.
         // On macOS, /tmp is a symlink to /private/tmp. If the user passes
@@ -197,22 +225,24 @@ fn collect_parent_dirs(caps: &CapabilitySet) -> std::collections::HashSet<String
         };
 
         for path in paths_to_walk {
-            let mut current = path.parent();
-            while let Some(parent) = current {
-                let parent_str = parent.to_string_lossy().to_string();
-
-                // Stop at root
-                if parent_str == "/" || parent_str.is_empty() {
-                    break;
-                }
-
-                // If already present, ancestors were processed too - early exit
-                if !parents.insert(parent_str) {
-                    break;
-                }
-                current = parent.parent();
-            }
+            insert_ancestors(&mut parents, path);
         }
+
+        grant_hops(&mut parents, &cap.original);
+    }
+
+    for cap in caps.unix_socket_capabilities() {
+        let paths_to_walk: Vec<&std::path::Path> = if cap.original != cap.resolved {
+            vec![cap.resolved.as_path(), cap.original.as_path()]
+        } else {
+            vec![cap.resolved.as_path()]
+        };
+
+        for path in paths_to_walk {
+            insert_ancestors(&mut parents, path);
+        }
+
+        grant_hops(&mut parents, &cap.original);
     }
 
     parents
@@ -795,6 +825,40 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
             ));
             current = parent.parent();
         }
+
+        // A $PATH dir reached through a multi-hop symlink needs metadata
+        // grants on the intermediate hops too, or the kernel denies EPERM
+        // (not ENOENT) dereferencing one, aborting the PATH walk.
+        for hop in collect_symlink_hops(dir) {
+            let Some(hop_str) = hop.to_str() else {
+                continue;
+            };
+            if !seen_dir.contains(hop_str) && seen_ancestor.insert(hop_str.to_string()) {
+                let escaped = escape_path(hop_str)?;
+                profile.push_str(&format!(
+                    "(allow file-read-metadata (literal \"{}\"))\n",
+                    escaped
+                ));
+            }
+            let mut current = hop.parent();
+            while let Some(parent) = current {
+                let Some(parent_str) = parent.to_str() else {
+                    break;
+                };
+                if parent_str == "/" || parent_str.is_empty() {
+                    break;
+                }
+                if seen_dir.contains(parent_str) || !seen_ancestor.insert(parent_str.to_string()) {
+                    break;
+                }
+                let escaped = escape_path(parent_str)?;
+                profile.push_str(&format!(
+                    "(allow file-read-metadata (literal \"{}\"))\n",
+                    escaped
+                ));
+                current = parent.parent();
+            }
+        }
     }
 
     // Network rules
@@ -1165,6 +1229,42 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn test_path_metadata_dir_through_multi_hop_symlink_grants_intermediate_hops() {
+        // Regression: a $PATH dir reached through a multi-hop symlink must
+        // get metadata grants on the intermediate hops, or the kernel denies
+        // EPERM (not ENOENT) dereferencing one, aborting the PATH walk.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real_bin = dir.path().join("real_bin");
+        std::fs::create_dir(&real_bin).expect("mkdir real_bin");
+        let hop1 = dir.path().join("hop1");
+        let hop2 = dir.path().join("hop2");
+        std::os::unix::fs::symlink(&real_bin, &hop2).expect("symlink hop2 -> real_bin");
+        std::os::unix::fs::symlink(&hop2, &hop1).expect("symlink hop1 -> hop2");
+
+        let mut caps = CapabilitySet::new();
+        caps.add_path_metadata_dir(hop1.clone());
+
+        let profile = generate_profile(&caps).unwrap();
+
+        let hop1_str = hop1.to_str().unwrap();
+        let hop2_str = hop2.to_str().unwrap();
+        assert!(
+            profile.contains(&format!(
+                "(allow file-read-metadata (literal \"{hop2_str}\"))"
+            )),
+            "intermediate hop hop2 missing metadata grant:\n{profile}"
+        );
+        assert!(
+            !profile.contains(&format!(
+                "(allow file-read-metadata (regex \"^{}/[^/]+$\"))",
+                regex_escape_path_for_seatbelt(hop2_str).unwrap()
+            )),
+            "intermediate hop must not get the direct-children regex, only the $PATH dir itself: {hop1_str}"
+        );
+    }
+
+    #[test]
     fn test_support_info() {
         let info = support_info();
         assert!(info.is_supported);
@@ -1186,6 +1286,65 @@ mod tests {
 
         assert!(parents.contains("/Users"));
         assert!(parents.contains("/Users/test"));
+        assert!(!parents.contains("/"));
+    }
+
+    /// A symlinked leaf through a symlinked directory component:
+    /// `.gitconfig -> hosts/current/gitconfig -> hosts/mymac/gitconfig`.
+    #[cfg(unix)]
+    #[test]
+    fn test_collect_parent_dirs_grants_intermediate_symlink_hop() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical_dir = dir.path().canonicalize().unwrap();
+
+        let hosts = canonical_dir.join("hosts");
+        let mymac = hosts.join("mymac");
+        std::fs::create_dir_all(&mymac).unwrap();
+        std::fs::write(mymac.join("gitconfig"), "[user]\n").unwrap();
+
+        let current = hosts.join("current");
+        std::os::unix::fs::symlink(&mymac, &current).unwrap();
+
+        let gitconfig_link = canonical_dir.join(".gitconfig");
+        std::os::unix::fs::symlink(current.join("gitconfig"), &gitconfig_link).unwrap();
+
+        let resolved = gitconfig_link.canonicalize().unwrap();
+
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(FsCapability {
+            original: gitconfig_link,
+            resolved,
+            access: AccessMode::Read,
+            is_file: true,
+            source: CapabilitySource::User,
+        });
+
+        let parents = collect_parent_dirs(&caps);
+
+        assert!(parents.contains(&current.to_string_lossy().to_string()));
+
+        // Must not widen authority to a sibling under the same directory.
+        let sibling = hosts.join("other-host");
+        assert!(!parents.contains(&sibling.to_string_lossy().to_string()));
+    }
+
+    /// A single-hop socket symlink, to isolate `UnixSocketCapability`
+    /// ancestor grants from the multi-hop case tested above.
+    #[test]
+    fn test_collect_parent_dirs_grants_unix_socket_ancestors() {
+        let mut caps = CapabilitySet::new();
+        caps.add_unix_socket(crate::UnixSocketCapability {
+            original: PathBuf::from("/tmp/test.sock"),
+            resolved: PathBuf::from("/private/tmp/test.sock"),
+            scope: crate::SocketScope::File,
+            mode: crate::UnixSocketMode::Connect,
+            source: CapabilitySource::User,
+        });
+
+        let parents = collect_parent_dirs(&caps);
+
+        assert!(parents.contains("/private/tmp"));
+        assert!(parents.contains("/tmp"));
         assert!(!parents.contains("/"));
     }
 

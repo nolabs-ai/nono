@@ -169,6 +169,7 @@ pub(crate) fn init_tracing(cli: &Cli) {
                 tracing_subscriber::fmt()
                     .with_env_filter(tracing_filter(cli))
                     .with_target(false)
+                    .with_writer(io::stderr)
                     .init();
             }
         },
@@ -176,6 +177,7 @@ pub(crate) fn init_tracing(cli: &Cli) {
             tracing_subscriber::fmt()
                 .with_env_filter(tracing_filter(cli))
                 .with_target(false)
+                .with_writer(io::stderr)
                 .init();
         }
     }

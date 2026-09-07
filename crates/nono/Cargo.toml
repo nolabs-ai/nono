@@ -29,7 +29,7 @@ getrandom.workspace = true
 walkdir.workspace = true
 ignore.workspace = true
 globset.workspace = true
-regress = "0.11"
+regress = "0.12"
 idna.workspace = true
 
 # Unix socket IPC for supervisor

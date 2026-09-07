@@ -5,7 +5,6 @@
 //! for `nono run`.
 
 use nono::{AccessMode, ApprovalBackend, ApprovalDecision, ApprovalRequest, Result};
-use std::io::IsTerminal;
 
 /// Interactive terminal approval backend.
 ///
@@ -17,8 +16,9 @@ pub struct TerminalApproval;
 
 impl ApprovalBackend for TerminalApproval {
     fn request_approval(&self, request: &ApprovalRequest) -> Result<ApprovalDecision> {
-        let stderr = std::io::stderr();
-        if !stderr.is_terminal() {
+        // Check the controlling terminal itself, in the same read/write mode
+        // used to prompt, so we don't print a prompt we cannot safely answer.
+        if !crate::terminal_prompt::consent_prompt_available() {
             return Ok(ApprovalDecision::Denied {
                 reason: "No terminal available for interactive approval".to_string(),
             });
@@ -191,6 +191,7 @@ fn format_access_mode(access: &AccessMode) -> &'static str {
 mod tests {
     use super::*;
     use nono::{AccessMode, ApprovalRequest};
+    use std::io::IsTerminal;
 
     // ── helpers ──────────────────────────────────────────────────────────────
 

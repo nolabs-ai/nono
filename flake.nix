@@ -28,7 +28,7 @@
       inherit version;
       src = self;
 
-      cargoHash = "sha256-N6lyAQJeFm9Aa78hYW1vMQ+IBHUhxfqGKAb5TH3oyh4=";
+      cargoLock.lockFile = "${self}/Cargo.lock";
 
       nativeBuildInputs = [ pkgs.pkg-config ];
       buildInputs = [ pkgs.dbus ];

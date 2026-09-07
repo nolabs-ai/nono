@@ -1,6 +1,6 @@
 name: Feature request
 description: Suggest something for nono to support or do better
-labels: ["enhancement", "triage"]
+labels: ["enhancement"]
 body:
   - type: markdown
     attributes:

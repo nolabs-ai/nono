@@ -227,8 +227,13 @@ pub(crate) fn terminal_prompts_available() -> bool {
     }
     // stdin/stderr being a tty doesn't mean we have a controlling terminal
     // (e.g. a new session can inherit a tty stdin with none). Check /dev/tty
-    // directly so we don't promise a prompt we can't open later.
-    std::fs::File::open("/dev/tty").is_ok()
+    // directly, in the same read+write mode the prompt itself needs, so we
+    // don't promise a prompt we can't open later.
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+        .is_ok()
 }
 
 pub(crate) fn offer_save_run_profile(offer: &ProfileSaveOffer<'_>) -> Result<()> {

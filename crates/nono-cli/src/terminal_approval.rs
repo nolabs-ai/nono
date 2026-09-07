@@ -5,7 +5,7 @@
 //! for `nono run`.
 
 use nono::{AccessMode, ApprovalBackend, ApprovalDecision, ApprovalRequest, NonoError, Result};
-use std::io::{BufRead, IsTerminal, Write};
+use std::io::{BufRead, Write};
 
 /// Interactive terminal approval backend.
 ///
@@ -17,8 +17,11 @@ pub struct TerminalApproval;
 
 impl ApprovalBackend for TerminalApproval {
     fn request_approval(&self, request: &ApprovalRequest) -> Result<ApprovalDecision> {
-        let stderr = std::io::stderr();
-        if !stderr.is_terminal() {
+        // stderr being a tty doesn't mean we have a controlling terminal (a
+        // new session can inherit a tty stderr with none). Check /dev/tty
+        // itself, in the same mode used to read the response below, so we
+        // don't print a prompt we can't get an answer to.
+        if std::fs::File::open("/dev/tty").is_err() {
             return Ok(ApprovalDecision::Denied {
                 reason: "No terminal available for interactive approval".to_string(),
             });
@@ -199,6 +202,7 @@ fn format_access_mode(access: &AccessMode) -> &'static str {
 mod tests {
     use super::*;
     use nono::{AccessMode, ApprovalRequest};
+    use std::io::IsTerminal;
 
     // ── helpers ──────────────────────────────────────────────────────────────
 

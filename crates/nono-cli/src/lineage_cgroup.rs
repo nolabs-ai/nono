@@ -304,7 +304,15 @@ fn sweep_stale_sessions(base: &Path) {
 fn teardown_session_tree(session_dir: &Path) {
     if let Ok(entries) = fs::read_dir(session_dir) {
         for entry in entries.flatten() {
-            remove_cgroup(&entry.path());
+            // Skip session_dir's own control files (memory.events, pids.peak, ...);
+            // only cmd_* are child cgroups rmdir can remove.
+            let is_cmd_dir = entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with(CMD_PREFIX));
+            if is_cmd_dir {
+                remove_cgroup(&entry.path());
+            }
         }
     }
     let _ = fs::remove_dir(session_dir);

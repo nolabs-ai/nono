@@ -743,6 +743,7 @@ fn copy_file_atomic(source: &Path, dest: &Path) -> Result<CopyOutcome> {
         fs::create_dir_all(parent).map_err(NonoError::Io)?;
     }
     let source_bytes = fs::read(source).map_err(NonoError::Io)?;
+    let source_perms = safe_perms(fs::metadata(source).map_err(NonoError::Io)?.permissions());
     let sha256 = hash_bytes(&source_bytes);
     // Skip-no-op only if existing content matches exactly. Caller has
     // already enforced the conflict policy (only owned files reach
@@ -750,18 +751,87 @@ fn copy_file_atomic(source: &Path, dest: &Path) -> Result<CopyOutcome> {
     if let Ok(existing) = fs::read(dest)
         && existing == source_bytes
     {
+        sync_permissions(dest, &source_perms)?;
         return Ok(CopyOutcome {
             mutated: false,
             sha256,
         });
     }
     let tmp = dest.with_extension("nono-tmp");
-    fs::write(&tmp, &source_bytes).map_err(NonoError::Io)?;
+    write_tmp_file(&tmp, &source_bytes, &source_perms)?;
     fs::rename(&tmp, dest).map_err(NonoError::Io)?;
     Ok(CopyOutcome {
         mutated: true,
         sha256,
     })
+}
+
+/// Creates `tmp` fresh with `perms` set at creation, so it never exists at a
+/// looser mode and never writes through a pre-planted symlink. Retries once
+/// past a leftover tmp file from an interrupted prior run.
+fn write_tmp_file(tmp: &Path, bytes: &[u8], perms: &std::fs::Permissions) -> Result<()> {
+    for _ in 0..2 {
+        #[cfg(unix)]
+        let opened = {
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .mode(perms.mode())
+                .open(tmp)
+        };
+        #[cfg(not(unix))]
+        let opened = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(tmp);
+
+        match opened {
+            Ok(mut file) => {
+                use std::io::Write;
+                return file.write_all(bytes).map_err(NonoError::Io);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                fs::remove_file(tmp).map_err(NonoError::Io)?;
+            }
+            Err(e) => return Err(NonoError::Io(e)),
+        }
+    }
+    Err(NonoError::Io(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!("could not create fresh temp file at {}", tmp.display()),
+    )))
+}
+
+/// Strips setuid/setgid/sticky bits, keeping only rwxrwxrwx — a pack must
+/// never be able to plant a setuid/setgid file via `write_file`.
+fn safe_perms(perms: std::fs::Permissions) -> std::fs::Permissions {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::Permissions::from_mode(perms.mode() & 0o777)
+    }
+    #[cfg(not(unix))]
+    {
+        perms
+    }
+}
+
+/// Reapplies source permissions to an already-up-to-date dest (no-op re-pull path).
+fn sync_permissions(dest: &Path, source_perms: &std::fs::Permissions) -> Result<()> {
+    let dest_perms = fs::metadata(dest).map_err(NonoError::Io)?.permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if dest_perms.mode() != source_perms.mode() {
+            fs::set_permissions(dest, source_perms.clone()).map_err(NonoError::Io)?;
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (dest_perms, source_perms);
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1950,6 +2020,114 @@ mod tests {
 
             rev(&r1.records);
             assert!(!home.join("dest").exists());
+        });
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn write_file_atomic_preserves_executable_bit() {
+        use std::os::unix::fs::PermissionsExt;
+        with_fake_home(|home| {
+            let pack = home.join("pack");
+            fs::create_dir_all(&pack).expect("mkdir pack");
+            let source = pack.join("hook.sh");
+            fs::write(&source, "#!/bin/sh\necho hi").expect("seed source");
+            fs::set_permissions(&source, fs::Permissions::from_mode(0o755)).expect("chmod source");
+            let ctx = ctx_in(home, pack);
+            let directives = vec![WiringDirective::WriteFile {
+                source: "hook.sh".to_string(),
+                dest: "$HOME/dest.sh".to_string(),
+            }];
+            let r1 = exec(&directives, &ctx).expect("first");
+            let dest_mode = fs::metadata(home.join("dest.sh"))
+                .expect("dest metadata")
+                .permissions()
+                .mode();
+            assert_eq!(dest_mode & 0o777, 0o755, "exec bit must survive the copy");
+
+            // Re-pull with identical content must still sync perms (fast no-op path).
+            fs::set_permissions(home.join("dest.sh"), fs::Permissions::from_mode(0o644))
+                .expect("simulate stripped perms");
+            let prior_sha = match &r1.records[0] {
+                WiringRecord::WriteFile { sha256, .. } => sha256.clone(),
+                other => panic!("expected WriteFile, got {other:?}"),
+            };
+            let mut owned: HashMap<PathBuf, String> = HashMap::new();
+            owned.insert(home.join("dest.sh"), prior_sha);
+            execute(&directives, &ctx, &owned).expect("second");
+            let dest_mode = fs::metadata(home.join("dest.sh"))
+                .expect("dest metadata")
+                .permissions()
+                .mode();
+            assert_eq!(dest_mode & 0o777, 0o755, "re-pull must restore exec bit");
+        });
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn write_file_atomic_strips_setuid_bit() {
+        use std::os::unix::fs::PermissionsExt;
+        with_fake_home(|home| {
+            let pack = home.join("pack");
+            fs::create_dir_all(&pack).expect("mkdir pack");
+            let source = pack.join("hook.sh");
+            fs::write(&source, "#!/bin/sh\necho hi").expect("seed source");
+            // A pack source should never be able to plant a setuid/setgid file.
+            fs::set_permissions(&source, fs::Permissions::from_mode(0o4755)).expect("chmod source");
+            let ctx = ctx_in(home, pack);
+            let directives = vec![WiringDirective::WriteFile {
+                source: "hook.sh".to_string(),
+                dest: "$HOME/dest.sh".to_string(),
+            }];
+            exec(&directives, &ctx).expect("first");
+            let dest_mode = fs::metadata(home.join("dest.sh"))
+                .expect("dest metadata")
+                .permissions()
+                .mode();
+            assert_eq!(
+                dest_mode & 0o7000,
+                0,
+                "setuid/setgid/sticky must never be copied"
+            );
+            assert_eq!(dest_mode & 0o777, 0o755, "regular perms still preserved");
+        });
+    }
+
+    #[test]
+    fn write_file_atomic_refuses_to_follow_preplanted_tmp_symlink() {
+        with_fake_home(|home| {
+            let pack = home.join("pack");
+            fs::create_dir_all(&pack).expect("mkdir pack");
+            fs::write(pack.join("file"), "pack content").expect("seed source");
+            let victim = home.join("victim");
+            fs::write(&victim, "sensitive").expect("seed victim");
+            let ctx = ctx_in(home, pack);
+            let directives = vec![WiringDirective::WriteFile {
+                source: "file".to_string(),
+                dest: "$HOME/dest".to_string(),
+            }];
+
+            // Attacker pre-plants the tmp path as a symlink to a file the
+            // process can otherwise write, before the wiring directive runs.
+            let tmp = home.join("dest.nono-tmp");
+            unix_fs::symlink(&victim, &tmp).expect("plant symlink");
+
+            exec(&directives, &ctx).expect("write_file must not fail outright");
+
+            assert_eq!(
+                fs::read_to_string(&victim).expect("victim readable"),
+                "sensitive",
+                "victim file must be untouched"
+            );
+            assert!(
+                !tmp.is_symlink(),
+                "planted symlink must be replaced, not written through"
+            );
+            assert_eq!(
+                fs::read_to_string(home.join("dest")).expect("dest readable"),
+                "pack content",
+                "dest must contain the actual pack content, not a redirected symlink"
+            );
         });
     }
 

@@ -353,6 +353,10 @@ fn format_command_failed_not_sandbox_line(exit_code: i32) -> String {
     )
 }
 
+fn format_allow_net_help_line() -> String {
+    "[nono]   --allow-net        unrestricted network for this session".to_string()
+}
+
 fn format_command_succeeded_with_stderr_line() -> String {
     "[nono] The command succeeded, but stderr showed a likely sandbox-related access issue."
         .to_string()
@@ -1204,6 +1208,15 @@ impl<'a> DiagnosticFormatter<'a> {
         let system_service_diagnostics = self.system_service_diagnostics(diagnostics);
         let has_path_findings =
             !path_diagnostics.is_empty() || !pathname_unix_diagnostics.is_empty();
+        // Path-specific remedies (`--allow/--read/--write <path>`, `nono why
+        // --path`) only make sense when something in this session named a
+        // path: a logged filesystem denial, a stderr line that looks like a
+        // sandbox denial on a path, or a stderr "No such file" report. A
+        // system-service block or an application error names no path, so
+        // there is nothing for those flags to attach to (issue #1646).
+        let has_observed_path_evidence = has_path_findings
+            || !stderr_likely_sandbox_diagnostics(diagnostics).is_empty()
+            || stderr_missing_path_diagnostic(diagnostics).is_some();
 
         if !has_path_findings
             && ipc_diagnostics.is_empty()
@@ -1247,10 +1260,19 @@ impl<'a> DiagnosticFormatter<'a> {
                     "[nono] The failure may be unrelated to sandbox restrictions.".to_string(),
                 );
             }
-            lines.push("[nono]".to_string());
-            self.format_grant_help(&mut lines);
-            lines.push("[nono]".to_string());
-            self.format_follow_up_from_diagnostics(&mut lines, diagnostics);
+            if has_observed_path_evidence {
+                lines.push("[nono]".to_string());
+                self.format_grant_help(&mut lines);
+                lines.push("[nono]".to_string());
+                self.format_follow_up_from_diagnostics(&mut lines, diagnostics);
+            } else if stderr_network_diagnostic(diagnostics).is_some() {
+                // Same principle as has_observed_path_evidence: a blocked
+                // capability config alone isn't evidence this failure was
+                // network-related. Only a logged network denial hint earns
+                // the --allow-net suggestion.
+                lines.push("[nono]".to_string());
+                self.format_network_grant_help(&mut lines);
+            }
         } else if has_path_findings {
             self.format_consolidated_denial_guidance(
                 &mut lines,
@@ -1897,10 +1919,18 @@ impl<'a> DiagnosticFormatter<'a> {
         lines.push("[nono]   --write <path>     write-only access to directory".to_string());
 
         if self.caps.is_network_blocked() {
-            lines.push(
-                "[nono]   --allow-net        unrestricted network for this session".to_string(),
-            );
+            lines.push(format_allow_net_help_line());
         }
+    }
+
+    /// Grant help without the path flags, for sessions that observed no path.
+    ///
+    /// Callers must check for a logged network-denial diagnostic first
+    /// (`stderr_network_diagnostic`); a blocked capability alone is not
+    /// evidence this failure was network-related.
+    fn format_network_grant_help(&self, lines: &mut Vec<String>) {
+        lines.push("[nono] To grant additional access, re-run with:".to_string());
+        lines.push(format_allow_net_help_line());
     }
 
     fn format_command_for_run(&self) -> Option<String> {
@@ -3203,9 +3233,83 @@ mod tests {
 
         assert!(output.contains("No path denials were observed during this session."));
         assert!(output.contains("The failure may be unrelated to sandbox restrictions."));
-        assert!(output.contains("To grant additional access, re-run with:"));
-        assert!(output.contains("--allow <path>"));
+        // Nothing in this session named a path, so path-specific grants and
+        // path queries have nothing to attach to and must not be prescribed.
+        assert!(!output.contains("--allow <path>"));
+        assert!(!output.contains("--read <path>"));
+        assert!(!output.contains("--write <path>"));
+        assert!(!output.contains("Add permissions:"));
+        assert!(!output.contains("nono why --path"));
+        // Network is blocked by make_test_caps, but nothing in this session
+        // observed a network denial either, so --allow-net has no evidence
+        // to attach to and must not be prescribed.
+        assert!(!output.contains("To grant additional access, re-run with:"));
+        assert!(!output.contains("--allow-net"));
         assert!(!output.contains("Sandbox policy:"));
+    }
+
+    #[test]
+    fn test_supervised_no_path_evidence_network_allowed_omits_grant_help_entirely() {
+        let caps = CapabilitySet::new();
+        let formatter = DiagnosticFormatter::new(&caps).with_mode(DiagnosticMode::Supervised);
+        let output = formatter.format_footer(71);
+
+        assert!(output.contains("Command exited with code 71."));
+        assert!(output.contains("No path denials were observed during this session."));
+        assert!(output.contains("The failure may be unrelated to sandbox restrictions."));
+        assert!(!output.contains("To grant additional access"));
+        assert!(!output.contains("--allow"));
+        assert!(!output.contains("Next steps:"));
+        assert!(!output.contains("nono why --path"));
+        assert!(!output.ends_with('\n'));
+    }
+
+    #[test]
+    fn test_supervised_system_service_only_omits_path_remedies() {
+        // A system-service block names no filesystem path (issue #1646). The
+        // operation below has no SYSTEM_SERVICE_DIAGNOSTICS entry, so this
+        // also covers the unclassified-service rendering path.
+        let caps = make_test_caps();
+        let violations = vec![SandboxViolation {
+            operation: "forbidden-sandbox-reinit".to_string(),
+            target: None,
+        }];
+        let formatter = DiagnosticFormatter::new(&caps)
+            .with_mode(DiagnosticMode::Supervised)
+            .with_sandbox_violations(&violations);
+        let output = format_footer_with_session_report(formatter, 71);
+
+        assert!(output.contains("Sandbox blocked system services:"));
+        assert!(output.contains("forbidden-sandbox-reinit"));
+        assert!(!output.contains("No path denials were observed"));
+        assert!(!output.contains("--allow <path>"));
+        assert!(!output.contains("--read <path>"));
+        assert!(!output.contains("--write <path>"));
+        assert!(!output.contains("Add permissions:"));
+        assert!(!output.contains("nono why --path"));
+        // A system-service block names no path and no network symptom; the
+        // capability config blocking network is not evidence this failure
+        // was network-related (Hermes Gate finding).
+        assert!(!output.contains("To grant additional access"));
+        assert!(!output.contains("--allow-net"));
+    }
+
+    #[test]
+    fn test_supervised_logged_path_denial_keeps_path_remedies() {
+        let caps = make_test_caps();
+        let denials = vec![DenialRecord {
+            path: PathBuf::from("/Users/alice/notes.txt"),
+            access: AccessMode::Read,
+            reason: DenialReason::InsufficientAccess,
+        }];
+        let formatter = DiagnosticFormatter::new(&caps)
+            .with_mode(DiagnosticMode::Supervised)
+            .with_denials(&denials);
+        let output = format_footer_with_session_report(formatter, 1);
+
+        assert!(output.contains("/Users/alice/notes.txt"));
+        assert!(output.contains("Fix flags: --read"));
+        assert!(!output.contains("No path denials were observed"));
     }
 
     #[test]
@@ -3327,8 +3431,39 @@ mod tests {
         );
         assert!(output.contains("Application error:"));
         assert!(output.contains("EEXIST: file already exists"));
+        // The session observed no path at all, so no path grant or path query
+        // is prescribed; the "may be unrelated" wording is retained.
+        assert!(output.contains("The failure may be unrelated to sandbox restrictions."));
+        assert!(!output.contains("--allow <path>"));
+        assert!(!output.contains("Add permissions:"));
+        assert!(!output.contains("nono why --path"));
+        // An application error (EEXIST) names no network symptom either;
+        // the capability config blocking network is not evidence this
+        // failure was network-related (Hermes Gate finding).
+        assert!(!output.contains("To grant additional access"));
+        assert!(!output.contains("--allow-net"));
+    }
+
+    #[test]
+    fn test_supervised_no_path_evidence_network_denial_keeps_network_grant_help() {
+        let caps = make_test_caps();
+        let formatter = DiagnosticFormatter::new(&caps)
+            .with_mode(DiagnosticMode::Supervised)
+            .with_error_observation(ErrorObservation {
+                primary_verdict: None,
+                blocked_protected_file: None,
+                path_hints: Vec::new(),
+                missing_paths: Vec::new(),
+                non_sandbox_failure: None,
+                network_blocked_hint: true,
+            });
+        let output = formatter.format_footer(1);
+
+        assert!(output.contains("No path denials were observed during this session."));
+        assert!(!output.contains("--allow <path>"));
+        // A logged network-denial hint is evidence, so --allow-net stays.
         assert!(output.contains("To grant additional access, re-run with:"));
-        assert!(output.contains("Add permissions: nono run --allow <path> -- <your command>"));
+        assert!(output.contains("--allow-net"));
     }
 
     #[test]
@@ -3340,7 +3475,9 @@ mod tests {
 
         assert!(output.contains("No path denials were observed during this session."));
         assert!(output.contains("may be unrelated"));
-        assert!(output.contains("--allow <path>"));
+        assert!(!output.contains("--allow <path>"));
+        assert!(!output.contains("nono why --path"));
+        assert!(!output.contains("--allow-net"));
     }
 
     #[test]

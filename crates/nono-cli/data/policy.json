@@ -683,7 +683,14 @@
       "security": {
         "signal_mode": "isolated"
       },
-      "filesystem": {},
+      "filesystem": {
+        "unix_socket_dir": [
+          {
+            "path": "/run/systemd/userdb",
+            "when": "linux"
+          }
+        ]
+      },
       "network": { "block": false },
       "workdir": { "access": "none" },
       "interactive": false

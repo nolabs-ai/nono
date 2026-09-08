@@ -488,6 +488,17 @@ impl PreparedToolSandboxRuntime {
         Ok(())
     }
 
+    pub(crate) fn prepare_outer_exec_gate(&self) -> Result<OwnedFd> {
+        let ruleset = prepare_outer_exec_gate(
+            &self.inner.allowed_outer_exec_files,
+            &self.inner.plan.outer_exec_writable_dirs,
+            self.inner.landlock_abi,
+        )?;
+        Option::<OwnedFd>::from(ruleset).ok_or_else(|| {
+            NonoError::SandboxInit("tool-sandbox execution gate was not created".to_string())
+        })
+    }
+
     pub(crate) fn apply_outer_exec_gate(&self) -> Result<()> {
         apply_outer_exec_gate(
             &self.inner.allowed_outer_exec_files,
@@ -3111,6 +3122,17 @@ fn apply_outer_exec_gate(
     writable_dirs: &[PathBuf],
     abi: nono::DetectedAbi,
 ) -> Result<()> {
+    let status = prepare_outer_exec_gate(paths, writable_dirs, abi)?
+        .restrict_self()
+        .map_err(|err| NonoError::SandboxInit(format!("tool-sandbox restrict_self: {err}")))?;
+    ensure_outer_exec_gate_fully_enforced(status.ruleset)
+}
+
+fn prepare_outer_exec_gate(
+    paths: &[PathBuf],
+    writable_dirs: &[PathBuf],
+    abi: nono::DetectedAbi,
+) -> Result<landlock::RulesetCreated> {
     if !abi.has_execute() {
         return Err(NonoError::SandboxInit(format!(
             "tool-sandbox outer exec gate requires Landlock ABI V3+; detected {}",
@@ -3190,12 +3212,7 @@ fn apply_outer_exec_gate(
             })?;
     }
 
-    let status = ruleset.restrict_self().map_err(|err| {
-        NonoError::SandboxInit(format!(
-            "tool-sandbox outer exec gate restrict_self failed: {err}"
-        ))
-    })?;
-    ensure_outer_exec_gate_fully_enforced(status.ruleset)
+    Ok(ruleset)
 }
 
 fn ensure_outer_exec_gate_fully_enforced(status: landlock::RulesetStatus) -> Result<()> {

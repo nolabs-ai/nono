@@ -257,10 +257,6 @@ This is the primary mechanism for surgically customizing inherited profiles with
 | `suppress_save_prompt` | `filesystem` | Paths whose runtime denials should not be offered in save-profile prompts. **Does not grant access** and does not hide diagnostics. |
 | `suppress_system_services` | `diagnostics` | macOS Seatbelt operation names to hide from diagnostic footers and save-profile prompts. **Does not grant access** and does not change enforcement. |
 
-<Note>
-  **Renamed in issue #594.** The old top-level `policy` section was dissolved into `filesystem`, `groups`, and `commands` in the canonical schema. Legacy names still deserialize with a deprecation warning; see the migration table in `nono profile guide` for the full mapping. The legacy keys will be removed in v1.0.0.
-</Note>
-
 #### Adding a Deny Rule to an Inherited Profile
 
 Block a specific path that a base profile would otherwise allow:
@@ -609,10 +605,7 @@ Every profile's effective capability set is built through composition:
 6. **CLI overrides** (`--allow`, `--read`, `--bypass-protection`, etc.) are applied last
 
 `profile.filesystem.suppress_save_prompt` and `--suppress-save-prompt` are
-prompt filters only; they do not participate in capability enforcement. The
-older `filesystem.ignore` and `--ignore-denied` forms are accepted as aliases,
-but new examples use the explicit suppress wording to avoid suggesting an
-access grant.
+prompt filters only; they do not participate in capability enforcement.
 
 `profile.diagnostics.suppress_system_services` is also output-only (macOS). It
 hides recurring non-filesystem Seatbelt violations from diagnostic footers and

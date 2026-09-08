@@ -123,8 +123,7 @@ pub struct ProfileDef {
     pub filesystem: profile::FilesystemConfig,
     #[serde(default)]
     pub network: profile::NetworkConfig,
-    /// ALIAS(canonical="env_credentials", introduced="v0.0.0", remove_by="indefinite", issue="#143")
-    #[serde(default, alias = "secrets")]
+    #[serde(default)]
     pub env_credentials: profile::SecretsConfig,
     #[serde(default)]
     pub command_policies: Option<crate::command_policy::CommandPoliciesConfig>,
@@ -132,8 +131,7 @@ pub struct ProfileDef {
     pub workdir: profile::WorkdirConfig,
     #[serde(default)]
     pub hooks: profile::HooksConfig,
-    /// ALIAS(canonical="rollback", introduced="v0.0.0", remove_by="indefinite", issue="#124")
-    #[serde(default, alias = "undo")]
+    #[serde(default)]
     pub rollback: profile::RollbackConfig,
     #[serde(default)]
     pub open_urls: Option<profile::OpenUrlConfig>,

@@ -135,7 +135,7 @@ fn test_validate_valid_profile() {
         &path,
         r#"{
             "meta": { "name": "test", "description": "test profile" },
-            "security": { "groups": ["deny_credentials"] },
+            "groups": { "include": ["deny_credentials"] },
             "workdir": { "access": "readwrite" }
         }"#,
     )
@@ -161,7 +161,7 @@ fn test_validate_invalid_group() {
         &path,
         r#"{
             "meta": { "name": "test" },
-            "security": { "groups": ["fake_group_that_does_not_exist"] }
+            "groups": { "include": ["fake_group_that_does_not_exist"] }
         }"#,
     )
     .expect("write");

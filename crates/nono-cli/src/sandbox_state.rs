@@ -30,8 +30,7 @@ pub struct SandboxState {
     /// Commands explicitly blocked
     pub blocked_commands: Vec<String>,
     /// Paths exempted from deny groups via bypass_protection (canonicalized)
-    /// ALIAS(canonical="bypass_protection_paths", introduced="v0.41.0", remove_by="v1.0.0", issue="#594")
-    #[serde(default, alias = "override_deny_paths")]
+    #[serde(default)]
     pub bypass_protection_paths: Vec<String>,
     /// Resolved filesystem deny paths enforced by the active profile.
     ///

@@ -253,8 +253,8 @@ fn env_allow_net_conflicts_with_upstream_proxy() {
 }
 
 #[test]
-fn allow_net_overrides_profile_external_proxy() {
-    // A profile with external_proxy should be overridden by --allow-net,
+fn allow_net_overrides_profile_upstream_proxy() {
+    // A profile with upstream_proxy should be overridden by --allow-net,
     // resulting in unrestricted network (no proxy mode activation).
     let dir = tempfile::tempdir().expect("tmpdir");
     let profile_path = dir.path().join("ext-proxy-profile.json");
@@ -262,7 +262,7 @@ fn allow_net_overrides_profile_external_proxy() {
         &profile_path,
         r#"{
             "meta": { "name": "ext-proxy-test" },
-            "network": { "external_proxy": "squid.corp:3128" }
+            "network": { "upstream_proxy": "squid.corp:3128" }
         }"#,
     )
     .expect("write profile");
@@ -284,7 +284,7 @@ fn allow_net_overrides_profile_external_proxy() {
     let text = combined_output(&output);
     assert!(
         output.status.success(),
-        "--allow-net should override profile external_proxy, stderr: {text}"
+        "--allow-net should override profile upstream_proxy, stderr: {text}"
     );
     // Should show "allowed" network, not proxy mode
     assert!(

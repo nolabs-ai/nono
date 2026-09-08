@@ -180,9 +180,7 @@ pub struct FilesystemConfig {
     /// bound. Recursive. Implies read+write access on the directory.
     #[serde(default, deserialize_with = "deserialize_conditional_path_vec")]
     pub unix_socket_subtree_bind: Vec<String>,
-    /// Paths denied filesystem access. Canonical location for deny entries
-    /// in the #594 schema; the legacy deny-access key drains here via
-    /// `deprecated_schema::LegacyPolicyPatch`.
+    /// Paths denied filesystem access.
     #[serde(default, deserialize_with = "deserialize_conditional_path_vec")]
     pub deny: Vec<String>,
     /// Paths exempted from group-level deny rules.
@@ -201,12 +199,7 @@ pub struct FilesystemConfig {
     /// prompt. This does not grant access, remove deny rules, or hide the
     /// diagnostic footer; it only suppresses repeated save suggestions for
     /// paths the user has decided not to grant.
-    /// ALIAS(canonical="suppress_save_prompt", introduced="v0.52.0", remove_by="indefinite", issue="#875")
-    #[serde(
-        default,
-        alias = "ignore",
-        deserialize_with = "deserialize_conditional_path_vec"
-    )]
+    #[serde(default, deserialize_with = "deserialize_conditional_path_vec")]
     pub suppress_save_prompt: Vec<String>,
 }
 
@@ -1781,42 +1774,25 @@ pub struct NetworkConfig {
     pub network_profile: InheritableValue<String>,
     /// Additional domains to allow through the proxy (on top of profile hosts).
     /// Entries can be plain hostname strings or objects with endpoint rules.
-    /// Canonical profile key: `allow_domain` (legacy `proxy_allow` and
-    /// `allow_proxy` are also accepted).
-    /// ALIAS(canonical="allow_domain", introduced="v0.0.0", remove_by="indefinite", issue="#415")
-    #[serde(
-        default,
-        rename = "allow_domain",
-        alias = "proxy_allow",
-        alias = "allow_proxy"
-    )]
+    #[serde(default, rename = "allow_domain")]
     pub allow_domain: Vec<AllowDomainEntry>,
     /// Domains to deny through the proxy regardless of the allowlist.
     /// Supports the same wildcard syntax as `allow_domain` (e.g. `*.ads.example.com`).
     #[serde(default)]
     pub deny_domain: Vec<String>,
     /// Credential services to enable via reverse proxy.
-    /// Canonical profile key: `credentials` (legacy `proxy_credentials` accepted).
     ///
     /// When `None` (absent from profile), inherits parent credentials during merge.
     /// When `Some([])` (explicitly set to empty array), overrides parent to disable
     /// all inherited credential routes.
-    /// ALIAS(canonical="credentials", introduced="v0.0.0", remove_by="indefinite", issue="#415")
     #[serde(
         default,
         rename = "credentials",
-        alias = "proxy_credentials",
         skip_serializing_if = "Option::is_none"
     )]
     pub credentials: Option<Vec<String>>,
     /// Localhost TCP IPC (`--open-port`). **`0`**: macOS only, means `localhost:*` outbound.
-    /// ALIAS(canonical="open_port", introduced="v0.0.0", remove_by="indefinite", issue="#415")
-    #[serde(
-        default,
-        rename = "open_port",
-        alias = "port_allow",
-        alias = "allow_port"
-    )]
+    #[serde(default, rename = "open_port")]
     pub open_port: Vec<u16>,
     /// Inclusive port ranges for bidirectional localhost TCP IPC (connect + bind).
     /// Multiple ranges are supported. Example: `[[3000, 3010], [8000, 8100]]`.
@@ -1856,16 +1832,10 @@ pub struct NetworkConfig {
     #[serde(default)]
     pub tls_intercept: Option<TlsInterceptConfig>,
     /// Upstream proxy address (host:port) for enterprise proxy passthrough.
-    /// Canonical profile key: `upstream_proxy` (legacy `external_proxy`
-    /// accepted).
-    /// ALIAS(canonical="upstream_proxy", introduced="v0.0.0", remove_by="indefinite", issue="#415")
-    #[serde(default, rename = "upstream_proxy", alias = "external_proxy")]
+    #[serde(default, rename = "upstream_proxy")]
     pub upstream_proxy: Option<String>,
     /// Hosts to bypass the upstream proxy and route directly.
-    /// Canonical profile key: `upstream_bypass` (legacy
-    /// `external_proxy_bypass` accepted).
-    /// ALIAS(canonical="upstream_bypass", introduced="v0.0.0", remove_by="indefinite", issue="#415")
-    #[serde(default, rename = "upstream_bypass", alias = "external_proxy_bypass")]
+    #[serde(default, rename = "upstream_bypass")]
     pub upstream_bypass: Vec<String>,
 }
 
@@ -2235,12 +2205,9 @@ pub struct WorkdirConfig {
 
 /// Security configuration — process-level isolation knobs.
 ///
-/// The legacy `groups` and `allowed_commands` fields were removed in phase 2
-/// of #594. Policy group membership now lives in `Profile.groups.include`
-/// (written by `merge_implicit_default_groups` at load time). Command
-/// allowlists live in `Profile.commands.allow`. Legacy JSON keys still
-/// deserialize via `deprecated_schema::RawSecurityConfig` and drain into
-/// those canonical sections.
+/// Policy group membership lives in `Profile.groups.include` (written by
+/// `merge_implicit_default_groups` at load time). Command allowlists live
+/// in `Profile.commands.allow`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SecurityConfig {
@@ -2460,8 +2427,7 @@ pub struct Profile {
     pub diagnostics: DiagnosticsConfig,
     #[serde(default)]
     pub linux: LinuxConfig,
-    /// ALIAS(canonical="env_credentials", introduced="v0.0.0", remove_by="indefinite", issue="#143")
-    #[serde(default, alias = "secrets")]
+    #[serde(default)]
     pub env_credentials: SecretsConfig,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub environment: Option<EnvironmentConfig>,
@@ -2482,8 +2448,7 @@ pub struct Profile {
     /// `before` can export env vars via NONO_ENV_FILE.
     #[serde(default)]
     pub session_hooks: SessionHooks,
-    /// ALIAS(canonical="rollback", introduced="v0.0.0", remove_by="indefinite", issue="#124")
-    #[serde(default, alias = "undo")]
+    #[serde(default)]
     pub rollback: RollbackConfig,
     /// Supervisor-delegated URL opening (e.g., for OAuth2 login flows).
     /// When `None` (absent from JSON), inherits from the base profile.
@@ -2616,7 +2581,7 @@ struct ProfileDeserialize {
     #[serde(default)]
     meta: ProfileMeta,
     #[serde(default)]
-    security: crate::deprecated_schema::RawSecurityConfig,
+    security: SecurityConfig,
     #[serde(default)]
     groups: GroupsConfig,
     #[serde(default)]
@@ -2624,15 +2589,12 @@ struct ProfileDeserialize {
     #[serde(default)]
     filesystem: FilesystemConfig,
     #[serde(default)]
-    policy: crate::deprecated_schema::LegacyPolicyPatch,
-    #[serde(default)]
     network: NetworkConfig,
     #[serde(default)]
     diagnostics: DiagnosticsConfig,
     #[serde(default)]
     linux: LinuxConfig,
-    /// ALIAS(canonical="env_credentials", introduced="v0.0.0", remove_by="indefinite", issue="#143")
-    #[serde(default, alias = "secrets")]
+    #[serde(default)]
     env_credentials: SecretsConfig,
     #[serde(default)]
     environment: Option<EnvironmentConfig>,
@@ -2650,8 +2612,7 @@ struct ProfileDeserialize {
     hooks: HooksConfig,
     #[serde(default)]
     session_hooks: SessionHooks,
-    /// ALIAS(canonical="rollback", introduced="v0.0.0", remove_by="indefinite", issue="#124")
-    #[serde(default, alias = "undo")]
+    #[serde(default)]
     rollback: RollbackConfig,
     #[serde(default)]
     open_urls: Option<OpenUrlConfig>,
@@ -2668,9 +2629,7 @@ struct ProfileDeserialize {
     packs: Vec<String>,
     #[serde(default)]
     binary: Option<String>,
-    /// ALIAS(canonical="command_args", introduced="v0.0.0", remove_by="indefinite", issue="N/A")
     #[serde(default)]
-    #[serde(alias = "brokered_commands")]
     command_args: Vec<String>,
     #[serde(default)]
     unsafe_macos_seatbelt_rules: Vec<String>,
@@ -2680,15 +2639,10 @@ struct ProfileDeserialize {
 
 impl From<ProfileDeserialize> for Profile {
     fn from(raw: ProfileDeserialize) -> Self {
-        // NOTE: During the transition, `SecurityConfig::from(&raw.security)` also
-        // copies legacy_groups/legacy_allowed_commands into the canonical
-        // SecurityConfig fields (removed in C2). The drains below extend
-        // canonical sections so both views carry the data until C2 narrows
-        // SecurityConfig.
-        let mut profile = Self {
+        Self {
             extends: raw.extends,
             meta: raw.meta,
-            security: crate::profile::SecurityConfig::from(&raw.security),
+            security: raw.security,
             groups: raw.groups,
             commands: raw.commands,
             filesystem: raw.filesystem,
@@ -2716,16 +2670,7 @@ impl From<ProfileDeserialize> for Profile {
             command_args: raw.command_args,
             unsafe_macos_seatbelt_rules: raw.unsafe_macos_seatbelt_rules,
             platform_overrides: raw.platform_overrides,
-        };
-
-        // Drain legacy keys into canonical sections (no-op unless the legacy
-        // keys are populated). Each populated key emits one deprecation
-        // warning to stderr and extends (does not replace) the canonical
-        // section.
-        crate::deprecated_schema::drain_legacy_security_into_canonical(&raw.security, &mut profile);
-        crate::deprecated_schema::drain_legacy_policy_into_canonical(&raw.policy, &mut profile);
-
-        profile
+        }
     }
 }
 
@@ -4666,21 +4611,6 @@ mod tests {
     }
 
     #[test]
-    fn test_filesystem_config_ignore_alias_drains_to_suppress_save_prompt() {
-        let json = r#"{
-            "meta": {"name": "t"},
-            "filesystem": {
-                "ignore": ["$HOME/.copilot/settings.json"]
-            }
-        }"#;
-        let profile: Profile = serde_json::from_str(json).expect("parse");
-        assert_eq!(
-            profile.filesystem.suppress_save_prompt,
-            vec!["$HOME/.copilot/settings.json"]
-        );
-    }
-
-    #[test]
     fn test_valid_profile_names() {
         assert!(is_valid_profile_name("claude-code"));
         assert!(is_valid_profile_name("linux-host-compat"));
@@ -4873,7 +4803,7 @@ mod tests {
             &profile_path,
             r#"{
                 "meta": { "name": "custom-test" },
-                "security": { "groups": ["node_runtime"] },
+                "groups": { "include": ["node_runtime"] },
                 "network": { "block": true }
             }"#,
         )
@@ -5619,28 +5549,6 @@ mod tests {
         let profile: Profile = serde_json::from_str(json_str).expect("Failed to parse profile");
         let err = validate_env_credential_keys(&profile).expect_err("should reject");
         assert!(err.to_string().contains("keyring URI"));
-    }
-
-    #[test]
-    fn test_secrets_alias_backward_compat() {
-        // "secrets" should still work as an alias for "env_credentials"
-        let json_str = r#"{
-            "meta": { "name": "test-profile" },
-            "secrets": {
-                "openai_api_key": "OPENAI_API_KEY"
-            }
-        }"#;
-
-        let profile: Profile = serde_json::from_str(json_str).expect("Failed to parse profile");
-        assert_eq!(profile.env_credentials.mappings.len(), 1);
-        assert_eq!(
-            profile
-                .env_credentials
-                .mappings
-                .get("openai_api_key")
-                .map(|s| s.as_str()),
-            Some("OPENAI_API_KEY")
-        );
     }
 
     #[test]
@@ -6995,11 +6903,6 @@ mod tests {
         let err = result.unwrap_err().to_string();
         assert!(err.contains("mutually exclusive"));
     }
-
-    // Note: the legacy `allowed_commands` placement (under the security
-    // section) is covered by an in-process unit test in
-    // `deprecated_schema::tests::legacy_security_allowed_commands_drains_to_canonical_commands_allow`,
-    // keeping legacy JSON literals confined to that module.
 
     #[test]
     fn test_security_config_allowed_commands_defaults_empty() {
@@ -8782,33 +8685,6 @@ mod tests {
     // `tests/legacy_drain_unit_tests.rs`.
 
     #[test]
-    fn test_network_config_accepts_verb_noun_collection_aliases() {
-        let profile: Profile = serde_json::from_str(
-            r#"{
-                "meta": { "name": "aliases" },
-                "network": {
-                    "block": true,
-                    "allow_proxy": ["api.openai.com"],
-                    "allow_port": [3000],
-                    "external_proxy": "squid.corp:3128"
-                }
-            }"#,
-        )
-        .expect("parse profile with supported aliases");
-
-        assert!(profile.network.block);
-        assert_eq!(
-            profile.network.allow_domain,
-            vec![AllowDomainEntry::Plain("api.openai.com".to_string())]
-        );
-        assert_eq!(profile.network.open_port, vec![3000]);
-        assert_eq!(
-            profile.network.upstream_proxy.as_deref(),
-            Some("squid.corp:3128")
-        );
-    }
-
-    #[test]
     fn test_network_config_serializes_new_names() {
         let profile: Profile = serde_json::from_str(
             r#"{
@@ -9345,11 +9221,11 @@ mod tests {
             "network": {
                 "block": false,
                 "network_profile": "anthropic",
-                "proxy_allow": ["extra.example.com"],
-                "allow_port": [8080]
+                "allow_domain": ["extra.example.com"],
+                "open_port": [8080]
             },
             "workdir": { "access": "readwrite" },
-            "undo": {
+            "rollback": {
                 "exclude_patterns": ["node_modules"],
                 "exclude_globs": ["*.tmp"]
             }

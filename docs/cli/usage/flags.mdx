@@ -250,9 +250,8 @@ nono run --profile nolabs-ai/claude \
 ```
 
 For persistent behavior, put the same path in
-`filesystem.suppress_save_prompt` in a user profile. The older
-`--ignore-denied` spelling is accepted as an alias, but the suppress wording is
-preferred because this flag never turns a denial into an allow rule.
+`filesystem.suppress_save_prompt` in a user profile. The suppress wording is
+used deliberately because this flag never turns a denial into an allow rule.
 
 When nono offers to save denied paths after a run, choosing `suppress` writes
 all listed path suggestions to `filesystem.suppress_save_prompt` instead of
@@ -685,8 +684,7 @@ nono run --allow-cwd --allow-command rm --allow-command mv -- my-script.sh
 </Note>
 
 Commands can also be allowed temporarily via the deprecated `commands.allow`
-field (the older `security` placement is also accepted with a deprecation
-warning, see issue #594):
+field:
 
 ```json
 {
@@ -745,10 +743,6 @@ Can be specified multiple times.
 
 <Note>
   `--bypass-protection` without a matching grant (`--allow`, `--read`, `--write`, etc.) is a hard error. This prevents silent no-ops on Linux and unintended implicit grants on macOS.
-</Note>
-
-<Note>
-  **Renamed in issue #594.** This flag was renamed from its former deny-override name. The legacy name is still accepted as a deprecated alias and emits a warning on use; it will be removed in v1.0.0.
 </Note>
 
 ### Credential Options

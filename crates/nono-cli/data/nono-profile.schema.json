@@ -58,10 +58,6 @@
       "$ref": "#/$defs/SecretsConfig",
       "description": "Maps keystore account names (or op://, bw://, apple-password://, env:// URIs) to environment variable names. Secrets are loaded from the system keystore at startup."
     },
-    "secrets": {
-      "$ref": "#/$defs/SecretsConfig",
-      "description": "Alias for env_credentials. Maps keystore account names to environment variable names."
-    },
     "environment": {
       "oneOf": [
         { "$ref": "#/$defs/EnvironmentConfig" },
@@ -88,10 +84,6 @@
     "rollback": {
       "$ref": "#/$defs/RollbackConfig",
       "description": "Rollback snapshot configuration controlling which files are excluded from undo snapshots."
-    },
-    "undo": {
-      "$ref": "#/$defs/RollbackConfig",
-      "description": "Alias for rollback. Controls which files are excluded from undo snapshots."
     },
     "open_urls": {
       "oneOf": [
@@ -838,11 +830,6 @@
           "type": "array",
           "items": { "$ref": "#/$defs/ConditionalPath" },
           "description": "Paths whose runtime denials should not be offered in the save-profile prompt. Does not grant access, remove deny rules, or hide diagnostic output."
-        },
-        "ignore": {
-          "type": "array",
-          "items": { "$ref": "#/$defs/ConditionalPath" },
-          "description": "Alias for suppress_save_prompt. Prefer filesystem.suppress_save_prompt in new profiles."
         }
       }
     },
@@ -912,25 +899,10 @@
           },
           "description": "Additional domains to allow through the proxy. Entries can be plain hostname strings (CONNECT tunnel, no L7 filtering) or objects with endpoint rules (TLS-intercepted method+path filtering). When endpoints are present, only matching requests are allowed (default-deny)."
         },
-        "proxy_allow": {
-          "type": "array",
-          "items": { "type": "string" },
-          "description": "Legacy alias for allow_domain."
-        },
-        "allow_proxy": {
-          "type": "array",
-          "items": { "type": "string" },
-          "description": "Legacy alias for allow_domain."
-        },
         "credentials": {
           "type": "array",
           "items": { "type": "string" },
           "description": "Credential service names to enable via the reverse proxy."
-        },
-        "proxy_credentials": {
-          "type": "array",
-          "items": { "type": "string" },
-          "description": "Legacy alias for credentials."
         },
         "open_port": {
           "type": "array",
@@ -967,16 +939,6 @@
           "items": { "type": "string" },
           "description": "Domains to deny through the proxy regardless of the allowlist. Supports the same wildcard syntax as allow_domain (e.g. *.ads.example.com)."
         },
-        "port_allow": {
-          "type": "array",
-          "items": { "type": "integer" },
-          "description": "Legacy alias for open_port."
-        },
-        "allow_port": {
-          "type": "array",
-          "items": { "type": "integer" },
-          "description": "Legacy alias for open_port."
-        },
         "listen_port": {
           "type": "array",
           "items": { "type": "integer" },
@@ -1005,22 +967,10 @@
           ],
           "description": "Upstream proxy address (host:port) for enterprise proxy passthrough."
         },
-        "external_proxy": {
-          "oneOf": [
-            { "type": "string" },
-            { "type": "null" }
-          ],
-          "description": "Legacy alias for upstream_proxy."
-        },
         "upstream_bypass": {
           "type": "array",
           "items": { "type": "string" },
           "description": "Hosts to bypass the upstream proxy and route directly. Supports exact hostnames and wildcard suffixes (e.g., *.example.com)."
-        },
-        "external_proxy_bypass": {
-          "type": "array",
-          "items": { "type": "string" },
-          "description": "Legacy alias for upstream_bypass."
         }
       }
     },

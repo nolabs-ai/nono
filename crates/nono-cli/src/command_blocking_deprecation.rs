@@ -159,8 +159,7 @@ mod tests {
         let profile: Profile = serde_json::from_str(
             r#"{
                 "meta": { "name": "deprecated-commands" },
-                "security": { "allowed_commands": ["rm"] },
-                "policy": { "add_deny_commands": ["docker"] }
+                "commands": { "allow": ["rm"], "deny": ["docker"] }
             }"#,
         )
         .expect("profile should deserialize");

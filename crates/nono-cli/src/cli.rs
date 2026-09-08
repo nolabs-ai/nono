@@ -516,30 +516,6 @@ IN-BAND DETACH:
     Session(SessionArgs),
 
     // ── Policy & profiles ────────────────────────────────────────────────
-    /// [deprecated] Use 'nono profile' instead
-    #[command(subcommand_help_heading = "COMMANDS")]
-    #[command(help_template = "\
-{about}
-
-\x1b[1mUSAGE\x1b[0m
-  nono policy <command>
-
-\x1b[1mNOTE\x1b[0m
-  These commands are deprecated. Use the corresponding 'nono profile'
-  form; every invocation of 'nono policy <sub>' prints a deprecation
-  warning to stderr.
-
-{all-args}
-{after-help}")]
-    #[command(after_help = "\x1b[1mEXAMPLES\x1b[0m
-  nono policy groups        # deprecated -> use 'nono profile groups'
-  nono policy profiles      # deprecated -> use 'nono profile list'
-  nono policy show <name>   # deprecated -> use 'nono profile show <name>'
-  nono policy diff a b      # deprecated -> use 'nono profile diff a b'
-  nono policy validate <f>  # deprecated -> use 'nono profile validate <f>'
-")]
-    Policy(crate::deprecated_policy::PolicyArgs),
-
     /// Create, inspect, and compare nono profiles
     #[command(subcommand_help_heading = "COMMANDS")]
     #[command(help_template = "\
@@ -926,12 +902,6 @@ pub struct CompletionsArgs {
     pub help: Option<bool>,
 }
 
-// NOTE: `PolicyArgs`, `PolicyCommands`, and `Policy*Args` types that
-// backed `nono policy <sub>` now live in `crate::deprecated_policy`. They
-// share their inner arg shapes with `ProfileGroupsArgs` / `ProfileListArgs`
-// / `ProfileShowArgs` / `ProfileDiffArgs` / `ProfileValidateArgs` via
-// `pub use` aliases so there is no parallel set of types to keep in sync.
-
 #[derive(Parser, Debug)]
 #[command(disable_help_flag = true)]
 pub struct ProfileCmdArgs {
@@ -1160,20 +1130,16 @@ pub struct SandboxArgs {
     pub allow_unix_socket_subtree_bind: Vec<PathBuf>,
 
     /// Override a deny rule for a path. Pair with --allow/--read/--write grant
-    /// ALIAS(canonical="--bypass-protection", introduced="v0.41.0", remove_by="v1.0.0", issue="#594")
     #[arg(
         long = "bypass-protection",
-        alias = "override-deny",
         value_name = "PATH",
         help_heading = "FILESYSTEM"
     )]
     pub bypass_protection: Vec<PathBuf>,
 
     /// Suppress save-profile prompts for denials under this path. Does not grant access
-    /// ALIAS(canonical="--suppress-save-prompt", introduced="v0.52.0", remove_by="indefinite", issue="#875")
     #[arg(
         long = "suppress-save-prompt",
-        alias = "ignore-denied",
         value_name = "PATH",
         help_heading = "FILESYSTEM"
     )]
@@ -1189,10 +1155,8 @@ pub struct SandboxArgs {
 
     // ── Network ──────────────────────────────────────────────────────────
     /// Block outbound network access (allowed by default)
-    /// ALIAS(canonical="--block-net", introduced="v0.0.0", remove_by="indefinite", issue="#302")
     #[arg(
         long = "block-net",
-        alias = "net-block",
         conflicts_with = "allow_net",
         env = "NONO_BLOCK_NET",
         value_parser = clap::builder::BoolishValueParser::new(),
@@ -1202,10 +1166,8 @@ pub struct SandboxArgs {
     pub block_net: bool,
 
     /// Deprecated compatibility flag. Network is unrestricted by default.
-    /// ALIAS(canonical="--allow-net", introduced="v0.0.0", remove_by="indefinite", issue="#302")
     #[arg(
         long = "allow-net",
-        alias = "net-allow",
         env = "NONO_ALLOW_NET",
         value_parser = clap::builder::BoolishValueParser::new(),
         action = clap::ArgAction::SetTrue,
@@ -1235,11 +1197,8 @@ pub struct SandboxArgs {
     /// Add a domain to the proxy allowlist (repeatable).
     /// Use a plain hostname for unrestricted access, or a URL with a path glob
     /// to restrict to specific endpoints (e.g., https://github.com/org/**)
-    /// ALIAS(canonical="--allow-domain", introduced="v0.0.0", remove_by="indefinite", issue="#415")
     #[arg(
         long = "allow-domain",
-        alias = "allow-proxy",
-        alias = "proxy-allow",
         env = "NONO_ALLOW_DOMAIN",
         value_name = "DOMAIN_OR_URL",
         help_heading = "NETWORK"
@@ -1258,23 +1217,11 @@ pub struct SandboxArgs {
     pub deny_proxy: Vec<String>,
 
     /// Allow the sandboxed child to listen on a TCP port (repeatable)
-    /// ALIAS(canonical="--listen-port", introduced="v0.0.0", remove_by="indefinite", issue="#415")
-    #[arg(
-        long = "listen-port",
-        alias = "allow-bind",
-        value_name = "PORT",
-        help_heading = "NETWORK"
-    )]
+    #[arg(long = "listen-port", value_name = "PORT", help_heading = "NETWORK")]
     pub allow_bind: Vec<u16>,
 
     /// Allow bidirectional localhost TCP on a port: connect + listen (repeatable)
-    /// ALIAS(canonical="--open-port", introduced="v0.0.0", remove_by="indefinite", issue="#415")
-    #[arg(
-        long = "open-port",
-        alias = "allow-port",
-        value_name = "PORT",
-        help_heading = "NETWORK"
-    )]
+    #[arg(long = "open-port", value_name = "PORT", help_heading = "NETWORK")]
     pub allow_port: Vec<u16>,
 
     /// Allow outbound TCP connect to a specific port (repeatable; Linux Landlock V4+ only)
@@ -1286,10 +1233,8 @@ pub struct SandboxArgs {
     pub allow_connect_port: Vec<u16>,
 
     /// Chain outbound traffic through an upstream proxy (host:port)
-    /// ALIAS(canonical="--upstream-proxy", introduced="v0.0.0", remove_by="indefinite", issue="#415")
     #[arg(
         long = "upstream-proxy",
-        alias = "external-proxy",
         value_name = "HOST:PORT",
         env = "NONO_UPSTREAM_PROXY",
         help_heading = "NETWORK"
@@ -1297,10 +1242,8 @@ pub struct SandboxArgs {
     pub external_proxy: Option<String>,
 
     /// Route these domains direct instead of through the upstream proxy
-    /// ALIAS(canonical="--upstream-bypass", introduced="v0.0.0", remove_by="indefinite", issue="#415")
     #[arg(
         long = "upstream-bypass",
-        alias = "external-proxy-bypass",
         value_name = "DOMAIN",
         env = "NONO_UPSTREAM_BYPASS",
         value_delimiter = ',',
@@ -1337,10 +1280,8 @@ pub struct SandboxArgs {
 
     // ── Credentials ──────────────────────────────────────────────────────
     /// Inject credentials via reverse proxy for a service (repeatable)
-    /// ALIAS(canonical="--credential", introduced="v0.0.0", remove_by="v1.0.0", issue="#143")
     #[arg(
         long = "credential",
-        alias = "proxy-credential",
         env = "NONO_CREDENTIAL",
         value_name = "SERVICE",
         help_heading = "CREDENTIALS"
@@ -1585,11 +1526,8 @@ pub struct ProxyArgs {
     /// Add a domain to the proxy allowlist (repeatable).
     /// Plain hostname for unrestricted access, or a URL with a path glob
     /// to restrict to specific endpoints (e.g., https://github.com/org/**)
-    /// ALIAS(canonical="--allow-domain", introduced="v0.0.0", remove_by="indefinite", issue="#415")
     #[arg(
         long = "allow-domain",
-        alias = "allow-proxy",
-        alias = "proxy-allow",
         env = "NONO_ALLOW_DOMAIN",
         value_name = "DOMAIN_OR_URL",
         help_heading = "NETWORK"
@@ -1607,10 +1545,8 @@ pub struct ProxyArgs {
     pub deny_proxy: Vec<String>,
 
     /// Chain outbound traffic through an upstream proxy (host:port)
-    /// ALIAS(canonical="--upstream-proxy", introduced="v0.0.0", remove_by="indefinite", issue="#415")
     #[arg(
         long = "upstream-proxy",
-        alias = "external-proxy",
         value_name = "HOST:PORT",
         env = "NONO_UPSTREAM_PROXY",
         help_heading = "NETWORK"
@@ -1618,10 +1554,8 @@ pub struct ProxyArgs {
     pub external_proxy: Option<String>,
 
     /// Route these domains direct instead of through the upstream proxy
-    /// ALIAS(canonical="--upstream-bypass", introduced="v0.0.0", remove_by="indefinite", issue="#415")
     #[arg(
         long = "upstream-bypass",
-        alias = "external-proxy-bypass",
         value_name = "DOMAIN",
         env = "NONO_UPSTREAM_BYPASS",
         value_delimiter = ',',
@@ -1688,10 +1622,8 @@ pub struct ProxyArgs {
 
     // ── Credentials ──────────────────────────────────────────────────────
     /// Inject credentials via reverse proxy for a service (repeatable)
-    /// ALIAS(canonical="--credential", introduced="v0.0.0", remove_by="v1.0.0", issue="#143")
     #[arg(
         long = "credential",
-        alias = "proxy-credential",
         env = "NONO_CREDENTIAL",
         value_name = "SERVICE",
         help_heading = "CREDENTIALS"
@@ -1786,20 +1718,16 @@ pub struct WrapSandboxArgs {
     pub allow_unix_socket_subtree_bind: Vec<PathBuf>,
 
     /// Override a deny rule for a path. Pair with --allow/--read/--write grant
-    /// ALIAS(canonical="--bypass-protection", introduced="v0.41.0", remove_by="v1.0.0", issue="#594")
     #[arg(
         long = "bypass-protection",
-        alias = "override-deny",
         value_name = "PATH",
         help_heading = "FILESYSTEM"
     )]
     pub bypass_protection: Vec<PathBuf>,
 
     /// Suppress save-profile prompts for denials under this path. Does not grant access
-    /// ALIAS(canonical="--suppress-save-prompt", introduced="v0.52.0", remove_by="indefinite", issue="#875")
     #[arg(
         long = "suppress-save-prompt",
-        alias = "ignore-denied",
         value_name = "PATH",
         help_heading = "FILESYSTEM"
     )]
@@ -1815,10 +1743,8 @@ pub struct WrapSandboxArgs {
 
     // ── Network ──────────────────────────────────────────────────────────
     /// Block outbound network access (allowed by default)
-    /// ALIAS(canonical="--block-net", introduced="v0.0.0", remove_by="indefinite", issue="#302")
     #[arg(
         long = "block-net",
-        alias = "net-block",
         env = "NONO_BLOCK_NET",
         value_parser = clap::builder::BoolishValueParser::new(),
         action = clap::ArgAction::SetTrue,
@@ -1827,23 +1753,11 @@ pub struct WrapSandboxArgs {
     pub block_net: bool,
 
     /// Allow the sandboxed child to listen on a TCP port (repeatable)
-    /// ALIAS(canonical="--listen-port", introduced="v0.0.0", remove_by="indefinite", issue="#415")
-    #[arg(
-        long = "listen-port",
-        alias = "allow-bind",
-        value_name = "PORT",
-        help_heading = "NETWORK"
-    )]
+    #[arg(long = "listen-port", value_name = "PORT", help_heading = "NETWORK")]
     pub allow_bind: Vec<u16>,
 
     /// Allow bidirectional localhost TCP on a port: connect + listen (repeatable)
-    /// ALIAS(canonical="--open-port", introduced="v0.0.0", remove_by="indefinite", issue="#415")
-    #[arg(
-        long = "open-port",
-        alias = "allow-port",
-        value_name = "PORT",
-        help_heading = "NETWORK"
-    )]
+    #[arg(long = "open-port", value_name = "PORT", help_heading = "NETWORK")]
     pub allow_port: Vec<u16>,
 
     /// Allow outbound TCP connect to a specific port (repeatable; Linux Landlock V4+ only)
@@ -2306,8 +2220,7 @@ pub struct WhyArgs {
     pub write_file: Vec<PathBuf>,
 
     /// Block network access (for query context)
-    /// ALIAS(canonical="--block-net", introduced="v0.0.0", remove_by="indefinite", issue="#302")
-    #[arg(long = "block-net", alias = "net-block", help_heading = "CONTEXT")]
+    #[arg(long = "block-net", help_heading = "CONTEXT")]
     pub block_net: bool,
 
     /// Use a named profile for query context
@@ -3985,7 +3898,7 @@ mod tests {
     }
 
     #[test]
-    fn test_network_flag_aliases_still_parse() {
+    fn test_network_flags_parse() {
         let cli = Cli::parse_from([
             "nono",
             "run",
@@ -4021,39 +3934,7 @@ mod tests {
             _ => panic!("Expected Run command"),
         }
 
-        let cli = Cli::parse_from([
-            "nono",
-            "run",
-            "--allow",
-            ".",
-            "--net-allow",
-            "echo",
-            "hello",
-        ]);
-        match cli.command {
-            Commands::Run(args) => {
-                assert!(args.sandbox.allow_net);
-            }
-            _ => panic!("Expected Run command"),
-        }
-
-        let cli = Cli::parse_from([
-            "nono",
-            "run",
-            "--allow",
-            ".",
-            "--proxy-allow",
-            "api.openai.com",
-            "echo",
-        ]);
-        match cli.command {
-            Commands::Run(args) => {
-                assert_eq!(args.sandbox.allow_proxy, vec!["api.openai.com"]);
-            }
-            _ => panic!("Expected Run command"),
-        }
-
-        let cli = Cli::parse_from(["nono", "why", "--host", "example.com", "--net-block"]);
+        let cli = Cli::parse_from(["nono", "why", "--host", "example.com", "--block-net"]);
         match cli.command {
             Commands::Why(args) => {
                 assert!(args.block_net);
@@ -4215,32 +4096,6 @@ mod tests {
     }
 
     #[test]
-    fn test_override_deny_alias_populates_bypass_protection() {
-        // The legacy `--override-deny` flag is retained as a clap alias for
-        // `--bypass-protection`. This test locks in that parsing behavior so
-        // removing the alias in the v1.0.0 cleanup is deliberate, not accidental.
-        let cli = Cli::parse_from([
-            "nono",
-            "run",
-            "--override-deny",
-            "/tmp/test",
-            "--allow",
-            "/tmp/test",
-            "echo",
-        ]);
-        match cli.command {
-            Commands::Run(args) => {
-                assert_eq!(args.sandbox.bypass_protection.len(), 1);
-                assert_eq!(
-                    args.sandbox.bypass_protection[0],
-                    PathBuf::from("/tmp/test")
-                );
-            }
-            _ => panic!("Expected Run command"),
-        }
-    }
-
-    #[test]
     fn test_suppress_save_prompt_multiple() {
         let cli = Cli::parse_from([
             "nono",
@@ -4263,28 +4118,6 @@ mod tests {
                 assert_eq!(
                     args.sandbox.suppress_save_prompt[1],
                     PathBuf::from("/tmp/b")
-                );
-            }
-            _ => panic!("Expected Run command"),
-        }
-    }
-
-    #[test]
-    fn test_ignore_denied_alias_maps_to_suppress_save_prompt() {
-        let cli = Cli::parse_from([
-            "nono",
-            "run",
-            "--ignore-denied",
-            "/tmp/a",
-            "--allow",
-            ".",
-            "echo",
-        ]);
-        match cli.command {
-            Commands::Run(args) => {
-                assert_eq!(
-                    args.sandbox.suppress_save_prompt,
-                    vec![PathBuf::from("/tmp/a")]
                 );
             }
             _ => panic!("Expected Run command"),

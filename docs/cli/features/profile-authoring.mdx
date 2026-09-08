@@ -351,10 +351,6 @@ nono profile groups deny_credentials
 
 Groups are referenced by name in the `groups.include` field. See [Profiles & Groups](/cli/features/profiles-groups#groups) for the full group taxonomy and built-in group list.
 
-<Note>
-  The `groups.include` key was renamed from its former location under `security` in issue #594. The legacy key still deserializes with a deprecation warning; see `nono profile guide` for the full migration table. Legacy keys will be removed in v1.0.0.
-</Note>
-
 ## Process and IPC Isolation
 
 The `security` section controls process-level isolation knobs that are not filesystem path grants:
@@ -456,9 +452,8 @@ to grant, but also do not want to see in the save-profile prompt on every run:
 This does not grant access and does not hide diagnostics. Suppressed denials
 still appear in the diagnostic footer annotated with `[save skipped]`, making
 it clear why they are absent from the save prompt. It only suppresses
-matching save-profile suggestions. `filesystem.ignore` is accepted as an alias,
-but the canonical name is deliberately explicit so it is not mistaken for
-allowing the denied path.
+matching save-profile suggestions. The canonical name is deliberately
+explicit so it is not mistaken for allowing the denied path.
 
 The post-run save prompt offers the same behavior interactively: choose
 `suppress` to save all listed denied-path suggestions here instead of adding

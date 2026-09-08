@@ -295,7 +295,6 @@ make build
 make test
 make check
 make audit
-make lint-aliases
 make lint-docs
 ```
 

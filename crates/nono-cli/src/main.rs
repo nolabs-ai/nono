@@ -23,8 +23,6 @@ mod config;
 #[cfg(unix)]
 mod connect_client;
 mod credential_runtime;
-mod deprecated_policy;
-mod deprecated_schema;
 mod deprecation_warnings;
 mod diagnostic;
 mod exec_strategy;
@@ -123,10 +121,6 @@ fn main() {
 
     let legacy_network_warnings = collect_legacy_network_warnings(&os_args);
     normalize_legacy_flag_env_vars();
-    // Emit one deprecation warning per distinct legacy long flag before clap
-    // parses. clap's `alias` rebinds `--override-deny` to `--bypass-protection`
-    // silently; without this scan the user would never see a removal notice.
-    deprecated_schema::warn_for_deprecated_flags(&os_args);
     let cli = Cli::parse();
     init_tracing(&cli);
     init_theme(&cli);

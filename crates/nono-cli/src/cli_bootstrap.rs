@@ -243,7 +243,6 @@ fn cli_verbosity(cli: &Cli) -> u8 {
         | Commands::Inspect(_)
         | Commands::Session(_)
         | Commands::Prune(_)
-        | Commands::Policy(_)
         | Commands::Profile(_)
         | Commands::Pin(_)
         | Commands::Unpin(_)

@@ -75,27 +75,14 @@ permanent_allow=(
   'CHANGELOG\.md'
 )
 
-# TEMPORARY allowlist entries — REMOVE in later Part G subtasks of issue #594
-# Phase 2 (or at v1.0.0 for the clap alias). See the plan at
-# docs/plans/2026-04-24-issue-594-phase-2-schema-plan.md.
-temporary_allow=(
-  # TODO(v1.0.0): REMOVE when the --override-deny clap alias is dropped
-  # (see /// ALIAS markers at crates/nono-cli/src/cli.rs ~lines 872 and 1135,
-  # both with remove_by="v1.0.0"). cli.rs carries the alias declaration and
-  # a parser test that locks it in; main.rs wires the deprecation warning.
-  'crates/nono-cli/src/cli\.rs'
-  'crates/nono-cli/src/main\.rs'
+# v1.0.0: the last temporary allowlist entries (cli.rs/main.rs for the
+# --override-deny clap alias, and the authoring guide's "Migration from
+# previous schema" section) were removed along with the legacy keys and
+# alias themselves. Only the permanent allowlist remains.
 
-  # TODO(v1.0.0): REMOVE the "Migration from previous schema" section (and
-  # this allowlist entry) when the deprecated keys are dropped. Until then the
-  # embedded authoring guide is the canonical migration-mapping location and
-  # deliberately lists every legacy → canonical mapping.
-  'crates/nono-cli/data/profile-authoring-guide\.md'
-)
-
-# Build a single alternation regex from both allowlists. Entries are already
+# Build a single alternation regex from the allowlist. Entries are already
 # regex-escaped where literal dots matter.
-allow_pattern=$(IFS='|'; echo "${permanent_allow[*]}|${temporary_allow[*]}")
+allow_pattern=$(IFS='|'; echo "${permanent_allow[*]}")
 
 hits=$(
   grep -RnE "$forbidden" crates/ docs/ tests/ qa-profiles/ README.md 2>/dev/null \

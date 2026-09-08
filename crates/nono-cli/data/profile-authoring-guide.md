@@ -361,17 +361,17 @@ Here `read` only ever matches `.ts`/`.tsx` files, so it can never overlap `.env`
 | `block`                 | boolean                           | `false`  | Block all network access. |
 | `allow_http2`           | boolean                           | `false`  | Allow HTTP/2 to upstream servers via ALPN negotiation. Default is HTTP/1.1 with keep-alive. Equivalent to `--allow-http2`. |
 | `network_profile`       | string or null                    | inherit  | Name from `network-policy.json` for proxy filtering. Set to `null` to clear inherited value. |
-| `allow_domain`          | array of string or object         | `[]`     | Additional domains to allow through the proxy. Entries can be plain strings (CONNECT tunnel) or objects with endpoint rules (TLS-intercepted L7 filtering). Supports wildcard subdomains (`*.googleapis.com`) and a whole-label wildcard in a non-leading position (`jenkins.*.ci.example.com`, matching exactly one label there). Aliases: `proxy_allow`, `allow_proxy`. |
+| `allow_domain`          | array of string or object         | `[]`     | Additional domains to allow through the proxy. Entries can be plain strings (CONNECT tunnel) or objects with endpoint rules (TLS-intercepted L7 filtering). Supports wildcard subdomains (`*.googleapis.com`) and a whole-label wildcard in a non-leading position (`jenkins.*.ci.example.com`, matching exactly one label there). |
 | `deny_domain`           | array of string                   | `[]`     | Domains to block through the proxy regardless of the allowlist. Evaluated before `allow_domain`. Supports the same wildcard grammar as `allow_domain` (`*.ads.example.com`, `jenkins.*.ci.example.com`). Equivalent to `--deny-domain`. |
-| `credentials`           | array of string                   | `[]`     | Credential services to enable via reverse proxy. Alias: `proxy_credentials`. |
-| `open_port`             | array of integer                  | `[]`     | Localhost TCP IPC (connect + bind). Aliases: `port_allow`, `allow_port`. Port **0**: macOS only (`localhost:*` outbound); Linux: explicit ports. |
+| `credentials`           | array of string                   | `[]`     | Credential services to enable via reverse proxy. |
+| `open_port`             | array of integer                  | `[]`     | Localhost TCP IPC (connect + bind). Port **0**: macOS only (`localhost:*` outbound); Linux: explicit ports. |
 | `open_port_range`       | array of `[start, end]`           | `[]`     | Inclusive port ranges for bidirectional localhost TCP (connect + bind). Multiple ranges are supported. Example: `[[3000, 3010], [8000, 8100]]`. Each port becomes an individual rule; overlapping ranges are merged automatically. **macOS**: hard limit of 16,384 unique ports across all ranges (2¹⁴) due to `sandbox_init` rule limits. **Linux**: no limit beyond the 16-bit port space (1–65535). |
 | `listen_port`           | array of integer                  | `[]`     | TCP ports the sandboxed child may listen on (bind only). |
 | `listen_port_range`     | array of `[start, end]`           | `[]`     | Inclusive port ranges for TCP listen (bind only). Multiple ranges are supported. Example: `[[8000, 8100], [9000, 9010]]`. Overlapping ranges are merged automatically. Same platform limits as `open_port_range`. |
 | `no_proxy`              | array of string                   | `[]`     | Additional client-side `NO_PROXY` / `no_proxy` entries in proxy mode. This does not grant network access; direct connections still require matching sandbox permissions. Entries must be host patterns only (safe single-label local alias, canonical IP literal, `*.` wildcard suffix, or leading-dot suffix); bare multi-label domains, protected metadata suffix tokens, URLs, credentials, ports, paths, comma-separated lists, and `*` are rejected. |
 | `custom_credentials`    | map of string to credential def   | `{}`     | Custom credential route definitions (see below). Defines the route only — the proxy does not activate unless the service name also appears in `credentials`. |
-| `upstream_proxy`        | string                            | `null`   | Enterprise proxy address (`host:port`). Alias: `external_proxy`. |
-| `upstream_bypass`       | array of string                   | `[]`     | Hosts to bypass the upstream proxy. Supports `*.` wildcard suffixes. Alias: `external_proxy_bypass`. |
+| `upstream_proxy`        | string                            | `null`   | Enterprise proxy address (`host:port`). |
+| `upstream_bypass`       | array of string                   | `[]`     | Hosts to bypass the upstream proxy. Supports `*.` wildcard suffixes. |
 
 #### Hostname wildcard patterns
 
@@ -717,7 +717,7 @@ is not the primary capture policy.
 | `base_url_env_var`   | string          | no       | Environment variable that points SDKs or CLIs at the mediated proxy base URL. |
 | `endpoint_policy`    | object          | no       | Method/path policy for provider API egress. |
 
-### env_credentials (alias: secrets)
+### env_credentials
 
 Maps keystore account names to environment variable names. Secrets are loaded from the system keystore (macOS Keychain / Linux Secret Service) under the service name "nono".
 
@@ -831,7 +831,7 @@ Map of application name to hook configuration:
 | `matcher` | string | Regex for tool name matching. |
 | `script`  | string | Script filename from embedded hooks. |
 
-### rollback (alias: undo)
+### rollback
 
 | Field              | Type            | Description |
 |--------------------|-----------------|-------------|
@@ -967,9 +967,8 @@ to grant, but also do not want offered in the save-profile prompt every run:
 ```
 
 The sandbox still denies these paths. `filesystem.suppress_save_prompt` only
-filters the save-profile suggestion. `filesystem.ignore` is accepted as an
-alias, but new profiles should use the explicit suppress name so it is not
-mistaken for an access grant.
+filters the save-profile suggestion; the explicit suppress name makes clear
+it is not an access grant.
 
 ### Denying specific project files
 
@@ -1267,26 +1266,3 @@ Supported predicate forms include `linux`, `macos`, `linux:fedora`, `linux:rhel-
 - `network.block: true` blocks all network access. It cannot be combined with proxy settings.
 - `custom_credentials` upstream URLs must use HTTPS. HTTP is only accepted for loopback addresses (localhost, 127.0.0.1, ::1).
 
-## 10. Migration from previous schema
-
-Issue [#594](https://github.com/nolabs-ai/nono/issues/594) restructured the profile JSON schema. The old `policy.*` namespace has been dissolved into `filesystem`, `groups`, and `commands`; `security.groups` and `security.allowed_commands` have moved to top-level `groups.include` and `commands.allow`.
-
-Legacy keys still deserialize — profiles using the old names continue to load and emit a single deprecation warning — but they are scheduled for removal in **v1.0.0**. New profiles and edits should use the canonical keys below.
-
-| OLD                          | NEW                             |
-|------------------------------|---------------------------------|
-| `security.groups`            | `groups.include`                |
-| `security.allowed_commands`  | `commands.allow`                |
-| `policy.add_allow_read`      | `filesystem.read`               |
-| `policy.add_allow_write`     | `filesystem.write`              |
-| `policy.add_allow_readwrite` | `filesystem.allow`              |
-| `policy.add_deny_access`     | `filesystem.deny`               |
-| `policy.add_deny_commands`   | `commands.deny`                 |
-| `policy.override_deny`       | `filesystem.bypass_protection`  |
-| `policy.exclude_groups`      | `groups.exclude`                |
-| `--override-deny` (CLI)      | `--bypass-protection` (CLI)     |
-
-Notes:
-- The old `policy` key is no longer recognized as a top-level section. Its former fields now live directly under `filesystem`, `groups`, or `commands` as shown above.
-- The CLI flag renamed from `--override-deny` to `--bypass-protection` for the same reason the JSON key was renamed: to make the "does not grant access" semantics explicit. The old flag remains as a deprecated alias until v1.0.0.
-- When mechanically migrating a profile, move each `policy.*` entry up one level and rename per the table. Array values are preserved unchanged.

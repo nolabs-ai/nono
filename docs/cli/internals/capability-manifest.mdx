@@ -12,7 +12,7 @@ A **capability manifest** is a fully-resolved, portable JSON document describing
 | | Profile | Manifest |
 |---|---|---|
 | **Audience** | Human authors | Machines (K8s operators, CI, policy engines) |
-| **Composition** | `extends`, group references, legacy aliases | Fully resolved, no composition |
+| **Composition** | `extends`, group references | Fully resolved, no composition |
 | **Contains** | Hooks, inheritance, deprecated fields | Only enforcement-relevant capabilities |
 | **Format** | JSON with `$schema` pointing to profile schema | JSON with `$schema` pointing to manifest schema |
 
@@ -154,7 +154,7 @@ Controls process-level isolation and execution strategy.
 ## Design Principles
 
 1. **Fully resolved** -- No inheritance, no `extends`, no group references. What you see is what the sandbox enforces.
-2. **No legacy aliases** -- Clean field names only. Legacy compatibility is the profile layer's concern.
+2. **No legacy aliases** -- Clean field names only. Any future back-compat parsing belongs in the profile layer, never here.
 3. **No hooks** -- Hooks are CLI UX, not sandbox enforcement. They belong in profiles.
 4. **Portable paths** -- Paths are unresolved strings. Canonicalization happens at enforcement time.
 5. **Schema-first** -- The JSON Schema is the source of truth. Rust types are generated from it (via [typify](https://github.com/oxidecomputer/typify)), not the other way around.

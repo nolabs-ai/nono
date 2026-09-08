@@ -521,7 +521,10 @@ fn path_matches_endpoint_rules(
     }
     let normalized = normalize_path(path);
     rules.iter().any(|r| {
-        let Ok(glob) = globset::Glob::new(&r.path) else {
+        let Ok(glob) = globset::GlobBuilder::new(&r.path)
+            .literal_separator(true)
+            .build()
+        else {
             return false;
         };
         let matcher = glob.compile_matcher();
@@ -1423,6 +1426,19 @@ mod tests {
     #[test]
     fn test_path_matches_empty_rules_allows_all() {
         assert!(path_matches_endpoint_rules("/any/path", &[]));
+    }
+
+    // Regression test for https://github.com/nolabs-ai/nono/issues/1824:
+    // a single `*` segment must not cross `/` the way `**` does.
+    #[test]
+    fn test_path_matches_endpoint_rules_single_wildcard_rejects_multi_segment() {
+        let rules = vec![crate::sandbox_state::EndpointRuleState {
+            method: "*".to_string(),
+            path: "/repos/*".to_string(),
+        }];
+        assert!(path_matches_endpoint_rules("/repos/one", &rules));
+        assert!(!path_matches_endpoint_rules("/repos/one/two", &rules));
+        assert!(!path_matches_endpoint_rules("/repos/a/b/c/d", &rules));
     }
 
     // suggested_flag_parts: non-existent file directly under $HOME must not widen to ~/

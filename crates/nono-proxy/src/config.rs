@@ -3,7 +3,7 @@
 //! Defines the configuration for the proxy server, including allowed hosts,
 //! credential routes, and external proxy settings.
 
-use globset::Glob;
+use globset::GlobBuilder;
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 use std::path::PathBuf;
@@ -1183,7 +1183,9 @@ impl CompiledEndpointRules {
     pub fn compile(rules: &[EndpointRule]) -> Result<Self, String> {
         let mut compiled = Vec::with_capacity(rules.len());
         for rule in rules {
-            let glob = Glob::new(&rule.path)
+            let glob = GlobBuilder::new(&rule.path)
+                .literal_separator(true)
+                .build()
                 .map_err(|e| format!("invalid endpoint path pattern '{}': {}", rule.path, e))?;
             compiled.push(CompiledRule {
                 method: rule.method.clone(),
@@ -1325,7 +1327,9 @@ impl CompiledEndpointPolicy {
 fn compile_policy_rules(rules: &[EndpointPolicyRule]) -> Result<Vec<CompiledPolicyRule>, String> {
     let mut compiled = Vec::with_capacity(rules.len());
     for rule in rules {
-        let glob = Glob::new(&rule.path)
+        let glob = GlobBuilder::new(&rule.path)
+            .literal_separator(true)
+            .build()
             .map_err(|e| format!("invalid endpoint path pattern '{}': {}", rule.path, e))?;
         compiled.push(CompiledPolicyRule {
             method: rule.method.clone(),
@@ -1383,7 +1387,9 @@ fn endpoint_allowed(rules: &[EndpointRule], method: &str, path: &str) -> bool {
     let normalized = normalize_path(path);
     rules.iter().any(|r| {
         (r.method == "*" || r.method.eq_ignore_ascii_case(method))
-            && Glob::new(&r.path)
+            && GlobBuilder::new(&r.path)
+                .literal_separator(true)
+                .build()
                 .ok()
                 .map(|g| g.compile_matcher())
                 .is_some_and(|m| m.is_match(&normalized))
@@ -1789,6 +1795,37 @@ mod tests {
         assert!(!check(&rule, "GET", "/api/v4/projects/merge_requests"));
     }
 
+    // Regression test for https://github.com/nolabs-ai/nono/issues/1824:
+    // `*` must not cross a `/` segment boundary the way `**` does.
+    #[test]
+    fn test_endpoint_rule_single_wildcard_rejects_multi_segment() {
+        let rule = EndpointRule {
+            method: "GET".to_string(),
+            path: "/api/v4/projects/*/merge_requests".to_string(),
+        };
+        assert!(!check(
+            &rule,
+            "GET",
+            "/api/v4/projects/123/456/merge_requests"
+        ));
+
+        let one_star = EndpointRule {
+            method: "*".to_string(),
+            path: "/repos/*".to_string(),
+        };
+        assert!(check(&one_star, "GET", "/repos/one"));
+        assert!(!check(&one_star, "GET", "/repos/one/two"));
+        assert!(!check(&one_star, "GET", "/repos/a/b/c/d"));
+
+        let two_star = EndpointRule {
+            method: "*".to_string(),
+            path: "/repos/**".to_string(),
+        };
+        assert!(check(&two_star, "GET", "/repos/one"));
+        assert!(check(&two_star, "GET", "/repos/one/two"));
+        assert!(check(&two_star, "GET", "/repos/a/b/c/d"));
+    }
+
     #[test]
     fn test_endpoint_rule_double_wildcard() {
         let rule = EndpointRule {
@@ -1941,6 +1978,37 @@ mod tests {
                 reason: Some("blocked"),
                 ..
             }
+        ));
+    }
+
+    // Regression test for https://github.com/nolabs-ai/nono/issues/1824:
+    // policy-config paths (allow/deny/approve) must honor the same
+    // one-segment `*` semantics as legacy EndpointRule.
+    #[test]
+    fn test_compiled_endpoint_policy_single_wildcard_rejects_multi_segment() {
+        let policy = EndpointPolicyConfig {
+            allow: vec![EndpointPolicyRule {
+                method: "GET".to_string(),
+                path: "/repos/*".to_string(),
+                backend: None,
+                reason: None,
+                timeout_secs: None,
+            }],
+            ..EndpointPolicyConfig::default()
+        };
+        let compiled = CompiledEndpointPolicy::compile(Some(&policy), &[]).unwrap();
+
+        assert!(matches!(
+            compiled.evaluate("GET", "/repos/one"),
+            EndpointPolicyOutcome::Allow { .. }
+        ));
+        assert!(matches!(
+            compiled.evaluate("GET", "/repos/one/two"),
+            EndpointPolicyOutcome::Deny { .. }
+        ));
+        assert!(matches!(
+            compiled.evaluate("GET", "/repos/a/b/c/d"),
+            EndpointPolicyOutcome::Deny { .. }
         ));
     }
 

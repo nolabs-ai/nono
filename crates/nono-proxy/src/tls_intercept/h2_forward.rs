@@ -2064,7 +2064,7 @@ mod tests {
                 env_var: None,
                 endpoint_rules: vec![EndpointRule {
                     method: "*".to_string(),
-                    path: "/v1/*".to_string(),
+                    path: "/v1/**".to_string(),
                 }],
                 tls_ca: None,
                 tls_client_cert: None,
@@ -2091,7 +2091,7 @@ mod tests {
                 env_var: None,
                 endpoint_rules: vec![EndpointRule {
                     method: "*".to_string(),
-                    path: "/v1/*".to_string(),
+                    path: "/v1/**".to_string(),
                 }],
                 tls_ca: None,
                 tls_client_cert: None,

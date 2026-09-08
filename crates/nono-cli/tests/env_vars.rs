@@ -122,21 +122,6 @@ fn env_nono_trust_proxy_ca_accepts_truthy() {
 }
 
 #[test]
-fn legacy_env_nono_net_block_still_works() {
-    let output = nono_bin()
-        .env("NONO_NET_BLOCK", "1")
-        .args(["run", "--allow", "/tmp", "--dry-run", "echo"])
-        .output()
-        .expect("failed to run nono");
-
-    let text = combined_output(&output);
-    assert!(
-        text.contains("blocked"),
-        "expected legacy NONO_NET_BLOCK to still block network, got:\n{text}"
-    );
-}
-
-#[test]
 fn env_nono_profile() {
     let output = nono_bin()
         .env("NONO_PROFILE", "node-dev")

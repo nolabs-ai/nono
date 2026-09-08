@@ -7,98 +7,6 @@ use std::sync::{Arc, Mutex};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::writer::MakeWriter;
 
-pub(crate) fn normalize_legacy_flag_env_vars() {
-    copy_legacy_env_var("NONO_NET_BLOCK", "NONO_BLOCK_NET");
-    copy_legacy_env_var("NONO_NET_ALLOW", "NONO_ALLOW_NET");
-    copy_legacy_env_var("NONO_ALLOW_PROXY", "NONO_ALLOW_DOMAIN");
-    copy_legacy_env_var("NONO_PROXY_ALLOW", "NONO_ALLOW_DOMAIN");
-    copy_legacy_env_var("NONO_PROXY_CREDENTIAL", "NONO_CREDENTIAL");
-    copy_legacy_env_var("NONO_EXTERNAL_PROXY", "NONO_UPSTREAM_PROXY");
-    copy_legacy_env_var("NONO_EXTERNAL_PROXY_BYPASS", "NONO_UPSTREAM_BYPASS");
-}
-
-/// Collect deprecation warnings for legacy network flags and env vars.
-///
-/// Every legacy flag below is ASCII, so comparing lossily can only fail to
-/// match an argument that was never a legacy flag to begin with.
-pub(crate) fn collect_legacy_network_warnings(args: &[std::ffi::OsString]) -> Vec<String> {
-    let mut warnings = Vec::new();
-    let args: Vec<std::borrow::Cow<'_, str>> = args
-        .iter()
-        .skip(1)
-        .map(|arg| arg.to_string_lossy())
-        .collect();
-
-    // (legacy, replacement, remove_by)
-    for (legacy, replacement, remove_by) in [
-        (
-            "--allow-net",
-            Some("network is unrestricted by default"),
-            None,
-        ),
-        (
-            "--net-allow",
-            Some("network is unrestricted by default"),
-            None,
-        ),
-        ("--allow-proxy", Some("--allow-domain"), None),
-        ("--proxy-allow", Some("--allow-domain"), None),
-        ("--proxy-credential", Some("--credential"), Some("v1.0.0")),
-        ("--allow-bind", Some("--listen-port"), None),
-        ("--allow-port", Some("--open-port"), None),
-        ("--external-proxy", Some("--upstream-proxy"), None),
-        ("--external-proxy-bypass", Some("--upstream-bypass"), None),
-        ("--net-block", Some("--block-net"), None),
-    ] {
-        if args
-            .iter()
-            .any(|arg| arg.as_ref() == legacy || arg.starts_with(&format!("{legacy}=")))
-        {
-            let mut message = if let Some(replacement) = replacement {
-                format!("Warning: `{legacy}` is deprecated; use `{replacement}` instead.")
-            } else {
-                format!("Warning: `{legacy}` is deprecated.")
-            };
-            if let Some(v) = remove_by {
-                message.push_str(&format!(" Will be removed in {v}."));
-            }
-            warnings.push(message);
-        }
-    }
-
-    // (legacy, replacement, remove_by)
-    for (legacy, replacement, remove_by) in [
-        ("NONO_NET_BLOCK", "NONO_BLOCK_NET", None),
-        ("NONO_NET_ALLOW", "NONO_ALLOW_NET", None),
-        ("NONO_ALLOW_PROXY", "NONO_ALLOW_DOMAIN", None),
-        ("NONO_PROXY_ALLOW", "NONO_ALLOW_DOMAIN", None),
-        ("NONO_PROXY_CREDENTIAL", "NONO_CREDENTIAL", Some("v1.0.0")),
-        ("NONO_EXTERNAL_PROXY", "NONO_UPSTREAM_PROXY", None),
-        ("NONO_EXTERNAL_PROXY_BYPASS", "NONO_UPSTREAM_BYPASS", None),
-    ] {
-        if std::env::var_os(legacy).is_some() {
-            let mut message =
-                format!("Warning: `{legacy}` is deprecated; use `{replacement}` instead.");
-            if let Some(v) = remove_by {
-                message.push_str(&format!(" Will be removed in {v}."));
-            }
-            warnings.push(message);
-        }
-    }
-
-    warnings
-}
-
-pub(crate) fn print_legacy_network_warnings(warnings: &[String], silent: bool) {
-    if silent {
-        return;
-    }
-
-    for warning in warnings {
-        eprintln!("  [nono] {warning}");
-    }
-}
-
 pub(crate) fn init_theme(cli: &Cli) {
     let config_theme = config::user::load_user_config()
         .ok()
@@ -183,19 +91,6 @@ pub(crate) fn init_tracing(cli: &Cli) {
     }
 }
 
-#[allow(clippy::disallowed_methods)] // Single-threaded at process startup, before any threads.
-fn copy_legacy_env_var(old: &str, new: &str) {
-    if std::env::var_os(new).is_some() {
-        return;
-    }
-
-    if let Some(value) = std::env::var_os(old) {
-        // SAFETY: called during single-threaded CLI bootstrap, before any
-        // threads are spawned.
-        unsafe { std::env::set_var(new, value) };
-    }
-}
-
 fn tracing_filter(cli: &Cli) -> EnvFilter {
     cli_log_override(cli)
         .map(EnvFilter::new)
@@ -242,7 +137,6 @@ fn cli_verbosity(cli: &Cli) -> u8 {
         | Commands::Logs(_)
         | Commands::Inspect(_)
         | Commands::Session(_)
-        | Commands::Prune(_)
         | Commands::Profile(_)
         | Commands::Pin(_)
         | Commands::Unpin(_)
@@ -301,58 +195,9 @@ impl Write for SharedFileWriter {
 
 #[cfg(test)]
 mod tests {
-    use super::{SharedFileMakeWriter, collect_legacy_network_warnings};
-    use std::ffi::{OsStr, OsString};
+    use super::SharedFileMakeWriter;
     use std::io::{Read, Write};
-    use std::os::unix::ffi::OsStrExt;
     use tracing_subscriber::fmt::writer::MakeWriter;
-
-    /// Issue #1504: this scan runs before clap, so reading argv as `String`
-    /// aborted the process before any diagnostic could be printed.
-    #[test]
-    fn legacy_network_warnings_tolerate_non_utf8_args() {
-        let args = vec![
-            OsString::from("nono"),
-            OsString::from("run"),
-            OsStr::from_bytes(b"\xff").to_os_string(),
-        ];
-
-        assert!(collect_legacy_network_warnings(&args).is_empty());
-    }
-
-    /// A non-UTF-8 element elsewhere in argv must not stop the scan from
-    /// recognising a legacy flag that really is present.
-    #[test]
-    fn legacy_network_warnings_still_match_alongside_non_utf8_args() {
-        let args = vec![
-            OsString::from("nono"),
-            OsString::from("run"),
-            OsString::from("--allow-net"),
-            OsStr::from_bytes(b"\xff").to_os_string(),
-        ];
-
-        let warnings = collect_legacy_network_warnings(&args);
-
-        assert_eq!(warnings.len(), 1, "warnings: {warnings:?}");
-        assert!(
-            warnings[0].contains("`--allow-net` is deprecated"),
-            "warnings: {warnings:?}"
-        );
-    }
-
-    /// The scan starts at argv[1] because argv[0] holds the program, which a
-    /// caller may set to anything. The same string warns when passed as a flag
-    /// and must not warn when it is the program.
-    #[test]
-    fn legacy_network_warnings_ignore_the_program_slot() {
-        let flag = OsString::from("--allow-net");
-
-        let as_program = vec![flag.clone()];
-        assert!(collect_legacy_network_warnings(&as_program).is_empty());
-
-        let as_flag = vec![OsString::from("/usr/local/bin/nono"), flag];
-        assert_eq!(collect_legacy_network_warnings(&as_flag).len(), 1);
-    }
 
     #[test]
     fn shared_file_make_writer_appends_output() {

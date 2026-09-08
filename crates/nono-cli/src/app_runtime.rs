@@ -110,9 +110,6 @@ fn dispatch_command(
         Commands::Inspect(args) => run_command_with_update(update_handle, silent, || {
             session_commands::run_inspect(&args)
         }),
-        Commands::Prune(args) => {
-            run_command_with_update(update_handle, silent, || session_commands::run_prune(&args))
-        }
         Commands::Session(args) => {
             run_command_with_update(update_handle, silent, || match args.command {
                 crate::cli::SessionCommands::Cleanup(args) => session_commands::run_prune(&args),

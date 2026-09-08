@@ -476,28 +476,6 @@ IN-BAND DETACH:
 ")]
     Inspect(InspectArgs),
 
-    /// Clean up old session files
-    #[command(help_template = "\
-{about}
-
-\x1b[1mUSAGE\x1b[0m
-  nono prune [flags]
-
-{all-args}
-{after-help}")]
-    #[command(after_help = "EXAMPLES:
-    # Preview what would be cleaned
-    nono prune --dry-run
-
-    # Remove sessions older than 7 days
-    nono prune --older-than 7
-
-    # Keep only 10 most recent sessions
-    nono prune --keep 10
-")]
-    #[command(hide = true)]
-    Prune(PruneArgs),
-
     /// Manage runtime session storage
     #[command(subcommand_help_heading = "COMMANDS")]
     #[command(help_template = "\
@@ -3490,15 +3468,6 @@ mod tests {
                 }
             },
             _ => panic!("Expected Session command"),
-        }
-    }
-
-    #[test]
-    fn test_prune_still_parses_as_hidden_compat_command() {
-        let cli = Cli::parse_from(["nono", "prune", "--dry-run"]);
-        match cli.command {
-            Commands::Prune(args) => assert!(args.dry_run),
-            _ => panic!("Expected hidden Prune command"),
         }
     }
 

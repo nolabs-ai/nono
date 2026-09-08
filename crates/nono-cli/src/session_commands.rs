@@ -1,7 +1,7 @@
 //! Session management command implementations.
 //!
 //! Handles `nono ps`, `nono stop`, `nono detach`, `nono attach`, `nono logs`,
-//! `nono inspect`, and `nono prune`.
+//! `nono inspect`, and `nono session cleanup`.
 
 use crate::cli::{AttachArgs, DetachArgs, InspectArgs, LogsArgs, PruneArgs, PsArgs, StopArgs};
 use crate::command_display::{format_command_line, truncate_chars};
@@ -599,9 +599,9 @@ impl ToolSummaryView {
     }
 }
 
-/// Dispatch `nono prune`.
+/// Dispatch `nono session cleanup`.
 pub fn run_prune(args: &PruneArgs) -> Result<()> {
-    reject_if_sandboxed("prune")?;
+    reject_if_sandboxed("session cleanup")?;
     let sessions = session::list_sessions()?;
 
     let now = chrono::Utc::now();

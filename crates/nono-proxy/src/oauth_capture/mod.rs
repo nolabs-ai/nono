@@ -310,6 +310,7 @@ mod tests {
                 path: "/oauth/token".to_string(),
                 response_fields: opaque_fields(["access_token", "refresh_token"]),
                 request_body: OAuthTokenRequestBodyFormat::Auto,
+                response_body: OAuthTokenRequestBodyFormat::Auto,
                 request_nonce_fields: vec!["refresh_token".to_string()],
             }],
             admitted_consumers: vec!["proxy.openai_oauth".to_string()],
@@ -326,6 +327,7 @@ mod tests {
                     path: "/oauth/token".to_string(),
                     response_fields: opaque_fields(["access_token", "refresh_token"]),
                     request_body: OAuthTokenRequestBodyFormat::Auto,
+                    response_body: OAuthTokenRequestBodyFormat::Auto,
                     request_nonce_fields: vec!["refresh_token".to_string()],
                 }],
                 admitted_consumers: vec!["proxy.openai_oauth".to_string()],
@@ -342,6 +344,7 @@ mod tests {
         let rewritten = store
             .rewrite_response_body(
                 endpoint,
+                &[],
                 br#"{"access_token":"real-access","refresh_token":"real-refresh"}"#,
             )
             .unwrap();
@@ -374,6 +377,7 @@ mod tests {
                 path: "/oauth/token".to_string(),
                 response_fields: opaque_fields(["access_token", "refresh_token", "id_token"]),
                 request_body: OAuthTokenRequestBodyFormat::Auto,
+                response_body: OAuthTokenRequestBodyFormat::Auto,
                 request_nonce_fields: vec!["refresh_token".to_string()],
             }],
             admitted_consumers: vec!["proxy.codex_oauth".to_string()],
@@ -383,6 +387,7 @@ mod tests {
         let rewritten = store
             .rewrite_response_body(
                 endpoint,
+                &[],
                 br#"{"access_token":"real-access","refresh_token":"real-refresh","id_token":"real-id"}"#,
             )
             .unwrap();
@@ -413,6 +418,7 @@ mod tests {
                     fields
                 },
                 request_body: OAuthTokenRequestBodyFormat::Auto,
+                response_body: OAuthTokenRequestBodyFormat::Auto,
                 request_nonce_fields: vec!["refresh_token".to_string()],
             }],
             admitted_consumers: vec!["proxy.codex_oauth".to_string()],
@@ -422,6 +428,7 @@ mod tests {
         let rewritten = store
             .rewrite_response_body(
                 endpoint,
+                &[],
                 br#"{"access_token":"real-access","refresh_token":"real-refresh","id_token":"real-id"}"#,
             )
             .unwrap();
@@ -454,6 +461,7 @@ mod tests {
         let err = store
             .rewrite_response_body(
                 endpoint,
+                &[],
                 br#"{"access_token":"real-access","refresh_token":"real-refresh","id_token":"real-id"}"#,
             )
             .expect_err("unlisted token fields must fail closed");
@@ -471,6 +479,7 @@ mod tests {
         let rewritten = store
             .rewrite_response_body(
                 endpoint,
+                &[],
                 br#"{"access_token":"real-access","refresh_token":"real-refresh"}"#,
             )
             .unwrap();
@@ -626,6 +635,7 @@ mod tests {
         let rewritten = store
             .rewrite_response_body(
                 endpoint,
+                &[],
                 br#"{"access_token":"real-access","refresh_token":"real-refresh"}"#,
             )
             .unwrap();
@@ -682,6 +692,7 @@ mod tests {
                     format: Some(template.to_string()),
                 }],
                 request_body: OAuthTokenRequestBodyFormat::Auto,
+                response_body: OAuthTokenRequestBodyFormat::Auto,
                 request_nonce_fields: vec!["refresh_token".to_string()],
             }],
             admitted_consumers: vec!["proxy.anthropic".to_string()],
@@ -696,7 +707,7 @@ mod tests {
             .lookup("platform.claude.com:443", "/v1/oauth/token")
             .unwrap();
         let rewritten = store
-            .rewrite_response_body(endpoint, br#"{"access_token":"real-oauth-token"}"#)
+            .rewrite_response_body(endpoint, &[], br#"{"access_token":"real-oauth-token"}"#)
             .unwrap();
         let json: Value = serde_json::from_slice(&rewritten).unwrap();
         let phantom = json["access_token"].as_str().unwrap();
@@ -724,7 +735,7 @@ mod tests {
             .lookup("platform.claude.com:443", "/v1/oauth/token")
             .unwrap();
         let rewritten = store
-            .rewrite_response_body(endpoint, br#"{"access_token":"real-oauth-token"}"#)
+            .rewrite_response_body(endpoint, &[], br#"{"access_token":"real-oauth-token"}"#)
             .unwrap();
         let json: Value = serde_json::from_slice(&rewritten).unwrap();
         let phantom = json["access_token"].as_str().unwrap();
@@ -748,6 +759,7 @@ mod tests {
                     format: Some("sk-ant-oat01-{}".to_string()),
                 }],
                 request_body: OAuthTokenRequestBodyFormat::Auto,
+                response_body: OAuthTokenRequestBodyFormat::Auto,
                 request_nonce_fields: vec!["refresh_token".to_string()],
             }],
             admitted_consumers: vec!["proxy.anthropic".to_string()],
@@ -768,7 +780,11 @@ mod tests {
             .lookup("platform.claude.com:443", "/v1/oauth/token")
             .unwrap();
         let rewritten = store
-            .rewrite_response_body(endpoint, br#"{"access_token":"totally-different-shape"}"#)
+            .rewrite_response_body(
+                endpoint,
+                &[],
+                br#"{"access_token":"totally-different-shape"}"#,
+            )
             .unwrap();
         let json: Value = serde_json::from_slice(&rewritten).unwrap();
         let phantom = json["access_token"].as_str().unwrap();
@@ -795,6 +811,7 @@ mod tests {
                         format: Some("sk-ant-oat01-{}".to_string()),
                     }],
                     request_body: OAuthTokenRequestBodyFormat::Auto,
+                    response_body: OAuthTokenRequestBodyFormat::Auto,
                     request_nonce_fields: vec!["refresh_token".to_string()],
                 }],
                 admitted_consumers: vec!["proxy.anthropic".to_string()],
@@ -810,6 +827,7 @@ mod tests {
                         format: Some("oth_{}".to_string()),
                     }],
                     request_body: OAuthTokenRequestBodyFormat::Auto,
+                    response_body: OAuthTokenRequestBodyFormat::Auto,
                     request_nonce_fields: vec!["refresh_token".to_string()],
                 }],
                 admitted_consumers: vec!["proxy.other".to_string()],
@@ -821,7 +839,7 @@ mod tests {
             let endpoint = store.lookup(host, path).unwrap();
             let body = format!(r#"{{"access_token":"{real}"}}"#);
             let rewritten = store
-                .rewrite_response_body(endpoint, body.as_bytes())
+                .rewrite_response_body(endpoint, &[], body.as_bytes())
                 .unwrap();
             let json: Value = serde_json::from_slice(&rewritten).unwrap();
             let phantom = json["access_token"].as_str().unwrap().to_string();

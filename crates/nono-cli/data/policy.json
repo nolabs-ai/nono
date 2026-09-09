@@ -214,6 +214,7 @@
           "/etc/hosts",
           "/etc/nsswitch.conf",
           "/etc/gai.conf",
+          "/etc/group",
           "/etc/ssl",
           "/etc/pki",
           "/etc/ca-certificates",
@@ -227,7 +228,9 @@
           "/etc/locale.gen",
           "/etc/alternatives",
           "/etc/os-release",
+          "/etc/passwd",
           "/etc/services",
+          "/run/systemd/userdb",
           "/usr/share",
           "/usr/share/locale",
           "/usr/share/locale-langpack",
@@ -680,7 +683,14 @@
       "security": {
         "signal_mode": "isolated"
       },
-      "filesystem": {},
+      "filesystem": {
+        "unix_socket_dir": [
+          {
+            "path": "/run/systemd/userdb",
+            "when": "linux"
+          }
+        ]
+      },
       "network": { "block": false },
       "workdir": { "access": "none" },
       "interactive": false

@@ -248,6 +248,76 @@ pub fn log_denied(
     );
 }
 
+/// Records a runtime host-approval decision on the CONNECT (transparent tunnel)
+/// path — the outcome of an interactive/backend prompt for a host that is not
+/// on the static allowlist.
+///
+/// `decision` distinguishes the approval lifecycle states
+/// ([`NetworkAuditDecision::ApproveGranted`] / [`ApproveDenied`] / etc.) from a
+/// plain static `Allow`/`Deny`, so the audit trail can tell a runtime approval
+/// apart from an allowlist hit. `ctx.approval_backend` names the deciding
+/// backend; `reason` carries the denial reason on refusal.
+///
+/// [`ApproveDenied`]: NetworkAuditDecision::ApproveDenied
+pub fn log_connect_approval(
+    audit_log: Option<&SharedAuditLog>,
+    ctx: &EventContext<'_>,
+    host: &str,
+    port: u16,
+    decision: NetworkAuditDecision,
+    reason: Option<&str>,
+) {
+    info!(
+        target: "nono_proxy::audit",
+        mode = %ProxyMode::Connect,
+        host = host,
+        port = port,
+        decision = ?decision,
+        approval_backend = ctx.approval_backend,
+        reason = reason,
+        "connect host approval decision"
+    );
+
+    push_event(
+        audit_log,
+        NetworkAuditEvent {
+            timestamp_unix_ms: now_unix_millis(),
+            mode: map_mode(ProxyMode::Connect),
+            decision,
+            route_id: ctx.route_id.map(str::to_string),
+            auth_mechanism: ctx.auth_mechanism.clone(),
+            auth_outcome: ctx.auth_outcome.clone(),
+            managed_credential_active: ctx.managed_credential_active,
+            injection_mode: ctx.injection_mode.clone(),
+            denial_category: ctx.denial_category.clone(),
+            endpoint_policy_action: ctx.endpoint_policy_action.map(str::to_string),
+            endpoint_policy_rule: ctx.endpoint_policy_rule.map(str::to_string),
+            approval_backend: ctx.approval_backend.map(str::to_string),
+            credential_capture_action: None,
+            credential_capture_name: None,
+            credential_capture_command: None,
+            credential_capture_argv: None,
+            credential_capture_exit_status: None,
+            credential_capture_duration_ms: None,
+            credential_capture_stdout_bytes: None,
+            credential_capture_stderr: None,
+            credential_capture_cache_scope: None,
+            credential_capture_output_format: None,
+            credential_capture_header_names: None,
+            credential_capture_stdin_mode: None,
+            credential_capture_interactive: None,
+            spiffe_context: ctx.spiffe_context.clone(),
+            target: host.to_string(),
+            upstream: ctx.upstream.map(str::to_string),
+            port: Some(port),
+            method: None,
+            path: None,
+            status: None,
+            reason: reason.map(str::to_string),
+        },
+    );
+}
+
 /// Used for `Reverse` and `ConnectIntercept` modes. `External` and `Connect`
 /// (transparent tunnel) modes have no L7 visibility and use `log_allowed`/`log_denied`.
 pub fn log_l7_request(

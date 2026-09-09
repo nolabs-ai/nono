@@ -112,11 +112,30 @@ The default backend reads approval from `/dev/tty` directly (since stdin belongs
         Allow? [y/N]
 ```
 
-### Webhook / Policy Approval (planned)
+### Dialog Approval (implemented)
 
-Future backends will support:
-- **Webhook**: HTTP callback to an external approval service
-- **Policy**: Automatic decisions based on predefined rules
+The `dialog` backend prompts with a **native OS dialog** (macOS `osascript`; Linux `zenity`/`kdialog`) instead of the terminal. Because the dialog is delivered by the window/display server — a channel separate from the controlling terminal — it works even when a full-screen TUI (such as an AI coding agent) owns the tty, where the terminal backend auto-denies or hangs.
+
+It **fails secure**: when no GUI display is reachable (headless, SSH, container, or CI) it denies immediately without prompting, and never falls back to the terminal. On such hosts, configure a non-interactive backend (e.g. `webhook`) explicitly instead.
+
+Select it via a named backend under `security.approval_backends`:
+
+```jsonc
+{
+  "security": {
+    "approval_backends": {
+      "desktop": { "type": "dialog", "timeout_secs": 60 }
+    },
+    "approval_defaults": { "backend": "desktop" }
+  }
+}
+```
+
+### Webhook / Policy Approval
+
+- **Webhook** (implemented): HTTP callback to an external approval service. Set `"type": "webhook"` with a `url`.
+- **Chain** (implemented): compose backends with `all`/`any` decision modes via `"type": "chain"`.
+- **Policy** (planned): automatic decisions based on predefined rules.
 
 ## Diagnostic Footer
 

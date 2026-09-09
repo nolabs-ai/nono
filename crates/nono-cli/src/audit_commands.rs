@@ -533,14 +533,19 @@ fn print_capability_decision(entry: &nono::supervisor::AuditEntry) {
     };
     let decision = match &entry.decision {
         ApprovalDecision::Granted => "granted".green(),
+        ApprovalDecision::GrantedForSession => "granted (session)".green(),
         ApprovalDecision::Denied { .. } => "denied".red(),
+        ApprovalDecision::DeniedForSession => "denied (session)".red(),
         ApprovalDecision::Timeout => "timeout".red(),
     };
     let reason = match &entry.decision {
         ApprovalDecision::Denied { reason } => {
             format!(" reason={}", sanitize_reason_for_terminal(reason))
         }
-        ApprovalDecision::Granted | ApprovalDecision::Timeout => String::new(),
+        ApprovalDecision::Granted
+        | ApprovalDecision::GrantedForSession
+        | ApprovalDecision::DeniedForSession
+        | ApprovalDecision::Timeout => String::new(),
     };
 
     eprintln!(

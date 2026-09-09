@@ -161,26 +161,63 @@ impl From<CapabilityRequest> for ApprovalRequest {
 pub enum ApprovalDecision {
     /// Access was granted. The supervisor will pass an fd via `SCM_RIGHTS`.
     Granted,
+    /// Access was granted, and the grant should persist for the remainder of
+    /// the session so equivalent later requests are not re-prompted.
+    ///
+    /// Callers that do not implement session caching (e.g. the L7 endpoint
+    /// approval path) MUST treat this exactly as [`ApprovalDecision::Granted`];
+    /// see [`ApprovalDecision::without_session_scope`].
+    GrantedForSession,
     /// Access was denied with a reason.
     Denied {
         /// Why the request was denied
         reason: String,
     },
+    /// Access was denied, and the denial should persist for the remainder of
+    /// the session so equivalent later requests are not re-prompted.
+    ///
+    /// Callers that do not implement session caching MUST treat this exactly as
+    /// [`ApprovalDecision::Denied`]; see
+    /// [`ApprovalDecision::without_session_scope`].
+    DeniedForSession,
     /// The approval request timed out without a decision.
     Timeout,
 }
 
 impl ApprovalDecision {
-    /// Returns true if access was granted.
+    /// Returns true if access was granted (once or for the session).
     #[must_use]
     pub fn is_granted(&self) -> bool {
-        matches!(self, ApprovalDecision::Granted)
+        matches!(
+            self,
+            ApprovalDecision::Granted | ApprovalDecision::GrantedForSession
+        )
     }
 
-    /// Returns true if access was denied.
+    /// Returns true if access was denied (once or for the session).
     #[must_use]
     pub fn is_denied(&self) -> bool {
-        matches!(self, ApprovalDecision::Denied { .. })
+        matches!(
+            self,
+            ApprovalDecision::Denied { .. } | ApprovalDecision::DeniedForSession
+        )
+    }
+
+    /// Collapse the session-scoped variants to their one-shot equivalents.
+    ///
+    /// Session caching is only implemented on the network CONNECT path, which
+    /// keys decisions by `(host, port)`. Every other approval consumer treats a
+    /// decision as a single yes/no; calling this keeps those `match` sites total
+    /// and fail-secure without teaching them about session persistence.
+    #[must_use]
+    pub fn without_session_scope(self) -> Self {
+        match self {
+            ApprovalDecision::GrantedForSession => ApprovalDecision::Granted,
+            ApprovalDecision::DeniedForSession => ApprovalDecision::Denied {
+                reason: "denied for this session".to_string(),
+            },
+            other => other,
+        }
     }
 }
 

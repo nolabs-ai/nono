@@ -1867,6 +1867,24 @@ pub struct NetworkConfig {
     /// ALIAS(canonical="upstream_bypass", introduced="v0.0.0", remove_by="indefinite", issue="#415")
     #[serde(default, rename = "upstream_bypass", alias = "external_proxy_bypass")]
     pub upstream_bypass: Vec<String>,
+    /// Where runtime host-approval prompts are sent when a CONNECT target is not
+    /// on the allowlist.
+    ///
+    /// A named backend here (e.g. `terminal`, `dialog`, `webhook`, or a `chain`)
+    /// answers the prompt; an approved host is tunnelled, a denied one gets a
+    /// 403. Empty (default) keeps the existing behavior: a not-allowed host is
+    /// denied immediately with no prompt. Uses the same
+    /// [`ApprovalBackendConfig`] shape as `security.approval_backends`.
+    /// Session-scoped "Always allow"/"Always deny" answers suppress re-prompting
+    /// for the rest of the session.
+    #[serde(default)]
+    pub approval_backends: BTreeMap<String, ApprovalBackendConfig>,
+    /// Which entry in `approval_backends` answers host-approval prompts by
+    /// default. `None` (default) means no prompt unless `approval_backends` is
+    /// set, in which case a default must be resolvable (we fail rather than
+    /// guess).
+    #[serde(default)]
+    pub approval_defaults: Option<ApprovalDefaultsConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3337,6 +3355,13 @@ pub(crate) fn finalize_profile(mut profile: Profile) -> Result<Profile> {
         &profile.security.approval_backends,
         profile.security.approval_defaults.as_ref(),
     )?;
+    // Same static checks for the network host-approval backend surface, so a
+    // malformed `network.approval_backends` fails at load rather than at proxy
+    // launch. The validator is section-agnostic (backend map + defaults).
+    crate::command_policy::validate_security_approval_backends(
+        &profile.network.approval_backends,
+        profile.network.approval_defaults.as_ref(),
+    )?;
     Ok(profile)
 }
 
@@ -3903,6 +3928,17 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
                 &base.network.upstream_bypass,
                 &child.network.upstream_bypass,
             ),
+            approval_backends: {
+                // Child overrides base by backend name, matching the child-wins
+                // key semantics used for `security.approval_backends`.
+                let mut merged = base.network.approval_backends;
+                merged.extend(child.network.approval_backends);
+                merged
+            },
+            approval_defaults: child
+                .network
+                .approval_defaults
+                .or(base.network.approval_defaults),
         },
         linux: LinuxConfig {
             af_unix_mediation: child
@@ -7067,6 +7103,8 @@ mod tests {
                 tls_intercept: None,
                 upstream_proxy: None,
                 upstream_bypass: Vec::new(),
+                approval_backends: BTreeMap::new(),
+                approval_defaults: None,
             },
             diagnostics: DiagnosticsConfig::default(),
             linux: LinuxConfig::default(),
@@ -7159,6 +7197,8 @@ mod tests {
                 tls_intercept: None,
                 upstream_proxy: None,
                 upstream_bypass: Vec::new(),
+                approval_backends: BTreeMap::new(),
+                approval_defaults: None,
             },
             diagnostics: DiagnosticsConfig::default(),
             linux: LinuxConfig::default(),
@@ -7317,6 +7357,80 @@ mod tests {
                 .and_then(|d| d.backend)
                 .as_deref(),
             Some("terminal-gate")
+        );
+    }
+
+    #[test]
+    fn test_merge_profiles_unions_network_approval_backends() {
+        let mut base = base_profile();
+        base.network.approval_backends.insert(
+            "terminal-gate".to_string(),
+            ApprovalBackendConfig {
+                backend_type: crate::command_policy::ApprovalBackendType::Terminal,
+                url: None,
+                timeout_secs: None,
+                mode: None,
+                backends: Vec::new(),
+            },
+        );
+        base.network.approval_defaults = Some(ApprovalDefaultsConfig {
+            backend: Some("terminal-gate".to_string()),
+            timeout_secs: None,
+        });
+
+        let mut child = child_profile();
+        child.network.approval_backends.insert(
+            "dialog-gate".to_string(),
+            ApprovalBackendConfig {
+                backend_type: crate::command_policy::ApprovalBackendType::Dialog,
+                url: None,
+                timeout_secs: Some(30),
+                mode: None,
+                backends: Vec::new(),
+            },
+        );
+
+        let merged = merge_profiles(base, child);
+        // Both backends survive the union; child adds without dropping base.
+        assert!(
+            merged
+                .network
+                .approval_backends
+                .contains_key("terminal-gate")
+        );
+        assert!(merged.network.approval_backends.contains_key("dialog-gate"));
+        // Child has no network defaults, so base's default is inherited.
+        assert_eq!(
+            merged
+                .network
+                .approval_defaults
+                .and_then(|d| d.backend)
+                .as_deref(),
+            Some("terminal-gate")
+        );
+    }
+
+    #[test]
+    fn test_merge_profiles_child_network_approval_defaults_win() {
+        let mut base = base_profile();
+        base.network.approval_defaults = Some(ApprovalDefaultsConfig {
+            backend: Some("base-default".to_string()),
+            timeout_secs: None,
+        });
+        let mut child = child_profile();
+        child.network.approval_defaults = Some(ApprovalDefaultsConfig {
+            backend: Some("child-default".to_string()),
+            timeout_secs: None,
+        });
+
+        let merged = merge_profiles(base, child);
+        assert_eq!(
+            merged
+                .network
+                .approval_defaults
+                .and_then(|d| d.backend)
+                .as_deref(),
+            Some("child-default")
         );
     }
 

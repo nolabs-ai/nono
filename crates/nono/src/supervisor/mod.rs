@@ -94,6 +94,19 @@ pub trait ApprovalBackend: Send + Sync {
 
     /// Human-readable name for this backend (used in audit logs).
     fn backend_name(&self) -> &str;
+
+    /// Optional hint of the maximum wall-clock time this backend may take to
+    /// answer a single request.
+    ///
+    /// Callers that impose their own backstop deadline (e.g. the proxy's
+    /// network-approval path, which runs the blocking `request_approval` on a
+    /// worker pool under a `timeout`) use this to size that backstop so it never
+    /// preempts a legitimately longer-configured timeout. `None` means the
+    /// backend is effectively unbounded (for example an interactive terminal
+    /// prompt with no timeout), and the caller should apply its own floor.
+    fn approval_timeout(&self) -> Option<std::time::Duration> {
+        None
+    }
 }
 
 #[cfg(test)]

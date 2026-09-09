@@ -38,6 +38,13 @@ pub(crate) struct PreparedProfile {
     pub(crate) no_proxy: Vec<String>,
     pub(crate) upstream_proxy: Option<String>,
     pub(crate) upstream_bypass: Vec<String>,
+    /// Named approval backends from the profile `network` section. When
+    /// non-empty, a CONNECT host not on the allowlist triggers a runtime
+    /// approval prompt (instead of an immediate 403).
+    pub(crate) network_approval_backends:
+        std::collections::BTreeMap<String, crate::command_policy::ApprovalBackendConfig>,
+    /// Default routing for `network_approval_backends`.
+    pub(crate) network_approval_defaults: Option<crate::command_policy::ApprovalDefaultsConfig>,
     pub(crate) listen_ports: Vec<u16>,
     pub(crate) open_url_origins: Vec<String>,
     pub(crate) open_url_allow_localhost: bool,
@@ -912,6 +919,13 @@ fn prepare_profile_with_options(
             .as_ref()
             .map(|profile| profile.network.upstream_bypass.clone())
             .unwrap_or_default(),
+        network_approval_backends: loaded_profile
+            .as_ref()
+            .map(|profile| profile.network.approval_backends.clone())
+            .unwrap_or_default(),
+        network_approval_defaults: loaded_profile
+            .as_ref()
+            .and_then(|profile| profile.network.approval_defaults.clone()),
         listen_ports: {
             let mut ports = loaded_profile
                 .as_ref()

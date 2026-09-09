@@ -6,6 +6,7 @@
 //! - All sandbox execution strategies must share one allow/deny implementation
 //!   to avoid drift in security behavior across code paths.
 
+use nono::env_glob::env_var_glob_matches;
 use std::borrow::Cow;
 
 /// Returns true if an environment variable is unsafe to inherit into a sandboxed child.
@@ -62,48 +63,14 @@ pub(crate) fn is_loader_injection_env_var(key: &str) -> bool {
     key.starts_with("LD_") || key.starts_with("DYLD_")
 }
 
-/// Whether `text` matches `pattern`, where `*` in `pattern` matches any run of
-/// zero or more characters (including none), anchored to the full string.
-/// `*` is the only wildcard; every other character is matched literally.
-fn glob_matches(pattern: &str, text: &str) -> bool {
-    // An empty pattern is invalid and must never act as an implicit match-all
-    // (every branch below treats "" as "no constraint").
-    if pattern.is_empty() {
-        return false;
-    }
-    // `split('*')` always yields at least one item, so an empty `parts` here
-    // is impossible; a pattern with no `*` is just an exact match.
-    let mut parts = pattern.split('*').peekable();
-    let first = parts.next().unwrap_or_default();
-    let Some(mut rest) = text.strip_prefix(first) else {
-        return false;
-    };
-    if parts.peek().is_none() {
-        // No `*`: exact full-string match.
-        return rest.is_empty();
-    }
-    while let Some(part) = parts.next() {
-        if parts.peek().is_none() {
-            // Last segment: must match the remaining text as a suffix.
-            return rest.ends_with(part);
-        }
-        if part.is_empty() {
-            continue;
-        }
-        match rest.find(part) {
-            Some(idx) => rest = &rest[idx + part.len()..],
-            None => return false,
-        }
-    }
-    true
-}
-
 /// Returns true if `key` matches any pattern in `patterns`.
 ///
-/// `*` may appear anywhere in a pattern — leading, trailing, or infix — and
-/// matches any run of characters: `"AWS_*"`, `"*_TOKEN"`, `"*SECRET*"`, and
-/// `"AWS_*_TOKEN"` are all valid. A bare `"*"` matches everything. Matching
-/// is anchored to the full variable name.
+/// The pattern grammar is [`env_var_glob_matches`], shared with diagnostics
+/// and audit redaction so an allow/deny pattern and a redaction pattern can
+/// never disagree: `*` may appear anywhere in a pattern — leading, trailing,
+/// or infix — and matches any run of characters, so `"AWS_*"`, `"*_TOKEN"`,
+/// `"*SECRET*"`, and `"AWS_*_TOKEN"` are all valid. A bare `"*"` matches
+/// everything. Matching is anchored to the full variable name.
 ///
 /// When `case_insensitive` is true, both `key` and every pattern are
 /// lowercased (ASCII-only) before comparison.
@@ -119,9 +86,9 @@ pub(crate) fn matches_env_var_patterns(
     };
     patterns.iter().any(|pattern| {
         if case_insensitive {
-            glob_matches(&pattern.to_ascii_lowercase(), &key)
+            env_var_glob_matches(&pattern.to_ascii_lowercase(), &key)
         } else {
-            glob_matches(pattern, &key)
+            env_var_glob_matches(pattern, &key)
         }
     })
 }
@@ -333,6 +300,51 @@ mod tests {
     // sandboxed child process. If a future refactor accidentally removes one,
     // these tests will catch it.
     // ============================================================================
+
+    /// A pattern that denies a variable from the child environment must also
+    /// redact it from diagnostics and audit output, and vice versa. Both paths
+    /// resolve the pattern through `env_var_glob_matches`, and this pins that
+    /// they stay wired to it: if either side grows its own matcher, one of
+    /// these rows will disagree. Names are chosen to sit outside the secure
+    /// default's exact-match list so only the pattern decides.
+    #[test]
+    fn deny_and_redaction_patterns_share_one_grammar() {
+        let patterns = [
+            "ACME_*",
+            "*_TOKEN",
+            "*SECRET*",
+            "ACME_*_TOKEN",
+            "EXACT_NAME",
+            "*",
+        ];
+        let names = [
+            "ACME_API_KEY",
+            "XACME_API_KEY",
+            "MY_ACME_API_KEY",
+            "ACME_",
+            "DEPLOY_TOKEN",
+            "DEPLOY_TOKEN_ID",
+            "MY_SECRET_VALUE",
+            "ACME_ROTATE_TOKEN",
+            "GCP_ROTATE_TOKEN",
+            "EXACT_NAME",
+            "EXACT_NAME_2",
+            "UNRELATED",
+        ];
+
+        for pattern in patterns {
+            let mut redactions = nono::ScrubPolicy::secure_default();
+            redactions.add_env_var_pattern(pattern);
+            for name in names {
+                let denied = matches_env_var_patterns(name, &[pattern.to_string()], true);
+                let redacted = nono::scrub_env_name_with_policy(name, &redactions) != name;
+                assert_eq!(
+                    denied, redacted,
+                    "pattern '{pattern}' vs '{name}': deny={denied} redact={redacted}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn test_blocks_op_service_account_token() {

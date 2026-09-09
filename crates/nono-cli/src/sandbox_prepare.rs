@@ -558,6 +558,18 @@ pub(crate) struct PreparedSandbox {
     pub(crate) bypass_protection_paths: Vec<PathBuf>,
     pub(crate) ignored_denial_paths: Vec<PathBuf>,
     pub(crate) suppressed_system_service_operations: Vec<String>,
+    /// `diagnostics.redaction.extra_env_vars` from the profile: extra
+    /// environment-variable name globs to redact in diagnostics and audit
+    /// records. Add-only; never removes a secure default.
+    pub(crate) redaction_extra_env_vars: Vec<String>,
+    /// Environment variable names the profile itself marks as secret: exact
+    /// `environment.deny_vars` entries, `env_credentials` destinations,
+    /// `command_policies.credentials` destinations, and
+    /// `network.custom_credentials` phantom destinations. Derived, not
+    /// authored — declaring a variable as a credential is what makes the name
+    /// secret, so an author does not have to repeat it under
+    /// `diagnostics.redaction.extra_env_vars`. Exact names, never globs.
+    pub(crate) redaction_derived_env_vars: Vec<String>,
     pub(crate) allowed_env_vars: Option<Vec<String>>,
     pub(crate) denied_env_vars: Option<Vec<String>>,
     pub(crate) case_insensitive_env_vars: bool,
@@ -1535,6 +1547,8 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
                 bypass_protection_paths: Vec::new(),
                 ignored_denial_paths: Vec::new(),
                 suppressed_system_service_operations: Vec::new(),
+                redaction_extra_env_vars: Vec::new(),
+                redaction_derived_env_vars: Vec::new(),
                 allowed_env_vars: None,
                 denied_env_vars: None,
                 case_insensitive_env_vars: false,
@@ -1586,6 +1600,8 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         bypass_protection_paths,
         ignored_denial_paths,
         suppressed_system_service_operations,
+        redaction_extra_env_vars,
+        redaction_derived_env_vars,
         allowed_env_vars: profile_allowed_env_vars,
         denied_env_vars: profile_denied_env_vars,
         case_insensitive_env_vars: profile_case_insensitive_env_vars,
@@ -1928,6 +1944,8 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
             bypass_protection_paths,
             ignored_denial_paths,
             suppressed_system_service_operations,
+            redaction_extra_env_vars,
+            redaction_derived_env_vars,
             allowed_env_vars: profile_allowed_env_vars,
             denied_env_vars: profile_denied_env_vars,
             case_insensitive_env_vars: profile_case_insensitive_env_vars,
@@ -2909,6 +2927,8 @@ mod tests {
             bypass_protection_paths: Vec::new(),
             ignored_denial_paths: Vec::new(),
             suppressed_system_service_operations: Vec::new(),
+            redaction_extra_env_vars: Vec::new(),
+            redaction_derived_env_vars: Vec::new(),
             allowed_env_vars: None,
             denied_env_vars: None,
             case_insensitive_env_vars: false,

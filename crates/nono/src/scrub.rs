@@ -3,6 +3,7 @@
 //! This module is output hygiene, not sandbox policy. It intentionally favors
 //! false positives for well-known secret-bearing flag, header, and query names.
 
+use crate::env_glob::env_var_glob_matches;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::BTreeSet;
@@ -73,6 +74,11 @@ pub struct ScrubPolicy {
     sensitive_headers: BTreeSet<String>,
     sensitive_query_keys: BTreeSet<String>,
     sensitive_env_vars: BTreeSet<String>,
+    /// Glob patterns matched against environment variable names, in addition
+    /// to the exact names in `sensitive_env_vars`. Empty in the secure
+    /// default: patterns exist so callers can describe families of
+    /// credential variables their own tooling injects.
+    sensitive_env_var_patterns: BTreeSet<String>,
 }
 
 /// Difference between a scrub policy and the secure default policy.
@@ -132,6 +138,7 @@ impl ScrubPolicy {
             sensitive_headers: normalized_set(SENSITIVE_HEADERS),
             sensitive_query_keys: normalized_set(SENSITIVE_QUERY_KEYS),
             sensitive_env_vars: normalized_set(SENSITIVE_ENV_VARS),
+            sensitive_env_var_patterns: BTreeSet::new(),
         }
     }
 
@@ -149,6 +156,17 @@ impl ScrubPolicy {
 
     pub fn add_env_var(&mut self, name: impl AsRef<str>) {
         insert_normalized(&mut self.sensitive_env_vars, name.as_ref());
+    }
+
+    /// Redact any environment variable whose name matches `pattern`.
+    ///
+    /// `*` matches any run of zero or more characters and is the only
+    /// wildcard; matching is anchored to the whole name and is ASCII
+    /// case-insensitive. An empty pattern is ignored rather than treated as
+    /// match-all. There is deliberately no removal counterpart: patterns can
+    /// only widen redaction.
+    pub fn add_env_var_pattern(&mut self, pattern: impl AsRef<str>) {
+        insert_normalized(&mut self.sensitive_env_var_patterns, pattern.as_ref());
     }
 
     pub fn remove_flag(&mut self, flag: &str) {
@@ -183,7 +201,22 @@ impl ScrubPolicy {
                 &default.sensitive_query_keys,
                 &self.sensitive_query_keys,
             ),
-            added_env_vars: set_difference(&self.sensitive_env_vars, &default.sensitive_env_vars),
+            // Exact names and glob patterns are reported in one list rather
+            // than a new public field, which would be a breaking change to
+            // this struct. A pattern is self-describing: `*` cannot occur in a
+            // POSIX environment variable name, so an entry containing one is
+            // a pattern and an entry without one is an exact name.
+            added_env_vars: {
+                let mut added =
+                    set_difference(&self.sensitive_env_vars, &default.sensitive_env_vars);
+                added.extend(set_difference(
+                    &self.sensitive_env_var_patterns,
+                    &default.sensitive_env_var_patterns,
+                ));
+                added.sort();
+                added.dedup();
+                added
+            },
             removed_env_vars: set_difference(&default.sensitive_env_vars, &self.sensitive_env_vars),
         }
     }
@@ -202,6 +235,7 @@ impl ScrubPolicy {
 
     fn is_sensitive_env_var(&self, name: &str) -> bool {
         contains_normalized_ascii(&self.sensitive_env_vars, name)
+            || matches_normalized_glob(&self.sensitive_env_var_patterns, name)
     }
 }
 
@@ -500,6 +534,22 @@ fn contains_normalized_ascii(set: &BTreeSet<String>, value: &str) -> bool {
         .any(|candidate| candidate.eq_ignore_ascii_case(trimmed))
 }
 
+/// Whether `value` matches any glob in `patterns`.
+///
+/// Patterns are stored already normalized (trimmed, lowercased), so only the
+/// candidate needs normalizing here. The glob grammar itself is
+/// [`env_var_glob_matches`], shared with the environment allow/deny lists so
+/// the two cannot drift.
+fn matches_normalized_glob(patterns: &BTreeSet<String>, value: &str) -> bool {
+    if patterns.is_empty() {
+        return false;
+    }
+    let normalized = normalize_name(value);
+    patterns
+        .iter()
+        .any(|pattern| env_var_glob_matches(pattern, &normalized))
+}
+
 fn set_difference(left: &BTreeSet<String>, right: &BTreeSet<String>) -> Vec<String> {
     left.difference(right).cloned().collect()
 }
@@ -622,6 +672,92 @@ mod tests {
         assert_eq!(
             scrub_env_value_with_policy("OBSERVED_ENV", "visible-value", &redactions),
             "visible-value"
+        );
+    }
+
+    #[test]
+    fn scrub_policy_env_var_patterns_redact_matching_names() {
+        let mut redactions = ScrubPolicy::secure_default();
+        redactions.add_env_var_pattern("ACME_*");
+        redactions.add_env_var_pattern("*_DEPLOY_SECRET");
+
+        for name in ["ACME_API_KEY", "acme_app_key", "STAGING_DEPLOY_SECRET"] {
+            assert_eq!(
+                scrub_env_value_with_policy(name, "tool-secret", &redactions),
+                REDACTED,
+                "{name} should have been redacted by pattern"
+            );
+            assert_eq!(scrub_env_name_with_policy(name, &redactions), REDACTED);
+        }
+
+        assert_eq!(
+            scrub_env_value_with_policy("ACMEISH", "visible-value", &redactions),
+            "visible-value"
+        );
+        assert_eq!(
+            scrub_env_value_with_policy("PATH", "/usr/bin", &redactions),
+            "/usr/bin"
+        );
+    }
+
+    #[test]
+    fn secure_default_has_no_env_var_patterns() {
+        let redactions = ScrubPolicy::secure_default();
+        assert_eq!(
+            scrub_env_value_with_policy("ACME_API_KEY", "tool-secret", &redactions),
+            "tool-secret",
+            "patterns must be opt-in; the secure default ships none"
+        );
+        assert!(redactions.diff_from_secure_default().is_empty());
+    }
+
+    #[test]
+    fn empty_env_var_pattern_is_ignored_not_match_all() {
+        let mut redactions = ScrubPolicy::secure_default();
+        redactions.add_env_var_pattern("");
+        redactions.add_env_var_pattern("   ");
+
+        assert_eq!(
+            scrub_env_value_with_policy("PATH", "/usr/bin", &redactions),
+            "/usr/bin"
+        );
+        assert!(
+            redactions
+                .diff_from_secure_default()
+                .added_env_vars
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn bare_star_env_var_pattern_redacts_everything() {
+        let mut redactions = ScrubPolicy::secure_default();
+        redactions.add_env_var_pattern("*");
+        assert_eq!(
+            scrub_env_value_with_policy("PATH", "/usr/bin", &redactions),
+            REDACTED
+        );
+    }
+
+    #[test]
+    fn env_var_patterns_are_reported_in_the_policy_diff() {
+        let mut redactions = ScrubPolicy::secure_default();
+        redactions.add_env_var_pattern("ACME_*");
+
+        let diff = redactions.diff_from_secure_default();
+        assert_eq!(diff.added_env_vars, vec!["acme_*".to_string()]);
+        assert!(!diff.is_empty());
+    }
+
+    #[test]
+    fn env_var_patterns_cannot_unredact_a_secure_default() {
+        // Patterns are add-only: there is no removal counterpart, and adding
+        // one must never widen what is visible.
+        let mut redactions = ScrubPolicy::secure_default();
+        redactions.add_env_var_pattern("ACME_*");
+        assert_eq!(
+            scrub_env_value_with_policy("OPENAI_API_KEY", "provider-secret", &redactions),
+            REDACTED
         );
     }
 

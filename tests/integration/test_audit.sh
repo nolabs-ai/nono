@@ -259,7 +259,7 @@ set +e
 list_output=$("$NONO_BIN" audit list 2>&1)
 list_exit=$?
 set -e
-if [[ "$list_exit" -eq 0 ]] && echo "$list_output" | grep -q "command"; then
+if [[ "$list_exit" -eq 0 ]] && grep -q "command" <<<"$list_output"; then
     echo -e "  ${GREEN}PASS${NC}: audit list shows sessions"
     TESTS_PASSED=$((TESTS_PASSED + 1))
 else

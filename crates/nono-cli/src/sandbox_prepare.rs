@@ -128,6 +128,85 @@ fn env_non_empty(key: &str) -> bool {
     std::env::var_os(key).is_some_and(|value| !value.is_empty())
 }
 
+// One-time migration onto canonical ~/.claude/.claude.json (what Claude Code
+// actually reads/writes once CLAUDE_CONFIG_DIR is set). No-op forever after
+// canonical exists. Priority, first match wins:
+//   1. canonical exists -> already migrated, do nothing.
+//   2. ~/.claude/claude.json (no dot, pre-#1820 nono) -> move in.
+//   3. ~/.claude.json (legacy) -> move in.
+// The moved-from side becomes a symlink to canonical, so bare `claude`
+// outside nono still resolves to the same file. Only ever done to legacy,
+// never to canonical: rename() replaces a symlink instead of writing
+// through it, and canonical is what nono's atomic writes target.
+//
+// lstat throughout: any unexpected symlink is left untouched, not followed
+// (this runs pre-sandbox, with write access to all these paths already).
+#[cfg(unix)]
+fn migrate_claude_json(legacy: &Path, canonical: &Path, claude_dir: &Path) {
+    fn is_regular_file(path: &Path) -> bool {
+        std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_file())
+    }
+
+    // rename() relocates a symlink rather than following it, so a race that
+    // swaps src for a symlink between our check and this call would leave
+    // canonical as that symlink. Verify and undo rather than trust it.
+    fn rename_verified(src: &Path, canonical: &Path) -> bool {
+        if let Err(error) = std::fs::rename(src, canonical) {
+            warn!("Failed to migrate {}: {error}", src.display());
+            return false;
+        }
+        if is_regular_file(canonical) {
+            return true;
+        }
+        warn!(
+            "{} was not a regular file immediately after migration (possible race); removing it",
+            canonical.display()
+        );
+        let _ = std::fs::remove_file(canonical);
+        false
+    }
+
+    fn relink_legacy(legacy: &Path, canonical: &Path) {
+        match std::fs::symlink_metadata(legacy) {
+            Err(_) => {}
+            Ok(meta) if meta.file_type().is_symlink() => {
+                if let Err(error) = std::fs::remove_file(legacy) {
+                    warn!(
+                        "Failed to remove old symlink at {}: {error}",
+                        legacy.display()
+                    );
+                    return;
+                }
+            }
+            Ok(_) => return, // unexpected non-symlink left behind; don't touch it
+        }
+        if let Err(error) = std::os::unix::fs::symlink(canonical, legacy) {
+            warn!(
+                "Failed to symlink {} -> {}: {error}",
+                legacy.display(),
+                canonical.display()
+            );
+        }
+    }
+
+    if std::fs::symlink_metadata(canonical).is_ok() {
+        return; // canonical exists (or is something we won't touch) - it wins
+    }
+
+    let old_style = claude_dir.join("claude.json");
+    if is_regular_file(&old_style) {
+        if rename_verified(&old_style, canonical) {
+            relink_legacy(legacy, canonical);
+        }
+        return;
+    }
+
+    if is_regular_file(legacy) && rename_verified(legacy, canonical) {
+        relink_legacy(legacy, canonical);
+    }
+    // Neither existed: nothing to migrate, Claude Code creates canonical fresh.
+}
+
 #[cfg(target_os = "macos")]
 fn claude_config_dir() -> std::result::Result<(PathBuf, bool), String> {
     if let Some(config_dir) = std::env::var_os("CLAUDE_CONFIG_DIR") {
@@ -1568,6 +1647,21 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         if let Err(error) = std::fs::create_dir_all(&claude_dir) {
             warn!("Failed to create ~/.claude: {error}");
         } else if std::env::var_os("CLAUDE_CONFIG_DIR").is_none() {
+            // Reuse claude_global_config_path for the oauth-suffix filename.
+            #[cfg(target_os = "macos")]
+            let (legacy_json, redirected_json) = {
+                let legacy = claude_global_config_path(home_path, false)
+                    .unwrap_or_else(|_| home_path.join(".claude.json"));
+                let redirected = claude_global_config_path(&claude_dir, true)
+                    .unwrap_or_else(|_| claude_dir.join(".claude.json"));
+                (legacy, redirected)
+            };
+            #[cfg(not(target_os = "macos"))]
+            let (legacy_json, redirected_json) = (
+                home_path.join(".claude.json"),
+                claude_dir.join(".claude.json"),
+            );
+            migrate_claude_json(&legacy_json, &redirected_json, &claude_dir);
             profile_set_vars.get_or_insert_with(Vec::new).push((
                 "CLAUDE_CONFIG_DIR".to_string(),
                 claude_dir.to_string_lossy().into_owned(),
@@ -1833,6 +1927,112 @@ mod tests {
     #[cfg(target_os = "macos")]
     use std::fs;
     use tempfile::tempdir;
+
+    #[test]
+    #[cfg(unix)]
+    fn migrate_claude_json_noop_when_canonical_already_exists() {
+        let dir = tempdir().expect("tempdir");
+        let legacy = dir.path().join("legacy.json");
+        let canonical = dir.path().join("claude").join("canonical.json");
+        std::fs::create_dir_all(canonical.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&canonical, "canonical").expect("write canonical");
+        std::fs::write(&legacy, "legacy").expect("write legacy");
+
+        migrate_claude_json(&legacy, &canonical, dir.path());
+
+        assert_eq!(
+            std::fs::read_to_string(&canonical).expect("read canonical"),
+            "canonical"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&legacy).expect("read legacy"),
+            "legacy"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn migrate_claude_json_prefers_old_style_no_dot_file() {
+        let dir = tempdir().expect("tempdir");
+        let claude_dir = dir.path().join("claude");
+        std::fs::create_dir_all(&claude_dir).expect("mkdir");
+        let legacy = dir.path().join("legacy.json");
+        let canonical = claude_dir.join("canonical.json");
+        let old_style = claude_dir.join("claude.json");
+        std::fs::write(&old_style, "old style").expect("write old style");
+        std::os::unix::fs::symlink(&old_style, &legacy).expect("symlink legacy to old style");
+
+        migrate_claude_json(&legacy, &canonical, &claude_dir);
+
+        assert_eq!(
+            std::fs::read_to_string(&canonical).expect("read canonical"),
+            "old style"
+        );
+        assert!(!old_style.exists(), "old-style file should have moved");
+        assert_eq!(
+            std::fs::read_link(&legacy).expect("legacy should be a symlink"),
+            canonical
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn migrate_claude_json_moves_plain_legacy_file_and_symlinks_it() {
+        let dir = tempdir().expect("tempdir");
+        let claude_dir = dir.path().join("claude");
+        std::fs::create_dir_all(&claude_dir).expect("mkdir");
+        let legacy = dir.path().join("legacy.json");
+        let canonical = claude_dir.join("canonical.json");
+        std::fs::write(&legacy, "legacy content").expect("write legacy");
+
+        migrate_claude_json(&legacy, &canonical, &claude_dir);
+
+        assert_eq!(
+            std::fs::read_to_string(&canonical).expect("read canonical"),
+            "legacy content"
+        );
+        assert_eq!(
+            std::fs::read_link(&legacy).expect("legacy should be a symlink"),
+            canonical
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn migrate_claude_json_noop_when_nothing_exists() {
+        let dir = tempdir().expect("tempdir");
+        let claude_dir = dir.path().join("claude");
+        std::fs::create_dir_all(&claude_dir).expect("mkdir");
+        let legacy = dir.path().join("legacy.json");
+        let canonical = claude_dir.join("canonical.json");
+
+        migrate_claude_json(&legacy, &canonical, &claude_dir);
+
+        assert!(!canonical.exists());
+        assert!(!legacy.exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn migrate_claude_json_refuses_to_follow_a_symlinked_legacy() {
+        let dir = tempdir().expect("tempdir");
+        let claude_dir = dir.path().join("claude");
+        std::fs::create_dir_all(&claude_dir).expect("mkdir");
+        let secret = dir.path().join("secret");
+        let legacy = dir.path().join("legacy.json");
+        let canonical = claude_dir.join("canonical.json");
+        std::fs::write(&secret, "host secret").expect("write secret");
+        std::os::unix::fs::symlink(&secret, &legacy).expect("symlink legacy to secret");
+
+        migrate_claude_json(&legacy, &canonical, &claude_dir);
+
+        // Not migrated: an untrusted symlink target must never be moved or read.
+        assert!(!canonical.exists());
+        assert_eq!(
+            std::fs::read_to_string(&secret).expect("read secret"),
+            "host secret"
+        );
+    }
 
     /// `check_writable_path_dirs` reads real PATH, so these mutate it under
     /// the shared env lock rather than mocking — mirrors the pattern used

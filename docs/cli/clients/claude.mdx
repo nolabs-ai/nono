@@ -129,6 +129,18 @@ Do not set `CLAUDE_CONFIG_DIR` to its default value (`~/.claude`) explicitly —
 For the default `~/.claude` config directory, no extra flags or directories are needed — the profile already grants access to both `~/.claude` and `~/.claude.lock`.
 </Note>
 
+### Config file migration
+
+When using the default config directory, `nono` sets `CLAUDE_CONFIG_DIR=~/.claude` so Claude Code's config (and the temp files it writes during atomic saves) land inside a directory `nono` already grants read+write, rather than as loose dotfiles in `~/` — closer to the XDG convention of keeping an app's state in its own directory instead of scattering it across `$HOME`. It also sidesteps a real sandboxing constraint: Landlock/Seatbelt can't scope a grant to the dynamically-named temp files Claude Code would otherwise write directly in `~/`.
+
+Claude Code then reads and writes `~/.claude/.claude.json`, not the historical `~/.claude.json`. The first time `nono` runs with an existing legacy config, it moves it into place automatically:
+
+- If `~/.claude/.claude.json` already exists, nothing changes.
+- Otherwise, an old-style `~/.claude/claude.json` (no dot, from `nono` versions predating this redirect) is moved in.
+- Otherwise, `~/.claude.json` is moved in.
+
+Whichever legacy file was moved is replaced with a symlink to the new location, so bare `claude` (run outside `nono`) keeps working against the same config. This migration only happens once — once `~/.claude/.claude.json` exists, it's left alone.
+
 ## Security Tips
 
 ### Use Secrets Management

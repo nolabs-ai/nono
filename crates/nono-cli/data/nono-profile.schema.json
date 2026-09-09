@@ -1776,8 +1776,8 @@
       "properties": {
         "type": {
           "type": "string",
-          "enum": ["terminal", "webhook", "chain"],
-          "description": "Approval backend kind."
+          "enum": ["terminal", "dialog", "webhook", "chain"],
+          "description": "Approval backend kind. `dialog` prompts via a native OS dialog (macOS/Linux desktop) and fails secure (denies) when no GUI display is reachable."
         },
         "url": {
           "type": "string",

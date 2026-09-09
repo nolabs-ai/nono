@@ -102,6 +102,10 @@ fn build_approval_backend(
         ApprovalBackendType::Terminal => Arc::new(NamedTerminalApproval {
             name: name.to_string(),
         }),
+        ApprovalBackendType::Dialog => Arc::new(crate::dialog_approval::DialogApproval::new(
+            name,
+            backend_config,
+        )),
         ApprovalBackendType::Webhook => Arc::new(WebhookApproval::new(name, backend_config)?),
         ApprovalBackendType::Chain => {
             let mode = backend_config.mode.ok_or_else(|| {

@@ -650,68 +650,117 @@ Groups use a structured allow/deny taxonomy:
 
 ### Built-in Groups
 
-**Deny groups** (block sensitive content):
-- `deny_credentials` — SSH keys, cloud credentials, GPG keys, container and package manager tokens
-- `deny_keychains_macos` — macOS Keychain databases, 1Password, password-store
-- `deny_keychains_linux` — Linux keyring, 1Password, password-store
-- `deny_browser_data_macos` — Browser data on macOS (Chrome, Firefox, Safari, Edge, Arc, Brave)
-- `deny_browser_data_linux` — Browser data on Linux (Chrome, Firefox, Edge, Brave)
-- `deny_macos_private` — macOS Messages, Mail, Cookies, MobileSync
-- `deny_shell_history` — Shell history files (.bash_history, .zsh_history, .python_history)
-- `deny_shell_configs` — Shell config files that may contain API keys (.bashrc, .zshrc, .profile, .env)
-
-**Protection groups**:
-- `unlink_protection` — Prevents file deletion, with override for user-writable paths
-- `dangerous_commands` — Blocks `rm`, `dd`, `chmod`, `sudo`, `mkfs`, `pip`, `npm`, `kill`, etc.
-- `dangerous_commands_macos` — macOS-specific: `srm`, `brew`, `launchctl`
-- `dangerous_commands_linux` — Linux-specific: `shred`, `mkfs.*`, `fdisk`, `systemctl`, `apt`, `yum`, `dnf`, `pacman`
-
-**System path groups** (grant necessary system access):
-- `system_read_macos` — macOS system libraries, frameworks, dyld cache
-- `system_read_linux_core` — Linux core system libraries, locale data, /dev/, /proc/self
-- `system_write_macos` — macOS temp directories, cache paths
-- `system_write_linux` — Linux temp directories
-- `linux_runtime_state` — Linux runtime state paths (/run, /var/run)
-- `linux_sysfs_read` — Linux sysfs paths for kernel and device state (/sys)
-- `linux_temp_read` — Linux shared temporary directory read access (/tmp)
-
-**Cache groups** (user-level caches and state):
-- `user_caches_macos` — ~/Library/Caches, ~/Library/Logs, ~/Library/Preferences
-- `user_caches_linux` — ~/.cache
-- `claude_cache_linux` — ~/.cache/claude-cli-nodejs
-
-**Runtime groups** (language toolchain paths):
-- `node_runtime` — nvm, fnm, npm, pnpm
-- `rust_runtime` — rustup, cargo
-- `python_runtime` — pyenv, conda, pip, uv
-- `go_runtime` — ~/go, /usr/local/go
-- `go_runtime_linux` — Go build cache on Linux (~/.cache/go-build)
-- `go_runtime_macos` — Go build cache on macOS (~/Library/Caches/go-build)
-- `java_runtime` — SDKMAN (~/.sdkman), Maven (~/.m2), Gradle (~/.gradle)
-- `nix_runtime` — Nix profile paths, /nix/store, /nix/var
-- `user_tools` — ~/.local/bin, .desktop files, man pages, shell completions
-- `homebrew_macos` — /opt/homebrew, /usr/local/Cellar, /usr/local/opt (macOS only)
-- `homebrew_linux` — /home/linuxbrew/.linuxbrew (Linux only)
-- `mise_manager` — Mise dev tools, env vars, task runner
-- `bun_runtime` — Bun runtime (~/.bun)
-
-**Tool-specific groups** (paths for specific applications):
-- `claude_code_macos` — macOS Keychain for Claude Code credential storage
-- `claude_code_linux` — ~/.local/share/claude
-- `codex_macos` — macOS Keychain for Codex credential storage
-- `opencode_linux` — ~/.opencode/bin (Linux only, needed for Landlock exec)
-- `vscode_macos` — ~/.vscode, ~/Library/Application Support/Code
-- `vscode_linux` — ~/.vscode, ~/.config/Code
-
-**Application config groups** (profile and configuration files):
-- `git_config` — Read access to git configuration files (~/.gitconfig, ~/.config/git/)
-
 <Note>
-  Group definitions are located in `crates/nono-cli/data/policy.json`. You can inspect them to see the exact rules applied by each group.
+  Adding a group to `groups.include` always applies *that group's own rules*.
+  For allow groups (like `git_config`) that grants access. For deny/protection
+  groups (like `dangerous_commands`, `unlink_protection`) that *adds a
+  restriction* — it does not grant the denied commands or paths. To permit a
+  normally-blocked command or path, put the group in `groups.exclude` instead,
+  or use `filesystem.bypass_protection` for a narrower hole.
 </Note>
 
+**Deny groups** (block sensitive content):
+
+- **`deny_credentials`** — Block access to cryptographic keys, tokens, and cloud credentials ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L7))
+
+- **`deny_keychains_macos`** — Block access to macOS keychains and password stores ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L35))
+
+- **`deny_keychains_linux`** — Block access to Linux keyrings and password stores ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L51))
+
+- **`deny_browser_data_macos`** — Block access to macOS browser stored data (cookies, saved passwords, sessions) ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L64))
+
+- **`deny_browser_data_linux`** — Block access to Linux browser stored data (cookies, saved passwords, sessions) ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L82))
+
+- **`deny_macos_private`** — Block access to macOS private data (messages, mail, cookies) ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L98))
+
+- **`deny_shell_history`** — Block access to shell command history files ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L112))
+
+- **`deny_shell_configs`** — Block access to shell configuration files that may embed secrets ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L124))
+
+**Protection groups**:
+
+- **`unlink_protection`** — Block file deletion globally, override for user-writable paths ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L573))
+
+- **`dangerous_commands`** — Cross-platform commands blocked by default to prevent destructive actions ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L580))
+
+- **`dangerous_commands_macos`** — macOS-specific commands blocked by default ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L613))
+
+- **`dangerous_commands_linux`** — Linux-specific commands blocked by default ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L624))
+
+**System path groups** (grant necessary system access):
+
+- **`system_read_macos`** — macOS system paths required for executables to function ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L145))
+
+- **`system_read_linux_core`** — Linux core system paths required for normal CLI execution ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L192))
+
+- **`system_write_macos`** — macOS paths requiring write for temp files and devices ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L292))
+
+- **`system_write_linux`** — Linux paths requiring write for temp files and devices ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L306))
+
+- **`linux_runtime_state`** — Linux runtime state paths for host session and service integration ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L264))
+
+- **`linux_sysfs_read`** — Linux sysfs paths for kernel and device state inspection ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L274))
+
+- **`linux_temp_read`** — Linux shared temporary directory read access ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L283))
+
+**Cache groups** (user-level caches and state):
+
+- **`user_caches_macos`** — User cache, log, and preference directories for macOS programs ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L325))
+
+- **`user_caches_linux`** — User cache directories for Linux programs (XDG) ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L339))
+
+- **`claude_cache_linux`** — Claude Code CLI cache and MCP log directories on Linux ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L348))
+
+**Runtime groups** (language toolchain paths):
+
+- **`node_runtime`** — Node.js runtime and package manager paths ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L369))
+
+- **`rust_runtime`** — Rust toolchain paths ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L423))
+
+- **`python_runtime`** — Python runtime paths (pyenv, conda, uv) ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L412))
+
+- **`go_runtime`** — Go toolchain paths ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L432))
+
+- **`go_runtime_linux`** — Go build cache on Linux ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L441))
+
+- **`go_runtime_macos`** — Go build cache on macOS ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L450))
+
+- **`java_runtime`** — Java runtime and build tool paths (SDKMAN, Maven, Gradle) ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L459))
+
+- **`nix_runtime`** — Nix package manager runtime paths ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L545))
+
+- **`user_tools`** — User-local executables, .desktop files, man pages, and shell completions ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L357))
+
+- **`homebrew_macos`** — Homebrew installation paths on macOS ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L471))
+
+- **`homebrew_linux`** — Homebrew (Linuxbrew) installation paths on Linux ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L482))
+
+- **`mise_manager`** — Mise - dev tools, env vars, task runner ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L401))
+
+- **`bun_runtime`** — Bun javascript runtime and package manager paths ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L384))
+
+**Tool-specific groups** (paths for specific applications):
+
+- **`claude_code_macos`** — Claude Code macOS-specific state and credential paths ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L491))
+
+- **`claude_code_linux`** — Claude Code Linux-specific state paths ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L516))
+
+- **`codex_macos`** — Codex macOS-specific state and credential paths ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L506))
+
+- **`opencode_linux`** — OpenCode binary directory (Landlock requires directory read to execute binaries) ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L392))
+
+- **`vscode_macos`** — Visual Studio Code configuration and extension directories for macOS ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L525))
+
+- **`vscode_linux`** — Visual Studio Code configuration and extension directories for Linux ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L535))
+
+**Application config groups** (profile and configuration files):
+
+- **`git_config`** — Read access to git configuration files ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L561))
+
 <Note>
-  Command blocking is a best-effort surface-level control. It matches against the executable name being invoked directly. A process can bypass this by calling the equivalent syscall from within an allowed interpreter (e.g., `os.remove()` in Python, `fs.unlinkSync()` in Node.js) or by invoking a renamed copy of the binary. For hard filesystem protection, rely on the kernel-enforced deny groups and `unlink_protection`, which cannot be bypassed from userspace regardless of how the operation is invoked.
+  Group definitions are located in `crates/nono-cli/data/policy.json`. Each
+  entry above links to its exact definition; inspect the file directly to see
+  the full set of rules a group applies.
 </Note>
 
 ### Platform-Specific Groups

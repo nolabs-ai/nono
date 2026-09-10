@@ -847,7 +847,8 @@ fn prepare_with_abi_inner(
     let needs_network_handling = tcp_network.handles_tcp()
         && (!matches!(caps.network_mode(), NetworkMode::AllowAll)
             || !caps.tcp_connect_ports().is_empty()
-            || !caps.tcp_bind_ports().is_empty());
+            || !caps.tcp_bind_ports().is_empty()
+            || !caps.tcp_bind_port_ranges().is_empty());
 
     let mut fallback = SeccompNetFallback::None;
     let mut handled_net = BitFlags::<AccessNet>::EMPTY;
@@ -897,6 +898,15 @@ fn prepare_with_abi_inner(
             port: *port,
             allowed_access: bind,
         }));
+        net_rules.extend(
+            merge_port_ranges(caps.tcp_bind_port_ranges())
+                .into_iter()
+                .flat_map(|(start, end)| start..=end)
+                .map(|port| PreparedNetRule {
+                    port,
+                    allowed_access: bind,
+                }),
+        );
 
         if !matches!(caps.network_mode(), NetworkMode::AllowAll) {
             for port in caps.localhost_ports() {
@@ -1020,7 +1030,8 @@ fn apply_with_abi_inner(
     let needs_network_handling = tcp_network.handles_tcp()
         && (!matches!(caps.network_mode(), NetworkMode::AllowAll)
             || !caps.tcp_connect_ports().is_empty()
-            || !caps.tcp_bind_ports().is_empty());
+            || !caps.tcp_bind_ports().is_empty()
+            || !caps.tcp_bind_port_ranges().is_empty());
 
     let mut seccomp_net_fallback = SeccompNetFallback::None;
     let mut landlock_network_active = false;
@@ -1171,6 +1182,19 @@ fn apply_with_abi_inner(
                         port, e
                     ))
                 })?;
+        }
+        for (start, end) in merge_port_ranges(caps.tcp_bind_port_ranges()) {
+            for port in start..=end {
+                debug!("Adding TCP bind rule for bind-range port {}", port);
+                ruleset = ruleset
+                    .add_rule(NetPort::new(port, AccessNet::BindTcp))
+                    .map_err(|e| {
+                        NonoError::SandboxInit(format!(
+                            "Cannot add TCP bind rule for port {}: {}",
+                            port, e
+                        ))
+                    })?;
+            }
         }
 
         // Add localhost IPC port rules (connect + bind per port).
@@ -2869,6 +2893,7 @@ pub fn seccomp_network_fallback_mode(caps: &CapabilitySet) -> SeccompNetFallback
         NetworkMode::Blocked => {
             if caps.tcp_connect_ports().is_empty()
                 && caps.tcp_bind_ports().is_empty()
+                && caps.tcp_bind_port_ranges().is_empty()
                 && caps.localhost_ports().is_empty()
                 && caps.localhost_port_ranges().is_empty()
             {
@@ -2892,6 +2917,7 @@ fn static_network_baseline_filter(caps: &CapabilitySet) -> StaticNetworkFilter {
         NetworkMode::Blocked => {
             if caps.tcp_connect_ports().is_empty()
                 && caps.tcp_bind_ports().is_empty()
+                && caps.tcp_bind_port_ranges().is_empty()
                 && caps.localhost_ports().is_empty()
                 && caps.localhost_port_ranges().is_empty()
             {
@@ -2902,7 +2928,10 @@ fn static_network_baseline_filter(caps: &CapabilitySet) -> StaticNetworkFilter {
         }
         NetworkMode::ProxyOnly { .. } => StaticNetworkFilter::TcpOnly,
         NetworkMode::AllowAll => {
-            if caps.tcp_connect_ports().is_empty() && caps.tcp_bind_ports().is_empty() {
+            if caps.tcp_connect_ports().is_empty()
+                && caps.tcp_bind_ports().is_empty()
+                && caps.tcp_bind_port_ranges().is_empty()
+            {
                 StaticNetworkFilter::None
             } else {
                 StaticNetworkFilter::TcpOnly
@@ -4913,6 +4942,28 @@ mod tests {
         assert_eq!(
             seccomp_network_fallback_mode(&caps),
             SeccompNetFallback::None
+        );
+    }
+
+    #[test]
+    fn test_seccomp_network_fallback_mode_blocked_with_tcp_bind_port_range_is_none() {
+        let caps = CapabilitySet::new()
+            .block_network()
+            .allow_tcp_bind_port_range(8000, 8100)
+            .expect("valid range");
+        assert_eq!(
+            seccomp_network_fallback_mode(&caps),
+            SeccompNetFallback::None
+        );
+    }
+
+    #[test]
+    fn test_seccomp_network_fallback_mode_blocked_without_tcp_bind_port_range_is_block_all() {
+        let caps = CapabilitySet::new().block_network();
+        assert!(caps.tcp_bind_port_ranges().is_empty());
+        assert_eq!(
+            seccomp_network_fallback_mode(&caps),
+            SeccompNetFallback::BlockAll
         );
     }
 

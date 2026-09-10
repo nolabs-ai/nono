@@ -961,6 +961,15 @@ pub struct CapabilitySet {
     tcp_connect_ports: Vec<u16>,
     /// Per-port TCP bind allowlist (Linux Landlock V4+ only).
     tcp_bind_ports: Vec<u16>,
+    /// Inclusive TCP bind-only port ranges (listen/bind, no outbound connect).
+    ///
+    /// Linux Landlock V4+ expands each port to a BindTcp rule. macOS Seatbelt
+    /// cannot filter bind by port, so a non-empty set enables blanket
+    /// `(allow network-bind)` / `(allow network-inbound)` — the same tradeoff
+    /// as [`NetworkMode::ProxyOnly`] bind_ports. Distinct from
+    /// [`tcp_bind_ports`](Self::tcp_bind_ports), which remains a raw per-port
+    /// request and is rejected on macOS.
+    tcp_bind_port_ranges: Vec<(u16, u16)>,
     /// TCP ports allowed for bidirectional IPC (connect + bind).
     /// These apply regardless of NetworkMode.
     ///
@@ -1180,6 +1189,16 @@ impl CapabilitySet {
         self
     }
 
+    /// Allow an inclusive TCP bind-only port range (listen/bind, no connect).
+    ///
+    /// Returns an error if `start` is 0 (port 0 has no defined meaning in a
+    /// range). See [`tcp_bind_port_ranges`](Self::tcp_bind_port_ranges) for
+    /// platform-specific enforcement.
+    pub fn allow_tcp_bind_port_range(mut self, start: u16, end: u16) -> Result<Self> {
+        self.add_tcp_bind_port_range(start, end)?;
+        Ok(self)
+    }
+
     /// Allow bidirectional localhost TCP on a specific port (builder pattern).
     ///
     /// The sandboxed process can both connect to and bind/listen on
@@ -1376,6 +1395,20 @@ impl CapabilitySet {
     /// Add a TCP bind port to the allowlist (mutable)
     pub fn add_tcp_bind_port(&mut self, port: u16) {
         self.tcp_bind_ports.push(port);
+    }
+
+    /// Add an inclusive TCP bind-only port range (mutable).
+    ///
+    /// Returns an error if `start` is 0 (port 0 has no defined meaning in a range).
+    pub fn add_tcp_bind_port_range(&mut self, start: u16, end: u16) -> Result<()> {
+        if start == 0 {
+            return Err(NonoError::ConfigParse(
+                "port range starting at 0 is invalid; port 0 has no defined meaning in a range"
+                    .to_string(),
+            ));
+        }
+        self.tcp_bind_port_ranges.push((start, end));
+        Ok(())
     }
 
     /// Localhost IPC port; `0` is macOS-only (`localhost:*` TCP outbound).
@@ -1635,6 +1668,12 @@ impl CapabilitySet {
         &self.tcp_bind_ports
     }
 
+    /// Get TCP bind-only port ranges
+    #[must_use]
+    pub fn tcp_bind_port_ranges(&self) -> &[(u16, u16)] {
+        &self.tcp_bind_port_ranges
+    }
+
     /// Get localhost IPC ports
     #[must_use]
     pub fn localhost_ports(&self) -> &[u16] {
@@ -1645,6 +1684,23 @@ impl CapabilitySet {
     #[must_use]
     pub fn localhost_port_ranges(&self) -> &[(u16, u16)] {
         &self.localhost_port_ranges
+    }
+
+    /// Single [`localhost_ports`](Self::localhost_ports) entries widened to `(port, port)`
+    /// ranges and merged with [`localhost_port_ranges`](Self::localhost_port_ranges).
+    ///
+    /// Port `0` (macOS-only wildcard) is omitted — it has no defined meaning as a
+    /// range endpoint. Used when expanding localhost IPC grants into per-port
+    /// sandbox rules or seccomp bind/connect allowlists.
+    #[must_use]
+    pub fn merged_localhost_port_ranges(&self) -> Vec<(u16, u16)> {
+        let mut ranges = self.localhost_port_ranges().to_vec();
+        for &port in self.localhost_ports() {
+            if port != 0 {
+                ranges.push((port, port));
+            }
+        }
+        merge_port_ranges(&ranges)
     }
 
     /// Check if sandbox extensions are enabled for runtime capability expansion
@@ -2014,6 +2070,14 @@ impl CapabilitySet {
         if !self.tcp_bind_ports.is_empty() {
             let ports: Vec<String> = self.tcp_bind_ports.iter().map(|p| p.to_string()).collect();
             lines.push(format!("  tcp bind ports: {}", ports.join(", ")));
+        }
+        if !self.tcp_bind_port_ranges.is_empty() {
+            let ranges: Vec<String> = self
+                .tcp_bind_port_ranges
+                .iter()
+                .map(|(start, end)| format!("{start}-{end}"))
+                .collect();
+            lines.push(format!("  tcp bind port ranges: {}", ranges.join(", ")));
         }
 
         lines.join("\n")
@@ -3017,6 +3081,28 @@ mod tests {
     }
 
     #[test]
+    fn test_tcp_bind_port_range_builder() {
+        let caps = CapabilitySet::new()
+            .allow_tcp_bind_port_range(8000, 8100)
+            .expect("valid range")
+            .allow_tcp_bind_port_range(9000, 9001)
+            .expect("valid range");
+        assert_eq!(caps.tcp_bind_port_ranges(), &[(8000, 8100), (9000, 9001)]);
+    }
+
+    #[test]
+    fn test_tcp_bind_port_range_rejects_zero_start() {
+        assert!(
+            CapabilitySet::new()
+                .allow_tcp_bind_port_range(0, 100)
+                .is_err()
+        );
+        let mut caps = CapabilitySet::new();
+        assert!(caps.add_tcp_bind_port_range(0, 100).is_err());
+        assert!(caps.tcp_bind_port_ranges().is_empty());
+    }
+
+    #[test]
     fn test_allow_https_convenience() {
         let caps = CapabilitySet::new().allow_https();
         assert_eq!(caps.tcp_connect_ports(), &[443, 8443]);
@@ -3077,6 +3163,27 @@ mod tests {
         );
         let mut caps = CapabilitySet::new();
         assert!(caps.add_localhost_port_range(0, 100).is_err());
+    }
+
+    #[test]
+    fn test_merged_localhost_port_ranges_widens_singles_and_merges() {
+        let caps = CapabilitySet::new()
+            .allow_localhost_port(8250)
+            .allow_localhost_port(8251)
+            .allow_localhost_port_range(3000, 3010)
+            .expect("valid range");
+        assert_eq!(
+            caps.merged_localhost_port_ranges(),
+            vec![(3000, 3010), (8250, 8251)]
+        );
+    }
+
+    #[test]
+    fn test_merged_localhost_port_ranges_omits_port_zero() {
+        let caps = CapabilitySet::new()
+            .allow_localhost_port(0)
+            .allow_localhost_port(8080);
+        assert_eq!(caps.merged_localhost_port_ranges(), vec![(8080, 8080)]);
     }
 
     #[test]

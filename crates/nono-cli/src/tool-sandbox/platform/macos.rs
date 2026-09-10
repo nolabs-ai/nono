@@ -4489,9 +4489,10 @@ fn caps_to_spec(caps: &CapabilitySet) -> ChildCapsSpec {
             NetworkMode::ProxyOnly { bind_ports, .. } => bind_ports.clone(),
             _ => Vec::new(),
         },
-        proxy_bind_port_ranges: caps.localhost_port_ranges().to_vec(),
+        proxy_bind_port_ranges: caps.merged_localhost_port_ranges(),
         tcp_connect_ports: caps.tcp_connect_ports().to_vec(),
         tcp_bind_ports: caps.tcp_bind_ports().to_vec(),
+        tcp_bind_port_ranges: caps.tcp_bind_port_ranges().to_vec(),
     }
 }
 
@@ -4522,6 +4523,9 @@ fn caps_from_spec(spec: &ChildCapsSpec) -> Result<CapabilitySet> {
     }
     for port in &spec.tcp_bind_ports {
         caps.add_tcp_bind_port(*port);
+    }
+    for &(start, end) in &spec.tcp_bind_port_ranges {
+        caps.add_tcp_bind_port_range(start, end)?;
     }
     Ok(caps)
 }
@@ -7061,6 +7065,7 @@ mod tests {
             proxy_bind_port_ranges: Vec::new(),
             tcp_connect_ports: Vec::new(),
             tcp_bind_ports: Vec::new(),
+            tcp_bind_port_ranges: Vec::new(),
         };
 
         let err = caps_from_spec(&spec).err().ok_or_else(|| {

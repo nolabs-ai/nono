@@ -1490,7 +1490,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         allowed_env_vars: profile_allowed_env_vars,
         denied_env_vars: profile_denied_env_vars,
         case_insensitive_env_vars: profile_case_insensitive_env_vars,
-        set_vars: mut profile_set_vars,
+        set_vars: profile_set_vars,
         resolved_command_binaries: profile_resolved_command_binaries,
     } = prepared_profile;
 
@@ -1558,20 +1558,23 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
 
         // Claude Code writes its config atomically via temp files named
         // <config>.tmp.<pid>.<timestamp> next to the config file itself.
-        // Landlock/Seatbelt cannot grant permission for these
-        // dynamically-named files in ~/, so token refreshes would silently
-        // fail there. Point Claude Code at ~/.claude (already readwrite)
-        // via CLAUDE_CONFIG_DIR instead of leaving its config at
-        // ~/.claude.json, so the config and its temp siblings both land
-        // inside a directory nono already grants.
+        // We pre-create ~/.claude so that capability grants (e.g. profile
+        // filesystem rules for ~/.claude) succeed even when the directory
+        // did not exist before the sandbox starts. However we MUST NOT
+        // synthesize CLAUDE_CONFIG_DIR=$HOME/.claude when it is unset.
+        //
+        // Claude Code treats "explicitly set to ~/.claude" differently from
+        // "unset" - explicit hashes the dir into the Keychain service name
+        // (Claude Code-xxxx) and moves the global config from ~/.claude.json
+        // to $CLAUDE_CONFIG_DIR/.claude.json (see claude_config_dir(),
+        // claude_global_config_path(), claude_keychain_service_name() and
+        // docs/cli/clients/claude.mdx "Multiple Claude Profiles").
+        // Synthesising the default broke existing users who only have
+        // ~/.claude.json (issue #1834). Only honour a host-exported
+        // CLAUDE_CONFIG_DIR; never inject the default.
         let claude_dir = home_path.join(".claude");
         if let Err(error) = std::fs::create_dir_all(&claude_dir) {
             warn!("Failed to create ~/.claude: {error}");
-        } else if !std::env::var_os("CLAUDE_CONFIG_DIR").is_some() {
-            profile_set_vars.get_or_insert_with(Vec::new).push((
-                "CLAUDE_CONFIG_DIR".to_string(),
-                claude_dir.to_string_lossy().into_owned(),
-            ));
         }
     }
 
@@ -2258,6 +2261,95 @@ mod tests {
             &program,
             &cmd_args
         ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn claude_config_dir_explicit_flag_distinguishes_default_vs_custom() {
+        let _lock = crate::test_env::ENV_LOCK.lock().expect("env lock");
+        let dir = tempdir().expect("tmpdir");
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).expect("mkdir home");
+
+        // Unset => not explicit, returns $HOME/.claude
+        {
+            let env = crate::test_env::EnvVarGuard::set_all(&[
+                ("HOME", home.to_str().expect("utf8")),
+                ("CLAUDE_CONFIG_DIR", "/tmp/placeholder-claude"),
+            ]);
+            env.remove("CLAUDE_CONFIG_DIR");
+            let (path, explicit) = claude_config_dir().expect("claude_config_dir");
+            assert!(!explicit, "unset should be non-explicit");
+            assert_eq!(path, home.join(".claude"));
+            // Ensure explicit custom dir is flagged (new guard shadows the previous)
+            let custom = dir.path().join("custom-claude");
+            let _env2 = crate::test_env::EnvVarGuard::set_all(&[
+                ("HOME", home.to_str().expect("utf8")),
+                ("CLAUDE_CONFIG_DIR", custom.to_str().expect("utf8")),
+            ]);
+            let (path2, explicit2) = claude_config_dir().expect("claude_config_dir explicit");
+            assert!(explicit2, "set CLAUDE_CONFIG_DIR should be explicit");
+            assert_eq!(path2, custom);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn claude_global_config_path_respects_explicit_flag() {
+        let _lock = crate::test_env::ENV_LOCK.lock().expect("env lock");
+        let dir = tempdir().expect("tmpdir");
+        let home = dir.path().join("home");
+        let claude_dir = home.join(".claude");
+        std::fs::create_dir_all(&claude_dir).expect("mkdir claude_dir");
+        let env = crate::test_env::EnvVarGuard::set_all(&[
+            ("HOME", home.to_str().expect("utf8")),
+            ("CLAUDE_CONFIG_DIR", "/tmp/placeholder-claude"),
+        ]);
+        env.remove("CLAUDE_CONFIG_DIR");
+
+        // Default (not explicit) should resolve to $HOME/.claude.json when no legacy file
+        let (config_dir, explicit) = claude_config_dir().expect("config_dir");
+        assert!(!explicit);
+        let global = claude_global_config_path(&config_dir, explicit).expect("global path");
+        assert_eq!(global, home.join(".claude.json"));
+
+        // Explicit should resolve to $CLAUDE_CONFIG_DIR/.claude.json
+        let explicit_dir = dir.path().join("explicit-claude");
+        std::fs::create_dir_all(&explicit_dir).expect("mkdir explicit");
+        let explicit_path =
+            claude_global_config_path(&explicit_dir, true).expect("global explicit");
+        assert_eq!(explicit_path, explicit_dir.join(".claude.json"));
+
+        // Legacy .config.json takes precedence over suffix logic
+        let legacy = explicit_dir.join(".config.json");
+        std::fs::write(&legacy, "{}").expect("write legacy");
+        let legacy_resolved = claude_global_config_path(&explicit_dir, true).expect("legacy");
+        assert_eq!(legacy_resolved, legacy);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn claude_keychain_service_name_only_hashes_when_explicit() {
+        let dir = tempdir().expect("tmpdir");
+        let home = dir.path().join("home");
+        let claude_dir = home.join(".claude");
+        // Not explicit => no hash suffix
+        let service_default = claude_keychain_service_name(&claude_dir, false, "-credentials");
+        assert_eq!(service_default, "Claude Code-credentials");
+        // Explicit => hash suffix present (8 hex chars)
+        let custom = dir.path().join("custom");
+        let service_explicit = claude_keychain_service_name(&custom, true, "-credentials");
+        assert!(
+            service_explicit.starts_with("Claude Code-credentials-"),
+            "explicit should hash: {service_explicit}"
+        );
+        assert_eq!(service_explicit.len(), "Claude Code-credentials-".len() + 8);
+        // Same explicit dir must produce same service name (deterministic)
+        let again = claude_keychain_service_name(&custom, true, "-credentials");
+        assert_eq!(service_explicit, again);
     }
 
     #[test]

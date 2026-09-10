@@ -433,13 +433,29 @@ impl RouteStore {
     #[must_use]
     pub fn lookup_by_upstream(&self, host_port: &str) -> Option<(&str, &LoadedRoute)> {
         let normalised = normalise_host_port(host_port);
-        self.routes.iter().find_map(|(prefix, route)| {
-            route
-                .upstream_host_port
-                .as_ref()
-                .filter(|hp| host_port_matches(hp, &normalised))
-                .map(|_| (prefix.as_str(), route))
-        })
+        self.routes
+            .iter()
+            .filter(|(_, route)| {
+                route
+                    .upstream_host_port
+                    .as_ref()
+                    .is_some_and(|hp| host_port_matches(hp, &normalised))
+            })
+            .min_by_key(|(prefix, _)| prefix.as_str())
+            .map(|(prefix, route)| (prefix.as_str(), route))
+    }
+
+    #[must_use]
+    pub fn lookup_credential_bearing_by_upstream(
+        &self,
+        host_port: &str,
+    ) -> Option<(&str, &LoadedRoute)> {
+        let candidates = self.lookup_all_by_upstream(host_port);
+        candidates
+            .iter()
+            .find(|(_, route)| route.carries_managed_credential)
+            .or_else(|| candidates.first())
+            .copied()
     }
 
     /// Return all routes whose upstream matches `host:port`, sorted by
@@ -2537,5 +2553,44 @@ h56ZLEEqHfVWFhJWIKRSabtxYPV/VJyMv+lo3L0QwSKsouHs3dtF1zVQ
             "the phantom cannot be swapped without L7 visibility"
         );
         assert!(store.has_intercept_route("api.anthropic.com:443"));
+    }
+
+    #[tokio::test]
+    async fn test_lookup_by_upstream_is_prefix_ordered() {
+        let ep_route = RouteConfig {
+            prefix: "_ep_api.example.com".to_string(),
+            upstream: "http://api.example.com:8080".to_string(),
+            endpoint_rules: vec![crate::config::EndpointRule {
+                method: "GET".to_string(),
+                path: "/**".to_string(),
+            }],
+            ..Default::default()
+        };
+        let redeem_route = RouteConfig {
+            prefix: "provider".to_string(),
+            upstream: "http://api.example.com:8080".to_string(),
+            redeem_phantoms: vec!["example".to_string()],
+            ..Default::default()
+        };
+
+        for _ in 0..64 {
+            let store = RouteStore::load(&[ep_route.clone(), redeem_route.clone()])
+                .await
+                .unwrap();
+            assert_eq!(
+                store
+                    .lookup_by_upstream("api.example.com:8080")
+                    .map(|(prefix, _)| prefix),
+                Some("_ep_api.example.com"),
+                "lookup must not depend on HashMap iteration order"
+            );
+            assert_eq!(
+                store
+                    .lookup_credential_bearing_by_upstream("api.example.com:8080")
+                    .map(|(prefix, _)| prefix),
+                Some("provider"),
+                "phantom redemption must name the credential-bearing route"
+            );
+        }
     }
 }

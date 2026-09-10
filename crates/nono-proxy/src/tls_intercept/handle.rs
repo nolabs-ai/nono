@@ -1268,7 +1268,7 @@ where
         request.push_str(&format!("Authorization: Bearer {}\r\n", token.as_str()));
     }
     let injected_header_names = reverse::injected_credential_header_names(cred);
-    let nonce_consumer = service.map(|s| format!("proxy.{s}"));
+    let nonce_consumer = service.map(crate::oauth_capture::route_consumer);
     let redeem_phantoms: &[String] = route.map_or(&[], |r| r.redeem_phantoms.as_slice());
     for (name, value) in &filtered_headers {
         if injected_header_names
@@ -2169,7 +2169,7 @@ fn build_websocket_upstream_request(
     if let Some(cred) = cred {
         reverse::inject_credential_for_mode(cred, &mut request);
     }
-    let nonce_consumer = service.map(|name| format!("proxy.{name}"));
+    let nonce_consumer = service.map(crate::oauth_capture::route_consumer);
     for field in filtered_headers {
         // Ask the resolver, not a bare `nono_` scan: a templated phantom carries
         // no marker and would otherwise be forwarded upstream unrewritten.

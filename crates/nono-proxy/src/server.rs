@@ -2096,7 +2096,7 @@ async fn handle_forward_http(
     let host_port = crate::route::format_host_port(&host, port);
     let matched_route = state
         .route_store
-        .lookup_by_upstream(&host_port)
+        .lookup_credential_bearing_by_upstream(&host_port)
         .map(|(prefix, _)| prefix.to_string());
     let redeemable = matched_route.as_ref().and_then(|prefix| {
         Some((
@@ -2112,7 +2112,7 @@ async fn handle_forward_http(
                  redeeming phantom headers before forwarding",
                     host_port, prefix
                 );
-                let consumer = format!("proxy.{prefix}");
+                let consumer = crate::oauth_capture::route_consumer(prefix);
                 strip_and_redeem_proxy_headers(header_bytes, &consumer, redeem_phantoms, resolver)
             }
             _ => (strip_proxy_headers(header_bytes), false),
